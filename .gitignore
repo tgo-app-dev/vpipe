@@ -1,0 +1,6 @@
+build
+.claude
+*.mdb
+
+# clangd index cache (written into the source root by the language server)
+.cache/

@@ -1,0 +1,1190 @@
+/* vpipe web-ui -- minimalist desktop theme. */
+
+:root {
+  --bg:        #14161a;
+  --bg-1:      #1b1e24;
+  --bg-2:      #21252c;
+  --bg-3:      #2a2f38;
+  --line:      #333a44;
+  --fg:        #d8dde5;
+  --fg-dim:    #8b94a3;
+  --accent:    #5cc8ff;
+  --accent-2:  #7ee0a0;
+  --warn:      #ffd166;
+  --danger:    #ff6b6b;
+  --radius:    6px;
+  --nav-w:     76px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          monospace;
+}
+
+/* Light theme palette. Applied when the user picks "light", or picks
+   "auto" and the OS prefers light. Dark (:root above) is the default. */
+:root[data-theme="light"] {
+  --bg:        #f4f6f9;
+  --bg-1:      #ffffff;
+  --bg-2:      #e9edf2;
+  --bg-3:      #dde3ea;
+  --line:      #cfd6df;
+  --fg:        #1b2330;
+  --fg-dim:    #5c6675;
+  --accent:    #0a66c2;
+  --accent-2:  #1a7f4b;
+  --warn:      #9a6700;
+  --danger:    #cf222e;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-theme="auto"] {
+    --bg:        #f4f6f9;
+    --bg-1:      #ffffff;
+    --bg-2:      #e9edf2;
+    --bg-3:      #dde3ea;
+    --line:      #cfd6df;
+    --fg:        #1b2330;
+    --fg-dim:    #5c6675;
+    --accent:    #0a66c2;
+    --accent-2:  #1a7f4b;
+    --warn:      #9a6700;
+    --danger:    #cf222e;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+/* ---- Top bar ---- */
+
+#topbar {
+  flex: 0 0 auto;
+  height: 46px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 0 18px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+#topbar .brand {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+#topbar .brand-sub {
+  font-size: 13px;
+  letter-spacing: .5px;
+  color: var(--fg-dim);
+}
+
+/* Row holding the nav strip + the active view. */
+#body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* ---- Bottom status bar ---- */
+
+#statusbar {
+  flex: 0 0 auto;
+  height: 42px;
+  display: flex;
+  align-items: stretch;
+  padding: 0 12px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--fg-dim);
+  user-select: none;
+}
+.sb-body {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;   /* cluster the monitors at the right */
+  gap: 18px;
+  width: 100%;
+}
+/* Static machine label on the left; the spacer pushes the live
+   monitors to the right edge. */
+.sb-machine {
+  display: flex; align-items: center; gap: 6px;
+  min-width: 0; color: var(--fg); white-space: nowrap;
+}
+.sb-machine .sb-mval {
+  font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+}
+.sb-grow { flex: 1 1 auto; min-width: 8px; }
+.sb-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.sb-label {
+  color: var(--fg-dim);
+  font-weight: 600;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+/* "Meter" widget: a 100-second sparkline with the current value
+   overlaid on the right edge. The translucent fill underneath
+   doubles as the proportional bar. */
+.sb-meter {
+  position: relative;
+  width: 140px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.sb-meter svg.sb-spark {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+}
+.sb-meter svg.sb-spark .fill { fill: var(--accent); opacity: .18; }
+.sb-meter svg.sb-spark .line {
+  fill: none; stroke: var(--accent); stroke-width: 1.25;
+  stroke-linejoin: round; stroke-linecap: round; opacity: .85;
+}
+.sb-val {
+  position: relative;     /* render above the sparkline */
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.sb-val.dim { color: var(--fg-dim); }
+.sb-error {
+  display: flex; align-items: center; gap: 6px;
+}
+
+/* ---- Navigation strip ---- */
+
+#nav {
+  width: var(--nav-w);
+  flex: 0 0 var(--nav-w);
+  background: var(--bg-1);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 10px 0;
+  gap: 4px;
+}
+#nav .spacer { flex: 1 1 auto; }
+
+.nav-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 9px 4px;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9.5px;
+  letter-spacing: .2px;
+  border-left: 2px solid transparent;
+}
+.nav-btn:hover { color: var(--fg); background: var(--bg-2); }
+.nav-btn.active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--bg-2);
+}
+.nav-btn .label { text-align: center; }
+
+/* ---- 10x10 boolean-grid icons ---- */
+
+.icon {
+  display: grid;
+  grid-template-columns: repeat(16, 1fr);
+  grid-template-rows: repeat(16, 1fr);
+  gap: 0;
+  width: 26px;
+  height: 26px;
+}
+.icon.lg { width: 32px; height: 32px; }
+.icon.sm { width: 16px; height: 16px; }
+.icon i { background: transparent; }
+.icon i.on {
+  background: currentColor;
+  box-shadow: 0 0 1px currentColor;
+}
+
+/* ---- Main view ---- */
+
+#view { flex: 1 1 auto; min-width: 0; display: flex; }
+
+.placeholder {
+  margin: auto;
+  color: var(--fg-dim);
+  text-align: center;
+}
+.placeholder h2 { color: var(--fg); font-weight: 600; }
+
+/* ---- Pipeline Manager: three panes ---- */
+
+.pm {
+  display: grid;
+  /* Pipelines : Stages : Configuration = 1 : 3 : 1. */
+  grid-template-columns: 1fr 3fr 1fr;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+.pane:last-child { border-right: none; }
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* Fixed height (not min-height) with no vertical padding so every
+     pane header is identical regardless of whether it carries buttons
+     -- otherwise the Stages header (Insert/Remove) is taller than the
+     title-only Pipelines/Configuration headers. */
+  height: 40px;
+  flex: 0 0 40px;
+  padding: 0 10px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--fg-dim);
+}
+.pane-head .title { font-weight: 600; color: var(--fg); }
+.pane-head .grow { flex: 1 1 auto; }
+/* Right-aligned meta in a pane header (e.g. the Stages total count):
+   dim + natural case (the pane head otherwise uppercases its text). */
+.stages-count {
+  color: var(--fg-dim); text-transform: none; letter-spacing: normal;
+  font-weight: 400;
+}
+.pane-body { flex: 1 1 auto; overflow: auto; }
+
+/* ---- Buttons ---- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.btn:hover:not(:disabled) { background: var(--bg-3); border-color: #475061; }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.primary { border-color: var(--accent); color: var(--accent); }
+.btn.danger  { border-color: var(--danger); color: var(--danger); }
+.btn.icon-btn { padding: 4px; }
+.btn.ghost { background: transparent; border-color: transparent; }
+.btn.ghost:hover:not(:disabled) { background: var(--bg-3); }
+
+/* Keyboard-shortcut hint badge shown inside buttons. */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--fg-dim);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 1px 0 rgba(0,0,0,.25);
+  pointer-events: none;
+}
+.btn.primary .kbd { color: var(--accent); border-color: var(--accent); }
+.btn.danger .kbd  { color: var(--danger); border-color: var(--danger); }
+
+.icon-action {
+  width: 22px; height: 22px; color: var(--fg-dim);
+  cursor: pointer; padding: 2px; border-radius: 4px;
+  border: 1px solid transparent; background: transparent;
+}
+.icon-action:hover:not(:disabled) { color: var(--fg); background: var(--bg-3); }
+.icon-action:disabled { opacity: .3; cursor: not-allowed; }
+.icon-action.play:hover  { color: var(--accent-2); }
+.icon-action.stop:hover  { color: var(--danger); }
+
+/* ---- Pipeline list ---- */
+
+.toolbar { display: flex; gap: 6px; padding: 8px 10px; flex-wrap: wrap;
+           border-bottom: 1px solid var(--line); }
+
+.pl-list { list-style: none; margin: 0; padding: 6px; }
+.pl-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px; border-radius: var(--radius);
+  border: 1px solid transparent; cursor: pointer; margin-bottom: 4px;
+}
+.pl-item:hover { background: var(--bg-1); }
+.pl-item.selected { background: var(--bg-2); border-color: var(--line); }
+.pl-item .pl-name { flex: 1 1 auto; min-width: 0; overflow: hidden;
+                    text-overflow: ellipsis; white-space: nowrap; }
+.pl-item .pl-state {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px;
+  padding: 1px 5px; border-radius: 8px; border: 1px solid var(--line);
+  color: var(--fg-dim);
+}
+.pl-state.running { color: var(--accent-2); border-color: var(--accent-2); }
+.pl-state.paused  { color: var(--warn); border-color: var(--warn); }
+/* In-flight lifecycle op ("Stopping…", "Starting…", "Pausing…").
+   The slow pulse signals "the click registered, the runtime is
+   draining" -- important on big pipelines whose stop can take
+   several seconds. */
+.pl-state.busy {
+  color: var(--accent); border-color: var(--accent);
+  animation: pl-state-busy-pulse 1.2s ease-in-out infinite;
+}
+@keyframes pl-state-busy-pulse {
+  0%, 100% { opacity: 1.0; }
+  50%      { opacity: 0.55; }
+}
+.pl-actions { display: flex; gap: 2px; }
+/* Disabled icon-actions need a visibly-disabled treatment so the
+   user can tell that a re-click won't do anything during the
+   lifecycle wait. */
+.icon-action:disabled { opacity: 0.35; cursor: default; }
+
+/* ---- Graph ---- */
+
+.graph-wrap { position: relative; width: 100%; height: 100%;
+              overflow: hidden; background:
+              radial-gradient(circle at 1px 1px,
+                var(--bg-2) 1px, transparent 0) 0 0 / 22px 22px; }
+.graph-empty { position:absolute; inset:0; display:flex;
+               align-items:center; justify-content:center;
+               color: var(--fg-dim); pointer-events: none; }
+.graph-view { position: absolute; inset: 0; }
+svg.graph { display: block; width: 100%; height: 100%;
+            cursor: grab; touch-action: none; }
+.graph-view.panning svg.graph { cursor: grabbing; }
+
+.graph-controls { position: absolute; left: 10px; bottom: 10px;
+                  display: flex; gap: 4px; z-index: 2; }
+.graph-ctl {
+  min-width: 28px; height: 26px; padding: 0 7px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 5px; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+}
+.graph-ctl:hover { background: var(--bg-3); border-color: #475061; }
+.gnode rect.box {
+  fill: var(--bg-2); stroke: var(--line); stroke-width: 1.2;
+  rx: 6; filter: drop-shadow(0 2px 3px rgba(0,0,0,.4));
+}
+.gnode.selected rect.box { stroke: var(--accent); stroke-width: 2; }
+.gnode.needs-config rect.box { stroke: var(--warn); stroke-dasharray: 5 3; }
+.gnode.needs-config.selected rect.box { stroke: var(--accent); }
+.gnode text.title { fill: var(--fg); font: 600 12px var(--mono); }
+.gnode text.subtitle { fill: var(--fg-dim); font: 10px var(--mono); }
+.gnode .port { fill: var(--bg-3); stroke: var(--fg-dim); stroke-width: 1; }
+.gnode .port.untyped { stroke-dasharray: 2 2; }
+/* A declared-but-unwired input slot (shown per the stage spec): hollow
+   dot + dimmed name so it reads as "available". */
+.gnode .port.empty { fill: var(--bg-1); opacity: .85; }
+.gnode .port-grp.in.empty text.portlabel { opacity: .6; }
+.gnode text.portlabel { fill: var(--fg-dim); font: 9px var(--mono); }
+.gnode { cursor: pointer; }
+.gedge { fill: none; stroke: var(--fg-dim); stroke-width: 1.5;
+         opacity: .8; }
+.gedge.untyped { stroke-dasharray: 4 3; opacity: .5; }
+
+/* ---- Composer: toolbox + drag-create + click-to-connect ---- */
+
+/* The Stages pane is split [toolbox | canvas]. */
+.graph-split { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
+.graph-split .graph-wrap { flex: 1 1 auto; min-width: 0; }
+/* position:relative anchors the show/hide tab (a child) to the toolbox's
+   real right edge. min-width:0 keeps the flex item at its 152px basis --
+   without it the search input's intrinsic width balloons the toolbox and
+   the tab would land inside it. */
+.toolbox {
+  position: relative;
+  flex: 0 0 152px; display: flex; flex-direction: column;
+  border-right: 1px solid var(--line); background: var(--bg-1);
+  min-height: 0; min-width: 0;
+}
+/* Collapsed: shrink to zero width and hide the content, but keep the
+   toggle tab (a child) visible at the canvas's left edge to re-extend. */
+.toolbox.collapsed { flex-basis: 0; width: 0; border-right: none; }
+.toolbox.collapsed > .toolbox-head,
+.toolbox.collapsed > .toolbox-filter,
+.toolbox.collapsed > .toolbox-body { display: none; }
+/* Extruding show/hide tab glued to the toolbox's right edge: vertically
+   centered, rounded on its outer (right) side -- a Chrome tab rotated
+   90 degrees. right:-15px keeps it on the real edge whatever the toolbox
+   width; it lands at the canvas's left edge when collapsed. */
+.tb-toggle {
+  position: absolute; top: 50%; right: -15px; transform: translateY(-50%);
+  z-index: 5; width: 15px; height: 48px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-2); color: var(--fg-dim);
+  border: 1px solid var(--line); border-left: none;
+  border-radius: 0 9px 9px 0; cursor: pointer;
+  font: 10px var(--mono); line-height: 1;
+  box-shadow: 2px 0 4px rgba(0,0,0,.25);
+}
+.tb-toggle:hover { background: var(--bg-3); color: var(--fg); }
+.toolbox-head {
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.toolbox-head .title { font: 600 11px var(--mono); color: var(--fg-dim); }
+.toolbox-filter {
+  margin: 6px; padding: 4px 6px; background: var(--bg-2); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 5px; font: 11px var(--mono);
+}
+.toolbox-body { flex: 1 1 auto; overflow: auto; padding: 0 6px 8px; }
+.tb-chip {
+  display: flex; align-items: center; gap: 6px; padding: 5px 7px;
+  margin-bottom: 4px; background: var(--bg-2);
+  border: 1px solid var(--line); border-radius: 6px; cursor: grab;
+  font: 11px var(--mono); color: var(--fg); user-select: none;
+}
+.tb-chip:hover { background: var(--bg-3); border-color: var(--accent); }
+.tb-chip.dragging { opacity: .5; }
+.tb-chip .tb-grip {
+  flex: 0 0 6px; align-self: stretch; border-radius: 2px; color: var(--fg-dim);
+  background-image: radial-gradient(currentColor 1px, transparent 1px);
+  background-size: 3px 4px; opacity: .5;
+}
+.tb-chip .tb-name {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tb-chip .tb-io {
+  flex: 0 0 auto; color: var(--fg-dim); font-size: 10px; opacity: .75;
+}
+/* Category section header in the toolbox; sticks while scrolling. */
+.tb-cat {
+  font: 600 10px var(--mono); color: var(--fg-dim);
+  text-transform: uppercase; letter-spacing: .04em;
+  padding: 9px 4px 3px; position: sticky; top: 0; background: var(--bg-1);
+}
+.tb-empty { color: var(--fg-dim); font: 11px var(--mono); padding: 8px 4px; }
+.graph-wrap.drop-target {
+  outline: 2px dashed var(--accent); outline-offset: -4px;
+}
+
+/* Interactive ports (only present when editable). The invisible
+   porthit gives a generous click target over the small visible dot. */
+.porthit { fill: transparent; }
+svg.graph.editable .porthit { cursor: pointer; }
+svg.graph.editable .port-grp .port { transition: fill .1s, stroke .1s; }
+svg.graph.editable .port-grp:hover .port {
+  fill: var(--accent); stroke: var(--accent);
+}
+/* Armed output port (a connection is in progress from it). */
+.port-grp.out.armed .port {
+  fill: var(--accent); stroke: var(--accent);
+  filter: drop-shadow(0 0 3px var(--accent));
+}
+/* While arming, nudge the eligible targets (inputs + add-input). */
+svg.graph.arming .port-grp.in .port,
+svg.graph.arming .port-grp.add-in .port-add { stroke: var(--accent-2); }
+/* ...except inputs whose declared beat type can't accept the armed
+   output: dim them and flag the cursor (the click is also refused). */
+svg.graph.arming .port-grp.in.incompatible { opacity: .35; }
+svg.graph.arming .port-grp.in.incompatible .port { stroke: var(--danger); }
+svg.graph.arming .port-grp.in.incompatible .porthit { cursor: not-allowed; }
+/* A spec slot past the next free one: inputs fill in order, so it is
+   shown but not yet connectable (a click explains why). */
+.gnode .port-grp.in.locked { opacity: .4; }
+svg.graph.editable .port-grp.in.locked .porthit { cursor: not-allowed; }
+
+/* The dashed "+ add input" stub. */
+.port-add {
+  fill: var(--bg-3); stroke: var(--fg-dim); stroke-width: 1;
+  stroke-dasharray: 2 2;
+}
+.port-add-glyph { fill: var(--fg-dim); font: 10px var(--mono); }
+.portlabel.add { fill: var(--fg-dim); font-style: italic; }
+svg.graph.editable .port-grp.add-in:hover .port-add { stroke: var(--accent-2); }
+svg.graph.editable .port-grp.add-in:hover .port-add-glyph,
+svg.graph.editable .port-grp.add-in:hover .portlabel.add {
+  fill: var(--accent-2);
+}
+
+/* Per-input × detach badge: hidden until the input is hovered. */
+.port-x { opacity: 0; cursor: pointer; transition: opacity .1s; }
+svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
+.port-x-bg { fill: var(--danger); }
+.port-x-glyph { fill: #fff; font: 700 9px var(--mono); }
+
+/* Edge select (click the fat invisible hit-path) + delete. */
+.gedge-hit { fill: none; stroke: transparent; stroke-width: 12;
+             cursor: pointer; }
+.gedge.selected { stroke: var(--accent); opacity: 1; stroke-width: 2.5; }
+
+/* The connect rubber-band that tracks the cursor while arming. */
+.pending-edge {
+  fill: none; stroke: var(--accent); stroke-width: 2;
+  stroke-dasharray: 5 4; opacity: .9; pointer-events: none;
+}
+
+/* ---- Buffer-utilization overlay ---- */
+/* Edge tint by consumer backlog / capacity. util-idle keeps the
+   default look (no flooding of colour when everything is empty). */
+.gedge.util-ok   { stroke: var(--accent-2); opacity: .9; }
+.gedge.util-high { stroke: var(--warn);     opacity: 1; stroke-width: 2; }
+.gedge.util-full { stroke: var(--danger);   opacity: 1; stroke-width: 2.5; }
+.gedge.util-drop { stroke: var(--danger);   opacity: 1; stroke-width: 2.5;
+                   stroke-dasharray: 3 2; }
+/* Edge-midpoint "backlog/capacity" labels. A stroke halo (paint-order:
+   stroke) keeps them legible where they cross an edge or box. */
+.edge-util {
+  font: 600 9px var(--mono); fill: var(--fg-dim);
+  paint-order: stroke; stroke: var(--bg); stroke-width: 3px;
+  stroke-linejoin: round; pointer-events: none;
+}
+.edge-util.util-idle { fill: var(--fg-dim); opacity: .65; }
+.edge-util.util-ok   { fill: var(--accent-2); }
+.edge-util.util-high { fill: var(--warn); }
+.edge-util.util-full { fill: var(--danger); }
+.edge-util.util-drop { fill: var(--danger); }
+/* Buffer-fill overlay control, docked into the graph view-control
+   cluster (bottom-left) and styled to match the .graph-ctl buttons. */
+.buf-group {
+  display: inline-flex; gap: 4px; margin-left: 10px; align-items: stretch;
+}
+.graph-ctl.buf-ctl.active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.graph-ctl.buf-interval { width: 48px; text-align: right; }
+.graph-ctl.buf-interval:disabled { opacity: .5; cursor: default; }
+
+/* ---- Config panel ---- */
+
+.cfg { padding: 10px; }
+.cfg .empty { color: var(--fg-dim); padding: 12px; }
+.cfg .stage-id { font-weight: 600; color: var(--fg); font-size: 14px; }
+.cfg .stage-type { color: var(--accent); font-size: 11px; }
+.cfg .stage-cat {
+  margin-left: 6px; padding: 0 5px; border-radius: 3px;
+  background: var(--bg-3); color: var(--fg-dim); font-size: 9px;
+  text-transform: uppercase; letter-spacing: .03em;
+}
+.cfg .stage-desc {
+  color: var(--fg-dim); font-size: 11px; line-height: 1.45;
+  margin: 4px 0 10px;
+}
+.cfg .ro-note { color: var(--warn); font-size: 11px; margin: 4px 0 10px; }
+.field { margin-bottom: 12px; }
+.field label { display: block; margin-bottom: 3px; }
+.field .key { color: var(--fg); }
+.field .req { color: var(--danger); margin-left: 3px; }
+.field .ty  { color: var(--fg-dim); font-size: 10px; margin-left: 6px; }
+.field .doc { color: var(--fg-dim); font-size: 10.5px; margin-top: 2px; }
+.field input[type=text], .field input[type=number], .field textarea {
+  width: 100%; padding: 5px 7px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 12px;
+}
+.field textarea { min-height: 54px; resize: vertical; }
+.field input:focus, .field textarea:focus {
+  outline: none; border-color: var(--accent);
+}
+.field input:disabled, .field textarea:disabled { opacity: .55; }
+/* The input + "clear/unset" mini-button live side-by-side on numeric/
+   string fields so the user can wipe a value (omit from POST) without
+   having to remember to clear the input. The button shrinks to fit. */
+.field-input-row { display: flex; gap: 4px; align-items: stretch; }
+.field-input-row > input,
+.field-input-row > textarea { flex: 1 1 auto; min-width: 0; }
+.btn.mini {
+  flex: 0 0 auto; padding: 0 8px; font-size: 11px; line-height: 1;
+  white-space: nowrap;
+}
+.btn.ghost.mini.active {
+  background: var(--bg-3); color: var(--warn);
+  border-color: var(--bg-3);
+}
+.cfg-actions { display: flex; gap: 6px; margin-top: 6px; }
+
+/* ---- Modal ---- */
+
+.modal-back {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal {
+  background: var(--bg-1); border: 1px solid var(--line);
+  border-radius: 8px; width: 460px; max-width: 92vw;
+  max-height: 88vh; overflow: auto;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5);
+}
+.modal h3 { margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line);
+            font-size: 13px; }
+.modal .body { padding: 14px 16px; }
+.modal .foot { display: flex; justify-content: flex-end; gap: 8px;
+               padding: 12px 16px; border-top: 1px solid var(--line); }
+.modal label.fl { display:block; margin: 10px 0 3px; color: var(--fg-dim); }
+.modal .fl-hint { color: var(--fg-dim); font-size: 10.5px;
+                  margin-top: 4px; }
+.modal input[type=text], .modal select, .modal textarea {
+  width: 100%; padding: 6px 8px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 12px;
+}
+.modal textarea { min-height: 80px; resize: vertical; }
+
+/* ---- Startup permission checks dialog ---- */
+.sc-intro { margin: 0 0 10px; color: var(--fg-dim); }
+.startup-checks { display: flex; flex-direction: column; gap: 2px; }
+.sc-row {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 3px 0;
+}
+.sc-badge {
+  flex: 0 0 auto; font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: .5px; padding: 1px 5px; border-radius: 8px;
+  border: 1px solid var(--line); color: var(--fg-dim);
+}
+.sc-row.ok   .sc-badge { color: var(--accent-2); border-color: var(--accent-2); }
+.sc-row.warn .sc-badge { color: var(--danger);   border-color: var(--danger); }
+.sc-name   { flex: 0 0 auto; font-weight: 600; }
+.sc-detail { color: var(--fg-dim); }
+.sc-hints {
+  margin: 0 0 6px 64px; color: var(--warn); font-size: 11.5px;
+  line-height: 1.45;
+}
+.iport-row { display: flex; gap: 6px; margin-bottom: 6px; align-items:center; }
+.iport-row select { flex: 1 1 auto; }
+.iport-row input { width: 70px; }
+
+/* ---- User I/O console ---- */
+
+.userio { display: flex; flex-direction: column; width: 100%; height: 100%;
+          min-width: 0; }
+.userio .console {
+  flex: 1 1 auto; overflow: auto; padding: 10px 12px;
+  background: var(--bg); font: 12px/1.55 var(--mono);
+  white-space: pre-wrap; word-break: break-word;
+}
+.userio .console .line { padding: 1px 0; }
+.userio .console .line.info  { color: var(--fg); }
+.userio .console .line.warn  { color: var(--warn); }
+.userio .console .line.error { color: var(--danger); }
+.userio .console .line.input { color: var(--accent); }
+.userio .console .line.stream { color: var(--accent-2); }
+.userio .console .line.stream.streaming::after {
+  content: '▋'; margin-left: 1px; color: var(--accent-2);
+  animation: blink 1s step-start infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.userio .io-input {
+  display: flex; align-items: flex-end; gap: 8px; padding: 8px 12px 4px;
+  border-top: 1px solid var(--line); background: var(--bg-1);
+}
+.userio .io-input .io-prompt {
+  flex: 0 0 auto; max-width: 45%; color: var(--fg-dim);
+  white-space: pre; overflow: hidden; text-overflow: ellipsis;
+  padding-bottom: 7px;
+}
+.userio .io-input .io-prompt.active { color: var(--accent-2); }
+.userio .io-input .btn { flex: 0 0 auto; }
+.userio .io-text {
+  flex: 1 1 auto; min-width: 0; padding: 6px 8px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 12px; line-height: 1.5;
+  resize: none; overflow-y: auto; max-height: 160px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.userio .io-text:focus { outline: none; border-color: var(--accent); }
+.userio .io-text:disabled { opacity: .5; }
+/* Password (getpasswd) request: mask the typed characters. */
+.userio .io-text.masked {
+  -webkit-text-security: disc;
+  text-security: disc;
+}
+.userio .io-hint {
+  padding: 0 12px 8px; background: var(--bg-1);
+  text-align: right; font-size: 10px; color: var(--fg-dim);
+}
+.userio .io-hint .kbd { vertical-align: middle; margin: 0 1px; height: 14px;
+  min-width: 14px; font-size: 9px; }
+
+/* "Markdown" render toggle in the pane header (User I/O actions). */
+.io-md-toggle {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--fg-dim); cursor: pointer;
+  text-transform: none; letter-spacing: 0; user-select: none;
+}
+.io-md-toggle input { margin: 0; cursor: pointer; }
+
+/* ---- Markdown-rendered console lines (User I/O "Markdown" toggle) ---- */
+/* A .line.md holds real block/inline elements instead of pre-wrapped
+   text, so it opts out of the console's white-space: pre-wrap. */
+.userio .console .line.md { white-space: normal; }
+.userio .console .line.md > :first-child { margin-top: 0; }
+.userio .console .line.md > :last-child { margin-bottom: 0; }
+.userio .console .line.md p { margin: 4px 0; }
+/* Headings / emphasis inherit the line's level color (info/warn/error/…)
+   and only restyle weight + size, so markdown keeps the console's cues. */
+.userio .console .line.md h1,
+.userio .console .line.md h2,
+.userio .console .line.md h3,
+.userio .console .line.md h4,
+.userio .console .line.md h5,
+.userio .console .line.md h6 {
+  margin: 8px 0 4px; line-height: 1.3; font-weight: 600;
+}
+.userio .console .line.md h1 { font-size: 1.5em; }
+.userio .console .line.md h2 { font-size: 1.3em; }
+.userio .console .line.md h3 { font-size: 1.15em; }
+.userio .console .line.md h4 { font-size: 1.05em; }
+.userio .console .line.md h5 { font-size: 1em; }
+.userio .console .line.md h6 { font-size: .9em; opacity: .8; }
+.userio .console .line.md strong { font-weight: 700; }
+.userio .console .line.md em { font-style: italic; }
+.userio .console .line.md u { text-decoration: underline; }
+.userio .console .line.md ul,
+.userio .console .line.md ol { margin: 4px 0; padding-left: 22px; }
+.userio .console .line.md li { margin: 2px 0; }
+.userio .console .line.md code {
+  font-family: var(--mono); font-size: .92em;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 3px; padding: 0 4px;
+}
+.userio .console .line.md pre {
+  margin: 6px 0; padding: 8px 10px; overflow-x: auto;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px;
+}
+.userio .console .line.md pre code {
+  background: none; border: none; padding: 0; white-space: pre;
+}
+.userio .console .line.md table {
+  border-collapse: collapse; margin: 6px 0; font-size: .95em;
+}
+.userio .console .line.md th,
+.userio .console .line.md td {
+  border: 1px solid var(--line); padding: 3px 8px; text-align: left;
+}
+.userio .console .line.md th { background: var(--bg-2); font-weight: 600; }
+/* The growing-stream caret would float below the block content; hide it
+   in Markdown mode where partial syntax is re-rendered each tick anyway. */
+.userio .console .line.md.stream.streaming::after { content: none; }
+
+/* ---- Session Log console ---- */
+
+.logview { display: flex; flex-direction: column; width: 100%; height: 100%;
+           min-width: 0; }
+.logview .console {
+  flex: 1 1 auto; overflow: auto; padding: 10px 12px;
+  background: var(--bg); font: 12px/1.55 var(--mono);
+  white-space: pre-wrap; word-break: break-word;
+}
+.logview .console .line { padding: 1px 0; }
+.logview .console .line.error   { color: var(--danger); }
+.logview .console .line.warn    { color: var(--warn); }
+.logview .console .line.info    { color: var(--fg); }
+.logview .console .line.normal  { color: var(--fg); }
+.logview .console .line.verbose { color: var(--fg-dim); }
+.logview .console .line.debug   { color: var(--fg-dim); }
+.logview .console .line.always  { color: var(--accent-2); }
+
+/* Debug-level dropdown in the pane header. */
+.log-level-label { font-size: 10px; color: var(--fg-dim);
+  text-transform: uppercase; letter-spacing: .6px; }
+.log-level {
+  height: 22px; padding: 0 4px; background: var(--bg-3);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0;
+  cursor: pointer;
+}
+.log-level:focus { outline: none; border-color: var(--accent); }
+
+/* ---- User I/O workspace (splittable panes) ---- */
+
+.io-workspace {
+  position: relative;          /* anchors the "⋯" dropdown menu */
+  display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0;
+}
+.io-workspace > .io-pane,
+.io-workspace > .io-split { flex: 1 1 auto; min-width: 0; min-height: 0; }
+
+.io-split { display: flex; min-width: 0; min-height: 0; }
+.io-split.dir-v { flex-direction: row; }     /* side by side */
+.io-split.dir-h { flex-direction: column; }  /* stacked */
+.io-split > .io-pane,
+.io-split > .io-split { flex: 1 1 0; min-width: 0; min-height: 0; }
+/* Seam between the two children of a split. */
+.io-split.dir-v > * + * { border-left: 1px solid var(--line); }
+.io-split.dir-h > * + * { border-top: 1px solid var(--line); }
+
+.io-pane {
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0; overflow: hidden;
+}
+.io-pane-head {
+  display: flex; align-items: center; gap: 6px;
+  height: 32px; flex: 0 0 32px; padding: 0 6px 0 10px;
+  background: var(--bg-1); border-bottom: 1px solid var(--line);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+  color: var(--fg-dim);
+}
+.io-pane-head .title { font-weight: 600; color: var(--fg);
+  text-transform: none; letter-spacing: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.io-pane-head .grow { flex: 1 1 auto; }
+.io-pane-actions { display: flex; align-items: center; gap: 4px; }
+.io-pane-actions a { text-decoration: none; }
+/* Low-profile "⋯" menu trigger. */
+.io-pane-menu {
+  flex: 0 0 auto; width: 24px; height: 22px; padding: 0;
+  border: 1px solid transparent; border-radius: 4px;
+  background: transparent; color: var(--fg-dim); cursor: pointer;
+  font: inherit; font-size: 15px; line-height: 1;
+}
+.io-pane-menu:hover { color: var(--fg); background: var(--bg-3); }
+.io-pane-body {
+  position: relative; flex: 1 1 auto; min-width: 0; min-height: 0;
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.io-pane-body > .userio,
+.io-pane-body > .logview { flex: 1 1 auto; min-height: 0; }
+
+/* "⋯" dropdown. */
+.io-menu {
+  position: absolute; z-index: 30; min-width: 180px;
+  background: var(--bg-1); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px; box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.io-menu-item {
+  text-align: left; padding: 7px 9px; border: none; border-radius: 4px;
+  background: transparent; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 12px; white-space: nowrap;
+}
+.io-menu-item:hover { background: var(--bg-2); }
+.io-menu-item.danger { color: var(--danger); }
+
+/* Empty pane chooser. */
+.io-empty {
+  flex: 1 1 auto; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px;
+  color: var(--fg-dim); padding: 16px;
+}
+.io-empty-title { color: var(--fg); font-size: 13px; }
+.io-empty-choices { display: flex; flex-wrap: wrap; gap: 8px;
+  justify-content: center; }
+.io-empty-hint { font-size: 11px; }
+
+/* HLS video pane. */
+.hls-picker {
+  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.hls-picker-title { color: var(--fg-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .6px; }
+.hls-list { display: flex; flex-direction: column; gap: 6px; }
+.hls-item {
+  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
+}
+.hls-item:hover { background: var(--bg-3); border-color: #475061; }
+.hls-item-name { font-weight: 600; font-size: 12px; }
+.hls-item-url { color: var(--fg-dim); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hls-hint { color: var(--fg-dim); font-size: 11.5px; padding: 6px 2px; }
+.hls-video {
+  flex: 1 1 auto; min-height: 0; width: 100%;
+  background: #000; object-fit: contain;
+}
+.hls-status {
+  flex: 0 0 auto; padding: 6px 10px; color: var(--fg-dim);
+  font-size: 11px; background: var(--bg-1);
+  border-top: 1px solid var(--line);
+}
+.hls-status:empty { display: none; }
+
+/* ---- Database viewer ---- */
+
+.db {
+  display: grid;
+  grid-template-columns: 25% 75%;
+  width: 100%; height: 100%; min-width: 0;
+}
+.db > .pane { border-right: 1px solid var(--line); }
+.db-right {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+}
+
+.db-query {
+  flex: 0 0 auto; padding: 12px 14px; background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.db-form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.db-form-row label { color: var(--fg-dim); font-size: 11px; }
+.db-query select, .db-query input[type=text] {
+  padding: 5px 7px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; color: var(--fg); font: inherit; font-size: 12px;
+}
+.db-query input[type=text] { flex: 1 1 140px; min-width: 0; }
+.db-query select:focus, .db-query input:focus {
+  outline: none; border-color: var(--accent);
+}
+.db-detected { color: var(--accent-2); font-size: 11px; }
+.db-local-toggle {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: auto; color: var(--fg-dim); font-size: 11px;
+  cursor: pointer;
+}
+.db-local-toggle input { margin: 0; }
+
+.db-data {
+  flex: 1 1 auto; min-height: 0;
+  display: grid; grid-template-columns: 40% 60%;
+}
+.db-keys {
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--line);
+}
+/* Key and value pane heads share size + alignment so the seam
+   lines up cleanly. Override font/gap per pane below. */
+.db-keys-head, .db-value-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center;
+  height: 32px; padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px; color: var(--fg-dim);
+  box-sizing: border-box;
+}
+.db-trunc { color: var(--warn); }
+.db-keylist {
+  flex: 1 1 auto; overflow: auto; list-style: none; margin: 0; padding: 4px;
+}
+.db-key {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; border-radius: 4px; cursor: pointer;
+  font: 12px var(--mono);
+}
+.db-key-label {
+  flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.db-key:hover { background: var(--bg-1); }
+.db-key.selected { background: var(--bg-2); color: var(--accent); }
+.db-key.empty { color: var(--fg-dim); cursor: default; }
+
+/* Drop/delete affordance shared by the database list rows (.pl-item)
+   and the key list rows (.db-key). Subtle by default so it doesn't
+   compete with the row content; turns danger-red on hover. Only
+   rendered while mutation is allowed (no pipeline running). */
+.db-del {
+  flex: 0 0 auto;
+  border: none; background: none; cursor: pointer; padding: 0 2px;
+  color: var(--fg-dim); opacity: 0.4;
+  font-size: 12px; line-height: 1; border-radius: 4px;
+}
+.pl-item:hover .db-del, .db-key:hover .db-del { opacity: 0.75; }
+.db-del:hover { opacity: 1; color: var(--danger); }
+.db-pager {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-top: 1px solid var(--line);
+}
+.db-pageno { color: var(--fg-dim); font-size: 11px; }
+
+.db-value { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+/* .db-value-head shares its size with .db-keys-head (rule above).
+   Pane-specific gap + key/meta styling stay here. */
+.db-value-head { gap: 10px; }
+.db-vkey { color: var(--fg); font: 600 12px var(--mono);
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.db-vmeta { color: var(--fg-dim); font-size: 10.5px; flex: 0 0 auto;
+            margin-left: auto; }
+/* Default to wrapping: long JSON strings (FlexData -> JSON) shouldn't
+   force a horizontal scroll. Indentation is preserved by pre-wrap,
+   and overflow-wrap: anywhere breaks tokens with no whitespace
+   (URLs, base64 blobs). The hex dump overrides to plain `pre` so its
+   fixed column layout stays intact. */
+.db-dump {
+  flex: 1 1 auto; overflow: auto; margin: 0; padding: 10px 12px;
+  background: var(--bg); color: var(--fg);
+  font: 12px/1.5 var(--mono);
+  white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2;
+}
+.db-dump.hex {
+  white-space: pre; overflow-wrap: normal;
+}
+.db-hint { padding: 14px; color: var(--fg-dim); }
+
+/* ---- Settings ---- */
+
+.settings { display: flex; flex-direction: column; width: 100%; height: 100%;
+            min-width: 0; }
+.settings-body { flex: 1 1 auto; overflow: auto; padding: 18px 20px;
+                 max-width: 640px; }
+.setting { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.setting-label { font-weight: 600; color: var(--fg); margin-bottom: 3px; }
+.setting-desc { color: var(--fg-dim); font-size: 11.5px; margin-bottom: 10px; }
+.setting-row { display: flex; align-items: center; gap: 8px; }
+.setting-row input[type=number] {
+  width: 120px; padding: 5px 7px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 12px;
+}
+.setting-row input:focus { outline: none; border-color: var(--accent); }
+.setting-unit { color: var(--fg-dim); font-size: 11px; }
+.setting-status {
+  display: block; margin-top: 8px;
+  color: var(--fg-dim); font-size: 11px;
+}
+
+.segmented { display: inline-flex; border: 1px solid var(--line);
+             border-radius: var(--radius); overflow: hidden; }
+.segmented .seg {
+  padding: 6px 16px; border: none; background: var(--bg-1);
+  color: var(--fg-dim); cursor: pointer; font: inherit; font-size: 12px;
+  border-right: 1px solid var(--line);
+}
+.segmented .seg:last-child { border-right: none; }
+.segmented .seg:hover { background: var(--bg-2); color: var(--fg); }
+.segmented .seg.active {
+  background: var(--accent); color: #fff;
+}
+
+/* ---- Profiler ---- */
+
+.profiler {
+  display: flex; flex-direction: column;
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+}
+.prof-head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: var(--bg-1);
+  border-bottom: 1px solid var(--line); flex-wrap: wrap;
+}
+.prof-head .title { font-weight: 600; color: var(--fg); font-size: 13px; }
+.prof-head .grow { flex: 1 1 auto; }
+.prof-sep { width: 1px; height: 18px; background: var(--line); margin: 0 2px; }
+.prof-maxlabel {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--fg-dim); font-size: 11px;
+}
+.prof-max {
+  width: 84px; padding: 4px 6px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
+  font: inherit; font-size: 12px;
+}
+.prof-max:focus { outline: none; border-color: var(--accent); }
+.prof-status {
+  color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.prof-status.live {
+  color: var(--accent);
+  animation: pl-state-busy-pulse 1.2s ease-in-out infinite;
+}
+
+.prof-timeline {
+  flex: 1 1 auto; min-height: 0; position: relative; overflow: hidden;
+  background: var(--bg);
+}
+.prof-canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+.prof-canvas.grabbing { cursor: grabbing; }
+
+/* Draggable divider above the details panel. The panel is pinned to
+   the bottom, so a top-edge handle (not the corner `resize:vertical`
+   grabber, which would be off-screen) is the intuitive affordance. */
+.prof-resizer {
+  flex: 0 0 auto; height: 7px; cursor: row-resize;
+  background: var(--bg-1); border-top: 1px solid var(--line);
+  position: relative; touch-action: none; user-select: none;
+}
+.prof-resizer::after {
+  content: ''; position: absolute; left: 50%; top: 50%;
+  width: 40px; height: 2px; transform: translate(-50%, -50%);
+  background: var(--line); border-radius: 1px;
+}
+.prof-resizer:hover, .prof-resizer.dragging { background: var(--bg-2); }
+.prof-resizer:hover::after,
+.prof-resizer.dragging::after { background: var(--accent); }
+
+.prof-inspector {
+  /* Taller default: ~10 detail rows visible without a manual drag.
+     User-adjustable via the .prof-resizer handle above (sticky). */
+  flex: 0 0 auto; height: 280px; overflow: auto;
+  padding: 10px 14px; background: var(--bg-1);
+}
+.prof-insp-title {
+  display: flex; align-items: center; gap: 7px;
+  font-weight: 600; color: var(--fg); font-size: 12px; margin-bottom: 8px;
+}
+.prof-swatch {
+  display: inline-block; width: 12px; height: 12px; border-radius: 2px;
+  border: 1px solid rgba(0,0,0,.25);
+}
+.prof-grid { display: flex; flex-direction: column; gap: 4px; }
+.prof-row { display: flex; gap: 10px; font-size: 12px; }
+.prof-k {
+  flex: 0 0 84px; color: var(--fg-dim); text-align: right;
+  text-transform: uppercase; letter-spacing: .4px; font-size: 10px;
+  padding-top: 1px;
+}
+.prof-v {
+  flex: 1 1 auto; min-width: 0; color: var(--fg);
+  font-variant-numeric: tabular-nums; word-break: break-word;
+}
+.prof-hint { color: var(--fg-dim); font-size: 11px; margin-top: 10px; }
+
+/* ---- Toasts ---- */
+
+#toast-root { position: fixed; bottom: 16px; right: 16px; z-index: 100;
+              display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent); border-radius: 5px;
+  padding: 9px 13px; max-width: 360px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.4); animation: slidein .15s ease;
+}
+.toast.err { border-left-color: var(--danger); }
+.toast.ok  { border-left-color: var(--accent-2); }
+@keyframes slidein { from { transform: translateX(20px); opacity: 0; } }

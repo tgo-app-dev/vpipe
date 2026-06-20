@@ -1,0 +1,12 @@
+[submodule "extern/lmdb"]
+	path = extern/lmdb
+	url = https://github.com/LMDB/lmdb.git
+[submodule "extern/nanobind"]
+	path = extern/nanobind
+	url = https://github.com/wjakob/nanobind.git
+[submodule "extern/metal-cpp"]
+	path = extern/metal-cpp
+	url = https://github.com/bkaradzic/metal-cpp.git
+[submodule "extern/pugixml"]
+	path = extern/pugixml
+	url = https://github.com/zeux/pugixml.git

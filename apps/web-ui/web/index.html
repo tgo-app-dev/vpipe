@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vpipe</title>
+  <script>
+    // Apply the saved theme before first paint to avoid a flash.
+    try {
+      var t = localStorage.getItem('vpipe_theme');
+      document.documentElement.dataset.theme =
+        (t === 'dark' || t === 'light' || t === 'auto') ? t : 'auto';
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <span class="brand">VPIPE</span>
+      <span class="brand-sub">Dashboard</span>
+    </header>
+    <div id="body">
+      <nav id="nav" aria-label="Primary"></nav>
+      <main id="view"></main>
+    </div>
+    <footer id="statusbar" aria-label="System status"></footer>
+  </div>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
