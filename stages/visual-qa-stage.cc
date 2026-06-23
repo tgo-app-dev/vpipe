@@ -557,16 +557,34 @@ VisualQaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // synchronous next_token loop when the backend can't pipeline.
   const std::span<const std::int32_t> no_prompt;
   if (_lm->pdecode_begin(ctx, cur, no_prompt, sp, _max_new_tokens)) {
-    while (cur >= 0 && produced < _max_new_tokens) {
-      if (tpl && tpl->is_stop_token(cur)) { break; }
+    // Run-ahead pipeline (matches text-chat / audio-transcribe): prime a
+    // second forward so each token's encode overlaps the in-flight GPU step,
+    // and refill BEFORE detokenizing so the GPU runs the next forward while the
+    // host streams the current token. The old commit-then-next loop kept the
+    // pipeline at depth 1, exposing the per-token encode bubble (~+2%/tok).
+    const bool first_stop = tpl && tpl->is_stop_token(cur);
+    bool committed = !first_stop ? _lm->pdecode_commit(ctx) : false;
+    if (_lm->pdecode_supports_runahead() && committed &&
+        _max_new_tokens > 1) {
+      _lm->pdecode_commit(ctx);                   // speculative 2nd forward
+    }
+    if (!first_stop) {
       const std::string piece = tok.step(sd, cur);
       out += piece;
       out_stream->write(piece);
       ++produced;
-      if (produced >= _max_new_tokens) { break; }
-      if (!_lm->pdecode_commit(ctx)) { break; }   // append cur's KV
+    }
+    for (int i = 1; i < _max_new_tokens && committed && !first_stop; ++i) {
       cur = _lm->pdecode_next(ctx);
       if (cur < 0) { break; }
+      const bool stop = tpl && tpl->is_stop_token(cur);
+      const bool cont = (i + 1 < _max_new_tokens) && !stop;
+      committed = cont ? _lm->pdecode_commit(ctx) : false;   // refill ahead
+      if (stop) { break; }
+      const std::string piece = tok.step(sd, cur);
+      out += piece;
+      out_stream->write(piece);
+      ++produced;
     }
     _lm->pdecode_end(ctx);
     out_stream->end();

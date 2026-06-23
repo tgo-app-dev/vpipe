@@ -434,6 +434,19 @@ public:
   const metal_compute::SharedBuffer* ssm_write(ContextId id, int layer) const;
   const metal_compute::SharedBuffer* conv_write(ContextId id, int layer) const;
 
+  // Buffer for the ring slot `k` AHEAD of the cursor: physical slot
+  // (gdn_cur + k) % R. Lets a single command buffer that advances the GDN
+  // state by several tokens bind each token's STATE-IN (k=i) and STATE-OUT
+  // (k=i+1) to a DISTINCT slot, so every intermediate state survives for a
+  // zero-copy partial-accept rollback (the MTP speculative verify). k=0 is the
+  // current cursor slot; identical to ssm_read/conv_read at k=0. When the ring
+  // is off (R==1) every k maps to the canonical slot. nullptr conditions as
+  // ssm_read/conv_read.
+  const metal_compute::SharedBuffer*
+  ssm_slot(ContextId id, int layer, int k) const;
+  const metal_compute::SharedBuffer*
+  conv_slot(ContextId id, int layer, int k) const;
+
   // Turn the ring ON for `id` with R = depth+1 slots (depth>=1; depth<=1 is a
   // no-op -- the ring stays off). Allocates the R-1 shadow buffers per GDN
   // layer on first use (kept for the context's lifetime; reused across

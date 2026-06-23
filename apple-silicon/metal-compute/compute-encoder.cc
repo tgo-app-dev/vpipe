@@ -92,7 +92,7 @@ ComputeEncoder::set_buffer(unsigned index, const SharedBuffer& buf,
     return;
   }
   _enc->setBuffer(buf.mtl_buffer(),
-                  static_cast<NS::UInteger>(byte_offset),
+                  static_cast<NS::UInteger>(byte_offset + buf.byte_offset()),
                   static_cast<NS::UInteger>(index));
 }
 
@@ -116,11 +116,12 @@ ComputeEncoder::set_buffer_view(unsigned buf_index,
   if (_enc == nullptr || buf.empty()) {
     return;
   }
-  // Data buffer at byte offset 0 -- the view's element offset is
-  // applied inside the kernel by vpipe_tv_index(), not at bind
-  // time. This mirrors how MLX and other strided libraries
-  // separate base pointer from logical view.
-  _enc->setBuffer(buf.mtl_buffer(), 0,
+  // Data buffer at the subview's baked-in base offset (0 for a normal
+  // buffer) -- the view's element offset is applied inside the kernel by
+  // vpipe_tv_index(), not at bind time. This mirrors how MLX and other
+  // strided libraries separate base pointer from logical view.
+  _enc->setBuffer(buf.mtl_buffer(),
+                  static_cast<NS::UInteger>(buf.byte_offset()),
                   static_cast<NS::UInteger>(buf_index));
 
   const BufferView& v = buf.view();

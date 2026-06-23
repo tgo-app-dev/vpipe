@@ -5,8 +5,8 @@ A concurrent pipeline framework for real-time multimedia tasks, built
 natively on Apple Silicon.
 
 [**Overview**](#overview) · [**Requirements**](#requirements) ·
-[**Build**](#build) · [**Run**](#run) · [**Tests**](#tests) ·
-[**Layout**](#layout) · [**License**](#license)
+[**Build**](#build) · [**Run**](#run) · [**Examples**](EXAMPLES.md) ·
+[**Tests**](#tests) · [**Layout**](#layout) · [**License**](#license)
 
 ---
 
@@ -162,6 +162,9 @@ to the machine's LAN address so other devices can connect; remote connections
 must supply the 8-character access key printed at startup, while localhost
 connects without one. Options: `--bind ADDR`, `--port N` (`0` = any free port),
 `--config CFG` (inline JSON, a file path, or empty for defaults), `--help`.
+
+New here? **[EXAMPLES.md](EXAMPLES.md)** walks through fetching a model and
+building text-chat and speech-transcription pipelines in the web UI.
 
 ### Python
 

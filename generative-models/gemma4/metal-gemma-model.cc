@@ -145,6 +145,31 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_qmv_mlp = m->_lib_qmv.function("affine_qmv_" + gmlp);
   // Fused per-layer-input gate GEMV (e4b PLE; base quant). Folds the geglu.
   m->_fn_qmv_gelu_mul = m->_lib_qmv.function("affine_qmv_gelu_mul_" + g);
+  // QKV-fused decode GEMV (one full-occupancy matvec over the q|k|v row-concat;
+  // the 512-row k/v matvecs alone under-occupy the GPU). ~0.9% decode GPU-time
+  // win (gpu_active 15.93 -> 15.79 ms/tok on M4 Pro, 4-sample medians),
+  // token-exact. Memory-neutral: prefill's qw/kw/vw are re-pointed as subviews
+  // of the concat (build_qkv) so there is no weight duplication. On by default
+  // for uniform-4-bit checkpoints (e4b + realtime-vqa); VPIPE_GEMMA_NO_QKV_FUSE
+  // disables. 8-bit/mixed (gemma4_unified, OptiQ) fall back per layer.
+  m->_qkv_fuse = std::getenv("VPIPE_GEMMA_NO_QKV_FUSE") == nullptr
+              && cfg.quant_bits != 8;
+  if (m->_qkv_fuse) {
+    m->_fn_qmv_qkv = m->_lib_qmv.function("affine_qmv_qkv_" + g);
+    if (!m->_fn_qmv_qkv.valid()) { m->_qkv_fuse = false; }
+    // input_layernorm fused into the QKV GEMV (decode). OPT-IN only: it is
+    // token-exact but ~0.4 ms/tok SLOWER -- the QKV matvec fans out into ~384
+    // threadgroups that each redundantly redo the O(H) RMS reduction (+ read x
+    // twice), and the staging threadgroup memory cuts the bandwidth-bound
+    // GEMV's occupancy; both outweigh the one saved rms dispatch. The standalone
+    // rms (one threadgroup, reduces once) wins. Parked behind the flag.
+    m->_qkv_rms_fuse = m->_qkv_fuse
+        && std::getenv("VPIPE_GEMMA_QKV_RMS_FUSE") != nullptr;
+    if (m->_qkv_rms_fuse) {
+      m->_fn_qmv_qkv_rms = m->_lib_qmv.function("affine_qmv_qkv_rms_" + g);
+      if (!m->_fn_qmv_qkv_rms.valid()) { m->_qkv_rms_fuse = false; }
+    }
+  }
   m->_fn_qmm = m->_lib_qmm.function("affine_qmm_steel_" + g);
   m->_fn_qmm_geglu = m->_lib_qmm.function("affine_qmm_geglu_" + gmlp);
   m->_fn_qmm_mlp = m->_lib_qmm.function("affine_qmm_steel_" + gmlp);
@@ -185,14 +210,36 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_rms = m->_lib_rms.function("rms_norm_f16");
   m->_fn_rms_add = m->_lib_rms.function("rms_add_f16");
+  // Fast simd_sum full-hidden norms: swap the order-invariant RMS_PAD tree (12
+  // barriers, reduces 4096) for MLX's rms_single_row simd_sum reduction (2
+  // barriers, reduces only H). ~33% off the norm category, +2% decode; matches
+  // the omlx/MLX reduction structure. DEFAULT ON (the tree's cross-config bit-
+  // exactness was already moot -- vpipe diverges from omlx at exact ties anyway,
+  // and all gemma token-exact regression tests pass with this on; the only
+  // change vs the tree is benign near-tie greedy reorders, §27-30/§53).
+  // VPIPE_GEMMA_RMS_FAST=0 reverts to the deterministic tree for A/B.
+  m->_fn_rms_fast = m->_lib_rms.function("rms_norm_fast_f16");
+  m->_fn_rms_add_fast = m->_lib_rms.function("rms_add_fast_f16");
+  m->_rms_fast = m->_fn_rms_fast.valid() && m->_fn_rms_add_fast.valid();
+  if (const char* e = std::getenv("VPIPE_GEMMA_RMS_FAST")) {
+    m->_rms_fast = m->_rms_fast && (std::atoi(e) != 0);
+  }
   m->_fn_rope = m->_lib_rope.function("rope_f16");
   m->_fn_rms_rope = m->_lib_rope.function("rms_rope_f16");
   m->_fn_rms_rope2 = m->_lib_rope.function("rms_rope2_f16");
   m->_fn_rms_rope3 = m->_lib_rope.function("rms_rope3_f16");
+  // Fused rope3 + ring KV-write (sliding decode). Default ON;
+  // VPIPE_GEMMA_NO_ROPE_KV_FUSE opts out for A/B. Falls back if unavailable.
+  m->_fn_rms_rope3_kvwrite =
+      m->_lib_rope.function("rms_rope3_kvwrite_f16");
+  m->_rope_kv_fuse = m->_fn_rms_rope3_kvwrite.valid()
+      && std::getenv("VPIPE_GEMMA_NO_ROPE_KV_FUSE") == nullptr;
   m->_fn_geglu = m->_lib_elt.function("geglu_f16");
   m->_fn_softcap = m->_lib_elt.function("softcap_f16");
   m->_fn_scale = m->_lib_elt.function("scale_inplace_f16");
+  m->_fn_dummy_disp = m->_lib_elt.function("dummy_disp_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
+  m->_fn_copy = m->_lib_elt.function("copy_f16");
   // Embedding gather at embed_bits. Only the w8 g32 variant is new (the
   // GGUF path); the 4-bit / g64 names are the existing mlx-checkpoint ones.
   std::string embed_fn;
@@ -232,6 +279,7 @@ MetalGemmaModel::load(const std::string& model_dir,
   }
   m->_fn_kv_write = m->_lib_elt.function("kv_write_f16");
   m->_fn_kv_write2 = m->_lib_elt.function("kv_write2_f16");
+  m->_fn_kv_write_sub = m->_lib_elt.function("kv_write_sub_f16");
   // PAGED K/V write + scalar paged attention for the FULL (global) layers when
   // full_layers_paged (branch shares prefix pages, no full-KV copy). The scalar
   // paged-causal kernel is register-based (D up to 512) and runs on every GPU.
@@ -247,11 +295,28 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_sdpa_pflash = m->_lib_sdpa.function("sdpa_paged_flash_d512_f16");
   m->_pflash_attn = m->_fn_sdpa_pflash.valid()
       && std::getenv("VPIPE_GEMMA_NO_PFLASH") == nullptr;
+  // MATERIALIZED GLOBAL (head_dim 512) prefill: per-head Q.K^T (steel dense) ->
+  // causal softmax (this kernel) -> P.V (steel dense), mirroring MLX's
+  // head_dim-512 fallback (no fused flash). Replaces the ~1 TFLOP/s fused
+  // sdpa_paged_flash_d512 for single-chunk global prefill: +17.7% pp@8k,
+  // +24.1% pp@16k, token-exact, decode unchanged (report §34). DEFAULT ON when
+  // the kernel validated; VPIPE_GEMMA_MATERIALIZED_GLOBAL=0 forces it off (A/B).
+  m->_fn_causal_softmax = m->_lib_sdpa.function("causal_softmax_rows_f16");
+  m->_materialized_global = m->_fn_causal_softmax.valid();
+  if (const char* e = std::getenv("VPIPE_GEMMA_MATERIALIZED_GLOBAL")) {
+    m->_materialized_global = std::atoi(e) != 0 && m->_fn_causal_softmax.valid();
+  }
   // KV-split GQA paged flash-decode for the full layers + its merge. The vec
   // kernel (one q-head/simdgroup, UK-unrolled vec4 loads, latency-optimal) is
   // already D-flexible (per4 = D/128; D=512 ok) -- the paged sibling of the
   // contiguous gqa_vec the full-layer decode used before paging.
   m->_fn_sdpa_pgqa = m->_lib_sdpa.function("sdpa_paged_gqa_vec_f16");
+  // Materialized paged decode (global D=512): QK GEMV -> rowstat -> PV GEMV
+  // -> merge (the omlx/MLX head_dim-512 fallback structure; no online softmax).
+  m->_fn_dec_qk      = m->_lib_sdpa.function("sdpa_paged_dec_qk_f16");
+  m->_fn_dec_rowstat = m->_lib_sdpa.function("sdpa_dec_rowstat_f16");
+  m->_fn_dec_pv      = m->_lib_sdpa.function("sdpa_paged_dec_pv_f16");
+  m->_fn_dec_merge   = m->_lib_sdpa.function("sdpa_dec_pv_merge_f16");
   m->_fn_argmax = m->_lib_elt.function("argmax_f16");
   // GPU sampler for the pipelined-decode non-greedy path (same kernel as
   // Qwen; dtype-correct via _lib_elt's suffix). Optional: greedy pdecode
@@ -276,6 +341,8 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_sdpa_gqa_tile = m->_lib_sdpa.function("sdpa_causal_gqa_tile_f16");
   m->_fn_sdpa_gqa_direct = m->_lib_sdpa.function("sdpa_causal_gqa_direct_f16");
   m->_fn_sdpa_gqa_vec = m->_lib_sdpa.function("sdpa_causal_gqa_vec_f16");
+  m->_fn_sdpa_gqa_vec_lin =
+      m->_lib_sdpa.function("sdpa_causal_gqa_vec_lin_f16");
   m->_fn_sdpa_mma_qhead = m->_lib_sdpa.function("sdpa_causal_mma_qhead_f16");
   // Matrix-core (M5+) matmul2d attention for GLOBAL (head_dim 512) prefill: the
   // sdpa_mma metallib needs -std=metal4.0, so load it (and enable the path)
@@ -299,7 +366,30 @@ MetalGemmaModel::load(const std::string& model_dir,
   // ring (forces the wrap/chunk path -- exercised by the ringwrap test, and
   // an e2e A/B knob).
   m->_sliding_grow = std::getenv("VPIPE_GEMMA_NO_SLIDING_GROW") == nullptr;
+  // Bounded-ring single-pass prefill: when the ring is bounded (no grow) and a
+  // one-shot prompt would wrap, run ONE forward over the whole prompt instead
+  // of chunking the entire stack to <= page tokens. The sliding ATTENTION reads
+  // the full-batch K/V scratch (materialized banded path, ring-independent), so
+  // only the sliding KV-WRITE touches the bounded ring -- and a single full
+  // write leaves the correct trailing window resident (the last `ring` logical
+  // positions are never clobbered). This decouples the proj/FFN/global GEMM
+  // batch from the page-sized ring sub-block, recovering the grown one-pass
+  // prefill speed while the ring stays bounded. Default ON; opt out with
+  // VPIPE_GEMMA_PREFILL_SUBBLOCK=0. Only fires when the materialized sliding
+  // path is available (it is the ring-independent attention primitive).
+  m->_prefill_subblock = [] {
+    const char* e = std::getenv("VPIPE_GEMMA_PREFILL_SUBBLOCK");
+    return !(e && std::atoi(e) == 0);
+  }();
+  m->_mat_sliding = [] {
+    const char* e = std::getenv("VPIPE_GEMMA_MAT_SLIDING");
+    return !(e && std::atoi(e) == 0);
+  }();
   m->_fn_dense_t = m->_lib_dense.function("dense_gemm_t_f16");
+  m->_fn_dense_t_qkcausal =
+      m->_lib_dense.function("dense_gemm_t_qkcausal_f16");
+  m->_fn_dense_t_pvcausal =
+      m->_lib_dense.function("dense_gemm_t_pvcausal_f16");
   // M=1 decode GEMV for the e4b PLE f16 projections (default ON when the
   // entry point is present; VPIPE_GEMMA_NO_PLE_GEMV=1 reverts to dense_t).
   m->_fn_dense_gemv = m->_lib_dense.function("dense_gemv_t_f16");
@@ -368,11 +458,30 @@ MetalGemmaModel::load(const std::string& model_dir,
   if (const char* e = std::getenv("VPIPE_GEMMA_GTILE_ATTN")) {
     m->_gtile_attn = m->_gtile_attn && (std::atoi(e) != 0);
   }
+  // Linearized sliding ring read (mirror tail): read the bounded window as ONE
+  // contiguous span (no per-key % ring_cap), token-exact and free/faster than
+  // the modulo read. Default ON when the lin kernel is loaded; opt out with
+  // VPIPE_GEMMA_RING_LINEAR=0. Alloc + mirror writes are always-on regardless.
+  m->_ring_linear = m->_fn_sdpa_gqa_vec_lin.valid();
+  if (const char* e = std::getenv("VPIPE_GEMMA_RING_LINEAR")) {
+    m->_ring_linear = m->_ring_linear && (std::atoi(e) != 0);
+  }
   // KV-split GQA paged flash-decode for the (paged) full layers: the fast
   // long-context decode path (the scalar paged kernel has no split). Default
   // ON when present; VPIPE_GEMMA_NO_PGQA=1 reverts to scalar sdpa_paged_causal.
   m->_pgqa_attn = m->_fn_sdpa_pgqa.valid() && m->_fn_sdpa_gqa_merge.valid()
       && std::getenv("VPIPE_GEMMA_NO_PGQA") == nullptr;
+  // Materialized global decode: the omlx/MLX head_dim-512 fallback structure
+  // (QK GEMV -> parallel softmax -> PV GEMV, no online-softmax serial chain).
+  // Token-exact but M4-NEUTRAL -- the scores DRAM round-trip cancels the gain
+  // the fused flash gets for free by keeping scores in registers (the KV-read
+  // latency, identical for both, is the real bottleneck). KEPT default-off as
+  // the M5 matrix-core substrate: the QK/PV are GEMM-shaped, so an MMA variant
+  // flips the scratch-vs-compute economics that lose on M4. VPIPE_GEMMA_MAT_DECODE=1.
+  m->_mat_decode = m->_pgqa_attn && m->_fn_dec_qk.valid()
+      && m->_fn_dec_rowstat.valid() && m->_fn_dec_pv.valid()
+      && m->_fn_dec_merge.valid()
+      && std::getenv("VPIPE_GEMMA_MAT_DECODE") != nullptr;
   if (const char* e = std::getenv("VPIPE_GEMMA_GTILE_SPLIT")) {
     const int v = std::atoi(e);
     if (v >= 1 && v <= 512) { m->_gtile_split = v; }
@@ -413,6 +522,13 @@ MetalGemmaModel::load(const std::string& model_dir,
     m->_fn_dense_mma = m->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
+    // Causal-tiled matmul2d QK for the MATERIALIZED attention core (M5): the
+    // diagonal-grid tile-skip on the matrix units. Only QK moves to matmul2d;
+    // softmax stays banded and PV stays steel causal-K-capped (a full-K matmul2d
+    // PV loses at 16k where PV dominates, and the matmul2d K-cap needs a tiny BM
+    // that starves the matrix units).
+    m->_fn_dense_mma_qkcausal =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_qkcausal_n128_f16");
     m->_fn_geglu_inter = m->_lib_elt.function("geglu_interleaved_f16");
     m->_use_mma = m->_fn_dequant.valid() && m->_fn_dense_mma.valid() &&
                   m->_fn_dense_mma_deep.valid() &&
@@ -425,6 +541,14 @@ MetalGemmaModel::load(const std::string& model_dir,
     }
     if (const char* e = std::getenv("VPIPE_GEMMA_MMA_NODQ")) {
       m->_skip_dequant = (std::atoi(e) != 0);   // diagnostic only
+    }
+    // Materialized-attention matmul2d core (M5): causal QK on the matrix units
+    // + full-K matmul2d PV, behind the materialized path. Default ON when the
+    // matmul2d GEMM path is on (e4b 4-bit + matrix cores); VPIPE_GEMMA_MAT_NO_MMA2
+    // forces the materialized GEMMs back to steel (A/B the matrix-core attn).
+    m->_mat_mma = m->_use_mma && m->_fn_dense_mma_qkcausal.valid();
+    if (const char* e = std::getenv("VPIPE_GEMMA_MAT_NO_MMA2")) {
+      if (std::atoi(e) != 0) { m->_mat_mma = false; }
     }
   }
 
@@ -604,6 +728,72 @@ MetalGemmaModel::load(const std::string& model_dir,
     return true;
   };
 
+  // Row-concatenate q|k|(v) quantized weights into one [q+k+v rows, hidden]
+  // buffer for the fused decode GEMV (affine_qmv_qkv). All three share the base
+  // bits/group so the concat is a byte-level row append; v empty => q|k only
+  // (k_eq_v). Skips (per-layer fallback) if any byte size is not a clean
+  // multiple of the base-bits row stride (mixed-precision safety).
+  const std::size_t qkv_wrow_b =
+      (std::size_t)cfg.hidden * (std::size_t)cfg.quant_bits / 8;   // bytes/row
+  const std::size_t qkv_grow_b = (std::size_t)(cfg.hidden / qg) * 2;  // f16/row
+  auto build_qkv = [&](Layer& ly) -> void {
+    if (qkv_wrow_b == 0 || ly.qw.empty() || ly.kw.empty()) { return; }
+    const bool vok = !ly.vw.empty();
+    if ((ly.qw.byte_size() % qkv_wrow_b) || (ly.kw.byte_size() % qkv_wrow_b) ||
+        (vok && (ly.vw.byte_size() % qkv_wrow_b))) {
+      return;                                    // not uniform base bits
+    }
+    const int qr = (int)(ly.qw.byte_size() / qkv_wrow_b);
+    const int kr = (int)(ly.kw.byte_size() / qkv_wrow_b);
+    const int vr = vok ? (int)(ly.vw.byte_size() / qkv_wrow_b) : 0;
+    if ((qr % 8) || (kr % 8) || (vr % 8)) { return; }   // 8-row TG boundary
+    // Reject mixed precision (e.g. OptiQ 8-bit q/k/v): the derived row counts
+    // must match the expected output dims, else an 8-bit tensor would parse as
+    // 2x the rows at the base 4-bit stride and corrupt the concat.
+    const int qd_exp = cfg.n_heads * ly.head_dim;
+    const int kd_exp = ly.n_kv * ly.head_dim;
+    if (qr != qd_exp || kr != kd_exp || (vr && vr != kd_exp)) { return; }
+    const int rows = qr + kr + vr;
+    ly.qkvw = mc->make_shared_buffer((std::size_t)rows * qkv_wrow_b);
+    ly.qkvs = mc->make_shared_buffer((std::size_t)rows * qkv_grow_b);
+    ly.qkvb = mc->make_shared_buffer((std::size_t)rows * qkv_grow_b);
+    if (ly.qkvw.empty() || ly.qkvs.empty() || ly.qkvb.empty()) { return; }
+    auto cat = [](const SharedBuffer& dst, std::size_t& off,
+                  const SharedBuffer& src) {
+      std::memcpy(static_cast<std::uint8_t*>(dst.contents()) + off,
+                  src.contents(), src.byte_size());
+      off += src.byte_size();
+    };
+    std::size_t wo = 0, so = 0, bo = 0;
+    cat(ly.qkvw, wo, ly.qw); cat(ly.qkvw, wo, ly.kw);
+    cat(ly.qkvs, so, ly.qs); cat(ly.qkvs, so, ly.ks);
+    cat(ly.qkvb, bo, ly.qb); cat(ly.qkvb, bo, ly.kb);
+    if (vr) {
+      cat(ly.qkvw, wo, ly.vw); cat(ly.qkvs, so, ly.vs); cat(ly.qkvb, bo, ly.vb);
+    }
+    ly.qkv_qrows = qr; ly.qkv_krows = kr; ly.qkv_vrows = vr;
+    ly.qkv_fused = true;
+    // Re-point the per-proj weights at slices of the concat so PREFILL (which
+    // still calls qmm(ly.qw/kw/vw)) reads the SAME storage as decode's fused
+    // GEMV -- no duplication. Reassignment frees the standalone q/k/v buffers
+    // copied above (subview shares qkvw's allocation by refcount).
+    const std::size_t qwb = (std::size_t)qr * qkv_wrow_b;
+    const std::size_t kwb = (std::size_t)kr * qkv_wrow_b;
+    const std::size_t qgb = (std::size_t)qr * qkv_grow_b;
+    const std::size_t kgb = (std::size_t)kr * qkv_grow_b;
+    ly.qw = ly.qkvw.subview(0, qwb);
+    ly.qs = ly.qkvs.subview(0, qgb);
+    ly.qb = ly.qkvb.subview(0, qgb);
+    ly.kw = ly.qkvw.subview(qwb, kwb);
+    ly.ks = ly.qkvs.subview(qgb, kgb);
+    ly.kb = ly.qkvb.subview(qgb, kgb);
+    if (vr) {
+      ly.vw = ly.qkvw.subview(qwb + kwb, (std::size_t)vr * qkv_wrow_b);
+      ly.vs = ly.qkvs.subview(qgb + kgb, (std::size_t)vr * qkv_grow_b);
+      ly.vb = ly.qkvb.subview(qgb + kgb, (std::size_t)vr * qkv_grow_b);
+    }
+  };
+
   // ---- per-layer bind ---------------------------------------------
   m->_layers.resize(cfg.n_layers);   // Layer is move-only (SharedBuffer)
   const int first_shared = cfg.first_shared();
@@ -659,6 +849,7 @@ MetalGemmaModel::load(const std::string& model_dir,
                   || qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb));
       ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
       if (ly.k_norm.empty()) { return nullptr; }
+      if (m->_qkv_fuse) { build_qkv(ly); }   // concat for the fused decode GEMV
     }
     // layer_scalar [1] -> host float.
     {
@@ -702,6 +893,12 @@ MetalGemmaModel::load(const std::string& model_dir,
     // share the parent's frozen prefix pages by refcount -- no per-branch
     // full-KV copy. Sliding layers keep the bounded contiguous ring.
     sp.page_tokens    = 256;
+    // A/B knob: scan the paged-pool page size (page-walk granularity in the
+    // pflash/pgqa kernels). Must stay a multiple of 16 (mma2 BK over-read).
+    if (const char* e = std::getenv("VPIPE_GEMMA_PAGE_TOKENS")) {
+      const int v = std::atoi(e);
+      if (v >= 16 && v <= 8192 && (v % 16) == 0) { sp.page_tokens = v; }
+    }
     sp.max_seq        = cfg.max_seq;
     sp.sliding_window = cfg.sliding_window;
     sp.sliding_chunk  = sliding_chunk;
@@ -782,6 +979,26 @@ MetalGemmaModel::ensure_scratch_()
   _d_k = b(kd);
   _d_v = b(kd);
   _d_attn = b(qd);
+  // Materialized GLOBAL-prefill scratch (VPIPE_GEMMA_MATERIALIZED_GLOBAL): the
+  // per-head score matrix [CAP,CAP] + V transpose [Hkv,D,CAP]. CAP bounds the
+  // preallocation so we never reserve max_seq^2 (e.g. 64k^2 -> 8 GB); beyond
+  // CAP the path falls back to pflash. Default 16384 (scores 16384^2*2 =
+  // 512 MB at 16k; scales DOWN with max_seq for shorter contexts).
+  // VPIPE_GEMMA_MATERIALIZED_CAP overrides (multiple of 16).
+  if (_materialized_global) {
+    int cap = 16384;
+    if (const char* e = std::getenv("VPIPE_GEMMA_MATERIALIZED_CAP")) {
+      const int v = std::atoi(e);
+      if (v >= 512 && (v % 16) == 0) { cap = v; }
+    }
+    _scores_cap = std::min(c.max_seq, cap);
+    _d_scores = b((std::size_t)_scores_cap * _scores_cap);
+    _d_vT = b((std::size_t)c.n_kv_heads * c.head_dim_full * _scores_cap);
+    if (_d_scores.empty() || _d_vT.empty()) {
+      _materialized_global = false;     // alloc failed -> fall back to pflash
+      _scores_cap = 0;
+    }
+  }
   _d_o = b(H);
   _d_act = b(c.ffn_inner);   // fused gate/up+geglu output (no gate/up bufs)
   _d_mlp = b(H);
@@ -790,9 +1007,29 @@ MetalGemmaModel::ensure_scratch_()
   _d_pli = b(ple);
   _d_plg = b(c.hpli);
   _d_plp = b(H);
+  // Pipelined PLE (Design A): per-chunk pli/pleproj buffers + private _d_x copy.
+  _ple_chunk_k = 0;
+  if (c.hpli > 0) {
+    if (const char* e = std::getenv("VPIPE_GEMMA_PLE_CHUNK_K")) {
+      _ple_chunk_k = std::max(0, std::atoi(e));
+    }
+    if (_ple_chunk_k > 0) {
+      const int nch = (c.n_layers + _ple_chunk_k - 1) / _ple_chunk_k;
+      _d_pli_ch.resize(nch);
+      _d_pleproj_ch.resize(nch);
+      for (int ci = 0; ci < nch; ++ci) {
+        const int a = ci * _ple_chunk_k;
+        const int nlc = std::min(a + _ple_chunk_k, c.n_layers) - a;
+        _d_pli_ch[ci] = b((std::size_t)nlc * c.hpli);
+        _d_pleproj_ch[ci] = b((std::size_t)nlc * c.hpli);
+      }
+      _d_x_ple = b(H);
+    }
+  }
   _d_logits = b(c.vocab);
   _d_tok = _mc->make_shared_buffer(sizeof(std::int32_t));
   _d_argmax_id = _mc->make_shared_buffer(sizeof(std::int32_t));
+  _d_dummy = _mc->make_shared_buffer(256 * 2);   // DUMMY_DISP scratch (f16)
   // Page table for the FULL-layer paged attention: max_pages triplets per
   // slot. kPgtabSlots slots form a ring so run-ahead pdecode (depth<=4) gives
   // each in-flight step its own table (the slot 0 path is used by every
@@ -818,6 +1055,15 @@ MetalGemmaModel::ensure_scratch_()
     _d_gqa_oacc = _mc->make_shared_buffer(Hq * sp * Dd * sizeof(float));
     _d_gqa_m = _mc->make_shared_buffer(Hq * sp * sizeof(float));
     _d_gqa_l = _mc->make_shared_buffer(Hq * sp * sizeof(float));
+    // Materialized global decode scores scratch: [Hq, Tstride] f32, Tstride =
+    // full KV capacity (max_pages * page_tokens). PV partials/m/l reuse the
+    // buffers above. _d_gqa_m/_l hold ONE stat per head (sp >= 1 fits).
+    if (_mat_decode) {
+      // f16 scratch (2 bytes/elt) -- halves the scores DRAM round-trip vs f32.
+      _dec_tstride = _ctx->max_pages() * c.page_tokens;
+      _d_dec_scores = _mc->make_shared_buffer(
+          Hq * (std::size_t)_dec_tstride * 2u);
+    }
   }
   _scratch_ready = !_d_logits.empty();
   return _scratch_ready;
@@ -853,13 +1099,13 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
 
   auto rms = [&](const SharedBuffer& xin, const SharedBuffer& w,
                  const SharedBuffer& y, int R, int Hd) {
-    enc.set_function(_fn_rms);
+    enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_fast : _fn_rms);
     enc.set_buffer(0, xin);
     enc.set_buffer(1, w);
     enc.set_buffer(2, y);
     enc.set_constant(3, Hd);
     enc.set_constant(4, eps);
-    enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+    enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
   };
   // Fused sublayer-out norm + residual add (+ post-scale): res = (res +
   // rms(xin, w)) * post_scale. One dispatch for the Gemma sandwich
@@ -867,7 +1113,7 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   auto rms_add = [&](const SharedBuffer& xin, const SharedBuffer& w,
                      const SharedBuffer& res, int R, int Hd,
                      float post_scale = 1.0f) {
-    enc.set_function(_fn_rms_add);
+    enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_add_fast : _fn_rms_add);
     enc.set_buffer(0, xin);
     enc.set_buffer(1, w);
     enc.set_buffer(2, res);
@@ -875,7 +1121,7 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_constant(4, Hd);
     enc.set_constant(5, eps);
     enc.set_constant(6, post_scale);
-    enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+    enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
   };
   // qmv_fn selects the kernel (base bits for attn / lm_head; the _mlp
   // variant -- 8-bit for gemma4_unified -- for down_proj). `qmv` defaults
@@ -898,6 +1144,50 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
                  const SharedBuffer& b, const SharedBuffer& xin,
                  const SharedBuffer& y, int Kk, int N) {
     qmv_fn(_fn_qmv, w, s, b, xin, y, Kk, N);
+  };
+  // QKV-fused decode GEMV: one dispatch over the q|k|v row-concat (full GPU
+  // occupancy), writing q/k/v into their separate buffers. v_out is bound to
+  // _d_k as a never-written dummy when vrows==0 (k_eq_v q|k fusion).
+  auto qmv_qkv = [&](const Layer& ly, const SharedBuffer& xin) {
+    enc.set_function(_fn_qmv_qkv);
+    enc.set_buffer(0, ly.qkvw);
+    enc.set_buffer(1, ly.qkvs);
+    enc.set_buffer(2, ly.qkvb);
+    enc.set_buffer(3, xin);
+    enc.set_buffer(4, _d_q);
+    enc.set_buffer(5, _d_k);
+    enc.set_buffer(6, ly.qkv_vrows ? _d_v : _d_k);
+    enc.set_constant(7, H);
+    enc.set_constant(8, ly.qkv_qrows);
+    enc.set_constant(9, ly.qkv_krows);
+    enc.set_constant(10, ly.qkv_vrows);
+    const int N = ly.qkv_qrows + ly.qkv_krows + ly.qkv_vrows;
+    enc.dispatch({32, (unsigned)(N / 4), 1}, {32, 2, 1});
+  };
+  // Fused input_layernorm + QKV GEMV: reads the residual stream _d_x directly,
+  // RMS-norms it in threadgroup memory (norm_w = in_ln, (1+w) already baked at
+  // load), then projects -- saving the standalone rms dispatch + _d_hn round-
+  // trip. tg_x sized to the block-aligned hidden dim. block_size = 16*32 = 512.
+  auto qmv_qkv_rms = [&](const Layer& ly, const SharedBuffer& xres) {
+    enc.set_function(_fn_qmv_qkv_rms);
+    enc.set_buffer(0, ly.qkvw);
+    enc.set_buffer(1, ly.qkvs);
+    enc.set_buffer(2, ly.qkvb);
+    enc.set_buffer(3, xres);
+    enc.set_buffer(4, ly.in_ln);
+    enc.set_buffer(5, _d_q);
+    enc.set_buffer(6, _d_k);
+    enc.set_buffer(7, ly.qkv_vrows ? _d_v : _d_k);
+    enc.set_constant(8, H);
+    enc.set_constant(9, ly.qkv_qrows);
+    enc.set_constant(10, ly.qkv_krows);
+    enc.set_constant(11, ly.qkv_vrows);
+    enc.set_constant(12, eps);
+    const int blk = 512;
+    const int aligned = ((H + blk - 1) / blk) * blk;
+    enc.set_threadgroup_memory_length(0, (unsigned)aligned * 2);  // f16/bf16
+    const int N = ly.qkv_qrows + ly.qkv_krows + ly.qkv_vrows;
+    enc.dispatch({32, (unsigned)(N / 4), 1}, {32, 2, 1});
   };
   // Dense f16 GEMV (M=1): y[1,N] = x[1,K] @ W[N,K]^T. The PLE's two f16
   // projections; same {32,N/4,1}/{32,2,1} grid as qmv (RPS=4/NSG=2).
@@ -963,6 +1253,37 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_constant(11, kv_off);
     enc.dispatch({256, (unsigned)(Hq_ + 2 * Hkv_), 1}, {256, 1, 1});
   };
+  // Fused rms_rope3 + ring KV-write: q normed+roped in place, k/v written
+  // straight into the contiguous ring cache (ck/cv) at slot kv_off%cap --
+  // folds the kv_write2 dispatch into the norm kernel. Ring (sliding) only.
+  auto rms_rope3_kvwrite =
+      [&](const SharedBuffer& q, const SharedBuffer& qw,
+          const SharedBuffer& k, const SharedBuffer& kw,
+          const SharedBuffer& v, const SharedBuffer& vw,
+          const SharedBuffer& invf, int Hq_, int Hkv_, int D,
+          const SharedBuffer& ck, const SharedBuffer& cv, int cap_,
+          int ring_cap_, int window_) {
+    enc.set_function(_fn_rms_rope3_kvwrite);
+    enc.set_buffer(0, q);
+    enc.set_buffer(1, qw);
+    enc.set_buffer(2, k);
+    enc.set_buffer(3, kw);
+    enc.set_buffer(4, v);
+    enc.set_buffer(5, vw);
+    enc.set_buffer(6, invf);
+    enc.set_constant(7, Hq_);
+    enc.set_constant(8, Hkv_);
+    enc.set_constant(9, D);
+    enc.set_constant(10, eps);
+    enc.set_constant(11, kv_off);
+    enc.set_buffer(12, ck);
+    enc.set_buffer(13, cv);
+    enc.set_constant(14, cap_);
+    enc.set_constant(15, kv_off);
+    enc.set_constant(16, ring_cap_);     // ring modulo (0 = linear, no mirror)
+    enc.set_constant(17, window_);       // trailing window (mirror tail size+1)
+    enc.dispatch({256, (unsigned)(Hq_ + 2 * Hkv_), 1}, {256, 1, 1});
+  };
   auto geglu = [&](const SharedBuffer& gate, const SharedBuffer& up,
                    const SharedBuffer& out, int n, std::size_t up_off = 0) {
     enc.set_function(_fn_geglu);
@@ -986,6 +1307,15 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_buffer(0, x);
     enc.set_constant(1, n);
     enc.set_constant(2, s);
+    enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  };
+  auto copy = [&](const SharedBuffer& src, const SharedBuffer& dst, int n) {
+    enc.set_function(_fn_copy);
+    enc.set_buffer(0, src);
+    enc.set_buffer(1, dst);
+    const int zoff = 0;
+    enc.set_constant(2, zoff);
+    enc.set_constant(3, n);
     enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
   };
   auto embed_gather = [&](const SharedBuffer& w, const SharedBuffer& s,
@@ -1043,8 +1373,70 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   }
   auto DUP = [&](int cat, auto&& fn) { fn(); if (dup == cat) { fn(); } };
 
+  // Per-layer-TYPE whole-layer doubling (gpu_active profiling): unlike DUP
+  // (per category), this repeats a matching layer's ENTIRE body, so the
+  // gpu_active delta vs the `none` baseline = that type's full GPU residency
+  // INCLUDING its uncategorized within-layer ops + inter-dispatch bubbles.
+  // Buckets by (is_full, owns-own-KV); 5 = lm_head. Timing only (corrupts the
+  // running hidden state, same as DUP). VPIPE_GEMMA_DUP_LAYER, _catprof-gated.
+  int dup_layer = 0;
+  if (_catprof) {
+    if (const char* e = std::getenv("VPIPE_GEMMA_DUP_LAYER")) {
+      const std::string s = e;
+      dup_layer = (s == "slide_own") ? 1 : (s == "global_own") ? 2
+                : (s == "slide_skip") ? 3 : (s == "global_skip") ? 4
+                : (s == "lmhead") ? 5 : 0;
+    }
+  }
+  // Whole-category STRIP (ablation): skip a layer category's entire body so the
+  // baseline-minus-stripped gpu_active delta = that category's GPU cost. Mirror
+  // of dup_layer but lreps=0 (remove instead of double). Timing only (corrupts
+  // the hidden state). Individual buckets + the user-facing combos:
+  //   sliding|global (by attn type), shared_kv|own_kv (by KV ownership).
+  // VPIPE_GEMMA_SKIP_LAYER, _catprof-gated.
+  int skip_layer = 0;
+  if (_catprof) {
+    if (const char* e = std::getenv("VPIPE_GEMMA_SKIP_LAYER")) {
+      const std::string s = e;
+      skip_layer = (s == "slide_own") ? 1 : (s == "global_own") ? 2
+                 : (s == "slide_skip") ? 3 : (s == "global_skip") ? 4
+                 : (s == "sliding") ? 5 : (s == "global") ? 6
+                 : (s == "shared_kv") ? 7 : (s == "own_kv") ? 8
+                 : (s == "all") ? 9 : 0;
+    }
+  }
+  // PLE strip (composable with SKIP_LAYER): drop the per-layer-embedding
+  // production AND every layer's per_layer_input gate (the layer tail falls
+  // back to just *= layer_scalar). Isolates PLE's wall cost, e.g. in an
+  // all-global run (SKIP_LAYER=sliding + SKIP_PLE). VPIPE_GEMMA_SKIP_PLE.
+  const bool do_ple =
+      has_ple && !(_catprof && std::getenv("VPIPE_GEMMA_SKIP_PLE") != nullptr);
+  // FFN strip (composable): drop each layer's gate/up + down GEMVs (the MLP
+  // matmuls), keeping the pre/post norms. Isolates the attention path once PLE
+  // and FFN -- both vpipe-favourable -- are removed. VPIPE_GEMMA_SKIP_FFN.
+  const bool skip_ffn =
+      _catprof && std::getenv("VPIPE_GEMMA_SKIP_FFN") != nullptr;
+  // Attention-vs-projection split inside a layer (composable). SKIP_ATTN drops
+  // the SDPA flash-decode core (keeps QKV/O proj, rope, KV-write); SKIP_PROJ
+  // drops the QKV + O projection GEMVs (keeps SDPA). Isolates which carries the
+  // sliding-layer deficit. VPIPE_GEMMA_SKIP_ATTN / VPIPE_GEMMA_SKIP_PROJ.
+  const bool skip_attn =
+      _catprof && std::getenv("VPIPE_GEMMA_SKIP_ATTN") != nullptr;
+  const bool skip_proj =
+      _catprof && std::getenv("VPIPE_GEMMA_SKIP_PROJ") != nullptr;
+  // Fixed-tail split (composable): SKIP_LMHEAD drops the final lm_head GEMV
+  // (262144-vocab, the bandwidth giant); SKIP_EMBED drops the input embed
+  // gather. Isolate the lm_head vs embed vs argmax shares of the fixed bucket.
+  // VPIPE_GEMMA_SKIP_LMHEAD / VPIPE_GEMMA_SKIP_EMBED.
+  const bool skip_lmhead =
+      _catprof && std::getenv("VPIPE_GEMMA_SKIP_LMHEAD") != nullptr;
+  const bool skip_embed =
+      _catprof && std::getenv("VPIPE_GEMMA_SKIP_EMBED") != nullptr;
+
   // ---- embeddings + per-layer inputs (once per token) -------------
-  if (_embed_is_q6k) { embed_q6k(tokbuf, toff, _d_x, H, 1); }
+  if (skip_embed) {
+    // embed gather stripped (timing-only): _d_x left stale
+  } else if (_embed_is_q6k) { embed_q6k(tokbuf, toff, _d_x, H, 1); }
   else { embed_gather(_embed_w, _embed_s, _embed_b, _d_x, H); }
   scale(_d_x, H, std::sqrt((float)H));                     // embed_scale
   // Diagnostic: fire N extra no-op dispatches/token to measure the per-launch
@@ -1053,10 +1445,52 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   {
     static const int kDummy = std::getenv("VPIPE_GEMMA_DUMMY_DISP")
         ? std::atoi(std::getenv("VPIPE_GEMMA_DUMMY_DISP")) : 0;
-    for (int i = 0; i < kDummy; ++i) { scale(_d_argmax_id, 1, 1.0f); }
+    const int one = 1;
+    for (int i = 0; i < kDummy; ++i) {
+      // Realistic per-dispatch load: 8 read buffers + 4 constants + 1 write.
+      // b0 == out == _d_dummy makes the dummies a RAW dependency chain (they
+      // serialize like the real decode chain instead of overlapping). Reads
+      // _d_x (live hidden state) for the filler args; never touches real state.
+      enc.set_function(_fn_dummy_disp);
+      enc.set_buffer(0, _d_dummy);                 // chain in (== out)
+      enc.set_buffer(1, _d_x); enc.set_buffer(2, _d_x); enc.set_buffer(3, _d_x);
+      enc.set_buffer(4, _d_x); enc.set_buffer(5, _d_x); enc.set_buffer(6, _d_x);
+      enc.set_buffer(7, _d_x);
+      enc.set_buffer(8, _d_dummy);                 // chain out
+      enc.set_constant(9, one);  enc.set_constant(10, one);
+      enc.set_constant(11, one); enc.set_constant(12, one);
+      enc.dispatch({256, 1, 1}, {256, 1, 1});
+    }
   }
   // Per-Layer-Input projection (e4b PLE only; gemma4_unified has no PLE).
-  if (has_ple) {
+  if (do_ple && _ple_chunk_k > 0 && _ple_gemv) {
+    // Pipelined PLE (Design A): produce pli in per-chunk buffers so chunks
+    // 1..N-1 overlap the layer chain (only chunk 0 gates layer 0). The chunk
+    // GEMVs read a PRIVATE copy of _d_x (no WAR with the per-layer residual
+    // writes), and each chunk writes its OWN buffer (no cross-chunk hazard,
+    // no whole-pli barrier at layer 0's gate). Token-identical to the block.
+    DUP(DC_PLE, [&] {
+    copy(_d_x, _d_x_ple, H);
+    embed_gather(_ple_w, _ple_s, _ple_b, _d_ple, ple);
+    scale(_d_ple, ple, std::sqrt((float)hpli));
+    const int nch = (int)_d_pli_ch.size();
+    for (int ci = 0; ci < nch; ++ci) {
+      const int a = ci * _ple_chunk_k;
+      const int nlc = std::min(a + _ple_chunk_k, c.n_layers) - a;
+      const int rows = nlc * hpli;
+      const std::size_t woff = (std::size_t)a * hpli * (std::size_t)H * 2;
+      dense_gemv(_d_x_ple,
+                 _plm_proj_w.subview(woff, (std::size_t)rows * (std::size_t)H * 2),
+                 _d_pleproj_ch[ci], H, rows);
+      scale(_d_pleproj_ch[ci], rows, std::pow((float)H, -0.5f));
+      rms(_d_pleproj_ch[ci], _ple_proj_norm, _d_pleproj_ch[ci], nlc, hpli);
+      residual(_d_pleproj_ch[ci],
+               _d_ple.subview((std::size_t)a * hpli * 2, (std::size_t)rows * 2),
+               _d_pli_ch[ci], rows);
+      scale(_d_pli_ch[ci], rows, 0.70710678f);
+    }
+    });
+  } else if (do_ple) {
     DUP(DC_PLE, [&] {
     embed_gather(_ple_w, _ple_s, _ple_b, _d_ple, ple);
     scale(_d_ple, ple, std::sqrt((float)hpli));            // ple scale
@@ -1108,15 +1542,50 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   // ---- layer loop -------------------------------------------------
   for (int L = 0; L < c.n_layers; ++L) {
     Layer& ly = _layers[L];
+    // Whole-layer doubling for per-type gpu_active profiling (see dup_layer).
+    const bool owns_kv = ly.kv_source < 0;
+    int lreps = 1;
+    if      (dup_layer == 1 && !ly.is_full &&  owns_kv) { lreps = 2; }
+    else if (dup_layer == 2 &&  ly.is_full &&  owns_kv) { lreps = 2; }
+    else if (dup_layer == 3 && !ly.is_full && !owns_kv) { lreps = 2; }
+    else if (dup_layer == 4 &&  ly.is_full && !owns_kv) { lreps = 2; }
+    if      (skip_layer == 1 && !ly.is_full &&  owns_kv) { lreps = 0; }
+    else if (skip_layer == 2 &&  ly.is_full &&  owns_kv) { lreps = 0; }
+    else if (skip_layer == 3 && !ly.is_full && !owns_kv) { lreps = 0; }
+    else if (skip_layer == 4 &&  ly.is_full && !owns_kv) { lreps = 0; }
+    else if (skip_layer == 5 && !ly.is_full)             { lreps = 0; }
+    else if (skip_layer == 6 &&  ly.is_full)             { lreps = 0; }
+    else if (skip_layer == 7 && !owns_kv)                { lreps = 0; }
+    else if (skip_layer == 8 &&  owns_kv)                { lreps = 0; }
+    else if (skip_layer == 9)                            { lreps = 0; }
+    for (int lrep = 0; lrep < lreps; ++lrep) {
     const int D = ly.head_dim;
     const int Hkv = ly.n_kv;
     const int qd = Hq * D, kd = Hkv * D;
     const SharedBuffer& invf = ly.is_full ? _inv_freq_full : _inv_freq_sliding;
     const bool paged_full = ly.is_full && _full_paged;
 
-    // Attention (input_norm -> attn -> post_attn_norm -> residual).
-    DUP(DC_NORM, [&] { rms(_d_x, ly.in_ln, _d_hn, 1, H); });
-    DUP(DC_PROJ, [&] { qmv(ly.qw, ly.qs, ly.qb, _d_hn, _d_q, H, qd); });
+    // Attention (input_norm -> attn -> post_attn_norm -> residual). The
+    // input_norm RMS is fused into the QKV GEMV (qmv_qkv_rms reads _d_x
+    // directly) when QKV is fused; the standalone rms stays for the fallback
+    // and the skip_proj ablation (where QKV is removed but the norm is not).
+    const bool fuse_rms = _qkv_rms_fuse && ly.qkv_fused && !skip_proj;
+    if (!fuse_rms) {
+      DUP(DC_NORM, [&] { rms(_d_x, ly.in_ln, _d_hn, 1, H); });
+    }
+    // QKV-fused decode: one full-occupancy GEMV over the q|k|v row-concat
+    // writes q/k/v into their separate buffers (the k/v halves alone
+    // under-occupy the GPU). Falls back to the per-proj GEMV (q here, k/v
+    // below) when not fused (shared layers, non-4-bit, or disabled).
+    if (skip_proj) {
+      // projection stripped: leave _d_q/_d_k/_d_v stale (timing-only)
+    } else if (fuse_rms) {
+      DUP(DC_PROJ, [&] { qmv_qkv_rms(ly, _d_x); });
+    } else if (ly.qkv_fused) {
+      DUP(DC_PROJ, [&] { qmv_qkv(ly, _d_hn); });
+    } else {
+      DUP(DC_PROJ, [&] { qmv(ly.qw, ly.qs, ly.qb, _d_hn, _d_q, H, qd); });
+    }
     // q_norm+rope is fused with k_norm+rope below (rms_rope2) for non-reuse
     // layers; reuse layers (no k_proj) do q alone in the else branch.
 
@@ -1152,7 +1621,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       }
     }
     if (ly.kv_source < 0) {
-      DUP(DC_PROJ, [&] { qmv(ly.kw, ly.ks, ly.kb, _d_hn, _d_k, H, kd); });
+      if (!ly.qkv_fused && !skip_proj) {         // k done in the fused GEMV
+        DUP(DC_PROJ, [&] { qmv(ly.kw, ly.ks, ly.kb, _d_hn, _d_k, H, kd); });
+      }
       // values: k_eq_v full layers reuse the k_proj output (no v_proj), taking
       // v_norm of it BEFORE k is normed -> can't fold V into the q+k+v kernel
       // (it norms k in place); use rms_rope2(q,k) + a separate v_norm. The
@@ -1163,14 +1634,34 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         DUP(DC_NORM, [&] {
           rms_rope2(_d_q, ly.q_norm, _d_k, ly.k_norm, invf, Hq, Hkv, D);
         });
-      } else {
-        DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
+      }
+      // Fuse the rope3 + ring KV-write into ONE dispatch for the common
+      // sliding/ring non-k_eq_v case (k/v normed+roped straight into the
+      // cache). Paged-global and k_eq_v keep the split path below.
+      const bool fuse_rope_kv =
+          _rope_kv_fuse && !ly.k_eq_v && !paged_full;
+      if (!ly.k_eq_v && !fuse_rope_kv) {
+        if (!ly.qkv_fused && !skip_proj) {       // v done in the fused GEMV
+          DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
+        }
         DUP(DC_NORM, [&] {
           rms_rope3(_d_q, ly.q_norm, _d_k, ly.k_norm, _d_v, _ones_vnorm,
                     invf, Hq, Hkv, D);
         });
+      } else if (fuse_rope_kv) {
+        if (!ly.qkv_fused && !skip_proj) {       // v done in the fused GEMV
+          DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
+        }
+        DUP(DC_NORM, [&] {
+          const int kvw_win = ly.is_full ? 0 : c.sliding_window;
+          rms_rope3_kvwrite(_d_q, ly.q_norm, _d_k, ly.k_norm, _d_v,
+                            _ones_vnorm, invf, Hq, Hkv, D, *Kuse, *Vuse, cap,
+                            ring_cap, kvw_win);
+        });
       }
-      if (paged_full) {
+      if (fuse_rope_kv) {
+        // KV-write folded into rms_rope3_kvwrite above; nothing to do.
+      } else if (paged_full) {
         // Paged write: this token's K and V into the page slot (one dispatch
         // each -- the fused kv_write2 is contiguous-only). Kuse/Vuse are the
         // pool; bind at the page byte base + slot.
@@ -1204,6 +1695,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         const int one = 1;
         enc.set_constant(6, one);
         enc.set_constant(7, kv_off);
+        const int kvw_win = ly.is_full ? 0 : c.sliding_window;
+        enc.set_constant(8, ring_cap);     // ring modulo (0 = linear)
+        enc.set_constant(9, kvw_win);      // trailing window (mirror)
         enc.dispatch({(unsigned)D, 1, (unsigned)Hkv}, {(unsigned)D, 1, 1});
       });
       }
@@ -1223,7 +1717,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     // Profiler: attn_global / attn_slide isolate the two layer types; attn
     // doubles both. (DUP can only match one category, so this is manual.)
     const int attn_cat = ly.is_full ? DC_ATTN_GLOBAL : DC_ATTN_SLIDE;
-    const int attn_runs = (dup == attn_cat || dup == DC_ATTN) ? 2 : 1;
+    const int attn_runs = skip_attn ? 0
+                        : (dup == attn_cat || dup == DC_ATTN) ? 2 : 1;
     for (int ar = 0; ar < attn_runs; ++ar) {
       if (paged_full) {
         // Paged decode attention (n_q=1) over the shared pool + page table.
@@ -1231,9 +1726,71 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         // G q-heads, split the scan across grid.z) + merge -- the long-context
         // full-layer decode. Fallback: the scalar paged kernel (no split).
         const int G = (Hkv > 0) ? Hq / Hkv : 0;
-        const bool use_pgqa = _pgqa_attn && Hkv > 0 && (Hq % Hkv == 0)
-            && G >= 1 && G <= 16 && (D % 128 == 0) && !_d_gqa_oacc.empty();
-        if (use_pgqa) {
+        const bool use_mat = _mat_decode && Hkv > 0 && (Hq % Hkv == 0)
+            && G >= 1 && (D % 128 == 0) && !_d_dec_scores.empty()
+            && (kv_off + 1) <= _dec_tstride;
+        const bool use_pgqa = !use_mat && _pgqa_attn && Hkv > 0
+            && (Hq % Hkv == 0) && G >= 1 && G <= 16 && (D % 128 == 0)
+            && !_d_gqa_oacc.empty();
+        if (use_mat) {
+          // Materialized decode (omlx/MLX D=512 fallback): QK GEMV -> rowstat
+          // -> PV GEMV -> merge. Split the QK/PV key scan for occupancy.
+          const int scan = kv_off + 1;
+          int sp = _gtile_split;
+          if (_gtile_kps > 0) {
+            sp = (scan + _gtile_kps - 1) / _gtile_kps;
+            sp = std::max(1, std::min(sp, _gtile_split));
+          }
+          // K1: QK GEMV -> scores[Hq, Tstride].
+          enc.set_function(_fn_dec_qk);
+          enc.set_buffer(0, _d_q);
+          enc.set_buffer(1, *Kuse);
+          enc.set_buffer(2, _d_dec_scores);
+          enc.set_constant(3, one_scale);
+          enc.set_constant(4, D);
+          enc.set_constant(5, Hq);
+          enc.set_constant(6, Hkv);
+          enc.set_constant(7, kv_off);        // q_offset
+          enc.set_constant(8, page_tokens);
+          enc.set_constant(9, n_pages);
+          enc.set_buffer(10, _d_pgtab, pgtab_off);
+          enc.set_constant(11, _dec_tstride);
+          enc.set_constant(12, sp);
+          enc.dispatch({32, (unsigned)Hq, (unsigned)sp}, {32, 1, 1});
+          // K2: per-head max + sum exp.
+          enc.set_function(_fn_dec_rowstat);
+          enc.set_buffer(0, _d_dec_scores);
+          enc.set_buffer(1, _d_gqa_m);
+          enc.set_buffer(2, _d_gqa_l);
+          enc.set_constant(3, T_kv);
+          enc.set_constant(4, _dec_tstride);
+          enc.set_constant(5, Hq);
+          enc.dispatch({256, (unsigned)Hq, 1}, {256, 1, 1});
+          // K3: PV GEMV (reads K2's exp weights) -> partials[Hq, sp, D].
+          enc.set_function(_fn_dec_pv);
+          enc.set_buffer(0, _d_dec_scores);
+          enc.set_buffer(1, *Vuse);
+          enc.set_buffer(2, _d_gqa_oacc);
+          enc.set_constant(3, D);
+          enc.set_constant(4, Hq);
+          enc.set_constant(5, Hkv);
+          enc.set_constant(6, kv_off);        // q_offset
+          enc.set_constant(7, page_tokens);
+          enc.set_constant(8, n_pages);
+          enc.set_buffer(9, _d_pgtab, pgtab_off);
+          enc.set_constant(10, _dec_tstride);
+          enc.set_constant(11, sp);
+          enc.dispatch({32, (unsigned)Hq, (unsigned)sp}, {32, 1, 1});
+          // K4: sum partials / row sum -> _d_attn.
+          enc.set_function(_fn_dec_merge);
+          enc.set_buffer(0, _d_gqa_oacc);
+          enc.set_buffer(1, _d_gqa_l);
+          enc.set_buffer(2, _d_attn);
+          enc.set_constant(3, D);
+          enc.set_constant(4, sp);
+          enc.set_constant(5, Hq);
+          enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+        } else if (use_pgqa) {
           // Size the split to the scan length so a short context isn't over-
           // split (mirrors the contiguous gtile adaptation).
           const int scan = kv_off + 1;
@@ -1367,6 +1924,53 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
           sp = std::max(1, std::min(sp, _gtile_split));
         }
         const bool use_vec = gtile_vec;
+        // One-shot dump (VPIPE_GEMMA_ATTN_DUMP): confirm which kernel + sp +
+        // threadgroup count each layer type uses at decode.
+        if (std::getenv("VPIPE_GEMMA_ATTN_DUMP") && kv_off >= 256) {
+          static int dumped_gt = 0;
+          if (dumped_gt < 4) {
+            std::fprintf(stderr,
+              "[attn-dump L=%2d %s] use_gtile kernel=%s sp=%d scan=%d "
+              "grid{32,%d,%d} tg{32,%d,1} -> %d threadgroups\n",
+              L, ly.is_full ? "GLOBAL " : "sliding",
+              _gtile_staged ? "gqa_tile" : use_vec ? "gqa_vec" : "gqa_direct",
+              sp, scan, Hq, sp, Hq / Hkv, (Hq / (Hq / Hkv)) * sp);
+            ++dumped_gt;
+          }
+        }
+        // Linearized-ring read (VPIPE_GEMMA_RING_LINEAR): for the BOUNDED
+        // sliding window (window>0, ring_cap>0, vec kernel), read the trailing
+        // window as ONE contiguous physical span [phys_first, phys_first+scan).
+        // The mirror tail (window-1 slots at [ring_cap, ...)) covers the wrap, so
+        // the kernel scans linearly -- no `% ring_cap`, no wrap branch. cap (the
+        // physical head stride) already includes the mirror tail, keeping the
+        // span in-bounds (phys_first+scan <= ring_cap-1+window == cap).
+        const bool ring_lin =
+            _ring_linear && use_vec && window > 0 && ring_cap > 0;
+        if (ring_lin) {
+          const int first = std::max(0, kv_off - window + 1);
+          const int phys_first = first % ring_cap;     // span start (physical)
+          const int scan_len = scan;                   // == min(window, T_kv)
+          enc.set_function(_fn_sdpa_gqa_vec_lin);
+          enc.set_buffer(0, _d_q);
+          enc.set_buffer(1, *Kuse);
+          enc.set_buffer(2, *Vuse);
+          enc.set_buffer(3, _d_gqa_oacc);
+          enc.set_buffer(4, _d_gqa_m);
+          enc.set_buffer(5, _d_gqa_l);
+          enc.set_constant(6, one_scale);
+          enc.set_constant(7, T_kv);
+          enc.set_constant(8, D);
+          enc.set_constant(9, Hq);
+          enc.set_constant(10, Hkv);
+          enc.set_constant(11, kv_off);    // q_offset (ABI parity)
+          enc.set_constant(12, cap);       // kv_stride (physical head stride)
+          enc.set_constant(13, phys_first);
+          enc.set_constant(14, scan_len);
+          enc.set_constant(15, sp);
+          enc.dispatch({32, (unsigned)Hq, (unsigned)sp},
+                       {32, (unsigned)(Hq / Hkv), 1});
+        } else {
         enc.set_function(_gtile_staged ? _fn_sdpa_gqa_tile
                          : use_vec      ? _fn_sdpa_gqa_vec
                                         : _fn_sdpa_gqa_direct);
@@ -1390,6 +1994,7 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         // threadgroups in y, each with G simdgroups (one per q-head).
         enc.dispatch({32, (unsigned)Hq, (unsigned)sp},
                      {32, (unsigned)(Hq / Hkv), 1});
+        }
         enc.set_function(_fn_sdpa_gqa_merge);
         enc.set_buffer(0, _d_gqa_oacc);
         enc.set_buffer(1, _d_gqa_m);
@@ -1429,6 +2034,15 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         enc.set_constant(6, Hq);
         enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
       } else {
+      if (std::getenv("VPIPE_GEMMA_ATTN_DUMP") && kv_off >= 256) {
+        static int dumped_mb = 0;
+        if (dumped_mb < 4) {
+          std::fprintf(stderr, "[attn-dump L=%2d %s] sdpa_mb (NO split) "
+              "grid{%d,%d,1} -> %d threadgroups\n", L,
+              ly.is_full ? "GLOBAL " : "sliding", (int)(4096 / D), Hq, Hq);
+          ++dumped_mb;
+        }
+      }
       const unsigned bn = (unsigned)(4096 / D);   // 16@256, 8@512
       enc.set_function(_fn_sdpa_mb);
       enc.set_buffer(0, _d_q);
@@ -1449,13 +2063,16 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       }
     }
 
-    DUP(DC_PROJ, [&] { qmv(ly.ow, ly.os, ly.ob, _d_attn, _d_o, qd, H); });
+    if (!skip_proj) {
+      DUP(DC_PROJ, [&] { qmv(ly.ow, ly.os, ly.ob, _d_attn, _d_o, qd, H); });
+    }
     DUP(DC_NORM, [&] { rms_add(_d_o, ly.post_attn_ln, _d_x, 1, H); });  // += rms
 
     // MLP (geglu sandwich).
     DUP(DC_NORM, [&] { rms(_d_x, ly.pre_ffn_ln, _d_hn, 1, H); });
     // Fused gate/up GEMV + GeGLU: one dispatch over the interleaved weight
     // writes gelu(gate)*up straight to _d_act [1, ffn] (no gate/up buffers).
+    if (!skip_ffn) {
     DUP(DC_FFN, [&] {
     enc.set_function(_fn_qmv_geglu);
     enc.set_buffer(0, ly.guw);
@@ -1471,13 +2088,21 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     DUP(DC_FFN, [&] {
       qmv_fn(_fn_qmv_mlp, ly.dw, ly.ds, ly.db, _d_act, _d_mlp, c.ffn_inner, H);
     });
+    }
     DUP(DC_NORM, [&] { rms_add(_d_mlp, ly.post_ffn_ln, _d_x, 1, H); });  // += rms
 
-    if (has_ple) {
+    if (do_ple) {
       DUP(DC_PLE, [&] {
       // Per-layer-input gate: gelu(gate(x)) * pli[L] -> proj -> norm -> add.
       // The gate GEMV + geglu are FUSED (gelu*pli[L] in the GEMV write); falls
       // back to the 2-dispatch path if the fused kernel is unavailable.
+      // pli[L] lives in a per-chunk buffer when pipelined (Design A), else the
+      // single _d_pli at L*hpli.
+      const SharedBuffer& pli_buf =
+          _ple_chunk_k > 0 ? _d_pli_ch[L / _ple_chunk_k] : _d_pli;
+      const std::size_t pli_off = _ple_chunk_k > 0
+          ? (std::size_t)(L % _ple_chunk_k) * hpli * 2
+          : (std::size_t)L * hpli * 2;
       if (_fn_qmv_gelu_mul.valid()) {
         enc.set_function(_fn_qmv_gelu_mul);
         enc.set_buffer(0, ly.plg_w);
@@ -1487,11 +2112,11 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         enc.set_buffer(4, _d_plg);
         enc.set_constant(5, H);
         enc.set_constant(6, hpli);
-        enc.set_buffer(7, _d_pli, (std::size_t)L * hpli * 2);  // pli[L] vec
+        enc.set_buffer(7, pli_buf, pli_off);                  // pli[L] vec
         enc.dispatch({32, (unsigned)(hpli / 4), 1}, {32, 2, 1});
       } else {
         qmv(ly.plg_w, ly.plg_s, ly.plg_b, _d_x, _d_plg, H, hpli);
-        geglu(_d_plg, _d_pli, _d_plg, hpli, (std::size_t)L * hpli * 2);
+        geglu(_d_plg, pli_buf, _d_plg, hpli, pli_off);
       }
       // per_layer_projection plp[1,H]=plg[1,hpli]@W[H,hpli]^T. Native 4-bit
       // qmv (K=hpli=256 -> one partial block) by default; f16 path for A/B.
@@ -1520,11 +2145,14 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       // No PLE: the layer tail is just h *= layer_scalar.
       DUP(DC_MISC, [&] { scale(_d_x, H, ly.layer_scalar); });
     }
+    }   // lrep (whole-layer doubling for per-type gpu_active profiling)
   }
 
   // ---- final norm + tied quantized lm_head + softcap --------------
   // lm_head GEMV runs at embed_bits (8-bit on the GGUF path).
   DUP(DC_NORM, [&] { rms(_d_x, _final_ln, _d_hn, 1, H); });
+  const int lm_reps = skip_lmhead ? 0 : (dup_layer == 5) ? 2 : 1;
+  for (int lr = 0; lr < lm_reps; ++lr) {
   DUP(DC_LMHEAD, [&] {
     if (_embed_is_q6k) { lm_head_q6k(_d_hn, _d_logits, 0, H, c.vocab); }
     else {
@@ -1532,6 +2160,7 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
              c.vocab);
     }
   });
+  }
   if (c.final_softcap > 0.0f) {
     enc.set_function(_fn_softcap);
     enc.set_buffer(0, _d_logits);
@@ -1634,21 +2263,21 @@ MetalGemmaModel::encode_batched_step_(
   auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                  const SharedBuffer& w, const SharedBuffer& y,
                  std::size_t yoff, int R, int Hd) {
-    enc.set_function(_fn_rms);
+    enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_fast : _fn_rms);
     enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
     enc.set_buffer(2, y, yoff);
     enc.set_constant(3, Hd); enc.set_constant(4, eps);
-    enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+    enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
   };
   auto rms_add = [&](const SharedBuffer& xin, const SharedBuffer& w,
                      const SharedBuffer& res, int R, int Hd,
                      float post_scale = 1.0f) {
-    enc.set_function(_fn_rms_add);
+    enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_add_fast : _fn_rms_add);
     enc.set_buffer(0, xin); enc.set_buffer(1, w);
     enc.set_buffer(2, res); enc.set_buffer(3, res);
     enc.set_constant(4, Hd); enc.set_constant(5, eps);
     enc.set_constant(6, post_scale);
-    enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+    enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
   };
   // fn_batch is the MAXM=2 batched GEMV for this weight (qmv bandwidth,
   // weights read once across the rows); invalid when the weight is 8-bit
@@ -1802,6 +2431,7 @@ MetalGemmaModel::encode_batched_step_(
           wp(bs.kbuf, *Kuse);
           wp(bs.vbuf, *Vuse);
         } else {
+          const int kvw_win = ly.is_full ? 0 : c.sliding_window;
           auto kvw = [&](const SharedBuffer& src, std::size_t soff,
                          const SharedBuffer& cache) {
             enc.set_function(_fn_kv_write);
@@ -1809,6 +2439,8 @@ MetalGemmaModel::encode_batched_step_(
             enc.set_constant(2, cap); enc.set_constant(3, D);
             const int one = 1; enc.set_constant(4, one);
             enc.set_constant(5, kv_off);
+            enc.set_constant(6, ring_cap);      // ring modulo (0 = linear)
+            enc.set_constant(7, kvw_win);       // trailing window (mirror)
             enc.dispatch({(unsigned)D, 1, (unsigned)Hkv}, {(unsigned)D, 1, 1});
           };
           kvw(bs.kbuf, koff, *Kuse);
@@ -2123,17 +2755,57 @@ MetalGemmaModel::decode_step_fast(ContextId cid, std::int32_t token_id,
     enc.dispatch({256, 1, 1}, {256, 1, 1});
     n_disp = enc.dispatch_count();
   }
+  // FEASIBILITY PROBE (VPIPE_GEMMA_PLE_PROBE): fire ~1.1 ms of INDEPENDENT
+  // bandwidth-bound work (the PLE-projection GEMV x5) on a SECOND command
+  // stream, concurrently with the main decode. If the main's gpu_active is
+  // unchanged, a concurrent queue overlaps into the bubbles (Design B viable);
+  // if it rises ~1 ms, both compete for memory bandwidth (B is dead). Timing
+  // only -- the throwaway writes to _d_pleproj race the real PLE (tokens wrong).
+  static const bool kProbe = std::getenv("VPIPE_GEMMA_PLE_PROBE") != nullptr;
+  metal_compute::CommandStream::Fence probeFence;
+  if (kProbe && _fn_dense_gemv.valid() && !_plm_proj_w.empty()) {
+    const int ple = c.n_layers * c.hpli;
+    if (_d_probe_in.empty()) {                  // private, no sharing with main
+      _d_probe_in = _mc->make_shared_buffer((std::size_t)c.hidden * 2);
+      _d_probe_out = _mc->make_shared_buffer((std::size_t)ple * 2);
+    }
+    metal_compute::CommandStream sB = _mc->make_command_stream();
+    {
+      ComputeEncoder eb = sB.begin_compute();
+      for (int it = 0; it < 5; ++it) {
+        eb.set_function(_fn_dense_gemv);
+        eb.set_buffer(0, _d_probe_in);
+        eb.set_buffer(1, _plm_proj_w);          // read-only shared (no hazard)
+        eb.set_buffer(2, _d_probe_out);
+        eb.set_constant(3, c.hidden);
+        eb.set_constant(4, ple);
+        eb.dispatch({32, (unsigned)(ple / 4), 1}, {32, 2, 1});
+      }
+    }
+    probeFence = sB.commit();                  // fire concurrently
+  }
   const auto t1 = std::chrono::steady_clock::now();
-  stream.commit().wait();
+  auto fence = stream.commit();
+  fence.wait();
+  if (probeFence.valid()) { probeFence.wait(); }
   if (kProf) {
     const auto t2 = std::chrono::steady_clock::now();
-    static double enc_ms = 0, gpu_ms = 0; static int cnt = 0;
+    const auto gt = fence.gpu_times();         // GPU/kernel active spans (s)
+    static double enc_ms = 0, gpu_ms = 0, gpuact_ms = 0, kern_ms = 0;
+    static int cnt = 0;
     enc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     gpu_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    gpuact_ms += gt.gpu_s * 1000.0;
+    kern_ms += gt.kernel_s * 1000.0;
     if (++cnt % 32 == 0) {
-      std::fprintf(stderr, "[gemma-metal-prof] encode %.2f ms | commit+gpu "
-                   "%.2f ms | %ld dispatches/tok (%d steps)\n",
-                   enc_ms / cnt, gpu_ms / cnt, n_disp, cnt);
+      // commit+gpu = CPU wall from commit() to wait() return.
+      // gpu_active = GPUStartTime..GPUEndTime (the buffer's GPU residency,
+      // INCLUDING inter-dispatch idle bubbles). kernel = kernel exec window.
+      // (commit+gpu - gpu_active) = CPU commit/dispatch + wait-wakeup latency.
+      std::fprintf(stderr, "[gemma-metal-prof] encode %.2f | commit+gpu %.2f "
+                   "| gpu_active %.2f | kernel %.2f ms | %ld disp/tok (%d)\n",
+                   enc_ms / cnt, gpu_ms / cnt, gpuact_ms / cnt, kern_ms / cnt,
+                   n_disp, cnt);
     }
   }
   // seq_len already advanced inside encode_step_ (append / kv_append).
@@ -2438,20 +3110,21 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                    const SharedBuffer& w, const SharedBuffer& y,
                    std::size_t yoff, int R, int Hd) {
-      enc.set_function(_fn_rms);
+      enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_fast : _fn_rms);
       enc.set_buffer(0, xin, xoff);
       enc.set_buffer(1, w);
       enc.set_buffer(2, y, yoff);
       enc.set_constant(3, Hd);
       enc.set_constant(4, eps);
-      enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+      enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
     };
     // Fused sandwich-out norm + residual (+ post-scale): res = (res +
     // rms(xin,w)) * post_scale. Tail-only (single row), mirrors decode.
     auto rms_add = [&](const SharedBuffer& xin, const SharedBuffer& w,
                        const SharedBuffer& res, int R, int Hd,
                        float post_scale = 1.0f) {
-      enc.set_function(_fn_rms_add);
+      enc.set_function((_rms_fast || Hd > 4096) ? _fn_rms_add_fast
+                                                : _fn_rms_add);
       enc.set_buffer(0, xin);
       enc.set_buffer(1, w);
       enc.set_buffer(2, res);
@@ -2459,7 +3132,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       enc.set_constant(4, Hd);
       enc.set_constant(5, eps);
       enc.set_constant(6, post_scale);
-      enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+      enc.dispatch({512, (unsigned)R, 1}, {512, 1, 1});
     };
     // Fused per-head q-norm + rope (tail single row), at global pos qpos.
     auto rms_rope = [&](const SharedBuffer& xb, const SharedBuffer& w,
@@ -2601,6 +3274,26 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     };
     auto dense = [&](const SharedBuffer& xin, const SharedBuffer& w,
                      const SharedBuffer& y, int Kk, int N) {
+      // The only dense f16 GEMM in prefill (per_layer_model_projection,
+      // [rows,H] @ [n_layers*hpli,H]^T). Route it onto the matrix units on M5
+      // (K=H=2560 <= 4096 -> n128) like the quantized proj/FFN GEMMs; the steel
+      // path stays for M4 / non-matrix-core. Same NT contract, f32 accumulate.
+      static const bool kPleSteel =
+          std::getenv("VPIPE_GEMMA_PLE_STEEL") != nullptr;
+      if (_use_mma && rows >= _mma_min_m && !kPleSteel) {
+        enc.set_function(_fn_dense_mma);          // 128x128, SG=8
+        enc.set_buffer(0, xin);
+        enc.set_buffer(1, w);
+        enc.set_buffer(2, w);                     // bias slot unused
+        enc.set_buffer(3, y);
+        enc.set_constant(4, Kk);
+        enc.set_constant(5, N);
+        enc.set_constant(6, rows);
+        enc.set_constant(7, 0);
+        enc.dispatch({(unsigned)(((N + 127) / 128) * 256),
+                      (unsigned)((rows + 127) / 128), 1}, {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_dense_t);
       enc.set_buffer(0, xin);
       enc.set_buffer(1, w);
@@ -2627,14 +3320,16 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       enc.dispatch({(unsigned)Hd, (unsigned)n, 1}, {256, 1, 1});
     };
     auto kvw = [&](const SharedBuffer& src, const SharedBuffer& cache,
-                   int D, int cap, int Hkv) {
+                   int D, int cap, int Hkv, int ring_cap, int window) {
       enc.set_function(_fn_kv_write);
       enc.set_buffer(0, src);
       enc.set_buffer(1, cache);
-      enc.set_constant(2, cap);              // cache stride == ring cap
+      enc.set_constant(2, cap);              // physical head stride
       enc.set_constant(3, D);
       enc.set_constant(4, n);
       enc.set_constant(5, kv_off);
+      enc.set_constant(6, ring_cap);         // ring modulo (0 = linear)
+      enc.set_constant(7, window);           // trailing window (mirror)
       enc.dispatch({(unsigned)D, (unsigned)n, (unsigned)Hkv},
                    {(unsigned)D, 1, 1});
     };
@@ -2782,8 +3477,42 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
           wpp(kt, *Kuse);
           wpp(vt, *Vuse);
         } else {
-          kvw(kt, *Kuse, D, cap, Hkv);
-          kvw(vt, *Vuse, D, cap, Hkv);
+          const int kvw_win = ly.is_full ? 0 : c.sliding_window;
+          // Bounded-ring single-pass prefill: when the write spans MORE rows
+          // than the ring holds (kv_off+n > ring_cap), a single kv_write
+          // dispatch would map multiple source rows to the same physical slot
+          // (pos % ring_cap collisions). Those parallel writes race -> the ring
+          // contents are non-deterministic. Sub-block the write to <= page
+          // (= ring_cap - window) rows so each dispatch touches each slot at
+          // most once; the last sub-block leaves the correct trailing window.
+          const bool wrap_write = ring_cap > 0
+              && (kv_off + n > ring_cap) && _fn_kv_write_sub.valid();
+          if (wrap_write) {
+            const int page = std::max(1, ring_cap - kvw_win);
+            auto kvw_sub = [&](const SharedBuffer& src,
+                               const SharedBuffer& cache) {
+              for (int s0 = 0; s0 < n; s0 += page) {
+                const int cnt = std::min(page, n - s0);
+                enc.set_function(_fn_kv_write_sub);
+                enc.set_buffer(0, src);
+                enc.set_buffer(1, cache);
+                enc.set_constant(2, cap);            // physical head stride
+                enc.set_constant(3, D);
+                enc.set_constant(4, n);              // source head stride
+                enc.set_constant(5, kv_off);         // base position
+                enc.set_constant(6, ring_cap);       // ring modulo
+                enc.set_constant(7, kvw_win);        // window (mirror)
+                enc.set_constant(8, s0);             // source start row
+                enc.dispatch({(unsigned)D, (unsigned)cnt, (unsigned)Hkv},
+                             {(unsigned)D, 1, 1});
+              }
+            };
+            kvw_sub(kt, *Kuse);
+            kvw_sub(vt, *Vuse);
+          } else {
+            kvw(kt, *Kuse, D, cap, Hkv, ring_cap, kvw_win);
+            kvw(vt, *Vuse, D, cap, Hkv, ring_cap, kvw_win);
+          }
         }
       }
 
@@ -2819,6 +3548,121 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       const bool skip_attn =
           kSkipMode == 1 || (kSkipMode == 2 && ly.is_full)
           || (kSkipMode == 3 && !ly.is_full);
+
+      // Causal-tiled dense GEMM available (skip strictly-upper-triangle work,
+      // and the below-window region for sliding). Default ON when both entry
+      // points are loaded; opt out with VPIPE_GEMMA_MAT_CAUSAL=0.
+      static const bool kMatCausal = [] {
+        const char* e = std::getenv("VPIPE_GEMMA_MAT_CAUSAL");
+        return !(e && std::atoi(e) == 0);
+      }();
+      // MATERIALIZED attention (steel GEMM Q.K^T -> windowed causal softmax ->
+      // P.V), the MLX head_dim-512 fallback shape, extended to BANDED for the
+      // sliding layers. window_mat=0 -> pure causal (global); window_mat>0 ->
+      // the Gemma-4 trailing band. Single-chunk only (qpos==0): kt/vt hold the
+      // full [Hkv,T_kv,D] chunk so they ARE the whole prefix (T_kv==rows).
+      // Reads qt/kt/vt, writes at. Token-exact with the flash/pflash path.
+      auto materialized_attn = [&](int window_mat) {
+        auto off = [](std::size_t e) { return e * sizeof(uint16_t); };
+        const bool use_causal = kMatCausal && _fn_dense_t_qkcausal.valid()
+            && _fn_dense_t_pvcausal.valid();
+        // Steel dense_t(x[M,K], W[N,K]) = x @ W^T -> y[M,N]; M == rows.
+        auto dense_g = [&](const metal_compute::ComputeFunction& fn,
+                           const SharedBuffer& xin, std::size_t xoff,
+                           const SharedBuffer& w, std::size_t woff,
+                           const SharedBuffer& y, std::size_t yoff,
+                           int Kk, int Nn) {
+          enc.set_function(fn);
+          enc.set_buffer(0, xin, off(xoff));
+          enc.set_buffer(1, w, off(woff));
+          enc.set_buffer(2, w, off(woff));
+          enc.set_buffer(3, y, off(yoff));
+          enc.set_constant(4, Kk);
+          enc.set_constant(5, Nn);
+          enc.set_constant(6, rows);
+          const int hb = 0;
+          enc.set_constant(7, hb);
+          enc.set_constant(8, qpos);          // q_offset (causal variants)
+          enc.set_constant(9, window_mat);    // trailing window (banded)
+          enc.dispatch({(unsigned)(((Nn + 31) / 32) * 32),
+                        (unsigned)(((rows + 31) / 32) * 2), 2}, {32, 2, 2});
+        };
+        // Matrix-core (M5) materialized QK: causal-tiled matmul2d (the
+        // diagonal-grid skip on the matrix units). Only QK moves to the matrix
+        // units; the softmax stays banded and PV stays steel-causal (K-capped) --
+        // a full-K matmul2d PV loses at 16k (2x FLOPs) where PV dominates, and
+        // the matmul2d causal K-cap would force a tiny BM that starves the matrix
+        // units. The QK tile-skip (128-wide) writes a SUPERSET of the softmax/PV
+        // 32-row band, so the banded consumers read only written keys.
+        const bool use_mat_mma = _mat_mma;
+        auto dense_mma_qk = [&](const SharedBuffer& xin, std::size_t xoff,
+                                const SharedBuffer& w, std::size_t woff,
+                                const SharedBuffer& y, int Kk, int Nn) {
+          enc.set_function(_fn_dense_mma_qkcausal);    // 128x128, SG=8
+          enc.set_buffer(0, xin, off(xoff));
+          enc.set_buffer(1, w, off(woff));
+          enc.set_buffer(2, w, off(woff));             // bias slot unused
+          enc.set_buffer(3, y);
+          enc.set_constant(4, Kk);                     // K = D
+          enc.set_constant(5, Nn);                     // N = T_kv
+          enc.set_constant(6, rows);                   // M
+          enc.set_constant(7, 0);                      // has_bias
+          enc.set_constant(8, qpos);                   // q_offset
+          enc.set_constant(9, window_mat);             // trailing window
+          enc.dispatch({(unsigned)(((Nn + 127) / 128) * 256),
+                        (unsigned)((rows + 127) / 128), 1}, {256, 1, 1});
+        };
+        // V transpose per kv-head: vt[kvh] [T_kv,D] -> _d_vT[kvh] [D,T_kv].
+        for (int kvh = 0; kvh < Hkv; ++kvh) {
+          enc.set_function(_fn_transpose);
+          enc.set_buffer(0, vt, off((std::size_t)kvh * T_kv * D));
+          enc.set_buffer(1, _d_vT, off((std::size_t)kvh * D * T_kv));
+          enc.set_constant(2, T_kv);          // A
+          enc.set_constant(3, D);             // Bd
+          const int one = 1;
+          enc.set_constant(4, one);           // D (last dim)
+          // 256-thread groups (32 along Bd for coalesced in[a*D+b] reads) --
+          // the old {1,1,1} launched D*T_kv single-thread groups (8.4M @16k).
+          enc.dispatch({1u, (unsigned)D, (unsigned)T_kv}, {1u, 32u, 8u});
+        }
+        const int Gq = Hq / Hkv;
+        for (int h = 0; h < Hq; ++h) {
+          const int kvh = h / Gq;
+          // QK^T: scores[rows,T_kv] = Qh[rows,D] @ Kkvh[T_kv,D]^T. Causal/
+          // banded variant skips the tiles softmax would mask away.
+          if (use_mat_mma) {
+            dense_mma_qk(qt, (std::size_t)h * rows * D,
+                         kt, (std::size_t)kvh * T_kv * D,
+                         _d_scores, /*Kk=*/D, /*Nn=*/T_kv);
+          } else {
+            dense_g(use_causal ? _fn_dense_t_qkcausal : _fn_dense_t,
+                    qt, (std::size_t)h * rows * D,
+                    kt, (std::size_t)kvh * T_kv * D,
+                    _d_scores, 0, /*Kk=*/D, /*Nn=*/T_kv);
+          }
+          // windowed causal softmax in place on scores[rows,T_kv].
+          enc.set_function(_fn_causal_softmax);
+          enc.set_buffer(0, _d_scores);
+          enc.set_constant(1, rows);          // M
+          enc.set_constant(2, T_kv);          // N
+          enc.set_constant(3, qpos);          // q_offset
+          enc.set_constant(4, one_scale);
+          enc.set_constant(5, window_mat);    // trailing window
+          const int banded = use_causal ? 1 : 0;
+          enc.set_constant(6, banded);        // band-limit to PV's [k0,Kc)
+          enc.dispatch({256u, (unsigned)rows, 1u}, {256u, 1, 1});
+          // PV: O_h[rows,D] = P[rows,T_kv] @ V_T[D,T_kv]^T. Steel banded variant
+          // contracts only the in-band keys.
+          dense_g(use_causal ? _fn_dense_t_pvcausal : _fn_dense_t,
+                  _d_scores, 0,
+                  _d_vT, (std::size_t)kvh * D * T_kv,
+                  at, (std::size_t)h * rows * D, /*Kk=*/T_kv, /*Nn=*/D);
+        }
+      };
+      // Eligibility: single-chunk prefill, scores fit the scratch cap.
+      const bool mat_ok = rows > 1 && _materialized_global && qpos == 0
+          && T_kv <= _scores_cap && _fn_causal_softmax.valid();
+
       if (skip_attn) {
         // intentionally no SDPA dispatch (probe)
       } else if (paged_full) {
@@ -2827,7 +3671,12 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // matrix-core GPU (M4), the simdgroup_matrix paged flash; only the
         // shared-KV tail (n_q=1) falls to the scalar paged kernel (q3/qt match
         // the q[Hq,n_q,D] layout all three read).
-        if (rows > 1 && _pmma2_attn) {
+        if (mat_ok && ly.is_full && D == 512) {
+          // MATERIALIZED global prefill (window=0: pure causal). _full_paged
+          // still wrote K/V to the pool above (for later decode); we attend
+          // over the chunk-local kt/vt, which ARE the whole prefix at qpos==0.
+          materialized_attn(/*window=*/0);
+        } else if (rows > 1 && _pmma2_attn) {
           enc.set_function(_fn_sdpa_pmma2);
           enc.set_buffer(0, *qsrc);
           enc.set_buffer(1, *Kuse);
@@ -2937,7 +3786,20 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
             && (kv_off + n + 64 <= cap);     // no-wrap + C=64 over-read slack
         const bool dev_ok = contig && sdpa_mode != 2
             && _fn_sdpa_mma_dev.valid() && (kv_off + n + 32 <= cap);
-        if (mma2_ok) {
+        // Materialized BANDED sliding prefill (head_dim 256): steel GEMM runs
+        // far above the simdgroup flash on M4 (no matrix cores). Reads the
+        // chunk-local kt/vt (qpos==0 single chunk), so it is independent of the
+        // ring cap/wrap. Default ON; VPIPE_GEMMA_MAT_SLIDING=0 reverts to flash.
+        // _mat_sliding is the construction-time member (prefill()'s bounded
+        // single-pass path keys off the SAME value so it never routes sliding
+        // to a wrapped-ring read when the materialized path is off).
+        const bool kMatSliding = _mat_sliding;
+        const bool mat_sliding = kMatSliding && mat_ok && window > 0
+            && D == 256 && _fn_dense_t_qkcausal.valid()
+            && _fn_dense_t_pvcausal.valid();
+        if (mat_sliding) {
+          materialized_attn(window);
+        } else if (mma2_ok) {
           enc.set_function(_fn_sdpa_mma2);
           enc.set_buffer(0, qt);
           enc.set_buffer(1, *Kuse);
@@ -3214,6 +4076,20 @@ MetalGemmaModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
   // grown ring's extra memory is only paid by the long-prompt context itself.
   if (_sliding_grow && wraps && kv_off == 0 && n <= _cfg.max_seq && cm.valid()
       && _ctx->ensure_sliding_capacity(cm, n)) {
+    wraps = false;
+  }
+  // Bounded-ring single-pass prefill: when the ring stays bounded but the
+  // materialized (kt/vt-reading) sliding attention can cover the whole prompt,
+  // run ONE forward over the full batch. The sliding ATTENTION then reads the
+  // full-batch K/V scratch (ring-independent, mat_sliding), so the wrap that
+  // would corrupt a ring read never happens; only the sliding KV-WRITE touches
+  // the bounded ring, and a single full write leaves the correct trailing
+  // window resident (the last `ring` logical positions are never clobbered).
+  // Eligible only on a fresh context (qpos==0, so mat_ok holds) and when the
+  // prompt fits the materialized score cap (T_kv == n <= _scores_cap).
+  if (wraps && _prefill_subblock && _mat_sliding && _materialized_global
+      && kv_off == 0 && n <= _scores_cap && _fn_dense_t_qkcausal.valid()
+      && _fn_dense_t_pvcausal.valid()) {
     wraps = false;
   }
   if (!wraps) {

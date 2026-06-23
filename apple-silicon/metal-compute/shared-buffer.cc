@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <utility>
 
 namespace vpipe::metal_compute {
@@ -43,10 +44,26 @@ SharedBuffer::wrap(MTL::Buffer* buf, void* contents,
   return SharedBuffer{buf, c, byte_size};
 }
 
+SharedBuffer
+SharedBuffer::subview(std::size_t offset, std::size_t size) const noexcept
+{
+  if (_buf == nullptr || size == 0) {
+    return SharedBuffer{};
+  }
+  _buf->retain();                          // the subview holds its own ref
+  SharedBuffer sv{_buf,
+                  static_cast<void*>(
+                      static_cast<std::uint8_t*>(_contents) + offset),
+                  size};
+  sv._base_off = _base_off + offset;       // composes with this view's offset
+  return sv;
+}
+
 SharedBuffer::SharedBuffer(SharedBuffer&& o) noexcept
   : _buf(std::exchange(o._buf, nullptr)),
     _contents(std::exchange(o._contents, nullptr)),
     _byte_size(std::exchange(o._byte_size, 0)),
+    _base_off(std::exchange(o._base_off, 0)),
     _view(o._view),
     _wired(std::exchange(o._wired, false))
 {
@@ -63,6 +80,7 @@ SharedBuffer::operator=(SharedBuffer&& o) noexcept
   _buf       = std::exchange(o._buf, nullptr);
   _contents  = std::exchange(o._contents, nullptr);
   _byte_size = std::exchange(o._byte_size, 0);
+  _base_off  = std::exchange(o._base_off, 0);
   _view      = o._view;
   _wired     = std::exchange(o._wired, false);
   o._view    = {};
@@ -95,6 +113,7 @@ SharedBuffer::teardown_() noexcept
   }
   _contents  = nullptr;
   _byte_size = 0;
+  _base_off  = 0;
 }
 
 bool

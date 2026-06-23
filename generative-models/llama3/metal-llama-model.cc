@@ -60,7 +60,11 @@ MetalLlamaModel::load(const std::string& model_dir,
   m->_fn_qmm = m->_lib_qmm.function("affine_qmm_steel_w4g64");
   m->_fn_qmm_swiglu = m->_lib_qmm.function("affine_qmm_swiglu_w4g64");
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
-  m->_fn_rms = m->_lib_rms.function("rms_norm_f16");
+  // simd_sum RMSNorm (dispatched at 256). The gemma-introduced tree
+  // rms_norm_f16 (f1ab287) strides by a fixed 512 -> silently wrong at 256;
+  // rms_norm_fast_f16 is the threadgroup-size-agnostic simd_sum (== pre-f1ab287
+  // behavior, no RMS_PAD cap). See gpu-kernels/metal/ops/rms_norm.metal.
+  m->_fn_rms = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
   m->_fn_embed = m->_lib_elt.function("dequant_embed_gather_f16");
   m->_fn_argmax = m->_lib_elt.function("argmax_f16");

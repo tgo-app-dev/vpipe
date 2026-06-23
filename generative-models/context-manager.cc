@@ -205,13 +205,47 @@ struct ContextManager::Impl {
     return c_cap[(size_t)layer];
   }
 
+  // Mirror-tail slots appended to a BOUNDED sliding ring so the decode
+  // attention can read its trailing window as ONE contiguous physical span
+  // (no `% ring_cap` wrap). The ring modulo stays ctx_cap_; the physical head
+  // stride is ctx_cap_ + (window-1). Every ring write that lands in the first
+  // (window-1) slots is mirrored into [ring_cap, ring_cap+window-1) so the tail
+  // is a live duplicate of the ring head; a window-length scan that crosses the
+  // ring end then reads straight into the mirror instead of wrapping. The tail
+  // is allocated UNCONDITIONALLY (harmless to the modulo read path -- it just
+  // never reads the extra slots); only the flag-gated linear READ uses it.
+  // 0 for Full/Linear layers and for a sliding ring grown to max_seq (then
+  // ring_cap == 0, addressing is already linear -- no mirror needed).
+  int
+  mirror_tail_(const Context& c, int layer) const noexcept
+  {
+    if (c_kind[(size_t)layer] != LayerKind::Sliding) {
+      return 0;
+    }
+    const int win = !c_win.empty() ? c_win[(size_t)layer] : 0;
+    const int cap = ctx_cap_(c, layer);
+    if (win <= 1 || cap >= spec.max_seq) {
+      return 0;                              // unbounded ring -> linear already
+    }
+    return win - 1;
+  }
+
+  // Physical head stride (token slots per K/V head) for context `c`: the ring
+  // modulo plus the mirror tail. This is the stride the kernels address with;
+  // the ring modulo (ctx_cap_) is passed separately to the write/read kernels.
+  int
+  ctx_stride_(const Context& c, int layer) const noexcept
+  {
+    return ctx_cap_(c, layer) + mirror_tail_(c, layer);
+  }
+
   // Bytes of one contiguous K (or V) buffer for an owning layer of context `c`
-  // (honors a grown sliding ring).
+  // (honors a grown sliding ring + the mirror tail).
   size_t
   contig_bytes_(const Context& c, int layer) const noexcept
   {
     const int nkv = !c_nkv.empty() ? c_nkv[(size_t)layer] : spec.n_kv_heads;
-    return (size_t)nkv * (size_t)ctx_cap_(c, layer)
+    return (size_t)nkv * (size_t)ctx_stride_(c, layer)
            * (size_t)c_hd[(size_t)layer] * 2;
   }
 
@@ -1280,6 +1314,34 @@ ContextManager::conv_write(ContextId id, int layer) const
   return _impl->gdn_conv_slot_(ctx, layer, wslot);
 }
 
+const metal_compute::SharedBuffer*
+ContextManager::ssm_slot(ContextId id, int layer, int k) const
+{
+  lock_guard<mutex> lk(_impl->mu);
+  if (!_impl->is_linear_(layer)) { return nullptr; }
+  const auto* ctx = _impl->find_locked_(id);
+  if (!ctx || static_cast<size_t>(layer) >= ctx->m_ssm_state.size()) {
+    return nullptr;
+  }
+  const int R = ctx->gdn_ring_R;
+  const int s = (R > 1) ? ((ctx->gdn_cur + k) % R + R) % R : 0;
+  return _impl->gdn_ssm_slot_(ctx, layer, s);
+}
+
+const metal_compute::SharedBuffer*
+ContextManager::conv_slot(ContextId id, int layer, int k) const
+{
+  lock_guard<mutex> lk(_impl->mu);
+  if (!_impl->is_linear_(layer)) { return nullptr; }
+  const auto* ctx = _impl->find_locked_(id);
+  if (!ctx || static_cast<size_t>(layer) >= ctx->m_conv_state.size()) {
+    return nullptr;
+  }
+  const int R = ctx->gdn_ring_R;
+  const int s = (R > 1) ? ((ctx->gdn_cur + k) % R + R) % R : 0;
+  return _impl->gdn_conv_slot_(ctx, layer, s);
+}
+
 bool
 ContextManager::gdn_ring_begin(ContextId id, int depth)
 {
@@ -1533,7 +1595,10 @@ ContextManager::kv_capacity(ContextId id, int layer) const
     return 0;
   }
   const auto* ctx = _impl->find_locked_(id);
-  return ctx ? _impl->ctx_cap_(*ctx, layer) : _impl->c_cap[(size_t)layer];
+  // The PHYSICAL head stride (ring modulo + mirror tail). The ring modulo is
+  // reported separately by kv_ring_cap; the read/write kernels address with
+  // this stride and wrap by the modulo (or, flag-on, read the mirror linearly).
+  return ctx ? _impl->ctx_stride_(*ctx, layer) : _impl->c_cap[(size_t)layer];
 }
 
 int
@@ -1594,7 +1659,12 @@ ContextManager::ensure_sliding_capacity(ContextId id, int need)
     }
     const int nkv = !_impl->c_nkv.empty() ? _impl->c_nkv[(size_t)L]
                                           : _impl->spec.n_kv_heads;
-    const size_t n = (size_t)nkv * (size_t)want
+    // Physical stride = grown ring modulo + mirror tail. The tail is dropped
+    // once the ring reaches max_seq (then ring_cap == 0 -> linear, no mirror).
+    const int win = !_impl->c_win.empty() ? _impl->c_win[(size_t)L] : 0;
+    const int tail =
+        (win > 1 && want < _impl->spec.max_seq) ? (win - 1) : 0;
+    const size_t n = (size_t)nkv * (size_t)(want + tail)
                      * (size_t)_impl->c_hd[(size_t)L] * 2;
     auto k = _impl->mc->make_shared_buffer(n);
     auto v = _impl->mc->make_shared_buffer(n);

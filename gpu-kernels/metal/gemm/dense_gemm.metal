@@ -105,12 +105,26 @@ struct BiasAddEpilogue {
   }
 };
 
+// CAUSAL: 0 = dense (default). 1 = QK (scores[query,key]): skip a whole tile
+// when its smallest key column (y_col) is above the block's largest query
+// (q_offset+y_row+BM-1) -- those columns are masked away by the downstream
+// causal softmax, so the never-written output is never read. 2 = PV
+// (out[query,D], contraction over keys): P[r,j]=0 for keys j>q_offset+r, so
+// cap the K-loop at the block's last query (rounded up to BK). Both halve the
+// strictly-upper-triangle work the materialized global path otherwise wastes.
+//
+// window > 0 adds the TRAILING-window lower bound (Gemma-4 sliding layers):
+// query q attends keys [q_offset+q-window+1, q_offset+q]. QK also skips tiles
+// fully BELOW the window; PV also starts the contraction at the band's lowest
+// key (rounded down to BK). With window <= 0 the band has no lower bound (pure
+// causal == the global path). Net: O(n*window) banded work, not O(n^2).
 template <
     typename T,
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    const int CAUSAL = 0>
 METAL_FUNC void dense_gemm_t_impl(
     const device T* x,
     const device T* W,
@@ -122,6 +136,8 @@ METAL_FUNC void dense_gemm_t_impl(
     const constant int& N,
     const constant int& M,
     const constant int& has_bias,
+    const int q_offset,
+    const int window,
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid) {
@@ -140,60 +156,65 @@ METAL_FUNC void dense_gemm_t_impl(
 
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
+  if (CAUSAL == 1) {
+    // Above the causal diagonal: smallest key (y_col) past largest query.
+    if (y_col > q_offset + y_row + BM - 1) { return; }
+    // Below the trailing window: largest key (y_col+BN-1) before the smallest
+    // row's window start (q_offset+y_row-window+1).
+    if (window > 0 && y_col + BN - 1 < q_offset + y_row - window + 1) {
+      return;
+    }
+  }
+  // PV (CAUSAL==2): only keys in [k0, Kc) can be nonzero for this row block.
+  int Kc = K;
+  int k0 = 0;
+  if (CAUSAL == 2) {
+    const int kmax = q_offset + y_row + BM;       // exclusive last key + 1
+    Kc = (kmax < K) ? ((kmax + BK - 1) / BK) * BK : K;
+    if (window > 0) {
+      // Smallest valid key over the block's rows (row y_row), rounded DOWN to
+      // a BK tile boundary. Keys below contribute 0 (softmax masked them).
+      const int lo = q_offset + y_row - window + 1;
+      k0 = (lo > 0) ? (lo / BK) * BK : 0;
+    }
+  }
   x += y_row * static_cast<int64_t>(K);
   W += y_col * static_cast<int64_t>(K);
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
-  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(W, K, Ws, simd_gid, simd_lid);
+  loader_x_t loader_x(x + k0, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(W + k0, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
-  if (num_els < BM) {
-    if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_safe(short2(BK, num_els));
-        loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
+  // Single loop with per-iteration K-tail masking. The original four-branch
+  // form passed BK as the load's K-extent unconditionally -- correct ONLY when
+  // K % BK == 0 (the comment above documents that assumption). For K not a
+  // multiple of BK (e.g. the materialized-attention PV, K = T_kv) the final
+  // block's tail columns [K%BK, BK) are invalid; load_unsafe / load_safe(BK,..)
+  // read them anyway, spilling into the next packed row (next score row / next
+  // kv-head's V^T) -> garbage. Clamp the K-extent to (K - k) on the tail block
+  // so the loader zero-pads it. For K % BK == 0, kt == BK every block, so this
+  // is byte-identical to the old fast path (load_unsafe on full tiles).
+  const bool n_tail = !aligned_N && num_outs < BN;
+  for (int k = k0; k < Kc; k += BK) {
+    const short kt = (K - k) < BK ? (short)(K - k) : (short)BK;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (num_els < BM || kt < BK) {
+      loader_x.load_safe(short2(kt, num_els));
     } else {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_safe(short2(BK, num_els));
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
+      loader_x.load_unsafe();
     }
-  } else {
-    if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_unsafe();
-        loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
+    if (n_tail || kt < BK) {
+      loader_w.load_safe(short2(kt, num_outs));
     } else {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        loader_x.load_unsafe();
-        loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-      }
+      loader_w.load_unsafe();
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
   }
 
   // Fold bias into the f32 accumulator as a [1, N] row broadcast (ldc=0,
@@ -233,7 +254,63 @@ kernel void dense_gemm_t_f16(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN>(
-      x, W, bias, y, Xs, Ws, K, N, M, has_bias, tid, simd_gid, simd_lid);
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid);
+}
+
+// Causal/banded QK (scores = Q @ K^T): skips score tiles above the causal
+// diagonal and (window>0) below the trailing window. q_offset is the query's
+// absolute start (kv_off); has_bias unused (pass 0). window<=0 = pure causal
+// (global); window>0 = Gemma-4 sliding band. Materialized-attention prefill.
+kernel void dense_gemm_t_qkcausal_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    const constant int& q_offset [[buffer(8)]],
+    const constant int& window   [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/1>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, q_offset, window, tid, simd_gid,
+      simd_lid);
+}
+
+// Causal/banded PV (out = P @ V^T, V_T row-major [D, T_kv]): contracts only
+// keys in [k0, Kc) -- caps at the row block's last query, and (window>0)
+// starts at the band's lowest key, since softmax zeroed P outside the band.
+kernel void dense_gemm_t_pvcausal_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    const constant int& q_offset [[buffer(8)]],
+    const constant int& window   [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/2>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, q_offset, window, tid, simd_gid,
+      simd_lid);
 }
 
 // ----------------------------------------------------------------------

@@ -84,6 +84,15 @@ public:
     // Non-blocking poll. Returns true iff status() == Completed.
     bool completed() const noexcept;
 
+    // GPU execution window of this command buffer, in seconds. `gpu_s` is
+    // Metal's GPUStartTime..GPUEndTime (schedule+execute), `kernel_s` is
+    // kernelStartTime..kernelEndTime (kernel execution only). Valid only
+    // after the buffer completes; {0,0} on an empty Fence. Diagnostic use:
+    // compare against the CPU commit..wait wall time to split GPU-active
+    // from CPU/scheduling overhead.
+    struct GpuTimes { double gpu_s; double kernel_s; };
+    GpuTimes gpu_times() const noexcept;
+
     MTL::CommandBuffer* mtl_command_buffer() const noexcept
     {
       return _cb;

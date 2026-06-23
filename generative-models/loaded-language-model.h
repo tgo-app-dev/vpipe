@@ -403,6 +403,13 @@ public:
   // the normal next_token / pdecode loop.
   bool mtp_available() const;
 
+  // Seed the MTP drafter's KV with the prompt at decode start (a prefill- vs
+  // decode-throughput tradeoff: higher draft acceptance for a small extra
+  // prefill cost). Off by default; a stage enables it (e.g. text-chat) or
+  // leaves it off (realtime-vqa). No-op on backends without a metal MTP head.
+  // Set once after load, before prefill.
+  void set_mtp_prefix_seed(bool on);
+
   // Speculative decode via the MTP head: token-exact vs the serial decode, but
   // the drafter lets the verifier accept multiple tokens per forward.
   // `first_token` is the prefill's already-decided first token on `ctx` (not

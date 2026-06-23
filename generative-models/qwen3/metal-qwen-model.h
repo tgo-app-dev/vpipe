@@ -381,11 +381,39 @@ public:
                   long* accepted_out = nullptr, long* rounds_out = nullptr,
                   const MtpDecodeCtl& ctl = {});
 
+  // Teacher-forced MTP depth-1 draft accuracy on a FIXED token sequence (a
+  // diagnostic to size MTP draft quality vs a reference WITHOUT the free-run
+  // stream-divergence confound). `cont` is walked verbatim through the base
+  // model on `cid` (already prefilled with the prefix); at each position i the
+  // MTP head is conditioned on the TRUE next token cont[i+1] and its draft is
+  // checked against cont[i+2]. `chunk` is the per-verify width (2 mirrors the
+  // depth-1 decode's MTP attention window). Prints + returns the hit/total.
+  bool mtp_teacher_force(ContextId cid, const std::vector<std::int32_t>& cont,
+                         int chunk, long* d1_hits, long* d1_total);
+
   // Toggle the shared-prefix batched decode attention at runtime (default set
   // at load from VPIPE_QWEN_SHARED_ATTN + kernel availability). For A/B tests
   // and benchmarks that compare the shared-prefix path against per-branch.
   void set_shared_attn(bool on) noexcept { _shared_attn = on; }
+  // Leviathan-Chen rejection sampling (with residual correction) for the MTP
+  // verify, instead of the default deterministic-seed exact-match acceptance.
+  // Opt-in: it raises SAMPLING (temp>0) acceptance but is NOT token-exact vs
+  // the serial sampler. Depth-1 + pure-temperature only (else falls back).
+  void set_leviathan(bool on) noexcept { _leviathan = on; }
+  bool leviathan() const noexcept { return _leviathan; }
+  // Run the L-C nucleus + accept/residual on the GPU (lc_sample / lc_accept)
+  // instead of the host CPU grind. Opt-in (also VPIPE_MTP_GPU_LC); no-op unless
+  // leviathan() is on.
+  void set_lc_gpu(bool on) noexcept { _lc_gpu = on; }
+  bool lc_gpu() const noexcept { return _lc_gpu; }
   bool shared_attn() const noexcept { return _shared_attn; }
+  // MTP prefix seed (decode- vs prefill-throughput tradeoff): when on,
+  // prefill() captures the per-position post-norm hiddens + ids so mtp_decode
+  // can seed the drafter's KV with the prompt (higher draft acceptance, small
+  // extra prefill cost). DEFAULT OFF -- a stage opts in (text-chat) or leaves
+  // it off (realtime-vqa). VPIPE_MTP_NO_SEED hard-disables regardless.
+  void set_mtp_prefix_seed(bool on) noexcept { _mtp_seed_enabled = on; }
+  bool mtp_prefix_seed() const noexcept { return _mtp_seed_enabled; }
 
   // M5 matrix-core fast-path engagement -- for perf-GUARD tests, NOT timing.
   // A silent fallback off these paths (a broken kernel load, or a gate
@@ -405,6 +433,8 @@ public:
   // Mixed-precision affine (OptiQ) de-fused per-tensor path engaged (some
   // 4-bit, some 8-bit linears). For the token-exact OptiQ guard test.
   bool uses_mixed_precision() const noexcept { return _mixed; }
+  // Native k-quant (GGUF) path engaged (per-tensor q4_K/q5_K/q6_K blocks).
+  bool uses_kquant() const noexcept { return _kquant; }
 
 private:
   MetalQwenModel() = default;
@@ -486,13 +516,21 @@ private:
   // return_hidden (MOSS-TTS): skip lm_head; final-norm the last position
   // into *hidden_out (a moved-out [n*hidden] f16 SharedBuffer, last row at
   // [0:hidden]) and return empty. Mutually exclusive with verify_all.
+  // allhidden_out (MTP prefix seed): in the normal prefill path (no verify_all,
+  // no return_hidden), ALSO final-norm ALL n positions into a moved-out [n,H]
+  // f16 SharedBuffer -- the per-position post-norm hiddens the MTP drafter
+  // conditions on. The normal logit return is unaffected. Only the mixed /
+  // k-quant paths (the MTP-capable ones) compute the full last-layer residual
+  // for every position, so the capture is valid exactly where an MTP head can
+  // consume it.
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,
       const metal_compute::SharedBuffer* mrope_sin,
       bool verify_all = false, std::vector<std::int32_t>* preds_out = nullptr,
       bool return_hidden = false,
-      metal_compute::SharedBuffer* hidden_out = nullptr);
+      metal_compute::SharedBuffer* hidden_out = nullptr,
+      metal_compute::SharedBuffer* allhidden_out = nullptr);
 
   // ---- Batched (N-branch parallel) decode --------------------------
   // VQA fanout: N branched contexts that share a prefix each decode one
@@ -506,6 +544,7 @@ private:
     int n = 0;                                   // batch size it was sized for
     metal_compute::SharedBuffer x, hn, qfull, q3, gate3, kbuf, vbuf, at, ao,
         mixqkv, zbuf, abuf, bbuf, convout, gbuf, betabuf, ygdn, normout, sg,
+        upb,   // mixed-precision MLP: de-fused up_proj (gate -> sg, up -> upb)
         logits;
     metal_compute::SharedBuffer pgt;             // [N * max_pages * 3] int32
     metal_compute::SharedBuffer tok_in;          // [N] int32 (embed gather in)
@@ -677,6 +716,7 @@ private:
       // Loaded only when _mixed so a tensor at either bit width dispatches its
       // matching kernel (the 4-bit set above + these). _fn_dequant (w4) shared.
       _fn_qmv8, _fn_qmv8_add, _fn_qmm8, _fn_dequant8, _fn_qmv8_batch,
+      _fn_requant_w8w4,
       _fn_transpose,
       _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rms_rope,
       _fn_mul_sigmoid,
@@ -696,18 +736,29 @@ private:
       _fn_gdn_qk_norm, _fn_gdn_gated_rms,
       // batched-decode GEMV (4-bit, MAXM=2; N>2 tiles along grid.z)
       _fn_qmv_batch, _fn_qmv_batch_swiglu,
+      // MAXM=4 twins: the MTP verify at draft depth>=2 (n=3..4) reads each
+      // weight ONCE instead of the MAXM=2 form's 2 grid.z tiles (the depth-2
+      // cliff). Bit-identical per row; gated to the verify path (see _qmv4_*).
+      _fn_qmv_batch4, _fn_qmv8_batch4, _fn_qmv_batch4_swiglu,
       // Matrix-core prefill: 4-bit -> dense expand + dense matmul2d GEMM,
       // the interleaved-gate/up SwiGLU combine for the matrix-core MLP, and
       // the matrix-core flash attention (head_dim 256, drop-in for qtile).
       _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_swiglu_inter,
       _fn_sdpa_mma,
       _fn_embed, _fn_argmax, _fn_sample,   // pipelined-decode kernels
+      // On-GPU Leviathan-Chen MTP correction (lc_sample / lc_accept): the
+      // nucleus + accept/residual that the host L-C path used to grind over the
+      // full vocab on the CPU, done one-threadgroup-per-row on the GPU.
+      _fn_lc_sample, _fn_lc_accept, _fn_lc_sample_batch,
       // Native k-quant (GGUF): per-family qmv (decode) + dequant-to-f16
       // (prefill) + plain dense f16 GEMV/GEMM + q6_K embed gather/lm_head.
       _fn_qmv_q4k, _fn_qmv_q5k, _fn_qmv_q6k, _fn_embed_q6k,
       // Batched k-quant GEMV (compile-time MAXM=2, weight read once across the
       // 2-row tile, grid.z tiles larger M): the MTP verify's weight-bound matmul.
       _fn_qmv_q4k_batch, _fn_qmv_q5k_batch, _fn_qmv_q6k_batch,
+      // MAXM=4 twins (depth-2 verify n=3..4 in one tile -> weight read ONCE vs
+      // the MAXM=2 form's 2 grid.z tiles; the k-quant depth-2 cliff). _qmv4_*.
+      _fn_qmv_q4k_batch4, _fn_qmv_q5k_batch4, _fn_qmv_q6k_batch4,
       _fn_dequant_q4k, _fn_dequant_q5k, _fn_dequant_q6k, _fn_copy,
       _fn_dense_gemv, _fn_dense_gemm;
   // Decode full-attn switches to the multi-simdgroup paged kernel once
@@ -733,6 +784,13 @@ private:
   // VPIPE_GQA_NO_VEC=1 forces the all-G kernel (A/B).
   bool _gqa_vec = true;
   int  _gqa_split = 32;
+  // MAXM=4 batched GEMV for the MTP verify at draft depth>=2 (n=3..4): read
+  // each weight ONCE vs the MAXM=2 form's 2 grid.z tiles. _qmv4_enabled is the
+  // capability+env gate (VPIPE_MTP_QMV4); _qmv4_active is set ONLY while
+  // mtp_verify_chunk_ encodes (so the realtime-vqa batched decode, which the
+  // MAXM=2 form was tuned for, is untouched). Picked by qmm_auto_ et al.
+  bool _qmv4_enabled = false;
+  bool _qmv4_active = false;
   // Matrix-core prefill path (M5+). Set at load when the GPU has matrix
   // cores (MetalCompute::supports_matrix_cores()) and both the dequant +
   // dense matmul2d kernels validated. When on, prefill projections with
@@ -866,11 +924,33 @@ private:
     std::unique_ptr<ContextManager> ctx;       // 1 full-attn layer
     ContextId cid;
     metal_compute::SharedBuffer pgt;           // MTP-ctx page table
+    // Optional 4-bit affine DRAFT lm_head (group 64), requantized at load from
+    // the 8-bit tied embed. Read by the MTP draft's vocab GEMV ONLY (the
+    // verifier keeps the 8-bit head), halving its bandwidth -- the draft is
+    // verify-corrected so the output stays exact. Empty => use the 8-bit head.
+    metal_compute::SharedBuffer dlm_w, dlm_s, dlm_b;
+    bool draft_head = false;
   };
   MtpHead _mtp;
   // Last-position pre-final-norm hidden of the most recent prefill / verify
   // forward [H] -- the main-model hidden the MTP drafter consumes.
   metal_compute::SharedBuffer _mtp_h;
+  // MTP prefix seed (opt-in, _mtp_seed_enabled): the last text prefill's
+  // per-position POST-final-norm main hiddens [s, H] (f16) + its token ids, so
+  // mtp_decode can populate the MTP head's self-attention KV with the prompt
+  // before drafting -- the drafter then attends over the whole prompt, not just
+  // the decode tail (closes the draft-accept gap vs a full-history runtime).
+  // Captured by prefill() when enabled; set _valid; mtp_seed_prefix_ consumes
+  // them (without clearing, so repeated decodes from one prefill seed
+  // identically). Empty / !_valid (multimodal prefill, no MTP head, seed
+  // disabled, or VPIPE_MTP_NO_SEED) => no seed.
+  metal_compute::SharedBuffer _mtp_prefix_h;
+  std::vector<std::int32_t> _mtp_prefix_ids;
+  int _mtp_prefix_len = 0;
+  bool _mtp_prefix_valid = false;
+  // Gate for capture+seed (set_mtp_prefix_seed). Default OFF: prefill pays
+  // nothing unless a stage opts in; realtime-vqa keeps it off.
+  bool _mtp_seed_enabled = false;
 
   // Per-(linear/GDN layer) cache of the verify's GDN recurrent-step INPUTS:
   // the conv input qkv [maxK, Cd] (f16) and g / beta [maxK, Hv] (f32). The
@@ -889,6 +969,16 @@ private:
   // weight reader + 4-bit qtri/fuse/interleave helpers as the main layers.)
   // Reset the MTP head's local KV context (a fresh drafting window per verify).
   void mtp_ctx_reset_();
+  // Seed the MTP head's KV from the captured prefix (the last prefill's
+  // positions): condition position t on (post-norm hidden_t, embed of the token
+  // at t+1; the last seeded position uses `first_token`, the decode's first
+  // token). KV-only (no attention/draft -- the written K/V is a pure projection
+  // of each position's input, so it is bit-identical to running the full MTP
+  // step), one command buffer. The caller resets the MTP ctx first. Tail-caps
+  // to the MTP page (RoPE attention is shift-invariant, so a tail seeded at
+  // slots 0.. keeps every relative distance). Returns the number of positions
+  // seeded (0 if no prefix was captured). Called at mtp_decode start (persist).
+  int mtp_seed_prefix_(std::int32_t first_token);
 
   // Direct quantized batched matmul y[m,N] = x[m,K] @ dequant_bits(w)^T,
   // reading the quantized weight ONCE across the m rows -- NO f16 dequant
@@ -928,7 +1018,12 @@ private:
                          std::vector<std::int32_t>* mtp_preds = nullptr,
                          std::vector<std::int32_t>* mtp_preds2 = nullptr,
                          int rope_delta = 0, const GpuSamplerParams& sp = {},
-                         int seed_slot0 = 0, GdnVerifyCache* gcache = nullptr);
+                         int seed_slot0 = 0, GdnVerifyCache* gcache = nullptr,
+                         bool lc_mode = false, bool gdn_ring = false,
+                         const metal_compute::SharedBuffer* mtp_cond = nullptr,
+                         const std::function<
+                             void(metal_compute::ComputeEncoder&)>&
+                             pre_commit = {});
 
   // Partial-accept GDN rollback. With every linear layer's conv/ssm recurrent
   // state restored to the round's S0 snapshot, replay conv1d -> qk_norm ->
@@ -990,6 +1085,32 @@ private:
   // Flash-decode-GQA partials (f32): un-normalized O [Hq,split,D], m/l
   // [Hq,split]. Allocated only when _gqa_attn (D==256). Reused across layers.
   metal_compute::SharedBuffer _d_gqa_oacc, _d_gqa_m, _d_gqa_l;
+  // Leviathan-Chen MTP sampling: opt-in (set_leviathan / VPIPE_MTP_LEVIATHAN).
+  // _lc_vlogits / _lc_mlogits hold the verify's full verifier / MTP-head logits
+  // [n,vocab] (copied off the reused vlogits) so mtp_decode can do the ratio
+  // test + residual/bonus sampling on the host (UMA). Default exact-match.
+  bool _leviathan = false;
+  // Persistent MTP self-attention KV: keep the 1-layer MTP head's K/V over the
+  // committed decode positions (vs the per-round wipe in mtp_ctx_reset_) so each
+  // draft attends over the decode history -- measured +0.25 depth-1 draft
+  // accuracy (0.63->0.88) on a fixed sequence, the whole vpipe->reference gap.
+  // Set per-decode from VPIPE_MTP_NO_PERSIST in mtp_decode (default ON).
+  bool _mtp_persist = false;
+  // _lc_mlogits2 holds the SECOND chained MTP-head application's logits (the
+  // depth-2 draft q2); _lc_mlogits is the first (q1), _lc_vlogits the verifier.
+  metal_compute::SharedBuffer _lc_vlogits, _lc_mlogits, _lc_mlogits2;
+  // On-GPU L-C (set_lc_gpu / VPIPE_MTP_GPU_LC). _lc_ws_p / _lc_ws_q are the
+  // per-row [vocab] weight scratch the nucleus stage caches into (reused across
+  // the round's serial dispatches); _lc_qcarry / _lc_qcarry2 hold the carried
+  // drafter logit rows for the pending d1 / d2 (copied out before the verify
+  // overwrites _lc_mlogits next round); _lc_out is the small [<=16] token-id
+  // readback. Lazily allocated on first GPU-L-C decode.
+  bool _lc_gpu = false;
+  metal_compute::SharedBuffer _lc_ws_p, _lc_ws_q, _lc_qcarry, _lc_qcarry2,
+                              _lc_out;
+  // Batched-sample (lc_sample_batch_f16) extras: _lc_ws_p is sized [K*vocab]
+  // for the K concurrent rows; _lc_seed_in holds the per-row 32-bit seeds.
+  metal_compute::SharedBuffer _lc_seed_in;
 };
 
 }  // namespace vpipe::genai

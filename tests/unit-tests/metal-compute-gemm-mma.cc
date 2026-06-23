@@ -730,3 +730,66 @@ TEST(gemm_mma, throughput) {
     EXPECT_TRUE(g_steel > 0.0);
   }
 }
+
+// De-risk for the materialized-decode steel lever (§57-58): the decode QK/PV are
+// GEMMs with a TINY N=G=4 (the GQA group). steel BlockMMA tiles N in BN=32, so
+// N=4 wastes 28/32 of the N tile. This measures dense_gemm_t_f16's achieved DRAM
+// bandwidth (x = the big K/V operand, read once) at the decode shapes vs an
+// N=32 aligned baseline -- if N=4 drops far below peak, steel won't beat the
+// hand-rolled GEMV on M4. QK: scores^T[T,G]=K[T,D]@Q[G,D]^T (M=T,N=G,K=D). PV:
+// out^T[D,G]=V^T[D,T]@w[G,T]^T (M=D,N=G,K=T). Gated VPIPE_GEMM_DECODE_BENCH.
+TEST(gemm_mma, decode_shapes) {
+  if (std::getenv("VPIPE_GEMM_DECODE_BENCH") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeFunction f = mc->load_library("dense_gemm_bf16")
+                          .function("dense_gemm_t_f16");
+  ASSERT_TRUE(f.valid());
+  struct DS { int M, N, K; const char* tag; };
+  const DS shapes[] = {
+      {16384, 4,  512,   "QK T16k N=G4"},
+      {16384, 32, 512,   "QK T16k N=32 "},   // aligned baseline
+      {512,   4,  16384, "PV D512 N=G4"},
+      {512,   32, 16384, "PV D512 N=32 "},   // aligned baseline
+  };
+  const double peak_gbs = 273.0;             // M4 Pro LPDDR5X
+  for (const auto& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K;
+    std::vector<std::uint16_t> x((std::size_t)M * K), W((std::size_t)N * K);
+    fill_bf16(x, 11 + M + K); fill_bf16(W, 22 + N + K);
+    SharedBuffer xb = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer wb = mc->make_shared_buffer((std::size_t)N * K * 2);
+    SharedBuffer bb = mc->make_shared_buffer((std::size_t)N * 2);
+    SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
+    std::memcpy(xb.contents(), x.data(), x.size() * 2);
+    std::memcpy(wb.contents(), W.data(), W.size() * 2);
+    std::memset(bb.contents(), 0, (std::size_t)N * 2);
+    const int ITERS = 60;
+    auto run = [&](int count) {
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        for (int c = 0; c < count; ++c) {
+          enc.set_function(f);
+          enc.set_buffer(0, xb); enc.set_buffer(1, wb);
+          enc.set_buffer(2, bb); enc.set_buffer(3, yb);
+          enc.set_constant(4, K); enc.set_constant(5, N);
+          enc.set_constant(6, M); enc.set_constant(7, 0);
+          enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                        (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
+        }
+      }
+      st.commit().wait();
+    };
+    run(3);
+    const auto t0 = std::chrono::steady_clock::now();
+    run(ITERS);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = secs_(t0, t1) * 1e3 / ITERS;
+    const double gbs = (double)M * K * 2 * ITERS / secs_(t0, t1) / 1e9;
+    std::printf("[gemm_decode] %-14s M=%5d N=%2d K=%5d | %.3f ms/call | "
+                "%6.1f GB/s (%.0f%% of %.0f peak)\n",
+                sh.tag, M, N, K, ms, gbs, 100.0 * gbs / peak_gbs, peak_gbs);
+    EXPECT_TRUE(gbs > 0.0);
+  }
+}

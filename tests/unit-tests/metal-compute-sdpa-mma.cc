@@ -1148,3 +1148,72 @@ TEST(sdpa_mma, gqa_decode_micro) {
   }
   }
 }
+
+// KV-stride DRAM bank-conflict probe. Reads a [Hkv, T, Dstride] K array with the
+// exact sdpa_paged_gqa_vec access pattern, sweeping the per-key STORAGE stride:
+// Dstride=D (512, power-of-2) vs padded (528/544/640). Same useful bytes read
+// (D=512 per key, ALL G q-heads re-read their kv-head -> Hq*T*D); only the
+// alignment of consecutive key transactions changes. If padding LOWERS the time,
+// the 512-element stride was aliasing DRAM banks. Gated VPIPE_KV_STRIDE_BENCH.
+TEST(sdpa_mma, kv_stride_bank_probe) {
+  if (std::getenv("VPIPE_KV_STRIDE_BENCH") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeFunction f = mc->load_library("sdpa").function("kv_read_probe_f16");
+  ASSERT_TRUE(f.valid());
+  const int D = 512, Hq = 8, Hkv = 2, T = 16384, split = 128;
+  const int G = Hq / Hkv;
+  std::mt19937 rng(1234);
+  const int strides[] = {512, 528, 544, 576, 640};   // 512=pow2; rest padded
+  std::printf("[kv_stride] T=%d D=%d Hq=%d Hkv=%d split=%d | useful=%.1f MB/call"
+              " (x G=%d re-reads)\n", T, D, Hq, Hkv, split,
+              (double)Hq * T * D * 2 / 1e6, G);
+  const char* mode_name[] = {"READ-ONLY (raw stream)",
+                             "FAITHFUL FLASH (read+online-softmax serial chain)",
+                             "M=G MATERIALIZED read (parallel, no serial carry)"};
+  for (int sm = 0; sm <= 2; ++sm) {
+    std::printf("[kv_stride] --- mode: %s ---\n", mode_name[sm]);
+    double t_pow2 = 0.0;
+    for (int Ds : strides) {
+      SharedBuffer kb = mc->make_shared_buffer((std::size_t)Hkv * T * Ds * 2);
+      SharedBuffer ob = mc->make_shared_buffer((std::size_t)Hq * split * 4);
+      auto* kp = static_cast<std::uint16_t*>(kb.contents());
+      for (std::size_t i = 0; i < (std::size_t)Hkv * T * Ds; ++i) {
+        kp[i] = (std::uint16_t)(rng() & 0xffff);
+      }
+      const int ITERS = 80;
+      auto run = [&](int count) {
+        CommandStream st = mc->make_command_stream();
+        { ComputeEncoder enc = st.begin_compute();
+          for (int c = 0; c < count; ++c) {
+            enc.set_function(f);
+            enc.set_buffer(0, kb); enc.set_buffer(1, ob);
+            enc.set_constant(2, D); enc.set_constant(3, Ds);
+            enc.set_constant(4, T); enc.set_constant(5, Hq);
+            enc.set_constant(6, Hkv); enc.set_constant(7, split);
+            enc.set_constant(8, sm);
+            if (sm == 2) {  // M=G: one simdgroup per (kv-head, split)
+              enc.dispatch({32, (unsigned)Hkv, (unsigned)split}, {32, 1, 1});
+            } else {        // flash: G simdgroups per (kv-head, split)
+              enc.dispatch({32, (unsigned)Hq, (unsigned)split},
+                           {32, (unsigned)G, 1});
+            }
+          }
+        }
+        st.commit().wait();
+      };
+      run(5);
+      const auto t0 = std::chrono::steady_clock::now();
+      run(ITERS);
+      const auto t1 = std::chrono::steady_clock::now();
+      const double ms = secs_(t0, t1) * 1e3 / ITERS;
+      const double gbs = (double)Hq * T * D * 2 * ITERS / secs_(t0, t1) / 1e9;
+      if (Ds == 512) { t_pow2 = ms; }
+      std::printf("[kv_stride] Dstride=%3d (%s) | %.4f ms/call | %6.1f GB/s "
+                  "| %+5.1f%% vs pow2\n", Ds, Ds == 512 ? "pow2 " : "padded",
+                  ms, gbs, t_pow2 > 0 ? 100.0 * (t_pow2 - ms) / t_pow2 : 0.0);
+      EXPECT_TRUE(gbs > 0.0);
+    }
+  }
+}

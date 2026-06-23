@@ -26,6 +26,8 @@ using namespace metal;
 #endif
 
 #define SDPA_MAX_PER 16  // max D/32 (supports D up to 512: Gemma-4 full-attn)
+#define SDPA_MAX_G   4   // max GQA group (e4b global Hq/Hkv = 8/2 = 4); used by
+                         // the kv_read_probe M=G mode (qreg/dd = per*G regs).
 
 // Full (non-causal) bidirectional attention over contiguous K/V, for the
 // Qwen3-VL vision tower (every patch attends every patch). Same layout
@@ -1607,6 +1609,112 @@ kernel void sdpa_paged_flash_d512_f16(
   }
 }
 
+// causal_softmax_rows_f16 -- in-place causal-masked softmax over a
+// MATERIALIZED score matrix scores[M, N] (M = n_q query rows, N = T_kv keys),
+// for the Gemma-4 GLOBAL (head_dim 512) prefill MATERIALIZED path: per-head
+// Q.K^T (steel GEMM) -> THIS softmax -> P.V (steel GEMM), mirroring MLX's
+// fallback for head_dim 512 (no fused flash). One threadgroup per query row i;
+// row i is query position (q_offset + i). Key j is VALID iff j <= q_offset + i
+// (causal); invalid keys -> prob 0. Math matches the online-softmax flash
+// (sdpa_paged_flash_d512): scaled = scores * scale, p = exp(scaled - row_max)
+// over valid j, P = p / sum, f32 accumulation, PLAIN exp (no exp2/M_LOG2E).
+//   0: scores (device VPIPE_ELT*)  [M, N]  (in-place: raw Q.K^T in, P out)
+//   1: M        (constant int&)    n_q
+//   2: N        (constant int&)    T_kv
+//   3: q_offset (constant int&)
+//   4: scale    (constant float&)
+// grid (CSM_TG, M, 1); threadgroup (CSM_TG, 1, 1).
+#define CSM_TG 256
+kernel void causal_softmax_rows_f16(
+    device VPIPE_ELT*  scores   [[buffer(0)]],
+    constant int&      M        [[buffer(1)]],
+    constant int&      N        [[buffer(2)]],
+    constant int&      q_offset [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      window   [[buffer(5)]],
+    constant int&      banded   [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  if ((int)row >= M) { return; }
+  const uint lid = ltid.x;
+  device VPIPE_ELT* sr = scores + (uint)row * N;
+  const int kmax = q_offset + (int)row;   // last valid key (inclusive)
+  // Trailing-window lower bound (window>0); else no lower bound (causal).
+  const int kmin = (window > 0) ? max(0, kmax - window + 1) : 0;
+
+  // Scan only the PV band [k0, kc) -- the EXACT key range the materialized PV
+  // (dense_gemm_t_pvcausal, BM=BK=32) reads for this row's 32-row block. The
+  // PV never reads outside it, so writing 0/p there is unnecessary; matching
+  // the band turns this from O(N) to O(window) per row (and halves the global
+  // causal scan). MUST mirror pvcausal's k0/Kc formula or PV reads stale data.
+  // banded==0 (the plain dense_t PV A/B path reads all [0,N)) -> full scan.
+  const int BLK = 32;
+  int k0 = 0;
+  int kc = N;
+  if (banded != 0) {
+    const int by = ((int)row / BLK) * BLK;        // PV block start
+    kc = q_offset + by + BLK;                      // Kc (exclusive)
+    kc = (kc < N) ? ((kc + BLK - 1) / BLK) * BLK : N;
+    if (window > 0) {
+      const int lo = q_offset + by - window + 1;
+      k0 = (lo > 0) ? (lo / BLK) * BLK : 0;
+    }
+  }
+
+  threadgroup float pmax[CSM_TG / 32];
+  threadgroup float psum[CSM_TG / 32];
+
+  // --- pass 1: row max over valid (scaled) scores ---
+  float m = -INFINITY;
+  for (int j = k0 + (int)lid; j < kc; j += CSM_TG) {
+    if (j >= kmin && j <= kmax) {
+      const float s = float(sr[j]) * scale;
+      m = max(m, s);
+    }
+  }
+  m = simd_max(m);
+  if (simd_lid == 0) { pmax[simd_gid] = m; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < CSM_TG / 32) ? pmax[simd_lid] : -INFINITY;
+    a = simd_max(a);
+    if (simd_lid == 0) { pmax[0] = a; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_max = pmax[0];
+
+  // --- pass 2: exp(scaled - max) over valid j, accumulate sum ---
+  float ssum = 0.0f;
+  for (int j = k0 + (int)lid; j < kc; j += CSM_TG) {
+    float p = 0.0f;
+    if (j >= kmin && j <= kmax) {
+      const float s = float(sr[j]) * scale;
+      p = (row_max == -INFINITY) ? 0.0f : exp(s - row_max);
+    }
+    sr[j] = (VPIPE_ELT)p;   // store unnormalized p; normalize after sum known
+    ssum += p;
+  }
+  ssum = simd_sum(ssum);
+  if (simd_lid == 0) { psum[simd_gid] = ssum; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < CSM_TG / 32) ? psum[simd_lid] : 0.0f;
+    a = simd_sum(a);
+    if (simd_lid == 0) { psum[0] = a; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = psum[0] > 0.0f ? 1.0f / psum[0] : 0.0f;
+
+  // --- pass 3: normalize (over the same band) ---
+  for (int j = k0 + (int)lid; j < kc; j += CSM_TG) {
+    sr[j] = (VPIPE_ELT)(float(sr[j]) * inv);
+  }
+}
+
 // sdpa_causal_mb_f16 -- MULTI-simdgroup DECODE attention over a CONTIGUOUS
 // [Hkv, kv_stride, D] KV cache, for Gemma-4 (head_dim 256 / 512). The scalar
 // sdpa_causal_f16 scans all T_kv keys with ONE simdgroup (32 lanes), so its
@@ -2425,6 +2533,264 @@ kernel void sdpa_paged_gqa_vec_f16(
   }
 }
 
+// ============================================================================
+// MATERIALIZED paged DECODE for the Gemma global (head_dim 512) layers.
+//
+// What omlx/MLX does for head_dim 512 (decode, M=1): head_dim 512 is in
+// NEITHER MLX's sdpa_vector {64,96,128,256} nor sdpa_full {64,80,128} support
+// set, so mx.fast.scaled_dot_product_attention FALLS BACK to the unfused form
+// (mlx/fast.cpp: "O = softmax(Q @ K.T) @ V") -- a materialized GEMV: scores =
+// Q.K^T, a single parallel softmax over the whole row, then scores.V. This
+// has NO online-softmax serial recurrence -- the m/l carry + per-key acc
+// rescale that bottlenecks our fused flash decode at depth (the attn_global
+// latency chain). We replicate it in 4 paged passes (the decode analogue of
+// the materialized PREFILL path):
+//   K1 sdpa_paged_dec_qk    : scores[h,t] = scale * (Q_h . K_t)   (GEMV)
+//   K2 sdpa_dec_rowstat     : per head, m[h]=max_t, l[h]=sum_t exp(s-m)
+//   K3 sdpa_paged_dec_pv    : partial[h,sp,d] = sum_t exp(s-m[h]) * V_t,d
+//   K4 sdpa_dec_pv_merge    : out[h,d] = (sum_sp partial) / l[h]
+// K1/K3 split the key range over grid.z (sp) for occupancy; scores live in a
+// [Hq, Tstride] f32 scratch. K2 is per-head (Hq threadgroups, tiny). Greedy
+// token-exact with the flash path (same softmax, fp reassociation only).
+// head_dim % 128 == 0 (per4 = D/128; D=512). Paged-pool contract matches
+// sdpa_paged_gqa_vec_f16.
+
+// K1: QK GEMV. grid (32, Hq, sp); tg (32,1,1). Each simdgroup owns one
+// (qhead, key-split): page-walk its global-position range [lo,hi), dot Q_h
+// with each K_t (32 lanes x per4 vec4), write scale*dot to scores[h*Tstride+t].
+//   0:q 1:kpool 2:scores(f32) 3:scale 4:D 5:Hq 6:Hkv 7:q_offset 8:page_tokens
+//   9:n_pages 10:page_table 11:Tstride 12:split
+#define SDPA_DEC_UK 8     // decode GEMV key-unroll (latency overlap)
+kernel void sdpa_paged_dec_qk_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    device VPIPE_ELT*       scores     [[buffer(2)]],   // f16 scratch
+    constant float&    scale      [[buffer(3)]],
+    constant int&      D          [[buffer(4)]],
+    constant int&      Hq         [[buffer(5)]],
+    constant int&      Hkv        [[buffer(6)]],
+    constant int&      q_offset   [[buffer(7)]],
+    constant int&      page_tokens[[buffer(8)]],
+    constant int&      n_pages    [[buffer(9)]],
+    const device int*  page_table [[buffer(10)]],
+    constant int&      Tstride    [[buffer(11)]],
+    constant int&      split      [[buffer(12)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  const int qhead = (int)tid.y;
+  const int s     = (int)tid.z;
+  const int G     = Hq / Hkv;
+  const int kv    = qhead / G;
+  const int per   = D / 32;
+  const int per4  = per / 4;
+  const int total = q_offset + 1;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off = (uint)kv * page_tokens * D;
+  const uint base_off = (uint)lane * (uint)per;
+
+  const int chunk = (total + split - 1) / split;
+  const int lo = s * chunk;
+  const int hi = min((s + 1) * chunk, total);
+  if (lo >= hi) { return; }
+
+  const device VPIPE_ELT* qh = q + (uint)qhead * D;
+  typedef vec<VPIPE_ELT, 4> elt4;
+  float qreg[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) { qreg[p] = float(qh[base_off + (uint)p]); }
+
+  device VPIPE_ELT* srow = scores + (uint)qhead * (uint)Tstride;
+  for (int pg = 0; pg < n_pages; ++pg) {
+    const int pid    = page_table[pg * 3 + 0];
+    const int nvalid = page_table[pg * 3 + 1];
+    const int gstart = page_table[pg * 3 + 2];
+    const int tlo = max(0, lo - gstart);
+    const int thi = min(nvalid, hi - gstart);
+    if (tlo >= thi) { continue; }
+    const device VPIPE_ELT* kbase =
+        kpool + (uint)pid * page_stride + head_off + base_off;
+    // UK-unroll: issue UK independent K-row dot-products together so the
+    // compiler overlaps their DRAM latency (memory-level parallelism), then
+    // reduce + write. Keys within a page are contiguous, so the unroll never
+    // straddles a page boundary.
+    for (int t = tlo; t < thi; t += SDPA_DEC_UK) {
+      const int ub = min((int)SDPA_DEC_UK, thi - t);
+      float dd[SDPA_DEC_UK];
+      for (int u = 0; u < ub; ++u) {
+        const device elt4* k4 =
+            (const device elt4*)(kbase + (uint)(t + u) * (uint)D);
+        float a = 0.0f;
+        for (int c = 0; c < per4; ++c) {
+          const elt4 kv4 = k4[c];
+          a += qreg[c * 4 + 0] * float(kv4.x);
+          a += qreg[c * 4 + 1] * float(kv4.y);
+          a += qreg[c * 4 + 2] * float(kv4.z);
+          a += qreg[c * 4 + 3] * float(kv4.w);
+        }
+        dd[u] = a;
+      }
+      for (int u = 0; u < ub; ++u) {
+        const float r = simd_sum(dd[u]);
+        if (lane == 0) { srow[gstart + t + u] = VPIPE_ELT(r * scale); }
+      }
+    }
+  }
+}
+
+// K2: per-head softmax stats AND weight write-back. grid (256, Hq, 1);
+// tg (256,1,1). Pass 1: m = max_t scores. Pass 2: OVERWRITE scores[t] with the
+// un-normalized weight exp(scores[t]-m) and accumulate l = sum_t weight. K3
+// then reads the weights directly (no exp on the V-read hot loop) and K4
+// divides the merged output by l. scores is read-WRITE here.
+//   0:scores(f16, rw) 1:m_out(f32) 2:l_out(f32) 3:T_kv 4:Tstride 5:Hq
+kernel void sdpa_dec_rowstat_f16(
+    device VPIPE_ELT* scores  [[buffer(0)]],   // f16 scratch (rw)
+    device float*     m_out   [[buffer(1)]],
+    device float*     l_out   [[buffer(2)]],
+    constant int&     T_kv    [[buffer(3)]],
+    constant int&     Tstride [[buffer(4)]],
+    constant int&     Hq      [[buffer(5)]],
+    uint3 tid   [[threadgroup_position_in_grid]],
+    uint3 ltid3 [[thread_position_in_threadgroup]],
+    uint3 ntg3  [[threads_per_threadgroup]])
+{
+  (void)Hq;                  // unused: head = tid.y; kept for the host buffer ABI
+  const int h = (int)tid.y;
+  const uint ltid = ltid3.x;
+  const uint ntg = ntg3.x;
+  device VPIPE_ELT* srow = scores + (uint)h * (uint)Tstride;
+  threadgroup float red[256];
+
+  float lm = -INFINITY;
+  for (uint t = ltid; t < (uint)T_kv; t += ntg) {
+    lm = max(lm, float(srow[t]));
+  }
+  red[ltid] = lm;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint w = ntg / 2; w > 0; w >>= 1) {
+    if (ltid < w) { red[ltid] = max(red[ltid], red[ltid + w]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float m = red[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float ls = 0.0f;
+  for (uint t = ltid; t < (uint)T_kv; t += ntg) {
+    const float e = fast::exp(float(srow[t]) - m);
+    srow[t] = VPIPE_ELT(e);       // overwrite raw score with its weight
+    ls += e;
+  }
+  red[ltid] = ls;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint w = ntg / 2; w > 0; w >>= 1) {
+    if (ltid < w) { red[ltid] += red[ltid + w]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (ltid == 0) { m_out[h] = m; l_out[h] = red[0]; }
+}
+
+// K3: PV GEMV. grid (32, Hq, sp); tg (32,1,1). Each (qhead, key-split)
+// page-walks [lo,hi) accumulating partial[h,sp,:] += weight[t] * V_t, where
+// weight[t] = K2's pre-computed exp(scores[t]-m) -- PURE FMA, no transcendental
+// on this (V-bandwidth-heavy) hot loop. UK-unroll prefetches the weights and
+// overlaps the independent V-row loads (memory-level parallelism). K4 divides
+// the merged output by the row sum l.  0:weights(f32) 1:vpool 2:partial(f32)
+//   3:D 4:Hq 5:Hkv 6:q_offset 7:page_tokens 8:n_pages 9:page_table 10:Tstride
+//   11:split
+kernel void sdpa_paged_dec_pv_f16(
+    const device VPIPE_ELT* weights    [[buffer(0)]],   // f16 scratch
+    const device VPIPE_ELT* vpool      [[buffer(1)]],
+    device float*           partial    [[buffer(2)]],
+    constant int&      D          [[buffer(3)]],
+    constant int&      Hq         [[buffer(4)]],
+    constant int&      Hkv        [[buffer(5)]],
+    constant int&      q_offset   [[buffer(6)]],
+    constant int&      page_tokens[[buffer(7)]],
+    constant int&      n_pages    [[buffer(8)]],
+    const device int*  page_table [[buffer(9)]],
+    constant int&      Tstride    [[buffer(10)]],
+    constant int&      split      [[buffer(11)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  const int qhead = (int)tid.y;
+  const int s     = (int)tid.z;
+  const int G     = Hq / Hkv;
+  const int kv    = qhead / G;
+  const int per   = D / 32;
+  const int per4  = per / 4;
+  const int total = q_offset + 1;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off = (uint)kv * page_tokens * D;
+  const uint base_off = (uint)lane * (uint)per;
+
+  const int chunk = (total + split - 1) / split;
+  const int lo = s * chunk;
+  const int hi = min((s + 1) * chunk, total);
+
+  typedef vec<VPIPE_ELT, 4> elt4;
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) { acc[p] = 0.0f; }
+  const device VPIPE_ELT* wrow = weights + (uint)qhead * (uint)Tstride;
+
+  if (lo < hi) {
+    for (int pg = 0; pg < n_pages; ++pg) {
+      const int pid    = page_table[pg * 3 + 0];
+      const int nvalid = page_table[pg * 3 + 1];
+      const int gstart = page_table[pg * 3 + 2];
+      const int tlo = max(0, lo - gstart);
+      const int thi = min(nvalid, hi - gstart);
+      if (tlo >= thi) { continue; }
+      const device VPIPE_ELT* vbase =
+          vpool + (uint)pid * page_stride + head_off + base_off;
+      for (int t = tlo; t < thi; t += SDPA_DEC_UK) {
+        const int ub = min((int)SDPA_DEC_UK, thi - t);
+        float w[SDPA_DEC_UK];
+        for (int u = 0; u < ub; ++u) { w[u] = float(wrow[gstart + t + u]); }
+        for (int u = 0; u < ub; ++u) {
+          const device elt4* v4 =
+              (const device elt4*)(vbase + (uint)(t + u) * (uint)D);
+          const float wu = w[u];
+          for (int c = 0; c < per4; ++c) {
+            const elt4 vv4 = v4[c];
+            acc[c * 4 + 0] += wu * float(vv4.x);
+            acc[c * 4 + 1] += wu * float(vv4.y);
+            acc[c * 4 + 2] += wu * float(vv4.z);
+            acc[c * 4 + 3] += wu * float(vv4.w);
+          }
+        }
+      }
+    }
+  }
+  const uint obase = ((uint)qhead * (uint)split + (uint)s) * (uint)D;
+  for (int p = 0; p < per; ++p) {
+    partial[obase + base_off + (uint)p] = acc[p];
+  }
+}
+
+// K4: sum the sp partials and divide by the row sum. grid (Hq*D,1,1);
+// tg (256,1,1). out[h,d] = (sum_sp partial[h,sp,d]) / l[h].
+//   0:partial(f32) 1:l_in(f32) 2:out 3:D 4:split 5:Hq
+kernel void sdpa_dec_pv_merge_f16(
+    const device float* partial [[buffer(0)]],
+    const device float* l_in    [[buffer(1)]],
+    device VPIPE_ELT*   out      [[buffer(2)]],
+    constant int& D     [[buffer(3)]],
+    constant int& split [[buffer(4)]],
+    constant int& Hq    [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)(Hq * D)) { return; }
+  const int h = (int)gid / D;
+  const int d = (int)gid % D;
+  float ov = 0.0f;
+  for (int s = 0; s < split; ++s) {
+    ov += partial[((uint)h * (uint)split + (uint)s) * (uint)D + (uint)d];
+  }
+  const float l = l_in[h];
+  out[(uint)h * (uint)D + (uint)d] = VPIPE_ELT(l > 0.0f ? ov / l : 0.0f);
+}
+
 // sdpa_causal_gqa_f16 -- flash-decode-GQA over a CONTIGUOUS [Hkv, kv_stride,
 // D] KV cache (Gemma-4 decode), the contiguous analogue of
 // sdpa_paged_gqa_mb256_f16. Same idea: each (kv, split) single-simdgroup
@@ -2825,6 +3191,112 @@ kernel void sdpa_causal_gqa_vec_f16(
   }
 }
 
+// sdpa_causal_gqa_vec_lin_f16 -- LINEARIZED-RING sibling of
+// sdpa_causal_gqa_vec_f16 for the BOUNDED sliding-window decode layers. The
+// host has guaranteed that the query's trailing window is one CONTIGUOUS
+// physical span: the K/V ring carries a mirror tail (the first window-1 head
+// slots duplicated at [ring_cap, ring_cap+window-1)), so a window-length scan
+// that crosses the ring end reads straight into the mirror. This kernel scans
+// physical slots [phys_first, phys_first+scan_len) LINEARLY -- no `% ring_cap`,
+// no wrap branch, and no per-key window mask (every scanned slot is in-window).
+// Softmax is order-invariant, so the physical scan order (which differs from the
+// logical key order only across the wrap) yields the same result. vec4 loads +
+// GQA are IDENTICAL to sdpa_causal_gqa_vec_f16; the split+merge structure is
+// unchanged (this only makes the K/V READ contiguous).
+//   0:q 1:k 2:v 3:o_acc 4:m_out 5:l_out 6:scale 7:T_kv 8:D 9:Hq 10:Hkv
+//   11:q_offset 12:kv_stride 13:phys_first 14:scan_len 15:split
+// grid (32, Hq, split); tg (32, G, 1).  (T_kv/q_offset bound for ABI parity.)
+kernel void sdpa_causal_gqa_vec_lin_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* k          [[buffer(1)]],
+    const device VPIPE_ELT* v          [[buffer(2)]],
+    device float*           o_acc      [[buffer(3)]],
+    device float*           m_out      [[buffer(4)]],
+    device float*           l_out      [[buffer(5)]],
+    constant float&    scale      [[buffer(6)]],
+    constant int&      T_kv       [[buffer(7)]],
+    constant int&      D          [[buffer(8)]],
+    constant int&      Hq         [[buffer(9)]],
+    constant int&      Hkv        [[buffer(10)]],
+    constant int&      q_offset   [[buffer(11)]],
+    constant int&      kv_stride  [[buffer(12)]],
+    constant int&      phys_first [[buffer(13)]],
+    constant int&      scan_len   [[buffer(14)]],
+    constant int&      split      [[buffer(15)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  (void)T_kv; (void)q_offset;
+  const int kv = (int)tid.y;
+  const int s  = (int)tid.z;
+  const int G  = Hq / Hkv;
+  const int g  = (int)simd_gid;
+  const int qhead = kv * G + g;
+  const int per = D / 32;
+  const int per4 = per / 4;
+  // Linear physical span [phys_first, phys_first+scan_len); split across z.
+  const int chunk = (scan_len > 0) ? (scan_len + split - 1) / split : 0;
+  const int lo = phys_first + s * chunk;
+  const int hi = min(phys_first + (s + 1) * chunk, phys_first + scan_len);
+
+  const device VPIPE_ELT* qh  = q + (uint)qhead * D;
+  const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
+  const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
+  typedef vec<VPIPE_ELT, 4> elt4;
+  const int base_off = (int)lane * per;
+  float qreg[SDPA_MAX_PER];
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    qreg[p] = float(qh[lane * per + p]) * scale;
+    acc[p] = 0.0f;
+  }
+  float m = -INFINITY, l = 0.0f;
+  for (int t = lo; t < hi; t += SDPA_GQA_UK) {
+    const int ub = min((int)SDPA_GQA_UK, hi - t);
+    float dots[SDPA_GQA_UK];
+    for (int u = 0; u < ub; ++u) {
+      const uint slot = (uint)(t + u);          // LINEAR -- no modulo
+      const device elt4* k4 =
+          (const device elt4*)(kkv + slot * (uint)D + base_off);
+      float d = 0.0f;
+      for (int c = 0; c < per4; ++c) {
+        const elt4 kv4 = k4[c];
+        d += qreg[c * 4 + 0] * float(kv4.x);
+        d += qreg[c * 4 + 1] * float(kv4.y);
+        d += qreg[c * 4 + 2] * float(kv4.z);
+        d += qreg[c * 4 + 3] * float(kv4.w);
+      }
+      dots[u] = simd_sum(d);
+    }
+    for (int u = 0; u < ub; ++u) {
+      const uint slot = (uint)(t + u);          // LINEAR -- no modulo
+      const float dot = dots[u];
+      const float m_new = max(m, dot);
+      const float corr = fast::exp(m - m_new);
+      const float pj = fast::exp(dot - m_new);
+      l = l * corr + pj;
+      const device elt4* v4 =
+          (const device elt4*)(vkv + slot * (uint)D + base_off);
+      for (int c = 0; c < per4; ++c) {
+        const elt4 vv4 = v4[c];
+        acc[c * 4 + 0] = acc[c * 4 + 0] * corr + pj * float(vv4.x);
+        acc[c * 4 + 1] = acc[c * 4 + 1] * corr + pj * float(vv4.y);
+        acc[c * 4 + 2] = acc[c * 4 + 2] * corr + pj * float(vv4.z);
+        acc[c * 4 + 3] = acc[c * 4 + 3] * corr + pj * float(vv4.w);
+      }
+      m = m_new;
+    }
+  }
+  const uint obase = ((uint)qhead * (uint)split + (uint)s) * (uint)D;
+  for (int p = 0; p < per; ++p) {
+    o_acc[obase + (uint)(lane * per + p)] = acc[p];
+  }
+  if (lane == 0) {
+    m_out[(uint)qhead * split + s] = m;
+    l_out[(uint)qhead * split + s] = l;
+  }
+}
 // sdpa_paged_qtile_f16 -- query-TILED paged causal flash attention for
 // head_dim 256 (Qwen3.5 full-attention PREFILL). The scalar and mb256 paged
 // kernels are PER-QUERY: each query streams the whole causal K/V, so the K/V
@@ -3071,6 +3543,119 @@ kernel void sdpa_paged_causal_f16(
 //   12:page_table (int[n_pages*3] = {page_id, n_valid, global_start})
 // Precondition: D % 16 == 0, D <= MMA_DMAX, page_tokens % MMA_BK == 0.
 // grid (256, Hq, ceil(n_q/32)); threadgroup (256,1,1).
+
+// KV-stride DRAM bank-conflict probe (user hypothesis): read a synthetic
+// [Hkv, T, Dstride] K array with the EXACT access pattern of sdpa_paged_gqa_vec
+// (32 lanes coalesced over the D=512 data dim, G simdgroups per kv-head each
+// re-reading it, sp splits over T via grid.z), but with the per-key STORAGE
+// stride Dstride decoupled from the data dim D. Dstride=D (512, power-of-2) vs
+// D+pad tests whether the 512-element key stride aliases DRAM banks. Pure read
+// (no softmax) to isolate read bandwidth; dummy simd_sum -> out[qhead*split+s]
+// so the loads aren't dead-code-eliminated. grid (32,Hq,sp); tg (32,G,1).
+kernel void kv_read_probe_f16(
+    const device VPIPE_ELT* k    [[buffer(0)]],
+    device float*           out  [[buffer(1)]],
+    constant int& D        [[buffer(2)]],
+    constant int& Dstride  [[buffer(3)]],
+    constant int& T        [[buffer(4)]],
+    constant int& Hq       [[buffer(5)]],
+    constant int& Hkv      [[buffer(6)]],
+    constant int& split    [[buffer(7)]],
+    constant int& softmax  [[buffer(8)]],   // 0 = read-only, 1 = flash chain
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  const int kv   = (int)tid.y;            // kv-head (grid.y=Hq, tg.y=G -> Hkv tg)
+  const int s    = (int)tid.z;            // split
+  const int g    = (int)simd_gid;         // q-head within the GQA group
+  const int G    = Hq / Hkv;
+  const int qhead = kv * G + g;
+  const int per  = D / 32;
+  const int per4 = per / 4;
+  const int chunk = (T + split - 1) / split;
+  const int lo = s * chunk;
+  const int hi = min((s + 1) * chunk, T);
+  typedef vec<VPIPE_ELT, 4> elt4;
+  // Per-kv-head plane base + this lane's D-strip; key t at + t*Dstride.
+  const device VPIPE_ELT* kbase =
+      k + (uint)kv * (uint)T * (uint)Dstride + (uint)lane * (uint)per;
+  if (softmax == 0) {
+    // READ-ONLY: pure coalesced stream (isolates raw KV-read bandwidth).
+    float acc = 0.0f;
+    for (int t = lo; t < hi; ++t) {
+      const device elt4* k4 =
+          (const device elt4*)(kbase + (uint)t * (uint)Dstride);
+      for (int c = 0; c < per4; ++c) {
+        const elt4 v4 = k4[c];
+        acc += float(v4.x) + float(v4.y) + float(v4.z) + float(v4.w);
+      }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) { out[(uint)qhead * (uint)split + (uint)s] = acc; }
+  } else if (softmax == 2) {
+    // M=G MATERIALIZED read (§58): read K[t] ONCE, compute G PARALLEL dots (no
+    // online-softmax serial carry) -> the QK pass is MEMORY-bound, so the
+    // bank conflict should be EXPOSED here (unlike flash). qreg[G*per].
+    float qreg[SDPA_MAX_PER * SDPA_MAX_G];
+    for (int gg = 0; gg < G; ++gg) {
+      for (int p = 0; p < per; ++p) { qreg[gg * per + p] = float(kbase[p]); }
+    }
+    float dd[SDPA_MAX_G];
+    for (int gg = 0; gg < G; ++gg) { dd[gg] = 0.0f; }
+    for (int t = lo; t < hi; ++t) {
+      const device elt4* k4 =
+          (const device elt4*)(kbase + (uint)t * (uint)Dstride);
+      for (int c = 0; c < per4; ++c) {
+        const elt4 v4 = k4[c];                // K[t] loaded ONCE -> G dots
+        for (int gg = 0; gg < G; ++gg) {
+          dd[gg] += qreg[gg * per + c * 4 + 0] * float(v4.x)
+                  + qreg[gg * per + c * 4 + 1] * float(v4.y)
+                  + qreg[gg * per + c * 4 + 2] * float(v4.z)
+                  + qreg[gg * per + c * 4 + 3] * float(v4.w);
+        }
+      }
+    }
+    float o = 0.0f;
+    for (int gg = 0; gg < G; ++gg) { o += simd_sum(dd[gg]); }
+    if (lane == 0) { out[(uint)qhead * (uint)split + (uint)s] = o; }
+  } else {
+    // FAITHFUL FLASH: per key -> QK dot (simd_sum) -> online-softmax m/l/acc[per]
+    // serial carry -> PV (reuse K as V). The same latency chain as the real
+    // sdpa_paged_gqa_vec, so this predicts whether the read win survives.
+    float qreg[SDPA_MAX_PER], acc[SDPA_MAX_PER];
+    for (int p = 0; p < per; ++p) { qreg[p] = float(kbase[p]); acc[p] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+    for (int t = lo; t < hi; ++t) {
+      const device elt4* k4 =
+          (const device elt4*)(kbase + (uint)t * (uint)Dstride);
+      float dot = 0.0f;
+      for (int c = 0; c < per4; ++c) {
+        const elt4 v4 = k4[c];
+        dot += qreg[c * 4 + 0] * float(v4.x) + qreg[c * 4 + 1] * float(v4.y)
+             + qreg[c * 4 + 2] * float(v4.z) + qreg[c * 4 + 3] * float(v4.w);
+      }
+      dot = simd_sum(dot);
+      const float m_new = max(m, dot);
+      const float corr = fast::exp(m - m_new);
+      const float pj = fast::exp(dot - m_new);
+      l = l * corr + pj;
+      for (int c = 0; c < per4; ++c) {
+        const elt4 v4 = k4[c];          // reuse K as V
+        acc[c * 4 + 0] = acc[c * 4 + 0] * corr + pj * float(v4.x);
+        acc[c * 4 + 1] = acc[c * 4 + 1] * corr + pj * float(v4.y);
+        acc[c * 4 + 2] = acc[c * 4 + 2] * corr + pj * float(v4.z);
+        acc[c * 4 + 3] = acc[c * 4 + 3] * corr + pj * float(v4.w);
+      }
+      m = m_new;
+    }
+    float s0 = 0.0f;
+    for (int p = 0; p < per; ++p) { s0 += acc[p]; }
+    s0 = simd_sum(s0) / (l > 0.0f ? l : 1.0f);
+    if (lane == 0) { out[(uint)qhead * (uint)split + (uint)s] = s0; }
+  }
+}
+
 // The simdgroup_matrix MMA flash kernel below is half-only (Llama/vision
 // prefill); Qwen3.5's head_dim 256 uses the scalar/multi-simdgroup paged
 // kernels instead, so the bf16 variant metallib skips this kernel.

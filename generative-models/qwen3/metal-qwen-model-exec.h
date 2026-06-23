@@ -63,20 +63,22 @@ public:
   std::int32_t pdecode_next(ContextId ctx) override;
   void pdecode_end(ContextId ctx) override;
   bool pdecode_supports_runahead() const override;
-  // Mixed-precision affine (OptiQ) has no batched-decode path yet (the de-fused
-  // per-tensor buffers the batched forward needs are unbuilt -- decode_batched_
-  // step / bdecode_begin both bail on _mixed). Advertise it as UNSUPPORTED so a
-  // batched caller (realtime-vqa) falls back to serial per-branch decode upfront
-  // instead of committing to the batched path and truncating when it fails.
+  // Batched decode runs the weight-bound matmuls batched over the N branches
+  // (like prefill) with per-branch attention/GDN (like decode), so it supports
+  // every quant the single-decode forward does: uniform-4bit AND mixed-precision
+  // affine (OptiQ) -- encode_batched_step_ de-fuses the mixed projections
+  // per-tensor (vqmm_), exactly as the verify/single decode. (Native k-quant is
+  // excluded: its q6_K embed gather isn't wired into the affine-embed batched
+  // step yet -- a separate follow-on.)
   bool supports_batched_decode() const override
-  { return _model != nullptr && !_model->uses_mixed_precision(); }
+  { return _model != nullptr && !_model->uses_kquant(); }
   bool batched_decode_logits(
       std::span<const ContextId>    cids,
       std::span<const std::int32_t> in_tokens,
       std::span<const std::int32_t> rope_pos,
       std::vector<float>&           out_logits) override;
   bool supports_batched_pipelined_decode() const override
-  { return _model != nullptr && !_model->uses_mixed_precision(); }
+  { return _model != nullptr && !_model->uses_kquant(); }
   bool bdecode_begin(std::span<const ContextId>    cids,
                      std::span<const std::int32_t> first_tokens,
                      const GpuSamplerParams& sp, int max_tokens,
@@ -87,6 +89,8 @@ public:
 
   bool supports_mtp() const override
   { return _model != nullptr && _model->has_mtp(); }
+  void set_mtp_prefix_seed(bool on) override
+  { if (_model != nullptr) { _model->set_mtp_prefix_seed(on); } }
   bool mtp_generate(
       ContextId ctx, std::int32_t first_token, int max_tokens, int rope_first,
       const GpuSamplerParams& sp,

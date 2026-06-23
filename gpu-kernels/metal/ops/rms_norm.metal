@@ -1,8 +1,12 @@
 // rms_norm.metal -- RMSNorm for LLM inference on metal-compute.
 //   out[r,i] = weight[i] * x[r,i] * rsqrt(mean_i(x[r,i]^2) + eps)
-// Matches mlx::fast::rms_norm: per-row reduction over the hidden dim,
-// f16 in/out with float32 accumulation. One threadgroup per row;
-// reduce sum(x^2) via simd_sum across 8 simdgroups (256 threads).
+// f16/bf16 in/out, float32 accumulation, one threadgroup per row. The sum(x^2)
+// reduction is an ORDER-INVARIANT fixed binary tree over an FP32 threadgroup
+// buffer (RMS_PAD-padded): the tree order depends only on RMS_PAD, NOT the
+// thread count, so the result is BIT-IDENTICAL for any RMS_TREE_TG and across
+// GPUs -- a faster (more-thread) kernel can't perturb a near-tie. (The earlier
+// simd_sum+partials reduction's grouping changed with thread count, flipping
+// greedy tokens at exact f32 logit ties; see GEMMA-E4B-DECODE-GAP §27-§30.)
 //
 //   0: x      (device const half*)  [R, H]
 //   1: weight (device const half*)  [H]
@@ -19,7 +23,13 @@ using namespace metal;
 #define VPIPE_ELT half
 #endif
 
+// RMS_TG: threadgroup size for the (legacy simd-reduction) layer_norm_relu_f16
+// audio kernel, dispatched at 256. RMS_TREE_TG: threadgroup size for the tree
+// rms_norm_f16 / rms_add_f16 (dispatched at 512 -- more threads pay for the
+// extra tree barriers and net faster). RMS_PAD: power-of-2 pad >= max H.
 #define RMS_TG 256
+#define RMS_TREE_TG 512
+#define RMS_PAD 4096
 
 kernel void rms_norm_f16(
     const device VPIPE_ELT*  x      [[buffer(0)]],
@@ -29,38 +39,32 @@ kernel void rms_norm_f16(
     constant float&     eps    [[buffer(4)]],
     uint3 tid      [[threadgroup_position_in_grid]],
     uint3 ltid     [[thread_position_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+    uint3 tptg     [[threads_per_threadgroup]])
 {
   const uint row = tid.y;
   const uint lid = ltid.x;
+  const uint tg = tptg.x;                 // ACTUAL tg size (256 or 512), not a
+                                          // hardcoded stride -> correct for any
+                                          // launch site (qwen/llama at 256).
   const device VPIPE_ELT* xr = x + (uint)row * H;
   device VPIPE_ELT* outr = out + (uint)row * H;
 
-  float local = 0.0f;
-  for (int i = (int)lid; i < H; i += RMS_TG) {
-    const float v = float(xr[i]);
-    local += v * v;
-  }
-  local = simd_sum(local);
-
-  threadgroup float partial[RMS_TG / 32];
-  if (simd_lid == 0) {
-    partial[simd_gid] = local;
+  // Order-invariant fixed-tree sum(x^2) over an FP32 threadgroup buffer. The
+  // tree order depends only on RMS_PAD (the s-halving), NOT tg -> bit-identical
+  // for any threadgroup size. Caps H <= RMS_PAD (host selects the simd_sum
+  // rms_norm_fast_f16 for larger H; see the helper guard).
+  threadgroup float sbuf[RMS_PAD];
+  for (uint i = lid; i < RMS_PAD; i += tg) {
+    const float v = (i < (uint)H) ? float(xr[i]) : 0.0f;
+    sbuf[i] = v * v;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (simd_gid == 0) {
-    float p = (simd_lid < RMS_TG / 32) ? partial[simd_lid] : 0.0f;
-    p = simd_sum(p);
-    if (simd_lid == 0) {
-      partial[0] = p;
-    }
+  for (int s = RMS_PAD / 2; s >= 1; s >>= 1) {
+    for (uint i = lid; i < (uint)s; i += tg) { sbuf[i] += sbuf[i + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const float inv = rsqrt(partial[0] / float(H) + eps);
-  for (int i = (int)lid; i < H; i += RMS_TG) {
+  const float inv = rsqrt(sbuf[0] / float(H) + eps);
+  for (uint i = lid; i < (uint)H; i += tg) {
     outr[i] = VPIPE_ELT(float(xr[i]) * inv * float(weight[i]));
   }
 }
@@ -127,34 +131,120 @@ kernel void rms_add_f16(
     constant float&     post_scale [[buffer(6)]],
     uint3 tid      [[threadgroup_position_in_grid]],
     uint3 ltid     [[thread_position_in_threadgroup]],
+    uint3 tptg     [[threads_per_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const uint tg = tptg.x;                 // ACTUAL tg size, not a fixed stride.
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  const device VPIPE_ELT* rr = residual + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
+
+  // Order-invariant fixed-tree sum(x^2) (bit-identical for any tg; H <= RMS_PAD).
+  threadgroup float sbuf[RMS_PAD];
+  for (uint i = lid; i < RMS_PAD; i += tg) {
+    const float v = (i < (uint)H) ? float(xr[i]) : 0.0f;
+    sbuf[i] = v * v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int s = RMS_PAD / 2; s >= 1; s >>= 1) {
+    for (uint i = lid; i < (uint)s; i += tg) { sbuf[i] += sbuf[i + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float inv = rsqrt(sbuf[0] / float(H) + eps);
+  for (uint i = lid; i < (uint)H; i += tg) {
+    const float normed = float(xr[i]) * inv * float(weight[i]);
+    outr[i] = VPIPE_ELT((float(rr[i]) + normed) * post_scale);
+  }
+}
+
+// FAST variants of rms_norm_f16 / rms_add_f16: simd_sum reduction (2 barriers,
+// reduces only the actual H) instead of the order-invariant RMS_PAD tree (12
+// barriers, reduces 4096). This is MLX's rms_single_row structure (and what
+// vpipe's own per-head rms_rope3 norm already uses) -- it is what rms_norm_f16
+// WAS before f1ab287, which qwen/llama still launch at 256 threads. The tree
+// replaced it for CROSS-CONFIG bit-exactness (RMS_TG 256 vs 512 flipped greedy
+// ties, §27-30); the simd_sum grouping is deterministic for a FIXED launch and
+// matches MLX's reduction order more closely. THREADGROUP-SIZE-AGNOSTIC: strides
+// by the actual [[threads_per_threadgroup]] and bounds the cross-simd reduce by
+// the real simdgroup count -> correct at 256 (qwen/llama) AND 512 (gemma), with
+// NO RMS_PAD cap (future large H is safe). DEFAULT path for all models (§53);
+// VPIPE_GEMMA_RMS_FAST=0 reverts gemma to the tree for A/B.
+kernel void rms_norm_fast_f16(
+    const device VPIPE_ELT*  x      [[buffer(0)]],
+    const device VPIPE_ELT*  weight [[buffer(1)]],
+    device VPIPE_ELT*        out    [[buffer(2)]],
+    constant int&       H      [[buffer(3)]],
+    constant float&     eps    [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint3 tptg     [[threads_per_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]])
 {
   const uint row = tid.y;
   const uint lid = ltid.x;
+  const uint tg = tptg.x;
+  const uint nsg = tg / 32;               // actual simdgroups (8@256, 16@512)
   const device VPIPE_ELT* xr = x + (uint)row * H;
-  const device VPIPE_ELT* rr = residual + (uint)row * H;
   device VPIPE_ELT* outr = out + (uint)row * H;
-
-  float local = 0.0f;
-  for (int i = (int)lid; i < H; i += RMS_TG) {
-    const float v = float(xr[i]);
-    local += v * v;
+  float acc = 0.0f;
+  for (uint i = lid; i < (uint)H; i += tg) {
+    const float v = float(xr[i]); acc += v * v;
   }
-  local = simd_sum(local);
-
-  threadgroup float partial[RMS_TG / 32];
-  if (simd_lid == 0) { partial[simd_gid] = local; }
+  acc = simd_sum(acc);
+  threadgroup float partial[32];          // max tg 1024 -> 32 simdgroups
+  if (simd_lid == 0) { partial[simd_gid] = acc; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0) {
-    float p = (simd_lid < RMS_TG / 32) ? partial[simd_lid] : 0.0f;
+    float p = (simd_lid < nsg) ? partial[simd_lid] : 0.0f;
     p = simd_sum(p);
     if (simd_lid == 0) { partial[0] = p; }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-
   const float inv = rsqrt(partial[0] / float(H) + eps);
-  for (int i = (int)lid; i < H; i += RMS_TG) {
+  for (uint i = lid; i < (uint)H; i += tg) {
+    outr[i] = VPIPE_ELT(float(xr[i]) * inv * float(weight[i]));
+  }
+}
+
+kernel void rms_add_fast_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  weight   [[buffer(1)]],
+    const device VPIPE_ELT*  residual [[buffer(2)]],
+    device VPIPE_ELT*        out      [[buffer(3)]],
+    constant int&       H          [[buffer(4)]],
+    constant float&     eps        [[buffer(5)]],
+    constant float&     post_scale [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint3 tptg     [[threads_per_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const uint tg = tptg.x;
+  const uint nsg = tg / 32;
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  const device VPIPE_ELT* rr = residual + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
+  float acc = 0.0f;
+  for (uint i = lid; i < (uint)H; i += tg) {
+    const float v = float(xr[i]); acc += v * v;
+  }
+  acc = simd_sum(acc);
+  threadgroup float partial[32];
+  if (simd_lid == 0) { partial[simd_gid] = acc; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float p = (simd_lid < nsg) ? partial[simd_lid] : 0.0f;
+    p = simd_sum(p);
+    if (simd_lid == 0) { partial[0] = p; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(H) + eps);
+  for (uint i = lid; i < (uint)H; i += tg) {
     const float normed = float(xr[i]) * inv * float(weight[i]);
     outr[i] = VPIPE_ELT((float(rr[i]) + normed) * post_scale);
   }

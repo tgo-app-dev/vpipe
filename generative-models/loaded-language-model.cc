@@ -326,7 +326,16 @@ LoadedLanguageModel::LoadedLanguageModel(
         // default here. A smaller caller request is still honored.
         // TODO: replace with on-demand contiguous-KV growth (like the paged
         // Qwen/Llama backend) and drop this cap.
-        constexpr std::uint32_t kGemmaMaxPages = 128;   // 512*128 = 65536 tok
+        // 512*128 = 65536 tok. Bounds the eager per-context (+per-branch) KV
+        // preallocation -- raising it risks OOM on 16 GB boxes under multi-
+        // branch realtime-vqa, so the DEFAULT stays 128. VPIPE_GEMMA_MAX_PAGES
+        // overrides it (e.g. 144 for a 64k prefill+decode, 256 for the model's
+        // native 128k) -- intended for the 64 GB box / long-context benches.
+        std::uint32_t kGemmaMaxPages = 128;
+        if (const char* e = std::getenv("VPIPE_GEMMA_MAX_PAGES")) {
+          const int v = std::atoi(e);
+          if (v >= 1 && v <= 4096) { kGemmaMaxPages = (std::uint32_t)v; }
+        }
         const std::uint32_t gemma_pages =
             max_pages > 0 ? std::min(max_pages, kGemmaMaxPages)
                           : kGemmaMaxPages;
@@ -1488,6 +1497,12 @@ LoadedLanguageModel::mtp_available() const
   return valid() && _impl->exec && _impl->exec->supports_mtp();
 }
 
+void
+LoadedLanguageModel::set_mtp_prefix_seed(bool on)
+{
+  if (_impl && _impl->exec) { _impl->exec->set_mtp_prefix_seed(on); }
+}
+
 bool
 LoadedLanguageModel::mtp_generate(
     Context& ctx, int32_t first_token, int max_tokens,
@@ -1526,6 +1541,11 @@ LoadedLanguageModel::mtp_generate(
                                      rope_first, sp, is_stop, on_wrapped,
                                      &prod, &hit);
   });
+  // One mtp_generate produces the WHOLE decode (many tokens accepted across the
+  // spec rounds), but the perf scope opened with a placeholder count of 1 --
+  // retag its end event with the real token count so the profiler reports decode
+  // tok/s, not ~1/decode. (next_token tags 1/call; m_bdecode_next tags N.)
+  _perf.set_value(static_cast<std::uint64_t>(prod));
   if (!ok) { return false; }
   if (prod > 0) {
     ctx._last_predicted = last_tok;

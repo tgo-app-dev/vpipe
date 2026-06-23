@@ -281,6 +281,13 @@ private:
     metal_compute::SharedBuffer in_ln, post_attn_ln, pre_ffn_ln,
         post_ffn_ln, post_pli_ln;
     metal_compute::SharedBuffer qw, qs, qb, kw, ks, kb, vw, vs, vb, ow, os, ob;
+    // QKV-fused decode GEMV: q|k|v weights row-concatenated into one buffer so
+    // a single full-occupancy GEMV replaces the 2-3 small per-proj GEMVs (the
+    // 512-row k/v matvecs under-occupy the GPU). Outputs still split to the
+    // separate _d_q/_d_k/_d_v. qkv_vrows==0 => q|k only (k_eq_v layers).
+    metal_compute::SharedBuffer qkvw, qkvs, qkvb;
+    int  qkv_qrows = 0, qkv_krows = 0, qkv_vrows = 0;
+    bool qkv_fused = false;
     metal_compute::SharedBuffer q_norm, k_norm;   // [head_dim]
     // MLP: gate/up INTERLEAVED into one [2*ffn, hidden] weight (row 2g=gate
     // g, 2g+1=up g) for the fused GeGLU qmv/qmm (no separate gate/up).
@@ -309,6 +316,12 @@ private:
       // e4b per-layer-input gate: gelu(qmv(plg_w,x))*pli[L] fused into the GEMV
       // write (folds the standalone geglu dispatch -- 1 fewer/layer at decode).
       _fn_qmv_gelu_mul,
+      // QKV-fused decode GEMV (one full-occupancy matvec over the q|k|v
+      // row-concat, base 4-bit only). Empty -> per-proj GEMV fallback.
+      _fn_qmv_qkv,
+      // input_layernorm RMSNorm fused into the QKV decode GEMV (one fewer
+      // dispatch + no normed-x device round-trip). Empty -> separate rms+qkv.
+      _fn_qmv_qkv_rms,
       // tied lm_head GEMV at embed_bits (8-bit on the GGUF path; aliases
       // _fn_qmv when embed_bits == base quant_bits).
       _fn_qmv_embed,
@@ -318,14 +331,16 @@ private:
       // the 12B 8-bit MLP -> steel GEMM).
       _fn_qmv_batch, _fn_qmv_batch_geglu, _fn_qmv_batch_mlp,
       _fn_qmm, _fn_qmm_geglu, _fn_transpose,
-      _fn_rms, _fn_rms_add, _fn_rope, _fn_rms_rope, _fn_rms_rope2,
-      _fn_rms_rope3, _fn_geglu, _fn_softcap,
-      _fn_scale, _fn_residual,
+      _fn_rms, _fn_rms_add, _fn_rms_fast, _fn_rms_add_fast,
+      _fn_rope, _fn_rms_rope, _fn_rms_rope2,
+      _fn_rms_rope3, _fn_rms_rope3_kvwrite, _fn_geglu, _fn_softcap,
+      _fn_scale, _fn_residual, _fn_copy, _fn_dummy_disp,
       // Native Q6_K tied embed/lm_head (GGUF path): reads the raw 6.5625-bit
       // table directly (lossless, ~25% smaller than an affine8 requant).
       // Bound + used only when an `embed_tokens.q6k` weight is present.
       _fn_embed_q6k, _fn_qmv_q6k,
-      _fn_embed, _fn_kv_write, _fn_kv_write2, _fn_sdpa_causal, _fn_sdpa_window,
+      _fn_embed, _fn_kv_write, _fn_kv_write2, _fn_kv_write_sub,
+      _fn_sdpa_causal, _fn_sdpa_window,
       _fn_sdpa_mma,
       // Device-direct contiguous (global/full-layer) prefill kernel: no tg K/V
       // staging + 3x larger key block, BIT-IDENTICAL to _fn_sdpa_mma (~1.3x).
@@ -335,6 +350,10 @@ private:
       // NOT bit-identical (online-softmax reblock). Default global-prefill SDPA.
       _fn_sdpa_flash,
       _fn_sdpa_mb, _fn_dense_t,
+      // Causal-tiled dense GEMM variants for the materialized global-attn
+      // prefill: QK skips score tiles above the diagonal, PV caps the key
+      // contraction at the row block's last query. ~halve each GEMM's work.
+      _fn_dense_t_qkcausal, _fn_dense_t_pvcausal,
       // Dense f16 GEMV (M=1 decode) for the e4b PLE's two f16 projections
       // (per_layer_model_projection + per_layer_projection). dense_gemm_t is
       // a 32-row-tiled GEMM that runs at ~half DRAM bandwidth at M=1; this
@@ -350,6 +369,11 @@ private:
       // + position-split merge, vs sdpa_mb's per-q-head re-scan. Reuses the
       // paged path's sdpa_gqa_merge_f16.
       _fn_sdpa_gqa, _fn_sdpa_gqa_merge,
+      // Materialized paged decode for the global (head_dim 512) layers (the
+      // omlx/MLX D=512 fallback: QK GEMV -> parallel softmax -> PV GEMV). M4-
+      // neutral (scratch round-trip cancels it); kept default-off as the M5
+      // matrix-core substrate. VPIPE_GEMMA_MAT_DECODE opts in.
+      _fn_dec_qk, _fn_dec_rowstat, _fn_dec_pv, _fn_dec_merge,
       // Direct-read flash-decode for the GLOBAL (head_dim 512, full-context)
       // layers -- the decode bottleneck. Reads K/V straight from device memory
       // (no threadgroup staging/barriers, fast::exp), like MLX sdpa_vector_2pass:
@@ -361,6 +385,10 @@ private:
       // UK-key unrolling + vec4 K/V loads (bit-identical to _direct, ~2x faster
       // -- the global decode attn is latency-bound). Used when D % 128 == 0.
       _fn_sdpa_gqa_tile, _fn_sdpa_gqa_direct, _fn_sdpa_gqa_vec,
+      // Linearized-ring sibling of _fn_sdpa_gqa_vec for BOUNDED sliding decode:
+      // scans the trailing window as ONE contiguous physical span (no `% ring`
+      // wrap), relying on the K/V mirror tail. Flag VPIPE_GEMMA_RING_LINEAR.
+      _fn_sdpa_gqa_vec_lin,
       // MMA flash-DECODE for the global layers (8 q-heads/tile sharing one kv
       // head -> matrix-core QK/PV, no per-key simd_sum). ~1.7-2x the vec kernel
       // + flatter with depth. Used when 8|G and D%64==0; split scales with depth
@@ -382,18 +410,36 @@ private:
       // sdpa_causal_flash_f16, D=512); fills the tier between _fn_sdpa_pmma2
       // (M5) and the scalar _fn_sdpa_paged_causal.
       _fn_sdpa_pflash,
+      // Materialized GLOBAL (head_dim 512) prefill softmax: in-place causal-
+      // masked softmax over a per-head materialized score matrix (the QK^T and
+      // PV use the steel dense GEMM). Gated by VPIPE_GEMMA_MATERIALIZED_GLOBAL.
+      _fn_causal_softmax,
       // Matrix-core (M5+) prefill GEMM: dequant a 4-bit weight to an f16
       // scratch, then dense matmul2d on the hardware matrix units.
       // _geglu_inter combines the interleaved gate|up dense output into
       // gelu(gate)*up so the matrix-core MLP stays token-exact with steel.
-      _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_geglu_inter;
+      _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_geglu_inter,
+      _fn_dense_mma_qkcausal;
 
   // Matrix-core prefill GEMM state (M5+). _use_mma gates the dense
   // matmul2d path (4-bit checkpoint + supports_matrix_cores); _mma_min_m is
   // the row threshold below which the steel quantized GEMM wins (dequant
   // cost is M-independent). _w_deq is the reused dequantized-weight scratch.
-  // _skip_dequant is a diagnostic A/B (VPIPE_GEMMA_MMA_NODQ).
+  // _skip_dequant is a diagnostic A/B (VPIPE_GEMMA_MMA_NODQ). _mat_mma routes
+  // the MATERIALIZED attention GEMMs (causal QK + full-K PV) onto the matrix
+  // units (VPIPE_GEMMA_MAT_NO_MMA2 reverts to steel).
   bool _use_mma = false;
+  bool _mat_mma = false;
+  // Bounded-ring single-pass prefill (VPIPE_GEMMA_PREFILL_SUBBLOCK). When the
+  // sliding ring is bounded (no grow), run the whole prompt in one forward
+  // (large proj/FFN/global GEMM batch) and let the sliding attention read the
+  // full-batch K/V scratch; only the ring KV-write stays page-bounded.
+  bool _prefill_subblock = true;
+  // Materialized banded sliding prefill enabled (VPIPE_GEMMA_MAT_SLIDING != 0).
+  // The ring-independent (kt/vt-reading) sliding attention; the bounded
+  // single-pass prefill above requires it, else a bounded ring would be read
+  // wrapped. Cached at construction so prefill() and forward_chunk_ agree.
+  bool _mat_sliding = true;
   int  _mma_min_m = 64;
   bool _skip_dequant = false;
   metal_compute::SharedBuffer _w_deq;
@@ -419,6 +465,10 @@ private:
   bool                                       _sliding_grow = true; // lazy 1-pass
   bool                                       _ple_gemv = true;     // M=1 PLE GEMV
   bool                                       _ple_quant = true;    // 4-bit PLE
+  bool                                       _qkv_fuse = true;     // fused QKV GEMV (~1% GPU win)
+  bool                                       _qkv_rms_fuse = false; // input_norm+QKV fusion (opt-in; slower)
+  bool                                       _rope_kv_fuse = true;  // rope3 + ring KV-write fused
+  bool                                       _rms_fast = true;      // simd_sum norms (default; RMS_FAST=0 -> tree)
 
   // Reused decode scratch (one token's worth, sized for head_dim_full).
   bool _scratch_ready = false;
@@ -426,6 +476,19 @@ private:
       _d_act, _d_mlp, _d_ple, _d_pleproj, _d_pli, _d_plg,
       _d_plp, _d_logits, _d_tok;
   metal_compute::SharedBuffer _d_argmax_id;   // [1] int32, GPU argmax out
+  metal_compute::SharedBuffer _d_dummy;       // [256] f16 scratch for DUMMY_DISP
+  // Materialized GLOBAL-prefill scratch (VPIPE_GEMMA_MATERIALIZED_GLOBAL):
+  // _d_scores = f16 [CAP, CAP] per-head score matrix; _d_vT = f16 [Hkv,D,CAP]
+  // V transpose. CAP = min(max_seq, 8192). Allocated only when the flag is on.
+  metal_compute::SharedBuffer _d_scores, _d_vT;
+  // Pipelined PLE production (Design A): split _d_pli into per-chunk buffers so
+  // chunks 1..N-1 overlap the layer chain's bubbles (only chunk 0 gates layer
+  // 0). _d_x_ple is a private snapshot of _d_x so the chunk GEMVs don't WAR with
+  // the per-layer residual writes. _ple_chunk_k = layers/chunk (0 = disabled).
+  std::vector<metal_compute::SharedBuffer> _d_pli_ch, _d_pleproj_ch;
+  metal_compute::SharedBuffer _d_x_ple;
+  int _ple_chunk_k = 0;
+  metal_compute::SharedBuffer _d_probe_in, _d_probe_out;  // concurrency probe
   // Page table {page_id,n_valid,global_start} triplets for the FULL-layer paged
   // attention (full_layers_paged); refilled per step/chunk. kPgtabSlots tables
   // ring so run-ahead pdecode (depth<=4) doesn't clobber an in-flight table.
@@ -437,6 +500,12 @@ private:
   bool _gqa_attn = false;
   int  _gqa_split = 32;
   metal_compute::SharedBuffer _d_gqa_oacc, _d_gqa_m, _d_gqa_l;
+  // Materialized global decode (VPIPE_GEMMA_MAT_DECODE): [Hq, Tstride] f32
+  // scores scratch (Tstride = max_pages*page_tokens); PV partials/m/l reuse
+  // _d_gqa_oacc/_d_gqa_m/_d_gqa_l. _dec_tstride is the per-head row stride.
+  bool _mat_decode = false;
+  int  _dec_tstride = 0;
+  metal_compute::SharedBuffer _d_dec_scores;
 
   // Per-context pipelined-decode state (pdecode_*). The token chain
   // (gen_ids) + sampler workspace stay GPU-resident; one command stream +
@@ -478,17 +547,27 @@ private:
   bool _gtile_attn = false;
   bool _gtile_staged = false;   // VPIPE_GEMMA_ATTN_STAGED: old staged kernel
   bool _gtile_direct = false;   // VPIPE_GEMMA_ATTN_DIRECT: scalar direct (A/B)
-  int  _gtile_split = 64;        // CAP on the per-layer position-split
+  // VPIPE_GEMMA_RING_LINEAR: read the bounded sliding window as ONE contiguous
+  // physical span (mirror-tail linearized ring) -- no `% ring_cap` in the
+  // decode SDPA hot loop. Default OFF. Mirror alloc/writes are always-on.
+  bool _ring_linear = false;
+  int  _gtile_split = 128;       // CAP on the per-layer position-split
   // Adaptive per-layer KV split: sp = clamp(ceil(scan_keys / _gtile_kps), 1,
   // _gtile_split). The global (full-context, ~2k+ keys) and sliding (512-key
   // window) layers want very different splits -- a fixed split over-splits the
   // tiny sliding window (sp=64 over 512 keys = 8 keys/split + a 64-partial
   // merge that reads more than the scan). Keys-per-split ~64 => global sp~32,
   // sliding sp~16. VPIPE_GEMMA_GTILE_KPS overrides; =0 restores the fixed split.
-  // 32 keeps global at the sp=64 cap (full-context layers want max split) while
-  // dropping sliding from 64->16 (swept optimum @2k; over-split of the 512-key
-  // window was the waste). Token-exact (split count doesn't change the math).
-  int  _gtile_kps = 32;
+  // 16 keeps the 512-key sliding window at sp=32. Global is CAP-limited: at
+  // depth >= kps*_gtile_split keys, sp pins to the cap, so the cap sets the
+  // global keys/split. The cap was 64 (set when only <=4k was tested); the
+  // LONG-CONTEXT decode is LATENCY/OCCUPANCY-bound (NOT bandwidth -- the mb256
+  // KV-read-once form is ~40% SLOWER at 16k), so MORE split-parallelism wins as
+  // depth grows. M4 Pro re-sweep raising the cap to 128: pipe decode 4k 60.7->
+  // 60.5 (neutral), 8k 56.7->57.4 (+1.2%), 16k 49.8->51.8 (+4.2%); 256 over-
+  // splits (16k 51.2 < 128's 51.8). Sliding is unaffected (sp=32 < cap either
+  // way). Token-exact (split count changes only the f32 merge order).
+  int  _gtile_kps = 16;
   // MMA q-head flash-decode for global layers (default ON when available + 8|G).
   // VPIPE_GEMMA_NO_MMA_QHEAD=1 forces the vec kernel for A/B. _mma_qhead_cap is
   // the max KV-split (partials buffer sizing); split = ceil(scan/64) at runtime.
@@ -508,6 +587,13 @@ private:
   // _pmma2_attn is off (no matrix cores). VPIPE_GEMMA_NO_PFLASH=1 reverts to
   // the scalar sdpa_paged_causal.
   bool _pflash_attn = false;
+  // MATERIALIZED GLOBAL (head_dim 512) prefill path (VPIPE_GEMMA_MATERIALIZED_
+  // GLOBAL=1; default OFF). Mirrors MLX's head_dim-512 fallback: per-head
+  // Q.K^T (steel GEMM) -> causal softmax (_fn_causal_softmax) -> P.V (steel
+  // GEMM), replacing the inefficient fused sdpa_paged_flash_d512 for the
+  // single-chunk (qpos==0) global prefill only. Capped at T_kv<=_scores_cap.
+  bool _materialized_global = false;
+  int  _scores_cap = 0;       // CAP = min(max_seq, 8192); 0 until scratch ready
   // KV-split GQA paged decode (sdpa_paged_gqa_d512 + merge) available -- the
   // fast full-layer decode path; falls back to scalar sdpa_paged_causal when
   // off / G>SDPA_GQA_MAXG / partials absent. VPIPE_GEMMA_NO_PGQA=1 reverts.

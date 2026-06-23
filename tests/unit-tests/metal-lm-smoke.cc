@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <random>
 #include <span>
 #include <string>
@@ -1712,6 +1713,460 @@ TEST(metal_lm_smoke, qwen_optiq_mtp_speculative_token_exact) {
   run_mtp(child2, /*draft_len=*/2, "depth-2");
 }
 
+// MTP acceptance/speedup on LONG, COHERENT text -- the regime the "<1.0x at
+// long context" complaint is really about. The token-exact test above decodes
+// 1000+ tokens out of a trivial prompt, which DEGENERATES (the model's own
+// rambling becomes high-entropy and the drafter's acceptance collapses ~ for
+// ANY drafter). Here we prefill a long, information-dense passage and decode a
+// GROUNDED continuation: the model stays coherent/confident, so acceptance
+// reflects real long-context usage (RAG / documents / code), not degeneracy.
+TEST(metal_lm_smoke, qwen_optiq_mtp_realtext_accept) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 512;
+  int kGen = 256;
+  if (const char* e = std::getenv("VPIPE_MTP_GEN_TOKENS")) {
+    const int v = std::atoi(e);
+    if (v > 0) { kGen = v; }
+  }
+  // Long enough page pool for the long prefix + root + two depth children.
+  mcfg.max_pages = std::max(16, (4 * (2048 + kGen)) / 512 + 8);
+  auto model = genai::MetalQwenModel::load(path, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  ASSERT_TRUE(model->has_mtp());
+  // Prefix-seed is opt-in (off by default); enable it so this bench/teacher-
+  // force exercises the seeded ("full history") drafter. VPIPE_MTP_NO_SEED
+  // still hard-disables it for the decode-only A/B.
+  model->set_mtp_prefix_seed(true);
+
+  // A long, coherent, information-dense passage (no repetition). The decode
+  // continues it in the same encyclopedic register -> grounded, low-entropy.
+  const char* passage =
+      "The deep ocean, comprising all marine waters below roughly one thousand "
+      "meters, is the largest continuous habitat on Earth and also the least "
+      "explored. Sunlight is fully extinguished within the first few hundred "
+      "meters, so the vast volume beneath -- the aphotic zone -- exists in "
+      "perpetual darkness. With increasing depth the water grows colder and the "
+      "pressure climbs by about one atmosphere for every ten meters of descent, "
+      "reaching more than a thousand atmospheres in the deepest trenches. These "
+      "conditions long convinced naturalists that the abyss must be lifeless, a "
+      "barren desert of cold and crushing weight. The reality proved far "
+      "stranger. Life is distributed throughout the water column and across the "
+      "seafloor, sustained by a thin, ceaseless rain of organic particles "
+      "descending from the sunlit surface, a flux that oceanographers call "
+      "marine snow. This detritus -- dead plankton, fecal pellets, and "
+      "aggregated mucus -- is the primary food supply for most deep dwellers, "
+      "and its slow settling couples the productive surface to the dark interior "
+      "over timescales of weeks. A second, wholly independent foundation for "
+      "life was discovered in 1977 near the Galapagos Rift, where submersibles "
+      "found hot springs venting mineral-rich fluid through the seafloor. "
+      "Around these hydrothermal vents thrive dense communities of tube worms, "
+      "clams, and shrimp that depend not on sunlight but on chemosynthesis: "
+      "specialized bacteria oxidize hydrogen sulfide and methane from the vent "
+      "fluid to fix carbon, forming the base of a food web powered by the "
+      "planet's internal heat rather than the sun. Many deep-sea animals "
+      "generate their own light through bioluminescence, a chemical reaction "
+      "between a substrate called luciferin and an enzyme called luciferase. "
+      "Light is used to lure prey, to startle predators, to find mates in the "
+      "dark, and as counter-illumination camouflage that erases an animal's "
+      "silhouette against the faint glow filtering down from above. The "
+      "anglerfish dangles a luminous lure before its jaws; the cookie-cutter "
+      "shark glows except for a dark collar that mimics a small fish to draw in "
+      "larger hunters. Bodies are adapted to scarcity and pressure: metabolism "
+      "is slowed, skeletons and muscles are reduced, and proteins are stabilized "
+      "by molecules that counteract the deforming effect of extreme pressure. "
+      "Growth is unhurried and lifespans are often long; some deep corals live "
+      "for thousands of years, recording ocean chemistry in their skeletons like "
+      "tree rings. The deep sea also governs the planet's climate over the long "
+      "term. Cold, dense water sinking at high latitudes drives the global "
+      "overturning circulation that redistributes heat, and the biological pump "
+      "that carries carbon downward as marine snow sequesters it in deep waters "
+      "and sediments for centuries. Exploration remains difficult and expensive. "
+      "Crewed submersibles, remotely operated vehicles, and autonomous gliders "
+      "have mapped only a small fraction of the seafloor in detail, and new "
+      "species are described on nearly every expedition.";
+
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec tspec;
+  tspec.hf_dir = path;
+  tspec.compute_dtype = "f16";
+  auto lm = mgr->load(tspec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const auto* tpl = lm->chat_template();
+  ASSERT_TRUE(tpl != nullptr);
+
+  std::vector<std::int32_t> ids;
+  std::string ask = std::string(passage) +
+      "\n\nContinue this encyclopedic article for several more paragraphs in "
+      "the same factual, expository style.";
+  // Prompt override (VPIPE_MTP_PROMPT_FILE): swap the whole user turn for a
+  // prompt read from a file, so acceptance can be A/B'd across prompt domains
+  // (e.g. our prose vs MTPLX's coding prompt) on the same head.
+  if (const char* pf = std::getenv("VPIPE_MTP_PROMPT_FILE")) {
+    std::ifstream pin(pf);
+    if (pin) {
+      std::stringstream ss;
+      ss << pin.rdbuf();
+      ask = ss.str();
+      std::printf("[mtp_realtext] prompt override from %s (%zu chars)\n",
+                  pf, ask.size());
+    }
+  }
+  tpl->render_user_turn(ask, /*is_first_turn=*/true, &ids);
+  ASSERT_TRUE(!ids.empty());
+  // VPIPE_MTP_NO_THINK: the VL template opens a thinking block (`<think>\n`);
+  // close it immediately (`\n</think>\n\n`) so the model answers directly,
+  // matching a thinking-OFF runtime (e.g. MTPLX) for a fair acceptance A/B.
+  if (std::getenv("VPIPE_MTP_NO_THINK")) {
+    const auto& tk = lm->tokenizer();
+    auto nl = tk.encode("\n");
+    ids.insert(ids.end(), nl.begin(), nl.end());
+    const std::int32_t tc = tk.special_token_id("</think>");
+    if (tc >= 0) { ids.push_back(tc); }
+    auto nl2 = tk.encode("\n\n");
+    ids.insert(ids.end(), nl2.begin(), nl2.end());
+    std::printf("[mtp_realtext] thinking DISABLED (closed think block, "
+                "</think>=%d)\n", tc);
+  }
+
+  // VPIPE_MTP_PREFIX_IDS: replace the rendered prefix with an explicit
+  // comma-separated token-id list, so an EXACT prompt (e.g. another runtime's
+  // rendered tokens) can be fed verbatim to isolate kernel/fp divergence from
+  // chat-template divergence.
+  if (const char* pe = std::getenv("VPIPE_MTP_PREFIX_IDS")) {
+    std::vector<std::int32_t> ov;
+    const char* p = pe;
+    while (*p) {
+      char* end = nullptr;
+      const long v = std::strtol(p, &end, 10);
+      if (end == p) { ++p; continue; }
+      ov.push_back((std::int32_t)v);
+      p = end;
+    }
+    if (!ov.empty()) {
+      ids = ov;
+      std::printf("[mtp_realtext] prefix OVERRIDE from VPIPE_MTP_PREFIX_IDS "
+                  "(%zu tok)\n", ids.size());
+    }
+  }
+
+  auto argmax = [](const std::vector<float>& v) -> std::int32_t {
+    std::int32_t best = 0;
+    float bv = v.empty() ? 0.0f : v[0];
+    for (std::size_t i = 1; i < v.size(); ++i) {
+      if (v[i] > bv) { bv = v[i]; best = (std::int32_t)i; }
+    }
+    return best;
+  };
+
+  std::vector<float> lg = model->prefill(ids);
+  ASSERT_TRUE(!lg.empty());
+  const std::int32_t first = argmax(lg);
+  std::printf("[mtp_realtext] prefix=%zu tok, decode at ctx %zu..%zu\n",
+              ids.size(), ids.size(), ids.size() + (std::size_t)kGen);
+  // VPIPE_MTP_DUMP_IDS: print the prefix + greedy-continuation token ids as
+  // comma-separated lists for cross-runtime divergence analysis.
+  if (std::getenv("VPIPE_MTP_DUMP_IDS")) {
+    std::printf("[mtp_realtext] prefix_ids=");
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      std::printf("%s%d", i ? "," : "", ids[i]);
+    }
+    std::printf("\n[mtp_realtext] first_pred=%d\n", first);
+  }
+  // VPIPE_MTP_TF: teacher-forced MTP draft-accuracy on a FIXED continuation
+  // (comma-separated ids in VPIPE_MTP_CONT_FILE) walked verbatim through the
+  // model from this prefill -- measures depth-1 draft quality WITHOUT the
+  // free-run stream-divergence confound (the head is conditioned on the TRUE
+  // next token). VPIPE_MTP_TF_CHUNK sets the per-verify width (default 2, the
+  // depth-1 decode's MTP attention window).
+  if (std::getenv("VPIPE_MTP_TF")) {
+    const char* cf = std::getenv("VPIPE_MTP_CONT_FILE");
+    std::vector<std::int32_t> cont;
+    if (cf) {
+      std::ifstream cin2(cf);
+      std::string s;
+      std::getline(cin2, s, '\0');
+      const char* p = s.c_str();
+      while (*p) {
+        char* e = nullptr;
+        const long v = std::strtol(p, &e, 10);
+        if (e == p) { ++p; continue; }
+        cont.push_back((std::int32_t)v);
+        p = e;
+      }
+    }
+    ASSERT_TRUE(!cont.empty());
+    int chunk = 2;
+    if (const char* ce = std::getenv("VPIPE_MTP_TF_CHUNK")) {
+      const int v = std::atoi(ce);
+      if (v >= 1) { chunk = v; }
+    }
+    const genai::ContextId tfc =
+        model->context_manager()->branch(model->root_context());
+    long hits = 0, tot = 0;
+    const bool ok = model->mtp_teacher_force(tfc, cont, chunk, &hits, &tot);
+    EXPECT_TRUE(ok);
+    std::printf("[mtp_realtext] teacher-force cont=%zu tok\n", cont.size());
+    return;
+  }
+
+  const genai::ContextId child1 =
+      model->context_manager()->branch(model->root_context());
+  const genai::ContextId child2 =
+      model->context_manager()->branch(model->root_context());
+  ASSERT_TRUE(child1.valid() && child2.valid());
+
+  std::vector<std::int32_t> ref;
+  ref.push_back(first);
+  const auto s0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kGen; ++i) {
+    const std::int32_t t = model->forward_argmax(ref.back());
+    if (t < 0) { break; }
+    ref.push_back(t);
+  }
+  const auto s1 = std::chrono::steady_clock::now();
+  const double serial_ms =
+      std::chrono::duration<double, std::milli>(s1 - s0).count();
+  const double serial_tps = (double)(ref.size() - 1) / (serial_ms / 1000.0);
+  std::printf("[mtp_realtext] serial baseline %.1f tok/s\n", serial_tps);
+  {
+    const std::string gen = lm->tokenizer().decode(ref);
+    std::printf("[mtp_realtext] gen: %.280s\n", gen.c_str());
+  }
+  if (std::getenv("VPIPE_MTP_DUMP_IDS")) {
+    std::printf("[mtp_realtext] gen_ids=");
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      std::printf("%s%d", i ? "," : "", ref[i]);
+    }
+    std::printf("\n");
+  }
+
+  // Optional sampler override (acceptance A/B vs an external runtime in the
+  // SAME mode): VPIPE_MTP_TEMP>0 switches to sampling at that temperature with
+  // VPIPE_MTP_TOP_P / VPIPE_MTP_TOP_K; VPIPE_MTP_LEVIATHAN=1 uses L-C accept.
+  // Default (unset) stays greedy/exact-match.
+  auto run_mtp = [&](genai::ContextId cid, int draft_len, const char* tag) {
+    std::vector<std::int32_t> got;
+    long accepted = 0, rounds = 0;
+    genai::MtpDecodeCtl ctl;
+    bool sampling = false;
+    if (const char* te = std::getenv("VPIPE_MTP_TEMP")) {
+      const float t = (float)std::atof(te);
+      if (t > 0.0f) {
+        sampling = true;
+        ctl.sampler.greedy = false;
+        ctl.sampler.temperature = t;
+        const char* tp = std::getenv("VPIPE_MTP_TOP_P");
+        const char* tk = std::getenv("VPIPE_MTP_TOP_K");
+        ctl.sampler.top_p = tp ? (float)std::atof(tp) : 1.0f;
+        ctl.sampler.top_k = tk ? std::atoi(tk) : 0;
+        ctl.sampler.seed = 777ull;
+        ctl.sampler.n_iter = 16;
+        const char* lv = std::getenv("VPIPE_MTP_LEVIATHAN");
+        model->set_leviathan(lv && std::atoi(lv) != 0);
+      }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = sampling
+        ? model->mtp_decode(cid, first, (int)ref.size(), got, draft_len,
+                            &accepted, &rounds, ctl)
+        : model->mtp_decode(cid, first, (int)ref.size(), got, draft_len,
+                            &accepted, &rounds);
+    model->set_leviathan(false);
+    const auto t1 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(ok);
+    const double ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    int mism = 0;
+    const std::size_t nn = std::min(ref.size(), got.size());
+    for (std::size_t i = 0; i < nn; ++i) {
+      if (ref[i] != got[i]) { ++mism; }
+    }
+    std::printf("[mtp_realtext] %s: %zu tok in %.0f ms (%.1f tok/s) | "
+                "speedup %.2fx | rounds=%ld tok/round=%.2f mism=%d\n",
+                tag, got.size(), ms, (double)got.size() / (ms / 1000.0),
+                ((double)got.size() / (ms / 1000.0)) / serial_tps, rounds,
+                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism);
+    // This is a perf/acceptance benchmark, NOT a token-exact check (the
+    // controlled-length *_token_exact tests cover that). Over long greedy
+    // generation MTP can diverge from the serial reference at a near-tie argmax
+    // (a tiny fp difference between the batched-verify and single-decode paths
+    // flips the top token, then the sequences cascade apart) -- expected, and
+    // independent of the MAXM=4 verify (depth-1 never takes it yet diverges
+    // identically). So report mism; don't fail on it.
+  };
+  run_mtp(child1, /*draft_len=*/1, "depth-1");
+  run_mtp(child2, /*draft_len=*/2, "depth-2");
+}
+
+// Leviathan-Chen MTP sampling: (A) at temperature it accepts MORE than the
+// default exact-match scheme (the whole point -- ours accepts a draft d with
+// prob p(d); L-C accepts min(1,p(d)/q(d)) >= p(d)); (B) as temp->0 it must
+// converge to the greedy result (a gross-corruption guard on the ratio +
+// residual math). Depth-1, pure temperature.
+TEST(metal_lm_smoke, qwen_optiq_mtp_leviathan_sampling) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 512;
+  mcfg.max_pages = 64;
+  auto model = genai::MetalQwenModel::load(path, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  ASSERT_TRUE(model->has_mtp());
+
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec tspec;
+  tspec.hf_dir = path;
+  tspec.compute_dtype = "f16";
+  auto lm = mgr->load(tspec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const auto* tpl = lm->chat_template();
+  ASSERT_TRUE(tpl != nullptr);
+
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(
+      "Write a short paragraph explaining why the sky looks blue during the "
+      "day and turns red at sunset.", /*is_first_turn=*/true, &ids);
+  ASSERT_TRUE(!ids.empty());
+  auto argmax = [](const std::vector<float>& v) -> std::int32_t {
+    std::int32_t b = 0; float bv = v.empty() ? 0.0f : v[0];
+    for (std::size_t i = 1; i < v.size(); ++i) {
+      if (v[i] > bv) { bv = v[i]; b = (std::int32_t)i; }
+    }
+    return b;
+  };
+  std::vector<float> lg = model->prefill(ids);
+  ASSERT_TRUE(!lg.empty());
+  const std::int32_t first = argmax(lg);
+  auto* cmgr = model->context_manager();
+  const genai::ContextId root = model->root_context();
+
+  const std::uint64_t seed = 777ull;
+  // Run mtp_decode and return acceptance (tok/round) for a sampler config.
+  auto run = [&](bool lc, float temp, float top_p, int top_k, int draft_len,
+                 int n, bool gpu = false) -> double {
+    model->set_leviathan(lc);
+    model->set_lc_gpu(gpu);
+    genai::MtpDecodeCtl ctl;
+    ctl.sampler.greedy = false; ctl.sampler.temperature = temp;
+    ctl.sampler.top_p = top_p; ctl.sampler.top_k = top_k;
+    ctl.sampler.seed = seed; ctl.sampler.n_iter = 16;
+    genai::ContextId c = cmgr->branch(root);
+    std::vector<std::int32_t> got; long acc = 0, rnds = 0;
+    EXPECT_TRUE(model->mtp_decode(c, first, n, got, draft_len, &acc, &rnds,
+                                  ctl));
+    model->set_leviathan(false);
+    model->set_lc_gpu(false);
+    return rnds > 0 ? (double)got.size() / (double)rnds : 0.0;
+  };
+  // Reduce-to-greedy guard: at temp->0 L-C samples ~argmax, so its output must
+  // track the (exact-match) GREEDY mtp_decode of the same depth until a rare
+  // near-tie deviation cascades. Validates the ratio + residual + nucleus math
+  // doesn't corrupt the distribution. Returns the first divergence index.
+  auto reduce = [&](float top_p, int top_k, int draft_len,
+                    const char* tag, bool gpu = false) -> std::size_t {
+    model->set_leviathan(false);
+    model->set_lc_gpu(false);
+    std::vector<std::int32_t> gref;
+    { genai::MtpDecodeCtl gc; genai::ContextId c = cmgr->branch(root);
+      long a = 0, r = 0;
+      EXPECT_TRUE(model->mtp_decode(c, first, 48, gref, draft_len, &a, &r, gc));
+    }
+    model->set_leviathan(true);
+    model->set_lc_gpu(gpu);
+    genai::MtpDecodeCtl ctl;
+    ctl.sampler.greedy = false; ctl.sampler.temperature = 0.005f;
+    ctl.sampler.top_p = top_p; ctl.sampler.top_k = top_k;
+    ctl.sampler.seed = 42ull; ctl.sampler.n_iter = 16;
+    genai::ContextId cb = cmgr->branch(root);
+    std::vector<std::int32_t> glc; long a2 = 0, r2 = 0;
+    EXPECT_TRUE(model->mtp_decode(cb, first, 48, glc, draft_len, &a2, &r2, ctl));
+    model->set_leviathan(false);
+    model->set_lc_gpu(false);
+    const std::size_t nn = std::min(gref.size(), glc.size());
+    std::size_t fd = nn;
+    for (std::size_t i = 0; i < nn; ++i) {
+      if (gref[i] != glc[i]) { fd = i; break; }
+    }
+    std::printf("[mtp_leviathan] reduce-to-greedy %s: first divergence "
+                "@%zu/%zu\n", tag, fd, nn);
+    return fd;
+  };
+
+  // ---- PART A: depth-1 acceptance benefit grows with temperature. ----
+  double tpr_em_hi = 0.0, tpr_lc_hi = 0.0;
+  for (float temp : {0.3f, 0.5f, 0.7f, 1.0f, 1.5f}) {
+    const double tpr_em = run(false, temp, 1.0f, 0, 1, 200);
+    const double tpr_lc = run(true,  temp, 1.0f, 0, 1, 200);
+    std::printf("[mtp_leviathan] depth-1 temp=%.2f | exact-match tok/round=%.2f "
+                "| leviathan tok/round=%.2f\n", temp, tpr_em, tpr_lc);
+    if (temp > 1.4f) { tpr_em_hi = tpr_em; tpr_lc_hi = tpr_lc; }
+  }
+  EXPECT_TRUE(tpr_lc_hi > tpr_em_hi + 0.1);   // clear high-temp win
+
+  // ---- PART B: depth-2 L-C acceptance at high temp (chained ratio test). ----
+  const double d2_em = run(false, 1.5f, 1.0f, 0, 2, 200);
+  const double d2_lc = run(true,  1.5f, 1.0f, 0, 2, 200);
+  std::printf("[mtp_leviathan] depth-2 temp=1.50 | exact-match tok/round=%.2f "
+              "| leviathan tok/round=%.2f\n", d2_em, d2_lc);
+  EXPECT_TRUE(d2_lc > d2_em + 0.1);
+
+  // ---- PART C: top_p nucleus acceptance (temperature + nucleus filter). ----
+  const double tp_em = run(false, 1.5f, 0.9f, 0, 1, 200);
+  const double tp_lc = run(true,  1.5f, 0.9f, 0, 1, 200);
+  std::printf("[mtp_leviathan] depth-1 temp=1.50 top_p=0.90 | exact-match "
+              "tok/round=%.2f | leviathan tok/round=%.2f\n", tp_em, tp_lc);
+
+  // ---- PART D: reduce-to-greedy across configs (correctness guard). ----
+  EXPECT_TRUE(reduce(1.0f, 0,  1, "depth-1 pure-temp") >= 4);
+  EXPECT_TRUE(reduce(0.9f, 0,  1, "depth-1 top_p=0.9") >= 4);
+  EXPECT_TRUE(reduce(1.0f, 40, 1, "depth-1 top_k=40") >= 4);
+  EXPECT_TRUE(reduce(1.0f, 0,  2, "depth-2 pure-temp") >= 4);
+  EXPECT_TRUE(reduce(0.9f, 0,  2, "depth-2 top_p=0.9") >= 4);
+
+  // ---- PART E: on-GPU L-C (lc_sample_f16 / lc_accept_f16). Same nucleus +
+  // accept/residual as the host path, done one-threadgroup-per-row on the GPU.
+  // (1) reduce-to-greedy: at temp->0 the GPU L-C must track exact-match greedy
+  // exactly as the host path does -- the strong correctness anchor that the
+  // GPU nucleus + accept + residual + Gumbel-max compose losslessly.
+  EXPECT_TRUE(reduce(1.0f, 0,  1, "gpu depth-1 pure-temp", true) >= 4);
+  EXPECT_TRUE(reduce(0.9f, 0,  1, "gpu depth-1 top_p=0.9", true) >= 4);
+  EXPECT_TRUE(reduce(1.0f, 40, 1, "gpu depth-1 top_k=40", true) >= 4);
+  EXPECT_TRUE(reduce(1.0f, 0,  2, "gpu depth-2 pure-temp", true) >= 4);
+  EXPECT_TRUE(reduce(0.9f, 0,  2, "gpu depth-2 top_p=0.9", true) >= 4);
+  // (2) acceptance parity host vs GPU (different RNG sub-streams -> the same
+  // distribution -> statistically-consistent tok/round, not a drift/bug).
+  for (float temp : {0.7f, 1.5f}) {
+    const double host = run(true, temp, 0.9f, 0, 1, 200, /*gpu=*/false);
+    const double gpu  = run(true, temp, 0.9f, 0, 1, 200, /*gpu=*/true);
+    std::printf("[mtp_leviathan] gpu-parity temp=%.2f top_p=0.90 | host "
+                "tok/round=%.2f | gpu tok/round=%.2f\n", temp, host, gpu);
+    EXPECT_TRUE(std::fabs(host - gpu) < 0.35);
+  }
+  model->set_leviathan(false);
+  model->set_lc_gpu(false);
+}
+
 // GGUF tokenizer scheme regression. Tokenizer::from_gguf must pick byte-level
 // (gpt2) vs metaspace (llama) from tokenizer.ggml.model. A Qwen3.5 GGUF is
 // "gpt2" byte-level -- the bug forced every GGUF to metaspace, so the raw
@@ -1808,6 +2263,26 @@ TEST(metal_lm_smoke, qwen_gguf_mtp_speculative_token_exact) {
       "What is the capital of France? Reply with the city name only.",
       /*is_first_turn=*/true, &ids);
   ASSERT_TRUE(!ids.empty());
+  // Exact-prefix override (e.g. another runtime's rendered ids) for a long-
+  // prefix seed A/B on the GGUF k-quant MTP head.
+  if (const char* pe = std::getenv("VPIPE_MTP_PREFIX_IDS")) {
+    std::vector<std::int32_t> ov;
+    const char* p = pe;
+    while (*p) {
+      char* end = nullptr;
+      const long v = std::strtol(p, &end, 10);
+      if (end == p) { ++p; continue; }
+      ov.push_back((std::int32_t)v);
+      p = end;
+    }
+    if (!ov.empty()) {
+      ids = ov;
+      std::printf("[qwen_gguf_mtp] prefix OVERRIDE (%zu tok)\n", ids.size());
+    }
+  }
+  // Prefix-seed the MTP drafter (opt-in; VPIPE_MTP_NO_SEED disables) so the
+  // GGUF k-quant seed path is exercised.
+  model->set_mtp_prefix_seed(std::getenv("VPIPE_MTP_NO_SEED") == nullptr);
 
   auto argmax = [](const std::vector<float>& v) -> std::int32_t {
     std::int32_t best = 0;
@@ -1823,9 +2298,63 @@ TEST(metal_lm_smoke, qwen_gguf_mtp_speculative_token_exact) {
   std::vector<float> lg = model->prefill(ids);
   ASSERT_TRUE(!lg.empty());
   const std::int32_t first = argmax(lg);
+  // VPIPE_MTP_DUMP_IDS: print this model's own greedy continuation (first +
+  // forward_argmax*N) so the TF run below walks an on-distribution sequence.
+  if (std::getenv("VPIPE_MTP_DUMP_IDS")) {
+    int n = 256;
+    if (const char* e = std::getenv("VPIPE_MTP_GEN_TOKENS")) {
+      const int v = std::atoi(e);
+      if (v > 0) { n = v; }
+    }
+    std::printf("[qwen_gguf_mtp] cont_ids=%d", first);
+    std::int32_t t = first;
+    for (int i = 0; i < n; ++i) {
+      t = model->forward_argmax(t);
+      if (t < 0) { break; }
+      std::printf(",%d", t);
+    }
+    std::printf("\n");
+    return;
+  }
+  // VPIPE_MTP_TF: teacher-forced depth-1 draft accuracy on a fixed continuation
+  // (VPIPE_MTP_CONT_FILE) -- the seed A/B for the GGUF k-quant MTP head, exactly
+  // as the OptiQ realtext test. Returns before the spec-decode timing below.
+  if (std::getenv("VPIPE_MTP_TF")) {
+    const char* cf = std::getenv("VPIPE_MTP_CONT_FILE");
+    std::vector<std::int32_t> cont;
+    if (cf) {
+      std::ifstream cin2(cf);
+      std::string s;
+      std::getline(cin2, s, '\0');
+      const char* p = s.c_str();
+      while (*p) {
+        char* e = nullptr;
+        const long v = std::strtol(p, &e, 10);
+        if (e == p) { ++p; continue; }
+        cont.push_back((std::int32_t)v);
+        p = e;
+      }
+    }
+    ASSERT_TRUE(!cont.empty());
+    int chunk = 2;
+    if (const char* ce = std::getenv("VPIPE_MTP_TF_CHUNK")) {
+      const int v = std::atoi(ce);
+      if (v >= 1) { chunk = v; }
+    }
+    const genai::ContextId tfc =
+        model->context_manager()->branch(model->root_context());
+    long hits = 0, tot = 0;
+    EXPECT_TRUE(model->mtp_teacher_force(tfc, cont, chunk, &hits, &tot));
+    return;
+  }
+  // One child branch per MTP depth, BOTH off the clean prefilled prefix (before
+  // the serial ref loop advances the root) so each depth starts from the exact
+  // same state as the reference.
   const genai::ContextId child =
       model->context_manager()->branch(model->root_context());
-  ASSERT_TRUE(child.valid());
+  const genai::ContextId child2 =
+      model->context_manager()->branch(model->root_context());
+  ASSERT_TRUE(child.valid() && child2.valid());
 
   // Serial greedy reference on the root context (kGen set above).
   std::vector<std::int32_t> ref;
@@ -1864,6 +2393,34 @@ TEST(metal_lm_smoke, qwen_gguf_mtp_speculative_token_exact) {
   EXPECT_TRUE(mism == 0);
   EXPECT_TRUE(got.size() + 1 >= ref.size());
   EXPECT_TRUE(rounds > 0 && (long)got.size() > rounds);   // some drafts landed
+
+  // Depth-2 (draft_len=2 -> 3 drafts/round, M=3): exercises the k-quant MAXM=4
+  // verify-GEMV twins (qmv_q*k_batch4) -- one weight read for the 3-row tile vs
+  // the MAXM=2 form's 2 grid.z tiles. Must stay token-exact vs the same serial
+  // ref. A/B the MAXM=2-tiled path with VPIPE_MTP_QMV4=0.
+  {
+    std::vector<std::int32_t> got2;
+    long acc2 = 0, rnd2 = 0;
+    const auto d0 = std::chrono::steady_clock::now();
+    const bool ok2 = model->mtp_decode(child2, first, (int)ref.size(), got2,
+                                       /*draft_len=*/2, &acc2, &rnd2);
+    const double ms2 =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - d0).count();
+    EXPECT_TRUE(ok2);
+    int mism2 = 0;
+    const std::size_t nn2 = std::min(ref.size(), got2.size());
+    for (std::size_t i = 0; i < nn2; ++i) {
+      if (ref[i] != got2[i]) { ++mism2; }
+    }
+    std::printf("[qwen_gguf_mtp] depth-2: %zu tok in %.0f ms (%.1f tok/s) | "
+                "speedup %.2fx | rounds=%ld tok/round=%.2f mism=%d\n",
+                got2.size(), ms2, (double)got2.size() / (ms2 / 1000.0),
+                ((double)got2.size() / (ms2 / 1000.0)) / serial_tps, rnd2,
+                rnd2 > 0 ? (double)got2.size() / (double)rnd2 : 0.0, mism2);
+    EXPECT_TRUE(mism2 == 0);
+    EXPECT_TRUE(rnd2 > 0 && (long)got2.size() > rnd2);
+  }
 }
 
 // MTP speculative SAMPLING (non-greedy): mtp_decode with a sampling verify MUST
@@ -2198,6 +2755,134 @@ TEST(metal_lm_smoke, gemma_mma_prefill_token_exact) {
   EXPECT_TRUE(mism == 0);
 }
 
+// The materialized global-attention prefill (default) must be greedy
+// token-exact with the pflash reference (materialized OFF). REGRESSION GUARD
+// for the steel dense_gemm_t K-tail bug: the materialized PV GEMM has
+// contraction K = T_kv, and the kernel read the final K-block unmasked when
+// T_kv % 32 != 0, spilling into the next packed row. The prompt below is
+// deliberately NOT a multiple of 32 tokens so the tail block exists; a
+// power-of-two ctx (the perf bench) never tripped it. The sibling mma/steel
+// token-exact tests both run materialized, so they could NOT catch this --
+// this one pins materialized against pflash. Gated on VPIPE_GEMMA4_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gemma_materialized_matches_pflash_token_exact) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  auto run = [&](bool materialized) -> std::vector<std::int32_t> {
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    ::setenv("VPIPE_GEMMA_MATERIALIZED_GLOBAL", materialized ? "1" : "0", 1);
+    // Force the DENSE (non-causal) materialized GEMMs: the plain dense_gemm_t
+    // is the kernel that had the K-tail bug; the causal variants mostly mask
+    // it, so pin the dense path here to keep this a real regression guard.
+    ::setenv("VPIPE_GEMMA_MAT_CAUSAL", "0", 1);
+    Session sess;
+    auto* mc = sess.metal_compute();
+    auto* mgr = sess.generative_model_manager();
+    std::vector<std::int32_t> out;
+    if (mc == nullptr || !mc->valid() || mgr == nullptr) { return out; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.compute_dtype = "f16";
+    spec.page_tokens = 512;
+    spec.max_pages = 16;
+    auto lm = mgr->load(spec);
+    if (!lm || !lm->valid()) { return out; }
+    // 47 tokens (NOT a multiple of 32) -> the PV contraction has a tail block.
+    auto ids = lm->tokenizer().encode(
+        "The old lighthouse keeper counted seven ships passing the rocky "
+        "point before dawn, each one heavier and slower than the last, and "
+        "he wondered which captain would dare the narrow channel.");
+    if (ids.empty()) { return out; }
+    auto ctx = lm->make_context();
+    if (!ctx.valid()) { return out; }
+    std::int32_t t = lm->prefill(ctx, ids);
+    for (int i = 0; i < 24 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token(ctx);
+    }
+    return out;
+  };
+
+  const auto ref = run(false);   // pflash reference
+  const auto got = run(true);    // materialized, dense GEMMs (K-tail path)
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ::unsetenv("VPIPE_GEMMA_MATERIALIZED_GLOBAL");
+  ::unsetenv("VPIPE_GEMMA_MAT_CAUSAL");
+  ASSERT_TRUE(!ref.empty());
+  ASSERT_TRUE(ref.size() == got.size());
+  std::size_t mism = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (ref[i] != got[i]) { ++mism; }
+  }
+  std::printf("[metal_lm_smoke.gemma_materialized_matches_pflash_token_exact] "
+              "%zu tokens, %zu mismatches\n", ref.size(), mism);
+  EXPECT_TRUE(mism == 0);
+}
+
+// Banded-materialized SLIDING prefill must be greedy token-exact with the
+// simdgroup-flash sliding path. REGRESSION GUARD for the banded GEMM/softmax:
+// the prompt is LONGER than the sliding window (512), with VARIED tokens, so
+// the trailing-window band actually engages (k0>0 for later rows, and the QK
+// below-window tile skips fire) -- every other gemma token-exact prompt is
+// <512 tokens, so the band is a no-op there and they cannot catch a banding
+// bug. Both arms keep materialized GLOBAL on; only the sliding path differs
+// (VPIPE_GEMMA_MAT_SLIDING toggles banded-GEMM vs flash). Gated on
+// VPIPE_GEMMA4_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gemma_banded_sliding_matches_flash_token_exact) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  auto run = [&](bool banded) -> std::vector<std::int32_t> {
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    ::setenv("VPIPE_GEMMA_MAT_SLIDING", banded ? "1" : "0", 1);
+    Session sess;
+    auto* mc = sess.metal_compute();
+    auto* mgr = sess.generative_model_manager();
+    std::vector<std::int32_t> out;
+    if (mc == nullptr || !mc->valid() || mgr == nullptr) { return out; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.compute_dtype = "f16";
+    spec.page_tokens = 512;
+    spec.max_pages = 16;
+    auto lm = mgr->load(spec);
+    if (!lm || !lm->valid()) { return out; }
+    // 700 VARIED tokens (> sliding_window 512) so the band engages for the
+    // later positions. Deterministic pseudo-random ids keep K/V non-uniform
+    // (a uniform prompt would hide a window bug -- all keys give the same V).
+    std::vector<std::int32_t> ids;
+    ids.reserve(700);
+    ids.push_back(2);                       // <bos>
+    std::uint32_t s = 0x9e3779b9u;
+    for (int i = 1; i < 700; ++i) {
+      s = s * 1664525u + 1013904223u;       // LCG
+      ids.push_back((std::int32_t)(106 + (s >> 9) % 200000));
+    }
+    auto ctx = lm->make_context();
+    if (!ctx.valid()) { return out; }
+    std::int32_t t = lm->prefill(ctx, ids);
+    for (int i = 0; i < 16 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token(ctx);
+    }
+    return out;
+  };
+
+  const auto ref = run(false);   // flash sliding
+  const auto got = run(true);    // banded-materialized sliding
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ::unsetenv("VPIPE_GEMMA_MAT_SLIDING");
+  ASSERT_TRUE(!ref.empty());
+  ASSERT_TRUE(ref.size() == got.size());
+  std::size_t mism = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (ref[i] != got[i]) { ++mism; }
+  }
+  std::printf("[metal_lm_smoke.gemma_banded_sliding_matches_flash_token_exact] "
+              "%zu tokens, %zu mismatches\n", ref.size(), mism);
+  EXPECT_TRUE(mism == 0);
+}
+
 // Chunked sliding-window prefill (ring wrap) must be greedy token-exact with a
 // single-pass prefill. Forces wrapping with a small VPIPE_GEMMA_SLIDING_CHUNK
 // on a prompt longer than the ring, vs a chunk large enough to prefill in one
@@ -2256,6 +2941,95 @@ TEST(metal_lm_smoke, gemma_chunked_prefill_token_exact) {
   std::printf("[metal_lm_smoke.gemma_chunked_prefill_token_exact] %zu tokens, "
               "%zu mismatches (chunk=128 vs 4096)\n", single.size(), mism);
   EXPECT_TRUE(mism == 0);
+}
+
+// Bounded-ring SINGLE-PASS prefill (VPIPE_GEMMA_PREFILL_SUBBLOCK) must be greedy
+// token-exact with the GROWN one-pass prefill on a LONG prompt that wraps the
+// bounded ring many times. The bounded path runs ONE forward over the whole
+// prompt (large proj/FFN/global GEMM batch) and reads the full-batch K/V for
+// the sliding attention (ring-independent), writing the bounded ring once; the
+// grown path grows the ring to the full prompt. Both must decode identically --
+// which also proves the single full-n ring write leaves the correct trailing
+// window resident for decode at depth. ~2400 VARIED tokens (>> ring 1024) so
+// the ring wraps repeatedly and a window/decode-state bug shows. Gated on the
+// Gemma model.
+TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_token_exact) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  // 2400 deterministic pseudo-random ids (non-uniform K/V so a window bug
+  // can't hide), >> the bounded ring (window 512 + chunk 512 = 1024).
+  std::vector<std::int32_t> ids;
+  ids.reserve(2400);
+  ids.push_back(2);                         // <bos>
+  std::uint32_t s = 0x12345678u;
+  for (int i = 1; i < 2400; ++i) {
+    s = s * 1664525u + 1013904223u;
+    ids.push_back((std::int32_t)(106 + (s >> 9) % 200000));
+  }
+
+  auto run = [&](int mode) -> std::vector<std::int32_t> {
+    // mode 0 = grown (A); 1 = bounded subblock (C); 2 = bounded chunked (B)
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    ::setenv("VPIPE_GEMMA_SLIDING_CHUNK", "512", 1);
+    if (mode == 0) {
+      ::unsetenv("VPIPE_GEMMA_NO_SLIDING_GROW");   // grown one-pass (A)
+      ::unsetenv("VPIPE_GEMMA_PREFILL_SUBBLOCK");
+    } else if (mode == 1) {
+      ::setenv("VPIPE_GEMMA_NO_SLIDING_GROW", "1", 1);  // bounded subblock (C)
+      ::setenv("VPIPE_GEMMA_PREFILL_SUBBLOCK", "1", 1);
+    } else {
+      ::setenv("VPIPE_GEMMA_NO_SLIDING_GROW", "1", 1);  // bounded chunked (B)
+      ::setenv("VPIPE_GEMMA_PREFILL_SUBBLOCK", "0", 1);
+    }
+    Session sess;
+    auto* mc = sess.metal_compute();
+    auto* mgr = sess.generative_model_manager();
+    std::vector<std::int32_t> out;
+    if (mc == nullptr || !mc->valid() || mgr == nullptr) { return out; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.compute_dtype = "f16";
+    spec.page_tokens = 512;
+    spec.max_pages = 16;
+    auto lm = mgr->load(spec);
+    if (!lm || !lm->valid()) { return out; }
+    auto ctx = lm->make_context();
+    if (!ctx.valid()) { return out; }
+    std::int32_t t = lm->prefill(ctx, ids);
+    for (int i = 0; i < 24 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token(ctx);
+    }
+    return out;
+  };
+
+  const auto grown   = run(0);
+  const auto bounded = run(1);
+  const auto chunked = run(2);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ::unsetenv("VPIPE_GEMMA_SLIDING_CHUNK");
+  ::unsetenv("VPIPE_GEMMA_NO_SLIDING_GROW");
+  ::unsetenv("VPIPE_GEMMA_PREFILL_SUBBLOCK");
+  ASSERT_TRUE(!grown.empty());
+  ASSERT_TRUE(grown.size() == bounded.size());
+  auto cnt = [&](const std::vector<std::int32_t>& a,
+                 const std::vector<std::int32_t>& b) {
+    std::size_t m = 0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      if (a[i] != b[i]) { ++m; }
+    }
+    return m;
+  };
+  // Bounded-subblock (C) must equal BOTH the grown one-pass (A) and the bounded
+  // chunked (B) reference -- all three decode identically.
+  const std::size_t mism = cnt(grown, bounded);
+  std::printf("[metal_lm_smoke.gemma_bounded_subblock_matches_grown_token_exact]"
+              " %zu tokens, %zu mismatches (C-vs-A=%zu C-vs-B=%zu B-vs-A=%zu)\n",
+              grown.size(), mism, cnt(bounded, grown), cnt(bounded, chunked),
+              cnt(chunked, grown));
+  EXPECT_TRUE(mism == 0);
+  EXPECT_TRUE(cnt(bounded, chunked) == 0);
 }
 
 // MULTIMODAL prefill must also respect the sliding-window ring. prefill_mm
@@ -2477,15 +3251,9 @@ TEST(metal_lm_smoke, gguf_gemma_pp_tg_bench) {
   Session sess;
   auto* mgr = sess.generative_model_manager();
   if (!mgr) { return; }
-  genai::LoadSpec spec;
-  spec.hf_dir        = path;
-  spec.compute_dtype = "bf16";
-  spec.page_tokens   = 512;
-  spec.max_pages     = 16;               // max_seq 8192 (room for d4096+gen)
-  auto lm = mgr->load(spec);
-  ASSERT_TRUE(lm != nullptr && lm->valid());
-
-  // Parse the comma-separated context-size list.
+  // Parse the comma-separated context-size list + decode count FIRST: the KV
+  // cache capacity (page_tokens * max_pages) must fit the largest ctx + gen,
+  // else prefill silently caps and the reported tok/s is garbage.
   std::vector<int> ctxs;
   {
     const char* cs = std::getenv("VPIPE_GGUF_BENCH_CTX");
@@ -2502,6 +3270,22 @@ TEST(metal_lm_smoke, gguf_gemma_pp_tg_bench) {
   ASSERT_TRUE(!ctxs.empty());
   const char* gs = std::getenv("VPIPE_GGUF_BENCH_GEN");
   const int G = (gs && *gs) ? std::max(1, std::atoi(gs)) : 64;
+
+  int max_ctx = 0;
+  for (const int v : ctxs) { max_ctx = std::max(max_ctx, v); }
+  const int page_tokens = 512;
+  // room for the deepest prompt + decode budget (+ slack for warmup steps).
+  const int need_seq = max_ctx + G + 64;
+  int max_pages = (need_seq + page_tokens - 1) / page_tokens;
+  if (max_pages < 16) { max_pages = 16; }
+
+  genai::LoadSpec spec;
+  spec.hf_dir        = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens   = page_tokens;
+  spec.max_pages     = max_pages;        // sized to max(ctx)+gen above
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
 
   // Seed token stream: a real rendered turn (keeps <bos> first), then pad
   // with a benign repeated token. Coherence is irrelevant for timing.
@@ -2543,6 +3327,11 @@ TEST(metal_lm_smoke, gguf_gemma_pp_tg_bench) {
             std::chrono::steady_clock::now() - p0).count();
     ASSERT_TRUE(pf >= 0);
     const double pp_tps = (psecs > 0.0) ? (double)L / psecs : 0.0;
+    // Early prefill-only print (BEFORE the decode blocks) so SKIP_ATTN probes,
+    // which leave logits garbage and can crash pdecode, still report prefill.
+    std::printf("[gguf_pp_only] ctx=%-5d  prefill=%7.1f tok/s (%.3fs)\n",
+                L, pp_tps, psecs);
+    std::fflush(stdout);
 
     // ---- synchronous decode (tg@L): next_token = host [vocab] readback +
     //      host argmax (the production fallback path when pdecode is off) ----
@@ -2586,16 +3375,22 @@ TEST(metal_lm_smoke, gguf_gemma_pp_tg_bench) {
       genai::SamplerParams gsp;            // defaults -> argmax-equivalent
       const int budget = G + 8;
       if (lm->pdecode_begin(cd, first, prompt, gsp, budget)) {
-        for (int k = 0; k < 4; ++k) {    // warm the pipeline
-          if (!lm->pdecode_commit(cd)) { break; }
+        // Run-ahead: PRIME the pipeline to pd.depth (commit until the ring is
+        // full), then steady-state refill ONE-ahead right after each wait, so
+        // each commit encodes step N+1 WHILE step N runs on the GPU --
+        // overlapping dispatch-encoding with GPU execution. The old
+        // commit-then-next loop oscillated the ring 0<->1 and never overlapped.
+        while (lm->pdecode_commit(cd)) {}     // prime to depth
+        for (int k = 0; k < 4; ++k) {         // warm steady-state
           if (lm->pdecode_next(cd) < 0) { break; }
+          lm->pdecode_commit(cd);
         }
         int produced = 0;
         const auto d0 = std::chrono::steady_clock::now();
         for (int k = 0; k < G; ++k) {
-          if (!lm->pdecode_commit(cd)) { break; }
           if (lm->pdecode_next(cd) < 0) { break; }
           ++produced;
+          lm->pdecode_commit(cd);           // refill one ahead (overlaps GPU)
         }
         const double dsecs =
             std::chrono::duration<double>(
@@ -2633,11 +3428,27 @@ TEST(metal_lm_smoke, gguf_gemma_decode_catprof) {
   if (mc == nullptr || !mc->valid() || mgr == nullptr) {
     ::unsetenv("VPIPE_LLM_BACKEND"); return;
   }
+  // Parse depths FIRST so the KV cache (page_tokens*max_pages) fits the
+  // deepest profile depth + decode slack (else prefill caps -> degenerate).
+  std::vector<int> depths{512, 4096};
+  if (const char* cs = std::getenv("VPIPE_GGUF_BENCH_CTX")) {
+    std::vector<int> v; const char* p = cs;
+    while (*p) {
+      int x = std::atoi(p);
+      if (x > 0) { v.push_back(x); }
+      while (*p && *p != ',') { ++p; }
+      if (*p == ',') { ++p; }
+    }
+    if (!v.empty()) { depths = v; }
+  }
+  int max_depth = 0;
+  for (const int v : depths) { max_depth = std::max(max_depth, v); }
+
   genai::LoadSpec spec;
   spec.hf_dir = path;
   spec.compute_dtype = "bf16";
   spec.page_tokens = 512;
-  spec.max_pages = 16;
+  spec.max_pages = std::max(16, (max_depth + 128 + 511) / 512);
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
   ASSERT_TRUE(lm != nullptr && lm->valid());
@@ -2654,18 +3465,6 @@ TEST(metal_lm_smoke, gguf_gemma_decode_catprof) {
     return ids;
   };
 
-  std::vector<int> depths{512, 4096};
-  if (const char* cs = std::getenv("VPIPE_GGUF_BENCH_CTX")) {
-    std::vector<int> v; const char* p = cs;
-    while (*p) {
-      int x = std::atoi(p);
-      if (x > 0) { v.push_back(x); }
-      while (*p && *p != ',') { ++p; }
-      if (*p == ',') { ++p; }
-    }
-    if (!v.empty()) { depths = v; }
-  }
-
   const int N = 48;
   auto decode_ms = [&](const std::vector<std::int32_t>& ids) -> double {
     auto ctx = lm->make_context();
@@ -2680,8 +3479,8 @@ TEST(metal_lm_smoke, gguf_gemma_decode_catprof) {
   };
 
   const char* cats[] = {"none", "proj", "ffn", "lmhead", "attn", "norm",
-                        "misc", "attn_global", "attn_slide"};
-  const int NC = 9;
+                        "misc", "ple", "attn_global", "attn_slide"};
+  const int NC = 10;
   for (int depth : depths) {
     const auto ids = make_ids(depth);
     for (int k = 0; k < 2; ++k) { (void)decode_ms(ids); }   // warm GPU clock
@@ -2704,6 +3503,480 @@ TEST(metal_lm_smoke, gguf_gemma_decode_catprof) {
                   depth, cats[c], d, d / N, 100.0 * d / T0);
     }
   }
+  EXPECT_TRUE(true);
+}
+
+// SINGLE-PREFILL strip ablation (decode). Same categories as gguf_gemma_decode_
+// strip, but prefills ONCE per sweep and toggles VPIPE_GEMMA_SKIP_LAYER (+the
+// composable SKIP_* knobs, all re-read every decode step) BETWEEN short decode
+// windows on the same pdecode session -> ~3 prefills total instead of ~60. The
+// re-prefill design wedges the GPU under sustained long-context (8k/16k) prefill
+// load; this variant decouples the measurement from prefill so it runs clean at
+// depth. Gated on VPIPE_GEMMA_STRIP_ONCE. Intra-sweep depth drift is tiny
+// (nconfigs*W steps << depth) and identical for every config (same session).
+TEST(metal_lm_smoke, gguf_gemma_decode_strip_once) {
+  const char* path = std::getenv("VPIPE_GGUF_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  if (std::getenv("VPIPE_GEMMA_STRIP_ONCE") == nullptr) { return; }
+  ::setenv("VPIPE_GEMMA_CATPROF", "1", 1);   // gate the skip path
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || mgr == nullptr) {
+    ::unsetenv("VPIPE_LLM_BACKEND"); return;
+  }
+  int depth = 8192;
+  if (const char* cs = std::getenv("VPIPE_GGUF_BENCH_CTX")) {
+    const int x = std::atoi(cs);
+    if (x > 0) { depth = x; }
+  }
+  const int W = 24;                          // timed decode tokens per window
+  const int SETTLE = 3;                      // untimed steps after each toggle
+  const int NSWEEP = 4;
+  // All distinct configs measured per sweep (label + SKIP env settings). The
+  // empty string for SKIP_LAYER means "no whole-layer strip".
+  struct Cfg { const char* label; const char* layer; bool ple, ffn, attn,
+               proj, lmhead, embed; };
+  const Cfg cfgs[] = {
+    {"none",            "",        0,0,0,0,0,0},
+    {"strip_sliding",   "sliding", 0,0,0,0,0,0},  // -> all-global
+    {"strip_global",    "global",  0,0,0,0,0,0},  // -> all-sliding
+    {"glob_noPLE",      "sliding", 1,0,0,0,0,0},
+    {"glob_noPLE_noFFN","sliding", 1,1,0,0,0,0},  // 7 global: attn+proj+norm
+    {"glob_..noATTN",   "sliding", 1,1,1,0,0,0},  //          proj+norm
+    {"glob_..noPROJ",   "sliding", 1,1,1,1,0,0},  //          norm/rope/kv
+    {"slid_noPLE_noFFN","global",  1,1,0,0,0,0},  // 35 sliding: attn+proj+norm
+    {"slid_..noATTN",   "global",  1,1,1,0,0,0},  //          proj+norm
+    {"slid_..noPROJ",   "global",  1,1,1,1,0,0},  //          norm/rope/kv
+    {"fixed_only",      "all",     1,0,0,0,0,0},  // embed+lmhead+sample+handoff
+    {"fixed_noLM",      "all",     1,0,0,0,1,0},  //  - lm_head
+    {"fixed_noLM_noEmb","all",     1,0,0,0,1,1},  //  - embed too
+  };
+  const int NC = (int)(sizeof(cfgs) / sizeof(cfgs[0]));
+  auto apply = [&](const Cfg& c) {
+    if (*c.label && *c.layer) { ::setenv("VPIPE_GEMMA_SKIP_LAYER", c.layer, 1); }
+    else { ::unsetenv("VPIPE_GEMMA_SKIP_LAYER"); }
+    auto tog = [&](const char* e, bool on) {
+      if (on) { ::setenv(e, "1", 1); } else { ::unsetenv(e); } };
+    tog("VPIPE_GEMMA_SKIP_PLE",    c.ple);
+    tog("VPIPE_GEMMA_SKIP_FFN",    c.ffn);
+    tog("VPIPE_GEMMA_SKIP_ATTN",   c.attn);
+    tog("VPIPE_GEMMA_SKIP_PROJ",   c.proj);
+    tog("VPIPE_GEMMA_SKIP_LMHEAD", c.lmhead);
+    tog("VPIPE_GEMMA_SKIP_EMBED",  c.embed);
+  };
+  auto clear_all = [&] {
+    ::unsetenv("VPIPE_GEMMA_SKIP_LAYER"); ::unsetenv("VPIPE_GEMMA_SKIP_PLE");
+    ::unsetenv("VPIPE_GEMMA_SKIP_FFN"); ::unsetenv("VPIPE_GEMMA_SKIP_ATTN");
+    ::unsetenv("VPIPE_GEMMA_SKIP_PROJ"); ::unsetenv("VPIPE_GEMMA_SKIP_LMHEAD");
+    ::unsetenv("VPIPE_GEMMA_SKIP_EMBED");
+  };
+
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  const int sweep_steps = NC * (W + SETTLE) + 32;
+  spec.max_pages = std::max(16, (depth + sweep_steps + 511) / 512);
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+
+  std::vector<std::int32_t> seedv;
+  lm->chat_template()->render_user_turn("Benchmark.", true, &seedv);
+  ASSERT_TRUE(!seedv.empty());
+  const std::int32_t bos  = seedv.front();
+  const std::int32_t fill = seedv.size() > 1 ? seedv[1] : bos;
+  std::vector<std::int32_t> ids; ids.reserve(depth);
+  ids.push_back(bos);
+  for (int k = 1; k < depth; ++k) { ids.push_back(fill); }
+  const std::span<const std::int32_t> prompt(ids.data(), ids.size());
+
+  // min-of-NSWEEP wall ms/tok per config. Each sweep: 1 prefill, warm, then
+  // every config's window back-to-back on the same pdecode session.
+  std::vector<double> best(NC, 1e18);
+  genai::SamplerParams gsp;                   // defaults -> argmax-equivalent
+  for (int sw = 0; sw < NSWEEP + 1; ++sw) {    // +1 warm sweep (discarded)
+    clear_all();
+    auto ctx = lm->make_context();
+    ASSERT_TRUE(ctx.valid());
+    const std::int32_t first = lm->prefill(ctx, ids);
+    ASSERT_TRUE(first >= 0);
+    if (!lm->pdecode_begin(ctx, first, prompt, gsp, sweep_steps)) {
+      lm->pdecode_end(ctx); continue;
+    }
+    for (int k = 0; k < 4; ++k) {              // warm the pipeline
+      if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+    }
+    for (int ci = 0; ci < NC; ++ci) {
+      apply(cfgs[ci]);
+      for (int k = 0; k < SETTLE; ++k) {       // let the toggle take effect
+        if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      int got = 0;
+      for (int k = 0; k < W; ++k) {
+        if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+        ++got;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      const double mt = got > 0 ? ms / got : 1e18;
+      if (sw > 0 && mt < best[ci]) { best[ci] = mt; }
+    }
+    clear_all();
+    lm->pdecode_end(ctx);
+  }
+
+  auto B = [&](const char* lbl) -> double {
+    for (int i = 0; i < NC; ++i) {
+      if (std::string(cfgs[i].label) == lbl) { return best[i]; }
+    }
+    return 0.0;
+  };
+  const double base = B("none");
+  std::printf("[strip_once depth=%d W=%d sweeps=%d] min wall ms/tok\n",
+              depth, W, NSWEEP);
+  for (int i = 0; i < NC; ++i) {
+    if (i == 0) {
+      std::printf("[strip_once] %-18s %.3f ms/tok (baseline)\n",
+                  cfgs[i].label, best[i]);
+    } else {
+      std::printf("[strip_once] %-18s %.3f ms/tok  (-%.3f, %4.1f%%)\n",
+                  cfgs[i].label, best[i], base - best[i],
+                  100.0 * (base - best[i]) / base);
+    }
+  }
+  // Derived per-category DECODE costs (ms/tok) for the head-to-head with omlx.
+  std::printf("[strip_once] === per-category decode cost (ms/tok) ===\n");
+  std::printf("[strip_once] sliding TOTAL (35 lyr) %.3f | global TOTAL (7 lyr) "
+              "%.3f\n", base - B("strip_sliding"), base - B("strip_global"));
+  std::printf("[strip_once] global: SDPA %.3f  QKV+O proj %.3f  norm/rope/kv "
+              "%.3f  FFN %.3f  PLE %.3f\n",
+              B("glob_noPLE_noFFN") - B("glob_..noATTN"),
+              B("glob_..noATTN")   - B("glob_..noPROJ"),
+              B("glob_..noPROJ")   - B("fixed_only"),
+              B("glob_noPLE")      - B("glob_noPLE_noFFN"),
+              B("strip_sliding")   - B("glob_noPLE"));
+  std::printf("[strip_once] sliding: SDPA %.3f  QKV+O proj %.3f  norm/rope/kv+"
+              "fixed %.3f\n",
+              B("slid_noPLE_noFFN") - B("slid_..noATTN"),
+              B("slid_..noATTN")    - B("slid_..noPROJ"),
+              B("slid_..noPROJ"));
+  std::printf("[strip_once] fixed: lm_head %.3f  embed %.3f  norm/argmax/sampler/"
+              "handoff %.3f\n",
+              B("fixed_only") - B("fixed_noLM"),
+              B("fixed_noLM") - B("fixed_noLM_noEmb"),
+              B("fixed_noLM_noEmb"));
+
+  // FULL-LOAD DUP sweep (VPIPE_GEMMA_STRIP_DUP): double a category INSIDE the
+  // full 42-layer pass (VPIPE_GEMMA_DUP_CAT, read per-step) -> delta vs none =
+  // that category's true full-occupancy GPU cost (no isolation clock artifact).
+  // norm = all RMSNorm/rope/KV-write; attn_slide/attn_global isolate by type.
+  if (std::getenv("VPIPE_GEMMA_STRIP_DUP") != nullptr) {
+    const char* dcats[] = {"none", "norm", "attn_slide", "attn_global",
+                           "proj", "ffn"};
+    const int ND = 6;
+    std::vector<double> dbest(ND, 1e18);
+    for (int sw = 0; sw < NSWEEP + 1; ++sw) {
+      clear_all();
+      ::unsetenv("VPIPE_GEMMA_DUP_CAT");
+      auto ctx = lm->make_context();
+      if (!ctx.valid()) { continue; }
+      const std::int32_t first = lm->prefill(ctx, ids);
+      if (first < 0) { lm->pdecode_end(ctx); continue; }
+      if (!lm->pdecode_begin(ctx, first, prompt, gsp, sweep_steps)) {
+        lm->pdecode_end(ctx); continue;
+      }
+      for (int k = 0; k < 4; ++k) {
+        if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+      }
+      for (int ci = 0; ci < ND; ++ci) {
+        if (ci == 0) { ::unsetenv("VPIPE_GEMMA_DUP_CAT"); }
+        else { ::setenv("VPIPE_GEMMA_DUP_CAT", dcats[ci], 1); }
+        for (int k = 0; k < SETTLE; ++k) {
+          if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        int got = 0;
+        for (int k = 0; k < W; ++k) {
+          if (!lm->pdecode_commit(ctx) || lm->pdecode_next(ctx) < 0) { break; }
+          ++got;
+        }
+        const double mt = got > 0 ? std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count() / got : 1e18;
+        if (sw > 0 && mt < dbest[ci]) { dbest[ci] = mt; }
+      }
+      ::unsetenv("VPIPE_GEMMA_DUP_CAT");
+      lm->pdecode_end(ctx);
+    }
+    std::printf("[strip_once] === full-load DUP (delta vs none = cat cost) ===\n");
+    for (int ci = 1; ci < ND; ++ci) {
+      std::printf("[strip_once] dup %-12s %.3f ms/tok  (+%.3f vs none %.3f)\n",
+                  dcats[ci], dbest[ci], dbest[ci] - dbest[0], dbest[0]);
+    }
+  }
+  EXPECT_TRUE(true);
+}
+
+// Whole-CATEGORY strip ablation (decode). Removes a layer category's entire
+// body (VPIPE_GEMMA_SKIP_LAYER) and reports wall ms/tok, so baseline-minus-
+// stripped = that category's wall cost. Mirror of the omlx passthrough-strip
+// bench (~/dump/omlx_strip_bench.py) for a head-to-head per-category gap.
+// Categories: sliding|global (attn type), shared_kv|own_kv (KV ownership),
+// and the 4 individual buckets. Gated on VPIPE_GEMMA_STRIP.
+TEST(metal_lm_smoke, gguf_gemma_decode_strip) {
+  const char* path = std::getenv("VPIPE_GGUF_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  if (std::getenv("VPIPE_GEMMA_STRIP") == nullptr) { return; }
+  ::setenv("VPIPE_GEMMA_CATPROF", "1", 1);   // gate the skip path
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || mgr == nullptr) {
+    ::unsetenv("VPIPE_LLM_BACKEND"); return;
+  }
+  // Parse depth FIRST so the KV cache (page_tokens*max_pages) fits it + the
+  // N decoded tokens of slack; else prefill caps at 8192 -> degenerate at 16k.
+  int depth = 2048;
+  if (const char* cs = std::getenv("VPIPE_GGUF_BENCH_CTX")) {
+    const int x = std::atoi(cs);
+    if (x > 0) { depth = x; }
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = std::max(16, (depth + 128 + 511) / 512);
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+
+  std::vector<std::int32_t> seed;
+  lm->chat_template()->render_user_turn("Benchmark.", true, &seed);
+  ASSERT_TRUE(!seed.empty());
+  const std::int32_t bos  = seed.front();
+  const std::int32_t fill = seed.size() > 1 ? seed[1] : bos;
+  auto make_ids = [&](int L) {
+    std::vector<std::int32_t> ids; ids.reserve(L);
+    ids.push_back(bos);
+    for (int k = 1; k < L; ++k) { ids.push_back(fill); }
+    return ids;
+  };
+
+  const int N = 48;
+  const auto ids = make_ids(depth);
+  // Use the PIPELINED decode path (pdecode_*, vpipe's production decode) so the
+  // per-token CPU<->GPU handoff is overlapped -- apples-to-apples with omlx's
+  // async_eval, removing the ~1.5 ms sync-handoff confound from every row.
+  // Returns total wall ms normalised to N tokens (caller divides by N).
+  auto decode_ms = [&](const std::vector<std::int32_t>& seq) -> double {
+    auto ctx = lm->make_context();
+    if (!ctx.valid()) { return -1.0; }
+    const std::span<const std::int32_t> prompt(seq.data(), seq.size());
+    const std::int32_t first = lm->prefill(ctx, seq);
+    if (first < 0) { return -1.0; }
+    genai::SamplerParams gsp;                  // defaults -> argmax-equivalent
+    if (!lm->pdecode_begin(ctx, first, prompt, gsp, N + 8)) { return -1.0; }
+    for (int k = 0; k < 4; ++k) {              // warm the pipeline
+      if (!lm->pdecode_commit(ctx)) { break; }
+      if (lm->pdecode_next(ctx) < 0) { break; }
+    }
+    int produced = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < N; ++i) {
+      if (!lm->pdecode_commit(ctx)) { break; }
+      if (lm->pdecode_next(ctx) < 0) { break; }
+      ++produced;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    lm->pdecode_end(ctx);
+    return produced > 0 ? ms * (double)N / produced : -1.0;
+  };
+
+  const char* strips[] = {"", "sliding", "global", "shared_kv", "own_kv",
+                          "slide_own", "global_own", "slide_skip",
+                          "global_skip"};
+  const int NS = 9;
+  for (int k = 0; k < 2; ++k) { (void)decode_ms(ids); }    // warm GPU clock
+  double base = 0.0;
+  std::printf("[gemma_strip depth=%d N=%d] min-of-5 wall ms/tok\n", depth, N);
+  for (int s = 0; s < NS; ++s) {
+    if (*strips[s]) { ::setenv("VPIPE_GEMMA_SKIP_LAYER", strips[s], 1); }
+    else            { ::unsetenv("VPIPE_GEMMA_SKIP_LAYER"); }
+    double m = 1e18;
+    for (int r = 0; r < 5; ++r) { m = std::min(m, decode_ms(ids)); }
+    const double mt = m / N;
+    if (s == 0) {
+      base = mt;
+      std::printf("[gemma_strip] %-12s %.3f ms/tok (baseline)\n",
+                  "none", mt);
+    } else {
+      std::printf("[gemma_strip] strip %-12s %.3f ms/tok  (-%.3f, %4.1f%%)\n",
+                  strips[s], mt, base - mt, 100.0 * (base - mt) / base);
+    }
+  }
+  ::unsetenv("VPIPE_GEMMA_SKIP_LAYER");
+
+  // Deeper ablation: all-global run (strip sliding -> only the 7 global layers),
+  // then toggle PLE. Delta = PLE's wall cost in the all-global config, to
+  // head-to-head omlx's PLE handling free of sliding-layer noise.
+  auto minms = [&](int reps) {
+    double m = 1e18; for (int r = 0; r < reps; ++r) { m = std::min(m, decode_ms(ids)); }
+    return m / N;
+  };
+  ::setenv("VPIPE_GEMMA_SKIP_LAYER", "sliding", 1);
+  ::unsetenv("VPIPE_GEMMA_SKIP_PLE");
+  (void)decode_ms(ids);
+  const double g_ple = minms(5);
+  ::setenv("VPIPE_GEMMA_SKIP_PLE", "1", 1);
+  (void)decode_ms(ids);
+  const double g_nople = minms(5);
+  // ... and additionally remove the FFN (gate/up + down GEMVs) -> only the
+  // attention path + norms remain in the 7 global layers.
+  ::setenv("VPIPE_GEMMA_SKIP_FFN", "1", 1);
+  (void)decode_ms(ids);
+  const double g_noff = minms(5);
+  ::unsetenv("VPIPE_GEMMA_SKIP_FFN");
+  // Fixed-only floor: strip ALL layers + PLE -> embed + final-norm + lm_head +
+  // argmax + the per-token CPU<->GPU handoff. Splits the residual gap into the
+  // global-attention path vs the fixed per-token overhead.
+  ::setenv("VPIPE_GEMMA_SKIP_LAYER", "all", 1);
+  ::setenv("VPIPE_GEMMA_SKIP_PLE", "1", 1);
+  (void)decode_ms(ids);
+  const double fixed_only = minms(5);
+  // Fixed-tail split: peel lm_head (262144-vocab GEMV) then embed gather.
+  ::setenv("VPIPE_GEMMA_SKIP_LMHEAD", "1", 1);
+  (void)decode_ms(ids);
+  const double fixed_nolm = minms(5);
+  ::setenv("VPIPE_GEMMA_SKIP_EMBED", "1", 1);
+  (void)decode_ms(ids);
+  const double fixed_nolm_noemb = minms(5);
+  ::unsetenv("VPIPE_GEMMA_SKIP_LMHEAD");
+  ::unsetenv("VPIPE_GEMMA_SKIP_EMBED");
+  ::unsetenv("VPIPE_GEMMA_SKIP_PLE");
+  ::unsetenv("VPIPE_GEMMA_SKIP_LAYER");
+  std::printf("[gemma_strip] fixed-tail: lm_head %.3f  embed %.3f  "
+              "argmax/norm/sampler %.3f ms/tok\n",
+              fixed_only - fixed_nolm, fixed_nolm - fixed_nolm_noemb,
+              fixed_nolm_noemb);
+  std::printf("[gemma_strip] all-global  with-PLE %.3f  no-PLE %.3f  "
+              "PLE cost %.3f ms/tok\n", g_ple, g_nople, g_ple - g_nople);
+  std::printf("[gemma_strip] all-global  no-PLE %.3f  no-PLE-no-FFN %.3f  "
+              "FFN cost %.3f ms/tok (7 global layers)\n",
+              g_nople, g_noff, g_nople - g_noff);
+  std::printf("[gemma_strip] fixed-only (embed+lm_head+sample+handoff) %.3f | "
+              "7 global attn+proj+norm = %.3f ms/tok\n",
+              fixed_only, g_noff - fixed_only);
+  // Also PLE cost in the FULL run (all 42 layers), for reference.
+  ::unsetenv("VPIPE_GEMMA_SKIP_LAYER");
+  ::setenv("VPIPE_GEMMA_SKIP_PLE", "1", 1);
+  (void)decode_ms(ids);
+  const double full_nople = minms(5);
+  ::unsetenv("VPIPE_GEMMA_SKIP_PLE");
+  std::printf("[gemma_strip] full        with-PLE %.3f  no-PLE %.3f  "
+              "PLE cost %.3f ms/tok\n", base, full_nople, base - full_nople);
+
+  // Sliding-attention split: all-SLIDING run (strip global -> 35 sliding
+  // layers), no-PLE no-FFN, then peel the SDPA core (SKIP_ATTN) and the QKV+O
+  // projections (SKIP_PROJ). Localises the +10%/sliding-layer deficit to the
+  // attention kernel vs the projection GEMVs vs the norm/rope/KV-write rest.
+  ::setenv("VPIPE_GEMMA_SKIP_LAYER", "global", 1);
+  ::setenv("VPIPE_GEMMA_SKIP_PLE", "1", 1);
+  ::setenv("VPIPE_GEMMA_SKIP_FFN", "1", 1);
+  (void)decode_ms(ids);
+  const double s_base = minms(5);                 // norm+QKV+SDPA+O (35 sliding)
+  ::setenv("VPIPE_GEMMA_SKIP_ATTN", "1", 1);
+  (void)decode_ms(ids);
+  const double s_noattn = minms(5);               // norm+QKV+O (SDPA removed)
+  ::setenv("VPIPE_GEMMA_SKIP_PROJ", "1", 1);
+  (void)decode_ms(ids);
+  const double s_noproj = minms(5);               // norm+rope+kvwrite (no GEMV)
+  ::unsetenv("VPIPE_GEMMA_SKIP_ATTN");
+  ::unsetenv("VPIPE_GEMMA_SKIP_PROJ");
+  ::unsetenv("VPIPE_GEMMA_SKIP_FFN");
+  ::unsetenv("VPIPE_GEMMA_SKIP_PLE");
+  ::unsetenv("VPIPE_GEMMA_SKIP_LAYER");
+  std::printf("[gemma_strip] all-sliding(35) no-PLE-no-FFN %.3f | "
+              "SDPA %.3f  QKV+O proj %.3f  norm/rope/kv+fixed %.3f ms/tok\n",
+              s_base, s_base - s_noattn, s_noattn - s_noproj, s_noproj);
+  EXPECT_TRUE(true);
+}
+
+// RMS-kernel accuracy probe: greedy-decode N tokens via the host-[vocab]-argmax
+// path and, at each step, record the token + the top1-top2 logit gap. Lets an
+// A/B of two RMS kernels (e.g. RMS_TG 256 vs 512) quantify HOW divergent they
+// are: where the streams first differ, how many tokens flip, and -- crucially --
+// the top1-top2 gap AT each flip (a tiny gap => a near-tie => benign f32-rounding
+// reorder, not a quality regression). Prints tokens= / gaps= CSV + FNV for
+// offline diffing. Gated on VPIPE_GEMMA_RMS_ACC (+ VPIPE_GGUF_TEST_MODEL_PATH).
+TEST(metal_lm_smoke, gguf_gemma_rms_accuracy) {
+  const char* path = std::getenv("VPIPE_GGUF_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  if (std::getenv("VPIPE_GEMMA_RMS_ACC") == nullptr) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  if (!mgr) { return; }
+  genai::LoadSpec spec;
+  spec.hf_dir = path; spec.compute_dtype = "bf16";
+  spec.page_tokens = 512; spec.max_pages = 8;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+
+  std::vector<std::int32_t> ids;
+  lm->chat_template()->render_user_turn(
+      "List the first ten prime numbers.", true, &ids);
+  ASSERT_TRUE(!ids.empty());
+  int N = 96;
+  if (const char* e = std::getenv("VPIPE_GEMMA_RMS_ACC_N")) {
+    const int v = std::atoi(e); if (v > 0) { N = v; }
+  }
+  auto top1_top2 = [&](double& gap) -> std::int32_t {
+    const std::vector<float>& lg = lm->last_logits_host();
+    if (lg.empty()) { gap = -1.0; return -1; }
+    int a1 = 0; float v1 = lg[0];
+    for (int i = 1; i < (int)lg.size(); ++i) {
+      if (lg[i] > v1) { v1 = lg[i]; a1 = i; }
+    }
+    float v2 = -1e30f;
+    for (int i = 0; i < (int)lg.size(); ++i) {
+      if (i != a1 && lg[i] > v2) { v2 = lg[i]; }
+    }
+    gap = (double)v1 - (double)v2;
+    return a1;
+  };
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  std::vector<std::int32_t> tok;
+  std::vector<double> gaps;
+  std::int32_t t = lm->prefill(ctx, ids);
+  ASSERT_TRUE(t >= 0);
+  { double g; (void)top1_top2(g); tok.push_back(t); gaps.push_back(g); }
+  for (int i = 1; i < N; ++i) {
+    t = lm->next_token(ctx, t);
+    if (t < 0) { break; }
+    double g; (void)top1_top2(g);
+    tok.push_back(t); gaps.push_back(g);
+  }
+  std::uint64_t h = 1469598103934665603ULL;
+  for (auto x : tok) {
+    h ^= (std::uint64_t)(std::uint32_t)x; h *= 1099511628211ULL;
+  }
+  double mingap = 1e30; int mingi = -1;
+  for (int i = 0; i < (int)gaps.size(); ++i) {
+    if (gaps[i] >= 0 && gaps[i] < mingap) { mingap = gaps[i]; mingi = i; }
+  }
+  std::printf("[rms_acc] N=%zu fnv=%016llx mingap=%.4f@%d\n",
+              tok.size(), (unsigned long long)h, mingap, mingi);
+  std::printf("[rms_acc] tokens=");
+  for (auto x : tok) { std::printf("%d,", x); }
+  std::printf("\n[rms_acc] gaps=");
+  for (auto g : gaps) { std::printf("%.3f,", g); }
+  std::printf("\n");
   EXPECT_TRUE(true);
 }
 
@@ -2792,9 +4065,18 @@ TEST(metal_lm_smoke, gguf_gemma_pdecode_matches_sync) {
   for (std::size_t i = 0; i < np; ++i) {
     if (ref[i] != pipe[i]) { ++mism_p; }
   }
+  // FNV-1a over the ref token stream + first 8 ids: cross-config token-exact
+  // check (run with/without VPIPE_GEMMA_NO_QKV_FUSE and compare the hash).
+  std::uint64_t h = 1469598103934665603ULL;
+  for (auto t : ref) { h ^= (std::uint64_t)(std::uint32_t)t; h *= 1099511628211ULL; }
   std::printf("[gguf_pdecode] ref=%zu greedy=%zu pipe=%zu  "
-              "greedy_mism=%zu pipe_mism=%zu\n",
-              ref.size(), grd.size(), pipe.size(), mism_g, mism_p);
+              "greedy_mism=%zu pipe_mism=%zu ref_fnv=%016llx first=",
+              ref.size(), grd.size(), pipe.size(), mism_g, mism_p,
+              (unsigned long long)h);
+  for (std::size_t i = 0; i < ref.size() && i < 8; ++i) {
+    std::printf("%d,", ref[i]);
+  }
+  std::printf("\n");
   ASSERT_TRUE(pipe.size() == ref.size());
   ASSERT_TRUE(grd.size() == ref.size());
   EXPECT_TRUE(mism_g == 0);
@@ -3994,6 +5276,12 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   // its decode tok/s + tok/round + the speedup over the baseline greedy decode.
   const bool mtp_en = std::getenv("VPIPE_QWEN_CTX_MTP")
       && std::atoi(std::getenv("VPIPE_QWEN_CTX_MTP")) != 0;
+  // VPIPE_QWEN_CTX_PIPE (default ON): ALSO time the production PIPELINED decode
+  // (pdecode_* event-chain CPU/GPU overlap) per ctx and add decode_pipe_tps to
+  // the line -- the apples-to-apples match for omlx's async-pipelined loop
+  // (mx.async_eval). Set 0 to skip. The sync greedy stays the baseline column.
+  const bool pipe_en = !(std::getenv("VPIPE_QWEN_CTX_PIPE")
+      && std::atoi(std::getenv("VPIPE_QWEN_CTX_PIPE")) == 0);
 
   const char* be = std::getenv("VPIPE_METAL_BENCH_BACKEND");
   const std::string backend = (be && *be) ? be : "metal";
@@ -4010,7 +5298,18 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   spec.hf_dir = path;
   spec.compute_dtype = "f16";
   spec.page_tokens = 512;
-  spec.max_pages = 32;           // up to 4096 ctx + decode (one ctx at a time)
+  // The pipelined-decode path keeps the timed context AND the pdecode context
+  // live at once, so the KV pool must fit 2 * (max ctx + decode) + slack. Size
+  // it off the ctx list (was a flat 32 -> decode_pipe_tps returned 0 past 4k).
+  {
+    int max_ctx = 0;
+    for (const int N : ctxs) { max_ctx = std::max(max_ctx, N); }
+    // Each live context rounds its token span UP to whole pages, so size per
+    // context then double (timed + pdecode contexts coexist), + slack.
+    const int per_ctx_pages =
+        (max_ctx + dec + 64 + spec.page_tokens - 1) / spec.page_tokens;
+    spec.max_pages = std::max(32, 2 * per_ctx_pages + 4);
+  }
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
   ASSERT_TRUE(lm != nullptr && lm->valid());
@@ -4057,17 +5356,51 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
     const auto d1 = clk::now();
     const double ps = secs(t1 - t0);
     const double ds = secs(d1 - d0);
+
+    // Pipelined decode (vpipe production pdecode_* path): same depth N, warmed
+    // pipeline, event-chained commit/next overlap -- the fair match for omlx's
+    // async_eval loop. 0 when unavailable / disabled.
+    double pipe_tps = 0.0;
+    if (pipe_en) {
+      auto cd = lm->make_context();
+      if (cd.valid()) {
+        const std::int32_t pf = lm->prefill(cd, ids);
+        const std::span<const std::int32_t> prompt(ids.data(), ids.size());
+        genai::SamplerParams gsp;            // defaults -> argmax-equivalent
+        if (pf >= 0 && lm->pdecode_begin(cd, pf, prompt, gsp, dec + 8)) {
+          for (int k = 0; k < 4; ++k) {      // warm the pipeline
+            if (!lm->pdecode_commit(cd)) { break; }
+            if (lm->pdecode_next(cd) < 0) { break; }
+          }
+          int pp = 0;
+          const auto p0 = clk::now();
+          for (int k = 0; k < dec; ++k) {
+            if (!lm->pdecode_commit(cd)) { break; }
+            if (lm->pdecode_next(cd) < 0) { break; }
+            ++pp;
+          }
+          const double pds = secs(clk::now() - p0);
+          pipe_tps = (pds > 0.0) ? (double)pp / pds : 0.0;
+          lm->pdecode_end(cd);
+        }
+      }
+    }
+
     std::printf(
         "[BENCH-CTX] backend=%s greedy_fast=%d ctx=%d prefill_s=%.4f "
-        "prefill_tps=%.1f decode_n=%d decode_s=%.4f decode_tps=%.2f\n",
+        "prefill_tps=%.1f decode_n=%d decode_s=%.4f decode_tps=%.2f "
+        "decode_pipe_tps=%.2f\n",
         backend.c_str(), greedy_fast ? 1 : 0, N, ps, N / ps, produced, ds,
-        produced / ds);
+        produced / ds, pipe_tps);
     EXPECT_TRUE(produced >= 1);
 
     // Greedy MTP speculative decode at the SAME depth N (OptiQ + MTP head).
     // A fresh context prefilled with the same ids so the spec decode starts at
     // depth N; report decode tok/s + tok/round + the speedup vs the baseline.
     if (mtp_en && lm->mtp_available()) {
+      // Seed the drafter's KV with the prefix (the text-chat shipping default)
+      // so the MTP number reflects the production config; set before prefill.
+      lm->set_mtp_prefix_seed(std::getenv("VPIPE_MTP_NO_SEED") == nullptr);
       auto count_round =
           [](int* prod, int* rounds) {
             return [prod, rounds](std::span<const std::int32_t> t) -> bool {
@@ -4532,6 +5865,68 @@ TEST(metal_lm_smoke, gemma_gqa_attn_token_exact) {
   std::printf("[metal_lm_smoke.gemma_gqa_attn_token_exact] %zu tokens, "
               "%zu mismatches\n", ref.size(), mism);
   EXPECT_TRUE(mism == 0);
+}
+
+// Materialized paged decode for the global (head_dim 512) layers
+// (VPIPE_GEMMA_MAT_DECODE=1) must be greedy token-exact with the base flash
+// decode (VECN/MAT unset). This is the omlx/MLX head_dim-512 fallback
+// structure: QK GEMV -> parallel softmax -> PV GEMV, replacing the fused
+// online-softmax flash. Same softmax math, fp reassociation only, so the
+// argmax must not move. Prompt is long enough (>2 global pages @ 512) that the
+// QK/PV key scan splits (sp>1) and the rowstat reduction spans a real range.
+// Greedy-decodes 48 tokens each and requires the streams to match. Gated on
+// VPIPE_GEMMA4_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gemma_mat_decode_matches_flash_token_exact) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  std::string prompt;   // ~1300 tokens -> 3 global pages @ page_tokens=512
+  for (int i = 0; i < 64; ++i) {
+    prompt += "The cartographer unrolled the brittle map across the table, "
+              "tracing rivers and mountain passes by candlelight. ";
+  }
+
+  auto run = [&](bool mat) -> std::vector<std::int32_t> {
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    if (mat) { ::setenv("VPIPE_GEMMA_MAT_DECODE", "1", 1); }
+    else     { ::unsetenv("VPIPE_GEMMA_MAT_DECODE"); }
+    Session sess;
+    auto* mc = sess.metal_compute();
+    auto* mgr = sess.generative_model_manager();
+    std::vector<std::int32_t> out;
+    if (mc == nullptr || !mc->valid() || mgr == nullptr) { return out; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.compute_dtype = "f16";
+    spec.page_tokens = 512;
+    spec.max_pages = 16;
+    auto lm = mgr->load(spec);
+    if (!lm || !lm->valid()) { return out; }
+    auto ids = lm->tokenizer().encode(prompt);
+    if (ids.empty()) { return out; }
+    auto ctx = lm->make_context();
+    if (!ctx.valid()) { return out; }
+    std::int32_t t = lm->prefill(ctx, ids);
+    for (int i = 0; i < 48 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token_greedy(ctx);
+    }
+    return out;
+  };
+
+  const auto ref = run(false);   // base flash decode
+  const auto mat = run(true);    // materialized decode
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ::unsetenv("VPIPE_GEMMA_MAT_DECODE");
+  ASSERT_TRUE(!ref.empty());
+  ASSERT_TRUE(ref.size() == mat.size());
+  std::size_t mm = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (ref[i] != mat[i]) { ++mm; }
+  }
+  std::printf("[metal_lm_smoke.gemma_mat_decode_matches_flash_token_exact] "
+              "%zu tokens, %zu mismatches\n", ref.size(), mm);
+  EXPECT_TRUE(mm == 0);
 }
 
 // Threadgroup-staged flash-decode for the Gemma-4 GLOBAL layers

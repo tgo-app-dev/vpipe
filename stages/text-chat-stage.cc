@@ -98,6 +98,9 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // standard decode path, so this is a perf-only switch; default on, set
   // false to force the pdecode loop.
   _mtp_enabled = attr_bool("mtp");
+  // Prefix-seed the MTP drafter's KV (decode- vs prefill-throughput tradeoff).
+  // Default on for chat; applied to the LM at launch (only when MTP is used).
+  _mtp_prefix_seed = attr_bool("mtp_prefix_seed");
 #endif
 
   if (_hf_dir.empty()) {
@@ -149,6 +152,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "mtp", .type = ConfigType::Bool,
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
+   .def_bool = true},
+  {.key = "mtp_prefix_seed", .type = ConfigType::Bool,
+   .doc = "seed the MTP drafter's KV with the prompt at decode start: higher "
+          "draft acceptance / decode throughput for a small extra prefill "
+          "cost (token-exact; perf only). Default on (chat is decode-bound); "
+          "set false to favor prefill throughput. No effect unless mtp is on.",
    .def_bool = true},
 };
 const PortSpec kIports[] = {
@@ -219,6 +228,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  // Apply the MTP prefix-seed preference before any prefill (no-op unless the
+  // model carries a metal MTP head). Chat is decode-bound, so default on.
+  if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
   // Acquire the persistent chat context here so every beat reuses the
   // same K/V cache; the conversation history becomes the model's
   // memory. Reset via `/clear` in process().

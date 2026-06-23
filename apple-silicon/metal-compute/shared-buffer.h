@@ -56,6 +56,18 @@ public:
   // that needs to call setBuffer:offset:atIndex: directly.
   MTL::Buffer* mtl_buffer() const noexcept { return _buf; }
 
+  // Baked-in GPU byte offset into mtl_buffer() (0 for a normal buffer;
+  // nonzero only for subview() handles). set_buffer() adds it to the
+  // per-call byte_offset so a subview reads the right slice transparently.
+  std::size_t  byte_offset() const noexcept { return _base_off; }
+
+  // A non-owning-data, refcount-sharing window [offset, offset+size) into
+  // this buffer's memory. The returned handle retains the SAME MTL::Buffer
+  // (refcount +1) and carries byte_offset()+offset, so binding it via
+  // set_buffer() addresses the slice on the GPU and contents() points at it
+  // on the CPU. Lets one big allocation back several logical buffers without
+  // copying (e.g. q|k|v sub-weights of a fused concat). Not wired.
+
   // Optional shape/strides/dtype metadata. Default-constructed view
   // (rank == 0) means "untyped raw buffer". set_view does NOT touch
   // bytes.
@@ -84,6 +96,9 @@ public:
   static SharedBuffer wrap(MTL::Buffer* buf, void* contents,
                            std::size_t byte_size) noexcept;
 
+  // See the comment block above byte_offset().
+  SharedBuffer subview(std::size_t offset, std::size_t size) const noexcept;
+
 private:
   friend class MetalCompute;
 
@@ -99,6 +114,7 @@ private:
   MTL::Buffer* _buf       = nullptr;
   void*        _contents  = nullptr;
   std::size_t  _byte_size = 0;
+  std::size_t  _base_off  = 0;     // GPU byte offset for subview() handles
   BufferView   _view{};
   bool         _wired     = false;
 };

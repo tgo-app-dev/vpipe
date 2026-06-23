@@ -110,6 +110,29 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int valid) {
   return sum;
 }
 
+// Threadgroup-memory counterpart of load_vector (for the fused rmsnorm+qmv
+// kernel, where the normalized x lives in threadgroup memory). Same 4-bit
+// power-of-16 pre-division so qdot's nibble-shift trick is unchanged.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_tg(const threadgroup T* x, thread U* x_thread) {
+  U sum = 0;
+  if (bits == 4) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] / 16.0f;
+      x_thread[i + 2] = x[i + 2] / 256.0f;
+      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+  } else if (bits == 8) {
+    for (int i = 0; i < values_per_thread; i++) {
+      sum += x[i];
+      x_thread[i] = x[i];
+    }
+  }
+  return sum;
+}
+
 // Dot product of x with one dequantized weight row chunk:
 //   scale * sum_i(x_i * q_i) + bias * sum(x_i)
 // The masked bits carry the nibble shifted left, which cancels the
@@ -377,6 +400,300 @@ kernel void affine_qmv_w4g32_add_q40(
   qmv_fast_impl<VPIPE_ELT, 32, 4, true, 4, 2, 2, /*SCALE_ONLY=*/true>(
       w, scales, biases, x, y, residual,
       in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// ---- QKV-fused decode GEMV ---------------------------------------------
+// One M=1 GEMV over the row-concatenated q|k|v weight [q_rows+k_rows+v_rows,
+// K], writing each row to its own output buffer (q_out/k_out/v_out). Decode
+// q/k/v share the same normed input and are independent, but issued as 2-3
+// SEPARATE small GEMVs the k/v halves (e.g. 512 rows = 64 threadgroups)
+// under-occupy the GPU and miss peak bandwidth. Fusing into ONE dispatch over
+// the concatenated rows keeps the GPU saturated (e.g. 3072 rows = 384 TGs)
+// while still landing q/k/v in their existing separate buffers (downstream
+// norm/rope/kv-write unchanged). q_rows/k_rows are multiples of the 8-row
+// threadgroup block, so each 8-row block lands entirely in one output buffer.
+// v_rows==0 => q|k fusion (k_eq_v layers; V is derived from K separately).
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_qkv_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* q_out,
+    device T* k_out,
+    device T* v_out,
+    const constant int& in_vec_size,
+    const constant int& q_rows,
+    const constant int& k_rows,
+    const constant int&,            // v_rows: unused (v-range = grid - q - k);
+                                    // kept positional for the host buffer ABI.
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    U sum;
+    if (krem >= block_size) {
+      sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    } else {
+      const int v = in_vec_size - (k + (int)simd_lid * values_per_thread);
+      sum = load_vector_safe<T, U, values_per_thread, bits>(
+          x, x_thread, v < 0 ? 0 : v);
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      U s = sl[0];
+      U b = (U)(biases + row * in_vec_size_g)[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  const int qk = q_rows + k_rows;
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      const int grow = out_row + row;
+      const T val = static_cast<T>(result[row]);
+      if (grow < q_rows) {
+        q_out[grow] = val;
+      } else if (grow < qk) {
+        k_out[grow - q_rows] = val;
+      } else {
+        v_out[grow - qk] = val;
+      }
+    }
+  }
+}
+
+kernel void affine_qmv_qkv_w4g64(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    device VPIPE_ELT*       q_out   [[buffer(4)]],
+    device VPIPE_ELT*       k_out   [[buffer(5)]],
+    device VPIPE_ELT*       v_out   [[buffer(6)]],
+    constant int&           in_vec_size [[buffer(7)]],
+    constant int&           q_rows  [[buffer(8)]],
+    constant int&           k_rows  [[buffer(9)]],
+    constant int&           v_rows  [[buffer(10)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_qkv_impl<VPIPE_ELT, 64, 4>(
+      w, scales, biases, x, q_out, k_out, v_out,
+      in_vec_size, q_rows, k_rows, v_rows, tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmv_qkv_w4g32(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    device VPIPE_ELT*       q_out   [[buffer(4)]],
+    device VPIPE_ELT*       k_out   [[buffer(5)]],
+    device VPIPE_ELT*       v_out   [[buffer(6)]],
+    constant int&           in_vec_size [[buffer(7)]],
+    constant int&           q_rows  [[buffer(8)]],
+    constant int&           k_rows  [[buffer(9)]],
+    constant int&           v_rows  [[buffer(10)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_qkv_impl<VPIPE_ELT, 32, 4>(
+      w, scales, biases, x, q_out, k_out, v_out,
+      in_vec_size, q_rows, k_rows, v_rows, tid, simd_gid, simd_lid);
+}
+
+// Fused RMSNorm(input_layernorm) + QKV qmv (Gemma-4 decode). Stages x into
+// threadgroup memory, computes the row RMS there, normalizes by norm_w, then
+// runs the QKV GEMV from threadgroup memory -- removing the standalone rms
+// dispatch AND the normed-x device round-trip (one fewer dispatch + less
+// intermediate bandwidth per layer). norm_w is Gemma's (1+w): the +1 is folded
+// into the stored weight at LOAD time (the mlx checkpoint already bakes it), so
+// this is a plain multiply, no runtime +1. tg_x is dynamic threadgroup memory
+// sized by the host to ceil(in_vec_size/block_size)*block_size elements; the
+// pad lanes are zeroed so the (non-safe) block loader matches the safe tail.
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_qkv_rmsnorm_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device T* norm_w,
+    device T* q_out,
+    device T* k_out,
+    device T* v_out,
+    const constant int& in_vec_size,
+    const constant int& q_rows,
+    const constant int& k_rows,
+    const constant int&,            // v_rows: unused (v-range = grid - q - k);
+                                    // kept positional for the host buffer ABI.
+    const constant float& eps,
+    threadgroup T* tg_x,
+    threadgroup float* partial,    // [num_simdgroups] reduction scratch
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  // ---- RMSNorm prologue: stage + normalize x in threadgroup memory --------
+  const int lid = (int)simd_gid * SIMD_SIZE + (int)simd_lid;   // 0..63
+  const int nthreads = num_simdgroups * SIMD_SIZE;             // 64
+  float sq = 0.0f;
+  for (int k = lid; k < in_vec_size; k += nthreads) {
+    const float v = float(x[k]);
+    sq += v * v;
+  }
+  sq = simd_sum(sq);
+  if (simd_lid == 0) { partial[simd_gid] = sq; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (int s = 0; s < num_simdgroups; ++s) { total += partial[s]; }
+  const float inv = rsqrt(total / float(in_vec_size) + eps);
+  // ceil to block_size so the GEMV's non-safe loader never reads past the pad.
+  const int aligned = ((in_vec_size + block_size - 1) / block_size) * block_size;
+  for (int k = lid; k < aligned; k += nthreads) {
+    tg_x[k] = (k < in_vec_size)
+        ? T(float(x[k]) * inv * float(norm_w[k]))
+        : T(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- QKV GEMV from threadgroup memory (mirror of qmv_qkv_impl) ----------
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const threadgroup T* xt = tg_x + simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    U sum = load_vector_tg<T, U, values_per_thread, bits>(xt, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      U s = sl[0];
+      U b = (U)(biases + row * in_vec_size_g)[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    xt += block_size;
+  }
+
+  const int qk = q_rows + k_rows;
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      const int grow = out_row + row;
+      const T val = static_cast<T>(result[row]);
+      if (grow < q_rows) {
+        q_out[grow] = val;
+      } else if (grow < qk) {
+        k_out[grow - q_rows] = val;
+      } else {
+        v_out[grow - qk] = val;
+      }
+    }
+  }
+}
+
+kernel void affine_qmv_qkv_rms_w4g64(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    const device VPIPE_ELT* norm_w  [[buffer(4)]],
+    device VPIPE_ELT*       q_out   [[buffer(5)]],
+    device VPIPE_ELT*       k_out   [[buffer(6)]],
+    device VPIPE_ELT*       v_out   [[buffer(7)]],
+    constant int&           in_vec_size [[buffer(8)]],
+    constant int&           q_rows  [[buffer(9)]],
+    constant int&           k_rows  [[buffer(10)]],
+    constant int&           v_rows  [[buffer(11)]],
+    constant float&         eps     [[buffer(12)]],
+    threadgroup VPIPE_ELT*  tg_x    [[threadgroup(0)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup float partial[2];
+  qmv_qkv_rmsnorm_impl<VPIPE_ELT, 64, 4>(
+      w, scales, biases, x, norm_w, q_out, k_out, v_out, in_vec_size,
+      q_rows, k_rows, v_rows, eps, tg_x, partial, tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmv_qkv_rms_w4g32(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    const device VPIPE_ELT* norm_w  [[buffer(4)]],
+    device VPIPE_ELT*       q_out   [[buffer(5)]],
+    device VPIPE_ELT*       k_out   [[buffer(6)]],
+    device VPIPE_ELT*       v_out   [[buffer(7)]],
+    constant int&           in_vec_size [[buffer(8)]],
+    constant int&           q_rows  [[buffer(9)]],
+    constant int&           k_rows  [[buffer(10)]],
+    constant int&           v_rows  [[buffer(11)]],
+    constant float&         eps     [[buffer(12)]],
+    threadgroup VPIPE_ELT*  tg_x    [[threadgroup(0)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup float partial[2];
+  qmv_qkv_rmsnorm_impl<VPIPE_ELT, 32, 4>(
+      w, scales, biases, x, norm_w, q_out, k_out, v_out, in_vec_size,
+      q_rows, k_rows, v_rows, eps, tg_x, partial, tid, simd_gid, simd_lid);
 }
 
 // Fused per-layer-input GATE GEMV (Gemma-4 e4b decode): y = gelu_pytorch_tanh(
@@ -804,6 +1121,13 @@ METAL_FUNC void qmv_batch_impl(
 // (measured 68.9 vs 58.3 tok/s aggregate at N=4). N==1 stays on plain
 // affine_qmv.
 VPIPE_QMV_BATCH(affine_qmv_batch_w4g64, 2)
+// MAXM=4 twin for the MTP speculative VERIFY at draft depth>=2 (n=3..4): the
+// MAXM=2 form tiles 3-4 rows into ceil(n/2)=2 grid.z passes, re-reading EVERY
+// weight matrix from DRAM (the depth-2 cliff -- measured to ~2x the depth-1
+// verify, esp. the >L2 lm_head). MAXM=4 reads weights ONCE for 3-4 rows. Goes
+// more compute-bound per the MAXM=2 note above, so it's gated to the verify
+// path and A/B'd; per-row math is bit-identical (token-exact).
+VPIPE_QMV_BATCH(affine_qmv_batch4_w4g64, 4)
 
 // 8-bit twin: qmv_batch_impl already carries the bits==8 dot (one raw byte
 // per value, no nibble unpack), so this is the same macro with the impl's
@@ -830,6 +1154,7 @@ VPIPE_QMV_BATCH(affine_qmv_batch_w4g64, 2)
         tid, simd_gid, simd_lid);                                            \
   }
 VPIPE_QMV_BATCH_W8(affine_qmv_batch_w8g64, 2)
+VPIPE_QMV_BATCH_W8(affine_qmv_batch4_w8g64, 4)   // MTP verify n=3..4 (see w4)
 
 // group_size=32 twin of VPIPE_QMV_BATCH (GGUF q4_0): identical to the
 // macro above but the impl group_size template arg is 32. The g64 macro
@@ -982,6 +1307,7 @@ METAL_FUNC void qmv_batch_swiglu_impl(
         tid, simd_gid, simd_lid);                                            \
   }
 VPIPE_QMV_BATCH_SWIGLU(affine_qmv_batch_swiglu_w4g64, 2)
+VPIPE_QMV_BATCH_SWIGLU(affine_qmv_batch4_swiglu_w4g64, 4)   // MTP verify n=3..4
 
 // Batched fused GeGLU MLP GEMV (Gemma-4): identical to the swiglu batch but
 // the activation is gelu_pytorch_tanh (matches affine_qmv_geglu_w4g64).

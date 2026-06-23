@@ -449,8 +449,14 @@ private:
   void m_reset_scene_();
   Job  m_process_(RuntimeContext& ctx);
   Job  m_close_scene_(RuntimeContext& ctx);
+  // Single-branch decode. use_mtp enables the MTP speculative head when the
+  // model carries one -- ONLY meaningful BEFORE the context branches (the scene
+  // description / audio interpretation). After branching for parallel questions
+  // pass use_mtp=false: the per-question fallback then decodes non-speculatively
+  // (the batched path, preferred, never uses MTP), since batched decode
+  // amortizes the weight reads across branches and beats N serial MTP decodes.
   std::string m_decode_(genai::LoadedLanguageModel::Context& ctx,
-                        const genai::SamplerParams& sp);
+                        const genai::SamplerParams& sp, bool use_mtp = true);
   // Interpret a scene's audio (host-f32 encoder rows) to a short text
   // phrase in ISOLATION -- a dedicated [audio block + "what sound?"]
   // prefill+decode where the audio is salient (no visual context to drown

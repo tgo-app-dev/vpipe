@@ -727,6 +727,10 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  // Never seed the MTP drafter's KV here, even when the model carries an MTP
+  // head: realtime-vqa re-prefills (multimodal) per scene and fans branches, so
+  // prefill throughput matters more than the per-branch decode acceptance.
+  _lm->set_mtp_prefix_seed(false);
   _chat_tpl = genai::make_chat_template(
       _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
@@ -1349,7 +1353,7 @@ RealtimeVqaStage::m_flush_pending_()
 
 std::string
 RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
-                            const genai::SamplerParams& sp)
+                            const genai::SamplerParams& sp, bool use_mtp)
 {
   using clock = std::chrono::steady_clock;
   const auto t_start = clock::now();
@@ -1364,14 +1368,17 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // MTP speculative head fast path (mtp.safetensors, Qwen3.5-OptiQ): the drafter
   // lets the verifier accept multiple tokens per forward, token-exact vs the
   // pdecode loop (greedy) or decode_pipelined (sampling -- the verify samples
-  // each position). This is the SINGLE-decode path (scene description, audio
-  // interpretation); the batched question decode (m_decode_batched_) never uses
-  // it. rope is anchored on ctx (post-image/audio mROPE or sequential) exactly
-  // as pdecode_begin reads it. Greedy OR penalty-free sampling -- the verify
+  // each position). MTP is the SINGLE-PRE-BRANCH decode only (scene description,
+  // audio interpretation): use_mtp gates it OFF for the post-branch per-question
+  // fallback so the questions decode non-speculatively -- the batched question
+  // decode (m_decode_batched_) is preferred there and never uses MTP, and N
+  // serial MTP decodes lose to one weight-amortized batched pass. rope is
+  // anchored on ctx (post-image/audio mROPE or sequential) exactly as
+  // pdecode_begin reads it. Greedy OR penalty-free sampling -- the verify
   // applies no repetition/presence penalty, so a penalised sampler stays on the
   // loops below (which do apply it).
   const std::span<const std::int32_t> no_prompt;
-  const bool mtp_ok = cur >= 0 && _lm->mtp_available()
+  const bool mtp_ok = use_mtp && cur >= 0 && _lm->mtp_available()
       && (argmax || (sp.repetition_penalty == 1.0f
                      && sp.presence_penalty == 0.0f));
   if (mtp_ok) {
@@ -1989,10 +1996,14 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       answers[qidx[k]] = std::move(a[k]);
     }
   } else {
+    // Serial per-question fallback (batched unavailable: <2 questions, config
+    // off, or unsupported). MTP is OFF here -- it's a post-branch decode, where
+    // the batched/non-speculative path wins; only the pre-branch scene/audio
+    // decode above uses MTP.
     for (std::size_t k = 0; k < children.size(); ++k) {
       genai::SamplerParams p = _sampler_params;
       if (p.seed != 0) { p.seed += static_cast<std::uint64_t>(qidx[k]); }
-      answers[qidx[k]] = m_decode_(children[k], p);
+      answers[qidx[k]] = m_decode_(children[k], p, /*use_mtp=*/false);
     }
   }
 

@@ -203,4 +203,14 @@ CommandStream::Fence::completed() const noexcept
   return _cb->status() == MTL::CommandBufferStatusCompleted;
 }
 
+CommandStream::Fence::GpuTimes
+CommandStream::Fence::gpu_times() const noexcept
+{
+  if (_cb == nullptr) {
+    return {0.0, 0.0};
+  }
+  return {_cb->GPUEndTime() - _cb->GPUStartTime(),
+          _cb->kernelEndTime() - _cb->kernelStartTime()};
+}
+
 }  // namespace vpipe::metal_compute

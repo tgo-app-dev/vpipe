@@ -118,6 +118,64 @@ kernel void dense_gemm_mma_t_f16(
 DGV(dense_gemm_mma_t_n128_f16,    128, 128, 8)
 DGV(dense_gemm_mma_t_n128x256_f16,128, 256, 8)
 
+// Causal/windowed QK for the MATERIALIZED attention path (M5 matrix-core core
+// on top of the M4 diagonal-grid exploit). y[m=query, n=key] = Q[m,:].K[n,:]
+// (x @ W^T, contraction K=D, full). A threadgroup whose key-column region is
+// entirely above the causal diagonal -- smallest key (n0) past the block's
+// largest query (q_offset + m0 + BM - 1) -- early-returns, leaving y unwritten;
+// for window>0 a block entirely BELOW the trailing window does too. The
+// downstream causal_softmax_rows (banded=0) rewrites the whole row [0,N), so the
+// skipped region is never read (same contract as steel dense_gemm_t_qkcausal,
+// just with the matmul2d core). M/N tails ride the tensor-extent clamp like the
+// dense entry above. Buffers add q_offset(8)/window(9); has_bias is unused.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_qkcausal_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M,
+    int q_offset, int window, uint3 tgid)
+{
+  const int m0 = (int)tgid.y * BM;          // query-row base
+  const int n0 = (int)tgid.x * BN;          // key-col base
+  if (n0 > q_offset + m0 + BM - 1) { return; }              // above diagonal
+  if (window > 0 && n0 + BN - 1 < q_offset + m0 - window + 1) { return; }
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  auto mY = tY.slice(n0, m0);
+  cT.store(mY);
+}
+
+#define DGVC(NAME, BM, BN, SG)                                           \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const constant int& q_offset [[buffer(8)]],                       \
+      const constant int& window [[buffer(9)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_qkcausal_impl<BM, BN, SG>(                            \
+        x, W, y, K, N, M, q_offset, window, tgid);                      \
+  }
+
+DGVC(dense_gemm_mma_t_qkcausal_n128_f16, 128, 128, 8)
+
 #else
 // Tensor ops unavailable for this target: emit stubs so the metallib
 // still builds. The loader never binds these on a non-tensor GPU.
@@ -129,4 +187,5 @@ DGV(dense_gemm_mma_t_n128x256_f16,128, 256, 8)
 DGV_STUB(dense_gemm_mma_t_f16)
 DGV_STUB(dense_gemm_mma_t_n128_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_f16)
+DGV_STUB(dense_gemm_mma_t_qkcausal_n128_f16)
 #endif

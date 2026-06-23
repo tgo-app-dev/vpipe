@@ -139,6 +139,9 @@ private:
   // ctor). Gates the metal MTP fast path; token-exact, so it only changes
   // decode speed. The MLX path has no MTP head, hence no-MLX only.
   bool _mtp_enabled{};
+  // MTP prefix-seed preference (config "mtp_prefix_seed", default true; read in
+  // the ctor, applied to the LM at launch). Decode- vs prefill-throughput.
+  bool _mtp_prefix_seed{};
   // Stage-local chat template built in initialize() with the
   // disable_thinking override applied (when set). Falls back to the
   // LM's family-default template when _disable_thinking is unset.

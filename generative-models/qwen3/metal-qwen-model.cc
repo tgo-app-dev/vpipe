@@ -170,9 +170,20 @@ MetalQwenModel::load(const std::string& model_dir,
     m->_fn_qmv_batch = m->_lib_qmv.function("affine_qmv_batch_w4g64");
     m->_fn_qmv_batch_swiglu =
         m->_lib_qmv.function("affine_qmv_batch_swiglu_w4g64");
+    // MAXM=4 twins for the MTP verify at draft depth>=2 (see _qmv4_* gate).
+    m->_fn_qmv_batch4 = m->_lib_qmv.function("affine_qmv_batch4_w4g64");
+    m->_fn_qmv_batch4_swiglu =
+        m->_lib_qmv.function("affine_qmv_batch4_swiglu_w4g64");
   }
-  m->_fn_rms = m->_lib_rms.function("rms_norm_f16");
+  // simd_sum RMSNorm (dispatched at 256). The gemma tree rms_norm_f16 (f1ab287)
+  // strides by a fixed 512 -> silently wrong at 256; rms_norm_fast_f16 is the
+  // threadgroup-size-agnostic simd_sum (== pre-f1ab287, no RMS_PAD cap).
+  m->_fn_rms = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_swiglu = m->_lib_elt.function("swiglu_f16");
+  // Generic f16 copy (used by the k-quant dequant fold AND the Leviathan-Chen
+  // MTP logit stash). Load unconditionally so the mixed-affine (OptiQ) path has
+  // it too -- it lives in the always-loaded elementwise lib.
+  m->_fn_copy = m->_lib_elt.function("copy_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
   m->_fn_mul_sigmoid = m->_lib_elt.function("mul_sigmoid_f16");
   m->_fn_head_slice = m->_lib_elt.function("head_slice_f16");
@@ -263,6 +274,9 @@ MetalQwenModel::load(const std::string& model_dir,
                           : "dequant_embed_gather_f16");
   m->_fn_argmax = m->_lib_elt.function("argmax_f16");
   m->_fn_sample = m->_lib_elt.function("sample_topp_f16");
+  m->_fn_lc_sample = m->_lib_elt.function("lc_sample_f16");
+  m->_fn_lc_accept = m->_lib_elt.function("lc_accept_f16");
+  m->_fn_lc_sample_batch = m->_lib_elt.function("lc_sample_batch_f16");
   if (!m->_fn_qmv.valid() || !m->_fn_qmv_add.valid() ||
       !m->_fn_qmv_swiglu.valid() || !m->_fn_qmm.valid() ||
       !m->_fn_qmm_swiglu.valid() || !m->_fn_transpose.valid() ||
@@ -319,6 +333,20 @@ MetalQwenModel::load(const std::string& model_dir,
     const int v = std::atoi(gqa_s);
     if (v >= 1 && v <= 64) { m->_gqa_split = v; }
   }
+  // MAXM=4 batched GEMV for the MTP verify at draft depth>=2 (n=3..4): read each
+  // weight ONCE vs the MAXM=2 form's 2 grid.z tiles (the depth-2 verify cliff).
+  // Capability-gated; default on, VPIPE_MTP_QMV4=0 forces the MAXM=2-tiled path
+  // (A/B). Consulted ONLY while mtp_verify_chunk_ runs (_qmv4_active), so the
+  // realtime-vqa batched decode -- tuned for MAXM=2 -- is untouched.
+  m->_qmv4_enabled = m->_fn_qmv_batch4.valid();
+  if (const char* e = std::getenv("VPIPE_MTP_QMV4")) {
+    m->_qmv4_enabled = m->_fn_qmv_batch4.valid() && (std::atoi(e) != 0);
+  }
+  // Leviathan-Chen MTP sampling (opt-in; default off keeps the exact-match
+  // sampler that's token-exact vs serial). VPIPE_MTP_LEVIATHAN=1 enables.
+  if (const char* e = std::getenv("VPIPE_MTP_LEVIATHAN")) {
+    m->_leviathan = (std::atoi(e) != 0) && m->_fn_copy.valid();
+  }
   // Decode category profiler: only when VPIPE_QWEN_CATPROF is set does the
   // decode step read VPIPE_QWEN_DUP_CAT (so production never pays a
   // per-step getenv). See encode_decode_step_ / metal_asr_decode_catprof.
@@ -347,6 +375,22 @@ MetalQwenModel::load(const std::string& model_dir,
     m->_fn_qmv_q4k_batch = m->_lib_elt.function("qmv_q4k_batch_f16");
     m->_fn_qmv_q5k_batch = m->_lib_elt.function("qmv_q5k_batch_f16");
     m->_fn_qmv_q6k_batch = m->_lib_elt.function("qmv_q6k_batch_f16");
+    // MAXM=4 twins: the depth-2 MTP verify (n=3..4) reads the weight ONCE (one
+    // tile) vs the MAXM=2 form's 2 grid.z tiles. The _qmv4_enabled gate above
+    // keyed off the affine batch4 (absent on the k-quant path), so re-derive it
+    // here from the k-quant twins, honoring the same VPIPE_MTP_QMV4 override.
+    m->_fn_qmv_q4k_batch4 = m->_lib_elt.function("qmv_q4k_batch4_f16");
+    m->_fn_qmv_q5k_batch4 = m->_lib_elt.function("qmv_q5k_batch4_f16");
+    m->_fn_qmv_q6k_batch4 = m->_lib_elt.function("qmv_q6k_batch4_f16");
+    {
+      const bool kq4 = m->_fn_qmv_q4k_batch4.valid()
+          && m->_fn_qmv_q5k_batch4.valid() && m->_fn_qmv_q6k_batch4.valid();
+      bool qmv4_on = true;
+      if (const char* e = std::getenv("VPIPE_MTP_QMV4")) {
+        qmv4_on = std::atoi(e) != 0;
+      }
+      m->_qmv4_enabled = m->_qmv4_enabled || (kq4 && qmv4_on);
+    }
     m->_fn_embed_q6k = m->_lib_elt.function("embed_gather_q6k_f16");
     m->_fn_dequant_q4k = m->_lib_elt.function("dequant_q4k_f16");
     m->_fn_dequant_q5k = m->_lib_elt.function("dequant_q5k_f16");
@@ -376,12 +420,15 @@ MetalQwenModel::load(const std::string& model_dir,
     m->_fn_qmv8 = m->_lib_qmv.function("affine_qmv_w8g64");
     m->_fn_qmv8_add = m->_lib_qmv.function("affine_qmv_w8g64_add");
     m->_fn_qmv8_batch = m->_lib_qmv.function("affine_qmv_batch_w8g64");
+    m->_fn_qmv8_batch4 = m->_lib_qmv.function("affine_qmv_batch4_w8g64");
     m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8g64");
     if (!m->_fn_dequant.valid()) {       // not taken the M5 mma path above
       m->_lib_dequant = mc->load_library("affine_dequant" + sfx);
       m->_fn_dequant = m->_lib_dequant.function("affine_dequant_w4g64");
     }
     m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8g64");
+    m->_fn_requant_w8w4 =
+        m->_lib_dequant.function("affine_requant_w8_to_w4_g64");
     if (!m->_fn_dense_gemm.valid()) {    // not taken the k-quant path
       m->_lib_dense = mc->load_library("dense_gemm" + sfx);
       m->_fn_dense_gemm = m->_lib_dense.function("dense_gemm_t_f16");
@@ -984,15 +1031,18 @@ MetalQwenModel::load(const std::string& model_dir,
       }
       ok = ok && m->_fn_dense_gemv.valid();
       if (ok) {
-        // The MTP layer's own 1-layer full-attn paged context (reset each
-        // drafting round; the draft window is tiny, so a small cap suffices).
+        // The MTP layer's own 1-layer full-attn paged context. ONE large page
+        // so the persistent path (mtp_persist) can keep the draft head's KV
+        // over the committed decode history without straddling pages (the
+        // kv-write/sdpa here are single-page); a long decode that overflows
+        // resets the ctx and continues (graceful loss of older history).
         ContextManager::Spec ms;
         ms.metal = mc;
         ms.n_layers = 1;
         ms.n_kv_heads = cfg.n_kv_heads;
         ms.head_dim = cfg.head_dim;
-        ms.max_seq = 256;
-        ms.page_tokens = 256;
+        ms.max_seq = 2048;
+        ms.page_tokens = 2048;
         ms.max_pages = 0;
         ms.is_linear_layer.assign(1, false);
         M.ctx = std::make_unique<ContextManager>(ms, nullptr);
@@ -1062,14 +1112,16 @@ MetalQwenModel::load(const std::string& model_dir,
     ok = ok && load_kq("mtp.layers.0.mlp.down_proj.weight",
                        ly.kqdown, ly.kqdown_t);
     if (ok) {
-      // The MTP layer's own 1-layer full-attn paged context (reset per round).
+      // The MTP layer's own 1-layer full-attn paged context. ONE large page so
+      // the persistent path keeps the draft head's KV over the committed decode
+      // history (single-page kv-write/sdpa); overflow resets + continues.
       ContextManager::Spec ms;
       ms.metal = mc;
       ms.n_layers = 1;
       ms.n_kv_heads = cfg.n_kv_heads;
       ms.head_dim = cfg.head_dim;
-      ms.max_seq = 256;
-      ms.page_tokens = 256;
+      ms.max_seq = 2048;
+      ms.page_tokens = 2048;
       ms.max_pages = 0;
       ms.is_linear_layer.assign(1, false);
       M.ctx = std::make_unique<ContextManager>(ms, nullptr);
@@ -1079,6 +1131,40 @@ MetalQwenModel::load(const std::string& model_dir,
         m->_mtp_h = mc->make_shared_buffer((std::size_t)cfg.hidden * 2);
         M.pgt = mc->make_shared_buffer(
             (std::size_t)M.ctx->max_pages() * 3 * sizeof(std::int32_t));
+      }
+    }
+  }
+
+  // Optional 4-bit DRAFT lm_head for the MTP draft (affine path, 8-bit tied
+  // embed source): requant the 8-bit head to 4-bit ONCE here so the draft's
+  // vocab GEMV reads half the bytes (the verifier keeps the 8-bit head). The
+  // draft is verify-corrected -> output stays exact; the lossy 4-bit quant
+  // costs a little draft acceptance. VPIPE_MTP_NO_DRAFT_HEAD disables.
+  if (m->_mtp.ok && m->_mixed && m->_fn_requant_w8w4.valid() &&
+      std::getenv("VPIPE_MTP_NO_DRAFT_HEAD") == nullptr) {
+    const bool tied = m->_tied;
+    const int src_bits = tied ? m->_embed_bits : m->_lm_bits;
+    const SharedBuffer& sw = tied ? m->_embed_w : m->_lm_w;
+    const SharedBuffer& ss = tied ? m->_embed_s : m->_lm_s;
+    const SharedBuffer& sb = tied ? m->_embed_b : m->_lm_b;
+    const int V = cfg.vocab, H = cfg.hidden;
+    if (src_bits == 8 && !sw.empty() && (H % 64) == 0) {
+      MtpHead& M = m->_mtp;
+      M.dlm_w = mc->make_shared_buffer((std::size_t)V * (H / 8) * 4);
+      M.dlm_s = mc->make_shared_buffer((std::size_t)V * (H / 64) * 2);
+      M.dlm_b = mc->make_shared_buffer((std::size_t)V * (H / 64) * 2);
+      if (!M.dlm_w.empty() && !M.dlm_s.empty() && !M.dlm_b.empty()) {
+        metal_compute::CommandStream stream = mc->make_command_stream();
+        ComputeEncoder enc = stream.begin_compute();
+        enc.set_function(m->_fn_requant_w8w4);
+        enc.set_buffer(0, sw); enc.set_buffer(1, ss); enc.set_buffer(2, sb);
+        enc.set_buffer(3, M.dlm_w); enc.set_buffer(4, M.dlm_s);
+        enc.set_buffer(5, M.dlm_b);
+        enc.set_constant(6, H); enc.set_constant(7, V);
+        enc.dispatch({(unsigned)(H / 64), (unsigned)V, 1}, {8, 32, 1});
+        enc.end();
+        stream.commit().wait();
+        M.draft_head = true;
       }
     }
   }
@@ -1289,22 +1375,27 @@ MetalQwenModel::kqmv_batch_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                             int N, int M, int ystride, int yoff)
 {
   // y[base+m, yoff + 0:N] = dequant(w[N,K]) @ x[base+m, 0:K] with the raw
-  // k-quant weight read ONCE across each 2-row tile (compile-time MAXM=2; grid.z
-  // tiles ceil(M/2)). At the depth-1 draft window M=2 this is one tile -> weight
-  // read once -> a 2-token verify costs ~1 decode step (vs M looped qmv reading
-  // the weight M times, or a full f16 dequant). Falls back to looped single-row
-  // qmv when the batched kernel for `type` is unavailable, or when
-  // VPIPE_GGUF_MTP_LOOPED_GEMV is set (the A/B baseline). M==1 -> plain qmv.
+  // k-quant weight read ONCE across each tile. MAXM=2 (depth-1 draft window M=2:
+  // one tile, weight read once -> ~1 decode step) or, in the MTP verify at
+  // draft depth>=2 (M=3..4, _qmv4_active), the MAXM=4 twin (one tile vs the
+  // MAXM=2 form's ceil(M/2)=2 tiles = the depth-2 cliff). Per-row math is
+  // bit-identical across MAXM (token-exact). Falls back to looped single-row qmv
+  // when the batched kernel is unavailable or VPIPE_GGUF_MTP_LOOPED_GEMV is set
+  // (the A/B baseline). M==1 -> plain qmv.
   static const bool force_looped =
       std::getenv("VPIPE_GGUF_MTP_LOOPED_GEMV") != nullptr;
   if (M == 1) {
     kqmv_(enc, type, w, x, 0, y, (std::size_t)yoff, K, N);
     return;
   }
+  const bool use4 = _qmv4_active && M > 2 && M <= 4;
   const metal_compute::ComputeFunction& fn =
-      type == KQ::kQ6K ? _fn_qmv_q6k_batch
-                       : (type == KQ::kQ5K ? _fn_qmv_q5k_batch
-                                           : _fn_qmv_q4k_batch);
+      use4 ? (type == KQ::kQ6K ? _fn_qmv_q6k_batch4
+                               : (type == KQ::kQ5K ? _fn_qmv_q5k_batch4
+                                                   : _fn_qmv_q4k_batch4))
+           : (type == KQ::kQ6K ? _fn_qmv_q6k_batch
+                               : (type == KQ::kQ5K ? _fn_qmv_q5k_batch
+                                                   : _fn_qmv_q4k_batch));
   if (force_looped || !fn.valid()) {
     for (int m = 0; m < M; ++m) {
       kqmv_(enc, type, w, x, (std::size_t)m * K, y,
@@ -1312,6 +1403,7 @@ MetalQwenModel::kqmv_batch_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
     }
     return;
   }
+  const int maxm = use4 ? 4 : 2;
   enc.set_function(fn);
   enc.set_buffer(0, w);
   enc.set_buffer(1, x);
@@ -1321,8 +1413,8 @@ MetalQwenModel::kqmv_batch_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
   enc.set_constant(5, M);
   enc.set_constant(6, ystride);
   enc.set_constant(7, yoff);
-  enc.dispatch({32, (unsigned)(((N + 1) / 2) * 2), (unsigned)((M + 1) / 2)},
-               {32, 2, 1});
+  enc.dispatch({32, (unsigned)(((N + 1) / 2) * 2),
+               (unsigned)((M + maxm - 1) / maxm)}, {32, 2, 1});
 }
 
 void
@@ -2020,6 +2112,7 @@ MetalQwenModel::ensure_bscratch_(BScratch& bs, int n)
   bs.ygdn   = f16((std::size_t)n * vald);
   bs.normout = f16((std::size_t)n * vald);
   bs.sg     = f16((std::size_t)n * ffn);
+  bs.upb    = f16((std::size_t)n * ffn);   // mixed MLP: de-fused up_proj
   bs.logits = f16((std::size_t)n * c.vocab);
   bs.pgt    = i32((std::size_t)n * _ctx->max_pages() * 3);
   bs.tok_in = i32((std::size_t)n);
@@ -2046,6 +2139,17 @@ MetalQwenModel::qmm_auto_(
   // MAXM=2 -> grid.z tiles ceil(m/2)). Decode is DRAM-bound on the weight
   // read, so this beats the steel GEMM (compute-tiled for prefill) until m
   // is large enough that the steel matrix cores win.
+  // MTP verify, 3-4 rows: MAXM=4 reads the weight ONCE (ceil(m/4)=1 tile) vs
+  // the MAXM=2 form's 2 tiles -- the depth-2 verify cliff. Scoped to the verify
+  // (_qmv4_active); per-row math is bit-identical to qmv_batch (token-exact).
+  if (_qmv4_active && m > 2 && m <= 4 && _fn_qmv_batch4.valid()) {
+    enc.set_function(_fn_qmv_batch4);
+    enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
+    enc.set_buffer(3, xin); enc.set_buffer(4, y);
+    enc.set_constant(5, Kk); enc.set_constant(6, Nout); enc.set_constant(7, m);
+    enc.dispatch({32, (unsigned)(Nout / 4), 1}, {32, 2, 1});
+    return;
+  }
   if (m > 1 && m <= kQmvBatchMaxRows && _fn_qmv_batch.valid()) {
     enc.set_function(_fn_qmv_batch);
     enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
@@ -2079,6 +2183,14 @@ MetalQwenModel::qmm_auto_swiglu_(
     int Kk, int Nout)
 {
   const unsigned gy = (unsigned)(Nout / 4);   // == ffn/2 (fused width 2*ffn)
+  if (_qmv4_active && m > 2 && m <= 4 && _fn_qmv_batch4_swiglu.valid()) {
+    enc.set_function(_fn_qmv_batch4_swiglu);   // verify 3-4 rows: one weight read
+    enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
+    enc.set_buffer(3, xin); enc.set_buffer(4, y);
+    enc.set_constant(5, Kk); enc.set_constant(6, Nout); enc.set_constant(7, m);
+    enc.dispatch({32, gy, 1}, {32, 2, 1});
+    return;
+  }
   if (m > 1 && m <= kQmvBatchMaxRows && _fn_qmv_batch_swiglu.valid()) {
     enc.set_function(_fn_qmv_batch_swiglu);
     enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
@@ -2188,15 +2300,30 @@ MetalQwenModel::encode_batched_step_(
       const bool gate = c.attn_output_gate;
       const int qdo = gate ? 2 * qd : qd;
       const int Nfqkv = qdo + 2 * kd;
-      qmm(ly.qw, ly.qs, ly.qb, bs.hn, bs.qfull, H, Nfqkv);
-      if (gate) {
-        hslice(bs.qfull, 0, bs.q3, 0, N * Hq, 2 * D, D, 0, Hq, Nfqkv);
-        hslice(bs.qfull, 0, bs.gate3, 0, N * Hq, 2 * D, D, D, Hq, Nfqkv);
+      if (_mixed) {
+        // Mixed-precision de-fuses q|k|v into per-tensor-bit projections (a
+        // batched-GEMV can't write a column slice of a fused buffer). q (+gate)
+        // -> qfull[N,qdo], k/v -> their own buffers; slice q|gate at stride qdo.
+        vqmm_(enc, N, ly.qw, ly.qs, ly.qb, ly.q_bits, bs.hn, bs.qfull, H, qdo);
+        vqmm_(enc, N, ly.kw, ly.ks, ly.kb, ly.k_bits, bs.hn, bs.kbuf, H, kd);
+        vqmm_(enc, N, ly.vw, ly.vs, ly.vb, ly.v_bits, bs.hn, bs.vbuf, H, kd);
+        if (gate) {
+          hslice(bs.qfull, 0, bs.q3, 0, N * Hq, 2 * D, D, 0, Hq, qdo);
+          hslice(bs.qfull, 0, bs.gate3, 0, N * Hq, 2 * D, D, D, Hq, qdo);
+        } else {
+          hslice(bs.qfull, 0, bs.q3, 0, N, qdo, qd, 0);
+        }
       } else {
-        hslice(bs.qfull, 0, bs.q3, 0, N, Nfqkv, qd, 0);
+        qmm(ly.qw, ly.qs, ly.qb, bs.hn, bs.qfull, H, Nfqkv);
+        if (gate) {
+          hslice(bs.qfull, 0, bs.q3, 0, N * Hq, 2 * D, D, 0, Hq, Nfqkv);
+          hslice(bs.qfull, 0, bs.gate3, 0, N * Hq, 2 * D, D, D, Hq, Nfqkv);
+        } else {
+          hslice(bs.qfull, 0, bs.q3, 0, N, Nfqkv, qd, 0);
+        }
+        hslice(bs.qfull, 0, bs.kbuf, 0, N, Nfqkv, kd, qdo);
+        hslice(bs.qfull, 0, bs.vbuf, 0, N, Nfqkv, kd, qdo + kd);
       }
-      hslice(bs.qfull, 0, bs.kbuf, 0, N, Nfqkv, kd, qdo);
-      hslice(bs.qfull, 0, bs.vbuf, 0, N, Nfqkv, kd, qdo + kd);
       // Batched per-head q/k RMSNorm (position-independent). RoPE is applied
       // per branch below at its own position (no transpose: the decode SDPA
       // reads q/k head-major [Hq|Hkv, D]).
@@ -2299,14 +2426,31 @@ MetalQwenModel::encode_batched_step_(
         enc.set_buffer(2, bs.at); enc.set_constant(3, N * qd);
         enc.dispatch({(unsigned)(N * qd), 1, 1}, {256, 1, 1});
       }
-      qmm(ly.ow, ly.os, ly.ob, bs.at, bs.ao, qd, H);
+      if (_mixed) {
+        vqmm_(enc, N, ly.ow, ly.os, ly.ob, ly.o_bits, bs.at, bs.ao, qd, H);
+      } else {
+        qmm(ly.ow, ly.os, ly.ob, bs.at, bs.ao, qd, H);
+      }
       residual(bs.x, bs.ao, bs.x, N * H);
     } else {
       const int Nf = Cd + vald + 2 * Hv;
-      qmm(ly.iqw, ly.iqs, ly.iqb, bs.hn, bs.mixqkv, H, Nf);
-      hslice(bs.mixqkv, 0, bs.zbuf, 0, N, Nf, vald, Cd);
-      hslice(bs.mixqkv, 0, bs.abuf, 0, N, Nf, Hv, Cd + vald);
-      hslice(bs.mixqkv, 0, bs.bbuf, 0, N, Nf, Hv, Cd + vald + Hv);
+      // GDN-input layout / conv x-stride: fused (uniform) packs qkv|z|a|b in one
+      // [N,Nf] row (conv reads the qkv part at stride Nf); mixed de-fuses qkv ->
+      // its own [N,Cd] buffer (conv stride Cd), z/a/b to their own buffers.
+      const int gdn_in_stride = _mixed ? Cd : Nf;
+      if (_mixed) {
+        vqmm_(enc, N, ly.iqw, ly.iqs, ly.iqb, ly.qkv_bits, bs.hn, bs.mixqkv,
+              H, Cd);
+        vqmm_(enc, N, ly.izw, ly.izs, ly.izb, ly.z_bits, bs.hn, bs.zbuf,
+              H, vald);
+        vqmm_(enc, N, ly.iaw, ly.ias, ly.iab, ly.a_bits, bs.hn, bs.abuf, H, Hv);
+        vqmm_(enc, N, ly.ibw, ly.ibs, ly.ibb, ly.b_bits, bs.hn, bs.bbuf, H, Hv);
+      } else {
+        qmm(ly.iqw, ly.iqs, ly.iqb, bs.hn, bs.mixqkv, H, Nf);
+        hslice(bs.mixqkv, 0, bs.zbuf, 0, N, Nf, vald, Cd);
+        hslice(bs.mixqkv, 0, bs.abuf, 0, N, Nf, Hv, Cd + vald);
+        hslice(bs.mixqkv, 0, bs.bbuf, 0, N, Nf, Hv, Cd + vald + Hv);
+      }
       // Per-branch GDN: conv1d + delta-rule recurrence over this branch's
       // own conv_state / ssm_state (cheap, not weight-bound). n=1 per branch.
       for (int i = 0; i < N; ++i) {
@@ -2314,12 +2458,13 @@ MetalQwenModel::encode_batched_step_(
         const SharedBuffer* ss = _ctx->ssm_state(cids[(std::size_t)i], L);
         const int one = 1;
         const std::size_t coff = (std::size_t)i * Cd * 2;       // convout row
-        const std::size_t moff = (std::size_t)i * Nf * 2;       // mixqkv row
+        const std::size_t moff =
+            (std::size_t)i * gdn_in_stride * 2;                 // qkv row
         enc.set_function(_fn_gdn_conv1d);
         enc.set_buffer(0, *cs); enc.set_buffer(1, bs.mixqkv, moff);
         enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, bs.convout, coff);
         enc.set_constant(4, one); enc.set_constant(5, Cd);
-        enc.set_constant(6, K); enc.set_constant(7, Nf);
+        enc.set_constant(6, K); enc.set_constant(7, gdn_in_stride);
         enc.set_constant(8, keyd);
         enc.set_buffer(9, *cs);          // in-place (no run-ahead ring here)
         enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
@@ -2360,21 +2505,42 @@ MetalQwenModel::encode_batched_step_(
         enc.set_constant(4, Dv); enc.set_constant(5, eps);
         enc.dispatch({128, (unsigned)Hv, 1}, {128, 1, 1});
       }
-      qmm(ly.gow, ly.gos, ly.gob, bs.normout, bs.ao, vald, H);
+      if (_mixed) {
+        vqmm_(enc, N, ly.gow, ly.gos, ly.gob, ly.gout_bits, bs.normout, bs.ao,
+              vald, H);
+      } else {
+        qmm(ly.gow, ly.gos, ly.gob, bs.normout, bs.ao, vald, H);
+      }
       residual(bs.x, bs.ao, bs.x, N * H);
     }
-    // MLP (batched over ALL N rows -- every branch needs its logits). The
-    // fused gate/up GEMV picks its kernel by N via the shared entrance.
+    // MLP (batched over ALL N rows -- every branch needs its logits). Uniform
+    // fuses gate|up (one swiglu GEMV); mixed de-fuses gate/up/down per-tensor.
     rms(bs.x, 0, ly.post_ln, bs.hn, 0, N, H);
-    qmm_auto_swiglu_(enc, N, ly.guw, ly.gus, ly.gub, bs.hn, bs.sg, H,
-                     2 * ffn);
-    qmm(ly.dw, ly.ds, ly.db, bs.sg, bs.ao, ffn, H);
+    if (_mixed) {
+      vqmm_(enc, N, ly.guw, ly.gus, ly.gub, ly.gate_bits, bs.hn, bs.sg, H, ffn);
+      vqmm_(enc, N, ly.uw, ly.us, ly.ub, ly.up_bits, bs.hn, bs.upb, H, ffn);
+      enc.set_function(_fn_swiglu);
+      enc.set_buffer(0, bs.sg); enc.set_buffer(1, bs.upb);
+      enc.set_buffer(2, bs.sg); enc.set_constant(3, N * ffn);
+      enc.dispatch({(unsigned)(N * ffn), 1, 1}, {256, 1, 1});
+      vqmm_(enc, N, ly.dw, ly.ds, ly.db, ly.down_bits, bs.sg, bs.ao, ffn, H);
+    } else {
+      qmm_auto_swiglu_(enc, N, ly.guw, ly.gus, ly.gub, bs.hn, bs.sg, H,
+                       2 * ffn);
+      qmm(ly.dw, ly.ds, ly.db, bs.sg, bs.ao, ffn, H);
+    }
     residual(bs.x, bs.ao, bs.x, N * H);
   }
   // Final norm + lm_head over ALL N rows.
   rms(bs.x, 0, _final_ln, bs.hn, 0, N, H);
-  qmm(_tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
-      _tied ? _embed_b : _lm_b, bs.hn, bs.logits, H, c.vocab);
+  if (_mixed) {
+    const int lb = _tied ? _embed_bits : _lm_bits;
+    vqmm_(enc, N, _tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
+          _tied ? _embed_b : _lm_b, lb, bs.hn, bs.logits, H, c.vocab);
+  } else {
+    qmm(_tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
+        _tied ? _embed_b : _lm_b, bs.hn, bs.logits, H, c.vocab);
+  }
 }
 
 bool
@@ -2388,10 +2554,10 @@ MetalQwenModel::decode_batched_step(
   if (N <= 0 || (int)in_tokens.size() != N) { return false; }
   if (!rope_pos.empty() && (int)rope_pos.size() != N) { return false; }
   if (!_fn_embed.valid()) { return false; }
-  // Mixed-precision affine de-fuses the projections, so the fused buffers the
-  // batched encoder reads (ly.qw|iqw|guw) are unbuilt -> not yet supported;
-  // the caller (realtime-vqa) falls back to per-branch serial decode.
-  if (_mixed) { return false; }
+  // Mixed-precision (OptiQ) is supported: encode_batched_step_ de-fuses the
+  // projections per-tensor (vqmm_), like the verify/single decode. The affine
+  // embed (_embed_w) is built for mixed too. (k-quant batched is a separate
+  // path -- its q6_K embed gather isn't wired into this affine-embed step.)
   if (!ensure_bscratch_(_bdec, N)) { return false; }
   BScratch& bs = _bdec;
   const Config& c = _cfg;
@@ -2524,9 +2690,8 @@ MetalQwenModel::bdecode_begin(std::span<const ContextId> cids,
       || (!sp.greedy && !_fn_sample.valid())) {
     return false;
   }
-  // Mixed-precision affine batched decode not yet supported (fused buffers
-  // unbuilt) -> caller falls back to per-branch serial pdecode.
-  if (_mixed) { return false; }
+  // Mixed-precision (OptiQ) supported: encode_batched_step_ de-fuses the
+  // projections per-tensor (vqmm_). Shares the encoder with the sync path.
   if (!ensure_bscratch_(_bdec, N)) { return false; }
   if (max_tokens < 1) { max_tokens = 1; }
 
@@ -2730,7 +2895,22 @@ MetalQwenModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
   if (emb.empty()) { return {}; }
   SharedBuffer x = _mc->make_shared_buffer((std::size_t)n * _cfg.hidden * 2);
   std::memcpy(x.contents(), emb.contents(), (std::size_t)n * _cfg.hidden * 2);
-  return forward_chunk_(cid, x, n, nullptr, nullptr);
+  // MTP prefix seed (opt-in: set_mtp_prefix_seed; VPIPE_MTP_NO_SEED hard-off):
+  // ask forward_chunk_ for the per-position post-norm hiddens and remember the
+  // prefix ids so mtp_decode can populate the drafter's KV with the prompt.
+  static const bool seed_off = std::getenv("VPIPE_MTP_NO_SEED") != nullptr;
+  const bool seed = _mtp.ok && _mtp_seed_enabled && !seed_off;
+  SharedBuffer allh;
+  std::vector<float> r =
+      forward_chunk_(cid, x, n, nullptr, nullptr, false, nullptr, false,
+                     nullptr, seed ? &allh : nullptr);
+  if (seed && !allh.empty()) {
+    _mtp_prefix_h = std::move(allh);
+    _mtp_prefix_ids = ids;
+    _mtp_prefix_len = n;
+    _mtp_prefix_valid = true;
+  }
+  return r;
 }
 
 std::vector<float>
@@ -2893,7 +3073,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
                                const SharedBuffer* mrope_cos,
                                const SharedBuffer* mrope_sin, bool verify_all,
                                std::vector<std::int32_t>* preds_out,
-                               bool return_hidden, SharedBuffer* hidden_out)
+                               bool return_hidden, SharedBuffer* hidden_out,
+                               SharedBuffer* allhidden_out)
 {
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -2928,6 +3109,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const auto t_p0 = std::chrono::steady_clock::now();
   auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
   SharedBuffer hn = buf((std::size_t)n * H);
+  // MTP prefix seed: all-position post-norm hiddens [n, H], filled in-band.
+  SharedBuffer ah;
   // qfull holds the FUSED q|k|v projection [n, 2*qd+2*kd] (q gated = 2*qd).
   SharedBuffer qfull = buf((std::size_t)n * (2 * qd + 2 * kd));
   SharedBuffer kbuf = buf((std::size_t)n * kd), vbuf = buf((std::size_t)n * kd);
@@ -3494,9 +3677,16 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.dispatch({32, (unsigned)(c.vocab / 4), 1}, {32, 2, 1});
       }
     }
+    // MTP prefix seed: final-norm ALL n positions into `ah` (the per-position
+    // post-norm hiddens). Encoded in this same buffer so no extra round-trip.
+    if (allhidden_out) {
+      ah = buf((std::size_t)n * H);
+      rms(x, 0, _final_ln, ah, 0, n, H);
+    }
   }
   const auto t_enc = std::chrono::steady_clock::now();
   stream.commit().wait();
+  if (allhidden_out) { *allhidden_out = std::move(ah); }
 
   // MTP batched verify: return the per-position greedy predictions; the
   // per-position pre-final-norm hidden stays in `x` for the caller. No
@@ -3553,6 +3743,14 @@ MetalQwenModel::vqmm_(ComputeEncoder& enc, int m, const SharedBuffer& w,
   // 8-bit, 2..kQmvBatchMaxRows: batched-GEMV (weight read once across the rows,
   // MAXM=2 -> ceil(m/2) tiles along grid.z) -- qmv bandwidth, so a small-M
   // verify costs ~1 decode step instead of steel's ~3x.
+  if (_qmv4_active && m > 2 && m <= 4 && _fn_qmv8_batch4.valid()) {
+    enc.set_function(_fn_qmv8_batch4);   // verify 3-4 rows: one weight read
+    enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
+    enc.set_buffer(3, xin); enc.set_buffer(4, y);
+    enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, m);
+    enc.dispatch({32, (unsigned)(N / 4), 1}, {32, 2, 1});
+    return;
+  }
   if (m > 1 && m <= kQmvBatchMaxRows && _fn_qmv8_batch.valid()) {
     enc.set_function(_fn_qmv8_batch);
     enc.set_buffer(0, w); enc.set_buffer(1, s); enc.set_buffer(2, b);
@@ -3578,14 +3776,44 @@ MetalQwenModel::vqmm_(ComputeEncoder& enc, int m, const SharedBuffer& w,
                (unsigned)(((m + 31) / 32) * 2), 2}, {32, 2, 2});
 }
 
+// Verify sub-profile accumulators (VPIPE_MTP_VPROFILE): the verify command
+// buffer is split into main-forward / verifier-head (lm_head+decision) / MTP-
+// head segments, each commit()+wait() timed. Reset per mtp_decode, printed in
+// its profile block. Off by default -> one command buffer, no perturbation.
+static double g_vp_main = 0.0, g_vp_vhead = 0.0, g_vp_mtp = 0.0;
+static long g_vp_n = 0;
+
 bool
 MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
                                   std::vector<std::int32_t>* preds,
                                   std::vector<std::int32_t>* mtp_preds,
                                   std::vector<std::int32_t>* mtp_preds2,
                                   int rope_delta, const GpuSamplerParams& sp,
-                                  int seed_slot0, GdnVerifyCache* gcache)
+                                  int seed_slot0, GdnVerifyCache* gcache,
+                                  bool lc_mode, bool gdn_ring,
+                                  const SharedBuffer* mtp_cond,
+                                  const std::function<void(ComputeEncoder&)>&
+                                      pre_commit)
 {
+  // Leviathan-Chen mode: expose the full verifier + MTP-head logits so
+  // mtp_decode can do the ratio test + residual/bonus sampling on the host.
+  // The verifier's per-position decision uses ARGMAX here (it only feeds the
+  // MTP head's drafting context; the committed token is chosen by mtp_decode).
+  if (lc_mode) {
+    const std::size_t need = (std::size_t)n * _cfg.vocab * 2;
+    if (_lc_vlogits.byte_size() < need) {
+      _lc_vlogits = _mc->make_shared_buffer(need);
+    }
+    if (_lc_mlogits.byte_size() < need) {
+      _lc_mlogits = _mc->make_shared_buffer(need);
+    }
+    if (_lc_vlogits.empty() || _lc_mlogits.empty()) { lc_mode = false; }
+    if (lc_mode && mtp_preds2 != nullptr &&     // depth-2: the chained q2
+        _lc_mlogits2.byte_size() < need) {
+      _lc_mlogits2 = _mc->make_shared_buffer(need);
+      if (_lc_mlogits2.empty()) { lc_mode = false; }
+    }
+  }
   // Direct-quantized batched verify. One forward over the n drafts, a per-
   // position decision (argmax or speculative sample), and the fused MTP head.
   // Two weight layouts:
@@ -3675,13 +3903,24 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const bool run_mtp = (mtp_preds != nullptr) && _mtp.ok;
   const bool run_mtp2 = run_mtp && (mtp_preds2 != nullptr);
   SharedBuffer emb_P, mnorm_e, mnorm_h, mcomb, mcomb2, mctmp, mqfull, mvamax,
-      mvamax2;
+      mvamax2, mhs;
   ContextManager::AppendSlot mslot;
   std::size_t m_page_off = 0;
   int m_npages = 0;
   if (run_mtp) {
-    mtp_ctx_reset_();
-    mslot = _mtp.ctx->append(_mtp.cid, run_mtp2 ? 2 * n : n);
+    // Persistent MTP KV: do NOT wipe each round -- append this round's draft
+    // window onto the retained committed history so the head attends over the
+    // decode so far. mtp_decode rolls back the rejected window after each round
+    // and resets once at decode start. Non-persistent (fallback): wipe per
+    // round (the old stateless behavior). Overflow of the single MTP page
+    // (long decode) -> reset + retry, gracefully dropping older history.
+    const int mtp_app = run_mtp2 ? 2 * n : n;
+    if (!_mtp_persist) { mtp_ctx_reset_(); }
+    mslot = _mtp.ctx->append(_mtp.cid, mtp_app);
+    if (!mslot.valid() && _mtp_persist) {
+      mtp_ctx_reset_();
+      mslot = _mtp.ctx->append(_mtp.cid, mtp_app);
+    }
     if (!mslot.valid()) { return false; }
     m_page_off = (std::size_t)mslot.page_id.v * _mtp.ctx->page_stride_bytes();
     m_npages = _mtp.ctx->fill_page_table(
@@ -3691,6 +3930,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     mnorm_h = buf((std::size_t)n * H);
     mcomb = buf((std::size_t)n * H);
     mctmp = buf((std::size_t)n * H);
+    mhs = buf((std::size_t)n * H);   // base post-final-norm hidden for the MTP
     mqfull = buf((std::size_t)n * (qdo + 2 * kd));
     mvamax = _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
     if (run_mtp2) {
@@ -3699,9 +3939,34 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     }
   }
 
+  // Enable MAXM=4 batched GEMV (read each weight once for n=3..4) for the
+  // duration of this verify only; the guard restores it on every return so the
+  // realtime-vqa batched decode keeps the MAXM=2-tiled path.
+  _qmv4_active = _qmv4_enabled;
+  struct Qmv4Guard {
+    bool* f;
+    ~Qmv4Guard() { *f = false; }
+  } qmv4_guard{&_qmv4_active};
+
+  static const bool vprof =
+      (std::getenv("VPIPE_MTP_VPROFILE") != nullptr);
+  std::chrono::steady_clock::time_point t_phase;
   metal_compute::CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
+    // Verify sub-profile: close the current segment (end+commit+wait), credit
+    // its wall time to `acc`, open a fresh command buffer. The lambdas below +
+    // the vqmm_/kqmv_batch_ helpers re-read `enc` each call, so the re-seat is
+    // transparent. No-op when vprof is off (one command buffer, no perturb).
+    auto vp_split = [&](double& acc) {
+      if (!vprof) { return; }
+      enc.end();
+      stream.commit().wait();
+      const auto t = std::chrono::steady_clock::now();
+      acc += std::chrono::duration<double, std::milli>(t - t_phase).count();
+      t_phase = t;
+      enc = stream.begin_compute();
+    };
     auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
                    const SharedBuffer& w, const SharedBuffer& y,
                    std::size_t yoff, int R, int Hd) {
@@ -3761,6 +4026,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       }
     };
 
+    if (vprof) { t_phase = std::chrono::steady_clock::now(); }
     int gci = 0;   // linear-layer index into gcache (when capturing GDN inputs)
     for (int L = 0; L < c.n_layers; ++L) {
       Layer& ly = _layers[L];
@@ -3876,13 +4142,10 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         }
         residual(x, ao, x, n * H);
       } else {
-        const SharedBuffer* csb = _ctx->conv_state(cid, L);
-        const SharedBuffer* ssb = _ctx->ssm_state(cid, L);
         // GDN recurrent-step inputs (conv input qkv, gdn_step g/beta) land in
-        // this layer's verify cache when capturing, so a partial accept can
-        // replay them (gdn_replay_); else shared scratch. The non-recurrent
-        // parts (zbuf/abuf/bbuf/convout/ygdn) stay shared -- not needed to
-        // re-advance the recurrent state.
+        // this layer's verify cache when capturing (non-ring path, for
+        // gdn_replay_); else shared scratch. The non-recurrent parts
+        // (zbuf/abuf/bbuf/convout/ygdn) stay shared.
         const SharedBuffer& qkv_c =
             (gcache && gci < (int)gcache->qkv.size()) ? gcache->qkv[gci] : qkv;
         const SharedBuffer& gbuf_c =
@@ -3908,35 +4171,83 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           vqmm_(enc, n, ly.iaw, ly.ias, ly.iab, ly.a_bits, hn, abuf, H, Hv);
           vqmm_(enc, n, ly.ibw, ly.ibs, ly.ibb, ly.b_bits, hn, bbuf, H, Hv);
         }
-        enc.set_function(_fn_gdn_conv1d);
-        enc.set_buffer(0, *csb); enc.set_buffer(1, qkv_c);
-        enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, convout);
-        enc.set_constant(4, n); enc.set_constant(5, Cd);
-        enc.set_constant(6, Kc); enc.set_constant(7, Cd);   // x_stride = Cd
-        enc.set_constant(8, keyd); enc.set_buffer(9, *csb);
-        enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
-        const std::size_t kb_off = (std::size_t)n * keyd * 2;
-        const std::size_t vb_off = 2 * kb_off;
-        rms(convout, 0, _gdn_qscale, convout, 0, n * Hk, Dk);
-        rms(convout, kb_off, _gdn_kscale, convout, kb_off, n * Hk, Dk);
+        const bool gdn4 = _fn_gdn_step_ndv4.valid() && (Dv % 4 == 0) &&
+                          !_gdn_force_v1;
+        const unsigned gdn_dvy = gdn4 ? (unsigned)(Dv / 4) : (unsigned)Dv;
+        // g_beta is position-independent (reads abuf/bbuf, not convout) -> batch
+        // it for both the ring and the in-place path.
         enc.set_function(_fn_gdn_g_beta);
         enc.set_buffer(0, abuf); enc.set_buffer(1, bbuf);
         enc.set_buffer(2, ly.A_log); enc.set_buffer(3, ly.dt_bias);
         enc.set_buffer(4, gbuf_c); enc.set_buffer(5, betabuf_c);
         enc.set_constant(6, Hv); enc.set_constant(7, n);
         enc.dispatch({(unsigned)(n * Hv), 1, 1}, {256, 1, 1});
-        const bool gdn4 = _fn_gdn_step_ndv4.valid() && (Dv % 4 == 0) &&
-                          !_gdn_force_v1;
-        enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
-        enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
-        enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gbuf_c);
-        enc.set_buffer(4, betabuf_c); enc.set_buffer(5, *ssb);
-        enc.set_buffer(6, ygdn); enc.set_buffer(7, *ssb);
-        enc.set_constant(8, n);
-        enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
-        enc.set_constant(10, Hv);
-        const unsigned gdn_dvy = gdn4 ? (unsigned)(Dv / 4) : (unsigned)Dv;
-        enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
+        if (gdn_ring) {
+          // ZERO-COPY rollback path: advance the recurrent state ONE position
+          // at a time through the GDN ring, binding each token's state-IN
+          // (slot cur+p) and state-OUT (slot cur+p+1) to a DISTINCT ring slot.
+          // Every intermediate S_{p+1..p+K} survives on-device, so a partial
+          // accept rolls back by a pure cursor move in mtp_decode -- no host
+          // snapshot, no gdn_replay_. Projections + g_beta stay batched above;
+          // only the cheap conv1d + gdn_step recurrence goes per-position. The
+          // cursor is fixed across this whole verify (advanced once, by `keep`,
+          // afterward), so all layers stay batched per-position -- the batching
+          // is NOT defeated.
+          const std::size_t kb1 = (std::size_t)keyd * 2;   // n=1 section stride
+          const std::size_t vb1 = 2 * kb1;
+          for (int p = 0; p < n; ++p) {
+            const SharedBuffer* cr = _ctx->conv_slot(cid, L, p);
+            const SharedBuffer* cw = _ctx->conv_slot(cid, L, p + 1);
+            const SharedBuffer* sr = _ctx->ssm_slot(cid, L, p);
+            const SharedBuffer* sw = _ctx->ssm_slot(cid, L, p + 1);
+            enc.set_function(_fn_gdn_conv1d);
+            enc.set_buffer(0, *cr);
+            enc.set_buffer(1, qkv_c, (std::size_t)p * Cd * 2);
+            enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, convout);
+            enc.set_constant(4, 1); enc.set_constant(5, Cd);
+            enc.set_constant(6, Kc); enc.set_constant(7, Cd);
+            enc.set_constant(8, keyd); enc.set_buffer(9, *cw);
+            enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
+            rms(convout, 0, _gdn_qscale, convout, 0, Hk, Dk);
+            rms(convout, kb1, _gdn_kscale, convout, kb1, Hk, Dk);
+            enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
+            enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb1);
+            enc.set_buffer(2, convout, vb1);
+            enc.set_buffer(3, gbuf_c, (std::size_t)p * Hv * 4);
+            enc.set_buffer(4, betabuf_c, (std::size_t)p * Hv * 4);
+            enc.set_buffer(5, *sr);
+            enc.set_buffer(6, ygdn, (std::size_t)p * vald * 2);
+            enc.set_buffer(7, *sw);
+            enc.set_constant(8, 1);
+            enc.set_constant(9, _kquant ? -Hk : Hk);
+            enc.set_constant(10, Hv);
+            enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
+          }
+        } else {
+          // In-place batched path (host snapshot + gdn_replay_ on reject).
+          const SharedBuffer* csb = _ctx->conv_state(cid, L);
+          const SharedBuffer* ssb = _ctx->ssm_state(cid, L);
+          enc.set_function(_fn_gdn_conv1d);
+          enc.set_buffer(0, *csb); enc.set_buffer(1, qkv_c);
+          enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, convout);
+          enc.set_constant(4, n); enc.set_constant(5, Cd);
+          enc.set_constant(6, Kc); enc.set_constant(7, Cd);   // x_stride = Cd
+          enc.set_constant(8, keyd); enc.set_buffer(9, *csb);
+          enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
+          const std::size_t kb_off = (std::size_t)n * keyd * 2;
+          const std::size_t vb_off = 2 * kb_off;
+          rms(convout, 0, _gdn_qscale, convout, 0, n * Hk, Dk);
+          rms(convout, kb_off, _gdn_kscale, convout, kb_off, n * Hk, Dk);
+          enc.set_function(gdn4 ? _fn_gdn_step_ndv4 : _fn_gdn_step);
+          enc.set_buffer(0, convout, 0); enc.set_buffer(1, convout, kb_off);
+          enc.set_buffer(2, convout, vb_off); enc.set_buffer(3, gbuf_c);
+          enc.set_buffer(4, betabuf_c); enc.set_buffer(5, *ssb);
+          enc.set_buffer(6, ygdn); enc.set_buffer(7, *ssb);
+          enc.set_constant(8, n);
+          enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
+          enc.set_constant(10, Hv);
+          enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
+        }
         rms(ygdn, 0, ly.gdn_norm, normout, 0, n * Hv, Dv);
         enc.set_function(_fn_swiglu);
         enc.set_buffer(0, zbuf); enc.set_buffer(1, normout);
@@ -3971,6 +4282,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       }
       residual(x, ao, x, n * H);
     }
+    vp_split(g_vp_main);   // main 36-layer forward over the n drafts
     // Final norm + per-position lm_head (direct quantized, M=n) + the verifier's
     // per-position DECISION -> vamax[k] (the token after drafts[0..k]). Greedy:
     // argmax. Speculative sampling: a token sampled from P at slot q_offset+k+1,
@@ -3990,7 +4302,16 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       vqmm_(enc, n, _tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
             _tied ? _embed_b : _lm_b, lb, hn, vlogits, H, c.vocab);
     }
-    const bool vsample = !sp.greedy && !vsample_ws.empty();
+    // lc_mode keeps vamax = ARGMAX (the MTP drafting context); the committed
+    // token is chosen by mtp_decode's Leviathan-Chen step from _lc_vlogits.
+    const bool vsample = !sp.greedy && !vsample_ws.empty() && !lc_mode;
+    if (lc_mode) {   // stash the verifier logits before the MTP head reuses them
+      enc.set_function(_fn_copy);
+      enc.set_buffer(0, vlogits); enc.set_buffer(1, _lc_vlogits);
+      const int zero = 0, cnt = n * c.vocab;
+      enc.set_constant(2, zero); enc.set_constant(3, cnt);
+      enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+    }
     for (int k = 0; k < n; ++k) {
       enc.set_buffer(1, vamax, (std::size_t)k * sizeof(std::int32_t));
       if (!vsample) {
@@ -4019,12 +4340,24 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       }
     }
 
+    vp_split(g_vp_vhead);   // final norm + verifier lm_head + per-pos decision
     // ---- Fused MTP head (the "verify is a decode step that drafts") ----
     // At each position i: combined = fc_e@norm_e(embed(P_i)) + fc_h@norm_h(H_i),
     // one full-attn MTP layer (its own KV), then argmax(lm_head(mtp.norm(.))) =
     // the next-next-token draft. Runs in THIS command buffer on the on-GPU main
     // preds (vamax) + hiddens (x) -- no separate draft forward.
     if (run_mtp) {
+      // The MTP head conditions on the POST-final-norm hidden, matching the
+      // reference contract (base_hidden_variant=post_norm / mtp_hidden_variant=
+      // post_norm): depth-1 from model.norm(main hidden), depth-2 from
+      // mtp.norm(prev MTP hidden) -- NOT the pre-norm residual stream. Feeding
+      // the pre-norm hidden mis-conditions the trained head and tanks draft
+      // acceptance (~0.58 vs ~0.92 measured) while staying invisible to the
+      // token-exact tests (the verifier-corrected output is independent of the
+      // draft). VPIPE_MTP_PRENORM_HIDDEN reverts to the old pre-norm feed for
+      // an A/B.
+      const bool mtp_prenorm =
+          std::getenv("VPIPE_MTP_PRENORM_HIDDEN") != nullptr;
       Layer& mly = _mtp.lyr;
       const int Nfqkv = qdo + 2 * kd;
       const SharedBuffer& mkp = *_mtp.ctx->kpool(0);
@@ -4136,6 +4469,11 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         if (_kquant) {
           kqmv_batch_(enc, KQ::kQ6K, _embed_q6k, hn, vlogits, H, c.vocab, n,
                       c.vocab, 0);
+        } else if (_mtp.draft_head) {
+          // 4-bit DRAFT head: half the vocab-matrix bandwidth of the 8-bit
+          // verifier head. Draft-only -> verify-corrected, output stays exact.
+          vqmm_(enc, n, _mtp.dlm_w, _mtp.dlm_s, _mtp.dlm_b, 4, hn, vlogits, H,
+                c.vocab);
         } else {
           const int mlb = _tied ? _embed_bits : _lm_bits;
           vqmm_(enc, n, _tied ? _embed_w : _lm_w, _tied ? _embed_s : _lm_s,
@@ -4148,6 +4486,15 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_constant(2, c.vocab);
           enc.dispatch({256, 1, 1}, {256, 1, 1});
         }
+        // Chain the POST-final-norm MTP hidden (mtp.norm output, now in hn) so
+        // a depth-2 step conditions on post_norm, not the pre-norm residual.
+        if (!mtp_prenorm) {
+          enc.set_function(_fn_copy);
+          enc.set_buffer(0, hn); enc.set_buffer(1, hidden_out);
+          const int zc = 0, cc = n * H;
+          enc.set_constant(2, zc); enc.set_constant(3, cc);
+          enc.dispatch({(unsigned)cc, 1, 1}, {256, 1, 1});
+        }
       };
       // depth-1: from the main hidden + emb(main pred). depth-2: chain from the
       // depth-1 MTP hidden + emb(depth-1 draft), into the SECOND ctx window.
@@ -4156,13 +4503,40 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       // prediction, which lies past the candidate window -- conditioning on a
       // candidate instead collapsed acceptance to ~0 (measured). This argmax
       // dependency is also why the MTP output heads can't be batched.
-      mtp_step(vamax, x, 0, mslot.position, mcomb, mvamax);
+      auto lc_stash = [&](const SharedBuffer& dst) {   // vlogits -> dst (q)
+        enc.set_function(_fn_copy);
+        enc.set_buffer(0, vlogits); enc.set_buffer(1, dst);
+        const int zero = 0, cnt = n * c.vocab;
+        enc.set_constant(2, zero); enc.set_constant(3, cnt);
+        enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+      };
+      // depth-1 hidden = model.norm(main hidden) (post_norm), not the pre-norm
+      // residual x. mhs holds it; the verifier's hn (= _final_ln(x)) is reused
+      // as scratch inside mtp_step, so compute a dedicated copy here.
+      if (!mtp_prenorm) { rms(x, 0, _final_ln, mhs, 0, n, H); }
+      // mtp_cond (teacher-forcing) overrides the conditioning token: condition
+      // the head on a caller-supplied token instead of the verifier's argmax.
+      mtp_step(mtp_cond ? *mtp_cond : vamax, mtp_prenorm ? x : mhs, 0,
+               mslot.position, mcomb, mvamax);
+      if (lc_mode) { lc_stash(_lc_mlogits); }   // q1 (1st MTP application)
       if (run_mtp2) {
         mtp_step(mvamax, mcomb, n, mslot.position + n, mcomb2, mvamax2);
+        if (lc_mode) { lc_stash(_lc_mlogits2); }   // q2 (chained 2nd)
       }
+      // Lever (b): fold the L-C step into THIS command buffer (one commit per
+      // round, not a second stream + sync). The verifier p (_lc_vlogits) and
+      // drafter q1/q2 (_lc_mlogits/_lc_mlogits2) are now stashed; the caller's
+      // pre_commit encodes lc_accept/lc_sample reading them, so the commit below
+      // covers the whole round's GPU work and the host reads only token ids.
+      if (pre_commit) { pre_commit(enc); }
     }
   }
   stream.commit().wait();
+  if (vprof) {   // last segment: the fused MTP head (1x depth-1, 2x depth-2)
+    g_vp_mtp += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_phase).count();
+    ++g_vp_n;
+  }
   preds->resize((std::size_t)n);
   const auto* a = static_cast<const std::int32_t*>(vamax.contents());
   for (int k = 0; k < n; ++k) { (*preds)[(std::size_t)k] = a[k]; }
@@ -4594,6 +4968,168 @@ MetalQwenModel::mtp_ctx_reset_()
   if (seq > 0) { _mtp.ctx->kv_rollback(_mtp.cid, seq); }
 }
 
+int
+MetalQwenModel::mtp_seed_prefix_(std::int32_t first_token)
+{
+  if (!_mtp.ok || !_mtp_persist || !_mtp_seed_enabled) { return 0; }
+  if (!_mtp_prefix_valid || _mtp_prefix_len <= 0 || _mtp_prefix_h.empty()) {
+    return 0;
+  }
+  // The prenorm-hidden diagnostic conditions the head on raw x, but the seed
+  // captured POST-norm hiddens -> skip seeding on that (non-default) path.
+  if (std::getenv("VPIPE_MTP_PRENORM_HIDDEN") != nullptr) { return 0; }
+  const Config& c = _cfg;
+  const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
+  const int qd = c.qd(), kd = c.kd();
+  const int gate = c.attn_output_gate ? 1 : 0;
+  const int qdo = gate ? 2 * qd : qd;
+  const int Nfqkv = qdo + 2 * kd;
+  const float eps = c.rms_eps;
+  (void)Hq;
+  // Seed the most-recent M prefix positions that fit the MTP page after leaving
+  // headroom for the first round's append (a partial seed keeps the tail; RoPE
+  // attention is shift-invariant so a tail at slots 0.. preserves all relative
+  // distances). Single page (page_tokens == max_seq), so one append + dispatch.
+  const int cap = _mtp.ctx->page_tokens();
+  const int reserve = 16;
+  const int s = _mtp_prefix_len;
+  int M = (s > cap - reserve) ? (cap - reserve) : s;
+  if (M <= 0) { return 0; }
+  const int tail0 = s - M;            // first prefix position seeded
+  ContextManager::AppendSlot mslot = _mtp.ctx->append(_mtp.cid, M);
+  if (!mslot.valid()) {
+    const int seq = _mtp.ctx->seq_len_of(_mtp.cid);
+    if (seq > 0) { _mtp.ctx->kv_rollback(_mtp.cid, seq); }
+    mslot = _mtp.ctx->append(_mtp.cid, M);
+    if (!mslot.valid()) { return 0; }
+  }
+  const std::size_t m_page_off =
+      (std::size_t)mslot.page_id.v * _mtp.ctx->page_stride_bytes();
+  const int mpt = _mtp.ctx->page_tokens();
+  const SharedBuffer& mkp = *_mtp.ctx->kpool(0);
+  const SharedBuffer& mvp = *_mtp.ctx->vpool(0);
+  Layer& mly = _mtp.lyr;
+
+  // Conditioning tokens: position (tail0 + i) conditions on the token at
+  // (tail0 + i + 1); the last seeded position uses the decode's first token.
+  SharedBuffer ids =
+      _mc->make_shared_buffer((std::size_t)M * sizeof(std::int32_t));
+  if (ids.empty()) { return 0; }
+  auto* idp = static_cast<std::int32_t*>(ids.contents());
+  for (int i = 0; i < M; ++i) {
+    const int t = tail0 + i;
+    idp[i] = (t + 1 < s) ? _mtp_prefix_ids[(std::size_t)(t + 1)] : first_token;
+  }
+
+  auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
+  SharedBuffer emb_P = buf((std::size_t)M * H);
+  SharedBuffer mnorm_e = buf((std::size_t)M * H);
+  SharedBuffer mnorm_h = buf((std::size_t)M * H);
+  SharedBuffer mcomb = buf((std::size_t)M * H);
+  SharedBuffer mctmp = buf((std::size_t)M * H);
+  SharedBuffer hn = buf((std::size_t)M * H);
+  SharedBuffer mqfull = buf((std::size_t)M * Nfqkv);
+  SharedBuffer kbuf = buf((std::size_t)M * kd);
+  SharedBuffer vbuf = buf((std::size_t)M * kd);
+  SharedBuffer kt = buf((std::size_t)M * kd);
+  SharedBuffer vt = buf((std::size_t)M * kd);
+  if (emb_P.empty() || hn.empty() || mqfull.empty() || kt.empty()
+      || vt.empty()) {
+    return 0;
+  }
+  const std::size_t hsrc_off = (std::size_t)tail0 * H * 2;   // tail of _mtp_h
+
+  metal_compute::CommandStream stream = _mc->make_command_stream();
+  {
+    ComputeEncoder enc = stream.begin_compute();
+    auto rms = [&](const SharedBuffer& xin, std::size_t xoff,
+                   const SharedBuffer& w, const SharedBuffer& y,
+                   std::size_t yoff, int R, int Hd) {
+      enc.set_function(_fn_rms);
+      enc.set_buffer(0, xin, xoff); enc.set_buffer(1, w);
+      enc.set_buffer(2, y, yoff);
+      enc.set_constant(3, Hd); enc.set_constant(4, eps);
+      enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+    };
+    auto residual = [&](const SharedBuffer& a, const SharedBuffer& bb,
+                        const SharedBuffer& out, int nn) {
+      enc.set_function(_fn_residual);
+      enc.set_buffer(0, a); enc.set_buffer(1, bb); enc.set_buffer(2, out);
+      enc.set_constant(3, nn);
+      enc.dispatch({(unsigned)nn, 1, 1}, {256, 1, 1});
+    };
+    auto hslice = [&](const SharedBuffer& in, const SharedBuffer& out, int Hh,
+                      int S, int W, int off, int block, int gstride) {
+      enc.set_function(_fn_head_slice);
+      enc.set_buffer(0, in, 0); enc.set_buffer(1, out, 0);
+      enc.set_constant(2, Hh); enc.set_constant(3, S); enc.set_constant(4, W);
+      enc.set_constant(5, off); enc.set_constant(6, block);
+      enc.set_constant(7, gstride);
+      enc.dispatch({(unsigned)(Hh * W), 1, 1}, {256, 1, 1});
+    };
+    auto transpose = [&](const SharedBuffer& in, const SharedBuffer& out,
+                         int A, int Bd) {
+      enc.set_function(_fn_transpose);
+      enc.set_buffer(0, in); enc.set_buffer(1, out);
+      enc.set_constant(2, A); enc.set_constant(3, Bd); enc.set_constant(4, D);
+      enc.dispatch({(unsigned)D, (unsigned)Bd, (unsigned)A},
+                   {(unsigned)D, 1, 1});
+    };
+    // combined = fc_e@norm_e(emb(ids)) + fc_h@norm_h(hsrc); MTP-layer in_ln.
+    if (_kquant) {
+      embed_q6k_(enc, ids, 0, emb_P, M);
+    } else {
+      enc.set_function(_fn_embed);
+      enc.set_buffer(0, ids);
+      enc.set_buffer(1, _embed_w); enc.set_buffer(2, _embed_s);
+      enc.set_buffer(3, _embed_b); enc.set_buffer(4, emb_P);
+      enc.set_constant(5, H);
+      enc.dispatch({(unsigned)H, (unsigned)M, 1}, {256, 1, 1});
+    }
+    rms(emb_P, 0, _mtp.prenorm_e, mnorm_e, 0, M, H);
+    rms(_mtp_prefix_h, hsrc_off, _mtp.prenorm_h, mnorm_h, 0, M, H);
+    dense_gemm_(enc, _mtp.fc_e, mnorm_e, mcomb, H, H, M);
+    dense_gemm_(enc, _mtp.fc_h, mnorm_h, mctmp, H, H, M);
+    residual(mcomb, mctmp, mcomb, M * H);
+    rms(mcomb, 0, mly.in_ln, hn, 0, M, H);
+    // q|k|v projection -> slice k,v only (q/attention not needed to seed KV).
+    if (_kquant) {
+      kqmv_batch_(enc, mly.kqk_t, mly.kqk, hn, mqfull, H, mly.kqk_n, M,
+                  Nfqkv, 0);
+      kqmv_batch_(enc, mly.kqv_t, mly.kqv, hn, mqfull, H, kd, M, Nfqkv,
+                  mly.kqk_n);
+    } else {
+      vqmm_(enc, M, mly.qw, mly.qs, mly.qb, 4, hn, mqfull, H, Nfqkv);
+    }
+    hslice(mqfull, kbuf, M, Nfqkv, kd, qdo, 0, 0);
+    hslice(mqfull, vbuf, M, Nfqkv, kd, qdo + kd, 0, 0);
+    rms(kbuf, 0, mly.k_norm, kbuf, 0, M * Hkv, D);
+    transpose(kbuf, kt, M, Hkv);
+    transpose(vbuf, vt, M, Hkv);
+    // RoPE k at positions mslot.position .. +M-1 (rope_partial adds the row).
+    enc.set_function(_fn_rope_partial);
+    enc.set_buffer(0, kt); enc.set_buffer(1, _inv_freq);
+    enc.set_constant(2, Hkv); enc.set_constant(3, M);
+    enc.set_constant(4, D); enc.set_constant(5, c.rotary_dim);
+    enc.set_constant(6, mslot.position);
+    enc.dispatch({(unsigned)(c.rotary_dim / 2), (unsigned)M, (unsigned)Hkv},
+                 {(unsigned)(c.rotary_dim / 2), 1, 1});
+    // Write K/V to the MTP ctx at slots [mslot.slot_offset, +M).
+    for (int two = 0; two < 2; ++two) {
+      enc.set_function(_fn_kv_write_paged);
+      enc.set_buffer(0, two == 0 ? kt : vt);
+      enc.set_buffer(1, two == 0 ? mkp : mvp, m_page_off);
+      enc.set_constant(2, mpt); enc.set_constant(3, D);
+      enc.set_constant(4, M); enc.set_constant(5, 0);
+      enc.set_constant(6, mslot.slot_offset);
+      enc.dispatch({(unsigned)D, (unsigned)M, (unsigned)Hkv},
+                   {(unsigned)D, 1, 1});
+    }
+  }
+  stream.commit().wait();
+  return M;
+}
+
 bool
 MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
                            int n_steps, std::vector<std::int32_t>& out_ids,
@@ -4607,6 +5143,19 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
   if (!_mtp.ok || n_steps <= 0 || !(_mixed || _kquant)) { return false; }
   if (!ensure_decode_scratch_()) { return false; }
   const Config& c = _cfg;
+  // Persistent MTP self-attention KV over this decode's committed positions
+  // (default ON; VPIPE_MTP_NO_PERSIST reverts to the per-round wipe). Reset the
+  // MTP ctx ONCE here so the head starts fresh and accumulates as the decode
+  // commits tokens; mtp_verify_chunk_ then appends without wiping and the loop
+  // below rolls back each round's rejected draft window.
+  _mtp_persist = (std::getenv("VPIPE_MTP_NO_PERSIST") == nullptr);
+  if (_mtp_persist) {
+    mtp_ctx_reset_();
+    // Prefix-seed the drafter's KV with the captured prompt (auto when an MTP
+    // head + a text prefill preceded this; no-op otherwise). The head then
+    // attends over the whole prompt from round 1, lifting draft acceptance.
+    mtp_seed_prefix_(first_token);
+  }
   // Perf-investigation knobs (default off): VPIPE_MTP_DRAFT_LEN overrides the
   // speculative depth (1 = two drafts/round, 2 = three); VPIPE_MTP_PROFILE
   // prints a per-round wall-clock breakdown so the speedup ceiling can be
@@ -4618,8 +5167,15 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
     if (d >= 1) { draft_len = d; }
   }
   static const bool mtp_prof = (std::getenv("VPIPE_MTP_PROFILE") != nullptr);
+  // Verify sub-profile (VPIPE_MTP_VPROFILE): reset the per-segment accumulators
+  // mtp_verify_chunk_ fills so this decode's breakdown stands alone.
+  static const bool vprof_d = (std::getenv("VPIPE_MTP_VPROFILE") != nullptr);
+  if (vprof_d) { g_vp_main = g_vp_vhead = g_vp_mtp = 0.0; g_vp_n = 0; }
   using mtp_clock = std::chrono::steady_clock;
   double prof_verify_ms = 0.0, prof_rerun_ms = 0.0, prof_snap_ms = 0.0;
+  // L-C step wall-time (host post()/sample() grind vs the GPU lc_* kernels).
+  static const bool lc_prof = (std::getenv("VPIPE_MTP_LC_PROFILE") != nullptr);
+  double prof_lc_ms = 0.0;
   long prof_reruns = 0;
   auto prof_ms = [](mtp_clock::time_point a, mtp_clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -4646,13 +5202,15 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
   const int rope_delta =
       (ctl.rope_first < 0) ? 0 : (ctl.rope_first - seed_slot0);
 
-  // GDN recurrent-state snapshot (one conv + ssm buffer per linear layer),
-  // reused across rounds. The batched verify advances the canonical GDN state
-  // in place by K; unlike the paged KV (positionally truncatable), the
-  // recurrent state has no position to rewind, so a partial accept restores
-  // this snapshot and re-runs the accepted tokens. (The per-token gdn ring
-  // can't be used here -- its cursor is per-context, so it would force the
-  // verify back to one-token-through-all-layers, defeating the batching.)
+  // GDN recurrent-state snapshot (one conv + ssm buffer per linear layer) --
+  // the FALLBACK path (VPIPE_MTP_NO_RING / ring alloc failure). The batched
+  // verify advances the canonical GDN state in place by K; a partial accept
+  // restores this snapshot and re-runs the accepted tokens (gdn_replay_). The
+  // default path instead drives the GDN ring (gdn_ring_begin below): the verify
+  // writes each token's state to a DISTINCT ring slot (state-in cur+p, state-out
+  // cur+p+1) -- the cursor is fixed across the verify (advanced once, by `keep`,
+  // afterward), so all layers stay batched per-position and rollback is a pure
+  // cursor move, no host copy / replay.
   std::vector<int> glayers;
   std::vector<SharedBuffer> gconv, gssm;
   for (int L = 0; L < c.n_layers; ++L) {
@@ -4677,6 +5235,16 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
       }
     }
   };
+
+  // GDN run-ahead ring: size R = K_max+1 = (draft_len+1)+1 slots so the verify
+  // can write every speculative token's recurrent state into a DISTINCT slot
+  // (state-in cur+p, state-out cur+p+1) and a partial accept rolls back by a
+  // pure cursor move (advance by `keep`) -- no host snapshot, no gdn_replay_.
+  // Falls back to the in-place snapshot path on alloc failure or VPIPE_MTP_NO_RING.
+  bool use_ring = (std::getenv("VPIPE_MTP_NO_RING") == nullptr);
+  if (use_ring && !_ctx->gdn_ring_begin(cid, draft_len + 1)) {
+    use_ring = false;
+  }
 
   // Depth: draft_len>=2 chains a 2nd MTP application (3 drafts/round); else
   // depth-1 (2 drafts/round). Both are FULLY fused -- the verify emits all the
@@ -4709,6 +5277,79 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
   bool have_d1 = false, have_d2 = false;
   long accepted = 0, rounds = 0;
 
+  // Leviathan-Chen rejection sampling (opt-in). Covers depth-1 and depth-2 and
+  // temperature + top_k/top_p/min_p (the CPU post-processing replicates the GPU
+  // sampler's nucleus). Repetition/presence penalties are NOT modelled -> fall
+  // back to the exact-match sampler. qcarry/qcarry2 hold the drafter dists q for
+  // the pending drafts d1/d2 (carried from the round that produced them -- the
+  // ratio p(d)/q(d) and the residual norm(max(0,p-q)) need them).
+  const GpuSamplerParams& sp = ctl.sampler;
+  const bool lc_mode =
+      _leviathan && !sp.greedy && sp.repetition_penalty == 1.0f
+      && sp.presence_penalty == 0.0f && c.vocab > 0;
+  // qcarry/qcarry2 are valid whenever a draft is verified: drafts[1]/drafts[2]
+  // exist only when have_d1/have_d2 were set last round, which (in lc_mode) set
+  // qcarry/qcarry2 in the same block -- so they stay in sync with the drafts.
+  std::vector<float> qcarry, qcarry2;
+  std::uint64_t lc_rng =
+      sp.seed * 0x2545F4914F6CDD1Dull + 0x9E3779B97F4A7C15ull;
+
+  // On-GPU L-C: do the nucleus + accept/residual in lc_accept_f16/lc_sample_f16
+  // instead of the host post()/sample() full-vocab grind. Opt-in via set_lc_gpu
+  // or VPIPE_MTP_GPU_LC; falls back to the host path on alloc/function failure.
+  static const bool gpu_lc_env = (std::getenv("VPIPE_MTP_GPU_LC") != nullptr);
+  bool gpu_lc = lc_mode && (_lc_gpu || gpu_lc_env)
+                && _fn_lc_sample.valid() && _fn_lc_accept.valid()
+                && _fn_lc_sample_batch.valid();
+  // Max concurrent sample rows in one batched dispatch (depth-2: bonus is 1,
+  // q1/q2 are K=3 rows each); _lc_ws_p must hold that many [vocab] scratches.
+  const int lc_kmax = (draft_len >= 2) ? 3 : 2;
+  if (gpu_lc) {
+    const std::size_t vb = (std::size_t)c.vocab * 2;
+    const std::size_t wpb = (std::size_t)lc_kmax * vb;
+    if (_lc_ws_p.byte_size() < wpb) { _lc_ws_p = _mc->make_shared_buffer(wpb); }
+    if (_lc_ws_q.byte_size() < vb) { _lc_ws_q = _mc->make_shared_buffer(vb); }
+    if (_lc_qcarry.byte_size() < vb) {
+      _lc_qcarry = _mc->make_shared_buffer(vb);
+    }
+    if (_lc_qcarry2.byte_size() < vb) {
+      _lc_qcarry2 = _mc->make_shared_buffer(vb);
+    }
+    const std::size_t ob = 16 * sizeof(std::int32_t);
+    if (_lc_out.byte_size() < ob) { _lc_out = _mc->make_shared_buffer(ob); }
+    if (_lc_seed_in.byte_size() < ob) {
+      _lc_seed_in = _mc->make_shared_buffer(ob);
+    }
+    if (_lc_ws_p.empty() || _lc_ws_q.empty() || _lc_qcarry.empty()
+        || _lc_qcarry2.empty() || _lc_out.empty() || _lc_seed_in.empty()) {
+      gpu_lc = false;
+    }
+  }
+  // Per-(round,purpose,position) seed for the GPU L-C draws. Counter-based (vs
+  // the host's sequential lc_rng) so each draw is an independent deterministic
+  // sub-stream -- L-C is lossless either way; the scheme only fixes the seed.
+  auto lc_seed32 = [&](long round, int purpose, int i) -> std::uint32_t {
+    std::uint64_t s = sp.seed * 0x2545F4914F6CDD1Dull + 0x9E3779B97F4A7C15ull;
+    s ^= (std::uint64_t)round * 0x9E3779B97F4A7C15ull;
+    s ^= (std::uint64_t)purpose * 0xD1B54A32D192ED03ull;
+    s ^= (std::uint64_t)(i + 1) * 0xBF58476D1CE4E5B9ull;
+    s ^= s >> 31;
+    return (std::uint32_t)s;
+  };
+  // GPU L-C step config (read once). lc_niter: bisection iters (diagnostic
+  // override). lc_hist: histogram nucleus (default) vs the n_iter bisection
+  // (VPIPE_MTP_LC_NO_HIST). lc_nofold: run the L-C dispatches in a separate
+  // command buffer + sync instead of folding them into the verify's buffer
+  // (default folded -> one commit/round); VPIPE_MTP_LC_NOFOLD opts out (A/B).
+  int lc_niter = sp.n_iter;
+  if (const char* e = std::getenv("VPIPE_MTP_LC_NITER")) {
+    const int v = std::atoi(e);
+    if (v > 0) { lc_niter = v; }
+  }
+  const int lc_hist =
+      (std::getenv("VPIPE_MTP_LC_NO_HIST") != nullptr) ? 0 : 1;
+  const bool lc_nofold = (std::getenv("VPIPE_MTP_LC_NOFOLD") != nullptr);
+
   bool terminate = false;   // stop token or caller abort
   while (!terminate && (int)out_ids.size() < n_steps) {
     ++rounds;
@@ -4726,20 +5367,277 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
         std::span<const std::int32_t>(drafts.data(), drafts.size()));
     if (xK.empty()) { break; }
     auto t_snap0 = mtp_clock::now();
-    snapshot_gdn(/*save=*/true);
+    if (!use_ring) { snapshot_gdn(/*save=*/true); }
     auto t_ver0 = mtp_clock::now();
     prof_snap_ms += prof_ms(t_snap0, t_ver0);
     std::vector<std::int32_t> preds, mpreds, mpreds2;
+    std::vector<std::vector<float>> qnew, qnew2;   // L-C: per-pos drafter dists
+    // L-C encoder closure for this round: encodes lc_accept (verifier p vs the
+    // carried q) + batched lc_sample (bonus + new q1/q2 drafts) reading the
+    // verify's stashed logits, writing token ids to _lc_out. Folded into the
+    // verify's command buffer via pre_commit (one commit/round); or run in a
+    // separate stream below when lc_nofold. Called synchronously this round, so
+    // the by-ref captures stay valid.
+    std::function<void(ComputeEncoder&)> encode_lc;
+    if (gpu_lc) {
+      const int V = c.vocab;
+      encode_lc = [&, V](ComputeEncoder& enc) {
+        auto* sd = static_cast<std::uint32_t*>(_lc_seed_in.contents());
+        // Batched nucleus sample: `rows` rows from `src` (starting at logit row
+        // `row0`) run as `rows` CONCURRENT threadgroups; out -> _lc_out[out0..],
+        // per-row seed lc_seed32(round, purpose, pos0+r) -> _lc_seed_in[sd0..].
+        auto sample_batch = [&](const SharedBuffer& src, int row0, int rows,
+                                int out0, int sd0, int purpose, int pos0) {
+          for (int r = 0; r < rows; ++r) {
+            sd[sd0 + r] = lc_seed32(rounds, purpose, pos0 + r);
+          }
+          enc.set_function(_fn_lc_sample_batch);
+          enc.set_buffer(0, src, (std::size_t)row0 * V * 2);
+          enc.set_buffer(1, _lc_out, (std::size_t)out0 * sizeof(std::int32_t));
+          enc.set_constant(2, V);
+          enc.set_constant(3, sp.temperature);
+          enc.set_constant(4, sp.top_p);
+          enc.set_buffer(5, _lc_seed_in,
+                         (std::size_t)sd0 * sizeof(std::uint32_t));
+          enc.set_buffer(6, _lc_ws_p);
+          enc.set_constant(7, lc_niter);
+          enc.set_constant(8, sp.top_k);
+          enc.set_constant(9, sp.min_p);
+          enc.set_constant(10, lc_hist);
+          enc.dispatch({256 * (unsigned)rows, 1, 1}, {256, 1, 1});
+        };
+        // Accept positions 0..K-2: verify drafts[i+1] against the carried q.
+        for (int i = 0; i + 1 < K; ++i) {
+          const SharedBuffer& q = (i == 0) ? _lc_qcarry : _lc_qcarry2;
+          enc.set_function(_fn_lc_accept);
+          enc.set_buffer(0, _lc_vlogits, (std::size_t)i * V * 2);
+          enc.set_buffer(1, q);
+          enc.set_buffer(2, _lc_out, (std::size_t)i * sizeof(std::int32_t));
+          enc.set_constant(3, V);
+          enc.set_constant(4, sp.temperature);
+          enc.set_constant(5, sp.top_p);
+          const std::uint32_t aseed = lc_seed32(rounds, 0, i);
+          enc.set_constant(6, aseed);
+          enc.set_buffer(7, _lc_ws_p);
+          enc.set_buffer(8, _lc_ws_q);
+          enc.set_constant(9, lc_niter);
+          enc.set_constant(10, sp.top_k);
+          enc.set_constant(11, sp.min_p);
+          enc.set_constant(12, drafts[(std::size_t)(i + 1)]);
+          enc.set_constant(13, lc_hist);
+          enc.dispatch({256, 1, 1}, {256, 1, 1});
+        }
+        // Bonus at position K-1 (sample from the verifier dist p). seeds[0].
+        sample_batch(_lc_vlogits, K - 1, 1, K - 1, 0, 1, K - 1);
+        // New depth-1 drafts q1 (K concurrent rows). seeds[1..K].
+        sample_batch(_lc_mlogits, 0, K, K, 1, 2, 0);
+        if (d2) {           // new depth-2 drafts q2 (K concurrent rows).
+          sample_batch(_lc_mlogits2, 0, K, 2 * K, 1 + K, 3, 0);
+        }
+      };
+    }
     const bool vok = mtp_verify_chunk_(cid, xK, K, &preds, &mpreds,
                                        d2 ? &mpreds2 : nullptr, rope_delta,
-                                       ctl.sampler, seed_slot0, &gcache);
+                                       ctl.sampler, seed_slot0,
+                                       use_ring ? nullptr : &gcache, lc_mode,
+                                       use_ring, nullptr,
+                                       (gpu_lc && !lc_nofold)
+                                           ? encode_lc
+                                           : std::function<void(
+                                                 ComputeEncoder&)>{});
     prof_verify_ms += prof_ms(t_ver0, mtp_clock::now());
     if (!vok ||
         (int)preds.size() != K || (int)mpreds.size() != K ||
         (d2 && (int)mpreds2.size() != K)) {
-      snapshot_gdn(/*save=*/false);
+      // Verify aborted: nothing committed this round. The ring's cursor never
+      // advanced, so slot `cur` still holds S0 -- finalize it back to canonical.
+      if (use_ring) { _ctx->gdn_ring_end(cid); }
+      else { snapshot_gdn(/*save=*/false); }
       break;
     }
+    auto t_lc0 = mtp_clock::now();
+    // Leviathan-Chen step: the GPU kernels already ran -- folded into the
+    // verify's command buffer (pre_commit = encode_lc, default) or, when
+    // lc_nofold, in a separate stream encoded here. Either way the corrected
+    // token ids are now in _lc_out; read them into preds/mpreds(/mpreds2).
+    if (lc_mode && gpu_lc) {
+      if (lc_nofold) {
+        metal_compute::CommandStream stream = _mc->make_command_stream();
+        { ComputeEncoder enc = stream.begin_compute(); encode_lc(enc); }
+        stream.commit().wait();
+      }
+      const auto* o = static_cast<const std::int32_t*>(_lc_out.contents());
+      for (int i = 0; i < K; ++i) {
+        preds[(std::size_t)i] = o[i];
+        mpreds[(std::size_t)i] = o[K + i];
+        if (d2) { mpreds2[(std::size_t)i] = o[2 * K + i]; }
+      }
+    }
+    // Leviathan-Chen step ON HOST: from the full verifier/MTP logits the verify
+    // stashed (_lc_vlogits / _lc_mlogits / _lc_mlogits2), post-process each row
+    // into the SAME nucleus distribution the GPU sampler draws from, then run
+    // the ratio test + residual/bonus sampling. The accept loop below is
+    // unchanged (the L-C decision is encoded into preds so `drafts[i]==
+    // preds[i-1]` reproduces accept/reject). New drafts (mpreds) are SAMPLED
+    // from the MTP dist q and that dist is carried (qnew) for next round.
+    if (lc_mode && !gpu_lc) {
+      const int V = c.vocab;
+      const float temp = (sp.temperature > 1e-3f) ? sp.temperature : 1e-3f;
+      const auto* vl =
+          static_cast<const std::uint16_t*>(_lc_vlogits.contents());
+      const auto* ml =
+          static_cast<const std::uint16_t*>(_lc_mlogits.contents());
+      auto h2f = [](std::uint16_t h) -> float {
+        const std::uint32_t s = (std::uint32_t)(h & 0x8000u) << 16;
+        const std::uint32_t e = (h >> 10) & 0x1Fu;
+        const std::uint32_t m = h & 0x3FFu;
+        std::uint32_t bits;
+        if (e == 0u) {
+          if (m == 0u) { bits = s; }
+          else {
+            std::uint32_t ee = 127u - 15u + 1u, mm = m;
+            while ((mm & 0x400u) == 0u) { mm <<= 1; --ee; }
+            mm &= 0x3FFu;
+            bits = s | (ee << 23) | (mm << 13);
+          }
+        } else if (e == 0x1Fu) {
+          bits = s | 0x7F800000u | (m << 13);
+        } else {
+          bits = s | ((e - 15u + 127u) << 23) | (m << 13);
+        }
+        float f; std::memcpy(&f, &bits, 4); return f;
+      };
+      auto next_u = [&]() -> float {
+        lc_rng += 0x9E3779B97F4A7C15ull;
+        std::uint64_t z = lc_rng;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= (z >> 31);
+        return (float)((double)(z >> 11) * (1.0 / 9007199254740992.0));
+      };
+      auto sample = [&](const std::vector<float>& d, float u) -> std::int32_t {
+        float cdf = 0.0f;
+        for (int v = 0; v < V; ++v) {
+          cdf += d[(std::size_t)v];
+          if (u < cdf) { return v; }
+        }
+        return V - 1;
+      };
+      // Post-process logits into the SAME distribution the GPU sampler draws
+      // from: softmax weights w=exp((logit-max)/temp), then the top_k weight
+      // threshold + min_p floor + top_p nucleus (binary search, matching
+      // sample_topp_f16), renormalized over the kept set. Pure temperature
+      // skips the nucleus search.
+      const int n_iter = (sp.n_iter > 0) ? sp.n_iter : 24;
+      const bool nucleus = (sp.top_k > 0 && sp.top_k < V) || sp.top_p < 1.0f
+                           || sp.min_p > 0.0f;
+      auto post = [&](const std::uint16_t* row, std::vector<float>& out) {
+        out.resize((std::size_t)V);
+        float maxl = -1e30f;
+        for (int v = 0; v < V; ++v) {
+          const float l = h2f(row[v]);
+          out[(std::size_t)v] = l; if (l > maxl) { maxl = l; }
+        }
+        const float inv_t = 1.0f / temp;
+        float Z = 0.0f;
+        for (int v = 0; v < V; ++v) {
+          const float w = std::exp((out[(std::size_t)v] - maxl) * inv_t);
+          out[(std::size_t)v] = w; Z += w;
+        }
+        if (!nucleus) {
+          const float inv = (Z > 0.0f) ? 1.0f / Z : 0.0f;
+          for (int v = 0; v < V; ++v) { out[(std::size_t)v] *= inv; }
+          return;
+        }
+        float t_k = 0.0f;
+        if (sp.top_k > 0 && sp.top_k < V) {
+          float lo = 0.0f, hi = 1.0f;
+          for (int it = 0; it < n_iter; ++it) {
+            const float mid = 0.5f * (lo + hi);
+            int cnt = 0;
+            for (int v = 0; v < V; ++v) {
+              if (out[(std::size_t)v] >= mid) { ++cnt; }
+            }
+            if (cnt >= sp.top_k) { lo = mid; } else { hi = mid; }
+          }
+          t_k = lo;
+        }
+        const float t_floor = std::max(t_k, std::max(sp.min_p, 0.0f));
+        const float target = sp.top_p * Z;
+        float lo = t_floor, hi = 1.0f;
+        for (int it = 0; it < n_iter; ++it) {
+          const float mid = 0.5f * (lo + hi);
+          float mass = 0.0f;
+          for (int v = 0; v < V; ++v) {
+            const float w = out[(std::size_t)v];
+            if (w >= mid) { mass += w; }
+          }
+          if (mass >= target) { lo = mid; } else { hi = mid; }
+        }
+        const float wt = std::max(lo, t_floor);
+        float kept = 0.0f;
+        for (int v = 0; v < V; ++v) {
+          if (out[(std::size_t)v] < wt) { out[(std::size_t)v] = 0.0f; }
+          else { kept += out[(std::size_t)v]; }
+        }
+        const float inv = (kept > 0.0f) ? 1.0f / kept : 0.0f;
+        for (int v = 0; v < V; ++v) { out[(std::size_t)v] *= inv; }
+      };
+      // L-C accept of draft `dft` against target `p` using carried draft dist
+      // `q`: accept w/ min(1,p(d)/q(d)) -> dft; else a residual sample from
+      // norm(max(0,p-q)). Encodes accept/reject into preds for the loop below.
+      std::vector<float> res;
+      auto lc_accept = [&](std::int32_t dft, const std::vector<float>& p,
+                           const std::vector<float>& q) -> std::int32_t {
+        const float pd = p[(std::size_t)dft];
+        const float qd = q[(std::size_t)dft];
+        const float acc = (qd > 0.0f) ? std::min(1.0f, pd / qd) : 1.0f;
+        if (next_u() < acc) { return dft; }            // accept
+        float s = 0.0f; res.assign((std::size_t)V, 0.0f);
+        for (int v = 0; v < V; ++v) {
+          float r = p[(std::size_t)v] - q[(std::size_t)v];
+          r = (r > 0.0f) ? r : 0.0f;
+          res[(std::size_t)v] = r; s += r;
+        }
+        if (s > 0.0f) {
+          const float inv = 1.0f / s;
+          for (int v = 0; v < V; ++v) { res[(std::size_t)v] *= inv; }
+          return sample(res, next_u());
+        }
+        return sample(p, next_u());
+      };
+      // Verifier preds: position i verifies drafts[i+1] (the i-th chained draft,
+      // carried dist q1=qcarry / q2=qcarry2); the last position is the bonus.
+      std::vector<float> p;
+      preds.assign((std::size_t)K, 0);
+      for (int i = 0; i < K; ++i) {
+        post(vl + (std::size_t)i * V, p);
+        if (i + 1 < K) {
+          const std::vector<float>& q = (i == 0) ? qcarry : qcarry2;
+          preds[(std::size_t)i] = lc_accept(drafts[(std::size_t)(i + 1)], p, q);
+        } else {
+          preds[(std::size_t)i] = sample(p, next_u());   // bonus / anchor
+        }
+      }
+      // New drafts: SAMPLE from the (post-processed) MTP dists, carry the dists.
+      mpreds.assign((std::size_t)K, 0);
+      qnew.assign((std::size_t)K, std::vector<float>());
+      for (int i = 0; i < K; ++i) {
+        post(ml + (std::size_t)i * V, qnew[(std::size_t)i]);
+        mpreds[(std::size_t)i] = sample(qnew[(std::size_t)i], next_u());
+      }
+      if (d2) {
+        const auto* ml2 =
+            static_cast<const std::uint16_t*>(_lc_mlogits2.contents());
+        mpreds2.assign((std::size_t)K, 0);
+        qnew2.assign((std::size_t)K, std::vector<float>());
+        for (int i = 0; i < K; ++i) {
+          post(ml2 + (std::size_t)i * V, qnew2[(std::size_t)i]);
+          mpreds2[(std::size_t)i] = sample(qnew2[(std::size_t)i], next_u());
+        }
+      }
+    }
+    if (lc_prof && lc_mode) { prof_lc_ms += prof_ms(t_lc0, mtp_clock::now()); }
     // Accept the longest prefix matching the verifier's greedy preds (drafts[0]
     // is always correct -- it IS the prior round's verified next token).
     int j = 1;
@@ -4770,6 +5668,20 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
       ++keep;
     }
     if (keep > 0) { accepted += (keep - 1); }
+    // GDN ring commit: advance the cursor by `keep`, so slot cur now holds the
+    // committed S_{p+keep}. The (K-keep) rejected states sit in cur+1.. and are
+    // overwritten next round -- a pure cursor move, NO host copy / replay.
+    if (use_ring) {
+      for (int a = 0; a < keep; ++a) { _ctx->gdn_ring_advance(cid); }
+    }
+    // Persistent MTP KV commit: the verify appended (d2?2:1)*K draft positions
+    // onto the MTP ctx; retain the `keep` committed ones and roll back the rest
+    // (rejected depth-1 drafts + the whole depth-2 lookahead window) so next
+    // round's drafts attend over exactly the committed decode history.
+    if (_mtp_persist) {
+      const int mtp_rb = (d2 ? 2 : 1) * K - keep;
+      if (mtp_rb > 0) { _mtp.ctx->kv_rollback(_mtp.cid, mtp_rb); }
+    }
     const bool budget_done = ((int)out_ids.size() >= n_steps);
     // Next round's drafts come straight out of THIS verify at the boundary --
     // only when we will actually continue (no stop, abort, or budget end).
@@ -4777,6 +5689,24 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
       d0 = preds[(std::size_t)(keep - 1)];
       d1 = mpreds[(std::size_t)(keep - 1)];
       have_d1 = true;
+      // Carry the drafter dists q1/q2 for the new d1/d2 (next round's ratios).
+      // GPU L-C carries the logit ROWS (copied out before next round's verify
+      // overwrites _lc_mlogits); the host path carries the post()'d dists.
+      if (lc_mode && gpu_lc) {
+        const std::size_t vb = (std::size_t)c.vocab * 2;
+        const std::size_t off = (std::size_t)(keep - 1) * vb;
+        std::memcpy(_lc_qcarry.contents(),
+                    static_cast<const std::uint8_t*>(_lc_mlogits.contents())
+                        + off, vb);
+        if (d2) {
+          std::memcpy(_lc_qcarry2.contents(),
+                      static_cast<const std::uint8_t*>(_lc_mlogits2.contents())
+                          + off, vb);
+        }
+      } else if (lc_mode) {
+        qcarry = std::move(qnew[(std::size_t)(keep - 1)]);
+        if (d2) { qcarry2 = std::move(qnew2[(std::size_t)(keep - 1)]); }
+      }
       if (d2) { d2v = mpreds2[(std::size_t)(keep - 1)]; have_d2 = true; }
     }
     // Over-append rollback: the main KV + GDN advanced by K but we keep only
@@ -4790,13 +5720,18 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
     if (keep < K) {
       auto t_rb0 = mtp_clock::now();
       _ctx->kv_rollback(cid, K - keep);
-      snapshot_gdn(/*save=*/false);
-      auto t_rr0 = mtp_clock::now();
-      prof_snap_ms += prof_ms(t_rb0, t_rr0);
-      if (keep > 0) {
-        gdn_replay_(cid, keep, gcache);
-        prof_rerun_ms += prof_ms(t_rr0, mtp_clock::now());
-        ++prof_reruns;
+      if (!use_ring) {
+        // In-place GDN: restore the round's S0 then replay the kept tokens to
+        // S_{p+keep}. (The ring path already committed S_{p+keep} via the cursor
+        // advance above -- the rejected states are abandoned, zero copy.)
+        snapshot_gdn(/*save=*/false);
+        auto t_rr0 = mtp_clock::now();
+        prof_snap_ms += prof_ms(t_rb0, t_rr0);
+        if (keep > 0) {
+          gdn_replay_(cid, keep, gcache);
+          prof_rerun_ms += prof_ms(t_rr0, mtp_clock::now());
+          ++prof_reruns;
+        }
       }
     }
     // Stream this round's kept tokens; an on_round false return aborts.
@@ -4807,6 +5742,10 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
       if (!ctl.on_round(fresh)) { terminate = true; }
     }
   }
+  // Finalize the GDN ring: O(1) handle-swap the cursor's (final committed) state
+  // into the canonical slot so the caller's assistant_close / next sync decode
+  // read the correct recurrent state. No-op when the ring was off.
+  if (use_ring) { _ctx->gdn_ring_end(cid); }
   if (accepted_out) { *accepted_out = accepted; }
   if (rounds_out) { *rounds_out = rounds; }
   if (mtp_prof) {
@@ -4822,6 +5761,117 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
         prof_reruns > 0 ? prof_rerun_ms / (double)prof_reruns : 0.0,
         prof_snap_ms, tot);
   }
+  if (lc_prof) {
+    std::printf(
+        "[mtp_lc] %s | tok=%d rounds=%ld | lc-step=%.1fms (%.3f/round)\n",
+        gpu_lc ? "GPU" : "host", (int)out_ids.size(), rounds, prof_lc_ms,
+        rounds > 0 ? prof_lc_ms / (double)rounds : 0.0);
+  }
+  if (vprof_d && g_vp_n > 0) {
+    const double v = (double)g_vp_n;
+    const double sum = g_vp_main + g_vp_vhead + g_vp_mtp;
+    std::printf(
+        "[mtp_vprof] depth=%d verifies=%ld | main=%.2f/v vhead=%.2f/v "
+        "mtp=%.2f/v (%.0fx head) | sum/v=%.2fms (main %.0f%% vhead %.0f%% "
+        "mtp %.0f%%)\n",
+        (draft_len >= 2 ? 2 : 1), g_vp_n, g_vp_main / v, g_vp_vhead / v,
+        g_vp_mtp / v, g_vp_vhead > 0 ? g_vp_mtp / g_vp_vhead : 0.0, sum / v,
+        100.0 * g_vp_main / sum, 100.0 * g_vp_vhead / sum,
+        100.0 * g_vp_mtp / sum);
+  }
+  return true;
+}
+
+bool
+MetalQwenModel::mtp_teacher_force(ContextId cid,
+                                  const std::vector<std::int32_t>& cont,
+                                  int chunk, long* d1_hits, long* d1_total)
+{
+  if (!_mtp.ok || !(_mixed || _kquant)) { return false; }
+  if (!ensure_decode_scratch_()) { return false; }
+  const Config& c = _cfg;
+  if (chunk < 1) { chunk = 1; }
+  const int N = (int)cont.size();
+  // Honor the persistent-MTP-KV flag so this hook measures the SAME head the
+  // decode uses: persistent accumulates the walked history (no per-chunk wipe),
+  // non-persistent (VPIPE_MTP_NO_PERSIST) wipes each chunk. Reset once here so
+  // the walk starts from a clean MTP ctx either way.
+  _mtp_persist = (std::getenv("VPIPE_MTP_NO_PERSIST") == nullptr);
+  mtp_ctx_reset_();
+  // Seed the MTP KV with the prefill's prompt (the "full history" mode -- this
+  // is what the production mtp_decode now does), so the measured draft accuracy
+  // matches the decode. cont[0] is the decode's first token (the last seeded
+  // position's conditioning). VPIPE_MTP_NO_SEED disables the capture upstream,
+  // leaving the decode-only ("no prefix") baseline for an A/B.
+  if (_mtp_persist && !cont.empty()) { mtp_seed_prefix_(cont[0]); }
+
+  // GDN snapshot cache for the use_ring=false verify path. Teacher-forcing keeps
+  // every token (keep==W each chunk), so the GDN advances in place and the cache
+  // is filled but never replayed.
+  std::vector<int> glayers;
+  for (int L = 0; L < c.n_layers; ++L) {
+    if (c.layer_is_full(L)) { continue; }
+    if (_ctx->conv_state(cid, L) != nullptr &&
+        _ctx->ssm_state(cid, L) != nullptr) {
+      glayers.push_back(L);
+    }
+  }
+  GdnVerifyCache gcache;
+  gcache.layers = glayers;
+  {
+    const int Cd = c.gdn_conv_dim, Hv = c.gdn_v_heads;
+    for (std::size_t i = 0; i < glayers.size(); ++i) {
+      gcache.qkv.push_back(
+          _mc->make_shared_buffer((std::size_t)chunk * Cd * 2));
+      gcache.gbuf.push_back(
+          _mc->make_shared_buffer((std::size_t)chunk * Hv * 4));
+      gcache.betabuf.push_back(
+          _mc->make_shared_buffer((std::size_t)chunk * Hv * 4));
+    }
+  }
+  const int seed_slot0 = _ctx->seq_len_of(cid);
+  const GpuSamplerParams sp;   // greedy
+  SharedBuffer condbuf =
+      _mc->make_shared_buffer((std::size_t)chunk * sizeof(std::int32_t));
+
+  long hits = 0, total = 0, aligned = 0, atot = 0;
+  int j = 0;
+  while (j + 1 < N) {
+    const int W = std::min(chunk, N - 1 - j);   // need cont[j+W] to condition
+    if (W < 1) { break; }
+    SharedBuffer xK = _muxer->fetch_text(
+        std::span<const std::int32_t>(cont.data() + j, (std::size_t)W));
+    if (xK.empty()) { break; }
+    // Position k conditions the MTP head on the TRUE next token cont[j+k+1].
+    auto* cb = static_cast<std::int32_t*>(condbuf.contents());
+    for (int k = 0; k < W; ++k) { cb[k] = cont[(std::size_t)(j + k + 1)]; }
+    std::vector<std::int32_t> preds, mpreds;
+    const bool ok =
+        mtp_verify_chunk_(cid, xK, W, &preds, &mpreds, nullptr, 0, sp,
+                          seed_slot0, &gcache, false, false, &condbuf);
+    if (!ok || (int)mpreds.size() != W) { return false; }
+    for (int k = 0; k < W; ++k) {
+      if ((int)preds.size() == W) {
+        ++atot;
+        if (preds[(std::size_t)k] == cont[(std::size_t)(j + k + 1)]) {
+          ++aligned;
+        }
+      }
+      const int tgt = j + k + 2;   // MTP draft predicts cont[j+k+2]
+      if (tgt < N) {
+        ++total;
+        if (mpreds[(std::size_t)k] == cont[(std::size_t)tgt]) { ++hits; }
+      }
+    }
+    j += W;
+  }
+  if (d1_hits) { *d1_hits = hits; }
+  if (d1_total) { *d1_total = total; }
+  std::printf("[mtp_tf] depth-1 draft acc %ld/%ld = %.3f | greedy-align "
+              "%ld/%ld = %.3f (chunk=%d)\n",
+              hits, total, total ? (double)hits / (double)total : 0.0,
+              aligned, atot, atot ? (double)aligned / (double)atot : 0.0,
+              chunk);
   return true;
 }
 

@@ -669,6 +669,36 @@ kernel void copy_f16(
   out[off + (int)gid] = src[gid];
 }
 
+// Diagnostic-only no-op carrying a REALISTIC dispatch arg load (8 read buffers
+// + 4 constants + 1 write), so VPIPE_GEMMA_DUMMY_DISP measures true per-launch
+// cost (arg-binding + command-processor setup + dependent-chain bubble) rather
+// than a 3-arg toy. Thread 0 reads one element from every bound buffer and the
+// constants and writes their sum to out[0] -- a live read->write the compiler
+// cannot elide. Binding out == b0 (same buffer) makes successive dummies a RAW
+// chain that serializes like the real decode dispatch chain.
+kernel void dummy_disp_f16(
+    const device VPIPE_ELT* b0  [[buffer(0)]],
+    const device VPIPE_ELT* b1  [[buffer(1)]],
+    const device VPIPE_ELT* b2  [[buffer(2)]],
+    const device VPIPE_ELT* b3  [[buffer(3)]],
+    const device VPIPE_ELT* b4  [[buffer(4)]],
+    const device VPIPE_ELT* b5  [[buffer(5)]],
+    const device VPIPE_ELT* b6  [[buffer(6)]],
+    const device VPIPE_ELT* b7  [[buffer(7)]],
+    device VPIPE_ELT*       out [[buffer(8)]],
+    constant int&           c0  [[buffer(9)]],
+    constant int&           c1  [[buffer(10)]],
+    constant int&           c2  [[buffer(11)]],
+    constant int&           c3  [[buffer(12)]],
+    uint tid [[thread_position_in_grid]])
+{
+  if (tid != 0u) { return; }
+  float s = float(b0[0]) + float(b1[0]) + float(b2[0]) + float(b3[0])
+          + float(b4[0]) + float(b5[0]) + float(b6[0]) + float(b7[0])
+          + float(c0 + c1 + c2 + c3);
+  out[0] = VPIPE_ELT(s);
+}
+
 kernel void dequant_q5k_f16(
     const device uchar* src [[buffer(0)]],
     device VPIPE_ELT*   out [[buffer(1)]],
@@ -791,32 +821,32 @@ kernel void qmv_q5k_f16(
 // ---- Batched k-quant GEMV (weight read ONCE across MAXM rows) ----------
 // The MTP verify's weight-bound matmul on the GGUF path. y[base+m, yoff+row] =
 // dequant(W[row]) . x[base+m] for the MAXM-row tile starting at base = tid.z*
-// MAXM. MAXM is a COMPILE-TIME 2 (the depth-1 draft window) so acc[] fully
-// unrolls into registers -- at 2 rows the per-row k-quant unpack/FMA hides
-// behind the once-read weight load (bandwidth-bound), so a 2-token verify costs
-// ~1 qmv step (the affine_qmv_batch result, here for native k-quant). m>MAXM
-// tiles along grid.z (ceil(m/2) tiles); pad rows alias the last valid row (no
+// MAXM. MAXM is a COMPILE-TIME TEMPLATE arg: 2 (qmv_q*k_batch_f16) is the
+// depth-1 draft window (acc[] unrolls into registers; the per-row k-quant
+// unpack/FMA hides behind the once-read weight load = bandwidth-bound, so a
+// 2-token verify costs ~1 qmv step); 4 (qmv_q*k_batch4_f16) serves the depth-2
+// MTP verify -- n=3..4 rows in ONE tile, reading the weight ONCE vs the MAXM=2
+// form's 2 grid.z tiles (the depth-2 cliff, mirroring the affine batch4). m>MAXM
+// tiles along grid.z (ceil(m/MAXM) tiles); pad rows alias the last valid row (no
 // OOB) and are never written. Output rows are `ystride` apart at base `yoff`
 // (ystride==N writes a contiguous [m,N]; a wider stride writes a column slice
 // of a fused buffer). Per-row arithmetic == the single-row qmv kernels
 // (acc += lo; acc += hi order) -> token-exact. grid {32, ceil(N/2)*2,
-// ceil(m/2)}, tg {32, 2, 1}. x is [m_total, K] tightly packed (xstride==K==H).
-constant constexpr int KQ_BATCH_MAXM = 2;
+// ceil(m/MAXM)}, tg {32, 2, 1}. x is [m_total, K] tightly packed (xstride==K==H).
 
-kernel void qmv_q4k_batch_f16(
-    const device uchar*     w       [[buffer(0)]],
-    const device VPIPE_ELT* x       [[buffer(1)]],
-    device VPIPE_ELT*       y       [[buffer(2)]],
-    constant int&           H       [[buffer(3)]],
-    constant int&           N       [[buffer(4)]],
-    constant int&           m_total [[buffer(5)]],
-    constant int&           ystride [[buffer(6)]],
-    constant int&           yoff    [[buffer(7)]],
-    uint3 tid      [[threadgroup_position_in_grid]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+template <int MAXM>
+inline void qmv_q4k_batch_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    const constant int&     H,
+    const constant int&     N,
+    const constant int&     m_total,
+    const constant int&     ystride,
+    const constant int&     yoff,
+    uint3 tid, uint simd_gid, uint simd_lid)
 {
-  constexpr int NSG = 2, MAXM = KQ_BATCH_MAXM;
+  constexpr int NSG = 2;
   const int row = (int)tid.y * NSG + (int)simd_gid;
   if (row >= N) { return; }
   const int base = (int)tid.z * MAXM;
@@ -868,20 +898,19 @@ kernel void qmv_q4k_batch_f16(
   }
 }
 
-kernel void qmv_q5k_batch_f16(
-    const device uchar*     w       [[buffer(0)]],
-    const device VPIPE_ELT* x       [[buffer(1)]],
-    device VPIPE_ELT*       y       [[buffer(2)]],
-    constant int&           H       [[buffer(3)]],
-    constant int&           N       [[buffer(4)]],
-    constant int&           m_total [[buffer(5)]],
-    constant int&           ystride [[buffer(6)]],
-    constant int&           yoff    [[buffer(7)]],
-    uint3 tid      [[threadgroup_position_in_grid]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+template <int MAXM>
+inline void qmv_q5k_batch_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    const constant int&     H,
+    const constant int&     N,
+    const constant int&     m_total,
+    const constant int&     ystride,
+    const constant int&     yoff,
+    uint3 tid, uint simd_gid, uint simd_lid)
 {
-  constexpr int NSG = 2, MAXM = KQ_BATCH_MAXM;
+  constexpr int NSG = 2;
   const int row = (int)tid.y * NSG + (int)simd_gid;
   if (row >= N) { return; }
   const int base = (int)tid.z * MAXM;
@@ -939,20 +968,19 @@ kernel void qmv_q5k_batch_f16(
 
 // Q6_K batched: the qmv_q6k_v2 algorithm (llama.cpp grouping) per row, batched
 // over MAXM inputs -- bit-identical to the serial decode lm_head -> token-exact.
-kernel void qmv_q6k_batch_f16(
-    const device uchar*     w       [[buffer(0)]],
-    const device VPIPE_ELT* x       [[buffer(1)]],
-    device VPIPE_ELT*       y       [[buffer(2)]],
-    constant int&           H       [[buffer(3)]],
-    constant int&           N       [[buffer(4)]],
-    constant int&           m_total [[buffer(5)]],
-    constant int&           ystride [[buffer(6)]],
-    constant int&           yoff    [[buffer(7)]],
-    uint3 tid      [[threadgroup_position_in_grid]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+template <int MAXM>
+inline void qmv_q6k_batch_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    const constant int&     H,
+    const constant int&     N,
+    const constant int&     m_total,
+    const constant int&     ystride,
+    const constant int&     yoff,
+    uint3 tid, uint simd_gid, uint simd_lid)
 {
-  constexpr int NSG = 2, MAXM = KQ_BATCH_MAXM;
+  constexpr int NSG = 2;
   const int nsb = H / 256;
   const int row_bytes = nsb * 210;
   const int out_row = (int)tid.y * NSG + (int)simd_gid;
@@ -1014,6 +1042,31 @@ kernel void qmv_q6k_batch_f16(
   }
 }
 
+// Entry points: MAXM=2 (qmv_q*k_batch_f16, depth-1 window, grid.z=ceil(m/2))
+// and MAXM=4 (qmv_q*k_batch4_f16, depth-2 verify n=3..4 in one tile, grid.z=1).
+#define KQ_BATCH_ENTRY(NAME, IMPL, MAXM)                                     \
+  kernel void NAME(                                                          \
+      const device uchar*     w       [[buffer(0)]],                         \
+      const device VPIPE_ELT* x       [[buffer(1)]],                         \
+      device VPIPE_ELT*       y       [[buffer(2)]],                         \
+      constant int&           H       [[buffer(3)]],                         \
+      constant int&           N       [[buffer(4)]],                         \
+      constant int&           m_total [[buffer(5)]],                         \
+      constant int&           ystride [[buffer(6)]],                         \
+      constant int&           yoff    [[buffer(7)]],                         \
+      uint3 tid      [[threadgroup_position_in_grid]],                       \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint  simd_lid [[thread_index_in_simdgroup]]) {                        \
+    IMPL<MAXM>(w, x, y, H, N, m_total, ystride, yoff, tid, simd_gid,         \
+               simd_lid);                                                    \
+  }
+KQ_BATCH_ENTRY(qmv_q4k_batch_f16,  qmv_q4k_batch_impl, 2)
+KQ_BATCH_ENTRY(qmv_q4k_batch4_f16, qmv_q4k_batch_impl, 4)
+KQ_BATCH_ENTRY(qmv_q5k_batch_f16,  qmv_q5k_batch_impl, 2)
+KQ_BATCH_ENTRY(qmv_q5k_batch4_f16, qmv_q5k_batch_impl, 4)
+KQ_BATCH_ENTRY(qmv_q6k_batch_f16,  qmv_q6k_batch_impl, 2)
+KQ_BATCH_ENTRY(qmv_q6k_batch4_f16, qmv_q6k_batch_impl, 4)
+
 // Transpose [A, B, D] -> [B, A, D] (D-vectors kept intact). Used by
 // batched prefill to swap token-major <-> head-major:
 //   q [n, Hq, D] -> [Hq, n, D]   (A=n, B=Hq)
@@ -1040,6 +1093,12 @@ kernel void transpose_abd_f16(
 // buffer is sized to its bounded capacity wraps in place. For a full
 // layer MAX_SEQ == max_seq and pos+t < max_seq, so the modulo is a
 // no-op. 0:src 1:cache 2:MAX_SEQ 3:D 4:n 5:pos. grid (D, n, Hkv).
+// MAX_SEQ here is the PHYSICAL head stride (== ring modulo + mirror tail for a
+// bounded sliding ring; == ring modulo otherwise). ring_cap/window are optional
+// trailing constants: ring_cap>0 selects the bounded ring (slot = pos % ring_cap)
+// and mirrors a head-slot (slot < window-1) into slot+ring_cap so the trailing
+// window reads as one linear span. ring_cap<=0 -> plain linear (slot = pos),
+// no mirror -- byte-identical to the pre-mirror behavior.
 kernel void kv_write_f16(
     const device VPIPE_ELT* src     [[buffer(0)]],
     device VPIPE_ELT*       cache   [[buffer(1)]],
@@ -1047,14 +1106,23 @@ kernel void kv_write_f16(
     constant int&      D       [[buffer(3)]],
     constant int&      n       [[buffer(4)]],
     constant int&      pos     [[buffer(5)]],
+    constant int&      ring_cap [[buffer(6)]],
+    constant int&      window   [[buffer(7)]],
     uint3 gid [[thread_position_in_grid]])
 {
   const int d = (int)gid.x;
   if (d >= D) { return; }
   const int t = (int)gid.y;
   const int h = (int)gid.z;
-  const int slot = (pos + t) % MAX_SEQ;
-  cache[((uint)h * MAX_SEQ + slot) * D + d] = src[((uint)h * n + t) * D + d];
+  const int mod  = (ring_cap > 0) ? ring_cap : MAX_SEQ;
+  const int slot = (pos + t) % mod;
+  const VPIPE_ELT val = src[((uint)h * n + t) * D + d];
+  cache[((uint)h * MAX_SEQ + slot) * D + d] = val;
+  // Mirror a head slot into the tail so a window-length scan past ring end
+  // reads the mirror linearly instead of wrapping.
+  if (ring_cap > 0 && slot < window - 1) {
+    cache[((uint)h * MAX_SEQ + (uint)(slot + ring_cap)) * D + d] = val;
+  }
 }
 
 // Fused K+V write: same geometry as kv_write_f16, but writes both the K and
@@ -1062,6 +1130,7 @@ kernel void kv_write_f16(
 // -> 2 launches/layer; fusing halves that, cutting the dependent-dispatch
 // idle). K and V share the layer's MAX_SEQ/D/n/pos. grid (D, n, Hkv).
 //   0:src_k 1:cache_k 2:src_v 3:cache_v 4:MAX_SEQ 5:D 6:n 7:pos
+//   8:ring_cap 9:window  (MAX_SEQ == physical head stride; see kv_write_f16)
 kernel void kv_write2_f16(
     const device VPIPE_ELT* src_k   [[buffer(0)]],
     device VPIPE_ELT*       cache_k [[buffer(1)]],
@@ -1071,17 +1140,65 @@ kernel void kv_write2_f16(
     constant int&      D       [[buffer(5)]],
     constant int&      n       [[buffer(6)]],
     constant int&      pos     [[buffer(7)]],
+    constant int&      ring_cap [[buffer(8)]],
+    constant int&      window   [[buffer(9)]],
     uint3 gid [[thread_position_in_grid]])
 {
   const int d = (int)gid.x;
   if (d >= D) { return; }
   const int t = (int)gid.y;
   const int h = (int)gid.z;
-  const int slot = (pos + t) % MAX_SEQ;
+  const int mod  = (ring_cap > 0) ? ring_cap : MAX_SEQ;
+  const int slot = (pos + t) % mod;
   const uint ci = ((uint)h * MAX_SEQ + slot) * D + d;
   const uint si = ((uint)h * n + t) * D + d;
-  cache_k[ci] = src_k[si];
-  cache_v[ci] = src_v[si];
+  const VPIPE_ELT kval = src_k[si];
+  const VPIPE_ELT vval = src_v[si];
+  cache_k[ci] = kval;
+  cache_v[ci] = vval;
+  if (ring_cap > 0 && slot < window - 1) {
+    const uint mi = ((uint)h * MAX_SEQ + (uint)(slot + ring_cap)) * D + d;
+    cache_k[mi] = kval;
+    cache_v[mi] = vval;
+  }
+}
+
+// Sub-blocked ring write: write the token sub-range [src_off, src_off+cnt) of a
+// FULL source src[Hkv, n_src, D] into the bounded ring cache[Hkv, MAX_SEQ, D].
+// Identical addressing to kv_write_f16 but the source row is (src_off + t) with
+// a per-head stride of n_src, and the logical position is (pos + src_off + t).
+// The bounded-ring single-pass prefill computes Q/K/V over the WHOLE prompt in
+// one batch but must sub-block the RING write to <= page (ring_cap - window)
+// rows per dispatch: a single dispatch wider than the ring would have multiple
+// source rows mapping to the same physical slot (pos % ring_cap collisions),
+// and those parallel writes RACE -- non-deterministic ring contents. Each
+// sub-block of <= page distinct slots writes each slot at most once.
+//   0:src 1:cache 2:MAX_SEQ 3:D 4:n_src 5:pos 6:ring_cap 7:window 8:src_off
+// grid (D, cnt, Hkv).
+kernel void kv_write_sub_f16(
+    const device VPIPE_ELT* src     [[buffer(0)]],
+    device VPIPE_ELT*       cache   [[buffer(1)]],
+    constant int&      MAX_SEQ [[buffer(2)]],
+    constant int&      D       [[buffer(3)]],
+    constant int&      n_src   [[buffer(4)]],
+    constant int&      pos     [[buffer(5)]],
+    constant int&      ring_cap [[buffer(6)]],
+    constant int&      window   [[buffer(7)]],
+    constant int&      src_off  [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  if (d >= D) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  const int sr = src_off + t;             // source row in [0, n_src)
+  const int mod  = (ring_cap > 0) ? ring_cap : MAX_SEQ;
+  const int slot = (pos + sr) % mod;
+  const VPIPE_ELT val = src[((uint)h * n_src + sr) * D + d];
+  cache[((uint)h * MAX_SEQ + slot) * D + d] = val;
+  if (ring_cap > 0 && slot < window - 1) {
+    cache[((uint)h * MAX_SEQ + (uint)(slot + ring_cap)) * D + d] = val;
+  }
 }
 
 // Write a token chunk of src[Hkv, n_src, D] -- the token range
@@ -1372,4 +1489,441 @@ kernel void sample_topp_f16(
     out_id[0] = pick;
     seen[pick] = 1;
   }
+}
+
+// ---------------------------------------------------------------------
+// Leviathan-Chen speculative-sampling kernels (on-GPU MTP correction).
+//
+// The host L-C path post-processed the full [V] verifier / MTP logits on the
+// CPU -- a per-row softmax + 2x threshold bisection + residual + CDF walk, run
+// ~7x per round single-threaded over V (~152K). These kernels do the SAME
+// nucleus math + accept/residual ON the GPU (one threadgroup per row), so a
+// round only moves a handful of token ids back to the host. The nucleus stage
+// mirrors sample_topp_f16 exactly (max -> single exp-cache -> top_k/min_p/top_p
+// threshold bisection); sampling is Gumbel-max over the kept set (no CDF, no
+// sort), matching the GPU decode sampler. L-C is a SAMPLING path (repetition /
+// presence penalties are gated out before we reach it), so there is no
+// `seen`/penalty handling here.
+
+// Shared nucleus stage: cache ws[i] = exp((logit_i - max)/temp) over the row and
+// return the nucleus weight cutoff `wt` plus the kept-weight sum `kept`, so a
+// kept token's normalized prob is ws[i]/kept (when ws[i] >= wt) else 0.
+// Threadgroup-UNIFORM: every thread in the group must call it (it barriers
+// internally), and `tg`/`tgi` are the caller's shared scratch.
+inline void lc_nucleus_stage(
+    const device VPIPE_ELT* logits, device VPIPE_ELT* ws,
+    int V, float inv_t, float top_p, int top_k, float min_p, int n_iter,
+    threadgroup float* tg, threadgroup int* tgi, uint tid, uint nthg,
+    thread float& wt_out, thread float& kept_out)
+{
+  // 1) max logit (softmax stability).
+  float m = -INFINITY;
+  for (uint i = tid; i < (uint)V; i += nthg) { m = max(m, float(logits[i])); }
+  tg[tid] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] = max(tg[tid], tg[tid + s]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float maxl = tg[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 2) Z = sum w_i, caching w_i into ws (the ONE exp pass).
+  float z = 0.0f;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    const float w = exp((float(logits[i]) - maxl) * inv_t);
+    ws[i] = (VPIPE_ELT)w;
+    z += w;
+  }
+  tg[tid] = z;
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] += tg[tid + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float Z = tg[0];
+  const float target = top_p * Z;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 3a) top-k weight threshold: largest t with count{w_i >= t} >= k.
+  float t_k = 0.0f;
+  if (top_k > 0 && top_k < V) {
+    float lo = 0.0f, hi = 1.0f;
+    for (int it = 0; it < n_iter; ++it) {
+      const float mid = 0.5f * (lo + hi);
+      int cnt = 0;
+      for (uint i = tid; i < (uint)V; i += nthg) {
+        if (float(ws[i]) >= mid) { ++cnt; }
+      }
+      tgi[tid] = cnt;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint s = nthg >> 1; s > 0; s >>= 1) {
+        if (tid < s) { tgi[tid] += tgi[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const int C = tgi[0];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (C >= top_k) { lo = mid; } else { hi = mid; }
+    }
+    t_k = lo;
+  }
+  const float t_floor = max(t_k, max(min_p, 0.0f));
+
+  // 3b) top-p nucleus threshold: largest t in [t_floor,1] whose tail mass
+  // {w_i >= t} >= top_p*Z.
+  float lo = t_floor, hi = 1.0f;
+  for (int it = 0; it < n_iter; ++it) {
+    const float mid = 0.5f * (lo + hi);
+    float mass = 0.0f;
+    for (uint i = tid; i < (uint)V; i += nthg) {
+      const float w = float(ws[i]);
+      if (w >= mid) { mass += w; }
+    }
+    tg[tid] = mass;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthg >> 1; s > 0; s >>= 1) {
+      if (tid < s) { tg[tid] += tg[tid + s]; }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float M = tg[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (M >= target) { lo = mid; } else { hi = mid; }
+  }
+  const float wt = max(lo, t_floor);
+
+  // 4) kept = sum of kept weights, so a kept token's prob is ws[i]/kept.
+  float kept = 0.0f;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    const float w = float(ws[i]);
+    if (w >= wt) { kept += w; }
+  }
+  tg[tid] = kept;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] += tg[tid + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  kept_out = tg[0];
+  wt_out = wt;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Histogram twin of lc_nucleus_stage: replaces the 2*n_iter full-V threshold
+// bisections with a SINGLE-PASS count histogram over log(weight), then a tiny
+// B-bin scan that finds the top_p/top_k/min_p cutoff -- so the per-nucleus
+// full-V passes drop from ~(2 + 2*n_iter) to ~3 (max, expZ+histogram, exact
+// kept). Weights w_i = exp((l_i - max)/temp) in (0,1]; log(w_i) in [LC_LOGMIN,
+// 0]; bin = (log(w) - LOGMIN)/(-LOGMIN)*B. The scan reconstructs each bin's mass
+// as count*midpoint-weight (a <=1 bin-width approximation, fine for a lossless
+// sampling path); the KEPT sum for the chosen threshold is then computed EXACTLY
+// in one pass, so p(d)=w/kept downstream stays exact. The cutoff weight is a bin
+// lower edge (B=1024 over 30 log-units => ~3% weight granularity).
+#define LC_HIST_B 1024
+constant float LC_LOGMIN = -30.0f;
+
+inline void lc_nucleus_hist(
+    const device VPIPE_ELT* logits, device VPIPE_ELT* ws,
+    int V, float inv_t, float top_p, int top_k, float min_p,
+    threadgroup float* tg, threadgroup int* tgi,
+    threadgroup atomic_uint* hist, threadgroup float* sh,
+    uint tid, uint nthg, thread float& wt_out, thread float& kept_out)
+{
+  (void)tgi;                 // bisection-only scratch; the histogram uses `hist`
+  // 1) max logit.
+  float m = -INFINITY;
+  for (uint i = tid; i < (uint)V; i += nthg) { m = max(m, float(logits[i])); }
+  tg[tid] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] = max(tg[tid], tg[tid + s]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float maxl = tg[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // zero the histogram.
+  for (uint b = tid; b < (uint)LC_HIST_B; b += nthg) {
+    atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 2) Z = sum w_i, cache w_i into ws, AND bin it (skip negligible weights so
+  // both the work and the bin-0 contention collapse at low temperature).
+  const float inv_range = 1.0f / (-LC_LOGMIN);
+  const float wmin = exp(LC_LOGMIN);
+  float z = 0.0f;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    const float w = exp((float(logits[i]) - maxl) * inv_t);
+    ws[i] = (VPIPE_ELT)w;
+    z += w;
+    if (w > wmin) {
+      const float lw = (float(logits[i]) - maxl) * inv_t;   // == log(w)
+      int b = (int)((lw - LC_LOGMIN) * inv_range * (float)LC_HIST_B);
+      b = clamp(b, 0, LC_HIST_B - 1);
+      atomic_fetch_add_explicit(&hist[b], 1u, memory_order_relaxed);
+    }
+  }
+  tg[tid] = z;
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] += tg[tid + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float Z = tg[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 3) scan the bins high->low on one thread; keep bins until the cumulative
+  // (reconstructed) mass >= top_p*Z and/or the count >= top_k; wt = the most
+  // restrictive cutoff's bin lower edge, floored by min_p.
+  if (tid == 0) {
+    const float targetp = top_p * Z;
+    const float binw = (-LC_LOGMIN) / (float)LC_HIST_B;
+    float cmass = 0.0f; int ccnt = 0;
+    float wt_p = 0.0f, wt_k = 0.0f;
+    bool got_p = (top_p >= 1.0f - 1e-9f);
+    bool got_k = (top_k <= 0 || top_k >= V);
+    for (int b = LC_HIST_B - 1; b >= 0; --b) {
+      const uint c = atomic_load_explicit(&hist[b], memory_order_relaxed);
+      const float wlo  = exp(LC_LOGMIN + (float)b * binw);
+      const float wmid = exp(LC_LOGMIN + ((float)b + 0.5f) * binw);
+      cmass += (float)c * wmid;
+      ccnt  += (int)c;
+      if (!got_p && cmass >= targetp) { wt_p = wlo; got_p = true; }
+      if (!got_k && ccnt >= top_k)    { wt_k = wlo; got_k = true; }
+      if (got_p && got_k) { break; }
+    }
+    sh[0] = max(max(wt_p, wt_k), max(min_p, 0.0f));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float wt = sh[0];
+
+  // 4) exact kept = sum of weights at or above the chosen threshold.
+  float kept = 0.0f;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    const float w = float(ws[i]);
+    if (w >= wt) { kept += w; }
+  }
+  tg[tid] = kept;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] += tg[tid + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  kept_out = tg[0];
+  wt_out = wt;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Gumbel-max argmax reduction over (tg=score, tgi=index), lowest-index tie
+// break -- the exact reduction sample_topp_f16 uses for its final draw.
+#define LC_ARGMAX_REDUCE(tg, tgi, tid, nthg)                                 \
+  do {                                                                       \
+    for (uint s = (nthg) >> 1; s > 0; s >>= 1) {                             \
+      if ((tid) < s) {                                                       \
+        const bool take = (tg)[(tid) + s] > (tg)[(tid)] ||                   \
+            ((tg)[(tid) + s] == (tg)[(tid)] && (tgi)[(tid) + s] >= 0 &&      \
+             ((tgi)[(tid)] < 0 || (tgi)[(tid) + s] < (tgi)[(tid)]));         \
+        if (take) { (tg)[(tid)] = (tg)[(tid) + s];                          \
+                    (tgi)[(tid)] = (tgi)[(tid) + s]; }                       \
+      }                                                                      \
+      threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                        \
+  } while (0)
+
+// Pure Gumbel-max nucleus sample of ONE logit row -> out_id[0]. Used for the
+// verifier bonus and for the new MTP drafts (q1 / depth-2 q2).
+//   0:logits 1:out_id 2:V 3:temp 4:top_p 5:seed 6:ws 7:n_iter 8:top_k 9:min_p
+kernel void lc_sample_f16(
+    const device VPIPE_ELT* logits [[buffer(0)]],
+    device int*             out_id [[buffer(1)]],
+    constant int&           V      [[buffer(2)]],
+    constant float&         temp   [[buffer(3)]],
+    constant float&         top_p  [[buffer(4)]],
+    constant uint&          seed   [[buffer(5)]],
+    device VPIPE_ELT*       ws     [[buffer(6)]],
+    constant int&           n_iter [[buffer(7)]],
+    constant int&           top_k  [[buffer(8)]],
+    constant float&         min_p  [[buffer(9)]],
+    constant int&           use_hist [[buffer(10)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  threadgroup float tg[256];
+  threadgroup int   tgi[256];
+  threadgroup atomic_uint hist[LC_HIST_B];
+  threadgroup float sh[1];
+  const float inv_t = 1.0f / max(temp, 1e-6f);
+  float wt = 0.0f, kept = 0.0f;
+  if (use_hist) {
+    lc_nucleus_hist(logits, ws, V, inv_t, top_p, top_k, min_p,
+                    tg, tgi, hist, sh, tid, nthg, wt, kept);
+  } else {
+    lc_nucleus_stage(logits, ws, V, inv_t, top_p, top_k, min_p, n_iter,
+                     tg, tgi, tid, nthg, wt, kept);
+  }
+  (void)kept;
+  float best = -INFINITY; int bi = -1;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    if (float(ws[i]) >= wt) {
+      const float e = float(logits[i]);
+      const float u = vpipe_hash_u01(seed ^ (i * 2654435761u + 1u));
+      const float g = -log(-log(u + 1e-20f) + 1e-20f);
+      const float score = e * inv_t + g;
+      if (score > best) { best = score; bi = (int)i; }
+    }
+  }
+  tg[tid] = best; tgi[tid] = bi;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  LC_ARGMAX_REDUCE(tg, tgi, tid, nthg);
+  if (tid == 0) { out_id[0] = tgi[0] >= 0 ? tgi[0] : 0; }
+}
+
+// Leviathan-Chen accept-or-residual for ONE draft position. Builds the nucleus
+// distributions of the verifier (p) and the carried drafter (q), then accepts
+// the draft `d` with prob min(1, p(d)/q(d)); on reject it Gumbel-max samples the
+// residual norm(max(0, p - q)), falling back to a draw from p when the residual
+// is empty (matches the host's sample(p) fallback). Output: out_id[0].
+//   0:plogits 1:qlogits 2:out_id 3:V 4:temp 5:top_p 6:seed
+//   7:wsp 8:wsq 9:n_iter 10:top_k 11:min_p 12:draft
+kernel void lc_accept_f16(
+    const device VPIPE_ELT* plogits [[buffer(0)]],
+    const device VPIPE_ELT* qlogits [[buffer(1)]],
+    device int*             out_id  [[buffer(2)]],
+    constant int&           V       [[buffer(3)]],
+    constant float&         temp    [[buffer(4)]],
+    constant float&         top_p   [[buffer(5)]],
+    constant uint&          seed    [[buffer(6)]],
+    device VPIPE_ELT*       wsp     [[buffer(7)]],
+    device VPIPE_ELT*       wsq     [[buffer(8)]],
+    constant int&           n_iter  [[buffer(9)]],
+    constant int&           top_k   [[buffer(10)]],
+    constant float&         min_p   [[buffer(11)]],
+    constant int&           draft   [[buffer(12)]],
+    constant int&           use_hist [[buffer(13)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  threadgroup float tg[256];
+  threadgroup int   tgi[256];
+  threadgroup atomic_uint hist[LC_HIST_B];
+  threadgroup float sh[1];
+  const float inv_t = 1.0f / max(temp, 1e-6f);
+  float wt_p = 0.0f, kept_p = 0.0f, wt_q = 0.0f, kept_q = 0.0f;
+  if (use_hist) {
+    lc_nucleus_hist(plogits, wsp, V, inv_t, top_p, top_k, min_p,
+                    tg, tgi, hist, sh, tid, nthg, wt_p, kept_p);
+    lc_nucleus_hist(qlogits, wsq, V, inv_t, top_p, top_k, min_p,
+                    tg, tgi, hist, sh, tid, nthg, wt_q, kept_q);
+  } else {
+    lc_nucleus_stage(plogits, wsp, V, inv_t, top_p, top_k, min_p, n_iter,
+                     tg, tgi, tid, nthg, wt_p, kept_p);
+    lc_nucleus_stage(qlogits, wsq, V, inv_t, top_p, top_k, min_p, n_iter,
+                     tg, tgi, tid, nthg, wt_q, kept_q);
+  }
+
+  // p(d), q(d) -> accept probability min(1, p/q). All threads read the same
+  // device weights + seed so the accept branch is threadgroup-uniform.
+  const float wpd = float(wsp[draft]);
+  const float wqd = float(wsq[draft]);
+  const float pd = (wpd >= wt_p && kept_p > 0.0f) ? wpd / kept_p : 0.0f;
+  const float qd = (wqd >= wt_q && kept_q > 0.0f) ? wqd / kept_q : 0.0f;
+  const float acc = (qd > 0.0f) ? min(1.0f, pd / qd) : 1.0f;
+  const float u = vpipe_hash_u01(seed);
+  if (u < acc) {                 // accept the draft (uniform branch)
+    if (tid == 0) { out_id[0] = draft; }
+    return;
+  }
+  // reject -> residual Gumbel-max over r_i = max(0, p_i - q_i); track the
+  // p-only argmax in the SAME pass as the empty-residual fallback.
+  const uint rseed = (seed * 2654435761u + 1u);
+  float bR = -INFINITY; int iR = -1;
+  float bP = -INFINITY; int iP = -1;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    const float wp = float(wsp[i]);
+    const float wq = float(wsq[i]);
+    const float pi = (wp >= wt_p && kept_p > 0.0f) ? wp / kept_p : 0.0f;
+    const float qi = (wq >= wt_q && kept_q > 0.0f) ? wq / kept_q : 0.0f;
+    const float uu = vpipe_hash_u01(rseed ^ (i * 2654435761u + 1u));
+    const float g = -log(-log(uu + 1e-20f) + 1e-20f);
+    const float r = pi - qi;
+    if (r > 0.0f) {
+      const float sc = log(r) + g;
+      if (sc > bR) { bR = sc; iR = (int)i; }
+    }
+    if (pi > 0.0f) {
+      const float sc = log(pi) + g;
+      if (sc > bP) { bP = sc; iP = (int)i; }
+    }
+  }
+  tg[tid] = bR; tgi[tid] = iR;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  LC_ARGMAX_REDUCE(tg, tgi, tid, nthg);
+  const int   resid_id   = tgi[0];
+  const bool  have_resid = tgi[0] >= 0;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (have_resid) {
+    if (tid == 0) { out_id[0] = resid_id; }
+    return;
+  }
+  // residual empty -> draw from p (its argmax under the same Gumbel noise).
+  tg[tid] = bP; tgi[tid] = iP;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  LC_ARGMAX_REDUCE(tg, tgi, tid, nthg);
+  if (tid == 0) { out_id[0] = tgi[0] >= 0 ? tgi[0] : 0; }
+}
+
+// Batched twin of lc_sample_f16: ROWS independent rows in ONE dispatch (grid.y
+// = rows), each row its own threadgroup -> the rows run CONCURRENTLY across GPU
+// cores (vs serial single-row dispatches that each leave the memory system
+// under-fed). Per-row logits/ws base = row*V; per-row seed = seeds[row];
+// out_id[row]. ws MUST be sized [rows*V] (disjoint per-row scratch).
+//   0:logits[rows*V] 1:out_id[rows] 2:V 3:temp 4:top_p 5:seeds[rows]
+//   6:ws[rows*V] 7:n_iter 8:top_k 9:min_p
+kernel void lc_sample_batch_f16(
+    const device VPIPE_ELT* logits [[buffer(0)]],
+    device int*             out_id [[buffer(1)]],
+    constant int&           V      [[buffer(2)]],
+    constant float&         temp   [[buffer(3)]],
+    constant float&         top_p  [[buffer(4)]],
+    const device uint*      seeds  [[buffer(5)]],
+    device VPIPE_ELT*       ws     [[buffer(6)]],
+    constant int&           n_iter [[buffer(7)]],
+    constant int&           top_k  [[buffer(8)]],
+    constant float&         min_p  [[buffer(9)]],
+    constant int&           use_hist [[buffer(10)]],
+    uint tid   [[thread_position_in_threadgroup]],
+    uint nthg  [[threads_per_threadgroup]],
+    uint tgrow [[threadgroup_position_in_grid]])
+{
+  threadgroup float tg[256];
+  threadgroup int   tgi[256];
+  threadgroup atomic_uint hist[LC_HIST_B];
+  threadgroup float sh[1];
+  const device VPIPE_ELT* lrow = logits + (ulong)tgrow * (ulong)V;
+  device VPIPE_ELT*       wrow = ws + (ulong)tgrow * (ulong)V;
+  const uint seed = seeds[tgrow];
+  const float inv_t = 1.0f / max(temp, 1e-6f);
+  float wt = 0.0f, kept = 0.0f;
+  if (use_hist) {
+    lc_nucleus_hist(lrow, wrow, V, inv_t, top_p, top_k, min_p,
+                    tg, tgi, hist, sh, tid, nthg, wt, kept);
+  } else {
+    lc_nucleus_stage(lrow, wrow, V, inv_t, top_p, top_k, min_p, n_iter,
+                     tg, tgi, tid, nthg, wt, kept);
+  }
+  (void)kept;
+  float best = -INFINITY; int bi = -1;
+  for (uint i = tid; i < (uint)V; i += nthg) {
+    if (float(wrow[i]) >= wt) {
+      const float e = float(lrow[i]);
+      const float u = vpipe_hash_u01(seed ^ (i * 2654435761u + 1u));
+      const float g = -log(-log(u + 1e-20f) + 1e-20f);
+      const float score = e * inv_t + g;
+      if (score > best) { best = score; bi = (int)i; }
+    }
+  }
+  tg[tid] = best; tgi[tid] = bi;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  LC_ARGMAX_REDUCE(tg, tgi, tid, nthg);
+  if (tid == 0) { out_id[tgrow] = tgi[0] >= 0 ? tgi[0] : 0; }
 }

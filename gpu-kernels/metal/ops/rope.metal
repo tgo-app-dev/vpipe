@@ -208,6 +208,116 @@ kernel void rms_rope3_f16(
   }
 }
 
+// Fused rms_rope3 + ring KV-write (Gemma-4 sliding decode). Same per-head
+// norm+rope as rms_rope3_f16, but the K and V heads write their result STRAIGHT
+// into the contiguous ring cache slot (cache[h*cap + slot, :]) instead of the
+// _d_k/_d_v scratch -- folding the kv_write2 dispatch into the norm kernel (one
+// fewer dependent dispatch per sliding layer). Q is normed+roped in place (read
+// by SDPA). One threadgroup per head (no fan-out), so the write redirect adds
+// zero compute. Sliding/ring layout only; paged-global keeps the split path.
+//   0:q 1:q_w 2:k(in) 3:k_w 4:v(in) 5:v_w 6:inv_freq 7:Hq 8:Hkv 9:D 10:eps
+//   11:offset 12:cache_k 13:cache_v 14:cap 15:pos. grid (RR_TG, Hq+2*Hkv, 1).
+kernel void rms_rope3_kvwrite_f16(
+    device VPIPE_ELT*        q        [[buffer(0)]],
+    const device VPIPE_ELT*  q_weight [[buffer(1)]],
+    const device VPIPE_ELT*  k        [[buffer(2)]],
+    const device VPIPE_ELT*  k_weight [[buffer(3)]],
+    const device VPIPE_ELT*  v        [[buffer(4)]],
+    const device VPIPE_ELT*  v_weight [[buffer(5)]],
+    const device float*      inv_freq [[buffer(6)]],
+    constant int&       Hq       [[buffer(7)]],
+    constant int&       Hkv      [[buffer(8)]],
+    constant int&       D        [[buffer(9)]],
+    constant float&     eps      [[buffer(10)]],
+    constant int&       offset   [[buffer(11)]],
+    device VPIPE_ELT*        cache_k  [[buffer(12)]],
+    device VPIPE_ELT*        cache_v  [[buffer(13)]],
+    constant int&       cap      [[buffer(14)]],
+    constant int&       pos      [[buffer(15)]],
+    constant int&       ring_cap [[buffer(16)]],
+    constant int&       window   [[buffer(17)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  // cap == PHYSICAL head stride (ring modulo + mirror tail). The slot wraps by
+  // the ring modulo; a head slot (slot < window-1) is mirrored into the tail
+  // (slot+ring_cap) so the trailing window reads linearly. ring_cap<=0 ->
+  // linear (slot = pos), no mirror.
+  const uint hh = tid.y;
+  const int mod  = (ring_cap > 0) ? ring_cap : cap;
+  const int slot = pos % mod;
+  const bool mirror = (ring_cap > 0) && (slot < window - 1);
+  const device VPIPE_ELT* xin;
+  device VPIPE_ELT* xout;
+  device VPIPE_ELT* xout_m = nullptr;          // mirror tail dst (K/V only)
+  const device VPIPE_ELT* weight;
+  bool do_rope;
+  if ((int)hh < Hq) {                                  // Q: in place (-> SDPA)
+    xin = q + hh * (uint)D; xout = q + hh * (uint)D;
+    weight = q_weight; do_rope = true;
+  } else if ((int)hh < Hq + Hkv) {                     // K: -> ring cache slot
+    const uint kh = hh - (uint)Hq;
+    xin = k + kh * (uint)D;
+    xout = cache_k + ((uint)kh * (uint)cap + (uint)slot) * (uint)D;
+    if (mirror) {
+      xout_m = cache_k
+          + ((uint)kh * (uint)cap + (uint)(slot + ring_cap)) * (uint)D;
+    }
+    weight = k_weight; do_rope = true;
+  } else {                                             // V: -> ring cache slot
+    const uint vh = hh - (uint)(Hq + Hkv);
+    xin = v + vh * (uint)D;
+    xout = cache_v + ((uint)vh * (uint)cap + (uint)slot) * (uint)D;
+    if (mirror) {
+      xout_m = cache_v
+          + ((uint)vh * (uint)cap + (uint)(slot + ring_cap)) * (uint)D;
+    }
+    weight = v_weight; do_rope = false;
+  }
+
+  const uint lid = ltid.x;
+  const int half_d = D / 2;
+  float local = 0.0f;
+  for (int i = (int)lid; i < D; i += RR_TG) {
+    const float vv = float(xin[i]);
+    local += vv * vv;
+  }
+  local = simd_sum(local);
+  threadgroup float partial[RR_TG / 32];
+  if (simd_lid == 0) { partial[simd_gid] = local; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float p = (simd_lid < RR_TG / 32) ? partial[simd_lid] : 0.0f;
+    p = simd_sum(p);
+    if (simd_lid == 0) { partial[0] = p; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(D) + eps);
+
+  for (int i = (int)lid; i < half_d; i += RR_TG) {
+    const float a = float(xin[i]) * inv * float(weight[i]);
+    const float b = float(xin[i + half_d]) * inv * float(weight[i + half_d]);
+    if (do_rope) {
+      const float angle = float(offset) * inv_freq[i];
+      const float c = cos(angle);
+      const float s = sin(angle);
+      const VPIPE_ELT lo = VPIPE_ELT(a * c - b * s);
+      const VPIPE_ELT hi = VPIPE_ELT(a * s + b * c);
+      xout[i]          = lo;
+      xout[i + half_d] = hi;
+      if (xout_m != nullptr) { xout_m[i] = lo; xout_m[i + half_d] = hi; }
+    } else {
+      const VPIPE_ELT lo = VPIPE_ELT(a);
+      const VPIPE_ELT hi = VPIPE_ELT(b);
+      xout[i]          = lo;
+      xout[i + half_d] = hi;
+      if (xout_m != nullptr) { xout_m[i] = lo; xout_m[i + half_d] = hi; }
+    }
+  }
+}
+
 kernel void rope_f16(
     device VPIPE_ELT*        x        [[buffer(0)]],
     const device float* inv_freq [[buffer(1)]],

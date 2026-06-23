@@ -366,6 +366,11 @@ public:
   // drive greedy speculative decode. Default: unsupported.
   virtual bool supports_mtp() const { return false; }
 
+  // Enable seeding the MTP drafter's KV with the prompt at decode start (a
+  // prefill-throughput vs decode-throughput tradeoff; see MetalQwenModel::
+  // set_mtp_prefix_seed). Default: no-op (only the metal Qwen exec honors it).
+  virtual void set_mtp_prefix_seed(bool on) { (void)on; }
+
   // Speculative decode with the MTP head as the drafter and this model as the
   // verifier. Generates from `first_token` (the prefill's already-decided first
   // token, NOT yet appended), appending up to `max_tokens` total tokens to
