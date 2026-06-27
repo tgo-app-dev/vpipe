@@ -218,6 +218,28 @@ parse_hybrid_fields_(const FlexData::ConstObjectView& root, ModelConfig* out)
   if (root.contains("attn_output_gate")) {
     out->attn_output_gate = root.at("attn_output_gate").as_bool(false);
   }
+
+  // ---- Mixture-of-Experts (Qwen3.5-MoE) ---------------------------
+  // num_experts > 0 switches every layer's MLP to a SparseMoeBlock.
+  if (root.contains("num_experts")) {
+    out->num_experts = static_cast<int>(
+        root.at("num_experts").as_int(0));
+  }
+  if (root.contains("num_experts_per_tok")) {
+    out->num_experts_per_tok = static_cast<int>(
+        root.at("num_experts_per_tok").as_int(0));
+  }
+  if (root.contains("moe_intermediate_size")) {
+    out->moe_intermediate_size = static_cast<int>(
+        root.at("moe_intermediate_size").as_int(0));
+  }
+  if (root.contains("shared_expert_intermediate_size")) {
+    out->shared_expert_inter = static_cast<int>(
+        root.at("shared_expert_intermediate_size").as_int(0));
+  }
+  if (root.contains("norm_topk_prob")) {
+    out->norm_topk_prob = root.at("norm_topk_prob").as_bool(true);
+  }
 }
 
 // Pull Gemma-4 text-family sizing off a config object view. Safe to

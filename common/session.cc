@@ -535,30 +535,44 @@ ext_of_(const string& path)
 }
 
 PipelineHandle
-Session::load_pipeline(string_view path_sv)
+Session::load_pipeline(string_view spec_sv)
 {
-  string path(path_sv);
-  if (path.empty()) {
-    warn(fmt("load_pipeline: empty path"));
+  string input(spec_sv);
+  if (input.empty()) {
+    warn(fmt("load_pipeline: empty input"));
     return HandleAccess::make_pipeline(nullptr);
   }
 
-  auto contents = slurp_file_(path);
-  if (!contents) {
-    warn(fmt("load_pipeline: failed to read '{}'", path));
-    return HandleAccess::make_pipeline(nullptr);
-  }
+  // A leading '{' or '[' (after whitespace) marks an inline JSON spec
+  // document; anything else is a filesystem path to a JSON / binary-
+  // FlexData spec file. Only a path becomes the handle's storage path --
+  // an inline spec has no file to round-trip back to, so a later no-arg
+  // store_pipeline() on it reports "no URL" until one is set.
+  const bool is_inline = looks_like_json_(input);
 
   FlexData spec;
+  string   storage;
   try {
-    if (looks_like_json_(*contents)) {
-      spec = FlexData::from_json(*contents);
+    if (is_inline) {
+      spec = FlexData::from_json(input);
     } else {
-      spec = FlexData::from_binary(*contents);
+      auto contents = slurp_file_(input);
+      if (!contents) {
+        warn(fmt("load_pipeline: failed to read '{}'", input));
+        return HandleAccess::make_pipeline(nullptr);
+      }
+      spec = looks_like_json_(*contents) ? FlexData::from_json(*contents)
+                                         : FlexData::from_binary(*contents);
+      storage = input;
     }
   } catch (const exception& e) {
-    warn(fmt(
-      "load_pipeline: parse failed for '{}': {}", path, e.what()));
+    if (is_inline) {
+      warn(fmt("load_pipeline: parse failed for inline spec: {}",
+               e.what()));
+    } else {
+      warn(fmt("load_pipeline: parse failed for '{}': {}", input,
+               e.what()));
+    }
     return HandleAccess::make_pipeline(nullptr);
   }
 
@@ -570,7 +584,9 @@ Session::load_pipeline(string_view path_sv)
 
   auto impl = make_unique<PipelineHandleImpl>(std::move(pipeline),
                                               this);
-  impl->storage_path(path);
+  if (!storage.empty()) {
+    impl->storage_path(storage);
+  }
   PipelineHandleImpl* raw = impl.get();
   {
     lock_guard<mutex> lk(_pipelines_mu);

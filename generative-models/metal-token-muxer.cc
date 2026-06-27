@@ -36,6 +36,20 @@ MetalTokenMuxer::MetalTokenMuxer(metal_compute::MetalCompute* mc,
   }
 }
 
+MetalTokenMuxer::MetalTokenMuxer(metal_compute::MetalCompute* mc,
+                                 const SharedBuffer* kq, int hidden,
+                                 bool bf16, bool table_is_q4k)
+    : _mc(mc), _hidden(hidden), _q6k(true), _q6k_table(kq)
+{
+  if (mc != nullptr && mc->valid()) {
+    _lib = mc->load_library(bf16 ? "llm_elementwise_bf16" : "llm_elementwise");
+    // The raw-table fetch path (the `_q6k` branch of fetch_text) is identical
+    // for Q4_K and Q6_K -- only the per-row gather kernel differs.
+    _fn = _lib.function(table_is_q4k ? "embed_gather_q4k_f16"
+                                     : "embed_gather_q6k_f16");
+  }
+}
+
 bool
 MetalTokenMuxer::valid() const noexcept
 {

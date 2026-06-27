@@ -2,6 +2,7 @@
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/shared/kernel-autotune.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -236,6 +237,7 @@ MetalGemmaModel::load(const std::string& model_dir,
       && std::getenv("VPIPE_GEMMA_NO_ROPE_KV_FUSE") == nullptr;
   m->_fn_geglu = m->_lib_elt.function("geglu_f16");
   m->_fn_softcap = m->_lib_elt.function("softcap_f16");
+  m->_fn_suppress = m->_lib_elt.function("suppress_logits_f16");
   m->_fn_scale = m->_lib_elt.function("scale_inplace_f16");
   m->_fn_dummy_disp = m->_lib_elt.function("dummy_disp_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
@@ -318,10 +320,21 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_dec_pv      = m->_lib_sdpa.function("sdpa_paged_dec_pv_f16");
   m->_fn_dec_merge   = m->_lib_sdpa.function("sdpa_dec_pv_merge_f16");
   m->_fn_argmax = m->_lib_elt.function("argmax_f16");
+  // Two-stage parallel argmax (optional; single-tg _fn_argmax is the fallback).
+  m->_fn_argmax_partial = m->_lib_elt.function("argmax_partial_f16");
+  m->_fn_argmax_combine = m->_lib_elt.function("argmax_combine_f16");
   // GPU sampler for the pipelined-decode non-greedy path (same kernel as
   // Qwen; dtype-correct via _lib_elt's suffix). Optional: greedy pdecode
   // only needs _fn_argmax.
   m->_fn_sample = m->_lib_elt.function("sample_topp_f16");
+  // Histogram multi-tg sampler (default; _fn_sample is the SAMPLE1 fallback).
+  m->_fn_smp_max_partial   = m->_lib_elt.function("sample_max_partial_f16");
+  m->_fn_smp_max_combine   = m->_lib_elt.function("sample_max_combine_f16");
+  m->_fn_smp_zhist_partial = m->_lib_elt.function("sample_zhist_partial_f16");
+  m->_fn_smp_zhist_combine = m->_lib_elt.function("sample_zhist_combine_f16");
+  m->_fn_smp_thresh        = m->_lib_elt.function("sample_thresh_f16");
+  m->_fn_smp_pick_partial  = m->_lib_elt.function("sample_pick_partial_f16");
+  m->_fn_smp_pick_combine  = m->_lib_elt.function("sample_pick_combine_f16");
   m->_fn_row_scatter = m->_lib_elt.function("row_scatter_f16");
   m->_fn_sdpa_causal = m->_lib_sdpa.function("sdpa_causal_f16");
   m->_fn_sdpa_window = m->_lib_sdpa.function("sdpa_causal_window_f16");
@@ -963,6 +976,184 @@ MetalGemmaModel::config_from(const ModelConfig& c)
   return m;
 }
 
+// Per-machine decode-attention SPLIT autotune (gtile-vec flash-decode). The
+// split count sp trades parallelism against the merge cost; the sweet spot is a
+// GPU property. Two regimes: the GLOBAL (head_dim_full, long-context) layers --
+// where sp pins to the _gtile_split CAP (the flagged D=512 long-context gap) --
+// and the window-bounded SLIDING layers (head_dim_sliding, ~window keys, set by
+// _gtile_kps). Greedy-token-exact safe: the split never changes the output, only
+// how the scan is parallelized. VPIPE_GEMMA_ATTN_AUTOTUNE=0 skips; an explicit
+// VPIPE_GEMMA_GTILE_SPLIT / _KPS (read in load()) is respected (no probe).
+void
+MetalGemmaModel::tune_decode_attn_(TuningReport& rep)
+{
+  if (!_gtile_attn || !_fn_sdpa_gqa_vec.valid()
+      || !_fn_sdpa_gqa_merge.valid()) {
+    return;
+  }
+  if (const char* e = std::getenv("VPIPE_GEMMA_ATTN_AUTOTUNE")) {
+    if (std::atoi(e) == 0) { return; }
+  }
+  const bool split_locked = std::getenv("VPIPE_GEMMA_GTILE_SPLIT") != nullptr;
+  const bool kps_locked   = std::getenv("VPIPE_GEMMA_GTILE_KPS") != nullptr;
+  if (split_locked && kps_locked) { return; }
+  const bool log = std::getenv("VPIPE_GEMMA_AUTOTUNE_LOG") != nullptr;
+
+  const Config& c = _cfg;
+  const int Hq = c.n_heads, Hkv = c.n_kv_heads;
+  if (Hkv <= 0 || Hq % Hkv != 0) { return; }
+  const int G = Hq / Hkv;
+  const int Dg = c.head_dim_full, Ds = c.head_dim_sliding;
+  const bool global_ok  = (Dg % 128 == 0);     // gtile-vec needs D % 128 == 0
+  const bool sliding_ok = (Ds % 128 == 0);
+  if (!global_ok && !sliding_ok) { return; }
+
+  // Synthetic q[Hq,D] attends a contiguous KV pool [Hkv,cap,D]. Buffers sized
+  // for the largest regime (global D, long T_kv, sp cap 256 -- matching the
+  // decode partials below); uninitialised values are fine (timing only).
+  const int kProbeTg = 16384;                  // long-context global probe
+  const int win = (c.sliding_window > 0) ? c.sliding_window : 512;
+  const int Dmax = (Dg > Ds) ? Dg : Ds;
+  const int sp_max = 256;
+  const std::size_t qb = (std::size_t)Hq * Dmax * 2;
+  const std::size_t kvg = (std::size_t)Hkv * kProbeTg * Dg * 2;
+  metal_compute::SharedBuffer q  = _mc->make_shared_buffer(qb);
+  metal_compute::SharedBuffer kp = _mc->make_shared_buffer(kvg);
+  metal_compute::SharedBuffer vp = _mc->make_shared_buffer(kvg);
+  metal_compute::SharedBuffer oacc =
+      _mc->make_shared_buffer((std::size_t)Hq * sp_max * Dmax * sizeof(float));
+  metal_compute::SharedBuffer mm =
+      _mc->make_shared_buffer((std::size_t)Hq * sp_max * sizeof(float));
+  metal_compute::SharedBuffer ll =
+      _mc->make_shared_buffer((std::size_t)Hq * sp_max * sizeof(float));
+  metal_compute::SharedBuffer at = _mc->make_shared_buffer(qb);
+  if (q.empty() || kp.empty() || vp.empty() || oacc.empty() || mm.empty()
+      || ll.empty() || at.empty()) {
+    return;
+  }
+
+  // One gtile-vec flash-decode + merge at (D, T_kv, window, cap, sp).
+  auto encode = [&](metal_compute::ComputeEncoder& enc, int D, int T_kv,
+                    int window, int cap, int sp) {
+    const float scale = 1.0f / std::sqrt((float)D);
+    enc.set_function(_fn_sdpa_gqa_vec);
+    enc.set_buffer(0, q);
+    enc.set_buffer(1, kp);
+    enc.set_buffer(2, vp);
+    enc.set_buffer(3, oacc);
+    enc.set_buffer(4, mm);
+    enc.set_buffer(5, ll);
+    enc.set_constant(6, scale);
+    enc.set_constant(7, T_kv);
+    enc.set_constant(8, D);
+    enc.set_constant(9, Hq);
+    enc.set_constant(10, Hkv);
+    enc.set_constant(11, T_kv - 1);            // q_offset (kv_off)
+    enc.set_constant(12, cap);                 // kv_stride (head stride)
+    enc.set_constant(13, window);
+    enc.set_constant(14, 0);                   // ring_cap (0 = linear)
+    enc.set_constant(15, sp);
+    enc.dispatch({32, (unsigned)Hq, (unsigned)sp}, {32, (unsigned)G, 1});
+    enc.set_function(_fn_sdpa_gqa_merge);
+    enc.set_buffer(0, oacc);
+    enc.set_buffer(1, mm);
+    enc.set_buffer(2, ll);
+    enc.set_buffer(3, at);
+    enc.set_constant(4, D);
+    enc.set_constant(5, sp);
+    enc.set_constant(6, Hq);
+    enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+  };
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::string detail;
+
+  // GLOBAL long-context: pick the split CAP (_gtile_split).
+  if (global_ok && !split_locked) {
+    const int cand[] = {64, 128, 192, 256};
+    auto bench = [&](int i) -> double {
+      return autotune_time(_mc, 2, [&](metal_compute::ComputeEncoder& enc) {
+        encode(enc, Dg, kProbeTg, 0, kProbeTg, cand[i]);
+      });
+    };
+    std::vector<double> us;
+    const int w = autotune_vote(4, 3, 2, bench, &us);
+    // On a GPU that already saturates at the default split the candidates are
+    // near-equivalent (~noise), so the per-round winner flips run-to-run. Move
+    // the cap only on a LARGE (>15%) clear win -- a genuine per-machine signal
+    // (e.g. more cores / matrix units favouring a different split), never noise.
+    int def_idx = 1;
+    for (int i = 0; i < 4; ++i) { if (cand[i] == _gtile_split) { def_idx = i; } }
+    const bool moved = (cand[w] != _gtile_split) && (us[w] < 0.85 * us[def_idx]);
+    if (moved) { _gtile_split = cand[w]; }
+    detail += "split=" + std::to_string(_gtile_split)
+        + (moved ? "" : "(def)");
+    if (log) {
+      std::string line = "[gemma] decode-attn global split:";
+      for (int i = 0; i < 4; ++i) {
+        char bb[40];
+        std::snprintf(bb, sizeof(bb), " sp%d=%.0fus", cand[i], us[i]);
+        line += bb;
+      }
+      std::fprintf(stderr, "%s -> %d%s\n", line.c_str(), _gtile_split,
+                   moved ? "" : " (kept default)");
+    }
+  }
+
+  // SLIDING window: the window-bounded layers scan only ~`win` keys, so the
+  // split is usually in the noise floor (the kernel-launch + merge cost
+  // dominates). Probe it, but only move _gtile_kps off its robust default when a
+  // candidate CLEARLY wins -- noise must not drive a mid-context regression
+  // (_gtile_kps also sets sp for moderate global scans). _gtile_kps = round(win
+  // / sp) reproduces the chosen split via the model's sp = ceil(scan/_gtile_kps).
+  if (sliding_ok && !kps_locked) {
+    const int cand[] = {8, 16, 32, 64};
+    auto bench = [&](int i) -> double {
+      return autotune_time(_mc, 3, [&](metal_compute::ComputeEncoder& enc) {
+        encode(enc, Ds, win, win, win, cand[i]);
+      });
+    };
+    std::vector<double> us;
+    const int w = autotune_vote(4, 3, 3, bench, &us);
+    const int best_sp = cand[w];
+    // The current default's split (sp = ceil(win/_gtile_kps)); keep it unless
+    // the winner beats that candidate's time by a clear (>8%) margin.
+    const int def_sp = (win + _gtile_kps - 1) / _gtile_kps;
+    int def_idx = 1;
+    for (int i = 0; i < 4; ++i) { if (cand[i] == def_sp) { def_idx = i; } }
+    // ~512-key scan sits in the launch/merge noise floor (run-to-run spread seen
+    // up to ~11%); require a LARGE (>20%) margin so only a genuine per-machine
+    // signal -- never noise -- moves kps off its robust default.
+    bool changed = false;
+    if (best_sp != def_sp && us[w] < 0.80 * us[def_idx]) {
+      int kps = (win + best_sp / 2) / best_sp;
+      _gtile_kps = (kps < 1) ? 1 : (kps > 64 ? 64 : kps);
+      changed = true;
+    }
+    if (!detail.empty()) { detail += "/"; }
+    detail += "kps=" + std::to_string(_gtile_kps)
+        + (changed ? "" : "(def)");
+    if (log) {
+      std::string line = "[gemma] decode-attn sliding split:";
+      for (int i = 0; i < 4; ++i) {
+        char bb[40];
+        std::snprintf(bb, sizeof(bb), " sp%d=%.0fus", cand[i], us[i]);
+        line += bb;
+      }
+      std::fprintf(stderr, "%s -> sp=%d kps=%d%s\n", line.c_str(), best_sp,
+                   _gtile_kps, changed ? "" : " (kept default; within noise)");
+    }
+  }
+
+  const double ms = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count() * 1e3;
+  rep.add("gemma-decode-attn", ms, detail);
+  if (log) {
+    std::fprintf(stderr, "[gemma] decode-attn tuning %.0fms -> %s\n", ms,
+                 detail.c_str());
+  }
+}
+
 bool
 MetalGemmaModel::ensure_scratch_()
 {
@@ -1029,6 +1220,22 @@ MetalGemmaModel::ensure_scratch_()
   _d_logits = b(c.vocab);
   _d_tok = _mc->make_shared_buffer(sizeof(std::int32_t));
   _d_argmax_id = _mc->make_shared_buffer(sizeof(std::int32_t));
+  // [2*kArgmaxM] f32 (val,idx) partials for the two-stage argmax.
+  _d_argmax_part =
+      _mc->make_shared_buffer((std::size_t)2 * kArgmaxM * sizeof(float));
+  // Histogram-sampler scratch (multi-tg sample_*_f16). Shared across pdecode
+  // steps; the per-context event serialises them on the GPU. Sizes derive from
+  // kSampM (stage-1 tgs) and kSampB (bins); kSampB MUST match the .metal value.
+  _d_smp_maxpart =
+      _mc->make_shared_buffer((std::size_t)kSampM * sizeof(float));
+  _d_smp_hpart = _mc->make_shared_buffer(
+      (std::size_t)kSampM * (2 * kSampB + 1) * sizeof(float));
+  _d_smp_hist =
+      _mc->make_shared_buffer((std::size_t)(2 * kSampB + 1) * sizeof(float));
+  _d_smp_maxl = _mc->make_shared_buffer(sizeof(float));
+  _d_smp_wt   = _mc->make_shared_buffer(sizeof(float));
+  _d_smp_pickpart =
+      _mc->make_shared_buffer((std::size_t)2 * kSampM * sizeof(float));
   _d_dummy = _mc->make_shared_buffer(256 * 2);   // DUMMY_DISP scratch (f16)
   // Page table for the FULL-layer paged attention: max_pages triplets per
   // slot. kPgtabSlots slots form a ring so run-ahead pdecode (depth<=4) gives
@@ -1037,6 +1244,16 @@ MetalGemmaModel::ensure_scratch_()
   if (_full_paged) {
     _d_pgtab = _mc->make_shared_buffer(
         (std::size_t)kPgtabSlots * _ctx->max_pages() * 3 * sizeof(std::int32_t));
+  }
+  // Autotune the decode-attention split for THIS GPU first -- the partials
+  // below derive from _gtile_split, so the probe must set it beforehand.
+  if (_gtile_attn || _gqa_attn || _pgqa_attn) {
+    TuningReport tuning;
+    tune_decode_attn_(tuning);
+    if (std::getenv("VPIPE_GEMMA_AUTOTUNE_LOG") && !tuning.empty()) {
+      std::fprintf(stderr, "[gemma] load-time kernel tuning %dms: %s\n",
+                   (int)(tuning.total_ms() + 0.5), tuning.summary().c_str());
+    }
   }
   // Split-decode partials (f32): O [Hq,split,D], m/l [Hq,split]. Shared by the
   // opt-in sliding GQA (D<=256) and the global threadgroup-staged flash-decode
@@ -2169,6 +2386,31 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_constant(3, c.final_softcap);
     enc.dispatch({(unsigned)c.vocab, 1, 1}, {256, 1, 1});
   }
+  // Ban suppressed tokens (realtime thinking-channel suppression) -- AFTER
+  // the softcap so the cap can't pull them back. Covers single-token decode
+  // + pdecode (which run through encode_step_); the prefill chunk masks its
+  // own local logits buffer separately.
+  encode_suppress_(enc, _d_logits, c.vocab);
+}
+
+void
+MetalGemmaModel::encode_suppress_(ComputeEncoder& enc,
+                                  const SharedBuffer& logits, int vocab)
+{
+  // Mask the banned ids to the far-negative sentinel so neither the host
+  // read-back, the GPU argmax, nor the GPU sampler can pick them (the sampler
+  // does exp(logit - max), so a far-negative logit -> ~0 weight). Tiny
+  // dispatch (one thread per banned id); skipped when nothing is suppressed.
+  if (_n_suppress <= 0 || !_fn_suppress.valid() || _d_suppress_ids.empty()) {
+    return;
+  }
+  enc.set_function(_fn_suppress);
+  enc.set_buffer(0, logits);
+  enc.set_buffer(1, _d_suppress_ids);
+  enc.set_constant(2, _n_suppress);
+  enc.set_constant(3, vocab);
+  enc.dispatch({(unsigned)_n_suppress, 1, 1},
+               {(unsigned)std::min(_n_suppress, 64), 1, 1});
 }
 
 // ---------------------------------------------------------------------
@@ -2719,6 +2961,141 @@ MetalGemmaModel::forward(ContextId cid, std::int32_t token_id, int rope_pos)
   return out;
 }
 
+// Encode a greedy argmax of _d_logits into out[out_off]. Two-stage when the
+// argmax_partial/combine kernels + partials scratch are present (the 262k read
+// parallelised across kArgmaxM cores; ~17x the single-tg scan in isolation,
+// token-exact), else the single-tg _fn_argmax. See header.
+void
+MetalGemmaModel::encode_argmax_(metal_compute::ComputeEncoder& enc,
+                                const metal_compute::SharedBuffer& out,
+                                std::size_t out_off, int vocab)
+{
+  // VPIPE_GEMMA_ARGMAX1=1 forces the single-tg argmax (A/B against two-stage).
+  static const bool kForce1 = std::getenv("VPIPE_GEMMA_ARGMAX1") != nullptr;
+  if (!kForce1 && _fn_argmax_partial.valid() && _fn_argmax_combine.valid()
+      && !_d_argmax_part.empty()) {
+    enc.set_function(_fn_argmax_partial);
+    enc.set_buffer(0, _d_logits);
+    enc.set_buffer(1, _d_argmax_part);
+    enc.set_constant(2, vocab);
+    enc.set_constant(3, kArgmaxM);
+    enc.dispatch({(unsigned)(256 * kArgmaxM), 1, 1}, {256, 1, 1});
+    enc.set_function(_fn_argmax_combine);
+    enc.set_buffer(0, _d_argmax_part);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, kArgmaxM);
+    enc.dispatch({256, 1, 1}, {256, 1, 1});
+  } else {
+    enc.set_function(_fn_argmax);
+    enc.set_buffer(0, _d_logits);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, vocab);
+    enc.dispatch({256, 1, 1}, {256, 1, 1});
+  }
+}
+
+// Encode the GPU sampler over _d_logits into out[out_off]. Histogram multi-tg
+// path (sample_*_f16) by default; VPIPE_GEMMA_SAMPLE1=1 (or missing kernels /
+// scratch) falls back to the single-tg _fn_sample. See header.
+void
+MetalGemmaModel::encode_sample_(metal_compute::ComputeEncoder& enc,
+                                const metal_compute::SharedBuffer& out,
+                                std::size_t out_off,
+                                const metal_compute::SharedBuffer& ws,
+                                const metal_compute::SharedBuffer& seen,
+                                const GpuSamplerParams& sp,
+                                std::uint32_t step_seed, int vocab)
+{
+  static const bool kForce1 = std::getenv("VPIPE_GEMMA_SAMPLE1") != nullptr;
+  const bool hist_ok =
+      _fn_smp_max_partial.valid() && _fn_smp_max_combine.valid() &&
+      _fn_smp_zhist_partial.valid() && _fn_smp_zhist_combine.valid() &&
+      _fn_smp_thresh.valid() && _fn_smp_pick_partial.valid() &&
+      _fn_smp_pick_combine.valid() && !_d_smp_hpart.empty();
+  if (kForce1 || !hist_ok) {
+    enc.set_function(_fn_sample);
+    enc.set_buffer(0, _d_logits);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, vocab);
+    enc.set_constant(3, sp.temperature);
+    enc.set_constant(4, sp.top_p);
+    enc.set_constant(5, step_seed);
+    enc.set_buffer(6, ws);
+    enc.set_constant(7, sp.n_iter);
+    enc.set_constant(8, sp.repetition_penalty);
+    enc.set_constant(9, sp.presence_penalty);
+    enc.set_constant(10, sp.top_k);
+    enc.set_constant(11, sp.min_p);
+    enc.set_buffer(12, seen);
+    enc.dispatch({256, 1, 1}, {256, 1, 1});
+    return;
+  }
+  const int M = kSampM;
+  const float rep = sp.repetition_penalty, pres = sp.presence_penalty;
+  // Pass A: max of penalised eff (partial -> combine).
+  enc.set_function(_fn_smp_max_partial);
+  enc.set_buffer(0, _d_logits);
+  enc.set_buffer(1, _d_smp_maxpart);
+  enc.set_constant(2, vocab);
+  enc.set_constant(3, M);
+  enc.set_constant(4, rep);
+  enc.set_constant(5, pres);
+  enc.set_buffer(6, seen);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_max_combine);
+  enc.set_buffer(0, _d_smp_maxpart);
+  enc.set_buffer(1, _d_smp_maxl);
+  enc.set_constant(2, M);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Pass B: ws + partial Z + per-tg histogram, then combine.
+  enc.set_function(_fn_smp_zhist_partial);
+  enc.set_buffer(0, _d_logits);
+  enc.set_buffer(1, ws);
+  enc.set_buffer(2, _d_smp_hpart);
+  enc.set_constant(3, vocab);
+  enc.set_constant(4, M);
+  enc.set_constant(5, sp.temperature);
+  enc.set_constant(6, rep);
+  enc.set_constant(7, pres);
+  enc.set_buffer(8, seen);
+  enc.set_buffer(9, _d_smp_maxl);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_zhist_combine);
+  enc.set_buffer(0, _d_smp_hpart);
+  enc.set_buffer(1, _d_smp_hist);
+  enc.set_constant(2, M);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Threshold scan over the bins (single tg, cheap).
+  enc.set_function(_fn_smp_thresh);
+  enc.set_buffer(0, _d_smp_hist);
+  enc.set_buffer(1, _d_smp_wt);
+  enc.set_constant(2, sp.top_p);
+  enc.set_constant(3, sp.top_k);
+  enc.set_constant(4, sp.min_p);
+  enc.set_constant(5, vocab);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Pass C: Gumbel-max pick over the nucleus (partial -> combine, sets seen).
+  enc.set_function(_fn_smp_pick_partial);
+  enc.set_buffer(0, _d_logits);
+  enc.set_buffer(1, ws);
+  enc.set_buffer(2, _d_smp_pickpart);
+  enc.set_constant(3, vocab);
+  enc.set_constant(4, M);
+  enc.set_constant(5, sp.temperature);
+  enc.set_constant(6, step_seed);
+  enc.set_constant(7, rep);
+  enc.set_constant(8, pres);
+  enc.set_buffer(9, seen);
+  enc.set_buffer(10, _d_smp_wt);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_pick_combine);
+  enc.set_buffer(0, _d_smp_pickpart);
+  enc.set_buffer(1, out, out_off);
+  enc.set_constant(2, M);
+  enc.set_buffer(3, seen);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+}
+
 std::int32_t
 MetalGemmaModel::decode_step_fast(ContextId cid, std::int32_t token_id,
                                   int rope_pos)
@@ -2745,14 +3122,12 @@ MetalGemmaModel::decode_step_fast(ContextId cid, std::int32_t token_id,
     ComputeEncoder enc = stream.begin_compute();
     encode_step_(enc, cm, kv_off);   // writes _d_logits
     // On-GPU greedy argmax -> _d_argmax_id (no full [vocab] host pull).
-    // softcap is monotonic, so argmax is unaffected by it. Single-TG: the
-    // 262k-vocab scan is small (~25us) and a two-pass parallel argmax
-    // regressed (dispatch overhead > scan savings) -- measured, reverted.
-    enc.set_function(_fn_argmax);
-    enc.set_buffer(0, _d_logits);
-    enc.set_buffer(1, _d_argmax_id);
-    enc.set_constant(2, c.vocab);
-    enc.dispatch({256, 1, 1}, {256, 1, 1});
+    // softcap is monotonic, so argmax is unaffected by it. Two-stage parallel
+    // argmax (encode_argmax_): the 262k-vocab read is split across kArgmaxM
+    // cores -- ~17x the single-tg scan in isolation, token-exact. (An EARLIER
+    // two-pass attempt without simd reduction regressed; the simd_max/min
+    // partials win on the M5 matrix-core GPU -- re-measured here.)
+    encode_argmax_(enc, _d_argmax_id, 0, c.vocab);
     n_disp = enc.dispatch_count();
   }
   // FEASIBILITY PROBE (VPIPE_GEMMA_PLE_PROBE): fire ~1.1 ms of INDEPENDENT
@@ -2905,29 +3280,12 @@ MetalGemmaModel::pdecode_commit(ContextId cid)
     // Sample/argmax the (softcapped) logits into gen_ids[out_idx], on-GPU.
     const std::size_t out_off = (std::size_t)out_idx * sizeof(std::int32_t);
     if (pd.sp.greedy) {
-      enc.set_function(_fn_argmax);
-      enc.set_buffer(0, _d_logits);
-      enc.set_buffer(1, pd.gen_ids, out_off);
-      enc.set_constant(2, c.vocab);
-      enc.dispatch({256, 1, 1}, {256, 1, 1});
+      encode_argmax_(enc, pd.gen_ids, out_off, c.vocab);
     } else {
       const std::uint32_t step_seed = (std::uint32_t)(
           pd.sp.seed + 0x9e3779b9ull * (std::uint64_t)(s + 1));
-      enc.set_function(_fn_sample);
-      enc.set_buffer(0, _d_logits);
-      enc.set_buffer(1, pd.gen_ids, out_off);
-      enc.set_constant(2, c.vocab);
-      enc.set_constant(3, pd.sp.temperature);
-      enc.set_constant(4, pd.sp.top_p);
-      enc.set_constant(5, step_seed);
-      enc.set_buffer(6, pd.sample_ws);
-      enc.set_constant(7, pd.sp.n_iter);
-      enc.set_constant(8, pd.sp.repetition_penalty);
-      enc.set_constant(9, pd.sp.presence_penalty);
-      enc.set_constant(10, pd.sp.top_k);
-      enc.set_constant(11, pd.sp.min_p);
-      enc.set_buffer(12, pd.seen);
-      enc.dispatch({256, 1, 1}, {256, 1, 1});
+      encode_sample_(enc, pd.gen_ids, out_off, pd.sample_ws, pd.seen,
+                     pd.sp, step_seed, c.vocab);
     }
   }
   pd.stream.encode_signal(pd.ev, s + 1);
@@ -4033,6 +4391,10 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.set_constant(3, c.final_softcap);
         enc.dispatch({(unsigned)c.vocab, 1, 1}, {256, 1, 1});
       }
+      // Ban suppressed tokens on the prefill's last-token logits too, so the
+      // FIRST predicted token (this chunk's argmax / the realtime describe's
+      // opener) can't be a reasoning-channel token. Same mask as decode.
+      encode_suppress_(enc, logits, c.vocab);
     }
   }
   stream.commit().wait();
@@ -4112,6 +4474,24 @@ MetalGemmaModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
     if (out.empty()) { return {}; }
   }
   return out;
+}
+
+void
+MetalGemmaModel::set_suppressed_tokens(std::span<const std::int32_t> ids)
+{
+  // A handful at most (the reasoning-channel open tokens). Uploaded once to a
+  // small device buffer; encode_step_ masks _d_logits at these ids after the
+  // softcap (suppress_logits_f16).
+  constexpr int kMaxSuppress = 16;
+  int n = (int)ids.size();
+  if (n > kMaxSuppress) { n = kMaxSuppress; }
+  if (n <= 0 || _mc == nullptr) { _n_suppress = 0; return; }
+  _d_suppress_ids =
+      _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
+  if (_d_suppress_ids.empty()) { _n_suppress = 0; return; }
+  std::memcpy(_d_suppress_ids.contents(), ids.data(),
+              (std::size_t)n * sizeof(std::int32_t));
+  _n_suppress = n;
 }
 
 std::vector<float>

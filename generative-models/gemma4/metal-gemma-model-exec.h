@@ -77,6 +77,11 @@ public:
 
   void set_eval_per_layer(bool) noexcept override {}
 
+  void set_suppressed_tokens(std::span<const std::int32_t> ids) override
+  {
+    if (_model != nullptr) { _model->set_suppressed_tokens(ids); }
+  }
+
 private:
   std::unique_ptr<MetalGemmaModel> _model;
   std::vector<float>               _logits;

@@ -21,6 +21,9 @@
 #include "generative-models/context-manager.h"   // ContextId, ContextManager
 #include "generative-models/metal-token-muxer.h"
 #include "generative-models/model-exec.h"         // GpuSamplerParams
+#include "generative-models/shared/kernel-autotune.h"  // TuningReport
+#include "generative-models/shared/kernel-sets/decode-gqa-attn-set.h"
+#include "generative-models/shared/kernel-sets/prefill-gqa-attn-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -103,6 +106,19 @@ public:
     int   gdn_k_dim       = 128;
     int   gdn_v_dim       = 128;
     bool  tie_embeddings  = true;
+    // Mixture-of-Experts (Qwen3.5-MoE). n_experts > 0 replaces every
+    // layer's dense MLP with a SparseMoeBlock: softmax router (mlp.gate,
+    // w8) over all n_experts -> top_k -> score-weighted sum of the
+    // selected experts' MLPs (mlp.switch_mlp, batched 3D w4, inner=
+    // moe_inner) + a sigmoid-gated always-on shared expert
+    // (mlp.shared_expert, dense w4, inner=moe_shared_inner). The
+    // GDN+full-attn backbone is unchanged. 0 for dense / non-MoE models.
+    int   n_experts        = 0;       // total experts (256)
+    int   top_k            = 0;       // num_experts_per_tok (8)
+    int   moe_inner        = 0;       // per-expert intermediate (512)
+    int   moe_shared_inner = 0;       // shared-expert intermediate (512)
+    bool  moe_norm_topk    = true;    // renorm top-k weights
+    bool  is_moe() const { return n_experts > 0; }
     // Element/compute dtype: false = f16 (default), true = bf16. bf16
     // loads the *_bf16 kernel metallibs and keeps the checkpoint's bf16
     // scales/norms/conv raw (no load-time conversion).
@@ -442,6 +458,40 @@ private:
   // Allocate the reused decode scratch buffers (lazy, first decode).
   bool ensure_decode_scratch_();
 
+  // Lazily allocate the two-stage-argmax + histogram-sampler scratch (mirrors
+  // MetalGemmaModel::ensure_scratch_'s _d_argmax_part/_d_smp_*). Allocated ONCE
+  // and reused across every decode path (single-stream, pdecode, batched,
+  // MTP/verify): the serial command encoder serialises the WAR hazard on the
+  // shared scratch, so no per-branch copy is needed. Independent of
+  // ensure_decode_scratch_/ensure_bscratch_ so the MTP heads (which use their
+  // own vlogits) get it too.
+  bool ensure_sampler_scratch_();
+
+  // Two-stage parallel argmax (argmax_partial -> argmax_combine) over
+  // logits[logits_off .. +vocab], lowest-index tie-break, writing the id to
+  // out[out_off]. Falls back to the single-tg _fn_argmax (VPIPE_QWEN_ARGMAX1=1
+  // or missing kernels/scratch). Token/bit-exact vs the single-tg path.
+  void encode_argmax_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& logits,
+                      std::size_t logits_off,
+                      const metal_compute::SharedBuffer& out,
+                      std::size_t out_off, int vocab);
+
+  // Histogram multi-tg sampler core (sample_*_f16) over logits[logits_off ..],
+  // writing the chosen id to out[out_off] and updating seen[seen_off..].
+  // Deterministic (integer-atomic histogram). Falls back to the single-tg
+  // _fn_sample (VPIPE_QWEN_SAMPLE1=1 or missing kernels/scratch).
+  void encode_sample_core_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& logits,
+                           std::size_t logits_off,
+                           const metal_compute::SharedBuffer& out,
+                           std::size_t out_off,
+                           const metal_compute::SharedBuffer& sample_ws,
+                           std::size_t ws_off,
+                           const metal_compute::SharedBuffer& seen,
+                           std::size_t seen_off, const GpuSamplerParams& sp,
+                           std::uint32_t step_seed, int vocab);
+
   // Encode one decode token's layer stack + final norm + lm_head into
   // `enc`, reading the residual stream `_d_x` (the caller fills it with
   // the token embedding -- host memcpy in forward(), in-stream gather in
@@ -546,6 +596,10 @@ private:
         mixqkv, zbuf, abuf, bbuf, convout, gbuf, betabuf, ygdn, normout, sg,
         upb,   // mixed-precision MLP: de-fused up_proj (gate -> sg, up -> upb)
         logits;
+    // MoE batched scratch (N branches; npair = N*top_k). Mirrors the prefill
+    // MoE temps. Allocated only when _cfg.is_moe().
+    metal_compute::SharedBuffer moe_logits, moe_eid, moe_w, moe_act, moe_part,
+        moe_out, moe_ssg, moe_sout, moe_gate;
     metal_compute::SharedBuffer pgt;             // [N * max_pages * 3] int32
     metal_compute::SharedBuffer tok_in;          // [N] int32 (embed gather in)
     metal_compute::SharedBuffer argmax_id;       // [N] int32 (greedy out)
@@ -556,6 +610,8 @@ private:
   bool ensure_bscratch_(BScratch& bs, int n);
   BScratch _bdec;   // cached batched-decode scratch (reused across steps)
 
+  struct Layer;     // defined below; fwd-declared for encode_moe_mlp_ (ref arg)
+
   // Size-based quantized-matmul entrance: y[M,Nout] = x[M,K] @ dequant(w)^T,
   // picking the kernel by the row count M (what MLX's quantized_matmul does
   // internally; the raw metal path needs it explicit). M==1 -> qmv (matvec);
@@ -564,6 +620,46 @@ private:
   // 8-bit weights have no batched-GEMV -> qmv (M==1) / steel. This is THE
   // place the batched decode adapts to the (shrinking) active branch count.
   static constexpr int kQmvBatchMaxRows = 8;
+  // MoE grouped-GEMM GEMV->steel crossover (prefill row count above which the
+  // matrix-tiled steel expert GEMM beats the bandwidth GEMV). Machine-dependent
+  // (matrix cores shift it down); default 1024, VPIPE_QWEN_MOE_STEEL_MIN sets
+  // it, and a future per-machine probe can resolve it at load.
+  int _moe_steel_min = 1024;
+  // Grouped-prefill scratch (counting sort by expert + segmented MAXM-batched
+  // expert GEMV). When passed to encode_moe_mlp_ the expert compute reads each
+  // expert's weight once per MAXM-row tile instead of once per routed token.
+  struct MoeGrouped {
+    const metal_compute::SharedBuffer *hist = nullptr, *boff = nullptr,
+        *curs = nullptr, *t2e = nullptr, *ntile = nullptr, *srow = nullptr,
+        *sdst = nullptr, *gact = nullptr, *gdout = nullptr;
+    int npad = 0, maxtiles = 0, maxm = 4;
+    // steel: matrix-tiled grouped GEMM (BM=maxm=32 tiles) for large prefill;
+    // else the bandwidth GEMV grouping (maxm=2). The steel tier fuses the
+    // row-gather into the gate|up load and the scatter into the down store.
+    bool steel = false;
+    // Timing-only ablation toggles (VPIPE_MOE_ABL=sort,gs,gemm,shared): skip a
+    // component to measure its prefill cost. Output is garbage -- bench only.
+    bool abl_sort = false, abl_gs = false, abl_gemm = false, abl_shared = false;
+  };
+  // Mixture-of-Experts MLP for M rows (Qwen3.5-MoE), shared by the batched
+  // decode path (M=N branches). Router(w8) -> per-row top-k route -> expert
+  // gate|up+SwiGLU -> down -> weighted combine + sigmoid-gated shared expert;
+  // finalize adds both into the residual x (in-place). M==1 uses the qmv
+  // router/shared, M>1 the steel GEMM. All buffers caller-owned. When `grp` is
+  // non-null the expert compute uses the grouped (sorted) path.
+  void encode_moe_mlp_(metal_compute::ComputeEncoder& enc, const Layer& ly,
+                       int M, const metal_compute::SharedBuffer& x,
+                       const metal_compute::SharedBuffer& hn,
+                       const metal_compute::SharedBuffer& logits,
+                       const metal_compute::SharedBuffer& eid,
+                       const metal_compute::SharedBuffer& w,
+                       const metal_compute::SharedBuffer& act,
+                       const metal_compute::SharedBuffer& part,
+                       const metal_compute::SharedBuffer& moe_out,
+                       const metal_compute::SharedBuffer& ssg,
+                       const metal_compute::SharedBuffer& sout,
+                       const metal_compute::SharedBuffer& gate,
+                       const MoeGrouped* grp = nullptr);
   void qmm_auto_(metal_compute::ComputeEncoder& enc, int m,
                  const metal_compute::SharedBuffer& w,
                  const metal_compute::SharedBuffer& s,
@@ -656,6 +752,20 @@ private:
     // MLP (every layer): fused interleaved gate/up + down.
     metal_compute::SharedBuffer guw, gus, gub, dw, ds, db;
 
+    // ---- Mixture-of-Experts weights (Qwen3.5-MoE, iff _cfg.is_moe()) ------
+    // Replaces the dense MLP above. Router (mlp.gate): w8 affine [E, H].
+    // Experts (mlp.switch_mlp): batched 3D w4 affine -- gate|up fused
+    // interleaved [E, 2*moe_inner, H], down [E, H, moe_inner]. Shared expert
+    // (mlp.shared_expert): dense w4 gate|up interleaved [2*shared_inner, H] +
+    // down [H, shared_inner], sigmoid-gated by mlp.shared_expert_gate
+    // (w8 [1, H]). All affine group_size 64.
+    metal_compute::SharedBuffer rgw, rgs, rgb;     // router gate (w8) [E,H]
+    metal_compute::SharedBuffer eguw, egus, egub;  // experts gate|up (w4) [E,2I,H]
+    metal_compute::SharedBuffer edw, eds, edb;     // experts down (w4) [E,H,I]
+    metal_compute::SharedBuffer sguw, sgus, sgub;  // shared gate|up (w4) [2S,H]
+    metal_compute::SharedBuffer sdw, sds, sdb;     // shared down (w4) [H,S]
+    metal_compute::SharedBuffer segw, segs, segb;  // shared_expert_gate (w8) [1,H]
+
     // ---- Mixed-precision affine (OptiQ) -------------------------------
     // Heterogeneous per-tensor bit-width (4 or 8 affine) across one model
     // (mlx-optiq sensitivity quant). Used iff the model is _mixed; the
@@ -690,6 +800,19 @@ private:
        kqkv_t = KQ::kNone, kqz_t = KQ::kNone, kqout_t = KQ::kNone,
        kqgate_t = KQ::kNone, kqup_t = KQ::kNone, kqdown_t = KQ::kNone;
     int kqk_n = 0;   // rows in the fused q|k buffer (2*qd + kd)
+
+    // ---- Q4_K -> affine-g32 decode repack (VPIPE_QWEN_Q4K_AFFINE) -------
+    // The native qmv_q4k is ~1.9x slower than the affine qmv (its hierarchical
+    // scale unpack is the bottleneck). When enabled, Q4_K MLP gate/up are
+    // losslessly repacked at load to the affine-4bit-g32 form (scale=d*sub,
+    // bias=-dmin*min) and decode dispatches affine_qmv_w4g32. The raw kq*
+    // buffers are kept (prefill's dequant->GEMM still reads them).
+    metal_compute::SharedBuffer gate_aw, gate_as, gate_ab;   // MLP gate affine
+    metal_compute::SharedBuffer up_aw, up_as, up_ab;         // MLP up affine
+    bool ffn_q4k_aff = false;
+    metal_compute::SharedBuffer qk_aw, qk_as, qk_ab;   // fused q|k affine
+    metal_compute::SharedBuffer o_aw, o_as, o_ab;      // attn o_proj affine
+    bool qk_q4k_aff = false, o_q4k_aff = false;
   };
 
   Config _cfg;
@@ -706,9 +829,16 @@ private:
       // On M5 dense_gemm_ instead routes the dequant'd GEMM onto the
       // matmul2d matrix units (_fn_dense_mma*, via _use_mma); this steel
       // GEMM is then the M4 / small-M (< _mma_min_m) fallback.
-      _lib_dense;
+      _lib_dense,
+      // MLX steel register-resident flash attention (attn_steel, half-only):
+      // the bd256 instantiation drives Qwen full-attn FRESH prefill (contiguous
+      // K/V). Invalid for bf16 models -> the paged path stays the fallback.
+      _lib_attn;
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmv_swiglu, _fn_qmm,
       _fn_qmm_swiglu,
+      // Q4_K->affine-g32 decode repack: the affine 4-bit g32 qmv (+fused-add)
+      // that consumes the repacked MLP gate/up, and the GPU repack kernel.
+      _fn_qmv_w4g32, _fn_qmv_w4g32_add, _fn_repack_q4k,
       // Mixed-precision affine (OptiQ): the 8-bit counterparts of qmv/qmv_add/
       // qmm + the 8-bit dequant (affine_dequant_w8g64) + the 8-bit batched-GEMV
       // (affine_qmv_batch_w8g64, weight read once across MAXM=2 rows -- lets the
@@ -724,14 +854,20 @@ private:
       _fn_sdpa_paged_qtile,
       // simdgroup_matrix key-split flash prefill (head_dim 256, drop-in for
       // qtile): runs on M4 (no matrix cores), unlike the matmul2d _fn_sdpa_mma.
-      _fn_sdpa_paged_flash, _fn_kv_write_paged,
+      _fn_sdpa_paged_flash, _fn_sdpa_paged_mma, _fn_kv_write_paged,
+      // MLX steel register-softmax flash with a paged K/V tg loader (mid-
+      // context prefill, q_offset>0 -- no de-paged kfull scratch). No function
+      // constants (bounds/causal handled in-kernel) -> a plain cached function.
+      _fn_steel_paged,
       // Shared-prefix batched decode attention (head_dim 256): phase A reads
       // the N branches' shared prefix once, phase B merges per-branch private.
       _fn_sdpa_shared_mb256, _fn_sdpa_merge_mb256,
       // Flash-decode-GQA serial attention (head_dim <= 256): read each KV
       // head ONCE for all Hq/Hkv query heads (phase A) + position-split merge
       // (phase B), vs mb256/mb128's GQA-redundant per-q-head re-scan.
-      _fn_sdpa_gqa, _fn_sdpa_gqa_vec, _fn_sdpa_gqa_merge,
+      _fn_sdpa_gqa, _fn_sdpa_gqa_vec, _fn_sdpa_gqa_kbl, _fn_sdpa_gqa_kbl128,
+      _fn_sdpa_gqa_vec1, _fn_sdpa_gqa_vec2, _fn_sdpa_gqa_merge2,
+      _fn_sdpa_gqa_merge,
       _fn_gdn_step, _fn_gdn_step_ndv4, _fn_gdn_conv1d, _fn_gdn_g_beta, _fn_mrope,
       _fn_gdn_qk_norm, _fn_gdn_gated_rms,
       // batched-decode GEMV (4-bit, MAXM=2; N>2 tiles along grid.z)
@@ -746,13 +882,20 @@ private:
       _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_swiglu_inter,
       _fn_sdpa_mma,
       _fn_embed, _fn_argmax, _fn_sample,   // pipelined-decode kernels
+      // Two-stage parallel argmax + histogram multi-tg sampler (the defaults;
+      // _fn_argmax/_fn_sample are the VPIPE_QWEN_ARGMAX1/SAMPLE1 single-tg
+      // fallbacks). Same kernels as Gemma's llm_elementwise.metal.
+      _fn_argmax_partial, _fn_argmax_combine,
+      _fn_smp_max_partial, _fn_smp_max_combine,
+      _fn_smp_zhist_partial, _fn_smp_zhist_combine,
+      _fn_smp_thresh, _fn_smp_pick_partial, _fn_smp_pick_combine,
       // On-GPU Leviathan-Chen MTP correction (lc_sample / lc_accept): the
       // nucleus + accept/residual that the host L-C path used to grind over the
       // full vocab on the CPU, done one-threadgroup-per-row on the GPU.
       _fn_lc_sample, _fn_lc_accept, _fn_lc_sample_batch,
       // Native k-quant (GGUF): per-family qmv (decode) + dequant-to-f16
       // (prefill) + plain dense f16 GEMV/GEMM + q6_K embed gather/lm_head.
-      _fn_qmv_q4k, _fn_qmv_q5k, _fn_qmv_q6k, _fn_embed_q6k,
+      _fn_qmv_q4k, _fn_qmv_q5k, _fn_qmv_q6k, _fn_embed_q6k, _fn_embed_q4k,
       // Batched k-quant GEMV (compile-time MAXM=2, weight read once across the
       // 2-row tile, grid.z tiles larger M): the MTP verify's weight-bound matmul.
       _fn_qmv_q4k_batch, _fn_qmv_q5k_batch, _fn_qmv_q6k_batch,
@@ -760,6 +903,19 @@ private:
       // the MAXM=2 form's 2 grid.z tiles; the k-quant depth-2 cliff). _qmv4_*.
       _fn_qmv_q4k_batch4, _fn_qmv_q5k_batch4, _fn_qmv_q6k_batch4,
       _fn_dequant_q4k, _fn_dequant_q5k, _fn_dequant_q6k, _fn_copy,
+      _fn_dequant_w4g32,   // affine g32 prefill dequant (Q4_K->affine repack)
+      // Mixture-of-Experts (Qwen3.5-MoE): on-GPU router (softmax+top-k+renorm),
+      // gathered expert gate|up+SwiGLU and down GEMVs (index a 3D expert slab),
+      // the shared-expert sigmoid gate (w8 dot), and the combine/finalize.
+      _fn_moe_route, _fn_moe_gather_swiglu, _fn_moe_gather_down,
+      _fn_moe_gate, _fn_moe_combine, _fn_moe_finalize,
+      _fn_moe_finalize_combined,
+      // Grouped prefill (counting-sort + segmented MAXM-batched expert GEMV):
+      // reads each expert's weight once per tile instead of once per token.
+      _fn_moe_grouped_swiglu, _fn_moe_grouped_down, _fn_moe_ifill,
+      _fn_moe_hist, _fn_moe_sort_setup, _fn_moe_scatter, _fn_moe_scatter_back,
+      // Steel (matrix-tiled) grouped expert GEMM + the sorted-row gather.
+      _fn_moe_qmm_grouped, _fn_moe_qmm_grouped_swiglu,
       _fn_dense_gemv, _fn_dense_gemm;
   // Decode full-attn switches to the multi-simdgroup paged kernel once
   // the context reaches this length (scalar wins at short ctx).
@@ -783,7 +939,18 @@ private:
   // (sdpa_paged_gqa_vec) -- ~2x the all-G mb256 form (head_dim % 128 == 0).
   // VPIPE_GQA_NO_VEC=1 forces the all-G kernel (A/B).
   bool _gqa_vec = true;
+  bool _gqa_blk = false;   // key-across-lanes block decode (head_dim 256;
+                           // default ON when available, VPIPE_GQA_BLK=0 opts out)
   int  _gqa_split = 32;
+  bool _gqa_split_fixed = false;   // true if VPIPE_GQA_SPLIT pinned it
+  // Context-adaptive flash-decode split: the optimal #position-splits grows
+  // with KV length (~pos/128 per the gqa_decode_micro sweep: 16@2k, 64@8k,
+  // 128@16k, 256@32k). A fixed 32 was 15-20% off at 16k-32k. Pinned by env.
+  int gqa_split_for(int pos) const {
+    if (_gqa_split_fixed) { return _gqa_split; }
+    const int s = (pos + 127) / 128;
+    return s < 16 ? 16 : (s > 256 ? 256 : s);
+  }
   // MAXM=4 batched GEMV for the MTP verify at draft depth>=2 (n=3..4): read
   // each weight ONCE vs the MAXM=2 form's 2 grid.z tiles. _qmv4_enabled is the
   // capability+env gate (VPIPE_MTP_QMV4); _qmv4_active is set ONLY while
@@ -874,7 +1041,9 @@ private:
                    const metal_compute::SharedBuffer& w,
                    const metal_compute::SharedBuffer& x,
                    const metal_compute::SharedBuffer& y, int K, int N, int M);
-  // q6_K embed gather: out[t,:] = dequant(_embed_q6k[ids[t], :]).
+  // Raw k-quant embed gather: out[t,:] = dequant(_embed_q6k[ids[t], :]).
+  // Picks the Q4_K / Q6_K gather kernel by _embed_kqt (the _embed_q6k buffer
+  // holds the raw table for either family).
   void embed_q6k_(metal_compute::ComputeEncoder& enc,
                   const metal_compute::SharedBuffer& ids, std::size_t ioff,
                   const metal_compute::SharedBuffer& out, int n);
@@ -898,6 +1067,29 @@ private:
              const metal_compute::SharedBuffer& b, int bits,
              const metal_compute::SharedBuffer& x,
              const metal_compute::SharedBuffer& y, int K, int N, int M);
+  // Affine-4bit-g32 prefill twins (the Q4_K->affine repack path): dequant the
+  // repacked weight into _w_deq (at dst_off for the fused q|k|v path), and the
+  // standalone projection prefill (adequant_g32 + dense GEMM).
+  void adequant_g32_(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& w,
+                     const metal_compute::SharedBuffer& s,
+                     const metal_compute::SharedBuffer& b,
+                     std::size_t dst_off, int N, int K);
+  void aqmm_g32_(metal_compute::ComputeEncoder& enc,
+                 const metal_compute::SharedBuffer& w,
+                 const metal_compute::SharedBuffer& s,
+                 const metal_compute::SharedBuffer& b,
+                 const metal_compute::SharedBuffer& x,
+                 const metal_compute::SharedBuffer& y, int K, int N, int M);
+  // Batched (multi-branch) decode over a repacked Q4_K projection: loops the
+  // affine g32 qmv per branch row (mirrors kqmv_batch_'s looped fallback).
+  void amv_g32_batch_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& w,
+                      const metal_compute::SharedBuffer& s,
+                      const metal_compute::SharedBuffer& b,
+                      const metal_compute::SharedBuffer& x,
+                      const metal_compute::SharedBuffer& y, int K, int N,
+                      int M, int ystride, int yoff);
 
   // ---- MTP head (Multi-Token Prediction drafter) ----------------------
   // A bundled mtp.safetensors: the eh-fusion `fc` ([H, 2H], dense f16) +
@@ -992,6 +1184,38 @@ private:
              const metal_compute::SharedBuffer& b, int bits,
              const metal_compute::SharedBuffer& xin,
              const metal_compute::SharedBuffer& y, int K, int N);
+  // Single-token flash-decode attention via the MLX sdpa_vector 2-pass kernels
+  // (vec2 pass-1 + coalesced merge2), shared by the single-token decode, the
+  // MTP per-draft verify loop, and the batched per-branch fallback. Writes the
+  // [Hq,D] attention for query `q`+qoff (at global position `pos`) into
+  // `out`+outoff via the shared _d_gqa_oacc/m/l scratch (serial per call).
+  // Split = MLX block count (must be %32 for merge2).
+  static int gqa_vec2_split(int pos) { return pos <= 8192 ? 128 : 256; }
+  // env (VPIPE_QWEN_GQA_VEC2) override else the per-regime autotune for `pos`.
+  bool gqa_vec2_on(int D, int pos) const;
+  // Tuned #position-splits for `pos`'s regime (the GQA split coefficient is
+  // autotuned jointly with the kernel); falls back to the heuristic on override.
+  int  gqa_decode_split(int D, int pos) const;
+  void encode_gqa_vec2_(metal_compute::ComputeEncoder& enc,
+      const metal_compute::SharedBuffer& q, std::size_t qoff,
+      const metal_compute::SharedBuffer& kp,
+      const metal_compute::SharedBuffer& vp,
+      const metal_compute::SharedBuffer& out, std::size_t outoff,
+      int pos, float scale, int D, int Hq, int Hkv,
+      int page_tokens, int n_pages,
+      const metal_compute::SharedBuffer& pgtab, std::size_t pgoff);
+  // The decode GQA attention KERNEL SET (vec2/kbl, paged, f16/bf16): owns its
+  // member kernels + partial scratch, autotunes kernel+split per machine/regime
+  // at load, and exposes the unified dispatch() the decode sites tap into. The
+  // model no longer carries the kernel selection / autotune / dispatch itself.
+  DecodeGqaAttnSet _decode_set;
+  // The prefill GQA attention set (steel/flash/qtile/scalar/mma): picks the
+  // member per query-count regime at load (discovers the steel/flash crossover
+  // per GPU). The prefill site taps its dispatch().
+  PrefillGqaAttnSet _prefill_set;
+  // Debug-log (via the session delegate) the resolved decode-attn kernel per
+  // regime at load. No-op without a session or a vec2/kbl-capable model.
+  void log_decode_attn_choice_() const;
   // MTP batched verify (direct-quantized), with the MTP head FUSED in. One
   // forward over the n drafts: the main model's weight-bound matmuls run as
   // direct quantized batched-GEMV (vqmm_), causal multi-token attention, and
@@ -1048,6 +1272,11 @@ private:
   // (q4_K/q5_K/q6_K), no requant. Set at load when the weights are a
   // qwen35 GGUF; selects the kqmv_/kqmm_ dispatch + the q6_K embed/lm_head.
   bool _kquant = false;
+  // q6_K decode qmv tuning: the loaded qmv_q6k_v2 variant's NSG (simdgroups/
+  // threadgroup) and rows-per-threadgroup (RPS*NSG). Tuned to r2n8 (nsg=8,
+  // rpt=16); fallbacks set nsg=2/rpt=8. Used by kqmv_'s q6_K dispatch.
+  int _q6k_nsg = 2;
+  int _q6k_rpt = 8;
   // Mixed-precision affine (mlx-optiq): some linear weights are 4-bit, some
   // 8-bit, in one checkpoint (per-tensor sensitivity quant). Set at load by
   // probing the on-disk packed-weight shapes; selects the per-tensor
@@ -1058,8 +1287,20 @@ private:
   // at 8-bit; the muxer gather + lm_head qmv pick the matching kernel.
   int  _embed_bits = 4;
   int  _lm_bits = 4;
-  bool _embed_is_q6k = false;
-  metal_compute::SharedBuffer _embed_q6k;   // raw Q6_K tied table
+  bool _embed_is_q6k = false;               // raw k-quant embed table present
+  metal_compute::SharedBuffer _embed_q6k;   // raw k-quant embed table (Q6_K
+                                            // tied, or Q4_K when untied)
+  KQ _embed_kqt = KQ::kQ6K;                  // embed table k-quant family
+  // Untied k-quant lm_head (GGUF output.weight; Q6_K on the 27B). When _tied
+  // the lm_head matvec reuses _embed_q6k / _embed_kqt instead.
+  metal_compute::SharedBuffer _lm_q6k;
+  KQ _lm_kqt = KQ::kNone;
+  // The lm_head raw table + family: the separate output.weight when untied,
+  // else the (tied) embed table. Used by the k-quant lm_head matvec sites.
+  const metal_compute::SharedBuffer& lm_head_kq_() const {
+    return _tied ? _embed_q6k : _lm_q6k;
+  }
+  KQ lm_head_kqt_() const { return _tied ? _embed_kqt : _lm_kqt; }
   // Per-pair mROPE axis lookup [rotary_dim/2] (0=T,1=H,2=W); built from
   // mrope_section at load. Empty -> all-T (plain 1D).
   std::vector<std::uint8_t> _mrope_axis;
@@ -1079,9 +1320,26 @@ private:
       // k-quant decode: [H] temp for qmv-then-residual-add (o/out/down),
       // and [ffn] up-proj temp (gate/up run as two qmv then swiglu).
       _d_radd, _d_up;
+  // MoE decode scratch (allocated only when _cfg.is_moe()). logits [E];
+  // routed ids [top_k] (int) + weights [top_k]; expert act [top_k*moe_inner];
+  // down partials [top_k*H]; combined [H]; shared-expert swiglu [shared_inner]
+  // + down [H]; sigmoid gate [1].
+  metal_compute::SharedBuffer _d_moe_logits, _d_moe_ids, _d_moe_w,
+      _d_moe_act, _d_moe_part, _d_moe_out, _d_moe_ssg, _d_moe_sout, _d_moe_gate;
   // 1-int scratch for decode_step_fast: input token id (in-stream embed)
   // and on-GPU argmax output.
   metal_compute::SharedBuffer _d_tok_in, _d_argmax_id;
+  // Two-stage-argmax + histogram-sampler scratch (mirrors Gemma). Allocated
+  // ONCE by ensure_sampler_scratch_() and reused across every decode path
+  // (serial encoder serialises the WAR hazard). kArgmaxM/kSampM = stage-1 tgs,
+  // kSampB = histogram bins (MUST match sample_*_f16 in llm_elementwise.metal).
+  bool _smp_scratch_ready = false;
+  static constexpr int kArgmaxM = 64;
+  static constexpr int kSampM = 64;
+  static constexpr int kSampB = 1024;
+  metal_compute::SharedBuffer _d_argmax_part;
+  metal_compute::SharedBuffer _d_smp_maxpart, _d_smp_hpart, _d_smp_hist,
+      _d_smp_maxl, _d_smp_wt, _d_smp_pickpart;
   // Flash-decode-GQA partials (f32): un-normalized O [Hq,split,D], m/l
   // [Hq,split]. Allocated only when _gqa_attn (D==256). Reused across layers.
   metal_compute::SharedBuffer _d_gqa_oacc, _d_gqa_m, _d_gqa_l;

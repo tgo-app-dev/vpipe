@@ -5,15 +5,21 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-event.h"
+#include "common/perf-scope.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace vpipe::genai {
@@ -47,6 +53,86 @@ double
 getr_(const FlexData::ConstObjectView& o, const char* k, double d)
 {
   return o.contains(k) ? o.at(k).as_real(d) : d;
+}
+
+// Host sampler over logit[0..n): temperature / top_k / top_p, with an optional
+// repetition penalty against `seen` (HF style: scale a seen logit by 1/pen if
+// >0 else *pen). `blocked` (small) excludes ids; temperature <= 0 => greedy
+// argmax. `cand`/`prob` are caller scratch (reused across steps, no per-call
+// alloc). Returns the chosen index.
+int
+sample_logits_(const float* logit, int n, const MossSampling& sp,
+               const std::vector<int>& blocked,
+               const std::unordered_set<int>* seen,
+               std::vector<int>& cand, std::vector<float>& prob,
+               std::mt19937_64& rng)
+{
+  auto is_blocked = [&](int i) {
+    for (int b : blocked) { if (b == i) { return true; } }
+    return false;
+  };
+  const bool rep = sp.repetition_penalty != 1.0f && seen != nullptr;
+  auto adj = [&](int i) -> float {     // logit after repetition penalty
+    float v = logit[i];
+    if (rep && seen->count(i)) {
+      v = (v > 0.0f) ? v / sp.repetition_penalty : v * sp.repetition_penalty;
+    }
+    return v;
+  };
+  if (sp.temperature <= 0.0f) {                       // greedy
+    float bv = -std::numeric_limits<float>::infinity();
+    int best = -1;
+    for (int i = 0; i < n; ++i) {
+      if (is_blocked(i)) { continue; }
+      const float v = adj(i);
+      if (v > bv) { bv = v; best = i; }
+    }
+    return best;
+  }
+  cand.clear();
+  for (int i = 0; i < n; ++i) { if (!is_blocked(i)) { cand.push_back(i); } }
+  if (cand.empty()) { return 0; }
+  // top_k: select the k highest-adjusted-logit candidates, sorted desc.
+  int k = (sp.top_k > 0 && sp.top_k < (int)cand.size())
+              ? sp.top_k
+              : (int)cand.size();
+  auto gt = [&](int a, int b) { return adj(a) > adj(b); };
+  if (k < (int)cand.size()) {
+    std::nth_element(cand.begin(), cand.begin() + (k - 1), cand.end(), gt);
+    cand.resize((std::size_t)k);
+  }
+  std::sort(cand.begin(), cand.end(), gt);
+  // temperature softmax over the kept set, then top_p nucleus truncation.
+  const float inv_t = 1.0f / sp.temperature;
+  const float mx = adj(cand[0]) * inv_t;
+  prob.resize(cand.size());
+  double sum = 0.0;
+  for (std::size_t i = 0; i < cand.size(); ++i) {
+    const float p = std::exp(adj(cand[i]) * inv_t - mx);
+    prob[i] = p;
+    sum += p;
+  }
+  std::size_t keep = cand.size();
+  if (sp.top_p < 1.0f) {
+    const double thresh = sp.top_p * sum;
+    double cum = 0.0;
+    keep = 0;
+    for (std::size_t i = 0; i < cand.size(); ++i) {
+      cum += prob[i];
+      ++keep;
+      if (cum >= thresh) { break; }
+    }
+  }
+  double ksum = 0.0;
+  for (std::size_t i = 0; i < keep; ++i) { ksum += prob[i]; }
+  const double target =
+      std::uniform_real_distribution<double>(0.0, 1.0)(rng) * ksum;
+  double acc = 0.0;
+  for (std::size_t i = 0; i < keep; ++i) {
+    acc += prob[i];
+    if (acc >= target) { return cand[i]; }
+  }
+  return cand[keep - 1];
 }
 }  // namespace
 
@@ -295,8 +381,10 @@ MetalMossTtsModel::head_logits_(const SharedBuffer& hn, bool need_full_text,
 }
 
 std::vector<std::vector<std::int32_t>>
-MetalMossTtsModel::generate_delay_greedy(
-    const std::vector<std::vector<std::int32_t>>& prompt, int max_new_tokens)
+MetalMossTtsModel::generate_delay(
+    const std::vector<std::vector<std::int32_t>>& prompt, int max_new_tokens,
+    const MossSampling& audio_sp, const MossSampling& text_sp,
+    std::uint64_t seed)
 {
   std::vector<std::vector<std::int32_t>> out;
   const int NV = _cfg.n_vq;
@@ -304,6 +392,19 @@ MetalMossTtsModel::generate_delay_greedy(
   if (seq <= 0) { return out; }
   ContextManager* cm = _backbone->context_manager();
   const ContextId cid = cm->acquire_root();
+
+  // Sampler state: one RNG (seed 0 => nondeterministic), reused scratch, and
+  // optional repetition-penalty history (per-codebook audio + text), allocated
+  // only when the respective penalty is enabled.
+  std::mt19937_64 rng(seed != 0 ? seed : std::random_device{}());
+  std::vector<int> samp_cand;
+  std::vector<float> samp_prob;
+  const std::vector<int> kNoBlock;
+  const bool audio_rep = audio_sp.repetition_penalty != 1.0f;
+  const bool text_rep  = text_sp.repetition_penalty != 1.0f;
+  std::vector<std::unordered_set<int>> audio_seen(
+      audio_rep ? (std::size_t)NV : 0);
+  std::unordered_set<int> text_seen;
 
   // Optional per-phase timing (VPIPE_MOSS_PROFILE).
   const bool kProf = std::getenv("VPIPE_MOSS_PROFILE") != nullptr;
@@ -318,8 +419,17 @@ MetalMossTtsModel::generate_delay_greedy(
   // reuse the optimized qmv decode path (cur_hn tracks the live hidden:
   // the prefill buffer first, then the backbone's internal _d_hn scratch).
   const auto p0 = Clk::now();
-  SharedBuffer x = assemble_embeds_(prompt, 0, seq);
-  SharedBuffer prefill_hn = _backbone->forward_embeddings_hidden(cid, x, seq);
+  SharedBuffer x;
+  SharedBuffer prefill_hn;
+  {
+    // text-prefill perf block (LLM lane). On the FIRST synthesis this also
+    // absorbs the cold Metal pipeline-state compilation + first-touch weight
+    // residency, so the block is huge on clip 1 and small thereafter.
+    PerfAuxScope _pre(_session, kPerfLaneLLM, kGvidLlmPrefill,
+                      kPerfLlmPrefillBegin, (std::uint64_t)seq);
+    x = assemble_embeds_(prompt, 0, seq);
+    prefill_hn = _backbone->forward_embeddings_hidden(cid, x, seq);
+  }
   if (kProf) { t_prefill = ms(p0, Clk::now()); }
   if (prefill_hn.empty()) { cm->release(cid); return out; }
   const SharedBuffer* cur_hn = &prefill_hn;
@@ -359,6 +469,11 @@ MetalMossTtsModel::generate_delay_greedy(
 
   for (int t = 0; t < max_new_tokens; ++t) {
     if (kProf) { ++prof_steps; }
+    // One text-decode perf event PER generated token (matches the LM /
+    // realtime-vqa per-token decode timeline): brackets this step's token
+    // selection + the fused decode forward that produces the next hidden.
+    PerfAuxScope _dec(_session, kPerfLaneLLM, kGvidLlmDecode,
+                      kPerfLlmDecodeBegin, 1);
 
     // ---- text channel (delay-pattern state machine) ------------------
     int next_text = _cfg.pad_token;
@@ -382,22 +497,17 @@ MetalMossTtsModel::generate_delay_greedy(
         }
         next_text = best;
       } else {
-        // exclude {pad, gen_slot, delay_slot, audio_end} (+t==0 delay,
-        // +t<=n_vq im_end), argmax over the rest (lowest index on ties).
-        float bv = kNegInf;
-        int best = -1;
-        for (int i = 0; i < _cfg.vocab; ++i) {
-          if (i == _cfg.pad_token || i == _cfg.audio_gen_slot ||
-              i == _cfg.audio_delay_slot || i == _cfg.audio_end) {
-            continue;
-          }
-          if (t <= NV && i == _cfg.im_end) { continue; }
-          if (text_logits[(std::size_t)i] > bv) {
-            bv = text_logits[(std::size_t)i];
-            best = i;
-          }
-        }
+        // Sample the free text token, excluding the control slots ({pad,
+        // gen_slot, delay_slot, audio_end} + im_end until past the delay
+        // window). temp<=0 reproduces the original argmax (lowest id on ties).
+        std::vector<int> blk = {_cfg.pad_token, _cfg.audio_gen_slot,
+                                _cfg.audio_delay_slot, _cfg.audio_end};
+        if (t <= NV) { blk.push_back(_cfg.im_end); }
+        const int best = sample_logits_(
+            text_logits.data(), _cfg.vocab, text_sp, blk,
+            text_rep ? &text_seen : nullptr, samp_cand, samp_prob, rng);
         next_text = best;
+        if (text_rep && best >= 0) { text_seen.insert(best); }
       }
     }
 
@@ -413,15 +523,12 @@ MetalMossTtsModel::generate_delay_greedy(
                                   : ((std::int64_t)cb > delayed_lengths - 1);
       if (!(pre_audio && post_audio)) { continue; }
       const auto& cl = audio_logits[(std::size_t)cb];
-      float bv = kNegInf;
-      int best = 0;
-      for (int code = 0; code < _cfg.audio_vocab; ++code) {
-        if (cl[(std::size_t)code] > bv) {
-          bv = cl[(std::size_t)code];
-          best = code;
-        }
-      }
-      next_audio[(std::size_t)cb] = best;
+      const int best = sample_logits_(
+          cl.data(), _cfg.audio_vocab, audio_sp, kNoBlock,
+          audio_rep ? &audio_seen[(std::size_t)cb] : nullptr,
+          samp_cand, samp_prob, rng);
+      next_audio[(std::size_t)cb] = (best >= 0) ? best : 0;
+      if (audio_rep && best >= 0) { audio_seen[(std::size_t)cb].insert(best); }
     }
 
     // ---- delay bookkeeping (order matches the reference) -------------

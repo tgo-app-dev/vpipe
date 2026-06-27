@@ -838,6 +838,114 @@ kernel void affine_qmv_swiglu_w4g64(
       tid, simd_gid, simd_lid);
 }
 
+// ====================================================================
+// MoE (Qwen3.5-MoE) gathered expert GEMVs (decode, M=1).
+//
+// The router selects top_k of n_experts experts per token, producing a list
+// of (token, expert) PAIRS -- npair = M*top_k (decode M=1 -> npair=top_k).
+// Each expert's gate/up/down weights live in a BATCHED 3D affine-quantized
+// tensor [n_experts, N, K-packed]; the gather kernels index the routed
+// expert (pair_eid[p]) and run the standard qmv against the selected slab.
+// grid.z = pair p; the weight/scale/bias/out/in base pointers are advanced
+// to the expert's slab + the pair's rows before delegating to the shared
+// qmv_fast_impl / qmv_swiglu_impl above -- so a gathered expert is token-
+// EXACT with the same expert run through the plain kernels. tid.x is 0
+// (grid.x == one threadgroup); tid.y tiles the output rows. This single pair-
+// indexed form serves BOTH decode and prefill (the "pair-batched" path).
+// ====================================================================
+
+// Gate|up gather + SwiGLU: for pair p, x = X[p/top_k, :K] @ the routed
+// expert's interleaved gate|up [2*inner, K] -> silu(gate)*up -> y[p, inner].
+// Pairs are ordered [token*top_k + slot], so the input row is p/top_k (decode:
+// top_k pairs, all row 0; prefill: M*top_k pairs over M token rows).
+kernel void affine_gather_qmv_swiglu_w4g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K/8]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // N = 2*inner
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    constant int& top_k             [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 8u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)(p / top_k) * (uint)in_vec_size;
+  y      += (uint)p * ((uint)out_vec_size / 2u);
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_swiglu_impl<VPIPE_ELT, 64, 4>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+      simd_gid, simd_lid);
+}
+
+// Down gather: x[p, inner] (per-pair expert activation, contiguous) @ the
+// routed expert's down [H, inner] -> partials[p, H] (UN-weighted; moe_combine
+// applies the routing weight and sums over the token's pairs).
+kernel void affine_gather_down_qmv_w4g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner/8]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, H]
+    constant int& in_vec_size       [[buffer(5)]],   // inner
+    constant int& out_vec_size      [[buffer(6)]],   // H
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 8u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)p * (uint)in_vec_size;
+  y      += (uint)p * (uint)out_vec_size;
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_fast_impl<VPIPE_ELT, 64, 4, false>(
+      w, scales, biases, x, y, /*residual=*/nullptr, in_vec_size,
+      out_vec_size, t0, simd_gid, simd_lid);
+}
+
+// Shared-expert sigmoid gate (Qwen3.5-MoE): g[t] = sigmoid(dequant(w[1,K] w8)
+// . X[t]). One simdgroup per input row (tid.y = row); lane 0 writes the gate.
+// grid {32, M, 1}, tg {32,1,1}; decode is the M=1 case. The router gate and
+// this shared gate are the only w8 tensors in the MoE block.
+kernel void affine_moe_gate_w8g64(
+    const device uint32_t* w       [[buffer(0)]],   // [1, K/4] (w8 packed)
+    const device VPIPE_ELT* scales [[buffer(1)]],   // [1, K/64]
+    const device VPIPE_ELT* biases [[buffer(2)]],   // [1, K/64]
+    const device VPIPE_ELT* x      [[buffer(3)]],   // [M, K]
+    device VPIPE_ELT*       outg   [[buffer(4)]],   // [M] = sigmoid(logit)
+    constant int&  in_vec_size     [[buffer(5)]],   // K
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+  const device uint8_t* wb = (const device uint8_t*)w;   // K bytes (q in 0..255)
+  const int K = in_vec_size;
+  const device VPIPE_ELT* xr = x + (uint)tid.y * (uint)K;
+  float acc = 0.0f;
+  for (int k = (int)simd_lid; k < K; k += SIMD_SIZE) {
+    const int g = k / 64;
+    const float s = (float)scales[g];
+    const float b = (float)biases[g];
+    acc += ((float)wb[k] * s + b) * (float)xr[k];
+  }
+  acc = simd_sum(acc);
+  if (simd_lid == 0) { outg[tid.y] = (VPIPE_ELT)(1.0f / (1.0f + metal::exp(-acc))); }
+}
+
 // Fused GeGLU MLP GEMV (Gemma-4): identical to qmv_swiglu_impl but the
 // activation is gelu_pytorch_tanh (matches geglu_f16) instead of silu.
 // SCALE_ONLY skips the redundant Q4_0 bias read (bias = -8*scale); see
@@ -1155,6 +1263,161 @@ VPIPE_QMV_BATCH(affine_qmv_batch4_w4g64, 4)
   }
 VPIPE_QMV_BATCH_W8(affine_qmv_batch_w8g64, 2)
 VPIPE_QMV_BATCH_W8(affine_qmv_batch4_w8g64, 4)   // MTP verify n=3..4 (see w4)
+
+// ====================================================================
+// MoE GROUPED expert GEMV (Qwen3.5-MoE prefill optimization).
+//
+// The pair-batched gather kernels above re-read an expert's full weight
+// matrix once PER routed token (npair = M*top_k GEMVs). For large M (prefill)
+// that is the dominant cost. Here the (token,expert) pairs are first sorted
+// into per-expert blocks padded to MAXM rows (on-GPU counting sort); this
+// grouped GEMV then processes one tile (MAXM rows of ONE expert) per grid.z,
+// reading that expert's weight slab ONCE across the tile -> ~MAXM-fold fewer
+// weight reads. Mirrors qmv_batch_impl (weight read once across MAXM rows)
+// plus: (1) the expert slab offset from tile2e[tile], (2) input rows gathered
+// via srow[] (GATHER, gate|up reads the shared hidden) or the slot itself
+// (!GATHER, down reads the sorted activations), (3) srow<0 marks padding.
+// Per-row arithmetic is identical to the plain kernels -> token-exact.
+template <typename T, int group_size, int bits, int MAXM, bool SWIGLU,
+          bool GATHER>
+METAL_FUNC void qmv_grouped_impl(
+    const device uint32_t* w,           // [E, N, K/8]
+    const device T* scales,             // [E, N, K/64]
+    const device T* biases,             // [E, N, K/64]
+    const device T* x,                  // [*, K] input rows
+    device T* y,                        // [npad, N]  (SWIGLU: [npad, N/2])
+    const device int* srow,             // [npad] input row per slot (<0 = pad)
+    const device int* tile2e,           // [ntiles] expert per tile (<0 = none)
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    uint3 tid, uint simd_gid, uint simd_lid) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const int tile = (int)tid.z;
+  const int e = tile2e[tile];
+  if (e < 0) { return; }                 // unused padding tile
+  const int base_slot = tile * MAXM;
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  // expert slab strides (rows N * per-row entries)
+  w      += (uint)e * (uint)out_vec_size * (uint)(in_vec_size_w / bytes_per_pack);
+  scales += (uint)e * (uint)out_vec_size * (uint)in_vec_size_g;
+  biases += (uint)e * (uint)out_vec_size * (uint)in_vec_size_g;
+
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  typedef float U;
+  thread U x_thread[MAXM][values_per_thread];
+  thread U result[results_per_simdgroup][MAXM];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+
+  bool valid[MAXM];
+  const device T* xptr[MAXM];
+  for (int m = 0; m < MAXM; m++) {
+    const int rr = srow[base_slot + m];
+    valid[m] = rr >= 0;
+    const int row = GATHER ? (valid[m] ? rr : 0) : (base_slot + m);
+    xptr[m] = x + row * in_vec_size + simd_lid * values_per_thread;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    const int kvalid = in_vec_size - (k + (int)simd_lid * values_per_thread);
+    U sum[MAXM];
+    for (int m = 0; m < MAXM; m++) {
+      sum[m] = (krem >= block_size)
+          ? load_vector<T, U, values_per_thread, bits>(xptr[m], x_thread[m])
+          : load_vector_safe<T, U, values_per_thread, bits>(
+                xptr[m], x_thread[m], kvalid < 0 ? 0 : kvalid);
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const U s = scales[row * in_vec_size_g];
+      const U b = biases[row * in_vec_size_g];
+      U acc[MAXM] = {0};
+      const device uint16_t* w16 = (const device uint16_t*)wl;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        const uint16_t p = w16[i];
+        const U w0 = (U)(p & 0x000f), w1 = (U)(p & 0x00f0);
+        const U w2 = (U)(p & 0x0f00), w3 = (U)(p & 0xf000);
+        for (int m = 0; m < MAXM; m++) {
+          acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
+                    x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+        }
+      }
+      for (int m = 0; m < MAXM; m++) { result[row][m] += s * acc[m] + sum[m] * b; }
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    for (int m = 0; m < MAXM; m++) { xptr[m] += block_size; }
+  }
+
+  if (!SWIGLU) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      for (int m = 0; m < MAXM; m++) {
+        const U v = simd_sum(result[row][m]);
+        if (simd_lid == 0 && valid[m]) {
+          y[(base_slot + m) * out_vec_size + out_row + row] = static_cast<T>(v);
+        }
+      }
+    }
+  } else {
+    for (int m = 0; m < MAXM; m++) {
+      const U g0 = simd_sum(result[0][m]);
+      const U u0 = simd_sum(result[1][m]);
+      const U g1 = simd_sum(result[2][m]);
+      const U u1 = simd_sum(result[3][m]);
+      if (simd_lid == 0 && valid[m]) {
+        device T* yo = y + (base_slot + m) * (out_vec_size / 2) + (out_row >> 1);
+        yo[0] = static_cast<T>((g0 / (1.0f + metal::exp(-g0))) * u0);
+        yo[1] = static_cast<T>((g1 / (1.0f + metal::exp(-g1))) * u1);
+      }
+    }
+  }
+}
+
+#define VPIPE_GROUPED(NAME, MAXM, SW, GA)                                     \
+  kernel void NAME(                                                          \
+      const device uint32_t* w       [[buffer(0)]],                          \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      const device int* srow     [[buffer(7)]],                              \
+      const device int* tile2e   [[buffer(8)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_grouped_impl<VPIPE_ELT, 64, 4, MAXM, SW, GA>(                        \
+        w, scales, biases, x, y, srow, tile2e, in_vec_size, out_vec_size,    \
+        tid, simd_gid, simd_lid);                                            \
+  }
+// MAXM=2: weight read once per 2 sorted same-expert rows (vs per token in the
+// pair path) -- the bandwidth-bound sweet spot (MAXM>=4 goes compute-bound on
+// the 4-bit unpack, losing the weight-read win; see the batch note above).
+// gate|up gathers the hidden via srow (GATHER); down reads the sorted
+// activations by slot (!GATHER).
+VPIPE_GROUPED(affine_grouped_swiglu_w4g64, 2, true, true)
+VPIPE_GROUPED(affine_grouped_down_w4g64, 2, false, false)
 
 // group_size=32 twin of VPIPE_QMV_BATCH (GGUF q4_0): identical to the
 // macro above but the impl group_size template arg is 32. The g64 macro

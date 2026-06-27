@@ -32,8 +32,20 @@
 #include <vector>
 
 namespace vpipe::metal_compute { class MetalCompute; }
+namespace vpipe { class SessionContextIntf; }
 
 namespace vpipe::genai {
+
+// Per-channel sampling controls for MOSS-TTS delay-pattern content choices
+// (the audio codebooks and the free text token). temperature <= 0 => greedy
+// argmax; top_k <= 0 / top_p >= 1 => that cap off; repetition_penalty 1.0 =>
+// disabled. The delay-pattern CONTROL transitions stay deterministic.
+struct MossSampling {
+  float temperature        = 0.0f;   // <=0 => greedy
+  int   top_k              = 0;
+  float top_p              = 1.0f;
+  float repetition_penalty = 1.0f;
+};
 
 class MetalMossTtsModel {
 public:
@@ -65,16 +77,27 @@ public:
   const Config& config() const { return _cfg; }
   int n_channels() const { return 1 + _cfg.n_vq; }   // 33
 
-  // Greedy (temperature 0) delay-pattern generation. `prompt` is the
-  // [seq][1+n_vq] int32 input grid (channel 0 text id; 1..n_vq audio codes,
-  // audio_pad_code where inactive). Returns the generated rows
-  // [G][1+n_vq] (text token + the n_vq DELAYED audio codes per step),
-  // matching the reference generate_delay_pattern_ids at temperature 0.
-  // Stops at <|im_end|> or max_new_tokens. Single generation per load
-  // (drives the backbone's root context, which is empty after load).
-  std::vector<std::vector<std::int32_t>> generate_delay_greedy(
+  // Optional profiling sink. When set (and profiling is enabled on the
+  // session), generate_delay_greedy brackets its prefill and decode phases
+  // onto the LLM perf lane (text-prefill / text-decode). No-op if null.
+  void set_session(const SessionContextIntf* s) { _session = s; }
+
+  // Delay-pattern generation. `prompt` is the [seq][1+n_vq] int32 input grid
+  // (channel 0 text id; 1..n_vq audio codes, audio_pad_code where inactive).
+  // `audio` samples the per-codebook audio codes, `text` the free text token
+  // (both greedy by default). `seed` 0 => nondeterministic. Returns the
+  // generated rows [G][1+n_vq]; stops at <|im_end|> or max_new_tokens.
+  std::vector<std::vector<std::int32_t>> generate_delay(
       const std::vector<std::vector<std::int32_t>>& prompt,
-      int max_new_tokens);
+      int max_new_tokens, const MossSampling& audio = {},
+      const MossSampling& text = {}, std::uint64_t seed = 0);
+
+  // Greedy convenience wrapper (used by the load-time warmup + verification).
+  std::vector<std::vector<std::int32_t>> generate_delay_greedy(
+      const std::vector<std::vector<std::int32_t>>& prompt, int max_new_tokens)
+  {
+    return generate_delay(prompt, max_new_tokens);
+  }
 
   // Verification: a single active-codebook disagreement with a reference
   // generation. The MOSS audio heads are full of exact bf16 logit ties, so
@@ -127,6 +150,7 @@ private:
                    std::vector<std::vector<float>>& audio_logits);
 
   metal_compute::MetalCompute*    _mc = nullptr;
+  const SessionContextIntf*       _session = nullptr;   // profiling sink
   std::unique_ptr<MetalQwenModel> _backbone;
   Config _cfg;
 

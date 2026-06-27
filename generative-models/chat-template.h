@@ -345,6 +345,16 @@ public:
   // for ChatML) without scanning the whole vocab.
   virtual bool is_stop_token(std::int32_t id) const = 0;
 
+  // Sanitize a fully-decoded assistant turn for display/storage: strip
+  // any model-internal reasoning the checkpoint emits but that should not
+  // surface to the user (e.g. Gemma-4's `<|channel>thought ...<channel|>`
+  // block, mirroring the checkpoint's own strip_thinking macro). The
+  // default is identity; families with a reasoning channel override it.
+  // Callers that always want a clean answer (e.g. realtime-vqa, where
+  // thinking is disabled) run their decoded text through this.
+  virtual std::string sanitize_output(std::string text) const
+  { return text; }
+
   // Family name for log / telemetry. Stable string literal; no need
   // to copy.
   virtual std::string_view family_name() const = 0;

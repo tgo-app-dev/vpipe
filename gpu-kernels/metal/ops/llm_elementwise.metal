@@ -14,6 +14,57 @@ using namespace metal;
 #define VPIPE_ELT half
 #endif
 
+// ---- opt-in int8 group-32 affine weight quant (MOSS codec) -------------
+// Quantize an f16 weight [N,K] to uint8 with a per-group-of-32 (along K)
+// affine scale+bias: q = round((v-min)/scale), v ~= q*scale + min. Halves
+// the codec's resident weight footprint; the codec dequants per stage at
+// decode. Output is explicit half (codec runs f16 in both metallib variants).
+//   quant:   0:in(f16)[N,K] 1:out(u8)[N,K] 2:scale(f16)[N,K/32]
+//            3:bias(f16)[N,K/32] 4:N 5:K.  grid (N*K/32), one group/thread.
+kernel void quant_f16_to_u8g32(
+    const device half* in    [[buffer(0)]],
+    device uchar*      out   [[buffer(1)]],
+    device half*       scale [[buffer(2)]],
+    device half*       bias  [[buffer(3)]],
+    constant int&      N     [[buffer(4)]],
+    constant int&      K     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int g = K / 32;
+  if ((int)gid >= N * g) { return; }
+  const int n = (int)gid / g, gg = (int)gid % g, base = n * K + gg * 32;
+  float mn = INFINITY, mx = -INFINITY;
+  for (int i = 0; i < 32; ++i) {
+    const float v = (float)in[base + i];
+    mn = min(mn, v); mx = max(mx, v);
+  }
+  const float s = (mx - mn) / 255.0f;
+  const float inv = (s > 0.0f) ? 1.0f / s : 0.0f;
+  scale[(int)gid] = (half)s;
+  bias[(int)gid]  = (half)mn;
+  for (int i = 0; i < 32; ++i) {
+    int q = (int)round(((float)in[base + i] - mn) * inv);
+    out[base + i] = (uchar)clamp(q, 0, 255);
+  }
+}
+
+// dequant uint8 g32 -> f16 [N,K]: out[n,k] = q*scale[n,k/32] + bias[n,k/32].
+//   0:in(u8)[N,K] 1:scale(f16) 2:bias(f16) 3:out(f16)[N,K] 4:N 5:K.  grid(N*K)
+kernel void dequant_u8g32_to_f16(
+    const device uchar* in    [[buffer(0)]],
+    const device half*  scale [[buffer(1)]],
+    const device half*  bias  [[buffer(2)]],
+    device half*        out   [[buffer(3)]],
+    constant int&       N     [[buffer(4)]],
+    constant int&       K     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if ((int)gid >= N * K) { return; }
+  const int n = (int)gid / K, k = (int)gid % K;
+  const int gi = n * (K / 32) + k / 32;
+  out[gid] = (half)((float)in[gid] * (float)scale[gi] + (float)bias[gi]);
+}
+
 // out[i] = silu(gate[i]) * up[i].   0:gate 1:up 2:out 3:n
 kernel void swiglu_f16(
     const device VPIPE_ELT* gate [[buffer(0)]],
@@ -48,6 +99,237 @@ kernel void swiglu_interleaved_f16(
   const float up = float(in[base + 1]);
   const float silu = ga / (1.0f + exp(-ga));
   out[gid] = VPIPE_ELT(silu * up);
+}
+
+// ====================================================================
+// Qwen3.5-MoE router + combine + finalize (decode, M=1).
+// ====================================================================
+
+// MoE router: precise softmax over n_experts logits, then top_k by
+// probability (argpartition-equivalent), renormalized when norm_topk != 0.
+// One simdgroup (32 lanes) per token (tid.z = token; grid {32,1,M}, decode
+// M=1); each lane owns ceil(n_experts/32) experts. Matches MLX qwen3_5_moe:
+//   p = softmax(logits, precise); inds = top_k(p); w = p[inds]; w /= w.sum().
+// (The softmax denominator cancels in the renorm, but is kept to mirror the
+// reference's compute order.) Writes the token's selected ids + weights into
+// the contiguous [token*top_k, ..] block.
+kernel void moe_route_f16(
+    const device VPIPE_ELT* logits [[buffer(0)]],   // [M, n_experts]
+    device int*       out_ids       [[buffer(1)]],   // [M*top_k]
+    device VPIPE_ELT* out_w         [[buffer(2)]],   // [M*top_k]
+    constant int& n_experts         [[buffer(3)]],
+    constant int& top_k             [[buffer(4)]],
+    constant int& norm_topk         [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_simdgroup]])
+{
+  const int E = n_experts;
+  logits  += (uint)tid.z * (uint)E;
+  out_ids += (uint)tid.z * (uint)top_k;
+  out_w   += (uint)tid.z * (uint)top_k;
+  const int PER = (E + 31) / 32;            // experts per lane (8 for E=256)
+  float lg[16];                             // PER <= 16 (E <= 512)
+  float lmax = -INFINITY;
+  for (int j = 0; j < PER; ++j) {
+    const int idx = (int)lid + j * 32;
+    const float v = (idx < E) ? (float)logits[idx] : -INFINITY;
+    lg[j] = v;
+    lmax = max(lmax, v);
+  }
+  const float gmax = simd_max(lmax);
+  float ex[16];                             // exp(logit - max); selection key
+  float lsum = 0.0f;
+  for (int j = 0; j < PER; ++j) {
+    const int idx = (int)lid + j * 32;
+    const float e = (idx < E) ? metal::exp(lg[j] - gmax) : 0.0f;
+    lsum += e;
+    ex[j] = (idx < E) ? e : -1.0f;          // mask padding out of the argmax
+  }
+  const float S = simd_sum(lsum);           // softmax denominator over all E
+  float wsum = 0.0f;
+  for (int k = 0; k < top_k; ++k) {
+    // local best among this lane's still-available experts
+    float bv = -1.0f; int bi = -1;
+    for (int j = 0; j < PER; ++j) {
+      if (ex[j] > bv) { bv = ex[j]; bi = (int)lid + j * 32; }
+    }
+    // simdgroup argmax reduction (lane 0 ends with the global best)
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = simd_shuffle_down(bv, (uint)off);
+      const int   oi = simd_shuffle_down(bi, (uint)off);
+      if (ov > bv) { bv = ov; bi = oi; }
+    }
+    bv = simd_shuffle(bv, 0);
+    bi = simd_shuffle(bi, 0);
+    for (int j = 0; j < PER; ++j) {         // mask the taken expert
+      if ((int)lid + j * 32 == bi) { ex[j] = -1.0f; }
+    }
+    const float p = bv / S;                 // softmax prob of the selected expert
+    wsum += p;
+    if (lid == 0) { out_ids[k] = bi; out_w[k] = (VPIPE_ELT)p; }
+  }
+  if (lid == 0 && norm_topk != 0 && wsum > 0.0f) {
+    for (int k = 0; k < top_k; ++k) {
+      out_w[k] = (VPIPE_ELT)((float)out_w[k] / wsum);
+    }
+  }
+}
+
+// MoE expert combine: out[t, h] = sum_s w[t*top_k+s] * partials[t*top_k+s, h].
+// The pairs for token t are the contiguous block [t*top_k, (t+1)*top_k).
+// grid(M*H); decode is the M=1 case.
+kernel void moe_combine_f16(
+    const device VPIPE_ELT* partials [[buffer(0)]],  // [M*top_k, H]
+    const device VPIPE_ELT* w         [[buffer(1)]],  // [M*top_k]
+    device VPIPE_ELT*       out        [[buffer(2)]],  // [M, H]
+    constant int& H                    [[buffer(3)]],
+    constant int& top_k                [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int h = (int)gid % H;
+  const int t = (int)gid / H;
+  float acc = 0.0f;
+  const int base = t * top_k;
+  for (int s = 0; s < top_k; ++s) {
+    acc += (float)w[base + s] * (float)partials[(int64_t)(base + s) * H + h];
+  }
+  out[gid] = (VPIPE_ELT)acc;
+}
+
+// ---- MoE grouped-prefill counting sort (sorts (token,expert) pairs into
+// per-expert blocks padded to MAXM, so the grouped GEMV reads each expert's
+// weight once per tile instead of once per token) ----------------------
+
+// Fill an int buffer with a constant (hist->0, srow/sdst/tile2e->-1). grid(n).
+kernel void moe_ifill_i32(
+    device int* buf   [[buffer(0)]],
+    constant int& val [[buffer(1)]],
+    constant int& n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid < (uint)n) { buf[gid] = val; }
+}
+
+// Histogram: hist[e] = # pairs routed to expert e. grid(np). hist pre-zeroed.
+kernel void moe_hist_i32(
+    const device int* eid [[buffer(0)]],   // [np] expert per pair
+    device atomic_int* hist [[buffer(1)]], // [E]
+    constant int& np [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)np) { return; }
+  atomic_fetch_add_explicit(&hist[eid[gid]], 1, memory_order_relaxed);
+}
+
+// Build MAXM-aligned per-expert offsets + tile->expert map from the histogram.
+// Single thread (E=256 is tiny). boff[e] = expert e's first slot (MAXM-aligned);
+// tile2e[t] = expert owning tile t; cursor[e] = 0; ntiles_out[0] = tiles used.
+kernel void moe_sort_setup_i32(
+    const device int* hist [[buffer(0)]],  // [E]
+    device int* boff       [[buffer(1)]],  // [E]
+    device int* tile2e     [[buffer(2)]],  // [maxtiles] (pre-filled -1)
+    device int* cursor     [[buffer(3)]],  // [E]
+    device int* ntiles_out [[buffer(4)]],  // [1]
+    constant int& E        [[buffer(5)]],
+    constant int& MAXM     [[buffer(6)]],
+    constant int& maxtiles [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid != 0) { return; }
+  int off = 0;
+  for (int e = 0; e < E; ++e) {
+    boff[e] = off;
+    cursor[e] = 0;
+    const int ntile_e = (hist[e] + MAXM - 1) / MAXM;
+    const int t0 = off / MAXM;
+    for (int t = 0; t < ntile_e; ++t) {
+      if (t0 + t < maxtiles) { tile2e[t0 + t] = e; }
+    }
+    off += ntile_e * MAXM;
+  }
+  ntiles_out[0] = off / MAXM;
+}
+
+// Scatter pairs into sorted per-expert slots. grid(np). srow[slot]=token row,
+// sdst[slot]=orig pair index (pad slots keep -1). Order within a bucket is
+// arbitrary but irrelevant -- combine sums per token in slot order via sdst.
+kernel void moe_scatter_i32(
+    const device int* eid    [[buffer(0)]],  // [np]
+    const device int* boff   [[buffer(1)]],  // [E]
+    device atomic_int* cursor [[buffer(2)]], // [E]
+    device int* srow         [[buffer(3)]],  // [npad]
+    device int* sdst         [[buffer(4)]],  // [npad]
+    constant int& np         [[buffer(5)]],
+    constant int& top_k      [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)np) { return; }
+  const int p = (int)gid;
+  const int e = eid[p];
+  const int slot = boff[e]
+      + atomic_fetch_add_explicit(&cursor[e], 1, memory_order_relaxed);
+  srow[slot] = p / top_k;   // input (token) row
+  sdst[slot] = p;           // pair-ordered destination
+}
+
+// Scatter grouped-down outputs back to pair order: partials[sdst[slot]] =
+// dsorted[slot]. grid(npad*H); pad slots (sdst<0) skipped.
+kernel void moe_scatter_back_f16(
+    const device VPIPE_ELT* dsorted [[buffer(0)]],  // [npad, H]
+    const device int* sdst          [[buffer(1)]],  // [npad]
+    device VPIPE_ELT* partials      [[buffer(2)]],  // [np, H]
+    constant int& H                 [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int slot = (int)gid / H;
+  const int h = (int)gid % H;
+  const int p = sdst[slot];
+  if (p < 0) { return; }
+  partials[(int64_t)p * H + h] = dsorted[(int64_t)slot * H + h];
+}
+
+// MoE block finalize: x[t,h] += moe_out[t,h] + g[t] * shared_out[t,h], where
+// g[t] = sigmoid(shared_expert_gate . x_t) precomputed in gbuf[t]. In-place on
+// x (the post-attention residual stream). grid(M*H); decode is the M=1 case.
+kernel void moe_finalize_f16(
+    device VPIPE_ELT* x                [[buffer(0)]],  // [M, H] residual, in-place
+    const device VPIPE_ELT* moe_out    [[buffer(1)]],  // [M, H]
+    const device VPIPE_ELT* shared_out [[buffer(2)]],  // [M, H]
+    const device VPIPE_ELT* gbuf       [[buffer(3)]],  // [M] sigmoid gate
+    constant int& H                    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int t = (int)gid / H;
+  const float g = (float)gbuf[t];
+  x[gid] = (VPIPE_ELT)((float)x[gid] + (float)moe_out[gid]
+                       + g * (float)shared_out[gid]);
+}
+
+// Fused combine + finalize: does moe_combine's weighted partial-sum INLINE
+// (saves the separate moe_combine dispatch + its hazard barrier + the moe_out
+// buffer, x40 decode layers). Bit-exact with moe_combine->moe_finalize: the
+// partial-sum is rounded to VPIPE_ELT before the add, matching the f16 moe_out
+// the two-kernel path materializes.  grid (M*H).
+kernel void moe_finalize_combined_f16(
+    device VPIPE_ELT* x                [[buffer(0)]],  // [M, H] residual in-place
+    const device VPIPE_ELT* partials   [[buffer(1)]],  // [M*top_k, H]
+    const device VPIPE_ELT* w          [[buffer(2)]],  // [M*top_k] routing wts
+    const device VPIPE_ELT* shared_out [[buffer(3)]],  // [M, H]
+    const device VPIPE_ELT* gbuf       [[buffer(4)]],  // [M] sigmoid gate
+    constant int& H                    [[buffer(5)]],
+    constant int& top_k                [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int h = (int)gid % H;
+  const int t = (int)gid / H;
+  const int base = t * top_k;
+  float acc = 0.0f;
+  for (int s = 0; s < top_k; ++s) {
+    acc += (float)w[base + s] * (float)partials[(int64_t)(base + s) * H + h];
+  }
+  const float moe = (float)(VPIPE_ELT)acc;   // match moe_out's f16 round
+  const float g = (float)gbuf[t];
+  x[gid] = (VPIPE_ELT)((float)x[gid] + moe + g * (float)shared_out[gid]);
 }
 
 // out[i] = gelu_approx(gate[i]) * up[i], where gelu_approx is the
@@ -107,6 +389,27 @@ kernel void softcap_f16(
 {
   if (gid >= (uint)n) { return; }
   out[gid] = VPIPE_ELT(precise::tanh(float(x[gid]) / cap) * cap);
+}
+
+// Forbid specific tokens: overwrite logits[ids[i]] with a large negative
+// sentinel so they are never argmaxed and get ~0 weight in the sampler
+// (which does exp(logit - maxlogit), so a far-negative logit -> weight 0).
+// Used to keep realtime decode short by banning Gemma's reasoning-channel
+// open tokens so the model can't spend the budget on a <|channel>thought
+// ...<channel|> block. MUST run AFTER the final softcap (else the cap pulls
+// it back). The sentinel is finite in both f16 and bf16 and far below
+// Gemma's capped logit range. n_ids is small.
+//   0:logits 1:ids(int32) 2:n_ids 3:V.  grid (n_ids).
+kernel void suppress_logits_f16(
+    device VPIPE_ELT*   logits [[buffer(0)]],
+    const device int*   ids    [[buffer(1)]],
+    constant int&       n_ids  [[buffer(2)]],
+    constant int&       V      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n_ids) { return; }
+  const int id = ids[gid];
+  if (id >= 0 && id < V) { logits[id] = (VPIPE_ELT)(-6.0e4f); }
 }
 
 // x[i] *= s  (Gemma-4 embed_scale, per-layer scalar, PLE scales). In
@@ -515,17 +818,13 @@ kernel void qmv_q6k_f16(
 // + f16 x/y contract and the SAME (32, ceil(N/8)*2, 1)/(32, 2, 1) dispatch.
 // NOT bit-identical to qmv_q6k_f16 (different fp grouping) but token-exact.
 // Requires H % 256 == 0.
-kernel void qmv_q6k_v2_f16(
-    const device uchar*     w [[buffer(0)]],
-    const device VPIPE_ELT* x [[buffer(1)]],
-    device VPIPE_ELT*       y [[buffer(2)]],
-    constant int&           H [[buffer(3)]],
-    constant int&           N [[buffer(4)]],
-    uint3 tid      [[threadgroup_position_in_grid]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+template <int RPS, int NSG>
+static inline void qmv_q6k_v2_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    int H, int N, uint3 tid, uint simd_gid, uint simd_lid)
 {
-  constexpr int RPS = 4, NSG = 2;
   const int nsb = H / 256;                  // super-blocks per row
   const int row_bytes = nsb * 210;
   const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
@@ -583,6 +882,32 @@ kernel void qmv_q6k_v2_f16(
     }
   }
 }
+
+// RPS = rows/simdgroup, NSG = simdgroups/threadgroup (= threadgroup.y at
+// dispatch). Default = <4,2>; the _rNnM variants exist to sweep the tuning
+// (llama.cpp uses nr0=2 + a device-tuned nsg via function constant).
+#define VPIPE_Q6K_V2(NAME, RPS, NSG)                                          \
+kernel void qmv_q6k_v2##NAME##_f16(                                           \
+    const device uchar*     w [[buffer(0)]],                                  \
+    const device VPIPE_ELT* x [[buffer(1)]],                                  \
+    device VPIPE_ELT*       y [[buffer(2)]],                                  \
+    constant int&           H [[buffer(3)]],                                  \
+    constant int&           N [[buffer(4)]],                                  \
+    uint3 tid      [[threadgroup_position_in_grid]],                          \
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],                        \
+    uint  simd_lid [[thread_index_in_simdgroup]])                            \
+{                                                                            \
+  qmv_q6k_v2_impl<RPS, NSG>(w, x, y, H, N, tid, simd_gid, simd_lid);          \
+}
+VPIPE_Q6K_V2(, 4, 2)        // qmv_q6k_v2_f16 (the production default)
+VPIPE_Q6K_V2(_r2n2, 2, 2)
+VPIPE_Q6K_V2(_r8n2, 8, 2)
+VPIPE_Q6K_V2(_r2n4, 2, 4)
+VPIPE_Q6K_V2(_r4n4, 4, 4)
+VPIPE_Q6K_V2(_r1n4, 1, 4)
+VPIPE_Q6K_V2(_r1n8, 1, 8)
+VPIPE_Q6K_V2(_r2n8, 2, 8)
+VPIPE_Q6K_V2(_r4n8, 4, 8)
 
 // ---- Q4_K / Q5_K (llama.cpp k-quant) native unpack ---------------------
 // Both are 256-weight super-blocks of eight 32-weight sub-blocks, each with
@@ -651,6 +976,126 @@ kernel void dequant_q4k_f16(
   if (gid >= (uint)N) { return; }
   const int i = (int)gid;
   out[i] = VPIPE_ELT(q4k_value(src + (i / 256) * 144, i & 255));
+}
+
+// Repack a raw Q4_K weight [N, H] into the MLX affine-4bit-g32 form the fast
+// affine_qmv_w4g32 kernel consumes (decode runs ~2x faster than the native
+// k-quant qmv_q4k -- the k-quant scale unpack is the bottleneck, the affine
+// kernel's uint32 loads + separate scale arrays are not). LOSSLESS: a Q4_K
+// 32-weight sub-block is exactly scale*q + bias with scale = d*subscale,
+// bias = -dmin*submin, which is the affine dot the kernel computes.
+//   wq    [N, H/8]  uint32 -- 8 nibbles/word, NATURAL order (weight h -> word
+//                   h/8, nibble h%8), matching qdot's masked-bit reconstruction
+//   scale [N, H/32] elt = d * subscale
+//   bias  [N, H/32] elt = -dmin * submin
+// One thread per (row, super-block) owns 32 words + 8 scales/biases (no races).
+// 0:src(Q4_K) 1:wq 2:scale 3:bias 4:H 5:N.  grid (H/256, N, 1).
+kernel void repack_q4k_to_affine_g32(
+    const device uchar* src   [[buffer(0)]],
+    device uint*        wq     [[buffer(1)]],
+    device VPIPE_ELT*   scale  [[buffer(2)]],
+    device VPIPE_ELT*   bias   [[buffer(3)]],
+    constant int&       H      [[buffer(4)]],
+    constant int&       N      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int nsb = H / 256;
+  const int s = (int)gid.x;          // super-block within the row
+  const int r = (int)gid.y;          // output row
+  if (r >= N || s >= nsb) { return; }
+  const device uchar* sb = src + ((uint)r * nsb + s) * 144;
+  const float d    = float(*(const device half*)(sb + 0));
+  const float dmin = float(*(const device half*)(sb + 2));
+  const int sc_base = r * (H / 32) + s * 8;
+  for (int is = 0; is < 8; ++is) {
+    uchar sc, m;
+    gsmk4_(is, sb + 4, sc, m);
+    scale[sc_base + is] = VPIPE_ELT(d * float(sc));
+    bias[sc_base + is]  = VPIPE_ELT(-dmin * float(m));
+  }
+  const device uchar* qs = sb + 16;
+  const int w_base = r * (H / 8) + s * 32;
+  for (int u = 0; u < 32; ++u) {       // 32 u32 = 256 weights / super-block
+    uint packed = 0;
+    for (int n = 0; n < 8; ++n) {
+      const int pos = u * 8 + n;       // 0..255 (natural order)
+      const int chunk = pos >> 6;
+      const int l = pos & 31;
+      const uint qb = qs[chunk * 32 + l];
+      const uint nib = ((pos & 63) < 32) ? (qb & 0x0F) : (qb >> 4);
+      packed |= nib << (n * 4);
+    }
+    wq[w_base + u] = packed;
+  }
+}
+
+// Repack a raw Q5_K weight [N, K] into MLX affine-8bit-g32 (Q5_K is 5-bit, so
+// it needs the 8-bit affine kernel -- the q value 0..31 stored one byte each,
+// natural order; scale = d*subscale, bias = -dmin*submin). Lossless. Consumed
+// by affine_qmv_w8g32. EXPERIMENT RESULT (not wired into the model): the 8-bit
+// affine reads +64% bytes (9 vs 5.5 bits/wt), which exactly cancels its higher
+// bandwidth -> 0.99x vs qmv_q5k (wash) for +64% memory. NOT worth it; only
+// Q4_K (same-bit-width 4-bit affine) wins. Kept for the experiment record.
+//   wq    [N, K]    uint8 (raw q, natural order, 1 byte/weight)
+//   scale [N, K/32] elt, bias [N, K/32] elt
+// One thread per (row, super-block). 0:src(Q5_K) 1:wq 2:scale 3:bias 4:K 5:N.
+kernel void repack_q5k_to_affine_g32(
+    const device uchar* src   [[buffer(0)]],
+    device uchar*       wq     [[buffer(1)]],
+    device VPIPE_ELT*   scale  [[buffer(2)]],
+    device VPIPE_ELT*   bias   [[buffer(3)]],
+    constant int&       K      [[buffer(4)]],
+    constant int&       N      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int nsb = K / 256;
+  const int s = (int)gid.x;
+  const int r = (int)gid.y;
+  if (r >= N || s >= nsb) { return; }
+  const device uchar* sb = src + ((uint)r * nsb + s) * 176;
+  const float d    = float(*(const device half*)(sb + 0));
+  const float dmin = float(*(const device half*)(sb + 2));
+  const device uchar* scales = sb + 4;
+  const device uchar* qh = sb + 16;
+  const device uchar* qs = sb + 48;
+  const int sc_base = r * (K / 32) + s * 8;
+  for (int is = 0; is < 8; ++is) {
+    uchar sc, m;
+    gsmk4_(is, scales, sc, m);
+    scale[sc_base + is] = VPIPE_ELT(d * float(sc));
+    bias[sc_base + is]  = VPIPE_ELT(-dmin * float(m));
+  }
+  const int w_base = r * K + s * 256;
+  for (int pos = 0; pos < 256; ++pos) {
+    const int chunk = pos >> 6;
+    const int l = pos & 31;
+    const uint qb = qs[chunk * 32 + l];
+    uint nib = ((pos & 63) < 32) ? (qb & 0x0F) : (qb >> 4);
+    const int bit = 2 * chunk + (((pos & 63) < 32) ? 0 : 1);
+    nib += ((uint(qh[l]) >> bit) & 1u) * 16u;
+    wq[w_base + pos] = (uchar)nib;
+  }
+}
+
+// Embed gather from a raw Q4_K table: out[t,:] = dequant(table[ids[t], :]).
+// Mirrors embed_gather_q6k_f16 but for Q4_K super-blocks (144 bytes / 256
+// weights, see q4k_value). Used by untied checkpoints whose token_embd is
+// Q4_K (the separate Q6_K output.weight is then the lm_head). 0:ids
+// 1:table(Q4_K) 2:out 3:H.  grid (H, n_tokens).
+kernel void embed_gather_q4k_f16(
+    const device int*   ids   [[buffer(0)]],
+    const device uchar* table [[buffer(1)]],
+    device VPIPE_ELT*   out   [[buffer(2)]],
+    constant int&       H     [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int h = (int)gid.x;
+  if (h >= H) { return; }
+  const int t = (int)gid.y;
+  const int id = ids[t];
+  const int row_bytes = (H / 256) * 144;
+  const device uchar* sb = table + (uint)id * row_bytes + (h / 256) * 144;
+  out[(uint)t * H + h] = VPIPE_ELT(q4k_value(sb, h & 255));
 }
 
 // Plain f16 strided copy: out[off + gid] = src[gid] for gid in [0, N).
@@ -767,8 +1212,13 @@ kernel void qmv_q4k_f16(
   if (lane == 0) { y[row] = VPIPE_ELT(v); }
 }
 
-// Q5_K: same full-byte tiling, plus the 5th bit from qh[l+k] (low nibble at
-// bit 2*chunk, high at 2*chunk+1).
+// Q5_K: ported from llama.cpp kernel_mul_mv_q5_K_f32 (the native q5k qmv was
+// the slow single-row scalar form). 1 row/simdgroup (NSG=2), but the 32 lanes
+// split FOUR ways over super-blocks (ix = lane%4 -> 4 blocks in flight = more
+// memory-level parallelism), with the x slice loaded once, the affine bias
+// FACTORED (d*sc*Sum(x*q) - dmin*m*Sum(x)), and the power-of-16 nibble trick
+// (high nibble kept in place, scale divided by 16). Token-exact (different fp
+// grouping). grid (32, ceil(N/2)*2, 1); threadgroup (32, 2, 1).
 kernel void qmv_q5k_f16(
     const device uchar*     w [[buffer(0)]],
     const device VPIPE_ELT* x [[buffer(1)]],
@@ -784,37 +1234,62 @@ kernel void qmv_q5k_f16(
   if (row >= N) { return; }
   const int nsb = H / 256;
   const device uchar* rowp = w + (uint)row * (nsb * 176);
-  const int lane  = (int)simd_lid;
-  const int bi    = lane * 4;
-  const int chunk = bi >> 5;
-  const int l     = bi & 31;
-  const int is_lo = chunk * 2, is_hi = chunk * 2 + 1;
-  const int blo_bit = 2 * chunk, bhi_bit = 2 * chunk + 1;
-  const int xlo   = chunk * 64 + l;
-  const int xhi   = xlo + 32;
-  float acc = 0.0f;
-  for (int s = 0; s < nsb; ++s) {
-    const device uchar* sb = rowp + s * 176;
-    const float d    = float(*(const device half*)(sb + 0));
-    const float dmin = float(*(const device half*)(sb + 2));
-    uchar slo, mlo, shi, mhi;
-    gsmk4_(is_lo, sb + 4, slo, mlo);
-    gsmk4_(is_hi, sb + 4, shi, mhi);
-    const float dlo = d * float(slo), blo = dmin * float(mlo);
-    const float dhi = d * float(shi), bhi = dmin * float(mhi);
-    const device uchar* qh = sb + 16 + l;
-    const device uchar* qs = sb + 48 + chunk * 32 + l;
-    const int xb = s * 256;
-    for (int k = 0; k < 4; ++k) {
-      const uint qb  = qs[k];
-      const uint qhb = qh[k];
-      const uint nlo = (qb & 0x0F) + (((qhb >> blo_bit) & 1u) * 16u);
-      const uint nhi = (qb >> 4)   + (((qhb >> bhi_bit) & 1u) * 16u);
-      acc += float(x[xb + xlo + k]) * (dlo * float(nlo) - blo);
-      acc += float(x[xb + xhi + k]) * (dhi * float(nhi) - bhi);
+  const int lane = (int)simd_lid;
+  const int tt = lane >> 2;            // 0..7
+  const int ix = lane & 3;             // 0..3 (4-way super-block split)
+  const int iq = tt >> 2;              // 0..1
+  const int ir = tt & 3;               // 0..3
+  const int l0 = 8 * ir;
+  const int q_offset = 32 * iq + l0;
+  const int y_offset = 64 * iq + l0;
+  const uint hm1 = 1u << (2 * iq);
+  const uint hm2 = hm1 << 1, hm3 = hm1 << 4, hm4 = hm2 << 4;
+  constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+  float sumf = 0.0f;
+  for (int i = ix; i < nsb; i += 4) {
+    const device uchar* sb = rowp + i * 176;
+    const device half*   dh = (const device half*)(sb + 0);          // d, dmin
+    const device ushort* a  = (const device ushort*)(sb + 4) + iq;   // scales
+    const device uchar*  qh = sb + 16 + l0;
+    const device uchar*  q1 = sb + 48 + q_offset;
+    const device uchar*  q2 = q1 + 64;
+    const int xb = i * 256 + y_offset;
+    float yl[16], yh[16];
+    float4 sumy = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int l = 0; l < 8; ++l) {
+      yl[l + 0] = float(x[xb + l +   0]); sumy[0] += yl[l + 0];
+      yl[l + 8] = float(x[xb + l +  32]); sumy[1] += yl[l + 8];
+      yh[l + 0] = float(x[xb + l + 128]); sumy[2] += yh[l + 0];
+      yh[l + 8] = float(x[xb + l + 160]); sumy[3] += yh[l + 8];
     }
+    ushort sc16[4];
+    sc16[0] = a[0] & kmask1;
+    sc16[1] = a[2] & kmask1;
+    sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+    sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+    const thread uchar* sc8 = (const thread uchar*)sc16;
+    float4 acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float4 acc2 = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int l = 0; l < 8; ++l) {
+      const uint h = qh[l];
+      acc1[0] += yl[l + 0] * float(q1[l] & 0x0F);
+      acc1[1] += yl[l + 8] * float(q1[l] & 0xF0);
+      acc1[2] += yh[l + 0] * float(q2[l] & 0x0F);
+      acc1[3] += yh[l + 8] * float(q2[l] & 0xF0);
+      acc2[0] += (h & hm1) ? yl[l + 0] : 0.0f;
+      acc2[1] += (h & hm2) ? yl[l + 8] : 0.0f;
+      acc2[2] += (h & hm3) ? yh[l + 0] : 0.0f;
+      acc2[3] += (h & hm4) ? yh[l + 8] : 0.0f;
+    }
+    const float d = float(dh[0]), dmin = float(dh[1]);
+    sumf += d * (float(sc8[0]) * (acc1[0]         + 16.0f * acc2[0]) +
+                 float(sc8[1]) * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
+                 float(sc8[4]) * (acc1[2]         + 16.0f * acc2[2]) +
+                 float(sc8[5]) * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
+          dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                  sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
   }
-  const float v = simd_sum(acc);
+  const float v = simd_sum(sumf);
   if (lane == 0) { y[row] = VPIPE_ELT(v); }
 }
 
@@ -1296,6 +1771,128 @@ kernel void argmax_f16(
   if (tid == 0) { out_id[0] = tg_idx[0]; }
 }
 
+// ---------------------------------------------------------------------
+// Two-stage argmax: parallelise the 512KB vocab read across GPU cores.
+// argmax_f16 above runs in a SINGLE threadgroup -> one core does the whole
+// 262k-element scan. Here stage-1 (argmax_partial_f16) fires M threadgroups,
+// each owning a CONTIGUOUS vocab slab, and stage-2 (argmax_combine_f16)
+// reduces the M (val,idx) partials in one small threadgroup.
+//
+// TIE-BREAK (must match argmax_f16 / the host left-to-right argmax exactly):
+// the winner on an f16 tie is the LOWEST global vocab index. Because each
+// partial carries the GLOBAL index of its slab-best (itself tie-broken to the
+// lowest index inside the slab), and the combine breaks ties by lower index
+// too, the global lowest-index winner is preserved bit-for-bit. Contiguous
+// slabs are not required for correctness (the index tie-break is global), but
+// they keep each threadgroup's reads coalesced.
+//
+// Intra-threadgroup reduction uses a simd_max on the value to find the slab
+// max, then a second simd reduction to pick the lowest index AMONG lanes
+// holding that max -- carrying the index through simd_shuffle so we never
+// need the full 8-step barrier tree. A tiny cross-simdgroup tree (<=8 entries)
+// finishes the threadgroup.
+
+// (val,idx) argmax reduction across one simdgroup (32 lanes): returns the max
+// value and, among lanes tied at that value, the lowest index. Branchless on
+// the value via simd_max; the index is resolved by masking non-winners to INT
+// MAX and taking simd_min.
+inline void simd_argmax_lowidx(float v, int idx, thread float& out_v,
+                               thread int& out_i)
+{
+  const float mx = simd_max(v);
+  // Lanes not holding the max can't win; push their idx to +inf for the min.
+  const int cand = (v == mx) ? idx : 0x7fffffff;
+  out_v = mx;
+  out_i = simd_min(cand);
+}
+
+//   0:logits 1:partials(float2-as-[val,idx] packed: 2*M floats) 2:V 3:M
+kernel void argmax_partial_f16(
+    const device VPIPE_ELT* logits   [[buffer(0)]],
+    device float*           partials [[buffer(1)]],   // [2*M]: val,idx pairs
+    constant int&           V        [[buffer(2)]],
+    constant int&           M        [[buffer(3)]],
+    uint  tid      [[thread_position_in_threadgroup]],
+    uint  nthg     [[threads_per_threadgroup]],
+    uint  gid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  // Contiguous slab for this threadgroup: [lo, hi).
+  const uint slab = ((uint)V + (uint)M - 1u) / (uint)M;
+  const uint lo = gid * slab;
+  uint hi = lo + slab;
+  if (hi > (uint)V) { hi = (uint)V; }
+
+  float best = -INFINITY;
+  int   bi   = 0x7fffffff;
+  for (uint i = lo + tid; i < hi; i += nthg) {
+    const float val = float(logits[i]);
+    // Lowest-index tie-break within the lane's own stream.
+    if (val > best || (val == best && (int)i < bi)) {
+      best = val; bi = (int)i;
+    }
+  }
+  // If this lane touched nothing (slab smaller than nthg), bi stays INT_MAX;
+  // best stays -inf so it loses the value compare anyway.
+
+  // Reduce within the simdgroup (32 lanes) -> (val,idx).
+  float sv; int si;
+  simd_argmax_lowidx(best, bi, sv, si);
+
+  threadgroup float tg_val[32];   // <= 256/32 = 8 simdgroups, sized to 32.
+  threadgroup int   tg_idx[32];
+  if (simd_lid == 0) { tg_val[simd_gid] = sv; tg_idx[simd_gid] = si; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Cross-simdgroup reduction in simdgroup 0 (<=8 live entries).
+  if (simd_gid == 0) {
+    const uint nsg = (nthg + 31u) / 32u;
+    float lv = (simd_lid < nsg) ? tg_val[simd_lid] : -INFINITY;
+    int   li = (simd_lid < nsg) ? tg_idx[simd_lid] : 0x7fffffff;
+    float fv; int fi;
+    simd_argmax_lowidx(lv, li, fv, fi);
+    if (simd_lid == 0) {
+      partials[2u * gid + 0u] = fv;
+      partials[2u * gid + 1u] = float(fi);   // idx fits exactly in f32 < 2^24? V=262144 < 2^24 -> exact.
+    }
+  }
+}
+
+//   0:partials([2*M]) 1:out_id(int) 2:M
+kernel void argmax_combine_f16(
+    const device float* partials [[buffer(0)]],
+    device int*         out_id   [[buffer(1)]],
+    constant int&       M        [[buffer(2)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  threadgroup float tg_val[256];
+  threadgroup int   tg_idx[256];
+  float best = -INFINITY;
+  int   bi   = 0x7fffffff;
+  for (uint p = tid; p < (uint)M; p += nthg) {
+    const float val = partials[2u * p + 0u];
+    const int   idx = (int)partials[2u * p + 1u];
+    if (val > best || (val == best && idx < bi)) { best = val; bi = idx; }
+  }
+  tg_val[tid] = best;
+  tg_idx[tid] = bi;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      const bool take = tg_val[tid + s] > tg_val[tid] ||
+          (tg_val[tid + s] == tg_val[tid] && tg_idx[tid + s] < tg_idx[tid]);
+      if (take) {
+        tg_val[tid] = tg_val[tid + s];
+        tg_idx[tid] = tg_idx[tid + s];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid == 0) { out_id[0] = tg_idx[0]; }
+}
+
 // Full sampler over a [V] logits row -> out_id[0] (int32), fully on-GPU
 // so the sampled token never leaves the device and the pipelined decode
 // loop runs non-greedy at greedy speed. Single threadgroup (256 lanes).
@@ -1484,6 +2081,361 @@ kernel void sample_topp_f16(
   }
   // Fallback to argmax of the (degenerate) row if nothing was kept; mark
   // the drawn token seen so penalties see it on the next step.
+  if (tid == 0) {
+    const int pick = tgi[0] >= 0 ? tgi[0] : 0;
+    out_id[0] = pick;
+    seen[pick] = 1;
+  }
+}
+
+// =====================================================================
+// HISTOGRAM-BASED MULTI-THREADGROUP SAMPLER (sample_topp drop-in).
+//
+// sample_topp_f16 above is a SINGLE threadgroup that rescans the full 262k
+// vocab ~18x (the top-k / top-p binary searches). These kernels keep its
+// EXACT semantics (penalty formula+order, temp/softmax, the top-k/min-p/top-p
+// MAX-of-thresholds combination, the Gumbel hash + seed, the seen[] update)
+// but reduce the work to ~3 multi-tg vocab passes + a tiny per-bin pass:
+//
+//   Pass A  (sample_max_partial / _combine): max of the penalised eff over
+//           vocab, split across slabs (mirrors argmax_partial/_combine).
+//   Pass B  (sample_zhist_partial / _combine): ONE vocab pass writes
+//           ws[i] = exp((eff_i - max)/temp), accumulates a partial Z, AND a
+//           per-tg log-spaced HISTOGRAM of ws into B bins; the combine sums
+//           the partial Z's and histograms into a global (count,mass)[B].
+//   Thresh  (sample_thresh): single tg over the B bins -- scan high-weight
+//           bin -> low, find the top-k count cutoff, the top-p mass cutoff,
+//           and the min-p floor; wt = max of the three bin-edge thresholds.
+//           NO vocab rescan (B is tiny).
+//   Pass C  (sample_pick_partial / _combine): Gumbel-max over {ws_i >= wt},
+//           lowest-index tie-break, write out_id, set seen[out_id].
+//
+// BIN LAYOUT: after subtracting the max penalised logit, max weight == 1, so
+// log-weight lw = -log(w) >= 0. Bins are uniform in lw over [0, kSampLwMax):
+// bin = floor(lw / (kSampLwMax/B)), clamped to [0, B-1] (bin 0 = highest
+// weight). The threshold a bin represents is its LOW-weight edge
+// exp(-(bin+1)*binw) -- including the whole bin makes the nucleus/top-k
+// slightly LOOSER than the exact binary search (distributionally negligible
+// at B=1024). Bins are reduced as float pairs (count, mass) so the combine is
+// a plain element-wise add.
+//
+// The histogram is laid out [2*B] floats per partial: [0..B) counts then
+// [B..2B) masses, so a tg writes its bins contiguously. The global histogram
+// after combine is also [2*B]: counts then masses.
+
+constant constexpr int   kSampB     = 1024;   // histogram bins
+constant constexpr float kSampLwMax = 40.0f;  // lw range [0,40): w in [e^-40,1]
+// Threadgroup atomic_float is unsupported in this MSL toolchain, so the per-tg
+// histogram counts go through atomic_uint (exact) and the per-tg histogram MASS
+// goes through atomic_uint fixed-point (weight w in (0,1] scaled by 2^16). A
+// single tg's slab has <= V/M elements (each mass <= 1), so the max per-bin
+// fixed-point sum is (V/M)*2^16; at M>=64, V=262144 that is < 2.7e8 << 2^32, so
+// no overflow. The 2^-16 quantum is ~1.5e-5 per add -- far finer than the ~4%
+// (one-bin) granularity the threshold scan needs, so it is distributionally
+// invisible.
+constant constexpr float kSampMassScale = 65536.0f;   // 2^16 fixed-point
+
+inline int vpipe_samp_bin(float w)
+{
+  // w in (0,1]; lw = -log(w) >= 0. Clamp lw into [0, kSampLwMax) -> bin.
+  const float lw = -log(max(w, 1e-30f));
+  const float binw = kSampLwMax / float(kSampB);
+  int b = int(lw / binw);
+  if (b < 0) { b = 0; }
+  if (b >= kSampB) { b = kSampB - 1; }
+  return b;
+}
+
+// Pass A stage 1: partial max of penalised eff over a contiguous slab.
+//   0:logits 1:partials([M] f32 maxes) 2:V 3:M 4:rep 5:pres 6:seen
+kernel void sample_max_partial_f16(
+    const device VPIPE_ELT* logits   [[buffer(0)]],
+    device float*           partials [[buffer(1)]],
+    constant int&           V        [[buffer(2)]],
+    constant int&           M        [[buffer(3)]],
+    constant float&         rep      [[buffer(4)]],
+    constant float&         pres     [[buffer(5)]],
+    const device uchar*     seen     [[buffer(6)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]],
+    uint gid  [[threadgroup_position_in_grid]])
+{
+  const uint slab = ((uint)V + (uint)M - 1u) / (uint)M;
+  const uint lo = gid * slab;
+  uint hi = lo + slab;
+  if (hi > (uint)V) { hi = (uint)V; }
+
+  threadgroup float tg[256];
+  float m = -INFINITY;
+  for (uint i = lo + tid; i < hi; i += nthg) {
+    m = max(m, vpipe_eff_logit(float(logits[i]), seen[i] != 0, rep, pres));
+  }
+  tg[tid] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] = max(tg[tid], tg[tid + s]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid == 0) { partials[gid] = tg[0]; }
+}
+
+// Pass A stage 2: combine the M partial maxes -> partials_out[0].
+//   0:partials([M]) 1:maxl_out([1] f32) 2:M
+kernel void sample_max_combine_f16(
+    const device float* partials [[buffer(0)]],
+    device float*       maxl_out [[buffer(1)]],
+    constant int&       M        [[buffer(2)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  threadgroup float tg[256];
+  float m = -INFINITY;
+  for (uint p = tid; p < (uint)M; p += nthg) { m = max(m, partials[p]); }
+  tg[tid] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] = max(tg[tid], tg[tid + s]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid == 0) { maxl_out[0] = tg[0]; }
+}
+
+// Pass B stage 1: over a contiguous slab, cache ws[i]=exp((eff-maxl)/temp),
+// accumulate partial Z and a per-tg log-spaced histogram (count,mass) of ws.
+// Each partial occupies [2*kSampB+1] floats: [0..B) counts, [B..2B) masses,
+// [2B] = partial Z.
+//   0:logits 1:ws 2:partials 3:V 4:M 5:temp 6:rep 7:pres 8:seen 9:maxl_in([1])
+kernel void sample_zhist_partial_f16(
+    const device VPIPE_ELT* logits   [[buffer(0)]],
+    device VPIPE_ELT*       ws       [[buffer(1)]],
+    device float*           partials [[buffer(2)]],
+    constant int&           V        [[buffer(3)]],
+    constant int&           M        [[buffer(4)]],
+    constant float&         temp     [[buffer(5)]],
+    constant float&         rep      [[buffer(6)]],
+    constant float&         pres     [[buffer(7)]],
+    const device uchar*     seen     [[buffer(8)]],
+    const device float*     maxl_in  [[buffer(9)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]],
+    uint gid  [[threadgroup_position_in_grid]])
+{
+  const float maxl  = maxl_in[0];
+  const float inv_t = 1.0f / max(temp, 1e-6f);
+  const uint  slab  = ((uint)V + (uint)M - 1u) / (uint)M;
+  const uint  lo    = gid * slab;
+  uint hi = lo + slab;
+  if (hi > (uint)V) { hi = (uint)V; }
+
+  // Per-tg histogram in threadgroup memory: counts[B] (exact uint) and masses
+  // [B] (uint fixed-point, scale 2^16). atomic_float is unsupported here.
+  threadgroup atomic_uint h_cnt[kSampB];
+  threadgroup atomic_uint h_mass[kSampB];
+  for (uint b = tid; b < (uint)kSampB; b += nthg) {
+    atomic_store_explicit(&h_cnt[b], 0u, memory_order_relaxed);
+    atomic_store_explicit(&h_mass[b], 0u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float z = 0.0f;
+  for (uint i = lo + tid; i < hi; i += nthg) {
+    const float e = vpipe_eff_logit(float(logits[i]), seen[i] != 0, rep, pres);
+    const float w = exp((e - maxl) * inv_t);
+    ws[i] = (VPIPE_ELT)w;
+    z += w;
+    const int b = vpipe_samp_bin(w);
+    atomic_fetch_add_explicit(&h_cnt[b], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&h_mass[b],
+                              (uint)(w * kSampMassScale), memory_order_relaxed);
+  }
+  // Partial Z reduction.
+  threadgroup float tg[256];
+  tg[tid] = z;
+  threadgroup_barrier(mem_flags::mem_threadgroup |
+                      mem_flags::mem_device);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) { tg[tid] += tg[tid + s]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Flush this tg's histogram + Z to its partial slab (count, mass-as-float).
+  device float* P = partials + (size_t)gid * (size_t)(2 * kSampB + 1);
+  for (uint b = tid; b < (uint)kSampB; b += nthg) {
+    P[b]          = (float)atomic_load_explicit(&h_cnt[b], memory_order_relaxed);
+    P[kSampB + b] = (float)atomic_load_explicit(&h_mass[b], memory_order_relaxed)
+                    * (1.0f / kSampMassScale);
+  }
+  if (tid == 0) { P[2 * kSampB] = tg[0]; }
+}
+
+// Pass B stage 2: sum the M partial histograms + Z into the global histogram.
+// Global layout: hist[0..B)=counts, hist[B..2B)=masses, hist[2B]=Z.
+//   0:partials 1:hist_out([2B+1]) 2:M
+kernel void sample_zhist_combine_f16(
+    const device float* partials [[buffer(0)]],
+    device float*       hist_out [[buffer(1)]],
+    constant int&       M        [[buffer(2)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  const uint stride = (uint)(2 * kSampB + 1);
+  // Each thread owns a strided set of the 2B histogram cells; sum over M.
+  for (uint c = tid; c < (uint)(2 * kSampB); c += nthg) {
+    float acc = 0.0f;
+    for (uint p = 0; p < (uint)M; ++p) { acc += partials[p * stride + c]; }
+    hist_out[c] = acc;
+  }
+  if (tid == 0) {
+    float zsum = 0.0f;
+    for (uint p = 0; p < (uint)M; ++p) {
+      zsum += partials[p * stride + (uint)(2 * kSampB)];
+    }
+    hist_out[2 * kSampB] = zsum;
+  }
+}
+
+// Threshold stage: single tg over the B bins. Scan high-weight bin (0) -> low,
+// accumulating count and mass; the top-k threshold is the LOW edge of the bin
+// where cumulative count first reaches top_k, the top-p threshold the LOW edge
+// of the bin where cumulative mass first reaches top_p*Z. min-p floor is the
+// raw min_p weight. wt = max(t_k, t_mp, t_p). Writes wt to wt_out[0].
+//   0:hist([2B+1]) 1:wt_out([1]) 2:top_p 3:top_k 4:min_p 5:V
+kernel void sample_thresh_f16(
+    const device float* hist   [[buffer(0)]],
+    device float*       wt_out [[buffer(1)]],
+    constant float&     top_p  [[buffer(2)]],
+    constant int&       top_k  [[buffer(3)]],
+    constant float&     min_p  [[buffer(4)]],
+    constant int&       V      [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+  if (tid != 0) { return; }
+  const float Z      = hist[2 * kSampB];
+  const float target = top_p * Z;
+  const float binw   = kSampLwMax / float(kSampB);
+
+  // bin b spans weights (exp(-(b+1)*binw), exp(-b*binw)]; its LOW edge (the
+  // threshold that INCLUDES the whole bin) is edge(b) = exp(-(b+1)*binw).
+  float t_k = 0.0f, t_p = 0.0f;
+  float cum_cnt = 0.0f, cum_mass = 0.0f;
+  bool have_k = false, have_p = false;
+  const bool do_k = (top_k > 0 && top_k < V);
+  for (int b = 0; b < kSampB; ++b) {
+    cum_cnt  += hist[b];
+    cum_mass += hist[kSampB + b];
+    const float edge = exp(-float(b + 1) * binw);
+    if (do_k && !have_k && cum_cnt >= float(top_k)) {
+      t_k = edge; have_k = true;
+    }
+    if (!have_p && cum_mass >= target) {
+      t_p = edge; have_p = true;
+    }
+    if ((!do_k || have_k) && have_p) { break; }
+  }
+  // If a target was never reached (e.g. all mass in the tail bin), the
+  // threshold stays 0 -> keeps everything (matches the binary search's lo=0).
+  const float t_mp = max(min_p, 0.0f);
+  wt_out[0] = max(max(t_k, t_mp), t_p);
+}
+
+// Pass C stage 1: Gumbel-max partial over a contiguous slab of {ws_i >= wt}.
+// partials: [2*M] (score,idx) pairs (idx as float, exact for V<2^24).
+//   0:logits 1:ws 2:partials 3:V 4:M 5:temp 6:seed 7:rep 8:pres 9:seen
+//   10:wt_in([1])
+kernel void sample_pick_partial_f16(
+    const device VPIPE_ELT* logits   [[buffer(0)]],
+    const device VPIPE_ELT* ws       [[buffer(1)]],
+    device float*           partials [[buffer(2)]],
+    constant int&           V        [[buffer(3)]],
+    constant int&           M        [[buffer(4)]],
+    constant float&         temp     [[buffer(5)]],
+    constant uint&          seed     [[buffer(6)]],
+    constant float&         rep      [[buffer(7)]],
+    constant float&         pres     [[buffer(8)]],
+    const device uchar*     seen     [[buffer(9)]],
+    const device float*     wt_in    [[buffer(10)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]],
+    uint gid  [[threadgroup_position_in_grid]])
+{
+  const float inv_t = 1.0f / max(temp, 1e-6f);
+  const float wt    = wt_in[0];
+  const uint  slab  = ((uint)V + (uint)M - 1u) / (uint)M;
+  const uint  lo    = gid * slab;
+  uint hi = lo + slab;
+  if (hi > (uint)V) { hi = (uint)V; }
+
+  threadgroup float tg[256];
+  threadgroup int   tgi[256];
+  float best = -INFINITY;
+  int   bi   = -1;
+  for (uint i = lo + tid; i < hi; i += nthg) {
+    if (float(ws[i]) >= wt) {
+      const float e =
+          vpipe_eff_logit(float(logits[i]), seen[i] != 0, rep, pres);
+      const float u = vpipe_hash_u01(seed ^ (i * 2654435761u + 1u));
+      const float g = -log(-log(u + 1e-20f) + 1e-20f);
+      const float score = e * inv_t + g;
+      // Lowest-index tie-break (deterministic given seed).
+      if (score > best || (score == best && (int)i < bi)) {
+        best = score; bi = (int)i;
+      }
+    }
+  }
+  tg[tid]  = best;
+  tgi[tid] = bi;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      const bool take = tg[tid + s] > tg[tid] ||
+          (tg[tid + s] == tg[tid] && tgi[tid + s] >= 0 &&
+           (tgi[tid] < 0 || tgi[tid + s] < tgi[tid]));
+      if (take) { tg[tid] = tg[tid + s]; tgi[tid] = tgi[tid + s]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid == 0) {
+    partials[2u * gid + 0u] = tg[0];
+    partials[2u * gid + 1u] = float(tgi[0]);
+  }
+}
+
+// Pass C stage 2: combine the M (score,idx) partials -> out_id, set seen.
+// Same tie-break as sample_topp_f16's final reduction (lowest index among
+// equal scores; -1 means "nothing kept in this partial").
+//   0:partials([2M]) 1:out_id 2:M 3:seen
+kernel void sample_pick_combine_f16(
+    const device float* partials [[buffer(0)]],
+    device int*         out_id   [[buffer(1)]],
+    constant int&       M        [[buffer(2)]],
+    device uchar*       seen     [[buffer(3)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint nthg [[threads_per_threadgroup]])
+{
+  threadgroup float tg[256];
+  threadgroup int   tgi[256];
+  float best = -INFINITY;
+  int   bi   = -1;
+  for (uint p = tid; p < (uint)M; p += nthg) {
+    const float sc = partials[2u * p + 0u];
+    const int   id = (int)partials[2u * p + 1u];
+    if (id < 0) { continue; }
+    if (sc > best || (sc == best && (bi < 0 || id < bi))) {
+      best = sc; bi = id;
+    }
+  }
+  tg[tid]  = best;
+  tgi[tid] = bi;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = nthg >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      const bool take = tg[tid + s] > tg[tid] ||
+          (tg[tid + s] == tg[tid] && tgi[tid + s] >= 0 &&
+           (tgi[tid] < 0 || tgi[tid + s] < tgi[tid]));
+      if (take) { tg[tid] = tg[tid + s]; tgi[tid] = tgi[tid + s]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (tid == 0) {
     const int pick = tgi[0] >= 0 ? tgi[0] : 0;
     out_id[0] = pick;

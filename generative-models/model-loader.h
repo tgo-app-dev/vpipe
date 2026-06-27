@@ -119,6 +119,20 @@ struct ModelConfig {
   // false for vanilla Llama/Qwen2.5.
   bool               attn_output_gate = false;
 
+  // ---- Mixture-of-Experts fields (Qwen3.5-MoE) ---------------------
+  // Populated for Qwen3_5MoeForConditionalGeneration. num_experts > 0
+  // means EVERY decoder layer's MLP is a SparseMoeBlock: a softmax router
+  // (mlp.gate, w8) selects top-k of num_experts experts (mlp.switch_mlp,
+  // batched 3D w4 tensors), their outputs are score-weighted and summed,
+  // plus an always-on shared expert (mlp.shared_expert, dense w4) gated by
+  // sigmoid(mlp.shared_expert_gate, w8). 0 for dense models. The hybrid
+  // GDN+full-attn backbone is unchanged; MoE only replaces the MLP.
+  int                num_experts             = 0;   // total experts (256)
+  int                num_experts_per_tok     = 0;   // top-k (8)
+  int                moe_intermediate_size   = 0;   // per-expert inner (512)
+  int                shared_expert_inter     = 0;   // shared-expert inner (512)
+  bool               norm_topk_prob          = true;// renorm top-k weights
+
   // ---- Vision tower config (Qwen3-VL family) -----------------------
   // Populated from the nested `vision_config` object in HF config.json
   // when the architecture is Qwen3_5ForConditionalGeneration (or any

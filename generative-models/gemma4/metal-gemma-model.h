@@ -46,6 +46,8 @@ namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
 
 namespace vpipe::genai {
 
+class TuningReport;   // generative-models/shared/kernel-autotune.h
+
 struct ModelConfig;
 
 class MetalGemmaModel {
@@ -189,10 +191,23 @@ public:
 
   const Config& config() const { return _cfg; }
 
+  // Forbid a small set of token ids from EVER being predicted (argmax or
+  // sampled), across prefill + every decode path. The logits at these ids
+  // are masked to a far-negative sentinel right after the final lm_head /
+  // softcap, so the host read-back, the GPU argmax, and the GPU sampler all
+  // see them suppressed. Used by realtime stages to ban Gemma's reasoning-
+  // channel tokens (<|channel>/<|think|>) so the model can't burn the decode
+  // budget on a thought block. Pass an empty span to clear. Idempotent.
+  void set_suppressed_tokens(std::span<const std::int32_t> ids);
+
 private:
   MetalGemmaModel() = default;
 
   bool ensure_scratch_();
+
+  // Per-machine decode-attention split autotune (sets _gtile_split + _gtile_kps
+  // for this GPU; called once from ensure_scratch_). Greedy-token-exact safe.
+  void tune_decode_attn_(TuningReport& rep);
 
   // Encode one decode token's full layer stack + final norm + lm_head +
   // softcap into `enc`, reading the residual stream `_d_x` (caller fills
@@ -211,6 +226,39 @@ private:
                     const metal_compute::SharedBuffer* tok_src = nullptr,
                     std::size_t tok_off = 0,
                     std::size_t pgtab_off = 0);
+
+  // Mask the suppressed (banned) token ids in a [vocab] logits buffer to a
+  // far-negative sentinel (suppress_logits_f16). MUST be encoded AFTER the
+  // final softcap. No-op when nothing is suppressed. Called from BOTH the
+  // decode step (_d_logits) and the prefill chunk (its local logits) so the
+  // banned tokens can't be predicted on the first token either.
+  void encode_suppress_(metal_compute::ComputeEncoder& enc,
+                        const metal_compute::SharedBuffer& logits, int vocab);
+
+  // Encode a greedy argmax of `_d_logits` (the [vocab] row) into `out`/`out_off`
+  // (an int32 slot). Dispatches the two-stage argmax_partial -> argmax_combine
+  // when those kernels + the partials scratch are available (the 262k-vocab read
+  // parallelised across kArgmaxM cores), else the single-tg _fn_argmax. Both are
+  // token-exact (global lowest-index tie-break). Caller must hold _d_argmax_part
+  // sized via ensure_scratch_().
+  void encode_argmax_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& out,
+                      std::size_t out_off, int vocab);
+
+  // Encode the GPU top-p/top-k/min-p sampler over `_d_logits` into `out`/
+  // `out_off`. Dispatches the histogram multi-tg path (sample_*_f16) when those
+  // kernels + scratch are available, else the single-tg _fn_sample fallback
+  // (forced by VPIPE_GEMMA_SAMPLE1=1). `ws`/`seen` are the per-context sampler
+  // scratch (sized [vocab]*sizeof(elt) / [vocab] uint8); `step_seed` is the
+  // per-step derived seed. Caller holds the histogram scratch via
+  // ensure_scratch_().
+  void encode_sample_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& out,
+                      std::size_t out_off,
+                      const metal_compute::SharedBuffer& ws,
+                      const metal_compute::SharedBuffer& seen,
+                      const GpuSamplerParams& sp, std::uint32_t step_seed,
+                      int vocab);
 
   // Batched prefill of `n` tokens (n>1) in a SINGLE forward pass: one
   // command buffer of steel GEMMs (M=n) + batched attention, amortising
@@ -334,6 +382,9 @@ private:
       _fn_rms, _fn_rms_add, _fn_rms_fast, _fn_rms_add_fast,
       _fn_rope, _fn_rms_rope, _fn_rms_rope2,
       _fn_rms_rope3, _fn_rms_rope3_kvwrite, _fn_geglu, _fn_softcap,
+      // Bans a small set of token ids by masking their logits after softcap
+      // (realtime thinking-channel suppression). See set_suppressed_tokens.
+      _fn_suppress,
       _fn_scale, _fn_residual, _fn_copy, _fn_dummy_disp,
       // Native Q6_K tied embed/lm_head (GGUF path): reads the raw 6.5625-bit
       // table directly (lossless, ~25% smaller than an affine8 requant).
@@ -361,9 +412,22 @@ private:
       // reverts to dense_t for A/B.
       _fn_dense_gemv,
       _fn_argmax, _fn_row_scatter,
+      // Two-stage parallel argmax (argmax_partial -> argmax_combine): M
+      // threadgroups each reduce a contiguous vocab slab, a 1-tg combine picks
+      // the global max. ~17x the single-tg _fn_argmax on the 262k vocab read in
+      // isolation; token-exact (global lowest-index tie-break preserved). Used
+      // by the greedy decode/pdecode paths; _fn_argmax is the small-V fallback.
+      _fn_argmax_partial, _fn_argmax_combine,
       // GPU sampler for pdecode_* (top-k/top-p/min-p/penalties); greedy uses
       // _fn_argmax. From _lib_elt (dtype-correct), same kernel as Qwen.
       _fn_sample,
+      // Histogram-based multi-tg sampler (the default; _fn_sample is the
+      // VPIPE_GEMMA_SAMPLE1=1 single-tg fallback). Same semantics, ~3 multi-tg
+      // vocab passes + a per-bin threshold scan instead of ~18 single-tg
+      // rescans. See sample_*_f16 in llm_elementwise.metal.
+      _fn_smp_max_partial, _fn_smp_max_combine,
+      _fn_smp_zhist_partial, _fn_smp_zhist_combine,
+      _fn_smp_thresh, _fn_smp_pick_partial, _fn_smp_pick_combine,
       // Flash-decode-GQA serial attention (contiguous KV, head_dim <= 256,
       // GQA G=Hq/n_kv(L) <= 4): read each KV head ONCE for all G query heads
       // + position-split merge, vs sdpa_mb's per-q-head re-scan. Reuses the
@@ -476,6 +540,25 @@ private:
       _d_act, _d_mlp, _d_ple, _d_pleproj, _d_pli, _d_plg,
       _d_plp, _d_logits, _d_tok;
   metal_compute::SharedBuffer _d_argmax_id;   // [1] int32, GPU argmax out
+  // Suppressed (banned) token ids: their _d_logits entries are masked to a
+  // far-negative sentinel after softcap (suppress_logits_f16) so they are
+  // never predicted. Tiny ([n] int32); set by set_suppressed_tokens.
+  metal_compute::SharedBuffer _d_suppress_ids;
+  int                         _n_suppress = 0;
+  // [2*kArgmaxM] f32 partials (val,idx) for the two-stage argmax. Allocated
+  // once in ensure_scratch_(); only used when _fn_argmax_partial is valid.
+  metal_compute::SharedBuffer _d_argmax_part;
+  static constexpr int kArgmaxM = 64;         // threadgroups in stage 1
+  // Histogram-sampler scratch (multi-tg sample_*_f16). kSampM = stage-1
+  // threadgroups; kSampB MUST match the kSampB in llm_elementwise.metal.
+  // _d_smp_maxpart [M] f32 max partials; _d_smp_hpart [M*(2B+1)] f32 per-tg
+  // (count,mass) histograms + partial Z; _d_smp_hist [2B+1] f32 combined;
+  // _d_smp_maxl/_d_smp_wt [1] f32; _d_smp_pickpart [2M] f32 (score,idx). All
+  // shared across pdecode steps (GPU-serialized by the per-context event).
+  static constexpr int kSampM = 64;
+  static constexpr int kSampB = 1024;
+  metal_compute::SharedBuffer _d_smp_maxpart, _d_smp_hpart, _d_smp_hist,
+      _d_smp_maxl, _d_smp_wt, _d_smp_pickpart;
   metal_compute::SharedBuffer _d_dummy;       // [256] f16 scratch for DUMMY_DISP
   // Materialized GLOBAL-prefill scratch (VPIPE_GEMMA_MATERIALIZED_GLOBAL):
   // _d_scores = f16 [CAP, CAP] per-head score matrix; _d_vT = f16 [Hkv,D,CAP]

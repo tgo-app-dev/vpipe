@@ -72,6 +72,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute-fence.cc
         metal-compute-function-constants.cc
         metal-compute-heap.cc
+        metal-compute-letterbox-rgb-f16.cc
         metal-compute-library.cc
         metal-compute-nv12.cc
         metal-compute-residency.cc

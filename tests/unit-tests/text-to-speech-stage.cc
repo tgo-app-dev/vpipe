@@ -20,7 +20,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <streambuf>
 #include <string>
 #include <string_view>
@@ -112,20 +114,34 @@ TEST(text_to_speech_stage, type_is_registered) {
               == "text-to-speech");
 }
 
-// The StageSpec must declare exactly one text iport and one PCM oport.
+// The StageSpec declares a text iport, an optional PCM reference iport, and
+// one PCM oport.
 TEST(text_to_speech_stage, spec_ports) {
   Session sess;
   CerrSilencer hush;
   TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, basic_cfg_());
   const StageSpec& sp = s.spec();
-  EXPECT_TRUE(sp.iports.size() == 1u);
+  EXPECT_TRUE(sp.iports.size() == 2u);
   EXPECT_TRUE(sp.oports.size() == 1u);
-  if (sp.iports.size() == 1u) {
+  if (sp.iports.size() == 2u) {
     EXPECT_TRUE(sp.iports[0].name == "text");
+    EXPECT_TRUE(sp.iports[1].name == "audio-ref");
   }
   if (sp.oports.size() == 1u) {
     EXPECT_TRUE(sp.oports[0].name == "pcm");
   }
+}
+
+// voice_lock + voice_ref_seconds parse and default sanely; an audio-ref edge
+// is optional (construction succeeds with or without it).
+TEST(text_to_speech_stage, voice_clone_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/a","codec_dir":"/b","voice_lock":true,
+          "voice_ref_seconds":5.0})");
+  TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
 }
 
 // ---- End-to-end runtime smoke (env-gated; real MOSS-TTS) -----------
@@ -206,6 +222,8 @@ TEST(text_to_speech_stage, metal_synthesis_smoke) {
   }
 
   Session  sess;
+  sess.enable_profiling(8192);   // capture the TTS LLM-lane perf blocks
+  EXPECT_TRUE(sess.profiling_enabled());
   Pipeline pl("tts-smoke", &sess);
 
   auto src = make_unique<OneTextSource>(
@@ -243,6 +261,200 @@ TEST(text_to_speech_stage, metal_synthesis_smoke) {
   std::printf("[tts-smoke] samples=%zu peak=%.4f sample_rate=%d\n",
               sink_stage->n_samples, sink_stage->peak,
               sink_stage->sample_rate);
+  EXPECT_TRUE(sink_stage->n_samples > 1000u);
+  EXPECT_TRUE(sink_stage->peak > 0.01);
+  EXPECT_TRUE(sink_stage->sample_rate == 24000);
+
+  // Profiling events: the synthesis must have recorded the LLM-lane blocks
+  // for the MOSS LM (text-prefill + text-decode) and the codec (audio-codec).
+  // dump_profiling emits a synthetic stage entry per aux activity that had
+  // events, so the labels appear in the JSON iff the brackets fired.
+  const char* td = std::getenv("TMPDIR");
+  const std::string prof =
+      std::string(td && *td ? td : "/tmp") + "/vpipe_tts_prof.json";
+  sess.dump_profiling(prof);
+  std::ifstream pf(prof);
+  const std::string pj((std::istreambuf_iterator<char>(pf)),
+                       std::istreambuf_iterator<char>());
+  std::printf("[tts-smoke] profiling dump = %zu bytes -> %s\n",
+              pj.size(), prof.c_str());
+  EXPECT_TRUE(pj.find("text-prefill") != std::string::npos);
+  EXPECT_TRUE(pj.find("text-decode")  != std::string::npos);
+  EXPECT_TRUE(pj.find("audio-codec")  != std::string::npos);
+}
+
+namespace {
+
+// Emits a fixed list of text beats (one per process tick), then done.
+class MultiTextSource : public TypedStage<MultiTextSource> {
+public:
+  static constexpr const char* kTypeName = "ut-tts-multitext-source";
+  using TypedStage::TypedStage;
+
+  std::vector<std::string> texts;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_i >= texts.size()) { ctx.signal_done(); co_return; }
+    const std::string t = texts[_i++];
+    co_await ctx.write(0, make_payload<FlexDataPayload>(
+        FlexData::make_string(t)));
+  }
+
+private:
+  std::size_t _i = 0;
+};
+
+// Emits a reference PCM beat on oport0, then a text beat on oport1 (same
+// tick, reference first), then done. Drives external voice cloning: the TTS
+// stage drains its reference iport before synthesising the text.
+class RefThenTextSource : public TypedStage<RefThenTextSource> {
+public:
+  static constexpr const char* kTypeName = "ut-tts-ref-text-source";
+  using TypedStage::TypedStage;
+
+  std::string          text = "This is a cloned voice test.";
+  std::vector<float>   ref_pcm;
+  int                  ref_sr = 16000;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    TensorBeat tb;
+    tb.dtype = TensorBeat::DType::F32;
+    tb.shape = { static_cast<std::int64_t>(ref_pcm.size()) };
+    tb.resize_contiguous(ref_pcm.size());
+    std::memcpy(tb.as_f32(), ref_pcm.data(), ref_pcm.size() * sizeof(float));
+    tb.sideband = FlexData::make_object();
+    tb.sideband.as_object().insert("sample_rate",
+                                   FlexData::make_int(ref_sr));
+    co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+    co_await ctx.write(1, make_payload<FlexDataPayload>(
+        FlexData::make_string(text)));
+  }
+
+private:
+  bool _sent = false;
+};
+
+}  // namespace
+
+// voice_lock (design-once): the second text beat must reuse the first beat's
+// voice as a reference. Exercises the reference-splice prompt path end-to-end
+// with real generated codes. Both beats must yield a real waveform.
+TEST(text_to_speech_stage, metal_voice_lock_smoke) {
+  const char* lm = std::getenv("VPIPE_MOSS_TTS_MODEL");
+  const char* cc = std::getenv("VPIPE_MOSS_CODEC_MODEL");
+  if (!lm || !*lm || !cc || !*cc) { return; }
+
+  Session  sess;
+  Pipeline pl("tts-voicelock", &sess);
+
+  auto src = make_unique<MultiTextSource>(
+      &sess, "text", vector<InEdge>{}, FlexData::make_object());
+  src->texts = { "First sentence picks the voice.",
+                 "Second sentence keeps the same voice." };
+  src->allocate_oports(1);
+  auto* txtsrc = static_cast<MultiTextSource*>(pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(lm));
+    o.insert("codec_dir", FlexData::make_string(cc));
+    o.insert("max_new_tokens", FlexData::make_int(512));
+    o.insert("voice_lock", FlexData::make_bool(true));
+  }
+  auto tts = make_unique<TextToSpeechStage>(
+      &sess, "tts", vector<InEdge>{ { txtsrc, 0 } }, std::move(cfg));
+  auto* tts_stage = static_cast<TextToSpeechStage*>(
+      pl.insert_stage(std::move(tts)));
+
+  auto sink = make_unique<PcmCollectorSink>(
+      &sess, "sink", vector<InEdge>{ { tts_stage, 0 } },
+      FlexData::make_object());
+  auto* sink_stage = static_cast<PcmCollectorSink*>(
+      pl.insert_stage(std::move(sink)));
+
+  PipelineRuntime rt(&pl, &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  std::printf("[tts-voicelock] clips=%llu last samples=%zu peak=%.4f\n",
+              (unsigned long long)tts_stage->clips_emitted(),
+              sink_stage->n_samples, sink_stage->peak);
+  EXPECT_TRUE(tts_stage->clips_emitted() == 2u);   // both beats synthesized
+  EXPECT_TRUE(sink_stage->n_samples > 1000u);      // 2nd (cloned) is real
+  EXPECT_TRUE(sink_stage->peak > 0.01);
+}
+
+// External voice cloning: a PCM reference on iport1 is resampled (16k -> 24k),
+// encoded to RVQ codes, and spliced into the prompt. The text beat then
+// synthesizes with that reference. Verifies the iport -> resample -> encode ->
+// splice -> generate chain produces a real waveform.
+TEST(text_to_speech_stage, metal_voice_clone_smoke) {
+  const char* lm = std::getenv("VPIPE_MOSS_TTS_MODEL");
+  const char* cc = std::getenv("VPIPE_MOSS_CODEC_MODEL");
+  if (!lm || !*lm || !cc || !*cc) { return; }
+
+  Session  sess;
+  Pipeline pl("tts-voiceclone", &sess);
+
+  // ~1.2 s of a vaguely voiced reference at 16 kHz (fundamental + harmonics
+  // with a slow amplitude envelope) so the encoder has real structure to
+  // analyse and the resampler runs (16k -> the codec's 24k).
+  const int rsr = 16000;
+  const int rn  = rsr * 6 / 5;
+  std::vector<float> ref(static_cast<std::size_t>(rn));
+  for (int i = 0; i < rn; ++i) {
+    const double t = static_cast<double>(i) / rsr;
+    const double env = 0.5 * (1.0 - std::cos(2.0 * M_PI * t / 1.2));
+    ref[(std::size_t)i] = static_cast<float>(
+        env * (0.6 * std::sin(2.0 * M_PI * 130.0 * t) +
+               0.3 * std::sin(2.0 * M_PI * 260.0 * t) +
+               0.1 * std::sin(2.0 * M_PI * 390.0 * t)));
+  }
+
+  auto src = make_unique<RefThenTextSource>(
+      &sess, "ref-text", vector<InEdge>{}, FlexData::make_object());
+  src->ref_pcm = std::move(ref);
+  src->ref_sr  = rsr;
+  src->allocate_oports(2);   // oport0 = ref PCM, oport1 = text
+  auto* rtsrc = static_cast<RefThenTextSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(lm));
+    o.insert("codec_dir", FlexData::make_string(cc));
+    o.insert("max_new_tokens", FlexData::make_int(512));
+  }
+  // iport0 = text (rtsrc oport1), iport1 = audio-ref (rtsrc oport0).
+  auto tts = make_unique<TextToSpeechStage>(
+      &sess, "tts",
+      vector<InEdge>{ { rtsrc, 1 }, { rtsrc, 0 } }, std::move(cfg));
+  auto* tts_stage = static_cast<TextToSpeechStage*>(
+      pl.insert_stage(std::move(tts)));
+
+  auto sink = make_unique<PcmCollectorSink>(
+      &sess, "sink", vector<InEdge>{ { tts_stage, 0 } },
+      FlexData::make_object());
+  auto* sink_stage = static_cast<PcmCollectorSink*>(
+      pl.insert_stage(std::move(sink)));
+
+  PipelineRuntime rt(&pl, &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  std::printf("[tts-voiceclone] clips=%llu samples=%zu peak=%.4f sr=%d\n",
+              (unsigned long long)tts_stage->clips_emitted(),
+              sink_stage->n_samples, sink_stage->peak,
+              sink_stage->sample_rate);
+  EXPECT_TRUE(tts_stage->clips_emitted() >= 1u);
   EXPECT_TRUE(sink_stage->n_samples > 1000u);
   EXPECT_TRUE(sink_stage->peak > 0.01);
   EXPECT_TRUE(sink_stage->sample_rate == 24000);

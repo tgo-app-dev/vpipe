@@ -644,13 +644,15 @@ private:
 // ---------------------------------------------------------------------
 class GemmaChatTemplate final : public ChatTemplate {
 public:
-  // `thinking_variant` is the gemma4_unified family (12B), whose model
-  // turns carry a reasoning channel; e4b is not a thinking model. When the
-  // variant is thinking-capable, `thinking_on` selects between emitting a
-  // leading `<|think|>` system turn (reasoning ON) and pre-filling an empty
-  // `<|channel>thought\n<channel|>` on every model turn (reasoning OFF --
-  // the checkpoint's canonical default, which makes the model skip
-  // reasoning instead of generating its own thought block).
+  // `thinking_variant` is used for the gemma4_unified family (12B), whose
+  // reasoning is steered at render time: `thinking_on` selects between
+  // emitting a leading `<|think|>` system turn (reasoning ON) and pre-filling
+  // an empty `<|channel>thought\n<channel|>` on every model turn (reasoning
+  // OFF -- meant to make the model skip its own thought block).
+  // NOTE: e4b ALSO carries a reasoning channel, but it is constructed plain
+  // (thinking_variant=false): the empty-thought prefill makes e4b answer in
+  // open meta-reasoning rather than skip it, so consumers that want a clean
+  // answer strip the channel post-hoc via sanitize_output() instead.
   explicit GemmaChatTemplate(const Tokenizer& tok,
                              bool             thinking_variant = false,
                              bool             thinking_on      = false)
@@ -971,6 +973,44 @@ public:
     return id == _eos || id == _eot || id == _tool_resp;
   }
 
+  // Strip the reasoning channel from a decoded turn, mirroring the
+  // checkpoint's own `strip_thinking` jinja macro: split on the
+  // channel-close marker; for each segment drop everything from a
+  // channel-open marker onward, keep the rest; trim. This removes both
+  // the `<|channel>`/`<channel|>` markers AND the thought text between
+  // them (and a trailing thought left unclosed by a truncated decode),
+  // leaving only the user-facing answer.
+  std::string sanitize_output(std::string text) const override
+  {
+    static constexpr std::string_view kOpen  = "<|channel>";
+    static constexpr std::string_view kClose = "<channel|>";
+    if (text.find(kOpen) == std::string::npos) {
+      return text;   // common case: nothing to strip
+    }
+    std::string out;
+    out.reserve(text.size());
+    const std::string_view tv(text);
+    std::size_t start = 0;
+    while (true) {
+      const std::size_t c = tv.find(kClose, start);
+      const std::string_view seg = (c == std::string_view::npos)
+          ? tv.substr(start)
+          : tv.substr(start, c - start);
+      const std::size_t o = seg.find(kOpen);
+      out.append(o == std::string_view::npos ? seg : seg.substr(0, o));
+      if (c == std::string_view::npos) {
+        break;
+      }
+      start = c + kClose.size();
+    }
+    const std::size_t b = out.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+      return {};
+    }
+    const std::size_t e = out.find_last_not_of(" \t\r\n");
+    return out.substr(b, e - b + 1);
+  }
+
   std::string_view family_name() const override { return "gemma"; }
 
 private:
@@ -1022,7 +1062,15 @@ make_chat_template(const std::string&    architecture,
     return std::make_unique<Qwen3AsrChatTemplate>(tokenizer);
   }
   if (architecture == "Gemma4ForConditionalGeneration") {
-    // e4b: not a reasoning model -- the thinking flag does not apply.
+    // e4b IS a reasoning checkpoint (its tokenizer carries
+    // <|think|>/<|channel>/<channel|> and it intermittently emits a
+    // `<|channel>thought ...<channel|>` block, e.g. on multi-part prompts).
+    // We deliberately do NOT prefill an empty thought channel to "disable"
+    // it: empirically that makes e4b answer in open meta-reasoning ("The
+    // user wants me to ...") instead of the actual content. Instead we keep
+    // the plain template and strip any thought channel from the decoded
+    // output (sanitize_output, matching the checkpoint's own strip_thinking
+    // macro). So the thinking flag does not apply at render time here.
     (void)disable_thinking;
     return std::make_unique<GemmaChatTemplate>(tokenizer);
   }
@@ -1036,7 +1084,8 @@ make_chat_template(const std::string&    architecture,
     return std::make_unique<GemmaChatTemplate>(
         tokenizer, /*thinking_variant=*/true, thinking_on);
   }
-  if (architecture == "Qwen3_5ForConditionalGeneration") {
+  if (architecture == "Qwen3_5ForConditionalGeneration"
+      || architecture == "Qwen3_5MoeForConditionalGeneration") {
     // VLM-capable when the tokenizer ships vision sentinel tokens.
     // Text-only Qwen3 checkpoints don't have <|vision_start|> in
     // their vocab; we fall back to plain Qwen3ChatTemplate so the

@@ -20,6 +20,7 @@
 // in both the MLX and no-MLX configs, so include it whenever the Apple
 // backend is on. The MLX runtime header is MLX-only.
 #include "generative-models/shared/coreml-vision-encoder.h"
+#include "apple-silicon/metal-compute/metal-compute.h"
 #endif
 #include "apple-silicon/tensor-beat.h"
 #include "common/session.h"
@@ -27,6 +28,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -256,6 +260,63 @@ TEST(coreml_vision_encoder, temporal_pair_video_model_host) {
       "coreml_vision_encoder.temporal_pair_host: in={}x{} out_tokens={} "
       "grid {}x{} differs={}",
       W, H, pair.n_tokens, pair.grid_h, pair.grid_w, differs));
+}
+
+// Zero-copy f16 RGB MLMultiArray input path. Gated on
+// VPIPE_TEST_COREML_MARRAY_MODEL -> a CoreML vision model whose image input
+// is a Float16 MLMultiArray ([1,3,H,W] NCHW or [1,H,W,3] NHWC). The test
+// fixture MarrayMeanRGB_f16io outputs the per-channel MEAN as its tokens, so
+// feeding a SOLID colour at the model's exact dims (no letterbox pad) proves
+// the resampled tensor reaches the model with the right RGB channel order +
+// values through the zero-copy MLMultiArray bind (an R<->B swap would flip
+// the returned channels).
+TEST(coreml_vision_encoder, marray_zero_copy_rgb_f16) {
+  const char* model = env_or_null_("VPIPE_TEST_COREML_MARRAY_MODEL");
+  if (!model) { return; }
+  vpipe::Session sess;
+  if (sess.metal_compute() == nullptr || !sess.metal_compute()->valid()) {
+    return;
+  }
+  vpipe::genai::CoreMLVisionEncoder::LoadSpec spec;
+  spec.mlpackage_path = model;
+  spec.compute_units  = 2;
+  auto enc = vpipe::genai::CoreMLVisionEncoder::create(spec, nullptr, &sess);
+  ASSERT_TRUE(enc != nullptr);
+  ASSERT_TRUE(enc->implemented());
+  // Must take the MLMultiArray (zero-copy) path, not the BGRA pixel buffer.
+  EXPECT_TRUE(enc->input_is_multiarray());
+
+  const int W = enc->model_input_width();
+  const int H = enc->model_input_height();
+  ASSERT_TRUE(W > 0 && H > 0);
+
+  // Solid colour at the model's exact dims (no pad): R=200, G=100, B=50
+  // planar [3,H,W]. The mean-RGB fixture returns these as its tokens.
+  const int R = 200, G = 100, B = 50;
+  std::vector<std::uint8_t> frame(static_cast<size_t>(3) * H * W);
+  const size_t plane = static_cast<size_t>(H) * W;
+  for (size_t i = 0; i < plane; ++i) {
+    frame[0 * plane + i] = static_cast<std::uint8_t>(R);
+    frame[1 * plane + i] = static_cast<std::uint8_t>(G);
+    frame[2 * plane + i] = static_cast<std::uint8_t>(B);
+  }
+  auto r = enc->encode_host(frame.data(), H, W);
+  ASSERT_TRUE(r.n_tokens > 0);
+  ASSERT_TRUE(!r.embeddings.empty());
+  ASSERT_TRUE(r.out_hidden >= 3);
+  const _Float16* e =
+      static_cast<const _Float16*>(r.embeddings.contents());
+  const float got_r = static_cast<float>(e[0]);
+  const float got_g = static_cast<float>(e[1]);
+  const float got_b = static_cast<float>(e[2]);
+  std::printf("[marray_rgb_f16] in=%dx%d tokens=%d hidden=%d -> "
+              "R=%.1f G=%.1f B=%.1f\n",
+              W, H, r.n_tokens, r.out_hidden, got_r, got_g, got_b);
+  // RGB order + values must survive the zero-copy f16 bind (f16 is exact for
+  // these small integers; allow a tiny slack).
+  EXPECT_TRUE(std::fabs(got_r - static_cast<float>(R)) < 1.0f);
+  EXPECT_TRUE(std::fabs(got_g - static_cast<float>(G)) < 1.0f);
+  EXPECT_TRUE(std::fabs(got_b - static_cast<float>(B)) < 1.0f);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

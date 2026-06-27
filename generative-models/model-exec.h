@@ -409,6 +409,14 @@ public:
   // few) command buffers for ~2x decode speedup.
   virtual void set_eval_per_layer(bool b) noexcept = 0;
 
+  // Forbid a small set of token ids from ever being predicted (argmax or
+  // sampled) across prefill + every decode path -- used to keep realtime
+  // decode short by banning a model's reasoning-channel tokens. Default
+  // no-op; execs whose model supports logit masking (the metal Gemma exec)
+  // override it. Pass an empty span to clear.
+  virtual void set_suppressed_tokens(std::span<const std::int32_t> ids)
+  { (void)ids; }
+
 };
 
 }

@@ -36,16 +36,22 @@ public:
   SessionIntf() {};
   virtual ~SessionIntf() = default;
 
-  // Load a pipeline from a filesystem path. The file format is
-  // auto-detected: a leading `{` or `[` (after whitespace) is
-  // parsed as JSON, anything else as the FlexData binary
-  // encoding. The returned handle is null (use !valid()) if the
-  // file cannot be read, the spec fails to parse, or any stage
-  // fails to instantiate; failures are reported through the
-  // session log delegate. The path is remembered on the handle's
-  // impl so a subsequent no-arg `store_pipeline(handle)` call can
-  // round-trip back to the same place.
-  virtual PipelineHandle load_pipeline(std::string_view path) = 0;
+  // Load a pipeline from either an inline spec or a file path.
+  //
+  // If `spec` begins with `{` or `[` (after leading whitespace) it
+  // is parsed directly as an inline JSON spec document. Otherwise it
+  // is a filesystem path, whose contents are format-auto-detected: a
+  // leading `{`/`[` is JSON, anything else the FlexData binary
+  // encoding.
+  //
+  // The returned handle is null (use !valid()) if the inline spec /
+  // file fails to parse, the file cannot be read, or any stage fails
+  // to instantiate; failures are reported through the session log
+  // delegate. A file path is remembered on the handle's impl so a
+  // subsequent no-arg `store_pipeline(handle)` round-trips back to
+  // it; an inline spec carries no path, so that call reports
+  // Status{1} until a path-taking `store_pipeline` sets one.
+  virtual PipelineHandle load_pipeline(std::string_view spec) = 0;
 
   // Create a new empty pipeline with the given id. The returned
   // handle is owned by this session and remains valid until the

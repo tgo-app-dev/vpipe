@@ -69,6 +69,17 @@ MetalLlamaModel::load(const std::string& model_dir,
   m->_fn_embed = m->_lib_elt.function("dequant_embed_gather_f16");
   m->_fn_argmax = m->_lib_elt.function("argmax_f16");
   m->_fn_sample = m->_lib_elt.function("sample_topp_f16");
+  // Two-stage parallel argmax + histogram multi-tg sampler (defaults; the
+  // single-tg _fn_argmax/_fn_sample are the ARGMAX1/SAMPLE1 fallbacks).
+  m->_fn_argmax_partial    = m->_lib_elt.function("argmax_partial_f16");
+  m->_fn_argmax_combine    = m->_lib_elt.function("argmax_combine_f16");
+  m->_fn_smp_max_partial   = m->_lib_elt.function("sample_max_partial_f16");
+  m->_fn_smp_max_combine   = m->_lib_elt.function("sample_max_combine_f16");
+  m->_fn_smp_zhist_partial = m->_lib_elt.function("sample_zhist_partial_f16");
+  m->_fn_smp_zhist_combine = m->_lib_elt.function("sample_zhist_combine_f16");
+  m->_fn_smp_thresh        = m->_lib_elt.function("sample_thresh_f16");
+  m->_fn_smp_pick_partial  = m->_lib_elt.function("sample_pick_partial_f16");
+  m->_fn_smp_pick_combine  = m->_lib_elt.function("sample_pick_combine_f16");
   m->_fn_kv_write_paged = m->_lib_elt.function("kv_write_paged_f16");
   m->_fn_kv_gather_paged = m->_lib_elt.function("kv_gather_paged_f16");
   m->_fn_rope = m->_lib_rope.function("rope_f16");
@@ -254,6 +265,20 @@ MetalLlamaModel::load(const std::string& model_dir,
   m->_sg = mc->make_shared_buffer((std::size_t)cfg.ffn_inner * 2);
   m->_mo = mc->make_shared_buffer((std::size_t)H * 2);
   m->_logits = mc->make_shared_buffer((std::size_t)cfg.vocab * 2);
+  // Two-stage-argmax + histogram-sampler scratch (mirrors Gemma/Qwen).
+  // Allocated once at load; reused every decode step (serial encoder).
+  m->_d_argmax_part =
+      mc->make_shared_buffer((std::size_t)2 * kArgmaxM * sizeof(float));
+  m->_d_smp_maxpart = mc->make_shared_buffer((std::size_t)kSampM
+                                             * sizeof(float));
+  m->_d_smp_hpart = mc->make_shared_buffer(
+      (std::size_t)kSampM * (2 * kSampB + 1) * sizeof(float));
+  m->_d_smp_hist = mc->make_shared_buffer(
+      (std::size_t)(2 * kSampB + 1) * sizeof(float));
+  m->_d_smp_maxl = mc->make_shared_buffer(sizeof(float));
+  m->_d_smp_wt = mc->make_shared_buffer(sizeof(float));
+  m->_d_smp_pickpart =
+      mc->make_shared_buffer((std::size_t)2 * kSampM * sizeof(float));
   // Flash-decode-GQA partials (f32): O [Hq,split,D], m/l [Hq,split].
   if (m->_gqa_attn) {
     const std::size_t sp = (std::size_t)m->_gqa_split;
@@ -922,24 +947,54 @@ MetalLlamaModel::decode_pipelined(
 }
 
 void
-MetalLlamaModel::encode_sample_(
-    metal_compute::ComputeEncoder& enc,
-    const metal_compute::SharedBuffer& logits,
-    const metal_compute::SharedBuffer& out_id, std::size_t out_off,
-    const GpuSamplerParams& sp, std::uint32_t step_seed,
-    const metal_compute::SharedBuffer& sample_ws,
-    const metal_compute::SharedBuffer& seen)
+MetalLlamaModel::encode_argmax_(metal_compute::ComputeEncoder& enc,
+                                const metal_compute::SharedBuffer& logits,
+                                const metal_compute::SharedBuffer& out,
+                                std::size_t out_off, int vocab)
 {
-  enc.set_buffer(1, out_id, out_off);
-  if (sp.greedy) {
-    enc.set_function(_fn_argmax);
+  static const bool kForce1 = std::getenv("VPIPE_LLAMA_ARGMAX1") != nullptr;
+  if (!kForce1 && _fn_argmax_partial.valid() && _fn_argmax_combine.valid()
+      && !_d_argmax_part.empty()) {
+    enc.set_function(_fn_argmax_partial);
     enc.set_buffer(0, logits);
-    enc.set_constant(2, _cfg.vocab);
+    enc.set_buffer(1, _d_argmax_part);
+    enc.set_constant(2, vocab);
+    enc.set_constant(3, kArgmaxM);
+    enc.dispatch({(unsigned)(256 * kArgmaxM), 1, 1}, {256, 1, 1});
+    enc.set_function(_fn_argmax_combine);
+    enc.set_buffer(0, _d_argmax_part);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, kArgmaxM);
     enc.dispatch({256, 1, 1}, {256, 1, 1});
   } else {
+    enc.set_function(_fn_argmax);
+    enc.set_buffer(0, logits);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, vocab);
+    enc.dispatch({256, 1, 1}, {256, 1, 1});
+  }
+}
+
+void
+MetalLlamaModel::encode_sample_core_(
+    metal_compute::ComputeEncoder& enc,
+    const metal_compute::SharedBuffer& logits,
+    const metal_compute::SharedBuffer& out, std::size_t out_off,
+    const metal_compute::SharedBuffer& sample_ws,
+    const metal_compute::SharedBuffer& seen, const GpuSamplerParams& sp,
+    std::uint32_t step_seed, int vocab)
+{
+  static const bool kForce1 = std::getenv("VPIPE_LLAMA_SAMPLE1") != nullptr;
+  const bool hist_ok =
+      _fn_smp_max_partial.valid() && _fn_smp_max_combine.valid() &&
+      _fn_smp_zhist_partial.valid() && _fn_smp_zhist_combine.valid() &&
+      _fn_smp_thresh.valid() && _fn_smp_pick_partial.valid() &&
+      _fn_smp_pick_combine.valid() && !_d_smp_hpart.empty();
+  if (kForce1 || !hist_ok) {
     enc.set_function(_fn_sample);
     enc.set_buffer(0, logits);
-    enc.set_constant(2, _cfg.vocab);
+    enc.set_buffer(1, out, out_off);
+    enc.set_constant(2, vocab);
     enc.set_constant(3, sp.temperature);
     enc.set_constant(4, sp.top_p);
     enc.set_constant(5, step_seed);
@@ -951,6 +1006,88 @@ MetalLlamaModel::encode_sample_(
     enc.set_constant(11, sp.min_p);
     enc.set_buffer(12, seen);
     enc.dispatch({256, 1, 1}, {256, 1, 1});
+    return;
+  }
+  const int M = kSampM;
+  const float rep = sp.repetition_penalty, pres = sp.presence_penalty;
+  // Pass A: max of penalised eff (partial -> combine).
+  enc.set_function(_fn_smp_max_partial);
+  enc.set_buffer(0, logits);
+  enc.set_buffer(1, _d_smp_maxpart);
+  enc.set_constant(2, vocab);
+  enc.set_constant(3, M);
+  enc.set_constant(4, rep);
+  enc.set_constant(5, pres);
+  enc.set_buffer(6, seen);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_max_combine);
+  enc.set_buffer(0, _d_smp_maxpart);
+  enc.set_buffer(1, _d_smp_maxl);
+  enc.set_constant(2, M);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Pass B: ws + partial Z + per-tg histogram, then combine.
+  enc.set_function(_fn_smp_zhist_partial);
+  enc.set_buffer(0, logits);
+  enc.set_buffer(1, sample_ws);
+  enc.set_buffer(2, _d_smp_hpart);
+  enc.set_constant(3, vocab);
+  enc.set_constant(4, M);
+  enc.set_constant(5, sp.temperature);
+  enc.set_constant(6, rep);
+  enc.set_constant(7, pres);
+  enc.set_buffer(8, seen);
+  enc.set_buffer(9, _d_smp_maxl);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_zhist_combine);
+  enc.set_buffer(0, _d_smp_hpart);
+  enc.set_buffer(1, _d_smp_hist);
+  enc.set_constant(2, M);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Threshold scan over the bins (single tg, cheap).
+  enc.set_function(_fn_smp_thresh);
+  enc.set_buffer(0, _d_smp_hist);
+  enc.set_buffer(1, _d_smp_wt);
+  enc.set_constant(2, sp.top_p);
+  enc.set_constant(3, sp.top_k);
+  enc.set_constant(4, sp.min_p);
+  enc.set_constant(5, vocab);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // Pass C: Gumbel-max pick over the nucleus (partial -> combine, sets seen).
+  enc.set_function(_fn_smp_pick_partial);
+  enc.set_buffer(0, logits);
+  enc.set_buffer(1, sample_ws);
+  enc.set_buffer(2, _d_smp_pickpart);
+  enc.set_constant(3, vocab);
+  enc.set_constant(4, M);
+  enc.set_constant(5, sp.temperature);
+  enc.set_constant(6, step_seed);
+  enc.set_constant(7, rep);
+  enc.set_constant(8, pres);
+  enc.set_buffer(9, seen);
+  enc.set_buffer(10, _d_smp_wt);
+  enc.dispatch({(unsigned)(256 * M), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_smp_pick_combine);
+  enc.set_buffer(0, _d_smp_pickpart);
+  enc.set_buffer(1, out, out_off);
+  enc.set_constant(2, M);
+  enc.set_buffer(3, seen);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+}
+
+void
+MetalLlamaModel::encode_sample_(
+    metal_compute::ComputeEncoder& enc,
+    const metal_compute::SharedBuffer& logits,
+    const metal_compute::SharedBuffer& out_id, std::size_t out_off,
+    const GpuSamplerParams& sp, std::uint32_t step_seed,
+    const metal_compute::SharedBuffer& sample_ws,
+    const metal_compute::SharedBuffer& seen)
+{
+  if (sp.greedy) {
+    encode_argmax_(enc, logits, out_id, out_off, _cfg.vocab);
+  } else {
+    encode_sample_core_(enc, logits, out_id, out_off, sample_ws, seen,
+                        sp, step_seed, _cfg.vocab);
   }
 }
 

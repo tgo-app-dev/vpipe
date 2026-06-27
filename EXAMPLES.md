@@ -86,6 +86,24 @@ refer to it by its **registry key** (the catalogue's HuggingFace path, e.g.
 `mlx-community/Qwen3.5-4B-MLX-4bit`). A model field also accepts a plain
 **filesystem path** to a model directory, which always works as a fallback.
 
+**Prefer the terminal?** The web UI isn't the only front end — VPIPE also ships
+a command-line entrance, **`vpipe`** (`./build/apps/vpipe/vpipe`), that launches
+pipelines straight from the shell. Two uses fit these walkthroughs:
+
+- **One-off single-stage pipelines** — wrap a single stage in a throwaway
+  pipeline with `--launch-stage <type>`, setting its config with
+  `--stage-cfg key=value`. Ideal for utility stages such as `model-fetch`
+  (Example 1, shown next) or `onvif-discovery`.
+- **Replaying a saved pipeline** — once you've tuned a pipeline in the web UI
+  and hit **Save**, run that `.vpipeline` spec in the terminal with
+  `--launch <file>`, overriding any stage's config with
+  `--stage-cfg stage-id::key=value`.
+
+Under the CLI an interactive stage prompts **directly on the terminal**
+(stdin/stdout) — there's no User I/O view to open. The web-UI walkthroughs
+below are still the best way to *learn* the stages; reach for the CLI once you
+know what you want to run. `vpipe --help` lists every option.
+
 ---
 
 ## 1. Fetch a model interactively
@@ -145,6 +163,39 @@ an empty config saves the same stage with an empty `config`):
   ]
 }
 ```
+
+### Fetch from the terminal (vpipe CLI)
+
+Same fetch, no browser. `model-fetch` is a single-stage, no-port stage, so it's
+a natural fit for the CLI's `--launch-stage`: `vpipe` wraps it in a one-shot
+pipeline, runs it, and exits when the download finishes.
+
+**Interactive — browse the catalogue:**
+
+```sh
+./build/apps/vpipe/vpipe --launch-stage model-fetch
+```
+
+With an empty config the stage browses the catalogue interactively — the same
+numbered menus as the web UI, except the prompts appear **right in your
+terminal** (the CLI routes the session's user I/O to stdin/stdout). Answer them
+the same way: press **Enter** to browse, then pick **Qwen → 3.5 → 4B → MLX
+4-bit**.
+
+**Non-interactive — one command:** point `model_path` at the registry key and
+it downloads without prompting:
+
+```sh
+./build/apps/vpipe/vpipe --launch-stage model-fetch \
+  --stage-cfg model_path=mlx-community/Qwen3.5-4B-MLX-4bit
+```
+
+Each `--stage-cfg key=value` sets one config key on the stage; repeat it for
+more (e.g. add `--stage-cfg base_path=./models`). Values that look like JSON are
+read as such (numbers, `true`/`false`); anything else — like a HuggingFace path
+— is taken verbatim as a string. The model registers under
+**`mlx-community/Qwen3.5-4B-MLX-4bit`** exactly as the web-UI flow does, so
+Example 2 can use it right away.
 
 ---
 

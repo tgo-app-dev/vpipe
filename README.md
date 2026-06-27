@@ -166,6 +166,29 @@ connects without one. Options: `--bind ADDR`, `--port N` (`0` = any free port),
 New here? **[EXAMPLES.md](EXAMPLES.md)** walks through fetching a model and
 building text-chat and speech-transcription pipelines in the web UI.
 
+### CLI
+
+`vpipe` launches pipelines straight from the terminal — a thin command-line
+front end over the same session and stages the web UI drives. It dynamically
+links `libvpipe`.
+
+```sh
+# A full pipeline from a saved spec file, or from inline JSON:
+./build/apps/vpipe/vpipe --launch my-pipeline.vpipeline
+./build/apps/vpipe/vpipe --launch '{"id":"tick","stages":[{"id":"c","type":"chrono","config":{"count":5}}]}'
+
+# A single stage wrapped in a one-shot pipeline (handy for utility stages):
+./build/apps/vpipe/vpipe --launch-stage onvif-discovery
+./build/apps/vpipe/vpipe --launch-stage model-fetch \
+  --stage-cfg model_path=mlx-community/Qwen3.5-4B-MLX-4bit
+```
+
+`--stage-cfg` overrides stage config: `key=value` after `--launch-stage`, or
+`stage-id::key=value` to target a stage inside a `--launch` spec. Repeat
+`--launch` / `--launch-stage` to run several pipelines **concurrently**;
+`Ctrl-C` stops them cleanly. `vpipe --help` lists every option, and
+**[EXAMPLES.md](EXAMPLES.md)** shows fetching a model from the terminal.
+
 ### Python
 
 The extension lands in `build/python/`. Importing the package creates a default
@@ -217,7 +240,7 @@ test skips.
 | `generative-models/` | On-device LLM/VLM/ASR stack (model families, tokenizers, encoders). |
 | `apple-silicon/` | metal-compute backend and CoreML C++ wrappers. |
 | `gpu-kernels/metal/` | Metal compute kernels (attention, GEMM, quant, …). |
-| `apps/` | Executables: `web-ui`, `db-log-reader`. |
+| `apps/` | Executables: `vpipe` (CLI), `web-ui`, `db-log-reader`. |
 | `python/` | Python bindings (nanobind). |
 | `tests/` | Unit tests. |
 | `extern/`, `3rd-party/` | Vendored dependencies. |

@@ -14,6 +14,7 @@
 #include "common/onvif-refresh.h"
 #include "common/oport-policy.h"
 #include "common/segment-writer.h"
+#include "common/thread-pool.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "pipeline/runtime-context.h"
@@ -21,10 +22,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,14 +114,17 @@ stop_aware_sleep(RuntimeContext&            ctx,
   }
 }
 
-// Opaque passed to AVIOInterruptCB. The two atomics are owned by
-// process() (stable for the connection's lifetime); FFmpeg's
-// blocking I/O code polls the callback periodically and aborts when
-// it returns non-zero, which lets stop_requested or the watchdog
-// punch out of recv()/read() promptly instead of waiting for
-// stimeout to elapse.
+// Opaque passed to AVIOInterruptCB. FFmpeg's blocking I/O code polls
+// the callback periodically and aborts when it returns non-zero,
+// which lets a session stop or the watchdog punch out of recv()/read()
+// promptly instead of waiting for stimeout to elapse. `ctx` is the
+// owning stage's RuntimeContext (stable for the whole run), so the
+// callback reads the stop flag straight off it -- no relay thread is
+// needed to mirror it into an atomic. `force_reconnect` is owned by
+// capture_loop_ and stays valid for every AVFormatContext built in the
+// connect loop.
 struct InterruptCtx {
-  std::atomic<bool>* stop_requested  = nullptr;
+  RuntimeContext*    ctx             = nullptr;
   std::atomic<bool>* force_reconnect = nullptr;
 };
 
@@ -127,8 +133,7 @@ interrupt_cb(void* opaque) noexcept
 {
   auto* ic = static_cast<InterruptCtx*>(opaque);
   if (!ic) { return 0; }
-  if (ic->stop_requested
-      && ic->stop_requested->load(std::memory_order_acquire)) {
+  if (ic->ctx && ic->ctx->stop_requested()) {
     return 1;
   }
   if (ic->force_reconnect
@@ -884,17 +889,20 @@ struct Publisher {
     seg_path      = path;
   }
 
-  // Emit one video Beat for this AU. `is_key` is informational
-  // only (the Beat carries the AU bytes verbatim; the decoder
-  // sniffs NAL types itself). Caller must hand us the bytes BEFORE
-  // SegmentWriter::write_packet (which consumes pkt->data).
-  Job feed_video(RuntimeContext& ctx,
-                 const uint8_t*  data,
-                 size_t          size,
-                 bool            is_key)
+  // Emit one video Beat for this AU on oport 0. `is_key` is
+  // informational only (the Beat carries the AU bytes verbatim; the
+  // decoder sniffs NAL types itself). Caller must hand us the bytes
+  // BEFORE SegmentWriter::write_packet (which consumes pkt->data).
+  // Runs on the capture thread, so it pushes through the non-coroutine
+  // write_sync path; a closed oport (teardown) just drops the AU and
+  // the capture loop exits via ctx.stop_requested() on its next check.
+  void feed_video(RuntimeContext& ctx,
+                  const uint8_t*  data,
+                  size_t          size,
+                  bool            is_key)
   {
     (void)is_key;
-    if (!video_enabled || size == 0) { co_return; }
+    if (!video_enabled || size == 0) { return; }
     const auto now = std::chrono::system_clock::now();
     EncodedSegment es;
     es.kind        = EncodedSegment::Kind::Video;
@@ -909,16 +917,17 @@ struct Publisher {
     es.height      = v_height;
     es.extradata   = v_extradata;
     es.data.assign(data, data + size);
-    co_await ctx.write(0,
+    ctx.write_sync(0,
         make_payload<EncodedSegmentPayload>(std::move(es)));
   }
 
-  // Emit one audio Beat for this audio packet.
-  Job feed_audio(RuntimeContext& ctx,
-                 const uint8_t*  data,
-                 size_t          size)
+  // Emit one audio Beat for this audio packet on oport 1. Same
+  // non-coroutine write_sync path as feed_video.
+  void feed_audio(RuntimeContext& ctx,
+                  const uint8_t*  data,
+                  size_t          size)
   {
-    if (!audio_enabled || size == 0) { co_return; }
+    if (!audio_enabled || size == 0) { return; }
     const auto now = std::chrono::system_clock::now();
     EncodedSegment es;
     es.kind        = EncodedSegment::Kind::Audio;
@@ -933,9 +942,65 @@ struct Publisher {
     es.channels    = a_channels;
     es.extradata   = a_extradata;
     es.data.assign(data, data + size);
-    co_await ctx.write(1,
+    ctx.write_sync(1,
         make_payload<EncodedSegmentPayload>(std::move(es)));
   }
+};
+
+}
+
+namespace {
+
+// Hand-off between RtspCaptureStage::process() and the capture thread
+// it spawns. process() co_awaits awaiter(); the capture thread calls
+// signal() when capture_loop_ returns. signal() resumes the coroutine
+// on the session ThreadPool (or, if process() has not suspended yet,
+// marks `finished` so the awaiter resumes inline). This lets process()
+// free its worker thread while the capture thread runs FFmpeg, instead
+// of pinning a pool worker for the camera's whole lifetime.
+struct CaptureThreadDone {
+  std::mutex              mu;
+  std::coroutine_handle<> waiter{};
+  bool                    finished = false;
+  ThreadPool*             pool     = nullptr;
+
+  void signal()
+  {
+    std::coroutine_handle<> h{};
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      finished = true;
+      h        = waiter;
+      waiter   = {};
+    }
+    if (h && pool) {
+      pool->schedule(h);
+    }
+  }
+
+  struct Awaiter {
+    CaptureThreadDone* st;
+
+    bool await_ready()
+    {
+      std::lock_guard<std::mutex> lk(st->mu);
+      return st->finished;
+    }
+
+    bool await_suspend(std::coroutine_handle<> h)
+    {
+      std::lock_guard<std::mutex> lk(st->mu);
+      if (st->finished) {
+        return false;          // already finished: resume inline
+      }
+      st->waiter = h;
+      return true;
+    }
+
+    void await_resume() const noexcept {}
+  };
+
+  Awaiter awaiter() noexcept { return Awaiter{this}; }
 };
 
 }
@@ -943,8 +1008,6 @@ struct Publisher {
 Job
 RtspCaptureStage::process(RuntimeContext& ctx)
 {
-  using namespace std::chrono;
-
   LmdbEnv* env = session()->lmdb_env();
   if (!env) {
     session()->error(fmt(
@@ -964,45 +1027,68 @@ RtspCaptureStage::process(RuntimeContext& ctx)
         "RtspCaptureStage('{}'): FFmpeg libraries unavailable",
         this->id()));
   }
+
+  // A capture stage does long-lived blocking FFmpeg I/O. Running that
+  // directly in the process() coroutine would pin a session worker for
+  // the camera's entire lifetime, so the number of simultaneous
+  // capture stages would be capped at the worker-pool size. Instead we
+  // run the whole capture on a thread this stage owns; process() then
+  // suspends (freeing its worker) and is resumed by the capture thread
+  // when it exits on stop.
+  CaptureThreadDone done;
+  done.pool = session()->thread_pool();
+  std::thread cap_thread([this, &ctx, &done] {
+    try {
+      capture_loop_(ctx);
+    } catch (...) {
+      // A std::thread must never let an exception escape (it would
+      // std::terminate the process). Oport writes use the non-throwing
+      // write_sync path; this is only a backstop for the surrounding
+      // FFmpeg / LMDB calls.
+    }
+    done.signal();
+  });
+
+  co_await done.awaiter();
+  if (cap_thread.joinable()) {
+    cap_thread.join();
+  }
+
+  ctx.signal_done();
+  co_return;
+}
+
+void
+RtspCaptureStage::capture_loop_(RuntimeContext& ctx)
+{
+  using namespace std::chrono;
+
+  LmdbEnv*               env  = session()->lmdb_env();
+  const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+  if (!env || !libs || !libs->valid()) {
+    return;          // process() validated these; defensive only.
+  }
   libs->avformat().api.network_init();
 
   std::string videos_db = _camera_name + _videos_db_suffix;
 
-  // Stop-aware + watchdog-aware abort plumbing. Both atomics are
-  // owned here so the InterruptCtx pointer stays valid for every
-  // AVFormatContext we create inside the connect loop. The
-  // watchdog thread reads `frames_count` (updated from the main
-  // packet loop) at each chrono tick and sets `force_reconnect`
-  // if no frames arrived in the last interval.
-  std::atomic<bool>     stop_flag{false};
+  // Watchdog-abort plumbing. `force_reconnect` is owned here so the
+  // InterruptCtx pointer stays valid for every AVFormatContext we
+  // create inside the connect loop. The watchdog thread reads
+  // `frames_count` (updated from the packet loop) at each chrono tick
+  // and sets `force_reconnect` if no frames arrived in the last
+  // interval. The session stop flag is read straight off the
+  // RuntimeContext by interrupt_cb, so no relay thread is needed.
   std::atomic<bool>     force_reconnect{false};
   std::atomic<uint64_t> frames_count{0};
   InterruptCtx          ic;
-  ic.stop_requested   = &stop_flag;
-  ic.force_reconnect  = &force_reconnect;
-
-  // Tiny relay thread that mirrors ctx.stop_requested() into
-  // stop_flag so the interrupt_callback can poll without going
-  // through the RuntimeContext (which holds a stop atomic but not
-  // at a stable pointer that survives across reconnects). 50ms
-  // granularity is well below FFmpeg's stimeout.
-  std::atomic<bool> relay_exit{false};
-  std::thread stop_relay([&] {
-    while (!relay_exit.load(std::memory_order_acquire)) {
-      if (ctx.stop_requested()) {
-        stop_flag.store(true, std::memory_order_release);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    if (ctx.stop_requested()) {
-      stop_flag.store(true, std::memory_order_release);
-    }
-  });
+  ic.ctx             = &ctx;
+  ic.force_reconnect = &force_reconnect;
 
   // Watchdog thread: when iport 0 is wired, consume each chrono
   // tick non-blockingly and arm `force_reconnect` if no RTSP
   // packets arrived since the previous tick. The non-blocking
-  // peek+release pattern is safe to drive from a non-coroutine
+  // peek+release pattern is safe to drive from this (non-coroutine)
   // thread -- it never registers a waiter, only takes the
   // buffer's mutex briefly.
   const bool watchdog_enabled = ctx.num_iports() >= 1;
@@ -1039,18 +1125,11 @@ RtspCaptureStage::process(RuntimeContext& ctx)
     });
   }
 
-  // RAII join guards for the helper threads above. process() does
-  // many `co_await ctx.write(...)` calls between here and the explicit
-  // join block at the end of the function; any of those writes can
-  // throw `OportBuffer: write to closed buffer` when stop_pipeline
-  // closes the oport bufs (typical SIGINT teardown path). If the
-  // throw escapes process() and the std::thread locals are destroyed
-  // while still joinable, ~std::thread immediately calls
-  // std::terminate -- the whole process aborts with `libc++abi:
-  // terminating` before stage_driver_'s catch can even log "entering
-  // drain". The guards below run on any scope exit (success or
-  // unwind) so the threads are guaranteed non-joinable by the time
-  // the coroutine frame is destroyed.
+  // RAII join guard for the watchdog thread. capture_loop_ runs on a
+  // thread this stage owns, but a stray exception from an FFmpeg /
+  // LMDB call would otherwise destroy the still-joinable std::thread
+  // local during unwind and std::terminate the process. The guard
+  // signals exit and joins on any scope exit (success or unwind).
   struct JoinGuard {
     std::thread&       t;
     std::atomic<bool>& exit_flag;
@@ -1065,7 +1144,6 @@ RtspCaptureStage::process(RuntimeContext& ctx)
       }
     }
   };
-  JoinGuard relay_guard{stop_relay, relay_exit};
   JoinGuard watchdog_guard{watchdog_thread, watchdog_exit};
 
   // Outer reconnect loop. Each pass: load record, decrypt, open
@@ -1245,7 +1323,7 @@ RtspCaptureStage::process(RuntimeContext& ctx)
               (cs.in_pkt->flags & AV_PKT_FLAG_KEY) != 0;
           // Snapshot bytes BEFORE write_packet -- interleaved_write_frame
           // takes ownership of the packet's buffer and unrefs it.
-          co_await pub.feed_video(ctx,
+          pub.feed_video(ctx,
               cs.in_pkt->data,
               static_cast<size_t>(cs.in_pkt->size),
               is_key);
@@ -1284,7 +1362,7 @@ RtspCaptureStage::process(RuntimeContext& ctx)
               if (rc < 0) { break; }
               bool is_key =
                   (cs.out_pkt->flags & AV_PKT_FLAG_KEY) != 0;
-              co_await pub.feed_video(ctx,
+              pub.feed_video(ctx,
                   cs.out_pkt->data,
                   static_cast<size_t>(cs.out_pkt->size),
                   is_key);
@@ -1303,7 +1381,7 @@ RtspCaptureStage::process(RuntimeContext& ctx)
       } else if (cs.in_pkt->stream_index == cs.a_in_idx
                  && v_audio_idx >= 0) {
         if (cs.stream_copy_a) {
-          co_await pub.feed_audio(ctx,
+          pub.feed_audio(ctx,
               cs.in_pkt->data,
               static_cast<size_t>(cs.in_pkt->size));
           writer.write_packet(cs.in_pkt, v_audio_idx, false);
@@ -1354,7 +1432,7 @@ RtspCaptureStage::process(RuntimeContext& ctx)
                   break;
                 }
                 if (rc < 0) { break; }
-                co_await pub.feed_audio(ctx,
+                pub.feed_audio(ctx,
                     cs.out_pkt->data,
                     static_cast<size_t>(cs.out_pkt->size));
                 writer.write_packet(cs.out_pkt, v_audio_idx, false);
@@ -1388,16 +1466,9 @@ RtspCaptureStage::process(RuntimeContext& ctx)
     }
   }
 
-  // Tear down helper threads. Order: signal exit, then join. The
-  // watchdog also reads ctx.stop_requested() so it exits on its own
-  // once stop is set; joining is just to be a good citizen.
-  watchdog_exit.store(true, std::memory_order_release);
-  relay_exit.store(true, std::memory_order_release);
-  if (watchdog_thread.joinable()) { watchdog_thread.join(); }
-  if (stop_relay.joinable())      { stop_relay.join(); }
-
-  ctx.signal_done();
-  co_return;
+  // The watchdog thread is torn down by watchdog_guard on scope exit.
+  // process() joins this capture thread and calls signal_done() once
+  // we return.
 }
 
 VPIPE_REGISTER_STAGE(RtspCaptureStage)

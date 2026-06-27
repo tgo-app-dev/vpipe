@@ -19,6 +19,8 @@ set(LOCAL_SOURCES
   tokenizer.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/kernel-sets/decode-gqa-attn-set.cc
+  shared/kernel-sets/prefill-gqa-attn-set.cc
   shared/whisper-feature-extractor.cc
   gemma4/gemma4-audio-feature-extractor.cc
   gemma4/gemma4-unified-embedder.cc

@@ -308,6 +308,7 @@ METAL_FUNC void qmm_t_impl(
     const constant int& N,
     const constant int& M,
     const constant int& K_eff,
+    const device int* tile2e,   // MoE grouped: per-tile expert (or nullptr)
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -346,6 +347,16 @@ METAL_FUNC void qmm_t_impl(
   const int y_col = tid.x * BN;
 
   auto wl = (const device uint8_t*)w;
+
+  // MoE grouped GEMM: each BM-row M-tile is one expert's (sorted, padded)
+  // rows -> offset the weight slab to that expert; skip empty padding tiles.
+  if (tile2e) {
+    const int e = tile2e[tid.y];
+    if (e < 0) { return; }
+    wl += static_cast<int64_t>(e) * N * K_w;
+    scales += static_cast<int64_t>(e) * N * K_g;
+    biases += static_cast<int64_t>(e) * N * K_g;
+  }
 
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
@@ -440,7 +451,7 @@ kernel void affine_qmm_steel_w4g64(
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
-      tid, lid, simd_gid, simd_lid);
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
 // group_size=32 twin of affine_qmm_steel_w4g64 (GGUF q4_0). Only the
@@ -465,7 +476,7 @@ kernel void affine_qmm_steel_w4g32(
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_impl<VPIPE_ELT, 32, 4, /*aligned_N=*/true, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
-      tid, lid, simd_gid, simd_lid);
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
 // ===================================================================
@@ -603,6 +614,291 @@ kernel void affine_qmm_swiglu_w4g64(
   qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M,
       tid, simd_gid, simd_lid);
+}
+
+// Row-gathering block loader: a drop-in for mlx::steel::BlockLoader whose BM
+// rows are GATHERED from a base matrix via srow[] (row r of the tile reads
+// src[srow[base_slot + r], :]; srow < 0 -> zero-filled padding row). Lets the
+// grouped gate|up GEMM read its sorted rows straight from the hidden, fusing
+// away the explicit moe_gather_x copy (the ablation's #1 prefill overhead).
+// K is a multiple of BK for these GEMMs so only load (column-aligned) is
+// needed; load_safe falls back to it (padding rows masked by srow).
+template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
+          short n_reads = (BCOLS * BROWS) / tgp_size,
+          short TCOLS = BCOLS / n_reads, short TROWS = tgp_size / TCOLS>
+struct GatherBlockLoader {
+  STEEL_CONST short vec_size = n_reads;
+  const int src_ld;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device T* src;        // base hidden [M, K]
+  const device int* srow;     // [npad] gathered row per sorted slot (<0 = pad)
+  const int base_slot;        // tile's first sorted slot (= y_row)
+  int k_off;
+  struct alignas(sizeof(T) * vec_size) ReadVector {
+    uint8_t v[sizeof(T) * vec_size];
+  };
+  METAL_FUNC GatherBlockLoader(
+      const device T* src_, const int src_ld_, const device int* srow_,
+      const int base_slot_, threadgroup T* dst_, ushort simd_group_id,
+      ushort simd_lane_id)
+      : src_ld(src_ld_),
+        bi((short)((simd_group_id * 32 + simd_lane_id) / TCOLS)),
+        bj((short)(vec_size * ((simd_group_id * 32 + simd_lane_id) % TCOLS))),
+        dst(dst_ + bi * dst_ld + bj),
+        src(src_), srow(srow_), base_slot(base_slot_), k_off(0) {}
+  METAL_FUNC void load_unsafe() const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      const int r = srow[base_slot + bi + i];
+      if (r >= 0) {
+        *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
+            *((const device ReadVector*)(&src[(int64_t)r * src_ld + bj + k_off]));
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < vec_size; j++) { dst[i * dst_ld + j] = T(0); }
+      }
+    }
+  }
+  METAL_FUNC void load_safe(short2) const { load_unsafe(); }
+  METAL_FUNC void next() { k_off += BCOLS; }
+};
+
+// ===================================================================
+// MoE GROUPED steel GEMM (Qwen3.5-MoE prefill -- the matrix-tiled expert
+// GEMM that closes the prefill gap vs MLX gather_qmm). The (token,expert)
+// pairs are counting-sorted into per-expert blocks padded to BM rows; each
+// M-tile (tid.y) belongs to ONE expert (tile2e[tid.y]) and the weight slab is
+// offset to it -- so the steel MMA runs per expert reading the weight once and
+// at full matrix-core/SIMD efficiency. Token-exact with the per-pair/GEMV
+// paths. The gate|up GEMM gathers its rows from the hidden via srow (fused into
+// the load); the down GEMM scatters its rows to partials via sdst (fused into
+// the store) -- no explicit gather/scatter copies.
+// ===================================================================
+// Forward decls (impls below): the down GEMM's scatter store + gate|up gather.
+template <typename T, const int group_size, const int bits,
+          const int BM, const int BK, const int BN>
+METAL_FUNC void qmm_t_grouped_down_impl(
+    const device uint32_t*, const device T*, const device T*, const device T*,
+    device T*, threadgroup T*, threadgroup T*, const constant int&,
+    const constant int&, const constant int&, const device int*,
+    const device int*, uint3, uint, uint);
+
+kernel void affine_qmm_grouped_w4g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // sorted activations [npad,K]
+    device VPIPE_ELT*       y      [[buffer(4)]],   // partials [np,N] scattered
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* sdst         [[buffer(9)]],   // sorted-slot -> pair index
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_down_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,
+      tid, simd_gid, simd_lid);
+}
+
+// Grouped gate|up + SwiGLU GEMM (copy of qmm_t_swiglu_impl + the per-M-tile
+// expert weight offset). Interleaved [E, 2*inner, K] weight; output halved to
+// sorted [npad, inner] (silu(gate)*up).
+template <typename T, const int group_size, const int bits,
+          const int BM = 32, const int BK = 32, const int BN = 32>
+METAL_FUNC void qmm_t_grouped_swiglu_impl(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    const device T* x, device T* y, threadgroup T* Xs, threadgroup T* Ws,
+    const constant int& K, const constant int& N, const constant int& M,
+    const device int* tile2e, const device int* srow,
+    uint3 tid, uint simd_gid, uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  // x is GATHERED from the hidden via srow (the gather fused into the load).
+  using loader_x_t =
+      GatherBlockLoader<T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  auto wl = (const device uint8_t*)w;
+  if (tile2e) {
+    const int e = tile2e[tid.y];
+    if (e < 0) { return; }
+    wl += static_cast<int64_t>(e) * N * K_w;
+    scales += static_cast<int64_t>(e) * N * K_g;
+    biases += static_cast<int64_t>(e) * N * K_g;
+  }
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  const short num_els = min(BM, M - y_row);
+  loader_x_t loader_x(x, K, srow, y_row, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  if (num_els < BM) {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_safe(short2(BK, num_els));
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  } else {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_unsafe();
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int FS = 8;
+  constexpr int TM = BM / (FS * WM);
+  constexpr int TN = BN / (FS * WN);
+  const int outN = N / 2;
+  const short sm = mma_op.sm;
+  const short sn = mma_op.sn;
+  for (short ti = 0; ti < TM; ti++) {
+    const int row = y_row + sm + ti * FS * WM;
+    if (row >= M) { continue; }
+    for (short tj = 0; tj < TN; tj++) {
+      const int col = y_col + sn + tj * FS * WN;
+      const thread auto& fr = mma_op.Ctile.frag_at(ti, tj);
+      const float ga = (float)fr[0];
+      const float up = (float)fr[1];
+      const float s = ga / (1.0f + metal::exp(-ga));
+      y[(int64_t)row * outN + (col >> 1)] = (T)(s * up);
+    }
+  }
+}
+
+kernel void affine_qmm_grouped_swiglu_w4g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // hidden [M, K] (gathered)
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],   // fused width = 2*inner
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* srow         [[buffer(9)]],   // sorted-slot -> hidden row
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
+      tid, simd_gid, simd_lid);
+}
+
+// Grouped down GEMM with a SCATTER store: each sorted output row is written to
+// partials[sdst[slot], :] (fuses moe_scatter_back into the store). x = sorted
+// activations (contiguous); w = per-tile expert down slab. Mirrors qmm_t_impl's
+// MMA loop; only the store differs (manual per-row scatter, no store_result).
+template <typename T, const int group_size, const int bits,
+          const int BM = 32, const int BK = 32, const int BN = 32>
+METAL_FUNC void qmm_t_grouped_down_impl(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    const device T* x, device T* y, threadgroup T* Xs, threadgroup T* Ws,
+    const constant int& K, const constant int& N, const constant int& M,
+    const device int* tile2e, const device int* sdst,
+    uint3 tid, uint simd_gid, uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  auto wl = (const device uint8_t*)w;
+  if (tile2e) {
+    const int e = tile2e[tid.y];
+    if (e < 0) { return; }
+    wl += static_cast<int64_t>(e) * N * K_w;
+    scales += static_cast<int64_t>(e) * N * K_g;
+    biases += static_cast<int64_t>(e) * N * K_g;
+  }
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  const short num_els = min(BM, M - y_row);
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  if (num_els < BM) {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_safe(short2(BK, num_els));
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  } else {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_unsafe();
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int FS = 8;
+  constexpr int TM = BM / (FS * WM);
+  constexpr int TN = BN / (FS * WN);
+  const short sm = mma_op.sm;
+  const short sn = mma_op.sn;
+  for (short ti = 0; ti < TM; ti++) {
+    const int row = y_row + sm + ti * FS * WM;
+    if (row >= M) { continue; }
+    const int dr = sdst[row];              // pair-ordered destination (or -1)
+    if (dr < 0) { continue; }
+    for (short tj = 0; tj < TN; tj++) {
+      const int col = y_col + sn + tj * FS * WN;
+      const thread auto& fr = mma_op.Ctile.frag_at(ti, tj);
+      y[(int64_t)dr * N + col] = (T)fr[0];
+      y[(int64_t)dr * N + col + 1] = (T)fr[1];
+    }
+  }
 }
 
 // Fused GeGLU MLP GEMM (Gemma-4 prefill): mirrors qmm_t_swiglu_impl
@@ -777,7 +1073,32 @@ kernel void affine_qmm_steel_w8g64(
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
-      tid, lid, simd_gid, simd_lid);
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+// group_size=32 twin of affine_qmm_steel_w8g64 (the MOSS codec int8 path):
+// only the template group_size differs. Requires N % 32 == 0 (aligned_N).
+kernel void affine_qmm_steel_w8g32(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 32, 8, /*aligned_N=*/true, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
 kernel void affine_qmm_swiglu_w8g64(

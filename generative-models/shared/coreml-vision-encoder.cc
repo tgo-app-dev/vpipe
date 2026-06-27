@@ -198,6 +198,111 @@ mc_letterbox_bgra_(metal_compute::MetalCompute& mc,
   return mc_letterbox_bgra_buf_(mc, src, in_w, in_h, pb, session);
 }
 
+// Letterbox a planar [3,in_h,in_w] u8 RGB image (resident in a Shared/UMA
+// buffer `src`) into an f16 RGB tensor in a freshly-allocated Shared/UMA
+// buffer, laid out NCHW (chw) or NHWC, via letterbox_planar_u8_to_rgb_f16.
+// Zero-copy: the returned buffer is wrapped DIRECTLY as a CoreML MLMultiArray
+// (no CVPixelBuffer, no lock, no host memcpy). Empty SharedBuffer on failure.
+metal_compute::SharedBuffer
+mc_letterbox_rgb_f16_buf_(metal_compute::MetalCompute&        mc,
+                          const metal_compute::SharedBuffer&  src,
+                          int in_w, int in_h, int out_w, int out_h,
+                          bool chw, const SessionContextIntf* session)
+{
+  namespace mcn = vpipe::metal_compute;
+  if (in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) { return {}; }
+  const std::size_t src_bytes =
+      static_cast<std::size_t>(3) * in_w * in_h;
+  if (src.empty() || src.byte_size() < src_bytes) { return {}; }
+
+  // Letterbox geometry (identical to the BGRA path).
+  const float sx = static_cast<float>(out_w) / static_cast<float>(in_w);
+  const float sy = static_cast<float>(out_h) / static_cast<float>(in_h);
+  const float scale = sx < sy ? sx : sy;
+  const int   new_w = static_cast<int>(std::round(scale * in_w));
+  const int   new_h = static_cast<int>(std::round(scale * in_h));
+  const int   pad_x = (out_w - new_w) / 2;
+  const int   pad_y = (out_h - new_h) / 2;
+  const float inv   = 1.0f / scale;
+
+  const std::size_t dst_elems =
+      static_cast<std::size_t>(3) * out_w * out_h;
+  mcn::SharedBuffer dst = mc.make_shared_buffer(dst_elems * 2);   // f16
+  if (dst.empty()) { return {}; }
+
+  std::uint32_t params[4]  = {
+      static_cast<std::uint32_t>(in_w),  static_cast<std::uint32_t>(in_h),
+      static_cast<std::uint32_t>(out_w), static_cast<std::uint32_t>(out_h) };
+  std::uint32_t params2[4] = {
+      static_cast<std::uint32_t>(new_w), static_cast<std::uint32_t>(new_h),
+      static_cast<std::uint32_t>(pad_x), static_cast<std::uint32_t>(pad_y) };
+  float         params3[4] = { inv, 0.0f, 0.0f, 0.0f };
+  std::uint32_t chw_u      = chw ? 1u : 0u;
+
+  bool ok = false;
+  mcn::ComputeLibrary lib =
+      mc.load_library("letterbox_planar_u8_to_rgb_f16");
+  mcn::ComputeFunction fn = lib.valid()
+      ? lib.function("letterbox_planar_u8_to_rgb_f16")
+      : mcn::ComputeFunction();
+  if (fn.valid()) {
+    mcn::CommandStream stream = mc.make_command_stream();
+    {
+      mcn::ComputeEncoder enc = stream.begin_compute();
+      if (enc.valid()) {
+        enc.set_function(fn);
+        enc.set_buffer(0, src, 0);
+        enc.set_buffer(1, dst, 0);
+        enc.set_constant_bytes(2, params,  sizeof(params));
+        enc.set_constant_bytes(3, params2, sizeof(params2));
+        enc.set_constant_bytes(4, params3, sizeof(params3));
+        enc.set_constant_bytes(5, &chw_u, sizeof(chw_u));
+        const unsigned tew  = fn.thread_execution_width();
+        const unsigned maxt = fn.max_total_threads_per_threadgroup();
+        const unsigned tgh  = (tew == 0) ? 1u : std::max(1u, maxt / tew);
+        enc.dispatch(
+            mcn::LaunchDims{ static_cast<unsigned>(out_w),
+                             static_cast<unsigned>(out_h), 1u },
+            mcn::LaunchDims{ tew == 0 ? 1u : tew, tgh, 1u });
+        ok = true;
+      }
+    }
+    if (ok) {
+      mcn::CommandStream::Fence cb = stream.commit();
+      cb.wait();
+      ok = cb.completed();
+    }
+  }
+  if (!ok) {
+    if (session) {
+      session->warn(fmt(
+          "CoreMLVisionEncoder: metal-compute rgb-f16 letterbox dispatch "
+          "failed ({}x{} -> {}x{})", in_w, in_h, out_w, out_h));
+    }
+    return {};
+  }
+  return dst;
+}
+
+// Host-input wrapper: stage planar [3,in_h,in_w] u8 RGB into a Shared
+// buffer, then letterbox to f16. Used when the source frame isn't already a
+// metal-compute (Shared/UMA) buffer.
+metal_compute::SharedBuffer
+mc_letterbox_rgb_f16_(metal_compute::MetalCompute& mc,
+                      const std::uint8_t* rgb, int in_w, int in_h,
+                      int out_w, int out_h, bool chw,
+                      const SessionContextIntf* session)
+{
+  if (in_w <= 0 || in_h <= 0) { return {}; }
+  const std::size_t src_bytes =
+      static_cast<std::size_t>(3) * in_w * in_h;
+  metal_compute::SharedBuffer src = mc.make_shared_buffer(src_bytes);
+  if (src.empty()) { return {}; }
+  std::memcpy(src.contents(), rgb, src_bytes);
+  return mc_letterbox_rgb_f16_buf_(mc, src, in_w, in_h, out_w, out_h, chw,
+                                   session);
+}
+
 }
 
 struct CoreMLVisionEncoder::Impl {
@@ -218,6 +323,15 @@ struct CoreMLVisionEncoder::Impl {
   int                                     input_w     = 0;
   int                                     input_h     = 0;
   std::uint32_t                           pixel_fmt   = 0;
+
+  // MultiArray-input path (zero-copy f16 RGB): set when the model's image
+  // input(s) are MLMultiArray (not ImageType). The frame is letterboxed
+  // straight into an f16 RGB tensor bound AS the MLMultiArray -- no
+  // CVPixelBuffer, no host copy. marray_chw selects NCHW vs NHWC;
+  // marray_shape is the exact shape used to wrap the f16 buffer.
+  bool                                    input_is_marray = false;
+  bool                                    marray_chw      = true;
+  std::vector<std::int64_t>               marray_shape;
 
   // Cached output feature contract.
   std::string                             output_name = "image_features";
@@ -286,6 +400,16 @@ CoreMLVisionEncoder::output_hidden() const noexcept
 #endif
 }
 
+bool
+CoreMLVisionEncoder::input_is_multiarray() const noexcept
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  return _p->input_is_marray;
+#else
+  return false;
+#endif
+}
+
 std::unique_ptr<CoreMLVisionEncoder>
 CoreMLVisionEncoder::create(const LoadSpec&             spec,
                             MlxRuntime*                 runtime,
@@ -348,62 +472,112 @@ CoreMLVisionEncoder::create(const LoadSpec&             spec,
   // Discover the image input layout: a single "image" input (the
   // still-frame tower), or "image0"+"image1" (the temporal-pair video
   // export that merges two frames per token in-model). Both pair
-  // inputs share the same shape, so dims/pixel-format are read from
-  // the first.
+  // inputs share the same shape. Each may be an ImageType (CVPixelBuffer /
+  // BGRA path) OR an MLMultiArray (zero-copy f16 RGB path).
   {
     auto* in_dict = desc->inputDescriptionsByName();
+    auto feat_desc = [&](const char* nm) -> CML::FeatureDescription* {
+      return in_dict
+          ? in_dict->object<CML::FeatureDescription>(ns_str_(nm)) : nullptr;
+    };
     auto image_constraint = [&](const char* nm) {
-      auto* fd = in_dict
-          ? in_dict->object<CML::FeatureDescription>(ns_str_(nm))
-          : nullptr;
+      auto* fd = feat_desc(nm);
       return fd ? fd->imageConstraint() : nullptr;
     };
-    auto* c_single = image_constraint("image");
-    decltype(c_single) im_constraint = nullptr;
-    if (c_single) {
+    auto marray_constraint = [&](const char* nm) -> CML::MultiArrayConstraint* {
+      auto* fd = feat_desc(nm);
+      return fd ? fd->multiArrayConstraint() : nullptr;
+    };
+
+    // Resolve the input name set: single "image" or "image0"+"image1".
+    bool have_single = feat_desc("image") != nullptr;
+    bool have_pair   = feat_desc("image0") != nullptr
+                    && feat_desc("image1") != nullptr;
+    if (have_single) {
       impl.input_names = {"image"};
       impl.is_pair     = false;
-      im_constraint    = c_single;
+    } else if (have_pair) {
+      impl.input_names = {"image0", "image1"};
+      impl.is_pair     = true;
     } else {
-      auto* c0 = image_constraint("image0");
-      auto* c1 = image_constraint("image1");
-      if (c0 && c1) {
-        impl.input_names = {"image0", "image1"};
-        impl.is_pair     = true;
-        im_constraint    = c0;
-      }
-    }
-    if (!im_constraint) {
       pool->release();
       session->warn(fmt(
-          "CoreMLVisionEncoder: model '{}' has no recognised image "
-          "input. Expected a single 'image' ImageType, or "
-          "'image0'+'image1' for the temporal-pair video export. "
-          "Re-export with ct.ImageType(color_layout=ct.colorlayout."
-          "BGR).",
+          "CoreMLVisionEncoder: model '{}' has no recognised image input. "
+          "Expected a single 'image' (or 'image0'+'image1') ImageType or "
+          "MLMultiArray input.",
           spec.mlpackage_path));
       return nullptr;
     }
     impl.input_name = impl.input_names.front();
-    const NS::UInteger mw = im_constraint->pixelsWide();
-    const NS::UInteger mh = im_constraint->pixelsHigh();
-    if (mw == 0 || mh == 0) {
+    const char* first = impl.input_names.front().c_str();
+
+    if (auto* im = image_constraint(first)) {
+      // ---- ImageType path: BGRA CVPixelBuffer ----
+      const NS::UInteger mw = im->pixelsWide();
+      const NS::UInteger mh = im->pixelsHigh();
+      if (mw == 0 || mh == 0) {
+        pool->release();
+        session->warn(fmt(
+            "CoreMLVisionEncoder: model declares flexible pixel "
+            "dimensions; re-export with a fixed image size."));
+        return nullptr;
+      }
+      impl.input_w   = static_cast<int>(mw);
+      impl.input_h   = static_cast<int>(mh);
+      impl.pixel_fmt = im->pixelFormatType();
+      if (impl.pixel_fmt != kCVPixelFormatType_32BGRA) {
+        pool->release();
+        session->warn(fmt(
+            "CoreMLVisionEncoder: model expects pixel format 0x{:x} "
+            "but only kCVPixelFormatType_32BGRA (0x{:x}) is supported.",
+            impl.pixel_fmt,
+            static_cast<std::uint32_t>(kCVPixelFormatType_32BGRA)));
+        return nullptr;
+      }
+    } else if (auto* ma = marray_constraint(first)) {
+      // ---- MultiArray path: zero-copy f16 RGB tensor ----
+      if (ma->dataType() != CML::MultiArrayDataTypeFloat16) {
+        pool->release();
+        session->warn(fmt(
+            "CoreMLVisionEncoder: MLMultiArray input '{}' dtype {} is not "
+            "Float16; re-export the image input as float16 for the "
+            "zero-copy path.",
+            impl.input_name,
+            static_cast<long long>(ma->dataType())));
+        return nullptr;
+      }
+      // Layout from the shape: [.,3,H,W] -> NCHW, [.,H,W,3] -> NHWC.
+      const std::vector<std::int64_t> sh = read_shape_(ma->shape());
+      int Hh = 0, Ww = 0; bool chw = true, ok_shape = false;
+      if (sh.size() == 4) {
+        if (sh[1] == 3) { chw = true;  Hh = (int)sh[2]; Ww = (int)sh[3];
+                          ok_shape = true; }
+        else if (sh[3] == 3) { chw = false; Hh = (int)sh[1]; Ww = (int)sh[2];
+                          ok_shape = true; }
+      } else if (sh.size() == 3) {
+        if (sh[0] == 3) { chw = true;  Hh = (int)sh[1]; Ww = (int)sh[2];
+                          ok_shape = true; }
+        else if (sh[2] == 3) { chw = false; Hh = (int)sh[0]; Ww = (int)sh[1];
+                          ok_shape = true; }
+      }
+      if (!ok_shape || Hh <= 0 || Ww <= 0) {
+        pool->release();
+        session->warn(fmt(
+            "CoreMLVisionEncoder: MLMultiArray input '{}' shape is not a "
+            "fixed [..,3,H,W] (NCHW) or [..,H,W,3] (NHWC) RGB tensor.",
+            impl.input_name));
+        return nullptr;
+      }
+      impl.input_is_marray = true;
+      impl.marray_chw      = chw;
+      impl.marray_shape    = sh;
+      impl.input_w         = Ww;
+      impl.input_h         = Hh;
+    } else {
       pool->release();
       session->warn(fmt(
-          "CoreMLVisionEncoder: model declares flexible pixel "
-          "dimensions; re-export with a fixed image size."));
-      return nullptr;
-    }
-    impl.input_w   = static_cast<int>(mw);
-    impl.input_h   = static_cast<int>(mh);
-    impl.pixel_fmt = im_constraint->pixelFormatType();
-    if (impl.pixel_fmt != kCVPixelFormatType_32BGRA) {
-      pool->release();
-      session->warn(fmt(
-          "CoreMLVisionEncoder: model expects pixel format 0x{:x} "
-          "but only kCVPixelFormatType_32BGRA (0x{:x}) is supported.",
-          impl.pixel_fmt,
-          static_cast<std::uint32_t>(kCVPixelFormatType_32BGRA)));
+          "CoreMLVisionEncoder: input '{}' is neither an ImageType nor an "
+          "MLMultiArray.", impl.input_name));
       return nullptr;
     }
   }
@@ -445,7 +619,8 @@ CoreMLVisionEncoder::create(const LoadSpec&             spec,
   pool->release();
 
   // Grid dims: prefer caller override, else infer from input pixels.
-  if (spec.grid_h > 0 && spec.grid_w > 0) {
+  const bool grid_inferred = !(spec.grid_h > 0 && spec.grid_w > 0);
+  if (!grid_inferred) {
     impl.grid_h = spec.grid_h;
     impl.grid_w = spec.grid_w;
   } else {
@@ -459,23 +634,36 @@ CoreMLVisionEncoder::create(const LoadSpec&             spec,
   if (impl.n_tokens == 0 && impl.grid_h > 0 && impl.grid_w > 0) {
     impl.n_tokens = impl.grid_h * impl.grid_w;
   }
-  // Sanity check: grid * grid should match the output token count.
+  // Sanity check: grid * grid should match the output token count. A
+  // mismatch on an INFERRED grid is expected and benign for pooled
+  // soft-token exports (e.g. Gemma-4: the ViT pools to a fixed token
+  // count that is not a patch grid) -- the model output count is
+  // authoritative and a 1xN strip drives plain 1-D RoPE. Only an
+  // explicit, wrong caller grid warrants a warning.
   if (impl.grid_h * impl.grid_w != impl.n_tokens) {
-    session->warn(fmt(
-        "CoreMLVisionEncoder: grid {}x{} = {} tokens does not match "
-        "model output n_tokens={}; using model output count and "
-        "treating the grid as a 1xN strip for mRoPE.",
-        impl.grid_h, impl.grid_w, impl.grid_h * impl.grid_w,
-        impl.n_tokens));
+    auto msg = [&] {
+      return fmt(
+          "CoreMLVisionEncoder: {}x{} patch grid ({} tokens) != model "
+          "output n_tokens={}; using the model count as a 1xN strip "
+          "(1-D RoPE).",
+          impl.grid_h, impl.grid_w, impl.grid_h * impl.grid_w,
+          impl.n_tokens);
+    };
+    if (grid_inferred) { session->info(msg()); }
+    else               { session->warn(msg()); }
     impl.grid_h = 1;
     impl.grid_w = impl.n_tokens;
   }
 
   session->info(fmt(
-      "CoreMLVisionEncoder: loaded '{}' -> in={}x{} BGRA ({}), "
+      "CoreMLVisionEncoder: loaded '{}' -> in={}x{} {} ({}), "
       "out='{}' [{}, {}] grid {}x{}",
       spec.mlpackage_path,
       impl.input_w, impl.input_h,
+      impl.input_is_marray
+          ? (impl.marray_chw ? "RGB-f16 MLMultiArray NCHW"
+                             : "RGB-f16 MLMultiArray NHWC")
+          : "BGRA CVPixelBuffer",
       impl.is_pair ? "temporal-pair image0+image1"
                    : "single image",
       impl.output_name, impl.n_tokens, impl.hidden,
@@ -511,19 +699,42 @@ CoreMLVisionEncoder::encode_frames_host_(
   const int Sw = impl.input_w;
   const int Sh = impl.input_h;
 
-  // 1-3. Letterbox each source frame into its own BGRA CVPixelBuffer
-  // (GPU bilinear resample + aspect-preserving pad + RGB->BGRA pack).
-  // CoreML retains its own reference during prediction; release_pbs()
-  // drops ours on every exit path.
-  std::vector<CVPixelBufferRef> pbs;
-  pbs.reserve(n_src);
-  auto release_pbs = [&pbs]() {
-    for (CVPixelBufferRef p : pbs) {
-      if (p) { CFRelease(p); }
-    }
+  // 1-3. Letterbox each source frame into the model's input form. Two
+  // backings, per the model contract:
+  //   * ImageType  -> a BGRA CVPixelBuffer (`pbs`), the model letterboxes
+  //                   onto a fixed-size pixel buffer.
+  //   * MultiArray -> an f16 RGB tensor in a Shared/UMA buffer (`marr_bufs`)
+  //                   wrapped as an MLMultiArray (`arrs`) -- zero-copy, no
+  //                   pixel buffer / lock / host memcpy.
+  // release_inputs() drops all of them on every exit path. (CoreML retains
+  // its own references during prediction.)
+  std::vector<CVPixelBufferRef>            pbs;
+  std::vector<metal_compute::SharedBuffer> marr_bufs;   // UMA f16 backings
+  std::vector<CML::MultiArray*>            arrs;         // retained wrappers
+  pbs.reserve(impl.input_is_marray ? 0 : n_src);
+  marr_bufs.reserve(impl.input_is_marray ? n_src : 0);
+  auto release_inputs = [&]() {
+    for (CVPixelBufferRef p : pbs) { if (p) { CFRelease(p); } }
     pbs.clear();
+    for (CML::MultiArray* a : arrs) { if (a) { a->release(); } }
+    arrs.clear();
+    marr_bufs.clear();
   };
   for (int i = 0; i < n_src; ++i) {
+    if (impl.input_is_marray) {
+      // GPU letterbox -> f16 RGB tensor (the MLMultiArray backing). Zero-copy
+      // input when a Shared buffer was supplied; else stage the host frame.
+      metal_compute::SharedBuffer dst = impl.mc
+          ? (src_buf
+                 ? mc_letterbox_rgb_f16_buf_(*impl.mc, *src_buf, W, H, Sw, Sh,
+                                             impl.marray_chw, impl.session)
+                 : mc_letterbox_rgb_f16_(*impl.mc, frames[i], W, H, Sw, Sh,
+                                         impl.marray_chw, impl.session))
+          : metal_compute::SharedBuffer();
+      if (dst.empty()) { release_inputs(); return std::nullopt; }
+      marr_bufs.push_back(std::move(dst));
+      continue;
+    }
     CVPixelBufferRef pb = nullptr;
     CVReturn cv_rc = CVPixelBufferCreate(
         kCFAllocatorDefault,
@@ -538,10 +749,10 @@ CoreMLVisionEncoder::encode_frames_host_(
             "CoreMLVisionEncoder: CVPixelBufferCreate ({}x{}) rc={}",
             Sw, Sh, static_cast<int>(cv_rc)));
       }
-      release_pbs();
+      release_inputs();
       return std::nullopt;
     }
-    pbs.push_back(pb);   // owned now; release_pbs() frees it
+    pbs.push_back(pb);   // owned now; release_inputs() frees it
 
     // GPU letterbox + RGB->BGRA pack into the pixel buffer via
     // metal-compute (no MetalRuntime, no MLX). Zero-copy input when a
@@ -553,7 +764,7 @@ CoreMLVisionEncoder::encode_frames_host_(
             : mc_letterbox_bgra_(*impl.mc, frames[i], W, H, pb,
                                  impl.session));
     if (!lb_ok) {
-      release_pbs();
+      release_inputs();
       return std::nullopt;
     }
   }
@@ -571,28 +782,76 @@ CoreMLVisionEncoder::encode_frames_host_(
     auto* pool = NS::AutoreleasePool::alloc()->init();
 
     NS::Error* err = nullptr;
-    // Bind each model image input to a pixel buffer. A single-input
-    // model uses pbs[0]; the two-input video model binds image0/image1
-    // to pbs[0]/pbs[1] (or replicates pbs[0] when only one frame was
-    // supplied -- e.g. a still-image encode() through the pair model).
+    // For the MultiArray path, wrap each f16 RGB backing buffer in an
+    // MLMultiArray with a zero-copy data pointer (the SharedBuffer's UMA
+    // contents) + contiguous strides. Built once; bound below.
+    if (impl.input_is_marray) {
+      const std::vector<std::int64_t>& sh = impl.marray_shape;
+      std::vector<std::int64_t> strides(sh.size(), 1);
+      for (int d = static_cast<int>(sh.size()) - 2; d >= 0; --d) {
+        strides[d] = strides[d + 1] * sh[d + 1];
+      }
+      auto ns_int_array = [](const std::vector<std::int64_t>& v) -> NS::Array* {
+        std::vector<const NS::Object*> nums;
+        nums.reserve(v.size());
+        for (std::int64_t d : v) {
+          nums.push_back(NS::Number::number(static_cast<long long>(d)));
+        }
+        return NS::Array::array(nums.data(), nums.size());
+      };
+      NS::Array* shape_arr  = ns_int_array(sh);
+      NS::Array* stride_arr = ns_int_array(strides);
+      bool ma_ok = true;
+      for (int i = 0; i < n_src; ++i) {
+        NS::Error* aerr = nullptr;
+        CML::MultiArray* a = CML::MultiArray::alloc()->initWithDataPointer(
+            marr_bufs[i].contents(), shape_arr,
+            CML::MultiArrayDataTypeFloat16, stride_arr,
+            /*deallocator=*/nullptr, &aerr);
+        if (aerr || !a) {
+          if (a) { a->release(); }
+          ma_ok = false; break;
+        }
+        arrs.push_back(a);   // retained; release_inputs() drops it
+      }
+      if (!ma_ok) {
+        pool->release();
+        release_inputs();
+        if (impl.session) {
+          impl.session->warn(fmt(
+              "CoreMLVisionEncoder: MLMultiArray initWithDataPointer "
+              "failed"));
+        }
+        return std::nullopt;
+      }
+    }
+    // Bind each model image input. A single-input model uses index 0; the
+    // two-input video model binds image0/image1 to [0]/[1] (or replicates
+    // [0] when only one frame was supplied -- a still encode() through the
+    // pair model). Source is a CVPixelBuffer (ImageType) or MLMultiArray.
     const std::size_t nin = impl.input_names.size();
     std::vector<const NS::Object*> objs(nin);
     std::vector<const NS::Object*> keys(nin);
     bool fv_ok = true;
     for (std::size_t i = 0; i < nin; ++i) {
-      CVPixelBufferRef use = (i < pbs.size()) ? pbs[i] : pbs.back();
-      CML::FeatureValue* fv =
-          CML::FeatureValue::featureValueWithPixelBuffer(use);
+      CML::FeatureValue* fv = nullptr;
+      if (impl.input_is_marray) {
+        CML::MultiArray* use = (i < arrs.size()) ? arrs[i] : arrs.back();
+        fv = CML::FeatureValue::featureValueWithMultiArray(use);
+      } else {
+        CVPixelBufferRef use = (i < pbs.size()) ? pbs[i] : pbs.back();
+        fv = CML::FeatureValue::featureValueWithPixelBuffer(use);
+      }
       if (!fv) { fv_ok = false; break; }
       objs[i] = fv;
       keys[i] = ns_str_(impl.input_names[i]);
     }
     if (!fv_ok) {
       pool->release();
-      release_pbs();
+      release_inputs();
       if (impl.session) {
         impl.session->warn(fmt(
-            "CoreMLVisionEncoder: featureValueWithPixelBuffer "
+            "CoreMLVisionEncoder: feature value (image/multiarray) "
             "returned null"));
       }
       return std::nullopt;
@@ -602,7 +861,7 @@ CoreMLVisionEncoder::encode_frames_host_(
     auto* dfp = CML::DictionaryFeatureProvider::alloc()
                     ->initWithDictionary(dict, &err);
     if (err || !dfp) {
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -626,7 +885,7 @@ CoreMLVisionEncoder::encode_frames_host_(
         desc = err->localizedDescription()->utf8String();
       }
       dfp->release();
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -641,7 +900,7 @@ CoreMLVisionEncoder::encode_frames_host_(
     auto* arr     = val ? val->multiArrayValue() : nullptr;
     if (!arr) {
       dfp->release();
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -663,7 +922,7 @@ CoreMLVisionEncoder::encode_frames_host_(
                              * static_cast<std::size_t>(impl.hidden);
     if (n != want) {
       dfp->release();
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -694,7 +953,7 @@ CoreMLVisionEncoder::encode_frames_host_(
         && dt != CML::MultiArrayDataTypeFloat16
         && dt != CML::MultiArrayDataTypeDouble) {
       dfp->release();
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -708,7 +967,7 @@ CoreMLVisionEncoder::encode_frames_host_(
     emb16 = impl.mc ? impl.mc->make_shared_buffer(n * 2) : metal_compute::SharedBuffer();
     if (emb16.empty()) {
       dfp->release();
-      release_pbs();
+      release_inputs();
       pool->release();
       if (impl.session) {
         impl.session->warn(fmt(
@@ -766,7 +1025,7 @@ CoreMLVisionEncoder::encode_frames_host_(
     dfp->release();
     pool->release();
   }
-  release_pbs();
+  release_inputs();
 
   // 5. Return the native-f16 GPU embeddings. The MLX path's
   // encode()/encode_pair() wrap these in an mc::array.

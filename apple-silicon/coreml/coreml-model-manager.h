@@ -63,6 +63,16 @@ public:
   const std::unordered_map<std::string, CoreMLOutputDesc>&
   output_descs() const noexcept { return _outputs; }
 
+  // Input / output feature names discovered at load time. CoreML does
+  // not guarantee an enumeration order across keys, so a consumer that
+  // wants to derive "the" feature name should require a single entry
+  // (single-I/O models, the common case). Empty if introspection
+  // failed.
+  const std::vector<std::string>& input_names() const noexcept
+  { return _input_names; }
+  const std::vector<std::string>& output_names() const noexcept
+  { return _output_names; }
+
   // For diagnostics + tests.
   const std::string& path() const noexcept { return _path; }
   int compute_units() const noexcept { return _compute_units; }
@@ -71,6 +81,8 @@ private:
   CML::Model*                                              _model;
   std::mutex                                               _predict_mu;
   std::unordered_map<std::string, CoreMLOutputDesc>        _outputs;
+  std::vector<std::string>                                 _input_names;
+  std::vector<std::string>                                 _output_names;
   std::string                                              _path;
   int                                                      _compute_units;
 };

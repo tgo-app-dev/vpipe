@@ -370,6 +370,11 @@ private:
 #if defined(VPIPE_BUILD_APPLE_SILICON)
   std::shared_ptr<genai::LoadedLanguageModel> _lm;
   std::unique_ptr<genai::ChatTemplate>        _chat_tpl;
+  // Token ids forbidden during decode to keep realtime decode short -- the
+  // model's reasoning-channel open tokens (Gemma-4 <|channel>/<|think|>), set
+  // on the LM AND host-masked in the batched per-question decode. Empty for
+  // families without a reasoning channel.
+  std::vector<std::int32_t>                   _m_suppress_ids;
   genai::MetalQwenVisionEncoder*              _mvis = nullptr;  // borrowed
   // Gemma-4 e4b metal ViT tower (borrowed; native-f16 SharedBuffer rows).
   // Mutually exclusive with _mvis/_mguni by family.

@@ -858,6 +858,10 @@ TEST(sdpa_mma, gqa_decode_micro) {
   ComputeFunction f_allg  = lib.function("sdpa_causal_gqa_f16");
   ComputeFunction f_pgqa  = lib.function("sdpa_paged_gqa_mb256_f16");
   ComputeFunction f_pvec  = lib.function("sdpa_paged_gqa_vec_f16");
+  ComputeFunction f_kbl   = lib.function("sdpa_paged_gqa_kbl_f16");
+  ComputeFunction f_vec1  = lib.function("sdpa_paged_gqa_vec1_f16");
+  ComputeFunction f_vec2  = lib.function("sdpa_paged_gqa_vec2_f16");
+  ComputeFunction f_merge2 = lib.function("sdpa_gqa_merge2_f16");
   ComputeFunction f_mma   = lib.function("sdpa_causal_mma_qhead_f16");
   ComputeFunction f_merge = lib.function("sdpa_gqa_merge_f16");
   if (!f_mb.valid() || !f_tile.valid() || !f_merge.valid()) {
@@ -872,16 +876,26 @@ TEST(sdpa_mma, gqa_decode_micro) {
   // SLIDING (head_dim 256, window 512), and the 12B gemma4_unified GLOBAL
   // (head_dim 512, Hkv=1/G=16 -- the lone-KV-head over-read case).
   struct Cfg { int D; int win; int Hq; int Hkv; const char* rt; };
-  const Cfg cfgs[] = {{512, 0, 8, 2, "global   "},
-                      {256, 512, 8, 2, "slide    "},
-                      {256, 0, 16, 4, "qwen(G4) "},
-                      {512, 0, 16, 1, "g12b(G16)"}};
-  for (const auto& cfg : cfgs) {
+  // VPIPE_SDPA_MICRO=g8 -> only the Qwen3.5-MoE decode shape (D=256, Hkv=2,
+  // G=8) over LONG context, to study kbl flash-decode scaling vs depth.
+  const bool g8_only = std::string(std::getenv("VPIPE_SDPA_MICRO")) == "g8";
+  const Cfg cfgs_all[] = {{512, 0, 8, 2, "global   "},
+                          {256, 512, 8, 2, "slide    "},
+                          {256, 0, 16, 4, "qwen(G4) "},
+                          {512, 0, 16, 1, "g12b(G16)"}};
+  const Cfg cfgs_g8[] = {{256, 0, 16, 2, "qwen(G8) "}};
+  const Cfg* cfgs = g8_only ? cfgs_g8 : cfgs_all;
+  const int ncfg = g8_only ? 1 : 4;
+  for (int ci = 0; ci < ncfg; ++ci) {
+  const Cfg& cfg = cfgs[ci];
   const int D = cfg.D;
   const int win = cfg.win;
   const int Hq = cfg.Hq, Hkv = cfg.Hkv, G = Hq / Hkv;
   const float scale = 1.0f / std::sqrt((float)D);
-  for (int T : {1024, 2048, 4096}) {
+  const std::vector<int> Ts = g8_only
+      ? std::vector<int>{2048, 8192, 16384, 32768}
+      : std::vector<int>{1024, 2048, 4096};
+  for (int T : Ts) {
     std::mt19937 rng(7 + T);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
     std::vector<std::uint16_t> q((size_t)Hq * D), k((size_t)Hkv * T * D),
@@ -1130,6 +1144,89 @@ TEST(sdpa_mma, gqa_decode_micro) {
         EXPECT_TRUE(rel < 5e-2);
       }
     }
+    // kbl: the PRODUCTION Qwen3.5 D=256 decode kernel (key-across-lanes block,
+    // per-head). The target of this study -- sweep S to see how its cost scales
+    // with depth (T) and which split keeps it flat.
+    if (win == 0 && D == 256 && f_kbl.valid()) {
+      for (int S : {16, 32, 64, 128, (T + 255) / 256}) {
+        if (S < 1 || S > Smax) { continue; }
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder enc = st.begin_compute();
+            enc_paged(enc, f_kbl, S, true); }
+          st.commit().wait(); }
+        const double rel = rel_of();
+        const double ms = bench([&](ComputeEncoder& e) {
+          enc_paged(e, f_kbl, S, true); });
+        std::printf("[gqa-micro] %s T=%5d  kbl    S=%3d  rel=%.2e  %.4f ms  "
+                    "(%.2fx mb)\n", cfg.rt, T, S, rel, ms, ms_mb / ms);
+        EXPECT_TRUE(rel < 5e-2);
+      }
+    }
+    // vec1: MLX sdpa_vector ported to paged KV (constexpr PER unroll, 2-pass
+    // split). One TG per (qhead, split), 32-simd key stripe, intra-TG merge ->
+    // partial; sdpa_gqa_merge combines splits. Sweep S. D=256 only.
+    if (win == 0 && D == 256 && f_vec1.valid()) {
+      auto enc_vec1 = [&](ComputeEncoder& enc, int S) {
+        enc.set_function(f_vec1);
+        enc.set_buffer(0, qb); enc.set_buffer(1, kb); enc.set_buffer(2, vb);
+        enc.set_buffer(3, oacc); enc.set_buffer(4, mbuf); enc.set_buffer(5, lbuf);
+        enc.set_constant(6, scale); enc.set_constant(7, D);
+        enc.set_constant(8, Hq); enc.set_constant(9, Hkv);
+        enc.set_constant(10, T - 1); enc.set_constant(11, T);
+        const int np1 = 1; enc.set_constant(12, np1); enc.set_buffer(13, ptb);
+        enc.set_constant(14, S);
+        enc.dispatch({1024, (unsigned)Hq, (unsigned)S}, {1024, 1, 1});
+        enc.set_function(f_merge);
+        enc.set_buffer(0, oacc); enc.set_buffer(1, mbuf); enc.set_buffer(2, lbuf);
+        enc.set_buffer(3, ob);
+        enc.set_constant(4, D); enc.set_constant(5, S); enc.set_constant(6, Hq);
+        enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+      };
+      for (int S : {1, 2, 4, 8, 16}) {
+        if (S > Smax) { continue; }
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder enc = st.begin_compute(); enc_vec1(enc, S); }
+          st.commit().wait(); }
+        const double rel = rel_of();
+        const double ms = bench([&](ComputeEncoder& e) { enc_vec1(e, S); });
+        std::printf("[gqa-micro] %s T=%5d  vec1   S=%3d  rel=%.2e  %.4f ms  "
+                    "(%.2fx mb)\n", cfg.rt, T, S, rel, ms, ms_mb / ms);
+        EXPECT_TRUE(rel < 5e-2);
+      }
+    }
+    // vec2: FAITHFUL MLX 2-pass (vec2 pass-1 = kbl-shaped grid, NO intra-TG
+    // merge; merge2 = MLX's coalesced sdpa_vector_2pass_2). Sweep blocks (must
+    // be %32). The cooperative-merge attempt at the residual MLX gap.
+    if (win == 0 && D == 256 && f_vec2.valid() && f_merge2.valid()) {
+      const int G = Hq / Hkv;
+      auto enc_vec2 = [&](ComputeEncoder& enc, int S) {
+        enc.set_function(f_vec2);
+        enc.set_buffer(0, qb); enc.set_buffer(1, kb); enc.set_buffer(2, vb);
+        enc.set_buffer(3, oacc); enc.set_buffer(4, mbuf); enc.set_buffer(5, lbuf);
+        enc.set_constant(6, scale); enc.set_constant(7, D);
+        enc.set_constant(8, Hq); enc.set_constant(9, Hkv);
+        enc.set_constant(10, T - 1); enc.set_constant(11, T);
+        const int np1 = 1; enc.set_constant(12, np1); enc.set_buffer(13, ptb);
+        enc.set_constant(14, S);
+        enc.dispatch({32, (unsigned)Hq, (unsigned)S}, {32, (unsigned)G, 1});
+        enc.set_function(f_merge2);
+        enc.set_buffer(0, oacc); enc.set_buffer(1, lbuf); enc.set_buffer(2, mbuf);
+        enc.set_buffer(3, ob);
+        enc.set_constant(4, D); enc.set_constant(5, S);
+        enc.dispatch({1024, (unsigned)Hq, 1}, {1024, 1, 1});
+      };
+      for (int S : {32, 64, 128, 256}) {
+        if (S > Smax) { continue; }
+        { CommandStream st = mc->make_command_stream();
+          { ComputeEncoder enc = st.begin_compute(); enc_vec2(enc, S); }
+          st.commit().wait(); }
+        const double rel = rel_of();
+        const double ms = bench([&](ComputeEncoder& e) { enc_vec2(e, S); });
+        std::printf("[gqa-micro] %s T=%5d  vec2   S=%3d  rel=%.2e  %.4f ms  "
+                    "(%.2fx mb)\n", cfg.rt, T, S, rel, ms, ms_mb / ms);
+        EXPECT_TRUE(rel < 5e-2);
+      }
+    }
     // MMA q-head flash-decode (8 heads/tile, needs 8|G): the depth-flat
     // candidate. split = ceil(T/FL_C(64)) keeps each split ~1 key block.
     if (f_mma.valid() && (G % 8 == 0) && (D % 8 == 0)) {
@@ -1216,4 +1313,114 @@ TEST(sdpa_mma, kv_stride_bank_probe) {
       EXPECT_TRUE(gbs > 0.0);
     }
   }
+}
+
+// Key-across-lanes block decode (sdpa_paged_gqa_kbl{,128}) vs a CPU softmax
+// oracle, head_dim 256 AND 128, across G in {2,4,6} and sequence lengths that
+// span partial / multi-block ranges. No model needed -- this is the
+// token-exactness proxy for the head_dim-128 kbl variant (no head_dim-128 LM
+// is in the test set). Single-page paged pool [1, Hkv, n, D]; one decode query
+// at pos n-1; split=32 + sdpa_gqa_merge_f16, same as the model decode path.
+TEST(sdpa_kbl, decode_matches_oracle) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib = mc->load_library("sdpa");
+  ComputeFunction f256 = lib.function("sdpa_paged_gqa_kbl_f16");
+  ComputeFunction f128 = lib.function("sdpa_paged_gqa_kbl128_f16");
+  ComputeFunction fmerge = lib.function("sdpa_gqa_merge_f16");
+  if (!f256.valid() || !f128.valid() || !fmerge.valid()) {
+    std::printf("[sdpa_kbl] kernels missing -- skipped.\n");
+    return;
+  }
+  struct Cfg { int D, Hq, Hkv, n; };
+  const Cfg cfgs[] = {
+      {128, 16, 4, 37},   {128, 16, 4, 100},  {128, 16, 4, 600},
+      {128, 16, 4, 1500}, {128, 24, 4, 600},  {128, 8, 2, 257},
+      {256, 16, 4, 100},  {256, 16, 4, 600},  {256, 16, 4, 1500},
+      {256, 24, 4, 600},
+  };
+  const int split = 32;
+  double worst = 0.0;
+  for (const auto& c : cfgs) {
+    const int D = c.D, Hq = c.Hq, Hkv = c.Hkv, n = c.n, G = Hq / Hkv;
+    std::mt19937 rng(7 + n + D);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    std::vector<std::uint16_t> q((size_t)Hq * D), k((size_t)Hkv * n * D),
+        vv((size_t)Hkv * n * D);
+    for (auto& e : q) { e = f32_to_h(d(rng) * 0.5f); }
+    for (auto& e : k) { e = f32_to_h(d(rng) * 0.5f); }
+    for (auto& e : vv) { e = f32_to_h(d(rng) * 0.5f); }
+    const float scale = 1.0f / std::sqrt((float)D);
+
+    SharedBuffer qb = mc->make_shared_buffer(q.size() * 2);
+    SharedBuffer kb = mc->make_shared_buffer(k.size() * 2);
+    SharedBuffer vb = mc->make_shared_buffer(vv.size() * 2);
+    std::memcpy(qb.contents(), q.data(), q.size() * 2);
+    std::memcpy(kb.contents(), k.data(), k.size() * 2);
+    std::memcpy(vb.contents(), vv.data(), vv.size() * 2);
+    std::vector<std::int32_t> pt = {0, n, 0};
+    SharedBuffer ptb = mc->make_shared_buffer(pt.size() * 4);
+    std::memcpy(ptb.contents(), pt.data(), pt.size() * 4);
+    SharedBuffer oacc = mc->make_shared_buffer((size_t)Hq * split * D * 4);
+    SharedBuffer mbb = mc->make_shared_buffer((size_t)Hq * split * 4);
+    SharedBuffer lbb = mc->make_shared_buffer((size_t)Hq * split * 4);
+    SharedBuffer outb = mc->make_shared_buffer((size_t)Hq * D * 2);
+    const int q_off = n - 1, page_tokens = n, n_pages = 1;
+    {
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        enc.set_function(D == 256 ? f256 : f128);
+        enc.set_buffer(0, qb); enc.set_buffer(1, kb); enc.set_buffer(2, vb);
+        enc.set_buffer(3, oacc); enc.set_buffer(4, mbb); enc.set_buffer(5, lbb);
+        enc.set_constant(6, scale); enc.set_constant(7, D);
+        enc.set_constant(8, Hq); enc.set_constant(9, Hkv);
+        enc.set_constant(10, q_off); enc.set_constant(11, page_tokens);
+        enc.set_constant(12, n_pages); enc.set_buffer(13, ptb);
+        enc.set_constant(14, split);
+        enc.dispatch({32, (unsigned)Hq, (unsigned)split},
+                     {32, (unsigned)G, 1});
+        enc.set_function(fmerge);
+        enc.set_buffer(0, oacc); enc.set_buffer(1, mbb); enc.set_buffer(2, lbb);
+        enc.set_buffer(3, outb); enc.set_constant(4, D);
+        enc.set_constant(5, split); enc.set_constant(6, Hq);
+        enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+      }
+      st.commit().wait();
+    }
+    const auto* op = static_cast<const std::uint16_t*>(outb.contents());
+    double num = 0.0, den = 0.0;
+    for (int h = 0; h < Hq; ++h) {
+      const int kvh = h / G;
+      std::vector<float> sc(n);
+      float mx = -1e30f;
+      for (int kk = 0; kk < n; ++kk) {
+        float sdot = 0.0f;
+        for (int dd = 0; dd < D; ++dd) {
+          sdot += h_to_f32(q[(size_t)h * D + dd]) *
+                  h_to_f32(k[((size_t)kvh * n + kk) * D + dd]);
+        }
+        sc[kk] = sdot * scale;
+        mx = std::max(mx, sc[kk]);
+      }
+      float sum = 0.0f;
+      for (int kk = 0; kk < n; ++kk) { sc[kk] = std::exp(sc[kk] - mx); sum += sc[kk]; }
+      for (int dd = 0; dd < D; ++dd) {
+        float o = 0.0f;
+        for (int kk = 0; kk < n; ++kk) {
+          o += sc[kk] * h_to_f32(vv[((size_t)kvh * n + kk) * D + dd]);
+        }
+        o /= sum;
+        const float got = h_to_f32(op[(size_t)h * D + dd]);
+        num += (double)(got - o) * (got - o);
+        den += (double)o * o;
+      }
+    }
+    const double rl2 = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    worst = std::max(worst, rl2);
+    std::printf("[sdpa_kbl] D=%3d Hq=%2d Hkv=%d G=%d n=%4d  relL2=%.3e\n",
+                D, Hq, Hkv, G, n, rl2);
+    EXPECT_TRUE(rl2 < 2e-2);
+  }
+  std::printf("[sdpa_kbl] worst relL2 = %.3e (tol 2e-2)\n", worst);
 }

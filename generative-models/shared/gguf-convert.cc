@@ -97,7 +97,10 @@ gguf_to_qwen35_config_(const GgufFile& g, ModelConfig* out)
   out->rms_eps    = static_cast<float>(
       fget("qwen35.attention.layer_norm_rms_epsilon", 1e-6));
   out->rope_theta = static_cast<float>(fget("qwen35.rope.freq_base", 1e7));
-  out->tie_word_embeddings = true;          // 2B ties lm_head to token_embd
+  // Tied unless the GGUF ships a separate output.weight (untied lm_head):
+  // small Qwen3.5 GGUFs tie lm_head to token_embd; the 27B is untied (Q4_K
+  // token_embd + a distinct Q6_K output.weight).
+  out->tie_word_embeddings = g.tensor("output.weight") == nullptr;
   out->max_position_embeddings =
       static_cast<int>(uget("qwen35.context_length", 0));
   out->attn_output_gate = true;             // Qwen3.5 gated attention
@@ -561,13 +564,36 @@ GgufQwen35Converter::build_specs_()
 
   const std::string P = "language_model.model.";
 
-  // token_embd (tied lm_head): raw Q6_K table, gathered + matvec'd natively.
+  // token_embd: raw k-quant table, gathered + matvec'd natively (no affine
+  // requant). Q6_K on tied checkpoints (lm_head == embed); Q4_K/Q5_K appear
+  // on untied checkpoints whose lm_head is the separate output.weight below.
+  // The suffix (.q6k/.q4k/.q5k) tags the family for the loader's dispatch;
+  // the raw copy is the same lossless super-block memcpy for all three.
   if (const GgufFile::Tensor* emb = _g->tensor("token_embd.weight");
-      emb != nullptr && emb->dims.size() == 2 &&
-      emb->type == GgufFile::kQ6_K) {
-    const std::int64_t hidden = emb->dims[0], vocab = emb->dims[1];
-    _specs.push_back({P + "embed_tokens.q6k", "Q6K", {vocab, hidden},
-                      emb->nbytes, "token_embd.weight", Op::kEmbedQ6KRaw});
+      emb != nullptr && emb->dims.size() == 2) {
+    const char* dt = kquant_dtype_(emb->type);
+    if (dt != nullptr) {
+      const std::int64_t hidden = emb->dims[0], vocab = emb->dims[1];
+      const char* sfx = emb->type == GgufFile::kQ6_K ? "embed_tokens.q6k"
+                      : emb->type == GgufFile::kQ4_K ? "embed_tokens.q4k"
+                                                     : "embed_tokens.q5k";
+      const Op op = emb->type == GgufFile::kQ6_K ? Op::kEmbedQ6KRaw
+                                                 : Op::kKQuantRaw;
+      _specs.push_back({P + sfx, dt, {vocab, hidden},
+                        emb->nbytes, "token_embd.weight", op});
+    }
+  }
+  // Untied lm_head: GGUF output.weight -> language_model.lm_head.weight, a raw
+  // k-quant tensor (Q6_K on the 27B). The metal lm_head matvec reads it
+  // natively (qmv_q6k). Absent on tied checkpoints (lm_head == token_embd).
+  if (const GgufFile::Tensor* ow = _g->tensor("output.weight");
+      ow != nullptr && ow->dims.size() == 2) {
+    const char* dt = kquant_dtype_(ow->type);
+    if (dt != nullptr) {
+      const std::int64_t in = ow->dims[0], outd = ow->dims[1];
+      _specs.push_back({"language_model.lm_head.weight", dt, {outd, in},
+                        ow->nbytes, "output.weight", Op::kKQuantRaw});
+    }
   }
   add_f32("output_norm.weight", P + "norm.weight");
 

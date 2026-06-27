@@ -410,6 +410,14 @@ public:
   // Set once after load, before prefill.
   void set_mtp_prefix_seed(bool on);
 
+  // Forbid a small set of token ids from ever being predicted (argmax or
+  // sampled), across prefill + every decode path. Used to keep realtime
+  // decode short -- e.g. banning Gemma-4's reasoning-channel open tokens so
+  // the model can't spend the budget generating a thought block. No-op on
+  // backends/models without logit-mask support (only the metal Gemma exec
+  // implements it today). Set once after load, before prefill; empty clears.
+  void set_suppressed_tokens(std::span<const std::int32_t> ids);
+
   // Speculative decode via the MTP head: token-exact vs the serial decode, but
   // the drafter lets the verifier accept multiple tokens per forward.
   // `first_token` is the prefill's already-decided first token on `ctx` (not

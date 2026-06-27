@@ -38,12 +38,20 @@ namespace vpipe::genai {
 //   * DeepStack features: not surfaced (checkpoints needing DeepStack
 //     stay on the MLX tower).
 //
-// Preprocessing (both paths): the source image is letterboxed
-// (aspect-preserving, 114/255 grey padding) and RGB->BGRA8888 packed
-// into a CVPixelBuffer of the model's fixed input size via the
-// metal-compute `letterbox_planar_u8_to_bgra_u8` kernel (no MLX, no
-// MetalRuntime). The model's input pixel dimensions are read off the
-// MLModelDescription at construction and never change.
+// Preprocessing: the source image is letterboxed (aspect-preserving,
+// 114/255 grey padding) on the metal-compute GPU to the model's fixed
+// input size (read off the MLModelDescription at construction; never
+// changes). The OUTPUT form is chosen from the model's image-input type:
+//   * ImageType  -> RGB->BGRA8888 packed into a CVPixelBuffer
+//     (`letterbox_planar_u8_to_bgra_u8`); CoreML applies the model's image
+//     scale/bias and (RGB vs BGR) colour layout.
+//   * MLMultiArray (Float16) -> RGB f16 tensor written straight into a
+//     Shared/UMA buffer (`letterbox_planar_u8_to_rgb_f16`, NCHW or NHWC per
+//     the model's shape) and wrapped ZERO-COPY as the MLMultiArray input --
+//     no CVPixelBuffer, no lock, no host memcpy. Values are RAW RGB in
+//     [0,255]; the model bakes its own normalization (as the ImageType
+//     export's model did). Re-export the image input as a float16
+//     MultiArray to take this path.
 class CoreMLVisionEncoder
 {
 public:
@@ -114,6 +122,9 @@ public:
   int model_input_height() const noexcept;
   int output_n_tokens()    const noexcept;
   int output_hidden()      const noexcept;
+  // True when the model's image input is an MLMultiArray (the zero-copy
+  // f16 RGB path); false for the ImageType (BGRA CVPixelBuffer) path.
+  bool input_is_multiarray() const noexcept;
 
 private:
   CoreMLVisionEncoder();

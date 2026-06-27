@@ -1456,6 +1456,201 @@ kernel void sdpa_paged_flash_f16(
   }
 }
 
+// sdpa_paged_mma_d256_f16 -- the head_dim-256 PAGED-KV register-resident
+// simdgroup_matrix flash (the existing sdpa_paged_mma_f16 is MMA_DMAX=128,
+// Llama-only). Port of sdpa_causal_mma_f16 (WM=4 x WD=D/64=4 -> 16 simdgroups,
+// 512 threads) to the paged pool. The key-split sdpa_paged_flash_
+// f16 round-trips the O accumulator through threadgroup memory every key block
+// (load lo<-so, accumulate, store so, plus a 256-wide per-block rescale so*=ms)
+// + 3 barriers/block + split SG ownership -- measured ~2x the compute roofline
+// at 8k (the dominant long-ctx prefill cost). This kernel instead keeps O in
+// REGISTERS (MMAF_NDF 8x8 frags/simdgroup) across the whole key scan, stages
+// K/V once per BK-block into tg, and does QK^T / softmax / PV exactly like the
+// contiguous MMA kernel -- the only changes are the page-walked K/V load and
+// the per-page causal bound. Full-causal only (Qwen3.5 full-attn, no window).
+// Online-softmax (NOT bit-identical to the scalar/qtile kernels; rel-L2 within
+// the flash tolerance, same fp32 accumulation as the steel GEMM). Precondition
+// page_tokens % BK == 0 (BK = 4096/D = 16 @ D256; 256/512/1024 all OK).
+//   0:q[Hq,n_q,D] 1:kpool 2:vpool 3:out 4:scale 5:D 6:Hq 7:Hkv 8:n_q
+//   9:q_offset 10:page_tokens 11:n_pages 12:page_table({pid,nvalid,gstart})
+// grid (MMAF_WM*WD*32, Hq, ceil(n_q/MMAF_BQ)); threadgroup (MMAF_WM*WD*32,1,1).
+// NO head-dim split (WD=1, like MLX wn=1): each of the WM=4 simdgroups owns a
+// query band's FULL-D O in registers (32 frags) -> 128 threads (high occupancy)
+// and no QK contraction-split tg recombination. (sdpa_causal_mma's WD>1 split
+// is for D=512 Gemma register pressure; D=256 holds 32 O frags fine.)
+#define MMA2_DSLICE 256
+#define MMA2_NDF    32          // MMA2_DSLICE / 8 -- full-D O col-frags / SG
+kernel void sdpa_paged_mma_d256_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    const device VPIPE_ELT* vpool      [[buffer(2)]],
+    device VPIPE_ELT*       out        [[buffer(3)]],
+    constant float&    scale      [[buffer(4)]],
+    constant int&      D          [[buffer(5)]],
+    constant int&      Hq         [[buffer(6)]],
+    constant int&      Hkv        [[buffer(7)]],
+    constant int&      n_q        [[buffer(8)]],
+    constant int&      q_offset   [[buffer(9)]],
+    constant int&      page_tokens[[buffer(10)]],
+    constant int&      n_pages    [[buffer(11)]],
+    const device int*  page_table [[buffer(12)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  lid       [[thread_index_in_threadgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  const int h   = (int)tid.y;
+  const int qb  = (int)tid.z;
+  const int kvh = h / (Hq / Hkv);
+  const int q_row0 = qb * MMAF_BQ;
+  if (q_row0 >= n_q) { return; }
+  const int WD  = D / MMA2_DSLICE;        // 1 @256 (no head-dim split)
+  const int BK  = MMAF_KVELT / D;         // 16 @256
+  const int per = D / 8;                  // QK contraction frags
+  const int nkf = BK / 8;                 // key-frags per block (2 @256)
+  const int nthreads = MMAF_WM * WD * 32;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off    = (uint)kvh * page_tokens * D;
+
+  const int wm  = (int)simd_gid / WD;     // query band 0..WM-1
+  const int wd  = (int)simd_gid % WD;     // head-dim slice 0 (WD=1)
+  const int srow0 = wm * 8;               // band's first tile row
+  const int grow0 = q_row0 + srow0;       // band's first global query row
+  const int dc0   = wd * MMA2_DSLICE;     // simdgroup's first O col (0 @WD=1)
+
+  threadgroup VPIPE_ELT Ks[MMAF_KVELT];
+  threadgroup VPIPE_ELT Vs[MMAF_KVELT];
+  threadgroup float     Ss[MMAF_BQ * MMAF_BKMAX];
+  threadgroup float     Sp[MMAF_BQ * 64];
+  threadgroup VPIPE_ELT Ps[MMAF_BQ * MMAF_BKMAX];
+  threadgroup float m_[MMAF_BQ];
+  threadgroup float l_[MMAF_BQ];
+  threadgroup float corr_[MMAF_BQ];
+
+  const int qid = (int)lane / 4;
+  const int fm  = (qid & 4) + (((int)lane / 2) % 4);    // frag row 0..7
+  const int fn  = (qid & 2) * 2 + ((int)lane % 2) * 2;  // frag col 0,2,4,6
+
+  simdgroup_matrix<float, 8, 8> O[MMA2_NDF];
+  for (int c = 0; c < MMA2_NDF; ++c) {
+    O[c] = simdgroup_matrix<float, 8, 8>(0.0f);
+  }
+  if (lid < MMAF_BQ) { m_[lid] = -INFINITY; l_[lid] = 0.0f; }
+
+  // Highest query pos in this tile bounds the causal key scan.
+  const int tile_qN   = q_offset + min(q_row0 + MMAF_BQ - 1, n_q - 1);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int pg = 0; pg < n_pages; ++pg) {
+    const int pid    = page_table[pg * 3 + 0];
+    const int nvalid = page_table[pg * 3 + 1];
+    const int gstart = page_table[pg * 3 + 2];
+    if (gstart > tile_qN) { break; }                    // past tile (uniform)
+    const device VPIPE_ELT* kbase = kpool + (uint)pid * page_stride + head_off;
+    const device VPIPE_ELT* vbase = vpool + (uint)pid * page_stride + head_off;
+    for (int local = 0; local < nvalid; local += BK) {
+      const int gbs = gstart + local;                   // global block start
+      if (gbs > tile_qN) { break; }                     // past tile (uniform)
+      const int bk = min(BK, nvalid - local);
+      // Stage K/V block [bk, D] into tg (zero-pad rows >= bk; masked later).
+      for (uint e = lid; e < (uint)(BK * D); e += (uint)nthreads) {
+        const int t = (int)e / D, d = (int)e % D;
+        if (t < bk) {
+          Ks[e] = kbase[(uint)(local + t) * D + d];
+          Vs[e] = vbase[(uint)(local + t) * D + d];
+        } else {
+          Ks[e] = (VPIPE_ELT)0;
+          Vs[e] = (VPIPE_ELT)0;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // QK^T: each slice contracts its per/WD frags into a partial S[8,BK].
+      {
+        const int pf0 = wd * (per / WD);
+        simdgroup_matrix<float, 8, 8> S[MMAF_BKMAX / 8];
+        for (int j = 0; j < nkf; ++j) { S[j] = simdgroup_matrix<float, 8, 8>(0.0f); }
+        for (int e = 0; e < per / WD; ++e) {
+          const int dd = pf0 + e;
+          simdgroup_matrix<VPIPE_ELT, 8, 8> A;
+          simdgroup_load(A, q + ((uint)h * n_q + grow0) * D + dd * 8, D);
+          for (int j = 0; j < nkf; ++j) {
+            simdgroup_matrix<VPIPE_ELT, 8, 8> B;
+            simdgroup_load(B, Ks, D, ulong2(dd * 8, j * 8), true);
+            simdgroup_multiply_accumulate(S[j], A, B, S[j]);
+          }
+        }
+        for (int j = 0; j < nkf; ++j) {
+          simdgroup_store(S[j], Sp + wd * MMAF_BQ * BK + srow0 * BK + j * 8, BK);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Online softmax + causal mask: 32 threads, one per query row.
+      if (lid < (uint)MMAF_BQ) {
+        const int r = (int)lid;
+        const int qpos = q_offset + q_row0 + r;
+        float lmax = -INFINITY;
+        for (int j = 0; j < bk; ++j) {
+          float sj = 0.0f;
+          for (int w = 0; w < WD; ++w) {
+            sj += Sp[w * MMAF_BQ * BK + r * BK + j];
+          }
+          float s = sj * scale;
+          const int gkey = gbs + j;
+          if (gkey > qpos) { s = -INFINITY; }
+          Ss[r * BK + j] = s;
+          lmax = max(lmax, s);
+        }
+        const float mold = m_[r];
+        const float mnew = max(mold, lmax);
+        const float corr = (mnew == -INFINITY) ? 1.0f : exp(mold - mnew);
+        float lsum = 0.0f;
+        for (int j = 0; j < bk; ++j) {
+          const float s = Ss[r * BK + j];
+          const float p = (s == -INFINITY) ? 0.0f : exp(s - mnew);
+          Ps[r * BK + j] = (VPIPE_ELT)p;
+          lsum += p;
+        }
+        l_[r] = l_[r] * corr + lsum;
+        m_[r] = mnew;
+        corr_[r] = corr;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Rescale this simdgroup's O frags by the per-row correction, then PV.
+      const float cr = corr_[srow0 + fm];
+      for (int c = 0; c < MMA2_NDF; ++c) {
+        O[c].thread_elements()[0] *= cr;
+        O[c].thread_elements()[1] *= cr;
+      }
+      for (int kk = 0; kk < nkf; ++kk) {
+        simdgroup_matrix<VPIPE_ELT, 8, 8> A2;
+        simdgroup_load(A2, Ps + srow0 * BK + kk * 8, BK);
+        for (int c = 0; c < MMA2_NDF; ++c) {
+          simdgroup_matrix<VPIPE_ELT, 8, 8> B2;
+          simdgroup_load(B2, Vs, D, ulong2(dc0 + c * 8, kk * 8), false);
+          simdgroup_multiply_accumulate(O[c], A2, B2, O[c]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  // Normalize + write O frags (guard rows past n_q).
+  const int row = grow0 + fm;
+  if (row < n_q) {
+    const float denom = l_[srow0 + fm];
+    const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+    const uint orow = ((uint)h * n_q + row) * D;
+    for (int c = 0; c < MMA2_NDF; ++c) {
+      const int col = dc0 + c * 8 + fn;
+      out[orow + col]     = VPIPE_ELT(O[c].thread_elements()[0] * inv);
+      out[orow + col + 1] = VPIPE_ELT(O[c].thread_elements()[1] * inv);
+    }
+  }
+}
+
 // sdpa_paged_flash_d512_f16 -- D=512 sibling of sdpa_paged_flash_f16 (which is
 // budgeted FLP_DMAX=256 for Qwen3.5's head_dim 256). Identical KEY-SPLIT
 // simdgroup_matrix flash over the PAGED pool, but the threadgroup Q/O tiles and
@@ -2267,9 +2462,16 @@ kernel void sdpa_merge_mb256_f16(
 //   B: sdpa_gqa_merge_f16 -- folds the SPLIT partials per query head and
 //      normalizes. Online softmax in fp32; same math as the mb256
 //      cross-simdgroup reduce, just split along position instead of stride.
-// Gated to G <= SDPA_GQA_MAXG (register budget; Qwen3.5 = 4) and head_dim
-// 256; other shapes use the mb256 / scalar paths.
-#define SDPA_GQA_MAXG     4   // max Hq/Hkv handled (qreg/acc register budget)
+// Gated to G <= SDPA_GQA_MAXG (register budget) and head_dim 256; other
+// shapes use the mb256 / scalar paths. Qwen3.5-4B is G=4; Qwen3.6-27B is
+// G=6 (Hq=24/Hkv=4); Qwen3.5-MoE (35B-A3B) is G=8 (Hq=16/Hkv=2). MAXG sizes
+// the all-G kernel's per-head reg arrays so the VPIPE_GQA_NO_VEC A/B path is
+// safe up to that G -- but production uses the VEC kernel even at high G:
+// decode attention is LATENCY-bound, not KV-byte-bound, so vec (per-head
+// simdgroup, one simd_sum/key) beats the all-G 1x-read form (measured +24%
+// @8k on the 27B). The vec/kbl kernels don't use MAXG (one head per
+// simdgroup), so they have no G ceiling here.
+#define SDPA_GQA_MAXG     8   // max Hq/Hkv for the all-G kernel (reg budget)
 #define SDPA_GQA_D256_PER 8   // D/32 for the fixed head_dim 256
 #define SDPA_GQA_UK       4   // decode key-unroll (latency overlap; see vec)
 
@@ -2531,6 +2733,463 @@ kernel void sdpa_paged_gqa_vec_f16(
     m_out[(uint)qhead * split + s] = m;
     l_out[(uint)qhead * split + s] = l;
   }
+}
+
+// sdpa_gqa_kbl_impl -- KEY-ACROSS-LANES block decode, templated on DK4
+// (head_dim/4) and LD (DK4/NL). A port of llama.cpp's kernel_flash_attn_ext_vec
+// NL/NE tiling onto vpipe's paged KV. The vec kernel spreads head_dim across the
+// 32 lanes and pays a cross-lane simd_sum PER KEY -- the binding long-context
+// decode cost (decode attention is latency-bound on that reduction, NOT on KV
+// bytes). Here each lane owns its OWN key: NL=8 lanes cooperate on one key's dot
+// via COALESCED sub-row K loads, NE=NW/NL=4 keys run in parallel, and the
+// BC=32-key block's scores land one-per-lane in shared memory -- so the whole
+// block needs just ONE simd_max + ONE simd_sum (not 32). Q is staged once in
+// threadgroup memory; P*V is accumulated per lane then tree-reduced across the
+// NE groups. Writes the SAME un-normalized per-(qhead,split) partials
+// sdpa_gqa_merge_f16 folds. Greedy token-exact vs the vec kernel. The NL/NE
+// reductions are independent of head_dim -- only DK4/LD change -- so the 256
+// (kbl) and 128 (kbl128) entry points share this body. The vec layout already
+// covers head_dim 128, so kbl128 is the matching key-across-lanes form for the
+// dense / head_dim-128 Qwen (ASR decoder, classic dense). grid (32, Hq, split);
+// threadgroup (32, G, 1).
+template <int DK4, int LD>
+static inline void sdpa_gqa_kbl_impl(
+    const device VPIPE_ELT* q,
+    const device VPIPE_ELT* kpool,
+    const device VPIPE_ELT* vpool,
+    device float*           o_acc,
+    device float*           m_out,
+    device float*           l_out,
+    float    scale,
+    int      D,
+    int      Hq,
+    int      Hkv,
+    int      q_offset,
+    int      page_tokens,
+    int      n_pages,
+    const device int*  page_table,
+    int      split,
+    threadgroup float* sq_all,
+    threadgroup float* ss_all,
+    uint3 tid, uint simd_gid, uint lane)
+{
+  constexpr int NW = 32, NL = 8, NE = 4, BC = 32;   // BC keys/block (= NW)
+  constexpr int DV = DK4 * 4;                        // head_dim
+  typedef vec<VPIPE_ELT, 4> elt4;
+
+  const int s    = (int)tid.z;
+  const int G    = Hq / Hkv;
+  const int g    = (int)simd_gid;
+  const int kvix = (int)tid.y;                      // 0..Hkv-1
+  const int qhead = kvix * G + g;
+  const int total = q_offset + 1;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off    = (uint)kvix * page_tokens * D;
+
+  const int chunk = (total + split - 1) / split;
+  const int lo = s * chunk;
+  const int hi = min((s + 1) * chunk, total);
+
+  const int tx = (int)lane % NL;                    // 0..7 head-dim sub-chunk
+  const int ty = (int)lane / NL;                    // 0..3 key in the NE group
+
+  threadgroup float* sq = sq_all + g * DV;
+  threadgroup float* ss = ss_all + g * BC;
+  threadgroup const float4* sq4 = (threadgroup const float4*)sq;
+
+  // Stage Q (scaled) into shared once.
+  const device VPIPE_ELT* qh = q + (uint)qhead * D;
+  for (int i = (int)lane; i < DV; i += NW) {
+    sq[i] = float(qh[i]) * scale;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  float M = -INFINITY, S = 0.0f;
+  float4 oa[LD];
+  for (int ii = 0; ii < LD; ++ii) { oa[ii] = float4(0.0f); }
+
+  if (lo < hi) {
+    for (int pg = 0; pg < n_pages; ++pg) {
+      const int pid    = page_table[pg * 3 + 0];
+      const int nvalid = page_table[pg * 3 + 1];
+      const int gstart = page_table[pg * 3 + 2];
+      const int tlo = max(0, lo - gstart);
+      const int thi = min(nvalid, hi - gstart);
+      if (tlo >= thi) { continue; }
+      const device elt4* kbase4 =
+          (const device elt4*)(kpool + (uint)pid * page_stride + head_off);
+      const device elt4* vbase4 =
+          (const device elt4*)(vpool + (uint)pid * page_stride + head_off);
+      for (int bt = tlo; bt < thi; bt += BC) {
+        const int bsz = min((int)BC, thi - bt);
+        // ---- Q*K^T: lane (tx,ty) accumulates key (NE*cc+ty) over its NL chunk.
+        float mqk[BC / NE];
+        for (int cc = 0; cc < BC / NE; ++cc) {
+          const int key = bt + NE * cc + ty;
+          float dd = 0.0f;
+          if (key < thi) {
+            for (int ii = 0; ii < LD; ++ii) {
+              const int d4 = ii * NL + tx;          // coalesced across tx
+              const elt4 k4 = kbase4[(uint)key * DK4 + (uint)d4];
+              const float4 qq = sq4[d4];
+              dd += float(k4.x) * qq.x + float(k4.y) * qq.y
+                  + float(k4.z) * qq.z + float(k4.w) * qq.w;
+            }
+          }
+          // Reduce dd over the NL=8 lanes of this ty-group; tx==0 holds the
+          // full dot, then broadcast it across the group.
+          dd += simd_shuffle_down(dd, 4);
+          dd += simd_shuffle_down(dd, 2);
+          dd += simd_shuffle_down(dd, 1);
+          dd = simd_shuffle(dd, (uint)(NL * ty));
+          mqk[cc] = (key < thi) ? dd : -INFINITY;
+        }
+        // Transpose lane-local mqk -> shared: ss[NE*tx+ty] = dot(key NE*tx+ty).
+        ss[NE * tx + ty] = mqk[tx];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- Block online softmax: one score per lane ----
+        const float sc = ss[lane];
+        const float M_new = simd_max(max(M, sc));
+        const float ms = fast::exp(M - M_new);
+        const float vs = ((int)lane < bsz) ? fast::exp(sc - M_new) : 0.0f;
+        S = S * ms + simd_sum(vs);
+        ss[lane] = vs;
+        for (int ii = 0; ii < LD; ++ii) { oa[ii] *= ms; }
+        M = M_new;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- O += sum_key p_key * V[key], per lane head-dim chunk ----
+        for (int cc = 0; cc < BC / NE; ++cc) {
+          const int key = bt + NE * cc + ty;
+          if (key < thi) {
+            const float p = ss[NE * cc + ty];
+            for (int ii = 0; ii < LD; ++ii) {
+              const int d4 = ii * NL + tx;
+              const elt4 vv = vbase4[(uint)key * DK4 + (uint)d4];
+              oa[ii] += float4(float(vv.x), float(vv.y),
+                               float(vv.z), float(vv.w)) * p;
+            }
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+  }
+
+  // Reduce O over the NE=4 ty-groups (lanes tx, tx+8, tx+16, tx+24 -> tx).
+  for (int ii = 0; ii < LD; ++ii) {
+    oa[ii].x += simd_shuffle_down(oa[ii].x, 8);
+    oa[ii].y += simd_shuffle_down(oa[ii].y, 8);
+    oa[ii].z += simd_shuffle_down(oa[ii].z, 8);
+    oa[ii].w += simd_shuffle_down(oa[ii].w, 8);
+    oa[ii].x += simd_shuffle_down(oa[ii].x, 16);
+    oa[ii].y += simd_shuffle_down(oa[ii].y, 16);
+    oa[ii].z += simd_shuffle_down(oa[ii].z, 16);
+    oa[ii].w += simd_shuffle_down(oa[ii].w, 16);
+  }
+  // Lanes with ty==0 (0..7) now hold the full O. Write float4 d4 = ii*NL+tx.
+  if (ty == 0) {
+    const uint obase4 = ((uint)qhead * (uint)split + (uint)s) * (uint)DK4;
+    device float4* o4 = (device float4*)o_acc;
+    for (int ii = 0; ii < LD; ++ii) {
+      o4[obase4 + (uint)(ii * NL + tx)] = oa[ii];
+    }
+  }
+  if (lane == 0) {
+    m_out[(uint)qhead * split + s] = M;
+    l_out[(uint)qhead * split + s] = S;
+  }
+}
+
+// Entry points: head_dim 256 (DK4=64, LD=8) and head_dim 128 (DK4=32, LD=4).
+#define VPIPE_SDPA_KBL(NAME, DK4V, LDV, DVV)                                   \
+kernel void NAME(                                                             \
+    const device VPIPE_ELT* q          [[buffer(0)]],                         \
+    const device VPIPE_ELT* kpool      [[buffer(1)]],                         \
+    const device VPIPE_ELT* vpool      [[buffer(2)]],                         \
+    device float*           o_acc      [[buffer(3)]],                         \
+    device float*           m_out      [[buffer(4)]],                         \
+    device float*           l_out      [[buffer(5)]],                         \
+    constant float&    scale      [[buffer(6)]],                              \
+    constant int&      D          [[buffer(7)]],                              \
+    constant int&      Hq         [[buffer(8)]],                              \
+    constant int&      Hkv        [[buffer(9)]],                              \
+    constant int&      q_offset   [[buffer(10)]],                             \
+    constant int&      page_tokens[[buffer(11)]],                             \
+    constant int&      n_pages    [[buffer(12)]],                             \
+    const device int*  page_table [[buffer(13)]],                             \
+    constant int&      split      [[buffer(14)]],                             \
+    uint3 tid       [[threadgroup_position_in_grid]],                         \
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],                       \
+    uint  lane      [[thread_index_in_simdgroup]])                            \
+{                                                                            \
+  threadgroup float sq_all[SDPA_GQA_MAXG * (DVV)];                            \
+  threadgroup float ss_all[SDPA_GQA_MAXG * 32];                               \
+  sdpa_gqa_kbl_impl<DK4V, LDV>(q, kpool, vpool, o_acc, m_out, l_out, scale,    \
+      D, Hq, Hkv, q_offset, page_tokens, n_pages, page_table, split,          \
+      sq_all, ss_all, tid, simd_gid, lane);                                   \
+}
+VPIPE_SDPA_KBL(sdpa_paged_gqa_kbl_f16,    64, 8, 256)
+VPIPE_SDPA_KBL(sdpa_paged_gqa_kbl128_f16, 32, 4, 128)
+
+// sdpa_paged_gqa_vec1_impl -- PAGED-KV port of MLX's sdpa_vector decode kernel.
+// ONE threadgroup per QUERY head: BN=32 simdgroups STRIPE the keys, BD=32 lanes
+// split the head dim (a single key's QK dot is fully 32-way parallel), then an
+// intra-threadgroup transpose+flash-merge over the BN stripes writes attn[Hq,D]
+// directly (no split across threadgroups, no merge kernel). PER (= D/BD) is a
+// COMPILE-TIME template arg so the per-lane qk/o loops UNROLL and stay in
+// registers (a runtime PER spills them to local memory -> ~8x slower). Decode
+// only (M=1): query at q_offset attends [0, q_offset].
+// grid (1024, Hq, 1); threadgroup (1024,1,1) = BN*BD simdgroups.
+template <int PER>
+METAL_FUNC void sdpa_paged_gqa_vec1_impl(
+    const device VPIPE_ELT* q, const device VPIPE_ELT* kpool,
+    const device VPIPE_ELT* vpool, device float* o_acc, device float* m_out,
+    device float* l_out, const constant float& scale, const constant int& D,
+    const constant int& Hq, const constant int& Hkv,
+    const constant int& q_offset, const constant int& page_tokens,
+    const constant int& n_pages, const device int* page_table,
+    const constant int& split,
+    threadgroup float* outputs, threadgroup float* max_scores,
+    threadgroup float* sum_scores,
+    uint3 tid, uint simd_gid, uint simd_lid)
+{
+  constexpr int BN = 32, BD = 32;
+  const int qh  = (int)tid.y;
+  const int sp  = (int)tid.z;
+  const int kvh = qh / (Hq / Hkv);
+  const int N   = q_offset + 1;            // keys 0..q_offset
+  (void)n_pages;                           // walked via page_table; kept for ABI
+  const int blk = (N + split - 1) / split; // keys per split
+  const int klo = sp * blk;
+  const int khi = min(N, klo + blk);
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off    = (uint)kvh * page_tokens * D;
+
+  thread float qv[PER], ov[PER];
+  const device VPIPE_ELT* qp = q + (uint)qh * D + (uint)simd_lid * PER;
+  for (int j = 0; j < PER; ++j) { qv[j] = (float)qp[j]; ov[j] = 0.0f; }
+  float m = -INFINITY, l = 0.0f;
+
+  // Each simdgroup strides this split's keys by BN; lanes hold the head dim.
+  for (int i = klo + (int)simd_gid; i < khi; i += BN) {
+    const int pg    = i / page_tokens;
+    const int pid   = page_table[pg * 3 + 0];
+    const int local = i - pg * page_tokens;
+    const uint koff = (uint)pid * page_stride + head_off + (uint)local * D
+                      + (uint)simd_lid * PER;
+    const device VPIPE_ELT* kp = kpool + koff;
+    const device VPIPE_ELT* vp = vpool + koff;
+    float s = 0.0f;
+    for (int j = 0; j < PER; ++j) { s += qv[j] * (float)kp[j]; }
+    s = simd_sum(s) * scale;
+    const float mnew = max(m, s);
+    const float f = fast::exp(m - mnew);
+    const float e = fast::exp(s - mnew);
+    m = mnew;
+    l = l * f + e;
+    for (int j = 0; j < PER; ++j) { ov[j] = ov[j] * f + e * (float)vp[j]; }
+  }
+
+  // Intra-threadgroup flash merge across the BN key-stripes -> this split's
+  // UN-normalized partial (O + m + l) in the kbl/sdpa_gqa_merge contract.
+  if (simd_lid == 0) { max_scores[simd_gid] = m; sum_scores[simd_gid] = l; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float lm = max_scores[simd_lid];
+  const float gm = simd_max(lm);
+  const float mf = fast::exp(lm - gm);
+  const float gl = simd_sum(sum_scores[simd_lid] * mf);
+  for (int j = 0; j < PER; ++j) {
+    outputs[simd_lid * BD + simd_gid] = ov[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ov[j] = simd_sum(outputs[simd_gid * BD + simd_lid] * mf);  // un-normalized
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const uint pbase = (uint)qh * (uint)split + (uint)sp;
+  if (simd_lid == 0) {
+    device float* op = o_acc + pbase * (uint)D + (uint)simd_gid * PER;
+    for (int j = 0; j < PER; ++j) { op[j] = ov[j]; }
+  }
+  if (simd_gid == 0 && simd_lid == 0) { m_out[pbase] = gm; l_out[pbase] = gl; }
+}
+kernel void sdpa_paged_gqa_vec1_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    const device VPIPE_ELT* vpool      [[buffer(2)]],
+    device float*           o_acc      [[buffer(3)]],
+    device float*           m_out      [[buffer(4)]],
+    device float*           l_out      [[buffer(5)]],
+    constant float& scale       [[buffer(6)]],
+    constant int&   D           [[buffer(7)]],
+    constant int&   Hq          [[buffer(8)]],
+    constant int&   Hkv         [[buffer(9)]],
+    constant int&   q_offset    [[buffer(10)]],
+    constant int&   page_tokens [[buffer(11)]],
+    constant int&   n_pages     [[buffer(12)]],
+    const device int* page_table[[buffer(13)]],
+    constant int&   split       [[buffer(14)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup float outputs[32 * 32];
+  threadgroup float max_scores[32];
+  threadgroup float sum_scores[32];
+  sdpa_paged_gqa_vec1_impl<8>(q, kpool, vpool, o_acc, m_out, l_out, scale, D,
+      Hq, Hkv, q_offset, page_tokens, n_pages, page_table, split,
+      outputs, max_scores, sum_scores, tid, simd_gid, simd_lid);
+}
+
+// sdpa_paged_gqa_vec2_impl -- the FAITHFUL MLX sdpa_vector_2pass_1 port (vs
+// vec1's intra-tg-merge variant). Per (kvhead, block) threadgroup, G simdgroups
+// (one per QUERY head, NO intra-tg merge), 32 lanes split the head dim. Block b
+// scans keys b, b+blocks, ... (strided), q PRE-scaled, writes its per-qhead
+// per-block partial [Hq, blocks, D] for the COOPERATIVE merge sdpa_gqa_merge2.
+// PER (= D/32) compile-time (unroll into registers). grid (32, Hq, blocks);
+// threadgroup (32, G, 1).
+template <int PER>
+METAL_FUNC void sdpa_paged_gqa_vec2_impl(
+    const device VPIPE_ELT* q, const device VPIPE_ELT* kpool,
+    const device VPIPE_ELT* vpool, device float* o_acc, device float* m_out,
+    device float* l_out, const constant float& scale, const constant int& D,
+    const constant int& Hq, const constant int& Hkv,
+    const constant int& q_offset, const constant int& page_tokens,
+    const constant int& n_pages, const device int* page_table,
+    const constant int& blocks,
+    uint3 tid, uint simd_gid, uint simd_lid)
+{
+  const int kvh   = (int)tid.y;            // threadgroups in y == Hkv
+  const int block = (int)tid.z;
+  const int G     = Hq / Hkv;
+  const int qh    = kvh * G + (int)simd_gid;
+  const int N     = q_offset + 1;          // keys 0..q_offset
+  (void)n_pages;                           // walked via page_table; kept for ABI
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off    = (uint)kvh * page_tokens * D;
+
+  thread float qv[PER], ov[PER];
+  const device VPIPE_ELT* qp = q + (uint)qh * D + (uint)simd_lid * PER;
+  for (int j = 0; j < PER; ++j) { qv[j] = scale * (float)qp[j]; ov[j] = 0.0f; }
+  float m = -INFINITY, l = 0.0f;
+
+  for (int i = block; i < N; i += blocks) {
+    const int pg    = i / page_tokens;
+    const int pid   = page_table[pg * 3 + 0];
+    const int local = i - pg * page_tokens;
+    const uint koff = (uint)pid * page_stride + head_off + (uint)local * D
+                      + (uint)simd_lid * PER;
+    const device VPIPE_ELT* kp = kpool + koff;
+    const device VPIPE_ELT* vp = vpool + koff;
+    float s = 0.0f;
+    for (int j = 0; j < PER; ++j) { s += qv[j] * (float)kp[j]; }
+    s = simd_sum(s);
+    const float mnew = max(m, s);
+    const float f = fast::exp(m - mnew);
+    const float e = fast::exp(s - mnew);
+    m = mnew;
+    l = l * f + e;
+    for (int j = 0; j < PER; ++j) { ov[j] = ov[j] * f + e * (float)vp[j]; }
+  }
+
+  const uint pbase = (uint)qh * (uint)blocks + (uint)block;
+  device float* op = o_acc + pbase * (uint)D + (uint)simd_lid * PER;
+  for (int j = 0; j < PER; ++j) { op[j] = ov[j]; }
+  if (simd_lid == 0) { m_out[pbase] = m; l_out[pbase] = l; }
+}
+kernel void sdpa_paged_gqa_vec2_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    const device VPIPE_ELT* vpool      [[buffer(2)]],
+    device float*           o_acc      [[buffer(3)]],
+    device float*           m_out      [[buffer(4)]],
+    device float*           l_out      [[buffer(5)]],
+    constant float& scale       [[buffer(6)]],
+    constant int&   D           [[buffer(7)]],
+    constant int&   Hq          [[buffer(8)]],
+    constant int&   Hkv         [[buffer(9)]],
+    constant int&   q_offset    [[buffer(10)]],
+    constant int&   page_tokens [[buffer(11)]],
+    constant int&   n_pages     [[buffer(12)]],
+    const device int* page_table[[buffer(13)]],
+    constant int&   blocks      [[buffer(14)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  sdpa_paged_gqa_vec2_impl<8>(q, kpool, vpool, o_acc, m_out, l_out, scale, D,
+      Hq, Hkv, q_offset, page_tokens, n_pages, page_table, blocks,
+      tid, simd_gid, simd_lid);
+}
+
+// sdpa_gqa_merge2_f16 -- COOPERATIVE merge (MLX sdpa_vector_2pass_2 port) for the
+// vec2 partials [Hq, blocks, D]. ONE threadgroup per query head, BN=32 simdgroups
+// each owning a block-stripe (block b, b+32, ...). maxs/sums read LANE-strided
+// (coalesced) + reduced via simd_max/simd_sum; partials read [block][head-dim]
+// with 32 lanes contiguous over D (coalesced), then a transpose+reduce over the
+// BN simdgroups. Far cheaper than sdpa_gqa_merge's one-thread-per-d stride-D
+// (non-coalesced) loop at high `blocks`. Requires blocks % 32 == 0.
+// grid (1024, Hq, 1); threadgroup (1024,1,1) = BN*BD simdgroups.
+template <int PER>
+METAL_FUNC void sdpa_gqa_merge2_impl(
+    const device float* partials, const device float* sums,
+    const device float* maxs, device VPIPE_ELT* out,
+    const constant int& D, const constant int& blocks,
+    threadgroup float* outputs, uint3 tid, uint simd_gid, uint simd_lid)
+{
+  constexpr int BN = 32, BD = 32;
+  const int qh = (int)tid.y;
+  const device float* pp = partials + (uint)qh * blocks * D
+                           + (uint)simd_gid * D + (uint)simd_lid * PER;
+  const device float* sp = sums + (uint)qh * blocks;
+  const device float* mp = maxs + (uint)qh * blocks;
+
+  thread float o[PER];
+  for (int j = 0; j < PER; ++j) { o[j] = 0.0f; }
+  float sum_exp = 0.0f, max_score = -INFINITY;
+
+  const int nb = blocks / BN;
+  for (int b = 0; b < nb; ++b) {
+    max_score = max(max_score, mp[simd_lid + BN * b]);
+  }
+  max_score = simd_max(max_score);
+  for (int b = 0; b < nb; ++b) {
+    const float f = fast::exp(mp[simd_lid + BN * b] - max_score);
+    sum_exp += f * sp[simd_lid + BN * b];
+  }
+  sum_exp = simd_sum(sum_exp);
+
+  for (int b = 0; b < nb; ++b) {
+    const float f = fast::exp(mp[simd_gid] - max_score);
+    for (int j = 0; j < PER; ++j) { o[j] += f * pp[j]; }
+    mp += BN; sp += BN; pp += (uint)BN * D;
+  }
+
+  // Transpose+reduce over the BN simdgroups (MLX sdpa_vector_2pass_2 tail).
+  for (int j = 0; j < PER; ++j) {
+    outputs[simd_lid * BD + simd_gid] = o[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float oj = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    o[j] = (sum_exp == 0.0f) ? oj : (oj / sum_exp);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (simd_lid == 0) {
+    device VPIPE_ELT* op = out + (uint)qh * D + (uint)simd_gid * PER;
+    for (int j = 0; j < PER; ++j) { op[j] = (VPIPE_ELT)o[j]; }
+  }
+}
+kernel void sdpa_gqa_merge2_f16(
+    const device float* partials [[buffer(0)]],
+    const device float* sums     [[buffer(1)]],
+    const device float* maxs     [[buffer(2)]],
+    device VPIPE_ELT*   out       [[buffer(3)]],
+    constant int& D      [[buffer(4)]],
+    constant int& blocks [[buffer(5)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup float outputs[32 * 32];
+  sdpa_gqa_merge2_impl<8>(partials, sums, maxs, out, D, blocks,
+      outputs, tid, simd_gid, simd_lid);
 }
 
 // ============================================================================

@@ -5,11 +5,17 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/perf-event.h"
+#include "common/perf-scope.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +26,35 @@ using metal_compute::ComputeEncoder;
 using metal_compute::SharedBuffer;
 
 namespace {
+
+// FNV-1a fingerprint of a model dir's *.safetensors (name+size+mtime), so a
+// converted-weight cache is invalidated when the source checkpoint changes.
+std::uint64_t codec_source_fingerprint_(const std::string& dir) {
+  namespace fs = std::filesystem;
+  std::uint64_t h = 1469598103934665603ull;
+  auto mix = [&](std::uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  std::error_code ec;
+  std::vector<std::string> names;
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    if (ec) { break; }
+    if (e.path().extension() == ".safetensors") {
+      names.push_back(e.path().filename().string());
+    }
+  }
+  std::sort(names.begin(), names.end());   // order-independent
+  for (const auto& n : names) {
+    const fs::path p = fs::path(dir) / n;
+    const auto sz = fs::file_size(p, ec);
+    if (ec) { continue; }
+    const auto mt = fs::last_write_time(p, ec);
+    if (ec) { continue; }
+    for (char c : n) { mix((std::uint64_t)(unsigned char)c); }
+    mix((std::uint64_t)sz);
+    mix((std::uint64_t)mt.time_since_epoch().count());
+  }
+  return h;
+}
+
 std::size_t numel_(const std::vector<std::int64_t>& s) {
   std::size_t n = 1;
   for (auto d : s) { n *= (std::size_t)d; }
@@ -99,10 +134,24 @@ SharedBuffer fold_wnconv_(const MetalLlamaWeights& wts,
 
 std::unique_ptr<MetalMossCodec>
 MetalMossCodec::load(const std::string& model_dir,
-                     metal_compute::MetalCompute* mc) {
+                     metal_compute::MetalCompute* mc, bool int8,
+                     bool with_encoder) {
   if (mc == nullptr || !mc->valid()) { return nullptr; }
   auto self = std::unique_ptr<MetalMossCodec>(new MetalMossCodec());
   self->_mc = mc;
+  self->_int8 = int8;
+  self->_with_encoder = with_encoder;
+  // int8 g32: quant kernel (build-time) + the fused affine GEMM (decode). The
+  // steel GEMM dequantizes the weight inside its MMA loader, so it reads the
+  // int8 weight directly (half the f16 bandwidth) -- no separate dequant pass
+  // or f16 temp. _lib_elt is reused for the forward-pass kernels below.
+  self->_lib_elt = mc->load_library("llm_elementwise");
+  self->_lib_qmm = mc->load_library("affine_qmm_steel");
+  self->_fn_quant = self->_lib_elt.function("quant_f16_to_u8g32");
+  self->_fn_qmm8g32 = self->_lib_qmm.function("affine_qmm_steel_w8g32");
+  if (int8 && (!self->_fn_quant.valid() || !self->_fn_qmm8g32.valid())) {
+    return nullptr;
+  }
 
   {
     std::ifstream in(model_dir + "/config.json");
@@ -122,7 +171,6 @@ MetalMossCodec::load(const std::string& model_dir,
   // The 8B MOSS-Audio-Tokenizer decoder structure (stable; see config.json
   // decoder_kwargs). 4 ProjectedTransformers, patch upsamplers x2,x2,x2,x240.
   // context = round(frame_rate * 10s); frame_rate = 12.5,25,50,100 Hz.
-  self->_stages.resize(4);
   const StageCfg cfgs[4] = {
       {768, 1280, 32, 20, 5120, 1280,   2,  125},  // decoder.0
       {640,  768, 12, 12, 3072,  768,   2,  250},  // decoder.2
@@ -131,61 +179,321 @@ MetalMossCodec::load(const std::string& model_dir,
   };
   const int module_idx[4] = {0, 2, 4, 6};
 
-  auto wts_opt = MetalLlamaWeights::open_model(model_dir);
-  if (!wts_opt) { return nullptr; }
-  const MetalLlamaWeights& wts = *wts_opt;
-
-  bool ok = true;
-  // ---- RVQ (quantizer) decode weights -------------------------------
-  self->_codebook.resize((std::size_t)self->_n_vq);
-  self->_q_outw.resize((std::size_t)self->_n_vq);
-  self->_q_outb.resize((std::size_t)self->_n_vq);
-  for (int i = 0; i < self->_n_vq; ++i) {
-    const std::string q = "quantizer.quantizers." + std::to_string(i);
-    self->_codebook[(std::size_t)i] = to_f16_(wts, mc, q + ".codebook.weight");
-    self->_q_outw[(std::size_t)i] = fold_wnconv_(wts, mc, q + ".out_proj");
-    self->_q_outb[(std::size_t)i] = to_f16_(wts, mc, q + ".out_proj.bias");
-    ok = ok && !self->_codebook[(std::size_t)i].empty() &&
-         !self->_q_outw[(std::size_t)i].empty() &&
-         !self->_q_outb[(std::size_t)i].empty();
-  }
-  self->_rvq_outw = fold_wnconv_(wts, mc, "quantizer.output_proj");
-  self->_rvq_outb = to_f16_(wts, mc, "quantizer.output_proj.bias");
-  ok = ok && !self->_rvq_outw.empty() && !self->_rvq_outb.empty();
-
-  // ---- decoder transformer stages -----------------------------------
+  // Set up shapes first so the cache reader can populate the same slots the
+  // builder would (the weight buffers are then filled from the cache, else by
+  // converting the safetensors).
+  self->_stages.resize(4);
   for (int s = 0; s < 4; ++s) {
     Stage& st = self->_stages[(std::size_t)s];
     st.cfg = cfgs[s];
-    const std::string base = "decoder." + std::to_string(module_idx[s]) + ".";
-    st.in_proj = to_f16_(wts, mc, base + "input_proj.weight");
-    ok = ok && !st.in_proj.empty();
-    if (st.cfg.out_dim != st.cfg.d_model) {
-      st.out_proj = to_f16_(wts, mc, base + "output_proj.weight");
-      ok = ok && !st.out_proj.empty();
-    }
-    st.layers.resize((std::size_t)st.cfg.n_layers);
-    for (int l = 0; l < st.cfg.n_layers; ++l) {
-      Layer& L = st.layers[(std::size_t)l];
-      const std::string p =
-          base + "transformer.layers." + std::to_string(l) + ".";
-      L.n1w = to_f16_(wts, mc, p + "norm1.weight");
-      L.n1b = to_f16_(wts, mc, p + "norm1.bias");
-      L.n2w = to_f16_(wts, mc, p + "norm2.weight");
-      L.n2b = to_f16_(wts, mc, p + "norm2.bias");
-      L.qkvw = to_f16_(wts, mc, p + "self_attn.in_projs.0.weight");
-      // Fold the two per-channel LayerScales into out_proj / linear2.
-      L.ow = to_f16_rowscale_(wts, mc, p + "self_attn.out_projs.0.weight",
-                              p + "layer_scale_1.scale");
-      L.fc1 = to_f16_(wts, mc, p + "linear1.weight");
-      L.fc2 = to_f16_rowscale_(wts, mc, p + "linear2.weight",
-                               p + "layer_scale_2.scale");
-      ok = ok && !L.n1w.empty() && !L.n1b.empty() && !L.n2w.empty() &&
-           !L.n2b.empty() && !L.qkvw.empty() && !L.ow.empty() &&
-           !L.fc1.empty() && !L.fc2.empty();
+    st.layers.resize((std::size_t)cfgs[s].n_layers);
+    // GEMM weight [N,K] shapes (K = contraction; must be % 32 for g32).
+    const StageCfg& c = st.cfg;
+    st.in_proj.N  = c.d_model; st.in_proj.K  = c.in_dim;
+    st.out_proj.N = c.out_dim; st.out_proj.K = c.d_model;
+    for (auto& L : st.layers) {
+      L.qkvw.N = 3 * c.d_model; L.qkvw.K = c.d_model;
+      L.ow.N   = c.d_model;     L.ow.K   = c.d_model;
+      L.fc1.N  = c.ff;          L.fc1.K  = c.d_model;
+      L.fc2.N  = c.d_model;     L.fc2.K  = c.ff;
     }
   }
-  if (!ok) { return nullptr; }
+  self->_codebook.resize((std::size_t)self->_n_vq);
+  self->_q_outw.resize((std::size_t)self->_n_vq);
+  self->_q_outb.resize((std::size_t)self->_n_vq);
+
+  // Encoder stages (mirror of the decoder; see config.json encoder_kwargs).
+  // StageCfg::patch is the DOWN patch applied BEFORE the stage's transformer
+  // (240,2,2,2 -> a 1920x total downsample). enc.3/5/7 have in_dim==d_model
+  // (Identity input_proj). context = round(frame_rate*10s); the frame rate
+  // RISES from 12.5Hz to 100Hz going from waveform inward, so the first
+  // encoder stage runs at 100Hz (context 1000) down to 12.5Hz (125).
+  const StageCfg enc_cfgs[4] = {
+      { 240,  768, 12, 12, 3072, 384, 240, 1000},  // encoder.1
+      { 768,  768, 12, 12, 3072, 384,   2,  500},  // encoder.3
+      { 768,  768, 12, 12, 3072, 640,   2,  250},  // encoder.5
+      {1280, 1280, 32, 20, 5120, 768,   2,  125},  // encoder.7
+  };
+  const int enc_module_idx[4] = {1, 3, 5, 7};
+  if (with_encoder) {
+    self->_enc_stages.resize(4);
+    self->_q_inw.resize((std::size_t)self->_n_vq);
+    self->_q_inb.resize((std::size_t)self->_n_vq);
+    self->_codebook_norm.resize((std::size_t)self->_n_vq);
+    for (int s = 0; s < 4; ++s) {
+      Stage& st = self->_enc_stages[(std::size_t)s];
+      st.cfg = enc_cfgs[s];
+      st.layers.resize((std::size_t)enc_cfgs[s].n_layers);
+      const StageCfg& c = st.cfg;
+      // input_proj exists only when in_dim != d_model (else Identity, N=K=0).
+      st.in_proj.N = (c.in_dim != c.d_model) ? c.d_model : 0;
+      st.in_proj.K = (c.in_dim != c.d_model) ? c.in_dim  : 0;
+      st.out_proj.N = c.out_dim; st.out_proj.K = c.d_model;
+      for (auto& L : st.layers) {
+        L.qkvw.N = 3 * c.d_model; L.qkvw.K = c.d_model;
+        L.ow.N   = c.d_model;     L.ow.K   = c.d_model;
+        L.fc1.N  = c.ff;          L.fc1.K  = c.d_model;
+        L.fc2.N  = c.d_model;     L.fc2.K  = c.ff;
+      }
+    }
+  }
+
+  // Visit every persistent weight buffer in a FIXED order -- used to read or
+  // write the converted-weight cache (must match the builder's order below).
+  // A QuantWeight contributes 3 buffers (w + scale + bias; scale/bias empty
+  // => 0 bytes in the cache for the f16 variant).
+  auto each_weight = [&](auto&& f) {
+    auto qw = [&](QuantWeight& q) { f(q.w); f(q.scale); f(q.bias); };
+    for (auto& b : self->_codebook) { f(b); }
+    for (auto& b : self->_q_outw)   { f(b); }
+    for (auto& b : self->_q_outb)   { f(b); }
+    f(self->_rvq_outw); f(self->_rvq_outb);
+    for (auto& st : self->_stages) {
+      qw(st.in_proj);
+      if (st.cfg.out_dim != st.cfg.d_model) { qw(st.out_proj); }
+      for (auto& L : st.layers) {
+        f(L.n1w); f(L.n1b); f(L.n2w); f(L.n2b);
+        qw(L.qkvw); qw(L.ow); qw(L.fc1); qw(L.fc2);
+      }
+    }
+    if (self->_with_encoder) {     // encode path (only in the "-enc" cache)
+      f(self->_rvq_inw); f(self->_rvq_inb);
+      for (auto& b : self->_q_inw) { f(b); }
+      for (auto& b : self->_q_inb) { f(b); }
+      for (auto& st : self->_enc_stages) {
+        qw(st.in_proj);    // Identity (in_dim==d_model) => empty entries
+        qw(st.out_proj);   // always present for encoder stages
+        for (auto& L : st.layers) {
+          f(L.n1w); f(L.n1b); f(L.n2w); f(L.n2b);
+          qw(L.qkvw); qw(L.ow); qw(L.fc1); qw(L.fc2);
+        }
+      }
+    }
+  };
+  std::uint32_t n_weights = 0;
+  each_weight([&](SharedBuffer&) { ++n_weights; });
+
+  // ---- converted-weight cache --------------------------------------------
+  // First load converts the ~6.6 GB F32 checkpoint to the ~3.3 GB f16 weights
+  // and writes them to a sidecar; later loads memcpy the cache back (half the
+  // disk read, no conversion). Keyed by the source fingerprint; atomic via
+  // .tmp+rename; best-effort (read-only model dir => just no caching).
+  // Disable with VPIPE_MOSS_NO_CACHE.
+  static const std::uint32_t kCacheMagic = 0x4d50564du;   // "MVPM"
+  static const std::uint32_t kCacheVer   = 2u;   // bump on any weight-layout
+                                                 // change (e.g. int8 fused-GEMM)
+  const bool cache_off = std::getenv("VPIPE_MOSS_NO_CACHE") != nullptr;
+  const std::uint64_t fp = codec_source_fingerprint_(model_dir);
+  // Variant in the filename so f16 and int8 caches coexist; kCacheVer guards
+  // format changes, the fingerprint guards source-checkpoint changes.
+  const std::string cache_path = model_dir + "/.vpipe-codec-cache-" +
+                                 (int8 ? "i8g32" : "f16") +
+                                 (with_encoder ? "-enc" : "") + ".bin";
+
+  bool from_cache = false;
+  if (!cache_off) {
+    std::ifstream cf(cache_path, std::ios::binary);
+    if (cf) {
+      std::uint32_t magic = 0, ver = 0, nt = 0;
+      std::uint64_t cfp = 0;
+      cf.read(reinterpret_cast<char*>(&magic), 4);
+      cf.read(reinterpret_cast<char*>(&ver), 4);
+      cf.read(reinterpret_cast<char*>(&cfp), 8);
+      cf.read(reinterpret_cast<char*>(&nt), 4);
+      if (cf && magic == kCacheMagic && ver == kCacheVer && cfp == fp &&
+          nt == n_weights) {
+        bool good = true;
+        each_weight([&](SharedBuffer& b) {
+          if (!good) { return; }
+          std::uint64_t nb = 0;
+          if (!cf.read(reinterpret_cast<char*>(&nb), 8)) { good = false; return; }
+          b = mc->make_shared_buffer((std::size_t)nb);
+          if (b.empty() ||
+              !cf.read(static_cast<char*>(b.contents()), (std::streamsize)nb)) {
+            good = false;
+          }
+        });
+        from_cache = good && static_cast<bool>(cf);
+      }
+    }
+  }
+
+  if (!from_cache) {
+    auto wts_opt = MetalLlamaWeights::open_model(model_dir);
+    if (!wts_opt) { return nullptr; }
+    const MetalLlamaWeights& wts = *wts_opt;
+
+    // Store an f16 GEMM weight into a QuantWeight slot (N/K preset): f16 mode
+    // keeps it as-is; int8 mode quantizes to uint8 g32 on the GPU and frees
+    // the f16 source.
+    auto store_qw = [&](QuantWeight& q, SharedBuffer f16) {
+      // int8 needs K % 32 (group) and N % 32 (the steel GEMM's aligned_N);
+      // weights that don't qualify (e.g. out_proj N=240) stay f16.
+      if (!self->_int8 || f16.empty() || q.K <= 0 || (q.K % 32) != 0 ||
+          q.N <= 0 || (q.N % 32) != 0) {
+        q.w = std::move(f16);
+        return;
+      }
+      const int N = q.N, K = q.K, G = K / 32;
+      q.w     = mc->make_shared_buffer((std::size_t)N * K);          // uint8
+      q.scale = mc->make_shared_buffer((std::size_t)N * G * 2);       // f16
+      q.bias  = mc->make_shared_buffer((std::size_t)N * G * 2);       // f16
+      if (q.w.empty() || q.scale.empty() || q.bias.empty()) { return; }
+      metal_compute::CommandStream stream = mc->make_command_stream();
+      {
+        ComputeEncoder enc = stream.begin_compute();
+        enc.set_function(self->_fn_quant);
+        enc.set_buffer(0, f16); enc.set_buffer(1, q.w);
+        enc.set_buffer(2, q.scale); enc.set_buffer(3, q.bias);
+        enc.set_constant(4, N); enc.set_constant(5, K);
+        enc.dispatch({(unsigned)(N * G), 1, 1}, {256, 1, 1});
+      }
+      stream.commit().wait();   // f16 freed on return
+    };
+
+    bool ok = true;
+    // ---- RVQ (quantizer) decode weights ----------------------------------
+    for (int i = 0; i < self->_n_vq; ++i) {
+      const std::string q = "quantizer.quantizers." + std::to_string(i);
+      self->_codebook[(std::size_t)i] = to_f16_(wts, mc, q + ".codebook.weight");
+      self->_q_outw[(std::size_t)i] = fold_wnconv_(wts, mc, q + ".out_proj");
+      self->_q_outb[(std::size_t)i] = to_f16_(wts, mc, q + ".out_proj.bias");
+      ok = ok && !self->_codebook[(std::size_t)i].empty() &&
+           !self->_q_outw[(std::size_t)i].empty() &&
+           !self->_q_outb[(std::size_t)i].empty();
+    }
+    self->_rvq_outw = fold_wnconv_(wts, mc, "quantizer.output_proj");
+    self->_rvq_outb = to_f16_(wts, mc, "quantizer.output_proj.bias");
+    ok = ok && !self->_rvq_outw.empty() && !self->_rvq_outb.empty();
+
+    // ---- decoder transformer stages --------------------------------------
+    for (int s = 0; s < 4; ++s) {
+      Stage& st = self->_stages[(std::size_t)s];
+      const std::string base = "decoder." + std::to_string(module_idx[s]) + ".";
+      store_qw(st.in_proj, to_f16_(wts, mc, base + "input_proj.weight"));
+      ok = ok && !st.in_proj.empty();
+      if (st.cfg.out_dim != st.cfg.d_model) {
+        store_qw(st.out_proj, to_f16_(wts, mc, base + "output_proj.weight"));
+        ok = ok && !st.out_proj.empty();
+      }
+      for (int l = 0; l < st.cfg.n_layers; ++l) {
+        Layer& L = st.layers[(std::size_t)l];
+        const std::string p =
+            base + "transformer.layers." + std::to_string(l) + ".";
+        L.n1w = to_f16_(wts, mc, p + "norm1.weight");
+        L.n1b = to_f16_(wts, mc, p + "norm1.bias");
+        L.n2w = to_f16_(wts, mc, p + "norm2.weight");
+        L.n2b = to_f16_(wts, mc, p + "norm2.bias");
+        store_qw(L.qkvw, to_f16_(wts, mc, p + "self_attn.in_projs.0.weight"));
+        // Fold the two per-channel LayerScales into out_proj / linear2.
+        store_qw(L.ow, to_f16_rowscale_(wts, mc,
+                          p + "self_attn.out_projs.0.weight",
+                          p + "layer_scale_1.scale"));
+        store_qw(L.fc1, to_f16_(wts, mc, p + "linear1.weight"));
+        store_qw(L.fc2, to_f16_rowscale_(wts, mc, p + "linear2.weight",
+                          p + "layer_scale_2.scale"));
+        ok = ok && !L.n1w.empty() && !L.n1b.empty() && !L.n2w.empty() &&
+             !L.n2b.empty() && !L.qkvw.empty() && !L.ow.empty() &&
+             !L.fc1.empty() && !L.fc2.empty();
+      }
+    }
+
+    // ---- encode path (optional) ------------------------------------------
+    if (self->_with_encoder) {
+      // Quantizer encode weights: input_proj (768->512) folded wnconv + bias,
+      // per-codebook in_proj (512->8) folded wnconv + bias.
+      self->_rvq_inw = fold_wnconv_(wts, mc, "quantizer.input_proj");
+      self->_rvq_inb = to_f16_(wts, mc, "quantizer.input_proj.bias");
+      ok = ok && !self->_rvq_inw.empty() && !self->_rvq_inb.empty();
+      for (int i = 0; i < self->_n_vq; ++i) {
+        const std::string q = "quantizer.quantizers." + std::to_string(i);
+        self->_q_inw[(std::size_t)i] = fold_wnconv_(wts, mc, q + ".in_proj");
+        self->_q_inb[(std::size_t)i] = to_f16_(wts, mc, q + ".in_proj.bias");
+        ok = ok && !self->_q_inw[(std::size_t)i].empty() &&
+             !self->_q_inb[(std::size_t)i].empty();
+      }
+      // Encoder transformer stages (mirror the decoder load; enc.3/5/7 have
+      // an Identity input_proj -> no input_proj.weight tensor).
+      for (int s = 0; s < 4; ++s) {
+        Stage& st = self->_enc_stages[(std::size_t)s];
+        const std::string base =
+            "encoder." + std::to_string(enc_module_idx[s]) + ".";
+        if (st.cfg.in_dim != st.cfg.d_model) {
+          store_qw(st.in_proj, to_f16_(wts, mc, base + "input_proj.weight"));
+          ok = ok && !st.in_proj.empty();
+        }
+        store_qw(st.out_proj, to_f16_(wts, mc, base + "output_proj.weight"));
+        ok = ok && !st.out_proj.empty();
+        for (int l = 0; l < st.cfg.n_layers; ++l) {
+          Layer& L = st.layers[(std::size_t)l];
+          const std::string p =
+              base + "transformer.layers." + std::to_string(l) + ".";
+          L.n1w = to_f16_(wts, mc, p + "norm1.weight");
+          L.n1b = to_f16_(wts, mc, p + "norm1.bias");
+          L.n2w = to_f16_(wts, mc, p + "norm2.weight");
+          L.n2b = to_f16_(wts, mc, p + "norm2.bias");
+          store_qw(L.qkvw, to_f16_(wts, mc, p + "self_attn.in_projs.0.weight"));
+          store_qw(L.ow, to_f16_rowscale_(wts, mc,
+                            p + "self_attn.out_projs.0.weight",
+                            p + "layer_scale_1.scale"));
+          store_qw(L.fc1, to_f16_(wts, mc, p + "linear1.weight"));
+          store_qw(L.fc2, to_f16_rowscale_(wts, mc, p + "linear2.weight",
+                            p + "layer_scale_2.scale"));
+          ok = ok && !L.n1w.empty() && !L.n1b.empty() && !L.n2w.empty() &&
+               !L.n2b.empty() && !L.qkvw.empty() && !L.ow.empty() &&
+               !L.fc1.empty() && !L.fc2.empty();
+        }
+      }
+    }
+    if (!ok) { return nullptr; }
+
+    if (!cache_off) {
+      const std::string tmp = cache_path + ".tmp";
+      std::ofstream cf(tmp, std::ios::binary | std::ios::trunc);
+      if (cf) {
+        cf.write(reinterpret_cast<const char*>(&kCacheMagic), 4);
+        cf.write(reinterpret_cast<const char*>(&kCacheVer), 4);
+        cf.write(reinterpret_cast<const char*>(&fp), 8);
+        cf.write(reinterpret_cast<const char*>(&n_weights), 4);
+        bool good = true;
+        each_weight([&](SharedBuffer& b) {
+          if (!good) { return; }
+          const std::uint64_t nb = b.byte_size();
+          cf.write(reinterpret_cast<const char*>(&nb), 8);
+          cf.write(static_cast<const char*>(b.contents()), (std::streamsize)nb);
+          if (!cf) { good = false; }
+        });
+        cf.close();
+        if (good && cf) { std::rename(tmp.c_str(), cache_path.c_str()); }
+        else { std::remove(tmp.c_str()); }
+      }
+    }
+  }
+
+  // Derived (not cached): the L2-normalized codebook for the encode-side
+  // cosine-nearest search. F.normalize semantics: v / max(||v||_2, eps).
+  if (self->_with_encoder) {
+    const int CD = self->_codebook_dim, Csz = self->_codebook_size;
+    for (int i = 0; i < self->_n_vq; ++i) {
+      SharedBuffer nb = mc->make_shared_buffer((std::size_t)Csz * CD * 2);
+      const auto* s =
+          static_cast<const _Float16*>(self->_codebook[(std::size_t)i].contents());
+      auto* d = static_cast<_Float16*>(nb.contents());
+      for (int r = 0; r < Csz; ++r) {
+        double ss = 0.0;
+        for (int e = 0; e < CD; ++e) {
+          const double x = (double)s[(std::size_t)r * CD + e];
+          ss += x * x;
+        }
+        const double inv = 1.0 / std::max(std::sqrt(ss), 1e-12);
+        for (int e = 0; e < CD; ++e) {
+          d[(std::size_t)r * CD + e] =
+              (_Float16)((double)s[(std::size_t)r * CD + e] * inv);
+        }
+      }
+      self->_codebook_norm[(std::size_t)i] = std::move(nb);
+    }
+  }
 
   // inv_freq for the interleaved RoPE (head_dim 64, max_period 10000).
   const int hd = 64, half = hd / 2;
@@ -198,7 +506,7 @@ MetalMossCodec::load(const std::string& model_dir,
   // ---- kernels (f16) ------------------------------------------------
   self->_lib_gemm = mc->load_library("dense_gemm");
   self->_lib_vis = mc->load_library("qwen3_5_vision");
-  self->_lib_elt = mc->load_library("llm_elementwise");
+  // _lib_elt already loaded up front (int8 quant/dequant kernels).
   self->_lib_sdpa = mc->load_library("sdpa");
   self->_lib_rope = mc->load_library("rope");
   self->_fn_gemm = self->_lib_gemm.function("dense_gemm_t_f16");
@@ -296,6 +604,12 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
   auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
 
   SharedBuffer x = buf((std::size_t)T * d);
+  // Identity input_proj (in_dim == d_model, e.g. encoder.3/5/7): x := in.
+  // Host copy before the stream opens (in is host-ready; UMA coherent).
+  const bool id_in = st.in_proj.empty();
+  if (id_in) {
+    std::memcpy(x.contents(), in.contents(), (std::size_t)T * d * 2);
+  }
   SharedBuffer n1 = buf((std::size_t)T * d), qkv = buf((std::size_t)T * 3 * d);
   SharedBuffer q3 = buf((std::size_t)T * d), k3 = buf((std::size_t)T * d),
                v3 = buf((std::size_t)T * d);
@@ -321,6 +635,25 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       enc.set_constant(5, N);
       enc.set_constant(6, M);
       enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                    (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
+    };
+    // GEMM with a (possibly int8) weight: f16 weights use the dense GEMM; int8
+    // ones use the fused affine steel GEMM, which dequantizes inside its MMA
+    // loader (reads the int8 weight directly -- no dequant pass, no f16 temp,
+    // half the weight bandwidth). y[M,N] = x[M,K] @ dequant(w)[N,K]^T.
+    auto gemm_q = [&](const SharedBuffer& xin, const QuantWeight& qw,
+                      const SharedBuffer& y, int M, int N, int K) {
+      if (!qw.is_int8()) { gemm(xin, qw.w, y, M, N, K); return; }
+      enc.set_function(_fn_qmm8g32);
+      enc.set_buffer(0, qw.w);
+      enc.set_buffer(1, qw.scale);
+      enc.set_buffer(2, qw.bias);
+      enc.set_buffer(3, xin);
+      enc.set_buffer(4, y);
+      enc.set_constant(5, K);
+      enc.set_constant(6, N);
+      enc.set_constant(7, M);
       enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
                     (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
     };
@@ -407,11 +740,11 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       enc.dispatch({32, (unsigned)heads, (unsigned)T}, {32, 1, 1});
     };
 
-    gemm(in, st.in_proj, x, T, d, in_dim);   // input_proj
+    if (!id_in) { gemm_q(in, st.in_proj, x, T, d, in_dim); }   // input_proj
     for (int l = 0; l < c.n_layers; ++l) {
       const Layer& L = st.layers[(std::size_t)l];
       ln(x, L.n1w, L.n1b, n1, T, d);
-      gemm(n1, L.qkvw, qkv, T, 3 * d, d);
+      gemm_q(n1, L.qkvw, qkv, T, 3 * d, d);
       hslice(qkv, q3, T, 3 * d, d, 0);
       hslice(qkv, k3, T, 3 * d, d, d);
       hslice(qkv, v3, T, 3 * d, d, 2 * d);
@@ -422,15 +755,15 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       rope(kt);
       attn(qt, kt, vt, atb);
       transpose(atb, att, heads, T);   // [heads,T,hd] -> [T,heads,hd]
-      gemm(att, L.ow, o, T, d, d);
+      gemm_q(att, L.ow, o, T, d, d);
       residual(x, o, x, T * d);
       ln(x, L.n2w, L.n2b, n1, T, d);
-      gemm(n1, L.fc1, h, T, ff, d);
+      gemm_q(n1, L.fc1, h, T, ff, d);
       gelu(h, h, T * ff);
-      gemm(h, L.fc2, o2, T, d, ff);
+      gemm_q(h, L.fc2, o2, T, d, ff);
       residual(x, o2, x, T * d);
     }
-    if (out_dim != d) { gemm(x, st.out_proj, out, T, out_dim, d); }
+    if (out_dim != d) { gemm_q(x, st.out_proj, out, T, out_dim, d); }
   }
   stream.commit().wait();
   if (out_dim != d) { return out; }
@@ -443,6 +776,11 @@ MetalMossCodec::decode(const std::vector<std::vector<std::int32_t>>& codes,
   std::vector<float> wave;
   const int T = (int)codes.size();
   if (T <= 0 || !_ok) { return wave; }
+
+  // audio-codec perf block (LLM lane): RVQ decode + 4 transformer/upsample
+  // stages -> waveform. value = input frame count.
+  PerfAuxScope _perf(_session, kPerfLaneLLM, kGvidLlmAudioCodec,
+                     kPerfLlmAudioCodecBegin, (std::uint64_t)T);
 
   // Channel-major [C][T] copy of a time-major [T,C] f16 buffer (for golden
   // comparison: the reference dumps [C, T]).
@@ -490,6 +828,128 @@ MetalMossCodec::decode(const std::vector<std::vector<std::int32_t>>& codes,
   const auto* w = static_cast<const _Float16*>(cur.contents());
   for (int i = 0; i < curT; ++i) { wave[(std::size_t)i] = (float)w[i]; }
   return wave;
+}
+
+std::vector<std::vector<std::int32_t>>
+MetalMossCodec::encode(const std::vector<float>& wave_in) {
+  std::vector<std::vector<std::int32_t>> codes;
+  if (!_ok || !_with_encoder || wave_in.empty()) { return codes; }
+
+  // audio-codec perf block (LLM lane): the encode mirror of decode().
+  PerfAuxScope _perf(_session, kPerfLaneLLM, kGvidLlmAudioCodec,
+                     kPerfLlmAudioCodecBegin, (std::uint64_t)wave_in.size());
+
+  const int ds = 1920;
+  const int N = (int)wave_in.size();
+  const int Npad = ((N + ds - 1) / ds) * ds;   // pad to a whole frame
+
+  // Waveform as a 1-channel f16 buffer [Npad, 1] (zero-padded tail).
+  SharedBuffer cur = _mc->make_shared_buffer((std::size_t)Npad * 2);
+  {
+    auto* w = static_cast<_Float16*>(cur.contents());
+    for (int i = 0; i < Npad; ++i) {
+      w[i] = (_Float16)(i < N ? wave_in[(std::size_t)i] : 0.0f);
+    }
+  }
+  int curT = Npad, curC = 1;
+
+  // DOWN patch-reshape: [Tin, Cin] -> [Tin/P, Cin*P],
+  // out[t][c*P+p] = in[t*P+p][c] (the inverse of decode's UP patch).
+  auto down_patch = [&](const SharedBuffer& inb, int Tin, int Cin, int P) {
+    const int Tout = Tin / P, Cout = Cin * P;
+    SharedBuffer outb = _mc->make_shared_buffer((std::size_t)Tout * Cout * 2);
+    const auto* s = static_cast<const _Float16*>(inb.contents());
+    auto* dptr = static_cast<_Float16*>(outb.contents());
+    for (int t = 0; t < Tout; ++t) {
+      for (int cc = 0; cc < Cin; ++cc) {
+        for (int p = 0; p < P; ++p) {
+          dptr[(std::size_t)t * Cout + cc * P + p] =
+              s[(std::size_t)(t * P + p) * Cin + cc];
+        }
+      }
+    }
+    return outb;
+  };
+
+  for (int si = 0; si < 4; ++si) {
+    const Stage& st = _enc_stages[(std::size_t)si];
+    const int P = st.cfg.patch;
+    SharedBuffer patched = down_patch(cur, curT, curC, P);
+    const int Tst = curT / P;               // frames into this stage
+    cur = run_stage_(st, Tst, patched);     // [Tst, out_dim]
+    curT = Tst;
+    curC = st.cfg.out_dim;
+  }
+  // cur = [curT, code_dim], curT = Npad/1920.
+  return encode_rvq_(cur, curT);
+}
+
+std::vector<std::vector<std::int32_t>>
+MetalMossCodec::encode_rvq_(const SharedBuffer& hidden, int T) {
+  const int CD = _codebook_dim, RV = _rvq_dim, OD = _code_dim;
+  const int Csz = _codebook_size, NV = _n_vq;
+  std::vector<std::vector<std::int32_t>> codes(
+      (std::size_t)T, std::vector<std::int32_t>((std::size_t)NV, 0));
+
+  const auto* hid = static_cast<const _Float16*>(hidden.contents());   // [T,OD]
+  const auto* Win = static_cast<const _Float16*>(_rvq_inw.contents()); // [RV,OD]
+  const auto* bin = static_cast<const _Float16*>(_rvq_inb.contents()); // [RV]
+
+  std::vector<float> resid((std::size_t)RV);   // running residual (rvq_dim)
+  std::vector<float> z((std::size_t)CD);        // per-codebook in_proj out
+  for (int t = 0; t < T; ++t) {
+    // input_proj: resid = Win @ hidden[t] + bin.
+    const _Float16* hr = hid + (std::size_t)t * OD;
+    for (int o = 0; o < RV; ++o) {
+      const _Float16* wr = Win + (std::size_t)o * OD;
+      float acc = (float)bin[o];
+      for (int k = 0; k < OD; ++k) { acc += (float)wr[k] * (float)hr[k]; }
+      resid[(std::size_t)o] = acc;
+    }
+    // LFQ residual loop over the n_vq codebooks.
+    for (int cb = 0; cb < NV; ++cb) {
+      const auto* Wq =
+          static_cast<const _Float16*>(_q_inw[(std::size_t)cb].contents());  // [CD,RV]
+      const auto* bq =
+          static_cast<const _Float16*>(_q_inb[(std::size_t)cb].contents());  // [CD]
+      // z = in_proj_cb(resid).
+      for (int e = 0; e < CD; ++e) {
+        const _Float16* wr = Wq + (std::size_t)e * RV;
+        float acc = (float)bq[e];
+        for (int k = 0; k < RV; ++k) { acc += (float)wr[k] * resid[(std::size_t)k]; }
+        z[(std::size_t)e] = acc;
+      }
+      // Cosine-nearest over the L2-normalized codebook. argmax(z . cb_norm)
+      // == argmax(z_norm . cb_norm) (z's norm is a positive per-step
+      // constant), reproducing the reference argmin squared distance.
+      const auto* cbn =
+          static_cast<const _Float16*>(_codebook_norm[(std::size_t)cb].contents());  // [Csz,CD]
+      int best = 0;
+      float bestdot = -std::numeric_limits<float>::infinity();
+      for (int code = 0; code < Csz; ++code) {
+        const _Float16* cr = cbn + (std::size_t)code * CD;
+        float dot = 0.0f;
+        for (int e = 0; e < CD; ++e) { dot += (float)cr[e] * z[(std::size_t)e]; }
+        if (dot > bestdot) { bestdot = dot; best = code; }
+      }
+      codes[(std::size_t)t][(std::size_t)cb] = best;
+      // residual -= out_proj(raw codebook[cb][best]) (== the decode path).
+      const auto* Wout =
+          static_cast<const _Float16*>(_q_outw[(std::size_t)cb].contents());  // [RV,CD]
+      const auto* bout =
+          static_cast<const _Float16*>(_q_outb[(std::size_t)cb].contents());  // [RV]
+      const auto* cbr =
+          static_cast<const _Float16*>(_codebook[(std::size_t)cb].contents()); // [Csz,CD]
+      const _Float16* crow = cbr + (std::size_t)best * CD;
+      for (int o = 0; o < RV; ++o) {
+        const _Float16* wr = Wout + (std::size_t)o * CD;
+        float acc = (float)bout[o];
+        for (int e = 0; e < CD; ++e) { acc += (float)wr[e] * (float)crow[e]; }
+        resid[(std::size_t)o] -= acc;
+      }
+    }
+  }
+  return codes;
 }
 
 }  // namespace vpipe::genai

@@ -68,6 +68,14 @@ public:
   const StageSpec& spec() const noexcept override;
 
 private:
+  // The whole FFmpeg connect/segment/packet loop. Runs on a thread
+  // this stage owns (spawned by process()) rather than on a session
+  // worker, so the number of concurrent capture stages is bounded by
+  // cameras, not by the worker-pool size. Pushes to the oports through
+  // RuntimeContext::write_sync (non-coroutine). Returns once the
+  // runtime requests stop.
+  void capture_loop_(RuntimeContext& ctx);
+
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   // The iport (watchdog tick) and the two oports (encoded segments)

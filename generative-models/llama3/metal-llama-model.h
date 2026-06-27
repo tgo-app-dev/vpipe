@@ -155,6 +155,24 @@ private:
                       const metal_compute::SharedBuffer& sample_ws,
                       const metal_compute::SharedBuffer& seen);
 
+  // Two-stage parallel argmax over logits -> out[out_off] (lowest-index
+  // tie-break). VPIPE_LLAMA_ARGMAX1=1 forces the single-tg fallback.
+  void encode_argmax_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& logits,
+                      const metal_compute::SharedBuffer& out,
+                      std::size_t out_off, int vocab);
+
+  // Histogram multi-tg sampler core over logits -> out[out_off], updating
+  // seen. Deterministic. VPIPE_LLAMA_SAMPLE1=1 forces the single-tg fallback.
+  void encode_sample_core_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& logits,
+                           const metal_compute::SharedBuffer& out,
+                           std::size_t out_off,
+                           const metal_compute::SharedBuffer& sample_ws,
+                           const metal_compute::SharedBuffer& seen,
+                           const GpuSamplerParams& sp,
+                           std::uint32_t step_seed, int vocab);
+
   // Per-context streaming-pipeline decode state (pdecode_*).
   struct PDecode {
     metal_compute::SharedBuffer gen_ids;     // [max+1] int32 GPU chain
@@ -193,7 +211,14 @@ private:
       _lib_rope, _lib_sdpa, _lib_attn;
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmm, _fn_rms,
       _fn_residual, _fn_rope, _fn_embed, _fn_transpose, _fn_argmax,
-      _fn_sample;
+      _fn_sample,
+      // Two-stage parallel argmax + histogram multi-tg sampler (defaults; the
+      // single-tg _fn_argmax/_fn_sample are the ARGMAX1/SAMPLE1 fallbacks).
+      // Same kernels as Gemma's llm_elementwise.metal.
+      _fn_argmax_partial, _fn_argmax_combine,
+      _fn_smp_max_partial, _fn_smp_max_combine,
+      _fn_smp_zhist_partial, _fn_smp_zhist_combine,
+      _fn_smp_thresh, _fn_smp_pick_partial, _fn_smp_pick_combine;
   // Fused SwiGLU MLP (interleaved gate/up weight -> silu(gate)*up in one
   // pass): GEMV for decode, GEMM for prefill.
   metal_compute::ComputeFunction _fn_qmv_swiglu, _fn_qmm_swiglu;
@@ -213,6 +238,16 @@ private:
   // Reused scratch (one decode token; prefill allocates its own).
   metal_compute::SharedBuffer _x, _hn, _q, _k, _v, _attn, _ao;
   metal_compute::SharedBuffer _sg, _mo, _logits;
+  // Two-stage-argmax + histogram-sampler scratch (mirrors Gemma/Qwen).
+  // Allocated once at load, reused across decode steps (serial encoder
+  // serialises the WAR hazard). kArgmaxM/kSampM = stage-1 tgs, kSampB = bins
+  // (MUST match sample_*_f16 in llm_elementwise.metal).
+  static constexpr int kArgmaxM = 64;
+  static constexpr int kSampM = 64;
+  static constexpr int kSampB = 1024;
+  metal_compute::SharedBuffer _d_argmax_part;
+  metal_compute::SharedBuffer _d_smp_maxpart, _d_smp_hpart, _d_smp_hist,
+      _d_smp_maxl, _d_smp_wt, _d_smp_pickpart;
   // Paged KV: page-table scratch [max_pages * 3] int32 (reused across
   // layers within a forward; the page list is per-context) + the paged
   // write/attention kernels.

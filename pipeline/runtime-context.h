@@ -209,6 +209,16 @@ public:
     return _out_bufs[out_port]->write(std::move(t));
   }
 
+  // Non-coroutine push to an oport, for a stage that produces from a
+  // thread it owns rather than from its process() coroutine. Returns
+  // false iff the oport buffer is closed (teardown) -- the caller
+  // should stop producing. See OportBuffer::push_sync.
+  bool
+  write_sync(unsigned out_port, std::unique_ptr<BeatPayloadIntf> t)
+  {
+    return _out_bufs[out_port]->push_sync(std::move(t));
+  }
+
   // Stage signals it has produced its last output (or read past EOS
   // and has no more work). The driver loop closes outputs and exits
   // after the current process_one returns.

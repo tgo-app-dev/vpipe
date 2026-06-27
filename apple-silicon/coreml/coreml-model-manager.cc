@@ -98,6 +98,24 @@ discover_outputs_(CML::Model* model,
   }
 }
 
+// Collect every feature name from a modelDescription input/output
+// dictionary into `out` (enumeration order; CoreML guarantees none).
+// Used to derive the single input/output name of single-I/O models.
+void
+collect_names_(NS::Dictionary* dict, vector<string>* out)
+{
+  if (!dict) {
+    return;
+  }
+  auto* keys = dict->keyEnumerator<NS::String>();
+  if (!keys) {
+    return;
+  }
+  while (auto* k = keys->nextObject()) {
+    out->emplace_back(k->utf8String());
+  }
+}
+
 // On-disk cache for the compiled .mlmodelc bundle CoreML produces
 // from a raw .mlmodel/.mlpackage. CML::Model::compileModelAtURL
 // drops the result into $TMPDIR and keeps it there until the caller
@@ -319,8 +337,13 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
   _model = model->retain();
 
   // Discover output descriptors so the consuming stage can decide
-  // whether to take the zero-copy outputBackings path.
+  // whether to take the zero-copy outputBackings path, plus the input/
+  // output feature names so a stage can derive them without config.
   discover_outputs_(_model, &_outputs);
+  if (auto* mdesc = _model->modelDescription()) {
+    collect_names_(mdesc->inputDescriptionsByName(),  &_input_names);
+    collect_names_(mdesc->outputDescriptionsByName(), &_output_names);
+  }
 
   pool->release();
 }

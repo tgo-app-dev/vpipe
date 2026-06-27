@@ -8,6 +8,7 @@
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/tensor-beat.h"
+#include "common/ffmpeg-libraries.h"
 #include "generative-models/moss/metal-moss-tts-model.h"
 #include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/tokenizer.h"
@@ -41,6 +42,7 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
   _hf_dir    = attr_str("hf_dir");
   _codec_dir = attr_str("codec_dir");
   _models_db = attr_str("models_db");
+  _codec_int8 = (attr_str("codec_quant") == "int8");
   if (_models_db.empty()) {
     _models_db = "models";
   }
@@ -53,6 +55,21 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
     }
     _max_new_tokens = static_cast<int>(v);
   }
+  _audio_temp  = attr_real("audio_temperature");
+  _audio_top_p = attr_real("audio_top_p");
+  _audio_top_k = static_cast<int>(attr_int("audio_top_k"));
+  _audio_rep   = attr_real("audio_repetition_penalty");
+  _text_temp   = attr_real("text_temperature");
+  _text_top_p  = attr_real("text_top_p");
+  _text_top_k  = static_cast<int>(attr_int("text_top_k"));
+  _text_rep    = attr_real("text_repetition_penalty");
+  _sampler_seed = static_cast<std::uint64_t>(attr_uint("sampler_seed"));
+  _voice_lock        = attr_bool("voice_lock");
+  _voice_ref_seconds = attr_real("voice_ref_seconds");
+  // A 2nd (PCM reference) iport means the codec needs its encode path, so a
+  // reference voice can be analysed for cloning. iport_edges() reflects the
+  // edges this stage was constructed with (the graph is frozen post-launch).
+  _with_encoder = this->iport_edges().size() >= 2;
 
   if (_hf_dir.empty()) {
     fail_config(fmt(
@@ -83,15 +100,64 @@ constexpr ConfigKey kAttrs[] = {
    .suggest_db = "models", .suggest_db_type = "moss-codec"},
   {.key = "models_db", .type = ConfigType::String,
    .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+  {.key = "codec_quant", .type = ConfigType::String,
+   .doc = "codec weight precision: \"int8\" stores the codec's transformer "
+          "GEMM weights as int8 group-32 affine (~half the resident codec "
+          "footprint, small audio-quality cost); default/empty = f16",
+   .def_str = ""},
   {.key = "max_new_tokens", .type = ConfigType::Int,
    .doc = "per-beat delay-pattern generation budget (>= 1)",
    .def_int = 1024},
+  // Sampling (flattened, separate audio + text channels). Defaults are the
+  // MossTTSDelay-8B recommendations; greedy decoding (temperature <= 0)
+  // degenerates (silent loops to max_new_tokens), so sampling is the default.
+  {.key = "audio_temperature", .type = ConfigType::Real,
+   .doc = "audio-code softmax temperature; <= 0 forces greedy", .def_real = 1.7},
+  {.key = "audio_top_p", .type = ConfigType::Real,
+   .doc = "audio-code nucleus top-p (1.0 = off)", .def_real = 0.8},
+  {.key = "audio_top_k", .type = ConfigType::Int,
+   .doc = "audio-code top-k (0 = off)", .def_int = 25},
+  {.key = "audio_repetition_penalty", .type = ConfigType::Real,
+   .doc = "audio-code repetition penalty (1.0 = off)", .def_real = 1.0},
+  {.key = "text_temperature", .type = ConfigType::Real,
+   .doc = "free-text-token temperature; <= 0 forces greedy. Default greedy: "
+          "vpipe GENERATES the text channel (re-emits the transcript), so it "
+          "must follow it to reach audio_end; sampling it over-generates. The "
+          "reference's text temp 1.5 is for its teacher-forced text path.",
+   .def_real = 0.0},
+  {.key = "text_top_p", .type = ConfigType::Real,
+   .doc = "free-text-token nucleus top-p (1.0 = off)", .def_real = 1.0},
+  {.key = "text_top_k", .type = ConfigType::Int,
+   .doc = "free-text-token top-k (0 = off)", .def_int = 50},
+  {.key = "text_repetition_penalty", .type = ConfigType::Real,
+   .doc = "free-text-token repetition penalty (1.0 = off)", .def_real = 1.0},
+  {.key = "sampler_seed", .type = ConfigType::Uint,
+   .doc = "audio-sampling RNG seed = the 'voice lock'. Nonzero (default) makes "
+          "a given text deterministic -> the SAME voice every run (per-script: "
+          "different texts may still differ; for a cross-text identity use "
+          "voice_lock or voice cloning via the audio iport). 0 = fresh voice.",
+   .def_uint = 0x6d6f7373},   // 'moss'
+  {.key = "voice_lock", .type = ConfigType::Bool,
+   .doc = "design-once: cache the FIRST generated voice and reuse it as the "
+          "clone reference for every later beat, so the timbre stays the same "
+          "across different texts (the first voice is picked by sampler_seed). "
+          "A reference on the audio iport overrides it. Needs no audio input.",
+   .def_bool = false},
+  {.key = "voice_ref_seconds", .type = ConfigType::Real,
+   .doc = "max seconds of reference audio kept for cloning (longer = more "
+          "prompt cost per beat); applies to both the iport reference and "
+          "voice_lock. <= 0 keeps the whole clip.",
+   .def_real = 12.0},
 };
 const PortSpec kIports[] = {
   {.name = "text",
    .doc = "FlexData string (or object with a \"text\" key): the text to "
           "synthesize",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "audio-ref",
+   .doc = "OPTIONAL mono f32 PCM TensorBeat (any rate; sideband.sample_rate "
+          "honoured): a reference voice to clone. Latest beat is sticky.",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "pcm",
@@ -142,9 +208,16 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
   const std::string codec_dir =
       resolve_model_dir(session(), _models_db, _codec_dir);
 
+  using clock = std::chrono::steady_clock;
+  auto ms = [](clock::duration d) {
+    return static_cast<int>(
+        std::chrono::duration<double, std::milli>(d).count());
+  };
+
   session()->info(fmt(
       "TextToSpeechStage('{}'): loading MOSS-TTS LM from '{}'",
       this->id(), _hf_dir));
+  const auto t_lm0 = clock::now();
   _lm = genai::MetalMossTtsModel::load(lm_dir, mc);
   if (!_lm || !_lm->valid()) {
     session()->error(fmt(
@@ -153,11 +226,17 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  session()->info(fmt(
+      "TextToSpeechStage('{}'): MOSS-TTS LM loaded in {} ms",
+      this->id(), ms(clock::now() - t_lm0)));
 
   session()->info(fmt(
       "TextToSpeechStage('{}'): loading MOSS-Audio-Tokenizer codec from "
-      "'{}'", this->id(), _codec_dir));
-  _codec = genai::MetalMossCodec::load(codec_dir, mc);
+      "'{}'{}", this->id(), _codec_dir,
+      _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
+  const auto t_cc0 = clock::now();
+  _codec = genai::MetalMossCodec::load(codec_dir, mc, _codec_int8,
+                                       _with_encoder);
   if (!_codec || !_codec->valid()) {
     session()->error(fmt(
         "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; "
@@ -166,6 +245,9 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     _codec.reset();
     co_return;
   }
+  session()->info(fmt(
+      "TextToSpeechStage('{}'): MOSS codec loaded in {} ms",
+      this->id(), ms(clock::now() - t_cc0)));
 
   // Tokenizer for the LM prompt. The MOSS user_inst prompt encodes the
   // <|im_start|> / <|im_end|> markers as single special-token ids.
@@ -179,6 +261,40 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     _codec.reset();
     co_return;
+  }
+
+  // Route profiling events (text-prefill / text-decode / audio-codec) onto
+  // the session's LLM perf lane.
+  _lm->set_session(session());
+  _codec->set_session(session());
+
+  // Cold-start warmup: the FIRST forward pass pays the Metal pipeline-state
+  // compilation + first-touch weight residency (tens of seconds on the 8B LM)
+  // with the GPU mostly idle. Run a tiny throwaway LM generation + codec decode
+  // HERE, at load, so that cost lands during stage init -- the first real
+  // synthesis then runs warm. Disable with VPIPE_TTS_NO_WARMUP for A/B.
+  if (std::getenv("VPIPE_TTS_NO_WARMUP") == nullptr) {
+    const auto t_w0 = clock::now();
+    const int n_vq = _lm->config().n_vq;
+    const int pad  = _lm->config().audio_pad_code;
+    // A few rows: channel 0 a valid text id, audio channels at pad. The exact
+    // ids are irrelevant -- this only compiles kernels + makes weights
+    // resident; the generated output is discarded.
+    std::vector<std::vector<std::int32_t>> wprompt(
+        4, std::vector<std::int32_t>(static_cast<std::size_t>(1 + n_vq), pad));
+    wprompt[0][0] = _lm->config().im_start;
+    wprompt[1][0] = _lm->config().pad_token;
+    wprompt[2][0] = _lm->config().pad_token;
+    wprompt[3][0] = _lm->config().pad_token;
+    (void)_lm->generate_delay_greedy(wprompt, 8);
+    // Codec: a few zero-code frames warm the RVQ decode + 4 transformer stages.
+    std::vector<std::vector<std::int32_t>> wcodes(
+        4, std::vector<std::int32_t>(static_cast<std::size_t>(n_vq), 0));
+    (void)_codec->decode(wcodes, nullptr);
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): warmup done in {} ms (cold pipeline-state "
+        "+ weight residency paid at load; first synthesis runs warm)",
+        this->id(), ms(clock::now() - t_w0)));
   }
 
   session()->info(fmt(
@@ -305,6 +421,109 @@ encode_moss_prompt_(const genai::Tokenizer& tok, const std::string& s)
   return ids;
 }
 
+// Build the MOSS prompt GRID [seq][1 + n_vq]: channel 0 = text/control id,
+// channels 1..n_vq = audio codes (audio_pad_code where inactive). When `ref`
+// is non-null/non-empty, splice it into the - Reference(s): section as a
+// single-speaker USER audio block, exactly as the MOSS processor does: the
+// channel-0 span is audio_start, then audio_user_slot for every (delayed) row,
+// then audio_end; channels 1..n_vq carry the reference codes with the delay
+// pattern applied (delayed[r][cb] = ref[r-cb][cb], else pad). Without a
+// reference this is the plain (- Reference(s): None) prompt.
+std::vector<std::vector<std::int32_t>>
+build_moss_grid_(const genai::Tokenizer&                       tok,
+                 const std::string&                            text,
+                 const genai::MetalMossTtsModel::Config&       cfg,
+                 const std::vector<std::vector<std::int32_t>>* ref)
+{
+  const int n_vq  = cfg.n_vq;
+  const int pad   = cfg.audio_pad_code;
+  const int nchan = 1 + n_vq;
+  std::vector<std::vector<std::int32_t>> grid;
+  auto text_row = [&](std::int32_t id) {
+    std::vector<std::int32_t> r(static_cast<std::size_t>(nchan), pad);
+    r[0] = id;
+    return r;
+  };
+  auto push_text = [&](const std::string& s) {
+    for (std::int32_t id : encode_moss_prompt_(tok, s)) {
+      grid.push_back(text_row(id));
+    }
+  };
+
+  if (ref == nullptr || ref->empty()) {
+    push_text(render_moss_prompt_(text));
+    return grid;
+  }
+
+  // Reference (S1) audio block, then the remaining user_inst sections + text.
+  push_text("<|im_start|>user\n<user_inst>\n- Reference(s):\n[S1]:\n");
+  grid.push_back(text_row(cfg.audio_start));
+  const int T = static_cast<int>(ref->size());
+  for (int r = 0; r < T + n_vq - 1; ++r) {           // apply_delay_pattern
+    std::vector<std::int32_t> g(static_cast<std::size_t>(nchan), pad);
+    g[0] = cfg.audio_user_slot;
+    for (int cb = 0; cb < n_vq; ++cb) {
+      const int src = r - cb;                          // delayed[r][cb]
+      if (src >= 0 && src < T) {
+        int v = (*ref)[static_cast<std::size_t>(src)][static_cast<std::size_t>(cb)];
+        if (v < 0) { v = 0; }
+        if (v >= pad) { v = pad - 1; }
+        g[static_cast<std::size_t>(1 + cb)] = v;
+      }
+    }
+    grid.push_back(std::move(g));
+  }
+  grid.push_back(text_row(cfg.audio_end));
+  push_text("\n- Instruction:\nNone\n- Tokens:\nNone\n- Quality:\nNone\n"
+            "- Sound Event:\nNone\n- Ambient Sound:\nNone\n- Language:\nNone\n"
+            "- Text:\n" + text + "\n</user_inst><|im_end|>\n"
+            "<|im_start|>assistant\n");
+  return grid;
+}
+
+// Resample a mono f32 clip from in_sr to out_sr via FFmpeg swresample (proper
+// anti-aliased conversion). Returns empty on failure (FFmpeg unavailable, bad
+// rate); an in_sr == out_sr clip is copied through. One-shot (whole clip +
+// flush).
+std::vector<float>
+resample_pcm_(const SessionContextIntf* session, const float* in,
+              std::size_t n_in, int in_sr, int out_sr)
+{
+  if (in == nullptr || n_in == 0 || in_sr <= 0 || out_sr <= 0) { return {}; }
+  if (in_sr == out_sr) { return std::vector<float>(in, in + n_in); }
+  const FFmpegLibraries* libs = session ? session->ffmpeg_libraries() : nullptr;
+  if (libs == nullptr) { return {}; }
+  const auto& swr = libs->swresample().api;
+  AVChannelLayout mono_in  = AV_CHANNEL_LAYOUT_MONO;
+  AVChannelLayout mono_out = AV_CHANNEL_LAYOUT_MONO;
+  SwrContext* sw = nullptr;
+  if (swr.alloc_set_opts2(&sw, &mono_out, AV_SAMPLE_FMT_FLT, out_sr,
+                          &mono_in, AV_SAMPLE_FMT_FLT, in_sr, 0, nullptr) < 0
+      || sw == nullptr) {
+    return {};
+  }
+  if (swr.init(sw) < 0) { swr.free(&sw); return {}; }
+  const std::int64_t max_out =
+      static_cast<std::int64_t>(n_in) * out_sr / in_sr + 64;
+  std::vector<float> out(static_cast<std::size_t>(max_out));
+  const std::uint8_t* in_ptr = reinterpret_cast<const std::uint8_t*>(in);
+  float* dst = out.data();
+  int n_out = swr.convert(sw, reinterpret_cast<std::uint8_t**>(&dst),
+                          static_cast<int>(max_out), &in_ptr,
+                          static_cast<int>(n_in));
+  if (n_out >= 0 && n_out < max_out) {            // flush the resampler tail
+    float* dst2 = out.data() + n_out;
+    const int n_flush = swr.convert(
+        sw, reinterpret_cast<std::uint8_t**>(&dst2),
+        static_cast<int>(max_out - n_out), nullptr, 0);
+    if (n_flush > 0) { n_out += n_flush; }
+  }
+  swr.free(&sw);
+  if (n_out <= 0) { return {}; }
+  out.resize(static_cast<std::size_t>(n_out));
+  return out;
+}
+
 }  // namespace
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
@@ -364,28 +583,90 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   using clock = std::chrono::steady_clock;
   const auto t_start = clock::now();
 
-  // 1. Build the prompt grid [seq][1 + n_vq]: channel 0 = text id,
-  // channels 1..n_vq = audio_pad_code (== no reference audio).
-  const int n_vq      = _lm->config().n_vq;             // 32
-  const int pad       = _lm->config().audio_pad_code;   // 1024
-  const int n_chan    = 1 + n_vq;                       // 33
-  const std::string prompt_str = render_moss_prompt_(text);
-  std::vector<std::int32_t> ids = encode_moss_prompt_(*_tokenizer, prompt_str);
-  if (ids.empty()) {
-    session()->warn(fmt(
-        "TextToSpeechStage('{}'): tokenizer produced 0 ids for the "
-        "prompt; dropping beat", this->id()));
-    co_return;
-  }
-  std::vector<std::vector<std::int32_t>> prompt(
-      ids.size(), std::vector<std::int32_t>(
-                      static_cast<std::size_t>(n_chan), pad));
-  for (std::size_t i = 0; i < ids.size(); ++i) {
-    prompt[i][0] = ids[i];   // channels 1..n_vq stay at audio_pad_code
+  const int n_vq = _lm->config().n_vq;             // 32
+  const int pad  = _lm->config().audio_pad_code;   // 1024
+
+  // 0. Drain any reference-audio beats on iport1 (voice cloning). The latest
+  // sets the cloned voice for this and subsequent text beats (sticky). Each
+  // is resampled to the codec rate, encoded to RVQ codes, and capped to
+  // voice_ref_seconds. backlog() keeps the read non-blocking.
+  if (_with_encoder && ctx.num_iports() >= 2) {
+    while (ctx.backlog(1) > 0) {
+      auto rp = co_await ctx.read(1);
+      if (!rp) { break; }
+      const auto* tbp = dynamic_cast<const TensorBeatPayload*>(rp.get());
+      if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): reference iport expects an f32 PCM "
+            "TensorBeat, got {}; ignoring", this->id(), rp->describe()));
+        continue;
+      }
+      int rsr = _codec->sample_rate();
+      if (tbp->sideband.is_object()) {
+        auto sb = tbp->sideband.as_object();
+        if (sb.contains("sample_rate")) {
+          rsr = static_cast<int>(sb.at("sample_rate").as_int(rsr));
+        }
+      }
+      const std::size_t n_in =
+          static_cast<std::size_t>(tbp->element_count());
+      std::vector<float> ref_pcm = resample_pcm_(
+          session(), tbp->as_f32(), n_in, rsr, _codec->sample_rate());
+      if (ref_pcm.empty()) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): reference resample {} Hz -> {} Hz "
+            "produced no samples; ignoring", this->id(), rsr,
+            _codec->sample_rate()));
+        continue;
+      }
+      auto rc = _codec->encode(ref_pcm);
+      if (rc.empty()) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): codec encode of the reference "
+            "produced 0 frames; ignoring", this->id()));
+        continue;
+      }
+      if (_voice_ref_seconds > 0.0) {              // cap reference length
+        const std::size_t cap = static_cast<std::size_t>(
+            _voice_ref_seconds * _codec->sample_rate() / 1920.0);
+        if (cap >= 1 && rc.size() > cap) { rc.resize(cap); }
+      }
+      _ref_codes = std::move(rc);
+      _ref_set   = true;
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): cloned reference voice from {} samples "
+          "@ {} Hz -> {} codec frames", this->id(), n_in, rsr,
+          static_cast<int>(_ref_codes.size())));
+    }
   }
 
-  // 2. Greedy delay-pattern generation -> [G][1 + n_vq].
-  auto gen = _lm->generate_delay_greedy(prompt, _max_new_tokens);
+  // 1. Build the prompt grid [seq][1 + n_vq]: channel 0 = text/control id,
+  // channels 1..n_vq = audio codes. A clone reference (from iport1 above, or
+  // the voice_lock cache) splices into - Reference(s):; else None.
+  std::vector<std::vector<std::int32_t>> prompt = build_moss_grid_(
+      *_tokenizer, text, _lm->config(), _ref_set ? &_ref_codes : nullptr);
+  if (prompt.empty()) {
+    session()->warn(fmt(
+        "TextToSpeechStage('{}'): empty prompt grid for the text; "
+        "dropping beat", this->id()));
+    co_return;
+  }
+
+  // 2. Sampled delay-pattern generation -> [G][1 + n_vq]. Separate audio +
+  // text sampling (config; defaults = MossTTSDelay-8B recommendation). Greedy
+  // (temperature <= 0) degenerates into silent loops, so sampling is default.
+  genai::MossSampling audio_sp;
+  audio_sp.temperature        = static_cast<float>(_audio_temp);
+  audio_sp.top_k              = _audio_top_k;
+  audio_sp.top_p              = static_cast<float>(_audio_top_p);
+  audio_sp.repetition_penalty = static_cast<float>(_audio_rep);
+  genai::MossSampling text_sp;
+  text_sp.temperature        = static_cast<float>(_text_temp);
+  text_sp.top_k              = _text_top_k;
+  text_sp.top_p              = static_cast<float>(_text_top_p);
+  text_sp.repetition_penalty = static_cast<float>(_text_rep);
+  auto gen = _lm->generate_delay(prompt, _max_new_tokens, audio_sp, text_sp,
+                                 _sampler_seed);
   const auto t_gen = clock::now();
   if (gen.empty()) {
     session()->warn(fmt(
@@ -419,6 +700,24 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     co_return;
   }
 
+  // 3b. voice_lock (design-once): cache the FIRST generated voice and reuse it
+  // as the clone reference for later beats, so the timbre stays consistent
+  // across texts. An external iport reference (above) takes precedence (it
+  // sets _ref_set), so this only fires until a voice is locked.
+  if (_voice_lock && !_ref_set) {
+    _ref_codes = codes;                            // copy (codes is decoded next)
+    if (_voice_ref_seconds > 0.0) {
+      const std::size_t cap = static_cast<std::size_t>(
+          _voice_ref_seconds * _codec->sample_rate() / 1920.0);
+      if (cap >= 1 && _ref_codes.size() > cap) { _ref_codes.resize(cap); }
+    }
+    _ref_set = true;
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): voice_lock engaged -- {} frames cached as "
+        "the reference for subsequent beats", this->id(),
+        static_cast<int>(_ref_codes.size())));
+  }
+
   // 4. Codec decode -> [T*1920] f32 PCM @ sample_rate.
   std::vector<float> wave = _codec->decode(codes, nullptr);
   const int sr = _codec->sample_rate();
@@ -450,12 +749,13 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     return std::chrono::duration<double, std::milli>(d).count();
   };
   session()->info(fmt(
-      "TextToSpeechStage('{}'): {} chars -> {} prompt ids -> {} gen rows "
+      "TextToSpeechStage('{}'): {} chars -> {} prompt rows{} -> {} gen rows "
       "-> {} frames -> {} PCM samples = {:.2f}s @ {} Hz, peak={:.3f} "
       "({} ms gen + {} ms decode)",
       this->id(),
       static_cast<int>(text.size()),
-      static_cast<int>(ids.size()), Gg,
+      static_cast<int>(prompt.size()),
+      _ref_set ? " (cloned)" : "", Gg,
       static_cast<int>(codes.size()), wave.size(),
       wave.size() / static_cast<double>(sr), sr, peak,
       static_cast<int>(ms(t_gen - t_start)),

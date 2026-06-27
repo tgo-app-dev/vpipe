@@ -506,4 +506,33 @@ OportBuffer::WriteAwaiter::await_resume()
   // is free.
 }
 
+bool
+OportBuffer::push_sync(unique_ptr<BeatPayloadIntf> t)
+{
+  vector<coroutine_handle<>>          wake_readers;
+  vector<shared_ptr<MultiReadWaiter>> wake_multi;
+  bool open = true;
+  {
+    lock_guard<mutex> lk(_mu);
+    auto r = push_locked_(t);
+    if (r.success) {
+      wake_readers = std::move(r.wake_readers);
+      wake_multi   = std::move(r.wake_multi);
+    } else if (r.closed) {
+      open = false;
+    }
+    // Backpressure-full / soft-error threshold: push_locked_ leaves
+    // `t` untouched. A plain thread cannot suspend to wait for space,
+    // so the payload is dropped here (t's destructor) and the buffer
+    // stays open.
+  }
+  for (auto h : wake_readers) {
+    session()->thread_pool()->schedule(h);
+  }
+  for (auto& m : wake_multi) {
+    m->notify();
+  }
+  return open;
+}
+
 }

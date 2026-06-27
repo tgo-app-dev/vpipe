@@ -138,6 +138,7 @@ TEST(model_catalog, gguf_entry_pins_quant_and_companions) {
 // can't disambiguate the shared repo, so resolve via catalog_find.
 TEST(model_catalog, supplement_archive_entries) {
   struct Want {
+    const char* family;
     const char* version;
     const char* param_class;
     const char* variant;
@@ -146,19 +147,26 @@ TEST(model_catalog, supplement_archive_entries) {
     const char* tar;
   };
   const Want wants[] = {
-    {"3.5", "4B", "Vision tower CoreML 512x320 w8 (vpipe-supplement)",
+    {"Qwen", "3.5", "4B", "Vision tower CoreML 512x320 w8 (vpipe-supplement)",
      "qwen3.5-vision-encoder", "qwen3_5_mlx_4b_vision_vid_512x320",
      "qwen3_5_mlx_4b_vision_vid_512x320_w8.tar"},
-    {"L", "1024x640", "CoreML w8 (vpipe-supplement)",
+    {"Qwen", "3.5", "4B", "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
+     "qwen3.5-vision-encoder", "qwen3_5_mlx_4b_vision_vid_768x480",
+     "qwen3_5_mlx_4b_vision_vid_768x480_w8.tar"},
+    {"Gemma", "4", "e4b", "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
+     "gemma4-vision-encoder", "gemma4_mlx_e4b_vision_768x480",
+     "gemma4_mlx_e4b_vision_768x480_w8.tar"},
+    {"YOLOX", "L", "1024x640", "CoreML w8 (vpipe-supplement)",
      "yolo", "yolox_l_1024x640", "yolox_l_1024x640_w8.tar"},
-    {"VAD v6", "unified", "CoreML (vpipe-supplement)",
+    {"Silero", "VAD v6", "unified", "CoreML (vpipe-supplement)",
      "silero-vad", "silero_vad_unified_v6", "silero-vad-unified-v6.tar"},
+    {"BEATs", "iter3+", "AS2M",
+     "Audio tagging CoreML 10s (vpipe-supplement)",
+     "audio-tagging", "beats_as2m_10s", "beats_as2m_10s.tar"},
   };
   for (const Want& w : wants) {
-    const char* family = (w.model_type[0] == 'q') ? "Qwen"
-                       : (w.model_type[0] == 'y') ? "YOLOX" : "Silero";
     const ModelCatalogEntry* e =
-        catalog_find(family, w.version, w.param_class, w.variant);
+        catalog_find(w.family, w.version, w.param_class, w.variant);
     EXPECT_TRUE(e != nullptr);
     EXPECT_TRUE(e->hf_path == "tgo-app-dev/vpipe-supplement");
     EXPECT_TRUE(e->model_type == w.model_type);

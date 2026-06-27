@@ -41,6 +41,15 @@ public:
                   const metal_compute::SharedBuffer* q6k, int hidden,
                   bool bf16 = false);
 
+  // Native raw k-quant embedding table that is Q6_K *or* Q4_K (untied
+  // checkpoints whose token_embd is Q4_K -- the separate Q6_K output.weight
+  // is the lm_head). Picks embed_gather_q4k_f16 / embed_gather_q6k_f16; the
+  // 5-arg signature disambiguates from the 4-arg Q6_K ctor above. `kq` is
+  // the raw [vocab, hidden] k-quant table (must outlive the muxer).
+  MetalTokenMuxer(metal_compute::MetalCompute* mc,
+                  const metal_compute::SharedBuffer* kq, int hidden,
+                  bool bf16, bool table_is_q4k);
+
   bool valid() const noexcept;
 
   // Gather + dequantize the rows for `ids` into a fresh [n, hidden]

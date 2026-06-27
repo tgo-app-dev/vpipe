@@ -518,11 +518,14 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "models_db", .type = ConfigType::String,
    .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
   {.key = "coreml_vision_path", .type = ConfigType::String,
-   .doc = "pre-converted CoreML vision tower: a models-DB key (registered "
-          "by model-fetch) or an mlpackage path; a DB key wins over a "
-          "same-named path",
+   .doc = "pre-converted CoreML vision tower (Qwen3.5-VL OR Gemma-4 "
+          "soft-token export): a models-DB key (registered by model-fetch) "
+          "or an mlpackage path; a DB key wins over a same-named path. When "
+          "set it replaces the GPU vision tower and the model's own input "
+          "size/format govern preprocessing, so vlm_input_width/height and "
+          "vlm_max_soft_tokens are ignored.",
    .def_str = "", .suggest_db = "models",
-   .suggest_db_type = "qwen3.5-vision-encoder"},
+   .suggest_db_type = "qwen3.5-vision-encoder,gemma4-vision-encoder"},
   {.key = "compute_dtype", .type = ConfigType::String,
    .doc = "bf16 | f16 | f32", .def_str = "bf16"},
   {.key = "language", .type = ConfigType::String,
@@ -536,16 +539,19 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "vlm_input_width", .type = ConfigType::Int,
    .doc = "fixed VLM input width; GPU letterbox-resample to this (with "
           "vlm_input_height) when the tower is GPU (not CoreML). 0 = "
-          "native", .def_int = 0},
+          "native. Ignored when coreml_vision_path is set (the CoreML "
+          "model letterboxes to its own fixed input size).", .def_int = 0},
   {.key = "vlm_input_height", .type = ConfigType::Int,
-   .doc = "fixed VLM input height; see vlm_input_width. 0 = native",
-   .def_int = 0},
+   .doc = "fixed VLM input height; see vlm_input_width. 0 = native. "
+          "Ignored when coreml_vision_path is set.", .def_int = 0},
   {.key = "vlm_max_soft_tokens", .type = ConfigType::Int,
    .doc = "per-frame vision soft-token budget. 0 = encoder still/default "
           "image budget (best detail). A positive value caps tokens/frame "
           "to trade detail for prefill speed. Mainly affects Gemma-4 (its "
           "dense-video budget ~64 tok/frame was too coarse for wide camera "
-          "frames). E.g. 64 restores the old coarse Gemma video budget.",
+          "frames). E.g. 64 restores the old coarse Gemma video budget. "
+          "Ignored when coreml_vision_path is set (the CoreML model's "
+          "output token count is fixed).",
    .def_int = 0},
   {.key = "max_frame_gap_ms", .type = ConfigType::Int,
    .doc = "inter-frame gap (ms) that closes a scene", .def_int = 10000},
@@ -739,6 +745,26 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
         "scenes will close without answers",
         this->id(), _lm->config().architecture));
   }
+  // Realtime decode must stay SHORT: forbid the model's reasoning-channel
+  // open tokens so it can't burn the budget on a <|channel>thought
+  // ...<channel|> block (Gemma-4 is a reasoning checkpoint; thinking is
+  // always disabled for realtime-vqa). The LM masks these logits across
+  // prefill + every decode path; we keep the list to also mask the batched
+  // per-question decode host-side. No-op for families without these tokens
+  // (the special ids resolve to -1). sanitize_output() still runs as a
+  // belt-and-suspenders strip.
+  _m_suppress_ids.clear();
+  for (const char* t : {"<|channel>", "<|think|>"}) {
+    const std::int32_t id = _lm->tokenizer().special_token_id(t);
+    if (id >= 0) { _m_suppress_ids.push_back(id); }
+  }
+  if (!_m_suppress_ids.empty()) {
+    _lm->set_suppressed_tokens(_m_suppress_ids);
+    session()->info(fmt(
+        "RealtimeVqaStage('{}'): [metal] banning {} reasoning-channel "
+        "token(s) to keep realtime decode short",
+        this->id(), _m_suppress_ids.size()));
+  }
   _mvis = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
   _mgaud = _lm->metal_gemma4_audio_encoder();
@@ -750,24 +776,13 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
         "(model has no vision config?); frames will be dropped",
         this->id()));
   }
-  // The Gemma ViT resizes the frame INTERNALLY to its soft-token budget
-  // (vlm_max_soft_tokens), so a fixed vlm_input_width/height that is
-  // SMALLER than that budget grid just pre-downscales the frame -> less
-  // detail at no encode-cost saving (the grid, hence cost, is set by the
-  // budget regardless of input size). vlm_input is meant for fixed-input
-  // towers (CoreML). For Gemma, prefer native frames (unset vlm_input) or
-  // set it at/above the budget grid. One-time hint, not a hard error.
-  if (_mgvis && _vlm_in_w > 0 && _vlm_in_h > 0) {
-    session()->warn(fmt(
-        "RealtimeVqaStage('{}'): vlm_input_width/height ({}x{}) pre-"
-        "downscales frames, but the Gemma ViT resizes internally to its "
-        "vlm_max_soft_tokens budget -- a small vlm_input only loses "
-        "detail (no cost saving). Consider unsetting vlm_input (use "
-        "native frames) for best Gemma quality.",
-        this->id(), _vlm_in_w, _vlm_in_h));
-  }
-  // Optional CoreML vision tower override (host-f32 + metal-compute
-  // letterbox preproc). When it loads it takes priority over _mvis.
+  // Optional CoreML vision tower override (native-f16 rows + metal-compute
+  // letterbox preproc). Works for either family -- a Qwen3.5-VL tower or a
+  // Gemma-4 soft-token export; when it loads it takes priority over the GPU
+  // tower (_mvis / _mgvis), letterboxes each frame to its OWN fixed input
+  // size/format, and produces a fixed soft-token count -- so the GPU-tower
+  // knobs (vlm_input_width/height, vlm_max_soft_tokens) no longer apply.
+  // Loaded BEFORE the vlm_input hint below so that hint stays quiet here.
   if (!_coreml_vision_path.empty()) {
     genai::CoreMLVisionEncoder::LoadSpec cm;
     cm.mlpackage_path =
@@ -788,6 +803,23 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
           "'{}' failed; falling back to the metal MLX-free tower",
           this->id(), _coreml_vision_path));
     }
+  }
+  // The Gemma ViT resizes the frame INTERNALLY to its soft-token budget
+  // (vlm_max_soft_tokens), so a fixed vlm_input_width/height that is
+  // SMALLER than that budget grid just pre-downscales the frame -> less
+  // detail at no encode-cost saving (the grid, hence cost, is set by the
+  // budget regardless of input size). vlm_input is meant for fixed-input
+  // towers (CoreML). For Gemma, prefer native frames (unset vlm_input) or
+  // set it at/above the budget grid. One-time hint, not a hard error.
+  // Suppressed when a CoreML tower is active (it owns preprocessing).
+  if (_mgvis && !_m_coreml && _vlm_in_w > 0 && _vlm_in_h > 0) {
+    session()->warn(fmt(
+        "RealtimeVqaStage('{}'): vlm_input_width/height ({}x{}) pre-"
+        "downscales frames, but the Gemma ViT resizes internally to its "
+        "vlm_max_soft_tokens budget -- a small vlm_input only loses "
+        "detail (no cost saving). Consider unsetting vlm_input (use "
+        "native frames) for best Gemma quality.",
+        this->id(), _vlm_in_w, _vlm_in_h));
   }
   session()->info(fmt(
       "RealtimeVqaStage('{}'): [metal/no-MLX] model ready ({} layers, "
@@ -1457,6 +1489,11 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
       this->id(), produced, dec_s,
       dec_s > 0.0 ? static_cast<double>(produced) / dec_s : 0.0,
       argmax ? "" : " [sampled]"));
+  // Strip any reasoning channel the model emitted (thinking is always
+  // disabled for realtime-vqa; Gemma-4 can still leak a <|channel>thought
+  // ...<channel|> block on multi-part prompts). No-op for non-reasoning
+  // families.
+  if (tpl) { out = tpl->sanitize_output(std::move(out)); }
   return out;
 }
 
@@ -1601,7 +1638,13 @@ RealtimeVqaStage::m_decode_batched_sync_(
     ++total_steps;
     for (std::size_t a = 0; a < active_idx.size(); ++a) {
       BState& b = st[active_idx[a]];
-      const float* row = logits.data() + a * static_cast<std::size_t>(vocab);
+      float* row = logits.data() + a * static_cast<std::size_t>(vocab);
+      // Keep realtime decode short: ban the reasoning-channel tokens (the
+      // GPU mask already covers each branch's prefill first token; this
+      // covers the host-sampled continuation). -6e4 == the kernel sentinel.
+      for (std::int32_t id : _m_suppress_ids) {
+        if (id >= 0 && id < vocab) { row[id] = -6.0e4f; }
+      }
       b.cur = b.sampler.sample(std::span<const float>(
           row, static_cast<std::size_t>(vocab)));
     }
@@ -1993,7 +2036,10 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       && _lm->m_batched_decode_supported()) {
     auto a = m_decode_batched_(children);
     for (std::size_t k = 0; k < children.size() && k < a.size(); ++k) {
-      answers[qidx[k]] = std::move(a[k]);
+      // Strip any leaked reasoning channel (thinking is disabled here; the
+      // serial m_decode_ fallback below already sanitizes its own output).
+      answers[qidx[k]] = tpl ? tpl->sanitize_output(std::move(a[k]))
+                             : std::move(a[k]);
     }
   } else {
     // Serial per-question fallback (batched unavailable: <2 questions, config

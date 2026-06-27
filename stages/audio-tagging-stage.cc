@@ -1,6 +1,8 @@
 #include "stages/audio-tagging-stage.h"
 
+#include "stages/beats-audioset-labels.h"
 #include "stages/ced-audioset-labels.h"
+#include "stages/model-registry.h"
 #include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "apple-silicon/tensor-beat.h"
@@ -96,6 +98,34 @@ half_to_float_(std::uint16_t h)
   return out;
 }
 
+// Per-model-kind window/hop defaults + label table. `model_kind`
+// selects one; the window/hop are overridable by explicit config. Both
+// tables hold 527 AudioSet names but in DIFFERENT orders (the BEATs
+// output order is permuted vs the CSV/CED order), so the table must
+// match the model -- a wrong pairing silently mislabels every tag. The
+// input/output feature names are NOT here: they are read from the
+// CoreML model at load time (single-I/O models, no ambiguity).
+struct ModelProfile {
+  const char*        kind;
+  double             window_seconds;
+  double             hop_seconds;
+  const char* const* labels;
+  int                label_count;
+};
+const ModelProfile kBeatsProfile = {
+    "beats", 10.0, 8.0, kBeatsAudiosetLabels, kBeatsAudiosetLabelCount };
+const ModelProfile kCedProfile = {
+    "ced", 5.0, 4.0, kCedAudiosetLabels, kCedAudiosetLabelCount };
+
+// Resolve a model_kind string to its profile; nullptr if unknown.
+const ModelProfile*
+profile_for_(string_view kind)
+{
+  if (kind == "beats") { return &kBeatsProfile; }
+  if (kind == "ced")   { return &kCedProfile; }
+  return nullptr;
+}
+
 }
 
 AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
@@ -114,10 +144,34 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
   // must construct for any config so a graph can be built/edited first.
   // Attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
-  _model_path          = attr_str("model_path");
-  _input_feature_name  = attr_str("input_feature_name");
-  _output_feature_name = attr_str("output_feature_name");
-  _compute_units       = static_cast<int>(attr_int("compute_units"));
+  //
+  // Resolve the model family first: it selects the label table and the
+  // window/hop defaults used below when the config leaves them unset.
+  _model_kind = attr_str("model_kind");
+  const ModelProfile* prof = profile_for_(_model_kind);
+  if (!prof) {
+    fail_config(fmt(
+        "AudioTaggingStage('{}'): model_kind '{}' unknown (expected "
+        "\"beats\" or \"ced\")", this->id(), _model_kind));
+    prof = &kBeatsProfile;  // keep a valid table for the rest of the ctor
+  }
+  _labels      = prof->labels;
+  _label_count = prof->label_count;
+
+  // True iff `key` was explicitly provided in this stage's config (vs.
+  // defaulted). The window/hop fall back to the model_kind profile --
+  // not the generic schema default -- when left unset.
+  const FlexData& cfg = this->config();
+  auto explicit_ = [&](const char* key) {
+    return cfg.is_object() && cfg.as_object().contains(key);
+  };
+
+  _model_path    = attr_str("model_path");
+  _models_db     = attr_str("models_db");
+  if (_models_db.empty()) {
+    _models_db = "models";
+  }
+  _compute_units = static_cast<int>(attr_int("compute_units"));
   {
     int64_t v = attr_int("sample_rate");
     if (v < 8000 || v > 48000) {
@@ -128,7 +182,8 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
     _sample_rate = static_cast<int>(v);
   }
   {
-    double v = attr_real("window_seconds");
+    double v = explicit_("window_seconds") ? attr_real("window_seconds")
+                                           : prof->window_seconds;
     if (v <= 0.0 || v > 60.0) {
       fail_config(fmt(
           "AudioTaggingStage('{}'): window_seconds {} outside "
@@ -137,7 +192,8 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
     _window_seconds = v;
   }
   {
-    double v = attr_real("hop_seconds");
+    double v = explicit_("hop_seconds") ? attr_real("hop_seconds")
+                                        : prof->hop_seconds;
     if (v <= 0.0 || v > _window_seconds) {
       fail_config(fmt(
           "AudioTaggingStage('{}'): hop_seconds {} outside "
@@ -152,8 +208,7 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
           "AudioTaggingStage('{}'): top_k must be >= 1 (got {})",
           this->id(), v));
     }
-    _top_k = static_cast<int>(std::min<int64_t>(
-        v, kCedAudiosetLabelCount));
+    _top_k = static_cast<int>(std::min<int64_t>(v, _label_count));
   }
   {
     double v = attr_real("score_threshold");
@@ -168,7 +223,7 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
   if (_model_path.empty()) {
     fail_config(fmt(
         "AudioTaggingStage('{}'): config.model_path is required "
-        "(path to the CED-base .mlpackage / .mlmodelc)",
+        "(path to the AudioSet tagger .mlpackage / .mlmodelc)",
         this->id()));
   }
 
@@ -190,19 +245,24 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "model_path", .type = ConfigType::String, .required = true,
-   .doc = "CED-base .mlpackage / .mlmodelc dir"},
-  {.key = "input_feature_name", .type = ConfigType::String,
-   .doc = "model input feature name", .def_str = "waveform"},
-  {.key = "output_feature_name", .type = ConfigType::String,
-   .doc = "model output feature name", .def_str = "probabilities"},
+   .doc = "AudioSet tagger: a models-DB key (registered by model-fetch, "
+          "e.g. the BEATs supplement model) or a .mlpackage / .mlmodelc "
+          "dir; a DB key wins over a same-named path",
+   .suggest_db = "models", .suggest_db_type = "audio-tagging"},
+  {.key = "models_db", .type = ConfigType::String,
+   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+  {.key = "model_kind", .type = ConfigType::String,
+   .doc = "model family: \"beats\" | \"ced\" (sets label table + "
+          "shape defaults)", .def_str = "beats"},
   {.key = "compute_units", .type = ConfigType::Int,
    .doc = "0=CPUOnly 1=CPU+GPU 2=All 3=CPU+ANE", .def_int = 2},
   {.key = "sample_rate", .type = ConfigType::Int,
    .doc = "expected input rate Hz, [8000,48000]", .def_int = 16000},
   {.key = "window_seconds", .type = ConfigType::Real,
-   .doc = "window length s, (0,60]", .def_real = 5.0},
+   .doc = "window length s, (0,60] (beats:10 ced:5)", .def_real = 10.0},
   {.key = "hop_seconds", .type = ConfigType::Real,
-   .doc = "advance per run s, (0,window_seconds]", .def_real = 4.0},
+   .doc = "advance per run s, (0,window] (beats:8 ced:4)",
+   .def_real = 8.0},
   {.key = "top_k", .type = ConfigType::Int,
    .doc = "tags per window, >= 1", .def_int = 5},
   {.key = "score_threshold", .type = ConfigType::Real,
@@ -223,8 +283,9 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "audio-tagging",
-  .doc       = "Runs the CED-base AudioSet tagger (CoreML) over a sliding "
-               "PCM window and emits top-k class tags per window.",
+  .doc       = "Runs an AudioSet tagger (CoreML; CED-base or BEATs, per "
+               "model_kind) over a sliding PCM window and emits top-k "
+               "class tags per window.",
   .display_name = "Audio Tagging",
   .category  = StageCategory::Audio,
   .iports    = kIports,
@@ -259,6 +320,9 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
         "AudioTaggingStage('{}'): session has no CoreML model manager "
         "(build without VPIPE_BUILD_APPLE_SILICON?)", this->id()));
   }
+  // A models-DB key (e.g. the model-fetch'd BEATs supplement model)
+  // resolves to its unpacked .mlpackage; a plain path passes through.
+  _model_path = resolve_model_dir(session(), _models_db, _model_path);
   _loaded = mgr->load(_model_path, _compute_units);
   if (!_loaded) {
     session()->error(fmt(
@@ -266,10 +330,24 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
         "prior log entries)", this->id(), _model_path));
   }
 
+  // Derive the input/output feature names from the model itself: these
+  // taggers have exactly one input and one output, so there is no
+  // ambiguity and nothing to configure.
+  const auto& in_names  = _loaded->input_names();
+  const auto& out_names = _loaded->output_names();
+  if (in_names.size() != 1 || out_names.size() != 1) {
+    session()->error(fmt(
+        "AudioTaggingStage('{}'): expected exactly one input and one "
+        "output feature, but model '{}' has {} input(s) / {} output(s)",
+        this->id(), _model_path, in_names.size(), out_names.size()));
+  }
+  _input_feature_name  = in_names.empty()  ? std::string() : in_names[0];
+  _output_feature_name = out_names.empty() ? std::string() : out_names[0];
+
   // Number of output classes: from the model's fixed output shape when
   // available, else the embedded label count. Mismatch is non-fatal --
   // label lookup guards out-of-range indices.
-  _n_classes = kCedAudiosetLabelCount;
+  _n_classes = _label_count;
   auto it = _loaded->output_descs().find(_output_feature_name);
   if (it != _loaded->output_descs().end() && it->second.fixed) {
     int64_t prod = 1;
@@ -280,12 +358,12 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
       _n_classes = static_cast<int>(prod);
     }
   }
-  if (_n_classes != kCedAudiosetLabelCount) {
+  if (_n_classes != _label_count) {
     session()->warn(fmt(
         "AudioTaggingStage('{}'): model reports {} output classes but "
-        "{} labels are embedded; indices >= {} will be unnamed",
-        this->id(), _n_classes, kCedAudiosetLabelCount,
-        kCedAudiosetLabelCount));
+        "{} labels are embedded ({}); indices >= {} will be unnamed",
+        this->id(), _n_classes, _label_count, _model_kind,
+        _label_count));
   }
 
   auto* pool = NS::AutoreleasePool::alloc()->init();
@@ -295,10 +373,11 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
   pool->release();
 
   session()->info(fmt(
-      "AudioTaggingStage('{}'): model ready ({}); window={} samples "
-      "({:.1f}s) hop={} samples ({:.1f}s) overlap={:.1f}s, sr={} Hz, "
-      "top_k={}, classes={}",
-      this->id(), _model_path, _window_samples, _window_seconds,
+      "AudioTaggingStage('{}'): model ready (kind={}, {}); in='{}' "
+      "out='{}' window={} samples ({:.1f}s) hop={} samples ({:.1f}s) "
+      "overlap={:.1f}s, sr={} Hz, top_k={}, classes={}",
+      this->id(), _model_kind, _model_path, _input_feature_name,
+      _output_feature_name, _window_samples, _window_seconds,
       _hop_samples, _hop_seconds,
       _window_seconds - _hop_seconds, _sample_rate, _top_k,
       _n_classes));
@@ -387,9 +466,7 @@ AudioTaggingStage::process(RuntimeContext& ctx)
         }
       }
       const char* best_label =
-          (best >= 0 && best < kCedAudiosetLabelCount)
-              ? kCedAudiosetLabels[best]
-              : "?";
+          (best >= 0 && best < _label_count) ? _labels[best] : "?";
       session()->info(fmt(
           "AudioTaggingStage('{}'): window {} ts_us={} -> '{}' "
           "({:.2f})",
@@ -556,8 +633,8 @@ AudioTaggingStage::build_tags_(const std::vector<float>& probs,
     }
     FlexData t = FlexData::make_object();
     auto to = t.as_object();
-    const char* name = (idx >= 0 && idx < kCedAudiosetLabelCount)
-                           ? kCedAudiosetLabels[idx]
+    const char* name = (idx >= 0 && idx < _label_count)
+                           ? _labels[idx]
                            : "unknown";
     to.insert_or_assign("label", FlexData::make_string(name));
     to.insert_or_assign("index", FlexData::make_int(idx));

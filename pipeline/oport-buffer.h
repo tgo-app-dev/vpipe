@@ -127,6 +127,18 @@ public:
     return WriteAwaiter{this, std::move(t)};
   }
 
+  // Non-coroutine push for a producer running on a thread it owns
+  // (not a pool worker / coroutine), so it cannot co_await the
+  // WriteAwaiter. Performs the same push + reader-wakeup as
+  // WriteAwaiter's ready path. Returns false iff the buffer is closed
+  // -- the caller should stop producing. Intended for non-
+  // backpressure oports (DropOldest / no-consumer): a Backpressure
+  // oport that is momentarily full, or a default-mode soft-error,
+  // cannot suspend a plain thread, so the payload is dropped and the
+  // call still returns true (buffer open). Use the coroutine
+  // WriteAwaiter when backpressure must actually be honoured.
+  bool push_sync(std::unique_ptr<BeatPayloadIntf> t);
+
   // Producer signals end-of-stream. After close():
   //   * every suspended cursor reader is woken; their next
   //     read/peek/acquire returns null once their position

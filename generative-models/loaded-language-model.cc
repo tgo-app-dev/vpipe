@@ -291,6 +291,7 @@ LoadedLanguageModel::LoadedLanguageModel(
     const std::string& arch_be = _impl->weights.config.architecture;
     const bool metal_llama = arch_be == "LlamaForCausalLM";
     const bool metal_qwen = arch_be == "Qwen3_5ForConditionalGeneration"
+        || arch_be == "Qwen3_5MoeForConditionalGeneration"
         || arch_be == "Qwen3ASRForConditionalGeneration";
     const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
         || arch_be == "Gemma4UnifiedForConditionalGeneration";
@@ -1501,6 +1502,12 @@ void
 LoadedLanguageModel::set_mtp_prefix_seed(bool on)
 {
   if (_impl && _impl->exec) { _impl->exec->set_mtp_prefix_seed(on); }
+}
+
+void
+LoadedLanguageModel::set_suppressed_tokens(std::span<const std::int32_t> ids)
+{
+  if (_impl && _impl->exec) { _impl->exec->set_suppressed_tokens(ids); }
 }
 
 bool

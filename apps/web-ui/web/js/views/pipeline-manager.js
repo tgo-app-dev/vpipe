@@ -889,19 +889,64 @@ export function mountPipelineManager(container) {
         input.setAttribute('list', dlId);
         // When the schema also pins a model_type, ask the server to keep
         // only registry records of that type (e.g. a yolo-only field
-        // suggests just yolo models, not every registered model).
-        const dbQuery = { db: f.suggest_db };
-        if (f.suggest_db_type) {
-          dbQuery.value_field = 'model_type';
-          dbQuery.value_equals = f.suggest_db_type;
+        // suggests just yolo models, not every registered model). The
+        // schema may list SEVERAL types comma-separated (e.g. a vision
+        // tower usable by >1 LM family: "qwen3.5-vision-encoder,
+        // gemma4-vision-encoder"); each is queried and the results
+        // merged.
+        const allTypes = (f.suggest_db_type || '')
+          .split(',').map((s) => s.trim()).filter(Boolean);
+        // Leading-alpha family token: "qwen3.5-vision-encoder" -> "qwen",
+        // "gemma4-vision-encoder" -> "gemma".
+        const familyOf = (s) => (String(s).match(/^[a-z]+/i) || [''])[0]
+          .toLowerCase();
+        // Fill the datalist from the given list of model_types (empty ->
+        // no type filter, i.e. every key in the sub-db). De-dupes.
+        const fill = (types) => {
+          datalist.replaceChildren();
+          const queries = types.length
+            ? types.map((tp) => ({ db: f.suggest_db,
+                value_field: 'model_type', value_equals: tp }))
+            : [{ db: f.suggest_db }];
+          Promise.all(queries.map(
+              (q) => api.dbKeys(q).catch(() => null))).then((rs) => {
+            const seen = new Set();
+            for (const r of rs) {
+              const keys = (r && r.keys) ? r.keys : [];
+              for (const k of keys) {
+                const v = (k && (k.display ?? k.key)) || '';
+                if (v && !seen.has(v)) {
+                  seen.add(v);
+                  datalist.append(el('option', { value: v }));
+                }
+              }
+            }
+          });
+        };
+        // When more than one type is offered, narrow to the family of
+        // the LM chosen in the sibling hf_dir field (its value is the
+        // model's HF path, which carries the family name) so a Qwen LM
+        // suggests Qwen towers and a Gemma LM Gemma towers. Best-effort:
+        // an unrecognised / empty LM shows all; free text always works.
+        const refresh = () => {
+          if (allTypes.length <= 1) { fill(allTypes); return; }
+          const lm = document.getElementById('f_hf_dir');
+          const ref = lm && lm.value ? lm.value.toLowerCase() : '';
+          const fam = /gemma/.test(ref) ? 'gemma'
+                    : /qwen/.test(ref)  ? 'qwen' : '';
+          const narrowed = fam
+            ? allTypes.filter((tp) => familyOf(tp) === fam) : [];
+          fill(narrowed.length ? narrowed : allTypes);
+        };
+        refresh();
+        if (allTypes.length > 1) {
+          // The sibling hf_dir input may not exist yet while this field
+          // is being built; wire the re-narrow listener after this tick.
+          setTimeout(() => {
+            const lm = document.getElementById('f_hf_dir');
+            if (lm) { lm.addEventListener('input', refresh); }
+          }, 0);
         }
-        api.dbKeys(dbQuery).then((r) => {
-          const keys = (r && r.keys) ? r.keys : [];
-          for (const k of keys) {
-            const v = (k && (k.display ?? k.key)) || '';
-            if (v) { datalist.append(el('option', { value: v })); }
-          }
-        }).catch(() => {});
       }
       read = () => {
         const s = input.value;

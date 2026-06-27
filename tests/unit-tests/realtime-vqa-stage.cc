@@ -91,6 +91,27 @@ TEST(realtime_vqa_stage, config_defaults) {
   EXPECT_TRUE(s.scenes_closed() == 0u);
 }
 
+// The CoreML vision tower field is associated with BOTH the Qwen and
+// Gemma vision-encoder registry types, so the editor suggests either
+// family's model-fetch'd tower (the web-ui narrows by the selected LM)
+// and a configured models-DB key resolves to its unpacked .mlpackage.
+TEST(realtime_vqa_stage, coreml_vision_field_offers_both_families) {
+  Session sess;
+  CerrSilencer hush;
+  RealtimeVqaStage s(&sess, "rvqa", vector<InEdge>{}, basic_cfg_());
+  const ConfigKey* cv = nullptr;
+  for (const ConfigKey& k : s.spec().attrs) {
+    if (k.key == "coreml_vision_path") { cv = &k; break; }
+  }
+  ASSERT_TRUE(cv != nullptr);
+  EXPECT_TRUE(cv->suggest_db == "models");
+  const std::string_view types = cv->suggest_db_type;
+  EXPECT_TRUE(types.find("qwen3.5-vision-encoder")
+              != std::string_view::npos);
+  EXPECT_TRUE(types.find("gemma4-vision-encoder")
+              != std::string_view::npos);
+}
+
 TEST(realtime_vqa_stage, config_questions_array) {
   Session sess;
   CerrSilencer hush;

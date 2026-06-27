@@ -108,6 +108,10 @@ inline constexpr std::uint32_t kGvidLlmPrefill  = kPerfAuxGvidBase + 0u;
 inline constexpr std::uint32_t kGvidLlmDecode   = kPerfAuxGvidBase + 1u;
 inline constexpr std::uint32_t kGvidLlmVision   = kPerfAuxGvidBase + 2u;
 inline constexpr std::uint32_t kGvidLlmAudio    = kPerfAuxGvidBase + 3u;
+// Audio CODEC (TTS vocoder: MOSS Audio Tokenizer code->waveform decode).
+// Distinct from kGvidLlmAudio (an audio ENCODER, waveform->tokens) so a
+// text-to-speech timeline reads "audio-codec", not "audio-encoder".
+inline constexpr std::uint32_t kGvidLlmAudioCodec = kPerfAuxGvidBase + 4u;
 
 // Per-activity begin type ids (end = begin + 1, per the parity
 // convention). Distinct pairs so the begin/end pairing is unambiguous
@@ -116,6 +120,7 @@ inline constexpr std::uint32_t kPerfLlmPrefillBegin = 0u;
 inline constexpr std::uint32_t kPerfLlmDecodeBegin  = 2u;
 inline constexpr std::uint32_t kPerfLlmVisionBegin  = 4u;
 inline constexpr std::uint32_t kPerfLlmAudioBegin   = 6u;
+inline constexpr std::uint32_t kPerfLlmAudioCodecBegin = 8u;
 
 // The LLM-lane synthetic stages, consumed by dump_profiling to emit
 // `stages` entries (id = block label; begin/end named in the dump).
@@ -129,6 +134,7 @@ inline constexpr PerfAuxStageDesc kPerfAuxStages[] = {
   { kGvidLlmDecode,  kPerfLlmDecodeBegin,  "text-decode"   },
   { kGvidLlmVision,  kPerfLlmVisionBegin,  "vision-tower"  },
   { kGvidLlmAudio,   kPerfLlmAudioBegin,   "audio-encoder" },
+  { kGvidLlmAudioCodec, kPerfLlmAudioCodecBegin, "audio-codec" },
 };
 
 // ANE-lane CoreML predict begin/end (recorded with the real CoreML
