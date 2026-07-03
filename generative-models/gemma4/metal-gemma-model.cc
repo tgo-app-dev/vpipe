@@ -90,12 +90,42 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_mc = mc;
   const bool bf16 = cfg.use_bf16;
 
+  // Tensor-name prefix auto-detect. The MLX e4b checkpoints prefix the LM
+  // tensors "language_model.model." (the Config default); the raw-HF google
+  // checkpoints use "model.language_model.". Probe layer-0's input_layernorm
+  // under each candidate and adopt whichever exists (keep the default if
+  // neither/ambiguous). All subsequent binds read m->_cfg.weight_prefix.
+  {
+    const char* cand[] = {"language_model.model.", "model.language_model."};
+    for (const char* pfx : cand) {
+      if (wts->info(std::string(pfx) + "layers.0.input_layernorm.weight")
+          != nullptr) {
+        m->_cfg.weight_prefix = pfx;
+        break;
+      }
+    }
+  }
+  // Unquantized dense (raw-HF bf16/f16) detection: the linear weights ship as
+  // plain .weight tensors (BF16/F16/F32) with NO affine .scales. Probe a
+  // representative gate_proj (present on every layer). Dense routes the plain
+  // f16 GEMM/GEMV; the mlp_bits/embed_bits packing derivations below are
+  // meaningless for an unpacked weight, so they are skipped when _dense.
+  {
+    const auto* gp = wts->info(m->_cfg.weight_prefix +
+                               "layers.0.mlp.gate_proj.weight");
+    if (gp != nullptr && (gp->dtype == "BF16" || gp->dtype == "F16" ||
+                          gp->dtype == "F32")) {
+      m->_dense = true;
+    }
+  }
+
   // Mixed quant: derive the MLP bit width from the gate_proj packing
   // (out=ffn, in_packed = hidden*bits/32 u32 columns). gemma4_unified is
   // 8-bit MLP / 4-bit elsewhere; e4b is uniform. Falls back to quant_bits.
   int mlp_bits = cfg.quant_bits;
-  {
-    const auto* gi = wts->info(cfg.weight_prefix + "layers.0.mlp.gate_proj.weight");
+  if (!m->_dense) {
+    const auto* gi =
+        wts->info(m->_cfg.weight_prefix + "layers.0.mlp.gate_proj.weight");
     if (gi != nullptr && cfg.hidden > 0 && gi->shape.size() == 2) {
       const long wcols = gi->shape[1];
       const int derived = static_cast<int>((32 * wcols) / cfg.hidden);
@@ -108,8 +138,8 @@ MetalGemmaModel::load(const std::string& model_dir,
   // packing (gemma4_unified mlx checkpoints are 4-bit; the GGUF path keeps
   // it 8-bit over a 4-bit body). bits = 32 * w_cols / hidden.
   int embed_bits = cfg.quant_bits;
-  {
-    const auto* ei = wts->info(cfg.weight_prefix + "embed_tokens.weight");
+  if (!m->_dense) {
+    const auto* ei = wts->info(m->_cfg.weight_prefix + "embed_tokens.weight");
     if (ei != nullptr && cfg.hidden > 0 && ei->shape.size() == 2) {
       const long wcols = ei->shape[1];
       const int derived = static_cast<int>((32 * wcols) / cfg.hidden);
@@ -152,9 +182,10 @@ MetalGemmaModel::load(const std::string& model_dir,
   // token-exact. Memory-neutral: prefill's qw/kw/vw are re-pointed as subviews
   // of the concat (build_qkv) so there is no weight duplication. On by default
   // for uniform-4-bit checkpoints (e4b + realtime-vqa); VPIPE_GEMMA_NO_QKV_FUSE
-  // disables. 8-bit/mixed (gemma4_unified, OptiQ) fall back per layer.
-  m->_qkv_fuse = std::getenv("VPIPE_GEMMA_NO_QKV_FUSE") == nullptr
-              && cfg.quant_bits != 8;
+  // disables. Uniform 8-bit now fuses too (affine_qmv_qkv_w8g64, resolved via
+  // `g`); the validity guard below falls back per layer if the base-bits fused
+  // kernel is absent, and build_qkv's stride-multiple check guards mixed q/k/v.
+  m->_qkv_fuse = std::getenv("VPIPE_GEMMA_NO_QKV_FUSE") == nullptr;
   if (m->_qkv_fuse) {
     m->_fn_qmv_qkv = m->_lib_qmv.function("affine_qmv_qkv_" + g);
     if (!m->_fn_qmv_qkv.valid()) { m->_qkv_fuse = false; }
@@ -242,6 +273,25 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_dummy_disp = m->_lib_elt.function("dummy_disp_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
   m->_fn_copy = m->_lib_elt.function("copy_f16");
+  // Mixture-of-Experts (Gemma-4 26B-A4B): route/combine (reused from the Qwen
+  // MoE), the gemma per-expert scale, and the gate|up (gelu) + down expert
+  // gathers (affine w4/w8 + the raw-HF dense f16 twins). eg_bits is uniform
+  // (== quant_bits) for the gemma checkpoint, so the gather variant is chosen
+  // here once.
+  if (cfg.is_moe()) {
+    const std::string egb = (cfg.quant_bits == 8) ? "w8g64" : "w4g64";
+    m->_fn_moe_route = m->_lib_elt.function("moe_route_f16");
+    m->_fn_moe_expert_scale = m->_lib_elt.function("moe_expert_scale_f16");
+    m->_fn_moe_combine = m->_lib_elt.function("moe_combine_f16");
+    m->_fn_moe_gather_geglu =
+        m->_lib_qmv.function("affine_gather_qmv_geglu_" + egb);
+    m->_fn_moe_gather_down =
+        m->_lib_qmv.function("affine_gather_down_qmv_" + egb);
+    m->_fn_moe_gather_geglu_dense =
+        m->_lib_dense.function("dense_moe_gather_geglu_f16");
+    m->_fn_moe_gather_down_dense =
+        m->_lib_dense.function("dense_moe_gather_down_f16");
+  }
   // Embedding gather at embed_bits. Only the w8 g32 variant is new (the
   // GGUF path); the 4-bit / g64 names are the existing mlx-checkpoint ones.
   std::string embed_fn;
@@ -408,6 +458,18 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_dense_gemv = m->_lib_dense.function("dense_gemv_t_f16");
   m->_ple_gemv = m->_fn_dense_gemv.valid() &&
                  std::getenv("VPIPE_GEMMA_NO_PLE_GEMV") == nullptr;
+  // Dense (raw-HF bf16/f16) path: the full-precision embedding gather (tied
+  // lm_head + main/PLE embed tables read this f16 gather instead of the
+  // dequantizing affine one). The dense_t / dense_gemv above already cover the
+  // projection matmuls. Fail the load if the gather kernel is missing.
+  if (m->_dense) {
+    m->_qkv_fuse = false;          // no affine qkv row-concat for dense
+    m->_qkv_rms_fuse = false;
+    m->_fn_embed_dense = m->_lib_elt.function("embed_gather_f16");
+    if (!m->_fn_embed_dense.valid() || !m->_fn_dense_gemv.valid()) {
+      return nullptr;
+    }
+  }
   // 4-bit per_layer_projection (plp) by default: the checkpoint ships plp
   // 4-bit, but vpipe dequantized it to f16 -> read 4x the bytes (55MB vs 14MB
   // /tok across 42 layers). Native qmv/qmm matches omlx. (plm is BF16 in the
@@ -429,6 +491,17 @@ MetalGemmaModel::load(const std::string& model_dir,
       !m->_fn_argmax.valid() || !m->_fn_qmm.valid() ||
       !m->_fn_transpose.valid() || !m->_fn_row_scatter.valid()) {
     return nullptr;
+  }
+  if (cfg.is_moe()) {
+    const bool gather_ok = m->_dense
+        ? (m->_fn_moe_gather_geglu_dense.valid() &&
+           m->_fn_moe_gather_down_dense.valid())
+        : (m->_fn_moe_gather_geglu.valid() && m->_fn_moe_gather_down.valid());
+    if (!m->_fn_moe_route.valid() || !m->_fn_moe_expert_scale.valid() ||
+        !m->_fn_moe_combine.valid() || !m->_fn_dense_gemv.valid() ||
+        !gather_ok) {
+      return nullptr;
+    }
   }
   // Flash-decode-GQA serial attention (contiguous KV) -- OFF by default for
   // Gemma. Unlike Qwen/Llama (full attention, where GQA cuts the dominant KV
@@ -633,13 +706,18 @@ MetalGemmaModel::load(const std::string& model_dir,
     return out;
   };
 
-  const std::string& P = cfg.weight_prefix;   // "language_model.model."
+  const std::string& P = m->_cfg.weight_prefix;   // auto-detected above
 
   // ---- model-level weights ----------------------------------------
   // Per-Layer-Input (PLE) embeddings exist only when hpli > 0 (e4b). The
   // gemma4_unified 12B ships none of the PLE weights.
   const bool has_ple = cfg.hpli > 0;
-  if (m->_embed_is_q6k) {
+  if (m->_dense) {
+    // Raw-HF dense bf16/f16 tied embed table [vocab, H] -> full-precision f16
+    // gather (embed_gather_f16). tie_word_embeddings, so the lm_head reuses it.
+    m->_embed_dense = to_f16(P + "embed_tokens.weight");
+    if (m->_embed_dense.empty()) { return nullptr; }
+  } else if (m->_embed_is_q6k) {
     // Lossless raw Q6_K table: load it once; skip the affine8 requant
     // entirely (ensure_embed_ never runs -> the ~25% memory saving is real).
     m->_embed_q6k = wts->load(P + "embed_tokens.q6k", mc);
@@ -649,7 +727,13 @@ MetalGemmaModel::load(const std::string& model_dir,
     return nullptr;
   }
   if (has_ple) {
-    if (!qtri(P + "embed_tokens_per_layer", m->_ple_w, m->_ple_s, m->_ple_b)) {
+    if (m->_dense) {
+      // Dense per-layer embed table [vocab, nl*hpli] -> f16 dense (reuses the
+      // _ple_w slot; the dense forward gathers it with embed_gather_f16).
+      m->_ple_w = to_f16(P + "embed_tokens_per_layer.weight");
+      if (m->_ple_w.empty()) { return nullptr; }
+    } else if (!qtri(P + "embed_tokens_per_layer", m->_ple_w, m->_ple_s,
+                     m->_ple_b)) {
       return nullptr;
     }
     // per_layer_model_projection ships BF16 (not quantized) -> f16 dense.
@@ -711,12 +795,16 @@ MetalGemmaModel::load(const std::string& model_dir,
       (std::size_t)cfg.hidden * (std::size_t)mlp_bits / 32;    // u32/row
   const std::size_t gu_grow =
       (std::size_t)cfg.hidden / (std::size_t)qg;               // f16/row
+  // ffn_rows = the per-layer MLP intermediate (rows of gate/up). Uniform
+  // (== cfg.ffn_inner) for e4b / gemma4_unified, but the raw-HF E2B DOUBLES
+  // it on the KV-shared layers (use_double_wide_mlp) -- the interleave must
+  // size to the actual gate rows or it truncates the double-wide layers.
   auto interleave_gu = [&](const SharedBuffer& gw, const SharedBuffer& gs,
                            const SharedBuffer& gb, const SharedBuffer& uw,
                            const SharedBuffer& us, const SharedBuffer& ub,
                            SharedBuffer& ow, SharedBuffer& os,
-                           SharedBuffer& ob) -> bool {
-    const std::size_t Fc = (std::size_t)cfg.ffn_inner;
+                           SharedBuffer& ob, int ffn_rows) -> bool {
+    const std::size_t Fc = (std::size_t)ffn_rows;
     ow = mc->make_shared_buffer(2 * Fc * gu_wrow * 4);
     os = mc->make_shared_buffer(2 * Fc * gu_grow * 2);
     ob = mc->make_shared_buffer(2 * Fc * gu_grow * 2);
@@ -737,6 +825,66 @@ MetalGemmaModel::load(const std::string& model_dir,
       std::memcpy(osp + (2 * g + 1) * gu_grow, usp + g * gu_grow, gu_grow * 2);
       std::memcpy(obp + (2 * g) * gu_grow, gbp + g * gu_grow, gu_grow * 2);
       std::memcpy(obp + (2 * g + 1) * gu_grow, ubp + g * gu_grow, gu_grow * 2);
+    }
+    return true;
+  };
+
+  // ---- MoE expert gate|up interleave (Gemma-4 26B-A4B) -------------
+  // The gather kernels read the routed expert's gate|up as ONE interleaved
+  // slab [E, 2I, H] (out row 2i = gate feature i, 2i+1 = up feature i), the
+  // same (g0,u0,g1,u1) RPS=4 layout the dense-MLP interleave_gu produces. The
+  // affine twin interleaves two per-expert affine triples (gate, up) from the
+  // quantizer (each [E, I, H-packed]); the dense twin interleaves the raw-HF
+  // CONCATENATED slab [E, 2I, H] (gate rows [0:I], up rows [I:2I]).
+  auto interleave_moe_q = [&](int bits, const SharedBuffer& gw,
+                              const SharedBuffer& gs, const SharedBuffer& gb,
+                              const SharedBuffer& uw, const SharedBuffer& us,
+                              const SharedBuffer& ub, int E, int I,
+                              SharedBuffer& ow, SharedBuffer& os,
+                              SharedBuffer& ob) -> bool {
+    const std::size_t wr = (std::size_t)cfg.hidden * (std::size_t)bits / 32;
+    const std::size_t gr = (std::size_t)cfg.hidden / (std::size_t)qg;
+    ow = mc->make_shared_buffer((std::size_t)E * 2 * I * wr * 4);
+    os = mc->make_shared_buffer((std::size_t)E * 2 * I * gr * 2);
+    ob = mc->make_shared_buffer((std::size_t)E * 2 * I * gr * 2);
+    if (ow.empty() || os.empty() || ob.empty()) { return false; }
+    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
+    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
+    auto* owp = static_cast<std::uint32_t*>(ow.contents());
+    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
+    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
+    auto* osp = static_cast<std::uint16_t*>(os.contents());
+    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
+    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
+    auto* obp = static_cast<std::uint16_t*>(ob.contents());
+    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
+      const std::size_t wob = e * 2 * I * wr, gob = e * 2 * I * gr;
+      const std::size_t wib = e * I * wr, gib = e * I * gr;
+      for (std::size_t i = 0; i < (std::size_t)I; ++i) {
+        std::memcpy(owp + wob + (2 * i) * wr, gwp + wib + i * wr, wr * 4);
+        std::memcpy(owp + wob + (2 * i + 1) * wr, uwp + wib + i * wr, wr * 4);
+        std::memcpy(osp + gob + (2 * i) * gr, gsp + gib + i * gr, gr * 2);
+        std::memcpy(osp + gob + (2 * i + 1) * gr, usp + gib + i * gr, gr * 2);
+        std::memcpy(obp + gob + (2 * i) * gr, gbp + gib + i * gr, gr * 2);
+        std::memcpy(obp + gob + (2 * i + 1) * gr, ubp + gib + i * gr, gr * 2);
+      }
+    }
+    return true;
+  };
+  auto interleave_moe_dense = [&](const SharedBuffer& gu_cat, int E, int I,
+                                  SharedBuffer& ow) -> bool {
+    const std::size_t Hs = (std::size_t)cfg.hidden;
+    ow = mc->make_shared_buffer((std::size_t)E * 2 * I * Hs * 2);
+    if (ow.empty() || gu_cat.empty()) { return false; }
+    const auto* sp = static_cast<const std::uint16_t*>(gu_cat.contents());
+    auto* op = static_cast<std::uint16_t*>(ow.contents());
+    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
+      const std::size_t eb = e * 2 * I * Hs;
+      for (std::size_t i = 0; i < (std::size_t)I; ++i) {
+        std::memcpy(op + eb + (2 * i) * Hs, sp + eb + i * Hs, Hs * 2);
+        std::memcpy(op + eb + (2 * i + 1) * Hs,
+                    sp + eb + ((std::size_t)I + i) * Hs, Hs * 2);
+      }
     }
     return true;
   };
@@ -815,6 +963,7 @@ MetalGemmaModel::load(const std::string& model_dir,
     ly.is_full = cfg.layer_is_full(L);
     ly.head_dim = cfg.head_dim(L);
     ly.n_kv = cfg.n_kv(L);
+    ly.ffn = cfg.ffn_inner;     // dense overrides per-layer (double-wide)
     ly.k_eq_v = cfg.k_eq_v(L);
     const bool shared = (cfg.num_kv_shared > 0) && (L >= first_shared);
     if (shared) {
@@ -834,13 +983,53 @@ MetalGemmaModel::load(const std::string& model_dir,
       ly.post_pli_ln = to_f16(p + "post_per_layer_input_norm.weight");
     }
     ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
+    bool ok;
+    if (m->_dense) {
+      // Raw-HF dense bf16/f16: load each linear's plain [out,in] .weight into an
+      // elt buffer (no scales/biases). q/k/v/o/down/plg/plp reuse the affine
+      // slots; gate/up go to the dedicated dgate/dup (no interleave). No qkv
+      // fusion (build_qkv is a quant-packing trick). q/k/v stay separate.
+      ly.qw    = to_f16(p + "self_attn.q_proj.weight");
+      ly.ow    = to_f16(p + "self_attn.o_proj.weight");
+      ly.dgate = to_f16(p + "mlp.gate_proj.weight");
+      ly.dup   = to_f16(p + "mlp.up_proj.weight");
+      ly.dw    = to_f16(p + "mlp.down_proj.weight");
+      ok = !ly.qw.empty() && !ly.ow.empty() && !ly.dgate.empty() &&
+           !ly.dup.empty() && !ly.dw.empty();
+      // Per-layer MLP intermediate from the gate weight [ffn, H] byte size
+      // (the E2B KV-shared layers DOUBLE it -- use_double_wide_mlp).
+      if (ok && cfg.hidden > 0) {
+        ly.ffn = (int)(ly.dgate.byte_size() / ((std::size_t)cfg.hidden * 2));
+      }
+      if (has_ple) {
+        ly.plg_w = to_f16(p + "per_layer_input_gate.weight");
+        ly.plp_w = to_f16(p + "per_layer_projection.weight");
+        ok = ok && !ly.plg_w.empty() && !ly.plp_w.empty();
+      }
+      if (ly.kv_source < 0) {
+        ly.kw = to_f16(p + "self_attn.k_proj.weight");
+        ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
+        ok = ok && !ly.kw.empty() && !ly.k_norm.empty();
+        if (!ly.k_eq_v) {
+          ly.vw = to_f16(p + "self_attn.v_proj.weight");
+          ok = ok && !ly.vw.empty();
+        }
+      }
+    } else {
     SharedBuffer gw, gs, gb, uw, us, ub;   // freed after interleave
-    bool ok = qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb)
+    // Per-layer MLP intermediate from the packed gate rows (E2B DOUBLES it on
+    // the KV-shared layers -- use_double_wide_mlp). shape[0] = ffn out rows;
+    // uniform (== cfg.ffn_inner) for e4b / gemma4_unified.
+    {
+      const auto* gi = wts->info(p + "mlp.gate_proj.weight");
+      if (gi != nullptr && !gi->shape.empty()) { ly.ffn = (int)gi->shape[0]; }
+    }
+    ok = qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb)
            && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob)
            && qtri(p + "mlp.gate_proj", gw, gs, gb)
            && qtri(p + "mlp.up_proj", uw, us, ub)
            && interleave_gu(gw, gs, gb, uw, us, ub,
-                            ly.guw, ly.gus, ly.gub)
+                            ly.guw, ly.gus, ly.gub, ly.ffn)
            && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
     if (has_ple) {
       ok = ok
@@ -864,12 +1053,67 @@ MetalGemmaModel::load(const std::string& model_dir,
       if (ly.k_norm.empty()) { return nullptr; }
       if (m->_qkv_fuse) { build_qkv(ly); }   // concat for the fused decode GEMV
     }
+    }
     // layer_scalar [1] -> host float.
     {
       SharedBuffer ls = to_f16(p + "layer_scalar");
       if (ls.empty()) { return nullptr; }
       ly.layer_scalar =
           elt_to_f32_(*static_cast<const std::uint16_t*>(ls.contents()), bf16);
+    }
+    // ---- Mixture-of-Experts FFN (Gemma-4 26B-A4B) -------------------
+    // Alongside the dense MLP loaded above, every layer carries a MoE block:
+    // three extra FFN norms, a router (dense f16 proj [E,H] + folded pre-norm
+    // weight router_norm_w = scale/sqrt(H) + per_expert_scale [E]), and the
+    // routed experts (gate|up interleaved [E,2I,H] + down [E,H,I]) -- affine
+    // (quantizer output) or raw-HF dense f16.
+    if (cfg.is_moe()) {
+      const int E = cfg.n_experts, I = cfg.moe_inner, Hh = cfg.hidden;
+      ly.pre_ffn_ln_2   = to_f16(p + "pre_feedforward_layernorm_2.weight");
+      ly.post_ffn_ln_1  = to_f16(p + "post_feedforward_layernorm_1.weight");
+      ly.post_ffn_ln_2  = to_f16(p + "post_feedforward_layernorm_2.weight");
+      ly.router_proj    = to_f16(p + "router.proj.weight");        // f16 [E,H]
+      ly.per_expert_scale = to_f16(p + "router.per_expert_scale"); // f16 [E]
+      // Fold the router pre-norm (RMSNorm, NO weight) * router.scale *
+      // (1/sqrt(H)) into a single [H] weight the multiplicative rms kernel
+      // applies: router_norm_w[h] = scale[h] / sqrt(H).
+      SharedBuffer rscale = to_f16(p + "router.scale");            // [H]
+      bool moe_ok = !ly.pre_ffn_ln_2.empty() && !ly.post_ffn_ln_1.empty() &&
+                    !ly.post_ffn_ln_2.empty() && !ly.router_proj.empty() &&
+                    !ly.per_expert_scale.empty() && !rscale.empty();
+      if (moe_ok) {
+        ly.router_norm_w = mc->make_shared_buffer((std::size_t)Hh * 2);
+        moe_ok = !ly.router_norm_w.empty();
+        if (moe_ok) {
+          const float inv = 1.0f / std::sqrt((float)Hh);
+          const auto* s = static_cast<const std::uint16_t*>(rscale.contents());
+          auto* o = static_cast<std::uint16_t*>(ly.router_norm_w.contents());
+          for (int h = 0; h < Hh; ++h) {
+            o[h] = f32_to_elt_(elt_to_f32_(s[h], bf16) * inv, bf16);
+          }
+        }
+      }
+      if (m->_dense) {
+        // Raw-HF: experts.gate_up_proj [E,2I,H] CONCATENATED -> interleave;
+        // experts.down_proj [E,H,I] straight to f16.
+        SharedBuffer gu = to_f16(p + "experts.gate_up_proj");
+        moe_ok = moe_ok && !gu.empty() &&
+                 interleave_moe_dense(gu, E, I, ly.eguw);
+        ly.edw2 = to_f16(p + "experts.down_proj");
+        moe_ok = moe_ok && !ly.edw2.empty();
+      } else {
+        // Affine (quantizer output): per-expert gate/up/down triples. Experts
+        // are quantized at quant_bits; the gather variant was chosen to match.
+        ly.eg_bits = cfg.quant_bits;
+        SharedBuffer gw, gs, gb, uw, us, ub;
+        moe_ok = moe_ok &&
+                 qtri(p + "experts.gate_proj", gw, gs, gb) &&
+                 qtri(p + "experts.up_proj", uw, us, ub) &&
+                 interleave_moe_q(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
+                                  ly.eguw, ly.egus, ly.egub) &&
+                 qtri(p + "experts.down_proj", ly.edw2, ly.eds2, ly.edb2);
+      }
+      if (!moe_ok) { return nullptr; }
     }
     if (!ok || ly.in_ln.empty() || ly.post_attn_ln.empty() ||
         ly.pre_ffn_ln.empty() || ly.post_ffn_ln.empty() ||
@@ -878,6 +1122,11 @@ MetalGemmaModel::load(const std::string& model_dir,
       return nullptr;
     }
   }
+
+  // Max MLP intermediate across layers (E2B double-wide shared layers), used to
+  // size the shared MLP scratch (_d_act/_d_gate + prefill act/gate buffers).
+  m->_ffn_max = cfg.ffn_inner;
+  for (const auto& ly : m->_layers) { m->_ffn_max = std::max(m->_ffn_max, ly.ffn); }
 
   // Contiguous KV via the shared ContextManager: per-layer head_dim
   // (sliding 256 / full 512), cross-layer KV sharing (kv_source), and
@@ -967,6 +1216,13 @@ MetalGemmaModel::config_from(const ModelConfig& c)
   m.attention_k_eq_v   = c.gemma4.attention_k_eq_v;
   m.layer_n_kv_heads   = c.gemma4.layer_n_kv_heads;
   m.is_full_layer = c.gemma4.is_full_layer;
+  // Mixture-of-Experts (Gemma-4 26B-A4B): a per-layer MoE block alongside the
+  // dense MLP (config `enable_moe_block`, `num_experts`, `top_k_experts` ->
+  // num_experts_per_tok, `moe_intermediate_size`).
+  m.enable_moe = c.enable_moe_block;
+  m.n_experts  = c.num_experts;
+  m.top_k      = c.num_experts_per_tok;
+  m.moe_inner  = c.moe_intermediate_size;
   // Per-context KV is preallocated contiguous [Hkv, max_seq, head_dim]
   // per owned layer (no lazy growth), so a generous cap costs memory.
   // This is only the standalone/test default: the LM load path overrides
@@ -1191,8 +1447,24 @@ MetalGemmaModel::ensure_scratch_()
     }
   }
   _d_o = b(H);
-  _d_act = b(c.ffn_inner);   // fused gate/up+geglu output (no gate/up bufs)
+  // MLP scratch sized to the widest layer (E2B double-wide shared layers use
+  // 2x ffn_inner); e4b/gemma4_unified keep _ffn_max == ffn_inner.
+  const int ffn_scr = (_ffn_max > 0) ? _ffn_max : c.ffn_inner;
+  _d_act = b(ffn_scr);       // fused gate/up+geglu output (no gate/up bufs)
+  // Dense path runs gate/up as two separate GEMVs -> a private gate buffer.
+  if (_dense) { _d_gate = b(ffn_scr); }
   _d_mlp = b(H);
+  // MoE decode scratch (M=1). npair = top_k pairs (all input row 0).
+  if (c.is_moe()) {
+    const int E = c.n_experts, K = c.top_k, I = c.moe_inner;
+    _d_moe_logits = b((std::size_t)E);
+    _d_moe_ids  = _mc->make_shared_buffer((std::size_t)K * sizeof(std::int32_t));
+    _d_moe_w    = b((std::size_t)K);
+    _d_moe_act  = b((std::size_t)K * I);
+    _d_moe_part = b((std::size_t)K * H);
+    _d_moe_out  = b((std::size_t)H);
+    _d_moe_h1   = b((std::size_t)H);
+  }
   _d_ple = b(ple);
   _d_pleproj = b(ple);
   _d_pli = b(ple);
@@ -1295,6 +1567,16 @@ MetalGemmaModel::cm_for_(ContextId lm_cid)
   if (!cm.valid()) { return ContextId{}; }
   _ctxmap.emplace(lm_cid.v, cm);
   return cm;
+}
+
+int
+MetalGemmaModel::context_seq_len(ContextId lm_cid) const
+{
+  // Read-only: an unmapped context has no KV yet -- do NOT lazily
+  // materialize one just to report its length.
+  auto it = _ctxmap.find(lm_cid.v);
+  if (it == _ctxmap.end() || !_ctx) { return 0; }
+  return _ctx->seq_len_of(it->second);
 }
 
 void
@@ -1547,6 +1829,17 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_constant(5, Hd);
     enc.dispatch({(unsigned)Hd, 1, 1}, {256, 1, 1});
   };
+  // Dense (raw-HF) embedding gather: out[:] = table[id, :] over a plain f16
+  // [rows, Hd] table (main embed or the PLE per-layer table). Single token.
+  auto embed_gather_dense = [&](const SharedBuffer& table,
+                                const SharedBuffer& out, int Hd) {
+    enc.set_function(_fn_embed_dense);
+    enc.set_buffer(0, tokbuf, toff);
+    enc.set_buffer(1, table);
+    enc.set_buffer(2, out);
+    enc.set_constant(3, Hd);
+    enc.dispatch({(unsigned)Hd, 1, 1}, {256, 1, 1});
+  };
   // Native Q6_K gather/lm_head (GGUF path). `ids`[ntok] -> out[ntok, Hd];
   // lm_head GEMV reads the raw Q6_K table directly (no DRAM dequant).
   auto embed_q6k = [&](const SharedBuffer& ids, std::size_t ioff,
@@ -1653,7 +1946,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   // ---- embeddings + per-layer inputs (once per token) -------------
   if (skip_embed) {
     // embed gather stripped (timing-only): _d_x left stale
-  } else if (_embed_is_q6k) { embed_q6k(tokbuf, toff, _d_x, H, 1); }
+  } else if (_dense) { embed_gather_dense(_embed_dense, _d_x, H); }
+  else if (_embed_is_q6k) { embed_q6k(tokbuf, toff, _d_x, H, 1); }
   else { embed_gather(_embed_w, _embed_s, _embed_b, _d_x, H); }
   scale(_d_x, H, std::sqrt((float)H));                     // embed_scale
   // Diagnostic: fire N extra no-op dispatches/token to measure the per-launch
@@ -1679,8 +1973,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       enc.dispatch({256, 1, 1}, {256, 1, 1});
     }
   }
-  // Per-Layer-Input projection (e4b PLE only; gemma4_unified has no PLE).
-  if (do_ple && _ple_chunk_k > 0 && _ple_gemv) {
+  // Per-Layer-Input projection (e4b PLE only; gemma4_unified has no PLE). The
+  // pipelined (chunked) variant is affine-only; dense takes the plain branch.
+  if (do_ple && !_dense && _ple_chunk_k > 0 && _ple_gemv) {
     // Pipelined PLE (Design A): produce pli in per-chunk buffers so chunks
     // 1..N-1 overlap the layer chain (only chunk 0 gates layer 0). The chunk
     // GEMVs read a PRIVATE copy of _d_x (no WAR with the per-layer residual
@@ -1709,7 +2004,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     });
   } else if (do_ple) {
     DUP(DC_PLE, [&] {
-    embed_gather(_ple_w, _ple_s, _ple_b, _d_ple, ple);
+    if (_dense) { embed_gather_dense(_ple_w, _d_ple, ple); }
+    else { embed_gather(_ple_w, _ple_s, _ple_b, _d_ple, ple); }
     scale(_d_ple, ple, std::sqrt((float)hpli));            // ple scale
     // per_layer_model_projection proj[1,ple]=x[1,H]@W[ple,H]^T (BF16 weight).
     // M=1 f16 GEMV (full-bandwidth) by default; dense_t GEMM for A/B.
@@ -1796,6 +2092,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     // below) when not fused (shared layers, non-4-bit, or disabled).
     if (skip_proj) {
       // projection stripped: leave _d_q/_d_k/_d_v stale (timing-only)
+    } else if (_dense) {
+      DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.qw, _d_q, H, qd); });
     } else if (fuse_rms) {
       DUP(DC_PROJ, [&] { qmv_qkv_rms(ly, _d_x); });
     } else if (ly.qkv_fused) {
@@ -1838,7 +2136,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       }
     }
     if (ly.kv_source < 0) {
-      if (!ly.qkv_fused && !skip_proj) {         // k done in the fused GEMV
+      if (_dense && !skip_proj) {
+        DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.kw, _d_k, H, kd); });
+      } else if (!ly.qkv_fused && !skip_proj) {   // k done in the fused GEMV
         DUP(DC_PROJ, [&] { qmv(ly.kw, ly.ks, ly.kb, _d_hn, _d_k, H, kd); });
       }
       // values: k_eq_v full layers reuse the k_proj output (no v_proj), taking
@@ -1858,7 +2158,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       const bool fuse_rope_kv =
           _rope_kv_fuse && !ly.k_eq_v && !paged_full;
       if (!ly.k_eq_v && !fuse_rope_kv) {
-        if (!ly.qkv_fused && !skip_proj) {       // v done in the fused GEMV
+        if (_dense && !skip_proj) {
+          DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.vw, _d_v, H, kd); });
+        } else if (!ly.qkv_fused && !skip_proj) {  // v done in the fused GEMV
           DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
         }
         DUP(DC_NORM, [&] {
@@ -1866,7 +2168,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
                     invf, Hq, Hkv, D);
         });
       } else if (fuse_rope_kv) {
-        if (!ly.qkv_fused && !skip_proj) {       // v done in the fused GEMV
+        if (_dense && !skip_proj) {
+          DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.vw, _d_v, H, kd); });
+        } else if (!ly.qkv_fused && !skip_proj) {  // v done in the fused GEMV
           DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
         }
         DUP(DC_NORM, [&] {
@@ -1949,6 +2253,17 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         const bool use_pgqa = !use_mat && _pgqa_attn && Hkv > 0
             && (Hq % Hkv == 0) && G >= 1 && G <= 16 && (D % 128 == 0)
             && !_d_gqa_oacc.empty();
+        if (std::getenv("VPIPE_GEMMA_ATTN_DUMP") && kv_off >= 256) {
+          static int dumped_pf = 0;
+          if (dumped_pf < 4) {
+            std::fprintf(stderr,
+              "[attn-dump L=%2d GLOBAL ] paged_full kernel=%s G=%d D=%d\n",
+              L, use_mat ? "dec_mat(QK/PV)"
+                 : use_pgqa ? "sdpa_pgqa(vec)"
+                            : "sdpa_paged_causal(SCALAR)", G, D);
+            ++dumped_pf;
+          }
+        }
         if (use_mat) {
           // Materialized decode (omlx/MLX D=512 fallback): QK GEMV -> rowstat
           // -> PV GEMV -> merge. Split the QK/PV key scan for occupancy.
@@ -2280,16 +2595,112 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       }
     }
 
-    if (!skip_proj) {
+    if (!skip_proj && _dense) {
+      DUP(DC_PROJ, [&] { dense_gemv(_d_attn, ly.ow, _d_o, qd, H); });
+    } else if (!skip_proj) {
       DUP(DC_PROJ, [&] { qmv(ly.ow, ly.os, ly.ob, _d_attn, _d_o, qd, H); });
     }
     DUP(DC_NORM, [&] { rms_add(_d_o, ly.post_attn_ln, _d_x, 1, H); });  // += rms
 
+    // Gemma-4 hybrid dense+MoE FFN (M=1): a dense-MLP branch and a routed-MoE
+    // branch off the SAME post-attention residual _d_x, each normed on the way
+    // in and out, summed, normed, and residual-added with layer_scalar (see the
+    // layer forward in the header). Replaces the plain geglu-sandwich MLP.
+    if (c.is_moe()) {
+      const int E = c.n_experts, K = c.top_k, I = c.moe_inner;
+      const int ffnL = ly.ffn, np = K;
+      // Dense branch: _d_mlp = dense_mlp(pre_ffn_ln(residual)).
+      rms(_d_x, ly.pre_ffn_ln, _d_hn, 1, H);
+      if (_dense) {
+        dense_gemv(_d_hn, ly.dgate, _d_gate, H, ffnL);
+        dense_gemv(_d_hn, ly.dup, _d_act, H, ffnL);
+        geglu(_d_gate, _d_act, _d_act, ffnL);
+        dense_gemv(_d_act, ly.dw, _d_mlp, ffnL, H);
+      } else {
+        enc.set_function(_fn_qmv_geglu);
+        enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
+        enc.set_buffer(2, ly.gub); enc.set_buffer(3, _d_hn);
+        enc.set_buffer(4, _d_act); enc.set_constant(5, H);
+        enc.set_constant(6, 2 * ffnL);
+        enc.dispatch({32, (unsigned)(ffnL / 2), 1}, {32, 2, 1});
+        qmv_fn(_fn_qmv_mlp, ly.dw, ly.ds, ly.db, _d_act, _d_mlp, ffnL, H);
+      }
+      rms(_d_mlp, ly.post_ffn_ln_1, _d_moe_h1, 1, H);         // h1
+      // MoE branch: router on the RAW residual (folded pre-norm * scale/sqrtH).
+      rms(_d_x, ly.router_norm_w, _d_hn, 1, H);
+      dense_gemv(_d_hn, ly.router_proj, _d_moe_logits, H, E);
+      enc.set_function(_fn_moe_route);
+      enc.set_buffer(0, _d_moe_logits); enc.set_buffer(1, _d_moe_ids);
+      enc.set_buffer(2, _d_moe_w); enc.set_constant(3, E);
+      enc.set_constant(4, K); const int norm_tk = 1;
+      enc.set_constant(5, norm_tk);
+      enc.dispatch({32, 1, 1}, {32, 1, 1});
+      // w[i] *= per_expert_scale[ids[i]]
+      enc.set_function(_fn_moe_expert_scale);
+      enc.set_buffer(0, _d_moe_w); enc.set_buffer(1, ly.per_expert_scale);
+      enc.set_buffer(2, _d_moe_ids); enc.set_constant(3, np);
+      enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
+      // experts input hm = pre_ffn_ln_2(residual) -> _d_hn.
+      rms(_d_x, ly.pre_ffn_ln_2, _d_hn, 1, H);
+      // gathered gate|up + GeGLU -> act[np, I].
+      enc.set_function(_dense ? _fn_moe_gather_geglu_dense
+                              : _fn_moe_gather_geglu);
+      if (_dense) {
+        enc.set_buffer(0, ly.eguw); enc.set_buffer(1, _d_hn);
+        enc.set_buffer(2, _d_moe_act); enc.set_constant(3, H);
+        enc.set_constant(4, 2 * I); enc.set_buffer(5, _d_moe_ids);
+        enc.set_constant(6, K);
+      } else {
+        enc.set_buffer(0, ly.eguw); enc.set_buffer(1, ly.egus);
+        enc.set_buffer(2, ly.egub); enc.set_buffer(3, _d_hn);
+        enc.set_buffer(4, _d_moe_act); enc.set_constant(5, H);
+        enc.set_constant(6, 2 * I); enc.set_buffer(7, _d_moe_ids);
+        enc.set_constant(8, K);
+      }
+      enc.dispatch({32, (unsigned)(I / 2), (unsigned)np}, {32, 2, 1});
+      // gathered down -> part[np, H].
+      enc.set_function(_dense ? _fn_moe_gather_down_dense
+                              : _fn_moe_gather_down);
+      if (_dense) {
+        enc.set_buffer(0, ly.edw2); enc.set_buffer(1, _d_moe_act);
+        enc.set_buffer(2, _d_moe_part); enc.set_constant(3, I);
+        enc.set_constant(4, H); enc.set_buffer(5, _d_moe_ids);
+      } else {
+        enc.set_buffer(0, ly.edw2); enc.set_buffer(1, ly.eds2);
+        enc.set_buffer(2, ly.edb2); enc.set_buffer(3, _d_moe_act);
+        enc.set_buffer(4, _d_moe_part); enc.set_constant(5, I);
+        enc.set_constant(6, H); enc.set_buffer(7, _d_moe_ids);
+      }
+      enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
+      // combine -> _d_moe_out[H]; h2 = post_ffn_ln_2(moe_out) in place.
+      enc.set_function(_fn_moe_combine);
+      enc.set_buffer(0, _d_moe_part); enc.set_buffer(1, _d_moe_w);
+      enc.set_buffer(2, _d_moe_out); enc.set_constant(3, H);
+      enc.set_constant(4, K);
+      enc.dispatch({(unsigned)H, 1, 1}, {256, 1, 1});
+      rms(_d_moe_out, ly.post_ffn_ln_2, _d_moe_out, 1, H);   // h2
+      // h = h1 + h2; _d_x = (_d_x + rms(h, post_ffn_ln)) * layer_scalar.
+      residual(_d_moe_h1, _d_moe_out, _d_moe_out, H);
+      rms_add(_d_moe_out, ly.post_ffn_ln, _d_x, 1, H, ly.layer_scalar);
+    } else {
     // MLP (geglu sandwich).
     DUP(DC_NORM, [&] { rms(_d_x, ly.pre_ffn_ln, _d_hn, 1, H); });
     // Fused gate/up GEMV + GeGLU: one dispatch over the interleaved weight
     // writes gelu(gate)*up straight to _d_act [1, ffn] (no gate/up buffers).
-    if (!skip_ffn) {
+    if (!skip_ffn && _dense) {
+      // Dense: gate + up as two separate GEMVs, then gelu(gate)*up -> _d_act.
+      // ly.ffn is per-layer (E2B doubles it on the KV-shared layers).
+      const int ffnL = ly.ffn;
+      DUP(DC_FFN, [&] {
+        dense_gemv(_d_hn, ly.dgate, _d_gate, H, ffnL);
+        dense_gemv(_d_hn, ly.dup, _d_act, H, ffnL);
+        geglu(_d_gate, _d_act, _d_act, ffnL);
+      });
+      DUP(DC_FFN, [&] { dense_gemv(_d_act, ly.dw, _d_mlp, ffnL, H); });
+    } else if (!skip_ffn) {
+    // ly.ffn is per-layer (E2B doubles it on the KV-shared layers); == the
+    // global ffn_inner for uniform e4b / gemma4_unified.
+    const int ffnL = ly.ffn;
     DUP(DC_FFN, [&] {
     enc.set_function(_fn_qmv_geglu);
     enc.set_buffer(0, ly.guw);
@@ -2298,12 +2709,12 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     enc.set_buffer(3, _d_hn);
     enc.set_buffer(4, _d_act);
     enc.set_constant(5, H);
-    enc.set_constant(6, 2 * c.ffn_inner);
-    enc.dispatch({32, (unsigned)(c.ffn_inner / 2), 1}, {32, 2, 1});
+    enc.set_constant(6, 2 * ffnL);
+    enc.dispatch({32, (unsigned)(ffnL / 2), 1}, {32, 2, 1});
     });
     // down_proj runs at mlp_bits (8-bit for gemma4_unified).
     DUP(DC_FFN, [&] {
-      qmv_fn(_fn_qmv_mlp, ly.dw, ly.ds, ly.db, _d_act, _d_mlp, c.ffn_inner, H);
+      qmv_fn(_fn_qmv_mlp, ly.dw, ly.ds, ly.db, _d_act, _d_mlp, ffnL, H);
     });
     }
     DUP(DC_NORM, [&] { rms_add(_d_mlp, ly.post_ffn_ln, _d_x, 1, H); });  // += rms
@@ -2320,7 +2731,11 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       const std::size_t pli_off = _ple_chunk_k > 0
           ? (std::size_t)(L % _ple_chunk_k) * hpli * 2
           : (std::size_t)L * hpli * 2;
-      if (_fn_qmv_gelu_mul.valid()) {
+      if (_dense) {
+        // Dense per-layer-input gate: gate GEMV then gelu(gate)*pli[L].
+        dense_gemv(_d_x, ly.plg_w, _d_plg, H, hpli);
+        geglu(_d_plg, pli_buf, _d_plg, hpli, pli_off);
+      } else if (_fn_qmv_gelu_mul.valid()) {
         enc.set_function(_fn_qmv_gelu_mul);
         enc.set_buffer(0, ly.plg_w);
         enc.set_buffer(1, ly.plg_s);
@@ -2337,7 +2752,9 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       }
       // per_layer_projection plp[1,H]=plg[1,hpli]@W[H,hpli]^T. Native 4-bit
       // qmv (K=hpli=256 -> one partial block) by default; f16 path for A/B.
-      if (_ple_quant) {
+      if (_dense) {
+        dense_gemv(_d_plg, ly.plp_w, _d_plp, hpli, H);
+      } else if (_ple_quant) {
         qmv(ly.plp_w, ly.plp_s, ly.plp_b, _d_plg, _d_plp, hpli, H);
       } else if (_ple_gemv) {
         dense_gemv(_d_plg, ly.plp_w, _d_plp, hpli, H);
@@ -2362,6 +2779,7 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       // No PLE: the layer tail is just h *= layer_scalar.
       DUP(DC_MISC, [&] { scale(_d_x, H, ly.layer_scalar); });
     }
+    }   // end dense (non-MoE) hybrid-FFN branch
     }   // lrep (whole-layer doubling for per-type gpu_active profiling)
   }
 
@@ -2371,7 +2789,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   const int lm_reps = skip_lmhead ? 0 : (dup_layer == 5) ? 2 : 1;
   for (int lr = 0; lr < lm_reps; ++lr) {
   DUP(DC_LMHEAD, [&] {
-    if (_embed_is_q6k) { lm_head_q6k(_d_hn, _d_logits, 0, H, c.vocab); }
+    if (_dense) { dense_gemv(_d_hn, _embed_dense, _d_logits, H, c.vocab); }
+    else if (_embed_is_q6k) { lm_head_q6k(_d_hn, _d_logits, 0, H, c.vocab); }
     else {
       qmv_fn(_fn_qmv_embed, _embed_w, _embed_s, _embed_b, _d_hn, _d_logits, H,
              c.vocab);
@@ -2877,6 +3296,11 @@ MetalGemmaModel::decode_batched_step(
   const int N = (int)cids.size();
   if (N <= 0 || (int)in_tokens.size() != N) { return false; }
   if (!rope_pos.empty() && (int)rope_pos.size() != N) { return false; }
+  // Batched (N-branch) decode is affine-only: the weight-bound matmuls run the
+  // interleaved/steel quant kernels. The dense (raw-HF) path does not implement
+  // it -> report unsupported so the caller falls back to serial per-branch
+  // decode (the milestone target is prefill + single-token decode).
+  if (_dense) { return false; }
   if (!_fn_embed.valid()) { return false; }
   if (!ensure_bscratch_(_bdec, N)) { return false; }
   BScratch& bs = _bdec;
@@ -3414,15 +3838,37 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
   SharedBuffer kt = buf((std::size_t)n * kd_max), vt = buf((std::size_t)n * kd_max);
   SharedBuffer at = buf((std::size_t)n * qd_max), att = buf((std::size_t)n * qd_max);
   SharedBuffer ao = buf((std::size_t)n * H);
-  SharedBuffer act = buf((std::size_t)n * ffn), mlp = buf((std::size_t)n * H);
+  // MLP act scratch sized to the widest layer (E2B double-wide shared layers);
+  // e4b/gemma4_unified keep _ffn_max == ffn.
+  const int ffn_scr = (_ffn_max > 0) ? _ffn_max : ffn;
+  SharedBuffer act = buf((std::size_t)n * ffn_scr), mlp = buf((std::size_t)n * H);
+  // Dense (raw-HF) gate scratch [n, ffn_scr]: the dense MLP runs gate + up as
+  // two separate dense GEMMs then gelu(gate)*up -> act (no interleaved-swiglu).
+  SharedBuffer gate_d = _dense ? buf((std::size_t)n * ffn_scr) : SharedBuffer{};
   // Matrix-core geglu intermediate: dequant gate|up -> dense gu_full[rows,
-  // 2*ffn], then GeGLU-combine -> act. Only on the matrix-core path.
-  SharedBuffer gu_full = _use_mma ? buf((std::size_t)n * 2 * ffn)
+  // 2*ffn], then GeGLU-combine -> act. Only on the matrix-core path. Sized to
+  // the widest layer (E2B double-wide shared layers).
+  SharedBuffer gu_full = _use_mma ? buf((std::size_t)n * 2 * ffn_scr)
                                   : SharedBuffer{};
   SharedBuffer ple = buf((std::size_t)n * ple_w);
   SharedBuffer plepj = buf((std::size_t)n * ple_w), pli = buf((std::size_t)n * ple_w);
   SharedBuffer pli_lm = buf((std::size_t)nl * n * hpli);
   SharedBuffer plg = buf((std::size_t)n * hpli), plp = buf((std::size_t)n * H);
+  // MoE prefill scratch (np = n*top_k pairs). Empty for non-MoE gemma.
+  const int moe_np = c.is_moe() ? n * c.top_k : 0;
+  auto i32n = [&](std::size_t e) {
+    return _mc->make_shared_buffer(e * sizeof(std::int32_t));
+  };
+  SharedBuffer moe_logits = c.is_moe() ? buf((std::size_t)n * c.n_experts)
+                                       : SharedBuffer{};
+  SharedBuffer moe_eid = c.is_moe() ? i32n((std::size_t)moe_np) : SharedBuffer{};
+  SharedBuffer moe_w   = c.is_moe() ? buf((std::size_t)moe_np) : SharedBuffer{};
+  SharedBuffer moe_act = c.is_moe() ? buf((std::size_t)moe_np * c.moe_inner)
+                                    : SharedBuffer{};
+  SharedBuffer moe_part = c.is_moe() ? buf((std::size_t)moe_np * H)
+                                     : SharedBuffer{};
+  SharedBuffer moe_out = c.is_moe() ? buf((std::size_t)n * H) : SharedBuffer{};
+  SharedBuffer moe_h1  = c.is_moe() ? buf((std::size_t)n * H) : SharedBuffer{};
   SharedBuffer toks = _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
   SharedBuffer logits = buf((std::size_t)c.vocab);
   {
@@ -3677,6 +4123,17 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       enc.set_constant(5, Hd);
       enc.dispatch({(unsigned)Hd, (unsigned)n, 1}, {256, 1, 1});
     };
+    // Dense (raw-HF) f16 embedding gather over the n token ids: o[t,:] =
+    // table[ids[t], :] (main embed or the PLE per-layer table).
+    auto embed_dense = [&](const SharedBuffer& table, const SharedBuffer& o,
+                           int Hd) {
+      enc.set_function(_fn_embed_dense);
+      enc.set_buffer(0, toks);
+      enc.set_buffer(1, table);
+      enc.set_buffer(2, o);
+      enc.set_constant(3, Hd);
+      enc.dispatch({(unsigned)Hd, (unsigned)n, 1}, {256, 1, 1});
+    };
     auto kvw = [&](const SharedBuffer& src, const SharedBuffer& cache,
                    int D, int cap, int Hkv, int ring_cap, int window) {
       enc.set_function(_fn_kv_write);
@@ -3692,7 +4149,9 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
                    {(unsigned)D, 1, 1});
     };
     // ---- embeddings + per-layer inputs (batched) -------------------
-    if (_embed_is_q6k) {
+    if (_dense) {
+      embed_dense(_embed_dense, x, H);
+    } else if (_embed_is_q6k) {
       enc.set_function(_fn_embed_q6k);
       enc.set_buffer(0, toks);
       enc.set_buffer(1, _embed_q6k);
@@ -3716,7 +4175,8 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       enc.dispatch({(unsigned)(n_mm * H), 1, 1}, {256, 1, 1});
     }
     if (has_ple) {
-      embed_gather(_ple_w, _ple_s, _ple_b, ple, ple_w);
+      if (_dense) { embed_dense(_ple_w, ple, ple_w); }
+      else { embed_gather(_ple_w, _ple_s, _ple_b, ple, ple_w); }
       scale(ple, n * ple_w, std::sqrt((float)hpli));
       dense(x, _plm_proj_w, plepj, H, ple_w);          // BF16 [n, nl*hpli]
       scale(plepj, n * ple_w, std::pow((float)H, -0.5f));
@@ -3772,7 +4232,8 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       }
 
       rms(*xcur, 0, ly.in_ln, hn, 0, rows, H);
-      qmm(ly.qw, ly.qs, ly.qb, hn, q3, H, qd);
+      if (_dense) { dense(hn, ly.qw, q3, H, qd); }
+      else { qmm(ly.qw, ly.qs, ly.qb, hn, q3, H, qd); }
       // q-norm + rope. Tail (1 row): fused rms_rope in place on q3, already
       // [Hq,D] head-major (== decode q layout); attention reads q3. Bulk:
       // separate norm, transpose to [Hq,rows,D], rope; attention reads qt.
@@ -3800,13 +4261,15 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       const int cap = paged_full ? 0 : _ctx->kv_capacity(cm, L);
       const int ring_cap = paged_full ? 0 : _ctx->kv_ring_cap(cm, L);
       if (ly.kv_source < 0) {
-        qmm(ly.kw, ly.ks, ly.kb, hn, kb, H, kd);
+        if (_dense) { dense(hn, ly.kw, kb, H, kd); }
+        else { qmm(ly.kw, ly.ks, ly.kb, hn, kb, H, kd); }
         // values: k_eq_v full layers reuse the k_proj output (no v_proj),
         // v_norm'd BEFORE k is normed in place. Else project v separately.
         if (ly.k_eq_v) {
           rms(kb, 0, _ones_vnorm, vb, 0, n * Hkv, D);   // vb = v_norm(k)
         } else {
-          qmm(ly.vw, ly.vs, ly.vb, hn, vb, H, kd);
+          if (_dense) { dense(hn, ly.vw, vb, H, kd); }
+          else { qmm(ly.vw, ly.vs, ly.vb, hn, vb, H, kd); }
           rms(vb, 0, _ones_vnorm, vb, 0, n * Hkv, D);   // v_norm (no wt)
         }
         rms(kb, 0, ly.k_norm, kb, 0, n * Hkv, D);
@@ -4278,7 +4741,8 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         tr(at, att, Hq, rows, D);
         attn_out = &att;
       }
-      qmm(ly.ow, ly.os, ly.ob, *attn_out, ao, qd, H);
+      if (_dense) { dense(*attn_out, ly.ow, ao, qd, H); }
+      else { qmm(ly.ow, ly.os, ly.ob, *attn_out, ao, qd, H); }
       if (rows == 1) {
         rms_add(ao, ly.post_attn_ln, *xcur, rows, H);
       } else {
@@ -4286,11 +4750,120 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         residual(*xcur, 0, ao, *xcur, 0, rows * H);
       }
 
+      // Last-layer FFN(+PLE) prune. Prefill consumes only the final row's
+      // logits, and the FFN + per-layer-input blocks are position-wise, so
+      // on the FINAL layer run them for the last row (rows-1) alone -- rows
+      // 0..rows-2 keep their (unread) post-attention residual. Bit-identical
+      // for the kept row; mirrors the Qwen/Llama prune. Affine path only
+      // (dense/MoE excluded, matching Qwen). Gemma has no MTP, so the final-
+      // layer prune is unconditionally safe. When the shared-KV tail has
+      // already collapsed rows to 1 (KV-sharing configs) this is inert -- the
+      // single-row branches below already compute just the last row; the win
+      // is for num_kv_shared==0 configs, where rows stays n to the last layer.
+      const bool prune = (L + 1 == nl) && want_logits
+                         && !_dense && !c.is_moe();
+      if (prune && rows > 1) {
+        const std::size_t roff = (std::size_t)(rows - 1) * H * 2;  // bytes
+        const int ffnL = ly.ffn;
+        rms(*xcur, roff, ly.pre_ffn_ln, hn, 0, 1, H);  // hn[0]=norm(x[rows-1])
+        enc.set_function(_fn_qmv_geglu);               // gelu(gate)*up->act[0]
+        enc.set_buffer(0, ly.guw);
+        enc.set_buffer(1, ly.gus);
+        enc.set_buffer(2, ly.gub);
+        enc.set_buffer(3, hn);
+        enc.set_buffer(4, act);
+        enc.set_constant(5, H);
+        enc.set_constant(6, 2 * ffnL);
+        enc.dispatch({32, (unsigned)(ffnL / 2), 1}, {32, 2, 1});
+        enc.set_function(_fn_qmv_mlp);                 // down_proj -> mlp[0]
+        enc.set_buffer(0, ly.dw);
+        enc.set_buffer(1, ly.ds);
+        enc.set_buffer(2, ly.db);
+        enc.set_buffer(3, act);
+        enc.set_buffer(4, mlp);
+        enc.set_constant(5, ffnL);
+        enc.set_constant(6, H);
+        enc.dispatch({32, (unsigned)(H / 4), 1}, {32, 2, 1});
+        enc.set_function((_rms_fast || H > 4096) ? _fn_rms_add_fast
+                                                 : _fn_rms_add);
+        enc.set_buffer(0, mlp);                        // post_ffn_ln + res add
+        enc.set_buffer(1, ly.post_ffn_ln);
+        enc.set_buffer(2, *xcur, roff);
+        enc.set_buffer(3, *xcur, roff);
+        enc.set_constant(4, H);
+        enc.set_constant(5, eps);
+        enc.set_constant(6, 1.0f);
+        enc.dispatch({512, 1, 1}, {512, 1, 1});
+        if (has_ple) {
+          // Per-layer-input gate for the last row. pli[L] for chunk row r is
+          // at (L*n + r)*hpli; the last row is r == rows-1 (== n-1 here).
+          enc.set_function(_fn_qmv);                   // gate -> plg[0]
+          enc.set_buffer(0, ly.plg_w);
+          enc.set_buffer(1, ly.plg_s);
+          enc.set_buffer(2, ly.plg_b);
+          enc.set_buffer(3, *xcur, roff);
+          enc.set_buffer(4, plg);
+          enc.set_constant(5, H);
+          enc.set_constant(6, hpli);
+          enc.dispatch({32, (unsigned)(hpli / 4), 1}, {32, 2, 1});
+          geglu(plg, pli_lm,
+                ((std::size_t)L * n + (rows - 1)) * hpli * 2, plg, hpli);
+          if (_ple_quant) {
+            enc.set_function(_fn_qmv);                 // projection -> plp[0]
+            enc.set_buffer(0, ly.plp_w);
+            enc.set_buffer(1, ly.plp_s);
+            enc.set_buffer(2, ly.plp_b);
+            enc.set_buffer(3, plg);
+            enc.set_buffer(4, plp);
+            enc.set_constant(5, hpli);
+            enc.set_constant(6, H);
+            enc.dispatch({32, (unsigned)(H / 4), 1}, {32, 2, 1});
+          } else {
+            enc.set_function(_fn_dense_t);             // f16 projection (1 row)
+            enc.set_buffer(0, plg);
+            enc.set_buffer(1, ly.plp_w);
+            enc.set_buffer(2, ly.plp_w);
+            enc.set_buffer(3, plp);
+            enc.set_constant(4, hpli);
+            enc.set_constant(5, H);
+            enc.set_constant(6, 1);
+            enc.set_constant(7, 0);
+            enc.dispatch({(unsigned)(((H + 31) / 32) * 32), 2, 2},
+                         {32, 2, 2});
+          }
+          enc.set_function((_rms_fast || H > 4096) ? _fn_rms_add_fast
+                                                   : _fn_rms_add);
+          enc.set_buffer(0, plp);                      // post_pli_ln + res add
+          enc.set_buffer(1, ly.post_pli_ln);
+          enc.set_buffer(2, *xcur, roff);
+          enc.set_buffer(3, *xcur, roff);
+          enc.set_constant(4, H);
+          enc.set_constant(5, eps);
+          enc.set_constant(6, ly.layer_scalar);
+          enc.dispatch({512, 1, 1}, {512, 1, 1});
+        } else {
+          enc.set_function(_fn_scale);                 // h[rows-1] *= scalar
+          enc.set_buffer(0, *xcur, roff);
+          enc.set_constant(1, H);
+          enc.set_constant(2, ly.layer_scalar);
+          enc.dispatch({(unsigned)H, 1, 1}, {256, 1, 1});
+        }
+        continue;   // final layer -- skip the full-rows FFN block below
+      }
+
       // MLP (geglu). Fused gate/up GEMM + GeGLU: one GEMM over the
       // interleaved [2*ffn, H] weight writes gelu(gate)*up straight to act
       // [n, ffn] (no separate gate/up buffers or geglu pass).
       rms(*xcur, 0, ly.pre_ffn_ln, hn, 0, rows, H);
-      if (rows == 1) {
+      // ly.ffn is per-layer (E2B doubles it on the KV-shared layers); == the
+      // global ffn for uniform e4b / gemma4_unified.
+      const int ffnL = ly.ffn;
+      if (_dense) {
+        // Dense: gate + up as two dense GEMMs, then gelu(gate)*up -> act.
+        dense(hn, ly.dgate, gate_d, H, ffnL);
+        dense(hn, ly.dup, act, H, ffnL);
+        geglu(gate_d, act, 0, act, rows * ffnL);
+      } else if (rows == 1) {
         enc.set_function(_fn_qmv_geglu);
         enc.set_buffer(0, ly.guw);
         enc.set_buffer(1, ly.gus);
@@ -4298,20 +4871,20 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.set_buffer(3, hn);
         enc.set_buffer(4, act);
         enc.set_constant(5, H);
-        enc.set_constant(6, 2 * ffn);
-        enc.dispatch({32, (unsigned)(ffn / 2), 1}, {32, 2, 1});
+        enc.set_constant(6, 2 * ffnL);
+        enc.dispatch({32, (unsigned)(ffnL / 2), 1}, {32, 2, 1});
       } else if (_use_mma && rows >= _mma_min_m) {
         // Matrix-core geglu: dequant the interleaved gate|up weight -> dense
         // matmul2d -> gu_full[rows, 2*ffn], then GeGLU-combine (gelu(gate)*up
         // over the interleaved columns) -> act[rows, ffn]. K=H (<=4096) so
         // dense_mma_qmm picks the 128x128 tile.
-        dense_mma_qmm(ly.guw, ly.gus, ly.gub, hn, gu_full, H, 2 * ffn);
+        dense_mma_qmm(ly.guw, ly.gus, ly.gub, hn, gu_full, H, 2 * ffnL);
         enc.set_function(_fn_geglu_inter);
         enc.set_buffer(0, gu_full);
         enc.set_buffer(1, act);
         enc.set_constant(2, rows);
-        enc.set_constant(3, ffn);
-        enc.dispatch({(unsigned)(rows * ffn), 1, 1}, {256, 1, 1});
+        enc.set_constant(3, ffnL);
+        enc.dispatch({(unsigned)(rows * ffnL), 1, 1}, {256, 1, 1});
       } else {
         enc.set_function(_fn_qmm_geglu);
         enc.set_buffer(0, ly.guw);
@@ -4320,13 +4893,80 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.set_buffer(3, hn);
         enc.set_buffer(4, act);
         enc.set_constant(5, H);
-        enc.set_constant(6, 2 * ffn);
+        enc.set_constant(6, 2 * ffnL);
         enc.set_constant(7, rows);
-        enc.dispatch({(unsigned)(((2 * ffn + 31) / 32) * 32),
+        enc.dispatch({(unsigned)(((2 * ffnL + 31) / 32) * 32),
                       (unsigned)(((rows + 31) / 32) * 2), 2}, {32, 2, 2});
       }
       // down_proj at mlp_bits (8-bit for gemma4_unified).
-      qmm_fn(_fn_qmv_mlp, _fn_qmm_mlp, ly.dw, ly.ds, ly.db, act, mlp, ffn, H);
+      if (_dense) { dense(act, ly.dw, mlp, ffnL, H); }
+      else {
+        qmm_fn(_fn_qmv_mlp, _fn_qmm_mlp, ly.dw, ly.ds, ly.db, act, mlp, ffnL,
+               H);
+      }
+      if (c.is_moe()) {
+        // Gemma-4 hybrid dense+MoE FFN (M=rows). The dense-MLP output `mlp`
+        // above is the dense branch (hd); h1 = post_ffn_ln_1(hd). The MoE
+        // branch routes the RAW residual, gathers top_k experts, and h2 =
+        // post_ffn_ln_2(combine). h = h1 + h2; residual += post_ffn_ln(h);
+        // *= layer_scalar. See the header layer forward.
+        const int E = c.n_experts, K = c.top_k, I = c.moe_inner;
+        const int np = rows * K;
+        rms(mlp, 0, ly.post_ffn_ln_1, moe_h1, 0, rows, H);      // h1
+        // router on the RAW residual (folded pre-norm * scale/sqrtH).
+        rms(*xcur, 0, ly.router_norm_w, hn, 0, rows, H);
+        dense(hn, ly.router_proj, moe_logits, H, E);
+        enc.set_function(_fn_moe_route);
+        enc.set_buffer(0, moe_logits); enc.set_buffer(1, moe_eid);
+        enc.set_buffer(2, moe_w); enc.set_constant(3, E);
+        enc.set_constant(4, K); const int norm_tk = 1;
+        enc.set_constant(5, norm_tk);
+        enc.dispatch({32, 1, (unsigned)rows}, {32, 1, 1});
+        enc.set_function(_fn_moe_expert_scale);
+        enc.set_buffer(0, moe_w); enc.set_buffer(1, ly.per_expert_scale);
+        enc.set_buffer(2, moe_eid); enc.set_constant(3, np);
+        enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
+        // experts input hm = pre_ffn_ln_2(residual) -> hn.
+        rms(*xcur, 0, ly.pre_ffn_ln_2, hn, 0, rows, H);
+        enc.set_function(_dense ? _fn_moe_gather_geglu_dense
+                                : _fn_moe_gather_geglu);
+        if (_dense) {
+          enc.set_buffer(0, ly.eguw); enc.set_buffer(1, hn);
+          enc.set_buffer(2, moe_act); enc.set_constant(3, H);
+          enc.set_constant(4, 2 * I); enc.set_buffer(5, moe_eid);
+          enc.set_constant(6, K);
+        } else {
+          enc.set_buffer(0, ly.eguw); enc.set_buffer(1, ly.egus);
+          enc.set_buffer(2, ly.egub); enc.set_buffer(3, hn);
+          enc.set_buffer(4, moe_act); enc.set_constant(5, H);
+          enc.set_constant(6, 2 * I); enc.set_buffer(7, moe_eid);
+          enc.set_constant(8, K);
+        }
+        enc.dispatch({32, (unsigned)(I / 2), (unsigned)np}, {32, 2, 1});
+        enc.set_function(_dense ? _fn_moe_gather_down_dense
+                                : _fn_moe_gather_down);
+        if (_dense) {
+          enc.set_buffer(0, ly.edw2); enc.set_buffer(1, moe_act);
+          enc.set_buffer(2, moe_part); enc.set_constant(3, I);
+          enc.set_constant(4, H); enc.set_buffer(5, moe_eid);
+        } else {
+          enc.set_buffer(0, ly.edw2); enc.set_buffer(1, ly.eds2);
+          enc.set_buffer(2, ly.edb2); enc.set_buffer(3, moe_act);
+          enc.set_buffer(4, moe_part); enc.set_constant(5, I);
+          enc.set_constant(6, H); enc.set_buffer(7, moe_eid);
+        }
+        enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
+        enc.set_function(_fn_moe_combine);
+        enc.set_buffer(0, moe_part); enc.set_buffer(1, moe_w);
+        enc.set_buffer(2, moe_out); enc.set_constant(3, H);
+        enc.set_constant(4, K);
+        enc.dispatch({(unsigned)(rows * H), 1, 1}, {256, 1, 1});
+        rms(moe_out, 0, ly.post_ffn_ln_2, moe_out, 0, rows, H); // h2 in place
+        residual(moe_h1, 0, moe_out, moe_out, 0, rows * H);     // h = h1 + h2
+        rms(moe_out, 0, ly.post_ffn_ln, moe_out, 0, rows, H);   // norm(h)
+        residual(*xcur, 0, moe_out, *xcur, 0, rows * H);        // res += norm(h)
+        scale(*xcur, rows * H, ly.layer_scalar);
+      } else {
       if (rows == 1) {
         rms_add(mlp, ly.post_ffn_ln, *xcur, rows, H);
       } else {
@@ -4338,13 +4978,14 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // Per-layer-input gate: gelu(gate(x)) * pli[L] -> proj -> norm -> add.
         // When collapsed to the tail, pli for layer L is the last row of its
         // [n, hpli] block: offset (L*n + (n-rows))*hpli.
-        qmm(ly.plg_w, ly.plg_s, ly.plg_b, *xcur, plg, H, hpli);
+        if (_dense) { dense(*xcur, ly.plg_w, plg, H, hpli); }
+        else { qmm(ly.plg_w, ly.plg_s, ly.plg_b, *xcur, plg, H, hpli); }
         geglu(plg, pli_lm,
               ((std::size_t)L * n + (n - rows)) * hpli * 2, plg, rows * hpli);
-        if (_ple_quant) {                              // 4-bit qmm
-          qmm(ly.plp_w, ly.plp_s, ly.plp_b, plg, plp, hpli, H);
-        } else {
+        if (_dense || !_ple_quant) {
           dense(plg, ly.plp_w, plp, hpli, H);
+        } else {                                       // 4-bit qmm
+          qmm(ly.plp_w, ly.plp_s, ly.plp_b, plg, plp, hpli, H);
         }
         if (rows == 1) {
           rms_add(plp, ly.post_pli_ln, *xcur, rows, H, ly.layer_scalar);
@@ -4357,13 +4998,24 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // No PLE: the layer tail is just h *= layer_scalar.
         scale(*xcur, rows * H, ly.layer_scalar);
       }
+      }   // end dense (non-MoE) hybrid-FFN branch
     }
 
     // ---- final norm (last token) + lm_head + softcap ---------------
     // Skipped on KV-only intermediate chunks (logits discarded there).
     if (want_logits) {
       rms(*xcur, (std::size_t)(rows - 1) * H * 2, _final_ln, hn, 0, 1, H);
-      if (_embed_is_q6k) {
+      if (_dense) {
+        // Dense tied lm_head GEMV (M=1, last token): logits[1,vocab] =
+        // hn[1,H] @ embed_dense[vocab,H]^T.
+        enc.set_function(_fn_dense_gemv);
+        enc.set_buffer(0, hn);
+        enc.set_buffer(1, _embed_dense);
+        enc.set_buffer(2, logits);
+        enc.set_constant(3, H);
+        enc.set_constant(4, c.vocab);
+        enc.dispatch({32, (unsigned)(c.vocab / 4), 1}, {32, 2, 1});
+      } else if (_embed_is_q6k) {
         enc.set_function(_fn_qmv_q6k);   // native Q6_K lm_head GEMV
         enc.set_buffer(0, _embed_q6k);
         enc.set_buffer(1, hn);

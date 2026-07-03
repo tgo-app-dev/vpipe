@@ -436,7 +436,25 @@ const STRINGS = {
   'userio.send_word':  [' send', ' 发送', ' 傳送'],
   'userio.input_requested': ['Input requested:', '请求输入：', '請求輸入：'],
   'userio.password_ph':['enter password…', '输入密码…', '輸入密碼…'],
+  'userio.media_ph':   ['type a response… (attach or drop image/audio)',
+      '输入回复…（可附加或拖入图片/音频）',
+      '輸入回覆…（可附加或拖入圖片/音訊）'],
+  'userio.attach_image': ['Attach image', '附加图片', '附加圖片'],
+  'userio.attach_audio': ['Attach audio', '附加音频', '附加音訊'],
+  'userio.attach_unsupported': ['Unsupported file type: {name}',
+      '不支持的文件类型：{name}', '不支援的檔案類型：{name}'],
+  'userio.attach_failed': ['Failed to read file: {name}',
+      '读取文件失败：{name}', '讀取檔案失敗：{name}'],
   'userio.markdown':   ['Markdown', 'Markdown', 'Markdown'],
+  'userio.thinking':   ['Thinking', '思考过程', '思考過程'],
+  'userio.thinking_title': ['Show the model’s reasoning '
+      + '("thinking") segments; when off they collapse to a 💭 glyph',
+      '显示模型的推理（思考）内容；关闭时折叠为 💭 图标',
+      '顯示模型的推理（思考）內容；關閉時摺疊為 💭 圖示'],
+  'userio.thinking_hidden': ['thinking hidden — enable the '
+      + 'Thinking toggle to view',
+      '思考内容已隐藏——打开“思考过程”开关可查看',
+      '思考內容已隱藏——開啟「思考過程」開關可檢視'],
   'userio.markdown_title': ['Render console text as simple Markdown '
       + '(bold / italic / underline, headings, lists, code, tables)',
       '将控制台文本渲染为简单 Markdown'
@@ -486,6 +504,7 @@ const STRINGS = {
   'cat.control':  ['Control', '控制', '控制'],
   'cat.database': ['Database', '数据库', '資料庫'],
   'cat.network':  ['Network', '网络', '網路'],
+  'cat.preparation': ['Preparation', '准备', '準備'],
   'cat.generic':  ['Generic', '通用', '通用'],
 
   // Stage display names + descriptions.
@@ -557,12 +576,12 @@ const STRINGS = {
       '安全上限；達到後提前結束場景'],
   'cfg.realtime-vqa.batched_decode': ['batch question branches that share the '
       + 'prefix', '批量解码共享前缀的问题分支', '批次解碼共享前綴的問題分支'],
-  'cfg.realtime-vqa.prev_scene_recap': ['carry prior scene description into '
-      + 'the next describe, but only across temporally-continuous scenes; '
-      + 'false disables it',
-      '将上一场景的描述带入下一次描述，但仅限时间上连续的场景；'
+  'cfg.realtime-vqa.scene_overlap': ['re-issue the previous scene\'s last '
+      + 'frame as the next scene\'s first frame, but only across temporally-'
+      + 'continuous scenes; false disables it',
+      '将上一场景的最后一帧作为下一场景的第一帧重新加入，但仅限时间上连续的场景；'
       + '设为 false 可禁用。',
-      '將上一場景的描述帶入下一次描述，但僅限時間上連續的場景；'
+      '將上一場景的最後一幀作為下一場景的第一幀重新加入，但僅限時間上連續的場景；'
       + '設為 false 可停用。'],
   'cfg.realtime-vqa.disable_thinking': ['override chat-template thinking '
       + 'default', '覆盖聊天模板的思考（thinking）默认设置',

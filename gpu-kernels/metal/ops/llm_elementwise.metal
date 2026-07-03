@@ -196,6 +196,22 @@ kernel void moe_combine_f16(
   out[gid] = (VPIPE_ELT)acc;
 }
 
+// Gemma-4 MoE per-expert router weight scale: w[i] *= per_expert_scale[ids[i]]
+// over the M*top_k routed pairs (applied AFTER moe_route's softmax-topk-renorm,
+// BEFORE moe_combine). ids[i] is the selected expert of pair i. One thread per
+// pair. n == M*top_k.
+kernel void moe_expert_scale_f16(
+    device VPIPE_ELT*       w                [[buffer(0)]],  // [n]
+    const device VPIPE_ELT* per_expert_scale [[buffer(1)]],  // [E]
+    const device int*       ids              [[buffer(2)]],  // [n]
+    constant int&           n                [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if ((int)gid >= n) { return; }
+  w[gid] = (VPIPE_ELT)((float)w[gid] *
+                       (float)per_expert_scale[(uint)ids[gid]]);
+}
+
 // ---- MoE grouped-prefill counting sort (sorts (token,expert) pairs into
 // per-expert blocks padded to MAXM, so the grouped GEMV reads each expert's
 // weight once per tile instead of once per token) ----------------------
@@ -2878,4 +2894,68 @@ kernel void lc_sample_batch_f16(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   LC_ARGMAX_REDUCE(tg, tgi, tid, nthg);
   if (tid == 0) { out_id[tgrow] = tgi[0] >= 0 ? tgi[0] : 0; }
+}
+
+// MOSS local/depth-transformer single-query causal attention step. The
+// current token's q/k/v (post-RoPE) are [n_head*head_dim]; the K/V caches are
+// [n_head, pmax, head_dim]. Writes k/v into slot `pos`, then attends over keys
+// 0..pos (causal), scale 1/sqrt(head_dim), and writes out[n_head*head_dim].
+// One threadgroup per head, head_dim threads/group (head_dim<=128, pos<=15).
+//   0:q 1:k_cur 2:v_cur 3:Kc 4:Vc 5:out 6:n_head 7:head_dim 8:pmax 9:pos
+//   grid {head_dim, n_head, 1}, tg {head_dim, 1, 1}.
+kernel void local_attn_step_f16(
+    const device VPIPE_ELT* q     [[buffer(0)]],
+    const device VPIPE_ELT* k_cur [[buffer(1)]],
+    const device VPIPE_ELT* v_cur [[buffer(2)]],
+    device VPIPE_ELT*       Kc    [[buffer(3)]],
+    device VPIPE_ELT*       Vc    [[buffer(4)]],
+    device VPIPE_ELT*       out   [[buffer(5)]],
+    constant int& n_head   [[buffer(6)]],
+    constant int& head_dim [[buffer(7)]],
+    constant int& pmax     [[buffer(8)]],
+    constant int& pos      [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]])
+{
+  const int h = (int)tgid.y;
+  const int d = (int)ltid.x;
+  const int D = head_dim;
+  if (h >= n_head || d >= D) { return; }
+
+  // Store the current k/v into the per-head cache slot `pos`.
+  const int slot = (h * pmax + pos) * D;
+  Kc[slot + d] = k_cur[h * D + d];
+  Vc[slot + d] = v_cur[h * D + d];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float qd = (float)q[h * D + d];
+  const float scale = rsqrt((float)D);
+  threadgroup float red[128];
+  threadgroup float sc[16];
+
+  for (int j = 0; j <= pos; ++j) {
+    red[d] = qd * (float)Kc[(h * pmax + j) * D + d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d == 0) {
+      float s = 0.0f;
+      for (int i = 0; i < D; ++i) { s += red[i]; }
+      sc[j] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (d == 0) {
+    float m = -INFINITY;
+    for (int j = 0; j <= pos; ++j) { m = max(m, sc[j]); }
+    float den = 0.0f;
+    for (int j = 0; j <= pos; ++j) { sc[j] = exp(sc[j] - m); den += sc[j]; }
+    const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+    for (int j = 0; j <= pos; ++j) { sc[j] *= inv; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float acc = 0.0f;
+  for (int j = 0; j <= pos; ++j) {
+    acc += sc[j] * (float)Vc[(h * pmax + j) * D + d];
+  }
+  out[h * D + d] = (VPIPE_ELT)acc;
 }

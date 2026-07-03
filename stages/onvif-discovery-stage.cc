@@ -121,7 +121,7 @@ const StageSpec kSpec = {
                "persists an encrypted camera record to LMDB. 0 in / 0 "
                "out (Apple-only).",
   .display_name = "ONVIF Discovery",
-  .category  = StageCategory::Network,
+  .category  = StageCategory::Preparation,
   .iports    = {},
   .oports    = {},
   .attrs     = kAttrs,

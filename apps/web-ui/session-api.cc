@@ -1320,7 +1320,8 @@ SessionApi::h_io_pending_(const HttpRequest&)
   uint64_t id = 0;
   string   prompt;
   bool     masked  = false;
-  bool     pending = _ui->pending_input(&id, &prompt, &masked);
+  bool     media   = false;
+  bool     pending = _ui->pending_input(&id, &prompt, &masked, &media);
 
   FlexData o = FlexData::make_object();
   auto oo = o.as_object();
@@ -1329,6 +1330,9 @@ SessionApi::h_io_pending_(const HttpRequest&)
     oo.insert("id", FlexData::make_uint(id));
     oo.insert("prompt", fstr_(prompt));
     oo.insert("masked", FlexData::make_bool(masked));
+    // getmedialine request: the client offers attach/drop controls and
+    // embeds attachments as base64 media-line markers in the answer.
+    oo.insert("media", FlexData::make_bool(media));
   }
   return HttpResponse::json(200, o.to_json());
 }

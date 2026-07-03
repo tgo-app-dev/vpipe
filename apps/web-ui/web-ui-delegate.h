@@ -50,6 +50,15 @@ public:
   getpasswd(const vpipe::VpipeFormat& prompt, std::string& out,
             const std::function<bool()>& should_cancel) override;
 
+  // Media variant: publishes the pending request with a `media` flag
+  // so the browser offers attach-image / attach-audio buttons and
+  // drag-and-drop; the answered line embeds each attachment as a
+  // base64 media-line marker (common/media-line.h). Identical
+  // rendezvous semantics to getline otherwise.
+  vpipe::UiInputStatus
+  getmedialine(const vpipe::VpipeFormat& prompt, std::string& out,
+               const std::function<bool()>& should_cancel) override;
+
   std::unique_ptr<vpipe::UiTextStream> open_text_stream() override;
 
   // ---- API surface (HTTP thread) -----------------------------------
@@ -83,15 +92,21 @@ public:
   console_since(std::uint64_t since, std::uint64_t* latest_seq,
                 std::size_t limit = 0);
 
-  // If an input request is waiting, fill (*id, *prompt, *masked) and
-  // return true. `masked` is set when the request came from getpasswd()
-  // (the browser should mask the field). Any out-param may be null.
+  // If an input request is waiting, fill (*id, *prompt, *masked,
+  // *media) and return true. `masked` is set when the request came
+  // from getpasswd() (the browser should mask the field); `media` when
+  // it came from getmedialine() (the browser should offer attach/drop
+  // controls). Any out-param may be null.
   bool pending_input(std::uint64_t* id, std::string* prompt,
-                     bool* masked = nullptr) const;
+                     bool* masked = nullptr,
+                     bool* media  = nullptr) const;
 
   // Answer the pending getline identified by `id`. Returns false when
   // no request is pending or the id does not match (stale answer).
-  // Echoes the answer into the transcript as an "input" line.
+  // Echoes the answer into the transcript as an "input" line; media-
+  // line attachment markers in the answer are compressed to glyphs in
+  // the echo (media_line::to_display) so base64 payloads never enter
+  // the console ring.
   bool submit_input(std::uint64_t id, std::string text);
 
   // Drop all console history (authoritative clear for the User I/O
@@ -116,13 +131,14 @@ private:
 
   void push_(const char* level, const vpipe::VpipeFormat&);
 
-  // Shared rendezvous body for getline()/getpasswd(): echoes the
-  // prompt, publishes a single pending request (masked or not), blocks
-  // until the browser answers or `should_cancel` fires.
+  // Shared rendezvous body for getline()/getpasswd()/getmedialine():
+  // echoes the prompt, publishes a single pending request (masked /
+  // media flags as requested), blocks until the browser answers or
+  // `should_cancel` fires.
   vpipe::UiInputStatus
   request_input_(const vpipe::VpipeFormat& prompt, std::string& out,
                  const std::function<bool()>& should_cancel,
-                 bool masked);
+                 bool masked, bool media);
   // Incremental ring bound: at most one entry per call. Bulk drains
   // after a cap reduction are handled by trim_in_background_() so a
   // single shrink request doesn't block every other HTTP handler
@@ -161,6 +177,7 @@ private:
   std::uint64_t _req_id      = 0;
   std::string   _req_prompt;
   bool          _req_masked  = false;   // request came from getpasswd()
+  bool          _req_media   = false;   // request came from getmedialine()
   bool          _have_resp   = false;
   std::string   _resp_text;
   std::uint64_t _next_req_id = 1;

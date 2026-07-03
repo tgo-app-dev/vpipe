@@ -240,6 +240,16 @@ parse_hybrid_fields_(const FlexData::ConstObjectView& root, ModelConfig* out)
   if (root.contains("norm_topk_prob")) {
     out->norm_topk_prob = root.at("norm_topk_prob").as_bool(true);
   }
+  // Gemma-4 MoE spelling: top-k is `top_k_experts` and the block is gated by
+  // `enable_moe_block` (Qwen uses num_experts_per_tok / always-on). Map top-k
+  // into the shared num_experts_per_tok field.
+  if (root.contains("top_k_experts")) {
+    out->num_experts_per_tok = static_cast<int>(
+        root.at("top_k_experts").as_int(0));
+  }
+  if (root.contains("enable_moe_block")) {
+    out->enable_moe_block = root.at("enable_moe_block").as_bool(false);
+  }
 }
 
 // Pull Gemma-4 text-family sizing off a config object view. Safe to
@@ -395,6 +405,21 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
       parse_dense_fields_(tcobj, out);
       parse_hybrid_fields_(tcobj, out);
       parse_gemma4_fields_(tcobj, out);
+    }
+  }
+
+  // MOSS-TTS-Local (model_type "moss_tts_local", arch "MossTTSLocalModel"):
+  // a TTS model whose text backbone is a dense Qwen3 LM. The Qwen3 dims live
+  // under `qwen3_config` (not the usual `text_config`), so parse them into the
+  // standard dense fields. This lets the metal Qwen text-backbone exec be built
+  // for text evaluation (e.g. WikiText-2 perplexity) -- it does NOT affect the
+  // TTS forward path, which loads the backbone directly via MetalMossV15Model.
+  if (out->architecture == "MossTTSLocalModel" &&
+      root.contains("qwen3_config")) {
+    auto qc = root.at("qwen3_config");
+    if (qc.is_object()) {
+      auto qcobj = qc.as_object();
+      parse_dense_fields_(qcobj, out);
     }
   }
 
@@ -867,6 +892,23 @@ ModelLoader::load(string_view hf_dir) const
 
   // 3. preprocessor_config.json (optional, VLM normalisation mean/std).
   apply_preprocessor_(dir, dir_str, &out.config, session());
+
+  // 4. gemma4_unified from RAW safetensors: unlike the GGUF variant (whose
+  // adaptor lives in a sibling mmproj-*.gguf), the raw 12B carries the
+  // shallow vision/audio adaptor weights INSIDE model.safetensors. Probe
+  // for them and flag the config so the loader builds a
+  // Gemma4UnifiedEmbedder via load_safetensors(model_dir).
+  if (out.config.architecture == "Gemma4UnifiedForConditionalGeneration"
+      && Gemma4UnifiedEmbedder::has_unified_safetensors(dir_str)) {
+    out.config.vision.present    = true;
+    out.config.vision.unified    = true;
+    out.config.vision.unified_st = true;
+    out.config.vision.out_hidden_size = out.config.hidden;
+    out.config.audio.present     = true;
+    out.config.audio.unified     = true;
+    out.config.audio.unified_st  = true;
+    out.config.audio.output_dim  = out.config.hidden;
+  }
 
   return out;
 }

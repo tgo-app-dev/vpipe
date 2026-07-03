@@ -56,6 +56,9 @@ public:
   // Return this context's KV pages to the pool (no-op leak otherwise).
   void release_context(ContextId ctx) override;
 
+  // Read-only KV length of a context (0 = never touched).
+  int context_seq_len(ContextId ctx) const override;
+
   void set_eval_per_layer(bool) noexcept override {}
 
 private:

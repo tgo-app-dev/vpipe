@@ -13,11 +13,11 @@ namespace vpipe {
 // web-ui toolbox) and for at-a-glance classification. A stage with no
 // declared category is Generic.
 enum class StageCategory : unsigned char {
-  Generic, Audio, Video, Text, Control, Database, Network
+  Generic, Audio, Video, Text, Control, Database, Network, Preparation
 };
 
 // Stable lower-case name ("generic", "audio", "video", "text",
-// "control", "database", "network"). Never returns null.
+// "control", "database", "network", "preparation"). Never returns null.
 std::string_view stage_category_name(StageCategory) noexcept;
 
 // Static, type-level declaration of one stage port (input or output).

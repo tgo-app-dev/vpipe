@@ -131,8 +131,17 @@ public:
     // layers). Used by the Qwen3-ASR text decoder, a plain Qwen3 dense
     // transformer.
     bool  dense       = false;
+    // Whether the RAW (unquantized, dense) checkpoint stores zero-centered
+    // RMSNorm weights -- i.e. the model applies (1+weight) and vpipe must add
+    // 1.0 to every loaded norm at bind. True for the raw-HF Qwen3.5 family
+    // (the default). FALSE for plain-Qwen3 backbones that use standard
+    // RMSNorm (weight*h directly, ones-init), e.g. MOSS-TTS-Local-v1.5's
+    // dense Qwen3 backbone -- adding 1 there corrupts the logits. Only
+    // consulted on the dense (raw bf16/f16) path; quantized loads fold the
+    // offset at quantize time, so this has no effect there.
+    bool  zero_centered_norm = true;
     // Whether q_proj carries a per-head output gate (Qwen3.5: q_proj
-    // emits 2*qd, the second half sigmoid-gates the attention output).
+    // emits 2*qd, the second half gates the attention output).
     // Qwen3-ASR has no gate (q_proj emits qd).
     bool  attn_output_gate = true;
     // Backbone-only load: skip the token-embedding muxer + lm_head (and the
@@ -141,9 +150,21 @@ public:
     // heads + 32 audio-code embeddings on top of a dense Qwen3 backbone).
     // forward_embeddings_hidden() is the only forward path in this mode.
     bool  backbone_only = false;
+    // Streaming-calibration load (MoE only): skip the per-layer weight load in
+    // load() entirely (leave _layers sized + is_full set, weights EMPTY) so the
+    // 35B never resides whole. calib_build_layer/calib_run_layer/
+    // calib_free_layer then stream ONE layer at a time over a held residual.
+    // Implies backbone_only behaviour (no lm_head). No effect on any non-calib
+    // forward (the per-layer weights are simply never populated).
+    bool  calib_stream = false;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
+    // Segment between weight_prefix and "layers."/"embed_tokens"/"norm".
+    // Default "model." gives the HF "<prefix>model.layers.N" convention.
+    // MOSS-TTS-Local-v1.5 nests the backbone under "transformer." with NO
+    // "model." segment, so it sets weight_prefix="transformer." + model_seg="".
+    std::string model_seg = "model.";
     int   max_seq     = 512;
     int   page_tokens = 256;
     int   max_pages   = 0;
@@ -234,6 +255,52 @@ public:
   metal_compute::SharedBuffer
   forward_embeddings_hidden(ContextId cid,
                             const metal_compute::SharedBuffer& x, int n);
+
+  // ---- On-device AWQ calibration ------------------------------------------
+  // Accumulate per-input-channel running |x| abs-max for the qkv / gate-up /
+  // down Linear inputs across every prefill chunk run while enabled. The taps
+  // sit in the verified forward (guarded; no effect when off) -- so this is
+  // the model's REAL activation distribution, streamed layer-by-layer. While
+  // enabled, forward_embeddings_hidden runs the full MLP on every layer (no
+  // last-layer prune) so the deepest layer's stats cover all positions. Used
+  // to replace the offline HF calib script; feeds ModelQuantizer's AWQ folds.
+  // Dense full-attention models only (the v1.5 backbone); GDN/MoE not tapped.
+  void calib_begin();
+  void calib_end() { _calib_on = false; }
+  bool calibrating() const { return _calib_on; }
+  // [n_layers][channels] abs-max (hidden for qkv/gateup, ffn_inner for down).
+  const std::vector<std::vector<float>>& calib_qkv()    const { return _calib_qkv; }
+  const std::vector<std::vector<float>>& calib_gateup() const { return _calib_gu; }
+  const std::vector<std::vector<float>>& calib_down()   const { return _calib_dn; }
+
+  // ---- Streaming per-layer MoE calibration (calib_stream load) ------------
+  // The memory-safe layer-by-layer calibration forward: the MoE counterpart of
+  // the calib_begin()/forward_embeddings_hidden() full-model path. The model is
+  // loaded with Config::calib_stream so _layers carry no weights; the streaming
+  // orchestrator (collect_backbone_calibration_streaming) then, for each layer
+  // L: calib_build_layer (load ONLY layer L's weights into _layers[L]),
+  // calib_run_layer (run layer L's forward over the held residual stream,
+  // advancing it in place + tapping the per-input-channel |activation| incl.
+  // PER-EXPERT gate/up + down stats), calib_free_layer (drop _layers[L]). Peak
+  // resident stays ~one layer's weights. calib_begin_streaming sizes the
+  // accumulators; the per-expert stats are exposed below.
+  void calib_begin_streaming();
+  bool calib_build_layer(const class MetalLlamaWeights& wts, int L,
+                         std::uint64_t* bytes_out, std::string* err);
+  // resid[s] is sequence s's [seq_lens[s]*hidden] f16 residual stream, advanced
+  // in place by layer L. Reuses _ctx for the (transient, per-seq) KV / GDN
+  // conv+ssm state. Taps into the accumulators. Returns false + *err on failure.
+  bool calib_run_layer(int L, std::vector<metal_compute::SharedBuffer>& resid,
+                       const std::vector<int>& seq_lens, std::string* err);
+  void calib_free_layer(int L);
+  // [n_layers][n_experts*hidden] per-expert routed gate/up input abs-max and
+  // [n_layers][n_experts*moe_inner] per-expert down input abs-max.
+  const std::vector<std::vector<float>>& calib_expert_gateup() const {
+    return _calib_eg;
+  }
+  const std::vector<std::vector<float>>& calib_expert_down() const {
+    return _calib_ed;
+  }
 
   // OPTIMIZED single-token decode from a pre-computed [hidden] embedding row
   // (the MOSS-TTS summed embedding), in the compute dtype. Reuses the
@@ -690,6 +757,15 @@ private:
   // Per-session batched pipelined-decode state (bdecode_*). One session at
   // a time (the realtime-vqa stage decodes one scene's branches), so this
   // is a single member rather than a per-cid map like _pdec.
+  // Run-ahead ring (mirrors PDecode): up to `depth` committed steps in
+  // flight, so the CPU encode of step N+1 AND the host's emit/stop-check
+  // both overlap the GPU's step N. Unlike the serial pdecode, depth>1 needs
+  // NO rollback machinery (no GDN ring, no kv_rollback): constant-N bdecode
+  // already over-advances stopped branches' KV/GDN by design and bdecode_end
+  // never rolls back -- a speculative uncollected tail is the same kind of
+  // discard. Collected rows stay byte-identical: the GPU event chain orders
+  // the steps and the embed gather reads gen_ids on-device.
+  // VPIPE_QWEN_BDECODE_DEPTH overrides (default 2, 1 = the old lockstep).
   struct BDecode {
     std::vector<ContextId>      cids;        // the N branch contexts
     std::vector<int>            rope_base;   // mROPE anchor / -1 sequential
@@ -699,14 +775,18 @@ private:
     metal_compute::SharedBuffer sample_ws;   // [N][vocab] f16 (sampled)
     metal_compute::CommandStream stream;
     metal_compute::Event ev;
-    metal_compute::CommandStream::Fence inflight;
+    struct InFlight {
+      metal_compute::CommandStream::Fence fence;
+      int idx = -1;                          // gen_ids step row it writes
+    };
+    std::deque<InFlight> ring;               // FIFO of in-flight steps
     GpuSamplerParams sp;
     int           n             = 0;
     int           cap           = 0;   // gen_ids step capacity
-    int           produced      = 0;   // step rows finalised in gen_ids
-    int           pending       = -1;  // gen_ids row awaited by next()
+    int           produced      = 0;   // step rows drained via next()
+    int           committed     = 0;   // next step row to assign
+    int           depth         = 1;   // run-ahead pipeline depth
     std::uint64_t gpu_step      = 0;
-    bool          have_inflight = false;
     bool          active        = false;
   };
   BDecode _bdec_sess;
@@ -780,6 +860,9 @@ private:
     int q_bits = 4, k_bits = 4, v_bits = 4, o_bits = 4;
     int qkv_bits = 4, z_bits = 4, a_bits = 4, b_bits = 4, gout_bits = 4;
     int gate_bits = 4, up_bits = 4, down_bits = 4;
+    // Routed-expert (MoE switch_mlp) quant width: 4 or 8. Selects the w4/w8
+    // gather + grouped expert kernels at dispatch (router/shared stay w8).
+    int eg_bits = 4;
 
     // ---- Native k-quant (GGUF) weights (used iff the model is _kquant) --
     // Heterogeneous per-tensor quant (Q4_K_M mixes q4/q5/q6), so each
@@ -876,12 +959,19 @@ private:
       // weight ONCE instead of the MAXM=2 form's 2 grid.z tiles (the depth-2
       // cliff). Bit-identical per row; gated to the verify path (see _qmv4_*).
       _fn_qmv_batch4, _fn_qmv8_batch4, _fn_qmv_batch4_swiglu,
+      // MAXM=8 grouped-x tall tile (xp2) for m=7..8 (see _qmv8_enabled),
+      // its fused-swiglu twin, and the w8 twin (OptiQ mixed verify).
+      _fn_qmv_batch8_xp, _fn_qmv_batch8_xp_swiglu, _fn_qmv8_batch8_xp,
       // Matrix-core prefill: 4-bit -> dense expand + dense matmul2d GEMM,
       // the interleaved-gate/up SwiGLU combine for the matrix-core MLP, and
       // the matrix-core flash attention (head_dim 256, drop-in for qtile).
       _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_swiglu_inter,
       _fn_sdpa_mma,
       _fn_embed, _fn_argmax, _fn_sample,   // pipelined-decode kernels
+      // Unquantized dense f16 in-stream embed gather (raw-HF path): row gather
+      // from the [vocab, H] f16 table for decode_step_fast (the muxer covers
+      // forward/prefill via its dense-table ctor).
+      _fn_embed_dense,
       // Two-stage parallel argmax + histogram multi-tg sampler (the defaults;
       // _fn_argmax/_fn_sample are the VPIPE_QWEN_ARGMAX1/SAMPLE1 single-tg
       // fallbacks). Same kernels as Gemma's llm_elementwise.metal.
@@ -916,6 +1006,15 @@ private:
       _fn_moe_hist, _fn_moe_sort_setup, _fn_moe_scatter, _fn_moe_scatter_back,
       // Steel (matrix-tiled) grouped expert GEMM + the sorted-row gather.
       _fn_moe_qmm_grouped, _fn_moe_qmm_grouped_swiglu,
+      // 8-bit twins of the routed-expert kernels above (selected at dispatch
+      // when the experts are w8-quantized; router/shared gates stay w8).
+      _fn_moe_gather_swiglu_w8, _fn_moe_gather_down_w8,
+      _fn_moe_grouped_swiglu_w8, _fn_moe_grouped_down_w8,
+      _fn_moe_qmm_grouped_w8, _fn_moe_qmm_grouped_swiglu_w8,
+      // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
+      // affine gather_swiglu / gather_down / moe_gate above.
+      _fn_moe_gather_swiglu_dense, _fn_moe_gather_down_dense,
+      _fn_moe_gate_dense,
       _fn_dense_gemv, _fn_dense_gemm;
   // Decode full-attn switches to the multi-simdgroup paged kernel once
   // the context reaches this length (scalar wins at short ctx).
@@ -951,13 +1050,50 @@ private:
     const int s = (pos + 127) / 128;
     return s < 16 ? 16 : (s > 256 ? 256 : s);
   }
-  // MAXM=4 batched GEMV for the MTP verify at draft depth>=2 (n=3..4): read
-  // each weight ONCE vs the MAXM=2 form's 2 grid.z tiles. _qmv4_enabled is the
-  // capability+env gate (VPIPE_MTP_QMV4); _qmv4_active is set ONLY while
-  // mtp_verify_chunk_ encodes (so the realtime-vqa batched decode, which the
-  // MAXM=2 form was tuned for, is untouched). Picked by qmm_auto_ et al.
+  // Adaptive batched GEMV: read each weight ONCE per MAXM rows vs the MAXM=2
+  // form's ceil(m/2) grid.z tiles. qmm_auto_ et al. pick MAXM by row count m:
+  // m in 3..4 -> MAXM=4 (one tile), else m>1 -> MAXM=2, else m==1 -> plain qmv.
+  // MAXM=4 is the MTP verify's depth-2 cliff win (n=3..4, the >L2 lm_head).
+  // m=5..6 (realtime-vqa batched decode) STAYS on MAXM=2. The REGISTER-
+  // resident MAXM=8 form blows the register budget (occupancy collapse,
+  // ~4x slower at m=5..8) and must not come back; m=7..8 instead uses the
+  // GROUPED-x xp2 kernel (affine_qmv_batch8_xp2_w4g64: weight packs hoisted
+  // to registers, x register-resident 2 rows at a time) -- one weight read
+  // for 8 rows at a ~43 GB/s pass vs MAXM=2's ~129, a measured ~1.3x win on
+  // the >=14MB matrices whose grid.z re-reads are NOT cache-served (the
+  // qmv_batch_bandwidth_sweep audit; o-proj-size matrices ARE SLC-served and
+  // neutral). Bit-identical per row. _qmv4_enabled gates the MAXM=4 tier
+  // (VPIPE_MTP_QMV4); _qmv8_enabled gates the xp2 tier (VPIPE_QMV_XP8),
+  // affine-4bit only.
   bool _qmv4_enabled = false;
-  bool _qmv4_active = false;
+  bool _qmv8_enabled = false;
+  // m=5..6 heterogeneous 2-read plan: one MAXM=4 tile (rows 0..3) + one
+  // MAXM=2 tile (rows 4..m-1) instead of the homogeneous 3-tile MAXM=2
+  // plan's 3 weight reads -- ~1.17x on the >=14MB matrices, bit-identical
+  // per row (each row runs a verified kernel). VPIPE_QMV_MIX56=0 reverts.
+  bool _qmv_mix56 = false;
+  // ---- Per-machine batched-GEMV LADDER (probed at first decode) -------
+  // Every tile kernel is bit-identical per row, so the per-m plan is a
+  // pure PERF choice, and plan costs are ADDITIVE in tile times (the
+  // encoder serializes dispatches; measured within 1% on M5). Probing
+  // just THREE single-tile times -- T2 (MAXM=2), T4 (xp4), T8 (xp2) --
+  // on real gate|up weights CYCLED ACROSS LAYERS (so every dispatch is
+  // DRAM-cold regardless of the machine's SLC size) therefore resolves
+  // the whole ladder per machine: bigger-SLC / more-core chips (M4 Pro /
+  // Max / Ultra) that re-serve tile re-reads or under-fill the tall
+  // one-read kernels get their own crossovers instead of this M5's.
+  // Static defaults (= the M5-measured ladder) apply when the probe is
+  // skipped (VPIPE_QMV_AUTOTUNE=0, MoE/mixed/k-quant, missing kernels).
+  enum class QmvPlan : std::uint8_t {
+    kTile2,   // MAXM=2, grid.z = ceil(m/2)
+    kXp4,     // xp4 tiles, grid.z = ceil(m/4)
+    kXp8,     // one xp2/xh16 tall tile
+    kMix4R,   // xp4 head (rows 0..3) + MAXM=2 tail (rows 4..m-1)
+  };
+  QmvPlan _qmv_plan[kQmvBatchMaxRows + 1] = {};
+  bool _qmv_plan_probed = false;
+  void qmv_ladder_defaults_();
+  void autotune_qmv_ladder_();
   // Matrix-core prefill path (M5+). Set at load when the GPU has matrix
   // cores (MetalCompute::supports_matrix_cores()) and both the dequant +
   // dense matmul2d kernels validated. When on, prefill projections with
@@ -1283,6 +1419,25 @@ private:
   // de-fused affine dispatch (Layer.*_bits + the separate triples) instead
   // of the fused single-bit-width path. Mutually exclusive with _kquant.
   bool _mixed = false;
+  // Unquantized dense f16 (raw-HF bf16 checkpoint, narrowed to the compute
+  // element at load): each linear is a plain [N,K] f16 weight in the same
+  // fused/interleaved *w slot, with its *s/*b triples left EMPTY. The forward
+  // dispatches the dense GEMM/GEMV when the scales buffer is empty. Mutually
+  // exclusive with _kquant / _mixed / is_moe().
+  bool _dense = false;
+  // MOSS-TTS text artifact: an AFFINE backbone whose embed/tied-lm_head were
+  // kept bf16 on disk (no .scales). The embed table + tied lm_head bind via
+  // the dense f16 path (muxer gather + dense GEMV head) so the full-precision
+  // head is not double-quantized, while the backbone stays affine. The
+  // backbone linears still dispatch the affine kernels (this flag is NOT
+  // _dense). Mutually exclusive with _dense / _kquant.
+  bool _dense_embed = false;
+  // On-device AWQ calibration accumulators (per-layer per-channel |x| abs-max).
+  bool _calib_on = false;
+  std::vector<std::vector<float>> _calib_qkv, _calib_gu, _calib_dn;
+  // Streaming per-expert accumulators: [n_layers][n_experts*hidden] routed
+  // gate/up input abs-max, [n_layers][n_experts*moe_inner] down input abs-max.
+  std::vector<std::vector<float>> _calib_eg, _calib_ed;
   // Affine bit width of the (tied) embed table / lm_head. OptiQ keeps these
   // at 8-bit; the muxer gather + lm_head qmv pick the matching kernel.
   int  _embed_bits = 4;
@@ -1326,6 +1481,9 @@ private:
   // + down [H]; sigmoid gate [1].
   metal_compute::SharedBuffer _d_moe_logits, _d_moe_ids, _d_moe_w,
       _d_moe_act, _d_moe_part, _d_moe_out, _d_moe_ssg, _d_moe_sout, _d_moe_gate;
+  // Single-zero pair_eid for the dense-MoE shared-expert gather (the shared
+  // expert is one slab -> "expert 0", top_k=1). Allocated lazily in load.
+  metal_compute::SharedBuffer _moe_zero_eid;
   // 1-int scratch for decode_step_fast: input token id (in-stream embed)
   // and on-GPU argmax output.
   metal_compute::SharedBuffer _d_tok_in, _d_argmax_id;

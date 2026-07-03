@@ -201,7 +201,7 @@ public:
   const std::string& language() const noexcept { return _language; }
   int  max_frame_gap_ms() const noexcept { return _max_frame_gap_ms; }
   int  idle_ticks_to_end() const noexcept { return _idle_ticks_to_end; }
-  bool prev_scene_recap() const noexcept { return _prev_scene_recap; }
+  bool scene_overlap() const noexcept { return _scene_overlap; }
   std::uint64_t scenes_closed() const noexcept { return _scenes_closed; }
   // Total iport2 audio-tagging beats released by the timestamp-gated drain
   // (across both the MLX and metal paths). Test-visible: a stuck audio
@@ -213,6 +213,11 @@ public:
   // visible so a PCM run can assert the audio was actually encoded + spliced.
   std::uint64_t audio_tokens_spliced() const noexcept
   { return _audio_tokens_spliced; }
+  // Total scenes that re-issued the previous scene's last frame as their
+  // first frame (scene-overlap fired). Test-visible so a multi-scene run
+  // can assert the continuity overlap actually engaged.
+  std::uint64_t overlaps_applied() const noexcept
+  { return _overlaps_applied; }
 #if defined(VPIPE_BUILD_APPLE_SILICON)
   // Size of the reusable per-question branch pool (metal path). Reserved
   // once on the first scene and reused thereafter; test-visible so a
@@ -257,27 +262,25 @@ private:
   // inheriting stage tracks a later session set_language().
   std::string effective_language_() const;
 
-  // Assemble the user-turn text preamble shared by both prompt builders:
-  // the local date/time anchor, an optional prior-scene recap, and the
-  // iport2 audio sound timeline (<X.Y seconds> markers, scene-relative to
-  // base_ts_us). `audio` is the drained non-Silence events.
+  // Assemble the user-turn text preamble: the local date/time anchor and
+  // the iport2 audio sound timeline (<X.Y seconds> markers, scene-relative
+  // to base_ts_us). `audio` is the drained non-Silence events. (Cross-
+  // scene continuity is carried by the scene-overlap frame, not by text.)
   std::string build_preamble_(
       std::uint64_t                                            first_ts_us,
-      const std::string&                                       prev_desc,
       const std::vector<std::pair<std::uint64_t, std::string>>& audio,
       std::uint64_t                                            base_ts_us,
       bool                                                     audio_wired) const;
 
-  // The prior scene's description to carry into THIS scene's describe
-  // recap -- or empty when it should not be carried. Empty unless the
-  // recap feature is enabled (_prev_scene_recap) AND the two scenes are
-  // temporally continuous: the gap from the previous scene's last frame
-  // (prev_last_ts_us) to this scene's first frame (this_first_ts_us) is
-  // below the scene-splitting gap (_max_frame_gap_ms). A new, unrelated
-  // scene gets an empty recap so the model can't echo a stale frame.
-  std::string prev_recap_(const std::string& prev_desc,
-                          std::uint64_t      prev_last_ts_us,
-                          std::uint64_t      this_first_ts_us) const;
+  // True when THIS scene should overlap with the previously-closed scene:
+  // the scene-overlap feature is enabled (_scene_overlap) AND the two
+  // scenes are temporally continuous -- the gap from the previous scene's
+  // last frame (prev_last_ts_us) to this scene's first frame
+  // (this_first_ts_us) is below the scene-splitting gap (_max_frame_gap_ms).
+  // When true, m_close_scene_ re-issues the carried-over last frame as this
+  // scene's first frame. A new, unrelated scene is not overlapped.
+  bool scenes_continuous_(std::uint64_t prev_last_ts_us,
+                          std::uint64_t this_first_ts_us) const;
 
   // Lazily verify (or seed) the <camera>-video-questions sub-db; append a
   // new questions epoch keyed by ts_us when the stored set differs. No-op
@@ -340,11 +343,14 @@ private:
   int                      _catch_up_drop{};
   bool                     _batched_decode{};
   // GPU-resident pipelined SINGLE-branch decode (metal); default true. It
-  // overlaps host/GPU per token, a clear win for a lone branch. Batched
-  // (multi-question) decode never pipelines -- the pipelined batched path
-  // is constant-N and wastes work on staggered answers -- so this flag
+  // overlaps host/GPU per token, a clear win for a lone branch. This flag
   // governs single decode only (see m_decode_ vs m_decode_batched_).
   bool                     _pipelined_decode{};
+  // OPT-IN GPU-resident pipelined BATCHED decode (bdecode_* + the run-ahead
+  // driver loop); default false: it is constant-N, and the shrinking sync
+  // path wins on staggered answer lengths (it drops finished branches).
+  // Enable when answers finish at similar lengths (short capped answers).
+  bool                     _pipelined_batched_decode{};
   std::optional<bool>      _disable_thinking;
   std::vector<std::string> _questions;
   // Instruction prepended to EVERY per-question user turn (after the scene
@@ -356,13 +362,13 @@ private:
   // (en-us / zh-cn / zh-tw) that pins the built-in scene prompts. Read via
   // effective_language_() at scene time.
   std::string              _language;
-  // When true (default), the previous scene's description is carried into
-  // the next scene's describe prompt as a recap -- but ONLY when the two
-  // scenes are temporally CONTINUOUS (small inter-scene gap). A new,
-  // unrelated scene must not inherit the prior description, or the model
-  // echoes it verbatim and the output locks onto a stale frame. Config
-  // key "prev_scene_recap"; set false to disable the recap entirely.
-  bool                     _prev_scene_recap{};
+  // When true (default), the previous scene's last frame/frame-pair vision
+  // tokens are re-issued as the next scene's FIRST frame -- but ONLY when
+  // the two scenes are temporally CONTINUOUS (small inter-scene gap) -- so
+  // an action spanning the boundary stays visible to the VLM. This replaced
+  // the old textual recap, which small models echoed verbatim or ignored.
+  // Config key "scene_overlap"; set false to disable.
+  bool                     _scene_overlap{};
   float                    _video_fps{};
 
 
@@ -412,9 +418,17 @@ private:
   std::uint64_t                            _m_last_ts_us  = 0;
   bool                                     _m_has_ts      = false;
   std::uint64_t                            _m_last_recv_ts_us = 0;
-  std::string                             _m_prev_desc;
+  // Scene-overlap carry-over (replaces the old textual recap): the last
+  // frame/frame-pair's encoded vision tokens from the previously-closed
+  // scene. When the next scene is temporally continuous (scenes_continuous_)
+  // this grid is re-issued as that scene's FIRST frame so an action
+  // spanning the boundary stays visible to the VLM. Consumed at most once.
+  MImg                                     _m_carry_img;
+  std::uint64_t                            _m_carry_marker_ts_us = 0;
+  std::uint64_t                            _m_carry_real_ts_us   = 0;
+  bool                                     _m_has_carry          = false;
   // Last (real) frame timestamp of the previously-closed scene; with this
-  // scene's first timestamp it gates the _m_prev_desc recap (continuity).
+  // scene's first timestamp it gates the scene-overlap carry (continuity).
   std::uint64_t                           _m_prev_last_ts_us = 0;
   bool _m_vision_warned = false;
   bool _m_tpl_warned    = false;
@@ -496,6 +510,7 @@ private:
   std::uint64_t                _next_scene_idx = 0;
   std::uint64_t                _audio_beats_released = 0;
   std::uint64_t                _audio_tokens_spliced = 0;
+  std::uint64_t                _overlaps_applied     = 0;
 
   // ---- Shared scene/audio/persistence state (BOTH paths) ----
   // camera_name latched from the first iport0 frame of the scene

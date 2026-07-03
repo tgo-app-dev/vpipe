@@ -55,6 +55,22 @@ FeedbackRxStage::initialize(RuntimeContext&)
         "FeedbackRxStage('{}'): no ThreadPool on session",
         this->id()));
   }
+  // Per-launch reset. Stage objects outlive a stop (the handle only
+  // destroys the runtime), so a stopped run leaves _eos=true (its read
+  // returned null when the buffers closed) plus the last run's beat +
+  // seq behind. Without this reset a RELAUNCH is dead on arrival: the
+  // paired tx's wait_new_beat resolves instantly on the stale _eos,
+  // sees no new beat, and signals done -- closing the loop's trigger
+  // edge before the first round can run. _waiters is necessarily empty
+  // here (the prior run's waiters were woken by the EOS path before
+  // its runtime was destroyed); cleared for the record.
+  {
+    lock_guard<mutex> lk(_mu);
+    _eos = false;
+    _seq = 0;
+    _last.reset();
+    _waiters.clear();
+  }
   co_return;
 }
 

@@ -392,3 +392,184 @@ kernel void dense_gemv_t_f16(
   dense_gemv_t_impl<VPIPE_ELT, /*RPS=*/4, /*VPT=*/8, /*NSG=*/2>(
       x, W, y, K, N, tid, simd_gid, simd_lid);
 }
+
+// ---- Dense f16 Mixture-of-Experts gather GEMVs (raw-HF bf16 MoE) ---------
+// The dense twins of affine_gather_qmv_swiglu_w4g64 / affine_gather_down /
+// affine_moe_gate: same on-GPU routing contract (pair_eid selects the expert
+// slab), plain f16 weights (no scales/biases). They plug into the identical
+// moe_route / moe_combine / moe_finalize flow as the affine path, so a dense
+// MoE forward is the affine forward with these GEMVs swapped in.
+
+// Gather gate|up + fused SwiGLU: per pair p, expert e = pair_eid[p]; read the
+// expert slab w[e] [2*inner, K] (interleaved row 2g=gate, 2g+1=up), x row =
+// p/top_k, write act[p, inner] = silu(gate)*up. grid {32, (2*inner)/8, npair},
+// tg {32, 2, 1}; mirrors qmv_swiglu_impl's (g0,u0,g1,u1) RPS=4 layout.
+kernel void dense_moe_gather_swiglu_f16(
+    const device VPIPE_ELT* w        [[buffer(0)]],   // [E, 2*inner, K]
+    const device VPIPE_ELT* x        [[buffer(1)]],   // [M, K] input rows
+    device VPIPE_ELT*       y         [[buffer(2)]],   // [npair, inner]
+    const constant int&     K         [[buffer(3)]],   // in_vec_size
+    const constant int&     N         [[buffer(4)]],   // 2*inner
+    const device int*       pair_eid  [[buffer(5)]],   // [npair]
+    const constant int&     top_k     [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int VPT = 8, NSG = 2, RPS = 4;
+  constexpr int block_size = VPT * DG_SIMD_SIZE;
+  typedef float U;
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const device VPIPE_ELT* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device VPIPE_ELT* xr = x + (int64_t)(p / top_k) * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  const device VPIPE_ELT* wl = we + (int64_t)out_row * K + simd_lid * VPT;
+  const device VPIPE_ELT* xl = xr + simd_lid * VPT;
+  thread U x_thread[VPT];
+  U result[RPS] = {0};
+  for (int k = 0; k < K; k += block_size) {
+    const int v = K - (k + (int)simd_lid * VPT);
+    if (v >= VPT) {
+#pragma clang loop unroll(full)
+      for (int i = 0; i < VPT; i++) { x_thread[i] = (U)xl[i]; }
+      for (int row = 0; row < RPS; row++) {
+        const device VPIPE_ELT* wr = wl + (int64_t)row * K;
+        U acc = 0;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < VPT; i++) { acc += x_thread[i] * (U)wr[i]; }
+        result[row] += acc;
+      }
+    } else if (v > 0) {
+      for (int i = 0; i < VPT; i++) {
+        x_thread[i] = (i < v) ? (U)xl[i] : (U)0;
+      }
+      for (int row = 0; row < RPS; row++) {
+        const device VPIPE_ELT* wr = wl + (int64_t)row * K;
+        U acc = 0;
+        for (int i = 0; i < v; i++) { acc += x_thread[i] * (U)wr[i]; }
+        result[row] += acc;
+      }
+    }
+    wl += block_size;
+    xl += block_size;
+  }
+  for (int row = 0; row < RPS; row++) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    // out_row even -> (g0,u0,g1,u1) for inner features out_row/2 and +1.
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)(N / 2) + (out_row >> 1);
+    const U g0 = result[0], u0 = result[1], g1 = result[2], u1 = result[3];
+    yo[0] = (VPIPE_ELT)((g0 / (1.0f + metal::exp(-g0))) * u0);
+    yo[1] = (VPIPE_ELT)((g1 / (1.0f + metal::exp(-g1))) * u1);
+  }
+}
+
+// Gemma-4 MoE twin of dense_moe_gather_swiglu_f16: identical gather + RPS=4
+// (g0,u0,g1,u1) layout over the interleaved [E, 2*inner, K] slab, but the
+// activation is gelu_pytorch_tanh(gate)*up (matches geglu_f16 / qmv_geglu_impl)
+// instead of silu(gate)*up. Used by the raw-HF bf16 Gemma MoE expert gather.
+kernel void dense_moe_gather_geglu_f16(
+    const device VPIPE_ELT* w        [[buffer(0)]],   // [E, 2*inner, K]
+    const device VPIPE_ELT* x        [[buffer(1)]],   // [M, K] input rows
+    device VPIPE_ELT*       y         [[buffer(2)]],   // [npair, inner]
+    const constant int&     K         [[buffer(3)]],   // in_vec_size
+    const constant int&     N         [[buffer(4)]],   // 2*inner
+    const device int*       pair_eid  [[buffer(5)]],   // [npair]
+    const constant int&     top_k     [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int VPT = 8, NSG = 2, RPS = 4;
+  constexpr int block_size = VPT * DG_SIMD_SIZE;
+  typedef float U;
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const device VPIPE_ELT* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device VPIPE_ELT* xr = x + (int64_t)(p / top_k) * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  const device VPIPE_ELT* wl = we + (int64_t)out_row * K + simd_lid * VPT;
+  const device VPIPE_ELT* xl = xr + simd_lid * VPT;
+  thread U x_thread[VPT];
+  U result[RPS] = {0};
+  for (int k = 0; k < K; k += block_size) {
+    const int v = K - (k + (int)simd_lid * VPT);
+    if (v >= VPT) {
+#pragma clang loop unroll(full)
+      for (int i = 0; i < VPT; i++) { x_thread[i] = (U)xl[i]; }
+      for (int row = 0; row < RPS; row++) {
+        const device VPIPE_ELT* wr = wl + (int64_t)row * K;
+        U acc = 0;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < VPT; i++) { acc += x_thread[i] * (U)wr[i]; }
+        result[row] += acc;
+      }
+    } else if (v > 0) {
+      for (int i = 0; i < VPT; i++) {
+        x_thread[i] = (i < v) ? (U)xl[i] : (U)0;
+      }
+      for (int row = 0; row < RPS; row++) {
+        const device VPIPE_ELT* wr = wl + (int64_t)row * K;
+        U acc = 0;
+        for (int i = 0; i < v; i++) { acc += x_thread[i] * (U)wr[i]; }
+        result[row] += acc;
+      }
+    }
+    wl += block_size;
+    xl += block_size;
+  }
+  for (int row = 0; row < RPS; row++) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    // out_row even -> (g0,u0,g1,u1) for inner features out_row/2 and +1.
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)(N / 2) + (out_row >> 1);
+    const U g0 = result[0], u0 = result[1], g1 = result[2], u1 = result[3];
+    const U k0 = 0.7978845608028654f;                // sqrt(2/pi)
+    const U t0 = metal::precise::tanh(k0 * (g0 + 0.044715f * g0 * g0 * g0));
+    const U t1 = metal::precise::tanh(k0 * (g1 + 0.044715f * g1 * g1 * g1));
+    yo[0] = (VPIPE_ELT)(0.5f * g0 * (1.0f + t0) * u0);
+    yo[1] = (VPIPE_ELT)(0.5f * g1 * (1.0f + t1) * u1);
+  }
+}
+
+// Gather down: per pair p, expert e = pair_eid[p]; read down slab w[e] [H,
+// inner], x = act[p, inner] -> partials[p, H] (UN-weighted; moe_combine
+// applies the routing weight). grid {32, H/8, npair}, tg {32, 2, 1}.
+kernel void dense_moe_gather_down_f16(
+    const device VPIPE_ELT* w        [[buffer(0)]],   // [E, H, inner]
+    const device VPIPE_ELT* x        [[buffer(1)]],   // [npair, inner]
+    device VPIPE_ELT*       y         [[buffer(2)]],   // [npair, H]
+    const constant int&     K         [[buffer(3)]],   // inner
+    const constant int&     N         [[buffer(4)]],   // H
+    const device int*       pair_eid  [[buffer(5)]],   // [npair]
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const device VPIPE_ELT* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device VPIPE_ELT* xr = x + (int64_t)p * (int64_t)K;
+  dense_gemv_t_impl<VPIPE_ELT, /*RPS=*/4, /*VPT=*/8, /*NSG=*/2>(
+      xr, we, y + (int64_t)p * (int64_t)N, K, N, tid, simd_gid, simd_lid);
+}
+
+// Shared-expert sigmoid gate (dense f16): g[t] = sigmoid(w[1,K] . x[t]).
+// One simdgroup per input row (tid.y = row). grid {32, M, 1}, tg {32, 1, 1}.
+kernel void dense_moe_gate_f16(
+    const device VPIPE_ELT* w        [[buffer(0)]],   // [1, K]
+    const device VPIPE_ELT* x        [[buffer(1)]],   // [M, K]
+    device VPIPE_ELT*       outg      [[buffer(2)]],   // [M]
+    const constant int&     K         [[buffer(3)]],
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+  const device VPIPE_ELT* xr = x + (int64_t)tid.y * (int64_t)K;
+  float acc = 0.0f;
+  for (int k = (int)simd_lid; k < K; k += DG_SIMD_SIZE) {
+    acc += (float)w[k] * (float)xr[k];
+  }
+  acc = simd_sum(acc);
+  if (simd_lid == 0) {
+    outg[tid.y] = (VPIPE_ELT)(1.0f / (1.0f + metal::exp(-acc)));
+  }
+}

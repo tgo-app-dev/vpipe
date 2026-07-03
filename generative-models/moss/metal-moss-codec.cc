@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -523,6 +524,37 @@ MetalMossCodec::load(const std::string& model_dir,
       !self->_fn_sdpa.valid() || !self->_fn_rope.valid()) {
     return nullptr;
   }
+
+  // M5 matrix-core decode acceleration (mirrors MetalMossCodecV2): the f16
+  // dense GEMM -> matmul2d, and the scalar windowed-causal attention -> the
+  // head_dim-64 flash kernel. Gated on GPU matrix-core support so M4/older
+  // keep the byte-identical steel+scalar path. VPIPE_MOSS_CODEC_NO_MMA2 /
+  // NO_ATTN_MMA force the steel/scalar path (A/B + safety). The int8 GEMM
+  // (fused affine steel) is left unchanged.
+  if (mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_MOSS_CODEC_NO_MMA2") == nullptr) {
+    self->_lib_dense_mma = mc->load_library("dense_gemm_mma");
+    self->_fn_gemm_mma =
+        self->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
+    self->_fn_gemm_mma_deep =
+        self->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
+    self->_mma_available =
+        self->_fn_gemm_mma.valid() && self->_fn_gemm_mma_deep.valid();
+    self->_use_mma2 = self->_mma_available;
+    // Int8 (w8 g32) matrix-core GEMM: dequant-once (-> f16 dense_gemm_mma).
+    // Only meaningful in int8 mode; the kernel load is harmless otherwise.
+    self->_lib_dequant = mc->load_library("affine_dequant");
+    self->_fn_dequant_w8g32 =
+        self->_lib_dequant.function("affine_dequant_w8g32");
+  }
+  if (mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_MOSS_CODEC_NO_ATTN_MMA") == nullptr) {
+    self->_lib_sdpa_mma = mc->load_library("sdpa_mma");
+    self->_fn_sdpa_mma =
+        self->_lib_sdpa_mma.function("sdpa_causal_mma2_d64_f16");
+    self->_attn_mma_available = self->_fn_sdpa_mma.valid();
+    self->_use_attn_mma = self->_attn_mma_available;
+  }
   self->_ok = true;
   return self;
 }
@@ -621,11 +653,44 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
   SharedBuffer out =
       (out_dim != d) ? buf((std::size_t)T * out_dim) : SharedBuffer{};
 
+  // Int8 + matrix-core: one reusable f16 scratch to dequant each weight into
+  // before the f16 dense_gemm_mma (dequant-once). matmul2d streams f16 from
+  // DRAM (it can't consume int8), so materializing once here + the fast direct
+  // matmul2d beats every fused int8 path at the codec's M. Sized to the stage's
+  // largest weight [N,K]; allocated only when this stage has int8 weights.
+  // (Double-buffering to overlap the dequant with the prior matmul was measured
+  // a no-op -- the ~15% over f16 is the materialization bandwidth, not a stall.)
+  const bool stage_int8 =
+      !st.layers.empty() && st.layers[0].qkvw.is_int8();
+  SharedBuffer deqw;
+  if (_use_mma2 && _fn_dequant_w8g32.valid() && stage_int8) {
+    const int mx = std::max(std::max(3 * d, ff), std::max(in_dim, out_dim));
+    deqw = buf((std::size_t)d * (std::size_t)mx);
+  }
+
   metal_compute::CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
     auto gemm = [&](const SharedBuffer& xin, const SharedBuffer& w,
                     const SharedBuffer& y, int M, int N, int K) {
+      if (_use_mma2) {
+        // M5 matrix-core matmul2d GEMM y = x @ w^T (no bias). n128 tile fits
+        // every codec GEMM (max K = ff = 5120 < the 6144 deep threshold).
+        const bool deep = (K >= 6144);
+        const int BN = deep ? 256 : 128;
+        enc.set_function(deep ? _fn_gemm_mma_deep : _fn_gemm_mma);
+        enc.set_buffer(0, xin);
+        enc.set_buffer(1, w);
+        enc.set_buffer(2, w);
+        enc.set_buffer(3, y);
+        enc.set_constant(4, K);
+        enc.set_constant(5, N);
+        enc.set_constant(6, M);
+        enc.set_constant(7, 0);
+        enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
+                      (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_gemm);
       enc.set_buffer(0, xin);
       enc.set_buffer(1, w);
@@ -645,6 +710,22 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
     auto gemm_q = [&](const SharedBuffer& xin, const QuantWeight& qw,
                       const SharedBuffer& y, int M, int N, int K) {
       if (!qw.is_int8()) { gemm(xin, qw.w, y, M, N, K); return; }
+      if (_use_mma2 && !deqw.empty()) {
+        // M5 matrix-core int8: dequant the w8g32 weight to f16 once (grid
+        // {K/4, N}), then the f16 matmul2d GEMM reads it (GPU-ordered in this
+        // command buffer). Beats both the steel w8 GEMM and a fused dequant-
+        // in-matmul2d at the codec's M (the fused kernel re-dequants per tile).
+        enc.set_function(_fn_dequant_w8g32);
+        enc.set_buffer(0, qw.w);
+        enc.set_buffer(1, qw.scale);
+        enc.set_buffer(2, qw.bias);
+        enc.set_buffer(3, deqw);
+        enc.set_constant(4, K);
+        enc.set_constant(5, N);
+        enc.dispatch({(unsigned)(K / 4), (unsigned)N, 1}, {64, 1, 1});
+        gemm(xin, deqw, y, M, N, K);
+        return;
+      }
       enc.set_function(_fn_qmm8g32);
       enc.set_buffer(0, qw.w);
       enc.set_buffer(1, qw.scale);
@@ -721,6 +802,30 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
     };
     auto attn = [&](const SharedBuffer& q, const SharedBuffer& k,
                     const SharedBuffer& v, const SharedBuffer& outb) {
+      const int zero = 0;
+      if (_use_attn_mma && hd == 64) {
+        // M5 matrix-core windowed-causal flash attention (BQ=16 query tile,
+        // 128 threads). Drop-in: same [heads,T,hd] layout + causal/window
+        // semantics; ring_cap unused (linear addressing).
+        enc.set_function(_fn_sdpa_mma);
+        enc.set_buffer(0, q);
+        enc.set_buffer(1, k);
+        enc.set_buffer(2, v);
+        enc.set_buffer(3, outb);
+        enc.set_constant(4, scale);
+        enc.set_constant(5, T);
+        enc.set_constant(6, hd);
+        enc.set_constant(7, heads);
+        enc.set_constant(8, heads);
+        enc.set_constant(9, T);
+        enc.set_constant(10, zero);
+        enc.set_constant(11, T);
+        enc.set_constant(12, c.context);
+        enc.set_constant(13, zero);
+        enc.dispatch({128, (unsigned)heads, (unsigned)((T + 15) / 16)},
+                     {128, 1, 1});
+        return;
+      }
       enc.set_function(_fn_sdpa);
       enc.set_buffer(0, q);
       enc.set_buffer(1, k);
@@ -732,7 +837,6 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       enc.set_constant(7, heads);      // Hq
       enc.set_constant(8, heads);      // Hkv
       enc.set_constant(9, T);          // n_q
-      const int zero = 0;
       enc.set_constant(10, zero);      // q_offset
       enc.set_constant(11, T);         // kv_stride
       enc.set_constant(12, c.context); // window (>= T => plain causal)

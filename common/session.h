@@ -86,6 +86,10 @@ public:
   getpasswd(const VpipeFormat& prompt, std::string& out,
             const std::function<bool()>& should_cancel) const override;
 
+  UiInputStatus
+  getmedialine(const VpipeFormat& prompt, std::string& out,
+               const std::function<bool()>& should_cancel) const override;
+
   std::unique_ptr<UiTextStream> open_text_stream() const override;
 
   std::string language() const override;

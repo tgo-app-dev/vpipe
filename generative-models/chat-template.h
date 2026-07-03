@@ -13,6 +13,17 @@ namespace vpipe::genai {
 
 class Tokenizer;
 
+// One ordered piece of a mixed text/media user turn (see
+// ChatTemplate::render_user_turn_media). Text chunks carry the run's
+// text; Image/Audio chunks carry the encoder's soft-token count for
+// that item (the number of pad placeholders to emit at that position).
+struct MediaChunk {
+  enum class Kind : std::uint8_t { Text, Image, Audio };
+  Kind        kind     = Kind::Text;
+  std::string text;        // Kind::Text only
+  int         n_tokens = 0;  // Kind::Image / Kind::Audio only
+};
+
 // Per-model-family chat-template renderer.
 //
 // Different LLM families wrap user/assistant turns in different
@@ -71,6 +82,40 @@ public:
   {
     (void)image_token_counts;
     render_user_turn(content, is_first_turn, dst);
+  }
+
+  // Append a MIXED text/media user turn with the media embedded
+  // IN-LINE: `chunks` is the ordered decomposition of the turn (text
+  // runs and image/audio items exactly where the user placed them,
+  // e.g. from a parsed media-line), and each media chunk becomes the
+  // family's wrapped pad-token block at that position (Qwen3-VL:
+  // vision_start + image_pad×n + vision_end; Gemma-4: boi/pad/eoi,
+  // boa/pad/eoa). The caller then overlays encoder embeddings at the
+  // pad positions via prefill_multimodal (TokenRef splice), walking
+  // media chunks in the same order. Emits the full turn: user open +
+  // chunks + user close + assistant open (+ family extras), honoring
+  // is_first_turn like render_user_turn.
+  //
+  // Returns false -- with NOTHING appended to *dst -- when the family
+  // cannot render one of the requested modalities (text-only family,
+  // or an Audio chunk on an image-only family), so the caller can
+  // drop the media and fall back to a text-only turn. Default: only
+  // supported when every chunk is Text (delegates to
+  // render_user_turn on the concatenated text).
+  virtual bool
+  render_user_turn_media(std::span<const MediaChunk>   chunks,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const
+  {
+    std::string text;
+    for (const auto& c : chunks) {
+      if (c.kind != MediaChunk::Kind::Text) {
+        return false;
+      }
+      text += c.text;
+    }
+    render_user_turn(text, is_first_turn, dst);
+    return true;
   }
 
   // Token id used as the image-token placeholder in the rendered id
@@ -344,6 +389,19 @@ public:
   // stop tokens (eot/eom/end_of_text for Llama-3; im_end/endoftext
   // for ChatML) without scanning the whole vocab.
   virtual bool is_stop_token(std::int32_t id) const = 0;
+
+  // True when the rendered assistant-turn opener leaves an OPEN
+  // reasoning block -- i.e. the model starts generating INSIDE its
+  // thinking channel (Qwen3 family with thinking enabled: the extras
+  // end with `<think>\n`). Since that opening token lives in the
+  // PROMPT, it is never streamed through the detokenizer; chat stages
+  // check this and emit the unified thinking-start marker
+  // (media_line::kThinkStart) into the output stream themselves before
+  // the first generated token. Families whose models emit their own
+  // reasoning delimiters (Gemma-4's channel tokens) return false --
+  // the detokenizer's id rewrite covers them.
+  virtual bool assistant_prompt_opens_thinking() const noexcept
+  { return false; }
 
   // Sanitize a fully-decoded assistant turn for display/storage: strip
   // any model-internal reasoning the checkpoint emits but that should not

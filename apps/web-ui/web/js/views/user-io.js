@@ -28,6 +28,54 @@ function readMdPref() {
   catch (e) { return false; }
 }
 
+// Persisted preference for the "Thinking" toggle (off by default: the
+// model's reasoning segments collapse to a 💭 glyph).
+const THINK_KEY = 'vpipe_io_thinking';
+function readThinkPref() {
+  try { return localStorage.getItem(THINK_KEY) === '1'; }
+  catch (e) { return false; }
+}
+
+// Unified vpipe thinking markers. The backend detokenizers rewrite
+// every model family's reasoning begin/end tokens (Qwen <think>,
+// Gemma channel tokens) to this single pair, so the client only ever
+// sees these.
+const THINK_START = '<|__vpipe_think_start__|>';
+const THINK_END = '<|__vpipe_think_end__|>';
+
+// Split a line's text into ordered {think, text} segments. A close
+// marker with no preceding open means the message BEGAN inside a
+// thinking block (shouldn't normally happen — the backend emits the
+// start marker — but render it sanely); an open with no close means
+// thinking runs to end-of-message (mid-stream, or a truncated turn).
+function splitThinking(text) {
+  const segs = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const s = text.indexOf(THINK_START, pos);
+    const e = text.indexOf(THINK_END, pos);
+    if (s < 0 && e < 0) {
+      segs.push({ think: false, text: text.slice(pos) });
+      break;
+    }
+    if (e >= 0 && (s < 0 || e < s)) {
+      segs.push({ think: true, text: text.slice(pos, e) });
+      pos = e + THINK_END.length;
+      continue;
+    }
+    if (s > pos) { segs.push({ think: false, text: text.slice(pos, s) }); }
+    const e2 = text.indexOf(THINK_END, s + THINK_START.length);
+    if (e2 < 0) {
+      segs.push({ think: true, text: text.slice(s + THINK_START.length) });
+      break;
+    }
+    segs.push({ think: true,
+                text: text.slice(s + THINK_START.length, e2) });
+    pos = e2 + THINK_END.length;
+  }
+  return segs;
+}
+
 export function mountUserIo(body, actions) {
   clear(body);
 
@@ -42,6 +90,23 @@ export function mountUserIo(body, actions) {
                                      disabled: true });
   const sendBtn   = el('button', { class: 'btn primary', disabled: true },
                        t('common.send'), kbd('⏎'));
+
+  // Media attach controls, shown only while a getmedialine() request is
+  // pending (pending.media). Attached/dropped files are read as base64
+  // and held aside in `attachments`; a short visible placeholder
+  // (⟦img1⟧ / ⟦aud1⟧) marks the insertion point in the textarea and is
+  // expanded to the full media-line marker on send. Deleting the
+  // placeholder text drops the attachment.
+  const attachImgBtn = el('button',
+      { class: 'btn ghost', title: t('userio.attach_image') }, '🖼');
+  const attachAudBtn = el('button',
+      { class: 'btn ghost', title: t('userio.attach_audio') }, '🔊');
+  const fileImg = el('input', { type: 'file', accept: 'image/*' });
+  const fileAud = el('input', { type: 'file', accept: 'audio/*' });
+  fileImg.multiple = true;
+  fileAud.multiple = true;
+  for (const n of [attachImgBtn, attachAudBtn]) { n.style.display = 'none'; }
+  for (const n of [fileImg, fileAud]) { n.style.display = 'none'; }
 
   const clearBtn  = el('button', { class: 'btn ghost', onclick: () => {
     clear(consoleEl);
@@ -69,18 +134,34 @@ export function mountUserIo(body, actions) {
     rerenderAll();
   });
 
+  // Thinking toggle: reveal or collapse the model's reasoning
+  // segments (unified thinking markers in the streamed text).
+  let thinkEnabled = readThinkPref();
+  const thinkCheck = el('input', { type: 'checkbox' });
+  thinkCheck.checked = thinkEnabled;
+  const thinkToggle = el('label', { class: 'io-md-toggle',
+                                    title: t('userio.thinking_title') },
+                         thinkCheck, t('userio.thinking'));
+  thinkCheck.addEventListener('change', () => {
+    thinkEnabled = thinkCheck.checked;
+    try { localStorage.setItem(THINK_KEY, thinkEnabled ? '1' : '0'); }
+    catch (e) { /* storage blocked -- preference just won't persist */ }
+    rerenderAll();
+  });
+
   const hint = el('div', { class: 'io-hint' },
     el('kbd', { class: 'kbd' }, 'Ctrl+J'), t('userio.newline') + '  ·  ',
     el('kbd', { class: 'kbd' }, '⏎'), t('userio.send_word'));
 
   const root = el('div', { class: 'userio' },
     consoleEl,
-    el('div', { class: 'io-input' }, promptEl, input, sendBtn),
+    el('div', { class: 'io-input' }, promptEl, input,
+       attachImgBtn, attachAudBtn, fileImg, fileAud, sendBtn),
     hint);
   body.append(root);
-  // The pane header (owned by the workspace) carries the Markdown toggle
-  // + Clear button.
-  if (actions) { actions.append(mdToggle, clearBtn); }
+  // The pane header (owned by the workspace) carries the Thinking +
+  // Markdown toggles + Clear button.
+  if (actions) { actions.append(thinkToggle, mdToggle, clearBtn); }
 
   // Grow the textarea with its content up to a cap, then scroll.
   function autosize() {
@@ -91,8 +172,68 @@ export function mountUserIo(body, actions) {
   let lastSeq = 0;
   let pendingId = 0;        // id currently shown in the input box (0 = none)
   let lastAnsweredId = 0;   // highest request id we've already answered
+  let mediaPending = false; // current request accepts media attachments
   let stopped = false;
   const lineEls = new Map();   // seq -> element
+
+  // Pending attachments: placeholder text -> {kind:'im'|'au', size, b64}.
+  // `size` is the file's decoded byte count (the marker LENGTH field).
+  let attachSeq = 0;
+  const attachments = new Map();
+
+  function insertAtCursor(text) {
+    const s = input.selectionStart, e = input.selectionEnd;
+    const v = input.value;
+    input.value = v.slice(0, s) + text + v.slice(e);
+    input.selectionStart = input.selectionEnd = s + text.length;
+    autosize();
+    input.focus();
+  }
+
+  function addAttachment(file, kind) {
+    const reader = new FileReader();
+    reader.onerror = () => {
+      toast(t('userio.attach_failed', { name: file.name }), 'error');
+    };
+    reader.onload = () => {
+      // readAsDataURL yields "data:<mime>;base64,<data>"; keep the tail.
+      const url = String(reader.result);
+      const b64 = url.slice(url.indexOf(',') + 1);
+      attachSeq += 1;
+      const ph = (kind === 'im' ? '⟦img' : '⟦aud') + attachSeq + '⟧';
+      attachments.set(ph, { kind, size: file.size, b64 });
+      insertAtCursor(ph);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Route a file by MIME type; non-media files are rejected with a toast.
+  function addAttachmentAuto(file) {
+    const ty = file.type || '';
+    if (ty.startsWith('image/')) { addAttachment(file, 'im'); }
+    else if (ty.startsWith('audio/')) { addAttachment(file, 'au'); }
+    else { toast(t('userio.attach_unsupported', { name: file.name }),
+                 'error'); }
+  }
+
+  // Expand each still-present placeholder to its wire marker
+  // (<|__vpipe_base64_im_start__|>LENGTH,DATA<|__vpipe_base64_im_end__|>).
+  // Placeholders the user deleted just drop their attachment.
+  function expandAttachments(text) {
+    let out = text;
+    for (const [ph, a] of attachments) {
+      const tag = a.kind === 'im' ? 'im' : 'au';
+      const marker = '<|__vpipe_base64_' + tag + '_start__|>'
+          + a.size + ',' + a.b64
+          + '<|__vpipe_base64_' + tag + '_end__|>';
+      out = out.split(ph).join(marker);
+    }
+    return out;
+  }
+
+  function clearAttachments() {
+    attachments.clear();
+  }
 
   function atBottom() {
     return consoleEl.scrollHeight - consoleEl.scrollTop
@@ -153,14 +294,38 @@ export function mountUserIo(body, actions) {
   }
 
   // Fill a line node from its source text, in the current render mode.
+  // Thinking segments (unified markers) render dimmed when the
+  // Thinking toggle is on, and collapse to a bare 💭 when off; the
+  // non-thinking remainder honours the Markdown toggle as before.
   function renderLineBody(node, l) {
-    if (mdEnabled) {
-      node.classList.add('md');
-      node.replaceChildren(renderMarkdown(l.text));
-    } else {
-      node.classList.remove('md');
-      node.textContent = l.text;
+    node.classList.toggle('md', mdEnabled);
+    const hasThink = l.text.indexOf(THINK_START) >= 0
+        || l.text.indexOf(THINK_END) >= 0;
+    if (!hasThink) {
+      if (mdEnabled) {
+        node.replaceChildren(renderMarkdown(l.text));
+      } else {
+        node.textContent = l.text;
+      }
+      return;
     }
+    const parts = [];
+    for (const seg of splitThinking(l.text)) {
+      if (seg.think) {
+        if (thinkEnabled) {
+          parts.push(el('span', { class: 'thinking' },
+                        '💭 ' + seg.text));
+        } else {
+          parts.push(el('span', { class: 'thinking-hidden',
+                                  title: t('userio.thinking_hidden') },
+                        '💭'));
+        }
+      } else if (seg.text) {
+        parts.push(mdEnabled ? renderMarkdown(seg.text)
+                             : document.createTextNode(seg.text));
+      }
+    }
+    node.replaceChildren(...parts);
   }
 
   // Re-render every line already on screen (after the Markdown toggle
@@ -200,9 +365,10 @@ export function mountUserIo(body, actions) {
     step();
   }
 
-  function setPending(on, prompt, id, masked) {
+  function setPending(on, prompt, id, masked, media) {
     if (on) {
       pendingId = id;
+      mediaPending = !!media;
       promptEl.textContent = prompt || t('userio.input_requested');
       promptEl.classList.add('active');
       input.disabled = false;
@@ -212,24 +378,38 @@ export function mountUserIo(body, actions) {
       // than swapping element types.
       input.classList.toggle('masked', !!masked);
       input.setAttribute('placeholder',
-          masked ? t('userio.password_ph') : t('userio.response_ph'));
+          masked ? t('userio.password_ph')
+                 : (media ? t('userio.media_ph')
+                          : t('userio.response_ph')));
+      // Media request: surface the attach buttons (drag-and-drop onto
+      // the textarea is armed via mediaPending).
+      attachImgBtn.style.display = media ? '' : 'none';
+      attachAudBtn.style.display = media ? '' : 'none';
       if (document.activeElement !== input) { input.focus(); }
     } else {
       pendingId = 0;
+      mediaPending = false;
       promptEl.textContent = t('userio.waiting');
       promptEl.classList.remove('active');
       input.disabled = true;
       sendBtn.disabled = true;
       input.classList.remove('masked');
       input.setAttribute('placeholder', t('userio.response_ph'));
+      attachImgBtn.style.display = 'none';
+      attachAudBtn.style.display = 'none';
+      clearAttachments();
     }
   }
 
   async function send() {
     if (!pendingId) { return; }
-    const text = input.value;
+    // Expand attachment placeholders to their wire markers just before
+    // shipping; the console echo comes back from the backend with the
+    // markers already compressed to glyphs.
+    const text = expandAttachments(input.value);
     const id = pendingId;
     input.value = '';
+    clearAttachments();
     autosize();
     // Mark this id answered so the next poll doesn't re-show it before
     // the backend has released the slot (which would steal the next
@@ -255,9 +435,63 @@ export function mountUserIo(body, actions) {
   }
 
   sendBtn.addEventListener('click', send);
+  attachImgBtn.addEventListener('click', () => fileImg.click());
+  attachAudBtn.addEventListener('click', () => fileAud.click());
+  fileImg.addEventListener('change', () => {
+    for (const f of fileImg.files) { addAttachment(f, 'im'); }
+    fileImg.value = '';
+  });
+  fileAud.addEventListener('change', () => {
+    for (const f of fileAud.files) { addAttachment(f, 'au'); }
+    fileAud.value = '';
+  });
+  // Drag-and-drop onto the input row while a media request is pending.
+  // dragover must be cancelled for the drop to be allowed at all.
+  for (const zone of [input, promptEl]) {
+    zone.addEventListener('dragover', (e) => {
+      if (mediaPending) { e.preventDefault(); }
+    });
+    zone.addEventListener('drop', (e) => {
+      if (!mediaPending) { return; }
+      e.preventDefault();
+      const files = (e.dataTransfer && e.dataTransfer.files) || [];
+      for (const f of files) { addAttachmentAuto(f); }
+    });
+  }
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', (e) => {
     if (input.disabled) { return; }
+    // Backspace/Delete touching an attachment placeholder (⟦img1⟧ /
+    // ⟦aud1⟧) removes the placeholder WHOLE -- it stands for one
+    // attachment, so it behaves as a single character. Applies when
+    // the character being deleted lies anywhere inside a placeholder
+    // (boundary or interior); range selections keep the default
+    // behavior. Unmatched (user-mangled) text falls through to normal
+    // per-character editing.
+    if ((e.key === 'Backspace' || e.key === 'Delete')
+        && !e.ctrlKey && !e.metaKey && !e.altKey
+        && input.selectionStart === input.selectionEnd) {
+      const v = input.value;
+      const pos = input.selectionStart;
+      // Index of the character the key would delete.
+      const target = e.key === 'Backspace' ? pos - 1 : pos;
+      if (target >= 0 && target < v.length) {
+        outer:
+        for (const ph of attachments.keys()) {
+          for (let i = v.indexOf(ph); i >= 0; i = v.indexOf(ph, i + 1)) {
+            if (target >= i && target < i + ph.length) {
+              e.preventDefault();
+              input.value = v.slice(0, i) + v.slice(i + ph.length);
+              input.selectionStart = input.selectionEnd = i;
+              autosize();
+              break outer;
+            }
+            if (i > target) { break; }   // occurrences are in order
+          }
+        }
+      }
+      if (e.defaultPrevented) { return; }
+    }
     // Ctrl+J -> newline (matches the console-style "line feed" key).
     if (e.ctrlKey && (e.key === 'j' || e.key === 'J')) {
       e.preventDefault();
@@ -296,7 +530,7 @@ export function mountUserIo(body, actions) {
       const fresh = p && p.pending && p.id > lastAnsweredId;
       if (fresh) {
         if (p.id !== pendingId) {
-          setPending(true, p.prompt, p.id, p.masked);
+          setPending(true, p.prompt, p.id, p.masked, p.media);
         }
       } else if (pendingId) {
         setPending(false);

@@ -50,6 +50,20 @@ MetalTokenMuxer::MetalTokenMuxer(metal_compute::MetalCompute* mc,
   }
 }
 
+MetalTokenMuxer::MetalTokenMuxer(DenseTag, metal_compute::MetalCompute* mc,
+                                 const SharedBuffer* table, int hidden,
+                                 bool bf16)
+    : _mc(mc), _hidden(hidden), _q6k(true), _q6k_table(table)
+{
+  if (mc != nullptr && mc->valid()) {
+    _lib = mc->load_library(bf16 ? "llm_elementwise_bf16" : "llm_elementwise");
+    // The raw-table fetch path (the `_q6k` branch of fetch_text) binds
+    // (ids, table, out, H) -- exactly embed_gather_f16's signature; only the
+    // per-row gather kernel differs from the k-quant tables.
+    _fn = _lib.function("embed_gather_f16");
+  }
+}
+
 bool
 MetalTokenMuxer::valid() const noexcept
 {

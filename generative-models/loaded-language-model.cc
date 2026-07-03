@@ -169,6 +169,50 @@ make_metal_cfg_(const ModelConfig& c)
 MetalQwenModel::Config
 make_metal_qwen_cfg_(const ModelConfig& c)
 {
+  // MOSS-TTS-Local-v1.5 ("MossTTSLocalModel"): the backbone is a dense Qwen3
+  // text LM stored under the "transformer." prefix, with a text head tied to
+  // transformer.embed_tokens (text_lm_head == embed_tokens, byte-identical).
+  // For text eval (perplexity) we build that backbone WITH its tied head so
+  // it emits full [vocab] text logits -- unlike the TTS stage's
+  // v15_backbone_cfg_, which sets backbone_only (no logits) for synthesis.
+  // Values mirror v15_backbone_cfg_ / arch-detect.cc, head enabled.
+  if (c.architecture == "MossTTSLocalModel") {
+    MetalQwenModel::Config m;
+    m.n_layers   = c.n_layers;
+    m.hidden     = c.hidden;
+    m.n_heads    = c.n_heads;
+    m.n_kv_heads = c.n_kv_heads;
+    m.head_dim   = c.head_dim > 0 ? c.head_dim
+                 : (c.n_heads > 0 ? c.hidden / c.n_heads : 0);
+    m.ffn_inner  = c.ffn_inner;
+    m.vocab      = c.vocab_size;
+    m.rope_theta = c.rope_theta;
+    m.rms_eps    = c.rms_eps;
+    m.rotary_dim = m.head_dim;
+    m.full_attn_interval = 1;       // every layer is full attention
+    // Honor a quantization block: a model-quantize'd MOSS has an AFFINE
+    // backbone (mixed 4/8 or uniform) -- only its embed/tied-head stay bf16
+    // (handled in MetalQwenModel's load). quant_bits drives the fused-width
+    // kernel selection (w8g64 for uniform-8, else w4g64). The raw-HF bf16
+    // source (no quant block) keeps the dense path.
+    if (c.quantization.bits == 4 || c.quantization.bits == 8) {
+      m.dense      = false;
+      m.quant_bits = c.quantization.bits;
+    } else {
+      m.dense      = true;          // raw-HF bf16 (no affine quant)
+    }
+    // MOSS's Qwen3 backbone uses STANDARD RMSNorm (weight*h, ones-init), not
+    // the zero-centered (1+weight) convention -- so the dense raw-HF +1 fold
+    // must be DISABLED here or the logits are corrupted.
+    m.zero_centered_norm = false;
+    m.tie_embeddings   = true;      // tied text head -> [vocab] logits
+    m.backbone_only    = false;     // MUST emit the lm_head (logits)
+    m.attn_output_gate = false;     // plain Qwen3 attention (no output gate)
+    m.use_bf16         = true;      // ctor overrides per compute_dtype
+    m.weight_prefix    = "transformer.";
+    m.model_seg        = "";
+    return m;
+  }
   return MetalQwenModel::config_from(c);
 }
 
@@ -292,7 +336,11 @@ LoadedLanguageModel::LoadedLanguageModel(
     const bool metal_llama = arch_be == "LlamaForCausalLM";
     const bool metal_qwen = arch_be == "Qwen3_5ForConditionalGeneration"
         || arch_be == "Qwen3_5MoeForConditionalGeneration"
-        || arch_be == "Qwen3ASRForConditionalGeneration";
+        || arch_be == "Qwen3ASRForConditionalGeneration"
+        // MOSS-TTS-Local-v1.5: TTS model with a dense Qwen3 TEXT backbone
+        // (under "transformer.", tied text head). Loaded as a Qwen text LM
+        // so it emits [vocab] text logits for perplexity / text eval.
+        || arch_be == "MossTTSLocalModel";
     const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
         || arch_be == "Gemma4UnifiedForConditionalGeneration";
     // Select the metal backend when explicitly requested
@@ -394,11 +442,19 @@ LoadedLanguageModel::LoadedLanguageModel(
       const bool g4_unified = _impl->weights.config.vision.unified ||
                               _impl->weights.config.audio.unified;
       if (metal_gemma && g4_unified) {
-        const std::string& mmp =
-            !_impl->weights.config.vision.mmproj_path.empty()
-                ? _impl->weights.config.vision.mmproj_path
-                : _impl->weights.config.audio.mmproj_path;
-        _impl->gemma4_unified = Gemma4UnifiedEmbedder::load(mmp);
+        const bool from_st = _impl->weights.config.vision.unified_st ||
+                             _impl->weights.config.audio.unified_st;
+        if (from_st) {
+          // Raw safetensors 12B: adaptor weights live in model.safetensors.
+          _impl->gemma4_unified =
+              Gemma4UnifiedEmbedder::load_safetensors(model_dir, mc_be);
+        } else {
+          const std::string& mmp =
+              !_impl->weights.config.vision.mmproj_path.empty()
+                  ? _impl->weights.config.vision.mmproj_path
+                  : _impl->weights.config.audio.mmproj_path;
+          _impl->gemma4_unified = Gemma4UnifiedEmbedder::load(mmp);
+        }
         if (_impl->gemma4_unified) {
           _impl->gemma4_unified->set_session(session);
           phase_log("gemma4_unified_embedder (load + bind, no MLX)");
@@ -785,7 +841,16 @@ LoadedLanguageModel::Context::operator=(Context&& o) noexcept
 int
 LoadedLanguageModel::Context::seq_len() const
 {
-  if (!_lm || !_lm->_impl || !_lm->_impl->ctx_mgr) { return 0; }
+  if (!_lm || !_lm->_impl) { return 0; }
+  // owns_kv() execs (the metal backends) track K/V internally and the
+  // LM-side ctx_mgr is bookkeeping-only (n_layers=0, length stays 0)
+  // -- ask the exec first. -1 = "not tracked here" falls through to
+  // the ContextManager path.
+  if (_lm->_impl->exec && _lm->_impl->exec->owns_kv()) {
+    const int n = _lm->_impl->exec->context_seq_len(_id);
+    if (n >= 0) { return n; }
+  }
+  if (!_lm->_impl->ctx_mgr) { return 0; }
   return _lm->_impl->ctx_mgr->seq_len_of(_id);
 }
 
@@ -1393,6 +1458,13 @@ LoadedLanguageModel::m_bdecode_begin(std::span<Context*> ctxs,
     _impl->bdecode_n = N;
   }
   return ok;
+}
+
+bool
+LoadedLanguageModel::m_bdecode_supports_runahead() const
+{
+  return valid() && _impl->metal_backend && _impl->exec
+      && _impl->exec->bdecode_supports_runahead();
 }
 
 bool

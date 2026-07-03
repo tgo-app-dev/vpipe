@@ -21,6 +21,7 @@
 #include <vector>
 
 namespace vpipe { class SessionContextIntf; }
+namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
@@ -44,6 +45,21 @@ public:
   // mmproj.
   static std::unique_ptr<Gemma4UnifiedEmbedder>
   load(const std::string& mmproj_path);
+
+  // Load the SAME shallow adaptor weights from a raw safetensors 12B
+  // checkpoint (`model.vision_embedder.* / model.embed_vision.* /
+  // model.embed_audio.*`), converting bf16 -> f32 into the identical
+  // internal buffers the GGUF path fills (encode_image/encode_audio are
+  // source-agnostic). `mc` is used only to stage tensors through the
+  // MetalLlamaWeights reader; no GPU kernels run. nullptr if neither
+  // adaptor is present.
+  static std::unique_ptr<Gemma4UnifiedEmbedder>
+  load_safetensors(const std::string& model_dir,
+                   metal_compute::MetalCompute* mc);
+
+  // True if `model_dir`'s safetensors carries the unified vision/audio
+  // adaptor tensors (used by the loader to flag config before load).
+  static bool has_unified_safetensors(const std::string& model_dir);
 
   // Locate a sibling `mmproj*.gguf` in `model_dir`; empty string if none.
   static std::string find_mmproj(const std::string& model_dir);

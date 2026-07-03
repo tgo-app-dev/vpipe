@@ -477,7 +477,7 @@ export function mountPipelineManager(container) {
   }
 
   // Category display order + labels for the toolbox sections.
-  const CATEGORY_ORDER = ['video', 'audio', 'text', 'network',
+  const CATEGORY_ORDER = ['preparation', 'video', 'audio', 'text', 'network',
                           'control', 'database', 'generic'];
 
   function stageChip(s) {

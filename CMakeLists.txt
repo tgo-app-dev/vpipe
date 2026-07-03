@@ -159,6 +159,7 @@ if(VPIPE_SOURCES)
             "-framework CoreML"
             "-framework CoreVideo"
             "-framework Foundation"
+            "-framework IOKit"
             "-framework Metal")
         target_link_options(vpipe PRIVATE
             "LINKER:-undefined,dynamic_lookup")

@@ -65,6 +65,7 @@ TEST(text_to_speech_stage, config_defaults) {
   EXPECT_TRUE(s.hf_dir() == "/tmp/moss-tts-fake");
   EXPECT_TRUE(s.codec_dir() == "/tmp/moss-codec-fake");
   EXPECT_TRUE(s.max_new_tokens() == 1024);
+  EXPECT_TRUE(s.max_frames() == 1000);  // v1.5-only default
   EXPECT_TRUE(s.num_oports() == 1);     // PCM oport
   EXPECT_TRUE(s.clips_emitted() == 0u);
   EXPECT_TRUE(s.config_error().empty());

@@ -1,4 +1,5 @@
 #include "apps/web-ui/web-ui-delegate.h"
+#include "common/media-line.h"
 #include "common/vpipe-format.h"
 
 #include <chrono>
@@ -186,7 +187,8 @@ WebUiDelegate::getline(const vpipe::VpipeFormat&    prompt,
                        string&                      out,
                        const function<bool()>&      should_cancel)
 {
-  return request_input_(prompt, out, should_cancel, /*masked=*/false);
+  return request_input_(prompt, out, should_cancel,
+                        /*masked=*/false, /*media=*/false);
 }
 
 vpipe::UiInputStatus
@@ -194,14 +196,25 @@ WebUiDelegate::getpasswd(const vpipe::VpipeFormat&    prompt,
                          string&                      out,
                          const function<bool()>&      should_cancel)
 {
-  return request_input_(prompt, out, should_cancel, /*masked=*/true);
+  return request_input_(prompt, out, should_cancel,
+                        /*masked=*/true, /*media=*/false);
+}
+
+vpipe::UiInputStatus
+WebUiDelegate::getmedialine(const vpipe::VpipeFormat&    prompt,
+                            string&                      out,
+                            const function<bool()>&      should_cancel)
+{
+  return request_input_(prompt, out, should_cancel,
+                        /*masked=*/false, /*media=*/true);
 }
 
 vpipe::UiInputStatus
 WebUiDelegate::request_input_(const vpipe::VpipeFormat&    prompt,
                               string&                      out,
                               const function<bool()>&      should_cancel,
-                              bool                         masked)
+                              bool                         masked,
+                              bool                         media)
 {
   string p;
   try {
@@ -232,6 +245,7 @@ WebUiDelegate::request_input_(const vpipe::VpipeFormat&    prompt,
   _req_id     = my_id;
   _req_prompt = p;
   _req_masked = masked;
+  _req_media  = media;
   _have_resp  = false;
   _resp_text.clear();
   _cv.notify_all();
@@ -257,6 +271,7 @@ WebUiDelegate::request_input_(const vpipe::VpipeFormat&    prompt,
     _resp_text.clear();
     _req_prompt.clear();
     _req_masked = false;
+    _req_media  = false;
     _cv.notify_all();
   }
   return status;
@@ -298,7 +313,7 @@ WebUiDelegate::console_since(uint64_t since, uint64_t* latest_seq,
 
 bool
 WebUiDelegate::pending_input(uint64_t* id, string* prompt,
-                             bool* masked) const
+                             bool* masked, bool* media) const
 {
   lock_guard<mutex> lk(_mu);
   if (_req_id == 0) {
@@ -313,6 +328,9 @@ WebUiDelegate::pending_input(uint64_t* id, string* prompt,
   if (masked) {
     *masked = _req_masked;
   }
+  if (media) {
+    *media = _req_media;
+  }
   return true;
 }
 
@@ -324,8 +342,12 @@ WebUiDelegate::submit_input(uint64_t id, string text)
     return false;
   }
   // Echo the answer into the transcript (so it persists across a view
-  // re-mount and shows in the log), then hand it to the waiting getline.
-  _console.push_back(ConsoleLine{ _next_seq++, "input", "> " + text });
+  // re-mount and shows in the log), then hand it to the waiting
+  // getline. Media-line attachment markers are compressed to glyphs in
+  // the echo so a multi-megabyte base64 payload never enters the
+  // console ring (and never re-polls to the browser).
+  _console.push_back(ConsoleLine{ _next_seq++, "input",
+                                  "> " + media_line::to_display(text) });
   trim_();
   _resp_text = std::move(text);
   _have_resp = true;

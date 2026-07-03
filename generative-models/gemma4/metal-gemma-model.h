@@ -105,6 +105,18 @@ public:
     // (uniform n_kv_heads).
     bool  attention_k_eq_v = false;
     std::vector<int> layer_n_kv_heads;
+    // Mixture-of-Experts (Gemma-4 26B-A4B). enable_moe adds, ON EVERY LAYER, a
+    // MoE block ALONGSIDE the existing dense MLP (a hybrid dense+MoE FFN): a
+    // router (proj [E,H] + scale [H] + per_expert_scale [E]) selects top_k of
+    // n_experts, whose gate|up (fused [E,2*moe_inner,H]) + down ([E,H,moe_inner])
+    // run gelu-gated and combine; the dense MLP (ffn_inner) is unchanged. Five
+    // FFN norms sandwich the two branches. n_experts==0 / !enable_moe => the
+    // plain dense/PLE path. See the hybrid layer forward in encode_step_.
+    int   n_experts   = 0;      // total experts (128)
+    int   top_k       = 0;      // experts per token (8)
+    int   moe_inner   = 0;      // per-expert intermediate (704)
+    bool  enable_moe  = false;
+    bool  is_moe() const { return enable_moe && n_experts > 0; }
     std::string weight_prefix = "language_model.model.";
     int   max_seq         = 4096;   // per-context KV preallocation
     int   page_tokens     = 256;    // bookkeeping ctx manager
@@ -293,6 +305,11 @@ public:
                            std::span<const std::int32_t>   rope_pos,
                            std::vector<float>&             out_logits);
 
+  // Read-only KV length (seq_len / rope position, tokens) of a
+  // LoadedLanguageModel context; 0 when the context has no KV yet.
+  // Never materializes a context (unlike cm_for_'s lazy acquire).
+  int context_seq_len(ContextId lm_cid) const;
+
 private:
   struct BScratch {
     int n = 0;
@@ -328,6 +345,20 @@ private:
     int  kv_source = -1;   // shared layers read this layer's K/V; -1 own
     metal_compute::SharedBuffer in_ln, post_attn_ln, pre_ffn_ln,
         post_ffn_ln, post_pli_ln;
+    // ---- Mixture-of-Experts (Gemma-4 26B-A4B, iff _cfg.is_moe()) ---------
+    // A MoE FFN block alongside the dense MLP (gate/up=guw, down=dw). Router:
+    // proj (f16 dense [E,H]) + router_norm_w (scale[H]/sqrt(H), the folded
+    // pre-norm weight) + per_expert_scale (f16 [E]). Experts: gate|up
+    // interleaved [E,2I,H] affine (or f16 for _dense) in eguw/egus/egub; down
+    // [E,H,I] affine (or f16) in edw2/eds2/edb2 (SEPARATE from the dense-MLP
+    // dw/ds/db). Three extra norms (pre_ffn_ln/post_ffn_ln already above):
+    // pre_ffn_ln_2 (MoE-branch input), post_ffn_ln_1 (dense-branch out),
+    // post_ffn_ln_2 (MoE-branch out).
+    metal_compute::SharedBuffer pre_ffn_ln_2, post_ffn_ln_1, post_ffn_ln_2;
+    metal_compute::SharedBuffer router_proj, router_norm_w, per_expert_scale;
+    metal_compute::SharedBuffer eguw, egus, egub;   // experts gate|up [E,2I,H]
+    metal_compute::SharedBuffer edw2, eds2, edb2;   // experts down [E,H,I]
+    int  eg_bits = 4;   // routed-expert quant width (4/8); selects w4/w8 gather
     metal_compute::SharedBuffer qw, qs, qb, kw, ks, kb, vw, vs, vb, ow, os, ob;
     // QKV-fused decode GEMV: q|k|v weights row-concatenated into one buffer so
     // a single full-occupancy GEMV replaces the 2-3 small per-proj GEMVs (the
@@ -342,6 +373,16 @@ private:
     metal_compute::SharedBuffer guw, gus, gub, dw, ds, db;
     metal_compute::SharedBuffer plg_w, plg_s, plg_b;   // per_layer_input_gate
     metal_compute::SharedBuffer plp_w, plp_s, plp_b;   // per_layer_projection
+    // Dense (raw-HF bf16/f16) path ONLY: plain [out,in] elt weights, no
+    // scales/biases. q/k/v/o/down/plg/plp reuse the buffers above (qw/kw/vw/
+    // ow/dw/plg_w/plp_w); gate/up stay SEPARATE here (the affine gate|up
+    // interleave is a quant-packing trick, unused for dense). Set iff _dense.
+    metal_compute::SharedBuffer dgate, dup;
+    // Per-layer MLP intermediate size. Uniform (== Config::ffn_inner) for e4b /
+    // gemma4_unified, but the raw-HF E2B DOUBLES it on the KV-shared layers
+    // (use_double_wide_mlp: gate/up/down widened 2x on L >= first_shared). The
+    // dense forward reads ly.ffn instead of the global ffn_inner.
+    int ffn = 0;
     float layer_scalar = 1.0f;
   };
 
@@ -382,6 +423,15 @@ private:
       _fn_rms, _fn_rms_add, _fn_rms_fast, _fn_rms_add_fast,
       _fn_rope, _fn_rms_rope, _fn_rms_rope2,
       _fn_rms_rope3, _fn_rms_rope3_kvwrite, _fn_geglu, _fn_softcap,
+      // Mixture-of-Experts (Gemma-4 26B-A4B). Router softmax-topk-renorm
+      // (_fn_moe_route, reused from Qwen), per-expert router-weight scale
+      // (_fn_moe_expert_scale, gemma-specific), weighted partial combine
+      // (_fn_moe_combine, reused). Expert gate|up gather (gelu-gated) + down
+      // gather: affine (_fn_moe_gather_geglu / _fn_moe_gather_down, w4/w8 twins)
+      // and the raw-HF dense f16 twins (_..._dense).
+      _fn_moe_route, _fn_moe_expert_scale, _fn_moe_combine,
+      _fn_moe_gather_geglu, _fn_moe_gather_down,
+      _fn_moe_gather_geglu_dense, _fn_moe_gather_down_dense,
       // Bans a small set of token ids by masking their logits after softcap
       // (realtime thinking-channel suppression). See set_suppressed_tokens.
       _fn_suppress,
@@ -508,6 +558,19 @@ private:
   bool _skip_dequant = false;
   metal_compute::SharedBuffer _w_deq;
 
+  // Unquantized dense (raw-HF bf16/f16) checkpoint: the linear weights ship as
+  // plain [out,in] .weight tensors (no affine .scales/.biases). Detected in
+  // load() by probing a representative gate_proj dtype; when set, every
+  // projection matmul routes the dense f16 GEMM/GEMV (dense_gemm_t / dense_gemv
+  // / embed_gather_f16) instead of the affine qmv/qmm kernels. Gated so the
+  // quantized e4b / gemma4_unified paths are untouched.
+  bool _dense = false;
+  // Max per-layer MLP intermediate (>= ffn_inner; 2x on the E2B double-wide
+  // shared layers). Sizes the shared MLP decode/prefill scratch.
+  int  _ffn_max = 0;
+  metal_compute::SharedBuffer _embed_dense;                     // dense tied embed
+  metal_compute::ComputeFunction _fn_embed_dense;               // embed_gather_f16
+
   std::vector<Layer> _layers;
   metal_compute::SharedBuffer _embed_w, _embed_s, _embed_b;      // tied lm_head
   // Raw Q6_K tied embed/lm_head table (GGUF path); when set, the affine8
@@ -539,6 +602,16 @@ private:
   metal_compute::SharedBuffer _d_x, _d_hn, _d_q, _d_k, _d_v, _d_attn, _d_o,
       _d_act, _d_mlp, _d_ple, _d_pleproj, _d_pli, _d_plg,
       _d_plp, _d_logits, _d_tok;
+  // Dense-path decode scratch: the raw-HF gate output [ffn] (the affine path
+  // fuses gate|up+geglu into _d_act, but dense runs two separate GEMVs). Only
+  // allocated when _dense.
+  metal_compute::SharedBuffer _d_gate;
+  // MoE decode scratch (M=1, iff _cfg.is_moe()). logits[E], ids[top_k] int32,
+  // w[top_k], act[top_k*moe_inner], part[top_k*H], out[H] (combined MoE), h1[H]
+  // (dense-branch normed). The dense-branch MLP reuses _d_hn/_d_act/_d_mlp; the
+  // MoE-branch pre-norm reuses _d_hn after the dense branch consumes it.
+  metal_compute::SharedBuffer _d_moe_logits, _d_moe_ids, _d_moe_w, _d_moe_act,
+      _d_moe_part, _d_moe_out, _d_moe_h1;
   metal_compute::SharedBuffer _d_argmax_id;   // [1] int32, GPU argmax out
   // Suppressed (banned) token ids: their _d_logits entries are masked to a
   // far-negative sentinel after softcap (suppress_logits_f16) so they are

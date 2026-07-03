@@ -94,6 +94,19 @@ public:
   // keep K/V in the ContextManager) keep the default false.
   virtual bool owns_kv() const noexcept { return false; }
 
+  // Logical sequence length of `ctx` (its KV / rope position, in
+  // tokens), for owns_kv() execs that track K/V internally. Returns 0
+  // for a context this exec has never touched, and -1 when the backend
+  // does not track lengths here at all (the default) -- the caller
+  // (LoadedLanguageModel::Context::seq_len) then falls back to the
+  // LM-side ContextManager bookkeeping. Read-only: never materializes
+  // a context.
+  virtual int context_seq_len(ContextId ctx) const
+  {
+    (void)ctx;
+    return -1;
+  }
+
   // Fork exec-private per-context state from `parent` to `child` when
   // LoadedLanguageModel::branch forks the ContextManager. The default
   // is a no-op: MLX execs keep all per-context state in the
@@ -360,6 +373,15 @@ public:
   virtual bool bdecode_next(std::vector<std::int32_t>& out_tokens)
   { (void)out_tokens; return false; }
   virtual void bdecode_end() {}
+
+  // True iff bdecode supports run-ahead: the driver may keep MORE than one
+  // committed step in flight (prime an extra bdecode_commit before the first
+  // bdecode_next, then refill after each next) so the host's stop-check AND
+  // the CPU encode of step N+1 both overlap the GPU's step N. A commit when
+  // the pipeline is full is REFUSED (returns false) harmlessly. Constant-N
+  // bdecode never rolls state back, so a speculative uncollected tail is
+  // indistinguishable from the already-over-advanced stopped branches.
+  virtual bool bdecode_supports_runahead() const { return false; }
 
   // ---- MTP speculative decode (metal Qwen3.5-OptiQ) ------------------
   // True iff this exec carries a bundled MTP head (mtp.safetensors) and can

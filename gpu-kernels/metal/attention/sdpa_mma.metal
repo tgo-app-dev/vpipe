@@ -394,6 +394,126 @@ kernel void sdpa_causal_mma2_d256_f16(
     }
   }
 }
+// head_dim 64 sliding-WINDOW causal sibling of the d256 kernel above -- the same
+// matrix-core matmul2d QK^T/PV flash body (online softmax in threadgroup, window
+// lower bound kpos >= qpos-window+1 on top of the causal mask), sized for D=64
+// (Of[16*64] f32 == 4 KB). This is the MOSS-codec-v2 decoder attention path (12
+// heads, head_dim 64, sliding window); linear KV addressing (ring_cap ignored,
+// logical key == physical slot). Replaces the scalar per-query sdpa_causal_
+// window_f16 on M5 (that kernel wasted 32x on redundant per-key simd_sum + exp).
+#define SA4_BQ 16
+#define SA4_BK 16
+#define SA4_D  64
+#define SA4_SG 4
+#define SA4_THREADS (SA4_SG * 32)
+kernel void sdpa_causal_mma2_d64_f16(
+    const device VPIPE_ELT* q     [[buffer(0)]],
+    const device VPIPE_ELT* k     [[buffer(1)]],
+    const device VPIPE_ELT* v     [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant float& scale     [[buffer(4)]],
+    constant int&   T_kv      [[buffer(5)]],
+    constant int&   D         [[buffer(6)]],
+    constant int&   Hq        [[buffer(7)]],
+    constant int&   Hkv       [[buffer(8)]],
+    constant int&   n_q       [[buffer(9)]],
+    constant int&   q_offset  [[buffer(10)]],
+    constant int&   kv_stride [[buffer(11)]],
+    constant int&   window    [[buffer(12)]],
+    constant int&   ring_cap  [[buffer(13)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  (void)D; (void)ring_cap;
+  const int h    = (int)tgid.y;
+  const int q0   = (int)tgid.z * SA4_BQ;
+  const int kvh  = h / (Hq / Hkv);
+  const device VPIPE_ELT* kbase = k + (int64_t)kvh * kv_stride * SA4_D;
+  const device VPIPE_ELT* vbase = v + (int64_t)kvh * kv_stride * SA4_D;
+
+  threadgroup VPIPE_ELT Ss[SA4_BQ * SA4_BK];
+  threadgroup float Of[SA4_BQ * SA4_D];
+  threadgroup float mrow[SA4_BQ], lrow[SA4_BQ], corr_s[SA4_BQ];
+
+  for (int e = (int)lid; e < SA4_BQ * SA4_D; e += SA4_THREADS) { Of[e] = 0.0f; }
+  for (int e = (int)lid; e < SA4_BQ; e += SA4_THREADS) {
+    mrow[e] = -INFINITY; lrow[e] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device VPIPE_ELT* qh = q + ((int64_t)h * n_q + q0) * SA4_D;
+  using TQ = tensor<device VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TP = tensor<threadgroup VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TO = tensor<threadgroup float, dextents<int32_t,2>, tensor_inline>;
+  constexpr auto qk = matmul2d_descriptor(
+      SA4_BQ, SA4_BK, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<qk, execution_simdgroups<SA4_SG>> opQK;
+  constexpr auto pv = matmul2d_descriptor(
+      SA4_BQ, SA4_D, SA4_BK, false, false, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv, execution_simdgroups<SA4_SG>> opPV;
+  TQ tQ(const_cast<device VPIPE_ELT*>(qh), dextents<int32_t,2>(SA4_D, SA4_BQ));
+
+  const int tile_qpos_max = q_offset + min(q0 + SA4_BQ - 1, n_q - 1);
+  const int last = min(T_kv - 1, tile_qpos_max);
+  const int tile_qmin = q_offset + q0;
+  const int first = (window > 0) ? max(0, tile_qmin - window + 1) : 0;
+
+  for (int bs = (first / SA4_BK) * SA4_BK; bs <= last; bs += SA4_BK) {
+    const int bk = min(SA4_BK, T_kv - bs);
+    TQ tK(const_cast<device VPIPE_ELT*>(kbase + (int64_t)bs * SA4_D),
+          dextents<int32_t,2>(SA4_D, SA4_BK));
+    auto cS = opQK.get_destination_cooperative_tensor<TQ, TQ, VPIPE_ELT>();
+    opQK.run(tQ, tK, cS);
+    TP tS(Ss, dextents<int32_t,2>(SA4_BK, SA4_BQ));
+    cS.store(tS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int r = (int)lid; r < SA4_BQ; r += SA4_THREADS) {
+      const int qpos = q_offset + q0 + r;
+      const bool qok = (q0 + r) < n_q;
+      const int wlo = (window > 0) ? (qpos - window + 1) : 0;
+      float mloc = mrow[r];
+      for (int j = 0; j < SA4_BK; ++j) {
+        const int kpos = bs + j;
+        const bool ok = qok && j < bk && kpos <= qpos && kpos >= wlo;
+        const float s = ok ? float(Ss[r * SA4_BK + j]) * scale : -INFINITY;
+        Ss[r * SA4_BK + j] = (VPIPE_ELT)s;
+        mloc = max(mloc, s);
+      }
+      const float corr = (mloc == -INFINITY) ? 1.0f : exp(mrow[r] - mloc);
+      float lloc = lrow[r] * corr;
+      for (int j = 0; j < SA4_BK; ++j) {
+        const float s = float(Ss[r * SA4_BK + j]);
+        const float p = (s == -INFINITY) ? 0.0f : exp(s - mloc);
+        Ss[r * SA4_BK + j] = (VPIPE_ELT)p;
+        lloc += p;
+      }
+      corr_s[r] = corr;
+      mrow[r] = mloc; lrow[r] = lloc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = (int)lid; e < SA4_BQ * SA4_D; e += SA4_THREADS) {
+      Of[e] *= corr_s[e / SA4_D];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    TP tP(Ss, dextents<int32_t,2>(SA4_BK, SA4_BQ));
+    TQ tV(const_cast<device VPIPE_ELT*>(vbase + (int64_t)bs * SA4_D),
+          dextents<int32_t,2>(SA4_D, SA4_BK));
+    TO tO(Of, dextents<int32_t,2>(SA4_D, SA4_BQ));
+    opPV.run(tP, tV, tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (int e = (int)lid; e < SA4_BQ * SA4_D; e += SA4_THREADS) {
+    const int r = e / SA4_D, dd = e % SA4_D;
+    if (q0 + r < n_q) {
+      const float inv = (lrow[r] > 0.0f) ? 1.0f / lrow[r] : 0.0f;
+      out[((int64_t)h * n_q + (q0 + r)) * SA4_D + dd] = (VPIPE_ELT)(Of[e] * inv);
+    }
+  }
+}
 // PAGED sibling of sdpa_causal_mma2_d512_f16: Gemma-4's GLOBAL (full-attention,
 // head_dim 512) layers, K/V in the PAGED pool instead of a contiguous cache.
 // Same D=512 matrix-core flash body (matmul2d QK^T/PV, online softmax in tg,
@@ -666,5 +786,8 @@ kernel void sdpa_causal_mma2_d256_f16(device VPIPE_ELT* out [[buffer(3)]],
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 kernel void sdpa_full_mma2_d64_f16(device VPIPE_ELT* out [[buffer(3)]],
                                    uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void sdpa_causal_mma2_d64_f16(device VPIPE_ELT* out [[buffer(3)]],
+                                     uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 #endif

@@ -689,7 +689,7 @@ kernel void affine_qmm_grouped_w4g64(
     const device uint32_t* w       [[buffer(0)]],
     const device VPIPE_ELT* scales [[buffer(1)]],
     const device VPIPE_ELT* biases [[buffer(2)]],
-    const device VPIPE_ELT* x      [[buffer(3)]],   // sorted activations [npad,K]
+    const device VPIPE_ELT* x      [[buffer(3)]],   // sorted acts [npad,K]
     device VPIPE_ELT*       y      [[buffer(4)]],   // partials [np,N] scattered
     const constant int& K          [[buffer(5)]],
     const constant int& N          [[buffer(6)]],
@@ -705,6 +705,33 @@ kernel void affine_qmm_grouped_w4g64(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_grouped_down_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,
+      tid, simd_gid, simd_lid);
+}
+
+// 8-bit twin of affine_qmm_grouped_w4g64 (prefill steel down GEMM). The impl
+// (QuantizedBlockLoader + K_w = K*bytes_per_pack/pack_factor) is fully bit-
+// parameterized, so bits=8 just instantiates the w8 slab stride + loader.
+kernel void affine_qmm_grouped_w8g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // sorted acts [npad,K]
+    device VPIPE_ELT*       y      [[buffer(4)]],   // partials [np,N] scattered
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* sdst         [[buffer(9)]],   // sorted-slot -> pair index
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_down_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,
       tid, simd_gid, simd_lid);
 }
@@ -813,6 +840,33 @@ kernel void affine_qmm_grouped_swiglu_w4g64(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_grouped_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
+      tid, simd_gid, simd_lid);
+}
+
+// 8-bit twin of affine_qmm_grouped_swiglu_w4g64 (prefill steel gate|up GEMM).
+// Fully bit-parameterized impl; bits=8 instantiates the w8 slab stride +
+// QuantizedBlockLoader.
+kernel void affine_qmm_grouped_swiglu_w8g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // hidden [M, K] (gathered)
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],   // fused width = 2*inner
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* srow         [[buffer(9)]],   // sorted-slot -> hidden row
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
       tid, simd_gid, simd_lid);
 }

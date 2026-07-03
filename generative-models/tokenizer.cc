@@ -2,6 +2,7 @@
 
 #include "generative-models/shared/gguf-file.h"
 #include "common/flex-data.h"
+#include "common/media-line.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -496,6 +497,18 @@ private:
   bool                                                      _metaspace = false;
   string                                                    _ms_marker;
 
+  // Family-specific reasoning begin/end token ids, detected once at
+  // load (Qwen3 `<think>`/`</think>`, else Gemma-4
+  // `<|channel>`/`<channel|>`; -1 when the vocab has neither). decode
+  // and step rewrite these ids to the UNIFIED vpipe thinking markers
+  // (media_line::kThinkStart/kThinkEnd) instead of their literal
+  // content, so every consumer sees one marker pair regardless of the
+  // model family.
+  int32_t                                                   _think_open_id  = -1;
+  int32_t                                                   _think_close_id = -1;
+
+  void detect_thinking_markers_();
+
   void bpe_(vector<string>* pieces) const;
   string normalize_ms_(string_view text) const;
   string metaspace_decode_(const string& s) const;
@@ -756,6 +769,7 @@ Tokenizer::Impl::parse(const FlexData&            root,
     }
   }
 
+  detect_thinking_markers_();
   return !_vocab.empty();
 }
 
@@ -828,7 +842,25 @@ Tokenizer::Impl::load_gguf(const GgufFile& g,
         "Tokenizer::from_gguf: {} tokens, {} merges, {} special",
         _vocab.size(), _merge_priority.size(), _special_by_name.size()));
   }
+  detect_thinking_markers_();
   return !_vocab.empty();
+}
+
+void
+Tokenizer::Impl::detect_thinking_markers_()
+{
+  auto sp = [this](const char* name) -> int32_t {
+    auto it = _special_by_name.find(name);
+    return it != _special_by_name.end() ? it->second : -1;
+  };
+  _think_open_id  = sp("<think>");
+  _think_close_id = sp("</think>");
+  if (_think_open_id < 0 && _think_close_id < 0) {
+    // Gemma-4 reasoning channel. (`<|think|>` is Gemma's arm-reasoning
+    // marker, not the block delimiter -- the channel tokens are.)
+    _think_open_id  = sp("<|channel>");
+    _think_close_id = sp("<channel|>");
+  }
 }
 
 void
@@ -1006,13 +1038,20 @@ Tokenizer::Impl::decode(span<const int32_t> ids) const
     auto sit = _special_by_id.find(id);
     if (sit != _special_by_id.end()) {
       // Flush pending regular tokens, then emit the special's
-      // literal content.
+      // literal content -- except the family's reasoning begin/end
+      // tokens, which rewrite to the unified vpipe thinking markers.
       if (!byte_buf.empty()) {
         out.append(_metaspace ? metaspace_decode_(byte_buf)
                               : byte_level_to_bytes_(byte_buf));
         byte_buf.clear();
       }
-      out.append(sit->second);
+      if (id == _think_open_id) {
+        out.append(media_line::kThinkStart);
+      } else if (id == _think_close_id) {
+        out.append(media_line::kThinkEnd);
+      } else {
+        out.append(sit->second);
+      }
       continue;
     }
     auto it = _inv_vocab.find(id);
@@ -1031,10 +1070,18 @@ Tokenizer::Impl::step(StreamDecoder& sd, int32_t id) const
 {
   // Append the decoded bytes (special: literal content, regular:
   // byte-level decode) to the pending buffer, then emit the longest
-  // valid UTF-8 prefix.
+  // valid UTF-8 prefix. The family's reasoning begin/end tokens
+  // rewrite to the unified vpipe thinking markers so streamed chat
+  // output carries one marker pair regardless of the model family.
   auto sit = _special_by_id.find(id);
   if (sit != _special_by_id.end()) {
-    sd.pending.append(sit->second);
+    if (id == _think_open_id) {
+      sd.pending.append(media_line::kThinkStart);
+    } else if (id == _think_close_id) {
+      sd.pending.append(media_line::kThinkEnd);
+    } else {
+      sd.pending.append(sit->second);
+    }
   } else {
     auto it = _inv_vocab.find(id);
     if (it != _inv_vocab.end()) {

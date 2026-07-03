@@ -94,6 +94,30 @@ public:
     return getline(prompt, out, should_cancel);
   }
 
+  // Like getline(), but the caller ACCEPTS media-line markers (see
+  // common/media-line.h): the returned line may carry inline
+  // image/audio attachments as special text sequences --
+  //   <|__vpipe_fs_im_start__|>path<|__vpipe_fs_im_end__|> (a local
+  // filesystem path; im=image, au=audio) or
+  //   <|__vpipe_base64_im_start__|>length,data<|__vpipe_base64_im_end__|>
+  // (an inline base64 payload). Delegates that can collect attachments
+  // advertise the capability to their front end: the web-ui delegate
+  // flags the pending request so the browser shows attach-image /
+  // attach-audio buttons and drag-and-drop, emitting base64 markers;
+  // the stdio delegate reads a plain line on which a local user types
+  // fs-path markers by hand. The default forwards to getline() so a
+  // delegate that knows nothing about media still functions (markers
+  // typed literally still parse downstream). Prompt, cancellation, the
+  // Ok/Eof/Canceled outcomes, and the newline-stripped `out` are
+  // identical to getline().
+  virtual UiInputStatus
+  getmedialine(const VpipeFormat&           prompt,
+               std::string&                 out,
+               const std::function<bool()>& should_cancel)
+  {
+    return getline(prompt, out, should_cancel);
+  }
+
   // Open a live text-output stream (see UiTextStream). Used for
   // token-by-token model output that should appear as it is produced,
   // rather than as one info() line at the end. Never returns null.

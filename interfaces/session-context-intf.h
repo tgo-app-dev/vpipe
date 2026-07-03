@@ -80,6 +80,21 @@ public:
     return UiInputStatus::Eof;
   }
 
+  // Blocking request for one line of interactive user input that MAY
+  // carry inline media-line attachment markers (images/audio; see
+  // common/media-line.h and UiDelegateIntf::getmedialine), routed to
+  // the session's UI delegate. Calling this instead of getline tells
+  // the delegate the caller will parse markers, so media-capable
+  // front ends (web-ui) offer attach/drop controls. The default
+  // returns Eof so adapter contexts that never service a UI need not
+  // override it.
+  virtual UiInputStatus
+  getmedialine(const VpipeFormat& /*prompt*/, std::string& /*out*/,
+               const std::function<bool()>& /*should_cancel*/) const
+  {
+    return UiInputStatus::Eof;
+  }
+
   // Open a live text-output stream routed to the session's UI delegate
   // (see UiDelegateIntf::open_text_stream / UiTextStream). The default
   // returns a no-op stream so adapter contexts that never service a UI

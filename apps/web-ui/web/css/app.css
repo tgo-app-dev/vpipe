@@ -711,6 +711,15 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 .userio .console .line.error { color: var(--danger); }
 .userio .console .line.input { color: var(--accent); }
 .userio .console .line.stream { color: var(--accent-2); }
+/* Model reasoning ("thinking") segments, delimited by the unified
+   vpipe thinking markers. Shown dimmed/italic when the Thinking
+   toggle is on; collapsed to a bare 💭 when off. */
+.userio .console .line .thinking {
+  color: var(--fg-dim); font-style: italic;
+}
+.userio .console .line .thinking-hidden {
+  opacity: .6; cursor: default;
+}
 .userio .console .line.stream.streaming::after {
   content: '▋'; margin-left: 1px; color: var(--accent-2);
   animation: blink 1s step-start infinite;

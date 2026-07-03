@@ -6,6 +6,8 @@
 
 #include "minitest.h"
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/session.h"
 
 #include <cmath>
 #include <cstdint>
@@ -17,6 +19,26 @@
 using vpipe::genai::Gemma4UnifiedEmbedder;
 
 namespace {
+
+// Raw safetensors 12B dir (arch Gemma4UnifiedForConditionalGeneration).
+std::string st_model_dir_() {
+  if (const char* p = std::getenv("VPIPE_GEMMA12B_ST_TEST_MODEL_PATH")) {
+    if (*p) { return std::string(p); }
+  }
+  return std::string();
+}
+
+// Relative L2 of a vs b (== L2(a-b)/L2(b)); -1 on a size mismatch.
+double rel_l2_(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) { return -1.0; }
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    num += d * d;
+    den += (double)b[i] * b[i];
+  }
+  return std::sqrt(num / (den > 0.0 ? den : 1.0));
+}
 
 std::string mmproj_path_() {
   if (const char* p = std::getenv("VPIPE_GEMMA12B_MMPROJ")) {
@@ -149,4 +171,75 @@ TEST(gemma4_unified_embedder, audio_shapes_and_finite) {
     EXPECT_TRUE(std::abs(r->rows[i] - gold0[i]) < 1e-2f);
   }
   EXPECT_TRUE(std::abs(mag - 2.1914e5) < 2e2);
+}
+
+// Load the SAME shallow adaptor from the raw SAFETENSORS 12B and check it
+// against the GGUF mmproj path: token counts + finiteness, plus a cross-
+// check rel-L2 of the encode outputs. The adaptor weights are identical;
+// only the quantisation (bf16 st vs q4 gguf) differs, so a small rel-L2 is
+// expected. A large one (>0.3) means a wrong name/shape/transpose mapping.
+TEST(gemma4_unified_embedder, safetensors_load_and_crosscheck) {
+  const std::string sd = st_model_dir_();
+  if (sd.empty()) { return; }
+  vpipe::Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  auto est = Gemma4UnifiedEmbedder::load_safetensors(sd, mc);
+  ASSERT_TRUE(est != nullptr);
+  ASSERT_TRUE(est->has_vision());
+  ASSERT_TRUE(est->has_audio());
+  EXPECT_TRUE(est->out_hidden() == 3840);
+
+  // Vision: same synthetic pixels + shapes as the GGUF test.
+  const int H = 288, W = 336;             // identity resize -> 7x6 = 42 tok
+  std::vector<std::uint8_t> rgb((std::size_t)3 * H * W);
+  for (int c = 0; c < 3; ++c) {
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        rgb[((std::size_t)c * H + y) * W + x] =
+            (std::uint8_t)((x * 3 + y * 5 + c * 37) & 0xff);
+      }
+    }
+  }
+  auto vst = est->encode_image(rgb.data(), H, W);
+  ASSERT_TRUE(vst.has_value());
+  EXPECT_TRUE(vst->grid_w == 7 && vst->grid_h == 6);
+  EXPECT_TRUE(vst->n_tokens == 42);
+  EXPECT_TRUE((int)vst->rows.size() == vst->n_tokens * est->out_hidden());
+  EXPECT_TRUE(all_finite_(vst->rows));
+
+  // Audio: 1 s @16k -> 25 tokens.
+  const std::size_t n = 16000;
+  std::vector<float> pcm(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    pcm[i] = 0.1f * std::sin(0.02f * (float)i);
+  }
+  auto ast = est->encode_audio(pcm.data(), n);
+  ASSERT_TRUE(ast.has_value());
+  EXPECT_TRUE(ast->n_tokens == 25);
+  EXPECT_TRUE((int)ast->rows.size() == ast->n_tokens * est->out_hidden());
+  EXPECT_TRUE(all_finite_(ast->rows));
+
+  // Cross-check vs the GGUF mmproj (if present): rel-L2 of the encode
+  // outputs. bf16 vs q4 quant => tolerate ~0.15; a wrong mapping is O(1)+.
+  const std::string mp = mmproj_path_();
+  if (mp.empty()) {
+    std::printf("[g4u_st] GGUF mmproj not set; skipping cross-check\n");
+    return;
+  }
+  auto eg = Gemma4UnifiedEmbedder::load(mp);
+  ASSERT_TRUE(eg != nullptr);
+  auto vg = eg->encode_image(rgb.data(), H, W);
+  auto ag = eg->encode_audio(pcm.data(), n);
+  ASSERT_TRUE(vg.has_value() && ag.has_value());
+  const double v_rl2 = rel_l2_(vst->rows, vg->rows);
+  const double a_rl2 = rel_l2_(ast->rows, ag->rows);
+  std::printf("[g4u_st] cross-check vs gguf: vision rel-L2=%.5f "
+              "audio rel-L2=%.5f\n", v_rl2, a_rl2);
+  // bf16(st) vs q4(gguf): the exact-same adaptor differs only by quant, so
+  // rel-L2 sits ~0.04-0.06. A wrong name/shape/transpose/order mapping is
+  // O(1)+ (a single wrong patch-axis order was 0.44).
+  EXPECT_TRUE(v_rl2 >= 0.0 && v_rl2 < 0.15);
+  EXPECT_TRUE(a_rl2 >= 0.0 && a_rl2 < 0.15);
 }

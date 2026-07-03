@@ -88,6 +88,18 @@ TEST(ui_delegate, getpasswd_defaults_to_getline) {
   EXPECT_TRUE(out == "from-getline");
 }
 
+// The UiDelegateIntf::getmedialine default forwards to getline for
+// delegates that don't collect attachments (any markers the user types
+// literally still travel through and parse downstream).
+TEST(ui_delegate, getmedialine_defaults_to_getline) {
+  GetlineOnlyUi d;
+  string out;
+  UiInputStatus st = d.getmedialine(fmt(">> "), out, nullptr);
+  EXPECT_TRUE(st == UiInputStatus::Ok);
+  EXPECT_TRUE(d.getline_called);
+  EXPECT_TRUE(out == "from-getline");
+}
+
 // error/warn -> stderr, info -> stdout, each a single framed line.
 TEST(ui_delegate, stdio_emit_routes_and_frames) {
   IoCapture cap;

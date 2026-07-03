@@ -204,21 +204,22 @@ TEST(realtime_vqa_stage, language_inherits_session_locale) {
               == std::string::npos);          // not the English default
 }
 
-// The prior-scene recap defaults ON (carried only across temporally-
-// continuous scenes -- see prev_recap_) and is disabled by setting
-// prev_scene_recap=false.
-TEST(realtime_vqa_stage, prev_scene_recap_default_and_override) {
+// Scene overlap defaults ON (the previous scene's last frame is re-issued
+// as the next scene's first frame, only across temporally-continuous
+// scenes -- see scenes_continuous_) and is disabled by setting
+// scene_overlap=false.
+TEST(realtime_vqa_stage, scene_overlap_default_and_override) {
   Session sess;
   CerrSilencer hush;
   {
     RealtimeVqaStage s(&sess, "rvqa", vector<InEdge>{}, basic_cfg_());
-    EXPECT_TRUE(s.prev_scene_recap());                     // default on
+    EXPECT_TRUE(s.scene_overlap());                        // default on
   }
   {
     FlexData cfg = FlexData::from_json(
-        R"({"hf_dir":"/p","questions":"q","prev_scene_recap":false})");
+        R"({"hf_dir":"/p","questions":"q","scene_overlap":false})");
     RealtimeVqaStage s(&sess, "rvqa", vector<InEdge>{}, std::move(cfg));
-    EXPECT_FALSE(s.prev_scene_recap());                    // disabled
+    EXPECT_FALSE(s.scene_overlap());                       // disabled
   }
 }
 
@@ -472,6 +473,10 @@ TEST(realtime_vqa_stage, metal_pipeline_smoke) {
     o.insert("max_new_tokens", FlexData::make_int(24));
     o.insert("max_pages", FlexData::make_int(16));
     o.insert("idle_ticks_to_end", FlexData::make_int(2));
+    // Opt into the constant-N pipelined batched decode (bdecode_* with the
+    // run-ahead driver loop); metal_branch_pool_reuse keeps covering the
+    // default shrinking sync path.
+    o.insert("pipelined_batched_decode", FlexData::make_bool(true));
     // Optional: exercise the CoreML vision tower on the metal path when
     // VPIPE_METAL_VQA_COREML_PATH points at a .mlpackage.
     if (const char* cmlp = std::getenv("VPIPE_METAL_VQA_COREML_PATH");
@@ -565,8 +570,8 @@ TEST(realtime_vqa_stage, metal_branch_pool_reuse) {
   drv->allocate_oports(2);
   auto* driver = static_cast<VqaDriverSource*>(
       pl.insert_stage(std::move(drv)));
-  driver->n_scenes = 2;        // two frame batches, 5 s gap -> two scenes
-  driver->n_ticks  = 12;       // enough idle ticks to close the 2nd scene
+  driver->n_scenes = 2;        // two frame batches, 5 s apart in ts
+  driver->n_ticks  = 12;       // drive the process loop to EOS
 
   FlexData cfg = FlexData::make_object();
   {
@@ -583,6 +588,13 @@ TEST(realtime_vqa_stage, metal_branch_pool_reuse) {
     o.insert("max_new_tokens", FlexData::make_int(24));
     o.insert("max_pages", FlexData::make_int(32));
     o.insert("idle_ticks_to_end", FlexData::make_int(2));
+    // Close a scene after each frame/grid (deterministic, no dependence on
+    // the idle-tick-vs-frame-arrival scheduling race): each of the two
+    // batches becomes its own scene. The batches are 5 s apart in ts --
+    // below the 10 s max_frame_gap_ms default -- so they are temporally
+    // CONTINUOUS, and the 2nd scene re-issues the 1st's last frame
+    // (scene-overlap), which we assert below.
+    o.insert("max_frames_per_scene", FlexData::make_int(1));
     if (const char* cmlp = std::getenv("VPIPE_METAL_VQA_COREML_PATH");
         cmlp && *cmlp) {
       o.insert("coreml_vision_path", FlexData::make_string(cmlp));
@@ -616,6 +628,10 @@ TEST(realtime_vqa_stage, metal_branch_pool_reuse) {
   // The pool was reserved once and reused -- sized to the question count,
   // not grown per scene.
   EXPECT_TRUE(rvqa->branch_pool_size() == static_cast<std::size_t>(2));
+  // Scene-overlap: the 2nd (temporally-continuous) scene re-issued the
+  // 1st scene's last frame as its first frame. At least one overlap must
+  // have fired across the two continuous scenes.
+  EXPECT_TRUE(rvqa->overlaps_applied() >= 1u);
 
   // Every emitted scene that carries answers must have BOTH non-empty (a
   // rebranch that leaked the prior scene's KV / dropped a branch would show

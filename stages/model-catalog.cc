@@ -14,6 +14,61 @@ model_catalog()
   // model; the selection menu rebuilds itself from this table.
   // ==================================================================
   static const std::vector<ModelCatalogEntry> kCatalog = {
+    // ---- Evaluation datasets (model-eval stage) ----------------------
+    // Fetched on demand from the HuggingFace datasets-server /rows API and
+    // registered in the models DB; the model-eval stage resolves the key to
+    // the local dir and reads the rows-*.json pages. Kept OUT of the binary
+    // so the dataset licenses (CC BY-SA) don't touch vpipe's Apache-2.0.
+    {.family = "Datasets", .version = "eval", .param_class = "WikiText-2",
+     .variant = "raw test (Salesforce/wikitext)",
+     .hf_path = "vpipe-eval-datasets/wikitext-2-raw-test",
+     .model_type = "eval-wikitext2",
+     .name = "wikitext-2-raw-test",
+     .dataset_files = {
+       {"https://datasets-server.huggingface.co/rows?dataset=Salesforce/"
+        "wikitext&config=wikitext-2-raw-v1&split=test&offset=0&length=100",
+        "rows-0000.json"},
+       {"https://datasets-server.huggingface.co/rows?dataset=Salesforce/"
+        "wikitext&config=wikitext-2-raw-v1&split=test&offset=100&length=100",
+        "rows-0100.json"},
+       {"https://datasets-server.huggingface.co/rows?dataset=Salesforce/"
+        "wikitext&config=wikitext-2-raw-v1&split=test&offset=200&length=100",
+        "rows-0200.json"},
+       {"https://datasets-server.huggingface.co/rows?dataset=Salesforce/"
+        "wikitext&config=wikitext-2-raw-v1&split=test&offset=300&length=100",
+        "rows-0300.json"}}},
+    {.family = "Datasets", .version = "eval", .param_class = "ARC-Challenge",
+     .variant = "test (allenai/ai2_arc)",
+     .hf_path = "vpipe-eval-datasets/arc-challenge-test",
+     .model_type = "eval-arc-challenge",
+     .name = "arc-challenge-test",
+     .dataset_files = {
+       {"https://datasets-server.huggingface.co/rows?dataset=allenai/"
+        "ai2_arc&config=ARC-Challenge&split=test&offset=0&length=100",
+        "rows-0000.json"},
+       {"https://datasets-server.huggingface.co/rows?dataset=allenai/"
+        "ai2_arc&config=ARC-Challenge&split=test&offset=100&length=100",
+        "rows-0100.json"},
+       {"https://datasets-server.huggingface.co/rows?dataset=allenai/"
+        "ai2_arc&config=ARC-Challenge&split=test&offset=200&length=100",
+        "rows-0200.json"}}},
+    // Qwen3.6-27B: a Qwen3.5-family hybrid VLM (model_type "qwen3_5",
+    // full-attn + gated-DeltaNet, 64 layers, hidden 5120). bf16 source
+    // (15 safetensors shards, ~54 GB) -- whole-repo fetch; quantize with
+    // the model-quantize stage (AWQ supported: the GDN in-proj group folds
+    // into input_layernorm).
+    {.family = "Qwen", .version = "3.6", .param_class = "27B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen3.6-27B",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
+    // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
+    // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
+    // the dense bf16 path covers the MoE experts so calibration can run).
+    {.family = "Qwen", .version = "3.6", .param_class = "35B-A3B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen3.6-35B-A3B",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
     {.family = "Qwen", .version = "3.5", .param_class = "9B",
      .variant = "MLX 4-bit (lmstudio-community)",
      .hf_path = "lmstudio-community/Qwen3.5-9B-MLX-4bit",
@@ -109,6 +164,30 @@ model_catalog()
      .variant = "GGUF QAT q4_0 (google, gated)",
      .hf_path = "google/gemma-4-12B-it-qat-q4_0-gguf",
      .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    // Raw google bf16 Gemma-4-it releases (gated; whole-repo fetch --
+    // quantize with model-quantize before running). E-series are the
+    // gemma3n-style effective (PLE) models -> "gemma4"; the dense 12B/31B
+    // -> "gemma4_unified"; 26B-A4B is a MoE (4B active).
+    {.family = "Gemma", .version = "4", .param_class = "E2B",
+     .variant = "bf16 (google, gated)",
+     .hf_path = "google/gemma-4-E2B-it",
+     .model_type = "gemma4", .needs_tokenizer_json = false},
+    {.family = "Gemma", .version = "4", .param_class = "E4B",
+     .variant = "bf16 (google, gated)",
+     .hf_path = "google/gemma-4-E4B-it",
+     .model_type = "gemma4", .needs_tokenizer_json = false},
+    {.family = "Gemma", .version = "4", .param_class = "12B",
+     .variant = "bf16 (google, gated)",
+     .hf_path = "google/gemma-4-12B-it",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    {.family = "Gemma", .version = "4", .param_class = "31B",
+     .variant = "bf16 (google, gated)",
+     .hf_path = "google/gemma-4-31B-it",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    {.family = "Gemma", .version = "4", .param_class = "26B-A4B",
+     .variant = "bf16 MoE (google, gated)",
+     .hf_path = "google/gemma-4-26B-A4B-it",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
     // ---- MOSS-TTS (text-to-speech: LM + audio codec) -----------------
     // The text-to-speech stage consumes TWO models: the MOSS-TTS LM
     // (the stage's hf_dir, model_type "moss-tts") and the
@@ -125,6 +204,18 @@ model_catalog()
      .variant = "F32 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer",
      .model_type = "moss-codec", .needs_tokenizer_json = false},
+    // MOSS-TTS-Local-v1.5: the text-to-speech stage's v1.5 LM (hf_dir,
+    // model_type "moss-tts-local"; quantize it with model-quantize before
+    // use) + its 48 kHz stereo codec (codec_dir, "moss-codec-v2"). The
+    // text-to-speech stage auto-detects this variant from config.json.
+    {.family = "MOSS", .version = "TTS-Local", .param_class = "v1.5",
+     .variant = "bf16 (OpenMOSS-Team)",
+     .hf_path = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
+     .model_type = "moss-tts-local", .needs_tokenizer_json = false},
+    {.family = "MOSS", .version = "Audio-Tokenizer", .param_class = "codec-v2",
+     .variant = "F32 (OpenMOSS-Team)",
+     .hf_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2",
+     .model_type = "moss-codec-v2", .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /

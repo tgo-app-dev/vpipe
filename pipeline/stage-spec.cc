@@ -13,6 +13,7 @@ stage_category_name(StageCategory c) noexcept
     case StageCategory::Control:  return "control";
     case StageCategory::Database: return "database";
     case StageCategory::Network:  return "network";
+    case StageCategory::Preparation: return "preparation";
   }
   return "generic";
 }

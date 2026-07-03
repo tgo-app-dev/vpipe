@@ -50,6 +50,15 @@ public:
                   const metal_compute::SharedBuffer* kq, int hidden,
                   bool bf16, bool table_is_q4k);
 
+  // Unquantized dense f16/bf16 embedding table [vocab, hidden] (raw-HF
+  // checkpoint): gathers rows with embed_gather_f16. The DenseTag overload
+  // disambiguates from the affine 3-buffer ctor. `table` must outlive the
+  // muxer.
+  struct DenseTag {};
+  MetalTokenMuxer(DenseTag, metal_compute::MetalCompute* mc,
+                  const metal_compute::SharedBuffer* table, int hidden,
+                  bool bf16 = false);
+
   bool valid() const noexcept;
 
   // Gather + dequantize the rows for `ids` into a fresh [n, hidden]

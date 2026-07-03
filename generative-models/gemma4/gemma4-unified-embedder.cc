@@ -1,11 +1,15 @@
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/perf-event.h"
 #include "common/perf-scope.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 
@@ -45,6 +49,109 @@ load_vec_(const GgufFile& g, const std::string& name, std::vector<float>* out)
   if (t == nullptr) { return false; }
   out->assign(static_cast<std::size_t>(t->numel()), 0.0f);
   return g.dequant_all_f32(*t, out->data());
+}
+
+// Convert one bf16 lane (top 16 bits of an f32) to f32.
+inline float
+bf16_to_f32_(std::uint16_t h)
+{
+  const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+// Convert one IEEE f16 lane to f32.
+inline float
+f16_to_f32_(std::uint16_t h)
+{
+  const std::uint32_t sign = (std::uint32_t(h) & 0x8000u) << 16;
+  const std::uint32_t exp = (h >> 10) & 0x1fu;
+  const std::uint32_t man = h & 0x3ffu;
+  std::uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;
+    } else {
+      int e = -1;
+      std::uint32_t m = man;
+      do { m <<= 1; ++e; } while ((m & 0x400u) == 0);
+      m &= 0x3ffu;
+      bits = sign | ((127 - 15 - e) << 23) | (m << 13);
+    }
+  } else if (exp == 0x1fu) {
+    bits = sign | 0x7f800000u | (man << 13);
+  } else {
+    bits = sign | ((exp + (127 - 15)) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+// Read a named safetensors tensor (bf16 / f16 / f32) into a row-major f32
+// buffer, keeping the on-disk element order. Tries `name` then a
+// `model.`-prefixed spelling. Returns false on a missing tensor. `numel`
+// (if non-null) receives the element count.
+bool
+st_load_f32_(const MetalLlamaWeights& w, metal_compute::MetalCompute* mc,
+             const std::string& name, std::vector<float>* out,
+             std::int64_t* numel)
+{
+  const MetalLlamaWeights::TensorInfo* ti = w.info(name);
+  std::string key = name;
+  if (ti == nullptr) {
+    key = "model." + name;
+    ti = w.info(key);
+  }
+  if (ti == nullptr) { return false; }
+  metal_compute::SharedBuffer buf = w.load(key, mc);
+  if (buf.empty()) { return false; }
+  std::int64_t n = 1;
+  for (std::int64_t d : ti->shape) { n *= d; }
+  out->assign(static_cast<std::size_t>(n), 0.0f);
+  const void* src = buf.contents();
+  if (ti->dtype == "F32") {
+    std::memcpy(out->data(), src,
+                static_cast<std::size_t>(n) * sizeof(float));
+  } else if (ti->dtype == "BF16") {
+    const auto* h = static_cast<const std::uint16_t*>(src);
+    for (std::int64_t i = 0; i < n; ++i) {
+      (*out)[static_cast<std::size_t>(i)] = bf16_to_f32_(h[i]);
+    }
+  } else if (ti->dtype == "F16") {
+    const auto* h = static_cast<const std::uint16_t*>(src);
+    for (std::int64_t i = 0; i < n; ++i) {
+      (*out)[static_cast<std::size_t>(i)] = f16_to_f32_(h[i]);
+    }
+  } else {
+    return false;
+  }
+  if (numel) { *numel = n; }
+  return true;
+}
+
+// Reorder the length-(C*P*P) fastest axis of each of `rows` rows from HF's
+// [KH,KW,C] (channels innermost) patch flatten into the forward's
+// [C,KH,KW] (channels outermost). llama.cpp's mmproj converter bakes this
+// permutation in; the raw safetensors keep HF order.
+void
+reorder_patch_axis_(std::vector<float>* v, int rows, int C, int P)
+{
+  const int inn = C * P * P;
+  std::vector<float> tmp(static_cast<std::size_t>(rows) * inn);
+  for (int r = 0; r < rows; ++r) {
+    const float* src = v->data() + static_cast<std::size_t>(r) * inn;
+    float* dst = tmp.data() + static_cast<std::size_t>(r) * inn;
+    for (int c = 0; c < C; ++c) {
+      for (int kh = 0; kh < P; ++kh) {
+        for (int kw = 0; kw < P; ++kw) {
+          dst[(c * P + kh) * P + kw] = src[(kh * P + kw) * C + c];
+        }
+      }
+    }
+  }
+  *v = std::move(tmp);
 }
 
 // LayerNorm over a length-D vector in place: (x-mean)/sqrt(var+eps)*w + b.
@@ -107,6 +214,115 @@ floor_by_(double x, int f)
 }
 
 }  // namespace
+
+bool
+Gemma4UnifiedEmbedder::has_unified_safetensors(const std::string& model_dir)
+{
+  auto w = MetalLlamaWeights::open_model(model_dir);
+  if (!w) { return false; }
+  return w->has("model.embed_vision.embedding_projection.weight") ||
+         w->has("embed_vision.embedding_projection.weight") ||
+         w->has("model.embed_audio.embedding_projection.weight") ||
+         w->has("embed_audio.embedding_projection.weight");
+}
+
+std::unique_ptr<Gemma4UnifiedEmbedder>
+Gemma4UnifiedEmbedder::load_safetensors(const std::string& model_dir,
+                                        metal_compute::MetalCompute* mc)
+{
+  if (mc == nullptr) { return nullptr; }
+  auto w = MetalLlamaWeights::open_model(model_dir);
+  if (!w) { return nullptr; }
+
+  auto m = std::unique_ptr<Gemma4UnifiedEmbedder>(new Gemma4UnifiedEmbedder());
+
+  // ---- Vision adaptor (model.vision_embedder.* + model.embed_vision.*) ----
+  // patch_dense.weight is [out=embed, in=patch_in] row-major -- the SAME
+  // layout load_weight_ produces from the GGUF v.patch_embd.weight, so a
+  // straight bf16->f32 copy suffices (no transpose).
+  const bool have_vis =
+      st_load_f32_(*w, mc, "vision_embedder.patch_dense.weight", &m->_w_patch,
+                   nullptr);
+  if (have_vis) {
+    const MetalLlamaWeights::TensorInfo* pd =
+        w->info("model.vision_embedder.patch_dense.weight");
+    if (pd == nullptr) {
+      pd = w->info("vision_embedder.patch_dense.weight");
+    }
+    const bool ok =
+        pd != nullptr && pd->shape.size() == 2 &&
+        st_load_f32_(*w, mc, "vision_embedder.patch_dense.bias",
+                     &m->_b_patch, nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.patch_ln1.weight", &m->_ln1_w,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.patch_ln1.bias", &m->_ln1_b,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.patch_ln2.weight", &m->_ln2_w,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.patch_ln2.bias", &m->_ln2_b,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.pos_norm.weight", &m->_ln3_w,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "vision_embedder.pos_norm.bias", &m->_ln3_b,
+                     nullptr) &&
+        st_load_f32_(*w, mc, "embed_vision.embedding_projection.weight",
+                     &m->_w_proj, nullptr);
+    // pos_embedding is [pos_max, 2, embed] row-major; the forward expects the
+    // GGUF layout [2, pos_max, embed] (block0 = column table, block1 = row
+    // table). Transpose the two leading axes (== what llama.cpp's converter
+    // did), so _pos is element-identical to the GGUF path.
+    std::vector<float> pos_st;
+    std::int64_t pos_n = 0;
+    const bool have_pos =
+        st_load_f32_(*w, mc, "vision_embedder.pos_embedding", &pos_st,
+                     &pos_n);
+    if (ok && have_pos) {
+      m->_embed = static_cast<int>(pd->shape[0]);     // 3840
+      m->_patch_in = static_cast<int>(pd->shape[1]);  // 6912
+      const std::size_t D = static_cast<std::size_t>(m->_embed);
+      const std::size_t pm =
+          static_cast<std::size_t>(pos_n) / (D * 2);
+      m->_pos_max = static_cast<int>(pm);
+      m->_pos.assign(static_cast<std::size_t>(pos_n), 0.0f);
+      for (std::size_t p = 0; p < pm; ++p) {
+        for (std::size_t s = 0; s < 2; ++s) {
+          const float* srow = pos_st.data() + (p * 2 + s) * D;
+          float* drow = m->_pos.data() + (s * pm + p) * D;
+          std::memcpy(drow, srow, D * sizeof(float));
+        }
+      }
+      // Patch-space (6912) tensors flatten as [KH,KW,C] in HF; permute the
+      // ln1 gamma/beta + patch_dense columns to the [C,KH,KW] order the
+      // forward's im2col uses.
+      const int C = 3;
+      const int P = static_cast<int>(
+          std::lround(std::sqrt(static_cast<double>(m->_patch_in) / C)));
+      reorder_patch_axis_(&m->_ln1_w, 1, C, P);
+      reorder_patch_axis_(&m->_ln1_b, 1, C, P);
+      reorder_patch_axis_(&m->_w_patch, m->_embed, C, P);
+      m->_has_vision = true;
+    }
+  }
+
+  // ---- Audio adaptor (model.embed_audio.embedding_projection.weight) ------
+  // [out=embed, in=audio_frame] row-major -- direct copy, as the GGUF path.
+  if (st_load_f32_(*w, mc, "embed_audio.embedding_projection.weight",
+                   &m->_w_aproj, nullptr)) {
+    const MetalLlamaWeights::TensorInfo* ap =
+        w->info("model.embed_audio.embedding_projection.weight");
+    if (ap == nullptr) {
+      ap = w->info("embed_audio.embedding_projection.weight");
+    }
+    if (ap != nullptr && ap->shape.size() == 2) {
+      m->_audio_frame = static_cast<int>(ap->shape[1]);   // 640
+      if (m->_embed == 0) { m->_embed = static_cast<int>(ap->shape[0]); }
+      m->_has_audio = true;
+    }
+  }
+
+  if (!m->_has_vision && !m->_has_audio) { return nullptr; }
+  return m;
+}
 
 std::string
 Gemma4UnifiedEmbedder::find_mmproj(const std::string& model_dir)

@@ -21,6 +21,8 @@ set(LOCAL_TEST_SOURCES
   lmdb-wrapper.cc
   lmdb.cc
   log-delegate.cc
+  media-decode.cc
+  media-line.cc
   mini-http.cc
   model-catalog.cc
   onvif-soap.cc
@@ -85,6 +87,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         gemma4-unified-embedder.cc
         gguf-convert.cc
         metal-lm-smoke.cc
+        model-quantize-roundtrip.cc
+        model-quantize-stage.cc
+        model-eval-stage.cc
+        model-benchmark-stage.cc
+        gemma-bench-driver.cc
+        quant-arch-detect.cc
+        moss-tts-local.cc
         llm-chat-template.cc
         llm-sampler.cc
         llm-tokenizer.cc

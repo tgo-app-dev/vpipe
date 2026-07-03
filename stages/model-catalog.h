@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -48,6 +49,13 @@ struct ModelCatalogEntry {
                             // entries share one hf_path); empty -> key=hf_path
   bool        extract_archive = false;  // unpack fetched .tar(s); local_path
                                         // -> the contained *.mlpackage
+  // Dataset fetch (evaluation datasets, e.g. WikiText-2 / ARC-Challenge):
+  // each pair is {full URL, destination filename}, downloaded VERBATIM into
+  // the registered dir (the HF datasets-server /rows pages) instead of walking
+  // a model repo's file tree. Keeps dataset text OUT of the binary (fetched on
+  // demand by the user) so vpipe's Apache-2.0 license is unaffected. When
+  // non-empty, the repo-tree download path is skipped.
+  std::vector<std::pair<std::string, std::string>> dataset_files;
 };
 
 // The full catalogue. Definition order is the display order within each

@@ -53,6 +53,17 @@ public:
   int sample_rate() const { return _sample_rate; }
   int n_quantizers() const { return _n_vq; }
 
+  // Test / A-B hooks for the M5 matrix-core (matmul2d/NAX) decode paths (the
+  // f16 GEMM and the windowed-causal flash attention). No-ops unless the NAX
+  // kernels loaded (M5 + not disabled via VPIPE_MOSS_CODEC_NO_MMA2 /
+  // NO_ATTN_MMA); production leaves the load-time default (on for M5).
+  bool set_use_mma2(bool on)
+  { _use_mma2 = on && _mma_available; return _use_mma2; }
+  bool use_mma2() const { return _use_mma2; }
+  bool set_use_attn_mma(bool on)
+  { _use_attn_mma = on && _attn_mma_available; return _use_attn_mma; }
+  bool use_attn_mma() const { return _use_attn_mma; }
+
   // Optional profiling sink. When set (and profiling enabled), decode()
   // brackets onto the LLM perf lane as an "audio-codec" block. No-op if null.
   void set_session(const SessionContextIntf* s) { _session = s; }
@@ -156,6 +167,27 @@ private:
       _fn_transpose, _fn_residual, _fn_sdpa, _fn_rope;
   metal_compute::ComputeFunction _fn_quant;        // int8 g32 quant (load)
   metal_compute::ComputeFunction _fn_qmm8g32;      // fused int8 g32 GEMM
+
+  // M5 matrix-core (matmul2d/NAX) decode acceleration (mirrors CodecV2): the
+  // f16 dense GEMM -> dense_gemm_mma, and the scalar windowed-causal attention
+  // -> sdpa_causal_mma2_d64_f16 (head_dim 64). The int8 GEMM path stays on the
+  // fused affine steel kernel. Loaded only when the GPU has matrix cores.
+  bool _mma_available = false;
+  bool _use_mma2 = false;
+  metal_compute::ComputeLibrary  _lib_dense_mma;
+  metal_compute::ComputeFunction _fn_gemm_mma, _fn_gemm_mma_deep;
+  bool _attn_mma_available = false;
+  bool _use_attn_mma = false;
+  metal_compute::ComputeLibrary  _lib_sdpa_mma;
+  metal_compute::ComputeFunction _fn_sdpa_mma;
+
+  // Int8 (w8 group-32) matrix-core GEMM path: dequant the weight to f16 once
+  // (affine_dequant_w8g32) then run the f16 dense_gemm_mma. This beats both the
+  // fused affine STEEL w8 kernel and a fused dequant-in-matmul2d at the codec's
+  // prefill-like M (the fused kernel re-dequants the weight per M-tile). Gated
+  // on _use_mma2 (the same GEMM lever as the f16 path); int8 mode only.
+  metal_compute::ComputeLibrary  _lib_dequant;
+  metal_compute::ComputeFunction _fn_dequant_w8g32;
 };
 
 }  // namespace vpipe::genai

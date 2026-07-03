@@ -70,6 +70,10 @@ public:
   bool has(const std::string& name) const;
   const TensorInfo* info(const std::string& name) const;
 
+  // All tensor names in the checkpoint (unordered). Used by the model
+  // quantizer to enumerate + classify every tensor.
+  std::vector<std::string> tensor_names() const;
+
   // Allocate a SharedBuffer and copy the tensor's bytes into it.
   // Returns an empty SharedBuffer if the tensor is missing.
   metal_compute::SharedBuffer load(

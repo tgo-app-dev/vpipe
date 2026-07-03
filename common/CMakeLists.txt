@@ -13,6 +13,8 @@ set(LOCAL_SOURCES
   lmdb-db.cc
   lmdb-env.cc
   lmdb-txn.cc
+  media-decode.cc
+  media-line.cc
   mini-http.cc
   onvif-soap.cc
   perf-buffer.cc
@@ -50,6 +52,8 @@ set(LOCAL_HEADERS
   lmdb-db.h
   lmdb-env.h
   lmdb-txn.h
+  media-decode.h
+  media-line.h
   mini-http.h
   onvif-soap.h
   oport-policy.h

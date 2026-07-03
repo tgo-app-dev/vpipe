@@ -1,5 +1,6 @@
 #include "generative-models/chat-template.h"
 
+#include "common/media-line.h"
 #include "generative-models/tokenizer.h"
 
 #include <algorithm>
@@ -203,6 +204,12 @@ public:
 
   bool thinking_disabled() const noexcept { return _disable_thinking; }
 
+  // Thinking-ON extras end with `<think>\n`, so generation starts
+  // inside the reasoning block; the opening token never streams
+  // (it's part of the prompt). See the base-class docs.
+  bool assistant_prompt_opens_thinking() const noexcept override
+  { return !_disable_thinking; }
+
 protected:
   // Emit the `<think>...` preamble as the SINGLE special-token ids the
   // tokenizer registered for `<think>` (id 248068) and `</think>` (id
@@ -302,6 +309,45 @@ public:
   {
     (void)render_vlm_prefix(image_token_counts, is_first_turn, dst);
     (void)render_vlm_completion(content, dst);
+  }
+
+  // Mixed in-line turn: text runs and image blocks in caller order.
+  // Qwen3.5-VL has no audio channel, so any Audio chunk rejects the
+  // whole render (nothing appended) and the caller falls back.
+  bool
+  render_user_turn_media(std::span<const MediaChunk>   chunks,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    (void)is_first_turn;   // ChatML has no session-start token
+    if (_image_pad < 0) {
+      return false;
+    }
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Audio) {
+        return false;
+      }
+    }
+    (void)push_sp_(im_start_(), dst);
+    append_text_(tok_(), "user\n", dst);
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Text) {
+        if (!c.text.empty()) {
+          append_text_(tok_(), c.text, dst);
+        }
+      } else if (c.n_tokens > 0) {
+        (void)push_sp_(_vision_start, dst);
+        dst->insert(dst->end(),
+                    static_cast<std::size_t>(c.n_tokens), _image_pad);
+        (void)push_sp_(_vision_end, dst);
+      }
+    }
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+    (void)push_sp_(im_start_(), dst);
+    append_text_(tok_(), "assistant\n", dst);
+    append_assistant_extras_(dst);
+    return true;
   }
 
   // Shared-prefix render. Used by VisualQaStage to prefill the
@@ -773,6 +819,47 @@ public:
     (void)render_vlm_completion(content, dst);
   }
 
+  // Mixed in-line turn: text runs, image blocks (boi + pad×n + eoi)
+  // and audio blocks (boa + pad×n + eoa) in caller order -- Gemma-4
+  // is the tree's only image+audio chat family, so both modalities
+  // can share one turn. Rejects (nothing appended) when a requested
+  // modality's soft tokens are missing from the tokenizer.
+  bool
+  render_user_turn_media(std::span<const MediaChunk>   chunks,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Image && _img_pad < 0) {
+        return false;
+      }
+      if (c.kind == MediaChunk::Kind::Audio
+          && (_aud_pad < 0 || _boa < 0 || _eoa < 0)) {
+        return false;
+      }
+    }
+    emit_turn_open_(is_first_turn, dst);
+    (void)push_sp_(_sot, dst);
+    append_text_(_tok, "user\n", dst);
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Text) {
+        if (!c.text.empty()) {
+          append_text_(_tok, c.text, dst);
+        }
+      } else if (c.n_tokens > 0) {
+        const bool img = c.kind == MediaChunk::Kind::Image;
+        (void)push_sp_(img ? _boi : _boa, dst);
+        dst->insert(dst->end(), static_cast<std::size_t>(c.n_tokens),
+                    img ? _img_pad : _aud_pad);
+        (void)push_sp_(img ? _eoi : _eoa, dst);
+      }
+    }
+    (void)push_sp_(_eot, dst);
+    append_text_(_tok, "\n", dst);
+    emit_model_open_(dst);
+    return true;
+  }
+
   // Shared image-block prefix: <bos>(first)<|turn>user\n then one
   // <|image> {pad x n} <image|> block per image. Pairs with
   // render_vlm_completion. The pad placeholders are overlaid with
@@ -982,27 +1069,38 @@ public:
   // leaving only the user-facing answer.
   std::string sanitize_output(std::string text) const override
   {
-    static constexpr std::string_view kOpen  = "<|channel>";
-    static constexpr std::string_view kClose = "<channel|>";
-    if (text.find(kOpen) == std::string::npos) {
-      return text;   // common case: nothing to strip
-    }
-    std::string out;
-    out.reserve(text.size());
-    const std::string_view tv(text);
-    std::size_t start = 0;
-    while (true) {
-      const std::size_t c = tv.find(kClose, start);
-      const std::string_view seg = (c == std::string_view::npos)
-          ? tv.substr(start)
-          : tv.substr(start, c - start);
-      const std::size_t o = seg.find(kOpen);
-      out.append(o == std::string_view::npos ? seg : seg.substr(0, o));
-      if (c == std::string_view::npos) {
-        break;
+    // The stream detokenizer rewrites the channel tokens to the
+    // unified vpipe thinking markers, so streamed text carries the
+    // marker form; bulk-decoded or externally-sourced text may still
+    // carry the raw channel form. Strip both.
+    auto strip_blocks = [](std::string in, std::string_view open,
+                           std::string_view close) -> std::string {
+      if (in.find(open) == std::string::npos) {
+        return in;   // common case: nothing to strip
       }
-      start = c + kClose.size();
-    }
+      std::string out;
+      out.reserve(in.size());
+      const std::string_view tv(in);
+      std::size_t start = 0;
+      while (true) {
+        const std::size_t c = tv.find(close, start);
+        const std::string_view seg = (c == std::string_view::npos)
+            ? tv.substr(start)
+            : tv.substr(start, c - start);
+        const std::size_t o = seg.find(open);
+        out.append(o == std::string_view::npos ? seg
+                                               : seg.substr(0, o));
+        if (c == std::string_view::npos) {
+          break;
+        }
+        start = c + close.size();
+      }
+      return out;
+    };
+    std::string out = strip_blocks(std::move(text),
+                                   "<|channel>", "<channel|>");
+    out = strip_blocks(std::move(out), vpipe::media_line::kThinkStart,
+                       vpipe::media_line::kThinkEnd);
     const std::size_t b = out.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) {
       return {};

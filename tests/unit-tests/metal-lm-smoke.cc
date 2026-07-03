@@ -25,6 +25,7 @@
 #include "generative-models/tokenizer.h"
 #include "generative-models/shared/gguf-file.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/media-line.h"
 #include "common/session.h"
 
 #include <algorithm>
@@ -66,6 +67,7 @@ TEST(metal_lm_smoke, qmv_w4_w8_bandwidth_ab) {
   const Shape shapes[] = {
       {"moss gate/up", 12288, 4096}, {"moss o-proj ", 4096, 4096},
       {"moss down   ", 4096, 12288}, {"big (SLC-bust)", 16384, 8192},
+      {"optiq lmhead ", 151936, 2560}, {"optiq in_proj", 12288, 2560},
   };
   struct V { const char* fn; int bits; int rps; int nsg; };
   const V vars[] = {
@@ -120,6 +122,415 @@ TEST(metal_lm_smoke, qmv_w4_w8_bandwidth_ab) {
       const double gbps = read_bytes * R / (best_ms / 1e3) / 1e9;
       std::printf("[qmv-ab] %-13s %-22s %4.1f MB | %6.1f GB/s (%4.1f%% peak)\n",
                   sh.name, v.fn, wwords * 4 / 1e6, gbps, 100.0 * gbps / kPeak);
+    }
+  }
+}
+
+// The tgmem-staged tall-tile batched GEMV (affine_qmv_batch8_tg*_w4g64,
+// MAXM=8: activations staged in threadgroup memory instead of per-thread
+// registers) must be BYTE-IDENTICAL to the proven register kernel
+// (affine_qmv_batch_w4g64, the token-exact-verified batched-decode path)
+// on the same inputs -- including a partial K tail (K=768 -> 256-tail
+// block) and a padded row tile (m=7 < MAXM=8). Always-on (no model).
+TEST(metal_lm_smoke, qmv_batch_tg_matches_batch) {
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  auto lib = mc->load_library("affine_qmv");
+  struct V { const char* fn; int bits; int nsg; int maxm; };
+  const V vars[] = {
+      {"affine_qmv_batch8_tg_w4g64", 4, 2, 8},
+      {"affine_qmv_batch8_tg4_w4g64", 4, 4, 8},
+      {"affine_qmv_batch8_tg4_w8g64", 8, 4, 8},
+      {"affine_qmv_batch8_xd_w4g64", 4, 2, 8},
+      {"affine_qmv_batch8_xd_w8g64", 8, 2, 8},
+      {"affine_qmv_batch8_xp1_w4g64", 4, 2, 8},
+      {"affine_qmv_batch8_xp2_w4g64", 4, 2, 8},
+      {"affine_qmv_batch8_xh_w4g64", 4, 2, 8},
+      {"affine_qmv_batch4_xp_w4g64", 4, 2, 4},
+      {"affine_qmv_batch4_xp_w8g64", 8, 2, 4},
+      {"affine_qmv_batch8_xp2_w8g64", 8, 2, 8},
+  };
+  const int m = 7, N = 64, K = 768;   // K%512 != 0: exercises the tail path
+  const int groups = K / 64;
+  std::mt19937 rng(11);
+  std::uniform_int_distribution<std::uint32_t> du(0, 0xffffffffu);
+  std::uniform_real_distribution<float> df(-1.0f, 1.0f);
+  for (const V& v : vars) {
+    auto ref_fn = lib.function(
+        v.bits == 4 ? "affine_qmv_batch_w4g64" : "affine_qmv_batch_w8g64");
+    auto tg_fn = lib.function(v.fn);
+    ASSERT_TRUE(ref_fn.valid());
+    ASSERT_TRUE(tg_fn.valid());
+    const std::size_t wwords = (std::size_t)N * K / (32 / v.bits);
+    auto wb = mc->make_shared_buffer(wwords * 4);
+    auto sb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto bb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto xb = mc->make_shared_buffer((std::size_t)m * K * 2);
+    auto y0 = mc->make_shared_buffer((std::size_t)m * N * 2);
+    auto y1 = mc->make_shared_buffer((std::size_t)m * N * 2);
+    auto* wp = static_cast<std::uint32_t*>(wb.contents());
+    for (std::size_t i = 0; i < wwords; ++i) { wp[i] = du(rng); }
+    auto fill_h = [&](metal_compute::SharedBuffer& b, std::size_t n) {
+      auto* p = static_cast<__fp16*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { p[i] = (__fp16)(df(rng) * 0.5f); }
+    };
+    fill_h(sb, (std::size_t)N * groups);
+    fill_h(bb, (std::size_t)N * groups);
+    fill_h(xb, (std::size_t)m * K);
+    auto run = [&](metal_compute::ComputeFunction& fn,
+                   metal_compute::SharedBuffer& y, unsigned maxm,
+                   unsigned nsg) {
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder e = st.begin_compute();
+        e.set_function(fn);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, xb); e.set_buffer(4, y);
+        e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+        e.dispatch({32u, (unsigned)(N / 4), (unsigned)((m + maxm - 1) / maxm)},
+                   {32u, nsg, 1u});
+      }
+      st.commit().wait();
+    };
+    run(ref_fn, y0, 2, 2);
+    run(tg_fn, y1, (unsigned)v.maxm, (unsigned)v.nsg);
+    const bool same = std::memcmp(y0.contents(), y1.contents(),
+                                  (std::size_t)m * N * 2) == 0;
+    if (!same) {
+      const auto* a = static_cast<const __fp16*>(y0.contents());
+      const auto* b2 = static_cast<const __fp16*>(y1.contents());
+      int bad = 0;
+      for (int i = 0; i < m * N && bad < 5; ++i) {
+        if ((float)a[i] != (float)b2[i]) {
+          std::printf("[qmv-batch-tg] %s mismatch @%d: %f vs %f\n",
+                      v.fn, i, (float)a[i], (float)b2[i]);
+          ++bad;
+        }
+      }
+    }
+    std::printf("[qmv-batch-tg] %-28s vs batch(MAXM=2): %s\n", v.fn,
+                same ? "byte-identical" : "MISMATCH");
+    EXPECT_TRUE(same);
+  }
+
+  // Fused-SwiGLU xp twins vs the register batch-swiglu (MAXM=2) reference:
+  // interleaved gate/up weights, halved [m, N/2] output.
+  {
+    auto ref_fn = lib.function("affine_qmv_batch_swiglu_w4g64");
+    ASSERT_TRUE(ref_fn.valid());
+    struct SV { const char* fn; int maxm; };
+    const SV svars[] = {
+        {"affine_qmv_batch4_xp_swiglu_w4g64", 4},
+        {"affine_qmv_batch8_xp2_swiglu_w4g64", 8},
+    };
+    const std::size_t wwords = (std::size_t)N * K / 8;
+    auto wb = mc->make_shared_buffer(wwords * 4);
+    auto sb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto bb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto xb = mc->make_shared_buffer((std::size_t)m * K * 2);
+    auto y0 = mc->make_shared_buffer((std::size_t)m * (N / 2) * 2);
+    auto y1 = mc->make_shared_buffer((std::size_t)m * (N / 2) * 2);
+    auto* wp = static_cast<std::uint32_t*>(wb.contents());
+    for (std::size_t i = 0; i < wwords; ++i) { wp[i] = du(rng); }
+    auto fill_h = [&](metal_compute::SharedBuffer& b, std::size_t n) {
+      auto* p = static_cast<__fp16*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { p[i] = (__fp16)(df(rng) * 0.5f); }
+    };
+    fill_h(sb, (std::size_t)N * groups);
+    fill_h(bb, (std::size_t)N * groups);
+    fill_h(xb, (std::size_t)m * K);
+    auto run = [&](metal_compute::ComputeFunction& fn,
+                   metal_compute::SharedBuffer& y, unsigned maxm) {
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder e = st.begin_compute();
+        e.set_function(fn);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, xb); e.set_buffer(4, y);
+        e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+        e.dispatch({32u, (unsigned)(N / 4), (unsigned)((m + maxm - 1) / maxm)},
+                   {32u, 2u, 1u});
+      }
+      st.commit().wait();
+    };
+    run(ref_fn, y0, 2);
+    for (const SV& v : svars) {
+      auto fn = lib.function(v.fn);
+      ASSERT_TRUE(fn.valid());
+      run(fn, y1, (unsigned)v.maxm);
+      const bool same = std::memcmp(y0.contents(), y1.contents(),
+                                    (std::size_t)m * (N / 2) * 2) == 0;
+      std::printf("[qmv-batch-tg] %-32s vs batch_swiglu: %s\n", v.fn,
+                  same ? "byte-identical" : "MISMATCH");
+      EXPECT_TRUE(same);
+    }
+  }
+
+  // xh16 (half-precision products/quad-sums, f32 block accumulator) is NOT
+  // bit-identical by design; check it stays within a tight rel tolerance of
+  // the reference (the token-exact bar is enforced end-to-end by
+  // qwen_batched_decode_token_exact).
+  {
+    auto ref_fn = lib.function("affine_qmv_batch_w4g64");
+    auto h_fn = lib.function("affine_qmv_batch8_xh16_w4g64");
+    ASSERT_TRUE(h_fn.valid());
+    const std::size_t wwords = (std::size_t)N * K / 8;
+    auto wb = mc->make_shared_buffer(wwords * 4);
+    auto sb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto bb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+    auto xb = mc->make_shared_buffer((std::size_t)m * K * 2);
+    auto y0 = mc->make_shared_buffer((std::size_t)m * N * 2);
+    auto y1 = mc->make_shared_buffer((std::size_t)m * N * 2);
+    auto* wp = static_cast<std::uint32_t*>(wb.contents());
+    for (std::size_t i = 0; i < wwords; ++i) { wp[i] = du(rng); }
+    auto fill_h = [&](metal_compute::SharedBuffer& b, std::size_t n) {
+      auto* p = static_cast<__fp16*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { p[i] = (__fp16)(df(rng) * 0.5f); }
+    };
+    fill_h(sb, (std::size_t)N * groups);
+    fill_h(bb, (std::size_t)N * groups);
+    fill_h(xb, (std::size_t)m * K);
+    auto run = [&](metal_compute::ComputeFunction& fn,
+                   metal_compute::SharedBuffer& y, unsigned maxm) {
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder e = st.begin_compute();
+        e.set_function(fn);
+        e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+        e.set_buffer(3, xb); e.set_buffer(4, y);
+        e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+        e.dispatch({32u, (unsigned)(N / 4), (unsigned)((m + maxm - 1) / maxm)},
+                   {32u, 2u, 1u});
+      }
+      st.commit().wait();
+    };
+    run(ref_fn, y0, 2);
+    run(h_fn, y1, 8);
+    const auto* a = static_cast<const __fp16*>(y0.contents());
+    const auto* b2 = static_cast<const __fp16*>(y1.contents());
+    double num = 0, den = 0;
+    for (int i = 0; i < m * N; ++i) {
+      const double d = (double)a[i] - (double)b2[i];
+      num += d * d; den += (double)a[i] * (double)a[i];
+    }
+    const double rel = den > 0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[qmv-batch-tg] affine_qmv_batch8_xh16_w4g64 rel-L2 %.3e\n",
+                rel);
+    EXPECT_TRUE(rel < 2e-3);
+  }
+}
+
+// Isolated batched-GEMV bandwidth sweep -- the MAXM audit. For each real
+// Qwen3.5-4B decode weight shape and m = 2..8, times: the serial qmv (m
+// weight re-reads), the MAXM=2 / MAXM=4 register kernels (grid.z tiles),
+// the new MAXM=8 tgmem-staged kernels, and the steel GEMM. COLD rows
+// cycle through enough weight copies (>=160 MB) that every dispatch
+// starts SLC-cold, isolating per-dispatch cache reuse (the grid.z
+// re-read question) from cross-rep cache warmth; WARM rows reuse one
+// copy (the SLC-artifact regime). GB/s = one-read weight bytes / time,
+// so >100% of peak means intra-dispatch cache service; the one-read
+// DRAM floor is ~peak. Gated on VPIPE_QMV_AB (M5 16GB peak ~153 GB/s).
+TEST(metal_lm_smoke, qmv_batch_bandwidth_sweep) {
+  if (std::getenv("VPIPE_QMV_AB") == nullptr) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  auto lib = mc->load_library("affine_qmv");
+  auto steel_lib = mc->load_library("affine_qmm_steel");
+  auto fn_qmv    = lib.function("affine_qmv_w4g64");
+  auto fn_b2     = lib.function("affine_qmv_batch_w4g64");
+  auto fn_b4     = lib.function("affine_qmv_batch4_w4g64");
+  auto fn_tg8    = lib.function("affine_qmv_batch8_tg_w4g64");
+  auto fn_tg8x4  = lib.function("affine_qmv_batch8_tg4_w4g64");
+  auto fn_xd8    = lib.function("affine_qmv_batch8_xd_w4g64");
+  auto fn_xp1    = lib.function("affine_qmv_batch8_xp1_w4g64");
+  auto fn_xp2    = lib.function("affine_qmv_batch8_xp2_w4g64");
+  auto fn_steel  = steel_lib.function("affine_qmm_steel_w4g64");
+  // Matrix-core fused dequant->matmul2d (M5/metal4 only; row skipped when
+  // the library/function is absent). BM=64 tile -> m=8 pads 8x on the M
+  // axis, but the MACs run on the matrix units, not the scalar ALUs.
+  auto mma_lib = mc->load_library("affine_qmm_mma");
+  auto fn_mma = mma_lib.function("affine_qmm_mma_w4g64");
+  auto fn_xh   = lib.function("affine_qmv_batch8_xh_w4g64");
+  auto fn_xh16 = lib.function("affine_qmv_batch8_xh16_w4g64");
+  auto fn_xp4  = lib.function("affine_qmv_batch4_xp_w4g64");
+  ASSERT_TRUE(fn_xh.valid() && fn_xh16.valid() && fn_xp4.valid());
+  ASSERT_TRUE(fn_qmv.valid() && fn_b2.valid() && fn_b4.valid());
+  ASSERT_TRUE(fn_tg8.valid() && fn_tg8x4.valid() && fn_steel.valid());
+  ASSERT_TRUE(fn_xd8.valid() && fn_xp1.valid() && fn_xp2.valid());
+  using Clock = std::chrono::steady_clock;
+  const double kPeak = 153.0;
+  struct Shape { const char* name; int n; int k; };
+  const Shape shapes[] = {
+      {"o-proj  2560x2560", 2560, 2560},
+      {"down    2560x9728", 2560, 9728},
+      {"gate|up 19456x2560", 19456, 2560},
+      {"lm_head 151936x2560", 151936, 2560},
+  };
+  std::mt19937 rng(7);
+  std::uniform_int_distribution<std::uint32_t> du(0, 0xffffffffu);
+  const int kMs[] = {2, 3, 4, 5, 6, 8};
+  for (const Shape& sh : shapes) {
+    const int groups = sh.k / 64;
+    const std::size_t wwords = (std::size_t)sh.n * sh.k / 8;   // w4
+    const std::size_t sbcnt = (std::size_t)sh.n * groups;
+    const double wbytes = (double)(wwords * 4 + 2 * sbcnt * 2);
+    // Enough copies that a full rep cycle exceeds the SLC by a wide
+    // margin -> each dispatch reads DRAM-cold weights.
+    const int C = std::max(1, (int)(160e6 / wbytes) + 1);
+    std::vector<metal_compute::SharedBuffer> wv, sv, bv;
+    for (int c = 0; c < C; ++c) {
+      wv.push_back(mc->make_shared_buffer(wwords * 4));
+      sv.push_back(mc->make_shared_buffer(sbcnt * 2));
+      bv.push_back(mc->make_shared_buffer(sbcnt * 2));
+      auto* wp = static_cast<std::uint32_t*>(wv.back().contents());
+      // Fill a stride; full random fill of 160MB x reps is slow and
+      // bandwidth is value-independent.
+      for (std::size_t i = 0; i < wwords; i += 97) { wp[i] = du(rng); }
+    }
+    auto xb = mc->make_shared_buffer((std::size_t)8 * sh.k * 2);
+    auto yb = mc->make_shared_buffer((std::size_t)8 * sh.n * 2);
+    const int R = wbytes > 100e6 ? 10 : 40;
+    std::printf("[qmv-sweep] %s  %5.1f MB  1-read floor %.2f ms  (C=%d,R=%d)\n",
+                sh.name, wbytes / 1e6, wbytes / kPeak / 1e6, C, R);
+    struct KV { const char* name; int kind; };  // kind: 0=serial,1=b2,2=b4,
+                                                //       3=tg8,4=tg8x4,5=steel
+    const KV kernels[] = {{"serial qmv x m", 0}, {"batch MAXM=2", 1},
+                          {"batch MAXM=4", 2},   {"tg8 (NSG=2)", 3},
+                          {"tg8 (NSG=4)", 4},    {"steel 32x32", 5},
+                          {"xd8 (no tgm)", 6},   {"xp1 (w-regs)", 7},
+                          {"xp2 (w-regs)", 8},   {"mma2 BM=64", 9},
+                          {"xh8 (hoist)", 10},   {"xh16 (half)", 11},
+                          {"xp4 (w-regs)", 12},  {"mix xp4+b2", 13}};
+    for (int m : kMs) {
+      for (const KV& kv : kernels) {
+        if (kv.kind == 9 && !fn_mma.valid()) { continue; }
+        auto dispatch_R = [&](int reps, bool cold) {
+          metal_compute::CommandStream st = mc->make_command_stream();
+          {
+            metal_compute::ComputeEncoder e = st.begin_compute();
+            for (int r = 0; r < reps; ++r) {
+              const int c = cold ? (r % C) : 0;
+              auto& w = wv[(std::size_t)c];
+              auto& s = sv[(std::size_t)c];
+              auto& b = bv[(std::size_t)c];
+              auto bind = [&](metal_compute::ComputeFunction& fn) {
+                e.set_function(fn);
+                e.set_buffer(0, w); e.set_buffer(1, s); e.set_buffer(2, b);
+                e.set_buffer(3, xb); e.set_buffer(4, yb);
+                e.set_constant(5, sh.k); e.set_constant(6, sh.n);
+              };
+              switch (kv.kind) {
+                case 0:
+                  for (int i = 0; i < m; ++i) {
+                    e.set_function(fn_qmv);
+                    e.set_buffer(0, w); e.set_buffer(1, s); e.set_buffer(2, b);
+                    e.set_buffer(3, xb, (std::size_t)i * sh.k * 2);
+                    e.set_buffer(4, yb, (std::size_t)i * sh.n * 2);
+                    e.set_constant(5, sh.k); e.set_constant(6, sh.n);
+                    e.dispatch({32u, (unsigned)(sh.n / 4), 1u}, {32u, 2u, 1u});
+                  }
+                  break;
+                case 1:
+                  bind(fn_b2); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 1) / 2)}, {32u, 2u, 1u});
+                  break;
+                case 2:
+                  bind(fn_b4); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 3) / 4)}, {32u, 2u, 1u});
+                  break;
+                case 3:
+                  bind(fn_tg8); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 7) / 8)}, {32u, 2u, 1u});
+                  break;
+                case 4:
+                  bind(fn_tg8x4); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 7) / 8)}, {32u, 4u, 1u});
+                  break;
+                case 5:
+                  bind(fn_steel); e.set_constant(7, m);
+                  e.dispatch({(unsigned)(((sh.n + 31) / 32) * 32),
+                              (unsigned)(((m + 31) / 32) * 2), 2u},
+                             {32u, 2u, 2u});
+                  break;
+                case 6:
+                  bind(fn_xd8); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 7) / 8)}, {32u, 2u, 1u});
+                  break;
+                case 7:
+                case 8:
+                  bind(kv.kind == 7 ? fn_xp1 : fn_xp2); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 7) / 8)}, {32u, 2u, 1u});
+                  break;
+                case 9:
+                  bind(fn_mma); e.set_constant(7, m);
+                  e.dispatch({(unsigned)(((sh.n + 63) / 64) * 128),
+                              (unsigned)((m + 63) / 64), 1u},
+                             {128u, 1u, 1u});
+                  break;
+                case 10:
+                case 11:
+                  bind(kv.kind == 10 ? fn_xh : fn_xh16); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 7) / 8)}, {32u, 2u, 1u});
+                  break;
+                case 12:
+                  bind(fn_xp4); e.set_constant(7, m);
+                  e.dispatch({32u, (unsigned)(sh.n / 4),
+                              (unsigned)((m + 3) / 4)}, {32u, 2u, 1u});
+                  break;
+                case 13: {
+                  // Heterogeneous 2-read plan for m=5..6: xp4 on rows 0..3
+                  // (one weight read @ ~84 GB/s) + batch MAXM=2 on the
+                  // remaining 1-2 rows (one read @ ~129), via x/y byte
+                  // offsets. vs the homogeneous 3-read MAXM=2 tiling.
+                  const int head = m < 4 ? m : 4;
+                  bind(fn_xp4); e.set_constant(7, head);
+                  e.dispatch({32u, (unsigned)(sh.n / 4), 1u}, {32u, 2u, 1u});
+                  if (m > head) {
+                    const int rest = m - head;
+                    e.set_function(fn_b2);
+                    e.set_buffer(0, w); e.set_buffer(1, s); e.set_buffer(2, b);
+                    e.set_buffer(3, xb, (std::size_t)head * sh.k * 2);
+                    e.set_buffer(4, yb, (std::size_t)head * sh.n * 2);
+                    e.set_constant(5, sh.k); e.set_constant(6, sh.n);
+                    e.set_constant(7, rest);
+                    e.dispatch({32u, (unsigned)(sh.n / 4),
+                                (unsigned)((rest + 1) / 2)}, {32u, 2u, 1u});
+                  }
+                  break;
+                }
+              }
+            }
+          }
+          st.commit().wait();
+        };
+        dispatch_R(4, true);   // warm the pipeline state (not the SLC)
+        double cold_ms = 1e18, warm_ms = 1e18;
+        for (int rep = 0; rep < 3; ++rep) {
+          auto t0 = Clock::now();
+          dispatch_R(R, true);
+          cold_ms = std::min(cold_ms,
+              std::chrono::duration<double, std::milli>(Clock::now() - t0)
+                  .count() / R);
+          t0 = Clock::now();
+          dispatch_R(R, false);
+          warm_ms = std::min(warm_ms,
+              std::chrono::duration<double, std::milli>(Clock::now() - t0)
+                  .count() / R);
+        }
+        std::printf("[qmv-sweep]   m=%d %-14s cold %7.3f ms (%5.1f GB/s eff) "
+                    "| warm %7.3f ms\n",
+                    m, kv.name, cold_ms, wbytes / (cold_ms / 1e3) / 1e9,
+                    warm_ms);
+      }
     }
   }
 }
@@ -707,6 +1118,14 @@ TEST(metal_lm_smoke, gemma_thinking_stripped) {
       == "Two boats on a calm lake.");
   EXPECT_TRUE(tpl->sanitize_output("Answer: 9.<|channel>thought\ncut off")
       == "Answer: 9.");
+  // The detokenizer rewrites the channel tokens to the UNIFIED vpipe
+  // thinking markers, so streamed text carries the marker form; the
+  // sanitizer must strip that form too.
+  EXPECT_TRUE(tpl->sanitize_output(
+      std::string(vpipe::media_line::kThinkStart)
+      + "thought\nlet me reason"
+      + std::string(vpipe::media_line::kThinkEnd) + "The answer is 9.")
+      == "The answer is 9.");
 
   // (2) End-to-end: ARM the reasoning channel directly (a `<|think|>` system
   // turn) so the real e4b checkpoint deterministically emits a
@@ -745,15 +1164,78 @@ TEST(metal_lm_smoke, gemma_thinking_stripped) {
   const std::string raw =
       tok.decode(std::span<const std::int32_t>(gen.data(), gen.size()));
   const std::string clean = tpl->sanitize_output(raw);
-  const bool raw_had_channel = raw.find("<|channel>") != std::string::npos;
-  std::printf("[gemma_thinking] raw_had_channel=%d\n", raw_had_channel ? 1 : 0);
+  // The channel token ids now DECODE as the unified vpipe thinking
+  // markers (the detokenizer rewrite), so the armed thought block shows
+  // up in raw as the marker form, never the literal channel strings.
+  const bool raw_had_think =
+      raw.find(vpipe::media_line::kThinkStart) != std::string::npos;
+  std::printf("[gemma_thinking] raw_had_think=%d\n", raw_had_think ? 1 : 0);
   std::printf("[gemma_thinking] RAW  : %s\n", raw.c_str());
   std::printf("[gemma_thinking] CLEAN: %s\n", clean.c_str());
+  EXPECT_TRUE(raw.find("<|channel>") == std::string::npos);
 
-  // The user-facing string must never carry a thought channel.
+  // The user-facing string must never carry a thought channel, in
+  // either the raw or the unified-marker form.
   EXPECT_TRUE(clean.find("<|channel>")  == std::string::npos);
   EXPECT_TRUE(clean.find("<channel|>") == std::string::npos);
+  EXPECT_TRUE(clean.find(vpipe::media_line::kThinkStart)
+              == std::string::npos);
+  EXPECT_TRUE(clean.find(vpipe::media_line::kThinkEnd)
+              == std::string::npos);
   EXPECT_TRUE(!clean.empty());
+}
+
+// Dense (raw-HF bf16/f16) Gemma-4 coherent-generation smoke. The raw google
+// gemma-4 releases (E2B/E4B/12B ...) ship UNQUANTIZED .weight tensors; the
+// metal gemma exec detects that and runs the dense GEMM/GEMV path (no affine
+// dequant, no scales/biases) instead of the quantized qmv/qmm kernels. A
+// deterministic factual prompt under greedy decode must produce the known
+// answer -- a broken dense forward (wrong transpose/norm/geglu/double-wide
+// ffn) yields word-salad or the wrong token. This is the bf16 bring-up gate
+// (token-exact-vs-omlx is a separate, reference-tooling-gated check). Env:
+// VPIPE_GEMMA4_DENSE_TEST_MODEL_PATH = a raw bf16 gemma-4 dir (e.g.
+// google/gemma-4-E2B-it).
+TEST(metal_lm_smoke, gemma_dense_bf16_generates) {
+  const char* path = std::getenv("VPIPE_GEMMA4_DENSE_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc  = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND"); return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 512; spec.max_pages = 16;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm && lm->valid());
+  auto& tok = lm->tokenizer();
+  auto tpl = genai::make_chat_template(lm->config().architecture, tok);
+  ASSERT_TRUE((bool)tpl);
+
+  // Deterministic factual prompt -> greedy -> a competent gemma-4 instruct
+  // answers "Paris" (leading token(s) may be whitespace/markdown; substring).
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(
+      "What is the capital of France? Reply with only the city name.",
+      /*is_first_turn=*/true, &ids);
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  std::int32_t t = lm->prefill(ctx, ids);
+  std::vector<std::int32_t> gen;
+  for (int i = 0; i < 24 && t >= 0; ++i) {
+    if (tpl->is_stop_token(t)) { break; }
+    gen.push_back(t);
+    t = lm->next_token(ctx);
+  }
+  const std::string out =
+      tok.decode(std::span<const std::int32_t>(gen.data(), gen.size()));
+  std::printf("[gemma_dense] OUT: %s\n", out.c_str());
+  EXPECT_TRUE(!gen.empty());
+  EXPECT_TRUE(out.find("Paris") != std::string::npos);
 }
 
 // The REALTIME fix: don't just strip the thought block after the fact (that
@@ -2721,6 +3203,93 @@ TEST(metal_lm_smoke, qwen_optiq_mtp_speculative_token_exact) {
     EXPECT_TRUE(got.size() + 1 >= ref.size());
   };
   std::printf("[qwen_optiq_mtp] serial baseline %.1f tok/s\n", serial_tps);
+  run_mtp(child1, /*draft_len=*/1, "depth-1");
+  run_mtp(child2, /*draft_len=*/2, "depth-2");
+}
+
+// Dense (raw-HF bf16/f16) MTP token-exact verification, SINGLE model load.
+// The optiq MTP test above double-loads (direct + via the model manager for a
+// chat template), which on a 64 GB box exceeds RAM for the 54 GB bf16 27B. This
+// loads the dense model ONCE, tokenizes the prompt from tokenizer.json, and
+// checks mtp_decode (depth-1 + depth-2) is token-exact vs plain serial decode.
+// Env: VPIPE_DENSE_MTP_MODEL = the raw-HF dense model dir.
+TEST(metal_lm_smoke, dense_mtp_speculative_token_exact) {
+  const char* path = std::getenv("VPIPE_DENSE_MTP_MODEL");
+  if (!path || !*path) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 512;
+  int kGen = 32;
+  if (const char* e = std::getenv("VPIPE_MTP_GEN_TOKENS")) {
+    const int v = std::atoi(e);
+    if (v > 0) { kGen = v; }
+  }
+  mcfg.max_pages = std::max(8, (3 * kGen) / 512 + 8);
+  auto model = genai::MetalQwenModel::load(path, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  ASSERT_TRUE(model->has_mtp());   // the raw-HF dense MTP head loaded
+
+  // Tokenize the prompt directly from tokenizer.json (no second model load).
+  const std::string tk = std::string(path) + "/tokenizer.json";
+  auto tok = genai::Tokenizer::from_huggingface_json(tk, &sess);
+  ASSERT_TRUE(tok != nullptr);
+  std::vector<std::int32_t> ids =
+      tok->encode("The capital of France is");
+  ASSERT_TRUE(!ids.empty());
+
+  auto argmax = [](const std::vector<float>& v) -> std::int32_t {
+    std::int32_t best = 0;
+    float bv = v.empty() ? 0.0f : v[0];
+    for (std::size_t i = 1; i < v.size(); ++i) {
+      if (v[i] > bv) { bv = v[i]; best = (std::int32_t)i; }
+    }
+    return best;
+  };
+
+  std::vector<float> lg = model->prefill(ids);
+  ASSERT_TRUE(!lg.empty());
+  const std::int32_t first = argmax(lg);
+  const genai::ContextId child1 =
+      model->context_manager()->branch(model->root_context());
+  const genai::ContextId child2 =
+      model->context_manager()->branch(model->root_context());
+  ASSERT_TRUE(child1.valid() && child2.valid());
+
+  // Serial greedy reference on the root context.
+  std::vector<std::int32_t> ref;
+  ref.push_back(first);
+  for (int i = 0; i < kGen; ++i) {
+    const std::int32_t t = model->forward_argmax(ref.back());
+    if (t < 0) { break; }
+    ref.push_back(t);
+  }
+  std::printf("[dense_mtp] serial ref %zu tok, first=%d\n", ref.size(), first);
+
+  auto run_mtp = [&](genai::ContextId cid, int draft_len, const char* tag) {
+    std::vector<std::int32_t> got;
+    long accepted = 0, rounds = 0;
+    const bool ok = model->mtp_decode(cid, first, (int)ref.size(), got,
+                                      draft_len, &accepted, &rounds);
+    EXPECT_TRUE(ok);
+    int mism = 0;
+    const std::size_t nn = std::min(ref.size(), got.size());
+    for (std::size_t i = 0; i < nn; ++i) {
+      if (ref[i] != got[i]) { ++mism; }
+    }
+    std::printf("[dense_mtp] %s: %zu tok rounds=%ld tok/round=%.2f mism=%d\n",
+                tag, got.size(), rounds,
+                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism);
+    EXPECT_TRUE(mism == 0);
+    EXPECT_TRUE(got.size() + 1 >= ref.size());
+  };
   run_mtp(child1, /*draft_len=*/1, "depth-1");
   run_mtp(child2, /*draft_len=*/2, "depth-2");
 }
@@ -6572,12 +7141,35 @@ TEST(metal_lm_bench, qwen_gguf_ctx_sweep) {
       const genai::ContextId cd = cm->branch(model->root_context());
       ASSERT_TRUE(cd.valid());
       const std::int32_t f = argmax(model->prefill(cd, ids));
-      std::vector<std::int32_t> out;
-      const auto d0 = clk::now();
-      const bool ok = model->decode_pipelined(cd, f, G, out);
-      const double ds = secs(clk::now() - d0);
-      tg_pipe = (ok && ds > 0.0 && !out.empty())
-                    ? (double)out.size() / ds : 0.0;
+      std::vector<std::int32_t> out;             // tok1.. (== decode_pipelined)
+      // Prime the pdecode ring + warm 4 steps, THEN time G steady-state steps.
+      // Excludes the single-call decode_pipelined path's ~1-tok in-call pipeline
+      // fill/drain, so tg_pipe matches qwen_ctx_sweep / gguf_gemma_pp_tg's warmed
+      // steady-state accounting (was ~1-1.5% conservative at G=64). Collecting
+      // every pdecode_next keeps `out` == decode_pipelined's [tok1..] fingerprint.
+      const std::span<const std::int32_t> prompt(ids.data(), ids.size());
+      genai::GpuSamplerParams gsp{};             // greedy default -> token-exact
+      if (f >= 0 && model->pdecode_begin(cd, f, prompt, gsp, G + 8)) {
+        while (model->pdecode_commit(cd)) {}     // prime ring to depth
+        for (int k = 0; k < 4; ++k) {            // warm steady-state
+          const std::int32_t t = model->pdecode_next(cd);
+          if (t < 0) { break; }
+          out.push_back(t);
+          model->pdecode_commit(cd);
+        }
+        int produced = 0;
+        const auto d0 = clk::now();
+        for (int k = 0; k < G; ++k) {
+          const std::int32_t t = model->pdecode_next(cd);
+          if (t < 0) { break; }
+          out.push_back(t);
+          ++produced;
+          model->pdecode_commit(cd);
+        }
+        const double ds = secs(clk::now() - d0);
+        tg_pipe = (ds > 0.0) ? (double)produced / ds : 0.0;
+        model->pdecode_end(cd);
+      }
       // Greedy id fingerprint: first 12 decoded ids. Deterministic across
       // attention-kernel variants -> diff new all-G path vs VPIPE_GQA_ATTN=0
       // (old mb256) to confirm token-exactness for G=6.
@@ -6685,12 +7277,35 @@ TEST(metal_lm_bench, qwen35_moe_ctx_sweep) {
       const genai::ContextId cd = cm->branch(model->root_context());
       ASSERT_TRUE(cd.valid());
       const std::int32_t f = argmax(model->prefill(cd, ids));
-      std::vector<std::int32_t> out;
-      const auto d0 = clk::now();
-      const bool ok = model->decode_pipelined(cd, f, G, out);
-      const double ds = secs(clk::now() - d0);
-      tg_pipe = (ok && ds > 0.0 && !out.empty())
-                    ? (double)out.size() / ds : 0.0;
+      std::vector<std::int32_t> out;             // tok1.. (== decode_pipelined)
+      // Prime the pdecode ring + warm 4 steps, THEN time G steady-state steps.
+      // Excludes the single-call decode_pipelined path's ~1-tok in-call pipeline
+      // fill/drain, so tg_pipe matches qwen_ctx_sweep / gguf_gemma_pp_tg's warmed
+      // steady-state accounting (was ~1-1.5% conservative at G=64). Collecting
+      // every pdecode_next keeps `out` == decode_pipelined's [tok1..] fingerprint.
+      const std::span<const std::int32_t> prompt(ids.data(), ids.size());
+      genai::GpuSamplerParams gsp{};             // greedy default -> token-exact
+      if (f >= 0 && model->pdecode_begin(cd, f, prompt, gsp, G + 8)) {
+        while (model->pdecode_commit(cd)) {}     // prime ring to depth
+        for (int k = 0; k < 4; ++k) {            // warm steady-state
+          const std::int32_t t = model->pdecode_next(cd);
+          if (t < 0) { break; }
+          out.push_back(t);
+          model->pdecode_commit(cd);
+        }
+        int produced = 0;
+        const auto d0 = clk::now();
+        for (int k = 0; k < G; ++k) {
+          const std::int32_t t = model->pdecode_next(cd);
+          if (t < 0) { break; }
+          out.push_back(t);
+          ++produced;
+          model->pdecode_commit(cd);
+        }
+        const double ds = secs(clk::now() - d0);
+        tg_pipe = (ds > 0.0) ? (double)produced / ds : 0.0;
+        model->pdecode_end(cd);
+      }
       // Greedy id fingerprint (first 12): deterministic across attention-kernel
       // variants -> cross-check the new MMA flash (VPIPE_QWEN_SDPA_PMMA=1) vs
       // the key-split flash (=0) produce identical tokens.
@@ -7516,7 +8131,7 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   auto mcfg = genai::MetalQwenModel::config_from(*cfg);
   mcfg.use_bf16 = false;
   mcfg.page_tokens = 512;
-  mcfg.max_pages = 16;
+  mcfg.max_pages = 40;   // fits 2*8 branches + shared prefix at N=8
   auto model = genai::MetalQwenModel::load(path, mc, mcfg);
   if (!model) { return; }
   auto tok = genai::Tokenizer::from_huggingface_json(
@@ -7532,8 +8147,12 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   if (!root.valid()) { return; }
   if (model->prefill(root, prompt).empty()) { return; }
 
-  const int N = 3;
   const int n_steps = 12;
+  // Sweep the adaptive MAXM tiers: N=3 -> MAXM=4 (1 grid.z tile); N=6 ->
+  // MAXM=2 (ceil(m/2) tiles); N=8 -> the grouped-x xp2 tall tile (one
+  // weight read for all 8 rows). All must stay token-exact with serial
+  // decode.
+  for (int N : {3, 6, 8}) {
 
   // Two independent branch sets sharing the same prefix: one batched, one
   // serial reference. Give each branch a DIFFERENT-LENGTH distinct suffix so
@@ -7542,7 +8161,7 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   // while RoPE + attention run per branch at each branch's own position.
   auto batched = ctxm->branch(root, N);
   auto serial  = ctxm->branch(root, N);
-  if ((int)batched.size() != N || (int)serial.size() != N) { return; }
+  if ((int)batched.size() != N || (int)serial.size() != N) { continue; }
 
   std::vector<std::int32_t> first_tokens((std::size_t)N);
   auto argmax_of = [&](const std::vector<float>& lg) {
@@ -7596,6 +8215,9 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   }
   std::printf("[metal_lm_smoke.qwen_batched_decode] N=%d steps=%d matched "
               "%d/%d\n", N, n_steps, matched, total);
+  for (auto id : batched) { ctxm->release(id); }
+  for (auto id : serial) { ctxm->release(id); }
+  }
 }
 
 // Shared-prefix batched decode attention (phase A reads the N branches' shared
@@ -7705,7 +8327,7 @@ TEST(metal_lm_smoke, qwen_bdecode_matches_batched_argmax) {
   auto mcfg = genai::MetalQwenModel::config_from(*cfg);
   mcfg.use_bf16 = false;
   mcfg.page_tokens = 512;
-  mcfg.max_pages = 16;
+  mcfg.max_pages = 40;   // fits 2*8 branches + shared prefix at N=8
   auto model = genai::MetalQwenModel::load(path, mc, mcfg);
   if (!model) { return; }
   auto tok = genai::Tokenizer::from_huggingface_json(
@@ -7746,19 +8368,27 @@ TEST(metal_lm_smoke, qwen_bdecode_matches_batched_argmax) {
       std::span<const genai::ContextId>(ref_set.data(), ref_set.size()),
       std::span<const std::int32_t>(first.data(), first.size()), n_steps);
 
-  // Pipelined: greedy bdecode over the second branch set.
+  // Pipelined: greedy bdecode over the second branch set, driven in the
+  // RUN-AHEAD shape (prime an extra commit, refill after each next) so the
+  // depth>=2 default keeps a speculative step in flight the whole session --
+  // the collected rows must still match the synchronous reference exactly.
+  // (At VPIPE_QWEN_BDECODE_DEPTH=1 the prime is refused and this degrades
+  // to the old commit/next lockstep.)
   genai::GpuSamplerParams sp;   // greedy=true by default
   std::vector<std::vector<std::int32_t>> got((std::size_t)N);
   ASSERT_TRUE(model->bdecode_begin(
       std::span<const genai::ContextId>(pipe_set.data(), pipe_set.size()),
       std::span<const std::int32_t>(first.data(), first.size()), sp, n_steps));
   std::vector<std::int32_t> step_tok;
+  bool committed = model->bdecode_commit();
+  model->bdecode_commit();   // run-ahead prime (refused at depth-1)
   for (int s = 0; s < n_steps; ++s) {
-    if (!model->bdecode_commit()) { break; }
+    if (!committed) { break; }
     if (!model->bdecode_next(step_tok)) { break; }
     for (int i = 0; i < N; ++i) {
       got[(std::size_t)i].push_back(step_tok[(std::size_t)i]);
     }
+    committed = model->bdecode_commit();
   }
   model->bdecode_end();
 
@@ -7834,16 +8464,25 @@ TEST(metal_lm_smoke, qwen_batched_decode_bench) {
   }
 
   // --- batched (qmm M=N) at several N ---
-  for (int N : {1, 2, 4, 8}) {
+  // Releases the branch set per iteration (the sweep would otherwise exhaust
+  // max_pages by N=24 and decode_batched_step would fail instantly -> a bogus
+  // 0.00 ms row). A step failure is reported, not timed.
+  for (int N : {2, 3, 4, 5, 6, 8, 12, 16, 24, 32}) {
     auto br = ctxm->branch(root, N);
-    if ((int)br.size() != N) { continue; }
+    if ((int)br.size() != N) {
+      std::printf("[bench] batched N=%d    SKIPPED (branch alloc failed)\n", N);
+      for (auto id : br) { ctxm->release(id); }
+      continue;
+    }
     std::vector<genai::ContextId> cids(br.begin(), br.end());
     std::vector<std::int32_t> cur((std::size_t)N, 100);
+    bool failed = false;
     auto step = [&]() {
       if (!model->decode_batched_step(
               std::span<const genai::ContextId>(cids.data(), cids.size()),
               std::span<const std::int32_t>(cur.data(), cur.size()),
               std::span<const std::int32_t>(), logits)) {
+        failed = true;
         return false;
       }
       for (int i = 0; i < N; ++i) {
@@ -7856,13 +8495,18 @@ TEST(metal_lm_smoke, qwen_batched_decode_bench) {
       }
       return true;
     };
-    for (int s = 0; s < 4; ++s) { step(); }   // warm
+    for (int s = 0; s < 4 && !failed; ++s) { step(); }   // warm
     const auto t0 = clock::now();
-    for (int s = 0; s < K; ++s) { step(); }
+    for (int s = 0; s < K && !failed; ++s) { step(); }
     const double dt = std::chrono::duration<double>(clock::now() - t0).count();
-    std::printf("[bench] batched N=%d    per-step %.2f ms  -> %.1f tok/s "
-                "(aggregate, %d branches)\n",
-                N, 1e3 * dt / K, (double)N * K / dt, N);
+    if (failed) {
+      std::printf("[bench] batched N=%d    FAILED (decode_batched_step)\n", N);
+    } else {
+      std::printf("[bench] batched N=%d    per-step %.2f ms  -> %.1f tok/s "
+                  "(aggregate, %d branches)\n",
+                  N, 1e3 * dt / K, (double)N * K / dt, N);
+    }
+    for (auto id : br) { ctxm->release(id); }
   }
 
   // --- pipelined bdecode (GPU sampler + event-chain overlap), greedy ---
@@ -7879,12 +8523,17 @@ TEST(metal_lm_smoke, qwen_batched_decode_bench) {
       continue;
     }
     std::vector<std::int32_t> toks;
+    // Run-ahead driver shape (the stage's): prime, then next+refill. At
+    // VPIPE_QWEN_BDECODE_DEPTH=1 the prime is refused -> old lockstep.
+    model->bdecode_commit();
+    model->bdecode_commit();   // run-ahead prime
     for (int s = 0; s < 4; ++s) {           // warm
-      model->bdecode_commit(); model->bdecode_next(toks);
+      model->bdecode_next(toks); model->bdecode_commit();
     }
     const auto t0 = clock::now();
     for (int s = 0; s < K; ++s) {
-      if (!model->bdecode_commit() || !model->bdecode_next(toks)) { break; }
+      if (!model->bdecode_next(toks)) { break; }
+      model->bdecode_commit();
     }
     const double dt = std::chrono::duration<double>(clock::now() - t0).count();
     model->bdecode_end();
@@ -7959,10 +8608,11 @@ TEST(metal_lm_smoke, qwen_batched_decode_bench) {
                 sp, maxL + 8)) {
           std::vector<std::int32_t> toks;
           const auto t0 = clock::now();
+          model->bdecode_commit();
+          model->bdecode_commit();   // run-ahead prime
           for (int s = 0; s < maxL; ++s) {
-            if (!model->bdecode_commit() || !model->bdecode_next(toks)) {
-              break;
-            }
+            if (!model->bdecode_next(toks)) { break; }
+            model->bdecode_commit();
           }
           const double dt =
               std::chrono::duration<double>(clock::now() - t0).count();
@@ -9281,6 +9931,279 @@ TEST(metal_lm_smoke, moss_codec_bench) {
               "(int8/f16=%.2fx, +%.1f ms)\n",
               T, f16, i8, (f16 > 0 ? i8 / f16 : 0.0), i8 - f16);
   EXPECT_TRUE(f16 > 0 && i8 > 0);
+}
+
+// M5 matrix-core decode paths (matmul2d f16 GEMM + windowed-causal flash
+// attention) must be numerically equivalent to the steel/scalar path: decode
+// the same codes with each mma lever on vs off and compare the waveform
+// rel-L2. Skips if the model env is unset or the mma paths are not active.
+TEST(metal_lm_smoke, moss_codec_mma_matches_scalar) {
+  const char* path = std::getenv("VPIPE_MOSS_CODEC_MODEL");
+  if (path == nullptr || *path == '\0') { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto codec = genai::MetalMossCodec::load(path, mc, /*int8=*/false);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+  if (!codec->use_attn_mma() && !codec->use_mma2()) {
+    std::fprintf(stderr, "[moss-codec] mma paths not active (pre-M5?), skip\n");
+    return;
+  }
+  const int T = 53, nvq = codec->n_quantizers();   // non-16-multiple: tail
+  std::vector<std::vector<std::int32_t>> codes(
+      (std::size_t)T, std::vector<std::int32_t>((std::size_t)nvq, 0));
+  for (int t = 0; t < T; ++t) {
+    for (int c = 0; c < nvq; ++c) {
+      codes[(std::size_t)t][(std::size_t)c] = (t * 37 + c * 101 + 7) % 1024;
+    }
+  }
+  auto rl2 = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d; den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  codec->set_use_mma2(true);  codec->set_use_attn_mma(true);
+  const std::vector<float> both = codec->decode(codes, nullptr);
+  ASSERT_TRUE(!both.empty());
+  codec->set_use_attn_mma(false);                 // scalar attn, mma gemm
+  const std::vector<float> no_attn = codec->decode(codes, nullptr);
+  codec->set_use_attn_mma(true); codec->set_use_mma2(false);  // steel gemm
+  const std::vector<float> no_gemm = codec->decode(codes, nullptr);
+  codec->set_use_mma2(true);
+  ASSERT_TRUE(no_attn.size() == both.size() && no_gemm.size() == both.size());
+  const double r_attn = rl2(both, no_attn);
+  const double r_gemm = rl2(both, no_gemm);
+  std::fprintf(stderr, "[moss-codec] attn mma-vs-scalar rel-L2=%.6f | "
+               "gemm mma-vs-steel rel-L2=%.6f\n", r_attn, r_gemm);
+  EXPECT_TRUE(r_attn < 1e-2);
+  EXPECT_TRUE(r_gemm < 1e-2);
+}
+
+// The int8 (w8 g32) matrix-core GEMM path (dequant-once via affine_dequant_
+// w8g32 -> the f16 dense_gemm_mma) must match the fused affine STEEL w8 GEMM:
+// decode the same codes with the int8 mma GEMM on vs off (attention held on
+// mma) and compare the waveform rel-L2. Skips if env unset or mma inactive.
+TEST(metal_lm_smoke, moss_codec_int8_mma_matches_steel) {
+  const char* path = std::getenv("VPIPE_MOSS_CODEC_MODEL");
+  if (path == nullptr || *path == '\0') { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto codec = genai::MetalMossCodec::load(path, mc, /*int8=*/true);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+  if (!codec->use_mma2()) {
+    std::fprintf(stderr, "[moss-codec] int8 mma not active (pre-M5?), skip\n");
+    return;
+  }
+  const int T = 53, nvq = codec->n_quantizers();
+  std::vector<std::vector<std::int32_t>> codes(
+      (std::size_t)T, std::vector<std::int32_t>((std::size_t)nvq, 0));
+  for (int t = 0; t < T; ++t) {
+    for (int c = 0; c < nvq; ++c) {
+      codes[(std::size_t)t][(std::size_t)c] = (t * 37 + c * 101 + 7) % 1024;
+    }
+  }
+  codec->set_use_mma2(true);
+  const std::vector<float> a = codec->decode(codes, nullptr);
+  codec->set_use_mma2(false);
+  const std::vector<float> b = codec->decode(codes, nullptr);
+  codec->set_use_mma2(true);
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    num += d * d; den += (double)b[i] * (double)b[i];
+  }
+  const double rl2 = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  std::fprintf(stderr, "[moss-codec] int8 GEMM mma-vs-steel rel-L2 = %.6f\n",
+               rl2);
+  EXPECT_TRUE(rl2 < 1e-2);
+}
+
+// Perf de-risk for "int8 faster than f16": at the codec's GEMM shapes, compare
+// (a) proto_gemm_mma_f16 (my 64x64x32 tiling, f16 weight), (b) proto_gemm_mma_i8
+// (same tiling, int8 weight + cheap symmetric dequant = MXINT8 proxy), and (c)
+// the production dense_gemm_mma_t_n128_f16. b-a = pure int8-read cost; c is the
+// real f16 number to beat. Gated on VPIPE_MXINT8_PROTO (no model needed).
+TEST(metal_lm_smoke, mxint8_matmul2d_proto) {
+  if (std::getenv("VPIPE_MXINT8_PROTO") == nullptr) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::fprintf(stderr, "[mxint8-proto] no matrix cores, skip\n");
+    return;
+  }
+  auto lib_p = mc->load_library("affine_qmm_mma");
+  auto lib_d = mc->load_library("dense_gemm_mma");
+  auto fn_f16 = lib_p.function("proto_gemm_mma_f16");
+  auto fn_i8  = lib_p.function("proto_gemm_mma_i8");
+  auto fn_prod = lib_d.function("dense_gemm_mma_t_n128_f16");
+  ASSERT_TRUE(fn_f16.valid() && fn_i8.valid() && fn_prod.valid());
+
+  struct Shape { int M, N, K; const char* tag; };
+  const Shape shapes[] = {
+      {200, 5120, 1280, "stage0 fc1  M=200"},
+      {200, 3840, 1280, "stage0 qkv  M=200"},
+      {800, 3072,  768, "mid    fc1  M=800"},
+      {1600, 3072, 768, "stage3 fc1  M=1600"},
+      {1600, 768,  768, "stage3 oproj M=1600"}};
+
+  for (const auto& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K;
+    auto wf16 = mc->make_shared_buffer((std::size_t)N * K * 2);
+    auto wi8  = mc->make_shared_buffer((std::size_t)N * K);        // 1 byte/wt
+    auto scl  = mc->make_shared_buffer((std::size_t)N * (K / 32) * 2);
+    auto xb   = mc->make_shared_buffer((std::size_t)M * K * 2);
+    auto yb   = mc->make_shared_buffer((std::size_t)M * N * 2);
+    {
+      auto* wf = static_cast<_Float16*>(wf16.contents());
+      for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+        wf[i] = (_Float16)(0.01f * (float)(i % 5));
+      }
+      auto* wi = static_cast<std::uint8_t*>(wi8.contents());
+      for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+        wi[i] = (std::uint8_t)(i % 13);
+      }
+      auto* sc = static_cast<_Float16*>(scl.contents());
+      for (std::size_t i = 0; i < (std::size_t)N * (K / 32); ++i) {
+        sc[i] = (_Float16)0.02f;
+      }
+      auto* xp = static_cast<_Float16*>(xb.contents());
+      for (std::size_t i = 0; i < (std::size_t)M * K; ++i) {
+        xp[i] = (_Float16)(0.01f * (float)(i % 7));
+      }
+    }
+    auto time_it = [&](const char* which) -> double {
+      auto run = [&]() {
+        metal_compute::CommandStream st = mc->make_command_stream();
+        { metal_compute::ComputeEncoder e = st.begin_compute();
+          if (which[0] == 'f') {                       // proto f16
+            e.set_function(fn_f16);
+            e.set_buffer(0, wf16); e.set_buffer(1, xb); e.set_buffer(2, yb);
+            e.set_constant(3, K); e.set_constant(4, N); e.set_constant(5, M);
+            e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                        (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+          } else if (which[0] == 'i') {                // proto int8
+            e.set_function(fn_i8);
+            e.set_buffer(0, wi8); e.set_buffer(1, scl); e.set_buffer(2, xb);
+            e.set_buffer(3, yb);
+            e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+            e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                        (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+          } else {                                     // production n128 f16
+            e.set_function(fn_prod);
+            e.set_buffer(0, xb); e.set_buffer(1, wf16); e.set_buffer(2, wf16);
+            e.set_buffer(3, yb);
+            e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+            e.set_constant(7, 0);
+            e.dispatch({(unsigned)(((N + 127) / 128) * 256),
+                        (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+          } }
+        st.commit().wait();
+      };
+      for (int i = 0; i < 3; ++i) { run(); }           // warm
+      const int IT = 30;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < IT; ++i) { run(); }
+      return std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count() / IT;
+    };
+    const double tf = time_it("f16");
+    const double ti = time_it("i8");
+    const double tp = time_it("prod");
+    std::fprintf(stderr,
+        "[mxint8-proto] %-20s  proto_f16=%.3f  proto_i8=%.3f  prod_f16=%.3f ms"
+        "  | i8/prod=%.2fx  i8-f16=%+.3f\n",
+        sh.tag, tf, ti, tp, tp > 0 ? ti / tp : 0.0, ti - tf);
+  }
+}
+
+// Does the dequant-once tax depend on bit width? Compare, at the codec's GEMM
+// shapes: f16 (dense_gemm_mma alone) vs 8-bit dequant-once (affine_dequant_w8g32
+// -> mma) vs 4-bit dequant-once (affine_dequant_w4g32 -> mma). Prediction: 4-bit
+// ~= 8-bit ~= a fixed ~15-20% over f16 -- the tax is the f16 WRITE + the matmul
+// f16 re-read (2 bytes either way), not the compressed read. Gated on
+// VPIPE_MXINT8_PROTO (no model needed).
+TEST(metal_lm_smoke, qmm_bitwidth_vs_f16) {
+  if (std::getenv("VPIPE_MXINT8_PROTO") == nullptr) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  auto lib_dq = mc->load_library("affine_dequant");
+  auto lib_mm = mc->load_library("dense_gemm_mma");
+  auto fn_dq8 = lib_dq.function("affine_dequant_w8g32");
+  auto fn_dq4 = lib_dq.function("affine_dequant_w4g32");
+  auto fn_mm  = lib_mm.function("dense_gemm_mma_t_n128_f16");
+  ASSERT_TRUE(fn_dq8.valid() && fn_dq4.valid() && fn_mm.valid());
+
+  struct Shape { int M, N, K; const char* tag; };
+  const Shape shapes[] = {
+      {200, 5120, 1280, "M=200 K=1280"},
+      {800, 3072,  768, "M=800 K=768 "},
+      {1600, 3072, 768, "M=1600 K=768"}};
+
+  for (const auto& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K, G = K / 32;
+    auto wf16 = mc->make_shared_buffer((std::size_t)N * K * 2);
+    auto wi8  = mc->make_shared_buffer((std::size_t)N * K);          // 1 B/wt
+    auto wi4  = mc->make_shared_buffer((std::size_t)N * (K / 2));    // 0.5 B/wt
+    auto scl  = mc->make_shared_buffer((std::size_t)N * G * 2);
+    auto bia  = mc->make_shared_buffer((std::size_t)N * G * 2);
+    auto deq  = mc->make_shared_buffer((std::size_t)N * K * 2);
+    auto xb   = mc->make_shared_buffer((std::size_t)M * K * 2);
+    auto yb   = mc->make_shared_buffer((std::size_t)M * N * 2);
+    { auto* s = static_cast<_Float16*>(scl.contents());
+      auto* b = static_cast<_Float16*>(bia.contents());
+      for (std::size_t i = 0; i < (std::size_t)N * G; ++i) {
+        s[i] = (_Float16)0.02f; b[i] = (_Float16)0.0f; } }
+
+    auto mm = [&](metal_compute::ComputeEncoder& e,
+                  const metal_compute::SharedBuffer& w) {
+      e.set_function(fn_mm);
+      e.set_buffer(0, xb); e.set_buffer(1, w); e.set_buffer(2, w);
+      e.set_buffer(3, yb);
+      e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+      e.set_constant(7, 0);
+      e.dispatch({(unsigned)(((N + 127) / 128) * 256),
+                  (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+    };
+    auto time_it = [&](int mode) -> double {          // 0=f16 1=w8 2=w4
+      auto run = [&]() {
+        metal_compute::CommandStream st = mc->make_command_stream();
+        { metal_compute::ComputeEncoder e = st.begin_compute();
+          if (mode == 1) {
+            e.set_function(fn_dq8);
+            e.set_buffer(0, wi8); e.set_buffer(1, scl); e.set_buffer(2, bia);
+            e.set_buffer(3, deq); e.set_constant(4, K); e.set_constant(5, N);
+            e.dispatch({(unsigned)(K / 4), (unsigned)N, 1}, {64, 1, 1});
+            mm(e, deq);
+          } else if (mode == 2) {
+            e.set_function(fn_dq4);
+            e.set_buffer(0, wi4); e.set_buffer(1, scl); e.set_buffer(2, bia);
+            e.set_buffer(3, deq); e.set_constant(4, K); e.set_constant(5, N);
+            e.dispatch({(unsigned)(K / 8), (unsigned)N, 1}, {64, 1, 1});
+            mm(e, deq);
+          } else {
+            mm(e, wf16);
+          } }
+        st.commit().wait();
+      };
+      for (int i = 0; i < 3; ++i) { run(); }
+      const int IT = 40;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < IT; ++i) { run(); }
+      return std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count() / IT;
+    };
+    const double f = time_it(0), w8 = time_it(1), w4 = time_it(2);
+    std::fprintf(stderr,
+        "[qmm-bits] %-14s  f16=%.3f  w8_deq1=%.3f (%.2fx)  w4_deq1=%.3f (%.2fx)"
+        " ms\n", sh.tag, f, w8, f > 0 ? w8 / f : 0.0, w4, f > 0 ? w4 / f : 0.0);
+  }
 }
 
 // End-to-end metal MOSS-TTS: LM (delay-pattern code generation) -> de-delay +

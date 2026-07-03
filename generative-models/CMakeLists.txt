@@ -37,6 +37,18 @@ set(LOCAL_SOURCES
   llama3/metal-llama-weights.cc
   moss/metal-moss-tts-model.cc
   moss/metal-moss-codec.cc
+  moss/metal-moss-codec-v2.cc
+  moss/moss-v15-processor.cc
+  moss/metal-moss-local-transformer.cc
+  moss/metal-moss-local-model.cc
+  moss/metal-moss-v15-model.cc
+  quantize/affine-quantizer.cc
+  quantize/arch-detect.cc
+  quantize/calibration.cc
+  quantize/calibration-corpus.cc
+  quantize/model-quantizer.cc
+  quantize/safetensors-writer.cc
+  eval/lm-eval.cc
 )
 set(LOCAL_HEADERS
   chat-template.h
@@ -67,6 +79,17 @@ set(LOCAL_HEADERS
   llama3/metal-llama-weights.h
   moss/metal-moss-tts-model.h
   moss/metal-moss-codec.h
+  moss/metal-moss-codec-v2.h
+  moss/moss-v15-processor.h
+  moss/metal-moss-local-transformer.h
+  moss/metal-moss-local-model.h
+  moss/metal-moss-v15-model.h
+  quantize/affine-quantizer.h
+  quantize/arch-detect.h
+  quantize/calibration.h
+  quantize/model-quantizer.h
+  quantize/safetensors-writer.h
+  eval/lm-eval.h
 )
 # The CoreML-backed vision tower builds on the apple-silicon axis: its
 # MLX-free host API (encode_host -> Result of host f32) + metal-compute

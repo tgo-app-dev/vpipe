@@ -127,7 +127,124 @@ kernel void affine_qmm_mma_w4g64(
   }
 }
 
+// ---------------------------------------------------------------------------
+// PROTOTYPE (perf de-risk only, not wired into production): isolate whether
+// reading the weight as int8 (half the bytes of f16) can beat f16 on the NAX
+// matmul2d path at the MOSS codec's M. Both kernels share IDENTICAL tiling +
+// matmul (only the weight staging differs), so proto_i8 - proto_f16 is the pure
+// int8-read+dequant cost. proto_i8 uses a symmetric per-group scale (no bias,
+// one multiply) -- the cheap MXINT8-style dequant. Not correctness-verified
+// (perf shape only). 0:w 1:x 2:y 3:K 4:N 5:M (f16); i8 inserts scales at 1.
+kernel void proto_gemm_mma_f16(
+    const device VPIPE_ELT* w [[buffer(0)]],   // f16 weight [N,K]
+    const device VPIPE_ELT* x [[buffer(1)]],
+    device VPIPE_ELT*       y [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    const constant int& N [[buffer(4)]],
+    const constant int& M [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  threadgroup VPIPE_ELT Xs[DG_BM * DG_BK];
+  threadgroup VPIPE_ELT Ws[DG_BN * DG_BK];
+  threadgroup float     Ysf[DG_BM * DG_BN];
+  const int m0 = (int)tgid.y * DG_BM, n0 = (int)tgid.x * DG_BN;
+  constexpr auto desc = matmul2d_descriptor(
+      DG_BM, DG_BN, DG_BK, false, true, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<DG_SG>> op;
+  using TT = tensor<threadgroup VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  auto cT = op.get_destination_cooperative_tensor<TT, TT, float>();
+  for (auto it = cT.begin(); it != cT.end(); ++it) { *it = 0.0f; }
+  for (int k0 = 0; k0 < K; k0 += DG_BK) {
+    for (int e = (int)lid; e < DG_BM * DG_BK; e += DG_THREADS) {
+      const int i = e / DG_BK, j = e % DG_BK, mm = m0 + i;
+      Xs[e] = (mm < M) ? x[(int64_t)mm * K + (k0 + j)] : (VPIPE_ELT)0;
+    }
+    for (int e = (int)lid; e < DG_BN * DG_BK; e += DG_THREADS) {
+      const int i = e / DG_BK, j = e % DG_BK, nn = n0 + i;
+      Ws[e] = (nn < N) ? w[(int64_t)nn * K + (k0 + j)] : (VPIPE_ELT)0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    TT tX(Xs, dextents<int32_t, 2>(DG_BK, DG_BM));
+    TT tW(Ws, dextents<int32_t, 2>(DG_BK, DG_BN));
+    op.run(tX, tW, cT);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  using TS = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+  TS tYs(Ysf, dextents<int32_t, 2>(DG_BN, DG_BM));
+  cT.store(tYs);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = (int)lid; e < DG_BM * DG_BN; e += DG_THREADS) {
+    const int i = e / DG_BN, j = e % DG_BN, mm = m0 + i, nn = n0 + j;
+    if (mm < M && nn < N) { y[(int64_t)mm * N + nn] = (VPIPE_ELT)Ysf[e]; }
+  }
+}
+
+kernel void proto_gemm_mma_i8(
+    const device uint32_t*  w      [[buffer(0)]],   // int8 weight [N,K]
+    const device VPIPE_ELT* scales [[buffer(1)]],   // per-group [N,K/32]
+    const device VPIPE_ELT* x      [[buffer(2)]],
+    device VPIPE_ELT*       y      [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  constexpr int GROUP8 = 32;
+  threadgroup VPIPE_ELT Xs[DG_BM * DG_BK];
+  threadgroup VPIPE_ELT Ws[DG_BN * DG_BK];
+  threadgroup float     Ysf[DG_BM * DG_BN];
+  const int m0 = (int)tgid.y * DG_BM, n0 = (int)tgid.x * DG_BN;
+  const int Kg = K / GROUP8;
+  const device uint8_t* wb = reinterpret_cast<const device uint8_t*>(w);
+  constexpr auto desc = matmul2d_descriptor(
+      DG_BM, DG_BN, DG_BK, false, true, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<DG_SG>> op;
+  using TT = tensor<threadgroup VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  auto cT = op.get_destination_cooperative_tensor<TT, TT, float>();
+  for (auto it = cT.begin(); it != cT.end(); ++it) { *it = 0.0f; }
+  for (int k0 = 0; k0 < K; k0 += DG_BK) {
+    for (int e = (int)lid; e < DG_BM * DG_BK; e += DG_THREADS) {
+      const int i = e / DG_BK, j = e % DG_BK, mm = m0 + i;
+      Xs[e] = (mm < M) ? x[(int64_t)mm * K + (k0 + j)] : (VPIPE_ELT)0;
+    }
+    for (int e = (int)lid; e < DG_BN * DG_BK; e += DG_THREADS) {
+      const int i = e / DG_BK, j = e % DG_BK, nn = n0 + i;
+      if (nn < N) {
+        const int k = k0 + j;
+        const uint qv = (uint)wb[(int64_t)nn * K + k];   // 1 byte
+        const float s = (float)scales[nn * Kg + (k / GROUP8)];
+        Ws[e] = (VPIPE_ELT)(s * (float)qv);              // symmetric, no bias
+      } else {
+        Ws[e] = (VPIPE_ELT)0;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    TT tX(Xs, dextents<int32_t, 2>(DG_BK, DG_BM));
+    TT tW(Ws, dextents<int32_t, 2>(DG_BK, DG_BN));
+    op.run(tX, tW, cT);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  using TS = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+  TS tYs(Ysf, dextents<int32_t, 2>(DG_BN, DG_BM));
+  cT.store(tYs);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = (int)lid; e < DG_BM * DG_BN; e += DG_THREADS) {
+    const int i = e / DG_BN, j = e % DG_BN, mm = m0 + i, nn = n0 + j;
+    if (mm < M && nn < N) { y[(int64_t)mm * N + nn] = (VPIPE_ELT)Ysf[e]; }
+  }
+}
+
 #else
+kernel void proto_gemm_mma_f16(device VPIPE_ELT* y [[buffer(2)]],
+                               uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { y[0] = (VPIPE_ELT)0; } }
+kernel void proto_gemm_mma_i8(device VPIPE_ELT* y [[buffer(3)]],
+                              uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { y[0] = (VPIPE_ELT)0; } }
 kernel void affine_qmm_mma_w4g64(device VPIPE_ELT* y [[buffer(4)]],
                                  uint tid [[thread_position_in_grid]])
 {

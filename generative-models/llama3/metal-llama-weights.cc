@@ -315,6 +315,15 @@ MetalLlamaWeights::info(const std::string& name) const
   return it == _tensors.end() ? nullptr : &it->second;
 }
 
+std::vector<std::string>
+MetalLlamaWeights::tensor_names() const
+{
+  std::vector<std::string> names;
+  names.reserve(_tensors.size());
+  for (const auto& kv : _tensors) { names.push_back(kv.first); }
+  return names;
+}
+
 metal_compute::SharedBuffer
 MetalLlamaWeights::load(const std::string& name,
                         metal_compute::MetalCompute* mc) const

@@ -132,6 +132,11 @@ struct ModelConfig {
   int                moe_intermediate_size   = 0;   // per-expert inner (512)
   int                shared_expert_inter     = 0;   // shared-expert inner (512)
   bool               norm_topk_prob          = true;// renorm top-k weights
+  // Gemma-4 MoE gate: the 26B-A4B hybrid layers carry BOTH a dense MLP and a
+  // MoE block (num_experts=128, top_k_experts=8, moe_intermediate_size=704).
+  // The HF config spells top-k `top_k_experts` (not `num_experts_per_tok`) and
+  // gates the block with `enable_moe_block`. Parsed into these fields.
+  bool               enable_moe_block        = false;
 
   // ---- Vision tower config (Qwen3-VL family) -----------------------
   // Populated from the nested `vision_config` object in HF config.json
@@ -189,6 +194,10 @@ struct ModelConfig {
     // tower. `mmproj_path` is the sibling mmproj-*.gguf.
     bool        unified = false;
     std::string mmproj_path;
+    // Raw safetensors 12B: the same adaptor weights live INSIDE
+    // model.safetensors (no mmproj sidecar). When set, the loader builds
+    // the Gemma4UnifiedEmbedder via load_safetensors(model_dir).
+    bool        unified_st = false;
   };
   VisionConfig vision;
 
@@ -240,6 +249,9 @@ struct ModelConfig {
     // Gemma4UnifiedEmbedder with vision.
     bool        unified = false;
     std::string mmproj_path;
+    // Raw safetensors 12B: adaptor lives inside model.safetensors (see the
+    // VisionConfig::unified_st note).
+    bool        unified_st = false;
   };
   AudioConfig audio;
 

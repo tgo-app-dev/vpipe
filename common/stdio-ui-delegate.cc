@@ -1,3 +1,4 @@
+#include "common/media-line.h"
 #include "common/stdio-ui-delegate.h"
 #include "common/vpipe-format.h"
 
@@ -32,6 +33,14 @@ public:
   {
     if (chunk.empty()) {
       return;
+    }
+    // Thinking markers arrive as whole chunks (the detokenizer emits
+    // each as one piece); render them as readable tags on a terminal.
+    string plain;
+    if (chunk.find(media_line::kThinkStart) != string_view::npos
+        || chunk.find(media_line::kThinkEnd) != string_view::npos) {
+      plain = media_line::render_think_markers_plain(chunk);
+      chunk = plain;
     }
     lock_guard<mutex> lk(_io_mu);
     cout << chunk;
@@ -110,6 +119,12 @@ StdioUiDelegate::emit_(const char* tag, bool to_err, const VpipeFormat& f)
     line.append(f());
   } catch (...) {
     line.append("<formatter threw>");
+  }
+  // Reply text relayed through info() (e.g. visual-qa answers) may
+  // carry the unified thinking markers; render them readably.
+  if (line.find(media_line::kThinkStart) != string::npos
+      || line.find(media_line::kThinkEnd) != string::npos) {
+    line = media_line::render_think_markers_plain(line);
   }
   line.push_back('\n');
 

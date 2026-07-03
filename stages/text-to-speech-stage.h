@@ -15,6 +15,8 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/moss/metal-moss-tts-model.h"
 #include "generative-models/moss/metal-moss-codec.h"
+#include "generative-models/moss/metal-moss-codec-v2.h"
+#include "generative-models/moss/metal-moss-v15-model.h"
 #include "generative-models/tokenizer.h"
 #endif
 
@@ -31,11 +33,21 @@ namespace vpipe {
 
 // Text-to-speech stage (MOSS-TTS, metal/no-MLX).
 //
-// Turns input text into a 24 kHz mono PCM waveform using the already-
-// built MOSS-TTS metal models: a MetalMossTtsModel (an 8B Qwen3 backbone
-// driving a [1+n_vq] delay-pattern code grid) generates RVQ audio codes,
-// and a MetalMossCodec (the MOSS Audio Tokenizer decoder) turns those
-// codes into PCM.
+// Handles BOTH MOSS-TTS variants from one stage, picked at load time from
+// the LM dir's config.json `model_type`:
+//
+//   * "moss_tts" (the 8B delay-pattern model): a MetalMossTtsModel (8B Qwen3
+//     backbone driving a [1+n_vq] delay-pattern code grid) generates RVQ
+//     audio codes; a MetalMossCodec (MOSS Audio Tokenizer) decodes them to
+//     24 kHz MONO PCM.
+//   * "moss_tts_local" (v1.5): a MetalMossV15Model (Qwen3 backbone + per-frame
+//     depth decoder, 12 RVQ codes/frame, greedy) feeding a MetalMossCodecV2
+//     decoder -> 48 kHz STEREO PCM. The LM dir must be PRE-QUANTIZED (produce
+//     it with the model-quantize stage); the codec_dir is a codec-v2 dir.
+//
+// Some config keys apply to only one variant (e.g. the sampling / voice-clone
+// knobs are 8B-only; max_frames / instruction / language are v1.5-only) -- the
+// unused keys are simply ignored for the loaded variant.
 //
 //   iport0  FlexDataPayload carrying the text to speak. Accepts either a
 //           plain FlexData string OR a FlexData object with a "text"
@@ -112,6 +124,7 @@ public:
   const std::string& hf_dir()    const noexcept { return _hf_dir; }
   const std::string& codec_dir() const noexcept { return _codec_dir; }
   int max_new_tokens()           const noexcept { return _max_new_tokens; }
+  int max_frames()               const noexcept { return _max_frames; }
   std::uint64_t clips_emitted()  const noexcept { return _clips_emitted; }
 
 private:
@@ -122,6 +135,10 @@ private:
   std::string _models_db;
   int         _max_new_tokens{};
   bool        _codec_int8{};   // codec_quant == "int8": int8 g32 codec weights
+  // v1.5-only config (ignored for the 8B variant).
+  int         _max_frames{};
+  std::string _instruction;
+  std::string _language;
   // Flattened sampling config (separate audio + text channels); assembled into
   // MossSampling in process(). Defaults = MossTTSDelay-8B recommendations.
   double        _audio_temp{}, _audio_top_p{}, _audio_rep{};
@@ -143,9 +160,13 @@ private:
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Loaded lazily in initialize(); cleared on a load failure so the
-  // stage stays inert (process() warns + emits nothing).
+  // stage stays inert (process() warns + emits nothing). Exactly one variant
+  // is loaded per stage (chosen from config.json model_type): the 8B pair
+  // (_lm + _codec) OR the v1.5 pair (_lm_v15 + _codec_v15).
   std::unique_ptr<genai::MetalMossTtsModel> _lm;
   std::unique_ptr<genai::MetalMossCodec>    _codec;
+  std::unique_ptr<genai::MetalMossV15Model> _lm_v15;
+  std::unique_ptr<genai::MetalMossCodecV2>  _codec_v15;
   std::unique_ptr<genai::Tokenizer>         _tokenizer;
   // Active clone reference: RVQ codes [T][n_vq] spliced into the prompt.
   // Set from an iport1 PCM beat (encode) or, under _voice_lock, from the

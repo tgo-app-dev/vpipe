@@ -536,6 +536,28 @@ kernel void affine_qmv_qkv_w4g32(
       in_vec_size, q_rows, k_rows, v_rows, tid, simd_gid, simd_lid);
 }
 
+// 8-bit twin of affine_qmv_qkv_w4g64 (uniform-w8 checkpoints: q|k|v all w8).
+kernel void affine_qmv_qkv_w8g64(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    device VPIPE_ELT*       q_out   [[buffer(4)]],
+    device VPIPE_ELT*       k_out   [[buffer(5)]],
+    device VPIPE_ELT*       v_out   [[buffer(6)]],
+    constant int&           in_vec_size [[buffer(7)]],
+    constant int&           q_rows  [[buffer(8)]],
+    constant int&           k_rows  [[buffer(9)]],
+    constant int&           v_rows  [[buffer(10)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_qkv_impl<VPIPE_ELT, 64, 8>(
+      w, scales, biases, x, q_out, k_out, v_out,
+      in_vec_size, q_rows, k_rows, v_rows, tid, simd_gid, simd_lid);
+}
+
 // Fused RMSNorm(input_layernorm) + QKV qmv (Gemma-4 decode). Stages x into
 // threadgroup memory, computes the row RMS there, normalizes by norm_w, then
 // runs the QKV GEMV from threadgroup memory -- removing the standalone rms
@@ -696,6 +718,32 @@ kernel void affine_qmv_qkv_rms_w4g32(
       q_rows, k_rows, v_rows, eps, tg_x, partial, tid, simd_gid, simd_lid);
 }
 
+// 8-bit twin of affine_qmv_qkv_rms_w4g64 (uniform-w8; opt-in RMS+QKV fuse).
+kernel void affine_qmv_qkv_rms_w8g64(
+    const device uint32_t* w        [[buffer(0)]],
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],
+    const device VPIPE_ELT* norm_w  [[buffer(4)]],
+    device VPIPE_ELT*       q_out   [[buffer(5)]],
+    device VPIPE_ELT*       k_out   [[buffer(6)]],
+    device VPIPE_ELT*       v_out   [[buffer(7)]],
+    constant int&           in_vec_size [[buffer(8)]],
+    constant int&           q_rows  [[buffer(9)]],
+    constant int&           k_rows  [[buffer(10)]],
+    constant int&           v_rows  [[buffer(11)]],
+    constant float&         eps     [[buffer(12)]],
+    threadgroup VPIPE_ELT*  tg_x    [[threadgroup(0)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup float partial[2];
+  qmv_qkv_rmsnorm_impl<VPIPE_ELT, 64, 8>(
+      w, scales, biases, x, norm_w, q_out, k_out, v_out, in_vec_size,
+      q_rows, k_rows, v_rows, eps, tg_x, partial, tid, simd_gid, simd_lid);
+}
+
 // Fused per-layer-input GATE GEMV (Gemma-4 e4b decode): y = gelu_pytorch_tanh(
 // dequant(w) @ x) * mul, where mul (buffer 7) is the per-layer-input vector
 // pli[L] (out_vec_size == hpli). Folds the standalone geglu dispatch into the
@@ -733,6 +781,25 @@ kernel void affine_qmv_gelu_mul_w4g32(
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
   qmv_fast_impl<VPIPE_ELT, 32, 4, false, 4, 2, 2, false, /*GELU_MUL=*/true>(
+      w, scales, biases, x, y, mul,
+      in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+// 8-bit twin of affine_qmv_gelu_mul_w4g64 (Gemma PLE per-layer-input gate).
+kernel void affine_qmv_gelu_mul_w8g64(
+    const device uint32_t* w            [[buffer(0)]],
+    const device VPIPE_ELT*     scales       [[buffer(1)]],
+    const device VPIPE_ELT*     biases       [[buffer(2)]],
+    const device VPIPE_ELT*     x            [[buffer(3)]],
+    device VPIPE_ELT*           y            [[buffer(4)]],
+    constant int&          in_vec_size  [[buffer(5)]],
+    constant int&          out_vec_size [[buffer(6)]],
+    const device VPIPE_ELT*     mul          [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_fast_impl<VPIPE_ELT, 64, 8, false, 4, 2, 2, false, /*GELU_MUL=*/true>(
       w, scales, biases, x, y, mul,
       in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
@@ -887,6 +954,40 @@ kernel void affine_gather_qmv_swiglu_w4g64(
       simd_gid, simd_lid);
 }
 
+// 8-bit twin of affine_gather_qmv_swiglu_w4g64: the expert weight is w8
+// (K/4 u32 words per row, so the slab stride uses /4u instead of /8u) and
+// the impl is instantiated with bits=8. Per-row arithmetic (qmv_swiglu_impl
+// -> qdot) is bit-parameterized, so this is token-exact with the plain w8
+// swiglu kernel on the same expert.
+kernel void affine_gather_qmv_swiglu_w8g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K/4]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // N = 2*inner
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    constant int& top_k             [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 4u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)(p / top_k) * (uint)in_vec_size;
+  y      += (uint)p * ((uint)out_vec_size / 2u);
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_swiglu_impl<VPIPE_ELT, 64, 8>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+      simd_gid, simd_lid);
+}
+
 // Down gather: x[p, inner] (per-pair expert activation, contiguous) @ the
 // routed expert's down [H, inner] -> partials[p, H] (UN-weighted; moe_combine
 // applies the routing weight and sums over the token's pairs).
@@ -914,6 +1015,36 @@ kernel void affine_gather_down_qmv_w4g64(
   y      += (uint)p * (uint)out_vec_size;
   const uint3 t0 = uint3(0u, tid.y, 0u);
   qmv_fast_impl<VPIPE_ELT, 64, 4, false>(
+      w, scales, biases, x, y, /*residual=*/nullptr, in_vec_size,
+      out_vec_size, t0, simd_gid, simd_lid);
+}
+
+// 8-bit twin of affine_gather_down_qmv_w4g64: w8 slab stride uses /4u and
+// the impl is instantiated with bits=8 (qmv_fast_impl -> qdot is bit-aware).
+kernel void affine_gather_down_qmv_w8g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner/4]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, H]
+    constant int& in_vec_size       [[buffer(5)]],   // inner
+    constant int& out_vec_size      [[buffer(6)]],   // H
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 4u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)p * (uint)in_vec_size;
+  y      += (uint)p * (uint)out_vec_size;
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_fast_impl<VPIPE_ELT, 64, 8, false>(
       w, scales, biases, x, y, /*residual=*/nullptr, in_vec_size,
       out_vec_size, t0, simd_gid, simd_lid);
 }
@@ -1083,6 +1214,71 @@ kernel void affine_qmv_geglu_w4g32_q40(
       tid, simd_gid, simd_lid);
 }
 
+// Gemma-4 MoE gathered expert gate|up GEMV: the geglu (gelu_pytorch_tanh)
+// twin of affine_gather_qmv_swiglu_w4g64. Identical routed-slab gather (the
+// routed expert's interleaved gate|up), but delegates to qmv_geglu_impl so the
+// activation is gelu(gate)*up. Token-exact with the plain qmv_geglu kernel on
+// the same expert. Defined here (after qmv_geglu_impl) so the template is in
+// scope.
+kernel void affine_gather_qmv_geglu_w4g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K/8]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // N = 2*inner
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    constant int& top_k             [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 8u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)(p / top_k) * (uint)in_vec_size;
+  y      += (uint)p * ((uint)out_vec_size / 2u);
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_geglu_impl<VPIPE_ELT, 64, 4>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+      simd_gid, simd_lid);
+}
+
+// 8-bit twin of affine_gather_qmv_geglu_w4g64 (w8 slab stride /4u, bits=8).
+kernel void affine_gather_qmv_geglu_w8g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K/4]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // N = 2*inner
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    constant int& top_k             [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint wstride = (uint)out_vec_size * ((uint)in_vec_size / 4u);
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  w      += e * wstride;
+  scales += e * gstride;
+  biases += e * gstride;
+  x      += (uint)(p / top_k) * (uint)in_vec_size;
+  y      += (uint)p * ((uint)out_vec_size / 2u);
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_geglu_impl<VPIPE_ELT, 64, 8>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+      simd_gid, simd_lid);
+}
+
 // ===================================================================
 // Batched GEMV (decode of N branches): y[N,Nout] = x[N,K] @ dequant(w)^T.
 //
@@ -1236,6 +1432,10 @@ VPIPE_QMV_BATCH(affine_qmv_batch_w4g64, 2)
 // more compute-bound per the MAXM=2 note above, so it's gated to the verify
 // path and A/B'd; per-row math is bit-identical (token-exact).
 VPIPE_QMV_BATCH(affine_qmv_batch4_w4g64, 4)
+// MAXM>4 is intentionally absent: an 8-row tile blows the register budget and
+// occupancy collapses (measured ~4x slower at m=5..8), a net loss for the
+// L2-resident decode weights vs MAXM=2's L2-served re-reads. Batched decode
+// with >=5 rows stays on MAXM=2; the MTP verify never exceeds m=4.
 
 // 8-bit twin: qmv_batch_impl already carries the bits==8 dot (one raw byte
 // per value, no nibble unpack), so this is the same macro with the impl's
@@ -1263,6 +1463,819 @@ VPIPE_QMV_BATCH(affine_qmv_batch4_w4g64, 4)
   }
 VPIPE_QMV_BATCH_W8(affine_qmv_batch_w8g64, 2)
 VPIPE_QMV_BATCH_W8(affine_qmv_batch4_w8g64, 4)   // MTP verify n=3..4 (see w4)
+
+// ===================================================================
+// Batched GEMV, TALL tile with THREADGROUP-STAGED activations
+// (the small-M / large-K / large-N decode-batch shape).
+//
+// qmv_batch_impl above holds every row's activation slice in per-thread
+// registers (x_thread[MAXM][16] f32) -- at MAXM=8 that alone is 128
+// registers/thread and occupancy collapses (the measured ~4x loss that
+// capped the MAXM ladder at 4). Here the k-block of ALL MAXM rows is
+// staged ONCE per threadgroup in threadgroup memory (MAXM*512 halfs =
+// 8 KB at MAXM=8) by a cooperative copy, and each lane re-reads its
+// 16-value slices from tgmem per output row -- so the register footprint
+// is ~MAXM-independent (one extracted weight chunk + the result
+// accumulators) and a tall tile keeps qmv-like occupancy while reading
+// each weight byte ONCE for all MAXM rows (m<=MAXM -> grid.z=1).
+//
+// Bit-exactness with qmv_batch_impl / affine_qmv: the weight nibbles are
+// extracted UNSHIFTED ((p>>4j)&0xf) instead of the shifted-mask +
+// power-of-16-pre-divided-x trick; every product pairs the same two
+// exactly-representable values (x/16^j is exact, nib<<4j is exact), so
+// the f32 rounding of each product -- and the per-quad accumulation
+// grouping, mirrored verbatim incl. load_vector's half-precision quad
+// sums on full blocks vs load_vector_safe's float sums on the K tail --
+// is identical. Verified byte-identical in
+// metal_lm_smoke.qmv_batch_tg_matches_batch.
+//
+// NSG simdgroups per threadgroup (NSG*4 output rows each): more
+// simdgroups amortize the cooperative stage and raise per-core occupancy
+// under the 32 KB threadgroup-memory budget (8 KB/tg at MAXM=8).
+// Dispatch grid = {32, Nout/4, ceil(N/MAXM)}, tg = {32, NSG, 1};
+// buffer(7) = total row count (m_total).
+// ===================================================================
+template <typename T, int group_size, int bits, int MAXM, int NSG>
+METAL_FUNC void qmv_batch_tg_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // [m_total, K]
+    device T* y,                        // [m_total, N]
+    threadgroup T* Xs,                  // [MAXM * block_size]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    const constant int& m_total,        // total rows in the batch
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  constexpr int tg_threads = NSG * SIMD_SIZE;
+
+  const int base_row = (int)tid.z * MAXM;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(MAXM, m_total - base_row);
+
+  typedef float U;
+  U result[results_per_simdgroup][MAXM];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (NSG * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  const int tidx = (int)(simd_gid * SIMD_SIZE + simd_lid);
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    // Cooperative stage of the k-block for all MAXM rows: pad rows alias
+    // the last valid row (never written back), the K tail zero-fills.
+    // The leading barrier orders the copy after the previous block's
+    // readers (single-buffered).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tidx; e < MAXM * block_size; e += tg_threads) {
+      const int mrow = e / block_size;
+      const int col = e % block_size;
+      const int mm = (mrow < m_rows) ? mrow : (m_rows - 1);
+      Xs[e] = (k + col < in_vec_size)
+          ? x[(size_t)(base_row + mm) * (size_t)in_vec_size + k + col]
+          : (T)0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int krem = in_vec_size - k;
+    // Per-row bias-term sums, mirroring load_vector's arithmetic exactly:
+    // full blocks accumulate each quad in T (half) precision, the K-tail
+    // block in float (load_vector_safe's form). Zeros staged past the
+    // tail contribute 0 either way.
+    U sum[MAXM];
+    for (int m = 0; m < MAXM; m++) {
+      const threadgroup T* xm =
+          Xs + m * block_size + (int)simd_lid * values_per_thread;
+      U s = 0;
+      if (bits == 4) {
+        if (krem >= block_size) {
+          for (int i = 0; i < values_per_thread; i += 4) {
+            s += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+          }
+        } else {
+          for (int i = 0; i < values_per_thread; i += 4) {
+            s += (U)xm[i] + (U)xm[i + 1] + (U)xm[i + 2] + (U)xm[i + 3];
+          }
+        }
+      } else {
+        for (int i = 0; i < values_per_thread; i++) { s += xm[i]; }
+      }
+      sum[m] = s;
+    }
+
+    // Output rows: extract this lane's weight chunk ONCE per row into
+    // f32 registers (unshifted nibbles), then sweep the MAXM rows from
+    // tgmem. Registers stay MAXM-independent.
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const U s = scales[row * in_vec_size_g];
+      const U b = biases[row * in_vec_size_g];
+      U wv[values_per_thread];
+      if (bits == 4) {
+        const device uint16_t* w16 = (const device uint16_t*)wl;
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint16_t p = w16[i];
+          wv[4 * i]     = (U)(p & 0x000f);
+          wv[4 * i + 1] = (U)((p >> 4) & 0x000f);
+          wv[4 * i + 2] = (U)((p >> 8) & 0x000f);
+          wv[4 * i + 3] = (U)(p >> 12);
+        }
+      } else if (bits == 8) {
+        for (int i = 0; i < values_per_thread; i++) { wv[i] = (U)wl[i]; }
+      }
+      for (int m = 0; m < MAXM; m++) {
+        const threadgroup T* xm =
+            Xs + m * block_size + (int)simd_lid * values_per_thread;
+        U acc = 0;
+        if (bits == 4) {
+          for (int i = 0; i < (values_per_thread / 4); i++) {
+            acc += ((U)xm[4 * i] * wv[4 * i] +
+                    (U)xm[4 * i + 1] * wv[4 * i + 1] +
+                    (U)xm[4 * i + 2] * wv[4 * i + 2] +
+                    (U)xm[4 * i + 3] * wv[4 * i + 3]);
+          }
+        } else {
+          for (int i = 0; i < values_per_thread; i++) {
+            acc += (U)xm[i] * wv[i];
+          }
+        }
+        result[row][m] += s * acc + sum[m] * b;
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int m = 0; m < MAXM; m++) {
+      const U v = simd_sum(result[row][m]);
+      if (simd_lid == 0 && m < m_rows) {
+        y[(base_row + m) * out_vec_size + out_row + row] = static_cast<T>(v);
+      }
+    }
+  }
+}
+
+#define VPIPE_QMV_BATCH_TG(NAME, BITS, MAXM, NSG, VPT)                       \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    threadgroup VPIPE_ELT Xs[MAXM * VPT * 32];                               \
+    qmv_batch_tg_impl<VPIPE_ELT, 64, BITS, MAXM, NSG>(                       \
+        w, scales, biases, x, y, Xs, in_vec_size, out_vec_size, m_total,     \
+        tid, simd_gid, simd_lid);                                            \
+  }
+// The audit candidates: MAXM=8 tall tile, 2 vs 4 simdgroups/threadgroup
+// (NSG=4 halves both the per-tg stage overhead and the tgmem footprint
+// per resident simdgroup). w8 twin at NSG=4 for the OptiQ mixed path.
+// MEASURED (M5, qmv_batch_bandwidth_sweep): the barrier-staged pipeline
+// throttles the weight stream to ~22 (NSG=2) / ~30 (NSG=4) GB/s vs the
+// register kernel's ~129 GB/s per pass -- a net loss at every m. Kept
+// for the A/B record; the xd variant below is the winning shape.
+VPIPE_QMV_BATCH_TG(affine_qmv_batch8_tg_w4g64, 4, 8, 2, 16)
+VPIPE_QMV_BATCH_TG(affine_qmv_batch8_tg4_w4g64, 4, 8, 4, 16)
+VPIPE_QMV_BATCH_TG(affine_qmv_batch8_tg4_w8g64, 8, 8, 4, 8)
+
+// ===================================================================
+// Batched GEMV, TALL tile, DEVICE-reread activations ("xd"): MAXM=8
+// with NO tgmem, NO barriers, and a register footprint ~equal to the
+// MAXM=2 kernel's.
+//
+// The sweep showed each kernel has an intrinsic weight-stream rate set
+// by LATENCY HIDING (resident simdgroups): ~129 GB/s at MAXM=2's ~70
+// regs/thread, ~70 GB/s at MAXM=4's ~120 (the register x_thread[MAXM][16]
+// is the hog), and the barrier-staged tgmem form chops the stream to
+// ~22-30 GB/s regardless. This variant keeps qmv_batch_impl's exact
+// streaming structure but drops the per-thread activation residency:
+// per output row it extracts the weight chunk ONCE into 16 f32 registers
+// (unshifted nibbles) and re-reads each row's 16-value x slice straight
+// from device memory inside the m loop. x is tiny (MAXM*K*2B, ~40-155 KB)
+// and every re-read hits L1/L2; the weight bytes -- the DRAM stream --
+// are read ONCE for all MAXM rows with no synchronization anywhere.
+// Registers: wv[16] + result[4][MAXM] + sums ~= the MAXM=2 footprint.
+//
+// Bit-exact with qmv_batch_impl by the same argument as the tg variant
+// (exact-product pairing, per-quad grouping, half-precision full-block
+// sums / float tail sums); covered by qmv_batch_tg_matches_batch.
+// Dispatch grid = {32, Nout/4, ceil(m/MAXM)}, tg = {32, 2, 1}.
+// ===================================================================
+template <typename T, int group_size, int bits, int MAXM>
+METAL_FUNC void qmv_batch_xd_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // [m_total, K]
+    device T* y,                        // [m_total, N]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    const constant int& m_total,        // total rows in the batch
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const int base_row = (int)tid.z * MAXM;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(MAXM, m_total - base_row);
+
+  typedef float U;
+  U result[results_per_simdgroup][MAXM];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  const device T* xptr[MAXM];
+  for (int m = 0; m < MAXM; m++) {
+    const int mm = (m < m_rows) ? m : (m_rows - 1);   // pad -> last valid row
+    xptr[m] = x + (size_t)(base_row + mm) * (size_t)in_vec_size +
+        (int)simd_lid * values_per_thread;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    const bool full = (krem >= block_size);
+    const int kvalid = full ? values_per_thread
+        : metal::max(0, metal::min(values_per_thread,
+              in_vec_size - (k + (int)simd_lid * values_per_thread)));
+
+    // Per-row bias-term sums (load_vector's half-precision quad sums on
+    // full blocks; load_vector_safe's clamped float sums on the tail).
+    U sum[MAXM];
+    for (int m = 0; m < MAXM; m++) {
+      const device T* xm = xptr[m];
+      U s = 0;
+      if (bits == 4) {
+        if (full) {
+          for (int i = 0; i < values_per_thread; i += 4) {
+            s += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+          }
+        } else {
+          for (int i = 0; i < values_per_thread; i += 4) {
+            const U v0 = (i + 0 < kvalid) ? (U)xm[i + 0] : (U)0;
+            const U v1 = (i + 1 < kvalid) ? (U)xm[i + 1] : (U)0;
+            const U v2 = (i + 2 < kvalid) ? (U)xm[i + 2] : (U)0;
+            const U v3 = (i + 3 < kvalid) ? (U)xm[i + 3] : (U)0;
+            s += v0 + v1 + v2 + v3;
+          }
+        }
+      } else {
+        for (int i = 0; i < values_per_thread; i++) {
+          s += (i < kvalid) ? (U)xm[i] : (U)0;
+        }
+      }
+      sum[m] = s;
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const U s = scales[row * in_vec_size_g];
+      const U b = biases[row * in_vec_size_g];
+      U wv[values_per_thread];
+      if (bits == 4) {
+        const device uint16_t* w16 = (const device uint16_t*)wl;
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint16_t p = w16[i];
+          wv[4 * i]     = (U)(p & 0x000f);
+          wv[4 * i + 1] = (U)((p >> 4) & 0x000f);
+          wv[4 * i + 2] = (U)((p >> 8) & 0x000f);
+          wv[4 * i + 3] = (U)(p >> 12);
+        }
+      } else if (bits == 8) {
+        for (int i = 0; i < values_per_thread; i++) { wv[i] = (U)wl[i]; }
+      }
+      for (int m = 0; m < MAXM; m++) {
+        const device T* xm = xptr[m];
+        U acc = 0;
+        if (bits == 4) {
+          if (full) {
+            for (int i = 0; i < (values_per_thread / 4); i++) {
+              acc += ((U)xm[4 * i] * wv[4 * i] +
+                      (U)xm[4 * i + 1] * wv[4 * i + 1] +
+                      (U)xm[4 * i + 2] * wv[4 * i + 2] +
+                      (U)xm[4 * i + 3] * wv[4 * i + 3]);
+            }
+          } else {
+            for (int i = 0; i < (values_per_thread / 4); i++) {
+              const U v0 = (4 * i + 0 < kvalid) ? (U)xm[4 * i + 0] : (U)0;
+              const U v1 = (4 * i + 1 < kvalid) ? (U)xm[4 * i + 1] : (U)0;
+              const U v2 = (4 * i + 2 < kvalid) ? (U)xm[4 * i + 2] : (U)0;
+              const U v3 = (4 * i + 3 < kvalid) ? (U)xm[4 * i + 3] : (U)0;
+              acc += (v0 * wv[4 * i] + v1 * wv[4 * i + 1] +
+                      v2 * wv[4 * i + 2] + v3 * wv[4 * i + 3]);
+            }
+          }
+        } else {
+          for (int i = 0; i < values_per_thread; i++) {
+            const U v = (i < kvalid) ? (U)xm[i] : (U)0;
+            acc += v * wv[i];
+          }
+        }
+        result[row][m] += s * acc + sum[m] * b;
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    for (int m = 0; m < MAXM; m++) { xptr[m] += block_size; }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int m = 0; m < MAXM; m++) {
+      const U v = simd_sum(result[row][m]);
+      if (simd_lid == 0 && m < m_rows) {
+        y[(base_row + m) * out_vec_size + out_row + row] = static_cast<T>(v);
+      }
+    }
+  }
+}
+
+#define VPIPE_QMV_BATCH_XD(NAME, BITS, MAXM)                                 \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_xd_impl<VPIPE_ELT, 64, BITS, MAXM>(                            \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_XD(affine_qmv_batch8_xd_w4g64, 4, 8)
+VPIPE_QMV_BATCH_XD(affine_qmv_batch8_xd_w8g64, 8, 8)
+
+// ===================================================================
+// Batched GEMV, TALL tile, GROUPED-row x registers + weight packs in
+// registers ("xp"): the third audit candidate.
+//
+// xd (above) showed the failure mode isn't only register pressure: at
+// MAXM=8 the per-row device re-reads of x cost ~16 load-issues per
+// weight byte and the kernel goes LOAD-ISSUE bound (~22 GB/s). Here the
+// block's weight packs are loaded from device ONCE into registers
+// (4 rows x 4 uint16 per lane) and x is register-resident for GROUPM
+// rows at a time (load_vector, exactly as qmv_batch_impl) -- the m loop
+// steps in GROUPM-row groups, re-masking the register-held packs per
+// group. Per-row load issue matches MAXM=2 exactly (x loaded once per
+// row per block, weights once per block); the register peak is
+// x_thread[GROUPM][16] + result[4][MAXM] + packs, ~84 (GROUPM=1) /
+// ~100 (GROUPM=2) instead of the register form's ~220 at MAXM=8.
+// Extraction ALU grows (re-mask per group), traded for full occupancy.
+//
+// Bit-exact with qmv_batch_impl: reuses load_vector/load_vector_safe
+// verbatim and the identical shifted-mask product/quad grouping; only
+// the (associativity-free) loop nesting differs.
+// Dispatch grid = {32, Nout/4, ceil(m/MAXM)}, tg = {32, 2, 1}.
+// ===================================================================
+// SWIGLU: fused gate|up epilogue -- the weights are the interleaved
+// [2*ffn, K] gate/up (row 2g = gate g, 2g+1 = up g) and y is the halved
+// [m, ffn] silu(gate)*up, exactly as qmv_batch_swiglu_impl (bit-exact).
+template <typename T, int group_size, int bits, int MAXM, int GROUPM,
+          bool SWIGLU = false>
+METAL_FUNC void qmv_batch_xp_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // [m_total, K]
+    device T* y,                        // [m_total, N]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    const constant int& m_total,        // total rows in the batch
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  // uint16 packs per lane per row (bits==4: 2 packs = 4 uint16).
+  constexpr int u16_per_row = packs_per_thread * bytes_per_pack / 2;
+
+  const int base_row = (int)tid.z * MAXM;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(MAXM, m_total - base_row);
+
+  typedef float U;
+  U result[results_per_simdgroup][MAXM];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  const device T* xbase = x +
+      (size_t)base_row * (size_t)in_vec_size +
+      (int)simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    // Hoist the block's weight packs + scales/biases for all 4 output
+    // rows into registers: ONE device read per weight byte per block,
+    // re-masked per row group below.
+    uint16_t wp[results_per_simdgroup][u16_per_row];
+    U sv[results_per_simdgroup], bv[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      if (bits == 4) {
+        const device uint16_t* w16 =
+            (const device uint16_t*)(ws + row * in_vec_size_w);
+        for (int j = 0; j < u16_per_row; j++) { wp[row][j] = w16[j]; }
+      } else {
+        const device uint16_t* w16 =
+            (const device uint16_t*)(ws + row * in_vec_size_w);
+        for (int j = 0; j < u16_per_row; j++) { wp[row][j] = w16[j]; }
+      }
+      sv[row] = scales[row * in_vec_size_g];
+      bv[row] = biases[row * in_vec_size_g];
+    }
+
+    for (int g = 0; g < MAXM; g += GROUPM) {
+      // x for GROUPM rows, register-resident via load_vector (identical
+      // pre-division + sum arithmetic to qmv_batch_impl).
+      U x_thread[GROUPM][values_per_thread];
+      U sum[GROUPM];
+      for (int gm = 0; gm < GROUPM; gm++) {
+        const int m = g + gm;
+        const int mm = (m < m_rows) ? m : (m_rows - 1);
+        const device T* xm = xbase + (size_t)mm * (size_t)in_vec_size + k;
+        if (krem >= block_size) {
+          sum[gm] = load_vector<T, U, values_per_thread, bits>(
+              xm, x_thread[gm]);
+        } else {
+          const int kvalid =
+              in_vec_size - (k + (int)simd_lid * values_per_thread);
+          sum[gm] = load_vector_safe<T, U, values_per_thread, bits>(
+              xm, x_thread[gm], kvalid < 0 ? 0 : kvalid);
+        }
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        for (int gm = 0; gm < GROUPM; gm++) {
+          U acc = 0;
+          if (bits == 4) {
+            for (int i = 0; i < u16_per_row; i++) {
+              const uint16_t p = wp[row][i];
+              acc += (x_thread[gm][4 * i]     * (U)(p & 0x000f) +
+                      x_thread[gm][4 * i + 1] * (U)(p & 0x00f0) +
+                      x_thread[gm][4 * i + 2] * (U)(p & 0x0f00) +
+                      x_thread[gm][4 * i + 3] * (U)(p & 0xf000));
+            }
+          } else if (bits == 8) {
+            for (int i = 0; i < u16_per_row; i++) {
+              const uint16_t p = wp[row][i];
+              acc += (x_thread[gm][2 * i]     * (U)(p & 0x00ff) +
+                      x_thread[gm][2 * i + 1] * (U)(p >> 8));
+            }
+          }
+          result[row][g + gm] += sv[row] * acc + sum[gm] * bv[row];
+        }
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+  }
+
+  if (SWIGLU) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      for (int m = 0; m < MAXM; m++) {
+        result[row][m] = simd_sum(result[row][m]);
+      }
+    }
+    if (simd_lid == 0) {
+      const int half_out = out_vec_size / 2;
+      for (int m = 0; m < MAXM; m++) {
+        if (m >= m_rows) { continue; }
+        device T* yo = y + (base_row + m) * half_out + (out_row >> 1);
+        const U g0 = result[0][m], u0 = result[1][m];
+        const U g1 = result[2][m], u1 = result[3][m];
+        yo[0] = static_cast<T>((g0 / (1.0f + metal::exp(-g0))) * u0);
+        yo[1] = static_cast<T>((g1 / (1.0f + metal::exp(-g1))) * u1);
+      }
+    }
+    return;
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int m = 0; m < MAXM; m++) {
+      const U v = simd_sum(result[row][m]);
+      if (simd_lid == 0 && m < m_rows) {
+        y[(base_row + m) * out_vec_size + out_row + row] = static_cast<T>(v);
+      }
+    }
+  }
+}
+
+#define VPIPE_QMV_BATCH_XP(NAME, BITS, MAXM, GROUPM)                         \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_xp_impl<VPIPE_ELT, 64, BITS, MAXM, GROUPM>(                    \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_XP(affine_qmv_batch8_xp1_w4g64, 4, 8, 1)
+VPIPE_QMV_BATCH_XP(affine_qmv_batch8_xp2_w4g64, 4, 8, 2)
+// MAXM=4 twin: same ALU/byte as the register-resident batch4 kernel but
+// ~70 regs instead of ~120 (x_thread[2][16] + result[4][4] + packs) --
+// the occupancy that caps batch4 at ~70 GB/s/pass comes back. Candidate
+// replacement for the m=3..4 tier (MTP depth-2 verify's >SLC lm_head).
+VPIPE_QMV_BATCH_XP(affine_qmv_batch4_xp_w4g64, 4, 4, 2)
+// 8-bit twins (the OptiQ mixed path's per-tensor w8 verify/decode): the
+// impl's bits==8 dot is the raw-byte form, bit-identical to
+// affine_qmv_batch_w8g64 per row. Same tile shapes as the w4 ladder.
+VPIPE_QMV_BATCH_XP(affine_qmv_batch4_xp_w8g64, 8, 4, 2)
+VPIPE_QMV_BATCH_XP(affine_qmv_batch8_xp2_w8g64, 8, 8, 2)
+
+// Fused-SwiGLU xp twins (the gate|up MLP GEMV -- the LARGEST decode
+// weight stream): interleaved gate/up weights, halved y, silu epilogue;
+// per-row arithmetic identical to the plain xp form, epilogue identical
+// to qmv_batch_swiglu_impl -> bit-exact vs affine_qmv_batch_swiglu_*.
+#define VPIPE_QMV_BATCH_XP_SWIGLU(NAME, BITS, MAXM, GROUPM)                  \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],   /* N = 2*ffn */            \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_xp_impl<VPIPE_ELT, 64, BITS, MAXM, GROUPM, true>(              \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_XP_SWIGLU(affine_qmv_batch4_xp_swiglu_w4g64, 4, 4, 2)
+VPIPE_QMV_BATCH_XP_SWIGLU(affine_qmv_batch8_xp2_swiglu_w4g64, 4, 8, 2)
+
+// ===================================================================
+// Batched GEMV, TALL tile, HOISTED dequant ("xh" / "xh16"): the last
+// two rungs of the m=7..8 one-pass ladder.
+//
+// xp2 (above) re-extracts the register-held weight packs once per
+// 2-row group (4x per block) and pays load_vector's power-of-16
+// pre-division per row; its measured ~43 GB/s pass sits near the
+// scalar-f32 ALU ceiling (8 FMAs per weight nibble at MAXM=8). xh
+// extracts each block's weights ONCE into registers as UNSHIFTED
+// nibbles (no pre-division anywhere: raw-x * true-nibble pairs the
+// same exactly-representable values, so f32 products round identically
+// -- still BIT-IDENTICAL to qmv_batch_impl) and streams x one row at a
+// time (transient 16 registers).
+//
+// xh16 (COMPUTE_HALF) additionally does the products + in-quad sums in
+// HALF precision (double-rate on Apple GPUs, and the hoisted weight
+// registers halve), accumulating quads into the f32 block accumulator.
+// All values are exact in f16 (nibbles 0..15, raw f16 x, products
+// bounded ~1e3); only the 4-term quad sums round in half, so logits
+// differ from the reference in the last bits: NOT bit-identical --
+// gate it on the greedy token-exact bar (qwen_batched_decode_token_
+// exact), like the matmul2d prefill path.
+// Dispatch grid = {32, Nout/4, ceil(m/MAXM)}, tg = {32, 2, 1}.
+// ===================================================================
+template <typename T, int group_size, int bits, int MAXM, bool COMPUTE_HALF>
+METAL_FUNC void qmv_batch_xh_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // [m_total, K]
+    device T* y,                        // [m_total, N]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    const constant int& m_total,        // total rows in the batch
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  constexpr int u16_per_row = packs_per_thread * bytes_per_pack / 2;
+
+  const int base_row = (int)tid.z * MAXM;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(MAXM, m_total - base_row);
+
+  typedef float U;
+  // Weight element type for the dot: half (double-rate) or float.
+  typedef typename metal::conditional<COMPUTE_HALF, half, float>::type W;
+  U result[results_per_simdgroup][MAXM];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  const device T* xbase = x +
+      (size_t)base_row * (size_t)in_vec_size +
+      (int)simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    const bool full = (krem >= block_size);
+    const int kvalid = full ? values_per_thread
+        : metal::max(0, metal::min(values_per_thread,
+              in_vec_size - (k + (int)simd_lid * values_per_thread)));
+
+    // Hoist + dequantize the block's weights ONCE: unshifted nibbles in
+    // W registers (exact in both half and float), plus scales/biases.
+    W wv[results_per_simdgroup][values_per_thread];
+    U sv[results_per_simdgroup], bv[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      if (bits == 4) {
+        const device uint16_t* w16 =
+            (const device uint16_t*)(ws + row * in_vec_size_w);
+        for (int i = 0; i < u16_per_row; i++) {
+          const uint16_t p = w16[i];
+          wv[row][4 * i]     = (W)(p & 0x000f);
+          wv[row][4 * i + 1] = (W)((p >> 4) & 0x000f);
+          wv[row][4 * i + 2] = (W)((p >> 8) & 0x000f);
+          wv[row][4 * i + 3] = (W)(p >> 12);
+        }
+      } else if (bits == 8) {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        for (int i = 0; i < values_per_thread; i++) {
+          wv[row][i] = (W)wl[i];
+        }
+      }
+      sv[row] = scales[row * in_vec_size_g];
+      bv[row] = biases[row * in_vec_size_g];
+    }
+
+    for (int m = 0; m < MAXM; m++) {
+      const int mm = (m < m_rows) ? m : (m_rows - 1);
+      const device T* xm = xbase + (size_t)mm * (size_t)in_vec_size + k;
+      // Raw x, transient registers; sum mirrors load_vector /
+      // load_vector_safe exactly (half quad sums on full blocks).
+      W xt[values_per_thread];
+      U sum = 0;
+      if (full) {
+        if (bits == 4) {
+          for (int i = 0; i < values_per_thread; i += 4) {
+            sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+            xt[i]     = (W)xm[i];
+            xt[i + 1] = (W)xm[i + 1];
+            xt[i + 2] = (W)xm[i + 2];
+            xt[i + 3] = (W)xm[i + 3];
+          }
+        } else {
+          for (int i = 0; i < values_per_thread; i++) {
+            sum += xm[i];
+            xt[i] = (W)xm[i];
+          }
+        }
+      } else if (bits == 4) {
+        // load_vector_safe's tail: clamped values, QUAD-grouped float sums.
+        for (int i = 0; i < values_per_thread; i += 4) {
+          const U v0 = (i + 0 < kvalid) ? (U)xm[i + 0] : (U)0;
+          const U v1 = (i + 1 < kvalid) ? (U)xm[i + 1] : (U)0;
+          const U v2 = (i + 2 < kvalid) ? (U)xm[i + 2] : (U)0;
+          const U v3 = (i + 3 < kvalid) ? (U)xm[i + 3] : (U)0;
+          sum += v0 + v1 + v2 + v3;
+          xt[i]     = (W)v0;
+          xt[i + 1] = (W)v1;
+          xt[i + 2] = (W)v2;
+          xt[i + 3] = (W)v3;
+        }
+      } else {
+        for (int i = 0; i < values_per_thread; i++) {
+          const U v = (i < kvalid) ? (U)xm[i] : (U)0;
+          sum += v;
+          xt[i] = (W)v;
+        }
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U acc = 0;
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const W q = xt[4 * i]     * wv[row][4 * i] +
+                      xt[4 * i + 1] * wv[row][4 * i + 1] +
+                      xt[4 * i + 2] * wv[row][4 * i + 2] +
+                      xt[4 * i + 3] * wv[row][4 * i + 3];
+          acc += (U)q;
+        }
+        result[row][m] += sv[row] * acc + sum * bv[row];
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int m = 0; m < MAXM; m++) {
+      const U v = simd_sum(result[row][m]);
+      if (simd_lid == 0 && m < m_rows) {
+        y[(base_row + m) * out_vec_size + out_row + row] = static_cast<T>(v);
+      }
+    }
+  }
+}
+
+#define VPIPE_QMV_BATCH_XH(NAME, BITS, MAXM, CHALF)                          \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_xh_impl<VPIPE_ELT, 64, BITS, MAXM, CHALF>(                     \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_XH(affine_qmv_batch8_xh_w4g64, 4, 8, false)
+VPIPE_QMV_BATCH_XH(affine_qmv_batch8_xh16_w4g64, 4, 8, true)
 
 // ====================================================================
 // MoE GROUPED expert GEMV (Qwen3.5-MoE prefill optimization).
@@ -1351,17 +2364,29 @@ METAL_FUNC void qmv_grouped_impl(
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
       U acc[MAXM] = {0};
-      const device uint16_t* w16 = (const device uint16_t*)wl;
-      for (int i = 0; i < (values_per_thread / 4); i++) {
-        const uint16_t p = w16[i];
-        const U w0 = (U)(p & 0x000f), w1 = (U)(p & 0x00f0);
-        const U w2 = (U)(p & 0x0f00), w3 = (U)(p & 0xf000);
-        for (int m = 0; m < MAXM; m++) {
-          acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
-                    x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+      if (bits == 4) {
+        // 4-bit: x_thread is power-of-16 pre-divided (load_vector) so the
+        // masked nibble (shifted) reconstructs the magnitude -- weight read
+        // once across MAXM rows.
+        const device uint16_t* w16 = (const device uint16_t*)wl;
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint16_t p = w16[i];
+          const U w0 = (U)(p & 0x000f), w1 = (U)(p & 0x00f0);
+          const U w2 = (U)(p & 0x0f00), w3 = (U)(p & 0xf000);
+          for (int m = 0; m < MAXM; m++) {
+            acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
+                      x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+          }
+        }
+      } else {   // bits == 8: weights are raw bytes; x_thread is raw x.
+        for (int i = 0; i < values_per_thread; i++) {
+          const U wv = (U)wl[i];
+          for (int m = 0; m < MAXM; m++) { acc[m] += x_thread[m][i] * wv; }
         }
       }
-      for (int m = 0; m < MAXM; m++) { result[row][m] += s * acc[m] + sum[m] * b; }
+      for (int m = 0; m < MAXM; m++) {
+        result[row][m] += s * acc[m] + sum[m] * b;
+      }
     }
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;
@@ -1393,7 +2418,7 @@ METAL_FUNC void qmv_grouped_impl(
   }
 }
 
-#define VPIPE_GROUPED(NAME, MAXM, SW, GA)                                     \
+#define VPIPE_GROUPED(NAME, BITS, MAXM, SW, GA)                              \
   kernel void NAME(                                                          \
       const device uint32_t* w       [[buffer(0)]],                          \
       const device VPIPE_ELT* scales [[buffer(1)]],                          \
@@ -1407,7 +2432,7 @@ METAL_FUNC void qmv_grouped_impl(
       uint3 tid [[threadgroup_position_in_grid]],                            \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid [[thread_index_in_simdgroup]]) {                         \
-    qmv_grouped_impl<VPIPE_ELT, 64, 4, MAXM, SW, GA>(                        \
+    qmv_grouped_impl<VPIPE_ELT, 64, BITS, MAXM, SW, GA>(                     \
         w, scales, biases, x, y, srow, tile2e, in_vec_size, out_vec_size,    \
         tid, simd_gid, simd_lid);                                            \
   }
@@ -1415,9 +2440,12 @@ METAL_FUNC void qmv_grouped_impl(
 // pair path) -- the bandwidth-bound sweet spot (MAXM>=4 goes compute-bound on
 // the 4-bit unpack, losing the weight-read win; see the batch note above).
 // gate|up gathers the hidden via srow (GATHER); down reads the sorted
-// activations by slot (!GATHER).
-VPIPE_GROUPED(affine_grouped_swiglu_w4g64, 2, true, true)
-VPIPE_GROUPED(affine_grouped_down_w4g64, 2, false, false)
+// activations by slot (!GATHER). w8 twins: same layout, bits=8 (the impl's
+// inner unpack + slab stride are bit-parameterized).
+VPIPE_GROUPED(affine_grouped_swiglu_w4g64, 4, 2, true, true)
+VPIPE_GROUPED(affine_grouped_down_w4g64, 4, 2, false, false)
+VPIPE_GROUPED(affine_grouped_swiglu_w8g64, 8, 2, true, true)
+VPIPE_GROUPED(affine_grouped_down_w8g64, 8, 2, false, false)
 
 // group_size=32 twin of VPIPE_QMV_BATCH (GGUF q4_0): identical to the
 // macro above but the impl group_size template arg is 32. The g64 macro

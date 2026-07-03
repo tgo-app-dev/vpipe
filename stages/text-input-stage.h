@@ -56,6 +56,8 @@ public:
                  std::vector<InEdge>       iports,
                  FlexData                  config);
 
+  // Per-launch state reset (the stage object survives stop/relaunch).
+  Job initialize(RuntimeContext& ctx) override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -65,6 +67,7 @@ public:
   uint64_t           count()  const noexcept { return _count; }
   bool present_first_without_beat() const noexcept
   { return _present_first_without_beat; }
+  bool media() const noexcept { return _media; }
 
 private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
@@ -73,6 +76,7 @@ private:
   uint64_t    _count   = 0;   // 0 == until EOF
   uint64_t    _emitted = 0;
   bool        _present_first_without_beat{};
+  bool        _media{};   // read via getmedialine (attachment markers)
   bool        _first_round_seen           = false;
 };
 

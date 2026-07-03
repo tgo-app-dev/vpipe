@@ -379,6 +379,13 @@ public:
   bool         m_bdecode_next(std::vector<std::int32_t>& out_tokens);
   void         m_bdecode_end();
 
+  // True iff the backend's bdecode supports run-ahead: the driver may prime
+  // an EXTRA m_bdecode_commit before the first m_bdecode_next (and refill
+  // after each next) so the CPU encode of step N+1 and the host's per-token
+  // emit both overlap the GPU's step N. A commit while the pipeline is full
+  // is refused (returns false) harmlessly.
+  bool         m_bdecode_supports_runahead() const;
+
   // ---- Reusable branch pool -- metal backend -----------------------
   // For stages that re-branch the same N children off a fresh parent every
   // scene (realtime-vqa: one image prefix, N question branches): pre-allocate

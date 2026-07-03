@@ -16,6 +16,7 @@
 #include "minitest.h"
 #include "generative-models/tokenizer.h"
 #include "stages/qwen-asr-tokenizer.h"
+#include "common/media-line.h"
 #include "common/session.h"
 
 #include <cstdint>
@@ -294,6 +295,66 @@ TEST(llm_tokenizer, special_tokens_render_literal_in_decode)
 
   string out = tok->decode(ids);
   EXPECT_TRUE(out == "<|begin_of_text|>hello<|end_of_text|>");
+}
+
+// The detokenizer rewrites each family's reasoning begin/end tokens
+// to the UNIFIED vpipe thinking markers (media_line::kThinkStart/
+// kThinkEnd), in both bulk decode and streaming step. Qwen-style
+// <think>/</think> and Gemma-style <|channel>/<channel|> map to the
+// same pair; other specials still render literally.
+TEST(llm_tokenizer, thinking_tokens_map_to_unified_markers)
+{
+  Session sess;
+  auto with_specials = [&](const char* extra) {
+    string js(kTokenizerJson);
+    const string needle =
+        "{\"id\": 101, \"content\": \"<|end_of_text|>\",   "
+        "\"special\": true}";
+    const size_t p = js.find(needle);
+    if (p == string::npos) {
+      return unique_ptr<genai::Tokenizer>();
+    }
+    js.insert(p + needle.size(), extra);
+    return genai::Tokenizer::from_huggingface_string(
+        js, "think-fixture", &sess);
+  };
+
+  {
+    // Qwen-style pair.
+    auto tok = with_specials(
+        ",\n    {\"id\": 102, \"content\": \"<think>\", "
+        "\"special\": true},\n"
+        "    {\"id\": 103, \"content\": \"</think>\", "
+        "\"special\": true}");
+    ASSERT_TRUE(tok != nullptr);
+    vector<int32_t> ids;
+    ids.push_back(102);
+    for (auto id : tok->encode("hello")) { ids.push_back(id); }
+    ids.push_back(103);
+    const string bulk = tok->decode(ids);
+    EXPECT_TRUE(bulk == string(media_line::kThinkStart) + "hello"
+                            + string(media_line::kThinkEnd));
+    auto sd = tok->make_stream_decoder();
+    string streamed;
+    for (auto id : ids) { streamed += tok->step(sd, id); }
+    EXPECT_TRUE(streamed == bulk);
+    // Unrelated specials still render literally.
+    vector<int32_t> plain = { 100 };
+    EXPECT_TRUE(tok->decode(plain) == "<|begin_of_text|>");
+  }
+  {
+    // Gemma-style channel pair (picked up when <think> is absent).
+    auto tok = with_specials(
+        ",\n    {\"id\": 102, \"content\": \"<|channel>\", "
+        "\"special\": true},\n"
+        "    {\"id\": 103, \"content\": \"<channel|>\", "
+        "\"special\": true}");
+    ASSERT_TRUE(tok != nullptr);
+    vector<int32_t> ids = { 102, 103 };
+    EXPECT_TRUE(tok->decode(ids)
+                == string(media_line::kThinkStart)
+                       + string(media_line::kThinkEnd));
+  }
 }
 
 TEST(llm_tokenizer, empty_input_round_trips)

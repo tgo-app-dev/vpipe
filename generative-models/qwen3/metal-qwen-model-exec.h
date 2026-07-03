@@ -86,6 +86,11 @@ public:
   bool bdecode_commit() override;
   bool bdecode_next(std::vector<std::int32_t>& out_tokens) override;
   void bdecode_end() override;
+  // Constant-N bdecode never rolls back (a speculative uncollected tail is
+  // discarded like any stopped branch's over-advanced KV/GDN), so run-ahead
+  // is always safe here.
+  bool bdecode_supports_runahead() const override
+  { return _model != nullptr; }
 
   bool supports_mtp() const override
   { return _model != nullptr && _model->has_mtp(); }
@@ -113,6 +118,9 @@ public:
 
   bool branch_context(ContextId parent, ContextId child) override;
   void release_context(ContextId ctx) override;
+
+  // Read-only KV length of a context (0 = never touched).
+  int context_seq_len(ContextId ctx) const override;
 
   bool supports_branch_pool() const noexcept override { return true; }
   bool reserve_branch_context(ContextId child, int max_tokens) override;

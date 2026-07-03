@@ -848,6 +848,14 @@ Session::getpasswd(const VpipeFormat&           prompt,
   return _ui_delegate->getpasswd(prompt, out, should_cancel);
 }
 
+UiInputStatus
+Session::getmedialine(const VpipeFormat&           prompt,
+                      string&                      out,
+                      const function<bool()>&      should_cancel) const
+{
+  return _ui_delegate->getmedialine(prompt, out, should_cancel);
+}
+
 unique_ptr<UiTextStream>
 Session::open_text_stream() const
 {

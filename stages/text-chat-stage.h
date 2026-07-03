@@ -39,6 +39,15 @@ namespace vpipe {
 // which resets the K/V cache and re-seeds the next turn's session-
 // start tokens. EOS on in-port 0 ends the stage.
 //
+// A user turn may embed image/audio attachments as media-line markers
+// (common/media-line.h; produced by text-input's `media` mode or typed
+// by hand). Markers are processed BEFORE the tokenizer: each item is
+// decoded with FFmpeg to the encoder's native input, encoded through
+// the model's own vision/audio tower, and its embeddings are spliced
+// at the marker position via prefill_multimodal_metal. A modality the
+// loaded model does not provide (no tower / no pad token) warns and
+// drops that attachment, keeping the surrounding text.
+//
 // Per assistant turn the stage emits a FlexData object on out-port 0
 // with keys:
 //   text        (string) -- the full assistant response text
@@ -135,6 +144,17 @@ private:
   std::shared_ptr<genai::LoadedLanguageModel> _lm;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::SamplerParams _sampler_params;
+  // Borrowed media-encoder towers (owned by the LM; cached in
+  // initialize()). Null when the checkpoint has no such tower. Used by
+  // the media-line turn path: a user line carrying attachment markers
+  // decodes each item (FFmpeg) and encodes it through the model's own
+  // tower, then splices the embeddings at the marker positions via
+  // prefill_multimodal_metal.
+  genai::MetalQwenVisionEncoder*   _mvis     = nullptr;
+  genai::MetalGemma4VisionEncoder* _mgvis    = nullptr;
+  genai::Gemma4UnifiedEmbedder*    _mguni    = nullptr;
+  genai::MetalAudioEncoder*        _m_audio  = nullptr;
+  genai::MetalGemma4AudioEncoder*  _mg_audio = nullptr;
   // MTP speculative-decode opt-out (config "mtp", default true; read in the
   // ctor). Gates the metal MTP fast path; token-exact, so it only changes
   // decode speed. The MLX path has no MTP head, hence no-MLX only.

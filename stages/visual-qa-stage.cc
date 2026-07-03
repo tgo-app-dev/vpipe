@@ -2,6 +2,7 @@
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/media-line.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
@@ -518,6 +519,17 @@ VisualQaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   std::string out;
   int produced = 0;
   std::int32_t cur = ctx.last_predicted_id();   // prefill's first token
+
+  // Thinking-ON templates open the reasoning block in the PROMPT
+  // (`<think>\n` in the assistant extras), so its start token never
+  // streams; emit the unified thinking-start marker so front ends can
+  // fold the reasoning (the model-generated close token is rewritten
+  // by the detokenizer).
+  if (tpl && tpl->assistant_prompt_opens_thinking()) {
+    const std::string m(media_line::kThinkStart);
+    out += m;
+    out_stream->write(m);
+  }
 
   // MTP speculative head fast path (mtp.safetensors, Qwen3.5-OptiQ): the drafter
   // lets the verifier accept multiple tokens per forward, token-exact vs the

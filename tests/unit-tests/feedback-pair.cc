@@ -10,9 +10,12 @@
 #include "common/job.h"
 #include "common/session.h"
 #include "common/vertex.h"
+#include "common/vpipe-format.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "pipeline/feedback-rx-stage.h"
 #include "pipeline/feedback-tx-stage.h"
 #include "stages/passthrough-stage.h"
+#include "stages/text-input-stage.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -21,8 +24,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -95,6 +100,20 @@ public:
 
   std::mutex       mu;
   std::vector<int> received;
+
+  // Per-launch reset, mirroring what real loop drivers (text-input)
+  // do: stage objects survive a stop/relaunch, so round-counting
+  // state must not leak into the next run.
+  vpipe::Job
+  initialize(vpipe::RuntimeContext&) override
+  {
+    next = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      received.clear();
+    }
+    co_return;
+  }
 
   vpipe::Job
   process(vpipe::RuntimeContext& ctx) override
@@ -181,6 +200,156 @@ TEST(feedback_pair, tx_relays_rx_cached_beats) {
     }
   }
   EXPECT_TRUE(ordered);
+}
+
+// RELAUNCH: the stage objects survive a stop (only the runtime dies),
+// so the pair must reset its cross-run state in initialize(). A run
+// that ended (rx saw EOS at drain) used to leave rx._eos sticky --
+// on the next launch tx's wait_new_beat resolved instantly on the
+// stale flag, saw no new beat, signalled done, and the closed trigger
+// edge EOS-cascaded the whole loop ("auto-stopped: all stages done"
+// before the first round). Build the loop once, run it to completion
+// TWICE over the same Pipeline, and require the second run to relay
+// the full round count again.
+TEST(feedback_pair, relaunch_after_stop_runs_again) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("p", &sess);
+
+  vpipe::FlexData tx_cfg = vpipe::FlexData::make_object();
+  tx_cfg.as_object().insert("from",
+      vpipe::FlexData::make_string("rx"));
+  auto tx_u = std::make_unique<vpipe::FeedbackTxStage>(
+    &sess, "tx", std::vector<vpipe::InEdge>{},
+    std::move(tx_cfg));
+  auto* tx = pl->insert_stage(std::move(tx_u));
+
+  auto drv_u = std::make_unique<FbLoopDriver>(
+    &sess, "driver", std::vector<vpipe::InEdge>{{tx, 0}});
+  drv_u->allocate_oports(1);
+  drv_u->target = 5;
+  auto* drv = static_cast<FbLoopDriver*>(
+    pl->insert_stage(std::move(drv_u)));
+
+  auto chat_u = std::make_unique<vpipe::PassthroughStage>(
+    &sess, "chat", std::vector<vpipe::InEdge>{{drv, 0}});
+  chat_u->allocate_oports(1);
+  auto* chat = pl->insert_stage(std::move(chat_u));
+
+  vpipe::FlexData rx_cfg = vpipe::FlexData::make_object();
+  auto rx_u = std::make_unique<vpipe::FeedbackRxStage>(
+    &sess, "rx", std::vector<vpipe::InEdge>{{chat, 0}},
+    std::move(rx_cfg));
+  pl->insert_stage(std::move(rx_u));
+
+  auto run_once = [&]() -> size_t {
+    vpipe::PipelineRuntime rt(pl.get(), &sess);
+    if (!rt.launch()) {
+      return static_cast<size_t>(-1);
+    }
+    // Bounded wait: a relaunch regression that deadlocks (instead of
+    // auto-stopping) must fail the test, not hang the suite.
+    const bool idle = rt.wait_idle(20000);
+    rt.stop();
+    if (!idle) {
+      return static_cast<size_t>(-1);
+    }
+    std::lock_guard<std::mutex> lk(drv->mu);
+    return drv->received.size();
+  };
+
+  const size_t first = run_once();
+  EXPECT_TRUE(first == 5);
+  // Same Pipeline, same stage objects, fresh runtime: the loop must
+  // run all 5 rounds again (0 = the stale-EOS instant shutdown).
+  const size_t second = run_once();
+  EXPECT_TRUE(second == 5);
+}
+
+namespace {
+
+// UI delegate that answers every getline immediately (no stdin) and
+// counts the calls -- lets a text-input-driven loop run headless.
+class ScriptedUi final : public vpipe::UiDelegateIntf {
+public:
+  std::atomic<int> calls{0};
+
+  void error(const vpipe::VpipeFormat&) override {}
+  void warn(const vpipe::VpipeFormat&) override {}
+  void info(const vpipe::VpipeFormat&) override {}
+  vpipe::UiInputStatus
+  getline(const vpipe::VpipeFormat&, std::string& out,
+          const std::function<bool()>&) override
+  {
+    ++calls;
+    out = "hello";
+    return vpipe::UiInputStatus::Ok;
+  }
+  std::unique_ptr<vpipe::UiTextStream> open_text_stream() override
+  {
+    return std::make_unique<vpipe::NullUiTextStream>();
+  }
+};
+
+}
+
+// The reported chat-loop topology, relaunched: {feedback-tx ->
+// text-input -> chat(passthrough) -> feedback-rx} with count=2 per
+// run. The first run reads two lines and self-terminates; the second
+// launch over the SAME stage objects must read two more. Before the
+// per-launch resets (rx._eos / tx._last_seen / text-input's
+// _first_round_seen + _emitted) the relaunch showed no prompt and
+// auto-stopped instantly with zero reads.
+TEST(feedback_pair, text_input_chat_loop_relaunches) {
+  vpipe::Session sess;
+  auto ui_owned = std::make_unique<ScriptedUi>();
+  ScriptedUi* ui = ui_owned.get();
+  sess.set_ui_delegate(std::move(ui_owned));
+
+  auto pl = std::make_unique<vpipe::Pipeline>("chat", &sess);
+
+  vpipe::FlexData tx_cfg = vpipe::FlexData::make_object();
+  tx_cfg.as_object().insert("from",
+      vpipe::FlexData::make_string("frx"));
+  auto tx_u = std::make_unique<vpipe::FeedbackTxStage>(
+    &sess, "ftx", std::vector<vpipe::InEdge>{},
+    std::move(tx_cfg));
+  auto* tx = pl->insert_stage(std::move(tx_u));
+
+  vpipe::FlexData tin_cfg = vpipe::FlexData::make_object();
+  tin_cfg.as_object().insert("count", vpipe::FlexData::make_int(2));
+  auto tin_u = std::make_unique<vpipe::TextInputStage>(
+    &sess, "tin", std::vector<vpipe::InEdge>{{tx, 0}},
+    std::move(tin_cfg));
+  auto* tin = pl->insert_stage(std::move(tin_u));
+
+  auto chat_u = std::make_unique<vpipe::PassthroughStage>(
+    &sess, "chat", std::vector<vpipe::InEdge>{{tin, 0}});
+  chat_u->allocate_oports(1);
+  auto* chat = pl->insert_stage(std::move(chat_u));
+
+  vpipe::FlexData rx_cfg = vpipe::FlexData::make_object();
+  auto rx_u = std::make_unique<vpipe::FeedbackRxStage>(
+    &sess, "frx", std::vector<vpipe::InEdge>{{chat, 0}},
+    std::move(rx_cfg));
+  pl->insert_stage(std::move(rx_u));
+
+  auto run_once = [&]() -> bool {
+    vpipe::PipelineRuntime rt(pl.get(), &sess);
+    if (!rt.launch()) {
+      return false;
+    }
+    const bool idle = rt.wait_idle(20000);
+    rt.stop();
+    return idle;
+  };
+
+  EXPECT_TRUE(run_once());
+  EXPECT_TRUE(ui->calls == 2);
+  // Relaunch over the same stage objects: two MORE prompts must be
+  // presented and read (0 new reads = the stale-state instant stop;
+  // a wait_idle timeout = the startup deadlock variant).
+  EXPECT_TRUE(run_once());
+  EXPECT_TRUE(ui->calls == 4);
 }
 
 // When config.from names a stage that does not exist, the runtime

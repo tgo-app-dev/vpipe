@@ -97,6 +97,11 @@ FeedbackTxStage::initialize(RuntimeContext&)
         "FeedbackTxStage('{}'): no feedback-rx stage named '{}' in "
         "this pipeline", this->id(), _from_id));
   }
+  // Per-launch reset, paired with FeedbackRxStage::initialize's
+  // _seq=0: a persisted _last_seen from a prior run would otherwise
+  // make wait_new_beat wait for a sequence number the reset rx never
+  // reaches again.
+  _last_seen = 0;
   co_return;
 }
 

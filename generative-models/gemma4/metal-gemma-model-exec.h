@@ -75,6 +75,13 @@ public:
   bool branch_context(ContextId parent, ContextId child) override;
   void release_context(ContextId ctx) override;
 
+  // Read-only KV length of a context (0 = never touched). The gemma
+  // model maps the LM ContextId internally, so this forwards to it.
+  int context_seq_len(ContextId ctx) const override
+  {
+    return _model != nullptr ? _model->context_seq_len(ctx) : 0;
+  }
+
   void set_eval_per_layer(bool) noexcept override {}
 
   void set_suppressed_tokens(std::span<const std::int32_t> ids) override

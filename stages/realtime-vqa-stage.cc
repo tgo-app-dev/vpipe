@@ -117,9 +117,8 @@ constexpr const char* kDescribePrompt =
     "- Avoid describing the background, environment or clothing details\n"
     "- Avoid assumptions or subjective interpretations\n"
     "- Be specific and concise\n"
-    "- Take the summary before the scene as a reference. Do not repeat "
-    "previous descriptions unless the actions described are part of a "
-    "continuous, unified sequence in the current scene.\n";
+    "- Treat the frames as one continuous sequence over time, including "
+    "any action already in progress in the first frame.\n";
 
 // Gemma-4 e4b variant of the describe instruction. Gemma clams up under
 // the heavy negative-constraint list above -- the "Avoid ... / Be concise
@@ -154,14 +153,10 @@ constexpr const char* kQuestionPreambleDefault =
     "concise explanation only if necessary.";
 
 // build_preamble_ fragments: the per-scene user-turn preamble (local
-// date/time anchor + optional prior-scene recap + audio sound timeline).
+// date/time anchor + audio sound timeline). Cross-scene continuity is
+// carried by the scene-overlap frame, not by a textual recap.
 constexpr const char* kPreambleDateTimePrefix =
     "The current local date and time is: ";
-constexpr const char* kPreamblePrevScenePrefix =
-    "Here's the summary of the scene before the first frame. "
-    "Please take the summary only as a reference. Do not repeat it unless "
-    "the actions described are part of a continuous, unified sequence "
-    "connected to the current scene: ";
 constexpr const char* kPreambleAudioHeader =
     "Sounds detected during this scene (timestamps are aligned with the "
     "video frame markers below):\n";
@@ -177,7 +172,8 @@ constexpr const char* kDescribePromptZhCn =
     "- 描述对象之间的手势和互动\n"
     "- 不要描述背景、环境或衣着细节\n"
     "- 不要做出假设或主观解读\n"
-    "- 要具体而简洁。\n";
+    "- 要具体而简洁\n"
+    "- 将各帧视为随时间连续的动作序列，包括第一帧中已经在进行的动作。\n";
 constexpr const char* kAudioInterpretPromptZhCn =
     "下面是这个场景的音频。请用几个词说明听到了什么声音？如果是语音，"
     "请说明语言以及你听到的内容。";
@@ -185,9 +181,6 @@ constexpr const char* kQuestionPreambleZhCn =
     "请先明确地用“是/否/不知道”回答问题，再在必要时给出简短的解释。";
 constexpr const char* kPreambleDateTimePrefixZhCn =
     "当前本地时间是：";
-constexpr const char* kPreamblePrevScenePrefixZhCn =
-    "以下是本段视频之前场景的摘要。请只作为回答问题的参考。"
-    "除非所描述的动作是当前场景中出现的动作的一部分，否则不要重复这个描述：";
 constexpr const char* kPreambleAudioHeaderZhCn =
     "在本场景中检测到了以下声音（时间戳与下方的视频帧标记对齐）：\n";
 constexpr const char* kPreambleNoAudioZhCn =
@@ -202,7 +195,8 @@ constexpr const char* kDescribePromptZhTw =
     "- 描述對象之間的手勢和互動\n"
     "- 不要描述背景、環境或衣著細節\n"
     "- 不要做出假設或主觀解讀\n"
-    "- 要具體而簡潔。\n";
+    "- 要具體而簡潔\n"
+    "- 將各幀視為隨時間連續的動作序列，包括第一幀中已經在進行的動作。\n";
 constexpr const char* kAudioInterpretPromptZhTw =
     "下面是這個場景的音訊。請用幾個詞說明聽到了什麼聲音？如果是語音，"
     "請說明語言以及你聽到的內容。";
@@ -210,9 +204,6 @@ constexpr const char* kQuestionPreambleZhTw =
     "請先明確地用「是/否/不知道」回答問題，再在必要時再給出簡短的解釋。";
 constexpr const char* kPreambleDateTimePrefixZhTw =
     "目前本地時間為：";
-constexpr const char* kPreamblePrevScenePrefixZhTw =
-    "以下是第一幀之前場景的摘要。請僅作爲回答問題的參考。"
-    "除非其描述的動作是當前場景中出現的動作的一部分，否則不要重複此摘要：";
 constexpr const char* kPreambleAudioHeaderZhTw =
     "在本場景中偵測到了以下聲音（時間戳與下方的視訊幀標記對齊）：\n";
 constexpr const char* kPreambleNoAudioZhTw =
@@ -228,7 +219,6 @@ struct VqaPrompts {
   const char* audio_interpret;
   const char* question_preamble;
   const char* preamble_datetime_prefix;
-  const char* preamble_prevscene_prefix;
   const char* preamble_audio_header;
   const char* preamble_no_audio;
 };
@@ -236,18 +226,15 @@ struct VqaPrompts {
 constexpr VqaPrompts kPromptsEn = {
     kDescribePrompt,          kAudioInterpretPrompt,
     kQuestionPreambleDefault, kPreambleDateTimePrefix,
-    kPreamblePrevScenePrefix, kPreambleAudioHeader,
-    kPreambleNoAudio};
+    kPreambleAudioHeader,     kPreambleNoAudio};
 constexpr VqaPrompts kPromptsZhCn = {
     kDescribePromptZhCn,          kAudioInterpretPromptZhCn,
     kQuestionPreambleZhCn,        kPreambleDateTimePrefixZhCn,
-    kPreamblePrevScenePrefixZhCn, kPreambleAudioHeaderZhCn,
-    kPreambleNoAudioZhCn};
+    kPreambleAudioHeaderZhCn,     kPreambleNoAudioZhCn};
 constexpr VqaPrompts kPromptsZhTw = {
     kDescribePromptZhTw,          kAudioInterpretPromptZhTw,
     kQuestionPreambleZhTw,        kPreambleDateTimePrefixZhTw,
-    kPreamblePrevScenePrefixZhTw, kPreambleAudioHeaderZhTw,
-    kPreambleNoAudioZhTw};
+    kPreambleAudioHeaderZhTw,     kPreambleNoAudioZhTw};
 
 // Select the prompt set for a normalized locale tag (en-us / zh-cn /
 // zh-tw). Any other / unsupported tag uses en-us (the fallback).
@@ -440,7 +427,8 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
   if (_catch_up_drop < 0) { _catch_up_drop = 0; }
   _batched_decode       = attr_bool("batched_decode");
   _pipelined_decode     = attr_bool("pipelined_decode");
-  _prev_scene_recap     = attr_bool("prev_scene_recap");
+  _pipelined_batched_decode = attr_bool("pipelined_batched_decode");
+  _scene_overlap        = attr_bool("scene_overlap");
   _video_fps            = static_cast<float>(attr_real("video_fps"));
   if (_video_fps <= 0.0f) { _video_fps = 1.0f; }
 
@@ -568,13 +556,19 @@ constexpr ConfigKey kAttrs[] = {
    .def_bool = true},
   {.key = "pipelined_decode", .type = ConfigType::Bool,
    .doc = "GPU-resident pipelined SINGLE-branch decode (metal): overlaps "
-          "host/GPU per token. Batched (multi-question) decode ignores this "
-          "and always uses the shrinking path (the pipelined batched path "
-          "is constant-N and wastes work on staggered answers).",
+          "host/GPU per token. Governs single decode only; see "
+          "pipelined_batched_decode for the multi-question path.",
    .def_bool = true},
-  {.key = "prev_scene_recap", .type = ConfigType::Bool,
-   .doc = "carry prior scene description into the next describe, but "
-          "only across temporally-continuous scenes; false disables it",
+  {.key = "pipelined_batched_decode", .type = ConfigType::Bool,
+   .doc = "OPT-IN GPU-resident pipelined BATCHED decode (metal, constant-N "
+          "with run-ahead): tokens stay on device and the host emit + next "
+          "step's CPU encode overlap the GPU. Default off: the shrinking "
+          "sync path wins on staggered answer lengths.",
+   .def_bool = false},
+  {.key = "scene_overlap", .type = ConfigType::Bool,
+   .doc = "re-issue the previous scene's last frame/frame-pair vision "
+          "tokens as the next scene's first frame, but only across "
+          "temporally-continuous scenes; false disables it",
    .def_bool = true},
   {.key = "video_fps", .type = ConfigType::Real,
    .doc = "fallback marker cadence when timestamp_us absent",
@@ -886,21 +880,17 @@ RealtimeVqaStage::effective_language_() const
 
 std::string
 RealtimeVqaStage::build_preamble_(
-    std::uint64_t first_ts_us, const std::string& prev_desc,
+    std::uint64_t first_ts_us,
     const std::vector<std::pair<std::uint64_t, std::string>>& audio,
     std::uint64_t base_ts_us, bool audio_wired) const
 {
   const VqaPrompts& p = vqa_prompts_for_(effective_language_());
   // Always lead with the current local date+time so the model has a
-  // wall-clock anchor for time-of-day reasoning.
+  // wall-clock anchor for time-of-day reasoning. (Cross-scene continuity
+  // is now carried by the scene-overlap frame, not a textual recap.)
   std::string pre = p.preamble_datetime_prefix;
   pre += local_prompt_time_(first_ts_us);
   pre += ".\n\n";
-  if (!prev_desc.empty()) {
-    pre += p.preamble_prevscene_prefix;
-    pre += prev_desc;
-    pre += "\n\n";
-  }
   // Audio sound timeline: same `<X.Y seconds>` markers + scene-relative
   // base as the video frames so the model can correlate sight + sound.
   if (!audio.empty()) {
@@ -922,28 +912,27 @@ RealtimeVqaStage::build_preamble_(
   return pre;
 }
 
-std::string
-RealtimeVqaStage::prev_recap_(const std::string& prev_desc,
-                              std::uint64_t      prev_last_ts_us,
-                              std::uint64_t      this_first_ts_us) const
+bool
+RealtimeVqaStage::scenes_continuous_(std::uint64_t prev_last_ts_us,
+                                     std::uint64_t this_first_ts_us) const
 {
-  if (!_prev_scene_recap || prev_desc.empty()) {
-    return {};
+  if (!_scene_overlap) {
+    return false;
   }
   // No reliable timestamps on either side -> can't establish continuity;
-  // treat as a fresh scene and drop the recap (the safe default that
-  // prevents the stale-description echo lock).
+  // treat as a fresh scene (the safe default that prevents carrying a
+  // stale frame across an unrelated cut).
   if (prev_last_ts_us == 0 || this_first_ts_us == 0
       || this_first_ts_us < prev_last_ts_us) {
-    return {};
+    return false;
   }
   const std::uint64_t gap_us = this_first_ts_us - prev_last_ts_us;
   const std::uint64_t thresh_us =
       static_cast<std::uint64_t>(_max_frame_gap_ms) * 1000ull;
   // Continuous == the inter-scene gap is below the same threshold that
   // splits scenes. A scene that ended on a real gap / idle stretch is a
-  // new event and gets no recap.
-  return (gap_us < thresh_us) ? prev_desc : std::string{};
+  // new event and is not overlapped.
+  return gap_us < thresh_us;
 }
 
 Job
@@ -1551,15 +1540,19 @@ std::vector<std::string>
 RealtimeVqaStage::m_decode_batched_(
     std::vector<genai::LoadedLanguageModel::Context>& children)
 {
-  // ALWAYS the synchronous SHRINKING path for batched decode: it drops a
+  // DEFAULT: the synchronous SHRINKING path for batched decode: it drops a
   // branch as it finishes and re-selects the matmul kernel by the current
   // active count via qmm_auto_ (so the tail runs qmv, not the wide batched
   // GEMV). The GPU-resident pipelined path overlaps host/GPU but is
   // CONSTANT-N (the overlap needs GPU-resident tokens, so it can't cheaply
   // shrink), which wastes work -- both weights AND per-branch attention --
   // once answers finish at staggered lengths. Multi-question answers are
-  // staggered by nature, so pipelining is never used for batched decode.
-  // (`pipelined_decode` governs SINGLE decode only -- see m_decode_.)
+  // staggered by nature, so constant-N stays OPT-IN
+  // (`pipelined_batched_decode`) for workloads whose answers finish at
+  // similar lengths; `pipelined_decode` governs SINGLE decode only.
+  if (_pipelined_batched_decode && _lm->m_bdecode_supported()) {
+    return m_decode_batched_pipelined_(children);
+  }
   return m_decode_batched_sync_(children);
 }
 
@@ -1583,6 +1576,9 @@ RealtimeVqaStage::m_decode_batched_sync_(
     std::int32_t                  cur = -1;
     int                           produced = 0;
     bool                          done = false;
+    // Emitted ids, mirroring the host sampler's penalty seen-set -- primes
+    // the GPU sampler if this branch is handed to the pipelined lone tail.
+    std::vector<std::int32_t>     ids;
   };
   std::vector<BState> st;
   st.reserve(N);
@@ -1598,7 +1594,8 @@ RealtimeVqaStage::m_decode_batched_sync_(
   }
 
   std::vector<float> logits;
-  int total_steps = 0;
+  int total_steps = 0, tail_steps = 0;
+  bool tail_tried = false;
   while (true) {
     // Emit each still-active branch's current token, then collect the active
     // set for the next batched forward.
@@ -1615,12 +1612,58 @@ RealtimeVqaStage::m_decode_batched_sync_(
       }
       b.out += tok.step(b.sd, b.cur);
       ++b.produced;
+      b.ids.push_back(b.cur);
       if (b.produced >= _max_new_tokens) { b.done = true; continue; }
       active_ctx.push_back(&children[k]);
       active_tok.push_back(b.cur);
       active_idx.push_back(k);
     }
     if (active_ctx.empty()) { break; }
+    // Lone-branch TAIL: staggered answers leave the last branch decoding
+    // alone; hand it to the GPU-resident pipelined single decode (on-device
+    // sampler, no per-token [1,vocab] host logit pull, run-ahead on depth>=2
+    // backends) instead of 1-branch synchronous batched steps. Greedy is
+    // token-exact vs the sync loop (same forwards, argmax on device); a
+    // penalised sampler carries its seen-set over via the emitted-id history
+    // (pdecode_begin's prompt span). A refused pdecode_begin falls through
+    // to the sync loop below (attempted once).
+    if (active_ctx.size() == 1 && _pipelined_decode && !tail_tried) {
+      tail_tried = true;
+      BState& b = st[active_idx[0]];
+      genai::LoadedLanguageModel::Context& c = *active_ctx[0];
+      genai::SamplerParams p = _sampler_params;
+      if (p.seed != 0) {
+        p.seed += static_cast<std::uint64_t>(active_idx[0]);
+      }
+      if (_lm->pdecode_begin(
+              c, b.cur,
+              std::span<const std::int32_t>(b.ids.data(), b.ids.size()),
+              p, _max_new_tokens - b.produced)) {
+        // Drain-before-refill ordering (see m_decode_): the first commit
+        // fills a depth-1 ring; the run-ahead pre-commit is a harmless
+        // no-op there and keeps a 2nd forward in flight on depth>=2.
+        bool committed = _lm->pdecode_commit(c);
+        if (committed && _lm->pdecode_supports_runahead()) {
+          _lm->pdecode_commit(c);
+        }
+        while (committed) {
+          const std::int32_t nx = _lm->pdecode_next(c);    // drain
+          if (nx < 0) { break; }
+          ++total_steps;
+          ++tail_steps;
+          b.cur = nx;
+          if (tpl && tpl->is_stop_token(nx)) { break; }
+          b.out += tok.step(b.sd, nx);
+          ++b.produced;
+          b.ids.push_back(nx);
+          if (b.produced >= _max_new_tokens) { break; }
+          committed = _lm->pdecode_commit(c);              // refill
+        }
+        _lm->pdecode_end(c);
+        b.done = true;
+        break;
+      }
+    }
     if (!_lm->m_batched_decode_step(
             std::span<genai::LoadedLanguageModel::Context*>(
                 active_ctx.data(), active_ctx.size()),
@@ -1659,9 +1702,12 @@ RealtimeVqaStage::m_decode_batched_sync_(
   const double dec_s = std::chrono::duration<double>(clock::now() - t0).count();
   session()->info(fmt(
       "RealtimeVqaStage('{}'): m_decode_batched {} branches, {} steps, {} "
-      "tok in {:.3f} s ({:.1f} tok/s)",
+      "tok in {:.3f} s ({:.1f} tok/s){}",
       this->id(), N, total_steps, total_tok, dec_s,
-      dec_s > 0.0 ? static_cast<double>(total_tok) / dec_s : 0.0));
+      dec_s > 0.0 ? static_cast<double>(total_tok) / dec_s : 0.0,
+      tail_steps > 0
+          ? fmt(" (lone-tail {} steps pipelined)", tail_steps)()
+          : std::string()));
   return answers;
 }
 
@@ -1705,8 +1751,20 @@ RealtimeVqaStage::m_decode_batched_pipelined_(
 
   int total_steps = 0, total_tok = 0;
   std::vector<std::int32_t> toks;
+  // Keep the GPU pipeline primed: step 1 is committed BEFORE the first
+  // host emit, and a run-ahead backend (depth>=2) takes a second
+  // speculative commit so the CPU encode of step N+1 overlaps the GPU's
+  // step N (mirrors the serial pdecode run-ahead above). The speculative
+  // commit is refused harmlessly when the backend is depth-1; constant-N
+  // bdecode never rolls back, so the run-ahead tail is discarded with the
+  // branch contexts like any stopped branch's over-advanced KV.
+  bool committed = _lm->m_bdecode_commit();
+  if (_lm->m_bdecode_supports_runahead()) {
+    _lm->m_bdecode_commit();
+  }
   while (true) {
     // Emit each still-active branch's current token (stop-check first).
+    // The in-flight GPU step(s) run under this host-side emit.
     bool any_active = false;
     for (int i = 0; i < N; ++i) {
       if (done[(std::size_t)i]) { continue; }
@@ -1725,14 +1783,15 @@ RealtimeVqaStage::m_decode_batched_pipelined_(
       any_active = true;
     }
     if (!any_active) { break; }
-    // One GPU-pipelined step over ALL N branches (commit overlaps the host
-    // emit above with the GPU's forward); next() returns the N sampled ids.
-    if (!_lm->m_bdecode_commit() || !_lm->m_bdecode_next(toks)
+    // Drain the oldest in-flight step (the N sampled ids), then refill the
+    // pipeline so the next step's CPU encode overlaps the GPU.
+    if (!committed || !_lm->m_bdecode_next(toks)
         || static_cast<int>(toks.size()) != N) {
       break;
     }
     ++total_steps;
     for (int i = 0; i < N; ++i) { cur[(std::size_t)i] = toks[(std::size_t)i]; }
+    committed = _lm->m_bdecode_commit();
   }
   _lm->m_bdecode_end();
 
@@ -1789,8 +1848,22 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       log_scene_qa_(cam, first_ts_us, last_ts_us,
                     scene_description, answers);
     }
-    _m_prev_desc        = scene_description;
+    // Scene-overlap carry-over: stash the last frame/frame-pair's vision
+    // tokens (and their marker time) so the next scene, when temporally
+    // continuous, can re-issue them as its first frame. Captured before
+    // m_reset_scene_ clears _m_imgs; _m_prev_last_ts_us gates continuity.
+    // (On the main path the carried-in overlap frame is _m_imgs.front(),
+    // so back() is always this scene's own last real frame.)
     _m_prev_last_ts_us  = _m_last_ts_us;   // before reset clears it
+    if (_scene_overlap && !_m_imgs.empty()) {
+      _m_carry_img          = std::move(_m_imgs.back());
+      _m_carry_marker_ts_us =
+          _m_frame_ts_us.empty() ? _m_last_ts_us : _m_frame_ts_us.back();
+      _m_carry_real_ts_us   = _m_last_ts_us;
+      _m_has_carry          = true;
+    } else {
+      _m_has_carry = false;
+    }
     m_reset_scene_();
     co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(out)));
     ++_scenes_closed;
@@ -1810,15 +1883,42 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
   // for Qwen3-VL; distinct for Gemma-4).
   const std::int32_t video_pad = tpl->video_pad_token_id();
 
+  // Scene overlap: re-issue the previous scene's carried last frame as
+  // THIS scene's first frame when the two scenes are temporally
+  // continuous, so an action spanning the boundary stays visible to the
+  // VLM. The final audio sweep above already gated _scene_audio at the
+  // real first-frame ts, so only THIS scene's sounds are present; shifting
+  // the marker base below to the carried frame keeps the sound and video-
+  // frame markers aligned (audio sync).
+  bool overlapped = false;
+  if (_m_has_carry
+      && scenes_continuous_(_m_prev_last_ts_us, _m_first_ts_us)) {
+    _m_imgs.insert(_m_imgs.begin(), std::move(_m_carry_img));
+    _m_frame_ts_us.insert(_m_frame_ts_us.begin(), _m_carry_marker_ts_us);
+    overlapped = true;
+    ++_overlaps_applied;
+    session()->info(fmt(
+        "RealtimeVqaStage('{}'): scene {} overlap: re-issued previous "
+        "scene's last frame (real_ts_us={} [{}]) as frame 0",
+        this->id(), scene_idx, _m_carry_real_ts_us,
+        ts_human_(_m_carry_real_ts_us)));
+  }
+  _m_has_carry = false;   // a carried frame is consumed at most once
+
+  // Per-frame markers + token counts + grids over ALL prefill frames (the
+  // overlap frame, when present, is frame 0). base_ts is the front frame's
+  // marker -> the overlap frame sits at <0.0s> and this scene's own frames
+  // and sounds follow at their real offsets from it.
+  const std::size_t n_prefill = _m_imgs.size();
   std::vector<float> frame_ts_s;
   std::vector<int>   image_token_counts;
   std::vector<std::pair<int, int>> image_grids;
-  frame_ts_s.reserve(n_frames);
-  image_token_counts.reserve(n_frames);
-  image_grids.reserve(n_frames);
+  frame_ts_s.reserve(n_prefill);
+  image_token_counts.reserve(n_prefill);
+  image_grids.reserve(n_prefill);
   const std::uint64_t base_ts = _m_frame_ts_us.empty()
       ? 0 : _m_frame_ts_us.front();
-  for (std::size_t i = 0; i < n_frames; ++i) {
+  for (std::size_t i = 0; i < n_prefill; ++i) {
     const std::uint64_t t = (i < _m_frame_ts_us.size())
         ? _m_frame_ts_us[i] : base_ts;
     frame_ts_s.push_back(
@@ -1874,15 +1974,12 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
         phrase.empty() ? "(none)" : phrase));
   }
 
-  // User-turn preamble (date + prior-scene recap + sound text timeline),
-  // shared with the MLX path via build_preamble_ so they can't drift. The
-  // timeline now carries the interpreted audio phrase (above) as well as
-  // any FlexData sound tags.
-  // Recap only across temporally-continuous scenes (see prev_recap_).
-  const std::string prev_recap = prev_recap_(
-      _m_prev_desc, _m_prev_last_ts_us, _m_first_ts_us);
+  // User-turn preamble (local date/time + sound text timeline). Cross-
+  // scene continuity is now carried by the overlap frame (frame 0 above),
+  // not a textual recap. The timeline carries the interpreted audio phrase
+  // (above) as well as any FlexData sound tags, aligned to base_ts.
   const std::string pre = build_preamble_(
-      _m_first_ts_us, prev_recap, _scene_audio, base_ts,
+      _m_first_ts_us, _scene_audio, base_ts,
       /*audio_wired=*/ctx.num_iports() >= 3);
   const std::string describe_prompt =
       describe_prompt_for_(vqa_prompts_for_(effective_language_()), tpl);
@@ -1959,14 +2056,14 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       std::chrono::steady_clock::now() - t_prefix_start).count();
   session()->info(fmt(
       "RealtimeVqaStage('{}'): scene {} describe-prefix {} tok in "
-      "{:.3f} s ({:.1f} tok/s), {} frame{}, prev_summary={}",
+      "{:.3f} s ({:.1f} tok/s), {} frame{}, overlap={}",
       this->id(), scene_idx,
       static_cast<int>(describe_refs.size()), prefix_s,
       prefix_s > 0.0
           ? static_cast<double>(describe_refs.size()) / prefix_s
           : 0.0,
-      n_frames, n_frames == 1 ? "" : "s",
-      prev_recap.empty() ? "no" : "yes"));
+      n_prefill, n_prefill == 1 ? "" : "s",
+      overlapped ? "yes" : "no"));
   if (prefix_pred < 0) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): scene {} describe-prefix prefill "

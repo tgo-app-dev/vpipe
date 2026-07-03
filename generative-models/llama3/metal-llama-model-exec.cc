@@ -45,6 +45,21 @@ MetalLlamaModelExec::state_for_(ContextId ctx)
   return &_ctxmap.emplace(ctx.v, st).first->second;
 }
 
+int
+MetalLlamaModelExec::context_seq_len(ContextId ctx) const
+{
+  if (!_model) {
+    return 0;
+  }
+  // Read-only: an unmapped context has no KV yet -- do NOT lazily
+  // materialize one just to report its length.
+  auto it = _ctxmap.find(ctx.v);
+  if (it == _ctxmap.end()) {
+    return 0;
+  }
+  return _model->context_manager()->seq_len_of(it->second.metal_cid);
+}
+
 std::int32_t
 MetalLlamaModelExec::prefill(ContextId ctx, std::span<const std::int32_t> tokens)
 {

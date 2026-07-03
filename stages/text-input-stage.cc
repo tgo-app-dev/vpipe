@@ -34,6 +34,7 @@ TextInputStage::TextInputStage(const SessionContextIntf* s,
     }
   }
   _present_first_without_beat = attr_bool("present_first_without_beat");
+  _media = attr_bool("media");
 
   allocate_oports(spec().oports.size());
 }
@@ -46,6 +47,11 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "lines to read; 0 = read until EOF", .def_int = 0},
   {.key = "present_first_without_beat", .type = ConfigType::Bool,
    .doc = "first prompt skips iport beat wait", .def_bool = true},
+  {.key = "media", .type = ConfigType::Bool,
+   .doc = "prompt via getmedialine: the line may embed image/audio "
+          "attachments as media-line markers (fs path on stdio, "
+          "base64 via the web-ui attach/drop controls)",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional beat that gates the next "
@@ -73,6 +79,20 @@ const StageSpec&
 TextInputStage::spec() const noexcept
 {
   return kSpec;
+}
+
+Job
+TextInputStage::initialize(RuntimeContext&)
+{
+  // Per-launch reset. The stage object survives a stop/relaunch (only
+  // the runtime is destroyed), so without this a second launch would
+  // (a) skip the present_first_without_beat startup-deadlock breaker
+  // (_first_round_seen stuck true -> the first prompt waits for a
+  // feedback beat that can never arrive), and (b) count lines emitted
+  // in prior runs against this run's `count` budget.
+  _emitted          = 0;
+  _first_round_seen = false;
+  co_return;
 }
 
 Job
@@ -110,11 +130,17 @@ TextInputStage::process(RuntimeContext& ctx)
   // delegate owns prompt display, cooperative cancellation (it polls
   // the predicate so a pipeline stop is observed within ~50ms), and
   // the actual read -- stdin by default, or the browser console under
-  // the web-ui delegate.
+  // the web-ui delegate. With `media` set the read goes through
+  // getmedialine instead, telling the delegate the consumer accepts
+  // media-line attachment markers (the web-ui then offers attach/drop
+  // controls; on stdio the user types fs-path markers by hand). The
+  // emitted payload is the raw marker-bearing line either way --
+  // downstream (text-chat) parses the markers.
   string line;
-  UiInputStatus st = session()->getline(
-      fmt("{}", _prompt), line,
-      [&ctx] { return ctx.stop_requested(); });
+  auto cancel = [&ctx] { return ctx.stop_requested(); };
+  UiInputStatus st = _media
+      ? session()->getmedialine(fmt("{}", _prompt), line, cancel)
+      : session()->getline(fmt("{}", _prompt), line, cancel);
   if (st != UiInputStatus::Ok) {
     // Canceled (stop requested) or Eof (input closed): end the input
     // cycle cleanly so downstream consumers see EOS on their iport.

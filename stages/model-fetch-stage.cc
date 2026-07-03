@@ -161,6 +161,9 @@ struct ProgressCtx {
   int                  last_pct = -1;     // throttle: redraw on % change
   bool                 drawn    = false;  // emitted at least one frame
   curl_off_t           total    = 0;
+  // Poll predicate: when set and it returns true, the xferinfo callback
+  // aborts the transfer mid-flight (-> CURLE_ABORTED_BY_CALLBACK).
+  const std::function<bool()>* cancel = nullptr;
 };
 
 // libcurl CURLOPT_XFERINFOFUNCTION. Redraws the bar (carriage-return +
@@ -171,6 +174,7 @@ progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
              curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
 {
   auto* c = static_cast<ProgressCtx*>(p);
+  if (c && c->cancel && (*c->cancel)()) { return 1; }   // abort transfer
   if (!c || !c->stream || dltotal <= 0) {
     return 0;
   }
@@ -188,9 +192,9 @@ progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
 }
 
 // Shared easy-handle perform. `wcb`/`wdata` sink the body. Fills
-// `*http_status` with the response code. When `progress` is non-null
-// (and carries a stream) the transfer is run with the xferinfo bar.
-// Returns the CURLcode.
+// `*http_status` with the response code. When `progress` is non-null the
+// transfer runs with the xferinfo callback (it draws the bar when a stream
+// is set and/or polls the cancel predicate). Returns the CURLcode.
 CURLcode
 curl_perform_(const string& url, const string& token, bool verify_tls,
               long timeout_s, size_t (*wcb)(char*, size_t, size_t, void*),
@@ -210,7 +214,10 @@ curl_perform_(const string& url, const string& token, bool verify_tls,
   curl_easy_setopt(c, CURLOPT_URL, url.c_str());
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-  if (progress && progress->stream) {
+  if (progress) {
+    // Attach the xferinfo callback whenever a ProgressCtx is present -- it
+    // carries the bar stream and/or the cancel predicate (the callback
+    // no-ops the bar when no stream is set).
     curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, &progress_cb_);
     curl_easy_setopt(c, CURLOPT_XFERINFODATA, progress);
@@ -256,11 +263,14 @@ http_get_(const string& url, const string& token, bool verify_tls,
 // GET streaming to `dest` (parent dirs created). `*status` carries the
 // HTTP code; `err` set + false on failure. When `progress` is non-null,
 // a live progress bar is rendered to it for the duration of the
-// transfer.
+// transfer. When `cancel` is non-null it is polled mid-transfer; if it
+// returns true the transfer aborts (curl error -> the partial dest is
+// removed).
 bool
 http_download_(const string& url, const string& token, bool verify_tls,
                long timeout_s, const fs::path& dest, long& status,
-               string& err, vpipe::UiTextStream* progress)
+               string& err, vpipe::UiTextStream* progress,
+               const std::function<bool()>* cancel = nullptr)
 {
   std::error_code ec;
   fs::create_directories(dest.parent_path(), ec);
@@ -271,9 +281,10 @@ http_download_(const string& url, const string& token, bool verify_tls,
   }
   ProgressCtx pctx;
   pctx.stream = progress;
+  pctx.cancel = cancel;
   CURLcode rc = curl_perform_(url, token, verify_tls, timeout_s,
                               &write_to_ofstream_, &ofs, &status,
-                              progress ? &pctx : nullptr);
+                              (progress || cancel) ? &pctx : nullptr);
   ofs.close();
   if (rc != CURLE_OK) {
     err = curl_easy_strerror(rc);
@@ -422,7 +433,7 @@ const StageSpec kSpec = {
                "tokenizer.json natively, and register it in LMDB sub-db "
                "'models' keyed by the huggingface.co path. 0 in / 0 out.",
   .display_name = "Model Fetch",
-  .category  = StageCategory::Network,
+  .category  = StageCategory::Preparation,
   .iports    = {},
   .oports    = {},
   .attrs     = kAttrs,
@@ -438,7 +449,11 @@ ModelFetchStage::spec() const noexcept
 Job
 ModelFetchStage::process(RuntimeContext& ctx)
 {
-  auto cancel = [&ctx] { return ctx.stop_requested(); };
+  // Stable object (not a temporary) so its address can be threaded into the
+  // libcurl xferinfo callback to abort an in-flight transfer mid-download.
+  const std::function<bool()> cancel = [&ctx] {
+    return ctx.stop_requested();
+  };
   const SessionContextIntf* s = session();
 
   // -------- 1. Identify the model --------------------------------------
@@ -541,6 +556,62 @@ ModelFetchStage::process(RuntimeContext& ctx)
 
   s->info(fmt("ModelFetchStage('{}'): fetching '{}' -> '{}'",
               this->id(), hf_path, local_dir.string()));
+
+  // -------- 3b. Dataset fetch (eval datasets) -------------------------
+  // A catalogue entry carrying explicit dataset_files is fetched VERBATIM from
+  // the given URLs (the HF datasets-server /rows pages) into local_dir and
+  // registered -- no model-repo tree walk. Keeps dataset text out of the binary
+  // (the model-eval stage reads these rows-*.json pages on demand).
+  if (entry != nullptr && !entry->dataset_files.empty()) {
+    std::error_code ec;
+    fs::create_directories(local_dir, ec);
+    uint64_t total = 0;
+    FlexData files_arr = FlexData::make_array();
+    for (size_t i = 0; i < entry->dataset_files.size(); ++i) {
+      if (ctx.stop_requested()) {
+        s->error(fmt("ModelFetchStage('{}'): canceled", this->id()));
+      }
+      const string& url  = entry->dataset_files[i].first;
+      const string& dest = entry->dataset_files[i].second;
+      const fs::path out = local_dir / dest;
+      s->info(fmt("  [{}/{}] {} ...",
+                  i + 1, entry->dataset_files.size(), dest));
+      long st = 0;
+      string derr;
+      // Datasets-server is public -- no auth token needed.
+      if (!http_download_(url, string(), _verify_tls, _timeout_seconds, out,
+                          st, derr, nullptr, &cancel)) {
+        s->error(fmt("ModelFetchStage('{}'): dataset fetch '{}' failed: {}",
+                     this->id(), dest, derr));
+      }
+      files_arr.as_array().push_back(FlexData::make_string(dest));
+      total += static_cast<uint64_t>(fs::file_size(out, ec));
+    }
+    FlexData rec = FlexData::make_object();
+    auto ro = rec.as_object();
+    ro.insert_or_assign("local_path",
+                        FlexData::make_string(local_dir.string()));
+    ro.insert_or_assign("source_url",
+                        FlexData::make_string(
+                            "https://huggingface.co/datasets"));
+    ro.insert_or_assign("dataset", FlexData::make_bool(true));
+    ro.insert_or_assign("model_type",
+                        FlexData::make_string(entry->model_type));
+    ro.insert_or_assign("total_bytes", FlexData::make_uint(total));
+    ro.insert_or_assign("files", std::move(files_arr));
+    {
+      LmdbDb  db(*env, _db_name);
+      LmdbTxn txn(*env, LmdbTxn::Mode::ReadWrite);
+      const string bytes = rec.to_binary();
+      db.put(txn, reg_key, bytes);
+      txn.commit();
+    }
+    s->info(fmt(
+        "ModelFetchStage('{}'): dataset '{}' ({}) registered in sub-db '{}'",
+        this->id(), reg_key, human_bytes_(total), _db_name));
+    ctx.signal_done();
+    co_return;
+  }
 
   // -------- 4. Resolve auth token -------------------------------------
   string token = _hf_token;
@@ -655,7 +726,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
     long dl_status = 0;
     string dl_err;
     if (!http_download_(file_url, token, _verify_tls, _timeout_seconds,
-                        dest, dl_status, dl_err, bar.get())) {
+                        dest, dl_status, dl_err, bar.get(), &cancel)) {
       if (bar) { bar->end(); }
       s->error(fmt("ModelFetchStage('{}'): download of '{}' failed: {}",
                    this->id(), f.path, dl_err));
