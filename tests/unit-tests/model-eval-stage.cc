@@ -53,6 +53,29 @@ TEST(model_eval_stage, type_is_registered)
   EXPECT_TRUE(std::string_view(ModelEvalStage::kTypeName) == "model-eval");
 }
 
+// The stage exposes one trigger iport (any beat type) + one FlexData
+// summary oport so it can cascade into a preparation recipe / save-text.
+TEST(model_eval_stage, trigger_and_summary_ports)
+{
+  Session sess;
+  CerrSilencer hush;
+  ModelEvalStage s(&sess, "ev", std::vector<InEdge>{},
+                   cfg_("/tmp/m", nullptr));
+  const StageSpec& sp = s.spec();
+  ASSERT_TRUE(sp.iports.size() == 1u);
+  ASSERT_TRUE(sp.oports.size() == 1u);
+  EXPECT_TRUE(std::string_view(sp.iports[0].name) == "trigger");
+  EXPECT_TRUE(sp.iports[0].type == nullptr);          // any beat type
+  EXPECT_TRUE(std::string_view(sp.oports[0].name) == "summary");
+  // Compare by mangled name, not typeid pointer: the stage lives in
+  // libvpipe while the test runs in a separate image, so the two
+  // &typeid(FlexDataPayload) addresses differ (runtime port matching is
+  // all within libvpipe, so it is unaffected).
+  ASSERT_TRUE(sp.oports[0].type != nullptr);
+  EXPECT_TRUE(std::string_view(sp.oports[0].type->name())
+              == typeid(FlexDataPayload).name());
+}
+
 TEST(model_eval_stage, config_defaults)
 {
   Session sess;
@@ -263,6 +286,107 @@ TEST(model_eval_stage, moss_tts_local_perplexity)
   EXPECT_TRUE(r.n_tokens > 0);
   EXPECT_TRUE(std::isfinite(r.perplexity));
   EXPECT_TRUE(r.perplexity > 1.0);
+}
+
+// MOSS-TTS-Realtime backbone (arch "MossTTSRealtime"): loads through
+// GenerativeModelManager as a Qwen3-1.7B text LM (shape from language_config,
+// head tied to language_model.embed_tokens == the text embed) and runs a text
+// forward. Like v1.5, its tied-embedding "head" is NOT a natural-language
+// predictor -- absolute PPL is meaningless/huge (use divergence for real quant
+// eval); this only asserts the recognition/parse/tied-head plumbing LOADS and
+// the forward produces scored [vocab] logits. Gated on
+// VPIPE_MOSS_TTS_REALTIME_MODEL (the bf16 OR 8-bit dir).
+TEST(model_eval_stage, moss_tts_realtime_perplexity)
+{
+  const char* m = std::getenv("VPIPE_MOSS_TTS_REALTIME_MODEL");
+  if (m == nullptr || *m == '\0') { return; }
+  if (!std::filesystem::exists(std::filesystem::path(m) / "config.json")) {
+    return;
+  }
+  Session sess;
+  CerrSilencer hush;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  genai::GenerativeModelManager mgr(&sess);
+  genai::LoadSpec spec;
+  spec.hf_dir = m;
+  std::shared_ptr<genai::LoadedLanguageModel> lm = mgr.load(spec);
+  ASSERT_TRUE(lm != nullptr);
+  ASSERT_TRUE(lm->valid());
+
+  static const char kText[] =
+      "The quick brown fox jumps over the lazy dog. Paris is the capital "
+      "of France, and the Eiffel Tower stands beside the river Seine.";
+  genai::PerplexityResult r =
+      genai::eval_wikitext2_perplexity(*lm, kText, 128, &sess);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.n_tokens > 0);
+  EXPECT_TRUE(std::isfinite(r.perplexity));
+  EXPECT_TRUE(r.perplexity > 1.0);
+}
+
+// The MEANINGFUL eval for the realtime TTS backbone: A/B divergence of the
+// 8-bit-quantized backbone vs the bf16 reference (quantization error). Captures
+// the bf16 logits, quantizes on the fly to 8-bit (embeds/tied-head stay bf16),
+// loads the quantized dir, and compares. Gated on VPIPE_MOSS_TTS_REALTIME_MODEL
+// pointing at the UNQUANTIZED bf16 dir (skips a dir that already has a
+// quantization block).
+TEST(model_eval_stage, moss_tts_realtime_quantized_diverges)
+{
+  const char* m = std::getenv("VPIPE_MOSS_TTS_REALTIME_MODEL");
+  if (m == nullptr || *m == '\0') { return; }
+  if (!std::filesystem::exists(std::filesystem::path(m) / "config.json")) {
+    return;
+  }
+  Session sess;
+  CerrSilencer hush;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  static const char kText[] =
+      "The quick brown fox jumps over the lazy dog. Paris is the capital "
+      "of France. Water boils at one hundred degrees Celsius at sea level.";
+
+  // Capture the bf16 reference logits (model A). Skip if `m` is not raw bf16.
+  std::vector<std::int32_t> ids;
+  std::vector<float> a_logits;
+  int a_n = 0, a_vocab = 0;
+  {
+    genai::GenerativeModelManager mgr(&sess);
+    genai::LoadSpec spec;
+    spec.hf_dir = m;
+    std::shared_ptr<genai::LoadedLanguageModel> lm = mgr.load(spec);
+    ASSERT_TRUE(lm != nullptr && lm->valid());
+    ASSERT_TRUE(genai::capture_token_logits(*lm, kText, 48, ids, a_logits,
+                                            a_n, a_vocab, &sess));
+    ASSERT_TRUE(a_n > 0 && a_vocab > 0);
+  }
+
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path qdir = fs::temp_directory_path() /
+      ("vpipe-moss-rt-q8-" + std::to_string(::getpid()));
+  fs::remove_all(qdir, ec);
+  {
+    genai::ModelQuantizer mq(sess.metal_compute());
+    genai::QuantizeOptions opt;   // 8-bit g64; quant_embeddings/norm_offset off
+    opt.bits = 8; opt.group = 64;
+    std::string err;
+    if (!mq.run(m, qdir.string(), opt, &err)) { return; }  // m wasn't raw bf16
+  }
+
+  genai::GenerativeModelManager mgr(&sess);
+  genai::LoadSpec spec;
+  spec.hf_dir = qdir.string();
+  std::shared_ptr<genai::LoadedLanguageModel> lm = mgr.load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  genai::AbDivergenceResult d =
+      genai::ab_divergence(*lm, ids, a_logits, a_n, a_vocab, &sess);
+  fs::remove_all(qdir, ec);
+  ASSERT_TRUE(d.ok);
+  std::fprintf(stderr, "[moss-rt 8-bit vs bf16] KL=%.6f rel_l2=%.6f\n",
+               d.kl, d.rel_l2);
+  EXPECT_TRUE(std::isfinite(d.kl) && d.kl >= 0.0 && d.kl < 50.0);
+  EXPECT_TRUE(std::isfinite(d.rel_l2) && d.rel_l2 >= 0.0);
 }
 
 // A model-quantize'd MOSS (AFFINE backbone, bf16 embed/tied-head) must LOAD

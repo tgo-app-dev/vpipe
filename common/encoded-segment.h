@@ -57,6 +57,14 @@ struct EncodedSegment {
   unsigned    codec_id    = 0;            // AV_CODEC_ID_* value
   unsigned    width       = 0;            // video only
   unsigned    height      = 0;            // video only
+  // Source frame rate as a rational (fps = fps_num / fps_den), video
+  // only. Taken from the input stream's avg_frame_rate (else
+  // r_frame_rate); 0/0 when the source did not advertise one.
+  // Downstream decoders (video-to-rgb) forward this onto each emitted
+  // frame's TensorBeat sideband so a sink (hls-broadcast) can adopt the
+  // original cadence without a hard-coded default.
+  unsigned    fps_num     = 0;            // video only
+  unsigned    fps_den     = 0;            // video only
   unsigned    sample_rate = 0;            // audio only
   unsigned    channels    = 0;            // audio only
 

@@ -170,6 +170,35 @@ TEST(pipeline_handle, insert_stage_oport_index_out_of_range) {
   EXPECT_TRUE(cap->warns >= 1u);
 }
 
+TEST(pipeline_handle, insert_stage_allows_disconnected_iport) {
+  // A null StageHandle in the iports list marks a DISCONNECTED
+  // (optional) iport and keeps its positional slot unwired -- the
+  // building block the web-ui composer uses for gapped inputs.
+  Session sess(make_unique<SilentLogDelegate>());
+
+  PipelineHandle pl = sess.create_pipeline("p");
+  StageHandle src = pl.insert_stage(
+      "chrono", "src", {},
+      R"({"frequency_hz": 10.0, "count": 1})");
+  ASSERT_TRUE(src.valid());
+
+  // detection-overlay has 3 iports; wire iport 1, leave iport 0 (and 2)
+  // disconnected via null StageHandles. (No launch, so the placeholder
+  // type mismatch on the wired port is irrelevant here.)
+  StageHandle ov = pl.insert_stage(
+      "detection-overlay", "ov",
+      { StagePortHandle{ StageHandle{}, 0u },
+        StagePortHandle{ src, 0u } },
+      "{}");
+  ASSERT_TRUE(ov.valid());
+
+  Stage* s = live_stage_(pl, "ov");
+  ASSERT_TRUE(s != nullptr);
+  ASSERT_TRUE(s->num_iports() == 2u);
+  EXPECT_TRUE(s->iport_edges()[0].v == nullptr);   // the gap
+  EXPECT_TRUE(s->iport_edges()[1].v != nullptr);   // wired to src
+}
+
 TEST(pipeline_handle, insert_stage_invalid_json_returns_null) {
   auto delegate = make_unique<CountingDelegate>();
   CountingDelegate* cap = delegate.get();

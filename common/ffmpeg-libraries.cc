@@ -185,7 +185,7 @@ find_first_loadable_(const SessionContextIntf*  session,
     void* h = ::dlopen(c, RTLD_NOW | RTLD_LOCAL);
     if (h) {
       ::dlclose(h);
-      session->info(fmt("{}: using '{}'", lib_name, c));
+      session->log_normal(fmt("{}: using '{}'", lib_name, c));
       return string(c);
     }
   }
@@ -345,6 +345,7 @@ LibAvFormat::LibAvFormat(const SessionContextIntf* s, LoadMode mode)
   VPIPE_RESOLVE(write_header,             "avformat_write_header");
   VPIPE_RESOLVE(write_trailer,            "av_write_trailer");
   VPIPE_RESOLVE(interleaved_write_frame,  "av_interleaved_write_frame");
+  VPIPE_RESOLVE(write_frame,              "av_write_frame");
   VPIPE_RESOLVE(avio_open,                "avio_open");
   VPIPE_RESOLVE(avio_closep,              "avio_closep");
   VPIPE_RESOLVE(avio_alloc_context,       "avio_alloc_context");

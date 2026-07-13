@@ -1,11 +1,14 @@
 // Pipeline Manager view: three panes -- pipeline list (1/4), stage
 // graph (1/2), and the config panel (1/4).
 
-import { el, clear, append, toast, openModal, kbd } from '../dom.js';
+import { el, clear, append, toast, openModal, openMenu, kbd }
+  from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
-import { renderGraph, applyBufferStats, shortType } from '../graph.js';
+import { renderGraph, applyBufferStats, shortType, worldToPin }
+  from '../graph.js';
 import { t, tOr } from '../i18n.js';
+import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
 
 export function mountPipelineManager(container) {
   const state = {
@@ -21,6 +24,16 @@ export function mountPipelineManager(container) {
     pending: null,
     selectedEdge: null,
     graphView: {},        // pan/zoom {k,cx,cy}; reset (new {}) per pipeline
+    // Previous layout's node positions (id -> {x,y,...}), fed back into
+    // the next render so re-layout is placement-aware (minimal movement)
+    // and can animate the reflow. Reset (null) per pipeline so a fresh
+    // pipeline lays out clean with no phantom glide.
+    graphLayout: null,
+    // User-placed drop pins (stageId -> {col, y}): where the operator
+    // dropped a new stage from the toolbox. Honoured by the layout as a
+    // column floor + row seed so the chosen grid cell survives. Cleared
+    // per pipeline.
+    graphPins: new Map(),
     graphContainer: null, // live element from renderGraph (overlay target)
     // Buffer-utilization overlay: poll the running pipeline's per-edge
     // backlog/capacity and annotate the graph. Enabled by default so a
@@ -54,13 +67,16 @@ export function mountPipelineManager(container) {
 
   const btnCreate = iconBtn('plus',  t('common.create'), () => onCreate(), 'N');
   const btnLoad   = iconBtn('load',  t('common.load'),   () => onLoad(),   'O');
+  const btnRename = iconBtn('edit',  t('common.rename'),
+                            () => onRenamePipeline(), 'R');
   const btnSave   = iconBtn('save',  t('common.save'),   () => onSave(),   'S');
   const btnUnload = iconBtn('trash', t('common.unload'), () => onUnload(), 'U');
 
   const listPane = el('div', { class: 'pane' },
     el('div', { class: 'pane-head' },
       el('span', { class: 'title' }, t('nav.pipelines'))),
-    el('div', { class: 'toolbar' }, btnCreate, btnLoad, btnSave, btnUnload),
+    el('div', { class: 'toolbar' },
+      btnCreate, btnLoad, btnRename, btnSave, btnUnload),
     listBody);
 
 
@@ -143,7 +159,9 @@ export function mountPipelineManager(container) {
   const graphPane = el('div', { class: 'pane' }, graphHead, graphSplit);
 
   // Drag-create: accept a stage-type drop anywhere on the canvas. The
-  // auto-layout positions the new node, so the drop point isn't used.
+  // drop point is mapped to a grid cell and pinned, so a new (edge-less)
+  // stage lands where the operator put it -- handy for pre-positioning it
+  // next to what it will connect to.
   graphBody.addEventListener('dragover', (e) => {
     if (!canEdit()) { return; }
     e.preventDefault();
@@ -163,7 +181,14 @@ export function mountPipelineManager(container) {
       return;
     }
     if (dropType && state.stageTypes.some((s) => s.type === dropType)) {
-      promptCreateStage(dropType);
+      // Map the drop point to a world coordinate (null when the canvas is
+      // empty / has no graph yet -> auto-place). worldToPin snaps + caps it.
+      let world = null;
+      const gc = state.graphContainer;
+      if (gc && gc.clientToWorld && state.graphLayout) {
+        world = gc.clientToWorld({ clientX: e.clientX, clientY: e.clientY });
+      }
+      promptCreateStage(dropType, world);
     }
   });
 
@@ -244,6 +269,8 @@ export function mountPipelineManager(container) {
       state.detail = null;
       state.selectedStage = null;
       state.graphView = {};   // refit when the selected pipeline changes
+      state.graphLayout = null;   // lay out the new pipeline clean (no glide)
+      state.graphPins = new Map();
     }
     renderList();
     if (state.selectedId) { await loadDetail(state.selectedId); }
@@ -269,6 +296,8 @@ export function mountPipelineManager(container) {
     state.pending = null;
     state.selectedEdge = null;
     state.graphView = {};   // refit the graph for the newly-selected pipeline
+    state.graphLayout = null;   // lay out the new pipeline clean (no glide)
+    state.graphPins = new Map();
     renderList();
     await loadDetail(id);
   }
@@ -377,7 +406,8 @@ export function mountPipelineManager(container) {
         t('pl.no_pipelines')));
     }
     listBody.append(ul);
-    btnSave.disabled = btnUnload.disabled = !state.selectedId;
+    btnSave.disabled = btnUnload.disabled = btnRename.disabled =
+      !state.selectedId;
   }
 
   function actIcon(icon, title, enabled, onclick) {
@@ -415,7 +445,7 @@ export function mountPipelineManager(container) {
   }
 
   // --- middle pane --------------------------------------------------
-  function renderGraphPane() {
+  function renderGraphPane(o = {}) {
     clear(graphBody);
     state.graphContainer = null;   // old overlay target is gone
     const editable = canEdit();
@@ -443,10 +473,28 @@ export function mountPipelineManager(container) {
         selected: state.selectedStage,
         onSelect: (sid) => selectStage(sid),
         view: state.graphView,
+        // Placement-aware re-layout + reflow animation: feed the previous
+        // positions in, capture the fresh ones for next time.
+        seedPos: state.graphLayout,
+        onLayout: (pos) => { state.graphLayout = pos; },
+        pins: state.graphPins,   // user drop-placements (column floor + row)
+        // One-shot fresh (tidy) re-layout, triggered by Auto-arrange.
+        freshLayout: !!o.fresh,
+        // Drag-to-move a stage (persists as a pin) + the Auto-arrange
+        // control next to the view buttons.
+        onNodeMove,
+        onAutoArrange: autoArrange,
+        onNodeContext,
         editable,
         pending: state.pending,
         pendingType: state.pending
           ? portType(nodeById(state.pending.from), 'out',
+                     state.pending.from_port)
+          : null,
+        // Tags of the armed output (for dimming tag-incompatible inputs
+        // on top of the beat-type filter).
+        pendingTags: state.pending
+          ? portTags(nodeById(state.pending.from), 'out',
                      state.pending.from_port)
           : null,
         selectedEdge: state.selectedEdge,
@@ -477,8 +525,9 @@ export function mountPipelineManager(container) {
   }
 
   // Category display order + labels for the toolbox sections.
-  const CATEGORY_ORDER = ['preparation', 'video', 'audio', 'text', 'network',
-                          'control', 'database', 'generic'];
+  const CATEGORY_ORDER = ['preparation', 'visual', 'vision', 'generative',
+                          'audio', 'text', 'network', 'control', 'database',
+                          'generic'];
 
   function stageChip(s) {
     const ins = (s.iports || []).length;
@@ -561,6 +610,28 @@ export function mountPipelineManager(container) {
   function typesCompatible(a, b) {
     return !a || !b || a === 'any' || b === 'any' || a === b;
   }
+  // Parse a comma-separated tag list into a trimmed, non-empty array.
+  function parseTags(s) {
+    return (s || '').split(',').map((x) => x.trim()).filter(Boolean);
+  }
+  // Declared payload tags of a port (finer constraint on the beat type).
+  // Prefer the live port's tags; fall back to the stage spec's declared
+  // port at that index. Empty array = no tag constraint.
+  function portTags(node, kind, idx) {
+    if (!node) { return []; }
+    const live = kind === 'in' ? node.iports : node.oports;
+    if (idx < live.length && live[idx] && live[idx].tags !== undefined) {
+      return parseTags(live[idx].tags);
+    }
+    const sp = specForType(node.type);
+    const decl = sp ? (kind === 'in' ? sp.iports : sp.oports) : null;
+    return parseTags(decl && decl[idx] && decl[idx].tags);
+  }
+  // Tag compatibility (OR semantics): compatible when either side is
+  // untagged, else when the two tag sets intersect.
+  function tagsCompatible(a, b) {
+    return !a.length || !b.length || a.some((x) => b.includes(x));
+  }
 
   // Input-port slots to render for a node: the stage spec's declared
   // iports (named + typed, indexed), widened to the wired count so an
@@ -580,6 +651,7 @@ export function mountPipelineManager(container) {
       slots.push({
         name: (d && d.name) || '',
         type: (d && d.type) || (l && l.type) || 'any',
+        tags: (d && d.tags) || (l && l.tags) || '',
         doc:  (d && d.doc) || '',
       });
     }
@@ -604,7 +676,10 @@ export function mountPipelineManager(container) {
     return type + '-' + i;
   }
 
-  function promptCreateStage(type) {
+  // `dropWorld` (optional) is the {x,y} world point the stage was dropped
+  // at; when given, the new stage is pinned to that grid cell (column
+  // floor + row) so its placement is honoured.
+  function promptCreateStage(type, dropWorld) {
     if (!canEdit()) {
       toast(t('pl.select_stopped'), 'error');
       return;
@@ -625,6 +700,14 @@ export function mountPipelineManager(container) {
               state.detail = await api.insertStage(state.selectedId, {
                 id, type, iports: [], config: {} });
               c();
+              // Pin the new stage to the dropped grid cell (snapped +
+              // distance-capped) so the layout honours where the operator
+              // put it. No drop point (toolbar add / empty canvas) ->
+              // auto-place as before.
+              if (dropWorld) {
+                state.graphPins.set(id, worldToPin(dropWorld,
+                  state.graphLayout));
+              }
               state.selectedStage = id;
               state.pending = null;
               state.selectedEdge = null;
@@ -663,18 +746,13 @@ export function mountPipelineManager(container) {
       renderGraphPane();
       return;
     }
-    // kind === 'in': complete the connection (re-point this input, or
-    // fill the next free slot). Inputs are stored densely and fill in
-    // index order, so a click on a slot past the next free one is
-    // refused with a hint rather than erroring at the server.
+    // kind === 'in': complete the connection. Iports are positional and
+    // may be gapped -- the core wires a higher-indexed input while a
+    // lower one stays unconnected (it pads the skipped lower slots as
+    // gaps), so any declared slot is connectable in any order. Wiring an
+    // already-wired slot re-points it.
     if (!state.pending) {
       toast(t('pl.wire_output_first'), 'info');
-      return;
-    }
-    const node = nodeById(stageId);
-    const liveCount = node ? node.iports.length : 0;
-    if (idx > liveCount) {
-      toast(t('pl.wire_in_order', { n: liveCount }), 'info');
       return;
     }
     if (!checkCompatible(stageId, idx)) { return; }
@@ -708,6 +786,16 @@ export function mountPipelineManager(container) {
               { from: shortType(ot), to: shortType(it) }), 'error');
       return false;
     }
+    // Deeper check: payload tags (finer than the beat type; OR semantics).
+    const otg = portTags(nodeById(state.pending.from), 'out',
+                         state.pending.from_port);
+    const itg = portTags(nodeById(toId), 'in', toPort);
+    if (!tagsCompatible(otg, itg)) {
+      toast(t('pl.incompatible_tags',
+              { from: otg.join(', ') || '—', to: itg.join(', ') || '—' }),
+            'error');
+      return false;
+    }
     return true;
   }
 
@@ -730,6 +818,13 @@ export function mountPipelineManager(container) {
 
   async function doDisconnect(to, to_port) {
     try {
+      // Freeze the consumer where it currently sits: losing an input edge
+      // would otherwise drop it to column 0 on the re-layout. Pin its
+      // present cell so it stays put (Auto-arrange re-tidies later).
+      if (state.graphLayout && state.graphLayout.get(to)) {
+        const p = state.graphLayout.get(to);
+        state.graphPins.set(to, { col: p.rank || 0, y: p.y });
+      }
       state.detail = await api.stageDisconnect(state.selectedId,
                                                { to, to_port });
       state.selectedEdge = null;
@@ -752,11 +847,53 @@ export function mountPipelineManager(container) {
     if (state.pending) { state.pending = null; renderGraphPane(); }
   }
 
+  // A stage was dragged to a new spot: persist it as a pin (so a later
+  // re-layout keeps the placement) and update the stored positions in
+  // place. Deliberately does NOT re-render -- the node already sits at its
+  // snapped position and nothing else on the canvas should shift.
+  function onNodeMove(id, pin, pos) {
+    state.graphPins.set(id, pin);
+    if (state.graphLayout) {
+      const cur = state.graphLayout.get(id);
+      if (cur) {
+        state.graphLayout.set(id, { ...cur, x: pos.x, y: pos.y });
+      }
+    }
+  }
+
+  // Auto-arrange: drop every manual placement (drag pins, drop pins,
+  // disconnect freezes) and re-run a fresh tidy layout, gliding from the
+  // current positions so the tidy-up is visible.
+  function autoArrange() {
+    if (!state.detail || !state.detail.graph.nodes.length) { return; }
+    state.graphPins = new Map();
+    renderGraphPane({ fresh: true });
+  }
+
+  // Toggle the selected-node highlight in the LIVE graph without a
+  // re-layout, so a stage the user hand-placed keeps its spot when they
+  // click it (only Auto-arrange should reshuffle). Returns false when there
+  // is no live graph to patch (caller falls back to a full render).
+  function patchSelection(sid) {
+    const gc = state.graphContainer;
+    if (!gc) { return false; }
+    gc.querySelectorAll('.gnode').forEach((elm) => {
+      elm.classList.toggle('selected', elm.dataset.id === sid);
+    });
+    return true;
+  }
+
   async function selectStage(sid) {
     state.selectedStage = sid;
+    // If an edge/arming overlay is showing it must be cleared, which needs
+    // a real re-render; otherwise just repaint the highlight in place so
+    // dragged positions are preserved.
+    const hadOverlay = !!(state.selectedEdge || state.pending);
     state.selectedEdge = null;
     state.pending = null;
-    renderGraphPane();
+    if (hadOverlay || !patchSelection(sid)) {
+      renderGraphPane();
+    }
     await renderConfig();
   }
 
@@ -834,6 +971,119 @@ export function mountPipelineManager(container) {
   // it's absent we fall back to "show whatever current is" so the
   // editor doesn't strand the user with empty inputs against an
   // un-upgraded server.
+  // Compatibility-aware model browser for a `suggest_db="models"` field.
+  // Lists installed models filtered by (a) the field's model_type allow-
+  // list (suggest_db_type) and (b) parent-model compatibility: a supplement
+  // (vision tower / LoRA) is shown only when the parent model chosen in a
+  // sibling field of this form matches its parent_model_type (+ size).
+  // Picking a model sets the field via onPick(key).
+  async function openModelBrowser(field, input, onPick) {
+    let data;
+    try {
+      data = await api.modelsInstalled();
+    } catch (e) {
+      toast(t('pl.mb_failed', { msg: e.message }), 'error');
+      return;
+    }
+    const all = (data && data.models) ? data.models : [];
+
+    // (a) Stage compatibility: the field's model_type allow-list (untyped
+    // fields show plain models only -- hide datasets + bare supplements)
+    // AND its required I/O modalities (need_inputs / need_outputs): a
+    // model's inputs must cover every required input, its outputs every
+    // required output. E.g. text-chat's LM field requires text->text.
+    const allowed = (field.suggest_db_type || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const needIn = (field.need_inputs || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const needOut = (field.need_outputs || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const ioOk = (m) =>
+      needIn.every((x) => (m.inputs || []).includes(x))
+      && needOut.every((x) => (m.outputs || []).includes(x));
+    const stageOk = (m) => (allowed.length
+      ? allowed.includes(m.model_type)
+      : (m.category || 'model') === 'model') && ioOk(m);
+
+    // (b) Parent compatibility: the installed models currently selected in
+    // OTHER fields of this config form (value matches an installed model
+    // key / hf_path) are candidate parents.
+    const chosen = new Set();
+    document.querySelectorAll('[id^="f_"]').forEach((elm) => {
+      if (elm === input) { return; }
+      const v = (elm.value || '').trim();
+      if (v) { chosen.add(v); }
+    });
+    const parents = all.filter(
+      (m) => chosen.has(m.key) || chosen.has(m.hf_path));
+    const parentOk = (m) => {
+      if (!m.parent_model_type) { return true; }   // not a supplement
+      if (!parents.length) { return true; }         // no parent chosen yet
+      return parents.some((p) => p.model_type === m.parent_model_type
+        && (!m.parent_param_class
+            // Case-insensitive: a registry record written before the catalog
+            // switched "e4b" -> "E4B" still matches the tower's "E4B".
+            || m.parent_param_class.toLowerCase()
+                 === (p.param_class || '').toLowerCase()));
+    };
+
+    const compatible = all.filter((m) => stageOk(m) && parentOk(m));
+
+    let closeModal = () => {};
+    const groups = [
+      ['model', t('pl.mb_g_models')],
+      ['supplement', t('pl.mb_g_supplements')],
+      ['dataset', t('pl.mb_g_datasets')],
+    ];
+    const bodyEl = el('div', { class: 'model-browser' });
+    if (!compatible.length) {
+      bodyEl.append(el('div', { class: 'mb-empty' }, t('pl.mb_empty')));
+    } else {
+      for (const [cat, label] of groups) {
+        const items = compatible.filter(
+          (m) => (m.category || 'model') === cat);
+        if (!items.length) { continue; }
+        bodyEl.append(el('div', { class: 'mb-group' }, label));
+        const list = el('div', { class: 'mb-list' });
+        for (const m of items) {
+          list.append(modelCard(m, () => { onPick(m.key); closeModal(); }));
+        }
+        bodyEl.append(list);
+      }
+    }
+    closeModal = openModal({
+      title: t('pl.mb_title'),
+      className: 'model-browser-modal',
+      body: bodyEl,
+      actions: [{ label: t('common.close'), cancel: true,
+        onClick: (c) => c() }],
+    });
+  }
+
+  // One model row in the browser: name/variant, model_type + size, the
+  // parent it attaches to (supplements), and in→out modality badges.
+  function modelCard(m, onClick) {
+    const io = (arr) => ((arr && arr.length)
+      ? arr.map((x) => el('span', { class: 'mb-badge mb-' + x }, x))
+      : [el('span', { class: 'mb-badge mb-none' }, '—')]);
+    const sub = [m.model_type,
+      [m.family, m.param_class].filter(Boolean).join(' ')]
+      .filter(Boolean).join(' · ');
+    const parentNote = m.parent_model_type
+      ? el('span', { class: 'mb-parent' },
+          t('pl.mb_attaches', { p: m.parent_model_type
+            + (m.parent_param_class ? ' ' + m.parent_param_class : '') }))
+      : null;
+    return el('button', { class: 'mb-card', type: 'button', onclick: onClick },
+      el('div', { class: 'mb-card-main' },
+        el('div', { class: 'mb-name', title: m.key }, m.variant || m.key),
+        el('div', { class: 'mb-sub' }, sub, parentNote)),
+      el('div', { class: 'mb-io' },
+        el('span', { class: 'mb-io-set' }, io(m.inputs)),
+        el('span', { class: 'mb-io-arrow' }, '→'),
+        el('span', { class: 'mb-io-set' }, io(m.outputs))));
+  }
+
   function configField(f, disabled, type) {
     const id = 'f_' + f.key;
     const placeholder = f.default !== undefined && f.default !== null
@@ -843,7 +1093,7 @@ export function mountPipelineManager(container) {
     const present = f.present !== undefined
         ? !!f.present
         : (f.current !== undefined && f.current !== null);
-    let input, read, unsetBtn = null, datalist = null;
+    let input, read, unsetBtn = null, datalist = null, browseBtn = null;
     if (f.type === 'bool') {
       // Two-state checkbox + an "unset" badge that toggles tri-state
       // by removing the field entirely on the next read.
@@ -883,7 +1133,9 @@ export function mountPipelineManager(container) {
       // keys as a datalist dropdown. Free text is still allowed (e.g.
       // hf_dir also accepts a filesystem path). Best-effort -- the field
       // stays usable if the keys can't be fetched.
-      if (f.suggest_db) {
+      // The "models" sub-db is handled by the compatibility-aware model
+      // browser instead (Browse button below), so skip the datalist there.
+      if (f.suggest_db && f.suggest_db !== 'models') {
         const dlId = id + '_dl';
         datalist = el('datalist', { id: dlId });
         input.setAttribute('list', dlId);
@@ -975,12 +1227,73 @@ export function mountPipelineManager(container) {
         disabled, onclick: () => { input.value = ''; input.focus(); } },
         t('pl.btn_clear'));
     }
+    // Filesystem-path fields (backend `is_path`) get a Browse… button
+    // that opens the sandbox-aware file dialog. String fields take the
+    // single picked path; array/any fields (e.g. load-image `url`) let
+    // the user add several, appended into the field's JSON array.
+    if (f.is_path && !disabled) {
+      const isMulti = f.type !== 'string';
+      const openBrowser = () => {
+        let seedDir = '';
+        if (f.type === 'string') {
+          seedDir = splitPath(input.value.trim()).dir;
+        } else {
+          try {
+            const v = JSON.parse(input.value.trim() || '[]');
+            const arr = Array.isArray(v) ? v : [v];
+            if (arr.length) { seedDir = splitPath(String(arr[arr.length - 1])).dir; }
+          } catch (e) { /* leave default */ }
+        }
+        openFsDialog({
+          mode: f.path_write ? 'save' : 'open',
+          kind: f.path_kind === 'dir' ? 'dir' : 'file',
+          multi: isMulti,
+          filters: filterForCategory(f.path_filter),
+          startDir: seedDir,
+          onPick: (picked) => {
+            if (f.type === 'string') {
+              input.value = picked;
+            } else {
+              const paths = Array.isArray(picked) ? picked : [picked];
+              let arr = [];
+              const cur = input.value.trim();
+              if (cur) {
+                try {
+                  const v = JSON.parse(cur);
+                  arr = Array.isArray(v) ? v : [v];
+                } catch (e) { arr = [cur]; }
+              }
+              arr.push(...paths);
+              input.value = JSON.stringify(arr, null, 2);
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+          },
+        });
+      };
+      browseBtn = el('button', { class: 'btn ghost mini browse',
+        type: 'button', title: t('fs.browse'), onclick: openBrowser },
+        makeIcon('folder', 'sm'));
+    }
+    // Model fields (schema `suggest_db="models"`) get a compatibility-aware
+    // model browser instead of a datalist: it lists only installed models
+    // matching the field's model_type(s) AND the parent model chosen in a
+    // sibling field. Free text is still allowed in the input.
+    if (f.suggest_db === 'models' && f.type === 'string' && !disabled) {
+      browseBtn = el('button', { class: 'btn ghost mini browse',
+        type: 'button', title: t('pl.mb_browse'),
+        onclick: () => openModelBrowser(f, input, (val) => {
+          input.value = val;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }) },
+        makeIcon('database', 'sm'));
+    }
     const label = el('label', { for: id },
       el('span', { class: 'key' }, f.key),
       f.required ? el('span', { class: 'req' }, '*') : null,
       el('span', { class: 'ty' }, f.type));
     const inputRow = el('div', { class: 'field-input-row' }, input);
     if (datalist) { inputRow.append(datalist); }
+    if (browseBtn) { inputRow.append(browseBtn); }
     if (unsetBtn) { inputRow.append(unsetBtn); }
     const field = el('div', { class: 'field' }, label, inputRow);
     const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
@@ -1040,6 +1353,35 @@ export function mountPipelineManager(container) {
     setTimeout(() => idIn.focus(), 0);
   }
 
+  function onRenamePipeline() {
+    if (!state.selectedId) { return; }
+    if (!canEdit()) { toast(t('pl.rename_pl_stopped'), 'error'); return; }
+    const old = state.selectedId;
+    const idIn = el('input', { type: 'text', value: old });
+    openModal({
+      title: t('pl.rename_pl_title'),
+      body: el('div', {}, el('label', { class: 'fl' }, t('pl.new_id')), idIn),
+      actions: [
+        { label: t('common.cancel'), cancel: true, onClick: (c) => c() },
+        { label: t('common.rename'), kind: 'primary', onClick: async (c) => {
+            const to = idIn.value.trim();
+            if (!to) { toast(t('pl.id_required'), 'error'); return; }
+            if (to === old) { c(); return; }
+            try {
+              await api.renamePipeline(old, to);
+              c();
+              state.selectedId = to;   // stage positions/pins survive
+              await refreshList();
+              toast(t('pl.pl_renamed', { from: old, to }), 'ok');
+            } catch (e) {
+              toast(t('pl.rename_failed', { msg: e.message }), 'error');
+            }
+          } },
+      ],
+    });
+    setTimeout(() => { idIn.focus(); idIn.select(); }, 0);
+  }
+
   // Append ".vpipeline" when the basename has no extension. Free-form
   // paths with any other extension pass through untouched, satisfying
   // the "still okay to specify a non-.vpipeline path" requirement.
@@ -1053,89 +1395,46 @@ export function mountPipelineManager(container) {
     return p;
   }
 
-  async function onLoad() {
-    // Pull the cwd file list up front so the input's <datalist> is
-    // populated before the user starts typing. Best-effort: if the
-    // endpoint isn't there (older server, fetch error) the dialog
-    // still works for hand-typed paths.
-    let cwd = '';
-    let files = [];
-    try {
-      const r = await api.cwdPipelines();
-      cwd = r && typeof r.cwd === 'string' ? r.cwd : '';
-      files = r && Array.isArray(r.files) ? r.files : [];
-    } catch (e) { /* leave defaults */ }
+  // Extension filter for pipeline-spec files, shared by load + save.
+  const PIPELINE_FILTER = [{ label: t('pl.vpipeline_filter'),
+    exts: ['.vpipeline'] }];
 
-    // <datalist> + input[list=...] gives native browser autocomplete:
-    // the suggestions filter as the user types, the browser handles
-    // arrow-key selection and Enter-to-fill, and free-form paths are
-    // still accepted (the datalist is hint-only, not a constraint).
-    const listId = 'pl-load-list';
-    const dlist = el('datalist', { id: listId });
-    for (const f of files) { dlist.append(el('option', { value: f })); }
-
-    const pathIn = el('input', { type: 'text',
-      placeholder: files.length
-        ? files[0]
-        : '/path/to/pipeline.vpipeline',
-      autocomplete: 'off', list: listId });
-
-    const hint = cwd
-      ? el('div', { class: 'fl-hint' },
-          files.length
-            ? t('pl.vpipeline_files',
-                { n: files.length, s: files.length === 1 ? '' : 's', cwd })
-            : t('pl.no_vpipeline', { cwd }))
-      : null;
-
-    openModal({
+  function onLoad() {
+    const seed = splitPath(state.detail ? state.detail.storage_path : '');
+    openFsDialog({
+      mode: 'open', kind: 'file', filters: PIPELINE_FILTER,
       title: t('pl.load_title'),
-      body: el('div', {},
-        el('label', { class: 'fl' }, t('pl.file_path')),
-        pathIn, dlist, hint),
-      actions: [
-        { label: t('common.cancel'), cancel: true, onClick: (c) => c() },
-        { label: t('common.load'), kind: 'primary', onClick: async (c) => {
-            const p = pathIn.value.trim();
-            if (!p) { toast(t('pl.path_required'), 'error'); return; }
-            try {
-              const d = await api.loadPipeline(p);
-              c(); state.selectedId = d.id; await refreshList();
-            } catch (e) {
-              toast(t('pl.load_failed', { msg: e.message }), 'error');
-            }
-          } },
-      ],
+      startDir: seed.dir,
+      onPick: async (p) => {
+        if (!p) { return; }
+        try {
+          const d = await api.loadPipeline(p);
+          state.selectedId = d.id; await refreshList();
+        } catch (e) {
+          toast(t('pl.load_failed', { msg: e.message }), 'error');
+        }
+      },
     });
-    setTimeout(() => pathIn.focus(), 0);
   }
 
   function onSave() {
     if (!state.selectedId) { return; }
-    const cur = state.detail ? state.detail.storage_path : '';
-    const pathIn = el('input', { type: 'text', value: cur || '',
-      placeholder: state.selectedId + '.vpipeline' });
-    openModal({
+    const seed = splitPath(state.detail ? state.detail.storage_path : '');
+    openFsDialog({
+      mode: 'save', kind: 'file', filters: PIPELINE_FILTER,
       title: t('pl.save_title', { id: state.selectedId }),
-      body: el('div', {},
-        el('label', { class: 'fl' },
-          t('pl.save_path_label')),
-        pathIn,
-        el('div', { class: 'fl-hint' },
-          t('pl.save_hint'))),
-      actions: [
-        { label: t('common.cancel'), cancel: true, onClick: (c) => c() },
-        { label: t('common.save'), kind: 'primary', onClick: async (c) => {
-            try {
-              const r = await api.savePipeline(state.selectedId,
-                withDefaultPipelineExt(pathIn.value.trim()));
-              c(); toast(t('pl.saved', { path: r.storage_path }), 'ok');
-              await loadDetail(state.selectedId);
-            } catch (e) {
-              toast(t('pl.save_failed', { msg: e.message }), 'error');
-            }
-          } },
-      ],
+      startDir: seed.dir,
+      defaultName: seed.name || (state.selectedId + '.vpipeline'),
+      onPick: async (p) => {
+        try {
+          const r = await api.savePipeline(state.selectedId,
+            withDefaultPipelineExt(p));
+          toast(t('pl.saved', { path: r.storage_path }), 'ok');
+          await loadDetail(state.selectedId);
+        } catch (e) {
+          toast(t('pl.save_failed', { msg: e.message }), 'error');
+        }
+      },
     });
   }
 
@@ -1171,6 +1470,7 @@ export function mountPipelineManager(container) {
             try {
               state.detail = await api.removeStage(state.selectedId, sid);
               c();
+              state.graphPins.delete(sid);   // drop any stale drop-pin
               state.selectedStage = null;
               renderGraphPane();
               await renderConfig();
@@ -1182,6 +1482,88 @@ export function mountPipelineManager(container) {
           } },
       ],
     });
+  }
+
+  // Right-click a stage -> a context menu (rename / delete). Selects the
+  // stage first so the menu clearly targets it (and the config pane
+  // reflects it).
+  function onNodeContext(sid, x, y) {
+    if (!canEdit()) { toast(t('pl.select_stopped'), 'error'); return; }
+    selectStage(sid);
+    openMenu(x, y, [
+      { label: t('pl.rename_stage'), onClick: () => promptRenameStage(sid) },
+      { label: t('pl.duplicate_stage'), onClick: () => duplicateStage(sid) },
+      null,
+      { label: t('common.remove'), danger: true,
+        onClick: () => { state.selectedStage = sid; onRemoveStage(); } },
+    ]);
+  }
+
+  // Duplicate a stage's settings under a server-generated, non-colliding
+  // id ("<sid>-N"). The copy has no connections; place it just below the
+  // source so it's easy to find, then select it.
+  async function duplicateStage(sid) {
+    if (!canEdit()) { toast(t('pl.select_stopped'), 'error'); return; }
+    try {
+      const resp = await api.duplicateStage(state.selectedId, sid);
+      state.detail = resp;
+      const nid = resp.stage;
+      // Pin the copy just under the source (same column) so it doesn't
+      // scatter to an auto-slot far from its original. A layout entry
+      // keys its column as `.rank`; the pin's `y` is only an ORDERING
+      // seed (the packer normalizes the real gap), so any positive delta
+      // over the source's y lands the copy directly after it.
+      const at = state.graphLayout && state.graphLayout.get(sid);
+      if (at) {
+        state.graphPins.set(nid, { col: at.rank || 0, y: at.y + 1 });
+      }
+      state.selectedStage = nid;
+      state.pending = null;
+      state.selectedEdge = null;
+      renderGraphPane();
+      await renderConfig();
+      await refreshList();
+      toast(t('pl.stage_duplicated', { from: sid, to: nid }), 'ok');
+    } catch (e) {
+      toast(t('pl.duplicate_failed', { msg: e.message }), 'error');
+    }
+  }
+
+  function promptRenameStage(sid) {
+    if (!canEdit()) { toast(t('pl.select_stopped'), 'error'); return; }
+    const idIn = el('input', { type: 'text', value: sid });
+    openModal({
+      title: t('pl.rename_stage_title'),
+      body: el('div', {}, el('label', { class: 'fl' }, t('pl.new_id')), idIn),
+      actions: [
+        { label: t('common.cancel'), cancel: true, onClick: (c) => c() },
+        { label: t('common.rename'), kind: 'primary', onClick: async (c) => {
+            const to = idIn.value.trim();
+            if (!to) { toast(t('pl.id_required'), 'error'); return; }
+            if (to === sid) { c(); return; }
+            try {
+              await api.renameStage(state.selectedId, sid, to);
+              c();
+              // Carry the stage's manual placement + selection to the new id
+              // so it doesn't jump on the re-layout.
+              if (state.graphPins.has(sid)) {
+                state.graphPins.set(to, state.graphPins.get(sid));
+                state.graphPins.delete(sid);
+              }
+              if (state.graphLayout && state.graphLayout.get(sid)) {
+                state.graphLayout.set(to, state.graphLayout.get(sid));
+                state.graphLayout.delete(sid);
+              }
+              if (state.selectedStage === sid) { state.selectedStage = to; }
+              await refreshList();
+              toast(t('pl.stage_renamed', { from: sid, to }), 'ok');
+            } catch (e) {
+              toast(t('pl.rename_failed', { msg: e.message }), 'error');
+            }
+          } },
+      ],
+    });
+    setTimeout(() => { idIn.focus(); idIn.select(); }, 0);
   }
 
   // --- boot ---------------------------------------------------------

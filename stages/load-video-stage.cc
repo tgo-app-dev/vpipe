@@ -1,4 +1,4 @@
-#include "stages/audio-video/video-file-decoder-stage.h"
+#include "stages/load-video-stage.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -39,12 +39,12 @@ fill_dict_from_options_(const FlexData& opts,
 
 }
 
-VideoFileDecoderStage::VideoFileDecoderStage
+LoadVideoStage::LoadVideoStage
   (const SessionContextIntf* s,
    string                    id,
    vector<InEdge>            iports,
    FlexData                  config)
-  : TypedStage<VideoFileDecoderStage>(s, std::move(id),
+  : TypedStage<LoadVideoStage>(s, std::move(id),
                                       std::move(iports),
                                       std::move(config))
   , _libs(s->ffmpeg_libraries())
@@ -54,7 +54,7 @@ VideoFileDecoderStage::VideoFileDecoderStage
   // missing because there's no graceful default.
   // Attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
-  _input_url          = attr_str("input_url");
+  _input_url          = attr_path("input_url", false);
   _format             = attr_str("format");
   _enable_video       = attr_bool("enable_video");
   _enable_audio       = attr_bool("enable_audio");
@@ -66,12 +66,12 @@ VideoFileDecoderStage::VideoFileDecoderStage
   // Validation is deferred to launch (see Stage::fail_config).
   if (_input_url.empty()) {
     fail_config(fmt(
-      "VideoFileDecoderStage('{}'): config.input_url is required",
+      "LoadVideoStage('{}'): config.input_url is required",
       this->id()));
   }
   if (!_enable_video && !_enable_audio) {
     fail_config(fmt(
-      "VideoFileDecoderStage('{}'): at least one of enable_video / "
+      "LoadVideoStage('{}'): at least one of enable_video / "
       "enable_audio must be true",
       this->id()));
   }
@@ -90,7 +90,8 @@ VideoFileDecoderStage::VideoFileDecoderStage
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "input_url", .type = ConfigType::String, .required = true,
-   .doc = "file path or network URL (rtsp/http/...)"},
+   .doc = "file path or network URL (rtsp/http/...)",
+   .is_path = true, .path_filter = "video"},
   {.key = "format", .type = ConfigType::String,
    .doc = "forced demuxer; \"\" = autodetect", .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
@@ -118,12 +119,12 @@ const PortSpec kOports[] = {
    .type = nullptr, .clock_group = 1},
 };
 const StageSpec kSpec = {
-  .type_name = "video-file-decoder",
+  .type_name = "load-video",
   .doc       = "Source: demuxes + decodes a video file or network URL "
                "and emits decoded video/audio frames (header + FrameRefs) "
                "on independent per-stream clocks.",
-  .display_name = "Video File Reader",
-  .category  = StageCategory::Video,
+  .display_name = "Load Video",
+  .category  = StageCategory::Visual,
   .iports    = {},
   .oports    = kOports,
   .attrs     = kAttrs,
@@ -131,12 +132,12 @@ const StageSpec kSpec = {
 }  // namespace
 
 const StageSpec&
-VideoFileDecoderStage::spec() const noexcept
+LoadVideoStage::spec() const noexcept
 {
   return kSpec;
 }
 
-VideoFileDecoderStage::~VideoFileDecoderStage()
+LoadVideoStage::~LoadVideoStage()
 {
   if (_pkt) {
     _libs->avcodec().api.packet_free(&_pkt);
@@ -153,7 +154,7 @@ VideoFileDecoderStage::~VideoFileDecoderStage()
 }
 
 string
-VideoFileDecoderStage::av_err_(int rc) const
+LoadVideoStage::av_err_(int rc) const
 {
   char buf[256];
   _libs->avutil().api.strerror(rc, buf, sizeof buf);
@@ -161,7 +162,7 @@ VideoFileDecoderStage::av_err_(int rc) const
 }
 
 int
-VideoFileDecoderStage::pick_stream_(int media_type,
+LoadVideoStage::pick_stream_(int media_type,
                                     int requested) const noexcept
 {
   if (!_fctx) {
@@ -183,21 +184,21 @@ VideoFileDecoderStage::pick_stream_(int media_type,
 }
 
 void
-VideoFileDecoderStage::open_codec_(int stream_idx, AVCodecContext** out)
+LoadVideoStage::open_codec_(int stream_idx, AVCodecContext** out)
 {
   AVStream* s = _fctx->streams[stream_idx];
   const AVCodec* codec =
     _libs->avcodec().api.find_decoder(s->codecpar->codec_id);
   if (!codec) {
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): no decoder for codec_id {}",
+        "LoadVideoStage('{}'): no decoder for codec_id {}",
         this->id(),
         static_cast<int>(s->codecpar->codec_id)));
   }
   AVCodecContext* cctx = _libs->avcodec().api.alloc_context3(codec);
   if (!cctx) {
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): avcodec_alloc_context3 failed",
+        "LoadVideoStage('{}'): avcodec_alloc_context3 failed",
         this->id()));
   }
   int rc = _libs->avcodec().api.parameters_to_context(cctx,
@@ -205,21 +206,21 @@ VideoFileDecoderStage::open_codec_(int stream_idx, AVCodecContext** out)
   if (rc < 0) {
     _libs->avcodec().api.free_context(&cctx);
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): parameters_to_context failed: "
+        "LoadVideoStage('{}'): parameters_to_context failed: "
         "{}", this->id(), av_err_(rc)));
   }
   rc = _libs->avcodec().api.open2(cctx, codec, nullptr);
   if (rc < 0) {
     _libs->avcodec().api.free_context(&cctx);
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): avcodec_open2 failed: {}",
+        "LoadVideoStage('{}'): avcodec_open2 failed: {}",
         this->id(), av_err_(rc)));
   }
   *out = cctx;
 }
 
 void
-VideoFileDecoderStage::open_input_()
+LoadVideoStage::open_input_()
 {
   AVDictionary* opts = nullptr;
   fill_dict_from_options_(_open_options, _libs->avutil(), &opts);
@@ -239,7 +240,7 @@ VideoFileDecoderStage::open_input_()
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): avformat_open_input('{}') "
+        "LoadVideoStage('{}'): avformat_open_input('{}') "
         "failed: {}", this->id(), _input_url, av_err_(rc)));
   }
   _fctx = fctx;
@@ -247,7 +248,7 @@ VideoFileDecoderStage::open_input_()
   rc = _libs->avformat().api.find_stream_info(_fctx, nullptr);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): find_stream_info failed: {}",
+        "LoadVideoStage('{}'): find_stream_info failed: {}",
         this->id(), av_err_(rc)));
   }
 
@@ -256,7 +257,7 @@ VideoFileDecoderStage::open_input_()
                                  _video_stream_index);
     if (_v_stream_idx < 0) {
       session()->warn(fmt(
-        "VideoFileDecoderStage('{}'): no video stream in '{}'; "
+        "LoadVideoStage('{}'): no video stream in '{}'; "
         "video oport will be closed immediately",
         this->id(), _input_url));
     } else {
@@ -268,7 +269,7 @@ VideoFileDecoderStage::open_input_()
                                  _audio_stream_index);
     if (_a_stream_idx < 0) {
       session()->warn(fmt(
-        "VideoFileDecoderStage('{}'): no audio stream in '{}'; "
+        "LoadVideoStage('{}'): no audio stream in '{}'; "
         "audio oport will be closed immediately",
         this->id(), _input_url));
     } else {
@@ -279,13 +280,13 @@ VideoFileDecoderStage::open_input_()
   _pkt = _libs->avcodec().api.packet_alloc();
   if (!_pkt) {
     session()->error(fmt(
-        "VideoFileDecoderStage('{}'): av_packet_alloc failed",
+        "LoadVideoStage('{}'): av_packet_alloc failed",
         this->id()));
   }
 }
 
 VideoStreamParams
-VideoFileDecoderStage::make_video_params_() const noexcept
+LoadVideoStage::make_video_params_() const noexcept
 {
   VideoStreamParams p;
   if (_v_stream_idx < 0) {
@@ -301,7 +302,7 @@ VideoFileDecoderStage::make_video_params_() const noexcept
 }
 
 AudioStreamParams
-VideoFileDecoderStage::make_audio_params_() const noexcept
+LoadVideoStage::make_audio_params_() const noexcept
 {
   AudioStreamParams p;
   if (_a_stream_idx < 0) {
@@ -320,7 +321,7 @@ VideoFileDecoderStage::make_audio_params_() const noexcept
 }
 
 Job
-VideoFileDecoderStage::drain_codec_(RuntimeContext& ctx,
+LoadVideoStage::drain_codec_(RuntimeContext& ctx,
                                     AVCodecContext* cctx,
                                     unsigned        port,
                                     AVPacket*       pkt)
@@ -360,7 +361,7 @@ VideoFileDecoderStage::drain_codec_(RuntimeContext& ctx,
 }
 
 Job
-VideoFileDecoderStage::initialize(RuntimeContext& ctx)
+LoadVideoStage::initialize(RuntimeContext& ctx)
 {
   try {
     open_input_();
@@ -384,7 +385,7 @@ VideoFileDecoderStage::initialize(RuntimeContext& ctx)
 }
 
 Job
-VideoFileDecoderStage::process(RuntimeContext& ctx)
+LoadVideoStage::process(RuntimeContext& ctx)
 {
   if (!_fctx) {
     // initialize() failed earlier; nothing to do.
@@ -427,7 +428,7 @@ VideoFileDecoderStage::process(RuntimeContext& ctx)
 }
 
 Job
-VideoFileDecoderStage::drain(RuntimeContext& ctx)
+LoadVideoStage::drain(RuntimeContext& ctx)
 {
   // Flush each decoder once (NULL packet) so any frames buffered
   // inside the codec are emitted downstream before the driver
@@ -444,7 +445,7 @@ VideoFileDecoderStage::drain(RuntimeContext& ctx)
   }
 }
 
-VPIPE_REGISTER_STAGE(VideoFileDecoderStage)
-VPIPE_REGISTER_SPEC(VideoFileDecoderStage, kSpec)
+VPIPE_REGISTER_STAGE(LoadVideoStage)
+VPIPE_REGISTER_SPEC(LoadVideoStage, kSpec)
 
 }

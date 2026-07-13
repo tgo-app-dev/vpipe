@@ -428,6 +428,7 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
   _batched_decode       = attr_bool("batched_decode");
   _pipelined_decode     = attr_bool("pipelined_decode");
   _pipelined_batched_decode = attr_bool("pipelined_batched_decode");
+  _i8_prefill               = attr_bool("i8_prefill");
   _scene_overlap        = attr_bool("scene_overlap");
   _video_fps            = static_cast<float>(attr_real("video_fps"));
   if (_video_fps <= 0.0f) { _video_fps = 1.0f; }
@@ -565,6 +566,13 @@ constexpr ConfigKey kAttrs[] = {
           "step's CPU encode overlap the GPU. Default off: the shrinking "
           "sync path wins on staggered answer lengths.",
    .def_bool = false},
+  {.key = "i8_prefill", .type = ConfigType::Bool,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 prefill GEMMs, ~2x their "
+          "f16 rate on matrix-core GPUs at int8 quality (prefill is NOT "
+          "token-exact with this on; a good fit here -- realtime-vqa "
+          "re-prefills every scene; IGNORED without NAX matmul2d -- matrix-core GPU + kernels). Default false; VPIPE_I8_GEMM "
+          "overrides.",
+   .def_bool = false},
   {.key = "scene_overlap", .type = ConfigType::Bool,
    .doc = "re-issue the previous scene's last frame/frame-pair vision "
           "tokens as the next scene's first frame, but only across "
@@ -624,7 +632,7 @@ const StageSpec kSpec = {
                "the configured questions per scene (batched), emitting a "
                "FlexData answer bundle.",
   .display_name = "Realtime VQA",
-  .category  = StageCategory::Text,
+  .category  = StageCategory::Vision,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,
@@ -731,6 +739,9 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   // head: realtime-vqa re-prefills (multimodal) per scene and fans branches, so
   // prefill throughput matters more than the per-branch decode acceptance.
   _lm->set_mtp_prefix_seed(false);
+  // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs -- a good
+  // fit here (per-scene re-prefill). No-op on backends without the route.
+  if (_i8_prefill) { _lm->set_i8_prefill(true); }
   _chat_tpl = genai::make_chat_template(
       _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
@@ -751,6 +762,18 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   for (const char* t : {"<|channel>", "<|think|>"}) {
     const std::int32_t id = _lm->tokenizer().special_token_id(t);
     if (id >= 0) { _m_suppress_ids.push_back(id); }
+  }
+  // Fold in the model's permanent base suppression (Gemma-4 multimodal end
+  // markers <image|>/<audio|>). The GPU mask already covers prefill + the
+  // single-token path, but our batched per-branch decode below masks
+  // HOST-side (m_batched_decode_step returns raw logits we sample); that
+  // host mask uses _m_suppress_ids, so the base must be in it or the eoi/
+  // eoa control tokens can leak into a batched answer.
+  for (const std::int32_t id : _lm->base_suppressed_tokens()) {
+    if (id >= 0 && std::find(_m_suppress_ids.begin(), _m_suppress_ids.end(),
+                             id) == _m_suppress_ids.end()) {
+      _m_suppress_ids.push_back(id);
+    }
   }
   if (!_m_suppress_ids.empty()) {
     _lm->set_suppressed_tokens(_m_suppress_ids);

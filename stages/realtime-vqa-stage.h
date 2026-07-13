@@ -351,6 +351,7 @@ private:
   // path wins on staggered answer lengths (it drops finished branches).
   // Enable when answers finish at similar lengths (short capped answers).
   bool                     _pipelined_batched_decode{};
+  bool                     _i8_prefill{};   // LOSSY int8 prefill (opt-in)
   std::optional<bool>      _disable_thinking;
   std::vector<std::string> _questions;
   // Instruction prepended to EVERY per-question user turn (after the scene

@@ -197,7 +197,16 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // shard's own header carries its tensors and their (shard-relative)
   // offsets. Mirror the MLX loader: collect the unique set and mmap
   // each once, in sorted order for determinism.
-  const fs::path index = dir / "model.safetensors.index.json";
+  // Diffusers checkpoints (Krea-2 transformer, Qwen-Image VAE) name their
+  // shards/index `diffusion_pytorch_model.*` instead of `model.*`; accept
+  // either. The index's weight_map still carries the real shard filenames,
+  // so only the index (and single-file) NAME needs the fallback.
+  fs::path index = dir / "model.safetensors.index.json";
+  if (!fs::exists(index, ec)) {
+    const fs::path dindex =
+        dir / "diffusion_pytorch_model.safetensors.index.json";
+    if (fs::exists(dindex, ec)) { index = dindex; }
+  }
   if (fs::exists(index, ec)) {
     std::ifstream in(index);
     if (!in) {
@@ -245,13 +254,16 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // model-00001-of-00002.safetensors + model-00002-of-... with NO
   // index.json. Glob the shards and map each in sorted order; each shard's
   // own header is self-describing.
-  if (!fs::exists(dir / "model.safetensors", ec)) {
+  if (!fs::exists(dir / "model.safetensors", ec)
+      && !fs::exists(dir / "diffusion_pytorch_model.safetensors", ec)) {
     std::set<std::string> shard_names;
     std::error_code lec;
     for (const auto& de : fs::directory_iterator(dir, lec)) {
       const fs::path& p = de.path();
       const std::string fn = p.filename().string();
-      if (p.extension() == ".safetensors" && fn.rfind("model-", 0) == 0) {
+      if (p.extension() == ".safetensors"
+          && (fn.rfind("model-", 0) == 0
+              || fn.rfind("diffusion_pytorch_model-", 0) == 0)) {
         shard_names.emplace(fn);
       }
     }
@@ -267,8 +279,13 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
     }
   }
 
-  // Single-file layout.
-  auto single = open((dir / "model.safetensors").string());
+  // Single-file layout (model.safetensors or the diffusers name).
+  fs::path sf = dir / "model.safetensors";
+  if (!fs::exists(sf, ec)) {
+    const fs::path dsf = dir / "diffusion_pytorch_model.safetensors";
+    if (fs::exists(dsf, ec)) { sf = dsf; }
+  }
+  auto single = open(sf.string());
   if (single) { map_vision_sidecar_(*single); }
   return single;
 }
@@ -282,20 +299,26 @@ MetalLlamaWeights&
 MetalLlamaWeights::operator=(MetalLlamaWeights&& o) noexcept
 {
   if (this != &o) {
+    // Release our no-copy wrappers BEFORE unmapping the pages they reference.
+    _shard_maps.clear();
     for (auto& sh : _shards) {
       if (sh.base != nullptr) { ::munmap(sh.base, sh.map_size); }
       if (sh.fd >= 0) { ::close(sh.fd); }
     }
     _shards = std::move(o._shards);
+    _shard_maps = std::move(o._shard_maps);
     _tensors = std::move(o._tensors);
     _gguf = std::move(o._gguf);
-    o._shards.clear();  // moved-from vector is empty; make it explicit
+    o._shards.clear();      // moved-from vectors are empty; make it explicit
+    o._shard_maps.clear();
   }
   return *this;
 }
 
 MetalLlamaWeights::~MetalLlamaWeights()
 {
+  // Release the no-copy MTL buffers before unmapping their backing pages.
+  _shard_maps.clear();
   for (auto& sh : _shards) {
     if (sh.base != nullptr) { ::munmap(sh.base, sh.map_size); }
     if (sh.fd >= 0) { ::close(sh.fd); }
@@ -351,6 +374,49 @@ MetalLlamaWeights::load(const std::string& name,
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
   std::memcpy(buf.contents(), src, ti->nbytes);
   return buf;
+}
+
+metal_compute::SharedBuffer
+MetalLlamaWeights::load_mapped(const std::string& name,
+                              metal_compute::MetalCompute* mc) const
+{
+  const TensorInfo* ti = info(name);
+  if (ti == nullptr || mc == nullptr) {
+    return {};
+  }
+  // GGUF tensors are converted on load (not a straight byte view), and only
+  // real shards can be wrapped. Anything else copies.
+  if (ti->shard < 0) {
+    return load(name, mc);
+  }
+  const std::size_t si = static_cast<std::size_t>(ti->shard);
+  if (si >= _shards.size()) {
+    return load(name, mc);
+  }
+  const Shard& sh = _shards[si];
+
+  // The GPU byte offset of this tensor within the whole-shard buffer, and a
+  // conservative bind-alignment guard (16 bytes comfortably covers Metal's
+  // device-buffer offset requirement and every weight element size). A
+  // misaligned or out-of-range tensor falls back to a copy so correctness is
+  // never at the mercy of the on-disk packing.
+  const std::size_t goff = sh.data_start + ti->offset;
+  const std::size_t end  = goff + ti->nbytes;
+  if ((goff & 0xF) != 0 || sh.base == nullptr || end > sh.map_size) {
+    return load(name, mc);
+  }
+
+  // Lazily wrap the whole shard once (newBufferWithBytesNoCopy over the mmap).
+  if (_shard_maps.size() < _shards.size()) {
+    _shard_maps.resize(_shards.size());
+  }
+  if (_shard_maps[si].empty()) {
+    _shard_maps[si] = mc->make_no_copy_buffer(sh.base, sh.map_size);
+    if (_shard_maps[si].empty()) {
+      return load(name, mc);        // wrap failed -> copy
+    }
+  }
+  return _shard_maps[si].subview(goff, ti->nbytes);
 }
 
 }  // namespace vpipe::genai

@@ -4760,6 +4760,100 @@ TEST(metal_lm_smoke, gguf_gemma_text_chat) {
   EXPECT_TRUE(!text.empty());
 }
 
+// Regression: the Gemma-4 12B (qat-q4_0 GGUF) text decoder must NEVER emit
+// the multimodal end-of-image / end-of-audio control tokens (<image|>
+// 258882 / <audio|> 258883) in text output. On visually-themed text the
+// QAT-4bit lm_head assigns <image|> the TOP logit (observed leak:
+// "...sketching the memory <image|>topology"); LoadedLanguageModel bakes a
+// PERMANENT suppression of exactly these two tokens into the model at load
+// -- matching the llama.cpp reference, which masks these two (and only
+// these two) to -inf.
+//
+// This teacher-forces the exact prompt+prefix that triggered the leak and
+// asserts the predicted next token is the sensible word (' layout', the
+// llama.cpp golden argmax at this position), NOT the control token, and
+// that both control ids sit below the winner. Deterministic (greedy).
+// Gated on VPIPE_GGUF_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gguf_gemma_no_multimodal_leak) {
+  const char* path = std::getenv("VPIPE_GGUF_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  if (!mgr) { return; }
+  genai::LoadSpec spec;
+  spec.hf_dir        = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens   = 1024;
+  spec.max_pages     = 4;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const auto& tok = lm->tokenizer();
+
+  // Tokenizer sanity: the control ids map to the expected literals (a
+  // mis-map would print <image|> for a NORMAL id).
+  std::int32_t eoi = 258882, eoa = 258883;
+  EXPECT_TRUE(tok.decode(std::span<const std::int32_t>(&eoi, 1)) == "<image|>");
+  EXPECT_TRUE(tok.decode(std::span<const std::int32_t>(&eoa, 1)) == "<audio|>");
+
+  // The permanent base suppression must be populated (both eoi + eoa) --
+  // realtime-vqa folds this into its host-side batched mask, so a regression
+  // that empties it would silently re-open the leak on the batched path.
+  {
+    auto base = lm->base_suppressed_tokens();
+    bool has_eoi = false, has_eoa = false;
+    for (std::int32_t id : base) {
+      if (id == 258882) { has_eoi = true; }
+      if (id == 258883) { has_eoa = true; }
+    }
+    EXPECT_TRUE(has_eoi);
+    EXPECT_TRUE(has_eoa);
+  }
+
+  // Prompt ("Write a short story about Yi...") + the greedy prefix up to
+  // (not including) the leaked <image|>. Position 213 predicts the word
+  // after "...sketching the memory".
+  static const std::int32_t kPrefix[] = {
+      2, 105, 2364, 107, 6974, 496, 2822, 3925, 1003, 54984, 236764, 496,
+      21042, 47133, 19042, 236764, 532, 1116, 9338, 61232, 496, 3909, 6347, 529,
+      3393, 236761, 11968, 236743, 236778, 236771, 236771, 4171, 236761, 106, 107,
+      105, 4368, 107, 100, 45518, 107, 101, 818, 147024, 19462, 529, 1806, 37845,
+      53522, 54984, 236858, 236751, 3392, 236764, 30439, 1440, 37676, 3418, 506,
+      173152, 15348, 236761, 1701, 1806, 5695, 236764, 1304, 1053, 1010, 79582,
+      684, 496, 25556, 528, 506, 5464, 236787, 496, 6571, 20651, 528, 506, 861,
+      1494, 236772, 32677, 47133, 600, 1186, 9177, 1208, 13610, 121160, 236761,
+      108, 2021, 6533, 1663, 236764, 506, 14510, 3938, 691, 496, 32585, 76692,
+      236761, 2282, 54984, 236764, 625, 691, 496, 122400, 607, 886, 199010, 5433,
+      236761, 2625, 3782, 236789, 236745, 1164, 1676, 506, 3393, 236793, 1304,
+      6345, 1061, 18479, 236761, 2625, 50070, 506, 6818, 75043, 236764, 10685,
+      1217, 506, 20974, 93905, 607, 506, 1262, 236761, 236743, 108, 236775, 1509,
+      236858, 236751, 711, 496, 20651, 2098, 1304, 71787, 236764, 1116, 6114,
+      188312, 699, 78370, 236761, 623, 1509, 236858, 236751, 496, 53970, 92560,
+      1781, 108, 5778, 532, 506, 47133, 964, 13710, 1024, 506, 1638, 15612, 1757,
+      236764, 496, 47617, 34847, 236772, 1340, 236772, 8281, 14260, 506, 1458,
+      531, 162911, 236761, 54984, 16630, 872, 496, 11580, 23037, 13039, 532,
+      6074, 130257, 506, 6571};
+  std::vector<std::int32_t> ids(kPrefix,
+      kPrefix + sizeof(kPrefix) / sizeof(kPrefix[0]));
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  const std::int32_t next = lm->prefill(ctx, ids);
+  std::int32_t nn = next;
+  std::printf("[no_leak] argmax=%d '%s' (golden=11273 ' layout')\n", next,
+      tok.decode(std::span<const std::int32_t>(&nn, 1)).c_str());
+  // The fix: greedy must not pick either suppressed control token.
+  EXPECT_TRUE(next != 258882);
+  EXPECT_TRUE(next != 258883);
+  // And it matches the llama.cpp golden argmax (' layout', 11273).
+  EXPECT_TRUE(next == 11273);
+  // Both suppressed ids must sit below the winner (masked to the sentinel).
+  const auto& lg = lm->last_logits_host();
+  if (!lg.empty() && (int)lg.size() > 258883) {
+    EXPECT_TRUE(lg[258882] < lg[11273]);
+    EXPECT_TRUE(lg[258883] < lg[11273]);
+  }
+}
+
 // Opt-in bench: native Q6_K tied embed/lm_head vs the affine8 requant.
 // Prints resident memory after load + decode tok/s. Run twice to A/B:
 //   VPIPE_GGUF_TEST_MODEL_PATH=<dir> vpipe_test --filter '*q6k_decode_bench'

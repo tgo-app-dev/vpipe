@@ -178,6 +178,47 @@ TEST(stage_config, suggest_db_type_surfaces_in_schema)
   EXPECT_TRUE(!e1.as_object().contains("suggest_db_type"));  // unset -> omit
 }
 
+// The filesystem-path hints (is_path + companions) flow from the schema
+// into the serialized config so the web-ui editor can offer a Browse...
+// file dialog. path_write / path_kind / path_filter are omitted at their
+// defaults; is_path is omitted entirely for non-path keys.
+TEST(stage_config, is_path_surfaces_in_schema)
+{
+  constexpr ConfigKey spec[] = {
+    // A write-target file with a category filter.
+    {.key = "out", .type = ConfigType::String,
+     .is_path = true, .path_write = true, .path_filter = "image"},
+    // A read directory.
+    {.key = "dir", .type = ConfigType::String,
+     .is_path = true, .path_kind = "dir"},
+    // A plain string key -- no path hints at all.
+    {.key = "name", .type = ConfigType::String},
+  };
+  FlexData arr = config_params_to_flex(
+      resolve_config_params(spec, FlexData::make_object()));
+  auto av = arr.as_array();
+  EXPECT_TRUE(av.size() == 3u);
+
+  FlexData e0 = av.at(0);
+  auto o0 = e0.as_object();
+  EXPECT_TRUE(o0.contains("is_path"));
+  EXPECT_TRUE(o0.at("is_path").as_bool(false));
+  EXPECT_TRUE(o0.contains("path_write"));
+  EXPECT_TRUE(o0.at("path_write").as_bool(false));
+  EXPECT_TRUE(o0.at("path_filter").as_string() == "image");
+  EXPECT_TRUE(!o0.contains("path_kind"));      // default (file) -> omit
+
+  FlexData e1 = av.at(1);
+  auto o1 = e1.as_object();
+  EXPECT_TRUE(o1.at("is_path").as_bool(false));
+  EXPECT_TRUE(o1.at("path_kind").as_string() == "dir");
+  EXPECT_TRUE(!o1.contains("path_write"));      // read (false) -> omit
+  EXPECT_TRUE(!o1.contains("path_filter"));     // unset -> omit
+
+  FlexData e2 = av.at(2);
+  EXPECT_TRUE(!e2.as_object().contains("is_path"));   // non-path -> omit
+}
+
 // ----- real stages ----------------------------------------------------
 
 TEST(stage_config, chrono_reports_keys_and_current_values)

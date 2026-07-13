@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# vpipe package config. Consumers do:
+#   find_package(vpipe REQUIRED)
+#   vpipe_add_plugin(myplugin SOURCES my-stage.cc)
+# which links vpipe::vpipe (the shared libvpipe + its SDK include dir).
+# All of libvpipe's own dependencies are PRIVATE, so no find_dependency()
+# calls are needed here.
+
+include("${CMAKE_CURRENT_LIST_DIR}/vpipeTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/vpipePluginHelpers.cmake")
+
+check_required_components(vpipe)

@@ -203,6 +203,78 @@ CommandStream::Fence::completed() const noexcept
   return _cb->status() == MTL::CommandBufferStatusCompleted;
 }
 
+bool
+CommandStream::Fence::errored() const noexcept
+{
+  return _cb != nullptr
+      && _cb->status() == MTL::CommandBufferStatusError;
+}
+
+long
+CommandStream::Fence::error_code() const noexcept
+{
+  if (_cb == nullptr) {
+    return 0;
+  }
+  NS::Error* e = _cb->error();
+  return e != nullptr ? static_cast<long>(e->code()) : 0;
+}
+
+bool
+CommandStream::Fence::out_of_memory() const noexcept
+{
+  // A PageFault is the GPU touching non-resident memory -- the exact
+  // symptom of over-committing UMA -- so treat it alongside OutOfMemory.
+  const long c = error_code();
+  return c == static_cast<long>(MTL::CommandBufferErrorOutOfMemory)
+      || c == static_cast<long>(MTL::CommandBufferErrorPageFault);
+}
+
+std::string
+CommandStream::Fence::error_message() const noexcept
+{
+  if (_cb == nullptr || _cb->status() != MTL::CommandBufferStatusError) {
+    return {};
+  }
+  NS::Error* e = _cb->error();
+  if (e == nullptr) {
+    return "GPU command buffer error (no NS::Error attached)";
+  }
+  const long code = static_cast<long>(e->code());
+  const char* kind =
+      code == static_cast<long>(MTL::CommandBufferErrorOutOfMemory) ? "out of memory"
+    : code == static_cast<long>(MTL::CommandBufferErrorPageFault)   ? "page fault (non-resident memory)"
+    : code == static_cast<long>(MTL::CommandBufferErrorTimeout)     ? "timeout"
+    : "error";
+  std::string msg = "GPU command buffer ";
+  msg += kind;
+  msg += " (code ";
+  msg += std::to_string(code);
+  NS::String* desc = e->localizedDescription();
+  if (desc != nullptr && desc->utf8String() != nullptr) {
+    msg += ": ";
+    msg += desc->utf8String();
+  }
+  msg += ")";
+  return msg;
+}
+
+bool
+CommandStream::Fence::wait_ok(std::string* reason)
+{
+  if (_cb == nullptr) {
+    return true;                 // nothing ran, nothing failed
+  }
+  _cb->waitUntilCompleted();
+  if (_cb->status() != MTL::CommandBufferStatusError) {
+    return true;
+  }
+  if (reason != nullptr) {
+    *reason = error_message();
+  }
+  return false;
+}
+
 CommandStream::Fence::GpuTimes
 CommandStream::Fence::gpu_times() const noexcept
 {

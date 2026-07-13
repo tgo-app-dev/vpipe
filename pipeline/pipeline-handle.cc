@@ -44,9 +44,10 @@ PipelineHandleImpl::insert_stage(string                  type,
     return HandleAccess::make_stage(nullptr);
   }
   // Resolve every StagePortHandle to an InEdge against the live
-  // Stage*. A null handle, an oport index >= the upstream stage's
-  // oport count, or a stage that no longer belongs to this pipeline
-  // is rejected; the call returns null.
+  // Stage*. A NULL handle marks a DISCONNECTED (optional) iport and
+  // keeps its positional slot unwired (InEdge{nullptr,0}); an oport
+  // index >= the upstream stage's oport count, or a stage that no
+  // longer belongs to this pipeline, is rejected (returns null).
   vector<InEdge> resolved;
   resolved.reserve(iports.size());
   for (size_t i = 0; i < iports.size(); ++i) {
@@ -54,12 +55,10 @@ PipelineHandleImpl::insert_stage(string                  type,
     StageHandleImpl* simpl = HandleAccess::impl(sph.stage);
     Stage* upstream = simpl ? simpl->stage() : nullptr;
     if (!upstream) {
-      if (_session) {
-        _session->warn(fmt(
-          "PipelineHandle::insert_stage('{}'): iport {} references "
-          "a null upstream stage", id, i));
-      }
-      return HandleAccess::make_stage(nullptr);
+      // Intentionally-unwired optional iport (a gap in the middle or
+      // at the end of the input list).
+      resolved.push_back(InEdge{nullptr, 0});
+      continue;
     }
     if (upstream->graph() != _pipeline.get()) {
       if (_session) {

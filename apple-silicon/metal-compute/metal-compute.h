@@ -121,6 +121,49 @@ public:
   };
   ResidencyStats residency_stats() const noexcept;
 
+  // GPU memory budget snapshot, for over-commit detection. All bytes.
+  //   recommended -- device()->recommendedMaxWorkingSetSize(): the amount
+  //                  of memory the GPU can keep resident without paging /
+  //                  perf penalties (on UMA Apple Silicon this tracks the
+  //                  usable slice of system RAM, and follows an
+  //                  iogpu.wired_limit_mb override).
+  //   allocated   -- device()->currentAllocatedSize(): total resource
+  //                  memory this device currently has allocated.
+  //   headroom    -- recommended - allocated, clamped at 0: how much a new
+  //                  allocation can safely take before over-committing.
+  // All zero when valid() == false. Cheap (two device property reads);
+  // note `allocated` is a live figure that moves as buffers come and go.
+  struct MemoryBudget {
+    std::size_t recommended = 0;
+    std::size_t allocated   = 0;
+    std::size_t headroom    = 0;
+    // Reclaimable physical memory available to the process right now: free +
+    // purgeable + speculative + file-backed(external) pages. Unlike `headroom`
+    // (a Metal working-set figure), this reflects TRUE physical pressure and
+    // COUNTS clean/mmap'd weight pages as available (the OS can evict them), so
+    // it catches an over-commit the working-set figure misses -- e.g. a big VAE
+    // decode running alongside mmap'd DiT weights. 0 when the query is
+    // unavailable; callers should skip the check then.
+    std::size_t available_physical = 0;
+    // True when `need` bytes fit in the current headroom (with an optional
+    // safety margin, default 5%). A quick preflight before a big alloc. Does
+    // NOT consult available_physical -- check that separately where relevant so
+    // this stays a pure GPU-working-set test for existing callers.
+    bool fits(std::size_t need, double margin = 0.05) const noexcept
+    {
+      const double avail = (double)headroom * (1.0 - margin);
+      return (double)need <= avail;
+    }
+    // True when `need` fits the reclaimable physical budget (margin default
+    // 10%). Vacuously true when available_physical == 0 (query unavailable).
+    bool fits_physical(std::size_t need, double margin = 0.10) const noexcept
+    {
+      if (available_physical == 0) { return true; }
+      return (double)need <= (double)available_physical * (1.0 - margin);
+    }
+  };
+  MemoryBudget memory_budget() const noexcept;
+
   // Allocate a `byte_size`-byte MTL::Buffer in Shared storage mode
   // (CPU and GPU share the same UMA address). Returns an empty
   // SharedBuffer if the runtime is not valid() or if Metal failed
@@ -134,6 +177,19 @@ public:
       std::size_t alignment = 64,
       HazardTracking hazard_tracking = HazardTracking::Tracked) const;
 
+  // Wrap already-mapped host memory as a Shared MTL::Buffer WITHOUT copying
+  // (newBufferWithBytesNoCopy). `ptr` must be page-aligned (mmap / vm_allocate
+  // memory is); the mapping length is page-rounded for Metal but the returned
+  // SharedBuffer reports `byte_size`. Metal does NOT own the memory (null
+  // deallocator) -- the CALLER must keep it mapped for the lifetime of the
+  // returned buffer and every subview() of it, and must not let the GPU touch
+  // it after unmapping. Intended for read-only, file-backed model weights:
+  // clean file pages the OS can reclaim under memory pressure and re-fault
+  // from disk, instead of dirty anonymous copies that must be swapped.
+  // Returns empty if the runtime is invalid, `ptr` is null / not page-aligned,
+  // or Metal rejects the wrap.
+  SharedBuffer make_no_copy_buffer(void* ptr, std::size_t byte_size) const;
+
   // Load a `.metallib` whose bytes were embedded into libvpipe by an
   // add_vpipe_metal_kernel(KERNEL_NAME ...) call in CMake. `name`
   // must match the KERNEL_NAME at registration. Returns an invalid
@@ -144,6 +200,22 @@ public:
   // the same MTL::Library* under the hood (each returned
   // ComputeLibrary independently retains).
   ComputeLibrary load_library(std::string_view name) const;
+
+  // Register a `.metallib`'s bytes under `name` at RUNTIME (e.g. from a
+  // plugin whose kernels were compiled offline). The bytes are COPIED into
+  // a process-owned store, so the caller's buffer need not outlive the
+  // call; `name` then resolves through load_library(name) exactly like a
+  // build-embedded metallib. First-wins: returns false (a warning is
+  // logged) if `name` is already registered -- built-in or runtime -- so a
+  // plugin can't shadow a built-in kernel, or if the bytes are empty.
+  bool register_metal_library(std::string_view     name,
+                              const unsigned char* bytes,
+                              std::size_t          n) const;
+
+  // Convenience: read `path` off disk and register its bytes under `name`
+  // (see register_metal_library). Returns false + warns on a read error.
+  bool register_metal_library_file(std::string_view name,
+                                   std::string_view path) const;
 
   // Resolve a kernel entry point on `lib` to a (MTL::Function,
   // MTL::ComputePipelineState) pair. The PSO is cached on

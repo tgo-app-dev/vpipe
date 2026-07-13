@@ -6,10 +6,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace vpipe {
 
@@ -38,6 +40,15 @@ public:
   virtual void log_verbose(const VpipeFormat&) const = 0;
   virtual void log_normal(const VpipeFormat&) const = 0;
   virtual void log_always(const VpipeFormat&) const = 0;
+
+  // The address the vpipe web-ui's HTTP server bound to, when this
+  // session is being served by the web-ui; empty otherwise. Stages that
+  // host their own HTTP endpoint (e.g. hls-broadcast) read this so, by
+  // default, they bind to the same interface the UI is reachable on --
+  // matching whatever the operator chose for the UI (en0, an explicit
+  // --bind, 0.0.0.0, ...). The default returns empty: CLI sessions and
+  // adapter contexts have no web-ui and callers fall back to en0.
+  virtual std::string web_ui_bind_address() const { return {}; }
 
   // Current UI/message locale as an IETF tag (e.g. "en-us", "zh-cn").
   // Drives tr() and any user-facing string the session formats. The
@@ -227,6 +238,45 @@ public:
   virtual metal_compute::MetalCompute* metal_compute() const
   {
     return nullptr;
+  }
+
+  // Confine a stage-supplied LOCAL file path to the session's filesystem
+  // sandbox. When the sandbox is disabled (the CLI, or the web-ui run
+  // with --expose-native-file-system) the path is returned unchanged.
+  // When enabled the path is re-rooted under the sandbox (chroot-like:
+  // the root acts as "/"), symlink/".." escapes set *err and return an
+  // empty path, and `for_write` creates the parent directory. Network
+  // URLs are NOT paths -- callers should skip this for rtsp/http(s).
+  // Model-manager file access intentionally does NOT go through here.
+  //
+  // Defaulted to passthrough so adapter contexts (e.g. CerrSessionContext)
+  // need not override.
+  virtual std::filesystem::path
+  confine_path(std::string_view user_path, bool /*for_write*/,
+               std::string* /*err*/ = nullptr) const
+  {
+    return std::filesystem::path(user_path);
+  }
+
+  // True when the filesystem sandbox is active (web-ui default). Lets a
+  // client -- e.g. the web-ui file browser -- present a chroot-like
+  // virtual namespace (root == "/") instead of native host paths.
+  // Defaulted false (native access).
+  virtual bool fs_sandboxed() const { return false; }
+
+  // The real directory the sandbox root maps to, or {} when not
+  // sandboxed. Server-side only (never surfaced to a sandboxed client),
+  // it lets a browser list the root itself -- confine_path("/") rejects
+  // the empty relative path, so the root needs this direct handle.
+  virtual std::filesystem::path fs_sandbox_root() const { return {}; }
+
+  // Real host prefixes the sandbox grants pass-through access to
+  // (web-ui --white-list-path), or empty. A browser can offer these as
+  // reachable "mounts"; confine_path() accepts absolute paths inside
+  // them unchanged. Defaulted empty.
+  virtual std::vector<std::filesystem::path> fs_whitelist() const
+  {
+    return {};
   }
 };
 

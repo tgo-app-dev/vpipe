@@ -55,6 +55,19 @@ public:
     return static_cast<unsigned>(_in_readers.size());
   }
 
+  // True iff positional iport `p` is wired to a producer. A declared
+  // but DISCONNECTED (optional) iport reads as immediate EOS; this
+  // distinguishes "unwired" from "wired producer that has finished".
+  // Stages with optional inputs (e.g. hls-broadcast video vs audio)
+  // branch on this at launch instead of a config flag.
+  bool
+  iport_connected(unsigned p) const noexcept
+  {
+    return p < _in_readers.size()
+        && _in_readers[p] != nullptr
+        && _in_readers[p]->parent() != nullptr;
+  }
+
   // Non-blocking count of unread items on iport `p`. Returns 0 when
   // the cursor is fully drained (a subsequent read() would suspend
   // until the producer writes again) and a positive value when at

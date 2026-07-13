@@ -27,6 +27,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,10 +88,17 @@ public:
   // `audio` samples the per-codebook audio codes, `text` the free text token
   // (both greedy by default). `seed` 0 => nondeterministic. Returns the
   // generated rows [G][1+n_vq]; stops at <|im_end|> or max_new_tokens.
+  // `should_stop`, when set, is polled once per generated step; returning true
+  // ends generation early (after the current row) -- the barge-in hook the TTS
+  // stage uses to abort an in-flight utterance when new text arrives. The rows
+  // produced so far are still returned (and decoded); the delay-pattern tail
+  // that never completes is dropped by the caller's de-delay. Default {} runs
+  // to <|im_end|> or max_new_tokens as before.
   std::vector<std::vector<std::int32_t>> generate_delay(
       const std::vector<std::vector<std::int32_t>>& prompt,
       int max_new_tokens, const MossSampling& audio = {},
-      const MossSampling& text = {}, std::uint64_t seed = 0);
+      const MossSampling& text = {}, std::uint64_t seed = 0,
+      const std::function<bool()>& should_stop = {});
 
   // Greedy convenience wrapper (used by the load-time warmup + verification).
   std::vector<std::vector<std::int32_t>> generate_delay_greedy(

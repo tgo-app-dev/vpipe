@@ -93,6 +93,8 @@ const char* const kUsage =
   "\n"
   "Other:\n"
   "  --config CFG                session config (inline JSON or file path).\n"
+  "  --plugin PATH               load a plugin .dylib at startup "
+  "(repeatable).\n"
   "  --help, -h                  print this help.\n";
 
 int
@@ -305,8 +307,9 @@ build_full(SessionIntf* s, const Launch& L)
 int
 run(int argc, char** argv)
 {
-  std::string           config;
-  std::vector<Launch>   launches;
+  std::string              config;
+  std::vector<Launch>      launches;
+  std::vector<std::string> plugins;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -316,6 +319,9 @@ run(int argc, char** argv)
     } else if (a == "--config") {
       if (++i >= argc) { return arg_err("--config needs a value"); }
       config = argv[i];
+    } else if (a == "--plugin") {
+      if (++i >= argc) { return arg_err("--plugin needs a path"); }
+      plugins.push_back(argv[i]);
     } else if (a == "--launch") {
       if (++i >= argc) { return arg_err("--launch needs a spec"); }
       launches.push_back({Launch::Full, argv[i], {}});
@@ -338,6 +344,20 @@ run(int argc, char** argv)
   if (launches.empty()) {
     std::fputs(kUsage, stderr);
     return 2;
+  }
+
+  // --plugin PATH (repeatable): fold into VPIPE_PLUGINS (after any
+  // pre-existing value) so the session's plugin-load hook picks them up
+  // when it constructs. Config here is an opaque string (inline JSON or a
+  // file path), so the env is the clean injection point.
+  if (!plugins.empty()) {
+    std::string joined;
+    if (const char* ex = std::getenv("VPIPE_PLUGINS")) { joined = ex; }
+    for (const std::string& p : plugins) {
+      if (!joined.empty()) { joined += ':'; }
+      joined += p;
+    }
+    ::setenv("VPIPE_PLUGINS", joined.c_str(), 1);
   }
 
   SessionManager& mgr = SessionManager::get();

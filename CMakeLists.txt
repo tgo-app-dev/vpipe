@@ -85,6 +85,7 @@ add_subdirectory(include)
 add_subdirectory(interfaces)
 add_subdirectory(common)
 add_subdirectory(pipeline)
+add_subdirectory(plugin)
 add_subdirectory(stages)
 if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     add_subdirectory(apple-silicon)
@@ -114,6 +115,10 @@ if(VPIPE_SOURCES)
     add_library(vpipe SHARED ${VPIPE_SOURCES} ${VPIPE_HEADERS})
     target_include_directories(vpipe
         PUBLIC
+            # Root, so a consumer of vpipe::vpipe resolves the SDK's
+            # root-relative includes ("pipeline/stage.h", ...) in-tree;
+            # the install prefix serves the same layout under include/.
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:include>
         PRIVATE
@@ -201,6 +206,53 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal_cpp_foundation)
 endif()
 
+# In-repo test plugin: a standalone MODULE .dylib built against libvpipe,
+# used by the plugin-loader unit test to exercise the real dlopen ->
+# register -> instantiate path. Defined here (not in tests/) because the
+# `vpipe` target only exists at root scope after the accumulation subdirs.
+# Its path is handed to the test as a compile definition.
+add_library(vpipe_test_echo_plugin MODULE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins/echo-plugin/echo-plugin.cc)
+set_target_properties(vpipe_test_echo_plugin PROPERTIES PREFIX "")
+target_include_directories(vpipe_test_echo_plugin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR})
+target_compile_features(vpipe_test_echo_plugin PRIVATE cxx_std_20)
+target_link_libraries(vpipe_test_echo_plugin PRIVATE vpipe)
+# A two-level-namespace MODULE already errors on undefined symbols by
+# default -- so a missing libvpipe symbol fails at plugin-link time rather
+# than silently at dlopen. (We must NOT inherit libvpipe's own
+# -undefined dynamic_lookup, which is PRIVATE to it and not transitive.)
+add_dependencies(vpipe_test vpipe_test_echo_plugin)
+if(TARGET vpipe_unit_tests)
+    target_compile_definitions(vpipe_unit_tests PRIVATE
+        VPIPE_TEST_ECHO_PLUGIN="$<TARGET_FILE:vpipe_test_echo_plugin>")
+endif()
+
+# A standalone .metallib compiled offline (NOT embedded into libvpipe),
+# mimicking how a plugin ships its own shaders. The plugin-metal-library
+# test registers it at runtime via MetalCompute::register_metal_library.
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
+    set(_probe_src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins/metal-kernel/plugin_probe.metal)
+    set(_probe_air ${CMAKE_BINARY_DIR}/plugin_probe.air)
+    set(_probe_lib ${CMAKE_BINARY_DIR}/plugin_probe.metallib)
+    add_custom_command(
+        OUTPUT ${_probe_lib}
+        COMMAND xcrun -sdk macosx metal -c ${_probe_src} -o ${_probe_air}
+        COMMAND xcrun -sdk macosx metallib ${_probe_air} -o ${_probe_lib}
+        DEPENDS ${_probe_src}
+        COMMENT "Compiling plugin_probe.metal -> plugin_probe.metallib (test)"
+        VERBATIM)
+    add_custom_target(vpipe_test_probe_metallib DEPENDS ${_probe_lib})
+    add_dependencies(vpipe_test vpipe_test_probe_metallib)
+    if(TARGET vpipe_unit_tests)
+        target_compile_definitions(vpipe_unit_tests PRIVATE
+            VPIPE_TEST_PROBE_METALLIB="${_probe_lib}")
+    endif()
+endif()
+
 # Applications shipping with libvpipe -- one subdir per app, each
 # building its own executable that links the vpipe shared library.
 add_subdirectory(apps)
@@ -221,6 +273,97 @@ install(TARGETS vpipe
 install(DIRECTORY include/vpipe
     DESTINATION include
 )
+
+# ---- plugin SDK: find_package(vpipe) + curated dev headers ----------
+# Emit the export set (declared on install(TARGETS) above) and generate a
+# package config so an out-of-tree plugin can find_package(vpipe) and link
+# vpipe::vpipe. See docs/PLUGINS.md + cmake/vpipePluginHelpers.cmake.
+install(EXPORT vpipeTargets
+    NAMESPACE vpipe::
+    FILE vpipeTargets.cmake
+    DESTINATION lib/cmake/vpipe)
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipeConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfig.cmake
+    INSTALL_DESTINATION lib/cmake/vpipe)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)   # SOVERSION 0 == major
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfigVersion.cmake
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipePluginHelpers.cmake
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipe-embed-metallib.cmake
+    DESTINATION lib/cmake/vpipe)
+
+# Curated SDK headers, installed under include/ preserving their
+# root-relative dirs so `#include "pipeline/stage.h"` resolves from the
+# prefix. Lists are the exact include-closures of the plugin entry points
+# (stage: typed-stage + runtime-context + job + flex-data + plugin/*).
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/beat-payload-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/flex-data.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/i18n.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/job.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/oport-policy.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/session-member.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/vertex.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-format.h
+    DESTINATION include/common)
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/session-context-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/ui-delegate-intf.h
+    DESTINATION include/interfaces)
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/edge-reader.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/oport-buffer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/runtime-context.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-config.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-registry.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-spec.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/typed-stage.h
+    DESTINATION include/pipeline)
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-abi.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-context.h
+    DESTINATION include/plugin)
+# Model + Metal SDK (apple-silicon axis only, same gate as the build).
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/context-manager.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/loaded-language-model.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-loader.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
+        DESTINATION include/generative-models)
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/buffer-view.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/command-stream.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/compute-encoder.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/compute-library.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/event.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/fence.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/metal-compute.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/shared-buffer.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/texture.h
+        DESTINATION include/apple-silicon/metal-compute)
+    # CoreML SDK: the model manager + the vendored CoreML C++ wrapper. A
+    # CoreML plugin is just a stage that loads a model via
+    # session()->coreml_model_manager() and decodes tensors to Beats; the
+    # vendored coreml-cpp/*.hpp let it touch CML::Model* directly.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/coreml/coreml-model-manager.h
+        DESTINATION include/apple-silicon/coreml)
+    install(DIRECTORY apple-silicon/coreml/coreml-cpp
+        DESTINATION include/apple-silicon/coreml
+        FILES_MATCHING PATTERN "*.hpp")
+endif()
+
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
     DESTINATION share/doc/vpipe
 )

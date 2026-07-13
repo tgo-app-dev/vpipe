@@ -1284,7 +1284,7 @@ const StageSpec kSpec = {
                "track_ids to yolo detections across frames (Kalman + "
                "two-stage IoU/Hungarian). Forwards confirmed detections.",
   .display_name = "ByteTrack",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Vision,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,

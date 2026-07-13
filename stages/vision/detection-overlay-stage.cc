@@ -513,7 +513,7 @@ const StageSpec kSpec = {
                "audio tag + timestamp) onto each RGB frame. iport0/1 + "
                "oport0 share the video clock; iport2 (audio) is separate.",
   .display_name = "Detection Overlay",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Vision,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,

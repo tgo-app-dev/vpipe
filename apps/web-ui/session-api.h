@@ -84,6 +84,7 @@ private:
   HttpResponse h_stage_types_(const HttpRequest&);
   HttpResponse h_list_pipelines_(const HttpRequest&);
   HttpResponse h_create_pipeline_(const HttpRequest&);
+  HttpResponse h_rename_pipeline_(const HttpRequest&);
   HttpResponse h_load_pipeline_(const HttpRequest&);
   HttpResponse h_get_pipeline_(const HttpRequest&);
   HttpResponse h_save_pipeline_(const HttpRequest&);
@@ -97,6 +98,8 @@ private:
   HttpResponse h_buffer_status_(const HttpRequest&);
   HttpResponse h_insert_stage_(const HttpRequest&);
   HttpResponse h_remove_stage_(const HttpRequest&);
+  HttpResponse h_rename_stage_(const HttpRequest&);
+  HttpResponse h_duplicate_stage_(const HttpRequest&);
   // Edge editing for the composer. connect re-points an existing
   // input port (in place, via PipelineHandle::move_iport) or appends a
   // new one (re-materialize); disconnect drops an input. Both are
@@ -137,9 +140,18 @@ private:
   // the view shows its delete controls only when mutation is allowed.
   HttpResponse h_db_list_(const HttpRequest&);
   HttpResponse h_db_keys_(const HttpRequest&);
+  // Streaming value-filtered scan: writes NDJSON records (meta / row* /
+  // done) incrementally as matches are found, so a large result set (up
+  // to 64k rows) reaches the client progressively.
+  void         h_db_scan_stream_(const HttpRequest&, ResponseStream&);
   HttpResponse h_db_value_(const HttpRequest&);
   HttpResponse h_db_delete_key_(const HttpRequest&);
   HttpResponse h_db_drop_(const HttpRequest&);
+
+  // Installed (registered) models, enriched with catalogue metadata
+  // (category / input-output modalities / parent linkage) for the web-ui
+  // compatibility-aware model browser.
+  HttpResponse h_models_installed_(const HttpRequest&);
 
   // System-level metrics for the bottom status bar (GPU util / memory
   // through IOKit + MLX). Always available; no auth state needed
@@ -165,6 +177,19 @@ private:
   // {streams:[{pipeline,stage,state,playlist_name,port,bind_address}]}.
   HttpResponse h_hls_streams_(const HttpRequest&);
 
+  // Active preview streams (live "preview" stages) for the User I/O
+  // workspace's low-latency Preview view. Enumerates the live "preview"
+  // stages and reports each one's coordinates + best-effort media hints:
+  // {streams:[{pipeline,stage,state,title,video,audio,width,height}]}.
+  HttpResponse h_preview_streams_(const HttpRequest&);
+  // Long-lived preview WebSocket (single-origin transport; see
+  // common/preview-channel.h for the message protocol). Resolves the live
+  // "preview" stage named by the :pipeline/:stage path params, subscribes
+  // to its PreviewChannel, and relays its messages (fMP4 init/fragments +
+  // PCM) to the browser until the client disconnects or the stage stops.
+  // Closes immediately when no such live stage exists.
+  void h_preview_ws_(const HttpRequest&, WebSocket&);
+
   // Performance profiler: start/stop the session's per-worker event
   // capture and retrieve the captured timeline. start accepts optional
   // {max_events}; data returns the dump_profiling document (live while
@@ -179,6 +204,9 @@ private:
   // server's cwd, used to populate the Load-Pipeline dialog's
   // autocomplete.
   HttpResponse h_cwd_pipelines_(const HttpRequest&);
+  // GET /api/fs/list?path= : one directory's entries for the file
+  // open/save dialog, in the session's (possibly sandboxed) namespace.
+  HttpResponse h_fs_list_(const HttpRequest&);
 
   // ---- internals -------------------------------------------------
   Pipe* find_(const std::string& id);

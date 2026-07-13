@@ -54,7 +54,7 @@ namespace vpipe {
 // domain).
 //
 // `crossers` contains every stage with ports in two or more distinct
-// domains (e.g. video-file-decoder reading packets in one domain and
+// domains (e.g. load-video reading packets in one domain and
 // emitting frames in another).
 //
 // `intra_domain_cycle` is set to true if the directed sub-graph

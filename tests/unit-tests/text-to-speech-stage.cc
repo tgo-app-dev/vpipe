@@ -68,6 +68,18 @@ TEST(text_to_speech_stage, config_defaults) {
   EXPECT_TRUE(s.max_frames() == 1000);  // v1.5-only default
   EXPECT_TRUE(s.num_oports() == 1);     // PCM oport
   EXPECT_TRUE(s.clips_emitted() == 0u);
+  EXPECT_TRUE(s.interrupt_on_new_text());   // barge-in default ON
+  EXPECT_TRUE(s.config_error().empty());
+}
+
+// interrupt_on_new_text parses and can be disabled.
+TEST(text_to_speech_stage, interrupt_on_new_text_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/a","codec_dir":"/b","interrupt_on_new_text":false})");
+  TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, std::move(cfg));
+  EXPECT_FALSE(s.interrupt_on_new_text());
   EXPECT_TRUE(s.config_error().empty());
 }
 
@@ -127,6 +139,10 @@ TEST(text_to_speech_stage, spec_ports) {
   if (sp.iports.size() == 2u) {
     EXPECT_TRUE(sp.iports[0].name == "text");
     EXPECT_TRUE(sp.iports[1].name == "audio-ref");
+    // audio-ref is its own clock domain (sticky, arrives independently of the
+    // text stream + PCM output, which share group 0).
+    EXPECT_TRUE(sp.iports[0].clock_group == sp.oports[0].clock_group);
+    EXPECT_TRUE(sp.iports[1].clock_group != sp.iports[0].clock_group);
   }
   if (sp.oports.size() == 1u) {
     EXPECT_TRUE(sp.oports[0].name == "pcm");
@@ -366,6 +382,10 @@ TEST(text_to_speech_stage, metal_voice_lock_smoke) {
     o.insert("codec_dir", FlexData::make_string(cc));
     o.insert("max_new_tokens", FlexData::make_int(512));
     o.insert("voice_lock", FlexData::make_bool(true));
+    // voice_lock spans multiple beats, so both must generate fully -- opt out
+    // of the default barge-in (which would abort the first beat the instant the
+    // second is queued, leaving nothing to design the locked voice from).
+    o.insert("interrupt_on_new_text", FlexData::make_bool(false));
   }
   auto tts = make_unique<TextToSpeechStage>(
       &sess, "tts", vector<InEdge>{ { txtsrc, 0 } }, std::move(cfg));

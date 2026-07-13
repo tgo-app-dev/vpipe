@@ -2,11 +2,14 @@
 #include "apps/web-ui/web-ui-delegate.h"
 #include "apps/web-ui/web-ui-log-delegate.h"
 #include "apps/web-ui/db-browser.h"
+#include "apps/web-ui/model-browser.h"
 #include "apps/web-ui/system-status.h"
 
 #include "interfaces/log-delegate-intf.h"
 #include "interfaces/session-context-intf.h"
 #include "common/graph.h"
+#include "common/preview-channel.h"
+#include "common/temp-root.h"
 #include "common/i18n.h"
 #include "common/vertex.h"
 #include "common/vpipe-format.h"
@@ -17,6 +20,8 @@
 #include "pipeline/stage.h"
 #include "pipeline/stage-registry.h"
 #include "vpipe/session-intf.h"
+
+#include "common/host-net.h"
 
 #include <algorithm>
 #include <cctype>
@@ -71,6 +76,16 @@ blank_(const string& s)
   return true;
 }
 
+// Strip leading/trailing ASCII whitespace (for user-supplied ids).
+string
+trim_(const string& s)
+{
+  const auto b = s.find_first_not_of(" \t\r\n");
+  if (b == string::npos) { return {}; }
+  const auto e = s.find_last_not_of(" \t\r\n");
+  return s.substr(b, e - b + 1);
+}
+
 optional<FlexData>
 parse_json_body_(const HttpRequest& req)
 {
@@ -108,6 +123,37 @@ query_param_(const string& query, const string& key)
     i = amp + 1;
   }
   return {};
+}
+
+// Percent-decode a query-string value (e.g. "%2Fa%20b" -> "/a b"). The
+// client sends paths via encodeURIComponent, which escapes '/', spaces
+// and non-ASCII, so a path query param must be decoded before use.
+// '+' is left literal (encodeURIComponent uses %20 for space, %2B for a
+// real '+'); a malformed trailing '%' is passed through unchanged.
+string
+url_decode_(const string& s)
+{
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+  };
+  string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      const int hi = hex(s[i + 1]);
+      const int lo = hex(s[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(s[i]);
+  }
+  return out;
 }
 
 // Resolve a PipelineHandle to its live Pipeline graph (internal).
@@ -301,6 +347,9 @@ SessionApi::materialize_(Pipe& p, string& err)
       const StageSpec& st = p.stages[i];
       bool ready = true;
       for (auto& [src, op] : st.iports) {
+        // An empty src is a DISCONNECTED (optional) iport -- no
+        // dependency to wait for.
+        if (src.empty()) { continue; }
         if (by_id.find(src) == by_id.end()) { ready = false; break; }
       }
       if (!ready) { continue; }
@@ -308,7 +357,11 @@ SessionApi::materialize_(Pipe& p, string& err)
       vector<StagePortHandle> iports;
       iports.reserve(st.iports.size());
       for (auto& [src, op] : st.iports) {
-        iports.push_back(StagePortHandle{ by_id.at(src), op });
+        // Empty src -> a null StageHandle keeps the positional slot
+        // unwired (see PipelineHandle::insert_stage).
+        iports.push_back(src.empty()
+            ? StagePortHandle{ StageHandle{}, 0 }
+            : StagePortHandle{ by_id.at(src), op });
       }
       string cfg = st.config.is_object() ? st.config.to_json()
                                          : string("{}");
@@ -406,6 +459,10 @@ SessionApi::graph_json_(const Pipe& p) const
         auto peo = pe.as_object();
         peo.insert("index", FlexData::make_uint(i));
         peo.insert("type", fstr_(demangle_(s->iport_payload_type(i))));
+        const std::string_view itags = s->iport_payload_tags(i);
+        if (!itags.empty()) {
+          peo.insert("tags", FlexData::make_string(itags));
+        }
         peo.insert("clock",
                    FlexData::make_uint(s->iport_clock_group(i)));
         ia.push_back(std::move(pe));
@@ -419,6 +476,10 @@ SessionApi::graph_json_(const Pipe& p) const
         auto peo = pe.as_object();
         peo.insert("index", FlexData::make_uint(i));
         peo.insert("type", fstr_(demangle_(s->oport_payload_type(i))));
+        const std::string_view otags = s->oport_payload_tags(i);
+        if (!otags.empty()) {
+          peo.insert("tags", FlexData::make_string(otags));
+        }
         peo.insert("clock",
                    FlexData::make_uint(s->oport_clock_group(i)));
         oa.push_back(std::move(pe));
@@ -550,6 +611,11 @@ ports_to_flex_(std::span<const PortSpec> ports)
     oo.insert("name", FlexData::make_string(p.name));
     oo.insert("doc",  FlexData::make_string(p.doc));
     oo.insert("type", FlexData::make_string(demangle_(p.type)));
+    // Optional finer-grained payload tags (comma-separated, OR semantics);
+    // the composer checks them on top of the beat type. Omitted when empty.
+    if (!p.tags.empty()) {
+      oo.insert("tags", FlexData::make_string(p.tags));
+    }
     a.push_back(std::move(o));
   }
   return arr;
@@ -650,6 +716,51 @@ SessionApi::h_create_pipeline_(const HttpRequest& req)
 }
 
 HttpResponse
+SessionApi::h_rename_pipeline_(const HttpRequest& req)
+{
+  auto body = parse_json_body_(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "invalid JSON body");
+  }
+  lock_guard<mutex> lk(_mu);
+  auto it = req.params.find("id");
+  Pipe* p = (it != req.params.end()) ? find_(it->second) : nullptr;
+  if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+  if (p->state != State::Stopped) {
+    return HttpResponse::error(409, "stop the pipeline before renaming");
+  }
+  string to = trim_(string(body->as_object().contains("to")
+                               ? body->as_object().at("to").as_string("")
+                               : ""));
+  if (to.empty()) {
+    return HttpResponse::error(400, "missing new pipeline id 'to'");
+  }
+  const string old = p->id;
+  if (to != old) {
+    if (find_(to)) {
+      return HttpResponse::error(
+          409, "pipeline '" + to + "' already exists");
+    }
+    // Re-materialize under the new id (the live handle is keyed by id).
+    p->id = to;
+    string err;
+    if (!materialize_(*p, err)) {
+      p->id = old;                    // revert + restore the old handle
+      string e2;
+      materialize_(*p, e2);
+      return HttpResponse::error(500, err);
+    }
+  }
+  FlexData detail = FlexData::make_object();
+  auto d = detail.as_object();
+  d.insert("id", fstr_(p->id));
+  d.insert("state", fstr_(state_name_(p->state)));
+  d.insert("storage_path", fstr_(p->storage_path));
+  d.insert("graph", graph_json_(*p));
+  return HttpResponse::json(200, detail.to_json());
+}
+
+HttpResponse
 SessionApi::h_load_pipeline_(const HttpRequest& req)
 {
   auto body = parse_json_body_(req);
@@ -661,8 +772,21 @@ SessionApi::h_load_pipeline_(const HttpRequest& req)
                            : "");
   if (path.empty()) { return HttpResponse::error(400, "missing 'path'"); }
 
+  // Confine the read to the filesystem sandbox. The client speaks the
+  // sandbox's virtual namespace; `path` stays the virtual path we
+  // remember for display, `real` is the file actually opened.
+  string cerr;
+  std::filesystem::path real =
+      _sctx ? _sctx->confine_path(path, /*for_write=*/false, &cerr)
+            : std::filesystem::path(path);
+  if (real.empty()) {
+    return HttpResponse::error(
+        400, "path '" + path + "' rejected: "
+                 + (cerr.empty() ? "outside sandbox" : cerr));
+  }
+
   lock_guard<mutex> lk(_mu);
-  PipelineHandle h = _session->load_pipeline(path);
+  PipelineHandle h = _session->load_pipeline(real.string());
   if (!h.valid()) {
     return HttpResponse::error(400, "failed to load '" + path + "'");
   }
@@ -706,6 +830,12 @@ SessionApi::h_load_pipeline_(const HttpRequest& req)
             auto ia = ipF.as_array();
             for (size_t j = 0; j < ia.size(); ++j) {
               FlexData pe = ia.at(j);
+              // A null element (or an object with empty/missing src) is
+              // a DISCONNECTED iport that keeps its positional slot.
+              if (pe.is_null()) {
+                st.iports.emplace_back(string(), 0u);
+                continue;
+              }
               if (!pe.is_object()) { continue; }
               auto peo = pe.as_object();
               string src = string(peo.contains("src")
@@ -766,8 +896,20 @@ SessionApi::h_save_pipeline_(const HttpRequest& req)
   if (path.empty()) {
     return HttpResponse::error(400, "no path given and none remembered");
   }
+  // Confine the write to the filesystem sandbox (the client works in the
+  // sandbox's virtual namespace; `path` stays the virtual path we echo
+  // and remember, `real` is where the bytes actually land).
+  string cerr;
+  std::filesystem::path real =
+      _sctx ? _sctx->confine_path(path, /*for_write=*/true, &cerr)
+            : std::filesystem::path(path);
+  if (real.empty()) {
+    return HttpResponse::error(
+        400, "path '" + path + "' rejected: "
+                 + (cerr.empty() ? "outside sandbox" : cerr));
+  }
   FlexData spec = to_flex_spec_(*p);
-  ofstream f(path, ios::binary);
+  ofstream f(real, ios::binary);
   if (!f) {
     return HttpResponse::error(500, "cannot open '" + path + "' for write");
   }
@@ -938,13 +1080,23 @@ SessionApi::h_insert_stage_(const HttpRequest& req)
     auto ia = ipF.as_array();
     for (size_t j = 0; j < ia.size(); ++j) {
       FlexData pe = ia.at(j);
+      // A null element is a DISCONNECTED iport (positional gap).
+      if (pe.is_null()) {
+        st.iports.emplace_back(string(), 0u);
+        continue;
+      }
       if (!pe.is_object()) { continue; }
       auto peo = pe.as_object();
       string src = string(peo.contains("src")
                               ? peo.at("src").as_string("") : "");
       unsigned op = static_cast<unsigned>(
           peo.contains("oport") ? peo.at("oport").as_uint(0) : 0);
-      // Topological insert: every source must already exist.
+      // An empty src is a disconnected iport -- no source to resolve.
+      if (src.empty()) {
+        st.iports.emplace_back(string(), 0u);
+        continue;
+      }
+      // Topological insert: every (real) source must already exist.
       if (find_if(p->stages.begin(), p->stages.end(),
                   [&](const StageSpec& s) { return s.id == src; })
           == p->stages.end()) {
@@ -988,6 +1140,20 @@ SessionApi::h_insert_stage_(const HttpRequest& req)
             400, "Beat type mismatch on iport " + to_string(i) +
                  " of '" + st.id + "': " + demangle_(b) +
                  " cannot accept " + demangle_(a));
+      }
+      // Deeper check: payload tags (finer constraint on the beat type).
+      const std::string_view atg =
+          src ? src->oport_payload_tags(ins[i].p) : std::string_view{};
+      const std::string_view btg =
+          ns->iport_payload_tags(static_cast<unsigned>(i));
+      if (!port_tags_compatible(atg, btg)) {
+        p->stages.pop_back();
+        string e2;
+        materialize_(*p, e2);
+        return HttpResponse::error(
+            400, "Payload tag mismatch on iport " + to_string(i) +
+                 " of '" + st.id + "': {" + string(btg) +
+                 "} cannot accept {" + string(atg) + "}");
       }
     }
   }
@@ -1044,6 +1210,148 @@ SessionApi::h_remove_stage_(const HttpRequest& req)
 }
 
 HttpResponse
+SessionApi::h_rename_stage_(const HttpRequest& req)
+{
+  auto body = parse_json_body_(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "invalid JSON body");
+  }
+  lock_guard<mutex> lk(_mu);
+  auto pit = req.params.find("id");
+  auto sit = req.params.find("sid");
+  Pipe* p = (pit != req.params.end()) ? find_(pit->second) : nullptr;
+  if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+  if (sit == req.params.end()) {
+    return HttpResponse::error(400, "missing stage id");
+  }
+  if (p->state != State::Stopped) {
+    return HttpResponse::error(409, "stop the pipeline before editing");
+  }
+  const string& sid = sit->second;
+  string to = trim_(string(body->as_object().contains("to")
+                               ? body->as_object().at("to").as_string("")
+                               : ""));
+  if (to.empty()) {
+    return HttpResponse::error(400, "missing new stage id 'to'");
+  }
+  auto target = find_if(p->stages.begin(), p->stages.end(),
+                        [&](const StageSpec& s) { return s.id == sid; });
+  if (target == p->stages.end()) {
+    return HttpResponse::error(404, "no such stage '" + sid + "'");
+  }
+  if (to != sid) {
+    if (find_if(p->stages.begin(), p->stages.end(),
+                [&](const StageSpec& s) { return s.id == to; })
+        != p->stages.end()) {
+      return HttpResponse::error(
+          409, "stage '" + to + "' already exists");
+    }
+    // Rename the stage AND rewrite every iport that sources from it, so
+    // the edges follow. Then rebuild the live graph.
+    target->id = to;
+    for (StageSpec& s : p->stages) {
+      for (auto& [src, op] : s.iports) {
+        if (src == sid) { src = to; }
+      }
+    }
+    string err;
+    if (!materialize_(*p, err)) {
+      target->id = sid;                 // revert both the id and the edges
+      for (StageSpec& s : p->stages) {
+        for (auto& [src, op] : s.iports) {
+          if (src == to) { src = sid; }
+        }
+      }
+      string e2;
+      materialize_(*p, e2);
+      return HttpResponse::error(500, err);
+    }
+  }
+  FlexData detail = FlexData::make_object();
+  auto d = detail.as_object();
+  d.insert("id", fstr_(p->id));
+  d.insert("state", fstr_(state_name_(p->state)));
+  d.insert("graph", graph_json_(*p));
+  return HttpResponse::json(200, detail.to_json());
+}
+
+// Duplicate a stage: deep-copy its type + config (its SETTINGS) under a
+// fresh, non-colliding id -- the source id plus a numeric suffix ("-2",
+// "-3", ...) as the composer's suggestId does. The copy carries NO input
+// connections (a duplicate clones settings, not wiring), so the operator
+// wires it where they want. Optional body {to} overrides the generated id
+// (rejected if it collides). Stopped-only, like the other topology edits.
+HttpResponse
+SessionApi::h_duplicate_stage_(const HttpRequest& req)
+{
+  lock_guard<mutex> lk(_mu);
+  auto pit = req.params.find("id");
+  auto sit = req.params.find("sid");
+  Pipe* p = (pit != req.params.end()) ? find_(pit->second) : nullptr;
+  if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+  if (sit == req.params.end()) {
+    return HttpResponse::error(400, "missing stage id");
+  }
+  if (p->state != State::Stopped) {
+    return HttpResponse::error(409, "stop the pipeline before editing");
+  }
+  const string& sid = sit->second;
+  auto src = find_if(p->stages.begin(), p->stages.end(),
+                     [&](const StageSpec& s) { return s.id == sid; });
+  if (src == p->stages.end()) {
+    return HttpResponse::error(404, "no such stage '" + sid + "'");
+  }
+
+  auto taken = [&](const string& cand) {
+    return find_if(p->stages.begin(), p->stages.end(),
+                   [&](const StageSpec& s) { return s.id == cand; })
+           != p->stages.end();
+  };
+
+  // New id: an optional caller-supplied 'to', else source id + a numeric
+  // suffix that does not collide.
+  string new_id;
+  if (auto body = parse_json_body_(req); body && body->is_object()
+      && body->as_object().contains("to")) {
+    new_id = trim_(string(body->as_object().at("to").as_string("")));
+    if (!new_id.empty() && taken(new_id)) {
+      return HttpResponse::error(409, "stage '" + new_id + "' already exists");
+    }
+  }
+  if (new_id.empty()) {
+    for (int i = 2; ; ++i) {
+      string cand = sid + "-" + to_string(i);
+      if (!taken(cand)) { new_id = std::move(cand); break; }
+    }
+  }
+
+  // Build the copy fully from `src` BEFORE push_back (which may realloc the
+  // vector and dangle the iterator). config copy is a deep clone (FlexData
+  // has value semantics); iports are intentionally left empty.
+  StageSpec dup;
+  dup.id     = new_id;
+  dup.type   = src->type;
+  dup.config = src->config;
+  p->stages.push_back(std::move(dup));
+
+  string err;
+  if (!materialize_(*p, err)) {
+    p->stages.pop_back();
+    string e2;
+    materialize_(*p, e2);
+    return HttpResponse::error(400, err);
+  }
+
+  FlexData detail = FlexData::make_object();
+  auto d = detail.as_object();
+  d.insert("id", fstr_(p->id));
+  d.insert("state", fstr_(state_name_(p->state)));
+  d.insert("stage", fstr_(new_id));   // the freshly created copy's id
+  d.insert("graph", graph_json_(*p));
+  return HttpResponse::json(201, detail.to_json());
+}
+
+HttpResponse
 SessionApi::h_connect_(const HttpRequest& req)
 {
   auto body = parse_json_body_(req);
@@ -1093,13 +1401,12 @@ SessionApi::h_connect_(const HttpRequest& req)
   const bool has_tp = bo.contains("to_port");
   const unsigned tp = static_cast<unsigned>(
       has_tp ? bo.at("to_port").as_uint(0) : 0);
-  if (has_tp && tp > n) {
-    return HttpResponse::error(
-        400, "iport " + to_string(tp) + " out of range ('" + to +
-             "' has " + to_string(n) + " input(s))");
-  }
+  // repoint = fill an EXISTING port index (including one currently
+  // disconnected). Otherwise the connection targets `to_port`, padding
+  // any positions up to it with disconnected iports (a gap), or -- with
+  // no explicit to_port -- appends at the current end.
   const bool repoint = has_tp && tp < n;
-  const unsigned target_port = repoint ? tp : static_cast<unsigned>(n);
+  const unsigned target_port = has_tp ? tp : static_cast<unsigned>(n);
 
   // Beat-type agreement check up front. iport_payload_type/
   // oport_payload_type are pure functions of the port index (the
@@ -1115,6 +1422,16 @@ SessionApi::h_connect_(const HttpRequest& req)
           400, "Beat type mismatch on iport " + to_string(target_port) +
                " of '" + to + "': " + demangle_(b) +
                " cannot accept " + demangle_(a));
+    }
+    // Deeper check: payload tags (finer constraint on the beat type).
+    const std::string_view atg =
+        lfrom ? lfrom->oport_payload_tags(from_port) : std::string_view{};
+    const std::string_view btg = lt->iport_payload_tags(target_port);
+    if (!port_tags_compatible(atg, btg)) {
+      return HttpResponse::error(
+          400, "Payload tag mismatch on iport " + to_string(target_port) +
+               " of '" + to + "': {" + string(btg) +
+               "} cannot accept {" + string(atg) + "}");
     }
   }
 
@@ -1132,11 +1449,17 @@ SessionApi::h_connect_(const HttpRequest& req)
           "' -> '" + to + "' iport " + to_string(tp));
     }
   } else {
-    // Append a new input -- changes arity, so rebuild from the spec.
+    // Append a new input (or fill a gap at/after the current end) --
+    // changes arity, so rebuild from the spec. Pad the positions
+    // between the current end and target_port with disconnected iports.
+    auto saved = to_it->iports;
+    while (to_it->iports.size() < target_port) {
+      to_it->iports.emplace_back(string(), 0u);
+    }
     to_it->iports.emplace_back(from, from_port);
     string err;
     if (!materialize_(*p, err)) {
-      to_it->iports.pop_back();
+      to_it->iports = std::move(saved);
       string e2;
       materialize_(*p, e2);
       return HttpResponse::error(400, err);
@@ -1186,12 +1509,20 @@ SessionApi::h_disconnect_(const HttpRequest& req)
              "' has " + to_string(to_it->iports.size()) + " input(s))");
   }
 
-  // Disconnect shrinks the input list, so rebuild from the spec (a
-  // null in-place source can't be represented in the spec).
-  to_it->iports.erase(to_it->iports.begin() + static_cast<long>(tp));
-  string err;
-  if (!materialize_(*p, err)) {
-    return HttpResponse::error(500, err);
+  // Disconnect turns the input into a GAP (empty source) IN PLACE,
+  // preserving the positional index of every later input -- iports are
+  // positional, so a disconnected port must keep its slot rather than
+  // shift its neighbours. move_iport accepts an empty src_id (null
+  // source), so no rebuild is needed.
+  pair<string, unsigned> old = to_it->iports[tp];
+  to_it->iports[tp] = { string(), 0u };
+  if (!p->handle || !p->handle->move_iport(to, tp, "", 0)) {
+    to_it->iports[tp] = old;
+    string e2;
+    materialize_(*p, e2);
+    return HttpResponse::error(
+        400, "could not disconnect iport " + to_string(tp) + " of '"
+             + to + "'");
   }
   FlexData detail = FlexData::make_object();
   auto d = detail.as_object();
@@ -1428,13 +1759,141 @@ SessionApi::h_hls_streams_(const HttpRequest&)
       eo.insert("port",
                 FlexData::make_uint(
                     static_cast<uint64_t>(get_int("port", 8080))));
-      eo.insert("bind_address",
-                fstr_(get_str("bind_address", "0.0.0.0")));
+      // Report the RESOLVED bind address so the browser embeds a
+      // player URL that actually connects. An empty configured value
+      // is the stage's "auto" default; mirror the stage's own
+      // resolution (web-ui address, else en0's LAN IP, else 0.0.0.0)
+      // -- both inputs are stable for the session's life, so this
+      // matches what the live stage bound to.
+      string bind = get_str("bind_address", "");
+      if (bind.empty()) {
+        bind = _sctx ? _sctx->web_ui_bind_address() : string();
+        if (bind.empty()) {
+          const string lan = netx::primary_ipv4();
+          bind = lan.empty() ? string("0.0.0.0") : lan;
+        }
+      }
+      eo.insert("bind_address", fstr_(bind));
+      // Whether this broadcast carries an audio track: iport 1 (the strict
+      // audio role) is wired to a producer. The UI uses it to auto-unmute the
+      // player when a viewer attaches (a video-only stream stays muted).
+      const auto& ie = s->iport_edges();
+      const bool has_audio = ie.size() > 1 && ie[1].v != nullptr;
+      eo.insert("audio", FlexData::make_bool(has_audio));
       a.push_back(std::move(e));
     }
   }
   oo.insert("streams", std::move(arr));
   return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
+SessionApi::h_preview_streams_(const HttpRequest&)
+{
+  lock_guard<mutex> lk(_mu);
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  FlexData arr = FlexData::make_array();
+  auto a = arr.as_array();
+
+  for (auto& up : _pipes) {
+    const Pipe& p = *up;
+    // A launched (or paused) pipeline has live stages behind its channels;
+    // a stopped one serves nothing.
+    if (p.state == State::Stopped) { continue; }
+    if (!p.handle || !p.handle->valid()) { continue; }
+    Pipeline* pl = live_pipeline_(*p.handle);
+    if (!pl) { continue; }
+    for (auto it = pl->begin(); it != pl->end(); ++it) {
+      const Stage* s = dynamic_cast<const Stage*>(*it);
+      if (!s || string(s->type_name()) != "preview") { continue; }
+
+      // The channel exposes best-effort media hints (populated once the
+      // first frame flows); the authoritative config reaches the browser
+      // in the stream's own config frame, so a not-yet-started stream is
+      // still listed and playable.
+      const PreviewSource* src = dynamic_cast<const PreviewSource*>(s);
+      std::shared_ptr<PreviewChannel> ch =
+          src ? src->preview_channel() : nullptr;
+
+      // `title` config -> picker label; fall back to the stage id.
+      string title;
+      for (const auto& pr : s->config_params()) {
+        if (pr.key == "title") {
+          title = string(pr.current_value.as_string(""));
+          break;
+        }
+      }
+      if (title.empty()) { title = s->id(); }
+
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("pipeline", fstr_(p.id));
+      eo.insert("stage", fstr_(s->id()));
+      eo.insert("state", fstr_(state_name_(p.state)));
+      eo.insert("title", fstr_(title));
+      eo.insert("video",
+                FlexData::make_bool(ch ? ch->has_video() : false));
+      eo.insert("audio",
+                FlexData::make_bool(ch ? ch->has_audio() : false));
+      eo.insert("width", FlexData::make_uint(
+                    static_cast<uint64_t>(ch ? ch->width() : 0)));
+      eo.insert("height", FlexData::make_uint(
+                    static_cast<uint64_t>(ch ? ch->height() : 0)));
+      a.push_back(std::move(e));
+    }
+  }
+  oo.insert("streams", std::move(arr));
+  return HttpResponse::json(200, o.to_json());
+}
+
+void
+SessionApi::h_preview_ws_(const HttpRequest& req, WebSocket& ws)
+{
+  string pipeline;
+  string stage;
+  {
+    auto pit = req.params.find("pipeline");
+    auto sit = req.params.find("stage");
+    if (pit != req.params.end()) { pipeline = pit->second; }
+    if (sit != req.params.end()) { stage = sit->second; }
+  }
+
+  // Resolve the live stage's channel under _mu, then release it: the relay
+  // loop must not hold the API lock for the connection's whole life. The
+  // shared_ptr keeps the channel alive even if the pipeline is stopped
+  // (the stage's teardown then close()s it, ending this WebSocket).
+  std::shared_ptr<PreviewChannel> ch;
+  {
+    lock_guard<mutex> lk(_mu);
+    Pipe* p = find_(pipeline);
+    if (p && p->handle && p->handle->valid()) {
+      Stage* s = live_stage_(*p, stage);
+      if (s) {
+        auto* src = dynamic_cast<PreviewSource*>(s);
+        if (src) { ch = src->preview_channel(); }
+      }
+    }
+  }
+  if (!ch) {
+    return;   // no such live stage: let the WebSocket close.
+  }
+
+  auto sub = ch->subscribe();
+  for (;;) {
+    auto blob = ch->wait_frame(sub, 1000);
+    if (blob) {
+      if (!ws.send_binary(blob->data(), blob->size())) {
+        break;   // client gone (send failed)
+      }
+    } else if (ch->closed()) {
+      break;     // stream ended (pipeline stopped)
+    } else if (!ws.alive()) {
+      break;     // client gone
+    }
+    // else: a 1s wait timed out with nothing queued -> re-check + retry.
+  }
+  ch->unsubscribe(sub);
 }
 
 // -------------------------------------------------------------------
@@ -1445,9 +1904,7 @@ std::string
 SessionApi::profiler_dump_json_(std::string& err)
 {
   namespace fs = std::filesystem;
-  std::error_code ec;
-  fs::path dir = fs::temp_directory_path(ec);
-  if (ec) { dir = fs::path("."); }
+  const fs::path dir = vpipe::temp_root();
   // One temp file per process; _mu serializes profiler ops so reuse is
   // safe. ".json" extension selects dump_profiling's pretty-JSON form.
   fs::path tmp = dir / ("vpipe-webui-profiler-"
@@ -1606,6 +2063,164 @@ SessionApi::h_cwd_pipelines_(const HttpRequest&)
     }
   }
   oo.insert("files", std::move(arr));
+  return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
+SessionApi::h_fs_list_(const HttpRequest& req)
+{
+  // Directory listing for the web-ui file open/save dialog. Operates in
+  // the session's filesystem namespace: when the sandbox is active the
+  // client sees a chroot-like virtual tree whose root is "/" (real host
+  // paths never leave the server); otherwise the virtual path IS the
+  // host path. Read-only, non-recursive: one directory per call.
+  namespace fs = std::filesystem;
+  const bool sb = _sctx && _sctx->fs_sandboxed();
+  auto strip = [](string s) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == '/' || s[i] == '\\')) { ++i; }
+    return s.substr(i);
+  };
+
+  // The client encodes the path with encodeURIComponent (so '/', spaces
+  // and unicode survive the query string) -- decode it before use.
+  string   want = url_decode_(query_param_(req.query, "path"));
+  string   vpath;      // clean virtual path echoed to the client
+  fs::path real;       // real directory actually enumerated
+  std::error_code ec;
+  if (sb) {
+    if (want.empty()) { want = "/"; }
+    // Normalise inside the virtual space; lexically_normal collapses "."
+    // and clamps ".." at the root so the browser cannot point above it.
+    fs::path v =
+        fs::path("/" + strip(want)).lexically_normal();
+    vpath = v.generic_string();
+    if (vpath.empty()) { vpath = "/"; }
+    const string rel = strip(vpath);
+    if (rel.empty()) {
+      real = _sctx->fs_sandbox_root();
+    } else {
+      string cerr;
+      real = _sctx->confine_path(vpath, /*for_write=*/false, &cerr);
+      if (real.empty()) {
+        return HttpResponse::error(
+            400, "path '" + vpath + "' rejected: "
+                     + (cerr.empty() ? "outside sandbox" : cerr));
+      }
+    }
+  } else {
+    fs::path v = want.empty() ? fs::current_path(ec) : fs::path(want);
+    if (v.is_relative()) { v = fs::current_path(ec) / v; }
+    fs::path canon = fs::weakly_canonical(v, ec);
+    real  = (ec || canon.empty()) ? v.lexically_normal() : canon;
+    vpath = real.generic_string();
+  }
+
+  std::error_code de;
+  if (!fs::is_directory(real, de) || de) {
+    return HttpResponse::error(400, "not a directory: " + vpath);
+  }
+
+  // Whitelisted pass-through prefixes ("mounts") the browser can jump
+  // to, and whether `real` sits AT one -- if so, "up" returns to the
+  // sandbox home rather than a re-rooted parent confine would reject.
+  std::vector<fs::path> wl = _sctx ? _sctx->fs_whitelist()
+                                   : std::vector<fs::path>{};
+  bool at_wl_root = false;
+  if (!wl.empty()) {
+    std::error_code ce;
+    fs::path rc = fs::weakly_canonical(real, ce);
+    if (ce || rc.empty()) { rc = real.lexically_normal(); }
+    for (const auto& w : wl) {
+      if (rc == w) { at_wl_root = true; break; }
+    }
+  }
+
+  // Parent (virtual). Empty string == "already at the root, no parent".
+  string parent;
+  if (strip(vpath).empty()) {
+    parent = "";                       // sandbox root
+  } else if (sb && at_wl_root) {
+    parent = "/";                      // a granted mount -> up == home
+  } else {
+    fs::path pp = fs::path(vpath).parent_path();
+    if (pp.empty() || pp == fs::path(vpath)) {
+      parent = "";                     // native filesystem root
+    } else {
+      parent = pp.generic_string();
+      if (sb && parent.empty()) { parent = "/"; }
+    }
+  }
+
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("sandboxed", FlexData::make_bool(sb));
+  oo.insert("path", fstr_(vpath));
+  oo.insert("parent", fstr_(parent));
+  // Granted mounts (empty unless --white-list-path was given). Surfaced
+  // ONLY at the sandbox ROOT: they are shortcuts to jump OUT of the sandbox
+  // home, so repeating them inside every directory listing -- and inside a
+  // mount itself -- is just noise.
+  FlexData mounts = FlexData::make_array();
+  if (sb && strip(vpath).empty()) {
+    auto ma = mounts.as_array();
+    for (const auto& w : wl) {
+      FlexData mo = FlexData::make_object();
+      auto x = mo.as_object();
+      const std::string base = w.filename().string();
+      x.insert("name", fstr_(base.empty() ? w.generic_string() : base));
+      x.insert("path", fstr_(w.generic_string()));
+      ma.push_back(std::move(mo));
+    }
+  }
+  oo.insert("mounts", std::move(mounts));
+
+  struct Ent { string name; bool dir; uint64_t size; };
+  vector<Ent> ents;
+  for (auto it = fs::directory_iterator(
+           real, fs::directory_options::skip_permission_denied, ec);
+       !ec && it != fs::directory_iterator(); it.increment(ec)) {
+    std::error_code se;
+    const bool isdir = it->is_directory(se);
+    if (se) { continue; }
+    Ent e;
+    e.name = it->path().filename().string();
+    if (e.name.empty()) { continue; }
+    e.dir  = isdir;
+    e.size = 0;
+    if (!isdir) {
+      std::error_code re;
+      if (!it->is_regular_file(re) || re) { continue; }  // skip non-files
+      std::error_code ze;
+      const auto sz = fs::file_size(*it, ze);
+      e.size = ze ? 0 : static_cast<uint64_t>(sz);
+    }
+    ents.push_back(std::move(e));
+  }
+  auto ci_less = [](const string& a, const string& b) {
+    return std::lexicographical_compare(
+        a.begin(), a.end(), b.begin(), b.end(),
+        [](unsigned char x, unsigned char y) {
+          return std::tolower(x) < std::tolower(y);
+        });
+  };
+  std::sort(ents.begin(), ents.end(), [&](const Ent& a, const Ent& b) {
+    if (a.dir != b.dir) { return a.dir; }   // directories first
+    return ci_less(a.name, b.name);
+  });
+
+  FlexData arr = FlexData::make_array();
+  auto av = arr.as_array();
+  av.reserve(ents.size());
+  for (const auto& e : ents) {
+    FlexData eo = FlexData::make_object();
+    auto x = eo.as_object();
+    x.insert("name", fstr_(e.name));
+    x.insert("dir",  FlexData::make_bool(e.dir));
+    if (!e.dir) { x.insert("size", FlexData::make_uint(e.size)); }
+    av.push_back(std::move(eo));
+  }
+  oo.insert("entries", std::move(arr));
   return HttpResponse::json(200, o.to_json());
 }
 
@@ -1871,6 +2486,77 @@ SessionApi::h_db_keys_(const HttpRequest& req)
   return HttpResponse::json(200, doc.to_json());
 }
 
+void
+SessionApi::h_db_scan_stream_(const HttpRequest& req, ResponseStream& rs)
+{
+  rs.begin(200, "application/x-ndjson");
+  // Coalesce records into a buffer flushed every ~32 KB (and once at the
+  // end) so a 64k-row scan doesn't cost one send() per row while still
+  // reaching the client in small, timely chunks.
+  string buf;
+  buf.reserve(1u << 16);
+  bool alive = true;
+  auto flush = [&]() -> bool {
+    if (!buf.empty()) { alive = rs.write(buf); buf.clear(); }
+    return alive;
+  };
+  auto send_line = [&](const string& line) -> bool {
+    if (!alive) { return false; }
+    buf += line;
+    buf.push_back('\n');
+    if (buf.size() >= (1u << 15)) { return flush(); }
+    return alive;
+  };
+  auto emit_err = [&](const string& msg) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("t", FlexData::make_string("error"));
+    eo.insert("error", FlexData::make_string(msg));
+    send_line(e.to_json());
+    flush();
+  };
+
+  auto body = parse_json_body_(req);
+  if (!body) { emit_err("invalid JSON body"); return; }
+
+  DbBrowser db(_sctx);
+  string err;
+  DbBrowser::ScanStats stats;
+  {
+    lock_guard<mutex> dlk(_db_mu);
+    db.stream_scan(
+        *body,
+        [&](const FlexData& meta) { return send_line(meta.to_json()); },
+        [&](const FlexData& row) { return send_line(row.to_json()); },
+        stats, err);
+  }
+  if (!err.empty()) { emit_err(err); return; }
+
+  FlexData d = FlexData::make_object();
+  auto dd = d.as_object();
+  dd.insert("t", FlexData::make_string("done"));
+  dd.insert("total", FlexData::make_uint(static_cast<uint64_t>(stats.matched)));
+  dd.insert("scanned",
+            FlexData::make_uint(static_cast<uint64_t>(stats.scanned)));
+  dd.insert("truncated", FlexData::make_bool(stats.truncated));
+  dd.insert("aborted", FlexData::make_bool(stats.aborted));
+  send_line(d.to_json());
+  flush();
+}
+
+HttpResponse
+SessionApi::h_models_installed_(const HttpRequest&)
+{
+  string err;
+  FlexData doc;
+  {
+    lock_guard<mutex> dlk(_db_mu);
+    doc = list_installed_models(_sctx, "models", err);
+  }
+  if (!err.empty()) { return HttpResponse::error(500, err); }
+  return HttpResponse::json(200, doc.to_json());
+}
+
 HttpResponse
 SessionApi::h_db_value_(const HttpRequest& req)
 {
@@ -1914,6 +2600,8 @@ SessionApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_list_pipelines_(r); });
   s.route("POST", "/api/pipelines",
           [this](const HttpRequest& r) { return h_create_pipeline_(r); });
+  s.route("POST", "/api/pipelines/:id/rename",
+          [this](const HttpRequest& r) { return h_rename_pipeline_(r); });
   s.route("POST", "/api/pipelines/load",
           [this](const HttpRequest& r) { return h_load_pipeline_(r); });
   s.route("GET", "/api/pipelines/:id",
@@ -1934,6 +2622,10 @@ SessionApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_insert_stage_(r); });
   s.route("DELETE", "/api/pipelines/:id/stages/:sid",
           [this](const HttpRequest& r) { return h_remove_stage_(r); });
+  s.route("POST", "/api/pipelines/:id/stages/:sid/rename",
+          [this](const HttpRequest& r) { return h_rename_stage_(r); });
+  s.route("POST", "/api/pipelines/:id/stages/:sid/duplicate",
+          [this](const HttpRequest& r) { return h_duplicate_stage_(r); });
   s.route("POST", "/api/pipelines/:id/connect",
           [this](const HttpRequest& r) { return h_connect_(r); });
   s.route("POST", "/api/pipelines/:id/disconnect",
@@ -1993,6 +2685,17 @@ SessionApi::register_routes(HttpServer& s)
   s.route("GET", "/api/hls/streams",
           [this](const HttpRequest& r) { return h_hls_streams_(r); });
 
+  // Low-latency preview: discovery (buffered) + the long-lived binary
+  // stream (single origin, auth-gated like every /api/* route). The stream
+  // route has more path segments than the discovery route, so the two
+  // never collide.
+  s.route("GET", "/api/preview/streams",
+          [this](const HttpRequest& r) { return h_preview_streams_(r); });
+  s.route_ws("/api/preview/:pipeline/:stage/ws",
+          [this](const HttpRequest& r, WebSocket& ws) {
+            h_preview_ws_(r, ws);
+          });
+
   // Performance profiler capture control + timeline retrieval.
   s.route("POST", "/api/profiler/start",
           [this](const HttpRequest& r) { return h_profiler_start_(r); });
@@ -2008,16 +2711,26 @@ SessionApi::register_routes(HttpServer& s)
   s.route("GET", "/api/cwd-pipelines",
           [this](const HttpRequest& r) { return h_cwd_pipelines_(r); });
 
+  // Directory browsing for the file open/save dialog (sandbox-aware).
+  s.route("GET", "/api/fs/list",
+          [this](const HttpRequest& r) { return h_fs_list_(r); });
+
   s.route("GET", "/api/db/list",
           [this](const HttpRequest& r) { return h_db_list_(r); });
   s.route("POST", "/api/db/keys",
           [this](const HttpRequest& r) { return h_db_keys_(r); });
+  s.route_stream("POST", "/api/db/scan",
+          [this](const HttpRequest& r, ResponseStream& rs) {
+            h_db_scan_stream_(r, rs);
+          });
   s.route("POST", "/api/db/value",
           [this](const HttpRequest& r) { return h_db_value_(r); });
   s.route("POST", "/api/db/delete-key",
           [this](const HttpRequest& r) { return h_db_delete_key_(r); });
   s.route("POST", "/api/db/drop",
           [this](const HttpRequest& r) { return h_db_drop_(r); });
+  s.route("GET", "/api/models/installed",
+          [this](const HttpRequest& r) { return h_models_installed_(r); });
 }
 
 }

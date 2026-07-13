@@ -174,12 +174,14 @@ constexpr ConfigKey kAttrs[] = {
 const PortSpec kIports[] = {
   {.name = "audio", .doc = "EncodedSegment with kind=Audio (e.g. AAC "
                            "from rtsp-capture or raw PCM)",
-   .type = &typeid(EncodedSegmentPayload), .clock_group = 0},
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "audio-encoder-segments", .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "pcm", .doc = "mono F32 PCM TensorBeat [N] at "
                          "output_sample_rate; sideband ts/sr/duration",
-   .type = &typeid(TensorBeatPayload), .clock_group = 1},
+   .type = &typeid(TensorBeatPayload),
+   .tags = "pcm-samples", .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "audio-to-pcm",

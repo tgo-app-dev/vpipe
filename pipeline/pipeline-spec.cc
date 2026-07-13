@@ -254,19 +254,26 @@ pipeline_from_spec(const FlexData&           spec,
         iports.reserve(ip.size());
         for (size_t j = 0, m = ip.size(); j < m; ++j) {
           FlexData e_val = ip.at(j);
+          // A disconnected (optional) iport keeps its positional slot:
+          // a null array element, or an object with empty/missing
+          // `src`, both mean "leave iport j unwired". This lets a stage
+          // with optional inputs skip a port in the middle or at the
+          // end (the serializer emits src="" for these).
+          if (e_val.is_null()) {
+            iports.push_back(InEdge{nullptr, 0});
+            continue;
+          }
           if (!e_val.is_object()) {
             warn(fmt(
                 "pipeline_from_spec('{}'): stage '{}' iports[{}] "
-                "must be an object", pl->id(), sid, j));
+                "must be an object or null", pl->id(), sid, j));
             return nullptr;
           }
           auto e = e_val.as_object();
           string src = read_string_(e, "src");
           if (src.empty()) {
-            warn(fmt(
-                "pipeline_from_spec('{}'): stage '{}' iports[{}] "
-                "missing 'src'", pl->id(), sid, j));
-            return nullptr;
+            iports.push_back(InEdge{nullptr, 0});
+            continue;
           }
           auto srcit = by_id.find(src);
           if (srcit == by_id.end()) {

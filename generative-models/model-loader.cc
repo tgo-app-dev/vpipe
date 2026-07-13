@@ -423,6 +423,23 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
     }
   }
 
+  // MOSS-TTS-Realtime (arch "MossTTSRealtime"): a streaming TTS whose text
+  // backbone is a dense Qwen3-1.7B under `language_config` (not `text_config`).
+  // Parse those dims so the metal Qwen text-backbone exec can be built for
+  // evaluation. NB the backbone has NO real text head (the model predicts audio
+  // via a depth transformer, not text) -- absolute perplexity is meaningless;
+  // the meaningful eval is the A/B divergence mode (e.g. 8-bit vs bf16
+  // quantization error). Does not affect the TTS forward (text-to-speech loads
+  // the backbone directly via MetalMossRtModel).
+  if (out->architecture == "MossTTSRealtime" &&
+      root.contains("language_config")) {
+    auto lc = root.at("language_config");
+    if (lc.is_object()) {
+      auto lcobj = lc.as_object();
+      parse_dense_fields_(lcobj, out);
+    }
+  }
+
   // Finalize the Gemma-4 view: mark present (which selects
   // Gemma4ModelExec) and fill derived defaults. Done here, after both
   // parse passes, so head_dim / n_layers reflect the text_config view.

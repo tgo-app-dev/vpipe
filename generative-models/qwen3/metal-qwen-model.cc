@@ -2,6 +2,7 @@
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -438,11 +439,13 @@ MetalQwenModel::load(const std::string& model_dir,
     m->_use_mma = m->_fn_dequant.valid() && m->_fn_dense_mma.valid() &&
                   m->_fn_dense_mma_deep.valid() &&
                   m->_fn_swiglu_inter.valid();
-    // Matrix-core flash attention is head_dim 256 only (Qwen3.5). Optional:
-    // its absence just leaves prefill attention on the scalar qtile path.
-    if (cfg.head_dim == 256) {
+    // Matrix-core (matmul2d) flash attention: head_dim 256 (Qwen3.5) and 128
+    // (Llama-3 / the Krea-2 Qwen3-VL text encoder). Optional: its absence just
+    // leaves prefill attention on the key-split simdgroup flash / scalar path.
+    if (cfg.head_dim == 256 || cfg.head_dim == 128) {
       m->_lib_sdpa_mma = mc->load_library("sdpa_mma" + sfx);
       m->_fn_sdpa_mma = m->_lib_sdpa_mma.function("sdpa_mma_f16");
+      m->_fn_sdpa_mma_d128 = m->_lib_sdpa_mma.function("sdpa_mma_d128_f16");
     }
     if (const char* e = std::getenv("VPIPE_QWEN_MMA_MIN_M")) {
       m->_mma_min_m = std::atoi(e);
@@ -1954,6 +1957,10 @@ MetalQwenModel::load(const std::string& model_dir,
       }
     }
   }
+  // Dynamic-int8 accelerated prefill GEMMs: default OFF; the stage opts
+  // in via set_i8_gemm (exec) and VPIPE_I8_GEMM=1 force-enables for
+  // benches/A-B (the context handles the env override internally).
+  m->set_i8_gemm(false);
   return m;
 }
 
@@ -2282,11 +2289,27 @@ MetalQwenModel::dense_gemv_(ComputeEncoder& enc, const SharedBuffer& w,
   enc.dispatch({32, (unsigned)(((N + 7) / 8) * 2), 1}, {32, 2, 1});
 }
 
+MetalQwenModel::~MetalQwenModel() = default;
+
+void
+MetalQwenModel::set_i8_gemm(bool on)
+{
+  // Dynamic-int8 accelerated prefill GEMMs (LOSSY, opt-in; see
+  // shared/i8-gemm.h). The context self-gates on matrix cores + kernels;
+  // VPIPE_I8_GEMM overrides the flag either way.
+  auto i8 = std::make_unique<I8GemmContext>(_mc, on);
+  _i8 = i8->enabled() ? std::move(i8) : nullptr;
+}
+
 void
 MetalQwenModel::dense_gemm_(ComputeEncoder& enc, const SharedBuffer& w,
                             const SharedBuffer& x, const SharedBuffer& y,
                             int K, int N, int M)
 {
+  // Dynamic-int8 accelerated mode (opt-in, LOSSY): quantize activations +
+  // the f16 weight on the fly, run the int8 matmul. Prefill-only by
+  // construction (the M gate); decode M=1 never qualifies.
+  if (_i8 && _i8->gemm(enc, x, 0, w, y, 0, M, N, K)) { return; }
   // y[M,N] = x[M,K] @ w[N,K]^T, all f16, no bias. The caller (kqmm_ / the
   // fused-dequant QKV+GDN paths) has already dequantized the k-quant weight
   // into the f16 scratch, so this is the same plain f16 GEMM the affine
@@ -4512,6 +4535,27 @@ MetalQwenModel::forward_embeddings_hidden(ContextId cid, const SharedBuffer& x,
   return hidden;
 }
 
+metal_compute::SharedBuffer
+MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
+                                        int n,
+                                        const std::vector<int>& tap_layers)
+{
+  const int H = _cfg.hidden;
+  if (n <= 0 || tap_layers.empty()
+      || x.byte_size() < (std::size_t)n * H * 2) {
+    return {};
+  }
+  SharedBuffer taps =
+      _mc->make_shared_buffer((std::size_t)tap_layers.size() * n * H * 2);
+  if (taps.empty()) { return {}; }
+  SharedBuffer hidden;   // discarded; return_hidden just skips the lm_head
+  forward_chunk_(cid, x, n, nullptr, nullptr,
+                 /*verify_all=*/false, /*preds_out=*/nullptr,
+                 /*return_hidden=*/true, &hidden, /*allhidden_out=*/nullptr,
+                 &tap_layers, &taps);
+  return taps;
+}
+
 void
 MetalQwenModel::calib_begin()
 {
@@ -5066,6 +5110,33 @@ MetalQwenModel::decode_embedding_hidden(
   return &_d_hn;
 }
 
+SharedBuffer&
+MetalQwenModel::decode_input_buffer()
+{
+  ensure_decode_scratch_();
+  return _d_x;
+}
+
+const SharedBuffer*
+MetalQwenModel::encode_decode_prewritten(ComputeEncoder& enc, ContextId cid,
+                                         int rope_pos)
+{
+  if (!ensure_decode_scratch_()) { return nullptr; }
+  ContextManager::AppendSlot slot = _ctx->append(cid, 1);
+  if (!slot.valid()) { return nullptr; }
+  const int pos = slot.position;
+  const int rpos = (rope_pos < 0) ? pos : rope_pos;
+  const std::size_t page_off =
+      (std::size_t)slot.page_id.v * _ctx->page_stride_bytes();
+  const int n_pages =
+      _ctx->fill_page_table(cid, static_cast<std::int32_t*>(_pgtab.contents()));
+  // No host copy: the caller already populated _d_x (decode_input_buffer())
+  // for this step (host memcpy or a GPU dispatch earlier in `enc`).
+  encode_decode_step_(enc, cid, pos, rpos, page_off, n_pages, slot, _pgtab, 0,
+                      /*return_hidden=*/true);
+  return &_d_hn;
+}
+
 metal_compute::SharedBuffer
 MetalQwenModel::embed_text_buf(const std::vector<std::int32_t>& ids)
 {
@@ -5080,7 +5151,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
                                const SharedBuffer* mrope_sin, bool verify_all,
                                std::vector<std::int32_t>* preds_out,
                                bool return_hidden, SharedBuffer* hidden_out,
-                               SharedBuffer* allhidden_out)
+                               SharedBuffer* allhidden_out,
+                               const std::vector<int>* tap_layers,
+                               SharedBuffer* taps_out)
 {
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -5328,8 +5401,11 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_constant(5, N);
           enc.dispatch({(unsigned)(Kk / 8), (unsigned)N, 1}, {64, 1, 1});
         }
-        // dense matmul2d: y[n,N] = xin[n,Kk] @ _w_deq[N,Kk]^T (no bias).
-        dense_mma(xin, _w_deq, y, Kk, N);
+        // dense matmul2d: y[n,N] = xin[n,Kk] @ _w_deq[N,Kk]^T (no bias) --
+        // or the dynamic-int8 accelerated GEMM when enabled + qualifying.
+        if (!(_i8 && _i8->gemm(enc, xin, 0, _w_deq, y, 0, n, N, Kk))) {
+          dense_mma(xin, _w_deq, y, Kk, N);
+        }
         return;
       }
       enc.set_function(_fn_qmm);
@@ -5559,9 +5635,17 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         // hardware matrix units -- ~1.4-2.3x the scalar qtile past the
         // crossover. Falls back to qtile (scalar, no matrix cores) / the
         // per-query scalar kernel for short prompts where attention is tiny.
+        // Matrix-core (matmul2d) flash: head_dim 256 uses sdpa_mma_f16, 128 the
+        // sdpa_mma_d128_f16 instantiation (Llama-3 / Qwen3-VL text encoder).
+        // M5-only (gated on _use_mma == supports_matrix_cores()); on M4 this is
+        // false and the key-split simdgroup flash below serves D=128 instead.
+        const bool mma_attn_d =
+            (D == 256 && _fn_sdpa_mma.valid())
+            || (D == 128 && _fn_sdpa_mma_d128.valid());
         const bool use_mma_attn =
-            _use_mma && _fn_sdpa_mma.valid() && (D == 256) &&
-            (n >= _mma_attn_min_n);
+            _use_mma && mma_attn_d && (n >= _mma_attn_min_n);
+        const metal_compute::ComputeFunction& fn_mma_attn =
+            (D == 128) ? _fn_sdpa_mma_d128 : _fn_sdpa_mma;
         // Register-resident simdgroup_matrix flash (sdpa_paged_mma_d256), the
         // O-in-registers port of sdpa_causal_mma. MEASURED SLOWER than the
         // key-split sdpa_paged_flash for this shape (head_dim 256): staging BK
@@ -5582,13 +5666,23 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         const bool use_pmma = !use_mma_attn && kPmma &&
             _fn_sdpa_paged_mma.valid() && (D == 256) && (n >= kPmmaMin);
         // simdgroup_matrix key-split flash (M4 fallback): preferred over the
-        // scalar qtile when neither MMA path is taken.
+        // scalar qtile when neither MMA path is taken. The kernel is
+        // head_dim-GENERIC (tg arrays sized to FLP_DMAX=256, D-driven QK/PV
+        // loops, O-frags = D/8/FL_NSG), so it also covers head_dim 128 --
+        // Llama-3 and the Krea-2 Qwen3-VL text encoder, which previously fell to
+        // the scalar per-query sdpa_paged (O(n^2), the long-prompt bottleneck).
+        // Only the host gate was Qwen3.5-D256-specific. D=128 additionally needs
+        // the page span 64-aligned (FL_C, the flash key block) so the partial-
+        // block V tail read stays inside the page allocation; page_tokens=256
+        // (the encoder + Llama) satisfies it. Short prompts (n<384, attention
+        // tiny, staging not repaid) stay on the scalar kernel for both widths.
+        const bool flash_d = (D == 256) || (D == 128 && page_tokens % 64 == 0);
         const bool use_flash = !use_mma_attn && !use_pmma && _flash_attn &&
-            _fn_sdpa_paged_flash.valid() && (D == 256) && (n >= 384);
+            _fn_sdpa_paged_flash.valid() && flash_d && (n >= 384);
         const bool use_qt = !use_mma_attn && !use_pmma && !use_flash &&
             (D == 256) && (n >= 384);
         enc.set_function(
-            use_mma_attn ? _fn_sdpa_mma
+            use_mma_attn ? fn_mma_attn
             : (use_pmma ? _fn_sdpa_paged_mma
                : (use_flash ? _fn_sdpa_paged_flash
                   : (use_qt ? _fn_sdpa_paged_qtile : _fn_sdpa_paged))));
@@ -5879,6 +5973,20 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.dispatch({32, (unsigned)(H / 4), 1}, {32, 2, 1});
       }
       if (kLayerDump != nullptr) { tap(x, dbgL[(std::size_t)L], n * H); }
+      // Krea-2 encoder: snapshot the residual after this layer into the
+      // requested tap slots (un-normed [n,H] == HF hidden_states[L+1]).
+      if (tap_layers != nullptr && taps_out != nullptr) {
+        for (std::size_t j = 0; j < tap_layers->size(); ++j) {
+          if ((*tap_layers)[j] != L) { continue; }
+          enc.set_function(_fn_copy);
+          enc.set_buffer(0, x);
+          enc.set_buffer(1, *taps_out, (std::size_t)j * n * H * 2);
+          const int zero = 0, count = n * H;
+          enc.set_constant(2, zero);
+          enc.set_constant(3, count);
+          enc.dispatch({(unsigned)count, 1, 1}, {256, 1, 1});
+        }
+      }
     }
 
     if (verify_all && preds_out) {

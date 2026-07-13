@@ -43,6 +43,7 @@ namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
 namespace vpipe::genai {
 
 struct ModelConfig;
+class I8GemmContext;   // fwd (shared/i8-gemm.h)
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
@@ -86,6 +87,8 @@ struct MtpDecodeCtl {
 
 class MetalQwenModel {
 public:
+  ~MetalQwenModel();   // out-of-line (unique_ptr members of fwd types)
+
   struct Config {
     int   n_layers   = 32;
     int   hidden     = 2560;
@@ -256,6 +259,18 @@ public:
   forward_embeddings_hidden(ContextId cid,
                             const metal_compute::SharedBuffer& x, int n);
 
+  // Backbone forward over a pre-assembled [n*hidden] compute-dtype embedding
+  // stream that captures the per-layer hidden states (the un-normed residual
+  // after each requested 0-indexed layer) instead of logits -- the seam for
+  // the Krea-2 text encoder, which conditions the DiT on a stack of tapped
+  // Qwen3-VL layers. Returns a [tap_layers.size()*n*hidden] compute-dtype
+  // SharedBuffer laid out [tap_slot][pos][hidden] (slot j = tap_layers[j]).
+  // Plain 1-D RoPE at sequential positions; skips the lm_head. Empty on
+  // failure. HF output_hidden_states[k] == the tap after layer k-1.
+  metal_compute::SharedBuffer
+  forward_embeddings_taps(ContextId cid, const metal_compute::SharedBuffer& x,
+                          int n, const std::vector<int>& tap_layers);
+
   // ---- On-device AWQ calibration ------------------------------------------
   // Accumulate per-input-channel running |x| abs-max for the qkv / gate-up /
   // down Linear inputs across every prefill chunk run while enabled. The taps
@@ -320,6 +335,25 @@ public:
       const std::function<void(metal_compute::ComputeEncoder&,
                                const metal_compute::SharedBuffer&)>*
           post_hidden = nullptr);
+
+  // ---- Fused whole-frame decode support (MOSS-TTS-Realtime depth loop) ----
+  // The decode-input residual buffer (compute dtype [hidden]). A caller fusing
+  // many decode steps into ONE command buffer writes the next step's input
+  // here -- e.g. an embed-gather kernel targeting this buffer -- instead of the
+  // host copy decode_embedding_hidden does, then calls encode_decode_prewritten,
+  // so the whole frame stays on-GPU in a single command buffer. Allocates the
+  // decode scratch on first call; empty on failure.
+  metal_compute::SharedBuffer& decode_input_buffer();
+  // Encode ONE decode step into a caller-owned encoder WITHOUT committing,
+  // reading decode_input_buffer() AS-IS (the caller already populated it this
+  // step -- host memcpy or a prior GPU dispatch in the same buffer). Appends a
+  // KV slot and returns the final-normed hidden (&_d_hn, valid until the next
+  // step/commit). The caller owns the command buffer + commit, so multiple
+  // steps + custom dispatches (heads, on-GPU sample, embed-gather) fuse into
+  // one buffer. nullptr on failure. rope_pos<0 uses the KV slot position.
+  const metal_compute::SharedBuffer*
+  encode_decode_prewritten(metal_compute::ComputeEncoder& enc, ContextId cid,
+                           int rope_pos = -1);
   // Prefill the prompt by looping forward() over the ids (v1 has no
   // batched GEMM path yet); returns the [vocab] logits at the last
   // position. Empty on failure.
@@ -513,6 +547,12 @@ public:
   bool uses_matrix_cores() const noexcept { return _use_mma; }
   bool mma_flash_attn() const noexcept { return _fn_sdpa_mma.valid(); }
   bool gqa_flash_decode() const noexcept { return _gqa_vec; }
+  // Dynamic-int8 accelerated PREFILL GEMMs (see shared/i8-gemm.h): LOSSY
+  // (int8 quantization, ~1e-2 per GEMM -- NOT token-exact), strictly
+  // opt-in. Decode is untouched (M=1 never qualifies). VPIPE_I8_GEMM
+  // overrides. Wired from the stage config via the exec.
+  void set_i8_gemm(bool on);
+  bool i8_gemm_enabled() const noexcept { return _i8 != nullptr; }
   // Mixed-precision affine (OptiQ) de-fused per-tensor path engaged (some
   // 4-bit, some 8-bit linears). For the token-exact OptiQ guard test.
   bool uses_mixed_precision() const noexcept { return _mixed; }
@@ -640,6 +680,12 @@ private:
   // k-quant paths (the MTP-capable ones) compute the full last-layer residual
   // for every position, so the capture is valid exactly where an MTP head can
   // consume it.
+  // tap_layers / taps_out (Krea-2 text encoder): snapshot the un-normed
+  // residual stream after each 0-indexed layer L listed in *tap_layers into
+  // *taps_out at slot offset j*n*H (j = index into tap_layers) -- the
+  // per-layer hidden states a downstream consumer conditions on (matches HF
+  // output_hidden_states[L+1]). *taps_out must be a [tap_layers->size()*n*H]
+  // compute-dtype buffer. No effect when either is null.
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,
@@ -647,7 +693,9 @@ private:
       bool verify_all = false, std::vector<std::int32_t>* preds_out = nullptr,
       bool return_hidden = false,
       metal_compute::SharedBuffer* hidden_out = nullptr,
-      metal_compute::SharedBuffer* allhidden_out = nullptr);
+      metal_compute::SharedBuffer* allhidden_out = nullptr,
+      const std::vector<int>* tap_layers = nullptr,
+      metal_compute::SharedBuffer* taps_out = nullptr);
 
   // ---- Batched (N-branch parallel) decode --------------------------
   // VQA fanout: N branched contexts that share a prefix each decode one
@@ -966,7 +1014,8 @@ private:
       // the interleaved-gate/up SwiGLU combine for the matrix-core MLP, and
       // the matrix-core flash attention (head_dim 256, drop-in for qtile).
       _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_swiglu_inter,
-      _fn_sdpa_mma,
+      _fn_sdpa_mma,        // head_dim 256 (Qwen3.5)
+      _fn_sdpa_mma_d128,   // head_dim 128 (Llama-3 / Qwen3-VL text encoder)
       _fn_embed, _fn_argmax, _fn_sample,   // pipelined-decode kernels
       // Unquantized dense f16 in-stream embed gather (raw-HF path): row gather
       // from the [vocab, H] f16 table for decode_step_fast (the muxer covers
@@ -1101,6 +1150,8 @@ private:
   // units) instead of the steel quantized GEMM; decode + small M stay on
   // the existing paths. Off -> behaviour is byte-identical to before.
   bool _use_mma = false;
+  // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
+  std::unique_ptr<I8GemmContext> _i8;
   // Min rows (M) to prefer the matrix-core GEMM. Below this the steel
   // path's lower fixed cost + no dequant pass wins. Override with
   // VPIPE_QWEN_MMA_MIN_M.

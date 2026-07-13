@@ -1,5 +1,7 @@
 #include "apps/web-ui/startup-checks.h"
 
+#include "common/host-net.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
@@ -326,25 +328,10 @@ hint_(const Palette& pal, std::vector<PermissionCheck>& out,
 std::string
 primary_ipv4()
 {
-  struct ifaddrs* ifap = nullptr;
-  if (::getifaddrs(&ifap) != 0) { return ""; }
-  std::string en0, fallback;
-  for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
-    if (ifa->ifa_addr == nullptr) { continue; }
-    if (ifa->ifa_addr->sa_family != AF_INET) { continue; }
-    if ((ifa->ifa_flags & IFF_UP) == 0) { continue; }
-    if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) { continue; }
-    char buf[INET_ADDRSTRLEN] = { 0 };
-    auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-    if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) {
-      continue;
-    }
-    const std::string name = ifa->ifa_name ? ifa->ifa_name : "";
-    if (name == "en0") { en0 = buf; break; }
-    if (fallback.empty()) { fallback = buf; }
-  }
-  ::freeifaddrs(ifap);
-  return en0.empty() ? fallback : en0;
+  // Single source of truth: the shared netx helper applies the same
+  // en0-first preference. Kept as a thin webui:: alias so existing
+  // callers (main.cc, the mDNS probe below) need no change.
+  return vpipe::netx::primary_ipv4();
 }
 
 #if !defined(__APPLE__)

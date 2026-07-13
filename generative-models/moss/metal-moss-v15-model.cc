@@ -150,7 +150,7 @@ MetalMossV15Model::text_decision_(const SharedBuffer& h0)
 std::vector<std::vector<int>>
 MetalMossV15Model::generate(
     const std::vector<std::vector<std::int32_t>>& grid, int max_frames,
-    const MossSampling& audio_sp, std::uint64_t seed)
+    const MossSampling& audio_sp, std::uint64_t seed, const FrameCb& on_frame)
 {
   std::vector<std::vector<int>> frames;
   const int H = _cfg.local.lt.hidden, NV = _cfg.local.n_vq;
@@ -202,6 +202,9 @@ MetalMossV15Model::generate(
     const auto t2 = clk::now();
     if (tok == _cfg.audio_end_token) { break; }
     frames.push_back(codes);
+    // Streaming hook: hand the just-finalized frame to the caller (codec
+    // decode + PCM emit) before advancing the backbone. false => stop.
+    if (on_frame && !on_frame(codes)) { break; }
 
     std::vector<std::vector<std::int32_t>> row(
         1, std::vector<std::int32_t>((std::size_t)(1 + NV)));

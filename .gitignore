@@ -4,3 +4,6 @@ build
 
 # clangd index cache (written into the source root by the language server)
 .cache/
+
+# app temp root (vpipe::temp_root) when a process runs from the source tree
+.vpipe-tmp/

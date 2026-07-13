@@ -10,14 +10,27 @@ set(LOCAL_SOURCES
   call-stage.cc
   chrono-stage.cc
   load-image-stage.cc
+  load-text-stage.cc
+  load-video-stage.cc
+  lora-fuse-stage.cc
+  sampler-select-stage.cc
+  save-image-stage.cc
+  save-video-stage.cc
+  scheduler-select-stage.cc
+  text-to-image-stage.cc
+  vae-decode-stage.cc
+  vae-encode-stage.cc
   model-catalog.cc
   model-fetch-stage.cc
+  model-remove-stage.cc
   model-registry.cc
   passthrough-stage.cc
   qwen-asr-tokenizer.cc
   rest-client-stage.cc
+  save-text-stage.cc
   shell-stage.cc
   text-input-stage.cc
+  text-prompt-stage.cc
   videos-db-cleanup-stage.cc
   # vision (always built)
   vision/byte-track-stage.cc
@@ -25,8 +38,7 @@ set(LOCAL_SOURCES
   # audio-video (always built; ffmpeg dlopen'd at runtime)
   audio-video/audio-to-pcm-stage.cc
   audio-video/hls-broadcast-stage.cc
-  audio-video/video-file-decoder-stage.cc
-  audio-video/video-file-encoder-stage.cc
+  audio-video/preview-stage.cc
   audio-video/video-to-rgb-stage.cc
 )
 set(LOCAL_HEADERS
@@ -34,14 +46,21 @@ set(LOCAL_HEADERS
   call-stage.h
   chrono-stage.h
   load-image-stage.h
+  load-text-stage.h
+  load-video-stage.h
   model-catalog.h
   model-fetch-stage.h
+  model-remove-stage.h
   model-registry.h
   passthrough-stage.h
   qwen-asr-tokenizer.h
   rest-client-stage.h
+  save-image-stage.h
+  save-text-stage.h
+  save-video-stage.h
   shell-stage.h
   text-input-stage.h
+  text-prompt-stage.h
   trigger-beat.h
   videos-db-cleanup-stage.h
   # vision
@@ -51,8 +70,7 @@ set(LOCAL_HEADERS
   # audio-video
   audio-video/audio-to-pcm-stage.h
   audio-video/hls-broadcast-stage.h
-  audio-video/video-file-decoder-stage.h
-  audio-video/video-file-encoder-stage.h
+  audio-video/preview-stage.h
   audio-video/video-to-rgb-stage.h
   audio-video/video-tokens.h
 )
@@ -71,8 +89,8 @@ endif()
 # coreml-model-manager / coreml-cpp library).
 if(VPIPE_BUILD_APPLE_SILICON)
   # audio-video on the apple-silicon axis (TensorBeatPayload / metal image ops)
-  list(APPEND LOCAL_SOURCES audio-video/audio-encode-stage.cc)
-  list(APPEND LOCAL_HEADERS audio-video/audio-encode-stage.h)
+  list(APPEND LOCAL_SOURCES save-audio-stage.cc)
+  list(APPEND LOCAL_HEADERS save-audio-stage.h)
   list(APPEND LOCAL_SOURCES audio-video/temporal-decimation-stage.cc)
   list(APPEND LOCAL_HEADERS audio-video/temporal-decimation-stage.h)
   # LM-driven stages (self-contained metal/no-MLX path)

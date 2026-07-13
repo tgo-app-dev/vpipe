@@ -156,7 +156,7 @@ model_catalog()
      .variant = "ASR MLX 8-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3-ASR-0.6B-8bit",
      .model_type = "qwen3-asr", .needs_tokenizer_json = true},
-    {.family = "Gemma", .version = "4", .param_class = "e4b",
+    {.family = "Gemma", .version = "4", .param_class = "E4B",
      .variant = "MLX 4-bit (mlx-community)",
      .hf_path = "mlx-community/gemma-4-e4b-it-4bit",
      .model_type = "gemma4", .needs_tokenizer_json = false},
@@ -216,6 +216,172 @@ model_catalog()
      .variant = "F32 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2",
      .model_type = "moss-codec-v2", .needs_tokenizer_json = false},
+    // MOSS-TTS-Realtime: the text-to-speech stage's realtime LM (hf_dir,
+    // model_type "moss-tts-realtime"). Runs as-is (unquantized bf16) OR after
+    // model-quantize to 8-bit (~2x faster, half the resident bytes). A
+    // context-aware streaming TTS: a bf16
+    // Qwen3-1.7B backbone drives a 4-layer Qwen3-style depth ("local")
+    // transformer that autoregressively emits 16 RVQ codebooks per 12.5 Hz
+    // frame. It reuses the 24 kHz MOSS-Audio-Tokenizer codec (codec_dir,
+    // "moss-codec", above) -- decoded with the first 16 codebooks. The
+    // text-to-speech stage auto-detects this variant from config.json.
+    {.family = "MOSS", .version = "TTS-Realtime", .param_class = "1.7B",
+     .variant = "bf16 (OpenMOSS-Team)",
+     .hf_path = "OpenMOSS-Team/MOSS-TTS-Realtime",
+     .model_type = "moss-tts-realtime", .needs_tokenizer_json = false},
+    // ---- Krea (text-to-image diffusion) ------------------------------
+    // Krea-2-Turbo: a flow-matching (rectified-flow) text-to-image model,
+    // model_type "krea2". Diffusers-layout repo with per-component
+    // subfolders -- three sub-models the text-to-image stages consume:
+    //   text_encoder/ = Qwen3-VL (model_type qwen3_vl, hidden 2560, 36L);
+    //     the pipeline conditions on 12 SELECTED hidden layers
+    //     (text_encoder_select_layers in model_index.json), not just the
+    //     last state -- reuses the metal Qwen backbone.
+    //   transformer/  = Krea2Transformer2DModel, a 12B dual-stream MMDiT
+    //     (28 image blocks, head_dim 128, 48 q-heads GQA kv=12, 3D-RoPE
+    //     axes [32,48,48]; in_channels 64 = 16 latent x 2x2 patch;
+    //     interleaved 12-layer text tower). CFG-DISTILLED turbo: ~8 steps
+    //     at guidance_scale 0 -- no classifier-free pass.
+    //   vae/          = AutoencoderKLQwenImage (16 latent ch, 8x spatial,
+    //     per-channel latents_mean/std whitening) -- the separate VAE stage.
+    // The text/encoder->DiT stage reads text_encoder/ + transformer/ (+
+    // scheduler/, tokenizer/, model_index.json); the VAE stage reads vae/.
+    // `files` PINS the diffusers subfolders (sharded transformer via its
+    // index.json) and SKIPS the redundant top-level turbo.safetensors (a
+    // second copy of the transformer, ~26 GB) and the sample images/ --
+    // fetching ~35.6 GB instead of the ~62 GB whole repo.
+    {.family = "Krea", .version = "2", .param_class = "12B",
+     .variant = "Turbo distilled bf16 (krea)",
+     .hf_path = "krea/Krea-2-Turbo",
+     .model_type = "krea2",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // Krea-2 softwatercolor LoRA (adapts the Turbo DiT). Fuse into a DiT with
+    // the lora-fuse stage (base = <Krea-2-Turbo>/transformer), then use the
+    // fused DiT via the text-to-image `dit_dir`. Trigger: "Art Deco watercolor
+    // style". A single ~0.47 GB safetensors (lora_A/B pairs, rank 32).
+    {.family = "Krea", .version = "2", .param_class = "LoRA",
+     .variant = "softwatercolor LoRA (krea)",
+     .hf_path = "krea/Krea-2-LoRA-softwatercolor",
+     .model_type = "krea2-lora",
+     .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
+     .files = {"softwatercolor.safetensors"},
+     .needs_tokenizer_json = false},
+    // M87 early-preview aesthetic LoRA (mgwr) for Krea-2 Turbo. A ~0.23 GB
+    // standard low-rank LoRA (lora_A/B pairs, rank 32). Trigger: "--preview".
+    // Uses the ai-toolkit / ComfyUI key convention
+    // (diffusion_model.blocks.N.attn.{wq,wk,wv,wo,gate}, mlp.{gate,up,down});
+    // the lora-fuse stage's name remap maps these to the diffusers base DiT
+    // weights (all 256 modules fuse, verified base + B@A).
+    {.family = "Krea", .version = "2", .param_class = "LoRA",
+     .variant = "M87 aesthetic LoRA (mgwr)",
+     .hf_path = "mgwr/M87",
+     .model_type = "krea2-lora",
+     .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
+     .files = {"m87_lora_v1.safetensors"},
+     .needs_tokenizer_json = false},
+    // Krea2-realism-V2 (RudySen) for Krea-2 Turbo. A ~1.56 GB LoKr (Kronecker)
+    // adapter (lokr_w1/lokr_w2/alpha, full-matrix so scale=1), in the ai-toolkit
+    // / ComfyUI key convention (diffusion_model.*). Trigger: "r3alism". The
+    // lora-fuse stage reconstructs dW = kron(w1,w2) and name-remaps to the base
+    // DiT (all 256 modules fuse, verified base + kron).
+    {.family = "Krea", .version = "2", .param_class = "LoRA",
+     .variant = "realism V2 LoKr (RudySen)",
+     .hf_path = "RudySen/Krea2-realism-V2",
+     .model_type = "krea2-lora",
+     .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
+     .files = {"Krea2-realism-V2.safetensors"},
+     .needs_tokenizer_json = false},
+    // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
+    // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
+    // separate VAE stages), but the FLUX topology rather than Qwen-Image
+    // MMDiT. Sub-models:
+    //   text_encoder/ = Qwen3ForCausalLM (DENSE: 36 layers, hidden 2560,
+    //     32 q-heads GQA kv=8, head_dim 128, tied embeds, rope theta 1e6).
+    //     FLUX.2 taps hidden states from layers {10,20,30} and CONCATENATES
+    //     them -> 3 x 2560 = 7680-dim prompt embeddings (max 512 tokens).
+    //   transformer/ = Flux2Transformer2DModel, a 4B FLUX-topology DiT:
+    //     5 double-stream (MMDiT joint) + 20 single-stream blocks, 24 heads
+    //     x head_dim 128 = 3072 hidden, in_channels 128 (= 32 latent x 2x2
+    //     patch), joint_attn_dim 7680, mlp_ratio 3.0, 4-axis RoPE
+    //     [32,32,32,32] theta 2000. DISTILLED (guidance_embeds=false) -- ~no
+    //     classifier-free pass.
+    //   vae/          = AutoencoderKLFlux2 (32 latent ch, 8x spatial + [2,2]
+    //     patch, block_out [128,256,512,512], mid-block attention) -- the
+    //     separate VAE stages.
+    // `files` PINS the diffusers subfolders (sharded text_encoder via its
+    // index.json; single-file transformer) and SKIPS the redundant top-level
+    // flux-2-klein-4b.safetensors (a second copy of the transformer, ~7.75
+    // GB) and the sample images -- fetching ~16 GB instead of ~23.7 GB.
+    {.family = "FLUX", .version = "2", .param_class = "4B",
+     .variant = "klein distilled bf16 (black-forest-labs)",
+     .hf_path = "black-forest-labs/FLUX.2-klein-4B",
+     .model_type = "flux2",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // FLUX.2-klein-9B (black-forest-labs) -- the larger klein sibling, same
+    // split-stage FLUX topology as the 4B (all sub-model code is config-driven
+    // off config.json, so one code path serves both sizes). Differences:
+    //   text_encoder/ = an 8B Qwen3 (4 shards) rather than the 4B's ~4B Qwen3
+    //     (still dense Qwen3ForCausalLM, tapped at layers {9,18,27}).
+    //   transformer/ = a larger Flux2Transformer2DModel (2 shards), and it is
+    //     GUIDANCE-DISTILLED (guidance_embeds=true): a guidance_embedder embeds
+    //     the guidance scale into the timestep embedding (single forward pass;
+    //     the distilled default runs ~4 steps at guidance_scale 1.0).
+    //   vae/          = AutoencoderKLFlux2 (single file), same as the 4B.
+    // `files` PINS the diffusers subfolders (sharded transformer + text_encoder
+    // via their index.json) and SKIPS the redundant top-level
+    // flux-2-klein-9b.safetensors (a second copy of the transformer) and the
+    // sample images.
+    {.family = "FLUX", .version = "2", .param_class = "9B",
+     .variant = "klein guidance-distilled bf16 (black-forest-labs)",
+     .hf_path = "black-forest-labs/FLUX.2-klein-9B",
+     .model_type = "flux2",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -226,6 +392,7 @@ model_catalog()
      .variant = "Vision tower CoreML 512x320 w8 (vpipe-supplement)",
      .hf_path = "tgo-app-dev/vpipe-supplement",
      .model_type = "qwen3.5-vision-encoder",
+     .parent_model_type = "qwen3.5", .parent_param_class = "4B",
      .files = {"qwen3_5_mlx_4b_vision_vid_512x320_w8.tar"},
      .name = "qwen3_5_mlx_4b_vision_vid_512x320",
      .extract_archive = true},
@@ -233,13 +400,15 @@ model_catalog()
      .variant = "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
      .hf_path = "tgo-app-dev/vpipe-supplement",
      .model_type = "qwen3.5-vision-encoder",
+     .parent_model_type = "qwen3.5", .parent_param_class = "4B",
      .files = {"qwen3_5_mlx_4b_vision_vid_768x480_w8.tar"},
      .name = "qwen3_5_mlx_4b_vision_vid_768x480",
      .extract_archive = true},
-    {.family = "Gemma", .version = "4", .param_class = "e4b",
+    {.family = "Gemma", .version = "4", .param_class = "E4B",
      .variant = "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
      .hf_path = "tgo-app-dev/vpipe-supplement",
      .model_type = "gemma4-vision-encoder",
+     .parent_model_type = "gemma4", .parent_param_class = "E4B",
      .files = {"gemma4_mlx_e4b_vision_768x480_w8.tar"},
      .name = "gemma4_mlx_e4b_vision_768x480",
      .extract_archive = true},
@@ -299,6 +468,44 @@ strip_prefix_(std::string& s, const std::string& prefix)
     return true;
   }
   return false;
+}
+
+// Default input / output modalities by model_type, used when an entry
+// does not record them explicitly (keeps I/O correct + DRY across the
+// many same-type entries; an entry may still override via inputs/outputs).
+void
+default_io_(const std::string& mt, std::vector<std::string>& in,
+            std::vector<std::string>& out)
+{
+  auto set = [&](std::initializer_list<const char*> i,
+                 std::initializer_list<const char*> o) {
+    for (const char* s : i) { in.emplace_back(s); }
+    for (const char* s : o) { out.emplace_back(s); }
+  };
+  if (mt == "qwen3.5" || mt == "qwen3.6") {
+    set({"text", "image", "video"}, {"text"});
+  } else if (mt == "qwen3-asr") {
+    set({"audio"}, {"text"});
+  } else if (mt == "gemma4") {
+    set({"text", "image", "audio", "video"}, {"text"});
+  } else if (mt == "gemma4_unified") {
+    set({"text"}, {"text"});
+  } else if (mt == "moss-tts" || mt == "moss-tts-local"
+             || mt == "moss-tts-realtime") {
+    set({"text"}, {"audio"});
+  } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
+    set({"audio"}, {"audio"});
+  } else if (mt == "krea2" || mt == "flux2") {
+    set({"text", "image"}, {"image"});
+  } else if (mt == "yolo") {
+    set({"image"}, {});
+  } else if (mt == "silero-vad" || mt == "audio-tagging") {
+    set({"audio"}, {});
+  } else if (mt == "qwen3.5-vision-encoder"
+             || mt == "gemma4-vision-encoder") {
+    set({"image", "video"}, {});
+  }
+  // Datasets (eval-*) and unknown types keep empty I/O.
 }
 
 }  // namespace
@@ -373,6 +580,79 @@ catalog_by_path(const std::string& hf_path)
     }
   }
   return nullptr;
+}
+
+const ModelCatalogEntry*
+catalog_by_name(const std::string& name)
+{
+  if (name.empty()) {
+    return nullptr;
+  }
+  for (const auto& e : model_catalog()) {
+    if (e.name == name) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
+std::string
+catalog_category(const ModelCatalogEntry& e)
+{
+  if (!e.dataset_files.empty()) {
+    return "dataset";
+  }
+  if (!e.parent_model_type.empty()) {
+    return "supplement";
+  }
+  return "model";
+}
+
+FlexData
+catalog_entry_to_flex(const ModelCatalogEntry& e)
+{
+  FlexData doc = FlexData::make_object();
+  auto o = doc.as_object();
+  o.insert("family", FlexData::make_string(e.family));
+  o.insert("version", FlexData::make_string(e.version));
+  o.insert("param_class", FlexData::make_string(e.param_class));
+  o.insert("variant", FlexData::make_string(e.variant));
+  o.insert("hf_path", FlexData::make_string(e.hf_path));
+  o.insert("model_type", FlexData::make_string(e.model_type));
+  o.insert("category", FlexData::make_string(catalog_category(e)));
+  if (!e.name.empty()) {
+    o.insert("name", FlexData::make_string(e.name));
+  }
+  if (!e.parent_model_type.empty()) {
+    o.insert("parent_model_type",
+             FlexData::make_string(e.parent_model_type));
+  }
+  if (!e.parent_param_class.empty()) {
+    o.insert("parent_param_class",
+             FlexData::make_string(e.parent_param_class));
+  }
+  // Input / output modalities: explicit if recorded, else derived.
+  std::vector<std::string> in = e.inputs, out = e.outputs;
+  if (in.empty() && out.empty()) {
+    default_io_(e.model_type, in, out);
+  }
+  FlexData ia = FlexData::make_array();
+  {
+    auto a = ia.as_array();
+    for (const auto& s : in) {
+      a.push_back(FlexData::make_string(s));
+    }
+  }
+  FlexData oa = FlexData::make_array();
+  {
+    auto a = oa.as_array();
+    for (const auto& s : out) {
+      a.push_back(FlexData::make_string(s));
+    }
+  }
+  o.insert("inputs", std::move(ia));
+  o.insert("outputs", std::move(oa));
+  return doc;
 }
 
 std::string

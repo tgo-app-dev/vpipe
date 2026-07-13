@@ -15,11 +15,18 @@
 // host pane header). Returns a cleanup function that stops the poll.
 
 import { el, clear, toast, kbd } from '../dom.js';
+import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
 import { renderMarkdown } from '../markdown.js';
 
 const POLL_MS = 600;
+
+// Per-file cap for image/audio attachments sent through getmedialine.
+// Enforced here in the browser so an oversized file is rejected before
+// it is read/base64-encoded. 10 MiB raw -> ~13.3 MiB base64, which keeps
+// the request body under the server's 16 MiB cap.
+const MAX_MEDIA_BYTES = 10 << 20;
 
 // Persisted preference for the "Markdown" render toggle (off by default).
 const MD_KEY = 'vpipe_io_markdown';
@@ -76,6 +83,81 @@ function splitThinking(text) {
   return segs;
 }
 
+// base64 media-attachment markers (mirror expandAttachments / the wire
+// format). The run between start/end is "LENGTH,BASE64"; group 1 is the
+// kind (im|au), group 2 the payload.
+const MEDIA_RE =
+  /<\|__vpipe_base64_(im|au)_start__\|>([\s\S]*?)<\|__vpipe_base64_\1_end__\|>/g;
+const MEDIA_SENTINEL = '<|__vpipe_base64_';   // cheap pre-check
+
+// Compact echo glyphs the backend substitutes for sent attachments
+// (media_line::to_display): "⟦🖼 <bytes>⟧" / "⟦🔊 <bytes>⟧". No payload
+// rides with them, so a live preview must reuse the base64 the browser
+// still holds from send time (session-only: a reload shows the glyph).
+const GLYPH_IMG = '⟦\u{1F5BC}';   // ⟦🖼
+const GLYPH_AUD = '⟦\u{1F50A}';   // ⟦🔊
+const MEDIA_GLYPH_RE = /⟦(?:\u{1F5BC}|\u{1F50A})[^⟧]*⟧/gu;
+function hasEchoGlyph(text) {
+  return text.indexOf(GLYPH_IMG) >= 0 || text.indexOf(GLYPH_AUD) >= 0;
+}
+
+// Detect an image/audio MIME from the first decoded bytes of the base64
+// so the data: URI is well-typed (the original MIME was dropped when the
+// attachment was made). Returns '' when nothing matches.
+function sniffB64Mime(b64) {
+  let b;
+  try {
+    const bin = atob(b64.slice(0, 24));   // ~18 bytes: enough for signatures
+    b = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  } catch (e) { return ''; }
+  const at = (i, s) => [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+  if (b[0] === 0x89 && at(1, 'PNG')) { return 'image/png'; }
+  if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) { return 'image/jpeg'; }
+  if (at(0, 'GIF8')) { return 'image/gif'; }
+  if (at(0, 'RIFF') && at(8, 'WEBP')) { return 'image/webp'; }
+  if (b[0] === 0x42 && b[1] === 0x4D) { return 'image/bmp'; }
+  if (at(0, 'RIFF') && at(8, 'WAVE')) { return 'audio/wav'; }
+  if (at(0, 'OggS')) { return 'audio/ogg'; }
+  if (at(0, 'fLaC')) { return 'audio/flac'; }
+  if (at(0, 'ID3') || (b[0] === 0xFF && (b[1] & 0xE0) === 0xE0)) {
+    return 'audio/mpeg';
+  }
+  if (at(4, 'ftyp')) { return 'audio/mp4'; }
+  return '';
+}
+
+// Preview node for one media item: tag 'im' | 'au', raw base64. Image ->
+// a <=256px block preview on its own line(s); audio -> play / pause /
+// stop buttons over a hidden <audio>.
+function mediaPreviewB64(tag, b64) {
+  const mime = sniffB64Mime(b64)
+      || (tag === 'im' ? 'image/png' : 'audio/mpeg');
+  const src = 'data:' + mime + ';base64,' + b64;
+  if (tag === 'im') {
+    return el('div', { class: 'io-media' },
+      el('img', { class: 'io-img', src, alt: t('userio.image_preview') }));
+  }
+  const audio = el('audio', { src, preload: 'metadata' });
+  const ctl = (icon, key, fn) => {
+    const b = el('button',
+        { class: 'btn ghost icon-btn', title: t(key) }, makeIcon(icon, 'sm'));
+    b.addEventListener('click', fn);
+    return b;
+  };
+  return el('div', { class: 'io-media io-audio' },
+    ctl('play',  'common.play',  () => { audio.play().catch(() => {}); }),
+    ctl('pause', 'common.pause', () => { audio.pause(); }),
+    ctl('stop',  'common.stop',
+        () => { audio.pause(); audio.currentTime = 0; }),
+    audio);
+}
+
+// Same, from a full marker payload "LENGTH,BASE64".
+function mediaPreview(tag, payload) {
+  const comma = payload.indexOf(',');
+  return mediaPreviewB64(tag, comma >= 0 ? payload.slice(comma + 1) : payload);
+}
+
 export function mountUserIo(body, actions) {
   clear(body);
 
@@ -98,9 +180,11 @@ export function mountUserIo(body, actions) {
   // expanded to the full media-line marker on send. Deleting the
   // placeholder text drops the attachment.
   const attachImgBtn = el('button',
-      { class: 'btn ghost', title: t('userio.attach_image') }, '🖼');
+      { class: 'btn ghost icon-btn', title: t('userio.attach_image') },
+      makeIcon('image', 'sm'));
   const attachAudBtn = el('button',
-      { class: 'btn ghost', title: t('userio.attach_audio') }, '🔊');
+      { class: 'btn ghost icon-btn', title: t('userio.attach_audio') },
+      makeIcon('audio', 'sm'));
   const fileImg = el('input', { type: 'file', accept: 'image/*' });
   const fileAud = el('input', { type: 'file', accept: 'audio/*' });
   fileImg.multiple = true;
@@ -153,11 +237,9 @@ export function mountUserIo(body, actions) {
     el('kbd', { class: 'kbd' }, 'Ctrl+J'), t('userio.newline') + '  ·  ',
     el('kbd', { class: 'kbd' }, '⏎'), t('userio.send_word'));
 
-  const root = el('div', { class: 'userio' },
-    consoleEl,
-    el('div', { class: 'io-input' }, promptEl, input,
-       attachImgBtn, attachAudBtn, fileImg, fileAud, sendBtn),
-    hint);
+  const inputRow = el('div', { class: 'io-input' }, promptEl, input,
+     attachImgBtn, attachAudBtn, fileImg, fileAud, sendBtn);
+  const root = el('div', { class: 'userio' }, consoleEl, inputRow, hint);
   body.append(root);
   // The pane header (owned by the workspace) carries the Thinking +
   // Markdown toggles + Clear button.
@@ -175,6 +257,12 @@ export function mountUserIo(body, actions) {
   let mediaPending = false; // current request accepts media attachments
   let stopped = false;
   const lineEls = new Map();   // seq -> element
+  // Live-preview support for the user's OWN sent media: the echoed input
+  // line arrives base64-stripped (compact "⟦🖼 N⟧" glyph), so keep the
+  // base64 the browser held at send time and re-attach it by line seq.
+  // Session-only -- a reload has no data and falls back to the glyph.
+  const pendingEchoMedia = [];   // FIFO of sent [{tag,b64}] awaiting echo
+  const mediaBySeq = new Map();  // input-line seq -> [{tag,b64}]
 
   // Pending attachments: placeholder text -> {kind:'im'|'au', size, b64}.
   // `size` is the file's decoded byte count (the marker LENGTH field).
@@ -191,6 +279,11 @@ export function mountUserIo(body, actions) {
   }
 
   function addAttachment(file, kind) {
+    if (file.size > MAX_MEDIA_BYTES) {
+      toast(t('userio.attach_too_big',
+              { name: file.name, mb: MAX_MEDIA_BYTES >> 20 }), 'error');
+      return;
+    }
     const reader = new FileReader();
     reader.onerror = () => {
       toast(t('userio.attach_failed', { name: file.name }), 'error');
@@ -283,6 +376,13 @@ export function mountUserIo(body, actions) {
       node = el('div', { class: 'line ' + (l.level || 'info') });
       (frag || consoleEl).append(node);
       lineEls.set(l.seq, node);
+      // First sighting of this line: if it's an input echo carrying media
+      // glyphs, claim the next queued sent-media list (FIFO -- getline is
+      // answered one at a time, so echo order matches send order).
+      if (l.level === 'input' && pendingEchoMedia.length
+          && hasEchoGlyph(l.text)) {
+        mediaBySeq.set(l.seq, pendingEchoMedia.shift());
+      }
     }
     // Keep the source line on the node so toggling Markdown can re-render
     // the existing transcript without re-fetching it.
@@ -297,33 +397,76 @@ export function mountUserIo(body, actions) {
   // Thinking segments (unified markers) render dimmed when the
   // Thinking toggle is on, and collapse to a bare 💭 when off; the
   // non-thinking remainder honours the Markdown toggle as before.
-  function renderLineBody(node, l) {
-    node.classList.toggle('md', mdEnabled);
-    const hasThink = l.text.indexOf(THINK_START) >= 0
-        || l.text.indexOf(THINK_END) >= 0;
+  // Render a run of text (no media markers) into an array of nodes,
+  // honoring the Thinking + Markdown toggles.
+  function renderTextRun(text) {
+    const hasThink = text.indexOf(THINK_START) >= 0
+        || text.indexOf(THINK_END) >= 0;
     if (!hasThink) {
-      if (mdEnabled) {
-        node.replaceChildren(renderMarkdown(l.text));
-      } else {
-        node.textContent = l.text;
-      }
-      return;
+      return [mdEnabled ? renderMarkdown(text)
+                        : document.createTextNode(text)];
     }
     const parts = [];
-    for (const seg of splitThinking(l.text)) {
+    for (const seg of splitThinking(text)) {
       if (seg.think) {
-        if (thinkEnabled) {
-          parts.push(el('span', { class: 'thinking' },
-                        '💭 ' + seg.text));
-        } else {
-          parts.push(el('span', { class: 'thinking-hidden',
-                                  title: t('userio.thinking_hidden') },
-                        '💭'));
-        }
+        parts.push(thinkEnabled
+          ? el('span', { class: 'thinking' }, '💭 ' + seg.text)
+          : el('span', { class: 'thinking-hidden',
+                         title: t('userio.thinking_hidden') }, '💭'));
       } else if (seg.text) {
         parts.push(mdEnabled ? renderMarkdown(seg.text)
                              : document.createTextNode(seg.text));
       }
+    }
+    return parts;
+  }
+
+  function renderLineBody(node, l) {
+    node.classList.toggle('md', mdEnabled);
+    const text = l.text;
+    // Echoed sent media: the line carries compact "⟦🖼 N⟧" glyphs; splice
+    // in the previews retained from send time, in glyph order.
+    const retained = mediaBySeq.get(l.seq);
+    if (retained) {
+      const parts = [];
+      let last = 0, i = 0;
+      for (const m of text.matchAll(MEDIA_GLYPH_RE)) {
+        if (m.index > last) {
+          parts.push(...renderTextRun(text.slice(last, m.index)));
+        }
+        const item = retained[i++];
+        parts.push(item ? mediaPreviewB64(item.tag, item.b64)
+                        : document.createTextNode(m[0]));
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) {
+        parts.push(...renderTextRun(text.slice(last)));
+      }
+      node.replaceChildren(...parts);
+      return;
+    }
+    // Fast path: no media marker present -> render the whole line as text.
+    if (text.indexOf(MEDIA_SENTINEL) < 0) {
+      node.replaceChildren(...renderTextRun(text));
+      return;
+    }
+    const matches = [...text.matchAll(MEDIA_RE)];
+    if (!matches.length) {
+      node.replaceChildren(...renderTextRun(text));
+      return;
+    }
+    // Interleave text runs with inline media previews.
+    const parts = [];
+    let last = 0;
+    for (const m of matches) {
+      if (m.index > last) {
+        parts.push(...renderTextRun(text.slice(last, m.index)));
+      }
+      parts.push(mediaPreview(m[1], m[2]));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      parts.push(...renderTextRun(text.slice(last)));
     }
     node.replaceChildren(...parts);
   }
@@ -407,6 +550,12 @@ export function mountUserIo(body, actions) {
     // shipping; the console echo comes back from the backend with the
     // markers already compressed to glyphs.
     const text = expandAttachments(input.value);
+    // Keep the media we just sent (in marker order) so its echoed line --
+    // which comes back base64-stripped -- can still show a live preview.
+    const sent = [...text.matchAll(MEDIA_RE)].map((m) => ({
+      tag: m[1], b64: m[2].slice(m[2].indexOf(',') + 1),
+    }));
+    if (sent.length) { pendingEchoMedia.push(sent); }
     const id = pendingId;
     input.value = '';
     clearAttachments();
@@ -421,6 +570,9 @@ export function mountUserIo(body, actions) {
     try {
       await api.ioInput(id, text);
     } catch (e) {
+      // No echo will arrive for a failed send -- drop the queued media so
+      // it can't mis-attach to a later line.
+      if (sent.length) { pendingEchoMedia.pop(); }
       toast(e.message, 'error');
     }
     tick();   // reflect new state promptly
@@ -445,19 +597,63 @@ export function mountUserIo(body, actions) {
     for (const f of fileAud.files) { addAttachment(f, 'au'); }
     fileAud.value = '';
   });
-  // Drag-and-drop onto the input row while a media request is pending.
-  // dragover must be cancelled for the drop to be allowed at all.
-  for (const zone of [input, promptEl]) {
-    zone.addEventListener('dragover', (e) => {
-      if (mediaPending) { e.preventDefault(); }
-    });
-    zone.addEventListener('drop', (e) => {
-      if (!mediaPending) { return; }
-      e.preventDefault();
-      const files = (e.dataTransfer && e.dataTransfer.files) || [];
-      for (const f of files) { addAttachmentAuto(f); }
-    });
+  // Media file drag-and-drop. A file dropped onto the input row or the
+  // output console is taken as an attachment while a media request is
+  // pending; a file dropped ANYWHERE ELSE in the window is swallowed so
+  // the browser never navigates away by opening it. Non-file drags (the
+  // pipeline toolbox's stage chips) are ignored so their DnD still works.
+  // Registered on `window` (drops land outside this pane's subtree too);
+  // cleanup() removes both listeners.
+  const dropZones = [inputRow, consoleEl];
+  function isFileDrag(e) {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    return !!types && Array.prototype.indexOf.call(types, 'Files') !== -1;
   }
+  function dropZoneFor(target) {
+    return dropZones.find((z) => z.contains(target)) || null;
+  }
+  function onWindowDragOver(e) {
+    if (!isFileDrag(e)) { return; }
+    // Cancelling dragover is required both to let a drop fire on the
+    // boxes AND to suppress the browser's open-file default elsewhere.
+    e.preventDefault();
+    const ok = mediaPending && dropZoneFor(e.target);
+    e.dataTransfer.dropEffect = ok ? 'copy' : 'none';
+  }
+  function onWindowDrop(e) {
+    if (!isFileDrag(e)) { return; }
+    e.preventDefault();   // block the browser default (open file) everywhere
+    if (!mediaPending || !dropZoneFor(e.target)) { return; }
+    const files = (e.dataTransfer && e.dataTransfer.files) || [];
+    for (const f of files) { addAttachmentAuto(f); }
+  }
+  window.addEventListener('dragover', onWindowDragOver);
+  window.addEventListener('drop', onWindowDrop);
+  // Paste an image (or audio) straight into the input: a screenshot or a
+  // copied media file on the clipboard becomes an attachment, same as the
+  // picker / drag-and-drop paths (addAttachment enforces the size cap).
+  // Only while a media request is pending; a paste carrying no media
+  // falls through to the normal text paste.
+  input.addEventListener('paste', (e) => {
+    if (!mediaPending || !e.clipboardData) { return; }
+    const dt = e.clipboardData;
+    let files = [...(dt.files || [])];
+    if (!files.length && dt.items) {
+      for (const it of dt.items) {
+        if (it.kind === 'file') {
+          const f = it.getAsFile();
+          if (f) { files.push(f); }
+        }
+      }
+    }
+    const media = files.filter((f) => {
+      const ty = f.type || '';
+      return ty.startsWith('image/') || ty.startsWith('audio/');
+    });
+    if (!media.length) { return; }   // no media -> let the text paste run
+    e.preventDefault();
+    for (const f of media) { addAttachmentAuto(f); }
+  });
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', (e) => {
     if (input.disabled) { return; }
@@ -552,6 +748,12 @@ export function mountUserIo(body, actions) {
     tick();
   }, POLL_MS);
 
-  // Cleanup for the workspace: stop polling when this pane is closed.
-  return () => { stopped = true; clearInterval(timer); };
+  // Cleanup for the workspace: stop polling + drop the window DnD guard
+  // when this pane is closed.
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    window.removeEventListener('dragover', onWindowDragOver);
+    window.removeEventListener('drop', onWindowDrop);
+  };
 }

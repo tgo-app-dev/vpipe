@@ -1,5 +1,6 @@
 #include "pipeline/stage.h"
 #include "common/job.h"
+#include "common/path-sandbox.h"
 #include "common/perf-event.h"
 #include <string>
 
@@ -112,6 +113,33 @@ Stage::attr_str(string_view key) const
   if (attr_present_(key, v)) { return string(v.as_string()); }
   const ConfigKey* k = find_key_(config_spec(), key);
   return k ? string(k->def_str) : string();
+}
+
+string
+Stage::confine_local_(string_view raw, bool for_write)
+{
+  if (raw.empty() || is_network_url(raw)) {
+    return string(raw);   // empty (handled by the stage) or a network URL
+  }
+  string_view p = raw;
+  if (p.rfind("file://", 0) == 0) { p.remove_prefix(7); }
+  string err;
+  const SessionContextIntf* sess = session();
+  string resolved = sess
+      ? sess->confine_path(p, for_write, &err).string()
+      : string(p);
+  if (!err.empty()) {
+    fail_config(fmt(
+        "path '{}' is blocked by the file sandbox: {}", string(raw), err));
+    return {};
+  }
+  return resolved;
+}
+
+string
+Stage::attr_path(string_view key, bool for_write)
+{
+  return confine_local_(attr_str(key), for_write);
 }
 
 FlexData

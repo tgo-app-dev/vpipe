@@ -1,4 +1,4 @@
-#include "stages/audio-video/video-file-encoder-stage.h"
+#include "stages/save-video-stage.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -37,12 +37,12 @@ fill_dict_from_options_(const FlexData& opts,
 
 }
 
-VideoFileEncoderStage::VideoFileEncoderStage
+SaveVideoStage::SaveVideoStage
   (const SessionContextIntf* s,
    string                    id,
    vector<InEdge>            iports_in,
    FlexData                  config)
-  : TypedStage<VideoFileEncoderStage>(s, std::move(id),
+  : TypedStage<SaveVideoStage>(s, std::move(id),
                                       std::move(iports_in),
                                       std::move(config))
   , _libs(s->ffmpeg_libraries())
@@ -59,7 +59,7 @@ VideoFileEncoderStage::VideoFileEncoderStage
 
   // Flat attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
-  _output_url   = attr_str("output_url");
+  _output_url   = attr_path("output_url", true);
   _format       = attr_str("format");
   _enable_video = attr_bool("enable_video");
   _enable_audio = attr_bool("enable_audio");
@@ -117,12 +117,12 @@ VideoFileEncoderStage::VideoFileEncoderStage
   // Validation is deferred to launch (see Stage::fail_config).
   if (_output_url.empty()) {
     fail_config(fmt(
-      "VideoFileEncoderStage('{}'): config.output_url is required",
+      "SaveVideoStage('{}'): config.output_url is required",
       this->id()));
   }
   if (!_enable_video && !_enable_audio) {
     fail_config(fmt(
-      "VideoFileEncoderStage('{}'): at least one of enable_video / "
+      "SaveVideoStage('{}'): at least one of enable_video / "
       "enable_audio must be true",
       this->id()));
   }
@@ -137,7 +137,7 @@ VideoFileEncoderStage::VideoFileEncoderStage
   }
   if (this->num_iports() != next) {
     fail_config(fmt(
-      "VideoFileEncoderStage('{}'): expected {} input edge(s) "
+      "SaveVideoStage('{}'): expected {} input edge(s) "
       "(enable_video={}, enable_audio={}) but got {}",
       this->id(), next, _enable_video, _enable_audio,
       this->num_iports()));
@@ -149,7 +149,7 @@ VideoFileEncoderStage::VideoFileEncoderStage
   _enc_pkt = _libs->avcodec().api.packet_alloc();
   if (!_enc_pkt) {
     fail_config(fmt(
-      "VideoFileEncoderStage('{}'): av_packet_alloc failed",
+      "SaveVideoStage('{}'): av_packet_alloc failed",
       this->id()));
   }
 }
@@ -157,7 +157,8 @@ VideoFileEncoderStage::VideoFileEncoderStage
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_url", .type = ConfigType::String, .required = true,
-   .doc = "output file path / URL"},
+   .doc = "output file path / URL",
+   .is_path = true, .path_write = true, .path_filter = "video"},
   {.key = "format", .type = ConfigType::String,
    .doc = "container format; \"\" = inferred", .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
@@ -183,12 +184,12 @@ const PortSpec kIports[] = {
    .type = nullptr, .clock_group = 1},
 };
 const StageSpec kSpec = {
-  .type_name = "video-file-encoder",
+  .type_name = "save-video",
   .doc       = "Sink: encodes incoming video/audio frames (H.264 + AAC "
                "by default) and muxes them into a container file. 0 "
                "oports; iports run on independent per-stream clocks.",
-  .display_name = "Video File Writer",
-  .category  = StageCategory::Video,
+  .display_name = "Save Video",
+  .category  = StageCategory::Visual,
   .iports    = kIports,
   .oports    = {},
   .attrs     = kAttrs,
@@ -196,12 +197,12 @@ const StageSpec kSpec = {
 }  // namespace
 
 const StageSpec&
-VideoFileEncoderStage::spec() const noexcept
+SaveVideoStage::spec() const noexcept
 {
   return kSpec;
 }
 
-VideoFileEncoderStage::~VideoFileEncoderStage()
+SaveVideoStage::~SaveVideoStage()
 {
   if (!_finalized) {
     // Best-effort cleanup if pipeline never reached EOS path.
@@ -226,7 +227,7 @@ VideoFileEncoderStage::~VideoFileEncoderStage()
 }
 
 string
-VideoFileEncoderStage::av_err_(int rc) const
+SaveVideoStage::av_err_(int rc) const
 {
   char buf[256];
   _libs->avutil().api.strerror(rc, buf, sizeof buf);
@@ -234,7 +235,7 @@ VideoFileEncoderStage::av_err_(int rc) const
 }
 
 void
-VideoFileEncoderStage::ensure_output_format_()
+SaveVideoStage::ensure_output_format_()
 {
   if (_ofctx) {
     return;
@@ -245,14 +246,14 @@ VideoFileEncoderStage::ensure_output_format_()
     &ofctx, nullptr, fmt_name, _output_url.c_str());
   if (rc < 0 || !ofctx) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): alloc_output_context2 failed: "
+        "SaveVideoStage('{}'): alloc_output_context2 failed: "
         "{}", this->id(), av_err_(rc)));
   }
   _ofctx = ofctx;
 }
 
 void
-VideoFileEncoderStage::init_video_encoder_(const VideoStreamParams& p)
+SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
 {
   ensure_output_format_();
 
@@ -260,14 +261,14 @@ VideoFileEncoderStage::init_video_encoder_(const VideoStreamParams& p)
     _video_codec.c_str());
   if (!codec) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): video encoder '{}' not found",
+        "SaveVideoStage('{}'): video encoder '{}' not found",
         this->id(), _video_codec));
   }
 
   _venc = _libs->avcodec().api.alloc_context3(codec);
   if (!_venc) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): alloc_context3 (video) failed",
+        "SaveVideoStage('{}'): alloc_context3 (video) failed",
         this->id()));
   }
 
@@ -306,28 +307,28 @@ VideoFileEncoderStage::init_video_encoder_(const VideoStreamParams& p)
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): avcodec_open2 (video) failed: "
+        "SaveVideoStage('{}'): avcodec_open2 (video) failed: "
         "{}", this->id(), av_err_(rc)));
   }
 
   _vstream = _libs->avformat().api.new_stream(_ofctx, codec);
   if (!_vstream) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): avformat_new_stream (video) "
+        "SaveVideoStage('{}'): avformat_new_stream (video) "
         "failed", this->id()));
   }
   rc = _libs->avcodec().api.parameters_from_context(_vstream->codecpar,
                                                    _venc);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): parameters_from_context "
+        "SaveVideoStage('{}'): parameters_from_context "
         "(video) failed: {}", this->id(), av_err_(rc)));
   }
   _vstream->time_base = _venc->time_base;
 }
 
 void
-VideoFileEncoderStage::init_audio_encoder_(const AudioStreamParams& p)
+SaveVideoStage::init_audio_encoder_(const AudioStreamParams& p)
 {
   ensure_output_format_();
 
@@ -335,14 +336,14 @@ VideoFileEncoderStage::init_audio_encoder_(const AudioStreamParams& p)
     _audio_codec.c_str());
   if (!codec) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): audio encoder '{}' not found",
+        "SaveVideoStage('{}'): audio encoder '{}' not found",
         this->id(), _audio_codec));
   }
 
   _aenc = _libs->avcodec().api.alloc_context3(codec);
   if (!_aenc) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): alloc_context3 (audio) failed",
+        "SaveVideoStage('{}'): alloc_context3 (audio) failed",
         this->id()));
   }
 
@@ -368,28 +369,28 @@ VideoFileEncoderStage::init_audio_encoder_(const AudioStreamParams& p)
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): avcodec_open2 (audio) failed: "
+        "SaveVideoStage('{}'): avcodec_open2 (audio) failed: "
         "{}", this->id(), av_err_(rc)));
   }
 
   _astream = _libs->avformat().api.new_stream(_ofctx, codec);
   if (!_astream) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): avformat_new_stream (audio) "
+        "SaveVideoStage('{}'): avformat_new_stream (audio) "
         "failed", this->id()));
   }
   rc = _libs->avcodec().api.parameters_from_context(_astream->codecpar,
                                                    _aenc);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): parameters_from_context "
+        "SaveVideoStage('{}'): parameters_from_context "
         "(audio) failed: {}", this->id(), av_err_(rc)));
   }
   _astream->time_base = _aenc->time_base;
 }
 
 bool
-VideoFileEncoderStage::ready_to_write_header_() const noexcept
+SaveVideoStage::ready_to_write_header_() const noexcept
 {
   bool v_ok = (!_enable_video) || _video_initialized;
   bool a_ok = (!_enable_audio) || _audio_initialized;
@@ -397,7 +398,7 @@ VideoFileEncoderStage::ready_to_write_header_() const noexcept
 }
 
 void
-VideoFileEncoderStage::open_output_and_write_header_()
+SaveVideoStage::open_output_and_write_header_()
 {
   // For non-NOFILE muxers we need to open the IO context.
   if (_ofctx->oformat
@@ -408,7 +409,7 @@ VideoFileEncoderStage::open_output_and_write_header_()
                                              AVIO_FLAG_WRITE);
     if (rc < 0) {
       session()->error(fmt(
-          "VideoFileEncoderStage('{}'): avio_open('{}') failed: {}",
+          "SaveVideoStage('{}'): avio_open('{}') failed: {}",
           this->id(), _output_url, av_err_(rc)));
     }
   }
@@ -419,13 +420,13 @@ VideoFileEncoderStage::open_output_and_write_header_()
   _libs->avutil().api.dict_free(&mux_opts);
   if (rc < 0) {
     session()->error(fmt(
-        "VideoFileEncoderStage('{}'): avformat_write_header failed: "
+        "SaveVideoStage('{}'): avformat_write_header failed: "
         "{}", this->id(), av_err_(rc)));
   }
 }
 
 void
-VideoFileEncoderStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
+SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
 {
   while (true) {
     int rc = _libs->avcodec().api.receive_packet(enc, _enc_pkt);
@@ -454,7 +455,7 @@ VideoFileEncoderStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
 }
 
 void
-VideoFileEncoderStage::encode_and_mux_(unsigned port, AVFrame* frame)
+SaveVideoStage::encode_and_mux_(unsigned port, AVFrame* frame)
 {
   AVCodecContext* enc = nullptr;
   AVStream*       st  = nullptr;
@@ -479,7 +480,7 @@ VideoFileEncoderStage::encode_and_mux_(unsigned port, AVFrame* frame)
 }
 
 void
-VideoFileEncoderStage::finalize_()
+SaveVideoStage::finalize_()
 {
   if (_finalized) {
     return;
@@ -510,7 +511,7 @@ VideoFileEncoderStage::finalize_()
 }
 
 Job
-VideoFileEncoderStage::initialize(RuntimeContext& /*ctx*/)
+SaveVideoStage::initialize(RuntimeContext& /*ctx*/)
 {
   // Output context, encoder contexts, and the file IO context all
   // depend on stream parameters that arrive as the first token on
@@ -519,7 +520,7 @@ VideoFileEncoderStage::initialize(RuntimeContext& /*ctx*/)
 }
 
 Job
-VideoFileEncoderStage::drain(RuntimeContext& /*ctx*/)
+SaveVideoStage::drain(RuntimeContext& /*ctx*/)
 {
   // Flush each encoder, write the muxer trailer, close the IO
   // context. Idempotent via _finalized.
@@ -528,7 +529,7 @@ VideoFileEncoderStage::drain(RuntimeContext& /*ctx*/)
 }
 
 Job
-VideoFileEncoderStage::process(RuntimeContext& ctx)
+SaveVideoStage::process(RuntimeContext& ctx)
 {
   // Are we entirely done?
   bool v_done = (_video_port < 0) || _video_eos;
@@ -574,7 +575,7 @@ VideoFileEncoderStage::process(RuntimeContext& ctx)
             t.get());
         if (!p) {
           session()->error(fmt(
-              "VideoFileEncoderStage('{}'): expected "
+              "SaveVideoStage('{}'): expected "
               "VideoStreamParams header on video port",
               this->id()));
         }
@@ -584,7 +585,7 @@ VideoFileEncoderStage::process(RuntimeContext& ctx)
             t.get());
         if (!p) {
           session()->error(fmt(
-              "VideoFileEncoderStage('{}'): expected "
+              "SaveVideoStage('{}'): expected "
               "AudioStreamParams header on audio port",
               this->id()));
         }
@@ -626,7 +627,7 @@ VideoFileEncoderStage::process(RuntimeContext& ctx)
   }
 }
 
-VPIPE_REGISTER_STAGE(VideoFileEncoderStage)
-VPIPE_REGISTER_SPEC(VideoFileEncoderStage, kSpec)
+VPIPE_REGISTER_STAGE(SaveVideoStage)
+VPIPE_REGISTER_SPEC(SaveVideoStage, kSpec)
 
 }

@@ -1,6 +1,8 @@
 #ifndef VPIPE_GENERATIVE_MODELS_CHAT_TEMPLATE_H
 #define VPIPE_GENERATIVE_MODELS_CHAT_TEMPLATE_H
 
+#include "generative-models/shared/mcp/mcp-tools.h"   // McpToolCall
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -374,6 +376,83 @@ public:
     (void)frame_timestamps_seconds;
     render_user_turn_vlm(content, image_token_counts,
                          is_first_turn, dst);
+  }
+
+  // ---- Tool / function calling (MCP) -------------------------------
+  // True when this family renders the tool-calling scaffold below (the
+  // Hermes/Qwen `<tools>` advertisement + `<tool_response>` result
+  // turn). Text-only chat stages check this before offering tools.
+  virtual bool supports_tools() const noexcept { return false; }
+
+  // Emit a leading system turn that advertises the callable tools to
+  // the model. `tools_json` is one function-spec JSON object per line
+  // (McpToolRegistry::tools_json()). Emitted ONCE, before the first
+  // user turn (honors is_first_turn like render_user_turn, for families
+  // that carry a session-start token). Returns false -- with nothing
+  // appended -- on families without tool support so the caller can skip
+  // the tool path.
+  virtual bool
+  render_tools_system_turn(std::string_view              tools_json,
+                           bool                          is_first_turn,
+                           std::vector<std::int32_t>*    dst) const
+  {
+    (void)tools_json; (void)is_first_turn; (void)dst;
+    return false;
+  }
+
+  // Emit a tool-results turn -- the outputs of the calls the model just
+  // made, in call order -- so decoding resumes with the model consuming
+  // the results. `tool_names[i]` is the function name of the i-th call
+  // (parallel to `results`); families that key the result block on the
+  // function name (Gemma-4's `response:NAME{...}`) use it, ChatML/Qwen
+  // ignore it. Depending on the family the turn either opens a fresh
+  // assistant-generation header (ChatML: results live in a new user
+  // turn) or continues the OPEN model turn in place (Gemma-4, whose
+  // tool call + result + answer are one turn). Returns false -- with
+  // nothing appended -- on families without tool support.
+  virtual bool
+  render_tool_results_turn(std::span<const std::string>  tool_names,
+                           std::span<const std::string>  results,
+                           std::vector<std::int32_t>*    dst) const
+  {
+    (void)tool_names; (void)results; (void)dst;
+    return false;
+  }
+
+  // Extract the tool calls the assistant emitted in THIS family's wire
+  // format, as name + JSON-arguments pairs the caller dispatches. The
+  // default handles the Hermes/Qwen `<tool_call>{json}</tool_call>`
+  // blocks (vpipe::parse_tool_calls); families with a different tool-
+  // call syntax (Gemma-4's `<|tool_call>call:NAME{...}<tool_call|>`)
+  // override. Empty when the turn made no tool calls.
+  virtual std::vector<vpipe::McpToolCall>
+  parse_tool_calls(const std::string& assistant_text) const
+  {
+    return vpipe::parse_tool_calls(assistant_text);
+  }
+
+  // The literal opening marker of a tool-call block in this family's
+  // DECODED text, used only for diagnostics (counting attempted calls
+  // when none parse). Hermes/Qwen: `<tool_call>`; Gemma-4:
+  // `<|tool_call>`.
+  virtual std::string_view tool_call_open_marker() const noexcept
+  {
+    return "<tool_call>";
+  }
+
+  // True when `id` stops the decode loop but does NOT close the
+  // assistant turn -- the model is handing control back mid-turn and
+  // generation resumes in the SAME turn once the caller injects a
+  // tool-results turn. Gemma-4's `<|tool_response>` is such a token: the
+  // model emits it right after a tool call to request the result, then
+  // the turn continues with the result + the model's answer, with no
+  // `<end_of_turn>` in between. The chat stage checks this so it does
+  // NOT commit the assistant-close token after a tool-calling decode.
+  // Default false: every stop token closes the turn.
+  virtual bool stop_token_continues_turn(std::int32_t id) const noexcept
+  {
+    (void)id;
+    return false;
   }
 
   // The id to commit to the K/V cache after a generated assistant

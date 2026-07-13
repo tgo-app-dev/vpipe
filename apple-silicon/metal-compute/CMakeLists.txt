@@ -123,6 +123,14 @@ add_vpipe_metal_kernel(dense_gemm_mma SRC gemm/dense_gemm_mma.metal
 add_vpipe_metal_kernel(dense_gemm_mma_bf16 SRC gemm/dense_gemm_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
+# Matrix-core (M5+) 3x3 conv2d via MetalPerformancePrimitives convolution2d.
+# Fuses away the im2col DRAM round-trip for the Krea-2 VAE 3x3 convs. metal4.0
+# tensor intrinsics; capability-gated at runtime (older GPUs keep im2col).
+add_vpipe_metal_kernel(conv2d_mma SRC gemm/conv2d_mma.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
+add_vpipe_metal_kernel(conv2d_mma_bf16 SRC gemm/conv2d_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)
 add_vpipe_metal_kernel(audio_encoder SRC encoders/audio_encoder.metal)
 set(STEEL_GEMM_HDRS

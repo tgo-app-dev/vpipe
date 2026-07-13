@@ -40,6 +40,9 @@ class HandleAccess;
 
 class StageHandle final {
 public:
+  // A default-constructed handle is null/invalid. Passed as the source
+  // of a StagePortHandle it marks a DISCONNECTED (optional) iport.
+  StageHandle() noexcept : _impl(nullptr) {}
   ~StageHandle() = default;
 
   unsigned num_oports() const;
@@ -76,7 +79,7 @@ public:
   ~PipelineHandle() = default;
 
   // Construct a stage of `type` (a name registered with the
-  // StageRegistry, e.g. "chrono", "shell", "video-file-decoder")
+  // StageRegistry, e.g. "chrono", "shell", "load-video")
   // and insert it into this pipeline.
   //
   //   id          stage-local id, used in log messages.

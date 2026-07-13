@@ -518,6 +518,7 @@ MetalMossCodec::load(const std::string& model_dir,
   self->_fn_residual = self->_lib_elt.function("residual_add_f16");
   self->_fn_sdpa = self->_lib_sdpa.function("sdpa_causal_window_f16");
   self->_fn_rope = self->_lib_rope.function("rope_interleaved_f16");
+  self->_fn_ring_append = self->_lib_elt.function("ring_append_f16");
   if (!self->_fn_gemm.valid() || !self->_fn_ln.valid() ||
       !self->_fn_gelu.valid() || !self->_fn_hslice.valid() ||
       !self->_fn_transpose.valid() || !self->_fn_residual.valid() ||
@@ -561,13 +562,15 @@ MetalMossCodec::load(const std::string& model_dir,
 
 SharedBuffer
 MetalMossCodec::rvq_decode_(const std::vector<std::vector<std::int32_t>>& codes,
-                            int T) {
+                            int T, int n_active) {
   auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
   const int CD = _codebook_dim, RV = _rvq_dim, OD = _code_dim;
+  // Residual truncation: sum only the first `na` codebooks (0 => all).
+  const int na = (n_active > 0 && n_active < _n_vq) ? n_active : _n_vq;
 
   // Host-gather each codebook's rows for the T frames.
-  std::vector<SharedBuffer> gathered((std::size_t)_n_vq);
-  for (int cb = 0; cb < _n_vq; ++cb) {
+  std::vector<SharedBuffer> gathered((std::size_t)na);
+  for (int cb = 0; cb < na; ++cb) {
     gathered[(std::size_t)cb] = buf((std::size_t)T * CD);
     auto* g = static_cast<_Float16*>(gathered[(std::size_t)cb].contents());
     const auto* tbl =
@@ -615,7 +618,7 @@ MetalMossCodec::rvq_decode_(const std::vector<std::vector<std::int32_t>>& codes,
       enc.set_constant(3, nn);
       enc.dispatch({(unsigned)nn, 1, 1}, {256, 1, 1});
     };
-    for (int cb = 0; cb < _n_vq; ++cb) {
+    for (int cb = 0; cb < na; ++cb) {
       gemm_bias(gathered[(std::size_t)cb], _q_outw[(std::size_t)cb],
                 _q_outb[(std::size_t)cb], tmp, T, RV, CD);
       residual(emb, tmp, emb, T * RV);
@@ -627,7 +630,11 @@ MetalMossCodec::rvq_decode_(const std::vector<std::vector<std::int32_t>>& codes,
 }
 
 SharedBuffer
-MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
+MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in,
+                           std::vector<SharedBuffer>* kc,
+                           std::vector<SharedBuffer>* vc, int pos,
+                           int ring_cap) {
+  const bool streaming = (kc != nullptr && vc != nullptr);
   const StageCfg& c = st.cfg;
   const int d = c.d_model, heads = c.n_heads, hd = d / heads, ff = c.ff;
   const int in_dim = c.in_dim, out_dim = c.out_dim;
@@ -796,32 +803,36 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       enc.set_constant(2, heads);
       enc.set_constant(3, T);
       enc.set_constant(4, hd);
-      const int off = 0;
+      const int off = pos;   // absolute position of the first (new) frame
       enc.set_constant(5, off);
       enc.dispatch({(unsigned)(hd / 2), (unsigned)T, (unsigned)heads}, {1, 1, 1});
     };
+    // See codec-v2: one-shot decodes all T from local K/V (linear); streaming
+    // decodes the T new frames (queries) at offset `pos` over the windowed ring.
+    const int Tkv      = streaming ? (pos + T) : T;
+    const int qoff     = streaming ? pos : 0;
+    const int kvstride = streaming ? ring_cap : T;
+    const int ringcap  = streaming ? ring_cap : T;
     auto attn = [&](const SharedBuffer& q, const SharedBuffer& k,
                     const SharedBuffer& v, const SharedBuffer& outb) {
-      const int zero = 0;
       if (_use_attn_mma && hd == 64) {
         // M5 matrix-core windowed-causal flash attention (BQ=16 query tile,
-        // 128 threads). Drop-in: same [heads,T,hd] layout + causal/window
-        // semantics; ring_cap unused (linear addressing).
+        // 128 threads). Same [heads,*,hd] layout + causal/window/ring semantics.
         enc.set_function(_fn_sdpa_mma);
         enc.set_buffer(0, q);
         enc.set_buffer(1, k);
         enc.set_buffer(2, v);
         enc.set_buffer(3, outb);
         enc.set_constant(4, scale);
-        enc.set_constant(5, T);
+        enc.set_constant(5, Tkv);
         enc.set_constant(6, hd);
         enc.set_constant(7, heads);
         enc.set_constant(8, heads);
         enc.set_constant(9, T);
-        enc.set_constant(10, zero);
-        enc.set_constant(11, T);
+        enc.set_constant(10, qoff);
+        enc.set_constant(11, kvstride);
         enc.set_constant(12, c.context);
-        enc.set_constant(13, zero);
+        enc.set_constant(13, streaming ? ringcap : 0);
         enc.dispatch({128, (unsigned)heads, (unsigned)((T + 15) / 16)},
                      {128, 1, 1});
         return;
@@ -832,16 +843,24 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       enc.set_buffer(2, v);
       enc.set_buffer(3, outb);
       enc.set_constant(4, scale);
-      enc.set_constant(5, T);          // T_kv
+      enc.set_constant(5, Tkv);        // T_kv
       enc.set_constant(6, hd);         // D
       enc.set_constant(7, heads);      // Hq
       enc.set_constant(8, heads);      // Hkv
       enc.set_constant(9, T);          // n_q
-      enc.set_constant(10, zero);      // q_offset
-      enc.set_constant(11, T);         // kv_stride
+      enc.set_constant(10, qoff);      // q_offset
+      enc.set_constant(11, kvstride);  // kv_stride
       enc.set_constant(12, c.context); // window (>= T => plain causal)
-      enc.set_constant(13, T);         // ring_cap (contiguous KV)
+      enc.set_constant(13, ringcap);   // ring_cap
       enc.dispatch({32, (unsigned)heads, (unsigned)T}, {32, 1, 1});
+    };
+    // Scatter the T new frames' per-head K (or V) rows into a windowed ring.
+    auto ring_append = [&](const SharedBuffer& src, const SharedBuffer& ring) {
+      enc.set_function(_fn_ring_append);
+      enc.set_buffer(0, src); enc.set_buffer(1, ring);
+      enc.set_constant(2, heads); enc.set_constant(3, T); enc.set_constant(4, hd);
+      enc.set_constant(5, ring_cap); enc.set_constant(6, pos);
+      enc.dispatch({(unsigned)hd, (unsigned)T, (unsigned)heads}, {1, 1, 1});
     };
 
     if (!id_in) { gemm_q(in, st.in_proj, x, T, d, in_dim); }   // input_proj
@@ -857,7 +876,13 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
       transpose(v3, vt, T, heads);
       rope(qt);
       rope(kt);
-      attn(qt, kt, vt, atb);
+      if (streaming) {
+        ring_append(kt, (*kc)[(std::size_t)l]);
+        ring_append(vt, (*vc)[(std::size_t)l]);
+        attn(qt, (*kc)[(std::size_t)l], (*vc)[(std::size_t)l], atb);
+      } else {
+        attn(qt, kt, vt, atb);
+      }
       transpose(atb, att, heads, T);   // [heads,T,hd] -> [T,heads,hd]
       gemm_q(att, L.ow, o, T, d, d);
       residual(x, o, x, T * d);
@@ -876,7 +901,7 @@ MetalMossCodec::run_stage_(const Stage& st, int T, const SharedBuffer& in) {
 
 std::vector<float>
 MetalMossCodec::decode(const std::vector<std::vector<std::int32_t>>& codes,
-                       std::vector<std::vector<float>>* stages) {
+                       std::vector<std::vector<float>>* stages, int n_active) {
   std::vector<float> wave;
   const int T = (int)codes.size();
   if (T <= 0 || !_ok) { return wave; }
@@ -899,7 +924,7 @@ MetalMossCodec::decode(const std::vector<std::vector<std::int32_t>>& codes,
     return out;
   };
 
-  SharedBuffer cur = rvq_decode_(codes, T);   // [T, 768]
+  SharedBuffer cur = rvq_decode_(codes, T, n_active);   // [T, 768]
   if (stages != nullptr) { stages->push_back(chan_major(cur, T, _code_dim)); }
 
   int curT = T;
@@ -928,6 +953,77 @@ MetalMossCodec::decode(const std::vector<std::vector<std::int32_t>>& codes,
   }
 
   // cur is [curT, 1] = [samples, 1].
+  wave.resize((std::size_t)curT);
+  const auto* w = static_cast<const _Float16*>(cur.contents());
+  for (int i = 0; i < curT; ++i) { wave[(std::size_t)i] = (float)w[i]; }
+  return wave;
+}
+
+std::unique_ptr<MetalMossCodec::StreamState>
+MetalMossCodec::decode_stream_begin(int max_chunk_frames, int n_active) const {
+  if (!_ok || max_chunk_frames <= 0) { return nullptr; }
+  auto st = std::make_unique<StreamState>();
+  const std::size_t ns = _stages.size();
+  st->kc.resize(ns);
+  st->vc.resize(ns);
+  st->pos.assign(ns, 0);
+  st->cap.assign(ns, 0);
+  st->max_chunk = max_chunk_frames;
+  st->n_active  = n_active;
+  int patchprod = 1;
+  for (std::size_t si = 0; si < ns; ++si) {
+    const StageCfg& c = _stages[si].cfg;
+    const int hd = c.d_model / c.n_heads;
+    const int cap = c.context + max_chunk_frames * patchprod;
+    st->cap[si] = cap;
+    const std::size_t ring =
+        (std::size_t)c.n_heads * (std::size_t)cap * (std::size_t)hd;
+    st->kc[si].reserve((std::size_t)c.n_layers);
+    st->vc[si].reserve((std::size_t)c.n_layers);
+    for (int l = 0; l < c.n_layers; ++l) {
+      st->kc[si].push_back(_mc->make_shared_buffer(ring * 2));
+      st->vc[si].push_back(_mc->make_shared_buffer(ring * 2));
+    }
+    patchprod *= c.patch;
+  }
+  return st;
+}
+
+std::vector<float>
+MetalMossCodec::decode_stream_chunk(
+    StreamState& st, const std::vector<std::vector<std::int32_t>>& codes) {
+  std::vector<float> wave;
+  const int Cnew = (int)codes.size();
+  if (Cnew <= 0 || !_ok || st.pos.size() != _stages.size()
+      || Cnew > st.max_chunk) {
+    return wave;
+  }
+  PerfAuxScope _perf(_session, kPerfLaneLLM, kGvidLlmAudioCodec,
+                     kPerfLlmAudioCodecBegin, (std::uint64_t)Cnew);
+
+  SharedBuffer cur = rvq_decode_(codes, Cnew, st.n_active);   // [Cnew, 768]
+  int curT = Cnew;
+  for (std::size_t si = 0; si < _stages.size(); ++si) {
+    const Stage& stg = _stages[si];
+    const int pos = st.pos[si];
+    SharedBuffer out =
+        run_stage_(stg, curT, cur, &st.kc[si], &st.vc[si], pos, st.cap[si]);
+    st.pos[si] = pos + curT;
+    const int P = stg.cfg.patch, Cout = stg.cfg.out_dim / P, Tout = curT * P;
+    SharedBuffer up = _mc->make_shared_buffer((std::size_t)Tout * Cout * 2);
+    const auto* s = static_cast<const _Float16*>(out.contents());
+    auto* d = static_cast<_Float16*>(up.contents());
+    for (int t = 0; t < curT; ++t) {
+      for (int co = 0; co < Cout; ++co) {
+        for (int p = 0; p < P; ++p) {
+          d[(std::size_t)(t * P + p) * Cout + co] =
+              s[(std::size_t)t * stg.cfg.out_dim + co * P + p];
+        }
+      }
+    }
+    cur = std::move(up);
+    curT = Tout;
+  }
   wave.resize((std::size_t)curT);
   const auto* w = static_cast<const _Float16*>(cur.contents());
   for (int i = 0; i < curT; ++i) { wave[(std::size_t)i] = (float)w[i]; }

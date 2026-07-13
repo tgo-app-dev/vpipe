@@ -57,6 +57,22 @@ function saveLocalTimePref(on) {
   catch (e) {}
 }
 
+// Sticky "highlight value-filter matches in the value pane" toggle.
+// Defaults ON (absent key => on) so a fresh session shows highlights.
+const HIGHLIGHT_KEY = 'vpipe_db_highlight';
+function loadHighlightPref() {
+  try { return localStorage.getItem(HIGHLIGHT_KEY) !== '0'; }
+  catch (e) { return true; }
+}
+function saveHighlightPref(on) {
+  try { localStorage.setItem(HIGHLIGHT_KEY, on ? '1' : '0'); }
+  catch (e) {}
+}
+
+// Page size for the client-paged (streaming value-filter) result set --
+// mirrors the server's kPageSize so both paths look the same.
+const STREAM_PAGE = 20;
+
 export function mountDatabase(container) {
   const state = {
     dbs: [],
@@ -77,14 +93,52 @@ export function mountDatabase(container) {
     // selected entry instead of jumping back to page 0 (task: re-query
     // unchanged conditions -> stay put).
     appliedSig: null,
+    // Value-content filter: an array of { cond, kw, op, indent } rows.
+    // `op` ("and" | "or") + `indent` form a boolean tree -- indented rows
+    // group with the row one step less indented; e.g. A / and B / or C
+    // (indents 0 1 0) = (A && B) || C. op/indent are ignored for row 0.
+    // When any row has a non-blank keyword the query runs through the
+    // streaming /api/db/scan endpoint (paged client-side); blank rows are
+    // ignored.
+    filters: [],
+    // Value pane: cache the last fetched value so the highlight toggle can
+    // re-render without a re-fetch. highlight is a sticky preference.
+    selectedValue: null,   // last /api/db/value response
+    selectedDisplay: '',   // the shown key label for the value head
+    highlight: loadHighlightPref(),
+    streamMode: false,     // true while showing streamed (value-filtered) results
+    scanRows: [],          // accumulated streamed rows (up to 64k)
+    scanning: false,       // a stream is in flight
+    scanTrunc: false,      // hit the 64k row cap / scan cap
+    scanMode: 'text',      // resolved key mode from the stream's meta
+    scanMatch: 'exact',
+    scanAbort: null,       // AbortController for the in-flight stream
   };
+
+  let streamRenderTimer = null;
+  // Abort the in-flight scan (if any). Does NOT clear state.scanAbort --
+  // the scan's own finalize step owns that, so a user-triggered Cancel is
+  // still recognised (state.scanAbort === its ctrl) and finalizes the UI,
+  // while a superseding scan overwrites scanAbort and the old finalize
+  // no-ops.
+  function abortScan() {
+    if (state.scanAbort) {
+      try { state.scanAbort.abort(); } catch (e) {}
+    }
+  }
+  // Any filter row with a non-blank keyword makes it a value-filtered
+  // (streaming) query.
+  function hasActiveFilters() {
+    return state.filters.some((f) => (f.kw || '').trim() !== '');
+  }
 
   // Identity of a query's *conditions* (not its page). localTime is
   // included because in time mode it changes how typed bounds are
   // interpreted (local vs UTC), so toggling it is a real change.
   function querySig() {
     return [state.selectedDb, state.mode, state.match,
-            state.q, state.lo, state.hi, state.localTime].join('\u0001');
+            state.q, state.lo, state.hi, state.localTime,
+            JSON.stringify(state.filters)].join('\u0001');
   }
 
   // --- skeleton -----------------------------------------------------
@@ -204,15 +258,113 @@ export function mountDatabase(container) {
         el('label', {}, t('db.to')), hiIn);
     }
 
+    // Run row: primary Run button, plus a Cancel + spinner while a
+    // value-filtered scan is streaming.
+    const runRow = el('div', { class: 'db-form-row' },
+      el('button', { class: 'btn primary', onclick: () => applyQuery() },
+        t('db.run_query')),
+      state.scanning
+        ? el('button', { class: 'btn', onclick: () => abortScan() },
+            t('common.cancel'))
+        : null,
+      state.scanning
+        ? el('span', { class: 'db-scanning' }, t('db.scanning'))
+        : null);
+
     queryBody.append(
       el('div', { class: 'db-form-row' },
         el('label', {}, t('db.interpret_as')), modeSel, detected,
         el('label', {}, t('db.match')), matchSel,
         localRow),
       fieldsRow,
-      el('div', { class: 'db-form-row' },
-        el('button', { class: 'btn primary', onclick: () => applyQuery() },
-          t('db.run_query'))));
+      renderValueFilter(),
+      runRow);
+  }
+
+  // Keep the indent levels a well-formed tree: row 0 at 0, every row at
+  // most one deeper than its predecessor (the ← / → buttons + blank-row
+  // removal can otherwise leave a gap).
+  function normalizeFilterIndents() {
+    for (let i = 0; i < state.filters.length; i++) {
+      const f = state.filters[i];
+      if (i === 0) { f.indent = 0; }
+      else {
+        const cap = (state.filters[i - 1].indent || 0) + 1;
+        f.indent = Math.max(0, Math.min(f.indent || 0, cap));
+      }
+    }
+  }
+
+  // Value-content filter section: rows of { cond, kw, op, indent }. Each
+  // row after the first carries an and/or connective + an indent level
+  // (adjusted by ← / →) so the rows form a boolean tree. Editing a keyword
+  // / dropdown updates state in place WITHOUT re-rendering (keeps input
+  // focus); add / remove / indent re-render the form.
+  function renderValueFilter() {
+    normalizeFilterIndents();
+    const rows = state.filters.map((f, i) => {
+      const first = (i === 0);
+      const indent = f.indent || 0;
+
+      const opSel = first ? null : el('select', { class: 'db-vfilter-op',
+        onchange: (e) => { state.filters[i].op = e.target.value; } },
+        el('option', { value: 'and', selected: f.op !== 'or' ? '' : null },
+          t('db.op_and')),
+        el('option', { value: 'or', selected: f.op === 'or' ? '' : null },
+          t('db.op_or')));
+
+      const condSel = el('select', {
+        onchange: (e) => { state.filters[i].cond = e.target.value; } },
+        ...[['includes', t('db.cond_includes')],
+            ['excludes', t('db.cond_excludes')],
+            ['regex', t('db.cond_regex')],
+            ['regex_not', t('db.cond_regex_not')],
+            ['regex_line', t('db.cond_regex_line')],
+            ['regex_line_not', t('db.cond_regex_line_not')]]
+          .map(([v, l]) => el('option',
+            { value: v, selected: f.cond === v ? '' : null }, l)));
+      const kwIn = el('input', { type: 'text', value: f.kw || '',
+        placeholder: t('db.vfilter_ph'),
+        oninput: (e) => { state.filters[i].kw = e.target.value; } });
+      kwIn.addEventListener('keydown',
+        (e) => { if (e.key === 'Enter') { applyQuery(); } });
+
+      // Indent controls (row 0 is pinned at indent 0). → can go at most
+      // one deeper than the row above; ← down to 0.
+      const canIn = !first && indent < ((state.filters[i - 1].indent || 0) + 1);
+      const outBtn = first ? null : el('button', { class: 'db-vfilter-ind',
+        title: t('db.outdent'), disabled: indent <= 0 ? '' : null,
+        onclick: () => {
+          state.filters[i].indent = Math.max(0, indent - 1);
+          renderQuery();
+        } }, '←');
+      const inBtn = first ? null : el('button', { class: 'db-vfilter-ind',
+        title: t('db.indent'), disabled: canIn ? null : '',
+        onclick: () => { state.filters[i].indent = indent + 1; renderQuery(); } },
+        '→');
+
+      const rm = el('button', { class: 'db-vfilter-rm',
+        title: t('common.remove'),
+        onclick: () => { state.filters.splice(i, 1); renderQuery(); } }, '×');
+
+      return el('div',
+        { class: 'db-vfilter-row',
+          style: 'margin-left:' + (indent * 22) + 'px' },
+        opSel, condSel, kwIn, outBtn, inBtn, rm);
+    });
+
+    return el('div', { class: 'db-vfilter' },
+      el('div', { class: 'db-vfilter-head' },
+        el('span', { class: 'db-vfilter-title' }, t('db.value_filter'))),
+      ...rows,
+      el('div', { class: 'db-vfilter-actions' },
+        el('button', { class: 'btn db-vfilter-add',
+          onclick: () => {
+            state.filters.push({ cond: 'includes', kw: '', op: 'and',
+              indent: 0 });
+            renderQuery();
+          } },
+          t('db.add_value_filter'))));
   }
 
   async function applyQuery() {
@@ -229,21 +381,39 @@ export function mountDatabase(container) {
     await runQuery({ reconcile: same });
   }
 
-  async function runQuery(opts) {
-    if (!state.selectedDb) { return; }
-    const reconcile = !!(opts && opts.reconcile);
-    // When the user enters times as LOCAL we convert them to epoch
-    // seconds here; the backend interprets bare numbers as epoch (with
-    // automatic ms/us/ns scaling), so this round-trips correctly.
+  // Convert typed LOCAL times to epoch seconds for the backend (which
+  // reads bare numbers as epoch with ms/us/ns auto-scaling). Shared by
+  // the server-paged and streaming paths.
+  function timeToQuery() {
     const usingLocal = state.localTime
         && (state.mode === 'time'
             || (state.mode === 'auto' && state.result
                 && state.result.mode === 'time'));
-    const toQ = (s) => {
+    return (s) => {
       if (!usingLocal || !s) { return s; }
       const ep = parseLocal(s);
       return ep != null ? String(ep) : s;
     };
+  }
+
+  // Dispatch: a value-content filter routes through the streaming scan
+  // (client-paged); otherwise the server-paged key query.
+  async function runQuery(opts) {
+    if (!state.selectedDb) { return; }
+    if (hasActiveFilters()) { return runScan(opts); }
+    return runKeyQuery(opts);
+  }
+
+  async function runKeyQuery(opts) {
+    if (!state.selectedDb) { return; }
+    // Leaving stream mode: stop any in-flight scan and take ownership so
+    // its finalize step no-ops (state.scanAbort no longer matches it).
+    abortScan();
+    state.scanAbort = null;
+    state.streamMode = false;
+    state.scanning = false;
+    const reconcile = !!(opts && opts.reconcile);
+    const toQ = timeToQuery();
     const fetchKeys = (page) => api.dbKeys({
       db: state.selectedDb, mode: state.mode, match: state.match,
       q: toQ(state.q), lo: toQ(state.lo), hi: toQ(state.hi),
@@ -301,6 +471,133 @@ export function mountDatabase(container) {
     renderDbList();
   }
 
+  // --- streaming value-filtered scan (client-paged) -----------------
+
+  // Synthesize a `state.result` (the shape renderKeys reads) from the
+  // accumulated streamed rows + the current page, so the same key-list /
+  // pager code serves both the server-paged and streaming paths.
+  function syncStreamResult() {
+    const rows = state.scanRows;
+    const total = rows.length;
+    const lastP = total > 0 ? Math.floor((total - 1) / STREAM_PAGE) : 0;
+    const page = Math.min(Math.max(0, state.page), lastP);
+    state.page = page;
+    const start = page * STREAM_PAGE;
+    state.result = {
+      db: state.selectedDb,
+      mode: state.scanMode,
+      match: state.scanMatch,
+      page, last_page: lastP, total,
+      keys: rows.slice(start, start + STREAM_PAGE),
+      has_prev: page > 0, has_next: page < lastP,
+      truncated: state.scanTrunc,
+      scanning: state.scanning,   // consumed by the key-list head
+    };
+  }
+
+  // Coalesce the flood of onRow callbacks into at most one re-render per
+  // ~120 ms so accumulating up to 64k rows doesn't thrash the DOM.
+  function scheduleStreamRender() {
+    if (streamRenderTimer) { return; }
+    streamRenderTimer = setTimeout(() => {
+      streamRenderTimer = null;
+      if (state.streamMode) { syncStreamResult(); renderKeys(); }
+    }, 120);
+  }
+
+  async function runScan(opts) {
+    if (!state.selectedDb) { return; }
+    const reconcile = !!(opts && opts.reconcile);
+    abortScan();
+    const ctrl = new AbortController();
+    state.scanAbort = ctrl;
+    state.streamMode = true;
+    state.scanRows = [];
+    state.scanning = true;
+    state.scanTrunc = false;
+    state.scanMode = state.mode === 'auto' ? 'text' : state.mode;
+    state.scanMatch = state.match;
+    if (!reconcile) {
+      state.page = 0;
+      state.selectedKey = null;
+      clear(valueBody);
+    }
+    // Best-effort left-pane count refresh (a writer may be adding rows),
+    // in parallel with the scan.
+    api.dbList().then((d) => {
+      if (d && d.databases) { state.dbs = d.databases; }
+      if (d && typeof d.deletable === 'boolean') {
+        state.deletable = d.deletable;
+      }
+      renderDbList();
+    }).catch(() => {});
+
+    // Drop blank rows, then re-normalize indents of the surviving rows so
+    // the tree stays well-formed (a removed middle row could leave a gap).
+    const active = state.filters.filter((f) => (f.kw || '').trim() !== '');
+    const sentFilters = [];
+    active.forEach((f, i) => {
+      const cap = i === 0 ? 0 : sentFilters[i - 1].indent + 1;
+      sentFilters.push({
+        cond: f.cond || 'includes',
+        kw: f.kw,
+        op: f.op === 'or' ? 'or' : 'and',
+        indent: i === 0 ? 0 : Math.max(0, Math.min(f.indent || 0, cap)),
+      });
+    });
+    const toQ = timeToQuery();
+    const body = {
+      db: state.selectedDb, mode: state.mode, match: state.match,
+      q: toQ(state.q), lo: toQ(state.lo), hi: toQ(state.hi),
+      filters: sentFilters,
+    };
+    // Show the scanning state (empty list + Cancel) right away.
+    syncStreamResult();
+    renderQuery();
+    renderKeys();
+
+    let errMsg = null;
+    try {
+      await api.dbScan(body, {
+        onMeta: (m) => {
+          if (m.mode) { state.scanMode = m.mode; }
+          if (m.match) { state.scanMatch = m.match; }
+        },
+        onRow: (row) => { state.scanRows.push(row); scheduleStreamRender(); },
+        onDone: (d) => {
+          state.scanning = false;
+          state.scanTrunc = !!d.truncated;
+        },
+        onError: (msg) => { state.scanning = false; errMsg = msg; },
+      }, ctrl.signal);
+    } catch (e) {
+      if (!e || e.name !== 'AbortError') { errMsg = e.message; }
+    } finally {
+      // Only the currently-owned scan finalizes the shared UI; a scan
+      // that was superseded (newer scan / left stream mode) no-ops.
+      if (state.scanAbort === ctrl) {
+        state.scanAbort = null;
+        state.scanning = false;
+        if (streamRenderTimer) {
+          clearTimeout(streamRenderTimer);
+          streamRenderTimer = null;
+        }
+        // Drop a selection that didn't survive the (re)scan.
+        if (reconcile && state.selectedKey
+            && !state.scanRows.some((k) => k.key === state.selectedKey)) {
+          state.selectedKey = null;
+          clear(valueBody);
+        }
+        state.appliedSig = querySig();
+        syncStreamResult();
+        renderQuery();
+        renderKeys();
+        renderDbList();
+        if (errMsg) { toast(t('db.query_failed', { msg: errMsg }), 'error'); }
+      }
+    }
+  }
+
   // --- right bottom-left: key list + pager --------------------------
   function renderKeys() {
     clear(keysBody);
@@ -338,7 +635,10 @@ export function mountDatabase(container) {
     const lastP = r && typeof r.last_page === 'number' ? r.last_page : 0;
     const goto_ = (p) => {
       state.page = Math.max(0, Math.min(lastP, p));
-      runQuery();
+      // Stream mode pages client-side over the accumulated rows -- no
+      // re-scan; the server-paged path re-queries for the new page.
+      if (state.streamMode) { syncStreamResult(); renderKeys(); }
+      else { runQuery(); }
     };
     const pageLabel = r
       ? t('db.page_of', { n: pageNo + 1, total: lastP + 1,
@@ -370,6 +670,10 @@ export function mountDatabase(container) {
         (r && r.truncated)
           ? el('span', { class: 'db-trunc', title: t('db.truncated_title') },
               t('db.truncated'))
+          : null,
+        // Live "scanning…" indicator while a value-filtered stream runs.
+        (r && r.scanning)
+          ? el('span', { class: 'db-scanning' }, t('db.scanning'))
           : null),
       list, pager);
   }
@@ -377,6 +681,8 @@ export function mountDatabase(container) {
   // --- right bottom-right: value ------------------------------------
   async function selectKey(b64, display) {
     state.selectedKey = b64;
+    state.selectedDisplay = display;
+    state.selectedValue = null;
     renderKeys();
     clear(valueBody);
     valueBody.append(el('div', { class: 'db-hint' }, t('common.loading')));
@@ -389,22 +695,120 @@ export function mountDatabase(container) {
         t('db.read_failed', { msg: e.message })));
       return;
     }
+    // A newer selection may have landed while this fetch was in flight.
+    if (state.selectedKey !== b64) { return; }
+    state.selectedValue = v;
+    renderValue();
+  }
+
+  // The positive value-filter conditions (the ones asserting presence) --
+  // these are what "highlight matches" marks in the value pane.
+  function activePositiveFilters() {
+    return state.filters.filter((f) =>
+      (f.kw || '').trim() !== ''
+      && (f.cond === 'includes' || f.cond === 'regex'
+          || f.cond === 'regex_line'));
+  }
+
+  // Merged [start,end) ranges in `text` matched by the positive filters.
+  // includes -> case-insensitive substring; regex kinds -> a global
+  // RegExp ('m' for the line variant so ^/$ anchor per line). Bad regexes
+  // are skipped. Zero-width matches are ignored.
+  function matchRanges(text, positives) {
+    const ranges = [];
+    for (const f of positives) {
+      const kw = f.kw;
+      if (f.cond === 'includes') {
+        const needle = kw.toLowerCase();
+        if (!needle) { continue; }
+        const hay = text.toLowerCase();
+        let i = 0;
+        while ((i = hay.indexOf(needle, i)) >= 0) {
+          ranges.push([i, i + needle.length]);
+          i += needle.length;
+        }
+      } else {
+        let re;
+        try {
+          re = new RegExp(kw, f.cond === 'regex_line' ? 'gim' : 'gi');
+        } catch (e) { continue; }
+        let m;
+        let guard = 0;
+        while ((m = re.exec(text)) !== null) {
+          if (m[0].length === 0) { re.lastIndex++; }
+          else { ranges.push([m.index, m.index + m[0].length]); }
+          if (++guard > 200000) { break; }
+        }
+      }
+    }
+    ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1]) { last[1] = Math.max(last[1], r[1]); }
+      else { merged.push([r[0], r[1]]); }
+    }
+    return merged;
+  }
+
+  // Fill `pre` with `text`, wrapping the matched ranges in <mark>.
+  function appendHighlighted(pre, text, positives) {
+    const ranges = matchRanges(text, positives);
+    if (ranges.length === 0) { pre.textContent = text; return; }
+    let pos = 0;
+    for (const [s, e] of ranges) {
+      if (s > pos) { pre.append(document.createTextNode(text.slice(pos, s))); }
+      pre.append(el('mark', { class: 'db-hl' }, text.slice(s, e)));
+      pos = e;
+    }
+    if (pos < text.length) {
+      pre.append(document.createTextNode(text.slice(pos)));
+    }
+  }
+
+  // Render the cached value (state.selectedValue). Highlighting is offered
+  // only for FlexData->JSON values (the hex dump of a binary value doesn't
+  // line up with the searched bytes) and only when positive filters exist.
+  function renderValue() {
     clear(valueBody);
+    const v = state.selectedValue;
+    if (!v) { return; }
     if (!v.found) {
       valueBody.append(el('div', { class: 'db-hint' }, t('db.key_not_found')));
       return;
     }
     const enc = v.encoding === 'json' ? t('db.enc_json')
               : t('db.enc_binary');
+    const positives = activePositiveFilters();
+    const canHl = v.encoding === 'json' && positives.length > 0;
+    const hlToggle = canHl
+      ? el('label', { class: 'db-hl-toggle', title: t('db.highlight_title') },
+          el('input', { type: 'checkbox',
+            checked: state.highlight ? '' : null,
+            onchange: (e) => {
+              state.highlight = e.target.checked;
+              saveHighlightPref(state.highlight);
+              renderValue();
+            } }),
+          t('db.highlight'))
+      : null;
+    // .allow-context-menu: keep the native right-click menu (copy /
+    // select-all) on the entry's value text, exempt from the app-wide
+    // context-menu suppression.
+    const pre = el('pre',
+      { class: 'db-dump allow-context-menu ' + v.encoding });
+    if (canHl && state.highlight) {
+      appendHighlighted(pre, v.text, positives);
+    } else {
+      pre.textContent = v.text;
+    }
     valueBody.append(
       el('div', { class: 'db-value-head' },
-        el('span', { class: 'db-vkey', title: display }, display),
+        el('span', { class: 'db-vkey', title: state.selectedDisplay },
+          state.selectedDisplay),
+        hlToggle,
         el('span', { class: 'db-vmeta' }, v.size + ' B · ' + enc)),
-      // .allow-context-menu: keep the native right-click menu (copy /
-      // select-all) on the entry's value text, exempt from the app-wide
-      // context-menu suppression.
-      el('pre', { class: 'db-dump allow-context-menu ' + v.encoding },
-        v.text));
+      pre);
   }
 
   // --- mutation: drop entry / database ------------------------------

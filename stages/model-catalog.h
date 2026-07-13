@@ -37,10 +37,25 @@ class FlexData;
 struct ModelCatalogEntry {
   std::string family;       // "Qwen", "Gemma"
   std::string version;      // "3.5", "3.6", "4", "3-ASR"
-  std::string param_class;  // "27B", "9B", "4B", "e4b", "12B", "1.7B"
+  std::string param_class;  // "27B", "9B", "4B", "E4B", "12B", "1.7B"
   std::string variant;      // label distinguishing publisher / quant
   std::string hf_path;      // "mlx-community/Qwen3.5-9B-MLX-4bit"
   std::string model_type;   // runtime hint: "qwen3.5"/"gemma4"/...
+  // Supported input / output modalities, each a subset of
+  // {"text","image","audio","video"}. Descriptive metadata surfaced in the
+  // web-ui model browser (e.g. gemma-4-e4b in {text,image,audio,video} out
+  // {text}; flux2 in {text,image} out {image}). Left empty for pure
+  // components/datasets where a modality doesn't apply.
+  std::vector<std::string> inputs;
+  std::vector<std::string> outputs;
+  // Parent linkage for SUPPLEMENTS (vision towers, LoRAs). A non-empty
+  // `parent_model_type` marks this entry as an attachment to a parent
+  // model of that model_type (e.g. a vision tower -> "qwen3.5"; a LoRA ->
+  // "krea2"). `parent_param_class` optionally pins the parent size ("4B",
+  // "E4B"); empty means any size within the parent family. Used to match
+  // a supplement to the parent model chosen in a sibling stage field.
+  std::string parent_model_type;
+  std::string parent_param_class;
   std::vector<std::string> files;  // repo files to fetch (one or more GGUF
                                    // quant(s) + mmproj/imatrix companions);
                                    // empty = fetch the whole repo
@@ -82,6 +97,21 @@ catalog_find(const std::string& family, const std::string& version,
 // catalogued -- a user-typed path is still downloadable, just without
 // the curated metadata).
 const ModelCatalogEntry* catalog_by_path(const std::string& hf_path);
+
+// Look up a catalogue entry by its `name` (the registration key used when
+// several entries share ONE hf_path -- the vpipe-supplement CoreML models).
+// catalog_by_path can't disambiguate those (they share hf_path), so the
+// registry-record enrichment matches by `name` first. nullptr on miss.
+const ModelCatalogEntry* catalog_by_name(const std::string& name);
+
+// Derived category of an entry: "dataset" (carries dataset_files),
+// "supplement" (has a parent_model_type -- a tower / LoRA), else "model".
+std::string catalog_category(const ModelCatalogEntry& e);
+
+// Serialize an entry's curated metadata (selection fields + model_type,
+// category, inputs, outputs, parent linkage) to a FlexData object, for the
+// web-ui model browser. Fetch-only fields (files, dataset URLs) are omitted.
+FlexData catalog_entry_to_flex(const ModelCatalogEntry& e);
 
 // Normalise a user-typed model reference to a bare "owner/repo" path:
 //   "https://huggingface.co/owner/repo"     -> "owner/repo"

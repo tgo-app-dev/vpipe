@@ -131,6 +131,7 @@ public:
     decltype(&::avformat_write_header)          write_header;
     decltype(&::av_write_trailer)               write_trailer;
     decltype(&::av_interleaved_write_frame)     interleaved_write_frame;
+    decltype(&::av_write_frame)                 write_frame;
     decltype(&::avio_open)                      avio_open;
     decltype(&::avio_closep)                    avio_closep;
     decltype(&::avio_alloc_context)             avio_alloc_context;

@@ -28,6 +28,11 @@ import { tOr } from './i18n.js';
 const NODE_W    = 176;
 const COL_GAP   = 74;
 const ROW_GAP   = 34;
+// Minimum clearance enforced when de-overlapping a DROPPED box. Kept small
+// (a hair, not a full ROW_GAP) so a box only shifts when it would actually
+// touch a neighbour -- otherwise a small nudge into the empty gap above a
+// node reads as "occupied" and snaps the box right back to its old slot.
+const OVERLAP_GAP = 6;
 const HEADER_H  = 38;
 const PORT_TOP  = HEADER_H + 8;
 const PORT_GAP  = 18;
@@ -35,6 +40,7 @@ const PORT_R    = 4.5;
 const PAD       = 28;
 const DUMMY_H   = 10;    // routing slot height for through-going edges
 const DUMMY_GAP = 6;     // tighter spacing when an adjacent item is a dummy
+const ROW_PITCH = 120;   // nominal row height for drop-pin distance caps
 const SWEEPS    = 16;    // barycentre crossing-min iterations
 const MIN_K     = 0.08;
 const MAX_K     = 4;
@@ -66,7 +72,25 @@ function truncate(s, n) {
 // `metrics` resolves per-node rendered-port counts:
 //   inCount(n)  -> number of input slots drawn (spec-declared)
 //   addStub(n)  -> whether the "+ add input" stub adds a row
-function computeLayout(graph, metrics) {
+//
+// `seed` (optional) is the PREVIOUS layout's `pos` map (id -> {x,y,...}).
+// When present the layout is PLACEMENT-AWARE: columns (depths) are still
+// assigned by longest-path rank, but within each column nodes keep their
+// current vertical order (sorted by seed Y) instead of being reshuffled
+// by crossing-minimisation, and each column is shifted by the median of
+// its nodes' Y deltas -- so a re-layout moves stages as little as
+// possible. New nodes and routing dummies (which have no seed) are
+// slotted near their neighbours by propagating the seed-Y field across
+// a few barycentre passes. Without a seed (first layout of a pipeline)
+// it falls back to crossing-min from JSON order.
+//
+// `pins` (optional) is a Map id -> {col, y} of USER-placed positions (a
+// stage dropped from the toolbox at a chosen grid cell). A pin sets a
+// rank FLOOR for its node (so the column the user chose is honoured, even
+// though a brand-new stage has no edges to rank it) and seeds its Y, so
+// the drop position survives the auto-layout. Topology can only push a
+// pinned node to a LATER column, never earlier.
+function computeLayout(graph, metrics, seed, pins) {
   // 1. Build node table + per-node iport-edge list (rank input).
   const nodes = new Map();
   for (const n of graph.nodes) { nodes.set(n.id, { ...n, _in: [] }); }
@@ -82,7 +106,10 @@ function computeLayout(graph, metrics) {
     if (rank.has(id)) { return rank.get(id); }
     if (stack.has(id)) { return 0; }
     stack.add(id);
-    let r = 0;
+    // A user pin sets the minimum column so the chosen depth is honoured
+    // even for an edge-less new stage; predecessors can only push later.
+    const pin = pins && pins.get(id);
+    let r = pin && pin.col > 0 ? pin.col : 0;
     for (const e of nodes.get(id)._in) {
       if (nodes.has(e.from)) { r = Math.max(r, rankOf(e.from) + 1); }
     }
@@ -192,20 +219,85 @@ function computeLayout(graph, metrics) {
       layers[r] = order.map((i) => layer[i]);
     }
   }
-  for (let it = 0; it < SWEEPS; it++) {
-    sweep(true);
-    sweep(false);
+  // A node's reference Y for placement-aware ordering: its previous
+  // position if we have one, else its user-pin Y (a freshly dropped
+  // stage), else undefined (new + unplaced -> estimated from neighbours).
+  const seedY = (id) => {
+    const s = seed && seed.get(id);
+    if (s && typeof s.y === 'number') { return s.y; }
+    const p = pins && pins.get(id);
+    if (p && typeof p.y === 'number') { return p.y; }
+    return undefined;
+  };
+  const hasSeed = (seed && seed.size > 0) || (pins && pins.size > 0);
+  if (hasSeed) {
+    // Placement-aware ordering: keep each column in the user's current
+    // vertical order (minimal displacement) instead of reshuffling.
+    // Seed real nodes with their previous Y; propagate that Y field to
+    // new nodes and routing dummies (no seed) from their neighbours so
+    // they land near where they connect, then order each layer by it.
+    const y0 = new Map();
+    for (const layer of layers) {
+      for (const item of layer) {
+        if (item.kind !== 'real') { continue; }
+        const y = seedY(item.id);
+        if (y !== undefined) { y0.set(item.id, y); }
+      }
+    }
+    const propagate = (neighbours) => {
+      for (const layer of layers) {
+        for (const item of layer) {
+          if (y0.has(item.id)) { continue; }
+          const ns = neighbours.get(item.id) || [];
+          let sum = 0, cnt = 0;
+          for (const nid of ns) {
+            if (y0.has(nid)) { sum += y0.get(nid); ++cnt; }
+          }
+          if (cnt > 0) { y0.set(item.id, sum / cnt); }
+        }
+      }
+    };
+    for (let it = 0; it < 4; it++) { propagate(preds); propagate(succs); }
+    // Anything still unseeded (a wholly disconnected new node) sinks to
+    // the bottom of its column, keeping the seeded nodes undisturbed.
+    layers.forEach((layer) => {
+      let base = 0;
+      for (const item of layer) {
+        if (y0.has(item.id)) { base = Math.max(base, y0.get(item.id)); }
+      }
+      for (const item of layer) {
+        if (!y0.has(item.id)) { base += 1000; y0.set(item.id, base); }
+      }
+    });
+    layers.forEach((layer, r) => {
+      const idx = new Map(layer.map((n, i) => [n.id, i]));
+      layers[r] = layer.slice().sort((a, b) => {
+        const ya = y0.get(a.id), yb = y0.get(b.id);
+        if (ya !== yb) { return ya - yb; }
+        return idx.get(a.id) - idx.get(b.id);   // stable tie-break
+      });
+    });
+  } else {
+    for (let it = 0; it < SWEEPS; it++) {
+      sweep(true);
+      sweep(false);
+    }
   }
 
-  // 7. Y positioning. Real nodes get their full nodeHeight + ROW_GAP;
-  //    dummies get a small lane slot with tighter spacing so the
-  //    overall layout doesn't blow up vertically for long edges.
+  // 7. Y positioning. Each column is packed top-to-bottom (real nodes get
+  //    their full nodeHeight + ROW_GAP; dummies get a small lane slot),
+  //    then shifted vertically by `offset`. With a seed, `offset` is the
+  //    median of the column's per-node Y deltas (packed vs. seed) so the
+  //    bulk of the nodes stay exactly where they were; clamped so the
+  //    column top stays on-canvas. Without a seed, offset == PAD (the
+  //    original top-packing).
   const pos = new Map();
   let maxX = 0;
   let maxY = 0;
   layers.forEach((layer, r) => {
     const x = PAD + r * (NODE_W + COL_GAP);
-    let y = PAD;
+    const packed = [];
+    let y = 0;
     for (let i = 0; i < layer.length; i++) {
       const item = layer[i];
       const rn = item.kind === 'real' ? nodes.get(item.id) : null;
@@ -213,15 +305,33 @@ function computeLayout(graph, metrics) {
           ? nodeHeight(metrics.inCount(rn), rn.oports.length,
                        metrics.addStub(rn))
           : DUMMY_H;
-      pos.set(item.id, {
-        x, y, h, rank: r, kind: item.kind,
-      });
+      packed.push({ item, y, h });
       const nxt = layer[i + 1];
       const dummyAdj = item.kind === 'dummy'
                     || (nxt && nxt.kind === 'dummy');
       y += h + (dummyAdj ? DUMMY_GAP : ROW_GAP);
+    }
+    let offset = PAD;
+    if (hasSeed) {
+      const deltas = [];
+      for (const p of packed) {
+        if (p.item.kind !== 'real') { continue; }
+        const sy = seedY(p.item.id);
+        if (sy !== undefined) { deltas.push(sy - p.y); }
+      }
+      if (deltas.length) {
+        deltas.sort((a, b) => a - b);
+        offset = deltas[Math.floor((deltas.length - 1) / 2)];   // median
+      }
+      if (offset < PAD) { offset = PAD; }   // keep the column top on-canvas
+    }
+    for (const p of packed) {
+      const yy = p.y + offset;
+      pos.set(p.item.id, {
+        x, y: yy, h: p.h, rank: r, kind: p.item.kind,
+      });
       maxX = Math.max(maxX, x + NODE_W);
-      maxY = Math.max(maxY, y);
+      maxY = Math.max(maxY, yy + p.h);
     }
   });
 
@@ -230,6 +340,64 @@ function computeLayout(graph, metrics) {
     width: maxX + PAD,
     height: maxY + PAD,
   };
+}
+
+// Snap a world drop point to a grid pin {col, y} for a newly-dropped
+// stage: nearest column, then clamped to within 5 columns / 5 rows of the
+// existing graph's extent (read from the previous layout `seedPos`) so a
+// stray far-away drop can't fling the node off into empty space. A
+// null/empty `seedPos` (dropping onto an empty canvas) clamps around the
+// origin instead.
+export function worldToPin(pos, seedPos) {
+  const cl = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  const COL_PITCH = NODE_W + COL_GAP;
+  let maxRank = 0, maxY = -Infinity, any = false;
+  if (seedPos) {
+    seedPos.forEach((p) => {
+      if (p.kind && p.kind !== 'real') { return; }
+      any = true;
+      maxRank = Math.max(maxRank, p.rank || 0);
+      maxY = Math.max(maxY, p.y + (p.h || 0));
+    });
+  }
+  if (!any) { maxY = PAD; }
+  const col = cl(Math.round((pos.x - PAD) / COL_PITCH), 0, maxRank + 5);
+  // Vertical: keep the box on-canvas (>= PAD, the top margin) and not flung
+  // far below the graph. The lower bound is an ABSOLUTE top margin, NOT
+  // relative to the current topmost node -- so a box can always be dragged
+  // back up to the top even after the rest of the graph was pushed down
+  // (the old `minY - 5*ROW_PITCH` floor rose with the graph and trapped it).
+  const y = cl(pos.y, PAD, maxY + 5 * ROW_PITCH);
+  return { col, y };
+}
+
+// Nudge a dragged box's Y so it doesn't overlap the boxes already sharing
+// its column -- moving ONLY the dragged box (the others stay put). Returns
+// the Y nearest `desired` whose [y, y+h] span clears every occupied span
+// (each padded by OVERLAP_GAP). `occupied` is [{y,h}] of the column's other
+// real nodes. When `desired` already fits (a gap, or empty space above /
+// below the column), it is returned unchanged -- INCLUDING space above the
+// content top, so a box can be dragged up past the topmost stage (there is
+// no PAD floor here; the caller places boxes wherever the cursor released).
+function deOverlapY(desired, h, occupied) {
+  const spans = occupied
+    .map((o) => [o.y - OVERLAP_GAP, o.y + o.h + OVERLAP_GAP])
+    .sort((a, b) => a[0] - b[0]);
+  const hits = (y) => spans.some(([a, b]) => y < b && y + h > a);
+  if (!hits(desired)) { return desired; }
+  // Candidate slots: just above / just below each occupied span. Pick the
+  // clear one nearest to `desired` (below the lowest span always clears,
+  // and above the highest is allowed even into negative Y so an upward
+  // reorder past the top box isn't blocked).
+  let best = desired, bestD = Infinity, found = false;
+  for (const [a, b] of spans) {
+    for (const c of [a - h, b]) {
+      if (hits(c)) { continue; }
+      const d = Math.abs(c - desired);
+      if (d < bestD) { bestD = d; best = c; found = true; }
+    }
+  }
+  return found ? best : desired;
 }
 
 // Stable per-edge key: matches the buffer-status payload's
@@ -294,6 +462,9 @@ export function renderGraph(graph, opts = {}) {
   // Beat type of the armed output port (for dimming incompatible
   // inputs while a connection is in progress); null/'any' = no filter.
   const pendingType = opts.pendingType || null;
+  // Payload tags of the armed output (finer constraint on top of the
+  // beat type; array or null). Empty/absent => no tag filter.
+  const pendingTags = opts.pendingTags || null;
   const selectedEdge = opts.selectedEdge || null;
   const view = opts.view || {};
 
@@ -310,9 +481,25 @@ export function renderGraph(graph, opts = {}) {
     inCount: (n) => inputPortsOf(n).length,
     addStub: addStubOf,
   };
-  const L = computeLayout(graph, metrics);
+  // Previous layout positions (id -> {x,y,...}) drive placement-aware
+  // re-layout + the reflow animation; onLayout hands the fresh positions
+  // back to the caller to seed the next render.
+  const seedPos = opts.seedPos || null;
+  // User-placed drop pins (id -> {col, y}); honour the chosen grid cell.
+  const pins = opts.pins || null;
+  // Auto-arrange requests a FRESH tidy layout: ignore the seed ordering
+  // and the pins for positioning (crossing-min from scratch). The reflow
+  // animation below still glides from `seedPos`, so the tidy-up is visible.
+  const fresh = !!opts.freshLayout;
+  const L = computeLayout(graph, metrics, fresh ? null : seedPos,
+                          fresh ? null : pins);
+  if (opts.onLayout) { opts.onLayout(L.pos); }
   const contentW = Math.max(L.width, 1);
   const contentH = Math.max(L.height, 1);
+
+  // Collected during node/edge creation to drive the reflow animation.
+  const animNodes = [];   // {g, id, toX, toY}
+  const animEdges = [];   // {path, e}
 
   // Which inputs are wired (for the × badge): "stageId#iport".
   const connectedIn = new Set();
@@ -336,11 +523,13 @@ export function renderGraph(graph, opts = {}) {
     const built = buildEdgePath(L, e);
     if (!built) { continue; }
     const key = edgeKey(e);
-    eg.append(svgEl('path', {
+    const gedge = svgEl('path', {
       class: 'gedge' + (e.type === 'any' ? ' untyped' : '')
              + (key === selectedEdge ? ' selected' : ''),
       d: built.d, 'data-ekey': key,
-    }));
+    });
+    eg.append(gedge);
+    animEdges.push({ path: gedge, e });
     // When editable, a fat invisible hit-path on top makes the thin
     // spline easy to click to select (then Delete removes it).
     if (editable && opts.onEdgeSelect) {
@@ -361,6 +550,24 @@ export function renderGraph(graph, opts = {}) {
   }
   svg.append(utilG);
 
+  // Re-spline every edge touching `id` (and reposition its util label) in
+  // place -- used during a node drag so the wires follow the box without
+  // a whole-graph re-render.
+  const resplineNode = (id) => {
+    for (const ae of animEdges) {
+      if (ae.e.from !== id && ae.e.to !== id) { continue; }
+      const built = buildEdgePath(L, ae.e);
+      if (!built) { continue; }
+      ae.path.setAttribute('d', built.d);
+      const lbl = utilG.querySelector(
+        `.edge-util[data-ekey="${edgeKey(ae.e)}"]`);
+      if (lbl) {
+        lbl.setAttribute('x', built.mid.x);
+        lbl.setAttribute('y', built.mid.y - 3);
+      }
+    }
+  };
+
   let moved = false;   // set during a pan so the trailing click is ignored
 
   // Nodes.
@@ -369,17 +576,104 @@ export function renderGraph(graph, opts = {}) {
     const g = svgEl('g', {
       class: 'gnode' + (n.id === selected ? ' selected' : '')
              + (n.config_error ? ' needs-config' : ''),
+      'data-id': n.id,
       transform: `translate(${p.x}, ${p.y})`,
     });
+    animNodes.push({ g, id: n.id, toX: p.x, toY: p.y });
     if (n.config_error) {
       const t = svgEl('title');
       t.textContent = 'Needs configuration: ' + n.config_error;
       g.append(t);
     }
+    // Drag-to-move sets this so the release's trailing click doesn't also
+    // fire selection.
+    let suppressClick = false;
     g.addEventListener('click', () => {
-      if (moved) { return; }
+      if (moved || suppressClick) { suppressClick = false; return; }
       if (onSelect) { onSelect(n.id); }
     });
+    // Right-click: a context menu (rename / delete) anchored at the cursor.
+    if (opts.onNodeContext) {
+      g.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        opts.onNodeContext(n.id, ev.clientX, ev.clientY);
+      });
+    }
+
+    // Drag the box to reposition it. On release it snaps to the nearest
+    // column (a minimal correction) and persists as a pin via
+    // opts.onNodeMove so a later re-layout keeps the spot -- without
+    // relaying-out (moving) the rest of the graph.
+    if (opts.onNodeMove) {
+      let nDrag = false, nCap = false, nMoved = false;
+      let sX = 0, sY = 0, grabDX = 0, grabDY = 0;
+      g.addEventListener('pointerdown', (e) => {
+        if (e.button !== undefined && e.button !== 0) { return; }
+        e.stopPropagation();      // don't let the SVG pan handler start
+        moved = false;            // fresh interaction: re-enable click
+        suppressClick = false;
+        nDrag = true; nMoved = false;
+        sX = e.clientX; sY = e.clientY;
+        const w = clientToWorld(e);
+        const cur = L.pos.get(n.id);
+        grabDX = w.x - cur.x; grabDY = w.y - cur.y;
+      });
+      g.addEventListener('pointermove', (e) => {
+        if (!nDrag) { return; }
+        if (!nMoved) {
+          if (Math.abs(e.clientX - sX) + Math.abs(e.clientY - sY) <= 3) {
+            return;
+          }
+          nMoved = true;
+          g.classList.add('dragging');
+          svg.appendChild(g);     // raise above the others (paint = DOM order)
+          // Capture AFTER re-parenting: appendChild moves the node in the
+          // DOM, which RELEASES an already-set pointer capture -- then a
+          // fast drag (whose cursor outruns the box and leaves it) stops
+          // getting pointermove/up and never finalizes ("lags + sticks").
+          try { g.setPointerCapture(e.pointerId); nCap = true; } catch (x) {}
+        }
+        const w = clientToWorld(e);
+        const cur = L.pos.get(n.id);
+        cur.x = w.x - grabDX; cur.y = w.y - grabDY;
+        g.setAttribute('transform', `translate(${cur.x}, ${cur.y})`);
+        resplineNode(n.id);
+      });
+      const endDrag = (e) => {
+        if (!nDrag) { return; }
+        nDrag = false;
+        if (nCap) {
+          try { g.releasePointerCapture(e.pointerId); } catch (x) {}
+          nCap = false;
+        }
+        g.classList.remove('dragging');
+        if (!nMoved) { return; }    // a press without a drag -> let it click
+        suppressClick = true;
+        // Snap to the nearest column (a small adjustment) and keep the drop
+        // Y. Clamp against the current layout's extent, not the seed, so a
+        // drag on a fresh graph isn't mis-clamped.
+        const cur = L.pos.get(n.id);
+        // worldToPin is used ONLY for the column snap; the vertical position
+        // is the raw released Y (cur.y) so there is no top-margin floor --
+        // the box can be placed anywhere the cursor let go, including above
+        // the topmost stage. De-overlap then keeps it off its column-mates.
+        const pin = worldToPin({ x: cur.x, y: cur.y }, L.pos);
+        const gx = PAD + pin.col * (NODE_W + COL_GAP);
+        const occ = [];
+        L.pos.forEach((q, qid) => {
+          if (qid === n.id || (q.kind && q.kind !== 'real')) { return; }
+          if (Math.abs(q.x - gx) < 1) { occ.push(q); }
+        });
+        const y = deOverlapY(cur.y, cur.h, occ);
+        cur.x = gx; cur.y = y;
+        g.setAttribute('transform', `translate(${gx}, ${y})`);
+        resplineNode(n.id);
+        opts.onNodeMove(n.id, { col: pin.col, y }, { x: gx, y });
+      };
+      g.addEventListener('pointerup', endDrag);
+      g.addEventListener('pointercancel', endDrag);
+    }
 
     g.append(svgEl('rect', {
       class: 'box', x: 0, y: 0, width: NODE_W, height: p.h, rx: 6,
@@ -393,25 +687,28 @@ export function renderGraph(graph, opts = {}) {
 
     // Input slots come from the stage spec (max'd with the wired
     // count): every declared input is shown with its semantic name, so
-    // the index→meaning mapping is visible. In the dense model the
-    // wired inputs are the contiguous prefix [0, liveCount); the slot
-    // at liveCount is the next connectable one and slots beyond it are
-    // "locked" (inputs fill in order).
+    // the index→meaning mapping is visible. Iports are positional and
+    // may be gapped: a slot is "connected" iff an edge targets it
+    // (`connectedIn`, built from the edge list), with no fill-in-order
+    // constraint, so any slot is connectable in any order.
     const inSlots = inputPortsOf(n);
-    const liveCount = n.iports.length;
     inSlots.forEach((pt, i) => {
       const y = PORT_TOP + i * PORT_GAP;
-      const connected = connectedIn.has(`${n.id}#${i}`) || i < liveCount;
-      const locked = i > liveCount;
-      // While arming, an existing input whose declared type can't
-      // accept the armed output's type is dimmed (CSS) -- a visible
-      // cue before the click (the click is also refused upstream).
-      const incompatible = !!pendingType && pendingType !== 'any'
+      const connected = connectedIn.has(`${n.id}#${i}`);
+      // While arming, an existing input that can't accept the armed
+      // output is dimmed (CSS) -- a visible cue before the click (also
+      // refused upstream). Two reasons: the beat types disagree, or the
+      // payload tags (finer constraint) don't intersect.
+      const typeBad = !!pendingType && pendingType !== 'any'
           && pt.type && pt.type !== 'any' && pt.type !== pendingType;
+      const slotTags = (pt.tags || '').split(',')
+          .map((x) => x.trim()).filter(Boolean);
+      const tagBad = !!pendingTags && pendingTags.length && slotTags.length
+          && !pendingTags.some((x) => slotTags.includes(x));
+      const incompatible = typeBad || tagBad;
       const pg = svgEl('g', { class: 'port-grp in'
           + (pt.type === 'any' ? ' untyped' : '')
           + (connected ? ' connected' : ' empty')
-          + (locked ? ' locked' : '')
           + (incompatible ? ' incompatible' : '') });
       pg.append(svgEl('circle', { class: 'port' + (connected ? '' : ' empty'),
         cx: 0, cy: y, r: PORT_R }));
@@ -426,6 +723,7 @@ export function renderGraph(graph, opts = {}) {
                             : pt.doc;
       tip.textContent = (pt.name ? pt.name + '  ' : '')
           + '(' + shortType(pt.type) + ')'
+          + (pt.tags ? '\ntags: ' + pt.tags : '')
           + (ptDoc ? '\n' + ptDoc : '');
       pg.append(tip);
       if (editable) {
@@ -468,6 +766,11 @@ export function renderGraph(graph, opts = {}) {
         y: y + 3, 'text-anchor': 'end' });
       lbl.textContent = truncate(shortType(pt.type), 12);
       pg.append(lbl);
+      const otip = svgEl('title');
+      otip.textContent = (pt.name ? pt.name + '  ' : '')
+          + '(' + shortType(pt.type) + ')'
+          + (pt.tags ? '\ntags: ' + pt.tags : '');
+      pg.append(otip);
       if (editable) {
         const hit = svgEl('circle', { class: 'porthit', cx: NODE_W, cy: y,
           r: 9 });
@@ -543,8 +846,17 @@ export function renderGraph(graph, opts = {}) {
     ctl('1:1', 'Actual size', () => setZoom(1)),
     ctl('Fit', 'Fit whole pipeline', fit),
     ctl('⊙', 'Center', center));
+  // Auto-arrange: re-layout the graph tidily (drops manual placements).
+  // Sits with the view controls; only shown when the caller wires it.
+  if (opts.onAutoArrange) {
+    controls.append(ctl('⌗', tOr('pl.auto_arrange', 'Auto-arrange'),
+      () => opts.onAutoArrange()));
+  }
 
   const container = el('div', { class: 'graph-view' }, svg, controls);
+  // Expose the screen->world mapper so the composer can turn a stage
+  // drop point into a grid pin. Takes anything with {clientX, clientY}.
+  container.clientToWorld = (evt) => clientToWorld(evt);
 
   // Drag to pan. The pointer is captured only once a real drag begins
   // (movement past a threshold). Capturing on pointerdown would
@@ -655,6 +967,64 @@ export function renderGraph(graph, opts = {}) {
   }
   applyView();
   requestAnimationFrame(applyView);
+
+  // --- reflow animation -------------------------------------------
+  // When re-laying-out an existing graph (a seed is present) glide every
+  // node from its previous position to its new one over ~0.75s, re-
+  // splining the edges each frame, so the user can follow how the stages
+  // moved. Nodes that didn't move (and brand-new nodes, which have no
+  // seed) simply sit at their final spot. The whole thing runs in "world"
+  // coordinates inside the viewBox, so pan/zoom is untouched.
+  if (seedPos && seedPos.size) {
+    const from = new Map();
+    L.pos.forEach((p, id) => from.set(id, { x: p.x, y: p.y }));  // default
+    let moved = false;
+    for (const a of animNodes) {
+      const s = seedPos.get(a.id);
+      if (s && (Math.abs(s.x - a.toX) > 0.5
+                || Math.abs(s.y - a.toY) > 0.5)) {
+        from.set(a.id, { x: s.x, y: s.y });
+        moved = true;
+      }
+    }
+    if (moved) {
+      const DUR = 750;
+      const ease = (t) =>
+        (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+      const applyFrame = (e) => {
+        for (const a of animNodes) {
+          const f = from.get(a.id);
+          a.g.setAttribute('transform', `translate(${f.x + (a.toX - f.x)
+            * e}, ${f.y + (a.toY - f.y) * e})`);
+        }
+        const interp = new Map();
+        L.pos.forEach((p, id) => {
+          const f = from.get(id);
+          interp.set(id, (f && (f.x !== p.x || f.y !== p.y))
+            ? { ...p, x: f.x + (p.x - f.x) * e, y: f.y + (p.y - f.y) * e }
+            : p);
+        });
+        const IL = { pos: interp, edgeChain: L.edgeChain };
+        for (const ae of animEdges) {
+          const built = buildEdgePath(IL, ae.e);
+          if (built) { ae.path.setAttribute('d', built.d); }
+        }
+      };
+      // Paint the FIRST frame at the old positions synchronously (before
+      // the container is attached), so there's no flash of the final
+      // layout before the glide starts.
+      applyFrame(0);
+      let t0 = null;
+      const step = (ts) => {
+        if (!svg.isConnected) { return; }   // superseded by a newer render
+        if (t0 === null) { t0 = ts; }
+        const t = Math.min(1, (ts - t0) / DUR);
+        applyFrame(ease(t));
+        if (t < 1) { requestAnimationFrame(step); }
+      };
+      requestAnimationFrame(step);
+    }
+  }
 
   return container;
 }

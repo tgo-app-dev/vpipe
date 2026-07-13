@@ -14,11 +14,18 @@ set(LOCAL_SOURCES
   generative-model-manager.cc
   loaded-language-model.cc
   metal-token-muxer.cc
+  model-exec-registry.cc
   model-loader.cc
   sampler.cc
   tokenizer.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/i8-gemm.cc
+  shared/mcp/file-sandbox.cc
+  shared/mcp/mcp-tools.cc
+  shared/mcp/python-sandbox.cc
+  shared/mcp/shell-tool.cc
+  shared/mcp/url-fetch.cc
   shared/kernel-sets/decode-gqa-attn-set.cc
   shared/kernel-sets/prefill-gqa-attn-set.cc
   shared/whisper-feature-extractor.cc
@@ -42,6 +49,16 @@ set(LOCAL_SOURCES
   moss/metal-moss-local-transformer.cc
   moss/metal-moss-local-model.cc
   moss/metal-moss-v15-model.cc
+  moss/moss-rt-processor.cc
+  moss/metal-moss-rt-model.cc
+  krea2/metal-krea2-transformer.cc
+  krea2/metal-krea2-vae.cc
+  krea2/metal-krea2-calibration.cc
+  krea2/flow-sampler.cc
+  flux2/metal-flux2-transformer.cc
+  flux2/metal-flux2-vae.cc
+  flux2/metal-flux2-calibration.cc
+  lora-fusion.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
   quantize/calibration.cc
@@ -57,12 +74,18 @@ set(LOCAL_HEADERS
   loaded-language-model.h
   metal-token-muxer.h
   model-exec.h
+  model-exec-registry.h
   model-loader.h
   sampler.h
   token-muxer.h
   tokenizer.h
   shared/gguf-convert.h
   shared/gguf-file.h
+  shared/mcp/file-sandbox.h
+  shared/mcp/mcp-tools.h
+  shared/mcp/python-sandbox.h
+  shared/mcp/shell-tool.h
+  shared/mcp/url-fetch.h
   shared/whisper-feature-extractor.h
   gemma4/gemma4-audio-feature-extractor.h
   gemma4/gemma4-unified-embedder.h
@@ -84,6 +107,8 @@ set(LOCAL_HEADERS
   moss/metal-moss-local-transformer.h
   moss/metal-moss-local-model.h
   moss/metal-moss-v15-model.h
+  moss/moss-rt-processor.h
+  moss/metal-moss-rt-model.h
   quantize/affine-quantizer.h
   quantize/arch-detect.h
   quantize/calibration.h

@@ -58,8 +58,12 @@ namespace vpipe {
 //           arrival the stage slices the PCM in [start_us, end_us) from its
 //           rolling buffer and transcribes it.
 //
-//   no oports (sink; transcription is streamed to stdout, matching
-//   visual-qa-stage's pattern).
+//   oport0  (OPTIONAL) FlexDataPayload carrying the recognized transcript as
+//           an object {text, start_us, end_us}. `text` is the decoded string;
+//           `start_us`/`end_us` are the segment span (STREAMING mode only --
+//           block mode has no timestamps, so they are omitted). Unconnected is
+//           fine: the transcript is still logged via the UI delegate. Feed it
+//           to save-text to save transcripts to a file.
 //
 // Per beat the stage:
 //   1. Pulls the PCM samples.
@@ -236,6 +240,16 @@ private:
   bool               _streaming    = false;
   std::uint64_t      _segments_seen         = 0;
   std::uint64_t      _segments_dropped_late = 0;
+
+  // Transcript oport plumbing. m_transcribe_one_ is not a coroutine, so it
+  // stashes each finished transcript here (as {text[, start_us, end_us]}) and
+  // process() drains the queue to oport 0. `_cur_*_us` carry the segment span
+  // for the in-flight clip (set by slice_and_transcribe_; absent in block
+  // mode, which has no timestamps).
+  std::vector<FlexData> _out_pending;
+  std::uint64_t         _cur_start_us = 0;
+  std::uint64_t         _cur_end_us   = 0;
+  bool                  _cur_has_ts   = false;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::SamplerParams _sampler_params;
   std::shared_ptr<genai::LoadedLanguageModel> _lm;

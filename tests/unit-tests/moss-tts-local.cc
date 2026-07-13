@@ -16,6 +16,7 @@
 #include "generative-models/context-manager.h"
 #include "common/flex-data.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/moss/metal-moss-codec-v2.h"
 #include "generative-models/moss/moss-v15-processor.h"
 #include "generative-models/tokenizer.h"
@@ -821,6 +822,332 @@ TEST(moss_tts_local, codec_v2_decode_bench)
       "[codec-v2-bench] T=%d -> %.2fs audio in %.1f ms (%.1fx realtime)\n",
       T, secs, wall, secs / (wall / 1000.0));
   EXPECT_TRUE(!wav.empty());
+}
+
+// STREAMING == ONE-SHOT: feeding the codes to decode_stream_chunk() in small
+// chunks and concatenating the per-chunk PCM must reproduce the whole-utterance
+// decode() bit-for-bit (f16 reduction noise only). Proves the windowed K/V-ring
+// streaming decode (bounded memory, O(chunk)/step) is numerically correct.
+// Env: VPIPE_MOSS_CODEC_V2_MODEL. Skips if unset.
+TEST(moss_tts_local, codec_v2_stream_matches_oneshot)
+{
+  const char* cdir = std::getenv("VPIPE_MOSS_CODEC_V2_MODEL");
+  if (cdir == nullptr || *cdir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto codec = MetalMossCodecV2::load(cdir, mc);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+
+  const int NV = codec->n_quantizers();
+  const int T = 260;          // > 2*window so the ring wraps and is exercised
+  int chunk = 20;
+  if (const char* e = std::getenv("VPIPE_STREAM_CHUNK")) {
+    chunk = std::max(1, std::atoi(e));
+  }
+  std::vector<std::vector<std::int32_t>> codes(
+      (std::size_t)T, std::vector<std::int32_t>((std::size_t)NV, 0));
+  std::uint64_t r = 0x9e3779b97f4a7c15ULL;
+  for (int t = 0; t < T; ++t) {
+    for (int q = 0; q < NV; ++q) {
+      r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+      codes[(std::size_t)t][(std::size_t)q] = (std::int32_t)((r >> 33) % 1024);
+    }
+  }
+
+  const std::vector<float> full = codec->decode(codes);   // [2*T*spf]
+  ASSERT_TRUE(!full.empty());
+  const int spf = (int)((full.size() / 2) / (std::size_t)T);
+
+  // Stream in `chunk`-frame steps; assemble channel-major [ch0(T*spf)|ch1].
+  auto stm = codec->decode_stream_begin(chunk);
+  ASSERT_TRUE(stm != nullptr);
+  std::vector<float> ch0, ch1;
+  ch0.reserve((std::size_t)T * spf);
+  ch1.reserve((std::size_t)T * spf);
+  for (int t0 = 0; t0 < T; t0 += chunk) {
+    const int c = std::min(chunk, T - t0);
+    std::vector<std::vector<std::int32_t>> sub(
+        codes.begin() + t0, codes.begin() + t0 + c);
+    std::vector<float> pcm = codec->decode_stream_chunk(*stm, sub);
+    ASSERT_TRUE((int)pcm.size() == 2 * c * spf);
+    const int per = c * spf;
+    ch0.insert(ch0.end(), pcm.begin(), pcm.begin() + per);
+    ch1.insert(ch1.end(), pcm.begin() + per, pcm.begin() + 2 * per);
+  }
+  ASSERT_TRUE((int)ch0.size() == T * spf && (int)ch1.size() == T * spf);
+
+  // rel-L2 of assembled-vs-full over both channels.
+  double num = 0, den = 0;
+  float maxd = 0.0f;
+  for (int k = 0; k < T * spf; ++k) {
+    const double a0 = full[(std::size_t)k], b0 = ch0[(std::size_t)k];
+    const double a1 = full[(std::size_t)T * spf + k], b1 = ch1[(std::size_t)k];
+    num += (a0 - b0) * (a0 - b0) + (a1 - b1) * (a1 - b1);
+    den += a0 * a0 + a1 * a1;
+    maxd = std::max(maxd, (float)std::max(std::fabs(a0 - b0),
+                                          std::fabs(a1 - b1)));
+  }
+  const double rel = den > 0 ? std::sqrt(num / den) : 0.0;
+  std::fprintf(stderr,
+      "[codec-v2-stream] T=%d chunk=%d spf=%d | rel-L2=%.3g max|d|=%.3g\n",
+      T, chunk, spf, rel, (double)maxd);
+  EXPECT_TRUE(rel < 1e-3);
+}
+
+// BARGE-IN mechanism: the generate() frame callback returning false stops
+// generation ASAP (after the current frame) -- what the TTS stage uses to abort
+// an in-flight utterance when new text arrives. Verify it stops at exactly the
+// requested frame instead of running to max_frames.
+// Env: VPIPE_MOSS15_QUANT_DIR. Skips if unset.
+TEST(moss_tts_local, v15_generate_callback_stop_is_prompt)
+{
+  const char* qd = std::getenv("VPIPE_MOSS15_QUANT_DIR");
+  if (qd == nullptr || *qd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  int bits = 4;
+  {
+    std::ifstream in(std::string(qd) + "/config.json");
+    if (in) {
+      FlexData root = FlexData::from_json(in);
+      if (root.is_object() && root.as_object().contains("quantization")) {
+        FlexData q = root.as_object().at("quantization");
+        if (q.is_object() && q.as_object().contains("bits")) {
+          bits = (int)q.as_object().at("bits").as_int(bits);
+        }
+      }
+    }
+  }
+  MetalMossV15Model::Config cfg;
+  cfg.backbone = v15_backbone_config_(bits);
+  auto m = MetalMossV15Model::load(qd, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+
+  const int NV = 12, pad = 1024, seq = 8;
+  std::vector<std::vector<std::int32_t>> grid(
+      (std::size_t)seq, std::vector<std::int32_t>((std::size_t)(1 + NV), pad));
+  for (int t = 0; t < seq; ++t) { grid[(std::size_t)t][0] = 100 + t; }
+  MossSampling sp; sp.temperature = 0.8f; sp.top_k = 50; sp.top_p = 0.95f;
+
+  const int F = 64, stop_after = 6;
+  int calls = 0;
+  auto cb = [&](const std::vector<int>&) { return ++calls < stop_after; };
+  std::vector<std::vector<int>> frames = m->generate(grid, F, sp, 555, cb);
+  std::fprintf(stderr, "[v15-barge] max=%d stop_after=%d -> %d frames\n",
+               F, stop_after, (int)frames.size());
+  // The callback fires after each pushed frame and false breaks the loop, so
+  // exactly `stop_after` frames come back -- well short of the F-frame budget.
+  EXPECT_TRUE((int)frames.size() == stop_after);
+}
+
+// STAGE-LEVEL streaming integration: driving the v1.5 LM with the per-frame
+// callback + feeding each chunk through the codec's windowed streaming decode
+// (what TextToSpeechStage does when stream_chunk_frames>0) must reproduce the
+// one-shot generate()+decode() PCM. Same seed => identical frames, and the
+// codec stream is bit-exact vs one-shot, so the assembled waveform matches.
+// Env: VPIPE_MOSS15_QUANT_DIR (v1.5 LM) + VPIPE_MOSS_CODEC_V2_MODEL (codec).
+TEST(moss_tts_local, v15_stream_pipeline_matches_oneshot)
+{
+  const char* qd = std::getenv("VPIPE_MOSS15_QUANT_DIR");
+  const char* cd = std::getenv("VPIPE_MOSS_CODEC_V2_MODEL");
+  if (qd == nullptr || *qd == '\0' || cd == nullptr || *cd == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  int bits = 4;
+  {
+    std::ifstream in(std::string(qd) + "/config.json");
+    if (in) {
+      FlexData root = FlexData::from_json(in);
+      if (root.is_object() && root.as_object().contains("quantization")) {
+        FlexData q = root.as_object().at("quantization");
+        if (q.is_object() && q.as_object().contains("bits")) {
+          bits = (int)q.as_object().at("bits").as_int(bits);
+        }
+      }
+    }
+  }
+  MetalMossV15Model::Config cfg;
+  cfg.backbone = v15_backbone_config_(bits);
+  auto m = MetalMossV15Model::load(qd, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  auto codec = MetalMossCodecV2::load(cd, mc);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+
+  const int NV = 12, pad = 1024, seq = 8;
+  std::vector<std::vector<std::int32_t>> grid(
+      (std::size_t)seq, std::vector<std::int32_t>((std::size_t)(1 + NV), pad));
+  for (int t = 0; t < seq; ++t) { grid[(std::size_t)t][0] = 100 + t; }
+  MossSampling sp; sp.temperature = 0.8f; sp.top_k = 50; sp.top_p = 0.95f;
+  const int F = 40, chunk = 12;
+  const std::uint64_t seed = 777;
+
+  // One-shot: generate all frames, decode once.
+  std::vector<std::vector<int>> f1 = m->generate(grid, F, sp, seed);
+  ASSERT_TRUE(!f1.empty());
+  std::vector<std::vector<std::int32_t>> c1;
+  for (const auto& f : f1) { c1.emplace_back(f.begin(), f.end()); }
+  const std::vector<float> full = codec->decode(c1);
+  const int spf = (int)((full.size() / 2) / f1.size());
+
+  // Streaming: same seed => same frames; emit `chunk`-frame PCM via the codec
+  // stream, assemble channel-major [ch0|ch1] exactly as the stage's consumer.
+  auto stm = codec->decode_stream_begin(chunk);
+  ASSERT_TRUE(stm != nullptr);
+  std::vector<float> ch0, ch1;
+  std::vector<std::vector<std::int32_t>> buf;
+  auto flush = [&]() {
+    if (buf.empty()) { return; }
+    std::vector<float> pcm = codec->decode_stream_chunk(*stm, buf);
+    const int c = (int)buf.size();
+    buf.clear();
+    if ((int)pcm.size() != 2 * c * spf) { return; }
+    ch0.insert(ch0.end(), pcm.begin(), pcm.begin() + (std::size_t)c * spf);
+    ch1.insert(ch1.end(), pcm.begin() + (std::size_t)c * spf, pcm.end());
+  };
+  auto on_frame = [&](const std::vector<int>& codes) -> bool {
+    buf.emplace_back(codes.begin(), codes.end());
+    if ((int)buf.size() >= chunk) { flush(); }
+    return true;
+  };
+  std::vector<std::vector<int>> f2 = m->generate(grid, F, sp, seed, on_frame);
+  flush();
+  EXPECT_TRUE(f2.size() == f1.size());   // callback must not perturb sampling
+
+  const int T = (int)f1.size();
+  ASSERT_TRUE((int)ch0.size() == T * spf && (int)ch1.size() == T * spf);
+  double num = 0, den = 0;
+  for (int k = 0; k < T * spf; ++k) {
+    const double a0 = full[(std::size_t)k], b0 = ch0[(std::size_t)k];
+    const double a1 = full[(std::size_t)T * spf + k], b1 = ch1[(std::size_t)k];
+    num += (a0 - b0) * (a0 - b0) + (a1 - b1) * (a1 - b1);
+    den += a0 * a0 + a1 * a1;
+  }
+  const double rel = den > 0 ? std::sqrt(num / den) : 0.0;
+  std::fprintf(stderr,
+      "[v15-stream-pipe] frames one-shot=%d stream=%d | chunk=%d | rel-L2=%.3g\n",
+      (int)f1.size(), (int)f2.size(), chunk, rel);
+  EXPECT_TRUE(rel < 1e-3);
+}
+
+// REUSE: a cached StreamState re-armed with reset() (the stage's per-beat reuse,
+// no realloc) must produce BIT-IDENTICAL PCM to a fresh state -- i.e. a prior
+// (longer) utterance leaves no stale ring contamination. Streams utterance B
+// through a fresh state and through a state that first ran a longer utterance A
+// then reset(); asserts equality.
+// Env: VPIPE_MOSS_CODEC_V2_MODEL. Skips if unset.
+TEST(moss_tts_local, codec_v2_stream_reuse_matches_fresh)
+{
+  const char* cdir = std::getenv("VPIPE_MOSS_CODEC_V2_MODEL");
+  if (cdir == nullptr || *cdir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto codec = MetalMossCodecV2::load(cdir, mc);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+
+  const int NV = codec->n_quantizers();
+  const int chunk = 20;
+  auto gen_codes = [&](int T, std::uint64_t s) {
+    std::vector<std::vector<std::int32_t>> c(
+        (std::size_t)T, std::vector<std::int32_t>((std::size_t)NV, 0));
+    for (int t = 0; t < T; ++t) {
+      for (int q = 0; q < NV; ++q) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        c[(std::size_t)t][(std::size_t)q] = (std::int32_t)((s >> 33) % 1024);
+      }
+    }
+    return c;
+  };
+  const auto A = gen_codes(300, 0x111);   // longer prior utterance
+  const auto B = gen_codes(180, 0x222);   // the utterance under test (shorter)
+
+  auto stream_all = [&](MetalMossCodecV2::StreamState& st,
+                        const std::vector<std::vector<std::int32_t>>& codes) {
+    std::vector<float> out;
+    for (int t0 = 0; t0 < (int)codes.size(); t0 += chunk) {
+      const int c = std::min(chunk, (int)codes.size() - t0);
+      std::vector<std::vector<std::int32_t>> sub(
+          codes.begin() + t0, codes.begin() + t0 + c);
+      std::vector<float> pcm = codec->decode_stream_chunk(st, sub);
+      out.insert(out.end(), pcm.begin(), pcm.end());
+    }
+    return out;
+  };
+
+  auto fresh = codec->decode_stream_begin(chunk);
+  ASSERT_TRUE(fresh != nullptr);
+  const std::vector<float> got_fresh = stream_all(*fresh, B);
+
+  auto reused = codec->decode_stream_begin(chunk);
+  ASSERT_TRUE(reused != nullptr);
+  (void)stream_all(*reused, A);     // run a longer utterance first
+  reused->reset();                  // re-arm (the stage's per-beat reuse)
+  const std::vector<float> got_reused = stream_all(*reused, B);
+
+  ASSERT_TRUE(got_fresh.size() == got_reused.size());
+  float maxd = 0.0f;
+  for (std::size_t k = 0; k < got_fresh.size(); ++k) {
+    maxd = std::max(maxd, std::fabs(got_fresh[k] - got_reused[k]));
+  }
+  std::fprintf(stderr, "[codec-v2-reuse] |A|=%d |B|=%d | max|fresh-reused|=%.6g\n",
+               (int)A.size(), (int)B.size(), (double)maxd);
+  EXPECT_TRUE(maxd == 0.0f);
+}
+
+// codec-v1 (24 kHz mono, RT/8B path) streaming == one-shot: same windowed
+// K/V-ring streaming decode as codec-v2, verified bit-exact vs decode().
+// Env: VPIPE_MOSS_CODEC_MODEL. Skips if unset.
+TEST(moss_tts_local, codec_v1_stream_matches_oneshot)
+{
+  const char* cdir = std::getenv("VPIPE_MOSS_CODEC_MODEL");
+  if (cdir == nullptr || *cdir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto codec = MetalMossCodec::load(cdir, mc, false, false);
+  ASSERT_TRUE(codec != nullptr && codec->valid());
+
+  const int NV = codec->n_quantizers();
+  const int T = 260, chunk = 20;
+  std::vector<std::vector<std::int32_t>> codes(
+      (std::size_t)T, std::vector<std::int32_t>((std::size_t)NV, 0));
+  std::uint64_t r = 0x9e3779b97f4a7c15ULL;
+  for (int t = 0; t < T; ++t) {
+    for (int q = 0; q < NV; ++q) {
+      r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+      codes[(std::size_t)t][(std::size_t)q] = (std::int32_t)((r >> 33) % 1024);
+    }
+  }
+  const std::vector<float> full = codec->decode(codes);   // mono [T*hop]
+  ASSERT_TRUE(!full.empty());
+  const int spf = (int)(full.size() / (std::size_t)T);
+
+  auto stm = codec->decode_stream_begin(chunk);
+  ASSERT_TRUE(stm != nullptr);
+  std::vector<float> got;
+  got.reserve(full.size());
+  for (int t0 = 0; t0 < T; t0 += chunk) {
+    const int c = std::min(chunk, T - t0);
+    std::vector<std::vector<std::int32_t>> sub(
+        codes.begin() + t0, codes.begin() + t0 + c);
+    std::vector<float> pcm = codec->decode_stream_chunk(*stm, sub);
+    ASSERT_TRUE((int)pcm.size() == c * spf);
+    got.insert(got.end(), pcm.begin(), pcm.end());
+  }
+  ASSERT_TRUE(got.size() == full.size());
+  double num = 0, den = 0;
+  for (std::size_t k = 0; k < full.size(); ++k) {
+    num += (full[k] - got[k]) * (full[k] - got[k]);
+    den += (double)full[k] * full[k];
+  }
+  const double rel = den > 0 ? std::sqrt(num / den) : 0.0;
+  std::fprintf(stderr, "[codec-v1-stream] T=%d chunk=%d spf=%d | rel-L2=%.3g\n",
+               T, chunk, spf, rel);
+  EXPECT_TRUE(rel < 1e-3);
 }
 
 // Isolate the codec decoder's windowed-attention cost: replay each stage's

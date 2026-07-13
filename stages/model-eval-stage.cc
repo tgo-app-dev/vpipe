@@ -1,5 +1,6 @@
 #include "stages/model-eval-stage.h"
 
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
@@ -81,17 +82,33 @@ constexpr ConfigKey kAttrs[] = {
           "tokens) -- lower ppl_tokens for huge-vocab models.",
    .def_bool = false},
 };
+// Trigger iport (optional, any beat) + summary oport -- see model-fetch
+// for the shared "preparation recipe" rationale.
+const PortSpec kIports[] = {
+  {.name = "trigger",
+   .doc  = "optional pacing trigger (any beat type); when wired, the work "
+           "waits for one beat before running -- lets these preparation "
+           "stages cascade into a recipe",
+   .type = nullptr, .clock_group = 0},
+};
+const PortSpec kOports[] = {
+  {.name = "summary",
+   .doc  = "FlexData summary of the evaluation; its `text` field is the "
+           "Markdown report (feed a save-text), and the beat also triggers "
+           "the next stage in a recipe",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+};
 const StageSpec kSpec = {
   .type_name = "model-eval",
   .doc       = "Source: one-shot offline evaluation of one or two language "
                "models (models-DB keys or paths). Runs WikiText-2 perplexity "
                "+ a random-sampled ARC-Challenge accuracy probe and logs a "
                "Markdown report (a comparison when two models are given). "
-               "0 in / 0 out.",
+               "Optional trigger in / summary out.",
   .display_name = "Model Eval",
   .category  = StageCategory::Preparation,
-  .iports    = {},
-  .oports    = {},
+  .iports    = kIports,
+  .oports    = kOports,
   .attrs     = kAttrs,
 };
 }  // namespace
@@ -150,6 +167,13 @@ constexpr const char* kDivergenceFallback =
 
 bool
 ModelEvalStage::evaluate_once()
+{
+  FlexData discard;
+  return evaluate_once(discard);
+}
+
+bool
+ModelEvalStage::evaluate_once(FlexData& summary)
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
   auto* mgr = session() ? session()->generative_model_manager() : nullptr;
@@ -318,8 +342,41 @@ ModelEvalStage::evaluate_once()
   session()->info(fmt("\n{}", md));
   session()->log_normal(fmt(
       "ModelEvalStage('{}'): evaluation complete", this->id()));
+
+  // FlexData summary (downstream trigger and/or save-text report). `text`
+  // is the full Markdown report; scores are exposed as structured fields.
+  summary = FlexData::make_object();
+  auto so = summary.as_object();
+  so.insert_or_assign("stage", FlexData::make_string("model-eval"));
+  so.insert_or_assign("model_a", FlexData::make_string(a.ref));
+  if (a.ppl.ok) {
+    so.insert_or_assign("perplexity_a",
+                        FlexData::make_real(a.ppl.perplexity));
+  }
+  if (a.arc.ok) {
+    so.insert_or_assign("arc_accuracy_a",
+                        FlexData::make_real(a.arc.accuracy));
+  }
+  if (two && b.loaded) {
+    so.insert_or_assign("model_b", FlexData::make_string(b.ref));
+    if (b.ppl.ok) {
+      so.insert_or_assign("perplexity_b",
+                          FlexData::make_real(b.ppl.perplexity));
+    }
+    if (b.arc.ok) {
+      so.insert_or_assign("arc_accuracy_b",
+                          FlexData::make_real(b.arc.accuracy));
+    }
+    if (want_div && b.div.ok) {
+      so.insert_or_assign("kl_divergence", FlexData::make_real(b.div.kl));
+      so.insert_or_assign("logit_rel_l2", FlexData::make_real(b.div.rel_l2));
+    }
+  }
+  so.insert_or_assign("ok", FlexData::make_bool(true));
+  so.insert_or_assign("text", FlexData::make_string(md));
   return true;
 #else
+  (void)summary;
   session()->warn(fmt(
       "ModelEvalStage('{}'): built without VPIPE_BUILD_APPLE_SILICON; the LM "
       "subsystem is unavailable", this->id()));
@@ -334,11 +391,36 @@ ModelEvalStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // Optional trigger (see model-fetch): gate the work on one beat when the
+  // iport is wired so this stage can cascade in a recipe.
+  if (ctx.iport_connected(0)) {
+    auto trig = co_await ctx.read(0);
+    if (!trig) {
+      ctx.signal_done();
+      co_return;
+    }
+  }
+  // model_a availability is checked HERE, AFTER the trigger -- in a recipe
+  // the upstream model-fetch/quantize may not have produced it at config
+  // time. Missing => log + halt without emitting (cascade stops). model_b
+  // is optional and handled gracefully (reported as A-only) if absent.
+  if (!model_dir_available(session(), _models_db, _model_a)) {
+    session()->error(fmt(
+        "ModelEvalStage('{}'): model_a '{}' is not available "
+        "(not produced yet?); skipping evaluation",
+        this->id(), _model_a));
+    ctx.signal_done();
+    co_return;
+  }
   session()->info(fmt(
       "ModelEvalStage('{}'): evaluating '{}'{}", this->id(), _model_a,
       _model_b.empty() ? std::string()
                        : fmt(" vs '{}'", _model_b)()));
-  evaluate_once();
+  FlexData summary;
+  evaluate_once(summary);
+  if (ctx.has_consumers(0) && summary.is_object()) {
+    co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(summary)));
+  }
   ctx.signal_done();
   co_return;
 }

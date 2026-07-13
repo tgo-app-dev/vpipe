@@ -26,13 +26,18 @@ using namespace mpp::tensor_ops;
 #endif
 #define SA_BQ 16
 #define SA_BK 16
-#define SA_D  256
 #define SA_SG 4
 #define SA_THREADS (SA_SG * 32)
 
 #if defined(__HAVE_TENSOR__)
 
-kernel void sdpa_mma_f16(
+// Head-dim-parameterized (SA_D template arg): instantiated for 256 (Qwen3.5)
+// and 128 (Llama-3 / the Krea-2 Qwen3-VL text encoder). The body is fully
+// SA_D-driven; only the Of[SA_BQ*SA_D] tg budget scales (8 KB @128, 16 KB
+// @256, both under 32 KB). matmul2d descriptors take SA_D as a constexpr
+// (a non-type template parameter), so each width JITs its own tile shapes.
+template <int SA_D>
+[[kernel]] void sdpa_mma_tmpl(
     const device VPIPE_ELT* q          [[buffer(0)]],
     const device VPIPE_ELT* kpool      [[buffer(1)]],
     const device VPIPE_ELT* vpool      [[buffer(2)]],
@@ -144,6 +149,13 @@ kernel void sdpa_mma_f16(
     }
   }
 }
+
+// Concrete entry points (the MLX-steel instantiate pattern): head_dim 256
+// (Qwen3.5) + head_dim 128 (Llama-3 / Krea-2 Qwen3-VL text encoder).
+template [[host_name("sdpa_mma_f16")]] [[kernel]]
+decltype(sdpa_mma_tmpl<256>) sdpa_mma_tmpl<256>;
+template [[host_name("sdpa_mma_d128_f16")]] [[kernel]]
+decltype(sdpa_mma_tmpl<128>) sdpa_mma_tmpl<128>;
 
 // Contiguous-KV matrix-core flash attention for Gemma-4 PREFILL, head_dim 512
 // (the GLOBAL/full-attention layers -- the O(n^2) term that dominates 12B
@@ -770,10 +782,140 @@ kernel void sdpa_full_mma2_d64_f16(
   }
 }
 
+// Contiguous-KV matrix-core FULL (non-causal) flash attention, head_dim a
+// template width. For the VAE spatial self-attention: SINGLE head (Hq=Hkv=1),
+// head_dim = the channel dim (Krea-2 384, FLUX.2 512), every one of the N=H*W
+// latent tokens attends every other. The scalar sdpa_full_f16 (grid one tg per
+// query, O(N^2) simd-reduce) DOMINATES VAE decode at high res (~60-75% @1024);
+// this runs QK^T + P*V on the matrix units (matmul2d) with the online softmax
+// in tg memory. Q/K/V are read DIRECTLY from device memory as tensors (no tg
+// staging), so only Ss[BQ,BK] + Of[BQ,D] f32 sit in tg memory: at D=512, BQ=8
+// that is 16 KB, under the 32 KB budget with slack for matmul2d scratch. The
+// over-read of the last BK block past T_kv is masked. Drop-in for sdpa_full_f16
+// (identical buffers 0..10, no q_offset -- full attention).
+//   0:q[Hq,n_q,D] 1:k 2:v[Hkv,kv_stride,D] 3:out[Hq,n_q,D] 4:scale 5:T_kv 6:D
+//   7:Hq 8:Hkv 9:n_q 10:kv_stride
+// grid {SAF_SG*32, Hq, ceil(n_q/SAF_BQ)}, tg {SAF_SG*32,1,1}.
+#define SAF_BQ 8
+#define SAF_BK 16
+#define SAF_SG 4
+#define SAF_THREADS (SAF_SG * 32)
+template <int SAF_D>
+[[kernel]] void sdpa_full_mma2_tmpl(
+    const device VPIPE_ELT* q     [[buffer(0)]],
+    const device VPIPE_ELT* k     [[buffer(1)]],
+    const device VPIPE_ELT* v     [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant float& scale     [[buffer(4)]],
+    constant int&   T_kv      [[buffer(5)]],
+    constant int&   D         [[buffer(6)]],
+    constant int&   Hq        [[buffer(7)]],
+    constant int&   Hkv       [[buffer(8)]],
+    constant int&   n_q       [[buffer(9)]],
+    constant int&   kv_stride [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  (void)D;
+  const int h    = (int)tgid.y;
+  const int q0   = (int)tgid.z * SAF_BQ;
+  const int kvh  = h / (Hq / Hkv);
+  const device VPIPE_ELT* kbase = k + (int64_t)kvh * kv_stride * SAF_D;
+  const device VPIPE_ELT* vbase = v + (int64_t)kvh * kv_stride * SAF_D;
+
+  threadgroup VPIPE_ELT Ss[SAF_BQ * SAF_BK];
+  threadgroup float Of[SAF_BQ * SAF_D];
+  threadgroup float mrow[SAF_BQ], lrow[SAF_BQ], corr_s[SAF_BQ];
+
+  for (int e = (int)lid; e < SAF_BQ * SAF_D; e += SAF_THREADS) { Of[e] = 0.0f; }
+  for (int e = (int)lid; e < SAF_BQ; e += SAF_THREADS) {
+    mrow[e] = -INFINITY; lrow[e] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device VPIPE_ELT* qh = q + ((int64_t)h * n_q + q0) * SAF_D;
+  using TQ = tensor<device VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TP = tensor<threadgroup VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TO = tensor<threadgroup float, dextents<int32_t,2>, tensor_inline>;
+  constexpr auto qk = matmul2d_descriptor(
+      SAF_BQ, SAF_BK, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<qk, execution_simdgroups<SAF_SG>> opQK;
+  constexpr auto pv = matmul2d_descriptor(
+      SAF_BQ, SAF_D, SAF_BK, false, false, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv, execution_simdgroups<SAF_SG>> opPV;
+  TQ tQ(const_cast<device VPIPE_ELT*>(qh), dextents<int32_t,2>(SAF_D, SAF_BQ));
+
+  for (int bs = 0; bs < T_kv; bs += SAF_BK) {
+    const int bk = min(SAF_BK, T_kv - bs);
+    TQ tK(const_cast<device VPIPE_ELT*>(kbase + (int64_t)bs * SAF_D),
+          dextents<int32_t,2>(SAF_D, SAF_BK));
+    auto cS = opQK.get_destination_cooperative_tensor<TQ, TQ, VPIPE_ELT>();
+    opQK.run(tQ, tK, cS);
+    TP tS(Ss, dextents<int32_t,2>(SAF_BK, SAF_BQ));
+    cS.store(tS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int r = (int)lid; r < SAF_BQ; r += SAF_THREADS) {
+      const bool qok = (q0 + r) < n_q;
+      float mloc = mrow[r];
+      for (int j = 0; j < SAF_BK; ++j) {
+        const bool ok = qok && j < bk;
+        const float s = ok ? float(Ss[r * SAF_BK + j]) * scale : -INFINITY;
+        Ss[r * SAF_BK + j] = (VPIPE_ELT)s;
+        mloc = max(mloc, s);
+      }
+      const float corr = exp(mrow[r] - mloc);
+      float lloc = lrow[r] * corr;
+      for (int j = 0; j < SAF_BK; ++j) {
+        const float s = float(Ss[r * SAF_BK + j]);
+        const float p = (s == -INFINITY) ? 0.0f : exp(s - mloc);
+        Ss[r * SAF_BK + j] = (VPIPE_ELT)p;
+        lloc += p;
+      }
+      corr_s[r] = corr;
+      mrow[r] = mloc; lrow[r] = lloc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = (int)lid; e < SAF_BQ * SAF_D; e += SAF_THREADS) {
+      Of[e] *= corr_s[e / SAF_D];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    TP tP(Ss, dextents<int32_t,2>(SAF_BK, SAF_BQ));
+    TQ tV(const_cast<device VPIPE_ELT*>(vbase + (int64_t)bs * SAF_D),
+          dextents<int32_t,2>(SAF_D, SAF_BK));
+    TO tO(Of, dextents<int32_t,2>(SAF_D, SAF_BQ));
+    opPV.run(tP, tV, tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (int e = (int)lid; e < SAF_BQ * SAF_D; e += SAF_THREADS) {
+    const int r = e / SAF_D, dd = e % SAF_D;
+    if (q0 + r < n_q) {
+      const float inv = (lrow[r] > 0.0f) ? 1.0f / lrow[r] : 0.0f;
+      out[((int64_t)h * n_q + (q0 + r)) * SAF_D + dd] = (VPIPE_ELT)(Of[e] * inv);
+    }
+  }
+}
+template [[host_name("sdpa_full_mma2_d384_f16")]] [[kernel]]
+decltype(sdpa_full_mma2_tmpl<384>) sdpa_full_mma2_tmpl<384>;
+template [[host_name("sdpa_full_mma2_d512_f16")]] [[kernel]]
+decltype(sdpa_full_mma2_tmpl<512>) sdpa_full_mma2_tmpl<512>;
+
 #else
 // Tensor ops unavailable for this target: stubs so the metallib still builds.
 kernel void sdpa_mma_f16(device VPIPE_ELT* out [[buffer(3)]],
                          uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void sdpa_full_mma2_d384_f16(device VPIPE_ELT* out [[buffer(3)]],
+                                    uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void sdpa_full_mma2_d512_f16(device VPIPE_ELT* out [[buffer(3)]],
+                                    uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void sdpa_mma_d128_f16(device VPIPE_ELT* out [[buffer(3)]],
+                              uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 kernel void sdpa_causal_mma2_d512_f16(device VPIPE_ELT* out [[buffer(3)]],
                                       uint t [[thread_position_in_grid]])

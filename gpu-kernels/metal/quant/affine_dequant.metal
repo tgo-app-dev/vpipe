@@ -299,3 +299,253 @@ VPIPE_AFFINE_QUANT(affine_quant_w8_g64, 8, 64)
 VPIPE_AFFINE_QUANT(affine_quant_w4_g64, 4, 64)
 VPIPE_AFFINE_QUANT(affine_quant_w8_g32, 8, 32)
 VPIPE_AFFINE_QUANT(affine_quant_w4_g32, 4, 32)
+
+// ---------------------------------------------------------------------
+// Block-floating-point f16 -> i8 quantization (group 64), feeding the
+// int8 convolution2d/matmul paths: one simdgroup per 64-element block
+// (each lane a half2), PURE INTEGER pipeline on the f16 bit patterns --
+// no fdiv, no float rounding:
+//   1. block max EXPONENT Emax = simd_max over the raw 5-bit exponents;
+//   2. per element recover the 11-bit magnitude (10-bit mantissa with
+//      the implicit leading one), right-shift by 4 + (Emax - e) (4 fits
+//      the 11-bit magnitude into 7 bits at e == Emax) with round-to-
+//      nearest (add half the shifted-out range), clamp 127, apply sign;
+//   3. scale = 2^(Emax - 21) per block, EXACT in f16 (normal for
+//      Emax >= 7, denormal below), so dequant q * scale reproduces the
+//      top 7 magnitude bits exactly.
+// Power-of-2 scales give up <= 1 bit of precision vs an amax scale (the
+// amax variant below is the float baseline: simd_max(|x|), q =
+// rint(x * 127/amax), scale = amax/127). Denormals/zeros (e == 0)
+// quantize to 0; NaN/Inf are not handled (activations are finite).
+// f16-format-specific (explicit half): the bf16 metallib twin compiles
+// but is meaningless -- load these from the f16 lib only.
+//   0:x[n] f16  1:q[n] i8  2:scales[n/64] f16  3:n (n % 64 == 0)
+//   dispatch (threads): {n/2, 1, 1}, tg {128, 1, 1}
+kernel void quant_f16_i8_g64_bfp(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device half*       scales [[buffer(2)]],
+    const constant int& n     [[buffer(3)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint base = tid * 2;                  // == simdgroup*64 + lane*2
+  if (base + 1 >= (uint)n) { return; }
+  const half2 h = *reinterpret_cast<const device half2*>(x + base);
+  const ushort2 u = as_type<ushort2>(h);
+  const ushort e0 = (u.x >> 10) & 0x1F, e1 = (u.y >> 10) & 0x1F;
+  const ushort emax = simd_max(max(e0, e1));
+
+  char2 o;
+  {
+    // Element 0: 11-bit magnitude, shift by the exponent gap (+4), round.
+    const ushort m = (u.x & 0x3FF) | 0x400;
+    const ushort s = 4 + (emax - e0);
+    int v = (e0 == 0 || s > 14) ? 0 : (int)((m + (1 << (s - 1))) >> s);
+    v = min(v, 127);
+    o.x = (char)((u.x & 0x8000) ? -v : v);
+  }
+  {
+    const ushort m = (u.y & 0x3FF) | 0x400;
+    const ushort s = 4 + (emax - e1);
+    int v = (e1 == 0 || s > 14) ? 0 : (int)((m + (1 << (s - 1))) >> s);
+    v = min(v, 127);
+    o.y = (char)((u.y & 0x8000) ? -v : v);
+  }
+  *reinterpret_cast<device char2*>(q + base) = o;
+
+  if (lane == 0) {
+    // scale = 2^(emax - 21): f16-normal for emax >= 7 (exponent field
+    // emax - 6), denormal 1 << (emax + 3) below. Exact either way.
+    const ushort sbits = (emax >= 7) ? (ushort)((emax - 6) << 10)
+                                     : (ushort)(1 << (emax + 3));
+    scales[base / 64] = as_type<half>(sbits);
+  }
+}
+
+// Float amax baseline for the A/B: same block/grid contract.
+kernel void quant_f16_i8_g64_amax(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device half*       scales [[buffer(2)]],
+    const constant int& n     [[buffer(3)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint base = tid * 2;
+  if (base + 1 >= (uint)n) { return; }
+  const half2 h = *reinterpret_cast<const device half2*>(x + base);
+  const float a0 = fabs((float)h.x), a1 = fabs((float)h.y);
+  const float amax = simd_max(max(a0, a1));
+  const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+  char2 o;
+  o.x = (char)clamp((int)rint((float)h.x * inv), -127, 127);
+  o.y = (char)clamp((int)rint((float)h.y * inv), -127, 127);
+  *reinterpret_cast<device char2*>(q + base) = o;
+  if (lane == 0) { scales[base / 64] = (half)(amax * (1.0f / 127.0f)); }
+}
+
+// bfp2: SAME block-floating-point quantization (block max exponent,
+// power-of-2 scale) but the mantissa shift runs on the FLOAT pipe: x *
+// 2^(21 - Emax) is EXACT (power-of-2 multiply), so rint() computes the
+// identical shifted-and-rounded magnitude the integer version derives by
+// bit surgery -- at amax-kernel speed (the pure-integer path's variable
+// shifts run ~27% below the bandwidth roofline). The inverse scale is
+// built in f32 (2^(21-Emax) overflows f16 for Emax < 6); the stored
+// per-block scale is the same exact f16 2^(Emax-21).
+kernel void quant_f16_i8_g64_bfp2(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device half*       scales [[buffer(2)]],
+    const constant int& n     [[buffer(3)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint base = tid * 2;
+  if (base + 1 >= (uint)n) { return; }
+  const half2 h = *reinterpret_cast<const device half2*>(x + base);
+  const ushort2 u = as_type<ushort2>(h);
+  const ushort emax =
+      simd_max(max((u.x >> 10) & 0x1F, (u.y >> 10) & 0x1F));
+  // 2^(21 - emax) exact in f32; multiply cannot round, rint() then does
+  // the round-to-nearest the integer path adds by hand.
+  const float inv = as_type<float>((uint)(21 - (int)emax + 127) << 23);
+  char2 o;
+  o.x = (char)clamp((int)rint((float)h.x * inv), -127, 127);
+  o.y = (char)clamp((int)rint((float)h.y * inv), -127, 127);
+  *reinterpret_cast<device char2*>(q + base) = o;
+  if (lane == 0) {
+    const ushort sbits = (emax >= 7) ? (ushort)((emax - 6) << 10)
+                                     : (ushort)(1 << (emax + 3));
+    scales[base / 64] = as_type<half>(sbits);
+  }
+}
+
+// Per-ROW f16 -> i8 quantization for the int8 GEMM path: the row IS the
+// GEMM's K contraction, so ONE scale rides the whole integer dot product
+// (the hw matmul accumulates int32 over full K -- scales cannot vary
+// along K). One threadgroup (256 threads) per row: amax reduction
+// (simd_max + tgmem cross-simdgroup fold), scale = amax/127, then a
+// strided quantize pass. K must be even.
+//   0:x[M,K] f16  1:q[M,K] i8  2:scales[M] f16  3:K
+//   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void quant_f16_i8_row(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device half*       scales [[buffer(2)]],
+    const constant int& K     [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const device half* xr = x + (int64_t)row * K;
+  device char* qr = q + (int64_t)row * K;
+
+  float am = 0.0f;
+  for (int i = (int)lid * 2; i < K; i += 512) {
+    const half2 h = *reinterpret_cast<const device half2*>(xr + i);
+    am = max(am, max(fabs((float)h.x), fabs((float)h.y)));
+  }
+  am = simd_max(am);
+  threadgroup float sm[8];
+  if (lane == 0) { sm[sgid] = am; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  am = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
+  am = max(am, max(max(sm[4], sm[5]), max(sm[6], sm[7])));
+
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+  for (int i = (int)lid * 2; i < K; i += 512) {
+    const half2 h = *reinterpret_cast<const device half2*>(xr + i);
+    char2 o;
+    o.x = (char)clamp((int)rint((float)h.x * inv), -127, 127);
+    o.y = (char)clamp((int)rint((float)h.y * inv), -127, 127);
+    *reinterpret_cast<device char2*>(qr + i) = o;
+  }
+  if (lid == 0) { scales[row] = (half)(am * (1.0f / 127.0f)); }
+}
+
+// Group-512 per-row f16 -> i8 quant for the K-chunked int8 GEMM: scales
+// vary along K in groups of 512 (finer than per-row = better outlier
+// isolation), one SIMDGROUP per group (32 lanes x 16 elems = 512; pure
+// simd_max, no tgmem). scales layout [M, K/512]. K % 512 == 0.
+//   0:x[M,K] 1:q[M,K] 2:scales[M,K/512] 3:K
+//   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void quant_f16_i8_row_g512(
+    const device half* x      [[buffer(0)]],
+    device char*       q      [[buffer(1)]],
+    device half*       scales [[buffer(2)]],
+    const constant int& K     [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = K / 512;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int64_t base = (int64_t)row * K + g * 512 + (int)lane * 16;
+    const device half* xp = x + base;
+    float am = 0.0f;
+    half2 h[8];
+    for (int i = 0; i < 8; ++i) {
+      h[i] = *reinterpret_cast<const device half2*>(xp + i * 2);
+      am = max(am, max(fabs((float)h[i].x), fabs((float)h[i].y)));
+    }
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    device char* qp = q + base;
+    for (int i = 0; i < 8; ++i) {
+      char2 o;
+      o.x = (char)clamp((int)rint((float)h[i].x * inv), -127, 127);
+      o.y = (char)clamp((int)rint((float)h[i].y * inv), -127, 127);
+      *reinterpret_cast<device char2*>(qp + i * 2) = o;
+    }
+    if (lane == 0) {
+      scales[(int64_t)row * G + g] = (half)(am * (1.0f / 127.0f));
+    }
+  }
+}
+
+// POW2-scale (block-floating-point) twin of quant_f16_i8_row_g512, for
+// the SHIFT-ALIGNED integer accumulation GEMM: per-(row, 512-group)
+// scale = 2^(Emax - 21) (Emax = the group's max f16 exponent field),
+// stored as the raw EXPONENT int8 (Emax - 21, range [-21, 9]) so the
+// GEMM can align group partials by integer shifts. The mantissa shift
+// runs on the float pipe (exact 2^(21-Emax) multiply + rint -- see
+// quant_f16_i8_g64_bfp2). Same contract as quant_f16_i8_row_g512 but
+// buffer 2 is int8 exponents [M, K/512].
+kernel void quant_f16_i8_row_g512_bfp(
+    const device half* x     [[buffer(0)]],
+    device char*       q     [[buffer(1)]],
+    device char*       eexp  [[buffer(2)]],
+    const constant int& K    [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = K / 512;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int64_t base = (int64_t)row * K + g * 512 + (int)lane * 16;
+    const device half* xp = x + base;
+    ushort em = 0;
+    half2 h[8];
+    for (int i = 0; i < 8; ++i) {
+      h[i] = *reinterpret_cast<const device half2*>(xp + i * 2);
+      const ushort2 u = as_type<ushort2>(h[i]);
+      em = max(em, max((ushort)((u.x >> 10) & 0x1F),
+                       (ushort)((u.y >> 10) & 0x1F)));
+    }
+    em = simd_max(em);
+    const float inv = as_type<float>((uint)(21 - (int)em + 127) << 23);
+    device char* qp = q + base;
+    for (int i = 0; i < 8; ++i) {
+      char2 o;
+      o.x = (char)clamp((int)rint((float)h[i].x * inv), -127, 127);
+      o.y = (char)clamp((int)rint((float)h[i].y * inv), -127, 127);
+      *reinterpret_cast<device char2*>(qp + i * 2) = o;
+    }
+    if (lane == 0) { eexp[(int64_t)row * G + g] = (char)((int)em - 21); }
+  }
+}

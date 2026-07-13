@@ -10,6 +10,9 @@
 #include "common/stdout-log-delegate.h"
 #include "common/thread-pool.h"
 #include "common/vpipe-format.h"
+
+#include <filesystem>
+#include <system_error>
 #include "common/perf-buffer.h"
 #include "common/perf-event.h"
 #include "interfaces/log-delegate-intf.h"
@@ -18,7 +21,9 @@
 #include "pipeline/pipeline-spec.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/stage.h"
+#include "plugin/plugin-manager.h"
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
@@ -132,6 +137,68 @@ parse_db_config(const FlexData& config,
       *out_map_size = static_cast<size_t>(mb) << 20;
     }
   }
+}
+
+// Read the "file_sandbox" config: { enabled: bool, root: string }. When
+// enabled, stage file paths are confined (chroot-like) to `root`
+// (default "<cwd>/sandbox"), which is created here. Unset / disabled ->
+// a disabled PathSandbox (native access). Fail-soft like the other
+// parse_*_config helpers.
+PathSandbox
+parse_sandbox_config(const FlexData& config)
+{
+  if (!config.is_object()) {
+    return PathSandbox{};
+  }
+  auto root = config.as_object();
+  if (!root.contains("file_sandbox")) {
+    return PathSandbox{};
+  }
+  FlexData fs_val = root.at("file_sandbox");
+  if (!fs_val.is_object()) {
+    return PathSandbox{};
+  }
+  auto obj = fs_val.as_object();
+  bool enabled = false;
+  if (obj.contains("enabled")) {
+    FlexData v = obj.at("enabled");
+    if (v.is_bool()) { enabled = v.get_bool(); }
+  }
+  if (!enabled) {
+    return PathSandbox{};
+  }
+  std::string dir;
+  if (obj.contains("root")) {
+    FlexData v = obj.at("root");
+    if (v.is_string()) { dir = std::string(v.get_string()); }
+  }
+  if (dir.empty()) {
+    std::error_code ec;
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    dir = ((ec ? std::filesystem::path(".") : cwd) / "sandbox").string();
+  }
+  // Optional whitelist: real host prefixes granted pass-through access
+  // (an array of path strings). These are existing directories the
+  // operator explicitly exposes -- do NOT create them here.
+  std::vector<std::filesystem::path> whitelist;
+  if (obj.contains("whitelist")) {
+    FlexData v = obj.at("whitelist");
+    if (v.is_array()) {
+      auto arr = v.as_array();
+      for (size_t i = 0; i < arr.size(); ++i) {
+        FlexData e = arr.at(i);
+        if (e.is_string()) {
+          std::string p(e.get_string());
+          if (!p.empty()) { whitelist.emplace_back(std::move(p)); }
+        }
+      }
+    }
+  }
+  // Self-maintained: create the root so confine() has a real directory
+  // to canonicalize against and land paths under.
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return PathSandbox{std::filesystem::path(dir), std::move(whitelist)};
 }
 
 // Read the top-level "language" config key (an IETF tag) and normalize
@@ -289,6 +356,44 @@ read_default_edge_capacity(const FlexData& config) noexcept
 
 }
 
+// Collect plugin .dylib paths to load: the session config's `plugins`
+// array (path strings) followed by the colon-separated VPIPE_PLUGINS
+// environment variable. Config entries come first.
+static vector<string>
+collect_plugin_paths_(const FlexData& config)
+{
+  vector<string> paths;
+  if (config.is_object()) {
+    auto obj = config.as_object();
+    if (obj.contains("plugins")) {
+      FlexData v = obj.at("plugins");
+      if (v.is_array()) {
+        auto arr = v.as_array();
+        for (size_t i = 0; i < arr.size(); ++i) {
+          FlexData e = arr.at(i);
+          if (e.is_string()) {
+            string p(e.get_string());
+            if (!p.empty()) { paths.push_back(std::move(p)); }
+          }
+        }
+      }
+    }
+  }
+  if (const char* env = std::getenv("VPIPE_PLUGINS")) {
+    const string s(env);
+    size_t start = 0;
+    for (;;) {
+      const size_t colon = s.find(':', start);
+      string p = (colon == string::npos) ? s.substr(start)
+                                          : s.substr(start, colon - start);
+      if (!p.empty()) { paths.push_back(std::move(p)); }
+      if (colon == string::npos) { break; }
+      start = colon + 1;
+    }
+  }
+  return paths;
+}
+
 Session::Session(string_view cfg)
   : _config(FlexData::make_object())
   , _delegate(make_unique<StdoutLogDelegate>(LogLevel::Normal))
@@ -312,6 +417,7 @@ Session::Session(string_view cfg)
   // Phase 2: read top-level db config. lmdb_env() is lazy -- the env
   // doesn't open here unless build_delegate() pulls it.
   parse_db_config(_config, &_db_path, &_db_map_size);
+  _path_sandbox = parse_sandbox_config(_config);
 
   // Phase 2b: UI/message locale (default en-us when unset/unsupported).
   _language = parse_language_config(_config);
@@ -335,6 +441,15 @@ Session::Session(string_view cfg)
   // Pool is up; switch a StdoutLogDelegate (bootstrap or chosen)
   // from sync to per-worker async logging.
   attach_if_stdout_(_delegate.get(), this);
+
+  // Phase 5: load plugin .dylibs named by the `plugins` config array and
+  // the VPIPE_PLUGINS env, now that the delegate + pool are up so their
+  // registrations + diagnostics are visible. Process-wide + dedup'd, so a
+  // plugin loads once even across multiple sessions.
+  const vector<string> plugin_paths = collect_plugin_paths_(_config);
+  if (!plugin_paths.empty()) {
+    PluginManager::get().load_all(this, plugin_paths);
+  }
 }
 
 Session::Session(unique_ptr<LogDelegateIntf> d)
@@ -440,6 +555,13 @@ Session::generative_model_manager() const
 #else
   return nullptr;
 #endif
+}
+
+std::filesystem::path
+Session::confine_path(std::string_view user_path, bool for_write,
+                      std::string* err) const
+{
+  return _path_sandbox.confine(user_path, for_write, err);
 }
 
 LmdbEnv*

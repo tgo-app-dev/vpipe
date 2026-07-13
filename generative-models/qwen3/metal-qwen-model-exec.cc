@@ -419,5 +419,11 @@ MetalQwenModelExec::detach_branch_context(ContextId child)
   return true;
 }
 
+void
+MetalQwenModelExec::set_i8_gemm(bool on)
+{
+  if (_model != nullptr) { _model->set_i8_gemm(on); }
+}
+
 
 }  // namespace vpipe::genai

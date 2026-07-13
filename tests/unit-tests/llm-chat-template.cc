@@ -7,12 +7,14 @@
 #include "minitest.h"
 #include "generative-models/chat-template.h"
 #include "generative-models/tokenizer.h"
+#include "common/flex-data.h"
 #include "common/session.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -937,4 +939,313 @@ TEST(llm_chat_template, gemma4_unified_thinking_modes)
   EXPECT_TRUE(d == kDisabled);   // default == reasoning OFF
   EXPECT_TRUE(o == kDisabled);   // explicit disable == OFF
   EXPECT_TRUE(e == kEnabled);    // explicit enable == <|think|> system turn
+}
+
+// ---- Tool / function calling (ChatML / Qwen) -----------------------
+
+TEST(llm_chat_template, chatml_supports_tools)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template("Qwen2ForCausalLM", *tok);
+  EXPECT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  EXPECT_TRUE(tpl->supports_tools());
+}
+
+TEST(llm_chat_template, llama3_has_no_tool_support)
+{
+  Session sess;
+  auto tok = make_tok_(kLlama3TokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template("LlamaForCausalLM", *tok);
+  EXPECT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  EXPECT_FALSE(tpl->supports_tools());
+  // The default (unsupported) hooks append nothing and return false.
+  vector<int32_t> ids;
+  EXPECT_FALSE(tpl->render_tools_system_turn("{}", true, &ids));
+  EXPECT_TRUE(ids.empty());
+  vector<string> results{"r"};
+  vector<string> names{"t"};
+  EXPECT_FALSE(tpl->render_tool_results_turn(
+      span<const string>(names.data(), names.size()),
+      span<const string>(results.data(), results.size()), &ids));
+  EXPECT_TRUE(ids.empty());
+}
+
+TEST(llm_chat_template, chatml_tools_system_turn_is_wrapped)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template("Qwen2ForCausalLM", *tok);
+  if (!tpl) { return; }
+
+  const int32_t im_start = tok->special_token_id("<|im_start|>");
+  const int32_t im_end   = tok->special_token_id("<|im_end|>");
+
+  vector<int32_t> ids;
+  EXPECT_TRUE(tpl->render_tools_system_turn("{\"a\":1}", true, &ids));
+  EXPECT_FALSE(ids.empty());
+  // A system turn: opens with <|im_start|> and closes with <|im_end|>.
+  EXPECT_TRUE(!ids.empty() && ids.front() == im_start);
+  EXPECT_TRUE(contains_id_(ids, im_end));
+}
+
+TEST(llm_chat_template, chatml_tool_results_turn_opens_assistant)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template("Qwen2ForCausalLM", *tok);
+  if (!tpl) { return; }
+
+  const int32_t im_start = tok->special_token_id("<|im_start|>");
+  const int32_t im_end   = tok->special_token_id("<|im_end|>");
+
+  vector<string> results{"{\"datetime\":\"now\"}"};
+  vector<string> names{"get_current_time"};
+  vector<int32_t> ids;
+  EXPECT_TRUE(tpl->render_tool_results_turn(
+      span<const string>(names.data(), names.size()),
+      span<const string>(results.data(), results.size()), &ids));
+  EXPECT_FALSE(ids.empty());
+  // Result turn closes the user turn (<|im_end|>) then opens a fresh
+  // assistant turn (<|im_start|>): both specials must be present, and
+  // there must be at least two <|im_start|> (user-open + assistant-open).
+  int starts = 0;
+  for (int32_t v : ids) { if (v == im_start) { ++starts; } }
+  EXPECT_TRUE(starts >= 2);
+  EXPECT_TRUE(contains_id_(ids, im_end));
+}
+
+// ---- Tool / function calling (Gemma-4 DSL) -------------------------
+
+// Synthetic Gemma-4 tokenizer carrying just the tool-DSL special tokens
+// (real ids) + a tiny vocab. Enough to construct GemmaChatTemplate and
+// exercise the tokenizer-independent tool logic (supports/marker/stop/
+// parse). The render + token-exact tests below use the REAL tokenizer.
+namespace {
+const char* kGemmaToolTokenizerJson = R"json({
+  "version": "1.0",
+  "added_tokens": [
+    {"id": 1,   "content": "<eos>",            "special": true},
+    {"id": 2,   "content": "<bos>",            "special": true},
+    {"id": 46,  "content": "<|tool>",          "special": true},
+    {"id": 47,  "content": "<tool|>",          "special": true},
+    {"id": 50,  "content": "<|tool_response>", "special": true},
+    {"id": 51,  "content": "<tool_response|>", "special": true},
+    {"id": 52,  "content": "<|\"|>",           "special": true},
+    {"id": 105, "content": "<|turn>",          "special": true},
+    {"id": 106, "content": "<turn|>",          "special": true}
+  ],
+  "pre_tokenizer": {
+    "type": "Sequence",
+    "pretokenizers": [
+      {"type": "Split",
+       "pattern": {"Regex": "\\S+|\\s+"},
+       "behavior": "Isolated"}
+    ]
+  },
+  "model": {
+    "type": "BPE",
+    "vocab": {"a": 300, "b": 301, "c": 302},
+    "merges": []
+  }
+})json";
+}
+
+TEST(llm_chat_template, gemma_supports_tools_and_markers)
+{
+  Session sess;
+  auto tok = make_tok_(kGemmaToolTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Gemma4ForConditionalGeneration", *tok);
+  EXPECT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  EXPECT_TRUE(string_view(tpl->family_name()) == "gemma");
+  // The DSL tokens are present -> tools are supported.
+  EXPECT_TRUE(tpl->supports_tools());
+  EXPECT_TRUE(string_view(tpl->tool_call_open_marker()) == "<|tool_call>");
+  // <|tool_response> (50) is a turn-CONTINUING stop; <turn|> (106) and
+  // <eos> (1) close the turn.
+  EXPECT_TRUE(tpl->stop_token_continues_turn(50));
+  EXPECT_FALSE(tpl->stop_token_continues_turn(106));
+  EXPECT_FALSE(tpl->stop_token_continues_turn(1));
+  EXPECT_FALSE(tpl->stop_token_continues_turn(-1));
+  // <|tool_response> is also a stop token.
+  EXPECT_TRUE(tpl->is_stop_token(50));
+}
+
+TEST(llm_chat_template, gemma_tools_unsupported_without_dsl_tokens)
+{
+  // A Gemma checkpoint whose tokenizer lacks the tool-DSL tokens must
+  // report no tool support (so the chat stage keeps tools off) and the
+  // render hooks must append nothing.
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);   // no gemma tokens
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Gemma4ForConditionalGeneration", *tok);
+  if (!tpl) { return; }
+  EXPECT_FALSE(tpl->supports_tools());
+  vector<int32_t> ids;
+  EXPECT_FALSE(tpl->render_tools_system_turn("{}", true, &ids));
+  EXPECT_TRUE(ids.empty());
+  vector<string> names{"t"}, results{"r"};
+  EXPECT_FALSE(tpl->render_tool_results_turn(
+      span<const string>(names.data(), names.size()),
+      span<const string>(results.data(), results.size()), &ids));
+  EXPECT_TRUE(ids.empty());
+}
+
+TEST(llm_chat_template, gemma_parse_tool_call_dsl)
+{
+  // parse_tool_calls decodes Gemma's `<|tool_call>call:NAME{...}<tool_call|>`
+  // DSL into name + JSON arguments. Works off the decoded text, so it
+  // needs no real tokenizer.
+  Session sess;
+  auto tok = make_tok_(kGemmaToolTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Gemma4ForConditionalGeneration", *tok);
+  if (!tpl) { return; }
+
+  // Single call, one string arg with an embedded comma/space.
+  const string txt1 =
+      "<|tool_call>call:get_weather{location:<|\"|>Tokyo, JP<|\"|>}"
+      "<tool_call|>";
+  auto c1 = tpl->parse_tool_calls(txt1);
+  ASSERT_TRUE(c1.size() == 1u);
+  EXPECT_TRUE(c1[0].name == "get_weather");
+  FlexData a1 = FlexData::from_json(c1[0].arguments_json);
+  ASSERT_TRUE(a1.is_object());
+  EXPECT_TRUE(a1.as_object().at("location").get_string() == "Tokyo, JP");
+
+  // Mixed types (string / bool) + TWO calls in one turn.
+  const string txt2 =
+      "<|tool_call>call:write_file{append:false,content:<|\"|>hi<|\"|>,"
+      "path:<|\"|>a.txt<|\"|>}<tool_call|>"
+      "<|tool_call>call:get_current_time{}<tool_call|>";
+  auto c2 = tpl->parse_tool_calls(txt2);
+  ASSERT_TRUE(c2.size() == 2u);
+  EXPECT_TRUE(c2[0].name == "write_file");
+  FlexData a2 = FlexData::from_json(c2[0].arguments_json);
+  ASSERT_TRUE(a2.is_object());
+  {
+    auto o = a2.as_object();
+    EXPECT_TRUE(o.at("path").get_string() == "a.txt");
+    EXPECT_TRUE(o.at("content").get_string() == "hi");
+    EXPECT_TRUE(o.at("append").is_bool());
+    EXPECT_FALSE(o.at("append").get_bool());
+  }
+  EXPECT_TRUE(c2[1].name == "get_current_time");
+  EXPECT_TRUE(c2[1].arguments_json == "{}");
+
+  // No tool call -> empty.
+  EXPECT_TRUE(tpl->parse_tool_calls("just a normal reply").empty());
+}
+
+// Token-exact vs the HF chat_template.jinja for a two-tool advertisement
+// (get_current_time with empty params + get_weather with a string param)
+// plus the user turn "What time is it?". Captured offline via
+// transformers.apply_chat_template on the real e4b tokenizer. Mirrors the
+// chat stage: user turn rendered is_first=false (the tools system turn
+// carries the single <bos>), tools system turn prepended. Gated on the
+// real tokenizer (VPIPE_GEMMA4_TEST_MODEL_PATH) -- the metaspace
+// SentencePiece tokenization of the DSL text spans must match exactly.
+TEST(llm_chat_template, gemma_tools_system_turn_token_exact)
+{
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(path) + "/tokenizer.json", &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Gemma4ForConditionalGeneration", *tok);
+  if (!tpl) { return; }
+  ASSERT_TRUE(tpl->supports_tools());
+
+  // One Hermes function-spec object per line -- exactly what
+  // McpToolRegistry::tools_json() emits.
+  const string tools_json =
+      "{\"type\":\"function\",\"function\":{\"name\":\"get_current_time\","
+      "\"description\":\"Get the host's current local date and time.\","
+      "\"parameters\":{\"type\":\"object\",\"properties\":{},"
+      "\"required\":[]}}}\n"
+      "{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+      "\"description\":\"Get the weather for a city.\",\"parameters\":"
+      "{\"type\":\"object\",\"properties\":{\"location\":{\"type\":"
+      "\"string\",\"description\":\"The city name\"}},\"required\":"
+      "[\"location\"]}}}";
+
+  vector<int32_t> user_ids;
+  tpl->render_user_turn("What time is it?", /*is_first_turn=*/false,
+                        &user_ids);
+  vector<int32_t> sys_ids;
+  ASSERT_TRUE(tpl->render_tools_system_turn(
+      tools_json, /*is_first_turn=*/true, &sys_ids));
+  vector<int32_t> got = sys_ids;
+  got.insert(got.end(), user_ids.begin(), user_ids.end());
+
+  const vector<int32_t> kExpected{
+      2, 105, 9731, 107, 46, 163688, 236787, 828, 236779, 4002, 236779,
+      2289, 236782, 7777, 236787, 52, 3407, 506, 4253, 236789, 236751,
+      1873, 2263, 3433, 532, 990, 236761, 52, 236764, 19031, 29616, 2084,
+      236787, 52, 60688, 52, 1807, 47, 46, 163688, 236787, 828, 236779,
+      19323, 236782, 7777, 236787, 52, 3407, 506, 7606, 573, 496, 3207,
+      236761, 52, 236764, 19031, 29616, 15921, 29616, 7125, 29616, 7777,
+      236787, 52, 818, 3207, 1463, 52, 236764, 2084, 236787, 52, 35410,
+      52, 5237, 15979, 24845, 52, 7125, 52, 1604, 2084, 236787, 52, 60688,
+      52, 1807, 47, 106, 107, 105, 2364, 107, 3689, 990, 563, 625, 236881,
+      106, 107, 105, 4368, 107};
+  EXPECT_TRUE(got == kExpected);
+}
+
+// The tool-results turn re-emits the <|tool_response> opener the model
+// stopped on (uncommitted) + one response:NAME{...} block per result +
+// <tool_response|>, and does NOT open a new model turn (Gemma keeps the
+// exchange in one turn). A JSON-object result renders as a native
+// {key:value,...} mapping. Decoded, it must match the HF reference
+// string. Gated on the real tokenizer.
+TEST(llm_chat_template, gemma_tool_results_turn_decodes_to_reference)
+{
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(path) + "/tokenizer.json", &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Gemma4ForConditionalGeneration", *tok);
+  if (!tpl) { return; }
+  ASSERT_TRUE(tpl->supports_tools());
+
+  vector<string> names{"get_weather"};
+  vector<string> results{"{\"temperature\":15,\"weather\":\"sunny\"}"};
+  vector<int32_t> ids;
+  ASSERT_TRUE(tpl->render_tool_results_turn(
+      span<const string>(names.data(), names.size()),
+      span<const string>(results.data(), results.size()), &ids));
+  // Native mapping form, keys dictsorted (temperature < weather), number
+  // bare, string <|"|>-wrapped -- exactly the HF reference block.
+  const string want =
+      "<|tool_response>response:get_weather{temperature:15,weather:"
+      "<|\"|>sunny<|\"|>}<tool_response|>";
+  EXPECT_TRUE(tok->decode(ids) == want);
+
+  // A non-JSON result falls back to {value:<|"|>...<|"|>}.
+  vector<string> results2{"plain text result"};
+  vector<int32_t> ids2;
+  ASSERT_TRUE(tpl->render_tool_results_turn(
+      span<const string>(names.data(), names.size()),
+      span<const string>(results2.data(), results2.size()), &ids2));
+  const string want2 =
+      "<|tool_response>response:get_weather{value:<|\"|>plain text "
+      "result<|\"|>}<tool_response|>";
+  EXPECT_TRUE(tok->decode(ids2) == want2);
 }

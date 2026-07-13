@@ -439,6 +439,14 @@ public:
   virtual void set_suppressed_tokens(std::span<const std::int32_t> ids)
   { (void)ids; }
 
+  // Dynamic-int8 accelerated PREFILL GEMMs ("accelerated mode"): the big
+  // prompt-time matmuls run on the matrix units' int8 pipe (~2x the f16
+  // rate) with on-the-fly per-(row, 512-group) activation quantization.
+  // LOSSY (int8, ~1e-2 rel per GEMM -- NOT token-exact) and strictly
+  // opt-in; decode is untouched. Default no-op; execs whose model
+  // implements the route (the metal Qwen exec) override.
+  virtual void set_i8_gemm(bool on) { (void)on; }
+
 };
 
 }

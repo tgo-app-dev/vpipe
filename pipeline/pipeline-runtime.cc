@@ -13,6 +13,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
 #include "stages/call-stage.h"
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <map>
@@ -398,10 +399,11 @@ PipelineRuntime::launch()
     for (unsigned i = 0; i < s->num_iports(); ++i) {
       const InEdge& raw = s->iport_edges()[i];
       if (!raw.v) {
-        session()->warn(fmt(
-          "PipelineRuntime: stage '{}' iport {} is unwired",
-          s->id(), i));
-        return false;
+        // A DISCONNECTED (optional) iport: no producer. Keep the
+        // positional slot -- it gets a null-parent EdgeReader below
+        // (permanent EOS) -- but contribute no clock-domain edge.
+        iport_src[si][i] = Endpoint{nullptr, 0};
+        continue;
       }
       Endpoint src = resolve_src_({raw.v, raw.p}, fx.src_rewrite);
       if (stage_set.find(src.v) == stage_set.end()) {
@@ -579,6 +581,19 @@ PipelineRuntime::launch()
     Stage* s = stages[si];
     for (unsigned i = 0; i < s->num_iports(); ++i) {
       Endpoint src = iport_src[si][i];
+      // Disconnected (optional) iport: no producer buffer. Give it a
+      // null-parent EdgeReader that reads as permanent EOS, and index
+      // it under the same {nullptr,0,s,i} key phase 3 rebuilds.
+      if (!src.v) {
+        auto reader = make_unique<EdgeReader>(nullptr, 0);
+        reader_idx[{nullptr, 0, s, i}] = reader.get();
+        _readers.push_back(std::move(reader));
+        _edge_labels.push_back(EdgeBufferStat{
+            std::string("(unwired)"), 0, s->id(), i,
+            /*backlog=*/0, /*capacity=*/0, /*dropped=*/0,
+            /*closed=*/true});
+        continue;
+      }
       // Type-compatibility check: producer's oport_payload_type vs
       // consumer's iport_payload_type. If both declare a type they
       // must match. Untyped (nullptr) on either side is permitted
@@ -588,12 +603,30 @@ PipelineRuntime::launch()
         const std::type_info* pt =
             prod->oport_payload_type(src.p);
         const std::type_info* ct = s->iport_payload_type(i);
-        if (pt && ct && *pt != *ct) {
+        // Compare by mangled name, not type_info identity: a plugin
+        // .dylib defines its own typeid objects, so `*pt != *ct` (value
+        // compare) can misfire across images. The fast pointer check
+        // short-circuits the common in-image case; the name() strcmp is
+        // the cross-image fallback the project's tests already use.
+        if (pt && ct && pt != ct
+            && std::strcmp(pt->name(), ct->name()) != 0) {
           throw std::runtime_error(
               "PipelineRuntime: payload type mismatch on edge "
               + prod->id() + "[" + std::to_string(src.p) + "] -> "
               + s->id() + "[" + std::to_string(i) + "]: producer "
               + pt->name() + " vs consumer " + ct->name());
+        }
+        // Deeper check: payload TAGS (a finer constraint on top of the
+        // beat type; OR semantics). Untagged on either side is permitted.
+        const std::string_view ptg = prod->oport_payload_tags(src.p);
+        const std::string_view ctg = s->iport_payload_tags(i);
+        if (!port_tags_compatible(ptg, ctg)) {
+          throw std::runtime_error(
+              "PipelineRuntime: payload tag mismatch on edge "
+              + prod->id() + "[" + std::to_string(src.p) + "] -> "
+              + s->id() + "[" + std::to_string(i) + "]: producer tags {"
+              + std::string(ptg) + "} vs consumer tags {"
+              + std::string(ctg) + "}");
         }
       }
       OportBuffer* obuf = oport_idx.at({src.v, src.p});

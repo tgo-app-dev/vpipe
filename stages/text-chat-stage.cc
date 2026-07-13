@@ -1,6 +1,7 @@
 #include "stages/text-chat-stage.h"
 
 #include "common/beat-payload-intf.h"
+#include "common/temp-root.h"
 #include "common/flex-data.h"
 #include "common/media-decode.h"
 #include "common/media-line.h"
@@ -17,6 +18,8 @@
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
+#include "generative-models/shared/mcp/python-sandbox.h"
+#include "generative-models/shared/mcp/shell-tool.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/tokenizer.h"
 #endif
@@ -27,11 +30,16 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <span>
 #include <vector>
+
+#include <cstdlib>   // mkdtemp
+#include <unistd.h>
 
 using namespace std;
 
@@ -176,6 +184,13 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
     }
     _max_new_tokens = static_cast<int>(v);
   }
+  _enable_tools = attr_bool("enable_tools");
+  _enable_python_tool = attr_bool("enable_python_tool");
+  _enable_file_tools = attr_bool("enable_file_tools");
+  _enable_shell_tool = attr_bool("enable_shell_tool");
+  _file_sandbox_dir = attr_str("file_sandbox_dir");
+  _enable_web_tools = attr_bool("enable_web_tools");
+  _web_allow_private = attr_bool("web_allow_private");
 
   // disable_thinking is tri-state (unset = family default), with no flat
   // ConfigKey form, so it's read from the config object directly.
@@ -207,6 +222,7 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // standard decode path, so this is a perf-only switch; default on, set
   // false to force the pdecode loop.
   _mtp_enabled = attr_bool("mtp");
+  _i8_prefill = attr_bool("i8_prefill");
   // Prefix-seed the MTP drafter's KV (decode- vs prefill-throughput tradeoff).
   // Default on for chat; applied to the LM at launch (only when MTP is used).
   _mtp_prefix_seed = attr_bool("mtp_prefix_seed");
@@ -230,7 +246,10 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "model: a models-DB key (registered by model-fetch) or an "
           "HF-style model dir; a DB key wins over a same-named path",
-   .suggest_db = "models"},
+   .suggest_db = "models",
+   // text-chat is a text->text LM: the model must accept text and emit
+   // text (so the browser hides ASR/image/audio-out models).
+   .need_inputs = "text", .need_outputs = "text"},
   {.key = "models_db", .type = ConfigType::String,
    .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
   {.key = "compute_dtype", .type = ConfigType::String,
@@ -243,6 +262,39 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "per-turn generation budget (>= 1)", .def_int = 1024},
   {.key = "disable_thinking", .type = ConfigType::Bool,
    .doc = "override chat-template thinking default", .def_bool = false},
+  {.key = "enable_tools", .type = ConfigType::Bool,
+   .doc = "enable MCP tool calling: advertise the built-in tools "
+          "(get_current_time) and run any <tool_call> the model emits, "
+          "feeding results back for another decode round (ChatML/Qwen "
+          "families only)", .def_bool = false},
+  {.key = "enable_python_tool", .type = ConfigType::Bool,
+   .doc = "add a sandboxed `run_python` tool (seatbelt: no network, "
+          "ephemeral scratch fs, home reads blocked, cpu/time limits). "
+          "Independent opt-in; either tool flag activates the tool loop. "
+          "Executes model-written code -- enable deliberately",
+   .def_bool = false},
+  {.key = "enable_file_tools", .type = ConfigType::Bool,
+   .doc = "add confined read_file / write_file / list_files tools rooted "
+          "at file_sandbox_dir (paths cannot escape the root). Any tool "
+          "flag activates the tool loop", .def_bool = false},
+  {.key = "file_sandbox_dir", .type = ConfigType::String,
+   .doc = "workspace root for the file tools; empty => an ephemeral "
+          "per-stage temp dir created at launch and removed at teardown",
+   .def_str = ""},
+  {.key = "enable_shell_tool", .type = ConfigType::Bool,
+   .doc = "add a sandboxed `run_shell` tool (seatbelt: no network, writes "
+          "confined to the file_sandbox_dir workspace, home reads blocked, "
+          "cpu/time limits). Shares the workspace with the file tools. "
+          "Runs model-written commands -- enable deliberately",
+   .def_bool = false},
+  {.key = "enable_web_tools", .type = ConfigType::Bool,
+   .doc = "add fetch_url / scrape_page tools (http/https GET; SSRF-"
+          "guarded: private/localhost targets refused). Any tool flag "
+          "activates the tool loop", .def_bool = false},
+  {.key = "web_allow_private", .type = ConfigType::Bool,
+   .doc = "allow the web tools to reach private/localhost addresses "
+          "(disables the SSRF guard) -- for trusted local use only",
+   .def_bool = false},
   // Flat sampler knobs; all at SamplerParams defaults -> greedy/argmax.
   {.key = "sampler_temperature", .type = ConfigType::Real,
    .doc = "softmax temperature; <= 0 forces argmax", .def_real = 1.0},
@@ -268,6 +320,12 @@ constexpr ConfigKey kAttrs[] = {
           "cost (token-exact; perf only). Default on (chat is decode-bound); "
           "set false to favor prefill throughput. No effect unless mtp is on.",
    .def_bool = true},
+  {.key = "i8_prefill", .type = ConfigType::Bool,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 prefill GEMMs, ~2x their "
+          "f16 rate on matrix-core GPUs at int8 quality (prefill is NOT "
+          "token-exact with this on; decode untouched; IGNORED without NAX matmul2d -- matrix-core GPU + kernels). Default false; env "
+          "VPIPE_I8_GEMM overrides.",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "user",
@@ -275,13 +333,15 @@ const PortSpec kIports[] = {
           "audio attachments as media-line markers (fs path or "
           "base64), spliced into the prefill via the model's own "
           "vision/audio towers",
-   .type = &typeid(FlexDataPayload), .clock_group = 0},
+   .type = &typeid(FlexDataPayload),
+   .tags = "text", .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "assistant",
    .doc = "FlexData {text,prefill_ms,decode_ms,ctx_pos} per turn "
           "(downstream optional)",
-   .type = &typeid(FlexDataPayload), .clock_group = 0},
+   .type = &typeid(FlexDataPayload),
+   .tags = "text", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "text-chat",
@@ -305,7 +365,57 @@ TextChatStage::spec() const noexcept
   return kSpec;
 }
 
-TextChatStage::~TextChatStage() = default;
+TextChatStage::~TextChatStage()
+{
+  // Remove the ephemeral file-tool workspace we created at launch (a
+  // caller-supplied file_sandbox_dir is left untouched).
+  if (_file_sandbox_ephemeral && !_file_sandbox_root.empty()) {
+    std::error_code ec;
+    std::filesystem::remove_all(_file_sandbox_root, ec);
+  }
+}
+
+void
+TextChatStage::setup_file_sandbox_()
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::path root;
+  if (!_file_sandbox_dir.empty()) {
+    // Caller-supplied workspace: create it if missing, keep it on
+    // teardown.
+    root = _file_sandbox_dir;
+    fs::create_directories(root, ec);
+    if (ec) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): file_sandbox_dir '{}' could not be "
+          "created ({}); file/shell tools disabled",
+          this->id(), _file_sandbox_dir, ec.message()));
+      _enable_file_tools = false;
+      _enable_shell_tool = false;
+      return;
+    }
+    _file_sandbox_ephemeral = false;
+  } else {
+    // Ephemeral per-stage workspace under the app temp root (CWD-local).
+    const fs::path base = vpipe::temp_root();
+    std::string tmpl = (base / "vpipe-chat-ws-XXXXXX").string();
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (!::mkdtemp(buf.data())) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): could not create an ephemeral file "
+          "workspace; file/shell tools disabled", this->id()));
+      _enable_file_tools = false;
+      _enable_shell_tool = false;
+      return;
+    }
+    root = buf.data();
+    _file_sandbox_ephemeral = true;
+  }
+  _file_sandbox = std::make_shared<FileSandbox>(root);
+  _file_sandbox_root = _file_sandbox->root().string();
+}
 
 Job
 TextChatStage::initialize(RuntimeContext& ctx)
@@ -347,6 +457,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // Apply the MTP prefix-seed preference before any prefill (no-op unless the
   // model carries a metal MTP head). Chat is decode-bound, so default on.
   if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
+  // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op on
+  // backends without the route; env VPIPE_I8_GEMM overrides either way.
+  if (_i8_prefill) { _lm->set_i8_prefill(true); }
   // Cache whichever media-encoder towers this checkpoint carries; the
   // media-line turn path (attachment markers in the user line) uses
   // them to splice image/audio embeddings into the prefill. All null
@@ -380,6 +493,68 @@ TextChatStage::initialize(RuntimeContext& ctx)
         "architecture '{}'; falling back to the LM's default (which "
         "is also null in this case)",
         this->id(), _lm->config().architecture));
+  }
+  // MCP tools: seed the registry when any tool is enabled and the model's
+  // chat template renders the tool-calling scaffold (ChatML/Qwen
+  // families). A template without tool support (Llama-3, Gemma-4) warns
+  // and leaves tools off so the plain chat path is unchanged. The runtime
+  // tool gate in process() is `!_tools.empty()`, so both flags feed one
+  // registry.
+  if (_enable_tools || _enable_python_tool || _enable_file_tools
+      || _enable_shell_tool || _enable_web_tools) {
+    if (_chat_tpl && _chat_tpl->supports_tools()) {
+      if (_enable_tools) {
+        _tools = make_builtin_tool_registry();   // get_current_time
+      }
+      if (_enable_python_tool) {
+        _tools.add(make_python_tool());           // sandboxed run_python
+      }
+      // The file tools and the shell tool share one workspace, so set it
+      // up once when either is on, then register each enabled surface.
+      if (_enable_file_tools || _enable_shell_tool) {
+        setup_file_sandbox_();
+      }
+      if (_enable_file_tools && _file_sandbox) {   // read/write/list_files
+        add_file_tools(_tools, _file_sandbox);
+      }
+      if (_enable_shell_tool && _file_sandbox) {   // sandboxed run_shell
+        ShellToolOptions so;
+        so.workspace = _file_sandbox->root();
+        if (session()) {
+          for (const auto& w : session()->fs_whitelist()) {
+            so.extra_writable.push_back(w);
+          }
+        }
+        _tools.add(make_shell_tool(so));
+      }
+      if (_enable_web_tools) {                     // fetch_url / scrape_page
+        UrlFetchOptions wo;
+        wo.allow_private = _web_allow_private;
+        _tools.add(make_fetch_url_tool(wo));
+        _tools.add(make_scrape_page_tool(wo));
+      }
+      session()->info(fmt(
+          "TextChatStage('{}'): MCP tools enabled ({} tool(s){}{}{}{})",
+          this->id(), static_cast<int>(_tools.size()),
+          _enable_python_tool ? ", incl. sandboxed python" : "",
+          _enable_shell_tool ? ", incl. sandboxed shell" : "",
+          (_enable_file_tools || _enable_shell_tool) && _file_sandbox
+              ? fmt(", workspace {}", _file_sandbox_root)()
+              : std::string(),
+          _enable_web_tools ? ", incl. web fetch" : ""));
+    } else {
+      session()->warn(fmt(
+          "TextChatStage('{}'): a tool flag is set but the model's chat "
+          "template ('{}') has no tool-calling support; tools disabled",
+          this->id(),
+          _chat_tpl ? std::string(_chat_tpl->family_name())
+                    : std::string("<none>")));
+      _enable_tools = false;
+      _enable_python_tool = false;
+      _enable_file_tools = false;
+      _enable_shell_tool = false;
+      _enable_web_tools = false;
+    }
   }
   _seeded = false;
   session()->info(fmt(
@@ -601,13 +776,22 @@ TextChatStage::process(RuntimeContext& ctx)
     chunks.push_back(std::move(c));
   }
 
+  // MCP tools are advertised in a leading system turn (below). On the
+  // FIRST turn that system turn carries the session-start token (Gemma's
+  // <bos>), so the user turn that follows must NOT emit it again -- pass
+  // is_first_turn=false to the user render when a tools system turn will
+  // precede it. A no-op for ChatML/Qwen (no session-start token).
+  const bool tools_active = !_tools.empty() && tpl->supports_tools();
+  const bool tools_seed   = tools_active && !_seeded;
+  const bool user_is_first = !_seeded && !tools_seed;
+
   vector<int32_t> ids;
   bool have_media = !items.empty();
   if (have_media
       && !tpl->render_user_turn_media(
              span<const genai::MediaChunk>(chunks.data(),
                                            chunks.size()),
-             /*is_first_turn=*/!_seeded, &ids)) {
+             /*is_first_turn=*/user_is_first, &ids)) {
     session()->warn(fmt(
         "TextChatStage('{}'): chat template '{}' cannot render the "
         "mixed media turn; dropping {} attachment(s)",
@@ -631,13 +815,296 @@ TextChatStage::process(RuntimeContext& ctx)
           build_turn_payload("", 0, 0, current_ctx_pos()));
       co_return;
     }
-    tpl->render_user_turn(text_only, /*is_first_turn=*/!_seeded, &ids);
+    tpl->render_user_turn(text_only, /*is_first_turn=*/user_is_first, &ids);
+  }
+
+  // ---- MCP tools: advertise them in a leading system turn ----------
+  // When tools are enabled (and the family renders the tool scaffold),
+  // the very first prompt in a fresh context is prefixed with a system
+  // turn declaring the callable tools. Subsequent turns skip it -- the
+  // declaration already lives in the K/V cache. After decode we scan
+  // the reply for tool-call blocks, run them, and feed the results
+  // back for another round (see the tool loop below).
+  if (tools_seed) {
+    vector<int32_t> sys;
+    if (tpl->render_tools_system_turn(_tools.tools_json(),
+                                      /*is_first_turn=*/true, &sys)
+        && !sys.empty()) {
+      ids.insert(ids.begin(), sys.begin(), sys.end());
+    }
   }
 
   using clock = std::chrono::steady_clock;
-  const auto t_prefill_start = clock::now();
+
+  // Termination reason for a decode round. Surfaced after the round to
+  // explain non-natural stops (budget, decode error, page exhaustion,
+  // pipeline stop) as a single warn line.
+  enum class StopReason {
+    StopToken,        // model emitted EOS/EOT -- the normal path
+    MaxNewTokens,     // hit the per-turn token budget
+    DecodeError,      // step_pipelined / materialize_lazy returned -1
+    PipelineStopped,  // ctx.stop_requested() while decoding
+  };
+  // Accumulators across the (possibly several) decode rounds a single
+  // user beat runs: one base round plus one per tool-call round.
+  double     prefill_s_total    = 0.0;
+  double     decode_s_total     = 0.0;
+  int        prefill_n_total    = 0;
+  int        decode_calls_total = 0;
+  StopReason reason             = StopReason::StopToken;
+
+  // Stop check + assistant-turn close token come from the same
+  // ChatTemplate. The template encapsulates the family-specific
+  // stop set (Llama-3: eot/eom/end_of_text; ChatML: im_end/endoftext)
+  // so this stage stays family-agnostic.
+  auto is_stop =
+      [tpl](int32_t id) {
+        return tpl->is_stop_token(id);
+      };
+  const int32_t assistant_close = tpl->assistant_close_token_id();
+
+  // The token the last decode round stopped on (or the last emitted
+  // token on a budget cutoff). Lets the tool loop tell a turn-CLOSING
+  // stop (<end_of_turn>/eos) from a turn-CONTINUING one (Gemma's
+  // <|tool_response>) so the assistant-close commit and the tool-results
+  // injection stay in the right order.
+  int32_t last_stop_token = -1;
+
+  // Decode one assistant turn. `next` is the token prefill predicted for
+  // this round (its logits are still in last_logits_host() when a
+  // sampled path re-samples below); `prompt_ids` are the round's full
+  // prompt ids (sampler priming + pdecode). Streams the reply to the UI,
+  // commits the assistant-close token to the K/V cache, accumulates
+  // decode timing/token counts, sets `reason`, and returns the decoded
+  // text. Called once for the user turn, then once per tool-call round.
+  auto decode_turn =
+      [&](int32_t next, std::span<const int32_t> prompt_ids)
+          -> std::string {
+    const auto t_decode_start = clock::now();
+    // Stream the assistant's tokens to the user as they are produced via
+    // the UI delegate's live text stream (stdout by default; the web-ui
+    // console under the web delegate). We also accumulate the full text
+    // so the per-turn FlexData beat on out-port 0 carries it.
+    auto out_stream = session()->open_text_stream();
+    std::string assistant_text;
+    auto emit_chunk =
+        [&assistant_text, &out_stream](const std::string& chunk) {
+          if (chunk.empty()) {
+            return;
+          }
+          assistant_text += chunk;
+          out_stream->write(chunk);
+        };
+
+    auto sd = tok.make_stream_decoder();
+    // Thinking-ON templates (Qwen3/Qwen3-VL) open the reasoning block in
+    // the PROMPT (`<think>\n` in the assistant extras), so its start
+    // token never streams; emit the unified thinking-start marker
+    // ourselves so front ends can fold the reasoning. The CLOSE token is
+    // generated by the model and the detokenizer rewrites it to
+    // media_line::kThinkEnd (as it does both of Gemma's channel tokens).
+    if (tpl->assistant_prompt_opens_thinking()) {
+      emit_chunk(string(media_line::kThinkStart));
+    }
+    // Per-turn sampler — fresh seen-token set each turn so the
+    // repetition / presence penalty rolls over cleanly between
+    // conversations. Prime with the prompt ids so the very first
+    // sampled token already penalises tokens the user just typed.
+    genai::Sampler sampler(_sampler_params);
+    sampler.prime(prompt_ids);
+    const bool sampled_path = !sampler.is_argmax();
+    // For sampled decode, re-sample from the prefill's logits (the
+    // forward pass that just ran computed them; last_logits() returns
+    // them on the host). The prefill stashed argmax as the next id;
+    // we replace that with our sampled choice. For argmax decode we
+    // keep `next` as the prefill's argmax.
+    if (sampled_path && !is_stop(next)) {
+      const auto& pre = _lm->last_logits_host();
+      if (!pre.empty()) {
+        next = sampler.sample(
+            std::span<const float>(pre.data(), pre.size()));
+      }
+    }
+    if (next >= 0 && !is_stop(next)) {
+      emit_chunk(tok.step(sd, next));
+      sampler.prime(std::span<const int32_t>(&next, 1));
+    }
+    reason = StopReason::StopToken;
+    if (_max_new_tokens <= 1 && !is_stop(next)) {
+      // Degenerate budget: prefill produced one token and we're done.
+      reason = StopReason::MaxNewTokens;
+    }
+    int decode_calls = 0;
+    // Metal/no-MLX MTP fast path: the bundled MTP speculative head
+    // (mtp.safetensors, present on Qwen3.5-OptiQ) drafts ahead so the verifier
+    // accepts multiple tokens per forward -- token-exact vs the pdecode loop
+    // (greedy) or decode_pipelined (sampling, the verify samples each position).
+    // The prefill's first token was already streamed above (and primes the
+    // pipeline); on_tokens drops MTP's echo of it (out_ids[0] == next) and emits
+    // the rest, stopping as soon as a stop token is seen. Greedy OR penalty-free
+    // sampling -- the verify applies no repetition/presence penalty, so a
+    // penalised sampler stays on the loops below (which apply it).
+    const bool mtp_no_penalty =
+        (_sampler_params.repetition_penalty == 1.0f
+         && _sampler_params.presence_penalty == 0.0f);
+    if (next >= 0 && !is_stop(next) && _mtp_enabled && _lm->mtp_available()
+        && (!sampled_path || mtp_no_penalty)) {
+      bool first_echo = true;
+      bool stopped = false;
+      int  produced = 0;
+      auto on_toks =
+          [&](std::span<const int32_t> toks) -> bool {
+            for (int32_t id : toks) {
+              if (first_echo) { first_echo = false; continue; }
+              emit_chunk(tok.step(sd, id));
+              ++decode_calls;
+            }
+            return !ctx.stop_requested();
+          };
+      _lm->mtp_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
+                        is_stop, on_toks, &produced, &stopped);
+      if (stopped) {
+        reason = StopReason::StopToken;
+      } else if (ctx.stop_requested()) {
+        reason = StopReason::PipelineStopped;
+      } else {
+        reason = StopReason::MaxNewTokens;
+      }
+    } else {
+    // Metal/no-MLX: GPU-resident pipelined decode -- the token chain stays
+    // on the GPU (in-stream embed + on-device argmax/sampling, no host logit
+    // pull), and committing the NEXT token's forward BEFORE detokenize+emit
+    // overlaps the GPU with the host's per-token work. Stop-token / abort /
+    // budget semantics are preserved: a step (which appends its input
+    // token's KV) is committed only after that token is confirmed not-stop.
+    // Falls back to the synchronous next_token loop if the backend can't
+    // pipeline (e.g. a Llama metal model without the primitive).
+    const bool pipelined = _lm->pdecode_begin(
+        _chat_ctx, next, prompt_ids,
+        _sampler_params, _max_new_tokens);
+    // Run-ahead: when the backend rolls back speculative KV (pdecode_end), keep
+    // a SECOND forward in flight so the GPU never idles on the CPU command-
+    // buffer encode (it runs the next forward while the host detokenizes AND
+    // while the CPU encodes the one after). A stop token's speculative forward
+    // is rolled back by pdecode_end. Paged backends without rollback stay
+    // strictly one-in-flight (commit only after not-stop).
+    const bool runahead = pipelined && _lm->pdecode_supports_runahead();
+    if (pipelined) {
+      // Kick off the forward for token 1 (input = the first token `next`,
+      // already confirmed not-stop above) so the GPU is busy immediately.
+      bool committed = (next >= 0 && !is_stop(next) && !ctx.stop_requested())
+          ? _lm->pdecode_commit(_chat_ctx) : false;
+      // Speculative second forward (input = token 1, not yet read) -> two in
+      // flight. Discarded by pdecode_end's rollback if token 1 is a stop.
+      if (runahead && committed && _max_new_tokens > 1
+          && !ctx.stop_requested()) {
+        _lm->pdecode_commit(_chat_ctx);
+      }
+      for (int i = 1; i < _max_new_tokens; ++i) {
+        if (ctx.stop_requested()) { reason = StopReason::PipelineStopped; break; }
+        if (is_stop(next)) { reason = StopReason::StopToken; break; }
+        if (!committed) { reason = StopReason::DecodeError; break; }
+        next = _lm->pdecode_next(_chat_ctx);
+        if (next < 0) { reason = StopReason::DecodeError; break; }
+        ++decode_calls;
+        // Commit token i+1's forward (input = `next`) BEFORE emit so it runs
+        // on the GPU while the host detokenizes + streams token i. Only when
+        // `next` is not a stop token (else its KV must not be appended).
+        const bool cont = (i + 1 < _max_new_tokens) && !is_stop(next)
+            && !ctx.stop_requested();
+        committed = cont ? _lm->pdecode_commit(_chat_ctx) : false;
+        if (!is_stop(next)) {
+          emit_chunk(tok.step(sd, next));
+        } else {
+          reason = StopReason::StopToken;
+        }
+        if (i + 1 == _max_new_tokens && !is_stop(next)) {
+          reason = StopReason::MaxNewTokens;
+        }
+      }
+      _lm->pdecode_end(_chat_ctx);
+    } else
+    // Fallback: synchronous next_token(forced) advances the K/V and returns
+    // the position's argmax; sampled decode draws from the host logits.
+    for (int i = 1; i < _max_new_tokens; ++i) {
+      if (ctx.stop_requested()) {
+        reason = StopReason::PipelineStopped;
+        break;
+      }
+      if (is_stop(next)) {
+        reason = StopReason::StopToken;
+        break;
+      }
+      const int32_t am = _lm->next_token(_chat_ctx, next);
+      if (am < 0) {
+        reason = StopReason::DecodeError;
+        break;
+      }
+      ++decode_calls;
+      if (sampled_path) {
+        const auto& lh = _lm->last_logits_host();
+        next = lh.empty()
+            ? am
+            : sampler.sample(
+                  std::span<const float>(lh.data(), lh.size()));
+      } else {
+        next = am;
+      }
+      if (next < 0) {
+        reason = StopReason::DecodeError;
+        break;
+      }
+      if (!is_stop(next)) {
+        emit_chunk(tok.step(sd, next));
+      } else {
+        reason = StopReason::StopToken;
+      }
+      if (i + 1 == _max_new_tokens && !is_stop(next)) {
+        reason = StopReason::MaxNewTokens;
+      }
+    }
+    }
+    const auto t_decode_end = clock::now();
+    // Finalize the streamed reply (terminates the line on stdio / closes
+    // the console entry in the web UI). Then commit the assistant's
+    // end-of-turn marker to the K/V cache so the *next* turn sees a
+    // clean turn boundary. Without this, the next prefill would tack the
+    // new header straight onto the assistant's last content token and
+    // confuse the model on long conversations. The EOT commit is
+    // bookkeeping, so it isn't included in the decode tok/s figure.
+    out_stream->end();
+    // Commit the assistant-close token only for a genuine turn close. A
+    // turn-CONTINUING stop (Gemma's <|tool_response>, emitted after a
+    // tool call to request the result) leaves the turn OPEN so the
+    // tool-results turn resumes it in place; committing <end_of_turn>
+    // here would break the single-turn tool exchange.
+    last_stop_token = next;
+    if (assistant_close >= 0 && !tpl->stop_token_continues_turn(next)) {
+      (void)_lm->next_token(_chat_ctx, assistant_close);
+    }
+    decode_calls_total += decode_calls;
+    decode_s_total += std::chrono::duration<double>(
+        t_decode_end - t_decode_start).count();
+    return assistant_text;
+  };
+
+  // Plain-text prefill of a round's prompt ids, timed into the
+  // accumulators. Returns the predicted next token (-1 on failure).
+  // Round 1 with media uses prefill_multimodal_metal inline instead.
+  auto prefill_plain =
+      [&](std::span<const int32_t> pids) -> int32_t {
+    const auto t0 = clock::now();
+    const int32_t n = _lm->prefill(_chat_ctx, pids);
+    const auto t1 = clock::now();
+    prefill_s_total += std::chrono::duration<double>(t1 - t0).count();
+    prefill_n_total += static_cast<int>(pids.size());
+    return n;
+  };
+
+  // ---- round 1: prefill (media or plain) + decode ------------------
   int32_t next;
   if (have_media) {
+    const auto t_prefill_start = clock::now();
     // ids -> TokenRefs: each pad id takes the next row of its item
     // (items consumed in chunk order per modality); everything else
     // is a plain text id. One (grid_h, grid_w) per IMAGE item feeds
@@ -685,10 +1152,13 @@ TextChatStage::process(RuntimeContext& ctx)
     next = _lm->prefill_multimodal_metal(
         _chat_ctx, span<const genai::TokenRef>(refs),
         span<const pair<int, int>>(image_grids));
+    const auto t_prefill_end = clock::now();
+    prefill_s_total += std::chrono::duration<double>(
+        t_prefill_end - t_prefill_start).count();
+    prefill_n_total += static_cast<int>(ids.size());
   } else {
-    next = _lm->prefill(_chat_ctx, ids);
+    next = prefill_plain(ids);
   }
-  const auto t_prefill_end = clock::now();
   if (next < 0) {
     session()->warn(fmt(
         "TextChatStage('{}'): prefill failed (returned -1) after "
@@ -706,229 +1176,137 @@ TextChatStage::process(RuntimeContext& ctx)
     co_return;
   }
   _seeded = true;
+  std::string assistant_text = decode_turn(next, ids);
 
-  // Stop check + assistant-turn close token come from the same
-  // ChatTemplate. The template encapsulates the family-specific
-  // stop set (Llama-3: eot/eom/end_of_text; ChatML: im_end/endoftext)
-  // so this stage stays family-agnostic.
-  auto is_stop =
-      [tpl](int32_t id) {
-        return tpl->is_stop_token(id);
-      };
-  const int32_t assistant_close = tpl->assistant_close_token_id();
-
-  // Stream the assistant's tokens to the user as they are produced via
-  // the UI delegate's live text stream (stdout by default; the web-ui
-  // console under the web delegate). We also accumulate the full text
-  // so the per-turn FlexData beat on out-port 0 carries it.
-  auto out_stream = session()->open_text_stream();
-  std::string assistant_text;
-  auto emit_chunk =
-      [&assistant_text, &out_stream](const std::string& chunk) {
-        if (chunk.empty()) {
-          return;
+  // ---- tool-call rounds (MCP) --------------------------------------
+  // Scan the reply for <tool_call> blocks; run each tool locally, feed
+  // the results back as a tool-response turn, and decode again. Repeat
+  // until the model answers without calling a tool, or we hit the round
+  // cap (a guard against a model that loops on tool calls). The FlexData
+  // `text` beat carries the FINAL round's answer; every round streams.
+  if (tools_active) {
+    constexpr int kMaxToolRounds = 8;
+    // Triage helpers: count the family's tool-call open markers, and cap
+    // a string for logging (tool code / results can be large). The marker
+    // is family-specific ("<tool_call>" for ChatML/Qwen, "<|tool_call>"
+    // for Gemma-4) so it comes from the template.
+    const string_view call_marker = tpl->tool_call_open_marker();
+    auto count_markers = [&call_marker](const string& s) {
+      int n = 0;
+      for (size_t p = s.find(call_marker); p != string::npos;
+           p = s.find(call_marker, p + call_marker.size())) {
+        ++n;
+      }
+      return n;
+    };
+    auto excerpt = [](const string& s, size_t cap) {
+      return s.size() <= cap ? s
+                             : s.substr(0, cap) + "...[+"
+                                   + std::to_string(s.size() - cap) + "B]";
+    };
+    int tool_round = 0;
+    while (true) {
+      const int markers = count_markers(assistant_text);
+      auto calls = tpl->parse_tool_calls(assistant_text);
+      // One trace per scan so a tool turn is always followed in the debug
+      // log -- both when it fires and when it silently produces nothing.
+      session()->log_debug(fmt(
+          "TextChatStage('{}'): tool scan (round {}): {} tool-call "
+          "marker(s), {} parsed call(s), reply {} chars",
+          this->id(), tool_round, markers,
+          static_cast<int>(calls.size()),
+          static_cast<int>(assistant_text.size())));
+      if (calls.empty()) {
+        if (markers > 0) {
+          // The model TRIED to call a tool but nothing parsed -- almost
+          // always a malformed call (e.g. unescaped quotes inside a
+          // `code` argument). This is exactly why such a turn "ends" with
+          // no tool result: the raw block is returned verbatim. Make it
+          // visible (warn) and dump the offending payload for triage.
+          session()->warn(fmt(
+              "TextChatStage('{}'): the model emitted {} tool-call "
+              "block(s) that did not parse; no tool ran and the raw block "
+              "is returned. Enable debug logging to see the payload (a "
+              "common cause is malformed arguments).",
+              this->id(), markers));
+          const size_t a = assistant_text.find(call_marker);
+          const string blk = (a == string::npos)
+              ? assistant_text : assistant_text.substr(a);
+          session()->log_debug(fmt(
+              "TextChatStage('{}'): unparsed tool-call payload: {}",
+              this->id(), excerpt(blk, 2000)));
         }
-        assistant_text += chunk;
-        out_stream->write(chunk);
-      };
+        break;
+      }
+      if (++tool_round > kMaxToolRounds) {
+        session()->warn(fmt(
+            "TextChatStage('{}'): reached the tool-call round cap ({}) "
+            "in one turn; not running further tool calls.",
+            this->id(), kMaxToolRounds));
+        break;
+      }
+      vector<string> results;
+      vector<string> tool_names;
+      results.reserve(calls.size());
+      tool_names.reserve(calls.size());
+      for (const auto& c : calls) {
+        session()->info(fmt(
+            "TextChatStage('{}'): tool call '{}' args {}",
+            this->id(), c.name, excerpt(c.arguments_json, 512)));
+        string res = _tools.dispatch(c);
+        session()->log_debug(fmt(
+            "TextChatStage('{}'): tool '{}' returned {} chars: {}",
+            this->id(), c.name, static_cast<int>(res.size()),
+            excerpt(res, 1000)));
+        results.push_back(std::move(res));
+        tool_names.push_back(c.name);
+      }
+      vector<int32_t> tr_ids;
+      if (!tpl->render_tool_results_turn(
+              span<const string>(tool_names.data(), tool_names.size()),
+              span<const string>(results.data(), results.size()),
+              &tr_ids)
+          || tr_ids.empty()) {
+        session()->log_debug(fmt(
+            "TextChatStage('{}'): tool-results turn rendered no tokens "
+            "(template '{}'); ending the tool loop",
+            this->id(), tpl->family_name()));
+        break;
+      }
+      const int32_t tn = prefill_plain(tr_ids);
+      if (tn < 0) {
+        session()->warn(fmt(
+            "TextChatStage('{}'): prefill of the tool-response turn "
+            "failed (returned -1) at ctx_pos={}; assistant turn "
+            "truncated.", this->id(), _chat_ctx.seq_len()));
+        reason = StopReason::DecodeError;
+        break;
+      }
+      session()->log_debug(fmt(
+          "TextChatStage('{}'): fed {} tool result(s) back as {} tokens; "
+          "decoding round {}", this->id(),
+          static_cast<int>(results.size()),
+          static_cast<int>(tr_ids.size()), tool_round));
+      assistant_text = decode_turn(tn, tr_ids);
+    }
+  }
 
-  auto sd = tok.make_stream_decoder();
-  // Thinking-ON templates (Qwen3/Qwen3-VL) open the reasoning block in
-  // the PROMPT (`<think>\n` in the assistant extras), so its start
-  // token never streams; emit the unified thinking-start marker
-  // ourselves so front ends can fold the reasoning. The CLOSE token is
-  // generated by the model and the detokenizer rewrites it to
-  // media_line::kThinkEnd (as it does both of Gemma's channel tokens).
-  if (tpl->assistant_prompt_opens_thinking()) {
-    emit_chunk(string(media_line::kThinkStart));
-  }
-  // Per-turn sampler — fresh seen-token set each turn so the
-  // repetition / presence penalty rolls over cleanly between
-  // conversations. Prime with the prompt ids so the very first
-  // sampled token already penalises tokens the user just typed.
-  genai::Sampler sampler(_sampler_params);
-  sampler.prime(std::span<const int32_t>(ids.data(), ids.size()));
-  const bool sampled_path = !sampler.is_argmax();
-  // For sampled decode, re-sample from the prefill's logits (the
-  // forward pass that just ran computed them; last_logits() returns
-  // them on the host). The prefill stashed argmax as the next id;
-  // we replace that with our sampled choice. For argmax decode we
-  // keep `next` as the prefill's argmax.
-  if (sampled_path && !is_stop(next)) {
-    const auto& pre = _lm->last_logits_host();
-    if (!pre.empty()) {
-      next = sampler.sample(
-          std::span<const float>(pre.data(), pre.size()));
-    }
-  }
-  if (next >= 0 && !is_stop(next)) {
-    emit_chunk(tok.step(sd, next));
-    sampler.prime(std::span<const int32_t>(&next, 1));
-  }
-  // Termination reason for this turn. Used after the decode loop to
-  // surface non-natural stops (max budget, decode error, page
-  // exhaustion, pipeline stop) to the user as a single warn line.
-  enum class StopReason {
-    StopToken,        // model emitted EOS/EOT -- the normal path
-    MaxNewTokens,     // hit the per-turn token budget
-    DecodeError,      // step_pipelined / materialize_lazy returned -1
-    PipelineStopped,  // ctx.stop_requested() while decoding
-  };
-  StopReason reason = StopReason::StopToken;
-  if (_max_new_tokens <= 1 && !is_stop(next)) {
-    // Degenerate budget: prefill produced one token and we're done.
-    reason = StopReason::MaxNewTokens;
-  }
-  int decode_calls = 0;
-  // Metal/no-MLX MTP fast path: the bundled MTP speculative head
-  // (mtp.safetensors, present on Qwen3.5-OptiQ) drafts ahead so the verifier
-  // accepts multiple tokens per forward -- token-exact vs the pdecode loop
-  // (greedy) or decode_pipelined (sampling, the verify samples each position).
-  // The prefill's first token was already streamed above (and primes the
-  // pipeline); on_tokens drops MTP's echo of it (out_ids[0] == next) and emits
-  // the rest, stopping as soon as a stop token is seen. Greedy OR penalty-free
-  // sampling -- the verify applies no repetition/presence penalty, so a
-  // penalised sampler stays on the loops below (which apply it).
-  const bool mtp_no_penalty =
-      (_sampler_params.repetition_penalty == 1.0f
-       && _sampler_params.presence_penalty == 0.0f);
-  if (next >= 0 && !is_stop(next) && _mtp_enabled && _lm->mtp_available()
-      && (!sampled_path || mtp_no_penalty)) {
-    bool first_echo = true;
-    bool stopped = false;
-    int  produced = 0;
-    auto on_toks =
-        [&](std::span<const int32_t> toks) -> bool {
-          for (int32_t id : toks) {
-            if (first_echo) { first_echo = false; continue; }
-            emit_chunk(tok.step(sd, id));
-            ++decode_calls;
-          }
-          return !ctx.stop_requested();
-        };
-    _lm->mtp_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
-                      is_stop, on_toks, &produced, &stopped);
-    if (stopped) {
-      reason = StopReason::StopToken;
-    } else if (ctx.stop_requested()) {
-      reason = StopReason::PipelineStopped;
-    } else {
-      reason = StopReason::MaxNewTokens;
-    }
-  } else {
-  // Metal/no-MLX: GPU-resident pipelined decode -- the token chain stays
-  // on the GPU (in-stream embed + on-device argmax/sampling, no host logit
-  // pull), and committing the NEXT token's forward BEFORE detokenize+emit
-  // overlaps the GPU with the host's per-token work. Stop-token / abort /
-  // budget semantics are preserved: a step (which appends its input
-  // token's KV) is committed only after that token is confirmed not-stop.
-  // Falls back to the synchronous next_token loop if the backend can't
-  // pipeline (e.g. a Llama metal model without the primitive).
-  const bool pipelined = _lm->pdecode_begin(
-      _chat_ctx, next,
-      std::span<const int32_t>(ids.data(), ids.size()),
-      _sampler_params, _max_new_tokens);
-  // Run-ahead: when the backend rolls back speculative KV (pdecode_end), keep
-  // a SECOND forward in flight so the GPU never idles on the CPU command-
-  // buffer encode (it runs the next forward while the host detokenizes AND
-  // while the CPU encodes the one after). A stop token's speculative forward
-  // is rolled back by pdecode_end. Paged backends without rollback stay
-  // strictly one-in-flight (commit only after not-stop).
-  const bool runahead = pipelined && _lm->pdecode_supports_runahead();
-  if (pipelined) {
-    // Kick off the forward for token 1 (input = the first token `next`,
-    // already confirmed not-stop above) so the GPU is busy immediately.
-    bool committed = (next >= 0 && !is_stop(next) && !ctx.stop_requested())
-        ? _lm->pdecode_commit(_chat_ctx) : false;
-    // Speculative second forward (input = token 1, not yet read) -> two in
-    // flight. Discarded by pdecode_end's rollback if token 1 is a stop.
-    if (runahead && committed && _max_new_tokens > 1
-        && !ctx.stop_requested()) {
-      _lm->pdecode_commit(_chat_ctx);
-    }
-    for (int i = 1; i < _max_new_tokens; ++i) {
-      if (ctx.stop_requested()) { reason = StopReason::PipelineStopped; break; }
-      if (is_stop(next)) { reason = StopReason::StopToken; break; }
-      if (!committed) { reason = StopReason::DecodeError; break; }
-      next = _lm->pdecode_next(_chat_ctx);
-      if (next < 0) { reason = StopReason::DecodeError; break; }
-      ++decode_calls;
-      // Commit token i+1's forward (input = `next`) BEFORE emit so it runs
-      // on the GPU while the host detokenizes + streams token i. Only when
-      // `next` is not a stop token (else its KV must not be appended).
-      const bool cont = (i + 1 < _max_new_tokens) && !is_stop(next)
-          && !ctx.stop_requested();
-      committed = cont ? _lm->pdecode_commit(_chat_ctx) : false;
-      if (!is_stop(next)) {
-        emit_chunk(tok.step(sd, next));
-      } else {
-        reason = StopReason::StopToken;
-      }
-      if (i + 1 == _max_new_tokens && !is_stop(next)) {
-        reason = StopReason::MaxNewTokens;
-      }
-    }
-    _lm->pdecode_end(_chat_ctx);
-  } else
-  // Fallback: synchronous next_token(forced) advances the K/V and returns
-  // the position's argmax; sampled decode draws from the host logits.
-  for (int i = 1; i < _max_new_tokens; ++i) {
-    if (ctx.stop_requested()) {
-      reason = StopReason::PipelineStopped;
-      break;
-    }
-    if (is_stop(next)) {
-      reason = StopReason::StopToken;
-      break;
-    }
-    const int32_t am = _lm->next_token(_chat_ctx, next);
-    if (am < 0) {
-      reason = StopReason::DecodeError;
-      break;
-    }
-    ++decode_calls;
-    if (sampled_path) {
-      const auto& lh = _lm->last_logits_host();
-      next = lh.empty()
-          ? am
-          : sampler.sample(
-                std::span<const float>(lh.data(), lh.size()));
-    } else {
-      next = am;
-    }
-    if (next < 0) {
-      reason = StopReason::DecodeError;
-      break;
-    }
-    if (!is_stop(next)) {
-      emit_chunk(tok.step(sd, next));
-    } else {
-      reason = StopReason::StopToken;
-    }
-    if (i + 1 == _max_new_tokens && !is_stop(next)) {
-      reason = StopReason::MaxNewTokens;
-    }
-  }
-  }
-  const auto t_decode_end = clock::now();
-  // Finalize the streamed reply (terminates the line on stdio / closes
-  // the console entry in the web UI). Then commit the assistant's
-  // end-of-turn marker to the K/V cache so the *next* user turn sees a
-  // clean turn boundary. Without this, the next prefill would tack the
-  // new user header straight onto the assistant's last content token
-  // and confuse the model on long conversations. The EOT commit is
-  // bookkeeping, so it isn't included in the decode tok/s figure
-  // logged below.
-  out_stream->end();
-  if (assistant_close >= 0) {
+  // If the tool loop exited with the assistant turn still OPEN in the
+  // K/V cache -- the last decode stopped on a turn-continuing token
+  // (Gemma's <|tool_response>) but we stopped feeding tools (no
+  // parseable call, the round cap, or a prefill error) -- close it now
+  // so the next user turn starts on a clean boundary. A no-op for
+  // families whose stop tokens all close the turn, and for turns that
+  // ended on a genuine stop (assistant_close already committed).
+  if (assistant_close >= 0
+      && tpl->stop_token_continues_turn(last_stop_token)) {
     (void)_lm->next_token(_chat_ctx, assistant_close);
   }
 
-  const double prefill_s = std::chrono::duration<double>(
-      t_prefill_end - t_prefill_start).count();
-  const double decode_s = std::chrono::duration<double>(
-      t_decode_end - t_prefill_end).count();
-  const int prefill_n = static_cast<int>(ids.size());
+  const double prefill_s    = prefill_s_total;
+  const double decode_s     = decode_s_total;
+  const int    prefill_n    = prefill_n_total;
+  const int    decode_calls = decode_calls_total;
   const double prefill_tps =
       prefill_s > 0.0 ? prefill_n / prefill_s : 0.0;
   const double decode_tps =

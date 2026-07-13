@@ -20,7 +20,7 @@ extern "C" {
 namespace vpipe {
 
 // Stream contract on each video / audio EdgeBuffer between a
-// VideoFileDecoderStage and a VideoFileEncoderStage:
+// LoadVideoStage and a SaveVideoStage:
 //
 //   1. The producer writes exactly one StreamParams header Beat
 //      (VideoStreamParams on a video port, AudioStreamParams on an

@@ -18,12 +18,13 @@
 
 namespace vpipe {
 
-// Source stage: 0 inputs, 0 outputs. One-shot LM throughput benchmark.
-// Loads one language model (a models-DB key or a directory path) and
-// times prefill + decode at several context lengths, recording GPU
-// temperature / frequency / utilization / power during each test, then
-// logs a Markdown report through session()->info(). Pure read-only;
-// emits no Beats.
+// 1 optional trigger iport (any beat) + 1 FlexData "summary" oport. One-
+// shot LM throughput benchmark. Loads one language model (a models-DB key
+// or a directory path) and times prefill + decode at several context
+// lengths, recording GPU temperature / frequency / utilization / power
+// during each test, then logs a Markdown report through session()->info()
+// and emits it as the summary Beat's `text` field (feed a save-text, or
+// use the beat to trigger the next stage in a recipe).
 //
 // Three benchmarks, each run for every configured context length:
 //   1. Full prefill   -- time a whole N-token prompt prefill.
@@ -79,7 +80,11 @@ public:
   // was produced); logs + returns false on error. `stop()` is polled
   // cooperatively between tests, between decode tokens, and during the
   // cooldown sleep -- when it goes true the run stops at the next check and
-  // a PARTIAL report (the tests completed so far) is emitted.
+  // a PARTIAL report (the tests completed so far) is emitted. `summary` is
+  // filled with the FlexData work-summary (peak tok/s + the Markdown
+  // report in its `text` field) on success; left untouched on error.
+  bool benchmark_once(const std::function<bool()>& stop, FlexData& summary);
+  // Convenience overload for callers that don't need the summary (tests).
   bool benchmark_once(const std::function<bool()>& stop = [] {
     return false;
   });

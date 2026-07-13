@@ -1,5 +1,6 @@
 #include "stages/model-benchmark-stage.h"
 
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/ui-delegate-intf.h"
@@ -139,6 +140,22 @@ constexpr ConfigKey kAttrs[] = {
           "verify isn't bit-identical to the single-row decode in bf16), so "
           "it is benchmarked anyway with a note", .def_bool = false},
 };
+// Trigger iport (optional, any beat) + summary oport -- see model-fetch
+// for the shared "preparation recipe" rationale.
+const PortSpec kIports[] = {
+  {.name = "trigger",
+   .doc  = "optional pacing trigger (any beat type); when wired, the work "
+           "waits for one beat before running -- lets these preparation "
+           "stages cascade into a recipe",
+   .type = nullptr, .clock_group = 0},
+};
+const PortSpec kOports[] = {
+  {.name = "summary",
+   .doc  = "FlexData summary of the benchmark; its `text` field is the "
+           "Markdown report (feed a save-text), and the beat also triggers "
+           "the next stage in a recipe",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+};
 const StageSpec kSpec = {
   .type_name = "model-benchmark",
   .doc       = "Source: one-shot LM throughput benchmark. Loads a "
@@ -146,11 +163,11 @@ const StageSpec kSpec = {
                "prefill + incremental-prefill + decode at several "
                "context lengths, recording GPU temperature / frequency "
                "/ utilization / power during each test, and logs a "
-               "Markdown report. 0 in / 0 out.",
+               "Markdown report. Optional trigger in / summary out.",
   .display_name = "Model Benchmark",
   .category  = StageCategory::Preparation,
-  .iports    = {},
-  .oports    = {},
+  .iports    = kIports,
+  .oports    = kOports,
   .attrs     = kAttrs,
 };
 }  // namespace
@@ -326,6 +343,14 @@ ModelBenchmarkStage::real_prompt_(int n) const
 
 bool
 ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop)
+{
+  FlexData discard;
+  return benchmark_once(stop, discard);
+}
+
+bool
+ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop,
+                                    FlexData& summary)
 {
   (void)stop;
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -742,8 +767,30 @@ ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop)
   }
 
   session()->info(fmt("\n{}", md));
+
+  // FlexData summary (drives a downstream trigger and/or a save-text
+  // report). `text` carries the full Markdown report; peak tok/s are
+  // exposed as structured fields.
+  double peak_prefill = 0.0, peak_decode = 0.0;
+  for (const Row& r : prefill_rows) {
+    if (r.ok && r.tok_s > peak_prefill) { peak_prefill = r.tok_s; }
+  }
+  for (const Row& r : decode_rows) {
+    if (r.ok && r.tok_s > peak_decode) { peak_decode = r.tok_s; }
+  }
+  summary = FlexData::make_object();
+  auto so = summary.as_object();
+  so.insert_or_assign("stage", FlexData::make_string("model-benchmark"));
+  so.insert_or_assign("model", FlexData::make_string(_model));
+  so.insert_or_assign("peak_prefill_tok_s",
+                      FlexData::make_real(peak_prefill));
+  so.insert_or_assign("peak_decode_tok_s",
+                      FlexData::make_real(peak_decode));
+  so.insert_or_assign("ok", FlexData::make_bool(true));
+  so.insert_or_assign("text", FlexData::make_string(md));
   return true;
 #else
+  (void)summary;
   session()->warn(fmt(
       "ModelBenchmarkStage('{}'): built without VPIPE_BUILD_APPLE_"
       "SILICON; the LM subsystem is unavailable", this->id()));
@@ -758,10 +805,34 @@ ModelBenchmarkStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // Optional trigger (see model-fetch): gate the work on one beat when the
+  // iport is wired so this stage can cascade in a recipe.
+  if (ctx.iport_connected(0)) {
+    auto trig = co_await ctx.read(0);
+    if (!trig) {
+      ctx.signal_done();
+      co_return;
+    }
+  }
+  // Availability is checked HERE, AFTER the trigger -- in a recipe the
+  // upstream model-fetch/quantize may not have produced the model at
+  // config time. Missing => log + halt without emitting (cascade stops).
+  if (!model_dir_available(session(), _models_db, _model)) {
+    session()->error(fmt(
+        "ModelBenchmarkStage('{}'): model '{}' is not available "
+        "(not produced yet?); skipping benchmark",
+        this->id(), _model));
+    ctx.signal_done();
+    co_return;
+  }
   session()->info(fmt(
       "ModelBenchmarkStage('{}'): benchmarking '{}'", this->id(),
       _model));
-  benchmark_once([&ctx] { return ctx.stop_requested(); });
+  FlexData summary;
+  benchmark_once([&ctx] { return ctx.stop_requested(); }, summary);
+  if (ctx.has_consumers(0) && summary.is_object()) {
+    co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(summary)));
+  }
   ctx.signal_done();
   co_return;
 }

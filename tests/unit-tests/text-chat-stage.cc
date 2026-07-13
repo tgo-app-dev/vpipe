@@ -15,6 +15,8 @@
 #include "common/job.h"
 #include "common/session.h"
 #include "common/vertex.h"
+#include "common/vpipe-format.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -38,6 +40,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>   // ::access (seatbelt availability check)
 
 using namespace std;
 using namespace vpipe;
@@ -80,6 +84,54 @@ TEST(text_chat_stage, config_defaults) {
   EXPECT_TRUE(s.hf_dir() == "/tmp/chat-fake-model");
   EXPECT_TRUE(s.max_new_tokens() == 1024);
   EXPECT_TRUE(s.num_oports() == 1);
+  // MCP tools are opt-in: off unless enable_tools is set.
+  EXPECT_FALSE(s.tools_enabled());
+}
+
+TEST(text_chat_stage, enable_tools_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/tmp/chat-fake-model","enable_tools":true})");
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+  EXPECT_TRUE(s.tools_enabled());
+  EXPECT_FALSE(s.python_tool_enabled());
+}
+
+TEST(text_chat_stage, enable_python_tool_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/tmp/chat-fake-model","enable_python_tool":true})");
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+  EXPECT_TRUE(s.python_tool_enabled());
+  // Independent of enable_tools (which stays default-off here).
+  EXPECT_FALSE(s.tools_enabled());
+}
+
+TEST(text_chat_stage, enable_file_tools_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/tmp/chat-fake-model","enable_file_tools":true})");
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+  EXPECT_TRUE(s.file_tools_enabled());
+  EXPECT_FALSE(s.tools_enabled());
+  EXPECT_FALSE(s.python_tool_enabled());
+}
+
+TEST(text_chat_stage, enable_web_tools_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/tmp/chat-fake-model","enable_web_tools":true})");
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+  EXPECT_TRUE(s.web_tools_enabled());
+  EXPECT_FALSE(s.tools_enabled());
 }
 
 TEST(text_chat_stage, missing_hf_dir_deferred) {
@@ -235,6 +287,459 @@ TEST(text_chat_stage, metal_chat_smoke) {
     EXPECT_TRUE(ctx_pos > 0);
   }
   EXPECT_TRUE(found);
+}
+
+// ---- MCP tool calling (env-gated; a Qwen/ChatML checkpoint) ---------
+//
+// Drives one "what time is it?" turn with enable_tools=true against a
+// real ChatML model and asserts the tool loop actually fired: the stage
+// logs a `tool call 'get_current_time'` line when it dispatches the
+// model-emitted <tool_call>, and the final answer beat is non-empty.
+
+namespace {
+
+// UI delegate that records every info/warn/error message into shared
+// storage (Session routes info/warn/error through the UI delegate) so a
+// test can assert a specific line was emitted. Streams are no-ops.
+class CapturingUiDelegate : public UiDelegateIntf {
+public:
+  CapturingUiDelegate(std::shared_ptr<std::mutex>               mu,
+                      std::shared_ptr<std::vector<std::string>> lines)
+    : _mu(std::move(mu)), _lines(std::move(lines)) {}
+
+  void error(const VpipeFormat& f) override { record_(f); }
+  void warn (const VpipeFormat& f) override { record_(f); }
+  void info (const VpipeFormat& f) override { record_(f); }
+
+  UiInputStatus
+  getline(const VpipeFormat&, std::string&,
+          const std::function<bool()>&) override
+  {
+    return UiInputStatus::Eof;
+  }
+
+  std::unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return std::make_unique<NullUiTextStream>();
+  }
+
+private:
+  void record_(const VpipeFormat& f)
+  {
+    std::string s = f();
+    lock_guard<mutex> g(*_mu);
+    _lines->push_back(std::move(s));
+  }
+  std::shared_ptr<std::mutex>               _mu;
+  std::shared_ptr<std::vector<std::string>> _lines;
+};
+
+}  // namespace
+
+TEST(text_chat_stage, metal_chat_tool_call_time) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  auto mu    = std::make_shared<std::mutex>();
+  auto lines = std::make_shared<std::vector<std::string>>();
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<CapturingUiDelegate>(mu, lines));
+  Pipeline pl("chat-tool-smoke", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "What is the current date and time? Use your tools.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(256));
+    o.insert("max_pages", FlexData::make_int(16));
+    o.insert("enable_tools", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(
+      pl.insert_stage(std::move(ch)));
+
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } },
+      FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  // The final answer beat must be non-empty.
+  auto turns = sink->take();
+  ASSERT_TRUE(!turns.empty());
+  std::string final_text;
+  for (const auto& fd : turns) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      final_text = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.tool_call] final='%s'\n",
+              final_text.c_str());
+  EXPECT_TRUE(!final_text.empty());
+
+  // The stage logged a get_current_time dispatch => the tool loop fired.
+  bool tool_fired = false;
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      if (l.find("tool call 'get_current_time'") != string::npos) {
+        tool_fired = true;
+        break;
+      }
+    }
+  }
+  EXPECT_TRUE(tool_fired);
+}
+
+// Same end-to-end tool-call smoke, but against a Gemma-4 checkpoint --
+// which uses the bespoke `<|tool>`/`<|tool_call>`/`<|tool_response>` DSL
+// (not Hermes JSON). Exercises the full Gemma runtime path: tools system
+// turn -> decode -> model emits `<|tool_call>call:get_current_time{}`
+// and stops on `<|tool_response>` (the assistant-close commit is skipped
+// so the turn stays open) -> parse -> dispatch -> render `response:...`
+// -> continue decoding the final answer in the SAME turn. Gated on the
+// e4b test model (VPIPE_GEMMA4_TEST_MODEL_PATH).
+TEST(text_chat_stage, metal_chat_tool_call_time_gemma) {
+  const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  auto mu    = std::make_shared<std::mutex>();
+  auto lines = std::make_shared<std::vector<std::string>>();
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<CapturingUiDelegate>(mu, lines));
+  Pipeline pl("chat-tool-smoke-gemma", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "What is the current date and time? Use your tools.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(256));
+    o.insert("max_pages", FlexData::make_int(16));
+    o.insert("enable_tools", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(
+      pl.insert_stage(std::move(ch)));
+
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } },
+      FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  // The stage must NOT have disabled tools at init (the bug this fixes):
+  // no "no tool-calling support" warning may appear.
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      EXPECT_TRUE(l.find("no tool-calling support") == string::npos);
+    }
+  }
+
+  auto turns = sink->take();
+  ASSERT_TRUE(!turns.empty());
+  std::string final_text;
+  for (const auto& fd : turns) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      final_text = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.tool_call_gemma] final='%s'\n",
+              final_text.c_str());
+  EXPECT_TRUE(!final_text.empty());
+
+  // The stage logged a get_current_time dispatch => the Gemma tool loop
+  // parsed the `<|tool_call>` DSL and ran the tool.
+  bool tool_fired = false;
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      if (l.find("tool call 'get_current_time'") != string::npos) {
+        tool_fired = true;
+        break;
+      }
+    }
+  }
+  EXPECT_TRUE(tool_fired);
+}
+
+TEST(text_chat_stage, metal_chat_python_tool_compute) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  if (::access("/usr/bin/sandbox-exec", X_OK) != 0) {
+    return;   // no seatbelt -> the run_python tool can't run here
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  auto mu    = std::make_shared<std::mutex>();
+  auto lines = std::make_shared<std::vector<std::string>>();
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<CapturingUiDelegate>(mu, lines));
+  Pipeline pl("chat-python-smoke", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "Use the run_python tool to compute 12345 * 67890 and "
+                "tell me the exact integer result.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(512));
+    o.insert("max_pages", FlexData::make_int(24));
+    o.insert("enable_python_tool", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(
+      pl.insert_stage(std::move(ch)));
+
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } },
+      FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  std::string final_text;
+  for (const auto& fd : sink->take()) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      final_text = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.python_tool] final='%s'\n",
+              final_text.c_str());
+
+  bool tool_fired = false;
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      if (l.find("tool call 'run_python'") != string::npos) {
+        tool_fired = true;
+        break;
+      }
+    }
+  }
+  EXPECT_TRUE(tool_fired);
+  // 12345 * 67890 == 838102050 -- the sandboxed python computed it and
+  // the model relayed it.
+  EXPECT_TRUE(final_text.find("838102050") != string::npos);
+}
+
+TEST(text_chat_stage, metal_chat_file_tools_write_read) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  // Use an explicit workspace dir so the test can inspect the file the
+  // model writes.
+  namespace fs = std::filesystem;
+  fs::path ws = fs::temp_directory_path() / "vpipe-ut-chat-ws";
+  std::error_code ec;
+  fs::remove_all(ws, ec);
+  fs::create_directories(ws, ec);
+
+  auto mu    = std::make_shared<std::mutex>();
+  auto lines = std::make_shared<std::vector<std::string>>();
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<CapturingUiDelegate>(mu, lines));
+  Pipeline pl("chat-file-smoke", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "Use the write_file tool to save the exact text "
+                "'vpipe-was-here' to a file named marker.txt, then use "
+                "read_file to read it back and tell me its contents.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(512));
+    o.insert("max_pages", FlexData::make_int(24));
+    o.insert("enable_file_tools", FlexData::make_bool(true));
+    o.insert("file_sandbox_dir", FlexData::make_string(ws.string()));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(
+      pl.insert_stage(std::move(ch)));
+
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } },
+      FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  std::string final_text;
+  for (const auto& fd : sink->take()) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      final_text = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.file_tools] final='%s'\n",
+              final_text.c_str());
+
+  bool wrote = false, read = false;
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      if (l.find("tool call 'write_file'") != string::npos) { wrote = true; }
+      if (l.find("tool call 'read_file'")  != string::npos) { read = true; }
+    }
+  }
+  EXPECT_TRUE(wrote);
+  EXPECT_TRUE(read);
+  // The file the model wrote must actually exist in the workspace with
+  // the requested content.
+  std::ifstream f(ws / "marker.txt");
+  std::string body((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>());
+  EXPECT_TRUE(body.find("vpipe-was-here") != string::npos);
+  fs::remove_all(ws, ec);
+}
+
+TEST(text_chat_stage, metal_chat_web_tool_scrape) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  const char* net  = std::getenv("VPIPE_MCP_NET_TEST");
+  if (!path || !*path || !net || !*net) {
+    return;   // needs a model AND explicit network opt-in
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  auto mu    = std::make_shared<std::mutex>();
+  auto lines = std::make_shared<std::vector<std::string>>();
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<CapturingUiDelegate>(mu, lines));
+  Pipeline pl("chat-web-smoke", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "Use the scrape_page tool on https://example.com/ and "
+                "tell me the main heading or title of the page.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(512));
+    o.insert("max_pages", FlexData::make_int(24));
+    o.insert("enable_web_tools", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(
+      pl.insert_stage(std::move(ch)));
+
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } },
+      FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  std::string final_text;
+  for (const auto& fd : sink->take()) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      final_text = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.web_tool] final='%s'\n",
+              final_text.c_str());
+
+  bool fired = false;
+  {
+    lock_guard<mutex> g(*mu);
+    for (const auto& l : *lines) {
+      if (l.find("tool call 'scrape_page'") != string::npos
+          || l.find("tool call 'fetch_url'") != string::npos) {
+        fired = true;
+        break;
+      }
+    }
+  }
+  EXPECT_TRUE(fired);
+  // example.com's page is titled/headed "Example Domain".
+  EXPECT_TRUE(final_text.find("Example Domain") != string::npos);
 }
 
 // ---- Media-line turns (env-gated; the VL checkpoint) ----------------

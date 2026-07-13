@@ -81,6 +81,14 @@ struct TensorBeat {
   //                               frame represents (video-to-rgb
   //                               sets this from its source AU's
   //                               capture time).
+  //   * camera_name  : string  -- source camera id (video-to-rgb).
+  //   * fps_num,
+  //     fps_den      : uint64  -- source frame rate as a rational
+  //                               (fps = fps_num / fps_den), forwarded
+  //                               by video-to-rgb from the capture
+  //                               stream. Present only when known;
+  //                               a sink (hls-broadcast) adopts it as
+  //                               the default encode cadence.
   FlexData sideband;
 
   TensorBeat() = default;

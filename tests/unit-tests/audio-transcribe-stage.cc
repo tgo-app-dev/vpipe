@@ -19,13 +19,17 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/audio-transcribe-stage.h"
+#include "stages/save-text-stage.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <numbers>
+#include <sstream>
 #include <streambuf>
 #include <string>
 #include <utility>
@@ -97,7 +101,7 @@ TEST(audio_transcribe_stage, config_defaults) {
   EXPECT_TRUE(s.max_new_tokens() == 256);
   EXPECT_TRUE(s.sample_rate()    == 16000);
   EXPECT_TRUE(s.language_hint().empty());
-  EXPECT_TRUE(s.num_oports() == 0);    // sink stage
+  EXPECT_TRUE(s.num_oports() == 1);    // transcript oport
   EXPECT_TRUE(s.clips_processed() == 0u);
   // Single iport => block mode by default.
   EXPECT_FALSE(s.streaming());
@@ -254,7 +258,8 @@ TEST(audio_transcribe_stage, spec_declares_both_iports) {
     EXPECT_TRUE(sp.iports[0].name == "audio");
     EXPECT_TRUE(sp.iports[1].name == "segments");
   }
-  EXPECT_TRUE(sp.oports.size() == 0u);   // sink
+  EXPECT_TRUE(sp.oports.size() == 1u);   // transcript oport
+  EXPECT_TRUE(sp.oports[0].name == "transcript");
 }
 
 // ---- End-to-end runtime smoke (env-gated; real Qwen3-ASR) ----------
@@ -336,6 +341,25 @@ TEST(audio_transcribe_stage, metal_transcribe_smoke) {
   auto* asr_stage = static_cast<AudioTranscribeStage*>(
       pl.insert_stage(std::move(asr)));
 
+  // The use case: audio-transcribe's transcript oport -> save-text saves the
+  // recognized text to a file.
+  const std::string out_path =
+      (std::filesystem::temp_directory_path() / "vpipe-asr-transcript.txt")
+          .string();
+  std::error_code ec;
+  std::filesystem::remove(out_path, ec);
+  FlexData twcfg = FlexData::make_object();
+  {
+    auto o = twcfg.as_object();
+    o.insert("path", FlexData::make_string(out_path));
+    o.insert("key", FlexData::make_string("text"));
+    o.insert("newline", FlexData::make_string("after"));
+    o.insert("append", FlexData::make_bool(false));
+  }
+  auto tw = make_unique<SaveTextStage>(
+      &sess, "tw", vector<InEdge>{ { asr_stage, 0 } }, std::move(twcfg));
+  auto* tw_stage = static_cast<SaveTextStage*>(pl.insert_stage(std::move(tw)));
+
   PipelineRuntime rt(&pl, &sess);
   const bool launched = rt.launch();
   ::unsetenv("VPIPE_LLM_BACKEND");
@@ -344,8 +368,18 @@ TEST(audio_transcribe_stage, metal_transcribe_smoke) {
   rt.stop();
   // Reaching here means the metal ASR path (WhisperFeatureExtractor +
   // MetalAudioEncoder + multimodal prefill + decode) ran end-to-end
-  // without crashing. The transcript is surfaced via session()->info.
+  // without crashing. The transcript is surfaced via session()->info AND
+  // emitted on oport 0 -> save-text saved it to the file.
   EXPECT_TRUE(asr_stage->clips_processed() >= 1u);
+  EXPECT_TRUE(tw_stage->entries_written() >= 1u);
+  std::ifstream tin(out_path, std::ios::binary);
+  std::ostringstream tbuf; tbuf << tin.rdbuf();
+  const std::string saved = tbuf.str();
+  std::fprintf(stderr, "[asr->save-text] saved transcript: '%s'\n",
+               saved.c_str());
+  EXPECT_TRUE(!saved.empty());        // the transcript reached the file
+  EXPECT_TRUE(saved.back() == '\n');  // newline=after policy
+  std::filesystem::remove(out_path, ec);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

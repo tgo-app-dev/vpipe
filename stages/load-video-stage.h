@@ -1,5 +1,5 @@
-#ifndef VIDEO_FILE_DECODER_STAGE_H
-#define VIDEO_FILE_DECODER_STAGE_H
+#ifndef LOAD_VIDEO_STAGE_H
+#define LOAD_VIDEO_STAGE_H
 
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
@@ -29,18 +29,18 @@ namespace vpipe {
 //   audio_stream_index   (int,    default -1)
 //   options              (object<string,string>) -- av_dict for open
 //   read_timeout_ms      (int,    default 0)   -- network timeout
-class VideoFileDecoderStage final
-  : public TypedStage<VideoFileDecoderStage>
+class LoadVideoStage final
+  : public TypedStage<LoadVideoStage>
 {
 public:
-  static constexpr const char* kTypeName = "video-file-decoder";
+  static constexpr const char* kTypeName = "load-video";
 
-  VideoFileDecoderStage(const SessionContextIntf* session,
+  LoadVideoStage(const SessionContextIntf* session,
                         std::string               id,
                         std::vector<InEdge>       iports,
                         FlexData                  config);
 
-  ~VideoFileDecoderStage() override;
+  ~LoadVideoStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
   Job process   (RuntimeContext& ctx) override;

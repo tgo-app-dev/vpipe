@@ -60,7 +60,8 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "text", .doc = "one FlexData string payload per read line",
-   .type = &typeid(FlexDataPayload), .clock_group = 0},
+   .type = &typeid(FlexDataPayload),
+   .tags = "text", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "text-input",

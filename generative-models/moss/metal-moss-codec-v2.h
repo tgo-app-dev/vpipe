@@ -77,6 +77,41 @@ public:
   metal_compute::SharedBuffer decode_latent(
       const std::vector<std::vector<std::int32_t>>& codes, int T);
 
+  // --- Streaming (incremental) decode -------------------------------------
+  // The decoder is causal (windowed-causal attention, patch-reshape upsamples
+  // only within a frame), so audio can be produced chunk-by-chunk as the LM
+  // emits codes instead of decoding the whole utterance at once. Each stage
+  // keeps its per-layer K/V in a windowed RING (ring_cap = that stage's
+  // attention context), so decode_stream_chunk() is O(chunk) -- total work
+  // O(T), same as one-shot decode() but streamed at low latency. Absolute
+  // RoPE positions are preserved across chunks, so concatenating the chunk
+  // PCM reproduces decode()'s waveform bit-for-bit (f16 reduction noise only).
+  struct StreamState {
+    // [stage][layer] windowed K/V ring caches, each [n_heads, cap, hd]. The
+    // ring capacity `cap` (>= context + the stage's per-chunk frame count) is
+    // sized so a chunk's K/V appends never evict context that same chunk's
+    // earliest query still needs; attention masking stays at `context`.
+    std::vector<std::vector<metal_compute::SharedBuffer>> kc, vc;
+    std::vector<int> pos;   // per-stage absolute input-frame position so far
+    std::vector<int> cap;   // per-stage ring capacity (frames)
+    int max_chunk = 0;      // max latent frames/chunk this state was sized for
+    // Re-arm for a NEW utterance without reallocating the rings (they are sized
+    // by chunk, not utterance length). Only the absolute positions reset; stale
+    // ring contents are never read -- attention only reaches this utterance's
+    // [0, pos+T), all freshly appended after the reset.
+    void reset() { for (int& p : pos) { p = 0; } }
+  };
+  // Allocate a fresh streaming state (per utterance). `max_chunk_frames` is the
+  // largest number of LATENT frames a single decode_stream_chunk() call will
+  // pass -- the rings are sized for it. Null if not loaded.
+  std::unique_ptr<StreamState> decode_stream_begin(int max_chunk_frames) const;
+  // Decode ONLY the new frames `codes[Cnew][n_vq]` (Cnew <= max_chunk_frames),
+  // advancing `st`. Returns the chunk's PCM channel-major flat
+  // [ch0(Cnew*hop) | ch1(Cnew*hop)] f32; bit-concatenating successive chunks
+  // == decode() of the full code stream.
+  std::vector<float> decode_stream_chunk(
+      StreamState& st, const std::vector<std::vector<std::int32_t>>& codes);
+
   // Encode a 48 kHz STEREO waveform into the 12 RVQ code streams the decoder
   // consumes -- the inverse of decode(). `wave` is channel-major flat:
   // [ch0 (N samples) | ch1 (N samples)] f32 (the same layout decode() returns).
@@ -115,8 +150,16 @@ private:
 
   bool init_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
              bool with_encoder);
-  metal_compute::SharedBuffer run_stage_(const Stage& st, int T,
-                                         const metal_compute::SharedBuffer& in);
+  // Runs one decoder transformer stage. In one-shot mode (kc/vc null) T is the
+  // full frame count and K/V come from the local per-call buffers. In STREAMING
+  // mode (kc/vc = the stage's per-layer ring caches) T is the new-frame count,
+  // `pos` the absolute start position; new K/V are appended into the rings and
+  // attention reads them windowed -- the layer math is otherwise identical.
+  metal_compute::SharedBuffer run_stage_(
+      const Stage& st, int T, const metal_compute::SharedBuffer& in,
+      std::vector<metal_compute::SharedBuffer>* kc = nullptr,
+      std::vector<metal_compute::SharedBuffer>* vc = nullptr, int pos = 0,
+      int ring_cap = 0);
   // Host RLFQ encode: encoder latent [T, code_dim] (f16) -> codes[T][n_vq].
   std::vector<std::vector<std::int32_t>> encode_rvq_(
       const metal_compute::SharedBuffer& hidden, int T);
@@ -155,7 +198,8 @@ private:
   metal_compute::ComputeLibrary _lib_gemm, _lib_vis, _lib_elt, _lib_sdpa,
       _lib_rope;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_ln, _fn_gelu,
-      _fn_hslice, _fn_transpose, _fn_residual, _fn_sdpa, _fn_rope;
+      _fn_hslice, _fn_transpose, _fn_residual, _fn_sdpa, _fn_rope,
+      _fn_ring_append;   // windowed K/V ring scatter (streaming decode)
 
   // M5-only matrix-core (matmul2d/NAX) dense GEMM -- the same NAX path the LM
   // prefill and the Gemma/ASR encoders use. Loaded only when the GPU supports

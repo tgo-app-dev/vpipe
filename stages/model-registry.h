@@ -22,6 +22,18 @@ resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        models_db,
                   const std::string&        ref);
 
+// True when `ref` resolves (via resolve_model_dir) to a path that exists
+// on disk -- i.e. the model is actually present, not just a registry key
+// or a not-yet-downloaded path. Cheap: one LMDB read + a stat. The
+// preparation stages (model-quantize / -benchmark / -eval) call this
+// AFTER their trigger fires, not at config time, because a cascaded
+// model-fetch may not have downloaded the model when the pipeline is
+// built. Empty `ref` -> false.
+bool
+model_dir_available(const SessionContextIntf* session,
+                    const std::string&        models_db,
+                    const std::string&        ref);
+
 }
 
 #endif

@@ -2,18 +2,25 @@
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
+#include "common/host-net.h"
+#include "common/thread-pool.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <chrono>
 #include <cmath>
+#include <coroutine>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 
 extern "C" {
+#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/samplefmt.h>
 }
 
 using namespace std;
@@ -21,6 +28,34 @@ using namespace std;
 namespace vpipe {
 
 namespace {
+
+// Re-schedules the awaiting coroutine on the pool after `delay` instead
+// of blocking the worker with a sleep (same pattern as ChronoStage). The
+// audio-only silence pump uses it to nap ~one frame between silence
+// frames without pinning a pipeline worker for the duration of a stall.
+struct TimerAwaiter {
+  ThreadPool*                          pool;
+  std::chrono::steady_clock::duration  delay;
+
+  bool
+  await_ready() const noexcept
+  {
+    return pool == nullptr ||
+           delay <= std::chrono::steady_clock::duration::zero();
+  }
+
+  void
+  await_suspend(std::coroutine_handle<> h) const noexcept
+  {
+    // Hoist members into locals before publishing the handle (the timer
+    // can resume it on another worker the instant it fires).
+    ThreadPool* p = pool;
+    auto        d = delay;
+    p->schedule_after(d, h);
+  }
+
+  void await_resume() const noexcept {}
+};
 
 // GBRP plane indices: G=0, B=1, R=2. RGB channel c maps here.
 const int kGbrpPlaneForChannel[3] = { 2, 0, 1 };
@@ -210,8 +245,16 @@ HlsBroadcastStage::HlsBroadcastStage(const SessionContextIntf* s,
   _gop_size          = static_cast<int>(attr_int("gop_size"));
   _preset            = attr_str("preset");
   _tune              = attr_str("tune");
+  // fps defaults to 0 ("auto"): the encode cadence is taken from the
+  // first frame's sideband (fps_num/fps_den, set by video-to-rgb from
+  // the capture stream) when the config doesn't pin it. An explicit
+  // fps_num > 0 in config always wins; a lone fps_num with fps_den
+  // unset implies /1. Final resolution (including the 30/1 last-resort
+  // fallback) happens in resolve_default_fps_ on the first frame.
   _fps_num           = static_cast<int>(attr_int("fps_num"));
   _fps_den           = static_cast<int>(attr_int("fps_den"));
+  _fps_from_config   = (_fps_num > 0);
+  if (_fps_from_config && _fps_den <= 0) { _fps_den = 1; }
   _input_normalized  = attr_bool("input_normalized");
   _realtime          = attr_bool("realtime");
   _log_input_stats_every =
@@ -220,9 +263,36 @@ HlsBroadcastStage::HlsBroadcastStage(const SessionContextIntf* s,
   _serve_http        = attr_bool("serve_http");
   _bind_address      = attr_str("bind_address");
   _http_port         = static_cast<int>(attr_int("port"));
+  _audio_codec_name  = attr_str("audio_codec");
+  _audio_bitrate     = attr_int("audio_bitrate");
+  _audio_sample_rate = static_cast<int>(attr_int("audio_sample_rate"));
+  _audio_channels    = static_cast<int>(attr_int("audio_channels"));
+  _audio_buffer_seconds = attr_real("audio_buffer_seconds");
+  _prime_silence = attr_bool("prime_silence");
+  if (_audio_sample_rate <= 0)     { _audio_sample_rate = 48000; }
+  if (_audio_channels    <= 0)     { _audio_channels    = 1; }
+  if (_audio_bitrate     < 8'000)  { _audio_bitrate     = 128'000; }
+  if (_audio_buffer_seconds < 0.0) { _audio_buffer_seconds = 0.0; }
 
-  if (_fps_num <= 0)            { _fps_num = 30; }
-  if (_fps_den <= 0)            { _fps_den = 1; }
+  // An empty bind_address (the default) means "auto": bind, in order of
+  // preference, to (1) the address the web-ui is served on -- so the
+  // HLS stream is reachable exactly where the UI is, matching whatever
+  // interface the operator chose -- else (2) this machine's LAN address
+  // (en0), so other devices on the network can play the stream out of
+  // the box, else (3) 0.0.0.0 (all interfaces) as a last resort. An
+  // explicit bind_address in config always wins (including "0.0.0.0").
+  if (_bind_address.empty()) {
+    const string web_ui = session()->web_ui_bind_address();
+    if (!web_ui.empty()) {
+      _bind_address = web_ui;
+    } else {
+      const string lan = netx::primary_ipv4();
+      _bind_address = lan.empty() ? string("0.0.0.0") : lan;
+    }
+  }
+
+  // fps is resolved on the first frame (resolve_default_fps_), not
+  // clamped here -- 0/0 stays as the "auto" sentinel until then.
   if (_gop_size <= 0)           { _gop_size = 60; }
   if (!(_segment_duration > 0.0)) { _segment_duration = 2.0; }
   if (_live_start_offset < 0.0) { _live_start_offset = 0.0; }
@@ -272,9 +342,11 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "tune", .type = ConfigType::String,
    .doc = "libx264 tune", .def_str = "zerolatency"},
   {.key = "fps_num", .type = ConfigType::Int,
-   .doc = "frame-rate numerator", .def_int = 30},
+   .doc = "frame-rate numerator; 0 = auto (adopt the input sideband's "
+          "fps, else 30)", .def_int = 0},
   {.key = "fps_den", .type = ConfigType::Int,
-   .doc = "frame-rate denominator", .def_int = 1},
+   .doc = "frame-rate denominator; 0 = auto (paired with fps_num)",
+   .def_int = 0},
   {.key = "input_normalized", .type = ConfigType::Bool,
    .doc = "F32 input in [0,1] vs [0,255]", .def_bool = true},
   {.key = "realtime", .type = ConfigType::Bool,
@@ -284,20 +356,48 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "serve_http", .type = ConfigType::Bool,
    .doc = "run in-process static HTTP server", .def_bool = true},
   {.key = "bind_address", .type = ConfigType::String,
-   .doc = "HTTP server bind address", .def_str = "0.0.0.0"},
+   .doc = "HTTP server bind address; empty = auto (web-ui address if "
+          "this session is served by the web-ui, else en0's LAN IP, "
+          "else 0.0.0.0)",
+   .def_str = ""},
   {.key = "port", .type = ConfigType::Int,
    .doc = "HTTP server port, [0,65535]", .def_int = 8080},
+  {.key = "audio_codec", .type = ConfigType::String,
+   .doc = "audio encoder name for the optional audio stream",
+   .def_str = "aac"},
+  {.key = "audio_bitrate", .type = ConfigType::Int,
+   .doc = "audio target bps", .def_int = 128000},
+  {.key = "audio_sample_rate", .type = ConfigType::Int,
+   .doc = "audio encoder output rate; 0 = auto (48000)", .def_int = 0},
+  {.key = "audio_channels", .type = ConfigType::Int,
+   .doc = "audio encoder output channel count", .def_int = 1},
+  {.key = "audio_buffer_seconds", .type = ConfigType::Real,
+   .doc = "initial jitter buffer (seconds) for timestamp-less audio; "
+          "0 = off", .def_real = 0.5},
+  {.key = "prime_silence", .type = ConfigType::Bool,
+   .doc = "audio-only realtime: go live with a silent track at startup so "
+          "viewers can attach before the first PCM arrives; the self-clocked "
+          "cadence advances it and real audio resumes gaplessly. Default on; "
+          "off keeps the old behavior (stream appears on the first audio beat)",
+   .def_bool = true},
 };
 const PortSpec kIports[] = {
-  {.name = "frames", .doc = "RGB TensorBeat [3,H,W] (F32 or U8); stable "
-                            "resolution for the stage's lifetime",
+  {.name = "frames", .doc = "video RGB TensorBeat [3,H,W] (F32 or U8); "
+                            "stable resolution for the stage's lifetime. "
+                            "For an audio-only stream, wire the PCM "
+                            "producer here instead (detected by rank).",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "audio", .doc = "OPTIONAL audio PCM TensorBeat: F32 rank-1 "
+                           "[n] (mono) or rank-2 [channels, n]. "
+                           "sideband.sample_rate + timestamp_us honoured.",
+   .type = &typeid(TensorBeatPayload), .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "hls-broadcast",
   .doc       = "Sink: encodes incoming RGB frames (VideoToolbox/libx264) "
-               "into a rolling in-memory HLS playlist + segments and "
-               "serves them over an in-process HTTP server. 0 oports.",
+               "and/or PCM audio (AAC) into a rolling in-memory HLS "
+               "playlist + segments and serves them over an in-process "
+               "HTTP server. 0 oports.",
   .display_name = "HLS Broadcast",
   .category  = StageCategory::Network,
   .iports    = kIports,
@@ -428,6 +528,33 @@ HlsBroadcastStage::io_close_(AVIOContext* pb)
     }
   }
   return 0;
+}
+
+void
+HlsBroadcastStage::resolve_default_fps_(const TensorBeat& tb)
+{
+  // Adopt the source cadence from the frame's sideband when present;
+  // otherwise fall back to 30/1. Called once, before the encoder is
+  // built, only when config didn't pin fps.
+  int num = 0;
+  int den = 0;
+  if (tb.sideband.is_object()) {
+    auto sb = tb.sideband.as_object();
+    if (sb.contains("fps_num") && sb.contains("fps_den")) {
+      num = static_cast<int>(sb.at("fps_num").as_uint(0));
+      den = static_cast<int>(sb.at("fps_den").as_uint(0));
+    }
+  }
+  if (num > 0 && den > 0) {
+    _fps_num = num;
+    _fps_den = den;
+    session()->info(fmt(
+        "hls-broadcast('{}'): adopting source frame rate {}/{} fps "
+        "from input sideband", this->id(), _fps_num, _fps_den));
+  } else {
+    _fps_num = 30;
+    _fps_den = 1;
+  }
 }
 
 bool
@@ -574,24 +701,57 @@ HlsBroadcastStage::open_output_()
   fctx->io_open   = &hls_io_open_thunk_;
   fctx->io_close2 = &hls_io_close_thunk_;
 
-  AVStream* st = _libs->avformat().api.new_stream(fctx, nullptr);
-  if (!st) {
+  // Add the wanted stream(s). Video first (stream 0) when present, so
+  // its index stays 0 as before; audio follows. At least one is added.
+  AVStream* vst = nullptr;
+  AVStream* ast = nullptr;
+  if (_want_video && _enc) {
+    vst = _libs->avformat().api.new_stream(fctx, nullptr);
+    if (!vst) {
+      _libs->avformat().api.free_context(fctx);
+      session()->error(fmt(
+          "hls-broadcast('{}'): avformat_new_stream (video) failed",
+          this->id()));
+      return false;
+    }
+    rc = _libs->avcodec().api.parameters_from_context(vst->codecpar,
+                                                      _enc);
+    if (rc < 0) {
+      _libs->avformat().api.free_context(fctx);
+      session()->error(fmt(
+          "hls-broadcast('{}'): parameters_from_context (video): {}",
+          this->id(), av_err_(rc)));
+      return false;
+    }
+    vst->time_base = AVRational{_fps_den, _fps_num};
+  }
+  if (_want_audio && _aenc) {
+    ast = _libs->avformat().api.new_stream(fctx, nullptr);
+    if (!ast) {
+      _libs->avformat().api.free_context(fctx);
+      session()->error(fmt(
+          "hls-broadcast('{}'): avformat_new_stream (audio) failed",
+          this->id()));
+      return false;
+    }
+    rc = _libs->avcodec().api.parameters_from_context(ast->codecpar,
+                                                      _aenc);
+    if (rc < 0) {
+      _libs->avformat().api.free_context(fctx);
+      session()->error(fmt(
+          "hls-broadcast('{}'): parameters_from_context (audio): {}",
+          this->id(), av_err_(rc)));
+      return false;
+    }
+    ast->time_base = AVRational{1, _audio_sample_rate};
+  }
+  if (!vst && !ast) {
     _libs->avformat().api.free_context(fctx);
     session()->error(fmt(
-        "hls-broadcast('{}'): avformat_new_stream failed",
-        this->id()));
+        "hls-broadcast('{}'): no streams to write (neither video nor "
+        "audio ready)", this->id()));
     return false;
   }
-  rc = _libs->avcodec().api.parameters_from_context(st->codecpar,
-                                                    _enc);
-  if (rc < 0) {
-    _libs->avformat().api.free_context(fctx);
-    session()->error(fmt(
-        "hls-broadcast('{}'): parameters_from_context: {}",
-        this->id(), av_err_(rc)));
-    return false;
-  }
-  st->time_base = AVRational{_fps_den, _fps_num};
 
   AVDictionary* mux_opts = nullptr;
   _libs->avutil().api.dict_set(
@@ -616,7 +776,10 @@ HlsBroadcastStage::open_output_()
   }
 
   _ofctx          = fctx;
-  _vstream        = st;
+  _vstream        = vst;
+  _astream        = ast;
+  _video_muxed    = _video_muxed || (vst != nullptr);
+  _audio_muxed    = _audio_muxed || (ast != nullptr);
   _header_written = true;
   return true;
 }
@@ -733,9 +896,26 @@ HlsBroadcastStage::tensor_to_yuv_(const TensorBeat& tb)
   // When _realtime is false (deterministic tests), PTS is just a
   // monotonic frame index and we leave keyframe scheduling to the
   // encoder.
+  // A/V ts-sync: when audio is also present and this frame carries a
+  // wall-clock `timestamp_us`, derive its PTS from the shared UTC epoch
+  // so video and audio share one clock. (When there's no audio we keep
+  // the legacy wall-clock/frame-index paths so behaviour is unchanged.)
+  uint64_t ts_us  = 0;
+  bool     has_ts = false;
+  if (tb.sideband.is_object()) {
+    auto sb = tb.sideband.as_object();
+    if (sb.contains("timestamp_us")) {
+      ts_us  = sb.at("timestamp_us").as_uint(0);
+      has_ts = true;
+    }
+  }
+  const bool ts_sync = _want_audio && has_ts;
+  if (ts_sync) { note_epoch_(ts_us); }
+
   auto now = std::chrono::steady_clock::now();
-  int64_t new_pts = 0;
-  bool    force_kf = false;
+  int64_t new_pts    = 0;
+  int64_t media_us   = 0;
+  bool    force_kf   = false;
   if (_realtime) {
     if (!_clock_started) {
       _epoch         = now;
@@ -743,10 +923,16 @@ HlsBroadcastStage::tensor_to_yuv_(const TensorBeat& tb)
       _clock_started = true;
       force_kf = true;            // first frame must be IDR
     }
-    int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
-        now - _epoch).count();
+    if (ts_sync && _av_epoch_set) {
+      media_us = static_cast<int64_t>(ts_us)
+               - static_cast<int64_t>(_av_epoch_us);
+      if (media_us < 0) { media_us = 0; }
+    } else {
+      media_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          now - _epoch).count();
+    }
     new_pts = _libs->avutil().api.rescale_q(
-        us, AVRational{1, 1'000'000}, _enc->time_base);
+        media_us, AVRational{1, 1'000'000}, _enc->time_base);
     auto since_kf = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - _last_kf_time).count();
     // Truncation guard: segment_duration is `double` (can be 0.5);
@@ -765,6 +951,14 @@ HlsBroadcastStage::tensor_to_yuv_(const TensorBeat& tb)
     new_pts = _last_pts + 1;
   }
   _last_pts = new_pts;
+  // Track the video media clock (microseconds from epoch) so ts-less
+  // audio can anchor its start to the current video edge.
+  if (_realtime) {
+    _video_media_us = media_us;
+  } else {
+    _video_media_us = _libs->avutil().api.rescale_q(
+        new_pts, _enc->time_base, AVRational{1, 1'000'000});
+  }
   yuv->pts  = new_pts;
   yuv->pict_type = force_kf ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
   return yuv;
@@ -811,6 +1005,592 @@ HlsBroadcastStage::send_and_mux_(AVFrame* yuv)
   return drain_packets_();
 }
 
+// ------------------------------------------------------------------
+// Role resolution + muxer-open orchestration
+// ------------------------------------------------------------------
+
+void
+HlsBroadcastStage::resolve_roles_(RuntimeContext& ctx)
+{
+  if (_roles_resolved) { return; }
+  // Strict positional roles: iport 0 is video, iport 1 is audio. Either
+  // may be left disconnected (an optional input); connectedness alone
+  // decides which streams exist -- for an audio-only stream leave
+  // iport 0 unwired and wire the PCM producer to iport 1.
+  _want_video = ctx.iport_connected(0);
+  _want_audio = ctx.num_iports() >= 2 && ctx.iport_connected(1);
+  _roles_resolved = true;
+  session()->info(fmt(
+      "hls-broadcast('{}'): inputs resolved -> video={}, audio={}",
+      this->id(), _want_video, _want_audio));
+}
+
+void
+HlsBroadcastStage::start_http_()
+{
+  if (!_serve_http || _http) { return; }
+  _http = std::make_unique<StaticFileServer>(
+      session(), /*doc_root*/ "", _bind_address, _http_port, &_blobs);
+  if (!_http->start()) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): static HTTP server failed to start on "
+        "{}:{}; the in-memory blob registry is still being populated "
+        "and is accessible via the stage's blobs() inspector for "
+        "tests.", this->id(), _bind_address, _http_port));
+    _http.reset();
+  }
+}
+
+bool
+HlsBroadcastStage::maybe_open_muxer_()
+{
+  if (_ofctx) { return true; }
+  if (!_roles_resolved) { return false; }
+  // Video needs its encoder (built from the first frame's W/H).
+  if (_want_video && !_enc) { return false; }
+  // Audio needs its encoder; give up on audio if it can't be built
+  // rather than blocking the whole output.
+  if (_want_audio && !_aenc) {
+    if (!ensure_audio_encoder_()) { _want_audio = false; }
+  }
+  if (!_want_video && !_want_audio) { return false; }
+  if (!open_output_()) { return false; }
+  start_http_();
+  return true;
+}
+
+// ------------------------------------------------------------------
+// Video handling (encode + mux one frame)
+// ------------------------------------------------------------------
+
+void
+HlsBroadcastStage::handle_video_(const TensorBeat& tb)
+{
+  const int H = static_cast<int>(tb.shape[1]);
+  const int W = static_cast<int>(tb.shape[2]);
+
+  if (!_enc) {
+    // Resolve the "auto" fps default from the first frame's sideband
+    // (video-to-rgb forwards the capture stream's rate) before the
+    // encoder is built; an explicit fps in config skips this.
+    if (!_fps_from_config) { resolve_default_fps_(tb); }
+    if (!ensure_encoder_(H, W) || !ensure_sws_(H, W)) {
+      _fatal = true;
+      return;
+    }
+  } else if (H != _enc_h || W != _enc_w) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): resolution changed mid-stream "
+        "({}x{} -> {}x{}); dropping frame",
+        this->id(), _enc_w, _enc_h, W, H));
+    return;
+  }
+
+  if (!maybe_open_muxer_()) { return; }
+
+  // Diagnostic: log min/mean/max of the input tensor periodically.
+  // A frame whose mean is essentially 0 and whose range is < a few
+  // percent is the smoking gun for "all-black playback".
+  if (_log_input_stats_every > 0
+      && (_frames_in % static_cast<uint64_t>(_log_input_stats_every))
+             == 0) {
+    double mn = 0.0, mx = 0.0, sum = 0.0;
+    size_t n   = 0;
+    bool   any = false;
+    auto accum = [&](double v) {
+      if (!any) { mn = mx = v; any = true; }
+      else      { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+      sum += v;
+    };
+    if (tb.dtype == TensorBeat::DType::F32) {
+      AlignedVector<float> tmp;
+      const float* data = nullptr;
+      if (tb.is_contiguous()) { data = tb.as_f32(); n = tb.element_count(); }
+      else { tmp = tb.materialize_contiguous_as<float>();
+             data = tmp.data(); n = tmp.size(); }
+      for (size_t i = 0; i < n; ++i) { accum(static_cast<double>(data[i])); }
+    } else if (tb.dtype == TensorBeat::DType::U8) {
+      AlignedVector<uint8_t> tmp;
+      const uint8_t* data = nullptr;
+      if (tb.is_contiguous()) { data = tb.as_u8(); n = tb.element_count(); }
+      else { tmp = tb.materialize_contiguous();
+             data = tmp.data(); n = tmp.size(); }
+      for (size_t i = 0; i < n; ++i) { accum(static_cast<double>(data[i])); }
+    }
+    session()->info(fmt(
+        "hls-broadcast('{}'): input frame #{} dtype={} shape=[3,{},{}] "
+        "elements={} min={:.4f} mean={:.4f} max={:.4f}",
+        this->id(), _frames_in, tb.dtype_name(), H, W, n,
+        mn, n > 0 ? sum / static_cast<double>(n) : 0.0, mx));
+  }
+
+  AVFrame* yuv = tensor_to_yuv_(tb);
+  if (yuv) {
+    send_and_mux_(yuv);
+    _libs->avutil().api.frame_free(&yuv);
+  }
+  // Drain any audio buffered while the muxer was still coming up.
+  if (_want_audio) { pump_audio_(false); }
+}
+
+// ------------------------------------------------------------------
+// Audio handling (resample -> FIFO -> AAC -> mux)
+// ------------------------------------------------------------------
+
+namespace {
+// Build a native AVChannelLayout for a plain N-channel stream. Mono /
+// stereo use the well-known masks; anything else gets the low-N bits.
+AVChannelLayout
+chlayout_for_(int ch)
+{
+  AVChannelLayout l = AV_CHANNEL_LAYOUT_MONO;
+  if (ch == 2) {
+    l = AV_CHANNEL_LAYOUT_STEREO;
+  } else if (ch > 2) {
+    l = AV_CHANNEL_LAYOUT_MASK(ch, (1ULL << ch) - 1ULL);
+  }
+  return l;
+}
+}  // namespace
+
+bool
+HlsBroadcastStage::ensure_audio_encoder_()
+{
+  if (_aenc) { return true; }
+  const auto& cdc = _libs->avcodec().api;
+
+  const AVCodec* codec =
+      cdc.find_encoder_by_name(_audio_codec_name.c_str());
+  if (!codec) { codec = cdc.find_encoder(AV_CODEC_ID_AAC); }
+  if (!codec) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio encoder '{}' not found "
+        "(and no AAC fallback)", this->id(), _audio_codec_name));
+    return false;
+  }
+
+  _aenc = cdc.alloc_context3(codec);
+  if (!_aenc) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio alloc_context3 failed", this->id()));
+    return false;
+  }
+  _aenc->sample_rate = _audio_sample_rate;
+  _aenc->ch_layout   = chlayout_for_(_audio_channels);
+  _aenc->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+  _aenc->bit_rate    = _audio_bitrate;
+  _aenc->time_base   = AVRational{1, _audio_sample_rate};
+
+  int rc = cdc.open2(_aenc, codec, nullptr);
+  if (rc < 0) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio avcodec_open2: {}",
+        this->id(), av_err_(rc)));
+    cdc.free_context(&_aenc);
+    return false;
+  }
+
+  _apkt = cdc.packet_alloc();
+  if (!_apkt) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio packet_alloc failed", this->id()));
+    cdc.free_context(&_aenc);
+    return false;
+  }
+  // AAC has a fixed 1024-sample frame; fall back to that if the codec
+  // reports variable (0) so the FIFO has a definite chunk size.
+  _aenc_frame_size = _aenc->frame_size > 0 ? _aenc->frame_size : 1024;
+
+  _aframe = _libs->avutil().api.frame_alloc();
+  if (!_aframe) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio frame_alloc failed", this->id()));
+    cdc.free_context(&_aenc);
+    return false;
+  }
+  _aframe->format      = AV_SAMPLE_FMT_FLTP;
+  _aframe->ch_layout   = _aenc->ch_layout;
+  _aframe->sample_rate = _audio_sample_rate;
+  _aframe->nb_samples  = _aenc_frame_size;
+  rc = _libs->avutil().api.frame_get_buffer(_aframe, 0);
+  if (rc < 0) {
+    session()->error(fmt(
+        "hls-broadcast('{}'): audio frame_get_buffer: {}",
+        this->id(), av_err_(rc)));
+    _libs->avutil().api.frame_free(&_aframe);
+    cdc.free_context(&_aenc);
+    return false;
+  }
+  _afifo.assign(static_cast<size_t>(_audio_channels), {});
+  return true;
+}
+
+bool
+HlsBroadcastStage::ensure_swr_(int in_rate, int in_ch)
+{
+  if (_swr && _swr_in_rate == in_rate && _swr_in_ch == in_ch) {
+    return true;
+  }
+  if (_swr) { _libs->swresample().api.free(&_swr); }
+  AVChannelLayout inl  = chlayout_for_(in_ch);
+  AVChannelLayout outl = _aenc->ch_layout;
+  int rc = _libs->swresample().api.alloc_set_opts2(
+      &_swr,
+      &outl, AV_SAMPLE_FMT_FLTP, _audio_sample_rate,
+      &inl,  AV_SAMPLE_FMT_FLTP, in_rate,
+      0, nullptr);
+  if (rc < 0 || !_swr) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): swr_alloc_set_opts2 failed ({})",
+        this->id(), rc));
+    return false;
+  }
+  rc = _libs->swresample().api.init(_swr);
+  if (rc < 0) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): swr_init failed ({})", this->id(), rc));
+    _libs->swresample().api.free(&_swr);
+    return false;
+  }
+  _swr_in_rate = in_rate;
+  _swr_in_ch   = in_ch;
+  return true;
+}
+
+void
+HlsBroadcastStage::afifo_push_(const uint8_t* const* planes, int n)
+{
+  for (int c = 0; c < _audio_channels; ++c) {
+    const float* f = reinterpret_cast<const float*>(planes[c]);
+    _afifo[static_cast<size_t>(c)].insert(
+        _afifo[static_cast<size_t>(c)].end(), f, f + n);
+  }
+}
+
+int
+HlsBroadcastStage::afifo_filled_() const
+{
+  return _afifo.empty()
+       ? 0
+       : static_cast<int>(_afifo.front().size());
+}
+
+bool
+HlsBroadcastStage::afifo_pull_frame_(uint8_t* const* dst)
+{
+  if (afifo_filled_() < _aenc_frame_size) { return false; }
+  for (int c = 0; c < _audio_channels; ++c) {
+    auto& src = _afifo[static_cast<size_t>(c)];
+    std::memcpy(dst[c], src.data(),
+                static_cast<size_t>(_aenc_frame_size) * sizeof(float));
+    src.erase(src.begin(), src.begin() + _aenc_frame_size);
+  }
+  return true;
+}
+
+int
+HlsBroadcastStage::afifo_pull_padded_(uint8_t* const* dst)
+{
+  const int have = afifo_filled_();
+  if (have <= 0) { return 0; }
+  const int real = std::min(have, _aenc_frame_size);
+  for (int c = 0; c < _audio_channels; ++c) {
+    auto& src = _afifo[static_cast<size_t>(c)];
+    std::memcpy(dst[c], src.data(),
+                static_cast<size_t>(real) * sizeof(float));
+    if (real < _aenc_frame_size) {
+      std::memset(reinterpret_cast<float*>(dst[c]) + real, 0,
+                  static_cast<size_t>(_aenc_frame_size - real)
+                      * sizeof(float));
+    }
+    src.erase(src.begin(), src.begin() + real);
+  }
+  return real;
+}
+
+void
+HlsBroadcastStage::push_audio_samples_(const TensorBeat& tb)
+{
+  if (!_aenc) { return; }
+  if (tb.dtype != TensorBeat::DType::F32) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): audio beat dtype '{}' not f32 -- dropping",
+        this->id(), tb.dtype_name()));
+    return;
+  }
+  int in_ch = 0;
+  int n     = 0;
+  if (tb.shape.size() == 1) {
+    in_ch = 1;
+    n     = static_cast<int>(tb.shape[0]);
+  } else if (tb.shape.size() == 2) {
+    in_ch = static_cast<int>(tb.shape[0]);
+    n     = static_cast<int>(tb.shape[1]);
+  } else {
+    return;
+  }
+  if (n <= 0 || in_ch <= 0) { return; }
+
+  int in_rate = _audio_sample_rate;
+  if (tb.sideband.is_object()) {
+    auto sb = tb.sideband.as_object();
+    if (sb.contains("sample_rate")) {
+      const int r = static_cast<int>(sb.at("sample_rate").as_int(0));
+      if (r > 0) { in_rate = r; }
+    }
+  }
+  if (!ensure_swr_(in_rate, in_ch)) { return; }
+
+  // Planar f32 view: rank-2 [ch, n] is already planar (row c = plane c);
+  // rank-1 [n] is a single mono plane.
+  const AlignedVector<float> buf = tb.materialize_contiguous_as<float>();
+  std::vector<const uint8_t*> src(static_cast<size_t>(in_ch));
+  for (int c = 0; c < in_ch; ++c) {
+    src[static_cast<size_t>(c)] = reinterpret_cast<const uint8_t*>(
+        buf.data() + static_cast<size_t>(c) * n);
+  }
+
+  // Output capacity: resampled sample count + slack for swr's buffer.
+  const int out_max =
+      static_cast<int>(static_cast<int64_t>(n) * _audio_sample_rate
+                       / in_rate)
+      + 1024;
+  std::vector<std::vector<float>> out(
+      static_cast<size_t>(_audio_channels),
+      std::vector<float>(static_cast<size_t>(out_max)));
+  std::vector<uint8_t*> outp(static_cast<size_t>(_audio_channels));
+  for (int c = 0; c < _audio_channels; ++c) {
+    outp[static_cast<size_t>(c)] =
+        reinterpret_cast<uint8_t*>(out[static_cast<size_t>(c)].data());
+  }
+
+  const int n_out = _libs->swresample().api.convert(
+      _swr, outp.data(), out_max, src.data(), n);
+  if (n_out < 0) {
+    session()->warn(fmt(
+        "hls-broadcast('{}'): swr_convert failed ({})",
+        this->id(), n_out));
+    return;
+  }
+  if (n_out > 0) { afifo_push_(outp.data(), n_out); }
+}
+
+bool
+HlsBroadcastStage::audio_stall_silence_due_(RuntimeContext& ctx)
+    const noexcept
+{
+  // Only audio-only, realtime, no-TC streams self-clock silence: a
+  // video+audio stream is already pumped at video cadence, ts-paced
+  // audio has its own clock, and non-realtime muxing has no wall clock
+  // to chase. Audio is always iport 1 (iport 0 is video). "Stall" = the
+  // producer is wired but idle right now (no backlog) yet not at EOS;
+  // once it closes, process() ends the stage instead of napping.
+  return _want_audio && !_want_video && _realtime
+      && _audio_started && !_audio_ts_mode
+      && _aenc && _astream
+      && ctx.num_iports() >= 2
+      && ctx.backlog(1) == 0
+      && !ctx.eos(1)
+      && !ctx.stop_requested();
+}
+
+void
+HlsBroadcastStage::prime_audio_silence_(RuntimeContext& ctx)
+{
+  // Audio-only, realtime, timestamp-less, not already started, and there is
+  // genuinely no audio waiting yet (a producer that already emitted starts on
+  // its real samples; priming is only to fill the gap BEFORE the first beat).
+  if (!_prime_silence || _audio_started || _audio_ts_mode
+      || !_realtime || _want_video || !_want_audio
+      || ctx.num_iports() < 2 || ctx.backlog(1) > 0 || ctx.eos(1)) {
+    return;
+  }
+  if (!maybe_open_muxer_() || !_aenc || !_astream) { return; }
+  // Start the clock now (pts 0) without the jitter wait -- there is no real
+  // audio to cushion; pump_audio_ synthesizes silence up to the wall clock and
+  // real samples later resume from the advanced pts (gapless).
+  _audio_started = true;
+  _audio_epoch   = std::chrono::steady_clock::now();
+  _audio_pts     = 0;
+  session()->info(fmt(
+      "hls-broadcast('{}'): audio-only live at startup -- broadcasting silence "
+      "until the first PCM", this->id()));
+  pump_audio_(/*flush=*/false);
+}
+
+void
+HlsBroadcastStage::pump_audio_(bool flush)
+{
+  if (!_aenc || !_astream) { return; }
+  const auto& cdc = _libs->avcodec().api;
+
+  if (!_audio_started) {
+    // Timestamp-less audio waits for an initial jitter cushion; ts-paced
+    // audio starts immediately (its own clock keeps it smooth).
+    int need = 0;
+    if (!_audio_ts_mode) {
+      need = static_cast<int>(_audio_buffer_seconds * _audio_sample_rate);
+    }
+    if (!flush && afifo_filled_() < need) { return; }
+    _audio_started = true;
+    _audio_epoch   = std::chrono::steady_clock::now();
+    const int64_t anchor_us =
+        _audio_ts_mode ? _audio_anchor_us
+                       : (_want_video ? _video_media_us : 0);
+    _audio_pts = _libs->avutil().api.rescale_q(
+        anchor_us, AVRational{1, 1'000'000},
+        AVRational{1, _audio_sample_rate});
+    if (_audio_pts < 0) { _audio_pts = 0; }
+    if (!_audio_ts_mode && _audio_buffer_seconds > 0.0) {
+      session()->info(fmt(
+          "hls-broadcast('{}'): audio jitter buffer filled "
+          "(~{}s), starting at pts {}",
+          this->id(), _audio_buffer_seconds, _audio_pts));
+    }
+  }
+
+  // Realtime PACING: release real audio at ~the media-clock rate (plus the
+  // jitter cushion), holding the rest in the FIFO. A bursty producer --
+  // streaming TTS arrives FASTER than realtime -- would otherwise dump the
+  // whole utterance at once, racing the audio pts seconds ahead of the clock;
+  // when it stops the stream freezes while the clock catches up and a live
+  // player skips the fast-delivered audio. Capping the drain leaves the excess
+  // buffered, played out at realtime by the self-clocked cadence (audio-only:
+  // the process() silence pump; video-locked: each video frame advances
+  // _video_media_us and re-pumps). The pace clock matches the silence-fill's
+  // target below -- the video media clock when video is present (keeps A/V
+  // locked), else the wall clock since the cushion released. ts-paced audio
+  // (its own clock), non-realtime muxing and the final flush drain in full.
+  const bool pace = !flush && _audio_started && !_audio_ts_mode && _realtime;
+  int64_t pace_limit = INT64_MAX;
+  if (pace) {
+    const int64_t target_us =
+        _want_video
+            ? _video_media_us
+            : std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - _audio_epoch).count();
+    const int64_t cushion =
+        static_cast<int64_t>(_audio_buffer_seconds * _audio_sample_rate);
+    pace_limit = _libs->avutil().api.rescale_q(
+                     target_us, AVRational{1, 1'000'000},
+                     AVRational{1, _audio_sample_rate})
+                 + cushion;
+  }
+
+  while (afifo_filled_() >= _aenc_frame_size && _audio_pts < pace_limit) {
+    afifo_pull_frame_(_aframe->data);
+    _aframe->pts  = _audio_pts;
+    _audio_pts   += _aenc_frame_size;
+    int rc = cdc.send_frame(_aenc, _aframe);
+    if (rc < 0) {
+      session()->warn(fmt(
+          "hls-broadcast('{}'): audio send_frame: {}",
+          this->id(), av_err_(rc)));
+      break;
+    }
+    drain_audio_packets_();
+  }
+
+  // No-TC audio must never pause the stream past the one-time startup
+  // cushion: once the FIFO has been drained to empty, keep the audio
+  // clock advancing to the current media time by emitting silence rather
+  // than stalling. Real samples that arrive later simply resume from the
+  // advanced pts, so the track stays gapless. The silence target is the
+  // video media clock when video is present (keeps A/V locked), else the
+  // wall clock since the cushion was released. ts-paced audio keeps its
+  // own clock and non-realtime muxing has no wall clock to chase, so
+  // both skip the fill.
+  if (!flush && _audio_started && !_audio_ts_mode && _realtime) {
+    const int64_t target_us =
+        _want_video
+            ? _video_media_us
+            : std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - _audio_epoch).count();
+    const int64_t target_pts = _libs->avutil().api.rescale_q(
+        target_us, AVRational{1, 1'000'000},
+        AVRational{1, _audio_sample_rate});
+    while (_audio_pts + _aenc_frame_size <= target_pts) {
+      for (int c = 0; c < _audio_channels; ++c) {
+        std::memset(_aframe->data[c], 0,
+                    static_cast<size_t>(_aenc_frame_size) * sizeof(float));
+      }
+      _aframe->pts = _audio_pts;
+      _audio_pts  += _aenc_frame_size;
+      if (cdc.send_frame(_aenc, _aframe) < 0) { break; }
+      drain_audio_packets_();
+    }
+  }
+
+  if (flush) {
+    const int real = afifo_pull_padded_(_aframe->data);
+    if (real > 0) {
+      _aframe->pts = _audio_pts;
+      _audio_pts  += _aenc_frame_size;
+      if (cdc.send_frame(_aenc, _aframe) >= 0) {
+        drain_audio_packets_();
+      }
+    }
+    cdc.send_frame(_aenc, nullptr);   // EOF -> flush encoder
+    drain_audio_packets_();
+  }
+}
+
+int
+HlsBroadcastStage::drain_audio_packets_()
+{
+  while (true) {
+    int rc = _libs->avcodec().api.receive_packet(_aenc, _apkt);
+    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { return 0; }
+    if (rc < 0) {
+      session()->warn(fmt(
+          "hls-broadcast('{}'): audio receive_packet: {}",
+          this->id(), av_err_(rc)));
+      return -1;
+    }
+    _apkt->stream_index = _astream->index;
+    _libs->avcodec().api.packet_rescale_ts(_apkt, _aenc->time_base,
+                                           _astream->time_base);
+    rc = _libs->avformat().api.interleaved_write_frame(_ofctx, _apkt);
+    _libs->avcodec().api.packet_unref(_apkt);
+    if (rc < 0) {
+      session()->warn(fmt(
+          "hls-broadcast('{}'): audio interleaved_write_frame: {}",
+          this->id(), av_err_(rc)));
+      return -1;
+    }
+  }
+}
+
+void
+HlsBroadcastStage::handle_audio_(const TensorBeat& tb)
+{
+  if (!_want_audio) { return; }
+  if (!ensure_audio_encoder_()) {
+    _want_audio = false;
+    return;
+  }
+  if (!_audio_seen) {
+    _audio_seen = true;
+    if (tb.sideband.is_object()) {
+      auto sb = tb.sideband.as_object();
+      if (sb.contains("timestamp_us")) {
+        const uint64_t ts = sb.at("timestamp_us").as_uint(0);
+        _audio_ts_mode = true;
+        note_epoch_(ts);
+        _audio_anchor_us = static_cast<int64_t>(ts)
+                         - static_cast<int64_t>(_av_epoch_us);
+        if (_audio_anchor_us < 0) { _audio_anchor_us = 0; }
+      }
+    }
+  }
+  push_audio_samples_(tb);
+  // Open audio-only output here; when video is also wanted the muxer
+  // opens on the first video frame instead and the buffered samples
+  // pump then.
+  maybe_open_muxer_();
+  pump_audio_(false);
+}
+
 void
 HlsBroadcastStage::close_output_()
 {
@@ -827,17 +1607,25 @@ HlsBroadcastStage::close_output_()
   _libs->avformat().api.free_context(_ofctx);
   _ofctx   = nullptr;
   _vstream = nullptr;
+  _astream = nullptr;
 }
 
 void
 HlsBroadcastStage::teardown_()
 {
   // Flush + close muxer first so the trailer is written before we
-  // drop the encoder. write_trailer invokes our io_close on every
+  // drop the encoders. write_trailer invokes our io_close on every
   // outstanding AVIOContext, draining _open_sinks naturally.
-  if (_enc && _ofctx && _header_written && !_trailer_written) {
-    _libs->avcodec().api.send_frame(_enc, nullptr);
-    drain_packets_();
+  if (_ofctx && _header_written && !_trailer_written) {
+    if (_enc) {
+      _libs->avcodec().api.send_frame(_enc, nullptr);
+      drain_packets_();
+    }
+    if (_aenc && _astream) {
+      // Release any samples still buffering (jitter cushion / partial
+      // frame) then flush the audio encoder.
+      pump_audio_(/*flush=*/true);
+    }
   }
   close_output_();
 
@@ -873,120 +1661,123 @@ HlsBroadcastStage::teardown_()
   if (_gbrp_scratch) {
     _libs->avutil().api.frame_free(&_gbrp_scratch);
   }
+  // Audio resources.
+  if (_swr)    { _libs->swresample().api.free(&_swr); }
+  if (_aframe) { _libs->avutil().api.frame_free(&_aframe); }
+  if (_apkt)   { _libs->avcodec().api.packet_free(&_apkt); }
+  if (_aenc)   { _libs->avcodec().api.free_context(&_aenc); }
+  _afifo.clear();
 }
 
 Job
 HlsBroadcastStage::process(RuntimeContext& ctx)
 {
-  auto in_opt = co_await ctx.read(0);
-  if (!in_opt) {
+  const unsigned n = ctx.num_iports();
+
+  // Gather the still-open iports (unread backlog, or not yet at EOS).
+  std::vector<unsigned> open;
+  open.reserve(n);
+  for (unsigned p = 0; p < n; ++p) {
+    if (ctx.backlog(p) > 0 || !ctx.eos(p)) { open.push_back(p); }
+  }
+  if (open.empty()) {
+    // Every input is drained + closed -> we're done. drain() flushes.
     ctx.signal_done();
     co_return;
   }
-  const auto* tin = dynamic_cast<const TensorBeatPayload*>(in_opt.get());
-  if (!tin || tin->shape.size() != 3 || tin->shape[0] != 3) {
-    session()->warn(fmt(
-        "hls-broadcast('{}'): iport0 not a [3,H,W] TensorBeat — "
-        "dropping beat", this->id()));
+
+  // Resolve roles up-front (idempotent) so an audio-only stream can go live
+  // with a silent track at startup -- before the producer's first PCM beat --
+  // and viewers that attach early hear silence instead of a 404. The stall
+  // path below then keeps the silence advancing until real audio arrives.
+  resolve_roles_(ctx);
+  prime_audio_silence_(ctx);
+
+  // Audio-only realtime stall: the PCM producer is wired but idle, so
+  // read_any() below would block indefinitely and freeze the audio
+  // track. Instead nap ~one frame on the pool timer (without pinning a
+  // worker) and pump silence up to the wall clock, then return so the
+  // driver re-enters -- a self-clocked silence source that keeps the
+  // live edge advancing until real PCM resumes or the input closes. Real
+  // beats arriving during the nap are drained on the next iteration (the
+  // added latency is at most one frame, ~21ms at 48 kHz).
+  if (audio_stall_silence_due_(ctx)) {
+    pump_audio_(/*flush=*/false);
+    const double frame_secs =
+        static_cast<double>(_aenc_frame_size) / _audio_sample_rate;
+    const auto chunk =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(frame_secs));
+    ThreadPool* pool = session() ? session()->thread_pool() : nullptr;
+    if (pool) {
+      co_await TimerAwaiter{pool, chunk};
+    } else {
+      // No pool (e.g. a unit context): fall back to a blocking nap.
+      std::this_thread::sleep_for(chunk);
+    }
     co_return;
   }
-  const int H = static_cast<int>(tin->shape[1]);
-  const int W = static_cast<int>(tin->shape[2]);
 
-  if (!_enc) {
-    if (!ensure_encoder_(H, W)) {
-      ctx.signal_done();
-      co_return;
-    }
-    if (!ensure_sws_(H, W)) {
-      ctx.signal_done();
-      co_return;
-    }
-    if (!open_output_()) {
-      ctx.signal_done();
-      co_return;
-    }
-    if (_serve_http) {
-      _http = std::make_unique<StaticFileServer>(
-          session(), /*doc_root*/ "", _bind_address, _http_port,
-          &_blobs);
-      if (!_http->start()) {
+  // Wait until at least one open port is readable, then drain whatever
+  // is ready on each. read_any handles the two clock domains (video is
+  // faster than audio) without blocking on the slower one.
+  co_await ctx.read_any(open);
+
+  for (unsigned p : open) {
+    const std::uint32_t avail = ctx.backlog(p);
+    for (std::uint32_t i = 0; i < avail; ++i) {
+      auto beat = co_await ctx.read(p);
+      if (!beat) { break; }   // this port hit EOS mid-drain
+      const auto* tb =
+          dynamic_cast<const TensorBeatPayload*>(beat.get());
+      if (!tb) {
         session()->warn(fmt(
-            "hls-broadcast('{}'): static HTTP server failed to "
-            "start on {}:{}; the in-memory blob registry is still "
-            "being populated and is accessible via the stage's "
-            "blobs() inspector for tests.",
-            this->id(), _bind_address, _http_port));
-        _http.reset();
+            "hls-broadcast('{}'): iport {} beat is not a TensorBeat "
+            "-- dropping", this->id(), p));
+        continue;
+      }
+      if (!_roles_resolved) { resolve_roles_(ctx); }
+      // Strict positional roles: iport 0 carries video, iport 1 carries
+      // audio. A beat whose rank doesn't match its port's role is
+      // dropped (e.g. PCM audio wrongly wired to the video port 0).
+      const bool is_video = (tb->shape.size() == 3 && tb->shape[0] == 3);
+      const bool is_audio = (tb->shape.size() == 1
+                             || tb->shape.size() == 2);
+      if (p == 0) {
+        if (is_video) {
+          ++_frames_in;
+          handle_video_(*tb);
+        } else {
+          session()->warn(fmt(
+              "hls-broadcast('{}'): iport 0 is the VIDEO port but got a "
+              "rank-{} beat (audio belongs on iport 1) -- dropping",
+              this->id(), tb->shape.size()));
+        }
+      } else if (p == 1) {
+        if (is_audio) {
+          handle_audio_(*tb);
+        } else {
+          session()->warn(fmt(
+              "hls-broadcast('{}'): iport 1 is the AUDIO port but got a "
+              "rank-{} beat -- dropping", this->id(), tb->shape.size()));
+        }
       }
     }
-  } else if (H != _enc_h || W != _enc_w) {
-    session()->warn(fmt(
-        "hls-broadcast('{}'): resolution changed mid-stream "
-        "({}x{} -> {}x{}); dropping frame",
-        this->id(), _enc_w, _enc_h, W, H));
-    co_return;
   }
 
-  // Diagnostic: log min/mean/max of the input tensor periodically.
-  // A frame whose mean is essentially 0 and whose range is < a few
-  // percent is the smoking gun for "all-black playback" — it means
-  // the data is already black before we touch it, so the bug is
-  // upstream of this stage.
-  if (_log_input_stats_every > 0) {
-    if ((_frames_in % static_cast<uint64_t>(_log_input_stats_every))
-        == 0) {
-      double mn = 0.0, mx = 0.0, sum = 0.0;
-      size_t n   = 0;
-      bool   any = false;
-      auto accum = [&](double v) {
-        if (!any) { mn = mx = v; any = true; }
-        else      { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
-        sum += v;
-      };
-      if (tin->dtype == TensorBeat::DType::F32) {
-        AlignedVector<float> tmp;
-        const float* data = nullptr;
-        if (tin->is_contiguous()) {
-          data = tin->as_f32();
-          n    = tin->element_count();
-        } else {
-          tmp  = tin->materialize_contiguous_as<float>();
-          data = tmp.data();
-          n    = tmp.size();
-        }
-        for (size_t i = 0; i < n; ++i) {
-          accum(static_cast<double>(data[i]));
-        }
-      } else if (tin->dtype == TensorBeat::DType::U8) {
-        AlignedVector<uint8_t> tmp;
-        const uint8_t* data = nullptr;
-        if (tin->is_contiguous()) {
-          data = tin->as_u8();
-          n    = tin->element_count();
-        } else {
-          tmp  = tin->materialize_contiguous();
-          data = tmp.data();
-          n    = tmp.size();
-        }
-        for (size_t i = 0; i < n; ++i) {
-          accum(static_cast<double>(data[i]));
-        }
-      }
-      session()->info(fmt(
-          "hls-broadcast('{}'): input frame #{} dtype={} shape=[3,{},{}] "
-          "elements={} min={:.4f} mean={:.4f} max={:.4f}",
-          this->id(), _frames_in, tin->dtype_name(), H, W, n,
-          mn, n > 0 ? sum / static_cast<double>(n) : 0.0, mx));
-    }
+  // If video was expected (>=2 inputs) but its port closed without ever
+  // delivering a frame, fall back to an audio-only stream so a live
+  // audio input still broadcasts.
+  if (_want_video && !_enc && _want_audio && n >= 1 && ctx.eos(0)) {
+    session()->info(fmt(
+        "hls-broadcast('{}'): video input closed with no frames; "
+        "broadcasting audio only", this->id()));
+    _want_video = false;
+    maybe_open_muxer_();
+    pump_audio_(false);
   }
-  ++_frames_in;
 
-  AVFrame* yuv = tensor_to_yuv_(*tin);
-  if (yuv) {
-    send_and_mux_(yuv);
-    _libs->avutil().api.frame_free(&yuv);
-  }
+  if (_fatal) { ctx.signal_done(); }
 }
 
 Job

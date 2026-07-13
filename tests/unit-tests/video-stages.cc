@@ -9,8 +9,8 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
-#include "stages/audio-video/video-file-decoder-stage.h"
-#include "stages/audio-video/video-file-encoder-stage.h"
+#include "stages/load-video-stage.h"
+#include "stages/save-video-stage.h"
 #include "stages/audio-video/video-tokens.h"
 
 #include <cstdio>
@@ -70,7 +70,7 @@ file_size_or_zero_(const string& path)
 
 // Test-only stage that emits one VideoStreamParams header followed by
 // `target_frames` plain-grey YUV420P AVFrames, then closes its
-// output. Used to drive the real VideoFileEncoderStage end-to-end
+// output. Used to drive the real SaveVideoStage end-to-end
 // without needing an input file.
 class SynthVideoSource : public TypedStage<SynthVideoSource> {
 public:
@@ -142,7 +142,7 @@ TEST(video_stages, decoder_oport_arity_follows_config) {
 
   {
     FlexData cfg = FlexData::from_json(R"({"input_url":"x"})");
-    VideoFileDecoderStage d(&sess, "d", {}, std::move(cfg));
+    LoadVideoStage d(&sess, "d", {}, std::move(cfg));
     EXPECT_TRUE(d.num_oports() == 2);
     EXPECT_TRUE(d.video_port() == 0);
     EXPECT_TRUE(d.audio_port() == 1);
@@ -150,7 +150,7 @@ TEST(video_stages, decoder_oport_arity_follows_config) {
   {
     FlexData cfg = FlexData::from_json(
       R"({"input_url":"x","enable_audio":false})");
-    VideoFileDecoderStage d(&sess, "d", {}, std::move(cfg));
+    LoadVideoStage d(&sess, "d", {}, std::move(cfg));
     EXPECT_TRUE(d.num_oports() == 1);
     EXPECT_TRUE(d.video_port() == 0);
     EXPECT_TRUE(d.audio_port() == -1);
@@ -158,7 +158,7 @@ TEST(video_stages, decoder_oport_arity_follows_config) {
   {
     FlexData cfg = FlexData::from_json(
       R"({"input_url":"x","enable_video":false})");
-    VideoFileDecoderStage d(&sess, "d", {}, std::move(cfg));
+    LoadVideoStage d(&sess, "d", {}, std::move(cfg));
     EXPECT_TRUE(d.num_oports() == 1);
     EXPECT_TRUE(d.video_port() == -1);
     EXPECT_TRUE(d.audio_port() == 0);
@@ -169,7 +169,7 @@ TEST(video_stages, decoder_oport_arity_follows_config) {
 // config_error() and deferred to launch.
 TEST(video_stages, decoder_missing_input_url_deferred) {
   Session sess;
-  VideoFileDecoderStage d(&sess, "d", {}, FlexData::make_object());
+  LoadVideoStage d(&sess, "d", {}, FlexData::make_object());
   EXPECT_FALSE(d.config_error().empty());
 }
 
@@ -179,13 +179,13 @@ TEST(video_stages, encoder_iport_arity_validates) {
   // 0 input edges is recorded as a config error (deferred to launch).
   FlexData cfg = FlexData::from_json(
     R"({"output_url":"/tmp/x.mp4","enable_audio":false})");
-  VideoFileEncoderStage e(&sess, "e", {}, std::move(cfg));
+  SaveVideoStage e(&sess, "e", {}, std::move(cfg));
   EXPECT_FALSE(e.config_error().empty());
 }
 
 TEST(video_stages, encoder_missing_output_url_deferred) {
   Session sess;
-  VideoFileEncoderStage e(&sess, "e", {}, FlexData::make_object());
+  SaveVideoStage e(&sess, "e", {}, FlexData::make_object());
   EXPECT_FALSE(e.config_error().empty());
 }
 
@@ -215,7 +215,7 @@ TEST(video_stages, encoder_unit_with_synth_frames) {
     obj.insert("video", std::move(v));
   }
 
-  auto enc_u = make_unique<VideoFileEncoderStage>(
+  auto enc_u = make_unique<SaveVideoStage>(
     &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
   pl->insert_stage(std::move(enc_u));
 
@@ -248,10 +248,10 @@ TEST(video_stages, round_trip_or_skips) {
   dec_cfg.as_object().insert("input_url",
                              FlexData::make_string(in_path));
   dec_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
-  auto dec_u = make_unique<VideoFileDecoderStage>(
+  auto dec_u = make_unique<LoadVideoStage>(
     &sess, "dec", vector<InEdge>{}, std::move(dec_cfg));
   dec_u->allocate_oports(1);
-  auto* dec = static_cast<VideoFileDecoderStage*>(
+  auto* dec = static_cast<LoadVideoStage*>(
     pl->insert_stage(std::move(dec_u)));
 
   FlexData enc_cfg = FlexData::make_object();
@@ -264,7 +264,7 @@ TEST(video_stages, round_trip_or_skips) {
                          FlexData::make_string("ultrafast"));
     enc_cfg.as_object().insert("video", std::move(v));
   }
-  auto enc_u = make_unique<VideoFileEncoderStage>(
+  auto enc_u = make_unique<SaveVideoStage>(
     &sess, "enc", vector<InEdge>{{dec, 0}}, std::move(enc_cfg));
   pl->insert_stage(std::move(enc_u));
 

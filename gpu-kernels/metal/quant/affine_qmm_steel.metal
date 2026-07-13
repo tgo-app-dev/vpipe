@@ -47,6 +47,14 @@ typedef bfloat16 bfloat16_t;
 #include "mlx/backend/metal/kernels/steel/gemm/mma.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"
 
+// The _acc16 entry points run the simdgroup MMA in half (FP16 pipe). In the
+// bf16-flavor build (VPIPE_ELT=bfloat) they degrade to f32 accumulate --
+// bfloat and half fragments don't interconvert in MSL, and nothing routes a
+// bf16 _acc16 -- so the entries still compile in both metallibs.
+typedef metal::conditional<
+    metal::is_same<VPIPE_ELT, bfloat>::value, float, half>::type
+    VPIPE_ACC16_T;
+
 // ===================================================================
 // Quantized helpers -- verbatim from MLX quantized.h (affine path).
 // ===================================================================
@@ -288,6 +296,11 @@ struct QuantizedBlockLoader {
 // qmm_t_impl -- verbatim from MLX quantized.h.
 // ===================================================================
 
+// AccumT: the simdgroup-MMA element type. float (default) widens every
+// A/B fragment and accumulates on the FP32 pipe (MLX-identical). half keeps
+// the whole multiply-accumulate on the FP16 pipe (2x ALU rate on M3/M4-class
+// GPUs) at the cost of f16 accumulation error over K -- callers must verify
+// against their accuracy bar before routing to an _acc16 entry point.
 template <
     typename T,
     const int group_size,
@@ -295,7 +308,10 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    typename AccumT = float,
+    const int WM = 2,
+    const int WN = 2>
 METAL_FUNC void qmm_t_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -318,16 +334,14 @@ METAL_FUNC void qmm_t_impl(
 
   (void)lid;
 
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   // Instantiate the appropriate BlockMMA and Loader
-  using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using mma_t = mlx::steel::BlockMMA<
+      T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded, AccumT>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -454,6 +468,123 @@ kernel void affine_qmm_steel_w4g64(
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
+// BM=64 tile twin of affine_qmm_steel_w4g64 for tall-M GEMMs (M ~= seq,
+// e.g. the Krea-2 DiT blocks). Same 128 threads compute a 64-row output
+// tile, so each dequantized [BN,BK] weight tile serves twice the output
+// rows -- halving both the weight-code re-reads (M/BM passes over the
+// codes) and the per-FLOP dequant ALU work vs the 32x32 tile. Mirrors
+// the dense dense_gemm_t_bm64_f16 tuning. Grid: x=ceil(N/32)*32,
+// y=ceil(M/64)*2, z=2 (threadgroup {32,2,2}).
+kernel void affine_qmm_steel_w4g64_bm64(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+// BM=128 tile (WM=4, WN=2 -> 256 threads, 8 simdgroups; each simdgroup owns a
+// 32x16 output tile = 8 accumulator frags, no register spill). Halves the
+// weight-code re-reads + dequant ALU again vs the BM=64 tile (M/128 vs M/64
+// passes over the codes). MEASURED ~7-8% SLOWER than BM=64 on M4 Pro at
+// M=4106/1024px (see the host _qmm_tile note): these GEMMs are compute/
+// occupancy-bound, not weight-bandwidth-bound, so fewer weight re-reads
+// doesn't pay while the bigger 128-row/256-thread tile halves the threadgroup
+// count and cuts latency-hiding. Kept opt-in (host gates on M >= 1024, tile
+// 2) only for an M5 matrix-core retest. Grid: x=ceil(N/32)*32, y=ceil(M/128)
+// *2, z=4 (threadgroup {32,2,4}).
+kernel void affine_qmm_steel_w4g64_bm128(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 128, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN, float,
+             /*WM=*/4, /*WN=*/2>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+// FP16-pipe (AccumT=half) twin of affine_qmm_steel_w4g64_bm64: the whole
+// simdgroup MMA runs on half8x8 fragments instead of widening to float.
+// Only pays on a GPU whose f16 matrix rate exceeds f32. MEASURED (M4 Pro
+// 20c, dg_mma_rate probes): f16 10.4 vs f32 10.1 TFLOP/s (+3%) and mixed
+// f16+f32 SLOWER (7.6) -- no double-rate/dual-issue f16 pipe, so this is
+// perf-neutral there and stays opt-in (VPIPE_KREA2_ACC16; costs accuracy:
+// f16 accumulation drift over K). Re-probe before enabling on new GPUs.
+kernel void affine_qmm_steel_w4g64_bm64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_steel_w8g64_bm64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
 // group_size=32 twin of affine_qmm_steel_w4g64 (GGUF q4_0). Only the
 // template group_size differs.
 kernel void affine_qmm_steel_w4g32(
@@ -495,17 +626,23 @@ kernel void affine_qmm_steel_w4g32(
 //
 //   0:w(uint32) 1:scales 2:biases 3:x 4:y([M, N/2]) 5:K 6:N(=2*ffn) 7:M
 //
-// qmm_t_swiglu_impl mirrors qmm_t_impl's MMA loop verbatim; only the
-// epilogue (store) differs. N must be even and the matmul N tail is
-// assumed aligned (2*ffn % BN == 0), so only the M tail needs guarding.
+// qmm_t_swiglu_rs_impl is the GENERIC (strided-output) SwiGLU GEMM: it writes
+// silu(gate)*up into y[row*out_rs + out_off + g], where out_rs = out_stride or
+// (out_stride<=0) the contiguous N/2. The non-strided qmm_t_swiglu_impl below is
+// a thin wrapper (out_stride=out_off=0) so its callers (Krea-2 etc.) are
+// unchanged. Mirrors qmm_t_impl's MMA loop; N even, matmul N tail aligned
+// (2*ffn % BN == 0), only the M tail guarded.
 template <
     typename T,
     const int group_size,
     const int bits,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
-METAL_FUNC void qmm_t_swiglu_impl(
+    const int BN = 32,
+    typename AccumT = float,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void qmm_t_swiglu_rs_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -516,17 +653,17 @@ METAL_FUNC void qmm_t_swiglu_impl(
     const constant int& K,
     const constant int& N,
     const constant int& M,
+    const int out_stride,
+    const int out_off,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using mma_t = mlx::steel::BlockMMA<
+      T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded, AccumT>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -577,7 +714,7 @@ METAL_FUNC void qmm_t_swiglu_impl(
   constexpr int FS = 8;
   constexpr int TM = BM / (FS * WM);   // simdgroup tiles along M (2)
   constexpr int TN = BN / (FS * WN);   // simdgroup tiles along N (2)
-  const int outN = N / 2;
+  const int outN = out_stride > 0 ? out_stride : N / 2;   // output row stride
   const short sm = mma_op.sm;
   const short sn = mma_op.sn;
   for (short ti = 0; ti < TM; ti++) {
@@ -589,9 +726,40 @@ METAL_FUNC void qmm_t_swiglu_impl(
       const float ga = (float)fr[0];               // gate (even col)
       const float up = (float)fr[1];               // up   (odd col)
       const float s = ga / (1.0f + metal::exp(-ga));
-      y[(int64_t)row * outN + (col >> 1)] = (T)(s * up);
+      y[(int64_t)row * outN + out_off + (col >> 1)] = (T)(s * up);
     }
   }
+}
+
+// Non-strided wrapper: the original qmm_t_swiglu_impl signature (contiguous
+// output, N/2 wide). Existing entry points (Krea-2's fused FF, etc.) call this
+// unchanged; it forwards to the generic with out_stride = out_off = 0.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32,
+    typename AccumT = float,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void qmm_t_swiglu_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  qmm_t_swiglu_rs_impl<T, group_size, bits, BM, BK, BN, AccumT, WM, WN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, 0, 0, tid, simd_gid, simd_lid);
 }
 
 kernel void affine_qmm_swiglu_w4g64(
@@ -613,6 +781,156 @@ kernel void affine_qmm_swiglu_w4g64(
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// BM=128 (WM=4, WN=2 -> 256 threads) twin of the fused SwiGLU GEMM. This is
+// the biggest DiT GEMM (FF gate+up, N = 2*FF = 32768) and the ONLY quantized
+// tile that had stayed at BM=32, so at high res (M = seq = 4106) it re-read
+// the fused gate|up codes M/32 = 128x; BM=128 cuts that to M/128 = 33x (4x
+// fewer weight re-reads + dequant). Host-gated on M >= 1024. Grid:
+// x=ceil(2*FF/32)*32, y=ceil(M/128)*2, z=4 (threadgroup {32,2,4}).
+kernel void affine_qmm_swiglu_w4g64_bm128(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 128, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN, float, /*WM=*/4, /*WN=*/2>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// FP16-pipe (AccumT=half) twin of affine_qmm_swiglu_w4g64 (see the qmm
+// _acc16 comment); the fused silu(gate)*up epilogue math stays f32.
+kernel void affine_qmm_swiglu_w4g64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// BM64 fused-SwiGLU (Krea-2's tile choice for the FF): a 64-row tile between the
+// BM32 base and BM128, float or FP16-pipe (acc16) accumulate.
+kernel void affine_qmm_swiglu_w4g64_bm64(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_swiglu_w4g64_bm64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// Strided-output BM64 fused-SwiGLU (writes silu(gate)*up into y[:, off:] of a
+// wider buffer, row stride out_stride) -- lets the FLUX.2 single block write the
+// mlp straight into scat[:, H:] with no concat. buffer(8)=out_stride,
+// buffer(9)=out_off.
+kernel void affine_qmm_swiglu_w4g64_bm64_rs(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    const constant int&    out_stride [[buffer(8)]],
+    const constant int&    out_off    [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_rs_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, out_stride, out_off,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_swiglu_w4g64_bm64_rs_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    const constant int&    out_stride [[buffer(8)]],
+    const constant int&    out_off    [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_rs_impl<VPIPE_ELT, 64, 4, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, out_stride, out_off,
       tid, simd_gid, simd_lid);
 }
 
@@ -1130,6 +1448,56 @@ kernel void affine_qmm_steel_w8g64(
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
+// BM=64 tile twin of affine_qmm_steel_w8g64 (see the w4 bm64 comment).
+kernel void affine_qmm_steel_w8g64_bm64(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+// BM=128 (WM=4, WN=2) twin of affine_qmm_steel_w8g64_bm64 -- see the w4 bm128
+// note. Host-gated on M >= 1024.
+kernel void affine_qmm_steel_w8g64_bm128(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 128, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN, float,
+             /*WM=*/4, /*WN=*/2>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
 // group_size=32 twin of affine_qmm_steel_w8g64 (the MOSS codec int8 path):
 // only the template group_size differs. Requires N % 32 == 0 (aligned_N).
 kernel void affine_qmm_steel_w8g32(
@@ -1174,6 +1542,147 @@ kernel void affine_qmm_swiglu_w8g64(
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// BM=128 (WM=4, WN=2) twin of affine_qmm_swiglu_w8g64 -- see the w4 bm128
+// note. Host-gated on M >= 1024.
+kernel void affine_qmm_swiglu_w8g64_bm128(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 128, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN, float, /*WM=*/4, /*WN=*/2>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// FP16-pipe (AccumT=half) twin of affine_qmm_swiglu_w8g64.
+kernel void affine_qmm_swiglu_w8g64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// BM64 fused-SwiGLU, 8-bit (Krea-2's FF tile choice); float or acc16 accumulate.
+kernel void affine_qmm_swiglu_w8g64_bm64(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_swiglu_w8g64_bm64_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// Strided-output BM64 fused-SwiGLU, 8-bit (FLUX.2 single-block mlp -> scat[:,H:]).
+kernel void affine_qmm_swiglu_w8g64_bm64_rs(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    const constant int&    out_stride [[buffer(8)]],
+    const constant int&    out_off    [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_rs_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, out_stride, out_off,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_swiglu_w8g64_bm64_rs_acc16(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],
+    const constant int&    M      [[buffer(7)]],
+    const constant int&    out_stride [[buffer(8)]],
+    const constant int&    out_off    [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_rs_impl<VPIPE_ELT, 64, 8, BM, BK, BN, VPIPE_ACC16_T>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, out_stride, out_off,
       tid, simd_gid, simd_lid);
 }
 

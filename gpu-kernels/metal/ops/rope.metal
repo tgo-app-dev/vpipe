@@ -379,6 +379,39 @@ kernel void rope_interleaved_f16(
   x[base + 2 * i + 1] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// Table-driven adjacent-pair RoPE (Krea-2 DiT / Flux 3-axis): apply a
+// precomputed per-position cos/sin table [T, D] to x[H, T, D] in place, using
+// the adjacent-pair ("repeat_interleave_real") convention -- the host builds
+// cos/sin by concatenating the (t,h,w) rotary axes, so the kernel is generic.
+//   out[2i]   = x[2i] * cos[2i] - x[2i+1] * sin[2i]
+//   out[2i+1] = x[2i] * sin[2i] + x[2i+1] * cos[2i]     (cos/sin repeat-interl.)
+//   0:x[H,T,D] (in/out) 1:cos[T,D] 2:sin[T,D] 3:H 4:T 5:D.  grid (D/2, T, H).
+kernel void rope_pair_table_f16(
+    device VPIPE_ELT*       x    [[buffer(0)]],
+    const device VPIPE_ELT* cosb [[buffer(1)]],
+    const device VPIPE_ELT* sinb [[buffer(2)]],
+    constant int&       H    [[buffer(3)]],
+    constant int&       T    [[buffer(4)]],
+    constant int&       D    [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  (void)H;
+  const int half_d = D / 2;
+  const int i = (int)gid.x;
+  if (i >= half_d) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+
+  const uint cb = (uint)t * D + 2 * i;
+  const float c = float(cosb[cb]);
+  const float s = float(sinb[cb]);
+  const uint base = ((uint)h * T + t) * D + 2 * i;
+  const float x1 = float(x[base]);
+  const float x2 = float(x[base + 1]);
+  x[base]     = VPIPE_ELT(x1 * c - x2 * s);
+  x[base + 1] = VPIPE_ELT(x1 * s + x2 * c);
+}
+
 // Partial RoPE (Qwen3.5): rotate only the FIRST `rotary_dim` of each
 // head's `D` dims, leaving [rotary_dim, D) untouched (pass-through). The
 // rotated block uses the half-split convention over rotary_dim/2 pairs;

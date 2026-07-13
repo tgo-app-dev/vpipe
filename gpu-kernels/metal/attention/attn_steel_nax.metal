@@ -75,10 +75,28 @@ template [[host_name("attn_steel_nax_h_bd64")]] [[kernel]] decltype(attention_na
                                                                     float>)
 attention_nax<half, 64, 32, 64, 4, 1, half, float>;
 
+// head_dim 128 (Krea-2 MMDiT joint attention -- GQA 48q/12kv). bq=64 (the NAX
+// static_assert needs BQ >= kNWarps*kU = 4*16 = 64, a multiple of 64), bk=32,
+// bd=128 -> TD = BD/kU = 8. Same AttnParams + func-const contract as bd64; only
+// the head dim (and thus the register-resident O tile) grows.
+template [[host_name("attn_steel_nax_h_bd128")]] [[kernel]] decltype(attention_nax<
+                                                                     half,
+                                                                     64,
+                                                                     32,
+                                                                     128,
+                                                                     4,
+                                                                     1,
+                                                                     half,
+                                                                     float>)
+attention_nax<half, 64, 32, 128, 4, 1, half, float>;
+
 #else
 // Tensor ops unavailable for this target: a stub so the metallib still builds.
 // The loader never binds this on a non-tensor (pre-M5) GPU.
 kernel void attn_steel_nax_h_bd64(device half* O [[buffer(3)]],
                                   uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_h_bd128(device half* O [[buffer(3)]],
+                                   uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (half)0; } }
 #endif

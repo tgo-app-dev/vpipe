@@ -121,6 +121,25 @@ public:
     return p < s.oports.size() ? s.oports[p].type : nullptr;
   }
 
+  // Per-port payload TAGS: an optional finer-grained constraint on top of
+  // the beat type (comma-separated, OR semantics; see PortSpec::tags and
+  // port_tags_compatible). PipelineRuntime and the web-ui composer require
+  // a producer oport's tags and a consumer iport's tags to be compatible
+  // in addition to the beat types. Default: read from spec().{i,o}ports[p]
+  // (empty when undeclared -> no constraint).
+  virtual std::string_view
+  iport_payload_tags(unsigned p) const noexcept
+  {
+    const StageSpec& s = spec();
+    return p < s.iports.size() ? s.iports[p].tags : std::string_view{};
+  }
+  virtual std::string_view
+  oport_payload_tags(unsigned p) const noexcept
+  {
+    const StageSpec& s = spec();
+    return p < s.oports.size() ? s.oports[p].tags : std::string_view{};
+  }
+
   // Read-only access to the configuration tree the stage was
   // constructed with. Public so pipeline serialization can
   // round-trip a stage's config back into the spec; derived
@@ -269,6 +288,19 @@ protected:
   std::uint64_t attr_uint(std::string_view key) const;
   double      attr_real(std::string_view key) const;
   std::string attr_str (std::string_view key) const;
+  // Like attr_str, but for a LOCAL file path: the value is confined to
+  // the session file sandbox (chroot-like) via
+  // session()->confine_path. A network URL (rtsp/http(s)/...) is
+  // returned unchanged (it is not a filesystem path); a file:// prefix
+  // is stripped before confining. On a sandbox escape the stage's config
+  // is failed (fail_config) and "" is returned. When `for_write` the
+  // parent directory is created. Non-const because it may fail_config.
+  std::string attr_path(std::string_view key, bool for_write);
+  // Confine one already-read path/URL string to the file sandbox (the
+  // shared core of attr_path). Network URLs pass through; file:// is
+  // stripped; a sandbox escape calls fail_config and returns "". For
+  // stages that parse their own path arrays (load-image / load-text).
+  std::string confine_local_(std::string_view raw, bool for_write);
   // Composite / any-typed attribute as a FlexData (the configured
   // value, else the schema default container).
   FlexData    attr     (std::string_view key) const;

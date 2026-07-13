@@ -17,6 +17,7 @@
 #include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/moss/metal-moss-codec-v2.h"
 #include "generative-models/moss/metal-moss-v15-model.h"
+#include "generative-models/moss/metal-moss-rt-model.h"
 #include "generative-models/tokenizer.h"
 #endif
 
@@ -51,7 +52,12 @@ namespace vpipe {
 //
 //   iport0  FlexDataPayload carrying the text to speak. Accepts either a
 //           plain FlexData string OR a FlexData object with a "text"
-//           key (mirrors text-chat's forgiving input handling).
+//           key (mirrors text-chat's forgiving input handling). BARGE-IN
+//           (interrupt_on_new_text, default on): if a new text beat arrives
+//           here while the current utterance is still generating, the current
+//           one is cut short -- the audio produced so far is flushed, then
+//           generation stops and the newer text is served. Set the config
+//           false to instead finish every utterance fully (queued FIFO).
 //
 //   iport1  OPTIONAL TensorBeatPayload, mono f32 PCM (any sample rate;
 //           sideband.sample_rate honoured) -- a REFERENCE voice to clone.
@@ -59,14 +65,24 @@ namespace vpipe {
 //           it to RVQ codes (the MOSS-Audio-Tokenizer analysis path), and
 //           splices those into the prompt's - Reference(s): section so the
 //           synthesized speech adopts the reference's timbre. The latest
-//           reference beat is sticky (it sets the voice for subsequent
-//           text). Loading the codec's encoder ~doubles its resident
-//           weights, so it is loaded only when iport1 is connected.
+//           reference beat is STICKY -- it sets the voice for every later
+//           utterance until a new reference arrives. This port is its OWN
+//           clock domain (clock_group 1): it arrives independently of the
+//           text stream / PCM output, not rate-locked to them, and is drained
+//           non-blocking at the start of each beat. Loading the codec's
+//           encoder ~doubles its resident weights, so it is loaded only when
+//           iport1 is connected.
 //
-//   oport0  TensorBeatPayload, rank-1 [n_samples] f32 PCM at 24 kHz, with
-//           `sample_rate` set in the beat's sideband object. The oport is
-//           unconditional; downstream consumers are optional (the runtime
-//           drops writes when no cursor is attached).
+//   oport0  TensorBeatPayload f32 PCM ([channels, n_samples]; 24 kHz mono for
+//           8B/realtime, 48 kHz stereo for v1.5), with `sample_rate` in the
+//           beat's sideband. With stream_chunk_frames>0 (the default) the LM
+//           decode and codec decode are INTERLEAVED: a chunk of PCM is emitted
+//           every stream_chunk_frames generated frames (via the codec's
+//           windowed-KV streaming decode), so a text beat produces a STREAM of
+//           PCM beats with near-realtime first-audio latency instead of one big
+//           beat at the end. stream_chunk_frames=0 restores the single-beat
+//           one-shot decode. The oport is unconditional; downstream consumers
+//           are optional (the runtime drops writes when no cursor is attached).
 //
 // Per beat the stage:
 //   0. Drains any reference-audio beats on iport1 (voice cloning): resamples
@@ -125,6 +141,9 @@ public:
   const std::string& codec_dir() const noexcept { return _codec_dir; }
   int max_new_tokens()           const noexcept { return _max_new_tokens; }
   int max_frames()               const noexcept { return _max_frames; }
+  int stream_chunk_frames()      const noexcept { return _stream_chunk; }
+  bool interrupt_on_new_text()   const noexcept
+  { return _interrupt_on_new_text; }
   std::uint64_t clips_emitted()  const noexcept { return _clips_emitted; }
 
 private:
@@ -134,6 +153,8 @@ private:
   std::string _codec_dir;
   std::string _models_db;
   int         _max_new_tokens{};
+  int         _stream_chunk{}; // emit PCM every N codec frames (0 = one-shot)
+  bool        _interrupt_on_new_text{}; // barge-in: abort in-flight on new text
   bool        _codec_int8{};   // codec_quant == "int8": int8 g32 codec weights
   // v1.5-only config (ignored for the 8B variant).
   int         _max_frames{};
@@ -167,7 +188,18 @@ private:
   std::unique_ptr<genai::MetalMossCodec>    _codec;
   std::unique_ptr<genai::MetalMossV15Model> _lm_v15;
   std::unique_ptr<genai::MetalMossCodecV2>  _codec_v15;
+  // Realtime variant (model_type moss_tts_realtime): a MetalMossRtModel
+  // (Qwen3-1.7B backbone + 4-layer depth decoder, 16 RVQ codes/frame) feeding
+  // the 24 kHz MetalMossCodec (_codec, shared with the 8B path). Loaded only
+  // when the LM dir's config.json model_type is "moss_tts_realtime".
+  std::unique_ptr<genai::MetalMossRtModel>  _lm_rt;
   std::unique_ptr<genai::Tokenizer>         _tokenizer;
+  // Cached codec streaming state, reused across beats (the windowed K/V rings
+  // are sized by stream_chunk_frames, not utterance length, so there is no need
+  // to reallocate per beat -- reset() re-arms them). _stream_v15 pairs with the
+  // codec-v2 (v1.5) path, _stream_v1 with the codec-v1 (8B/realtime) path.
+  std::unique_ptr<genai::MetalMossCodecV2::StreamState> _stream_v15;
+  std::unique_ptr<genai::MetalMossCodec::StreamState>   _stream_v1;
   // Active clone reference: RVQ codes [T][n_vq] spliced into the prompt.
   // Set from an iport1 PCM beat (encode) or, under _voice_lock, from the
   // first beat's own generated codes. Empty => no reference (plain TTS).

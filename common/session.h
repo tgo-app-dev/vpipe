@@ -2,6 +2,7 @@
 #define SESSION_H
 
 #include "common/flex-data.h"
+#include "common/path-sandbox.h"
 #include "interfaces/log-delegate-intf.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "interfaces/session-context-intf.h"
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -111,6 +113,20 @@ public:
   // caller installs it before launching pipelines.
   void set_log_delegate(std::unique_ptr<LogDelegateIntf>);
 
+  // Record the address the web-ui's HTTP server bound to, so stages
+  // that host their own HTTP endpoint (hls-broadcast) can default to
+  // the same interface. Called once by the web-ui app at startup,
+  // before pipelines launch; empty in every other front end. See
+  // SessionContextIntf::web_ui_bind_address.
+  void set_web_ui_bind_address(std::string addr)
+  {
+    _web_ui_bind_address = std::move(addr);
+  }
+  std::string web_ui_bind_address() const override
+  {
+    return _web_ui_bind_address;
+  }
+
   // Session-level resources surfaced through SessionContextIntf so
   // every SessionMember can reach them via session()->...().
   ThreadPool* thread_pool() const noexcept override
@@ -159,6 +175,26 @@ public:
   // through the active log delegate). Concurrent first calls
   // serialise on an internal once_flag.
   LmdbEnv* lmdb_env() const override;
+
+  // Confine a stage-supplied local file path to the session filesystem
+  // sandbox (see SessionContextIntf::confine_path). Passthrough when the
+  // sandbox is disabled.
+  std::filesystem::path
+  confine_path(std::string_view user_path, bool for_write,
+               std::string* err = nullptr) const override;
+
+  // Filesystem-sandbox state (see SessionContextIntf). Reflect the
+  // session's PathSandbox so the web-ui file browser can present the
+  // sandbox's chroot-like namespace.
+  bool fs_sandboxed() const override { return _path_sandbox.enabled(); }
+  std::filesystem::path fs_sandbox_root() const override
+  {
+    return _path_sandbox.root();
+  }
+  std::vector<std::filesystem::path> fs_whitelist() const override
+  {
+    return _path_sandbox.whitelist();
+  }
 
   // Session-shared CoreML model cache. Lazily constructed on first
   // call. Returns nullptr on non-Apple builds. See SessionContextIntf
@@ -215,6 +251,19 @@ private:
   // falls back to the process CWD (".") in that case.
   std::string                      _db_path;
   std::size_t                      _db_map_size = 0;
+
+  // Filesystem sandbox for stage file paths (web-ui default; disabled
+  // for the CLI and under --expose-native-file-system). Parsed once from
+  // the "file_sandbox" config key at construction. Model-manager file
+  // access is intentionally not routed through it.
+  PathSandbox                      _path_sandbox;
+
+  // Set once by the web-ui app (set_web_ui_bind_address) before any
+  // pipeline launches; empty otherwise. Read by HTTP-hosting stages
+  // via SessionContextIntf::web_ui_bind_address to pick a default
+  // bind interface. No synchronization: written before launch, only
+  // read afterward.
+  std::string                      _web_ui_bind_address;
 
   std::unique_ptr<ThreadPool>      _pool;
   unsigned                         _default_edge_capacity = 4;

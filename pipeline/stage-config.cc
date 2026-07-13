@@ -56,6 +56,12 @@ resolve_config_params(span<const ConfigKey> spec, const FlexData& config)
     p.doc             = string(k.doc);
     p.suggest_db      = string(k.suggest_db);
     p.suggest_db_type = string(k.suggest_db_type);
+    p.need_inputs     = string(k.need_inputs);
+    p.need_outputs    = string(k.need_outputs);
+    p.is_path         = k.is_path;
+    p.path_write      = k.path_write;
+    p.path_kind       = string(k.path_kind);
+    p.path_filter     = string(k.path_filter);
     p.default_value   = config_default_value(k);
 
     p.current_value = p.default_value;   // fall back to the default
@@ -94,6 +100,24 @@ config_params_to_flex(const vector<ConfigParam>& params)
     if (!p.suggest_db_type.empty()) {
       ov.insert("suggest_db_type",
                 FlexData::make_string(p.suggest_db_type));
+    }
+    if (!p.need_inputs.empty()) {
+      ov.insert("need_inputs", FlexData::make_string(p.need_inputs));
+    }
+    if (!p.need_outputs.empty()) {
+      ov.insert("need_outputs", FlexData::make_string(p.need_outputs));
+    }
+    if (p.is_path) {
+      ov.insert("is_path", FlexData::make_bool(true));
+      if (p.path_write) {
+        ov.insert("path_write", FlexData::make_bool(true));
+      }
+      if (!p.path_kind.empty()) {
+        ov.insert("path_kind", FlexData::make_string(p.path_kind));
+      }
+      if (!p.path_filter.empty()) {
+        ov.insert("path_filter", FlexData::make_string(p.path_filter));
+      }
     }
     ov.insert("default", p.default_value);
     ov.insert("current", p.current_value);

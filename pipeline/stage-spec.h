@@ -13,11 +13,17 @@ namespace vpipe {
 // web-ui toolbox) and for at-a-glance classification. A stage with no
 // declared category is Generic.
 enum class StageCategory : unsigned char {
-  Generic, Audio, Video, Text, Control, Database, Network, Preparation
+  Generic, Audio, Visual, Vision, Generative, Text, Control, Database,
+  Network, Preparation
 };
 
-// Stable lower-case name ("generic", "audio", "video", "text",
-// "control", "database", "network", "preparation"). Never returns null.
+// Stable lower-case name ("generic", "audio", "visual", "vision",
+// "generative", "text", "control", "database", "network",
+// "preparation"). Never returns null. "visual" is media I/O and frame
+// transforms (image/video load/save, decode/encode, rgb, decimation);
+// "vision" is perception/understanding (detection, tracking, overlay,
+// visual QA); "generative" is model-driven synthesis (text-to-image /
+// -speech, VAE codec, sampler/scheduler selection).
 std::string_view stage_category_name(StageCategory) noexcept;
 
 // Static, type-level declaration of one stage port (input or output).
@@ -26,12 +32,35 @@ std::string_view stage_category_name(StageCategory) noexcept;
 // runtime and the composer treat as compatible with everything. Like
 // ConfigKey, all string_view members must point at static storage --
 // the owning StageSpec outlives every stage instance.
+//
+// `tags` is an OPTIONAL finer-grained payload constraint layered on top
+// of `type`: a comma-separated list of semantic tags with OR meaning --
+// the port produces / accepts ANY of the listed tags. Two ports are
+// tag-compatible iff either declares no tags OR their tag sets intersect
+// (see port_tags_compatible). It distinguishes payloads that share one
+// beat type but are not interchangeable -- e.g. rtsp-capture emits both
+// its video and audio as EncodedSegment, so its video oport tags
+// "video-encoder-segments" and video-to-rgb's iport requires the same,
+// while the audio oport tags "audio-encoder-segments" and is refused.
+// Empty (the default) keeps the legacy behaviour: type alone decides.
 struct PortSpec {
   std::string_view      name;            // short label, e.g. "frames"
   std::string_view      doc;             // one-line description
   const std::type_info* type        = nullptr;
+  std::string_view      tags;            // comma-separated; OR semantics
   unsigned              clock_group  = 0;
 };
+
+// True iff a producer output port advertising the tag list `produced`
+// may feed a consumer input port advertising `accepted`. Both are
+// comma-separated tag lists (surrounding whitespace ignored, empty
+// entries skipped). An empty / all-blank list on EITHER side means "no
+// tag constraint" and is compatible with anything; otherwise the two are
+// compatible iff they share at least one tag (OR semantics). This is the
+// deeper check the runtime and the web-ui composer apply on top of the
+// beat-type match.
+bool port_tags_compatible(std::string_view produced,
+                          std::string_view accepted) noexcept;
 
 // One formal description of a stage type: its human description,
 // category, declared input/output ports, and configuration attributes

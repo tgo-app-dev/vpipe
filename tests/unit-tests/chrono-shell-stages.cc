@@ -2,6 +2,8 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "common/vertex.h"
+#include "common/vpipe-format.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "pipeline/pipeline-handle-impl.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
@@ -13,7 +15,9 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -70,6 +74,64 @@ shell_cfg_(const string& cmd)
   cfg.as_object().insert_or_assign(
       "command", FlexData::make_string(cmd));
   return cfg;
+}
+
+// UI delegate that records every info/warn/error line (so a test can assert
+// the shell stage forwarded stdout->info / stderr->warn) and sources
+// getline() from a canned input queue (for the forward_stdin path). Thread-
+// safe: the stage's stdin-pump thread calls getline concurrently with the
+// drain thread's info/warn.
+class ShellCaptureUi final : public UiDelegateIntf {
+public:
+  ShellCaptureUi(shared_ptr<mutex>          mu,
+                 shared_ptr<vector<string>> lines,
+                 shared_ptr<vector<string>> input)
+    : _mu(std::move(mu)), _lines(std::move(lines)),
+      _input(std::move(input)) {}
+
+  void error(const VpipeFormat& f) override { rec_(f); }
+  void warn (const VpipeFormat& f) override { rec_(f); }
+  void info (const VpipeFormat& f) override { rec_(f); }
+
+  UiInputStatus
+  getline(const VpipeFormat&, string& out,
+          const function<bool()>&) override
+  {
+    lock_guard<mutex> g(*_mu);
+    if (_input->empty()) {
+      return UiInputStatus::Eof;
+    }
+    out = _input->front();
+    _input->erase(_input->begin());
+    return UiInputStatus::Ok;
+  }
+
+  unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return make_unique<NullUiTextStream>();
+  }
+
+private:
+  void rec_(const VpipeFormat& f)
+  {
+    string s = f();
+    lock_guard<mutex> g(*_mu);
+    _lines->push_back(std::move(s));
+  }
+  shared_ptr<mutex>          _mu;
+  shared_ptr<vector<string>> _lines;
+  shared_ptr<vector<string>> _input;
+};
+
+bool
+has_substr_(const vector<string>& v, const string& want)
+{
+  for (const auto& s : v) {
+    if (s.find(want) != string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }
@@ -143,6 +205,74 @@ TEST(shell_stage, empty_command_deferred) {
       "command", FlexData::make_string(""));
   ShellStage s(&sess, "sh", {}, std::move(cfg));
   EXPECT_FALSE(s.config_error().empty());
+}
+
+// The command's stdout is forwarded to the UI info() channel and its
+// stderr to warn(), so a shell program's output reaches the front end.
+TEST(shell_stage, forwards_stdout_to_info_and_stderr_to_warn) {
+  Session sess;
+  auto mu    = make_shared<mutex>();
+  auto lines = make_shared<vector<string>>();
+  auto input = make_shared<vector<string>>();
+  sess.set_ui_delegate(make_unique<ShellCaptureUi>(mu, lines, input));
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto* src = pl->insert_stage("chrono", "src", {}, chrono_cfg_(0.01, 1));
+  ASSERT_TRUE(src != nullptr);
+  auto* sink = pl->insert_stage(
+      "shell", "sink", vector<InEdge>{{src, 0}},
+      shell_cfg_("echo hello-out; echo bad-err 1>&2"));
+  ASSERT_TRUE(sink != nullptr);
+
+  PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+
+  {
+    lock_guard<mutex> g(*mu);
+    EXPECT_TRUE(has_substr_(*lines, "hello-out"));
+    EXPECT_TRUE(has_substr_(*lines, "bad-err"));
+  }
+  auto* shell = dynamic_cast<ShellStage*>(sink);
+  ASSERT_TRUE(shell != nullptr);
+  EXPECT_TRUE(shell->invocations() == 1u);
+  EXPECT_TRUE(shell->last_status() == 0);
+}
+
+// forward_stdin=true feeds the UI's getline() to the command's stdin: `cat`
+// echoes the typed line back, which is forwarded to info().
+TEST(shell_stage, forward_stdin_feeds_command_stdin) {
+  Session sess;
+  auto mu    = make_shared<mutex>();
+  auto lines = make_shared<vector<string>>();
+  auto input = make_shared<vector<string>>();
+  input->push_back("typed-input-line");
+  sess.set_ui_delegate(make_unique<ShellCaptureUi>(mu, lines, input));
+
+  FlexData scfg = FlexData::make_object();
+  scfg.as_object().insert_or_assign(
+      "command", FlexData::make_string("cat"));
+  scfg.as_object().insert_or_assign(
+      "forward_stdin", FlexData::make_bool(true));
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto* src = pl->insert_stage("chrono", "src", {}, chrono_cfg_(0.01, 1));
+  ASSERT_TRUE(src != nullptr);
+  auto* sink = pl->insert_stage(
+      "shell", "sink", vector<InEdge>{{src, 0}}, std::move(scfg));
+  ASSERT_TRUE(sink != nullptr);
+
+  PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+
+  {
+    lock_guard<mutex> g(*mu);
+    EXPECT_TRUE(has_substr_(*lines, "typed-input-line"));
+  }
+  auto* shell = dynamic_cast<ShellStage*>(sink);
+  ASSERT_TRUE(shell != nullptr);
+  EXPECT_TRUE(shell->last_status() == 0);
 }
 
 // -------- pipeline -------------------------------------------------

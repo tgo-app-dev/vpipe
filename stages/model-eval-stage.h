@@ -10,7 +10,9 @@
 
 namespace vpipe {
 
-// Source stage: 0 inputs, 0 outputs. One-shot offline model evaluation.
+// 1 optional trigger iport (any beat) + 1 FlexData "summary" oport (for
+// cascading a preparation recipe / a save-text report). One-shot offline
+// model evaluation.
 // Loads one or two language models (each a models-DB key or a directory path),
 // runs WikiText-2 perplexity + a random-sampled ARC-Challenge accuracy probe on
 // each, and logs a Markdown report through session()->info(). With two models a
@@ -60,6 +62,10 @@ public:
 
   // Test seam: run the evaluation once. Returns true on success (a report was
   // produced); logs + returns false on error (no manager / load failure).
+  // `summary` is filled with the FlexData work-summary (scores + the
+  // Markdown report in its `text` field) on success; untouched on error.
+  bool evaluate_once(FlexData& summary);
+  // Convenience overload for callers that don't need the summary (tests).
   bool evaluate_once();
 
 private:

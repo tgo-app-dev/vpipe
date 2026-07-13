@@ -173,15 +173,23 @@ const PortSpec kIports[] = {
                               "PCM buffer per marker)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
+const PortSpec kOports[] = {
+  {.name = "transcript", .doc = "FlexData {text, start_us, end_us} per "
+                                "transcribed clip (start_us/end_us present in "
+                                "streaming mode only). Optional -- unconnected "
+                                "is fine (the transcript still logs).",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+};
 const StageSpec kSpec = {
   .type_name = "audio-transcribe",
-  .doc       = "Sink: transcribes each incoming PCM clip with a Qwen3-ASR "
-               "language model (encoder + greedy/sampled decode) and "
-               "surfaces the transcript via the UI delegate. 0 oports.",
+  .doc       = "Transcribes each incoming PCM clip with a Qwen3-ASR language "
+               "model (encoder + greedy/sampled decode), logs the transcript "
+               "via the UI delegate, and emits it as FlexData {text[, "
+               "start_us, end_us]} on oport 0.",
   .display_name = "Transcribe",
   .category  = StageCategory::Audio,
   .iports    = kIports,
-  .oports    = {},
+  .oports    = kOports,
   .attrs     = kAttrs,
 };
 }  // namespace
@@ -363,6 +371,10 @@ AudioTranscribeStage::process(RuntimeContext& ctx)
       slice_and_transcribe_(obj.at("start_us").as_uint(0),
                             obj.at("end_us").as_uint(0));
     }
+    for (auto& fd : _out_pending) {
+      co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(fd)));
+    }
+    _out_pending.clear();
     co_return;
   }
 
@@ -434,8 +446,13 @@ AudioTranscribeStage::process(RuntimeContext& ctx)
     }
     pcm = reinterpret_cast<const float*>(scratch.data());
   }
+  _cur_has_ts = false;   // block mode: one clip per beat, no timestamp span
   transcribe_pcm_(pcm, n_samples, sr);
   ++_clips_processed;
+  for (auto& fd : _out_pending) {
+    co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(fd)));
+  }
+  _out_pending.clear();
 #else
   (void)ctx;
   co_return;
@@ -598,6 +615,18 @@ AudioTranscribeStage::m_transcribe_one_(const float* pcm,
     return std::chrono::duration<double, std::milli>(d).count();
   };
   session()->info(fmt("[{}] {}", this->id(), text));
+  // Queue the transcript for oport 0 (process() drains it). {text[, start_us,
+  // end_us]} -- the span is present only in streaming mode.
+  {
+    FlexData out = FlexData::make_object();
+    auto o = out.as_object();
+    o.insert("text", FlexData::make_string(text));
+    if (_cur_has_ts) {
+      o.insert("start_us", FlexData::make_uint(_cur_start_us));
+      o.insert("end_us", FlexData::make_uint(_cur_end_us));
+    }
+    _out_pending.push_back(std::move(out));
+  }
   session()->log_verbose(fmt(
       "AudioTranscribeStage('{}'): [metal] {:.2f} s clip -> {} audio "
       "tokens, {} decoded ({} ms encode + {} ms prefill + {} ms "
@@ -778,6 +807,10 @@ AudioTranscribeStage::slice_and_transcribe_(std::uint64_t start_us,
       "AudioTranscribeStage('{}'): transcribing segment [{}..{}] = "
       "{:.2f} s",
       this->id(), start_us, clamped_end, dur_us / 1.0e6));
+  // Carry the (clamped) segment span onto the transcript emitted on oport 0.
+  _cur_start_us = start_us;
+  _cur_end_us   = clamped_end;
+  _cur_has_ts   = true;
   const bool ok = transcribe_pcm_(_pcm_buf.data() + off_samples,
                                   n_samples, _sample_rate);
   if (ok) { ++_clips_processed; }

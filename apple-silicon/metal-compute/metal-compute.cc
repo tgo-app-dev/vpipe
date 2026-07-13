@@ -19,10 +19,14 @@
 #include <Metal/Metal.hpp>
 
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
 
+#include <deque>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <utility>
 
@@ -85,6 +89,54 @@ find_embedded_metallib(std::string_view name,
   }
   *out_data = it->second.first;
   *out_size = it->second.second;
+  return true;
+}
+
+namespace {
+
+// Process-lifetime owner for bytes handed in at RUNTIME (a plugin's
+// offline-compiled metallib). The build-embedded path points the registry
+// at static-const arrays; a runtime caller's buffer has no such lifetime,
+// so we copy into here. std::deque never relocates existing elements, so
+// pointers into the stored vectors stay stable, and the store is never
+// freed (plugins are never dlclose'd), which keeps the no-op dispatch_data
+// destructor in load_library valid.
+struct RuntimeStore {
+  std::mutex mu;
+  std::deque<std::vector<unsigned char>> blobs;
+};
+
+RuntimeStore& runtime_store()
+{
+  static RuntimeStore s;
+  return s;
+}
+
+}  // namespace
+
+// Copy `data` into process-owned storage and register it under `name`.
+// First-wins: returns false (a no-op) if `name` is already registered
+// (built-in or runtime) or the bytes are empty.
+bool
+register_runtime_metallib(std::string_view name,
+                          const unsigned char* data, std::size_t size)
+{
+  if (data == nullptr || size == 0) {
+    return false;
+  }
+  const unsigned char* d = nullptr;
+  std::size_t s = 0;
+  if (find_embedded_metallib(name, &d, &s)) {
+    return false;                          // name already taken
+  }
+  RuntimeStore& store = runtime_store();
+  const unsigned char* owned = nullptr;
+  {
+    std::lock_guard<std::mutex> g(store.mu);
+    store.blobs.emplace_back(data, data + size);
+    owned = store.blobs.back().data();
+  }
+  register_embedded_metallib(std::string(name).c_str(), owned, size);
   return true;
 }
 
@@ -544,6 +596,44 @@ MetalCompute::residency_stats() const noexcept
   return out;
 }
 
+MetalCompute::MemoryBudget
+MetalCompute::memory_budget() const noexcept
+{
+  MemoryBudget out;
+  if (!_impl->valid || _impl->device == nullptr) {
+    return out;
+  }
+  out.recommended =
+      static_cast<std::size_t>(_impl->device->recommendedMaxWorkingSetSize());
+  out.allocated =
+      static_cast<std::size_t>(_impl->device->currentAllocatedSize());
+  out.headroom = out.recommended > out.allocated
+                     ? out.recommended - out.allocated
+                     : 0;
+  // Reclaimable physical memory: free + purgeable + file-backed(external)
+  // pages. These are exactly the pages the OS can hand a new allocation --
+  // including clean mmap'd weight pages (external), which is why a large decode
+  // can succeed alongside mmap'd model weights. Conservative: dirty inactive
+  // pages (may need swap) are excluded.
+  {
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm), &n)
+        == KERN_SUCCESS) {
+      vm_size_t page = 0;
+      if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) {
+        page = 16384;                       // Apple Silicon default
+      }
+      const std::size_t pages = (std::size_t)vm.free_count
+                              + (std::size_t)vm.purgeable_count
+                              + (std::size_t)vm.external_page_count;
+      out.available_physical = pages * (std::size_t)page;
+    }
+  }
+  return out;
+}
+
 MetalCompute::PsoArchiveStats
 MetalCompute::pso_archive_stats() const noexcept
 {
@@ -623,6 +713,45 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   return out;
 }
 
+SharedBuffer
+MetalCompute::make_no_copy_buffer(void* ptr, std::size_t byte_size) const
+{
+  if (!_impl->valid || ptr == nullptr || byte_size == 0) {
+    return SharedBuffer{};
+  }
+  const std::size_t page =
+      static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  // newBufferWithBytesNoCopy requires a page-aligned base; mmap/vm_allocate
+  // memory satisfies this. Reject anything else rather than silently copy.
+  if ((reinterpret_cast<std::uintptr_t>(ptr) & (page - 1)) != 0) {
+    return SharedBuffer{};
+  }
+  // Metal wants the length page-aligned too; round up. Accessing the tail of
+  // the last page is safe for an mmap (zero-filled past EOF).
+  const std::size_t mapped_len = (byte_size + page - 1) & ~(page - 1);
+
+  NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+  // Null deallocator: Metal does not own or free the memory.
+  MTL::Buffer* buf = _impl->device->newBuffer(
+      ptr, static_cast<NS::UInteger>(mapped_len),
+      MTL::ResourceStorageModeShared, nullptr);
+  if (buf == nullptr) {
+    session()->warn(fmt(
+        "MetalCompute::make_no_copy_buffer: newBufferWithBytesNoCopy failed "
+        "(byte_size={})", byte_size));
+    pool->release();
+    return SharedBuffer{};
+  }
+  {
+    std::lock_guard<std::mutex> g(_impl->alloc_mu);
+    ++_impl->alloc_buffers_device;
+  }
+  // Report the caller's logical size (not the page-rounded length).
+  SharedBuffer out = SharedBuffer::wrap(buf, ptr, byte_size);
+  pool->release();
+  return out;
+}
+
 ComputeLibrary
 MetalCompute::load_library(std::string_view name) const
 {
@@ -694,6 +823,46 @@ MetalCompute::load_library(std::string_view name) const
   ComputeLibrary out(lib, std::move(name_str), this);
   pool->release();
   return out;
+}
+
+bool
+MetalCompute::register_metal_library(std::string_view     name,
+                                     const unsigned char* bytes,
+                                     std::size_t          n) const
+{
+  if (_embedded::register_runtime_metallib(name, bytes, n)) {
+    if (session() != nullptr) {
+      session()->log_normal(fmt(
+          "MetalCompute: registered runtime metal library '{}' ({} bytes)",
+          name, n));
+    }
+    return true;
+  }
+  if (session() != nullptr) {
+    session()->warn(fmt(
+        "MetalCompute::register_metal_library: '{}' already registered or "
+        "empty; ignored (runtime kernels cannot shadow a built-in)", name));
+  }
+  return false;
+}
+
+bool
+MetalCompute::register_metal_library_file(std::string_view name,
+                                          std::string_view path) const
+{
+  std::ifstream in(std::string(path), std::ios::binary);
+  if (!in) {
+    if (session() != nullptr) {
+      session()->warn(fmt(
+          "MetalCompute::register_metal_library_file: cannot open '{}'",
+          path));
+    }
+    return false;
+  }
+  const std::vector<unsigned char> bytes(
+      (std::istreambuf_iterator<char>(in)),
+      std::istreambuf_iterator<char>());
+  return register_metal_library(name, bytes.data(), bytes.size());
 }
 
 ComputeFunction

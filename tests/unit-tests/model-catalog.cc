@@ -14,6 +14,22 @@ namespace {
 bool has_(const vector<string>& v, const string& x) {
   return std::find(v.begin(), v.end(), x) != v.end();
 }
+string flex_str_(const FlexData& obj, const char* key) {
+  auto o = obj.as_object();
+  return o.contains(key) ? string(o.at(key).as_string("")) : string();
+}
+vector<string> flex_arr_(const FlexData& obj, const char* key) {
+  vector<string> out;
+  auto o = obj.as_object();
+  if (!o.contains(key)) { return out; }
+  FlexData a = o.at(key);
+  if (!a.is_array()) { return out; }
+  auto arr = a.as_array();
+  for (size_t i = 0; i < arr.size(); ++i) {
+    out.push_back(string(arr.at(i).as_string("")));
+  }
+  return out;
+}
 }
 
 TEST(model_catalog, families_present) {
@@ -153,7 +169,7 @@ TEST(model_catalog, supplement_archive_entries) {
     {"Qwen", "3.5", "4B", "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
      "qwen3.5-vision-encoder", "qwen3_5_mlx_4b_vision_vid_768x480",
      "qwen3_5_mlx_4b_vision_vid_768x480_w8.tar"},
-    {"Gemma", "4", "e4b", "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
+    {"Gemma", "4", "E4B", "Vision tower CoreML 768x480 w8 (vpipe-supplement)",
      "gemma4-vision-encoder", "gemma4_mlx_e4b_vision_768x480",
      "gemma4_mlx_e4b_vision_768x480_w8.tar"},
     {"YOLOX", "L", "1024x640", "CoreML w8 (vpipe-supplement)",
@@ -230,6 +246,93 @@ TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   EXPECT_TRUE(has_(e->files, "Qwen3.6-27B-Q4_K_M.gguf"));
   EXPECT_TRUE(has_(e->files, "mmproj-BF16.gguf"));
   EXPECT_TRUE(has_(e->files, "imatrix_unsloth.gguf_file"));
+}
+
+// Input/output modalities + derived category are exposed via
+// catalog_entry_to_flex (gemma-4 e4b multimodal-in/text-out; flux2
+// text+image-in/image-out).
+TEST(model_catalog, io_types_and_category) {
+  const ModelCatalogEntry* g =
+      catalog_by_path("mlx-community/gemma-4-e4b-it-4bit");
+  EXPECT_TRUE(g != nullptr);
+  EXPECT_TRUE(catalog_category(*g) == "model");
+  FlexData gf = catalog_entry_to_flex(*g);
+  EXPECT_TRUE(flex_str_(gf, "category") == "model");
+  auto gin = flex_arr_(gf, "inputs");
+  EXPECT_TRUE(has_(gin, "text"));
+  EXPECT_TRUE(has_(gin, "image"));
+  EXPECT_TRUE(has_(gin, "audio"));
+  EXPECT_TRUE(has_(gin, "video"));
+  auto gout = flex_arr_(gf, "outputs");
+  EXPECT_TRUE(gout.size() == 1);
+  EXPECT_TRUE(has_(gout, "text"));
+
+  const ModelCatalogEntry* fx =
+      catalog_by_path("black-forest-labs/FLUX.2-klein-4B");
+  EXPECT_TRUE(fx != nullptr);
+  FlexData ff = catalog_entry_to_flex(*fx);
+  auto fin = flex_arr_(ff, "inputs");
+  EXPECT_TRUE(has_(fin, "text"));
+  EXPECT_TRUE(has_(fin, "image"));
+  auto fout = flex_arr_(ff, "outputs");
+  EXPECT_TRUE(has_(fout, "image"));
+  EXPECT_FALSE(has_(fout, "text"));
+}
+
+// Datasets are their own category.
+TEST(model_catalog, dataset_category) {
+  const ModelCatalogEntry* d =
+      catalog_by_path("vpipe-eval-datasets/wikitext-2-raw-test");
+  EXPECT_TRUE(d != nullptr);
+  EXPECT_TRUE(catalog_category(*d) == "dataset");
+  EXPECT_TRUE(flex_str_(catalog_entry_to_flex(*d), "category") == "dataset");
+}
+
+// Supplements (vision towers, LoRA) carry an explicit parent linkage, and
+// catalog_by_name disambiguates the ones sharing the vpipe-supplement repo.
+TEST(model_catalog, supplement_parent_linkage) {
+  const ModelCatalogEntry* qt =
+      catalog_by_name("qwen3_5_mlx_4b_vision_vid_512x320");
+  EXPECT_TRUE(qt != nullptr);
+  EXPECT_TRUE(qt->model_type == "qwen3.5-vision-encoder");
+  EXPECT_TRUE(catalog_category(*qt) == "supplement");
+  FlexData qf = catalog_entry_to_flex(*qt);
+  EXPECT_TRUE(flex_str_(qf, "category") == "supplement");
+  EXPECT_TRUE(flex_str_(qf, "parent_model_type") == "qwen3.5");
+  EXPECT_TRUE(flex_str_(qf, "parent_param_class") == "4B");
+
+  const ModelCatalogEntry* gt =
+      catalog_by_name("gemma4_mlx_e4b_vision_768x480");
+  EXPECT_TRUE(gt != nullptr);
+  EXPECT_TRUE(gt->model_type == "gemma4-vision-encoder");
+  EXPECT_TRUE(gt->parent_model_type == "gemma4");
+  EXPECT_TRUE(gt->parent_param_class == "E4B");
+
+  // The Krea LoRA attaches to any krea2 DiT (no size pin).
+  const ModelCatalogEntry* lora =
+      catalog_by_path("krea/Krea-2-LoRA-softwatercolor");
+  EXPECT_TRUE(lora != nullptr);
+  EXPECT_TRUE(catalog_category(*lora) == "supplement");
+  EXPECT_TRUE(lora->parent_model_type == "krea2");
+  EXPECT_TRUE(lora->parent_param_class.empty());
+
+  // The community Krea-2 LoRAs (fusible via the ai-toolkit name remap + LoKr
+  // support in lora-fuse) are catalogued as krea2 supplements too.
+  for (const char* p : {"mgwr/M87", "RudySen/Krea2-realism-V2"}) {
+    const ModelCatalogEntry* e = catalog_by_path(p);
+    EXPECT_TRUE(e != nullptr);
+    EXPECT_TRUE(catalog_category(*e) == "supplement");
+    EXPECT_TRUE(e->parent_model_type == "krea2");
+  }
+
+  // A plain model has no parent linkage.
+  const ModelCatalogEntry* lm =
+      catalog_by_path("lmstudio-community/Qwen3.5-4B-MLX-4bit");
+  EXPECT_TRUE(lm != nullptr);
+  EXPECT_TRUE(lm->parent_model_type.empty());
+
+  EXPECT_TRUE(catalog_by_name("nope") == nullptr);
+  EXPECT_TRUE(catalog_by_name("") == nullptr);
 }
 
 TEST(model_catalog, normalize_paths) {

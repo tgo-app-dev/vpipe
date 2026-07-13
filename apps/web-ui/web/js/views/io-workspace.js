@@ -16,6 +16,7 @@
 
 import { el, clear } from '../dom.js';
 import { mountUserIo } from './user-io.js';
+import { mountPreview } from './preview-video.js';
 import { mountHlsVideo } from './hls-video.js';
 import { mountLog } from './log.js';
 import { t } from '../i18n.js';
@@ -118,6 +119,12 @@ export function mountIoWorkspace(container) {
     if (view === 'text') {
       setTitle(leaf, t('nav.io'));
       leaf.cleanup = mountUserIo(leaf.bodyEl, leaf.actions);
+    } else if (view === 'preview') {
+      setTitle(leaf, t('io.preview'));
+      leaf.cleanup = mountPreview(leaf.bodyEl, leaf.actions, {
+        stream: opts && opts.stream,
+        onTitle: (t) => setTitle(leaf, t),
+      });
     } else if (view === 'hls') {
       setTitle(leaf, t('io.hls'));
       leaf.cleanup = mountHlsVideo(leaf.bodyEl, leaf.actions, {
@@ -140,6 +147,8 @@ export function mountIoWorkspace(container) {
       el('div', { class: 'io-empty-title' }, t('io.add_view')),
       el('div', { class: 'io-empty-choices' },
         el('button', { class: 'btn primary',
+          onclick: () => mountView(leaf, 'preview') }, t('io.preview')),
+        el('button', { class: 'btn',
           onclick: () => mountView(leaf, 'hls') }, t('io.hls')),
         el('button', { class: 'btn',
           onclick: () => mountView(leaf, 'log') }, t('io.session_log'))),

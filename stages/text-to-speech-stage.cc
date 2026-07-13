@@ -15,6 +15,8 @@
 #include "generative-models/moss/metal-moss-codec-v2.h"
 #include "generative-models/moss/metal-moss-v15-model.h"
 #include "generative-models/moss/moss-v15-processor.h"
+#include "generative-models/moss/metal-moss-rt-model.h"
+#include "generative-models/moss/moss-rt-processor.h"
 #include "generative-models/tokenizer.h"
 #include <algorithm>
 #include <cctype>
@@ -64,6 +66,11 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
     _max_new_tokens = static_cast<int>(v);
   }
   {
+    int64_t v = attr_int("stream_chunk_frames");
+    _stream_chunk = v > 0 ? static_cast<int>(v) : 0;
+  }
+  _interrupt_on_new_text = attr_bool("interrupt_on_new_text");
+  {
     int64_t v = attr_int("max_frames");
     if (v < 1) {
       fail_config(fmt(
@@ -110,8 +117,10 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "MOSS-TTS LM model: a models-DB key (registered by model-fetch / "
           "model-quantize) or an HF-style model dir; a DB key wins over a "
-          "same-named path. 8B (moss-tts) or v1.5 (moss-tts-local).",
-   .suggest_db = "models", .suggest_db_type = "moss-tts,moss-tts-local"},
+          "same-named path. 8B (moss-tts), v1.5 (moss-tts-local), or realtime "
+          "(moss-tts-realtime).",
+   .suggest_db = "models",
+   .suggest_db_type = "moss-tts,moss-tts-local,moss-tts-realtime"},
   {.key = "codec_dir", .type = ConfigType::String, .required = true,
    .doc = "MOSS-Audio-Tokenizer (codec) model: a models-DB key or a "
           "filesystem path; a DB key wins over a same-named path. Match the "
@@ -127,6 +136,26 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "max_new_tokens", .type = ConfigType::Int,
    .doc = "8B-only: per-beat delay-pattern generation budget (>= 1)",
    .def_int = 1024},
+  // Streaming: emit PCM incrementally as the LM generates instead of decoding
+  // the whole utterance at the end. The codec streams its decode with a
+  // windowed K/V cache, so a chunk of `stream_chunk_frames` codec frames is
+  // decoded + emitted every that-many frames (first audio out ~one chunk after
+  // audio starts). 0 => legacy one-shot (single PCM beat per text beat).
+  {.key = "stream_chunk_frames", .type = ConfigType::Int,
+   .doc = "emit PCM every N generated codec frames (near-realtime streaming); "
+          "0 = one-shot (single beat). Each frame ~= 80 ms of audio.",
+   .def_int = 16},
+  // Barge-in: when a NEW text beat arrives on the text iport while the current
+  // utterance is still generating, cut the current one short (emit the audio
+  // produced so far, then stop) and move on to the new text, rather than
+  // finishing the whole current utterance first. Default on (interactive TTS
+  // wants the latest text to win); set false to always generate each text beat
+  // to completion (queued FIFO).
+  {.key = "interrupt_on_new_text", .type = ConfigType::Bool,
+   .doc = "abort the in-flight utterance (after flushing what it produced) as "
+          "soon as new text arrives, then speak the new text; false = finish "
+          "each utterance fully before the next",
+   .def_bool = true},
   // v1.5-only (model_type moss_tts_local): per-beat frame budget + prompt
   // fields. Ignored for the 8B variant.
   {.key = "max_frames", .type = ConfigType::Int,
@@ -183,18 +212,23 @@ const PortSpec kIports[] = {
   {.name = "text",
    .doc = "FlexData string (or object with a \"text\" key): the text to "
           "synthesize",
-   .type = &typeid(FlexDataPayload), .clock_group = 0},
+   .type = &typeid(FlexDataPayload),
+   .tags = "text", .clock_group = 0},
   {.name = "audio-ref",
    .doc = "OPTIONAL mono f32 PCM TensorBeat (any rate; sideband.sample_rate "
-          "honoured): a reference voice to clone. Latest beat is sticky.",
-   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+          "honoured): a reference voice to clone. Latest beat is sticky "
+          "(applies to all later utterances until superseded). Its own clock "
+          "group -- it arrives independently of the text stream / PCM output, "
+          "not rate-locked to them.",
+   .type = &typeid(TensorBeatPayload), .clock_group = 1},
 };
 const PortSpec kOports[] = {
   {.name = "pcm",
    .doc = "TensorBeat f32 PCM (sideband.sample_rate set); downstream "
           "optional. 8B variant: rank-1 [n_samples] mono @ 24 kHz. v1.5 "
           "variant: rank-2 [2, n_samples] stereo @ 48 kHz.",
-   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+   .type = &typeid(TensorBeatPayload),
+   .tags = "pcm-samples", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "text-to-speech",
@@ -204,7 +238,7 @@ const StageSpec kSpec = {
                "model_type: \"moss_tts\" (8B delay-pattern -> 24 kHz mono) "
                "or \"moss_tts_local\" (v1.5 depth decoder -> 48 kHz stereo).",
   .display_name = "Speak",
-  .category  = StageCategory::Audio,
+  .category  = StageCategory::Generative,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,
@@ -297,6 +331,70 @@ v15_backbone_cfg_(const std::string& dir)
   return c;
 }
 
+// Build a MetalQwenModel::Config for a MOSS-TTS-Realtime sub-transformer. Both
+// the backbone (28 layers) and the depth/local decoder (4 layers) are PLAIN
+// dense Qwen3 (RMSNorm, GQA 16/8, head_dim 128, SwiGLU 6144, rope 1e6), reused
+// via MetalQwenModel in backbone_only mode, 8-bit affine. `prefix`/`seg` select
+// the weight subtree ("language_model."/"model." vs "local_transformer."/
+// "model."); `n_layers`/`max_seq` differ (backbone streams the prompt; the
+// local decoder is 16 positions/frame).
+genai::MetalQwenModel::Config
+rt_qwen_cfg_(const std::string& dir, const std::string& prefix,
+             const std::string& seg, int n_layers, int max_seq, int page_tokens)
+{
+  genai::MetalQwenModel::Config c;
+  c.n_layers = n_layers; c.hidden = 2048; c.n_heads = 16; c.n_kv_heads = 8;
+  c.head_dim = 128; c.ffn_inner = 6144; c.vocab = 151936;
+  c.rope_theta = 1.0e6f; c.rms_eps = 1e-6f; c.rotary_dim = 128;
+  c.full_attn_interval = 1; c.tie_embeddings = false; c.use_bf16 = true;
+  c.quant_bits = 8; c.dense = true; c.attn_output_gate = false;
+  // Plain Qwen3 standard RMSNorm (no +1). Only consulted on the dense (raw
+  // bf16) path -- MetalQwenModel auto-detects raw vs 8-bit affine from the dir,
+  // so ONE config loads either an unquantized bf16 checkpoint OR a
+  // model-quantize'd 8-bit one. (No effect on the quantized path.)
+  c.zero_centered_norm = false;
+  c.backbone_only = true; c.weight_prefix = prefix; c.model_seg = seg;
+  c.max_seq = max_seq; c.page_tokens = page_tokens;
+  std::ifstream in(dir + "/config.json");
+  if (in) {
+    try {
+      FlexData root = FlexData::from_json(in);
+      if (root.is_object()) {
+        auto o = root.as_object();
+        if (o.contains("quantization")) {
+          FlexData q = o.at("quantization");
+          if (q.is_object() && q.as_object().contains("bits")) {
+            c.quant_bits = (int)q.as_object().at("bits").as_int(c.quant_bits);
+          }
+        }
+        // language_config carries the backbone shape (num_hidden_layers etc).
+        if (seg == "model." && prefix == "language_model." &&
+            o.contains("language_config")) {
+          FlexData lc = o.at("language_config");
+          if (lc.is_object()) {
+            auto q = lc.as_object();
+            auto gi = [&](const char* k, int d) {
+              return q.contains(k) ? (int)q.at(k).as_int(d) : d;
+            };
+            c.n_layers   = gi("num_hidden_layers", c.n_layers);
+            c.hidden     = gi("hidden_size", c.hidden);
+            c.n_heads    = gi("num_attention_heads", c.n_heads);
+            c.n_kv_heads = gi("num_key_value_heads", c.n_kv_heads);
+            c.head_dim   = gi("head_dim", c.head_dim);
+            c.ffn_inner  = gi("intermediate_size", c.ffn_inner);
+            c.vocab      = gi("vocab_size", c.vocab);
+            if (q.contains("rope_theta")) {
+              c.rope_theta = (float)q.at("rope_theta").as_real(c.rope_theta);
+            }
+            c.rotary_dim = c.head_dim;
+          }
+        }
+      }
+    } catch (...) {}
+  }
+  return c;
+}
+
 }  // namespace
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
@@ -321,10 +419,62 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
   const std::string codec_dir =
       resolve_model_dir(session(), _models_db, _codec_dir);
 
-  // Pick the variant from the LM dir's config.json. "moss_tts_local" => the
-  // v1.5 depth-decoder path (48 kHz stereo); anything else => the 8B
-  // delay-pattern path (24 kHz mono).
-  if (read_model_type_(lm_dir) == "moss_tts_local") {
+  // Pick the variant from the LM dir's config.json. "moss_tts_realtime" => the
+  // realtime streaming path (Qwen3-1.7B backbone + depth decoder -> 24 kHz
+  // mono); "moss_tts_local" => the v1.5 depth-decoder path (48 kHz stereo);
+  // anything else => the 8B delay-pattern path (24 kHz mono).
+  const std::string _mt = read_model_type_(lm_dir);
+  if (_mt == "moss_tts_realtime") {
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): loading MOSS-TTS-Realtime LM from '{}'",
+        this->id(), _hf_dir));
+    genai::MetalMossRtModel::Config cfg;
+    cfg.backbone = rt_qwen_cfg_(lm_dir, "language_model.", "model.", 28, 2048,
+                                256);
+    cfg.local    = rt_qwen_cfg_(lm_dir, "local_transformer.", "model.", 4, 32,
+                                32);
+    _lm_rt = genai::MetalMossRtModel::load(lm_dir, mc, cfg);
+    if (!_lm_rt) {
+      session()->error(fmt(
+          "TextToSpeechStage('{}'): failed to load MOSS-TTS-Realtime LM from "
+          "'{}'; inert. Point hf_dir at the unquantized bf16 checkpoint (runs "
+          "as-is) OR a model-quantize'd 8-bit dir (~2x faster).",
+          this->id(), _hf_dir));
+      co_return;
+    }
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): loading MOSS-Audio-Tokenizer codec from "
+        "'{}'{}", this->id(), _codec_dir,
+        _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
+    _codec = genai::MetalMossCodec::load(codec_dir, mc, _codec_int8,
+                                         _with_encoder);
+    if (!_codec || !_codec->valid()) {
+      session()->error(fmt(
+          "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; inert",
+          this->id(), _codec_dir));
+      _lm_rt.reset();
+      co_return;
+    }
+    // Route the codec's audio-codec-lane profiler events to this session (the
+    // MetalMossRtModel already took mc->session() at load). Without this the
+    // codec-decode events never fire.
+    _codec->set_session(session());
+    _tokenizer = genai::Tokenizer::from_huggingface_json(
+        lm_dir + "/tokenizer.json", session());
+    if (!_tokenizer) {
+      session()->error(fmt(
+          "TextToSpeechStage('{}'): no tokenizer.json in '{}'; inert",
+          this->id(), lm_dir));
+      _lm_rt.reset(); _codec.reset();
+      co_return;
+    }
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): ready (realtime, 24 kHz mono, "
+        "n_vq={}, max_frames={})", this->id(), _lm_rt->config().n_vq,
+        _max_frames));
+    co_return;
+  }
+  if (_mt == "moss_tts_local") {
     session()->info(fmt(
         "TextToSpeechStage('{}'): loading MOSS-TTS-Local-v1.5 LM from '{}'",
         this->id(), _hf_dir));
@@ -729,6 +879,48 @@ build_stereo_ref_wave_(const SessionContextIntf* session,
   return flat;
 }
 
+// A reference-voice PCM TensorBeat -> a mono f32 clip resampled to `out_sr`
+// (sideband.sample_rate honoured; multi-channel averaged to mono), capped to
+// `max_seconds` (<= 0 = whole clip). For the realtime / 8B 24 kHz mono codec
+// encode path. Empty on failure.
+std::vector<float>
+build_mono_ref_wave_(const SessionContextIntf* session,
+                     const TensorBeatPayload& tbp, int out_sr,
+                     double max_seconds)
+{
+  int in_sr = out_sr;
+  if (tbp.sideband.is_object()) {
+    auto sb = tbp.sideband.as_object();
+    if (sb.contains("sample_rate")) {
+      in_sr = static_cast<int>(sb.at("sample_rate").as_int(in_sr));
+    }
+  }
+  int in_ch = 1;
+  std::int64_t in_n = static_cast<std::int64_t>(tbp.element_count());
+  if (tbp.shape.size() == 2) { in_ch = static_cast<int>(tbp.shape[0]);
+                               in_n = tbp.shape[1]; }
+  else if (tbp.shape.size() == 1) { in_ch = 1; in_n = tbp.shape[0]; }
+  if (in_ch < 1 || in_n < 1) { return {}; }
+  const float* base = tbp.as_f32();
+  std::vector<float> mono((std::size_t)in_n);
+  if (in_ch == 1) {
+    std::memcpy(mono.data(), base, (std::size_t)in_n * sizeof(float));
+  } else {
+    for (std::int64_t i = 0; i < in_n; ++i) {
+      float s = 0.0f;
+      for (int c = 0; c < in_ch; ++c) { s += base[(std::int64_t)c * in_n + i]; }
+      mono[(std::size_t)i] = s / (float)in_ch;
+    }
+  }
+  std::vector<float> out =
+      resample_pcm_(session, mono.data(), (std::size_t)in_n, in_sr, out_sr);
+  if (max_seconds > 0.0) {
+    const std::size_t cap = static_cast<std::size_t>(max_seconds * out_sr);
+    if (cap >= 1 && out.size() > cap) { out.resize(cap); }
+  }
+  return out;
+}
+
 }  // namespace
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
@@ -742,6 +934,206 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Barge-in predicate: true once a NEW text beat is waiting on the text iport
+  // (iport 0) while we're mid-utterance. When interrupt_on_new_text is set, the
+  // generators poll this and stop ASAP (after flushing the audio produced so
+  // far); process() then re-runs and serves the newer text. The audio-ref iport
+  // (iport 1) is deliberately excluded -- it is sticky + its own clock domain.
+  auto new_text_pending = [&]() {
+    return _interrupt_on_new_text && ctx.backlog(0) > 0;
+  };
+
+  // ---- realtime variant (Qwen3-1.7B backbone + depth decoder -> 24 kHz mono)
+  if (_lm_rt) {
+    if (!_codec || !_tokenizer) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): realtime models not loaded; dropping beat",
+          this->id()));
+      co_return;
+    }
+    const auto* rtfdp = dynamic_cast<const FlexDataPayload*>(t.get());
+    if (rtfdp == nullptr) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): expected FlexDataPayload on in-port 0, "
+          "got {}; dropping beat", this->id(), t->describe()));
+      co_return;
+    }
+    std::string rtraw(rtfdp->data.as_string(""));
+    if (rtraw.empty() && rtfdp->data.is_object()) {
+      auto obj = rtfdp->data.as_object();
+      if (obj.contains("text")) { rtraw = std::string(obj.at("text").as_string("")); }
+    }
+    const std::string rt_text = normalize_text_(rtraw);
+    if (rt_text.empty()) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): empty text; dropping beat", this->id()));
+      co_return;
+    }
+    using rtclock = std::chrono::steady_clock;
+    const auto rt0 = rtclock::now();
+
+    // Drain reference-audio beats on iport1 (voice cloning). The latest sets
+    // the cloned voice for this + subsequent text beats (sticky). Reference
+    // PCM is resampled to 24 kHz mono, codec-encoded, and the FIRST n_vq (16)
+    // codebooks kept (the realtime model's codebook count). backlog() keeps it
+    // non-blocking.
+    if (_with_encoder && _codec->has_encoder() && ctx.num_iports() >= 2) {
+      while (ctx.backlog(1) > 0) {
+        auto rp = co_await ctx.read(1);
+        if (!rp) { break; }
+        const auto* tbp = dynamic_cast<const TensorBeatPayload*>(rp.get());
+        if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32) {
+          session()->warn(fmt(
+              "TextToSpeechStage('{}'): reference iport expects an f32 PCM "
+              "TensorBeat, got {}; ignoring", this->id(), rp->describe()));
+          continue;
+        }
+        std::vector<float> ref_wave = build_mono_ref_wave_(
+            session(), *tbp, _codec->sample_rate(), _voice_ref_seconds);
+        if (ref_wave.empty()) { continue; }
+        auto rc32 = _codec->encode(ref_wave);   // [Tref][32]
+        if (rc32.empty()) { continue; }
+        const int nvq = _lm_rt->config().n_vq;
+        std::vector<std::vector<std::int32_t>> rc;
+        rc.reserve(rc32.size());
+        for (auto& fr : rc32) {
+          const int m = std::min<int>(nvq, (int)fr.size());
+          rc.emplace_back(fr.begin(), fr.begin() + m);   // keep first n_vq
+        }
+        _ref_codes = std::move(rc);
+        _ref_set   = true;
+        session()->info(fmt(
+            "TextToSpeechStage('{}'): cloned reference voice -> {} codec frames "
+            "(24 kHz)", this->id(), static_cast<int>(_ref_codes.size())));
+      }
+    }
+
+    genai::MossRtPromptIds pids;
+    auto prompt_grid = _ref_set
+        ? genai::moss_rt_build_clone_grid(*_tokenizer, _ref_codes, pids)
+        : genai::moss_rt_build_prompt_grid(*_tokenizer, pids);
+    std::vector<std::int32_t> text_ids = _tokenizer->encode(rt_text);
+    // Audio codes MUST be sampled (the reference defaults: temp 0.8 / top_p
+    // 0.6 / top_k 30 / rep_pen 1.1); greedy degenerates into silence.
+    genai::MossSampling rt_sp;
+    rt_sp.temperature        = 0.8f;
+    rt_sp.top_k              = 30;
+    rt_sp.top_p              = 0.6f;
+    rt_sp.repetition_penalty = 1.1f;
+    const int rt_sr  = _lm_rt->sampling_rate();
+    const int rt_nvq = _lm_rt->config().n_vq;   // active codebooks (16)
+    const int max_f  = _max_frames > 0 ? _max_frames : 1000;
+    // Build a mono PCM TensorBeat [1, samples] from a wav vector.
+    auto make_pcm_beat = [&](const std::vector<float>& wav) {
+      TensorBeat tb;
+      tb.dtype = TensorBeat::DType::F32;
+      tb.shape = { 1, static_cast<std::int64_t>(wav.size()) };
+      tb.resize_contiguous(wav.size());
+      std::memcpy(tb.as_f32(), wav.data(), wav.size() * sizeof(float));
+      tb.sideband = FlexData::make_object();
+      tb.sideband.as_object().insert("sample_rate", FlexData::make_int(rt_sr));
+      return tb;
+    };
+
+    std::vector<std::vector<int>> frames;
+    std::int64_t total_samps = 0;
+    if (_stream_chunk > 0) {
+      // STREAMING: decode + emit PCM every _stream_chunk frames via the codec's
+      // windowed-KV streaming decode (first audio out ~one chunk after start).
+      // Reuse the cached ring state across beats (see the v1.5 path); the guard
+      // also re-allocates if the active-codebook count changes.
+      if (!_stream_v1 || _stream_v1->max_chunk != _stream_chunk
+          || _stream_v1->n_active != rt_nvq) {
+        _stream_v1 = _codec->decode_stream_begin(_stream_chunk, rt_nvq);
+      } else {
+        _stream_v1->reset();
+      }
+      std::vector<std::vector<std::int32_t>> buf;
+      bool open = (_stream_v1 != nullptr);
+      auto flush = [&]() {
+        if (!open || buf.empty()) { return; }
+        std::vector<float> pcm = _codec->decode_stream_chunk(*_stream_v1, buf);
+        buf.clear();
+        if (pcm.empty()) { return; }
+        total_samps += static_cast<std::int64_t>(pcm.size());
+        open = ctx.write_sync(
+            0, make_payload<TensorBeatPayload>(make_pcm_beat(pcm)));
+        if (open) { ++_clips_emitted; }
+      };
+      auto on_frame = [&](const std::vector<int>& codes) -> bool {
+        buf.emplace_back(codes.begin(), codes.end());
+        if (static_cast<int>(buf.size()) >= _stream_chunk) { flush(); }
+        return open && !new_text_pending();   // barge-in: stop on new text
+      };
+      frames = _lm_rt->generate(prompt_grid, text_ids, max_f, rt_sp,
+                                _sampler_seed, on_frame);
+      flush();
+    } else {
+      frames = _lm_rt->generate(
+          prompt_grid, text_ids, max_f, rt_sp, _sampler_seed,
+          [&](const std::vector<int>&) { return !new_text_pending(); });
+    }
+    const auto rt_gen = rtclock::now();
+    if (frames.empty()) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): realtime generated 0 frames; emitting "
+          "nothing", this->id()));
+      co_return;
+    }
+    // voice_lock (design-once): cache the FIRST generated voice as the clone
+    // reference for later beats (a fixed sampler_seed picks it deterministically).
+    // An external iport reference overrides it (_ref_set already true).
+    if (_voice_lock && !_ref_set) {
+      std::vector<std::vector<std::int32_t>> rc;
+      rc.reserve(frames.size());
+      for (const auto& f : frames) { rc.emplace_back(f.begin(), f.end()); }
+      if (_voice_ref_seconds > 0.0) {
+        const std::size_t cap = static_cast<std::size_t>(
+            _voice_ref_seconds * 12.5);   // 12.5 Hz frame rate
+        if (cap >= 1 && rc.size() > cap) { rc.resize(cap); }
+      }
+      _ref_codes = std::move(rc);
+      _ref_set   = true;
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): voice_lock engaged -- {} frames cached as "
+          "the realtime reference", this->id(),
+          static_cast<int>(_ref_codes.size())));
+    }
+    if (_stream_chunk <= 0) {
+      // ONE-SHOT: decode the whole utterance, emit a single PCM beat.
+      std::vector<std::vector<std::int32_t>> rt_codes;
+      rt_codes.reserve(frames.size());
+      for (const auto& f : frames) {
+        rt_codes.emplace_back(f.begin(), f.end());
+      }
+      std::vector<float> rt_wav = _codec->decode(rt_codes, nullptr, rt_nvq);
+      if (rt_wav.empty()) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): codec produced 0 samples", this->id()));
+        co_return;
+      }
+      total_samps = static_cast<std::int64_t>(rt_wav.size());
+      ++_clips_emitted;
+      co_await ctx.write(
+          0, make_payload<TensorBeatPayload>(make_pcm_beat(rt_wav)));
+    }
+    auto rtms = [](rtclock::duration d) {
+      return static_cast<int>(
+          std::chrono::duration<double, std::milli>(d).count());
+    };
+    std::string rt_mode = _stream_chunk > 0
+        ? fmt("streamed {}-frame chunks", _stream_chunk)()
+        : std::string("one-shot decode");
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): realtime {} chars -> {} frames -> {} PCM = "
+        "{:.2f}s @ {} Hz ({} ms gen, {})",
+        this->id(), static_cast<int>(rt_text.size()),
+        static_cast<int>(frames.size()), static_cast<int>(total_samps),
+        total_samps / static_cast<double>(rt_sr), rt_sr,
+        rtms(rt_gen - rt0), rt_mode));
+    co_return;
+  }
+
   // ---- v1.5 variant (depth decoder -> codec-v2 -> 48 kHz stereo) ----
   if (_lm_v15) {
     if (!_codec_v15 || !_tokenizer) {
@@ -829,8 +1221,64 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     v15_audio_sp.top_k              = _audio_top_k;
     v15_audio_sp.top_p              = static_cast<float>(_audio_top_p);
     v15_audio_sp.repetition_penalty = static_cast<float>(_audio_rep);
-    std::vector<std::vector<int>> frames =
-        _lm_v15->generate(grid, _max_frames, v15_audio_sp, _sampler_seed);
+    const int v15_sr = _codec_v15->sample_rate();
+    const int v15_ch = _codec_v15->channels();
+    // Build a PCM TensorBeat (channel-major [ch, samples]) from a wav vector.
+    auto make_pcm_beat = [&](const std::vector<float>& wav) {
+      const std::int64_t per =
+          static_cast<std::int64_t>(wav.size()) / (v15_ch > 0 ? v15_ch : 1);
+      TensorBeat tb;
+      tb.dtype = TensorBeat::DType::F32;
+      tb.shape = { static_cast<std::int64_t>(v15_ch), per };
+      tb.resize_contiguous(wav.size());
+      std::memcpy(tb.as_f32(), wav.data(), wav.size() * sizeof(float));
+      tb.sideband = FlexData::make_object();
+      tb.sideband.as_object().insert("sample_rate", FlexData::make_int(v15_sr));
+      return tb;
+    };
+
+    std::vector<std::vector<int>> frames;
+    std::int64_t total_samps = 0;   // samples/channel emitted this beat
+    if (_stream_chunk > 0) {
+      // STREAMING: decode + emit PCM every _stream_chunk generated frames via
+      // the codec's windowed-KV streaming decode, so the first audio leaves
+      // ~one chunk after audio starts instead of after the whole utterance.
+      // The generate callback is synchronous (can't co_await), so chunks go
+      // out with write_sync; open=false (downstream closed) stops generation.
+      // Reuse the cached ring state across beats; allocate only on first use
+      // (or if the chunk size changed), else just re-arm the positions.
+      if (!_stream_v15 || _stream_v15->max_chunk != _stream_chunk) {
+        _stream_v15 = _codec_v15->decode_stream_begin(_stream_chunk);
+      } else {
+        _stream_v15->reset();
+      }
+      std::vector<std::vector<std::int32_t>> buf;
+      bool open = (_stream_v15 != nullptr);
+      auto flush = [&]() {
+        if (!open || buf.empty()) { return; }
+        std::vector<float> pcm =
+            _codec_v15->decode_stream_chunk(*_stream_v15, buf);
+        buf.clear();
+        if (pcm.empty()) { return; }
+        total_samps += static_cast<std::int64_t>(pcm.size())
+                       / (v15_ch > 0 ? v15_ch : 1);
+        open = ctx.write_sync(
+            0, make_payload<TensorBeatPayload>(make_pcm_beat(pcm)));
+        if (open) { ++_clips_emitted; }
+      };
+      auto on_frame = [&](const std::vector<int>& codes) -> bool {
+        buf.emplace_back(codes.begin(), codes.end());
+        if (static_cast<int>(buf.size()) >= _stream_chunk) { flush(); }
+        return open && !new_text_pending();   // barge-in: stop on new text
+      };
+      frames = _lm_v15->generate(grid, _max_frames, v15_audio_sp,
+                                 _sampler_seed, on_frame);
+      flush();   // the final partial (< _stream_chunk) chunk
+    } else {
+      frames = _lm_v15->generate(
+          grid, _max_frames, v15_audio_sp, _sampler_seed,
+          [&](const std::vector<int>&) { return !new_text_pending(); });
+    }
     const auto vt_gen = v15clock::now();
     if (frames.empty()) {
       session()->warn(fmt(
@@ -856,44 +1304,42 @@ TextToSpeechStage::process(RuntimeContext& ctx)
           "the v1.5 reference for subsequent beats", this->id(),
           static_cast<int>(_ref_codes.size())));
     }
-    std::vector<std::vector<std::int32_t>> v15_codes;
-    v15_codes.reserve(frames.size());
-    for (const auto& f : frames) {
-      v15_codes.emplace_back(f.begin(), f.end());
+    if (_stream_chunk <= 0) {
+      // ONE-SHOT: decode the whole utterance and emit a single PCM beat.
+      std::vector<std::vector<std::int32_t>> v15_codes;
+      v15_codes.reserve(frames.size());
+      for (const auto& f : frames) {
+        v15_codes.emplace_back(f.begin(), f.end());
+      }
+      std::vector<float> v15_wav = _codec_v15->decode(v15_codes);
+      if (v15_wav.empty()) {
+        session()->warn(fmt(
+            "TextToSpeechStage('{}'): codec-v2 produced 0 samples",
+            this->id()));
+        co_return;
+      }
+      total_samps = static_cast<std::int64_t>(v15_wav.size())
+                    / (v15_ch > 0 ? v15_ch : 1);
+      ++_clips_emitted;
+      co_await ctx.write(
+          0, make_payload<TensorBeatPayload>(make_pcm_beat(v15_wav)));
     }
-    std::vector<float> v15_wav = _codec_v15->decode(v15_codes);
-    const auto vt_dec = v15clock::now();
-    if (v15_wav.empty()) {
-      session()->warn(fmt(
-          "TextToSpeechStage('{}'): codec-v2 produced 0 samples", this->id()));
-      co_return;
-    }
-    const int v15_sr = _codec_v15->sample_rate();
-    const int v15_ch = _codec_v15->channels();
-    const std::int64_t per =
-        static_cast<std::int64_t>(v15_wav.size()) / (v15_ch > 0 ? v15_ch : 1);
-    TensorBeat vtb;
-    vtb.dtype = TensorBeat::DType::F32;
-    vtb.shape = { static_cast<std::int64_t>(v15_ch), per };
-    vtb.resize_contiguous(v15_wav.size());
-    std::memcpy(vtb.as_f32(), v15_wav.data(), v15_wav.size() * sizeof(float));
-    vtb.sideband = FlexData::make_object();
-    vtb.sideband.as_object().insert("sample_rate",
-                                    FlexData::make_int(v15_sr));
     auto v15ms = [](v15clock::duration d) {
       return static_cast<int>(
           std::chrono::duration<double, std::milli>(d).count());
     };
+    std::string mode = _stream_chunk > 0
+        ? fmt("streamed {}-frame chunks", _stream_chunk)()
+        : std::string("one-shot decode");
     session()->info(fmt(
         "TextToSpeechStage('{}'): v1.5 {} chars -> {} prompt rows{} -> {} "
-        "frames -> {}x{} PCM = {:.2f}s @ {} Hz ({} ms gen + {} ms decode)",
+        "frames -> {}x{} PCM = {:.2f}s @ {} Hz ({} ms gen, {})",
         this->id(), static_cast<int>(v15_text.size()),
         static_cast<int>(grid.size()), _ref_set ? " (cloned)" : "",
         static_cast<int>(frames.size()),
-        v15_ch, static_cast<int>(per), per / static_cast<double>(v15_sr),
-        v15_sr, v15ms(vt_gen - vt0), v15ms(vt_dec - vt_gen)));
-    ++_clips_emitted;
-    co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(vtb)));
+        v15_ch, static_cast<int>(total_samps),
+        total_samps / static_cast<double>(v15_sr), v15_sr,
+        v15ms(vt_gen - vt0), mode));
     co_return;
   }
 
@@ -1025,8 +1471,19 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   text_sp.top_k              = _text_top_k;
   text_sp.top_p              = static_cast<float>(_text_top_p);
   text_sp.repetition_penalty = static_cast<float>(_text_rep);
-  auto gen = _lm->generate_delay(prompt, _max_new_tokens, audio_sp, text_sp,
-                                 _sampler_seed);
+  // NOTE: the 8B delay-pattern path is not yet streamed -- de-delaying a real
+  // frame needs its code channels from the next n_vq delayed rows, so streaming
+  // it requires a rolling de-delay (a self-contained follow-up). It always
+  // decodes one-shot; flag it once so stream_chunk_frames isn't silently ignored.
+  if (_stream_chunk > 0) {
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): stream_chunk_frames set but the 8B "
+        "delay-pattern variant decodes one-shot (streaming N/A here)",
+        this->id()));
+  }
+  auto gen = _lm->generate_delay(
+      prompt, _max_new_tokens, audio_sp, text_sp, _sampler_seed,
+      [&]() { return new_text_pending(); });   // barge-in: stop on new text
   const auto t_gen = clock::now();
   if (gen.empty()) {
     session()->warn(fmt(

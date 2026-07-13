@@ -10,9 +10,12 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <optional>
+#include <regex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace std;
 
@@ -21,6 +24,24 @@ namespace vpipe::webui {
 namespace {
 
 constexpr size_t kScanCap = 500000;   // bound work per keys query
+// Streaming value-filter scan bounds: at most 64k rows are streamed back
+// (the client caps its in-memory result there), and a single value larger
+// than this is substring-searched over its raw bytes rather than decoded
+// to JSON (keeps the per-entry cost bounded).
+constexpr long   kMatchCap     = 65536;
+constexpr size_t kValueTextCap = 4u * 1024 * 1024;
+
+// ASCII lowercase (leaves non-ASCII bytes untouched) for case-insensitive
+// substring matching.
+string
+lower_ascii(string_view s)
+{
+  string out(s);
+  for (char& c : out) {
+    if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c - 'A' + 'a'); }
+  }
+  return out;
+}
 
 // ---- base64 (standard alphabet) ----------------------------------
 const char kB64[] =
@@ -499,6 +520,305 @@ DbBrowser::query_keys(const FlexData& req, string& err)
   d.insert("truncated", FlexData::make_bool(truncated));
   d.insert("keys", std::move(keysArr));
   return doc;
+}
+
+namespace {
+
+// One parsed value-content condition.
+//   0 includes   1 excludes   (case-insensitive substring)
+//   2 regex      3 !regex     (whole value, one input)
+//   4 line-regex 5 !line-regex (per line: ^/$ anchor to line bounds,
+//                               matches if ANY / NO single line matches)
+// `op` (0=and, 1=or) connects this row to the preceding context; `indent`
+// nests it -- a more-indented run forms a group with the row one step less
+// indented (see eval_node). op/indent are unused for the first row.
+struct ValueCond {
+  int              kind   = 0;
+  int              op     = 0;   // 0 and, 1 or
+  int              indent = 0;
+  string           needle;       // lowercased, for includes/excludes
+  optional<regex>  re;           // compiled, for the regex kinds
+};
+
+// Evaluate the and/or-indent tree of conditions. `test(i)` runs condition
+// i against the current value. A node is its own leaf value folded (left
+// to right) with each deeper-indented child subtree, using the child's
+// `op`; siblings at the same level fold the same way. Indentation thus
+// parenthesizes: e.g.  A / and B / and C / or D / and E  (indents 0 1 1 0
+// 1) evaluates to (A&&B&&C) || (D&&E). Assumes normalized indents
+// (conds[0].indent==0, each indent <= previous+1).
+template <class Test>
+std::pair<bool, size_t>
+eval_node(const vector<ValueCond>& conds, size_t i, Test& test)
+{
+  const int lvl = conds[i].indent;
+  bool acc = test(i);
+  size_t j = i + 1;
+  while (j < conds.size() && conds[j].indent > lvl) {
+    const bool is_or = (conds[j].op == 1);
+    auto r = eval_node(conds, j, test);
+    acc = is_or ? (acc || r.first) : (acc && r.first);
+    j = r.second;
+  }
+  return { acc, j };
+}
+
+template <class Test>
+bool
+eval_tree(const vector<ValueCond>& conds, Test& test)
+{
+  if (conds.empty()) { return true; }
+  auto r = eval_node(conds, 0, test);
+  bool acc = r.first;
+  size_t j = r.second;
+  while (j < conds.size()) {
+    const bool is_or = (conds[j].op == 1);
+    auto rr = eval_node(conds, j, test);
+    acc = is_or ? (acc || rr.first) : (acc && rr.first);
+    j = rr.second;
+  }
+  return acc;
+}
+
+// True if any single line of `text` matches `re`. Each line is fed as an
+// independent input so `^`/`$` bind to the line's bounds and `.` never
+// crosses a newline (grep-style single-line matching).
+bool
+any_line_matches(const string& text, const regex& re)
+{
+  const char* base = text.data();
+  const size_t n = text.size();
+  size_t start = 0;
+  for (;;) {
+    size_t nl = text.find('\n', start);
+    size_t end = (nl == string::npos) ? n : nl;
+    if (regex_search(base + start, base + end, re)) { return true; }
+    if (nl == string::npos) { break; }
+    start = nl + 1;
+  }
+  return false;
+}
+
+// Build a searchable text for a value: FlexData records decode to
+// *pretty* JSON -- byte-for-byte the same text read_value hands the value
+// pane -- so the filter and the value-pane highlighter agree, and a
+// `regex_line` condition matches the same visual lines the user sees.
+// (Compact JSON would put the whole record on one line, making
+// `regex_line` behave like whole-value `regex` and match across fields.)
+// Everything else (and oversized flex) is searched as raw bytes so a
+// substring still hits.
+string
+value_search_text(string_view raw)
+{
+  bool looks_flex = raw.size() >= 8 && raw[0] == 'V' && raw[1] == 'P'
+                    && raw[2] == 'F' && raw[3] == 'D';
+  if (looks_flex && raw.size() <= kValueTextCap) {
+    try {
+      return FlexData::from_binary(raw).to_json(/*pretty=*/true);
+    } catch (...) {
+      // fall through to raw bytes
+    }
+  }
+  return string(raw);
+}
+
+}  // namespace
+
+void
+DbBrowser::stream_scan(const FlexData& req,
+                       const function<bool(const FlexData&)>& emit_meta,
+                       const function<bool(const FlexData&)>& emit_row,
+                       ScanStats& stats, string& err)
+{
+  if (!req.is_object()) { err = "expected a JSON object"; return; }
+  auto root = req.as_object();
+  const string dbname = fstr_get(root, "db");
+  string mode  = fstr_get(root, "mode", "auto");
+  const string match = fstr_get(root, "match", "exact");
+  const string q  = fstr_get(root, "q");
+  const string lo = fstr_get(root, "lo");
+  const string hi = fstr_get(root, "hi");
+  if (dbname.empty()) { err = "no database selected"; return; }
+
+  // Parse the value-content conditions (blank keywords are skipped). Each
+  // carries an and/or `op` + `indent` that together form a boolean tree
+  // (see eval_tree). op/indent for the first row are ignored.
+  vector<ValueCond> conds;
+  if (root.contains("filters")) {
+    FlexData fld = root.at("filters");
+    if (fld.is_array()) {
+      auto fa = fld.as_array();
+      for (size_t i = 0; i < fa.size(); ++i) {
+        FlexData e = fa.at(i);
+        if (!e.is_object()) { continue; }
+        auto eo = e.as_object();
+        string kw = eo.contains("kw") ? string(eo.at("kw").as_string(""))
+                                      : string();
+        if (kw.empty()) { continue; }
+        string cond = eo.contains("cond")
+                        ? string(eo.at("cond").as_string("includes"))
+                        : string("includes");
+        ValueCond c;
+        if (cond == "excludes")             { c.kind = 1; }
+        else if (cond == "regex")           { c.kind = 2; }
+        else if (cond == "regex_not")       { c.kind = 3; }
+        else if (cond == "regex_line")      { c.kind = 4; }
+        else if (cond == "regex_line_not")  { c.kind = 5; }
+        else                                { c.kind = 0; }   // includes
+        if (c.kind >= 2) {   // all regex kinds compile a pattern
+          try {
+            c.re.emplace(kw, regex::ECMAScript | regex::icase);
+          } catch (...) {
+            err = "invalid regular expression: " + kw;
+            return;
+          }
+        } else {
+          c.needle = lower_ascii(kw);
+        }
+        string op = eo.contains("op") ? string(eo.at("op").as_string("and"))
+                                      : string("and");
+        c.op = (op == "or") ? 1 : 0;
+        long ind = eo.contains("indent") ? eo.at("indent").as_int(0) : 0;
+        c.indent = ind < 0 ? 0 : static_cast<int>(ind);
+        conds.push_back(std::move(c));
+      }
+    }
+  }
+  // Normalize indents to a well-formed tree: first row at 0, every row at
+  // most one deeper than its predecessor (guards against gaps left by
+  // skipped-blank rows or a malformed request).
+  for (size_t i = 0; i < conds.size(); ++i) {
+    if (i == 0) {
+      conds[0].indent = 0;
+    } else {
+      int cap = conds[i - 1].indent + 1;
+      if (conds[i].indent > cap) { conds[i].indent = cap; }
+    }
+  }
+
+  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  if (!env || !env->valid()) { err = "no database available"; return; }
+  MDB_env* e = env->raw();
+  MDB_txn* txn = nullptr;
+  if (mdb_txn_begin(e, nullptr, MDB_RDONLY, &txn) != 0) {
+    err = "could not open a read transaction"; return;
+  }
+  MDB_dbi dbi = 0;
+  if (mdb_dbi_open(txn, dbname.c_str(), 0, &dbi) != 0) {
+    mdb_txn_abort(txn);
+    err = "no such database: " + dbname; return;
+  }
+  MDB_cursor* cur = nullptr;
+  mdb_cursor_open(txn, dbi, &cur);
+
+  // Resolve auto mode from the first key (same rule as query_keys).
+  if (mode == "auto") {
+    MDB_val k0, v0;
+    if (mdb_cursor_get(cur, &k0, &v0, MDB_FIRST) == 0) {
+      mode = detect_mode(string_view(static_cast<const char*>(k0.mv_data),
+                                     k0.mv_size));
+    } else {
+      mode = "text";
+    }
+  }
+  if (mode != "text" && mode != "number" && mode != "time") { mode = "text"; }
+
+  const bool range = (match == "range");
+  const bool match_all = range ? (lo.empty() && hi.empty()) : q.empty();
+  optional<double> qn, lon, hin, qt, lot, hit;
+  if (mode == "number") {
+    if (!q.empty())  { qn  = key_as_number(q); }
+    if (!lo.empty()) { lon = key_as_number(lo); }
+    if (!hi.empty()) { hin = key_as_number(hi); }
+  } else if (mode == "time") {
+    if (!q.empty())  { qt  = parse_datetime(q); }
+    if (!lo.empty()) { lot = parse_datetime(lo); }
+    if (!hi.empty()) { hit = parse_datetime(hi); }
+  }
+
+  auto key_matches = [&](string_view ks) -> bool {
+    if (match_all) { return true; }
+    if (mode == "number") {
+      auto kn = key_as_number(ks);
+      if (!kn) { return false; }
+      if (!range) { return qn && *kn == *qn; }
+      return (!lon || *kn >= *lon) && (!hin || *kn <= *hin);
+    }
+    if (mode == "time") {
+      auto kt = key_as_time(ks);
+      if (!kt) { return false; }
+      if (!range) { return qt && fabs(*kt - *qt) < 0.5; }
+      return (!lot || *kt >= *lot) && (!hit || *kt <= *hit);
+    }
+    if (!range) { return ks == q; }
+    return (lo.empty() || ks >= lo) && (hi.empty() || ks <= hi);
+  };
+
+  // Value-content test. Only the key-matched set pays the decode cost.
+  // Each condition is tested against the value, then the and/or-indent
+  // tree combines the results (eval_tree).
+  auto value_matches = [&](const MDB_val& vv) -> bool {
+    if (conds.empty()) { return true; }
+    string text = value_search_text(
+        string_view(static_cast<const char*>(vv.mv_data), vv.mv_size));
+    string low;
+    bool low_ready = false;
+    auto ensure_low = [&]() {
+      if (!low_ready) { low = lower_ascii(text); low_ready = true; }
+    };
+    auto test = [&](size_t idx) -> bool {
+      const ValueCond& c = conds[idx];
+      switch (c.kind) {
+        case 0: ensure_low(); return low.find(c.needle) != string::npos;
+        case 1: ensure_low(); return low.find(c.needle) == string::npos;
+        case 2: return regex_search(text, *c.re);
+        case 3: return !regex_search(text, *c.re);
+        case 4: return any_line_matches(text, *c.re);
+        default: return !any_line_matches(text, *c.re);
+      }
+    };
+    return eval_tree(conds, test);
+  };
+
+  // Emit the resolved header before any rows.
+  {
+    FlexData meta = FlexData::make_object();
+    auto mo = meta.as_object();
+    mo.insert("t", FlexData::make_string("meta"));
+    mo.insert("db", FlexData::make_string(dbname));
+    mo.insert("mode", FlexData::make_string(mode));
+    mo.insert("match", FlexData::make_string(range ? "range" : "exact"));
+    if (!emit_meta(meta)) {
+      stats.aborted = true;
+      mdb_cursor_close(cur);
+      mdb_txn_abort(txn);
+      return;
+    }
+  }
+
+  MDB_val k, v;
+  int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+  while (rc == 0) {
+    if (++stats.scanned > kScanCap) { stats.truncated = true; break; }
+    string_view ks(static_cast<const char*>(k.mv_data), k.mv_size);
+    if (key_matches(ks) && value_matches(v)) {
+      FlexData o = FlexData::make_object();
+      auto oo = o.as_object();
+      oo.insert("t", FlexData::make_string("row"));
+      oo.insert("key", FlexData::make_string(b64_encode(ks)));
+      oo.insert("display", FlexData::make_string(key_display(ks, mode)));
+      if (mode == "time") {
+        if (auto t = key_as_time(ks)) {
+          oo.insert("epoch", FlexData::make_real(*t));
+        }
+      }
+      if (!emit_row(o)) { stats.aborted = true; break; }
+      if (++stats.matched >= kMatchCap) { stats.truncated = true; break; }
+    }
+    rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+  }
+  mdb_cursor_close(cur);
+  mdb_txn_abort(txn);
 }
 
 FlexData

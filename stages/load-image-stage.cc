@@ -134,6 +134,11 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
         "LoadImageStage('{}'): config.url is required "
         "(non-empty string or array of strings)", this->id()));
   }
+  // Confine local file sources to the session file sandbox (network URLs
+  // pass through; no-op when the sandbox is disabled). Escape fails config.
+  for (auto& url : _urls) {
+    url = confine_local_(url, /*for_write=*/false);
+  }
   for (const auto& url : _urls) {
     if (url.empty()) {
       fail_config(fmt(
@@ -152,7 +157,8 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "url", .type = ConfigType::Any, .required = true,
-   .doc = "image path/URL string or array of strings"},
+   .doc = "image path/URL string or array of strings",
+   .is_path = true, .path_filter = "image"},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional pacing beat (e.g. chrono); each "
@@ -162,7 +168,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "image", .doc = "decoded image as planar U8 RGB TensorBeat "
                            "[3,H,W]",
-   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-frames", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "load-image",
@@ -170,7 +177,7 @@ const StageSpec kSpec = {
                "planar U8 RGB TensorBeats. With a wired trigger iport one "
                "beat emits one image; unwired it emits all then ends.",
   .display_name = "Load Image",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Visual,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,

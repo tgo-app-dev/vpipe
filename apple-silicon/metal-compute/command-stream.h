@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace MTL {
 class CommandBuffer;
@@ -81,8 +82,32 @@ public:
     // empty Fence.
     void wait();
 
+    // Block until complete, then report success. Returns true iff the
+    // GPU command finished without error; false if the buffer faulted
+    // (status Error) -- most importantly an out-of-memory or page-fault
+    // from over-committing GPU memory, which otherwise leaves the output
+    // buffer silently corrupt. When it returns false and `reason` is
+    // non-null, `*reason` gets a human-readable description. An empty
+    // Fence returns true (nothing ran, nothing failed).
+    bool wait_ok(std::string* reason = nullptr);
+
     // Non-blocking poll. Returns true iff status() == Completed.
     bool completed() const noexcept;
+
+    // True iff the command buffer ended in the Error status (query after
+    // wait()/completed()). false on an empty Fence.
+    bool errored() const noexcept;
+
+    // True when the error is a memory fault -- MTLCommandBufferError
+    // OutOfMemory or PageFault (the GPU touched non-resident memory);
+    // i.e. an over-commit. false if there was no error / a non-memory
+    // error / an empty Fence.
+    bool out_of_memory() const noexcept;
+
+    // Raw MTLCommandBufferError code (0 == no error), and a human
+    // message ("" when no error). Valid after the buffer completes.
+    long        error_code() const noexcept;
+    std::string error_message() const noexcept;
 
     // GPU execution window of this command buffer, in seconds. `gpu_s` is
     // Metal's GPUStartTime..GPUEndTime (schedule+execute), `kernel_s` is

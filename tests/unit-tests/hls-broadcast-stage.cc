@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -86,6 +87,30 @@ public:
   }
 };
 
+// Keeps its oport OPEN but emits NOTHING for `naps` iterations (each a short
+// sleep) before closing -- a producer that is wired + live but has not yet
+// produced any data. Lets a downstream audio-only hls-broadcast prime + self-
+// clock silence during the idle window.
+class IdleThenCloseSource : public TypedStage<IdleThenCloseSource> {
+public:
+  static constexpr const char* kTypeName = "ut-hls-idle-source";
+  using TypedStage::TypedStage;
+
+  int naps   = 30;
+  int nap_ms = 50;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_n >= naps) { ctx.signal_done(); co_return; }
+    ++_n;
+    std::this_thread::sleep_for(std::chrono::milliseconds(nap_ms));
+    co_return;   // stay open, produce nothing
+  }
+
+private:
+  int _n = 0;
+};
+
 TensorBeat
 make_tensor_(int H, int W, float v = 0.5f)
 {
@@ -108,6 +133,33 @@ make_u8_tensor_(int H, int W, uint8_t v = 128)
   tb.shape = {3, H, W};
   tb.resize_contiguous(static_cast<size_t>(3) * H * W);
   std::memset(tb.as_u8(), v, static_cast<size_t>(3) * H * W);
+  return tb;
+}
+
+// A mono PCM audio beat: rank-1 [n] F32 tone, with a sideband carrying
+// sample_rate (+ optional timestamp_us). This is the shape audio-to-pcm
+// / text-to-speech emit.
+TensorBeat
+make_pcm_tensor_(int n, int sample_rate,
+                 bool with_ts = false, uint64_t ts_us = 0)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::F32;
+  tb.shape = {static_cast<int64_t>(n)};
+  tb.resize_contiguous(static_cast<size_t>(n));
+  float* p = tb.as_f32();
+  for (int i = 0; i < n; ++i) {
+    // A quiet 440 Hz tone -- content doesn't matter, just be non-zero.
+    p[i] = 0.05f * std::sin(2.0f * 3.14159265f * 440.0f
+                            * static_cast<float>(i)
+                            / static_cast<float>(sample_rate));
+  }
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert("sample_rate", FlexData::make_int(sample_rate));
+  if (with_ts) {
+    sb.as_object().insert("timestamp_us", FlexData::make_uint(ts_us));
+  }
+  tb.sideband = std::move(sb);
   return tb;
 }
 
@@ -515,6 +567,106 @@ TEST(hls_broadcast_stage, defaults_and_derived_url)
   EXPECT_TRUE(stage.live_start_offset() == 0.0);
 }
 
+namespace {
+
+// Run one hls-broadcast stage over `count` copies of `frame` (the
+// RepeatTensorSource deep-copies it, sideband included) and return the
+// stage's resolved {fps_num, fps_den} after the run. The encode fps is
+// resolved on the first frame, so it's populated regardless of whether
+// the encoder itself (codec availability) succeeded.
+std::pair<int, int>
+run_hls_resolve_fps_(Session& sess, FlexData cfg,
+                     const TensorBeat& frame, int count)
+{
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatTensorSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = frame;
+  src_u->count = count;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(src_u)));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc", vector<InEdge>{{src, 0}}, std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  rt.launch();
+  rt.wait_idle();
+  rt.stop();
+  return { bc->fps_num(), bc->fps_den() };
+}
+
+// Base config for the fps tests: cheap software encoder, deterministic
+// PTS, no HTTP server. Callers layer fps_* on top (or omit for auto).
+FlexData
+fps_test_base_cfg_()
+{
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("codec", FlexData::make_string("libx264"));
+  cfg.as_object().insert("preset", FlexData::make_string("ultrafast"));
+  cfg.as_object().insert("realtime", FlexData::make_bool(false));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+  return cfg;
+}
+
+// A frame carrying an fps_num/fps_den sideband, the shape video-to-rgb
+// forwards from the capture stream.
+TensorBeat
+make_tensor_with_fps_(int H, int W, unsigned fps_num, unsigned fps_den)
+{
+  TensorBeat tb = make_tensor_(H, W, 0.5f);
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert("fps_num", FlexData::make_uint(fps_num));
+  sb.as_object().insert("fps_den", FlexData::make_uint(fps_den));
+  tb.sideband = std::move(sb);
+  return tb;
+}
+
+}  // namespace
+
+TEST(hls_broadcast_stage, adopts_fps_from_sideband_when_unset)
+{
+  // No fps in config -> the stage adopts the input frame's sideband
+  // rate (23.976 fps as 24000/1001), not the 30/1 fallback.
+  CerrSilencer hush;
+  Session sess;
+  auto fps = run_hls_resolve_fps_(
+      sess, fps_test_base_cfg_(),
+      make_tensor_with_fps_(32, 32, 24000, 1001), 3);
+  EXPECT_TRUE(fps.first  == 24000);
+  EXPECT_TRUE(fps.second == 1001);
+}
+
+TEST(hls_broadcast_stage, config_fps_overrides_sideband)
+{
+  // An explicit fps in config wins over whatever the sideband says.
+  CerrSilencer hush;
+  Session sess;
+  FlexData cfg = fps_test_base_cfg_();
+  cfg.as_object().insert("fps_num", FlexData::make_int(10));
+  cfg.as_object().insert("fps_den", FlexData::make_int(1));
+  auto fps = run_hls_resolve_fps_(
+      sess, std::move(cfg),
+      make_tensor_with_fps_(32, 32, 24000, 1001), 3);
+  EXPECT_TRUE(fps.first  == 10);
+  EXPECT_TRUE(fps.second == 1);
+}
+
+TEST(hls_broadcast_stage, fps_falls_back_to_30_without_sideband_or_config)
+{
+  // No config fps and no sideband fps -> the 30/1 last-resort default.
+  CerrSilencer hush;
+  Session sess;
+  auto fps = run_hls_resolve_fps_(
+      sess, fps_test_base_cfg_(),
+      make_tensor_(32, 32, 0.5f), 3);
+  EXPECT_TRUE(fps.first  == 30);
+  EXPECT_TRUE(fps.second == 1);
+}
+
 TEST(hls_broadcast_stage, accepts_fractional_segment_duration)
 {
   // Pre-per-AU latency work shipped segment_duration as int (so 0.5
@@ -902,3 +1054,306 @@ TEST(hls_broadcast_stage, videotoolbox_encoder_writes_mpegts) {
   }
 }
 #endif
+
+namespace {
+// Emits `count` copies of `base`, each stamped with an incrementing
+// timestamp_us sideband (ts0 + i*ts_step_us). Used to exercise the
+// A/V timestamp-sync path (which needs monotonically-advancing wall
+// clocks that RepeatTensorSource's identical copies can't provide).
+class RampTsSource : public TypedStage<RampTsSource> {
+public:
+  static constexpr const char* kTypeName = "ut-hls-ramp-ts-source";
+  using TypedStage::TypedStage;
+
+  TensorBeat base;
+  int        count      = 1;
+  uint64_t   ts0        = 0;
+  uint64_t   ts_step_us = 0;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_i >= count) {
+      ctx.signal_done();
+      co_return;
+    }
+    TensorBeat tb = base;   // deep copy (shape + sideband)
+    if (!tb.sideband.is_object()) { tb.sideband = FlexData::make_object(); }
+    tb.sideband.as_object().insert_or_assign(
+        "timestamp_us",
+        FlexData::make_uint(ts0 + static_cast<uint64_t>(_i) * ts_step_us));
+    ++_i;
+    co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+  }
+
+private:
+  int _i = 0;
+};
+}  // namespace
+
+TEST(hls_broadcast_stage, audio_on_video_iport0_is_rejected) {
+  // iport 0 is STRICTLY the video port. Wiring PCM audio to it (the
+  // stage's single input) is a misconfiguration: the audio beats are
+  // dropped, nothing is muxed, and no stream is produced. (Audio-only
+  // must leave iport 0 disconnected and wire audio to iport 1.)
+  CerrSilencer hush;
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatTensorSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = make_pcm_tensor_(4800, 48000);   // 0.1 s mono @ 48k
+  src_u->count = 40;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(src_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("realtime", FlexData::make_bool(false));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc", vector<InEdge>{{src, 0}}, std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(!bc->audio_muxed());
+  EXPECT_TRUE(!bc->video_muxed());
+  EXPECT_TRUE(!bc->blobs().contains("/stream.m3u8"));
+}
+
+TEST(hls_broadcast_stage, audio_only_via_disconnected_video_iport) {
+  // Positional roles: iport 0 = video, iport 1 = audio. Leaving iport 0
+  // DISCONNECTED (InEdge{nullptr,0}) and wiring audio to iport 1 yields
+  // an audio-only broadcast -- the runtime treats the unwired iport as
+  // an immediate-EOS input, and resolve_roles_ reads its connectedness.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto a_u = make_unique<RepeatTensorSource>(
+      &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  a_u->tb    = make_pcm_tensor_(4800, 48000);
+  a_u->count = 40;                              // 4.0 s
+  a_u->allocate_oports(1);
+  auto* a = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(a_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("realtime", FlexData::make_bool(false));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+  cfg.as_object().insert("audio_buffer_seconds", FlexData::make_real(0.0));
+
+  // iport 0 (video) unwired; iport 1 (audio) = asrc.
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc",
+      vector<InEdge>{ InEdge{nullptr, 0}, InEdge{a, 0} },
+      std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(bc->audio_muxed());
+  EXPECT_TRUE(!bc->video_muxed());
+  EXPECT_TRUE(bc->blobs().contains("/stream.m3u8"));
+  EXPECT_TRUE(ts_segment_count_(bc->blobs()) >= 2);
+}
+
+TEST(hls_broadcast_stage, realtime_audio_only_primes_silence_before_audio) {
+  // Audio-only + realtime: the stream must go LIVE with a SILENT track at
+  // startup, before the producer emits any PCM, so a viewer can attach early.
+  // An idle producer (open but silent) is wired to the audio iport (iport 1),
+  // video (iport 0) left unwired; over the ~1.7s it stays open the stage should
+  // prime + self-clock silence -> a real playlist + segments with NO audio ever
+  // sent. (prime_silence defaults on.)
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto a_u = make_unique<IdleThenCloseSource>(
+      &sess, "idle", vector<InEdge>{}, FlexData::make_object());
+  a_u->naps = 34;                               // ~1.7s open, zero beats
+  a_u->nap_ms = 50;
+  a_u->allocate_oports(1);
+  auto* a = static_cast<IdleThenCloseSource*>(
+      pl->insert_stage(std::move(a_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("realtime", FlexData::make_bool(true));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+  cfg.as_object().insert("audio_buffer_seconds", FlexData::make_real(0.2));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc",
+      vector<InEdge>{ InEdge{nullptr, 0}, InEdge{a, 0} },
+      std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(bc->audio_muxed());     // silence broadcast with no real audio
+  EXPECT_TRUE(!bc->video_muxed());
+  EXPECT_TRUE(bc->blobs().contains("/stream.m3u8"));
+  EXPECT_TRUE(ts_segment_count_(bc->blobs()) >= 1);
+}
+
+TEST(hls_broadcast_stage, realtime_audio_only_paces_burst_without_loss) {
+  // REALTIME audio-only path (the streaming-TTS use case): a producer that
+  // bursts audio FASTER than realtime must not be dumped ahead of the wall
+  // clock -- pump_audio_ paces the drain and buffers the excess in the FIFO, so
+  // the self-clocked cadence / teardown flush plays it all out (no loss). Here
+  // a source emits 4 s of PCM as fast as it can with realtime=true; the whole
+  // 4 s must still reach the muxer (segments), exercising the paced code path.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto a_u = make_unique<RepeatTensorSource>(
+      &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  a_u->tb    = make_pcm_tensor_(4800, 48000);   // 0.1 s mono @ 48k
+  a_u->count = 40;                              // 4.0 s, pushed in a burst
+  a_u->allocate_oports(1);
+  auto* a = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(a_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("realtime", FlexData::make_bool(true));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+  cfg.as_object().insert("audio_buffer_seconds", FlexData::make_real(0.2));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc",
+      vector<InEdge>{ InEdge{nullptr, 0}, InEdge{a, 0} },
+      std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(bc->audio_muxed());
+  EXPECT_TRUE(!bc->video_muxed());
+  EXPECT_TRUE(bc->blobs().contains("/stream.m3u8"));
+  // All 4 s reached the output (the burst was paced + buffered, then flushed) --
+  // not truncated to a live-edge sliver. ~4 one-second segments expected.
+  EXPECT_TRUE(ts_segment_count_(bc->blobs()) >= 3);
+}
+
+TEST(hls_broadcast_stage, video_plus_audio_muxes_both_streams) {
+  // Video on iport 0 + audio on iport 1 -> one HLS output carrying both
+  // streams. libx264 so the test runs without VideoToolbox.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto v_u = make_unique<RepeatTensorSource>(
+      &sess, "vsrc", vector<InEdge>{}, FlexData::make_object());
+  v_u->tb    = make_tensor_(32, 32, 0.5f);
+  v_u->count = 90;                              // 3.0 s @ 30 fps
+  v_u->allocate_oports(1);
+  auto* v = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(v_u)));
+
+  auto a_u = make_unique<RepeatTensorSource>(
+      &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  a_u->tb    = make_pcm_tensor_(4800, 48000);   // 0.1 s mono @ 48k
+  a_u->count = 30;                              // 3.0 s total
+  a_u->allocate_oports(1);
+  auto* a = static_cast<RepeatTensorSource*>(
+      pl->insert_stage(std::move(a_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("codec", FlexData::make_string("libx264"));
+  cfg.as_object().insert("preset", FlexData::make_string("ultrafast"));
+  cfg.as_object().insert("realtime", FlexData::make_bool(false));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("fps_num", FlexData::make_int(30));
+  cfg.as_object().insert("fps_den", FlexData::make_int(1));
+  cfg.as_object().insert("gop_size", FlexData::make_int(30));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+  cfg.as_object().insert("audio_buffer_seconds", FlexData::make_real(0.0));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc", vector<InEdge>{{v, 0}, {a, 0}}, std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(bc->video_muxed());    // video stream
+  EXPECT_TRUE(bc->audio_muxed());    // audio stream
+  EXPECT_TRUE(bc->blobs().contains("/stream.m3u8"));
+  EXPECT_TRUE(ts_segment_count_(bc->blobs()) >= 2);
+}
+
+TEST(hls_broadcast_stage, av_timestamp_sync_muxes_both) {
+  // Both inputs carry monotonically-advancing timestamp_us, so the
+  // stage derives PTS for video AND audio from one shared UTC epoch
+  // (the ts-sync path, active in realtime mode). Verify it muxes both
+  // streams and emits at least one segment.
+  Session sess;
+
+  const uint64_t t0 = 1'700'000'000'000ull;   // arbitrary UTC epoch (us)
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto v_u = make_unique<RampTsSource>(
+      &sess, "vsrc", vector<InEdge>{}, FlexData::make_object());
+  v_u->base       = make_tensor_(32, 32, 0.5f);
+  v_u->count      = 90;
+  v_u->ts0        = t0;
+  v_u->ts_step_us = 33'333;                    // ~30 fps
+  v_u->allocate_oports(1);
+  auto* v = static_cast<RampTsSource*>(
+      pl->insert_stage(std::move(v_u)));
+
+  auto a_u = make_unique<RampTsSource>(
+      &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  a_u->base       = make_pcm_tensor_(4800, 48000);
+  a_u->count      = 30;
+  a_u->ts0        = t0;
+  a_u->ts_step_us = 100'000;                   // 0.1 s chunks
+  a_u->allocate_oports(1);
+  auto* a = static_cast<RampTsSource*>(
+      pl->insert_stage(std::move(a_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("codec", FlexData::make_string("libx264"));
+  cfg.as_object().insert("preset", FlexData::make_string("ultrafast"));
+  cfg.as_object().insert("realtime", FlexData::make_bool(true));
+  cfg.as_object().insert("segment_duration", FlexData::make_int(1));
+  cfg.as_object().insert("fps_num", FlexData::make_int(30));
+  cfg.as_object().insert("fps_den", FlexData::make_int(1));
+  cfg.as_object().insert("gop_size", FlexData::make_int(30));
+  cfg.as_object().insert("serve_http", FlexData::make_bool(false));
+
+  auto bc_u = make_unique<HlsBroadcastStage>(
+      &sess, "bc", vector<InEdge>{{v, 0}, {a, 0}}, std::move(cfg));
+  auto* bc = static_cast<HlsBroadcastStage*>(
+      pl->insert_stage(std::move(bc_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(bc->video_muxed());
+  EXPECT_TRUE(bc->audio_muxed());
+  EXPECT_TRUE(bc->blobs().contains("/stream.m3u8"));
+  EXPECT_TRUE(ts_segment_count_(bc->blobs()) >= 1);
+}

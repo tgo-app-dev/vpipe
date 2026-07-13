@@ -7,6 +7,8 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <filesystem>
+
 namespace vpipe {
 
 std::string
@@ -51,6 +53,19 @@ resolve_model_dir(const SessionContextIntf* session,
       "model registry: '{}' -> '{}' (models DB '{}')",
       ref, local, models_db));
   return local;
+}
+
+bool
+model_dir_available(const SessionContextIntf* session,
+                    const std::string&        models_db,
+                    const std::string&        ref)
+{
+  if (ref.empty()) {
+    return false;
+  }
+  const std::string dir = resolve_model_dir(session, models_db, ref);
+  std::error_code ec;
+  return std::filesystem::exists(dir, ec) && !ec;
 }
 
 }

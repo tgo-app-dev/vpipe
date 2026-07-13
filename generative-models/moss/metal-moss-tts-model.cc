@@ -384,7 +384,7 @@ std::vector<std::vector<std::int32_t>>
 MetalMossTtsModel::generate_delay(
     const std::vector<std::vector<std::int32_t>>& prompt, int max_new_tokens,
     const MossSampling& audio_sp, const MossSampling& text_sp,
-    std::uint64_t seed)
+    std::uint64_t seed, const std::function<bool()>& should_stop)
 {
   std::vector<std::vector<std::int32_t>> out;
   const int NV = _cfg.n_vq;
@@ -550,6 +550,10 @@ MetalMossTtsModel::generate_delay(
     out.push_back(row);
 
     if (is_stopping) { break; }
+    // Barge-in: new text arrived -> stop ASAP. The delayed codes still in
+    // flight (the last ~n_vq rows) never complete; the caller's de-delay drops
+    // them, so the emitted audio ends a hair early but the new text starts now.
+    if (should_stop && should_stop()) { break; }
 
     // Feed the new row back through the optimized qmv decode path, FUSING the
     // next step's heads (the state is now t+1) into the same command buffer.

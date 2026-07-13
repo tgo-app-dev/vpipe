@@ -38,6 +38,27 @@ TEST(model_benchmark_stage, type_is_registered)
               == "model-benchmark");
 }
 
+// The stage exposes one trigger iport (any beat type) + one FlexData
+// summary oport so it can cascade into a preparation recipe / save-text.
+TEST(model_benchmark_stage, trigger_and_summary_ports)
+{
+  Session sess;
+  CerrSilencer hush;
+  FlexData c = FlexData::make_object();
+  c.as_object().insert("model", FlexData::make_string("/tmp/m"));
+  ModelBenchmarkStage s(&sess, "bm", std::vector<InEdge>{}, std::move(c));
+  const StageSpec& sp = s.spec();
+  ASSERT_TRUE(sp.iports.size() == 1u);
+  ASSERT_TRUE(sp.oports.size() == 1u);
+  EXPECT_TRUE(std::string_view(sp.iports[0].name) == "trigger");
+  EXPECT_TRUE(sp.iports[0].type == nullptr);          // any beat type
+  EXPECT_TRUE(std::string_view(sp.oports[0].name) == "summary");
+  // By mangled name, not typeid pointer (stage in libvpipe vs test image).
+  ASSERT_TRUE(sp.oports[0].type != nullptr);
+  EXPECT_TRUE(std::string_view(sp.oports[0].type->name())
+              == typeid(FlexDataPayload).name());
+}
+
 TEST(model_benchmark_stage, config_defaults)
 {
   Session sess;

@@ -128,6 +128,95 @@ TEST(pipeline_spec, round_trip_through_flexdata_preserves_topology) {
   EXPECT_TRUE(spec1.to_json(true) == spec2.to_json(true));
 }
 
+TEST(pipeline_spec, disconnected_iport_gap_preserved_positionally) {
+  // iports are positional and optional: a null array element (or an
+  // object with empty "src") leaves that iport unwired, and later
+  // entries keep their index -- so a gap in the MIDDLE is honoured, not
+  // collapsed. detection-overlay has 3 iports; wire 0 and 2, leave 1
+  // disconnected.
+  Session sess;
+
+  FlexData spec = FlexData::make_object();
+  spec.as_object().insert_or_assign("id", FlexData::make_string("p"));
+  FlexData stages = FlexData::make_array();
+
+  auto add_chrono = [&](const char* id) {
+    FlexData s = FlexData::make_object();
+    s.as_object().insert_or_assign("id", FlexData::make_string(id));
+    s.as_object().insert_or_assign("type", FlexData::make_string("chrono"));
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("frequency_hz",
+                                     FlexData::make_real(10.0));
+    cfg.as_object().insert_or_assign("count", FlexData::make_int(1));
+    s.as_object().insert_or_assign("config", std::move(cfg));
+    stages.as_array().push_back(std::move(s));
+  };
+  add_chrono("img");
+  add_chrono("aud");
+
+  FlexData ov = FlexData::make_object();
+  ov.as_object().insert_or_assign("id", FlexData::make_string("ov"));
+  ov.as_object().insert_or_assign("type",
+      FlexData::make_string("detection-overlay"));
+  FlexData iports = FlexData::make_array();
+  {
+    FlexData e0 = FlexData::make_object();
+    e0.as_object().insert_or_assign("src", FlexData::make_string("img"));
+    e0.as_object().insert_or_assign("oport", FlexData::make_int(0));
+    iports.as_array().push_back(std::move(e0));
+  }
+  iports.as_array().push_back(FlexData::make_null());   // iport 1 unwired
+  {
+    FlexData e2 = FlexData::make_object();
+    e2.as_object().insert_or_assign("src", FlexData::make_string("aud"));
+    e2.as_object().insert_or_assign("oport", FlexData::make_int(0));
+    iports.as_array().push_back(std::move(e2));
+  }
+  ov.as_object().insert_or_assign("iports", std::move(iports));
+  stages.as_array().push_back(std::move(ov));
+  spec.as_object().insert_or_assign("stages", std::move(stages));
+
+  auto pl = pipeline_from_spec(spec, &sess);
+  ASSERT_TRUE(pl != nullptr);
+
+  // Find "ov" and confirm its positional iport edges: 0 + 2 wired, 1
+  // disconnected (v == nullptr).
+  bool checked = false;
+  for (auto it = pl->begin(); it != pl->end(); ++it) {
+    const Vertex* v = *it;
+    if (v->id() != "ov") { continue; }
+    const auto& edges = v->iport_edges();
+    ASSERT_TRUE(edges.size() == 3u);
+    EXPECT_TRUE(edges[0].v != nullptr);   // img
+    EXPECT_TRUE(edges[1].v == nullptr);   // the gap
+    EXPECT_TRUE(edges[2].v != nullptr);   // aud
+    checked = true;
+  }
+  EXPECT_TRUE(checked);
+
+  // The gap must survive re-serialization (src="" at index 1).
+  FlexData spec2 = pipeline_to_spec(*pl);
+  auto root2 = spec2.as_object();
+  FlexData stages2 = root2.at("stages");
+  auto sarr = stages2.as_array();
+  bool round_ok = false;
+  for (size_t i = 0; i < sarr.size(); ++i) {
+    FlexData st = sarr.at(i);
+    auto so = st.as_object();
+    FlexData id = so.at("id");
+    if (string(id.as_string("")) != "ov") { continue; }
+    FlexData ip = so.at("iports");
+    auto ia = ip.as_array();
+    EXPECT_TRUE(ia.size() == 3u);
+    FlexData e1 = ia.at(1);
+    auto e1o = e1.as_object();
+    FlexData s1 = e1o.at("src");
+    EXPECT_TRUE(string(s1.as_string("x")).empty());   // disconnected
+    round_ok = true;
+  }
+  EXPECT_TRUE(round_ok);
+}
+
 TEST(pipeline_spec, rejects_unknown_stage_type) {
   Session sess;
   FlexData spec = FlexData::make_object();

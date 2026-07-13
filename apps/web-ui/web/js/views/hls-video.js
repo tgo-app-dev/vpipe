@@ -121,6 +121,23 @@ export function mountHlsVideo(body, actions, ctx) {
       controlslist: 'nofullscreen noplaybackrate nodownload',
       disablepictureinpicture: '' });
     video.muted = true;        // required for autoplay in most browsers
+    // Auto-unmute when the stream actually carries audio (the stage's audio
+    // iport is wired). Start muted so autoplay always begins, then drop the
+    // mute once playback starts -- the click that opened this view is the user
+    // gesture that lets the browser honor sound. If the browser still refuses
+    // (rejects the re-play), fall back to muted so the picture keeps running
+    // and the viewer can unmute from the controls. Video-only streams stay
+    // muted (nothing to hear).
+    if (s.audio) {
+      video.addEventListener('playing', function unmuteOnce() {
+        video.removeEventListener('playing', unmuteOnce);
+        video.muted = false;
+        const p = video.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(() => { video.muted = true; });
+        }
+      });
+    }
     video.disablePictureInPicture = true;
     // Disable the built-in click/double-click-to-toggle on the video
     // surface: this is a live realtime view, so pausing or scrubbing by

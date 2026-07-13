@@ -15,15 +15,24 @@ EdgeReader::EdgeReader(OportBuffer* parent, unsigned cursor_idx)
 {
 }
 
+// A null parent marks a DISCONNECTED iport (an optional input the graph
+// left unwired). It has no producer, so it behaves as a permanently
+// closed edge: no backlog, immediate EOS, and every awaiter resolves to
+// null. This lets a stage declare positional iports where some are
+// optional -- num_iports() still counts the slot, ctx.eos(p) is true,
+// and read()/peek()/acquire() return null.
+
 uint32_t
 EdgeReader::dropped() const
 {
+  if (!_parent) { return 0; }
   return _parent->dropped_for_cursor(_cursor_idx);
 }
 
 uint32_t
 EdgeReader::backlog() const
 {
+  if (!_parent) { return 0; }
   // Active-from-this-cursor distance: wp - cursor.next_seq.
   // Relaxed loads are safe -- under-estimating progress yields a
   // larger backlog, never a negative or wrapped value.
@@ -42,7 +51,7 @@ EdgeReader::backlog() const
 void
 EdgeReader::release_read(uint32_t n)
 {
-  if (n == 0) { return; }
+  if (n == 0 || !_parent) { return; }
   auto wake = _parent->release_read_(_cursor_idx, n);
   if (wake) {
     _parent->session()->thread_pool()->schedule(*wake);
@@ -54,6 +63,8 @@ EdgeReader::release_read(uint32_t n)
 bool
 EdgeReader::readable_now() const
 {
+  // Disconnected: permanently readable (an immediate EOS never suspends).
+  if (!_parent) { return true; }
   // A beat to read, or closed (EOS) -- either way read() won't suspend.
   return backlog() > 0 || _parent->closed();
 }
@@ -61,12 +72,14 @@ EdgeReader::readable_now() const
 bool
 EdgeReader::at_eos() const
 {
+  if (!_parent) { return true; }
   return backlog() == 0 && _parent->closed();
 }
 
 EdgeReader::MultiReg
 EdgeReader::register_multi(const shared_ptr<MultiReadWaiter>& w)
 {
+  if (!_parent) { return MultiReg::Ready; }
   OportBuffer* buf = _parent;
   lock_guard<mutex> lk(buf->_mu);
   auto r = buf->peek_locked_(_cursor_idx, 0);
@@ -85,6 +98,7 @@ EdgeReader::register_multi(const shared_ptr<MultiReadWaiter>& w)
 void
 EdgeReader::deregister_multi(const shared_ptr<MultiReadWaiter>& w)
 {
+  if (!_parent) { return; }
   _parent->deregister_reader_multi_waiter_(_cursor_idx, w);
 }
 
@@ -93,6 +107,7 @@ EdgeReader::deregister_multi(const shared_ptr<MultiReadWaiter>& w)
 bool
 EdgeReader::PeekAwaiter::await_ready()
 {
+  if (!_reader->_parent) { _is_eos = true; return true; }
   OportBuffer* buf = _reader->_parent;
   lock_guard<mutex> lk(buf->_mu);
   auto r = buf->peek_locked_(_reader->_cursor_idx, _offset);
@@ -155,6 +170,7 @@ EdgeReader::PeekAwaiter::await_resume()
 bool
 EdgeReader::AcquireAwaiter::await_ready()
 {
+  if (!_reader->_parent) { _is_eos = true; return true; }
   OportBuffer* buf = _reader->_parent;
   optional<coroutine_handle<>> wake_writer;
   {
@@ -254,6 +270,7 @@ EdgeReader::AcquireAwaiter::await_resume()
 bool
 EdgeReader::ReadAwaiter::await_ready()
 {
+  if (!_reader->_parent) { _is_eos = true; return true; }
   OportBuffer* buf = _reader->_parent;
   optional<coroutine_handle<>> wake_writer;
   {

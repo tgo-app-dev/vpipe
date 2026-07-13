@@ -20,9 +20,10 @@ typedef std::unique_ptr<Graph> GraphPtr;
 //   any of its vertices.
 // - Mutators require external serialization, with one exception: the
 //   pre-wrap gvid allocation inside insert_vertex is lock-free
-//   MT-safe (CAS loop on _next_gvid). The wrap-path scan that takes
-//   over after ~2^32 inserts is *not* MT-safe and, like the rest of
-//   insert_vertex's body, must run under external serialization.
+//   MT-safe (CAS loop on the shared, process-global _next_gvid). The
+//   wrap-path scan that takes over after ~2^32 inserts process-wide is
+//   *not* MT-safe and, like the rest of insert_vertex's body, must run
+//   under external serialization.
 class Graph : public SessionMember {
 public:
   class vertex_iterator {
@@ -158,7 +159,14 @@ private:
   std::vector<InEdge>  _iports;
   std::vector<OutEdge> _oports;
   std::unordered_set<Vertex*> _port_vertices;
-  std::atomic<unsigned> _next_gvid{1};
+  // Process-global gvid allocator: shared across every Graph (all
+  // pipelines + subgraphs) so a graph-vertex id is unique across the
+  // whole session, not just within one graph. The profiler keys events
+  // by gvid alone (events carry no pipeline id), so per-graph counters
+  // let two loaded pipelines collide on gvid N and mis-attribute one's
+  // events to the other's stage. 0 stays reserved (means "not in a
+  // graph"); values are opaque handles, so global monotonicity is fine.
+  static inline std::atomic<unsigned> _next_gvid{1};
   Graph* _parent_graph = nullptr;
 };
 

@@ -171,6 +171,35 @@ local_ipv4_addresses()
   return out;
 }
 
+std::string
+primary_ipv4()
+{
+  ifaddrs* ifa = nullptr;
+  if (::getifaddrs(&ifa) != 0 || !ifa) {
+    return {};
+  }
+  std::string en0, fallback;
+  for (ifaddrs* p = ifa; p != nullptr; p = p->ifa_next) {
+    if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) {
+      continue;
+    }
+    if ((p->ifa_flags & IFF_LOOPBACK) || !(p->ifa_flags & IFF_UP)) {
+      continue;
+    }
+    auto* sin = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
+    char  buf[INET_ADDRSTRLEN] = {0};
+    if (!::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))
+        || buf[0] == 0) {
+      continue;
+    }
+    const std::string name = p->ifa_name ? p->ifa_name : "";
+    if (name == "en0") { en0 = buf; break; }   // built-in LAN: prefer it
+    if (fallback.empty()) { fallback = buf; }  // first non-loopback up
+  }
+  ::freeifaddrs(ifa);
+  return en0.empty() ? fallback : en0;
+}
+
 void
 warm_arp_cache(const std::vector<std::string>& ips)
 {

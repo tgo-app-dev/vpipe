@@ -239,7 +239,8 @@ constexpr ConfigKey kAttrs[] = {
 };
 const PortSpec kIports[] = {
   {.name = "frames", .doc = "planar u8 RGB TensorBeat [3,H,W]",
-   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-frames", .clock_group = 0},
   {.name = "detections", .doc = "optional FlexData YOLO detections, read "
                                 "1:1 with frames",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
@@ -255,7 +256,7 @@ const StageSpec kSpec = {
                "FPS ceiling, biased toward motion (and focus-class motion "
                "when detections are wired on iport1). Forwards kept frames.",
   .display_name = "Frame Dropper",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Visual,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,

@@ -24,6 +24,21 @@ struct QuantizeOptions {
   std::vector<std::string> quant_linears;
   std::uint64_t shard_max_bytes = 5ull << 30;
 
+  // Optional submodule SCOPE: when non-empty, ONLY tensors whose full name
+  // contains this substring are eligible to quantize; everything else passes
+  // through verbatim. Lets a multi-modal LLM quantize one part in isolation --
+  // e.g. scope "language_model." to quantize just the text backbone and leave
+  // the (precision-sensitive) vision/audio towers bf16, or scope "visual." to
+  // quantize just the vision tower. Empty (default) => the whole model.
+  std::string quant_scope;
+  // Broadened leaf rule for a scoped submodule: when true (with quant_scope
+  // set), quantize EVERY 2D fp weight in scope whose leaf is not a norm /
+  // embedding (ignore quant_linears). Vision/audio towers name their linears
+  // differently (qkv / linear_fc1 / proj / ...), so the standard leaf set
+  // misses them; this quantizes the tower wholesale. Off => the leaf set still
+  // gates (right for the language backbone, whose leaves are standard).
+  bool quant_all_in_scope = false;
+
   // Also quantize the token-embedding table + (untied) lm_head, matching the
   // MLX convention (its checkpoints quantize embed/lm_head). Needed so a
   // standard LM (Qwen/Llama) RELOADS for inference -- the affine load path
@@ -80,6 +95,22 @@ struct QuantizeOptions {
   bool  mixed      = false;
   int   high_bits  = 8;
   float mixed_frac = 0.25f;          // fraction of LAYERS promoted to high_bits
+
+  // Krea-2 DiT activation-aware weight CLIPPING (the fold-free half of AWQ; the
+  // adaLN smoothing fold is obstructed by the shared timestep-dependent
+  // time_mod_proj shift). When set, each quantized transformer_blocks.{L}
+  // Linear's weight groups are clipped by awq_clip_search using its per-input-
+  // channel activation from `calib_dir` (calib_{qkv,o,gateup,down}.f32, produced
+  // by collect_dit_calibration) before quantizing at clip=1. Non-block DiT
+  // Linears (img_in / txt_in / time_embed / text_fusion / final) quantize plain.
+  // Requires calib_dir + n_layers (the main-block count).
+  bool  dit_awq    = false;
+  // DiT family for the AWQ activation mapping: "" / "krea2" -> the Krea-2
+  // calib_{qkv,o,gateup,down}.f32 scheme; "flux2" -> per-group files
+  // (dbl_*/sgl_*/emb_* from collect_flux2_calibration) mapped by the FLUX
+  // topology (double/single blocks + embedders). Clip-only for flux2 (the
+  // exact ff.down<-ff.up fold is Krea-2-specific).
+  std::string dit_family;
 };
 
 // M0 per-tensor group-affine quantizer. Opens a source safetensors model,

@@ -5,6 +5,7 @@ set(VPIPE_WEBUI_SOURCES
     web-ui-delegate.cc
     web-ui-log-delegate.cc
     db-browser.cc
+    model-browser.cc
     system-status.cc
     startup-checks.cc
 )
@@ -71,6 +72,25 @@ if(APPLE)
     target_link_libraries(vpipe-web-ui PRIVATE
         "-framework AVFoundation"
         "-framework CoreAudio")
+endif()
+
+# HTTPS support (opt-in at runtime via --tls). Requires OpenSSL; when it
+# isn't found the web-ui still builds and runs, but --tls reports a clear
+# "built without TLS" error. Homebrew keeps openssl keg-only, so hint its
+# prefix on Apple. Why HTTPS matters here: browser WebCodecs (the
+# low-latency Preview view) is only exposed in a secure context (HTTPS or
+# localhost), so LAN viewers need this to use Preview at all.
+if(APPLE AND NOT OPENSSL_ROOT_DIR AND EXISTS /opt/homebrew/opt/openssl@3)
+    set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
+endif()
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_sources(vpipe-web-ui PRIVATE tls-context.cc)
+    target_compile_definitions(vpipe-web-ui PRIVATE VPIPE_WEBUI_TLS=1)
+    target_link_libraries(vpipe-web-ui PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "vpipe-web-ui: HTTPS enabled (OpenSSL ${OPENSSL_VERSION})")
+else()
+    message(STATUS "vpipe-web-ui: OpenSSL not found; --tls unavailable")
 endif()
 
 install(TARGETS vpipe-web-ui RUNTIME DESTINATION bin)

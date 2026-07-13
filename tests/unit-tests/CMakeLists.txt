@@ -2,6 +2,7 @@ set(LOCAL_TEST_SOURCES
   byte-track-stage.cc
   call-stage.cc
   chrono-shell-stages.cc
+  save-text-stage.cc
   clock-domain.cc
   credential-store.cc
   detection-overlay-stage.cc
@@ -15,6 +16,8 @@ set(LOCAL_TEST_SOURCES
   flex-data.cc
   graph-move-iport.cc
   load-image-stage.cc
+  text-source-stages.cc
+  save-image-stage.cc
   host-identity.cc
   i18n.cc
   library-handle.cc
@@ -24,7 +27,13 @@ set(LOCAL_TEST_SOURCES
   media-decode.cc
   media-line.cc
   mini-http.cc
+  command-sandbox.cc
+  path-sandbox.cc
+  session-sandbox.cc
   model-catalog.cc
+  model-remove-stage.cc
+  plugin-abi.cc
+  plugin-loader.cc
   onvif-soap.cc
   pipeline-handle.cc
   pipeline-runtime.cc
@@ -34,6 +43,7 @@ set(LOCAL_TEST_SOURCES
   profiling.cc
   perf-buffer.cc
   hls-broadcast-stage.cc
+  preview-stage.cc
   read-any.cc
   runtime-context-has-consumers.cc
   segment-writer.cc
@@ -59,7 +69,7 @@ if(APPLE)
 endif()
 if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     list(APPEND LOCAL_TEST_SOURCES
-        audio-encode-stage.cc
+        save-audio-stage.cc
         audio-segment-stage.cc
         audio-tagging-stage.cc
         coreml-cpp.cc
@@ -90,13 +100,30 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         model-quantize-roundtrip.cc
         model-quantize-stage.cc
         model-eval-stage.cc
+        model-exec-registry.cc
+        plugin-metal-library.cc
         model-benchmark-stage.cc
         gemma-bench-driver.cc
+        moss-rt-driver.cc
         quant-arch-detect.cc
         moss-tts-local.cc
+        krea2-encoder.cc
+        krea2-dit.cc
+        krea2-vae.cc
+        krea2-t2i.cc
+        krea2-dit-quant.cc
+        krea2-lora.cc
+        lora-fuse-stage.cc
+        krea2-sampler.cc
+        flux2-smoke.cc
         llm-chat-template.cc
         llm-sampler.cc
         llm-tokenizer.cc
+        file-sandbox.cc
+        mcp-tools.cc
+        python-sandbox.cc
+        shell-tool.cc
+        url-fetch.cc
         metal-compute-image-ops.cc
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc

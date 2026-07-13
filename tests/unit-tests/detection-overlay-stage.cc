@@ -301,6 +301,42 @@ TEST(detection_overlay_stage, shape_preserved_and_contiguous)
                                        * out.element_byte_size());
 }
 
+TEST(detection_overlay_stage, sideband_including_fps_passes_through)
+{
+  // The overlay copies the whole input sideband onto its output, so a
+  // frame rate that video-to-rgb attached (fps_num/fps_den) survives
+  // the overlay and reaches a downstream sink (hls-broadcast).
+  CerrSilencer hush;
+
+  TensorBeat tin = make_tensor_(64, 80, 0.0f);
+  {
+    FlexData sb = FlexData::make_object();
+    sb.as_object().insert("timestamp_us",
+                          FlexData::make_uint(1'700'000'123'456ull));
+    sb.as_object().insert("fps_num", FlexData::make_uint(24000));
+    sb.as_object().insert("fps_den", FlexData::make_uint(1001));
+    tin.sideband = std::move(sb);
+  }
+  FlexData fd = make_detections_(80, 64, {
+    { /*cls*/ 0, /*x1*/ 10, /*y1*/ 12, /*x2*/ 30, /*y2*/ 32,
+      /*score*/ 0.9 }
+  });
+
+  auto h = build_(std::move(tin), std::move(fd), FlexData::make_object());
+  EXPECT_TRUE(run_(*h));
+
+  EXPECT_TRUE(h->sink->collected().size() == 1u);
+  const TensorBeat& out = h->sink->collected()[0];
+  EXPECT_TRUE(out.sideband.is_object());
+  auto obj = out.sideband.as_object();
+  EXPECT_TRUE(obj.contains("fps_num"));
+  EXPECT_TRUE(obj.contains("fps_den"));
+  EXPECT_TRUE(obj.at("fps_num").get_uint() == 24000u);
+  EXPECT_TRUE(obj.at("fps_den").get_uint() == 1001u);
+  // The timestamp still rides along too.
+  EXPECT_TRUE(obj.contains("timestamp_us"));
+}
+
 TEST(detection_overlay_stage, class_names_config_supplies_label)
 {
   // class_names config takes effect when the per-detection FlexData

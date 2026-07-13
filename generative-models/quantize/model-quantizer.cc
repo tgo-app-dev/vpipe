@@ -420,7 +420,67 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     auto it = bit_map.find(name);
     return it == bit_map.end() ? opt.bits : it->second;
   };
-  if (opt.mixed) {
+  if (opt.mixed && opt.dit_family == "flux2") {
+    // FLUX.2 spans TWO block prefixes (transformer_blocks + single_transformer_
+    // blocks), so rank each block UNIT ("<prefix>.<L>") by aggregate promotion
+    // gain across both and promote the top mixed_frac fraction of all blocks.
+    auto unit_of = [](const std::string& name) -> std::string {
+      for (const char* pre : {"single_transformer_blocks.",
+                              "transformer_blocks."}) {
+        const std::string p = pre;
+        if (name.rfind(p, 0) == 0 && name.size() > p.size() &&
+            name[p.size()] >= '0' && name[p.size()] <= '9') {
+          const std::size_t dot = name.find('.', p.size());
+          if (dot != std::string::npos) { return name.substr(0, dot); }
+        }
+      }
+      return {};
+    };
+    std::unordered_map<std::string, double> ugain;
+    std::unordered_map<std::string, std::vector<std::string>> unames;
+    for (const auto& name : names) {
+      const auto* ti = src->info(name);
+      if (ti == nullptr) { continue; }
+      const std::string leaf = weight_leaf_(name);
+      const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
+      if (leaf.empty() || quant_set.count(leaf) == 0 ||
+          ti->shape.size() != 2 || !fp || ti->shape[1] % opt.group != 0) {
+        continue;
+      }
+      const std::string unit = unit_of(name);
+      if (unit.empty()) { continue; }
+      int N, K;
+      auto W = load_f32(name, N, K);
+      if (W.empty()) { return fail("mixed: load failed: " + name); }
+      const int RS = 8;
+      const float e_lo = recon_err_(W.data(), N, K, opt.bits, opt.group, RS);
+      const float e_hi = recon_err_(W.data(), N, K, opt.high_bits, opt.group, RS);
+      ugain[unit] += std::max(e_lo - e_hi, 0.0f);
+      unames[unit].push_back(name);
+    }
+    std::vector<std::string> order;
+    for (const auto& kv : ugain) { order.push_back(kv.first); }
+    std::sort(order.begin(), order.end(), [&](const std::string& a,
+                                              const std::string& b) {
+      return ugain[a] > ugain[b];
+    });
+    const std::size_t n_hi =
+        (std::size_t)std::llround(opt.mixed_frac * (double)order.size());
+    int n_hi_t = 0;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      const int b = i < n_hi ? opt.high_bits : opt.bits;
+      for (const auto& nm : unames[order[i]]) {
+        bit_map[nm] = b;
+        if (b == opt.high_bits) { ++n_hi_t; }
+      }
+    }
+    if (_mc->session() != nullptr) {
+      _mc->session()->info(fmt(
+          "model-quantize: FLUX.2 mixed bit map: {}/{} blocks ({} linears) @ "
+          "{}-bit, rest @ {}-bit", n_hi, order.size(), n_hi_t, opt.high_bits,
+          opt.bits));
+    }
+  } else if (opt.mixed) {
     // Bit width is assigned per-LAYER (every quantizable linear in a layer
     // shares one width), NOT per-tensor: the runtime's mixed decode/prefill
     // path corrupts a layer whose projections carry DIFFERENT widths (the
@@ -440,7 +500,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       if (leaf.empty() || quant_set.count(leaf) == 0 ||
           ti->shape.size() != 2 || !fp ||
           ti->shape[1] % opt.group != 0 ||
-          name.rfind(opt.layer_prefix, 0) != 0) {
+          name.rfind(opt.layer_prefix, 0) != 0 ||
+          (!opt.quant_scope.empty() &&
+           name.find(opt.quant_scope) == std::string::npos)) {
         continue;
       }
       const int L = std::atoi(name.c_str() + opt.layer_prefix.size());
@@ -489,6 +551,114 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     const char* p = name.c_str() + opt.layer_prefix.size();
     if (*p < '0' || *p > '9') { return -1; }
     return std::atoi(p);
+  };
+
+  // ---- Krea-2 DiT activation-aware clipping calib (dit_awq) ----------------
+  // Load the per-input-channel abs-max stats (flat [n_layers*dim]) and map a
+  // block-Linear name -> its activation row; awq_clip_search then clips each
+  // block Linear's weight before quantizing (the fold-free half of AWQ).
+  const bool dit_flux2_fam = (opt.dit_family == "flux2");
+  std::vector<float> dit_cq, dit_co, dit_cg, dit_cd;
+  int dit_dq = 0, dit_dd = 0;
+  std::unordered_map<std::string, std::vector<float>> dit_fx;   // flux2 per-group
+  auto calib_load = [&](const std::string& fn) {
+    std::vector<float> v;
+    std::ifstream f(opt.calib_dir + "/" + fn, std::ios::binary);
+    if (!f) { return v; }
+    f.seekg(0, std::ios::end);
+    const std::streamoff nb = f.tellg();
+    f.seekg(0, std::ios::beg);
+    v.resize((std::size_t)nb / 4);
+    f.read(reinterpret_cast<char*>(v.data()), nb);
+    return v;
+  };
+  if (opt.dit_awq && !dit_flux2_fam) {
+    dit_cq = calib_load("calib_qkv.f32");
+    dit_co = calib_load("calib_o.f32");
+    dit_cg = calib_load("calib_gateup.f32");
+    dit_cd = calib_load("calib_down.f32");
+    if (opt.n_layers > 0) {
+      dit_dq = dit_cq.empty() ? 0 : (int)(dit_cq.size() / opt.n_layers);
+      dit_dd = dit_cd.empty() ? 0 : (int)(dit_cd.size() / opt.n_layers);
+    }
+  } else if (opt.dit_awq && dit_flux2_fam) {
+    static const char* kG[] = {
+        "dbl_norm1_img", "dbl_norm1_txt", "dbl_attn_img", "dbl_attn_txt",
+        "dbl_norm2_img", "dbl_ffact_img", "dbl_norm2_txt", "dbl_ffact_txt",
+        "sgl_norm", "sgl_cat", "emb_x", "emb_ctx", "emb_proj"};
+    for (const char* g : kG) { dit_fx[g] = calib_load(std::string(g) + ".f32"); }
+  }
+
+  // FLUX.2 clip-only AWQ: map a weight -> its per-input-channel abs-max row
+  // (the per-group files from collect_flux2_calibration), keyed by the FLUX
+  // topology (double/single blocks + embedders).
+  auto flux2_act = [&](const std::string& name, int K) -> const float* {
+    if (!ends_with(name, ".weight")) { return nullptr; }
+    const std::string base = name.substr(0, name.size() - 7);
+    auto row = [&](const char* g, int L) -> const float* {
+      auto it = dit_fx.find(g);
+      if (it == dit_fx.end() || it->second.empty()) { return nullptr; }
+      const std::vector<float>& c = it->second;
+      if (K <= 0 || c.size() % (std::size_t)K != 0 ||
+          (std::size_t)(L + 1) * K > c.size()) {
+        return nullptr;
+      }
+      return c.data() + (std::size_t)L * K;
+    };
+    if (base == "x_embedder") { return row("emb_x", 0); }
+    if (base == "context_embedder") { return row("emb_ctx", 0); }
+    if (base == "proj_out") { return row("emb_proj", 0); }
+    static const std::string kDbl = "transformer_blocks.";
+    static const std::string kSgl = "single_transformer_blocks.";
+    if (base.rfind(kDbl, 0) == 0) {
+      const int L = std::atoi(base.c_str() + kDbl.size());
+      if (ends_with(base, ".attn.to_q") || ends_with(base, ".attn.to_k") ||
+          ends_with(base, ".attn.to_v")) { return row("dbl_norm1_img", L); }
+      if (ends_with(base, ".attn.add_q_proj") ||
+          ends_with(base, ".attn.add_k_proj") ||
+          ends_with(base, ".attn.add_v_proj")) { return row("dbl_norm1_txt", L); }
+      if (ends_with(base, ".attn.to_out.0")) { return row("dbl_attn_img", L); }
+      if (ends_with(base, ".attn.to_add_out")) { return row("dbl_attn_txt", L); }
+      if (ends_with(base, ".ff.linear_in")) { return row("dbl_norm2_img", L); }
+      if (ends_with(base, ".ff.linear_out")) { return row("dbl_ffact_img", L); }
+      if (ends_with(base, ".ff_context.linear_in")) { return row("dbl_norm2_txt", L); }
+      if (ends_with(base, ".ff_context.linear_out")) { return row("dbl_ffact_txt", L); }
+      return nullptr;
+    }
+    if (base.rfind(kSgl, 0) == 0) {
+      const int L = std::atoi(base.c_str() + kSgl.size());
+      if (ends_with(base, ".attn.to_qkv_mlp_proj")) { return row("sgl_norm", L); }
+      if (ends_with(base, ".attn.to_out")) { return row("sgl_cat", L); }
+    }
+    return nullptr;
+  };
+  auto dit_act = [&](const std::string& name, int K) -> const float* {
+    if (!opt.dit_awq) { return nullptr; }
+    if (dit_flux2_fam) { return flux2_act(name, K); }
+    static const std::string kBlk = "transformer_blocks.";
+    if (name.rfind(kBlk, 0) != 0) { return nullptr; }
+    const int L = std::atoi(name.c_str() + kBlk.size());
+    if (L < 0 || L >= opt.n_layers) { return nullptr; }
+    auto row = [&](const std::vector<float>& c, int dim) -> const float* {
+      if (dim != K || c.empty() ||
+          (std::size_t)(L + 1) * dim > c.size()) {
+        return nullptr;
+      }
+      return c.data() + (std::size_t)L * dim;
+    };
+    if (ends_with(name, ".attn.to_q.weight") ||
+        ends_with(name, ".attn.to_k.weight") ||
+        ends_with(name, ".attn.to_v.weight") ||
+        ends_with(name, ".attn.to_gate.weight")) {
+      return row(dit_cq, dit_dq);
+    }
+    if (ends_with(name, ".attn.to_out.0.weight")) { return row(dit_co, dit_dq); }
+    if (ends_with(name, ".ff.gate.weight") ||
+        ends_with(name, ".ff.up.weight")) {
+      return row(dit_cg, dit_dq);
+    }
+    if (ends_with(name, ".ff.down.weight")) { return row(dit_cd, dit_dd); }
+    return nullptr;
   };
 
   // ---- MoE per-expert AWQ fold state (raw-HF Qwen3.5/3.6 MoE) -------------
@@ -573,13 +743,19 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     if (cq.empty() || (FFN > 0 && (cg.empty() || cd.empty()))) {
       return fail("smoothquant: calib stats missing in " + opt.calib_dir);
     }
-    // o_proj clip needs its own input (attn-output) calib; only required when
-    // AWQ clipping is on AND the model has full-attention layers.
+    // o_proj clip needs its own input (attn-output) calib. It is OPTIONAL: the
+    // fold loop's o_proj clip is guarded by !co.empty(), so when calib_o.f32 is
+    // absent the o_proj is simply quantized unclipped (qkv/gate/up/down still
+    // clip). The on-device auto-calibration does not tap the o_proj input, so
+    // don't hard-fail on it -- only an offline calib_dir carries calib_o.f32.
     const auto co = (opt.awq_clip && QD > 0)
                         ? load_calib_(opt.calib_dir, "o", nL, QD)
                         : std::vector<float>{};
-    if (opt.awq_clip && QD > 0 && co.empty()) {
-      return fail("awq_clip: calib_o.f32 missing in " + opt.calib_dir);
+    if (opt.awq_clip && QD > 0 && co.empty() && S) {
+      S->log_normal(fmt(
+          "model-quantize: awq_clip has no calib_o.f32 in {} -- o_proj is "
+          "quantized unclipped (supply a calib_dir with calib_o.f32 to clip "
+          "the attention output too)", opt.calib_dir));
     }
     const int RS = 8;   // row-subsample stride for the AWQ error estimate
 
@@ -877,6 +1053,224 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
            wr.add(pfx + ".biases", "F16", {N, gcols}, b.contents(),
                   b.byte_size());
   };
+
+  // DiT AWQ: load the weight to f32, activation-aware clip its groups
+  // (awq_clip_search with the per-input-channel `act`), then quantize at clip=1.
+  auto clip_quant = [&](const std::string& pfx, const SharedBuffer& in,
+                        const std::string& dtype, int N, int K, int bits,
+                        const float* act) -> bool {
+    std::vector<float> W((std::size_t)N * K);
+    if (dtype == "BF16") {
+      const auto* sp = static_cast<const std::uint16_t*>(in.contents());
+      for (std::size_t i = 0; i < W.size(); ++i) { W[i] = bf16_to_f32_(sp[i]); }
+    } else {
+      const auto* sp = static_cast<const _Float16*>(in.contents());
+      for (std::size_t i = 0; i < W.size(); ++i) { W[i] = (float)sp[i]; }
+    }
+    awq_clip_search(W.data(), N, K, bits, opt.group, act);
+    SharedBuffer f = _mc->make_shared_buffer((std::size_t)N * K * 2);
+    if (f.empty()) { return false; }
+    auto* d = static_cast<_Float16*>(f.contents());
+    for (std::size_t i = 0; i < W.size(); ++i) { d[i] = (_Float16)W[i]; }
+    return quant_2d_buf(pfx, f, "F16", N, K, bits, nullptr);
+  };
+
+  // ---- DiT FFN AWQ scale fold (dit_awq) -----------------------------------
+  // The ONE exact smoothing fold available in the DiT: the ff.down input (the
+  // SwiGLU output silu(gate(x))*up(x)) has NO adaLN modulation, so -- like the
+  // LM's down<-up fold -- the AWQ scale sd folds fp-equivalently into ff.up rows
+  // (up out-channel c *= sd[c]) and ff.down cols (down in-channel c *= 1/sd[c]);
+  // ff.gate is untouched. Per block: search sd from calib_down, fold, then clip
+  // (full AWQ = smooth+clip) and quantize; mark handled so the plain loop skips
+  // them (ff.gate + qkv/o still clip-only there, the adaLN fold being obstructed).
+  if (opt.dit_awq && !dit_cd.empty() && opt.n_layers > 0) {
+    auto to_buf = [&](const std::vector<float>& W) {
+      SharedBuffer f = _mc->make_shared_buffer(W.size() * 2);
+      if (!f.empty()) {
+        auto* d = static_cast<_Float16*>(f.contents());
+        for (std::size_t i = 0; i < W.size(); ++i) { d[i] = (_Float16)W[i]; }
+      }
+      return f;
+    };
+    int folded = 0, fold_pct = -1;
+    for (int L = 0; L < opt.n_layers; ++L) {
+      if (stop()) {
+        if (bar) { bar->end(); }
+        return fail("model-quantize: stopped by request");
+      }
+      quant_progress_(bar.get(), "dit-fold", L + 1, opt.n_layers, fold_pct);
+      if (S != nullptr) {
+        S->log_debug(fmt("DiT fold: block {}/{} (ff.down <- ff.up)", L + 1,
+                         opt.n_layers));
+      }
+      const std::string pu = "transformer_blocks." + std::to_string(L) + ".ff.up";
+      const std::string pd = "transformer_blocks." + std::to_string(L) + ".ff.down";
+      int Nu = 0, Ku = 0, Nd = 0, Kd = 0;
+      std::vector<float> Wu = load_f32(pu + ".weight", Nu, Ku);
+      std::vector<float> Wd = load_f32(pd + ".weight", Nd, Kd);
+      if (Wu.empty() || Wd.empty()) { continue; }
+      if (Kd != dit_dd || (std::size_t)(L + 1) * dit_dd > dit_cd.size()) {
+        continue;
+      }
+      const float* act = dit_cd.data() + (std::size_t)L * dit_dd;  // [FF]
+      const int bu = tbits(pu + ".weight"), bd = tbits(pd + ".weight");
+      std::vector<float> sd;
+      std::vector<std::pair<const float*, int>> mats = {{Wd.data(), Nd}};
+      // The alpha search self-disables (sd->1) when smoothing doesn't reduce
+      // the activation-weighted error -- e.g. the DiT's SwiGLU output has
+      // extreme single-channel outliers (~500x) that clipping handles but
+      // group-affine smoothing (clamped [0.1,10]) can't, so it picks identity
+      // and the fold reduces to the clip result. It still helps models whose
+      // down path has the milder multi-channel salience AWQ smoothing exploits.
+      awq_search(act, Kd, mats, bd, opt.group, /*inv=*/true, 8, sd);
+      scale_rows(Wu, Nu, Ku, sd);          // up out-channel c *= sd[c]
+      scale_cols(Wd, Nd, Kd, sd, true);    // down in-channel c *= 1/sd[c]
+      // AWQ clip (smooth+clip) with the per-input-channel calib.
+      if (dit_dq == Ku && (std::size_t)(L + 1) * dit_dq <= dit_cg.size()) {
+        awq_clip_search(Wu.data(), Nu, Ku, bu, opt.group,
+                        dit_cg.data() + (std::size_t)L * dit_dq);
+      }
+      awq_clip_search(Wd.data(), Nd, Kd, bd, opt.group, act);
+      if (!quant_2d_buf(pu, to_buf(Wu), "F16", Nu, Ku, bu, nullptr) ||
+          !quant_2d_buf(pd, to_buf(Wd), "F16", Nd, Kd, bd, nullptr)) {
+        return fail("model-quantize: DiT FFN fold failed at L=" +
+                    std::to_string(L));
+      }
+      handled.insert(pu + ".weight");
+      handled.insert(pd + ".weight");
+      ++folded;
+    }
+    if (S != nullptr) {
+      S->log_normal(fmt("model-quantize: DiT FFN AWQ scale fold on {} blocks "
+                        "(ff.down <- ff.up)", folded));
+    }
+  }
+
+  // ---- FLUX.2 AWQ smoothing fold (dit_awq, flux2) -------------------------
+  // The unmodulated paths in the FLUX DiT: the SwiGLU output feeding
+  // ff.linear_out (double stream, img + txt) and the mlp columns of to_out
+  // (single stream) have NO adaLN modulation between them and their producer,
+  // so an AWQ scale sd folds fp-equivalently -- producer UP-half rows *= sd,
+  // consumer cols *= 1/sd. The fused gate|up means "up" is the SECOND half of
+  // linear_in / the mlp-up slice of to_qkv_mlp_proj. Then clip (smooth+clip) and
+  // quantize; mark handled so the plain loop skips them. The attention Linears
+  // (to_q/k/v/out, add_*, single qkv) keep clip-only there (adaLN-obstructed).
+  if (opt.dit_awq && dit_flux2_fam) {
+    auto fx = [&](const char* g, int L, int dim) -> const float* {
+      auto it = dit_fx.find(g);
+      if (it == dit_fx.end() ||
+          (std::size_t)(L + 1) * dim > it->second.size()) {
+        return nullptr;
+      }
+      return it->second.data() + (std::size_t)L * dim;
+    };
+    // One double-stream FF (img or txt): linear_in [2*inner, hidden] (fused
+    // gate|up) -> SwiGLU -> linear_out [hidden, inner].
+    auto fold_dbl = [&](int L, const std::string& ip, const std::string& op,
+                        const char* ffg, const char* n2g) -> int {
+      int Ni = 0, Ki = 0, No = 0, Ko = 0;
+      std::vector<float> Wi = load_f32(ip + ".weight", Ni, Ki);
+      std::vector<float> Wo = load_f32(op + ".weight", No, Ko);
+      if (Wi.empty() || Wo.empty()) { return 0; }
+      const int inner = Ni / 2;
+      if (Ko != inner) { return 0; }
+      const int bi = tbits(ip + ".weight"), bo = tbits(op + ".weight");
+      const float* act = fx(ffg, L, inner);   // swiglu-output abs-max [inner]
+      if (act != nullptr) {
+        std::vector<float> sd;
+        std::vector<std::pair<const float*, int>> mats = {{Wo.data(), No}};
+        awq_search(act, inner, mats, bo, opt.group, /*inv=*/true, 8, sd);
+        std::vector<float> rs((std::size_t)Ni, 1.0f);    // up rows only
+        for (int c = 0; c < inner; ++c) {
+          rs[(std::size_t)(inner + c)] = sd[(std::size_t)c];
+        }
+        scale_rows(Wi, Ni, Ki, rs);
+        scale_cols(Wo, No, Ko, sd, true);
+      }
+      const float* cin = fx(n2g, L, Ki);         // linear_in input (norm2)
+      if (cin != nullptr) {
+        awq_clip_search(Wi.data(), Ni, Ki, bi, opt.group, cin);
+      }
+      if (act != nullptr) {
+        awq_clip_search(Wo.data(), No, Ko, bo, opt.group, act);
+      }
+      if (!quant_write(ip, Wi, Ni, Ki, bi) ||
+          !quant_write(op, Wo, No, Ko, bo)) {
+        return -1;
+      }
+      handled.insert(ip + ".weight");
+      handled.insert(op + ".weight");
+      return 1;
+    };
+    int nd = 0;
+    for (int L = 0;; ++L) {
+      if (stop()) { return fail("model-quantize: stopped by request"); }
+      const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+      int tN = 0, tK = 0;
+      if (load_f32(p + "ff.linear_in.weight", tN, tK).empty()) { break; }
+      const int a = fold_dbl(L, p + "ff.linear_in", p + "ff.linear_out",
+                             "dbl_ffact_img", "dbl_norm2_img");
+      const int b = fold_dbl(L, p + "ff_context.linear_in",
+                             p + "ff_context.linear_out", "dbl_ffact_txt",
+                             "dbl_norm2_txt");
+      if (a < 0 || b < 0) {
+        return fail("model-quantize: flux2 fold (double)");
+      }
+      ++nd;
+    }
+    // Single stream: to_qkv_mlp_proj [3*hidden + 2*smlp, hidden]; the mlp-up
+    // slice feeds to_out [hidden, hidden+smlp] cols [hidden:].
+    int ns = 0;
+    for (int L = 0;; ++L) {
+      if (stop()) { return fail("model-quantize: stopped by request"); }
+      const std::string p =
+          "single_transformer_blocks." + std::to_string(L) + ".";
+      int Nq = 0, Kq = 0, No = 0, Ko = 0;
+      std::vector<float> Wq = load_f32(p + "attn.to_qkv_mlp_proj.weight", Nq, Kq);
+      std::vector<float> Wo = load_f32(p + "attn.to_out.weight", No, Ko);
+      if (Wq.empty() || Wo.empty()) { break; }
+      const int hidden = Kq;
+      const int smlp = (Nq - 3 * hidden) / 2;
+      if (smlp <= 0 || Ko != hidden + smlp) { continue; }
+      const int bq = tbits(p + "attn.to_qkv_mlp_proj.weight");
+      const int bo = tbits(p + "attn.to_out.weight");
+      const float* cat = fx("sgl_cat", L, hidden + smlp);   // to_out input
+      if (cat != nullptr) {
+        const float* act = cat + hidden;                    // mlp portion [smlp]
+        std::vector<float> sub((std::size_t)No * smlp);     // to_out mlp cols
+        for (int n = 0; n < No; ++n) {
+          for (int c = 0; c < smlp; ++c) {
+            sub[(std::size_t)n * smlp + c] = Wo[(std::size_t)n * Ko + hidden + c];
+          }
+        }
+        std::vector<float> sd;
+        awq_search(act, smlp, {{sub.data(), No}}, bo, opt.group, true, 8, sd);
+        std::vector<float> rs((std::size_t)Nq, 1.0f);       // mlp-up rows only
+        for (int c = 0; c < smlp; ++c) {
+          rs[(std::size_t)(3 * hidden + smlp + c)] = sd[(std::size_t)c];
+        }
+        scale_rows(Wq, Nq, Kq, rs);
+        std::vector<float> cs((std::size_t)Ko, 1.0f);       // to_out mlp cols
+        for (int c = 0; c < smlp; ++c) { cs[(std::size_t)(hidden + c)] = sd[(std::size_t)c]; }
+        scale_cols(Wo, No, Ko, cs, true);
+      }
+      const float* cq = fx("sgl_norm", L, hidden);
+      if (cq != nullptr) { awq_clip_search(Wq.data(), Nq, Kq, bq, opt.group, cq); }
+      if (cat != nullptr) { awq_clip_search(Wo.data(), No, Ko, bo, opt.group, cat); }
+      if (!quant_write(p + "attn.to_qkv_mlp_proj", Wq, Nq, Kq, bq) ||
+          !quant_write(p + "attn.to_out", Wo, No, Ko, bo)) {
+        return fail("model-quantize: flux2 fold (single)");
+      }
+      handled.insert(p + "attn.to_qkv_mlp_proj.weight");
+      handled.insert(p + "attn.to_out.weight");
+      ++ns;
+    }
+    if (S != nullptr) {
+      S->log_normal(fmt("model-quantize: FLUX.2 AWQ smoothing fold on {} double "
+                        "+ {} single blocks (SwiGLU out <- linear_in up)",
+                        nd, ns));
+    }
+  }
 
   // ---- MoE 3D expert bridge (raw-HF Qwen3.5/3.6 MoE) ----------------------
   // The HF checkpoint stores experts as fused 3D slabs; vpipe's MoE loader
@@ -1238,8 +1632,21 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     const std::string leaf = weight_leaf_(name);
     const bool is_2d = ti->shape.size() == 2;
     const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
-    const bool quant = !leaf.empty() && quant_set.count(leaf) > 0 && is_2d &&
-                       fp && (ti->shape[1] % opt.group == 0);
+    // Submodule scope: only in-scope tensors are eligible (empty => all).
+    const bool in_scope = opt.quant_scope.empty() ||
+                          name.find(opt.quant_scope) != std::string::npos;
+    const bool shape_ok = is_2d && fp && (ti->shape[1] % opt.group == 0);
+    bool quant;
+    if (opt.quant_all_in_scope && !opt.quant_scope.empty()) {
+      // Scoped submodule (vision/audio tower): quantize every 2D fp linear in
+      // scope except norms + embeddings (their leaves are non-standard).
+      quant = in_scope && shape_ok &&
+              leaf.find("norm") == std::string::npos &&
+              leaf.find("embed") == std::string::npos;
+    } else {
+      quant = in_scope && !leaf.empty() && quant_set.count(leaf) > 0 &&
+              shape_ok;
+    }
 
     SharedBuffer in = src->load(name, _mc);
     if (in.empty()) { return fail("model-quantize: load failed: " + name); }
@@ -1271,7 +1678,11 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     if (S) {
       S->log_debug(fmt("  quant {} [{}x{}] {}-bit", name, N, K, tb));
     }
-    if (!quant_2d_buf(pfx, in, ti->dtype, N, K, tb, gcs)) {
+    const float* cact = dit_act(name, K);
+    const bool clip_ok = cact != nullptr
+        ? clip_quant(pfx, in, ti->dtype, N, K, tb, cact)
+        : quant_2d_buf(pfx, in, ti->dtype, N, K, tb, gcs);
+    if (!clip_ok) {
       return fail("model-quantize: write (quant) failed: " + name);
     }
     ++n_quant;

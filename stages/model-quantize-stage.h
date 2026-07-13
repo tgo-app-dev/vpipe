@@ -12,7 +12,11 @@
 
 namespace vpipe {
 
-// Source stage: 0 inputs, 0 outputs. One-shot offline model quantization.
+namespace genai { struct QuantArchInfo; }
+
+// 1 optional trigger iport (any beat) + 1 FlexData "summary" oport (for
+// cascading a preparation recipe / a save-text report). One-shot offline
+// model quantization.
 // Reads a source HF/safetensors model, quantizes its backbone linear weights
 // to the MLX-affine group-quant format (passing embeddings / heads / norms /
 // any auxiliary modules through unchanged), writes the result, registers it in
@@ -49,6 +53,21 @@ namespace vpipe {
 //   group_size    (uint, default 64) -- affine group size (32 | 64).
 //   arch          (string, default "") -- model family tag; empty => auto-
 //                  detect from the source config.json model_type.
+//   target        (string, default "") -- which part of the model to quantize.
+//                  Krea-2 (text-to-image): a COMPONENT -- dit (default) |
+//                  text_encoder | vae. The output is a SELF-CONTAINED pipeline
+//                  (all components copied, the target quantized), usable
+//                  directly as a text-to-image hf_dir with no dit_dir override;
+//                  chain passes (feed one pass's output as the next src_model)
+//                  to quantize the DiT, then the text encoder, etc. (vae not
+//                  yet supported -- it is a conv net).
+//                  General / multi-modal LLM: a submodule SCOPE -- all
+//                  (default, whole model) | text (the language backbone only) |
+//                  vision | audio | an explicit tensor-name prefix. Only that
+//                  submodule is quantized; the rest stays bf16 (e.g. quantize
+//                  the LM backbone, keep a precision-sensitive vision tower
+//                  full precision). Resolved against the model's tensor names;
+//                  vision/audio scopes are plain-quant only (no awq/mixed).
 //   skip_existing (bool, default true) -- skip if the output config.json
 //                  already exists.
 //   awq           (bool, default false) -- AWQ activation-aware smoothing
@@ -109,12 +128,53 @@ private:
   void register_output_(const std::string& key, const std::string& dir,
                         const std::string& arch, int bits);
 
+  // Text-to-image (Krea-2 / FLUX.2) multi-component quantize. `family` is the
+  // vpipe tag ("krea2" | "flux2"); `root` is the pipeline ROOT (transformer/,
+  // text_encoder/, vae/, tokenizer/, ...); `out_dir` gets a SELF-CONTAINED copy
+  // of every component with the configured `target` component quantized in
+  // place, so the result is usable directly as a text-to-image hf_dir (no
+  // dit_dir override). Chainable: `root` may be a prior pass's output, whose
+  // already-quantized components copy through.
+  bool quantize_t2i_pipeline_(const std::string&           root,
+                              const std::string&           family,
+                              const std::string&           out_dir,
+                              const std::function<bool()>& stop);
+  // Quantize one DiT (transformer) dir -> out_dir (a plain group-affine pass +
+  // optional AWQ-clip / mixed). `family` selects the DiT quant leaf set
+  // ("krea2" | "flux2"); `calib_root` is the pipeline root the on-device AWQ
+  // calibration reads (encoder + tokenizer).
+  bool quantize_dit_component_(const std::string&           dit_dir,
+                               const std::string&           out_dir,
+                               const std::string&           family,
+                               const std::string&           calib_root,
+                               const std::function<bool()>& stop);
+  // Quantize the text encoder (a dense Qwen3 / Qwen3-VL backbone) -> out_dir.
+  // Keeps embed_tokens bf16 (the text-to-image stage host-gathers it). `root`
+  // is the pipeline root -- its tokenizer/ feeds AWQ auto-calibration (the
+  // encoder sub-dir has no tokenizer of its own).
+  bool quantize_text_encoder_(const std::string&           enc_dir,
+                              const std::string&           out_dir,
+                              const std::string&           root,
+                              const std::function<bool()>& stop);
+
+  // On-device AWQ auto-calibration: 8-bit base + tapped forward over the
+  // built-in text corpus (or the memory-safe streaming forward for MoE).
+  // Returns a temp calib dir the caller must remove_all, or "" on failure /
+  // stop (already logged). `tok_path` is the tokenizer.json feeding the
+  // corpus (a sub-model may borrow the pipeline's shared tokenizer).
+  std::string auto_calibrate_backbone_(const std::string& src_dir,
+                                       const genai::QuantArchInfo& meta,
+                                       int n_layers,
+                                       const std::string& tok_path,
+                                       const std::function<bool()>& stop);
+
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _src_model;
   std::string _output_name;
   std::string _models_db;
   std::string _arch;
+  std::string _target;   // krea2 component to quantize: dit|text_encoder|vae
   int         _bits{};
   int         _group_size{};
   bool        _skip_existing{};

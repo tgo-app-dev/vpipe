@@ -274,6 +274,7 @@ private:
   int                      _num_images{};
   int                      _pause_ms_between_rounds{};
   bool                     _batched_decode{};
+  bool                     _i8_prefill{};   // LOSSY int8 prefill (opt-in)
   std::string              _pre_image_prompt;
   std::string              _post_image_prompt;
   bool                     _decode_after_post_image{};

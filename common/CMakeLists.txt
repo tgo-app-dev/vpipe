@@ -1,4 +1,5 @@
 set(LOCAL_SOURCES
+  command-sandbox.cc
   credential-store.cc
   db-log-delegate.cc
   ffmpeg-libraries.cc
@@ -17,7 +18,10 @@ set(LOCAL_SOURCES
   media-line.cc
   mini-http.cc
   onvif-soap.cc
+  os-sandbox.cc
+  path-sandbox.cc
   perf-buffer.cc
+  preview-channel.cc
   segment-publisher.cc
   segment-writer.cc
   session-config.cc
@@ -27,6 +31,7 @@ set(LOCAL_SOURCES
   static-file-server.cc
   stdio-ui-delegate.cc
   stdout-log-delegate.cc
+  temp-root.cc
   thread-pool.cc
   vertex.cc
   ws-discovery.cc
@@ -36,6 +41,7 @@ if(APPLE)
   list(APPEND LOCAL_SOURCES onvif-refresh.cc)
 endif()
 set(LOCAL_HEADERS
+  command-sandbox.h
   credential-store.h
   db-log-delegate.h
   encoded-segment.h
@@ -57,8 +63,11 @@ set(LOCAL_HEADERS
   mini-http.h
   onvif-soap.h
   oport-policy.h
+  os-sandbox.h
+  path-sandbox.h
   perf-buffer.h
   perf-event.h
+  preview-channel.h
   segment-publisher.h
   segment-writer.h
   session-config.h
@@ -67,6 +76,7 @@ set(LOCAL_HEADERS
   static-file-server.h
   stdio-ui-delegate.h
   stdout-log-delegate.h
+  temp-root.h
   thread-pool.h
   beat-payload-intf.h
   vertex.h

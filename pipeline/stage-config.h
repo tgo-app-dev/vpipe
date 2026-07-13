@@ -29,8 +29,8 @@ std::string_view config_type_name(ConfigType) noexcept;
 // initializers:
 //
 //   constexpr ConfigKey kKeys[] = {
-//     {.key = "top_n",   .type = ConfigType::Int,  .def_int = 10,
-//      .doc = "0 = draw all"},
+//     {.key = "top_n",   .type = ConfigType::Int,
+//      .doc = "0 = draw all", .def_int = 10},
 //     {.key = "hf_dir",  .type = ConfigType::String, .required = true,
 //      .doc = "HuggingFace model directory"},
 //   };
@@ -66,6 +66,34 @@ struct ConfigKey {
   // "qwen3.5-vision-encoder"). Lets a CoreML-model field offer only the
   // type it can actually load. Ignored when suggest_db is unset.
   std::string_view suggest_db_type = {};
+
+  // Optional companions to suggest_db: required input / output modalities
+  // (comma-separated subset of "text","image","audio","video"). The web-ui
+  // model browser keeps only models whose catalogue I/O covers these -- a
+  // model's inputs must include every need_inputs entry and its outputs
+  // every need_outputs entry. E.g. a text-chat LM field sets
+  // need_inputs="text", need_outputs="text". Ignored when suggest_db unset.
+  std::string_view need_inputs  = {};
+  std::string_view need_outputs = {};
+
+  // Optional UI hint: this field is a filesystem path the stage reads or
+  // writes (and which the web-ui filesystem sandbox confines -- see
+  // path-sandbox.h). Lets an editor offer a "Browse..." file dialog.
+  // Only meaningful for String keys (or an Array of path strings). NOTE:
+  // model-manager paths (hf_dir, model_path, ...) are deliberately NOT
+  // flagged here -- they are sandbox-exempt and get a model picker
+  // instead of the sandbox browser.
+  bool             is_path    = false;
+  // When is_path: true, this path is WRITTEN (a save target) rather than
+  // read; the browser opens in "save" mode (offers a filename field).
+  bool             path_write = false;
+  // When is_path: the kind of target -- "dir" selects a directory,
+  // anything else (empty) selects a file. Static storage.
+  std::string_view path_kind  = {};
+  // When is_path: an optional filter category the browser maps to a set
+  // of extensions ("image", "audio", "video", "text"); empty = no
+  // filter (all files). Static storage.
+  std::string_view path_filter = {};
 };
 
 // Per-instance resolved descriptor: one ConfigKey paired with the
@@ -87,6 +115,17 @@ struct ConfigParam {
   // Mirrors ConfigKey::suggest_db_type (empty when unset): filters the
   // suggestion dropdown to registry records of this model_type.
   std::string suggest_db_type;
+  // Mirror ConfigKey::need_inputs / need_outputs (empty when unset):
+  // required I/O modalities the model browser filters on.
+  std::string need_inputs;
+  std::string need_outputs;
+  // Mirror ConfigKey's filesystem-path hints (see there). is_path drives
+  // the editor's "Browse..." affordance; path_write / path_kind /
+  // path_filter shape the file dialog.
+  bool        is_path    = false;
+  bool        path_write = false;
+  std::string path_kind;
+  std::string path_filter;
   FlexData    default_value;
   FlexData    current_value;
   // True when the instance's config tree actually contains this key

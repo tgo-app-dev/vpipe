@@ -17,6 +17,7 @@
 #include "generative-models/quantize/calibration.h"
 #include "generative-models/tokenizer.h"
 #include "stages/model-quantize-stage.h"
+#include "stages/model-registry.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +65,43 @@ TEST(model_quantize_stage, type_is_registered)
 {
   EXPECT_TRUE(std::string_view(ModelQuantizeStage::kTypeName) ==
               "model-quantize");
+}
+
+// model_dir_available (the post-trigger source-availability gate): an
+// existing path is available; a bogus / empty ref is not. This is what
+// lets a cascaded fetch->quantize wait until the model actually exists.
+TEST(model_quantize_stage, source_availability_check)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  CerrSilencer hush;
+  std::error_code ec;
+  const auto tmp = fs::temp_directory_path() / "vpipe_avail_probe";
+  fs::create_directories(tmp, ec);
+  EXPECT_TRUE(model_dir_available(&sess, "models", tmp.string()));
+  EXPECT_FALSE(model_dir_available(&sess, "models",
+                                   "/no/such/vpipe/model/xyz"));
+  EXPECT_FALSE(model_dir_available(&sess, "models", ""));
+  fs::remove_all(tmp, ec);
+}
+
+// The stage exposes one trigger iport (any beat type) + one FlexData
+// summary oport so it can cascade into a preparation recipe / save-text.
+TEST(model_quantize_stage, trigger_and_summary_ports)
+{
+  Session sess;
+  CerrSilencer hush;
+  ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, basic_cfg_());
+  const StageSpec& sp = s.spec();
+  ASSERT_TRUE(sp.iports.size() == 1u);
+  ASSERT_TRUE(sp.oports.size() == 1u);
+  EXPECT_TRUE(std::string_view(sp.iports[0].name) == "trigger");
+  EXPECT_TRUE(sp.iports[0].type == nullptr);          // any beat type
+  EXPECT_TRUE(std::string_view(sp.oports[0].name) == "summary");
+  // By mangled name, not typeid pointer (stage in libvpipe vs test image).
+  ASSERT_TRUE(sp.oports[0].type != nullptr);
+  EXPECT_TRUE(std::string_view(sp.oports[0].type->name())
+              == typeid(FlexDataPayload).name());
 }
 
 TEST(model_quantize_stage, config_defaults)

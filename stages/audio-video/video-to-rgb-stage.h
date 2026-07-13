@@ -227,6 +227,13 @@ private:
   // (which runs at EOS without a source segment) can still stamp the
   // reorder-drain frames with the correct name.
   std::string         _last_camera_name;
+
+  // Last seen EncodedSegment source frame rate (fps = num / den), 0/0
+  // when the source did not advertise one. Cached alongside
+  // _last_camera_name and written into every emitted frame's sideband
+  // ("fps_num"/"fps_den") so a sink can adopt the original cadence.
+  unsigned            _last_fps_num = 0;
+  unsigned            _last_fps_den = 0;
 };
 
 }

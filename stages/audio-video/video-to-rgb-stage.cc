@@ -411,11 +411,13 @@ constexpr ConfigKey kAttrs[] = {
 };
 const PortSpec kIports[] = {
   {.name = "segments", .doc = "EncodedSegment: AVCC H.264 + extradata",
-   .type = &typeid(EncodedSegmentPayload), .clock_group = 0},
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "video-encoder-segments", .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "frames", .doc = "planar RGB TensorBeat [3,H,W] (F32 or U8)",
-   .type = &typeid(TensorBeatPayload), .clock_group = 1},
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-frames", .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "video-to-rgb",
@@ -423,7 +425,7 @@ const StageSpec kSpec = {
                "to planar RGB TensorBeats, one per frame; optional "
                "crop+rescale. Crosses segment-rate -> frame-rate clocks.",
   .display_name = "Video → RGB",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Visual,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,
@@ -911,15 +913,21 @@ VideoToRgbStage::get_format_(AVCodecContext* ctx,
 
 namespace {
 
-// Attach a {"timestamp_us": <uint64>, "camera_name": <str>}
-// sideband object to `tb`. Used by both the Metal fast path and the
-// CPU swscale path so consumers always see the same shape. Empty
-// camera_name omits the field so consumers that don't care aren't
-// forced to ignore an empty value.
+// Attach a {"timestamp_us": <uint64>, "camera_name": <str>,
+// "fps_num": <uint>, "fps_den": <uint>} sideband object to `tb`. Used
+// by both the Metal fast path and the CPU swscale path so consumers
+// always see the same shape. Empty camera_name omits its field so
+// consumers that don't care aren't forced to ignore an empty value;
+// the fps pair is emitted only when known (both > 0), so a sink can
+// distinguish "source cadence available" from "unknown". The fps comes
+// from the source EncodedSegment (rtsp-capture's input stream rate) and
+// lets a downstream sink (hls-broadcast) adopt the original frame rate.
 void
 attach_sideband_(TensorBeat&      tb,
                  std::uint64_t    ts_us,
-                 std::string_view camera_name)
+                 std::string_view camera_name,
+                 unsigned         fps_num,
+                 unsigned         fps_den)
 {
   FlexData o = FlexData::make_object();
   o.as_object().insert_or_assign("timestamp_us",
@@ -927,6 +935,10 @@ attach_sideband_(TensorBeat&      tb,
   if (!camera_name.empty()) {
     o.as_object().insert_or_assign("camera_name",
                                    FlexData::make_string(camera_name));
+  }
+  if (fps_num > 0 && fps_den > 0) {
+    o.as_object().insert_or_assign("fps_num", FlexData::make_uint(fps_num));
+    o.as_object().insert_or_assign("fps_den", FlexData::make_uint(fps_den));
   }
   tb.sideband = std::move(o);
 }
@@ -1055,7 +1067,8 @@ VideoToRgbStage::frame_to_tensor_beat_(const AVFrame*   src,
     }
   }
 
-  attach_sideband_(tb, timestamp_us, camera_name);
+  attach_sideband_(tb, timestamp_us, camera_name,
+                   _last_fps_num, _last_fps_den);
   return make_payload<TensorBeatPayload>(std::move(tb));
 }
 
@@ -1171,7 +1184,8 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
               ? "shared" : "cpu"));
           _metal_logged = true;
         }
-        attach_sideband_(tb, timestamp_us, camera_name);
+        attach_sideband_(tb, timestamp_us, camera_name,
+                         _last_fps_num, _last_fps_den);
         co_await ctx.write(0,
             make_payload<TensorBeatPayload>(std::move(tb)));
         ++(*out_emitted);
@@ -1241,8 +1255,12 @@ VideoToRgbStage::decode_segment_(RuntimeContext& ctx,
 
   // Latch the segment's camera_name on the stage so flush_decoder_
   // (run at EOS, with no source segment in hand) can still stamp
-  // reorder-drain frames with the most recent producer's name.
+  // reorder-drain frames with the most recent producer's name. The
+  // source frame rate rides along the same way so every emitted frame
+  // (including reorder-drain frames) carries it in its sideband.
   _last_camera_name = seg.camera_name;
+  _last_fps_num     = seg.fps_num;
+  _last_fps_den     = seg.fps_den;
 
   // Split the concatenated bitstream into per-frame access units.
   // The H.264 decoder takes one AU per send_packet call; feeding a

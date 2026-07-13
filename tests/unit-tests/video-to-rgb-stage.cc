@@ -12,8 +12,8 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
-#include "stages/audio-video/video-file-decoder-stage.h"
-#include "stages/audio-video/video-file-encoder-stage.h"
+#include "stages/load-video-stage.h"
+#include "stages/save-video-stage.h"
 #include "stages/audio-video/video-to-rgb-stage.h"
 #include "stages/audio-video/video-tokens.h"
 
@@ -206,7 +206,7 @@ private:
 };
 
 // Produce one mp4 worth of frames via SolidYuvSource + the real
-// VideoFileEncoderStage, then read it back as an EncodedSegment.
+// SaveVideoStage, then read it back as an EncodedSegment.
 // Returns an EncodedSegment whose `data` is AVCC NAL units and
 // `extradata` is the AVCDecoderConfigurationRecord -- the same shape
 // rtsp-capture emits.
@@ -243,7 +243,7 @@ make_solid_color_segment_(Session&        sess,
                             FlexData::make_string("ultrafast"));
     obj.insert("video", std::move(vcfg));
   }
-  auto enc_u = make_unique<VideoFileEncoderStage>(
+  auto enc_u = make_unique<SaveVideoStage>(
       &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
   pl->insert_stage(std::move(enc_u));
 
@@ -1119,6 +1119,58 @@ TEST(video_to_rgb_stage, sideband_timestamp_us_propagates_from_au) {
     auto obj = tb.sideband.as_object();
     EXPECT_TRUE(obj.contains("timestamp_us"));
     EXPECT_TRUE(obj.at("timestamp_us").get_uint() == kTs);
+  }
+}
+
+TEST(video_to_rgb_stage, sideband_fps_propagates_from_segment) {
+  // rtsp-capture carries the source stream's frame rate on each
+  // EncodedSegment (fps_num/fps_den); video-to-rgb must forward it onto
+  // every emitted TensorBeat's sideband so a downstream sink
+  // (hls-broadcast) can adopt the original cadence.
+  Session sess;
+  CerrSilencer hush;
+
+  EncodedSegment seg;
+  if (!make_solid_color_segment_(sess, 128, 128, 128, 320, 240, 4,
+                                 seg)) {
+    return;
+  }
+  // 23.976 fps as a rational, the sort of value cameras report.
+  seg.fps_num = 24000;
+  seg.fps_den = 1001;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<OneSegmentSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->seg = seg;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<OneSegmentSource*>(
+      pl->insert_stage(std::move(src_u)));
+
+  auto cvt_u = make_unique<VideoToRgbStage>(
+      &sess, "cvt", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* cvt = static_cast<VideoToRgbStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+
+  auto sink_u = make_unique<TensorBeatSink>(
+      &sess, "sink", vector<InEdge>{{cvt, 0}}, FlexData::make_object());
+  auto* sink = static_cast<TensorBeatSink*>(
+      pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  const auto& got = sink->collected();
+  EXPECT_TRUE(!got.empty());
+  for (const auto& tb : got) {
+    EXPECT_TRUE(tb.sideband.is_object());
+    auto obj = tb.sideband.as_object();
+    EXPECT_TRUE(obj.contains("fps_num"));
+    EXPECT_TRUE(obj.contains("fps_den"));
+    EXPECT_TRUE(obj.at("fps_num").get_uint() == 24000u);
+    EXPECT_TRUE(obj.at("fps_den").get_uint() == 1001u);
   }
 }
 

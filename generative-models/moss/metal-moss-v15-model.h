@@ -16,6 +16,7 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,9 +52,16 @@ public:
   // sentence); `seed` seeds the deterministic audio sampler (0 => fresh).
   // The continue/stop decision stays greedy. Defaults => greedy (callers and
   // golden/teacher-forced tests stay token-exact).
+  // `on_frame`, when set, is called with each generated frame's n_vq codes as
+  // soon as it is finalized (before the next backbone step) -- this is the
+  // streaming hook the TTS stage uses to interleave codec decode + PCM
+  // emission. Returning false stops generation early (e.g. downstream closed).
+  // Returned frames are unaffected; default {} keeps the one-shot behavior.
+  using FrameCb = std::function<bool(const std::vector<int>&)>;
   std::vector<std::vector<int>> generate(
       const std::vector<std::vector<std::int32_t>>& grid, int max_frames,
-      const MossSampling& audio_sp = {}, std::uint64_t seed = 0);
+      const MossSampling& audio_sp = {}, std::uint64_t seed = 0,
+      const FrameCb& on_frame = {});
 
   MetalQwenModel*      backbone() { return _bb.get(); }
   MetalMossLocalModel* local() { return _lm.get(); }

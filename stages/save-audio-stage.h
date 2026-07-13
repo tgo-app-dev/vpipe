@@ -1,5 +1,5 @@
-#ifndef VPIPE_STAGES_AUDIO_ENCODE_STAGE_H
-#define VPIPE_STAGES_AUDIO_ENCODE_STAGE_H
+#ifndef VPIPE_STAGES_SAVE_AUDIO_STAGE_H
+#define VPIPE_STAGES_SAVE_AUDIO_STAGE_H
 
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
@@ -12,8 +12,8 @@ namespace vpipe {
 
 class TensorBeatPayload;
 
-// Audio-encode stage: the audio counterpart to the video segment writer,
-// and the natural downstream of `text-to-speech` (which emits PCM).
+// Save-audio sink: the audio counterpart to save-image, and the natural
+// downstream of `text-to-speech` (which emits PCM).
 //
 //   iport0  TensorBeatPayload, f32 PCM. Accepts rank-1 [n_samples] (mono)
 //           or rank-2 [channels, n_samples]. Sample rate is read from
@@ -52,15 +52,15 @@ class TensorBeatPayload;
 //   bitrate      (int, default 128000)-- AAC / MP3 target bitrate.
 //   sample_rate  (int, default 0)    -- 0 = use the payload sideband; if
 //                                        neither present, 24000.
-class AudioEncodeStage final : public TypedStage<AudioEncodeStage> {
+class SaveAudioStage final : public TypedStage<SaveAudioStage> {
 public:
-  static constexpr const char* kTypeName = "audio-encode";
+  static constexpr const char* kTypeName = "save-audio";
 
-  AudioEncodeStage(const SessionContextIntf* session,
-                   std::string               id,
-                   std::vector<InEdge>       iports,
-                   FlexData                  config);
-  ~AudioEncodeStage() override;
+  SaveAudioStage(const SessionContextIntf* session,
+                 std::string               id,
+                 std::vector<InEdge>       iports,
+                 FlexData                  config);
+  ~SaveAudioStage() override;
 
   Job process(RuntimeContext& ctx) override;
 

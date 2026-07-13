@@ -129,6 +129,10 @@ public:
 
   void set_eval_per_layer(bool) noexcept override {}
 
+  // Dynamic-int8 accelerated prefill GEMMs (LOSSY, opt-in) -- forwards
+  // to the metal model (see MetalQwenModel::set_i8_gemm).
+  void set_i8_gemm(bool on) override;
+
 private:
   struct CtxState { ContextId metal_cid; };
   CtxState* state_for_(ContextId ctx);

@@ -247,7 +247,7 @@ RtspCaptureStage::RtspCaptureStage(const SessionContextIntf* s,
         this->id()));
   }
 
-  _output_dir = attr_str("output_dir");
+  _output_dir = attr_path("output_dir", /*for_write=*/true);
   if (_output_dir.empty()) {
     fail_config(fmt(
         "RtspCaptureStage('{}'): config.output_dir is required",
@@ -287,7 +287,8 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "camera_name", .type = ConfigType::String, .required = true,
    .doc = "camera key in the cameras sub-db", .suggest_db = "cameras"},
   {.key = "output_dir", .type = ConfigType::String, .required = true,
-   .doc = "directory for finalized MP4 segments"},
+   .doc = "directory for finalized MP4 segments",
+   .is_path = true, .path_write = true, .path_kind = "dir"},
   {.key = "segment_seconds", .type = ConfigType::Uint,
    .doc = "target segment length in seconds", .def_uint = 60},
   {.key = "cameras_db", .type = ConfigType::String,
@@ -322,9 +323,11 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "video", .doc = "EncodedSegment per H.264 access unit (AVCC)",
-   .type = &typeid(EncodedSegmentPayload), .clock_group = 1},
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "video-encoder-segments", .clock_group = 1},
   {.name = "audio", .doc = "EncodedSegment per AAC packet (ADTS-free)",
-   .type = &typeid(EncodedSegmentPayload), .clock_group = 1},
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "audio-encoder-segments", .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "rtsp-capture",
@@ -870,6 +873,8 @@ struct Publisher {
   unsigned                          a_codec_id    = 0;
   unsigned                          v_width       = 0;
   unsigned                          v_height      = 0;
+  unsigned                          v_fps_num     = 0;
+  unsigned                          v_fps_den     = 0;
   unsigned                          a_sample_rate = 0;
   unsigned                          a_channels    = 0;
   std::vector<uint8_t>              v_extradata;
@@ -915,6 +920,8 @@ struct Publisher {
     es.codec_id    = v_codec_id;
     es.width       = v_width;
     es.height      = v_height;
+    es.fps_num     = v_fps_num;
+    es.fps_den     = v_fps_den;
     es.extradata   = v_extradata;
     es.data.assign(data, data + size);
     ctx.write_sync(0,
@@ -1274,6 +1281,19 @@ RtspCaptureStage::capture_loop_(RuntimeContext& ctx)
       pub.v_codec_id = static_cast<unsigned>(cs.v_out_par->codec_id);
       pub.v_width    = static_cast<unsigned>(cs.v_out_par->width);
       pub.v_height   = static_cast<unsigned>(cs.v_out_par->height);
+      // Original source cadence: the input stream's avg_frame_rate,
+      // falling back to r_frame_rate (many RTSP cameras leave avg unset
+      // until enough frames arrive). 0/0 stays when neither is known.
+      AVRational fr{0, 1};
+      if (cs.v_in_idx >= 0) {
+        const AVStream* v_in = cs.ictx->streams[cs.v_in_idx];
+        fr = v_in->avg_frame_rate;
+        if (fr.num <= 0 || fr.den <= 0) { fr = v_in->r_frame_rate; }
+      }
+      if (fr.num > 0 && fr.den > 0) {
+        pub.v_fps_num = static_cast<unsigned>(fr.num);
+        pub.v_fps_den = static_cast<unsigned>(fr.den);
+      }
       if (cs.v_out_par->extradata && cs.v_out_par->extradata_size > 0) {
         pub.v_extradata.assign(
             cs.v_out_par->extradata,

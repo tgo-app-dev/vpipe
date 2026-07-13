@@ -1,5 +1,5 @@
-#ifndef VIDEO_FILE_ENCODER_STAGE_H
-#define VIDEO_FILE_ENCODER_STAGE_H
+#ifndef SAVE_VIDEO_STAGE_H
+#define SAVE_VIDEO_STAGE_H
 
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
@@ -38,18 +38,18 @@ namespace vpipe {
 // from the incoming StreamParams headers; mismatches between input
 // format and what the encoder accepts surface as clean error logs at
 // avcodec_open2 time (no swscale / swresample yet).
-class VideoFileEncoderStage final
-  : public TypedStage<VideoFileEncoderStage>
+class SaveVideoStage final
+  : public TypedStage<SaveVideoStage>
 {
 public:
-  static constexpr const char* kTypeName = "video-file-encoder";
+  static constexpr const char* kTypeName = "save-video";
 
-  VideoFileEncoderStage(const SessionContextIntf* session,
+  SaveVideoStage(const SessionContextIntf* session,
                         std::string               id,
                         std::vector<InEdge>       iports,
                         FlexData                  config);
 
-  ~VideoFileEncoderStage() override;
+  ~SaveVideoStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
   Job process   (RuntimeContext& ctx) override;

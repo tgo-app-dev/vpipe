@@ -50,10 +50,11 @@ export function kbd(label) {
 // action (kind:'primary'); Escape / backdrop click triggers the cancel
 // action (cancel:true or label "Cancel"), else just closes. The
 // primary and cancel buttons render ⏎ / Esc hint badges.
-export function openModal({ title, body, actions = [] }) {
+export function openModal({ title, body, actions = [], className = '' }) {
   const root = document.getElementById('modal-root');
   const back = el('div', { class: 'modal-back' });
-  const modal = el('div', { class: 'modal' });
+  const modal = el('div',
+    { class: 'modal' + (className ? ' ' + className : '') });
   const close = () => { back.remove(); document.removeEventListener('keydown', onKey); };
 
   const primary = actions.find((a) => a.kind === 'primary');
@@ -89,6 +90,45 @@ export function openModal({ title, body, actions = [] }) {
   back.addEventListener('click', (e) => { if (e.target === back) { dismiss(); } });
   document.addEventListener('keydown', onKey);
   root.append(back);
+  return close;
+}
+
+// A lightweight context menu anchored at viewport point (x, y). `items`
+// is a list of { label, danger?, onClick }; a null entry renders a
+// divider. The menu closes on selection, click-away, Escape, scroll or
+// resize, and is clamped to stay on-screen. Returns a close fn.
+export function openMenu(x, y, items) {
+  const root = document.getElementById('modal-root') || document.body;
+  const menu = el('div', { class: 'ctx-menu' });
+  const close = () => {
+    menu.remove();
+    document.removeEventListener('keydown', onKey, true);
+    document.removeEventListener('pointerdown', onAway, true);
+    window.removeEventListener('resize', close);
+    window.removeEventListener('scroll', close, true);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  };
+  const onAway = (e) => { if (!menu.contains(e.target)) { close(); } };
+  for (const it of items) {
+    if (!it) { menu.append(el('div', { class: 'ctx-sep' })); continue; }
+    menu.append(el('button', {
+      class: 'ctx-item' + (it.danger ? ' danger' : ''),
+      onclick: () => { close(); it.onClick(); },
+    }, it.label));
+  }
+  root.append(menu);
+  const r = menu.getBoundingClientRect();
+  menu.style.left =
+    Math.max(4, Math.min(x, window.innerWidth - r.width - 6)) + 'px';
+  menu.style.top =
+    Math.max(4, Math.min(y, window.innerHeight - r.height - 6)) + 'px';
+  document.addEventListener('keydown', onKey, true);
+  // Defer the away-listener a tick so the opening click doesn't close it.
+  setTimeout(() => document.addEventListener('pointerdown', onAway, true), 0);
+  window.addEventListener('resize', close);
+  window.addEventListener('scroll', close, true);
   return close;
 }
 

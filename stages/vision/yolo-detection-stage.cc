@@ -442,7 +442,7 @@ const StageSpec kSpec = {
                "(letterbox + NMS) and emits a FlexData detection record "
                "per frame.",
   .display_name = "YOLO Detector",
-  .category  = StageCategory::Video,
+  .category  = StageCategory::Vision,
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,

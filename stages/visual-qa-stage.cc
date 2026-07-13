@@ -95,6 +95,7 @@ VisualQaStage::VisualQaStage(const SessionContextIntf* s,
     _pause_ms_between_rounds = static_cast<int>(v);
   }
   _batched_decode          = attr_bool("batched_decode");
+  _i8_prefill              = attr_bool("i8_prefill");
   _pre_image_prompt        = attr_str("pre_image_prompt");
   _post_image_prompt       = attr_str("post_image_prompt");
   _decode_after_post_image = attr_bool("decode_after_post_image");
@@ -215,6 +216,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "batched_decode", .type = ConfigType::Bool,
    .doc = "batch question branches that share the prefix",
    .def_bool = true},
+  {.key = "i8_prefill", .type = ConfigType::Bool,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 prefill GEMMs, ~2x their "
+          "f16 rate on matrix-core GPUs at int8 quality (prefill is NOT "
+          "token-exact with this on; IGNORED without NAX matmul2d -- matrix-core GPU + kernels). Default false; VPIPE_I8_GEMM "
+          "overrides.",
+   .def_bool = false},
   {.key = "pre_image_prompt", .type = ConfigType::String,
    .doc = "user-turn text before the image block", .def_str = ""},
   {.key = "post_image_prompt", .type = ConfigType::String,
@@ -242,7 +249,7 @@ const StageSpec kSpec = {
                "image/video frames, and asks the configured questions per "
                "round, streaming answers to the UI. 0 oports.",
   .display_name = "Visual Q&A",
-  .category  = StageCategory::Text,
+  .category  = StageCategory::Vision,
   .iports    = kIports,
   .oports    = {},
   .attrs     = kAttrs,
@@ -288,6 +295,9 @@ VisualQaStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op
+  // on backends without the route; env VPIPE_I8_GEMM overrides.
+  if (_i8_prefill) { _lm->set_i8_prefill(true); }
   _chat_tpl = genai::make_chat_template(
       _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {

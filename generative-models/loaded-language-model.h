@@ -422,8 +422,27 @@ public:
   // decode short -- e.g. banning Gemma-4's reasoning-channel open tokens so
   // the model can't spend the budget generating a thought block. No-op on
   // backends/models without logit-mask support (only the metal Gemma exec
-  // implements it today). Set once after load, before prefill; empty clears.
+  // implements it today). Set once after load, before prefill. A caller's
+  // ids are MERGED on top of the model's permanent base (see
+  // base_suppressed_tokens) rather than replacing it.
   void set_suppressed_tokens(std::span<const std::int32_t> ids);
+
+  // The tokens the model ALWAYS suppresses, independent of any caller set
+  // (Gemma-4's multimodal end markers <image|>/<audio|>, baked in at load).
+  // The GPU mask applies these on prefill + single-token decode; a caller
+  // that masks logits HOST-side on a path the GPU mask doesn't cover (e.g.
+  // realtime-vqa's batched per-branch continuation) must fold these in too.
+  // Empty for families without a base (Qwen/Llama).
+  std::span<const std::int32_t> base_suppressed_tokens() const noexcept;
+
+  // Dynamic-int8 accelerated PREFILL GEMMs ("accelerated mode"): the big
+  // prompt-time matmuls run on the matrix units' int8 pipe (~2x the f16
+  // rate) with on-the-fly per-(row, 512-group) activation quantization.
+  // LOSSY (int8, ~1e-2 rel per GEMM -- prefill is NOT token-exact with
+  // this on) and strictly opt-in; decode is untouched. No-op on backends
+  // without the route (only the metal Qwen exec implements it today).
+  // Env VPIPE_I8_GEMM=0|1 overrides. Set after load, before prefill.
+  void set_i8_prefill(bool on);
 
   // Speculative decode via the MTP head: token-exact vs the serial decode, but
   // the drafter lets the verifier accept multiple tokens per forward.

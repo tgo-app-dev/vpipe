@@ -1,4 +1,4 @@
-#include "stages/audio-video/audio-encode-stage.h"
+#include "stages/save-audio-stage.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/ffmpeg-libraries.h"
@@ -136,7 +136,8 @@ struct AudioPlanarFloatFifo {
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_path", .type = ConfigType::String, .required = true,
    .doc = "output file path; when it has no extension, one is appended "
-          "from `format`"},
+          "from `format`",
+   .is_path = true, .path_write = true, .path_filter = "audio"},
   {.key = "format", .type = ConfigType::String,
    .doc = "wav | aac | mp3 | m4a (m4a => AAC in mp4). Default: inferred "
           "from the output_path extension, else wav",
@@ -163,13 +164,13 @@ const PortSpec kOports[] = {
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const StageSpec kSpec = {
-  .type_name = "audio-encode",
-  .doc       = "Encodes each incoming PCM clip (one beat = one clip) to a "
-               "file: AAC / MP3 / M4A via FFmpeg, or 16-bit WAV directly. "
-               "The audio counterpart to the video segment writer; pairs "
-               "with text-to-speech. Multiple beats append an "
-               "incrementing index before the extension.",
-  .display_name = "Encode Audio",
+  .type_name = "save-audio",
+  .doc       = "Sink: encodes each incoming PCM clip (one beat = one clip) "
+               "to a file: AAC / MP3 / M4A via FFmpeg, or 16-bit WAV "
+               "directly. The audio counterpart to save-image; pairs with "
+               "text-to-speech. Multiple beats append an incrementing index "
+               "before the extension.",
+  .display_name = "Save Audio",
   .category  = StageCategory::Audio,
   .iports    = kIports,
   .oports    = kOports,
@@ -178,18 +179,18 @@ const StageSpec kSpec = {
 
 }  // namespace
 
-AudioEncodeStage::AudioEncodeStage(const SessionContextIntf* s,
-                                   std::string               id,
-                                   std::vector<InEdge>       iports,
-                                   FlexData                  config)
-  : TypedStage<AudioEncodeStage>(s, std::move(id), std::move(iports),
-                                 std::move(config))
+SaveAudioStage::SaveAudioStage(const SessionContextIntf* s,
+                               std::string               id,
+                               std::vector<InEdge>       iports,
+                               FlexData                  config)
+  : TypedStage<SaveAudioStage>(s, std::move(id), std::move(iports),
+                               std::move(config))
 {
   // Construction must succeed for any config (see Stage::fail_config):
   // a stage must construct so a graph can be built/edited before
   // required fields are supplied. Config problems are recorded via
   // fail_config (first message wins) and deferred to launch.
-  _output_path = attr_str("output_path");
+  _output_path = attr_path("output_path", true);
   _bitrate     = static_cast<int>(attr_int("bitrate"));
   _sample_rate = static_cast<int>(attr_int("sample_rate"));
 
@@ -204,22 +205,22 @@ AudioEncodeStage::AudioEncodeStage(const SessionContextIntf* s,
 
   if (_output_path.empty()) {
     fail_config(fmt(
-        "AudioEncodeStage('{}'): config.output_path is required "
+        "SaveAudioStage('{}'): config.output_path is required "
         "(non-empty string)", this->id()));
   }
   if (!is_known_format_(_format)) {
     fail_config(fmt(
-        "AudioEncodeStage('{}'): unsupported format '{}' (expected one "
+        "SaveAudioStage('{}'): unsupported format '{}' (expected one "
         "of wav | aac | mp3 | m4a)", this->id(), _format));
   }
   if (_bitrate <= 0) {
     fail_config(fmt(
-        "AudioEncodeStage('{}'): bitrate must be > 0 (got {})",
+        "SaveAudioStage('{}'): bitrate must be > 0 (got {})",
         this->id(), _bitrate));
   }
   if (_sample_rate < 0) {
     fail_config(fmt(
-        "AudioEncodeStage('{}'): sample_rate must be >= 0 (got {})",
+        "SaveAudioStage('{}'): sample_rate must be >= 0 (got {})",
         this->id(), _sample_rate));
   }
 
@@ -229,16 +230,16 @@ AudioEncodeStage::AudioEncodeStage(const SessionContextIntf* s,
   allocate_oports(spec().oports.size());
 }
 
-AudioEncodeStage::~AudioEncodeStage() = default;
+SaveAudioStage::~SaveAudioStage() = default;
 
 const StageSpec&
-AudioEncodeStage::spec() const noexcept
+SaveAudioStage::spec() const noexcept
 {
   return kSpec;
 }
 
 std::string
-AudioEncodeStage::next_output_path_(const std::string& ext) const
+SaveAudioStage::next_output_path_(const std::string& ext) const
 {
   // Start from output_path; ensure it ends in `.ext`. For the 2nd+ file
   // insert "-NNN" before the extension to avoid overwrite.
@@ -263,14 +264,14 @@ AudioEncodeStage::next_output_path_(const std::string& ext) const
 }
 
 bool
-AudioEncodeStage::encode_wav_(const std::string& path, const float* pcm,
+SaveAudioStage::encode_wav_(const std::string& path, const float* pcm,
                               std::size_t n_frames, int channels,
                               int sample_rate)
 {
   std::ofstream out(path, std::ios::binary);
   if (!out) {
     session()->error(fmt(
-        "AudioEncodeStage('{}'): cannot open '{}' for writing",
+        "SaveAudioStage('{}'): cannot open '{}' for writing",
         this->id(), path));
     return false;
   }
@@ -304,7 +305,7 @@ AudioEncodeStage::encode_wav_(const std::string& path, const float* pcm,
   out.close();
   if (!out) {
     session()->error(fmt(
-        "AudioEncodeStage('{}'): write error finalizing '{}'",
+        "SaveAudioStage('{}'): write error finalizing '{}'",
         this->id(), path));
     return false;
   }
@@ -312,14 +313,14 @@ AudioEncodeStage::encode_wav_(const std::string& path, const float* pcm,
 }
 
 bool
-AudioEncodeStage::encode_ffmpeg_(const std::string& path, const float* pcm,
+SaveAudioStage::encode_ffmpeg_(const std::string& path, const float* pcm,
                                  std::size_t n_frames, int channels,
                                  int sample_rate, const std::string& format)
 {
   const FFmpegLibraries* libs = session()->ffmpeg_libraries();
   if (!libs || !libs->valid()) {
     session()->error(fmt(
-        "AudioEncodeStage('{}'): ffmpeg unavailable for format '{}'",
+        "SaveAudioStage('{}'): ffmpeg unavailable for format '{}'",
         this->id(), format));
     return false;
   }
@@ -353,7 +354,7 @@ AudioEncodeStage::encode_ffmpeg_(const std::string& path, const float* pcm,
     }
   };
   auto fail = [&](const std::string& msg) -> bool {
-    session()->error(fmt("AudioEncodeStage('{}'): {}", this->id(), msg));
+    session()->error(fmt("SaveAudioStage('{}'): {}", this->id(), msg));
     cleanup();
     return false;
   };
@@ -587,7 +588,7 @@ AudioEncodeStage::encode_ffmpeg_(const std::string& path, const float* pcm,
 }
 
 Job
-AudioEncodeStage::process(RuntimeContext& ctx)
+SaveAudioStage::process(RuntimeContext& ctx)
 {
   auto p = co_await ctx.read(0);
   if (!p) {
@@ -597,13 +598,13 @@ AudioEncodeStage::process(RuntimeContext& ctx)
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(p.get());
   if (!tbp) {
     session()->warn(fmt(
-        "AudioEncodeStage('{}'): expected TensorBeatPayload on in-port 0, "
+        "SaveAudioStage('{}'): expected TensorBeatPayload on in-port 0, "
         "got {}; dropping beat", this->id(), p->describe()));
     co_return;
   }
   if (tbp->dtype != TensorBeat::DType::F32) {
     session()->warn(fmt(
-        "AudioEncodeStage('{}'): expected TensorBeat dtype=F32 (f32 PCM), "
+        "SaveAudioStage('{}'): expected TensorBeat dtype=F32 (f32 PCM), "
         "got {}; dropping beat",
         this->id(), TensorBeat::name_of(tbp->dtype)));
     co_return;
@@ -620,7 +621,7 @@ AudioEncodeStage::process(RuntimeContext& ctx)
     n_frames = static_cast<std::size_t>(tbp->shape[1]);
   } else {
     session()->warn(fmt(
-        "AudioEncodeStage('{}'): expected TensorBeat shape [N] or "
+        "SaveAudioStage('{}'): expected TensorBeat shape [N] or "
         "[channels,N], got rank={}; dropping beat",
         this->id(), static_cast<int>(tbp->shape.size())));
     co_return;
@@ -650,7 +651,7 @@ AudioEncodeStage::process(RuntimeContext& ctx)
   AlignedVector<float> contig = tbp->materialize_contiguous_as<float>();
   if (contig.size() < n_frames * static_cast<std::size_t>(channels)) {
     session()->warn(fmt(
-        "AudioEncodeStage('{}'): materialized buffer too small "
+        "SaveAudioStage('{}'): materialized buffer too small "
         "({} floats vs {} channels * {} frames); dropping beat",
         this->id(), contig.size(), channels, n_frames));
     co_return;
@@ -677,7 +678,7 @@ AudioEncodeStage::process(RuntimeContext& ctx)
     const FFmpegLibraries* libs = session()->ffmpeg_libraries();
     if (!libs || !libs->valid()) {
       session()->warn(fmt(
-          "AudioEncodeStage('{}'): format '{}' requested but ffmpeg is "
+          "SaveAudioStage('{}'): format '{}' requested but ffmpeg is "
           "unavailable; falling back to WAV",
           this->id(), format));
       format = "wav";
@@ -705,7 +706,7 @@ AudioEncodeStage::process(RuntimeContext& ctx)
   const double duration_s =
       static_cast<double>(n_frames) / static_cast<double>(sr);
   session()->info(fmt(
-      "AudioEncodeStage('{}'): wrote '{}' ({}, {} frames x {} ch, "
+      "SaveAudioStage('{}'): wrote '{}' ({}, {} frames x {} ch, "
       "{:.2f}s @ {} Hz)",
       this->id(), out_path, format, n_frames, channels, duration_s, sr));
 
@@ -726,7 +727,7 @@ AudioEncodeStage::process(RuntimeContext& ctx)
   co_return;
 }
 
-VPIPE_REGISTER_STAGE(AudioEncodeStage)
-VPIPE_REGISTER_SPEC(AudioEncodeStage, kSpec)
+VPIPE_REGISTER_STAGE(SaveAudioStage)
+VPIPE_REGISTER_SPEC(SaveAudioStage, kSpec)
 
 }

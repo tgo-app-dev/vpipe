@@ -72,9 +72,41 @@ public:
   // f32 PCM waveform at sample_rate. When `stages` is non-null it is filled
   // with the per-stage intermediates in CHANNEL-major [C][T] order (index 0 =
   // post-RVQ [768,T], then one per decoder module) for rel-L2 verification.
+  // `n_active` (0 => all n_quantizers) decodes with only the FIRST n_active
+  // residual codebooks (residual truncation) -- MOSS-TTS-Realtime emits 16 of
+  // this codec's codebooks, so its rows are 16 wide and n_active=16.
   std::vector<float> decode(
       const std::vector<std::vector<std::int32_t>>& codes,
-      std::vector<std::vector<float>>* stages = nullptr);
+      std::vector<std::vector<float>>* stages = nullptr, int n_active = 0);
+
+  // --- Streaming (incremental) decode -------------------------------------
+  // The decoder is causal (windowed-causal attention, patch-reshape upsamples
+  // only within a frame), so audio streams chunk-by-chunk as the LM emits
+  // codes. Each stage keeps its per-layer K/V in a windowed RING (ring_cap =
+  // context + the chunk's frame count), so decode_stream_chunk() is O(chunk),
+  // total O(T) like one-shot decode() but low-latency. Concatenating the chunk
+  // PCM reproduces decode()'s mono waveform bit-for-bit (f16 noise only).
+  struct StreamState {
+    std::vector<std::vector<metal_compute::SharedBuffer>> kc, vc;  // [stage][L]
+    std::vector<int> pos;   // per-stage absolute input-frame position so far
+    std::vector<int> cap;   // per-stage ring capacity (frames)
+    int max_chunk = 0;
+    int n_active = 0;       // active codebooks (RT emits 16); 0 => all
+    // Re-arm for a NEW utterance without reallocating the rings (sized by chunk,
+    // not utterance length). Only positions reset; stale ring contents are never
+    // read (attention only reaches this utterance's [0, pos+T)).
+    void reset() { for (int& p : pos) { p = 0; } }
+  };
+  // Allocate a fresh streaming state (per utterance). `max_chunk_frames` is the
+  // largest latent frame count a single decode_stream_chunk() will pass;
+  // `n_active` matches decode()'s (0 => all codebooks). Null if not loaded.
+  std::unique_ptr<StreamState> decode_stream_begin(int max_chunk_frames,
+                                                   int n_active = 0) const;
+  // Decode ONLY the new frames `codes[Cnew][n_vq]` (Cnew <= max_chunk_frames),
+  // advancing `st`. Returns the chunk's mono PCM [Cnew*hop] f32; concatenating
+  // successive chunks == decode() of the whole code stream.
+  std::vector<float> decode_stream_chunk(
+      StreamState& st, const std::vector<std::vector<std::int32_t>>& codes);
 
   // Encode a mono `wave` (f32 @ sample_rate; the caller resamples) into RVQ
   // codes `codes[T][n_vq]` -- the inverse of decode(): the waveform is
@@ -115,10 +147,16 @@ private:
     std::vector<Layer> layers;
   };
 
-  metal_compute::SharedBuffer run_stage_(const Stage& st, int T,
-                                         const metal_compute::SharedBuffer& in);
+  // kc/vc null => one-shot; non-null => streaming (T = new frames, `pos` the
+  // absolute start, `ring_cap` the K/V ring capacity). See codec-v2 for detail.
+  metal_compute::SharedBuffer run_stage_(
+      const Stage& st, int T, const metal_compute::SharedBuffer& in,
+      std::vector<metal_compute::SharedBuffer>* kc = nullptr,
+      std::vector<metal_compute::SharedBuffer>* vc = nullptr, int pos = 0,
+      int ring_cap = 0);
   metal_compute::SharedBuffer rvq_decode_(
-      const std::vector<std::vector<std::int32_t>>& codes, int T);
+      const std::vector<std::vector<std::int32_t>>& codes, int T,
+      int n_active);
   // RVQ encode (host): the [T, code_dim] encoder hidden -> codes[T][n_vq].
   // input_proj (768->512) then the LFQ residual loop (per codebook: in_proj
   // 512->8, L2-normalized cosine argmax over the codebook, subtract
@@ -164,7 +202,7 @@ private:
   metal_compute::ComputeLibrary _lib_gemm, _lib_vis, _lib_elt, _lib_sdpa,
       _lib_rope, _lib_qmm;
   metal_compute::ComputeFunction _fn_gemm, _fn_ln, _fn_gelu, _fn_hslice,
-      _fn_transpose, _fn_residual, _fn_sdpa, _fn_rope;
+      _fn_transpose, _fn_residual, _fn_sdpa, _fn_rope, _fn_ring_append;
   metal_compute::ComputeFunction _fn_quant;        // int8 g32 quant (load)
   metal_compute::ComputeFunction _fn_qmm8g32;      // fused int8 g32 GEMM
 

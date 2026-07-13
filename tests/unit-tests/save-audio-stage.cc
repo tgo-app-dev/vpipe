@@ -1,4 +1,4 @@
-// AudioEncodeStage tests.
+// SaveAudioStage tests.
 //
 // Always-on: config plumbing (kTypeName, fail_config on missing
 // output_path, format inferred from extension) + the WAV path
@@ -25,7 +25,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
-#include "stages/audio-video/audio-encode-stage.h"
+#include "stages/save-audio-stage.h"
 
 #include <cmath>
 #include <cstdint>
@@ -63,7 +63,7 @@ std::string
 make_tempdir_()
 {
   auto base = std::filesystem::temp_directory_path()
-            / "vpipe-audio-encode-XXXXXX";
+            / "vpipe-save-audio-XXXXXX";
   std::string tmpl = base.string();
   if (!::mkdtemp(tmpl.data())) {
     throw std::runtime_error("mkdtemp failed");
@@ -130,20 +130,20 @@ slurp_(const std::string& path)
       std::istreambuf_iterator<char>());
 }
 
-// Drive a one-beat pipeline: the sine source -> an AudioEncodeStage with
+// Drive a one-beat pipeline: the sine source -> a SaveAudioStage with
 // `cfg`. Returns true iff the runtime launched (assertions are made by
 // the caller, since ASSERT_TRUE only works inside a TEST body).
 bool
 run_one_(Session& sess, FlexData cfg)
 {
-  Pipeline pl("audio-encode-smoke", &sess);
+  Pipeline pl("save-audio-smoke", &sess);
   auto src = make_unique<OneSineSource>(
       &sess, "sine", vector<InEdge>{}, FlexData::make_object());
   src->allocate_oports(1);
   auto* sinesrc =
       static_cast<OneSineSource*>(pl.insert_stage(std::move(src)));
 
-  auto enc = make_unique<AudioEncodeStage>(
+  auto enc = make_unique<SaveAudioStage>(
       &sess, "enc", vector<InEdge>{ { sinesrc, 0 } }, std::move(cfg));
   pl.insert_stage(std::move(enc));
 
@@ -160,61 +160,61 @@ run_one_(Session& sess, FlexData cfg)
 
 // ---- Always-on config tests ------------------------------------------
 
-TEST(audio_encode_stage, type_is_registered) {
-  EXPECT_TRUE(string_view(AudioEncodeStage::kTypeName) == "audio-encode");
+TEST(save_audio_stage, type_is_registered) {
+  EXPECT_TRUE(string_view(SaveAudioStage::kTypeName) == "save-audio");
 }
 
-TEST(audio_encode_stage, missing_output_path_deferred) {
+TEST(save_audio_stage, missing_output_path_deferred) {
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::make_object();
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
   EXPECT_FALSE(s.config_error().empty());
 }
 
-TEST(audio_encode_stage, format_inferred_from_extension) {
+TEST(save_audio_stage, format_inferred_from_extension) {
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::from_json(R"({"output_path":"/tmp/out.mp3"})");
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.config_error().empty());
   EXPECT_TRUE(s.format() == "mp3");
   EXPECT_TRUE(s.bitrate() == 128000);
 }
 
-TEST(audio_encode_stage, format_default_wav_when_no_extension) {
+TEST(save_audio_stage, format_default_wav_when_no_extension) {
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::from_json(R"({"output_path":"/tmp/out"})");
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.config_error().empty());
   EXPECT_TRUE(s.format() == "wav");
 }
 
-TEST(audio_encode_stage, explicit_format_overrides_extension) {
+TEST(save_audio_stage, explicit_format_overrides_extension) {
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::from_json(
       R"({"output_path":"/tmp/out.dat","format":"aac","bitrate":96000})");
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.config_error().empty());
   EXPECT_TRUE(s.format() == "aac");
   EXPECT_TRUE(s.bitrate() == 96000);
 }
 
-TEST(audio_encode_stage, bad_format_deferred) {
+TEST(save_audio_stage, bad_format_deferred) {
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::from_json(
       R"({"output_path":"/tmp/out","format":"flac"})");
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{}, std::move(cfg));
   EXPECT_FALSE(s.config_error().empty());
 }
 
-TEST(audio_encode_stage, spec_ports) {
+TEST(save_audio_stage, spec_ports) {
   Session sess;
   CerrSilencer hush;
-  AudioEncodeStage s(&sess, "enc", vector<InEdge>{ { nullptr, 0 } },
+  SaveAudioStage s(&sess, "enc", vector<InEdge>{ { nullptr, 0 } },
                      FlexData::from_json(R"({"output_path":"/tmp/o.wav"})"));
   const StageSpec& sp = s.spec();
   EXPECT_TRUE(sp.iports.size() == 1u);
@@ -226,7 +226,7 @@ TEST(audio_encode_stage, spec_ports) {
 
 // ---- WAV end-to-end (always-on; no ffmpeg) ---------------------------
 
-TEST(audio_encode_stage, wav_roundtrip) {
+TEST(save_audio_stage, wav_roundtrip) {
   const std::string dir = make_tempdir_();
   const std::string wav = dir + "/sine.wav";
   {
@@ -255,7 +255,7 @@ TEST(audio_encode_stage, wav_roundtrip) {
   const std::uint32_t data_bytes = rd32_(b, 40);
   // 24000 mono int16 samples = 48000 bytes (allow exact).
   EXPECT_TRUE(data_bytes == 48000u);
-  std::printf("[audio-encode] wav: %zu bytes, %u Hz, %u ch, %u-bit, "
+  std::printf("[save-audio] wav: %zu bytes, %u Hz, %u ch, %u-bit, "
               "data=%u bytes (~%.2fs)\n",
               b.size(), sr, channels, bits, data_bytes,
               data_bytes / 2.0 / sr);
@@ -344,11 +344,11 @@ encode_and_probe_(const FFmpegLibraries& libs, const std::string& dir,
 
 }  // namespace
 
-TEST(audio_encode_stage, aac_mp3_m4a_roundtrip) {
+TEST(save_audio_stage, aac_mp3_m4a_roundtrip) {
   Session probe_sess;
   const FFmpegLibraries* libs = probe_sess.ffmpeg_libraries();
   if (!libs || !libs->valid()) {
-    std::printf("[audio-encode] ffmpeg unavailable; skipping AAC/MP3/M4A "
+    std::printf("[save-audio] ffmpeg unavailable; skipping AAC/MP3/M4A "
                 "cases\n");
     return;
   }
@@ -362,7 +362,7 @@ TEST(audio_encode_stage, aac_mp3_m4a_roundtrip) {
   };
   for (const Case& c : cases) {
     const EncodeProbe r = encode_and_probe_(*libs, dir, c.ext, c.format);
-    std::printf("[audio-encode] %s: launched=%d %zu bytes, probe "
+    std::printf("[save-audio] %s: launched=%d %zu bytes, probe "
                 "dur=%.2fs codec=%d (want %d)\n",
                 c.format, static_cast<int>(r.launched), r.size,
                 r.probe.duration_s, r.probe.codec_id, c.want_codec);
@@ -415,13 +415,13 @@ private:
 
 }  // namespace
 
-TEST(audio_encode_stage, multiple_beats_index_suffix) {
+TEST(save_audio_stage, multiple_beats_index_suffix) {
   const std::string dir = make_tempdir_();
   const std::string wav = dir + "/clip.wav";
   {
     Session  sess;
     CerrSilencer hush;
-    Pipeline pl("audio-encode-multi", &sess);
+    Pipeline pl("save-audio-multi", &sess);
     auto src = make_unique<TwoSineSource>(
         &sess, "sine2", vector<InEdge>{}, FlexData::make_object());
     src->allocate_oports(1);
@@ -429,10 +429,10 @@ TEST(audio_encode_stage, multiple_beats_index_suffix) {
 
     FlexData cfg = FlexData::make_object();
     cfg.as_object().insert("output_path", FlexData::make_string(wav));
-    auto enc = make_unique<AudioEncodeStage>(
+    auto enc = make_unique<SaveAudioStage>(
         &sess, "enc", vector<InEdge>{ { s2, 0 } }, std::move(cfg));
     auto* enc_stage =
-        static_cast<AudioEncodeStage*>(pl.insert_stage(std::move(enc)));
+        static_cast<SaveAudioStage*>(pl.insert_stage(std::move(enc)));
 
     PipelineRuntime rt(&pl, &sess);
     ASSERT_TRUE(rt.launch());
@@ -443,7 +443,7 @@ TEST(audio_encode_stage, multiple_beats_index_suffix) {
   // First file is the plain path, second gets a "-001" index suffix.
   EXPECT_TRUE(std::filesystem::exists(dir + "/clip.wav"));
   EXPECT_TRUE(std::filesystem::exists(dir + "/clip-001.wav"));
-  std::printf("[audio-encode] multi: clip.wav + clip-001.wav present\n");
+  std::printf("[save-audio] multi: clip.wav + clip-001.wav present\n");
 
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);

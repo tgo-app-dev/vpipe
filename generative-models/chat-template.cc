@@ -1,12 +1,18 @@
 #include "generative-models/chat-template.h"
 
+#include "common/flex-data.h"
 #include "common/media-line.h"
+#include "generative-models/shared/mcp/mcp-tools.h"
 #include "generative-models/tokenizer.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -45,6 +51,489 @@ push_sp_(std::int32_t                id,
   }
   dst->push_back(id);
   return true;
+}
+
+// ---------------------------------------------------------------------
+// Gemma-4 tool-calling DSL helpers.
+//
+// Gemma-4 advertises tools and exchanges calls/results in a bespoke text
+// DSL (see the model's chat_template.jinja), NOT the Hermes JSON the
+// ChatML families use. String values are wrapped in the special `<|"|>`
+// quote token; structural punctuation ({}:,[]) and identifiers are plain
+// text. The HF tokenizer BPEs each maximal text run BETWEEN special
+// tokens as one unit (e.g. ":{" and "}}" are each single tokens), so we
+// MUST accumulate contiguous text and flush it in one append_text_ call
+// per run -- splitting a run into several encode() calls can pick
+// different BPE merges and drift off the trained token sequence.
+// ---------------------------------------------------------------------
+
+// The literal Gemma string-quote token, as it appears in decoded text.
+constexpr std::string_view kGemmaQuote = "<|\"|>";
+
+// Accumulates plain text and flushes it as ONE BPE segment, interleaved
+// with single special-token ids -- mirrors HF's "split on special
+// tokens, BPE each segment" pipeline.
+struct GemmaEmit {
+  const Tokenizer&           tok;
+  std::vector<std::int32_t>* dst;
+  std::string                run;
+
+  void text(std::string_view s) { run.append(s); }
+  void flush()
+  {
+    if (!run.empty()) {
+      append_text_(tok, run, dst);
+      run.clear();
+    }
+  }
+  void sp(std::int32_t id)
+  {
+    flush();
+    if (id >= 0) {
+      dst->push_back(id);
+    }
+  }
+  // `<|"|>text<|"|>` -- Gemma's quoted-string form (`q` is the id of the
+  // `<|"|>` special token).
+  void quoted(std::int32_t q, std::string_view s)
+  {
+    sp(q);
+    text(s);
+    sp(q);
+  }
+};
+
+// Trim ASCII whitespace from both ends of a view.
+std::string_view
+trim_sv_(std::string_view s)
+{
+  const std::size_t b = s.find_first_not_of(" \t\r\n");
+  if (b == std::string_view::npos) {
+    return {};
+  }
+  const std::size_t e = s.find_last_not_of(" \t\r\n");
+  return s.substr(b, e - b + 1);
+}
+
+// Normalise a JSON-Schema `type` field to Gemma's upper-case type name.
+// `type` may be a string ("string") or, for a union type
+// (["string","array"]), an array -- we take the first string element (the
+// reference macro assumes a scalar type; this keeps a union from breaking
+// the render). Empty/other -> "STRING".
+std::string
+gemma_type_upper_(const FlexData& type_field)
+{
+  auto up = [](std::string_view s) {
+    std::string o(s);
+    for (char& c : o) {
+      c = static_cast<char>(
+          std::toupper(static_cast<unsigned char>(c)));
+    }
+    return o;
+  };
+  if (type_field.is_string()) {
+    return up(type_field.get_string());
+  }
+  if (type_field.is_array()) {
+    auto arr = type_field.as_array();
+    for (const auto& el : arr) {
+      if (el.is_string()) {
+        return up(el.get_string());
+      }
+    }
+  }
+  return "STRING";
+}
+
+// Sorted key list of a JSON object (the Jinja `| dictsort`).
+std::vector<std::string>
+sorted_keys_(const FlexData& obj)
+{
+  std::vector<std::string> keys;
+  if (obj.is_object()) {
+    auto o = obj.as_object();
+    for (const auto& kv : o) {
+      keys.emplace_back(kv.first);
+    }
+    std::sort(keys.begin(), keys.end());
+  }
+  return keys;
+}
+
+// Render a JSON value in Gemma's argument DSL, mirroring the Jinja
+// `format_argument` macro: strings -> `<|"|>s<|"|>`, bool -> true/false,
+// numbers -> literal, objects -> `{k:v,...}` (keys dictsorted, escaped
+// with `<|"|>` iff escape_keys), arrays -> `[v,...]`.
+void
+gemma_format_argument_(GemmaEmit& e, std::int32_t q,
+                       const FlexData& v, bool escape_keys)
+{
+  if (v.is_string()) {
+    e.quoted(q, v.get_string());
+    return;
+  }
+  if (v.is_bool()) {
+    e.text(v.get_bool() ? "true" : "false");
+    return;
+  }
+  if (v.is_object()) {
+    e.text("{");
+    const std::vector<std::string> keys = sorted_keys_(v);
+    auto o = v.as_object();
+    bool first = true;
+    for (const auto& k : keys) {
+      if (!first) { e.text(","); }
+      first = false;
+      if (escape_keys) { e.quoted(q, k); }
+      else             { e.text(k); }
+      e.text(":");
+      gemma_format_argument_(e, q, o.at(k), escape_keys);
+    }
+    e.text("}");
+    return;
+  }
+  if (v.is_array()) {
+    e.text("[");
+    auto a = v.as_array();
+    bool first = true;
+    for (const auto& item : a) {
+      if (!first) { e.text(","); }
+      first = false;
+      gemma_format_argument_(e, q, item, escape_keys);
+    }
+    e.text("]");
+    return;
+  }
+  if (v.is_null()) {
+    e.text("null");
+    return;
+  }
+  // numbers (int/uint/real): emit the literal JSON form.
+  e.text(v.to_json(false));
+}
+
+// Forward declaration (properties <-> nested-object recursion).
+void gemma_render_property_(GemmaEmit& e, std::int32_t q,
+                            const FlexData& prop);
+
+// Render a properties map body: `k1:{...},k2:{...}` for each property,
+// keys dictsorted.
+void
+gemma_render_properties_(GemmaEmit& e, std::int32_t q,
+                         const FlexData& properties)
+{
+  const std::vector<std::string> keys = sorted_keys_(properties);
+  auto o = properties.as_object();
+  bool first = true;
+  for (const auto& k : keys) {
+    if (!first) { e.text(","); }
+    first = false;
+    e.text(k);
+    e.text(":");
+    gemma_render_property_(e, q, o.at(k));
+  }
+}
+
+// Render one property's JSON-Schema value as Gemma's `{ ...fields...
+// type:<|"|>T<|"|>}` block. Mirrors the per-property body of the Jinja
+// `format_parameters` macro for the schema features tools use in
+// practice: description, enum (string), nullable, nested object
+// (properties + required), and the trailing type.
+void
+gemma_render_property_(GemmaEmit& e, std::int32_t q,
+                       const FlexData& prop)
+{
+  e.text("{");
+  bool add_comma = false;
+  auto comma = [&]() {
+    if (add_comma) { e.text(","); }
+    else           { add_comma = true; }
+  };
+  std::string type_up = "STRING";
+  if (prop.is_object()) {
+    auto o = prop.as_object();
+    if (o.contains("description")) {
+      FlexData d = o.at("description");
+      if (d.is_string()) {
+        comma();
+        e.text("description:");
+        e.quoted(q, d.get_string());
+      }
+    }
+    if (o.contains("type")) {
+      type_up = gemma_type_upper_(o.at("type"));
+    }
+    if (type_up == "STRING" && o.contains("enum")) {
+      FlexData en = o.at("enum");
+      if (en.is_array()) {
+        comma();
+        e.text("enum:");
+        gemma_format_argument_(e, q, en, /*escape_keys=*/true);
+      }
+    }
+    if (o.contains("nullable")) {
+      FlexData nu = o.at("nullable");
+      if (nu.is_bool() && nu.get_bool()) {
+        comma();
+        e.text("nullable:true");
+      }
+    }
+    if (type_up == "OBJECT") {
+      if (o.contains("properties")) {
+        FlexData props = o.at("properties");
+        if (props.is_object() && props.as_object().size() > 0) {
+          comma();
+          e.text("properties:{");
+          gemma_render_properties_(e, q, props);
+          e.text("}");
+        }
+      }
+      if (o.contains("required")) {
+        FlexData req = o.at("required");
+        if (req.is_array() && req.as_array().size() > 0) {
+          comma();
+          e.text("required:[");
+          auto ra = req.as_array();
+          bool rf = true;
+          for (const auto& r : ra) {
+            if (!rf) { e.text(","); }
+            rf = false;
+            if (r.is_string()) { e.quoted(q, r.get_string()); }
+          }
+          e.text("]");
+        }
+      }
+    }
+  }
+  comma();
+  e.text("type:");
+  e.quoted(q, type_up);
+  e.text("}");
+}
+
+// Render one tool as `<|tool>declaration:NAME{...}<tool|>`. `tool` is one
+// function spec in the Hermes/OpenAI shape
+// ({"type":"function","function":{name,description,parameters}}), the
+// same object McpToolRegistry::tools_json() emits per line.
+void
+gemma_render_declaration_(GemmaEmit& e, std::int32_t q,
+                          std::int32_t tool_open, std::int32_t tool_close,
+                          const FlexData& tool)
+{
+  if (!tool.is_object()) { return; }
+  auto to = tool.as_object();
+  if (!to.contains("function")) { return; }
+  FlexData fn = to.at("function");
+  if (!fn.is_object()) { return; }
+  auto fo = fn.as_object();
+  std::string name;
+  if (fo.contains("name") && fo.at("name").is_string()) {
+    name = std::string(fo.at("name").get_string());
+  }
+  std::string desc;
+  if (fo.contains("description") && fo.at("description").is_string()) {
+    desc = std::string(fo.at("description").get_string());
+  }
+
+  e.sp(tool_open);
+  e.text("declaration:");
+  e.text(name);
+  e.text("{description:");
+  e.quoted(q, desc);
+  if (fo.contains("parameters")) {
+    FlexData params = fo.at("parameters");
+    if (params.is_object() && params.as_object().size() > 0) {
+      auto po = params.as_object();
+      e.text(",parameters:{");
+      if (po.contains("properties")) {
+        FlexData props = po.at("properties");
+        if (props.is_object() && props.as_object().size() > 0) {
+          e.text("properties:{");
+          gemma_render_properties_(e, q, props);
+          e.text("},");
+        }
+      }
+      if (po.contains("required")) {
+        FlexData req = po.at("required");
+        if (req.is_array() && req.as_array().size() > 0) {
+          e.text("required:[");
+          auto ra = req.as_array();
+          bool rf = true;
+          for (const auto& r : ra) {
+            if (!rf) { e.text(","); }
+            rf = false;
+            if (r.is_string()) { e.quoted(q, r.get_string()); }
+          }
+          e.text("],");
+        }
+      }
+      std::string ptype = "OBJECT";
+      if (po.contains("type")) {
+        ptype = gemma_type_upper_(po.at("type"));
+      }
+      e.text("type:");
+      e.quoted(q, ptype);
+      e.text("}");             // close the parameters object
+    }
+  }
+  e.text("}");                 // close the declaration
+  e.sp(tool_close);
+}
+
+// Parse one Gemma argument-DSL value at s[pos] into `out`; advance pos.
+// Grammar: string=<|"|>...<|"|>, {k:v,...}, [v,...], true/false, null,
+// number. Object keys are barewords up to ':'. Returns false on
+// malformed input.
+bool
+parse_gemma_dsl_value_(std::string_view s, std::size_t& pos,
+                       FlexData* out)
+{
+  auto skip_ws = [&]() {
+    while (pos < s.size()
+           && (s[pos] == ' ' || s[pos] == '\t'
+               || s[pos] == '\n' || s[pos] == '\r')) {
+      ++pos;
+    }
+  };
+  skip_ws();
+  if (pos >= s.size()) { return false; }
+
+  // string: <|"|> ... <|"|>
+  if (s.compare(pos, kGemmaQuote.size(), kGemmaQuote) == 0) {
+    const std::size_t start = pos + kGemmaQuote.size();
+    const std::size_t end = s.find(kGemmaQuote, start);
+    if (end == std::string_view::npos) { return false; }
+    *out = FlexData::make_string(s.substr(start, end - start));
+    pos = end + kGemmaQuote.size();
+    return true;
+  }
+  // object: { key:value , ... }
+  if (s[pos] == '{') {
+    ++pos;
+    FlexData obj = FlexData::make_object();
+    auto o = obj.as_object();
+    skip_ws();
+    if (pos < s.size() && s[pos] == '}') {
+      ++pos;
+      *out = std::move(obj);
+      return true;
+    }
+    while (true) {
+      skip_ws();
+      const std::size_t kstart = pos;
+      while (pos < s.size() && s[pos] != ':' && s[pos] != '}') { ++pos; }
+      if (pos >= s.size() || s[pos] != ':') { return false; }
+      const std::string_view key = trim_sv_(s.substr(kstart, pos - kstart));
+      ++pos;   // consume ':'
+      FlexData val;
+      if (!parse_gemma_dsl_value_(s, pos, &val)) { return false; }
+      if (!key.empty()) {
+        o.insert_or_assign(key, std::move(val));
+      }
+      skip_ws();
+      if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+      if (pos < s.size() && s[pos] == '}') { ++pos; break; }
+      return false;
+    }
+    *out = std::move(obj);
+    return true;
+  }
+  // array: [ value , ... ]
+  if (s[pos] == '[') {
+    ++pos;
+    FlexData arr = FlexData::make_array();
+    auto a = arr.as_array();
+    skip_ws();
+    if (pos < s.size() && s[pos] == ']') {
+      ++pos;
+      *out = std::move(arr);
+      return true;
+    }
+    while (true) {
+      FlexData val;
+      if (!parse_gemma_dsl_value_(s, pos, &val)) { return false; }
+      a.push_back(std::move(val));
+      skip_ws();
+      if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+      if (pos < s.size() && s[pos] == ']') { ++pos; break; }
+      return false;
+    }
+    *out = std::move(arr);
+    return true;
+  }
+  // scalar: read until , } ] or end, then classify.
+  const std::size_t start = pos;
+  while (pos < s.size()
+         && s[pos] != ',' && s[pos] != '}' && s[pos] != ']') {
+    ++pos;
+  }
+  const std::string_view tok = trim_sv_(s.substr(start, pos - start));
+  if (tok == "true")  { *out = FlexData::make_bool(true);  return true; }
+  if (tok == "false") { *out = FlexData::make_bool(false); return true; }
+  if (tok.empty() || tok == "null") {
+    *out = FlexData::make_null();
+    return true;
+  }
+  const bool looks_int =
+      tok.find('.') == std::string_view::npos
+      && tok.find('e') == std::string_view::npos
+      && tok.find('E') == std::string_view::npos;
+  try {
+    if (looks_int) {
+      *out = FlexData::make_int(
+          static_cast<std::int64_t>(std::stoll(std::string(tok))));
+    } else {
+      *out = FlexData::make_real(std::stod(std::string(tok)));
+    }
+  } catch (const std::exception&) {
+    // Not a number -- keep the bareword as a string.
+    *out = FlexData::make_string(tok);
+  }
+  return true;
+}
+
+// Extract every `<|tool_call>call:NAME{...}<tool_call|>` block Gemma-4
+// emitted, converting each call's argument DSL into a JSON object string
+// the dispatcher consumes. Malformed blocks are skipped; an empty result
+// means the turn made no tool calls.
+std::vector<vpipe::McpToolCall>
+parse_gemma_tool_calls_(const std::string& text)
+{
+  static constexpr std::string_view kOpen  = "<|tool_call>";
+  static constexpr std::string_view kClose = "<tool_call|>";
+  static constexpr std::string_view kCall  = "call:";
+  std::vector<vpipe::McpToolCall> calls;
+  std::size_t pos = 0;
+  while (true) {
+    const std::size_t o = text.find(kOpen, pos);
+    if (o == std::string::npos) { break; }
+    const std::size_t inner = o + kOpen.size();
+    const std::size_t c = text.find(kClose, inner);
+    const std::string_view block = (c == std::string::npos)
+        ? std::string_view(text).substr(inner)
+        : std::string_view(text).substr(inner, c - inner);
+    pos = (c == std::string::npos) ? text.size() : c + kClose.size();
+
+    const std::size_t cp = block.find(kCall);
+    if (cp == std::string_view::npos) { continue; }
+    const std::size_t nstart = cp + kCall.size();
+    const std::size_t brace = block.find('{', nstart);
+    if (brace == std::string_view::npos) { continue; }
+    const std::string_view name =
+        trim_sv_(block.substr(nstart, brace - nstart));
+    if (name.empty()) { continue; }
+
+    vpipe::McpToolCall call;
+    call.name = std::string(name);
+    call.arguments_json = "{}";
+    std::size_t p = brace;
+    FlexData args;
+    if (parse_gemma_dsl_value_(block, p, &args) && args.is_object()) {
+      call.arguments_json = args.to_json(false);
+    }
+    calls.push_back(std::move(call));
+  }
+  return calls;
 }
 
 // ---------------------------------------------------------------------
@@ -162,6 +651,65 @@ public:
   }
 
   std::string_view family_name() const override { return "chatml"; }
+
+  // ---- Tool / function calling (Hermes/Qwen scheme) ----------------
+  bool supports_tools() const noexcept override { return true; }
+
+  bool
+  render_tools_system_turn(std::string_view              tools_json,
+                           bool                          /*is_first_turn*/,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    // ChatML has no session-start token; the tools live in a system
+    // turn placed before the first user turn. The instruction text
+    // mirrors the Qwen tool-use preamble the family was trained on so
+    // the model emits well-formed <tool_call> blocks.
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "system\n", dst);
+    append_text_(_tok,
+        "# Tools\n\nYou may call one or more functions to assist with "
+        "the user query.\n\nYou are provided with function signatures "
+        "within <tools></tools> XML tags:\n<tools>\n", dst);
+    append_text_(_tok, tools_json, dst);
+    append_text_(_tok,
+        "\n</tools>\n\nFor each function call, return a json object "
+        "with function name and arguments within <tool_call></tool_call> "
+        "XML tags:\n<tool_call>\n{\"name\": <function-name>, "
+        "\"arguments\": <args-json-object>}\n</tool_call>", dst);
+    (void)push_sp_(_im_end, dst);
+    append_text_(_tok, "\n", dst);
+    return true;
+  }
+
+  bool
+  render_tool_results_turn(std::span<const std::string>  tool_names,
+                           std::span<const std::string>  results,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    // ChatML keys the result block on <tool_response> wrappers, not the
+    // function name, so the parallel names span is unused here.
+    (void)tool_names;
+    if (results.empty()) {
+      return false;
+    }
+    // Qwen packs every tool result into ONE user turn, each wrapped in
+    // <tool_response>...</tool_response>, then opens the assistant turn
+    // (with the family's assistant extras, e.g. the Qwen3 <think>
+    // preamble) so decoding resumes cleanly.
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "user", dst);
+    for (const auto& r : results) {
+      append_text_(_tok, "\n<tool_response>\n", dst);
+      append_text_(_tok, r, dst);
+      append_text_(_tok, "\n</tool_response>", dst);
+    }
+    (void)push_sp_(_im_end, dst);
+    append_text_(_tok, "\n", dst);
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "assistant\n", dst);
+    append_assistant_extras_(dst);
+    return true;
+  }
 
 protected:
   const Tokenizer& tok_() const noexcept { return _tok; }
@@ -707,7 +1255,11 @@ public:
     , _sot      (sp_(tok, "<|turn>"))
     , _eot      (sp_(tok, "<turn|>"))
     , _eos      (sp_(tok, "<eos>"))
-    , _tool_resp(sp_(tok, "<|tool_response>"))
+    , _tool_open (sp_(tok, "<|tool>"))          // begin tool decl   (46)
+    , _tool_close(sp_(tok, "<tool|>"))          // end tool decl     (47)
+    , _tool_resp(sp_(tok, "<|tool_response>"))  // tool-result open  (50)
+    , _tool_resp_close(sp_(tok, "<tool_response|>"))  // ...close     (51)
+    , _quote    (sp_(tok, "<|\"|>"))            // string-quote tok  (52)
     , _boi      (sp_(tok, "<|image>"))    // begin-of-image  (255999)
     , _img_pad  (sp_(tok, "<|image|>"))   // image soft tok  (258880)
     , _eoi      (sp_(tok, "<image|>"))    // end-of-image    (258882)
@@ -1060,6 +1612,143 @@ public:
     return id == _eos || id == _eot || id == _tool_resp;
   }
 
+  // ---- Tool / function calling (Gemma-4 DSL) -----------------------
+  // Gemma-4 renders tools in its own `<|tool>declaration:...<tool|>` /
+  // `<|tool_call>call:NAME{...}<tool_call|>` /
+  // `<|tool_response>response:NAME{...}<tool_response|>` DSL (see the
+  // checkpoint's chat_template.jinja), gated on the DSL tokens being in
+  // the vocab.
+  bool supports_tools() const noexcept override
+  {
+    return _tool_open >= 0 && _tool_close >= 0 && _tool_resp >= 0
+        && _tool_resp_close >= 0 && _quote >= 0;
+  }
+
+  std::string_view tool_call_open_marker() const noexcept override
+  {
+    return "<|tool_call>";
+  }
+
+  // The model requests a tool result by emitting `<|tool_response>`
+  // (id 50, a stop token) right after its tool call; the turn is NOT
+  // closed -- it resumes in place once the caller injects the results.
+  bool stop_token_continues_turn(std::int32_t id) const noexcept override
+  {
+    return id >= 0 && id == _tool_resp;
+  }
+
+  std::vector<vpipe::McpToolCall>
+  parse_tool_calls(const std::string& assistant_text) const override
+  {
+    return parse_gemma_tool_calls_(assistant_text);
+  }
+
+  // Leading system turn advertising the callable tools:
+  //   <bos>(first)<|turn>system\n [<|think|>\n if reasoning-on]
+  //     <|tool>declaration:...<tool|> (one per tool)
+  //   <turn|>\n
+  // The tools_json is one Hermes function-spec object per line
+  // (McpToolRegistry::tools_json()); each is re-rendered into Gemma's
+  // declaration DSL. When reasoning is ON we arm the thought channel in
+  // the SAME system turn as the tools (mirroring the Jinja, which merges
+  // the two); when OFF the model-open still prefills the empty thought.
+  bool
+  render_tools_system_turn(std::string_view              tools_json,
+                           bool                          is_first_turn,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    if (!supports_tools() || _sot < 0 || _eot < 0) {
+      return false;
+    }
+    GemmaEmit e{_tok, dst, {}};
+    if (is_first_turn) {
+      e.sp(_bos);
+    }
+    e.sp(_sot);
+    e.text("system\n");
+    if (_thinking_variant && _thinking_on && _think >= 0) {
+      e.sp(_think);
+      e.text("\n");
+    }
+    std::size_t pos = 0;
+    while (pos < tools_json.size()) {
+      const std::size_t nl = tools_json.find('\n', pos);
+      const std::string_view line = tools_json.substr(
+          pos, nl == std::string_view::npos ? std::string_view::npos
+                                            : nl - pos);
+      pos = (nl == std::string_view::npos) ? tools_json.size() : nl + 1;
+      if (trim_sv_(line).empty()) {
+        continue;
+      }
+      FlexData tool;
+      try {
+        tool = FlexData::from_json(line);
+      } catch (const std::exception&) {
+        continue;
+      }
+      gemma_render_declaration_(e, _quote, _tool_open, _tool_close, tool);
+    }
+    e.sp(_eot);
+    e.text("\n");
+    e.flush();
+    return true;
+  }
+
+  // Tool-results turn. Gemma keeps the whole call/result/answer exchange
+  // in ONE model turn: the model stopped on `<|tool_response>` (which is
+  // NOT committed to the K/V cache), so we re-emit that opener and append
+  // one `response:NAME{...}<tool_response|>` block per result, then let
+  // decoding continue in place (NO new `<|turn>model`). A result that is
+  // a JSON object renders as a native `{key:value,...}` mapping; anything
+  // else falls back to `{value:<|"|>...<|"|>}`.
+  bool
+  render_tool_results_turn(std::span<const std::string>  tool_names,
+                           std::span<const std::string>  results,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    if (results.empty() || !supports_tools()) {
+      return false;
+    }
+    GemmaEmit e{_tok, dst, {}};
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      const std::string_view name =
+          i < tool_names.size() ? std::string_view(tool_names[i])
+                                : std::string_view();
+      e.sp(_tool_resp);
+      e.text("response:");
+      e.text(name);
+      e.text("{");
+      FlexData parsed;
+      bool is_obj = false;
+      try {
+        parsed = FlexData::from_json(results[i]);
+        is_obj = parsed.is_object();
+      } catch (const std::exception&) {
+      }
+      if (is_obj) {
+        const std::vector<std::string> keys = sorted_keys_(parsed);
+        auto o = parsed.as_object();
+        bool first = true;
+        for (const auto& k : keys) {
+          if (!first) { e.text(","); }
+          first = false;
+          e.text(k);
+          e.text(":");
+          gemma_format_argument_(e, _quote, o.at(k),
+                                 /*escape_keys=*/false);
+        }
+      } else {
+        e.text("value:");
+        FlexData sv = FlexData::make_string(results[i]);
+        gemma_format_argument_(e, _quote, sv, /*escape_keys=*/false);
+      }
+      e.text("}");
+      e.sp(_tool_resp_close);
+    }
+    e.flush();
+    return true;
+  }
+
   // Strip the reasoning channel from a decoded turn, mirroring the
   // checkpoint's own `strip_thinking` jinja macro: split on the
   // channel-close marker; for each segment drop everything from a
@@ -1117,7 +1806,11 @@ private:
   const std::int32_t _sot;
   const std::int32_t _eot;
   const std::int32_t _eos;
-  const std::int32_t _tool_resp;
+  const std::int32_t _tool_open;       // <|tool> (46)
+  const std::int32_t _tool_close;      // <tool|> (47)
+  const std::int32_t _tool_resp;       // <|tool_response> (50)
+  const std::int32_t _tool_resp_close; // <tool_response|> (51)
+  const std::int32_t _quote;           // <|"|> (52)
   const std::int32_t _boi;
   const std::int32_t _img_pad;
   const std::int32_t _eoi;

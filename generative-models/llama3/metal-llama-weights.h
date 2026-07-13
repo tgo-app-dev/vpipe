@@ -79,6 +79,21 @@ public:
   metal_compute::SharedBuffer load(
       const std::string& name, metal_compute::MetalCompute* mc) const;
 
+  // Zero-copy variant: return a READ-ONLY SharedBuffer that is a view into
+  // the mmapped shard (newBufferWithBytesNoCopy over the whole shard, then a
+  // subview at the tensor's offset) -- NO memcpy, so the tensor stays on clean
+  // file-backed pages the OS reclaims under pressure and re-faults from disk.
+  //
+  // The returned buffer MUST be treated as read-only (the mapping is PROT_READ)
+  // and is valid only while THIS MetalLlamaWeights stays alive (it owns the
+  // mmap) -- so callers that use it must retain the weights for the model's
+  // lifetime. Falls back to a copying load() (allocating an owned buffer) for
+  // GGUF-backed tensors, when the no-copy wrap fails, or when the tensor's file
+  // offset is not GPU-bindable (misaligned / out of range) -- so the result is
+  // always correct, just not always zero-copy. Empty if the tensor is missing.
+  metal_compute::SharedBuffer load_mapped(
+      const std::string& name, metal_compute::MetalCompute* mc) const;
+
 private:
   MetalLlamaWeights() = default;
 
@@ -98,6 +113,12 @@ private:
   bool map_shard_(const std::string& safetensors_path);
 
   std::vector<Shard>                          _shards;
+  // Lazily-created whole-shard newBufferWithBytesNoCopy wrappers, one per
+  // _shards entry (empty until load_mapped() first wraps that shard). Declared
+  // after _shards so it is destroyed FIRST -- the MTL buffers release before
+  // ~MetalLlamaWeights munmaps the pages they reference. `mutable`: the wraps
+  // are a lazy cache built by the const load_mapped().
+  mutable std::vector<metal_compute::SharedBuffer> _shard_maps;
   std::unordered_map<std::string, TensorInfo> _tensors;
   // Non-null when this checkpoint was loaded from a `.gguf`; owns the
   // GgufFile + converter and backs the shard==-2 tensors in load().

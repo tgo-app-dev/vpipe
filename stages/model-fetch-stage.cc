@@ -75,38 +75,52 @@ human_bytes_(uint64_t n)
 
 // ---- interactive selection --------------------------------------------
 
-// Prompt the user to pick one of `options` by index; the chosen string
-// is returned via `out`. Auto-selects when there is exactly one option.
-// Returns false on Eof / Canceled.
-bool
+// Outcome of one interactive level pick.
+enum class SelectResult {
+  Ok,       // a concrete option was chosen (returned in `out`)
+  Auto,     // a single option was auto-selected (in `out`); no prompt shown
+  Back,     // the user asked to step back to the previous level
+  Aborted,  // input closed / canceled
+};
+
+// Prompt the user to pick one of `options` by index; the chosen string is
+// returned via `out`. Auto-selects (-> Auto) when there is exactly one
+// option. When `allow_back` is set the user may enter 'b' to step back a
+// level (-> Back). Returns Aborted on Eof / Canceled.
+SelectResult
 select_from_(const SessionContextIntf* s, const string& title,
              const vector<string>& options,
-             const function<bool()>& cancel, string& out)
+             const function<bool()>& cancel, bool allow_back, string& out)
 {
   if (options.empty()) {
-    return false;
+    return SelectResult::Aborted;
   }
   if (options.size() == 1) {
     out = options[0];
     s->info(fmt("{}: {}", title, out));
-    return true;
+    return SelectResult::Auto;
   }
+  const VpipeFormat prompt = allow_back
+      ? fmt("Select [0-{}] (b=back): ", options.size() - 1)
+      : fmt("Select [0-{}]: ", options.size() - 1);
   for (;;) {
     s->info(fmt("{}", title));
     for (size_t i = 0; i < options.size(); ++i) {
       s->info(fmt("  [{}] {}", i, options[i]));
     }
     string line;
-    if (s->getline(fmt("Select [0-{}]: ", options.size() - 1), line,
-                   cancel) != UiInputStatus::Ok) {
-      return false;
+    if (s->getline(prompt, line, cancel) != UiInputStatus::Ok) {
+      return SelectResult::Aborted;
     }
     trim_(line);
+    if (allow_back && (line == "b" || line == "B")) {
+      return SelectResult::Back;
+    }
     try {
       size_t idx = static_cast<size_t>(std::stoul(line));
       if (idx < options.size()) {
         out = options[idx];
-        return true;
+        return SelectResult::Ok;
       }
     } catch (...) {
     }
@@ -425,17 +439,36 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "per-file network timeout (large shards need headroom)",
    .def_uint = 1800},
 };
+// One trigger iport (optional, any beat type) + one summary oport shared
+// by all four "preparation" stages so they can be cascaded into a recipe
+// (each stage's summary triggers the next) and/or dumped to a save-text
+// report. See the ports doc below.
+const PortSpec kIports[] = {
+  {.name = "trigger",
+   .doc  = "optional pacing trigger (any beat type); when wired, the work "
+           "waits for one beat before running -- lets these preparation "
+           "stages cascade into a recipe",
+   .type = nullptr, .clock_group = 0},
+};
+const PortSpec kOports[] = {
+  {.name = "summary",
+   .doc  = "FlexData summary of the completed work; its `text` field "
+           "renders a report via save-text, and the beat also triggers "
+           "the next stage in a recipe",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+};
 const StageSpec kSpec = {
   .type_name = "model-fetch",
   .doc       = "Interactive one-shot: identify a model (browse the "
                "internal HuggingFace catalogue or type a path), download "
                "it under a base path, synthesize the Qwen3-ASR "
                "tokenizer.json natively, and register it in LMDB sub-db "
-               "'models' keyed by the huggingface.co path. 0 in / 0 out.",
+               "'models' keyed by the huggingface.co path. Optional "
+               "trigger in / summary out.",
   .display_name = "Model Fetch",
   .category  = StageCategory::Preparation,
-  .iports    = {},
-  .oports    = {},
+  .iports    = kIports,
+  .oports    = kOports,
   .attrs     = kAttrs,
 };
 }  // namespace
@@ -455,6 +488,17 @@ ModelFetchStage::process(RuntimeContext& ctx)
     return ctx.stop_requested();
   };
   const SessionContextIntf* s = session();
+
+  // Optional trigger: when the iport is wired, wait for one beat before
+  // starting so this stage can cascade in a preparation recipe. Any beat
+  // type works (payload ignored); upstream EOS -> nothing to do.
+  if (ctx.iport_connected(0)) {
+    auto trig = co_await ctx.read(0);
+    if (!trig) {
+      ctx.signal_done();
+      co_return;
+    }
+  }
 
   // -------- 1. Identify the model --------------------------------------
   // Precedence: configured model_path > direct entry > catalogue browse.
@@ -483,18 +527,49 @@ ModelFetchStage::process(RuntimeContext& ctx)
                      "owner/repo", this->id(), direct));
       }
     } else {
-      // Catalogue drill-down: family -> version -> param -> variant.
+      // Catalogue drill-down: family -> version -> param -> variant. At
+      // any prompt the user may enter 'b' to step back to the previous
+      // level. `dir` remembers whether we reached the current level going
+      // forward (+1) or backward (-1) so an auto-selected (single-option)
+      // level stays transparent to back-navigation instead of trapping it.
       string family, version, param, variant;
-      if (!select_from_(s, "Model family", catalog_families(), cancel,
-                        family)
-          || !select_from_(s, "Version", catalog_versions(family), cancel,
-                           version)
-          || !select_from_(s, "Parameter class",
-                           catalog_param_classes(family, version), cancel,
-                           param)
-          || !select_from_(s, "Variant",
-                           catalog_variants(family, version, param),
-                           cancel, variant)) {
+      bool aborted = false;
+      for (int level = 0, dir = 1; level < 4; ) {
+        string title;
+        vector<string> opts;
+        string* out = nullptr;
+        switch (level) {
+          case 0:
+            title = "Model family"; opts = catalog_families();
+            out = &family; break;
+          case 1:
+            title = "Version"; opts = catalog_versions(family);
+            out = &version; break;
+          case 2:
+            title = "Parameter class";
+            opts = catalog_param_classes(family, version);
+            out = &param; break;
+          default:
+            title = "Variant";
+            opts = catalog_variants(family, version, param);
+            out = &variant; break;
+        }
+        switch (select_from_(s, title, opts, cancel, level > 0, *out)) {
+          case SelectResult::Ok:
+            dir = 1; ++level; break;
+          case SelectResult::Auto:
+            // A forced single-option level: keep moving the way we came,
+            // bouncing forward if there is nothing before level 0.
+            if (dir < 0 && level == 0) { dir = 1; }
+            level += dir; break;
+          case SelectResult::Back:
+            dir = -1; --level; break;
+          case SelectResult::Aborted:
+            aborted = true; break;
+        }
+        if (aborted) { break; }
+      }
+      if (aborted) {
         s->error(fmt("ModelFetchStage('{}'): selection aborted",
                      this->id()));
       }
@@ -549,6 +624,17 @@ ModelFetchStage::process(RuntimeContext& ctx)
           "ModelFetchStage('{}'): '{}' already registered; set "
           "overwrite_existing=true to refresh. Done.",
           this->id(), reg_key));
+      if (ctx.has_consumers(0)) {
+        FlexData sum = FlexData::make_object();
+        auto so = sum.as_object();
+        so.insert_or_assign("stage", FlexData::make_string("model-fetch"));
+        so.insert_or_assign("hf_path", FlexData::make_string(hf_path));
+        so.insert_or_assign("already_present", FlexData::make_bool(true));
+        so.insert_or_assign("text", FlexData::make_string(
+            fmt("[model-fetch] {} already present (skipped)", hf_path)()));
+        co_await ctx.write(0,
+            make_payload<FlexDataPayload>(std::move(sum)));
+      }
       ctx.signal_done();
       co_return;
     }
@@ -609,6 +695,14 @@ ModelFetchStage::process(RuntimeContext& ctx)
     s->info(fmt(
         "ModelFetchStage('{}'): dataset '{}' ({}) registered in sub-db '{}'",
         this->id(), reg_key, human_bytes_(total), _db_name));
+    ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
+    ro.insert_or_assign("text", FlexData::make_string(
+        fmt("[model-fetch] dataset {}\n  -> {}\n  {} file(s), {} bytes",
+            reg_key, local_dir.string(),
+            entry->dataset_files.size(), total)()));
+    if (ctx.has_consumers(0)) {
+      co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(rec)));
+    }
     ctx.signal_done();
     co_return;
   }
@@ -857,6 +951,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
 
   s->info(fmt("ModelFetchStage('{}'): registered '{}' in sub-db '{}'",
               this->id(), reg_key, _db_name));
+  ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
+  ro.insert_or_assign("text", FlexData::make_string(
+      fmt("[model-fetch] {}\n  -> {}\n  {} file(s), {} bytes",
+          hf_path, local_path_str, files.size(), total_bytes)()));
+  if (ctx.has_consumers(0)) {
+    co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(rec)));
+  }
   ctx.signal_done();
   co_return;
 }

@@ -112,6 +112,13 @@ inline constexpr std::uint32_t kGvidLlmAudio    = kPerfAuxGvidBase + 3u;
 // Distinct from kGvidLlmAudio (an audio ENCODER, waveform->tokens) so a
 // text-to-speech timeline reads "audio-codec", not "audio-encoder".
 inline constexpr std::uint32_t kGvidLlmAudioCodec = kPerfAuxGvidBase + 4u;
+// Diffusion DiT (Krea-2 MMDiT text-to-image). NOT strictly an LLM, but the
+// forward pass is the same GEMM-bound backbone shape, so its events land on
+// the LLM lane for now (to be split into a dedicated lane later).
+//   dit-text-fuse : the text-fusion tower (forward_text), once per image.
+//   dit-denoise   : one MMDiT forward (forward_dit), once per sampler step.
+inline constexpr std::uint32_t kGvidLlmDitText = kPerfAuxGvidBase + 5u;
+inline constexpr std::uint32_t kGvidLlmDit     = kPerfAuxGvidBase + 6u;
 
 // Per-activity begin type ids (end = begin + 1, per the parity
 // convention). Distinct pairs so the begin/end pairing is unambiguous
@@ -121,6 +128,8 @@ inline constexpr std::uint32_t kPerfLlmDecodeBegin  = 2u;
 inline constexpr std::uint32_t kPerfLlmVisionBegin  = 4u;
 inline constexpr std::uint32_t kPerfLlmAudioBegin   = 6u;
 inline constexpr std::uint32_t kPerfLlmAudioCodecBegin = 8u;
+inline constexpr std::uint32_t kPerfLlmDitTextBegin = 10u;
+inline constexpr std::uint32_t kPerfLlmDitBegin     = 12u;
 
 // The LLM-lane synthetic stages, consumed by dump_profiling to emit
 // `stages` entries (id = block label; begin/end named in the dump).
@@ -135,6 +144,8 @@ inline constexpr PerfAuxStageDesc kPerfAuxStages[] = {
   { kGvidLlmVision,  kPerfLlmVisionBegin,  "vision-tower"  },
   { kGvidLlmAudio,   kPerfLlmAudioBegin,   "audio-encoder" },
   { kGvidLlmAudioCodec, kPerfLlmAudioCodecBegin, "audio-codec" },
+  { kGvidLlmDitText, kPerfLlmDitTextBegin, "dit-text-fuse" },
+  { kGvidLlmDit,     kPerfLlmDitBegin,     "dit-denoise"   },
 };
 
 // ANE-lane CoreML predict begin/end (recorded with the real CoreML

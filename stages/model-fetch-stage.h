@@ -21,7 +21,9 @@ namespace vpipe {
 //      the key facts;
 //   5) signal_done and terminate.
 //
-// 0 iports, 0 oports. All prompts route through the session UI delegate
+// 1 optional trigger iport (any beat) + 1 FlexData "summary" oport, so
+// these preparation stages can be cascaded into a recipe and/or dumped to
+// a save-text report. All prompts route through the session UI delegate
 // (stdin by default, or the browser under the web-ui delegate); the
 // optional HuggingFace token prompt uses getpasswd so it is masked.
 class ModelFetchStage final : public TypedStage<ModelFetchStage>

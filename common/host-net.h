@@ -61,6 +61,16 @@ private:
 std::vector<std::string>
 local_ipv4_addresses();
 
+// Best-effort IPv4 address of the primary network interface: prefers
+// en0 (the built-in LAN port on macOS), else the first non-loopback
+// IPv4 that is up. Empty string if none is up -- callers fall back to
+// 127.0.0.1 / 0.0.0.0. Unlike local_ipv4_addresses(), this applies the
+// en0-first preference and returns a single "reachable-from-the-LAN"
+// address, which is what an in-process HTTP server wants to bind to so
+// other devices can connect out of the box.
+std::string
+primary_ipv4();
+
 // Fire one tiny UDP datagram at each candidate (to the discard port
 // 9). Errors are ignored; the only purpose is to make the kernel
 // resolve the dest MAC, populating the ARP cache so a follow-up

@@ -10,6 +10,7 @@
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/model-exec.h"
+#include "generative-models/model-exec-registry.h"
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -84,6 +85,12 @@ struct LoadedLanguageModel::Impl {
   // metal compute dtype is bf16 (else f16). Gates the native-f16
   // zero-copy multimodal splice (only valid when the model is f16).
   bool                              metal_bf16    = false;
+  // Tokens the model must NEVER predict in text output, baked in at load
+  // and always applied (Gemma-4 multimodal end markers <image|>/<audio|>;
+  // the llama.cpp reference masks exactly these to -inf). set_suppressed_
+  // tokens() merges any stage-provided ids ON TOP of this base so a stage
+  // override never drops it.
+  std::vector<std::int32_t>         base_suppress;
   // Active branch count of the in-flight m_bdecode pipelined batch
   // (CONSTANT-N). Captured at m_bdecode_begin so each m_bdecode_next can
   // tag its decode perf event with the per-step token count -- otherwise
@@ -210,6 +217,42 @@ make_metal_qwen_cfg_(const ModelConfig& c)
     m.attn_output_gate = false;     // plain Qwen3 attention (no output gate)
     m.use_bf16         = true;      // ctor overrides per compute_dtype
     m.weight_prefix    = "transformer.";
+    m.model_seg        = "";
+    return m;
+  }
+  // MOSS-TTS-Realtime ("MossTTSRealtime"): the backbone is a dense Qwen3-1.7B
+  // text LM under "language_model.". It has no trained text head, but its input
+  // text embedding (embed_tokens[0]) is byte-identical to
+  // language_model.embed_tokens, so a head TIED to that emits full [vocab]
+  // logits -- enough for A/B divergence (e.g. 8-bit vs bf16 quant error).
+  // Absolute perplexity is meaningless (the model does not predict text). The
+  // shape comes from language_config (parsed into the dense fields).
+  if (c.architecture == "MossTTSRealtime") {
+    MetalQwenModel::Config m;
+    m.n_layers   = c.n_layers;
+    m.hidden     = c.hidden;
+    m.n_heads    = c.n_heads;
+    m.n_kv_heads = c.n_kv_heads;
+    m.head_dim   = c.head_dim > 0 ? c.head_dim
+                 : (c.n_heads > 0 ? c.hidden / c.n_heads : 0);
+    m.ffn_inner  = c.ffn_inner;
+    m.vocab      = c.vocab_size;
+    m.rope_theta = c.rope_theta;
+    m.rms_eps    = c.rms_eps;
+    m.rotary_dim = m.head_dim;
+    m.full_attn_interval = 1;       // every layer is full attention
+    if (c.quantization.bits == 4 || c.quantization.bits == 8) {
+      m.dense      = false;         // model-quantize'd 8-bit affine backbone
+      m.quant_bits = c.quantization.bits;
+    } else {
+      m.dense      = true;          // raw-HF bf16 (unquantized)
+    }
+    m.zero_centered_norm = false;   // plain Qwen3 std RMSNorm (no +1 fold)
+    m.tie_embeddings   = true;      // tied text head -> [vocab] logits
+    m.backbone_only    = false;     // MUST emit the lm_head (logits)
+    m.attn_output_gate = false;     // plain Qwen3 attention (no output gate)
+    m.use_bf16         = true;      // ctor overrides per compute_dtype
+    m.weight_prefix    = "language_model.";
     m.model_seg        = "";
     return m;
   }
@@ -340,9 +383,18 @@ LoadedLanguageModel::LoadedLanguageModel(
         // MOSS-TTS-Local-v1.5: TTS model with a dense Qwen3 TEXT backbone
         // (under "transformer.", tied text head). Loaded as a Qwen text LM
         // so it emits [vocab] text logits for perplexity / text eval.
-        || arch_be == "MossTTSLocalModel";
+        || arch_be == "MossTTSLocalModel"
+        // MOSS-TTS-Realtime: Qwen3-1.7B backbone under "language_model." with a
+        // tied text head (embed_tokens). Loaded as a Qwen text LM so it emits
+        // [vocab] logits. It has NO real text head (predicts audio), so
+        // absolute perplexity is meaningless -- use the A/B divergence mode.
+        || arch_be == "MossTTSRealtime";
     const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
         || arch_be == "Gemma4UnifiedForConditionalGeneration";
+    // A plugin may register a new arch -> ModelExec factory. Consulted
+    // BEFORE the built-in cascade below so a plugin family is selectable
+    // by its config.json `architecture` string.
+    const bool metal_plugin = ModelExecRegistry::get().contains(arch_be);
     // Select the metal backend when explicitly requested
     // (VPIPE_LLM_BACKEND=metal). In a build WITHOUT MLX the metal path is
     // the ONLY LM backend, so default to it when the env var is unset --
@@ -354,7 +406,7 @@ LoadedLanguageModel::LoadedLanguageModel(
         be_env == nullptr || std::string(be_env) == "metal";
     const bool use_metal = backend_wants_metal && mc_be != nullptr &&
         mc_be->valid() && !model_dir.empty() &&
-        (metal_llama || metal_qwen || metal_gemma);
+        (metal_llama || metal_qwen || metal_gemma || metal_plugin);
     if (use_metal) {
       // Bookkeeping-only ctx_mgr (the metal exec owns its own KV).
       ContextManager::Spec s;
@@ -362,7 +414,16 @@ LoadedLanguageModel::LoadedLanguageModel(
       s.max_pages   = max_pages;
       s.n_layers    = 0;
       _impl->ctx_mgr = make_unique<ContextManager>(s, session);
-      if (metal_gemma) {
+      if (metal_plugin) {
+        // A plugin-registered arch builds its own ModelExec (which owns
+        // its KV) from the raw config + runtime knobs.
+        ModelExecCreateArgs a{
+            model_dir, _impl->weights.config, mc_be, session,
+            (std::uint32_t)page_tokens, (std::uint32_t)max_pages,
+            compute_dtype_in == ComputeDtype::BF16};
+        _impl->exec = ModelExecRegistry::get().create(arch_be, a);
+        _impl->metal_bf16 = (compute_dtype_in == ComputeDtype::BF16);
+      } else if (metal_gemma) {
         MetalGemmaModel::Config mcfg =
             MetalGemmaModel::config_from(_impl->weights.config);
         mcfg.page_tokens = page_tokens;
@@ -425,6 +486,25 @@ LoadedLanguageModel::LoadedLanguageModel(
       }
       _impl->metal_backend = true;
       phase_log("metal_model_exec (load + bind, no MLX)");
+      // Gemma-4 text decoders must NEVER emit the multimodal STRUCTURAL
+      // control tokens -- the end-of-image / end-of-audio markers
+      // (<image|>/<audio|>). The QAT-4bit 12B intermittently assigns them
+      // the TOP logit in visually-themed text (e.g. "sketching the memory
+      // <image|>topology"), and the llama.cpp reference masks exactly
+      // these two (attr CONTROL) to -inf. Bake the same mask in as a
+      // PERMANENT base so EVERY consumer (text-chat, which never calls
+      // set_suppressed_tokens) gets it; stage-set suppressions merge on
+      // top (see set_suppressed_tokens). No-op for families/tokenizers
+      // without these tokens (special_token_id -> -1).
+      if (metal_gemma && _impl->tokenizer) {
+        for (const char* t : {"<image|>", "<audio|>"}) {
+          const std::int32_t id = _impl->tokenizer->special_token_id(t);
+          if (id >= 0) { _impl->base_suppress.push_back(id); }
+        }
+        if (!_impl->base_suppress.empty()) {
+          _impl->exec->set_suppressed_tokens(_impl->base_suppress);
+        }
+      }
       // Metal vision tower (Qwen3-VL): host-f32 image embeddings for the
       // metal multimodal splice. No MLX in the forward.
       if (_impl->weights.config.vision.present && metal_qwen) {
@@ -1579,7 +1659,35 @@ LoadedLanguageModel::set_mtp_prefix_seed(bool on)
 void
 LoadedLanguageModel::set_suppressed_tokens(std::span<const std::int32_t> ids)
 {
-  if (_impl && _impl->exec) { _impl->exec->set_suppressed_tokens(ids); }
+  if (!_impl || !_impl->exec) { return; }
+  // Merge the caller's ids ON TOP of the permanent base (Gemma multimodal
+  // end markers) so a stage-set suppression never drops the base mask.
+  if (_impl->base_suppress.empty()) {
+    _impl->exec->set_suppressed_tokens(ids);
+    return;
+  }
+  std::vector<std::int32_t> merged = _impl->base_suppress;
+  for (std::int32_t id : ids) {
+    if (std::find(merged.begin(), merged.end(), id) == merged.end()) {
+      merged.push_back(id);
+    }
+  }
+  _impl->exec->set_suppressed_tokens(
+      std::span<const std::int32_t>(merged.data(), merged.size()));
+}
+
+std::span<const std::int32_t>
+LoadedLanguageModel::base_suppressed_tokens() const noexcept
+{
+  if (!_impl) { return {}; }
+  return std::span<const std::int32_t>(_impl->base_suppress.data(),
+                                       _impl->base_suppress.size());
+}
+
+void
+LoadedLanguageModel::set_i8_prefill(bool on)
+{
+  if (_impl && _impl->exec) { _impl->exec->set_i8_gemm(on); }
 }
 
 bool
