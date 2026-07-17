@@ -10,10 +10,6 @@
 #include <string>
 #include <vector>
 
-namespace CML {
-class PredictionOptions;
-}
-
 namespace vpipe {
 
 class CoreMLLoadedModel;
@@ -172,7 +168,6 @@ private:
 
   // ---- Model handle ----
   std::shared_ptr<CoreMLLoadedModel> _loaded;
-  CML::PredictionOptions*            _opts = nullptr;
 
   // ---- Sliding-window buffer ----
   // Pending mono samples not yet consumed by a window. `_buf[0]`

@@ -1629,6 +1629,11 @@ public:
     return "<|tool_call>";
   }
 
+  std::string_view tool_call_close_marker() const noexcept override
+  {
+    return "<tool_call|>";
+  }
+
   // The model requests a tool result by emitting `<|tool_response>`
   // (id 50, a stop token) right after its tool call; the turn is NOT
   // closed -- it resumes in place once the caller injects the results.

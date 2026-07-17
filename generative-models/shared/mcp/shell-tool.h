@@ -22,6 +22,12 @@ struct ShellToolOptions {
   // Extra writable roots (e.g. the session --white-list-path grants).
   std::vector<std::filesystem::path> extra_writable;
   bool        allow_network    = false;      // seatbelt denies net by default
+  // Allow the per-user system temp as a writable root + $TMPDIR (default
+  // false confines all temp under the workspace/CWD). See
+  // CommandSandboxSpec::allow_system_temp: enable so tools that hardcode the
+  // system temp (e.g. the macOS `mktemp` CLI) work, at the cost of temp files
+  // landing outside the launch CWD.
+  bool        allow_system_temp = false;
   // Optional program whitelist (kernel-enforced); empty => any program.
   std::vector<std::string>           exec_allow;
 
@@ -30,7 +36,8 @@ struct ShellToolOptions {
   long        cpu_seconds      = 10;
   long        address_space_mb = 2048;
   long        file_size_mb     = 64;
-  long        max_procs        = 64;
+  // No process-count cap: RLIMIT_NPROC is per real-UID system-wide, not per
+  // command, so it would break any command that forks an external program.
 };
 
 // Build the MCP `run_shell` tool backed by run_shell_command(). The handler

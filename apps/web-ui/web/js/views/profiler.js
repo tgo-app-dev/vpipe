@@ -196,7 +196,9 @@ export function mountProfiler(container) {
   clear(container);
 
   const S = {
-    lanes: [],            // [{label, dropped, capacity, items:[block|point]}]
+    lanes: [],            // visible lanes (allLanes filtered by hideWorkers)
+    allLanes: [],         // every lane from the last ingest (unfiltered)
+    hideWorkers: false,   // show only the aux LLM / ANE lanes (save space)
     stages: {},           // gvid -> {id, type, pipeline, names:{type->name}}
     gvidColor: {},        // gvid -> css color
     anchorRealtime: 0,
@@ -225,6 +227,18 @@ export function mountProfiler(container) {
     title: t('prof.reset_title') }, t('common.reset'));
   const statusEl = el('span', { class: 'prof-status' }, '—');
 
+  // Hide the worker / overflow lanes, keeping only the aux LLM / ANE
+  // activity lanes -- saves vertical space when those are all that matters.
+  // Sticky across re-mounts (like the inspector height below).
+  const HIDE_WK_KEY = 'vpipe_profiler_hide_workers';
+  try { S.hideWorkers = localStorage.getItem(HIDE_WK_KEY) === '1'; }
+  catch (e) { /* storage unavailable */ }
+  const hideWorkersCb = el('input', { type: 'checkbox' });
+  hideWorkersCb.checked = S.hideWorkers;
+  const hideWorkersLabel = el('label', { class: 'prof-check',
+    title: t('prof.hide_workers_title') },
+    hideWorkersCb, el('span', {}, t('prof.hide_workers')));
+
   const head = el('div', { class: 'prof-head' },
     el('span', { class: 'title' }, t('nav.profiler')),
     el('span', { class: 'prof-sep' }),
@@ -232,7 +246,7 @@ export function mountProfiler(container) {
       maxInput),
     startBtn, stopBtn,
     el('span', { class: 'grow' }),
-    refreshBtn, fitBtn, resetBtn, statusEl);
+    hideWorkersLabel, refreshBtn, fitBtn, resetBtn, statusEl);
 
   const canvas = el('canvas', { class: 'prof-canvas' });
   const timeline = el('div', { class: 'prof-timeline' }, canvas);
@@ -605,6 +619,14 @@ export function mountProfiler(container) {
   }
 
   // ---- data load ---------------------------------------------------
+  // Derive the visible lanes from the full set: hide-workers on keeps only
+  // the aux LLM / ANE lanes (backend-labeled); off shows every lane.
+  function applyLaneFilter() {
+    S.lanes = S.hideWorkers
+        ? S.allLanes.filter((l) => l.aux)
+        : S.allLanes;
+  }
+
   function ingest(doc) {
     S.anchorRealtime = doc.anchor_realtime_ns || 0;
     const stages = {};
@@ -660,7 +682,8 @@ export function mountProfiler(container) {
     // Array.sort is stable, so order within each group is preserved.
     lanes.sort((a, b) => (a.aux === b.aux) ? 0 : (a.aux ? -1 : 1));
     S.gvidColor = colors;
-    S.lanes = lanes;
+    S.allLanes = lanes;
+    applyLaneFilter();       // sets S.lanes (respects the hide-workers toggle)
     S.totalEvents = total;
     S.totalDropped = dropped;
     if (total === 0) { minNs = 0; maxNs = 1; }
@@ -756,6 +779,17 @@ export function mountProfiler(container) {
 
   refreshBtn.addEventListener('click', () => loadData().then(loadStatus));
   fitBtn.addEventListener('click', () => fit());
+
+  hideWorkersCb.addEventListener('change', () => {
+    S.hideWorkers = hideWorkersCb.checked;
+    try { localStorage.setItem(HIDE_WK_KEY, S.hideWorkers ? '1' : '0'); }
+    catch (e) { /* storage unavailable */ }
+    S.selected = null;      // a laneIdx would be stale after re-filtering
+    applyLaneFilter();
+    layout();               // fewer lanes -> taller lanes (more room)
+    render();
+    renderInspector();
+  });
 
   // Reset: drop the captured events (the retained snapshot, and the
   // live buffers if still capturing) and clear the view to a clean

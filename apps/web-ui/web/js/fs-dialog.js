@@ -5,6 +5,11 @@
 // ARE host paths. The dialog is path-namespace agnostic -- it just walks
 // whatever `path` / `parent` the server hands back.
 //
+// The directory listing itself (paging + virtualization + loading) is the
+// shared createFsList component (fs-list.js), so the dialog gets the same
+// large-directory handling as the file-browser view; extension filters are
+// applied server-side (via the component's exts) so paging stays correct.
+//
 //   openFsDialog({
 //     mode: 'open' | 'save',        // save adds a filename field
 //     kind: 'file' | 'dir',         // dir picks the browsed directory
@@ -18,8 +23,9 @@
 
 import { el, clear, openModal, toast } from './dom.js';
 import { makeIcon } from './icons.js';
-import { api } from './api.js';
 import { t } from './i18n.js';
+import { api } from './api.js';
+import { createFsList, joinPath } from './fs-list.js';
 
 // Category -> extension set. Kept in sync with the backend `path_filter`
 // keywords a stage may declare (stage-config.h). Lower-case, dot-led.
@@ -52,33 +58,6 @@ export function splitPath(p) {
   return { dir: s.slice(0, i) || '/', name: s.slice(i + 1) };
 }
 
-// Truncate a long string in the MIDDLE (keep head + tail). Used for a
-// mount's real host path so it keeps BOTH its leading "/" and its
-// meaningful tail. Plain LTR text -- bidi-safe, unlike the CSS
-// direction:rtl left-ellipsis it replaces (which dropped the leading "/").
-function truncateMiddle(s, max) {
-  s = String(s || '');
-  if (s.length <= max) { return s; }
-  const head = Math.ceil((max - 1) * 0.4);
-  const tail = max - 1 - head;
-  return s.slice(0, head) + '…' + s.slice(s.length - tail);
-}
-
-function humanSize(n) {
-  if (!(n > 0)) { return '0 B'; }
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0, v = n;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return (i === 0 ? v : v.toFixed(v < 10 ? 1 : 0)) + ' ' + u[i];
-}
-
-// Join a directory with a child name in the server's forward-slash
-// namespace (works for both the virtual "/" root and native paths).
-function joinPath(dir, name) {
-  if (!dir || dir === '/') { return '/' + name; }
-  return dir.replace(/[\/\\]+$/, '') + '/' + name;
-}
-
 export function openFsDialog(opts = {}) {
   const mode = opts.mode === 'save' ? 'save' : 'open';
   const kind = opts.kind === 'dir' ? 'dir' : 'file';
@@ -88,30 +67,69 @@ export function openFsDialog(opts = {}) {
 
   // ---- state --------------------------------------------------------
   let cur = '';               // current directory (server-echoed)
+  let parent = '';
   let sandboxed = false;
-  let data = { entries: [], parent: '' };
-  const selected = new Set();  // selected file names (relative to cur)
+  let selCount = 0;
   let filterIdx = filters.length ? 0 : -1;   // -1 == all files
   let close = () => {};
+  // True while a nested prompt/confirm (New folder, Overwrite?) is
+  // stacked on top. It neutralizes THIS dialog's Enter/Escape so the
+  // keys act on the overlay alone (both share document-level handlers).
+  let overlayOpen = false;
+
+  const activeExts = () =>
+    (filterIdx >= 0 && filters[filterIdx]) ? filters[filterIdx].exts : [];
 
   // ---- DOM ----------------------------------------------------------
   const upBtn = el('button', { class: 'btn ghost mini', type: 'button',
     title: t('fs.up') }, makeIcon('levelup', 'sm'));
   const refreshBtn = el('button', { class: 'btn ghost mini', type: 'button',
     title: t('fs.refresh') }, makeIcon('refresh', 'sm'));
+  // "New folder" -- only where creating one is meaningful: a save
+  // dialog or an explicit destination-folder pick (not open+file).
+  const canMkdir = mode === 'save' || kind === 'dir';
+  const mkdirBtn = canMkdir
+    ? el('button', { class: 'btn ghost mini fs-mkdir', type: 'button',
+        title: t('fs.new_folder') }, makeIcon('folder', 'sm'),
+        el('span', { class: 'fs-mk-lbl' }, t('fs.new_folder')))
+    : null;
   const pathIn = el('input', { type: 'text', class: 'fs-path',
     autocomplete: 'off', spellcheck: 'false' });
-  // Hourglass shown while the backend enumerates the directory (a big
-  // folder can take a moment); hidden otherwise.
+  // Hourglass shown while the backend enumerates a directory (a big folder,
+  // or a lazily-loaded page while scrolling). Driven by the list's onLoading.
   const busyEl = el('span', { class: 'fs-busy' }, makeIcon('hourglass', 'sm'));
   busyEl.hidden = true;
-  const bar = el('div', { class: 'fs-bar' }, upBtn, refreshBtn, pathIn,
-    busyEl);
-
-  const listEl = el('div', { class: 'fs-list' });
+  const bar = el('div', { class: 'fs-bar' }, upBtn, refreshBtn, mkdirBtn,
+    pathIn, busyEl);
 
   const nameIn = el('input', { type: 'text', class: 'fs-name',
     placeholder: t('fs.filename'), value: opts.defaultName || '' });
+
+  // ---- shared virtualized/paged list --------------------------------
+  const list = createFsList({
+    multi,
+    selectableDirs: false,     // the dialog never "selects" a directory
+    dirClickOpens: true,       // single click on a directory navigates in
+    exts: activeExts(),
+    onDirOpen: (e) => navigate(joinPath(cur, e.name)),
+    onFileActivate: (e) => {
+      // Double-click a file = confirm it directly.
+      if (mode === 'save') { nameIn.value = e.name; tryConfirm(); return; }
+      if (kind === 'dir') { commit(cur); return; }
+      commit(multi ? [joinPath(cur, e.name)] : joinPath(cur, e.name));
+    },
+    onSelect: (names, entries) => {
+      selCount = names.length;
+      if (mode === 'save' && entries.length === 1 && !entries[0].dir) {
+        nameIn.value = entries[0].name;
+      }
+      renderStatus();
+    },
+    onMount: (m) => navigate(m.path),
+    onLoading: (b) => { busyEl.hidden = !b; },
+  });
+  const listBox = el('div', { class: 'fs-list' }, list.el);
+
   let filterSel = null;
   if (filters.length) {
     filterSel = el('select', { class: 'fs-filter' });
@@ -121,7 +139,7 @@ export function openFsDialog(opts = {}) {
     filterSel.value = String(filterIdx);
     filterSel.addEventListener('change', () => {
       filterIdx = parseInt(filterSel.value, 10);
-      renderList();
+      list.setExts(activeExts());   // reloads the current dir server-filtered
     });
   }
   const footRow = el('div', { class: 'fs-foot-row' });
@@ -132,33 +150,100 @@ export function openFsDialog(opts = {}) {
   if (filterSel) { footRow.append(filterSel); }
 
   const statusEl = el('div', { class: 'fs-status' });
-  const body = el('div', { class: 'fs-dialog' }, bar, listEl,
+  const body = el('div', { class: 'fs-dialog' }, bar, listBox,
     footRow, statusEl);
 
   // ---- helpers ------------------------------------------------------
-  function matchFilter(name) {
-    if (filterIdx < 0 || !filters[filterIdx]) { return true; }
-    const lc = name.toLowerCase();
-    return filters[filterIdx].exts.some((e) => lc.endsWith(e));
-  }
-
   function commit(result) { onPick(result); close(); }
 
-  function tryConfirm() {
+  async function tryConfirm() {
+    if (overlayOpen) { return; }   // a prompt/confirm owns the keyboard
     if (kind === 'dir') { commit(cur); return; }
     if (mode === 'save') {
       const nm = nameIn.value.trim();
       if (!nm) { toast(t('fs.name_required'), 'error'); return; }
+      // Confirm before clobbering an existing file of the same name. The
+      // in-view list is paged (may not hold every entry), so ask the
+      // server for the whole listing of `cur` -- omitting offset/limit
+      // returns it un-windowed. A same-named directory is left for the
+      // backend/stage to reject; if the probe fails we don't block saving.
+      let clash = false;
+      try {
+        const all = await api.fsList(cur);
+        clash = (all.entries || []).some((e) => !e.dir && e.name === nm);
+      } catch (e) { /* can't tell -- fall through and let the save proceed */ }
+      if (clash) {
+        openConfirm({
+          title: t('fs.overwrite_title'),
+          message: t('fs.overwrite_msg', { name: nm }),
+          confirmLabel: t('common.overwrite'),
+          onOk: () => commit(joinPath(cur, nm)),
+        });
+        return;
+      }
       commit(joinPath(cur, nm));
       return;
     }
     // open + file
-    if (selected.size === 0) {
+    const names = list.getSelectionNames();
+    if (names.length === 0) {
       toast(t('fs.select_required'), 'error');
       return;
     }
-    const picks = [...selected].map((n) => joinPath(cur, n));
+    const picks = names.map((n) => joinPath(cur, n));
     commit(multi ? picks : picks[0]);
+  }
+
+  // A single-line text prompt stacked over the dialog (New folder).
+  // `onOk(value, closePrompt)` performs the action and closes the prompt
+  // itself on success, so a failed create can keep it open.
+  function openPrompt({ title, label, confirmLabel, onOk }) {
+    overlayOpen = true;
+    const input = el('input', { type: 'text', class: 'fs-name',
+      autocomplete: 'off', spellcheck: 'false' });
+    const pbody = el('div', { class: 'fs-prompt' },
+      el('label', { class: 'fs-name-lbl' }, label), input);
+    const done = (c) => { overlayOpen = false; c(); };
+    openModal({
+      title, className: 'fs-prompt-modal', body: pbody,
+      actions: [
+        { label: t('common.cancel'), cancel: true, onClick: (c) => done(c) },
+        { label: confirmLabel, kind: 'primary', onClick: (c) => {
+            const v = input.value.trim();
+            if (!v) { return; }
+            onOk(v, () => done(c));
+          } },
+      ],
+    });
+    setTimeout(() => input.focus(), 0);
+  }
+
+  // A yes/no confirmation stacked over the dialog (Overwrite?). Same
+  // overlayOpen guard as openPrompt.
+  function openConfirm({ title, message, confirmLabel, onOk }) {
+    overlayOpen = true;
+    const done = (c) => { overlayOpen = false; c(); };
+    openModal({
+      title, className: 'fs-confirm-modal',
+      body: el('div', { class: 'fs-confirm' }, message),
+      actions: [
+        { label: t('common.cancel'), cancel: true, onClick: (c) => done(c) },
+        { label: confirmLabel, kind: 'primary',
+          onClick: (c) => { done(c); onOk(); } },
+      ],
+    });
+  }
+
+  // Create `name` under the current directory, then step into it (or the
+  // already-present folder) so the user can save there straight away.
+  async function doMkdir(name, closePrompt) {
+    try {
+      const res = await api.fsMkdir(cur, name);
+      closePrompt();
+      navigate(res && res.path ? res.path : joinPath(cur, name));
+    } catch (e) {
+      toast(t('fs.mkdir_failed', { msg: e.message }), 'error');
+    }
   }
 
   function renderStatus() {
@@ -166,90 +251,43 @@ export function openFsDialog(opts = {}) {
     statusEl.append(sandboxed
       ? el('span', { class: 'fs-badge' }, t('fs.sandboxed'))
       : el('span', { class: 'fs-badge native' }, t('fs.native')));
-    if (multi && selected.size) {
+    if (multi && selCount) {
       statusEl.append(el('span', { class: 'fs-count' },
-        t('fs.n_selected', { n: selected.size })));
+        t('fs.n_selected', { n: selCount })));
     }
-  }
-
-  function renderList() {
-    clear(listEl);
-    upBtn.disabled = !data.parent;
-    // Granted pass-through "mounts" (--white-list-path) pinned on top so
-    // they're reachable from anywhere in the sandbox tree.
-    const mounts = data.mounts || [];
-    for (const m of mounts) {
-      const row = el('div', { class: 'fs-row mount', title: m.path },
-        makeIcon('folder', 'sm'),
-        el('span', { class: 'fs-nm' }, m.name),
-        el('span', { class: 'fs-mount-path' }, truncateMiddle(m.path, 42)));
-      row.addEventListener('click', () => navigate(m.path));
-      listEl.append(row);
-    }
-    const entries = data.entries || [];
-    let shown = mounts.length;
-    for (const e of entries) {
-      if (!e.dir && !matchFilter(e.name)) { continue; }
-      shown++;
-      const isSel = !e.dir && selected.has(e.name);
-      const row = el('div',
-        { class: 'fs-row' + (e.dir ? ' dir' : '') + (isSel ? ' sel' : '') },
-        makeIcon(e.dir ? 'folder' : 'file', 'sm'),
-        el('span', { class: 'fs-nm' }, e.name),
-        e.dir ? null
-              : el('span', { class: 'fs-sz' }, humanSize(e.size || 0)));
-      if (e.dir) {
-        row.addEventListener('click', () => navigate(joinPath(cur, e.name)));
-      } else {
-        row.addEventListener('click', () => {
-          if (multi) {
-            if (selected.has(e.name)) { selected.delete(e.name); }
-            else { selected.add(e.name); }
-          } else {
-            selected.clear();
-            selected.add(e.name);
-            if (mode === 'save') { nameIn.value = e.name; }
-          }
-          renderList();
-          renderStatus();
-        });
-        row.addEventListener('dblclick', () => {
-          selected.clear();
-          selected.add(e.name);
-          tryConfirm();
-        });
-      }
-      listEl.append(row);
-    }
-    if (!shown) {
-      listEl.append(el('div', { class: 'fs-empty' }, t('fs.empty')));
-    }
-    renderStatus();
   }
 
   async function navigate(path) {
-    busyEl.hidden = false;          // hourglass on while the backend works
     try {
-      const d = await api.fsList(path);
-      data = d || { entries: [], parent: '' };
-      cur = (d && typeof d.path === 'string') ? d.path : (path || '/');
-      sandboxed = !!(d && d.sandboxed);
-      selected.clear();
+      const info = await list.load(path);
+      if (!info) { return; }          // superseded by a later navigate
+      cur = info.path;
+      parent = info.parent;
+      sandboxed = info.sandboxed;
       pathIn.value = cur;
-      renderList();
-      busyEl.hidden = true;
+      upBtn.disabled = !parent;
+      renderStatus();
     } catch (e) {
       toast(t('fs.list_failed', { msg: e.message }), 'error');
       // Fall back to the session default directory once, so a bad seed
-      // path (e.g. a not-yet-created save dir) still opens. The retry owns
-      // the hourglass from here; only clear it when there's no retry.
+      // path (e.g. a not-yet-created save dir) still opens.
       if (path) { navigate(''); }
-      else { busyEl.hidden = true; }
     }
   }
 
-  // Refresh: re-list the current directory to pick up host-side changes.
   refreshBtn.addEventListener('click', () => navigate(cur));
+
+  if (mkdirBtn) {
+    mkdirBtn.addEventListener('click', () => {
+      if (overlayOpen) { return; }
+      openPrompt({
+        title: t('fs.new_folder'),
+        label: t('fs.folder_name'),
+        confirmLabel: t('common.create'),
+        onOk: (name, closeP) => doMkdir(name, closeP),
+      });
+    });
+  }
 
   // Enter in the path box navigates; keep it from bubbling to the
   // modal's global Enter=confirm handler.
@@ -261,9 +299,7 @@ export function openFsDialog(opts = {}) {
     }
   });
   upBtn.addEventListener('click', () => {
-    if (data.parent || data.parent === '') {
-      if (data.parent) { navigate(data.parent); }
-    }
+    if (parent) { navigate(parent); }
   });
 
   const title = opts.title
@@ -272,15 +308,30 @@ export function openFsDialog(opts = {}) {
   const confirmLabel = mode === 'save' ? t('common.save')
     : kind === 'dir' ? t('fs.select_folder') : t('common.open');
 
-  close = openModal({
+  // list.destroy() (drops the ResizeObserver) must run on EVERY close path
+  // -- confirm, Cancel, Escape, and backdrop click. openModal routes
+  // Escape/backdrop through the cancel action, so destroying there + in the
+  // dialog's own close() (used by commit) covers them all; destroy() is
+  // idempotent so the overlap is harmless.
+  const closeModal = openModal({
     title,
     className: 'fs-modal',
     body,
     actions: [
-      { label: t('common.cancel'), cancel: true, onClick: (c) => c() },
+      // While a nested prompt/confirm is up, swallow this dialog's own
+      // Escape so it dismisses only the overlay -- both share the document
+      // keydown handler, so Escape would otherwise close this dialog too.
+      // Otherwise destroy the list (drops its ResizeObserver) before close.
+      { label: t('common.cancel'), cancel: true,
+        onClick: (c) => {
+          if (overlayOpen) { return; }
+          list.destroy();
+          c();
+        } },
       { label: confirmLabel, kind: 'primary', onClick: () => tryConfirm() },
     ],
   });
+  close = () => { list.destroy(); closeModal(); };
 
   navigate(opts.startDir || '');
   setTimeout(() => { (mode === 'save' ? nameIn : pathIn).focus(); }, 0);

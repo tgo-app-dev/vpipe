@@ -1,5 +1,6 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/buffer-view.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/fence.h"
@@ -39,13 +40,21 @@ static_assert(sizeof(BufferViewWire) == 4 + 4 + 4 * 8 + 4 * 8 + 4,
 
 }  // namespace
 
-ComputeEncoder::ComputeEncoder(MTL::ComputeCommandEncoder* enc) noexcept
-  : _enc(enc)
+ComputeEncoder::ComputeEncoder(MTL::ComputeCommandEncoder* enc,
+                               MTL::CommandBuffer* cb) noexcept
+  : _enc(enc), _cb(cb)
 {
 }
 
 ComputeEncoder::ComputeEncoder(ComputeEncoder&& o) noexcept
-  : _enc(std::exchange(o._enc, nullptr))
+  : _enc(std::exchange(o._enc, nullptr)),
+    _cb(std::exchange(o._cb, nullptr)),
+    _n_dispatch(std::exchange(o._n_dispatch, 0)),
+    _stream(std::exchange(o._stream, nullptr)),
+    _split_every(std::exchange(o._split_every, 0)),
+    _since_split(std::exchange(o._since_split, 0)),
+    _scope_depth(std::exchange(o._scope_depth, 0)),
+    _dt(o._dt)
 {
 }
 
@@ -56,8 +65,59 @@ ComputeEncoder::operator=(ComputeEncoder&& o) noexcept
     return *this;
   }
   end();
-  _enc = std::exchange(o._enc, nullptr);
+  _enc          = std::exchange(o._enc, nullptr);
+  _cb           = std::exchange(o._cb, nullptr);
+  _n_dispatch   = std::exchange(o._n_dispatch, 0);
+  _stream       = std::exchange(o._stream, nullptr);
+  _split_every  = std::exchange(o._split_every, 0);
+  _since_split  = std::exchange(o._since_split, 0);
+  _scope_depth  = std::exchange(o._scope_depth, 0);
+  _dt           = o._dt;
   return *this;
+}
+
+void
+ComputeEncoder::reencode_(DispatchType dt)
+{
+  if (_enc == nullptr || _cb == nullptr) {
+    return;
+  }
+  _enc->endEncoding();
+  _enc->release();
+  _enc = nullptr;
+  NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+  const MTL::DispatchType mtl_dt = dt == DispatchType::Concurrent
+                                       ? MTL::DispatchTypeConcurrent
+                                       : MTL::DispatchTypeSerial;
+  MTL::ComputeCommandEncoder* e = _cb->computeCommandEncoder(mtl_dt);
+  if (e != nullptr) {
+    e->retain();
+  }
+  _enc = e;
+  pool->release();
+}
+
+ComputeEncoder::ConcurrentScope::ConcurrentScope(ComputeEncoder* e,
+                                                 bool active) noexcept
+  : _e(active ? e : nullptr)
+{
+  if (_e != nullptr) {
+    ++_e->_scope_depth;   // suppress auto-split for the duration of the group
+    _e->reencode_(DispatchType::Concurrent);
+  }
+}
+
+ComputeEncoder::ConcurrentScope::ConcurrentScope(ConcurrentScope&& o) noexcept
+  : _e(std::exchange(o._e, nullptr))
+{
+}
+
+ComputeEncoder::ConcurrentScope::~ConcurrentScope()
+{
+  if (_e != nullptr) {
+    _e->reencode_(DispatchType::Serial);   // reopen Serial for the chain
+    if (_e->_scope_depth > 0) { --_e->_scope_depth; }
+  }
 }
 
 ComputeEncoder::~ComputeEncoder()
@@ -80,6 +140,17 @@ ComputeEncoder::set_function(const ComputeFunction& fn)
 {
   if (_enc == nullptr || !fn.valid()) {
     return;
+  }
+  // Auto command-buffer split: at an OP BOUNDARY (set_function starts a new op),
+  // once _split_every dispatches have accumulated, commit the current buffer +
+  // reopen a fresh one, so the CPU-encode of the next chunk pipelines against
+  // the GPU-exec of this one. Must be here (before the pipeline/buffers are set
+  // on the encoder), NOT in dispatch() -- splitting mid-op would strand the
+  // just-set state on the old encoder. Deferred inside a concurrent_scope.
+  if (_split_every > 0 && _scope_depth == 0 && _stream != nullptr &&
+      _since_split >= _split_every) {
+    _stream->split_encoder_(*this);
+    _since_split = 0;
   }
   _enc->setComputePipelineState(fn.mtl_pso());
 }
@@ -209,6 +280,16 @@ ComputeEncoder::memory_barrier(BarrierScope scope)
 }
 
 void
+ComputeEncoder::memory_barrier_buffer(const SharedBuffer& buf)
+{
+  if (_enc == nullptr || buf.empty()) {
+    return;
+  }
+  const MTL::Resource* res = buf.mtl_buffer();
+  _enc->memoryBarrier(&res, 1);
+}
+
+void
 ComputeEncoder::dispatch(LaunchDims threads_per_grid,
                          LaunchDims threads_per_threadgroup)
 {
@@ -216,6 +297,7 @@ ComputeEncoder::dispatch(LaunchDims threads_per_grid,
     return;
   }
   ++_n_dispatch;
+  ++_since_split;
   MTL::Size grid(
       static_cast<NS::UInteger>(threads_per_grid.x),
       static_cast<NS::UInteger>(threads_per_grid.y),

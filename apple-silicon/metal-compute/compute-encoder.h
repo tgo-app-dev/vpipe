@@ -6,6 +6,7 @@
 
 namespace MTL {
 class Buffer;
+class CommandBuffer;
 class ComputeCommandEncoder;
 }
 
@@ -140,6 +141,41 @@ public:
   // with Tracked buffers -- Metal already barriers there.
   void memory_barrier(BarrierScope scope = BarrierScope::Buffers);
 
+  // Resource-scoped barrier: order prior writes to `buf` before subsequent
+  // dispatches' accesses to `buf`, leaving every OTHER buffer unordered. On a
+  // Concurrent encoder this lets the next kernel's independent DRAM traffic
+  // (e.g. its weights) issue during this kernel's drain, while still making a
+  // dependent activation write visible. Finer + cheaper than the scope-wide
+  // memory_barrier(Buffers), which drains ALL buffers. No-op on empty buf.
+  void memory_barrier_buffer(const SharedBuffer& buf);
+
+  // RAII: for the duration of the scope, swap this encoder's underlying MTL
+  // encoder from Serial to a CONCURRENT one (in the SAME command buffer), so
+  // the dispatches inside run concurrently -- for a group of provably
+  // INDEPENDENT dispatches (unfused q|k|v, gate|up, GDN in_proj qkv|z|a|b). On
+  // scope exit it reopens a Serial encoder so the dependent chain keeps Metal's
+  // cheap native ordering. The encoder boundaries carry cross-group ordering
+  // via Metal's automatic hazard tracking (Tracked buffers). No explicit
+  // memoryBarrier -> avoids the full-flush barrier tax. `active == false` is a
+  // no-op (stays Serial). Requires the encoder to know its command buffer
+  // (set by CommandStream::begin_compute). Move-only.
+  class ConcurrentScope {
+   public:
+    ConcurrentScope(ConcurrentScope&&) noexcept;
+    ConcurrentScope& operator=(ConcurrentScope&&) = delete;
+    ConcurrentScope(const ConcurrentScope&)       = delete;
+    ~ConcurrentScope();
+
+   private:
+    friend class ComputeEncoder;
+    ConcurrentScope(ComputeEncoder* e, bool active) noexcept;
+    ComputeEncoder* _e = nullptr;   // null when inactive -> dtor no-op
+  };
+  ConcurrentScope concurrent_scope(bool active = true)
+  {
+    return ConcurrentScope(this, active);
+  }
+
   // Dispatch using Metal's automatic threadgroup-grid calculation.
   // `threads_per_grid` is the *total* number of threads (CUDA-
   // shape); the driver partitions into threadgroups of size
@@ -164,10 +200,28 @@ public:
 
 private:
   friend class CommandStream;
-  explicit ComputeEncoder(MTL::ComputeCommandEncoder* enc) noexcept;
+  friend class ConcurrentScope;
+  ComputeEncoder(MTL::ComputeCommandEncoder* enc,
+                 MTL::CommandBuffer* cb) noexcept;
+  // End the current MTL encoder and open a fresh one on _cb with the given
+  // dispatch type; used by ConcurrentScope to flip Serial<->Concurrent in
+  // place. No-op if _cb is unknown.
+  void reencode_(DispatchType dt);
 
   MTL::ComputeCommandEncoder* _enc = nullptr;
+  MTL::CommandBuffer* _cb = nullptr;   // owning command buffer (for reencode_)
   long _n_dispatch = 0;
+  // Auto command-buffer split (lifted from the per-model decode split): when
+  // _split_every>0, dispatch() commits _cb + reopens a fresh one every
+  // _split_every dispatches (outside any concurrent_scope), so a long stream's
+  // CPU-encode pipelines against GPU-exec. Set by CommandStream::begin_compute;
+  // the rollover is done by _stream so the stream's _cb stays coherent. Tracked
+  // buffers auto-fence deps across the split, so it is correctness-safe.
+  CommandStream* _stream = nullptr;
+  int _split_every = 0;
+  int _since_split = 0;
+  int _scope_depth = 0;   // >0 inside a concurrent_scope -> suppress split
+  DispatchType _dt = DispatchType::Serial;
 };
 
 }  // namespace vpipe::metal_compute

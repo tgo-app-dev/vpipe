@@ -211,7 +211,11 @@ constexpr ConfigKey kAttrs[] = {
 const PortSpec kIports[] = {
   {.name = "text",
    .doc = "FlexData string (or object with a \"text\" key): the text to "
-          "synthesize",
+          "synthesize. An object may also carry \"end_of_response\" (bool); "
+          "barge-in only cuts the current utterance on a new beat when the "
+          "current one is end_of_response (true, or absent -> defaults true). "
+          "A mid-reply chunk (false, from text-chat's stream oport) is always "
+          "spoken in full",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
   {.name = "audio-ref",
@@ -934,13 +938,37 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // End-of-response gating for barge-in. A streaming text producer
+  // (text-chat's `stream` oport) splits ONE reply into several beats and
+  // marks only the LAST with end_of_response=true; the earlier chunks
+  // carry end_of_response=false. Those non-final chunks are the SAME
+  // reply continuing, so a newer beat waiting behind one is NOT a new
+  // request -- it must be spoken in sequence, never cut. Only when the
+  // beat we are speaking is end_of_response (a complete reply -- or a
+  // legacy beat with no such field, which defaults true) does a newer
+  // beat mean "new request": barge-in. So the cut is armed only for EOR
+  // beats. A plain-string beat has no field and stays end_of_response, so
+  // non-streaming producers keep the original barge-in behaviour.
+  bool cur_is_eor = true;
+  if (const auto* fdp0 = dynamic_cast<const FlexDataPayload*>(t.get())) {
+    if (fdp0->data.is_object()) {
+      auto obj = fdp0->data.as_object();
+      if (obj.contains("end_of_response")) {
+        cur_is_eor = obj.at("end_of_response").as_bool(true);
+      }
+    }
+  }
+
   // Barge-in predicate: true once a NEW text beat is waiting on the text iport
-  // (iport 0) while we're mid-utterance. When interrupt_on_new_text is set, the
-  // generators poll this and stop ASAP (after flushing the audio produced so
-  // far); process() then re-runs and serves the newer text. The audio-ref iport
-  // (iport 1) is deliberately excluded -- it is sticky + its own clock domain.
+  // (iport 0) while we're mid-utterance AND the current beat is the last of its
+  // reply (cur_is_eor). When interrupt_on_new_text is set, the generators poll
+  // this and stop ASAP (after flushing the audio produced so far); process()
+  // then re-runs and serves the newer text. A mid-reply chunk (cur_is_eor
+  // false) is finished in full so the reply plays continuously. The audio-ref
+  // iport (iport 1) is deliberately excluded -- it is sticky + its own clock
+  // domain.
   auto new_text_pending = [&]() {
-    return _interrupt_on_new_text && ctx.backlog(0) > 0;
+    return _interrupt_on_new_text && cur_is_eor && ctx.backlog(0) > 0;
   };
 
   // ---- realtime variant (Qwen3-1.7B backbone + depth decoder -> 24 kHz mono)

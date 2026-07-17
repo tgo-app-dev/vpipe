@@ -13,7 +13,6 @@
 
 #include "minitest.h"
 
-#include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #ifdef VPIPE_BUILD_APPLE_SILICON
 // The host vision-encoder API (encode_host / encode_pair_host) is built
@@ -143,13 +142,13 @@ TEST(coreml_model_manager, weak_ptr_releases_when_last_consumer_drops) {
 }
 
 TEST(coreml_model_manager, serializes_concurrent_predicts_on_same_model) {
-  // Two threads each grab the same shared model and call predict
-  // through the per-model mutex; we increment a counter on entry to
-  // the mutex-guarded region and decrement on exit, asserting the
-  // counter never exceeds 1.
+  // predict() serializes per model internally (the per-model mutex is no
+  // longer exposed). Drive predict() concurrently from two threads with a
+  // zero-filled input derived from the model's sole fixed input; assert
+  // every call succeeds. A data race in the shared model / prediction
+  // options would crash or corrupt rather than return cleanly.
   const char* model = env_or_null_("VPIPE_TEST_COREML_MODEL");
-  const char* in_n  = env_or_null_("VPIPE_TEST_COREML_INPUT");
-  if (!model || !in_n) {
+  if (!model) {
     return;
   }
   vpipe::Session sess;
@@ -158,29 +157,50 @@ TEST(coreml_model_manager, serializes_concurrent_predicts_on_same_model) {
   auto loaded = mgr->load(model, 2);
   ASSERT_TRUE(loaded != nullptr);
 
-  atomic<int>  in_flight{0};
-  atomic<int>  max_in_flight{0};
-  atomic<bool> any_overlap{false};
+  // Need exactly one input and at least one output to build a call.
+  const auto& in_descs  = loaded->input_descs();
+  const auto& out_descs = loaded->output_descs();
+  if (in_descs.size() != 1 || out_descs.empty()) {
+    return;
+  }
+  const std::string    in_name  = in_descs.begin()->first;
+  const vpipe::CoreMLInputDesc in_desc = in_descs.begin()->second;
+  const std::string    out_name = out_descs.begin()->first;
 
+  // Zero-filled input bytes (shared read-only across both threads).
+  std::vector<std::uint8_t> in_bytes;
+  const bool is_image = in_desc.kind == vpipe::CoreMLFeatureKind::Image;
+  if (is_image) {
+    if (in_desc.image_width <= 0 || in_desc.image_height <= 0) { return; }
+    in_bytes.assign(static_cast<std::size_t>(in_desc.image_width)
+                        * in_desc.image_height * 4u, 0);
+  } else {
+    if (!in_desc.fixed) { return; }
+    std::size_t n = 1;
+    for (auto d : in_desc.shape) { n *= static_cast<std::size_t>(d); }
+    in_bytes.assign(n * vpipe::coreml_dtype_size(in_desc.dtype), 0);
+  }
+
+  atomic<bool> all_ok{true};
   auto worker = [&]() {
-    for (int i = 0; i < 50; ++i) {
-      std::lock_guard<std::mutex> lk(loaded->predict_mutex());
-      int now = ++in_flight;
-      if (now > 1) {
-        any_overlap.store(true);
+    for (int i = 0; i < 20; ++i) {
+      vpipe::CoreMLPredictInput cin;
+      cin.name = in_name;
+      if (is_image) {
+        cin.image        = in_bytes.data();
+        cin.image_width  = in_desc.image_width;
+        cin.image_height = in_desc.image_height;
+      } else {
+        cin.data  = in_bytes.data();
+        cin.dtype = in_desc.dtype;
+        cin.shape = in_desc.shape;
       }
-      int prev = max_in_flight.load();
-      while (now > prev &&
-             !max_in_flight.compare_exchange_weak(prev, now)) {
-        // retry
-      }
-      // Spin briefly to widen any race window.
-      auto deadline =
-          chrono::steady_clock::now() + chrono::microseconds(50);
-      while (chrono::steady_clock::now() < deadline) {
-        // busy-wait
-      }
-      --in_flight;
+      vpipe::CoreMLPredictOutput cout;
+      cout.name = out_name;
+      cout.want = vpipe::CoreMLDType::F32;
+      const vpipe::CoreMLPredictInput cins[1]  = { std::move(cin) };
+      vpipe::CoreMLPredictOutput      couts[1] = { std::move(cout) };
+      if (!loaded->predict(cins, couts)) { all_ok.store(false); }
     }
   };
 
@@ -189,8 +209,7 @@ TEST(coreml_model_manager, serializes_concurrent_predicts_on_same_model) {
   t1.join();
   t2.join();
 
-  EXPECT_FALSE(any_overlap.load());
-  EXPECT_TRUE(max_in_flight.load() == 1);
+  EXPECT_TRUE(all_ok.load());
 }
 
 // Two-input temporal-pair CoreML vision tower (image0+image1). Env-

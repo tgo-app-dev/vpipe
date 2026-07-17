@@ -52,11 +52,18 @@ namespace vpipe {
 //
 //   iport0  FlexDataPayload carrying the text to speak. Accepts either a
 //           plain FlexData string OR a FlexData object with a "text"
-//           key (mirrors text-chat's forgiving input handling). BARGE-IN
-//           (interrupt_on_new_text, default on): if a new text beat arrives
-//           here while the current utterance is still generating, the current
-//           one is cut short -- the audio produced so far is flushed, then
-//           generation stops and the newer text is served. Set the config
+//           key (mirrors text-chat's forgiving input handling). An object
+//           may also carry "end_of_response" (bool) -- text-chat's `stream`
+//           oport sets it, false on every chunk of a reply except the last.
+//           BARGE-IN (interrupt_on_new_text, default on): if a new text beat
+//           arrives here while the current utterance is still generating, the
+//           current one is cut short -- the audio produced so far is flushed,
+//           then generation stops and the newer text is served. The cut is
+//           GATED by end_of_response: a chunk with end_of_response=false is
+//           the same reply continuing, so it is always finished in full and a
+//           waiting beat is served next (never cut); only a chunk that is
+//           end_of_response (true, or a plain beat with no such field ->
+//           defaults true) is cut when a newer beat waits. Set the config
 //           false to instead finish every utterance fully (queued FIFO).
 //
 //   iport1  OPTIONAL TensorBeatPayload, mono f32 PCM (any sample rate;

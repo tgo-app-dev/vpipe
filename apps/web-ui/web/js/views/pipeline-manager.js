@@ -11,6 +11,37 @@ import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
 
 export function mountPipelineManager(container) {
+  return mountEditor(container, { showSelector: true, showControls: false });
+}
+
+// The reusable per-pipeline editor -- the stage canvas + configuration
+// panel for ONE pipeline, without the pipeline-list selector. Options:
+//   pipelineId  the linked pipeline id (required; designated at creation).
+//   split       stage:config width ratio as the stage FRACTION (default
+//               2/3 == 2:1); onSplit(fraction) fires when the user drags
+//               the divider, so a host (composer) can persist it.
+// Shows run / pause / stop on the canvas top-left (the selector, which
+// carries per-row controls, is absent here).
+// `onRebind(newId)` fires when the bound pipeline is unloaded and the
+// operator picks another from the rebind menu (see renderRebindPane), so
+// the host (composer) can re-point the panel config + re-title.
+export function mountPipelineEditor(container, opts = {}) {
+  return mountEditor(container, {
+    showSelector: false, showControls: true,
+    pipelineId: opts.pipelineId || null,
+    split: opts.split, onSplit: opts.onSplit,
+    onRebind: opts.onRebind,
+  });
+}
+
+function mountEditor(container, opts = {}) {
+  const showSelector = opts.showSelector !== false;
+  const showControls = !!opts.showControls;
+  const clampN = (v, lo, hi) => (v < lo ? lo : (v > hi ? hi : v));
+  // Stage:config split as the stage fraction (2:1 default). Adjustable via
+  // the divider; onSplit lets a host persist it as a view config.
+  let split = clampN(
+    Number.isFinite(opts.split) ? opts.split : 2 / 3, 0.2, 0.85);
   const state = {
     pipelines: [],        // summaries
     stageTypes: [],
@@ -47,7 +78,18 @@ export function mountPipelineManager(container) {
     // …" badge and disables every lifecycle button until the
     // backend's response confirms the new state.
     inflight: new Map(),  // id -> { op, label }
+    // Standalone editor only: the bound pipeline was unloaded (removed
+    // from the manager or another panel) and no longer exists. The graph
+    // pane then shows a rebind menu (renderRebindPane) instead of a stale
+    // graph; `rebindKey` guards against re-rendering it when unchanged.
+    missing: false,
+    rebindChoices: [],    // loaded pipeline ids to rebind to
+    rebindKey: '',
   };
+  // Standalone editor: the pipeline is fixed (no selector to change it),
+  // but it CAN be re-pointed via the rebind menu, so track it mutably.
+  let boundId = opts.pipelineId || null;
+  if (!showSelector) { state.selectedId = boundId; }
 
   // Labels shown in the pipeline row's state pill while a lifecycle
   // op is in-flight. "Stopping" specifically addresses the user's
@@ -192,12 +234,56 @@ export function mountPipelineManager(container) {
     }
   });
 
+  // Apply / Remove live in the config pane HEADER (not the scrolling body)
+  // so they stay reachable no matter where a long form is scrolled.
+  // renderConfig fills this per stage; it is empty when none is selected.
+  const cfgActions = el('span', { class: 'pane-head-actions' });
   const cfgPane = el('div', { class: 'pane' },
     el('div', { class: 'pane-head' },
-      el('span', { class: 'title' }, t('pl.configuration'))),
+      el('span', { class: 'title' }, t('pl.configuration')), cfgActions),
     cfgBody);
 
-  const pmRoot = el('div', { class: 'pm' }, listPane, graphPane, cfgPane);
+  // Run / pause / stop overlay pinned to the canvas top-left (standalone
+  // editor only; the selector's per-row controls cover the full view).
+  // Contents are rebuilt by renderControls() from the pipeline state.
+  const canvasControls = showControls
+    ? el('div', { class: 'pe-canvas-ctl' }) : null;
+
+  // Stage editor : config editor split, adjustable via a divider. The
+  // stage pane's flex-grow is `split`, the config pane's is `1 - split`.
+  graphPane.classList.add('pe-graph');
+  cfgPane.classList.add('pe-config');
+  const divider = el('div', { class: 'pe-divider', title: t('pl.stages') });
+  const editorArea = el('div', { class: 'pe-editor' },
+    graphPane, divider, cfgPane);
+  function applySplit() {
+    graphPane.style.flexBasis = '0';
+    cfgPane.style.flexBasis = '0';
+    graphPane.style.flexGrow = String(split);
+    cfgPane.style.flexGrow = String(1 - split);
+  }
+  applySplit();
+  divider.addEventListener('pointerdown', (ev) => {
+    ev.preventDefault();
+    const r = editorArea.getBoundingClientRect();
+    const mv = (e) => {
+      split = clampN((e.clientX - r.left) / r.width, 0.2, 0.85);
+      applySplit();
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', mv);
+      window.removeEventListener('pointerup', up);
+      if (typeof opts.onSplit === 'function') {
+        opts.onSplit(+split.toFixed(4));
+      }
+    };
+    window.addEventListener('pointermove', mv);
+    window.addEventListener('pointerup', up);
+  });
+
+  const pmRoot = showSelector
+    ? el('div', { class: 'pm' }, listPane, editorArea)
+    : el('div', { class: 'pm no-sel' }, editorArea);
   clear(container).append(pmRoot);
 
   function iconBtn(icon, label, onclick, key) {
@@ -245,6 +331,9 @@ export function mountPipelineManager(container) {
       }
       return;
     }
+    // Pipeline-level shortcuts (create / load / save / unload) belong to
+    // the selector; skip them in the standalone editor (no such buttons).
+    if (!showSelector) { return; }
     const fire = (btn, fn) => {
       if (!btn.disabled) { e.preventDefault(); fn(); }
     };
@@ -260,6 +349,30 @@ export function mountPipelineManager(container) {
 
   // --- data flow ----------------------------------------------------
   async function refreshList(keepSel = true) {
+    // Standalone editor: the pipeline is fixed; just refresh its detail
+    // (state + graph) and the canvas controls. No list to enumerate --
+    // but we DO fetch it once to confirm the bound pipeline still exists.
+    // If it was unloaded, clear the editor and show the rebind menu.
+    if (!showSelector) {
+      state.selectedId = boundId;
+      if (!state.selectedId) {
+        state.missing = false;
+        renderGraphPane(); renderConfig(); renderList();
+        return;
+      }
+      let list = null;
+      try { list = await api.listPipelines(); }
+      catch (e) { /* transient -- fall through to loadDetail */ }
+      if (list && !list.find((p) => p.id === state.selectedId)) {
+        enterRebind(list);
+        renderList();
+        return;
+      }
+      state.missing = false;
+      await loadDetail(state.selectedId);
+      renderList();   // updates the canvas run/pause/stop controls
+      return;
+    }
     try {
       state.pipelines = await api.listPipelines();
     } catch (e) { toast(t('pl.list_failed', { msg: e.message }), 'error');
@@ -333,6 +446,31 @@ export function mountPipelineManager(container) {
   async function pollBuffers() {
     bufTimer = null;
     if (!document.body.contains(pmRoot)) { return; }
+    // Standalone editor: watch for an EXTERNAL unload of the bound
+    // pipeline (removed from the manager or another panel) and flip to
+    // the rebind menu; restore in place if it is reloaded under the same
+    // id. Cheap GET; the loop already ticks while mounted.
+    if (!showSelector && boundId) {
+      let list = null;
+      try { list = await api.listPipelines(); } catch (e) { /* transient */ }
+      if (!document.body.contains(pmRoot)) { return; }
+      if (list) {
+        const present = list.some((p) => p.id === boundId);
+        if (!present) {
+          const key = list.map((p) => p.id).join('\n');
+          if (!state.missing || state.rebindKey !== key) {
+            enterRebind(list); renderList();
+          }
+          scheduleBufferPoll();
+          return;
+        }
+        if (state.missing) {   // came back under the same id -> restore
+          state.missing = false;
+          await loadDetail(boundId);
+          renderList();
+        }
+      }
+    }
     if (pollActive()) {
       const id = state.selectedId;
       try {
@@ -369,6 +507,8 @@ export function mountPipelineManager(container) {
 
   // --- left pane ----------------------------------------------------
   function renderList() {
+    if (canvasControls) { renderControls(); }
+    if (!showSelector) { return; }     // standalone editor: no selector
     clear(listBody);
     const ul = el('ul', { class: 'pl-list' });
     for (const p of state.pipelines) {
@@ -417,6 +557,25 @@ export function mountPipelineManager(container) {
     }, makeIcon(icon, 'sm'));
   }
 
+  // Rebuild the canvas run/pause/stop overlay from the current pipeline
+  // state (standalone editor). Enabled/disabled mirrors the selector's
+  // per-row lifecycle buttons; an in-flight op disables all three.
+  function renderControls() {
+    if (!canvasControls) { return; }
+    clear(canvasControls);
+    const id = state.selectedId;
+    const st = state.detail ? state.detail.state : null;
+    const busy = id ? state.inflight.has(id) : false;
+    canvasControls.append(
+      actIcon('play', t('common.start'),
+        !!id && !busy && st === 'stopped', (e) => lc(e, id, 'launch')),
+      actIcon('pause', t('common.pause'),
+        !!id && !busy && st === 'running', (e) => lc(e, id, 'pause')),
+      actIcon('stop', t('common.stop'),
+        !!id && !busy && (st === 'running' || st === 'paused'),
+        (e) => lc(e, id, 'stop')));
+  }
+
   async function lc(ev, id, op) {
     ev.stopPropagation();
     // Reject a re-click while the previous lifecycle op for this
@@ -444,10 +603,70 @@ export function mountPipelineManager(container) {
     await refreshList();
   }
 
+  // --- rebind menu (standalone editor: bound pipeline unloaded) ------
+  // Enter the rebind state: drop the stale detail/selection and remember
+  // which pipelines are currently loaded so the menu can offer them.
+  function enterRebind(list) {
+    state.missing = true;
+    state.detail = null;
+    state.selectedStage = null;
+    state.pending = null;
+    state.selectedEdge = null;
+    state.rebindChoices = (list || []).map((p) => p.id);
+    state.rebindKey = state.rebindChoices.join('\n');
+    renderGraphPane();   // routes to renderRebindPane() while missing
+    renderConfig();
+  }
+  // Re-point this editor at another loaded pipeline (picked from the menu).
+  async function rebindTo(id) {
+    boundId = id;
+    state.selectedId = id;
+    state.missing = false;
+    state.detail = null;
+    state.selectedStage = null;
+    state.pending = null;
+    state.selectedEdge = null;
+    state.graphView = {};       // refit + clean layout for the new pipeline
+    state.graphLayout = null;
+    state.graphPins = new Map();
+    if (typeof opts.onRebind === 'function') { opts.onRebind(id); }
+    await refreshList();
+    toast(t('pl.rebound', { id }), 'ok');
+  }
+  function renderRebindPane() {
+    clear(graphBody);
+    state.graphContainer = null;
+    if (canvasControls) { renderControls(); graphBody.append(canvasControls); }
+    stagesCount.textContent = '';
+    const box = el('div', { class: 'graph-rebind' });
+    box.append(el('div', { class: 'graph-rebind-title' },
+      t('pl.rebind_gone', { id: state.selectedId || '' })));
+    const choices = state.rebindChoices || [];
+    if (!choices.length) {
+      box.append(el('div', { class: 'graph-rebind-hint' },
+        t('pl.no_pipelines')));
+    } else {
+      box.append(el('div', { class: 'graph-rebind-hint' },
+        t('pl.rebind_pick')));
+      const list = el('div', { class: 'graph-rebind-list' });
+      for (const id of choices) {
+        list.append(el('button', { class: 'graph-rebind-item',
+          onclick: () => rebindTo(id) },
+          makeIcon('pipeline', 'sm'), el('span', {}, id)));
+      }
+      box.append(list);
+    }
+    graphBody.append(box);
+  }
+
   // --- middle pane --------------------------------------------------
   function renderGraphPane(o = {}) {
+    if (state.missing) { renderRebindPane(); return; }
     clear(graphBody);
     state.graphContainer = null;   // old overlay target is gone
+    // Re-dock the (persistent) canvas run/pause/stop overlay; it floats at
+    // the top-left regardless of graph/empty content (absolute-positioned).
+    if (canvasControls) { renderControls(); graphBody.append(canvasControls); }
     const editable = canEdit();
     // Edit affordances only make sense while stopped; drop any stale
     // arming/selection when the pipeline isn't editable.
@@ -900,6 +1119,7 @@ export function mountPipelineManager(container) {
   // --- right pane (config) -----------------------------------------
   async function renderConfig() {
     clear(cfgBody);
+    clear(cfgActions);   // header Apply/Remove; refilled below when editable
     if (!state.detail || !state.selectedStage) {
       cfgBody.append(el('div', { class: 'cfg' },
         el('div', { class: 'empty' }, t('pl.select_stage_config'))));
@@ -916,7 +1136,26 @@ export function mountPipelineManager(container) {
     }
     const editable = !!info.editable;
     const wrap = el('div', { class: 'cfg' });
+
+    // Apply / Remove go in the pane HEADER (cfgActions) so they stay pinned
+    // above the scroll. `inputs` is captured by Apply's handler and filled
+    // in by the schema loop below.
+    const inputs = [];
+    const applyBtn = el('button', {
+      class: 'btn primary mini', disabled: !editable,
+      onclick: () => applyConfig(inputs),
+    }, t('common.apply'));
+    // Remove the stage (topology edit -- stopped pipelines only).
+    const removeBtn = el('button', {
+      class: 'btn danger mini', disabled: !editable,
+      title: editable ? t('pl.remove_stage_title')
+                      : t('pl.stop_to_edit'),
+      onclick: () => onRemoveStage(),
+    }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
+    cfgActions.append(applyBtn, removeBtn);
+
     wrap.append(el('div', { class: 'stage-id' }, info.id));
+
     const sp = specForType(info.type);
     wrap.append(el('div', { class: 'stage-type' },
       info.type,
@@ -931,27 +1170,11 @@ export function mountPipelineManager(container) {
       wrap.append(el('div', { class: 'ro-note' },
         t('pl.config_readonly')));
     }
-    const inputs = [];
     for (const f of info.schema) {
       const { field, read } = configField(f, !editable, info.type);
       inputs.push({ key: f.key, type: f.type, read });
       wrap.append(field);
     }
-    const applyBtn = el('button', {
-      class: 'btn primary', disabled: !editable,
-      onclick: () => applyConfig(inputs),
-    }, t('common.apply'));
-    // Remove the stage (topology edit -- stopped pipelines only). Lives
-    // here now that the Stages title bar has no Remove button; pushed to
-    // the right so it's clearly separated from Apply.
-    const removeBtn = el('button', {
-      class: 'btn danger', disabled: !editable,
-      style: 'margin-left:auto',
-      title: editable ? t('pl.remove_stage_title')
-                      : t('pl.stop_to_edit'),
-      onclick: () => onRemoveStage(),
-    }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
-    wrap.append(el('div', { class: 'cfg-actions' }, applyBtn, removeBtn));
     cfgBody.append(wrap);
   }
 
@@ -1576,4 +1799,24 @@ export function mountPipelineManager(container) {
     await refreshList();
     scheduleBufferPoll();   // start the buffer-utilization overlay loop
   })();
+
+  // Re-arm hook: a host that keeps this editor alive across nav switches
+  // (the composer) calls onShow() when it re-attaches the DOM, to RESUME
+  // the buffer-fullness overlay. The poll loop and the keyboard listener
+  // self-stop on detach (see scheduleBufferPoll / onShortcut), so away/back
+  // is seamless -- this just restarts the loop and re-syncs the shown
+  // state. Idempotent; a no-op while detached. cleanup() tears both down
+  // promptly when the host removes the panel.
+  function onShow() {
+    if (!document.body.contains(pmRoot)) { return; }
+    document.removeEventListener('keydown', onShortcut);
+    document.addEventListener('keydown', onShortcut);
+    refreshList();          // re-sync pipeline state + rebuild the overlay
+    scheduleBufferPoll();   // resume the poll loop
+  }
+  function cleanup() {
+    stopBufferPoll();
+    document.removeEventListener('keydown', onShortcut);
+  }
+  return { onShow, cleanup };
 }

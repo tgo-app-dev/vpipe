@@ -8,10 +8,6 @@
 #include <string>
 #include <vector>
 
-namespace CML {
-class PredictionOptions;
-}
-
 namespace vpipe {
 
 namespace metal_compute { class MetalCompute; }
@@ -127,7 +123,6 @@ private:
   unsigned                 _oport_capacity{};
 
   std::shared_ptr<CoreMLLoadedModel> _loaded;
-  CML::PredictionOptions*            _opts = nullptr;
 
   // Session-shared metal-compute device captured at initialize() so
   // the hot path doesn't have to walk session() per call. nullptr on

@@ -8,10 +8,6 @@
 #include <string>
 #include <vector>
 
-namespace CML {
-class PredictionOptions;
-}
-
 namespace vpipe {
 
 class CoreMLLoadedModel;
@@ -67,12 +63,9 @@ private:
   // The model is borrowed from the session-shared
   // CoreMLModelManager via a shared_ptr; multiple stages requesting
   // the same (path, compute_units) pair share one underlying model
-  // and thus one per-model prediction mutex.
+  // and thus one per-model prediction mutex (held inside predict()).
+  // The uses_cpu_only override is passed per-call to predict().
   std::shared_ptr<CoreMLLoadedModel> _loaded;
-
-  // PredictionOptions is per-stage (the uses_cpu_only override is a
-  // per-stage knob) and owned via raw retain/release.
-  CML::PredictionOptions* _opts  = nullptr;
 };
 
 }

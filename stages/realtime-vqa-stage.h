@@ -223,6 +223,10 @@ public:
   // once on the first scene and reused thereafter; test-visible so a
   // multi-scene run can assert the pool stays put rather than churning.
   std::size_t branch_pool_size() const noexcept { return _branch_pool.size(); }
+  // Test-only: is a scene currently in progress (>= 1 captured frame or a
+  // buffered first-of-pair)? Lets a stop-behavior test wait until a real
+  // scene is open before requesting stop, so the drop is deterministic.
+  bool scene_active_for_test() const noexcept { return m_scene_active_(); }
 #endif
 
 private:
@@ -503,6 +507,16 @@ private:
   std::vector<std::string> m_decode_batched_pipelined_(
       std::vector<genai::LoadedLanguageModel::Context>& children);
 #endif
+
+  // Live RuntimeContext for the current run, set at process()/drain()
+  // entry. Lets the inner inference helpers (m_decode_*, m_interpret_
+  // audio_ -- which don't take a ctx) poll the pipeline stop flag and
+  // abandon a long decode promptly instead of running it to completion
+  // before the driver's between-process() stop check is seen. The ctx
+  // outlives the stage's run, so the raw pointer stays valid.
+  RuntimeContext*              _run_ctx = nullptr;
+  bool m_stopping_() const noexcept
+  { return _run_ctx && _run_ctx->stop_requested(); }
 
   // ---- Trigger / scene-boundary bookkeeping ----
   int                          _consec_idle_ticks = 0;

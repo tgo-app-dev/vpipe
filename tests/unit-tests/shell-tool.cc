@@ -108,6 +108,37 @@ TEST(shell_tool, confines_writes_to_workspace)
   fs::remove_all(outside, ec);
 }
 
+// Regression: a command that forks several external programs in an `&&`
+// chain must succeed. Previously run_shell set RLIMIT_NPROC to an absolute
+// max_procs (64); since RLIMIT_NPROC caps the real UID's processes
+// system-wide (already far above 64 on an interactive box), the sandboxed
+// /bin/sh's first fork() -- to run `mkdir` -- returned EAGAIN
+// ("fork: Resource temporarily unavailable") and the command died exit 128.
+TEST(shell_tool, forking_command_chain_succeeds)
+{
+  if (!sandbox_available_()) { return; }
+  const string ws = make_tmpdir_("fork");
+  ASSERT_TRUE(!ws.empty());
+
+  ShellToolOptions o;
+  o.workspace = ws;
+  McpTool t = make_shell_tool(o);
+
+  // Each of touch / mkdir / mv is an external binary -> a fork per command.
+  const string out = t.handler(
+      "{\"command\": \"touch fibonacci.c && mkdir -p proj && "
+      "mv fibonacci.c proj/\"}");
+  FlexData fd = FlexData::from_json(out);
+  EXPECT_TRUE(fd.is_object());
+  auto obj = fd.as_object();
+  EXPECT_TRUE(obj.at("exit_code").as_int(-1) == 0);
+  EXPECT_FALSE(fs::exists(ws + "/fibonacci.c"));
+  EXPECT_TRUE(fs::exists(ws + "/proj/fibonacci.c"));
+
+  error_code ec;
+  fs::remove_all(ws, ec);
+}
+
 TEST(shell_tool, accepts_command_as_array_of_lines)
 {
   if (!sandbox_available_()) { return; }

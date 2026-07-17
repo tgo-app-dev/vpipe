@@ -13,7 +13,8 @@ enum class DType : std::uint8_t {
   U8,
   I8,
   Bf16,
-  F32
+  F32,
+  F16   // IEEE half. Appended last to keep ordinals == TensorBeat::DType.
 };
 
 // Optional shape/stride/dtype metadata attached to a SharedBuffer.
@@ -39,6 +40,7 @@ element_size(DType t) noexcept
     case DType::U8:   return 1;
     case DType::I8:   return 1;
     case DType::Bf16: return 2;
+    case DType::F16:  return 2;
     case DType::F32:  return 4;
   }
   return 0;

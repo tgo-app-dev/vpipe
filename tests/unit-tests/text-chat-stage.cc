@@ -83,7 +83,12 @@ TEST(text_chat_stage, config_defaults) {
   TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
   EXPECT_TRUE(s.hf_dir() == "/tmp/chat-fake-model");
   EXPECT_TRUE(s.max_new_tokens() == 1024);
-  EXPECT_TRUE(s.num_oports() == 1);
+  // Two oports: the per-turn record ("assistant") + the progressive
+  // streaming port ("stream").
+  EXPECT_TRUE(s.num_oports() == 2);
+  EXPECT_TRUE(s.spec().oports.size() == 2);
+  EXPECT_TRUE(string_view(s.spec().oports[0].name) == "assistant");
+  EXPECT_TRUE(string_view(s.spec().oports[1].name) == "stream");
   // MCP tools are opt-in: off unless enable_tools is set.
   EXPECT_FALSE(s.tools_enabled());
 }
@@ -97,6 +102,44 @@ TEST(text_chat_stage, enable_tools_config) {
   EXPECT_TRUE(s.config_error().empty());
   EXPECT_TRUE(s.tools_enabled());
   EXPECT_FALSE(s.python_tool_enabled());
+}
+
+// The sandboxed run_shell / run_python tools can be allowed to use the
+// per-user system temp (default off = temp confined under the CWD). Pure
+// config parse -- no model.
+TEST(text_chat_stage, allow_system_temp_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_FALSE(s.allow_system_temp());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","allow_system_temp":true})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+    EXPECT_TRUE(s.allow_system_temp());
+  }
+}
+
+// The streaming out-port (index 1) can be narrowed to the answer only,
+// folding reasoning + tool-call spans out. Off by default. Pure config
+// parse -- no model.
+TEST(text_chat_stage, stream_answer_only_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_FALSE(s.stream_answer_only());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","stream_answer_only":true})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+    EXPECT_TRUE(s.stream_answer_only());
+  }
 }
 
 TEST(text_chat_stage, enable_python_tool_config) {
@@ -121,6 +164,46 @@ TEST(text_chat_stage, enable_file_tools_config) {
   EXPECT_TRUE(s.file_tools_enabled());
   EXPECT_FALSE(s.tools_enabled());
   EXPECT_FALSE(s.python_tool_enabled());
+  // Default file-sandbox mode is the ephemeral per-chat workspace.
+  EXPECT_TRUE(s.file_sandbox_mode() == "per-chat");
+}
+
+TEST(text_chat_stage, file_sandbox_persistent_config) {
+  Session sess;
+  CerrSilencer hush;
+  FlexData cfg = FlexData::from_json(
+      R"({"hf_dir":"/tmp/chat-fake-model","enable_file_tools":true,)"
+      R"("file_sandbox":"persistent"})");
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+  EXPECT_TRUE(s.file_tools_enabled());
+  EXPECT_TRUE(s.file_sandbox_mode() == "persistent");
+}
+
+// Persistent mode roots the file tools at the SESSION sandbox root
+// ($CWD/sandbox in the web-ui) -- not an ephemeral per-chat temp dir.
+TEST(text_chat_stage, file_sandbox_persistent_uses_session_root) {
+  namespace fs = std::filesystem;
+  const auto tmp = fs::temp_directory_path() / "vpipe_fsbx_test_root";
+  fs::create_directories(tmp);
+  Session sess(R"({"file_sandbox":{"enabled":true,"root":")"
+               + tmp.string() + R"("}})");
+  CerrSilencer hush;
+
+  TextChatStage s(&sess, "chat", vector<InEdge>{}, FlexData::from_json(
+      R"({"hf_dir":"/p","enable_file_tools":true,)"
+      R"("file_sandbox":"persistent"})"));
+  const std::string root = s.resolve_file_sandbox_for_test();
+  EXPECT_FALSE(root.empty());
+  EXPECT_TRUE(root.find("vpipe_fsbx_test_root") != std::string::npos);
+
+  // The default (per-chat) mode uses an ephemeral temp dir instead.
+  TextChatStage e(&sess, "chat", vector<InEdge>{}, FlexData::from_json(
+      R"({"hf_dir":"/p","enable_file_tools":true})"));
+  const std::string eroot = e.resolve_file_sandbox_for_test();
+  EXPECT_TRUE(eroot.find("vpipe_fsbx_test_root") == std::string::npos);
+
+  fs::remove_all(tmp);
 }
 
 TEST(text_chat_stage, enable_web_tools_config) {
@@ -207,6 +290,43 @@ private:
   std::vector<FlexData> _collected;
 };
 
+// Collects every {text, end_of_response} beat from the streaming oport
+// (out-port 1) in arrival order.
+class StreamSink : public TypedStage<StreamSink> {
+public:
+  static constexpr const char* kTypeName = "ut-chat-stream-sink";
+  using TypedStage::TypedStage;
+
+  struct Beat { std::string text; bool eor; };
+
+  std::vector<Beat> take()
+  {
+    lock_guard<mutex> g(_mu);
+    return _beats;
+  }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    auto in = co_await ctx.read(0);
+    if (!in) { ctx.signal_done(); co_return; }
+    const auto* p = dynamic_cast<const FlexDataPayload*>(in.get());
+    if (p && p->data.is_object()) {
+      auto o = p->data.as_object();
+      Beat b;
+      b.text = o.contains("text")
+          ? std::string(o.at("text").as_string("")) : std::string();
+      b.eor = o.contains("end_of_response")
+          && o.at("end_of_response").as_bool(false);
+      lock_guard<mutex> g(_mu);
+      _beats.push_back(std::move(b));
+    }
+  }
+
+private:
+  mutex             _mu;
+  std::vector<Beat> _beats;
+};
+
 }  // namespace
 
 // The flattened `mtp` flag wires into _mtp_enabled (metal path only).
@@ -287,6 +407,180 @@ TEST(text_chat_stage, metal_chat_smoke) {
     EXPECT_TRUE(ctx_pos > 0);
   }
   EXPECT_TRUE(found);
+}
+
+// End-to-end streaming out-port (out-port 1): a real turn must arrive as
+// one or more {text, end_of_response} beats whose concatenation equals
+// the full turn text, with exactly one end_of_response beat and it last.
+TEST(text_chat_stage, metal_chat_stream) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  Session  sess;
+  Pipeline pl("chat-stream-smoke", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  // A descriptive prompt so the reply spans several ~20-word chunks.
+  src->prompt = "In three or four sentences, describe a walk through a "
+                "spring garden. Keep it flowing and vivid.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(200));
+    o.insert("max_pages", FlexData::make_int(24));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+
+  // out-port 0 -> full-turn record; out-port 1 -> progressive stream.
+  auto turnsk = make_unique<TurnSink>(
+      &sess, "turn", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* turnsink = static_cast<TurnSink*>(pl.insert_stage(std::move(turnsk)));
+
+  auto strsk = make_unique<StreamSink>(
+      &sess, "stream", vector<InEdge>{ { chat, 1 } },
+      FlexData::make_object());
+  auto* streamsink = static_cast<StreamSink*>(
+      pl.insert_stage(std::move(strsk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  auto beats = streamsink->take();
+  auto turns = turnsink->take();
+  ASSERT_TRUE(!beats.empty());
+  ASSERT_TRUE(!turns.empty());
+
+  // Exactly one end_of_response beat, and it is the final beat.
+  int eor_count = 0;
+  for (std::size_t i = 0; i < beats.size(); ++i) {
+    if (beats[i].eor) {
+      ++eor_count;
+      EXPECT_TRUE(i + 1 == beats.size());   // end_of_response is terminal
+    }
+  }
+  EXPECT_TRUE(eor_count == 1);
+
+  // Concatenated stream chunks == the full turn text (no tools here => a
+  // single decode round, so the stream is exactly the turn text).
+  std::string streamed;
+  for (const auto& b : beats) { streamed += b.text; }
+  std::string full;
+  for (const auto& fd : turns) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      full = std::string(root.at("text").as_string(""));
+    }
+  }
+  std::printf("[text_chat_stage.metal_chat_stream] beats=%zu eor=%d "
+              "streamed=%zuB full=%zuB\n",
+              beats.size(), eor_count, streamed.size(), full.size());
+  EXPECT_TRUE(streamed == full);
+}
+
+// stream_answer_only: the reasoning block is folded OUT of the streaming
+// out-port (index 1) while out-port 0 still carries the full reply. The
+// Qwen3.5-VL default is thinking-ON, so out-port 0 opens with the unified
+// thinking-START marker; the stream must contain NEITHER thinking marker,
+// and must equal the full text with the [START..END] reasoning span removed.
+TEST(text_chat_stage, metal_chat_stream_answer_only) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  Session  sess;
+  Pipeline pl("chat-stream-answer-only", &sess);
+
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = "What is the capital of France? Answer in one word.";
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(256));
+    o.insert("max_pages", FlexData::make_int(24));
+    o.insert("stream_answer_only", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+
+  auto turnsk = make_unique<TurnSink>(
+      &sess, "turn", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* turnsink = static_cast<TurnSink*>(pl.insert_stage(std::move(turnsk)));
+  auto strsk = make_unique<StreamSink>(
+      &sess, "stream", vector<InEdge>{ { chat, 1 } },
+      FlexData::make_object());
+  auto* streamsink = static_cast<StreamSink*>(
+      pl.insert_stage(std::move(strsk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+  rt.wait_idle();
+  rt.stop();
+
+  auto beats = streamsink->take();
+  auto turns = turnsink->take();
+  ASSERT_TRUE(!turns.empty());
+
+  std::string streamed;
+  for (const auto& b : beats) { streamed += b.text; }
+  std::string full;
+  for (const auto& fd : turns) {
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (root.contains("text")) {
+      full = std::string(root.at("text").as_string(""));
+    }
+  }
+
+  const std::string ts(vpipe::media_line::kThinkStart);
+  const std::string te(vpipe::media_line::kThinkEnd);
+  std::printf("[text_chat_stage.stream_answer_only] streamed=%zuB full=%zuB\n",
+              streamed.size(), full.size());
+
+  // out-port 0 opened the reasoning block; out-port 1 dropped both markers.
+  EXPECT_TRUE(full.find(ts) != std::string::npos);
+  EXPECT_TRUE(streamed.find(ts) == std::string::npos);
+  EXPECT_TRUE(streamed.find(te) == std::string::npos);
+
+  // The stream is exactly the full reply with the [START..END] reasoning
+  // span removed (no tools => a single decode round). Only assert the exact
+  // match when the model closed reasoning within budget (END present).
+  const auto s = full.find(ts);
+  const auto e = full.find(te);
+  if (s != std::string::npos && e != std::string::npos && e >= s) {
+    std::string expected = full;
+    expected.erase(s, (e + te.size()) - s);
+    EXPECT_TRUE(streamed == expected);
+    EXPECT_TRUE(!streamed.empty());   // "Paris" survives the fold
+  }
 }
 
 // ---- MCP tool calling (env-gated; a Qwen/ChatML checkpoint) ---------

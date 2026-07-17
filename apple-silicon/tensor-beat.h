@@ -45,6 +45,8 @@ struct TensorBeat {
     I8   = 1,
     Bf16 = 2,
     F32  = 3,
+    F16  = 4,   // IEEE half. Appended (ordinal 4) so the ordinals stay
+                // locked to metal_compute::DType (tensor-beat-bridge.cc).
   };
 
   DType                  dtype = DType::F32;
@@ -192,6 +194,7 @@ struct TensorBeat {
       case DType::U8:   return 1;
       case DType::I8:   return 1;
       case DType::Bf16: return 2;
+      case DType::F16:  return 2;
       case DType::F32:  return 4;
     }
     return 0;
@@ -204,6 +207,7 @@ struct TensorBeat {
       case DType::U8:   return "u8";
       case DType::I8:   return "i8";
       case DType::Bf16: return "bf16";
+      case DType::F16:  return "f16";
       case DType::F32:  return "f32";
     }
     return "?";
@@ -353,6 +357,24 @@ struct TensorBeat {
   as_bf16() noexcept
   {
     assert(dtype == DType::Bf16);
+    return reinterpret_cast<uint16_t*>(bytes_()) + storage_offset;
+  }
+
+  // IEEE half (f16). Like bf16, exposed as the raw uint16_t bit
+  // pattern; consumers reinterpret as needed (e.g. _Float16 on Clang,
+  // or CoreML's half output). Distinct from bf16 (different exponent
+  // width) despite the shared 2-byte width.
+  const uint16_t*
+  as_f16() const noexcept
+  {
+    assert(dtype == DType::F16);
+    return reinterpret_cast<const uint16_t*>(bytes_())
+         + storage_offset;
+  }
+  uint16_t*
+  as_f16() noexcept
+  {
+    assert(dtype == DType::F16);
     return reinterpret_cast<uint16_t*>(bytes_()) + storage_offset;
   }
 

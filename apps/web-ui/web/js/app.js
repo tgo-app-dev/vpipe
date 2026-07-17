@@ -8,6 +8,8 @@ import { t, getLocale, onLocaleChange } from './i18n.js';
 import { mountPipelineManager } from './views/pipeline-manager.js';
 import { mountIoWorkspace } from './views/io-workspace.js';
 import { mountDatabase } from './views/database.js';
+import { mountFileBrowser } from './views/file-browser.js';
+import { mountComposer } from './views/composer.js';
 import { mountProfiler } from './views/profiler.js';
 import { mountSettings } from './views/settings.js';
 import { mountStatusBar } from './status-bar.js';
@@ -131,6 +133,10 @@ const VIEWS = [
     mount: mountIoWorkspace },
   { id: 'db', labelKey: 'nav.database', icon: 'database',
     mount: mountDatabase },
+  { id: 'files', labelKey: 'nav.files', icon: 'files',
+    mount: mountFileBrowser },
+  { id: 'composer', labelKey: 'nav.composer', icon: 'composer',
+    mount: mountComposer },
 ];
 const SETTINGS = { id: 'settings', labelKey: 'nav.settings', icon: 'settings',
   mount: mountSettings };

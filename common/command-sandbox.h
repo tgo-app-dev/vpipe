@@ -43,12 +43,26 @@ struct CommandSandboxSpec {
   // Empty => inherit the parent CWD.
   std::filesystem::path               cwd;
 
-  // Resource limits (0 => leave the OS default).
+  // Allow the per-user system temp dir (macOS Darwin temp/cache,
+  // `/var/folders/.../{T,C}/`) as a writable root and point $TMPDIR at it.
+  // Default false keeps ALL writes under the workspace, so nothing is written
+  // outside the launch CWD (bar the explicit whitelist) -- but tools that
+  // hardcode the system temp and ignore $TMPDIR (e.g. the macOS `mktemp` CLI)
+  // then fail. Enable to make those tools work, accepting that temp files may
+  // land in the user's private temp outside the CWD.
+  bool                                allow_system_temp = false;
+
+  // Resource limits (0 => leave the OS default). Note there is deliberately
+  // no process-count cap: RLIMIT_NPROC counts ALL processes owned by the real
+  // UID system-wide (not just this command's descendants), so on an
+  // interactive session it is already far exceeded and would make the child's
+  // first fork() fail with EAGAIN -- breaking any command that runs an
+  // external program. Runaway is contained by the wall-clock timeout +
+  // RLIMIT_CPU + the seatbelt profile instead.
   int   timeout_ms       = 0;   // wall-clock; SIGKILL the group on expiry
   long  cpu_seconds      = 0;   // RLIMIT_CPU (hard = +2s)
   long  address_space_mb = 0;   // RLIMIT_AS
   long  file_size_mb     = 0;   // RLIMIT_FSIZE
-  long  max_procs        = 0;   // RLIMIT_NPROC
 };
 
 // Line-oriented I/O hooks for a run. The runner splits the child's stdout
@@ -93,6 +107,15 @@ CommandSandboxResult
 run_shell_command(const std::string&        command,
                   const CommandSandboxSpec& spec,
                   const CommandSandboxIo&   io);
+
+// The per-user system temp dirs a sandboxed child may be granted when
+// `allow_system_temp` is set: the macOS Darwin temp + cache
+// (`/var/folders/.../{T,C}/`), canonicalized (/private/...) so a seatbelt
+// subpath rule fires at runtime. Empty on non-macOS. Deliberately NOT the
+// world-shared /tmp -- the per-user temp (mode 0700) is a narrower grant.
+// Shared so every sandbox (run_shell, run_python, future MCP tools) opts in
+// the same way.
+std::vector<std::string> system_temp_roots();
 
 }  // namespace vpipe
 

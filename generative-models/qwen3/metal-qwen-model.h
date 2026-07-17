@@ -908,6 +908,18 @@ private:
     int q_bits = 4, k_bits = 4, v_bits = 4, o_bits = 4;
     int qkv_bits = 4, z_bits = 4, a_bits = 4, b_bits = 4, gout_bits = 4;
     int gate_bits = 4, up_bits = 4, down_bits = 4;
+    // Mixed-precision MLP fusion: when gate_bits==up_bits==4 the gate|up are
+    // interleaved into guw (like the uniform path) and the fused swiglu qmv /
+    // qmm kernels run, recovering the fusion the per-tensor de-fused path
+    // would drop (28/32 OptiQ layers). down stays per-tensor (own bits). The
+    // 4 genuinely mixed-bit gate/up layers keep the de-fused path (uw built).
+    bool mlp_fused = false;
+    // Mixed-precision QKV fusion: when a full-attn layer's q/k/v are uniform at
+    // the base width, they are fused into one q|k|v GEMM (like the non-mixed
+    // path) and the forward's fused branch (gated on !qkv_fused) dispatches it
+    // with the base-width qmv/qmm. Genuinely mixed layers keep qkv_fused=false
+    // (kw/vw built). o_proj is always per-tensor (own o_bits).
+    bool qkv_fused = false;
     // Routed-expert (MoE switch_mlp) quant width: 4 or 8. Selects the w4/w8
     // gather + grouped expert kernels at dispatch (router/shared stay w8).
     int eg_bits = 4;

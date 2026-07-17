@@ -80,6 +80,7 @@ reason_phrase_(int code)
     case 200: return "OK";
     case 201: return "Created";
     case 204: return "No Content";
+    case 206: return "Partial Content";
     case 400: return "Bad Request";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
@@ -644,15 +645,12 @@ HttpServer::serve_one_(Conn& conn, bool loopback)
     bool ok = false;
     auto kit = req.headers.find("x-auth-key");
     if (kit != req.headers.end() && kit->second == _auth_key) { ok = true; }
-    if (!ok) {
-      // A WebSocket handshake can't carry custom headers, so accept the
-      // key as a ?key= query parameter for upgrade requests.
-      auto up = req.headers.find("upgrade");
-      if (up != req.headers.end()
-          && lower_(up->second).find("websocket") != string::npos
-          && query_param_(req.query, "key") == _auth_key) {
-        ok = true;
-      }
+    if (!ok && query_param_(req.query, "key") == _auth_key) {
+      // Requests a browser makes WITHOUT scriptable headers accept the
+      // key as a ?key= query parameter: a WebSocket handshake (Preview),
+      // and a media element / <img> `src` loading a file-browser preview
+      // (GET /api/fs/file). Same key, just a header the element can't set.
+      ok = true;
     }
     needs_auth = !ok;
   }

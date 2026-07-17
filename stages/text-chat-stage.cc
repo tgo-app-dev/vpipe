@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "common/media-decode.h"
 #include "common/media-line.h"
+#include "common/text-stream-chunk.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
@@ -189,8 +190,11 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   _enable_file_tools = attr_bool("enable_file_tools");
   _enable_shell_tool = attr_bool("enable_shell_tool");
   _file_sandbox_dir = attr_str("file_sandbox_dir");
+  _file_sandbox_mode = attr_str("file_sandbox");
   _enable_web_tools = attr_bool("enable_web_tools");
   _web_allow_private = attr_bool("web_allow_private");
+  _allow_system_temp = attr_bool("allow_system_temp");
+  _stream_answer_only = attr_bool("stream_answer_only");
 
   // disable_thinking is tri-state (unset = family default), with no flat
   // ConfigKey form, so it's read from the config object directly.
@@ -278,9 +282,15 @@ constexpr ConfigKey kAttrs[] = {
           "at file_sandbox_dir (paths cannot escape the root). Any tool "
           "flag activates the tool loop", .def_bool = false},
   {.key = "file_sandbox_dir", .type = ConfigType::String,
-   .doc = "workspace root for the file tools; empty => an ephemeral "
-          "per-stage temp dir created at launch and removed at teardown",
+   .doc = "explicit workspace root for the file/shell tools; overrides "
+          "file_sandbox when set. Empty => use the file_sandbox mode",
    .def_str = ""},
+  {.key = "file_sandbox", .type = ConfigType::String,
+   .doc = "file/shell tool workspace when file_sandbox_dir is unset: "
+          "'per-chat' (an ephemeral per-stage temp dir, wiped at teardown "
+          "-- the default) or 'persistent' (the session sandbox root, "
+          "$CWD/sandbox, kept across chats)",
+   .def_str = "per-chat"},
   {.key = "enable_shell_tool", .type = ConfigType::Bool,
    .doc = "add a sandboxed `run_shell` tool (seatbelt: no network, writes "
           "confined to the file_sandbox_dir workspace, home reads blocked, "
@@ -294,6 +304,20 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "web_allow_private", .type = ConfigType::Bool,
    .doc = "allow the web tools to reach private/localhost addresses "
           "(disables the SSRF guard) -- for trusted local use only",
+   .def_bool = false},
+  {.key = "allow_system_temp", .type = ConfigType::Bool,
+   .doc = "let the sandboxed run_shell / run_python tools use the per-user "
+          "system temp (macOS Darwin temp) as $TMPDIR + a writable root. "
+          "Default false confines ALL temp under the workspace/CWD; enable so "
+          "tools that hardcode the system temp and ignore $TMPDIR (e.g. the "
+          "macOS `mktemp` CLI) work, at the cost of temp files landing outside "
+          "the launch CWD",
+   .def_bool = false},
+  {.key = "stream_answer_only", .type = ConfigType::Bool,
+   .doc = "fold reasoning (<think>) and tool-call blocks OUT of the "
+          "streaming out-port (index 1) so a speaking consumer (e.g. "
+          "text-to-speech) voices only the answer; out-port 0 still "
+          "carries the full reply",
    .def_bool = false},
   // Flat sampler knobs; all at SamplerParams defaults -> greedy/argmax.
   {.key = "sampler_temperature", .type = ConfigType::Real,
@@ -339,6 +363,16 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "assistant",
    .doc = "FlexData {text,prefill_ms,decode_ms,ctx_pos} per turn "
+          "(downstream optional)",
+   .type = &typeid(FlexDataPayload),
+   .tags = "text", .clock_group = 0},
+  {.name = "stream",
+   .doc = "FlexData {text,end_of_response} emitted progressively during "
+          "the reply -- one beat ~every 20 words at a sentence/clause "
+          "punctuation (English + Chinese); the last beat of a reply sets "
+          "end_of_response=true. Feeds a streaming consumer (e.g. "
+          "text-to-speech) so it starts before the turn finishes. With "
+          "stream_answer_only, reasoning + tool-call spans are folded out "
           "(downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
@@ -391,6 +425,28 @@ TextChatStage::setup_file_sandbox_()
           "TextChatStage('{}'): file_sandbox_dir '{}' could not be "
           "created ({}); file/shell tools disabled",
           this->id(), _file_sandbox_dir, ec.message()));
+      _enable_file_tools = false;
+      _enable_shell_tool = false;
+      return;
+    }
+    _file_sandbox_ephemeral = false;
+  } else if (_file_sandbox_mode == "persistent") {
+    // Persistent workspace shared across chats: the session's filesystem
+    // sandbox root ($CWD/sandbox for the web-ui) -- or $CWD/sandbox
+    // literally when the session isn't sandboxed (e.g. the CLI). Kept on
+    // teardown.
+    fs::path base = session() ? session()->fs_sandbox_root() : fs::path();
+    if (base.empty()) {
+      base = fs::current_path(ec) / "sandbox";
+      ec.clear();
+    }
+    root = base;
+    fs::create_directories(root, ec);
+    if (ec) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): persistent file sandbox '{}' could not be "
+          "created ({}); file/shell tools disabled",
+          this->id(), root.string(), ec.message()));
       _enable_file_tools = false;
       _enable_shell_tool = false;
       return;
@@ -507,7 +563,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
         _tools = make_builtin_tool_registry();   // get_current_time
       }
       if (_enable_python_tool) {
-        _tools.add(make_python_tool());           // sandboxed run_python
+        PythonSandboxOptions po;
+        po.allow_system_temp = _allow_system_temp;
+        _tools.add(make_python_tool(po));         // sandboxed run_python
       }
       // The file tools and the shell tool share one workspace, so set it
       // up once when either is on, then register each enabled surface.
@@ -520,6 +578,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
       if (_enable_shell_tool && _file_sandbox) {   // sandboxed run_shell
         ShellToolOptions so;
         so.workspace = _file_sandbox->root();
+        so.allow_system_temp = _allow_system_temp;
         if (session()) {
           for (const auto& w : session()->fs_whitelist()) {
             so.extra_writable.push_back(w);
@@ -870,6 +929,81 @@ TextChatStage::process(RuntimeContext& ctx)
   // injection stay in the right order.
   int32_t last_stop_token = -1;
 
+  // ---- streaming out-port (index 1) --------------------------------
+  // Emit the assistant reply progressively as {text, end_of_response}
+  // beats -- one roughly every ~20 words, cut at a sentence/clause
+  // punctuation (English + Chinese) -- so a downstream consumer (e.g.
+  // text-to-speech) can begin work before the full turn is decoded.
+  // Chunks are accumulated across ALL decode rounds of the turn (mirrors
+  // the live UI stream); the last beat of the turn carries
+  // end_of_response=true. The per-turn record on out-port 0 is
+  // unchanged. write_sync is used because the decode loop is synchronous
+  // (no co_await inside it); the default-depth oport ring never
+  // backpressures and a closed buffer (teardown) simply ends streaming.
+  constexpr int kStreamWordTarget = 20;   // flush at a punct past ~20 words
+  constexpr int kStreamWordMax    = 60;   // hard cap (runaway clause)
+  text_stream::Chunker stream_chunker(kStreamWordTarget, kStreamWordMax);
+  bool stream_alive = true;
+  bool streamed_any = false;
+  // When stream_answer_only is set, fold reasoning (<think>) and tool-call
+  // spans OUT of the streamed text so a speaking consumer voices only the
+  // answer. The tool-call markers are only armed when tools are active (a
+  // literal marker in ordinary prose must NOT be suppressed otherwise); the
+  // thinking markers are the family-agnostic unified pair. The full text
+  // still reaches the live UI stream and out-port 0.
+  text_stream::MetaFilter stream_filter(
+      media_line::kThinkStart, media_line::kThinkEnd,
+      tools_active ? tpl->tool_call_open_marker() : std::string_view(),
+      tools_active ? tpl->tool_call_close_marker() : std::string_view());
+  auto stream_emit =
+      [&](std::string text, bool end_of_response) {
+        if (!stream_alive) { return; }
+        FlexData fd = FlexData::make_object();
+        {
+          auto o = fd.as_object();
+          o.insert("text", FlexData::make_string(text));
+          o.insert("end_of_response",
+                   FlexData::make_bool(end_of_response));
+        }
+        stream_alive =
+            ctx.write_sync(1, make_payload<FlexDataPayload>(std::move(fd)));
+      };
+  // Push VISIBLE text into the ~20-word chunker; emit a beat at each
+  // punctuation-bounded flush.
+  auto stream_consume =
+      [&](const std::string& chunk) {
+        if (chunk.empty() || !stream_alive) { return; }
+        if (stream_chunker.push(chunk)) {
+          streamed_any = true;
+          stream_emit(stream_chunker.take(), /*end_of_response=*/false);
+        }
+      };
+  // Per-token feed: route through the meta-filter when answer-only, else
+  // straight into the chunker.
+  auto stream_push =
+      [&](const std::string& chunk) {
+        if (chunk.empty() || !stream_alive) { return; }
+        if (_stream_answer_only) {
+          stream_filter.feed(chunk, stream_consume);
+        } else {
+          stream_consume(chunk);
+        }
+      };
+  // Close the stream for the turn: flush the meta-filter's held-back
+  // visible tail, then the chunker tail as the final beat with
+  // end_of_response=true. When the reply ended exactly on a flush
+  // boundary (empty tail) but we streamed earlier beats, emit a closing
+  // empty end_of_response beat; a reply that streamed nothing emits none.
+  auto stream_finish =
+      [&]() {
+        if (_stream_answer_only) { stream_filter.flush(stream_consume); }
+        if (!stream_chunker.empty()) {
+          stream_emit(stream_chunker.take(), /*end_of_response=*/true);
+        } else if (streamed_any) {
+          stream_emit(std::string(), /*end_of_response=*/true);
+        }
+      };
+
   // Decode one assistant turn. `next` is the token prefill predicted for
   // this round (its logits are still in last_logits_host() when a
   // sampled path re-samples below); `prompt_ids` are the round's full
@@ -888,12 +1022,15 @@ TextChatStage::process(RuntimeContext& ctx)
     auto out_stream = session()->open_text_stream();
     std::string assistant_text;
     auto emit_chunk =
-        [&assistant_text, &out_stream](const std::string& chunk) {
+        [&assistant_text, &out_stream, &stream_push](const std::string& chunk) {
           if (chunk.empty()) {
             return;
           }
           assistant_text += chunk;
           out_stream->write(chunk);
+          // Feed the streaming out-port (index 1): same text as the live
+          // UI stream, re-chunked into ~20-word punctuation-bounded beats.
+          stream_push(chunk);
         };
 
     auto sd = tok.make_stream_decoder();
@@ -1355,6 +1492,11 @@ TextChatStage::process(RuntimeContext& ctx)
         this->id(), decode_calls));
     break;
   }
+
+  // Close the streaming out-port for this turn: the tail text goes out
+  // as the final {text, end_of_response=true} beat (before the complete
+  // per-turn record on out-port 0, so a consumer sees the reply end).
+  stream_finish();
 
   // Emit the per-turn FlexData object on out-port 0. When nothing is
   // wired downstream the runtime drops this write; when a feedback

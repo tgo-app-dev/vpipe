@@ -93,6 +93,48 @@ TEST(python_sandbox, home_reads_denied)
   EXPECT_TRUE(r.output.find("READ_OK") == string::npos);
 }
 
+TEST(python_sandbox, scratch_navigation_works)
+{
+  if (!sandbox_available_()) { return; }
+  // os.getcwd()/chdir()/listdir() must work in the scratch dir even when it
+  // lives under the real $HOME (temp_root() defaults to $CWD/.vpipe-tmp).
+  // The secret-protecting read-deny is scoped to file CONTENTS, so these
+  // metadata/traversal calls succeed.
+  const char* code =
+      "import os\n"
+      "try:\n"
+      "    d = os.getcwd()\n"
+      "    os.chdir(d)\n"
+      "    os.listdir(d)\n"
+      "    print('NAV_OK')\n"
+      "except Exception as e:\n"
+      "    print('NAV_FAIL', e)\n";
+  auto r = run_python_sandboxed(code);
+  EXPECT_TRUE(r.ok);
+  EXPECT_TRUE(r.output.find("NAV_OK") != string::npos);
+  EXPECT_TRUE(r.output.find("NAV_FAIL") == string::npos);
+}
+
+TEST(python_sandbox, system_temp_allowed_when_opted_in)
+{
+  if (!sandbox_available_()) { return; }
+  PythonSandboxOptions o;
+  o.allow_system_temp = true;   // opt in
+  // The real use case: code that shells out to a tool hardcoding the system
+  // temp (the macOS `mktemp` CLI, which ignores $TMPDIR) now succeeds.
+  const char* code =
+      "import subprocess, os\n"
+      "r = subprocess.run(['mktemp'], capture_output=True, text=True)\n"
+      "if r.returncode == 0:\n"
+      "    print('SYS_OK'); os.remove(r.stdout.strip())\n"
+      "else:\n"
+      "    print('SYS_DENIED', r.stderr.strip())\n";
+  auto r = run_python_sandboxed(code, o);
+  EXPECT_TRUE(r.ok);
+  EXPECT_TRUE(r.output.find("SYS_OK") != string::npos);
+  EXPECT_TRUE(r.output.find("SYS_DENIED") == string::npos);
+}
+
 TEST(python_sandbox, timeout_kills_runaway)
 {
   if (!sandbox_available_()) { return; }

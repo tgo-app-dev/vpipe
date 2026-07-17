@@ -49,6 +49,13 @@ public:
   ComputeEncoder
   begin_compute(DispatchType dispatch_type = DispatchType::Serial);
 
+  // Internal (called by ComputeEncoder::dispatch for the auto command-buffer
+  // split): commit the current command buffer fire-and-forget and reopen a
+  // fresh one, retargeting `enc` at it (same dispatch type). Not for direct
+  // use. Any encode_signal/on_completion the caller adds after encoding lands
+  // on the final buffer; an encode_wait added before encoding gated the first.
+  void split_encoder_(ComputeEncoder& enc);
+
   // Append a GPU-side signal/wait of `value` on `ev` to the
   // current command buffer (auto-opened if needed). The op is
   // encoded immediately but executes only when commit() submits

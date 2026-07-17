@@ -1,5 +1,6 @@
 #include "generative-models/shared/mcp/python-sandbox.h"
 
+#include "common/command-sandbox.h"
 #include "common/flex-data.h"
 #include "common/temp-root.h"
 
@@ -53,7 +54,8 @@ find_python3_()
 // the scratch dir (+ /dev), and deny reads of the invoking user's real
 // home so model code can't slurp secrets into the reply.
 string
-build_profile_(const string& scratch_real, const string& home_real)
+build_profile_(const string& scratch_real, const string& home_real,
+               const vector<string>& temp_roots)
 {
   string p;
   p += "(version 1)\n";
@@ -62,9 +64,26 @@ build_profile_(const string& scratch_real, const string& home_real)
   p += "(deny file-write*)\n";
   p += "(allow file-write*\n";
   p += "  (subpath \"" + scratch_real + "\")\n";
+  // The per-user system temp when allow_system_temp granted it (so code that
+  // shells out to tools hardcoding it works); empty otherwise, keeping temp
+  // inside the scratch dir under the CWD.
+  for (const auto& t : temp_roots) {
+    p += "  (subpath \"" + t + "\")\n";
+  }
   p += "  (subpath \"/dev\"))\n";
   if (!home_real.empty()) {
+    // Deny reads under the real $HOME so model code can't slurp secrets into
+    // the reply -- but then re-allow file-read-METADATA. A blunt file-read*
+    // deny also blocks the stat/lookup that os.getcwd() / os.chdir() / path
+    // resolution need, so any code touching its own working directory breaks
+    // when the scratch dir lives under $HOME (temp_root() defaults to
+    // $CWD/.vpipe-tmp). Re-allowing metadata (stat/traversal only -- NOT file
+    // contents or directory listing) keeps secrets unreadable while
+    // navigation works; contents re-open only under the scratch dir below. A
+    // more-specific file-read-data deny would instead beat the scratch
+    // file-read* allow and break reads in the scratch itself.
     p += "(deny file-read* (subpath \"" + home_real + "\"))\n";
+    p += "(allow file-read-metadata (subpath \"" + home_real + "\"))\n";
     p += "(allow file-read* (subpath \"" + scratch_real + "\"))\n";
   }
   return p;
@@ -116,7 +135,12 @@ run_python_sandboxed(const string& code, const PythonSandboxOptions& opts)
     home_real = ec ? string(h) : hc.string();
   }
 
-  const string profile = build_profile_(scratch_s, home_real);
+  const vector<string> temp_roots =
+      opts.allow_system_temp ? system_temp_roots() : vector<string>{};
+  const string profile = build_profile_(scratch_s, home_real, temp_roots);
+  // TMPDIR: the per-user system temp when granted (writable above), else the
+  // ephemeral scratch under the CWD.
+  const string tmpdir = temp_roots.empty() ? scratch_s : temp_roots.front();
 
   // argv: sandbox-exec -p <profile> python3 -I -B -c <code>. -I isolates
   // python (ignores env / user site); -B suppresses .pyc writes.
@@ -130,10 +154,11 @@ run_python_sandboxed(const string& code, const PythonSandboxOptions& opts)
   }
   argv.push_back(nullptr);
 
-  // Minimal env: HOME/TMPDIR -> scratch so `~` and tempfile land in the
-  // writable dir; no inherited secrets.
+  // Minimal env: HOME -> scratch (so `~` lands in the writable dir); TMPDIR
+  // -> scratch by default, or the system temp when allow_system_temp; no
+  // inherited secrets.
   const string env_home = "HOME=" + scratch_s;
-  const string env_tmp  = "TMPDIR=" + scratch_s;
+  const string env_tmp  = "TMPDIR=" + tmpdir;
   vector<string> env_s = {
     "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
     env_home, env_tmp,
@@ -162,8 +187,6 @@ run_python_sandboxed(const string& code, const PythonSandboxOptions& opts)
       ? static_cast<rlim_t>(opts.address_space_mb) * 1024 * 1024 : 0;
   const rlim_t fsz   = opts.file_size_mb    > 0
       ? static_cast<rlim_t>(opts.file_size_mb) * 1024 * 1024 : 0;
-  const rlim_t nproc = opts.max_procs       > 0
-      ? static_cast<rlim_t>(opts.max_procs) : 0;
   const char* scratch_cstr = scratch_s.c_str();
 
   const pid_t pid = ::fork();
@@ -193,11 +216,9 @@ run_python_sandboxed(const string& code, const PythonSandboxOptions& opts)
 #else
     (void)asb;
 #endif
-#ifdef RLIMIT_NPROC
-    if (nproc) { rlimit l{nproc, nproc}; ::setrlimit(RLIMIT_NPROC, &l); }
-#else
-    (void)nproc;
-#endif
+    // No RLIMIT_NPROC: it caps the real UID's processes system-wide, so on an
+    // interactive session it is already exceeded and the child's first fork()
+    // would fail with EAGAIN.
     { rlimit l{0, 0}; ::setrlimit(RLIMIT_CORE, &l); }
     ::chdir(scratch_cstr);            // best-effort cwd = scratch
     ::execve(kSandboxExec, argv.data(), envp.data());

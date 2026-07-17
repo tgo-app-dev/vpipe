@@ -1,5 +1,4 @@
 #include "stages/coreml-inference-stage.h"
-#include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -7,59 +6,13 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 using namespace std;
 
 namespace vpipe {
-
-namespace {
-
-// Build NS::String from std::string (UTF-8). Returned object is
-// autoreleased (factory convention); caller does not own +1.
-NS::String*
-ns_str_(string_view s)
-{
-  return NS::String::string(string(s).c_str(),
-                            NS::UTF8StringEncoding);
-}
-
-// Build NS::Array<NSNumber*> from a shape vector. Each element is
-// boxed as NS::Number*. Returned array is autoreleased.
-NS::Array*
-shape_array_(const vector<int64_t>& shape)
-{
-  vector<const NS::Object*> nums;
-  nums.reserve(shape.size());
-  for (auto d : shape) {
-    nums.push_back(
-        static_cast<const NS::Object*>(NS::Number::number(
-            static_cast<long long>(d))));
-  }
-  return NS::Array::array(nums.data(),
-                          static_cast<NS::UInteger>(nums.size()));
-}
-
-// Copy an NS::Array<NSNumber*> shape into a vector<int64_t>.
-vector<int64_t>
-read_shape_(const NS::Array* arr)
-{
-  vector<int64_t> out;
-  if (!arr) {
-    return out;
-  }
-  NS::UInteger n = arr->count();
-  out.reserve(n);
-  for (NS::UInteger i = 0; i < n; ++i) {
-    auto* num = arr->object<NS::Number>(i);
-    out.push_back(num ? num->longLongValue() : 0);
-  }
-  return out;
-}
-
-}
 
 CoreMLInferenceStage::CoreMLInferenceStage(const SessionContextIntf* s,
                                            string                    id,
@@ -158,13 +111,8 @@ CoreMLInferenceStage::spec() const noexcept
 
 CoreMLInferenceStage::~CoreMLInferenceStage()
 {
-  if (_opts) {
-    _opts->release();
-    _opts = nullptr;
-  }
   // _loaded drops via shared_ptr; the underlying CoreMLLoadedModel
-  // releases its retained CML::Model when the last consumer goes
-  // away.
+  // releases its retained model when the last consumer goes away.
 }
 
 Job
@@ -190,12 +138,6 @@ CoreMLInferenceStage::initialize(RuntimeContext& /*ctx*/)
         "(see prior log entries for the underlying error)",
         this->id(), _model_path));
   }
-
-  auto* pool = NS::AutoreleasePool::alloc()->init();
-  auto* opts = CML::PredictionOptions::alloc()->init();
-  opts->setUsesCPUOnly(_uses_cpu_only);
-  _opts = opts;  // alloc/init returns +1; no extra retain.
-  pool->release();
   co_return;
 }
 
@@ -218,53 +160,6 @@ CoreMLInferenceStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // Decide up-front whether every requested output has a fully-
-  // specified shape. If yes we take the zero-copy outputBackings
-  // path; otherwise we drop into the legacy memcpy path for that
-  // call so flexible-shape models still work.
-  vector<TensorBeat> outputs;
-  bool all_fixed = true;
-  for (const auto& name : _output_feature_names) {
-    auto it = _loaded->output_descs().find(name);
-    if (it == _loaded->output_descs().end() || !it->second.fixed) {
-      all_fixed = false;
-      break;
-    }
-  }
-  if (all_fixed) {
-    outputs.reserve(_output_feature_names.size());
-    for (const auto& name : _output_feature_names) {
-      const auto& d = _loaded->output_descs().at(name);
-      TensorBeat tb;
-      tb.shape = d.shape;
-      tb.dtype = TensorBeat::DType::F32;  // CoreML output is f32
-      size_t n = 1;
-      for (auto x : d.shape) {
-        n *= static_cast<size_t>(x);
-      }
-      // tb.data is raw bytes; CoreML writes f32 into this buffer so
-      // we size it in bytes = elements * sizeof(float). Previously
-      // this was sized to `n` bytes (element-count, not byte-count),
-      // which the initWithDataPointer binding would overrun by 3*n
-      // bytes -- a latent heap-corruption bug that landed quietly in
-      // the malloc bucket's tail padding for small test tensors.
-      tb.data.resize(n * sizeof(float));
-      outputs.push_back(std::move(tb));
-    }
-  }
-
-  // Serialise per-model so multiple worker threads can't all stall
-  // inside CoreML's framework mutex; observable contention here is
-  // strictly cheaper than opaque blocking inside Apple's runtime.
-  std::lock_guard<std::mutex> lk(_loaded->predict_mutex());
-
-  // Build the source pointer + strides to hand to MLMultiArray.
-  // TensorBeat's PyTorch-style element strides are directly
-  // compatible with MLMultiArray (same row-major orientation,
-  // larger-than-shape outer strides allowed for pitch padding) so
-  // we can publish the buffer zero-copy when the innermost stride
-  // is 1. Non-unit innermost stride (a v2+ TensorBeat feature) and
-  // any failure path fall back to materialize_contiguous().
   if (tin->dtype != TensorBeat::DType::F32) {
     session()->warn(fmt(
         "coreml-inference: unsupported input dtype '{}' "
@@ -272,185 +167,91 @@ CoreMLInferenceStage::process(RuntimeContext& ctx)
         tin->dtype_name()));
     co_return;
   }
+
+  // Build the input pointer + strides for the model input feature.
+  // TensorBeat's PyTorch-style element strides are directly compatible
+  // with the MLMultiArray predict() builds (same row-major orientation,
+  // larger-than-shape outer strides allowed) so the buffer is published
+  // zero-copy when the innermost stride is 1; a non-unit innermost
+  // stride is materialized contiguous first.
   const bool tb_strided = !tin->strides.empty();
   const bool stride_ok  = !tb_strided || tin->strides.back() == 1;
   AlignedVector<float> tmp_in;
   const float*         in_src = tin->as_f32();
-  const size_t         in_n   = tin->element_count();
   std::vector<int64_t> in_strides;
   if (stride_ok) {
-    in_strides = tb_strided ? tin->strides
-                            : tin->contiguous_strides();
+    in_strides = tb_strided ? tin->strides : tin->contiguous_strides();
   } else {
     tmp_in     = tin->materialize_contiguous_as<float>();
     in_src     = tmp_in.data();
     in_strides = tin->contiguous_strides();
   }
 
-  bool ok = false;
-  {
-    auto* pool = NS::AutoreleasePool::alloc()->init();
+  CoreMLPredictInput cin;
+  cin.name    = _input_feature_name;
+  cin.data    = in_src;
+  cin.dtype   = CoreMLDType::F32;
+  cin.shape   = tin->shape;
+  cin.strides = in_strides;
 
-    // ---- Input MultiArray, zero-copy via initWithDataPointer.
-    NS::Array* in_shape       = shape_array_(tin->shape);
-    NS::Array* in_strides_arr = shape_array_(in_strides);
-    NS::Error* err            = nullptr;
-    auto* in_multi = CML::MultiArray::alloc()->initWithDataPointer(
-        const_cast<float*>(in_src),
-        in_shape, CML::MultiArrayDataTypeFloat32,
-        in_strides_arr,
-        /* deallocator */ nullptr,
-        &err);
-    if (err || !in_multi) {
-      // Surface the NSError, then fall back to alloc + memcpy.
-      string desc = "(no NSError details)";
-      if (err && err->localizedDescription()) {
-        if (const char* utf8 =
-                err->localizedDescription()->utf8String()) {
-          desc = utf8;
-        }
+  // One output per configured feature. A fixed-shape output's
+  // TensorBeat is pre-allocated and handed to predict() as a zero-copy
+  // backing; flexible-shape outputs are filled from predict()'s owned
+  // buffer afterwards.
+  const size_t                     no = _output_feature_names.size();
+  std::vector<TensorBeat>          obeats(no);
+  std::vector<CoreMLPredictOutput> couts(no);
+  for (size_t i = 0; i < no; ++i) {
+    couts[i].name = _output_feature_names[i];
+    couts[i].want = CoreMLDType::F32;   // CoreML output decoded to f32
+    auto it = _loaded->output_descs().find(_output_feature_names[i]);
+    if (it != _loaded->output_descs().end() && it->second.fixed) {
+      size_t n = 1;
+      for (auto d : it->second.shape) {
+        n *= static_cast<size_t>(d);
       }
-      session()->warn(fmt(
-          "coreml-inference: initWithDataPointer failed ({}); "
-          "retrying via initWithShape+memcpy", desc));
-      err = nullptr;
-      const float* contig = in_src;
-      if (stride_ok && tb_strided) {
-        // The strided source isn't safe for a flat memcpy; build a
-        // contiguous copy for the fallback path.
-        tmp_in = tin->materialize_contiguous_as<float>();
-        contig = tmp_in.data();
-      }
-      in_multi = CML::MultiArray::alloc()->initWithShape(
-          in_shape, CML::MultiArrayDataTypeFloat32, &err);
-      if (!err && in_multi) {
-        std::memcpy(in_multi->dataPointer(), contig,
-                    in_n * sizeof(float));
-      }
+      obeats[i].dtype = TensorBeat::DType::F32;
+      obeats[i].shape = it->second.shape;
+      obeats[i].resize_contiguous(n);
+      couts[i].backing       = obeats[i].as_f32();
+      couts[i].backing_elems = n;
     }
-
-    if (err || !in_multi) {
-      session()->error(fmt(
-          "coreml-inference: MLMultiArray init failed"));
-    } else {
-      auto* fv  = CML::FeatureValue::featureValueWithMultiArray(in_multi);
-      auto* key = ns_str_(_input_feature_name);
-      const NS::Object* objs[1] = { fv };
-      const NS::Object* keys[1] = { key };
-      NS::Dictionary* dict = NS::Dictionary::dictionary(objs, keys, 1);
-
-      auto* dfp = CML::DictionaryFeatureProvider::alloc()
-                      ->initWithDictionary(dict, &err);
-      if (err || !dfp) {
-        session()->error(fmt(
-            "coreml-inference: feature provider init failed"));
-      } else {
-        // ---- Output MultiArrays, zero-copy via setOutputBackings
-        //      when every requested output has a fixed shape.
-        if (all_fixed) {
-          vector<const NS::Object*> back_objs;
-          vector<const NS::Object*> back_keys;
-          back_objs.reserve(outputs.size());
-          back_keys.reserve(outputs.size());
-          bool back_ok = true;
-          for (size_t i = 0; i < outputs.size(); ++i) {
-            NS::Array* sh = shape_array_(outputs[i].shape);
-            auto* om = CML::MultiArray::alloc()->initWithDataPointer(
-                outputs[i].data.data(),
-                sh, CML::MultiArrayDataTypeFloat32,
-                /* strides */ nullptr,
-                /* deallocator */ nullptr,
-                &err);
-            if (err || !om) {
-              back_ok = false;
-              break;
-            }
-            back_objs.push_back(om);
-            back_keys.push_back(ns_str_(_output_feature_names[i]));
-          }
-          if (back_ok) {
-            NS::Dictionary* backings = NS::Dictionary::dictionary(
-                back_objs.data(), back_keys.data(),
-                static_cast<NS::UInteger>(back_objs.size()));
-            _opts->setOutputBackings(backings);
-          } else {
-            // Couldn't bind output backings; fall back to the copy
-            // path on this call.
-            all_fixed = false;
-            outputs.clear();
-          }
-          // Note: the MultiArray instances created here are
-          // autoreleased into `pool`; CoreML retains the entries it
-          // pulls out of the dictionary across the predict call.
-        }
-
-        // ANE timeline: the CoreML prediction is the Apple-Neural-
-        // Engine job. Bracket just the predict call; it records under
-        // this stage's gvid so the block is named/colored by the stage.
-        record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
-        auto* result = _loaded->model()->predictionFromFeatures(
-            dfp, _opts, &err);
-        record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
-        if (err || !result) {
-          session()->error(fmt(
-              "coreml-inference: predictionFromFeatures failed"));
-        } else if (all_fixed) {
-          // Outputs are already populated in our TensorBeats.
-          ok = true;
-        } else {
-          // Legacy memcpy path: build outputs from the result
-          // FeatureProvider's MultiArrays.
-          ok = true;
-          outputs.clear();
-          for (const auto& name : _output_feature_names) {
-            auto* nm  = ns_str_(name);
-            auto* val = result->featureValueForName(nm);
-            if (!val) {
-              ok = false;
-              break;
-            }
-            auto* arr = val->multiArrayValue();
-            if (!arr) {
-              outputs.emplace_back();
-              continue;
-            }
-            TensorBeat tout;
-            tout.shape = read_shape_(arr->shape());
-            tout.dtype = TensorBeat::DType::F32;
-            size_t n = 1;
-            for (auto d : tout.shape) {
-              n *= static_cast<size_t>(d);
-            }
-            // tout.data is raw bytes; CoreML output is float32 so we
-            // size in bytes accordingly. Pre-refactor this used a
-            // uint8_t vector sized to `n` and the memcpy below wrote
-            // 4*n bytes, a quiet overrun that became fatal once
-            // TensorStorage shifted the heap layout.
-            tout.data.resize(n * sizeof(float));
-            std::memcpy(tout.data.data(), arr->dataPointer(),
-                        n * sizeof(float));
-            outputs.push_back(std::move(tout));
-          }
-        }
-        dfp->release();
-      }
-
-      in_multi->release();
-    }
-
-    pool->release();
   }
 
+  const CoreMLPredictInput cins[1] = { std::move(cin) };
+  // ANE timeline: the CoreML prediction is the Apple-Neural-Engine job.
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
+  const bool ok = _loaded->predict(cins, couts, _uses_cpu_only);
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
   if (!ok) {
+    session()->error(fmt("coreml-inference: prediction failed"));
     ctx.signal_done();
     co_return;
   }
 
-  // Fan out: one TensorBeat per output port. If outputs.size() <
-  // num_oports we just stop -- alignment is configured statically.
-  for (size_t i = 0; i < outputs.size() && i < ctx.num_oports(); ++i) {
+  // Fixed outputs are filled in place (backing); flexible ones are
+  // copied from predict()'s owned buffer.
+  for (size_t i = 0; i < no; ++i) {
+    if (couts[i].backing) {
+      continue;   // obeats[i] already holds the result
+    }
+    size_t n = 1;
+    for (auto d : couts[i].shape) {
+      n *= static_cast<size_t>(d);
+    }
+    obeats[i].dtype = TensorBeat::DType::F32;
+    obeats[i].shape = couts[i].shape;
+    obeats[i].resize_contiguous(n);
+    if (couts[i].data && n) {
+      std::memcpy(obeats[i].as_f32(), couts[i].data, n * sizeof(float));
+    }
+  }
+
+  // Fan out: one TensorBeat per output port. If no < num_oports we just
+  // stop -- alignment is configured statically.
+  for (size_t i = 0; i < no && i < ctx.num_oports(); ++i) {
     co_await ctx.write(static_cast<unsigned>(i),
-        make_payload<TensorBeatPayload>(std::move(outputs[i])));
+        make_payload<TensorBeatPayload>(std::move(obeats[i])));
   }
 }
 

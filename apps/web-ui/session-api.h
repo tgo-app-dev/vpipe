@@ -6,6 +6,7 @@
 #include "common/flex-data.h"
 #include "vpipe/pipeline-handle.h"
 
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -207,6 +208,23 @@ private:
   // GET /api/fs/list?path= : one directory's entries for the file
   // open/save dialog, in the session's (possibly sandboxed) namespace.
   HttpResponse h_fs_list_(const HttpRequest&);
+  // GET /api/fs/file?path= : raw bytes of one file for the file-browser
+  // preview (image / audio / video / text). Range-aware (206 partial)
+  // and per-response size-bounded. Sandbox-confined (read-only).
+  HttpResponse h_fs_file_(const HttpRequest&);
+  // POST /api/fs/mkdir {path, name} : create a directory `name` under
+  // the existing virtual directory `path`. Sandbox-confined for write.
+  HttpResponse h_fs_mkdir_(const HttpRequest&);
+  // POST /api/fs/rename {path, to} : rename the item at virtual `path`
+  // to base name `to`, in place. Sandbox-confined for write.
+  HttpResponse h_fs_rename_(const HttpRequest&);
+  // Map a client virtual path to a real host path with the same
+  // namespace rules as h_fs_list_ (sandbox chroot / native passthrough).
+  // Returns {} and sets *err on rejection; *vpath receives the cleaned
+  // virtual path. `for_write` is forwarded to confine_path.
+  std::filesystem::path fs_resolve_(const std::string& want,
+                                    bool for_write, std::string* vpath,
+                                    std::string* err) const;
 
   // ---- internals -------------------------------------------------
   Pipe* find_(const std::string& id);

@@ -31,7 +31,24 @@ namespace {
 #if defined(__APPLE__)
 constexpr const char* kSandboxExec = "/usr/bin/sandbox-exec";
 #endif
-constexpr const char* kShell = "/bin/sh";
+
+// The shell we exec `-c <command>` with. Prefer /bin/bash so interactive-
+// shell idioms behave as they do in the user's terminal -- notably
+// `echo -e`: macOS /bin/sh is bash in POSIX mode, where `echo` does NOT take
+// `-e` as a flag and prints a literal "-e ". Fall back to /bin/sh where bash
+// is absent. Resolved once. (`make` and friends still re-exec /bin/sh for
+// recipes, so the exec whitelist allows both.)
+const char*
+shell_path_()
+{
+#if defined(__APPLE__) || defined(__unix__)
+  static const char* const kShell =
+      (::access("/bin/bash", X_OK) == 0) ? "/bin/bash" : "/bin/sh";
+#else
+  static const char* const kShell = "/bin/sh";
+#endif
+  return kShell;
+}
 
 // Canonical form (symlinks + /var -> /private/var + ".." collapsed), with a
 // lexical-normal fallback when the target does not exist yet. Matches how
@@ -92,11 +109,13 @@ resolve_exec_(const string& name, vector<string>& out)
 
 #if defined(__APPLE__)
 // Compile the seatbelt profile that contains the command's side effects:
-// deny writes outside `writable`, deny the real $HOME reads, deny network
-// (unless allowed), and -- when `exec_allow` is non-empty -- deny
-// process-exec of anything but the shell and the whitelisted programs.
+// deny writes outside `writable` (+ /dev, + `temp_roots` when granted), deny
+// the real $HOME reads, deny network (unless allowed), and -- when
+// `exec_allow` is non-empty -- deny process-exec of anything but the shell
+// and the whitelisted programs.
 string
-build_profile_(const CommandSandboxSpec& spec, const string& home)
+build_profile_(const CommandSandboxSpec& spec, const string& home,
+               const vector<string>& temp_roots)
 {
   string p;
   p += "(version 1)\n";
@@ -109,21 +128,44 @@ build_profile_(const CommandSandboxSpec& spec, const string& home)
   for (const auto& w : spec.writable_roots) {
     p += "  (subpath \"" + esc_(canon_(w)) + "\")\n";
   }
+  // Besides the writable roots, only /dev -- and, when allow_system_temp was
+  // set, the per-user system temp (so tools that hardcode it, ignoring
+  // $TMPDIR, work). With it OFF `temp_roots` is empty and the child's $TMPDIR
+  // points at a subdir UNDER the workspace (see the env setup), so every temp
+  // file stays inside the launch CWD; nothing is written outside it (bar the
+  // caller's explicit whitelist grants).
+  for (const auto& t : temp_roots) {
+    p += "  (subpath \"" + esc_(t) + "\")\n";
+  }
   p += "  (subpath \"/dev\"))\n";
   if (!home.empty()) {
+    // Deny reads under the real $HOME so model code can't slurp secrets
+    // (~/.ssh, ~/.aws, keychains) into the reply -- but then re-allow
+    // file-read-METADATA. A blunt file-read* deny also blocks the stat/lookup
+    // that `cd`, `getcwd`, and path resolution need, so any command that
+    // changes directory breaks the instant the sandbox workspace lives under
+    // $HOME (the persistent web-ui case, $CWD/sandbox). Re-allowing metadata
+    // (stat/traversal only -- NOT file contents or directory listing) makes
+    // navigation work while secrets stay unreadable. Contents re-open only
+    // under the writable roots below. (Order matters: a same-specificity
+    // file-read* allow on a writable root under $HOME must come AFTER this
+    // deny to win; a more-specific file-read-data deny here would instead
+    // beat that allow and break reads in a $HOME workspace.)
     p += "(deny file-read* (subpath \"" + esc_(home) + "\"))\n";
-    // Re-open reads under the writable roots (a workspace may live under
-    // $HOME, and the child must read what it just wrote there).
+    p += "(allow file-read-metadata (subpath \"" + esc_(home) + "\"))\n";
+    // Re-open FULL reads under the writable roots (a workspace may live under
+    // $HOME, and the child must read/list what it just wrote there).
     for (const auto& w : spec.writable_roots) {
       p += "(allow file-read* (subpath \"" + esc_(canon_(w)) + "\"))\n";
     }
   }
   if (!spec.exec_allow.empty()) {
     vector<string> allowed;
-    // The shell machinery must exec: /bin/sh on macOS is a bash "variant"
-    // that internally re-execs /bin/bash, so both have to be allowed or
-    // even a whitelisted program never gets a shell to launch it.
-    resolve_exec_(kShell, allowed);
+    // The shell machinery must exec: we run the command with /bin/bash
+    // (shell_path_), but `make` and other tools re-exec /bin/sh for their
+    // recipes, so both have to be allowed or a whitelisted program never
+    // gets a shell to launch it.
+    resolve_exec_("/bin/sh", allowed);
     resolve_exec_("/bin/bash", allowed);
     for (const auto& n : spec.exec_allow) {
       resolve_exec_(n, allowed);
@@ -174,6 +216,25 @@ struct LineSplitter {
 
 }  // namespace
 
+std::vector<std::string>
+system_temp_roots()
+{
+  std::vector<std::string> out;
+#if defined(__APPLE__)
+  auto add_confstr = [&out](int name) {
+    const size_t n = ::confstr(name, nullptr, 0);
+    if (n == 0) { return; }
+    std::string buf(n, '\0');
+    if (::confstr(name, buf.data(), n) == 0) { return; }
+    buf.resize(::strlen(buf.c_str()));      // drop confstr's trailing NUL
+    if (!buf.empty()) { out.push_back(canon_(buf)); }
+  };
+  add_confstr(_CS_DARWIN_USER_TEMP_DIR);
+  add_confstr(_CS_DARWIN_USER_CACHE_DIR);
+#endif
+  return out;
+}
+
 CommandSandboxResult
 run_shell_command(const std::string&        command,
                   const CommandSandboxSpec& spec,
@@ -188,6 +249,10 @@ run_shell_command(const std::string&        command,
   return r;
 #else
 
+  // TMPDIR handed to a sandboxed child: the per-user system temp when
+  // allow_system_temp granted it (writable under the profile below);
+  // otherwise empty and the env setup points $TMPDIR under the workspace.
+  string sandbox_tmpdir;
 #if defined(__APPLE__)
   string profile;
   if (spec.enabled) {
@@ -199,7 +264,10 @@ run_shell_command(const std::string&        command,
     if (const char* h = ::getenv("HOME"); h && *h) {
       home = canon_(h);
     }
-    profile = build_profile_(spec, home);
+    const vector<string> temp_roots =
+        spec.allow_system_temp ? system_temp_roots() : vector<string>{};
+    profile = build_profile_(spec, home, temp_roots);
+    if (!temp_roots.empty()) { sandbox_tmpdir = temp_roots.front(); }
   }
 #else
   if (spec.enabled) {
@@ -220,15 +288,16 @@ run_shell_command(const std::string&        command,
   }
 
   // argv (parent-owned strings; c_str() captured just before fork).
+  const char* const shell = shell_path_();
   vector<string> argv_s;
 #if defined(__APPLE__)
   if (spec.enabled) {
-    argv_s = {kSandboxExec, "-p", profile, kShell, "-c", command};
+    argv_s = {kSandboxExec, "-p", profile, shell, "-c", command};
   } else {
-    argv_s = {kShell, "-c", command};
+    argv_s = {shell, "-c", command};
   }
 #else
-  argv_s = {kShell, "-c", command};
+  argv_s = {shell, "-c", command};
 #endif
   vector<char*> argv;
   argv.reserve(argv_s.size() + 1);
@@ -248,10 +317,23 @@ run_shell_command(const std::string&        command,
         ? cwd
         : (spec.writable_roots.empty() ? string(".")
                                        : canon_(spec.writable_roots.front()));
+    // $TMPDIR: the per-user system temp when allow_system_temp granted it;
+    // otherwise a dedicated subdir UNDER the workspace (already a writable
+    // root, and under the launch CWD), so every temp file a command creates
+    // stays inside the CWD. The subdir is created here (parent side) before
+    // the child runs; falls back to the workspace root if it can't be made.
+    string tmpdir = sandbox_tmpdir;
+    if (tmpdir.empty()) {
+      tmpdir = ws;
+      std::error_code te;
+      const fs::path td = fs::path(ws) / ".vpipe_tmp";
+      fs::create_directories(td, te);
+      if (!te) { tmpdir = td.string(); }
+    }
     env_s = {
       "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
       "HOME=" + ws,
-      "TMPDIR=" + ws,
+      "TMPDIR=" + tmpdir,
       "LC_ALL=en_US.UTF-8",
     };
     envp.reserve(env_s.size() + 1);
@@ -283,8 +365,6 @@ run_shell_command(const std::string&        command,
       ? static_cast<rlim_t>(spec.address_space_mb) * 1024 * 1024 : 0;
   const rlim_t fsz = spec.file_size_mb > 0
       ? static_cast<rlim_t>(spec.file_size_mb) * 1024 * 1024 : 0;
-  const rlim_t nproc = spec.max_procs > 0
-      ? static_cast<rlim_t>(spec.max_procs) : 0;
   const char* cwd_cstr = cwd.empty() ? nullptr : cwd.c_str();
   const char* argv0    = argv_s.front().c_str();
 
@@ -324,11 +404,9 @@ run_shell_command(const std::string&        command,
 #else
     (void)asb;
 #endif
-#ifdef RLIMIT_NPROC
-    if (nproc) { rlimit l{nproc, nproc}; ::setrlimit(RLIMIT_NPROC, &l); }
-#else
-    (void)nproc;
-#endif
+    // No RLIMIT_NPROC: it caps the real UID's processes system-wide, so on an
+    // interactive session the limit is already blown and the child's first
+    // fork() (e.g. to run an external program from the shell) would fail.
     { rlimit l{0, 0}; ::setrlimit(RLIMIT_CORE, &l); }
     if (cwd_cstr) { ::chdir(cwd_cstr); }
     ::execve(argv0, argv.data(), child_env);

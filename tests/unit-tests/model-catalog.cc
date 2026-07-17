@@ -267,6 +267,21 @@ TEST(model_catalog, io_types_and_category) {
   EXPECT_TRUE(gout.size() == 1);
   EXPECT_TRUE(has_(gout, "text"));
 
+  // The unified 12B is the same multimodal Gemma-4 family (not text-only):
+  // image/audio/video/text in, text out -- like the e4b.
+  const ModelCatalogEntry* g12 =
+      catalog_by_path("google/gemma-4-12B-it-qat-q4_0-gguf");
+  EXPECT_TRUE(g12 != nullptr);
+  FlexData g12f = catalog_entry_to_flex(*g12);
+  auto g12in = flex_arr_(g12f, "inputs");
+  EXPECT_TRUE(has_(g12in, "text"));
+  EXPECT_TRUE(has_(g12in, "image"));
+  EXPECT_TRUE(has_(g12in, "audio"));
+  EXPECT_TRUE(has_(g12in, "video"));
+  auto g12out = flex_arr_(g12f, "outputs");
+  EXPECT_TRUE(g12out.size() == 1);
+  EXPECT_TRUE(has_(g12out, "text"));
+
   const ModelCatalogEntry* fx =
       catalog_by_path("black-forest-labs/FLUX.2-klein-4B");
   EXPECT_TRUE(fx != nullptr);

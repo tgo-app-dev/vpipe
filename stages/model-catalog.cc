@@ -486,10 +486,10 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text", "image", "video"}, {"text"});
   } else if (mt == "qwen3-asr") {
     set({"audio"}, {"text"});
-  } else if (mt == "gemma4") {
+  } else if (mt == "gemma4" || mt == "gemma4_unified") {
+    // Both the effective (e4b) and the unified (12B/31B/26B-A4B) Gemma-4
+    // models are multimodal-in / text-out.
     set({"text", "image", "audio", "video"}, {"text"});
-  } else if (mt == "gemma4_unified") {
-    set({"text"}, {"text"});
   } else if (mt == "moss-tts" || mt == "moss-tts-local"
              || mt == "moss-tts-realtime") {
     set({"text"}, {"audio"});

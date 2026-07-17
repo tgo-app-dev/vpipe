@@ -71,6 +71,32 @@ TEST(mcp_tools, dispatch_unknown_tool_reports_error)
   EXPECT_TRUE(fd.as_object().contains("error"));
 }
 
+// A model may call a declared tool under a module namespace -- the Gemma-4
+// 12B emits e.g. `file_operations.get_current_time`. Dispatch resolves the
+// segment after the last '.' to the registered tool; has() agrees.
+TEST(mcp_tools, dispatch_resolves_namespaced_tool_name)
+{
+  McpToolRegistry reg = make_builtin_tool_registry();
+  EXPECT_TRUE(reg.has("tools.get_current_time"));
+  EXPECT_TRUE(reg.has("file_operations.get_current_time"));
+  EXPECT_FALSE(reg.has("file_operations.no_such_tool"));
+
+  McpToolCall call;
+  call.name = "default_api.get_current_time";
+  const string res = reg.dispatch(call);
+  FlexData fd = FlexData::from_json(res);
+  EXPECT_TRUE(fd.is_object());
+  auto o = fd.as_object();
+  EXPECT_TRUE(o.contains("datetime"));   // resolved + ran, not "unknown tool"
+  EXPECT_FALSE(o.contains("error"));
+
+  // A namespaced name whose base is still unknown stays an error.
+  McpToolCall bad;
+  bad.name = "file_operations.create_directory_recursive";
+  FlexData bfd = FlexData::from_json(reg.dispatch(bad));
+  EXPECT_TRUE(bfd.as_object().contains("error"));
+}
+
 TEST(mcp_tools, parse_single_tool_call)
 {
   const string reply =

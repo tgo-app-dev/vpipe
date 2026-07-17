@@ -84,13 +84,13 @@ make_shell_tool(const ShellToolOptions& opts)
     CommandSandboxSpec spec;
     spec.enabled          = true;
     spec.allow_network    = opts.allow_network;
+    spec.allow_system_temp = opts.allow_system_temp;
     spec.exec_allow       = opts.exec_allow;
     spec.cwd              = opts.workspace;
     spec.timeout_ms       = opts.timeout_ms;
     spec.cpu_seconds      = opts.cpu_seconds;
     spec.address_space_mb = opts.address_space_mb;
     spec.file_size_mb     = opts.file_size_mb;
-    spec.max_procs        = opts.max_procs;
     if (!opts.workspace.empty()) {
       spec.writable_roots.push_back(opts.workspace);
     }

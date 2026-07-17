@@ -19,6 +19,7 @@
 #include <CoreVideo/CVPixelBuffer.h>
 #include <CoreVideo/CVPixelBufferIOSurface.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -425,7 +426,11 @@ letterbox_planar_u8_to_u8_chw(
       static_cast<uint32_t>(new_w), static_cast<uint32_t>(new_h),
       static_cast<uint32_t>(pad_x), static_cast<uint32_t>(pad_y),
   };
-  float params3[4] = { inv, 0.0f, 0.0f, 0.0f };
+  // inv_x = inv_y = inv, no source offset -> plain letterbox; grey 114 pad
+  // (the generalised kernel takes a pad colour, but this entry point keeps
+  // the historical 114-grey behaviour its VLM-input callers rely on).
+  float params3[4] = { inv, inv, 0.0f, 0.0f };
+  float params4[4] = { 114.0f, 114.0f, 114.0f, 0.0f };
 
   return dispatch_(mc, "letterbox_planar_u8_to_u8_chw",
       "letterbox_planar_u8_to_u8_chw", "letterbox-u8", session,
@@ -435,6 +440,107 @@ letterbox_planar_u8_to_u8_chw(
         enc.set_constant_bytes(2, params,  sizeof(params));
         enc.set_constant_bytes(3, params2, sizeof(params2));
         enc.set_constant_bytes(4, params3, sizeof(params3));
+        enc.set_constant_bytes(5, params4, sizeof(params4));
+        const Dims2D d = dims2d_(fn, out_w, out_h);
+        enc.dispatch(d.grid, d.threadgroup);
+        return true;
+      });
+}
+
+ResampleGeom
+compute_resample_geom(int in_w, int in_h, int out_w, int out_h,
+                      int mode, int src_x, int src_y, float scale)
+{
+  // Map a source rectangle into the destination via the letterbox kernel's
+  // (new_w/new_h/pad/inv/src0) parameters, per fit mode:
+  //   0 Pad     -- match the long side, centre, pad the rest.
+  //   1 Crop    -- match the short side, fill the destination, centre-crop.
+  //   2 Stretch -- fill the destination, independent x/y scale (AR change).
+  //   3 Manual  -- sample from (src_x, src_y) at `scale`, placed at the
+  //                destination origin, pad where the source runs out.
+  ResampleGeom g{};
+  const float iw = static_cast<float>(in_w), ih = static_cast<float>(in_h);
+  const float ow = static_cast<float>(out_w), oh = static_cast<float>(out_h);
+  if (mode == 2) {                              // stretch
+    g.new_w = out_w; g.new_h = out_h; g.pad_x = 0; g.pad_y = 0;
+    g.inv_x = iw / ow; g.inv_y = ih / oh; g.src_x0 = 0.0f; g.src_y0 = 0.0f;
+  } else if (mode == 1) {                        // crop (fill + centre-crop)
+    const float s = std::max(ow / iw, oh / ih);
+    g.new_w = out_w; g.new_h = out_h; g.pad_x = 0; g.pad_y = 0;
+    g.inv_x = g.inv_y = 1.0f / s;
+    g.src_x0 = (iw - ow / s) * 0.5f;
+    g.src_y0 = (ih - oh / s) * 0.5f;
+  } else if (mode == 3) {                        // manual
+    const float s = scale > 0.0f ? scale : 1.0f;
+    const int sx = std::clamp(src_x, 0, in_w - 1);
+    const int sy = std::clamp(src_y, 0, in_h - 1);
+    g.pad_x = 0; g.pad_y = 0;
+    g.new_w = std::min(out_w,
+        static_cast<int>(std::floor((iw - sx) * s)));
+    g.new_h = std::min(out_h,
+        static_cast<int>(std::floor((ih - sy) * s)));
+    if (g.new_w < 0) { g.new_w = 0; }
+    if (g.new_h < 0) { g.new_h = 0; }
+    g.inv_x = g.inv_y = 1.0f / s;
+    g.src_x0 = static_cast<float>(sx);
+    g.src_y0 = static_cast<float>(sy);
+  } else {                                       // pad (letterbox)
+    const float s = std::min(ow / iw, oh / ih);
+    g.new_w = static_cast<int>(std::round(s * iw));
+    g.new_h = static_cast<int>(std::round(s * ih));
+    g.pad_x = (out_w - g.new_w) / 2;
+    g.pad_y = (out_h - g.new_h) / 2;
+    g.inv_x = g.inv_y = 1.0f / s;
+    g.src_x0 = 0.0f; g.src_y0 = 0.0f;
+  }
+  return g;
+}
+
+bool
+resample_planar_u8_to_u8(
+    MetalCompute& mc, const ExternalStorageHandle& src,
+    int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    std::uint8_t pad_r, std::uint8_t pad_g, std::uint8_t pad_b,
+    const SessionContextIntf* session)
+{
+  if (!mc.valid()
+      || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) {
+    return false;
+  }
+  auto* src_buf = static_cast<MTL::Buffer*>(src.mtl_buffer);
+  auto* dst_buf = static_cast<MTL::Buffer*>(dst.mtl_buffer);
+  if (!src_buf || !dst_buf) { return false; }
+  const size_t need_src = static_cast<size_t>(3) * in_w * in_h;
+  const size_t need_dst = static_cast<size_t>(3) * out_w * out_h;
+  if (src.byte_size < need_src || dst.byte_size < need_dst) {
+    return false;
+  }
+
+  const ResampleGeom g =
+      compute_resample_geom(in_w, in_h, out_w, out_h, mode, src_x, src_y,
+                            scale);
+  uint32_t params[4] = {
+      static_cast<uint32_t>(in_w), static_cast<uint32_t>(in_h),
+      static_cast<uint32_t>(out_w), static_cast<uint32_t>(out_h),
+  };
+  uint32_t params2[4] = {
+      static_cast<uint32_t>(g.new_w), static_cast<uint32_t>(g.new_h),
+      static_cast<uint32_t>(g.pad_x), static_cast<uint32_t>(g.pad_y),
+  };
+  float params3[4] = { g.inv_x, g.inv_y, g.src_x0, g.src_y0 };
+  float params4[4] = { static_cast<float>(pad_r), static_cast<float>(pad_g),
+                       static_cast<float>(pad_b), 0.0f };
+
+  return dispatch_(mc, "letterbox_planar_u8_to_u8_chw",
+      "letterbox_planar_u8_to_u8_chw", "resample-u8", session,
+      [&](ComputeEncoder& enc, const ComputeFunction& fn) {
+        enc.set_mtl_buffer(0, src_buf, 0);
+        enc.set_mtl_buffer(1, dst_buf, 0);
+        enc.set_constant_bytes(2, params,  sizeof(params));
+        enc.set_constant_bytes(3, params2, sizeof(params2));
+        enc.set_constant_bytes(4, params3, sizeof(params3));
+        enc.set_constant_bytes(5, params4, sizeof(params4));
         const Dims2D d = dims2d_(fn, out_w, out_h);
         enc.dispatch(d.grid, d.threadgroup);
         return true;
@@ -530,6 +636,65 @@ letterbox_planar_u8_to_bgra_cvpixelbuffer(
   }
   CVPixelBufferUnlockBaseAddress(pb, 0);
   return ok;
+}
+
+bool
+letterbox_planar_u8_to_bgra_u8(
+    MetalCompute& mc, const ExternalStorageHandle& src,
+    int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h,
+    float* out_scale, int* out_pad_x, int* out_pad_y,
+    const SessionContextIntf* session)
+{
+  if (!mc.valid() || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) {
+    return false;
+  }
+  auto* src_buf = static_cast<MTL::Buffer*>(src.mtl_buffer);
+  auto* dst_buf = static_cast<MTL::Buffer*>(dst.mtl_buffer);
+  if (!src_buf || !dst_buf) { return false; }
+  const size_t need_src = static_cast<size_t>(3) * in_w * in_h;
+  const size_t bpr      = static_cast<size_t>(out_w) * 4u;   // tight rows
+  const size_t need_dst = bpr * static_cast<size_t>(out_h);
+  if (src.byte_size < need_src || dst.byte_size < need_dst) {
+    return false;
+  }
+
+  const float sx = static_cast<float>(out_w) / static_cast<float>(in_w);
+  const float sy = static_cast<float>(out_h) / static_cast<float>(in_h);
+  const float scale = sx < sy ? sx : sy;
+  const int   new_w = static_cast<int>(std::round(scale * in_w));
+  const int   new_h = static_cast<int>(std::round(scale * in_h));
+  const int   pad_x = (out_w - new_w) / 2;
+  const int   pad_y = (out_h - new_h) / 2;
+  const float inv   = 1.0f / scale;
+  if (out_scale) { *out_scale = scale; }
+  if (out_pad_x) { *out_pad_x = pad_x; }
+  if (out_pad_y) { *out_pad_y = pad_y; }
+
+  uint32_t params[4] = {
+      static_cast<uint32_t>(in_w),  static_cast<uint32_t>(in_h),
+      static_cast<uint32_t>(out_w), static_cast<uint32_t>(out_h),
+  };
+  uint32_t params2[4] = {
+      static_cast<uint32_t>(new_w), static_cast<uint32_t>(new_h),
+      static_cast<uint32_t>(pad_x), static_cast<uint32_t>(pad_y),
+  };
+  float    params3[4] = { inv, 0.0f, 0.0f, 0.0f };
+  uint32_t dst_bpr    = static_cast<uint32_t>(bpr);
+
+  return dispatch_(mc, "letterbox_planar_u8_to_bgra_u8",
+      "letterbox_planar_u8_to_bgra_u8", "letterbox-bgra", session,
+      [&](ComputeEncoder& enc, const ComputeFunction& fn) {
+        enc.set_mtl_buffer(0, src_buf, 0);
+        enc.set_mtl_buffer(1, dst_buf, 0);
+        enc.set_constant_bytes(2, params,   sizeof(params));
+        enc.set_constant_bytes(3, params2,  sizeof(params2));
+        enc.set_constant_bytes(4, params3,  sizeof(params3));
+        enc.set_constant_bytes(5, &dst_bpr, sizeof(dst_bpr));
+        const Dims2D d = dims2d_(fn, out_w, out_h);
+        enc.dispatch(d.grid, d.threadgroup);
+        return true;
+      });
 }
 
 bool

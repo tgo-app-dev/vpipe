@@ -13,7 +13,6 @@
 #include "stages/audio-tagging-stage.h"
 #include "stages/beats-audioset-labels.h"
 #include "stages/ced-audioset-labels.h"
-#include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "common/flex-data.h"
 #include "common/session.h"
@@ -244,52 +243,26 @@ TEST(audio_tagging_stage, real_model_smoke) {
     wav[i] = 0.2f * std::sin(2.0 * M_PI * 440.0 * i / 16000.0);
   }
 
+  // Exercise the exact input-binding + f16 output-decode path the stage
+  // uses, via the native predict() API (no coreml-cpp in the test).
   std::vector<float> probs;
   {
-    std::lock_guard<std::mutex> lk(loaded->predict_mutex());
-    auto* pool = NS::AutoreleasePool::alloc()->init();
-    NS::Error* err = nullptr;
-
-    const NS::Object* dims[2] = {
-        NS::Number::number(static_cast<long long>(1)),
-        NS::Number::number(static_cast<long long>(kSamples)) };
-    NS::Array* shape = NS::Array::array(dims, 2);
-    auto* in = CML::MultiArray::alloc()->initWithShape(
-        shape, CML::MultiArrayDataTypeFloat32, &err);
-    ASSERT_TRUE(!err && in != nullptr);
-    std::memcpy(in->dataPointer(), wav.data(),
-                kSamples * sizeof(float));
-
-    auto* fv = CML::FeatureValue::featureValueWithMultiArray(in);
-    auto* key = NS::String::string("waveform", NS::UTF8StringEncoding);
-    const NS::Object* objs[1] = { fv };
-    const NS::Object* keys[1] = { key };
-    NS::Dictionary* dict = NS::Dictionary::dictionary(objs, keys, 1);
-    auto* dfp = CML::DictionaryFeatureProvider::alloc()
-                    ->initWithDictionary(dict, &err);
-    ASSERT_TRUE(!err && dfp != nullptr);
-
-    auto* result =
-        loaded->model()->predictionFromFeatures(dfp, nullptr, &err);
-    ASSERT_TRUE(!err && result != nullptr);
-    auto* out = result->featureValueForName(
-        NS::String::string("probabilities", NS::UTF8StringEncoding));
-    ASSERT_TRUE(out != nullptr);
-    auto* arr = out->multiArrayValue();
-    ASSERT_TRUE(arr != nullptr);
-
-    NS::Integer n = 1;
-    for (NS::UInteger d = 0; d < arr->shape()->count(); ++d) {
-      n *= arr->shape()->object<NS::Number>(d)->longLongValue();
-    }
-    probs.resize(static_cast<std::size_t>(n));
-    for (NS::Integer i = 0; i < n; ++i) {
-      probs[static_cast<std::size_t>(i)] =
-          arr->objectAtIndexedSubscript(i)->floatValue();
-    }
-    dfp->release();
-    in->release();
-    pool->release();
+    vpipe::CoreMLPredictInput in;
+    in.name  = "waveform";
+    in.data  = wav.data();
+    in.dtype = vpipe::CoreMLDType::F32;
+    in.shape = { 1, kSamples };
+    vpipe::CoreMLPredictOutput out;
+    out.name = "probabilities";
+    out.want = vpipe::CoreMLDType::F32;
+    const vpipe::CoreMLPredictInput ins[1]  = { std::move(in) };
+    vpipe::CoreMLPredictOutput      outs[1] = { std::move(out) };
+    ASSERT_TRUE(loaded->predict(ins, outs));
+    const float* pf = static_cast<const float*>(outs[0].data);
+    ASSERT_TRUE(pf != nullptr);
+    std::size_t n = 1;
+    for (auto d : outs[0].shape) { n *= static_cast<std::size_t>(d); }
+    probs.assign(pf, pf + n);
   }
 
   EXPECT_TRUE(probs.size() == 527u);
@@ -340,50 +313,22 @@ TEST(audio_tagging_stage, beats_real_model_smoke) {
 
   std::vector<float> probs;
   {
-    std::lock_guard<std::mutex> lk(loaded->predict_mutex());
-    auto* pool = NS::AutoreleasePool::alloc()->init();
-    NS::Error* err = nullptr;
-
-    const NS::Object* dims[2] = {
-        NS::Number::number(static_cast<long long>(1)),
-        NS::Number::number(static_cast<long long>(kSamples)) };
-    NS::Array* shape = NS::Array::array(dims, 2);
-    auto* in = CML::MultiArray::alloc()->initWithShape(
-        shape, CML::MultiArrayDataTypeFloat32, &err);
-    ASSERT_TRUE(!err && in != nullptr);
-    std::memcpy(in->dataPointer(), wav.data(),
-                kSamples * sizeof(float));
-
-    auto* fv = CML::FeatureValue::featureValueWithMultiArray(in);
-    auto* key = NS::String::string("waveform", NS::UTF8StringEncoding);
-    const NS::Object* objs[1] = { fv };
-    const NS::Object* keys[1] = { key };
-    NS::Dictionary* dict = NS::Dictionary::dictionary(objs, keys, 1);
-    auto* dfp = CML::DictionaryFeatureProvider::alloc()
-                    ->initWithDictionary(dict, &err);
-    ASSERT_TRUE(!err && dfp != nullptr);
-
-    auto* result =
-        loaded->model()->predictionFromFeatures(dfp, nullptr, &err);
-    ASSERT_TRUE(!err && result != nullptr);
-    auto* out = result->featureValueForName(
-        NS::String::string("probs", NS::UTF8StringEncoding));
-    ASSERT_TRUE(out != nullptr);
-    auto* arr = out->multiArrayValue();
-    ASSERT_TRUE(arr != nullptr);
-
-    NS::Integer n = 1;
-    for (NS::UInteger d = 0; d < arr->shape()->count(); ++d) {
-      n *= arr->shape()->object<NS::Number>(d)->longLongValue();
-    }
-    probs.resize(static_cast<std::size_t>(n));
-    for (NS::Integer i = 0; i < n; ++i) {
-      probs[static_cast<std::size_t>(i)] =
-          arr->objectAtIndexedSubscript(i)->floatValue();
-    }
-    dfp->release();
-    in->release();
-    pool->release();
+    vpipe::CoreMLPredictInput in;
+    in.name  = "waveform";
+    in.data  = wav.data();
+    in.dtype = vpipe::CoreMLDType::F32;
+    in.shape = { 1, kSamples };
+    vpipe::CoreMLPredictOutput out;
+    out.name = "probs";
+    out.want = vpipe::CoreMLDType::F32;
+    const vpipe::CoreMLPredictInput ins[1]  = { std::move(in) };
+    vpipe::CoreMLPredictOutput      outs[1] = { std::move(out) };
+    ASSERT_TRUE(loaded->predict(ins, outs));
+    const float* pf = static_cast<const float*>(outs[0].data);
+    ASSERT_TRUE(pf != nullptr);
+    std::size_t n = 1;
+    for (auto d : outs[0].shape) { n *= static_cast<std::size_t>(d); }
+    probs.assign(pf, pf + n);
   }
 
   EXPECT_TRUE(probs.size() == 527u);

@@ -352,16 +352,15 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/shared-buffer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/texture.h
         DESTINATION include/apple-silicon/metal-compute)
-    # CoreML SDK: the model manager + the vendored CoreML C++ wrapper. A
-    # CoreML plugin is just a stage that loads a model via
-    # session()->coreml_model_manager() and decodes tensors to Beats; the
-    # vendored coreml-cpp/*.hpp let it touch CML::Model* directly.
+    # CoreML SDK: the model manager ONLY. A CoreML plugin is just a stage
+    # that loads a model via session()->coreml_model_manager()->load() and
+    # runs it through CoreMLLoadedModel::predict() (neutral CoreMLPredict*
+    # structs). All CoreML / Foundation / CoreVideo marshaling lives inside
+    # libvpipe, so the vendored coreml-cpp/*.hpp are intentionally NOT
+    # installed -- a plugin never needs them.
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/coreml/coreml-model-manager.h
         DESTINATION include/apple-silicon/coreml)
-    install(DIRECTORY apple-silicon/coreml/coreml-cpp
-        DESTINATION include/apple-silicon/coreml
-        FILES_MATCHING PATTERN "*.hpp")
 endif()
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE

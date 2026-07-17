@@ -28,9 +28,9 @@ release_mtl_buffer_(void* mtl_buffer)
 }
 
 // TensorBeat::DType uses the same ordinals as metal_compute::DType
-// (U8=0, I8=1, Bf16=2, F32=3) -- the matching order is intentional
-// so the conversion is mechanical. The explicit switch documents
-// the contract and would catch reordering.
+// (U8=0, I8=1, Bf16=2, F32=3, F16=4) -- the matching order is
+// intentional so the conversion is mechanical. The explicit switch
+// documents the contract and would catch reordering.
 DType
 to_view_dtype_(TensorBeat::DType d) noexcept
 {
@@ -38,6 +38,7 @@ to_view_dtype_(TensorBeat::DType d) noexcept
     case TensorBeat::DType::U8:   return DType::U8;
     case TensorBeat::DType::I8:   return DType::I8;
     case TensorBeat::DType::Bf16: return DType::Bf16;
+    case TensorBeat::DType::F16:  return DType::F16;
     case TensorBeat::DType::F32:  return DType::F32;
   }
   return DType::F32;
@@ -50,6 +51,7 @@ to_beat_dtype_(DType d) noexcept
     case DType::U8:   return TensorBeat::DType::U8;
     case DType::I8:   return TensorBeat::DType::I8;
     case DType::Bf16: return TensorBeat::DType::Bf16;
+    case DType::F16:  return TensorBeat::DType::F16;
     case DType::F32:  return TensorBeat::DType::F32;
   }
   return TensorBeat::DType::F32;

@@ -16,7 +16,16 @@ struct PythonSandboxOptions {
   long   cpu_seconds       = 10;           // RLIMIT_CPU (hard = +2s)
   long   address_space_mb  = 2048;         // RLIMIT_AS (0 => leave alone)
   long   file_size_mb      = 64;           // RLIMIT_FSIZE (0 => leave alone)
-  long   max_procs         = 64;           // RLIMIT_NPROC (0 => leave alone)
+  // Allow the per-user system temp as a writable root + $TMPDIR (default
+  // false confines all temp to the ephemeral scratch under the CWD). Enable
+  // so code that shells out to tools hardcoding the system temp works, at the
+  // cost of temp files landing outside the launch CWD. See
+  // vpipe::system_temp_roots() / CommandSandboxSpec::allow_system_temp.
+  bool   allow_system_temp = false;
+  // No RLIMIT_NPROC: it counts the real UID's processes system-wide, not this
+  // run's descendants, so on an interactive session it is already exceeded and
+  // would make the child's first fork() fail. CPU/time limits + the seatbelt
+  // contain runaway instead.
 };
 
 // Outcome of a sandboxed run. `ok` means the child spawned and we

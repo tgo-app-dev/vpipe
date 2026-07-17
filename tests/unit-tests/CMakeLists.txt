@@ -26,6 +26,7 @@ set(LOCAL_TEST_SOURCES
   log-delegate.cc
   media-decode.cc
   media-line.cc
+  text-stream-chunk.cc
   mini-http.cc
   command-sandbox.cc
   path-sandbox.cc
@@ -127,6 +128,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute-image-ops.cc
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc
+        image-resample-stage.cc
         text-chat-stage.cc
         text-to-speech-stage.cc
         visual-qa-stage.cc

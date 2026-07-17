@@ -62,6 +62,19 @@ namespace vpipe {
 // consumer is a feedback-rx + feedback-tx pair driving the input
 // stage in an interactive chat loop.
 //
+// Out-port 1 ("stream") emits the SAME reply progressively, as a series
+// of FlexData objects with keys:
+//   text            (string) -- one chunk of the reply
+//   end_of_response (bool)   -- true only on the final chunk of the turn
+// A chunk is flushed roughly every ~20 words at a sentence/clause
+// punctuation boundary (English + Chinese; see common/text-stream-chunk.h),
+// so a streaming consumer -- notably text-to-speech, whose barge-in
+// respects end_of_response -- can start before the turn finishes. Like
+// out-port 0 it is unconditional and downstream-optional. When
+// `stream_answer_only` is set the reasoning (<think>) and tool-call blocks
+// are folded OUT of this port so a speaking consumer voices only the
+// answer; out-port 0 still carries the full text.
+//
 // Configuration (FlexData object on the 4th constructor parameter):
 //   hf_dir         (string, required)         -- path to a Hugging-
 //                                                Face style Llama
@@ -144,6 +157,17 @@ public:
   bool file_tools_enabled() const noexcept { return _enable_file_tools; }
   bool shell_tool_enabled() const noexcept { return _enable_shell_tool; }
   bool web_tools_enabled() const noexcept { return _enable_web_tools; }
+  bool allow_system_temp() const noexcept { return _allow_system_temp; }
+  bool stream_answer_only() const noexcept { return _stream_answer_only; }
+  const std::string& file_sandbox_mode() const noexcept
+  { return _file_sandbox_mode; }
+  const std::string& file_sandbox_root() const noexcept
+  { return _file_sandbox_root; }
+  // Test-only: run the file-sandbox root resolution (normally done inside
+  // initialize(), after the model load, which the test skips) and return
+  // the resolved root.
+  const std::string& resolve_file_sandbox_for_test()
+  { setup_file_sandbox_(); return _file_sandbox_root; }
 #if defined(VPIPE_BUILD_APPLE_SILICON)
   // The flattened `mtp` opt-out (metal path only). Test-visible.
   bool mtp_enabled() const noexcept { return _mtp_enabled; }
@@ -172,10 +196,13 @@ private:
   // default false). Adds read_file / write_file / list_files backed by a
   // FileSandbox rooted at _file_sandbox_root; paths cannot escape it.
   bool        _enable_file_tools{};
-  // Workspace root for the file tools (config "file_sandbox_dir"). Empty
-  // => an ephemeral per-stage temp dir is created in initialize() and
-  // removed in the destructor (_file_sandbox_ephemeral tracks that).
+  // Workspace root for the file tools. An explicit "file_sandbox_dir"
+  // wins; otherwise "file_sandbox" picks the mode: "per-chat" (default) is
+  // an ephemeral per-stage temp dir created in initialize() and removed in
+  // the destructor (_file_sandbox_ephemeral tracks that); "persistent" is
+  // the session sandbox root ($CWD/sandbox), kept across chats.
   std::string _file_sandbox_dir;
+  std::string _file_sandbox_mode;      // "per-chat" | "persistent"
   std::string _file_sandbox_root;      // resolved root actually used
   bool        _file_sandbox_ephemeral{};
   std::shared_ptr<FileSandbox> _file_sandbox;
@@ -190,6 +217,16 @@ private:
   // "web_allow_private", default false) is set.
   bool        _enable_web_tools{};
   bool        _web_allow_private{};
+  // Allow the sandboxed run_shell / run_python tools to use the per-user
+  // system temp (config "allow_system_temp", default false). Off = all temp
+  // stays under the workspace/CWD; on = tools that hardcode the system temp
+  // (e.g. the macOS `mktemp` CLI) work, at the cost of temp outside the CWD.
+  bool        _allow_system_temp{};
+  // Fold reasoning (<think>) and tool-call blocks OUT of the streaming
+  // out-port (index 1) so a speaking consumer voices only the answer
+  // (config "stream_answer_only", default false). Out-port 0 always
+  // carries the full text.
+  bool        _stream_answer_only{};
   // The locally-dispatchable tool registry, seeded in initialize() when
   // tools are enabled and supported. Empty otherwise.
   McpToolRegistry _tools;

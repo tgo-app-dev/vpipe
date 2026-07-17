@@ -58,6 +58,12 @@ public:
   std::string dispatch(const McpToolCall& call) const;
 
 private:
+  // Resolve a possibly-namespaced tool name to a registered tool. Some
+  // models call a declared tool under a module namespace -- e.g. the
+  // Gemma-4 12B emits `file_operations.write_file` for `write_file`. Tries
+  // the exact name, then the segment after the last '.'. Null if no match.
+  const McpTool* find_(const std::string& name) const noexcept;
+
   std::vector<McpTool> _tools;
 };
 

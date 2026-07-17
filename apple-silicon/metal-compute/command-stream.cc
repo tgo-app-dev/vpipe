@@ -5,6 +5,7 @@
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 
+#include <cstdlib>
 #include <utility>
 
 namespace vpipe::metal_compute {
@@ -91,7 +92,37 @@ CommandStream::begin_compute(DispatchType dispatch_type)
     enc->retain();
   }
   pool->release();
-  return ComputeEncoder{enc};
+  ComputeEncoder e{enc, cb};
+  // Arm the auto command-buffer split. Default 50 commands/buffer (matches the
+  // measured decode sweet spot + MLX's commit cadence); VPIPE_MC_CMDBUF_SPLIT=N
+  // overrides, 0 disables. Only long streams (>N dispatches) ever trip it;
+  // short one-off encodes never split.
+  static const int kSplit = []() {
+    const char* s = std::getenv("VPIPE_MC_CMDBUF_SPLIT");
+    return s ? std::atoi(s) : 50;
+  }();
+  e._stream = this;
+  e._dt = dispatch_type;
+  e._split_every = kSplit;
+  e._since_split = 0;
+  return e;
+}
+
+void
+CommandStream::split_encoder_(ComputeEncoder& enc)
+{
+  const DispatchType dt = enc._dt;
+  enc.end();                       // endEncoding + release enc._enc
+  if (_cb != nullptr) {
+    _cb->commit();                 // fire-and-forget; final commit() waits
+    _cb->release();
+    _cb = nullptr;
+  }
+  ComputeEncoder fresh = begin_compute(dt);   // opens a new cb + configures it
+  enc._enc = fresh._enc;
+  enc._cb  = fresh._cb;
+  fresh._enc = nullptr;            // keep fresh's dtor from ending our encoder
+  fresh._cb  = nullptr;
 }
 
 void

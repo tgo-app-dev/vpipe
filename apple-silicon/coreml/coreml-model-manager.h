@@ -3,9 +3,11 @@
 
 #include "common/session-member.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -19,15 +21,102 @@ namespace vpipe {
 
 class SessionContextIntf;
 
+// Element type on the CoreML predict() I/O boundary. Independent of
+// TensorBeat::DType -- it names the types MLMultiArray actually uses
+// here: f32, IEEE half (f16), double (f64, an output-only shape some
+// models emit), and int32 (recurrent-state inputs). A native consumer
+// never sees a CML:: type, so this enum is the whole dtype vocabulary
+// the plugin surface needs.
+enum class CoreMLDType : std::uint8_t { F32, F16, F64, I32 };
+
+// Byte width of one CoreMLDType element.
+constexpr std::size_t
+coreml_dtype_size(CoreMLDType d) noexcept
+{
+  switch (d) {
+    case CoreMLDType::F32: return 4;
+    case CoreMLDType::F16: return 2;
+    case CoreMLDType::F64: return 8;
+    case CoreMLDType::I32: return 4;
+  }
+  return 0;
+}
+
+// Whether a model feature is a dense tensor (MLMultiArray) or an image
+// (bound as a CVPixelBuffer inside predict()).
+enum class CoreMLFeatureKind : std::uint8_t { MultiArray, Image };
+
+// Per-input metadata captured at load time (the input-side mirror of
+// CoreMLOutputDesc). `fixed == true` means every dim / image size is
+// fully specified. For an Image input, `pixel_format` is the model's
+// CVPixelFormatType (predict() supports 32-bit BGRA only). `shape` /
+// `dtype` describe a MultiArray input; `image_*` describe an Image.
+struct CoreMLInputDesc {
+  CoreMLFeatureKind    kind = CoreMLFeatureKind::MultiArray;
+  std::vector<int64_t> shape;                     // MultiArray dims
+  CoreMLDType          dtype = CoreMLDType::F32;   // MultiArray element
+  int                  image_width  = 0;           // Image (0 == flex)
+  int                  image_height = 0;
+  std::uint32_t        pixel_format = 0;           // Image CVPixelFormat
+  bool                 fixed = false;
+};
+
 // Per-output metadata captured at model-load time. `fixed == true`
 // means CoreML reports a fully-specified shape (every dim > 0); the
-// stage can pre-allocate output TensorBeats and bind them via
-// PredictionOptions::setOutputBackings for zero-copy. `fixed == false`
-// covers flexible / range / enumerated shapes -- the stage falls back
-// to allocate-and-memcpy on the result.
+// consumer can pre-allocate a buffer and hand it to predict() as an
+// output `backing` for zero-copy. `fixed == false` covers flexible /
+// range / enumerated shapes -- predict() then allocates and fills its
+// own `owned` buffer. `dtype` is the model's native output element type.
 struct CoreMLOutputDesc {
   std::vector<int64_t> shape;
+  CoreMLDType          dtype = CoreMLDType::F32;
   bool                 fixed = false;
+};
+
+// One MODEL INPUT bound for CoreMLLoadedModel::predict(). Populate the
+// form matching the model's input kind (see input_descs()):
+//   * MultiArray -- set `data` (borrowed, laid out per `dtype`),
+//     `shape`, and optionally `strides` (element strides; empty ==
+//     row-major contiguous). `data` may point at UMA / Metal-shared
+//     memory; CoreML reads it zero-copy.
+//   * Image -- set `image` to width*height interleaved 8-bit BGRA
+//     pixels (`image_row_bytes` 0 == tight `image_width*4`); predict()
+//     stages it into a CVPixelBuffer of the model's fixed size.
+// `name` may be left empty for a single-input model.
+struct CoreMLPredictInput {
+  std::string          name;
+
+  // MultiArray form.
+  const void*          data = nullptr;
+  CoreMLDType          dtype = CoreMLDType::F32;
+  std::vector<int64_t> shape;
+  std::vector<int64_t> strides;
+
+  // Image form (used when `image != nullptr`).
+  const std::uint8_t*  image = nullptr;
+  int                  image_width  = 0;
+  int                  image_height = 0;
+  std::size_t          image_row_bytes = 0;
+};
+
+// One MODEL OUTPUT requested from CoreMLLoadedModel::predict(). predict()
+// fills `shape` and points `data` at the delivered bytes (dtype ==
+// `want`). Provide `backing` (capacity `backing_elems` elements of
+// `want`) to receive the result in place: when the model output is
+// fixed-shape and its native dtype equals `want`, CoreML writes there
+// zero-copy; otherwise predict() converts the result into `backing`
+// (if it fits) or into the `owned` buffer. `name` may be left empty for
+// a single-output model.
+struct CoreMLPredictOutput {
+  std::string               name;
+  CoreMLDType               want = CoreMLDType::F32;
+  void*                     backing = nullptr;
+  std::size_t               backing_elems = 0;
+
+  // Filled by predict().
+  std::vector<int64_t>      shape;
+  std::vector<std::uint8_t> owned;
+  const void*               data = nullptr;
 };
 
 // One loaded CoreML model. Wraps a retained `CML::Model*` plus a
@@ -54,8 +143,27 @@ public:
 
   ~CoreMLLoadedModel() override;
 
-  CML::Model* model() const noexcept { return _model; }
-  std::mutex& predict_mutex() noexcept { return _predict_mu; }
+  // True once the underlying CoreML model bound successfully. The raw
+  // CML::Model* is intentionally NOT exposed: every prediction goes
+  // through predict() so a consumer never needs the coreml-cpp headers.
+  bool valid() const noexcept { return _model != nullptr; }
+
+  // Run one prediction. Binds every entry of `inputs` as a model input
+  // feature, retrieves every entry of `outputs`, and returns true on
+  // success. ALL CoreML / Foundation / CoreVideo marshaling and the
+  // per-model serialization happen inside -- a caller never touches
+  // coreml-cpp. `cpu_only` forces CPU execution for this call
+  // (overriding the load-time compute units). On any failure logs via
+  // session() and returns false (leaving `outputs` empty).
+  bool predict(std::span<const CoreMLPredictInput> inputs,
+               std::span<CoreMLPredictOutput>      outputs,
+               bool                                cpu_only = false);
+
+  // Input descriptors discovered at load time, keyed by input feature
+  // name (the input-side mirror of output_descs()). Empty if
+  // introspection failed.
+  const std::unordered_map<std::string, CoreMLInputDesc>&
+  input_descs() const noexcept { return _inputs_desc; }
 
   // Output descriptors discovered at load time, keyed by output
   // feature name. Empty if introspection failed (the stage then
@@ -80,6 +188,7 @@ public:
 private:
   CML::Model*                                              _model;
   std::mutex                                               _predict_mu;
+  std::unordered_map<std::string, CoreMLInputDesc>         _inputs_desc;
   std::unordered_map<std::string, CoreMLOutputDesc>        _outputs;
   std::vector<std::string>                                 _input_names;
   std::vector<std::string>                                 _output_names;

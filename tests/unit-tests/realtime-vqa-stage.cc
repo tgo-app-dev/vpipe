@@ -30,6 +30,7 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +42,7 @@
 #include <streambuf>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -406,6 +408,68 @@ public:
 private:
   mutex                 _mu;
   std::vector<FlexData> _collected;
+};
+
+// Emits ONE scene's frames then HOLDS the pipeline open -- no ticks,
+// never signalling EOS -- so the scene never closes on its own (no idle /
+// gap / EOS boundary). A stop-behavior test can then stop() mid-scene and
+// observe the drop deterministically, without racing the LM's inference.
+// It never signals done: the driver loop's own stop check (re-evaluated
+// between these quick, napping process() calls) ends the stage when the
+// test requests stop, and stop() closes the buffers to wake the consumer.
+class VqaHoldSource : public TypedStage<VqaHoldSource> {
+public:
+  static constexpr const char* kTypeName = "ut-vqa-hold-source";
+  using TypedStage::TypedStage;
+
+  int           n_frames = 3;
+  int           H        = 128;
+  int           W        = 128;
+  std::uint64_t base_us  = 1'000'000;
+  std::uint64_t step_us  = 100'000;   // sub-gap step -> one scene
+  std::string   camera_name;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (!_sent) {
+      _sent = true;
+      for (int idx = 0; idx < n_frames; ++idx) {
+        TensorBeat tb;
+        tb.dtype = TensorBeat::DType::U8;
+        tb.shape = { 3, H, W };
+        tb.resize_contiguous(static_cast<size_t>(3) * H * W);
+        std::uint8_t* p = tb.as_u8();
+        for (int c = 0; c < 3; ++c) {
+          for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+              p[(static_cast<size_t>(c) * H + y) * W + x] =
+                  static_cast<std::uint8_t>((x + 2 * y + 40 * c + 7 * idx)
+                                            & 0xFF);
+            }
+          }
+        }
+        tb.sideband = FlexData::make_object();
+        tb.sideband.as_object().insert(
+            "timestamp_us",
+            FlexData::make_uint(base_us
+                + static_cast<std::uint64_t>(idx) * step_us));
+        if (!camera_name.empty()) {
+          tb.sideband.as_object().insert(
+              "camera_name", FlexData::make_string(camera_name));
+        }
+        co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+      }
+      co_return;
+    }
+    // Hold the scene open: no ticks, no EOS. Return (without signalling
+    // done) after a short nap so the driver re-checks the stop flag each
+    // iteration and ends this stage promptly once the test calls stop().
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    co_return;
+  }
+
+private:
+  bool _sent = false;
 };
 
 // Throwaway LMDB directory for the persistence test.
@@ -879,6 +943,85 @@ TEST(realtime_vqa_stage, metal_persists_scene_to_lmdb) {
   EXPECT_TRUE(rvqa->scenes_closed() >= 1);
   EXPECT_TRUE(n_qa >= 1);   // the bug: was 0 on the metal path
   EXPECT_TRUE(n_q  >= 1);   // questions epoch seeded
+}
+
+// A stop requested while a scene is still OPEN (frames captured, but no
+// idle/gap/EOS close yet) must be dropped: no scene beat on oport0, and no
+// <camera>-video-qa row for the unfinished scene. VqaHoldSource keeps the
+// scene open until stop(), so this does NOT depend on racing the LM.
+TEST(realtime_vqa_stage, metal_stop_drops_unfinished_scene) {
+  const char* path = std::getenv("VPIPE_METAL_VQA_SMOKE_MODEL");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  TempDir tdir;
+  const std::string sess_cfg =
+      R"({"db":{"path":")" + tdir.path + R"("}})";
+  Session  sess(sess_cfg);
+  Pipeline pl("rvqa-stop-drop", &sess);
+
+  auto drv = make_unique<VqaHoldSource>(
+      &sess, "driver", vector<InEdge>{}, FlexData::make_object());
+  drv->allocate_oports(2);   // oport0 = frames, oport1 = ticks (unused)
+  drv->camera_name = "cam0";
+  auto* driver = static_cast<VqaHoldSource*>(pl.insert_stage(std::move(drv)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("questions", FlexData::make_string("What is happening?"));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    // A generous decode budget: the scene would take real time to finish,
+    // so a fast stop is the only way this run ends without emitting.
+    o.insert("max_new_tokens", FlexData::make_int(256));
+    o.insert("max_pages", FlexData::make_int(16));
+    o.insert("idle_ticks_to_end", FlexData::make_int(2));
+    if (const char* cmlp = std::getenv("VPIPE_METAL_VQA_COREML_PATH");
+        cmlp && *cmlp) {
+      o.insert("coreml_vision_path", FlexData::make_string(cmlp));
+    }
+  }
+  auto rv = make_unique<RealtimeVqaStage>(
+      &sess, "rvqa",
+      vector<InEdge>{ { driver, 0 }, { driver, 1 } }, std::move(cfg));
+  auto* rvqa = static_cast<RealtimeVqaStage*>(pl.insert_stage(std::move(rv)));
+
+  auto sk = make_unique<VqaSceneSink>(
+      &sess, "sink", vector<InEdge>{ { rvqa, 0 } }, FlexData::make_object());
+  auto* sink = static_cast<VqaSceneSink*>(pl.insert_stage(std::move(sk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  ASSERT_TRUE(rt.launch());
+  ::unsetenv("VPIPE_LLM_BACKEND");
+
+  // Wait until the stage has captured the scene's frames (scene active),
+  // so stop() below drops a REAL in-progress scene, not a no-op.
+  bool active = false;
+  for (int i = 0; i < 2000 && !active; ++i) {   // up to ~10 s
+    active = rvqa->scene_active_for_test();
+    if (!active) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  EXPECT_TRUE(active);
+
+  rt.stop();   // request stop while the scene is still open -> drop it
+
+  auto scenes = sink->take();
+  LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  const std::size_t n_qa = count_db_(*env, "cam0-video-qa");
+  std::printf("[realtime_vqa_stage.metal_stop] active=%d scenes=%zu "
+              "closed=%llu video-qa=%zu\n",
+              active ? 1 : 0, scenes.size(),
+              static_cast<unsigned long long>(rvqa->scenes_closed()), n_qa);
+  // The unfinished scene is waived: nothing emitted, nothing persisted.
+  EXPECT_TRUE(scenes.empty());
+  EXPECT_TRUE(rvqa->scenes_closed() == 0);
+  EXPECT_TRUE(n_qa == 0);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

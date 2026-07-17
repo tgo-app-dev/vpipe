@@ -1,6 +1,5 @@
 #include "stages/audio-segment-stage.h"
 
-#include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -25,40 +24,6 @@ namespace vpipe {
 
 namespace {
 
-NS::String*
-ns_str_(string_view s)
-{
-  return NS::String::string(string(s).c_str(),
-                            NS::UTF8StringEncoding);
-}
-
-NS::Array*
-shape_array_(const vector<int64_t>& shape)
-{
-  vector<const NS::Object*> nums;
-  nums.reserve(shape.size());
-  for (auto d : shape) {
-    nums.push_back(static_cast<const NS::Object*>(
-        NS::Number::number(static_cast<long long>(d))));
-  }
-  return NS::Array::array(nums.data(),
-                          static_cast<NS::UInteger>(nums.size()));
-}
-
-vector<int64_t>
-read_shape_(const NS::Array* arr)
-{
-  vector<int64_t> out;
-  if (!arr) { return out; }
-  NS::UInteger n = arr->count();
-  out.reserve(n);
-  for (NS::UInteger i = 0; i < n; ++i) {
-    auto* num = arr->object<NS::Number>(i);
-    out.push_back(num ? num->longLongValue() : 0);
-  }
-  return out;
-}
-
 // Read a config array of integers into a vector<int64_t>. Returns true
 // when the FlexData node is a non-empty array of integer-like values.
 bool
@@ -82,37 +47,9 @@ product_(const vector<int64_t>& shape)
   for (auto d : shape) { n *= static_cast<size_t>(std::max<int64_t>(d, 0)); }
   return n;
 }
-
-// IEEE-754 binary16 -> binary32 (some Silero CoreML exports emit prob
-// as Float16). Same helper as audio-tagging-stage.cc.
-float
-half_to_float_(std::uint16_t h)
-{
-  const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
-  std::uint32_t       exp  = (h >> 10) & 0x1Fu;
-  std::uint32_t       mant = h & 0x3FFu;
-  std::uint32_t       f;
-  if (exp == 0) {
-    if (mant == 0) {
-      f = sign;
-    } else {
-      exp = 1;
-      while ((mant & 0x400u) == 0) {
-        mant <<= 1;
-        --exp;
-      }
-      mant &= 0x3FFu;
-      f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-  } else if (exp == 0x1Fu) {
-    f = sign | 0x7F800000u | (mant << 13);
-  } else {
-    f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-  }
-  float out;
-  std::memcpy(&out, &f, sizeof(out));
-  return out;
-}
+// (The f16 prob output is decoded to f32 inside
+// CoreMLLoadedModel::predict, so the old host half-to-float helper and
+// the NS/CoreML feature marshaling are gone.)
 
 }  // namespace
 
@@ -377,10 +314,7 @@ AudioSegmentStage::spec() const noexcept
 
 AudioSegmentStage::~AudioSegmentStage()
 {
-  if (_opts) {
-    _opts->release();
-    _opts = nullptr;
-  }
+  // _loaded drops via shared_ptr; predict() owns all CoreML lifetime.
 }
 
 void
@@ -413,12 +347,6 @@ AudioSegmentStage::initialize(RuntimeContext& /*ctx*/)
   }
 
   reset_lstm_state_();
-
-  auto* pool = NS::AutoreleasePool::alloc()->init();
-  auto* opts = CML::PredictionOptions::alloc()->init();
-  opts->setUsesCPUOnly(false);
-  _opts = opts;
-  pool->release();
 
   session()->info(fmt(
       "AudioSegmentStage('{}'): model ready ({}); window={} samples "
@@ -573,166 +501,80 @@ AudioSegmentStage::drain(RuntimeContext& ctx)
 bool
 AudioSegmentStage::run_window_(const float* samples, float& prob_out)
 {
-  if (!_loaded || !_opts) { return false; }
-  std::lock_guard<std::mutex> lk(_loaded->predict_mutex());
+  if (!_loaded) { return false; }
 
-  bool ok = false;
-  auto* pool = NS::AutoreleasePool::alloc()->init();
-  NS::Error* err = nullptr;
+  // Sample-rate feature value must outlive the predict() call.
+  const std::int32_t sr_val = static_cast<std::int32_t>(_sample_rate);
 
-  const vector<int64_t> in_shape = { 1, _window_samples };
-  NS::Array* sh = shape_array_(in_shape);
-
-  // 1) Input PCM MultiArray (zero-copy; alloc+memcpy fallback).
-  auto* in_multi = CML::MultiArray::alloc()->initWithDataPointer(
-      const_cast<float*>(samples), sh, CML::MultiArrayDataTypeFloat32,
-      /*strides*/ nullptr, /*deallocator*/ nullptr, &err);
-  if (err || !in_multi) {
-    err = nullptr;
-    in_multi = CML::MultiArray::alloc()->initWithShape(
-        sh, CML::MultiArrayDataTypeFloat32, &err);
-    if (!err && in_multi) {
-      std::memcpy(in_multi->dataPointer(), samples,
-                  static_cast<size_t>(_window_samples) * sizeof(float));
-    }
+  // Inputs: PCM (zero-copy), the two LSTM states, and (optionally) the
+  // int32 sample rate. predict() binds each as a model input feature.
+  std::vector<CoreMLPredictInput> ins;
+  ins.reserve(4);
+  auto add_marray = [&](const std::string& name, const void* data,
+                        CoreMLDType dtype, std::vector<int64_t> shape) {
+    CoreMLPredictInput a;
+    a.name  = name;
+    a.data  = data;
+    a.dtype = dtype;
+    a.shape = std::move(shape);
+    ins.push_back(std::move(a));
+  };
+  add_marray(_input_feature_name, samples, CoreMLDType::F32,
+             { 1, static_cast<int64_t>(_window_samples) });
+  add_marray(_state_h_in_name, _state_h.data(), CoreMLDType::F32,
+             _state_h_shape);
+  add_marray(_state_c_in_name, _state_c.data(), CoreMLDType::F32,
+             _state_c_shape);
+  if (!_sr_feature_name.empty()) {
+    add_marray(_sr_feature_name, &sr_val, CoreMLDType::I32, { 1 });
   }
 
-  // 2) LSTM state inputs (always alloc+memcpy from _state_h/_state_c).
-  CML::MultiArray* h_multi = nullptr;
-  CML::MultiArray* c_multi = nullptr;
-  if (!err && in_multi) {
-    NS::Array* hsh = shape_array_(_state_h_shape);
-    h_multi = CML::MultiArray::alloc()->initWithShape(
-        hsh, CML::MultiArrayDataTypeFloat32, &err);
-    if (!err && h_multi) {
-      std::memcpy(h_multi->dataPointer(), _state_h.data(),
-                  _state_h.size() * sizeof(float));
-    }
-  }
-  if (!err && h_multi) {
-    NS::Array* csh = shape_array_(_state_c_shape);
-    c_multi = CML::MultiArray::alloc()->initWithShape(
-        csh, CML::MultiArrayDataTypeFloat32, &err);
-    if (!err && c_multi) {
-      std::memcpy(c_multi->dataPointer(), _state_c.data(),
-                  _state_c.size() * sizeof(float));
-    }
-  }
+  // Outputs: the speech probability plus the updated LSTM states (all
+  // delivered as f32; a model that emits f16 prob is decoded inside
+  // predict()).
+  std::vector<CoreMLPredictOutput> outs;
+  outs.reserve(3);
+  auto add_out = [&](const std::string& name) {
+    CoreMLPredictOutput o;
+    o.name = name;
+    o.want = CoreMLDType::F32;
+    outs.push_back(std::move(o));
+  };
+  add_out(_prob_feature_name);
+  add_out(_state_h_out_name);
+  add_out(_state_c_out_name);
 
-  // 3) Optional int32 sample-rate input.
-  CML::MultiArray* sr_multi = nullptr;
-  if (!err && c_multi && !_sr_feature_name.empty()) {
-    const vector<int64_t> sr_shape = { 1 };
-    NS::Array* ssh = shape_array_(sr_shape);
-    sr_multi = CML::MultiArray::alloc()->initWithShape(
-        ssh, CML::MultiArrayDataTypeInt32, &err);
-    if (!err && sr_multi) {
-      std::int32_t v = static_cast<std::int32_t>(_sample_rate);
-      std::memcpy(sr_multi->dataPointer(), &v, sizeof(v));
-    }
-  }
-
-  // 4) Build the feature provider and run.
-  if (!err && c_multi) {
-    vector<const NS::Object*> objs;
-    vector<const NS::Object*> keys;
-    objs.reserve(4);
-    keys.reserve(4);
-    auto add_feat = [&](const string& name, CML::MultiArray* arr) {
-      auto* fv  = CML::FeatureValue::featureValueWithMultiArray(arr);
-      auto* key = ns_str_(name);
-      objs.push_back(fv);
-      keys.push_back(key);
-    };
-    add_feat(_input_feature_name, in_multi);
-    add_feat(_state_h_in_name,    h_multi);
-    add_feat(_state_c_in_name,    c_multi);
-    if (sr_multi) { add_feat(_sr_feature_name, sr_multi); }
-
-    NS::Dictionary* dict = NS::Dictionary::dictionary(
-        objs.data(), keys.data(),
-        static_cast<NS::UInteger>(objs.size()));
-    auto* dfp = CML::DictionaryFeatureProvider::alloc()
-                    ->initWithDictionary(dict, &err);
-    if (!err && dfp) {
-      // ANE timeline: the per-window Silero VAD CoreML predict is the
-      // Apple-Neural-Engine job (recorded under this stage's gvid so the
-      // block is named/colored as audio-segment in the profiler).
-      record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
-      auto* result =
-          _loaded->model()->predictionFromFeatures(dfp, _opts, &err);
-      record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
-      if (!err && result) {
-        // Prob output (accept f16 or f32; flatten to first element).
-        auto* nm  = ns_str_(_prob_feature_name);
-        auto* val = result->featureValueForName(nm);
-        auto* arr = val ? val->multiArrayValue() : nullptr;
-        if (arr && arr->dataPointer()) {
-          const CML::MultiArrayDataType dt = arr->dataType();
-          if (dt == CML::MultiArrayDataTypeFloat32) {
-            prob_out = *static_cast<const float*>(arr->dataPointer());
-            ok = true;
-          } else if (dt == CML::MultiArrayDataTypeFloat16) {
-            prob_out = half_to_float_(
-                *static_cast<const std::uint16_t*>(arr->dataPointer()));
-            ok = true;
-          } else {
-            session()->warn(fmt(
-                "AudioSegmentStage('{}'): unsupported prob dtype {}; "
-                "dropping window",
-                this->id(), static_cast<long>(dt)));
-          }
-        } else {
-          session()->warn(fmt(
-              "AudioSegmentStage('{}'): prob output '{}' missing",
-              this->id(), _prob_feature_name));
-        }
-        // Updated LSTM state outputs.
-        if (ok) {
-          auto* hnm = ns_str_(_state_h_out_name);
-          auto* hv  = result->featureValueForName(hnm);
-          auto* harr = hv ? hv->multiArrayValue() : nullptr;
-          if (harr && harr->dataPointer()
-              && harr->dataType() == CML::MultiArrayDataTypeFloat32) {
-            const auto n = std::min(_state_h.size(),
-                                    product_(read_shape_(harr->shape())));
-            std::memcpy(_state_h.data(), harr->dataPointer(),
-                        n * sizeof(float));
-          }
-          auto* cnm = ns_str_(_state_c_out_name);
-          auto* cv  = result->featureValueForName(cnm);
-          auto* carr = cv ? cv->multiArrayValue() : nullptr;
-          if (carr && carr->dataPointer()
-              && carr->dataType() == CML::MultiArrayDataTypeFloat32) {
-            const auto n = std::min(_state_c.size(),
-                                    product_(read_shape_(carr->shape())));
-            std::memcpy(_state_c.data(), carr->dataPointer(),
-                        n * sizeof(float));
-          }
-        }
-      } else {
-        session()->warn(fmt(
-            "AudioSegmentStage('{}'): predictionFromFeatures failed",
-            this->id()));
-      }
-      dfp->release();
-    } else {
-      session()->warn(fmt(
-          "AudioSegmentStage('{}'): feature provider init failed",
-          this->id()));
-    }
-  } else {
+  // ANE timeline: the per-window Silero VAD CoreML predict is the
+  // Apple-Neural-Engine job (recorded under this stage's gvid).
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
+  const bool ok = _loaded->predict(ins, outs);
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
+  if (!ok) {
     session()->warn(fmt(
-        "AudioSegmentStage('{}'): input/state MultiArray init failed",
-        this->id()));
+        "AudioSegmentStage('{}'): prediction failed", this->id()));
+    return false;
   }
 
-  if (sr_multi) { sr_multi->release(); }
-  if (c_multi)  { c_multi->release(); }
-  if (h_multi)  { h_multi->release(); }
-  if (in_multi) { in_multi->release(); }
-  pool->release();
-  return ok;
+  const float* pf = static_cast<const float*>(outs[0].data);
+  if (!pf) {
+    session()->warn(fmt(
+        "AudioSegmentStage('{}'): prob output '{}' missing",
+        this->id(), _prob_feature_name));
+    return false;
+  }
+  prob_out = pf[0];
+
+  // Feed the updated LSTM states back, clamped to our buffer sizes.
+  auto copy_state = [](std::vector<float>&        dst,
+                       const CoreMLPredictOutput& o) {
+    const auto* f = static_cast<const float*>(o.data);
+    if (!f) { return; }
+    const size_t n = std::min(dst.size(), product_(o.shape));
+    std::memcpy(dst.data(), f, n * sizeof(float));
+  };
+  copy_state(_state_h, outs[1]);
+  copy_state(_state_c, outs[2]);
+  return true;
 }
 
 Job

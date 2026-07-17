@@ -44,9 +44,11 @@ cmake --build build
 `vpipe_add_plugin(name SOURCES ... [METAL] [COREML])` builds a dlopen-only
 `MODULE` linked to `vpipe::vpipe` with C++20. **Base plugins need no
 framework flags** — every Metal/CoreML call lives inside `libvpipe` and the
-SDK headers only *forward-declare* the framework types. Pass `METAL` /
-`COREML` only if you use an escape hatch (`mtl_buffer()`,
-`SharedBuffer::wrap`, `CML::Model* model()`).
+SDK headers only *forward-declare* the framework types. A CoreML plugin runs
+its model entirely through `CoreMLLoadedModel::predict()` (neutral structs,
+no `coreml-cpp`), so it does **not** need `COREML` either. Pass `METAL` /
+`COREML` only if you reach for a Metal escape hatch (`mtl_buffer()`,
+`SharedBuffer::wrap`) or otherwise link the frameworks yourself.
 
 ## The three required symbols
 
@@ -158,17 +160,38 @@ multimodal encoders remain a built-in concern.
 
 There is no separate CoreML plugin type: a CoreML consumer is just a
 **stage** (extension point 1) that loads a model through the session and
-decodes its tensors to Beats:
+runs it via the model manager's native `predict()` API. The plugin never
+includes `coreml-cpp` and never touches a `CML::`/`NS::`/CoreVideo type —
+all of that marshaling lives inside `libvpipe`:
 
 ```cpp
-auto model = session()->coreml_model_manager()->load(path, /*units*/...);
-// run prediction, then emit TensorBeat / FlexData Beats
+auto model = session()->coreml_model_manager()->load(path, /*units*/ 2);
+if (!model) { /* fail_config / drop */ }
+
+// Describe inputs/outputs with the neutral CoreMLPredict* structs. A
+// tensor input is a borrowed buffer + dtype + shape; an image input is
+// BGRA bytes; an output names the feature and the dtype you want back.
+CoreMLPredictInput  in { .name = "waveform", .data = pcm,
+                         .dtype = CoreMLDType::F32, .shape = {1, n} };
+CoreMLPredictOutput out { .name = "probs", .want = CoreMLDType::F32 };
+const CoreMLPredictInput ins[1]  = { std::move(in) };
+CoreMLPredictOutput      outs[1] = { std::move(out) };
+if (model->predict(ins, outs)) {
+  const float* p = static_cast<const float*>(outs[0].data);  // + outs[0].shape
+  // ... emit TensorBeat / FlexData Beats ...
+}
 ```
 
-Build with `vpipe_add_plugin(... COREML)` for the framework links. Use the
-in-tree stages as templates: `stages/coreml-inference-stage.cc` (generic
-tensor passthrough), `stages/audio-tagging-stage.cc`,
-`stages/vision/yolo-detection-stage.cc`.
+`predict()` handles the whole feature dance: zero-copy tensor binding
+(incl. Metal/UMA pointers), image inputs (it builds the CVPixelBuffer),
+per-model serialization, `f16`/`f64` → your requested dtype decode
+(non-contiguous strides included), and optional zero-copy output backings
+(`CoreMLPredictOutput::backing`) for fixed-shape outputs. Model shape /
+dtype / image-format introspection is available via `input_descs()` /
+`output_descs()`. No `COREML` framework flag is required. Use the in-tree
+stages as templates: `stages/coreml-inference-stage.cc` (generic tensor
+passthrough), `stages/audio-tagging-stage.cc`,
+`stages/vision/yolo-detection-stage.cc` (image input).
 
 ## Loading a plugin
 

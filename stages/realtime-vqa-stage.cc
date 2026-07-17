@@ -1435,7 +1435,7 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
             out += tok.step(sd, id);
             ++produced;
           }
-          return true;
+          return !m_stopping_();   // abort the spec loop on pipeline stop
         };
     _lm->mtp_generate(ctx, cur, _max_new_tokens, sp, is_stop, on_toks);
   } else if (_pipelined_decode
@@ -1458,6 +1458,7 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
       _lm->pdecode_commit(ctx);   // speculative 2nd forward (depth>=2 only)
     }
     while (produced < _max_new_tokens) {
+      if (m_stopping_()) { break; }              // pipeline stop -> abandon
       if (tpl && tpl->is_stop_token(cur)) { break; }
       out += tok.step(sd, cur);
       ++produced;
@@ -1475,6 +1476,7 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
       sampler.prime(std::span<const std::int32_t>(&cur, 1));
     }
     while (cur >= 0 && produced < _max_new_tokens) {
+      if (m_stopping_()) { break; }              // pipeline stop -> abandon
       if (tpl && tpl->is_stop_token(cur)) { break; }
       out += tok.step(sd, cur);
       ++produced;
@@ -1620,6 +1622,7 @@ RealtimeVqaStage::m_decode_batched_sync_(
   int total_steps = 0, tail_steps = 0;
   bool tail_tried = false;
   while (true) {
+    if (m_stopping_()) { break; }   // pipeline stop -> abandon all branches
     // Emit each still-active branch's current token, then collect the active
     // set for the next batched forward.
     std::vector<genai::LoadedLanguageModel::Context*> active_ctx;
@@ -1670,6 +1673,7 @@ RealtimeVqaStage::m_decode_batched_sync_(
           _lm->pdecode_commit(c);
         }
         while (committed) {
+          if (m_stopping_()) { break; }      // pipeline stop -> abandon tail
           const std::int32_t nx = _lm->pdecode_next(c);    // drain
           if (nx < 0) { break; }
           ++total_steps;
@@ -1786,6 +1790,7 @@ RealtimeVqaStage::m_decode_batched_pipelined_(
     _lm->m_bdecode_commit();
   }
   while (true) {
+    if (m_stopping_()) { break; }   // pipeline stop -> abandon all branches
     // Emit each still-active branch's current token (stop-check first).
     // The in-flight GPU step(s) run under this host-side emit.
     bool any_active = false;
@@ -1834,6 +1839,11 @@ RealtimeVqaStage::m_decode_batched_pipelined_(
 Job
 RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
 {
+  // Pipeline stopping: waive this scene entirely -- drop its frames and
+  // run no prefill/decode, emit nothing on oport0, and write nothing to
+  // the DB for an unfinished scene. (A natural EOS close is not stopping,
+  // so it still renders + emits the final scene below.)
+  if (ctx.stop_requested()) { m_reset_scene_(); co_return; }
   // Merge any buffered odd-tail frame (temporal-pair path) before we
   // count frames -- a scene that ended on an unpaired frame still emits
   // its last grid.
@@ -2069,6 +2079,11 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
     if (c.valid()) { _lm->m_detach_branch(c); }
   }
 
+  // Don't start the (potentially large, uninterruptible) describe-prefix
+  // prefill if a stop already landed -- e.g. during audio interpretation,
+  // whose decode aborts but returns here. Waive the scene.
+  if (ctx.stop_requested()) { m_reset_scene_(); co_return; }
+
   auto base_ctx = _lm->make_context();
   if (!base_ctx.valid()) { co_await emit(); co_return; }
   const auto t_prefix_start = std::chrono::steady_clock::now();
@@ -2098,7 +2113,13 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
     co_await emit();
     co_return;
   }
+  // Stop landed during the (uninterruptible) describe-prefix prefill: skip
+  // the decode and waive the scene (no emit / no DB).
+  if (ctx.stop_requested()) { m_reset_scene_(); co_return; }
   scene_description = m_decode_(base_ctx, _sampler_params);
+  // The description decode may have been cut short by a stop -- don't fan
+  // out into the (expensive) per-question branches; drop the scene.
+  if (ctx.stop_requested()) { m_reset_scene_(); co_return; }
   const std::int32_t assistant_close = tpl->assistant_close_token_id();
   if (assistant_close >= 0) { (void)_lm->next_token(base_ctx, assistant_close); }
 
@@ -2181,6 +2202,12 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
     }
   }
 
+  // Stop landed during the question decode (the loops bail per token, so
+  // the answers here are partial): waive the scene rather than emit half an
+  // answer or persist an unfinished scene. Pool contexts were returned
+  // above, so this is a clean drop.
+  if (ctx.stop_requested()) { m_reset_scene_(); co_return; }
+
   // Debug summary -- same shape as the MLX path so logs read identically
   // across backends.
   session()->info(fmt(
@@ -2227,6 +2254,17 @@ RealtimeVqaStage::m_process_(RuntimeContext& ctx)
     co_return;
   }
   co_await ctx.read_any(std::move(wait_ports));
+
+  // Fast stop: the pipeline may have been stopped while we were suspended
+  // on read_any. Drop the in-progress scene AND leave the just-arrived
+  // frames unread (they're discarded at teardown) -- no encode, no scene
+  // close, no inference. Return promptly so the driver's stop check ends
+  // the process loop and drain() runs.
+  if (ctx.stop_requested()) {
+    if (m_scene_active_()) { m_reset_scene_(); }
+    ctx.signal_done();
+    co_return;
+  }
 
   // 1) Encode every frame currently available (ASAP).
   const std::uint32_t bl = ctx.backlog(0);
@@ -2376,6 +2414,7 @@ RealtimeVqaStage::process(RuntimeContext& ctx)
   // no frame arrived since the last tick). Encoding only pauses while a
   // close_scene_ prefill/decode runs (synchronous in this coroutine);
   // frames that pile up during it drain on the next wake.
+  _run_ctx = &ctx;   // so inner decode helpers can poll the stop flag
   if (ctx.num_iports() < 2) {
     session()->error(fmt(
         "RealtimeVqaStage('{}'): iport1 (chrono trigger) must be "
@@ -2503,7 +2542,15 @@ RealtimeVqaStage::process(RuntimeContext& ctx)
 Job
 RealtimeVqaStage::drain(RuntimeContext& ctx)
 {
+  _run_ctx = &ctx;
 #if defined(VPIPE_BUILD_APPLE_SILICON)
+  // On a pipeline STOP, drop any in-progress scene without inference or a
+  // DB write -- the user asked for a fast stop, not a final flush. Only a
+  // natural EOS drain (stop flag clear) closes + emits the last scene.
+  if (ctx.stop_requested()) {
+    if (m_scene_active_()) { m_reset_scene_(); }
+    co_return;
+  }
   if (m_scene_active_()) {
     co_await m_close_scene_(ctx);
   }

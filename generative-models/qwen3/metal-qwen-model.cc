@@ -10,6 +10,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <cassert>
 #include <chrono>
 #include <limits>
 #include <cmath>
@@ -174,11 +175,42 @@ MetalQwenModel::load(const std::string& model_dir,
     if (wi == nullptr || wi->shape.size() < 2 || K <= 0) { return 0; }
     return (int)((wi->shape.back() * 32) / K);
   };
+  // Affine group size from the .scales shape [N, K/group]; 0 if not affine.
+  auto affine_group = [&](const std::string& pfx, int K) -> int {
+    const auto* si = wts->info(pfx + ".scales");
+    if (si == nullptr || si->shape.empty() || si->shape.back() <= 0
+        || K <= 0) {
+      return 0;
+    }
+    return (int)(K / si->shape.back());
+  };
   {
     bool saw4 = false, saw8 = false;
+    // Reject any AFFINE linear that isn't 4/8-bit group-64: every dispatch is a
+    // binary `bits==8?w8:w4` and every mixed kernel is g64, so a 2/3/6-bit or
+    // non-64-group weight would silently bind the wrong kernel -> garbage. Only
+    // affine weights (with .scales) are checked; k-quant / dense / bf16 (no
+    // .scales) take their own paths and are skipped. Fail the load loudly.
+    std::string quant_err;
     auto note = [&](const std::string& nm, int K) {
+      if (!wts->has(nm + ".scales")) { return; }   // non-affine: not our path
       const int b = affine_bits(nm, K);
-      if (b == 4) { saw4 = true; } else if (b == 8) { saw8 = true; }
+      const int g = affine_group(nm, K);
+      if (b != 4 && b != 8) {
+        if (quant_err.empty()) {
+          quant_err = nm + " is " + std::to_string(b)
+                    + "-bit (only 4/8-bit affine supported)";
+        }
+        return;
+      }
+      if (g != 64) {
+        if (quant_err.empty()) {
+          quant_err = nm + " has group " + std::to_string(g)
+                    + " (only group-64 affine supported)";
+        }
+        return;
+      }
+      if (b == 4) { saw4 = true; } else { saw8 = true; }
     };
     for (int L = 0; L < cfg.n_layers; ++L) {
       const std::string p =
@@ -198,6 +230,13 @@ MetalQwenModel::load(const std::string& model_dir,
       note(p + "mlp.down_proj", cfg.ffn_inner);
     }
     m->_mixed = saw4 && saw8;
+    // TEST HOOK: force the mixed/de-fused paths on a UNIFORM affine model so
+    // they can be token-exact-verified against the fused path (a uniform layer
+    // then takes qkv_fused / mlp_fused, the GDN in_proj de-fuses, etc. -- all
+    // must reproduce the fused output). Only meaningful for affine models.
+    if ((saw4 || saw8) && std::getenv("VPIPE_QWEN_FORCE_MIXED") != nullptr) {
+      m->_mixed = true;
+    }
     // Embed/lm_head bit width (q6k k-quant -> 0 -> fall back to the scalar).
     const std::string ebn =
         cfg.weight_prefix + cfg.model_seg + "embed_tokens";
@@ -217,6 +256,28 @@ MetalQwenModel::load(const std::string& model_dir,
     m->_dense_embed = embed_bf16 && (saw4 || saw8);
     m->_embed_bits = (eb == 4 || eb == 8) ? eb : cfg.quant_bits;
     m->_lm_bits = m->_embed_bits;
+    // An AFFINE embed (has .scales; not the bf16/k-quant artifacts above) must
+    // also be 4/8-bit group-64 -- the gather picks w8 iff _embed_bits==8.
+    if (quant_err.empty() && wts->has(ebn + ".scales")) {
+      const int eg = affine_group(ebn, cfg.hidden);
+      if (eb != 4 && eb != 8) {
+        quant_err = ebn + " is " + std::to_string(eb)
+                  + "-bit (only 4/8-bit affine supported)";
+      } else if (eg != 64) {
+        quant_err = ebn + " has group " + std::to_string(eg)
+                  + " (only group-64 affine supported)";
+      }
+    }
+    if (!quant_err.empty()) {
+      // Every affine dispatch is a binary bits==8?w8:w4 over g64 kernels, so an
+      // unsupported width/group would silently mis-bind -> garbage. Fail loudly
+      // via the session log delegate (no direct stderr) instead.
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] unsupported affine quantization: {} -- model not "
+                    "loaded (only 4/8-bit, group-64)", quant_err));
+      }
+      return nullptr;
+    }
   }
 
   const std::string sfx = cfg.use_bf16 ? "_bf16" : "";
@@ -1095,9 +1156,27 @@ MetalQwenModel::load(const std::string& model_dir,
   auto load_kq = [&](const std::string& name, SharedBuffer& buf,
                      KQ& ty) -> bool {
     const auto* info = wts->info(name);
-    if (info == nullptr) { return false; }
+    if (info == nullptr) {
+      // Required k-quant tensor absent. The GGUF converter DROPS tensors of an
+      // unsupported quant type (Q2_K/Q3_K/Q4_0/Q8_0-linear/IQ*), so a missing
+      // tensor here is most often exactly that. Fail loud with the name (no
+      // direct stderr -- via the session, mirroring the affine-quant guard).
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] k-quant load failed: required tensor '{}' is "
+                    "absent -- wrong checkpoint, or an unsupported GGUF quant "
+                    "type was dropped at conversion (only Q4_K/Q5_K/Q6_K "
+                    "linears are supported)", name));
+      }
+      return false;
+    }
     ty = kq_of(info->dtype);
-    if (ty == KQ::kNone) { return false; }
+    if (ty == KQ::kNone) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] k-quant load failed: tensor '{}' has unsupported "
+                    "type '{}' (only Q4_K/Q5_K/Q6_K)", name, info->dtype));
+      }
+      return false;
+    }
     buf = wts->load(name, mc);
     return !buf.empty();
   };
@@ -1202,17 +1281,30 @@ MetalQwenModel::load(const std::string& model_dir,
           if (ly.o_q4k_aff) { ly.kqo = {}; }
         }
       } else if (m->_mixed) {
-        // De-fused per-tensor: q|k|v|o each keep their own triple + bits, the
-        // decode writes them into the same _d_qfull[q|k|v] offsets the fused
-        // path produces, the prefill dequants each into _w_deq for one GEMM.
-        ok = ok && qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
-        ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
-        ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
+        const int qb = affine_bits(p + "self_attn.q_proj", cfg.hidden);
+        const int kb = affine_bits(p + "self_attn.k_proj", cfg.hidden);
+        const int vb = affine_bits(p + "self_attn.v_proj", cfg.hidden);
         ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
-        ly.q_bits = affine_bits(p + "self_attn.q_proj", cfg.hidden);
-        ly.k_bits = affine_bits(p + "self_attn.k_proj", cfg.hidden);
-        ly.v_bits = affine_bits(p + "self_attn.v_proj", cfg.hidden);
         ly.o_bits = affine_bits(p + "self_attn.o_proj", cfg.qd());
+        if (qb == kb && kb == vb && qb == cfg.quant_bits) {
+          // Uniform q/k/v at the BASE width: FUSE into one [2*qd+2*kd, H] GEMM
+          // like the non-mixed path -- the forward's fused branch (gated on
+          // !ly.qkv_fused) then dispatches it with the base-width qmv/qmm, so
+          // no per-bits handling is needed. o_proj stays per-tensor.
+          ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
+                             p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
+          ly.qkv_fused = true;
+          ly.q_bits = ly.k_bits = ly.v_bits = qb;
+        } else {
+          // Genuinely mixed q/k/v -> de-fused per-tensor: q|k|v each keep their
+          // own triple + bits, the decode writes them into the same
+          // _d_qfull[q|k|v] offsets the fused path produces, the prefill
+          // dequants each into _w_deq for one GEMM.
+          ok = ok && qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
+          ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
+          ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
+          ly.q_bits = qb; ly.k_bits = kb; ly.v_bits = vb;
+        }
       } else {
         // Fuse q|k|v into ONE [2*qd+2*kd, H] GEMM (q_proj is gated, 2*qd).
         ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
@@ -1328,14 +1420,25 @@ MetalQwenModel::load(const std::string& model_dir,
         if (ly.ffn_q4k_aff) { ly.kqgate = {}; ly.kqup = {}; }
       }
     } else if (m->_mixed) {
-      // De-fused per-tensor MLP: gate->guw, up->uw, down->dw (no interleave;
-      // decode runs two qmv + swiglu, prefill two dense GEMMs + swiglu).
-      ok = ok && qtri(p + "mlp.gate_proj", ly.guw, ly.gus, ly.gub);
-      ok = ok && qtri(p + "mlp.up_proj", ly.uw, ly.us, ly.ub);
-      ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
+      // Mixed per-tensor MLP. When gate/up share the (4-bit) width, interleave
+      // them into guw and run the FUSED swiglu qmv/qmm (the same kernels the
+      // uniform path uses -- recovers the fusion the de-fused path drops on
+      // 28/32 OptiQ layers). Otherwise keep gate->guw, up->uw de-fused (the 4
+      // genuinely mixed-bit layers). down->dw always per-tensor (own bits).
       ly.gate_bits = affine_bits(p + "mlp.gate_proj", cfg.hidden);
       ly.up_bits = affine_bits(p + "mlp.up_proj", cfg.hidden);
       ly.down_bits = affine_bits(p + "mlp.down_proj", cfg.ffn_inner);
+      if (ly.gate_bits == 4 && ly.up_bits == 4) {
+        SharedBuffer gw, gs, gb, uw, us, ub;
+        ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb);
+        ok = ok && qtri(p + "mlp.up_proj", uw, us, ub);
+        ok = ok && interleave(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
+        ly.mlp_fused = true;
+      } else {
+        ok = ok && qtri(p + "mlp.gate_proj", ly.guw, ly.gus, ly.gub);
+        ok = ok && qtri(p + "mlp.up_proj", ly.uw, ly.us, ly.ub);
+      }
+      ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
     } else if (cfg.is_moe()) {
       // Mixture-of-Experts MLP (Qwen3.5-MoE). Router (w8) + batched experts
       // (w4, gate|up interleaved per slab + down) + dense shared expert (w4,
@@ -1393,6 +1496,19 @@ MetalQwenModel::load(const std::string& model_dir,
         m->_embed_kqt = KQ::kQ4K;
       }
       m->_embed_is_q6k = !m->_embed_q6k.empty();
+      if (!m->_embed_is_q6k) {
+        // Only Q4_K / Q6_K token_embd have a native gather kernel. A Q5_K embed
+        // (the converter emits a .q5k tag) is intentionally unsupported -- fail
+        // loud with the reason instead of an opaque nullptr. (Q5_K works for
+        // every LINEAR; only the embedding table lacks a q5k gather.)
+        if (const SessionContextIntf* s = mc->session()) {
+          s->warn(fmt("[qwen] unsupported k-quant embedding table: {} -- only "
+                      "Q4_K / Q6_K token_embd is supported (re-quantize the "
+                      "embedding table to Q6_K or Q4_K)",
+                      wts->has(ep + "q5k") ? "token_embd is Q5_K"
+                          : "token_embd is missing or an unknown k-quant type"));
+        }
+      }
       ok = m->_embed_is_q6k;
     } else if (m->_dense || m->_dense_embed) {
       // Dense f16 embed table [vocab, H] (scales/biases left empty). The
@@ -1693,6 +1809,11 @@ MetalQwenModel::load(const std::string& model_dir,
       MtpHead& M = m->_mtp;
       Layer& ly = M.lyr;
       ly.is_full = true;
+      // The head is uniform mtp_bits (fused qkv / interleaved gate-up / o /
+      // down all packed at wrow above); record it so the forward dispatches
+      // the matching-width kernel instead of a hardcoded 4-bit.
+      ly.q_bits = ly.k_bits = ly.v_bits = ly.o_bits = mtp_bits;
+      ly.gate_bits = ly.up_bits = ly.down_bits = mtp_bits;
       bool ok = true;
       // fc is [H, 2H] dense; split each output row into its embedding half
       // (cols 0:H) and hidden half (cols H:2H), both contiguous [H, H].
@@ -1732,7 +1853,18 @@ MetalQwenModel::load(const std::string& model_dir,
         SharedBuffer gw, gs, gb, uw, us, ub;
         ok = ok && mqtri("mtp.layers.0.mlp.gate_proj", gw, gs, gb);
         ok = ok && mqtri("mtp.layers.0.mlp.up_proj", uw, us, ub);
-        ok = ok && minter(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
+        // Interleave gate|up for the 4-bit fused swiglu; an 8-bit head has no
+        // fused w8 swiglu kernel, so keep gate/up de-fused (own w8 GEMVs +
+        // plain swiglu in the forward), mirroring the backbone MLP.
+        if (mtp_bits == 4) {
+          ok = ok && minter(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
+          ly.mlp_fused = true;
+        } else {
+          ly.guw = std::move(gw); ly.gus = std::move(gs);
+          ly.gub = std::move(gb);
+          ly.uw = std::move(uw); ly.us = std::move(us); ly.ub = std::move(ub);
+          ly.mlp_fused = false;
+        }
         ok = ok && mqtri("mtp.layers.0.mlp.down_proj", ly.dw, ly.ds, ly.db);
       }
       ok = ok && m->_fn_dense_gemv.valid();
@@ -2028,6 +2160,80 @@ MetalQwenModel::config_from(const ModelConfig& c)
   return m;
 }
 
+// Hybrid dispatch (DEFAULT ON; VPIPE_QWEN_NO_HYBRID=1 disables for A/B): keep the
+// decode encoder SERIAL (cheap native ordering, no explicit barriers) but wrap
+// each de-fused sibling group (unfused q|k|v, GDN in_proj qkv|z|a|b, de-fused
+// gate|up -- in the mixed-precision OptiQ and k-quant/GGUF paths) in a short
+// CONCURRENT sub-encoder so those independent GEMVs overlap. Cross-group ordering
+// rides Metal's automatic hazard tracking across the encoder boundaries (Tracked
+// buffers). Token-exact; measured +2-3% on the de-fused decode paths.
+static bool decode_hybrid_()
+{
+  static const bool hybrid = std::getenv("VPIPE_QWEN_NO_HYBRID") == nullptr;
+  return hybrid;
+}
+
+// Batched-decode per-branch concurrency (DEFAULT ON; VPIPE_QWEN_NO_BATCH_
+// CONCURRENT=1 disables for A/B): the N branches' per-stream attention
+// (shared-prefix phase-B merge) and GDN recurrence write DISJOINT output slices
+// and use their OWN KV / conv / ssm state, so across branches they are
+// independent. Dispatch them into concurrent sub-encoders (attention: one scope
+// over the N branch merges; GDN: phase-interleaved -- all conv1d+g_beta, then
+// all qk_norm, then all ssm, then all gated_rms, each phase a concurrent scope)
+// so the N branches overlap instead of serializing. Only helps N>1. Measured
+// aggregate batched decode: +2.5-3% @N=4 (typical realtime-vqa), growing to
+// ~+8% @N=32 (more branches -> more independent work to overlap). Token-exact.
+static bool decode_batch_concurrent_()
+{
+  static const bool on =
+      std::getenv("VPIPE_QWEN_NO_BATCH_CONCURRENT") == nullptr;
+  return on;
+}
+
+
+// No-hslice GDN views (DEFAULT ON; VPIPE_QWEN_HSLICE_COPY=1 restores the copy
+// path for A/B): skip the 3 GDN hslice COPY dispatches that materialize z/a/b out
+// of the contiguous _d_mixqkv [qkv|z|a|b] buffer; instead bind _d_mixqkv directly
+// at the right byte offset to g_beta (a,b) and gated_rms (z) -- a free "view" the
+// way MLX's mx.split works. Removes 72 launch-bound copies/token; token-exact.
+// Applies to every Qwen3.x variant (all share this GDN recurrence block).
+static bool decode_no_hslice_()
+{
+  static const bool on = std::getenv("VPIPE_QWEN_HSLICE_COPY") == nullptr;
+  return on;
+}
+
+// GDN recurrence overlap (DEFAULT ON; VPIPE_QWEN_NO_GDN_OVERLAP=1 disables for
+// A/B): in the GDN recurrence block the g_beta dispatch (reads the a|b slices of
+// the in_proj output) is independent of the conv1d -> qk_norm sub-chain, yet the
+// serial order conv1d -> qk_norm -> g_beta -> gdn_step puts g_beta's launch
+// latency fully on the critical path. Issue {conv1d, g_beta} in one CONCURRENT
+// sub-encoder so g_beta overlaps conv1d (and rides the encoder boundary into the
+// serial qk_norm -> gdn_step tail). Removes one dispatch from the critical path
+// per GDN layer (x24). Token-exact; measured a small consistent win (+0.3-0.4%,
+// strongest at short ctx where the context-independent GDN recurrence is a larger
+// fraction of the step). Rides decode_hybrid_ (no-op if hybrid dispatch is off).
+static bool decode_gdn_overlap_()
+{
+  static const bool on = std::getenv("VPIPE_QWEN_NO_GDN_OVERLAP") == nullptr;
+  return on && decode_hybrid_();
+}
+
+// No-hslice full-attention K/V views (DEFAULT ON; VPIPE_QWEN_ATTN_HSLICE_COPY=1
+// restores the copy for A/B): the fused qkv matvec writes [q|k|v] (or
+// [q|gate|...|k|v]) into _d_qfull; k and v are the CONTIGUOUS tail (byte offsets
+// qdo*2, (qdo+kd)*2), so bind _d_qfull directly there for the k-path
+// (qk_norm+rope in place) and the K/V-cache write instead of COPYING them out
+// first. Removes 2 hslice copies per full-attn layer (x8). q/gate always stay
+// copied -- Qwen3.5's output gate interleaves them ([q|gate] per head), a
+// strided de-interleave not expressible as an offset view. Token-exact; a small
+// win at short ctx, neutral at long ctx (fewer copies, never a regression).
+static bool decode_attn_nohs_()
+{
+  static const bool on = std::getenv("VPIPE_QWEN_ATTN_HSLICE_COPY") == nullptr;
+  return on;
+}
+
 bool
 MetalQwenModel::ensure_decode_scratch_()
 {
@@ -2035,7 +2241,9 @@ MetalQwenModel::ensure_decode_scratch_()
   const Config& c = _cfg;
   const int H = c.hidden, qd = c.qd(), kd = c.kd();
   const int Cd = c.gdn_conv_dim, vald = c.value_dim(), Hv = c.gdn_v_heads;
-  auto b = [&](std::size_t elems) { return _mc->make_shared_buffer(elems * 2); };
+  auto b = [&](std::size_t elems) {
+    return _mc->make_shared_buffer(elems * 2);
+  };
   _d_x = b((std::size_t)H);
   _d_hn = b((std::size_t)H);
   _d_logits = b((std::size_t)c.vocab);
@@ -2199,6 +2407,10 @@ MetalQwenModel::kqmv_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                       const SharedBuffer& x, std::size_t xoff,
                       const SharedBuffer& y, std::size_t yoff, int K, int N)
 {
+  // Defensive: kNone must never reach dispatch (load_kq aborts the load on an
+  // unsupported/absent tensor). The kernel-selection else below maps any
+  // non-Q6K/Q5K tag to the Q4_K kernel, so a kNone would silently mis-decode.
+  assert(type != KQ::kNone && "k-quant dispatch received kNone");
   // y[0:N] = dequant(w[N,K]) @ x[0:K]. q4_K/q5_K: one simdgroup per row
   // (grid (32,N,1)); q6_K: the optimized v2 form (grid (32,ceil(N/8)*2,1),
   // tg (32,2,1)). Offsets are in elements (the helper converts to bytes).
@@ -2225,6 +2437,7 @@ MetalQwenModel::kqmv_batch_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                             const SharedBuffer& x, const SharedBuffer& y, int K,
                             int N, int M, int ystride, int yoff)
 {
+  assert(type != KQ::kNone && "k-quant batch dispatch received kNone");
   // y[base+m, yoff + 0:N] = dequant(w[N,K]) @ x[base+m, 0:K] with the raw
   // k-quant weight read ONCE across each tile. MAXM=2 (depth-1 draft window M=2:
   // one tile, weight read once -> ~1 decode step) or, in the MTP verify at
@@ -2351,6 +2564,7 @@ MetalQwenModel::kqmm_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                       const SharedBuffer& x, const SharedBuffer& y,
                       int K, int N, int M)
 {
+  assert(type != KQ::kNone && "k-quant prefill GEMM received kNone");
   // Prefill (M rows): dequant the k-quant weight into the reusable f16
   // scratch (sized to the largest N*K seen), then a dense f16 GEMM. The
   // M-independent dequant amortizes across the M prompt rows.
@@ -2371,6 +2585,7 @@ void
 MetalQwenModel::kdequant_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                           std::size_t dst_off, int count)
 {
+  assert(type != KQ::kNone && "k-quant dequant received kNone");
   // Dequant `count` k-quant elements of `w` into _w_deq[dst_off:], for a
   // fused prefill GEMM (heterogeneous parts share one f16 scratch).
   enc.set_function(type == KQ::kQ6K ? _fn_dequant_q6k
@@ -2613,7 +2828,7 @@ MetalQwenModel::encode_decode_step_(
     enc.set_buffer(4, y);
     enc.set_constant(5, Kk);
     enc.set_constant(6, N);
-    enc.set_buffer(7, res);
+    enc.set_buffer(7, res);     // read (residual); y==res is in-place
     enc.dispatch({32, (unsigned)(N / 4), 1}, {32, 2, 1});
   };
   auto hslice = [&](const SharedBuffer& in, std::size_t ioff,
@@ -2630,9 +2845,9 @@ MetalQwenModel::encode_decode_step_(
     enc.set_constant(7, gstride);
     enc.dispatch({(unsigned)(Hh * W), 1, 1}, {256, 1, 1});
   };
-  auto rope = [&](const SharedBuffer& xb, int heads) {
+  auto rope = [&](const SharedBuffer& xb, int heads, std::size_t xoff = 0) {
     enc.set_function(_fn_rope_partial);
-    enc.set_buffer(0, xb);
+    enc.set_buffer(0, xb, xoff);  // in-place rotate
     enc.set_buffer(1, _inv_freq);
     enc.set_constant(2, heads);
     const int one = 1;
@@ -2645,9 +2860,9 @@ MetalQwenModel::encode_decode_step_(
   };
   // Fused per-head RMSNorm + partial RoPE (one dispatch vs rms + rope).
   auto rms_rope = [&](const SharedBuffer& xb, const SharedBuffer& w,
-                      int heads) {
+                      int heads, std::size_t xoff = 0) {
     enc.set_function(_fn_rms_rope);
-    enc.set_buffer(0, xb);
+    enc.set_buffer(0, xb, xoff);  // in-place norm+rotate
     enc.set_buffer(1, w);
     enc.set_buffer(2, _inv_freq);
     enc.set_constant(3, D);
@@ -2656,9 +2871,10 @@ MetalQwenModel::encode_decode_step_(
     enc.set_constant(6, eps);
     enc.dispatch({256, (unsigned)heads, 1}, {256, 1, 1});
   };
-  auto kv_write = [&](const SharedBuffer& src, const SharedBuffer& pool) {
+  auto kv_write = [&](const SharedBuffer& src, const SharedBuffer& pool,
+                      std::size_t soff = 0) {
     enc.set_function(_fn_kv_write_paged);
-    enc.set_buffer(0, src);
+    enc.set_buffer(0, src, soff);
     enc.set_buffer(1, pool, page_off);
     enc.set_constant(2, page_tokens);
     enc.set_constant(3, D);
@@ -2684,17 +2900,48 @@ MetalQwenModel::encode_decode_step_(
   // toggle the duplicated category between passes -- the only reliable way
   // to compare categories at a STEADY GPU clock (cross-process runs start
   // at a low clock and ramp, corrupting cross-run deltas).
-  int dup = -1;
+  auto parse_cat = [](const char* s) -> int {
+    const std::string v = s;
+    return (v == "proj") ? 1 : (v == "ffn") ? 2 : (v == "lmhead") ? 3
+         : (v == "attn") ? 4 : (v == "norm") ? 5 : (v == "rope") ? 6
+         : (v == "misc") ? 7 : (v == "gdn") ? 8 : (v == "gdn_rec") ? 9 : 0;
+  };
+  int dup = -1, skip = -1;
   if (_catprof) {
-    if (const char* e = std::getenv("VPIPE_QWEN_DUP_CAT")) {
-      const std::string s = e;
-      dup = (s == "proj") ? 1 : (s == "ffn") ? 2 : (s == "lmhead") ? 3
-          : (s == "attn") ? 4 : (s == "norm") ? 5 : (s == "rope") ? 6
-          : (s == "misc") ? 7 : (s == "gdn") ? 8
-          : (s == "gdn_rec") ? 9 : 0;
+    if (const char* e = std::getenv("VPIPE_QWEN_DUP_CAT")) { dup = parse_cat(e); }
+    // Ablation: VPIPE_QWEN_SKIP_CAT short-circuits a category (fn() not run) ->
+    // the tok/s delta vs baseline = that category's REAL cost, with no
+    // cache-reuse inflation (unlike DUP doubling a BW-bound matmul). Output is
+    // garbage but the timing is valid.
+    if (const char* e = std::getenv("VPIPE_QWEN_SKIP_CAT")) { skip = parse_cat(e); }
+  }
+  auto DUP = [&](int cat, auto&& fn) {
+    if (skip == cat) { return; }
+    fn();
+    if (dup == cat) { fn(); }
+  };
+  // Fine GDN-recurrence sub-op AMPLIFICATION: re-dispatch one sub-op N extra
+  // times so the measured delta is N x its per-invocation GPU cost (small ops
+  // are below the tok/s noise floor at 1x). VPIPE_QWEN_GDN_REP_OP in
+  // {conv,qknorm,gbeta,ssm,gatedrms}, VPIPE_QWEN_GDN_REP_N = extra count.
+  int grep_op = -1, grep_n = 0;
+  if (_catprof) {
+    if (const char* e = std::getenv("VPIPE_QWEN_GDN_REP_OP")) {
+      const std::string v = e;
+      grep_op = (v == "conv") ? 1 : (v == "qknorm") ? 2 : (v == "gbeta") ? 3
+              : (v == "ssm") ? 4 : (v == "gatedrms") ? 5 : -1;
+    }
+    if (const char* e = std::getenv("VPIPE_QWEN_GDN_REP_N")) {
+      grep_n = std::atoi(e);
     }
   }
-  auto DUP = [&](int cat, auto&& fn) { fn(); if (dup == cat) { fn(); } };
+  auto GREP = [&](int op, metal_compute::LaunchDims g,
+                  metal_compute::LaunchDims tg) {
+    enc.dispatch(g, tg);
+    if (op == grep_op) {
+      for (int i = 0; i < grep_n; ++i) { enc.dispatch(g, tg); }
+    }
+  };
   // k-quant residual add: _d_x[0:n] += _d_radd[0:n] (the qmv-then-add the
   // affine qmv_*_add fuses; native k-quant has no fused-add qmv variant).
   auto radd = [&](int n) {
@@ -2718,7 +2965,10 @@ MetalQwenModel::encode_decode_step_(
       DUP(DC_PROJ, [&] {
         if (_kquant) {
           // q+k fused (q4_K) -> _d_qfull[0:kqk_n]; v (q6_K) -> the kd tail
-          // [kqk_n : kqk_n+kd], reproducing the [q|k|v] fused layout.
+          // [kqk_n : kqk_n+kd], reproducing the [q|k|v] fused layout. The qk and
+          // v matvecs are independent (shared _d_hn, disjoint _d_qfull writes) ->
+          // overlap them under hybrid (GGUF mixed-quant can't fuse qk with v).
+          auto _cg = enc.concurrent_scope(decode_hybrid_());
           if (ly.qk_q4k_aff) {
             amv_g32(ly.qk_aw, ly.qk_as, ly.qk_ab, _d_hn, _d_qfull, H,
                     ly.kqk_n);
@@ -2727,8 +2977,13 @@ MetalQwenModel::encode_decode_step_(
           }
           kqmv_(enc, ly.kqv_t, ly.kqv, _d_hn, 0, _d_qfull,
                 (std::size_t)ly.kqk_n, H, kd);
-        } else if (_mixed) {
+        } else if (_mixed && !ly.qkv_fused) {
           // q|k|v each its own bit width into the [q(qdo)|k(kd)|v(kd)] layout.
+          // Independent (shared _d_hn read, disjoint _d_qfull writes) -> run
+          // them concurrently so k/v overlap under q's DRAM read (no-op on a
+          // Serial encoder). (A uniform-base-width layer is fused -> the plain
+          // qmv else below; gated on !ly.qkv_fused.)
+          auto _cg = enc.concurrent_scope(decode_hybrid_());
           amv(ly.qw, ly.qs, ly.qb, ly.q_bits, _d_hn, _d_qfull, 0, H, qdo);
           amv(ly.kw, ly.ks, ly.kb, ly.k_bits, _d_hn, _d_qfull,
               (std::size_t)qdo, H, kd);
@@ -2738,6 +2993,15 @@ MetalQwenModel::encode_decode_step_(
           qmv(ly.qw, ly.qs, ly.qb, _d_hn, 0, _d_qfull, H, Nfqkv);
         }
       });
+      // No-hslice K/V: k and v are the contiguous [q..|k(kd)|v(kd)] tail of
+      // _d_qfull -> bind it at the k/v byte offsets to the k-path + kv-write
+      // instead of copying them out. q/gate always stay copied (the gated case
+      // interleaves them). kb/vb are the (buffer, byte-offset) of k/v.
+      const bool attn_nohs = decode_attn_nohs_();
+      const SharedBuffer& kb = attn_nohs ? _d_qfull : _d_kbuf;
+      const SharedBuffer& vb = attn_nohs ? _d_qfull : _d_vbuf;
+      const std::size_t kb_o = attn_nohs ? (std::size_t)qdo * 2 : 0;
+      const std::size_t vb_o = attn_nohs ? (std::size_t)(qdo + kd) * 2 : 0;
       DUP(DC_MISC, [&] {
         if (gate) {
           hslice(_d_qfull, 0, _d_q3, 0, Hq, 2 * D, D, 0);
@@ -2745,21 +3009,25 @@ MetalQwenModel::encode_decode_step_(
         } else {
           hslice(_d_qfull, 0, _d_q3, 0, 1, Nfqkv, qd, 0);
         }
-        hslice(_d_qfull, 0, _d_kbuf, 0, 1, Nfqkv, kd, qdo);
-        hslice(_d_qfull, 0, _d_vbuf, 0, 1, Nfqkv, kd, qdo + kd);
+        if (!attn_nohs) {
+          hslice(_d_qfull, 0, _d_kbuf, 0, 1, Nfqkv, kd, qdo);
+          hslice(_d_qfull, 0, _d_vbuf, 0, 1, Nfqkv, kd, qdo + kd);
+        }
       });
       if (_fn_rms_rope.valid() && dup < 0) {
-        // Fused: q_norm+rope_q and k_norm+rope_k -> one dispatch each.
+        // Fused: q_norm+rope_q and k_norm+rope_k -> one dispatch each. (These
+        // two are independent, but overlapping them under hybrid measured ~0 --
+        // latency-bound tiny ops, encoder-switch cost cancels the gain.)
         rms_rope(_d_q3, ly.q_norm, Hq);
-        rms_rope(_d_kbuf, ly.k_norm, Hkv);
+        rms_rope(kb, ly.k_norm, Hkv, kb_o);
       } else {
         DUP(DC_NORM, [&] {
           rms(_d_q3, 0, ly.q_norm, _d_q3, 0, Hq, D);
-          rms(_d_kbuf, 0, ly.k_norm, _d_kbuf, 0, Hkv, D);
+          rms(kb, kb_o, ly.k_norm, kb, kb_o, Hkv, D);
         });
-        DUP(DC_ROPE, [&] { rope(_d_q3, Hq); rope(_d_kbuf, Hkv); });
+        DUP(DC_ROPE, [&] { rope(_d_q3, Hq); rope(kb, Hkv, kb_o); });
       }
-      DUP(DC_MISC, [&] { kv_write(_d_kbuf, kp); kv_write(_d_vbuf, vp); });
+      DUP(DC_MISC, [&] { kv_write(kb, kp, kb_o); kv_write(vb, vp, vb_o); });
       // Multi-simdgroup paged attention past the long-context threshold
       // (the scalar kernel scans KV with only 32 lanes -> dominates the
       // per-layer critical path at high pos). D==256 (Qwen3.5) -> mb256
@@ -2904,8 +3172,9 @@ MetalQwenModel::encode_decode_step_(
       DUP(DC_GDN, [&] {     // GDN in_proj matvecs
       if (_kquant) {
         // in_proj is heterogeneous: qkv (q5_K) + z (q4_K) + a|b (f16) each
-        // run their own matmul into the [qkv|z|a|b] mixqkv layout; the
-        // hslices below then carve out z/a/b exactly as the fused path.
+        // run their own matmul into the [qkv|z|a|b] mixqkv layout. Independent
+        // (shared _d_hn read, disjoint _d_mixqkv writes) -> overlap under hybrid.
+        auto _cg = enc.concurrent_scope(decode_hybrid_());
         kqmv_(enc, ly.kqkv_t, ly.kqkv, _d_hn, 0, _d_mixqkv, 0, H, Cd);
         kqmv_(enc, ly.kqz_t, ly.kqz, _d_hn, 0, _d_mixqkv, (std::size_t)Cd,
               H, vald);
@@ -2913,7 +3182,10 @@ MetalQwenModel::encode_decode_step_(
                     (std::size_t)(Cd + vald), H, 2 * Hv);
       } else if (_mixed) {
         // qkv|z|a|b each its own bit width into the [qkv(Cd)|z(vald)|a(Hv)|
-        // b(Hv)] fused layout the hslices below carve up.
+        // b(Hv)] fused layout the hslices below carve up. Independent (shared
+        // _d_hn read, disjoint _d_mixqkv writes) -> concurrent so z/a/b overlap
+        // under qkv's read (no-op on a Serial encoder).
+        auto _cg = enc.concurrent_scope(decode_hybrid_());
         amv(ly.iqw, ly.iqs, ly.iqb, ly.qkv_bits, _d_hn, _d_mixqkv, 0, H, Cd);
         amv(ly.izw, ly.izs, ly.izb, ly.z_bits, _d_hn, _d_mixqkv,
             (std::size_t)Cd, H, vald);
@@ -2926,23 +3198,54 @@ MetalQwenModel::encode_decode_step_(
       }
       });
       DUP(DC_GDN_REC, [&] {   // conv1d + qk_norm + g_beta + ssm step + gated_rms
-      hslice(_d_mixqkv, 0, _d_zbuf, 0, 1, Nf, vald, Cd);
-      hslice(_d_mixqkv, 0, _d_abuf, 0, 1, Nf, Hv, Cd + vald);
-      hslice(_d_mixqkv, 0, _d_bbuf, 0, 1, Nf, Hv, Cd + vald + Hv);
-      enc.set_function(_fn_gdn_conv1d);
-      enc.set_buffer(0, *cs_r);
-      enc.set_buffer(1, _d_mixqkv);
-      enc.set_buffer(2, ly.conv_w);
-      enc.set_buffer(3, _d_convout);
-      enc.set_constant(4, one);
-      enc.set_constant(5, Cd);
-      enc.set_constant(6, K);
-      enc.set_constant(7, Nf);
-      enc.set_constant(8, keyd);
-      enc.set_buffer(9, *cs_w);
-      enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
+      // z/a/b are contiguous in _d_mixqkv [qkv|z|a|b]; materialize them as
+      // separate buffers OR (no-hslice) bind _d_mixqkv directly by offset below.
+      const bool noslice = decode_no_hslice_();
+      if (!noslice) {
+        hslice(_d_mixqkv, 0, _d_zbuf, 0, 1, Nf, vald, Cd);
+        hslice(_d_mixqkv, 0, _d_abuf, 0, 1, Nf, Hv, Cd + vald);
+        hslice(_d_mixqkv, 0, _d_bbuf, 0, 1, Nf, Hv, Cd + vald + Hv);
+      }
+      // _d_mixqkv is 2-byte elements (f16/bf16); z/a/b byte offsets:
+      const std::size_t z_off = (std::size_t)Cd * 2;
+      const std::size_t a_off = (std::size_t)(Cd + vald) * 2;
+      const std::size_t b_off = (std::size_t)(Cd + vald + Hv) * 2;
       const float inv_scale = 1.0f / std::sqrt((float)Dk);
       const float s_q = inv_scale * inv_scale, s_k = inv_scale;
+      // conv1d and g_beta are independent (conv1d reads the qkv slice of the
+      // in_proj output, g_beta reads the a|b slices); issue them into one short
+      // CONCURRENT sub-encoder so g_beta overlaps conv1d and leaves the critical
+      // path. The scope-end boundary syncs both into the serial qk_norm tail.
+      {
+        auto _cg = enc.concurrent_scope(decode_gdn_overlap_());
+        enc.set_function(_fn_gdn_conv1d);
+        enc.set_buffer(0, *cs_r);
+        enc.set_buffer(1, _d_mixqkv);
+        enc.set_buffer(2, ly.conv_w);
+        enc.set_buffer(3, _d_convout);
+        enc.set_constant(4, one);
+        enc.set_constant(5, Cd);
+        enc.set_constant(6, K);
+        enc.set_constant(7, Nf);
+        enc.set_constant(8, keyd);
+        enc.set_buffer(9, *cs_w);
+        GREP(1, {(unsigned)Cd, 1, 1}, {256, 1, 1});
+        enc.set_function(_fn_gdn_g_beta);
+        if (noslice) {
+          enc.set_buffer(0, _d_mixqkv, a_off);
+          enc.set_buffer(1, _d_mixqkv, b_off);
+        } else {
+          enc.set_buffer(0, _d_abuf);
+          enc.set_buffer(1, _d_bbuf);
+        }
+        enc.set_buffer(2, ly.A_log);
+        enc.set_buffer(3, ly.dt_bias);
+        enc.set_buffer(4, _d_gbuf);
+        enc.set_buffer(5, _d_betabuf);
+        enc.set_constant(6, Hv);
+        enc.set_constant(7, one);
+        GREP(3, {(unsigned)Hv, 1, 1}, {256, 1, 1});
+      }
       enc.set_function(_fn_gdn_qk_norm);
       enc.set_buffer(0, _d_convout);
       enc.set_constant(1, Hk);
@@ -2950,17 +3253,7 @@ MetalQwenModel::encode_decode_step_(
       enc.set_constant(3, s_q);
       enc.set_constant(4, s_k);
       enc.set_constant(5, eps);
-      enc.dispatch({128, (unsigned)(2 * Hk), 1}, {128, 1, 1});
-      enc.set_function(_fn_gdn_g_beta);
-      enc.set_buffer(0, _d_abuf);
-      enc.set_buffer(1, _d_bbuf);
-      enc.set_buffer(2, ly.A_log);
-      enc.set_buffer(3, ly.dt_bias);
-      enc.set_buffer(4, _d_gbuf);
-      enc.set_buffer(5, _d_betabuf);
-      enc.set_constant(6, Hv);
-      enc.set_constant(7, one);
-      enc.dispatch({(unsigned)Hv, 1, 1}, {256, 1, 1});
+      GREP(2, {128, (unsigned)(2 * Hk), 1}, {128, 1, 1});
       enc.set_function(_fn_gdn_step);
       enc.set_buffer(0, _d_convout, 0);
       enc.set_buffer(1, _d_convout, (std::size_t)keyd * 2);
@@ -2977,15 +3270,16 @@ MetalQwenModel::encode_decode_step_(
       // (hk = hv / (Hv/Hk)) assumes. No-op when Hv == Hk (2B).
       enc.set_constant(9, _kquant ? -Hk : Hk);
       enc.set_constant(10, Hv);
-      enc.dispatch({32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
+      GREP(4, {32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
       enc.set_function(_fn_gdn_gated_rms);
       enc.set_buffer(0, _d_ygdn);
       enc.set_buffer(1, ly.gdn_norm);
-      enc.set_buffer(2, _d_zbuf);
+      if (noslice) { enc.set_buffer(2, _d_mixqkv, z_off); }
+      else { enc.set_buffer(2, _d_zbuf); }
       enc.set_buffer(3, _d_normout);
       enc.set_constant(4, Dv);
       enc.set_constant(5, eps);
-      enc.dispatch({128, (unsigned)Hv, 1}, {128, 1, 1});
+      GREP(5, {128, (unsigned)Hv, 1}, {128, 1, 1});
       });   // DUP(DC_GDN_REC)
       DUP(DC_GDN, [&] {     // GDN out_proj
       if (_kquant) {
@@ -3012,13 +3306,18 @@ MetalQwenModel::encode_decode_step_(
     } else if (_kquant) {
       // gate + up as two q4_K qmv into _d_sg / _d_up, then SwiGLU + down.
       DUP(DC_FFN, [&] {
-        if (ly.ffn_q4k_aff) {
-          amv_g32(ly.gate_aw, ly.gate_as, ly.gate_ab, _d_hn, _d_sg, H,
-                  c.ffn_inner);
-          amv_g32(ly.up_aw, ly.up_as, ly.up_ab, _d_hn, _d_up, H, c.ffn_inner);
-        } else {
-          kqmv_(enc, ly.kqgate_t, ly.kqgate, _d_hn, 0, _d_sg, 0, H, c.ffn_inner);
-          kqmv_(enc, ly.kqup_t, ly.kqup, _d_hn, 0, _d_up, 0, H, c.ffn_inner);
+        {
+          // gate + up independent (shared _d_hn, disjoint _d_sg/_d_up) -> overlap
+          // under hybrid; the swiglu below reads both -> barriers at scope end.
+          auto _cg = enc.concurrent_scope(decode_hybrid_());
+          if (ly.ffn_q4k_aff) {
+            amv_g32(ly.gate_aw, ly.gate_as, ly.gate_ab, _d_hn, _d_sg, H,
+                    c.ffn_inner);
+            amv_g32(ly.up_aw, ly.up_as, ly.up_ab, _d_hn, _d_up, H, c.ffn_inner);
+          } else {
+            kqmv_(enc, ly.kqgate_t, ly.kqgate, _d_hn, 0, _d_sg, 0, H, c.ffn_inner);
+            kqmv_(enc, ly.kqup_t, ly.kqup, _d_hn, 0, _d_up, 0, H, c.ffn_inner);
+          }
         }
         enc.set_function(_fn_swiglu);
         enc.set_buffer(0, _d_sg);
@@ -3033,19 +3332,42 @@ MetalQwenModel::encode_decode_step_(
         radd(H);
       });
     } else if (_mixed) {
-      // gate + up as two affine qmv (own bits) into _d_sg / _d_up, SwiGLU,
-      // then down (own bits) with fused residual add.
-      DUP(DC_FFN, [&] {
-        amv(ly.guw, ly.gus, ly.gub, ly.gate_bits, _d_hn, _d_sg, 0, H,
-            c.ffn_inner);
-        amv(ly.uw, ly.us, ly.ub, ly.up_bits, _d_hn, _d_up, 0, H, c.ffn_inner);
-        enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, _d_sg);
-        enc.set_buffer(1, _d_up);
-        enc.set_buffer(2, _d_sg);
-        enc.set_constant(3, c.ffn_inner);
-        enc.dispatch({(unsigned)c.ffn_inner, 1, 1}, {256, 1, 1});
-      });
+      if (ly.mlp_fused) {
+        // gate|up fused (both w4) -> ONE swiglu qmv (weights read once, no
+        // _d_up round-trip, no standalone swiglu bubble). down keeps its bits.
+        enc.set_function(_fn_qmv_swiglu);
+        enc.set_buffer(0, ly.guw);
+        enc.set_buffer(1, ly.gus);
+        enc.set_buffer(2, ly.gub);
+        enc.set_buffer(3, _d_hn);
+        enc.set_buffer(4, _d_sg);
+        enc.set_constant(5, H);
+        enc.set_constant(6, 2 * c.ffn_inner);
+        DUP(DC_FFN, [&] {
+          enc.dispatch({32, (unsigned)(c.ffn_inner / 2), 1}, {32, 2, 1});
+        });
+      } else {
+        // De-fused: gate + up as two affine qmv (own bits) into _d_sg / _d_up,
+        // then a standalone SwiGLU (the 4 genuinely mixed-bit layers).
+        DUP(DC_FFN, [&] {
+          {
+            // gate/up independent (shared _d_hn read, distinct _d_sg/_d_up
+            // writes) -> concurrent. The swiglu below reads both -> barriers
+            // after the group. (no-op on a Serial encoder.)
+            auto _cg = enc.concurrent_scope(decode_hybrid_());
+            amv(ly.guw, ly.gus, ly.gub, ly.gate_bits, _d_hn, _d_sg, 0, H,
+                c.ffn_inner);
+            amv(ly.uw, ly.us, ly.ub, ly.up_bits, _d_hn, _d_up, 0, H,
+                c.ffn_inner);
+          }
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, _d_sg);
+          enc.set_buffer(1, _d_up);
+          enc.set_buffer(2, _d_sg);
+          enc.set_constant(3, c.ffn_inner);
+          enc.dispatch({(unsigned)c.ffn_inner, 1, 1}, {256, 1, 1});
+        });
+      }
       DUP(DC_FFN, [&] {
         amv_add(ly.dw, ly.ds, ly.db, ly.down_bits, _d_sg, _d_x, _d_x,
                 c.ffn_inner, H);
@@ -3798,10 +4120,11 @@ MetalQwenModel::encode_batched_step_(
       const bool gate = c.attn_output_gate;
       const int qdo = gate ? 2 * qd : qd;
       const int Nfqkv = qdo + 2 * kd;
-      if (_mixed) {
+      if (_mixed && !ly.qkv_fused) {
         // Mixed-precision de-fuses q|k|v into per-tensor-bit projections (a
         // batched-GEMV can't write a column slice of a fused buffer). q (+gate)
         // -> qfull[N,qdo], k/v -> their own buffers; slice q|gate at stride qdo.
+        // (A uniform-base-width layer is fused -> the qmm else below.)
         vqmm_(enc, N, ly.qw, ly.qs, ly.qb, ly.q_bits, bs.hn, bs.qfull, H, qdo);
         vqmm_(enc, N, ly.kw, ly.ks, ly.kb, ly.k_bits, bs.hn, bs.kbuf, H, kd);
         vqmm_(enc, N, ly.vw, ly.vs, ly.vb, ly.v_bits, bs.hn, bs.vbuf, H, kd);
@@ -3906,7 +4229,10 @@ MetalQwenModel::encode_batched_step_(
         enc.set_buffer(13, bs.pgt, 0);
         enc.dispatch({32u * 16u, (unsigned)Hq, 1}, {32u * 16u, 1, 1});
         // PHASE B: per branch -- scan its PRIVATE pages (offset past the
-        // shared prefix) and merge with its phase-A shared partial.
+        // shared prefix) and merge with its phase-A shared partial. Each branch
+        // writes its own bs.at slice -> the N merges are independent, so run
+        // them in one concurrent sub-encoder to overlap.
+        auto _bcg = enc.concurrent_scope(decode_batch_concurrent_() && N > 1);
         for (int i = 0; i < N; ++i) {
           const std::size_t qoff = (std::size_t)i * qd * 2;
           const int pos_i = slots[(std::size_t)i].position;
@@ -3959,59 +4285,83 @@ MetalQwenModel::encode_batched_step_(
         hslice(bs.mixqkv, 0, bs.abuf, 0, N, Nf, Hv, Cd + vald);
         hslice(bs.mixqkv, 0, bs.bbuf, 0, N, Nf, Hv, Cd + vald + Hv);
       }
-      // Per-branch GDN: conv1d + delta-rule recurrence over this branch's
-      // own conv_state / ssm_state (cheap, not weight-bound). n=1 per branch.
-      for (int i = 0; i < N; ++i) {
-        const SharedBuffer* cs = _ctx->conv_state(cids[(std::size_t)i], L);
-        const SharedBuffer* ss = _ctx->ssm_state(cids[(std::size_t)i], L);
-        const int one = 1;
-        const std::size_t coff = (std::size_t)i * Cd * 2;       // convout row
-        const std::size_t moff =
-            (std::size_t)i * gdn_in_stride * 2;                 // qkv row
-        enc.set_function(_fn_gdn_conv1d);
-        enc.set_buffer(0, *cs); enc.set_buffer(1, bs.mixqkv, moff);
-        enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, bs.convout, coff);
-        enc.set_constant(4, one); enc.set_constant(5, Cd);
-        enc.set_constant(6, K); enc.set_constant(7, gdn_in_stride);
-        enc.set_constant(8, keyd);
-        enc.set_buffer(9, *cs);          // in-place (no run-ahead ring here)
-        enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
-        const float inv_scale = 1.0f / std::sqrt((float)Dk);
-        const float s_q = inv_scale * inv_scale, s_k = inv_scale;
-        enc.set_function(_fn_gdn_qk_norm);
-        enc.set_buffer(0, bs.convout, coff);
-        enc.set_constant(1, Hk); enc.set_constant(2, Dk);
-        enc.set_constant(3, s_q); enc.set_constant(4, s_k);
-        enc.set_constant(5, eps);
-        enc.dispatch({128, (unsigned)(2 * Hk), 1}, {128, 1, 1});
-        enc.set_function(_fn_gdn_g_beta);
-        enc.set_buffer(0, bs.abuf, (std::size_t)i * Hv * 2);
-        enc.set_buffer(1, bs.bbuf, (std::size_t)i * Hv * 2);
-        enc.set_buffer(2, ly.A_log); enc.set_buffer(3, ly.dt_bias);
-        enc.set_buffer(4, bs.gbuf, (std::size_t)i * Hv * 4);
-        enc.set_buffer(5, bs.betabuf, (std::size_t)i * Hv * 4);
-        enc.set_constant(6, Hv); enc.set_constant(7, one);
-        enc.dispatch({(unsigned)Hv, 1, 1}, {256, 1, 1});
-        enc.set_function(_fn_gdn_step);
-        enc.set_buffer(0, bs.convout, coff);
-        enc.set_buffer(1, bs.convout, coff + (std::size_t)keyd * 2);
-        enc.set_buffer(2, bs.convout, coff + (std::size_t)2 * keyd * 2);
-        enc.set_buffer(3, bs.gbuf, (std::size_t)i * Hv * 4);
-        enc.set_buffer(4, bs.betabuf, (std::size_t)i * Hv * 4);
-        enc.set_buffer(5, *ss);
-        enc.set_buffer(6, bs.ygdn, (std::size_t)i * vald * 2);
-        enc.set_buffer(7, *ss);
-        enc.set_constant(8, one);
-        enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
-        enc.set_constant(10, Hv);
-        enc.dispatch({32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
-        enc.set_function(_fn_gdn_gated_rms);
-        enc.set_buffer(0, bs.ygdn, (std::size_t)i * vald * 2);
-        enc.set_buffer(1, ly.gdn_norm);
-        enc.set_buffer(2, bs.zbuf, (std::size_t)i * vald * 2);
-        enc.set_buffer(3, bs.normout, (std::size_t)i * vald * 2);
-        enc.set_constant(4, Dv); enc.set_constant(5, eps);
-        enc.dispatch({128, (unsigned)Hv, 1}, {128, 1, 1});
+      // Per-branch GDN over each branch's OWN conv/ssm state + disjoint output
+      // slices -> the N branches are independent. Phase-interleave the chain
+      // (all conv1d+g_beta, then all qk_norm, then all ssm, then all gated_rms),
+      // each phase a concurrent sub-encoder, so the branches overlap. Off ->
+      // the scopes are no-ops and the phases run serially (same result; deps
+      // preserved by the phase order conv1d -> qk_norm -> ssm -> gated_rms).
+      const bool bconc = decode_batch_concurrent_() && N > 1;
+      const int one = 1;
+      const float inv_scale = 1.0f / std::sqrt((float)Dk);
+      const float s_q = inv_scale * inv_scale, s_k = inv_scale;
+      {   // phase A: conv1d + g_beta (mutually independent, per branch)
+        auto _g = enc.concurrent_scope(bconc);
+        for (int i = 0; i < N; ++i) {
+          const SharedBuffer* cs = _ctx->conv_state(cids[(std::size_t)i], L);
+          const std::size_t coff = (std::size_t)i * Cd * 2;
+          const std::size_t moff = (std::size_t)i * gdn_in_stride * 2;
+          enc.set_function(_fn_gdn_conv1d);
+          enc.set_buffer(0, *cs); enc.set_buffer(1, bs.mixqkv, moff);
+          enc.set_buffer(2, ly.conv_w); enc.set_buffer(3, bs.convout, coff);
+          enc.set_constant(4, one); enc.set_constant(5, Cd);
+          enc.set_constant(6, K); enc.set_constant(7, gdn_in_stride);
+          enc.set_constant(8, keyd);
+          enc.set_buffer(9, *cs);          // in-place (no run-ahead ring here)
+          enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
+          enc.set_function(_fn_gdn_g_beta);
+          enc.set_buffer(0, bs.abuf, (std::size_t)i * Hv * 2);
+          enc.set_buffer(1, bs.bbuf, (std::size_t)i * Hv * 2);
+          enc.set_buffer(2, ly.A_log); enc.set_buffer(3, ly.dt_bias);
+          enc.set_buffer(4, bs.gbuf, (std::size_t)i * Hv * 4);
+          enc.set_buffer(5, bs.betabuf, (std::size_t)i * Hv * 4);
+          enc.set_constant(6, Hv); enc.set_constant(7, one);
+          enc.dispatch({(unsigned)Hv, 1, 1}, {256, 1, 1});
+        }
+      }
+      {   // phase B: qk_norm (reads conv output)
+        auto _g = enc.concurrent_scope(bconc);
+        for (int i = 0; i < N; ++i) {
+          const std::size_t coff = (std::size_t)i * Cd * 2;
+          enc.set_function(_fn_gdn_qk_norm);
+          enc.set_buffer(0, bs.convout, coff);
+          enc.set_constant(1, Hk); enc.set_constant(2, Dk);
+          enc.set_constant(3, s_q); enc.set_constant(4, s_k);
+          enc.set_constant(5, eps);
+          enc.dispatch({128, (unsigned)(2 * Hk), 1}, {128, 1, 1});
+        }
+      }
+      {   // phase C: ssm step (reads qk-normed conv output + g/beta + ssm state)
+        auto _g = enc.concurrent_scope(bconc);
+        for (int i = 0; i < N; ++i) {
+          const SharedBuffer* ss = _ctx->ssm_state(cids[(std::size_t)i], L);
+          const std::size_t coff = (std::size_t)i * Cd * 2;
+          enc.set_function(_fn_gdn_step);
+          enc.set_buffer(0, bs.convout, coff);
+          enc.set_buffer(1, bs.convout, coff + (std::size_t)keyd * 2);
+          enc.set_buffer(2, bs.convout, coff + (std::size_t)2 * keyd * 2);
+          enc.set_buffer(3, bs.gbuf, (std::size_t)i * Hv * 4);
+          enc.set_buffer(4, bs.betabuf, (std::size_t)i * Hv * 4);
+          enc.set_buffer(5, *ss);
+          enc.set_buffer(6, bs.ygdn, (std::size_t)i * vald * 2);
+          enc.set_buffer(7, *ss);
+          enc.set_constant(8, one);
+          enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
+          enc.set_constant(10, Hv);
+          enc.dispatch({32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
+        }
+      }
+      {   // phase D: gated RMSNorm
+        auto _g = enc.concurrent_scope(bconc);
+        for (int i = 0; i < N; ++i) {
+          enc.set_function(_fn_gdn_gated_rms);
+          enc.set_buffer(0, bs.ygdn, (std::size_t)i * vald * 2);
+          enc.set_buffer(1, ly.gdn_norm);
+          enc.set_buffer(2, bs.zbuf, (std::size_t)i * vald * 2);
+          enc.set_buffer(3, bs.normout, (std::size_t)i * vald * 2);
+          enc.set_constant(4, Dv); enc.set_constant(5, eps);
+          enc.dispatch({128, (unsigned)Hv, 1}, {128, 1, 1});
+        }
       }
       if (_mixed) {
         vqmm_(enc, N, ly.gow, ly.gos, ly.gob, ly.gout_bits, bs.normout, bs.ao,
@@ -4031,12 +4381,18 @@ MetalQwenModel::encode_batched_step_(
                       bs.moe_ssg, bs.moe_sout, bs.moe_gate);
     } else {
       if (_mixed) {
-        vqmm_(enc, N, ly.guw, ly.gus, ly.gub, ly.gate_bits, bs.hn, bs.sg, H, ffn);
-        vqmm_(enc, N, ly.uw, ly.us, ly.ub, ly.up_bits, bs.hn, bs.upb, H, ffn);
-        enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, bs.sg); enc.set_buffer(1, bs.upb);
-        enc.set_buffer(2, bs.sg); enc.set_constant(3, N * ffn);
-        enc.dispatch({(unsigned)(N * ffn), 1, 1}, {256, 1, 1});
+        if (ly.mlp_fused) {
+          qmm_auto_swiglu_(enc, N, ly.guw, ly.gus, ly.gub, bs.hn, bs.sg, H,
+                           2 * ffn);
+        } else {
+          vqmm_(enc, N, ly.guw, ly.gus, ly.gub, ly.gate_bits, bs.hn, bs.sg, H,
+                ffn);
+          vqmm_(enc, N, ly.uw, ly.us, ly.ub, ly.up_bits, bs.hn, bs.upb, H, ffn);
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, bs.sg); enc.set_buffer(1, bs.upb);
+          enc.set_buffer(2, bs.sg); enc.set_constant(3, N * ffn);
+          enc.dispatch({(unsigned)(N * ffn), 1, 1}, {256, 1, 1});
+        }
         vqmm_(enc, N, ly.dw, ly.ds, ly.db, ly.down_bits, bs.sg, bs.ao, ffn, H);
       } else {
         qmm_auto_swiglu_(enc, N, ly.guw, ly.gus, ly.gub, bs.hn, bs.sg, H,
@@ -4341,6 +4697,7 @@ MetalQwenModel::bdecode_end()
   bd = BDecode{};
 }
 
+
 std::vector<float>
 MetalQwenModel::forward(ContextId cid, std::int32_t token_id, int rope_pos)
 {
@@ -4379,10 +4736,12 @@ MetalQwenModel::forward(ContextId cid, std::int32_t token_id, int rope_pos)
       std::getenv("VPIPE_QWEN_DECODE_PROFILE") != nullptr;
   const auto t_enc0 = std::chrono::steady_clock::now();
   metal_compute::CommandStream stream = _mc->make_command_stream();
+  long n_disp = 0;
   {
     ComputeEncoder enc = stream.begin_compute();
     encode_decode_step_(enc, cid, pos, rpos, page_off, n_pages, slot,
                         _pgtab, 0);
+    n_disp = enc.dispatch_count();
   }
   const auto t_enc1 = std::chrono::steady_clock::now();
   stream.commit().wait();
@@ -4394,7 +4753,8 @@ MetalQwenModel::forward(ContextId cid, std::int32_t token_id, int rope_pos)
     gpu_ms += std::chrono::duration<double, std::milli>(t_done - t_enc1).count();
     if (++cnt % 16 == 0) {
       std::printf("[qwen-decode-prof] encode %.3f ms | commit+gpu %.3f ms "
-                  "(%d steps avg)\n", enc_ms / cnt, gpu_ms / cnt, cnt);
+                  "| dispatches/token %ld (%d steps avg)\n",
+                  enc_ms / cnt, gpu_ms / cnt, n_disp, cnt);
     }
   }
 
@@ -5563,9 +5923,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           }
           kdequant_(enc, ly.kqv_t, ly.kqv, (std::size_t)ly.kqk_n * H, kd * H);
           dense_gemm_(enc, _w_deq, hn, qfull, H, Nfqkv, n);
-        } else if (_mixed) {
+        } else if (_mixed && !ly.qkv_fused) {
           // q|k|v each its own bits -> one f16 scratch [Nfqkv,H], one dense
           // -> qfull[n, Nfqkv] (the same [q|k|v] layout downstream slices).
+          // (A uniform-base-width layer is fused -> the qmm else below.)
           ensure_wdeq((std::size_t)Nfqkv * H);
           adequant_(enc, ly.qw, ly.qs, ly.qb, ly.q_bits, 0, qdo, H);
           adequant_(enc, ly.kw, ly.ks, ly.kb, ly.k_bits,
@@ -5881,17 +6242,60 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         kqmm_(enc, ly.kqdown_t, ly.kqdown, sg, ao, ffn, H, n);
         residual(x, ao, x, n * H);
       } else if (_mixed) {
-        // Mixed MLP over all n rows (no last-layer prune): gate/up each its
-        // own bits (dequant+dense into sg / kqubuf), SwiGLU, then down.
+        // Mixed MLP over all n rows (no last-layer prune). Fused (gate|up both
+        // w4): the fused swiglu qmm (interleaved guw). De-fused (mixed bits):
+        // gate/up each its own bits into sg / kqubuf, then standalone SwiGLU.
+        // down always per-tensor (own bits).
         rms(x, 0, ly.post_ln, hn, 0, n, H);
-        aqmm_(enc, ly.guw, ly.gus, ly.gub, ly.gate_bits, hn, sg, H, ffn, n);
-        aqmm_(enc, ly.uw, ly.us, ly.ub, ly.up_bits, hn, kqubuf, H, ffn, n);
-        enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, sg);
-        enc.set_buffer(1, kqubuf);
-        enc.set_buffer(2, sg);
-        enc.set_constant(3, n * ffn);
-        enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
+        if (ly.mlp_fused && mma_mlp) {
+          // Fused gate|up are both 4-bit (interleaved in guw), so take the
+          // SAME matrix-core MLP the uniform path uses: dequant guw -> dense
+          // matmul2d -> gu_full[n, 2*ffn], then SwiGLU-combine -> sg. This is
+          // what closes the OptiQ/mixed prefill gap vs uniform-4bit on M5 --
+          // the FFN is the bulk of the prefill GEMM work, and the steel
+          // _fn_qmm_swiglu below (the M4 / small-M fallback) leaves it off the
+          // matrix units. Byte-identical weight/layout to the uniform branch,
+          // so it stays token-exact (verified vs the steel path).
+          const int N2 = 2 * ffn;
+          const std::size_t need = (std::size_t)N2 * H * 2;
+          if (_w_deq.empty() || _w_deq.byte_size() < need) {
+            _w_deq = _mc->make_shared_buffer(need);
+          }
+          if (!_skip_dequant) {
+            enc.set_function(_fn_dequant);
+            enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
+            enc.set_buffer(2, ly.gub); enc.set_buffer(3, _w_deq);
+            enc.set_constant(4, H); enc.set_constant(5, N2);
+            enc.dispatch({(unsigned)(H / 8), (unsigned)N2, 1}, {64, 1, 1});
+          }
+          dense_mma(hn, _w_deq, gu_full, H, N2);   // K=H (<=4096) -> 128x128
+          enc.set_function(_fn_swiglu_inter);
+          enc.set_buffer(0, gu_full); enc.set_buffer(1, sg);
+          enc.set_constant(2, n); enc.set_constant(3, ffn);
+          enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
+        } else if (ly.mlp_fused) {
+          enc.set_function(_fn_qmm_swiglu);
+          enc.set_buffer(0, ly.guw);
+          enc.set_buffer(1, ly.gus);
+          enc.set_buffer(2, ly.gub);
+          enc.set_buffer(3, hn);
+          enc.set_buffer(4, sg);
+          enc.set_constant(5, H);
+          enc.set_constant(6, 2 * ffn);
+          enc.set_constant(7, n);
+          const unsigned gx = (unsigned)(((2 * ffn + 31) / 32) * 32);
+          const unsigned gy = (unsigned)(((n + 31) / 32) * 2);
+          enc.dispatch({gx, gy, 2}, {32, 2, 2});
+        } else {
+          aqmm_(enc, ly.guw, ly.gus, ly.gub, ly.gate_bits, hn, sg, H, ffn, n);
+          aqmm_(enc, ly.uw, ly.us, ly.ub, ly.up_bits, hn, kqubuf, H, ffn, n);
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, sg);
+          enc.set_buffer(1, kqubuf);
+          enc.set_buffer(2, sg);
+          enc.set_constant(3, n * ffn);
+          enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
+        }
         aqmm_(enc, ly.dw, ly.ds, ly.db, ly.down_bits, sg, ao, ffn, H, n);
         residual(x, ao, x, n * H);
       } else if (_dense) {
@@ -6551,6 +6955,19 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           }
           hslice(qfull, kbuf, n, Nfqkv, kd, qdo, 0, 0);
           hslice(qfull, vbuf, n, Nfqkv, kd, qdo + kd, 0, 0);
+        } else if (ly.qkv_fused) {
+          // Uniform-base-width fused q|k|v -> ONE affine GEMV into qfull, then
+          // slice k/v from the tail (like the dense/kquant fused branches).
+          const int Nfqkv = qdo + 2 * kd;
+          vqmm_(enc, n, ly.qw, ly.qs, ly.qb, ly.q_bits, hn, qfull, H, Nfqkv);
+          if (gate) {
+            hslice(qfull, q3, n * Hq, 2 * D, D, 0, Hq, Nfqkv);
+            hslice(qfull, gate3, n * Hq, 2 * D, D, D, Hq, Nfqkv);
+          } else {
+            hslice(qfull, q3, n, Nfqkv, qd, 0, 0, 0);
+          }
+          hslice(qfull, kbuf, n, Nfqkv, kd, qdo, 0, 0);
+          hslice(qfull, vbuf, n, Nfqkv, kd, qdo + kd, 0, 0);
         } else {
           // De-fused q|k|v, each a direct quantized batched-GEMV.
           vqmm_(enc, n, ly.qw, ly.qs, ly.qb, ly.q_bits, hn, qraw, H, qdo);
@@ -6792,24 +7209,30 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
       // MLP: gate/up GEMM + SwiGLU + down (all rows). k-quant batched-GEMV
       // (weight read once) into sg/upb; affine direct batched-GEMV (vqmm_).
       rms(x, 0, ly.post_ln, hn, 0, n, H);
-      if (_kquant) {
-        if (ly.ffn_q4k_aff) {
-          amv_g32_batch_(enc, ly.gate_aw, ly.gate_as, ly.gate_ab, hn, sg, H,
-                         ffn, n, ffn, 0);
-          amv_g32_batch_(enc, ly.up_aw, ly.up_as, ly.up_ab, hn, upb, H, ffn,
-                         n, ffn, 0);
-        } else {
-          kqmv_batch_(enc, ly.kqgate_t, ly.kqgate, hn, sg, H, ffn, n, ffn, 0);
-          kqmv_batch_(enc, ly.kqup_t, ly.kqup, hn, upb, H, ffn, n, ffn, 0);
-        }
+      if (!_kquant && ly.mlp_fused) {
+        // Mixed-fused (gate|up both w4): fused swiglu qmm straight into sg
+        // (weights read once, no standalone swiglu pass).
+        qmm_auto_swiglu_(enc, n, ly.guw, ly.gus, ly.gub, hn, sg, H, 2 * ffn);
       } else {
-        vqmm_(enc, n, ly.guw, ly.gus, ly.gub, ly.gate_bits, hn, sg, H, ffn);
-        vqmm_(enc, n, ly.uw, ly.us, ly.ub, ly.up_bits, hn, upb, H, ffn);
+        if (_kquant) {
+          if (ly.ffn_q4k_aff) {
+            amv_g32_batch_(enc, ly.gate_aw, ly.gate_as, ly.gate_ab, hn, sg, H,
+                           ffn, n, ffn, 0);
+            amv_g32_batch_(enc, ly.up_aw, ly.up_as, ly.up_ab, hn, upb, H, ffn,
+                           n, ffn, 0);
+          } else {
+            kqmv_batch_(enc, ly.kqgate_t, ly.kqgate, hn, sg, H, ffn, n, ffn, 0);
+            kqmv_batch_(enc, ly.kqup_t, ly.kqup, hn, upb, H, ffn, n, ffn, 0);
+          }
+        } else {
+          vqmm_(enc, n, ly.guw, ly.gus, ly.gub, ly.gate_bits, hn, sg, H, ffn);
+          vqmm_(enc, n, ly.uw, ly.us, ly.ub, ly.up_bits, hn, upb, H, ffn);
+        }
+        enc.set_function(_fn_swiglu);
+        enc.set_buffer(0, sg); enc.set_buffer(1, upb); enc.set_buffer(2, sg);
+        enc.set_constant(3, n * ffn);
+        enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
       }
-      enc.set_function(_fn_swiglu);
-      enc.set_buffer(0, sg); enc.set_buffer(1, upb); enc.set_buffer(2, sg);
-      enc.set_constant(3, n * ffn);
-      enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
       if (_kquant) {
         kqmv_batch_(enc, ly.kqdown_t, ly.kqdown, sg, ao, ffn, H, n, H, 0);
       } else {
@@ -6927,7 +7350,8 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           // Dense f16: fused q|k|v GEMM (M=n) -> mqfull[n, Nfqkv].
           dense_gemm_(enc, mly.qw, hn, mqfull, H, Nfqkv, n);
         } else {
-          vqmm_(enc, n, mly.qw, mly.qs, mly.qb, 4, hn, mqfull, H, Nfqkv);
+          vqmm_(enc, n, mly.qw, mly.qs, mly.qb, mly.q_bits, hn, mqfull, H,
+                Nfqkv);
         }
         hslice(mqfull, q3, n * Hq, 2 * D, D, 0, Hq, Nfqkv);
         hslice(mqfull, gate3, n * Hq, 2 * D, D, D, Hq, Nfqkv);
@@ -6978,7 +7402,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
         } else if (mly.os.empty()) {
           dense_gemm_(enc, mly.ow, att, ao, qd, H, n);   // dense f16 o_proj
         } else {
-          vqmm_(enc, n, mly.ow, mly.os, mly.ob, 4, att, ao, qd, H);
+          vqmm_(enc, n, mly.ow, mly.os, mly.ob, mly.o_bits, att, ao, qd, H);
         }
         residual(hidden_out, ao, hidden_out, n * H);
         rms(hidden_out, 0, mly.post_ln, hn, 0, n, H);
@@ -7001,13 +7425,24 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_constant(3, n * ffn);
           enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
           dense_gemm_(enc, mly.dw, sg, ao, ffn, H, n);
-        } else {
-          // Interleaved gate/up SwiGLU via the size-adaptive path: at the small
-          // M of a verify it picks the batched-GEMV swiglu (weight read once
-          // across rows) instead of steel (~3x slower; run 1-2x/round).
+        } else if (mly.mlp_fused) {
+          // 4-bit interleaved gate/up SwiGLU via the size-adaptive path: at the
+          // small M of a verify it picks the batched-GEMV swiglu (weight read
+          // once across rows) instead of steel (~3x slower; run 1-2x/round).
           qmm_auto_swiglu_(enc, n, mly.guw, mly.gus, mly.gub, hn, sg, H,
                            2 * ffn);
-          vqmm_(enc, n, mly.dw, mly.ds, mly.db, 4, sg, ao, ffn, H);
+          vqmm_(enc, n, mly.dw, mly.ds, mly.db, mly.down_bits, sg, ao, ffn, H);
+        } else {
+          // 8-bit head (no fused w8 swiglu): de-fused gate/up GEMVs + plain
+          // SwiGLU, then down -- each at its own bits. Mirrors the kquant path.
+          vqmm_(enc, n, mly.guw, mly.gus, mly.gub, mly.gate_bits, hn, sg, H,
+                ffn);
+          vqmm_(enc, n, mly.uw, mly.us, mly.ub, mly.up_bits, hn, upb, H, ffn);
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, sg); enc.set_buffer(1, upb); enc.set_buffer(2, sg);
+          enc.set_constant(3, n * ffn);
+          enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
+          vqmm_(enc, n, mly.dw, mly.ds, mly.db, mly.down_bits, sg, ao, ffn, H);
         }
         residual(hidden_out, ao, hidden_out, n * H);
         rms(hidden_out, 0, _mtp.final_norm, hn, 0, n, H);

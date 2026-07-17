@@ -440,6 +440,15 @@ public:
     return "<tool_call>";
   }
 
+  // The literal CLOSING marker of a tool-call block in this family's
+  // DECODED text (mirrors tool_call_open_marker). Used to fold a tool-call
+  // span out of a streamed reply. Hermes/Qwen: `</tool_call>`; Gemma-4:
+  // `<tool_call|>`.
+  virtual std::string_view tool_call_close_marker() const noexcept
+  {
+    return "</tool_call>";
+  }
+
   // True when `id` stops the decode loop but does NOT close the
   // assistant turn -- the model is handing control back mid-turn and
   // generation resumes in the SAME turn once the caller injects a

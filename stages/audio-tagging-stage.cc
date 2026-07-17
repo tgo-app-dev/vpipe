@@ -3,7 +3,6 @@
 #include "stages/beats-audioset-labels.h"
 #include "stages/ced-audioset-labels.h"
 #include "stages/model-registry.h"
-#include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -28,75 +27,10 @@ namespace vpipe {
 
 namespace {
 
-// NS::String from UTF-8; autoreleased (factory convention).
-NS::String*
-ns_str_(string_view s)
-{
-  return NS::String::string(string(s).c_str(),
-                            NS::UTF8StringEncoding);
-}
-
-// NS::Array<NSNumber*> from a shape vector; autoreleased.
-NS::Array*
-shape_array_(const vector<int64_t>& shape)
-{
-  vector<const NS::Object*> nums;
-  nums.reserve(shape.size());
-  for (auto d : shape) {
-    nums.push_back(static_cast<const NS::Object*>(
-        NS::Number::number(static_cast<long long>(d))));
-  }
-  return NS::Array::array(nums.data(),
-                          static_cast<NS::UInteger>(nums.size()));
-}
-
-// NS::Array<NSNumber*> shape -> vector<int64_t>.
-vector<int64_t>
-read_shape_(const NS::Array* arr)
-{
-  vector<int64_t> out;
-  if (!arr) {
-    return out;
-  }
-  NS::UInteger n = arr->count();
-  out.reserve(n);
-  for (NS::UInteger i = 0; i < n; ++i) {
-    auto* num = arr->object<NS::Number>(i);
-    out.push_back(num ? num->longLongValue() : 0);
-  }
-  return out;
-}
-
-// IEEE-754 binary16 -> binary32. The CED-base export emits its 527
-// probabilities as FLOAT16; CoreML hands them back as raw half bytes.
-float
-half_to_float_(std::uint16_t h)
-{
-  const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
-  std::uint32_t       exp  = (h >> 10) & 0x1Fu;
-  std::uint32_t       mant = h & 0x3FFu;
-  std::uint32_t       f;
-  if (exp == 0) {
-    if (mant == 0) {
-      f = sign;                       // +/- zero
-    } else {
-      exp = 1;
-      while ((mant & 0x400u) == 0) {  // normalise the subnormal
-        mant <<= 1;
-        --exp;
-      }
-      mant &= 0x3FFu;
-      f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-  } else if (exp == 0x1Fu) {
-    f = sign | 0x7F800000u | (mant << 13);   // inf / nan
-  } else {
-    f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-  }
-  float out;
-  std::memcpy(&out, &f, sizeof(out));
-  return out;
-}
+// (CoreML feature marshaling now lives in CoreMLLoadedModel::predict;
+// this stage builds neutral CoreMLPredictInput/Output only. The f16
+// output is decoded to f32 inside predict(), so the old host
+// half-to-float helper is gone.)
 
 // Per-model-kind window/hop defaults + label table. `model_kind`
 // selects one; the window/hop are overridable by explicit config. Both
@@ -302,12 +236,8 @@ AudioTaggingStage::spec() const noexcept
 
 AudioTaggingStage::~AudioTaggingStage()
 {
-  if (_opts) {
-    _opts->release();
-    _opts = nullptr;
-  }
   // _loaded drops via shared_ptr; the CoreMLLoadedModel releases its
-  // retained CML::Model when the last consumer goes away.
+  // retained model when the last consumer goes away.
 }
 
 Job
@@ -365,12 +295,6 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
         this->id(), _n_classes, _label_count, _model_kind,
         _label_count));
   }
-
-  auto* pool = NS::AutoreleasePool::alloc()->init();
-  auto* opts = CML::PredictionOptions::alloc()->init();
-  opts->setUsesCPUOnly(false);
-  _opts = opts;  // alloc/init returns +1; no extra retain.
-  pool->release();
 
   session()->info(fmt(
       "AudioTaggingStage('{}'): model ready (kind={}, {}); in='{}' "
@@ -497,105 +421,46 @@ bool
 AudioTaggingStage::run_window_(const float*        samples,
                                std::vector<float>& probs_out)
 {
-  if (!_loaded || !_opts) {
+  if (!_loaded) {
     return false;
   }
-  // Serialise per-model (CoreML serialises internally anyway; a cheap
-  // observable mutex beats opaque blocking inside the framework).
-  std::lock_guard<std::mutex> lk(_loaded->predict_mutex());
 
-  bool ok = false;
-  auto* pool = NS::AutoreleasePool::alloc()->init();
-  NS::Error* err = nullptr;
+  // Zero-copy f32 input [1, window]; the model's f16 output (CED) is
+  // decoded to f32 inside predict().
+  CoreMLPredictInput in;
+  in.name  = _input_feature_name;
+  in.data  = samples;
+  in.dtype = CoreMLDType::F32;
+  in.shape = { 1, static_cast<int64_t>(_window_samples) };
 
-  const vector<int64_t> in_shape = { 1, _window_samples };
-  NS::Array* sh = shape_array_(in_shape);
+  CoreMLPredictOutput out;
+  out.name = _output_feature_name;
+  out.want = CoreMLDType::F32;
 
-  // Zero-copy input; fall back to alloc + memcpy if the framework
-  // rejects the borrowed pointer.
-  auto* in_multi = CML::MultiArray::alloc()->initWithDataPointer(
-      const_cast<float*>(samples), sh, CML::MultiArrayDataTypeFloat32,
-      /* strides */ nullptr, /* deallocator */ nullptr, &err);
-  if (err || !in_multi) {
-    err = nullptr;
-    in_multi = CML::MultiArray::alloc()->initWithShape(
-        sh, CML::MultiArrayDataTypeFloat32, &err);
-    if (!err && in_multi) {
-      std::memcpy(in_multi->dataPointer(), samples,
-                  static_cast<std::size_t>(_window_samples)
-                      * sizeof(float));
-    }
-  }
+  const CoreMLPredictInput ins[1]  = { std::move(in) };
+  CoreMLPredictOutput      outs[1] = { std::move(out) };
 
-  if (!err && in_multi) {
-    auto* fv  = CML::FeatureValue::featureValueWithMultiArray(in_multi);
-    auto* key = ns_str_(_input_feature_name);
-    const NS::Object* objs[1] = { fv };
-    const NS::Object* keys[1] = { key };
-    NS::Dictionary* dict = NS::Dictionary::dictionary(objs, keys, 1);
-    auto* dfp = CML::DictionaryFeatureProvider::alloc()
-                    ->initWithDictionary(dict, &err);
-    if (!err && dfp) {
-      // ANE timeline: the CoreML audio-tagging inference is the
-      // Apple-Neural-Engine job (recorded under this stage's gvid).
-      record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
-      auto* result =
-          _loaded->model()->predictionFromFeatures(dfp, _opts, &err);
-      record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
-      if (!err && result) {
-        auto* nm  = ns_str_(_output_feature_name);
-        auto* val = result->featureValueForName(nm);
-        auto* arr = val ? val->multiArrayValue() : nullptr;
-        if (arr && arr->dataPointer()) {
-          std::size_t n = 1;
-          for (auto d : read_shape_(arr->shape())) {
-            n *= static_cast<std::size_t>(d);
-          }
-          probs_out.resize(n);
-          const CML::MultiArrayDataType dt = arr->dataType();
-          if (dt == CML::MultiArrayDataTypeFloat16) {
-            const auto* h =
-                static_cast<const std::uint16_t*>(arr->dataPointer());
-            for (std::size_t i = 0; i < n; ++i) {
-              probs_out[i] = half_to_float_(h[i]);
-            }
-            ok = true;
-          } else if (dt == CML::MultiArrayDataTypeFloat32) {
-            const auto* f =
-                static_cast<const float*>(arr->dataPointer());
-            std::copy(f, f + n, probs_out.begin());
-            ok = true;
-          } else {
-            session()->warn(fmt(
-                "AudioTaggingStage('{}'): unsupported output dtype "
-                "{}; dropping window",
-                this->id(), static_cast<long>(dt)));
-          }
-        } else {
-          session()->warn(fmt(
-              "AudioTaggingStage('{}'): output '{}' missing from "
-              "prediction", this->id(), _output_feature_name));
-        }
-      } else {
-        session()->warn(fmt(
-            "AudioTaggingStage('{}'): predictionFromFeatures failed",
-            this->id()));
-      }
-      dfp->release();
-    } else {
-      session()->warn(fmt(
-          "AudioTaggingStage('{}'): feature provider init failed",
-          this->id()));
-    }
-    in_multi->release();
-  } else {
+  // ANE timeline: the CoreML audio-tagging inference is the Apple-
+  // Neural-Engine job (recorded under this stage's gvid).
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin);
+  const bool ok = _loaded->predict(ins, outs);
+  record_perf_event_aux(kPerfLaneANE, kPerfAnePredictBegin + 1u);
+  if (!ok) {
     session()->warn(fmt(
-        "AudioTaggingStage('{}'): input MLMultiArray init failed",
-        this->id()));
+        "AudioTaggingStage('{}'): prediction failed", this->id()));
+    return false;
   }
 
-  pool->release();
-  return ok;
+  const auto* f = static_cast<const float*>(outs[0].data);
+  if (!f) {
+    return false;
+  }
+  std::size_t n = 1;
+  for (auto d : outs[0].shape) {
+    n *= static_cast<std::size_t>(d);
+  }
+  probs_out.assign(f, f + n);
+  return true;
 }
 
 FlexData

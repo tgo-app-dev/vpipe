@@ -144,11 +144,63 @@ export const api = {
   // {cwd, files:[...]} -- .vpipeline files at the server's cwd for
   // the Load-Pipeline dialog's autocomplete.
   cwdPipelines:  ()        => req('GET',  '/api/cwd-pipelines'),
-  // One directory's entries for the file open/save dialog. `path` is in
-  // the session's namespace (virtual "/"-rooted when sandboxed). Returns
-  // {sandboxed, path, parent, entries:[{name, dir, size?}]}.
-  fsList:        (path)    => req('GET',  '/api/fs/list?path='
-                                  + encodeURIComponent(path || '')),
+  // One directory's entries in the session's namespace (virtual "/"-rooted
+  // when sandboxed). Returns {sandboxed, path, parent, mounts, total,
+  // offset, entries:[{name, dir, size?}]}. `opts` (all optional):
+  //   offset,limit -- return only entries [offset, offset+limit) of the
+  //                   sorted listing (large-directory windowing); omit for
+  //                   the whole listing (the open/save dialog's default).
+  //   dirsOnly     -- return only sub-directories (the tree pane).
+  //   exts         -- array of dot-led extensions ('.png', ...); keep only
+  //                   files matching one (dirs always shown). Empty = all.
+  fsList:        (path, opts = {}) => {
+    let q = '/api/fs/list?path=' + encodeURIComponent(path || '');
+    if (opts.dirsOnly) { q += '&dirs_only=1'; }
+    if (Number.isInteger(opts.offset)) { q += '&offset=' + opts.offset; }
+    if (Number.isInteger(opts.limit))  { q += '&limit=' + opts.limit; }
+    if (Array.isArray(opts.exts) && opts.exts.length) {
+      q += '&exts=' + encodeURIComponent(opts.exts.join(','));
+    }
+    return req('GET', q);
+  },
+  // Direct URL to a file's raw bytes (Range-aware) for the file-browser
+  // preview -- used as an <img>/<audio>/<video> `src`. A media element
+  // can't set headers, so the access key rides as ?key= (accepted by the
+  // server the same way the Preview WebSocket does).
+  fsFileUrl:     (path)    => {
+    let u = '/api/fs/file?path=' + encodeURIComponent(path || '');
+    if (authKey) { u += '&key=' + encodeURIComponent(authKey); }
+    return u;
+  },
+  // Fetch up to `maxBytes` of a file decoded as text (one preview
+  // "screen"). A Range request bounds the transfer so a huge file is
+  // never pulled whole. -> { text, truncated, total }.
+  fsText:        async (path, maxBytes = 65536) => {
+    const headers = { Range: 'bytes=0-' + Math.max(0, maxBytes - 1) };
+    if (authKey) { headers['X-Auth-Key'] = authKey; }
+    const r = await fetch('/api/fs/file?path='
+                          + encodeURIComponent(path || ''), { headers });
+    if (!r.ok && r.status !== 206) {
+      let msg = 'HTTP ' + r.status;
+      try { const j = JSON.parse(await r.text()); if (j && j.error) { msg = j.error; } }
+      catch (e) {}
+      throw new Error(msg);
+    }
+    const text = await r.text();
+    let total = text.length;
+    let truncated = false;
+    const cr = r.headers.get('Content-Range');   // "bytes 0-65535/123456"
+    if (cr) {
+      const m = /\/(\d+)\s*$/.exec(cr);
+      if (m) {
+        total = parseInt(m[1], 10);
+        truncated = total > maxBytes;
+      }
+    }
+    return { text, truncated, total };
+  },
+  fsMkdir:       (path, name) => req('POST', '/api/fs/mkdir', { path, name }),
+  fsRename:      (path, to)   => req('POST', '/api/fs/rename', { path, to }),
   getPipeline:   (id)      => req('GET',  `/api/pipelines/${pid(id)}`),
   savePipeline:  (id, path)=> req('POST', `/api/pipelines/${pid(id)}/save`,
                                    path ? { path } : {}),

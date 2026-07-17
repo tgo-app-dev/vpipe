@@ -101,15 +101,33 @@ McpToolRegistry::add(McpTool tool)
   _tools.push_back(std::move(tool));
 }
 
-bool
-McpToolRegistry::has(const string& name) const noexcept
+const McpTool*
+McpToolRegistry::find_(const string& name) const noexcept
 {
   for (const auto& t : _tools) {
     if (t.name == name) {
-      return true;
+      return &t;
     }
   }
-  return false;
+  // Namespace-tolerant fallback: a model may call a declared tool under a
+  // module namespace (the Gemma-4 12B emits `file_operations.write_file`
+  // for `write_file`). Retry with the segment after the last '.'.
+  const size_t dot = name.rfind('.');
+  if (dot != string::npos && dot + 1 < name.size()) {
+    const string base = name.substr(dot + 1);
+    for (const auto& t : _tools) {
+      if (t.name == base) {
+        return &t;
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool
+McpToolRegistry::has(const string& name) const noexcept
+{
+  return find_(name) != nullptr;
 }
 
 string
@@ -149,16 +167,14 @@ McpToolRegistry::tools_json() const
 string
 McpToolRegistry::dispatch(const McpToolCall& call) const
 {
-  for (const auto& t : _tools) {
-    if (t.name != call.name) {
-      continue;
-    }
-    if (!t.handler) {
+  // Resolve the (possibly module-namespaced) name against the registry.
+  if (const McpTool* t = find_(call.name)) {
+    if (!t->handler) {
       return "{\"error\":\"tool has no handler\"}";
     }
     try {
-      return t.handler(call.arguments_json.empty() ? "{}"
-                                                   : call.arguments_json);
+      return t->handler(call.arguments_json.empty() ? "{}"
+                                                     : call.arguments_json);
     } catch (const std::exception& e) {
       FlexData err = FlexData::make_object();
       auto eo = err.as_object();
