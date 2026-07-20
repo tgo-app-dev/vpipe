@@ -60,11 +60,21 @@ class MetalKrea2Transformer {
   // the retained source mmap just before use and frees it after, so peak block
   // memory is ~1 block (~0.85 GB bf16) instead of all 28 (~24 GB). The small
   // parts (text-fusion tower, conditioning, final layer) are still preloaded.
+  //
+  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of the main
+  // blocks resident so pinned + running stays within that fraction of physical
+  // RAM (e.g. 0.60). Pinned blocks are read once and reused across every
+  // forward; only the tail streams -- trades spare RAM for speed. 0 => pure
+  // streaming.
   static std::unique_ptr<MetalKrea2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
 
   ~MetalKrea2Transformer();   // out-of-line: _stream_wts is a fwd-declared type
+
+  // Leading main blocks pinned resident in streaming mode (0 = pure streaming,
+  // or preloaded). For logging the RAM-for-speed decision.
+  int pinned_blocks() const { return _pinned; }
 
   // Cooperative-stop hook for the (long, disk-bound) streaming-blocks forward:
   // forward_dit polls this before each main block and bails early (returns
@@ -220,9 +230,11 @@ class MetalKrea2Transformer {
   metal_compute::SharedBuffer _te_l1b, _te_l2b;              // time_embed
   QWeight _tmp_w; metal_compute::SharedBuffer _tmp_b;        // time_mod_proj
   std::vector<Block> _blocks;                          // 28 transformer_blocks
-  // Streaming-blocks mode: _blocks stays empty; forward_dit loads each block on
-  // demand from _stream_wts (the retained source mmap) and frees it after use.
+  // Streaming-blocks mode: _blocks holds only the pinned prefix (_pinned
+  // blocks, possibly 0); blocks L >= _pinned are loaded from _stream_wts (the
+  // retained source mmap) on demand in forward_dit and freed after use.
   bool _stream_blocks = false;
+  int _pinned = 0;                       // pinned leading blocks (streaming)
   // Zero-copy weights: quantized Linears load as READ-ONLY views into the
   // retained source mmap (newBufferWithBytesNoCopy) rather than owned copies,
   // so the OS reclaims those clean file pages under memory pressure. On by

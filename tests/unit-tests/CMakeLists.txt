@@ -116,6 +116,14 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-lora.cc
         lora-fuse-stage.cc
         krea2-sampler.cc
+        qwen-image-edit-sched.cc
+        qwen-image-edit-vae.cc
+        qwen-image-edit-text.cc
+        qwen-image-edit-dit.cc
+        qwen-image-edit-vision.cc
+        qwen-image-edit-mm.cc
+        qwen-image-edit-t2i.cc
+        qwen-image-edit-awq.cc
         flux2-smoke.cc
         llm-chat-template.cc
         llm-sampler.cc

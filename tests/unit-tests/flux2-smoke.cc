@@ -33,6 +33,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/diffusion-conditioner-stage.h"
 #include "stages/text-to-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
@@ -177,6 +178,19 @@ public:
     co_return;
   }
 };
+
+// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// (DiT) stage -- the encoder half moved there. Returns the conditioner; wire
+// the t2i's iport0 to {cond, 0}.
+Stage*
+add_conditioner_(Pipeline* pl, Session& sess, Stage* src, const char* root)
+{
+  FlexData c = FlexData::make_object();
+  c.as_object().insert("hf_dir", FlexData::make_string(root));
+  auto u = std::make_unique<DiffusionConditionerStage>(
+      &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c));
+  return pl->insert_stage(std::move(u));
+}
 
 }  // namespace
 
@@ -1084,8 +1098,9 @@ TEST(flux2_e2e, text_to_image_produces_image)
   t2i_cfg.as_object().insert("width", FlexData::make_int(W));
   t2i_cfg.as_object().insert("steps", FlexData::make_int(steps));
   t2i_cfg.as_object().insert("seed", FlexData::make_int(0));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(t2i_cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
@@ -1187,10 +1202,12 @@ TEST(flux2_e2e, reference_latent_iport_changes_latent)
     cfg.as_object().insert("width", FlexData::make_int(W));
     cfg.as_object().insert("steps", FlexData::make_int(steps));
     cfg.as_object().insert("seed", FlexData::make_int(0));
-    // iports {prompt, negative, sampler, scheduler, ref0, ref1}; wire ref0.
-    std::vector<InEdge> edges{{src, 0}};
+    // iports {conditioning, neg_conditioning, sampler, scheduler, ref0, ref1};
+    // the conditioner feeds conditioning; wire ref0 for the with_ref case.
+    auto* cond = add_conditioner_(pl.get(), sess, src, root);
+    std::vector<InEdge> edges{{cond, 0}};
     if (with_ref) {
-      edges = std::vector<InEdge>{{src, 0}, InEdge{nullptr, 0},
+      edges = std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0},
                                   InEdge{nullptr, 0}, InEdge{nullptr, 0},
                                   {rt_src, 0}};
     }

@@ -83,6 +83,22 @@ template [[host_name("attn_steel_h_bd128")]] [[kernel]] decltype(attention<
                                                                  float>)
 attention<half, 32, 16, 128, 4, 1, half, float>;
 
+// bf16 variant of the head_dim-128 steel flash-attention, for the
+// Qwen-Image-Edit DiT: its residual stream reaches ~1e7 (beyond f16 range), so
+// the whole DiT -- and hence its joint attention Q/K/V -- runs bf16. Same steel
+// kernel, T=bfloat (accumulation stays f32). Lets the dual-stream MMDiT use the
+// register-resident flash path instead of the scalar O(seq^2) sdpa at high res.
+template [[host_name("attn_steel_h_bd128_bf16")]] [[kernel]] decltype(attention<
+                                                                 bfloat,
+                                                                 32,
+                                                                 16,
+                                                                 128,
+                                                                 4,
+                                                                 1,
+                                                                 bfloat,
+                                                                 float>)
+attention<bfloat, 32, 16, 128, 4, 1, bfloat, float>;
+
 // (Qwen3.5 head_dim 256 full-attention prefill uses the paged-KV variant
 // attn_steel_paged_bd256 below -- it serves both fresh and mid-context prefill
 // straight from the paged pool, so the contiguous bd256 entry point is not

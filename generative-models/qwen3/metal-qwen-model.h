@@ -147,6 +147,14 @@ public:
     // emits 2*qd, the second half gates the attention output).
     // Qwen3-ASR has no gate (q_proj emits qd).
     bool  attn_output_gate = true;
+    // Whether q/k carry a per-head RMSNorm (Qwen3 / Qwen3-VL). Qwen2.5-VL
+    // (the Qwen-Image-Edit text encoder) has NONE -- skip the load + the
+    // per-head norm in the forward, and RoPE runs unfused. Dense path only.
+    bool  qk_norm = true;
+    // Whether q/k/v projections carry a bias (Qwen2 / Qwen2.5-VL). Qwen3 has
+    // no attention bias. When set, the fused q|k|v bias is added after the
+    // projection GEMM (before the head split). Dense f16 path only.
+    bool  attention_bias = false;
     // Backbone-only load: skip the token-embedding muxer + lm_head (and the
     // tied/affine embed table). For host-fed-embedding models that supply
     // their own embeddings and output heads (MOSS-TTS: 33 bf16 code/text
@@ -174,6 +182,10 @@ public:
     // mROPE section split (T/H/W) over rotary_dim/2 pairs; default
     // Qwen3.5 [11,11,10]. Only used by the multimodal (image) prefill.
     std::vector<int> mrope_section = {11, 11, 10};
+    // mROPE axis layout. Qwen3-VL (interleaved, mlx apply_interleaved_mrope):
+    // T everywhere, H at 1+3k, W at 2+3k. Qwen2.5-VL (sectioned, classic HF
+    // apply_multimodal_rotary_pos_emb): contiguous blocks [T..|H..|W..].
+    bool  mrope_interleaved = true;
 
     int key_dim()   const { return gdn_k_heads * gdn_k_dim; }   // 2048
     int value_dim() const { return gdn_v_heads * gdn_v_dim; }   // 4096
@@ -270,6 +282,15 @@ public:
   metal_compute::SharedBuffer
   forward_embeddings_taps(ContextId cid, const metal_compute::SharedBuffer& x,
                           int n, const std::vector<int>& tap_layers);
+
+  // Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
+  // row 0=T,1=H,2=W) for a text+vision-spliced multimodal sequence -- the
+  // Qwen-Image-Edit image-aware conditioning tap.
+  metal_compute::SharedBuffer
+  forward_embeddings_taps_mrope(ContextId cid,
+                                const metal_compute::SharedBuffer& x, int n,
+                                const std::vector<std::int32_t>& position_ids,
+                                const std::vector<int>& tap_layers);
 
   // ---- On-device AWQ calibration ------------------------------------------
   // Accumulate per-input-channel running |x| abs-max for the qkv / gate-up /
@@ -868,6 +889,7 @@ private:
     metal_compute::SharedBuffer qw, qs, qb;   // q_proj (2*qd out, gated)
     metal_compute::SharedBuffer kw, ks, kb, vw, vs, vb, ow, os, ob;
     metal_compute::SharedBuffer q_norm, k_norm;     // [head_dim]
+    metal_compute::SharedBuffer qkv_bias;   // fused q|k|v bias [qdo+2*kd] (Qwen2.5)
     // Gated-DeltaNet weights (!is_full).
     metal_compute::SharedBuffer iqw, iqs, iqb;   // in_proj_qkv -> conv_dim
     metal_compute::SharedBuffer izw, izs, izb;   // in_proj_z   -> value_dim
@@ -992,7 +1014,7 @@ private:
       _fn_requant_w8w4,
       _fn_transpose,
       _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rms_rope,
-      _fn_mul_sigmoid,
+      _fn_mul_sigmoid, _fn_bias_add,
       _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
       _fn_sdpa_paged_qtile,
       // simdgroup_matrix key-split flash prefill (head_dim 256, drop-in for

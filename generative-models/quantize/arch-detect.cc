@@ -305,6 +305,41 @@ detect_quant_arch(const SessionContextIntf* session, const std::string& src_dir)
     c.max_seq            = 2048;
     c.page_tokens        = 256;
     m.calib_ok = true;
+  } else if (m.awq_ok && (model_type == "qwen2_5_vl" ||
+                          model_type.rfind("qwen2_5_vl", 0) == 0)) {
+    // Qwen2.5-VL text encoder (the Qwen-Image-Edit conditioner): a dense Qwen2
+    // decoder with q/k/v attention BIAS and NO per-head q/k RMSNorm, under the
+    // "model." segment (not Qwen3-VL's "language_model."). backbone_only ignores
+    // the vision tower, so a plain text corpus exercises the encoded path. The
+    // SmoothQuant fold is bias-invariant (it scales input_layernorm + the q/k/v
+    // weight columns; the output-dim biases are unchanged), so AWQ is valid.
+    MetalQwenModel::Config& c = m.backbone;
+    c.n_layers   = m.n_layers;
+    c.hidden     = hidden;
+    c.n_heads    = n_heads;
+    c.n_kv_heads = kv;
+    c.head_dim   = head_dim > 0 ? head_dim
+                                : (n_heads > 0 ? hidden / n_heads : 0);
+    c.ffn_inner  = ffn;
+    c.vocab      = vocab;
+    c.rope_theta = rope;
+    c.rms_eps    = eps;
+    c.rotary_dim = c.head_dim;
+    c.full_attn_interval = 1;
+    c.tie_embeddings     = false;
+    c.use_bf16           = true;
+    c.quant_bits         = 8;     // calibration runs over the 8-bit base
+    c.dense              = true;
+    c.zero_centered_norm = false; // standard RMSNorm
+    c.attn_output_gate   = false;
+    c.qk_norm            = false; // Qwen2.5-VL: no per-head q/k RMSNorm
+    c.attention_bias     = true;  // Qwen2.5-VL: q/k/v bias
+    c.backbone_only      = true;
+    c.weight_prefix      = wp.empty() ? "model." : wp;
+    c.model_seg          = "";
+    c.max_seq            = 2048;
+    c.page_tokens        = 256;
+    m.calib_ok = true;
   }
   return m;
 }

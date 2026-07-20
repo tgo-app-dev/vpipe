@@ -187,6 +187,7 @@ private:
   float       _mixed_frac{};
   std::string _layer_prefix;
   int         _n_layers{};
+  bool        _quant_modulation{};   // QIE DiT: quantize *_mod.1 too (opt-in)
 };
 
 }  // namespace vpipe

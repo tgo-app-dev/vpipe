@@ -294,6 +294,27 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
 
   std::error_code ec;
   fs::create_directories(out_dir, ec);
+  // Purge stale shards from a previous run. The shard COUNT depends on the
+  // output size, so re-quantizing into an existing dir with a different count
+  // (e.g. bf16->w8 then ->w4, or an interrupted retry) leaves orphaned
+  // model-*-of-*.safetensors behind: the fresh index.json references only the
+  // new set, but the old shards still inflate the directory (a w4 DiT that
+  // reads ~21 GB can sit in a 46 GB dir). Remove any existing model*.safetensors
+  // + index before writing -- unless out_dir IS the source (never delete the
+  // model we are reading through the mmap).
+  {
+    std::error_code se;
+    const bool same_as_src = fs::equivalent(in_dir, out_dir, se);
+    if (!same_as_src) {
+      for (const auto& de : fs::directory_iterator(out_dir, se)) {
+        const std::string fn = de.path().filename().string();
+        if (fn.rfind("model", 0) == 0 &&
+            fn.find(".safetensors") != std::string::npos) {
+          fs::remove(de.path(), se);
+        }
+      }
+    }
+  }
 
   std::unordered_set<std::string> quant_set;
   for (const auto& s :
@@ -418,7 +439,15 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   std::unordered_map<std::string, int> bit_map;
   auto tbits = [&](const std::string& name) -> int {
     auto it = bit_map.find(name);
-    return it == bit_map.end() ? opt.bits : it->second;
+    if (it != bit_map.end()) { return it->second; }
+    // Leaf-level high-bits override (e.g. the QIE modulation at w8, body w4).
+    if (!opt.high_bit_leaves.empty()) {
+      const std::string leaf = weight_leaf_(name);
+      for (const auto& hl : opt.high_bit_leaves) {
+        if (leaf == hl) { return opt.high_bits; }
+      }
+    }
+    return opt.bits;
   };
   if (opt.mixed && opt.dit_family == "flux2") {
     // FLUX.2 spans TWO block prefixes (transformer_blocks + single_transformer_
@@ -558,9 +587,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   // block-Linear name -> its activation row; awq_clip_search then clips each
   // block Linear's weight before quantizing (the fold-free half of AWQ).
   const bool dit_flux2_fam = (opt.dit_family == "flux2");
+  const bool dit_qie_fam = (opt.dit_family == "qwen-image-edit");
   std::vector<float> dit_cq, dit_co, dit_cg, dit_cd;
   int dit_dq = 0, dit_dd = 0;
-  std::unordered_map<std::string, std::vector<float>> dit_fx;   // flux2 per-group
+  std::unordered_map<std::string, std::vector<float>> dit_fx;   // flux2/qie group
   auto calib_load = [&](const std::string& fn) {
     std::vector<float> v;
     std::ifstream f(opt.calib_dir + "/" + fn, std::ios::binary);
@@ -572,7 +602,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     f.read(reinterpret_cast<char*>(v.data()), nb);
     return v;
   };
-  if (opt.dit_awq && !dit_flux2_fam) {
+  if (opt.dit_awq && !dit_flux2_fam && !dit_qie_fam) {
     dit_cq = calib_load("calib_qkv.f32");
     dit_co = calib_load("calib_o.f32");
     dit_cg = calib_load("calib_gateup.f32");
@@ -586,6 +616,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
         "dbl_norm1_img", "dbl_norm1_txt", "dbl_attn_img", "dbl_attn_txt",
         "dbl_norm2_img", "dbl_ffact_img", "dbl_norm2_txt", "dbl_ffact_txt",
         "sgl_norm", "sgl_cat", "emb_x", "emb_ctx", "emb_proj"};
+    for (const char* g : kG) { dit_fx[g] = calib_load(std::string(g) + ".f32"); }
+  } else if (opt.dit_awq && dit_qie_fam) {
+    static const char* kG[] = {"img_qkv", "txt_qkv", "img_o", "txt_o",
+                               "img_fc1", "txt_fc1", "img_fc2", "txt_fc2"};
     for (const char* g : kG) { dit_fx[g] = calib_load(std::string(g) + ".f32"); }
   }
 
@@ -632,9 +666,43 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     return nullptr;
   };
+  // Qwen-Image-Edit clip-only AWQ: dual-stream leaf -> its calib group (the
+  // per-input-channel abs-max from collect_qwen_image_calibration). K infers the
+  // layer slice. No smoothing fold (the FFN's GELU is non-linear, so scaling
+  // fc1-out / fc2-in is not fp-equivalent).
+  auto qie_act = [&](const std::string& name, int K) -> const float* {
+    if (!ends_with(name, ".weight")) { return nullptr; }
+    const std::string base = name.substr(0, name.size() - 7);
+    static const std::string kBlk = "transformer_blocks.";
+    if (base.rfind(kBlk, 0) != 0) { return nullptr; }
+    const int L = std::atoi(base.c_str() + kBlk.size());
+    auto row = [&](const char* g) -> const float* {
+      auto it = dit_fx.find(g);
+      if (it == dit_fx.end() || it->second.empty() || K <= 0) { return nullptr; }
+      const std::vector<float>& c = it->second;
+      if (c.size() % (std::size_t)K != 0 ||
+          (std::size_t)(L + 1) * K > c.size()) {
+        return nullptr;
+      }
+      return c.data() + (std::size_t)L * K;
+    };
+    if (ends_with(base, ".attn.to_q") || ends_with(base, ".attn.to_k") ||
+        ends_with(base, ".attn.to_v")) { return row("img_qkv"); }
+    if (ends_with(base, ".attn.add_q_proj") ||
+        ends_with(base, ".attn.add_k_proj") ||
+        ends_with(base, ".attn.add_v_proj")) { return row("txt_qkv"); }
+    if (ends_with(base, ".attn.to_out.0")) { return row("img_o"); }
+    if (ends_with(base, ".attn.to_add_out")) { return row("txt_o"); }
+    if (ends_with(base, ".img_mlp.net.0.proj")) { return row("img_fc1"); }
+    if (ends_with(base, ".img_mlp.net.2")) { return row("img_fc2"); }
+    if (ends_with(base, ".txt_mlp.net.0.proj")) { return row("txt_fc1"); }
+    if (ends_with(base, ".txt_mlp.net.2")) { return row("txt_fc2"); }
+    return nullptr;
+  };
   auto dit_act = [&](const std::string& name, int K) -> const float* {
     if (!opt.dit_awq) { return nullptr; }
     if (dit_flux2_fam) { return flux2_act(name, K); }
+    if (dit_qie_fam) { return qie_act(name, K); }
     static const std::string kBlk = "transformer_blocks.";
     if (name.rfind(kBlk, 0) != 0) { return nullptr; }
     const int L = std::atoi(name.c_str() + kBlk.size());

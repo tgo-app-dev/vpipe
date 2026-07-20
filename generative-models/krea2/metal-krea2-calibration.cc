@@ -242,10 +242,23 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
           stream_blocks ? "STREAM blocks" : "PRELOAD (fast)"));
     }
   }
+  // Pinned-prefix: in streaming mode, pin as many leading blocks as fit in 60%
+  // of physical RAM (pinned + running), read once + reused across every forward;
+  // only the tail streams. VPIPE_KREA2_CALIB_PIN_FRAC overrides.
+  double pin_frac = stream_blocks ? 0.60 : 0.0;
+  if (const char* e = std::getenv("VPIPE_KREA2_CALIB_PIN_FRAC")) {
+    pin_frac = std::atof(e);
+  }
   auto dit = MetalKrea2Transformer::load(dit_dir, mc,
                                          MetalKrea2Transformer::Config{},
-                                         stream_blocks);
+                                         stream_blocks, pin_frac);
   if (!dit) { return fail("calib: DiT load failed: " + dit_dir); }
+  if (mc->session() != nullptr && stream_blocks) {
+    mc->session()->log_debug(fmt(
+        "DiT calib: pinned {} of {} DiT blocks resident ({}% RAM budget), "
+        "streaming the rest", dit->pinned_blocks(), dit->config().n_layers,
+        (int)(pin_frac * 100)));
+  }
 
   const int EH = 2560, NL = 12;
   const int lh = height / 8, lw = width / 8;

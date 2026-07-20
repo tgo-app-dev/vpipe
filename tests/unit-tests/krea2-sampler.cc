@@ -27,6 +27,7 @@
 #include "pipeline/typed-stage.h"
 #include "stages/sampler-select-stage.h"
 #include "stages/scheduler-select-stage.h"
+#include "stages/diffusion-conditioner-stage.h"
 #include "stages/text-to-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
@@ -345,6 +346,18 @@ public:
   }
 };
 
+// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// stage -- the encoder half moved there. Returns the conditioner.
+Stage*
+add_conditioner_(Pipeline* pl, Session& sess, Stage* src,
+                 const std::string& root)
+{
+  FlexData c = FlexData::make_object();
+  c.as_object().insert_or_assign("hf_dir", FlexData::make_string(root));
+  return pl->insert_stage(std::make_unique<DiffusionConditionerStage>(
+      &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c)));
+}
+
 // Optionally wire sampler-select (port2) + scheduler-select (port3), both
 // model-derived (euler + simple defaults). Returns the emitted latent.
 std::vector<float>
@@ -378,9 +391,10 @@ run_t2i(Session& sess, const std::string& root, const std::string& gdir,
   cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(root));
   cfg.as_object().insert_or_assign(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   std::vector<InEdge> ip = wire_ports
-      ? std::vector<InEdge>{{src, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}}
-      : std::vector<InEdge>{{src, 0}};
+      ? std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}}
+      : std::vector<InEdge>{{cond, 0}};
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
       std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
                                          std::move(cfg))));
@@ -453,7 +467,8 @@ TEST(krea2_sampler, dpmpp_2m_karras_end_to_end)
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(rs));
   cfg.as_object().insert_or_assign("seed", FlexData::make_int(0));
-  std::vector<InEdge> ip{{src, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}};
+  auto* cond = add_conditioner_(pl.get(), sess, src, rs);
+  std::vector<InEdge> ip{{cond, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}};
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
       std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
                                          std::move(cfg))));

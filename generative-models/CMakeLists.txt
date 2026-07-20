@@ -55,6 +55,9 @@ set(LOCAL_SOURCES
   krea2/metal-krea2-vae.cc
   krea2/metal-krea2-calibration.cc
   krea2/flow-sampler.cc
+  qwen-image/metal-qwen-image-transformer.cc
+  qwen-image/metal-qwen-image-calibration.cc
+  qwen-image/metal-qwen25-vision.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc

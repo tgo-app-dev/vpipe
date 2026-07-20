@@ -6,6 +6,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
@@ -218,7 +219,8 @@ MetalKrea2Transformer::~MetalKrea2Transformer() = default;
 
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks)
+                            const Config& cfg, bool stream_blocks,
+                            double pin_frac)
 {
   if (mc == nullptr) { return nullptr; }
   auto wtsopt = MetalLlamaWeights::open_model(model_dir);
@@ -518,10 +520,29 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_tmp_w  = m->load_qw_(wts, "time_mod_proj");
   m->_tmp_b  = to_f16_(wts, mc, "time_mod_proj.bias");
   // Main blocks: preload all 28 (default), or stream them on demand from the
-  // retained mmap (memory-bounded mode; loaded per-block in forward_dit).
+  // retained mmap (memory-bounded mode; loaded per-block in forward_dit). In
+  // streaming mode with pin_frac > 0, preload a LEADING prefix (as many blocks
+  // as fit in pin_frac of RAM) and stream only the tail. Loaded from `wts` here
+  // (before it is moved into _stream_wts below); the pinned buffers survive the
+  // move (owned copies keep their refcount; mmap views keep the base alive).
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
+      if (!m->load_block_(wts,
+              "transformer_blocks." + std::to_string(i) + ".",
+              m->_blocks[(std::size_t)i], true)) {
+        return nullptr;
+      }
+    }
+  } else if (pin_frac > 0.0) {
+    std::vector<std::string> prefixes((std::size_t)cfg.n_layers);
+    for (int i = 0; i < cfg.n_layers; ++i) {
+      prefixes[(std::size_t)i] = "transformer_blocks." + std::to_string(i) + ".";
+    }
+    m->_pinned = stream_pin_count(wts, prefixes, pin_frac);
+    if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
+    m->_blocks.resize((std::size_t)m->_pinned);
+    for (int i = 0; i < m->_pinned; ++i) {
       if (!m->load_block_(wts,
               "transformer_blocks." + std::to_string(i) + ".",
               m->_blocks[(std::size_t)i], true)) {
@@ -1354,11 +1375,14 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     psplit(t_cond);
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
     for (int L = 0; L < c.n_layers; ++L) {
+      // Cooperative stop: bail EVERY block (not just the streamed tail) so a
+      // pipeline stop is honored within ~one block even on the preloaded path
+      // (a slow high-res step otherwise runs all blocks before responding).
+      if (_stream_stop && _stream_stop()) { return {}; }
+      // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams.
+      const bool streaming = _stream_blocks && L >= _pinned;
       Block streamed;
-      if (_stream_blocks) {
-        // Cooperative stop: bail before the (expensive) block load so a pipeline
-        // stop is honored within ~one block instead of a whole forward.
-        if (_stream_stop && _stream_stop()) { return {}; }
+      if (streaming) {
         if (!load_block_(*_stream_wts,
                          "transformer_blocks." + std::to_string(L) + ".",
                          streamed, true)) {
@@ -1370,7 +1394,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
               seq));
         }
       }
-      const Block& b = _stream_blocks ? streamed : _blocks[(std::size_t)L];
+      const Block& b = streaming ? streamed : _blocks[(std::size_t)L];
       elt3(_fn_residual, tmod, b.sst, mod, 6 * HID);          // mod = temb_mod+sst
       rms(joint, 0, b.n1, n1, 0, seq, HID);
       adaln(n1, mod, 0, HID, nm, HID, seq * HID);             // (1+pre_s)*n1+pre_sh
@@ -1459,7 +1483,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       gemm(g, b.ff_down, o, 0, seq, HID, FF);
       gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
       psplit(t_ff);
-      if (_stream_blocks) { flush(); }   // commit block L before its weights free
+      if (streaming) { flush(); }   // commit block L before its weights free
       if (stop_after_block == L) { break; }   // joint holds the block-L output
     }
     if (!tap) {

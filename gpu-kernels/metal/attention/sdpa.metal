@@ -161,6 +161,78 @@ kernel void sdpa_window_f16(
   }
 }
 
+// Variable-window (non-causal) attention: like sdpa_window_f16 but each query
+// reads its window bounds [win_start[qi], win_end[qi]) from per-query buffers
+// instead of a single fixed window size, so windows may have DIFFERENT lengths
+// (the Qwen2.5-VL vision tower tiles a grid into 4x4-merged windows whose edge
+// tiles are smaller). Uses the GUARDED per = ceil(D/32) like sdpa_full_f16, so
+// head_dim need not be a multiple of 32 (the Qwen2.5-VL ViT has head_dim 80).
+// Buffers mirror sdpa_full_f16; 11:win_start[n_q] 12:win_end[n_q].
+kernel void sdpa_varwindow_f16(
+    const device VPIPE_ELT* q        [[buffer(0)]],
+    const device VPIPE_ELT* k        [[buffer(1)]],
+    const device VPIPE_ELT* v        [[buffer(2)]],
+    device VPIPE_ELT*       out      [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      T_kv     [[buffer(5)]],
+    constant int&      D        [[buffer(6)]],
+    constant int&      Hq       [[buffer(7)]],
+    constant int&      Hkv      [[buffer(8)]],
+    constant int&      n_q      [[buffer(9)]],
+    constant int&      kv_stride [[buffer(10)]],
+    const device int*  win_start [[buffer(11)]],
+    const device int*  win_end   [[buffer(12)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  (void)T_kv;   // kept for sdpa_full_f16 buffer-layout parity; the per-query
+                // win_start/win_end bound the loop instead of the total KV len.
+  const int h = (int)tid.y;
+  const int qi = (int)tid.z;
+  const int kv = h / (Hq / Hkv);
+  const int per = (D + 31) / 32;
+  const int ws = win_start[qi];
+  const int we = win_end[qi];
+  const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
+  const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
+  const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
+
+  float qreg[SDPA_MAX_PER];
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    qreg[p] = idx < D ? float(qh[idx]) * scale : 0.0f;
+    acc[p] = 0.0f;
+  }
+  float m = -INFINITY, l = 0.0f;
+  for (int j = ws; j < we; ++j) {
+    float dot = 0.0f;
+    for (int p = 0; p < per; ++p) {
+      const int idx = lane * per + p;
+      if (idx < D) { dot += qreg[p] * float(kkv[(uint)j * D + idx]); }
+    }
+    dot = simd_sum(dot);
+    const float m_new = max(m, dot);
+    const float corr = exp(m - m_new);
+    const float pj = exp(dot - m_new);
+    l = l * corr + pj;
+    for (int p = 0; p < per; ++p) {
+      const int idx = lane * per + p;
+      if (idx < D) {
+        acc[p] = acc[p] * corr + pj * float(vkv[(uint)j * D + idx]);
+      }
+    }
+    m = m_new;
+  }
+  const float inv_l = 1.0f / l;
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    if (idx < D) {
+      out[((uint)h * n_q + qi) * D + idx] = VPIPE_ELT(acc[p] * inv_l);
+    }
+  }
+}
+
 // Gemma-4 USM Conformer chunked-local attention with relative-position
 // bias + logit softcap. Token-major layout q/k/v/out [T, N, Hd] (N heads,
 // Hd = head_dim, row stride D = N*Hd). Each query position attends only

@@ -303,10 +303,23 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
           dit_b >> 30, ram >> 30, stream_blocks ? "STREAM" : "PRELOAD"));
     }
   }
+  // Pinned-prefix: in streaming mode, pin as many leading blocks (double first,
+  // then single) as fit in 60% of physical RAM (pinned + running), read once +
+  // reused; only the tail streams. VPIPE_FLUX2_CALIB_PIN_FRAC overrides.
+  double pin_frac = stream_blocks ? 0.60 : 0.0;
+  if (const char* e = std::getenv("VPIPE_FLUX2_CALIB_PIN_FRAC")) {
+    pin_frac = std::atof(e);
+  }
   auto dit = MetalFlux2Transformer::load(
-      dit_dir, mc, MetalFlux2Transformer::Config{}, stream_blocks);
+      dit_dir, mc, MetalFlux2Transformer::Config{}, stream_blocks, pin_frac);
   if (!dit) { return fail("flux2 calib: DiT load failed: " + dit_dir); }
   dit->set_stream_stop(stop);
+  if (sess && stream_blocks) {
+    sess->log_debug(fmt(
+        "flux2 calib: pinned {} of {} DiT blocks resident ({}% RAM budget), "
+        "streaming the rest", dit->pinned_blocks(),
+        dit->config().n_double + dit->config().n_single, (int)(pin_frac * 100)));
+  }
 
   const int gh = height / 16, gw = width / 16;
   const int img_seq = gh * gw;
@@ -321,6 +334,33 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   sched.shift_type = "exponential";
   const std::vector<double> sig = sched.sigmas();
 
+  // Reference-conditioned (draw-with-reference / Kontext) calibration. FLUX.2
+  // supports appending clean reference latents to the image stream; when it is
+  // used that way the image-stream linears see clean reference tokens (sigma 0)
+  // and the joint attention runs a longer sequence -- a different activation
+  // distribution than pure text-to-image. To cover BOTH use cases, we roll the
+  // PREVIOUS prompt's fully denoised latent in as the reference for a fraction
+  // of the prompts (cost-neutral: the trajectory's own clean output is exactly
+  // the packed [img_seq, IC] DiT-input layout a RefImage wants). Prompt 0 runs
+  // reference-less to bootstrap. VPIPE_FLUX2_CALIB_EDIT_FRAC in [0,1] picks the
+  // fraction (Bresenham selection); klein is primarily text-to-image so the
+  // default is 0.5 (an even mix of plain and reference-conditioned prompts).
+  double edit_frac = 0.5;
+  if (const char* e = std::getenv("VPIPE_FLUX2_CALIB_EDIT_FRAC")) {
+    edit_frac = std::atof(e);
+    edit_frac = edit_frac < 0.0 ? 0.0 : (edit_frac > 1.0 ? 1.0 : edit_frac);
+  }
+  SharedBuffer ref_buf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+  bool ref_ready = false;   // ref_buf holds a valid generated latent
+  double edit_acc = 0.0;
+  int edit_used = 0;
+  if (sess) {
+    sess->log_debug(fmt(
+        "flux2 calib: draw-with-reference calibration frac {} (rolling each "
+        "prompt's generated latent in as the next prompt's reference)",
+        edit_frac));
+  }
+
   dit->calib_begin();
   SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
   std::vector<float> packed((std::size_t)img_seq * IC);
@@ -331,6 +371,19 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
       if (bar) { bar->end(); }
       dit->calib_end();
       return fail("flux2 calib: stopped");
+    }
+    // Attach the rolling reference (a previous generation) for this prompt?
+    std::vector<MetalFlux2Transformer::RefImage> refs;
+    if (ref_ready && edit_frac > 0.0) {
+      edit_acc += edit_frac;
+      if (edit_acc >= 1.0) {
+        edit_acc -= 1.0;
+        MetalFlux2Transformer::RefImage r;
+        r.latents = ref_buf.subview(0, ref_buf.byte_size());
+        r.seq = img_seq; r.grid_h = gh; r.grid_w = gw;
+        refs.push_back(std::move(r));
+        ++edit_used;
+      }
     }
     std::mt19937_64 rng(seed + e);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -347,7 +400,8 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
       }
       SharedBuffer vel = dit->forward_dit(ctx_cache[e], n_cache[e], latbuf,
                                           img_seq, gh, gw,
-                                          (float)sig[(std::size_t)i]);
+                                          (float)sig[(std::size_t)i], -1.0f,
+                                          refs);
       if (vel.empty()) {
         if (bar) { bar->end(); }
         dit->calib_end();
@@ -361,9 +415,19 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
       calib_progress_(bar.get(), "denoise", (int)e * steps + i + 1, total_fwd,
                       pct);
     }
+    // Snapshot this prompt's now-clean generated latent as the rolling
+    // reference for subsequent prompts (draw-with-reference calibration).
+    if (edit_frac > 0.0) {
+      auto* rb = static_cast<_Float16*>(ref_buf.contents());
+      for (std::size_t k = 0; k < packed.size(); ++k) {
+        rb[k] = (_Float16)packed[k];
+      }
+      ref_ready = true;
+    }
     if (sess) {
-      sess->log_debug(fmt("flux2 calib: denoised prompt {}/{}", e + 1,
-                          ctx_cache.size()));
+      sess->log_debug(fmt("flux2 calib: denoised prompt {}/{}{}", e + 1,
+                          ctx_cache.size(),
+                          refs.empty() ? "" : " (+1 reference)"));
     }
   }
   if (bar) { bar->end(); }
@@ -382,8 +446,9 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   }
   if (sess) {
     sess->log_normal(fmt(
-        "flux2 calib: {} prompts x {} steps -> {} group files in {}",
-        ctx_cache.size(), steps, stats.size(), out_dir));
+        "flux2 calib: {} prompts x {} steps -> {} group files in {} ({} prompts "
+        "with a draw-with-reference image)",
+        ctx_cache.size(), steps, stats.size(), out_dir, edit_used));
   }
   return true;
 }

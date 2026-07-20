@@ -305,6 +305,59 @@ model_catalog()
      .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
      .files = {"Krea2-realism-V2.safetensors"},
      .needs_tokenizer_json = false},
+    // ---- Qwen-Image (text+image -> image editing diffusion) -----------
+    // Qwen-Image-Edit-2511 (Qwen): a flow-matching multi-reference IMAGE
+    // EDIT model, model_type "qwen-image-edit". Same diffusers split-stage
+    // shape as Krea-2 (encoder->DiT stage + separate VAE stages) and the
+    // SAME Qwen-Image VAE, but the base Qwen-Image topology (dual-stream)
+    // rather than Krea's single-stream distill. Three sub-models:
+    //   text_encoder/ = Qwen2.5-VL (Qwen2_5_VLForConditionalGeneration,
+    //     hidden 3584, 28L, 28q/4kv, q/k/v attention BIAS, NO q/k-norm,
+    //     mrope [16,24,24]) + a 32-layer vision tower (window attention,
+    //     full-attn blocks [7,15,23,31]). Reference images are fed to the
+    //     vision tower so the LM conditions on them; the pipeline uses the
+    //     LAST hidden state -> txt_in (not a multi-layer tap).
+    //   transformer/  = QwenImageTransformer2DModel, a 20B DUAL-STREAM
+    //     MMDiT (60 blocks, 24 heads x head_dim 128 = 3072 hidden, in_ch
+    //     64 = 16 latent x 2x2 patch, joint_attn_dim 3584, 3D-RoPE axes
+    //     [16,56,56], guidance_embeds false). Reference latents are VAE-
+    //     encoded and concatenated into the DiT sequence (RefImage tokens).
+    //   vae/          = AutoencoderKLQwenImage (16 latent ch, 8x spatial,
+    //     per-channel latents_mean/std) -- identical to Krea-2's VAE.
+    // `files` PINS the diffusers subfolders (sharded transformer + text
+    // encoder via their index.json) + the processor/ fast tokenizer +
+    // image preprocessor + multimodal chat template; skips the README /
+    // sample media. ~55 GB (20B DiT + 7B VL encoder, bf16).
+    {.family = "Qwen-Image", .version = "Edit-2511", .param_class = "20B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-Edit-2511",
+     .model_type = "qwen-image-edit",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00005.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00005.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00005.safetensors",
+               "transformer/diffusion_pytorch_model-00004-of-00005.safetensors",
+               "transformer/diffusion_pytorch_model-00005-of-00005.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "tokenizer/special_tokens_map.json",
+               "tokenizer/added_tokens.json",
+               "processor/tokenizer.json",
+               "processor/preprocessor_config.json",
+               "processor/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
     // separate VAE stages), but the FLUX topology rather than Qwen-Image
@@ -495,7 +548,7 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
     set({"audio"}, {"audio"});
-  } else if (mt == "krea2" || mt == "flux2") {
+  } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "yolo") {
     set({"image"}, {});

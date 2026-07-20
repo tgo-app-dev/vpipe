@@ -1,8 +1,23 @@
 <a id="top"></a>
 # VPIPE
 
-A concurrent pipeline framework for real-time multimedia tasks, built
-natively on Apple Silicon.
+**Real-time multimodal AI pipelines on Apple Silicon**
+
+**VPIPE** is a high-performance pipeline framework for building real-time AI
+applications on Apple Silicon. Instead of treating AI models as isolated
+inference calls, vpipe treats them as stages in a continuously running
+dataflow system, where video, audio, text, tensors, and user interactions
+flow through a unified pipeline with deterministic scheduling and minimal
+overhead. The result is an architecture that makes complex multimodal
+systems—from real-time video understanding and speech interaction to local
+LLM applications—feel less like collections of scripts and more like
+engineered software systems.
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-black)
+![Python](https://img.shields.io/badge/Python-bindings-green)
+![Status](https://img.shields.io/badge/Status-alpha-orange)
 
 [**Overview**](#overview) · [**Requirements**](#requirements) ·
 [**Build**](#build) · [**Run**](#run) · [**Examples**](EXAMPLES.md) ·

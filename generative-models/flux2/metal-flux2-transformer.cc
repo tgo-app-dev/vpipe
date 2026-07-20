@@ -6,6 +6,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
@@ -243,7 +244,8 @@ MetalFlux2Transformer::~MetalFlux2Transformer() = default;
 
 std::unique_ptr<MetalFlux2Transformer>
 MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks)
+                            const Config& cfg, bool stream_blocks,
+                            double pin_frac)
 {
   if (mc == nullptr) { return nullptr; }
   auto wtsopt = MetalLlamaWeights::open_model(model_dir);
@@ -591,6 +593,41 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
             "MetalFlux2Transformer: streaming -- could not derive FF dims"));
       }
       return nullptr;
+    }
+    // Pinned-prefix: pin as many LEADING blocks as fit in pin_frac of RAM, in
+    // stream order (double blocks first, then single). Greedy over the actual
+    // per-block bytes (double blocks are larger). Loaded from `wts` before it is
+    // moved into _stream_wts; the pinned buffers survive the move.
+    if (pin_frac > 0.0) {
+      std::vector<std::string> prefixes;
+      prefixes.reserve((std::size_t)(m->_cfg.n_double + m->_cfg.n_single));
+      for (int i = 0; i < m->_cfg.n_double; ++i) {
+        prefixes.push_back("transformer_blocks." + std::to_string(i) + ".");
+      }
+      for (int i = 0; i < m->_cfg.n_single; ++i) {
+        prefixes.push_back("single_transformer_blocks." + std::to_string(i) +
+                           ".");
+      }
+      int pin = stream_pin_count(wts, prefixes, pin_frac);
+      if (pin > (int)prefixes.size()) { pin = (int)prefixes.size(); }
+      m->_pinned_d = pin < m->_cfg.n_double ? pin : m->_cfg.n_double;
+      m->_pinned_s = pin - m->_pinned_d;
+      m->_double.resize((std::size_t)m->_pinned_d);
+      for (int i = 0; i < m->_pinned_d; ++i) {
+        if (!m->load_double_(wts,
+                "transformer_blocks." + std::to_string(i) + ".",
+                m->_double[(std::size_t)i])) {
+          return nullptr;
+        }
+      }
+      m->_single.resize((std::size_t)m->_pinned_s);
+      for (int i = 0; i < m->_pinned_s; ++i) {
+        if (!m->load_single_(wts,
+                "single_transformer_blocks." + std::to_string(i) + ".",
+                m->_single[(std::size_t)i])) {
+          return nullptr;
+        }
+      }
     }
     // Retain the source mmap so forward_dit can re-read each block on demand.
     m->_stream_wts = std::make_unique<MetalLlamaWeights>(std::move(*wtsopt));
@@ -1251,9 +1288,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
 
     for (int L = 0; L < c.n_double; ++L) {
+      // Pipeline stop -> abandon: checked EVERY block (not just the streamed
+      // tail) so a slow high-res step responds within ~one block on the
+      // preloaded path too.
+      if (_stream_stop && _stream_stop()) { return {}; }
+      // Pinned prefix (L < _pinned_d) is resident in _double; the tail streams.
+      const bool streaming = _stream_blocks && L >= _pinned_d;
       DoubleBlock streamed;
-      if (_stream_blocks) {
-        if (_stream_stop && _stream_stop()) { return {}; }
+      if (streaming) {
         if (!load_double_(*_stream_wts,
                           "transformer_blocks." + std::to_string(L) + ".",
                           streamed)) {
@@ -1261,7 +1303,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         }
       }
       const DoubleBlock& b =
-          _stream_blocks ? streamed : _double[(std::size_t)L];
+          streaming ? streamed : _double[(std::size_t)L];
       // MSA: img (mod set 0) + txt.  mod layout [shift,scale,gate]*2 (each H).
       op.ln(img, 0, nrm, 0, IS, H);
       op.adaln(nrm, 0, mimg, H, 0, nrm, 0, H, IS * H);
@@ -1318,7 +1360,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.tap("dbl_ffact_txt", L, smlp, 0, TS, INNER);
       op.gemm(smlp, b.cff_out, ob, 0, TS, H, INNER);
       op.gated(txt, 0, mtxt, 5 * H, ob, 0, H, TS * H);
-      if (_stream_blocks) { flush(); }   // commit block L before it frees
+      if (streaming) { flush(); }   // commit block L before it frees
     }
     enc.end();
     std::string gpu_err;
@@ -1356,16 +1398,18 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                : _fn_swiglu_rs.valid();
   const bool ff_direct = _fn_transpose_rs.valid() && have_mlp_rs;
   for (int L = 0; L < c.n_single; ++L) {
+    if (_stream_stop && _stream_stop()) { return {}; }   // pipeline stop, any mode
+    // Pinned prefix (L < _pinned_s) is resident in _single; the tail streams.
+    const bool streaming = _stream_blocks && L >= _pinned_s;
     SingleBlock streamed;
-    if (_stream_blocks) {
-      if (_stream_stop && _stream_stop()) { return {}; }
+    if (streaming) {
       if (!load_single_(*_stream_wts,
                         "single_transformer_blocks." + std::to_string(L) + ".",
                         streamed)) {
         return {};
       }
     }
-    const SingleBlock& b = _stream_blocks ? streamed : _single[(std::size_t)L];
+    const SingleBlock& b = streaming ? streamed : _single[(std::size_t)L];
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();

@@ -96,6 +96,13 @@ struct QuantizeOptions {
   int   high_bits  = 8;
   float mixed_frac = 0.25f;          // fraction of LAYERS promoted to high_bits
 
+  // Leaves (weight_leaf_ names) to quantize at `high_bits` instead of `bits`,
+  // independent of `mixed`. For a precision-sensitive tensor type that is too
+  // lossy at 4-bit but fine at 8-bit -- e.g. the Qwen-Image-Edit AdaLN
+  // modulation ("1"): body @ w4, modulation @ w8. The loader auto-detects the
+  // per-tensor bit width, so a checkpoint mixing widths loads + infers as-is.
+  std::vector<std::string> high_bit_leaves;
+
   // Krea-2 DiT activation-aware weight CLIPPING (the fold-free half of AWQ; the
   // adaLN smoothing fold is obstructed by the shared timestep-dependent
   // time_mod_proj shift). When set, each quantized transformer_blocks.{L}

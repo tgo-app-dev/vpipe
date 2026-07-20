@@ -23,6 +23,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/diffusion-conditioner-stage.h"
 #include "stages/model-quantize-stage.h"
 #include "stages/text-to-image-stage.h"
 #include "stages/vae-decode-stage.h"
@@ -191,6 +192,19 @@ public:
   }
 };
 
+// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// (DiT) stage -- the encoder half moved there, so the DiT consumes ready-made
+// conditioning. Returns the conditioner; wire the t2i's iport0 to {cond, 0}.
+Stage*
+add_conditioner_(Pipeline* pl, Session& sess, Stage* src, const char* root)
+{
+  FlexData c = FlexData::make_object();
+  c.as_object().insert("hf_dir", FlexData::make_string(root));
+  auto u = std::make_unique<DiffusionConditionerStage>(
+      &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c));
+  return pl->insert_stage(std::move(u));
+}
+
 }  // namespace
 
 // The prompt template tokenizes to the exact golden encoder ids.
@@ -262,8 +276,9 @@ TEST(krea2_t2i, end_to_end_from_golden_noise)
   t2i_cfg.as_object().insert("width", FlexData::make_int(W));
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(t2i_cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
@@ -378,8 +393,9 @@ TEST(krea2_t2i, end_to_end_quantized_dit)
   t2i_cfg.as_object().insert("dit_dir", FlexData::make_string(qdit));  // 4-bit
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(t2i_cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
@@ -464,8 +480,9 @@ TEST(krea2_t2i, end_to_end_lora_dit)
   t2i_cfg.as_object().insert("dit_dir", FlexData::make_string(ldit));
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(t2i_cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
@@ -549,8 +566,9 @@ TEST(krea2_t2i, img2img_sampling_from_golden_init)
   cfg.as_object().insert("strength", FlexData::make_real(0.6));
   cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/b_init_latents.f32"));
+  auto* cond = add_conditioner_(pl.get(), sess, src, root);
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
   auto sinku = std::make_unique<SinkCapture>(
@@ -626,11 +644,13 @@ TEST(krea2_t2i, img2img_end_to_end)
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string(root));
   cfg.as_object().insert("strength", FlexData::make_real(0.6));
-  // prompt on iport0; negative/sampler/scheduler (iport1-3) DISCONNECTED; the
-  // img2img init latent (from vae-encode) on iport4 (ref latent 0).
+  // conditioning on iport0 (from the conditioner); neg/sampler/scheduler
+  // (iport1-3) DISCONNECTED; the img2img init latent (from vae-encode) on
+  // iport4 (ref latent 0).
+  auto* cond = add_conditioner_(pl.get(), sess, pr, root);
   auto t2iu = std::make_unique<TextToImageStage>(
       &sess, "t2i",
-      std::vector<InEdge>{{pr, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
+      std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
                           InEdge{nullptr, 0}, {ve, 0}},
       std::move(cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
@@ -724,8 +744,9 @@ TEST(krea2_t2i, enc_quantized_hf_dir)
 
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string(qdir));
+  auto* cond = add_conditioner_(pl.get(), sess, src, qdir.c_str());
   auto t2iu = std::make_unique<TextToImageStage>(
-      &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(cfg));
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
   auto sinku = std::make_unique<SinkCapture>(

@@ -412,6 +412,97 @@ kernel void rope_pair_table_f16(
   x[base + 1] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// Same as rope_pair_table_f16 but the cos/sin tables are FLOAT32 (host-built
+// at full precision). The QwenImage DiT reference applies RoPE in f32; keeping
+// the tables f32 (only x is bf16) avoids the ~4e-3 bf16-table rounding that
+// otherwise compounds over the 60 blocks.
+kernel void rope_pair_table_ftab_f16(
+    device VPIPE_ELT*    x    [[buffer(0)]],
+    const device float*  cosb [[buffer(1)]],
+    const device float*  sinb [[buffer(2)]],
+    constant int&        H    [[buffer(3)]],
+    constant int&        T    [[buffer(4)]],
+    constant int&        D    [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  (void)H;
+  const int half_d = D / 2;
+  const int i = (int)gid.x;
+  if (i >= half_d) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  const uint cb = (uint)t * D + 2 * i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const uint base = ((uint)h * T + t) * D + 2 * i;
+  const float x1 = float(x[base]);
+  const float x2 = float(x[base + 1]);
+  x[base]     = VPIPE_ELT(x1 * c - x2 * s);
+  x[base + 1] = VPIPE_ELT(x1 * s + x2 * c);
+}
+
+// Fused transpose [T,H,D] -> [H,T,D] + pair RoPE (f32 cos/sin tables), for the
+// q/k path: reads TOKEN-major in[(t*H+h)*D + 2i(,+1)], applies token t's rope
+// (interleaved pairs, same convention as rope_pair_table_ftab_f16), and writes
+// HEAD-major out[(h*T+t)*D + 2i(,+1)]. One pass replaces a transpose_abd_f16
+// followed by an in-place rope_pair over the transposed buffer (saves the
+// separate rope's full read+write of the head-major tensor). `in` and `out` are
+// distinct buffers. grid (D/2, T, H).
+kernel void transpose_rope_pair_ftab_f16(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    device VPIPE_ELT*       out  [[buffer(1)]],
+    const device float*     cosb [[buffer(2)]],
+    const device float*     sinb [[buffer(3)]],
+    constant int&           H    [[buffer(4)]],
+    constant int&           T    [[buffer(5)]],
+    constant int&           D    [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int half_d = D / 2;
+  const int i = (int)gid.x;
+  if (i >= half_d) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  const uint cb = (uint)t * D + 2 * i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const uint ib = ((uint)t * H + h) * D + 2 * i;   // token-major input
+  const uint ob = ((uint)h * T + t) * D + 2 * i;   // head-major output
+  const float x1 = float(in[ib]);
+  const float x2 = float(in[ib + 1]);
+  out[ob]     = VPIPE_ELT(x1 * c - x2 * s);
+  out[ob + 1] = VPIPE_ELT(x1 * s + x2 * c);
+}
+
+// HALF-SPLIT (NEOX) RoPE from f32 cos/sin tables [T, D/2] (Qwen2.5-VL vision:
+// rotate_half convention, out = x*cos + rotate_half(x)*sin, cos/sin duplicated
+// over the two halves so only D/2 table entries are needed). Pairs dim i with
+// i+D/2. x is VPIPE_ELT [H,T,D] in place; tables are host-built f32.
+kernel void rope_half_table_ftab_f16(
+    device VPIPE_ELT*    x    [[buffer(0)]],
+    const device float*  cosb [[buffer(1)]],
+    const device float*  sinb [[buffer(2)]],
+    constant int&        H    [[buffer(3)]],
+    constant int&        T    [[buffer(4)]],
+    constant int&        D    [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  (void)H;
+  const int half_d = D / 2;
+  const int i = (int)gid.x;
+  if (i >= half_d) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  const uint cb = (uint)t * half_d + i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const uint base = ((uint)h * T + t) * D + i;
+  const float x1 = float(x[base]);
+  const float x2 = float(x[base + half_d]);
+  x[base]          = VPIPE_ELT(x1 * c - x2 * s);
+  x[base + half_d] = VPIPE_ELT(x2 * c + x1 * s);
+}
+
 // Partial RoPE (Qwen3.5): rotate only the FIRST `rotary_dim` of each
 // head's `D` dims, leaving [rotary_dim, D) untouched (pass-through). The
 // rotated block uses the half-split convention over rotary_dim/2 pairs;

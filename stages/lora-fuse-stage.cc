@@ -13,11 +13,39 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace vpipe {
+
+namespace {
+
+// The registry model_type for a fused DiT dir, from its config.json
+// _class_name. Krea-2 is the historical default; FLUX.2 and Qwen-Image-Edit
+// fused outputs must register under their own family so downstream family
+// detection (text-to-image, quantize) picks the right loader.
+std::string
+fused_model_type_(const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(dir) / "config.json");
+  if (in) {
+    FlexData fd = FlexData::from_json(in);
+    if (fd.is_object()) {
+      auto o = fd.as_object();
+      if (o.contains("_class_name")) {
+        const std::string cls(o.at("_class_name").as_string(""));
+        if (cls == "Flux2Transformer2DModel") { return "flux2"; }
+        if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
+      }
+    }
+  }
+  return "krea2";
+}
+
+}  // namespace
 
 LoraFuseStage::LoraFuseStage(const SessionContextIntf* s,
                              std::string               id,
@@ -118,7 +146,8 @@ LoraFuseStage::register_output_(const std::string& key, const std::string& dir)
     ro.insert_or_assign("source", FlexData::make_string(_base_model));
     ro.insert_or_assign("lora", FlexData::make_string(_lora));
     ro.insert_or_assign("lora_fused", FlexData::make_bool(true));
-    ro.insert_or_assign("model_type", FlexData::make_string("krea2"));
+    ro.insert_or_assign("model_type",
+                        FlexData::make_string(fused_model_type_(dir)));
     LmdbDb  db(*env, _models_db);
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadWrite);
     db.put(txn, key, rec.to_binary());

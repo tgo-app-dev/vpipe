@@ -9,6 +9,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
+#include "generative-models/qwen-image/metal-qwen-image-calibration.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/quantize/arch-detect.h"
@@ -61,6 +62,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _high_bits     = static_cast<int>(attr_uint("high_bits"));
   _mixed_frac    = static_cast<float>(attr_real("mixed_frac"));
   _layer_prefix  = attr_str("layer_prefix");
+  _quant_modulation = attr_bool("quant_modulation");
   _n_layers      = static_cast<int>(attr_uint("n_layers"));
   if (_models_db.empty()) { _models_db = "models"; }
 
@@ -125,6 +127,7 @@ dit_class_family_(const std::string& class_name)
 {
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
+  if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
   return {};
 }
 
@@ -155,6 +158,32 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family)
   const fs::path sub = fs::path(src_dir) / "transformer";
   fam = family_of(sub / "config.json");
   if (!fam.empty()) { if (family) { *family = fam; } return sub.string(); }
+  // Fallback: the diffusers pipeline root carries a model_index.json whose
+  // `transformer` entry names the DiT class ([library, class_name]). Use it when
+  // transformer/config.json is absent or has lost its _class_name (e.g. a
+  // re-exported checkpoint) -- it is the canonical pipeline descriptor.
+  {
+    std::ifstream in(fs::path(src_dir) / "model_index.json");
+    if (in) {
+      FlexData mi = FlexData::from_json(in);
+      if (mi.is_object()) {
+        auto o = mi.as_object();
+        if (o.contains("transformer")) {
+          FlexData t = o.at("transformer");
+          if (t.is_array()) {
+            auto arr = t.as_array();
+            if (arr.size() >= 2) {
+              fam = dit_class_family_(std::string(arr[1].as_string("")));
+              if (!fam.empty() && fs::is_directory(sub)) {
+                if (family) { *family = fam; }
+                return sub.string();
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   return {};
 }
 
@@ -178,27 +207,39 @@ t2i_target_subdir_(const std::string& target)
 // Recursively materialise `src` at `dst`, hard-linking regular files when the
 // two live on one filesystem (instant, no extra space -- the copies are
 // read-only) and falling back to a byte copy across devices. Used to assemble
-// a self-contained Krea-2 output from the un-quantized (or already-quantized)
-// components that this pass does not touch.
-void
+// a self-contained Krea-2 / FLUX.2 / Qwen-Image-Edit output from the un-
+// quantized (or already-quantized) components this pass does not touch.
+//
+// Polls `stop` before every file/subdir so a pipeline stop is honored PER FILE
+// (not just between top-level components): assembling a self-contained output
+// copies the sibling sub-models, and on a cross-device dst that is a real byte
+// copy of large shards (e.g. the ~20 GB w4 DiT when quantizing the text encoder
+// on top). Returns false as soon as the stop fires (a partial `dst` is left for
+// the caller to discard), true on completion.
+bool
 link_or_copy_tree_(const std::filesystem::path& src,
-                   const std::filesystem::path& dst, std::error_code& ec)
+                   const std::filesystem::path& dst, std::error_code& ec,
+                   const std::function<bool()>& stop)
 {
   namespace fs = std::filesystem;
+  if (stop()) { return false; }
   if (fs::is_directory(src)) {
     fs::create_directories(dst, ec);
     for (const auto& e : fs::directory_iterator(src, ec)) {
-      link_or_copy_tree_(e.path(), dst / e.path().filename(), ec);
+      if (!link_or_copy_tree_(e.path(), dst / e.path().filename(), ec, stop)) {
+        return false;
+      }
     }
-    return;
+    return true;
   }
-  if (!fs::is_regular_file(src)) { return; }
+  if (!fs::is_regular_file(src)) { return true; }
   fs::remove(dst, ec);
   std::error_code le;
   fs::create_hard_link(src, dst, le);
   if (le) {   // cross-device / unsupported -> real copy
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
   }
+  return true;
 }
 
 // Resolve a general-LLM `target` to a submodule quantization SCOPE. Sets
@@ -284,6 +325,17 @@ dit_quant_linears_(const std::string& family)
     return {"to_q", "to_k", "to_v", "to_out", "to_add_out",
             "add_q_proj", "add_k_proj", "add_v_proj", "to_qkv_mlp_proj",
             "linear_in", "linear_out"};
+  }
+  if (family == "qwen-image-edit") {
+    // Dual-stream QwenImageTransformer2DModel. The quantizer matches the LAST
+    // dot-component before ".weight", so use those: to_out is "attn.to_out.0"
+    // -> "0" (60, unique); both FeedForward up-projs "*_mlp.net.0.proj" ->
+    // "proj" (120); both down-projs "*_mlp.net.2" -> "2" (120). The adaLN
+    // modulation ("*_mod.1" -> "1"), img_in/txt_in and the norm_out/proj_out
+    // head stay bf16 (precision-sensitive; the residual reaches ~1e7).
+    return {"to_q", "to_k", "to_v", "0",
+            "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
+            "proj", "2"};
   }
   return {"to_q", "to_k", "to_v", "to_gate", "0", "gate", "up", "down",
           "linear_1", "linear_2", "img_in", "time_mod_proj", "linear"};
@@ -371,6 +423,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "n_layers", .type = ConfigType::Uint,
    .doc = "layer count for awq/mixed; 0 => auto-detect from config.json",
    .def_uint = 0},
+  {.key = "quant_modulation", .type = ConfigType::Bool,
+   .doc = "Qwen-Image-Edit DiT only: also quantize the AdaLN modulation "
+          "projections (*_mod.1). They are the largest weights (~13 GB bf16 -> "
+          "~3.4 GB at 4-bit, which lets the whole DiT fit a 16 GB box) but "
+          "precision-sensitive, so they are kept bf16 by default -- opt in here",
+   .def_bool = false},
 };
 // Trigger iport (optional, any beat) + summary oport -- see model-fetch
 // for the shared "preparation recipe" rationale.
@@ -575,6 +633,24 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // in the ctor -- it depends on the resolved source).
   if (_awq || _mixed) {
     if (eff_n_layers <= 0 || eff_layer_prefix.empty()) {
+      // A diffusion pipeline reaching the general LM path means its DiT was not
+      // recognised as a text-to-image transformer (resolve_t2i_dit_dir_ returned
+      // empty) -- typically a build that predates the model's DiT-quant support,
+      // or a transformer/ config whose _class_name is unknown. Give that hint
+      // instead of the bare auto-detect failure.
+      const bool looks_t2i =
+          fs::exists(fs::path(src_dir) / "model_index.json") ||
+          fs::exists(fs::path(src_dir) / "transformer" / "config.json");
+      if (looks_t2i) {
+        session()->warn(fmt(
+            "ModelQuantizeStage('{}'): '{}' looks like a text-to-image pipeline "
+            "(has model_index.json / transformer/), but its DiT was not routed "
+            "to the DiT-quantize path -- the build likely predates this model's "
+            "support, or its transformer _class_name is unrecognised. Rebuild "
+            "from a current tree (or point src_model at the transformer/ dir).",
+            this->id(), src_dir));
+        return false;
+      }
       session()->warn(fmt(
           "ModelQuantizeStage('{}'): awq/mixed need n_layers + layer_prefix; "
           "auto-detect from '{}' failed -- set them explicitly (got "
@@ -705,6 +781,8 @@ ModelQuantizeStage::quantize_dit_component_(
   if (mc == nullptr) { return false; }
 
   const bool is_flux2 = (family == "flux2");
+  const bool is_qie   = (family == "qwen-image-edit");
+  const bool awq = _awq;
 
   // Plain group-affine over the DiT leaf set (no LM arch-detect / embedding
   // quant; the DiT loader folds the zero-centered norms' +1 itself, so
@@ -714,6 +792,23 @@ ModelQuantizeStage::quantize_dit_component_(
   opt.bits  = _bits;
   opt.group = _group_size;
   opt.quant_linears    = dit_quant_linears_(family);
+  // Opt-in: also quantize the QIE AdaLN modulation (*_mod.1 -> leaf "1", the
+  // largest weights, kept bf16 by default for precision). The DiT loader runs a
+  // quantized modulation through gemm_bias_q, so a model built with this flag
+  // loads + infers on a 16 GB box.
+  if (is_qie && _quant_modulation) {
+    opt.quant_linears.push_back("1");
+    // The modulation carries large-magnitude scale/gate values (they drive the
+    // ~1e7 residual), so 4-bit wrecks it (block-0 rel-L2 ~0.75) while 8-bit is
+    // fine. Force w8 for the modulation regardless of the body's bit-width; the
+    // DiT loader auto-detects per-tensor bits, so body @ bits, modulation @ 8.
+    opt.high_bit_leaves.push_back("1");
+    opt.high_bits = 8;
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): quantizing the AdaLN modulation (*_mod.1) "
+        "at 8-bit (precision-sensitive; body stays {}-bit)", this->id(),
+        _bits));
+  }
   opt.quant_embeddings = false;
   opt.norm_offset      = false;
   opt.dit_family       = family;   // "krea2" | "flux2"
@@ -729,7 +824,7 @@ ModelQuantizeStage::quantize_dit_component_(
     opt.n_layers   = dit_layers;
     if (!is_flux2) { opt.layer_prefix = "transformer_blocks."; }
   }
-  if (_awq) {
+  if (awq) {
     // DiT AWQ = activation-aware weight CLIPPING. On-device auto-calibrate over
     // prompts x sigmas (reading the encoder + tokenizer from calib_root) when
     // no calib_dir is supplied. Krea-2 and FLUX.2 use family-specific collectors
@@ -739,8 +834,9 @@ ModelQuantizeStage::quantize_dit_component_(
       opt.calib_dir = _calib_dir;
     } else {
       tmp_cal = vpipe::temp_root() /
-                ((is_flux2 ? "vpipe-flux2-ditcal-" : "vpipe-krea2-ditcal-") +
-                 this->id());
+                ((is_flux2 ? "vpipe-flux2-ditcal-"
+                  : is_qie ? "vpipe-qie-ditcal-"
+                  : "vpipe-krea2-ditcal-") + this->id());
       fs::remove_all(tmp_cal, ec);
       session()->info(fmt(
           "ModelQuantizeStage('{}'): on-device {} DiT AWQ calibration "
@@ -748,6 +844,10 @@ ModelQuantizeStage::quantize_dit_component_(
       std::string ce;
       const bool ok = is_flux2
           ? genai::collect_flux2_calibration(
+                mc, calib_root, genai::default_dit_calibration_prompts(), 8, 256,
+                256, 0, tmp_cal.string(), &ce, stop)
+          : is_qie
+          ? genai::collect_qwen_image_calibration(
                 mc, calib_root, genai::default_dit_calibration_prompts(), 8, 256,
                 256, 0, tmp_cal.string(), &ce, stop)
           : genai::collect_dit_calibration(
@@ -840,10 +940,16 @@ ModelQuantizeStage::quantize_text_encoder_(
       // On-device auto-calibration. The text encoder is a dense Qwen3
       // backbone, so a plain text corpus exercises exactly the encoded path;
       // its tokenizer lives in the pipeline root (the sub-dir has none).
-      const std::string tok = fs::exists(fs::path(enc_dir) / "tokenizer.json",
-                                         ec)
-          ? (fs::path(enc_dir) / "tokenizer.json").string()
-          : (fs::path(root) / "tokenizer" / "tokenizer.json").string();
+      // The fast tokenizer.json lives in the encoder dir, the pipeline
+      // tokenizer/ (Krea-2 / FLUX.2), or processor/ (Qwen-Image-Edit, whose
+      // tokenizer/ holds only the slow vocab.json + merges).
+      std::string tok = (fs::path(enc_dir) / "tokenizer.json").string();
+      if (!fs::exists(tok, ec)) {
+        tok = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
+      }
+      if (!fs::exists(tok, ec)) {
+        tok = (fs::path(root) / "processor" / "tokenizer.json").string();
+      }
       calib = auto_calibrate_backbone_(enc_dir, meta, meta.n_layers, tok, stop);
       if (calib.empty()) { return false; }   // logged inside
       auto_calib = calib;
@@ -1015,8 +1121,8 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
   fs::create_directories(out_dir, ec);
   for (const auto& e : fs::directory_iterator(root, ec)) {
     if (e.path().filename().string() == tgt) { continue; }
-    link_or_copy_tree_(e.path(), fs::path(out_dir) / e.path().filename(), ec);
-    if (stop()) {
+    if (!link_or_copy_tree_(e.path(), fs::path(out_dir) / e.path().filename(),
+                            ec, stop)) {
       session()->info(fmt(
           "ModelQuantizeStage('{}'): stopped while assembling '{}'",
           this->id(), out_dir));

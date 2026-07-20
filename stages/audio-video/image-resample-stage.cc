@@ -60,9 +60,12 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
 
   const string alg = attr_str("algorithm");
   // Deferred validation: the ctor never throws (Stage::fail_config).
-  if (_out_w <= 0 || _out_h <= 0) {
-    fail_config(fmt("ImageResampleStage('{}'): width and height must be "
-                    "> 0 (got {}x{})", this->id(), _out_w, _out_h));
+  // At least one of width / height must be positive; a missing (<= 0)
+  // axis is inferred per-frame from the source aspect ratio.
+  if (_out_w <= 0 && _out_h <= 0) {
+    fail_config(fmt("ImageResampleStage('{}'): at least one of width / "
+                    "height must be > 0 (got {}x{})",
+                    this->id(), _out_w, _out_h));
   } else if (!alg.empty() && alg != "bilinear") {
     fail_config(fmt("ImageResampleStage('{}'): unknown algorithm '{}' "
                     "(only 'bilinear' is supported)", this->id(), alg));
@@ -74,10 +77,14 @@ ImageResampleStage::~ImageResampleStage() = default;
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
-  {.key = "width",  .type = ConfigType::Int, .required = true,
-   .doc = "output width in pixels (> 0)"},
-  {.key = "height", .type = ConfigType::Int, .required = true,
-   .doc = "output height in pixels (> 0)"},
+  {.key = "width",  .type = ConfigType::Int,
+   .doc = "output width in pixels; omit (or set <= 0) to infer it from "
+          "height, preserving the source aspect ratio",
+   .def_int = 0},
+  {.key = "height", .type = ConfigType::Int,
+   .doc = "output height in pixels; omit (or set <= 0) to infer it from "
+          "width, preserving the source aspect ratio",
+   .def_int = 0},
   {.key = "fit", .type = ConfigType::String,
    .doc = "aspect-ratio handling: pad (match long side + pad_color) | "
           "crop (match short side + centre-crop) | stretch (change AR) | "
@@ -134,22 +141,43 @@ Job
 ImageResampleStage::initialize(RuntimeContext&)
 {
   _mc = session() ? session()->metal_compute() : nullptr;
+  const string ws = _out_w > 0 ? std::to_string(_out_w) : string("auto");
+  const string hs = _out_h > 0 ? std::to_string(_out_h) : string("auto");
   session()->info(fmt(
       "ImageResampleStage('{}'): -> {}x{}, fit={}, metal {}",
-      this->id(), _out_w, _out_h, _mode,
+      this->id(), ws, hs, _mode,
       (_mc && _mc->valid()) ? "ok" : "cpu-fallback"));
   co_return;
 }
 
 void
+ImageResampleStage::resolve_out_dims_(int in_w, int in_h,
+                                      int* out_w, int* out_h) const noexcept
+{
+  int ow = _out_w, oh = _out_h;
+  if (ow <= 0 && oh <= 0) {          // both unset -> pass the source through
+    ow = in_w; oh = in_h;
+  } else if (ow <= 0) {              // infer width from height (keep AR)
+    ow = static_cast<int>(
+        llround(static_cast<double>(in_w) * oh / in_h));
+  } else if (oh <= 0) {              // infer height from width (keep AR)
+    oh = static_cast<int>(
+        llround(static_cast<double>(in_h) * ow / in_w));
+  }
+  *out_w = ow < 1 ? 1 : ow;
+  *out_h = oh < 1 ? 1 : oh;
+}
+
+void
 ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
+                                  int out_w, int out_h,
                                   uint8_t* dst, bool is_f32) const
 {
   const metal_compute::ResampleGeom g =
-      metal_compute::compute_resample_geom(in_w, in_h, _out_w, _out_h,
+      metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
           _mode, _src_x, _src_y, static_cast<float>(_scale));
   const int planeS = in_w * in_h;
-  const int planeD = _out_w * _out_h;
+  const int planeD = out_w * out_h;
   const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
   const float pad[3] = { _pad_r / div, _pad_g / div, _pad_b / div };
   const float* sf = reinterpret_cast<const float*>(src);
@@ -159,12 +187,12 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
     return is_f32 ? sf[i] : static_cast<float>(src[i]);
   };
   auto wr = [&](int c, int x, int y, float v) {
-    const int i = c * planeD + y * _out_w + x;
+    const int i = c * planeD + y * out_w + x;
     if (is_f32) { df[i] = v; }
     else { dst[i] = static_cast<uint8_t>(clamp(v + 0.5f, 0.0f, 255.0f)); }
   };
-  for (int y = 0; y < _out_h; ++y) {
-    for (int x = 0; x < _out_w; ++x) {
+  for (int y = 0; y < out_h; ++y) {
+    for (int x = 0; x < out_w; ++x) {
       const bool out = x < g.pad_x || x >= g.pad_x + g.new_w
                     || y < g.pad_y || y >= g.pad_y + g.new_h;
       if (out) {
@@ -211,10 +239,29 @@ ImageResampleStage::process(RuntimeContext& ctx)
   const int in_w = static_cast<int>(tin->shape[2]);
   if (in_w <= 0 || in_h <= 0) { co_return; }
 
+  // Resolve the output size against this frame: an axis left at 0 is
+  // inferred from the other so the source aspect ratio is preserved.
+  int out_w = 0, out_h = 0;
+  resolve_out_dims_(in_w, in_h, &out_w, &out_h);
+
+  // Both the resample kernel and the CPU fallback assume a tightly
+  // packed planar source (row pitch == in_w). Producers can hand us
+  // padded rows -- load-image forwards FFmpeg's GBRP linesize, which is
+  // 32-byte aligned, so a width that isn't a multiple of 32 gives
+  // strides with pitch > in_w. Reading that as tight shears every row
+  // (slanted colour bands). Materialise a contiguous copy when needed.
+  AlignedVector<uint8_t> contig;
+  const uint8_t* src_tight = tin->bytes_();
+  const bool contiguous = tin->is_contiguous();
+  if (!contiguous) {
+    contig = tin->materialize_contiguous();
+    src_tight = contig.data();
+  }
+
   // GPU fast path: u8 frames via the (generalised) letterbox kernel.
   if (tin->dtype == TensorBeat::DType::U8 && _mc && _mc->valid()) {
     const ExternalStorageHandle* src_h = nullptr;
-    if (tin->external) {
+    if (tin->external && contiguous) {
       src_h = tin->external.get();               // already GPU-resident
     } else {
       const size_t need = static_cast<size_t>(3) * in_w * in_h;
@@ -224,20 +271,20 @@ ImageResampleStage::process(RuntimeContext& ctx)
         _stage_in_w = in_w; _stage_in_h = in_h;
       }
       if (_src_stage) {
-        std::memcpy(_src_stage->contents, tin->as_u8(), need);
+        std::memcpy(_src_stage->contents, src_tight, need);
         src_h = _src_stage.get();
       }
     }
     if (src_h) {
       auto dst = metal_compute::make_shared_storage(
-          *_mc, static_cast<size_t>(3) * _out_w * _out_h, session());
+          *_mc, static_cast<size_t>(3) * out_w * out_h, session());
       if (dst && metal_compute::resample_planar_u8_to_u8(
-              *_mc, *src_h, in_w, in_h, *dst, _out_w, _out_h,
+              *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
               _mode, _src_x, _src_y, static_cast<float>(_scale),
               _pad_r, _pad_g, _pad_b, session())) {
         TensorBeat tb;
         tb.dtype = TensorBeat::DType::U8;
-        tb.shape = { 3, _out_h, _out_w };
+        tb.shape = { 3, out_h, out_w };
         tb.sideband = tin->sideband;
         tb.external = std::move(dst);
         co_await ctx.write(0,
@@ -251,10 +298,10 @@ ImageResampleStage::process(RuntimeContext& ctx)
   // CPU fallback: f32 frames, no-metal builds, or a GPU miss.
   TensorBeat tb;
   tb.dtype = tin->dtype;
-  tb.shape = { 3, _out_h, _out_w };
+  tb.shape = { 3, out_h, out_w };
   tb.sideband = tin->sideband;
-  tb.resize_contiguous(static_cast<size_t>(3) * _out_w * _out_h);
-  cpu_resample_(tin->bytes_(), in_w, in_h, tb.bytes_(),
+  tb.resize_contiguous(static_cast<size_t>(3) * out_w * out_h);
+  cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(),
                 tin->dtype == TensorBeat::DType::F32);
   co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
 }

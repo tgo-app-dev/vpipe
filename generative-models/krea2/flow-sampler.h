@@ -36,18 +36,47 @@ struct FlowSchedulerSpec {
   std::string shift_type = "exponential";   // "exponential" | "linear"
   double      rho        = 7.0;             // karras curvature
 
-  FlexData to_flex() const;   // {scheduler, type, steps, shift, shift_type, rho}
+  // ---- FlowMatchEuler dynamic shifting (Qwen-Image / SD3-style) --------
+  // When `dynamic_shift`, the flow-matching mu (used in place of `shift`)
+  // is computed PER-IMAGE from the packed image-token count (`img_seq_len`)
+  // via calculate_shift(base_seq,max_seq,base_shift,max_shift); the base
+  // sigma grid is the diffusers linspace(1, 1/num_train, steps) (not the
+  // linspace(1, 1/steps) of the static `type`s); and a nonzero
+  // `shift_terminal` stretches the shifted schedule so its last nonzero
+  // sigma lands exactly on `shift_terminal`. `type`/`shift`/`rho` are
+  // ignored in this mode; `shift_type` still selects the time-shift curve.
+  bool        dynamic_shift  = false;
+  double      base_shift     = 0.5;
+  double      max_shift      = 0.9;
+  double      shift_terminal = 0.0;         // 0 = no terminal stretch
+  int         base_seq       = 256;
+  int         max_seq        = 8192;
+  int         num_train      = 1000;        // num_train_timesteps
+  // Per-image RUNTIME binding (packed grid_h*grid_w) -- NOT a config
+  // choice: excluded from operator== and (de)serialization. The caller
+  // sets it before constructing the FlowSampler when dynamic_shift is on.
+  int         img_seq_len    = 0;
+
+  FlexData to_flex() const;   // {scheduler, type, steps, shift, shift_type, rho, +dyn}
   static FlowSchedulerSpec from_flex(const FlexData& fd,
                                      std::string* err = nullptr);
 
-  // The [steps+1] schedule: base sigmas (per `type`) over (1/steps .. 1] then
-  // time-shifted by mu, decreasing, with a terminal 0 appended.
+  // The [steps+1] schedule: base sigmas over (1/steps .. 1] (or the
+  // diffusers linspace(1, 1/num_train, steps) when dynamic_shift) then
+  // time-shifted by mu (static `shift`, or per-image calculate_shift),
+  // decreasing, with a terminal 0 appended. In dynamic_shift mode mu comes
+  // from `img_seq_len`; the explicit overload lets a caller pass it inline.
   std::vector<double> sigmas() const;
+  std::vector<double> sigmas(int img_seq_len_override) const;
 
   bool operator==(const FlowSchedulerSpec& o) const noexcept
   {
     return type == o.type && steps == o.steps && shift == o.shift &&
-           shift_type == o.shift_type && rho == o.rho;
+           shift_type == o.shift_type && rho == o.rho &&
+           dynamic_shift == o.dynamic_shift && base_shift == o.base_shift &&
+           max_shift == o.max_shift && shift_terminal == o.shift_terminal &&
+           base_seq == o.base_seq && max_seq == o.max_seq &&
+           num_train == o.num_train;
   }
 };
 

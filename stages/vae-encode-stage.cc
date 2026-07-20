@@ -110,8 +110,10 @@ VaeEncodeStage::parse_pad_color_()
 namespace {
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
-   .doc = "Krea-2-Turbo / FLUX.2 model dir (VAE read from <hf_dir>/vae)",
-   .suggest_db = "models", .suggest_db_type = "krea2,flux2"},
+   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit model dir (VAE read from "
+          "<hf_dir>/vae)",
+   .suggest_db = "models",
+   .suggest_db_type = "krea2,flux2,qwen-image-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,

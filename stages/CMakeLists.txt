@@ -17,6 +17,7 @@ set(LOCAL_SOURCES
   save-image-stage.cc
   save-video-stage.cc
   scheduler-select-stage.cc
+  diffusion-conditioner-stage.cc
   text-to-image-stage.cc
   vae-decode-stage.cc
   vae-encode-stage.cc

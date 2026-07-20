@@ -13,34 +13,35 @@
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
-#include "generative-models/qwen3/metal-qwen-model.h"
-#include "generative-models/tokenizer.h"
+#include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace vpipe {
 
-// Text-to-image stage: the first half of the `krea2` (Krea-2-Turbo) split --
-// prompt -> latents. Runs the Qwen3-VL text encoder (a 12-layer tap), the
-// Krea2 12B MMDiT denoiser and the 8-step turbo FlowMatchEuler sampler on the
-// metal-compute backend, then emits the unpacked latent for the vae-decode
-// stage.
+// Text-to-image (DiT) stage: the denoiser half of the diffusion split -- it
+// consumes ready-made conditioning from a `diffusion-conditioner` stage (which
+// owns the tokenizer + text encoder + vision tower) and runs the family DiT
+// (Krea2 12B MMDiT / FLUX.2 / Qwen-Image-Edit dual-stream) + FlowMatchEuler
+// sampler on the metal-compute backend, then emits the unpacked latent for the
+// vae-decode stage. Pair it with a diffusion-conditioner on the SAME hf_dir.
 //
-//   iport0  FlexDataPayload carrying the prompt (a plain string OR an object
-//           with a "text" key, like text-chat / text-to-speech).
+//   iport0  TensorBeatPayload conditioning from the diffusion-conditioner stage
+//           (family-shaped + typed: krea2 f16 [n,12,2560]; flux2 f16
+//           [n,3*enc_hidden]; qwen-image-edit bf16 [n_real,3584]).
 //
-//   iport1  OPTIONAL FlexDataPayload negative prompt (same string-or-{text:}
-//           shape as iport0). Drives classifier-free guidance: when a negative
-//           prompt is present AND guidance_scale != 1, each denoise step runs
-//           the DiT a second time conditioned on the negative and combines
-//           v = v_neg + scale*(v_pos - v_neg). Read once per prompt when a beat
-//           is available and cached, so a single fixed negative is reused for
-//           every generation. Unwired (or scale 1) => no CFG (single DiT pass,
-//           the token-exact turbo default).
+//   iport1  OPTIONAL TensorBeatPayload neg_conditioning (same shape/type, the
+//           conditioner's oport1). Drives classifier-free guidance: when it is
+//           present AND guidance_scale != 1, each denoise step runs the DiT a
+//           second time on the negative conditioning and combines
+//           v = v_neg + scale*(v_pos - v_neg). Read per generation when a beat is
+//           available. Unwired (or scale 1) => no CFG (single DiT pass, the
+//           token-exact turbo default).
 //
 //   iport2  OPTIONAL FlexDataPayload sampler spec (from a `sampler-select`
 //           stage). Latched on the first beat and reused for every prompt;
@@ -67,8 +68,10 @@ namespace vpipe {
 //           unpacked, still whitened -- the vae-decode stage un-whitens).
 //
 // Config (FlexData object):
-//   hf_dir     (string, required) -- the Krea-2-Turbo model dir (text_encoder/,
-//                                    transformer/, tokenizer/ subfolders).
+//   hf_dir     (string, required) -- the model dir; the transformer/ subfolder's
+//                                    _class_name selects the DiT family. (The
+//                                    text_encoder/ + tokenizer/ live here too but
+//                                    are the diffusion-conditioner's concern.)
 //   dit_dir    (string, optional) -- override for the DiT (transformer) dir,
 //                                    e.g. a model-quantize'd 4/8-bit DiT; else
 //                                    <hf_dir>/transformer.
@@ -111,12 +114,6 @@ public:
   // Test-only accessors.
   const std::string& hf_dir()        const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
-#ifdef VPIPE_BUILD_APPLE_SILICON
-  // Tokenize a prompt into the compact encoder id sequence
-  // [prefix | prompt | suffix] (the 34-token system prefix is dropped after
-  // encoding). Empty if the tokenizer is not loaded. Exposed for tests.
-  std::vector<std::int32_t> tokenize_prompt(const std::string& prompt) const;
-#endif
 
 private:
   std::string _hf_dir;
@@ -133,25 +130,21 @@ private:
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 
-  std::string _family = "krea2";   // "krea2" | "flux2" (transformer _class_name)
+  // "krea2" | "flux2" | "qwen-image-edit" (from the transformer _class_name).
+  std::string _family = "krea2";
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Loaded lazily in initialize() (one DiT per the detected family); left null
-  // on failure (stage stays inert).
-  std::unique_ptr<genai::MetalQwenModel>          _encoder;
+  // on failure (stage stays inert). The text encoder + tokenizer + vision tower
+  // live in the paired diffusion-conditioner stage, not here.
   std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
   std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
-  std::unique_ptr<genai::Tokenizer>               _tokenizer;
-  metal_compute::SharedBuffer                     _embed;   // encoder embed table
-  int _enc_hidden = 2560;
-  // Text-encoder dir, retained so the encoder can be reloaded after a free.
-  std::string _enc_dir;
-  // Free the text encoder + embed table after each generation's conditioning is
-  // built (the encoder is idle through denoise + VAE decode) and lazily reload
-  // it for the next prompt, so its multi-GB footprint doesn't crowd out a large
-  // decode on a memory-bounded box. Auto-on when the DiT is streamed
-  // (memory-constrained); force with VPIPE_FLUX2_FREE_ENCODER.
-  bool _free_encoder = false;
+  std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;
+  // On a memory-bounded box (DiT + the conditioner's resident encoder can't fit
+  // a large decode too), drop the DiT's per-forward scratch after each
+  // generation so it doesn't crowd out the downstream vae-decode. Set from the
+  // same RAM heuristic that decides DiT streaming.
+  bool _release_scratch = false;
 
   // The active sampler (integrator) + scheduler (sigma schedule) specs. Seeded
   // from config (euler + simple / _steps / shift 1.15) and each overridden by
@@ -160,9 +153,6 @@ private:
   genai::FlowSchedulerSpec _scheduler_spec;
   bool                     _sampler_latched   = false;
   bool                     _scheduler_latched = false;
-  // Last negative prompt seen on iport1, cached across generations (a fixed
-  // negative is read once and reused). Empty => no CFG conditioning.
-  std::string              _negative_prompt;
 
   // A reference-image latent as it arrives on a ref-latent iport: the
   // vae-encode output, channel-first f32 [c, h, w] (FLUX.2 dit_channels @ H/16,
@@ -176,36 +166,58 @@ private:
   // available, reused for every later prompt like the negative prompt).
   RefLatent _ref[2];
 
-  // (Re)load the text encoder + embed table from _enc_dir into _encoder/_embed
-  // (also sets _enc_hidden). Returns false and logs on failure. Called by
-  // initialize() and to lazily reload after a _free_encoder free. mc non-null.
-  bool load_encoder_(metal_compute::MetalCompute* mc);
-
-  // The full prompt -> unpacked-latent forward: tokenize, encode (12-layer
-  // tap), fuse text, sample the FlowMatchEuler turbo steps and unpack. When
-  // `init_latent` is non-null (a whitened latent [z, H/8, W/8], from the
-  // vae-encode stage) with strength>0 it is an img2img run: scale_noise init,
-  // denoising only the tail steps. `init_packed` (when non-null) overrides the
-  // packed init (repro / golden). `refs` are optional reference-conditioning
-  // latents ([z_dim, h, w] channel-first) packed to DiT tokens + given per-
-  // reference RoPE frame offsets (Qwen-Image-Edit multi-reference; only steers
-  // a reference-trained checkpoint). Returns the unpacked latent [z, H/8, W/8]
-  // (whitened) or empty.
+  // The conditioning -> unpacked-latent forward: fuse the tapped text
+  // conditioning through the DiT's text tower, sample the FlowMatchEuler turbo
+  // steps and unpack. `cond` is the diffusion-conditioner's krea2 conditioning
+  // (f16 [n_real, 12, EH]); `cond_neg` is the optional negative conditioning
+  // (empty => no CFG). When `init_latent` is non-null (a whitened latent
+  // [z, H/8, W/8], from the vae-encode stage) with strength>0 it is an img2img
+  // run: scale_noise init, denoising only the tail steps. `init_packed` (when
+  // non-null) overrides the packed init (repro / golden). `refs` are optional
+  // reference-conditioning latents ([z_dim, h, w] channel-first) packed to DiT
+  // tokens + given per-reference RoPE frame offsets. Returns the unpacked latent
+  // [z, H/8, W/8] (whitened) or empty. When `emit_step` is set it is called with
+  // the unpacked latent AFTER each sampler step (same [z, H/8, W/8] format) so
+  // process() can stream it LIVE to the step_latent oport for a per-step preview.
   std::vector<float>
-  generate_(const std::string& prompt, const std::string& negative,
+  generate_(const metal_compute::SharedBuffer& cond, int n_real,
+            const metal_compute::SharedBuffer& cond_neg, int n_real_neg,
             int gen_h, int gen_w,
             const std::vector<float>* init_packed,
             const std::vector<float>* init_latent,
-            const std::vector<RefLatent>& refs) const;
+            const std::vector<RefLatent>& refs,
+            const std::function<void(const std::vector<float>&)>& emit_step =
+                {}) const;
 
-  // FLUX.2 forward: tokenize -> Qwen3 dense encoder {10,20,30}-layer tap concat
-  // ([n, 7680]) -> FLUX DiT sampler loop (no text-fusion tower, no CFG). `refs`
-  // are optional reference images (patchify-packed to DiT tokens + given per-
-  // reference RoPE T offsets inside the DiT). Returns the DiT-facing latent
-  // [dit_channels, H/16, W/16] (channel-first) or empty.
+  // FLUX.2 forward: `context` is the diffusion-conditioner's flux2 conditioning
+  // (f16 [n, 3*enc_hidden] concatenated taps) -> FLUX DiT sampler loop (no
+  // text-fusion tower, no CFG). `refs` are optional reference images
+  // (patchify-packed to DiT tokens + given per-reference RoPE T offsets inside
+  // the DiT). Returns the DiT-facing latent [dit_channels, H/16, W/16]
+  // (channel-first) or empty.
   std::vector<float>
-  generate_flux2_(const std::string& prompt, int gen_h, int gen_w,
-                  const std::vector<RefLatent>& refs) const;
+  generate_flux2_(const metal_compute::SharedBuffer& context, int n_real,
+                  int gen_h, int gen_w,
+                  const std::vector<RefLatent>& refs,
+                  const std::function<void(const std::vector<float>&)>&
+                      emit_step = {}) const;
+
+  // Qwen-Image-Edit forward: `txt` is the diffusion-conditioner's qwen-image-edit
+  // conditioning (bf16 [n_real, 3584] image-aware last-hidden, POST final-norm);
+  // run the dual-stream MetalQwenImageTransformer over pure-noise packed latents
+  // with the M2 dynamic-shift sampler and (when `txt_neg` is set + scale>1)
+  // norm-preserving true-CFG. `refs` are reference latents (vae-encode output
+  // [16, h, w]) packed 2x2 to DiT tokens + appended in their own RoPE frame
+  // bands. Returns the unpacked, whitened latent [16, H/8, W/8] (channel-first)
+  // or empty.
+  std::vector<float>
+  generate_qie_(const metal_compute::SharedBuffer& txt, int n_real,
+                const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+                int gen_h, int gen_w,
+                const std::vector<float>* init_packed,
+                const std::vector<RefLatent>& refs,
+                const std::function<void(const std::vector<float>&)>&
+                    emit_step = {}) const;
 #endif
 };
 

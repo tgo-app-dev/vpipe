@@ -77,11 +77,22 @@ class MetalFlux2Transformer {
   // just before use in forward_dit and freed after, so peak block RAM is ~one
   // block instead of the whole DiT (the embedders / modulation / final layer
   // are still preloaded). ~2-3x slower per step (weights re-read per forward).
+  //
+  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of blocks (in
+  // stream order: the double blocks first, then the single blocks) resident so
+  // pinned + running stays within that fraction of physical RAM (e.g. 0.60).
+  // Pinned blocks are read once and reused; only the tail streams -- trades
+  // spare RAM for speed. Greedy over the actual (heterogeneous) block sizes.
+  // 0 => pure streaming.
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
 
   ~MetalFlux2Transformer();
+
+  // Leading blocks pinned resident in streaming mode (double + single;
+  // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
+  int pinned_blocks() const { return _pinned_d + _pinned_s; }
 
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
   // honored within ~one block instead of a whole forward. No-op preloaded.
@@ -209,12 +220,15 @@ class MetalFlux2Transformer {
   QWeight _mod_img, _mod_txt, _mod_single;   // Flux2Modulation.linear (no bias)
   QWeight _proj_out;                                 // proj_out (hidden->out_ch)
   QWeight _norm_out_lin;      // AdaLayerNormContinuous.linear (hidden->2*hidden)
-  std::vector<DoubleBlock> _double;   // preloaded (empty when streaming)
-  std::vector<SingleBlock> _single;   // preloaded (empty when streaming)
+  std::vector<DoubleBlock> _double;   // pinned prefix (all when preloaded)
+  std::vector<SingleBlock> _single;   // pinned prefix (all when preloaded)
 
-  // Streaming mode: the double/single blocks are loaded on demand from the
-  // retained source mmap (_stream_wts) per forward and freed after use.
+  // Streaming mode: blocks past the pinned prefix (_pinned_d double, _pinned_s
+  // single) are loaded on demand from the retained source mmap (_stream_wts)
+  // per forward and freed after use.
   bool _stream_blocks = false;
+  int _pinned_d = 0;                  // pinned leading double blocks (streaming)
+  int _pinned_s = 0;                  // pinned leading single blocks (streaming)
   // Zero-copy mmap of the quantized weight tensors (codes/scales/qbias) as
   // read-only views aliasing the retained source mmap (_stream_wts), instead of
   // owned copies. The pages are clean + file-backed, so the OS can reclaim the

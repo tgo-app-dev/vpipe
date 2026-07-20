@@ -45,13 +45,20 @@ public:
 
   const StageSpec& spec() const noexcept override;
 
-  // Test / introspection accessors.
+  // Test / introspection accessors. width()/height() return the
+  // configured target; 0 means "infer from the source aspect ratio".
   int out_width()  const noexcept { return _out_w; }
   int out_height() const noexcept { return _out_h; }
   int fit_mode()   const noexcept { return _mode; }
 
+  // Resolve the configured target against a concrete source size: a
+  // dimension left at 0 (or negative) is inferred from the other so the
+  // source aspect ratio is preserved. Both configured -> used verbatim.
+  void resolve_out_dims_(int in_w, int in_h,
+                         int* out_w, int* out_h) const noexcept;
+
 private:
-  int          _out_w{}, _out_h{};
+  int          _out_w{}, _out_h{};  // 0 on either axis = infer from AR
   int          _mode{};            // 0 pad, 1 crop, 2 stretch, 3 manual
   int          _src_x{}, _src_y{}; // manual source origin
   double       _scale{};           // manual resample ratio
@@ -64,8 +71,10 @@ private:
   int _stage_in_w = 0, _stage_in_h = 0;
 
   // CPU bilinear fallback (f32, or no metal). Handles u8 and f32; matches
-  // the GPU kernel's geometry exactly for u8.
+  // the GPU kernel's geometry exactly for u8. `out_w`/`out_h` are the
+  // resolved (aspect-inferred) output dimensions.
   void cpu_resample_(const std::uint8_t* src, int in_w, int in_h,
+                     int out_w, int out_h,
                      std::uint8_t* dst, bool is_f32) const;
 };
 

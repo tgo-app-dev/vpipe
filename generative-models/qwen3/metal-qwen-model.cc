@@ -369,6 +369,7 @@ MetalQwenModel::load(const std::string& model_dir,
   // it too -- it lives in the always-loaded elementwise lib.
   m->_fn_copy = m->_lib_elt.function("copy_f16");
   m->_fn_residual = m->_lib_elt.function("residual_add_f16");
+  m->_fn_bias_add = m->_lib_elt.function("bias_add_rows_f16");
   m->_fn_mul_sigmoid = m->_lib_elt.function("mul_sigmoid_f16");
   // Mixture-of-Experts (Qwen3.5-MoE). Gather GEMVs + the shared-expert gate
   // live in affine_qmv.metal (_lib_qmv); router/combine/finalize in
@@ -1311,11 +1312,31 @@ MetalQwenModel::load(const std::string& model_dir,
                            p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
         ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
       }
-      ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
-      ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
-      ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
-      if (m->_dense && fold_norm_plus_one) {
-        add_one_f16(ly.q_norm); add_one_f16(ly.k_norm);
+      if (cfg.attention_bias) {
+        // Qwen2.5-VL (Qwen-Image-Edit encoder): q/k/v carry a bias. Fuse into
+        // one [qdo+2*kd] vector in the SAME order as the fused q|k|v weight;
+        // the forward adds it after the projection GEMM, before the head split.
+        const SharedBuffer qbb = to_f16(p + "self_attn.q_proj.bias");
+        const SharedBuffer kbb = to_f16(p + "self_attn.k_proj.bias");
+        const SharedBuffer vbb = to_f16(p + "self_attn.v_proj.bias");
+        ok = ok && !qbb.empty() && !kbb.empty() && !vbb.empty();
+        if (ok) {
+          const std::size_t nq = qbb.byte_size() / 2, nk = kbb.byte_size() / 2,
+                            nv = vbb.byte_size() / 2;
+          ly.qkv_bias = mc->make_shared_buffer((nq + nk + nv) * 2);
+          auto* d = static_cast<_Float16*>(ly.qkv_bias.contents());
+          std::memcpy(d, qbb.contents(), nq * 2);
+          std::memcpy(d + nq, kbb.contents(), nk * 2);
+          std::memcpy(d + nq + nk, vbb.contents(), nv * 2);
+        }
+      }
+      if (cfg.qk_norm) {
+        ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
+        ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
+        ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
+        if (m->_dense && fold_norm_plus_one) {
+          add_one_f16(ly.q_norm); add_one_f16(ly.k_norm);
+        }
       }
     } else {
       if (m->_dense) {
@@ -1574,19 +1595,31 @@ MetalQwenModel::load(const std::string& model_dir,
                               (2.0f * (float)i) / (float)cfg.rotary_dim);
   }
 
-  // Interleaved mROPE axis lookup over the rotary_dim/2 pairs (matches
-  // mlx-vlm apply_interleaved_mrope): T everywhere, then H overrides
-  // slots 1+3k (mrope_section[1] of them), W overrides 2+3k
-  // (mrope_section[2]). Used only by the multimodal prefill.
+  // mROPE axis lookup over the rotary_dim/2 pairs. Two layouts:
+  //  - interleaved (Qwen3-VL, mlx-vlm apply_interleaved_mrope): T everywhere,
+  //    then H overrides slots 1+3k (mrope_section[1] of them), W overrides
+  //    2+3k (mrope_section[2]).
+  //  - sectioned (Qwen2.5-VL, classic HF apply_multimodal_rotary_pos_emb):
+  //    contiguous blocks [T x sec0 | H x sec1 | W x sec2].
+  // Used only by the multimodal prefill.
   m->_mrope_axis.assign((std::size_t)half, 0);
   if (cfg.mrope_section.size() >= 3) {
-    for (int k = 0; k < cfg.mrope_section[1]; ++k) {
-      const int idx = 1 + 3 * k;
-      if (idx < half) { m->_mrope_axis[(std::size_t)idx] = 1; }
-    }
-    for (int k = 0; k < cfg.mrope_section[2]; ++k) {
-      const int idx = 2 + 3 * k;
-      if (idx < half) { m->_mrope_axis[(std::size_t)idx] = 2; }
+    if (cfg.mrope_interleaved) {
+      for (int k = 0; k < cfg.mrope_section[1]; ++k) {
+        const int idx = 1 + 3 * k;
+        if (idx < half) { m->_mrope_axis[(std::size_t)idx] = 1; }
+      }
+      for (int k = 0; k < cfg.mrope_section[2]; ++k) {
+        const int idx = 2 + 3 * k;
+        if (idx < half) { m->_mrope_axis[(std::size_t)idx] = 2; }
+      }
+    } else {
+      int off = 0;
+      for (std::uint8_t axis = 0; axis < 3; ++axis) {
+        for (int k = 0; k < cfg.mrope_section[axis] && off < half; ++k) {
+          m->_mrope_axis[(std::size_t)off++] = axis;
+        }
+      }
     }
   }
 
@@ -4916,6 +4949,58 @@ MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
   return taps;
 }
 
+// Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
+// row 0=T,1=H,2=W) -- for the image-aware multimodal prefill (Qwen-Image-Edit
+// conditioning): the DiT reads the LAST-layer hidden of a text+vision-spliced
+// sequence, which must use mROPE (image tokens get 2-D grid positions).
+metal_compute::SharedBuffer
+MetalQwenModel::forward_embeddings_taps_mrope(
+    ContextId cid, const SharedBuffer& x, int n,
+    const std::vector<std::int32_t>& position_ids,
+    const std::vector<int>& tap_layers)
+{
+  const int H = _cfg.hidden;
+  if (n <= 0 || tap_layers.empty() ||
+      x.byte_size() < (std::size_t)n * H * 2 ||
+      position_ids.size() < (std::size_t)3 * n) {
+    return {};
+  }
+  const bool bf16 = _cfg.use_bf16;
+  auto store_elt = [&](float f) -> std::uint16_t {
+    if (bf16) { return f32_to_bf16_(f); }
+    _Float16 h = (_Float16)f; std::uint16_t b; std::memcpy(&b, &h, 2); return b;
+  };
+  // mROPE cos/sin [n, rotary_dim] (cat([f,f]) layout: [d]==[d+half]).
+  const int rd = _cfg.rotary_dim, half = rd / 2;
+  const auto* invf = static_cast<const float*>(_inv_freq.contents());
+  SharedBuffer cosb = _mc->make_shared_buffer((std::size_t)n * rd * 2);
+  SharedBuffer sinb = _mc->make_shared_buffer((std::size_t)n * rd * 2);
+  auto* cp = static_cast<std::uint16_t*>(cosb.contents());
+  auto* sp = static_cast<std::uint16_t*>(sinb.contents());
+  for (int t = 0; t < n; ++t) {
+    for (int d = 0; d < half; ++d) {
+      const int axis = (d < (int)_mrope_axis.size()) ? _mrope_axis[d] : 0;
+      const float pos = (float)position_ids[(std::size_t)axis * n + t];
+      const float ang = pos * invf[d];
+      const std::uint16_t cc = store_elt(std::cos(ang));
+      const std::uint16_t ss = store_elt(std::sin(ang));
+      cp[(std::size_t)t * rd + d] = cc;
+      cp[(std::size_t)t * rd + half + d] = cc;
+      sp[(std::size_t)t * rd + d] = ss;
+      sp[(std::size_t)t * rd + half + d] = ss;
+    }
+  }
+  SharedBuffer taps =
+      _mc->make_shared_buffer((std::size_t)tap_layers.size() * n * H * 2);
+  if (taps.empty()) { return {}; }
+  SharedBuffer hidden;
+  forward_chunk_(cid, x, n, &cosb, &sinb,
+                 /*verify_all=*/false, /*preds_out=*/nullptr,
+                 /*return_hidden=*/true, &hidden, /*allhidden_out=*/nullptr,
+                 &tap_layers, &taps);
+  return taps;
+}
+
 void
 MetalQwenModel::calib_begin()
 {
@@ -5937,6 +6022,16 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         } else {
           qmm(ly.qw, ly.qs, ly.qb, hn, qfull, H, Nfqkv);
         }
+        if (c.attention_bias && !ly.qkv_bias.empty()) {
+          // Qwen2.5-VL: add the fused q|k|v bias over all n rows, before the
+          // head split. bias_add_rows_f16: y[g] += bias[g % Nfqkv].
+          enc.set_function(_fn_bias_add);
+          enc.set_buffer(0, qfull);
+          enc.set_buffer(1, ly.qkv_bias);
+          enc.set_constant(2, Nfqkv);
+          enc.set_constant(3, (unsigned)(n * Nfqkv));
+          enc.dispatch({(unsigned)(n * Nfqkv), 1, 1}, {256, 1, 1});
+        }
         if (gate) {
           // q is the gated [n_heads, 2*head_dim] front block; block-strided
           // read extracts q / gate straight from the fused buffer.
@@ -5949,8 +6044,12 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         // k/v are contiguous tails -> plain row-strided slice into kbuf/vbuf.
         hslice(qfull, 0, kbuf, 0, n, Nfqkv, kd, qdo);
         hslice(qfull, 0, vbuf, 0, n, Nfqkv, kd, qdo + kd);
-        rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
-        rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        // Qwen3 / Qwen3-VL: per-head q/k RMSNorm. Qwen2.5-VL has none (qk_norm
+        // false) -> RoPE runs on the raw projections.
+        if (c.qk_norm) {
+          rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
+          rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        }
         transpose(q3, qt, n, Hq);       // [n,Hq,D] -> [Hq,n,D]
         transpose(kbuf, kt, n, Hkv);
         transpose(vbuf, vt, n, Hkv);
@@ -6313,7 +6412,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.dispatch({(unsigned)(n * ffn), 1, 1}, {256, 1, 1});
         qmm(ly.dw, ly.ds, ly.db, sg, ao, ffn, H);
         residual(x, ao, x, n * H);
-      } else if (L + 1 < c.n_layers || verify_all) {
+      } else if (L + 1 < c.n_layers || verify_all || taps_out != nullptr) {
+        // The affine-uniform path prunes the LAST layer's MLP (decode reads
+        // only the last row's logits). The tap path (encoder conditioning)
+        // reads ALL rows of the tapped layers, so run the full MLP when tapping.
         rms(x, 0, ly.post_ln, hn, 0, n, H);
         if (_calib_on) { tap(hn, ctg[(std::size_t)L], n * H); }  // gate/up in
         if (mma_mlp) {

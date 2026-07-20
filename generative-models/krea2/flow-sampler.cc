@@ -54,6 +54,15 @@ FlowSchedulerSpec::to_flex() const
   o.insert_or_assign("shift", FlexData::make_real(shift));
   o.insert_or_assign("shift_type", FlexData::make_string(shift_type));
   o.insert_or_assign("rho", FlexData::make_real(rho));
+  if (dynamic_shift) {
+    o.insert_or_assign("dynamic_shift", FlexData::make_bool(true));
+    o.insert_or_assign("base_shift", FlexData::make_real(base_shift));
+    o.insert_or_assign("max_shift", FlexData::make_real(max_shift));
+    o.insert_or_assign("shift_terminal", FlexData::make_real(shift_terminal));
+    o.insert_or_assign("base_seq", FlexData::make_int(base_seq));
+    o.insert_or_assign("max_seq", FlexData::make_int(max_seq));
+    o.insert_or_assign("num_train", FlexData::make_int(num_train));
+  }
   return fd;
 }
 
@@ -73,6 +82,27 @@ FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
         std::string(o.at("shift_type").as_string(s.shift_type.c_str()));
   }
   if (o.contains("rho")) { s.rho = o.at("rho").as_real(s.rho); }
+  if (o.contains("dynamic_shift")) {
+    s.dynamic_shift = o.at("dynamic_shift").as_bool(false);
+  }
+  if (o.contains("base_shift")) {
+    s.base_shift = o.at("base_shift").as_real(s.base_shift);
+  }
+  if (o.contains("max_shift")) {
+    s.max_shift = o.at("max_shift").as_real(s.max_shift);
+  }
+  if (o.contains("shift_terminal")) {
+    s.shift_terminal = o.at("shift_terminal").as_real(s.shift_terminal);
+  }
+  if (o.contains("base_seq")) {
+    s.base_seq = (int)o.at("base_seq").as_int(s.base_seq);
+  }
+  if (o.contains("max_seq")) {
+    s.max_seq = (int)o.at("max_seq").as_int(s.max_seq);
+  }
+  if (o.contains("num_train")) {
+    s.num_train = (int)o.at("num_train").as_int(s.num_train);
+  }
   if (s.steps < 1) { s.steps = 1; }
   if (s.type != "simple" && s.type != "karras" && s.type != "exponential") {
     if (err != nullptr) {
@@ -90,8 +120,52 @@ FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
 std::vector<double>
 FlowSchedulerSpec::sigmas() const
 {
+  return sigmas(img_seq_len);
+}
+
+std::vector<double>
+FlowSchedulerSpec::sigmas(int img_seq_len_override) const
+{
   const int S = steps < 1 ? 1 : steps;
   const bool expo = shift_type != "linear";
+
+  // ---- FlowMatchEuler dynamic shifting (Qwen-Image / SD3) --------------
+  // Reproduces diffusers FlowMatchEulerDiscreteScheduler.set_timesteps with
+  // use_dynamic_shifting as the QwenImageEditPlus pipeline calls it: the base
+  // sigmas the pipeline passes are linspace(1, 1/steps, steps) (NOT the
+  // scheduler's internal 1/num_train default); mu = calculate_shift(
+  // image_seq_len); each base sigma time-shifted by mu; then
+  // stretch_shift_to_terminal so the last nonzero sigma == shift_terminal.
+  // (num_train only maps sigma->t as t=sigma*num_train downstream; vpipe feeds
+  // the DiT `timestep` = sigma directly, so it does not enter the schedule.)
+  if (dynamic_shift) {
+    // calculate_shift(image_seq_len, base_seq, max_seq, base_shift, max_shift)
+    const double denom = (double)(max_seq - base_seq);
+    const double m = denom != 0.0 ? (max_shift - base_shift) / denom : 0.0;
+    const double b = base_shift - m * (double)base_seq;
+    const double mu = (double)img_seq_len_override * m + b;
+
+    std::vector<double> sig((std::size_t)S + 1);
+    for (int i = 0; i < S; ++i) {
+      const double r = (S == 1) ? 0.0 : (double)i / (double)(S - 1);
+      // base = linspace(1.0, 1/S, S) -- the pipeline's explicit sigmas arg.
+      const double base = 1.0 + r * ((1.0 / (double)S) - 1.0);
+      sig[(std::size_t)i] = time_shift(base, mu, expo);
+    }
+    // stretch_shift_to_terminal: 1 - (1 - sig) / ((1 - sig[S-1])/(1 - term)).
+    if (shift_terminal > 0.0 && S >= 1) {
+      const double last_omz = 1.0 - sig[(std::size_t)S - 1];
+      const double scale = last_omz / (1.0 - shift_terminal);
+      if (scale != 0.0) {
+        for (int i = 0; i < S; ++i) {
+          sig[(std::size_t)i] = 1.0 - (1.0 - sig[(std::size_t)i]) / scale;
+        }
+      }
+    }
+    sig[(std::size_t)S] = 0.0;   // terminal
+    return sig;
+  }
+
   const double smax = 1.0, smin = 1.0 / (double)S;
 
   std::vector<double> base((std::size_t)S);

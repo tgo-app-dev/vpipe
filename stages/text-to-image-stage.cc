@@ -8,8 +8,8 @@
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
-#include "generative-models/context-manager.h"
-#include "generative-models/llama3/metal-llama-weights.h"
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
 #endif
 
 #include <sys/sysctl.h>
@@ -31,36 +31,22 @@ namespace vpipe {
 
 namespace {
 
-// The Krea-2 prompt template (pipeline_krea2.py): the DiT is conditioned on
-// [prefix | prompt | suffix], with the 34-token system prefix DROPPED after
-// encoding. Verified compact-equivalent to the padded+masked HF path.
-constexpr const char* kPrefix =
-    "<|im_start|>system\nDescribe the image by detailing the color, shape, "
-    "size, texture, quantity, text, spatial relationships of the objects and "
-    "background:<|im_end|>\n<|im_start|>user\n";
-constexpr const char* kSuffix = "<|im_end|>\n<|im_start|>assistant\n";
-constexpr int kDropPrefix = 34;          // prompt_template_encode_start_idx
-const int kSelectLayers[12] = {2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35};
-
-// True when `dir` looks like a transformer-only Krea2 DiT (the quantize
-// output) rather than a full Krea-2-Turbo pipeline: it has a diffusers
-// config.json whose _class_name is the DiT model, and lacks the tokenizer
-// sub-dir. Used only to sharpen the error message when hf_dir is misset.
-bool
-looks_like_bare_dit_(const std::string& dir)
+// The Qwen-Image-Edit DiT runs bf16 (its residual stream exceeds f16's 65504);
+// its packed-latent + velocity buffers are raw bf16, not _Float16.
+inline std::uint16_t
+f32_to_bf16_(float f)
 {
-  namespace fs = std::filesystem;
-  if (fs::exists(fs::path(dir) / "tokenizer" / "tokenizer.json")) {
-    return false;
-  }
-  std::ifstream in(fs::path(dir) / "config.json");
-  if (!in) { return false; }
-  FlexData fd = FlexData::from_json(in);
-  if (!fd.is_object()) { return false; }
-  auto obj = fd.as_object();
-  if (!obj.contains("_class_name")) { return false; }
-  const std::string cls(obj.at("_class_name").as_string(""));
-  return cls.find("Transformer") != std::string::npos;
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+inline float
+bf16_to_f32_(std::uint16_t b)
+{
+  std::uint32_t u = (std::uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
 }
 
 const ConfigKey kAttrs[] = {
@@ -68,10 +54,11 @@ const ConfigKey kAttrs[] = {
    .doc = "Krea-2-Turbo / FLUX.2 model dir (text_encoder/, transformer/, "
           "tokenizer/); an original or model-quantize'd (self-contained) "
           "pipeline",
-   .suggest_db = "models", .suggest_db_type = "krea2,flux2"},
+   .suggest_db = "models", .suggest_db_type = "krea2,flux2,qwen-image-edit"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
-   .suggest_db = "models", .suggest_db_type = "krea2-dit,flux2-dit"},
+   .suggest_db = "models",
+   .suggest_db_type = "krea2-dit,flux2-dit,qwen-image-edit-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
           "(the init latent arrives on the `latent` iport from vae-encode)"},
@@ -100,23 +87,25 @@ const ConfigKey kAttrs[] = {
           "false; env VPIPE_I8_GEMM overrides"},
 };
 const PortSpec kIports[] = {
-  {.name = "prompt", .doc = "prompt text (FlexData string or {text: ...})",
-   .type = &typeid(FlexDataPayload),
-   .tags = "text", .clock_group = 0},
-  {.name = "negative", .doc = "OPTIONAL negative prompt (FlexData string or "
-                              "{text: ...}) for classifier-free guidance",
-   .type = &typeid(FlexDataPayload),
-   .tags = "text", .clock_group = 0},
+  {.name = "conditioning", .doc = "conditioning tensor from a diffusion-"
+                                  "conditioner stage (family-shaped + typed)",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "conditioning", .clock_group = 0},
+  {.name = "neg_conditioning", .doc = "OPTIONAL negative conditioning (the "
+                                      "conditioner's oport1) for classifier-free "
+                                      "guidance",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "conditioning", .clock_group = 0},
   {.name = "sampler", .doc = "OPTIONAL sampler spec FlexData (sampler-select)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler", .doc = "OPTIONAL scheduler spec FlexData (scheduler-select)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0", .doc = "OPTIONAL reference latent 0 (channel-first "
-                                 "f32 from vae-encode); FLUX.2 conditioning / "
-                                 "Krea-2 img2img init",
+                                 "f32 from vae-encode); FLUX.2/QIE conditioning "
+                                 "/ Krea-2 img2img init",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_latent1", .doc = "OPTIONAL reference latent 1 (channel-first "
-                                 "f32 from vae-encode); FLUX.2 2nd reference "
+                                 "f32 from vae-encode); FLUX.2/QIE 2nd reference "
                                  "(distinct RoPE position); ignored by Krea-2",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
@@ -125,12 +114,19 @@ const PortSpec kOports[] = {
    .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
+  {.name = "step_latent",
+   .doc = "OPTIONAL per-denoise-step latent (one beat per sampler step, SAME "
+          "format as `latent`) -- connect a vae-decode here to visualize the "
+          "denoising progression for debugging. Only emitted when connected.",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "latent", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "text-to-image",
-  .doc       = "Krea-2-Turbo text-to-image: prompt -> Qwen3-VL 12-layer encode "
-               "-> 12B MMDiT -> 8-step FlowMatchEuler -> latent, on the metal-"
-               "compute backend. First half of the krea2 split (feed vae-decode).",
+  .doc       = "Diffusion DiT denoiser: conditioning (from a diffusion-"
+               "conditioner stage) -> family MMDiT -> FlowMatchEuler -> latent, "
+               "on the metal-compute backend. The denoiser half of the split "
+               "(feed vae-decode).",
   .display_name = "Text to Image",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -200,79 +196,6 @@ TextToImageStage::spec() const noexcept
 
 namespace {
 
-// The Krea-2 text encoder: a dense Qwen3-VL decoder (36L / 2560 / 32q-8kv /
-// hd128 / ffn9728, q/k-norm, STANDARD RMSNorm, mRoPE theta 5e6), run on
-// MetalQwenModel as raw bf16 with the per-layer tap.
-genai::MetalQwenModel::Config
-encoder_config_()
-{
-  genai::MetalQwenModel::Config c;
-  c.n_layers           = 36;
-  c.hidden             = 2560;
-  c.n_heads            = 32;
-  c.n_kv_heads         = 8;
-  c.head_dim           = 128;
-  c.ffn_inner          = 9728;
-  c.vocab              = 151936;
-  c.rope_theta         = 5.0e6f;
-  c.rms_eps            = 1e-6f;
-  c.rotary_dim         = 128;
-  c.full_attn_interval = 1;
-  c.tie_embeddings     = true;
-  c.use_bf16           = true;
-  c.dense              = true;
-  c.zero_centered_norm = false;
-  c.attn_output_gate   = false;
-  c.backbone_only      = true;      // we host-gather the embeddings ourselves
-  c.weight_prefix      = "language_model.";
-  c.model_seg          = "";
-  c.max_seq            = 1024;
-  c.page_tokens        = 256;
-  return c;
-}
-
-// FLUX.2 klein text encoder: a plain DENSE Qwen3ForCausalLM under the "model."
-// prefix (not the Qwen3-VL "language_model."). Sized from the encoder's
-// config.json so both klein sizes work off one path -- the 4B taps a ~4B Qwen3
-// (36L / 2560), the 9B an 8B Qwen3 (larger depth/width). Absent keys keep the
-// base (4B) default.
-genai::MetalQwenModel::Config
-encoder_config_flux2_(const std::string& enc_dir)
-{
-  genai::MetalQwenModel::Config c = encoder_config_();
-  c.rope_theta    = 1.0e6f;
-  c.weight_prefix = "model.";
-  namespace fs = std::filesystem;
-  std::ifstream in(fs::path(enc_dir) / "config.json");
-  if (in) {
-    FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto o = fd.as_object();
-      auto geti = [&](const char* k, int cur) -> int {
-        return o.contains(k) ? (int)o.at(k).as_int(cur) : cur;
-      };
-      auto getf = [&](const char* k, float cur) -> float {
-        return o.contains(k) ? (float)o.at(k).as_real(cur) : cur;
-      };
-      c.n_layers    = geti("num_hidden_layers", c.n_layers);
-      c.hidden      = geti("hidden_size", c.hidden);
-      c.n_heads     = geti("num_attention_heads", c.n_heads);
-      c.n_kv_heads  = geti("num_key_value_heads", c.n_kv_heads);
-      c.head_dim    = geti("head_dim",
-                           c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
-      c.rotary_dim  = c.head_dim;
-      c.ffn_inner   = geti("intermediate_size", c.ffn_inner);
-      c.vocab       = geti("vocab_size", c.vocab);
-      c.rope_theta  = getf("rope_theta", c.rope_theta);
-      c.rms_eps     = getf("rms_norm_eps", c.rms_eps);
-      if (o.contains("tie_word_embeddings")) {
-        c.tie_embeddings = o.at("tie_word_embeddings").as_bool(c.tie_embeddings);
-      }
-    }
-  }
-  return c;
-}
-
 // FLUX.2 empirical flow-shift mu (diffusers Flux2Pipeline.compute_empirical_mu):
 // the sigma time-shift is resolution- AND step-dependent (a fixed shift washes
 // out at other resolutions -> grey). `image_seq_len` is the packed image token
@@ -293,7 +216,8 @@ flux2_empirical_mu_(int image_seq_len, int num_steps)
 }
 
 // The transformer family from <root>/transformer/config.json `_class_name`:
-// "Flux2Transformer2DModel" -> "flux2"; else "krea2".
+// "Flux2Transformer2DModel" -> "flux2"; "QwenImageTransformer2DModel" ->
+// "qwen-image-edit"; else "krea2".
 std::string
 t2i_family_(const std::string& transformer_dir)
 {
@@ -303,10 +227,10 @@ t2i_family_(const std::string& transformer_dir)
     FlexData fd = FlexData::from_json(in);
     if (fd.is_object()) {
       auto obj = fd.as_object();
-      if (obj.contains("_class_name") &&
-          std::string(obj.at("_class_name").as_string("")) ==
-              "Flux2Transformer2DModel") {
-        return "flux2";
+      if (obj.contains("_class_name")) {
+        const std::string cls(obj.at("_class_name").as_string(""));
+        if (cls == "Flux2Transformer2DModel") { return "flux2"; }
+        if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
       }
     }
   }
@@ -341,70 +265,6 @@ dir_weights_bytes_(const std::string& dir)
 
 }  // namespace
 
-bool
-TextToImageStage::load_encoder_(metal_compute::MetalCompute* mc)
-{
-  namespace fs = std::filesystem;
-  const std::string& enc_dir = _enc_dir;
-  if (mc == nullptr || enc_dir.empty()) { return false; }
-  // The encoder may be affine-quantized (model-quantize target=text_encoder).
-  // The loader auto-detects quantized-vs-dense weights but needs the bit-width
-  // to pick the w4g64 vs w8g64 kernel, so read it from the encoder's
-  // config.json quantization block (absent => dense bf16, quant_bits unused).
-  genai::MetalQwenModel::Config ecfg =
-      _family == "flux2" ? encoder_config_flux2_(enc_dir) : encoder_config_();
-  _enc_hidden = ecfg.hidden;
-  {
-    std::ifstream in(fs::path(enc_dir) / "config.json");
-    if (in) {
-      FlexData fd = FlexData::from_json(in);
-      if (fd.is_object()) {
-        auto o = fd.as_object();
-        if (o.contains("quantization")) {
-          FlexData q = o.at("quantization");
-          if (q.is_object()) {
-            auto qo = q.as_object();
-            const int b = qo.contains("bits")
-                ? (int)qo.at("bits").as_int(0) : 0;
-            if (b == 4 || b == 8) {
-              ecfg.quant_bits = b;
-              session()->log_debug(fmt(
-                  "TextToImageStage('{}'): text encoder is {}-bit quantized",
-                  this->id(), b));
-            }
-          }
-        }
-      }
-    }
-  }
-  session()->info(fmt(
-      "TextToImageStage('{}'): loading {} text encoder from '{}'",
-      this->id(), _family == "flux2" ? "Qwen3 (dense)" : "Qwen3-VL", enc_dir));
-  _encoder = genai::MetalQwenModel::load(enc_dir, mc, ecfg);
-  if (!_encoder) {
-    session()->error(fmt(
-        "TextToImageStage('{}'): failed to load text encoder from '{}'; inert",
-        this->id(), enc_dir));
-    return false;
-  }
-  // The embed table (backbone_only skips the model's embed muxer, so we gather
-  // input rows ourselves) -- kept resident for per-prompt gathers.
-  auto wts = genai::MetalLlamaWeights::open_model(enc_dir);
-  if (wts.has_value()) {
-    _embed = wts->load(_family == "flux2"
-                           ? "model.embed_tokens.weight"
-                           : "language_model.embed_tokens.weight", mc);
-  }
-  if (_embed.empty()) {
-    session()->error(fmt(
-        "TextToImageStage('{}'): failed to load the encoder embed table; inert",
-        this->id()));
-    _encoder.reset();
-    return false;
-  }
-  return true;
-}
-
 Job
 TextToImageStage::initialize(RuntimeContext& ctx)
 {
@@ -419,49 +279,30 @@ TextToImageStage::initialize(RuntimeContext& ctx)
   }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  // The text encoder lives in the paired diffusion-conditioner stage, but its
+  // weights are resident in the SAME process while the DiT runs, so the
+  // encoder-coexistence streaming heuristics below still budget for it.
   const std::string enc_dir = (fs::path(root) / "text_encoder").string();
   const std::string dit_dir = _dit_dir.empty()
       ? (fs::path(root) / "transformer").string()
       : resolve_model_dir(session(), _models_db, _dit_dir);
-  const std::string tok_path =
-      (fs::path(root) / "tokenizer" / "tokenizer.json").string();
   _family = t2i_family_(dit_dir);
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): init root='{}' enc='{}' dit='{}' "
+      "TextToImageStage('{}'): init root='{}' dit='{}' family={} "
       "(default {}x{}, {} steps, seed {}, strength {})", this->id(), root,
-      enc_dir, dit_dir, _width, _height, _steps, _seed, _strength));
-
-  _tokenizer = genai::Tokenizer::from_huggingface_json(tok_path, session());
-  if (!_tokenizer) {
-    session()->error(fmt(
-        "TextToImageStage('{}'): failed to load tokenizer from '{}'; inert",
-        this->id(), tok_path));
-    // Common mistake: hf_dir points at a quantized DiT (transformer-only)
-    // instead of the full Krea-2-Turbo pipeline. Detect it and steer the
-    // user to the dit_dir override.
-    if (looks_like_bare_dit_(root)) {
-      session()->error(fmt(
-          "TextToImageStage('{}'): '{}' looks like a transformer-only DiT "
-          "(no tokenizer/text_encoder/vae). Set hf_dir to the full "
-          "Krea-2-Turbo model and pass this dir as dit_dir instead.",
-          this->id(), root));
-    }
-    co_return;
-  }
-
-  // Load the text encoder + embed table (see load_encoder_; reloaded lazily
-  // after a _free_encoder free between generations).
-  _enc_dir = enc_dir;
-  if (!load_encoder_(mc)) { co_return; }
+      dit_dir, _family, _width, _height, _steps, _seed, _strength));
 
   session()->info(fmt(
       "TextToImageStage('{}'): loading {} DiT from '{}'", this->id(),
-      _family == "flux2" ? "FLUX.2" : "Krea2 MMDiT", dit_dir));
+      _family == "flux2" ? "FLUX.2"
+      : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
+      : "Krea2 MMDiT", dit_dir));
   if (_family == "flux2") {
     // Stream the DiT blocks when the box can't hold encoder + DiT together
     // (e.g. the 18 GB 9B DiT + a 16 GB encoder on a 16/32 GB box); ~2-3x slower
     // per step but bounds peak RAM to ~one block. VPIPE_FLUX2_STREAM forces it.
     bool stream_blocks;
+    double pin_frac = 0.0;
     {
       const std::size_t dit_b = dir_weights_bytes_(dit_dir);
       const std::size_t enc_b = dir_weights_bytes_(enc_dir);
@@ -471,26 +312,81 @@ TextToImageStage::initialize(RuntimeContext& ctx)
       if (const char* e = std::getenv("VPIPE_FLUX2_STREAM")) {
         stream_blocks = (std::atoi(e) != 0);
       }
+      // Pin as many leading blocks as fit alongside the resident encoder (see
+      // the Qwen-Image-Edit branch below for the encoder-coexistence rationale).
+      if (stream_blocks && ram > enc_b + (5ull << 30)) {
+        pin_frac = std::min(0.60,
+            double(ram - enc_b - (5ull << 30)) / double(ram));
+      }
       session()->log_debug(fmt(
           "TextToImageStage('{}'): FLUX.2 DiT {} GB + enc {} GB + 6 GB vs {} GB "
           "RAM -> {}", this->id(), dit_b >> 30, enc_b >> 30, ram >> 30,
           stream_blocks ? "STREAM blocks" : "PRELOAD"));
     }
+    if (const char* e = std::getenv("VPIPE_FLUX2_PIN_FRAC")) {
+      pin_frac = std::atof(e);
+    }
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
     _flux2_dit = genai::MetalFlux2Transformer::load(
-        dit_dir, mc, fcfg, stream_blocks);
+        dit_dir, mc, fcfg, stream_blocks, pin_frac);
     if (!_flux2_dit) {
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
           "inert", this->id(), dit_dir));
-      _encoder.reset();
       co_return;
     }
-    // When the DiT had to stream (box can't hold encoder + DiT together), also
-    // free the idle encoder around each generation so it doesn't crowd out a
-    // large VAE decode; reloaded lazily per prompt (see load_encoder_).
-    _free_encoder = stream_blocks;
+    // When the DiT had to stream (box can't hold encoder + DiT together), drop
+    // the DiT's per-forward scratch after each generation so it doesn't crowd
+    // out a large downstream VAE decode.
+    _release_scratch = stream_blocks;
+  } else if (_family == "qwen-image-edit") {
+    // Dual-stream Qwen-Image-Edit DiT (20B). Stream the blocks when the box
+    // can't hold encoder + DiT together (else it can't run on a 16 GB box), and
+    // PIN as many leading blocks resident as fit ALONGSIDE the per-prompt
+    // encoder: pinned + encoder + headroom <= RAM. The encoder is reloaded for
+    // each prompt's conditioning and stays resident while the DiT weights do,
+    // so -- unlike the calibration collector, which frees the encoder before
+    // loading the DiT and can pin 60% -- the stage must budget around it. On a
+    // 16 GB box with the ~14 GB bf16 encoder that leaves no room (pin 0 => pure
+    // streaming, ~one block resident); a roomier box pins more. Pinned blocks
+    // are read once + reused, only the tail streams. VPIPE_QIE_STREAM /
+    // VPIPE_QIE_PIN_FRAC override.
+    const std::size_t dit_b = dir_weights_bytes_(dit_dir);
+    const std::size_t enc_b = dir_weights_bytes_(enc_dir);
+    const std::size_t ram = phys_ram_();
+    bool stream_blocks = (ram != 0) && (ram < dit_b + enc_b + (6ull << 30));
+    if (const char* e = std::getenv("VPIPE_QIE_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    double pin_frac = 0.0;
+    if (stream_blocks && ram > enc_b + (5ull << 30)) {
+      pin_frac = std::min(0.60,
+          double(ram - enc_b - (5ull << 30)) / double(ram));
+    }
+    if (const char* e = std::getenv("VPIPE_QIE_PIN_FRAC")) {
+      pin_frac = std::atof(e);
+    }
+    session()->log_debug(fmt(
+        "TextToImageStage('{}'): Qwen-Image-Edit DiT {} GB + enc {} GB + 6 GB "
+        "vs {} GB RAM -> {}", this->id(), dit_b >> 30, enc_b >> 30, ram >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    genai::MetalQwenImageTransformer::Config qcfg;
+    _qie_dit = genai::MetalQwenImageTransformer::load(dit_dir, mc, qcfg,
+                                                      stream_blocks, pin_frac);
+    if (!_qie_dit) {
+      session()->error(fmt(
+          "TextToImageStage('{}'): failed to load the Qwen-Image-Edit DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      co_return;
+    }
+    if (stream_blocks) {
+      session()->info(fmt(
+          "TextToImageStage('{}'): Qwen-Image-Edit DiT streaming, pinned {} of "
+          "{} blocks resident", this->id(), _qie_dit->pinned_blocks(),
+          qcfg.n_layers));
+    }
+    _release_scratch = stream_blocks;
   } else {
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
@@ -499,74 +395,44 @@ TextToImageStage::initialize(RuntimeContext& ctx)
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the DiT from '{}'; inert",
           this->id(), dit_dir));
-      _encoder.reset();
       co_return;
     }
     // The Krea-2 DiT mmaps its quantized weights (evictable under GPU memory
-    // pressure), but the dense text encoder is copied into dirty, non-
-    // reclaimable buffers. When the box can't hold encoder + DiT + a large VAE
-    // decode at once, free the idle encoder around each generation (reloaded
-    // lazily next prompt) so its multi-GB footprint doesn't crowd out the
-    // downstream vae-decode stage's working set -- the same reclaim the FLUX.2
-    // path does when it streams. VPIPE_FLUX2_FREE_ENCODER overrides below.
+    // pressure), but the conditioner's dense text encoder is copied into dirty,
+    // non-reclaimable buffers resident in this process. When the box can't hold
+    // encoder + DiT + a large VAE decode at once, drop the DiT's per-forward
+    // scratch after each generation so its working set doesn't crowd out the
+    // downstream vae-decode stage.
     const std::size_t dit_b = dir_weights_bytes_(dit_dir);
     const std::size_t enc_b = dir_weights_bytes_(enc_dir);
     const std::size_t ram = phys_ram_();
     const std::size_t need = dit_b + enc_b + (6ull << 30);   // +6 GB headroom
-    _free_encoder = (ram != 0) && (ram < need);
+    _release_scratch = (ram != 0) && (ram < need);
     session()->log_debug(fmt(
         "TextToImageStage('{}'): Krea2 DiT {} GB + enc {} GB + 6 GB vs {} GB "
-        "RAM -> {} idle encoder", this->id(), dit_b >> 30, enc_b >> 30,
-        ram >> 30, _free_encoder ? "FREE" : "keep"));
-  }
-  if (const char* e = std::getenv("VPIPE_FLUX2_FREE_ENCODER")) {
-    _free_encoder = (std::atoi(e) != 0);
+        "RAM -> {} DiT scratch", this->id(), dit_b >> 30, enc_b >> 30,
+        ram >> 30, _release_scratch ? "RELEASE" : "keep"));
   }
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): {} DiT + encoder ready (encoder hidden {}){}",
-      this->id(), _family, _enc_hidden,
-      _strength > 0.0 ? "; img2img init latent expected on the `latent` iport"
+      "TextToImageStage('{}'): {} DiT ready{}",
+      this->id(), _family,
+      _strength > 0.0 ? "; img2img init latent expected on a ref_latent iport"
                       : ""));
 }
 
 namespace {
 
-// Encode a template string that embeds ChatML special-token markers
-// (<|im_start|> / <|im_end|>). genai::Tokenizer::encode() byte-encodes literal
-// text and does NOT isolate special tokens, so split at the markers, encode
-// each plain-text run, and splice the markers' ids via special_token_id() --
-// matching the HF fast tokenizer (special tokens are isolated, each text run
-// BPE-encoded independently).
-std::vector<std::int32_t>
-encode_with_specials_(const genai::Tokenizer& tok, const std::string& text)
+// Copy a conditioning TensorBeat (2 bytes/elt, f16 or bf16) into a metal
+// SharedBuffer for the DiT. The element type is family-fixed and interpreted by
+// the DiT (f16 for krea2/flux2, bf16 for qwen-image-edit); here it is opaque
+// bytes. Empty on allocation failure.
+metal_compute::SharedBuffer
+cond_to_shared_(metal_compute::MetalCompute* mc, const TensorBeatPayload& tb)
 {
-  static const char* kMarkers[] = {"<|im_start|>", "<|im_end|>"};
-  std::vector<std::int32_t> out;
-  std::size_t pos = 0;
-  while (pos < text.size()) {
-    std::size_t best = std::string::npos;
-    int which = -1;
-    for (int mi = 0; mi < 2; ++mi) {
-      const std::size_t f = text.find(kMarkers[mi], pos);
-      if (f != std::string::npos && (best == std::string::npos || f < best)) {
-        best = f; which = mi;
-      }
-    }
-    if (which < 0) {
-      const std::vector<std::int32_t> seg = tok.encode(text.substr(pos));
-      out.insert(out.end(), seg.begin(), seg.end());
-      break;
-    }
-    if (best > pos) {
-      const std::vector<std::int32_t> seg =
-          tok.encode(text.substr(pos, best - pos));
-      out.insert(out.end(), seg.begin(), seg.end());
-    }
-    const std::int32_t sid = tok.special_token_id(kMarkers[which]);
-    if (sid >= 0) { out.push_back(sid); }
-    pos = best + std::strlen(kMarkers[which]);
-  }
-  return out;
+  const auto bytes = tb.materialize_contiguous();
+  metal_compute::SharedBuffer b = mc->make_shared_buffer(bytes.size());
+  if (!b.empty()) { std::memcpy(b.contents(), bytes.data(), bytes.size()); }
+  return b;
 }
 
 // Throttled in-place denoise progress bar, mirroring the model-quantize
@@ -593,20 +459,15 @@ denoise_progress_(UiTextStream* bar, int done, int total, int& last_pct)
 
 }  // namespace
 
-std::vector<std::int32_t>
-TextToImageStage::tokenize_prompt(const std::string& prompt) const
-{
-  if (!_tokenizer) { return {}; }
-  return encode_with_specials_(*_tokenizer,
-                               std::string(kPrefix) + prompt + kSuffix);
-}
-
 std::vector<float>
-TextToImageStage::generate_(const std::string& prompt,
-                            const std::string& negative, int gen_h, int gen_w,
+TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
+                            const metal_compute::SharedBuffer& cond_neg,
+                            int n_real_neg, int gen_h, int gen_w,
                             const std::vector<float>* init_packed,
                             const std::vector<float>* init_latent,
-                            const std::vector<RefLatent>& refs) const
+                            const std::vector<RefLatent>& refs,
+                            const std::function<void(const std::vector<float>&)>&
+                                emit_step) const
 {
   auto* mc = session()->metal_compute();
   using metal_compute::SharedBuffer;
@@ -615,98 +476,27 @@ TextToImageStage::generate_(const std::string& prompt,
   const int gh = H / 16, gw = W / 16;        // 2x2-patch grid
   const int img_seq = gh * gw;
   const int IC = 64;                         // z_dim(16) * patch(2) * patch(2)
-  const int EH = _enc_hidden;                // 2560
-  const int NL = 12;
 
-  // Steps 1-5: text -> fused DiT conditioning [n_real, hidden]. Factored so
-  // it can run for both the positive prompt and (for classifier-free
-  // guidance) the negative prompt. Returns the fused buffer (empty on
-  // failure) and writes the post-prefix row count to `n_real_out`.
-  auto encode_text = [&](const std::string& text, const char* which,
-                         int& n_real_out) -> SharedBuffer {
-    // 1. tokenize -> compact [prefix | text | suffix].
-    const std::vector<std::int32_t> ids = tokenize_prompt(text);
-    if ((int)ids.size() <= kDropPrefix) { return SharedBuffer{}; }
-    const int n = (int)ids.size();
-    const int n_real = n - kDropPrefix;
-    session()->log_debug(fmt(
-        "TextToImageStage('{}'): [{}] tokenized {} ids ({} rows after "
-        "dropping {} prefix)", this->id(), which, n, n_real, kDropPrefix));
-
-    // 2. gather encoder input rows (bf16) by id.
-    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
-    if (x.empty()) { return SharedBuffer{}; }
-    {
-      const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
-      auto* xb = static_cast<std::uint8_t*>(x.contents());
-      const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
-      for (int i = 0; i < n; ++i) {
-        const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
-        if (id >= vocab) { return SharedBuffer{}; }
-        std::memcpy(xb + (std::size_t)i * EH * 2,
-                    tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
-      }
-    }
-
-    // 3. tap the 12 selected layers.
-    std::vector<int> tap_layers;
-    for (int k : kSelectLayers) { tap_layers.push_back(k - 1); }
-    genai::ContextManager* cm = _encoder->context_manager();
-    const genai::ContextId cid = cm->acquire_root();
-    SharedBuffer taps =
-        _encoder->forward_embeddings_taps(cid, x, n, tap_layers);
-    cm->release(cid);
-    if (taps.empty()) { return SharedBuffer{}; }
-
-    // 4. drop the prefix rows + reorder to the DiT's [n_real, 12, 2560] f16
-    //    (taps slot j is [n][EH] at j*n*EH).
-    SharedBuffer ehs =
-        mc->make_shared_buffer((std::size_t)n_real * NL * EH * 2);
-    if (ehs.empty()) { return SharedBuffer{}; }
-    {
-      const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
-      auto* ep = static_cast<_Float16*>(ehs.contents());
-      for (int p = 0; p < n_real; ++p) {
-        for (int j = 0; j < NL; ++j) {
-          const std::size_t src =
-              ((std::size_t)j * n + (kDropPrefix + p)) * EH;
-          const std::size_t dst = ((std::size_t)p * NL + j) * EH;
-          for (int h = 0; h < EH; ++h) {
-            std::uint32_t u = (std::uint32_t)tp[src + h] << 16;
-            float f; std::memcpy(&f, &u, 4);
-            ep[dst + h] = (_Float16)f;
-          }
-        }
-      }
-    }
-
-    // 5. text-fusion tower + txt_in -> fused text [n_real, hidden].
-    SharedBuffer fused = _dit->forward_text(ehs, n_real);
-    if (fused.empty()) { return SharedBuffer{}; }
-    n_real_out = n_real;
-    return fused;
-  };
-
-  int n_real = 0;
-  SharedBuffer fused = encode_text(prompt, "prompt", n_real);
+  // The conditioner emits the 12-tap f16 conditioning [n_real, 12, EH]; the
+  // DiT's text-fusion tower fuses it into the DiT-facing text [n_real, hidden].
+  SharedBuffer fused = _dit->forward_text(cond, n_real);
   if (fused.empty()) { return {}; }
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): encoded prompt -> fused text [{}, hidden]; "
+      "TextToImageStage('{}'): fused conditioning [{}, hidden]; "
       "{}x{} grid {}x{} img_seq {}", this->id(), n_real, W, H, gh, gw,
       img_seq));
 
-  // Classifier-free guidance: encode the negative prompt too and, at each
+  // Classifier-free guidance: fuse the negative conditioning too and, at each
   // denoise step, push the velocity away from it. Skipped when no negative
-  // prompt is wired or the scale is a no-op (1.0), so the single-pass turbo
-  // default stays token-exact.
-  bool cfg = !negative.empty() && _guidance_scale != 1.0;
-  int n_real_neg = 0;
+  // conditioning is wired or the scale is a no-op (1.0), so the single-pass
+  // turbo default stays token-exact.
+  bool cfg = !cond_neg.empty() && n_real_neg > 0 && _guidance_scale != 1.0;
   SharedBuffer fused_neg;
   if (cfg) {
-    fused_neg = encode_text(negative, "negative", n_real_neg);
+    fused_neg = _dit->forward_text(cond_neg, n_real_neg);
     if (fused_neg.empty()) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): negative-prompt encode failed; running "
+          "TextToImageStage('{}'): negative-conditioning fuse failed; running "
           "without classifier-free guidance", this->id()));
       cfg = false;
     } else {
@@ -859,6 +649,22 @@ TextToImageStage::generate_(const std::string& prompt,
   // in-place progress bar on the user-facing stream (model-quantize style)
   // and time the whole loop so the operator sees steady progress instead
   // of a silent stall, plus a wall-clock summary when the latent is done.
+  // unpack packed [img_seq, 64] -> channel-first latent [16, lh, lw] (2x2). Used
+  // per-step (debug step_latents) and for the final return.
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)16 * lh * lw);
+    for (int c = 0; c < 16; ++c) {
+      for (int y = 0; y < lh; ++y) {
+        for (int xx = 0; xx < lw; ++xx) {
+          const int a = y / 2, ph = y % 2, b = xx / 2, pw = xx % 2;
+          const std::size_t t = (std::size_t)a * gw + b;
+          latent[((std::size_t)c * lh + y) * lw + xx] =
+              pk[t * IC + (std::size_t)c * 4 + ph * 2 + pw];
+        }
+      }
+    }
+    return latent;
+  };
   std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
   const int nsteps = S - start;
   int last_pct = -1;
@@ -871,6 +677,7 @@ TextToImageStage::generate_(const std::string& prompt,
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
     if (!dit_ok) { bar->end(); return {}; }
+    if (emit_step) { emit_step(unpack(packed)); }
     denoise_progress_(bar.get(), i - start + 1, nsteps, last_pct);
   }
   bar->end();
@@ -889,24 +696,16 @@ TextToImageStage::generate_(const std::string& prompt,
   }
 
   // 9. unpack [img_seq, 64] -> channel-first latent [16, lh, lw].
-  std::vector<float> latent((std::size_t)16 * lh * lw);
-  for (int c = 0; c < 16; ++c) {
-    for (int y = 0; y < lh; ++y) {
-      for (int xx = 0; xx < lw; ++xx) {
-        const int a = y / 2, ph = y % 2, b = xx / 2, pw = xx % 2;
-        const std::size_t t = (std::size_t)a * gw + b;
-        latent[((std::size_t)c * lh + y) * lw + xx] =
-            packed[t * IC + (std::size_t)c * 4 + ph * 2 + pw];
-      }
-    }
-  }
-  return latent;
+  return unpack(packed);
 }
 
 std::vector<float>
-TextToImageStage::generate_flux2_(const std::string& prompt, int gen_h,
-                                  int gen_w,
-                                  const std::vector<RefLatent>& refs) const
+TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
+                                  int n_real, int gen_h, int gen_w,
+                                  const std::vector<RefLatent>& refs,
+                                  const std::function<void(
+                                      const std::vector<float>&)>& emit_step)
+    const
 {
   auto* mc = session()->metal_compute();
   using metal_compute::SharedBuffer;
@@ -914,65 +713,8 @@ TextToImageStage::generate_flux2_(const std::string& prompt, int gen_h,
   const int gh = H / 16, gw = W / 16;        // VAE latent grid (128ch @ H/16)
   const int img_seq = gh * gw;
   const int IC = _flux2_dit->config().in_channels;   // 128
-  const int EH = _enc_hidden;                        // 2560
-  const int JD = _flux2_dit->config().joint_dim;     // 7680 = 3 * EH
-  // FLUX.2 taps output.hidden_states[{9,18,27}] (the pipeline default
-  // text_encoder_out_layers) and concatenates them -> joint_dim. Tap index into
-  // forward_embeddings_taps is (hidden_states index - 1), matching Krea-2.
-  static const int kFluxTaps[3] = {9, 18, 27};
-
-  // FLUX.2 uses the plain Qwen3 chat template (no Krea-2 system prompt, no
-  // prefix drop -- ALL rows feed the DiT). NOTE: enable_thinking=False; the
-  // exact thinking-block tokens + the reference's pad-to-512 are NOT replicated
-  // here, so this is not yet token-exact. VERIFY vs the tokenizer chat_template.
-  const std::string templated = std::string("<|im_start|>user\n") + prompt +
-                                "<|im_end|>\n<|im_start|>assistant\n";
-  const std::vector<std::int32_t> ids =
-      encode_with_specials_(*_tokenizer, templated);
-  if (ids.empty()) { return {}; }
-  const int n = (int)ids.size();
-
-  // Gather encoder input rows (bf16) by id.
-  SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
-  if (x.empty()) { return {}; }
-  {
-    const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
-    auto* xb = static_cast<std::uint8_t*>(x.contents());
-    const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
-    for (int i = 0; i < n; ++i) {
-      const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
-      if (id >= vocab) { return {}; }
-      std::memcpy(xb + (std::size_t)i * EH * 2,
-                  tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
-    }
-  }
-
-  // Tap the 3 selected layers -> concat per token into context [n, JD=7680].
-  std::vector<int> tap_layers;
-  for (int k : kFluxTaps) { tap_layers.push_back(k - 1); }
-  genai::ContextManager* cm = _encoder->context_manager();
-  const genai::ContextId cid = cm->acquire_root();
-  SharedBuffer taps = _encoder->forward_embeddings_taps(cid, x, n, tap_layers);
-  cm->release(cid);
-  if (taps.empty()) { return {}; }
-  SharedBuffer context = mc->make_shared_buffer((std::size_t)n * JD * 2);
-  if (context.empty()) { return {}; }
-  {
-    const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
-    auto* cp = static_cast<_Float16*>(context.contents());
-    for (int p = 0; p < n; ++p) {
-      for (int j = 0; j < 3; ++j) {          // taps slot j is [n][EH] at j*n*EH
-        const std::size_t src = ((std::size_t)j * n + p) * EH;
-        const std::size_t dst = (std::size_t)p * JD + (std::size_t)j * EH;
-        for (int h = 0; h < EH; ++h) {
-          std::uint32_t u = (std::uint32_t)tp[src + h] << 16;
-          float f; std::memcpy(&f, &u, 4);
-          cp[dst + h] = (_Float16)f;
-        }
-      }
-    }
-  }
-  const int n_real = n;
+  // `context` is the diffusion-conditioner's flux2 conditioning: the {9,18,27}
+  // encoder taps concatenated per token -> f16 [n_real, joint_dim=3*enc_hidden].
 
   // Sampler (FlowMatchEuler; klein distilled -> no CFG). FLUX.2's flow-shift
   // (mu) is resolution- AND step-dependent (compute_empirical_mu): a fixed
@@ -1078,6 +820,20 @@ TextToImageStage::generate_flux2_(const std::string& prompt, int gen_h,
     ++dit_calls;
     return v;
   };
+  // Unpack [img_seq, IC] (token-major) -> channel-first [IC, gh, gw]. Used
+  // per-step (debug step_latents) and for the final return.
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)IC * gh * gw);
+    for (int i = 0; i < gh; ++i) {
+      for (int j = 0; j < gw; ++j) {
+        const std::size_t t = (std::size_t)i * gw + j;
+        for (int cc = 0; cc < IC; ++cc) {
+          latent[((std::size_t)cc * gh + i) * gw + j] = pk[t * IC + cc];
+        }
+      }
+    }
+    return latent;
+  };
   std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
   int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
@@ -1086,6 +842,7 @@ TextToImageStage::generate_flux2_(const std::string& prompt, int gen_h,
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
     if (!dit_ok) { bar->end(); return {}; }
+    if (emit_step) { emit_step(unpack(packed)); }
     denoise_progress_(bar.get(), i + 1, S, last_pct);
   }
   bar->end();
@@ -1101,81 +858,280 @@ TextToImageStage::generate_flux2_(const std::string& prompt, int gen_h,
         dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
         n_real + img_seq));
   }
+  return unpack(packed);
+}
 
-  // Unpack [img_seq, IC] (token-major) -> channel-first [IC, gh, gw].
-  std::vector<float> latent((std::size_t)IC * gh * gw);
-  for (int i = 0; i < gh; ++i) {
-    for (int j = 0; j < gw; ++j) {
-      const std::size_t t = (std::size_t)i * gw + j;
-      for (int cc = 0; cc < IC; ++cc) {
-        latent[((std::size_t)cc * gh + i) * gw + j] =
-            packed[t * IC + cc];
+std::vector<float>
+TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
+                               int n_real,
+                               const metal_compute::SharedBuffer& txt_neg,
+                               int n_real_neg, int gen_h, int gen_w,
+                               const std::vector<float>* init_packed,
+                               const std::vector<RefLatent>& refs,
+                               const std::function<void(
+                                   const std::vector<float>&)>& emit_step)
+    const
+{
+  auto* mc = session()->metal_compute();
+  using metal_compute::SharedBuffer;
+  const int H = gen_h, W = gen_w;
+  const int lh = H / 8, lw = W / 8;          // latent H/W (z_dim 16)
+  const int gh = H / 16, gw = W / 16;        // 2x2-patch grid
+  const int img_seq = gh * gw;
+  const int IC = _qie_dit->config().in_channels;   // 64 = 16 * 2 * 2
+
+  // `txt_pos` is the diffusion-conditioner's qwen-image-edit conditioning: the
+  // image-aware last-hidden [n_real, 3584] bf16, already POST encoder final-norm
+  // (the conditioner ran the vision tower + splice + drop-64 + final-RMSNorm).
+  session()->log_debug(fmt(
+      "TextToImageStage('{}'): QIE conditioning [{}, txt]; {}x{} grid {}x{} "
+      "img_seq {}", this->id(), n_real, W, H, gh, gw, img_seq));
+
+  // norm-preserving true-CFG: use the negative conditioning too and, per step,
+  // comb = neg + scale*(pos-neg), then rescale comb to pos's per-token norm.
+  const bool cfg = !txt_neg.empty() && n_real_neg > 0 && _guidance_scale != 1.0;
+
+  // Sampler: FlowMatchEuler with the QIE dynamic shift (mu from img_seq, terminal
+  // stretch 0.02). Operator-supplied scheduler beats win (skip the override).
+  genai::FlowSchedulerSpec sched = _scheduler_spec;
+  if (!_scheduler_latched) {
+    sched.dynamic_shift  = true;
+    sched.base_shift     = 0.5;
+    sched.max_shift      = 0.9;
+    sched.shift_terminal = 0.02;
+    sched.base_seq       = 256;
+    sched.max_seq        = 8192;
+    sched.num_train      = 1000;
+    sched.shift_type     = "exponential";
+    sched.img_seq_len    = img_seq;
+  } else {
+    sched.img_seq_len    = img_seq;
+  }
+  genai::FlowSampler sampler(_sampler_spec, sched);
+  const int S = sampler.steps();
+
+  // Packed latents [img_seq, IC]: a supplied init (repro / golden) or pure noise.
+  std::vector<float> packed((std::size_t)img_seq * IC);
+  if (init_packed != nullptr && init_packed->size() == packed.size()) {
+    packed = *init_packed;
+  } else {
+    std::mt19937_64 rng(_seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : packed) { v = nd(rng); }
+  }
+  SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+  if (latbuf.empty()) { return {}; }
+
+  // Reference conditioning: each ref latent arrives channel-first [16, rlh, rlw]
+  // (vae-encode output); pack it 2x2 into token-major [rseq, IC] bf16 (the same
+  // patchify the generated latent uses) so the DiT embeds it via img_in in its
+  // own RoPE frame band. Odd-dim / non-16-channel refs are skipped.
+  //
+  // The DiT's scale_rope centers each reference's h/w positions at 0 (matching
+  // diffusers), so a reference grid SMALLER than the generated grid (gh x gw)
+  // covers only the centered sub-region and leaves a visible rectangular "box"
+  // at its boundary. The fix is to encode the reference at the OUTPUT resolution
+  // (so ref grid == gen grid == full overlap, as the diffusers pipeline does) --
+  // we keep the reference at native resolution (re-gridding the latent here just
+  // blurs it) and WARN when the grids differ so the user can match them.
+  std::vector<genai::MetalQwenImageTransformer::RefImage> ri;
+  for (const auto& r : refs) {
+    if (r.empty() || r.c != 16 || (r.h % 2) != 0 || (r.w % 2) != 0) {
+      if (!r.empty()) {
+        session()->warn(fmt(
+            "TextToImageStage('{}'): reference latent [{}, {}, {}] must be "
+            "16-channel with even H/W; ignoring", this->id(), r.c, r.h, r.w));
+      }
+      continue;
+    }
+    const int rgh = r.h / 2, rgw = r.w / 2, rseq = rgh * rgw;
+    if (rgh != gh || rgw != gw) {
+      session()->warn(fmt(
+          "TextToImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
+          "the centered reference will cover only part of the output and leave a "
+          "rectangular artifact. Encode the reference at the output resolution "
+          "(set vae-encode target to {}x{}) to avoid it.",
+          this->id(), rgw, rgh, gw, gh, W, H));
+    }
+    SharedBuffer rb = mc->make_shared_buffer((std::size_t)rseq * IC * 2);
+    if (rb.empty()) { continue; }
+    auto* d = static_cast<std::uint16_t*>(rb.contents());
+    std::memset(d, 0, rb.byte_size());
+    for (int cc = 0; cc < 16; ++cc) {
+      for (int y = 0; y < r.h; ++y) {
+        for (int x = 0; x < r.w; ++x) {
+          const int a = y / 2, ph = y % 2, bcol = x / 2, pw = x % 2;
+          const std::size_t t = (std::size_t)a * rgw + bcol;
+          d[t * IC + (std::size_t)cc * 4 + ph * 2 + pw] =
+              f32_to_bf16_(r.chw[((std::size_t)cc * r.h + y) * r.w + x]);
+        }
       }
     }
+    genai::MetalQwenImageTransformer::RefImage img;
+    img.latents = std::move(rb);
+    img.seq = rseq; img.grid_h = rgh; img.grid_w = rgw;
+    ri.push_back(std::move(img));
   }
-  return latent;
+  if (!ri.empty()) {
+    session()->info(fmt(
+        "TextToImageStage('{}'): Qwen-Image-Edit conditioning on {} reference "
+        "image(s)", this->id(), ri.size()));
+  }
+
+  // Denoise callback: upload the candidate, run the dual-stream DiT at `sigma`,
+  // read the velocity back; apply norm-preserving true-CFG when enabled.
+  bool dit_ok = true;
+  const float gscale = (float)_guidance_scale;
+  auto denoise = [&](const std::vector<float>& cand,
+                     double sigma) -> std::vector<float> {
+    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+    for (std::size_t k = 0; k < cand.size(); ++k) {
+      lb[k] = f32_to_bf16_(cand[k]);
+    }
+    SharedBuffer vel = _qie_dit->forward(latbuf, img_seq, txt_pos, n_real, gh,
+                                         gw, (float)sigma, ri);
+    if (vel.empty()) { dit_ok = false; return {}; }
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    std::vector<float> v(cand.size());
+    for (std::size_t k = 0; k < v.size(); ++k) { v[k] = bf16_to_f32_(vp[k]); }
+    if (cfg) {
+      SharedBuffer veln = _qie_dit->forward(latbuf, img_seq, txt_neg, n_real_neg,
+                                            gh, gw, (float)sigma, ri);
+      if (veln.empty()) { dit_ok = false; return {}; }
+      const auto* np = static_cast<const std::uint16_t*>(veln.contents());
+      // Per-token (over IC channels): comb = neg + scale*(pos-neg), then
+      // rescale comb to preserve pos's L2 norm (diffusers true-CFG).
+      for (int t = 0; t < img_seq; ++t) {
+        double npos = 0.0, ncomb = 0.0;
+        std::vector<float> comb((std::size_t)IC);
+        for (int c = 0; c < IC; ++c) {
+          const std::size_t k = (std::size_t)t * IC + c;
+          const float vneg = bf16_to_f32_(np[k]);
+          const float cb = vneg + gscale * (v[k] - vneg);
+          comb[(std::size_t)c] = cb;
+          npos += (double)v[k] * v[k];
+          ncomb += (double)cb * cb;
+        }
+        const double s = ncomb > 0.0 ? std::sqrt(npos / ncomb) : 1.0;
+        for (int c = 0; c < IC; ++c) {
+          v[(std::size_t)t * IC + c] = (float)(comb[(std::size_t)c] * s);
+        }
+      }
+    }
+    return v;
+  };
+
+  sampler.reset();
+  // Per-step DiT timing (VPIPE_QIE_PROFILE), mirroring the Krea-2 / FLUX.2
+  // paths: time each forward + log a ms/call summary. Pair with
+  // VPIPE_QIE_DIT_PROFILE for the per-section breakdown inside a step.
+  const bool prof = std::getenv("VPIPE_QIE_PROFILE") != nullptr;
+  double dit_ms = 0.0;
+  int dit_calls = 0;
+  auto denoise_p = [&](const std::vector<float>& cand, double sigma) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<float> v = denoise(cand, sigma);
+    dit_ms += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count();
+    ++dit_calls;
+    return v;
+  };
+  // Unpack [img_seq, IC] -> channel-first latent [16, lh, lw] (2x2). Used
+  // per-step (debug step_latents) and for the final return.
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)16 * lh * lw);
+    for (int c = 0; c < 16; ++c) {
+      for (int y = 0; y < lh; ++y) {
+        for (int xx = 0; xx < lw; ++xx) {
+          const int a = y / 2, ph = y % 2, b = xx / 2, pw = xx % 2;
+          const std::size_t t = (std::size_t)a * gw + b;
+          latent[((std::size_t)c * lh + y) * lw + xx] =
+              pk[t * IC + (std::size_t)c * 4 + ph * 2 + pw];
+        }
+      }
+    }
+    return latent;
+  };
+  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
+  int last_pct = -1;
+  const auto gen_t0 = std::chrono::steady_clock::now();
+  denoise_progress_(bar.get(), 0, S, last_pct);
+  for (int i = 0; i < S; ++i) {
+    sampler.step(i, packed,
+                 prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
+    if (!dit_ok) { bar->end(); return {}; }
+    if (emit_step) { emit_step(unpack(packed)); }
+    denoise_progress_(bar.get(), i + 1, S, last_pct);
+  }
+  bar->end();
+  const double gen_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - gen_t0).count();
+  session()->info(fmt(
+      "TextToImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
+      "{} ms/step)", this->id(), gen_s, S,
+      S ? (long)(gen_s * 1000.0 / S) : 0));
+  if (prof) {
+    session()->log_normal(fmt(
+        "TextToImageStage('{}'): QIE DiT {} forward calls, {} ms total, {} "
+        "ms/call (txt {} + img {} = {})", this->id(), dit_calls, (long)dit_ms,
+        dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
+        n_real + img_seq));
+  }
+  return unpack(packed);
 }
 
 Job
 TextToImageStage::process(RuntimeContext& ctx)
 {
+  auto* mc = session()->metal_compute();
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }
-  const bool have_dit = _family == "flux2" ? (bool)_flux2_dit : (bool)_dit;
+  const bool have_dit = _family == "flux2" ? (bool)_flux2_dit
+      : _family == "qwen-image-edit" ? (bool)_qie_dit
+      : (bool)_dit;
   if (!have_dit) {
     session()->warn(fmt(
         "TextToImageStage('{}'): models not loaded; dropping beat", this->id()));
     co_return;
   }
-  // Lazily reload the text encoder if it was freed after the previous
-  // generation (see _free_encoder); a no-op (encoder resident) otherwise.
-  if (!_encoder && !load_encoder_(session()->metal_compute())) {
+  // iport0: the conditioning tensor from a diffusion-conditioner stage
+  // (family-shaped + typed; rows = shape[0]). Copy it into a metal buffer.
+  const auto* ctb = dynamic_cast<const TensorBeatPayload*>(in.get());
+  if (ctb == nullptr || ctb->shape.empty() || ctb->shape[0] <= 0) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): text encoder reload failed; dropping beat",
-        this->id()));
-    co_return;
-  }
-  const auto* fdp = dynamic_cast<const FlexDataPayload*>(in.get());
-  if (fdp == nullptr) {
-    session()->warn(fmt(
-        "TextToImageStage('{}'): expected a FlexDataPayload prompt, got {}; "
+        "TextToImageStage('{}'): expected a conditioning TensorBeat, got {}; "
         "dropping beat", this->id(), in->describe()));
     co_return;
   }
-  std::string prompt(fdp->data.as_string(""));
-  if (prompt.empty() && fdp->data.is_object()) {
-    auto obj = fdp->data.as_object();
-    if (obj.contains("text")) { prompt = std::string(obj.at("text").as_string("")); }
-  }
-  if (prompt.empty()) {
+  metal_compute::SharedBuffer cond = cond_to_shared_(mc, *ctb);
+  if (cond.empty()) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): empty prompt; dropping beat", this->id()));
+        "TextToImageStage('{}'): conditioning upload failed; dropping beat",
+        this->id()));
     co_return;
   }
+  const int n_real = (int)ctb->shape[0];
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): beat received, prompt ({} chars): '{}'",
-      this->id(), prompt.size(), prompt));
+      "TextToImageStage('{}'): conditioning beat [{} rows, {}]", this->id(),
+      n_real, ctb->dtype == TensorBeat::DType::Bf16 ? "bf16" : "f16"));
 
-  // iport1: OPTIONAL negative prompt for classifier-free guidance. Read one
-  // beat per generation when available and cache it (`_negative_prompt`), so a
-  // fixed negative supplied once is reused for every later prompt. The
-  // non-blocking backlog gate avoids stalling when none is wired/pending.
+  // iport1: OPTIONAL negative conditioning (the conditioner's oport1) for
+  // classifier-free guidance. The conditioner enqueues oport1 BEFORE oport0, so
+  // when iport0 arrives its paired negative is already in this port's FIFO --
+  // the non-blocking backlog gate reads it reliably (and never stalls when no
+  // negative is wired).
+  metal_compute::SharedBuffer cond_neg;
+  int n_real_neg = 0;
   if (ctx.num_iports() >= 2 && ctx.iport_connected(1) && ctx.backlog(1) > 0) {
     auto nb = co_await ctx.read(1);
-    const auto* nfd = nb ? dynamic_cast<const FlexDataPayload*>(nb.get())
+    const auto* ntb = nb ? dynamic_cast<const TensorBeatPayload*>(nb.get())
                          : nullptr;
-    if (nfd != nullptr) {
-      std::string np(nfd->data.as_string(""));
-      if (np.empty() && nfd->data.is_object()) {
-        auto o = nfd->data.as_object();
-        if (o.contains("text")) {
-          np = std::string(o.at("text").as_string(""));
-        }
-      }
-      _negative_prompt = std::move(np);
+    if (ntb != nullptr && !ntb->shape.empty() && ntb->shape[0] > 0) {
+      cond_neg = cond_to_shared_(mc, *ntb);
+      if (!cond_neg.empty()) { n_real_neg = (int)ntb->shape[0]; }
       session()->log_debug(fmt(
-          "TextToImageStage('{}'): negative prompt ({} chars): '{}'",
-          this->id(), _negative_prompt.size(), _negative_prompt));
+          "TextToImageStage('{}'): negative conditioning [{} rows]", this->id(),
+          n_real_neg));
     }
   }
 
@@ -1239,7 +1195,7 @@ TextToImageStage::process(RuntimeContext& ctx)
   // adopt_latent_dims the output size is taken FROM the latent (the DiT
   // patchifies 2x2, so H/W must be even). FLUX.2 skips this -- refs are
   // conditioning tokens, not an init, handled in generate_flux2_.
-  if (_family != "flux2" && _strength > 0.0 && !_ref[0].empty()) {
+  if (_family == "krea2" && _strength > 0.0 && !_ref[0].empty()) {
     const RefLatent& rr = _ref[0];
     const bool ok_type = rr.c == 16 && rr.h > 0 && rr.w > 0;
     if (ok_type && _adopt_latent_dims) {
@@ -1305,24 +1261,52 @@ TextToImageStage::process(RuntimeContext& ctx)
   // ---- FLUX.2: text-to-image from noise (+ optional reference-image
   // conditioning from iport4/iport5) -> latent [dit_channels, H/16, W/16].
   // (No negative-prompt CFG; klein is distilled.) ----
+  // step_latent (oport1): stream each denoise step's latent LIVE so a downstream
+  // vae-decode -> preview updates every step. Emitted only when a consumer is
+  // wired. `step_emitter(shape)` returns a per-step callback the generate_ loops
+  // call right after each sampler step; it write_sync's the unpacked latent from
+  // the (synchronous) denoise loop -- the runtime wakes the consumer on the
+  // thread pool, so it decodes concurrently with the next DiT step. write_sync
+  // never blocks the loop (drops if the ring is full) and stops on consumer
+  // close (step_alive). Empty callback (no consumer) => zero overhead.
+  const bool want_steps = ctx.num_oports() > 1 && ctx.has_consumers(1);
+  bool step_alive = true;
+  auto step_emitter = [&](std::vector<std::int64_t> shape)
+      -> std::function<void(const std::vector<float>&)> {
+    if (!want_steps) { return {}; }
+    return [&, shape](const std::vector<float>& lat) {
+      if (!step_alive) { return; }
+      auto so = std::make_unique<TensorBeatPayload>();
+      so->dtype = TensorBeat::DType::F32;
+      so->shape = shape;
+      so->resize_contiguous(lat.size());
+      std::memcpy(so->as_f32(), lat.data(), lat.size() * sizeof(float));
+      step_alive = ctx.write_sync(1, std::move(so));
+    };
+  };
+  // Cooperative stop: feed the active DiT a hook reporting the pipeline stop
+  // flag so it abandons the forward within ~one block instead of running the
+  // whole (multi-second at high res) step. Set around each generate_ call and
+  // cleared after -- the callback captures ctx, valid only for this process().
+  auto stopping = [&ctx]() { return ctx.stop_requested(); };
+
   if (_family == "flux2") {
     std::vector<RefLatent> frefs;
     if (!_ref[0].empty()) { frefs.push_back(_ref[0]); }
     if (!_ref[1].empty()) { frefs.push_back(_ref[1]); }
-    const std::vector<float> fl =
-        generate_flux2_(prompt, gen_h, gen_w, frefs);
-    if (fl.empty()) {
-      session()->warn(fmt(
-          "TextToImageStage('{}'): FLUX.2 generation failed; dropping beat",
-          this->id()));
-      co_return;
-    }
-    // Conditioning is built and denoising is done -- the encoder is now idle
-    // through the downstream VAE decode. Free it (reloaded lazily next beat) so
-    // its footprint doesn't crowd out a large decode on a memory-bounded box.
-    if (_free_encoder) { _encoder.reset(); _embed = {}; }
     const int Cdit = _flux2_dit->config().in_channels;
     const int fgh = gen_h / 16, fgw = gen_w / 16;
+    _flux2_dit->set_stream_stop(stopping);
+    const std::vector<float> fl =
+        generate_flux2_(cond, n_real, gen_h, gen_w, frefs,
+                        step_emitter({Cdit, fgh, fgw}));
+    _flux2_dit->set_stream_stop({});
+    if (fl.empty()) {
+      session()->info(fmt(
+          "TextToImageStage('{}'): FLUX.2 generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
     auto out = std::make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::F32;
     out->shape = {Cdit, fgh, fgw};
@@ -1330,9 +1314,40 @@ TextToImageStage::process(RuntimeContext& ctx)
     std::memcpy(out->as_f32(), fl.data(), fl.size() * sizeof(float));
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): '{}' -> FLUX.2 latent [{}, {}, {}] ({} steps "
-        "@ {}x{})", this->id(), prompt, Cdit, fgh, fgw,
-        _scheduler_spec.steps, gen_h, gen_w));
+        "TextToImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
+        this->id(), Cdit, fgh, fgw, _scheduler_spec.steps, gen_h, gen_w));
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Qwen-Image-Edit: image-aware conditioning (from the conditioner) +
+  // dual-stream DiT (reference latents from iport4/iport5 as DiT conditioning
+  // tokens) + norm-preserving true-CFG -> whitened latent [16, H/8, W/8]. ----
+  if (_family == "qwen-image-edit") {
+    std::vector<RefLatent> qrefs;
+    if (!_ref[0].empty()) { qrefs.push_back(_ref[0]); }
+    if (!_ref[1].empty()) { qrefs.push_back(_ref[1]); }
+    _qie_dit->set_stream_stop(stopping);
+    const std::vector<float> ql =
+        generate_qie_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
+                      init_ptr, qrefs, step_emitter({16, lh, lw}));
+    _qie_dit->set_stream_stop({});
+    if (ql.empty()) {
+      session()->info(fmt(
+          "TextToImageStage('{}'): Qwen-Image-Edit generation {}; dropping "
+          "beat", this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {16, lh, lw};
+    out->resize_contiguous(ql.size());
+    std::memcpy(out->as_f32(), ql.data(), ql.size() * sizeof(float));
+    ++_latents_emitted;
+    session()->info(fmt(
+        "TextToImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
+        "({} steps @ {}x{})", this->id(), lh, lw, _scheduler_spec.steps,
+        gen_h, gen_w));
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -1348,26 +1363,23 @@ TextToImageStage::process(RuntimeContext& ctx)
       if (!_ref[i].empty()) { krefs.push_back(_ref[i]); }
     }
   }
+  _dit->set_stream_stop(stopping);
   const std::vector<float> out_latent =
-      generate_(prompt, _negative_prompt, gen_h, gen_w, init_ptr, latent_ptr,
-                krefs);
+      generate_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w, init_ptr,
+                latent_ptr, krefs, step_emitter({16, lh, lw}));
+  _dit->set_stream_stop({});
   if (out_latent.empty()) {
-    session()->warn(fmt(
-        "TextToImageStage('{}'): generation failed; dropping beat", this->id()));
+    session()->info(fmt(
+        "TextToImageStage('{}'): generation {}; dropping beat", this->id(),
+        ctx.stop_requested() ? "stopped" : "failed"));
     co_return;
   }
-  // Encoder idle through the downstream VAE decode -- free it (lazily reloaded
-  // next beat) so it doesn't crowd out a large decode on a memory-bounded box.
-  // The DiT is idle too now (latent read back): drop its per-forward scratch
-  // (DitScratch activations + dequant/split-K + i8 accel buffers, ~1-2 GB at
-  // 1024px), which regrows on the next generation. The DiT weights themselves
-  // stay mmap'd (evictable). Together these free enough working set for the
+  // The DiT is idle now (latent read back): on a memory-bounded box drop its
+  // per-forward scratch (DitScratch activations + dequant/split-K + i8 accel
+  // buffers, ~1-2 GB at 1024px), which regrows on the next generation. The DiT
+  // weights stay mmap'd (evictable). This frees enough working set for the
   // separate vae-decode stage; without it a 1024px decode OOMs on a 16 GB box.
-  if (_free_encoder) {
-    _encoder.reset();
-    _embed = {};
-    if (_dit) { _dit->release_forward_scratch(); }
-  }
+  if (_release_scratch && _dit) { _dit->release_forward_scratch(); }
 
   auto out = std::make_unique<TensorBeatPayload>();
   out->dtype = TensorBeat::DType::F32;
@@ -1377,8 +1389,8 @@ TextToImageStage::process(RuntimeContext& ctx)
               out_latent.size() * sizeof(float));
   ++_latents_emitted;
   session()->info(fmt(
-      "TextToImageStage('{}'): '{}' -> latent [16, {}, {}] ({}+{} {} steps @ "
-      "{}x{})", this->id(), prompt, lh, lw, _sampler_spec.method,
+      "TextToImageStage('{}'): latent [16, {}, {}] ({}+{} {} steps @ "
+      "{}x{})", this->id(), lh, lw, _sampler_spec.method,
       _scheduler_spec.type, _scheduler_spec.steps, gen_h, gen_w));
   co_await ctx.write(0, std::move(out));
 }

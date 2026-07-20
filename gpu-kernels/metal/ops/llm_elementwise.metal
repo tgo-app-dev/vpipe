@@ -489,6 +489,64 @@ kernel void residual_add_f16(
   out[gid] = VPIPE_ELT(float(a[gid]) + float(b[gid]));
 }
 
+// GELU (tanh approximation), the QwenImage FeedForward activation. VPIPE_ELT
+// storage so a bf16 metallib exists (the vision gelu_tanh_f16 is half-only).
+//   0:x 1:out 2:n.  grid (n).
+kernel void gelu_tanh_ff_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  const float v = (float)x[gid];
+  const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+  out[gid] = VPIPE_ELT(0.5f * v * (1.0f + metal::precise::tanh(inner)));
+}
+
+// Plain LayerNorm, NO affine (elementwise_affine=False): out = (x-mean)/
+// sqrt(var+eps), normalized over the last H dims. VPIPE_ELT storage (a bf16
+// metallib exists; the vision layer_norm_bias_f16 is half-only + needs w/b).
+// One threadgroup of LN_FF_TG threads per row (row = tid.y).
+#define LN_FF_TG 256
+kernel void layer_norm_plain_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H   [[buffer(2)]],
+    constant float&    eps [[buffer(3)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    const float v = (float)xr[i];
+    s1 += v; s2 += v * v;
+  }
+  s1 = simd_sum(s1); s2 = simd_sum(s2);
+  threadgroup float p1[LN_FF_TG / 32], p2[LN_FF_TG / 32];
+  if (simd_lid == 0) { p1[simd_gid] = s1; p2[simd_gid] = s2; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < LN_FF_TG / 32) ? p1[simd_lid] : 0.0f;
+    float b = (simd_lid < LN_FF_TG / 32) ? p2[simd_lid] : 0.0f;
+    a = simd_sum(a); b = simd_sum(b);
+    if (simd_lid == 0) { p1[0] = a; p2[0] = b; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mean = p1[0] / (float)H;
+  const float var = p2[0] / (float)H - mean * mean;
+  const float inv = rsqrt(var + eps);
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    outr[i] = VPIPE_ELT(((float)xr[i] - mean) * inv);
+  }
+}
+
 // adaLN modulation (Krea-2 DiT): out[m,n] = (1 + scale[n]) * x[m,n] + shift[n],
 // with scale/shift [N] broadcast over the M rows (total = M*N). scale/shift may
 // be offset slices of a shared modulation buffer.
