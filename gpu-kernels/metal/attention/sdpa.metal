@@ -4237,6 +4237,89 @@ kernel void sdpa_paged_causal_f16(
   }
 }
 
+// sdpa_paged_causal_kvl_f16 -- sdpa_paged_causal_f16 + a PREFIX KEY-MASK: a
+// query attends only to keys whose global position is < key_valid_len (in
+// addition to the causal horizon). Used by the diffusion text encoder to match
+// HF's attention_mask over right-padded prompts (padding="max_length"): the
+// real prefix attends causally among itself; every padding query attends ONLY
+// to the real prefix (never to other padding, matching the masked keys). With
+// key_valid_len <= 0 this is byte-identical to sdpa_paged_causal_f16. Same
+// buffer contract + one extra constant.
+//   0:q 1:kpool 2:vpool 3:out 4:scale 5:D 6:Hq 7:Hkv 8:n_q 9:q_offset
+//   10:page_tokens 11:n_pages 12:page_table 13:key_valid_len
+kernel void sdpa_paged_causal_kvl_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    const device VPIPE_ELT* vpool      [[buffer(2)]],
+    device VPIPE_ELT*       out        [[buffer(3)]],
+    constant float&    scale      [[buffer(4)]],
+    constant int&      D          [[buffer(5)]],
+    constant int&      Hq         [[buffer(6)]],
+    constant int&      Hkv        [[buffer(7)]],
+    constant int&      n_q        [[buffer(8)]],
+    constant int&      q_offset   [[buffer(9)]],
+    constant int&      page_tokens[[buffer(10)]],
+    constant int&      n_pages    [[buffer(11)]],
+    const device int*  page_table [[buffer(12)]],
+    constant int&      key_valid_len [[buffer(13)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int h = (int)tid.y;
+  const int qi = (int)tid.z;
+  const int kv = h / (Hq / Hkv);
+  const int per = D / 32;
+  const int q_pos = q_offset + qi;
+
+  const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off = (uint)kv * page_tokens * D;
+
+  float qreg[SDPA_MAX_PER];
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    qreg[p] = float(qh[lane * per + p]) * scale;
+    acc[p] = 0.0f;
+  }
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  bool done = false;
+  for (int pg = 0; pg < n_pages && !done; ++pg) {
+    const int pid    = page_table[pg * 3 + 0];
+    const int nvalid = page_table[pg * 3 + 1];
+    const int gstart = page_table[pg * 3 + 2];
+    const device VPIPE_ELT* kbase = kpool + (uint)pid * page_stride + head_off;
+    const device VPIPE_ELT* vbase = vpool + (uint)pid * page_stride + head_off;
+    for (int t = 0; t < nvalid; ++t) {
+      const int kpos = gstart + t;
+      if (kpos > q_pos) { done = true; break; }        // causal (monotonic)
+      // prefix key-mask: keys >= key_valid_len are padding -> skip. Monotonic
+      // in kpos, so break (uniform across the simdgroup, like the causal break).
+      if (key_valid_len > 0 && kpos >= key_valid_len) { done = true; break; }
+      float dot = 0.0f;
+      for (int p = 0; p < per; ++p) {
+        dot += qreg[p] * float(kbase[(uint)t * D + lane * per + p]);
+      }
+      dot = simd_sum(dot);
+
+      const float m_new = max(m, dot);
+      const float corr = exp(m - m_new);
+      const float pj = exp(dot - m_new);
+      l = l * corr + pj;
+      for (int p = 0; p < per; ++p) {
+        acc[p] = acc[p] * corr + pj * float(vbase[(uint)t * D + lane * per + p]);
+      }
+      m = m_new;
+    }
+  }
+
+  const float inv_l = 1.0f / l;
+  for (int p = 0; p < per; ++p) {
+    out[((uint)h * n_q + qi) * D + lane * per + p] = VPIPE_ELT(acc[p] * inv_l);
+  }
+}
+
 // sdpa_paged_mma_f16 -- MMA (simdgroup_matrix) flash attention over the
 // paged KV pool, for PREFILL (n_q large). The scalar paged kernels above
 // do per-key online-softmax dot products with only 32-lane parallelism;

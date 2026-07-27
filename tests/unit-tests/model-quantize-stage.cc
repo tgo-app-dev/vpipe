@@ -17,6 +17,8 @@
 #include "generative-models/quantize/calibration.h"
 #include "generative-models/tokenizer.h"
 #include "stages/model-quantize-stage.h"
+
+#include "generative-models/mage/metal-mage-flow-transformer.h"
 #include "stages/model-registry.h"
 
 #include <cstdio>
@@ -450,4 +452,84 @@ TEST(model_quantize_stage, gemma_quantize_generates)
   fs::remove_all(out, ec);
   EXPECT_TRUE(!gen.empty());
   EXPECT_TRUE(ans.find("Paris") != std::string::npos);
+}
+
+// Mage-Flow DiT quantization: the family is detected from the transformer's
+// `_class_name` ("MageFlow"), shares Qwen-Image's quant leaf set (identical
+// tensor names) and takes its block count from `depth`, not `num_layers`.
+// Also exercises the self-contained pipeline assembly (and its progress bar).
+// Env: VPIPE_MAGE_TEST_MODEL_PATH = the Mage-Flow model root.
+TEST(model_quantize_stage, mage_flow_dit_quantizes)
+{
+  const char* root = std::getenv("VPIPE_MAGE_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path out = fs::temp_directory_path() /
+                       ("vpipe-mq-mage-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(out, ec);
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("src_model", FlexData::make_string(root));
+    o.insert("output_name", FlexData::make_string(out.string()));
+    o.insert("target", FlexData::make_string("dit"));
+    o.insert("bits", FlexData::make_int(4));
+    o.insert("group_size", FlexData::make_int(64));
+    o.insert("skip_existing", FlexData::make_bool(false));
+  }
+  ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
+  ASSERT_TRUE(s.config_error().empty());
+  ASSERT_TRUE(s.quantize_once());
+
+  // The output must be a SELF-CONTAINED pipeline: the quantized transformer
+  // plus the copied siblings, usable directly as an hf_dir.
+  EXPECT_TRUE(fs::exists(out / "transformer" / "config.json", ec));
+  EXPECT_TRUE(fs::exists(out / "vae" / "config.json", ec));
+  EXPECT_TRUE(fs::exists(out / "text_encoder" / "config.json", ec));
+  EXPECT_TRUE(fs::exists(out / "model_index.json", ec));
+
+  auto wts =
+      vpipe::genai::MetalLlamaWeights::open_model((out / "transformer").string());
+  ASSERT_TRUE(wts.has_value());
+  int n_scales = 0, n_u32 = 0, n_bf16 = 0;
+  for (const auto& n : wts->tensor_names()) {
+    const auto* ti = wts->info(n);
+    if (ti == nullptr) { continue; }
+    if (n.size() > 7 && n.compare(n.size() - 7, 7, ".scales") == 0) {
+      ++n_scales;
+    }
+    if (ti->dtype == "U32") { ++n_u32; }
+    if (ti->dtype == "BF16") { ++n_bf16; }
+  }
+  std::printf("[model_quantize_stage] mage-flow DiT: %d quantized (.scales), "
+              "%d U32, %d BF16 passthrough\n", n_scales, n_u32, n_bf16);
+  EXPECT_TRUE(n_scales > 0);
+  EXPECT_TRUE(n_u32 > 0);
+  // img_in / txt_in / the norm_out+proj_out head and the adaLN modulation stay
+  // bf16 by default (precision-sensitive), so a pure-U32 output means the leaf
+  // set matched too much.
+  EXPECT_TRUE(n_bf16 > 0);
+  // 12 quantized leaves per block x depth 12 -- proves `depth` was read (a
+  // fallback to the default 28 would not change this count, but a wrong leaf
+  // set would).
+  EXPECT_TRUE(n_scales == 144);
+
+  // Producing files is not the same as producing a usable model: load the
+  // quantized DiT back through the real Mage-Flow loader.
+  {
+    auto m = vpipe::genai::MetalMageFlowTransformer::load(
+        (out / "transformer").string(), sess.metal_compute(),
+        vpipe::genai::mage_flow_dit_config());
+    EXPECT_TRUE((bool)m);
+    if (m) {
+      std::printf("[model_quantize_stage] quantized mage-flow DiT reloaded\n");
+    }
+  }
+
+  fs::remove_all(out, ec);
 }

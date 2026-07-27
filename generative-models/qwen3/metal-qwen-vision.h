@@ -43,10 +43,26 @@ public:
     float image_mean[3] = {0.5f, 0.5f, 0.5f};
     float image_std[3]  = {0.5f, 0.5f, 0.5f};
     float ln_eps       = 1e-6f;
+    // smart_resize pixel bounds (preprocessor_config.json size.shortest_edge /
+    // size.longest_edge). The defaults are the Qwen2/3-VL processor defaults
+    // the LM path has always used; a repo that ships its own bounds (e.g.
+    // Mage-Flow's 65536 / 16777216) must set them or a small / very wide
+    // reference image is left un-upscaled where the reference upscales it.
+    int min_pixels     = 56 * 56;
+    int max_pixels     = 28 * 28 * 1280;
     // When non-empty, the tower loads from this mmproj-*.gguf (llama.cpp
     // CLIP layout) instead of the safetensors `model_dir`. Same BF16/F32
     // weights, just CLIP tensor names + a split patch-embed conv.
     std::string gguf_mmproj;
+    // Safetensors weight-name prefix for the tower. The Qwen3-VL LM checkpoints
+    // store it under "vision_tower." (default); the Krea-2 diffusion text
+    // encoder (a qwen3_vl checkpoint) stores the same tower under "visual.".
+    std::string weight_prefix = "vision_tower.";
+    // Qwen3-VL deepstack: ViT block indices whose post-block hidden states are
+    // additionally merged (postshuffle-norm merger) into extra visual features
+    // injected into the LM at layers 0..N-1. Empty => no deepstack (the tower
+    // emits only the final merger tokens). Populated from config_from.
+    std::vector<int> deepstack_indexes;
     int head_dim() const { return hidden / n_heads; }   // 64
   };
 
@@ -59,6 +75,11 @@ public:
     int out_hidden = 0;
     int grid_h     = 0;
     int grid_w     = 0;
+    // Qwen3-VL deepstack features, one per config.deepstack_indexes entry
+    // (in that order): native f16 [n_tokens * out_hidden]. Empty when the
+    // tower has no deepstack mergers. Added to the LM hidden states at the
+    // image-token rows after LM layers 0,1,... (see MetalQwenModel forward).
+    std::vector<metal_compute::SharedBuffer> deepstack;
   };
 
   static std::unique_ptr<MetalQwenVisionEncoder> load(
@@ -126,6 +147,14 @@ private:
   metal_compute::SharedBuffer _pe_w, _pe_b;   // patch embed [hidden,1536],[hidden]
   metal_compute::SharedBuffer _pos_w;          // pos table [num_pos_embed, hidden] f16
   metal_compute::SharedBuffer _mnw, _mnb, _mfc1w, _mfc1b, _mfc2w, _mfc2b;
+  // Qwen3-VL deepstack mergers (one per _cfg.deepstack_indexes). Same shape as
+  // the main merger but POSTSHUFFLE norm (LayerNorm over S*S*hidden, applied to
+  // the merged window), so `dnw`/`dnb` are mdim-wide (vs the main merger's
+  // hidden-wide norm). Empty when the tower has no deepstack.
+  struct DsMerger {
+    metal_compute::SharedBuffer dnw, dnb, fc1w, fc1b, fc2w, fc2b;
+  };
+  std::vector<DsMerger> _ds;
   std::vector<float> _rope_inv_freq;           // [head_dim/4]
   int _feat_dim = 0;                           // temporal*patch*patch*3
 };

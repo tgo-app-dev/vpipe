@@ -547,6 +547,170 @@ resample_planar_u8_to_u8(
       });
 }
 
+int
+build_lanczos_coeffs(int srcN, double in0, int outSize, double scale,
+                     std::vector<int>& bounds, std::vector<float>& weights)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double a = 3.0;                       // Lanczos-3 support
+  const double filterscale = std::max(1.0, scale);
+  const double support = a * filterscale;
+  const int ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+  bounds.assign(static_cast<std::size_t>(outSize), 0);
+  weights.assign(static_cast<std::size_t>(outSize) * ksize, 0.0f);
+  auto sinc = [&](double x) -> double {
+    if (x == 0.0) { return 1.0; }
+    x *= kPi;
+    return std::sin(x) / x;
+  };
+  auto lanczos = [&](double x) -> double {
+    if (x > -a && x < a) { return sinc(x) * sinc(x / a); }
+    return 0.0;
+  };
+  std::vector<double> tmp(static_cast<std::size_t>(ksize));
+  const double ss = 1.0 / filterscale;
+  for (int o = 0; o < outSize; ++o) {
+    const double center = in0 + (o + 0.5) * scale;
+    int xmin = static_cast<int>(center - support + 0.5);
+    if (xmin < 0) { xmin = 0; }
+    int xmax = static_cast<int>(center + support + 0.5);
+    if (xmax > srcN) { xmax = srcN; }
+    xmax -= xmin;                                 // tap count
+    double ww = 0.0;
+    for (int t = 0; t < xmax; ++t) {
+      const double w = lanczos((t + xmin - center + 0.5) * ss);
+      tmp[static_cast<std::size_t>(t)] = w;
+      ww += w;
+    }
+    float* row = &weights[static_cast<std::size_t>(o) * ksize];
+    for (int t = 0; t < xmax; ++t) {
+      row[t] = static_cast<float>(ww != 0.0 ? tmp[static_cast<std::size_t>(t)]
+                                                  / ww
+                                            : 0.0);
+    }
+    bounds[static_cast<std::size_t>(o)] = xmin;
+  }
+  return ksize;
+}
+
+int
+build_cubic_coeffs(int srcN, double in0, int outSize, double scale,
+                   std::vector<int>& bounds, std::vector<float>& weights)
+{
+  constexpr double a = -0.5;                      // Pillow's bicubic `a`
+  constexpr double support0 = 2.0;
+  const double filterscale = std::max(1.0, scale);
+  const double support = support0 * filterscale;
+  const int ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+  bounds.assign(static_cast<std::size_t>(outSize), 0);
+  weights.assign(static_cast<std::size_t>(outSize) * ksize, 0.0f);
+  auto cubic = [&](double x) -> double {
+    if (x < 0.0) { x = -x; }
+    if (x < 1.0) { return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0; }
+    if (x < 2.0) { return (((x - 5.0) * x + 8.0) * x - 4.0) * a; }
+    return 0.0;
+  };
+  std::vector<double> tmp(static_cast<std::size_t>(ksize));
+  const double ss = 1.0 / filterscale;
+  for (int o = 0; o < outSize; ++o) {
+    const double center = in0 + (o + 0.5) * scale;
+    int xmin = static_cast<int>(center - support + 0.5);
+    if (xmin < 0) { xmin = 0; }
+    int xmax = static_cast<int>(center + support + 0.5);
+    if (xmax > srcN) { xmax = srcN; }
+    xmax -= xmin;                                 // tap count
+    double ww = 0.0;
+    for (int t = 0; t < xmax; ++t) {
+      const double w = cubic((t + xmin - center + 0.5) * ss);
+      tmp[static_cast<std::size_t>(t)] = w;
+      ww += w;
+    }
+    float* row = &weights[static_cast<std::size_t>(o) * ksize];
+    for (int t = 0; t < xmax; ++t) {
+      row[t] = static_cast<float>(ww != 0.0 ? tmp[static_cast<std::size_t>(t)]
+                                                  / ww
+                                            : 0.0);
+    }
+    bounds[static_cast<std::size_t>(o)] = xmin;
+  }
+  return ksize;
+}
+
+bool
+resample_lanczos_planar_u8_to_u8(
+    MetalCompute& mc, const ExternalStorageHandle& src,
+    int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    std::uint8_t pad_r, std::uint8_t pad_g, std::uint8_t pad_b,
+    const SessionContextIntf* session)
+{
+  if (!mc.valid()
+      || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) {
+    return false;
+  }
+  auto* src_buf = static_cast<MTL::Buffer*>(src.mtl_buffer);
+  auto* dst_buf = static_cast<MTL::Buffer*>(dst.mtl_buffer);
+  if (!src_buf || !dst_buf) { return false; }
+  const std::size_t need_src = static_cast<std::size_t>(3) * in_w * in_h;
+  const std::size_t need_dst = static_cast<std::size_t>(3) * out_w * out_h;
+  if (src.byte_size < need_src || dst.byte_size < need_dst) { return false; }
+
+  const ResampleGeom g =
+      compute_resample_geom(in_w, in_h, out_w, out_h, mode, src_x, src_y,
+                            scale);
+  if (g.new_w <= 0 || g.new_h <= 0) { return false; }  // nothing to sample
+
+  std::vector<int> bx, by;
+  std::vector<float> wx, wy;
+  const int ksx =
+      build_lanczos_coeffs(in_w, g.src_x0, g.new_w, g.inv_x, bx, wx);
+  const int ksy =
+      build_lanczos_coeffs(in_h, g.src_y0, g.new_h, g.inv_y, by, wy);
+
+  SharedBuffer wxb =
+      staging_from_bytes_(mc, wx.data(), wx.size() * sizeof(float));
+  SharedBuffer bxb =
+      staging_from_bytes_(mc, bx.data(), bx.size() * sizeof(int));
+  SharedBuffer wyb =
+      staging_from_bytes_(mc, wy.data(), wy.size() * sizeof(float));
+  SharedBuffer byb =
+      staging_from_bytes_(mc, by.data(), by.size() * sizeof(int));
+  if (wxb.empty() || bxb.empty() || wyb.empty() || byb.empty()) {
+    return false;
+  }
+
+  uint32_t params[4] = {
+      static_cast<uint32_t>(in_w),  static_cast<uint32_t>(in_h),
+      static_cast<uint32_t>(out_w), static_cast<uint32_t>(out_h) };
+  uint32_t params2[4] = {
+      static_cast<uint32_t>(g.new_w), static_cast<uint32_t>(g.new_h),
+      static_cast<uint32_t>(g.pad_x), static_cast<uint32_t>(g.pad_y) };
+  uint32_t params3[4] = {
+      static_cast<uint32_t>(ksx), static_cast<uint32_t>(ksy), 0u, 0u };
+  float params4[4] = { static_cast<float>(pad_r), static_cast<float>(pad_g),
+                       static_cast<float>(pad_b), 0.0f };
+
+  // The coeff SharedBuffers stay alive across the (synchronous commit+wait)
+  // dispatch_ below, so they are resident for the whole GPU run.
+  return dispatch_(mc, "resample_lanczos_planar_u8",
+      "resample_lanczos_planar_u8", "resample-lanczos", session,
+      [&](ComputeEncoder& enc, const ComputeFunction& fn) {
+        enc.set_mtl_buffer(0, src_buf, 0);
+        enc.set_mtl_buffer(1, dst_buf, 0);
+        enc.set_buffer(2, wxb, 0);
+        enc.set_buffer(3, bxb, 0);
+        enc.set_buffer(4, wyb, 0);
+        enc.set_buffer(5, byb, 0);
+        enc.set_constant_bytes(6, params,  sizeof(params));
+        enc.set_constant_bytes(7, params2, sizeof(params2));
+        enc.set_constant_bytes(8, params3, sizeof(params3));
+        enc.set_constant_bytes(9, params4, sizeof(params4));
+        const Dims2D d = dims2d_(fn, out_w, out_h);
+        enc.dispatch(d.grid, d.threadgroup);
+        return true;
+      });
+}
+
 bool
 letterbox_planar_u8_to_bgra_cvpixelbuffer(
     MetalCompute& mc, const ExternalStorageHandle& src,

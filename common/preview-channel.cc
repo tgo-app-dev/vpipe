@@ -42,12 +42,17 @@ PreviewChannel::broadcast_(const Blob& blob)
   for (auto& sub : _subs) {
     if (sub->bytes + blob->size() > kMaxSubBytes) {
       // Lagging client: drop the backlog and re-seed the init segment so
-      // its MediaSource rebuilds + resyncs to the live edge.
+      // its MediaSource rebuilds + resyncs to the live edge. A retained
+      // still (image mode) is re-seeded too so the client keeps a picture.
       sub->q.clear();
       sub->bytes = 0;
       if (_init_blob) {
         sub->q.push_back(_init_blob);
         sub->bytes += _init_blob->size();
+      }
+      if (_image_blob) {
+        sub->q.push_back(_image_blob);
+        sub->bytes += _image_blob->size();
       }
     }
     sub->q.push_back(blob);
@@ -128,6 +133,21 @@ PreviewChannel::push_audio(const float* const* planes, int channels,
 }
 
 void
+PreviewChannel::push_image(const std::uint8_t* data, std::size_t n)
+{
+  if (n == 0 || !data) {
+    return;
+  }
+  Blob b = msg_(kMsgImage, data, n);
+  std::lock_guard<std::mutex> lk(_mu);
+  if (_closed) {
+    return;
+  }
+  _image_blob = b;   // retained + replayed to new subscribers
+  broadcast_(b);
+}
+
+void
 PreviewChannel::close()
 {
   std::lock_guard<std::mutex> lk(_mu);
@@ -173,6 +193,10 @@ PreviewChannel::subscribe()
   if (_init_blob) {
     sub->q.push_back(_init_blob);
     sub->bytes += _init_blob->size();
+  }
+  if (_image_blob) {
+    sub->q.push_back(_image_blob);   // a mid-still connect sees the picture
+    sub->bytes += _image_blob->size();
   }
   _subs.push_back(sub);
   return sub;

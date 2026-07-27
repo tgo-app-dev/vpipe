@@ -49,10 +49,13 @@ kernel void dense_gemm_bias_f16(
   for (int k0 = 0; k0 < Kd; k0 += DG_TILE) {
     // As[ty][tx] = x[m, k0+tx]; Bs[ty][tx] = W[n_of_tx, k0+ty].
     const int ax = k0 + tx;
-    As[ty][tx] = (m < M && ax < Kd) ? x[(uint)m * Kd + ax] : (VPIPE_ELT)0;
+    // 64-bit row offsets: for a VAE-decode conv-GEMM the im2col operand x[M,Kd]
+    // has M*Kd > 2^32 once the output area passes ~1.86M px at Kd=9*256 (M =
+    // Hout*Wout, e.g. 2048x1536 -> 3.15M*2304 = 7.26G), which a uint index wraps.
+    As[ty][tx] = (m < M && ax < Kd) ? x[(ulong)m * Kd + ax] : (VPIPE_ELT)0;
     const int bn = (int)tgig.x * DG_TILE + ty;   // the W-row this slot feeds
     const int bk = k0 + tx;
-    Bs[ty][tx] = (bn < N && bk < Kd) ? W[(uint)bn * Kd + bk] : (VPIPE_ELT)0;
+    Bs[ty][tx] = (bn < N && bk < Kd) ? W[(ulong)bn * Kd + bk] : (VPIPE_ELT)0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int t = 0; t < DG_TILE; ++t) {
       // x[m, k0+t] = As[ty][t]; W[n, k0+t] = Bs[tx][t].
@@ -62,7 +65,7 @@ kernel void dense_gemm_bias_f16(
   }
   if (m < M && n < N) {
     if (has_bias) { acc += (float)bias[n]; }
-    y[(uint)m * N + n] = (VPIPE_ELT)acc;
+    y[(ulong)m * N + n] = (VPIPE_ELT)acc;
   }
 }
 

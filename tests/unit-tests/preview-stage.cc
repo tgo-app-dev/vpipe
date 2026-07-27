@@ -93,6 +93,19 @@ make_tensor_(int H, int W, float v = 0.5f)
   return tb;
 }
 
+// A video-type frame: carries an fps sideband (as video-to-rgb tags its
+// output). The preview stage treats such a source as video, never image.
+TensorBeat
+make_tensor_fps_(int H, int W, int fps, float v = 0.5f)
+{
+  TensorBeat tb = make_tensor_(H, W, v);
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert("fps_num", FlexData::make_uint(fps));
+  sb.as_object().insert("fps_den", FlexData::make_uint(1));
+  tb.sideband = std::move(sb);
+  return tb;
+}
+
 TensorBeat
 make_pcm_tensor_(int n, int sample_rate)
 {
@@ -130,10 +143,12 @@ struct Collected {
   int  init      = 0;
   int  fragment  = 0;
   int  audio     = 0;
+  int  image     = 0;
   bool cfg_video = false;
   bool cfg_audio = false;
   vector<uint8_t> last_init;
   vector<uint8_t> last_fragment;
+  vector<uint8_t> last_image;
 };
 
 Collected
@@ -164,6 +179,9 @@ drain_(const std::shared_ptr<PreviewChannel>& ch,
       c.last_fragment = payload;
     } else if (type == PreviewChannel::kMsgAudio) {
       ++c.audio;
+    } else if (type == PreviewChannel::kMsgImage) {
+      ++c.image;
+      c.last_image = payload;
     }
   }
   ch->unsubscribe(sub);
@@ -233,11 +251,12 @@ TEST(preview_stage, black_before_input_produces_fmp4)
   EXPECT_TRUE(has_box_(c.last_fragment, "mdat"));
 }
 
-TEST(preview_stage, still_image_repeats_at_cadence)
+TEST(preview_stage, still_image_switches_to_image_mode)
 {
-  // A single still image (one beat then EOS) must play as continuous video:
-  // the cadence repeats the last frame, so fragments keep flowing. The
-  // output adopts the image's native resolution.
+  // A single still image (one beat then EOS, no fps sideband) is an
+  // image-type source arriving slower than 1 fps: after ~1 s the stage
+  // stops encoding video and sends the picture as a PNG still (type 5).
+  // The output still adopts the image's native resolution.
   Session sess;
 
   auto pl = make_unique<Pipeline>("p", &sess);
@@ -252,16 +271,96 @@ TEST(preview_stage, still_image_repeats_at_cadence)
       &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
   auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
 
-  Collected c = run_preview_(sess, *pl, pv, 2000);
+  Collected c = run_preview_(sess, *pl, pv, 2500);
   EXPECT_TRUE(c.cfg_video);
   EXPECT_TRUE(c.init >= 1);
   EXPECT_TRUE(has_box_(c.last_init, "moov"));
-  EXPECT_TRUE(c.fragment >= 2);        // still image keeps flowing live
-  EXPECT_TRUE(has_box_(c.last_fragment, "moof"));
+  EXPECT_TRUE(c.image >= 1);            // flipped to still-image mode
+  EXPECT_TRUE(pv->image_mode_active());
+  // The still is a PNG (0x89 'P' 'N' 'G' signature).
+  EXPECT_TRUE(c.last_image.size() > 8);
+  EXPECT_TRUE(c.last_image[0] == 0x89 && c.last_image[1] == 'P'
+              && c.last_image[2] == 'N' && c.last_image[3] == 'G');
   // Native resolution adopted from the frame.
   EXPECT_TRUE(pv->output_width() == 320);
   EXPECT_TRUE(pv->output_height() == 240);
-  EXPECT_TRUE(pv->codec_string().rfind("avc1.", 0) == 0);
+}
+
+TEST(preview_stage, image_mode_disabled_stays_video)
+{
+  // image_mode=false forces the legacy behavior: a still image repeats as
+  // continuous video (fragments keep flowing), no type-5 stills.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = make_tensor_(240, 320, 0.5f);
+  src_u->count = 1;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("image_mode", FlexData::make_bool(false));
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, std::move(cfg));
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 2500);
+  EXPECT_TRUE(c.image == 0);           // never enters image mode
+  EXPECT_TRUE(!pv->image_mode_active());
+  EXPECT_TRUE(c.fragment >= 2);        // still flowing as video
+  EXPECT_TRUE(has_box_(c.last_fragment, "moof"));
+}
+
+TEST(preview_stage, fast_image_source_stays_video)
+{
+  // An image-type source (no fps sideband) that arrives faster than 1 fps
+  // is NOT downgraded to stills -- it stays video.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb          = make_tensor_(240, 320, 0.5f);   // no fps sideband
+  src_u->count       = 1000;
+  src_u->per_beat_us = 100'000;                        // ~10 fps
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 2500);
+  EXPECT_TRUE(c.image == 0);           // fast input -> stays video
+  EXPECT_TRUE(!pv->image_mode_active());
+  EXPECT_TRUE(c.fragment >= 2);
+}
+
+TEST(preview_stage, slow_video_source_stays_video)
+{
+  // A slow VIDEO-type source (single frame, but tagged with an fps
+  // sideband like a camera via video-to-rgb) stays video however slow it
+  // runs -- image mode is only for image-type sources.
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = make_tensor_fps_(240, 320, 30, 0.5f);   // fps sideband
+  src_u->count = 1;                                       // then idle
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 2500);
+  EXPECT_TRUE(c.image == 0);           // video-type: never image mode
+  EXPECT_TRUE(!pv->image_mode_active());
+  EXPECT_TRUE(c.fragment >= 2);        // repeats as video
 }
 
 TEST(preview_stage, adopts_native_resolution_reinits)

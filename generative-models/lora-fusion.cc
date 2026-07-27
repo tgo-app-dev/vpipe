@@ -147,7 +147,8 @@ ends_with(const std::string& s, const std::string& suf)
 bool
 fuse_lora(MetalCompute* mc, const std::string& base_dir,
           const std::string& lora_path, const std::string& out_dir,
-          float scale, std::string* err, const std::function<bool()>& stop)
+          float scale, std::string* err, const std::function<bool()>& stop,
+          const std::function<void(std::size_t, std::size_t)>& progress)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
@@ -285,7 +286,9 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
 
   std::vector<std::string> names = base.tensor_names();
   int n_fused = 0, n_pass = 0, n_lokr = 0;
-  for (const std::string& name : names) {
+  for (std::size_t idx = 0; idx < names.size(); ++idx) {
+    const std::string& name = names[idx];
+    if (progress) { progress(idx, names.size()); }
     if (stop()) { return fail("lora-fuse: stopped"); }
     const auto* ti = base.info(name);
     if (ti == nullptr) { continue; }
@@ -383,6 +386,7 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
     }
     ++n_fused;
   }
+  if (progress) { progress(names.size(), names.size()); }
   if (!wr.close()) { return fail("lora-fuse: finalize shards failed"); }
 
   // Copy config.json (+ any other small json sidecars) verbatim.

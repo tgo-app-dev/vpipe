@@ -138,16 +138,30 @@ class MetalFlux2Vae {
   Conv _enc_conv_out;               // -> 2*latent (mean, logvar)
   Conv _quant_conv;                 // quant_conv (1x1, 2*latent -> 2*latent)
 
+  // y_row0: write the M-row result into y starting at output row y_row0 (the
+  // tiled im2col conv feeds one band at a time into out[r0:r0+M]); 0 = at y[0].
   void conv_gemm_bias_(metal_compute::ComputeEncoder& enc,
                        const metal_compute::SharedBuffer& x,
                        const metal_compute::SharedBuffer& w,
                        const metal_compute::SharedBuffer& b,
-                       const metal_compute::SharedBuffer& y, int M, int N, int K);
+                       const metal_compute::SharedBuffer& y, int M, int N, int K,
+                       int y_row0 = 0);
+
+  // Row-tiled im2col 3x3 conv (stride 1 or 2) into a pre-alloc'd `out`: streams
+  // output-row bands through `col` (bounded to `cap` ELEMS) instead of the full
+  // [OH*OW, 9*cin] scratch. Each band's GEMM is one un-chunked dispatch under
+  // the matmul2d M-corruption threshold (band <= _mma_max_m/2). Shared by
+  // decode + encode; the caller does the hw-conv fast path first.
+  void tiled_conv3x3_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& in,
+                      const metal_compute::SharedBuffer& out, int H, int W,
+                      const Conv& c, int stride,
+                      const metal_compute::SharedBuffer& col, std::size_t cap);
 
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_groupnorm, _fn_mul_sigmoid,
       _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2,
-      _fn_upsample, _fn_bias_add;
+      _fn_im2col_tiled, _fn_im2col_s2_tiled, _fn_upsample, _fn_bias_add;
   // Matrix-core FULL flash-attention for the mid-block self-attention (D = the
   // mid channel dim block_out[-1]). Replaces the scalar O(N^2) sdpa_full_f16
   // that dominates decode at high res. Best-effort (matrix cores + D in

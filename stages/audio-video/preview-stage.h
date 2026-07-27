@@ -42,6 +42,16 @@ struct TensorBeat;
 // frame establishes the native size). Audio (optional) is passed through
 // as planar float and rendered by WebAudio in the browser.
 //
+// STILL-IMAGE MODE. An image-type source (one that never tags its frames
+// with an fps sideband -- e.g. load-image or a generative image stage, as
+// opposed to a camera/video feed) that delivers frames slower than 1 fps
+// is streamed as still pictures instead of continuous H.264: each new
+// frame is PNG-encoded (full quality -- image mode is NOT bounded by the
+// video bitrate) and pushed as a type-5 message; the browser shows it in
+// an <img> and stops the video decoder. If the frame rate climbs back
+// above 1 fps the stage returns to video mode. Auto + adaptive; gated by
+// the `image_mode` config (default on).
+//
 // iport 0: video RGB TensorBeat ([3,H,W], F32 or U8). The first frame sets
 //          the output resolution; later size changes are dropped.
 // iport 1: (optional) audio PCM TensorBeat -- F32 rank-1 [n] (mono) or
@@ -53,6 +63,9 @@ struct TensorBeat;
 //   input_normalized (bool, default true) -- F32 input in [0,1] vs [0,255]
 //   title            (string, default "") -- optional picker label; empty
 //                    = the stage id.
+//   image_mode       (bool, default true) -- allow still-image mode for a
+//                    slow image-type source (see above); false = always
+//                    encode video.
 class PreviewStage final
   : public TypedStage<PreviewStage>
   , public PreviewSource
@@ -81,6 +94,7 @@ public:
   { return _cadence_den ? _cadence_num / _cadence_den : 0; }
   int  output_width()  const noexcept { return _out_w; }
   int  output_height() const noexcept { return _out_h; }
+  bool image_mode_active() const noexcept { return _mode == Mode::Image; }
 
 private:
   void resolve_roles_(RuntimeContext& ctx);
@@ -104,6 +118,14 @@ private:
   void convert_to_frame_(const TensorBeat& tb);   // RGB [3,H,W] -> _frame
   void fill_black_();
 
+  // Still-image mode: keep the latest frame as packed RGB24, PNG-encode it
+  // on demand, and push it as a type-5 message. Only image-type sources
+  // (no fps sideband) allocate/fill _rgb.
+  bool ensure_rgb_(int W, int H);
+  bool ensure_png_();
+  void pack_rgb24_(const TensorBeat& tb);          // RGB [3,H,W] -> _rgb
+  void send_image_();                              // encode + push PNG
+
   void handle_audio_(const TensorBeat& tb);
 
   // Encode + mux the current output frame (one cadence tick); flush a
@@ -123,6 +145,7 @@ private:
   std::int64_t _bitrate{};
   bool         _input_normalized{};
   std::string  _title;
+  bool         _image_mode_enabled = true;
 
   // Cadence (default 25 fps; adopts an input frame's sideband fps).
   int _cadence_num = 25;
@@ -160,6 +183,23 @@ private:
 
   std::chrono::steady_clock::time_point _next_tick;
   bool _clock_started = false;
+
+  // Still-image mode. A source is "image-type" until it tags a frame with
+  // an fps sideband (_source_is_video). The stage flips to Image when such
+  // a source goes slower than 1 fps, and back to Video when it speeds up.
+  enum class Mode { Video, Image };
+  Mode _mode           = Mode::Video;
+  bool _source_is_video = false;   // saw an fps sideband => video-type
+  bool _fast_input      = false;   // last inter-arrival < 1 s (>= 1 fps)
+  bool _have_arrival    = false;
+  std::chrono::steady_clock::time_point _last_arrival{};
+
+  // PNG still encoder (built lazily for an image-type source).
+  AVCodecContext* _png     = nullptr;
+  AVFrame*        _rgb     = nullptr;   // packed RGB24 of the latest frame
+  AVPacket*       _png_pkt = nullptr;
+  bool            _png_bad = false;     // encoder unavailable => stay video
+  bool            _have_rgb = false;
 
   // Audio passthrough.
   bool _audio_seen = false;

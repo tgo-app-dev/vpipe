@@ -13,6 +13,29 @@ model_catalog()
   // MODEL CATALOGUE -- single edit point. Append an entry to add a
   // model; the selection menu rebuilds itself from this table.
   // ==================================================================
+  // The 18 non-asset files every Mage-Flow repo ships. All six repos share
+  // ONE layout, so the list is named once here and reused by each entry
+  // below; pinning it skips the ~20 sample images under assets/.
+  static const std::vector<std::string> kMageFlowFiles = {
+      "model_index.json",
+      "transformer/config.json",
+      "transformer/diffusion_pytorch_model.safetensors",
+      "vae/config.json",
+      "vae/diffusion_pytorch_model.safetensors",
+      "text_encoder/config.json",
+      "text_encoder/generation_config.json",
+      "text_encoder/model.safetensors.index.json",
+      "text_encoder/model-00001-of-00002.safetensors",
+      "text_encoder/model-00002-of-00002.safetensors",
+      "text_encoder/tokenizer.json",
+      "text_encoder/tokenizer_config.json",
+      "text_encoder/vocab.json",
+      "text_encoder/merges.txt",
+      "text_encoder/chat_template.json",
+      "text_encoder/preprocessor_config.json",
+      "text_encoder/video_preprocessor_config.json",
+      "scheduler/scheduler_config.json"};
+
   static const std::vector<ModelCatalogEntry> kCatalog = {
     // ---- Evaluation datasets (model-eval stage) ----------------------
     // Fetched on demand from the HuggingFace datasets-server /rows API and
@@ -164,6 +187,10 @@ model_catalog()
      .variant = "GGUF QAT q4_0 (google, gated)",
      .hf_path = "google/gemma-4-12B-it-qat-q4_0-gguf",
      .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    {.family = "Gemma", .version = "4", .param_class = "12B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/gemma-4-12B-it-OptiQ-4bit",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
     // Raw google bf16 Gemma-4-it releases (gated; whole-repo fetch --
     // quantize with model-quantize before running). E-series are the
     // gemma3n-style effective (PLE) models -> "gemma4"; the dense 12B/31B
@@ -269,6 +296,32 @@ model_catalog()
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // Krea-2-Raw: the NON-distilled sibling of Krea-2-Turbo -- same diffusers
+    // layout + topology (Qwen3-VL text_encoder, Krea2Transformer2DModel, Qwen-
+    // Image VAE), but NOT CFG-distilled, so it runs classifier-free guidance
+    // (CFG>1). This is the model the identity-edit README prescribes for
+    // DELETION edits ("Raw model at CFG 3, ~20 steps"); Turbo (CFG-1 only)
+    // handles restyle/replace but not deletions. Same `files` pinning as Turbo
+    // (SKIPS the redundant top-level raw.safetensors, ~26 GB).
+    {.family = "Krea", .version = "2", .param_class = "12B",
+     .variant = "Raw bf16 (krea)",
+     .hf_path = "krea/Krea-2-Raw",
+     .model_type = "krea2",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // Krea-2 softwatercolor LoRA (adapts the Turbo DiT). Fuse into a DiT with
     // the lora-fuse stage (base = <Krea-2-Turbo>/transformer), then use the
     // fused DiT via the text-to-image `dit_dir`. Trigger: "Art Deco watercolor
@@ -304,6 +357,27 @@ model_catalog()
      .model_type = "krea2-lora",
      .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
      .files = {"Krea2-realism-V2.safetensors"},
+     .needs_tokenizer_json = false},
+    // Krea-2 identity-edit LoRA (conradlocke). Unlike the style LoRAs above,
+    // this is the adapter that ACTIVATES the in-context reference-edit path
+    // (ComfyUI-Krea2Edit): the source image is kept as clean frame-1 tokens in
+    // the DiT + the instruction is encoded image-grounded through Qwen3-VL. Wire
+    // the source VAE latent to the text-to-image `ref_latent0` iport (strength 0)
+    // and the raw source image to the diffusion-conditioner `ref_image` iport.
+    // Standard low-rank LoRA (lora_A/B), ai-toolkit / ComfyUI key convention
+    // (diffusion_model.{blocks,txtfusion.{layerwise,refiner}_blocks}.N.attn.
+    // {wq,wk,wv,wo,gate},mlp.{gate,up,down}); the lora-fuse name remap maps all
+    // 512 modules onto the diffusers base DiT (28 main + 2+2 fusion blocks).
+    // Trained on krea/Krea-2-Raw; the node + shared topology run on Turbo too.
+    // v1_2 (~1.83 GB) recommended; r128/r64 are SVD rank-reduced (>99% energy).
+    {.family = "Krea", .version = "2", .param_class = "LoRA",
+     .variant = "identity-edit LoRA (conradlocke)",
+     .hf_path = "conradlocke/krea2-identity-edit",
+     .model_type = "krea2-lora",
+     .parent_model_type = "krea2",   // fuses into any Krea-2 DiT
+     .files = {"krea2_identity_edit_v1_2.safetensors",
+               "krea2_identity_edit_v1_2_r128.safetensors",
+               "krea2_identity_edit_v1_2_r64.safetensors"},
      .needs_tokenizer_json = false},
     // ---- Qwen-Image (text+image -> image editing diffusion) -----------
     // Qwen-Image-Edit-2511 (Qwen): a flow-matching multi-reference IMAGE
@@ -435,6 +509,77 @@ model_catalog()
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // ---- Mage-Flow (microsoft) -- native-resolution t2i + image edit --
+    // A 4B flow-matching family in the SAME split-stage diffusers shape as
+    // Krea-2 / FLUX.2 (encoder -> DiT stage + separate VAE stages). Two
+    // instantiations share ONE architecture and one code path: Mage-Flow
+    // (text-to-image, model_type "mage-flow") and Mage-Flow-Edit
+    // (instruction editing, "mage-flow-edit"); each ships Base, RL-aligned
+    // and 4-step Turbo weights. All six repos are byte-identical in layout
+    // (~17.5 GB bf16). Sub-models:
+    //   text_encoder/ = Qwen3VLForConditionalGeneration (Qwen3-VL 4B: 36L,
+    //     hidden 2560, 32q/8kv GQA head_dim 128, interleaved mrope
+    //     [24,20,20] theta 5e6, tied embeds; plus a 24-layer ViT, patch 16,
+    //     out_hidden 2560, deepstack taps [5,11,17]). The pipeline takes the
+    //     LAST hidden state (a single tap, NOT a multi-layer concat like
+    //     FLUX.2) and DROPS the templated system prefix -- 34 tokens for
+    //     t2i, 64 for edit. Reference images ride the VL tower (long edge
+    //     capped at 384) so the instruction is image-grounded.
+    //   transformer/  = MageFlow, a 4B NR-MMDiT: 12 DUAL-STREAM joint
+    //     blocks (no single-stream tail), 24 heads x head_dim 128 = 3072
+    //     hidden, mlp_ratio 4 (GELU), in/out_channels 128 at patch_size 1
+    //     (one token per latent pixel -- no 2x2 packing), context_in_dim
+    //     2560, 3-axis RoPE [16,56,56] theta 10000 (frame/height/width,
+    //     scale_rope) with the TEXT stream left UNROTATED. Distilled
+    //     (guidance_embed=false). Edit conditioning matches Qwen-Image-Edit:
+    //     each reference occupies its own RoPE frame band (frame = index+1)
+    //     and stays clean while only the target tokens are stepped.
+    //   vae/          = MageVAE -- NOT an AutoencoderKL, but a symmetric
+    //     one-step diffusion codec (128 latent channels, 16x downsample, so
+    //     the same bytes/pixel as FLUX.2-VAE's 32ch/8x). Encoder and decoder
+    //     are DiCo conv trunks (1x1 + depthwise 3x3 + channel attention,
+    //     adaLN) evaluated at a FIXED t=0, so every adaLN modulation is a
+    //     constant that folds at load; the decoder ends in a per-pixel
+    //     32-dim MLP head. ~0.35 GB.
+    // Scheduler: FlowMatchEulerDiscreteScheduler, static shift 6.0. Turbo
+    // runs 4 steps at cfg 1.0 (a single forward, no negative branch);
+    // Base/RL run 30 / 20 steps at cfg 5.0.
+    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
+     .variant = "base bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow-Base",
+     .model_type = "mage-flow",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
+     .variant = "RL-aligned bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow",
+     .model_type = "mage-flow",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
+     .variant = "Turbo 4-step distilled bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow-Turbo",
+     .model_type = "mage-flow",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
+     .variant = "base bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow-Edit-Base",
+     .model_type = "mage-flow-edit",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
+     .variant = "RL-aligned bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow-Edit",
+     .model_type = "mage-flow-edit",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
+     .variant = "Turbo 4-step distilled bf16 (microsoft)",
+     .hf_path = "microsoft/Mage-Flow-Edit-Turbo",
+     .model_type = "mage-flow-edit",
+     .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -548,8 +693,13 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
     set({"audio"}, {"audio"});
-  } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit") {
+  } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
+             || mt == "mage-flow-edit") {
     set({"text", "image"}, {"image"});
+  } else if (mt == "mage-flow") {
+    // The t2i instantiation takes no reference image (the edit checkpoints,
+    // "mage-flow-edit", are the image-conditioned ones).
+    set({"text"}, {"image"});
   } else if (mt == "yolo") {
     set({"image"}, {});
   } else if (mt == "silero-vad" || mt == "audio-tagging") {

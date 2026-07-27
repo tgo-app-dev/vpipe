@@ -547,6 +547,52 @@ kernel void layer_norm_plain_f16(
   }
 }
 
+// Fused (no-affine) LayerNorm + adaLN modulate: out[r,h] = (1+scale[h]) *
+// LN(x[r])[h] + shift[h]. Folds layer_norm_plain_f16 + adaln_modulate_f16 into
+// one pass over x -- drops the intermediate normed-row write+read and one
+// dispatch per DiT norm site. scale/shift are [H] vectors (offset slices of a
+// shared modulation buffer) broadcast over the R rows. One threadgroup per row.
+kernel void layernorm_modulate_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* scale [[buffer(1)]],
+    const device VPIPE_ELT* shift [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&      H   [[buffer(4)]],
+    constant float&    eps [[buffer(5)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    const float v = (float)xr[i];
+    s1 += v; s2 += v * v;
+  }
+  s1 = simd_sum(s1); s2 = simd_sum(s2);
+  threadgroup float p1[LN_FF_TG / 32], p2[LN_FF_TG / 32];
+  if (simd_lid == 0) { p1[simd_gid] = s1; p2[simd_gid] = s2; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < LN_FF_TG / 32) ? p1[simd_lid] : 0.0f;
+    float b = (simd_lid < LN_FF_TG / 32) ? p2[simd_lid] : 0.0f;
+    a = simd_sum(a); b = simd_sum(b);
+    if (simd_lid == 0) { p1[0] = a; p2[0] = b; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mean = p1[0] / (float)H;
+  const float var = p2[0] / (float)H - mean * mean;
+  const float inv = rsqrt(var + eps);
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    const float ln = ((float)xr[i] - mean) * inv;
+    outr[i] = VPIPE_ELT((1.0f + (float)scale[i]) * ln + (float)shift[i]);
+  }
+}
+
 // adaLN modulation (Krea-2 DiT): out[m,n] = (1 + scale[n]) * x[m,n] + shift[n],
 // with scale/shift [N] broadcast over the M rows (total = M*N). scale/shift may
 // be offset slices of a shared modulation buffer.
@@ -636,23 +682,61 @@ kernel void im2col_hwc_3x3_f16(
     constant int&      C   [[buffer(4)]],
     uint2 tpig [[thread_position_in_grid]])
 {
-  // gid + total are UINT: at 1024px a VAE-decode conv has H*W*9*C > 2^31 (e.g.
-  // 1024*1024*9*256 = 2.4G), which overflows a signed int -- `total` goes
-  // negative, every thread early-returns, and the im2col is left all-zero (a
-  // grey decode). uint holds it (< 2^32); the derived indices stay under 2^32.
-  const uint gid = tpig.y * (uint)(9 * C) + tpig.x;
-  const uint total = (uint)H * (uint)W * 9u * (uint)C;
+  // gid + total are ULONG (64-bit): a VAE-decode conv's flat element count
+  // H*W*9*C exceeds 2^32 once the OUTPUT area passes ~1.86M px at C=256 (the top
+  // up-block's 256-ch full-res resnet: e.g. 2048*1536*9*256 = 7.26G) -- both a
+  // signed int (>2^31 at 1024px, 1024*1024*9*256 = 2.4G) and a uint (>2^32 at 2K)
+  // wrap, leaving the im2col partially written -> a tiled/gapped decode. 64-bit
+  // holds it; r fits uint (H*W <= 2^32 for any real resolution).
+  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;
+  const ulong total = (ulong)H * (uint)W * 9u * (uint)C;
   if (gid >= total) { return; }
-  const uint c = gid % (uint)C;
-  const uint j = (gid / (uint)C) % 9u;       // ky*3 + kx
-  const uint r = gid / (uint)(9 * C);
+  const uint c = (uint)(gid % (uint)C);
+  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
+  const uint r = (uint)(gid / (uint)(9 * C));
   const int x = (int)(r % (uint)W);
   const int y = (int)(r / (uint)W);
   const int sy = y + (int)(j / 3u) - 1;
   const int sx = x + (int)(j % 3u) - 1;
   VPIPE_ELT val = (VPIPE_ELT)0;
   if (sy >= 0 && sy < H && sx >= 0 && sx < W) {
-    val = in[(uint)(sy * W + sx) * (uint)C + c];
+    val = in[((ulong)sy * W + sx) * (uint)C + c];
+  }
+  out[gid] = val;
+}
+
+// Row-tiled im2col: same 3x3 channel-last expansion as im2col_hwc_3x3_f16, but
+// materializes only OUTPUT rows [row_off, row_off+row_cnt) into a TILE-LOCAL
+// out[0 .. row_cnt*9*C). Lets a memory-pressured caller stream a conv in row
+// bands so the col scratch is one band, not the full [H*W, 9*C] (a 1024^2 conv
+// at C=256 is ~4.6 GB). The input `in` is the WHOLE [H*W, C] map (the 3x3 halo
+// reads span the band edges), so the band boundary needs no overlap handling.
+// row_off=0, row_cnt=H*W reproduces im2col_hwc_3x3_f16 byte-for-byte.
+//   0:in[H*W,C] 1:out[row_cnt,9*C] 2:H 3:W 4:C 5:row_off 6:row_cnt.
+//   grid {9*C, row_cnt}.
+kernel void im2col_hwc_3x3_tiled_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H       [[buffer(2)]],
+    constant int&      W       [[buffer(3)]],
+    constant int&      C       [[buffer(4)]],
+    constant int&      row_off [[buffer(5)]],
+    constant int&      row_cnt [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;   // tile-local
+  const ulong total = (ulong)(uint)row_cnt * 9u * (uint)C;
+  if (gid >= total) { return; }
+  const uint c = (uint)(gid % (uint)C);
+  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
+  const uint r = (uint)row_off + (uint)(gid / (uint)(9 * C));  // global out row
+  const int x = (int)(r % (uint)W);
+  const int y = (int)(r / (uint)W);
+  const int sy = y + (int)(j / 3u) - 1;
+  const int sx = x + (int)(j % 3u) - 1;
+  VPIPE_ELT val = (VPIPE_ELT)0;
+  if (sy >= 0 && sy < H && sx >= 0 && sx < W) {
+    val = in[((ulong)sy * W + sx) * (uint)C + c];
   }
   out[gid] = val;
 }
@@ -701,18 +785,52 @@ kernel void im2col_hwc_3x3_s2_f16(
     uint2 tpig [[thread_position_in_grid]])
 {
   const int OH = H / 2, OW = W / 2;
-  const uint gid = tpig.y * (uint)(9 * C) + tpig.x;
-  const uint total = (uint)OH * (uint)OW * 9u * (uint)C;
+  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * 9u * (uint)C;
   if (gid >= total) { return; }
-  const uint c = gid % (uint)C;
-  const uint j = (gid / (uint)C) % 9u;      // ky*3 + kx
-  const uint r = gid / (uint)(9 * C);
+  const uint c = (uint)(gid % (uint)C);
+  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
+  const uint r = (uint)(gid / (uint)(9 * C));
   const int ox = (int)(r % (uint)OW);
   const int oy = (int)(r / (uint)OW);
   const int iy = oy * 2 + (int)(j / 3u);    // no -1: pad is (0,1,0,1)
   const int ix = ox * 2 + (int)(j % 3u);
   VPIPE_ELT val = (VPIPE_ELT)0;
-  if (iy < H && ix < W) { val = in[(uint)(iy * W + ix) * (uint)C + c]; }
+  if (iy < H && ix < W) { val = in[((ulong)iy * W + ix) * (uint)C + c]; }
+  out[gid] = val;
+}
+
+// Row-tiled strided (stride-2, pad (0,1,0,1)) im2col -- the tiled twin of
+// im2col_hwc_3x3_s2_f16, for the VAE-ENCODE downsample convs. Materializes only
+// downsampled OUTPUT rows [row_off, row_off+row_cnt) of the [(H/2)*(W/2), 9*C]
+// im2col into a TILE-LOCAL out. `in` is the whole [H*W, C] input (the strided
+// 3x3 halo spans band edges). row_off=0, row_cnt=(H/2)*(W/2) == the untiled
+// kernel byte-for-byte.
+//   0:in[H*W,C] 1:out[row_cnt,9*C] 2:H 3:W 4:C 5:row_off 6:row_cnt.
+//   grid {9*C, row_cnt}.
+kernel void im2col_hwc_3x3_s2_tiled_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H       [[buffer(2)]],
+    constant int&      W       [[buffer(3)]],
+    constant int&      C       [[buffer(4)]],
+    constant int&      row_off [[buffer(5)]],
+    constant int&      row_cnt [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int OW = W / 2;
+  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;   // tile-local
+  const ulong total = (ulong)(uint)row_cnt * 9u * (uint)C;
+  if (gid >= total) { return; }
+  const uint c = (uint)(gid % (uint)C);
+  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
+  const uint r = (uint)row_off + (uint)(gid / (uint)(9 * C));  // global out row
+  const int ox = (int)(r % (uint)OW);
+  const int oy = (int)(r / (uint)OW);
+  const int iy = oy * 2 + (int)(j / 3u);    // no -1: pad is (0,1,0,1)
+  const int ix = ox * 2 + (int)(j % 3u);
+  VPIPE_ELT val = (VPIPE_ELT)0;
+  if (iy < H && ix < W) { val = in[((ulong)iy * W + ix) * (uint)C + c]; }
   out[gid] = val;
 }
 
@@ -733,14 +851,14 @@ kernel void upsample_nearest2x_hwc_f16(
     uint2 tpig [[thread_position_in_grid]])
 {
   const int OW = 2 * W, OH = 2 * H;
-  const uint gid = tpig.y * (uint)C + tpig.x;
-  const uint total = (uint)OH * (uint)OW * (uint)C;
+  const ulong gid = (ulong)tpig.y * (uint)C + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * (uint)C;
   if (gid >= total) { return; }
-  const uint c = gid % (uint)C;
-  const uint p = gid / (uint)C;
+  const uint c = (uint)(gid % (uint)C);
+  const uint p = (uint)(gid / (uint)C);
   const int ox = (int)(p % (uint)OW);
   const int oy = (int)(p / (uint)OW);
-  out[gid] = in[(uint)((oy / 2) * W + (ox / 2)) * (uint)C + c];
+  out[gid] = in[((ulong)(oy / 2) * W + (ox / 2)) * (uint)C + c];
 }
 
 // GLU over a [rows, 2*D] matrix split into halves: each row is [a(D) |
@@ -840,6 +958,304 @@ kernel void depthwise_conv1d_causal_f16(
     acc += float(in[(uint)ti * D + d]) * float(w[(uint)d * K + kk]);
   }
   out[gid] = VPIPE_ELT(acc);
+}
+
+// ---- MageVAE (DiCo conv codec) ops --------------------------------------
+// Depthwise 3x3 conv, stride 1, pad 1, CHANNEL-LAST [H*W, C] (the VAE
+// layout): out[p, c] = sum_ky,kx in[(y+ky-1)*W + (x+kx-1), c] * w[c, ky, kx]
+// + b[c], zero outside the image. Each channel has its own 3x3 tap set
+// (groups == C), so unlike the dense 3x3 there is no im2col/GEMM to fold it
+// into -- one thread per (pixel, channel) reads 9 neighbours directly.
+//   0:in[H*W,C] 1:w[C,9] 2:b[C] 3:out[H*W,C] 4:H 5:W 6:C 7:has_bias.
+// grid (C, H*W) -- 2D so neither dimension overflows at >=1K px.
+kernel void depthwise_conv2d_3x3_hwc_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    const device VPIPE_ELT* w   [[buffer(1)]],
+    const device VPIPE_ELT* b   [[buffer(2)]],
+    device VPIPE_ELT*       out [[buffer(3)]],
+    constant int&      H   [[buffer(4)]],
+    constant int&      W   [[buffer(5)]],
+    constant int&      C   [[buffer(6)]],
+    constant int&      has_bias [[buffer(7)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int c = (int)tpig.x;
+  const uint p = tpig.y;
+  if (c >= C || p >= (uint)(H * W)) { return; }
+  const int y = (int)(p / (uint)W);
+  const int x = (int)(p % (uint)W);
+  float acc = has_bias ? float(b[c]) : 0.0f;
+  for (int ky = 0; ky < 3; ++ky) {
+    const int yy = y + ky - 1;
+    if (yy < 0 || yy >= H) { continue; }
+    for (int kx = 0; kx < 3; ++kx) {
+      const int xx = x + kx - 1;
+      if (xx < 0 || xx >= W) { continue; }
+      acc += float(in[((uint)yy * (uint)W + (uint)xx) * (uint)C + (uint)c])
+             * float(w[(uint)c * 9u + (uint)(ky * 3 + kx)]);
+    }
+  }
+  out[p * (uint)C + (uint)c] = VPIPE_ELT(acc);
+}
+
+// Column mean of a row-major [M, N] matrix: out[n] = (1/M) sum_m x[m, n].
+// The spatial global-average-pool of the DiCo channel-attention branch
+// (AdaptiveAvgPool2d(1) over a channel-last [H*W, C] activation). One
+// threadgroup per column, strided over rows, f32 accumulation.
+//   0:x[M,N] 1:out[N] 2:M 3:N.  grid (N * CM_TG) / tg (CM_TG).
+#define CM_TG 256
+kernel void col_mean_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      M   [[buffer(2)]],
+    constant int&      N   [[buffer(3)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint n = tid.x;
+  if (n >= (uint)N) { return; }
+  float s = 0.0f;
+  for (uint m = ltid.x; m < (uint)M; m += CM_TG) {
+    s += float(x[m * (uint)N + n]);
+  }
+  s = simd_sum(s);
+  threadgroup float part[CM_TG / 32];
+  if (simd_lid == 0) { part[simd_gid] = s; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < CM_TG / 32) ? part[simd_lid] : 0.0f;
+    a = simd_sum(a);
+    if (simd_lid == 0) { out[n] = VPIPE_ELT(a / (float)M); }
+  }
+}
+
+// Per-column gated scale, in place: y[m, n] *= sigmoid(v[n]). Fuses the
+// Sigmoid tail of the DiCo channel-attention with its broadcast multiply
+// (the pooled 1x1-conv logits arrive unactivated), so the [C] vector is
+// read once and no separate sigmoid pass is needed.
+//   0:y[M*N] (inout) 1:v[N] 2:N 3:total(=M*N).  grid (N, M).
+kernel void mul_rows_sigmoid_f16(
+    device VPIPE_ELT*       y [[buffer(0)]],
+    const device VPIPE_ELT* v [[buffer(1)]],
+    constant int&      N     [[buffer(2)]],
+    constant uint&     total [[buffer(3)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint gid = tpig.y * (uint)N + tpig.x;
+  if (gid >= total) { return; }
+  const float g = 1.0f / (1.0f + metal::precise::exp(-float(v[gid % (uint)N])));
+  y[gid] = VPIPE_ELT(float(y[gid]) * g);
+}
+
+// Metal has no erf intrinsic; Abramowitz & Stegun 7.1.26 (max abs error
+// ~1.5e-7, well under f16 precision). Same formulation as the vision
+// metallib's helper -- each .metal is its own metallib, so it is redefined
+// here rather than shared.
+inline float elt_erf_approx_(float x) {
+  const float p = 0.3275911f;
+  const float a1 = 0.254829592f, a2 = -0.284496736f, a3 = 1.421413741f,
+              a4 = -1.453152027f, a5 = 1.061405429f;
+  const float s = (x < 0.0f) ? -1.0f : 1.0f;
+  const float ax = metal::fabs(x);
+  const float t = 1.0f / (1.0f + p * ax);
+  const float y = 1.0f -
+      (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * metal::exp(-ax * ax);
+  return s * y;
+}
+
+// EXACT (erf) GELU: out = x * 0.5 * (1 + erf(x / sqrt(2))). MageVAE calls
+// F.gelu() with the default approximate='none', so the tanh approximation
+// used by the DiT feed-forwards (gelu_tanh_ff_f16) is NOT interchangeable
+// here -- they differ by ~1e-3 relative near |x| ~ 2.
+//   0:x 1:out 2:n.  grid (n).
+kernel void gelu_erf_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  const float v = (float)x[gid];
+  out[gid] =
+      VPIPE_ELT(0.5f * v * (1.0f + elt_erf_approx_(v * 0.7071067811865476f)));
+}
+
+// LayerNorm WITH affine (weight + bias), normalized over the last H dims:
+// out = (x-mean)/sqrt(var+eps) * w + b. The plain twin above has no affine
+// and the vision metallib's layer_norm_bias_f16 is half-only; MageVAE's
+// encoder LayerNorm2d layers carry affine params and run in both element
+// types, so it gets a VPIPE_ELT version here.
+//   0:x 1:w[H] 2:b[H] 3:out 4:H 5:eps.  grid (1, rows) / tg (LN_FF_TG).
+kernel void layer_norm_affine_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    const device VPIPE_ELT* w   [[buffer(1)]],
+    const device VPIPE_ELT* b   [[buffer(2)]],
+    device VPIPE_ELT*       out [[buffer(3)]],
+    constant int&      H   [[buffer(4)]],
+    constant float&    eps [[buffer(5)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    const float v = (float)xr[i];
+    s1 += v; s2 += v * v;
+  }
+  s1 = simd_sum(s1); s2 = simd_sum(s2);
+  threadgroup float p1[LN_FF_TG / 32], p2[LN_FF_TG / 32];
+  if (simd_lid == 0) { p1[simd_gid] = s1; p2[simd_gid] = s2; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < LN_FF_TG / 32) ? p1[simd_lid] : 0.0f;
+    float bb = (simd_lid < LN_FF_TG / 32) ? p2[simd_lid] : 0.0f;
+    a = simd_sum(a); bb = simd_sum(bb);
+    if (simd_lid == 0) { p1[0] = a; p2[0] = bb; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mean = p1[0] / (float)H;
+  const float var = p2[0] / (float)H - mean * mean;
+  const float inv = rsqrt(var + eps);
+  for (int i = (int)lid; i < H; i += LN_FF_TG) {
+    outr[i] = VPIPE_ELT(((float)xr[i] - mean) * inv * (float)w[i]
+                        + (float)b[i]);
+  }
+}
+
+// Gather non-overlapping dxd tiles out of a channel-last [H*W, C] image
+// into a tile-major [nt*d*d, C] buffer, REPLICATE-clamping coordinates past
+// the edge. This is the MageVAE CoD decoder's patched attention: the
+// reference F.pad(..., mode="replicate") to a whole number of dxd tiles is
+// exactly a clamp on the gather, so no separate pad pass is needed.
+//   0:in[H*W,C] 1:out[nt*d*d,C] 2:H 3:W 4:C 5:d 6:npw.
+// grid (C, d*d, nt) with nt = nph*npw.
+kernel void tile_gather_clamp_hwc_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H   [[buffer(2)]],
+    constant int&      W   [[buffer(3)]],
+    constant int&      C   [[buffer(4)]],
+    constant int&      d   [[buffer(5)]],
+    constant int&      npw [[buffer(6)]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  const int c = (int)tpig.x;
+  const int uv = (int)tpig.y;
+  const int t = (int)tpig.z;
+  if (c >= C || uv >= d * d) { return; }
+  const int u = uv / d, v = uv % d;
+  int y = (t / npw) * d + u;
+  int x = (t % npw) * d + v;
+  y = metal::min(y, H - 1);
+  x = metal::min(x, W - 1);
+  out[((uint)t * (uint)(d * d) + (uint)uv) * (uint)C + (uint)c] =
+      in[((uint)y * (uint)W + (uint)x) * (uint)C + (uint)c];
+}
+
+// Scatter tiles back into a channel-last [H*W, C] image, dropping the
+// replicate-padded positions that fall outside the image (the reference
+// crops h_[:, :, :H, :W] after the tiled attention).
+//   0:src[nt*d*d,C] 1:out[H*W,C] 2:H 3:W 4:C 5:d 6:npw.
+// grid (C, d*d, nt).
+kernel void tile_scatter_hwc_f16(
+    const device VPIPE_ELT* src [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H   [[buffer(2)]],
+    constant int&      W   [[buffer(3)]],
+    constant int&      C   [[buffer(4)]],
+    constant int&      d   [[buffer(5)]],
+    constant int&      npw [[buffer(6)]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  const int c = (int)tpig.x;
+  const int uv = (int)tpig.y;
+  const int t = (int)tpig.z;
+  if (c >= C || uv >= d * d) { return; }
+  const int y = (t / npw) * d + uv / d;
+  const int x = (t % npw) * d + uv % d;
+  if (y >= H || x >= W) { return; }
+  out[((uint)y * (uint)W + (uint)x) * (uint)C + (uint)c] =
+      src[((uint)t * (uint)(d * d) + (uint)uv) * (uint)C + (uint)c];
+}
+
+// Per-ROW adaLN LayerNorm for the MageVAE decoder's per-pixel MLP head:
+//   out[r,i] = (LN(x[r,:])[i] * w[i] + b[i]) * (1 + mod[r, H+i]) + mod[r, i]
+// Unlike layernorm_modulate_f16, shift/scale are PER ROW (every pixel gets
+// its own, from that patch's latent), and the rows are short (x_dim = 32),
+// so one thread owns a whole row rather than a threadgroup. `mod` is the
+// [M, 3H] chunk(shift, scale, gate) buffer; gate is used by the twin below.
+//   0:x[M,H] 1:w[H] 2:b[H] 3:mod[M,3H] 4:out[M,H] 5:H 6:eps 7:M.  grid (M).
+kernel void layer_norm_mod_rows_f16(
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    const device VPIPE_ELT* w   [[buffer(1)]],
+    const device VPIPE_ELT* b   [[buffer(2)]],
+    const device VPIPE_ELT* mod [[buffer(3)]],
+    device VPIPE_ELT*       out [[buffer(4)]],
+    constant int&      H   [[buffer(5)]],
+    constant float&    eps [[buffer(6)]],
+    constant uint&     M   [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= M) { return; }
+  const device VPIPE_ELT* xr = x + (ulong)gid * (uint)H;
+  const device VPIPE_ELT* mr = mod + (ulong)gid * (uint)(3 * H);
+  device VPIPE_ELT* orow = out + (ulong)gid * (uint)H;
+  float s1 = 0.0f, s2 = 0.0f;
+  for (int i = 0; i < H; ++i) {
+    const float v = (float)xr[i];
+    s1 += v; s2 += v * v;
+  }
+  const float mean = s1 / (float)H;
+  const float inv = rsqrt(s2 / (float)H - mean * mean + eps);
+  for (int i = 0; i < H; ++i) {
+    const float ln = ((float)xr[i] - mean) * inv * (float)w[i] + (float)b[i];
+    orow[i] = VPIPE_ELT(ln * (1.0f + (float)mr[H + i]) + (float)mr[i]);
+  }
+}
+
+// Per-ROW gated residual twin: x[r,i] += mod[r, 2H+i] * sub[r,i].
+//   0:x[M,H] (inout) 1:mod[M,3H] 2:sub[M,H] 3:H 4:M.  grid (M).
+kernel void gated_residual_rows_f16(
+    device VPIPE_ELT*       x   [[buffer(0)]],
+    const device VPIPE_ELT* mod [[buffer(1)]],
+    const device VPIPE_ELT* sub [[buffer(2)]],
+    constant int&      H [[buffer(3)]],
+    constant uint&     M [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= M) { return; }
+  const ulong xo = (ulong)gid * (uint)H;
+  const device VPIPE_ELT* mr = mod + (ulong)gid * (uint)(3 * H) + (uint)(2 * H);
+  for (int i = 0; i < H; ++i) {
+    x[xo + i] = VPIPE_ELT(float(x[xo + i]) + float(mr[i]) * float(sub[xo + i]));
+  }
+}
+
+// Add a row-cyclic constant table: y[r, n] += tbl[(r % P), n]. The MageVAE
+// decoder's NerfEmbedder contributes a fixed per-intra-patch-pixel DCT
+// position term (folded with the linear bias at load into a [P, N] table,
+// P = patch*patch), which repeats for every patch.
+//   0:y[M,N] (inout) 1:tbl[P,N] 2:N 3:P 4:total(=M*N).  grid (N, M).
+kernel void add_rows_mod_f16(
+    device VPIPE_ELT*       y   [[buffer(0)]],
+    const device VPIPE_ELT* tbl [[buffer(1)]],
+    constant int&      N     [[buffer(2)]],
+    constant int&      P     [[buffer(3)]],
+    constant uint&     total [[buffer(4)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint gid = tpig.y * (uint)N + tpig.x;
+  if (gid >= total) { return; }
+  const uint n = gid % (uint)N;
+  const uint r = gid / (uint)N;
+  y[gid] = VPIPE_ELT(float(y[gid]) + float(tbl[(r % (uint)P) * (uint)N + n]));
 }
 
 // Row scatter: out[pos[r], :] = src[r, :] for r in 0..R-1. Overlays the

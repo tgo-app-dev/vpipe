@@ -128,6 +128,26 @@ TEST(pipeline_spec, round_trip_through_flexdata_preserves_topology) {
   EXPECT_TRUE(spec1.to_json(true) == spec2.to_json(true));
 }
 
+TEST(pipeline_spec, loader_tolerates_aux_key) {
+  // The web-ui persists auxiliary data objects (e.g. the composer view
+  // arrangement) under a top-level "aux" key. The pipeline core must ignore
+  // unknown top-level keys, so a file carrying "aux" still loads.
+  Session sess;
+  auto src_pl = build_chrono_shell_(sess, "p", "true");
+  FlexData spec = pipeline_to_spec(*src_pl);
+
+  FlexData aux = FlexData::make_object();
+  FlexData composer = FlexData::make_object();
+  composer.as_object().insert_or_assign("version", FlexData::make_int(1));
+  aux.as_object().insert_or_assign("composer", std::move(composer));
+  spec.as_object().insert_or_assign("aux", std::move(aux));
+
+  auto rebuilt = pipeline_from_spec(spec, &sess);
+  ASSERT_TRUE(rebuilt != nullptr);
+  EXPECT_TRUE(rebuilt->id() == "p");
+  EXPECT_TRUE(rebuilt->num_vertices() == 2u);
+}
+
 TEST(pipeline_spec, disconnected_iport_gap_preserved_positionally) {
   // iports are positional and optional: a null array element (or an
   // object with empty "src") leaves that iport unwired, and later

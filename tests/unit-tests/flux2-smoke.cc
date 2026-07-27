@@ -377,6 +377,64 @@ TEST(flux2_smoke, vae_decode_1024_no_matmul2d_corruption)
   EXPECT_TRUE(min_std > 0.05);         // >> the ~0.01 of a collapsed grey band
 }
 
+// Regression for the row-tiled im2col path at 1024 (VPIPE_VAE_NO_HWCONV -- the
+// non-matrix-core M4 fallback and the conv_out fallback on every box). The
+// matmul2d op corrupts output rows past M ~ 2^18-2^19 for the large-K 3x3 im2col
+// GEMMs (LOWER than the small-K _mma_max_m=2^19 the chunk split assumes), so a
+// 1024 decode on the im2col path went grey-BANDED until the band was safe-capped
+// below the threshold. The band std check above is too coarse to catch a thin
+// stripe, so decode the SAME latent through the default hw-conv path and the
+// adaptive-tiled im2col path and rel-L2 the two full 1024x1024 images -- a banded
+// region spikes rel-L2 far past the ~7e-4 hw-vs-im2col numerical floor. Uses the
+// DEFAULT adaptive band (no BAND_ROWS override) so a broken safe-cap (which would
+// pick a >2^18 band on the roomy test box) is caught. Gated on model + mma.
+TEST(flux2_smoke, vae_decode_1024_im2col_tiled_matches_hwconv)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  const int gh = 64, gw = 64;                   // -> 1024x1024
+
+  auto run = [&](bool no_hwconv) -> std::vector<float> {
+    if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
+    else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
+    auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+    ::unsetenv("VPIPE_VAE_NO_HWCONV");
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    const int C = vae->config().dit_channels();
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+    if (z.empty()) { return out; }
+    std::mt19937 rng(1234);                     // same latent both legs
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+      d[i] = (_Float16)nd(rng);
+    }
+    std::string err;
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> hw  = run(/*no_hwconv=*/false);
+  const std::vector<float> tld = run(/*no_hwconv=*/true);
+  ASSERT_TRUE(!hw.empty());
+  ASSERT_TRUE(hw.size() == tld.size());
+  const double r = rel_l2_(hw.data(), tld.data(), hw.size());
+  std::printf("[flux2_smoke] 1024 im2col-tiled vs hwconv rel-L2 = %.6g\n", r);
+  EXPECT_TRUE(std::isfinite(r) && r < 3e-2);   // a banded region would be >> this
+}
+
 // The mid-block self-attention on the matrix-core FULL flash kernel
 // (sdpa_full_mma2_d512) must match the scalar sdpa_full_f16 it replaces. Decode
 // the same latent both ways (VPIPE_FLUX2_NO_MMA_ATTN forces scalar) and rel-L2.
@@ -522,6 +580,64 @@ TEST(flux2_smoke, vae_encode_hwconv_matches_im2col)
   EXPECT_TRUE(r < 3e-2);
 }
 
+// VAE ENCODE golden at 1024: a deterministic normalized image [3,1024,1024] ->
+// DiT-facing reference latent [128,64,64] vs the diffusers golden
+// (dump_vae_encode_1024.py). This is the reference-conditioning latent an edit
+// feeds the DiT; the DiT + decode both pass at 1024, so a mismatch here is the
+// remaining place "block patches" can enter. VPIPE_FLUX2_ENCODE_GOLDEN = dir.
+TEST(flux2_golden, vae_encode_1024_rel_l2)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* gd   = std::getenv("VPIPE_FLUX2_ENCODE_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string g = gd;
+
+  std::ifstream mf(g + "/meta.json");
+  FlexData meta = FlexData::from_json(mf);
+  ASSERT_TRUE(meta.is_object());
+  auto mo = meta.as_object();
+  const int H = (int)mo.at("H").as_int(0);
+  const int W = (int)mo.at("W").as_int(0);
+  const int C = (int)mo.at("dit_channels").as_int(0);
+  const int lh = (int)mo.at("lh").as_int(0);
+  const int lw = (int)mo.at("lw").as_int(0);
+
+  const std::vector<float> img = read_f32_file_(g + "/img.f32");
+  const std::vector<float> ref = read_f32_file_(g + "/z.f32");
+  ASSERT_TRUE(img.size() == (std::size_t)3 * H * W);
+  ASSERT_TRUE(ref.size() == (std::size_t)C * lh * lw);
+
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{},
+                                 /*with_encoder=*/true);
+  ASSERT_TRUE(vae != nullptr);
+  if (!vae->has_encoder()) {
+    std::printf("[flux2_golden] no encoder in checkpoint -- skip\n");
+    return;
+  }
+
+  SharedBuffer ib = mc->make_shared_buffer(img.size() * 2);
+  { auto* d = static_cast<_Float16*>(ib.contents());
+    for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; } }
+  SharedBuffer z = vae->encode(ib, H, W);
+  ASSERT_TRUE(!z.empty());
+  std::vector<float> got(ref.size());
+  const auto* zp = static_cast<const _Float16*>(z.contents());
+  for (std::size_t i = 0; i < got.size(); ++i) { got[i] = (float)zp[i]; }
+
+  const double r = rel_l2_(got.data(), ref.data(), got.size());
+  std::printf("[flux2_golden] VAE encode rel-L2 = %.5f (%dx%d -> [%d,%d,%d])\n",
+              r, H, W, C, lh, lw);
+  EXPECT_TRUE(r < 0.02);
+}
+
 // The DiT loads and one forward step produces a finite velocity of the packed
 // latent shape [img_seq, in_channels].
 TEST(flux2_smoke, dit_forward_shape_finite)
@@ -538,8 +654,16 @@ TEST(flux2_smoke, dit_forward_shape_finite)
   ASSERT_TRUE(dit != nullptr);
 
   const auto& c = dit->config();
-  const int TS = 8;                     // a short fake prompt
-  const int gh = 4, gw = 4, img_seq = gh * gw;
+  // Resolution-parametrized profiling: VPIPE_FLUX2_BENCH_GRID=<n> sets a
+  // square gh=gw=n token grid (n=64 -> 1024x1024), VPIPE_FLUX2_BENCH_TS the
+  // conditioning length, VPIPE_FLUX2_BENCH_ITERS the (warm) forward count. With
+  // VPIPE_FLUX2_DIT_PROFILE set this prints the per-section timing per forward.
+  auto envi = [](const char* k, int d) {
+    const char* e = std::getenv(k); return (e && *e) ? std::atoi(e) : d; };
+  const int grid = envi("VPIPE_FLUX2_BENCH_GRID", 4);
+  const int TS = envi("VPIPE_FLUX2_BENCH_TS", 8);   // a short fake prompt
+  const int iters = envi("VPIPE_FLUX2_BENCH_ITERS", 1);
+  const int gh = grid, gw = grid, img_seq = gh * gw;
   SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
   SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq *
                                             c.in_channels * 2);
@@ -556,8 +680,11 @@ TEST(flux2_smoke, dit_forward_shape_finite)
       lp[i] = (_Float16)nd(rng);
     }
   }
-  SharedBuffer vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
-  ASSERT_TRUE(!vel.empty());
+  SharedBuffer vel;
+  for (int it = 0; it < iters; ++it) {   // warm iterations (profile prints each)
+    vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    ASSERT_TRUE(!vel.empty());
+  }
   const std::size_t n = (std::size_t)img_seq * c.out_channels;
   ASSERT_TRUE(vel.byte_size() >= n * 2);
   EXPECT_TRUE(all_finite_(vel, n));
@@ -716,7 +843,137 @@ TEST(flux2_smoke, dit_mma_matches_steel)
   const double r = rel_l2_(v_mma.data(), v_steel.data(), v_mma.size());
   std::printf("[flux2_smoke] DiT mma-vs-steel velocity rel-L2 = %.6g "
               "(seq=%d)\n", r, TS + img_seq);
-  EXPECT_TRUE(r < 3e-2);
+  // bf16 floor: with the DiT now bf16 (f16 overflowed on real conditioning),
+  // the per-GEMM matmul2d-vs-steel difference compounds through 32 blocks' deep
+  // residual stream to ~0.045 (kernel-level bf16 mma-vs-steel is ~1.6e-3 --
+  // gemm_mma.correctness -- so this is accumulation, not a logic error). The
+  // 3e-2 f16-era bound was only ever hit steel-vs-steel (~0) on the M4 stub; on
+  // real M5 matrix cores it needs the same loosening the DiT golden got
+  // (0.02->0.10). Still far under the sibling QIE velocity bound (0.2 / 60 blk).
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+}
+
+// M5 matrix-core NAX attention A/B. The bf16 DiT's joint attention runs the
+// matmul2d NAX flash-attention (attn_steel_nax_h_bd128_bf16) on matrix-core
+// GPUs; VPIPE_FLUX2_NO_ATTN_NAX forces the non-nax bf16 steel attention
+// (attn_steel_h_bd128_bf16). The GEMM path is the SAME (matmul2d) in both runs,
+// so the velocity rel-L2 isolates the NAX-vs-steel attention kernel. Both are
+// bf16 with f32-accumulate online softmax, so they match to the bf16 floor.
+// The commit that added the bf16 nax attention could only compile it to its M4
+// stub (no matrix cores) -- this is the missing M5 verification it asked for.
+// Skips vacuously off matrix-core GPUs (there the nax path is capability-gated
+// off and both runs take the same steel attention).
+TEST(flux2_smoke, dit_attn_nax_matches_nonax)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  const int TS = 64, gh = 16, gw = 16, img_seq = gh * gw;
+
+  auto run = [&](bool no_nax) {
+    if (no_nax) { ::setenv("VPIPE_FLUX2_NO_ATTN_NAX", "1", 1); }
+    else        { ::unsetenv("VPIPE_FLUX2_NO_ATTN_NAX"); }
+    auto dit = MetalFlux2Transformer::load(
+        tdir, mc, MetalFlux2Transformer::Config{}, /*stream_blocks=*/true);
+    ::unsetenv("VPIPE_FLUX2_NO_ATTN_NAX");
+    std::vector<float> out;
+    if (dit == nullptr) { return out; }
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return out; }
+    std::mt19937 rng(4242);              // same inputs both runs
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (vel.empty() || vel.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* vp = static_cast<const _Float16*>(vel.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)vp[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_nax   = run(/*no_nax=*/false);
+  const std::vector<float> v_steel = run(/*no_nax=*/true);
+  ASSERT_TRUE(!v_nax.empty());
+  ASSERT_TRUE(v_nax.size() == v_steel.size());
+  const double r = rel_l2_(v_nax.data(), v_steel.data(), v_nax.size());
+  std::printf("[flux2_smoke] DiT nax-attn-vs-steel velocity rel-L2 = %.6g "
+              "(seq=%d)\n", r, TS + img_seq);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+}
+
+// DiT step wall-clock (preloaded w4g64, bf16 compute). Warm once, best-of-5 min
+// (least DVFS-throttled -- the M5 GPU clock tracks the shared SoC power budget,
+// so measure cold). VPIPE_FLUX2_BENCH_SIDE overrides the square latent grid side
+// (default 48 -> 2304 img tokens ~ 768px; 64 -> 4096 ~ 1024px). Pair with
+// VPIPE_FLUX2_DIT_PROFILE=1 for the per-op (gemm / attn) breakdown, and A/B the
+// paths across runs: default (nax matmul2d + nax attn) vs VPIPE_FLUX2_NO_MMA2
+// (steel GEMM) vs VPIPE_FLUX2_NO_ATTN_NAX (steel attn). Gated on the model path.
+TEST(flux2_smoke, dit_bench)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+  int side = 48;
+  if (const char* s = std::getenv("VPIPE_FLUX2_BENCH_SIDE")) {
+    const int v = std::atoi(s);
+    if (v >= 8) { side = v; }
+  }
+  const int TS = 64, gh = side, gw = side, img_seq = gh * gw;
+
+  // Preloaded (not streaming) so compute -- not per-block weight re-reads --
+  // dominates the wall-clock. The w4g64 DiT is ~5.4 GB, fits a 16 GB box.
+  auto dit = MetalFlux2Transformer::load(
+      tdir, mc, MetalFlux2Transformer::Config{}, /*stream_blocks=*/false);
+  ASSERT_TRUE(dit != nullptr);
+  const auto& c = dit->config();
+  SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+  SharedBuffer lat =
+      mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+  ASSERT_TRUE(!ctx.empty() && !lat.empty());
+  std::mt19937 rng(4242);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* cp = static_cast<_Float16*>(ctx.contents());
+  for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+    cp[i] = (_Float16)nd(rng);
+  }
+  auto* lp = static_cast<_Float16*>(lat.contents());
+  for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+    lp[i] = (_Float16)nd(rng);
+  }
+  dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);       // warm
+  double best = 1e18;
+  for (int i = 0; i < 5; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (!vel.empty() && ms < best) { best = ms; }
+  }
+  std::printf("[flux2_smoke] DiT step (side=%d, img=%d, seq=%d): %.1f ms\n",
+              side, img_seq, TS + img_seq, best);
 }
 
 // Accelerated mode A/B: the same deterministic forward with the dynamic-
@@ -846,11 +1103,93 @@ TEST(flux2_golden, dit_velocity_rel_l2)
 
   const double r = rel_l2_(got.data(), ref.data(), got.size());
   std::printf("[flux2_golden] DiT velocity rel-L2 = %.5f (%s, %d blocks)\n", r,
-              quantized ? "quantized" : "f16 vs f32 ref", 5 + 20);
-  // Dense f16 drifts ~0.005. Quantized is looser and width-dependent: plain w8
-  // ~0.04, plain w4 ~0.31 on this random-input golden (AWQ/mixed are the quality
-  // path). The bound here is a coarse "did it dispatch + stay sane" smoke.
-  EXPECT_TRUE(r < (quantized ? 0.40 : 0.02));
+              quantized ? "quantized" : "bf16 vs f32 ref", 5 + 20);
+  // The DiT runs BF16 (f16's 65504 range overflows on real conditioning
+  // outliers -> NaN; see the flux2_edit test). bf16-vs-f32 drifts ~0.06 on this
+  // tiny random golden (16 img tokens; QIE's bf16 DiT is cosine 0.9974 ~= 0.072
+  // rel-L2 -- same family, same floor). Real-image cases average lower (the
+  // 64x48 edit is ~0.018). Quantized adds group-affine error on top.
+  EXPECT_TRUE(r < (quantized ? 0.40 : 0.10));
+}
+
+// EDITING path: feed the DiT a generated + reference token stream exactly as
+// pipeline_flux2_klein does for image editing (hidden = [gen; ref];
+// img_ids = [gen T=0 ; ref T=10]) and rel-L2 the generated-portion velocity
+// against the diffusers golden (dump_edit_golden.py). VPIPE_FLUX2_EDIT_GOLDEN
+// points at a size subdir (small / big). Isolates the reference-conditioning
+// path (RoPE T band, ref embed, joint attention) from the encoder/template.
+TEST(flux2_edit, dit_ref_velocity_rel_l2)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* gd   = std::getenv("VPIPE_FLUX2_EDIT_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string g = gd;
+
+  std::ifstream mf(g + "/meta.json");
+  FlexData meta = FlexData::from_json(mf);
+  ASSERT_TRUE(meta.is_object());
+  auto mo = meta.as_object();
+  const int gh = (int)mo.at("gh").as_int(0);
+  const int gw = (int)mo.at("gw").as_int(0);
+  const int gen_seq = (int)mo.at("gen_seq").as_int(0);
+  const int rgh = (int)mo.at("rgh").as_int(0);
+  const int rgw = (int)mo.at("rgw").as_int(0);
+  const int ref_seq = (int)mo.at("ref_seq").as_int(0);
+  const int TSq = (int)mo.at("text_seq").as_int(0);
+  const int IN = (int)mo.at("in_channels").as_int(0);
+  const int JD = (int)mo.at("joint_dim").as_int(0);
+  const int OUT = (int)mo.at("out_channels").as_int(0);
+  const float ts = (float)mo.at("timestep").as_real(0.0);
+
+  const std::vector<float> gen = read_f32_file_(g + "/gen.f32");
+  const std::vector<float> rfl = read_f32_file_(g + "/ref.f32");
+  const std::vector<float> ctx = read_f32_file_(g + "/ctx.f32");
+  const std::vector<float> ref = read_f32_file_(g + "/vel.f32");
+  ASSERT_TRUE(gen.size() == (std::size_t)gen_seq * IN);
+  ASSERT_TRUE(rfl.size() == (std::size_t)ref_seq * IN);
+  ASSERT_TRUE(ctx.size() == (std::size_t)TSq * JD);
+  ASSERT_TRUE(ref.size() == (std::size_t)gen_seq * OUT);
+
+  auto dit = MetalFlux2Transformer::load(
+      std::string(root) + "/transformer", mc,
+      MetalFlux2Transformer::Config{}, /*stream=*/false);
+  ASSERT_TRUE(dit != nullptr);
+
+  SharedBuffer latb = mc->make_shared_buffer(gen.size() * 2);
+  SharedBuffer ctxb = mc->make_shared_buffer(ctx.size() * 2);
+  SharedBuffer refb = mc->make_shared_buffer(rfl.size() * 2);
+  { auto* d = static_cast<_Float16*>(latb.contents());
+    for (std::size_t i = 0; i < gen.size(); ++i) { d[i] = (_Float16)gen[i]; } }
+  { auto* d = static_cast<_Float16*>(ctxb.contents());
+    for (std::size_t i = 0; i < ctx.size(); ++i) { d[i] = (_Float16)ctx[i]; } }
+  { auto* d = static_cast<_Float16*>(refb.contents());
+    for (std::size_t i = 0; i < rfl.size(); ++i) { d[i] = (_Float16)rfl[i]; } }
+
+  std::vector<MetalFlux2Transformer::RefImage> refs;
+  MetalFlux2Transformer::RefImage ri;
+  ri.latents = std::move(refb);
+  ri.seq = ref_seq; ri.grid_h = rgh; ri.grid_w = rgw;
+  refs.push_back(std::move(ri));
+
+  SharedBuffer vel = dit->forward_dit(ctxb, TSq, latb, gen_seq, gh, gw, ts,
+                                      -1.0f, refs);
+  ASSERT_TRUE(!vel.empty());
+  std::vector<float> got(ref.size());
+  const auto* vp = static_cast<const _Float16*>(vel.contents());
+  for (std::size_t i = 0; i < got.size(); ++i) { got[i] = (float)vp[i]; }
+
+  const double r = rel_l2_(got.data(), ref.data(), got.size());
+  std::printf("[flux2_edit] DiT ref velocity rel-L2 = %.5f (gen %dx%d + ref "
+              "%dx%d, seq %d)\n", r, gh, gw, rgh, rgw,
+              TSq + gen_seq + ref_seq);
+  // BF16 DiT (fixes the f16 overflow -> NaN on real conditioning): the real-
+  // image edit drifts ~0.018 vs the f32 ref. Was NaN (f16 overflow) before bf16.
+  EXPECT_TRUE(r < 0.05);
 }
 
 // Embedded guidance (guidance-distilled variants, e.g. klein-9B): re-feed the
@@ -1202,14 +1541,15 @@ TEST(flux2_e2e, reference_latent_iport_changes_latent)
     cfg.as_object().insert("width", FlexData::make_int(W));
     cfg.as_object().insert("steps", FlexData::make_int(steps));
     cfg.as_object().insert("seed", FlexData::make_int(0));
-    // iports {conditioning, neg_conditioning, sampler, scheduler, ref0, ref1};
-    // the conditioner feeds conditioning; wire ref0 for the with_ref case.
+    // iports {conditioning, neg_conditioning, model, sampler, scheduler, ref0,
+    // ref1}; the conditioner feeds conditioning; wire ref0 (iport5) for the
+    // with_ref case (model iport2 left unwired here).
     auto* cond = add_conditioner_(pl.get(), sess, src, root);
     std::vector<InEdge> edges{{cond, 0}};
     if (with_ref) {
       edges = std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0},
                                   InEdge{nullptr, 0}, InEdge{nullptr, 0},
-                                  {rt_src, 0}};
+                                  InEdge{nullptr, 0}, {rt_src, 0}};
     }
     auto t2iu = std::make_unique<TextToImageStage>(&sess, "t2i", edges,
                                                    std::move(cfg));

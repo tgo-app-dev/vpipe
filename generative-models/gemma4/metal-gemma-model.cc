@@ -148,6 +148,52 @@ MetalGemmaModel::load(const std::string& model_dir,
   }
   m->_cfg.embed_bits = embed_bits;
 
+  // Per-tensor mixed-precision (OptiQ) detection. Such a checkpoint quantizes
+  // each projection at its OWN width (some 4-bit, some 8-bit, varying per
+  // layer) -- distinct from the category-uniform GGUF pack (all-attn 4-bit /
+  // all-MLP 8-bit, group 32), which the base/mlp_bits path already handles.
+  // Detect it by comparing each attn (q/k/v) and MLP (gate/up) projection's
+  // derived bit width against the category model (attn == quant_bits, MLP ==
+  // mlp_bits); ANY deviation flags _mixed, switching on the per-tensor kernel
+  // dispatch. o_proj / down_proj widths are derived per-layer during binding.
+  // The mixed dispatch is g64-only, so a mixed checkpoint carrying a non-4/8
+  // width or a non-64 group is rejected (return nullptr).
+  if (!m->_dense) {
+    auto abits = [&](const std::string& t, int K) -> int {
+      const auto* wi = wts->info(t + ".weight");
+      if (wi == nullptr || wi->shape.size() < 2 || K <= 0) { return 0; }
+      return static_cast<int>((wi->shape.back() * 32) / K);
+    };
+    auto agroup = [&](const std::string& t, int K) -> int {
+      const auto* si = wts->info(t + ".scales");
+      if (si == nullptr || si->shape.empty() || si->shape.back() <= 0 ||
+          K <= 0) { return 0; }
+      return static_cast<int>(K / si->shape.back());
+    };
+    const int base = cfg.quant_bits;
+    const std::string pfx = m->_cfg.weight_prefix;
+    const struct { const char* t; int ref; } probes[] = {
+      {"self_attn.q_proj", base}, {"self_attn.k_proj", base},
+      {"self_attn.v_proj", base}, {"mlp.gate_proj", mlp_bits},
+      {"mlp.up_proj", mlp_bits},
+    };
+    bool mixed = false, bad = false;
+    for (int L = 0; L < cfg.n_layers; ++L) {
+      const std::string p = pfx + "layers." + std::to_string(L) + ".";
+      for (const auto& pr : probes) {
+        const std::string t = p + pr.t;
+        if (!wts->has(t + ".scales")) { continue; }   // shared/absent/dense
+        const int b = abits(t, cfg.hidden);
+        if (b != 4 && b != 8) { bad = true; continue; }
+        if (b != pr.ref) { mixed = true; }
+        if (agroup(t, cfg.hidden) != 64) { bad = true; }
+      }
+    }
+    if (std::getenv("VPIPE_GEMMA_FORCE_MIXED") != nullptr) { mixed = true; }
+    if (mixed && bad) { return nullptr; }   // unsupported width/group: mixed path
+    m->_mixed = mixed;
+  }
+
   // Affine group size (64 default, 32 for GGUF q4_0). Selects the kernel
   // variant suffix w<bits>g<group>.
   const int qg = cfg.quant_group > 0 ? cfg.quant_group : 64;
@@ -237,6 +283,24 @@ MetalGemmaModel::load(const std::string& model_dir,
     if (mlp_bits != 8) {                             // FFN gate/up + down
       swap(m->_fn_qmv_geglu, "affine_qmv_geglu_w4g32_q40");
       swap(m->_fn_qmv_mlp, "affine_qmv_w4g32_q40");
+    }
+  }
+  // Per-tensor mixed-precision (OptiQ): both w4 AND w8 twins of the projection
+  // GEMV (qmv) + steel GEMM (qmm) must be resident; the per-proj dispatch picks
+  // by Layer::*_bits. The w4 twins alias the base kernels when quant_bits==4 but
+  // are bound explicitly so the selector is width-correct regardless of base.
+  if (m->_mixed) {
+    m->_fn_qmv4 = m->_lib_qmv.function("affine_qmv_w4" + gtok);
+    m->_fn_qmv8 = m->_lib_qmv.function("affine_qmv_w8" + gtok);
+    m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + gtok);
+    m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + gtok);
+    // Batched-decode GEMV twins (the realtime-vqa path); the fused-geglu batch
+    // GEMV is w4-only, so a fused 8-bit MLP layer falls to steel-geglu there.
+    m->_fn_qmv_batch4 = m->_lib_qmv.function("affine_qmv_batch_w4" + gtok);
+    m->_fn_qmv_batch8 = m->_lib_qmv.function("affine_qmv_batch_w8" + gtok);
+    if (!m->_fn_qmv4.valid() || !m->_fn_qmv8.valid() ||
+        !m->_fn_qmm4.valid() || !m->_fn_qmm8.valid()) {
+      return nullptr;
     }
   }
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
@@ -598,10 +662,19 @@ MetalGemmaModel::load(const std::string& model_dir,
   // ~2-2.5x the steel quantized GEMM at prefill row counts. The 8-bit-MLP
   // 12B (gemma4_unified) stays on steel. Same source keeps the steel path on
   // non-matrix-core GPUs. VPIPE_GEMMA_NO_MMA=1 forces steel (A/B + safety).
-  if (cfg.quant_bits != 8 && mlp_bits != 8 && mc->supports_matrix_cores()) {
+  // The matmul2d (matrix-core) prefill GEMM path. Fires for a 4-bit checkpoint
+  // (both attn + MLP 4-bit; the GGUF 12B's 8-bit MLP stays on steel) OR for a
+  // per-tensor mixed (OptiQ) checkpoint, which loads BOTH dequant widths and
+  // dequants each part at its own bits -> dense matmul2d.
+  if (((cfg.quant_bits != 8 && mlp_bits != 8) || m->_mixed) &&
+      mc->supports_matrix_cores()) {
     m->_lib_dequant = mc->load_library("affine_dequant" + sfx);
     m->_lib_dense_mma = mc->load_library("dense_gemm_mma" + sfx);
     m->_fn_dequant = m->_lib_dequant.function("affine_dequant_w4" + gtok);
+    // Mixed needs the w8 dequant twin too (per-tensor: some parts are 8-bit).
+    if (m->_mixed) {
+      m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8" + gtok);
+    }
     // Tile-adaptive dense matmul2d: 128x128 for K <= 4096 (q/k/v/o, gate/up),
     // 128x256 for deeper K (down_proj, K=ffn) where the square tile is
     // bandwidth-starved on weight streaming (M5 gemm_mma.tune).
@@ -618,7 +691,8 @@ MetalGemmaModel::load(const std::string& model_dir,
     m->_fn_geglu_inter = m->_lib_elt.function("geglu_interleaved_f16");
     m->_use_mma = m->_fn_dequant.valid() && m->_fn_dense_mma.valid() &&
                   m->_fn_dense_mma_deep.valid() &&
-                  m->_fn_geglu_inter.valid();
+                  m->_fn_geglu_inter.valid() &&
+                  (!m->_mixed || m->_fn_dequant8.valid());
     if (const char* e = std::getenv("VPIPE_GEMMA_MMA_MIN_M")) {
       m->_mma_min_m = std::atoi(e);
     }
@@ -637,7 +711,6 @@ MetalGemmaModel::load(const std::string& model_dir,
       if (std::atoi(e) != 0) { m->_mat_mma = false; }
     }
   }
-
   // ---- conversion helpers (mirror MetalQwenModel) -----------------
   auto to_elt = [&](const std::string& name) -> SharedBuffer {
     const auto* info = wts->info(name);
@@ -1015,6 +1088,68 @@ MetalGemmaModel::load(const std::string& model_dir,
           ok = ok && !ly.vw.empty();
         }
       }
+    } else if (m->_mixed) {
+    // Per-tensor mixed-precision (OptiQ): bind each projection separately and
+    // record its OWN bit width (4 or 8). gate|up are interleaved into guw only
+    // when both equal mlp_bits (the fused geglu kernel runs at mlp_bits), else
+    // de-fused (gate -> guw, up -> uw) and run as two GEMVs + a standalone
+    // geglu. o_proj is always separate. q/k/v decode-fusion (build_qkv) stays
+    // only when q/k/v share a width (it self-guards on the packing stride).
+    auto mbits = [&](const std::string& t, int K) -> int {
+      const auto* wi = wts->info(t + ".weight");
+      if (wi == nullptr || wi->shape.size() < 2 || K <= 0) { return 4; }
+      return ((int)((wi->shape.back() * 32) / K) == 8) ? 8 : 4;
+    };
+    {
+      const auto* gi = wts->info(p + "mlp.gate_proj.weight");
+      if (gi != nullptr && !gi->shape.empty()) { ly.ffn = (int)gi->shape[0]; }
+    }
+    const int qd = cfg.n_heads * ly.head_dim;
+    ly.q_bits    = mbits(p + "self_attn.q_proj", cfg.hidden);
+    ly.o_bits    = mbits(p + "self_attn.o_proj", qd);
+    ly.gate_bits = mbits(p + "mlp.gate_proj", cfg.hidden);
+    ly.up_bits   = mbits(p + "mlp.up_proj", cfg.hidden);
+    ly.down_bits = mbits(p + "mlp.down_proj", ly.ffn);
+    ok = qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb)
+           && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob)
+           && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
+    if (ly.gate_bits == mlp_bits && ly.up_bits == mlp_bits) {
+      SharedBuffer gw, gs, gb, uw, us, ub;   // freed after interleave
+      ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb)
+              && qtri(p + "mlp.up_proj", uw, us, ub)
+              && interleave_gu(gw, gs, gb, uw, us, ub,
+                               ly.guw, ly.gus, ly.gub, ly.ffn);
+      ly.mlp_fused = true;
+    } else {
+      ok = ok && qtri(p + "mlp.gate_proj", ly.guw, ly.gus, ly.gub)
+              && qtri(p + "mlp.up_proj", ly.uw, ly.us, ly.ub);
+      ly.mlp_fused = false;
+    }
+    if (has_ple) {
+      ok = ok
+        && qtri(p + "per_layer_input_gate", ly.plg_w, ly.plg_s, ly.plg_b);
+      if (m->_ple_quant) {
+        ok = ok && qtri(p + "per_layer_projection", ly.plp_w, ly.plp_s,
+                        ly.plp_b);
+      } else {
+        ly.plp_w = dequant_dense(p + "per_layer_projection", cfg.hidden,
+                                 cfg.hpli);
+      }
+    }
+    if (ly.kv_source < 0) {
+      ly.k_bits = mbits(p + "self_attn.k_proj", cfg.hidden);
+      ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
+      if (!ly.k_eq_v) {
+        ly.v_bits = mbits(p + "self_attn.v_proj", cfg.hidden);
+        ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
+      }
+      ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
+      if (ly.k_norm.empty()) { return nullptr; }
+      if (m->_qkv_fuse && ly.q_bits == ly.k_bits &&
+          (ly.k_eq_v || ly.q_bits == ly.v_bits)) {
+        build_qkv(ly);   // self-guards on the packing stride
+      }
+    }
     } else {
     SharedBuffer gw, gs, gb, uw, us, ub;   // freed after interleave
     // Per-layer MLP intermediate from the packed gate rows (E2B DOUBLES it on
@@ -1451,8 +1586,10 @@ MetalGemmaModel::ensure_scratch_()
   // 2x ffn_inner); e4b/gemma4_unified keep _ffn_max == ffn_inner.
   const int ffn_scr = (_ffn_max > 0) ? _ffn_max : c.ffn_inner;
   _d_act = b(ffn_scr);       // fused gate/up+geglu output (no gate/up bufs)
-  // Dense path runs gate/up as two separate GEMVs -> a private gate buffer.
-  if (_dense) { _d_gate = b(ffn_scr); }
+  // The dense path (and a de-fused mixed layer, gate/up at different widths)
+  // run gate + up as two separate GEMVs -> private gate + up buffers, then a
+  // standalone geglu into _d_act.
+  if (_dense || _mixed) { _d_gate = b(ffn_scr); _d_up = b(ffn_scr); }
   _d_mlp = b(H);
   // MoE decode scratch (M=1). npair = top_k pairs (all input row 0).
   if (c.is_moe()) {
@@ -1643,6 +1780,21 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
                  const SharedBuffer& b, const SharedBuffer& xin,
                  const SharedBuffer& y, int Kk, int N) {
     qmv_fn(_fn_qmv, w, s, b, xin, y, Kk, N);
+  };
+  // Per-tensor mixed-precision (OptiQ) GEMV: pick the w4/w8 kernel per tensor.
+  auto amv = [&](const SharedBuffer& w, const SharedBuffer& s,
+                 const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                 const SharedBuffer& y, int Kk, int N) {
+    qmv_fn(bits == 8 ? _fn_qmv8 : _fn_qmv4, w, s, b, xin, y, Kk, N);
+  };
+  // Projection GEMV, width-correct under mixed precision: the per-tensor
+  // w4/w8 kernel when _mixed, else the base _fn_qmv. A no-op wrapper on the
+  // uniform path (base bits), so projection sites can call it unconditionally.
+  auto pmv = [&](const SharedBuffer& w, const SharedBuffer& s,
+                 const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                 const SharedBuffer& y, int Kk, int N) {
+    if (_mixed) { amv(w, s, b, bits, xin, y, Kk, N); }
+    else { qmv(w, s, b, xin, y, Kk, N); }
   };
   // QKV-fused decode GEMV: one dispatch over the q|k|v row-concat (full GPU
   // occupancy), writing q/k/v into their separate buffers. v_out is bound to
@@ -2099,7 +2251,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     } else if (ly.qkv_fused) {
       DUP(DC_PROJ, [&] { qmv_qkv(ly, _d_hn); });
     } else {
-      DUP(DC_PROJ, [&] { qmv(ly.qw, ly.qs, ly.qb, _d_hn, _d_q, H, qd); });
+      DUP(DC_PROJ, [&] {
+        pmv(ly.qw, ly.qs, ly.qb, ly.q_bits, _d_hn, _d_q, H, qd); });
     }
     // q_norm+rope is fused with k_norm+rope below (rms_rope2) for non-reuse
     // layers; reuse layers (no k_proj) do q alone in the else branch.
@@ -2139,7 +2292,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
       if (_dense && !skip_proj) {
         DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.kw, _d_k, H, kd); });
       } else if (!ly.qkv_fused && !skip_proj) {   // k done in the fused GEMV
-        DUP(DC_PROJ, [&] { qmv(ly.kw, ly.ks, ly.kb, _d_hn, _d_k, H, kd); });
+        DUP(DC_PROJ, [&] {
+          pmv(ly.kw, ly.ks, ly.kb, ly.k_bits, _d_hn, _d_k, H, kd); });
       }
       // values: k_eq_v full layers reuse the k_proj output (no v_proj), taking
       // v_norm of it BEFORE k is normed -> can't fold V into the q+k+v kernel
@@ -2161,7 +2315,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         if (_dense && !skip_proj) {
           DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.vw, _d_v, H, kd); });
         } else if (!ly.qkv_fused && !skip_proj) {  // v done in the fused GEMV
-          DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
+          DUP(DC_PROJ, [&] {
+            pmv(ly.vw, ly.vs, ly.vb, ly.v_bits, _d_hn, _d_v, H, kd); });
         }
         DUP(DC_NORM, [&] {
           rms_rope3(_d_q, ly.q_norm, _d_k, ly.k_norm, _d_v, _ones_vnorm,
@@ -2171,7 +2326,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         if (_dense && !skip_proj) {
           DUP(DC_PROJ, [&] { dense_gemv(_d_hn, ly.vw, _d_v, H, kd); });
         } else if (!ly.qkv_fused && !skip_proj) {  // v done in the fused GEMV
-          DUP(DC_PROJ, [&] { qmv(ly.vw, ly.vs, ly.vb, _d_hn, _d_v, H, kd); });
+          DUP(DC_PROJ, [&] {
+            pmv(ly.vw, ly.vs, ly.vb, ly.v_bits, _d_hn, _d_v, H, kd); });
         }
         DUP(DC_NORM, [&] {
           const int kvw_win = ly.is_full ? 0 : c.sliding_window;
@@ -2598,7 +2754,8 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
     if (!skip_proj && _dense) {
       DUP(DC_PROJ, [&] { dense_gemv(_d_attn, ly.ow, _d_o, qd, H); });
     } else if (!skip_proj) {
-      DUP(DC_PROJ, [&] { qmv(ly.ow, ly.os, ly.ob, _d_attn, _d_o, qd, H); });
+      DUP(DC_PROJ, [&] {
+        pmv(ly.ow, ly.os, ly.ob, ly.o_bits, _d_attn, _d_o, qd, H); });
     }
     DUP(DC_NORM, [&] { rms_add(_d_o, ly.post_attn_ln, _d_x, 1, H); });  // += rms
 
@@ -2697,6 +2854,30 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         geglu(_d_gate, _d_act, _d_act, ffnL);
       });
       DUP(DC_FFN, [&] { dense_gemv(_d_act, ly.dw, _d_mlp, ffnL, H); });
+    } else if (_mixed && !skip_ffn) {
+      // Per-tensor mixed (OptiQ): a layer whose gate|up both equal mlp_bits was
+      // interleaved (mlp_fused) and runs the fused geglu; otherwise gate + up
+      // run as two width-correct GEMVs + a standalone geglu. down is per-tensor.
+      const int ffnL = ly.ffn;
+      if (ly.mlp_fused) {
+        DUP(DC_FFN, [&] {
+          enc.set_function(_fn_qmv_geglu);
+          enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
+          enc.set_buffer(2, ly.gub); enc.set_buffer(3, _d_hn);
+          enc.set_buffer(4, _d_act); enc.set_constant(5, H);
+          enc.set_constant(6, 2 * ffnL);
+          enc.dispatch({32, (unsigned)(ffnL / 2), 1}, {32, 2, 1});
+        });
+      } else {
+        DUP(DC_FFN, [&] {
+          amv(ly.guw, ly.gus, ly.gub, ly.gate_bits, _d_hn, _d_gate, H, ffnL);
+          amv(ly.uw, ly.us, ly.ub, ly.up_bits, _d_hn, _d_up, H, ffnL);
+          geglu(_d_gate, _d_up, _d_act, ffnL);
+        });
+      }
+      DUP(DC_FFN, [&] {
+        amv(ly.dw, ly.ds, ly.db, ly.down_bits, _d_act, _d_mlp, ffnL, H);
+      });
     } else if (!skip_ffn) {
     // ly.ffn is per-layer (E2B doubles it on the KV-shared layers); == the
     // global ffn_inner for uniform e4b / gemma4_unified.
@@ -2856,6 +3037,8 @@ MetalGemmaModel::ensure_bscratch_(BScratch& bs, int n)
   bs.o       = f16((std::size_t)n * H);
   bs.act     = f16((std::size_t)n * ffn);
   bs.mlp     = f16((std::size_t)n * H);
+  // De-fused mixed (OptiQ) gate scratch: gate + up run as two GEMMs then geglu.
+  if (_mixed) { bs.gate = f16((std::size_t)n * ffn); }
   if (hpli > 0) {
     bs.ple     = f16((std::size_t)n * nl * hpli);
     bs.pleproj = f16((std::size_t)n * nl * hpli);
@@ -2979,6 +3162,24 @@ MetalGemmaModel::encode_batched_step_(
                  const SharedBuffer& y, int Kk, int Nout) {
     qmm_fn(_fn_qmv, _fn_qmm, _fn_qmv_batch, w, s, b, xin, y, Kk, Nout);
   };
+  // Per-tensor mixed-precision (OptiQ) batched GEMM: the width-correct matvec
+  // (N==1) / batched-GEMV (N>1) / steel twins -- same dispatch ladder the
+  // uniform-4-bit models take (the proven batched path), just bit-aware. pmm is
+  // a no-op wrapper on the uniform path so batched sites call it directly.
+  auto amm = [&](const SharedBuffer& w, const SharedBuffer& s,
+                 const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                 const SharedBuffer& y, int Kk, int Nout) {
+    qmm_fn(bits == 8 ? _fn_qmv8 : _fn_qmv4,
+           bits == 8 ? _fn_qmm8 : _fn_qmm4,
+           bits == 8 ? _fn_qmv_batch8 : _fn_qmv_batch4,
+           w, s, b, xin, y, Kk, Nout);
+  };
+  auto pmm = [&](const SharedBuffer& w, const SharedBuffer& s,
+                 const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                 const SharedBuffer& y, int Kk, int Nout) {
+    if (_mixed) { amm(w, s, b, bits, xin, y, Kk, Nout); }
+    else { qmm(w, s, b, xin, y, Kk, Nout); }
+  };
   // Per-branch single-position RoPE at that branch's rope position.
   auto rope1 = [&](const SharedBuffer& xb, std::size_t xoff,
                    const SharedBuffer& invf, int heads, int D, int rp) {
@@ -3044,14 +3245,14 @@ MetalGemmaModel::encode_batched_step_(
     const int qd = Hq * D, kd = Hkv * D;
     const SharedBuffer& invf = ly.is_full ? _inv_freq_full : _inv_freq_sliding;
     rms(bs.x, 0, ly.in_ln, bs.hn, 0, N, H);
-    qmm(ly.qw, ly.qs, ly.qb, bs.hn, bs.q3, H, qd);
+    pmm(ly.qw, ly.qs, ly.qb, ly.q_bits, bs.hn, bs.q3, H, qd);
     rms(bs.q3, 0, ly.q_norm, bs.q3, 0, N * Hq, D);
     if (ly.kv_source < 0) {
-      qmm(ly.kw, ly.ks, ly.kb, bs.hn, bs.kbuf, H, kd);
+      pmm(ly.kw, ly.ks, ly.kb, ly.k_bits, bs.hn, bs.kbuf, H, kd);
       if (ly.k_eq_v) {
         rms(bs.kbuf, 0, _ones_vnorm, bs.vbuf, 0, N * Hkv, D);   // v=vnorm(k)
       } else {
-        qmm(ly.vw, ly.vs, ly.vb, bs.hn, bs.vbuf, H, kd);
+        pmm(ly.vw, ly.vs, ly.vb, ly.v_bits, bs.hn, bs.vbuf, H, kd);
         rms(bs.vbuf, 0, _ones_vnorm, bs.vbuf, 0, N * Hkv, D);
       }
       rms(bs.kbuf, 0, ly.k_norm, bs.kbuf, 0, N * Hkv, D);
@@ -3227,15 +3428,30 @@ MetalGemmaModel::encode_batched_step_(
         enc.dispatch({bn * 32, (unsigned)Hq, 1}, {bn * 32, 1, 1});
       }
     }
-    qmm(ly.ow, ly.os, ly.ob, bs.attn, bs.o, qd, H);
+    pmm(ly.ow, ly.os, ly.ob, ly.o_bits, bs.attn, bs.o, qd, H);
     rms_add(bs.o, ly.post_attn_ln, bs.x, N, H);
 
-    // MLP (geglu): fused gate/up + down, batched.
+    // MLP (geglu): fused gate/up + down, batched. A de-fused mixed (OptiQ)
+    // layer (gate/up at different widths) runs gate + up as two GEMMs + a
+    // standalone geglu; fused / uniform layers use the interleaved geglu.
     rms(bs.x, 0, ly.pre_ffn_ln, bs.hn, 0, N, H);
-    qmm_fn(_fn_qmv_geglu, _fn_qmm_geglu, _fn_qmv_batch_geglu, ly.guw, ly.gus,
-           ly.gub, bs.hn, bs.act, H, 2 * ffn);
-    qmm_fn(_fn_qmv_mlp, _fn_qmm_mlp, _fn_qmv_batch_mlp, ly.dw, ly.ds, ly.db,
-           bs.act, bs.mlp, ffn, H);
+    if (_mixed && !ly.mlp_fused) {
+      amm(ly.guw, ly.gus, ly.gub, ly.gate_bits, bs.hn, bs.gate, H, ffn);
+      amm(ly.uw, ly.us, ly.ub, ly.up_bits, bs.hn, bs.act, H, ffn);
+      enc.set_function(_fn_geglu);           // gelu(gate)*up -> act
+      enc.set_buffer(0, bs.gate); enc.set_buffer(1, bs.act);
+      enc.set_buffer(2, bs.act); enc.set_constant(3, N * ffn);
+      enc.dispatch({(unsigned)(N * ffn), 1, 1}, {256, 1, 1});
+    } else {
+      qmm_fn(_fn_qmv_geglu, _fn_qmm_geglu, _fn_qmv_batch_geglu, ly.guw, ly.gus,
+             ly.gub, bs.hn, bs.act, H, 2 * ffn);
+    }
+    if (_mixed) {
+      amm(ly.dw, ly.ds, ly.db, ly.down_bits, bs.act, bs.mlp, ffn, H);
+    } else {
+      qmm_fn(_fn_qmv_mlp, _fn_qmm_mlp, _fn_qmv_batch_mlp, ly.dw, ly.ds, ly.db,
+             bs.act, bs.mlp, ffn, H);
+    }
     rms_add(bs.mlp, ly.post_ffn_ln, bs.x, N, H);
 
     if (has_ple) {
@@ -3275,6 +3491,12 @@ MetalGemmaModel::encode_batched_step_(
       enc.set_constant(4, c.vocab);
       enc.dispatch({32, (unsigned)(((c.vocab + 7) / 8) * 2), 1}, {32, 2, 1});
     }
+  } else if (_mixed) {
+    // The tied lm_head is a single uniform tensor at embed_bits (8-bit for the
+    // OptiQ pack); the base qmm would bind a w4 kernel to it. Dispatch at its
+    // own width -- mirrors the decode path's _fn_qmv_embed.
+    amm(_embed_w, _embed_s, _embed_b, _cfg.embed_bits, bs.hn, bs.logits, H,
+        c.vocab);
   } else {
     qmm(_embed_w, _embed_s, _embed_b, bs.hn, bs.logits, H, c.vocab);
   }
@@ -3842,9 +4064,11 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
   // e4b/gemma4_unified keep _ffn_max == ffn.
   const int ffn_scr = (_ffn_max > 0) ? _ffn_max : ffn;
   SharedBuffer act = buf((std::size_t)n * ffn_scr), mlp = buf((std::size_t)n * H);
-  // Dense (raw-HF) gate scratch [n, ffn_scr]: the dense MLP runs gate + up as
-  // two separate dense GEMMs then gelu(gate)*up -> act (no interleaved-swiglu).
-  SharedBuffer gate_d = _dense ? buf((std::size_t)n * ffn_scr) : SharedBuffer{};
+  // Dense (raw-HF), and de-fused mixed (gate/up different widths), gate scratch
+  // [n, ffn_scr]: gate + up run as two separate GEMMs then gelu(gate)*up -> act
+  // (no interleaved geglu).
+  SharedBuffer gate_d = (_dense || _mixed) ? buf((std::size_t)n * ffn_scr)
+                                           : SharedBuffer{};
   // Matrix-core geglu intermediate: dequant gate|up -> dense gu_full[rows,
   // 2*ffn], then GeGLU-combine -> act. Only on the matrix-core path. Sized to
   // the widest layer (E2B double-wide shared layers).
@@ -3957,20 +4181,23 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     // M-independent dequant amortises over `rows`; ~2-2.5x steel at prefill.
     auto dense_mma_qmm = [&](const SharedBuffer& w, const SharedBuffer& s,
                              const SharedBuffer& b, const SharedBuffer& xin,
-                             const SharedBuffer& y, int Kk, int Nn) {
+                             const SharedBuffer& y, int Kk, int Nn,
+                             int bits = 4) {
+      // `bits` selects the dequant width per tensor (mixed/OptiQ); the base 4
+      // matches every uniform caller. The dequant packs Kk*bits/32 u32 columns.
       const std::size_t need = (std::size_t)Nn * Kk * 2;
       if (_w_deq.empty() || _w_deq.byte_size() < need) {
         _w_deq = _mc->make_shared_buffer(need);
       }
       if (!_skip_dequant) {
-        enc.set_function(_fn_dequant);
+        enc.set_function(bits == 8 ? _fn_dequant8 : _fn_dequant);
         enc.set_buffer(0, w);
         enc.set_buffer(1, s);
         enc.set_buffer(2, b);
         enc.set_buffer(3, _w_deq);
         enc.set_constant(4, Kk);
         enc.set_constant(5, Nn);
-        enc.dispatch({(unsigned)(Kk / 8), (unsigned)Nn, 1}, {64, 1, 1});
+        enc.dispatch({(unsigned)(Kk * bits / 32), (unsigned)Nn, 1}, {64, 1, 1});
       }
       const bool deep = (Kk >= 6144);
       const int BN = deep ? 256 : 128;
@@ -3992,7 +4219,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     auto qmm_fn = [&](const auto& fn_mv, const auto& fn_mm,
                       const SharedBuffer& w, const SharedBuffer& s,
                       const SharedBuffer& b, const SharedBuffer& xin,
-                      const SharedBuffer& y, int Kk, int N) {
+                      const SharedBuffer& y, int Kk, int N, int bits = 4) {
       if (rows == 1) {
         // Single row (shared-KV tail): the matvec kernel beats the matmul,
         // which computes a 32-row tile for 1 valid row.
@@ -4008,7 +4235,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         return;
       }
       if (_use_mma && rows >= _mma_min_m) {
-        dense_mma_qmm(w, s, b, xin, y, Kk, N);
+        dense_mma_qmm(w, s, b, xin, y, Kk, N, bits);
         return;
       }
       enc.set_function(fn_mm);
@@ -4027,6 +4254,23 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
                    const SharedBuffer& b, const SharedBuffer& xin,
                    const SharedBuffer& y, int Kk, int N) {
       qmm_fn(_fn_qmv, _fn_qmm, w, s, b, xin, y, Kk, N);
+    };
+    // Per-tensor mixed-precision (OptiQ) prefill GEMM: the width-correct matvec
+    // / steel / matmul2d twins. qmm_fn routes rows==1 -> matvec, matrix-core
+    // (_use_mma, M5) -> dequant-at-`bits` -> dense matmul2d, else steel GEMM.
+    auto amm = [&](const SharedBuffer& w, const SharedBuffer& s,
+                   const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                   const SharedBuffer& y, int Kk, int N) {
+      qmm_fn(bits == 8 ? _fn_qmv8 : _fn_qmv4,
+             bits == 8 ? _fn_qmm8 : _fn_qmm4, w, s, b, xin, y, Kk, N, bits);
+    };
+    // Projection GEMM, width-correct under mixed precision; a no-op wrapper on
+    // the uniform path (base bits) so sites can call it unconditionally.
+    auto pmm = [&](const SharedBuffer& w, const SharedBuffer& s,
+                   const SharedBuffer& b, int bits, const SharedBuffer& xin,
+                   const SharedBuffer& y, int Kk, int N) {
+      if (_mixed) { amm(w, s, b, bits, xin, y, Kk, N); }
+      else { qmm(w, s, b, xin, y, Kk, N); }
     };
     auto tr = [&](const SharedBuffer& in, const SharedBuffer& out, int A,
                   int Bd, int D) {
@@ -4233,7 +4477,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
 
       rms(*xcur, 0, ly.in_ln, hn, 0, rows, H);
       if (_dense) { dense(hn, ly.qw, q3, H, qd); }
-      else { qmm(ly.qw, ly.qs, ly.qb, hn, q3, H, qd); }
+      else { pmm(ly.qw, ly.qs, ly.qb, ly.q_bits, hn, q3, H, qd); }
       // q-norm + rope. Tail (1 row): fused rms_rope in place on q3, already
       // [Hq,D] head-major (== decode q layout); attention reads q3. Bulk:
       // separate norm, transpose to [Hq,rows,D], rope; attention reads qt.
@@ -4262,14 +4506,14 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       const int ring_cap = paged_full ? 0 : _ctx->kv_ring_cap(cm, L);
       if (ly.kv_source < 0) {
         if (_dense) { dense(hn, ly.kw, kb, H, kd); }
-        else { qmm(ly.kw, ly.ks, ly.kb, hn, kb, H, kd); }
+        else { pmm(ly.kw, ly.ks, ly.kb, ly.k_bits, hn, kb, H, kd); }
         // values: k_eq_v full layers reuse the k_proj output (no v_proj),
         // v_norm'd BEFORE k is normed in place. Else project v separately.
         if (ly.k_eq_v) {
           rms(kb, 0, _ones_vnorm, vb, 0, n * Hkv, D);   // vb = v_norm(k)
         } else {
           if (_dense) { dense(hn, ly.vw, vb, H, kd); }
-          else { qmm(ly.vw, ly.vs, ly.vb, hn, vb, H, kd); }
+          else { pmm(ly.vw, ly.vs, ly.vb, ly.v_bits, hn, vb, H, kd); }
           rms(vb, 0, _ones_vnorm, vb, 0, n * Hkv, D);   // v_norm (no wt)
         }
         rms(kb, 0, ly.k_norm, kb, 0, n * Hkv, D);
@@ -4742,7 +4986,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         attn_out = &att;
       }
       if (_dense) { dense(*attn_out, ly.ow, ao, qd, H); }
-      else { qmm(ly.ow, ly.os, ly.ob, *attn_out, ao, qd, H); }
+      else { pmm(ly.ow, ly.os, ly.ob, ly.o_bits, *attn_out, ao, qd, H); }
       if (rows == 1) {
         rms_add(ao, ly.post_attn_ln, *xcur, rows, H);
       } else {
@@ -4863,6 +5107,13 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         dense(hn, ly.dgate, gate_d, H, ffnL);
         dense(hn, ly.dup, act, H, ffnL);
         geglu(gate_d, act, 0, act, rows * ffnL);
+      } else if (_mixed && !ly.mlp_fused) {
+        // Per-tensor mixed (OptiQ) de-fused: gate + up at their own widths as
+        // two GEMMs (matvec at rows==1, else steel; _use_mma off for mixed),
+        // then gelu(gate)*up -> act.
+        amm(ly.guw, ly.gus, ly.gub, ly.gate_bits, hn, gate_d, H, ffnL);
+        amm(ly.uw, ly.us, ly.ub, ly.up_bits, hn, act, H, ffnL);
+        geglu(gate_d, act, 0, act, rows * ffnL);
       } else if (rows == 1) {
         enc.set_function(_fn_qmv_geglu);
         enc.set_buffer(0, ly.guw);
@@ -4878,7 +5129,10 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // matmul2d -> gu_full[rows, 2*ffn], then GeGLU-combine (gelu(gate)*up
         // over the interleaved columns) -> act[rows, ffn]. K=H (<=4096) so
         // dense_mma_qmm picks the 128x128 tile.
-        dense_mma_qmm(ly.guw, ly.gus, ly.gub, hn, gu_full, H, 2 * ffnL);
+        // Fused interleaved gate|up: dequant at mlp_bits (the fused-mixed layer
+        // has gate|up == mlp_bits; uniform e4b is 4-bit here).
+        dense_mma_qmm(ly.guw, ly.gus, ly.gub, hn, gu_full, H, 2 * ffnL,
+                      _cfg.mlp_bits);
         enc.set_function(_fn_geglu_inter);
         enc.set_buffer(0, gu_full);
         enc.set_buffer(1, act);
@@ -4898,9 +5152,11 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.dispatch({(unsigned)(((2 * ffnL + 31) / 32) * 32),
                       (unsigned)(((rows + 31) / 32) * 2), 2}, {32, 2, 2});
       }
-      // down_proj at mlp_bits (8-bit for gemma4_unified).
+      // down_proj at mlp_bits (8-bit for gemma4_unified); per-tensor for mixed.
       if (_dense) { dense(act, ly.dw, mlp, ffnL, H); }
-      else {
+      else if (_mixed) {
+        amm(ly.dw, ly.ds, ly.db, ly.down_bits, act, mlp, ffnL, H);
+      } else {
         qmm_fn(_fn_qmv_mlp, _fn_qmm_mlp, ly.dw, ly.ds, ly.db, act, mlp, ffnL,
                H);
       }

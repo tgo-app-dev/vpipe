@@ -86,6 +86,10 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "title", .type = ConfigType::String,
    .doc = "optional label shown in the web-ui preview picker; empty = "
           "the stage id", .def_str = ""},
+  {.key = "image_mode", .type = ConfigType::Bool,
+   .doc = "allow still-image mode for a slow image-type source (sends a "
+          "picture instead of video below 1 fps); false = always video",
+   .def_bool = true},
 };
 const PortSpec kIports[] = {
   {.name = "frames", .doc = "video RGB TensorBeat [3,H,W] (F32 or U8); the "
@@ -123,9 +127,10 @@ PreviewStage::PreviewStage(const SessionContextIntf* s,
                              std::move(config))
   , _libs(s->ffmpeg_libraries())
 {
-  _bitrate          = attr_int("bitrate");
-  _input_normalized = attr_bool("input_normalized");
-  _title            = attr_str("title");
+  _bitrate            = attr_int("bitrate");
+  _input_normalized   = attr_bool("input_normalized");
+  _title              = attr_str("title");
+  _image_mode_enabled = attr_bool("image_mode");
   if (_bitrate < 64'000) { _bitrate = 64'000; }
 
   allocate_oports(spec().oports.size());   // sink: 0 oports
@@ -363,11 +368,15 @@ PreviewStage::teardown_media_()
     _avio = nullptr;
     _avio_buf = nullptr;
   }
-  if (_pkt)   { _libs->avcodec().api.packet_free(&_pkt); }
-  if (_enc)   { _libs->avcodec().api.free_context(&_enc); }
-  if (_sws)   { _libs->swscale().api.free_context(_sws); _sws = nullptr; }
-  if (_gbrp)  { _libs->avutil().api.frame_free(&_gbrp); }
-  if (_frame) { _libs->avutil().api.frame_free(&_frame); }
+  if (_pkt)     { _libs->avcodec().api.packet_free(&_pkt); }
+  if (_enc)     { _libs->avcodec().api.free_context(&_enc); }
+  if (_png_pkt) { _libs->avcodec().api.packet_free(&_png_pkt); }
+  if (_png)     { _libs->avcodec().api.free_context(&_png); }
+  if (_sws)     { _libs->swscale().api.free_context(_sws); _sws = nullptr; }
+  if (_gbrp)    { _libs->avutil().api.frame_free(&_gbrp); }
+  if (_rgb)     { _libs->avutil().api.frame_free(&_rgb); }
+  if (_frame)   { _libs->avutil().api.frame_free(&_frame); }
+  _have_rgb = false;
   _mux_buf.clear();
 }
 
@@ -479,6 +488,9 @@ PreviewStage::adopt_fps_(const TensorBeat& tb)
   const int num = static_cast<int>(sb.at("fps_num").as_uint(0));
   const int den = sb.contains("fps_den")
                       ? static_cast<int>(sb.at("fps_den").as_uint(0)) : 1;
+  // An fps sideband marks a video-type source: it is never eligible for
+  // still-image mode, however slow it runs (a 0.5 fps camera stays video).
+  if (num > 0 && den > 0) { _source_is_video = true; }
   if (num > 0 && den > 0 && (num != _cadence_num || den != _cadence_den)) {
     _cadence_num = num;
     _cadence_den = den;
@@ -508,7 +520,142 @@ PreviewStage::handle_video_frame_(const TensorBeat& tb)
   } else if (W != _out_w || H != _out_h) {
     return;   // resolution is fixed after adoption; drop mismatches
   }
+  // Image-type source: retain the frame as packed RGB24 for still mode.
+  // (A video-type source never packs -- no per-frame cost at 30 fps.)
+  if (_image_mode_enabled && !_source_is_video && !_png_bad) {
+    if (ensure_rgb_(_out_w, _out_h)) { pack_rgb24_(tb); }
+  }
   convert_to_frame_(tb);
+}
+
+bool
+PreviewStage::ensure_rgb_(int W, int H)
+{
+  if (_rgb && _rgb->width == W && _rgb->height == H) { return true; }
+  if (_rgb) { _libs->avutil().api.frame_free(&_rgb); }
+  _have_rgb = false;
+  _rgb = _libs->avutil().api.frame_alloc();
+  if (!_rgb) { return false; }
+  _rgb->format = AV_PIX_FMT_RGB24;
+  _rgb->width  = W;
+  _rgb->height = H;
+  if (_libs->avutil().api.frame_get_buffer(_rgb, 32) < 0) {
+    _libs->avutil().api.frame_free(&_rgb);
+    return false;
+  }
+  return true;
+}
+
+// Build the PNG still encoder once, at the (fixed) output resolution.
+// Sets _png_bad if the encoder is unavailable so the caller stays in
+// video mode.
+bool
+PreviewStage::ensure_png_()
+{
+  if (_png) { return true; }
+  if (_png_bad) { return false; }
+  const AVCodec* codec = _libs->avcodec().api.find_encoder_by_name("png");
+  if (!codec) {
+    session()->warn(fmt(
+        "preview('{}'): PNG encoder unavailable; still-image mode off",
+        this->id()));
+    _png_bad = true;
+    return false;
+  }
+  _png = _libs->avcodec().api.alloc_context3(codec);
+  if (!_png) { _png_bad = true; return false; }
+  _png->width     = _out_w;
+  _png->height    = _out_h;
+  _png->pix_fmt   = AV_PIX_FMT_RGB24;
+  _png->time_base = AVRational{1, 1};
+  int rc = _libs->avcodec().api.open2(_png, codec, nullptr);
+  if (rc < 0) {
+    session()->warn(fmt(
+        "preview('{}'): PNG avcodec_open2: {}", this->id(), av_err_(rc)));
+    _libs->avcodec().api.free_context(&_png);
+    _png_bad = true;
+    return false;
+  }
+  _png_pkt = _libs->avcodec().api.packet_alloc();
+  if (!_png_pkt) { _png_bad = true; return false; }
+  return true;
+}
+
+void
+PreviewStage::pack_rgb24_(const TensorBeat& tb)
+{
+  if (!_rgb) { return; }
+  const int    W        = _out_w;
+  const int    H        = _out_h;
+  const size_t expected = static_cast<size_t>(3) * H * W;
+  uint8_t*     dst      = _rgb->data[0];
+  const int    ls       = _rgb->linesize[0];
+
+  if (tb.dtype == TensorBeat::DType::U8) {
+    const uint8_t*         src = nullptr;
+    AlignedVector<uint8_t> tmp;
+    if (tb.is_contiguous() && tb.byte_size() == expected) {
+      src = tb.as_u8();
+    } else {
+      tmp = tb.materialize_contiguous();
+      src = tmp.data();
+    }
+    for (int y = 0; y < H; ++y) {
+      uint8_t* drow = dst + static_cast<size_t>(y) * ls;
+      for (int x = 0; x < W; ++x) {
+        for (int c = 0; c < 3; ++c) {
+          drow[x * 3 + c] =
+              src[(static_cast<size_t>(c) * H + y) * W + x];
+        }
+      }
+    }
+  } else if (tb.dtype == TensorBeat::DType::F32) {
+    const float*         src = nullptr;
+    AlignedVector<float> tmp;
+    if (tb.is_contiguous()
+        && tb.byte_size() == expected * sizeof(float)) {
+      src = tb.as_f32();
+    } else {
+      tmp = tb.materialize_contiguous_as<float>();
+      src = tmp.data();
+    }
+    const float scale = _input_normalized ? 255.0f : 1.0f;
+    for (int y = 0; y < H; ++y) {
+      uint8_t* drow = dst + static_cast<size_t>(y) * ls;
+      for (int x = 0; x < W; ++x) {
+        for (int c = 0; c < 3; ++c) {
+          drow[x * 3 + c] = clamp_byte_(
+              src[(static_cast<size_t>(c) * H + y) * W + x] * scale);
+        }
+      }
+    }
+  } else {
+    return;   // unsupported dtype: keep the previous still
+  }
+  _have_rgb = true;
+}
+
+void
+PreviewStage::send_image_()
+{
+  if (!_have_rgb || !ensure_png_()) { return; }
+  _rgb->pts = 0;
+  int rc = _libs->avcodec().api.send_frame(_png, _rgb);
+  if (rc < 0) {
+    session()->warn(fmt(
+        "preview('{}'): PNG send_frame: {}", this->id(), av_err_(rc)));
+    return;
+  }
+  while (true) {
+    rc = _libs->avcodec().api.receive_packet(_png, _png_pkt);
+    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { break; }
+    if (rc < 0) { break; }
+    if (_channel && _png_pkt->size > 0) {
+      _channel->push_image(_png_pkt->data,
+                           static_cast<size_t>(_png_pkt->size));
+    }
+    _libs->avcodec().api.packet_unref(_png_pkt);
+  }
 }
 
 void
@@ -619,6 +766,7 @@ PreviewStage::process(RuntimeContext& ctx)
   // Drain inputs without blocking: the latest video frame (sampling), and
   // every audio chunk. Only the newest video frame is kept -- an unread
   // backlog is still consumed so the producer isn't back-pressured.
+  bool got_frame = false;
   if (!_fatal && _want_video) {
     const uint32_t avail = ctx.backlog(0);
     for (uint32_t i = 0; i < avail; ++i) {
@@ -628,6 +776,7 @@ PreviewStage::process(RuntimeContext& ctx)
       if (tb && tb->shape.size() == 3 && tb->shape[0] == 3) {
         ++_frames_in;
         handle_video_frame_(*tb);
+        got_frame = true;
       }
     }
   }
@@ -649,7 +798,43 @@ PreviewStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  encode_tick_();
+  // Decide between video and still-image mode. An image-type source (no
+  // fps sideband) that has gone quiet for >= 1 s (arrivals slower than
+  // 1 fps) streams stills; when two frames land < 1 s apart it returns to
+  // video. The 1 s hysteresis keeps the mode from flapping.
+  const auto t_now = std::chrono::steady_clock::now();
+  if (got_frame) {
+    if (_have_arrival) {
+      _fast_input = (t_now - _last_arrival) < std::chrono::seconds(1);
+    }
+    _last_arrival = t_now;
+    _have_arrival = true;
+  }
+  bool entered_image = false;
+  if (_image_mode_enabled && !_source_is_video && !_png_bad && _have_frame) {
+    if (_mode == Mode::Video) {
+      const bool idle = _have_arrival
+          && (t_now - _last_arrival) >= std::chrono::seconds(1);
+      // ensure_png_() sets _png_bad (and returns false) if the still
+      // encoder is missing -- then we never enter image mode.
+      if (idle && !_fast_input && _have_rgb && ensure_png_()) {
+        _mode         = Mode::Image;
+        entered_image = true;
+      }
+    } else if (got_frame && _fast_input) {
+      // Sped back up past 1 fps: resume video. The next fragment starts a
+      // fresh keyframe so the browser rebuilds its MediaSource cleanly.
+      _mode               = Mode::Video;
+      _force_next_key     = true;
+      _frames_since_flush = 0;
+    }
+  }
+
+  if (_mode == Mode::Image) {
+    if (entered_image || got_frame) { send_image_(); }
+  } else {
+    encode_tick_();
+  }
 
   // Self-clock to the next cadence tick.
   ThreadPool* pool = session() ? session()->thread_pool() : nullptr;

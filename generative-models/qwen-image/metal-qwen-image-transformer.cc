@@ -1,6 +1,7 @@
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 
 #include "common/flex-data.h"
+#include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/stream-pin.h"
@@ -205,6 +206,11 @@ MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
       FlexData fd = FlexData::from_json(in);
       if (fd.is_object()) {
         auto o = fd.as_object();
+        // zero_cond_t: modulate the reference tokens at timestep 0 (see the
+        // Config comment). Qwen-Image-Edit-2511 sets it.
+        if (o.contains("zero_cond_t")) {
+          m->_cfg.zero_cond_t = o.at("zero_cond_t").as_bool(false);
+        }
         if (o.contains("quantization")) {
           FlexData q = o.at("quantization");
           if (q.is_object()) {
@@ -454,8 +460,29 @@ MetalQwenImageTransformer::time_proj_(float sigma) const
   const int C = _cfg.time_proj, half = C / 2;
   std::vector<float> out((std::size_t)C);
   const float sc = 1000.0f;
+  // Round-to-nearest-even down to bf16 (what torch's .to(bfloat16) does).
+  auto to_bf16 = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    u &= 0xffff0000u;
+    float o;
+    std::memcpy(&o, &u, 4);
+    return o;
+  };
+  // Mage-Flow's forward does `timesteps = timesteps.to(img.dtype)` with the
+  // model in bf16, so the TIMESTEP is rounded before the angle is formed --
+  // the same trap as the frequency table below, and just as consequential:
+  // the angle reaches sigma*1000 ~ 950 rad, so bf16's ~2e-3 ulp near 1.0 is
+  // ~2 RADIANS of phase and moves temb by 30-40%. Only sigmas that are
+  // exactly representable in bf16 (1.0, 0.75, 0.5) are unaffected -- which is
+  // why a golden pinned at sigma 0.75 cannot see this, while the real
+  // FlowMatchEuler schedule (0.947, 0.857, 0.667) is wrong at every step but
+  // the first.
+  if (_cfg.bf16_timestep) { sigma = to_bf16(sigma); }
   for (int i = 0; i < half; ++i) {
-    const float freq = std::exp(-std::log(10000.0f) * (float)i / (float)half);
+    float freq = std::exp(-std::log(10000.0f) * (float)i / (float)half);
+    if (_cfg.bf16_time_freqs) { freq = to_bf16(freq); }
     const float arg = sigma * sc * freq;
     out[(std::size_t)i] = std::cos(arg);
     out[(std::size_t)(half + i)] = std::sin(arg);
@@ -503,8 +530,17 @@ MetalQwenImageTransformer::build_rope_(int txt_seq,
       cb[o] = c; cb[o + 1] = c; sb[o] = s; sb[o + 1] = s;
     }
   };
-  // Text rows first: position = max_vid + tt on all axes.
+  // Text rows first: position = max_vid + tt on all axes. When the model
+  // leaves text unrotated (Mage-Flow), write the identity rotation instead
+  // -- cos 1 / sin 0 -- so the shared roped-attention path needs no branch.
   for (int tt = 0; tt < txt_seq; ++tt) {
+    if (!_cfg.rotate_txt) {
+      for (int j = 0; j < P; ++j) {
+        const std::size_t o = (std::size_t)tt * D + 2 * j;
+        cb[o] = 1.0f; cb[o + 1] = 1.0f; sb[o] = 0.0f; sb[o + 1] = 0.0f;
+      }
+      continue;
+    }
     const double p = (double)(max_vid + tt);
     fill(tt, p, p, p);
   }
@@ -636,6 +672,12 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   }
   const int JT = txt_seq + total_img;   // joint sequence length
 
+  // LLM-lane perf event (perf-visualizer): one dual-stream DiT forward per
+  // sampler step (2 per step under CFG). value = the joint sequence length.
+  // Mirrors the Krea-2 / FLUX.2 DiT events so QIE shows on the LLM lane too.
+  PerfAuxScope _perf(_mc->session(), kPerfLaneLLM, kGvidLlmDit,
+                     kPerfLlmDitBegin, (std::uint64_t)JT);
+
   auto buf = [&](std::size_t n) { return _mc->make_shared_buffer(n * 2); };
 
   // Persistent host-built inputs.
@@ -656,6 +698,17 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // into imod_all/tmod_all when modulation is precomputed (preloaded path).
   SharedBuffer imod_s = buf((std::size_t)6 * H), tmod_s = buf((std::size_t)6 * H);
   SharedBuffer msilu = buf((std::size_t)H);
+  // zero_cond_t twins: the timestep-0 embedding and its image modulation, used
+  // for the reference rows only. Allocated only when references are present.
+  const int ref_seq = total_img - gen_seq;
+  const bool want_zct = _cfg.zero_cond_t && ref_seq > 0;
+  SharedBuffer tproj0_b, temb0, msilu0, zmod_s;
+  if (want_zct) {
+    tproj0_b = buf((std::size_t)_cfg.time_proj);
+    temb0 = buf((std::size_t)H);
+    msilu0 = buf((std::size_t)H);
+    zmod_s = buf((std::size_t)6 * H);
+  }
   SharedBuffer nrm = buf((std::size_t)JT * H), mdl = buf((std::size_t)JT * H);
   SharedBuffer jq = buf((std::size_t)JT * H), jk = buf((std::size_t)JT * H),
                jv = buf((std::size_t)JT * H);
@@ -665,6 +718,14 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   SharedBuffer g1 = buf((std::size_t)total_img * FF),
                g2 = buf((std::size_t)txt_seq * FF);
   SharedBuffer velo = buf((std::size_t)gen_seq * IC);
+  // Staged-verification sentinels (alongside the existing -2 post-embedder
+  // and -3 post-attention-residual): -4 returns block 0's joint attention
+  // output for the image rows BEFORE the output projection and gate, and -5
+  // returns the timestep conditioning vector temb. Together they split a
+  // mismatch into conditioning / attention / out-proj+gate -- which is how
+  // the Mage-Flow bf16-frequency bug was localized.
+  bool dbg_att = false;          // stop_after_block == -4 fired
+  std::size_t dbg_ioff = 0;
 
   // Env-gated per-section GPU timing (VPIPE_QIE_DIT_PROFILE). Each section
   // boundary inserts a commit+wait barrier and accumulates wall time, splitting
@@ -673,7 +734,11 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // absolute step time inflates a little, but the RELATIVE breakdown is
   // faithful. Mirrors the Krea-2 / FLUX.2 DiT profilers.
   const bool prof = !_stream_blocks &&
-                    std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr;
+                    (std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr
+                     // Mage-Flow drives this same class, so accept a
+                     // Mage-named alias -- section timing for a Mage run
+                     // should not hide behind a QIE-named variable.
+                     || std::getenv("VPIPE_MAGE_DIT_PROFILE") != nullptr);
   // Measurement-only: skip the modulation GEMVs to isolate their bandwidth cost
   // (imod/tmod left stale -> output is garbage; timing only). VPIPE_QIE_SKIP_MOD.
   const bool skip_mod = std::getenv("VPIPE_QIE_SKIP_MOD") != nullptr;
@@ -912,11 +977,14 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       enc.set_constant(4, H); enc.set_constant(5, total);
       enc.dispatch({(unsigned)total, 1, 1}, {256, 1, 1});
     };
-    auto gated = [&](const SharedBuffer& h, const SharedBuffer& mod,
-                     std::size_t gate_e, const SharedBuffer& sub, int total) {
+    // h[he..] += mod[gate_e..] * sub[se..]. `he`/`se` let the image stream be
+    // gated in two row-ranges (generated vs reference) with different mod sets.
+    auto gated = [&](const SharedBuffer& h, std::size_t he,
+                     const SharedBuffer& mod, std::size_t gate_e,
+                     const SharedBuffer& sub, std::size_t se, int total) {
       enc.set_function(_fn_gated);
-      enc.set_buffer(0, h); enc.set_buffer(1, mod, gate_e * 2);
-      enc.set_buffer(2, sub);
+      enc.set_buffer(0, h, he * 2); enc.set_buffer(1, mod, gate_e * 2);
+      enc.set_buffer(2, sub, se * 2);
       enc.set_constant(3, H); enc.set_constant(4, total);
       enc.dispatch({(unsigned)total, 1, 1}, {256, 1, 1});
     };
@@ -942,6 +1010,18 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     gemm_bias(tproj_b, 0, _t1_w, _t1_b, th1, 0, 1, H, _cfg.time_proj);
     silu(th1, tsilu, H);
     gemm_bias(tsilu, 0, _t2_w, _t2_b, temb, 0, 1, H, H);
+    // zero_cond_t: a SECOND embedding at timestep 0 for the (clean) reference
+    // tokens -- diffusers' `torch.cat([timestep, timestep * 0])` + per-token
+    // `modulate_index`. Only needed when references are actually present.
+    const bool zct = want_zct;
+    if (zct) {
+      const std::vector<float> tp0 = time_proj_(0.0f);
+      auto* d0 = static_cast<std::uint16_t*>(tproj0_b.contents());
+      for (int i = 0; i < _cfg.time_proj; ++i) { d0[i] = f32_to_bf16_(tp0[i]); }
+      gemm_bias(tproj0_b, 0, _t1_w, _t1_b, th1, 0, 1, H, _cfg.time_proj);
+      silu(th1, tsilu, H);
+      gemm_bias(tsilu, 0, _t2_w, _t2_b, temb0, 0, 1, H, H);
+    }
     psplit(t_embed);
 
     // Build the bf16 steel flash-attention function for this joint length + fill
@@ -978,7 +1058,8 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     const unsigned a_nqb = (unsigned)((JT + A_BQ - 1) / A_BQ);
 
     // ---- transformer blocks ----
-    const int n_layers = (stop_after_block == -2) ? 0 : _cfg.n_layers;
+    const int n_layers =
+        (stop_after_block == -2 || stop_after_block == -5) ? 0 : _cfg.n_layers;
     // Streaming mode: commit the embedders before the first streamed block so
     // the per-block command buffers stay bounded.
     if (_stream_blocks && n_layers > 0) { flush(); }
@@ -990,16 +1071,20 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     // path (blocks aren't all resident). VPIPE_QIE_NO_MOD_PRECOMP disables.
     const bool precomp_mod = !_stream_blocks && !skip_mod && n_layers > 0 &&
         std::getenv("VPIPE_QIE_NO_MOD_PRECOMP") == nullptr;
-    SharedBuffer imod_all, tmod_all;
+    SharedBuffer imod_all, tmod_all, zmod_all;
     if (precomp_mod) {
       imod_all = buf((std::size_t)n_layers * 6 * H);
       tmod_all = buf((std::size_t)n_layers * 6 * H);
+      if (zct) { zmod_all = buf((std::size_t)n_layers * 6 * H); }
       silu(temb, msilu, H);
+      if (zct) { silu(temb0, msilu0, H); }
       for (int L = 0; L < n_layers; ++L) {
         const Block& bb = _blocks[(std::size_t)L];
         const std::size_t off = (std::size_t)L * 6 * H;
         mod_gemv(msilu, bb.img_mod_w, bb.img_mod_b, imod_all, off);
         mod_gemv(msilu, bb.txt_mod_w, bb.txt_mod_b, tmod_all, off);
+        // same img_mod weights, driven by the timestep-0 embedding
+        if (zct) { mod_gemv(msilu0, bb.img_mod_w, bb.img_mod_b, zmod_all, off); }
       }
       psplit(t_mod);
     }
@@ -1025,14 +1110,29 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
                                       : imod_s.subview(0, msz);
       SharedBuffer tmod = precomp_mod ? tmod_all.subview(moff, msz)
                                       : tmod_s.subview(0, msz);
+      // zero_cond_t: the reference rows' modulation (timestep 0).
+      SharedBuffer zmod;
+      if (zct) {
+        zmod = precomp_mod ? zmod_all.subview(moff, msz) : zmod_s.subview(0, msz);
+      }
       if (!precomp_mod) {
         silu(temb, msilu, H);
+        if (zct) { silu(temb0, msilu0, H); }
         if (!skip_mod) {
           mod_gemv(msilu, b.img_mod_w, b.img_mod_b, imod, 0);
           mod_gemv(msilu, b.txt_mod_w, b.txt_mod_b, tmod, 0);
+          if (zct) { mod_gemv(msilu0, b.img_mod_w, b.img_mod_b, zmod, 0); }
         }
         psplit(t_mod);
       }
+      // Image-stream modulation is applied in two row-ranges when zero_cond_t
+      // is on: generated rows [0, gen_seq) at the current sigma, reference rows
+      // [gen_seq, total_img) at timestep 0. `img_mod` picks the mod set and
+      // `img_rows` the row count for each range.
+      const int nrange = zct ? 2 : 1;
+      const SharedBuffer* img_mod[2] = {&imod, &zmod};   // move-only: by ref
+      const int img_rows[2] = {zct ? gen_seq : total_img, ref_seq};
+      const std::size_t img_off[2] = {0, (std::size_t)gen_seq * H};
 
       const std::size_t ioff = (std::size_t)txt_seq * H;   // image row offset
       SharedBuffer io = buf((std::size_t)total_img * H);
@@ -1045,7 +1145,10 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       layernorm(x_img, 0, nrm, ioff, total_img);
       // mod chunk layout [shift1|scale1|gate1|shift2|scale2|gate2] (H each).
       adaln(nrm, 0, tmod, H, 0, mdl, 0, txt_seq * H);              // txt norm1
-      adaln(nrm, ioff, imod, H, 0, mdl, ioff, total_img * H);       // img norm1
+      for (int r = 0; r < nrange; ++r) {                            // img norm1
+        adaln(nrm, ioff + img_off[r], *img_mod[r], H, 0, mdl,
+              ioff + img_off[r], img_rows[r] * H);
+      }
       psplit(t_norm);
       // q/k/v projections (txt: add_*; img: to_*) into the joint buffers.
       tap("txt_qkv", L, mdl, 0, txt_seq, H);
@@ -1090,20 +1193,36 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       tap("txt_o", L, att, 0, txt_seq, H);
       gemm_bias_q(att, ioff, b.ow, b.ob, io, 0, total_img, H, H);
       gemm_bias_q(att, 0, b.aow, b.aob, to, 0, txt_seq, H, H);
-      gated(x_img, imod, 2 * H, io, total_img * H);
-      gated(x_txt, tmod, 2 * H, to, txt_seq * H);
+      for (int r = 0; r < nrange; ++r) {                            // img gate1
+        gated(x_img, img_off[r], *img_mod[r], 2 * H, io, img_off[r],
+              img_rows[r] * H);
+      }
+      gated(x_txt, 0, tmod, 2 * H, to, 0, txt_seq * H);
       psplit(t_oproj);
+      if (stop_after_block == -4 && L == 0) {
+        // Flag only -- the GPU work is still deferred here, so `att` cannot
+        // be read until after stream.commit().wait() below.
+        dbg_att = true;
+        dbg_ioff = ioff;
+        break;
+      }
       if (stop_after_block == -3 && L == 0) { break; }   // post-attention debug
 
       // --- MLP (norm2 + adaLN + GELU FeedForward + gated residual, gate2) ---
       layernorm(x_img, 0, nrm, ioff, total_img);
-      adaln(nrm, ioff, imod, 4 * H, 3 * H, mdl, ioff, total_img * H);
+      for (int r = 0; r < nrange; ++r) {                            // img norm2
+        adaln(nrm, ioff + img_off[r], *img_mod[r], 4 * H, 3 * H, mdl,
+              ioff + img_off[r], img_rows[r] * H);
+      }
       tap("img_fc1", L, mdl, ioff, total_img, H);
       gemm_bias_q(mdl, ioff, b.img_fc1_w, b.img_fc1_b, g1, 0, total_img, FF, H);
       gelu(g1, g1, total_img * FF);
       tap("img_fc2", L, g1, 0, total_img, FF);
       gemm_bias_q(g1, 0, b.img_fc2_w, b.img_fc2_b, io, 0, total_img, H, FF);
-      gated(x_img, imod, 5 * H, io, total_img * H);
+      for (int r = 0; r < nrange; ++r) {                            // img gate2
+        gated(x_img, img_off[r], *img_mod[r], 5 * H, io, img_off[r],
+              img_rows[r] * H);
+      }
 
       layernorm(x_txt, 0, nrm, 0, txt_seq);
       adaln(nrm, 0, tmod, 4 * H, 3 * H, mdl, 0, txt_seq * H);
@@ -1112,7 +1231,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       gelu(g2, g2, txt_seq * FF);
       tap("txt_fc2", L, g2, 0, txt_seq, FF);
       gemm_bias_q(g2, 0, b.txt_fc2_w, b.txt_fc2_b, to, 0, txt_seq, H, FF);
-      gated(x_txt, tmod, 5 * H, to, txt_seq * H);
+      gated(x_txt, 0, tmod, 5 * H, to, 0, txt_seq * H);
       psplit(t_ff);
 
       // Commit block L before `streamed` (its weights) frees at iteration end.
@@ -1146,6 +1265,19 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
         (long)t_oproj, (long)t_ff, (long)t_final));
   }
 
+  if (stop_after_block == -5) {          // staged debug: temb [1, H]
+    SharedBuffer out = buf((std::size_t)H);
+    std::memcpy(out.contents(), temb.contents(), (std::size_t)H * 2);
+    return out;
+  }
+  if (stop_after_block == -4) {
+    if (!dbg_att) { return {}; }
+    SharedBuffer out = buf((std::size_t)gen_seq * H);
+    std::memcpy(out.contents(),
+                static_cast<const char*>(att.contents()) + dbg_ioff * 2,
+                (std::size_t)gen_seq * H * 2);
+    return out;
+  }
   if (stop_after_block == -2 || stop_after_block == -3) {
     SharedBuffer out = buf((std::size_t)gen_seq * H);
     std::memcpy(out.contents(), x_img.contents(), (std::size_t)gen_seq * H * 2);

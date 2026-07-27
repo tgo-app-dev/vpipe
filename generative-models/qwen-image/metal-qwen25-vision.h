@@ -69,6 +69,9 @@ class MetalQwen25Vision {
 
  private:
   MetalQwen25Vision() = default;
+  // Load a dense weight, transparently expanding an affine group-quantized
+  // linear (model-quantize caught it in the text_encoder scope) back to dense
+  // bf16 -- the vision tower has no quantized-matmul kernels, so it runs dense.
   metal_compute::SharedBuffer to_elt_(const MetalLlamaWeights& wts,
                                       const std::string& name);
   bool load_linear_(const MetalLlamaWeights& wts, const std::string& pre,
@@ -83,6 +86,13 @@ class MetalQwen25Vision {
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
+  // Set from the text_encoder config.json `quantization` block when the model
+  // was model-quantize'd: a nonzero _quant_bits means some visual linears are
+  // stored affine-packed (U32 codes + F16 scales/biases) and get dequantized
+  // to bf16 at load. _quant_group is the group size (default 64). Per-tensor
+  // bit width is derived from the shapes (robust to mixed 4/8-bit).
+  int _quant_bits = 0;
+  int _quant_group = 64;
   metal_compute::SharedBuffer _patch_w;                  // [hidden, patch_in]
   std::vector<Block> _blocks;
   metal_compute::SharedBuffer _merge_ln;                 // RMSNorm [hidden]

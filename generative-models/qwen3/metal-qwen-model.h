@@ -279,18 +279,43 @@ public:
   // SharedBuffer laid out [tap_slot][pos][hidden] (slot j = tap_layers[j]).
   // Plain 1-D RoPE at sequential positions; skips the lm_head. Empty on
   // failure. HF output_hidden_states[k] == the tap after layer k-1.
+  // key_valid_len > 0 applies a PREFIX KEY-MASK (full-attn layers): every query
+  // attends only to keys with position < key_valid_len. Used by the diffusion
+  // text encoder to match HF's attention_mask over a right-padded prompt (the
+  // real prefix attends causally; padding tokens attend ONLY to the prefix).
+  // Qwen3-VL deepstack injection: after LM layer `layers[i]`, ADD `feats[i]`
+  // (bf16 [rows, hidden]) to the hidden states of the `rows` CONTIGUOUS image
+  // tokens starting at `row0`. The image tokens are contiguous in the grounded
+  // template (<|vision_start|> [image_pad x rows] <|vision_end|>), so this is a
+  // slice add. `feats` are the vision tower's deepstack features converted to
+  // bf16. Empty/null => no injection (all other callers unaffected).
+  struct DeepstackInject {
+    // Borrowed (non-owning) pointers to bf16 [rows,H] features, one per layer;
+    // SharedBuffer is move-only so the caller keeps ownership.
+    std::vector<const metal_compute::SharedBuffer*> feats;
+    std::vector<int> layers;                          // LM layers to inject after
+    int row0 = 0;                                     // first image-token row
+    int rows = 0;                                     // # image tokens (== feat rows)
+  };
+
   metal_compute::SharedBuffer
   forward_embeddings_taps(ContextId cid, const metal_compute::SharedBuffer& x,
-                          int n, const std::vector<int>& tap_layers);
+                          int n, const std::vector<int>& tap_layers,
+                          int key_valid_len = 0,
+                          const DeepstackInject* deepstack = nullptr);
 
   // Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
   // row 0=T,1=H,2=W) for a text+vision-spliced multimodal sequence -- the
-  // Qwen-Image-Edit image-aware conditioning tap.
+  // image-aware conditioning tap (Qwen-Image-Edit last-hidden, or Krea-2's
+  // 12-layer grounded tap). `deepstack` (Qwen3-VL) injects vision features at
+  // the image rows after early layers, exactly as the non-mROPE variant.
   metal_compute::SharedBuffer
   forward_embeddings_taps_mrope(ContextId cid,
                                 const metal_compute::SharedBuffer& x, int n,
                                 const std::vector<std::int32_t>& position_ids,
-                                const std::vector<int>& tap_layers);
+                                const std::vector<int>& tap_layers,
+                                int key_valid_len = 0,
+                                const DeepstackInject* deepstack = nullptr);
 
   // ---- On-device AWQ calibration ------------------------------------------
   // Accumulate per-input-channel running |x| abs-max for the qkv / gate-up /
@@ -716,7 +741,9 @@ private:
       metal_compute::SharedBuffer* hidden_out = nullptr,
       metal_compute::SharedBuffer* allhidden_out = nullptr,
       const std::vector<int>* tap_layers = nullptr,
-      metal_compute::SharedBuffer* taps_out = nullptr);
+      metal_compute::SharedBuffer* taps_out = nullptr,
+      int key_valid_len = 0, int stop_after_layer = -1,
+      const DeepstackInject* deepstack = nullptr);
 
   // ---- Batched (N-branch parallel) decode --------------------------
   // VQA fanout: N branched contexts that share a prefix each decode one
@@ -1015,7 +1042,8 @@ private:
       _fn_transpose,
       _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rms_rope,
       _fn_mul_sigmoid, _fn_bias_add,
-      _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
+      _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_kvl,
+      _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
       _fn_sdpa_paged_qtile,
       // simdgroup_matrix key-split flash prefill (head_dim 256, drop-in for
       // qtile): runs on M4 (no matrix cores), unlike the matmul2d _fn_sdpa_mma.

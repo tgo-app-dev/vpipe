@@ -34,10 +34,15 @@ namespace genai {
 // (BF16/F16/F32), one tensor at a time (peak RAM ~one weight). `stop` is polled
 // at tensor boundaries. Returns false + *err on failure; logs counts via mc's
 // session.
+// `progress(done, total)` is invoked at each base-tensor boundary (total = the
+// base's tensor count) so the caller can paint a progress bar; empty = no
+// reporting.
 bool fuse_lora(metal_compute::MetalCompute* mc, const std::string& base_dir,
                const std::string& lora_path, const std::string& out_dir,
                float scale, std::string* err,
-               const std::function<bool()>& stop = [] { return false; });
+               const std::function<bool()>& stop = [] { return false; },
+               const std::function<void(std::size_t done, std::size_t total)>&
+                   progress = {});
 
 }  // namespace genai
 }  // namespace vpipe

@@ -42,7 +42,24 @@ struct SteelAttnParams {
   std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
 };
 
-// Load a checkpoint tensor -> f16 SharedBuffer (F32/F16/BF16 sources).
+// bf16 <-> f32 host helpers. The Krea-2 DiT runs in bf16 (like the QIE + FLUX.2
+// siblings on the same Qwen-Image MMDiT stack): f16's 65504 range overflows on
+// real conditioning outliers through the deep 28-block residual/attention
+// stream, and the reference itself runs bf16. bf16's f32 exponent range holds
+// them.
+inline std::uint16_t f32_to_bf16_(float f)
+{
+  std::uint32_t u; std::memcpy(&u, &f, 4);
+  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+inline float bf16_to_f32_(std::uint16_t b)
+{
+  std::uint32_t u = (std::uint32_t)b << 16;
+  float f; std::memcpy(&f, &u, 4); return f;
+}
+
+// Load a checkpoint tensor -> bf16 SharedBuffer (F32/F16/BF16 sources). The DiT
+// compute is bf16; the name keeps the historical "_f16" for call-site churn.
 SharedBuffer
 to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
 {
@@ -54,18 +71,15 @@ to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   if (raw.empty()) { return {}; }
   SharedBuffer out = mc->make_shared_buffer(n * 2);
   if (out.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(out.contents());
+  auto* d = static_cast<std::uint16_t*>(out.contents());
   if (info->dtype == "F32") {
     const auto* s = static_cast<const float*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)s[i]; }
-  } else if (info->dtype == "F16") {
-    std::memcpy(d, raw.contents(), n * 2);
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_(s[i]); }
   } else if (info->dtype == "BF16") {
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      std::uint32_t u = (std::uint32_t)s[i] << 16;
-      float f; std::memcpy(&f, &u, 4); d[i] = (_Float16)f;
-    }
+    std::memcpy(d, raw.contents(), n * 2);
+  } else if (info->dtype == "F16") {
+    const auto* s = static_cast<const _Float16*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
   } else {
     return {};
   }
@@ -86,8 +100,8 @@ to_f16_norm_(const MetalLlamaWeights& wts, MetalCompute* mc,
   if (raw.empty()) { return {}; }
   SharedBuffer out = mc->make_shared_buffer(n * 2);
   if (out.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(out.contents());
-  auto put = [&](std::size_t i, float f) { d[i] = (_Float16)(f + 1.0f); };
+  auto* d = static_cast<std::uint16_t*>(out.contents());
+  auto put = [&](std::size_t i, float f) { d[i] = f32_to_bf16_(f + 1.0f); };
   if (info->dtype == "F32") {
     const auto* s = static_cast<const float*>(raw.contents());
     for (std::size_t i = 0; i < n; ++i) { put(i, s[i]); }
@@ -96,10 +110,7 @@ to_f16_norm_(const MetalLlamaWeights& wts, MetalCompute* mc,
     for (std::size_t i = 0; i < n; ++i) { put(i, (float)s[i]); }
   } else if (info->dtype == "BF16") {
     const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      std::uint32_t u = (std::uint32_t)s[i] << 16;
-      float f; std::memcpy(&f, &u, 4); put(i, f);
-    }
+    for (std::size_t i = 0; i < n; ++i) { put(i, bf16_to_f32_(s[i])); }
   } else {
     return {};
   }
@@ -129,15 +140,13 @@ MetalKrea2Transformer::load_qw_(const MetalLlamaWeights& wts,
     // Zero-copy (read-only mmap view) when enabled: the codes/scales/biases go
     // straight to the GEMM and are never modified on the CPU, so they are safe
     // to alias the file. Otherwise (default) an owned copy.
-    if (_mmap_weights) {
-      qw.codes  = wts.load_mapped(name + ".weight", _mc);  // U32 packed
-      qw.scales = wts.load_mapped(name + ".scales", _mc);  // F16
-      qw.qbias  = wts.load_mapped(name + ".biases", _mc);  // F16 (group min)
-    } else {
-      qw.codes  = wts.load(name + ".weight", _mc);     // U32 packed (raw bytes)
-      qw.scales = wts.load(name + ".scales", _mc);     // F16
-      qw.qbias  = wts.load(name + ".biases", _mc);     // F16 (group min)
-    }
+    // Codes are U32 (raw; mmap-aliased when enabled). Scales/biases are F16 on
+    // disk but the affine kernels are now bf16 (the DiT runs bf16), so convert
+    // them F16->bf16 via to_f16_ (which emits bf16). Mirrors the QIE/FLUX.2 path.
+    qw.codes  = _mmap_weights ? wts.load_mapped(name + ".weight", _mc)
+                              : wts.load(name + ".weight", _mc);
+    qw.scales = to_f16_(wts, _mc, name + ".scales");  // -> bf16 (group scale)
+    qw.qbias  = to_f16_(wts, _mc, name + ".biases");  // -> bf16 (group min)
     if (!qw.codes.empty() && !qw.scales.empty() && !qw.qbias.empty()) {
       qw.quantized = true;
       return qw;
@@ -264,12 +273,17 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     }
   }
 
-  m->_lib_gemm = mc->load_library("dense_gemm");
-  m->_lib_elt  = mc->load_library("llm_elementwise");
-  m->_lib_rms  = mc->load_library("rms_norm");
-  m->_lib_sdpa = mc->load_library("sdpa");
-  m->_lib_vis  = mc->load_library("qwen3_5_vision");
-  m->_lib_rope = mc->load_library("rope");
+  // The Krea-2 DiT runs in bf16 (f16's 65504 range overflows on real
+  // conditioning through the 28-block residual/attention stream, and the
+  // reference is bf16). Load the bf16 metallibs (VPIPE_ELT=bfloat); entry-point
+  // names keep the "_f16" label. gelu_tanh comes from llm_elementwise's
+  // VPIPE_ELT gelu_tanh_ff_f16 (the vision gelu_tanh_f16 is half-only).
+  m->_lib_gemm = mc->load_library("dense_gemm_bf16");
+  m->_lib_elt  = mc->load_library("llm_elementwise_bf16");
+  m->_lib_rms  = mc->load_library("rms_norm_bf16");
+  m->_lib_sdpa = mc->load_library("sdpa_bf16");
+  m->_lib_vis  = mc->load_library("llm_elementwise_bf16");
+  m->_lib_rope = mc->load_library("rope_bf16");
   m->_fn_gemm        = m->_lib_gemm.function("dense_gemm_t_f16");
   m->_fn_gemm_bm64   = m->_lib_gemm.function("dense_gemm_t_bm64_f16");
   m->_fn_gemm_bm64bn64 = m->_lib_gemm.function("dense_gemm_t_bm64bn64_f16");
@@ -280,7 +294,7 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_residual    = m->_lib_elt.function("residual_add_f16");
   m->_fn_transpose   = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
-  m->_fn_gelu_tanh   = m->_lib_vis.function("gelu_tanh_f16");
+  m->_fn_gelu_tanh   = m->_lib_elt.function("gelu_tanh_ff_f16");
   // Steel flash-attention (head_dim 128) for the joint-sequence GQA attention.
   // Best-effort: if the library / bd128 entry point is missing, forward_dit
   // keeps the scalar sdpa fallback. VPIPE_KREA2_NO_STEEL_ATTN forces scalar.
@@ -295,7 +309,7 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_use_attn_nax = m->_steel_attn_ok && mc->supports_matrix_cores()
                      && m->_lib_attn_nax.valid()
                      && std::getenv("VPIPE_KREA2_NO_ATTN_NAX") == nullptr;
-  m->_fn_rope_table  = m->_lib_rope.function("rope_pair_table_f16");
+  m->_fn_rope_table  = m->_lib_rope.function("rope_pair_table_ftab_f16");
   m->_fn_adaln       = m->_lib_elt.function("adaln_modulate_f16");
   m->_fn_gated       = m->_lib_elt.function("gated_residual_f16");
   m->_fn_colabsmax   = m->_lib_elt.function("col_absmax_f16");
@@ -324,7 +338,7 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // quantized-Linear path. Both bit widths are loaded so a MIXED-precision
   // checkpoint (per-weight w4/w8 at group g) dispatches by each weight's bits.
   if (m->_quant_bits > 0) {
-    m->_lib_qmm = mc->load_library("affine_qmm_steel");
+    m->_lib_qmm = mc->load_library("affine_qmm_steel_bf16");
     const std::string g = "g" + std::to_string(m->_quant_group);
     m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + g);
     m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + g);
@@ -368,7 +382,7 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // f32 rounding. Gated on matrix cores (M4/older keep steel); NO_MMA2 A/B off.
   if (mc->supports_matrix_cores() &&
       std::getenv("VPIPE_KREA2_NO_MMA2") == nullptr) {
-    m->_lib_dense_mma = mc->load_library("dense_gemm_mma");
+    m->_lib_dense_mma = mc->load_library("dense_gemm_mma_bf16");
     m->_fn_dense_mma = m->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
@@ -391,7 +405,7 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     // Quantized checkpoint: group-matched dequant kernels feed the dense
     // matmul2d. Both bit widths loaded (mixed-precision per-weight w4/w8).
     if (m->_use_mma2 && m->_quant_bits > 0) {
-      m->_lib_dequant = mc->load_library("affine_dequant");
+      m->_lib_dequant = mc->load_library("affine_dequant_bf16");
       const std::string g = "g" + std::to_string(m->_quant_group);
       m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant_w4" + g);
       m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8" + g);
@@ -410,9 +424,11 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // Dynamic-int8 accelerated GEMMs (opt-in, LOSSY): tried first in
   // gemm_mma_ for the big block matmuls. Config::i8_gemm is the stage
   // switch; VPIPE_I8_GEMM overrides (the context self-gates on matrix
-  // cores + kernel availability).
+  // cores + kernel availability). The DiT runs bf16, so the i8 path reads/
+  // writes bf16 (its activation, dequant-scratch weight, and output); load
+  // the _bf16 i8 kernels (the f16 ones would misread bf16 buffers -> NaN).
   {
-    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm);
+    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
 
@@ -590,26 +606,44 @@ MetalKrea2Transformer::build_rope_tables_(int text_seq,
   const int D = _cfg.head_dim;                 // 128
   const int axes[3] = {_cfg.rope_t, _cfg.rope_h, _cfg.rope_w};   // 32,48,48
   const double theta = (double)_cfg.rope_theta;
-  cos_out = _mc->make_shared_buffer((std::size_t)seq * D * 2);
-  sin_out = _mc->make_shared_buffer((std::size_t)seq * D * 2);
-  auto* cb = static_cast<_Float16*>(cos_out.contents());
-  auto* sb = static_cast<_Float16*>(sin_out.contents());
+  // f32 cos/sin tables (only x is bf16), via rope_pair_table_ftab_f16: RoPE
+  // rotation error is STRUCTURED, so the ~4e-3 bf16-table rounding compounds
+  // over the DiT's blocks (and denoise steps) rather than averaging out -- the
+  // same reason the shared Qwen-Image stack (QIE) keeps these tables f32.
+  cos_out = _mc->make_shared_buffer((std::size_t)seq * D * sizeof(float));
+  sin_out = _mc->make_shared_buffer((std::size_t)seq * D * sizeof(float));
+  auto* cb = static_cast<float*>(cos_out.contents());
+  auto* sb = static_cast<float*>(sin_out.contents());
+  // Per-pair inverse frequency + coordinate axis + element offset within the D
+  // row -- depend only on (axis, i), NOT the token, so precompute once (pairs
+  // pow() calls) instead of recomputing inside the per-token emit (seq*pairs).
+  const int pairs = D / 2;
+  std::vector<double> pair_freq((std::size_t)pairs);
+  std::vector<int> pair_axis((std::size_t)pairs), pair_off((std::size_t)pairs);
+  {
+    int base = 0, pair = 0;
+    for (int a = 0; a < 3; ++a) {
+      const int Dax = axes[a];
+      for (int i = 0; i < Dax / 2; ++i, ++pair) {
+        pair_freq[(std::size_t)pair] =
+            1.0 / std::pow(theta, (2.0 * i) / (double)Dax);
+        pair_axis[(std::size_t)pair] = a;
+        pair_off[(std::size_t)pair] = base + 2 * i;
+      }
+      base += Dax;
+    }
+  }
   // Emit one token row (s) from its 3 coordinates (frame/t, h, w).
   auto emit = [&](int s, double c0, double c1, double c2) {
     const double coord[3] = {c0, c1, c2};
-    int base = 0;
-    for (int a = 0; a < 3; ++a) {
-      const int Dax = axes[a];
-      for (int i = 0; i < Dax / 2; ++i) {
-        const double freq = 1.0 / std::pow(theta, (2.0 * i) / (double)Dax);
-        const double ang = coord[a] * freq;
-        const _Float16 c = (_Float16)std::cos(ang);
-        const _Float16 sn = (_Float16)std::sin(ang);
-        const std::size_t o = (std::size_t)s * D + base + 2 * i;
-        cb[o] = c; cb[o + 1] = c;
-        sb[o] = sn; sb[o + 1] = sn;
-      }
-      base += Dax;
+    for (int pair = 0; pair < pairs; ++pair) {
+      const double ang =
+          coord[pair_axis[(std::size_t)pair]] * pair_freq[(std::size_t)pair];
+      const float c = (float)std::cos(ang);
+      const float sn = (float)std::sin(ang);
+      const std::size_t o = (std::size_t)s * D + pair_off[(std::size_t)pair];
+      cb[o] = c; cb[o + 1] = c;
+      sb[o] = sn; sb[o + 1] = sn;
     }
   };
   // Text tokens sit at the origin (0,0,0).
@@ -730,8 +764,11 @@ MetalKrea2Transformer::read_calib_(const std::vector<SharedBuffer>& acc,
   std::vector<std::vector<float>> out(acc.size());
   for (std::size_t L = 0; L < acc.size(); ++L) {
     out[L].resize((std::size_t)dim);
-    const auto* s = static_cast<const _Float16*>(acc[L].contents());
-    for (int d = 0; d < dim; ++d) { out[L][(std::size_t)d] = (float)s[d]; }
+    // The col_absmax (AWQ) accumulator is bf16 now that the DiT runs bf16.
+    const auto* s = static_cast<const std::uint16_t*>(acc[L].contents());
+    for (int d = 0; d < dim; ++d) {
+      out[L][(std::size_t)d] = bf16_to_f32_(s[d]);
+    }
   }
   return out;
 }
@@ -873,7 +910,14 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
 
   // Residual + scratch (all live until stream.commit().wait()).
   SharedBuffer xlw = buf((std::size_t)TS * NL * TH);   // layerwise residual
-  std::memcpy(xlw.contents(), ehs.contents(), (std::size_t)TS * NL * TH * 2);
+  // Upcast the f16 encoder taps -> bf16 residual (the DiT computes in bf16; the
+  // conditioner boundary stays f16).
+  {
+    const auto* s = static_cast<const _Float16*>(ehs.contents());
+    auto* d = static_cast<std::uint16_t*>(xlw.contents());
+    const std::size_t n = (std::size_t)TS * NL * TH;
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
+  }
   SharedBuffer xt    = buf((std::size_t)TS * TH * NL); // projector transpose
   SharedBuffer fused = buf((std::size_t)TS * TH);      // projector out / refiner
   SharedBuffer sn = buf((std::size_t)BTmax * TH), sq = buf((std::size_t)BTmax * TH),
@@ -1036,7 +1080,17 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
     gemm_bias(y2, _txt_l2w, _txt_l2b, y3, TS, HID, HID);
   }
   stream.commit().wait();
-  return y3;
+  // Downcast the bf16 fused-text to the public f16 boundary (forward_dit upcasts
+  // it back -- lossless: the txt_in output is f16-safe, the overflow that needs
+  // bf16 is deeper in the forward_dit residual stream).
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)TS * HID * 2);
+  {
+    const auto* s = static_cast<const std::uint16_t*>(y3.contents());
+    auto* d = static_cast<_Float16*>(out.contents());
+    const std::size_t n = (std::size_t)TS * HID;
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)bf16_to_f32_(s[i]); }
+  }
+  return out;
 }
 
 SharedBuffer
@@ -1102,23 +1156,49 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   // Only the generated tokens get a velocity; reference tokens are discarded.
   SharedBuffer noise = _mc->make_shared_buffer((std::size_t)IS_GEN * IC * 2);
 
+  // The DiT computes in bf16 (f16's 65504 range overflows on the deep residual/
+  // attention stream). The sampler boundary is f16, so upcast the latents inputs
+  // to bf16 once here (lossless -- bf16's exponent range covers f16); the
+  // returned velocity is downcast back to f16 at the end so callers are
+  // unchanged. (fused_text is upcast into `joint` above.)
+  auto up_bf16 = [&](const SharedBuffer& src, std::size_t n) -> SharedBuffer {
+    SharedBuffer o = _mc->make_shared_buffer(n * 2);
+    if (o.empty()) { return o; }
+    const auto* s = static_cast<const _Float16*>(src.contents());
+    auto* d = static_cast<std::uint16_t*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
+    return o;
+  };
+  const SharedBuffer latents_b = up_bf16(latents, (std::size_t)IS_GEN * IC);
+  std::vector<SharedBuffer> refs_b;
+  refs_b.reserve(refs.size());
+  for (const auto& r : refs) {
+    refs_b.push_back(up_bf16(r.latents, (std::size_t)r.seq * IC));
+  }
+  if (latents_b.empty()) { return {}; }
+
   // Host-built sinusoidal timestep row [1, TD] (cos-first, input scaled x1000).
   // Timestep-dependent -> rewritten every call.
   {
-    auto* ti = static_cast<_Float16*>(te_in.contents());
+    auto* ti = static_cast<std::uint16_t*>(te_in.contents());   // bf16 (DiT bf16)
     const int half = TD / 2;
     for (int i = 0; i < half; ++i) {
       const double fr = std::exp(-std::log(1e4) * (double)i / (double)half);
       const double ang = (double)timestep * 1000.0 * fr;
-      ti[i] = (_Float16)std::cos(ang);
-      ti[half + i] = (_Float16)std::sin(ang);
+      ti[i] = f32_to_bf16_((float)std::cos(ang));
+      ti[half + i] = f32_to_bf16_((float)std::sin(ang));
     }
   }
 
   // Joint residual [seq, HID]: text rows = fused_text (host copy), image rows =
-  // img_in(latents) (written in-stream at the image offset).
-  std::memcpy(joint.contents(), fused_text.contents(),
-              (std::size_t)TS * HID * 2);
+  // img_in(latents) (written in-stream at the image offset). The DiT computes in
+  // bf16; upcast the f16 fused-text boundary into the bf16 joint residual.
+  {
+    const auto* s = static_cast<const _Float16*>(fused_text.contents());
+    auto* d = static_cast<std::uint16_t*>(joint.contents());
+    const std::size_t n = (std::size_t)TS * HID;
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
+  }
   const bool tap = (stop_after_block >= 0 && stop_after_block < c.n_layers);
 
   // Env-gated per-section GPU timing (VPIPE_KREA2_DIT_PROFILE). Inserts a
@@ -1316,14 +1396,14 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // ---- img_in -> joint image region ----
     // Generated tokens embed into joint[TS .. TS+IS_GEN]; each reference embeds
     // (same img_in) into the tail joint[TS+IS_GEN .. TS+IS].
-    gemm_bias(latents, _img_in_w, _img_in_b, joint, (std::size_t)TS * HID,
+    gemm_bias(latents_b, _img_in_w, _img_in_b, joint, (std::size_t)TS * HID,
               IS_GEN, HID, IC);
     {
       std::size_t ro = (std::size_t)TS + IS_GEN;   // ref token row offset
-      for (const auto& r : refs) {
-        gemm_bias(r.latents, _img_in_w, _img_in_b, joint, ro * HID, r.seq, HID,
-                  IC);
-        ro += (std::size_t)r.seq;
+      for (std::size_t ri = 0; ri < refs.size(); ++ri) {
+        gemm_bias(refs_b[ri], _img_in_w, _img_in_b, joint, ro * HID,
+                  refs[ri].seq, HID, IC);
+        ro += (std::size_t)refs[ri].seq;
       }
     }
 
@@ -1366,9 +1446,10 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
           .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+      // The DiT runs bf16: use the bf16 attention entries (Q/K/V are bf16).
       fn_attn = nax
-          ? _lib_attn_nax.function("attn_steel_nax_h_bd128", fc)
-          : _lib_attn.function("attn_steel_h_bd128", fc);
+          ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+          : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
       use_steel = fn_attn.valid();
     }
     const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
@@ -1532,12 +1613,18 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   // Return owned buffers (the persistent scratch is move-only + reused next
   // call). `noise` is a fresh per-call local -> move it out; the tap path hands
   // back an owned copy of the persistent joint.
-  if (tap) {
-    SharedBuffer out = _mc->make_shared_buffer((std::size_t)seq * HID * 2);
-    std::memcpy(out.contents(), joint.contents(), (std::size_t)seq * HID * 2);
-    return out;
-  }
-  return noise;
+  // Downcast the bf16 compute buffers to the public f16 boundary (callers/tests
+  // consume f16; the sampler feeds the velocity back as f16 latents).
+  auto down_f16 = [&](const SharedBuffer& src, std::size_t n) -> SharedBuffer {
+    SharedBuffer o = _mc->make_shared_buffer(n * 2);
+    if (o.empty()) { return o; }
+    const auto* s = static_cast<const std::uint16_t*>(src.contents());
+    auto* d = static_cast<_Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)bf16_to_f32_(s[i]); }
+    return o;
+  };
+  if (tap) { return down_f16(joint, (std::size_t)seq * HID); }
+  return down_f16(noise, (std::size_t)IS_GEN * IC);
 }
 
 }  // namespace genai

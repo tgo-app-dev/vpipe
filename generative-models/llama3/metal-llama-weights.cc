@@ -241,10 +241,23 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
       return std::nullopt;
     }
     MetalLlamaWeights w;
+    bool mapped_any = false;
     for (const auto& name : shard_names) {
-      if (!w.map_shard_((dir / name).string())) {
+      const fs::path shard = dir / name;
+      // A shard listed in the index but ABSENT on disk is an optional
+      // sidecar the download skipped (e.g. an OptiQ text-only checkpoint
+      // whose vision/audio adaptor shard under optiq/ was not fetched). Skip
+      // it: its tensors stay unregistered (has() == false), so a text-only
+      // load proceeds and the multimodal probe reports "no adaptor". A shard
+      // that EXISTS but fails to map is still fatal (corrupt/unreadable).
+      if (!fs::exists(shard, ec)) { continue; }
+      if (!w.map_shard_(shard.string())) {
         return std::nullopt;
       }
+      mapped_any = true;
+    }
+    if (!mapped_any) {
+      return std::nullopt;   // every listed shard absent -> nothing to load
     }
     map_vision_sidecar_(w);
     return w;

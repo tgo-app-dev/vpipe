@@ -52,10 +52,23 @@ namespace _embedded {
 
 namespace {
 
+// A kernel is registered as EITHER compiled metallib bytes (build-time
+// metallib mode) or MSL source (runtime-compile mode) -- never both for
+// the same name. `src` is a NUL-terminated, include-flattened source
+// string owned by a static array in the generated TU; `lang` is a
+// language-version code (0 = default, 40 = metal4.0) applied via
+// MTLCompileOptions when compiling via newLibraryWithSource:.
+struct SourceEntry {
+  const char* src  = nullptr;
+  std::size_t len  = 0;
+  int         lang = 0;
+};
+
 struct Registry {
   std::mutex mu;
   std::unordered_map<std::string,
                      std::pair<const unsigned char*, std::size_t>> map;
+  std::unordered_map<std::string, SourceEntry>                     src_map;
 };
 
 Registry& registry()
@@ -89,6 +102,35 @@ find_embedded_metallib(std::string_view name,
   }
   *out_data = it->second.first;
   *out_size = it->second.second;
+  return true;
+}
+
+// Runtime-compile mode: register the include-flattened MSL source for a
+// kernel (emitted by embed-metal-source.cmake). load_library() compiles it
+// via newLibraryWithSource: on first use.
+void
+register_embedded_metal_source(const char* name, const char* src,
+                               std::size_t len, int lang_version)
+{
+  Registry& r = registry();
+  std::lock_guard<std::mutex> g(r.mu);
+  r.src_map.emplace(std::string(name),
+                    SourceEntry{src, len, lang_version});
+}
+
+bool
+find_embedded_metal_source(std::string_view name, const char** out_src,
+                           std::size_t* out_len, int* out_lang)
+{
+  Registry& r = registry();
+  std::lock_guard<std::mutex> g(r.mu);
+  auto it = r.src_map.find(std::string(name));
+  if (it == r.src_map.end()) {
+    return false;
+  }
+  *out_src  = it->second.src;
+  *out_len  = it->second.len;
+  *out_lang = it->second.lang;
   return true;
 }
 
@@ -771,30 +813,57 @@ MetalCompute::load_library(std::string_view name) const
     }
   }
 
-  const unsigned char* bytes = nullptr;
-  std::size_t          size  = 0;
-  if (!_embedded::find_embedded_metallib(name, &bytes, &size)) {
+  NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+  NS::Error*           err  = nullptr;
+  MTL::Library*        lib  = nullptr;
+
+  const unsigned char* bytes  = nullptr;
+  std::size_t          size   = 0;
+  const char*          src    = nullptr;
+  std::size_t          srclen = 0;
+  int                  lang   = 0;
+
+  if (_embedded::find_embedded_metallib(name, &bytes, &size)) {
+    // Build-time metallib mode: load the compiled bytes. Wrap the
+    // static-const bytes in a dispatch_data_t with a no-op destructor
+    // block (the registry's bytes outlive the process, so libdispatch
+    // must not free them). We hold the dispatch_data_t ref only across
+    // the newLibrary call; MTL::Library takes its own internal hold.
+    dispatch_data_t data = dispatch_data_create(
+        bytes, size,
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+        ^{ /* no-op: bytes are static const, owned by the registry */ });
+    lib = _impl->device->newLibrary(data, &err);
+    dispatch_release(data);
+  } else if (_embedded::find_embedded_metal_source(name, &src, &srclen,
+                                                   &lang)) {
+    // Runtime-compile mode (no build-time Metal toolchain): compile the
+    // embedded, include-flattened MSL source via newLibraryWithSource:.
+    // Match the AOT flags that affect numerics -- safe math (the offline
+    // path uses -fno-fast-math) -- and set the language version for the
+    // metal4.0 matrix-core kernels. Result is cached below like any lib.
+    (void)srclen;   // src is NUL-terminated; length kept for diagnostics
+    NS::String* nssrc = NS::String::string(src, NS::UTF8StringEncoding);
+    MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
+    opts->setFastMathEnabled(false);
+    if (lang >= 40) {
+      opts->setLanguageVersion(MTL::LanguageVersion4_0);
+    } else if (lang >= 32) {
+      opts->setLanguageVersion(MTL::LanguageVersion3_2);
+    } else if (lang >= 31) {
+      opts->setLanguageVersion(MTL::LanguageVersion3_1);
+    } else if (lang >= 30) {
+      opts->setLanguageVersion(MTL::LanguageVersion3_0);
+    }
+    lib = _impl->device->newLibrary(nssrc, opts, &err);
+    opts->release();
+  } else {
     session()->warn(fmt(
-        "MetalCompute::load_library: no embedded metallib registered "
-        "as '{}'", name_str));
+        "MetalCompute::load_library: no embedded metallib or source "
+        "registered as '{}'", name_str));
+    pool->release();
     return ComputeLibrary{};
   }
-
-  NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-
-  // Wrap the static-const bytes in a dispatch_data_t. Use a no-op
-  // destructor block (the registry's bytes outlive the process, so
-  // libdispatch must not free them). We hold the dispatch_data_t
-  // ref only across the newLibrary call; MTL::Library takes its
-  // own internal hold on the bytes it needs.
-  dispatch_data_t data = dispatch_data_create(
-      bytes, size,
-      dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
-      ^{ /* no-op: bytes are static const, owned by the registry */ });
-
-  NS::Error*    err = nullptr;
-  MTL::Library* lib = _impl->device->newLibrary(data, &err);
-  dispatch_release(data);
 
   if (lib == nullptr) {
     const char* msg = "(no description)";
@@ -802,8 +871,8 @@ MetalCompute::load_library(std::string_view name) const
       msg = err->localizedDescription()->utf8String();
     }
     session()->warn(fmt(
-        "MetalCompute::load_library: device->newLibrary failed for "
-        "'{}': {}", name_str, msg));
+        "MetalCompute::load_library: newLibrary failed for '{}': {}",
+        name_str, msg));
     pool->release();
     return ComputeLibrary{};
   }

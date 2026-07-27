@@ -251,9 +251,74 @@ TEST(qwen_image_edit_vision, multiwindow_gap)
       double d2 = 0, a2 = 0, b2 = 0;
       for (std::size_t i = 0; i < n; ++i) { d2 += (double)gt2[i] * gvis[i];
         a2 += (double)gt2[i] * gt2[i]; b2 += (double)gvis[i] * gvis[i]; }
+      const double r2 = rel_l2_(gt2, gvis.data(), n);
+      const double c2 = d2 / (std::sqrt(a2) * std::sqrt(b2));
       std::printf("[qwen_image_edit_vision] encode_rgb vs golden: rel-L2 = %.4f "
-                  "cosine = %.4f\n", rel_l2_(gt2, gvis.data(), n),
-                  d2 / (std::sqrt(a2) * std::sqrt(b2)));
+                  "cosine = %.4f\n", r2, c2);
+      // encode_rgb must reproduce the HF condition preprocessing (two-stage
+      // PIL LANCZOS -> BICUBIC, U8 between stages), so it lands on the same
+      // ~0.058 bf16 tower floor as the golden pixels do. This was UNASSERTED
+      // and a single bilinear resize sat here at 0.496 / cosine 0.88 -- the
+      // tower amplifies input error ~29x, so keep this tight.
+      EXPECT_TRUE(r2 < 0.12);
+      EXPECT_TRUE(c2 > 0.99);
     }
   }
+}
+
+// A model-quantize'd text_encoder can carry affine-packed (U32 codes + F16
+// scales/biases) VISUAL linears when the quant scope catches them. The vision
+// tower runs dense bf16, so MetalQwen25Vision::load must dequantize them at load
+// rather than fail. Regression: point at a quantized model root and confirm the
+// tower LOADS (previously returned nullptr -> "vision tower load failed") and
+// produces finite, non-degenerate tokens. Env:
+// VPIPE_QWEN_IMAGE_EDIT_QUANT_MODEL_PATH (model root; uses <root>/text_encoder).
+TEST(qwen_image_edit_vision, quantized_encoder_tower_loads)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_QUANT_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalQwen25Vision::Config cfg;
+  auto m = MetalQwen25Vision::load(std::string(root) + "/text_encoder", mc, cfg);
+  // The fix: a quantized text_encoder must still yield a loaded vision tower.
+  ASSERT_TRUE(m != nullptr);
+
+  // Synthetic 224x224 RGB gradient [3,H,W] U8 -- exercises the full dequant +
+  // tower forward without needing a golden.
+  const int ih = 224, iw = 224;
+  std::vector<std::uint8_t> rgb((std::size_t)3 * ih * iw);
+  for (int c = 0; c < 3; ++c) {
+    for (int y = 0; y < ih; ++y) {
+      for (int x = 0; x < iw; ++x) {
+        rgb[((std::size_t)c * ih + y) * iw + x] =
+            (std::uint8_t)((x * 37 + y * 19 + c * 61) & 0xff);
+      }
+    }
+  }
+  int gh = 0, gw = 0;
+  SharedBuffer vt = m->encode_rgb(rgb.data(), ih, iw, 384 * 384, gh, gw);
+  ASSERT_TRUE(!vt.empty());
+  const int mtok = (gh / cfg.merge) * (gw / cfg.merge);
+  const std::size_t n = (std::size_t)mtok * cfg.out_hidden;
+  const auto* p = static_cast<const std::uint16_t*>(vt.contents());
+  bool finite = true;
+  double mean = 0.0, var = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float v = bf16_to_f32_(p[i]);
+    if (!std::isfinite(v)) { finite = false; break; }
+    mean += v;
+  }
+  ASSERT_TRUE(finite);
+  mean /= (double)n;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double d = (double)bf16_to_f32_(p[i]) - mean; var += d * d;
+  }
+  const double sd = std::sqrt(var / (double)n);
+  std::printf("[qwen_image_edit_vision] quantized tower loaded: grid %dx%d -> "
+              "%d tokens, mean=%.3f std=%.3f\n", gh, gw, mtok, mean, sd);
+  EXPECT_TRUE(sd > 0.01);      // real content, not collapsed
+  EXPECT_TRUE(sd < 100.0);     // not exploded
 }

@@ -253,6 +253,73 @@ TEST(krea2_dit, forward_dit_mma_matches_steel)
   EXPECT_TRUE(r < 3e-2);
 }
 
+// M5 matrix-core int8-accel A/B: the same 2-block forward with the dynamic-int8
+// GEMMs (VPIPE_I8_GEMM=1) vs the default bf16 matmul2d path. LOSSY by design
+// (int8, rel-L2 ~1e-2 per GEMM), so the bar is the drift budget, not exactness.
+// The DiT runs bf16, so the i8 path must load the _bf16 i8 kernels; through the
+// f16 kernels it reads the bf16 activation/weight/output buffers as f16 ->
+// garbage (rel-L2 ~1). Grid is large enough (joint seq >= 1024) to pass the i8
+// M-gate; stream_blocks keeps the DiT off the heap. Off matrix-core GPUs the i8
+// path is capability-gated off and this skips vacuously.
+TEST(krea2_dit, forward_dit_i8_matches_f16)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  const int HID = cfg.hidden, IC = cfg.in_channels;
+  const int text_seq = 64, grid = 32;      // img_seq 1024 -> joint 1088 (>=1024)
+  const int img_seq = grid * grid;
+  const int stop = 1;                       // run blocks 0..1, return joint
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x1278c0deu;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+
+  auto run = [&](bool i8) {
+    ::setenv("VPIPE_I8_GEMM", i8 ? "1" : "0", 1);
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream_blocks=*/true);
+    ::unsetenv("VPIPE_I8_GEMM");
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_i8 = run(true);
+  const std::vector<float> v_f16 = run(false);
+  ASSERT_TRUE(!v_i8.empty());
+  ASSERT_TRUE(v_i8.size() == v_f16.size());
+  const double r = rel_l2_(v_i8.data(), v_f16.data(), v_i8.size());
+  std::printf("[krea2_dit] forward_dit i8-vs-f16 rel-L2 = %.6g (seq=%d)\n", r,
+              text_seq + img_seq);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+}
+
 // Reference-image conditioning (Qwen-Image-Edit multi-reference): forward_dit
 // with reference latents (a) still emits ONLY the generated-token velocity
 // [img_seq, in_channels] (refs dropped from the output), (b) stays finite with
@@ -337,6 +404,87 @@ TEST(krea2_dit, forward_dit_reference_images_change_output)
               "rel-L2 %.4f (vs no-ref)\n", r1, r2);
   EXPECT_TRUE(r1 > 1e-3);          // a reference materially changes the output
   EXPECT_TRUE(r2 > 1e-3);
+}
+
+// Full-DiT velocity golden: the bf16 DiT (forward_text -> forward_dit) against a
+// diffusers Krea2Transformer2DModel reference (dump_dit.py, bf16 -- the model's
+// native dtype). Feeds the REAL 18-token fox conditioning (a1_prompt_embeds,
+// txt_in absmax ~82 -- the large-magnitude activations that stress the residual
+// stream and would overflow an f16 DiT, exactly the FLUX.2 class of bug this
+// bf16 switch fixes) plus the golden's deterministic packed latents, at t=0.5 on
+// a 16x16 grid. Checks (a) the txt_in text-fusion vs d_txtin and (b) the
+// velocity vs d_velocity, both to a bf16-vs-bf16 rounding floor. Env:
+// VPIPE_KREA2_TEST_MODEL_PATH + VPIPE_KREA2_GOLDEN (needs d_latents/d_velocity).
+TEST(krea2_dit, forward_dit_velocity_matches_golden)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  const char* gd   = std::getenv("VPIPE_KREA2_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+  const std::string gdir = gd;
+
+  const std::vector<float> pe   = read_f32_(gdir + "/a1_prompt_embeds.f32");
+  const std::vector<float> gtx  = read_f32_(gdir + "/d_txtin.f32");
+  const std::vector<float> glat = read_f32_(gdir + "/d_latents.f32");
+  const std::vector<float> gvel = read_f32_(gdir + "/d_velocity.f32");
+  if (pe.empty() || glat.empty() || gvel.empty()) { return; }   // no DiT golden
+
+  MetalKrea2Transformer::Config cfg;
+  const int NL = cfg.n_text_layers, TH = cfg.text_hidden, HID = cfg.hidden;
+  const int IC = cfg.in_channels;
+  ASSERT_TRUE(pe.size() % ((std::size_t)NL * TH) == 0);
+  const int text_seq = (int)(pe.size() / ((std::size_t)NL * TH));
+  const int img_seq  = (int)(glat.size() / (std::size_t)IC);
+  const int grid = (int)(std::lround(std::sqrt((double)img_seq)));
+  ASSERT_TRUE(grid * grid == img_seq);          // square grid (dump_dit default)
+  ASSERT_TRUE(gvel.size() == (std::size_t)img_seq * IC);
+
+  auto m = MetalKrea2Transformer::load(tdir, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+
+  // f16 conditioning taps [text_seq, 12, 2560] and packed latents [img_seq, IC].
+  auto to_buf = [&](const std::vector<float>& v) {
+    SharedBuffer b = mc->make_shared_buffer(v.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < v.size(); ++i) { d[i] = (_Float16)v[i]; }
+    return b;
+  };
+  SharedBuffer ehs = to_buf(pe);
+  SharedBuffer lat = to_buf(glat);
+
+  SharedBuffer fused = m->forward_text(ehs, text_seq);
+  ASSERT_TRUE(!fused.empty());
+  if (!gtx.empty() && gtx.size() == (std::size_t)text_seq * HID) {
+    const auto* fp = static_cast<const _Float16*>(fused.contents());
+    std::vector<float> ftx((std::size_t)text_seq * HID);
+    for (std::size_t i = 0; i < ftx.size(); ++i) { ftx[i] = (float)fp[i]; }
+    const double rt = rel_l2_(ftx.data(), gtx.data(), ftx.size());
+    std::printf("[krea2_dit] velocity-golden txt_in rel-L2 = %.6f\n", rt);
+    EXPECT_TRUE(rt < 0.06);
+  }
+
+  SharedBuffer vel = m->forward_dit(fused, text_seq, lat, img_seq, grid, grid,
+                                    0.5f);
+  ASSERT_TRUE(!vel.empty());
+  ASSERT_TRUE(vel.byte_size() >= (std::size_t)img_seq * IC * 2);
+  const auto* vp = static_cast<const _Float16*>(vel.contents());
+  std::vector<float> got((std::size_t)img_seq * IC);
+  bool finite = true;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    got[i] = (float)vp[i];
+    if (!std::isfinite(got[i])) { finite = false; }
+  }
+  EXPECT_TRUE(finite);                           // the whole point: no f16 NaN
+  const double r = rel_l2_(got.data(), gvel.data(), got.size());
+  std::printf("[krea2_dit] forward_dit velocity rel-L2 = %.6f "
+              "(seq=%d img=%d grid=%d) [bf16-vs-bf16 floor]\n",
+              r, text_seq + img_seq, img_seq, grid);
+  EXPECT_TRUE(r < 0.10);                          // bf16-vs-bf16 rounding floor
 }
 
 // A/B oracle for the BM=128 quantized qmm tile (_qmm_tile=2) vs BM=64

@@ -14,6 +14,8 @@
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
+#include "generative-models/mage/metal-mage-flow-transformer.h"
+#include "generative-models/mage/mage-watermark.h"
 #endif
 
 #include <cstdint>
@@ -43,18 +45,24 @@ namespace vpipe {
 //           available. Unwired (or scale 1) => no CFG (single DiT pass, the
 //           token-exact turbo default).
 //
-//   iport2  OPTIONAL FlexDataPayload sampler spec (from a `sampler-select`
+//   iport2  OPTIONAL FlexDataPayload model reference (from a `model-select`
+//           source). Latched once; OVERRIDES the hf_dir config so the
+//           conditioner / DiT / vae stages of a graph share one model. When
+//           wired, the (heavy) DiT load is DEFERRED to the first process() (the
+//           beat only arrives after the init barrier).
+//
+//   iport3  OPTIONAL FlexDataPayload sampler spec (from a `sampler-select`
 //           stage). Latched on the first beat and reused for every prompt;
 //           selects the integrator (euler / heun / dpmpp_2m / dpmpp_sde) + its
 //           knobs. Unwired => the config default (euler, the token-exact turbo).
 //
-//   iport3  OPTIONAL FlexDataPayload scheduler spec (from a `scheduler-select`
+//   iport4  OPTIONAL FlexDataPayload scheduler spec (from a `scheduler-select`
 //           stage). Latched likewise; selects the sigma schedule (simple /
 //           karras / exponential), steps and shift. Unwired => config default
 //           (simple / `steps` / shift 1.15).
 //
-//   iport4  OPTIONAL TensorBeatPayload reference latent 0 -- an f32 latent
-//   iport5  OPTIONAL TensorBeatPayload reference latent 1 (channel-first,
+//   iport5  OPTIONAL TensorBeatPayload reference latent 0 -- an f32 latent
+//   iport6  OPTIONAL TensorBeatPayload reference latent 1 (channel-first,
 //           the format the vae-encode stage emits: FLUX.2 [dit_channels, H/16,
 //           W/16], Krea-2 [z_dim, H/8, W/8]). Read once when a beat is available
 //           and cached. FLUX.2 uses them as multi-reference conditioning: each
@@ -68,10 +76,12 @@ namespace vpipe {
 //           unpacked, still whitened -- the vae-decode stage un-whitens).
 //
 // Config (FlexData object):
-//   hf_dir     (string, required) -- the model dir; the transformer/ subfolder's
+//   hf_dir     (string, OPTIONAL) -- the model dir; the transformer/ subfolder's
 //                                    _class_name selects the DiT family. (The
 //                                    text_encoder/ + tokenizer/ live here too but
-//                                    are the diffusion-conditioner's concern.)
+//                                    are the diffusion-conditioner's concern.) A
+//                                    model-select source on iport2 overrides it;
+//                                    required only when iport2 is unwired.
 //   dit_dir    (string, optional) -- override for the DiT (transformer) dir,
 //                                    e.g. a model-quantize'd 4/8-bit DiT; else
 //                                    <hf_dir>/transformer.
@@ -126,25 +136,72 @@ private:
   double      _strength{};      // img2img: 0 => text-to-image (pure noise)
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _adopt_latent_dims{};  // take output size from the img2img latent
+  // Mage-Flow provenance watermark (Gaussian-Shading in the initial noise).
+  // ON by default -- the reference applies it unconditionally, and it is
+  // distribution-preserving, so there is no quality reason to skip it.
+  bool        _watermark{};
+  std::string _watermark_key;
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 
-  // "krea2" | "flux2" | "qwen-image-edit" (from the transformer _class_name).
+  // "krea2" | "flux2" | "qwen-image-edit" | "mage-flow" (from the transformer
+  // _class_name).
   std::string _family = "krea2";
 
+  // Model iport bookkeeping (used only when a model-select source is wired):
+  // latch the model beat once, and load the DiT at most once (lazily, since the
+  // beat only arrives after the init barrier).
+  bool _model_latched  = false;
+  bool _load_attempted = false;
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  // Loaded lazily in initialize() (one DiT per the detected family); left null
-  // on failure (stage stays inert). The text encoder + tokenizer + vision tower
-  // live in the paired diffusion-conditioner stage, not here.
+  // Resolve _hf_dir + load the family DiT (idempotent: the _load_attempted
+  // guard runs the body at most once). Called from initialize() when the model
+  // comes from config, or from the first process() when it arrives on the model
+  // iport. No-op when _hf_dir is still empty.
+  void ensure_loaded_();
+
+  // Loaded lazily by ensure_loaded_ (one DiT per the detected family); left
+  // null on failure (stage stays inert). The text encoder + tokenizer + vision
+  // tower live in the paired diffusion-conditioner stage, not here.
   std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
   std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
   std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;
+  // Mage-Flow's NR-MMDiT IS MetalQwenImageTransformer (a different Config);
+  // kept in its own handle so the two families never share load state.
+  std::unique_ptr<genai::MetalMageFlowTransformer> _mage_dit;
+  // Mage-Flow's STATIC flow shift from <root>/scheduler/scheduler_config.json
+  // (6.0 in every published checkpoint; use_dynamic_shifting is false).
+  double _mage_shift = 6.0;
   // On a memory-bounded box (DiT + the conditioner's resident encoder can't fit
   // a large decode too), drop the DiT's per-forward scratch after each
   // generation so it doesn't crowd out the downstream vae-decode. Set from the
   // same RAM heuristic that decides DiT streaming.
   bool _release_scratch = false;
+
+  // FLUX.2 free/reload: on a memory-bounded box a PRELOADED ~9 GB DiT leaves
+  // no working-set room for a 1024px vae-decode. After a generation, if the
+  // pending decode won't fit alongside the resident DiT, free the DiT weights
+  // (they are mmap'd; the destructor releases the working set) BEFORE the
+  // latent is published, then reload lazily when the next prompt arrives. The
+  // load params are cached here so process() can reload without re-deriving.
+  std::string _flux2_dit_dir;            // resolved transformer dir (reload)
+  bool        _flux2_stream   = false;   // streaming mode used at load
+  double      _flux2_pin_frac = 0.0;     // pinned-block fraction at load
+  std::string _krea2_dit_dir;            // resolved Krea-2 DiT dir (reload)
+  int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
+  bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
+
+  // (Re)load the FLUX.2 DiT from the cached params. Returns false on failure.
+  bool load_flux2_dit_();
+  // Free the FLUX.2 DiT if the pending gen_w x gen_h vae-decode won't fit the
+  // current GPU working-set headroom alongside it. No-op otherwise / non-flux2.
+  void free_flux2_dit_for_decode_(int gen_w, int gen_h);
+  // Same, for the Krea-2 DiT (its ~7 GB of resident weights otherwise starve
+  // the shared MetalKrea2Vae's 1024px decode); reloaded on the next prompt.
+  bool load_krea2_dit_();
+  void free_krea2_dit_for_decode_(int gen_w, int gen_h);
 
   // The active sampler (integrator) + scheduler (sigma schedule) specs. Seeded
   // from config (euler + simple / _steps / shift 1.15) and each overridden by
@@ -199,6 +256,7 @@ private:
   generate_flux2_(const metal_compute::SharedBuffer& context, int n_real,
                   int gen_h, int gen_w,
                   const std::vector<RefLatent>& refs,
+                  const std::vector<float>* init_packed = nullptr,
                   const std::function<void(const std::vector<float>&)>&
                       emit_step = {}) const;
 
@@ -210,6 +268,24 @@ private:
   // [16, h, w]) packed 2x2 to DiT tokens + appended in their own RoPE frame
   // bands. Returns the unpacked, whitened latent [16, H/8, W/8] (channel-first)
   // or empty.
+  // Mage-Flow forward: `txt` is the diffusion-conditioner's mage-flow
+  // conditioning (bf16 [n_real, 2560] single last-hidden tap, POST final
+  // norm). MageVAE downsamples 16x and the DiT is patch_size 1, so a latent
+  // pixel IS a token: no 2x2 pack/unpack anywhere on this path. `refs` are
+  // MageVAE reference latents ([128, h, w] channel-first from vae-encode),
+  // appended CLEAN after the target in their own RoPE frame bands -- the
+  // sampler steps only the target tokens. FlowMatchEuler with the checkpoint's
+  // STATIC shift 6.0 (scheduler_config.json, use_dynamic_shifting false).
+  // Returns the latent [128, H/16, W/16] (channel-first) or empty.
+  std::vector<float>
+  generate_mage_(const metal_compute::SharedBuffer& txt, int n_real,
+                 const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+                 int gen_h, int gen_w,
+                 const std::vector<float>* init_packed,
+                 const std::vector<RefLatent>& refs,
+                 const std::function<void(const std::vector<float>&)>&
+                     emit_step = {}) const;
+
   std::vector<float>
   generate_qie_(const metal_compute::SharedBuffer& txt, int n_real,
                 const metal_compute::SharedBuffer& txt_neg, int n_real_neg,

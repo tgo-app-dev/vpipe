@@ -427,6 +427,116 @@ TEST(krea2_vae, decode_1024_no_matmul2d_corruption)
   EXPECT_TRUE(min_std > 0.2);          // >> the ~0.01 of a collapsed grey band
 }
 
+// Regression for the row-tiled im2col path at 1024 (VPIPE_VAE_NO_HWCONV -- the
+// non-matrix-core M4 fallback, + conv_out / top resblocks on every box). The
+// matmul2d op corrupts output rows past M ~ 2^18-2^19 for the large-K 3x3 im2col
+// GEMMs, so a 1024 decode on the im2col path grey-BANDS unless each band is
+// safe-capped below the threshold. The band std check above is too coarse for a
+// thin stripe, so decode the SAME latent through the default hw-conv path and
+// the adaptive-tiled im2col path and rel-L2 the two 1024x1024 images -- a banded
+// region spikes rel-L2 far past the ~7e-4 hw-vs-im2col floor. DEFAULT band (no
+// override) so a broken safe-cap is caught. Gated on model + matrix cores.
+TEST(krea2_vae, decode_1024_im2col_tiled_matches_hwconv)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string vdir = std::string(root) + "/vae";
+  MetalKrea2Vae::Config cfg;                        // Qwen-Image VAE defaults
+  const int Cz = cfg.z_dim, h8 = 128, w8 = 128;     // -> 1024x1024
+  const std::size_t hw = (std::size_t)h8 * w8;
+  std::vector<float> lat((std::size_t)Cz * hw);
+  std::uint32_t s = 0x9e3779b9u;
+  for (auto& v : lat) {
+    s = s * 1664525u + 1013904223u;
+    v = ((float)(s >> 8) / 8388608.0f - 1.0f) * 3.0f;
+  }
+  const int H = h8 * 8, W = w8 * 8;
+  const std::size_t n = (std::size_t)3 * H * W;
+  auto run = [&](bool no_hwconv) -> std::vector<float> {
+    if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
+    else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
+    auto vae = MetalKrea2Vae::load(vdir, mc, cfg);
+    ::unsetenv("VPIPE_VAE_NO_HWCONV");
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    SharedBuffer z = mc->make_shared_buffer(lat.size() * 2);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < lat.size(); ++i) { d[i] = (_Float16)lat[i]; }
+    SharedBuffer rgb = vae->decode(z, h8, w8);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  const std::vector<float> hwc = run(/*no_hwconv=*/false);
+  const std::vector<float> tld = run(/*no_hwconv=*/true);
+  ASSERT_TRUE(!hwc.empty());
+  ASSERT_TRUE(hwc.size() == tld.size());
+  const double r = rel_l2_(hwc.data(), tld.data(), hwc.size());
+  std::printf("[krea2_vae] 1024 im2col-tiled vs hwconv rel-L2 = %.6g\n", r);
+  EXPECT_TRUE(std::isfinite(r) && r < 3e-2);   // a banded region would be >> this
+}
+
+// VAE-ENCODE row-tiled im2col regression: encode the SAME image through the
+// default hw-conv path and the multi-band (VPIPE_KREA2_VAE_BAND_ROWS forced
+// small) im2col path, rel-L2 the two latents. Exercises the tiled STRIDE-1
+// (resblock) AND STRIDE-2 (downsample) convs + their band boundaries. Skips if
+// the model has no encoder. Gated on model + matrix cores.
+TEST(krea2_vae, encode_tiled_im2col_matches_hwconv)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string vdir = std::string(root) + "/vae";
+  MetalKrea2Vae::Config cfg;
+  // encode() un-whitens with per-channel latents_mean/std (size z_dim); default
+  // Config leaves them empty -> encode returns {}. Dummy values are fine here:
+  // BOTH legs normalize identically, so the hw-vs-tiled A/B is unaffected.
+  cfg.latents_mean.assign(cfg.z_dim, 0.0f);
+  cfg.latents_std.assign(cfg.z_dim, 1.0f);
+  const int H = 512, W = 512;                       // -> s1 resblocks + s2 downs
+  std::vector<float> img((std::size_t)3 * H * W);   // channel-first [3,H,W]
+  std::uint32_t s = 0x243f6a88u;
+  for (auto& v : img) {
+    s = s * 1664525u + 1013904223u;
+    v = ((float)(s >> 8) / 8388608.0f - 1.0f);      // ~[-1, 1]
+  }
+  auto run = [&](bool no_hwconv, const char* band) -> std::vector<float> {
+    if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
+    else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
+    if (band) { ::setenv("VPIPE_KREA2_VAE_BAND_ROWS", band, 1); }
+    else      { ::unsetenv("VPIPE_KREA2_VAE_BAND_ROWS"); }
+    auto vae = MetalKrea2Vae::load(vdir, mc, cfg, /*with_encoder=*/true);
+    ::unsetenv("VPIPE_VAE_NO_HWCONV");
+    ::unsetenv("VPIPE_KREA2_VAE_BAND_ROWS");
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    SharedBuffer im = mc->make_shared_buffer(img.size() * 2);
+    auto* d = static_cast<_Float16*>(im.contents());
+    for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; }
+    SharedBuffer z = vae->encode(im, H, W);
+    if (z.empty()) { return out; }                  // no encoder in this build
+    const std::size_t nz = z.byte_size() / 2;
+    out.resize(nz);
+    const auto* p = static_cast<const _Float16*>(z.contents());
+    for (std::size_t i = 0; i < nz; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  const std::vector<float> hwc = run(/*no_hwconv=*/false, nullptr);
+  const std::vector<float> tld = run(/*no_hwconv=*/true, "4096");   // multi-band
+  if (hwc.empty() || tld.empty()) { return; }       // encoder unavailable -> skip
+  ASSERT_TRUE(hwc.size() == tld.size());
+  const double r = rel_l2_(hwc.data(), tld.data(), hwc.size());
+  std::printf("[krea2_vae] encode tiled-im2col vs hwconv rel-L2 = %.6g\n", r);
+  EXPECT_TRUE(std::isfinite(r) && r < 3e-2);
+}
+
 // The mid-block self-attention on the matrix-core FULL flash kernel
 // (sdpa_full_mma2_dN) must match the scalar sdpa_full_f16 it replaces. Decode
 // the same latent both ways (VPIPE_KREA2_NO_MMA_ATTN forces scalar) and rel-L2.

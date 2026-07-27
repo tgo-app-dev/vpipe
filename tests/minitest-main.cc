@@ -81,7 +81,9 @@ int main(int argc, const char** argv)
   }
 
   auto test_mgr = minitest::TestManager::get_instance();
-  test_mgr->run(cfg);
-
-  return 0;
+  // Propagate the result: run() returns 1 when any test failed. Dropping it
+  // made every invocation exit 0, so no script or CI step could detect a
+  // failure from the exit status -- a `vpipe_test && ...` gate was a no-op and
+  // failures were visible only by grepping stdout for "[  FAILED  ]".
+  return test_mgr->run(cfg);
 }

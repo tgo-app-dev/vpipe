@@ -17,6 +17,7 @@ import { el, clear, openMenu, openModal, toast } from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
+import { openFsDialog, splitPath } from '../fs-dialog.js';
 
 import { mountPipelineManager, mountPipelineEditor }
   from './pipeline-manager.js';
@@ -92,9 +93,19 @@ const SIDES = ['left', 'right', 'top', 'bottom'];
 // z=60). Docked/background sit below; the menu always wins.
 const FLOAT_Z = 10;
 const LS_CUR = 'vpipe_composer_current';       // auto-persisted layout
-const LS_PL  = (id) => 'vpipe_composer_pl_' + id;   // per-pipeline layout
+// Per-pipeline arrangements now live on the backend as auxiliary data
+// objects (aux.composer), travelling with the pipeline file -- see
+// saveWithPipeline / loadForPipeline.
 
 const clamp = (v, lo, hi) => (v < lo ? lo : (v > hi ? hi : v));
+
+// Default `ext` when the user typed a bare name (no extension) in a dialog.
+function withExt(p, ext) {
+  if (!p) { return p; }
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  const base = i >= 0 ? p.slice(i + 1) : p;
+  return base.indexOf('.') === -1 ? p + ext : p;
+}
 
 // One live composer instance persists for the life of the page so its
 // panels (a playing video, a streaming console) survive nav switches.
@@ -613,63 +624,103 @@ function build() {
     });
   });
 
+  // Write the arrangement as a standalone JSON file on the SERVER (a
+  // Save-As browse into the sandbox), like the pipeline save -- not a
+  // client-side download.
   function saveToFile() {
-    const blob = new Blob([JSON.stringify(serialize(), null, 2)],
-      { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = el('a', { href: url, download: 'composer-layout.json' });
-    document.body.append(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast(t('composer.saved'), 'ok');
+    const doc = serialize();
+    openFsDialog({
+      mode: 'save', kind: 'file',
+      filters: [{ label: t('composer.layout_filter'), exts: ['.json'] }],
+      title: t('composer.save_file_title'),
+      defaultName: 'composer-layout.json',
+      onPick: async (p) => {
+        if (!p) { return; }
+        try {
+          const r = await api.fsWrite(
+            withExt(p, '.json'), JSON.stringify(doc, null, 2));
+          toast(t('composer.saved_pl_path', { path: r.path }), 'ok');
+        } catch (e) {
+          toast(t('composer.save_pl_failed', { msg: e.message }), 'error');
+        }
+      },
+    });
   }
+  // Save a pipeline together with THIS arrangement: pick the pipeline, then
+  // a Save-As dialog makes it explicit that the pipeline file is being
+  // written (with the arrangement bundled in as aux.composer). It travels
+  // with the pipeline file -- written on save, recovered on load.
   async function saveWithPipeline(anchor) {
     const list = await pipelines();
     if (!list.length) { toast(t('composer.no_pipeline'), 'error'); return; }
     openMenu(anchor.left, anchor.bottom + 4, list.map((id) => ({
-      label: id, onClick: () => {
+      label: id, onClick: async () => {
         state.pipeline = id; updatePlLabel();
         const doc = serialize(); doc.pipeline = id;
-        try { localStorage.setItem(LS_PL(id), JSON.stringify(doc)); }
-        catch (e) { /* ignore */ }
         persist();
-        toast(t('composer.saved_pl', { id }), 'ok');
+        // Seed the dialog with the pipeline's current file, if any.
+        let seed = { dir: '', name: '' };
+        try {
+          const d = await api.getPipeline(id);
+          seed = splitPath((d && d.storage_path) || '');
+        } catch (e) { /* fall back to defaults */ }
+        openFsDialog({
+          mode: 'save', kind: 'file',
+          filters: [{ label: t('pl.vpipeline_filter'),
+            exts: ['.vpipeline'] }],
+          title: t('composer.save_pl_title', { id }),
+          startDir: seed.dir,
+          defaultName: seed.name || (id + '.vpipeline'),
+          onPick: async (p) => {
+            if (!p) { return; }
+            try {
+              const r = await api.savePipeline(
+                id, withExt(p, '.vpipeline'), { composer: doc });
+              toast(t('composer.saved_pl_path',
+                { path: r.storage_path }), 'ok');
+            } catch (e) {
+              toast(t('composer.save_pl_failed',
+                { msg: e.message }), 'error');
+            }
+          },
+        });
       } })));
   }
+  // Read a standalone layout JSON from the SERVER (a browse into the
+  // sandbox), like the pipeline load -- not a client-side file picker.
   function loadFromFile() {
-    const inp = el('input', { type: 'file', accept: '.json,application/json' });
-    inp.style.display = 'none';
-    inp.addEventListener('change', () => {
-      const f = inp.files && inp.files[0];
-      if (!f) { return; }
-      const rd = new FileReader();
-      rd.onload = () => {
-        try { deserialize(JSON.parse(String(rd.result)));
-          toast(t('composer.loaded'), 'ok'); }
-        catch (e) { toast(t('composer.load_failed',
-          { msg: e.message }), 'error'); }
-      };
-      rd.readAsText(f);
-      inp.remove();
-    });
-    document.body.append(inp); inp.click();
-  }
-  async function loadForPipeline(anchor) {
-    // Pipelines that have a saved layout in localStorage.
-    const saved = [];
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith('vpipe_composer_pl_')) {
-          saved.push(k.slice('vpipe_composer_pl_'.length));
-        }
-      }
-    } catch (e) { /* ignore */ }
-    if (!saved.length) { toast(t('composer.no_saved'), 'error'); return; }
-    openMenu(anchor.left, anchor.bottom + 4, saved.map((id) => ({
-      label: id, onClick: () => {
+    openFsDialog({
+      mode: 'open', kind: 'file',
+      filters: [{ label: t('composer.layout_filter'), exts: ['.json'] }],
+      title: t('composer.load_file_title'),
+      onPick: async (p) => {
+        if (!p) { return; }
         try {
-          const raw = localStorage.getItem(LS_PL(id));
-          deserialize(JSON.parse(raw));
+          const r = await api.fsText(p, 4 * 1024 * 1024);
+          if (r.truncated) { throw new Error(t('composer.file_too_large')); }
+          deserialize(JSON.parse(r.text));
+          toast(t('composer.loaded'), 'ok');
+        } catch (e) {
+          toast(t('composer.load_failed', { msg: e.message }), 'error');
+        }
+      },
+    });
+  }
+  // Restore a pipeline's arrangement from the BACKEND (aux.composer). Lists
+  // the loaded pipelines; a pick with no saved arrangement just says so.
+  async function loadForPipeline(anchor) {
+    const list = await pipelines();
+    if (!list.length) { toast(t('composer.no_pipeline'), 'error'); return; }
+    openMenu(anchor.left, anchor.bottom + 4, list.map((id) => ({
+      label: id, onClick: async () => {
+        try {
+          const d = await api.getPipeline(id);
+          const doc = d && d.aux && d.aux.composer;
+          if (!doc || typeof doc !== 'object') {
+            toast(t('composer.no_saved_pl', { id }), 'error');
+            return;
+          }
+          deserialize(doc);
           toast(t('composer.loaded'), 'ok');
         } catch (e) {
           toast(t('composer.load_failed', { msg: e.message }), 'error');

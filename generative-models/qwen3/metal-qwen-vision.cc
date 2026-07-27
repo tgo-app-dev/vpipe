@@ -292,8 +292,47 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     return w;
   };
 
-  const std::string r = "vision_tower.";
+  const std::string r = cfg.weight_prefix;   // "vision_tower." or "visual."
   m->_pe_w = gguf ? patch_embed_gguf() : to_f16(r + "patch_embed.proj.weight");
+  if (!gguf && !m->_pe_w.empty()) {
+    // The host patchify above emits each patch's features CHANNELS-LAST
+    // [T, P, P, C]. Two on-disk layouts occur for patch_embed.proj.weight:
+    //   qwen3_vl   (Krea-2 encoder): [hidden, C, T, P, P] (Conv3d, channels-1st)
+    //   qwen3_5    (realtime-vqa)  : [hidden, T, P, P, C] (already channels-last)
+    // Permute to [hidden, T, P, P, C] ONLY for the channels-first layout (axis 1
+    // == in_channels); the channels-last checkpoints are already aligned and MUST
+    // be left untouched (permuting them scrambles the projection). Detected from
+    // the on-disk tensor shape, so it is per-checkpoint, not per-family. Without
+    // the permute the qwen3_vl projection mixes the wrong channel/spatial lanes
+    // (~0.4 rel-L2, compounding through the ViT vs HF). GGUF already reorders.
+    const int Hh = cfg.hidden, Ci = 3, Tt = cfg.temporal_patch, Pp = cfg.patch_size;
+    const auto* pinfo = wts ? wts->info(r + "patch_embed.proj.weight") : nullptr;
+    const bool channels_first =
+        pinfo != nullptr && pinfo->shape.size() == 5 &&
+        (int)pinfo->shape[1] == Ci && (int)pinfo->shape[2] == Tt;
+    if (channels_first &&
+        (std::size_t)Hh * Ci * Tt * Pp * Pp * 2 == m->_pe_w.byte_size()) {
+      SharedBuffer re = mc->make_shared_buffer(m->_pe_w.byte_size());
+      const auto* s = static_cast<const _Float16*>(m->_pe_w.contents());
+      auto* d = static_cast<_Float16*>(re.contents());
+      for (int h = 0; h < Hh; ++h) {
+        for (int t = 0; t < Tt; ++t) {
+          for (int ph = 0; ph < Pp; ++ph) {
+            for (int pw = 0; pw < Pp; ++pw) {
+              for (int c = 0; c < Ci; ++c) {
+                const std::size_t si =   // [H, C, T, P, P]
+                    ((((std::size_t)h * Ci + c) * Tt + t) * Pp + ph) * Pp + pw;
+                const std::size_t di =   // [H, T, P, P, C]
+                    ((((std::size_t)h * Tt + t) * Pp + ph) * Pp + pw) * Ci + c;
+                d[di] = s[si];
+              }
+            }
+          }
+        }
+      }
+      m->_pe_w = std::move(re);
+    }
+  }
   m->_pe_b = to_f16(r + "patch_embed.proj.bias");
   m->_pos_w = to_f16(r + "pos_embed.weight");
   bool ok = !m->_pe_w.empty() && !m->_pe_b.empty() && !m->_pos_w.empty();
@@ -325,6 +364,23 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
   ok = ok && !m->_mnw.empty() && !m->_mfc1w.empty() && !m->_mfc2w.empty();
   if (!ok) { return nullptr; }
 
+  // Qwen3-VL deepstack mergers (postshuffle norm over S*S*hidden).
+  for (std::size_t i = 0; i < cfg.deepstack_indexes.size(); ++i) {
+    const std::string p =
+        r + "deepstack_merger_list." + std::to_string(i) + ".";
+    DsMerger d;
+    d.dnw  = to_f16(p + "norm.weight");
+    d.dnb  = to_f16(p + "norm.bias");
+    d.fc1w = to_f16(p + "linear_fc1.weight");
+    d.fc1b = to_f16(p + "linear_fc1.bias");
+    d.fc2w = to_f16(p + "linear_fc2.weight");
+    d.fc2b = to_f16(p + "linear_fc2.bias");
+    if (d.dnw.empty() || d.fc1w.empty() || d.fc2w.empty()) {
+      return nullptr;   // config declares deepstack but weights are missing
+    }
+    m->_ds.push_back(std::move(d));
+  }
+
   const int rope_dim = cfg.head_dim() / 2;
   for (int i = 0; i < rope_dim; i += 2) {
     m->_rope_inv_freq.push_back(
@@ -348,6 +404,7 @@ MetalQwenVisionEncoder::config_from(const ModelConfig& c)
   m.num_pos_embed  = v.num_position_embeddings;
   m.intermediate   = v.intermediate_size;
   m.gguf_mmproj    = v.mmproj_path;
+  m.deepstack_indexes = v.deepstack_visual_indexes;
   for (int i = 0; i < 3; ++i) {
     m.image_mean[i] = v.image_mean[i];
     m.image_std[i]  = v.image_std[i];
@@ -383,7 +440,7 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 
   const int factor = P * S;
   int th, tw;
-  smart_resize_(H, W, factor, 56 * 56, 28 * 28 * 1280, &th, &tw);
+  smart_resize_(H, W, factor, c.min_pixels, c.max_pixels, &th, &tw);
   const int grid_h = th / P, grid_w = tw / P;
   const int mh = grid_h / S, mw = grid_w / S;
   const int n_patches = grid_h * grid_w;
@@ -495,6 +552,12 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
   SharedBuffer out2 = buf((std::size_t)n_patches * hidden);
   SharedBuffer mg = buf((std::size_t)n_im * mdim);
   SharedBuffer emb = buf((std::size_t)n_im * outh);
+  // Deepstack: one output feature [n_im, outh] per merger + shared scratch
+  // (postshuffle-norm out [n_im, mdim] + fc1 out [n_im, mdim]).
+  std::vector<SharedBuffer> ds_out(_ds.size());
+  for (auto& b : ds_out) { b = buf((std::size_t)n_im * outh); }
+  SharedBuffer ds_n1 = _ds.empty() ? SharedBuffer{} : buf((std::size_t)n_im * mdim);
+  SharedBuffer ds_h  = _ds.empty() ? SharedBuffer{} : buf((std::size_t)n_im * mdim);
 
   metal_compute::CommandStream stream = _mc->make_command_stream();
   {
@@ -738,6 +801,18 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       gelu(_fn_gelu_tanh, hbuf, h2, n_patches * inter);
       gemm(h2, blk.fc2w, blk.fc2b, out2, n_patches, hidden, inter);
       residual(x, out2, x, n_patches * hidden);
+      // Qwen3-VL deepstack: after a tapped block, merge the CURRENT [n_patches,
+      // hidden] residual with the postshuffle-norm merger -> [n_im, outh]. The
+      // norm is over the merged window (mdim), so the contiguous x is read as
+      // [n_im, mdim] directly (same reshape the main merger uses for fc1).
+      for (std::size_t i = 0; i < _cfg.deepstack_indexes.size(); ++i) {
+        if (_cfg.deepstack_indexes[i] != b) { continue; }
+        const DsMerger& d = _ds[i];
+        ln(x, d.dnw, d.dnb, ds_n1, n_im, mdim);        // postshuffle LN over mdim
+        gemm(ds_n1, d.fc1w, d.fc1b, ds_h, n_im, mdim, mdim);
+        gelu(_fn_gelu_erf, ds_h, ds_h, n_im * mdim);
+        gemm(ds_h, d.fc2w, d.fc2b, ds_out[i], n_im, outh, mdim);
+      }
     }
 
     // Patch merger: per-patch LN, then reshape [n_im, S^2*hidden] -> fc1
@@ -766,6 +841,7 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
   // host-f32 readback). The LM splice copies f16 rows straight in.
   res.embeddings = std::move(emb);
   res.out_hidden = outh;
+  res.deepstack = std::move(ds_out);
   return res;
 }
 

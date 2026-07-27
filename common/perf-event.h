@@ -119,6 +119,13 @@ inline constexpr std::uint32_t kGvidLlmAudioCodec = kPerfAuxGvidBase + 4u;
 //   dit-denoise   : one MMDiT forward (forward_dit), once per sampler step.
 inline constexpr std::uint32_t kGvidLlmDitText = kPerfAuxGvidBase + 5u;
 inline constexpr std::uint32_t kGvidLlmDit     = kPerfAuxGvidBase + 6u;
+// Diffusion VAE (latent <-> pixels), the other half of a text-to-image
+// timeline: one encode per reference image, one decode per generated image.
+// At 1024px the decode is seconds of GPU work that previously showed up
+// nowhere, so a run looked like a gap between the last denoise step and the
+// image. Recorded by the vae-encode / vae-decode STAGES, so it is
+// family-agnostic (Krea-2 / FLUX.2 / Qwen-Image / MageVAE alike).
+inline constexpr std::uint32_t kGvidLlmVae     = kPerfAuxGvidBase + 7u;
 
 // Per-activity begin type ids (end = begin + 1, per the parity
 // convention). Distinct pairs so the begin/end pairing is unambiguous
@@ -130,6 +137,7 @@ inline constexpr std::uint32_t kPerfLlmAudioBegin   = 6u;
 inline constexpr std::uint32_t kPerfLlmAudioCodecBegin = 8u;
 inline constexpr std::uint32_t kPerfLlmDitTextBegin = 10u;
 inline constexpr std::uint32_t kPerfLlmDitBegin     = 12u;
+inline constexpr std::uint32_t kPerfLlmVaeBegin    = 14u;
 
 // The LLM-lane synthetic stages, consumed by dump_profiling to emit
 // `stages` entries (id = block label; begin/end named in the dump).
@@ -146,6 +154,7 @@ inline constexpr PerfAuxStageDesc kPerfAuxStages[] = {
   { kGvidLlmAudioCodec, kPerfLlmAudioCodecBegin, "audio-codec" },
   { kGvidLlmDitText, kPerfLlmDitTextBegin, "dit-text-fuse" },
   { kGvidLlmDit,     kPerfLlmDitBegin,     "dit-denoise"   },
+  { kGvidLlmVae,     kPerfLlmVaeBegin,     "vae-codec"     },
 };
 
 // ANE-lane CoreML predict begin/end (recorded with the real CoreML

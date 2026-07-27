@@ -225,9 +225,14 @@ TEST(image_resample_stage, config_parse_and_validation) {
     ImageResampleStage s(&sess, "rs", vector<InEdge>{}, std::move(c));
     EXPECT_TRUE(s.config_error().empty());
   }
-  {  // bad algorithm -> deferred config error
+  {  // lanczos -> valid algorithm
     ImageResampleStage s(&sess, "rs", vector<InEdge>{},
         FlexData::from_json(R"({"width":8,"height":8,"algorithm":"lanczos"})"));
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  {  // unknown algorithm -> deferred config error
+    ImageResampleStage s(&sess, "rs", vector<InEdge>{},
+        FlexData::from_json(R"({"width":8,"height":8,"algorithm":"cubic"})"));
     EXPECT_FALSE(s.config_error().empty());
   }
 }

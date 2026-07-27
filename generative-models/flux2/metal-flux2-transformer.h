@@ -262,6 +262,7 @@ class MetalFlux2Transformer {
       _lib_vis, _lib_rope, _lib_ln, _lib_qmm;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_swiglu,
       _fn_residual, _fn_transpose, _fn_sdpa, _fn_gelu_tanh, _fn_rope_table,
+      _fn_transpose_rope, _fn_ln_mod,
       _fn_adaln, _fn_gated, _fn_layernorm, _fn_bias_add, _fn_qmm4, _fn_qmm8,
       _fn_headslice, _fn_mulsig, _fn_concat, _fn_transpose_rs;
   // Larger-tile dense f16 GEMM twins (fewer weight re-reads at the DiT's big

@@ -248,6 +248,61 @@ TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   EXPECT_TRUE(has_(e->files, "imatrix_unsloth.gguf_file"));
 }
 
+// The Mage-Flow family: six 4B entries in two instantiations -- Gen
+// (t2i, "mage-flow", text-in) and Edit ("mage-flow-edit", text+image-in),
+// each in Base / RL-aligned / Turbo. All six pin the SAME 18-file
+// non-asset layout.
+TEST(model_catalog, mage_flow_family_present) {
+  struct Row { const char* path; const char* ver; const char* mt; };
+  const Row rows[] = {
+      {"microsoft/Mage-Flow-Base", "Gen", "mage-flow"},
+      {"microsoft/Mage-Flow", "Gen", "mage-flow"},
+      {"microsoft/Mage-Flow-Turbo", "Gen", "mage-flow"},
+      {"microsoft/Mage-Flow-Edit-Base", "Edit", "mage-flow-edit"},
+      {"microsoft/Mage-Flow-Edit", "Edit", "mage-flow-edit"},
+      {"microsoft/Mage-Flow-Edit-Turbo", "Edit", "mage-flow-edit"}};
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "Mage-Flow");
+    EXPECT_TRUE(e->version == r.ver);
+    EXPECT_TRUE(e->param_class == "4B");
+    EXPECT_TRUE(e->model_type == r.mt);
+    EXPECT_FALSE(e->needs_tokenizer_json);
+    // Pinned layout: the split-stage sub-models, no assets/.
+    EXPECT_TRUE(e->files.size() == 18);
+    EXPECT_TRUE(has_(e->files, "model_index.json"));
+    EXPECT_TRUE(has_(e->files,
+                     "transformer/diffusion_pytorch_model.safetensors"));
+    EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
+    EXPECT_TRUE(has_(e->files,
+                     "text_encoder/model-00002-of-00002.safetensors"));
+    EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+  }
+  // Both variants of each instantiation drill down under one family.
+  auto gen = catalog_variants("Mage-Flow", "Gen", "4B");
+  EXPECT_TRUE(gen.size() == 3);
+  EXPECT_TRUE(has_(gen, "Turbo 4-step distilled bf16 (microsoft)"));
+  auto edit = catalog_variants("Mage-Flow", "Edit", "4B");
+  EXPECT_TRUE(edit.size() == 3);
+  EXPECT_TRUE(has_(edit, "Turbo 4-step distilled bf16 (microsoft)"));
+
+  // Modalities: Edit is image-conditioned, Gen is not; both emit images.
+  FlexData ef = catalog_entry_to_flex(
+      *catalog_by_path("microsoft/Mage-Flow-Edit-Turbo"));
+  auto ein = flex_arr_(ef, "inputs");
+  EXPECT_TRUE(has_(ein, "text"));
+  EXPECT_TRUE(has_(ein, "image"));
+  EXPECT_TRUE(has_(flex_arr_(ef, "outputs"), "image"));
+  FlexData tf = catalog_entry_to_flex(
+      *catalog_by_path("microsoft/Mage-Flow-Turbo"));
+  auto tin = flex_arr_(tf, "inputs");
+  EXPECT_TRUE(tin.size() == 1);
+  EXPECT_TRUE(has_(tin, "text"));
+  EXPECT_TRUE(has_(flex_arr_(tf, "outputs"), "image"));
+}
+
 // Input/output modalities + derived category are exposed via
 // catalog_entry_to_flex (gemma-4 e4b multimodal-in/text-out; flux2
 // text+image-in/image-out).

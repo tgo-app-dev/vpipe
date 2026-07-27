@@ -37,6 +37,13 @@ namespace vpipe {
 //   type 4 (audio):    planar float32, `channels` planes of `frames`
 //     samples (frames = payload_bytes / (channels*4)); channels +
 //     sampleRate come from the config message.
+//   type 5 (image):    one encoded still picture (PNG). Sent instead of
+//     video fragments while the stage is in still-image mode (an
+//     image-type source arriving slower than 1 fps): the browser shows it
+//     in an <img> and stops feeding the MediaSource. Retained + replayed
+//     to each new subscriber (like the init segment). Full quality --
+//     image mode is not bounded by the video bitrate. A resumed fragment
+//     (type 3) flips the browser back to video.
 //
 // Thread-safe: one producer (the stage's cadence coroutine) calls the
 // set_*/push_*/close methods; any number of subscriber threads (the HTTP
@@ -49,6 +56,7 @@ public:
   static constexpr std::uint8_t kMsgInit     = 2;
   static constexpr std::uint8_t kMsgFragment = 3;
   static constexpr std::uint8_t kMsgAudio    = 4;
+  static constexpr std::uint8_t kMsgImage    = 5;
 
   // Opaque per-connection subscription; created by subscribe(), passed
   // back to wait_frame() / unsubscribe(). Defined in the .cc.
@@ -76,6 +84,11 @@ public:
 
   // Publish one PCM chunk (planes[c] = `frames` float samples for ch c).
   void push_audio(const float* const* planes, int channels, int frames);
+
+  // Latch + broadcast one still picture (an encoded PNG). Retained and
+  // replayed to every future subscriber (so a client that connects mid-
+  // still sees it immediately); replaces the previously retained still.
+  void push_image(const std::uint8_t* data, std::size_t n);
 
   // End the stream: every subscriber's wait_frame() returns null once its
   // queue drains. Idempotent.
@@ -118,6 +131,7 @@ private:
   std::string                              _config_json;
   Blob                                     _config_blob;   // retained
   Blob                                     _init_blob;     // retained
+  Blob                                     _image_blob;    // retained still
   bool                                     _has_video = false;
   bool                                     _has_audio = false;
   int                                      _width     = 0;

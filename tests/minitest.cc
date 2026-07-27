@@ -1,5 +1,6 @@
 #include "minitest.h"
 #include <algorithm>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <list>
@@ -78,6 +79,16 @@ TestCaseBase::report_failure(string_view file, size_t line)
 {
   cout << file << ":" << line << ": Failure" << endl;
   _result->register_failure(file, line);
+}
+
+void
+TestCaseBase::report_uncaught_exception(string_view what)
+{
+  // The literal is static, so the string_view the result keeps stays valid;
+  // `what` itself only has to live long enough to print here.
+  cout << "<uncaught exception>: Failure" << endl;
+  cout << "  Test threw and did not catch: " << what << endl;
+  _result->register_failure("<uncaught exception>", 0);
 }
 
 void
@@ -355,7 +366,16 @@ TestManagerImpl::run(const TestPlanConfig& cfg)
     GREEN_COUT("[ RUN      ] ");
     cout << test_id << endl;
     monotonic_time_stamp(&begin);
-    test_class->run();
+    // Contain a throwing test: report it as a failure and carry on, rather
+    // than letting the exception escape main and abort() the binary -- which
+    // would skip every remaining test and lose the summary entirely.
+    try {
+      test_class->run();
+    } catch (const std::exception& e) {
+      test_class->report_uncaught_exception(e.what());
+    } catch (...) {
+      test_class->report_uncaught_exception("unknown (non-std) exception");
+    }
     monotonic_time_stamp(&end);
     ++ tests_in_suite_ran;
     ++ tests_ran;

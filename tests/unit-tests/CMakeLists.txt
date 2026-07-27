@@ -33,6 +33,7 @@ set(LOCAL_TEST_SOURCES
   session-sandbox.cc
   model-catalog.cc
   model-remove-stage.cc
+  model-select-stage.cc
   plugin-abi.cc
   plugin-loader.cc
   onvif-soap.cc
@@ -111,6 +112,11 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-encoder.cc
         krea2-dit.cc
         krea2-vae.cc
+        mage-vae.cc
+        mage-dit.cc
+        mage-cond.cc
+        mage-watermark.cc
+        mage-t2i.cc
         krea2-t2i.cc
         krea2-dit-quant.cc
         krea2-lora.cc

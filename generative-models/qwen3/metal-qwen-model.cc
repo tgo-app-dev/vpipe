@@ -429,6 +429,7 @@ MetalQwenModel::load(const std::string& model_dir,
   m->_fn_rms_rope = m->_lib_rope.function("rms_rope_partial_f16");
   m->_fn_mrope = m->_lib_rope.function("mrope_partial_f16");
   m->_fn_sdpa_paged = m->_lib_sdpa.function("sdpa_paged_causal_f16");
+  m->_fn_sdpa_paged_kvl = m->_lib_sdpa.function("sdpa_paged_causal_kvl_f16");
   m->_fn_sdpa_paged_mb256 = m->_lib_sdpa.function("sdpa_paged_mb256_f16");
   // D<=128 multi-simdgroup paged decode (shared with the Llama path);
   // optional -- decode falls back to the scalar kernel if absent.
@@ -2542,8 +2543,9 @@ MetalQwenModel::set_i8_gemm(bool on)
 {
   // Dynamic-int8 accelerated prefill GEMMs (LOSSY, opt-in; see
   // shared/i8-gemm.h). The context self-gates on matrix cores + kernels;
-  // VPIPE_I8_GEMM overrides the flag either way.
-  auto i8 = std::make_unique<I8GemmContext>(_mc, on);
+  // VPIPE_I8_GEMM overrides the flag either way. The i8 kernels must match the
+  // model's element type (bf16 backbones -- QIE / MOSS -- feed bf16 buffers).
+  auto i8 = std::make_unique<I8GemmContext>(_mc, on, _cfg.use_bf16);
   _i8 = i8->enabled() ? std::move(i8) : nullptr;
 }
 
@@ -4931,7 +4933,9 @@ MetalQwenModel::forward_embeddings_hidden(ContextId cid, const SharedBuffer& x,
 metal_compute::SharedBuffer
 MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
                                         int n,
-                                        const std::vector<int>& tap_layers)
+                                        const std::vector<int>& tap_layers,
+                                        int key_valid_len,
+                                        const DeepstackInject* deepstack)
 {
   const int H = _cfg.hidden;
   if (n <= 0 || tap_layers.empty()
@@ -4942,10 +4946,19 @@ MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
       _mc->make_shared_buffer((std::size_t)tap_layers.size() * n * H * 2);
   if (taps.empty()) { return {}; }
   SharedBuffer hidden;   // discarded; return_hidden just skips the lm_head
+  // Only layers up to the deepest tap are needed -- stop there (the trailing
+  // layers' hidden states + KV are never read by the taps-only consumer). A
+  // deepstack injection layer must also be reached, though its indexes (0..N-1)
+  // are always below the tap layers.
+  int stop = 0;
+  for (int t : tap_layers) { stop = std::max(stop, t); }
+  if (deepstack != nullptr) {
+    for (int l : deepstack->layers) { stop = std::max(stop, l); }
+  }
   forward_chunk_(cid, x, n, nullptr, nullptr,
                  /*verify_all=*/false, /*preds_out=*/nullptr,
                  /*return_hidden=*/true, &hidden, /*allhidden_out=*/nullptr,
-                 &tap_layers, &taps);
+                 &tap_layers, &taps, key_valid_len, stop, deepstack);
   return taps;
 }
 
@@ -4957,7 +4970,9 @@ metal_compute::SharedBuffer
 MetalQwenModel::forward_embeddings_taps_mrope(
     ContextId cid, const SharedBuffer& x, int n,
     const std::vector<std::int32_t>& position_ids,
-    const std::vector<int>& tap_layers)
+    const std::vector<int>& tap_layers,
+    int key_valid_len,
+    const DeepstackInject* deepstack)
 {
   const int H = _cfg.hidden;
   if (n <= 0 || tap_layers.empty() ||
@@ -4994,10 +5009,16 @@ MetalQwenModel::forward_embeddings_taps_mrope(
       _mc->make_shared_buffer((std::size_t)tap_layers.size() * n * H * 2);
   if (taps.empty()) { return {}; }
   SharedBuffer hidden;
+  // Only run up to the deepest tap (and any deepstack injection layer).
+  int stop = 0;
+  for (int t : tap_layers) { stop = std::max(stop, t); }
+  if (deepstack != nullptr) {
+    for (int l : deepstack->layers) { stop = std::max(stop, l); }
+  }
   forward_chunk_(cid, x, n, &cosb, &sinb,
                  /*verify_all=*/false, /*preds_out=*/nullptr,
                  /*return_hidden=*/true, &hidden, /*allhidden_out=*/nullptr,
-                 &tap_layers, &taps);
+                 &tap_layers, &taps, key_valid_len, stop, deepstack);
   return taps;
 }
 
@@ -5598,7 +5619,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
                                bool return_hidden, SharedBuffer* hidden_out,
                                SharedBuffer* allhidden_out,
                                const std::vector<int>* tap_layers,
-                               SharedBuffer* taps_out)
+                               SharedBuffer* taps_out, int key_valid_len,
+                               int stop_after_layer,
+                               const DeepstackInject* deepstack)
 {
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -6057,7 +6080,29 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         else { rope(qt, Hq); rope(kt, Hkv); }
         kv_write(kt, kp);
         kv_write(vt, vp);
-        if (use_pset && kSkipMode != 1) {
+        if (key_valid_len > 0 && kSkipMode != 1) {
+          // Prefix key-mask (diffusion text encoder, right-padded prompt): every
+          // query attends only to keys with position < key_valid_len. Force the
+          // scalar kvl kernel -- this path runs once per generation over a short
+          // (n<=512) sequence, so its O(n^2) cost is immaterial and it keeps the
+          // masking off the hot flash/steel kernels entirely.
+          enc.set_function(_fn_sdpa_paged_kvl);
+          enc.set_buffer(0, qt);
+          enc.set_buffer(1, kp);
+          enc.set_buffer(2, vp);
+          enc.set_buffer(3, at);
+          enc.set_constant(4, scale);
+          enc.set_constant(5, D);
+          enc.set_constant(6, Hq);
+          enc.set_constant(7, Hkv);
+          enc.set_constant(8, n);
+          enc.set_constant(9, q_offset);
+          enc.set_constant(10, page_tokens);
+          enc.set_constant(11, n_pages);
+          enc.set_buffer(12, _pgtab);
+          enc.set_constant(13, key_valid_len);
+          enc.dispatch({32, (unsigned)Hq, (unsigned)n}, {32, 1, 1});
+        } else if (use_pset && kSkipMode != 1) {
           PrefillGqaAttnSet::Attn pa;
           pa.qt = &qt; pa.kpool = &kp; pa.vpool = &vp; pa.out = &at;
           pa.page_table = &_pgtab;
@@ -6478,6 +6523,29 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.set_buffer(7, x, roff);
         enc.dispatch({32, (unsigned)(H / 4), 1}, {32, 2, 1});
       }
+      // Qwen3-VL deepstack: after this layer, ADD the matching deepstack feature
+      // to the CONTIGUOUS image-token rows (x[row0 .. row0+rows), same dtype as
+      // the residual stream). Done BEFORE the tap copy so a coinciding tap layer
+      // captures the injected state (HF hidden_states[L+1] includes it) and the
+      // next layer reads the injected residual.
+      if (deepstack != nullptr && deepstack->rows > 0) {
+        for (std::size_t j = 0; j < deepstack->layers.size(); ++j) {
+          if (deepstack->layers[j] != L
+              || j >= deepstack->feats.size()
+              || deepstack->feats[j] == nullptr
+              || deepstack->feats[j]->empty()) {
+            continue;
+          }
+          const std::size_t off = (std::size_t)deepstack->row0 * H * 2;
+          const int cnt = deepstack->rows * H;
+          enc.set_function(_fn_residual);
+          enc.set_buffer(0, x, off);
+          enc.set_buffer(1, *deepstack->feats[j]);
+          enc.set_buffer(2, x, off);
+          enc.set_constant(3, cnt);
+          enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+        }
+      }
       if (kLayerDump != nullptr) { tap(x, dbgL[(std::size_t)L], n * H); }
       // Krea-2 encoder: snapshot the residual after this layer into the
       // requested tap slots (un-normed [n,H] == HF hidden_states[L+1]).
@@ -6493,6 +6561,12 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.dispatch({(unsigned)count, 1, 1}, {256, 1, 1});
         }
       }
+      // Taps-only early exit: once the deepest requested tap layer is captured,
+      // the remaining layers (and their KV) are never read -- skip them. Used by
+      // the diffusion conditioner (flux2 taps {9,18,27} of a 36-layer encoder ->
+      // skips the trailing 9 layers, ~25%). No-op (stop_after_layer < 0) for the
+      // LM path, which needs the final norm + lm_head.
+      if (stop_after_layer >= 0 && L >= stop_after_layer) { break; }
     }
 
     if (verify_all && preds_out) {

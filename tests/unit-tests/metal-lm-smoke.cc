@@ -1777,6 +1777,59 @@ TEST(metal_lm_smoke, gemma_dense_bf16_generates) {
   EXPECT_TRUE(out.find("Paris") != std::string::npos);
 }
 
+// Per-tensor mixed-precision (OptiQ) Gemma-4-12B coherent-generation smoke. The
+// mlx-community gemma-4-12B-it-OptiQ-4bit pack quantizes each projection at its
+// OWN width (some 4-bit, some 8-bit, varying per layer) -- the metal gemma model
+// detects this (_mixed), binds each projection with its own bits and de-fuses
+// gate|up / QKV whenever widths differ, then dispatches the width-correct
+// w4/w8 kernel per tensor. A wrong per-tensor binding (an 8-bit weight parsed at
+// the 4-bit stride) yields word-salad, so the greedy factual answer is the
+// bring-up gate (token-exact-vs-omlx is a separate reference-tooling check).
+// Env: VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH = the OptiQ model dir.
+TEST(metal_lm_smoke, gemma12b_optiq_generates) {
+  const char* path = std::getenv("VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc  = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND"); return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512; spec.max_pages = 16;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm && lm->valid());
+  auto& tok = lm->tokenizer();
+  auto tpl = genai::make_chat_template(lm->config().architecture, tok);
+  ASSERT_TRUE((bool)tpl);
+
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(
+      "Name the capital of France and give one sentence about it.",
+      /*is_first_turn=*/true, &ids);
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  std::int32_t t = lm->prefill(ctx, ids);
+  std::vector<std::int32_t> gen;
+  for (int i = 0; i < 48 && t >= 0; ++i) {
+    if (tpl->is_stop_token(t)) { break; }
+    gen.push_back(t);
+    t = lm->next_token(ctx);
+  }
+  const std::string out =
+      tok.decode(std::span<const std::int32_t>(gen.data(), gen.size()));
+  std::printf("[gemma12b_optiq] OUT: %s\n", out.c_str());
+  std::string idline;
+  for (std::int32_t g : gen) { idline += std::to_string(g) + " "; }
+  std::printf("[gemma12b_optiq] IDS: %s\n", idline.c_str());
+  EXPECT_TRUE(gen.size() >= 5);
+  EXPECT_TRUE(out.find("Paris") != std::string::npos);
+}
+
 // The REALTIME fix: don't just strip the thought block after the fact (that
 // still pays its decode cost) -- forbid the reasoning-channel tokens at the
 // logit level so the model never GENERATES the block, keeping decode short.
@@ -7179,6 +7232,114 @@ TEST(metal_lm_smoke, gemma12b_unified_vqa_e2e) {
   EXPECT_TRUE(!text.empty());
 }
 
+// Gemma-4-12B OptiQ (per-tensor mixed-precision) IMAGE end-to-end: the same
+// unified-embedder VQA path, but the model is the mixed 4/8-bit OptiQ pack and
+// its vision/audio adaptor ships in the optiq/optiq_vision.safetensors shard
+// (dense bf16). Confirms the raw-safetensors unified embedder loads
+// (has_unified_safetensors -> load_safetensors), encode_image projects raw
+// patches to soft tokens, and the mixed forward consumes text+image tokens.
+// Gated on VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH + VPIPE_GEMMA12B_TEST_IMAGE.
+TEST(metal_lm_smoke, gemma12b_optiq_vqa_e2e) {
+  const char* dir = std::getenv("VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH");
+  const char* imgp = std::getenv("VPIPE_GEMMA12B_TEST_IMAGE");
+  if (!dir || !*dir || !imgp || !*imgp) { return; }
+  std::FILE* f = std::fopen(imgp, "rb");
+  if (!f) { return; }
+  char magic[3] = {0};
+  int W = 0, H = 0, maxv = 0;
+  if (std::fscanf(f, "%2s %d %d %d", magic, &W, &H, &maxv) != 4 ||
+      std::string(magic) != "P6" || W <= 0 || H <= 0) {
+    std::fclose(f); return;
+  }
+  std::fgetc(f);
+  std::vector<std::uint8_t> inter((std::size_t)3 * H * W);
+  const std::size_t got = std::fread(inter.data(), 1, inter.size(), f);
+  std::fclose(f);
+  ASSERT_TRUE(got == inter.size());
+  std::vector<std::uint8_t> planar((std::size_t)3 * H * W);
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        planar[((std::size_t)c * H + y) * W + x] =
+            inter[((std::size_t)y * W + x) * 3 + c];
+      }
+    }
+  }
+
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) {
+    ::unsetenv("VPIPE_LLM_BACKEND"); return;
+  }
+  auto* mgr = sess.generative_model_manager();
+  if (!mgr) { ::unsetenv("VPIPE_LLM_BACKEND"); return; }
+  genai::LoadSpec spec;
+  spec.hf_dir = dir;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 1024;
+  spec.max_pages = 8;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+
+  // The unified embedder must be built from the optiq_vision safetensors shard.
+  auto* uni = lm->gemma4_unified_embedder();
+  ASSERT_TRUE(uni != nullptr);
+  ASSERT_TRUE(uni->has_vision());
+
+  auto enc = uni->encode_image(planar.data(), H, W);
+  ASSERT_TRUE(enc.has_value());
+  ASSERT_TRUE(enc->n_tokens > 0);
+  const int n_im = enc->n_tokens;
+
+  auto tpl = genai::make_chat_template(lm->config().architecture,
+                                     lm->tokenizer());
+  ASSERT_TRUE(tpl != nullptr);
+  const std::int32_t image_pad = tpl->image_pad_token_id();
+  std::vector<std::int32_t> ids;
+  const int counts[1] = {n_im};
+  tpl->render_user_turn_vlm("Describe this image in one sentence.",
+                            std::span<const int>(counts, 1),
+                            /*is_first_turn=*/true, &ids);
+  ASSERT_TRUE(!ids.empty());
+
+  std::vector<genai::TokenRef> refs;
+  refs.reserve(ids.size());
+  int img_off = 0;
+  for (std::int32_t id : ids) {
+    genai::TokenRef r;
+    if (id == image_pad && img_off < n_im) {
+      r.kind = genai::TokenRef::Kind::ImageTokens;
+      r.embeddings_host = &enc->rows;
+      r.image_token_offset = img_off++;
+    } else {
+      r.kind = genai::TokenRef::Kind::Text;
+      r.text_id = id;
+    }
+    refs.push_back(r);
+  }
+  ASSERT_TRUE(img_off == n_im);
+
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  const std::int32_t first = lm->prefill_multimodal_metal(
+      ctx, std::span<const genai::TokenRef>(refs), {});
+  ASSERT_TRUE(first >= 0);
+  std::vector<std::int32_t> gen;
+  std::int32_t nx = first;
+  for (int i = 0; i < 64 && nx >= 0 && !tpl->is_stop_token(nx); ++i) {
+    gen.push_back(nx);
+    nx = lm->next_token(ctx);
+  }
+  const auto text = lm->tokenizer().decode(
+      std::span<const std::int32_t>(gen.data(), gen.size()));
+  std::printf("[metal_lm_smoke.gemma12b_optiq_vqa] %dx%d -> %d img tok | "
+              "gen(%zu)='%s'\n", W, H, n_im, gen.size(), text.c_str());
+  EXPECT_TRUE(gen.size() >= 2u);
+  EXPECT_TRUE(!text.empty());
+}
+
 // Gemma-4-12B unified AUDIO+VIDEO end-to-end: mirrors the realtime-vqa
 // metal path exactly -- render_video_prefix (1 frame) + render_audio_block
 // (the new inline audio block) + render_vlm_completion, splicing BOTH image
@@ -7296,6 +7457,127 @@ TEST(metal_lm_smoke, gemma12b_unified_av_e2e) {
   const auto text = lm->tokenizer().decode(
       std::span<const std::int32_t>(gen.data(), gen.size()));
   std::printf("[metal_lm_smoke.gemma12b_unified_av] img=%d aud=%d tok | "
+              "gen(%zu)='%s'\n", n_im, n_au, gen.size(), text.c_str());
+  EXPECT_TRUE(gen.size() >= 2u);
+  EXPECT_TRUE(!text.empty());
+}
+
+// Gemma-4-12B OptiQ (mixed-precision) AUDIO+VIDEO end-to-end: the same unified
+// realtime-vqa path (image + synthetic-tone audio spliced as soft tokens ->
+// prefill_multimodal_metal -> greedy), but the model is the mixed 4/8-bit
+// OptiQ pack whose vision AND audio adaptors ship in optiq_vision.safetensors.
+// Confirms has_vision()+has_audio(), encode_audio, and the mixed forward over a
+// text+image+audio token stream. Gated on VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH
+// + VPIPE_GEMMA12B_TEST_IMAGE.
+TEST(metal_lm_smoke, gemma12b_optiq_av_e2e) {
+  const char* dir = std::getenv("VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH");
+  const char* imgp = std::getenv("VPIPE_GEMMA12B_TEST_IMAGE");
+  if (!dir || !*dir || !imgp || !*imgp) { return; }
+  std::FILE* f = std::fopen(imgp, "rb");
+  if (!f) { return; }
+  char magic[3] = {0};
+  int W = 0, H = 0, maxv = 0;
+  if (std::fscanf(f, "%2s %d %d %d", magic, &W, &H, &maxv) != 4 ||
+      std::string(magic) != "P6") { std::fclose(f); return; }
+  std::fgetc(f);
+  std::vector<std::uint8_t> inter((std::size_t)3 * H * W);
+  if (std::fread(inter.data(), 1, inter.size(), f) != inter.size()) {
+    std::fclose(f); return;
+  }
+  std::fclose(f);
+  std::vector<std::uint8_t> planar((std::size_t)3 * H * W);
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        planar[((std::size_t)c * H + y) * W + x] =
+            inter[((std::size_t)y * W + x) * 3 + c];
+      }
+    }
+  }
+
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { ::unsetenv("VPIPE_LLM_BACKEND"); return; }
+  auto* mgr = sess.generative_model_manager();
+  if (!mgr) { ::unsetenv("VPIPE_LLM_BACKEND"); return; }
+  genai::LoadSpec spec;
+  spec.hf_dir = dir;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 1024;
+  spec.max_pages = 8;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  auto* uni = lm->gemma4_unified_embedder();
+  ASSERT_TRUE(uni != nullptr && uni->has_vision() && uni->has_audio());
+
+  auto ei = uni->encode_image(planar.data(), H, W);
+  ASSERT_TRUE(ei.has_value() && ei->n_tokens > 0);
+  const int n_im = ei->n_tokens;
+  std::vector<float> pcm(32000);
+  for (std::size_t i = 0; i < pcm.size(); ++i) {
+    pcm[i] = 0.2f * std::sin(2.0f * 3.14159265f * 440.0f * i / 16000.0f);
+  }
+  auto ea = uni->encode_audio(pcm.data(), pcm.size());
+  ASSERT_TRUE(ea.has_value() && ea->n_tokens > 0);
+  const int n_au = ea->n_tokens;
+
+  auto tpl = genai::make_chat_template(lm->config().architecture,
+                                     lm->tokenizer());
+  ASSERT_TRUE(tpl != nullptr);
+  const std::int32_t video_pad = tpl->video_pad_token_id();
+  const std::int32_t audio_pad = tpl->audio_pad_token_id();
+  ASSERT_TRUE(audio_pad >= 0);
+
+  const float fts[1] = {0.0f};
+  const int counts[1] = {n_im};
+  std::vector<std::int32_t> ids;
+  ASSERT_TRUE(tpl->render_video_prefix(std::span<const float>(fts, 1),
+                                       std::span<const int>(counts, 1),
+                                       /*is_first_turn=*/true,
+                                       std::string_view(), &ids));
+  ASSERT_TRUE(tpl->render_audio_block(
+      "Audio captured during this scene (<0.0 seconds> to <2.0 seconds>):\n",
+      n_au, &ids));
+  ASSERT_TRUE(tpl->render_vlm_completion("Describe the scene.", &ids));
+
+  std::vector<genai::TokenRef> refs;
+  refs.reserve(ids.size());
+  int img_off = 0, aud_off = 0;
+  for (std::int32_t id : ids) {
+    genai::TokenRef r;
+    if (id == video_pad && img_off < n_im) {
+      r.kind = genai::TokenRef::Kind::ImageTokens;
+      r.embeddings_host = &ei->rows;
+      r.image_token_offset = img_off++;
+    } else if (id == audio_pad && aud_off < n_au) {
+      r.kind = genai::TokenRef::Kind::AudioTokens;
+      r.embeddings_host = &ea->rows;
+      r.audio_token_offset = aud_off++;
+    } else {
+      r.kind = genai::TokenRef::Kind::Text;
+      r.text_id = id;
+    }
+    refs.push_back(r);
+  }
+  EXPECT_TRUE(img_off == n_im);
+  EXPECT_TRUE(aud_off == n_au);
+
+  auto ctx = lm->make_context();
+  ASSERT_TRUE(ctx.valid());
+  const std::int32_t first = lm->prefill_multimodal_metal(
+      ctx, std::span<const genai::TokenRef>(refs), {});
+  ASSERT_TRUE(first >= 0);
+  std::vector<std::int32_t> gen;
+  std::int32_t nx = first;
+  for (int i = 0; i < 48 && nx >= 0 && !tpl->is_stop_token(nx); ++i) {
+    gen.push_back(nx);
+    nx = lm->next_token(ctx);
+  }
+  const auto text = lm->tokenizer().decode(
+      std::span<const std::int32_t>(gen.data(), gen.size()));
+  std::printf("[metal_lm_smoke.gemma12b_optiq_av] img=%d aud=%d tok | "
               "gen(%zu)='%s'\n", n_im, n_au, gen.size(), text.c_str());
   EXPECT_TRUE(gen.size() >= 2u);
   EXPECT_TRUE(!text.empty());
@@ -9608,6 +9890,21 @@ TEST(metal_lm_smoke, gemma12b_batched_step_matches_serial) {
   EXPECT_TRUE(r.total > 0);
   EXPECT_TRUE(r.matched == r.total);
   std::printf("[metal_lm_smoke.gemma12b_batched_step] matched %d/%d\n",
+              r.matched, r.total);
+}
+
+// OptiQ 12B: the per-tensor mixed-precision BATCHED decode (realtime-vqa
+// path) must match serial next_token token-for-token. Exercises the
+// bit-aware batched projection dispatch (encode_batched_step_) + the de-fused
+// mixed geglu. Gated on VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, gemma12b_optiq_batched_step_matches_serial) {
+  const char* path = std::getenv("VPIPE_GEMMA12B_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  auto r = gemma_lm_batched_run_(path);
+  if (!r.loaded) { return; }
+  EXPECT_TRUE(r.total > 0);
+  EXPECT_TRUE(r.matched == r.total);
+  std::printf("[metal_lm_smoke.gemma12b_optiq_batched_step] matched %d/%d\n",
               r.matched, r.total);
 }
 

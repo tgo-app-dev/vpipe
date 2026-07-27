@@ -9,15 +9,18 @@ using metal_compute::ComputeEncoder;
 using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
 
-I8GemmContext::I8GemmContext(MetalCompute* mc, bool want) : _mc(mc)
+I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16) : _mc(mc)
 {
   bool on = want;
   if (const char* e = std::getenv("VPIPE_I8_GEMM")) {
     on = std::atoi(e) != 0;                    // env overrides either way
   }
   if (!on || mc == nullptr || !mc->supports_matrix_cores()) { return; }
-  _lib_q = mc->load_library("affine_dequant");
-  _lib_g = mc->load_library("dense_gemm_mma");
+  // The kernels' float I/O is VPIPE_ELT; load the _bf16 twins for a bf16
+  // caller (its bf16 activations/weights would be garbage through the f16
+  // kernels). Entry-point names keep the historical "_f16" label.
+  _lib_q = mc->load_library(bf16 ? "affine_dequant_bf16" : "affine_dequant");
+  _lib_g = mc->load_library(bf16 ? "dense_gemm_mma_bf16" : "dense_gemm_mma");
   _fn_quant = _lib_q.function("quant_f16_i8_row_g512");
   _fn_gemm = _lib_g.function("gemm_i8i8_sc_f16_n64_g512");
   _on = _fn_quant.valid() && _fn_gemm.valid();

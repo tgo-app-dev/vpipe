@@ -143,12 +143,25 @@ class MetalKrea2Vae {
   // cores) this rides the hardware matmul2d dense GEMM when M is tall enough to
   // amortize the tiled kernel; otherwise the steel dense_gemm_bias. Used by
   // both decode() and encode() (their conv3x3/conv1x1 helpers).
+  // y_row0: write the M-row result into y at output row y_row0 (the row-tiled
+  // im2col conv feeds one band into out[r0:r0+M]); 0 = at y[0].
   void conv_gemm_bias_(metal_compute::ComputeEncoder& enc,
                        const metal_compute::SharedBuffer& x,
                        const metal_compute::SharedBuffer& w,
                        const metal_compute::SharedBuffer& b,
                        const metal_compute::SharedBuffer& y, int M, int N,
-                       int K);
+                       int K, int y_row0 = 0);
+
+  // Row-tiled im2col 3x3 conv (stride 1 or 2) into a pre-alloc'd `out`: streams
+  // output-row bands through `col` (bounded to `cap` ELEMS) instead of the full
+  // [OH*OW, 9*cin] scratch. Each band's GEMM is one un-chunked dispatch under
+  // the matmul2d M-corruption threshold (band <= _mma_max_m/2). Shared by
+  // decode + encode; the caller runs the hw-conv fast path first.
+  void tiled_conv3x3_(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& in,
+                      const metal_compute::SharedBuffer& out, int H, int W,
+                      const Conv& c, int stride,
+                      const metal_compute::SharedBuffer& col, std::size_t cap);
 
   // Fused 3x3 conv2d on the matrix units (im2col staged in threadgroup memory ->
   // matmul2d): out[OH*OW, Cout] = conv(in[H*W, Cin], w[Cout, 9*Cin]) + bias, pad
@@ -181,7 +194,8 @@ class MetalKrea2Vae {
   // kernels im2col_hwc_3x3{,_s2} / upsample_nearest2x_hwc in llm_elementwise).
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_rms, _fn_mul_sigmoid,
-      _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2, _fn_upsample;
+      _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2, _fn_upsample,
+      _fn_im2col_tiled, _fn_im2col_s2_tiled;
   // Matrix-core FULL flash-attention for the mid-block self-attention (D = the
   // mid channel dim). Replaces the scalar O(N^2) sdpa_full_f16 that dominates
   // decode at high res. Loaded best-effort (matrix cores only, D in {384,512});

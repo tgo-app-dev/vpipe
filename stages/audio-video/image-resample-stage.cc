@@ -59,6 +59,8 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   else                       { _mode = 0; }   // pad (default)
 
   const string alg = attr_str("algorithm");
+  if      (alg == "lanczos")  { _alg = 1; }
+  else                        { _alg = 0; }   // bilinear (default)
   // Deferred validation: the ctor never throws (Stage::fail_config).
   // At least one of width / height must be positive; a missing (<= 0)
   // axis is inferred per-frame from the source aspect ratio.
@@ -66,9 +68,9 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
     fail_config(fmt("ImageResampleStage('{}'): at least one of width / "
                     "height must be > 0 (got {}x{})",
                     this->id(), _out_w, _out_h));
-  } else if (!alg.empty() && alg != "bilinear") {
+  } else if (!alg.empty() && alg != "bilinear" && alg != "lanczos") {
     fail_config(fmt("ImageResampleStage('{}'): unknown algorithm '{}' "
-                    "(only 'bilinear' is supported)", this->id(), alg));
+                    "(supported: 'bilinear', 'lanczos')", this->id(), alg));
   }
   allocate_oports(spec().oports.size());
 }
@@ -102,7 +104,9 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "manual: resample ratio (output px per source px, > 0)",
    .def_real = 1.0},
   {.key = "algorithm", .type = ConfigType::String,
-   .doc = "interpolation algorithm (only 'bilinear' for now)",
+   .doc = "interpolation algorithm: 'bilinear' (fast) | 'lanczos' "
+          "(Lanczos-3, anti-aliased, matches PIL LANCZOS -- prefer for "
+          "downscaling)",
    .def_str = "bilinear"},
 };
 const PortSpec kIports[] = {
@@ -220,6 +224,73 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
   }
 }
 
+void
+ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
+                                 int out_w, int out_h,
+                                 uint8_t* dst, bool is_f32) const
+{
+  const metal_compute::ResampleGeom g =
+      metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
+          _mode, _src_x, _src_y, static_cast<float>(_scale));
+  const int planeS = in_w * in_h;
+  const int planeD = out_w * out_h;
+  const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
+  const float pad[3] = { _pad_r / div, _pad_g / div, _pad_b / div };
+  const float* sf = reinterpret_cast<const float*>(src);
+  float* df = reinterpret_cast<float*>(dst);
+  auto rd = [&](int c, int x, int y) -> float {
+    const int i = c * planeS + y * in_w + x;
+    return is_f32 ? sf[i] : static_cast<float>(src[i]);
+  };
+  auto wr = [&](int c, int x, int y, float v) {
+    const int i = c * planeD + y * out_w + x;
+    if (is_f32) { df[i] = v; }
+    else { dst[i] = static_cast<uint8_t>(clamp(v + 0.5f, 0.0f, 255.0f)); }
+  };
+  if (g.new_w <= 0 || g.new_h <= 0) {           // degenerate -> all pad
+    for (int y = 0; y < out_h; ++y) {
+      for (int x = 0; x < out_w; ++x) {
+        for (int c = 0; c < 3; ++c) { wr(c, x, y, pad[c]); }
+      }
+    }
+    return;
+  }
+  std::vector<int> bx, by;
+  std::vector<float> wx, wy;
+  const int ksx = metal_compute::build_lanczos_coeffs(
+      in_w, g.src_x0, g.new_w, g.inv_x, bx, wx);
+  const int ksy = metal_compute::build_lanczos_coeffs(
+      in_h, g.src_y0, g.new_h, g.inv_y, by, wy);
+  for (int y = 0; y < out_h; ++y) {
+    for (int x = 0; x < out_w; ++x) {
+      const bool out = x < g.pad_x || x >= g.pad_x + g.new_w
+                    || y < g.pad_y || y >= g.pad_y + g.new_h;
+      if (out) {
+        for (int c = 0; c < 3; ++c) { wr(c, x, y, pad[c]); }
+        continue;
+      }
+      const int cx = x - g.pad_x, cy = y - g.pad_y;
+      const int xmin = bx[static_cast<size_t>(cx)];
+      const int ymin = by[static_cast<size_t>(cy)];
+      for (int c = 0; c < 3; ++c) {
+        float acc = 0.0f;
+        for (int ty = 0; ty < ksy; ++ty) {
+          const float wyt = wy[static_cast<size_t>(cy) * ksy + ty];
+          if (wyt == 0.0f) { continue; }
+          const int sy = clamp(ymin + ty, 0, in_h - 1);
+          float racc = 0.0f;
+          for (int tx = 0; tx < ksx; ++tx) {
+            const int sx = clamp(xmin + tx, 0, in_w - 1);
+            racc += wx[static_cast<size_t>(cx) * ksx + tx] * rd(c, sx, sy);
+          }
+          acc += wyt * racc;
+        }
+        wr(c, x, y, acc);
+      }
+    }
+  }
+}
+
 Job
 ImageResampleStage::process(RuntimeContext& ctx)
 {
@@ -278,10 +349,16 @@ ImageResampleStage::process(RuntimeContext& ctx)
     if (src_h) {
       auto dst = metal_compute::make_shared_storage(
           *_mc, static_cast<size_t>(3) * out_w * out_h, session());
-      if (dst && metal_compute::resample_planar_u8_to_u8(
-              *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
-              _mode, _src_x, _src_y, static_cast<float>(_scale),
-              _pad_r, _pad_g, _pad_b, session())) {
+      const bool ok = dst && (_alg == 1
+          ? metal_compute::resample_lanczos_planar_u8_to_u8(
+                *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
+                _mode, _src_x, _src_y, static_cast<float>(_scale),
+                _pad_r, _pad_g, _pad_b, session())
+          : metal_compute::resample_planar_u8_to_u8(
+                *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
+                _mode, _src_x, _src_y, static_cast<float>(_scale),
+                _pad_r, _pad_g, _pad_b, session()));
+      if (ok) {
         TensorBeat tb;
         tb.dtype = TensorBeat::DType::U8;
         tb.shape = { 3, out_h, out_w };
@@ -301,8 +378,12 @@ ImageResampleStage::process(RuntimeContext& ctx)
   tb.shape = { 3, out_h, out_w };
   tb.sideband = tin->sideband;
   tb.resize_contiguous(static_cast<size_t>(3) * out_w * out_h);
-  cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(),
-                tin->dtype == TensorBeat::DType::F32);
+  const bool is_f32 = tin->dtype == TensorBeat::DType::F32;
+  if (_alg == 1) {
+    cpu_lanczos_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32);
+  } else {
+    cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32);
+  }
   co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
 }
 

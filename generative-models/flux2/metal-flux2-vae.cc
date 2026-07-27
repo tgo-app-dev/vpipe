@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -250,12 +251,16 @@ MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
   m->_fn_im2col      = m->_lib_elt.function("im2col_hwc_3x3_f16");
+  m->_fn_im2col_tiled = m->_lib_elt.function("im2col_hwc_3x3_tiled_f16");
   m->_fn_im2col_s2   = m->_lib_elt.function("im2col_hwc_3x3_s2_f16");
+  m->_fn_im2col_s2_tiled =
+      m->_lib_elt.function("im2col_hwc_3x3_s2_tiled_f16");
   m->_fn_upsample    = m->_lib_elt.function("upsample_nearest2x_hwc_f16");
   m->_fn_bias_add    = m->_lib_elt.function("bias_add_rows_f16");
   if (!m->_fn_gemm_bias.valid() || !m->_fn_groupnorm.valid() ||
       !m->_fn_mul_sigmoid.valid() || !m->_fn_residual.valid() ||
       !m->_fn_clamp.valid() || !m->_fn_sdpa.valid() || !m->_fn_im2col.valid() ||
+      !m->_fn_im2col_tiled.valid() || !m->_fn_im2col_s2_tiled.valid() ||
       !m->_fn_im2col_s2.valid() || !m->_fn_upsample.valid() ||
       !m->_fn_bias_add.valid()) {
     return nullptr;
@@ -486,9 +491,13 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
 void
 MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
                                const SharedBuffer& w, const SharedBuffer& b,
-                               const SharedBuffer& y, int M, int N, int K)
+                               const SharedBuffer& y, int M, int N, int K,
+                               int y_row0)
 {
-  // y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N]). M5 matmul2d for tall M, else steel.
+  // y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N]), written into y at output row y_row0
+  // (a row-tiled im2col conv feeds one band into out[y_row0:y_row0+M]). M5
+  // matmul2d for tall M, else steel.
+  const std::size_t ybase = (std::size_t)y_row0 * N;   // element offset into y
   if (_use_mma2 && M >= _mma_min_m && N >= _mma_min_n) {
     // Tile-adaptive matrix-core dense GEMM (no bias): 128x128 for K < 6144,
     // 128x256 for deeper K. The matmul2d tensor extents clamp M/N tails, so M
@@ -508,7 +517,7 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
       enc.set_buffer(0, x, (std::size_t)r0 * K * 2);
       enc.set_buffer(1, w);
       enc.set_buffer(2, w);        // bias slot unused (has_bias=0)
-      enc.set_buffer(3, y, (std::size_t)r0 * N * 2);
+      enc.set_buffer(3, y, (ybase + (std::size_t)r0 * N) * 2);
       enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, mc);
       enc.set_constant(7, 0);
       enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
@@ -518,7 +527,7 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
       // Fold bias[N] across ALL M rows at once (a plain kernel, no M limit).
       const std::size_t total = (std::size_t)M * N;
       enc.set_function(_fn_bias_add);
-      enc.set_buffer(0, y); enc.set_buffer(1, b);
+      enc.set_buffer(0, y, ybase * 2); enc.set_buffer(1, b);
       enc.set_constant(2, N); enc.set_constant(3, (unsigned)total);
       // 2D grid {N, M}: gid = row*N + col (a 1D {M*N} grid overflows past ~2K).
       enc.dispatch({(unsigned)N, (unsigned)M, 1}, {256, 1, 1});
@@ -527,11 +536,45 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
   }
   enc.set_function(_fn_gemm_bias);
   enc.set_buffer(0, x); enc.set_buffer(1, w);
-  enc.set_buffer(2, b.empty() ? w : b); enc.set_buffer(3, y);
+  enc.set_buffer(2, b.empty() ? w : b); enc.set_buffer(3, y, ybase * 2);
   enc.set_constant(4, M); enc.set_constant(5, N); enc.set_constant(6, K);
   enc.set_constant(7, b.empty() ? 0 : 1);
   enc.dispatch({(unsigned)(((N + 15) / 16) * 16),
                 (unsigned)(((M + 15) / 16) * 16), 1}, {16, 16, 1});
+}
+
+void
+MetalFlux2Vae::tiled_conv3x3_(ComputeEncoder& enc, const SharedBuffer& in,
+                              const SharedBuffer& out, int H, int W,
+                              const Conv& c, int stride, const SharedBuffer& col,
+                              std::size_t cap)
+{
+  const int OH = (stride == 2) ? H / 2 : H;
+  const int OW = (stride == 2) ? W / 2 : W;
+  const std::size_t ohw = (std::size_t)OH * OW;
+  const std::size_t per_row = (std::size_t)9 * c.cin;
+  std::size_t tile_rows = (per_row > 0) ? (cap / per_row) : ohw;
+  // Safe-cap so each band's GEMM is one un-chunked matmul2d under the
+  // M-corruption threshold (measured 2^18 clean / 2^19 banded for large-K 3x3).
+  if (_mma_max_m > 0 && tile_rows > (std::size_t)_mma_max_m / 2) {
+    tile_rows = (std::size_t)_mma_max_m / 2;
+  }
+  if (tile_rows > ohw) { tile_rows = ohw; }
+  if (tile_rows < 1) { tile_rows = 1; }
+  const metal_compute::ComputeFunction& fn =
+      (stride == 2) ? _fn_im2col_s2_tiled : _fn_im2col_tiled;
+  // The whole [H*W, cin] input stays live so the 3x3 halo spans band edges; the
+  // shared `col` is reused across bands (serial dispatch orders band b's GEMM
+  // before band b+1 overwrites col).
+  for (std::size_t r0 = 0; r0 < ohw; r0 += tile_rows) {
+    const int mc = (int)std::min(tile_rows, ohw - r0);
+    enc.set_function(fn);
+    enc.set_buffer(0, in); enc.set_buffer(1, col);
+    enc.set_constant(2, H); enc.set_constant(3, W); enc.set_constant(4, c.cin);
+    enc.set_constant(5, (int)r0); enc.set_constant(6, mc);
+    enc.dispatch({(unsigned)(9 * c.cin), (unsigned)mc, 1}, {64, 1, 1});
+    conv_gemm_bias_(enc, col, c.w, c.b, out, mc, c.cout, c.k, (int)r0);
+  }
 }
 
 std::size_t
@@ -540,23 +583,41 @@ MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
   if (h16 <= 0 || w16 <= 0) { return 0; }
   const std::size_t Hout = (std::size_t)h16 * 16;
   const std::size_t Wout = (std::size_t)w16 * 16;
-  const std::size_t base = (std::size_t)_cfg.block_out[0];
+  // The top up-block's FIRST resnet reads block_out[1] channels (256) at full
+  // res (the upsampled level-2 output, before it reduces to block_out[0]=128),
+  // so the largest full-res im2col is [Hout*Wout, 9*block_out[1]] -- TWICE the
+  // conv_out/block_out[0] figure. Budget the real peak (block_out[0] alone
+  // under-modelled it 2x and risked a false-pass -> a mid-flight OOM).
+  const std::size_t base =
+      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+  const std::size_t top = Hout * Wout * base * 2;  // one full-res base-ch f16 buf
   // The per-up-block command-buffer split (default on; VPIPE_FLUX2_NO_VAE_SPLIT
   // opts out) commits + frees each up-level, so the resident peak is ONE
-  // level's working set, not the summed up-path. That peak is the top-res
-  // im2col scratch [Hout*Wout, 9*base]: conv_out (3 ch) can't use the hw conv
-  // (cout % 64 != 0) so it falls back to im2col even in hwconv mode -- it is the
-  // single largest buffer. Budget it + ~50% for the level's I/O activations. A
-  // miss is caught cleanly by the per-level wait_ok() backstop; the previous
-  // top*10 hwconv figure UNDER-modelled this im2col and risked a false pass.
-  const std::size_t im2col = Hout * Wout * 9 * base * 2;
-  if (std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr) {
-    return im2col + im2col / 2;             // split on: one up-level
+  // level's working set, not the summed up-path.
+  const bool split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
+  if (_use_hwconv) {
+    // Hardware-conv path (DEFAULT): the big convs run through conv3x3_hw_ and
+    // NEVER materialize the [Hout*Wout, 9*base] im2col scratch -- only the tiny
+    // 3-ch fallback convs im2col (their own small col buffers). The resident
+    // peak is the per-level activation pool. MEASURED ~5.5x `top` at 1024^2
+    // (2.8 GB decode delta) on the split path; budget 7x for the hw-conv
+    // workspace + margin (a miss is caught cleanly by the per-level wait_ok()).
+    // The old 9x-im2col figure (13.5x top split-on) was a ~2.3x PHANTOM -- it
+    // budgeted scratch this path never allocates and, once the doubled `base`
+    // pushed it to 6912 MB, falsely rejected a 1024 decode sharing the box with
+    // other resident models (it fit in ~3 GB the whole time).
+    return split ? top * 7 : top * 10;     // split frees per level; no-split sums
   }
-  // Split off: the whole up-path is one command buffer -- keep the summed,
-  // conservative figure.
-  const std::size_t top = Hout * Wout * base * 2;
-  return _use_hwconv ? top * 10 : top * 9 * 2;
+  // im2col fallback (VPIPE_VAE_NO_HWCONV, or any non-matrix-core M4 GPU): the big
+  // convs materialize im2col, but conv3x3 ROW-TILES it into bands bounded to fit
+  // the free headroom (im2col_cap), so the split-on peak is the activation pool
+  // + one band -- the SAME order as the hw path (the band never exceeds the
+  // headroom). Budget top*7 like the hw path; the actual band shrinks to fit.
+  // Split-off keeps everything in one command buffer (pool holds every level),
+  // so keep the conservative summed im2col figure there.
+  if (split) { return top * 7; }
+  const std::size_t im2col = Hout * Wout * 9 * base * 2;
+  return im2col * 2;
 }
 
 SharedBuffer
@@ -579,8 +640,10 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   int h8 = h16 * P, w8 = w16 * P;                // latent spatial after unpatch
   const int Hout = h16 * 16, Wout = w16 * 16;
 
+  std::size_t decode_headroom = 0;   // free working set, for the im2col band cap
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    decode_headroom = (mb.recommended != 0) ? mb.headroom : 0;
     const std::size_t need = decode_peak_bytes(h16, w16);
     if (mb.recommended != 0 && !mb.fits(need)) {
       return fail(fmt(
@@ -660,18 +723,46 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       if (&s.buf == &b) { s.used = false; return; }
     }
   };
-  // im2col scratch: with the NAX hw conv active, only the small fallback convs
-  // (3-ch conv_in/out, non-tiling shapes) use im2col and they alloc their own
-  // col buffers -- so skip the multi-GB up-front scratch (a 1024^2 conv reserves
-  // ~2.4 GB it never touches on the hw path). Without hw conv, keep the shared
-  // scratch sized for the largest conv.
-  const std::size_t im2col_cap =
-      _use_hwconv ? 0 : (std::size_t)Hout * Wout * 9 * _cfg.block_out[0];
-  SharedBuffer im2col_scratch;
-  if (im2col_cap != 0) {
-    im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-    if (im2col_scratch.empty()) { return fail("im2col scratch alloc failed"); }
+  // im2col band scratch (ROW-TILED). im2col convs stream their [H*W, 9*cin]
+  // expansion in output-row bands so the shared col scratch is bounded to ONE
+  // band -- a 1024^2 im2col is otherwise ~2.4 GB (conv_out, 128-ch, even on the
+  // hw-conv path) to ~4.6 GB (256-ch, the non-hw M4 path). `im2col_cap` (ELEMS)
+  // caps a band by TWO limits: (1) memory -- reserve the level's activation pool
+  // (~decode_peak_bytes = 7x one full-res buffer), give the band the rest of the
+  // headroom, floored at a few output rows; (2) CORRECTNESS -- the matmul2d op
+  // corrupts output rows past M ~ 2^18-2^19 for the large-K 3x3 im2col GEMMs
+  // (MEASURED at 1024: a 2^19-row band bands the image, 2^18 is clean; this is
+  // LOWER than the small-K _mma_max_m=2^19 the chunk split assumes), so cap a
+  // band at kSafeBand = _mma_max_m/2 rows for the widest conv, which also keeps
+  // each band a single un-chunked GEMM. Each conv derives its own band rows =
+  // im2col_cap / (9*cin), re-capped at kSafeBand below.
+  // VPIPE_FLUX2_VAE_BAND_ROWS overrides the memory budget (still safe-capped).
+  const std::size_t base_max =
+      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+  const std::size_t big_cin =
+      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+  const std::size_t k_safe_band =                            // corruption cap
+      _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)Hout * Wout;
+  const std::size_t full_band =
+      (std::size_t)Hout * Wout * 9 * big_cin;                // full im2col elems
+  const std::size_t floor_band = (std::size_t)Wout * 9 * big_cin * 8;  // 8 rows
+  const std::size_t act_reserve = (std::size_t)Hout * Wout * base_max * 7;
+  std::size_t im2col_cap = full_band;                        // roomy default
+  if (decode_headroom > 0) {
+    const std::size_t avail_el =                             // bytes -> elems
+        decode_headroom > act_reserve * 2
+            ? (decode_headroom - act_reserve * 2) / 2 : 0;
+    im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
   }
+  // Never size the scratch past one safe band for the widest conv -- a bigger
+  // buffer just wastes UMA (the per-conv band is safe-capped at k_safe_band).
+  im2col_cap = std::min(im2col_cap, k_safe_band * 9 * big_cin);
+  if (const char* e = std::getenv("VPIPE_FLUX2_VAE_BAND_ROWS")) {
+    const long r = std::atol(e);
+    if (r > 0) { im2col_cap = (std::size_t)r * 9 * big_cin; }
+  }
+  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+  if (im2col_scratch.empty()) { return fail("im2col band scratch alloc failed"); }
 
   CommandStream stream = mc->make_command_stream();
   int H = h8, W = w8;
@@ -697,20 +788,11 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
                        const Conv& c) -> SharedBuffer& {
       const std::size_t hw = (std::size_t)H * W;
       SharedBuffer& out = alloc(hw * c.cout);
-      // NAX hardware conv when the shape tiles; else im2col + GEMM.
+      // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
+      // (streams the [hw, 9*cin] im2col in bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
-      const std::size_t cols = hw * 9 * c.cin;
-      const SharedBuffer& col =
-          cols <= im2col_cap ? im2col_scratch : alloc(cols);
-      enc.set_function(_fn_im2col);
-      enc.set_buffer(0, in); enc.set_buffer(1, col);
-      enc.set_constant(2, H); enc.set_constant(3, W);
-      enc.set_constant(4, c.cin);
-      // 2D grid {9*cin, hw} keeps each grid dimension small (a 1D {cols} grid is
-      // > 2^31 for a 1024px conv); the im2col kernel reconstructs the flat index
-      // as tpig.y*(9*cin)+tpig.x.
-      enc.dispatch({(unsigned)(9 * c.cin), (unsigned)hw, 1}, {64, 1, 1});
-      conv_gemm_bias_(enc, col, c.w, c.b, out, (int)hw, c.cout, c.k);
+      tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
+                     im2col_cap);
       return out;
     };
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,
@@ -924,14 +1006,36 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       if (&s.buf == &b) { s.used = false; return; }
     }
   };
-  // See decode(): the hw conv path never touches the big shared scratch.
-  const std::size_t im2col_cap =
-      _use_hwconv ? 0 : (std::size_t)H0 * W0 * 9 * _cfg.block_out[0];
-  SharedBuffer im2col_scratch;
-  if (im2col_cap != 0) {
-    im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-    if (im2col_scratch.empty()) { return {}; }
+  // Row-tiled im2col band scratch (see decode()): stream each conv's [H*W, 9*cin]
+  // (or the s2 downsample's [(H/2)(W/2), 9*cin]) in output-row bands so the
+  // shared col scratch is bounded to ONE band -- a full-res encode conv is
+  // otherwise ~2.4 GB. Cap the band by memory (headroom, no encode preflight so
+  // query it here) AND correctness (k_safe_band rows, matmul2d M-corruption).
+  const std::size_t base_max =
+      (std::size_t)std::max(_cfg.block_out[0], _cfg.block_out[1]);
+  const std::size_t big_cin =
+      _use_hwconv ? (std::size_t)_cfg.block_out[0] : base_max;
+  const std::size_t k_safe_band =
+      _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)H0 * W0;
+  const std::size_t full_band = (std::size_t)H0 * W0 * 9 * big_cin;
+  const std::size_t floor_band = (std::size_t)W0 * 9 * big_cin * 8;
+  const std::size_t act_reserve = (std::size_t)H0 * W0 * base_max * 7;
+  std::size_t im2col_cap = full_band;
+  {
+    const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    if (mb.recommended != 0) {
+      const std::size_t avail_el = mb.headroom > act_reserve * 2
+          ? (mb.headroom - act_reserve * 2) / 2 : 0;
+      im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+    }
   }
+  im2col_cap = std::min(im2col_cap, k_safe_band * 9 * big_cin);
+  if (const char* e = std::getenv("VPIPE_FLUX2_VAE_BAND_ROWS")) {
+    const long r = std::atol(e);
+    if (r > 0) { im2col_cap = (std::size_t)r * 9 * big_cin; }
+  }
+  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+  if (im2col_scratch.empty()) { return {}; }
 
   // Channel-first [3,H,W] -> channel-last [H*W, 3].
   SharedBuffer& x0 = alloc((std::size_t)H0 * W0 * 3);
@@ -956,43 +1060,18 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     ComputeEncoder enc = stream.begin_compute();
     auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
                        const Conv& c) -> SharedBuffer& {
-      const std::size_t hw = (std::size_t)H * W;
-      SharedBuffer& out = alloc(hw * c.cout);
-      // NAX hardware conv when the shape tiles; else im2col + GEMM.
+      SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
-      const std::size_t cols = hw * 9 * c.cin;
-      const SharedBuffer& col =
-          cols <= im2col_cap ? im2col_scratch : alloc(cols);
-      enc.set_function(_fn_im2col);
-      enc.set_buffer(0, in); enc.set_buffer(1, col);
-      enc.set_constant(2, H); enc.set_constant(3, W);
-      enc.set_constant(4, c.cin);
-      // 2D grid {9*cin, hw} keeps each grid dimension small (a 1D {cols} grid is
-      // > 2^31 for a 1024px conv); the im2col kernel reconstructs the flat index
-      // as tpig.y*(9*cin)+tpig.x.
-      enc.dispatch({(unsigned)(9 * c.cin), (unsigned)hw, 1}, {64, 1, 1});
-      conv_gemm_bias_(enc, col, c.w, c.b, out, (int)hw, c.cout, c.k);
+      tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
+                     im2col_cap);
       return out;
     };
     auto conv3x3_s2 = [&](const SharedBuffer& in, int H, int W,
                           const Conv& c) -> SharedBuffer& {
-      const int OH = H / 2, OW = W / 2;
-      const std::size_t ohw = (std::size_t)OH * OW;
-      SharedBuffer& out = alloc(ohw * c.cout);
-      // NAX hardware conv when the shape tiles; else im2col + GEMM.
+      SharedBuffer& out = alloc((std::size_t)(H / 2) * (W / 2) * c.cout);
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/2)) { return out; }
-      const std::size_t cols = ohw * 9 * c.cin;
-      const SharedBuffer& col =
-          cols <= im2col_cap ? im2col_scratch : alloc(cols);
-      enc.set_function(_fn_im2col_s2);
-      enc.set_buffer(0, in); enc.set_buffer(1, col);
-      enc.set_constant(2, H); enc.set_constant(3, W);
-      enc.set_constant(4, c.cin);
-      // 2D grid {9*cin, (H/2)*(W/2)} keeps each dimension small (a 1D {cols}
-      // grid is > 2^31 for a >=~2K conv); the kernel reconstructs the flat
-      // index as tpig.y*(9*cin)+tpig.x.
-      enc.dispatch({(unsigned)(9 * c.cin), (unsigned)ohw, 1}, {64, 1, 1});
-      conv_gemm_bias_(enc, col, c.w, c.b, out, (int)ohw, c.cout, c.k);
+      tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/2, im2col_scratch,
+                     im2col_cap);
       return out;
     };
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,

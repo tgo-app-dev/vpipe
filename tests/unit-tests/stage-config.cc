@@ -49,9 +49,25 @@ TEST(stage_config, type_names_are_stable)
   EXPECT_TRUE(config_type_name(ConfigType::Uint)   == "uint");
   EXPECT_TRUE(config_type_name(ConfigType::Real)   == "real");
   EXPECT_TRUE(config_type_name(ConfigType::String) == "string");
+  EXPECT_TRUE(config_type_name(ConfigType::Text)   == "text");
   EXPECT_TRUE(config_type_name(ConfigType::Array)  == "array");
   EXPECT_TRUE(config_type_name(ConfigType::Object) == "object");
   EXPECT_TRUE(config_type_name(ConfigType::Any)    == "any");
+}
+
+// `Text` is a String in every backend respect (same FlexData kind, same
+// def_str default) -- it differs only as a multi-line UI hint.
+TEST(stage_config, text_defaults_like_string)
+{
+  constexpr ConfigKey spec[] = {
+    {.key = "prompt", .type = ConfigType::Text, .def_str = "hi"},
+  };
+  auto params = resolve_config_params(spec, FlexData::make_object());
+  EXPECT_TRUE(params.size() == 1u);
+  EXPECT_TRUE(params[0].type == ConfigType::Text);
+  EXPECT_TRUE(params[0].default_value.is_string());
+  EXPECT_TRUE(params[0].default_value.as_string() == "hi");
+  EXPECT_TRUE(params[0].current_value.as_string() == "hi");
 }
 
 TEST(stage_config, resolve_uses_default_when_key_absent)

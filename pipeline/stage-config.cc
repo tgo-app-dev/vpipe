@@ -15,6 +15,7 @@ config_type_name(ConfigType t) noexcept
     case ConfigType::Uint:   return "uint";
     case ConfigType::Real:   return "real";
     case ConfigType::String: return "string";
+    case ConfigType::Text:   return "text";
     case ConfigType::Array:  return "array";
     case ConfigType::Object: return "object";
     case ConfigType::Any:    return "any";
@@ -34,6 +35,7 @@ config_default_value(const ConfigKey& k)
     case ConfigType::Uint:   return FlexData::make_uint(k.def_uint);
     case ConfigType::Real:   return FlexData::make_real(k.def_real);
     case ConfigType::String: return FlexData::make_string(k.def_str);
+    case ConfigType::Text:   return FlexData::make_string(k.def_str);
     case ConfigType::Array:  return FlexData::make_array();
     case ConfigType::Object: return FlexData::make_object();
     case ConfigType::Any:    return FlexData::make_null();

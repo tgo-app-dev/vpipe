@@ -1,11 +1,16 @@
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 
+#include "apple-silicon/metal-compute/image-ops.h"
+#include "common/flex-data.h"
+#include "common/perf-scope.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace vpipe {
@@ -23,6 +28,60 @@ f32_to_bf16_(float f)
 {
   std::uint32_t u; std::memcpy(&u, &f, 4);
   return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// Pillow-style separable resample of a PLANAR image [C,sh,sw] -> [C,dh,dw]
+// carried in float but holding U8-valued samples. `cubic` picks Pillow's
+// BICUBIC kernel over LANCZOS-3. Used to reproduce the HF condition-image
+// preprocessing bit-closely.
+//
+// NOTE the round+clamp to U8 BETWEEN the horizontal and vertical passes: that
+// is what Pillow's 8-bit path does (ImagingResampleHorizontal_8bpc writes a U8
+// temp image via clip8, then the vertical pass reads it). Skipping it is a
+// real error, not a rounding nicety -- measured up to 6 levels off PIL, vs
+// 1 level with it, and the vision tower amplifies input error ~29x.
+void
+resample_planar_(const float* src, int C, int sh, int sw,
+                 float* dst, int dh, int dw, bool cubic)
+{
+  std::vector<int> bx, by;
+  std::vector<float> wx, wy;
+  const double scx = (double)sw / (double)dw;
+  const double scy = (double)sh / (double)dh;
+  const int kx = cubic
+      ? metal_compute::build_cubic_coeffs(sw, 0.0, dw, scx, bx, wx)
+      : metal_compute::build_lanczos_coeffs(sw, 0.0, dw, scx, bx, wx);
+  const int ky = cubic
+      ? metal_compute::build_cubic_coeffs(sh, 0.0, dh, scy, by, wy)
+      : metal_compute::build_lanczos_coeffs(sh, 0.0, dh, scy, by, wy);
+  std::vector<float> tmp((std::size_t)sh * dw);
+  for (int c = 0; c < C; ++c) {
+    const float* s = src + (std::size_t)c * sh * sw;
+    for (int y = 0; y < sh; ++y) {
+      for (int x = 0; x < dw; ++x) {
+        const float* w = &wx[(std::size_t)x * kx];
+        const int x0 = bx[(std::size_t)x];
+        float acc = 0.0f;
+        for (int t = 0; t < kx && x0 + t < sw; ++t) {
+          acc += w[t] * s[(std::size_t)y * sw + x0 + t];
+        }
+        tmp[(std::size_t)y * dw + x] =
+            std::min(255.0f, std::max(0.0f, std::round(acc)));
+      }
+    }
+    float* d = dst + (std::size_t)c * dh * dw;
+    for (int y = 0; y < dh; ++y) {
+      const float* w = &wy[(std::size_t)y * ky];
+      const int y0 = by[(std::size_t)y];
+      for (int x = 0; x < dw; ++x) {
+        float acc = 0.0f;
+        for (int t = 0; t < ky && y0 + t < sh; ++t) {
+          acc += w[t] * tmp[(std::size_t)(y0 + t) * dw + x];
+        }
+        d[(std::size_t)y * dw + x] = acc;
+      }
+    }
+  }
 }
 
 // Qwen2.5-VL vision window partition for a single image grid (matches HF
@@ -85,6 +144,66 @@ to_elt_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   return out;
 }
 
+// Expand an affine group-quantized linear <name> (U32 packed codes + F16
+// per-group scales/biases, w_deq = scale*q + bias) into a dense bf16 [N,K]
+// buffer. The vision tower runs dense bf16 -- it has no quantized-matmul
+// kernels -- so when model-quantize's text_encoder scope catches a visual
+// linear (e.g. mlp.gate_proj/up_proj), it is dequantized here at load. Returns
+// empty if the tensors are missing / malformed. `group` is the quant group
+// size; the per-tensor bit width is derived from the shapes (mixed 4/8 safe).
+SharedBuffer
+dequant_affine_(const MetalLlamaWeights& wts, MetalCompute* mc,
+                const std::string& base, int group)
+{
+  // `base` is the linear name without the ".weight" suffix; the affine triple
+  // is base.weight (U32 codes) + base.scales + base.biases (F16).
+  const auto* ci = wts.info(base + ".weight");   // codes [N, K*bits/32] (U32)
+  const auto* si = wts.info(base + ".scales");   // [N, K/group] (F16)
+  if (ci == nullptr || si == nullptr || ci->shape.size() != 2 ||
+      si->shape.size() != 2 || group <= 0) {
+    return {};
+  }
+  const std::int64_t N  = ci->shape[0];
+  const std::int64_t cc = ci->shape[1];              // codes cols = K*bits/32
+  const std::int64_t sc = si->shape[1];              // K / group
+  const std::int64_t K  = sc * group;
+  if (N <= 0 || K <= 0 || cc <= 0) { return {}; }
+  const int bits = (int)(cc * 32 / K);               // 4 or 8
+  if (bits != 4 && bits != 8) { return {}; }
+  SharedBuffer codes = wts.load(base + ".weight", mc);
+  SharedBuffer scb   = wts.load(base + ".scales", mc);
+  SharedBuffer bib   = wts.load(base + ".biases", mc);
+  if (codes.empty() || scb.empty() || bib.empty()) { return {}; }
+  const auto* cw = static_cast<const std::uint32_t*>(codes.contents());
+  const auto* sf = static_cast<const _Float16*>(scb.contents());   // F16
+  const auto* bf = static_cast<const _Float16*>(bib.contents());   // F16
+  SharedBuffer out = mc->make_shared_buffer((std::size_t)N * K * 2);   // bf16
+  if (out.empty()) { return {}; }
+  auto* op = static_cast<std::uint16_t*>(out.contents());
+  const int vpw = 32 / bits;                         // values per u32 word
+  const std::int64_t Kw = K / vpw;                   // words per row
+  const std::uint32_t mask = (bits == 8) ? 0xffu : 0xfu;
+  for (std::int64_t n = 0; n < N; ++n) {
+    const _Float16* srow = sf + n * sc;
+    const _Float16* brow = bf + n * sc;
+    const std::uint32_t* crow = cw + n * Kw;
+    std::uint16_t* orow = op + n * K;
+    for (std::int64_t w = 0; w < Kw; ++w) {
+      const std::uint32_t packed = crow[w];
+      const std::int64_t k0 = w * vpw;
+      for (int i = 0; i < vpw; ++i) {
+        const std::int64_t k = k0 + i;
+        const std::int64_t g = k / group;
+        const float s = (float)srow[g];
+        const float b = (float)brow[g];
+        const std::uint32_t q = (packed >> (bits * i)) & mask;
+        orow[k] = f32_to_bf16_(s * (float)q + b);
+      }
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 MetalQwen25Vision::~MetalQwen25Vision() = default;
@@ -92,6 +211,20 @@ MetalQwen25Vision::~MetalQwen25Vision() = default;
 SharedBuffer
 MetalQwen25Vision::to_elt_(const MetalLlamaWeights& wts, const std::string& name)
 {
+  // A quantized model may have affine-packed some of the visual linears
+  // (model-quantize's text_encoder scope). The affine scales live at
+  // <base>.scales where <base> is the linear name without ".weight"; detect that
+  // and expand back to dense bf16. Dense tensors (norms, patch_embed, biases,
+  // unquantized linears) have no such sibling and take the plain path.
+  if (_quant_bits > 0 && name.size() > 7 &&
+      name.compare(name.size() - 7, 7, ".weight") == 0) {
+    const std::string base = name.substr(0, name.size() - 7);
+    if (wts.info(base + ".scales") != nullptr) {
+      SharedBuffer dq =
+          vpipe::genai::dequant_affine_(wts, _mc, base, _quant_group);
+      if (!dq.empty()) { return dq; }
+    }
+  }
   return vpipe::genai::to_elt_(wts, _mc, name);
 }
 
@@ -115,6 +248,30 @@ MetalQwen25Vision::load(const std::string& model_dir, MetalCompute* mc,
   const MetalLlamaWeights& wts = *wtsopt;
   auto m = std::unique_ptr<MetalQwen25Vision>(new MetalQwen25Vision());
   m->_mc = mc; m->_cfg = cfg;
+
+  // Quantized model? The text_encoder config.json `quantization {bits,
+  // group_size}` (written by model-quantize) means some visual linears are
+  // affine-packed; to_elt_ dequantizes them to bf16 at load. Absent => dense.
+  {
+    std::ifstream in(model_dir + "/config.json");
+    if (in) {
+      FlexData fd = FlexData::from_json(in);
+      if (fd.is_object()) {
+        auto o = fd.as_object();
+        if (o.contains("quantization")) {
+          FlexData q = o.at("quantization");
+          if (q.is_object()) {
+            auto qo = q.as_object();
+            m->_quant_bits =
+                qo.contains("bits") ? (int)qo.at("bits").as_int(0) : 0;
+            m->_quant_group = qo.contains("group_size")
+                                  ? (int)qo.at("group_size").as_int(64) : 64;
+            if (m->_quant_group <= 0) { m->_quant_group = 64; }
+          }
+        }
+      }
+    }
+  }
 
   m->_lib_gemm = mc->load_library("dense_gemm_bf16");
   m->_lib_elt  = mc->load_library("llm_elementwise_bf16");
@@ -224,27 +381,36 @@ MetalQwen25Vision::encode_rgb(const std::uint8_t* rgb, int H, int W,
   // CLIP (OpenAI) mean/std -- the Qwen2.5-VL image_mean/std.
   static const float MEAN[3] = {0.48145466f, 0.4578275f, 0.40821073f};
   static const float STD[3]  = {0.26862954f, 0.26130258f, 0.27577711f};
-  // Bilinear resize [3,H,W] U8 -> normalized [3,th,tw] f32 (channel-first).
+  // Reproduce the HF QwenImageEditPlus condition preprocessing EXACTLY. It is a
+  // TWO-stage resize, not one: diffusers' VaeImageProcessor.resize (PIL
+  // LANCZOS, its default `resample`) to the condition dims cw x ch, then the
+  // Qwen2VL processor's smart_resize (PIL BICUBIC) to tw x th. PIL hands a U8
+  // image between the stages, so round+clamp there -- that quantization is
+  // observable. Approximating any of this is NOT good enough: the vision tower
+  // amplifies an input perturbation by ~29x, so a 1% pixel error becomes a ~30%
+  // token error (a single bilinear resize measured 0.496 vs 0.058 rel-L2).
+  auto to_u8 = [](float v) {
+    return std::min(255.0f, std::max(0.0f, std::round(v)));
+  };
+  std::vector<float> src0((std::size_t)3 * H * W);
+  for (std::size_t i = 0; i < src0.size(); ++i) {
+    src0[i] = (float)rgb[i];
+  }
+  std::vector<float> stage1((std::size_t)3 * ch * cw);
+  resample_planar_(src0.data(), 3, H, W, stage1.data(), ch, cw,
+                   /*cubic=*/false);
+  for (auto& v : stage1) { v = to_u8(v); }
+  std::vector<float> stage2((std::size_t)3 * th * tw);
+  resample_planar_(stage1.data(), 3, ch, cw, stage2.data(), th, tw,
+                   /*cubic=*/true);
+  // -> normalized [3,th,tw] f32 (channel-first).
   std::vector<float> norm((std::size_t)3 * th * tw);
-  { const double sy = (double)H / th, sx = (double)W / tw;
-    const int pin = H * W, pout = th * tw;
+  { const int pout = th * tw;
     for (int c = 0; c < 3; ++c) {
-      const std::uint8_t* src = rgb + (std::size_t)c * pin;
-      float* dst = norm.data() + (std::size_t)c * pout;
       const float inv = 1.0f / (255.0f * STD[c]), bias = -MEAN[c] / STD[c];
-      for (int yy = 0; yy < th; ++yy) {
-        double y = std::min(std::max((yy + 0.5) * sy - 0.5, 0.0), (double)(H - 1));
-        int y0 = (int)std::floor(y), y1 = std::min(y0 + 1, H - 1);
-        float dy = (float)(y - y0);
-        for (int xx = 0; xx < tw; ++xx) {
-          double x = std::min(std::max((xx + 0.5) * sx - 0.5, 0.0), (double)(W - 1));
-          int x0 = (int)std::floor(x), x1 = std::min(x0 + 1, W - 1);
-          float dx = (float)(x - x0);
-          float v0 = src[y0 * W + x0] * (1 - dx) + src[y0 * W + x1] * dx;
-          float v1 = src[y1 * W + x0] * (1 - dx) + src[y1 * W + x1] * dx;
-          dst[yy * tw + xx] = (v0 * (1 - dy) + v1 * dy) * inv + bias;
-        }
-      }
+      const float* s = stage2.data() + (std::size_t)c * pout;
+      float* dst = norm.data() + (std::size_t)c * pout;
+      for (int i = 0; i < pout; ++i) { dst[i] = to_u8(s[i]) * inv + bias; }
     }
   }
   // Patchify to merge-block order [gh//M, gw//M, M, M] with per-patch features
@@ -286,6 +452,12 @@ SharedBuffer
 MetalQwen25Vision::encode(const SharedBuffer& pixels, int seq,
                           const std::vector<int>& pos)
 {
+  // LLM-lane perf event (perf-visualizer): the QIE image-aware conditioning
+  // vision tower. value = the patch-token count. Mirrors the gemma4 / qwen3
+  // vision-tower events so the "vision-tower" lane lights up for QIE too.
+  PerfAuxScope _perf(_mc->session(), kPerfLaneLLM, kGvidLlmVision,
+                     kPerfLlmVisionBegin, (std::uint64_t)seq);
+
   const int H = _cfg.hidden, Hd = _cfg.head_dim, NH = _cfg.n_heads;
   const int FF = _cfg.ffn, OUT = _cfg.out_hidden, M = _cfg.merge;
   const int MU = M * M, mseq = seq / MU, mh = H * MU;   // merged

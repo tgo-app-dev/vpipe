@@ -233,7 +233,9 @@ endif()
 # A standalone .metallib compiled offline (NOT embedded into libvpipe),
 # mimicking how a plugin ships its own shaders. The plugin-metal-library
 # test registers it at runtime via MetalCompute::register_metal_library.
-if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
+# Skipped in runtime-compile mode (no metal/metallib toolchain to build it);
+# the test then skips vacuously on the empty path.
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND NOT VPIPE_METAL_RUNTIME_COMPILE)
     set(_probe_src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins/metal-kernel/plugin_probe.metal)
     set(_probe_air ${CMAKE_BINARY_DIR}/plugin_probe.air)

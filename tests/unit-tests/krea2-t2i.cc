@@ -24,6 +24,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
+#include "stages/load-image-stage.h"
 #include "stages/model-quantize-stage.h"
 #include "stages/text-to-image-stage.h"
 #include "stages/vae-decode-stage.h"
@@ -644,14 +645,14 @@ TEST(krea2_t2i, img2img_end_to_end)
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string(root));
   cfg.as_object().insert("strength", FlexData::make_real(0.6));
-  // conditioning on iport0 (from the conditioner); neg/sampler/scheduler
-  // (iport1-3) DISCONNECTED; the img2img init latent (from vae-encode) on
-  // iport4 (ref latent 0).
+  // conditioning on iport0 (from the conditioner); neg/model/sampler/scheduler
+  // (iport1-4) DISCONNECTED; the img2img init latent (from vae-encode) on
+  // iport5 (ref latent 0).
   auto* cond = add_conditioner_(pl.get(), sess, pr, root);
   auto t2iu = std::make_unique<TextToImageStage>(
       &sess, "t2i",
       std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
-                          InEdge{nullptr, 0}, {ve, 0}},
+                          InEdge{nullptr, 0}, InEdge{nullptr, 0}, {ve, 0}},
       std::move(cfg));
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
@@ -783,9 +784,9 @@ TEST(krea2_t2i, enc_quantized_hf_dir)
   fs::remove_all(qdir, ec);
 }
 
-// Model-free: the iport contract is {prompt, negative, sampler, scheduler,
-// ref_latent0, ref_latent1} in that order, and guidance_scale is a valid
-// config attr.
+// Model-free: the iport contract is {conditioning, neg_conditioning, model,
+// sampler, scheduler, ref_latent0, ref_latent1} in that order, and
+// guidance_scale is a valid config attr.
 TEST(krea2_t2i, negative_prompt_ports_and_cfg_config)
 {
   Session sess;
@@ -796,13 +797,14 @@ TEST(krea2_t2i, negative_prompt_ports_and_cfg_config)
   EXPECT_TRUE(s.config_error().empty());   // guidance_scale is accepted
 
   const auto& ip = s.spec().iports;
-  ASSERT_TRUE(ip.size() == 6);
-  EXPECT_TRUE(ip[0].name == "prompt");
-  EXPECT_TRUE(ip[1].name == "negative");
-  EXPECT_TRUE(ip[2].name == "sampler");
-  EXPECT_TRUE(ip[3].name == "scheduler");
-  EXPECT_TRUE(ip[4].name == "ref_latent0");
-  EXPECT_TRUE(ip[5].name == "ref_latent1");
+  ASSERT_TRUE(ip.size() == 7);
+  EXPECT_TRUE(ip[0].name == "conditioning");
+  EXPECT_TRUE(ip[1].name == "neg_conditioning");
+  EXPECT_TRUE(ip[2].name == "model");
+  EXPECT_TRUE(ip[3].name == "sampler");
+  EXPECT_TRUE(ip[4].name == "scheduler");
+  EXPECT_TRUE(ip[5].name == "ref_latent0");
+  EXPECT_TRUE(ip[6].name == "ref_latent1");
 }
 
 // Classifier-free guidance actually consumes the negative prompt: the SAME
@@ -889,4 +891,214 @@ TEST(krea2_t2i, cfg_changes_latent)
   const double r = rel_l2_(cfgl.data(), base.data(), base.size());
   std::printf("[krea2_t2i] CFG-vs-noCFG latent rel-L2 = %.6f\n", r);
   EXPECT_TRUE(r > 0.01);   // the negative prompt materially changed the output
+}
+
+// Image-grounded conditioning (Krea-2 edit / identity-edit LoRA): with a
+// reference image on the conditioner's ref_image iport the Qwen3-VL vision
+// tower runs and its tokens are spliced into the 12-tap conditioning
+// (training-matched grounded encode). Verifies the new path RUNS and produces
+// finite conditioning whose length grows by the vision tokens vs text-only.
+// Env: VPIPE_KREA2_TEST_MODEL_PATH; source image from VPIPE_KREA2_EDIT_IMAGE
+// (default ~/dock/dump/vpipe-test/image.png).
+TEST(krea2_t2i, grounded_encode_image_aware)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+  const char* imge = std::getenv("VPIPE_KREA2_EDIT_IMAGE");
+  const std::string img = (imge && *imge) ? std::string(imge)
+      : (std::string(std::getenv("HOME")) + "/dock/dump/vpipe-test/image.png");
+  if (!std::filesystem::exists(img)) {
+    std::printf("[krea2_t2i] no edit image at %s; skipping\n", img.c_str());
+    return;
+  }
+
+  // Run the conditioner with/without a ref image; return {n_real, finite}.
+  auto run = [&](bool with_image) -> std::pair<int, bool> {
+    auto pl = std::make_unique<Pipeline>("gc", &sess);
+    auto srcu = std::make_unique<SourceText>(&sess, "src",
+                                             std::vector<InEdge>{},
+                                             FlexData::make_object());
+    srcu->prompt = "make the sky a vivid blue";
+    auto* src = static_cast<SourceText*>(pl->insert_stage(std::move(srcu)));
+
+    Stage* imgstage = nullptr;
+    if (with_image) {
+      FlexData ic = FlexData::make_object();
+      ic.as_object().insert("url", FlexData::make_string(img));
+      auto iu = std::make_unique<LoadImageStage>(&sess, "img",
+                                                 std::vector<InEdge>{},
+                                                 std::move(ic));
+      imgstage = pl->insert_stage(std::move(iu));
+    }
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(root));
+    std::vector<InEdge> ce{{src, 0}};
+    if (with_image) {                       // iport1 (negative) unconnected
+      ce.push_back({nullptr, 0});
+      ce.push_back({nullptr, 0});           // iport2 = model (model-select)
+      ce.push_back({imgstage, 0});          // iport3 = ref_image
+    }
+    auto cu = std::make_unique<DiffusionConditionerStage>(
+        &sess, "cond", std::move(ce), std::move(c));
+    auto* cond = static_cast<DiffusionConditionerStage*>(
+        pl->insert_stage(std::move(cu)));
+    auto sinku = std::make_unique<SinkCapture>(
+        &sess, "sink", std::vector<InEdge>{{cond, 0}}, FlexData::make_object());
+    auto* sink = static_cast<SinkCapture*>(pl->insert_stage(std::move(sinku)));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    if (sink->captured.empty()) { return {0, false}; }
+    const auto* tb =
+        dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+    if (tb == nullptr || tb->shape.size() != 3) { return {0, false}; }
+    const int n_real = (int)tb->shape[0];
+    const auto bytes = tb->materialize_contiguous();
+    const auto* h = reinterpret_cast<const _Float16*>(bytes.data());
+    const std::size_t n = bytes.size() / 2;
+    bool finite = n > 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!std::isfinite((float)h[i])) { finite = false; break; }
+    }
+    return {n_real, finite};
+  };
+
+  const auto [nt, ft] = run(false);   // text-only
+  const auto [ng, fg] = run(true);    // image-grounded
+  std::printf("[krea2_t2i] grounded encode: text n_real=%d (finite=%d), "
+              "grounded n_real=%d (finite=%d) -> +%d vision tokens\n",
+              nt, (int)ft, ng, (int)fg, ng - nt);
+  ASSERT_TRUE(nt > 0 && ng > 0);
+  EXPECT_TRUE(ft && fg);              // both conditionings finite
+  EXPECT_TRUE(ng > nt);              // the source's vision tokens were spliced in
+}
+
+// End-to-end IMAGE EDIT (ComfyUI-Krea2Edit + identity-edit LoRA): the source
+// image drives BOTH conditioning paths -- the raw RGB into the conditioner's
+// Qwen3-VL grounded encode (ref_image) AND its VAE latent into the DiT as clean
+// in-context frame-1 tokens (ref_latent0) -- denoised by the LoRA-FUSED DiT
+// (dit_dir) that activates the reference-edit capability, then vae-decoded.
+// Verifies the whole new path runs + produces a coherent (non-degenerate) edit.
+// Env: VPIPE_KREA2_TEST_MODEL_PATH + a fused identity-edit DiT at
+// <root>-dit-lora-krea2_identity_edit_v1_2 (from krea2_lora fusion). Source from
+// VPIPE_KREA2_EDIT_IMAGE (default image.png). Skips if the fused DiT is absent.
+TEST(krea2_t2i, edit_end_to_end)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  namespace fs = std::filesystem;
+  const std::string ldit =
+      std::string(root) + "-dit-lora-krea2_identity_edit_v1_2";
+  if (!fs::exists(fs::path(ldit) / "config.json")) {
+    std::printf("[krea2_t2i] no fused identity-edit DiT at %s; skipping\n",
+                ldit.c_str());
+    return;
+  }
+  const char* imge = std::getenv("VPIPE_KREA2_EDIT_IMAGE");
+  const std::string img = (imge && *imge) ? std::string(imge)
+      : (std::string(std::getenv("HOME")) + "/dock/dump/vpipe-test/image.png");
+  if (!fs::exists(img)) { return; }
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+  const int H = 512, W = 512;
+
+  auto pl = std::make_unique<Pipeline>("edit", &sess);
+  auto srcu = std::make_unique<SourceText>(&sess, "src",
+                                           std::vector<InEdge>{},
+                                           FlexData::make_object());
+  srcu->prompt = "make it a watercolor painting";
+  auto* src = static_cast<SourceText*>(pl->insert_stage(std::move(srcu)));
+
+  // Two independent image loads (one per consumer -- avoids oport fan-out).
+  auto mkimg = [&](const char* id) -> Stage* {
+    FlexData ic = FlexData::make_object();
+    ic.as_object().insert("url", FlexData::make_string(img));
+    return pl->insert_stage(std::make_unique<LoadImageStage>(
+        &sess, id, std::vector<InEdge>{}, std::move(ic)));
+  };
+  Stage* img_cond = mkimg("img_c");   // -> conditioner ref_image
+  Stage* img_vae  = mkimg("img_v");   // -> vae-encode -> ref_latent0
+
+  // conditioner: prompt (iport0) + ref_image (iport3); iport1 (negative) and
+  // iport2 (model, a model-select source) unconnected -- hf_dir comes from the
+  // stage config here.
+  FlexData cc = FlexData::make_object();
+  cc.as_object().insert("hf_dir", FlexData::make_string(root));
+  auto* cond = static_cast<DiffusionConditionerStage*>(pl->insert_stage(
+      std::make_unique<DiffusionConditionerStage>(
+          &sess, "cond",
+          std::vector<InEdge>{{src, 0}, {nullptr, 0}, {nullptr, 0},
+                              {img_cond, 0}},
+          std::move(cc))));
+
+  // vae-encode the source, letterboxed to the output size -> ref latent grid
+  // matches the target grid.
+  FlexData ec = FlexData::make_object();
+  ec.as_object().insert("hf_dir", FlexData::make_string(root));
+  ec.as_object().insert("target_width", FlexData::make_int(W));
+  ec.as_object().insert("target_height", FlexData::make_int(H));
+  auto* vaee = static_cast<VaeEncodeStage*>(pl->insert_stage(
+      std::make_unique<VaeEncodeStage>(
+          &sess, "vaee", std::vector<InEdge>{{img_vae, 0}}, std::move(ec))));
+
+  // text-to-image on the FUSED DiT: conditioning (iport0) + ref_latent0
+  // (iport5). strength 0 => the source stays a clean in-context ref (not img2img).
+  FlexData tc = FlexData::make_object();
+  tc.as_object().insert("hf_dir", FlexData::make_string(root));
+  tc.as_object().insert("dit_dir", FlexData::make_string(ldit));
+  tc.as_object().insert("height", FlexData::make_int(H));
+  tc.as_object().insert("width", FlexData::make_int(W));
+  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
+      std::make_unique<TextToImageStage>(
+          &sess, "t2i",
+          std::vector<InEdge>{{cond, 0}, {nullptr, 0}, {nullptr, 0},
+                              {nullptr, 0}, {nullptr, 0}, {vaee, 0}},
+          std::move(tc))));
+  ASSERT_TRUE(t2i->config_error().empty());
+
+  FlexData vc = FlexData::make_object();
+  vc.as_object().insert("hf_dir", FlexData::make_string(root));
+  auto* vae = static_cast<VaeDecodeStage*>(pl->insert_stage(
+      std::make_unique<VaeDecodeStage>(
+          &sess, "vae", std::vector<InEdge>{{t2i, 0}}, std::move(vc))));
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(
+      std::make_unique<SinkCapture>(
+          &sess, "sink", std::vector<InEdge>{{vae, 0}}, FlexData::make_object())));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  ASSERT_TRUE(sink->captured.size() == 1);
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+  ASSERT_TRUE(tb != nullptr && tb->dtype == TensorBeat::DType::U8 &&
+              tb->shape.size() == 3 && tb->shape[0] == 3);
+  const auto bytes = tb->materialize_contiguous();
+  const std::uint8_t* u = bytes.data();
+  const std::size_t np = bytes.size();
+  double mean = 0.0;
+  for (std::size_t i = 0; i < np; ++i) { mean += u[i]; }
+  mean /= (double)np;
+  double var = 0.0;
+  for (std::size_t i = 0; i < np; ++i) { const double d = u[i] - mean; var += d * d; }
+  const double sd = std::sqrt(var / (double)np);
+  std::printf("[krea2_t2i] edit image [%lld,%lld] mean=%.1f std=%.1f\n",
+              (long long)tb->shape[1], (long long)tb->shape[2], mean, sd);
+  EXPECT_TRUE(sd > 8.0);   // structured (not flat / degenerate)
+  {
+    const int oh = (int)tb->shape[1], ow = (int)tb->shape[2];
+    std::ofstream o("/tmp/krea2_edit_metal.ppm", std::ios::binary);
+    o << "P6\n" << ow << " " << oh << "\n255\n";
+    for (int y = 0; y < oh; ++y)
+      for (int x = 0; x < ow; ++x)
+        for (int c = 0; c < 3; ++c)
+          o.put((char)u[((std::size_t)c * oh + y) * ow + x]);
+    std::printf("[krea2_t2i] wrote /tmp/krea2_edit_metal.ppm\n");
+  }
 }

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace vpipe { class SessionContextIntf; }
 
@@ -75,6 +76,34 @@ ResampleGeom compute_resample_geom(int in_w, int in_h, int out_w, int out_h,
 // [3,out_h,out_w] with the fit mode + solid pad colour above. Reuses the
 // (generalised) letterbox kernel.
 bool resample_planar_u8_to_u8(
+    MetalCompute& mc, const ExternalStorageHandle& src,
+    int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    std::uint8_t pad_r, std::uint8_t pad_g, std::uint8_t pad_b,
+    const SessionContextIntf* session);
+
+// Pillow-exact Lanczos-3 resample coefficients for one axis: srcN pixels
+// [in0, in0 + outSize*scale) -> outSize outputs, `scale` source px per output
+// px. Matches ImagingResample precompute_coeffs (support 3.0, filterscale =
+// max(1, scale)). Fills `bounds[o]` = first source index for output o and
+// `weights[o*ksize + t]` = its normalized taps (zero-padded to ksize). Returns
+// ksize. Shared by the GPU kernel and the CPU fallback.
+int build_lanczos_coeffs(int srcN, double in0, int outSize, double scale,
+                         std::vector<int>& bounds,
+                         std::vector<float>& weights);
+
+// Pillow-exact BICUBIC resample coefficients for one axis -- same contract as
+// build_lanczos_coeffs above, with Pillow's cubic kernel (a = -0.5, support
+// 2.0). Needed to reproduce PIL Image.BICUBIC, which is what the HF
+// Qwen2VL image processor uses for its smart-resize pass.
+int build_cubic_coeffs(int srcN, double in0, int outSize, double scale,
+                       std::vector<int>& bounds,
+                       std::vector<float>& weights);
+
+// Lanczos-3 resample of planar u8 RGB [3,in_h,in_w] -> planar u8 RGB
+// [3,out_h,out_w] with the fit mode + solid pad colour, matching PIL LANCZOS.
+// GPU path (resample_lanczos_planar_u8 kernel).
+bool resample_lanczos_planar_u8_to_u8(
     MetalCompute& mc, const ExternalStorageHandle& src,
     int in_w, int in_h, const ExternalStorageHandle& dst,
     int out_w, int out_h, int mode, int src_x, int src_y, float scale,

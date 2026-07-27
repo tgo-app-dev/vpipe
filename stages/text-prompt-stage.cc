@@ -33,7 +33,7 @@ TextPromptStage::TextPromptStage(const SessionContextIntf* s,
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
-  {.key = "text", .type = ConfigType::String, .required = true,
+  {.key = "text", .type = ConfigType::Text, .required = true,
    .doc = "the prompt text to emit as a FlexData string"},
 };
 const PortSpec kIports[] = {

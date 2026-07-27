@@ -79,6 +79,11 @@ private:
     std::optional<PipelineHandle> handle;        // live materialization
     State                       state = State::Stopped;
     std::string                 storage_path;
+    // Auxiliary data objects round-tripped with the pipeline document but
+    // opaque to the pipeline core -- a map of named JSON objects (e.g. the
+    // web-ui composer's view arrangement under "composer"). Persisted under
+    // the spec's "aux" key on save, recovered on load. Null/empty = none.
+    FlexData                    aux;
   };
 
   // ---- request handlers (return ready HttpResponses) -------------
@@ -89,6 +94,7 @@ private:
   HttpResponse h_load_pipeline_(const HttpRequest&);
   HttpResponse h_get_pipeline_(const HttpRequest&);
   HttpResponse h_save_pipeline_(const HttpRequest&);
+  HttpResponse h_set_pipeline_aux_(const HttpRequest&);
   HttpResponse h_unload_pipeline_(const HttpRequest&);
   HttpResponse h_launch_pipeline_(const HttpRequest&);
   HttpResponse h_pause_pipeline_(const HttpRequest&);
@@ -218,6 +224,10 @@ private:
   // POST /api/fs/rename {path, to} : rename the item at virtual `path`
   // to base name `to`, in place. Sandbox-confined for write.
   HttpResponse h_fs_rename_(const HttpRequest&);
+  // POST /api/fs/write {path, text} : write a UTF-8 text file at virtual
+  // `path` (parent must exist), truncating any existing file. Sandbox-
+  // confined for write. Used by the composer's Save-to-file.
+  HttpResponse h_fs_write_(const HttpRequest&);
   // Map a client virtual path to a real host path with the same
   // namespace rules as h_fs_list_ (sandbox chroot / native passthrough).
   // Returns {} and sets *err on rejection; *vpath receives the cleaned
@@ -262,6 +272,9 @@ private:
   FlexData pipe_summary_(const Pipe& p) const;     // {id,state,...}
   FlexData graph_json_(const Pipe& p) const;        // {nodes,edges}
   FlexData to_flex_spec_(const Pipe& p) const;      // pipeline-spec doc
+  // Merge each key of `incoming` (an object) into p.aux, creating it as an
+  // object if needed; a null value erases that key. No-op if not an object.
+  void merge_aux_(Pipe& p, const FlexData& incoming);
   // Stage indices in dependency order (Kahn, stable wrt the input order).
   // The core pipeline_from_spec loader resolves iports in a single pass, so
   // a saved spec MUST declare each stage after its sources; in-memory edits

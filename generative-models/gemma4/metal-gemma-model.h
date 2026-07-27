@@ -315,6 +315,10 @@ private:
     int n = 0;
     metal_compute::SharedBuffer x, hn, q3, kbuf, vbuf, attn, o, act, mlp,
         ple, pleproj, pli, plg, plp, logits;
+    // De-fused mixed-precision (OptiQ) gate scratch [n, ffn]: a batched layer
+    // whose gate/up are at different widths runs them as two GEMMs + a geglu
+    // (gate -> gate, up -> act, geglu -> act). Allocated only when _mixed.
+    metal_compute::SharedBuffer gate;
     metal_compute::SharedBuffer tok_in, argmax_id;
     // Per-branch flash-decode partials (f32) for the global-layer gtile path:
     // [n, Hq, gtile_split, head_dim_full] + m/l [n, Hq, gtile_split]. Branch i
@@ -371,6 +375,20 @@ private:
     // MLP: gate/up INTERLEAVED into one [2*ffn, hidden] weight (row 2g=gate
     // g, 2g+1=up g) for the fused GeGLU qmv/qmm (no separate gate/up).
     metal_compute::SharedBuffer guw, gus, gub, dw, ds, db;
+    // ---- Per-tensor mixed-precision affine (OptiQ) ------------------
+    // Each projection's own bit width (4 or 8), derived from its packed
+    // shape at load. Used ONLY when _mixed: the qmv/qmm dispatch selects the
+    // w4 vs w8 kernel per tensor. o_bits always applies (o_proj is always a
+    // separate GEMM). q/k/v_bits apply on the per-proj decode path (used when
+    // qkv_fused is false, which the load forces when their bits differ).
+    int  q_bits = 4, k_bits = 4, v_bits = 4, o_bits = 4;
+    int  gate_bits = 4, up_bits = 4, down_bits = 4;
+    // When gate_bits==up_bits==mlp_bits the two are interleaved into guw
+    // (mlp_fused=true, runs the existing geglu kernel at mlp_bits). Otherwise
+    // they are kept SEPARATE: gate in guw, up in uw/us/ub, and the decode /
+    // prefill run gate + up as two GEMVs/GEMMs + a standalone geglu.
+    metal_compute::SharedBuffer uw, us, ub;   // separate up_proj (de-fused)
+    bool mlp_fused = false;
     metal_compute::SharedBuffer plg_w, plg_s, plg_b;   // per_layer_input_gate
     metal_compute::SharedBuffer plp_w, plp_s, plp_b;   // per_layer_projection
     // Dense (raw-HF bf16/f16) path ONLY: plain [out,in] elt weights, no
@@ -535,6 +553,27 @@ private:
       _fn_dequant, _fn_dense_mma, _fn_dense_mma_deep, _fn_geglu_inter,
       _fn_dense_mma_qkcausal;
 
+  // ---- Per-tensor mixed-precision affine (OptiQ) --------------------
+  // A mixed checkpoint (per-tensor 4- AND 8-bit projections, e.g. the
+  // gemma-4-12B OptiQ pack) needs BOTH widths of each projection kernel
+  // resident; the dispatch picks per Layer::*_bits. The w4 twins alias the
+  // base kernels when quant_bits==4 but are bound explicitly so the selector
+  // is width-correct regardless of base. _fn_dequant8 is the w8 dequant twin
+  // for the matmul2d prefill (the base _fn_dequant is w4). Loaded only when
+  // _mixed. Fused geglu (interleaved gate|up) is kept only for layers whose
+  // gate/up both equal mlp_bits, so the existing _fn_*_geglu (at mlp_bits)
+  // serve them; de-fused mixed layers run plain qmv/qmm + a standalone geglu.
+  metal_compute::ComputeFunction
+      _fn_qmv4, _fn_qmv8, _fn_qmm4, _fn_qmm8, _fn_dequant8,
+      // Batched-decode GEMV twins (realtime-vqa): the MAXM=2 batched GEMV at
+      // each width. Used by the mixed batched path so it takes the proven
+      // batch-GEMV kernel (like the uniform-4-bit models) rather than the
+      // batched steel GEMM. _fn_qmv_batch4 == _fn_qmv_batch when base is 4-bit.
+      _fn_qmv_batch4, _fn_qmv_batch8;
+  // Per-tensor mixed-precision checkpoint (some projections 4-bit, some
+  // 8-bit). Detected in load() by walking each layer's proj packing.
+  bool _mixed = false;
+
   // Matrix-core prefill GEMM state (M5+). _use_mma gates the dense
   // matmul2d path (4-bit checkpoint + supports_matrix_cores); _mma_min_m is
   // the row threshold below which the steel quantized GEMM wins (dequant
@@ -602,10 +641,12 @@ private:
   metal_compute::SharedBuffer _d_x, _d_hn, _d_q, _d_k, _d_v, _d_attn, _d_o,
       _d_act, _d_mlp, _d_ple, _d_pleproj, _d_pli, _d_plg,
       _d_plp, _d_logits, _d_tok;
-  // Dense-path decode scratch: the raw-HF gate output [ffn] (the affine path
-  // fuses gate|up+geglu into _d_act, but dense runs two separate GEMVs). Only
-  // allocated when _dense.
-  metal_compute::SharedBuffer _d_gate;
+  // Dense-path (and de-fused mixed-path) decode scratch: the gate output
+  // [ffn] and up output [ffn]. The uniform affine path fuses gate|up+geglu
+  // into _d_act, but the raw-HF dense path and a de-fused mixed layer (gate
+  // and up at different bit widths) run gate + up as two separate GEMVs +
+  // a standalone geglu into _d_act. Allocated when _dense || _mixed.
+  metal_compute::SharedBuffer _d_gate, _d_up;
   // MoE decode scratch (M=1, iff _cfg.is_moe()). logits[E], ids[top_k] int32,
   // w[top_k], act[top_k*moe_inner], part[top_k*H], out[H] (combined MoE), h1[H]
   // (dense-branch normed). The dense-branch MLP reuses _d_hn/_d_act/_d_mlp; the

@@ -1154,6 +1154,16 @@ function mountEditor(container, opts = {}) {
     }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
     cfgActions.append(applyBtn, removeBtn);
 
+    // Auto-apply on blur (stopped pipelines only): when a field commits (a
+    // text/number box loses focus after an edit), re-POST the whole config
+    // without rebuilding the pane. Self-gates on canEdit() so a running
+    // pipeline never hot-applies -- there the Apply button is the deliberate
+    // trigger (running-config support lands later). `inputs` is captured here
+    // and populated by the schema loop below (filled before any blur fires).
+    const commit = () => {
+      if (canEdit()) { applyConfig(inputs, { rerender: false }); }
+    };
+
     wrap.append(el('div', { class: 'stage-id' }, info.id));
 
     const sp = specForType(info.type);
@@ -1171,7 +1181,7 @@ function mountEditor(container, opts = {}) {
         t('pl.config_readonly')));
     }
     for (const f of info.schema) {
-      const { field, read } = configField(f, !editable, info.type);
+      const { field, read } = configField(f, !editable, info.type, commit);
       inputs.push({ key: f.key, type: f.type, read });
       wrap.append(field);
     }
@@ -1307,7 +1317,7 @@ function mountEditor(container, opts = {}) {
         el('span', { class: 'mb-io-set' }, io(m.outputs))));
   }
 
-  function configField(f, disabled, type) {
+  function configField(f, disabled, type, onCommit) {
     const id = 'f_' + f.key;
     const placeholder = f.default !== undefined && f.default !== null
         ? t('pl.field_default', { val: typeof f.default === 'object'
@@ -1338,6 +1348,14 @@ function mountEditor(container, opts = {}) {
         step: f.type === 'real' ? 'any' : '1',
         placeholder,
         value: present ? (f.current ?? '') : '' });
+      // The scroll wheel must never change a numeric config value. The
+      // browser only increments/decrements a number input while it's
+      // FOCUSED, so intercept the wheel only there -- normal page/pane
+      // scrolling stays intact when the field isn't focused. (The spinner
+      // up/down buttons are hidden in CSS.)
+      input.addEventListener('wheel', (e) => {
+        if (document.activeElement === input) { e.preventDefault(); }
+      }, { passive: false });
       read = () => {
         const s = input.value.trim();
         if (s === '') { return undefined; }
@@ -1436,6 +1454,24 @@ function mountEditor(container, opts = {}) {
         title: t('pl.clear_omit'),
         disabled, onclick: () => { input.value = ''; input.focus(); } },
         t('pl.btn_clear'));
+    } else if (f.type === 'text') {
+      // Multi-line string (backend ConfigType::Text): to the backend this is
+      // identical to a `string` field, but the value is multi-line, so render
+      // a resizable textarea rather than a single-line input. NOT JSON: read
+      // the raw value verbatim (newlines and surrounding whitespace are
+      // significant, so don't trim).
+      input = el('textarea', { id, disabled, rows: 4, placeholder },
+        present ? String(f.current ?? '') : '');
+      read = () => {
+        const s = input.value;
+        // Empty -> omit so the stage falls back to its declared default
+        // (mirrors the single-line `string` field above).
+        return s === '' ? undefined : s;
+      };
+      unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
+        title: t('pl.clear_omit'),
+        disabled, onclick: () => { input.value = ''; input.focus(); } },
+        t('pl.btn_clear'));
     } else {
       // array / object / any -> JSON textarea.
       input = el('textarea', { id, disabled, placeholder },
@@ -1490,6 +1526,10 @@ function mountEditor(container, opts = {}) {
               input.value = JSON.stringify(arr, null, 2);
             }
             input.dispatchEvent(new Event('input', { bubbles: true }));
+            // Picking a path is a deliberate value commit -- auto-apply like a
+            // blur (the programmatic set fires no `change`). Works for the JSON
+            // array path fields too, which the `change` listener skips.
+            if (onCommit) { onCommit(); }
           },
         });
       };
@@ -1507,6 +1547,9 @@ function mountEditor(container, opts = {}) {
         onclick: () => openModelBrowser(f, input, (val) => {
           input.value = val;
           input.dispatchEvent(new Event('input', { bubbles: true }));
+          // Picking a model is a deliberate value commit -- auto-apply like a
+          // blur (the programmatic set fires no `change`).
+          if (onCommit) { onCommit(); }
         }) },
         makeIcon('database', 'sm'));
     }
@@ -1521,10 +1564,26 @@ function mountEditor(container, opts = {}) {
     const field = el('div', { class: 'field' }, label, inputRow);
     const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
     if (docTxt) { field.append(el('div', { class: 'doc' }, docTxt)); }
+    // Auto-apply when a text/number box loses focus after an edit. `change`
+    // fires on blur-after-edit (and Enter), so tabbing through untouched
+    // fields costs nothing; onCommit self-gates on the pipeline being
+    // stopped. `text` is a plain-string textarea that never throws on read,
+    // so it commits on blur like `string`; only the JSON textareas
+    // (array/object/any) are excluded -- a half-typed blob would just throw
+    // on every blur.
+    if (onCommit && (f.type === 'string' || f.type === 'text'
+        || f.type === 'int' || f.type === 'uint' || f.type === 'real')) {
+      input.addEventListener('change', () => onCommit());
+    }
     return { field, read };
   }
 
-  async function applyConfig(inputs) {
+  // `opts.rerender === false` skips rebuilding the config pane after a
+  // successful apply -- used by the auto-apply-on-blur path so committing one
+  // field doesn't tear down (and steal focus from) the field the user just
+  // tabbed into. The Apply button leaves it at the default (rebuild).
+  async function applyConfig(inputs, opts) {
+    const rerender = !(opts && opts.rerender === false);
     const cfg = {};
     try {
       for (const it of inputs) {
@@ -1547,7 +1606,7 @@ function mountEditor(container, opts = {}) {
         state.selectedId, state.selectedStage, cfg);
       toast(t('pl.config_applied'), 'ok');
       renderGraphPane();
-      await renderConfig();
+      if (rerender) { await renderConfig(); }
     } catch (e) { toast(t('pl.apply_failed', { msg: e.message }), 'error'); }
   }
 

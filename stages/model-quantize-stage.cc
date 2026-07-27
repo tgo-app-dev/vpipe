@@ -17,6 +17,7 @@
 #include "generative-models/quantize/model-quantizer.h"
 #include "generative-models/tokenizer.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "stages/model-registry.h"
 
 #include <cctype>
@@ -24,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -128,6 +130,9 @@ dit_class_family_(const std::string& class_name)
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
+  // Mage-Flow's NR-MMDiT is the Qwen-Image dual-stream MMDiT under a different
+  // config (see metal-mage-flow-transformer.h), so it shares that leaf set.
+  if (class_name == "MageFlow") { return "mage-flow"; }
   return {};
 }
 
@@ -216,17 +221,56 @@ t2i_target_subdir_(const std::string& target)
 // copy of large shards (e.g. the ~20 GB w4 DiT when quantizing the text encoder
 // on top). Returns false as soon as the stop fires (a partial `dst` is left for
 // the caller to discard), true on completion.
+// Throttled in-place progress bar, matching the quantizer's own and the
+// lora-fuse one (same width + shape, so the two phases of a run read as one).
+void
+mq_progress_(UiTextStream* bar, const char* phase, std::size_t done,
+             std::size_t total, int& last_pct)
+{
+  if (bar == nullptr || total == 0) { return; }
+  int pct = (int)(done * 100 / total);
+  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
+  if (pct == last_pct) { return; }
+  last_pct = pct;
+  constexpr int W = 24;
+  const int fill = pct * W / 100;
+  std::string b((std::size_t)fill, '#');
+  b += std::string((std::size_t)(W - fill), '-');
+  std::string line =
+      fmt("\r[{}] {}% {} ({}/{})", b, pct, phase, done, total)();
+  while (line.size() < 52) { line += ' '; }
+  bar->write(line);
+}
+
+// Regular files under `p` (recursive) -- the denominator for the copy bar.
+std::size_t
+count_files_(const std::filesystem::path& p)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (fs::is_regular_file(p, ec)) { return 1; }
+  if (!fs::is_directory(p, ec)) { return 0; }
+  std::size_t n = 0;
+  for (fs::recursive_directory_iterator it(p, ec), end; it != end;
+       it.increment(ec)) {
+    if (it->is_regular_file(ec)) { ++n; }
+  }
+  return n;
+}
+
 bool
 link_or_copy_tree_(const std::filesystem::path& src,
                    const std::filesystem::path& dst, std::error_code& ec,
-                   const std::function<bool()>& stop)
+                   const std::function<bool()>& stop,
+                   const std::function<void()>& on_file = {})
 {
   namespace fs = std::filesystem;
   if (stop()) { return false; }
   if (fs::is_directory(src)) {
     fs::create_directories(dst, ec);
     for (const auto& e : fs::directory_iterator(src, ec)) {
-      if (!link_or_copy_tree_(e.path(), dst / e.path().filename(), ec, stop)) {
+      if (!link_or_copy_tree_(e.path(), dst / e.path().filename(), ec, stop,
+                              on_file)) {
         return false;
       }
     }
@@ -239,6 +283,7 @@ link_or_copy_tree_(const std::filesystem::path& src,
   if (le) {   // cross-device / unsupported -> real copy
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
   }
+  if (on_file) { on_file(); }
   return true;
 }
 
@@ -326,8 +371,12 @@ dit_quant_linears_(const std::string& family)
             "add_q_proj", "add_k_proj", "add_v_proj", "to_qkv_mlp_proj",
             "linear_in", "linear_out"};
   }
-  if (family == "qwen-image-edit") {
-    // Dual-stream QwenImageTransformer2DModel. The quantizer matches the LAST
+  if (family == "qwen-image-edit" || family == "mage-flow") {
+    // Dual-stream QwenImageTransformer2DModel -- and Mage-Flow's NR-MMDiT,
+    // whose checkpoint tensor NAMES are identical (that is what let the metal
+    // port reuse the transformer wholesale), so one leaf set covers both.
+    // Mage-Flow simply has no single_transformer_blocks tail.
+    // The quantizer matches the LAST
     // dot-component before ".weight", so use those: to_out is "attn.to_out.0"
     // -> "0" (60, unique); both FeedForward up-projs "*_mlp.net.0.proj" ->
     // "proj" (120); both down-projs "*_mlp.net.2" -> "2" (120). The adaLN
@@ -354,6 +403,13 @@ dit_num_layers_(const std::string& src_dir)
       auto obj = cfg.as_object();
       if (obj.contains("num_layers")) {
         const int n = (int)obj.at("num_layers").as_int(0);
+        if (n > 0) { return n; }
+      }
+      // Mage-Flow's transformer/config.json is FLUX-shaped: the block count is
+      // `depth` (12), with no num_layers. Without this the mixed / AWQ
+      // per-layer ranking would silently run over the default 28 blocks.
+      if (obj.contains("depth")) {
+        const int n = (int)obj.at("depth").as_int(0);
         if (n > 0) { return n; }
       }
     }
@@ -781,7 +837,10 @@ ModelQuantizeStage::quantize_dit_component_(
   if (mc == nullptr) { return false; }
 
   const bool is_flux2 = (family == "flux2");
-  const bool is_qie   = (family == "qwen-image-edit");
+  const bool is_mage  = (family == "mage-flow");
+  // Mage-Flow shares Qwen-Image's block topology and tensor names, so the
+  // modulation handling below applies to it too.
+  const bool is_qie   = (family == "qwen-image-edit") || is_mage;
   const bool awq = _awq;
 
   // Plain group-affine over the DiT leaf set (no LM arch-detect / embedding
@@ -830,6 +889,17 @@ ModelQuantizeStage::quantize_dit_component_(
     // no calib_dir is supplied. Krea-2 and FLUX.2 use family-specific collectors
     // (different encoder / template / tap groups); the quantizer reads the
     // right calib layout via opt.dit_family.
+    if (is_mage && _calib_dir.empty()) {
+      // The on-device collectors drive a family's own encoder + template; no
+      // Mage-Flow collector exists yet, and the Qwen-Image one would build a
+      // QIE DiT config against Mage weights. Refuse rather than silently
+      // calibrate the wrong model -- an explicit calib_dir still works.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): Mage-Flow DiT AWQ has no on-device "
+          "collector yet; supply calib_dir, or drop awq (plain / mixed "
+          "quantization is supported)", this->id()));
+      return false;
+    }
     if (!_calib_dir.empty()) {
       opt.calib_dir = _calib_dir;
     } else {
@@ -1119,15 +1189,38 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
   //    tokenizer/scheduler/model_index.json + the other (un- or already-
   //    quantized) sub-models -- usable directly as a text-to-image hf_dir.
   fs::create_directories(out_dir, ec);
-  for (const auto& e : fs::directory_iterator(root, ec)) {
-    if (e.path().filename().string() == tgt) { continue; }
-    if (!link_or_copy_tree_(e.path(), fs::path(out_dir) / e.path().filename(),
-                            ec, stop)) {
-      session()->info(fmt(
-          "ModelQuantizeStage('{}'): stopped while assembling '{}'",
-          this->id(), out_dir));
-      return false;
+  {
+    // Progress over FILES, not components: on a cross-device destination this
+    // is a real byte copy of the sibling sub-models (a ~9 GB text encoder, a
+    // multi-GB DiT), which otherwise looks like a hang before the quantizer's
+    // own bar appears.
+    std::vector<fs::path> comps;
+    std::size_t total = 0;
+    for (const auto& e : fs::directory_iterator(root, ec)) {
+      if (e.path().filename().string() == tgt) { continue; }
+      comps.push_back(e.path());
+      total += count_files_(e.path());
     }
+    std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
+    int pct = -1;
+    std::size_t done = 0;
+    mq_progress_(bar.get(), "copy", 0, total, pct);
+    for (const auto& c : comps) {
+      if (!link_or_copy_tree_(c, fs::path(out_dir) / c.filename(), ec, stop,
+                              [&] {
+                                ++done;
+                                mq_progress_(bar.get(), "copy", done, total,
+                                             pct);
+                              })) {
+        bar->end();
+        session()->info(fmt(
+            "ModelQuantizeStage('{}'): stopped while assembling '{}'",
+            this->id(), out_dir));
+        return false;
+      }
+    }
+    mq_progress_(bar.get(), "copy", total, total, pct);
+    bar->end();
   }
   session()->log_debug(fmt(
       "ModelQuantizeStage('{}'): copied {} components (all but {}) into '{}'",

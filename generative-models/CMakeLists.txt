@@ -58,6 +58,8 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen-image-transformer.cc
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
+  mage/metal-mage-vae.cc
+  mage/mage-watermark.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc

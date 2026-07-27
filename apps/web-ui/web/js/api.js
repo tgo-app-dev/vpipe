@@ -1,11 +1,21 @@
 // REST client for the web-ui backend (/api/*).
 
 // First-cut auth: a remote server gates /api/* on an 8-char key printed
-// in its console. We persist it and attach it as X-Auth-Key; on a 401
-// we ask the UI (via the registered prompt) for the key and retry once.
+// in its console. We hold it and attach it as X-Auth-Key; on a 401 we ask
+// the UI (via the registered prompt) for the key and retry once.
+//
+// The key is TAB-SESSION scoped: sessionStorage is cleared when the tab /
+// window is closed, so reopening a previously authenticated tab requires
+// re-entering the key. localStorage (the old store) never expires -- it
+// kept a remote client authenticated across tab closes and browser
+// restarts, a standing credential left on the device. sessionStorage still
+// survives a page reload within the same tab, so F5 does not re-prompt.
 const KEY_STORE = 'vpipe_key';
 let authKey = '';
-try { authKey = localStorage.getItem(KEY_STORE) || ''; } catch (e) {}
+try { authKey = sessionStorage.getItem(KEY_STORE) || ''; } catch (e) {}
+// Hygiene: drop any key a prior version left persisted in localStorage so
+// it no longer lingers on disk (forces one re-auth after the upgrade).
+try { localStorage.removeItem(KEY_STORE); } catch (e) {}
 let authPrompt = null;
 // A single shared key-prompt promise. The User I/O view polls a few
 // times a second, so without this every 401 would open its own modal
@@ -15,7 +25,7 @@ let authInflight = null;
 
 export function setAuthKey(k) {
   authKey = k || '';
-  try { localStorage.setItem(KEY_STORE, authKey); } catch (e) {}
+  try { sessionStorage.setItem(KEY_STORE, authKey); } catch (e) {}
 }
 export function setAuthPrompt(fn) { authPrompt = fn; }
 
@@ -201,9 +211,19 @@ export const api = {
   },
   fsMkdir:       (path, name) => req('POST', '/api/fs/mkdir', { path, name }),
   fsRename:      (path, to)   => req('POST', '/api/fs/rename', { path, to }),
+  // Write a UTF-8 text file at server path `path` (sandbox-confined).
+  fsWrite:       (path, text) => req('POST', '/api/fs/write', { path, text }),
   getPipeline:   (id)      => req('GET',  `/api/pipelines/${pid(id)}`),
-  savePipeline:  (id, path)=> req('POST', `/api/pipelines/${pid(id)}/save`,
-                                   path ? { path } : {}),
+  // Save the pipeline to a file. `aux` (optional) is a map of auxiliary
+  // data objects (e.g. {composer: <layout>}) merged into the pipeline's aux
+  // and persisted alongside the graph.
+  savePipeline:  (id, path, aux) =>
+    req('POST', `/api/pipelines/${pid(id)}/save`,
+        Object.assign({}, path ? { path } : {}, aux ? { aux } : {})),
+  // Attach/update the pipeline's auxiliary data objects WITHOUT a full save
+  // dialog (merged into the aux map, written through to its file if it has
+  // one). {composer: <layout>} etc.
+  setPipelineAux:(id, aux) => req('PUT', `/api/pipelines/${pid(id)}/aux`, aux),
   unloadPipeline:(id)      => req('POST', `/api/pipelines/${pid(id)}/unload`),
   launch:        (id)      => req('POST', `/api/pipelines/${pid(id)}/launch`),
   pause:         (id)      => req('POST', `/api/pipelines/${pid(id)}/pause`),

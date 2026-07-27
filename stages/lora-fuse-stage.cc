@@ -9,11 +9,13 @@
 #include "common/vpipe-format.h"
 #include "generative-models/lora-fusion.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "stages/model-registry.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,19 +32,76 @@ std::string
 fused_model_type_(const std::string& dir)
 {
   namespace fs = std::filesystem;
-  std::ifstream in(fs::path(dir) / "config.json");
-  if (in) {
+  // A bare-DiT output has config.json at the root; a self-contained pipeline
+  // carries the DiT config under transformer/. Check both.
+  const fs::path cfgs[] = {fs::path(dir) / "config.json",
+                           fs::path(dir) / "transformer" / "config.json"};
+  for (const fs::path& cfg : cfgs) {
+    std::ifstream in(cfg);
+    if (!in) { continue; }
     FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto o = fd.as_object();
-      if (o.contains("_class_name")) {
-        const std::string cls(o.at("_class_name").as_string(""));
-        if (cls == "Flux2Transformer2DModel") { return "flux2"; }
-        if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
-      }
-    }
+    if (!fd.is_object()) { continue; }
+    auto o = fd.as_object();
+    if (!o.contains("_class_name")) { continue; }
+    const std::string cls(o.at("_class_name").as_string(""));
+    if (cls == "Flux2Transformer2DModel") { return "flux2"; }
+    if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
+    return "krea2";
   }
   return "krea2";
+}
+
+// Recursively replicate `src` into `dst`, hard-linking files where possible
+// (same filesystem -- no data duplication for the ~GB encoder/vae shards) and
+// falling back to a byte copy across devices. Used to place the base pipeline's
+// non-transformer components next to the fused DiT.
+bool
+link_or_copy_tree_(const std::filesystem::path& src,
+                   const std::filesystem::path& dst, std::error_code& ec,
+                   const std::function<bool()>& stop)
+{
+  namespace fs = std::filesystem;
+  if (stop()) { return false; }
+  if (fs::is_directory(src, ec)) {
+    fs::create_directories(dst, ec);
+    if (ec) { return false; }
+    for (const auto& e : fs::directory_iterator(src, ec)) {
+      if (!link_or_copy_tree_(e.path(), dst / e.path().filename(), ec, stop)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  std::error_code le;
+  fs::create_hard_link(src, dst, le);
+  if (le) {   // cross-device / unsupported -> real copy
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) { return false; }
+  }
+  return true;
+}
+
+// Throttled in-place progress bar on the user-facing text stream, mirroring the
+// model-quantize / text-to-image style: redrawn on a carriage return only when
+// the integer percentage changes, space-padded so a shorter redraw overwrites a
+// longer prior one.
+void
+fuse_progress_(UiTextStream* bar, std::size_t done, std::size_t total,
+               int& last_pct, const char* phase)
+{
+  if (bar == nullptr || total == 0) { return; }
+  int pct = (int)(done * 100 / total);
+  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
+  if (pct == last_pct) { return; }
+  last_pct = pct;
+  constexpr int W = 24;
+  const int fill = pct * W / 100;
+  std::string b(static_cast<std::size_t>(fill), '#');
+  b += std::string(static_cast<std::size_t>(W - fill), '-');
+  std::string line =
+      fmt("\r[{}] {}% {} ({}/{})", b, pct, phase, done, total)();
+  while (line.size() < 52) { line += ' '; }
+  bar->write(line);
 }
 
 }  // namespace
@@ -54,11 +113,12 @@ LoraFuseStage::LoraFuseStage(const SessionContextIntf* s,
   : TypedStage<LoraFuseStage>(s, std::move(id), std::move(iports),
                               std::move(config))
 {
-  _base_model  = attr_str("base_model");
-  _lora        = attr_str("lora");
-  _output_name = attr_str("output_name");
-  _models_db   = attr_str("models_db");
-  _scale       = attr_real("scale");
+  _base_model    = attr_str("base_model");
+  _lora          = attr_str("lora");
+  _output_name   = attr_str("output_name");
+  _base_pipeline = attr_str("base_pipeline");
+  _models_db     = attr_str("models_db");
+  _scale         = attr_real("scale");
   if (_models_db.empty()) { _models_db = "models"; }
   if (_scale == 0.0) { _scale = 1.0; }
   if (_base_model.empty()) {
@@ -87,6 +147,13 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "output_name", .type = ConfigType::String, .required = true,
    .doc = "result name -> <cwd>/models/<output_name> (registered), or an "
           "explicit path"},
+  {.key = "base_pipeline", .type = ConfigType::String,
+   .doc = "optional base diffusers pipeline ROOT (dir or key); when set, the "
+          "fused DiT is written under <output>/transformer/ and the pipeline's "
+          "other components (text_encoder/, vae/, tokenizer/, scheduler/, "
+          "model_index.json) are hard-linked/copied alongside -> a "
+          "self-contained model that chain-quantizes like the stock one. Empty "
+          "=> bare DiT output.", .suggest_db = "models"},
   {.key = "scale", .type = ConfigType::Real,
    .doc = "LoRA fusion strength (default 1.0)", .def_real = 1.0},
   {.key = "models_db", .type = ConfigType::String,
@@ -115,7 +182,9 @@ const StageSpec kSpec = {
                "registered model. Handles diffusers and ai-toolkit / ComfyUI "
                "(diffusion_model.*) adapter naming. For Krea-2 point base_model "
                "at the transformer/ DiT and use the result via text-to-image "
-               "dit_dir. Optional trigger in / summary out.",
+               "dit_dir; set base_pipeline to also copy the encoder/vae/tokenizer "
+               "for a self-contained, chain-quantizable model. Optional trigger "
+               "in / summary out.",
   .display_name = "LoRA Fuse",
   .category  = StageCategory::Preparation,
   .iports    = kIports,
@@ -207,20 +276,73 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
     return false;
   }
 
-  session()->info(fmt("LoraFuseStage('{}'): fusing '{}' + LoRA '{}' (scale {}) "
-                      "-> '{}'", this->id(), base_dir, lora_file, _scale,
-                      out_dir));
-  std::string err;
-  if (!genai::fuse_lora(mc, base_dir, lora_file, out_dir, (float)_scale, &err,
-                        stop)) {
-    if (stop()) {
-      session()->info(fmt("LoraFuseStage('{}'): fusion stopped; output '{}' "
-                          "incomplete", this->id(), out_dir));
-    } else {
-      session()->warn(fmt("LoraFuseStage('{}'): {}", this->id(), err));
+  // Self-contained mode: fuse the DiT into <out>/transformer/ and place the base
+  // pipeline's other components next to it; bare-DiT mode fuses into <out>.
+  std::string pipe_root;
+  std::string fuse_out = out_dir;
+  if (!_base_pipeline.empty()) {
+    pipe_root = resolve_model_dir(session(), _models_db, _base_pipeline);
+    if (!fs::is_directory(pipe_root, ec)) {
+      session()->warn(fmt("LoraFuseStage('{}'): base_pipeline '{}' is not a "
+                          "directory", this->id(), pipe_root));
+      return false;
     }
-    return false;
+    fuse_out = (fs::path(out_dir) / "transformer").string();
   }
+
+  session()->info(fmt("LoraFuseStage('{}'): fusing '{}' + LoRA '{}' (scale {}) "
+                      "-> '{}'{}", this->id(), base_dir, lora_file, _scale,
+                      fuse_out,
+                      pipe_root.empty() ? ""
+                          : (" (self-contained from '" + pipe_root + "')")));
+  std::string err;
+  {   // in-place fusion progress bar (per base tensor written)
+    std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
+    int last_pct = -1;
+    const bool ok = genai::fuse_lora(
+        mc, base_dir, lora_file, fuse_out, (float)_scale, &err, stop,
+        [&](std::size_t done, std::size_t total) {
+          fuse_progress_(bar.get(), done, total, last_pct, "fuse");
+        });
+    bar->end();
+    if (!ok) {
+      if (stop()) {
+        session()->info(fmt("LoraFuseStage('{}'): fusion stopped; output '{}' "
+                            "incomplete", this->id(), fuse_out));
+      } else {
+        session()->warn(fmt("LoraFuseStage('{}'): {}", this->id(), err));
+      }
+      return false;
+    }
+  }
+
+  // Copy the base pipeline's non-transformer components alongside the fused DiT
+  // (progress bar over the components; the big encoder/vae shards hard-link).
+  if (!pipe_root.empty()) {
+    std::vector<fs::path> comps;
+    for (const auto& e : fs::directory_iterator(pipe_root, ec)) {
+      if (e.path().filename() != "transformer") { comps.push_back(e.path()); }
+    }
+    std::unique_ptr<UiTextStream> cbar = session()->open_text_stream();
+    int cpct = -1;
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+      fuse_progress_(cbar.get(), i, comps.size(), cpct, "copy");
+      if (stop()) { cbar->end(); return false; }
+      if (!link_or_copy_tree_(comps[i], fs::path(out_dir) / comps[i].filename(),
+                              ec, stop)) {
+        cbar->end();
+        session()->warn(fmt("LoraFuseStage('{}'): failed to copy component '{}' "
+                            "from '{}'", this->id(),
+                            comps[i].filename().string(), pipe_root));
+        return false;
+      }
+    }
+    fuse_progress_(cbar.get(), comps.size(), comps.size(), cpct, "copy");
+    cbar->end();
+    session()->log_normal(fmt("LoraFuseStage('{}'): assembled self-contained "
+                              "model at '{}'", this->id(), out_dir));
+  }
+
   session()->log_normal(fmt("LoraFuseStage('{}'): fused '{}' -> '{}'",
                             this->id(), base_dir, out_dir));
   if (!explicit_path) { register_output_(_output_name, out_dir); }

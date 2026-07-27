@@ -103,6 +103,35 @@ fstr_(string_view s)
   return FlexData::make_string(s);
 }
 
+// Recover the top-level "aux" object from a saved pipeline file (JSON).
+// The pipeline core loader discards it, so we re-read the file here. Returns
+// a null FlexData when the file isn't JSON, carries no aux, or can't be read
+// -- the pipeline still loads, just without auxiliary data.
+FlexData
+aux_from_file_(const std::filesystem::path& real)
+{
+  try {
+    ifstream f(real, ios::binary);
+    if (!f) { return FlexData(); }
+    string contents((istreambuf_iterator<char>(f)),
+                    istreambuf_iterator<char>());
+    if (blank_(contents)) { return FlexData(); }
+    const auto b = contents.find_first_not_of(" \t\r\n");
+    if (b == string::npos || contents[b] != '{') {
+      return FlexData();   // binary-FlexData spec (no JSON aux to recover)
+    }
+    FlexData doc = FlexData::from_json(contents);
+    if (doc.is_object()) {
+      auto o = doc.as_object();
+      if (o.contains("aux")) {
+        FlexData a = o.at("aux");
+        if (a.is_object()) { return a; }
+      }
+    }
+  } catch (const exception&) { /* leave aux empty */ }
+  return FlexData();
+}
+
 // Extract a single query-string parameter value (no URL-decoding
 // beyond '+'); returns empty when absent. `query` is the raw string
 // after '?', e.g. "since=42&foo=bar".
@@ -692,7 +721,23 @@ SessionApi::to_flex_spec_(const Pipe& p) const
   }
   o.insert("stages", std::move(stages));
   o.insert("subpipelines", FlexData::make_array());
+  // Round-trip auxiliary data objects (opaque to the pipeline core).
+  if (p.aux.is_object() && !p.aux.as_object().empty()) {
+    o.insert("aux", p.aux);
+  }
   return spec;
+}
+
+void
+SessionApi::merge_aux_(Pipe& p, const FlexData& incoming)
+{
+  if (!incoming.is_object()) { return; }
+  if (!p.aux.is_object()) { p.aux = FlexData::make_object(); }
+  auto dst = p.aux.as_object();
+  for (const auto& [k, v] : incoming.as_object()) {
+    if (v.is_null()) { dst.erase(k); }
+    else             { dst.insert_or_assign(k, v); }
+  }
 }
 
 // ===================================================================
@@ -910,6 +955,9 @@ SessionApi::h_load_pipeline_(const HttpRequest& req)
   p->handle       = h;
   p->state        = State::Stopped;
   p->storage_path = path;
+  // Recover auxiliary data objects (composer arrangement, etc.) that the
+  // pipeline core dropped -- re-read from the file we just loaded.
+  p->aux          = aux_from_file_(real);
 
   // Recover the editable spec from the live graph.
   FlexData spec = pipeline_to_spec(*pl);
@@ -960,6 +1008,9 @@ SessionApi::h_load_pipeline_(const HttpRequest& req)
   d.insert("state", fstr_(state_name_(p->state)));
   d.insert("storage_path", fstr_(p->storage_path));
   d.insert("graph", graph_json_(*p));
+  if (p->aux.is_object() && !p->aux.as_object().empty()) {
+    d.insert("aux", p->aux);
+  }
   _pipes.push_back(std::move(p));
   return HttpResponse::json(200, detail.to_json());
 }
@@ -978,6 +1029,9 @@ SessionApi::h_get_pipeline_(const HttpRequest& req)
   d.insert("state", fstr_(state_name_(p->state)));
   d.insert("storage_path", fstr_(p->storage_path));
   d.insert("graph", graph_json_(*p));
+  if (p->aux.is_object() && !p->aux.as_object().empty()) {
+    d.insert("aux", p->aux);
+  }
   return HttpResponse::json(200, detail.to_json());
 }
 
@@ -990,6 +1044,11 @@ SessionApi::h_save_pipeline_(const HttpRequest& req)
   auto it = req.params.find("id");
   Pipe* p = (it != req.params.end()) ? find_(it->second) : nullptr;
   if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+
+  // A save may carry updated auxiliary data objects to persist alongside.
+  if (body->is_object() && body->as_object().contains("aux")) {
+    merge_aux_(*p, body->as_object().at("aux"));
+  }
 
   string path = p->storage_path;
   if (body->is_object() && body->as_object().contains("path")) {
@@ -1024,6 +1083,51 @@ SessionApi::h_save_pipeline_(const HttpRequest& req)
   FlexData o = FlexData::make_object();
   o.as_object().insert("ok", FlexData::make_bool(true));
   o.as_object().insert("storage_path", fstr_(path));
+  return HttpResponse::json(200, o.to_json());
+}
+
+// PUT /api/pipelines/:id/aux -- attach/update auxiliary data objects (e.g.
+// the composer view arrangement). The request body's keys are merged into
+// the pipeline's aux map (null value = erase). If the pipeline already has a
+// storage path, the change is written through to that file so it persists;
+// otherwise it stays in the session until the pipeline is next saved.
+HttpResponse
+SessionApi::h_set_pipeline_aux_(const HttpRequest& req)
+{
+  auto body = parse_json_body_(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "invalid JSON body");
+  }
+  lock_guard<mutex> lk(_mu);
+  auto it = req.params.find("id");
+  Pipe* p = (it != req.params.end()) ? find_(it->second) : nullptr;
+  if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+
+  // A body of {"aux": {...}} or a bare {...} object are both accepted.
+  const FlexData& incoming =
+      body->as_object().contains("aux") ? body->as_object().at("aux")
+                                        : *body;
+  merge_aux_(*p, incoming);
+
+  bool persisted = false;
+  if (!p->storage_path.empty()) {
+    string cerr;
+    std::filesystem::path real =
+        _sctx ? _sctx->confine_path(p->storage_path, /*for_write=*/true,
+                                    &cerr)
+              : std::filesystem::path(p->storage_path);
+    if (!real.empty()) {
+      FlexData spec = to_flex_spec_(*p);
+      ofstream f(real, ios::binary);
+      if (f) { f << spec.to_json(/*pretty=*/true); persisted = bool(f); }
+    }
+  }
+
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("ok", FlexData::make_bool(true));
+  oo.insert("persisted", FlexData::make_bool(persisted));
+  oo.insert("storage_path", fstr_(p->storage_path));
   return HttpResponse::json(200, o.to_json());
 }
 
@@ -2606,6 +2710,47 @@ SessionApi::h_fs_rename_(const HttpRequest& req)
 }
 
 HttpResponse
+SessionApi::h_fs_write_(const HttpRequest& req)
+{
+  // Write a UTF-8 text file at virtual `path` (its parent must exist),
+  // truncating any existing file. Sandbox-confined for write. Used by the
+  // composer's Save-to-file (a JSON view arrangement).
+  namespace fs = std::filesystem;
+  auto body = parse_json_body_(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "expected object {path, text}");
+  }
+  auto bo = body->as_object();
+  const string pathv = string(bo.contains("path")
+                                  ? bo.at("path").as_string("") : "");
+  if (pathv.empty()) { return HttpResponse::error(400, "missing 'path'"); }
+  const string text = string(bo.contains("text")
+                                 ? bo.at("text").as_string("") : "");
+  string   cv, cerr;
+  fs::path real = fs_resolve_(pathv, /*for_write=*/true, &cv, &cerr);
+  if (real.empty()) {
+    return HttpResponse::error(400, cerr.empty() ? "rejected" : cerr);
+  }
+  std::error_code ec;
+  if (fs::is_directory(real, ec)) {
+    return HttpResponse::error(400, "is a directory: " + cv);
+  }
+  ofstream f(real, ios::binary | ios::trunc);
+  if (!f) {
+    return HttpResponse::error(500, "cannot open '" + cv + "' for write");
+  }
+  f.write(text.data(), static_cast<std::streamsize>(text.size()));
+  if (!f) {
+    return HttpResponse::error(500, "write to '" + cv + "' failed");
+  }
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("ok", FlexData::make_bool(true));
+  oo.insert("path", fstr_(cv));
+  return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
 SessionApi::h_io_limit_get_(const HttpRequest&)
 {
   if (!_ui) { return HttpResponse::error(404, "user I/O not available"); }
@@ -2989,6 +3134,8 @@ SessionApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_get_pipeline_(r); });
   s.route("POST", "/api/pipelines/:id/save",
           [this](const HttpRequest& r) { return h_save_pipeline_(r); });
+  s.route("PUT", "/api/pipelines/:id/aux",
+          [this](const HttpRequest& r) { return h_set_pipeline_aux_(r); });
   s.route("POST", "/api/pipelines/:id/unload",
           [this](const HttpRequest& r) { return h_unload_pipeline_(r); });
   s.route("POST", "/api/pipelines/:id/launch",
@@ -3102,6 +3249,8 @@ SessionApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_fs_mkdir_(r); });
   s.route("POST", "/api/fs/rename",
           [this](const HttpRequest& r) { return h_fs_rename_(r); });
+  s.route("POST", "/api/fs/write",
+          [this](const HttpRequest& r) { return h_fs_write_(r); });
 
   s.route("GET", "/api/db/list",
           [this](const HttpRequest& r) { return h_db_list_(r); });

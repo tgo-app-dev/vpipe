@@ -25,19 +25,17 @@ namespace vpipe {
 // shift_type -- "exponential" | "linear".
 // rho        -- karras curvature (default 7).
 //
-// Defaults come from a model's scheduler config when `model` is set
-// (time_shift_type -> shift_type, and max_shift/shift -> shift); any explicit
-// config field overrides. With no `model`, the built-in distilled turbo defaults
-// apply (simple / 8 / 1.15 / exponential / 7).
+// This stage is MODEL-AGNOSTIC: it forwards the user's schedule choice and does
+// not read any model's scheduler config (the text-to-image stage owns the
+// model). The built-in distilled turbo defaults apply unless a config field
+// overrides (simple / 8 / 1.15 / exponential / 7).
 //
 // Config (FlexData object):
-//   model      (string, optional) -- model dir/key to read scheduler defaults.
-//   type       (string, optional) -- override "simple"/"karras"/"exponential".
+//   type       (string, optional) -- "simple" (default)/"karras"/"exponential".
 //   steps      (int,    optional) -- override step count (default 8).
 //   shift      (real,   optional) -- override mu (default 1.15).
 //   shift_type (string, optional) -- override "exponential"/"linear".
 //   rho        (real,   optional) -- override karras curvature (default 7).
-//   models_db  (string, default "models") -- registry for resolve_model_dir.
 class SchedulerSelectStage final : public TypedStage<SchedulerSelectStage> {
 public:
   static constexpr const char* kTypeName = "scheduler-select";
@@ -56,10 +54,8 @@ public:
   FlexData resolved_spec() const;
 
 private:
-  std::string  _model;
   std::string  _type;
   std::string  _shift_type;
-  std::string  _models_db;
   std::int64_t _steps = 0;
   double       _shift = 0.0;
   double       _rho = 0.0;

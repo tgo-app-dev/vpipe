@@ -466,16 +466,19 @@ kernel void quant_f16_i8_row(
   if (lid == 0) { scales[row] = (half)(am * (1.0f / 127.0f)); }
 }
 
-// Group-512 per-row f16 -> i8 quant for the K-chunked int8 GEMM: scales
+// Group-512 per-row VPIPE_ELT -> i8 quant for the K-chunked int8 GEMM: scales
 // vary along K in groups of 512 (finer than per-row = better outlier
 // isolation), one SIMDGROUP per group (32 lanes x 16 elems = 512; pure
-// simd_max, no tgmem). scales layout [M, K/512]. K % 512 == 0.
+// simd_max, no tgmem). scales layout [M, K/512]. K % 512 == 0. The element
+// type is VPIPE_ELT (half or bfloat -- the FLUX.2 bf16 DiT feeds this its
+// bf16 activations/weights; a bf16 group's absmax can exceed f16's 65504, so
+// the derived scale is stored VPIPE_ELT, not half, to avoid overflow).
 //   0:x[M,K] 1:q[M,K] 2:scales[M,K/512] 3:K
 //   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
 kernel void quant_f16_i8_row_g512(
-    const device half* x      [[buffer(0)]],
-    device char*       q      [[buffer(1)]],
-    device half*       scales [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device char*            q      [[buffer(1)]],
+    device VPIPE_ELT*       scales [[buffer(2)]],
     const constant int& K     [[buffer(3)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
@@ -485,11 +488,11 @@ kernel void quant_f16_i8_row_g512(
   const int G = K / 512;
   for (int g = (int)sgid; g < G; g += 8) {
     const int64_t base = (int64_t)row * K + g * 512 + (int)lane * 16;
-    const device half* xp = x + base;
+    const device VPIPE_ELT* xp = x + base;
     float am = 0.0f;
-    half2 h[8];
+    vec<VPIPE_ELT, 2> h[8];
     for (int i = 0; i < 8; ++i) {
-      h[i] = *reinterpret_cast<const device half2*>(xp + i * 2);
+      h[i] = *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(xp + i * 2);
       am = max(am, max(fabs((float)h[i].x), fabs((float)h[i].y)));
     }
     am = simd_max(am);
@@ -502,7 +505,7 @@ kernel void quant_f16_i8_row_g512(
       *reinterpret_cast<device char2*>(qp + i * 2) = o;
     }
     if (lane == 0) {
-      scales[(int64_t)row * G + g] = (half)(am * (1.0f / 127.0f));
+      scales[(int64_t)row * G + g] = (VPIPE_ELT)(am * (1.0f / 127.0f));
     }
   }
 }

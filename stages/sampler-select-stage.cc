@@ -4,11 +4,8 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
-#include "stages/model-registry.h"
 
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,9 +29,6 @@ canon_sampler_method(const std::string& m)
 }
 
 const ConfigKey kAttrs[] = {
-  {.key = "model", .type = ConfigType::String, .required = false,
-   .doc = "model dir/key to read the scheduler default method",
-   .suggest_db = "models"},
   {.key = "method", .type = ConfigType::String, .required = false,
    .doc = "sampler method: euler (default) | heun | dpmpp_2m | dpmpp_sde"},
   {.key = "eta", .type = ConfigType::Real, .required = false,
@@ -43,8 +37,6 @@ const ConfigKey kAttrs[] = {
    .doc = "dpmpp_sde added-noise scale (default 1.0)"},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "dpmpp_sde noise seed (default 0)"},
-  {.key = "models_db", .type = ConfigType::String, .required = false,
-   .doc = "model registry db for resolve_model_dir (default \"models\")"},
 };
 const PortSpec kOports[] = {
   {.name = "sampler",
@@ -73,10 +65,7 @@ SamplerSelectStage::SamplerSelectStage(const SessionContextIntf* s,
   : TypedStage<SamplerSelectStage>(s, std::move(id), std::move(iports),
                                    std::move(config))
 {
-  _model     = attr_str("model");
   _method    = attr_str("method");
-  _models_db = attr_str("models_db");
-  if (_models_db.empty()) { _models_db = "models"; }
   auto o = this->config().as_object();
   if (o.contains("eta")) { _eta = attr_real("eta"); _eta_set = true; }
   if (o.contains("s_noise")) {
@@ -105,28 +94,11 @@ SamplerSelectStage::spec() const noexcept
 FlexData
 SamplerSelectStage::resolved_spec() const
 {
+  // Model-agnostic: this stage forwards the user's sampler choice and does NOT
+  // read the model's scheduler config (the text-to-image stage owns the model).
+  // The built-in distilled-turbo default (euler) applies unless `method` (already
+  // canonicalized in the ctor) overrides it.
   std::string method = "euler";
-
-  // Model scheduler config -> default method (_class_name).
-  if (!_model.empty()) {
-    namespace fs = std::filesystem;
-    const std::string dir = resolve_model_dir(session(), _models_db, _model);
-    std::ifstream in(fs::path(dir) / "scheduler" / "scheduler_config.json");
-    if (!in) { in.open((fs::path(dir) / "scheduler_config.json")); }
-    if (in) {
-      FlexData fd = FlexData::from_json(in);
-      if (fd.is_object()) {
-        auto o = fd.as_object();
-        if (o.contains("_class_name")) {
-          const std::string cn(o.at("_class_name").as_string(""));
-          if (cn.find("Heun") != std::string::npos) { method = "heun"; }
-          else if (cn.find("Euler") != std::string::npos) { method = "euler"; }
-        }
-      }
-    }
-  }
-
-  // Explicit config overrides (method already canonicalized in the ctor).
   if (!_method.empty()) { method = _method; }
   const double eta = _eta_set ? _eta : 1.0;
   const double s_noise = _s_noise_set ? _s_noise : 1.0;

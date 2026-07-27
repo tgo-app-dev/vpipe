@@ -222,6 +222,8 @@ add_vpipe_metal_kernel(letterbox_planar_u8_to_bgra_u8
                        SRC image-processing/letterbox_planar_u8_to_bgra_u8.metal)
 add_vpipe_metal_kernel(letterbox_planar_u8_to_rgb_f16
                        SRC image-processing/letterbox_planar_u8_to_rgb_f16.metal)
+add_vpipe_metal_kernel(resample_lanczos_planar_u8
+                       SRC image-processing/resample_lanczos_planar_u8.metal)
 add_vpipe_metal_kernel(motion_signature_u8
                        SRC image-processing/motion_signature_u8.metal)
 add_vpipe_metal_kernel(motion_diff_u8

@@ -3,6 +3,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
@@ -28,15 +29,12 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
                                std::move(config))
 {
   // Deferred validation (see Stage::fail_config): construct for any config so
-  // a graph can be built/edited before hf_dir is supplied.
+  // a graph can be built/edited before hf_dir is supplied. hf_dir is OPTIONAL
+  // now -- a model-select source on the model iport can supply it instead --
+  // so the "no model at all" case is reported at initialize()/process() time.
   _hf_dir    = attr_str("hf_dir");
   _models_db = attr_str("models_db");
   if (_models_db.empty()) { _models_db = "models"; }
-  if (_hf_dir.empty()) {
-    fail_config(fmt(
-        "VaeEncodeStage('{}'): config.hf_dir is required (the Krea-2-Turbo "
-        "model dir; the VAE is read from <hf_dir>/vae)", this->id()));
-  }
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
@@ -108,12 +106,18 @@ VaeEncodeStage::parse_pad_color_()
 }
 
 namespace {
+// The model iport (a model-select source) overrides hf_dir. Appended after the
+// primary `image` input, so it is iport1. (Referenced only from the Apple-gated
+// code below; marked maybe_unused for the inert non-Apple build.)
+[[maybe_unused]] constexpr unsigned kModelPort = 1;
+
 const ConfigKey kAttrs[] = {
-  {.key = "hf_dir", .type = ConfigType::String, .required = true,
-   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit model dir (VAE read from "
-          "<hf_dir>/vae)",
+  {.key = "hf_dir", .type = ConfigType::String, .required = false,
+   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
+          "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
+          "model iport overrides it",
    .suggest_db = "models",
-   .suggest_db_type = "krea2,flux2,qwen-image-edit"},
+   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
@@ -131,6 +135,9 @@ const PortSpec kIports[] = {
                            "0..255 or f32 [-1,1])",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
+  {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
+                           "source; overrides the hf_dir config",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "latent", .doc = "f32 whitened latent [z_dim, H/8, W/8] (unpacked)",
@@ -151,7 +158,7 @@ const StageSpec kSpec = {
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 // VAE family from the vae config.json `_class_name` ("AutoencoderKLFlux2" ->
-// "flux2"; else "krea2").
+// "flux2"; "MageVAE" -> "mage"; else "krea2").
 std::string
 vae_family_(const std::string& vae_dir)
 {
@@ -161,14 +168,36 @@ vae_family_(const std::string& vae_dir)
     FlexData fd = FlexData::from_json(in);
     if (fd.is_object()) {
       auto obj = fd.as_object();
-      if (obj.contains("_class_name") &&
-          std::string(obj.at("_class_name").as_string("")) ==
-              "AutoencoderKLFlux2") {
-        return "flux2";
+      if (obj.contains("_class_name")) {
+        const std::string cls(obj.at("_class_name").as_string(""));
+        if (cls == "AutoencoderKLFlux2") { return "flux2"; }
+        if (cls == "MageVAE") { return "mage"; }
       }
     }
   }
   return "krea2";
+}
+
+// MageVAE geometry from vae/config.json (see the vae-decode twin).
+genai::MetalMageVae::Config
+mage_vae_config_(const std::string& vae_dir)
+{
+  genai::MetalMageVae::Config c;
+  std::ifstream in(std::filesystem::path(vae_dir) / "config.json");
+  if (in) {
+    FlexData fd = FlexData::from_json(in);
+    if (fd.is_object()) {
+      auto o = fd.as_object();
+      if (o.contains("latent_channels")) {
+        c.latent_channels =
+            (int)o.at("latent_channels").as_int(c.latent_channels);
+      }
+      if (o.contains("downsample_factor")) {
+        c.patch = (int)o.at("downsample_factor").as_int(c.patch);
+      }
+    }
+  }
+  return c;
 }
 #endif
 }  // namespace
@@ -184,14 +213,32 @@ VaeEncodeStage::spec() const noexcept
 Job
 VaeEncodeStage::initialize(RuntimeContext& ctx)
 {
-  (void)ctx;
-  if (_hf_dir.empty()) { co_return; }   // ctor already recorded the error.
+  // Defer the VAE load when a model-select source feeds the model iport (its
+  // beat only arrives after the init barrier, in process()). Otherwise load
+  // now from the config hf_dir, as before.
+  const bool model_from_iport =
+      ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
+  if (!model_from_iport) { ensure_loaded_(); }
+  co_return;
+}
+
+void
+VaeEncodeStage::ensure_loaded_()
+{
+  if (_load_attempted) { return; }   // idempotent: load at most once
+  _load_attempted = true;
+  if (_hf_dir.empty()) {
+    session()->error(fmt(
+        "VaeEncodeStage('{}'): no model -- set config.hf_dir or wire a "
+        "model-select source to the model iport; inert", this->id()));
+    return;
+  }
   auto* mc = session() ? session()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "VaeEncodeStage('{}'): no metal-compute backend on this session; "
         "the stage is inert", this->id()));
-    co_return;
+    return;
   }
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
   namespace fs = std::filesystem;
@@ -240,7 +287,22 @@ VaeEncodeStage::initialize(RuntimeContext& ctx)
           "'{}'; inert", this->id(), vae_dir));
       _flux2_vae.reset();
     }
-    co_return;
+    return;
+  }
+
+  if (_family == "mage") {
+    session()->info(fmt("VaeEncodeStage('{}'): loading MageVAE encoder from "
+                        "'{}'", this->id(), vae_dir));
+    _mage_vae = genai::MetalMageVae::load(vae_dir, mc,
+                                          mage_vae_config_(vae_dir),
+                                          /*with_encoder=*/true);
+    if (!_mage_vae || !_mage_vae->has_encoder()) {
+      session()->error(fmt(
+          "VaeEncodeStage('{}'): failed to load the MageVAE encoder from '{}'; "
+          "inert", this->id(), vae_dir));
+      _mage_vae.reset();
+    }
+    return;
   }
 
   genai::MetalKrea2Vae::Config cfg;   // Qwen-Image VAE defaults
@@ -279,7 +341,7 @@ VaeEncodeStage::initialize(RuntimeContext& ctx)
         "VaeEncodeStage('{}'): vae config.json is missing latents_mean/"
         "latents_std ({}/{} of z_dim {}); the stage is inert", this->id(),
         cfg.latents_mean.size(), cfg.latents_std.size(), cfg.z_dim));
-    co_return;
+    return;
   }
 
   session()->info(fmt(
@@ -291,7 +353,7 @@ VaeEncodeStage::initialize(RuntimeContext& ctx)
         "VaeEncodeStage('{}'): failed to load the VAE encoder from '{}'; "
         "inert", this->id(), vae_dir));
     _vae.reset();
-    co_return;
+    return;
   }
   session()->log_debug(fmt(
       "VaeEncodeStage('{}'): VAE encoder ready from '{}' (z_dim {}, base_dim "
@@ -301,12 +363,42 @@ VaeEncodeStage::initialize(RuntimeContext& ctx)
 
 namespace {
 
+// Anti-aliased separable resample weights for one axis (srcN -> dstN). A
+// triangle (linear) filter whose support scales with the downscale ratio: on
+// downscale it averages the full source footprint (no aliasing), and on upscale
+// (ratio <= 1) it reduces EXACTLY to 2-tap bilinear. Each entry gives the first
+// source index and its contiguous, normalized weights.
+struct AxisContrib { int i0; std::vector<float> w; };
+static std::vector<AxisContrib>
+build_resample_(int srcN, int dstN)
+{
+  std::vector<AxisContrib> c((std::size_t)dstN);
+  const double ratio = (double)srcN / (double)dstN;
+  const double fscale = std::max(1.0, ratio);   // filter scale, in source px
+  for (int o = 0; o < dstN; ++o) {
+    const double center = (o + 0.5) * ratio - 0.5;
+    const int i0 = (int)std::ceil(center - fscale);
+    const int i1 = (int)std::floor(center + fscale);
+    AxisContrib& e = c[(std::size_t)o];
+    e.i0 = i0;
+    double sum = 0.0;
+    for (int i = i0; i <= i1; ++i) {
+      const double t = std::fabs((i - center) / fscale);
+      const double w = t < 1.0 ? (1.0 - t) : 0.0;
+      e.w.push_back((float)w);
+      sum += w;
+    }
+    if (sum > 0.0) { for (float& w : e.w) { w = (float)(w / sum); } }
+  }
+  return c;
+}
+
 // Produce a normalized f32 [-1,1] planar RGB [3,outH,outW] from the source
 // image bytes (channel-first [3,sH,sW], U8 0..255 or f32 already in [-1,1]).
-// When the target differs from the source the picture is scaled to fit with
-// its original aspect ratio (bilinear), centered, and the leftover border is
-// filled with `pad` (per-channel, already mapped to [-1,1]). Same size =>
-// straight normalize, no resample.
+// When the target differs from the source the picture is scaled to fit with its
+// original aspect ratio (anti-aliased separable resample), centered, and the
+// leftover border is filled with `pad` (per-channel, already mapped to [-1,1]).
+// Same size => straight normalize, no resample.
 std::vector<float>
 normalize_and_fit_(const std::uint8_t* src, bool is_u8, int sH, int sW,
                    int outH, int outW, const float pad[3])
@@ -340,27 +432,36 @@ normalize_and_fit_(const std::uint8_t* src, bool is_u8, int sH, int sW,
       out[base + i] = pad[c];
     }
   }
+  // Separable anti-aliased resample: horizontal (sW -> newW) into a scratch,
+  // then vertical (sH -> newH) into the centered output window. The triangle
+  // filter's footprint = the downscale ratio, so shrinking a high-res photo no
+  // longer aliases fine detail (pleats, hair); an upscale stays 2-tap bilinear.
+  const std::vector<AxisContrib> cx = build_resample_(sW, newW);
+  const std::vector<AxisContrib> cy = build_resample_(sH, newH);
+  std::vector<float> tmp((std::size_t)3 * sH * newW);
+  for (int c = 0; c < 3; ++c) {
+    for (int y = 0; y < sH; ++y) {
+      for (int ox = 0; ox < newW; ++ox) {
+        const AxisContrib& e = cx[(std::size_t)ox];
+        float acc = 0.0f;
+        for (std::size_t k = 0; k < e.w.size(); ++k) {
+          const int sx = std::min(std::max(e.i0 + (int)k, 0), sW - 1);
+          acc += e.w[k] * src_val(c, y, sx);
+        }
+        tmp[((std::size_t)c * sH + y) * newW + ox] = acc;
+      }
+    }
+  }
   for (int c = 0; c < 3; ++c) {
     for (int oy = 0; oy < newH; ++oy) {
-      const double sy = ((oy + 0.5) * sH / newH) - 0.5;
-      const int y0 = (int)std::floor(sy);
-      const float fy = (float)(sy - y0);
-      const int y0c = std::min(std::max(y0, 0), sH - 1);
-      const int y1c = std::min(std::max(y0 + 1, 0), sH - 1);
+      const AxisContrib& e = cy[(std::size_t)oy];
       for (int ox = 0; ox < newW; ++ox) {
-        const double sx = ((ox + 0.5) * sW / newW) - 0.5;
-        const int x0 = (int)std::floor(sx);
-        const float fx = (float)(sx - x0);
-        const int x0c = std::min(std::max(x0, 0), sW - 1);
-        const int x1c = std::min(std::max(x0 + 1, 0), sW - 1);
-        const float v00 = src_val(c, y0c, x0c);
-        const float v01 = src_val(c, y0c, x1c);
-        const float v10 = src_val(c, y1c, x0c);
-        const float v11 = src_val(c, y1c, x1c);
-        const float top = v00 + fx * (v01 - v00);
-        const float bot = v10 + fx * (v11 - v10);
-        out[((std::size_t)c * outH + (offY + oy)) * outW + (offX + ox)] =
-            top + fy * (bot - top);
+        float acc = 0.0f;
+        for (std::size_t k = 0; k < e.w.size(); ++k) {
+          const int sy = std::min(std::max(e.i0 + (int)k, 0), sH - 1);
+          acc += e.w[k] * tmp[((std::size_t)c * sH + sy) * newW + ox];
+        }
+        out[((std::size_t)c * outH + (offY + oy)) * outW + (offX + ox)] = acc;
       }
     }
   }
@@ -372,6 +473,19 @@ normalize_and_fit_(const std::uint8_t* src, bool is_u8, int sH, int sW,
 Job
 VaeEncodeStage::process(RuntimeContext& ctx)
 {
+  // Latch the shared model (iport1) once -- a model-select source overrides the
+  // hf_dir config -- then lazily load the VAE before the first encode.
+  if (!_model_latched && ctx.num_iports() > kModelPort &&
+      ctx.iport_connected(kModelPort)) {
+    auto mb = co_await ctx.read(kModelPort);
+    _model_latched = true;
+    if (const auto* mfd =
+            mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
+      if (apply_model_select_beat(mfd->data, _hf_dir, _models_db)) {
+        ensure_loaded_();
+      }
+    }
+  }
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }   // upstream EOS -> close oport
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
@@ -420,7 +534,12 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     if (imgbuf.empty()) { co_return; }
     { auto* d = static_cast<_Float16*>(imgbuf.contents());
       for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; } }
-    metal_compute::SharedBuffer lat = _flux2_vae->encode(imgbuf, H, W);
+    metal_compute::SharedBuffer lat;
+    {   // LLM-lane perf event: one VAE encode per reference image.
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)H * W);
+      lat = _flux2_vae->encode(imgbuf, H, W);
+    }
     if (lat.empty()) {
       session()->warn(fmt(
           "VaeEncodeStage('{}'): FLUX.2 encode failed; skipping", this->id()));
@@ -440,6 +559,76 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     session()->log_debug(fmt(
         "VaeEncodeStage('{}'): FLUX.2 encoded latent #{} [{}, {}, {}]",
         this->id(), _latents_emitted, Cdit, lh, lw));
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Mage-Flow MageVAE: encode to [128, H/16, W/16] (16x, patch_size 1 in
+  // the DiT), so the image must be a multiple of 16. The posterior is NOT
+  // sampled (vae/config.json sample_posterior:false) -- encode returns the
+  // MEAN, so this is deterministic and needs no whitening. ----
+  if (_family == "mage") {
+    if (!_mage_vae) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): MageVAE encoder not loaded; skipping",
+          this->id()));
+      co_return;
+    }
+    const int P = _mage_vae->config().patch;
+    const int sH = (int)tbp->shape[1], sW = (int)tbp->shape[2];
+    if (sH <= 0 || sW <= 0) { co_return; }
+    const bool resize = _target_w > 0 && _target_h > 0;
+    const int H = resize ? _target_h : sH;
+    const int W = resize ? _target_w : sW;
+    if ((H % P) != 0 || (W % P) != 0) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): MageVAE image [{}x{}] must be a positive "
+          "multiple of {} (or set target_width/height); skipping", this->id(),
+          W, H, P));
+      co_return;
+    }
+    auto* mc = session()->metal_compute();
+    const auto img = tbp->materialize_contiguous();
+    const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
+    const float pad[3] = {
+      (float)_pad_r / 255.0f * 2.0f - 1.0f,
+      (float)_pad_g / 255.0f * 2.0f - 1.0f,
+      (float)_pad_b / 255.0f * 2.0f - 1.0f,
+    };
+    const std::vector<float> norm =
+        normalize_and_fit_(img.data(), is_u8, sH, sW, H, W, pad);
+    const std::size_t n = (std::size_t)3 * H * W;
+    metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
+    if (imgbuf.empty()) { co_return; }
+    { auto* d = static_cast<_Float16*>(imgbuf.contents());
+      for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; } }
+    std::string eerr;
+    metal_compute::SharedBuffer lat;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)H * W);
+      lat = _mage_vae->encode(imgbuf, H, W, &eerr);
+    }
+    if (lat.empty()) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): MageVAE encode failed ({}); skipping",
+          this->id(), eerr.empty() ? "unknown error" : eerr));
+      co_return;
+    }
+    const int Cz = _mage_vae->config().latent_channels;
+    const int lh = H / P, lw = W / P;
+    const std::size_t nz = (std::size_t)Cz * lh * lw;
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {Cz, lh, lw};
+    out->resize_contiguous(nz);
+    const auto* lp = static_cast<const _Float16*>(lat.contents());
+    float* op = out->as_f32();
+    for (std::size_t i = 0; i < nz; ++i) { op[i] = (float)lp[i]; }
+    ++_latents_emitted;
+    session()->log_debug(fmt(
+        "VaeEncodeStage('{}'): MageVAE encoded latent #{} [{}, {}, {}]",
+        this->id(), _latents_emitted, Cz, lh, lw));
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -502,7 +691,12 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; }
   }
 
-  metal_compute::SharedBuffer lat = _vae->encode(imgbuf, H, W);
+  metal_compute::SharedBuffer lat;
+  {
+    PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae, kPerfLlmVaeBegin,
+                       (std::uint64_t)H * W);
+    lat = _vae->encode(imgbuf, H, W);
+  }
   if (lat.empty()) {
     session()->warn(fmt(
         "VaeEncodeStage('{}'): encode failed; skipping", this->id()));

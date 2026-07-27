@@ -68,4 +68,35 @@ model_dir_available(const SessionContextIntf* session,
   return std::filesystem::exists(dir, ec) && !ec;
 }
 
+bool
+apply_model_select_beat(const FlexData& beat,
+                        std::string&    hf_dir,
+                        std::string&    models_db)
+{
+  std::string ref, db;
+  bool has_db = false;
+  if (beat.is_string()) {
+    ref = std::string(beat.as_string(""));
+  } else if (beat.is_object()) {
+    auto o = beat.as_object();
+    if (o.contains("hf_dir")) {
+      ref = std::string(o.at("hf_dir").as_string(""));
+    } else if (o.contains("model")) {
+      ref = std::string(o.at("model").as_string(""));
+    }
+    if (o.contains("models_db")) {
+      db = std::string(o.at("models_db").as_string(""));
+      has_db = !db.empty();
+    }
+  }
+  if (ref.empty()) {
+    return false;
+  }
+  hf_dir = ref;
+  if (has_db) {
+    models_db = db;
+  }
+  return true;
+}
+
 }

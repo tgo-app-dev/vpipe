@@ -664,6 +664,13 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   border: 1px solid var(--line); border-radius: 4px; color: var(--fg);
   font: inherit; font-size: 12px;
 }
+/* Config numeric fields: no up/down spinner buttons (and the wheel is
+   blocked in JS), so the value only changes by typing. */
+.field input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+.field input[type=number]::-webkit-outer-spin-button,
+.field input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
 .field textarea { min-height: 54px; resize: vertical; }
 .field input:focus, .field textarea:focus {
   outline: none; border-color: var(--accent);
@@ -1260,9 +1267,35 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   position: absolute; inset: 0;
   display: flex; flex-direction: column; min-height: 0;
 }
-.preview-video {
-  flex: 1 1 auto; min-height: 0; width: 100%;
+/* The zoom/pan viewport clips the transformed media; the media wrapper
+   stacks the MSE <video> and the still-image <img> (one visible). */
+.preview-viewport {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  overflow: hidden; background: #000;
+  touch-action: none;              /* pointer drag pans, not scrolls */
+}
+.preview-viewport.zoomable { cursor: grab; }
+.preview-viewport.panning  { cursor: grabbing; }
+/* Sized in JS to the on-screen frame rect (so the browser rasterizes at
+   the zoomed resolution -- sharp); translate-only transform pans it. */
+.preview-media {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  transform-origin: top left; will-change: transform;
+  user-select: none;
+}
+.preview-video, .preview-still {
+  position: absolute; inset: 0; width: 100%; height: 100%;
   background: #000; object-fit: contain;
+}
+.preview-still {
+  display: none;                   /* video is the default face */
+  pointer-events: none; -webkit-user-drag: none;
+}
+.preview-media.show-still .preview-video { display: none; }
+.preview-media.show-still .preview-still { display: block; }
+/* View controls reuse the .graph-ctl look; greyed out for audio-only. */
+.preview-viewport.no-view .preview-controls {
+  opacity: .4; pointer-events: none;
 }
 .preview-status {
   flex: 0 0 auto; padding: 6px 10px; color: var(--fg-dim);

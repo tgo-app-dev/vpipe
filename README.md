@@ -70,25 +70,51 @@ not bundled with the source.
   it.
 - **Apple Silicon Mac** — for the on-device inference stack and CoreML/Metal
   stages.
-- **Full Xcode (Metal shader toolchain)** *(Apple Silicon builds only)* — the
-  build compiles `.metal` kernel sources into embedded metallibs using
-  `xcrun -sdk macosx metal` and `xcrun -sdk macosx metallib`. These two
-  compilers ship **only with the full Xcode app** (from the App Store or
-  developer.apple.com); the standalone *Command Line Tools* do **not**
-  include them, even though the rest of the build never opens Xcode.
+- **Metal shader toolchain** *(Apple Silicon builds only; recommended, not
+  required)* — by default the build compiles `.metal` kernel sources into
+  embedded metallibs using `xcrun -sdk macosx metal` and
+  `xcrun -sdk macosx metallib`. These compilers are part of Xcode's **Metal
+  Toolchain**; the standalone *Command Line Tools* do **not** include them, even
+  though the rest of the build never opens Xcode.
 
-  **Common pitfall.** If you previously installed the Command Line Tools and
-  *then* installed Xcode, `xcrun` usually still points at the standalone CLT,
-  which lacks `metal`/`metallib` — so the build fails with an error like
-  `error: cannot execute tool 'metal'` or `xcrun: error: unable to find
-  utility "metal"`. Point the toolchain at Xcode with `xcode-select`:
+  **No toolchain? The build falls back automatically.** If `metal`/`metallib`
+  aren't found at configure time, the build switches to **runtime-compile
+  mode**: it embeds the Metal shader *source* and compiles each kernel on first
+  use via the OS's built-in runtime compiler (`newLibraryWithSource:`), which
+  needs no toolchain on the build **or** run machine. The Metal Toolchain is
+  therefore optional; the tradeoff is a one-time per-kernel compile on first use
+  instead of at build time. Force either mode with
+  `-DVPIPE_METAL_RUNTIME_COMPILE=ON|OFF`.
+
+  To get the faster build-time (AOT) path, install the toolchain. Two
+  independent things can leave `metal`/`metallib` unavailable — both surface the
+  same way, as `error: cannot execute tool 'metal'` or `xcrun: error: unable
+  to find utility "metal"`:
+
+  **1. The Metal Toolchain isn't installed.** On **Xcode 26 and later**
+  (macOS 26) the Metal Toolchain is no longer bundled with Xcode by default —
+  it's an optional component you download once. Install it from the command
+  line (or via Xcode ▸ Settings ▸ Components ▸ Metal Toolchain ▸ Get):
+
+  ```sh
+  xcodebuild -downloadComponent metalToolchain     # download + install
+  ```
+
+  On air-gapped or CI machines, export once and import where needed:
+
+  ```sh
+  xcodebuild -downloadComponent metalToolchain -exportPath ~/Downloads
+  xcodebuild -importComponent metalToolchain ~/Downloads/metalToolchain.dmg
+  ```
+
+  **2. `xcrun` points at the Command Line Tools, not Xcode.** If you installed
+  the CLT and *then* Xcode, `xcrun` often still resolves to the standalone CLT,
+  which lacks `metal`/`metallib`. Point the toolchain at Xcode:
 
   ```sh
   # Direct xcrun at the Xcode app (run once; needs admin)
   sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-
-  # Accept the Xcode license if you haven't already
-  sudo xcodebuild -license accept
+  sudo xcodebuild -license accept    # accept the license if you haven't
   ```
 
   Verify the active developer dir and that both compilers resolve:

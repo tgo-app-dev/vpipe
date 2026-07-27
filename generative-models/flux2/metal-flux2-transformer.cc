@@ -41,7 +41,23 @@ struct SteelAttnParams {
   std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
 };
 
-// Load a checkpoint tensor -> f16 SharedBuffer (F32/F16/BF16 sources).
+// bf16 <-> f32 host helpers (the flux2 DiT runs in bf16: f16's 65504 range
+// overflows on real conditioning outliers -- e.g. the <|im_start|> attention-
+// sink activation -- through the deep residual/attention stream, exactly the
+// QIE "residual 1e7" class. bf16's f32 exponent range holds them).
+inline std::uint16_t f32_to_bf16_(float f)
+{
+  std::uint32_t u; std::memcpy(&u, &f, 4);
+  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+inline float bf16_to_f32_(std::uint16_t b)
+{
+  std::uint32_t u = (std::uint32_t)b << 16;
+  float f; std::memcpy(&f, &u, 4); return f;
+}
+
+// Load a checkpoint tensor -> bf16 SharedBuffer (F32/F16/BF16 sources). The DiT
+// compute is bf16; the name keeps the historical "_f16" for call-site churn.
 SharedBuffer
 to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
 {
@@ -53,18 +69,15 @@ to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   if (raw.empty()) { return {}; }
   SharedBuffer out = mc->make_shared_buffer(n * 2);
   if (out.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(out.contents());
+  auto* d = static_cast<std::uint16_t*>(out.contents());
   if (info->dtype == "F32") {
     const auto* s = static_cast<const float*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)s[i]; }
-  } else if (info->dtype == "F16") {
-    std::memcpy(d, raw.contents(), n * 2);
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_(s[i]); }
   } else if (info->dtype == "BF16") {
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      std::uint32_t u = (std::uint32_t)s[i] << 16;
-      float f; std::memcpy(&f, &u, 4); d[i] = (_Float16)f;
-    }
+    std::memcpy(d, raw.contents(), n * 2);
+  } else if (info->dtype == "F16") {
+    const auto* s = static_cast<const _Float16*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
   } else {
     return {};
   }
@@ -93,15 +106,13 @@ MetalFlux2Transformer::load_qw_(const MetalLlamaWeights& wts,
     // codes/scales/qbias feed the GEMM read-only and are never CPU-modified, so
     // aliasing the file is safe. interleave_gu_/slice_rows_ still copy where a
     // CPU relayout is needed, correctly dropping the mapping for those.
-    if (_mmap_weights) {
-      qw.codes  = wts.load_mapped(name + ".weight", _mc);
-      qw.scales = wts.load_mapped(name + ".scales", _mc);
-      qw.qbias  = wts.load_mapped(name + ".biases", _mc);
-    } else {
-      qw.codes  = wts.load(name + ".weight", _mc);
-      qw.scales = wts.load(name + ".scales", _mc);
-      qw.qbias  = wts.load(name + ".biases", _mc);
-    }
+    // Codes are U32 (raw; mmap-aliased when enabled). Scales/biases are F16 on
+    // disk but the affine kernels are now bf16 (the DiT runs bf16), so convert
+    // them F16->bf16 via to_f16_ (which emits bf16). Mirrors the QIE quant path.
+    qw.codes  = _mmap_weights ? wts.load_mapped(name + ".weight", _mc)
+                              : wts.load(name + ".weight", _mc);
+    qw.scales = to_f16_(wts, _mc, name + ".scales");
+    qw.qbias  = to_f16_(wts, _mc, name + ".biases");
     if (!qw.codes.empty() && !qw.scales.empty() && !qw.qbias.empty()) {
       qw.quantized = true;
       return qw;
@@ -325,12 +336,16 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     }
   }
 
-  m->_lib_gemm = mc->load_library("dense_gemm");
-  m->_lib_elt  = mc->load_library("llm_elementwise");
-  m->_lib_rms  = mc->load_library("rms_norm");
-  m->_lib_sdpa = mc->load_library("sdpa");
-  m->_lib_vis  = mc->load_library("qwen3_5_vision");
-  m->_lib_rope = mc->load_library("rope");
+  // bf16 metallibs (VPIPE_ELT=bfloat); entry-point names keep the "_f16" label.
+  // gelu/layernorm come from llm_elementwise (the qwen3_5_vision gelu_tanh_f16 /
+  // layer_norm_bias_f16 are half-only): gelu_tanh_ff_f16 (same x,out,n sig) and
+  // layer_norm_plain_f16 (no-affine; flux2's op.ln uses identity weight/bias).
+  m->_lib_gemm = mc->load_library("dense_gemm_bf16");
+  m->_lib_elt  = mc->load_library("llm_elementwise_bf16");
+  m->_lib_rms  = mc->load_library("rms_norm_bf16");
+  m->_lib_sdpa = mc->load_library("sdpa_bf16");
+  m->_lib_vis  = mc->load_library("llm_elementwise_bf16");
+  m->_lib_rope = mc->load_library("rope_bf16");
   m->_fn_gemm        = m->_lib_gemm.function("dense_gemm_t_f16");
   m->_fn_gemm_bm64   = m->_lib_gemm.function("dense_gemm_t_bm64_f16");
   m->_fn_gemm_bm64bn64 = m->_lib_gemm.function("dense_gemm_t_bm64bn64_f16");
@@ -344,9 +359,12 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_residual    = m->_lib_elt.function("residual_add_f16");
   m->_fn_transpose   = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
-  m->_fn_gelu_tanh   = m->_lib_vis.function("gelu_tanh_f16");
-  m->_fn_layernorm   = m->_lib_vis.function("layer_norm_bias_f16");
-  m->_fn_rope_table  = m->_lib_rope.function("rope_pair_table_f16");
+  m->_fn_gelu_tanh   = m->_lib_elt.function("gelu_tanh_ff_f16");
+  m->_fn_layernorm   = m->_lib_elt.function("layer_norm_plain_f16");
+  m->_fn_rope_table  = m->_lib_rope.function("rope_pair_table_ftab_f16");
+  m->_fn_transpose_rope =
+      m->_lib_rope.function("transpose_rope_pair_ftab_f16");
+  m->_fn_ln_mod      = m->_lib_elt.function("layernorm_modulate_f16");
   m->_fn_adaln       = m->_lib_elt.function("adaln_modulate_f16");
   m->_fn_gated       = m->_lib_elt.function("gated_residual_f16");
   m->_fn_bias_add    = m->_lib_elt.function("bias_add_rows_f16");
@@ -369,7 +387,7 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     return nullptr;
   }
   if (m->_quant_bits > 0) {
-    m->_lib_qmm = mc->load_library("affine_qmm_steel");
+    m->_lib_qmm = mc->load_library("affine_qmm_steel_bf16");
     const std::string g = "g" + std::to_string(m->_quant_group);
     m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + g);
     m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + g);
@@ -408,7 +426,7 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // fused-FF choice below (the mma path defaults the fusion off).
   if (mc->supports_matrix_cores() &&
       std::getenv("VPIPE_FLUX2_NO_MMA2") == nullptr) {
-    m->_lib_dense_mma = mc->load_library("dense_gemm_mma");
+    m->_lib_dense_mma = mc->load_library("dense_gemm_mma_bf16");
     m->_fn_dense_mma = m->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
@@ -425,7 +443,7 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     // Quantized checkpoint: group-matched dequant kernels feed the dense
     // matmul2d. Both bit widths loaded (mixed-precision per-weight w4/w8).
     if (m->_use_mma2 && m->_quant_bits > 0) {
-      m->_lib_dequant = mc->load_library("affine_dequant");
+      m->_lib_dequant = mc->load_library("affine_dequant_bf16");
       const std::string dg = "g" + std::to_string(m->_quant_group);
       m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant_w4" + dg);
       m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8" + dg);
@@ -445,7 +463,9 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // switch; VPIPE_I8_GEMM overrides (the context self-gates on matrix
   // cores + kernel availability).
   {
-    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm);
+    // The flux2 DiT runs bf16, so the i8 path must read/write bf16 (its x, the
+    // dequant scratch weight, and y are all bf16); load the _bf16 i8 kernels.
+    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   // Fuse the SwiGLU FF (default on, EXCEPT on the matmul2d path): needs the
@@ -474,6 +494,8 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_steel_attn_ok = m->_lib_attn.valid() && !m->_attn_params.empty()
                       && std::getenv("VPIPE_FLUX2_NO_STEEL_ATTN") == nullptr;
   m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+  // The DiT runs bf16; use the bf16 NAX entry (attn_steel_nax_h_bd128_bf16) on
+  // M5 matrix-core GPUs, else the non-nax bf16 steel attention.
   m->_use_attn_nax = m->_steel_attn_ok && mc->supports_matrix_cores()
                      && m->_lib_attn_nax.valid()
                      && std::getenv("VPIPE_FLUX2_NO_ATTN_NAX") == nullptr;
@@ -644,7 +666,7 @@ MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
 // head_dim]. Text tokens sit at the origin on axis-3 (0,0,0,l); the generated
 // image carries (0, row, col, 0); each reference image carries (T, row, col, 0)
 // with T its per-reference index band. Adjacent-pair layout matches
-// rope_pair_table_f16.
+// rope_pair_table_ftab_f16 (f32 cos/sin tables).
 // NOTE: the axis->coordinate mapping is a best reading of Flux2PosEmbed; VERIFY
 // against a diffusers golden.
 void
@@ -658,27 +680,48 @@ MetalFlux2Transformer::build_rope_tables_(int text_seq,
   const int seq = text_seq + img_seq;
   const int HD = _cfg.head_dim;
   const int pairs = HD / 2;
-  cos_out = _mc->make_shared_buffer((std::size_t)seq * HD * 2);
-  sin_out = _mc->make_shared_buffer((std::size_t)seq * HD * 2);
-  auto* c = static_cast<_Float16*>(cos_out.contents());
-  auto* s = static_cast<_Float16*>(sin_out.contents());
+  // f32 cos/sin tables (only x is bf16): RoPE rotation error is STRUCTURED, so
+  // the ~4e-3 bf16-table rounding compounds over blocks and, worse, over denoise
+  // steps -- exactly what rope_pair_table_ftab_f16 was written to avoid (see
+  // QwenImage). Keep full precision here.
+  cos_out = _mc->make_shared_buffer((std::size_t)seq * HD * sizeof(float));
+  sin_out = _mc->make_shared_buffer((std::size_t)seq * HD * sizeof(float));
+  auto* c = static_cast<float*>(cos_out.contents());
+  auto* s = static_cast<float*>(sin_out.contents());
   const float theta = _cfg.rope_theta;
-  // Flux2 position ids (T, H, W, L). axes_dim [32,32,32,32] -> axis0=T, axis1=H,
-  // axis2=W, axis3=L. Emit one token row from its 4 coordinates.
-  auto emit = [&](int t, float p0, float p1, float p2, float p3) {
-    const float pos[4] = {p0, p1, p2, p3};
+  // Per-pair inverse frequency + which of the 4 position axes it reads. These
+  // depend only on (axis, j) -- NOT the token -- so precompute once (pairs pow()
+  // calls) instead of recomputing inside the per-token emit (seq*pairs). Angles
+  // stay f64 to match diffusers' FLUX rope() (arange/theta**scale in float64);
+  // the nonlinear cos/sin makes the angle precision matter more than the table
+  // storage. Flux2 position ids (T,H,W,L): axes_dim [32,32,32,32] -> axis0=T,
+  // axis1=H, axis2=W, axis3=L.
+  std::vector<double> pair_freq((std::size_t)pairs);
+  std::vector<int> pair_axis((std::size_t)pairs);
+  {
     int pair = 0;
     for (int a = 0; a < 4; ++a) {
       const int adim = _cfg.axes_dim[a];
       const int apairs = adim / 2;
       for (int j = 0; j < apairs && pair < pairs; ++j, ++pair) {
-        const float freq = 1.0f / std::pow(theta, (float)(2 * j) / (float)adim);
-        const float ang = pos[a] * freq;
-        c[(std::size_t)t * HD + 2 * pair]     = (_Float16)std::cos(ang);
-        c[(std::size_t)t * HD + 2 * pair + 1] = (_Float16)std::cos(ang);
-        s[(std::size_t)t * HD + 2 * pair]     = (_Float16)std::sin(ang);
-        s[(std::size_t)t * HD + 2 * pair + 1] = (_Float16)std::sin(ang);
+        pair_freq[(std::size_t)pair] =
+            1.0 / std::pow((double)theta, (double)(2 * j) / (double)adim);
+        pair_axis[(std::size_t)pair] = a;
       }
+    }
+  }
+  // Emit one token row from its 4 coordinates.
+  auto emit = [&](int t, float p0, float p1, float p2, float p3) {
+    const double pos[4] = {p0, p1, p2, p3};
+    for (int pair = 0; pair < pairs; ++pair) {
+      const double ang = pos[pair_axis[(std::size_t)pair]]
+                         * pair_freq[(std::size_t)pair];
+      const float cb = (float)std::cos(ang);
+      const float sb = (float)std::sin(ang);
+      c[(std::size_t)t * HD + 2 * pair]     = cb;
+      c[(std::size_t)t * HD + 2 * pair + 1] = cb;
+      s[(std::size_t)t * HD + 2 * pair]     = sb;
+      s[(std::size_t)t * HD + 2 * pair + 1] = sb;
     }
   };
   int t = 0;
@@ -722,8 +765,9 @@ MetalFlux2Transformer::calib_stats() const
   for (const auto& kv : _calib_acc) {
     const std::size_t n = kv.second.empty() ? 0 : kv.second.byte_size() / 2;
     std::vector<float> v(n);
-    const auto* s = static_cast<const _Float16*>(kv.second.contents());
-    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)s[i]; }
+    // The calib accumulator (col_absmax) is bf16 now that the DiT runs bf16.
+    const auto* s = static_cast<const std::uint16_t*>(kv.second.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = bf16_to_f32_(s[i]); }
     out[kv.first] = std::move(v);
   }
   return out;
@@ -869,6 +913,28 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       return {};
     }
   }
+  // The DiT computes in bf16 (f16's 65504 range overflows on real conditioning
+  // outliers through the deep residual/attention stream). The stage/conditioner
+  // boundary is f16, so upcast the inputs to bf16 once here (lossless: bf16's
+  // exponent range covers all f16 values); the returned velocity is downcast
+  // back to f16 at the end so callers/tests are unchanged.
+  auto up_bf16 = [&](const SharedBuffer& src, std::size_t n) -> SharedBuffer {
+    SharedBuffer o = _mc->make_shared_buffer(n * 2);
+    if (o.empty()) { return o; }
+    const auto* s = static_cast<const _Float16*>(src.contents());
+    auto* d = static_cast<std::uint16_t*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
+    return o;
+  };
+  const SharedBuffer context_b =
+      up_bf16(context, (std::size_t)TS * c.joint_dim);
+  const SharedBuffer latents_b = up_bf16(latents, (std::size_t)IS_GEN * IC);
+  std::vector<SharedBuffer> refs_b;
+  refs_b.reserve(refs.size());
+  for (const auto& r : refs) {
+    refs_b.push_back(up_bf16(r.latents, (std::size_t)r.seq * IC));
+  }
+  if (context_b.empty() || latents_b.empty()) { return {}; }
   const int PW = 3 * H + 2 * SMLP;                 // to_qkv_mlp_proj out width
   const float scale = 1.0f / std::sqrt((float)HD);
 
@@ -907,13 +973,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
 
   SharedBuffer te_in = buf((std::size_t)TD);
   {
-    auto* ti = static_cast<_Float16*>(te_in.contents());
+    auto* ti = static_cast<std::uint16_t*>(te_in.contents());
     const int half = TD / 2;
     for (int i = 0; i < half; ++i) {
       const double fr = std::exp(-std::log(1e4) * (double)i / (double)half);
       const double ang = (double)timestep * 1000.0 * fr;
-      ti[i] = (_Float16)std::cos(ang);
-      ti[half + i] = (_Float16)std::sin(ang);
+      ti[i] = f32_to_bf16_((float)std::cos(ang));
+      ti[half + i] = f32_to_bf16_((float)std::sin(ang));
     }
   }
   // Embedded guidance (guidance-distilled klein-9B): the same cos-first
@@ -924,13 +990,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   SharedBuffer ge_in;
   if (use_g) {
     ge_in = buf((std::size_t)TD);
-    auto* gi = static_cast<_Float16*>(ge_in.contents());
+    auto* gi = static_cast<std::uint16_t*>(ge_in.contents());
     const int half = TD / 2;
     for (int i = 0; i < half; ++i) {
       const double fr = std::exp(-std::log(1e4) * (double)i / (double)half);
       const double ang = (double)guidance * 1000.0 * fr;
-      gi[i] = (_Float16)std::cos(ang);
-      gi[half + i] = (_Float16)std::sin(ang);
+      gi[i] = f32_to_bf16_((float)std::cos(ang));
+      gi[half + i] = f32_to_bf16_((float)std::sin(ang));
     }
   }
 
@@ -1087,9 +1153,26 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
       void ln(const SharedBuffer& x, std::size_t xe, const SharedBuffer& y,
               std::size_t ye, int R, int Hd) {
+        // layer_norm_plain_f16 (no affine): 0:x 1:out 2:H 3:eps.
         e->set_function(self->_fn_layernorm);
-        e->set_buffer(0, x, xe * 2); e->set_buffer(1, self->_ln_w1);
-        e->set_buffer(2, self->_ln_b0); e->set_buffer(3, y, ye * 2);
+        e->set_buffer(0, x, xe * 2); e->set_buffer(1, y, ye * 2);
+        e->set_constant(2, Hd); e->set_constant(3, eps);
+        e->dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+      }
+      // Fused LayerNorm(no-affine) + adaLN modulate: out = (1+scale)*LN(x)+shift.
+      // scale = mod[sc_e:], shift = mod[sh_e:] ([Hd] each, broadcast over R
+      // rows). Falls back to ln + adaln if the fused kernel is unavailable.
+      void ln_mod(const SharedBuffer& x, std::size_t xe, const SharedBuffer& mod,
+                  std::size_t sc_e, std::size_t sh_e, const SharedBuffer& out,
+                  std::size_t oe, int Hd, int R) {
+        if (!self->_fn_ln_mod.valid()) {
+          ln(x, xe, out, oe, R, Hd);
+          adaln(out, oe, mod, sc_e, sh_e, out, oe, Hd, R * Hd);
+          return;
+        }
+        e->set_function(self->_fn_ln_mod);
+        e->set_buffer(0, x, xe * 2); e->set_buffer(1, mod, sc_e * 2);
+        e->set_buffer(2, mod, sh_e * 2); e->set_buffer(3, out, oe * 2);
         e->set_constant(4, Hd); e->set_constant(5, eps);
         e->dispatch({256, (unsigned)R, 1}, {256, 1, 1});
       }
@@ -1116,6 +1199,23 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         e->set_function(self->_fn_rope_table);
         e->set_buffer(0, x); e->set_buffer(1, *rcos); e->set_buffer(2, *rsin);
         e->set_constant(3, nh); e->set_constant(4, T); e->set_constant(5, D);
+        e->dispatch({(unsigned)(D / 2), (unsigned)T, (unsigned)nh},
+                    {(unsigned)(D / 2), 1, 1});
+      }
+      // Fused transpose [T,nh,D] (token-major) -> [nh,T,D] (head-major) + pair
+      // RoPE (f32 tables), for the q/k path -- one pass replaces tr + rope (saves
+      // the roped buffer's extra read/write). Falls back to tr + rope.
+      void tr_rope(const SharedBuffer& in, const SharedBuffer& out, int T,
+                   int nh, int D) {
+        if (!self->_fn_transpose_rope.valid()) {
+          tr(in, 0, out, 0, T, nh, D);
+          rope(out, nh, T, D);
+          return;
+        }
+        e->set_function(self->_fn_transpose_rope);
+        e->set_buffer(0, in); e->set_buffer(1, out);
+        e->set_buffer(2, *rcos); e->set_buffer(3, *rsin);
+        e->set_constant(4, nh); e->set_constant(5, T); e->set_constant(6, D);
         e->dispatch({(unsigned)(D / 2), (unsigned)T, (unsigned)nh},
                     {(unsigned)(D / 2), 1, 1});
       }
@@ -1212,8 +1312,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     metal_compute::FunctionConstants fc;
     fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-    fn_attn = nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128", fc)
-                  : _lib_attn.function("attn_steel_h_bd128", fc);
+    fn_attn = nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
     use_steel = fn_attn.valid();
   }
   const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
@@ -1222,11 +1322,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // major transpose -> rope -> flash attn -> transpose the result into `out`
   // (row stride out_rs; out_rs > 0 writes a sub-view, e.g. att -> scat[:, :H]).
   auto attention = [&](auto& op, const SharedBuffer& out, int out_rs) {
-    op.tr(jq, 0, qt, 0, seq, HED, HD);
-    op.tr(jk, 0, kt, 0, seq, HED, HD);
-    op.tr(jv, 0, vt, 0, seq, HED, HD);
-    op.rope(qt, HED, seq, HD);
-    op.rope(kt, HED, seq, HD);
+    op.tr_rope(jq, qt, seq, HED, HD);   // fused transpose + rope (q)
+    op.tr_rope(jk, kt, seq, HED, HD);   // fused transpose + rope (k)
+    op.tr(jv, 0, vt, 0, seq, HED, HD);  // v: transpose only (no rope)
     if (use_steel) {
       op.e->set_function(fn_attn);
       op.e->set_buffer(0, qt); op.e->set_buffer(1, kt); op.e->set_buffer(2, vt);
@@ -1274,17 +1372,17 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     // Embed image + text. The generated tokens embed into img[0:IS_GEN]; each
     // reference embeds (same x_embedder) into the tail img[IS_GEN..IS]. (Calib
     // taps the generated tokens only -- calibration runs text-only, refs empty.)
-    op.tap("emb_x", 0, latents, 0, IS_GEN, IC);
-    op.gemm(latents, _x_embed, img, 0, IS_GEN, H, IC);
+    op.tap("emb_x", 0, latents_b, 0, IS_GEN, IC);
+    op.gemm(latents_b, _x_embed, img, 0, IS_GEN, H, IC);
     {
       std::size_t ro = (std::size_t)IS_GEN;   // ref token offset into img
-      for (const auto& r : refs) {
-        op.gemm(r.latents, _x_embed, img, ro * H, r.seq, H, IC);
-        ro += (std::size_t)r.seq;
+      for (std::size_t i = 0; i < refs.size(); ++i) {
+        op.gemm(refs_b[i], _x_embed, img, ro * H, refs[i].seq, H, IC);
+        ro += (std::size_t)refs[i].seq;
       }
     }
-    op.tap("emb_ctx", 0, context, 0, TS, c.joint_dim);
-    op.gemm(context, _ctx_embed, txt, 0, TS, H, c.joint_dim);
+    op.tap("emb_ctx", 0, context_b, 0, TS, c.joint_dim);
+    op.gemm(context_b, _ctx_embed, txt, 0, TS, H, c.joint_dim);
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
 
     for (int L = 0; L < c.n_double; ++L) {
@@ -1305,14 +1403,12 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       const DoubleBlock& b =
           streaming ? streamed : _double[(std::size_t)L];
       // MSA: img (mod set 0) + txt.  mod layout [shift,scale,gate]*2 (each H).
-      op.ln(img, 0, nrm, 0, IS, H);
-      op.adaln(nrm, 0, mimg, H, 0, nrm, 0, H, IS * H);
+      op.ln_mod(img, 0, mimg, H, 0, nrm, 0, H, IS);
       op.tap("dbl_norm1_img", L, nrm, 0, IS, H);
       op.gemm(nrm, b.q, jq, (std::size_t)TS * H, IS, H, H);
       op.gemm(nrm, b.k, jk, (std::size_t)TS * H, IS, H, H);
       op.gemm(nrm, b.v, jv, (std::size_t)TS * H, IS, H, H);
-      op.ln(txt, 0, nrm, 0, TS, H);
-      op.adaln(nrm, 0, mtxt, H, 0, nrm, 0, H, TS * H);
+      op.ln_mod(txt, 0, mtxt, H, 0, nrm, 0, H, TS);
       op.tap("dbl_norm1_txt", L, nrm, 0, TS, H);
       op.gemm(nrm, b.aq, jq, 0, TS, H, H);
       op.gemm(nrm, b.ak, jk, 0, TS, H, H);
@@ -1332,8 +1428,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.gated(img, 0, mimg, 2 * H, ob, 0, H, IS * H);
       // FF (mod set 1: shift_mlp=3H, scale_mlp=4H, gate_mlp=5H). Flux2FeedForward
       // is SwiGLU: linear_in -> [gate|up] (2*INNER) -> silu(gate)*up -> linear_out.
-      op.ln(img, 0, nrm, 0, IS, H);
-      op.adaln(nrm, 0, mimg, 4 * H, 3 * H, nrm, 0, H, IS * H);
+      op.ln_mod(img, 0, mimg, 4 * H, 3 * H, nrm, 0, H, IS);
       op.tap("dbl_norm2_img", L, nrm, 0, IS, H);
       if (_fuse_ff) {
         op.swiglu_ff(nrm, b.ff_in, smlp, IS, H, DFF);    // silu(gate)*up [IS,INNER]
@@ -1346,8 +1441,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.tap("dbl_ffact_img", L, smlp, 0, IS, INNER);
       op.gemm(smlp, b.ff_out, ob, 0, IS, H, INNER);
       op.gated(img, 0, mimg, 5 * H, ob, 0, H, IS * H);
-      op.ln(txt, 0, nrm, 0, TS, H);
-      op.adaln(nrm, 0, mtxt, 4 * H, 3 * H, nrm, 0, H, TS * H);
+      op.ln_mod(txt, 0, mtxt, 4 * H, 3 * H, nrm, 0, H, TS);
       op.tap("dbl_norm2_txt", L, nrm, 0, TS, H);
       if (_fuse_ff) {
         op.swiglu_ff(nrm, b.cff_in, smlp, TS, H, DFF);
@@ -1414,8 +1508,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
     auto op = make_ops(enc);
-    op.ln(joint, 0, nrm, 0, seq, H);
-    op.adaln(nrm, 0, msin, H, 0, nrm, 0, H, seq * H);      // (1+scale)+shift
+    op.ln_mod(joint, 0, msin, H, 0, nrm, 0, H, seq);       // (1+scale)*LN+shift
     op.tap("sgl_norm", L, nrm, 0, seq, H);
     if (_fuse_ff) {
       // qkv-only proj [seq, 3H] + a fused-SwiGLU mlp GEMM writing smlp directly
@@ -1519,7 +1612,18 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           (long)t_sgl_cat, (long)t_sgl_out, (long)t_final));
     }
   }
-  return velocity;
+  // Downcast the bf16 velocity back to f16 for the stage/test boundary (the
+  // velocity is O(1), so f16 is lossless here).
+  SharedBuffer vel_f16 = _mc->make_shared_buffer((std::size_t)IS_GEN * OC * 2);
+  if (vel_f16.empty()) { return {}; }
+  {
+    const auto* s = static_cast<const std::uint16_t*>(velocity.contents());
+    auto* d = static_cast<_Float16*>(vel_f16.contents());
+    for (std::size_t i = 0; i < (std::size_t)IS_GEN * OC; ++i) {
+      d[i] = (_Float16)bf16_to_f32_(s[i]);
+    }
+  }
+  return vel_f16;
 }
 
 }  // namespace genai

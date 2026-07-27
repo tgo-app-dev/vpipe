@@ -31,12 +31,25 @@ namespace vpipe {
 // lokr_w1/lokr_w2); keys map to base weights by name (leading-prefix strip +
 // the ai-toolkit -> diffusers remap), and dW is B@A or kron(w1,w2).
 //
+// With `base_pipeline` set, the output is a SELF-CONTAINED diffusers model: the
+// fused DiT is written under <output>/transformer/ and the pipeline's other
+// components (text_encoder/, vae/, tokenizer/, scheduler/, model_index.json)
+// are hard-linked/copied from `base_pipeline` alongside it -- so the fused model
+// can be chain-quantized (model-quantize target=dit then text_encoder) exactly
+// like the stock model. Without it, the output is a bare DiT (used via dit_dir).
+//
 // Config (FlexData object):
-//   base_model  (string, required) -- base model dir (or a models-DB key).
+//   base_model  (string, required) -- base model dir (or a models-DB key). For a
+//                                     self-contained fuse, point it at the
+//                                     `transformer/` DiT of `base_pipeline`.
 //   lora        (string, required) -- LoRA .safetensors file, or a dir/key
 //                                     containing exactly one .safetensors.
 //   output_name (string, required) -- result name -> <cwd>/models/<name>
 //                                     (registered), or an explicit "/.." path.
+//   base_pipeline (string, optional) -- the base diffusers pipeline ROOT whose
+//                                     non-transformer components are copied next
+//                                     to the fused DiT -> a self-contained model.
+//                                     Empty => bare DiT output.
 //   scale       (real, default 1.0) -- LoRA fusion strength (lora_scale *
 //                                      alpha/rank; alpha=rank when unspecified).
 //   models_db   (string, default "models") -- registry sub-db.
@@ -65,6 +78,7 @@ private:
   std::string _base_model;
   std::string _lora;
   std::string _output_name;
+  std::string _base_pipeline;   // pipeline root -> self-contained fused model
   std::string _models_db;
   double      _scale{};
   // Resolved output dir of the last fuse (for the summary beat).

@@ -13,6 +13,7 @@ set(LOCAL_SOURCES
   load-text-stage.cc
   load-video-stage.cc
   lora-fuse-stage.cc
+  model-select-stage.cc
   sampler-select-stage.cc
   save-image-stage.cc
   save-video-stage.cc
@@ -53,6 +54,7 @@ set(LOCAL_HEADERS
   model-fetch-stage.h
   model-remove-stage.h
   model-registry.h
+  model-select-stage.h
   passthrough-stage.h
   qwen-asr-tokenizer.h
   rest-client-stage.h

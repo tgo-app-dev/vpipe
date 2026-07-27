@@ -64,6 +64,12 @@ public:
   virtual void run() = 0;
   const TestResult* result() const;
 
+  // Record an exception that escaped run() as a failure of THIS test. The
+  // runner catches instead of letting it terminate the process: a single
+  // throwing test (a bad pipeline wiring, a missing file, a bad_variant_access)
+  // otherwise takes the whole binary down and every later test never runs.
+  void report_uncaught_exception(std::string_view what);
+
 protected:
   void report_failure(std::string_view file, size_t line);
   void report_expect_true_failure(std::string_view cond,

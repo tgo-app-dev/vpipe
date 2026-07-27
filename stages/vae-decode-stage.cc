@@ -3,6 +3,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
@@ -26,27 +27,31 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
                                std::move(config))
 {
   // Deferred validation (see Stage::fail_config): construct for any config so
-  // a graph can be built/edited before hf_dir is supplied.
+  // a graph can be built/edited before hf_dir is supplied. hf_dir is OPTIONAL
+  // now -- a model-select source on the model iport can supply it instead --
+  // so the "no model at all" case is reported at initialize()/process() time
+  // (when iport connectivity is known), not here.
   _hf_dir    = attr_str("hf_dir");
   _models_db = attr_str("models_db");
   if (_models_db.empty()) { _models_db = "models"; }
-  if (_hf_dir.empty()) {
-    fail_config(fmt(
-        "VaeDecodeStage('{}'): config.hf_dir is required (the Krea-2-Turbo "
-        "model dir; the VAE is read from <hf_dir>/vae)", this->id()));
-  }
   allocate_oports(spec().oports.size());
 }
 
 VaeDecodeStage::~VaeDecodeStage() = default;
 
 namespace {
+// The model iport (a model-select source) overrides hf_dir. Appended after
+// the primary `latent` input, so it is iport1. (Referenced only from the
+// Apple-gated code below; marked maybe_unused for the inert non-Apple build.)
+[[maybe_unused]] constexpr unsigned kModelPort = 1;
+
 const ConfigKey kAttrs[] = {
-  {.key = "hf_dir", .type = ConfigType::String, .required = true,
-   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit model dir (VAE read from "
-          "<hf_dir>/vae)",
+  {.key = "hf_dir", .type = ConfigType::String, .required = false,
+   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
+          "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
+          "model iport overrides it",
    .suggest_db = "models",
-   .suggest_db_type = "krea2,flux2,qwen-image-edit"},
+   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
 };
@@ -54,6 +59,9 @@ const PortSpec kIports[] = {
   {.name = "latent", .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
+  {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
+                           "source; overrides the hf_dir config",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "image", .doc = "decoded image as planar U8 RGB TensorBeat [3,H,W]",
@@ -74,8 +82,8 @@ const StageSpec kSpec = {
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 // Detect the VAE family from the vae config.json `_class_name`:
-// "AutoencoderKLFlux2" -> "flux2"; anything else (AutoencoderKLQwenImage) ->
-// "krea2".
+// "AutoencoderKLFlux2" -> "flux2"; "MageVAE" -> "mage"; anything else
+// (AutoencoderKLQwenImage) -> "krea2".
 std::string
 vae_family_(const std::string& vae_dir)
 {
@@ -85,14 +93,39 @@ vae_family_(const std::string& vae_dir)
     FlexData fd = FlexData::from_json(in);
     if (fd.is_object()) {
       auto obj = fd.as_object();
-      if (obj.contains("_class_name") &&
-          std::string(obj.at("_class_name").as_string("")) ==
-              "AutoencoderKLFlux2") {
-        return "flux2";
+      if (obj.contains("_class_name")) {
+        const std::string cls(obj.at("_class_name").as_string(""));
+        if (cls == "AutoencoderKLFlux2") { return "flux2"; }
+        if (cls == "MageVAE") { return "mage"; }
       }
     }
   }
   return "krea2";
+}
+
+// Mage-Flow's MageVAE geometry from vae/config.json (latent_channels 128,
+// downsample_factor 16). Everything else -- the DiCo trunk width, the CoD
+// decoder, the per-pixel MLP head -- is fixed by the checkpoint, not
+// configurable, so it stays on MetalMageVae::Config's defaults.
+genai::MetalMageVae::Config
+mage_vae_config_(const std::string& vae_dir)
+{
+  genai::MetalMageVae::Config c;
+  std::ifstream in(std::filesystem::path(vae_dir) / "config.json");
+  if (in) {
+    FlexData fd = FlexData::from_json(in);
+    if (fd.is_object()) {
+      auto o = fd.as_object();
+      if (o.contains("latent_channels")) {
+        c.latent_channels =
+            (int)o.at("latent_channels").as_int(c.latent_channels);
+      }
+      if (o.contains("downsample_factor")) {
+        c.patch = (int)o.at("downsample_factor").as_int(c.patch);
+      }
+    }
+  }
+  return c;
 }
 #endif
 }  // namespace
@@ -108,14 +141,32 @@ VaeDecodeStage::spec() const noexcept
 Job
 VaeDecodeStage::initialize(RuntimeContext& ctx)
 {
-  (void)ctx;
-  if (_hf_dir.empty()) { co_return; }   // ctor already recorded the error.
+  // Defer the VAE load when a model-select source feeds the model iport (its
+  // beat only arrives after the init barrier, in process()). Otherwise load
+  // now from the config hf_dir, as before.
+  const bool model_from_iport =
+      ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
+  if (!model_from_iport) { ensure_loaded_(); }
+  co_return;
+}
+
+void
+VaeDecodeStage::ensure_loaded_()
+{
+  if (_load_attempted) { return; }   // idempotent: load at most once
+  _load_attempted = true;
+  if (_hf_dir.empty()) {
+    session()->error(fmt(
+        "VaeDecodeStage('{}'): no model -- set config.hf_dir or wire a "
+        "model-select source to the model iport; inert", this->id()));
+    return;
+  }
   auto* mc = session() ? session()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "VaeDecodeStage('{}'): no metal-compute backend on this session; "
         "the stage is inert", this->id()));
-    co_return;
+    return;
   }
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
   namespace fs = std::filesystem;
@@ -164,7 +215,23 @@ VaeDecodeStage::initialize(RuntimeContext& ctx)
           "VaeDecodeStage('{}'): failed to load the FLUX.2 VAE from '{}'; inert",
           this->id(), vae_dir));
     }
-    co_return;
+    return;
+  }
+
+  if (_family == "mage") {
+    session()->info(fmt("VaeDecodeStage('{}'): loading MageVAE from '{}'",
+                        this->id(), vae_dir));
+    // Decode-only here: the encoder half (student.dconv_encoder.*) is the
+    // vae-encode stage's business, and skipping it saves ~67M params.
+    _mage_vae = genai::MetalMageVae::load(vae_dir, mc,
+                                          mage_vae_config_(vae_dir),
+                                          /*with_encoder=*/false);
+    if (!_mage_vae) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): failed to load the MageVAE from '{}'; inert",
+          this->id(), vae_dir));
+    }
+    return;
   }
 
   genai::MetalKrea2Vae::Config cfg;   // Qwen-Image VAE defaults
@@ -203,7 +270,7 @@ VaeDecodeStage::initialize(RuntimeContext& ctx)
         "VaeDecodeStage('{}'): vae config.json is missing latents_mean/"
         "latents_std ({}/{} of z_dim {}); the stage is inert", this->id(),
         cfg.latents_mean.size(), cfg.latents_std.size(), cfg.z_dim));
-    co_return;
+    return;
   }
 
   session()->info(fmt(
@@ -214,7 +281,7 @@ VaeDecodeStage::initialize(RuntimeContext& ctx)
     session()->error(fmt(
         "VaeDecodeStage('{}'): failed to load the VAE from '{}'; inert",
         this->id(), vae_dir));
-    co_return;
+    return;
   }
   session()->log_debug(fmt(
       "VaeDecodeStage('{}'): VAE ready from '{}' (z_dim {}, base_dim {}, "
@@ -225,6 +292,19 @@ VaeDecodeStage::initialize(RuntimeContext& ctx)
 Job
 VaeDecodeStage::process(RuntimeContext& ctx)
 {
+  // Latch the shared model (iport1) once -- a model-select source overrides the
+  // hf_dir config -- then lazily load the VAE before the first decode.
+  if (!_model_latched && ctx.num_iports() > kModelPort &&
+      ctx.iport_connected(kModelPort)) {
+    auto mb = co_await ctx.read(kModelPort);
+    _model_latched = true;
+    if (const auto* mfd =
+            mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
+      if (apply_model_select_beat(mfd->data, _hf_dir, _models_db)) {
+        ensure_loaded_();
+      }
+    }
+  }
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }   // upstream EOS -> close oport
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
@@ -261,7 +341,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       const float* s = tbp->as_f32();
       for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
     std::string derr;
-    metal_compute::SharedBuffer rgb = _flux2_vae->decode(z, h16, w16, &derr);
+    metal_compute::SharedBuffer rgb;
+    {   // LLM-lane perf event: one VAE decode per image (value = pixel count).
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin,
+                         (std::uint64_t)(h16 * 16) * (w16 * 16));
+      rgb = _flux2_vae->decode(z, h16, w16, &derr);
+    }
     if (rgb.empty()) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): FLUX.2 decode failed ({}); skipping",
@@ -286,6 +372,67 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     ++_images_emitted;
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): FLUX.2 decoded + emitted image #{} [3, {}, {}]",
+        this->id(), _images_emitted, H, W));
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Mage-Flow MageVAE: input [128, H/16, W/16]; decode straight to RGB in
+  // [-1,1] (no per-channel un-whiten -- MageVAE has no latents_mean/std). ----
+  if (_family == "mage") {
+    if (!_mage_vae) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): MageVAE not loaded; skipping", this->id()));
+      co_return;
+    }
+    const int Cz = (int)tbp->shape[0];
+    const int h = (int)tbp->shape[1], w = (int)tbp->shape[2];
+    const int P = _mage_vae->config().patch;
+    if (Cz != _mage_vae->config().latent_channels || h <= 0 || w <= 0) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): latent [{}, {}, {}] does not match "
+          "latent_channels {}; skipping", this->id(), Cz, h, w,
+          _mage_vae->config().latent_channels));
+      co_return;
+    }
+    const std::size_t nz = (std::size_t)Cz * h * w;
+    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
+    if (z.empty()) { co_return; }
+    { auto* d = static_cast<_Float16*>(z.contents());
+      const float* s = tbp->as_f32();
+      for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
+    std::string derr;
+    metal_compute::SharedBuffer rgb;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)(h * P) * (w * P));
+      rgb = _mage_vae->decode(z, h, w, &derr);
+    }
+    if (rgb.empty()) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): MageVAE decode failed ({}); skipping",
+          this->id(), derr.empty() ? "unknown error" : derr));
+      co_return;
+    }
+    const int H = h * P, W = w * P;
+    const std::size_t n = (std::size_t)3 * H * W;
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::U8;
+    out->shape = {3, H, W};
+    out->resize_contiguous(n);
+    const auto* rp = static_cast<const _Float16*>(rgb.contents());
+    std::uint8_t* op = out->as_u8();
+    for (std::size_t i = 0; i < n; ++i) {
+      // MetalMageVae::decode does NOT clamp (the reference clamps at the PIL
+      // conversion, which is this).
+      float v = std::round(((float)rp[i] + 1.0f) * 0.5f * 255.0f);
+      if (v < 0.0f) { v = 0.0f; }
+      if (v > 255.0f) { v = 255.0f; }
+      op[i] = (std::uint8_t)v;
+    }
+    ++_images_emitted;
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): MageVAE decoded + emitted image #{} [3, {}, {}]",
         this->id(), _images_emitted, H, W));
     co_await ctx.write(0, std::move(out));
     co_return;
@@ -323,7 +470,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
   std::string derr;
-  metal_compute::SharedBuffer rgb = _vae->decode(zw, h8, w8, &derr);
+  metal_compute::SharedBuffer rgb;
+  {
+    PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae, kPerfLlmVaeBegin,
+                       (std::uint64_t)(h8 * 8) * (w8 * 8));
+    rgb = _vae->decode(zw, h8, w8, &derr);
+  }
   if (rgb.empty()) {
     session()->warn(fmt(
         "VaeDecodeStage('{}'): decode failed ({}); skipping", this->id(),

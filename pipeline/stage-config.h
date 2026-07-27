@@ -13,13 +13,18 @@ namespace vpipe {
 
 // Declared type of a configuration value. Mirrors the FlexData kinds a
 // stage actually consumes (Null is never a declared type). `Any` marks
-// a key whose accepted kind varies by context.
+// a key whose accepted kind varies by context. `Text` is a String in
+// every backend respect (same FlexData kind, same def_str default,
+// read via attr_str); it differs only as a UI hint -- the value is a
+// multi-line string, so an editor renders a multi-line text box rather
+// than a single-line input.
 enum class ConfigType : unsigned char {
-  Bool, Int, Uint, Real, String, Array, Object, Any
+  Bool, Int, Uint, Real, String, Text, Array, Object, Any
 };
 
 // Stable lower-case name for a ConfigType ("bool", "int", "uint",
-// "real", "string", "array", "object", "any"). Never returns null.
+// "real", "string", "text", "array", "object", "any"). Never returns
+// null.
 std::string_view config_type_name(ConfigType) noexcept;
 
 // Static, type-level declaration of one configuration key. A stage

@@ -419,12 +419,16 @@ kernel void gemm_i8i8_sc_f16_n64_kacc(
   }
 }
 
+// Element type of the scales/output is VPIPE_ELT (half or bfloat): the FLUX.2
+// bf16 DiT loads this from the _bf16 metallib so it reads its bf16 scales and
+// stores a bf16 result (the int8 tensors are format-independent). The int32
+// tile accumulation + f32 per-group scaling are unchanged.
 kernel void gemm_i8i8_sc_f16_n64_g512(
-    const device int8_t* xq [[buffer(0)]],
-    const device int8_t* wq [[buffer(1)]],
-    const device half*   as [[buffer(2)]],   // [M, K/512] per-token-group
-    const device half*   ws [[buffer(3)]],   // [N, K/512] per-chan-group
-    device half*         y  [[buffer(4)]],
+    const device int8_t*    xq [[buffer(0)]],
+    const device int8_t*    wq [[buffer(1)]],
+    const device VPIPE_ELT* as [[buffer(2)]],   // [M, K/512] per-token-group
+    const device VPIPE_ELT* ws [[buffer(3)]],   // [N, K/512] per-chan-group
+    device VPIPE_ELT*       y  [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
     const constant int& M [[buffer(7)]],
@@ -471,7 +475,7 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
     const int e = (int)lid + t * (SG * 32);
     const int i = e / BN, j = e % BN;
     const int gm = m0 + i, gn = n0 + j;
-    if (gm < M && gn < N) { y[(int64_t)gm * N + gn] = (half)facc[t]; }
+    if (gm < M && gn < N) { y[(int64_t)gm * N + gn] = (VPIPE_ELT)facc[t]; }
   }
 }
 

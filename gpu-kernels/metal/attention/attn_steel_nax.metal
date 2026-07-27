@@ -57,6 +57,17 @@ struct Limits<half> {
   static constexpr constant half finite_min =
       -metal::numeric_limits<half>::max();
 };
+template <>
+struct Limits<bfloat> {
+  static constexpr constant bfloat max =
+      metal::numeric_limits<bfloat>::infinity();
+  static constexpr constant bfloat min =
+      -metal::numeric_limits<bfloat>::infinity();
+  static constexpr constant bfloat finite_max =
+      metal::numeric_limits<bfloat>::max();
+  static constexpr constant bfloat finite_min =
+      -metal::numeric_limits<bfloat>::max();
+};
 
 #if defined(__HAVE_TENSOR__)
 
@@ -90,6 +101,22 @@ template [[host_name("attn_steel_nax_h_bd128")]] [[kernel]] decltype(attention_n
                                                                      float>)
 attention_nax<half, 64, 32, 128, 4, 1, half, float>;
 
+// bf16 twin of the head_dim-128 NAX (M5 matrix-core) attention, for the FLUX.2
+// DiT: its residual stream overflows f16 range, so the whole DiT runs bf16 and
+// its joint attention Q/K/V are bf16. Same kernel, T=bfloat (accumulation f32).
+// Restores the M5 nax speedup for flux2 (the non-nax attn_steel_h_bd128_bf16 is
+// the M4/fallback path).
+template [[host_name("attn_steel_nax_h_bd128_bf16")]] [[kernel]] decltype(attention_nax<
+                                                                     bfloat,
+                                                                     64,
+                                                                     32,
+                                                                     128,
+                                                                     4,
+                                                                     1,
+                                                                     bfloat,
+                                                                     float>)
+attention_nax<bfloat, 64, 32, 128, 4, 1, bfloat, float>;
+
 #else
 // Tensor ops unavailable for this target: a stub so the metallib still builds.
 // The loader never binds this on a non-tensor (pre-M5) GPU.
@@ -99,4 +126,7 @@ kernel void attn_steel_nax_h_bd64(device half* O [[buffer(3)]],
 kernel void attn_steel_nax_h_bd128(device half* O [[buffer(3)]],
                                    uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_h_bd128_bf16(device bfloat* O [[buffer(3)]],
+                                        uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
 #endif

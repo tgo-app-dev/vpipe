@@ -194,11 +194,15 @@ MetalKrea2Vae::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
   m->_fn_im2col      = m->_lib_elt.function("im2col_hwc_3x3_f16");
   m->_fn_im2col_s2   = m->_lib_elt.function("im2col_hwc_3x3_s2_f16");
+  m->_fn_im2col_tiled = m->_lib_elt.function("im2col_hwc_3x3_tiled_f16");
+  m->_fn_im2col_s2_tiled =
+      m->_lib_elt.function("im2col_hwc_3x3_s2_tiled_f16");
   m->_fn_upsample    = m->_lib_elt.function("upsample_nearest2x_hwc_f16");
   if (!m->_fn_gemm_bias.valid() || !m->_fn_rms.valid() ||
       !m->_fn_mul_sigmoid.valid() || !m->_fn_residual.valid() ||
       !m->_fn_clamp.valid() || !m->_fn_sdpa.valid() ||
       !m->_fn_im2col.valid() || !m->_fn_im2col_s2.valid() ||
+      !m->_fn_im2col_tiled.valid() || !m->_fn_im2col_s2_tiled.valid() ||
       !m->_fn_upsample.valid()) {
     return nullptr;
   }
@@ -387,9 +391,13 @@ MetalKrea2Vae::unwhiten(const SharedBuffer& z, int h8, int w8)
 void
 MetalKrea2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
                                const SharedBuffer& w, const SharedBuffer& b,
-                               const SharedBuffer& y, int M, int N, int K)
+                               const SharedBuffer& y, int M, int N, int K,
+                               int y_row0)
 {
-  // y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N]). M5 matmul2d for tall M, else steel.
+  // y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N]), written into y at output row y_row0
+  // (a row-tiled im2col conv feeds one band into out[y_row0:y_row0+M]). M5
+  // matmul2d for tall M, else steel.
+  const std::size_t ybase = (std::size_t)y_row0 * N;   // element offset into y
   if (_use_mma2 && M >= _mma_min_m && N >= _mma_min_n) {
     // Tile-adaptive matrix-core dense GEMM (no bias): 128x128 for K < 6144,
     // 128x256 for deeper K. The matmul2d tensor extents clamp M/N tails, so M
@@ -410,7 +418,7 @@ MetalKrea2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
       enc.set_buffer(0, x, (std::size_t)r0 * K * 2);
       enc.set_buffer(1, w);
       enc.set_buffer(2, w);        // bias slot unused (has_bias=0)
-      enc.set_buffer(3, y, (std::size_t)r0 * N * 2);
+      enc.set_buffer(3, y, (ybase + (std::size_t)r0 * N) * 2);
       enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, mc);
       enc.set_constant(7, 0);
       enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
@@ -420,7 +428,7 @@ MetalKrea2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
       // Fold bias[N] across ALL M rows at once (a plain kernel, no M limit).
       const std::size_t total = (std::size_t)M * N;
       enc.set_function(_fn_bias_add);
-      enc.set_buffer(0, y); enc.set_buffer(1, b);
+      enc.set_buffer(0, y, ybase * 2); enc.set_buffer(1, b);
       enc.set_constant(2, N); enc.set_constant(3, (unsigned)total);
       // 2D grid {N, M}: gid = row*N + col (a 1D {M*N} grid overflows past ~2K).
       enc.dispatch({(unsigned)N, (unsigned)M, 1}, {256, 1, 1});
@@ -429,11 +437,45 @@ MetalKrea2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
   }
   enc.set_function(_fn_gemm_bias);
   enc.set_buffer(0, x); enc.set_buffer(1, w);
-  enc.set_buffer(2, b.empty() ? w : b); enc.set_buffer(3, y);
+  enc.set_buffer(2, b.empty() ? w : b); enc.set_buffer(3, y, ybase * 2);
   enc.set_constant(4, M); enc.set_constant(5, N); enc.set_constant(6, K);
   enc.set_constant(7, b.empty() ? 0 : 1);
   enc.dispatch({(unsigned)(((N + 15) / 16) * 16),
                 (unsigned)(((M + 15) / 16) * 16), 1}, {16, 16, 1});
+}
+
+void
+MetalKrea2Vae::tiled_conv3x3_(ComputeEncoder& enc, const SharedBuffer& in,
+                              const SharedBuffer& out, int H, int W,
+                              const Conv& c, int stride, const SharedBuffer& col,
+                              std::size_t cap)
+{
+  const int OH = (stride == 2) ? H / 2 : H;
+  const int OW = (stride == 2) ? W / 2 : W;
+  const std::size_t ohw = (std::size_t)OH * OW;
+  const std::size_t per_row = (std::size_t)9 * c.cin;
+  std::size_t tile_rows = (per_row > 0) ? (cap / per_row) : ohw;
+  // Safe-cap so each band's GEMM is one un-chunked matmul2d under the
+  // M-corruption threshold (measured 2^18 clean / 2^19 banded for large-K 3x3).
+  if (_mma_max_m > 0 && tile_rows > (std::size_t)_mma_max_m / 2) {
+    tile_rows = (std::size_t)_mma_max_m / 2;
+  }
+  if (tile_rows > ohw) { tile_rows = ohw; }
+  if (tile_rows < 1) { tile_rows = 1; }
+  const metal_compute::ComputeFunction& fn =
+      (stride == 2) ? _fn_im2col_s2_tiled : _fn_im2col_tiled;
+  // The whole [H*W, cin] input stays live so the 3x3 halo spans band edges; the
+  // shared `col` is reused across bands (serial dispatch orders band b's GEMM
+  // before band b+1 overwrites col).
+  for (std::size_t r0 = 0; r0 < ohw; r0 += tile_rows) {
+    const int mc = (int)std::min(tile_rows, ohw - r0);
+    enc.set_function(fn);
+    enc.set_buffer(0, in); enc.set_buffer(1, col);
+    enc.set_constant(2, H); enc.set_constant(3, W); enc.set_constant(4, c.cin);
+    enc.set_constant(5, (int)r0); enc.set_constant(6, mc);
+    enc.dispatch({(unsigned)(9 * c.cin), (unsigned)mc, 1}, {64, 1, 1});
+    conv_gemm_bias_(enc, col, c.w, c.b, out, mc, c.cout, c.k, (int)r0);
+  }
 }
 
 bool
@@ -555,8 +597,10 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   // current working-set headroom, rather than allocating our way into an
   // out-of-memory / page-fault mid-decode (which corrupts the output). A
   // shortfall here is the "prevent" half of over-commit handling.
+  std::size_t decode_headroom = 0;   // free working set, for the im2col band cap
   {
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    decode_headroom = (mb.recommended != 0) ? mb.headroom : 0;
     const std::size_t need = decode_peak_bytes(h8, w8);
     if (mb.recommended != 0 && !mb.fits(need)) {
       return fail(fmt(
@@ -615,19 +659,35 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     }
   };
   // Max im2col = the highest-resolution 3x3 conv (the up-block upsample conv at
-  // full res, cin = base*dim_mult[1]); a guard falls back to a held buffer if
-  // some conv ever needs more, so correctness never depends on the estimate.
-  // With the NAX hw conv active only the small fallback convs use im2col (they
-  // alloc their own col buffers), so skip the multi-GB up-front scratch. Else
-  // keep the shared scratch sized for the largest conv.
-  const std::size_t im2col_cap =
-      _use_hwconv ? 0 : (std::size_t)Hout * Wout * 9 * (base * _cfg.dim_mult[1]);
-  SharedBuffer im2col_scratch;
-  if (im2col_cap != 0) {
-    im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-    if (im2col_scratch.empty()) {
-      return fail("im2col scratch allocation failed (out of GPU memory)");
-    }
+  // full res, cin = base*dim_mult[1]). Row-tiled im2col (see the flux2 VAE):
+  // stream each conv's [H*W, 9*cin] in output-row bands so the shared col
+  // scratch is bounded to ONE band (a full-res conv is otherwise multi-GB), on
+  // BOTH the hw-conv path (conv_out + top resblocks fall back to im2col) and the
+  // non-matrix-core M4 path (all convs). `im2col_cap` (ELEMS) caps a band by
+  // memory (reserve the level activation pool = decode_peak_bytes, band gets the
+  // rest of the headroom) AND correctness (k_safe_band rows, matmul2d
+  // M-corruption). Each conv derives band rows = im2col_cap / (9*cin), re-capped
+  // at k_safe_band. VPIPE_KREA2_VAE_BAND_ROWS overrides the band.
+  const std::size_t wide = (std::size_t)base * _cfg.dim_mult[1];   // widest cin
+  const std::size_t k_safe_band =
+      _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : (std::size_t)Hout * Wout;
+  const std::size_t full_band = (std::size_t)Hout * Wout * 9 * wide;
+  const std::size_t floor_band = (std::size_t)Wout * 9 * wide * 8;   // 8 rows
+  std::size_t im2col_cap = full_band;
+  if (decode_headroom > 0) {
+    const std::size_t reserve = decode_peak_bytes(h8, w8);   // pool reserve bytes
+    const std::size_t avail_el = decode_headroom > reserve
+        ? (decode_headroom - reserve) / 2 : 0;
+    im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+  }
+  im2col_cap = std::min(im2col_cap, k_safe_band * 9 * wide);
+  if (const char* e = std::getenv("VPIPE_KREA2_VAE_BAND_ROWS")) {
+    const long r = std::atol(e);
+    if (r > 0) { im2col_cap = (std::size_t)r * 9 * wide; }
+  }
+  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+  if (im2col_scratch.empty()) {
+    return fail("im2col band scratch allocation failed (out of GPU memory)");
   }
 
   CommandStream stream = mc->make_command_stream();
@@ -653,24 +713,15 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     // overflows) then gemm_bias. Spatial size preserved.
     auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
                        const Conv& c) -> SharedBuffer& {
-      const std::size_t hw = (std::size_t)H * W;
-      SharedBuffer& out = alloc(hw * c.cout);
-      // NAX hardware conv first; then the (opt-in) fused tgmem conv; else
-      // im2col + gemm_bias into the same output buffer.
+      SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
+      // NAX hardware conv first; then the (opt-in) fused tgmem conv; else the
+      // row-tiled im2col + gemm_bias (bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
       if (conv2d_mma_(enc, in, c.w, c.b, out, H, W, c.cin, c.cout, H, W, 1)) {
         return out;
       }
-      const std::size_t cols = hw * 9 * c.cin;
-      const SharedBuffer& col =
-          cols <= im2col_cap ? im2col_scratch : alloc(cols);
-      enc.set_function(_fn_im2col);
-      enc.set_buffer(0, in); enc.set_buffer(1, col);
-      enc.set_constant(2, H); enc.set_constant(3, W); enc.set_constant(4, c.cin);
-      // 2D grid {9*cin, hw} keeps each dimension small (a 1D {cols} grid is
-      // > 2^31 for a >=1K conv); the kernel reconstructs tpig.y*(9*cin)+tpig.x.
-      enc.dispatch({(unsigned)(9 * c.cin), (unsigned)hw, 1}, {64, 1, 1});
-      gemm_bias(col, c.w, c.b, out, (int)hw, c.cout, c.k);
+      tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
+                     im2col_cap);
       return out;
     };
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hw,
@@ -977,17 +1028,33 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       if (&s.buf == &b) { s.used = false; return; }
     }
   };
-  // Peak im2col = the full-res base-channel s1 convs (hw*9*base); every deeper
-  // level shrinks (hw/4 per stage, channels x2). A held fallback covers any
-  // surprise.
-  // See decode(): the hw conv path never touches the big shared scratch.
-  const std::size_t im2col_cap =
-      _use_hwconv ? 0 : hw * 9 * (std::size_t)base;
-  SharedBuffer im2col_scratch;
-  if (im2col_cap != 0) {
-    im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
-    if (im2col_scratch.empty()) { return {}; }
+  // Row-tiled im2col band scratch (see decode() / the flux2 VAE): stream each
+  // conv's [OH*OW, 9*cin] in output-row bands so the shared col scratch is one
+  // band, not the full-res base-channel [hw, 9*base] (multi-GB at high res).
+  // Peak full-res im2col is the base-ch s1 convs; deeper levels shrink. Cap the
+  // band by memory (headroom -- no encode preflight, query it here) AND
+  // correctness (k_safe_band rows, matmul2d M-corruption).
+  const std::size_t k_safe_band =
+      _mma_max_m > 0 ? (std::size_t)_mma_max_m / 2 : hw;
+  const std::size_t full_band = hw * 9 * (std::size_t)base;
+  const std::size_t floor_band = (std::size_t)W * 9 * base * 8;
+  const std::size_t act_reserve = hw * (std::size_t)base * 7;
+  std::size_t im2col_cap = full_band;
+  {
+    const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    if (mb.recommended != 0) {
+      const std::size_t avail_el = mb.headroom > act_reserve * 2
+          ? (mb.headroom - act_reserve * 2) / 2 : 0;
+      im2col_cap = std::min(full_band, std::max(floor_band, avail_el));
+    }
   }
+  im2col_cap = std::min(im2col_cap, k_safe_band * 9 * (std::size_t)base);
+  if (const char* e = std::getenv("VPIPE_KREA2_VAE_BAND_ROWS")) {
+    const long r = std::atol(e);
+    if (r > 0) { im2col_cap = (std::size_t)r * 9 * base; }
+  }
+  SharedBuffer im2col_scratch = mc->make_shared_buffer(im2col_cap * 2);
+  if (im2col_scratch.empty()) { return {}; }
 
   CommandStream stream = mc->make_command_stream();
   int Hc = H, Wc = W;
@@ -1008,8 +1075,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
     auto conv3x3g = [&](const SharedBuffer& in, int H, int W, const Conv& c,
                         bool stride2) -> SharedBuffer& {
       const int OH = stride2 ? H / 2 : H, OW = stride2 ? W / 2 : W;
-      const std::size_t ohw = (std::size_t)OH * OW;
-      SharedBuffer& out = alloc(ohw * c.cout);
+      SharedBuffer& out = alloc((std::size_t)OH * OW * c.cout);
       if (conv3x3_hw_(enc, in, c, out, H, W, stride2 ? 2 : 1)) {
         return out;
       }
@@ -1017,17 +1083,10 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
                       stride2 ? 2 : 1)) {
         return out;
       }
-      const std::size_t cols = ohw * 9 * c.cin;
-      const SharedBuffer& col =
-          cols <= im2col_cap ? im2col_scratch : alloc(cols);
-      enc.set_function(stride2 ? _fn_im2col_s2 : _fn_im2col);
-      enc.set_buffer(0, in); enc.set_buffer(1, col);
-      enc.set_constant(2, H); enc.set_constant(3, W); enc.set_constant(4, c.cin);
-      // 2D grid {9*cin, OH*OW} keeps each dimension small (a 1D {cols} grid is
-      // > 2^31 for a >=~2K conv); the kernel reconstructs tpig.y*(9*cin)+tpig.x
-      // (identical for the s1 and s2 im2col kernels).
-      enc.dispatch({(unsigned)(9 * c.cin), (unsigned)ohw, 1}, {64, 1, 1});
-      gemm_bias(col, c.w, c.b, out, (int)ohw, c.cout, c.k);
+      // Row-tiled im2col (streams bands through im2col_scratch): the s1 and s2
+      // tiled kernels share the tpig.y*(9*cin)+tpig.x layout.
+      tiled_conv3x3_(enc, in, out, H, W, c, stride2 ? 2 : 1, im2col_scratch,
+                     im2col_cap);
       return out;
     };
     auto conv1x1 = [&](const SharedBuffer& in, std::size_t hwv,

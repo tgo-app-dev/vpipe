@@ -1,7 +1,16 @@
 # vpipe-metal-kernel.cmake -- helper to declare a Metal compute
-# kernel. Compiles `.metal` -> `.air` -> `.metallib` via xcrun, then
-# emits a generated `.cc` that registers the metallib bytes with
-# MetalCompute's process-wide embedded registry at static-init time.
+# kernel. Two build modes, chosen automatically (override with
+# -DVPIPE_METAL_RUNTIME_COMPILE=ON/OFF):
+#
+#   * build-time metallib (default when the Metal toolchain is present):
+#     compiles `.metal` -> `.air` -> `.metallib` via xcrun, then emits a
+#     generated `.cc` that registers the compiled metallib BYTES with
+#     MetalCompute's embedded registry at static-init.
+#
+#   * runtime-compile (fallback when metal/metallib are unavailable, e.g.
+#     a Command-Line-Tools-only box with no Xcode Metal Toolchain): embeds
+#     the include-flattened `.metal` SOURCE instead, and MetalCompute
+#     compiles it via newLibraryWithSource: on first load_library().
 #
 # The generated `.cc` is appended to the caller's VPIPE_SOURCES list
 # so it links into libvpipe.dylib alongside the framework -- no
@@ -17,9 +26,45 @@
 # calls reuse it.
 
 find_program(XCRUN_EXECUTABLE xcrun)
-if(NOT XCRUN_EXECUTABLE)
+
+# Decide build-time-metallib vs runtime-compile mode. The offline Metal
+# shader compiler (the `metal` + `metallib` xcrun subcommands) ships only
+# with Xcode's Metal Toolchain; a Command-Line-Tools-only box lacks it.
+# When it's missing, fall back to embedding source and compiling at load.
+# The user can force either mode with -DVPIPE_METAL_RUNTIME_COMPILE=ON/OFF.
+if(NOT DEFINED VPIPE_METAL_RUNTIME_COMPILE)
+  set(_vp_have_metal FALSE)
+  if(XCRUN_EXECUTABLE)
+    execute_process(COMMAND ${XCRUN_EXECUTABLE} -sdk macosx -f metal
+        RESULT_VARIABLE _vp_m_rc OUTPUT_QUIET ERROR_QUIET)
+    execute_process(COMMAND ${XCRUN_EXECUTABLE} -sdk macosx -f metallib
+        RESULT_VARIABLE _vp_ml_rc OUTPUT_QUIET ERROR_QUIET)
+    if(_vp_m_rc EQUAL 0 AND _vp_ml_rc EQUAL 0)
+      set(_vp_have_metal TRUE)
+    endif()
+  endif()
+  if(_vp_have_metal)
+    set(VPIPE_METAL_RUNTIME_COMPILE OFF CACHE BOOL
+        "Embed .metal source + compile at runtime (no Metal toolchain needed)")
+  else()
+    set(VPIPE_METAL_RUNTIME_COMPILE ON CACHE BOOL
+        "Embed .metal source + compile at runtime (no Metal toolchain needed)")
+  endif()
+endif()
+
+if(VPIPE_METAL_RUNTIME_COMPILE)
+  message(STATUS
+      "vpipe Metal kernels: RUNTIME-COMPILE mode -- embedding .metal source; "
+      "kernels compiled via newLibraryWithSource: at load (no metal/metallib "
+      "toolchain required)")
+elseif(NOT XCRUN_EXECUTABLE)
   message(FATAL_ERROR
-      "xcrun not found in PATH; required to compile vpipe Metal kernels")
+      "xcrun not found in PATH; required to compile vpipe Metal kernels "
+      "(or set -DVPIPE_METAL_RUNTIME_COMPILE=ON to embed source and compile "
+      "at runtime instead)")
+else()
+  message(STATUS
+      "vpipe Metal kernels: build-time metallib mode (xcrun metal/metallib)")
 endif()
 
 # Resolve the directory this file lives in so we can hand off to
@@ -68,39 +113,76 @@ function(add_vpipe_metal_kernel KERNEL_NAME)
     list(APPEND DEPENDS_ABS "${VPIPE_METAL_KERNEL_DIR}/${D}")
   endforeach()
 
-  add_custom_command(
-    OUTPUT ${AIR}
-    COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal
-            -gline-tables-only -frecord-sources
-            -Wall -Wextra -fno-fast-math ${STD_FLAG} ${DEFINE_FLAGS} ${K_FLAGS}
-            -I "${VPIPE_METAL_KERNEL_DIR}"
-            -I "${VPIPE_METAL_KERNEL_DIR}/vendored"
-            -c "${SRC}" -o "${AIR}"
-    DEPENDS "${SRC}" ${DEPENDS_ABS}
-    COMMENT "Compiling Metal kernel ${KERNEL_NAME}.metal -> .air"
-    VERBATIM
-  )
+  if(VPIPE_METAL_RUNTIME_COMPILE)
+    # --- runtime-compile: embed include-flattened SOURCE ---------------
+    # Map STD (e.g. metal4.0) to a numeric language-version code the
+    # runtime compiler applies via MTLCompileOptions.
+    set(LANG 0)
+    if(K_STD MATCHES "^metal([0-9]+)\\.([0-9]+)$")
+      math(EXPR LANG "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")
+    endif()
 
-  add_custom_command(
-    OUTPUT ${LIB}
-    COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metallib "${AIR}" -o "${LIB}"
-    DEPENDS ${AIR}
-    COMMENT "Linking metallib ${KERNEL_NAME}.metallib"
-    VERBATIM
-  )
+    # The AOT compiler resolves quoted includes against these -I roots;
+    # replicate them for the flattener. '|'-join so the lists survive as
+    # single args through add_custom_command.
+    string(JOIN "|" _INC_ARG
+        "${VPIPE_METAL_KERNEL_DIR}" "${VPIPE_METAL_KERNEL_DIR}/vendored")
+    set(_DEF_ARG "")
+    if(K_DEFINES)
+      string(JOIN "|" _DEF_ARG ${K_DEFINES})
+    endif()
 
-  add_custom_command(
-    OUTPUT ${EMBED_CC}
-    COMMAND ${CMAKE_COMMAND}
-            -D KERNEL_NAME=${KERNEL_NAME}
-            -D INPUT=${LIB}
-            -D OUTPUT=${EMBED_CC}
-            -P ${_VPIPE_METAL_KERNEL_DIR}/embed-metallib.cmake
-    DEPENDS ${LIB}
-            ${_VPIPE_METAL_KERNEL_DIR}/embed-metallib.cmake
-    COMMENT "Embedding ${KERNEL_NAME}.metallib into vpipe TU"
-    VERBATIM
-  )
+    add_custom_command(
+      OUTPUT ${EMBED_CC}
+      COMMAND ${CMAKE_COMMAND}
+              -D KERNEL_NAME=${KERNEL_NAME}
+              -D SRC=${SRC}
+              -D OUTPUT=${EMBED_CC}
+              -D INCLUDE_DIRS=${_INC_ARG}
+              -D DEFINES=${_DEF_ARG}
+              -D LANG=${LANG}
+              -P ${_VPIPE_METAL_KERNEL_DIR}/embed-metal-source.cmake
+      DEPENDS "${SRC}" ${DEPENDS_ABS}
+              ${_VPIPE_METAL_KERNEL_DIR}/embed-metal-source.cmake
+      COMMENT "Embedding ${KERNEL_NAME}.metal SOURCE (runtime-compile)"
+      VERBATIM
+    )
+  else()
+    # --- build-time: compile .metal -> .air -> .metallib, embed bytes --
+    add_custom_command(
+      OUTPUT ${AIR}
+      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal
+              -gline-tables-only -frecord-sources
+              -Wall -Wextra -fno-fast-math ${STD_FLAG} ${DEFINE_FLAGS} ${K_FLAGS}
+              -I "${VPIPE_METAL_KERNEL_DIR}"
+              -I "${VPIPE_METAL_KERNEL_DIR}/vendored"
+              -c "${SRC}" -o "${AIR}"
+      DEPENDS "${SRC}" ${DEPENDS_ABS}
+      COMMENT "Compiling Metal kernel ${KERNEL_NAME}.metal -> .air"
+      VERBATIM
+    )
+
+    add_custom_command(
+      OUTPUT ${LIB}
+      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metallib "${AIR}" -o "${LIB}"
+      DEPENDS ${AIR}
+      COMMENT "Linking metallib ${KERNEL_NAME}.metallib"
+      VERBATIM
+    )
+
+    add_custom_command(
+      OUTPUT ${EMBED_CC}
+      COMMAND ${CMAKE_COMMAND}
+              -D KERNEL_NAME=${KERNEL_NAME}
+              -D INPUT=${LIB}
+              -D OUTPUT=${EMBED_CC}
+              -P ${_VPIPE_METAL_KERNEL_DIR}/embed-metallib.cmake
+      DEPENDS ${LIB}
+              ${_VPIPE_METAL_KERNEL_DIR}/embed-metallib.cmake
+      COMMENT "Embedding ${KERNEL_NAME}.metallib into vpipe TU"
+      VERBATIM
+    )
+  endif()
 
   # Compile the embed TU in *this* directory so the custom_command
   # rules above bind to a real target's Makefile. The OBJECT library

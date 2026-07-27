@@ -310,3 +310,115 @@ TEST(qwen_image_edit_dit, step_matches_golden)
     }
   }
 }
+
+// Per-block bisect at the REAL edit config -- gen 3072 + REF 3072 + txt 200 at
+// sigma 1.0 -- against a diffusers golden (dit_bisect_golden.py). The shipped
+// `step_matches_golden` case is gen 16 / txt 24 / NO refs, i.e. exactly the
+// configuration in which the DiT is already correct; measured in latent space
+// the step-1 velocity error is 0.011 without refs but 0.093 WITH them. This
+// walks the dumped block indices to find where that error first appears.
+// Env: VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH + VPIPE_QIE_BISECT_GOLDEN.
+TEST(qwen_image_edit_dit, ref_block_bisect)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH");
+  const char* gd   = std::getenv("VPIPE_QIE_BISECT_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string g = gd;
+
+  const std::vector<float> meta = read_f32_(g + "/r_meta.f32");
+  const std::vector<float> hid  = read_f32_(g + "/r_hidden.f32");
+  const std::vector<float> ref  = read_f32_(g + "/r_ref.f32");
+  const std::vector<float> txt  = read_f32_(g + "/r_txt.f32");
+  const std::vector<float> gvel = read_f32_(g + "/g_r_vel.f32");
+  if (meta.size() < 7 || hid.empty() || ref.empty() || txt.empty()) { return; }
+  const int gen_seq = (int)meta[0], txt_seq = (int)meta[1];
+  const int gh = (int)meta[2], gw = (int)meta[3];
+  const int rgh = (int)meta[4], rgw = (int)meta[5];
+  const float sigma = meta[6];
+  const int ref_seq = rgh * rgw;
+
+  auto m = MetalQwenImageTransformer::load(std::string(root) + "/transformer",
+                                           mc, {});
+  ASSERT_TRUE(m != nullptr);
+  const int H = 3072;
+  const SharedBuffer h = upload_(mc, hid);
+  const SharedBuffer t = upload_(mc, txt);
+  std::vector<MetalQwenImageTransformer::RefImage> ri;
+  {
+    MetalQwenImageTransformer::RefImage r;
+    r.latents = upload_(mc, ref);
+    r.seq = ref_seq; r.grid_h = rgh; r.grid_w = rgw;
+    ri.push_back(std::move(r));
+  }
+  std::printf("[qie_bisect] gen %d (+ref %d) txt %d sigma %.3f\n",
+              gen_seq, ref_seq, txt_seq, sigma);
+
+  // Per-block image-stream hidden vs the golden, for the dumped block indices.
+  std::ifstream bf(g + "/r_blocks.i32", std::ios::binary);
+  std::vector<std::int32_t> blocks;
+  if (bf) {
+    std::int32_t v;
+    while (bf.read(reinterpret_cast<char*>(&v), 4)) { blocks.push_back(v); }
+  }
+  // rel-L2 alone cannot tell a SCALE error from a STRUCTURAL one, so report the
+  // norm ratio and cosine too (a k-times-too-large tensor has cosine 1.0).
+  auto report = [](const char* what, const std::vector<float>& got,
+                   const std::vector<float>& gold) {
+    double dot = 0, na = 0, nb = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      dot += (double)got[i] * gold[i];
+      na += (double)got[i] * got[i];
+      nb += (double)gold[i] * gold[i];
+    }
+    std::printf("[qie_bisect] %-16s rel-L2 = %.5f  |a|/|b| = %.5f  cos = "
+                "%.5f\n", what, rel_l2_(got, gold.data(), got.size()),
+                nb > 0 ? std::sqrt(na / nb) : 0.0,
+                (na > 0 && nb > 0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0);
+  };
+
+  // stop=-2 is the post-img_in embedding: if the error is already here it is in
+  // the latent embedding (gen+ref packing / concat), not in any block.
+  const std::vector<float> gimg = read_f32_(g + "/g_r_img_in.f32");
+  if (!gimg.empty()) {
+    SharedBuffer e = m->forward(h, gen_seq, t, txt_seq, gh, gw, sigma, ri,
+                                /*stop=*/-2);
+    if (!e.empty()) {
+      const auto got = readback_(e, (std::size_t)gen_seq * H);
+      // the golden holds gen+ref rows; compare the gen rows vpipe returns
+      if (gimg.size() >= got.size()) {
+        std::vector<float> gg(gimg.begin(), gimg.begin() + got.size());
+        report("img_in(gen)", got, gg);
+      }
+    }
+  }
+  for (const std::int32_t b : blocks) {
+    char nm[64];
+    std::snprintf(nm, sizeof nm, "/g_r_blk%02d.f32", (int)b);
+    const std::vector<float> gb = read_f32_(g + nm);
+    if (gb.empty()) { continue; }
+    SharedBuffer o = m->forward(h, gen_seq, t, txt_seq, gh, gw, sigma, ri,
+                                /*stop=*/(int)b);
+    if (o.empty()) { continue; }
+    const auto got = readback_(o, (std::size_t)gen_seq * H);
+    if (got.size() != gb.size()) {
+      std::printf("[qie_bisect] block %2d SIZE %zu vs golden %zu\n", (int)b,
+                  got.size(), gb.size());
+      continue;
+    }
+    char lbl[32];
+    std::snprintf(lbl, sizeof lbl, "block %2d", (int)b);
+    report(lbl, got, gb);
+  }
+  if (!gvel.empty()) {
+    SharedBuffer v = m->forward(h, gen_seq, t, txt_seq, gh, gw, sigma, ri);
+    ASSERT_TRUE(!v.empty());
+    const auto got = readback_(v, gvel.size());
+    std::printf("[qie_bisect] FINAL velocity rel-L2 = %.5f\n",
+                rel_l2_(got, gvel.data(), got.size()));
+  }
+}

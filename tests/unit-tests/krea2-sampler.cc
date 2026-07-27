@@ -283,31 +283,41 @@ TEST(krea2_sampler, scheduler_select_resolves_defaults_and_overrides)
   }
 }
 
-// ---- env-gated: model scheduler + end-to-end ports ----------------------
+// ---- model-agnostic select stages + end-to-end ports --------------------
 
-TEST(krea2_sampler, select_stages_read_model)
+// The sampler/scheduler select stages forward the user's choice and DO NOT read
+// the model (the text-to-image stage owns it). With no config they emit the
+// built-in distilled-turbo defaults, and a stray `model` key is simply ignored
+// (it is no longer a declared config attr) -- so the model path can no longer
+// silently change the emitted spec.
+TEST(krea2_sampler, select_stages_are_model_agnostic)
 {
-  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
-  if (root == nullptr || *root == '\0') { return; }
   Session sess;
+  // A stray `model` key must not change the emitted spec: build one pair with
+  // it and one without, and require identical turbo defaults.
   FlexData scfg = FlexData::make_object();
-  scfg.as_object().insert_or_assign("model", FlexData::make_string(root));
+  scfg.as_object().insert_or_assign("model",
+                                    FlexData::make_string("/some/model/dir"));
   FlexData ccfg = FlexData::make_object();
-  ccfg.as_object().insert_or_assign("model", FlexData::make_string(root));
+  ccfg.as_object().insert_or_assign("model",
+                                    FlexData::make_string("/some/model/dir"));
   SamplerSelectStage samp(&sess, "s", {}, std::move(scfg));
   SchedulerSelectStage sched(&sess, "c", {}, std::move(ccfg));
+  SamplerSelectStage samp0(&sess, "s0", {}, FlexData::make_object());
+  SchedulerSelectStage sched0(&sess, "c0", {}, FlexData::make_object());
   FlexData sfd = samp.resolved_spec(), cfd = sched.resolved_spec();
   auto so = sfd.as_object();
   auto co = cfd.as_object();
-  std::printf("[krea2_sampler] model -> sampler %s / scheduler %s %.3f %s\n",
-              std::string(so.at("method").as_string("")).c_str(),
-              std::string(co.at("type").as_string("")).c_str(),
-              co.at("shift").as_real(0.0),
-              std::string(co.at("shift_type").as_string("")).c_str());
+  // The turbo defaults, unaffected by the (ignored) `model` key.
   EXPECT_TRUE(std::string(so.at("method").as_string("")) == "euler");
   EXPECT_TRUE(std::string(co.at("type").as_string("")) == "simple");
   EXPECT_TRUE(std::abs(co.at("shift").as_real(0.0) - 1.15) < 1e-6);
   EXPECT_TRUE(std::string(co.at("shift_type").as_string("")) == "exponential");
+  // Identical to the no-`model` build (proves `model` is inert).
+  EXPECT_TRUE(FlowSamplerSpec::from_flex(sfd) ==
+              FlowSamplerSpec::from_flex(samp0.resolved_spec()));
+  EXPECT_TRUE(FlowSchedulerSpec::from_flex(cfd) ==
+              FlowSchedulerSpec::from_flex(sched0.resolved_spec()));
 }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -358,8 +368,9 @@ add_conditioner_(Pipeline* pl, Session& sess, Stage* src,
       &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c)));
 }
 
-// Optionally wire sampler-select (port2) + scheduler-select (port3), both
-// model-derived (euler + simple defaults). Returns the emitted latent.
+// Optionally wire sampler-select (iport3) + scheduler-select (iport4), both
+// model-agnostic (their built-in euler + simple defaults). Returns the emitted
+// latent. Those defaults equal the config default path, so the two runs match.
 std::vector<float>
 run_t2i(Session& sess, const std::string& root, const std::string& gdir,
         bool wire_ports)
@@ -373,18 +384,14 @@ run_t2i(Session& sess, const std::string& root, const std::string& gdir,
   SamplerSelectStage* sel = nullptr;
   SchedulerSelectStage* sch = nullptr;
   if (wire_ports) {
-    FlexData a = FlexData::make_object();
-    a.as_object().insert_or_assign("model", FlexData::make_string(root));
     sel = static_cast<SamplerSelectStage*>(pl->insert_stage(
         std::make_unique<SamplerSelectStage>(&sess, "sel",
                                              std::vector<InEdge>{},
-                                             std::move(a))));
-    FlexData b = FlexData::make_object();
-    b.as_object().insert_or_assign("model", FlexData::make_string(root));
+                                             FlexData::make_object())));
     sch = static_cast<SchedulerSelectStage*>(pl->insert_stage(
         std::make_unique<SchedulerSelectStage>(&sess, "sch",
                                                std::vector<InEdge>{},
-                                               std::move(b))));
+                                               FlexData::make_object())));
   }
 
   FlexData cfg = FlexData::make_object();
@@ -392,8 +399,11 @@ run_t2i(Session& sess, const std::string& root, const std::string& gdir,
   cfg.as_object().insert_or_assign(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
+  // t2i iports: {conditioning, neg, model, sampler, scheduler, ref0, ref1};
+  // sampler/scheduler are iport3/iport4 (model iport2 left unwired here).
   std::vector<InEdge> ip = wire_ports
-      ? std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}}
+      ? std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
+                            {sel, 0}, {sch, 0}}
       : std::vector<InEdge>{{cond, 0}};
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
       std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
@@ -468,7 +478,9 @@ TEST(krea2_sampler, dpmpp_2m_karras_end_to_end)
   cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(rs));
   cfg.as_object().insert_or_assign("seed", FlexData::make_int(0));
   auto* cond = add_conditioner_(pl.get(), sess, src, rs);
-  std::vector<InEdge> ip{{cond, 0}, InEdge{nullptr, 0}, {sel, 0}, {sch, 0}};
+  // sampler/scheduler are iport3/iport4 (model iport2 left unwired here).
+  std::vector<InEdge> ip{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
+                         {sel, 0}, {sch, 0}};
   auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
       std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
                                          std::move(cfg))));

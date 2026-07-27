@@ -11,6 +11,7 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
+#include "generative-models/mage/metal-mage-vae.h"
 #endif
 
 #include <cstdint>
@@ -30,15 +31,23 @@ namespace vpipe {
 //           U8 0..255 or f32 [-1,1]) -- the format load-image / vae-decode
 //           emit. Converted to [-1,1] and encoded to the posterior mode.
 //
+//   iport1  OPTIONAL FlexDataPayload model reference (from a `model-select`
+//           source). Latched on the first beat; OVERRIDES the hf_dir config so
+//           a graph's conditioner / DiT / vae-encode / vae-decode can share one
+//           model choice. When wired, the VAE load is DEFERRED to the first
+//           process() (the beat only arrives after the init barrier).
+//
 //   oport0  TensorBeatPayload, an f32 latent [z_dim, H/8, W/8] (channel-first,
 //           unpacked, WHITENED -- (x-mean)/std) -- the same format the
 //           text-to-image stage emits, so it flows into the `latent` port
 //           there (img2img init) or straight back into vae-decode.
 //
 // Config (FlexData object on the 4th constructor parameter):
-//   hf_dir     (string, required) -- the Krea-2-Turbo model directory; the VAE
+//   hf_dir     (string, OPTIONAL) -- the Krea-2-Turbo model directory; the VAE
 //                                    weights are read from <hf_dir>/vae (or
 //                                    hf_dir itself if it is already a vae dir).
+//                                    A model-select source on iport1 overrides
+//                                    it; required only when iport1 is unwired.
 //   models_db  (string, default "models") -- registry for resolve_model_dir.
 //   target_width, target_height (int, optional) -- when BOTH are set (and
 //                                    multiples of 8), the input image is
@@ -79,7 +88,7 @@ private:
   int _pad_r = 0;
   int _pad_g = 0;
   int _pad_b = 0;
-  std::string _family;   // "krea2" | "flux2"
+  std::string _family;   // "krea2" | "flux2" | "mage"
   std::uint64_t _latents_emitted = 0;
 
   // Parse the `pad_color` config attr into _pad_r/_pad_g/_pad_b (0..255).
@@ -87,11 +96,24 @@ private:
   // gray level; leaves the black default on an unrecognized value.
   void parse_pad_color_();
 
+  // Model iport bookkeeping (used only when a model-select source is wired):
+  // latch the model beat once, and load the VAE at most once (lazily, since
+  // the beat only arrives after the init barrier).
+  bool _model_latched  = false;
+  bool _load_attempted = false;
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  // Loaded lazily in initialize() (one per the detected family); left null on
-  // failure so the stage stays inert (process() warns + emits nothing).
+  // Loaded lazily (one per the detected family) by ensure_loaded_ -- from
+  // initialize() when the model comes from config, or from process() when it
+  // arrives on the model iport. Left null on failure so the stage stays inert
+  // (process() warns + emits nothing).
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
+  std::unique_ptr<genai::MetalMageVae>  _mage_vae;
+
+  // Resolve _hf_dir + load the VAE encoder (idempotent: the _load_attempted
+  // guard runs the body at most once). No-op when _hf_dir is still empty.
+  void ensure_loaded_();
 #endif
 };
 
