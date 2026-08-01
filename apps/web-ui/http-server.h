@@ -54,6 +54,14 @@ public:
   // Write all `len` bytes; returns false once the peer / link has gone
   // away (so a streaming producer can stop early).
   virtual bool write_all(const char* data, std::size_t len) = 0;
+  // Wait up to `timeout_ms` for read() to be able to make progress
+  // (data buffered or the peer closed). Returns false on timeout. This
+  // is what lets ONE thread service a bidirectional WebSocket without a
+  // blocking read: it polls for inbound work, then falls through to
+  // flush whatever the backend queued. A single thread also keeps TLS
+  // correct -- concurrent SSL_read/SSL_write on one SSL object is not
+  // permitted.
+  virtual bool poll_readable(int timeout_ms) = 0;
 };
 
 // Incremental (chunk-as-you-go) response writer for streaming routes.
@@ -81,10 +89,12 @@ private:
   bool  _alive = true;
 };
 
-// A negotiated WebSocket connection over a Conn (plaintext or TLS). The
-// server side only sends -- binary messages (fMP4 init/fragments + PCM for
-// the Preview view) -- and detects the peer going away via write failure.
-// Frames are unmasked (server->client) per RFC 6455.
+// A negotiated WebSocket connection over a Conn (plaintext or TLS).
+// Bidirectional: the server sends binary/text messages (a stage view's
+// media and structured messages) and receives the client's, which are
+// MASKED per RFC 6455 and unmasked here. Frames the server sends are
+// unmasked, again per RFC 6455. Continuation frames are reassembled;
+// ping is answered with pong; close ends the conversation.
 class WebSocket {
 public:
   explicit WebSocket(Conn& conn) : _conn(&conn) {}
@@ -98,11 +108,38 @@ public:
   bool send_text(std::string_view s);
   bool alive() const noexcept { return _alive; }
 
+  // Outcome of recv().
+  enum class Msg {
+    None,     // nothing arrived within the timeout -- call again
+    Text,     // `payload` holds one complete text message
+    Binary,   // `payload` holds one complete binary message
+    Closed,   // peer closed / the link failed -- stop
+  };
+
+  // Receive at most one complete message, waiting up to `timeout_ms`.
+  // Control frames (ping/pong) are handled internally and do not
+  // surface; a message split across continuation frames is reassembled
+  // before it does. A partially-arrived frame stays buffered, so a
+  // timeout mid-frame is not a loss -- the next call resumes it.
+  Msg recv(std::string& payload, int timeout_ms);
+
+  // Largest client message accepted, as a guard against a buggy or
+  // hostile peer. The client side of a view channel sends small control
+  // objects; bulk data only ever flows server -> client.
+  static constexpr std::size_t kMaxIncoming = 4u << 20;   // 4 MiB
+
 private:
   bool send_frame_(std::uint8_t opcode, const std::uint8_t* data,
                    std::size_t len);
-  Conn* _conn;
-  bool  _alive = true;
+  // Buffer at least `n` bytes of inbound data, waiting up to the
+  // deadline. False on timeout or a dead peer.
+  bool fill_(std::size_t n, int timeout_ms);
+
+  Conn*       _conn;
+  bool        _alive = true;
+  std::string _rx;            // bytes received, not yet consumed
+  std::string _frag;          // reassembly of a fragmented message
+  std::uint8_t _frag_op = 0;  // opcode of the message being reassembled
 };
 
 // Minimal single-threaded-accept HTTP/1.1 server for the web-ui app.
@@ -159,6 +196,18 @@ public:
   // (default) disables the gate entirely.
   void set_auth_key(std::string key) { _auth_key = std::move(key); }
 
+  // The QR shortcut (--show-qr): one long, unguessable top-level path
+  // that a phone reaches by scanning the console, and which redirects to
+  // "/?key=<access key>" so the client adopts the key without anyone
+  // typing it. Empty (default) means no such path exists.
+  //
+  // A separate, longer secret rather than the 8-character console key
+  // because this one travels IN A URL -- somewhere it can be shoulder-
+  // read off a screen, kept in history, or logged by a proxy -- so it is
+  // sized to be worth nothing to a guesser. It is matched as a whole
+  // path segment, so it shadows no asset and no route.
+  void set_qr_key(std::string key) { _qr_key = std::move(key); }
+
   // Enable HTTPS. Loads (or generates + caches) a self-signed certificate
   // under `cache_dir`, whose SubjectAltName covers localhost + `bind_hint`
   // so the browser reaches a matching secure origin. MUST be called before
@@ -179,6 +228,14 @@ public:
   void stop();                       // idempotent; dtor calls it
   int  bound_port() const noexcept { return _bound_port; }
 
+  // True once stop() has begun. A LONG-LIVED handler -- one that owns its
+  // connection for as long as the client keeps it open, rather than
+  // answering and returning -- MUST poll this and unwind promptly.
+  // stop() waits only a bounded time for handlers to finish, and then
+  // the caller tears down everything those handlers borrow; a handler
+  // that outlives that wait is left dereferencing freed objects.
+  bool stopping() const noexcept { return _stop.load(); }
+
 private:
   struct Route {
     std::string              method;
@@ -198,6 +255,9 @@ private:
   void        accept_loop_();
   void        serve_one_(Conn& conn, bool loopback);
   bool        dispatch_(const HttpRequest& req, HttpResponse& out) const;
+  // Returns true (and fills `out` with a redirect) when the path is the
+  // QR shortcut set by set_qr_key(); false otherwise.
+  bool        qr_redirect_(const HttpRequest& req, HttpResponse& out) const;
   // Returns true (and writes the whole response through `conn`) if a
   // streaming route matched; false if none did.
   bool        dispatch_stream_(const HttpRequest& req, Conn& conn) const;
@@ -211,6 +271,7 @@ private:
   int                _bound_port = 0;
   std::string        _doc_root;
   std::string        _auth_key;
+  std::string        _qr_key;
   // Non-null when HTTPS is enabled (enable_tls). Guarded so a build
   // without OpenSSL never instantiates the incomplete type.
 #ifdef VPIPE_WEBUI_TLS

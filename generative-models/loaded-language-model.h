@@ -96,6 +96,14 @@ public:
   // entry points will return -1.
   bool valid() const noexcept;
 
+  // Bytes of KV / recurrent state this model is holding right now,
+  // wherever it lives: an owns_kv exec keeps its own paged pools, and
+  // everything else uses this object's context manager.
+  //
+  // Grows with the conversation, unlike the weights, so it is reported
+  // separately -- see GenerativeModelManager::resident_kv_bytes().
+  std::size_t kv_bytes() const;
+
   const ModelConfig& config()    const noexcept;
   const Tokenizer&   tokenizer() const noexcept;
 

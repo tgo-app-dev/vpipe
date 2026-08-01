@@ -9,6 +9,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
+#include "stages/sampler-spec.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/chat-template.h"
@@ -206,21 +207,10 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
     }
   }
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  // Flat `sampler_*` knobs (mirrors realtime-vqa). Each defaults to the
-  // SamplerParams default in kSpec.attrs, so leaving them all unset gives
-  // greedy/argmax decoding (text-chat's historical default). attr_*
-  // resolves config-else-default.
-  _sampler_params.temperature =
-      static_cast<float>(attr_real("sampler_temperature"));
-  _sampler_params.top_k  = static_cast<int>(attr_int("sampler_top_k"));
-  _sampler_params.top_p  = static_cast<float>(attr_real("sampler_top_p"));
-  _sampler_params.min_p  = static_cast<float>(attr_real("sampler_min_p"));
-  _sampler_params.repetition_penalty =
-      static_cast<float>(attr_real("sampler_repetition_penalty"));
-  _sampler_params.presence_penalty =
-      static_cast<float>(attr_real("sampler_presence_penalty"));
-  _sampler_params.seed =
-      static_cast<std::uint64_t>(attr_uint("sampler_seed"));
+  // Sampling is programmed by a `sampler-select` stage on the OPTIONAL
+  // sampler iport, latched on the first turn. Unwired => _sampler_params
+  // stays at its defaults, which are argmax (text-chat's historical
+  // default).
   // MTP speculative-decode head (metal path only): engaged when the loaded
   // model carries one (Qwen3.5-OptiQ / GGUF NextN). Token-exact vs the
   // standard decode path, so this is a perf-only switch; default on, set
@@ -319,21 +309,6 @@ constexpr ConfigKey kAttrs[] = {
           "text-to-speech) voices only the answer; out-port 0 still "
           "carries the full reply",
    .def_bool = false},
-  // Flat sampler knobs; all at SamplerParams defaults -> greedy/argmax.
-  {.key = "sampler_temperature", .type = ConfigType::Real,
-   .doc = "softmax temperature; <= 0 forces argmax", .def_real = 1.0},
-  {.key = "sampler_top_k", .type = ConfigType::Int,
-   .doc = "keep top-k logits; 0 = disabled", .def_int = 0},
-  {.key = "sampler_top_p", .type = ConfigType::Real,
-   .doc = "nucleus top-p; >= 1 = disabled", .def_real = 1.0},
-  {.key = "sampler_min_p", .type = ConfigType::Real,
-   .doc = "min-p floor; <= 0 = disabled", .def_real = 0.0},
-  {.key = "sampler_repetition_penalty", .type = ConfigType::Real,
-   .doc = "repetition penalty; 1.0 = disabled", .def_real = 1.0},
-  {.key = "sampler_presence_penalty", .type = ConfigType::Real,
-   .doc = "presence penalty; 0.0 = disabled", .def_real = 0.0},
-  {.key = "sampler_seed", .type = ConfigType::Uint,
-   .doc = "RNG seed; 0 = non-deterministic", .def_uint = 0},
   {.key = "mtp", .type = ConfigType::Bool,
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
@@ -359,6 +334,11 @@ const PortSpec kIports[] = {
           "vision/audio towers",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
+  {.name = "sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select). Latched "
+          "on the first turn and reused for every later one; unwired = "
+          "greedy (argmax) decoding",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "assistant",
@@ -473,10 +453,45 @@ TextChatStage::setup_file_sandbox_()
   _file_sandbox_root = _file_sandbox->root().string();
 }
 
+void
+TextChatStage::reset_run_state()
+{
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _sampler_latched = false;
+}
+
+std::vector<std::string>
+TextChatStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+}
+
 Job
 TextChatStage::initialize(RuntimeContext& ctx)
 {
   (void)ctx;
+  // Let the user interrupt a running generation (Ctrl-C on the console,
+  // the web UI's Interrupt button). Registered unconditionally -- even
+  // on a build/config with no model the handler is harmless, it just
+  // never has anything to report. The handler runs on the front end's
+  // thread and only raises a flag; the decode loops in process() act on
+  // it. Returning false when no turn is in flight is what lets the CLI
+  // treat that Ctrl-C as "quit" instead of swallowing it.
+  if (session()) {
+    _interrupt_tok = session()->register_interrupt_handler(
+        "text-chat '" + this->id() + "'",
+        [this]() {
+          if (!_generating.load(std::memory_order_acquire)) {
+            return false;
+          }
+          _interrupt.store(true, std::memory_order_release);
+          return true;
+        });
+  }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // No-MLX build: the LM subsystem runs on the metal-compute backend.
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
@@ -640,6 +655,21 @@ TextChatStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Latch the token-sampler spec off the OPTIONAL sampler iport, once: the
+  // `sampler-select` source emits a single beat at launch, which we cache and
+  // reuse for every later turn. Read AFTER the user beat so an unwired-but-
+  // declared port never stalls the first turn. Unwired => greedy.
+  if (!_sampler_latched && ctx.num_iports() >= 2 && ctx.iport_connected(1)) {
+    auto sb = co_await ctx.read(1);
+    _sampler_latched = true;   // beat consumed either way; never re-read
+    bool ok = false;
+    const genai::SamplerParams p = sampler_params_from_beat(
+        sb.get(), session(), "TextChatStage('" + this->id() + "')", &ok);
+    if (ok) { _sampler_params = p; }
+  }
+#endif
 
   // Every input beat must produce exactly one output beat, otherwise
   // a feedback-driven trigger downstream (feedback-rx + feedback-tx)
@@ -903,6 +933,12 @@ TextChatStage::process(RuntimeContext& ctx)
     MaxNewTokens,     // hit the per-turn token budget
     DecodeError,      // step_pipelined / materialize_lazy returned -1
     PipelineStopped,  // ctx.stop_requested() while decoding
+    UserInterrupted,  // the user asked to interrupt (Ctrl-C / button)
+  };
+  // Polled by every decode loop. Raised by the interrupt handler
+  // registered in initialize(); cleared when this turn is armed below.
+  auto interrupted = [this]() {
+    return _interrupt.load(std::memory_order_acquire);
   };
   // Accumulators across the (possibly several) decode rounds a single
   // user beat runs: one base round plus one per tool-call round.
@@ -1096,12 +1132,14 @@ TextChatStage::process(RuntimeContext& ctx)
               emit_chunk(tok.step(sd, id));
               ++decode_calls;
             }
-            return !ctx.stop_requested();
+            return !ctx.stop_requested() && !interrupted();
           };
       _lm->mtp_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
                         is_stop, on_toks, &produced, &stopped);
       if (stopped) {
         reason = StopReason::StopToken;
+      } else if (interrupted()) {
+        reason = StopReason::UserInterrupted;
       } else if (ctx.stop_requested()) {
         reason = StopReason::PipelineStopped;
       } else {
@@ -1139,6 +1177,10 @@ TextChatStage::process(RuntimeContext& ctx)
       }
       for (int i = 1; i < _max_new_tokens; ++i) {
         if (ctx.stop_requested()) { reason = StopReason::PipelineStopped; break; }
+        // A user interrupt ends the turn here, exactly where a stop
+        // token would: everything decoded so far stays in the K/V
+        // cache and the partial reply is emitted normally.
+        if (interrupted()) { reason = StopReason::UserInterrupted; break; }
         if (is_stop(next)) { reason = StopReason::StopToken; break; }
         if (!committed) { reason = StopReason::DecodeError; break; }
         next = _lm->pdecode_next(_chat_ctx);
@@ -1148,7 +1190,7 @@ TextChatStage::process(RuntimeContext& ctx)
         // on the GPU while the host detokenizes + streams token i. Only when
         // `next` is not a stop token (else its KV must not be appended).
         const bool cont = (i + 1 < _max_new_tokens) && !is_stop(next)
-            && !ctx.stop_requested();
+            && !ctx.stop_requested() && !interrupted();
         committed = cont ? _lm->pdecode_commit(_chat_ctx) : false;
         if (!is_stop(next)) {
           emit_chunk(tok.step(sd, next));
@@ -1166,6 +1208,10 @@ TextChatStage::process(RuntimeContext& ctx)
     for (int i = 1; i < _max_new_tokens; ++i) {
       if (ctx.stop_requested()) {
         reason = StopReason::PipelineStopped;
+        break;
+      }
+      if (interrupted()) {
+        reason = StopReason::UserInterrupted;
         break;
       }
       if (is_stop(next)) {
@@ -1239,6 +1285,21 @@ TextChatStage::process(RuntimeContext& ctx)
   };
 
   // ---- round 1: prefill (media or plain) + decode ------------------
+  // Arm the interrupt handler for this turn. Clearing the flag here
+  // (rather than after a turn) means an interrupt that lands between
+  // turns is dropped instead of killing the next one. Prefill itself
+  // is a single un-splittable call, so an interrupt during it is
+  // honoured by the decode loop the moment prefill returns -- which is
+  // still the right answer for the user, and lets the handler report
+  // the interrupt as consumed rather than falling through to "quit".
+  struct TurnGuard {
+    std::atomic<bool>* gen;
+    ~TurnGuard() { gen->store(false, std::memory_order_release); }
+  };
+  _interrupt.store(false, std::memory_order_release);
+  _generating.store(true, std::memory_order_release);
+  TurnGuard turn_guard{&_generating};
+
   int32_t next;
   if (have_media) {
     const auto t_prefill_start = clock::now();
@@ -1343,6 +1404,10 @@ TextChatStage::process(RuntimeContext& ctx)
     };
     int tool_round = 0;
     while (true) {
+      // An interrupted turn stops here too: running the tools the
+      // model asked for -- and decoding another round on top -- is
+      // exactly the work the user just asked us to abandon.
+      if (interrupted()) { break; }
       const int markers = count_markers(assistant_text);
       auto calls = tpl->parse_tool_calls(assistant_text);
       // One trace per scan so a tool turn is always followed in the debug
@@ -1489,6 +1554,16 @@ TextChatStage::process(RuntimeContext& ctx)
     session()->warn(fmt(
         "TextChatStage('{}'): pipeline stop requested mid-generation "
         "after {} new tokens; assistant turn truncated.",
+        this->id(), decode_calls));
+    break;
+  case StopReason::UserInterrupted:
+    // A deliberate user action, not a fault -- info, not warn. The
+    // context keeps the partial turn, so the conversation continues
+    // from here as if the model had stopped on its own.
+    session()->info(fmt(
+        "TextChatStage('{}'): interrupted by the user after {} new "
+        "tokens; the partial reply is kept and the conversation "
+        "continues.",
         this->id(), decode_calls));
     break;
   }

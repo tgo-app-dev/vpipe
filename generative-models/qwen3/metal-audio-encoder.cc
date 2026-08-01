@@ -1,6 +1,7 @@
 #include "generative-models/qwen3/metal-audio-encoder.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -61,11 +62,20 @@ std::unique_ptr<MetalAudioEncoder>
 MetalAudioEncoder::load(const std::string& model_dir,
                         metal_compute::MetalCompute* mc, const Config& cfg)
 {
-  if (mc == nullptr || !mc->valid()) { return nullptr; }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalAudioEncoder>
+MetalAudioEncoder::load(std::shared_ptr<WeightSet> ws_in,
+                        metal_compute::MetalCompute* mc, const Config& cfg)
+{
+  if (mc == nullptr || !mc->valid() || ws_in == nullptr) { return nullptr; }
+  WeightSet* wts = ws_in.get();
 
   auto m = std::unique_ptr<MetalAudioEncoder>(new MetalAudioEncoder());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
 
@@ -124,53 +134,66 @@ MetalAudioEncoder::load(const std::string& model_dir,
     }
   }
 
-  auto to_f16 = [&](const std::string& name) -> SharedBuffer {
-    const auto* info = wts->info(name);
+  // Cache namespace for this encoder's derived tensors.
+  const std::string dk = "qwen3asr-conformer/";
+  // `cache` false for a tensor that is CONSUMED by a transform below and
+  // then dropped -- caching those would keep the source alive next to
+  // the product it was folded into, for nothing.
+  auto to_f16 = [&](const std::string& name,
+                    bool cache = true) -> SharedBuffer {
+    const auto* info = wts->src().info(name);
     if (info == nullptr) { return {}; }
-    if (info->dtype == "F16") { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
-    if (raw.empty()) { return {}; }
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<_Float16*>(out.contents());
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)bf16_to_f32_(s[i]); }
-    } else if (info->dtype == "F32") {
-      const auto* s = static_cast<const float*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
-    } else {
-      return {};
+    // Already f16: the checkpoint's own bytes. Copied, not Mapped --
+    // mapping wraps the whole shard, which this encoder shares with the
+    // ASR decoder, and the decoder loads by copy.
+    if (info->dtype == "F16") {
+      return cache ? wts->tensor(name, mc, WeightSet::Residency::Copied)
+                   : wts->read(name, mc, WeightSet::Residency::Copied);
     }
-    return out;
+    auto build = [&]() -> SharedBuffer {
+      SharedBuffer raw = wts->read(name, mc, WeightSet::Residency::Copied);
+      if (raw.empty()) { return {}; }
+      const std::size_t n = numel_(info->shape);
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      auto* o = static_cast<_Float16*>(out.contents());
+      if (info->dtype == "BF16") {
+        const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          o[i] = (_Float16)bf16_to_f32_(s[i]);
+        }
+      } else if (info->dtype == "F32") {
+        const auto* s = static_cast<const float*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
+      } else {
+        return {};
+      }
+      return out;
+    };
+    return cache ? wts->derived(dk + name, build) : build();
   };
-  // Row-concatenate q|k|v (each [d_model, d_model]) into one [3*d, d]
-  // weight and [3*d] bias -- one fused GEMM replaces three.
-  auto fuse3 = [&](const std::string& a, const std::string& b,
-                   const std::string& c, SharedBuffer& w,
-                   SharedBuffer& bias) -> bool {
-    SharedBuffer wa = to_f16(a + ".weight"), wb = to_f16(b + ".weight"),
-                 wc = to_f16(c + ".weight");
-    SharedBuffer ba = to_f16(a + ".bias"), bb = to_f16(b + ".bias"),
-                 bc = to_f16(c + ".bias");
-    if (wa.empty() || wb.empty() || wc.empty() || ba.empty() || bb.empty() ||
-        bc.empty()) {
-      return false;
-    }
-    w = mc->make_shared_buffer(wa.byte_size() + wb.byte_size() + wc.byte_size());
-    bias = mc->make_shared_buffer(ba.byte_size() + bb.byte_size() +
-                                  bc.byte_size());
-    char* wp = static_cast<char*>(w.contents());
-    std::memcpy(wp, wa.contents(), wa.byte_size());
-    std::memcpy(wp + wa.byte_size(), wb.contents(), wb.byte_size());
-    std::memcpy(wp + wa.byte_size() + wb.byte_size(), wc.contents(),
-                wc.byte_size());
-    char* bp = static_cast<char*>(bias.contents());
-    std::memcpy(bp, ba.contents(), ba.byte_size());
-    std::memcpy(bp + ba.byte_size(), bb.contents(), bb.byte_size());
-    std::memcpy(bp + ba.byte_size() + bb.byte_size(), bc.contents(),
-                bc.byte_size());
-    return true;
+  // Row-concatenate q|k|v (each [d_model, d_model], or their [d_model]
+  // biases) into one tensor so a single fused GEMM replaces three. The
+  // FUSED result is what the encoder keeps, so that is what is cached;
+  // the three pieces are read uncached and dropped here.
+  auto cat3 = [&](const std::string& key, const std::string& a,
+                  const std::string& b, const std::string& c,
+                  const char* suffix) -> SharedBuffer {
+    return wts->derived(key, [&]() -> SharedBuffer {
+      SharedBuffer xa = to_f16(a + suffix, false),
+                   xb = to_f16(b + suffix, false),
+                   xc = to_f16(c + suffix, false);
+      if (xa.empty() || xb.empty() || xc.empty()) { return {}; }
+      SharedBuffer out = mc->make_shared_buffer(
+          xa.byte_size() + xb.byte_size() + xc.byte_size());
+      if (out.empty()) { return out; }
+      char* p = static_cast<char*>(out.contents());
+      std::memcpy(p, xa.contents(), xa.byte_size());
+      p += xa.byte_size();
+      std::memcpy(p, xb.contents(), xb.byte_size());
+      p += xb.byte_size();
+      std::memcpy(p, xc.contents(), xc.byte_size());
+      return out;
+    });
   };
 
   const std::string r = "audio_tower.";
@@ -199,8 +222,13 @@ MetalAudioEncoder::load(const std::string& model_dir,
     Block& blk = m->_blocks[b];
     blk.n1w = to_f16(p + "self_attn_layer_norm.weight");
     blk.n1b = to_f16(p + "self_attn_layer_norm.bias");
-    ok = ok && fuse3(p + "self_attn.q_proj", p + "self_attn.k_proj",
-                     p + "self_attn.v_proj", blk.qkvw, blk.qkvb);
+    blk.qkvw = cat3(dk + p + "qkv.weight", p + "self_attn.q_proj",
+                    p + "self_attn.k_proj", p + "self_attn.v_proj",
+                    ".weight");
+    blk.qkvb = cat3(dk + p + "qkv.bias", p + "self_attn.q_proj",
+                    p + "self_attn.k_proj", p + "self_attn.v_proj",
+                    ".bias");
+    ok = ok && !blk.qkvw.empty() && !blk.qkvb.empty();
     blk.ow = to_f16(p + "self_attn.out_proj.weight");
     blk.ob = to_f16(p + "self_attn.out_proj.bias");
     blk.n2w = to_f16(p + "final_layer_norm.weight");

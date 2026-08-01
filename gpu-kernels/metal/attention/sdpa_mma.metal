@@ -793,6 +793,22 @@ kernel void sdpa_full_mma2_d64_f16(
 // that is 16 KB, under the 32 KB budget with slack for matmul2d scratch. The
 // over-read of the last BK block past T_kv is masked. Drop-in for sdpa_full_f16
 // (identical buffers 0..10, no q_offset -- full attention).
+//
+// The QK^T accumulator is FLOAT, unlike the LM attention kernels above (which
+// accumulate in VPIPE_ELT). It has to be: this is the one call site whose Q/K
+// are raw conv1x1 outputs rather than RMSNorm'd projections, and the dot runs
+// over D=384/512 rather than a head_dim <= 256. A VAE decoder's mid-block
+// scores leave f16's range, and the failure is SILENT at the magnitudes that
+// actually occur: the output stays FINITE (only a further overflow reaches inf
+// and NaN, which is what the synthetic range arm of the unit test sees) and is
+// merely wrong -- nothing traps. Measured on Boogu's plain
+// AutoencoderKL -- which, unlike FLUX.2's, whitens its latent with a scalar
+// shift/scale rather than a BatchNorm, so its decoder activations are much
+// larger -- rel-L2 2.23 against the simdgroup-matrix flash it replaces, at 256,
+// 1024 and 4096 mid tokens ALIKE. Shape-independence is what distinguishes a
+// range failure from a tiling bug; f32 here takes it to bit-identical. FLUX.2's
+// own decode sat at 5e-4 before and after, which is why an M5 bring-up that
+// only exercised FLUX.2 could not see this. The extra tg cost is 512 B.
 //   0:q[Hq,n_q,D] 1:k 2:v[Hkv,kv_stride,D] 3:out[Hq,n_q,D] 4:scale 5:T_kv 6:D
 //   7:Hq 8:Hkv 9:n_q 10:kv_stride
 // grid {SAF_SG*32, Hq, ceil(n_q/SAF_BQ)}, tg {SAF_SG*32,1,1}.
@@ -823,7 +839,8 @@ template <int SAF_D>
   const device VPIPE_ELT* kbase = k + (int64_t)kvh * kv_stride * SAF_D;
   const device VPIPE_ELT* vbase = v + (int64_t)kvh * kv_stride * SAF_D;
 
-  threadgroup VPIPE_ELT Ss[SAF_BQ * SAF_BK];
+  threadgroup VPIPE_ELT Ss[SAF_BQ * SAF_BK];   // P (softmax output, in [0,1])
+  threadgroup float Sf[SAF_BQ * SAF_BK];       // QK^T scores (see above)
   threadgroup float Of[SAF_BQ * SAF_D];
   threadgroup float mrow[SAF_BQ], lrow[SAF_BQ], corr_s[SAF_BQ];
 
@@ -850,10 +867,10 @@ template <int SAF_D>
     const int bk = min(SAF_BK, T_kv - bs);
     TQ tK(const_cast<device VPIPE_ELT*>(kbase + (int64_t)bs * SAF_D),
           dextents<int32_t,2>(SAF_D, SAF_BK));
-    auto cS = opQK.get_destination_cooperative_tensor<TQ, TQ, VPIPE_ELT>();
+    auto cS = opQK.get_destination_cooperative_tensor<TQ, TQ, float>();
     opQK.run(tQ, tK, cS);
-    TP tS(Ss, dextents<int32_t,2>(SAF_BK, SAF_BQ));
-    cS.store(tS);
+    TO tSf(Sf, dextents<int32_t,2>(SAF_BK, SAF_BQ));
+    cS.store(tSf);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int r = (int)lid; r < SAF_BQ; r += SAF_THREADS) {
@@ -861,14 +878,14 @@ template <int SAF_D>
       float mloc = mrow[r];
       for (int j = 0; j < SAF_BK; ++j) {
         const bool ok = qok && j < bk;
-        const float s = ok ? float(Ss[r * SAF_BK + j]) * scale : -INFINITY;
-        Ss[r * SAF_BK + j] = (VPIPE_ELT)s;
+        const float s = ok ? Sf[r * SAF_BK + j] * scale : -INFINITY;
+        Sf[r * SAF_BK + j] = s;
         mloc = max(mloc, s);
       }
       const float corr = exp(mrow[r] - mloc);
       float lloc = lrow[r] * corr;
       for (int j = 0; j < SAF_BK; ++j) {
-        const float s = float(Ss[r * SAF_BK + j]);
+        const float s = Sf[r * SAF_BK + j];
         const float p = (s == -INFINITY) ? 0.0f : exp(s - mloc);
         Ss[r * SAF_BK + j] = (VPIPE_ELT)p;
         lloc += p;

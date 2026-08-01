@@ -988,6 +988,277 @@ kernel void affine_gather_qmv_swiglu_w8g64(
       simd_gid, simd_lid);
 }
 
+// ---- Mixed-width fused SwiGLU (gate and up at DIFFERENT widths) ----
+//
+// Per-tensor quantizers (OptiQ) can land a layer's gate at w4 and its up at
+// w8 (or vice versa). Such a pair cannot share the interleaved [2*ffn, K]
+// slab the fused kernels above read, since the packed row stride differs.
+// Widening the narrow side to w8 at load would fix the layout but DOUBLE its
+// DRAM traffic, and decode is bound on exactly that weight read -- so instead
+// keep both tensors at their native width in memory and widen in-register
+// here: each side is accumulated by its own bit-parameterized pass and the
+// two meet in registers for silu(gate)*up. Same bytes off DRAM as a uniform
+// layer of the same widths, no scratch buffer, still one dispatch.
+//
+// x-sum and dot-product in the W8 ACCUMULATION SHAPE, for either width.
+//
+// The stock load_vector/qdot add in groups of four at w4 but one at a time at
+// w8, so the same weights read as w4 and as widened-w8 would land on slightly
+// different sums (float add is not associative). These two instantiate BOTH
+// widths in w8's sequential shape, which is what makes "widen in registers"
+// mean the same thing as widening at load: every term is bit-identical
+// ((x/16)*(16q) and x*q round the same, since both scalings are exact powers
+// of two), and now the accumulation order is too. Used only by the
+// mixed-width kernels below -- the stock helpers keep their tuned shape for
+// every existing kernel.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_seq_(const device T* x, thread U* x_thread) {
+  U sum = 0;
+  if (bits == 4) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i];
+      sum += x[i + 1];
+      sum += x[i + 2];
+      sum += x[i + 3];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] / 16.0f;
+      x_thread[i + 2] = x[i + 2] / 256.0f;
+      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      sum += x[i];
+      x_thread[i] = x[i];
+    }
+  }
+  return sum;
+}
+
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_safe_seq_(const device T* x, thread U* x_thread,
+                               int valid) {
+  U sum = 0;
+  if (bits == 4) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      const U v0 = (i + 0 < valid) ? (U)x[i + 0] : (U)0;
+      const U v1 = (i + 1 < valid) ? (U)x[i + 1] : (U)0;
+      const U v2 = (i + 2 < valid) ? (U)x[i + 2] : (U)0;
+      const U v3 = (i + 3 < valid) ? (U)x[i + 3] : (U)0;
+      sum += v0;
+      sum += v1;
+      sum += v2;
+      sum += v3;
+      x_thread[i]     = v0;
+      x_thread[i + 1] = v1 / 16.0f;
+      x_thread[i + 2] = v2 / 256.0f;
+      x_thread[i + 3] = v3 / 4096.0f;
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      const U v = (i < valid) ? (U)x[i] : (U)0;
+      sum += v;
+      x_thread[i] = v;
+    }
+  }
+  return sum;
+}
+
+template <typename U, int values_per_thread, int bits>
+inline U qdot_seq_(const device uint8_t* w, const thread U* x_thread,
+                   U scale, U bias, U sum) {
+  U accum = 0;
+  if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum += x_thread[4 * i]     * (ws[i] & 0x000f);
+      accum += x_thread[4 * i + 1] * (ws[i] & 0x00f0);
+      accum += x_thread[4 * i + 2] * (ws[i] & 0x0f00);
+      accum += x_thread[4 * i + 3] * (ws[i] & 0xf000);
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w[i];
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+// Accumulate results_per_simdgroup(=4) row dot-products of x against rows
+// [out_row, out_row+4) of a [N, K] affine matrix at `bits`. Split out of
+// qmv_swiglu_impl so the gate and up passes can be instantiated at
+// DIFFERENT bits.
+//
+// values_per_thread is pinned to 8 at BOTH widths (packs_per_thread =
+// 8/pack_factor -> 1 at w4, 2 at w8) rather than the stock 16-at-w4: the two
+// passes then walk x with the same block_size and the same lane->k partition
+// -- the w8 traversal, i.e. the one the widened case would use.
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_rows4_accum_(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // already advanced to the input row
+    const constant int& in_vec_size,
+    int out_row,
+    uint simd_lid,
+    thread float* result)               // [4], accumulated into
+{
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  // 8 values per thread at BOTH widths -> one u32 per lane at w4, two at w8,
+  // and an identical lane->k partition either way (see the header above).
+  constexpr int packs_per_thread = 8 / pack_factor;
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  const device uint8_t* ws = (const device uint8_t*)w;
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* xp = x + simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    U sum;
+    if (krem >= block_size) {
+      sum = load_vector_seq_<T, U, values_per_thread, bits>(xp, x_thread);
+    } else {
+      const int v = in_vec_size - (k + (int)simd_lid * values_per_thread);
+      sum = load_vector_safe_seq_<T, U, values_per_thread, bits>(
+          xp, x_thread, v < 0 ? 0 : v);
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      result[row] +=
+          qdot_seq_<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    xp += block_size;
+  }
+}
+
+// y = silu(gate) * up with gate [ffn, K] at GBITS and up [ffn, K] at UBITS,
+// as SEPARATE (un-interleaved) matrices. out_vec_size is the FEATURE count
+// ffn here, not the fused 2*ffn -- each simdgroup owns 4 whole features, so
+// grid.y in threads is ffn/4 (vs ffn/2 for the interleaved form).
+template <typename T, int group_size, int GBITS, int UBITS>
+METAL_FUNC void qmv_swiglu_split_impl(
+    const device uint32_t* wg, const device T* sg, const device T* bg,
+    const device uint32_t* wu, const device T* su, const device T* bu,
+    const device T* x,
+    device T* y,                        // [M, out_vec_size]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // ffn
+    uint3 tid, uint simd_gid, uint simd_lid)
+{
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  typedef float U;
+  thread U rg[results_per_simdgroup] = {0};
+  thread U ru[results_per_simdgroup] = {0};
+
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const device T* xr = x + tid.x * in_vec_size;
+
+  qmv_rows4_accum_<T, group_size, GBITS>(
+      wg, sg, bg, xr, in_vec_size, out_row, simd_lid, rg);
+  qmv_rows4_accum_<T, group_size, UBITS>(
+      wu, su, bu, xr, in_vec_size, out_row, simd_lid, ru);
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    rg[row] = simd_sum(rg[row]);
+    ru[row] = simd_sum(ru[row]);
+  }
+  if (simd_lid == 0) {
+    device T* yo = y + tid.x * out_vec_size + out_row;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const U g = rg[row], u = ru[row];
+      yo[row] = static_cast<T>((g / (1.0f + metal::exp(-g))) * u);
+    }
+  }
+}
+
+// Mixed-width gathered expert SwiGLU. Two flavors cover every {4,8} pair a
+// per-tensor quantizer can produce; equal-width layers keep the cheaper
+// interleaved kernels above. Buffers: gate triple 0/1/2, up triple 3/4/5.
+kernel void affine_gather_qmv_swiglu_w4w8g64(     // gate w4, up w8
+    const device uint32_t* wg       [[buffer(0)]],   // [E, ffn, K/8]
+    const device VPIPE_ELT* sg      [[buffer(1)]],   // [E, ffn, K/64]
+    const device VPIPE_ELT* bg      [[buffer(2)]],
+    const device uint32_t* wu       [[buffer(3)]],   // [E, ffn, K/4]
+    const device VPIPE_ELT* su      [[buffer(4)]],
+    const device VPIPE_ELT* bu      [[buffer(5)]],
+    const device VPIPE_ELT* x       [[buffer(6)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(7)]],   // [npair, ffn]
+    constant int& in_vec_size       [[buffer(8)]],   // K
+    constant int& out_vec_size      [[buffer(9)]],   // ffn
+    const device int* pair_eid      [[buffer(10)]],
+    constant int& top_k             [[buffer(11)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  wg += e * (uint)out_vec_size * ((uint)in_vec_size / 8u);
+  wu += e * (uint)out_vec_size * ((uint)in_vec_size / 4u);
+  sg += e * gstride; bg += e * gstride;
+  su += e * gstride; bu += e * gstride;
+  x  += (uint)(p / top_k) * (uint)in_vec_size;
+  y  += (uint)p * (uint)out_vec_size;
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_swiglu_split_impl<VPIPE_ELT, 64, 4, 8>(
+      wg, sg, bg, wu, su, bu, x, y, in_vec_size, out_vec_size,
+      t0, simd_gid, simd_lid);
+}
+
+kernel void affine_gather_qmv_swiglu_w8w4g64(     // gate w8, up w4
+    const device uint32_t* wg       [[buffer(0)]],   // [E, ffn, K/4]
+    const device VPIPE_ELT* sg      [[buffer(1)]],
+    const device VPIPE_ELT* bg      [[buffer(2)]],
+    const device uint32_t* wu       [[buffer(3)]],   // [E, ffn, K/8]
+    const device VPIPE_ELT* su      [[buffer(4)]],
+    const device VPIPE_ELT* bu      [[buffer(5)]],
+    const device VPIPE_ELT* x       [[buffer(6)]],
+    device VPIPE_ELT*       y       [[buffer(7)]],
+    constant int& in_vec_size       [[buffer(8)]],
+    constant int& out_vec_size      [[buffer(9)]],
+    const device int* pair_eid      [[buffer(10)]],
+    constant int& top_k             [[buffer(11)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const uint e = (uint)pair_eid[p];
+  const uint gstride = (uint)out_vec_size * ((uint)in_vec_size / 64u);
+  wg += e * (uint)out_vec_size * ((uint)in_vec_size / 4u);
+  wu += e * (uint)out_vec_size * ((uint)in_vec_size / 8u);
+  sg += e * gstride; bg += e * gstride;
+  su += e * gstride; bu += e * gstride;
+  x  += (uint)(p / top_k) * (uint)in_vec_size;
+  y  += (uint)p * (uint)out_vec_size;
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_swiglu_split_impl<VPIPE_ELT, 64, 8, 4>(
+      wg, sg, bg, wu, su, bu, x, y, in_vec_size, out_vec_size,
+      t0, simd_gid, simd_lid);
+}
+
 // Down gather: x[p, inner] (per-pair expert activation, contiguous) @ the
 // routed expert's down [H, inner] -> partials[p, H] (UN-weighted; moe_combine
 // applies the routing weight and sums over the token's pairs).

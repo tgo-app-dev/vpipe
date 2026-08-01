@@ -4,6 +4,9 @@
 #include "common/beat-payload-intf.h"
 #include "common/ffmpeg-libraries.h"
 #include "common/flex-data.h"
+#include "common/image-metadata.h"
+#include "common/media-line.h"
+#include "vpipe/vpipe.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -210,6 +213,12 @@ const PortSpec kIports[] = {
                            "vae-decode format)",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
+  {.name = "metadata", .doc = "OPTIONAL FlexData carrying exif_tiff_b64 (as "
+                              "load-image's metadata oport emits); when wired, "
+                              "the EXIF block is written into each output "
+                              "file. One beat per image",
+   .type = &typeid(FlexDataPayload),
+   .tags = "image-metadata", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "save-image",
@@ -264,7 +273,8 @@ SaveImageStage::resolve_path_(uint64_t index) const
 }
 
 bool
-SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path)
+SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
+                        std::span<const std::uint8_t> exif_tiff)
 {
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(&beat);
   if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
@@ -393,6 +403,46 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path)
   // Flush: still-image encoders emit one packet after an EOF signal.
   _libs->avcodec().api.send_frame(cctx.get(), nullptr);
 
+  // Collect the encoder output in memory rather than streaming it straight
+  // to the file: EXIF has to be spliced into the container bytes (an APP1
+  // segment after SOI / an eXIf chunk after IHDR), which needs the head of
+  // the file in hand. A still image is one packet, so this costs one buffer.
+  std::vector<std::uint8_t> bytes;
+  for (;;) {
+    rc = _libs->avcodec().api.receive_packet(cctx.get(), pkt.get());
+    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { break; }
+    if (rc < 0) {
+      session()->error(fmt(
+          "SaveImageStage('{}'): receive_packet failed: {}",
+          this->id(), av_err_(rc)));
+      _libs->avcodec().api.packet_unref(pkt.get());
+      return false;
+    }
+    bytes.insert(bytes.end(), pkt->data, pkt->data + pkt->size);
+    _libs->avcodec().api.packet_unref(pkt.get());
+  }
+  if (bytes.empty()) {
+    session()->error(fmt(
+        "SaveImageStage('{}'): no encoded data produced for '{}'",
+        this->id(), out_path));
+    return false;
+  }
+
+  if (!exif_tiff.empty()) {
+    const bool ok =
+        (_format == "png")  ? imgmeta::png_set_exif(bytes, exif_tiff)
+      : (_format == "tiff" || _format == "tif")
+                            ? imgmeta::tiff_set_exif(bytes, exif_tiff)
+                            : imgmeta::jpeg_set_exif(bytes, exif_tiff);
+    if (!ok) {
+      // Never fail the image over its metadata -- the pixels are the point.
+      session()->warn(fmt(
+          "SaveImageStage('{}'): could not write {} bytes of EXIF into '{}' "
+          "({}); the image is still written without it",
+          this->id(), exif_tiff.size(), out_path, _format));
+    }
+  }
+
   namespace fs = std::filesystem;
   std::error_code ec;
   const fs::path parent = fs::path(out_path).parent_path();
@@ -404,29 +454,30 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path)
         this->id(), out_path));
     return false;
   }
-  bool wrote = false;
-  for (;;) {
-    rc = _libs->avcodec().api.receive_packet(cctx.get(), pkt.get());
-    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { break; }
-    if (rc < 0) {
-      session()->error(fmt(
-          "SaveImageStage('{}'): receive_packet failed: {}",
-          this->id(), av_err_(rc)));
-      _libs->avcodec().api.packet_unref(pkt.get());
-      return false;
-    }
-    out.write(reinterpret_cast<const char*>(pkt->data), pkt->size);
-    wrote = true;
-    _libs->avcodec().api.packet_unref(pkt.get());
-  }
+  out.write(reinterpret_cast<const char*>(bytes.data()),
+            (std::streamsize)bytes.size());
   out.flush();
-  if (!wrote || !out.good()) {
+  if (!out.good()) {
     session()->error(fmt(
-        "SaveImageStage('{}'): no encoded data written to '{}'",
-        this->id(), out_path));
+        "SaveImageStage('{}'): write to '{}' failed", this->id(), out_path));
     return false;
   }
   return true;
+}
+
+void
+SaveImageStage::reset_run_state()
+{
+  // Per-launch reset. `_seen` is the filename index: image 0 writes
+  // `path` verbatim and every later one gets a `-%06u` suffix so a
+  // stream can't clobber itself WITHIN a run. Across runs that is
+  // wrong -- the stage survives a stop/relaunch, so without this the
+  // second launch starts at index 1 and writes `name-000001.jpeg`,
+  // the third `name-000002.jpeg`, and the file the user is actually
+  // watching is never rewritten.
+  _seen    = 0;
+  _written = 0;
+
 }
 
 Job
@@ -445,10 +496,68 @@ SaveImageStage::process(RuntimeContext& ctx)
 {
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }   // upstream EOS -> end.
+
+  // Metadata iport (optional): one beat per image, so read it in lockstep
+  // with the image. Only when wired -- an unwired graph behaves exactly as
+  // before. A producer that EOSes early just stops contributing EXIF; the
+  // images keep being written.
+  std::vector<std::uint8_t> exif_tiff;
+  if (ctx.num_iports() > 1 && ctx.iport_connected(1)) {
+    auto mb = co_await ctx.read(1);
+    const auto* fd = mb ? dynamic_cast<const FlexDataPayload*>(mb.get())
+                        : nullptr;
+    if (fd != nullptr && fd->data.is_object()) {
+      auto obj = fd->data.as_object();
+      if (obj.contains("exif_tiff_b64")) {
+        const std::string b64(obj.at("exif_tiff_b64").as_string(""));
+        if (auto raw = media_line::base64_decode(b64)) {
+          exif_tiff = std::move(*raw);
+        } else {
+          session()->warn(fmt(
+              "SaveImageStage('{}'): metadata exif_tiff_b64 is not valid "
+              "base64; ignoring", this->id()));
+        }
+      }
+    } else if (mb) {
+      session()->warn(fmt(
+          "SaveImageStage('{}'): metadata iport expects a FlexData object; "
+          "got {}, ignoring", this->id(), mb->describe()));
+    }
+  }
   if (_path.empty() || !_libs || !_libs->valid()) { co_return; }   // inert.
 
+  // Provenance: text-to-image stamps the generating model onto the latent's
+  // sideband and vae-decode carries it onto the image, so a GENERATED image
+  // arrives knowing what made it. Record that in EXIF Software. Only when a
+  // model name is actually present -- a plain load-image -> save-image copy
+  // must not claim vpipe authored someone else's photo, and its own Software
+  // tag (if any) is left exactly as it was.
+  {
+    const auto* itb = dynamic_cast<const TensorBeatPayload*>(in.get());
+    std::string model;
+    if (itb != nullptr && itb->sideband.is_object()) {
+      FlexData sb = itb->sideband;          // as_object() is a view
+      auto o = sb.as_object();
+      if (o.contains("model_name")) {
+        model = std::string(o.at("model_name").as_string(""));
+      }
+    }
+    if (!model.empty()) {
+      const std::string sw = std::string("Vpipe ") + vpipe_version_number()
+          + " " + vpipe_build_hash() + " with " + model;
+      exif_tiff = imgmeta::exif_set_software(exif_tiff, sw);
+    }
+  }
+
+  if (!exif_tiff.empty() && !imgmeta::format_supports_exif(_format)) {
+    session()->warn(fmt(
+        "SaveImageStage('{}'): {} cannot carry EXIF; the image is written "
+        "without it (use png or jpeg)", this->id(), _format));
+    exif_tiff.clear();
+  }
+
   const string out_path = resolve_path_(_seen++);
-  if (encode_(*in, out_path)) {
+  if (encode_(*in, out_path, exif_tiff)) {
     ++_written;
     session()->log_verbose(fmt(
         "SaveImageStage('{}'): wrote '{}'", this->id(), out_path));

@@ -54,6 +54,13 @@ FlowSchedulerSpec::to_flex() const
   o.insert_or_assign("shift", FlexData::make_real(shift));
   o.insert_or_assign("shift_type", FlexData::make_string(shift_type));
   o.insert_or_assign("rho", FlexData::make_real(rho));
+  if (type == "boogu_v1") {
+    o.insert_or_assign("base_shift", FlexData::make_real(base_shift));
+    o.insert_or_assign("max_shift", FlexData::make_real(max_shift));
+    o.insert_or_assign("base_seq", FlexData::make_int(base_seq));
+    o.insert_or_assign("max_seq", FlexData::make_int(max_seq));
+    o.insert_or_assign("seq_len", FlexData::make_int(seq_len));
+  }
   if (dynamic_shift) {
     o.insert_or_assign("dynamic_shift", FlexData::make_bool(true));
     o.insert_or_assign("base_shift", FlexData::make_real(base_shift));
@@ -103,7 +110,11 @@ FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
   if (o.contains("num_train")) {
     s.num_train = (int)o.at("num_train").as_int(s.num_train);
   }
+  if (o.contains("seq_len")) {
+    s.seq_len = (int)o.at("seq_len").as_int(s.seq_len);
+  }
   if (s.steps < 1) { s.steps = 1; }
+  if (s.type == "boogu_v1") { return s; }
   if (s.type != "simple" && s.type != "karras" && s.type != "exponential") {
     if (err != nullptr) {
       *err = "unknown scheduler type '" + s.type + "'; using 'simple'";
@@ -128,6 +139,34 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
 {
   const int S = steps < 1 ? 1 : steps;
   const bool expo = shift_type != "linear";
+
+  // ---- Boogu-Image v1 time shifting (ASCENDING sigma) ------------------
+  // Reproduces the checkpoint's FlowMatchEulerDiscreteScheduler.set_timesteps:
+  // base = linspace(0, 1, S+1)[:-1]; mu = lin(seq_len) over the
+  // (base_seq, base_shift) -> (max_seq, max_shift) line; each base t pushed
+  // through the logistic shift; then a terminal 1.0 appended (the reference
+  // concatenates torch.ones(1) so the last Euler step lands on clean).
+  // NOTE the inverted convention: 0 is noise and 1 is clean here, so the
+  // returned array INCREASES. Callers must integrate x += (t[i+1]-t[i]) * v.
+  if (type == "boogu_v1") {
+    const int L = seq_len > 0 ? seq_len : img_seq_len_override;
+    const double denom = (double)(max_seq - base_seq);
+    const double m = denom != 0.0 ? (max_shift - base_shift) / denom : 0.0;
+    const double b = base_shift - m * (double)base_seq;
+    const double mu = (double)L * m + b;
+    const double num = std::exp(mu);
+    std::vector<double> sig((std::size_t)S + 1);
+    for (int i = 0; i < S; ++i) {
+      const double t = (double)i / (double)S;      // linspace(0,1,S+1)[:-1]
+      double t1 = 1.0 - t;                          // the reference flips...
+      const double e = 1e-8;
+      if (t1 < e) { t1 = e; } else if (t1 > 1.0 - e) { t1 = 1.0 - e; }
+      const double y = num / (num + (1.0 / t1 - 1.0));   // sigma exponent 1
+      sig[(std::size_t)i] = 1.0 - y;                // ...and flips back
+    }
+    sig[(std::size_t)S] = 1.0;                      // terminal: fully clean
+    return sig;
+  }
 
   // ---- FlowMatchEuler dynamic shifting (Qwen-Image / SD3) --------------
   // Reproduces diffusers FlowMatchEulerDiscreteScheduler.set_timesteps with
@@ -203,11 +242,13 @@ std::string
 FlowSamplerSpec::canon_method(const std::string& m, bool* ok)
 {
   if (ok != nullptr) { *ok = true; }
-  if (m == "euler" || m == "heun" || m == "dpmpp_2m" || m == "dpmpp_sde") {
+  if (m == "euler" || m == "heun" || m == "dpmpp_2m" || m == "dpmpp_sde" ||
+      m == "dmd") {
     return m;
   }
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
   if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
+  if (m == "dmd_student" || m == "turbo") { return "dmd"; }
   if (ok != nullptr) { *ok = false; }
   return "euler";
 }
@@ -222,6 +263,10 @@ FlowSamplerSpec::to_flex() const
   o.insert_or_assign("eta", FlexData::make_real(eta));
   o.insert_or_assign("s_noise", FlexData::make_real(s_noise));
   o.insert_or_assign("seed", FlexData::make_int((std::int64_t)seed));
+  if (method == "dmd") {
+    o.insert_or_assign("conditioning_sigma",
+                       FlexData::make_real(conditioning_sigma));
+  }
   return fd;
 }
 
@@ -243,6 +288,10 @@ FlowSamplerSpec::from_flex(const FlexData& fd, std::string* err)
   if (o.contains("s_noise")) { s.s_noise = o.at("s_noise").as_real(s.s_noise); }
   if (o.contains("seed")) {
     s.seed = (std::uint64_t)o.at("seed").as_int((std::int64_t)s.seed);
+  }
+  if (o.contains("conditioning_sigma")) {
+    s.conditioning_sigma =
+        o.at("conditioning_sigma").as_real(s.conditioning_sigma);
   }
   return s;
 }

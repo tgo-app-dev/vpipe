@@ -13,6 +13,7 @@
 #include "generative-models/model-exec-registry.h"
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
@@ -508,9 +509,16 @@ LoadedLanguageModel::LoadedLanguageModel(
       // Metal vision tower (Qwen3-VL): host-f32 image embeddings for the
       // metal multimodal splice. No MLX in the forward.
       if (_impl->weights.config.vision.present && metal_qwen) {
+        // The tower's weights live in the LM's own checkpoint, so it
+        // goes through the manager's set for that directory -- the same
+        // one the exec above is holding. Without this the ViT opened a
+        // second private mmap of shards already open for the LM.
+        const auto vcfg = make_metal_vision_cfg_(_impl->weights.config);
         _impl->metal_vision = MetalQwenVisionEncoder::load(
-            model_dir, mc_be,
-            make_metal_vision_cfg_(_impl->weights.config));
+            vcfg.gguf_mmproj.empty()
+                ? open_weight_set(model_dir, session)
+                : nullptr,
+            mc_be, vcfg);
         if (_impl->metal_vision) {
           _impl->metal_vision->set_session(session);
           phase_log("metal_vision_encoder (load + bind, no MLX)");
@@ -526,8 +534,10 @@ LoadedLanguageModel::LoadedLanguageModel(
                              _impl->weights.config.audio.unified_st;
         if (from_st) {
           // Raw safetensors 12B: adaptor weights live in model.safetensors.
-          _impl->gemma4_unified =
-              Gemma4UnifiedEmbedder::load_safetensors(model_dir, mc_be);
+          // Same checkpoint as the LM -- read it through the LM's set
+          // rather than opening a second mmap of the same shards.
+          _impl->gemma4_unified = Gemma4UnifiedEmbedder::load_safetensors(
+              open_weight_set(model_dir, session), mc_be);
         } else {
           const std::string& mmp =
               !_impl->weights.config.vision.mmproj_path.empty()
@@ -543,8 +553,9 @@ LoadedLanguageModel::LoadedLanguageModel(
       // Metal vision tower (Gemma-4 e4b): native-f16 image embeddings for the
       // owns_kv metal multimodal splice. No MLX in the forward.
       if (_impl->weights.config.vision.present && metal_gemma && !g4_unified) {
+        // Same checkpoint as the LM -- share its set.
         _impl->metal_gemma4_vision = MetalGemma4VisionEncoder::load(
-            model_dir, mc_be,
+            open_weight_set(model_dir, session), mc_be,
             MetalGemma4VisionEncoder::config_from(_impl->weights.config));
         if (_impl->metal_gemma4_vision) {
           _impl->metal_gemma4_vision->set_session(session);
@@ -554,8 +565,9 @@ LoadedLanguageModel::LoadedLanguageModel(
       // Metal audio tower (Gemma-4 e4b): host-f32 audio embeddings for the
       // owns_kv metal multimodal splice. No MLX in the forward.
       if (_impl->weights.config.audio.present && metal_gemma && !g4_unified) {
+        // Same checkpoint as the LM -- share its set.
         _impl->metal_gemma4_audio = MetalGemma4AudioEncoder::load(
-            model_dir, mc_be,
+            open_weight_set(model_dir, session), mc_be,
             MetalGemma4AudioEncoder::config_from(_impl->weights.config));
         if (_impl->metal_gemma4_audio) {
           _impl->metal_gemma4_audio->set_session(session);
@@ -566,8 +578,9 @@ LoadedLanguageModel::LoadedLanguageModel(
       // metal multimodal splice. No MLX in the forward.
       if (_impl->weights.config.audio.present &&
           arch_be == "Qwen3ASRForConditionalGeneration") {
+        // Same checkpoint as the ASR decoder above -- share its set.
         _impl->metal_audio = MetalAudioEncoder::load(
-            model_dir, mc_be,
+            open_weight_set(model_dir, session), mc_be,
             make_metal_audio_cfg_(_impl->weights.config));
         if (_impl->metal_audio) {
           phase_log("metal_audio_encoder (load + bind, no MLX)");
@@ -759,6 +772,20 @@ bool
 LoadedLanguageModel::valid() const noexcept
 {
   return _impl && _impl->valid;
+}
+
+std::size_t
+LoadedLanguageModel::kv_bytes() const
+{
+  if (!_impl) { return 0; }
+  // An owns_kv exec (every metal one) keeps its own pools and the
+  // ctx_mgr here is bookkeeping-only, so asking both would either
+  // double-count or miss it depending on the backend. Ask the exec
+  // first and fall back.
+  if (_impl->exec && _impl->exec->owns_kv()) {
+    return _impl->exec->kv_bytes();
+  }
+  return _impl->ctx_mgr ? _impl->ctx_mgr->resident_bytes() : 0;
 }
 
 const ModelConfig&

@@ -2,6 +2,7 @@
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
@@ -55,12 +56,22 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
                               metal_compute::MetalCompute* mc,
                               const Config& cfg)
 {
-  if (mc == nullptr || !mc->valid()) { return nullptr; }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalGemma4AudioEncoder>
+MetalGemma4AudioEncoder::load(std::shared_ptr<WeightSet> ws_in,
+                              metal_compute::MetalCompute* mc,
+                              const Config& cfg)
+{
+  if (mc == nullptr || !mc->valid() || ws_in == nullptr) { return nullptr; }
+  WeightSet* wts = ws_in.get();
 
   auto m = std::unique_ptr<MetalGemma4AudioEncoder>(
       new MetalGemma4AudioEncoder());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
   m->_lib_gemm = mc->load_library("dense_gemm");
@@ -111,8 +122,14 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
   std::memset(m->_zero_bias.contents(), 0, (std::size_t)cfg.ffn * 2);
 
   bool ok = true;
+  // Cache namespace for this encoder's derived tensors.
+  const std::string dk = "gemma4-conformer/";
+  // Everything read through the set below is Copied, not Mapped:
+  // mapping wraps the whole shard, which this tower shares with the LM,
+  // and the LM loads by copy.
+  const auto cp = WeightSet::Residency::Copied;
   auto host_f32 = [&](const std::string& name) -> std::vector<float> {
-    const auto* info = wts->info(name);
+    const auto* info = wts->src().info(name);
     if (!info) {
       ok = false;
       if (std::getenv("VPIPE_GEMMA_AUDIO_DBG")) {
@@ -120,7 +137,9 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
       }
       return {};
     }
-    SharedBuffer raw = wts->load(name, mc);
+    // Uncached: the bytes land in a host vector and the buffer is
+    // dropped here, so there is nothing worth keeping in the set.
+    SharedBuffer raw = wts->read(name, mc, cp);
     const std::size_t n = numel_(info->shape);
     std::vector<float> out(n);
     if (info->dtype == "BF16") {
@@ -136,7 +155,7 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
   };
   auto f16_gpu = [&](const std::string& name, int* n_out,
                      int* k_out) -> SharedBuffer {
-    const auto* info = wts->info(name);
+    const auto* info = wts->src().info(name);
     if (!info || info->shape.size() != 2) {
       ok = false;
       if (std::getenv("VPIPE_GEMMA_AUDIO_DBG")) {
@@ -145,26 +164,33 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
       }
       return {};
     }
+    // Outside the builder: a cache HIT skips it, and the caller still
+    // needs the shape.
     if (n_out) { *n_out = (int)info->shape[0]; }
     if (k_out) { *k_out = (int)info->shape[1]; }
-    SharedBuffer raw = wts->load(name, mc);
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<_Float16*>(out.contents());
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)bf16_to_f32_(s[i]); }
-    } else if (info->dtype == "F16") {
-      std::memcpy(o, raw.contents(), n * 2);
-    } else { ok = false; }
-    return out;
+    return wts->derived(dk + name, [&]() -> SharedBuffer {
+      SharedBuffer raw = wts->read(name, mc, cp);
+      const std::size_t n = numel_(info->shape);
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      auto* o = static_cast<_Float16*>(out.contents());
+      if (info->dtype == "BF16") {
+        const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          o[i] = (_Float16)bf16_to_f32_(s[i]);
+        }
+      } else if (info->dtype == "F16") {
+        std::memcpy(o, raw.contents(), n * 2);
+      } else { ok = false; }
+      return out;
+    });
   };
   auto clip_of = [&](const std::string& base) -> Clip {
     Clip c;
     auto rd = [&](const char* f, float* v) -> bool {
-      const auto* info = wts->info(base + f);
+      const auto* info = wts->src().info(base + f);
       if (!info) { return false; }
-      SharedBuffer raw = wts->load(base + f, mc);
+      // One scalar, read and dropped -- nothing to cache.
+      SharedBuffer raw = wts->read(base + f, mc, cp);
       if (info->dtype == "BF16") {
         *v = bf16_to_f32_(*static_cast<const std::uint16_t*>(raw.contents()));
       } else if (info->dtype == "F32") {
@@ -195,22 +221,24 @@ MetalGemma4AudioEncoder::load(const std::string& model_dir,
   m->_out_proj = load_lin(r + "output_proj", false, false);
   m->_out_proj_bias = host_f32(r + "output_proj.bias");
 
-  m->_ev_w = wts->load("embed_audio.embedding_projection.weight", mc);
-  { const auto* info = wts->info("embed_audio.embedding_projection.scales");
-    SharedBuffer s2 = wts->load("embed_audio.embedding_projection.scales", mc);
-    SharedBuffer b2 = wts->load("embed_audio.embedding_projection.biases", mc);
-    auto cast = [&](SharedBuffer& raw, const char* nm) {
-      const auto* in2 = wts->info(nm);
-      const std::size_t n = in2 ? numel_(in2->shape) : 0;
-      SharedBuffer o = mc->make_shared_buffer(n * 2);
-      auto* op = static_cast<_Float16*>(o.contents());
-      const auto* sp = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { op[i] = (_Float16)bf16_to_f32_(sp[i]); }
-      return o;
+  m->_ev_w = wts->tensor("embed_audio.embedding_projection.weight", mc, cp);
+  { auto cast = [&](const char* nm) {
+      return wts->derived(dk + nm, [&]() -> SharedBuffer {
+        const auto* in2 = wts->src().info(nm);
+        const std::size_t n = in2 ? numel_(in2->shape) : 0;
+        SharedBuffer raw = wts->read(nm, mc, cp);
+        if (raw.empty()) { return {}; }
+        SharedBuffer o = mc->make_shared_buffer(n * 2);
+        auto* op = static_cast<_Float16*>(o.contents());
+        const auto* sp = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          op[i] = (_Float16)bf16_to_f32_(sp[i]);
+        }
+        return o;
+      });
     };
-    (void)info;
-    m->_ev_s = cast(s2, "embed_audio.embedding_projection.scales");
-    m->_ev_b = cast(b2, "embed_audio.embedding_projection.biases");
+    m->_ev_s = cast("embed_audio.embedding_projection.scales");
+    m->_ev_b = cast("embed_audio.embedding_projection.biases");
   }
 
   m->_layers.resize((std::size_t)cfg.n_layers);

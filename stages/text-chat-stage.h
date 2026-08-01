@@ -17,6 +17,7 @@
 #include "generative-models/sampler.h"
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,7 +30,7 @@ class LoadedLanguageModel;
 
 namespace vpipe {
 
-// Stage: 1 input, 1 output. The model is loaded once in
+// Stage: 2 inputs (the 2nd optional), 2 outputs. The model is loaded once in
 // initialize() and a single K/V chat context is acquired there too;
 // every subsequent beat on in-port 0 appends a user turn to that
 // context, runs chat-templated inference using the per-model
@@ -41,6 +42,10 @@ namespace vpipe {
 // model "remembers" prior turns until the user types `/clear`,
 // which resets the K/V cache and re-seeds the next turn's session-
 // start tokens. EOS on in-port 0 ends the stage.
+//
+// In-port 1 is an OPTIONAL token-sampler spec from a `sampler-select` stage,
+// latched on the first turn and reused thereafter. Unwired => greedy (argmax)
+// decoding, which is what this stage has always done by default.
 //
 // A user turn may embed image/audio attachments as media-line markers
 // (common/media-line.h; produced by text-input's `media` mode or typed
@@ -113,13 +118,6 @@ namespace vpipe {
 //                                                OFF; Qwen3-VL: ON;
 //                                                Llama-3 / ChatML
 //                                                ignore this flag).
-//   sampler_temperature (real, default 1.0)  -- flat decode-sampler
-//   sampler_top_k       (int,  default 0)       knobs; all at their
-//   sampler_top_p       (real, default 1.0)     defaults == greedy
-//   sampler_min_p       (real, default 0.0)     (argmax). Any non-
-//   sampler_repetition_penalty (real, default 1.0) default switches to
-//   sampler_presence_penalty   (real, default 0.0) sampled decoding.
-//   sampler_seed        (uint, default 0 = non-deterministic)
 //   mtp              (bool,   default true)    -- use the MTP speculative-
 //                                                decode head when the
 //                                                loaded model carries one
@@ -145,6 +143,12 @@ public:
   ~TextChatStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The LM this stage holds. Declared before any stage initializes so
+  // the diffusion stages -- which cannot see it from their own config --
+  // size the box against it. See Stage::declare_models.
+  std::vector<std::string> declare_models() const override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -235,7 +239,11 @@ private:
   // Loaded lazily in initialize(); cleared on shutdown.
   std::shared_ptr<genai::LoadedLanguageModel> _lm;
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Token-sampler knobs, latched once off the OPTIONAL sampler iport (a
+  // `sampler-select` source). Defaults are argmax, so an unwired port keeps
+  // the historical greedy decoding.
   genai::SamplerParams _sampler_params;
+  bool                 _sampler_latched = false;
   // Borrowed media-encoder towers (owned by the LM; cached in
   // initialize()). Null when the checkpoint has no such tower. Used by
   // the media-line turn path: a user line carrying attachment markers
@@ -271,6 +279,26 @@ private:
   // subsequent turns skip it because the cache already starts with
   // BOS. `/clear` flips this back to false.
   bool _seeded = false;
+
+  // ---- user interrupt (Ctrl-C / the web UI's Interrupt button) -----
+  //
+  // initialize() registers a handler with the session's UI delegate;
+  // the token unregisters it when the stage dies. The handler runs on
+  // the front end's thread, so all it does is raise _interrupt, which
+  // the decode loops poll. _generating says whether a turn is actually
+  // in flight -- the handler reports that back so a front end can tell
+  // a consumed interrupt from one with nothing to act on (the CLI
+  // escalates the latter to a process stop).
+  //
+  // An interrupted turn ends exactly as a model-emitted stop token
+  // would: the K/V context keeps everything decoded so far (the
+  // conversation stays usable), the assistant turn is closed, and the
+  // partial reply goes out on both out-ports as usual.
+  std::atomic<bool> _generating{false};
+  std::atomic<bool> _interrupt{false};
+  // Declared last so it unregisters BEFORE the state its handler
+  // touches is destroyed.
+  UiInterruptToken  _interrupt_tok;
 
   // Resolve/create the file-tool workspace root and register the file
   // tools into _tools. Called from initialize() when enable_file_tools is

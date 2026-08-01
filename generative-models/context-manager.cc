@@ -1165,6 +1165,32 @@ ContextManager::page_stride_bytes() const noexcept
   return _impl->m_page_bytes;
 }
 
+size_t
+ContextManager::resident_bytes() const
+{
+  lock_guard<mutex> lk(_impl->mu);
+  size_t total = 0;
+  // Paged pools: whatever they have grown to so far.
+  for (const auto& b : _impl->m_kpool) { total += b.byte_size(); }
+  for (const auto& b : _impl->m_vpool) { total += b.byte_size(); }
+  // Per-context state: the contiguous K/V layout (Gemma) and the GDN
+  // recurrent state, whose shadows are the pipelined run-ahead ring.
+  for (const auto& [id, c] : _impl->contexts) {
+    (void)id;
+    for (const auto& b : c.c_k) { total += b.byte_size(); }
+    for (const auto& b : c.c_v) { total += b.byte_size(); }
+    for (const auto& b : c.m_conv_state) { total += b.byte_size(); }
+    for (const auto& b : c.m_ssm_state)  { total += b.byte_size(); }
+    for (const auto& v : c.m_conv_shadow) {
+      for (const auto& b : v) { total += b.byte_size(); }
+    }
+    for (const auto& v : c.m_ssm_shadow) {
+      for (const auto& b : v) { total += b.byte_size(); }
+    }
+  }
+  return total;
+}
+
 uint32_t
 ContextManager::pages_in_use() const
 {

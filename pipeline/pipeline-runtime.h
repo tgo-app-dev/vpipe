@@ -45,6 +45,13 @@ public:
   // Build buffers / contexts / drivers and start them. Returns true
   // on success, false if the graph is malformed or has already been
   // launched. Any failure logs through the SessionContextIntf.
+  //
+  // NEVER throws. A malformed graph is a user error -- a mis-wired edge in
+  // a hand-written .vpipeline, or a pipeline edited in the composer -- and
+  // must fail THIS pipeline, not take the process down with it (which for
+  // the web-ui would drop every other pipeline and the operator's session).
+  // The build steps signal such faults by throwing, so launch() converts any
+  // escaping exception into a warn + false; see launch_().
   bool launch();
 
   // Request stop. Drivers exit on the next iteration boundary. Does
@@ -111,6 +118,11 @@ public:
   std::vector<EdgeBufferStat> edge_buffer_stats() const;
 
 private:
+  // The real launch. May throw (port type / tag mismatches and other
+  // malformed-graph faults are reported that way); launch() is the guard
+  // that turns those into a clean false.
+  bool launch_();
+
   // Spin until every driver's coroutine handle reports done(),
   // i.e. has reached final_suspend. Caller must already have
   // satisfied _completed >= _expected via the done condvar.

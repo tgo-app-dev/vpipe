@@ -281,8 +281,14 @@ TEST(port_tags, runtime_accepts_intersecting_tags) {
 }
 
 TEST(port_tags, runtime_rejects_disjoint_tags) {
-  // {gamma} ∩ {alpha,beta} = ∅ -> launch throws on the tag mismatch even
-  // though both ports carry the same beat type (SpecTestPayload).
+  // {gamma} ∩ {alpha,beta} = ∅ -> launch REFUSES the tag mismatch even though
+  // both ports carry the same beat type (SpecTestPayload).
+  //
+  // The refusal is a clean `false`, not an exception: a malformed graph is a
+  // user error and must fail only its own pipeline. launch() used to let the
+  // throw escape, which reached std::terminate and killed the host process
+  // (for the web-ui, the whole session) -- so this asserts BOTH that the
+  // mismatch is caught and that nothing propagates.
   Session sess;
   auto pl = make_unique<Pipeline>("p", &sess);
   auto* src = pl->insert_stage("ut-tag-source", "src", {},
@@ -294,12 +300,14 @@ TEST(port_tags, runtime_rejects_disjoint_tags) {
   ASSERT_TRUE(sink != nullptr);
   PipelineRuntime rt(pl.get(), &sess);
   bool threw = false;
+  bool launched = true;
   try {
-    rt.launch();
+    launched = rt.launch();
   } catch (const std::exception&) {
     threw = true;
   }
-  EXPECT_TRUE(threw);
+  EXPECT_FALSE(threw);
+  EXPECT_FALSE(launched);
 }
 
 // The video chain is the motivating example: rtsp-capture emits both its

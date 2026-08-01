@@ -68,6 +68,11 @@ public:
   ~MetalLlamaWeights();
 
   bool has(const std::string& name) const;
+  // True when this checkpoint came from a `.gguf`, i.e. every tensor is
+  // produced by the on-demand converter rather than copied from a mapped
+  // shard. Callers that want to parallelise loads need this: the
+  // converter is not re-entrant, while the safetensors memcpy is.
+  bool is_gguf() const noexcept;
   const TensorInfo* info(const std::string& name) const;
 
   // All tensor names in the checkpoint (unordered). Used by the model
@@ -93,6 +98,17 @@ public:
   // always correct, just not always zero-copy. Empty if the tensor is missing.
   metal_compute::SharedBuffer load_mapped(
       const std::string& name, metal_compute::MetalCompute* mc) const;
+
+  // Re-read a tensor into memory the CALLER already owns. The point is
+  // in-place refresh: a buffer whose pages the kernel reclaimed while
+  // parked keeps its allocation (and therefore its GPU address and every
+  // alias handed out from it), so restoring it has to write back into
+  // THAT pointer rather than allocate a replacement. Handles GGUF-backed
+  // tensors too -- the converter already writes through a caller-supplied
+  // destination. Returns false if the tensor is missing or `cap` is
+  // smaller than its bytes.
+  bool read_into(const std::string& name, void* dst,
+                 std::size_t cap) const;
 
 private:
   MetalLlamaWeights() = default;

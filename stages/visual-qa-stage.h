@@ -32,7 +32,9 @@ class Gemma4UnifiedEmbedder;
 
 namespace vpipe {
 
-// Sink stage: 1 input (TensorBeat RGB images), 0 outputs. Loads a
+// Sink stage: 2 inputs (TensorBeat RGB images, plus an OPTIONAL token-sampler
+// spec from a `sampler-select` stage on in-port 1 -- latched on the first
+// round, unwired => greedy/argmax decoding), 0 outputs. Loads a
 // vision-language model once in initialize(), then consumes
 // TensorBeats on in-port 0 num_images at a time. Within a round:
 //
@@ -237,6 +239,11 @@ public:
   ~VisualQaStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The LM this stage holds. Declared before any stage initializes so
+  // the diffusion stages -- which cannot see it from their own config --
+  // size the box against it. See Stage::declare_models.
+  std::vector<std::string> declare_models() const override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 
@@ -302,7 +309,11 @@ private:
   // Optional CoreML vision tower (host-f32 + metal-compute preproc).
   // Owned when coreml_vision_path is set; takes priority over _mvis.
   std::unique_ptr<genai::CoreMLVisionEncoder> _m_coreml;
+  // Token-sampler knobs, latched once off the OPTIONAL sampler iport (a
+  // `sampler-select` source). Defaults are argmax, so an unwired port keeps
+  // greedy decoding.
   genai::SamplerParams                        _sampler_params;
+  bool                                        _sampler_latched = false;
   // One encoded image: owned host-f32 embeddings + POST-merger token
   // grid (normalised here so m_run_round_ is encoder-agnostic -- the
   // metal tower reports pre-merger patches, the CoreML tower reports

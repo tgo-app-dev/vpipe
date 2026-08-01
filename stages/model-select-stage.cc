@@ -20,7 +20,8 @@ const ConfigKey kAttrs[] = {
           "beat that overrides each of their hf_dir config keys",
    .suggest_db = "models",
    .suggest_db_type =
-       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
+       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "boogu-image,boogu-image-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db the consumers pass to resolve_model_dir "
           "(default \"models\")"},
@@ -81,6 +82,18 @@ ModelSelectStage::resolved_beat() const
   o.insert_or_assign("hf_dir", FlexData::make_string(_hf_dir));
   o.insert_or_assign("models_db", FlexData::make_string(_models_db));
   return fd;
+}
+
+void
+ModelSelectStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately, and every stage downstream of the model beat
+  // would sit idle while the pipeline "completed" in milliseconds.
+  _emitted = 0;
 }
 
 Job

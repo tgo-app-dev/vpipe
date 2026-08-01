@@ -2,6 +2,8 @@
 #define STDIO_UI_DELEGATE_H
 
 #include "interfaces/ui-delegate-intf.h"
+#include <atomic>
+#include <chrono>
 #include <mutex>
 
 namespace vpipe {
@@ -44,6 +46,33 @@ public:
   // delegate must outlive every stream it hands out.
   std::unique_ptr<UiTextStream> open_text_stream() override;
 
+  // ---- Ctrl-C (SIGINT) policy --------------------------------------
+  //
+  // Two-stroke. The FIRST Ctrl-C interrupts whatever work stages
+  // registered interrupt handlers for (see
+  // UiDelegateIntf::register_interrupt_handler) -- typically a running
+  // text generation -- and the process keeps going. A SECOND Ctrl-C
+  // struck within kDoubleTapMs of the first means "quit", which is
+  // what a lone SIGINT has always meant: drain the pipelines and
+  // terminate. A first Ctrl-C that NO handler consumes also means
+  // quit, so a pipeline with nothing interruptible still stops on one
+  // keystroke rather than swallowing it.
+  //
+  // Split in two because a signal handler may not do the work:
+  //   note_sigint()  -- call from the process's SIGINT handler. Bumps
+  //                     an atomic and nothing else, so it is
+  //                     async-signal-safe.
+  //   poll_sigint()  -- call from the app's ordinary wait loop. Applies
+  //                     the policy (which may run handlers and write to
+  //                     the console) and returns true when the caller
+  //                     should stop the pipelines and exit.
+  // poll_sigint() keeps unsynchronized state and expects a single
+  // caller -- the app's control thread; note_sigint() may be called
+  // from anywhere.
+  static constexpr int kDoubleTapMs = 2000;
+  void note_sigint() noexcept;
+  bool poll_sigint();
+
 private:
   // Format `[tag] msg\n` and write to stderr (to_err) or stdout.
   void emit_(const char* tag, bool to_err, const VpipeFormat&);
@@ -58,6 +87,13 @@ private:
              const std::function<bool()>& should_cancel, bool mask);
 
   std::mutex _io_mu;
+
+  // SIGINT bookkeeping. `_sigint_count` is the only field the signal
+  // handler touches; the rest belong to poll_sigint()'s caller.
+  std::atomic<unsigned> _sigint_count{0};
+  unsigned              _sigint_seen = 0;      // last count acted on
+  bool                  _sigint_armed = false; // a 2nd tap now quits
+  std::chrono::steady_clock::time_point _sigint_at{};
 };
 
 }

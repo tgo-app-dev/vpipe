@@ -13,6 +13,8 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
 #include "stages/call-stage.h"
+#include "generative-models/generative-model-manager.h"
+#include "stages/model-memory.h"
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -38,9 +40,15 @@ namespace vpipe {
 // barrier never deadlocks the pool even when N exceeds worker count.
 class InitBarrier {
 public:
-  InitBarrier(unsigned expected, ThreadPool* pool) noexcept
+  // `on_open` runs once, on whichever thread completes the barrier,
+  // before the parked drivers are re-scheduled. It is the "the graph has
+  // settled" hook: every initialize() has returned, so every model this
+  // run will load has loaded.
+  InitBarrier(unsigned expected, ThreadPool* pool,
+              std::function<void()> on_open = {})
     : _expected(expected)
     , _pool(pool)
+    , _on_open(std::move(on_open))
   {}
 
   // Signal that one stage's initialize() has returned. When the last
@@ -48,14 +56,19 @@ public:
   void arrive()
   {
     std::vector<std::coroutine_handle<>> wake;
+    bool opened = false;
     {
       std::lock_guard<std::mutex> lk(_mu);
       ++_arrived;
       if (_arrived >= _expected && !_open) {
         _open = true;
         wake.swap(_waiters);
+        opened = true;
       }
     }
+    // Outside the lock: the hook takes other locks (the model manager's)
+    // and must not do so while holding this one.
+    if (opened && _on_open) { _on_open(); }
     for (auto h : wake) {
       _pool->schedule(h);
     }
@@ -92,6 +105,7 @@ private:
   unsigned                              _expected = 0;
   bool                                  _open     = false;
   ThreadPool*                           _pool     = nullptr;
+  std::function<void()>                 _on_open;
 };
 
 PipelineRuntime::PipelineRuntime(Pipeline*                 pipeline,
@@ -359,6 +373,29 @@ flatten_(Graph*                    g,
 
 bool
 PipelineRuntime::launch()
+{
+  // The whole build is guarded: every malformed-graph fault below reports by
+  // throwing (payload type / tag mismatch, a missing oport buffer, ...), and
+  // an uncaught one would call std::terminate and kill the host process --
+  // for the web-ui, the operator's entire session. Nothing has been scheduled
+  // when these fire (the checks all precede Phase 4), and the caller drops
+  // the runtime on false, so returning is a clean unwind.
+  try {
+    return launch_();
+  } catch (const std::exception& e) {
+    session()->warn(fmt(
+      "PipelineRuntime: cannot launch '{}': {}", _pipeline->id(), e.what()));
+    return false;
+  } catch (...) {
+    session()->warn(fmt(
+      "PipelineRuntime: cannot launch '{}': unknown error",
+      _pipeline->id()));
+    return false;
+  }
+}
+
+bool
+PipelineRuntime::launch_()
 {
   if (_launched) {
     session()->warn(fmt(
@@ -666,8 +703,43 @@ PipelineRuntime::launch()
       std::move(in_readers), std::move(out_bufs), &_stop));
   }
 
-  // Phase 4: spawn drivers and schedule.
+  // Phase 4: declare every model this run will load, then spawn drivers.
+  //
+  // This has to happen BEFORE any driver starts, because initialize() is
+  // where model-holding stages both size the box and load. Run
+  // concurrently with nothing declared, each of them sees whichever
+  // peers happen to have loaded already -- so the same graph decides
+  // differently run to run, and a stage cannot account for a model held
+  // by a peer it has no configuration link to. Declaring first replaces
+  // that race with a complete picture. See Stage::declare_models.
+  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  if (mgr != nullptr) {
+    mgr->clear_declarations();             // a previous launch's, if any
+    std::size_t declared = 0;
+    for (Stage* s : stages) {
+      for (const std::string& d : s->declare_models()) {
+        if (d.empty()) { continue; }
+        const std::size_t b = model_memory::dir_weights_bytes(d);
+        if (b == 0) { continue; }          // absent component: nothing to hold
+        mgr->declare_weights(d, b);
+        declared += b;
+      }
+    }
+    if (declared > 0) {
+      session()->log_debug(fmt(
+          "PipelineRuntime: {} declared {} MB of model weights before init",
+          _pipeline->id(), declared >> 20));
+    }
+  }
+
   _expected = static_cast<unsigned>(stages.size());
+  // NOTE: the declarations are NOT cleared when the barrier opens. A
+  // weight set only accounts for what it CACHED, and the LMs read
+  // uncached -- their weights live in the model's own members -- so
+  // dropping the estimates would make a multi-GB checkpoint read as
+  // near-zero the instant it finished loading. Models that genuinely
+  // hold less than their files weigh say so themselves, via
+  // GenerativeModelManager::revise_declaration.
   _init_barrier = std::make_unique<InitBarrier>(
       _expected, session()->thread_pool());
   // Mark every driven stage running before any driver is scheduled, so
@@ -813,6 +885,20 @@ stage_driver_(Stage*                    stage,
   // a graph can be built/inspected/edited before required fields are
   // supplied. Its initialize()/process() do not run; it still arrives
   // at the barrier and drains so peers don't hang.
+  // Clear whatever the PREVIOUS launch left on this stage. Runs before
+  // initialize() and regardless of config validity: a stage sitting out
+  // this run on a bad config must still not carry last run's state into
+  // the one after. See Stage::reset_run_state.
+  try {
+    stage->reset_run_state();
+  } catch (const exception& e) {
+    session->warn(fmt(
+      "stage '{}' reset_run_state: {}", stage->id(), e.what()));
+  } catch (...) {
+    session->warn(fmt(
+      "stage '{}' reset_run_state: non-std exception", stage->id()));
+  }
+
   if (!stage->config_error().empty()) {
     session->warn(fmt(
       "stage '{}' invalid config: {}; skipping initialize/process",

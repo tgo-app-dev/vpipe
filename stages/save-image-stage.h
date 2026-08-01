@@ -6,6 +6,7 @@
 #include "pipeline/typed-stage.h"
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,7 @@ public:
   ~SaveImageStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -59,8 +61,12 @@ public:
 
 private:
   // Encode the planar U8 RGB payload to `out_path`. Returns true on a
-  // fully-written file; logs + returns false otherwise.
-  bool encode_(const BeatPayloadIntf& beat, const std::string& out_path);
+  // fully-written file; logs + returns false otherwise. When `exif_tiff` is
+  // non-empty it is spliced into the encoded container (JPEG APP1 / PNG
+  // eXIf) before the bytes hit disk; a splice failure warns but still writes
+  // the image, since the pixels matter more than the metadata.
+  bool encode_(const BeatPayloadIntf& beat, const std::string& out_path,
+               std::span<const std::uint8_t> exif_tiff = {});
 
   // Materialise the output path for the `index`-th beat (printf token or
   // suffix rule -- see the class doc).

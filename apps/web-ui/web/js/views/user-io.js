@@ -11,8 +11,9 @@
 // the returned cleanup() (when the pane is closed).
 //
 // Embeddable pane: renders the console/input into `body`, and appends
-// its "Clear" control into the caller-provided `actions` element (the
-// host pane header). Returns a cleanup function that stops the poll.
+// its "Interrupt" / "Clear" controls into the caller-provided `actions`
+// element (the host pane header). Returns a cleanup function that stops
+// the poll.
 
 import { el, clear, toast, kbd } from '../dom.js';
 import { makeIcon } from '../icons.js';
@@ -192,6 +193,28 @@ export function mountUserIo(body, actions) {
   for (const n of [attachImgBtn, attachAudBtn]) { n.style.display = 'none'; }
   for (const n of [fileImg, fileAud]) { n.style.display = 'none'; }
 
+  // Interrupt: ask every stage that registered an interrupt handler to
+  // cut its current work short (a running model reply is the case this
+  // exists for). Deliberately ALWAYS enabled -- the browser has no
+  // reliable view of whether a stage is mid-generation, and the poll
+  // that could tell it would be stale by the time the user clicked. The
+  // backend answers with how many stages acted, so a click with nothing
+  // running is a harmless no-op the toast explains.
+  const interruptBtn = el('button',
+      { class: 'btn ghost', title: t('userio.interrupt_title') },
+      makeIcon('stop', 'sm'), t('userio.interrupt'));
+  interruptBtn.addEventListener('click', async () => {
+    try {
+      const r = await api.ioInterrupt();
+      const n = (r && typeof r.handled === 'number') ? r.handled : 0;
+      toast(n > 0 ? t('userio.interrupted', { n })
+                  : t('userio.interrupt_idle'),
+            n > 0 ? 'ok' : 'info');
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  });
+
   const clearBtn  = el('button', { class: 'btn ghost', onclick: () => {
     clear(consoleEl);
     lineEls.clear();
@@ -242,8 +265,10 @@ export function mountUserIo(body, actions) {
   const root = el('div', { class: 'userio' }, consoleEl, inputRow, hint);
   body.append(root);
   // The pane header (owned by the workspace) carries the Thinking +
-  // Markdown toggles + Clear button.
-  if (actions) { actions.append(thinkToggle, mdToggle, clearBtn); }
+  // Markdown toggles + the Interrupt and Clear buttons.
+  if (actions) {
+    actions.append(thinkToggle, mdToggle, interruptBtn, clearBtn);
+  }
 
   // Grow the textarea with its content up to a cap, then scroll.
   function autosize() {

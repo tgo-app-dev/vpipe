@@ -1,5 +1,6 @@
 #include "apps/web-ui/http-server.h"
 #include "apps/web-ui/embedded-assets.h"
+#include "ui/ui-view-registry.h"
 #ifdef VPIPE_WEBUI_TLS
 #include "apps/web-ui/tls-context.h"
 #endif
@@ -14,6 +15,7 @@
 #include <thread>
 #include <netinet/in.h>
 #include <sstream>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -81,6 +83,7 @@ reason_phrase_(int code)
     case 201: return "Created";
     case 204: return "No Content";
     case 206: return "Partial Content";
+    case 302: return "Found";
     case 400: return "Bad Request";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
@@ -142,6 +145,18 @@ public:
   write_all(const char* data, size_t len) override
   {
     return send_all_(_fd, data, len);
+  }
+  bool
+  poll_readable(int timeout_ms) override
+  {
+    struct pollfd p{};
+    p.fd     = _fd;
+    p.events = POLLIN;
+    for (;;) {
+      int r = ::poll(&p, 1, timeout_ms);
+      if (r < 0 && errno == EINTR) { continue; }
+      return r > 0;
+    }
   }
 private:
   int _fd;
@@ -358,6 +373,119 @@ WebSocket::send_frame_(uint8_t opcode, const uint8_t* data, size_t len)
     return false;
   }
   return true;
+}
+
+bool
+WebSocket::fill_(size_t n, int timeout_ms)
+{
+  using clock = std::chrono::steady_clock;
+  const auto deadline = clock::now() + std::chrono::milliseconds(timeout_ms);
+  char chunk[8192];
+  while (_rx.size() < n) {
+    if (!_alive) { return false; }
+    const auto now = clock::now();
+    int remain = 0;
+    if (now < deadline) {
+      remain = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - now).count());
+    }
+    if (!_conn->poll_readable(remain)) { return false; }   // timed out
+    ssize_t r = _conn->read(chunk, sizeof chunk);
+    if (r <= 0) { _alive = false; return false; }          // EOF / error
+    _rx.append(chunk, static_cast<size_t>(r));
+  }
+  return true;
+}
+
+WebSocket::Msg
+WebSocket::recv(string& payload, int timeout_ms)
+{
+  payload.clear();
+  if (!_alive) { return Msg::Closed; }
+
+  for (;;) {
+    // Peek the 2-byte prefix, then whatever extended length + mask key
+    // it implies, and only consume once the WHOLE frame is buffered --
+    // so a timeout part-way through leaves the bytes for the next call.
+    if (!fill_(2, timeout_ms)) { return _alive ? Msg::None : Msg::Closed; }
+    const auto* h = reinterpret_cast<const uint8_t*>(_rx.data());
+    const bool    fin    = (h[0] & 0x80) != 0;
+    const uint8_t opcode = h[0] & 0x0f;
+    const bool    masked = (h[1] & 0x80) != 0;
+    const uint8_t len7   = h[1] & 0x7f;
+
+    size_t hlen = 2;
+    size_t plen = len7;
+    if (len7 == 126) {
+      if (!fill_(4, timeout_ms)) { return _alive ? Msg::None : Msg::Closed; }
+      h = reinterpret_cast<const uint8_t*>(_rx.data());
+      plen = (static_cast<size_t>(h[2]) << 8) | h[3];
+      hlen = 4;
+    } else if (len7 == 127) {
+      if (!fill_(10, timeout_ms)) { return _alive ? Msg::None : Msg::Closed; }
+      h = reinterpret_cast<const uint8_t*>(_rx.data());
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i) {
+        v = (v << 8) | h[2 + i];
+      }
+      plen = static_cast<size_t>(v);
+      hlen = 10;
+    }
+    if (plen > kMaxIncoming) { _alive = false; return Msg::Closed; }
+    const size_t mlen = masked ? 4u : 0u;
+    if (!fill_(hlen + mlen + plen, timeout_ms)) {
+      return _alive ? Msg::None : Msg::Closed;
+    }
+
+    h = reinterpret_cast<const uint8_t*>(_rx.data());
+    string body(reinterpret_cast<const char*>(h + hlen + mlen), plen);
+    if (masked) {
+      const uint8_t* key = h + hlen;
+      for (size_t i = 0; i < body.size(); ++i) {
+        body[i] = static_cast<char>(
+            static_cast<uint8_t>(body[i]) ^ key[i & 3]);
+      }
+    }
+    _rx.erase(0, hlen + mlen + plen);
+
+    // Control frames never fragment and may interleave with a message.
+    if (opcode == 0x8) {                     // close
+      send_frame_(0x8, nullptr, 0);          // courtesy echo
+      _alive = false;
+      return Msg::Closed;
+    }
+    if (opcode == 0x9) {                     // ping -> pong
+      send_frame_(0xA, reinterpret_cast<const uint8_t*>(body.data()),
+                  body.size());
+      continue;
+    }
+    if (opcode == 0xA) { continue; }         // pong: nothing to do
+
+    if (opcode == 0x0) {                     // continuation
+      if (_frag_op == 0) { continue; }       // stray: no message open
+      if (_frag.size() + body.size() > kMaxIncoming) {
+        _alive = false;
+        return Msg::Closed;
+      }
+      _frag += body;
+      if (!fin) { continue; }
+      payload.swap(_frag);
+      const uint8_t op = _frag_op;
+      _frag.clear();
+      _frag_op = 0;
+      return op == 0x1 ? Msg::Text : Msg::Binary;
+    }
+
+    if (opcode != 0x1 && opcode != 0x2) { continue; }   // reserved: ignore
+    if (!fin) {                              // first frame of a message
+      _frag    = std::move(body);
+      _frag_op = opcode;
+      continue;
+    }
+    payload.swap(body);
+    return opcode == 0x1 ? Msg::Text : Msg::Binary;
+  }
 }
 
 bool
@@ -657,7 +785,13 @@ HttpServer::serve_one_(Conn& conn, bool loopback)
 
   // Build the response.
   HttpResponse resp;
-  if (needs_auth) {
+  // The QR shortcut goes FIRST: it is matched on the whole path, so it
+  // shadows no asset and no route, and it is deliberately outside the
+  // auth gate -- possessing the path IS the credential (and it is not
+  // under /api/, which is all the gate covers).
+  if (qr_redirect_(req, resp)) {
+    // handled
+  } else if (needs_auth) {
     resp = HttpResponse::error(401, "access key required");
   } else if (req.method == "OPTIONS") {
     resp.status = 204;
@@ -698,6 +832,26 @@ HttpServer::serve_one_(Conn& conn, bool loopback)
   if (req.method != "HEAD" && !resp.body.empty()) {
     conn.write_all(resp.body.data(), resp.body.size());
   }
+}
+
+// GET /<qr key> -> 302 to "/?key=<access key>". The key rides in the
+// redirect target only long enough for the page to adopt it: api.js
+// stores it and strips it from the URL on load, so it does not survive
+// into the address bar, the history or a bookmark.
+bool
+HttpServer::qr_redirect_(const HttpRequest& req, HttpResponse& out) const
+{
+  if (_qr_key.empty() || req.path.size() != _qr_key.size() + 1
+      || req.path[0] != '/'
+      || req.path.compare(1, string::npos, _qr_key) != 0) {
+    return false;
+  }
+  out.status = 302;
+  out.content_type.clear();
+  out.body.clear();
+  out.extra_headers.emplace_back("Location", "/?key=" + _auth_key);
+  out.extra_headers.emplace_back("Cache-Control", "no-store");
+  return true;
 }
 
 bool
@@ -829,12 +983,30 @@ HttpServer::serve_static_(const HttpRequest& req) const
     return true;
   };
 
+  // Front-end assets a STAGE ships with itself, embedded in libvpipe and
+  // published through the UiViewRegistry (everything under /ui/). The
+  // app serves these bytes without knowing what they are -- that is what
+  // lets a stage own its panel.
+  auto read_view_asset = [&](const string& path, HttpResponse& r) -> bool {
+    const UiViewAsset* a = UiViewRegistry::get().find_asset(path);
+    if (a == nullptr) { return false; }
+    r.status       = 200;
+    r.body.assign(reinterpret_cast<const char*>(a->data), a->size);
+    r.content_type = mime_for_(path);
+    return true;
+  };
+
   HttpResponse r;
   if (!_doc_root.empty() && read_file(_doc_root + rel, r)) { return r; }
   if (read_embedded(rel, r)) { return r; }
+  if (read_view_asset(rel, r)) { return r; }
   // SPA fallback: any unknown non-asset path returns index.html so the
-  // client router can render it (only for paths that aren't /api/*).
-  if (rel.rfind("/api/", 0) != 0) {
+  // client router can render it. Excluded: /api/* (a route, not a page)
+  // and /ui/* (a stage's view assets) -- an unresolved module there MUST
+  // 404 rather than be answered with HTML, which an ES-module import
+  // would try to parse as JavaScript and report as a syntax error a long
+  // way from the actual cause.
+  if (rel.rfind("/api/", 0) != 0 && rel.rfind("/ui/", 0) != 0) {
     if (!_doc_root.empty() && read_file(_doc_root + "/index.html", r)) {
       return r;
     }

@@ -1,6 +1,7 @@
 #include "generative-models/mage/metal-mage-vae.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <cmath>
 #include <cstdint>
@@ -18,6 +19,12 @@ using metal_compute::ComputeEncoder;
 using metal_compute::CommandStream;
 
 namespace {
+
+// Namespace for this class's derived-tensor cache keys. A WeightSet is
+// shared by everything reading one checkpoint, so a key has to say which
+// class's transform produced the bytes, not just which tensor they came
+// from.
+constexpr const char* kKey = "mage-vae/";
 
 constexpr const char* kEncPre = "student.dconv_encoder.";
 
@@ -75,50 +82,55 @@ MetalMageVae::~MetalMageVae() = default;
 // Linear / 1x1 conv -> dense-GEMM weight [Cout, Cin] (trailing 1x1 dims of a
 // Conv2d flatten away).
 MetalMageVae::Conv
-MetalMageVae::load_linear_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalMageVae::load_linear_(WeightSet& wts, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;
-  c.cout = (int)sh[0];
+  const auto* info = wts.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.empty()) { return c; }
+  std::size_t n = 1;
+  for (auto d : info->shape) { n *= (std::size_t)d; }
+  c.cout = (int)info->shape[0];
   c.cin = (int)(n / (std::size_t)c.cout);
   c.k = c.cin;
-  c.w = f16_buf_(_mc, w.data(), n);
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  c.w = load_vec_(wts, nm + ".weight");
+  if (c.w.empty()) { return Conv{}; }
+  c.b = load_vec_(wts, nm + ".bias");
   return c;
 }
 
 // 3x3 conv -> [Cout, 9*Cin] flattened (ky,kx,cin), pairing with
 // im2col_hwc_3x3 (same convention as the Krea-2 / FLUX.2 VAEs).
 MetalMageVae::Conv
-MetalMageVae::load_conv3x3_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalMageVae::load_conv3x3_(WeightSet& wts, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;   // [Cout, Cin, 3, 3]
-  const int Cout = (int)sh[0], Cin = (int)sh[1];
+  const auto* info = wts.src().info(nm + ".weight");   // [Cout, Cin, 3, 3]
+  if (info == nullptr || info->shape.size() < 2) { return c; }
+  const int Cout = (int)info->shape[0], Cin = (int)info->shape[1];
   c.cin = Cin; c.cout = Cout; c.k = 9 * Cin;
-  std::vector<float> flat((std::size_t)Cout * 9 * Cin);
-  for (int o = 0; o < Cout; ++o) {
-    for (int ky = 0; ky < 3; ++ky) {
-      for (int kx = 0; kx < 3; ++kx) {
-        for (int i = 0; i < Cin; ++i) {
-          flat[((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i] =
-              w[((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx];
+  // The flattened [Cout, 9*Cin] weight is DERIVED -- built from the
+  // checkpoint's bytes, not copied out of them -- so it is cached under
+  // a key naming the transform rather than the tensor.
+  c.w = wts.derived(std::string(kKey) + "c3x3|" + nm,
+                    [&]() -> SharedBuffer {
+    std::size_t n = 0;
+    std::vector<float> w = read_f32_(wts.src(), _mc, nm + ".weight", n);
+    if (w.empty()) { return {}; }
+    std::vector<float> flat((std::size_t)Cout * 9 * Cin);
+    for (int o = 0; o < Cout; ++o) {
+      for (int ky = 0; ky < 3; ++ky) {
+        for (int kx = 0; kx < 3; ++kx) {
+          for (int i = 0; i < Cin; ++i) {
+            flat[((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i] =
+                w[((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx];
+          }
         }
       }
     }
-  }
-  c.w = f16_buf_(_mc, flat.data(), flat.size());
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+    return f16_buf_(_mc, flat.data(), flat.size());
+  }, _part);
+  if (c.w.empty()) { return Conv{}; }
+  c.b = load_vec_(wts, nm + ".bias");
   return c;
 }
 
@@ -126,62 +138,65 @@ MetalMageVae::load_conv3x3_(const MetalLlamaWeights& wts, const std::string& nm)
 // [Cout, Cin, p, p] already flattens to the (cin, ky, kx) column order the
 // host patchify emits, so this is a straight copy.
 MetalMageVae::Conv
-MetalMageVae::load_patch_conv_(const MetalLlamaWeights& wts,
-                               const std::string& nm)
+MetalMageVae::load_patch_conv_(WeightSet& wts, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;
-  c.cout = (int)sh[0];
-  c.cin = (int)sh[1];
+  const auto* info = wts.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.size() < 2) { return c; }
+  std::size_t n = 1;
+  for (auto d : info->shape) { n *= (std::size_t)d; }
+  c.cout = (int)info->shape[0];
+  c.cin = (int)info->shape[1];
   c.k = (int)(n / (std::size_t)c.cout);
-  c.w = f16_buf_(_mc, w.data(), n);
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  c.w = load_vec_(wts, nm + ".weight");
+  if (c.w.empty()) { return Conv{}; }
+  c.b = load_vec_(wts, nm + ".bias");
   return c;
 }
 
 // Depthwise 3x3 ([C, 1, 3, 3]) -> [C, 9] (the natural flatten).
 MetalMageVae::DwConv
-MetalMageVae::load_dwconv_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalMageVae::load_dwconv_(WeightSet& wts, const std::string& nm)
 {
   DwConv d;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return d; }
-  d.c = (int)wts.info(nm + ".weight")->shape[0];
-  d.w = f16_buf_(_mc, w.data(), n);
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { d.b = f16_buf_(_mc, b.data(), nb); }
+  const auto* info = wts.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.empty()) { return d; }
+  d.c = (int)info->shape[0];
+  d.w = load_vec_(wts, nm + ".weight");
+  if (d.w.empty()) { return DwConv{}; }
+  d.b = load_vec_(wts, nm + ".bias");
   return d;
 }
 
+// Every tensor the VAE keeps is stored as f16 regardless of its on-disk
+// dtype, so "read as f32 and narrow" IS the transform -- and the result
+// is cached like any other derived tensor. The straight-copy weights
+// (linear, patch conv, depthwise) need nothing beyond it and share this
+// entry.
 SharedBuffer
-MetalMageVae::load_vec_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalMageVae::load_vec_(WeightSet& wts, const std::string& nm)
 {
-  std::size_t n = 0;
-  std::vector<float> v = read_f32_(wts, _mc, nm, n);
-  if (v.empty()) { return {}; }
-  return f16_buf_(_mc, v.data(), n);
+  return wts.derived(std::string(kKey) + "f16|" + nm, [&]() -> SharedBuffer {
+    std::size_t n = 0;
+    std::vector<float> v = read_f32_(wts.src(), _mc, nm, n);
+    if (v.empty()) { return {}; }
+    return f16_buf_(_mc, v.data(), n);
+  }, _part);
 }
 
 // TimestepEmbedder(0): timestep_embedding(0, 256) is [cos(0)]*128 ++
 // [sin(0)]*128 = [1]*128 ++ [0]*128 regardless of the frequency table, so
 // the whole embedder collapses to mlp.2(SiLU(mlp.0(that))) -- host math.
 std::vector<float>
-MetalMageVae::t_embed_zero_(const MetalLlamaWeights& wts,
+MetalMageVae::t_embed_zero_(WeightSet& wts,
                             const std::string& t_pre) const
 {
   std::size_t n1 = 0, nb1 = 0, n2 = 0, nb2 = 0;
   auto* self = const_cast<MetalMageVae*>(this);
-  std::vector<float> w1 = read_f32_(wts, self->_mc, t_pre + "mlp.0.weight", n1);
-  std::vector<float> b1 = read_f32_(wts, self->_mc, t_pre + "mlp.0.bias", nb1);
-  std::vector<float> w2 = read_f32_(wts, self->_mc, t_pre + "mlp.2.weight", n2);
-  std::vector<float> b2 = read_f32_(wts, self->_mc, t_pre + "mlp.2.bias", nb2);
+  std::vector<float> w1 = read_f32_(wts.src(), self->_mc, t_pre + "mlp.0.weight", n1);
+  std::vector<float> b1 = read_f32_(wts.src(), self->_mc, t_pre + "mlp.0.bias", nb1);
+  std::vector<float> w2 = read_f32_(wts.src(), self->_mc, t_pre + "mlp.2.weight", n2);
+  std::vector<float> b2 = read_f32_(wts.src(), self->_mc, t_pre + "mlp.2.bias", nb2);
   if (w1.empty() || w2.empty()) { return {}; }
   const int H = (int)nb1;             // hidden
   const int F = (int)(n1 / (std::size_t)H);   // frequency_embedding_size (256)
@@ -205,7 +220,7 @@ MetalMageVae::t_embed_zero_(const MetalLlamaWeights& wts,
 // adaLN_modulation = Sequential(SiLU, Linear(H, 6H)) applied to the constant
 // t_embedder(0) -- the whole thing folds to a fixed [6H] vector.
 std::vector<float>
-MetalMageVae::fold_adaln_(const MetalLlamaWeights& wts,
+MetalMageVae::fold_adaln_(WeightSet& wts,
                           const std::string& t_pre,
                           const std::string& adaln_pre) const
 {
@@ -213,8 +228,8 @@ MetalMageVae::fold_adaln_(const MetalLlamaWeights& wts,
   if (c.empty()) { return {}; }
   auto* self = const_cast<MetalMageVae*>(this);
   std::size_t nw = 0, nb = 0;
-  std::vector<float> w = read_f32_(wts, self->_mc, adaln_pre + ".weight", nw);
-  std::vector<float> b = read_f32_(wts, self->_mc, adaln_pre + ".bias", nb);
+  std::vector<float> w = read_f32_(wts.src(), self->_mc, adaln_pre + ".weight", nw);
+  std::vector<float> b = read_f32_(wts.src(), self->_mc, adaln_pre + ".bias", nb);
   if (w.empty() || b.empty()) { return {}; }
   const int H = (int)c.size();
   const int O = (int)nb;              // 6*H
@@ -230,7 +245,7 @@ MetalMageVae::fold_adaln_(const MetalLlamaWeights& wts,
 }
 
 bool
-MetalMageVae::load_dico_(const MetalLlamaWeights& wts, const std::string& pre,
+MetalMageVae::load_dico_(WeightSet& wts, const std::string& pre,
                          DiCoBlock& b, int c, bool with_mod,
                          bool with_norm_affine)
 {
@@ -255,7 +270,7 @@ MetalMageVae::load_dico_(const MetalLlamaWeights& wts, const std::string& pre,
 }
 
 bool
-MetalMageVae::load_encoder_(const MetalLlamaWeights& wts)
+MetalMageVae::load_encoder_(WeightSet& wts)
 {
   const std::string p = kEncPre;
   _enc_patch = load_patch_conv_(wts, p + "patch_cond_embed");
@@ -277,9 +292,9 @@ MetalMageVae::load_encoder_(const MetalLlamaWeights& wts)
   // disappears entirely.
   {
     std::size_t nw = 0, nb = 0, nzb = 0;
-    std::vector<float> w = read_f32_(wts, _mc, p + "fuse_proj.weight", nw);
-    std::vector<float> b = read_f32_(wts, _mc, p + "fuse_proj.bias", nb);
-    std::vector<float> zb = read_f32_(wts, _mc, p + "z_proj.bias", nzb);
+    std::vector<float> w = read_f32_(wts.src(), _mc, p + "fuse_proj.weight", nw);
+    std::vector<float> b = read_f32_(wts.src(), _mc, p + "fuse_proj.bias", nb);
+    std::vector<float> zb = read_f32_(wts.src(), _mc, p + "z_proj.bias", nzb);
     if (w.empty() || b.empty() || zb.empty()) { return false; }
     const int H = _cfg.hidden;
     const int O = (int)nb;                 // == H
@@ -320,7 +335,7 @@ MetalMageVae::load_encoder_(const MetalLlamaWeights& wts)
 }
 
 bool
-MetalMageVae::load_resblock_(const MetalLlamaWeights& wts,
+MetalMageVae::load_resblock_(WeightSet& wts,
                              const std::string& pre, ResBlock& rb)
 {
   rb.n1w = load_vec_(wts, pre + "norm1.weight");
@@ -334,7 +349,7 @@ MetalMageVae::load_resblock_(const MetalLlamaWeights& wts,
 }
 
 bool
-MetalMageVae::load_attn_(const MetalLlamaWeights& wts, const std::string& pre,
+MetalMageVae::load_attn_(WeightSet& wts, const std::string& pre,
                          AttnBlock& a)
 {
   a.nw = load_vec_(wts, pre + "norm.weight");
@@ -348,7 +363,7 @@ MetalMageVae::load_attn_(const MetalLlamaWeights& wts, const std::string& pre,
 }
 
 bool
-MetalMageVae::load_decoder_(const MetalLlamaWeights& wts)
+MetalMageVae::load_decoder_(WeightSet& wts)
 {
   const std::string p = "pipeline.";
   const std::string dp = p + "y_embedder.decoder.";
@@ -369,9 +384,9 @@ MetalMageVae::load_decoder_(const MetalLlamaWeights& wts)
   // keep only the `cond` columns and the concat disappears.
   {
     std::size_t nw = 0, nb = 0;
-    std::vector<float> w = read_f32_(wts, _mc, p + "s_embedder.proj2.weight",
+    std::vector<float> w = read_f32_(wts.src(), _mc, p + "s_embedder.proj2.weight",
                                      nw);
-    std::vector<float> b = read_f32_(wts, _mc, p + "s_embedder.proj2.bias", nb);
+    std::vector<float> b = read_f32_(wts.src(), _mc, p + "s_embedder.proj2.bias", nb);
     if (w.empty() || b.empty()) { return false; }
     const int O = (int)nb;                      // hidden
     const int K = (int)(nw / (std::size_t)O);   // latent + hidden
@@ -408,8 +423,8 @@ MetalMageVae::load_decoder_(const MetalLlamaWeights& wts)
   // runtime gather is needed.
   {
     std::size_t nw = 0, nb = 0;
-    std::vector<float> w = read_f32_(wts, _mc, p + "y_embedder_x.weight", nw);
-    std::vector<float> b = read_f32_(wts, _mc, p + "y_embedder_x.bias", nb);
+    std::vector<float> w = read_f32_(wts.src(), _mc, p + "y_embedder_x.weight", nw);
+    std::vector<float> b = read_f32_(wts.src(), _mc, p + "y_embedder_x.bias", nb);
     if (w.empty() || b.empty()) { return false; }
     const int O = (int)nb;                      // x_dim * P^2
     const int K = (int)(nw / (std::size_t)O);   // hidden
@@ -442,8 +457,8 @@ MetalMageVae::load_decoder_(const MetalLlamaWeights& wts)
   {
     std::size_t nw = 0, nb = 0;
     const std::string xe = p + "x_embedder.embedder.0";
-    std::vector<float> w = read_f32_(wts, _mc, xe + ".weight", nw);
-    std::vector<float> b = read_f32_(wts, _mc, xe + ".bias", nb);
+    std::vector<float> w = read_f32_(wts.src(), _mc, xe + ".weight", nw);
+    std::vector<float> b = read_f32_(wts.src(), _mc, xe + ".bias", nb);
     if (w.empty() || b.empty()) { return false; }
     const int O = (int)nb;                      // x_dim
     const int K = (int)(nw / (std::size_t)O);   // 3 + x_dim + max_freqs^2
@@ -519,12 +534,18 @@ std::unique_ptr<MetalMageVae>
 MetalMageVae::load(const std::string& model_dir, MetalCompute* mc,
                    const Config& cfg, bool with_encoder)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, with_encoder);
+}
+
+std::unique_ptr<MetalMageVae>
+MetalMageVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
+                   const Config& cfg, bool with_encoder)
+{
+  if (mc == nullptr || !ws_in) { return nullptr; }
+  WeightSet& wts = *ws_in;
 
   auto m = std::unique_ptr<MetalMageVae>(new MetalMageVae());
+  m->_ws = std::move(ws_in);
   m->_mc = mc;
   m->_cfg = cfg;
 
@@ -551,9 +572,12 @@ MetalMageVae::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_sdpa       = m->_lib_sdpa.function("sdpa_full_f16");
   m->_fn_tile_gather  = m->_lib_elt.function("tile_gather_clamp_hwc_f16");
   m->_fn_tile_scatter = m->_lib_elt.function("tile_scatter_hwc_f16");
-  m->_fn_ln_mod_rows  = m->_lib_elt.function("layer_norm_mod_rows_f16");
-  m->_fn_gated_rows   = m->_lib_elt.function("gated_residual_rows_f16");
   m->_fn_add_rows_mod = m->_lib_elt.function("add_rows_mod_f16");
+  m->_fn_widen_rows   = m->_lib_elt.function("widen_rows_f16_to_f32");
+  m->_fn_ln_mod_rows32 =
+      m->_lib_elt.function("layer_norm_mod_rows_x32_f16");
+  m->_fn_gated_rows32 = m->_lib_elt.function("gated_residual_rows_x32_f16");
+  m->_fn_rms_rows32   = m->_lib_elt.function("rms_norm_rows_x32_f16");
   if (!m->_fn_gemm_bias.valid() || !m->_fn_gelu.valid()
       || !m->_fn_ln_affine.valid() || !m->_fn_ln_mod.valid()
       || !m->_fn_gated.valid() || !m->_fn_dw3x3.valid()
@@ -562,8 +586,9 @@ MetalMageVae::load(const std::string& model_dir, MetalCompute* mc,
       || !m->_fn_groupnorm.valid() || !m->_fn_swish.valid()
       || !m->_fn_im2col.valid() || !m->_fn_rms.valid() || !m->_fn_sdpa.valid()
       || !m->_fn_copy.valid() || !m->_fn_tile_gather.valid()
-      || !m->_fn_tile_scatter.valid() || !m->_fn_ln_mod_rows.valid()
-      || !m->_fn_gated_rows.valid() || !m->_fn_add_rows_mod.valid()) {
+      || !m->_fn_tile_scatter.valid() || !m->_fn_add_rows_mod.valid()
+      || !m->_fn_widen_rows.valid() || !m->_fn_ln_mod_rows32.valid()
+      || !m->_fn_gated_rows32.valid() || !m->_fn_rms_rows32.valid()) {
     return nullptr;
   }
   // M5 matrix-core dense GEMM for the 1x1 / patch GEMMs (M = H*W pixels, so
@@ -583,11 +608,37 @@ MetalMageVae::load(const std::string& model_dir, MetalCompute* mc,
   // The decoder half is ~105M params and every caller decodes, so it always
   // loads; the encoder (~67M) is optional.
   if (!m->load_decoder_(wts)) { return nullptr; }
-  if (with_encoder) {
-    if (!m->load_encoder_(wts)) { return nullptr; }
-    m->_has_encoder = true;
-  }
+  if (with_encoder && !m->ensure_encoder()) { return nullptr; }
   return m;
+}
+
+bool
+MetalMageVae::ensure_encoder()
+{
+  if (_has_encoder) { return true; }
+  if (!_ws) { return false; }
+  // Through the WeightSet so the encoder half loads ONCE per checkpoint
+  // however many VAEs over it end up needing it -- and, when nobody
+  // does, never.
+  const bool ok = _ws->ensure_part("encoder", [this]() {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    return r;
+  });
+  if (!ok) { return false; }
+  // A second VAE over a checkpoint whose encoder another one already
+  // loaded still has to populate ITS OWN struct members; ensure_part
+  // reports the cached success without re-running the loader, so bind
+  // the (now cache-hit) tensors here.
+  if (_enc_patch.w.empty()) {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    if (!r) { return false; }
+  }
+  _has_encoder = true;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -985,13 +1036,15 @@ MetalMageVae::decode(const SharedBuffer& z, int h, int w, std::string* err)
   SharedBuffer yx = _mc->make_shared_buffer(yxw * 2);
   SharedBuffer ce = _mc->make_shared_buffer(yxw * 2);
   SharedBuffer xm = _mc->make_shared_buffer(M * X * 2);
+  SharedBuffer xr = _mc->make_shared_buffer(M * X * 4);   // f32 residual
   SharedBuffer hm = _mc->make_shared_buffer(M * X * 2);
   SharedBuffer h2 = _mc->make_shared_buffer(M * X * 2);
   SharedBuffer mod = _mc->make_shared_buffer(M * 3 * X * 2);
   SharedBuffer outm = _mc->make_shared_buffer(M * _dec_final_lin.cout * 2);
   if (cond.empty() || s.empty() || t1.empty() || t2.empty() || col.empty()
       || qkv.empty() || pool.empty() || yx.empty() || ce.empty() || xm.empty()
-      || hm.empty() || h2.empty() || mod.empty() || outm.empty()) {
+      || xr.empty() || hm.empty() || h2.empty() || mod.empty()
+      || outm.empty()) {
     return fail("MageVAE: decode scratch alloc failed (lower the resolution)");
   }
 
@@ -1027,6 +1080,8 @@ MetalMageVae::decode(const SharedBuffer& z, int h, int w, std::string* err)
   enc.set_constant(3, (int)yxw);                   // hoisted (shared by all
   enc.dispatch({(unsigned)yxw, 1, 1}, {256, 1, 1});   // three res blocks)
 
+  // The head's pre-residual steps stay f16 (values are small here): the
+  // x_embed projection, the DCT/bias constant, then input_proj.
   gemm_(enc, yx, 0, _dec_x_embed, xm, 0, (int)M);
   enc.set_function(_fn_add_rows_mod);               // + the DCT/bias constant
   enc.set_buffer(0, xm); enc.set_buffer(1, _dec_x_const);
@@ -1034,15 +1089,21 @@ MetalMageVae::decode(const SharedBuffer& z, int h, int w, std::string* err)
   enc.set_constant(4, (unsigned)(M * X));
   enc.dispatch({(unsigned)X, (unsigned)M, 1}, {256, 1, 1});
   gemm_(enc, xm, 0, _dec_input_proj, hm, 0, (int)M);
-  enc.set_function(_fn_copy);
-  enc.set_buffer(0, hm); enc.set_buffer(1, xm);
-  enc.set_constant(2, 0); enc.set_constant(3, (int)(M * X));
-  enc.dispatch({(unsigned)(M * X), 1, 1}, {256, 1, 1});
+  // From here the stream is a chain of gated residual adds with no norm until
+  // the end, and it runs far past the f16 range (~1.5e5 on blown-out
+  // highlights vs f16's 65504 ceiling); an overflow becomes inf and then NaN
+  // at the final RMS norm, blackening the whole 16x16 patch. Widen into `xr`
+  // (f32) and keep the residual there -- no GEMM reads it, so only the three
+  // row kernels below need an f32 twin.
+  enc.set_function(_fn_widen_rows);
+  enc.set_buffer(0, hm); enc.set_buffer(1, xr);
+  enc.set_constant(2, X); enc.set_constant(3, (unsigned)M);
+  enc.dispatch({(unsigned)M, 1, 1}, {256, 1, 1});
 
   for (auto& r : _dec_mlp) {
     gemm_(enc, ce, 0, r.adaln, mod, 0, (int)M);
-    enc.set_function(_fn_ln_mod_rows);
-    enc.set_buffer(0, xm); enc.set_buffer(1, r.lnw); enc.set_buffer(2, r.lnb);
+    enc.set_function(_fn_ln_mod_rows32);
+    enc.set_buffer(0, xr); enc.set_buffer(1, r.lnw); enc.set_buffer(2, r.lnb);
     enc.set_buffer(3, mod); enc.set_buffer(4, hm);
     enc.set_constant(5, X); enc.set_constant(6, _cfg.norm_eps);
     enc.set_constant(7, (unsigned)M);
@@ -1053,15 +1114,16 @@ MetalMageVae::decode(const SharedBuffer& z, int h, int w, std::string* err)
     enc.set_constant(3, (int)(M * X));
     enc.dispatch({(unsigned)(M * X), 1, 1}, {256, 1, 1});
     gemm_(enc, h2, 0, r.fc2, hm, 0, (int)M);
-    enc.set_function(_fn_gated_rows);
-    enc.set_buffer(0, xm); enc.set_buffer(1, mod); enc.set_buffer(2, hm);
+    enc.set_function(_fn_gated_rows32);
+    enc.set_buffer(0, xr); enc.set_buffer(1, mod); enc.set_buffer(2, hm);
     enc.set_constant(3, X); enc.set_constant(4, (unsigned)M);
     enc.dispatch({(unsigned)M, 1, 1}, {256, 1, 1});
   }
-  enc.set_function(_fn_rms);                       // final_layer.norm
-  enc.set_buffer(0, xm); enc.set_buffer(1, _dec_final_n); enc.set_buffer(2, hm);
+  enc.set_function(_fn_rms_rows32);                // final_layer.norm
+  enc.set_buffer(0, xr); enc.set_buffer(1, _dec_final_n); enc.set_buffer(2, hm);
   enc.set_constant(3, X); enc.set_constant(4, _cfg.norm_eps);
-  enc.dispatch({256, (unsigned)M, 1}, {256, 1, 1});
+  enc.set_constant(5, (unsigned)M);
+  enc.dispatch({(unsigned)M, 1, 1}, {256, 1, 1});
   gemm_(enc, hm, 0, _dec_final_lin, outm, 0, (int)M);
   }
   std::string gpu_err;

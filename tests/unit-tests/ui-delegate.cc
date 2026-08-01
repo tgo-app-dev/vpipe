@@ -134,3 +134,116 @@ TEST(ui_delegate, stdio_text_stream_empty_emits_nothing) {
   { auto s = d.open_text_stream(); }   // dtor calls end()
   EXPECT_TRUE(cap.out().empty());
 }
+
+// ---- stage interrupt handlers ---------------------------------------
+
+// dispatch() calls every registered handler and reports how many said
+// they actually interrupted something (returned true).
+TEST(ui_delegate, interrupt_dispatch_counts_only_handlers_that_acted) {
+  GetlineOnlyUi d;
+  int acting_calls = 0;
+  int idle_calls   = 0;
+  auto t1 = d.register_interrupt_handler(
+      "acting", [&] { ++acting_calls; return true; });
+  auto t2 = d.register_interrupt_handler(
+      "idle", [&] { ++idle_calls; return false; });
+  EXPECT_TRUE(d.interrupt_handler_count() == 2);
+  EXPECT_TRUE(d.dispatch_interrupt() == 1);
+  EXPECT_TRUE(acting_calls == 1);
+  EXPECT_TRUE(idle_calls == 1);
+}
+
+// Destroying the token unregisters: the handler is not called again.
+TEST(ui_delegate, interrupt_token_unregisters_on_destruction) {
+  GetlineOnlyUi d;
+  int calls = 0;
+  {
+    auto t = d.register_interrupt_handler(
+        "gone", [&] { ++calls; return true; });
+    EXPECT_TRUE(bool(t));
+    EXPECT_TRUE(d.dispatch_interrupt() == 1);
+  }
+  EXPECT_TRUE(d.interrupt_handler_count() == 0);
+  EXPECT_TRUE(d.dispatch_interrupt() == 0);
+  EXPECT_TRUE(calls == 1);
+}
+
+// A token that outlives its delegate unregisters into thin air rather
+// than dangling -- the registry is shared-owned and the token holds a
+// weak reference. (A stage torn down after its session would otherwise
+// write through a freed delegate.)
+TEST(ui_delegate, interrupt_token_outliving_delegate_is_safe) {
+  UiInterruptToken tok;
+  {
+    GetlineOnlyUi d;
+    tok = d.register_interrupt_handler("orphan", [] { return true; });
+    EXPECT_TRUE(bool(tok));
+  }
+  tok.reset();          // must not touch the destroyed delegate
+  EXPECT_TRUE(!tok);
+}
+
+// The SessionContextIntf default hands back an inert token (adapter
+// contexts that service no UI), which is safe to destroy.
+TEST(ui_delegate, interrupt_token_default_is_inert) {
+  UiInterruptToken tok;
+  EXPECT_TRUE(!tok);
+  tok.reset();
+}
+
+// First Ctrl-C: the stages' handlers run and the process keeps going.
+TEST(ui_delegate, stdio_sigint_first_stroke_interrupts_not_quits) {
+  IoCapture cap;
+  StdioUiDelegate d;
+  int calls = 0;
+  auto t = d.register_interrupt_handler("busy", [&] { ++calls; return true; });
+  EXPECT_TRUE(d.poll_sigint() == false);   // nothing pending yet
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == false);   // consumed by the handler
+  EXPECT_TRUE(calls == 1);
+  // A poll with no new stroke must not re-fire the handlers.
+  EXPECT_TRUE(d.poll_sigint() == false);
+  EXPECT_TRUE(calls == 1);
+}
+
+// Second Ctrl-C while the first is still armed: quit.
+TEST(ui_delegate, stdio_sigint_second_stroke_quits) {
+  IoCapture cap;
+  StdioUiDelegate d;
+  auto t = d.register_interrupt_handler("busy", [] { return true; });
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == false);
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == true);
+}
+
+// Two strokes inside one poll interval are a double tap too -- the
+// count jumps by 2 and we must not read that as a single stroke.
+TEST(ui_delegate, stdio_sigint_burst_quits) {
+  IoCapture cap;
+  StdioUiDelegate d;
+  auto t = d.register_interrupt_handler("busy", [] { return true; });
+  d.note_sigint();
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == true);
+}
+
+// A lone Ctrl-C that no handler consumes keeps its historical meaning:
+// stop the process. Without this a pipeline with nothing interruptible
+// would swallow the keystroke.
+TEST(ui_delegate, stdio_sigint_unconsumed_quits) {
+  IoCapture cap;
+  StdioUiDelegate d;
+  EXPECT_TRUE(d.poll_sigint() == false);
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == true);
+}
+
+// Same when handlers exist but all report "nothing in flight".
+TEST(ui_delegate, stdio_sigint_idle_handlers_quit) {
+  IoCapture cap;
+  StdioUiDelegate d;
+  auto t = d.register_interrupt_handler("idle", [] { return false; });
+  d.note_sigint();
+  EXPECT_TRUE(d.poll_sigint() == true);
+}

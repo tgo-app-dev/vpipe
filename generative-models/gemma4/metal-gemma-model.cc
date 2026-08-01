@@ -1,8 +1,10 @@
 #include "generative-models/gemma4/metal-gemma-model.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/kernel-autotune.h"
+#include "generative-models/shared/mma-tile.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -80,12 +82,27 @@ std::unique_ptr<MetalGemmaModel>
 MetalGemmaModel::load(const std::string& model_dir,
                       metal_compute::MetalCompute* mc, const Config& cfg)
 {
-  if (mc == nullptr || !mc->valid()) { return nullptr; }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) { return nullptr; }
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalGemmaModel>
+MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
+                      metal_compute::MetalCompute* mc, const Config& cfg)
+{
+  if (mc == nullptr || !mc->valid() || !ws_in) {
+    return nullptr;
+  }
+  // Held for the model's lifetime below (m->_ws). This model reads its
+  // tensors as owned COPIES (see the Copied residency below), so the
+  // hold is not about keeping views alive -- it is the reference count
+  // that decides when the checkpoint is closed.
+  WeightSet& wset = *ws_in;
+  const MetalLlamaWeights* wts = &wset.src();
+  const std::string model_dir = wset.dir();
   if ((int)cfg.is_full_layer.size() != cfg.n_layers) { return nullptr; }
 
   auto m = std::unique_ptr<MetalGemmaModel>(new MetalGemmaModel());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
   const bool bf16 = cfg.use_bf16;
@@ -355,6 +372,25 @@ MetalGemmaModel::load(const std::string& model_dir,
         m->_lib_dense.function("dense_moe_gather_geglu_f16");
     m->_fn_moe_gather_down_dense =
         m->_lib_dense.function("dense_moe_gather_down_f16");
+    // GROUPED (sorted-segment) prefill tier. The pair-batched gathers above
+    // re-read a whole expert slab per (token,expert) pair, which is right at
+    // decode (npair = top_k) but quadratically wasteful at prefill
+    // (npair = rows*top_k). Counting-sort the pairs by expert, then run one
+    // steel GEMM tile per expert block so each expert's weights are read once
+    // per BM=32 tile. The sort/scatter kernels are weight-free and shared with
+    // the Qwen MoE; only the gate|up GEMM needed a GeGLU twin.
+    m->_fn_moe_ifill = m->_lib_elt.function("moe_ifill_i32");
+    m->_fn_moe_hist = m->_lib_elt.function("moe_hist_i32");
+    m->_fn_moe_sort_setup = m->_lib_elt.function("moe_sort_setup_i32");
+    m->_fn_moe_scatter = m->_lib_elt.function("moe_scatter_i32");
+    m->_fn_moe_qmm_grouped_geglu =
+        m->_lib_qmm.function("affine_qmm_grouped_geglu_" + egb);
+    m->_fn_moe_qmm_grouped_down =
+        m->_lib_qmm.function("affine_qmm_grouped_" + egb);
+    m->_moe_grouped_ok = m->_fn_moe_ifill.valid() && m->_fn_moe_hist.valid()
+        && m->_fn_moe_sort_setup.valid() && m->_fn_moe_scatter.valid()
+        && m->_fn_moe_qmm_grouped_geglu.valid()
+        && m->_fn_moe_qmm_grouped_down.valid();
   }
   // Embedding gather at embed_bits. Only the w8 g32 variant is new (the
   // GGUF path); the 4-bit / g64 names are the existing mlx-checkpoint ones.
@@ -471,6 +507,10 @@ MetalGemmaModel::load(const std::string& model_dir,
   m->_fn_sdpa_gqa_vec_lin =
       m->_lib_sdpa.function("sdpa_causal_gqa_vec_lin_f16");
   m->_fn_sdpa_mma_qhead = m->_lib_sdpa.function("sdpa_causal_mma_qhead_f16");
+  // Paged twin, for the GLOBAL layers -- they live in the paged pool, so
+  // the contiguous one above cannot serve them.
+  m->_fn_sdpa_pmma_qhead =
+      m->_lib_sdpa.function("sdpa_paged_mma_qhead_f16");
   // Matrix-core (M5+) matmul2d attention for GLOBAL (head_dim 512) prefill: the
   // sdpa_mma metallib needs -std=metal4.0, so load it (and enable the path)
   // only on a matrix-core GPU. ~1.7-1.9x the simdgroup_matrix flash kernel.
@@ -644,6 +684,10 @@ MetalGemmaModel::load(const std::string& model_dir,
   // with depth so partials are sized for _mma_qhead_cap = ceil(max_seq/64).
   m->_mma_qhead = m->_fn_sdpa_mma_qhead.valid()
       && std::getenv("VPIPE_GEMMA_NO_MMA_QHEAD") == nullptr;
+  // Same knob covers the paged twin (VPIPE_GEMMA_NO_PMMA_QHEAD isolates it).
+  m->_pmma_qhead = m->_fn_sdpa_pmma_qhead.valid()
+      && std::getenv("VPIPE_GEMMA_NO_MMA_QHEAD") == nullptr
+      && std::getenv("VPIPE_GEMMA_NO_PMMA_QHEAD") == nullptr;
   {
     const int max_seq = cfg.page_tokens * std::max(1, cfg.max_pages);
     int cap = (max_seq + 63) / 64;
@@ -702,6 +746,9 @@ MetalGemmaModel::load(const std::string& model_dir,
     if (const char* e = std::getenv("VPIPE_GEMMA_MMA_NODQ")) {
       m->_skip_dequant = (std::atoi(e) != 0);   // diagnostic only
     }
+    // Split-K for the very deep down_proj contraction (fires only at
+    // ffn = 17408 / 21504; inert on every other checkpoint).
+    m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
     // Materialized-attention matmul2d core (M5): causal QK on the matrix units
     // + full-K matmul2d PV, behind the materialized path. Default ON when the
     // matmul2d GEMM path is on (e4b 4-bit + matrix cores); VPIPE_GEMMA_MAT_NO_MMA2
@@ -716,8 +763,15 @@ MetalGemmaModel::load(const std::string& model_dir,
     const auto* info = wts->info(name);
     if (info == nullptr) { return {}; }
     const std::string want = bf16 ? "BF16" : "F16";
-    if (info->dtype == want) { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
+    // Already the compute dtype: an owned copy, uncached. Mapping was
+    // measured and rejected for the LMs -- see the note in
+    // metal-qwen-model.cc's to_elt.
+    if (info->dtype == want) {
+      return wset.read(name, mc, WeightSet::Residency::Copied);
+    }
+    // Consumed here and dropped, so read UNCACHED rather than keep a
+    // redundant copy beside the converted one.
+    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
     if (raw.empty()) { return {}; }
     const std::size_t n = numel_(info->shape);
     SharedBuffer out = mc->make_shared_buffer(n * 2);
@@ -739,7 +793,8 @@ MetalGemmaModel::load(const std::string& model_dir,
   auto to_f16 = to_elt;
   auto qtri = [&](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
                   SharedBuffer& b) -> bool {
-    w = wts->load(pfx + ".weight", mc);
+    // Raw packed codes, uncached (see the note in metal-qwen-model.cc).
+    w = wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
     s = to_f16(pfx + ".scales");
     b = to_f16(pfx + ".biases");
     return !w.empty() && !s.empty() && !b.empty();
@@ -750,17 +805,28 @@ MetalGemmaModel::load(const std::string& model_dir,
   // per u32 (low-nibble first), scales/biases per group of 64.
   auto dequant_dense = [&](const std::string& pfx, int out_dim,
                            int in_dim) -> SharedBuffer {
-    SharedBuffer wq = wts->load(pfx + ".weight", mc);
+    SharedBuffer wq =
+        wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
     const auto* sinfo = wts->info(pfx + ".scales");
     const auto* binfo = wts->info(pfx + ".biases");
     if (wq.empty() || sinfo == nullptr || binfo == nullptr) { return {}; }
-    SharedBuffer sraw = wts->load(pfx + ".scales", mc);
-    SharedBuffer braw = wts->load(pfx + ".biases", mc);
+    // Dequantized into a dense buffer below, then dropped.
+    const auto cp = WeightSet::Residency::Copied;
+    SharedBuffer sraw = wset.read(pfx + ".scales", mc, cp);
+    SharedBuffer braw = wset.read(pfx + ".biases", mc, cp);
     if (sraw.empty() || braw.empty()) { return {}; }
+    // Width from the packed row: 8 nibbles (w4) or 4 bytes (w8) per u32,
+    // low-order element first. The MoE router arrives w8 in the OptiQ packs.
+    const auto* winfo = wts->info(pfx + ".weight");
+    if (winfo == nullptr || winfo->shape.empty() || in_dim <= 0) { return {}; }
+    const int bits = (int)((winfo->shape.back() * 32) / in_dim);
+    if (bits != 4 && bits != 8) { return {}; }
+    const int per_word = 32 / bits;
+    const std::uint32_t qmask = (bits == 4) ? 0xFu : 0xFFu;
     const bool sbf = sinfo->dtype == "BF16";
     const int gs = qg;
     const int ng = in_dim / gs;
-    const int words = in_dim / 8;
+    const int words = in_dim / per_word;
     const auto* wptr = static_cast<const std::uint32_t*>(wq.contents());
     const auto* sptr = static_cast<const std::uint16_t*>(sraw.contents());
     const auto* bptr = static_cast<const std::uint16_t*>(braw.contents());
@@ -768,12 +834,12 @@ MetalGemmaModel::load(const std::string& model_dir,
     auto* o = static_cast<std::uint16_t*>(out.contents());
     for (int r = 0; r < out_dim; ++r) {
       for (int c = 0; c < in_dim; ++c) {
-        const std::uint32_t word = wptr[(std::size_t)r * words + c / 8];
-        const int nib = (int)((word >> (4 * (c % 8))) & 0xF);
+        const std::uint32_t word = wptr[(std::size_t)r * words + c / per_word];
+        const int q = (int)((word >> (bits * (c % per_word))) & qmask);
         const int grp = c / gs;
         const float sc = elt_to_f32_(sptr[(std::size_t)r * ng + grp], sbf);
         const float bi = elt_to_f32_(bptr[(std::size_t)r * ng + grp], sbf);
-        o[(std::size_t)r * in_dim + c] = f32_to_elt_((float)nib * sc + bi, bf16);
+        o[(std::size_t)r * in_dim + c] = f32_to_elt_((float)q * sc + bi, bf16);
       }
     }
     return out;
@@ -793,7 +859,8 @@ MetalGemmaModel::load(const std::string& model_dir,
   } else if (m->_embed_is_q6k) {
     // Lossless raw Q6_K table: load it once; skip the affine8 requant
     // entirely (ensure_embed_ never runs -> the ~25% memory saving is real).
-    m->_embed_q6k = wts->load(P + "embed_tokens.q6k", mc);
+    m->_embed_q6k = wset.read(P + "embed_tokens.q6k", mc,
+                              WeightSet::Residency::Copied);
     if (m->_embed_q6k.empty()) { return nullptr; }
   } else if (!qtri(P + "embed_tokens", m->_embed_w, m->_embed_s,
                    m->_embed_b)) {
@@ -1207,7 +1274,13 @@ MetalGemmaModel::load(const std::string& model_dir,
       ly.pre_ffn_ln_2   = to_f16(p + "pre_feedforward_layernorm_2.weight");
       ly.post_ffn_ln_1  = to_f16(p + "post_feedforward_layernorm_1.weight");
       ly.post_ffn_ln_2  = to_f16(p + "post_feedforward_layernorm_2.weight");
-      ly.router_proj    = to_f16(p + "router.proj.weight");        // f16 [E,H]
+      // The router GEMV is dense f16 [E,H]. Raw-HF and model-quantize output
+      // ship router.proj dense; the OptiQ packs quantize it (w8), so
+      // dequantize at load instead of adding a quantized router path -- it's
+      // one [E,H] matrix per layer, negligible next to the experts.
+      ly.router_proj    = wts->has(p + "router.proj.scales")
+                              ? dequant_dense(p + "router.proj", E, Hh)
+                              : to_f16(p + "router.proj.weight");
       ly.per_expert_scale = to_f16(p + "router.per_expert_scale"); // f16 [E]
       // Fold the router pre-norm (RMSNorm, NO weight) * router.scale *
       // (1/sqrt(H)) into a single [H] weight the multiplicative rms kernel
@@ -1237,16 +1310,30 @@ MetalGemmaModel::load(const std::string& model_dir,
         ly.edw2 = to_f16(p + "experts.down_proj");
         moe_ok = moe_ok && !ly.edw2.empty();
       } else {
-        // Affine (quantizer output): per-expert gate/up/down triples. Experts
-        // are quantized at quant_bits; the gather variant was chosen to match.
-        ly.eg_bits = cfg.quant_bits;
+        // Affine: per-expert gate/up/down triples, under one of two naming
+        // conventions -- `experts.<proj>` (the model-quantize output) or
+        // `experts.switch_glu.<proj>` (the mlx-community OptiQ packs).
+        const std::string ep = wts->has(p + "experts.gate_proj.scales")
+                                   ? p + "experts."
+                                   : p + "experts.switch_glu.";
+        // Routed-expert quant width, read off the packed gate tensor PER
+        // LAYER: OptiQ varies it across layers (gemma-4-26B-A4B is w8 on
+        // layers 0-4 + 29, w4 on the other 24), so the global cfg.quant_bits
+        // would mis-stride those layers' slabs. gate/up/down agree within a
+        // layer, so one width per layer covers all three.
+        {
+          const auto* gi = wts->info(ep + "gate_proj.weight");
+          ly.eg_bits = (gi != nullptr && !gi->shape.empty() && Hh > 0 &&
+                        (int)((gi->shape.back() * 32) / Hh) == 8)
+                           ? 8 : 4;
+        }
         SharedBuffer gw, gs, gb, uw, us, ub;
         moe_ok = moe_ok &&
-                 qtri(p + "experts.gate_proj", gw, gs, gb) &&
-                 qtri(p + "experts.up_proj", uw, us, ub) &&
+                 qtri(ep + "gate_proj", gw, gs, gb) &&
+                 qtri(ep + "up_proj", uw, us, ub) &&
                  interleave_moe_q(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
                                   ly.eguw, ly.egus, ly.egub) &&
-                 qtri(p + "experts.down_proj", ly.edw2, ly.eds2, ly.edb2);
+                 qtri(ep + "down_proj", ly.edw2, ly.eds2, ly.edb2);
       }
       if (!moe_ok) { return nullptr; }
     }
@@ -2406,7 +2493,15 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
         const bool use_mat = _mat_decode && Hkv > 0 && (Hq % Hkv == 0)
             && G >= 1 && (D % 128 == 0) && !_d_dec_scores.empty()
             && (kv_off + 1) <= _dec_tstride;
-        const bool use_pgqa = !use_mat && _pgqa_attn && Hkv > 0
+        // Matrix-core q-head, paged: 8 q-heads per tile on one kv head, so
+        // it needs 8|G. Preferred over both when available -- measured at the
+        // gemma-4 global geometry (D=512, G=8) it is ~1.5x the vec path the
+        // globals were falling to. page_tokens % 64 == 0 keeps an FL_C block
+        // inside one page (the kernel's over-read contract).
+        const bool use_pmma = _pmma_qhead && Hkv > 0 && (Hq % Hkv == 0)
+            && G >= 8 && (G % 8 == 0) && (D % 64 == 0) && (D <= 512)
+            && (page_tokens % 64 == 0) && !_d_gqa_oacc.empty();
+        const bool use_pgqa = !use_pmma && !use_mat && _pgqa_attn && Hkv > 0
             && (Hq % Hkv == 0) && G >= 1 && G <= 16 && (D % 128 == 0)
             && !_d_gqa_oacc.empty();
         if (std::getenv("VPIPE_GEMMA_ATTN_DUMP") && kv_off >= 256) {
@@ -2414,13 +2509,50 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
           if (dumped_pf < 4) {
             std::fprintf(stderr,
               "[attn-dump L=%2d GLOBAL ] paged_full kernel=%s G=%d D=%d\n",
-              L, use_mat ? "dec_mat(QK/PV)"
+              L, use_pmma ? "sdpa_pmma_qhead"
+                 : use_mat ? "dec_mat(QK/PV)"
                  : use_pgqa ? "sdpa_pgqa(vec)"
                             : "sdpa_paged_causal(SCALAR)", G, D);
             ++dumped_pf;
           }
         }
-        if (use_mat) {
+        if (use_pmma) {
+          // Split scales with depth, same cadence as the contiguous twin
+          // (one split per 64 keys), capped so the partials stay sized.
+          int sp = (kv_off + 1 + 63) / 64;
+          sp = std::max(1, std::min(sp, _mma_qhead_cap));
+          enc.set_function(_fn_sdpa_pmma_qhead);
+          enc.set_buffer(0, _d_q);
+          enc.set_buffer(1, *Kuse);
+          enc.set_buffer(2, *Vuse);
+          enc.set_buffer(3, _d_gqa_oacc);
+          enc.set_buffer(4, _d_gqa_m);
+          enc.set_buffer(5, _d_gqa_l);
+          enc.set_constant(6, one_scale);
+          enc.set_constant(7, D);
+          enc.set_constant(8, Hq);
+          enc.set_constant(9, Hkv);
+          enc.set_constant(10, kv_off);     // q_offset
+          enc.set_constant(11, page_tokens);
+          enc.set_constant(12, n_pages);
+          enc.set_buffer(13, _d_pgtab, pgtab_off);
+          // paged_full is the FULL(global)-layer path by construction, so the
+          // sliding window does not apply -- 0 means "full causal" here, the
+          // same value the contiguous twin gets for a full layer.
+          const int pmma_window = 0;
+          enc.set_constant(14, pmma_window);
+          enc.set_constant(15, sp);
+          enc.dispatch({256, (unsigned)(Hq / 8), (unsigned)sp}, {256, 1, 1});
+          enc.set_function(_fn_sdpa_gqa_merge);
+          enc.set_buffer(0, _d_gqa_oacc);
+          enc.set_buffer(1, _d_gqa_m);
+          enc.set_buffer(2, _d_gqa_l);
+          enc.set_buffer(3, _d_attn);
+          enc.set_constant(4, D);
+          enc.set_constant(5, sp);
+          enc.set_constant(6, Hq);
+          enc.dispatch({(unsigned)(Hq * D), 1, 1}, {256, 1, 1});
+        } else if (use_mat) {
           // Materialized decode (omlx/MLX D=512 fallback): QK GEMV -> rowstat
           // -> PV GEMV -> merge. Split the QK/PV key scan for occupancy.
           const int scan = kv_off + 1;
@@ -4093,6 +4225,32 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
                                      : SharedBuffer{};
   SharedBuffer moe_out = c.is_moe() ? buf((std::size_t)n * H) : SharedBuffer{};
   SharedBuffer moe_h1  = c.is_moe() ? buf((std::size_t)n * H) : SharedBuffer{};
+  // Grouped-MoE prefill scratch (counting sort by expert -> steel tiles).
+  // Default-on from n >= 64, where the sort's fixed cost is already repaid;
+  // VPIPE_GEMMA_MOE_GROUPED=1/0 forces it for A/B. npad pads each expert's
+  // block to the BM=32 tile, and maxtiles adds one pad tile per expert so the
+  // segmented dispatch never indexes past tile2e.
+  const bool moe_grouped = c.is_moe() && !_dense && _moe_grouped_ok && [&] {
+    const char* e = std::getenv("VPIPE_GEMMA_MOE_GROUPED");
+    if (e != nullptr) { return std::atoi(e) != 0; }
+    return n >= 64;
+  }();
+  const int kMoeBM = 32;                       // steel BM tile
+  const int moe_maxtiles = moe_grouped
+      ? (moe_np + kMoeBM - 1) / kMoeBM + c.n_experts : 0;
+  const int moe_npad = moe_maxtiles * kMoeBM;
+  auto gi = [&](std::size_t e) {
+    return moe_grouped ? i32n(e) : SharedBuffer{};
+  };
+  SharedBuffer moe_hist = gi((std::size_t)c.n_experts);
+  SharedBuffer moe_boff = gi((std::size_t)c.n_experts);
+  SharedBuffer moe_curs = gi((std::size_t)c.n_experts);
+  SharedBuffer moe_t2e  = gi((std::size_t)moe_maxtiles);
+  SharedBuffer moe_ntile = gi(1);
+  SharedBuffer moe_srow = gi((std::size_t)moe_npad);
+  SharedBuffer moe_sdst = gi((std::size_t)moe_npad);
+  SharedBuffer moe_gact = moe_grouped
+      ? buf((std::size_t)moe_npad * c.moe_inner) : SharedBuffer{};
   SharedBuffer toks = _mc->make_shared_buffer((std::size_t)n * sizeof(std::int32_t));
   SharedBuffer logits = buf((std::size_t)c.vocab);
   {
@@ -4199,7 +4357,10 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.set_constant(5, Nn);
         enc.dispatch({(unsigned)(Kk * bits / 32), (unsigned)Nn, 1}, {64, 1, 1});
       }
-      const bool deep = (Kk >= 6144);
+      // Very deep K (the 31B's down_proj) splits the contraction rather than
+      // walking it in one op; see mma-splitk.h.
+      if (_splitk.encode(_mc, enc, xin, _w_deq, y, Kk, Nn, rows)) { return; }
+      const bool deep = mma_use_wide_tile(Nn, Kk);
       const int BN = deep ? 256 : 128;
       enc.set_function(deep ? _fn_dense_mma_deep : _fn_dense_mma);
       enc.set_buffer(0, xin);
@@ -5184,6 +5345,63 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
         // experts input hm = pre_ffn_ln_2(residual) -> hn.
         rms(*xcur, 0, ly.pre_ffn_ln_2, hn, 0, rows, H);
+        if (moe_grouped) {
+          // ---- GROUPED: counting-sort pairs by expert, then one steel tile
+          // per expert block. Each expert's slab is read once per BM tile
+          // instead of once per routed token. The row-gather is fused into
+          // the gate|up load (srow) and the scatter into the down store
+          // (sdst), so no explicit gather/scatter copies.
+          const int mt = moe_maxtiles;
+          auto ifill = [&](const SharedBuffer& b, int val, int nb) {
+            enc.set_function(_fn_moe_ifill);
+            enc.set_buffer(0, b); enc.set_constant(1, val);
+            enc.set_constant(2, nb);
+            enc.dispatch({(unsigned)nb, 1, 1}, {256, 1, 1});
+          };
+          ifill(moe_hist, 0, E);
+          ifill(moe_srow, -1, moe_npad);
+          ifill(moe_sdst, -1, moe_npad);
+          ifill(moe_t2e, -1, mt);
+          enc.set_function(_fn_moe_hist);
+          enc.set_buffer(0, moe_eid); enc.set_buffer(1, moe_hist);
+          enc.set_constant(2, np);
+          enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
+          enc.set_function(_fn_moe_sort_setup);
+          enc.set_buffer(0, moe_hist); enc.set_buffer(1, moe_boff);
+          enc.set_buffer(2, moe_t2e); enc.set_buffer(3, moe_curs);
+          enc.set_buffer(4, moe_ntile);
+          enc.set_constant(5, E); enc.set_constant(6, kMoeBM);
+          enc.set_constant(7, mt);
+          enc.dispatch({1, 1, 1}, {1, 1, 1});
+          enc.set_function(_fn_moe_scatter);
+          enc.set_buffer(0, moe_eid); enc.set_buffer(1, moe_boff);
+          enc.set_buffer(2, moe_curs); enc.set_buffer(3, moe_srow);
+          enc.set_buffer(4, moe_sdst);
+          enc.set_constant(5, np); enc.set_constant(6, K);
+          enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
+          // gate|up + GeGLU -> gact[npad, I], x gathered via srow
+          enc.set_function(_fn_moe_qmm_grouped_geglu);
+          enc.set_buffer(0, ly.eguw); enc.set_buffer(1, ly.egus);
+          enc.set_buffer(2, ly.egub);
+          enc.set_buffer(3, hn); enc.set_buffer(4, moe_gact);
+          enc.set_constant(5, H); enc.set_constant(6, 2 * I);
+          enc.set_constant(7, moe_npad); enc.set_buffer(8, moe_t2e);
+          enc.set_buffer(9, moe_srow);
+          enc.dispatch({(unsigned)(((2 * I + 31) / 32) * 32),
+                        (unsigned)(((moe_npad + 31) / 32) * 2), 2},
+                       {32, 2, 2});
+          // down -> part[np, H], scattered via sdst inside the store
+          enc.set_function(_fn_moe_qmm_grouped_down);
+          enc.set_buffer(0, ly.edw2); enc.set_buffer(1, ly.eds2);
+          enc.set_buffer(2, ly.edb2);
+          enc.set_buffer(3, moe_gact); enc.set_buffer(4, moe_part);
+          enc.set_constant(5, I); enc.set_constant(6, H);
+          enc.set_constant(7, moe_npad); enc.set_buffer(8, moe_t2e);
+          enc.set_buffer(9, moe_sdst);
+          enc.dispatch({(unsigned)(((H + 31) / 32) * 32),
+                        (unsigned)(((moe_npad + 31) / 32) * 2), 2},
+                       {32, 2, 2});
+        } else {
         enc.set_function(_dense ? _fn_moe_gather_geglu_dense
                                 : _fn_moe_gather_geglu);
         if (_dense) {
@@ -5212,6 +5430,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
           enc.set_constant(6, H); enc.set_buffer(7, moe_eid);
         }
         enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
+        }
         enc.set_function(_fn_moe_combine);
         enc.set_buffer(0, moe_part); enc.set_buffer(1, moe_w);
         enc.set_buffer(2, moe_out); enc.set_constant(3, H);

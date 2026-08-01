@@ -1,0 +1,139 @@
+/* Styling for the compare-image stage's panel. Ships with the stage;
+ * injected by the host on first mount. Uses the front end's design
+ * tokens (--bg-*, --fg-*, --line, --accent-*) and its .btn utility;
+ * everything else is local. */
+
+.cmpi-picker {
+  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.cmpi-picker-title { color: var(--fg-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .6px; }
+.cmpi-list { display: flex; flex-direction: column; gap: 6px; }
+.cmpi-item {
+  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
+}
+.cmpi-item:hover { background: var(--bg-3); border-color: #475061; }
+.cmpi-item-name { font-weight: 600; font-size: 12px; }
+.cmpi-item-sub { color: var(--fg-dim); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmpi-hint { color: var(--fg-dim); font-size: 11.5px; padding: 6px 2px; }
+.cmpi-item.live { border-left: 2px solid var(--accent-2); }
+.cmpi-item.live .cmpi-item-sub { color: var(--accent-2); }
+.cmpi-waiting { display: flex; justify-content: center; padding: 4px 0; }
+.cmpi-waiting .icon {
+  animation: cmpi-hourglass 1.1s ease-in-out infinite;
+  transform-origin: 50% 50%; opacity: .8;
+}
+@keyframes cmpi-hourglass {
+  0%, 55% { transform: rotate(0deg); }
+  100%    { transform: rotate(180deg); }
+}
+
+/* The comparison screen fills the panel body as a column. */
+.cmpi-view {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; min-height: 0;
+}
+/* Everything is drawn into ONE canvas so both images share a single
+   transform -- that is what keeps zoom/pan exactly in sync and makes
+   the wipe seam land on the same source pixel in both. */
+.cmpi-viewport {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  overflow: hidden; background: #000;
+  touch-action: none;              /* pointer drag pans, not scrolls */
+}
+.cmpi-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; }
+.cmpi-viewport.zoomable { cursor: grab; }
+.cmpi-viewport.panning  { cursor: grabbing; }
+
+/* The draggable wipe handle. A wide invisible hit area over a thin
+   visible line, so the seam stays hairline but is still easy to grab. */
+.cmpi-handle { position: absolute; z-index: 3; }
+.cmpi-handle.v { top: 0; bottom: 0; width: 18px; margin-left: -9px;
+  cursor: ew-resize; }
+.cmpi-handle.h { left: 0; right: 0; height: 18px; margin-top: -9px;
+  cursor: ns-resize; }
+.cmpi-handle::before {
+  content: ''; position: absolute; background: var(--accent-2);
+  box-shadow: 0 0 4px rgba(0, 0, 0, .8);
+}
+.cmpi-handle.v::before { top: 0; bottom: 0; left: 8px; width: 2px; }
+.cmpi-handle.h::before { left: 0; right: 0; top: 8px; height: 2px; }
+/* The grab dot stays OUT OF THE WAY: a comparison is looked at, and a
+   marker parked in the middle of the frame is exactly where the eye
+   wants to be. It fades in when the pointer comes near the seam (the
+   handle's hit band) and stays up for the duration of a drag, since
+   pointer capture can carry the pointer off the band mid-drag and :hover
+   would drop out from under it. */
+.cmpi-handle::after {
+  content: ''; position: absolute; width: 14px; height: 14px;
+  left: 50%; top: 50%; margin: -7px 0 0 -7px;
+  border: 2px solid var(--accent-2); border-radius: 50%;
+  background: var(--bg-1); box-shadow: 0 0 4px rgba(0, 0, 0, .8);
+  opacity: 0; transition: opacity .12s ease;
+  pointer-events: none;
+}
+.cmpi-handle:hover::after,
+.cmpi-handle.dragging::after { opacity: 1; }
+
+/* Seam hidden: the line, its shadow and the grab dot all go, so nothing
+   is painted over the pixels being compared -- a seam sitting on the
+   detail you are trying to judge is exactly the wrong place for it.
+   Only the DECORATION goes. The element keeps its size, its hit band and
+   its resize cursor, so the seam is still there to grab; the pointer
+   shape is what tells you so. Must come AFTER the :hover/.dragging rules
+   above -- same specificity, so order decides. */
+.cmpi-handle.line-hidden::before,
+.cmpi-handle.line-hidden::after,
+.cmpi-handle.line-hidden:hover::after,
+.cmpi-handle.line-hidden.dragging::after { opacity: 0; }
+
+/* Controls, bottom-left: the collapse toggle, then the five view
+ * buttons, swap, and the six modes. */
+.cmpi-controls {
+  position: absolute; left: 10px; bottom: 10px;
+  display: flex; gap: 4px; flex-wrap: wrap; z-index: 2;
+  align-items: flex-start;
+}
+.cmpi-ctl-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.cmpi-modes { display: flex; gap: 4px; margin-left: 8px; }
+/* Collapsed: everything but the toggle goes, leaving an unobstructed
+   look at the images. The toggle is first in the row, so it keeps its
+   position and the pointer that just clicked it is still over it. */
+.cmpi-controls.collapsed .cmpi-ctl-group { display: none; }
+.cmpi-toggle { opacity: .75; }
+.cmpi-toggle:hover { opacity: 1; }
+.cmpi-ctl {
+  min-width: 28px; height: 26px; padding: 0 7px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 5px; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.cmpi-ctl:hover { background: var(--bg-3); border-color: #475061; }
+/* A control that does not apply to the current mode (the seam toggle
+   outside the wipe modes) is dimmed rather than removed, so the row
+   doesn't reflow as modes change. */
+.cmpi-ctl:disabled { opacity: .4; cursor: default; }
+.cmpi-ctl:disabled:hover { background: var(--bg-2); border-color: var(--line); }
+/* Selected == the host's accent blue, exactly as its own overlay
+   controls do it (.graph-ctl.buf-ctl.active, .segmented .seg.active).
+   --accent is theme-defined, so this follows light/dark for free.
+   NOT --accent-2: that is the host's RUNNING/live green, which this
+   view uses in the picker for a live stage -- keeping the two apart is
+   what makes "selected" and "live" readable at a glance. */
+.cmpi-ctl.on {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.cmpi-viewport.no-view .cmpi-controls { opacity: .4; pointer-events: none; }
+
+.cmpi-status {
+  flex: 0 0 auto; padding: 6px 10px; color: var(--fg-dim);
+  font-size: 11px; background: var(--bg-1);
+  border-top: 1px solid var(--line);
+}
+.cmpi-status:empty { display: none; }

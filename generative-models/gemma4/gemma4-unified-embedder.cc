@@ -2,6 +2,7 @@
 
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/perf-event.h"
@@ -94,18 +95,22 @@ f16_to_f32_(std::uint16_t h)
 // `model.`-prefixed spelling. Returns false on a missing tensor. `numel`
 // (if non-null) receives the element count.
 bool
-st_load_f32_(const MetalLlamaWeights& w, metal_compute::MetalCompute* mc,
+st_load_f32_(WeightSet& w, metal_compute::MetalCompute* mc,
              const std::string& name, std::vector<float>* out,
              std::int64_t* numel)
 {
-  const MetalLlamaWeights::TensorInfo* ti = w.info(name);
+  const MetalLlamaWeights::TensorInfo* ti = w.src().info(name);
   std::string key = name;
   if (ti == nullptr) {
     key = "model." + name;
-    ti = w.info(key);
+    ti = w.src().info(key);
   }
   if (ti == nullptr) { return false; }
-  metal_compute::SharedBuffer buf = w.load(key, mc);
+  // Uncached, and Copied: the bytes are converted into `out` (a host
+  // float vector) right here and the buffer is dropped, so there is
+  // nothing for the set to keep.
+  metal_compute::SharedBuffer buf =
+      w.read(key, mc, WeightSet::Residency::Copied);
   if (buf.empty()) { return false; }
   std::int64_t n = 1;
   for (std::int64_t d : ti->shape) { n *= d; }
@@ -230,9 +235,17 @@ std::unique_ptr<Gemma4UnifiedEmbedder>
 Gemma4UnifiedEmbedder::load_safetensors(const std::string& model_dir,
                                         metal_compute::MetalCompute* mc)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto w = MetalLlamaWeights::open_model(model_dir);
-  if (!w) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load_safetensors(WeightSet::open(model_dir, nullptr), mc);
+}
+
+std::unique_ptr<Gemma4UnifiedEmbedder>
+Gemma4UnifiedEmbedder::load_safetensors(const std::shared_ptr<WeightSet>& ws,
+                                        metal_compute::MetalCompute* mc)
+{
+  if (mc == nullptr || ws == nullptr) { return nullptr; }
+  WeightSet* w = ws.get();
 
   auto m = std::unique_ptr<Gemma4UnifiedEmbedder>(new Gemma4UnifiedEmbedder());
 
@@ -245,9 +258,9 @@ Gemma4UnifiedEmbedder::load_safetensors(const std::string& model_dir,
                    nullptr);
   if (have_vis) {
     const MetalLlamaWeights::TensorInfo* pd =
-        w->info("model.vision_embedder.patch_dense.weight");
+        w->src().info("model.vision_embedder.patch_dense.weight");
     if (pd == nullptr) {
-      pd = w->info("vision_embedder.patch_dense.weight");
+      pd = w->src().info("vision_embedder.patch_dense.weight");
     }
     const bool ok =
         pd != nullptr && pd->shape.size() == 2 &&
@@ -309,9 +322,9 @@ Gemma4UnifiedEmbedder::load_safetensors(const std::string& model_dir,
   if (st_load_f32_(*w, mc, "embed_audio.embedding_projection.weight",
                    &m->_w_aproj, nullptr)) {
     const MetalLlamaWeights::TensorInfo* ap =
-        w->info("model.embed_audio.embedding_projection.weight");
+        w->src().info("model.embed_audio.embedding_projection.weight");
     if (ap == nullptr) {
-      ap = w->info("embed_audio.embedding_projection.weight");
+      ap = w->src().info("embed_audio.embedding_projection.weight");
     }
     if (ap != nullptr && ap->shape.size() == 2) {
       m->_audio_frame = static_cast<int>(ap->shape[1]);   // 640

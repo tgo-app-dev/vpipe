@@ -94,6 +94,17 @@ public:
   // keep K/V in the ContextManager) keep the default false.
   virtual bool owns_kv() const noexcept { return false; }
 
+  // Bytes of KV / recurrent state this exec is holding right now, or 0
+  // when it keeps none of its own (a non-owns_kv exec leaves the KV to
+  // the LM's context manager).
+  //
+  // Reported separately from weights because it behaves differently:
+  // weights are allocated once at load and then constant, while KV grows
+  // with the conversation. A memory accounting that only sees weights
+  // reads as healthy right up to the point a long context exhausts the
+  // box.
+  virtual std::size_t kv_bytes() const { return 0; }
+
   // Logical sequence length of `ctx` (its KV / rope position, in
   // tokens), for owns_kv() execs that track K/V internally. Returns 0
   // for a context this exec has never touched, and -1 when the backend

@@ -6,6 +6,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
@@ -47,6 +48,11 @@ struct SteelAttnParams {
 // real conditioning outliers through the deep 28-block residual/attention
 // stream, and the reference itself runs bf16. bf16's f32 exponent range holds
 // them.
+// Namespace for this class's derived-tensor cache keys. A WeightSet is
+// shared by everything reading one checkpoint, so a key has to say which
+// class's transform produced the bytes, not just which tensor.
+constexpr const char* kKey = "krea2-dit/";
+
 inline std::uint16_t f32_to_bf16_(float f)
 {
   std::uint32_t u; std::memcpy(&u, &f, 4);
@@ -121,11 +127,28 @@ to_f16_norm_(const MetalLlamaWeights& wts, MetalCompute* mc,
 
 // Load a Linear weight: an affine-quantized triple (codes/scales/qbias) when
 // `<name>.scales` is present in a quantized checkpoint, else dense f16.
+SharedBuffer
+MetalKrea2Transformer::elt_(WeightSet& ws, const std::string& nm, Retain r,
+                            bool norm)
+{
+  auto build = [&]() {
+    return norm ? to_f16_norm_(ws.src(), _mc, nm)
+                : to_f16_(ws.src(), _mc, nm);
+  };
+  if (r == Retain::Streamed) { return ws.stream_derived(build); }
+  // The (1 + w) norm fold produces DIFFERENT bytes from the plain
+  // narrowing, so it gets its own key -- sharing one would hand a
+  // caller the wrong tensor.
+  return ws.derived(
+      std::string(kKey) + (norm ? "eltn|" : "elt|") + nm, build);
+}
+
 MetalKrea2Transformer::QWeight
-MetalKrea2Transformer::load_qw_(const MetalLlamaWeights& wts,
-                                const std::string& name)
+MetalKrea2Transformer::load_qw_(WeightSet& ws, const std::string& name,
+                                Retain r)
 {
   QWeight qw;
+  const MetalLlamaWeights& wts = ws.src();
   const auto* si = wts.info(name + ".scales");
   const auto* ci = wts.info(name + ".weight");
   if (_quant_bits > 0 && si != nullptr && ci != nullptr &&
@@ -143,41 +166,44 @@ MetalKrea2Transformer::load_qw_(const MetalLlamaWeights& wts,
     // Codes are U32 (raw; mmap-aliased when enabled). Scales/biases are F16 on
     // disk but the affine kernels are now bf16 (the DiT runs bf16), so convert
     // them F16->bf16 via to_f16_ (which emits bf16). Mirrors the QIE/FLUX.2 path.
-    qw.codes  = _mmap_weights ? wts.load_mapped(name + ".weight", _mc)
-                              : wts.load(name + ".weight", _mc);
-    qw.scales = to_f16_(wts, _mc, name + ".scales");  // -> bf16 (group scale)
-    qw.qbias  = to_f16_(wts, _mc, name + ".biases");  // -> bf16 (group min)
+    const auto res = _mmap_weights ? WeightSet::Residency::Mapped
+                                   : WeightSet::Residency::Copied;
+    qw.codes = r == Retain::Streamed
+                   ? ws.stream_tensor(name + ".weight", _mc, res)
+                   : ws.tensor(name + ".weight", _mc, res);
+    qw.scales = elt_(ws, name + ".scales", r);   // -> bf16 (group scale)
+    qw.qbias  = elt_(ws, name + ".biases", r);   // -> bf16 (group min)
     if (!qw.codes.empty() && !qw.scales.empty() && !qw.qbias.empty()) {
       qw.quantized = true;
       return qw;
     }
     qw.codes = {}; qw.scales = {}; qw.qbias = {};
   }
-  qw.w = to_f16_(wts, _mc, name + ".weight");        // dense fallback
+  qw.w = elt_(ws, name + ".weight", r);              // dense fallback
   return qw;
 }
 
 bool
-MetalKrea2Transformer::load_block_(const MetalLlamaWeights& wts,
+MetalKrea2Transformer::load_block_(WeightSet& ws,
                                    const std::string& pre, Block& b,
-                                   bool main_block)
+                                   bool main_block, Retain r)
 {
   if (main_block) {
-    b.sst = to_f16_(wts, _mc, pre + "scale_shift_table");
+    b.sst = elt_(ws, pre + "scale_shift_table", r);
     if (b.sst.empty()) { return false; }
   }
-  b.n1 = to_f16_norm_(wts, _mc, pre + "norm1.weight");
-  b.n2 = to_f16_norm_(wts, _mc, pre + "norm2.weight");
-  b.q  = load_qw_(wts, pre + "attn.to_q");
-  b.k  = load_qw_(wts, pre + "attn.to_k");
-  b.v  = load_qw_(wts, pre + "attn.to_v");
-  b.gate = load_qw_(wts, pre + "attn.to_gate");
-  b.qn = to_f16_norm_(wts, _mc, pre + "attn.norm_q.weight");
-  b.kn = to_f16_norm_(wts, _mc, pre + "attn.norm_k.weight");
-  b.o  = load_qw_(wts, pre + "attn.to_out.0");
-  b.ff_gate = load_qw_(wts, pre + "ff.gate");
-  b.ff_up   = load_qw_(wts, pre + "ff.up");
-  b.ff_down = load_qw_(wts, pre + "ff.down");
+  b.n1 = elt_(ws, pre + "norm1.weight", r, true);
+  b.n2 = elt_(ws, pre + "norm2.weight", r, true);
+  b.q  = load_qw_(ws, pre + "attn.to_q", r);
+  b.k  = load_qw_(ws, pre + "attn.to_k", r);
+  b.v  = load_qw_(ws, pre + "attn.to_v", r);
+  b.gate = load_qw_(ws, pre + "attn.to_gate", r);
+  b.qn = elt_(ws, pre + "attn.norm_q.weight", r, true);
+  b.kn = elt_(ws, pre + "attn.norm_k.weight", r, true);
+  b.o  = load_qw_(ws, pre + "attn.to_out.0", r);
+  b.ff_gate = load_qw_(ws, pre + "ff.gate", r);
+  b.ff_up   = load_qw_(ws, pre + "ff.up", r);
+  b.ff_down = load_qw_(ws, pre + "ff.down", r);
   // Fused-FF interleave (main blocks): gate|up -> one [2*ffn, K] quantized
   // weight (row 2g = gate feature g, 2g+1 = up feature g) -- the layout both
   // affine_qmm_swiglu's register-local epilogue (steel) and the matmul2d +
@@ -189,27 +215,39 @@ MetalKrea2Transformer::load_block_(const MetalLlamaWeights& wts,
     const std::size_t FF = (std::size_t)_cfg.ffn;
     const std::size_t wrow = (std::size_t)_cfg.hidden * b.ff_gate.bits / 32;
     const std::size_t grow = (std::size_t)_cfg.hidden / _quant_group;
+    // Interleave gate|up rows into one buffer: row 2g = gate g, 2g+1 = up g.
+    auto row2 = [&](const SharedBuffer& g0, const SharedBuffer& u0,
+                    std::size_t rb) -> SharedBuffer {
+      if (g0.empty() || u0.empty()) { return {}; }
+      SharedBuffer dst = _mc->make_shared_buffer(2 * FF * rb);
+      if (dst.empty()) { return {}; }
+      auto* d = static_cast<std::uint8_t*>(dst.contents());
+      const auto* gp = static_cast<const std::uint8_t*>(g0.contents());
+      const auto* up = static_cast<const std::uint8_t*>(u0.contents());
+      for (std::size_t i = 0; i < FF; ++i) {
+        std::memcpy(d + (2 * i) * rb, gp + i * rb, rb);
+        std::memcpy(d + (2 * i + 1) * rb, up + i * rb, rb);
+      }
+      return dst;
+    };
+    // The interleaved weight is the largest tensor in a block, so it
+    // goes through the set like any other derived tensor: two models
+    // over this checkpoint pay for the relayout once. Streamed blocks
+    // rebuild it per forward and keep nothing, as they must. Building
+    // INSIDE the builder matters -- allocating first and filling after
+    // would rewrite a cache hit's bytes under a peer model's feet.
+    auto fused = [&](const char* tag, const SharedBuffer& g0,
+                     const SharedBuffer& u0,
+                     std::size_t rb) -> SharedBuffer {
+      auto mk = [&]() { return row2(g0, u0, rb); };
+      if (r == Retain::Streamed) { return ws.stream_derived(mk); }
+      return ws.derived(std::string(kKey) + "gu|" + pre + "ff|" + tag, mk);
+    };
     QWeight gu;
-    gu.codes  = _mc->make_shared_buffer(2 * FF * wrow * 4);
-    gu.scales = _mc->make_shared_buffer(2 * FF * grow * 2);
-    gu.qbias  = _mc->make_shared_buffer(2 * FF * grow * 2);
+    gu.codes  = fused("codes", b.ff_gate.codes, b.ff_up.codes, wrow * 4);
+    gu.scales = fused("scales", b.ff_gate.scales, b.ff_up.scales, grow * 2);
+    gu.qbias  = fused("qbias", b.ff_gate.qbias, b.ff_up.qbias, grow * 2);
     if (!gu.codes.empty() && !gu.scales.empty() && !gu.qbias.empty()) {
-      auto row2 = [](void* dst, const void* g0, const void* u0,
-                     std::size_t rows, std::size_t rb) {
-        auto* d = static_cast<std::uint8_t*>(dst);
-        const auto* gp = static_cast<const std::uint8_t*>(g0);
-        const auto* up = static_cast<const std::uint8_t*>(u0);
-        for (std::size_t r = 0; r < rows; ++r) {
-          std::memcpy(d + (2 * r) * rb, gp + r * rb, rb);
-          std::memcpy(d + (2 * r + 1) * rb, up + r * rb, rb);
-        }
-      };
-      row2(gu.codes.contents(), b.ff_gate.codes.contents(),
-           b.ff_up.codes.contents(), FF, wrow * 4);
-      row2(gu.scales.contents(), b.ff_gate.scales.contents(),
-           b.ff_up.scales.contents(), FF, grow * 2);
-      row2(gu.qbias.contents(), b.ff_gate.qbias.contents(),
-           b.ff_up.qbias.contents(), FF, grow * 2);
       gu.quantized = true;
       gu.bits = b.ff_gate.bits;
       b.ff_gu = std::move(gu);
@@ -231,12 +269,25 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
                             const Config& cfg, bool stream_blocks,
                             double pin_frac)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
+              pin_frac);
+}
+
+std::unique_ptr<MetalKrea2Transformer>
+MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
+                            const Config& cfg, bool stream_blocks,
+                            double pin_frac)
+{
+  if (mc == nullptr || !ws_in) { return nullptr; }
+  const std::string model_dir = ws_in->dir();
 
   auto m = std::unique_ptr<MetalKrea2Transformer>(new MetalKrea2Transformer());
+  m->_ws = ws_in;
+  WeightSet& ws = *m->_ws;
+  // Everything loaded from here to the end of load() is RETAINED for the
+  // model's life. The streamed blocks are read in forward(), and there
+  // only.
+  const Retain r = Retain::Cached;
   m->_mc = mc;
   m->_cfg = cfg;
   m->_stream_blocks = stream_blocks;
@@ -312,6 +363,13 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   m->_fn_rope_table  = m->_lib_rope.function("rope_pair_table_ftab_f16");
   m->_fn_adaln       = m->_lib_elt.function("adaln_modulate_f16");
   m->_fn_gated       = m->_lib_elt.function("gated_residual_f16");
+  // vec4 twins: same arithmetic per element (so bit-identical), 3-4x the
+  // throughput -- one element per thread leaves these at ~37-54 GB/s where the
+  // same bytes through a vec4 2-D grid run at 143-181. VPIPE_NO_ELT_V4 reverts.
+  if (std::getenv("VPIPE_NO_ELT_V4") == nullptr) {
+    m->_fn_adaln4 = m->_lib_elt.function("adaln_modulate_v4_f16");
+    m->_fn_gated4 = m->_lib_elt.function("gated_residual_v4_f16");
+  }
   m->_fn_colabsmax   = m->_lib_elt.function("col_absmax_f16");
   if (!m->_fn_gemm.valid() || !m->_fn_gemm_bias.valid() ||
       !m->_fn_rms.valid() || !m->_fn_swiglu.valid() ||
@@ -505,48 +563,48 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
 
   m->_layerwise.resize((std::size_t)cfg.n_layerwise);
   for (int i = 0; i < cfg.n_layerwise; ++i) {
-    if (!m->load_block_(wts,
+    if (!m->load_block_(ws,
             "text_fusion.layerwise_blocks." + std::to_string(i) + ".",
-            m->_layerwise[(std::size_t)i], false)) {
+            m->_layerwise[(std::size_t)i], false, r)) {
       return nullptr;
     }
   }
   m->_refiner.resize((std::size_t)cfg.n_refiner);
   for (int i = 0; i < cfg.n_refiner; ++i) {
-    if (!m->load_block_(wts,
+    if (!m->load_block_(ws,
             "text_fusion.refiner_blocks." + std::to_string(i) + ".",
-            m->_refiner[(std::size_t)i], false)) {
+            m->_refiner[(std::size_t)i], false, r)) {
       return nullptr;
     }
   }
-  m->_projector = m->load_qw_(wts, "text_fusion.projector");
-  m->_txt_norm  = to_f16_norm_(wts, mc, "txt_in.norm.weight");
-  m->_txt_l1w   = m->load_qw_(wts, "txt_in.linear_1");
-  m->_txt_l1b   = to_f16_(wts, mc, "txt_in.linear_1.bias");
-  m->_txt_l2w   = m->load_qw_(wts, "txt_in.linear_2");
-  m->_txt_l2b   = to_f16_(wts, mc, "txt_in.linear_2.bias");
+  m->_projector = m->load_qw_(ws, "text_fusion.projector", r);
+  m->_txt_norm  = m->elt_(ws, "txt_in.norm.weight", r, true);
+  m->_txt_l1w   = m->load_qw_(ws, "txt_in.linear_1", r);
+  m->_txt_l1b   = m->elt_(ws, "txt_in.linear_1.bias", r);
+  m->_txt_l2w   = m->load_qw_(ws, "txt_in.linear_2", r);
+  m->_txt_l2b   = m->elt_(ws, "txt_in.linear_2.bias", r);
 
   // DiT image path.
-  m->_img_in_w = m->load_qw_(wts, "img_in");
-  m->_img_in_b = to_f16_(wts, mc, "img_in.bias");
-  m->_te_l1w = m->load_qw_(wts, "time_embed.linear_1");
-  m->_te_l1b = to_f16_(wts, mc, "time_embed.linear_1.bias");
-  m->_te_l2w = m->load_qw_(wts, "time_embed.linear_2");
-  m->_te_l2b = to_f16_(wts, mc, "time_embed.linear_2.bias");
-  m->_tmp_w  = m->load_qw_(wts, "time_mod_proj");
-  m->_tmp_b  = to_f16_(wts, mc, "time_mod_proj.bias");
+  m->_img_in_w = m->load_qw_(ws, "img_in", r);
+  m->_img_in_b = m->elt_(ws, "img_in.bias", r);
+  m->_te_l1w = m->load_qw_(ws, "time_embed.linear_1", r);
+  m->_te_l1b = m->elt_(ws, "time_embed.linear_1.bias", r);
+  m->_te_l2w = m->load_qw_(ws, "time_embed.linear_2", r);
+  m->_te_l2b = m->elt_(ws, "time_embed.linear_2.bias", r);
+  m->_tmp_w  = m->load_qw_(ws, "time_mod_proj", r);
+  m->_tmp_b  = m->elt_(ws, "time_mod_proj.bias", r);
   // Main blocks: preload all 28 (default), or stream them on demand from the
   // retained mmap (memory-bounded mode; loaded per-block in forward_dit). In
   // streaming mode with pin_frac > 0, preload a LEADING prefix (as many blocks
   // as fit in pin_frac of RAM) and stream only the tail. Loaded from `wts` here
-  // (before it is moved into _stream_wts below); the pinned buffers survive the
+  // (read from the weight set); the pinned buffers survive the
   // move (owned copies keep their refcount; mmap views keep the base alive).
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
-      if (!m->load_block_(wts,
+      if (!m->load_block_(ws,
               "transformer_blocks." + std::to_string(i) + ".",
-              m->_blocks[(std::size_t)i], true)) {
+              m->_blocks[(std::size_t)i], true, r)) {
         return nullptr;
       }
     }
@@ -555,21 +613,21 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
     for (int i = 0; i < cfg.n_layers; ++i) {
       prefixes[(std::size_t)i] = "transformer_blocks." + std::to_string(i) + ".";
     }
-    m->_pinned = stream_pin_count(wts, prefixes, pin_frac);
+    m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
     if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
     m->_blocks.resize((std::size_t)m->_pinned);
     for (int i = 0; i < m->_pinned; ++i) {
-      if (!m->load_block_(wts,
+      if (!m->load_block_(ws,
               "transformer_blocks." + std::to_string(i) + ".",
-              m->_blocks[(std::size_t)i], true)) {
+              m->_blocks[(std::size_t)i], true, r)) {
         return nullptr;
       }
     }
   }
-  m->_final_sst  = to_f16_(wts, mc, "final_layer.scale_shift_table");
-  m->_final_norm = to_f16_norm_(wts, mc, "final_layer.norm.weight");
-  m->_final_lw   = m->load_qw_(wts, "final_layer.linear");
-  m->_final_lb   = to_f16_(wts, mc, "final_layer.linear.bias");
+  m->_final_sst  = m->elt_(ws, "final_layer.scale_shift_table", r);
+  m->_final_norm = m->elt_(ws, "final_layer.norm.weight", r, true);
+  m->_final_lw   = m->load_qw_(ws, "final_layer.linear", r);
+  m->_final_lb   = m->elt_(ws, "final_layer.linear.bias", r);
 
   if (m->_projector.empty() || m->_txt_norm.empty() || m->_txt_l1w.empty() ||
       m->_txt_l1b.empty() || m->_txt_l2w.empty() || m->_txt_l2b.empty() ||
@@ -584,8 +642,6 @@ MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
   // into it (moving the weights leaves the mmap base + the wrapped whole-shard
   // buffers intact; the subviews handed out keep their own refcount).
   if (stream_blocks || m->_mmap_weights) {
-    m->_stream_wts =
-        std::make_unique<MetalLlamaWeights>(std::move(*wtsopt));
     if (m->_mmap_weights && mc->session() != nullptr) {
       mc->session()->log_debug(fmt(
           "MetalKrea2Transformer: zero-copy (mmap) quantized weights enabled"));
@@ -1366,9 +1422,28 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       enc.dispatch({(unsigned)N, 1, 1}, {256, 1, 1});
     };
     // adaLN modulate out = (1+scale)*x + shift (scale/shift = offset slices).
+    // vec4 eligibility for the twins below: they load/store 8 bytes at a time
+    // off each bound base, so every element offset must be 4-aligned (an
+    // unaligned vec4 access is undefined, not just slow) and `total` must be a
+    // whole number of rows for the 2-D grid to cover it.
+    auto elt4_ok = [&](int N, int total,
+                       std::initializer_list<std::size_t> offs) {
+      if ((N % 4) != 0 || N <= 0 || (total % N) != 0) { return false; }
+      for (std::size_t o : offs) { if ((o % 4) != 0) { return false; } }
+      return true;
+    };
     auto adaln = [&](const SharedBuffer& x, const SharedBuffer& sh,
                      std::size_t scale_e, std::size_t shift_e,
                      const SharedBuffer& out, int N, int total) {
+      if (_fn_adaln4.valid() && elt4_ok(N, total, {scale_e, shift_e})) {
+        enc.set_function(_fn_adaln4);
+        enc.set_buffer(0, x); enc.set_buffer(1, sh, scale_e * 2);
+        enc.set_buffer(2, sh, shift_e * 2); enc.set_buffer(3, out);
+        enc.set_constant(4, N / 4); enc.set_constant(5, total / N);
+        enc.dispatch({(unsigned)(N / 4), (unsigned)(total / N), 1},
+                     {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_adaln);
       enc.set_buffer(0, x); enc.set_buffer(1, sh, scale_e * 2);
       enc.set_buffer(2, sh, shift_e * 2); enc.set_buffer(3, out);
@@ -1379,6 +1454,15 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     auto gated = [&](const SharedBuffer& h, const SharedBuffer& gt,
                      std::size_t gate_e, const SharedBuffer& sub, int N,
                      int total) {
+      if (_fn_gated4.valid() && elt4_ok(N, total, {gate_e})) {
+        enc.set_function(_fn_gated4);
+        enc.set_buffer(0, h); enc.set_buffer(1, gt, gate_e * 2);
+        enc.set_buffer(2, sub);
+        enc.set_constant(3, N / 4); enc.set_constant(4, total / N);
+        enc.dispatch({(unsigned)(N / 4), (unsigned)(total / N), 1},
+                     {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_gated);
       enc.set_buffer(0, h); enc.set_buffer(1, gt, gate_e * 2);
       enc.set_buffer(2, sub);
@@ -1464,9 +1548,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       const bool streaming = _stream_blocks && L >= _pinned;
       Block streamed;
       if (streaming) {
-        if (!load_block_(*_stream_wts,
+        if (!load_block_(*_ws,
                          "transformer_blocks." + std::to_string(L) + ".",
-                         streamed, true)) {
+                         streamed, true, Retain::Streamed)) {
           return {};
         }
         if (_mc->session() != nullptr) {

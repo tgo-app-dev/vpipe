@@ -13,6 +13,7 @@
 // stage is an inert stub (the constructor errors through session() and
 // every beat emits nothing).
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/sampler.h"
 #include "generative-models/moss/metal-moss-tts-model.h"
 #include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/moss/metal-moss-codec-v2.h"
@@ -46,9 +47,10 @@ namespace vpipe {
 //     decoder -> 48 kHz STEREO PCM. The LM dir must be PRE-QUANTIZED (produce
 //     it with the model-quantize stage); the codec_dir is a codec-v2 dir.
 //
-// Some config keys apply to only one variant (e.g. the sampling / voice-clone
-// knobs are 8B-only; max_frames / instruction / language are v1.5-only) -- the
-// unused keys are simply ignored for the loaded variant.
+// Some config keys apply to only one variant (e.g. the voice-clone knobs are
+// 8B-only; max_frames / instruction / language are v1.5-only) -- the unused
+// keys are simply ignored for the loaded variant. Sampling is NOT config: it
+// comes from the two optional sampler iports below.
 //
 //   iport0  FlexDataPayload carrying the text to speak. Accepts either a
 //           plain FlexData string OR a FlexData object with a "text"
@@ -80,6 +82,24 @@ namespace vpipe {
 //           encoder ~doubles its resident weights, so it is loaded only when
 //           iport1 is connected.
 //
+//   iport2  OPTIONAL FlexDataPayload token-sampler spec (a `sampler-select`
+//           stage) for the AUDIO-code channel; latched on the first beat.
+//           Its seed doubles as the voice seed. UNLIKE every other sampler
+//           port in the tree, an unwired iport2 does NOT fall back to greedy:
+//           MOSS's audio head degenerates into silent loops under argmax, so
+//           it keeps the model's own recommendation instead (temp 1.7 /
+//           top_p 0.8 / top_k 25 for 8B + v1.5; temp 0.8 / top_p 0.6 /
+//           top_k 30 / rep 1.1 for the realtime variant).
+//
+//   iport3  OPTIONAL FlexDataPayload token-sampler spec for the free-TEXT
+//           channel; latched on the first beat. Unwired => greedy, which is
+//           the right default: vpipe GENERATES the text channel (it re-emits
+//           the transcript) and must follow it to reach audio_end, so
+//           sampling it over-generates.
+//
+//           MossSampling has no min_p / presence-penalty knob, so a spec
+//           setting either warns on latch and that knob is ignored.
+//
 //   oport0  TensorBeatPayload f32 PCM ([channels, n_samples]; 24 kHz mono for
 //           8B/realtime, 48 kHz stereo for v1.5), with `sample_rate` in the
 //           beat's sideband. With stream_chunk_frames>0 (the default) the LM
@@ -109,11 +129,12 @@ namespace vpipe {
 //   6. Emits the PCM on oport0 as a TensorBeatPayload.
 //
 // Audio codes are SAMPLED (the MossTTSDelay-8B recommendation); the text
-// channel defaults to greedy (vpipe re-emits the transcript there). All
-// sampling knobs + the voice-lock seed are flattened config (see kAttrs).
+// channel defaults to greedy (vpipe re-emits the transcript there). Neither
+// is a config key -- both come from the sampler iports above, and the audio
+// spec's seed is the voice-lock seed.
 //
 // Config (FlexData object on the 4th constructor parameter; see kAttrs for
-// the full flattened list incl. sampling + voice cloning):
+// the full flattened list incl. voice cloning):
 //   hf_dir         (string, required)      -- the MOSS-TTS LM directory
 //                                             (config.json + safetensors).
 //   codec_dir      (string, required)      -- the MOSS-Audio-Tokenizer
@@ -139,6 +160,10 @@ public:
   ~TextToSpeechStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The TTS LM and its audio codec -- two checkpoints, both large.
+  // See Stage::declare_models.
+  std::vector<std::string> declare_models() const override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -152,6 +177,10 @@ public:
   bool interrupt_on_new_text()   const noexcept
   { return _interrupt_on_new_text; }
   std::uint64_t clips_emitted()  const noexcept { return _clips_emitted; }
+  // Test-only: whether the codec's (heavy) encode path will be loaded. True
+  // only when the PCM-reference iport1 SLOT is wired -- the sampler iports
+  // that follow it must not turn it on.
+  bool with_encoder()            const noexcept { return _with_encoder; }
 
 private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
@@ -167,26 +196,44 @@ private:
   int         _max_frames{};
   std::string _instruction;
   std::string _language;
-  // Flattened sampling config (separate audio + text channels); assembled into
-  // MossSampling in process(). Defaults = MossTTSDelay-8B recommendations.
-  double        _audio_temp{}, _audio_top_p{}, _audio_rep{};
-  int           _audio_top_k{};
-  double        _text_temp{}, _text_top_p{}, _text_rep{};
-  int           _text_top_k{};
-  std::uint64_t _sampler_seed{};
-  // Voice cloning / lock. _with_encoder (set in the ctor from the iport
-  // count) gates loading the codec's encode path -- only paid when a PCM
-  // reference iport is wired. _voice_lock is the "design-once" mode: cache
-  // the FIRST generated voice and reuse it as the reference for every later
-  // beat, so the timbre stays consistent across different texts (a fixed
-  // sampler_seed picks that first voice deterministically). An external
-  // reference on iport1 overrides it. _voice_ref_seconds caps how much
-  // reference audio is kept (longer prompts cost more per beat).
+  // Voice cloning / lock. _with_encoder (set in the ctor from the iport1
+  // SLOT, not the port count -- the sampler iports sit after it) gates
+  // loading the codec's encode path, only paid when a PCM reference iport is
+  // wired. _voice_lock is the "design-once" mode: cache the FIRST generated
+  // voice and reuse it as the reference for every later beat, so the timbre
+  // stays consistent across different texts (a fixed audio-sampler seed picks
+  // that first voice deterministically). An external reference on iport1
+  // overrides it. _voice_ref_seconds caps how much reference audio is kept
+  // (longer prompts cost more per beat).
   bool          _with_encoder{};
   bool          _voice_lock{};
   double        _voice_ref_seconds{};
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Per-channel token-sampler knobs, latched once off the OPTIONAL sampler
+  // iports 2 (audio codes) and 3 (free text).
+  //
+  // The TEXT channel falls back to the SamplerParams default (argmax), like
+  // every other LLM stage: vpipe GENERATES the text channel (it re-emits the
+  // transcript) and must follow it to reach audio_end, so sampling it
+  // over-generates.
+  //
+  // The AUDIO channel does NOT: MOSS degenerates into silent loops under
+  // greedy, so an unwired iport2 keeps the model's own recommended sampling
+  // (moss_audio_default_sampler(), set in the ctor; the realtime variant has
+  // its own recommendation and applies it at its call site). The audio
+  // spec's seed doubles as the voice seed -- it is the only RNG the
+  // delay-pattern generator takes.
+  genai::SamplerParams _audio_sp;
+  genai::SamplerParams _text_sp;
+  // _*_read: the port's one beat has been consumed (never re-read it, even
+  // if it was unusable). _audio_sp_set: a VALID spec was accepted, so
+  // _audio_sp is the operator's and not MOSS's default -- the realtime
+  // variant needs the distinction because its own fallback differs from the
+  // 8B/v1.5 one seeded in the ctor.
+  bool                 _audio_sp_read = false;
+  bool                 _audio_sp_set  = false;
+  bool                 _text_sp_read  = false;
   // Loaded lazily in initialize(); cleared on a load failure so the
   // stage stays inert (process() warns + emits nothing). Exactly one variant
   // is loaded per stage (chosen from config.json model_type): the 8B pair
@@ -212,6 +259,12 @@ private:
   // first beat's own generated codes. Empty => no reference (plain TTS).
   std::vector<std::vector<std::int32_t>>    _ref_codes;
   bool                                      _ref_set = false;
+
+  // Drop every loaded model + its streaming state. Called at the top of
+  // initialize() so a relaunch over a stopped-but-not-destroyed stage
+  // frees the previous run's weights BEFORE loading the next copy,
+  // instead of transiently holding both.
+  void release_models_();
 #endif
 
   // Bookkeeping for tests / logging.

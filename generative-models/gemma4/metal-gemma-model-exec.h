@@ -34,6 +34,13 @@ public:
   bool valid() const noexcept override { return _model != nullptr; }
   bool owns_kv() const noexcept override { return true; }
 
+  // This exec keeps its own paged KV; report what it has grown to.
+  std::size_t kv_bytes() const override
+  {
+    auto* cm = _model ? _model->context_manager() : nullptr;
+    return cm != nullptr ? cm->resident_bytes() : 0;
+  }
+
   std::int32_t
   prefill(ContextId ctx, std::span<const std::int32_t> tokens) override;
 

@@ -4,6 +4,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
@@ -84,24 +85,34 @@ to_elt_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   return out;
 }
 
+// Namespace for this class's derived-tensor cache keys. A WeightSet is
+// shared by everything reading one checkpoint, so a key has to say which
+// class's transform produced the bytes, not just which tensor.
+constexpr const char* kKey = "qwen-image-dit/";
+
 }  // namespace
 
 MetalQwenImageTransformer::~MetalQwenImageTransformer() = default;
 
+// bf16 view of a checkpoint tensor. Cached ones go through the weight
+// set so a second model over this checkpoint shares them; streamed ones
+// are rebuilt per forward and retained by nobody.
 SharedBuffer
-MetalQwenImageTransformer::to_elt_(const MetalLlamaWeights& wts,
-                                   const std::string& name)
+MetalQwenImageTransformer::to_elt_(WeightSet& ws, const std::string& name,
+                                   Retain r)
 {
-  return vpipe::genai::to_elt_(wts, _mc, name);
+  auto build = [&]() { return vpipe::genai::to_elt_(ws.src(), _mc, name); };
+  if (r == Retain::Streamed) { return ws.stream_derived(build); }
+  return ws.derived(std::string(kKey) + "elt|" + name, build);
 }
 
 bool
-MetalQwenImageTransformer::load_linear_(const MetalLlamaWeights& wts,
+MetalQwenImageTransformer::load_linear_(WeightSet& ws,
                                         const std::string& pre, SharedBuffer& w,
-                                        SharedBuffer& b)
+                                        SharedBuffer& b, Retain r)
 {
-  w = to_elt_(wts, pre + ".weight");
-  b = to_elt_(wts, pre + ".bias");
+  w = to_elt_(ws, pre + ".weight", r);
+  b = to_elt_(ws, pre + ".bias", r);
   return !w.empty() && !b.empty();
 }
 
@@ -112,10 +123,11 @@ MetalQwenImageTransformer::load_linear_(const MetalLlamaWeights& wts,
 // so a mixed-precision checkpoint (w4/w8 per layer) loads correctly. Otherwise
 // `<name>.weight` is a dense bf16 matrix.
 MetalQwenImageTransformer::QWeight
-MetalQwenImageTransformer::load_qw_(const MetalLlamaWeights& wts,
-                                    const std::string& name)
+MetalQwenImageTransformer::load_qw_(WeightSet& ws, const std::string& name,
+                                    Retain r)
 {
   QWeight qw;
+  const MetalLlamaWeights& wts = ws.src();
   const auto* si = wts.info(name + ".scales");
   const auto* ci = wts.info(name + ".weight");
   if (_quant_bits > 0 && si != nullptr && ci != nullptr &&
@@ -125,59 +137,68 @@ MetalQwenImageTransformer::load_qw_(const MetalLlamaWeights& wts,
     const long K = scols * (long)_quant_group;
     const int bits = K > 0 ? (int)(gcols * 32 / K) : 0;
     qw.bits   = (bits == 8) ? 8 : 4;
-    qw.codes  = wts.load(name + ".weight", _mc);     // raw U32 codes
-    qw.scales = to_elt_(wts, name + ".scales");      // F16 -> bf16
-    qw.qbias  = to_elt_(wts, name + ".biases");
+    // Codes stay OWNED copies (as before this class went through the
+    // set) -- switching them to mapped views is a residency change, not
+    // a refactor, and belongs in its own measured step.
+    qw.codes = r == Retain::Streamed
+                   ? ws.stream_tensor(name + ".weight", _mc,
+                                      WeightSet::Residency::Copied)
+                   : ws.tensor(name + ".weight", _mc,
+                               WeightSet::Residency::Copied);
+    qw.scales = to_elt_(ws, name + ".scales", r);    // F16 -> bf16
+    qw.qbias  = to_elt_(ws, name + ".biases", r);
     if (!qw.codes.empty() && !qw.scales.empty() && !qw.qbias.empty()) {
       qw.quantized = true;
       return qw;
     }
     qw.codes = {}; qw.scales = {}; qw.qbias = {};
   }
-  qw.w = to_elt_(wts, name + ".weight");             // dense bf16
+  qw.w = to_elt_(ws, name + ".weight", r);           // dense bf16
   return qw;
 }
 
 bool
-MetalQwenImageTransformer::load_linear_q_(const MetalLlamaWeights& wts,
+MetalQwenImageTransformer::load_linear_q_(WeightSet& ws,
                                           const std::string& pre, QWeight& qw,
-                                          SharedBuffer& b)
+                                          SharedBuffer& b, Retain r)
 {
-  qw = load_qw_(wts, pre);
-  b = to_elt_(wts, pre + ".bias");
+  qw = load_qw_(ws, pre, r);
+  b = to_elt_(ws, pre + ".bias", r);
   return !qw.empty() && !b.empty();
 }
 
 bool
-MetalQwenImageTransformer::load_block_(const MetalLlamaWeights& wts, int L,
-                                       Block& b)
+MetalQwenImageTransformer::load_block_(WeightSet& ws, int L,
+                                       Block& b, Retain r)
 {
   const std::string p = "transformer_blocks." + std::to_string(L) + ".";
   bool ok = true;
   // AdaLN modulation: dense bf16 by default, or affine-quantized when the
   // checkpoint was built with model-quantize quant_modulation (load_linear_q_
   // auto-detects via the presence of *_mod.1.scales).
-  ok = ok && load_linear_q_(wts, p + "img_mod.1", b.img_mod_w, b.img_mod_b);
-  ok = ok && load_linear_q_(wts, p + "txt_mod.1", b.txt_mod_w, b.txt_mod_b);
-  ok = ok && load_linear_q_(wts, p + "attn.to_q", b.qw, b.qb);
-  ok = ok && load_linear_q_(wts, p + "attn.to_k", b.kw, b.kb);
-  ok = ok && load_linear_q_(wts, p + "attn.to_v", b.vw, b.vb);
-  ok = ok && load_linear_q_(wts, p + "attn.to_out.0", b.ow, b.ob);
-  ok = ok && load_linear_q_(wts, p + "attn.add_q_proj", b.aqw, b.aqb);
-  ok = ok && load_linear_q_(wts, p + "attn.add_k_proj", b.akw, b.akb);
-  ok = ok && load_linear_q_(wts, p + "attn.add_v_proj", b.avw, b.avb);
-  ok = ok && load_linear_q_(wts, p + "attn.to_add_out", b.aow, b.aob);
-  b.nq  = to_elt_(wts, p + "attn.norm_q.weight");
-  b.nk  = to_elt_(wts, p + "attn.norm_k.weight");
-  b.naq = to_elt_(wts, p + "attn.norm_added_q.weight");
-  b.nak = to_elt_(wts, p + "attn.norm_added_k.weight");
+  ok = ok && load_linear_q_(ws, p + "img_mod.1", b.img_mod_w, b.img_mod_b, r);
+  ok = ok && load_linear_q_(ws, p + "txt_mod.1", b.txt_mod_w, b.txt_mod_b, r);
+  ok = ok && load_linear_q_(ws, p + "attn.to_q", b.qw, b.qb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.to_k", b.kw, b.kb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.to_v", b.vw, b.vb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.to_out.0", b.ow, b.ob, r);
+  ok = ok && load_linear_q_(ws, p + "attn.add_q_proj", b.aqw, b.aqb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.add_k_proj", b.akw, b.akb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.add_v_proj", b.avw, b.avb, r);
+  ok = ok && load_linear_q_(ws, p + "attn.to_add_out", b.aow, b.aob, r);
+  b.nq  = to_elt_(ws, p + "attn.norm_q.weight", r);
+  b.nk  = to_elt_(ws, p + "attn.norm_k.weight", r);
+  b.naq = to_elt_(ws, p + "attn.norm_added_q.weight", r);
+  b.nak = to_elt_(ws, p + "attn.norm_added_k.weight", r);
   ok = ok && !b.nq.empty() && !b.nk.empty() && !b.naq.empty() && !b.nak.empty();
-  ok = ok && load_linear_q_(wts, p + "img_mlp.net.0.proj", b.img_fc1_w,
-                            b.img_fc1_b);
-  ok = ok && load_linear_q_(wts, p + "img_mlp.net.2", b.img_fc2_w, b.img_fc2_b);
-  ok = ok && load_linear_q_(wts, p + "txt_mlp.net.0.proj", b.txt_fc1_w,
-                            b.txt_fc1_b);
-  ok = ok && load_linear_q_(wts, p + "txt_mlp.net.2", b.txt_fc2_w, b.txt_fc2_b);
+  ok = ok && load_linear_q_(ws, p + "img_mlp.net.0.proj", b.img_fc1_w,
+                            b.img_fc1_b, r);
+  ok = ok && load_linear_q_(ws, p + "img_mlp.net.2", b.img_fc2_w,
+                            b.img_fc2_b, r);
+  ok = ok && load_linear_q_(ws, p + "txt_mlp.net.0.proj", b.txt_fc1_w,
+                            b.txt_fc1_b, r);
+  ok = ok && load_linear_q_(ws, p + "txt_mlp.net.2", b.txt_fc2_w,
+                            b.txt_fc2_b, r);
   return ok;
 }
 
@@ -186,13 +207,26 @@ MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
                                 const Config& cfg, bool stream_blocks,
                                 double pin_frac)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
+              pin_frac);
+}
+
+std::unique_ptr<MetalQwenImageTransformer>
+MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
+                                MetalCompute* mc, const Config& cfg,
+                                bool stream_blocks, double pin_frac)
+{
+  if (mc == nullptr || !ws_in) { return nullptr; }
+  const std::string model_dir = ws_in->dir();
 
   auto m = std::unique_ptr<MetalQwenImageTransformer>(
       new MetalQwenImageTransformer());
+  m->_ws = std::move(ws_in);
+  WeightSet& ws = *m->_ws;
+  // Everything loaded from here to the end of load() is RETAINED for the
+  // model's life. The streamed blocks are read in forward(), and there
+  // only.
+  const Retain r = Retain::Cached;
   m->_mc = mc;
   m->_cfg = cfg;
   m->_stream_blocks = stream_blocks;
@@ -255,6 +289,14 @@ MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
   }
   m->_fn_adaln     = m->_lib_elt.function("adaln_modulate_f16");
   m->_fn_gated     = m->_lib_elt.function("gated_residual_f16");
+  // vec4 twins: same arithmetic per element (bit-identical), 3-4x throughput --
+  // one element per thread leaves these at ~37-54 GB/s where the same bytes
+  // through a vec4 2-D grid run at 143-181. Serves Qwen-Image-Edit AND
+  // Mage-Flow (same class, different Config). VPIPE_NO_ELT_V4 reverts.
+  if (std::getenv("VPIPE_NO_ELT_V4") == nullptr) {
+    m->_fn_adaln4 = m->_lib_elt.function("adaln_modulate_v4_f16");
+    m->_fn_gated4 = m->_lib_elt.function("gated_residual_v4_f16");
+  }
   m->_fn_colabsmax = m->_lib_elt.function("col_absmax_f16");
   if (!m->_fn_gemm.valid() || !m->_fn_gemm_bias.valid() || !m->_fn_rms.valid() ||
       !m->_fn_layernorm.valid() || !m->_fn_silu.valid() || !m->_fn_gelu.valid() ||
@@ -370,32 +412,32 @@ MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
   }
 
   // Top-level weights.
-  bool ok = m->load_linear_(wts, "img_in", m->_img_in_w, m->_img_in_b);
-  m->_txt_norm_w = m->to_elt_(wts, "txt_norm.weight");
+  bool ok = m->load_linear_(ws, "img_in", m->_img_in_w, m->_img_in_b, r);
+  m->_txt_norm_w = m->to_elt_(ws, "txt_norm.weight", r);
   ok = ok && !m->_txt_norm_w.empty();
-  ok = ok && m->load_linear_(wts, "txt_in", m->_txt_in_w, m->_txt_in_b);
+  ok = ok && m->load_linear_(ws, "txt_in", m->_txt_in_w, m->_txt_in_b, r);
   ok = ok && m->load_linear_(
-      wts, "time_text_embed.timestep_embedder.linear_1", m->_t1_w, m->_t1_b);
+      ws, "time_text_embed.timestep_embedder.linear_1", m->_t1_w,
+      m->_t1_b, r);
   ok = ok && m->load_linear_(
-      wts, "time_text_embed.timestep_embedder.linear_2", m->_t2_w, m->_t2_b);
-  ok = ok && m->load_linear_(wts, "norm_out.linear", m->_normout_w,
-                             m->_normout_b);
-  ok = ok && m->load_linear_(wts, "proj_out", m->_projout_w, m->_projout_b);
+      ws, "time_text_embed.timestep_embedder.linear_2", m->_t2_w,
+      m->_t2_b, r);
+  ok = ok && m->load_linear_(ws, "norm_out.linear", m->_normout_w,
+                             m->_normout_b, r);
+  ok = ok && m->load_linear_(ws, "proj_out", m->_projout_w, m->_projout_b, r);
   if (!ok) { return nullptr; }
 
   // Blocks: preload all 60 (default), or -- in streaming mode -- skip the
-  // preload and retain the source mmap so forward() loads/frees each block on
+  // preload so forward() reads/frees each block from the weight set on
   // demand (memory-bounded, for 16GB boxes).
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int L = 0; L < cfg.n_layers; ++L) {
-      if (!m->load_block_(wts, L, m->_blocks[(std::size_t)L])) {
+      if (!m->load_block_(ws, L, m->_blocks[(std::size_t)L], r)) {
         return nullptr;
       }
     }
   } else {
-    m->_stream_wts =
-        std::make_unique<MetalLlamaWeights>(std::move(*wtsopt));
     // Pinned-prefix: pin as many LEADING blocks as fit in pin_frac of RAM;
     // forward() reuses them and streams only the tail (blocks >= _pinned).
     if (pin_frac > 0.0) {
@@ -404,11 +446,11 @@ MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
         prefixes[(std::size_t)L] =
             "transformer_blocks." + std::to_string(L) + ".";
       }
-      m->_pinned = stream_pin_count(*m->_stream_wts, prefixes, pin_frac);
+      m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
       if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
       m->_blocks.resize((std::size_t)m->_pinned);
       for (int L = 0; L < m->_pinned; ++L) {
-        if (!m->load_block_(*m->_stream_wts, L, m->_blocks[(std::size_t)L])) {
+        if (!m->load_block_(ws, L, m->_blocks[(std::size_t)L], r)) {
           return nullptr;
         }
       }
@@ -967,10 +1009,28 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     };
     // out[ye..] = (1 + mod[scale_e..]) * x[xe..] + mod[shift_e..], broadcasting
     // the single-row mod over `total`/H token rows.
+    // vec4 eligibility for the twins below: they load/store 8 bytes at a time
+    // off each bound base, so every element offset must be 4-aligned (an
+    // unaligned vec4 access is undefined, not just slow) and `total` must be a
+    // whole number of H-wide rows for the 2-D grid to cover it.
+    auto elt4_ok = [&](int total, std::initializer_list<std::size_t> offs) {
+      if ((H % 4) != 0 || H <= 0 || (total % H) != 0) { return false; }
+      for (std::size_t o : offs) { if ((o % 4) != 0) { return false; } }
+      return true;
+    };
     auto adaln = [&](const SharedBuffer& x, std::size_t xe,
                      const SharedBuffer& mod, std::size_t scale_e,
                      std::size_t shift_e, const SharedBuffer& out,
                      std::size_t ye, int total) {
+      if (_fn_adaln4.valid() && elt4_ok(total, {xe, scale_e, shift_e, ye})) {
+        enc.set_function(_fn_adaln4);
+        enc.set_buffer(0, x, xe * 2); enc.set_buffer(1, mod, scale_e * 2);
+        enc.set_buffer(2, mod, shift_e * 2); enc.set_buffer(3, out, ye * 2);
+        enc.set_constant(4, H / 4); enc.set_constant(5, total / H);
+        enc.dispatch({(unsigned)(H / 4), (unsigned)(total / H), 1},
+                     {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_adaln);
       enc.set_buffer(0, x, xe * 2); enc.set_buffer(1, mod, scale_e * 2);
       enc.set_buffer(2, mod, shift_e * 2); enc.set_buffer(3, out, ye * 2);
@@ -982,6 +1042,15 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     auto gated = [&](const SharedBuffer& h, std::size_t he,
                      const SharedBuffer& mod, std::size_t gate_e,
                      const SharedBuffer& sub, std::size_t se, int total) {
+      if (_fn_gated4.valid() && elt4_ok(total, {he, gate_e, se})) {
+        enc.set_function(_fn_gated4);
+        enc.set_buffer(0, h, he * 2); enc.set_buffer(1, mod, gate_e * 2);
+        enc.set_buffer(2, sub, se * 2);
+        enc.set_constant(3, H / 4); enc.set_constant(4, total / H);
+        enc.dispatch({(unsigned)(H / 4), (unsigned)(total / H), 1},
+                     {256, 1, 1});
+        return;
+      }
       enc.set_function(_fn_gated);
       enc.set_buffer(0, h, he * 2); enc.set_buffer(1, mod, gate_e * 2);
       enc.set_buffer(2, sub, se * 2);
@@ -1099,7 +1168,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       const bool streaming = _stream_blocks && L >= _pinned;
       Block streamed;
       if (streaming) {
-        if (!load_block_(*_stream_wts, L, streamed)) { return {}; }
+        if (!load_block_(*_ws, L, streamed, Retain::Streamed)) { return {}; }
       }
       const Block& b = streaming ? streamed : _blocks[(std::size_t)L];
       // Modulation params: mod = mod_linear(silu(temb)) [6H]. Precomputed slice

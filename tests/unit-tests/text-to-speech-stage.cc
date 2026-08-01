@@ -56,6 +56,15 @@ basic_cfg_()
   return cfg;
 }
 
+// A stand-in upstream vertex: the ctor-time iport checks only look at whether
+// a slot holds a non-null Vertex*, so this is never launched or read.
+class DummyUpstream : public TypedStage<DummyUpstream> {
+public:
+  static constexpr const char* kTypeName = "ut-tts-dummy-upstream";
+  using TypedStage::TypedStage;
+  Job process(RuntimeContext& ctx) override { ctx.signal_done(); co_return; }
+};
+
 }  // namespace
 
 TEST(text_to_speech_stage, config_defaults) {
@@ -127,18 +136,22 @@ TEST(text_to_speech_stage, type_is_registered) {
               == "text-to-speech");
 }
 
-// The StageSpec declares a text iport, an optional PCM reference iport, and
-// one PCM oport.
+// The StageSpec declares a text iport, an optional PCM reference iport, the
+// two optional sampler iports, and one PCM oport.
 TEST(text_to_speech_stage, spec_ports) {
   Session sess;
   CerrSilencer hush;
   TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, basic_cfg_());
   const StageSpec& sp = s.spec();
-  EXPECT_TRUE(sp.iports.size() == 2u);
+  EXPECT_TRUE(sp.iports.size() == 4u);
   EXPECT_TRUE(sp.oports.size() == 1u);
-  if (sp.iports.size() == 2u) {
+  if (sp.iports.size() == 4u) {
     EXPECT_TRUE(sp.iports[0].name == "text");
     EXPECT_TRUE(sp.iports[1].name == "audio-ref");
+    // The two sampler ports come AFTER audio-ref: appending keeps every
+    // existing graph's port indices (and the iport1 encoder check) valid.
+    EXPECT_TRUE(sp.iports[2].name == "audio-sampler");
+    EXPECT_TRUE(sp.iports[3].name == "text-sampler");
     // audio-ref is its own clock domain (sticky, arrives independently of the
     // text stream + PCM output, which share group 0).
     EXPECT_TRUE(sp.iports[0].clock_group == sp.oports[0].clock_group);
@@ -146,6 +159,44 @@ TEST(text_to_speech_stage, spec_ports) {
   }
   if (sp.oports.size() == 1u) {
     EXPECT_TRUE(sp.oports[0].name == "pcm");
+  }
+}
+
+// The codec's encode path is gated on the PCM-reference SLOT (iport1), not on
+// the iport COUNT -- the sampler iports 2/3 sit after it, so a graph that
+// wires only a sampler must not pay for the encoder (~2x the codec's resident
+// weights). Counting would silently turn it on.
+TEST(text_to_speech_stage, encoder_gated_on_the_audio_ref_slot) {
+  Session sess;
+  CerrSilencer hush;
+  DummyUpstream up(&sess, "up", vector<InEdge>{}, FlexData::make_object());
+  // Nothing wired.
+  {
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, basic_cfg_());
+    EXPECT_FALSE(s.with_encoder());
+  }
+  // Text only.
+  {
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{InEdge{&up, 0}},
+                        basic_cfg_());
+    EXPECT_FALSE(s.with_encoder());
+  }
+  // Text + an UNWIRED audio-ref hole + a wired sampler at iport2: the port
+  // COUNT is 3, but no reference audio can arrive -- encoder stays off. A
+  // count-based check would wrongly turn it on here.
+  {
+    TextToSpeechStage s(&sess, "tts",
+                        vector<InEdge>{InEdge{&up, 0}, InEdge{nullptr, 0},
+                                       InEdge{&up, 0}},
+                        basic_cfg_());
+    EXPECT_FALSE(s.with_encoder());
+  }
+  // A genuinely wired audio-ref turns it on.
+  {
+    TextToSpeechStage s(&sess, "tts",
+                        vector<InEdge>{InEdge{&up, 0}, InEdge{&up, 0}},
+                        basic_cfg_());
+    EXPECT_TRUE(s.with_encoder());
   }
 }
 

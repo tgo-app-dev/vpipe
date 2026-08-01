@@ -3,6 +3,7 @@
 #include "common/vpipe-format.h"
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <iostream>
@@ -157,6 +158,48 @@ void
 StdioUiDelegate::info(const VpipeFormat& f)
 {
   emit_("INFO", /*to_err=*/false, f);
+}
+
+void
+StdioUiDelegate::note_sigint() noexcept
+{
+  _sigint_count.fetch_add(1, memory_order_relaxed);
+}
+
+bool
+StdioUiDelegate::poll_sigint()
+{
+  const unsigned n = _sigint_count.load(memory_order_relaxed);
+  if (n == _sigint_seen) {
+    return false;
+  }
+  const auto now = chrono::steady_clock::now();
+  // A double tap is either two strokes since the last poll (the user
+  // hit Ctrl-C twice inside one poll interval) or a fresh stroke
+  // arriving while the previous one is still armed.
+  const bool burst = (n - _sigint_seen) >= 2;
+  const bool armed_recently =
+      _sigint_armed
+      && (now - _sigint_at) < chrono::milliseconds(kDoubleTapMs);
+  _sigint_seen = n;
+  _sigint_at   = now;
+  if (burst || armed_recently) {
+    _sigint_armed = false;
+    return true;
+  }
+  // First stroke: hand it to the stages. If nobody had anything to
+  // interrupt, fall through to the historical meaning of a lone SIGINT
+  // so the process still stops on one keystroke.
+  const int acted = dispatch_interrupt();
+  if (acted <= 0) {
+    _sigint_armed = false;
+    return true;
+  }
+  _sigint_armed = true;
+  info(fmt("interrupted {} running task(s). Press Ctrl-C again within "
+           "{:.1f}s to stop the pipelines and quit.",
+           acted, kDoubleTapMs / 1000.0));
+  return false;
 }
 
 UiInputStatus

@@ -52,6 +52,7 @@ public:
   ~SaveVideoStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 
@@ -86,6 +87,13 @@ private:
   void encode_and_mux_(unsigned port, AVFrame* frame);
   void drain_encoder_(AVCodecContext* enc, AVStream* st);
   void finalize_();
+  // Free the muxer/encoder objects (finalizing first if needed).
+  // Shared by the destructor and the per-launch reset.
+  void release_media_();
+  // NOTE _enc_pkt below is deliberately NOT released there: it is a
+  // ctor-allocated scratch packet reused by every run (an owned
+  // resource, not per-run state), and process() dereferences it without
+  // a null check. Freeing it per launch segfaults on the next drain.
   std::string av_err_(int rc) const;
 
   // Config attributes. Flat-key defaults live in kSpec.attrs (read via
@@ -124,6 +132,11 @@ private:
   AVCodecContext*  _aenc            = nullptr;
   AVPacket*        _enc_pkt         = nullptr;
 
+  // Everything below is PER-RUN muxer state, cleared by
+  // reset_run_state(). It matters more here than elsewhere: after
+  // drain() finalizes the file, _video_eos/_audio_eos stay true, so a
+  // relaunch's process() sees itself as already done and writes NOTHING
+  // -- no file at all, silently.
   bool _video_initialized = false;
   bool _audio_initialized = false;
   bool _video_eos         = false;

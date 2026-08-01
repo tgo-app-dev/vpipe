@@ -89,7 +89,8 @@ TEST(load_image_stage, config_url_string) {
   LoadImageStage s(&sess, "li", vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.urls().size() == 1);
   EXPECT_TRUE(s.urls()[0] == "/tmp/x.png");
-  EXPECT_TRUE(s.num_oports() == 1);
+  // oport0 image, oport1 the metadata that rides with it.
+  EXPECT_TRUE(s.num_oports() == 2);
 }
 
 TEST(load_image_stage, config_url_array) {

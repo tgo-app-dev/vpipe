@@ -37,6 +37,8 @@ namespace vpipe { class SessionContextIntf; }
 
 namespace vpipe::genai {
 
+class WeightSet;       // generative-models/weight-set.h
+
 // Per-channel sampling controls for MOSS-TTS delay-pattern content choices
 // (the audio codebooks and the free text token). temperature <= 0 => greedy
 // argmax; top_k <= 0 / top_p >= 1 => that cap off; repetition_penalty 1.0 =>
@@ -73,6 +75,13 @@ public:
   // the bf16 embedding tables + output heads. Returns nullptr on failure.
   static std::unique_ptr<MetalMossTtsModel> load(
       const std::string& model_dir, metal_compute::MetalCompute* mc);
+
+  // Preferred: the backbone and the embedding/head tables come from ONE
+  // checkpoint, which this used to open twice over.
+  //
+  // The returned model KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalMossTtsModel> load(
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc);
 
   bool valid() const { return _backbone != nullptr; }
   const Config& config() const { return _cfg; }
@@ -172,6 +181,8 @@ private:
   metal_compute::ComputeLibrary  _lib_dense;
   metal_compute::ComputeFunction _fn_dense_gemv;
   metal_compute::SharedBuffer    _logits_buf;   // bf16 [vocab + n_vq*(Ac+1)]
+  // The checkpoint, held for this model's whole life.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

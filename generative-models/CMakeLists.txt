@@ -12,6 +12,8 @@ set(LOCAL_SOURCES
   chat-template.cc
   context-manager.cc
   generative-model-manager.cc
+  weight-registry.cc
+  weight-set.cc
   loaded-language-model.cc
   metal-token-muxer.cc
   model-exec-registry.cc
@@ -60,9 +62,13 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen25-vision.cc
   mage/metal-mage-vae.cc
   mage/mage-watermark.cc
+  mage/mage-screen.cc
+  mage/mage-screen-policy.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc
+  boogu/metal-boogu-transformer.cc
+  boogu/metal-boogu-calibration.cc
   lora-fusion.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
@@ -76,6 +82,8 @@ set(LOCAL_HEADERS
   chat-template.h
   context-manager.h
   generative-model-manager.h
+  weight-registry.h
+  weight-set.h
   loaded-language-model.h
   metal-token-muxer.h
   model-exec.h
@@ -114,6 +122,12 @@ set(LOCAL_HEADERS
   moss/metal-moss-v15-model.h
   moss/moss-rt-processor.h
   moss/metal-moss-rt-model.h
+  boogu/metal-boogu-transformer.h
+  boogu/metal-boogu-calibration.h
+  mage/metal-mage-vae.h
+  mage/metal-mage-flow-transformer.h
+  mage/mage-watermark.h
+  mage/mage-screen.h
   quantize/affine-quantizer.h
   quantize/arch-detect.h
   quantize/calibration.h

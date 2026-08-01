@@ -6,6 +6,7 @@ set(VPIPE_WEBUI_SOURCES
     web-ui-log-delegate.cc
     db-browser.cc
     model-browser.cc
+    qr-code.cc
     system-status.cc
     startup-checks.cc
 )

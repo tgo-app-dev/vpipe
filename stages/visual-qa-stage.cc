@@ -6,7 +6,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
-
+#include "stages/sampler-spec.h"
 
 // No-MLX metal path: MLX-free headers driving image-VQA on the
 // metal-compute backend (chat-template / loaded-language-model / sampler /
@@ -107,20 +107,17 @@ VisualQaStage::VisualQaStage(const SessionContextIntf* s,
         "non-empty post_image_prompt", this->id()));
   }
 
-  // Tri-state / composite attributes (disable_thinking, sampler, the
-  // video sub-object, and the string-or-array questions) have no flat
-  // ConfigKey form and are read from the config directly.
+  // Tri-state / composite attributes (disable_thinking, the video
+  // sub-object, and the string-or-array questions) have no flat ConfigKey
+  // form and are read from the config directly. Sampling is NOT config: it
+  // is programmed by a `sampler-select` stage on the optional sampler iport
+  // (unwired => _sampler_params stays greedy).
   const FlexData& cfg = this->config();
   if (cfg.is_object()) {
     auto root = cfg.as_object();
     if (root.contains("disable_thinking")) {
       _disable_thinking = root.at("disable_thinking").as_bool(false);
     }
-#ifdef VPIPE_BUILD_APPLE_SILICON
-    if (root.contains("sampler")) {
-      _sampler_params = genai::parse_sampler_config(root.at("sampler"));
-    }
-#endif
 
     if (root.contains("video")) {
       FlexData v = root.at("video");
@@ -231,8 +228,6 @@ constexpr ConfigKey kAttrs[] = {
    .def_bool = false},
   {.key = "disable_thinking", .type = ConfigType::Bool,
    .doc = "override chat-template thinking default", .def_bool = false},
-  {.key = "sampler", .type = ConfigType::Object,
-   .doc = "decode sampler knobs (temperature/top_k/top_p/...)"},
   {.key = "video", .type = ConfigType::Object,
    .doc = "video mode: { enabled:bool, fps:real }"},
   {.key = "questions", .type = ConfigType::Any, .required = true,
@@ -242,6 +237,11 @@ const PortSpec kIports[] = {
   {.name = "images", .doc = "RGB TensorBeat [3,H,W]; num_images per Q&A "
                             "round (or frames in video mode)",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select). Latched "
+          "on the first round and reused for every later one; unwired = "
+          "greedy (argmax) decoding",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "visual-qa",
@@ -263,6 +263,13 @@ VisualQaStage::spec() const noexcept
 }
 
 VisualQaStage::~VisualQaStage() = default;
+
+std::vector<std::string>
+VisualQaStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+}
 
 Job
 VisualQaStage::initialize(RuntimeContext& ctx)
@@ -371,6 +378,18 @@ VisualQaStage::process(RuntimeContext& ctx)
   }
 
 #if   defined(VPIPE_BUILD_APPLE_SILICON)
+  // Latch the token-sampler spec off the OPTIONAL sampler iport, once: the
+  // `sampler-select` source emits a single beat at launch, which we cache and
+  // reuse for every later round. Read AFTER the image beat so a declared-but-
+  // unwired port never stalls the first round. Unwired => greedy.
+  if (!_sampler_latched && ctx.num_iports() >= 2 && ctx.iport_connected(1)) {
+    auto sb = co_await ctx.read(1);
+    _sampler_latched = true;   // beat consumed either way; never re-read
+    bool ok = false;
+    const genai::SamplerParams p = sampler_params_from_beat(
+        sb.get(), session(), "VisualQaStage('" + this->id() + "')", &ok);
+    if (ok) { _sampler_params = p; }
+  }
   if (!_lm) { co_return; }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(p.get());
   if (!tbp || tbp->shape.size() != 3 || tbp->shape[0] != 3

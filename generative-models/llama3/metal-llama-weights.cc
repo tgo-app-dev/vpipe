@@ -151,9 +151,16 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // it's harmless for the LM load (which never references vision_tower.*), and
   // the mmap is lazy (no pages faulted until a tensor is load()ed). No-op when
   // the sidecar is absent (every non-optiq checkpoint).
+  // Two sidecar layouts are in the wild: the older packs (Qwen3.5-4B/9B
+  // OptiQ) keep it at the model-dir ROOT, the newer ones (Qwen3.6-27B /
+  // 35B-A3B, gemma-4 12B/26B/31B OptiQ) moved it into an `optiq/` subdir
+  // alongside mtp.safetensors. Probe root first, then the subdir.
   auto map_vision_sidecar_ = [&](MetalLlamaWeights& w) {
-    const fs::path side = dir / "optiq_vision.safetensors";
-    if (fs::exists(side, ec)) { w.map_shard_(side.string()); }
+    const fs::path cands[] = {dir / "optiq_vision.safetensors",
+                              dir / "optiq" / "optiq_vision.safetensors"};
+    for (const fs::path& side : cands) {
+      if (fs::exists(side, ec)) { w.map_shard_(side.string()); break; }
+    }
   };
 
   // GGUF layout: a `.gguf` checkpoint. Parse it, derive the config, and
@@ -360,6 +367,12 @@ MetalLlamaWeights::tensor_names() const
   return names;
 }
 
+bool
+MetalLlamaWeights::is_gguf() const noexcept
+{
+  return _gguf != nullptr;
+}
+
 metal_compute::SharedBuffer
 MetalLlamaWeights::load(const std::string& name,
                         metal_compute::MetalCompute* mc) const
@@ -387,6 +400,35 @@ MetalLlamaWeights::load(const std::string& name,
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
   std::memcpy(buf.contents(), src, ti->nbytes);
   return buf;
+}
+
+bool
+MetalLlamaWeights::read_into(const std::string& name, void* dst,
+                             std::size_t cap) const
+{
+  const TensorInfo* ti = info(name);
+  if (ti == nullptr || dst == nullptr || cap < ti->nbytes) {
+    return false;
+  }
+  // GGUF tensors are CONVERTED, not copied, and the converter writes
+  // through its own destination -- which is `dst` here, so no staging
+  // buffer is needed after all.
+  if (ti->shard == -2) {
+    if (!_gguf) { return false; }
+    auto it = _gguf->specs.find(name);
+    return it != _gguf->specs.end()
+        && _gguf->conv->convert(it->second, static_cast<std::uint8_t*>(dst));
+  }
+  if (ti->shard < 0 ||
+      static_cast<std::size_t>(ti->shard) >= _shards.size()) {
+    return false;
+  }
+  const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
+  if (sh.base == nullptr) { return false; }
+  const auto* src =
+      static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
+  std::memcpy(dst, src, ti->nbytes);
+  return true;
 }
 
 metal_compute::SharedBuffer

@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,13 @@ namespace genai {
 // Total physical RAM in bytes, or 0 if unknown.
 inline std::size_t stream_physical_ram()
 {
+  // Same override as stages/model-memory.h's phys_ram(): the pinned-block
+  // budget has to agree with the stage-level stream/unload decision, so both
+  // read VPIPE_RAM_LIMIT_MB when it is set.
+  if (const char* e = std::getenv("VPIPE_RAM_LIMIT_MB")) {
+    const long long mb = std::atoll(e);
+    if (mb > 0) { return (std::size_t)mb << 20; }
+  }
   std::uint64_t mem = 0;
   std::size_t len = sizeof(mem);
   if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) != 0) { return 0; }

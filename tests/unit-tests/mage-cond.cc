@@ -79,6 +79,14 @@ bf16_to_f32_(std::uint16_t b)
   float f; std::memcpy(&f, &u, 4); return f;
 }
 
+// Decode one 2-byte element with the tower's own storage type.
+float
+dec_elt_(std::uint16_t b, bool bf16)
+{
+  if (bf16) { return bf16_to_f32_(b); }
+  _Float16 h; std::memcpy(&h, &b, 2); return (float)h;
+}
+
 double
 rel_l2_(const std::vector<float>& a, const std::vector<float>& b)
 {
@@ -251,65 +259,109 @@ TEST(mage_cond, t2i_matches_golden)
 // drop 64 == PROMPT_TEMPLATE["mage-flow-edit"]) with the reference's 144 vision
 // tokens spliced over the image_pad rows and the tower's deepstack features
 // injected at LM layers 0..2.
+//
+// TWO images, with deliberately different bounds -- see the per-case notes.
+// Both goldens are the REFERENCE's bf16 conditioning (bf16 is what the
+// Mage-Flow pipeline ships), and both source images are pre-sized to 384 so
+// NEITHER side resizes: vpipe caps with an area-average box filter and the
+// python harness with PIL, and feeding a 1024px source makes the two
+// preprocessors the dominant term (it inflated this number 0.13 -> 0.33 when
+// measured that way). Same-pixels-in is what makes the comparison about the
+// model instead of about two resamplers.
 TEST(mage_cond, edit_matches_golden)
 {
   const Env env = mage_cond_env_();
   if (env.root == nullptr) { return; }
-  const std::string ref = env.golden + "/ref.png";
-  if (!std::filesystem::exists(ref)) {
-    std::printf("[mage_cond] no %s; skipping\n", ref.c_str());
-    return;
-  }
   Session sess;
   if (sess.metal_compute() == nullptr) { return; }
 
-  const std::vector<float> g = read_f32_(env.golden + "/edit_txt.f32");
-  ASSERT_TRUE(!g.empty() && (g.size() % kEncHidden) == 0);
-  const int gn = (int)(g.size() / kEncHidden);
+  struct Case {
+    const char* tag;      // label in the log / dump filename
+    const char* image;    // 384px source, in the golden dir
+    const char* golden;   // the reference's bf16 conditioning for it
+    double      tol;
+    bool        required; // ref.png ships with every golden dump; ref2 may not
+    const char* note;
+  };
+  // ref.png is the LOOSE one ON PURPOSE. Its layer-16 MLP contains a feature
+  // that reads out the DIFFERENCE between two near-duplicate image patches
+  // (weight row 103: cos 0.73 to the difference direction, 0.02 to the shared
+  // one), so the two rows get gates of +59.7 / -53.4 and SiLU passes exactly
+  // one -- which then receives a ~140x activation. By layer 16 the reference's
+  // own bf16 trajectory perturbs those rows by more than the difference they
+  // encode (19.7 vs |d| 12.1), the readout inverts, and its massive activation
+  // moves to the other row. That is a property of the GOLDEN, not of vpipe:
+  // the reference's own bf16-vs-fp32 conditioning is 0.240 on this image while
+  // vpipe's is 0.179. Measured across four images, only this one does it.
+  // Scoring vpipe tightly against a golden that contains an arbitrary
+  // tie-break would be calibrating on the worst case.
+  //
+  // ref2 (a 384px dog photo) does NOT trip it -- its layer-16 activation stays
+  // on the same row in both dtypes -- so it is an ordinary bf16-vs-bf16
+  // comparison and carries a bound that can actually catch a regression.
+  //
+  // WHERE 0.15 COMES FROM: measured 0.104 on the default path, and across the
+  // legitimate kernel/dtype paths it ranges 0.077 (VPIPE_QWEN_VISION_NO_MMA2)
+  // to 0.104 (matmul2d; NO_NAX_ATTN is identical, that path is f16-only) with
+  // an f16 tower at 0.099. So ~35% spread before any machine change, and the
+  // bound sits ~44% above the worst of them -- it catches anything that
+  // DOUBLES the error while surviving M4-vs-M5 kernel differences. Do not
+  // tighten it below ~0.13 without re-measuring that spread on both boxes.
+  //
+  // Regenerate either golden with scratchpad/ref_multi.py (writes the
+  // reference's fp32 and bf16 conditioning for a list of images). Source
+  // images must already be <=384 on the long edge.
+  const Case cases[] = {
+    {"edit",  "/ref.png",  "/edit_txt.f32",  0.35, true,
+     "flip-prone: the golden itself carries a tie-break"},
+    {"edit2", "/ref2.png", "/edit2_txt.f32", 0.15, false,
+     "stable: the real regression gate"},
+  };
 
-  int n = 0;
-  const std::vector<float> v = run_conditioner_(
-      sess, env.root, "make the sky a vivid blue", ref, &n);
-  if (v.empty()) {
-    std::printf("[mage_cond] no edit conditioning emitted; skipping\n");
-    return;
+  for (const Case& c : cases) {
+    const std::string img = env.golden + c.image;
+    const std::string gld = env.golden + c.golden;
+    if (!std::filesystem::exists(img) || !std::filesystem::exists(gld)) {
+      if (c.required) {
+        std::printf("[mage_cond] no %s; skipping\n", img.c_str());
+      } else {
+        std::printf("[mage_cond] no %s (older golden dump); skipping that "
+                    "case\n", img.c_str());
+      }
+      continue;
+    }
+    const std::vector<float> g = read_f32_(gld);
+    ASSERT_TRUE(!g.empty() && (g.size() % kEncHidden) == 0);
+    const int gn = (int)(g.size() / kEncHidden);
+
+    int n = 0;
+    const std::vector<float> v = run_conditioner_(
+        sess, env.root, "make the sky a vivid blue", img, &n);
+    if (v.empty()) {
+      std::printf("[mage_cond] no edit conditioning emitted; skipping\n");
+      continue;
+    }
+    dump_(c.tag, v);
+    std::printf("[mage_cond] %s n_real=%d (golden %d)\n", c.tag, n, gn);
+    // A mismatch here means the vision grid differs (smart_resize bounds) or
+    // the template / drop index is wrong -- not a numerical issue.
+    ASSERT_TRUE(n == gn);
+    const double r = rel_l2_(v, g);
+    std::printf("[mage_cond] %s rel-L2 = %.6f  (bound %.2f, %s)\n",
+                c.tag, r, c.tol, c.note);
+    EXPECT_TRUE(r < c.tol);
   }
-  dump_("edit", v);
-  std::printf("[mage_cond] edit n_real=%d (golden %d)\n", n, gn);
-  // A mismatch here means the vision grid differs (smart_resize bounds) or the
-  // template / drop index is wrong -- not a numerical issue.
-  ASSERT_TRUE(n == gn);
-  const double r = rel_l2_(v, g);
-  std::printf("[mage_cond] edit rel-L2 = %.6f\n", r);
-  // MUCH looser than t2i (0.02), and deliberately so: this number measures
-  // the REFERENCE's tower noise, not vpipe's. The reference pipeline runs its
-  // Qwen3-VL tower in bf16; vpipe runs f16, which is ~3x CLOSER to an fp32
-  // oracle (0.0142 vs 0.0425 -- bf16 has 8 mantissa bits to f16's 11, and its
-  // range advantage buys nothing when the tower peaks at ~2238 against f16's
-  // 65504 ceiling). Driving the SAME reference bf16 LM from three different
-  // towers shows what that costs downstream:
-  //     fp32 oracle tower vs the reference bf16 tower  0.2429
-  //     vpipe f16 tower   vs the reference bf16 tower  0.2409
-  //     vpipe f16 tower   vs the fp32 oracle tower     0.0531
-  // A PERFECT tower would sit just as far from the reference as vpipe does,
-  // so this gap cannot be closed by making vpipe more accurate -- only by
-  // deliberately importing bf16 rounding noise. vpipe is the closer of the
-  // two to truth; do not "fix" this number.
-  // Measured with scratchpad/probe_cond_sensitivity.py + tower_dtype_probe.py
-  // + probe_tower_dtype_lm.py. vpipe's own share is small: feeding vpipe's
-  // tower into the REFERENCE LM gives 0.2409 (the whole gap), while vpipe's
-  // LM on the SAME tower input gives 0.0462. A few-percent perturbation of
-  // the image rows becomes ~24% after 36 bf16 layers, but the direction
-  // survives (median per-row cosine 0.998, ~80% of the squared error in 10 of
-  // the 144 image rows). The REAL gates are the token count above, t2i, and
-  // vision_tower_matches_golden below -- that last one is measured against an
-  // fp32 oracle, which is the comparison that can actually catch a defect.
-  EXPECT_TRUE(r < 0.35);
 }
 
 // The Qwen3-VL vision tower ALONE, against an fp32 oracle -- the split that
 // says whether an edit-conditioning mismatch lives in the tower or downstream
 // of it (splice / positions / deepstack / the 36 LM layers).
+//
+// Runs BOTH element types. f16 is the more ACCURATE tower; bf16 is what
+// Mage-Flow actually ships (the reference casts its whole text encoder, tower
+// included, so vpipe matches its numerics). Testing only f16 would leave the
+// shipped configuration unmeasured -- and a dtype bug in the bf16 twin does
+// NOT look like a crash, it looks like a slightly-off end-to-end number.
 TEST(mage_cond, vision_tower_matches_golden)
 {
   const Env env = mage_cond_env_();
@@ -329,12 +381,20 @@ TEST(mage_cond, vision_tower_matches_golden)
   genai::ModelLoader loader(&sess);
   const auto mcfg = loader.load_config(enc_dir);
   ASSERT_TRUE(mcfg.has_value());
+  // (dtype, embeddings tol, deepstack tol). bf16 carries 3 fewer mantissa
+  // bits than f16, so it is allowed ~4x the error against the SAME fp32
+  // oracle -- and nowhere near the O(1) a mis-typed buffer read produces.
+  struct Arm { bool bf16; double emb_tol; double ds_tol; };
+  for (const Arm& arm : {Arm{false, 0.02, 0.02}, Arm{true, 0.08, 0.08}}) {
   auto vcfg = genai::MetalQwenVisionEncoder::config_from(*mcfg);
   vcfg.weight_prefix = "model.visual.";
   vcfg.min_pixels = 65536;
   vcfg.max_pixels = 16777216;
+  vcfg.use_bf16 = arm.bf16;
   auto tower = genai::MetalQwenVisionEncoder::load(enc_dir, mc, vcfg);
   ASSERT_TRUE((bool)tower);
+  // The env A/B knobs would silently override the arm under test.
+  ASSERT_TRUE(tower->is_bf16() == arm.bf16);
 
   // Decode ref.png through the same load-image path the stage uses.
   std::vector<std::uint8_t> rgb;
@@ -373,25 +433,35 @@ TEST(mage_cond, vision_tower_matches_golden)
   ASSERT_TRUE((int)g.size() == r.n_tokens * kEncHidden);
   std::vector<float> v((std::size_t)r.n_tokens * kEncHidden);
   {
-    const auto* p = static_cast<const _Float16*>(r.embeddings.contents());
-    for (std::size_t i = 0; i < v.size(); ++i) { v[i] = (float)p[i]; }
+    // Read with the encoder's OWN element type: a bf16 tower's buffers are
+    // bf16 bits, and decoding them as f16 yields plausible-looking garbage
+    // (right magnitude, wrong values) rather than an obvious failure.
+    const auto* p = static_cast<const std::uint16_t*>(r.embeddings.contents());
+    const bool bf = tower->is_bf16();
+    for (std::size_t i = 0; i < v.size(); ++i) { v[i] = dec_elt_(p[i], bf); }
   }
   dump_("tower_emb", v);
   const double re = rel_l2_(v, g);
-  std::printf("[mage_cond] tower embeddings rel-L2 = %.6f\n", re);
-  EXPECT_TRUE(re < 0.02);
+  std::printf("[mage_cond] tower[%s] embeddings rel-L2 = %.6f\n",
+              arm.bf16 ? "bf16" : "f16", re);
+  EXPECT_TRUE(re < arm.emb_tol);
 
   for (std::size_t k = 0; k < r.deepstack.size(); ++k) {
     const std::vector<float> gd =
         read_f32_(env.golden + "/tower_ds" + std::to_string(k) + ".f32");
     if ((int)gd.size() != r.n_tokens * kEncHidden) { continue; }
     std::vector<float> vd((std::size_t)r.n_tokens * kEncHidden);
-    const auto* p = static_cast<const _Float16*>(r.deepstack[k].contents());
-    for (std::size_t i = 0; i < vd.size(); ++i) { vd[i] = (float)p[i]; }
+    const auto* p =
+        static_cast<const std::uint16_t*>(r.deepstack[k].contents());
+    for (std::size_t i = 0; i < vd.size(); ++i) {
+      vd[i] = dec_elt_(p[i], tower->is_bf16());
+    }
     dump_(("tower_ds" + std::to_string(k)).c_str(), vd);
     const double rd = rel_l2_(vd, gd);
-    std::printf("[mage_cond] tower deepstack[%d] rel-L2 = %.6f\n", (int)k, rd);
-    EXPECT_TRUE(rd < 0.05);
+    std::printf("[mage_cond] tower[%s] deepstack[%d] rel-L2 = %.6f\n",
+                arm.bf16 ? "bf16" : "f16", (int)k, rd);
+    EXPECT_TRUE(rd < arm.ds_tol);
+  }
   }
 }
 
@@ -654,6 +724,13 @@ TEST(mage_cond, lm_per_layer_edit_matches_golden)
     std::vector<float> v(per);
     for (std::size_t i = 0; i < per; ++i) {
       v[i] = bf16_to_f32_(tp[(std::size_t)l * per + i]);
+    }
+    {   // VPIPE_MAGE_COND_DUMP: vpipe's own per-layer states, so an external
+        // 3-way decomposition (vpipe / reference-on-vpipe's-tower /
+        // reference-on-its-own-tower) can be computed per layer.
+      char t[48];
+      std::snprintf(t, sizeof(t), "lm_edit_layer_%02d", l);
+      dump_(t, v);
     }
     const double r = rel_l2_(v, g);
     double dot = 0.0, na = 0.0, nbm = 0.0;

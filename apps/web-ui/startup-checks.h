@@ -52,6 +52,21 @@ int microphone_auth_status();
 // macOS: CoreAudio HAL device enumeration (startup-checks-mac.mm).
 int audio_input_device_count();
 
+// Camera authorization status -- the video twin of
+// microphone_auth_status(), same encoding:
+//    1  authorized
+//    0  denied / restricted
+//   -1  not-determined / unknown / unsupported platform
+// macOS: AVCaptureDevice authorizationStatusForMediaType:video
+// (apps/web-ui/startup-checks-mac.mm).
+int camera_auth_status();
+
+// Number of VIDEO capture devices present on the system (hardware
+// topology -- independent of camera permission). Returns the count
+// (>= 0), or -1 if it can't be determined / unsupported platform.
+// macOS: AVCaptureDeviceDiscoverySession (startup-checks-mac.mm).
+int video_input_device_count();
+
 }  // namespace vpipe::webui
 
 #endif

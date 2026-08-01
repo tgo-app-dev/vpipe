@@ -269,6 +269,251 @@ TEST(sdpa_mma, full_encoder_d64) {
   }
 }
 
+// sdpa_full_mma2_d{64,512} -- the matmul2d FULL flash attention, against a
+// DOUBLE-precision CPU oracle, in both element types and at two input SCALES.
+//
+// The scale sweep is the point. This kernel's consumers are the VAE mid-block
+// self-attention (D = 384/512) and the bf16 vision tower (D = 64), and unlike
+// every LM attention path its Q/K are raw conv/linear outputs -- not RMSNorm'd
+// projections -- so the QK^T dot can leave f16's range. It did: the kernel
+// accumulated QK in the element type, and Boogu's VAE decode came out at
+// rel-L2 2.23 against the simdgroup-matrix flash while staying finite (no NaN,
+// no crash) and while FLUX.2's VAE -- same kernel, same D=512 -- sat at 5e-4.
+// The `big` arm below has a POSITIVE-MEAN Q/K, which is what a VAE's smooth
+// latent actually produces: the dot is then ~D*s^2 rather than a random walk,
+// so it crosses 65504 and pins the range. A benign arm keeps the ordinary
+// numerics honest (the big arm's softmax is near-one-hot).
+TEST(sdpa_mma, full_mma2_matches_oracle_across_range) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  struct Lib { const char* name; bool bf16; double tol; };
+  const Lib libs[] = {{"sdpa_mma", false, 3e-3}, {"sdpa_mma_bf16", true, 2e-2}};
+  struct Case { int D; int H; int n; float s; bool mean; const char* tag; };
+  const Case cases[] = {
+    {384, 1, 40, 0.3f,  false, "benign"},
+    {512, 1, 40, 0.3f,  false, "benign"},
+    // s chosen so D*s^2*(mean^2) > 65504: the f16 accumulator overflows here.
+    {384, 1, 40, 19.0f, true,  "big"},
+    {512, 1, 40, 16.0f, true,  "big"},
+  };
+  auto enc16 = [](float v, bool bf16) -> std::uint16_t {
+    if (!bf16) { return f32_to_h(v); }
+    std::uint32_t u; std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto dec16 = [](std::uint16_t b, bool bf16) -> float {
+    if (!bf16) { return h_to_f32(b); }
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f; std::memcpy(&f, &u, 4); return f;
+  };
+
+  for (const Lib& L : libs) {
+    ComputeLibrary lib = mc->load_library(L.name);
+    for (const Case& c : cases) {
+      const std::string fname =
+          "sdpa_full_mma2_d" + std::to_string(c.D) + "_f16";
+      ComputeFunction fn = lib.function(fname);
+      if (!fn.valid()) {
+        std::printf("[full_mma2] %s/%s unavailable -- skipped\n", L.name,
+                    fname.c_str());
+        continue;
+      }
+      const std::size_t nel = (std::size_t)c.H * c.n * c.D;
+      std::vector<std::uint16_t> q(nel), k(nel), v(nel);
+      std::mt19937 rng(7 + c.D + (c.mean ? 1 : 0));
+      std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+      // Round-trip every input through the storage type so the oracle sees the
+      // SAME values the kernel does -- otherwise the encode error dominates.
+      std::vector<float> qf(nel), kf(nel), vf(nel);
+      for (std::size_t i = 0; i < nel; ++i) {
+        const float bias = c.mean ? 0.8f : 0.0f;
+        q[i] = enc16(c.s * (bias + 0.2f * u(rng)), L.bf16);
+        k[i] = enc16(c.s * (bias + 0.2f * u(rng)), L.bf16);
+        v[i] = enc16(0.5f * u(rng), L.bf16);
+        qf[i] = dec16(q[i], L.bf16);
+        kf[i] = dec16(k[i], L.bf16);
+        vf[i] = dec16(v[i], L.bf16);
+      }
+      SharedBuffer qb = mc->make_shared_buffer(nel * 2);
+      SharedBuffer kb = mc->make_shared_buffer(nel * 2);
+      SharedBuffer vb = mc->make_shared_buffer(nel * 2);
+      SharedBuffer ob = mc->make_shared_buffer(nel * 2);
+      if (qb.empty() || kb.empty() || vb.empty() || ob.empty()) { return; }
+      std::memcpy(qb.contents(), q.data(), nel * 2);
+      std::memcpy(kb.contents(), k.data(), nel * 2);
+      std::memcpy(vb.contents(), v.data(), nel * 2);
+      const float scale = 1.0f / std::sqrt((float)c.D);
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          e.set_function(fn);
+          e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+          e.set_buffer(3, ob);
+          e.set_constant(4, scale); e.set_constant(5, c.n);
+          e.set_constant(6, c.D); e.set_constant(7, c.H);
+          e.set_constant(8, c.H); e.set_constant(9, c.n);
+          e.set_constant(10, c.n);
+          e.dispatch({128, (unsigned)c.H, (unsigned)((c.n + 7) / 8)},
+                     {128, 1, 1}); }
+        st.commit().wait(); }
+
+      double num = 0.0, den = 0.0;
+      const auto* got = static_cast<const std::uint16_t*>(ob.contents());
+      std::vector<double> s((std::size_t)c.n);
+      for (int h = 0; h < c.H; ++h) {
+        const std::size_t hb = (std::size_t)h * c.n * c.D;
+        for (int i = 0; i < c.n; ++i) {
+          double m = -1e300;
+          for (int j = 0; j < c.n; ++j) {
+            double dot = 0.0;
+            for (int d = 0; d < c.D; ++d) {
+              dot += (double)qf[hb + (std::size_t)i * c.D + d] *
+                     (double)kf[hb + (std::size_t)j * c.D + d];
+            }
+            s[(std::size_t)j] = dot * (double)scale;
+            if (s[(std::size_t)j] > m) { m = s[(std::size_t)j]; }
+          }
+          double z = 0.0;
+          for (int j = 0; j < c.n; ++j) {
+            s[(std::size_t)j] = std::exp(s[(std::size_t)j] - m);
+            z += s[(std::size_t)j];
+          }
+          for (int d = 0; d < c.D; ++d) {
+            double acc = 0.0;
+            for (int j = 0; j < c.n; ++j) {
+              acc += s[(std::size_t)j] *
+                     (double)vf[hb + (std::size_t)j * c.D + d];
+            }
+            const double want = acc / z;
+            const double diff =
+                (double)dec16(got[hb + (std::size_t)i * c.D + d], L.bf16) - want;
+            num += diff * diff; den += want * want;
+          }
+        }
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[full_mma2] %-14s D=%3d n=%d %-6s (|q|~%.0f) rel-L2 = "
+                  "%.4e\n", L.name, c.D, c.n, c.tag, (double)c.s, rel);
+      EXPECT_TRUE(std::isfinite(rel) && rel < L.tol);
+    }
+  }
+}
+
+// sdpa_full_mma2_d64 -- the ViT twin of the above, and a DIFFERENT kernel
+// despite the shared name prefix: [n, Hq*D] INTERLEAVED layout (no q/k/v/o
+// transposes), BQ=32, one extra constant (q_offset at 10, kv_stride at 11), and
+// the caller pads q/k/v by BQ rows because the last K/V block is matmul-read
+// before it is masked. It carries the bf16 vision tower's attention (Mage-Flow
+// and Boogu cast their whole text encoder, and the steel/NAX flash kernels are
+// f16-only, so this is the DEFAULT there) and is opt-in in f16.
+TEST(sdpa_mma, full_mma2_d64_vit_matches_oracle) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  struct Lib { const char* name; bool bf16; double tol; };
+  const Lib libs[] = {{"sdpa_mma", false, 3e-3}, {"sdpa_mma_bf16", true, 2e-2}};
+  auto enc16 = [](float v, bool bf16) -> std::uint16_t {
+    if (!bf16) { return f32_to_h(v); }
+    std::uint32_t u; std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto dec16 = [](std::uint16_t b, bool bf16) -> float {
+    if (!bf16) { return h_to_f32(b); }
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f; std::memcpy(&f, &u, 4); return f;
+  };
+  const int D = 64, Hq = 4, n = 70;          // n deliberately not a BQ multiple
+  const int rs = Hq * D, npad = n + 32;
+  const float scale = 1.0f / std::sqrt((float)D);
+
+  for (const Lib& L : libs) {
+    ComputeLibrary lib = mc->load_library(L.name);
+    ComputeFunction fn = lib.function("sdpa_full_mma2_d64_f16");
+    if (!fn.valid()) {
+      std::printf("[full_mma2_d64] %s unavailable -- skipped\n", L.name);
+      continue;
+    }
+    // A ViT's q/k are post-LayerNorm projections: O(1), zero-mean. The dot runs
+    // over only 64 terms, so unlike the D=384/512 twin this one has no range
+    // problem -- what it has is 8-bit-mantissa ACCUMULATION in bf16, which is
+    // what the tolerance band below pins.
+    const std::size_t nel = (std::size_t)npad * rs;
+    std::vector<std::uint16_t> q(nel, 0), k(nel, 0), v(nel, 0);
+    std::vector<float> qf(nel, 0.0f), kf(nel, 0.0f), vf(nel, 0.0f);
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    for (int r = 0; r < n; ++r) {
+      for (int cix = 0; cix < rs; ++cix) {
+        const std::size_t i = (std::size_t)r * rs + cix;
+        q[i] = enc16(u(rng) * 1.5f, L.bf16);
+        k[i] = enc16(u(rng) * 1.5f, L.bf16);
+        v[i] = enc16(u(rng) * 0.5f, L.bf16);
+        qf[i] = dec16(q[i], L.bf16);
+        kf[i] = dec16(k[i], L.bf16);
+        vf[i] = dec16(v[i], L.bf16);
+      }
+    }
+    SharedBuffer qb = mc->make_shared_buffer(nel * 2);
+    SharedBuffer kb = mc->make_shared_buffer(nel * 2);
+    SharedBuffer vb = mc->make_shared_buffer(nel * 2);
+    SharedBuffer ob = mc->make_shared_buffer(nel * 2);
+    if (qb.empty() || kb.empty() || vb.empty() || ob.empty()) { return; }
+    std::memcpy(qb.contents(), q.data(), nel * 2);
+    std::memcpy(kb.contents(), k.data(), nel * 2);
+    std::memcpy(vb.contents(), v.data(), nel * 2);
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(fn);
+        e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+        e.set_buffer(3, ob);
+        e.set_constant(4, scale); e.set_constant(5, n);
+        e.set_constant(6, D); e.set_constant(7, Hq);
+        e.set_constant(8, Hq); e.set_constant(9, n);
+        e.set_constant(10, 0); e.set_constant(11, n);
+        e.dispatch({128, (unsigned)Hq, (unsigned)((n + 31) / 32)},
+                   {128, 1, 1}); }
+      st.commit().wait(); }
+
+    double num = 0.0, den = 0.0;
+    const auto* got = static_cast<const std::uint16_t*>(ob.contents());
+    std::vector<double> s((std::size_t)n);
+    for (int h = 0; h < Hq; ++h) {
+      const int hc = h * D;
+      for (int i = 0; i < n; ++i) {
+        double m = -1e300;
+        for (int j = 0; j < n; ++j) {
+          double dot = 0.0;
+          for (int d = 0; d < D; ++d) {
+            dot += (double)qf[(std::size_t)i * rs + hc + d] *
+                   (double)kf[(std::size_t)j * rs + hc + d];
+          }
+          s[(std::size_t)j] = dot * (double)scale;
+          if (s[(std::size_t)j] > m) { m = s[(std::size_t)j]; }
+        }
+        double z = 0.0;
+        for (int j = 0; j < n; ++j) {
+          s[(std::size_t)j] = std::exp(s[(std::size_t)j] - m);
+          z += s[(std::size_t)j];
+        }
+        for (int d = 0; d < D; ++d) {
+          double acc = 0.0;
+          for (int j = 0; j < n; ++j) {
+            acc += s[(std::size_t)j] * (double)vf[(std::size_t)j * rs + hc + d];
+          }
+          const double want = acc / z;
+          const double diff =
+              (double)dec16(got[(std::size_t)i * rs + hc + d], L.bf16) - want;
+          num += diff * diff; den += want * want;
+        }
+      }
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    std::printf("[full_mma2_d64] %-14s D=64 Hq=%d n=%d rel-L2 = %.4e\n",
+                L.name, Hq, n, rel);
+    EXPECT_TRUE(std::isfinite(rel) && rel < L.tol);
+  }
+}
+
 // Gemma-4 GLOBAL-layer prefill attention: sdpa_causal_mma_f16 over a
 // CONTIGUOUS [Hkv, T_kv, D] K/V, head_dim 512, full causal, Hkv=1 (unified
 // K/V). This is the O(n^2) path that dominates long-context prefill. Bench
@@ -879,13 +1124,25 @@ TEST(sdpa_mma, gqa_decode_micro) {
   // VPIPE_SDPA_MICRO=g8 -> only the Qwen3.5-MoE decode shape (D=256, Hkv=2,
   // G=8) over LONG context, to study kbl flash-decode scaling vs depth.
   const bool g8_only = std::string(std::getenv("VPIPE_SDPA_MICRO")) == "g8";
+  // =g2 -> the gemma-4-31B GLOBAL decode shape (D=256, Hq=32/Hkv=16 -> G=2)
+  // over depth. That model's decode deficit localizes entirely to its global
+  // attention (category profiler: +9.5 ms of a +9.2 ms 1k->8k total) at
+  // ~2.3-3x the KV bandwidth floor, and G=2 is the least-amortized geometry
+  // the gtile family runs -- one KV head feeding only two q heads.
+  const bool g2_only = std::string(std::getenv("VPIPE_SDPA_MICRO")) == "g2";
   const Cfg cfgs_all[] = {{512, 0, 8, 2, "global   "},
                           {256, 512, 8, 2, "slide    "},
                           {256, 0, 16, 4, "qwen(G4) "},
                           {512, 0, 16, 1, "g12b(G16)"}};
   const Cfg cfgs_g8[] = {{256, 0, 16, 2, "qwen(G8) "}};
-  const Cfg* cfgs = g8_only ? cfgs_g8 : cfgs_all;
-  const int ncfg = g8_only ? 1 : 4;
+  // BOTH gemma-4-31B decode geometries, verified with VPIPE_GEMMA_ATTN_DUMP:
+  // gemma-4 uses PER-LAYER-TYPE head_dim, so the globals are D=512/G=8 (paged,
+  // sdpa_pgqa) and the sliding layers D=256/G=2 (contiguous, gtile). config.json
+  // head_dim=256 is the SLIDING value -- do not assume it is uniform.
+  const Cfg cfgs_g2[] = {{512, 0, 32, 4, "g31bGL(G8)"},
+                         {256, 0, 32, 16, "g31bSL(G2)"}};
+  const Cfg* cfgs = g8_only ? cfgs_g8 : (g2_only ? cfgs_g2 : cfgs_all);
+  const int ncfg = g8_only ? 1 : (g2_only ? 2 : 4);
   for (int ci = 0; ci < ncfg; ++ci) {
   const Cfg& cfg = cfgs[ci];
   const int D = cfg.D;
@@ -894,7 +1151,8 @@ TEST(sdpa_mma, gqa_decode_micro) {
   const float scale = 1.0f / std::sqrt((float)D);
   const std::vector<int> Ts = g8_only
       ? std::vector<int>{2048, 8192, 16384, 32768}
-      : std::vector<int>{1024, 2048, 4096};
+      : (g2_only ? std::vector<int>{1024, 2048, 4096, 8192}
+                 : std::vector<int>{1024, 2048, 4096});
   for (int T : Ts) {
     std::mt19937 rng(7 + T);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);

@@ -12,6 +12,7 @@ namespace vpipe {
 namespace genai {
 
 class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 
 // Qwen2.5-VL vision tower (the Qwen-Image-Edit-2511 text_encoder's `visual`).
 // A 32-block ViT: RMSNorm, fused-qkv attention (per-head, head_dim 80, 2D
@@ -45,6 +46,15 @@ class MetalQwen25Vision {
   static std::unique_ptr<MetalQwen25Vision>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg);
+
+  // Preferred: the tower's weights live in the SAME checkpoint as the
+  // text encoder the conditioner runs beside it, so passing that set
+  // reads them from the mmap already open rather than a second one.
+  //
+  // The returned tower KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalQwen25Vision>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg);
   ~MetalQwen25Vision();
 
   // Encode patchified pixels -> vision tokens [seq/merge^2, out_hidden] f16(bf16).
@@ -72,9 +82,9 @@ class MetalQwen25Vision {
   // Load a dense weight, transparently expanding an affine group-quantized
   // linear (model-quantize caught it in the text_encoder scope) back to dense
   // bf16 -- the vision tower has no quantized-matmul kernels, so it runs dense.
-  metal_compute::SharedBuffer to_elt_(const MetalLlamaWeights& wts,
+  metal_compute::SharedBuffer to_elt_(WeightSet& wts,
                                       const std::string& name);
-  bool load_linear_(const MetalLlamaWeights& wts, const std::string& pre,
+  bool load_linear_(WeightSet& wts, const std::string& pre,
                     metal_compute::SharedBuffer& w,
                     metal_compute::SharedBuffer& b);
 
@@ -109,6 +119,9 @@ class MetalQwen25Vision {
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_silu,
       _fn_mul, _fn_gelu, _fn_residual, _fn_transpose, _fn_sdpa, _fn_rope,
       _fn_swiglu, _fn_varwindow;
+  // The checkpoint, held for this tower's whole life: the weights above
+  // are aliases of buffers the set owns.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace genai

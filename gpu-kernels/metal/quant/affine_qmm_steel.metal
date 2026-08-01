@@ -301,11 +301,24 @@ struct QuantizedBlockLoader {
 // the whole multiply-accumulate on the FP16 pipe (2x ALU rate on M3/M4-class
 // GPUs) at the cost of f16 accumulation error over K -- callers must verify
 // against their accuracy bar before routing to an _acc16 entry point.
+// NOTE ON THE REMOVED `aligned_N` PARAMETER: this template used to take a
+// compile-time "N is a multiple of BN" promise and, when given it, let the
+// WEIGHT loader run load_unsafe() on the ragged last N-tile -- reading a full
+// BN=32 rows regardless. Every entry point passed true, which was fine while
+// every model's projection widths happened to be multiples of 32. Boogu-Image
+// is not: its GQA k/v projections are N = 7*120 = 840 = 26.25 tiles, so the
+// last tile read ~50 KB past the end of the codes + scales + biases (results
+// were still correct -- the STORE is bound-checked -- so it was a latent fault,
+// visible only if a ragged tensor landed at the end of a shard mapping). The
+// promise is gone: the ragged tile is now decided at RUNTIME off num_outs, the
+// same way dense_gemm.metal has always done it (it instantiates aligned_N=false
+// everywhere) and the same way the store already did. The predicate is
+// evaluated once per threadgroup to select a loop, NOT inside the K loop, so an
+// aligned N pays a single comparison -- measured no regression.
 template <
     typename T,
     const int group_size,
     const int bits,
-    const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32,
@@ -386,7 +399,7 @@ METAL_FUNC void qmm_t_impl(
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
-    if (!aligned_N && num_outs < BN) {
+    if (num_outs < BN) {
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_safe(short2(BK, num_els));
@@ -408,7 +421,7 @@ METAL_FUNC void qmm_t_impl(
       }
     }
   } else {
-    if (!aligned_N && num_outs < BN) {
+    if (num_outs < BN) {
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_unsafe();
@@ -463,7 +476,7 @@ kernel void affine_qmm_steel_w4g64(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -493,7 +506,7 @@ kernel void affine_qmm_steel_w4g64_bm64(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -526,7 +539,7 @@ kernel void affine_qmm_steel_w4g64_bm128(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN, float,
+  qmm_t_impl<VPIPE_ELT, 64, 4, BM, BK, BN, float,
              /*WM=*/4, /*WN=*/2>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
@@ -557,7 +570,7 @@ kernel void affine_qmm_steel_w4g64_bm64_acc16(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 4, /*aligned_N=*/true, BM, BK, BN, VPIPE_ACC16_T>(
+  qmm_t_impl<VPIPE_ELT, 64, 4, BM, BK, BN, VPIPE_ACC16_T>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -580,7 +593,7 @@ kernel void affine_qmm_steel_w8g64_bm64_acc16(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN, VPIPE_ACC16_T>(
+  qmm_t_impl<VPIPE_ELT, 64, 8, BM, BK, BN, VPIPE_ACC16_T>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -605,7 +618,7 @@ kernel void affine_qmm_steel_w4g32(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 32, 4, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 32, 4, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -642,6 +655,14 @@ template <
     typename AccumT = float,
     const int WM = 2,
     const int WN = 2>
+// N-ALIGNMENT: unlike qmm_t_impl above, this and the other fused-epilogue
+// variants below (swiglu / geglu / grouped-MoE) bound-check NEITHER the weight
+// load NOR the store against N -- their epilogues write a fixed pattern of
+// simdgroup fragments. They therefore REQUIRE N % BN == 0, which every caller
+// satisfies structurally (N = 2*ff_inner, and ff_inner is a multiple of
+// `multiple_of` = 256 in every model here). A future caller with a ragged N
+// must NOT be routed here: it would over-read the weight AND write past the row
+// (the latter is why making these runtime-safe is more than a load fix).
 METAL_FUNC void qmm_t_swiglu_rs_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1138,6 +1159,143 @@ METAL_FUNC void qmm_t_grouped_swiglu_impl(
   }
 }
 
+// GeGLU twin of qmm_t_grouped_swiglu_impl (Gemma-4 MoE prefill): identical
+// gathered-x / per-tile-expert weight loading, only the store activation is
+// gelu_pytorch_tanh instead of silu -- the same relationship
+// qmm_t_geglu_impl has to qmm_t_swiglu_impl. Gemma's routed experts use
+// GeGLU, so without this the MoE prefill had no grouped path at all and fell
+// back to one gathered GEMV per (token,expert) pair, re-reading each expert
+// slab once per routed token.
+template <typename T, const int group_size, const int bits,
+          const int BM = 32, const int BK = 32, const int BN = 32>
+METAL_FUNC void qmm_t_grouped_geglu_impl(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    const device T* x, device T* y, threadgroup T* Xs, threadgroup T* Ws,
+    const constant int& K, const constant int& N, const constant int& M,
+    const device int* tile2e, const device int* srow,
+    uint3 tid, uint simd_gid, uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      GatherBlockLoader<T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  auto wl = (const device uint8_t*)w;
+  if (tile2e) {
+    const int e = tile2e[tid.y];
+    if (e < 0) { return; }
+    wl += static_cast<int64_t>(e) * N * K_w;
+    scales += static_cast<int64_t>(e) * N * K_g;
+    biases += static_cast<int64_t>(e) * N * K_g;
+  }
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  const short num_els = min(BM, M - y_row);
+  loader_x_t loader_x(x, K, srow, y_row, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+  if (num_els < BM) {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_safe(short2(BK, num_els));
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  } else {
+    for (int k = 0; k < K; k += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_unsafe();
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      loader_x.next();
+      loader_w.next();
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int FS = 8;
+  constexpr int TM = BM / (FS * WM);
+  constexpr int TN = BN / (FS * WN);
+  const int outN = N / 2;
+  const short sm = mma_op.sm;
+  const short sn = mma_op.sn;
+  for (short ti = 0; ti < TM; ti++) {
+    const int row = y_row + sm + ti * FS * WM;
+    if (row >= M) { continue; }
+    for (short tj = 0; tj < TN; tj++) {
+      const int col = y_col + sn + tj * FS * WN;
+      const thread auto& fr = mma_op.Ctile.frag_at(ti, tj);
+      const float ga = (float)fr[0];               // gate (even col)
+      const float up = (float)fr[1];               // up   (odd col)
+      const float k0 = 0.7978845608028654f;
+      const float t =
+          metal::precise::tanh(k0 * (ga + 0.044715f * ga * ga * ga));
+      y[(int64_t)row * outN + (col >> 1)] = (T)(0.5f * ga * (1.0f + t) * up);
+    }
+  }
+}
+
+kernel void affine_qmm_grouped_geglu_w4g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // hidden [M, K] (gathered)
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],   // fused width = 2*inner
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* srow         [[buffer(9)]],   // sorted-slot -> hidden row
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_geglu_impl<VPIPE_ELT, 64, 4, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_grouped_geglu_w8g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* srow         [[buffer(9)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_geglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
+      tid, simd_gid, simd_lid);
+}
+
 kernel void affine_qmm_grouped_swiglu_w4g64(
     const device uint32_t* w       [[buffer(0)]],
     const device VPIPE_ELT* scales [[buffer(1)]],
@@ -1443,7 +1601,7 @@ kernel void affine_qmm_steel_w8g64(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -1467,7 +1625,7 @@ kernel void affine_qmm_steel_w8g64_bm64(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
@@ -1492,14 +1650,15 @@ kernel void affine_qmm_steel_w8g64_bm128(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 64, 8, /*aligned_N=*/true, BM, BK, BN, float,
+  qmm_t_impl<VPIPE_ELT, 64, 8, BM, BK, BN, float,
              /*WM=*/4, /*WN=*/2>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
 // group_size=32 twin of affine_qmm_steel_w8g64 (the MOSS codec int8 path):
-// only the template group_size differs. Requires N % 32 == 0 (aligned_N).
+// only the template group_size differs. Any N: the ragged last tile is
+// bound-checked at runtime (see the note on qmm_t_impl).
 kernel void affine_qmm_steel_w8g32(
     const device uint32_t* w      [[buffer(0)]],
     const device VPIPE_ELT*     scales [[buffer(1)]],
@@ -1518,7 +1677,7 @@ kernel void affine_qmm_steel_w8g32(
   constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
-  qmm_t_impl<VPIPE_ELT, 32, 8, /*aligned_N=*/true, BM, BK, BN>(
+  qmm_t_impl<VPIPE_ELT, 32, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K,
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }

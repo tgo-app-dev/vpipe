@@ -12,7 +12,8 @@
 namespace vpipe {
 namespace genai {
 
-class MetalLlamaWeights;   // fwd: kept source mmap for streaming-blocks mode
+class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 class I8GemmContext;       // fwd (shared/i8-gemm.h)
 
 // Krea-2-Turbo denoiser (Krea2Transformer2DModel): a single-stream MMDiT
@@ -70,7 +71,15 @@ class MetalKrea2Transformer {
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
 
-  ~MetalKrea2Transformer();   // out-of-line: _stream_wts is a fwd-declared type
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so two pipelines running
+  // this model share its weights instead of loading a copy each. The dir
+  // overload opens a PRIVATE set (tests, and callers with no session).
+  static std::unique_ptr<MetalKrea2Transformer>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+
+  ~MetalKrea2Transformer();   // out-of-line: _ws is a fwd-declared type
 
   // Leading main blocks pinned resident in streaming mode (0 = pure streaming,
   // or preloaded). For logging the RAM-for-speed decision.
@@ -190,11 +199,24 @@ class MetalKrea2Transformer {
     metal_compute::SharedBuffer sst;            // adaLN scale_shift_table (main)
   };
 
-  bool load_block_(const class MetalLlamaWeights& wts, const std::string& pre,
-                   Block& b, bool main_block);
+  // Whether a load is RETAINED for the model's life or read once and
+  // thrown away. Explicit, not a mode flag: the same loaders serve the
+  // preloaded/pinned blocks AND the per-forward streamed ones, and
+  // caching a streamed block would silently undo streaming, putting the
+  // whole DiT back in RAM on the box least able to hold it.
+  enum class Retain { Cached, Streamed };
+
+  bool load_block_(WeightSet& ws, const std::string& pre,
+                   Block& b, bool main_block, Retain r);
   // Load a Linear weight: quantized (affine triple) when `<name>.scales` is
   // present, else dense f16.
-  QWeight load_qw_(const class MetalLlamaWeights& wts, const std::string& name);
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // bf16 view of a checkpoint tensor. Cached ones go through the weight
+  // set so a second model over this checkpoint shares them; streamed
+  // ones are rebuilt per forward and retained by nobody. `norm` selects
+  // the (1 + w) fold the RMSNorm weights need.
+  metal_compute::SharedBuffer
+  elt_(WeightSet& ws, const std::string& nm, Retain r, bool norm = false);
 
   // M5 matrix-core GEMM fast path for one Linear: y[M,N] (element offset ye) =
   // xin[M,K] @ dequant(w)[N,K]^T on the hardware matmul2d units. Dense weights
@@ -231,7 +253,7 @@ class MetalKrea2Transformer {
   QWeight _tmp_w; metal_compute::SharedBuffer _tmp_b;        // time_mod_proj
   std::vector<Block> _blocks;                          // 28 transformer_blocks
   // Streaming-blocks mode: _blocks holds only the pinned prefix (_pinned
-  // blocks, possibly 0); blocks L >= _pinned are loaded from _stream_wts (the
+  // blocks, possibly 0); blocks L >= _pinned come from the weight set (the
   // retained source mmap) on demand in forward_dit and freed after use.
   bool _stream_blocks = false;
   int _pinned = 0;                       // pinned leading blocks (streaming)
@@ -239,9 +261,13 @@ class MetalKrea2Transformer {
   // retained source mmap (newBufferWithBytesNoCopy) rather than owned copies,
   // so the OS reclaims those clean file pages under memory pressure. On by
   // default; disable with VPIPE_KREA2_NO_MMAP_WEIGHTS. Requires retaining
-  // _stream_wts for the model's lifetime (as streaming mode already does).
+  // the weight set for the model's lifetime (as streaming already does).
   bool _mmap_weights = true;
-  std::unique_ptr<MetalLlamaWeights> _stream_wts;
+  // The checkpoint, held for this model's whole life -- it owns the mmap
+  // the mapped weights alias AND is where the streamed blocks are read
+  // from, so streaming is the manager's business rather than a private
+  // mmap this class kept to itself.
+  std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;   // polled per block in streaming mode
   metal_compute::SharedBuffer _final_sst;              // final_layer (2, hidden)
   metal_compute::SharedBuffer _final_norm;             // final_layer.norm (+1)
@@ -289,6 +315,8 @@ class MetalKrea2Transformer {
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_swiglu,
       _fn_mul_sigmoid, _fn_residual, _fn_transpose, _fn_sdpa, _fn_gelu_tanh,
       _fn_rope_table, _fn_adaln, _fn_gated, _fn_qmm4, _fn_qmm8, _fn_bias_add,
+      // vec4 twins of adaln/gated (bit-identical; VPIPE_NO_ELT_V4 disables).
+      _fn_adaln4, _fn_gated4,
       _fn_colabsmax;
   // Steel MMA flash-attention (attn_steel_h_bd128, head_dim 128, GQA-aware) for
   // the joint-sequence attention. The scalar sdpa_full_f16 is O(seq^2) at <2%

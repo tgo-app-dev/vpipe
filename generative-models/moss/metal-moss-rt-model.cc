@@ -7,6 +7,7 @@
 #include "common/perf-scope.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
@@ -38,35 +39,43 @@ std::uint16_t f32_to_bf16(float f)
   const std::uint32_t r = x + 0x7fffu + ((x >> 16) & 1u);   // round-to-nearest
   return (std::uint16_t)(r >> 16);
 }
-SharedBuffer load_bf16(const MetalLlamaWeights& wts, MetalCompute* mc,
+SharedBuffer load_bf16(WeightSet& wts, MetalCompute* mc,
                        const std::string& nm)
 {
-  if (wts.info(nm) == nullptr) { return {}; }
-  return wts.load(nm, mc);   // already bf16 in the checkpoint
+  if (wts.src().info(nm) == nullptr) { return {}; }
+  // Already bf16 in the checkpoint: cache the bytes as they sit. Copied,
+  // not Mapped -- mapping wraps the whole shard, which the two
+  // MetalQwenModels below also read, and they load by copy.
+  return wts.tensor(nm, mc, WeightSet::Residency::Copied);
 }
 // Load a BF16/F16 tensor as f16 (the local transformer + heads run f16 so the
 // f16 fusion kernels -- argmax/lc_sample/embed_gather -- apply directly).
-SharedBuffer load_f16(const MetalLlamaWeights& wts, MetalCompute* mc,
+SharedBuffer load_f16(WeightSet& wts, MetalCompute* mc,
                       const std::string& nm)
 {
-  const auto* info = wts.info(nm);
+  const auto* info = wts.src().info(nm);
   if (info == nullptr) { return {}; }
-  SharedBuffer raw = wts.load(nm, mc);
-  if (raw.empty()) { return {}; }
-  std::size_t n = 1;
-  for (auto d : info->shape) { n *= (std::size_t)d; }
-  SharedBuffer out = mc->make_shared_buffer(n * 2);
-  if (out.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(out.contents());
-  if (info->dtype == "F16") {
-    std::memcpy(out.contents(), raw.contents(), n * 2);
-  } else if (info->dtype == "BF16") {
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)bf16_to_f32(s[i]); }
-  } else {
-    return {};
-  }
-  return out;
+  return wts.derived("moss-rt/f16/" + nm, [&]() -> SharedBuffer {
+    // Uncached: consumed by the conversion and dropped.
+    SharedBuffer raw = wts.read(nm, mc, WeightSet::Residency::Copied);
+    if (raw.empty()) { return {}; }
+    std::size_t n = 1;
+    for (auto d : info->shape) { n *= (std::size_t)d; }
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty()) { return {}; }
+    auto* d = static_cast<_Float16*>(out.contents());
+    if (info->dtype == "F16") {
+      std::memcpy(out.contents(), raw.contents(), n * 2);
+    } else if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = (_Float16)bf16_to_f32(s[i]);
+      }
+    } else {
+      return {};
+    }
+    return out;
+  });
 }
 
 }  // namespace
@@ -75,17 +84,27 @@ std::unique_ptr<MetalMossRtModel>
 MetalMossRtModel::load(const std::string& quant_dir, MetalCompute* mc,
                        const Config& cfg)
 {
-  auto wts = MetalLlamaWeights::open_model(quant_dir);
-  if (!wts.has_value()) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(quant_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalMossRtModel>
+MetalMossRtModel::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
+                       const Config& cfg)
+{
+  if (ws == nullptr) { return nullptr; }
   auto self = std::make_unique<MetalMossRtModel>();
-  if (!self->init_(*wts, mc, cfg, quant_dir)) { return nullptr; }
+  if (!self->init_(ws, mc, cfg)) { return nullptr; }
   return self;
 }
 
 bool
-MetalMossRtModel::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
-                        const Config& cfg, const std::string& quant_dir)
+MetalMossRtModel::init_(const std::shared_ptr<WeightSet>& ws, MetalCompute* mc,
+                        const Config& cfg)
 {
+  _ws = ws;
+  WeightSet& wts = *ws;
   _mc = mc;
   _session = mc->session();
   _cfg = cfg;
@@ -93,9 +112,10 @@ MetalMossRtModel::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
   // frame can fuse through the f16 on-GPU sampler + embed-gather kernels; the
   // backbone stays bf16 (verified). Both are 8-bit affine.
   _cfg.local.use_bf16 = false;
-  _bb = MetalQwenModel::load(quant_dir, mc, _cfg.backbone);
+  // Both from the SAME set: one checkpoint, opened once.
+  _bb = MetalQwenModel::load(ws, mc, _cfg.backbone);
   if (!_bb) { return false; }
-  _lt = MetalQwenModel::load(quant_dir, mc, _cfg.local);
+  _lt = MetalQwenModel::load(ws, mc, _cfg.local);
   if (!_lt) { return false; }
 
   const int NV = cfg.n_vq;

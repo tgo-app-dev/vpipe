@@ -28,6 +28,7 @@
 // over the prompt. Pipelined / batched paths are a later (Phase 4) add.
 
 #include "generative-models/context-manager.h"   // ContextId
+#include "generative-models/shared/mma-splitk.h"  // MmaSplitK
 #include "generative-models/model-exec.h"         // GpuSamplerParams
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-library.h"
@@ -45,6 +46,8 @@
 namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
 
 namespace vpipe::genai {
+
+class WeightSet;   // generative-models/weight-set.h
 
 class TuningReport;   // generative-models/shared/kernel-autotune.h
 
@@ -145,6 +148,17 @@ public:
       const std::string& model_dir,
       metal_compute::MetalCompute* mc, const Config& cfg);
 
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second stage naming
+  // this same directory joins it instead of loading the weights again.
+  // The reads themselves are owned copies -- mapping was measured to
+  // cost MORE here, because load_mapped wraps the whole shard and this
+  // model converts most tensors anyway, so it would pay both bills.
+  static std::unique_ptr<MetalGemmaModel> load(
+      std::shared_ptr<WeightSet> ws,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
   // Derive the shape-affecting Config from a parsed ModelConfig.
   static Config config_from(const ModelConfig& c);
 
@@ -202,6 +216,8 @@ public:
   void release_kv(ContextId cid);
 
   const Config& config() const { return _cfg; }
+
+  ContextManager* context_manager() { return _ctx.get(); }
 
   // Forbid a small set of token ids from EVER being predicted (argmax or
   // sampled), across prefill + every decode path. The logits at these ids
@@ -449,6 +465,11 @@ private:
       // and the raw-HF dense f16 twins (_..._dense).
       _fn_moe_route, _fn_moe_expert_scale, _fn_moe_combine,
       _fn_moe_gather_geglu, _fn_moe_gather_down,
+      // Grouped (counting-sort + steel) PREFILL tier: weight-free sort/scatter
+      // kernels shared with the Qwen MoE, plus the GeGLU gate|up GEMM and the
+      // activation-free down GEMM (scatter fused into its store).
+      _fn_moe_ifill, _fn_moe_hist, _fn_moe_sort_setup, _fn_moe_scatter,
+      _fn_moe_qmm_grouped_geglu, _fn_moe_qmm_grouped_down,
       _fn_moe_gather_geglu_dense, _fn_moe_gather_down_dense,
       // Bans a small set of token ids by masking their logits after softcap
       // (realtime thinking-channel suppression). See set_suppressed_tokens.
@@ -525,7 +546,7 @@ private:
       // head -> matrix-core QK/PV, no per-key simd_sum). ~1.7-2x the vec kernel
       // + flatter with depth. Used when 8|G and D%64==0; split scales with depth
       // (each split ~one 64-key block). Folded by _fn_sdpa_gqa_merge.
-      _fn_sdpa_mma_qhead,
+      _fn_sdpa_mma_qhead, _fn_sdpa_pmma_qhead,
       // Matrix-core (M5+) matmul2d flash attention for the GLOBAL (head_dim
       // 512) PREFILL layers -- QK^T/PV on the hardware matrix units, ~1.7-1.9x
       // the simdgroup_matrix flash kernel (the prefill attention was the 12B
@@ -593,7 +614,13 @@ private:
   // single-pass prefill above requires it, else a bounded ring would be read
   // wrapped. Cached at construction so prefill() and forward_chunk_ agree.
   bool _mat_sliding = true;
+  // Min rows to prefer the matrix-core GEMM over steel (VPIPE_GEMMA_MMA_MIN_M).
+  // Stays 64 -- see MetalQwenModel::_mma_min_m for why 128 looks right on the
+  // block bench and costs 29% on a real short prefill.
   int  _mma_min_m = 64;
+  // Split-K for the very deep down_proj contraction (gemma-4-31B, K=21504).
+  // Inert on every other checkpoint -- it keys on the exact depth.
+  MmaSplitK _splitk;
   bool _skip_dequant = false;
   metal_compute::SharedBuffer _w_deq;
 
@@ -790,6 +817,12 @@ private:
   // GEMM), replacing the inefficient fused sdpa_paged_flash_d512 for the
   // single-chunk (qpos==0) global prefill only. Capped at T_kv<=_scores_cap.
   bool _materialized_global = false;
+  // All six grouped-MoE-prefill functions validated (see the loader). Off ->
+  // the MoE prefill stays on the pair-batched gathers.
+  bool _moe_grouped_ok = false;
+  // Paged matrix-core q-head decode attention available (the GLOBAL
+  // layers' path; the contiguous _mma_qhead serves only sliding/contig KV).
+  bool _pmma_qhead = false;
   int  _scores_cap = 0;       // CAP = min(max_seq, 8192); 0 until scratch ready
   // KV-split GQA paged decode (sdpa_paged_gqa_d512 + merge) available -- the
   // fast full-layer decode path; falls back to scalar sdpa_paged_causal when
@@ -801,6 +834,12 @@ private:
   // work, so a within-process A/B isolates per-category cost at a steady
   // clock. Off in production (no per-step getenv). See encode_step_.
   bool _catprof = false;
+
+  // The checkpoint, held for this model's whole life. The weights are
+  // owned copies rather than views, so this is the reference count that
+  // keeps the set (and the manager's record of it) alive, not a
+  // lifetime dependency of the buffers.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

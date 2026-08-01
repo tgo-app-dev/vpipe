@@ -341,6 +341,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
 
   SafetensorsWriter wr(out_dir, opt.shard_max_bytes);
   int n_quant = 0, n_pass = 0;
+  // Targeted linears skipped because K % group != 0 (see the warning below).
+  int n_group_skip = 0, group_skip_k = 0;
+  std::size_t group_skip_bytes = 0;
   std::unordered_set<std::string> handled;   // names done by the SQ pass
 
   // ---- helpers (host f32) shared by the SmoothQuant pass ------------------
@@ -472,7 +475,13 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       if (ti == nullptr) { continue; }
       const std::string leaf = weight_leaf_(name);
       const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
-      if (leaf.empty() || quant_set.count(leaf) == 0 ||
+      bool ex_hit = false;
+      for (const auto& ex : opt.quant_exclude) {
+        if (!ex.empty() && name.find(ex) != std::string::npos) {
+          ex_hit = true; break;
+        }
+      }
+      if (ex_hit || leaf.empty() || quant_set.count(leaf) == 0 ||
           ti->shape.size() != 2 || !fp || ti->shape[1] % opt.group != 0) {
         continue;
       }
@@ -588,6 +597,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   // block Linear's weight before quantizing (the fold-free half of AWQ).
   const bool dit_flux2_fam = (opt.dit_family == "flux2");
   const bool dit_qie_fam = (opt.dit_family == "qwen-image-edit");
+  const bool dit_boogu_fam = (opt.dit_family == "boogu-image");
   std::vector<float> dit_cq, dit_co, dit_cg, dit_cd;
   int dit_dq = 0, dit_dd = 0;
   std::unordered_map<std::string, std::vector<float>> dit_fx;   // flux2/qie group
@@ -602,7 +612,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     f.read(reinterpret_cast<char*>(v.data()), nb);
     return v;
   };
-  if (opt.dit_awq && !dit_flux2_fam && !dit_qie_fam) {
+  if (opt.dit_awq && !dit_flux2_fam && !dit_qie_fam && !dit_boogu_fam) {
     dit_cq = calib_load("calib_qkv.f32");
     dit_co = calib_load("calib_o.f32");
     dit_cg = calib_load("calib_gateup.f32");
@@ -620,6 +630,16 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   } else if (opt.dit_awq && dit_qie_fam) {
     static const char* kG[] = {"img_qkv", "txt_qkv", "img_o", "txt_o",
                                "img_fc1", "txt_fc1", "img_fc2", "txt_fc2"};
+    for (const char* g : kG) { dit_fx[g] = calib_load(std::string(g) + ".f32"); }
+  } else if (opt.dit_awq && dit_boogu_fam) {
+    static const char* kG[] = {
+        "ctx_attn", "ctx_ffn", "ctx_ffact",
+        "noise_attn", "noise_ffn", "noise_ffact",
+        "ref_attn", "ref_ffn", "ref_ffact",
+        "dbl_jattn_img", "dbl_jattn_txt", "dbl_sattn_img", "dbl_jout",
+        "dbl_ffn_img", "dbl_ffn_txt", "dbl_ffact_img", "dbl_ffact_txt",
+        "sgl_attn", "sgl_ffn", "sgl_ffact",
+        "emb_x", "emb_ref", "emb_ctx", "emb_proj"};
     for (const char* g : kG) { dit_fx[g] = calib_load(std::string(g) + ".f32"); }
   }
 
@@ -699,10 +719,104 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     if (ends_with(base, ".txt_mlp.net.2")) { return row("txt_fc2"); }
     return nullptr;
   };
+  // Boogu-Image clip-only AWQ: NextDiT leaf -> its calib group (the
+  // per-input-channel abs-max from collect_boogu_calibration). Five block kinds
+  // over three refiner stacks + the dual/single streams, so the block prefix
+  // picks the group family and the leaf picks the member. The embedders are
+  // mapped too even though the stage excludes them from quantization -- so an
+  // explicit calib_dir + a widened leaf set still lines up.
+  auto boogu_act = [&](const std::string& name, int K) -> const float* {
+    if (!ends_with(name, ".weight")) { return nullptr; }
+    const std::string base = name.substr(0, name.size() - 7);
+    auto row = [&](const char* g, int L) -> const float* {
+      auto it = dit_fx.find(g);
+      if (it == dit_fx.end() || it->second.empty() || K <= 0) { return nullptr; }
+      const std::vector<float>& c = it->second;
+      if (c.size() % (std::size_t)K != 0 ||
+          (std::size_t)(L + 1) * K > c.size()) {
+        return nullptr;
+      }
+      return c.data() + (std::size_t)L * K;
+    };
+    if (base == "x_embedder") { return row("emb_x", 0); }
+    if (base == "ref_image_patch_embedder") { return row("emb_ref", 0); }
+    if (base == "time_caption_embed.caption_embedder.1") {
+      return row("emb_ctx", 0);
+    }
+    if (base == "norm_out.linear_2") { return row("emb_proj", 0); }
+    // The plain-block stacks all share the BooguImageTransformerBlock shape:
+    // attn.to_{q,k,v} read norm1's output, attn.to_out.0 reads the attention
+    // result, feed_forward.linear_{1,3} read ffn_norm1's output and linear_2
+    // reads the SwiGLU activation.
+    struct Stack { const char* pre; const char* attn; const char* ffn;
+                   const char* ffact; };
+    static const Stack kStacks[] = {
+        {"context_refiner.",   "ctx_attn",   "ctx_ffn",   "ctx_ffact"},
+        {"noise_refiner.",     "noise_attn", "noise_ffn", "noise_ffact"},
+        {"ref_image_refiner.", "ref_attn",   "ref_ffn",   "ref_ffact"},
+        {"single_stream_layers.", "sgl_attn", "sgl_ffn",  "sgl_ffact"}};
+    for (const Stack& st : kStacks) {
+      const std::string pre(st.pre);
+      if (base.rfind(pre, 0) != 0) { continue; }
+      const int L = std::atoi(base.c_str() + pre.size());
+      if (ends_with(base, ".attn.to_q") || ends_with(base, ".attn.to_k") ||
+          ends_with(base, ".attn.to_v")) { return row(st.attn, L); }
+      if (ends_with(base, ".attn.to_out.0")) { return row(st.attn, L); }
+      if (ends_with(base, ".feed_forward.linear_1") ||
+          ends_with(base, ".feed_forward.linear_3")) { return row(st.ffn, L); }
+      if (ends_with(base, ".feed_forward.linear_2")) { return row(st.ffact, L); }
+      return nullptr;
+    }
+    static const std::string kDbl = "double_stream_layers.";
+    if (base.rfind(kDbl, 0) == 0) {
+      const int L = std::atoi(base.c_str() + kDbl.size());
+      if (ends_with(base, ".processor.img_to_q") ||
+          ends_with(base, ".processor.img_to_k") ||
+          ends_with(base, ".processor.img_to_v")) {
+        return row("dbl_jattn_img", L);
+      }
+      if (ends_with(base, ".processor.instruct_to_q") ||
+          ends_with(base, ".processor.instruct_to_k") ||
+          ends_with(base, ".processor.instruct_to_v")) {
+        return row("dbl_jattn_txt", L);
+      }
+      // img_out/instruct_out read the joint attention result; the shared
+      // to_out.0 reads their concatenation, which is the same group.
+      if (ends_with(base, ".processor.img_out")) { return row("dbl_jattn_img", L); }
+      if (ends_with(base, ".processor.instruct_out")) {
+        return row("dbl_jattn_txt", L);
+      }
+      if (ends_with(base, ".img_instruct_attn.to_out.0")) {
+        return row("dbl_jout", L);
+      }
+      if (ends_with(base, ".img_self_attn.to_q") ||
+          ends_with(base, ".img_self_attn.to_k") ||
+          ends_with(base, ".img_self_attn.to_v") ||
+          ends_with(base, ".img_self_attn.to_out.0")) {
+        return row("dbl_sattn_img", L);
+      }
+      if (ends_with(base, ".img_feed_forward.linear_1") ||
+          ends_with(base, ".img_feed_forward.linear_3")) {
+        return row("dbl_ffn_img", L);
+      }
+      if (ends_with(base, ".img_feed_forward.linear_2")) {
+        return row("dbl_ffact_img", L);
+      }
+      if (ends_with(base, ".instruct_feed_forward.linear_1") ||
+          ends_with(base, ".instruct_feed_forward.linear_3")) {
+        return row("dbl_ffn_txt", L);
+      }
+      if (ends_with(base, ".instruct_feed_forward.linear_2")) {
+        return row("dbl_ffact_txt", L);
+      }
+    }
+    return nullptr;
+  };
   auto dit_act = [&](const std::string& name, int K) -> const float* {
     if (!opt.dit_awq) { return nullptr; }
     if (dit_flux2_fam) { return flux2_act(name, K); }
     if (dit_qie_fam) { return qie_act(name, K); }
+    if (dit_boogu_fam) { return boogu_act(name, K); }
     static const std::string kBlk = "transformer_blocks.";
     if (name.rfind(kBlk, 0) != 0) { return nullptr; }
     const int L = std::atoi(name.c_str() + kBlk.size());
@@ -1703,17 +1817,35 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     // Submodule scope: only in-scope tensors are eligible (empty => all).
     const bool in_scope = opt.quant_scope.empty() ||
                           name.find(opt.quant_scope) != std::string::npos;
+    bool excluded = false;
+    for (const auto& ex : opt.quant_exclude) {
+      if (!ex.empty() && name.find(ex) != std::string::npos) {
+        excluded = true; break;
+      }
+    }
     const bool shape_ok = is_2d && fp && (ti->shape[1] % opt.group == 0);
+    // A targeted linear whose K is not a multiple of the group size is NOT
+    // quantizable at this group and falls through to passthrough. Silence here
+    // is a trap: a model whose hidden size is not a multiple of 64 (Boogu's is
+    // 3360 = 52.5 groups) yields a "4-bit" checkpoint that is almost entirely
+    // bf16, at nearly the source size, with nothing in the log. Count them and
+    // say so at the end.
+    if (is_2d && fp && !shape_ok && !leaf.empty() &&
+        quant_set.count(leaf) > 0) {
+      ++n_group_skip;
+      if (group_skip_k == 0) { group_skip_k = (int)ti->shape[1]; }
+      group_skip_bytes += (std::size_t)ti->shape[0] * ti->shape[1] * 2;
+    }
     bool quant;
     if (opt.quant_all_in_scope && !opt.quant_scope.empty()) {
       // Scoped submodule (vision/audio tower): quantize every 2D fp linear in
       // scope except norms + embeddings (their leaves are non-standard).
-      quant = in_scope && shape_ok &&
+      quant = in_scope && !excluded && shape_ok &&
               leaf.find("norm") == std::string::npos &&
               leaf.find("embed") == std::string::npos;
     } else {
-      quant = in_scope && !leaf.empty() && quant_set.count(leaf) > 0 &&
-              shape_ok;
+      quant = in_scope && !excluded && !leaf.empty() &&
+              quant_set.count(leaf) > 0 && shape_ok;
     }
 
     SharedBuffer in = src->load(name, _mc);
@@ -1800,6 +1932,23 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     _mc->session()->info(fmt(
         "model-quantize: {} -> {} ({}-bit g{}): {} quantized, {} passthrough",
         in_dir, out_dir, opt.bits, opt.group, n_quant, n_pass));
+    // Loud, because the failure is otherwise invisible: the run "succeeds" and
+    // writes a checkpoint the size of the source that reports itself as
+    // quantized. Name a group size that WOULD divide the offending width.
+    if (n_group_skip > 0) {
+      int alt = 0;
+      for (int g : {64, 32}) {
+        if (g < opt.group && group_skip_k % g == 0) { alt = g; break; }
+      }
+      const std::string hint =
+          alt > 0 ? (" -- re-run with group_size " + std::to_string(alt))
+                  : std::string(" -- no smaller supported group divides it");
+      _mc->session()->warn(fmt(
+          "model-quantize: {} targeted linears ({} MB) were left bf16 because "
+          "their input width (e.g. {}) is not a multiple of group_size {}{}",
+          n_group_skip, group_skip_bytes >> 20, group_skip_k, opt.group,
+          hint));
+    }
   }
   return true;
 }

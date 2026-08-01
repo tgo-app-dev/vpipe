@@ -8,5 +8,15 @@ const char* vpipe_version()
   return VPIPE_VERSION_MAJOR "." VPIPE_VERSION_MINOR " (" GIT_HASH ")";
 }
 
+const char* vpipe_version_number()
+{
+  return VPIPE_VERSION_MAJOR "." VPIPE_VERSION_MINOR;
+}
+
+const char* vpipe_build_hash()
+{
+  return GIT_HASH;
+}
+
 }
 

@@ -30,6 +30,7 @@ class ComputeEncoder;
 namespace vpipe::genai {
 
 class MetalLlamaWeights;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalMossLocalModel {
 public:
@@ -41,6 +42,14 @@ public:
 
   static std::unique_ptr<MetalMossLocalModel> load(
       const std::string& model_dir, metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Preferred: shares the caller's checkpoint (the v1.5 model loads its
+  // backbone from the SAME directory) instead of opening a second one.
+  //
+  // The returned model KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalMossLocalModel> load(
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
       const Config& cfg);
 
   // Greedy per-frame codebook decode from the backbone seed [hidden] f16.
@@ -79,7 +88,8 @@ public:
   const metal_compute::SharedBuffer& last_h0() const { return _h0; }
 
 private:
-  bool init_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
+  bool init_(const std::shared_ptr<WeightSet>& ws,
+             metal_compute::MetalCompute* mc,
              const Config& cfg);
   int  argmax_head_(int k, const metal_compute::SharedBuffer& h);
   // Run codebook-k head GEMV, pull logits to host, and SAMPLE one code.
@@ -121,6 +131,8 @@ private:
   metal_compute::ComputeLibrary  _lib_dense, _lib_elt;
   metal_compute::ComputeFunction _fn_gemv, _fn_argmax, _fn_sample;
   metal_compute::ComputeFunction _fn_embed_gather, _fn_copy;
+  // The checkpoint, held for this model's whole life.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

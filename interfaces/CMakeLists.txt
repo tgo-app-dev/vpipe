@@ -1,9 +1,11 @@
 set(LOCAL_SOURCES
   log-delegate-intf.cc
+  ui-delegate-intf.cc
 )
 set(LOCAL_HEADERS
   log-delegate-intf.h
   ui-delegate-intf.h
+  ui-view-intf.h
   session-context-intf.h
 )
 

@@ -52,6 +52,7 @@ namespace vpipe { class SessionContextIntf; }
 namespace vpipe::genai {
 
 class MetalLlamaWeights;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalMossRtModel {
 public:
@@ -71,6 +72,14 @@ public:
 
   static std::unique_ptr<MetalMossRtModel> load(
       const std::string& quant_dir, metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Preferred: the backbone AND the local transformer are two models
+  // over ONE checkpoint, so the set is what stops them opening it twice.
+  //
+  // The returned model KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalMossRtModel> load(
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
       const Config& cfg);
 
   // Streaming single-turn TTS. `prompt_grid` is the fixed system/assistant
@@ -109,8 +118,8 @@ public:
                                const MossSampling& sp, std::uint64_t& rng);
 
 private:
-  bool init_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
-             const Config& cfg, const std::string& quant_dir);
+  bool init_(const std::shared_ptr<WeightSet>& ws,
+             metal_compute::MetalCompute* mc, const Config& cfg);
   // Assemble n grid rows -> bf16 [n*hidden] (text embed + sum audio embeds).
   metal_compute::SharedBuffer assemble_embeds_(
       const std::vector<std::vector<std::int32_t>>& grid, int start, int n);
@@ -161,6 +170,8 @@ private:
   metal_compute::ComputeLibrary  _lib_dense, _lib_elt;
   metal_compute::ComputeFunction _fn_gemv, _fn_argmax, _fn_sample, _fn_gather;
   metal_compute::ComputeFunction _fn_rep;
+  // The checkpoint, held for this model's whole life.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

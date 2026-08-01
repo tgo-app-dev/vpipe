@@ -345,6 +345,16 @@ audio_input_device_count()
 {
   return -1;   // no portable enumeration off macOS
 }
+int
+camera_auth_status()
+{
+  return -1;   // no portable check off macOS
+}
+int
+video_input_device_count()
+{
+  return -1;   // no portable enumeration off macOS
+}
 #endif
 
 std::vector<PermissionCheck>
@@ -451,6 +461,43 @@ run_permission_checks(const std::atomic<bool>* abort)
       hint_(pal, checks, "or audio interface.");
     } else {
       ok_(pal, checks, "Audio input", "not checked");
+    }
+  }
+
+  // 2.4 Camera -- the video twin of the microphone check above. Worth
+  // reporting separately because a camera open on a not-yet-granted system
+  // can BLOCK rather than fail, so "video-capture hangs" is otherwise a
+  // mystery.
+  {
+    const int cam = camera_auth_status();
+    if (cam == 1) {
+      ok_(pal, checks, "Camera", "authorized");
+    } else if (cam == -1) {
+      warn_(pal, checks, "Camera", "permission not yet granted");
+      hint_(pal, checks, "Video capture will prompt, hang or fail until "
+                         "approved in System Settings >");
+      hint_(pal, checks, "Privacy & Security > Camera.");
+    } else {
+      warn_(pal, checks, "Camera", "denied");
+      hint_(pal, checks, "Video capture will not work. Enable it in System "
+                         "Settings >");
+      hint_(pal, checks, "Privacy & Security > Camera.");
+    }
+  }
+
+  // Video input device presence (hardware -- not a permission).
+  {
+    const int n = video_input_device_count();
+    if (n > 0) {
+      ok_(pal, checks, "Video input",
+          std::to_string(n) + " camera(s) present");
+    } else if (n == 0) {
+      warn_(pal, checks, "Video input", "no camera found");
+      hint_(pal, checks, "Video-capture stages will have nothing to record. "
+                         "Connect a camera");
+      hint_(pal, checks, "or enable Continuity Camera on a nearby iPhone.");
+    } else {
+      ok_(pal, checks, "Video input", "not checked");
     }
   }
 

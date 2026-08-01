@@ -5,6 +5,8 @@
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
 
@@ -55,6 +57,18 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   // Letterbox pad color: an [r,g,b] array (0..255), a named color, or a single
   // gray level. Defaults to black.
   parse_pad_color_();
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  {
+    bool bad = false;
+    _unload_cfg = model_memory::parse_unload_policy(
+        attr_str("unload_when_idle"), &bad);
+    if (bad) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): unload_when_idle '{}' is not auto|always|never; "
+          "using auto", this->id(), attr_str("unload_when_idle")));
+    }
+  }
+#endif
   allocate_oports(spec().oports.size());
 }
 
@@ -117,7 +131,8 @@ const ConfigKey kAttrs[] = {
           "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
           "model iport overrides it",
    .suggest_db = "models",
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
+   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "boogu-image,boogu-image-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
@@ -129,6 +144,14 @@ const ConfigKey kAttrs[] = {
   {.key = "pad_color", .type = ConfigType::Any, .required = false,
    .doc = "letterbox pad color: [r,g,b] 0..255, a name "
           "(black/white/gray), or a single gray level. Default black"},
+  {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
+   .doc = "drop the VAE weights after each beat and reload on the next one. "
+          "This stage is idle for the whole denoise, so on a memory-bounded box "
+          "releasing it (weights AND the decode working set) is what lets a "
+          "large DiT run in the same machine. \"auto\" (default) decides from "
+          "physical RAM vs the pipeline's weight bytes; \"always\" / "
+          "\"never\" force it",
+   .def_str = "auto"},
 };
 const PortSpec kIports[] = {
   {.name = "image", .doc = "U8 or f32 RGB image [3,H,W] (channel-first, U8 "
@@ -171,6 +194,11 @@ vae_family_(const std::string& vae_dir)
       if (obj.contains("_class_name")) {
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "AutoencoderKLFlux2") { return "flux2"; }
+        // The PLAIN diffusers AutoencoderKL (the FLUX.1 VAE Boogu-Image uses)
+        // runs on the SAME code path -- MetalFlux2Vae is config-driven, and at
+        // patch 1 with a scalar shift/scale whitening it IS a plain
+        // AutoencoderKL. Same family string, so the branches below are shared.
+        if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
       }
     }
@@ -210,16 +238,83 @@ VaeEncodeStage::spec() const noexcept
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
+void
+VaeEncodeStage::reset_run_state()
+{
+  // If a previous run left the weights UNLOADED (the idle-unload
+  // policy drops them between beats), let this launch load them again:
+  // ensure_loaded_'s once-only guard is per-Stage, not per-launch, so
+  // without this the stage stays inert for the whole run. When the
+  // weights are still held we deliberately leave the guard set --
+  // reloading on top of a resident copy is exactly what doubles peak
+  // memory.
+  if (!_vae && !_flux2_vae && !_mage_vae) {
+    _load_attempted = false;
+    _unloaded       = false;
+  }
+
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _model_latched = false;
+
+}
+
+std::vector<std::string>
+VaeEncodeStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  return {(fs::path(root) / "vae").string()};
+}
+
 Job
 VaeEncodeStage::initialize(RuntimeContext& ctx)
 {
-  // Defer the VAE load when a model-select source feeds the model iport (its
-  // beat only arrives after the init barrier, in process()). Otherwise load
-  // now from the config hf_dir, as before.
-  const bool model_from_iport =
-      ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
-  if (!model_from_iport) { ensure_loaded_(); }
+  // Nothing is loaded here, deliberately. This stage encodes REFERENCE
+  // images, and a graph that is wired for one but never sent one -- a
+  // text-to-image run through an edit-capable pipeline -- must not pay
+  // for the encoder's weights. The load happens on the first image
+  // instead (see process()), so "no reference image" costs nothing.
+  //
+  // The cost of deferring is that the load lands inside the first beat
+  // rather than at the init barrier. It is the same work either way, and
+  // an edit run needs it before it can produce anything regardless.
+  (void)ctx;
   co_return;
+}
+
+// Loading chatter: info on the first load, debug on an idle-unload reload (a
+// bounded box reloads per beat, and one line per frame is noise).
+void
+VaeEncodeStage::load_note_(const VpipeFormat& msg) const
+{
+  if (_quiet_reload) { session()->log_debug(msg); }
+  else               { session()->info(msg); }
+}
+
+void
+VaeEncodeStage::unload_vae_()
+{
+  if (!_vae && !_flux2_vae && !_mage_vae) { return; }
+  _vae.reset();
+  _flux2_vae.reset();
+  _mage_vae.reset();
+  _unloaded = true;
+  _quiet_reload = true;
+  session()->log_debug(fmt("VaeEncodeStage('{}'): VAE encoder unloaded (idle)",
+                           this->id()));
+}
+
+void
+VaeEncodeStage::reload_vae_()
+{
+  if (!_unloaded) { return; }
+  _unloaded = false;
+  _load_attempted = false;      // let ensure_loaded_ run its body again
+  ensure_loaded_();
 }
 
 void
@@ -241,6 +336,31 @@ VaeEncodeStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  // Idle-unload decision (auto: the DiT + text encoder of this same pipeline are
+  // resident during a run, so size the box against THEIR weights -- the VAE's
+  // own are small, it is the decode working set that has to fit beside them).
+  if (!_unload_resolved) {
+    _unload_resolved = true;
+    const std::vector<std::string> peers = {
+        (std::filesystem::path(root) / "transformer").string(),
+        (std::filesystem::path(root) / "text_encoder").string(),
+        (std::filesystem::path(root) / "mllm").string()};
+    const std::size_t fp = model_memory::weight_footprint(session(), peers);
+    switch (_unload_cfg) {
+      case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+      case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+      default:
+        _unload_idle =
+            model_memory::bounded(session(), peers, model_memory::kHeadroom);
+        break;
+    }
+    session()->log_debug(fmt(
+        "VaeEncodeStage('{}'): peer footprint {} MB + {} MB headroom vs {} MB "
+        "RAM, unload_when_idle={} -> {}", this->id(), fp >> 20,
+        model_memory::kHeadroom >> 20, model_memory::phys_ram() >> 20,
+        model_memory::unload_policy_name(_unload_cfg),
+        _unload_idle ? "UNLOAD after each beat" : "keep resident"));
+  }
   namespace fs = std::filesystem;
   std::string vae_dir = root;
   if (fs::exists(fs::path(root) / "vae" / "config.json")) {
@@ -248,6 +368,21 @@ VaeEncodeStage::ensure_loaded_()
   }
 
   _family = vae_family_(vae_dir);
+  // One shared, reference-counted view of this checkpoint. The peer VAE
+  // stage in the same graph (encode beside decode) names the same
+  // directory and gets the SAME set, so the two halves of the model are
+  // loaded once between them instead of once each -- and two pipelines
+  // running the same model share it too.
+  // Falls back to a private set when the session has no manager; see
+  // open_weight_set().
+  std::shared_ptr<genai::WeightSet> ws =
+      genai::open_weight_set(vae_dir, session());
+  if (!ws) {
+    session()->error(fmt(
+        "{}('{}'): no readable checkpoint under '{}'; inert",
+        "VaeEncodeStage", this->id(), vae_dir));
+    return;
+  }
   if (_family == "flux2") {
     genai::MetalFlux2Vae::Config fcfg;
     std::ifstream in(fs::path(vae_dir) / "config.json");
@@ -276,14 +411,14 @@ VaeEncodeStage::ensure_loaded_()
         }
       }
     }
-    session()->info(fmt(
-        "VaeEncodeStage('{}'): loading FLUX.2 VAE encoder from '{}'", this->id(),
+    load_note_(fmt(
+        "VaeEncodeStage('{}'): loading AutoencoderKL encoder from '{}'", this->id(),
         vae_dir));
-    _flux2_vae = genai::MetalFlux2Vae::load(vae_dir, mc, fcfg,
+    _flux2_vae = genai::MetalFlux2Vae::load(ws, mc, fcfg,
                                             /*with_encoder=*/true);
     if (!_flux2_vae || !_flux2_vae->has_encoder()) {
       session()->error(fmt(
-          "VaeEncodeStage('{}'): failed to load the FLUX.2 VAE encoder from "
+          "VaeEncodeStage('{}'): failed to load the AutoencoderKL encoder from "
           "'{}'; inert", this->id(), vae_dir));
       _flux2_vae.reset();
     }
@@ -291,9 +426,9 @@ VaeEncodeStage::ensure_loaded_()
   }
 
   if (_family == "mage") {
-    session()->info(fmt("VaeEncodeStage('{}'): loading MageVAE encoder from "
+    load_note_(fmt("VaeEncodeStage('{}'): loading MageVAE encoder from "
                         "'{}'", this->id(), vae_dir));
-    _mage_vae = genai::MetalMageVae::load(vae_dir, mc,
+    _mage_vae = genai::MetalMageVae::load(ws, mc,
                                           mage_vae_config_(vae_dir),
                                           /*with_encoder=*/true);
     if (!_mage_vae || !_mage_vae->has_encoder()) {
@@ -344,10 +479,10 @@ VaeEncodeStage::ensure_loaded_()
     return;
   }
 
-  session()->info(fmt(
+  load_note_(fmt(
       "VaeEncodeStage('{}'): loading Qwen-Image VAE encoder from '{}'",
       this->id(), vae_dir));
-  _vae = genai::MetalKrea2Vae::load(vae_dir, mc, cfg, /*with_encoder=*/true);
+  _vae = genai::MetalKrea2Vae::load(ws, mc, cfg, /*with_encoder=*/true);
   if (!_vae || !_vae->has_encoder()) {
     session()->error(fmt(
         "VaeEncodeStage('{}'): failed to load the VAE encoder from '{}'; "
@@ -481,9 +616,9 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     _model_latched = true;
     if (const auto* mfd =
             mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
-      if (apply_model_select_beat(mfd->data, _hf_dir, _models_db)) {
-        ensure_loaded_();
-      }
+      // Records the selection only -- the weights still wait for an
+      // actual image, so a model-select beat alone never loads anything.
+      apply_model_select_beat(mfd->data, _hf_dir, _models_db);
     }
   }
   auto in = co_await ctx.read(0);
@@ -497,13 +632,22 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         "{}; skipping", this->id(), in->describe()));
     co_return;
   }
+  // THIS is where the encoder's weights are read: a real reference image
+  // has arrived, so they will actually be used. Idempotent after the
+  // first beat.
+  ensure_loaded_();
+  // A previous beat may have dropped the encoder to leave the DiT room.
+  if (_unloaded) { reload_vae_(); }
 
-  // ---- FLUX.2: encode to [dit_channels, H/16, W/16] (8x VAE + 2x patch), so
-  // the native image must be a multiple of 16. ----
+  // ---- 2D AutoencoderKL: encode to [dit_channels, H/px, W/px] with px =
+  // 8*patch -- 16 on FLUX.2 (8x VAE + 2x patch), 8 on the plain FLUX.1 VAE
+  // Boogu uses. The multiple-of-16 requirement holds for both: Boogu's DiT
+  // patches its H/8 latent 2x2, so the pixel dims still have to be even
+  // multiples of 8, and its own image processor uses vae_scale_factor 16. ----
   if (_family == "flux2") {
     if (!_flux2_vae) {
       session()->warn(fmt(
-          "VaeEncodeStage('{}'): FLUX.2 VAE encoder not loaded; skipping",
+          "VaeEncodeStage('{}'): AutoencoderKL encoder not loaded; skipping",
           this->id()));
       co_return;
     }
@@ -514,7 +658,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     const int W = resize ? _target_w : sW;
     if (!resize && ((H % 16) != 0 || (W % 16) != 0)) {
       session()->warn(fmt(
-          "VaeEncodeStage('{}'): FLUX.2 image [{}x{}] must be a positive "
+          "VaeEncodeStage('{}'): image [{}x{}] must be a positive "
           "multiple of 16 (or set target_width/height); skipping", this->id(),
           sW, sH));
       co_return;
@@ -542,11 +686,15 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     }
     if (lat.empty()) {
       session()->warn(fmt(
-          "VaeEncodeStage('{}'): FLUX.2 encode failed; skipping", this->id()));
+          "VaeEncodeStage('{}'): AutoencoderKL encode failed; skipping",
+          this->id()));
       co_return;
     }
     const int Cdit = _flux2_vae->config().dit_channels();
-    const int lh = H / 16, lw = W / 16;
+    // Pixels per latent cell: 8x conv trunk times the patch factor (2 on
+    // AutoencoderKLFlux2, 1 on the plain AutoencoderKL Boogu uses).
+    const int px = 8 * _flux2_vae->config().patch;
+    const int lh = H / px, lw = W / px;
     const std::size_t nz = (std::size_t)Cdit * lh * lw;
     auto out = std::make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::F32;
@@ -557,8 +705,9 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     for (std::size_t i = 0; i < nz; ++i) { op[i] = (float)lp[i]; }
     ++_latents_emitted;
     session()->log_debug(fmt(
-        "VaeEncodeStage('{}'): FLUX.2 encoded latent #{} [{}, {}, {}]",
+        "VaeEncodeStage('{}'): AutoencoderKL encoded latent #{} [{}, {}, {}]",
         this->id(), _latents_emitted, Cdit, lh, lw));
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -629,6 +778,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     session()->log_debug(fmt(
         "VaeEncodeStage('{}'): MageVAE encoded latent #{} [{}, {}, {}]",
         this->id(), _latents_emitted, Cz, lh, lw));
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -717,6 +867,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   session()->log_debug(fmt(
       "VaeEncodeStage('{}'): encoded + emitted latent #{} [16, {}, {}]",
       this->id(), _latents_emitted, lh, lw));
+  if (_unload_idle) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));
 }
 

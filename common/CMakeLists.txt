@@ -15,12 +15,15 @@ set(LOCAL_SOURCES
   lmdb-env.cc
   lmdb-txn.cc
   media-decode.cc
+  image-metadata.cc
   media-line.cc
   mini-http.cc
   onvif-soap.cc
   os-sandbox.cc
   path-sandbox.cc
   perf-buffer.cc
+  compare-image-channel.cc
+  mask-editor-channel.cc
   preview-channel.cc
   segment-publisher.cc
   segment-writer.cc
@@ -59,6 +62,7 @@ set(LOCAL_HEADERS
   lmdb-env.h
   lmdb-txn.h
   media-decode.h
+  image-metadata.h
   media-line.h
   mini-http.h
   onvif-soap.h
@@ -67,6 +71,8 @@ set(LOCAL_HEADERS
   path-sandbox.h
   perf-buffer.h
   perf-event.h
+  compare-image-channel.h
+  mask-editor-channel.h
   preview-channel.h
   segment-publisher.h
   segment-writer.h

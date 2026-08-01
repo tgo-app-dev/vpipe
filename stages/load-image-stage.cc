@@ -3,6 +3,8 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/image-metadata.h"
+#include "common/media-line.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -170,6 +172,12 @@ const PortSpec kOports[] = {
                            "[3,H,W]",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
+  {.name = "metadata", .doc = "FlexData {url, width, height, exif{...}, "
+                              "exif_tiff_b64} carried with the image; one "
+                              "beat per image, paired with oport 0. Feeds "
+                              "save-image's metadata iport",
+   .type = &typeid(FlexDataPayload),
+   .tags = "image-metadata", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "load-image",
@@ -432,6 +440,56 @@ LoadImageStage::decode_url_(const string& url) const
   return out;
 }
 
+unique_ptr<BeatPayloadIntf>
+LoadImageStage::build_metadata_(const string&          url,
+                                const BeatPayloadIntf& image) const
+{
+  FlexData o = FlexData::make_object();
+  o.as_object().insert_or_assign("url", FlexData::make_string(url));
+
+  const auto* tbp = dynamic_cast<const TensorBeatPayload*>(&image);
+  if (tbp != nullptr && tbp->shape.size() == 3) {
+    o.as_object().insert_or_assign(
+        "height", FlexData::make_uint((uint64_t)tbp->shape[1]));
+    o.as_object().insert_or_assign(
+        "width", FlexData::make_uint((uint64_t)tbp->shape[2]));
+  }
+
+  // EXIF comes from the FILE, not the decoder: FFmpeg surfaces none of it
+  // for stills (see common/image-metadata.h). Only a local path can be
+  // re-read here -- a remote URL would mean a second fetch, so those simply
+  // carry no exif rather than paying for one.
+  string local = url;
+  if (local.rfind("file://", 0) == 0) { local.erase(0, 7); }
+  const bool is_remote = local.find("://") != string::npos;
+  if (!is_remote) {
+    const vector<uint8_t> tiff = imgmeta::read_exif_blob(local);
+    if (!tiff.empty()) {
+      FlexData ex = imgmeta::parse_exif(tiff);
+      if (ex.is_object()) {
+        o.as_object().insert_or_assign("exif", std::move(ex));
+      }
+      o.as_object().insert_or_assign(
+          "exif_tiff_b64",
+          FlexData::make_string(media_line::base64_encode(tiff)));
+    }
+  }
+  return make_payload<FlexDataPayload>(std::move(o));
+}
+
+void
+LoadImageStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately -- its url list is already consumed, so
+  // nothing downstream would see an image and the pipeline would
+  // "complete" in milliseconds.
+  _next = 0;
+}
+
 Job
 LoadImageStage::process(RuntimeContext& ctx)
 {
@@ -455,7 +513,15 @@ LoadImageStage::process(RuntimeContext& ctx)
   const string url = _urls[_next++];
   auto payload = decode_url_(url);
   if (payload) {
+    // Build the metadata beat BEFORE the image moves out of `payload` (it
+    // reads the decoded dimensions), and emit it only when oport 1 is wired
+    // -- reading EXIF costs a file read, so an unwired graph pays nothing.
+    unique_ptr<BeatPayloadIntf> meta;
+    if (ctx.num_oports() > 1 && ctx.has_consumers(1)) {
+      meta = build_metadata_(url, *payload);
+    }
     co_await ctx.write(0, std::move(payload));
+    if (meta) { co_await ctx.write(1, std::move(meta)); }
   }
 
   // No iport => batch mode: signal done as soon as we've emitted (or

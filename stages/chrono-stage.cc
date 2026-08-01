@@ -188,6 +188,19 @@ ChronoStage::spec() const noexcept
   return kSpec;
 }
 
+void
+ChronoStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately -- a `count`-limited chrono would never
+  // tick again, and everything it drives would sit idle while the
+  // pipeline "completed" in milliseconds.
+  _emitted = 0;
+}
+
 Job
 ChronoStage::process(RuntimeContext& ctx)
 {

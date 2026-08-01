@@ -204,12 +204,19 @@ SaveVideoStage::spec() const noexcept
 
 SaveVideoStage::~SaveVideoStage()
 {
-  if (!_finalized) {
-    // Best-effort cleanup if pipeline never reached EOS path.
-    finalize_();
-  }
+  release_media_();
+  // Ctor-owned scratch, not per-run state -- freed only here.
   if (_enc_pkt) {
     _libs->avcodec().api.packet_free(&_enc_pkt);
+  }
+}
+
+void
+SaveVideoStage::release_media_()
+{
+  if (!_finalized) {
+    // Best-effort cleanup if the pipeline never reached the EOS path.
+    finalize_();
   }
   if (_venc) {
     _libs->avcodec().api.free_context(&_venc);
@@ -224,6 +231,24 @@ SaveVideoStage::~SaveVideoStage()
     _libs->avformat().api.free_context(_ofctx);
     _ofctx = nullptr;
   }
+  _vstream = nullptr;
+  _astream = nullptr;
+}
+
+void
+SaveVideoStage::reset_run_state()
+{
+  // Free the PREVIOUS run's muxer + encoders before clearing the flags
+  // that say they exist -- otherwise this launch rebuilds them and the
+  // old ones leak until the stage is destroyed.
+  release_media_();
+  _video_initialized = false;
+  _audio_initialized = false;
+  _video_eos         = false;
+  _audio_eos         = false;
+  _header_written    = false;
+  _finalized         = false;
+  _next_port         = 0;
 }
 
 string

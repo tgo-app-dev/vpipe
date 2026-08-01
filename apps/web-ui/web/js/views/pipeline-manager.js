@@ -1192,13 +1192,24 @@ function mountEditor(container, opts = {}) {
   //   - undefined  -> "field intentionally unset, omit from POST"
   //   - any other  -> value to send under f.key
   //
-  // Numeric and string fields render EMPTY when the backend reports
-  // `present === false`, with the schema default in the placeholder so
-  // the user knows what the value will resolve to if left blank. This
-  // lets the user wipe a field (e.g. chrono's frequency_hz) so the
-  // mutually-exclusive period_* set is the only thing that arrives at
-  // the stage's validator. Bool toggles are tri-state via a small
-  // "unset" affordance to support the same pattern.
+  // Fields render EMPTY when the backend reports `present === false`, with
+  // the schema default in the placeholder so the user knows what the value
+  // resolves to if left blank. This lets the user wipe a field (e.g. chrono's
+  // frequency_hz) so the mutually-exclusive period_* set is the only thing
+  // that reaches the stage's validator.
+  //
+  // How "empty" is read back depends on whether the type HAS an empty value:
+  //   bool / string / text  tri-state. An omitted key and a key present as ""
+  //                         (or a present `false`) are different configs, so
+  //                         `unset` is tracked explicitly rather than inferred
+  //                         from the box being blank. The Clear button moves
+  //                         between the two and shows which is live.
+  //   int / uint / real     blank == unset. There is no "empty number".
+  //   array / object / any  blank == unset. An empty box is not valid JSON.
+  //
+  // Anything that fully determines a value on its own -- Clear/unset, a
+  // checkbox flip, a path or model pick -- calls `onCommit` straight away;
+  // free-text boxes wait for the blur-after-edit `change` instead.
   //
   // Backward-compat: older backends predate the `present` flag. When
   // it's absent we fall back to "show whatever current is" so the
@@ -1327,6 +1338,56 @@ function mountEditor(container, opts = {}) {
         ? !!f.present
         : (f.current !== undefined && f.current !== null);
     let input, read, unsetBtn = null, datalist = null, browseBtn = null;
+    // Two-state fields (numbers, JSON) have no "present but empty" reading --
+    // an empty number is not a number, an empty box is not valid JSON -- so
+    // blank IS unset and `read()` already omits the key. They still need the
+    // same INDICATOR the tri-state fields below get, or the button keeps
+    // offering "clear" on a field that is already cleared and nothing
+    // distinguishes unset from set. Assigned per branch; called after any
+    // programmatic change to the box.
+    let syncUnset = () => {};
+    const emptyMeansUnset = () => {
+      syncUnset = () => {
+        const unset = input.value.trim() === '';
+        input.classList.toggle('field-unset', unset);
+        unsetBtn.textContent = unset ? t('pl.btn_unset') : t('pl.btn_clear');
+        unsetBtn.title = unset ? t('pl.unset_type_value') : t('pl.clear_omit');
+        unsetBtn.classList.toggle('active', unset);
+      };
+      input.addEventListener('input', () => syncUnset());
+    };
+    // Tri-state for the free-text fields (string / text). An OMITTED key and a
+    // key present as "" are different configs -- the first lets the stage fall
+    // back to its declared default, the second forces an empty value -- so an
+    // empty box alone cannot mean both. Track `unset` explicitly: typing marks
+    // the field set (even when the text is deleted back to empty), and the
+    // button is what moves between the two, clearing to unset and back to an
+    // explicit empty. Placeholder and button label show which state is live.
+    // Returns the field's `read`; assigns the shared `unsetBtn`.
+    const textTriState = () => {
+      let unset = !present;
+      const sync = () => {
+        input.classList.toggle('field-unset', unset);
+        input.placeholder = unset ? placeholder : t('pl.empty_value');
+        unsetBtn.textContent = unset ? t('pl.btn_unset') : t('pl.btn_clear');
+        unsetBtn.title = unset ? t('pl.set_empty') : t('pl.clear_omit');
+        unsetBtn.classList.toggle('active', unset);
+      };
+      input.addEventListener('input', () => {
+        if (unset) { unset = false; sync(); }
+      });
+      unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
+        disabled, onclick: () => {
+          unset = !unset;
+          if (unset) { input.value = ''; } else { input.focus(); }
+          sync();
+          // Clearing (or un-clearing) is a complete edit on its own; there is
+          // no blur to wait for, so commit now.
+          if (onCommit) { onCommit(); }
+        } });
+      sync();
+      return () => (unset ? undefined : input.value);
+    };
     if (f.type === 'bool') {
       // Two-state checkbox + an "unset" badge that toggles tri-state
       // by removing the field entirely on the next read.
@@ -1340,8 +1401,16 @@ function mountEditor(container, opts = {}) {
       };
       unsetBtn = el('button', { class: 'btn ghost mini',
         type: 'button', title: t('pl.omit_field'),
-        disabled, onclick: () => { unset = !unset; updateUi(); } });
+        disabled, onclick: () => {
+          unset = !unset; updateUi();
+          // Toggling set/unset IS the whole edit for a checkbox -- there is
+          // no blur to wait for, so commit immediately.
+          if (onCommit) { onCommit(); }
+        } });
       updateUi();
+      // Same for flipping the checkbox itself: `change` fires on click, and
+      // the value is already final at that point.
+      input.addEventListener('change', () => { if (onCommit) { onCommit(); } });
       read = () => (unset ? undefined : input.checked);
     } else if (f.type === 'int' || f.type === 'uint' || f.type === 'real') {
       input = el('input', { type: 'number', id, disabled,
@@ -1356,6 +1425,9 @@ function mountEditor(container, opts = {}) {
       input.addEventListener('wheel', (e) => {
         if (document.activeElement === input) { e.preventDefault(); }
       }, { passive: false });
+      // An empty number box has no "present but empty" reading -- there is no
+      // such number -- so blank always means unset, for both the Clear button
+      // and a manual delete.
       read = () => {
         const s = input.value.trim();
         if (s === '') { return undefined; }
@@ -1363,9 +1435,14 @@ function mountEditor(container, opts = {}) {
         return Number.isNaN(n) ? NaN : n;
       };
       unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
-        title: t('pl.clear_omit'),
-        disabled, onclick: () => { input.value = ''; input.focus(); } },
-        t('pl.btn_clear'));
+        disabled, onclick: () => {
+          // Already unset: nothing to clear, so just invite a value.
+          if (input.value.trim() === '') { input.focus(); return; }
+          input.value = ''; syncUnset(); input.focus();
+          if (onCommit) { onCommit(); }
+        } });
+      emptyMeansUnset();
+      syncUnset();
     } else if (f.type === 'string') {
       input = el('input', { type: 'text', id, disabled,
         placeholder,
@@ -1441,19 +1518,7 @@ function mountEditor(container, opts = {}) {
           }, 0);
         }
       }
-      read = () => {
-        const s = input.value;
-        // Empty input -> omit so the stage falls back to its declared
-        // default. Stages that legitimately need an explicit empty
-        // string can declare a non-empty default and use the JSON
-        // textarea (any-typed) path -- we don't try to round-trip ""
-        // through the convenience text input.
-        return s === '' ? undefined : s;
-      };
-      unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
-        title: t('pl.clear_omit'),
-        disabled, onclick: () => { input.value = ''; input.focus(); } },
-        t('pl.btn_clear'));
+      read = textTriState();
     } else if (f.type === 'text') {
       // Multi-line string (backend ConfigType::Text): to the backend this is
       // identical to a `string` field, but the value is multi-line, so render
@@ -1462,29 +1527,28 @@ function mountEditor(container, opts = {}) {
       // significant, so don't trim).
       input = el('textarea', { id, disabled, rows: 4, placeholder },
         present ? String(f.current ?? '') : '');
-      read = () => {
-        const s = input.value;
-        // Empty -> omit so the stage falls back to its declared default
-        // (mirrors the single-line `string` field above).
-        return s === '' ? undefined : s;
-      };
-      unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
-        title: t('pl.clear_omit'),
-        disabled, onclick: () => { input.value = ''; input.focus(); } },
-        t('pl.btn_clear'));
+      read = textTriState();     // same unset-vs-empty split as `string`
     } else {
       // array / object / any -> JSON textarea.
       input = el('textarea', { id, disabled, placeholder },
         present ? JSON.stringify(f.current ?? null, null, 2) : '');
+      // An empty JSON box is not a value either (it does not parse), so blank
+      // means unset here too -- no present-but-empty state to distinguish.
       read = () => {
         const s = input.value.trim();
         if (s === '') { return undefined; }
         return JSON.parse(s);
       };
       unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
-        title: t('pl.clear_omit'),
-        disabled, onclick: () => { input.value = ''; input.focus(); } },
-        t('pl.btn_clear'));
+        disabled, onclick: () => {
+          if (input.value.trim() === '') { input.focus(); return; }
+          input.value = ''; syncUnset(); input.focus();
+          // Safe to commit even though the JSON box has no blur-commit: an
+          // empty box always reads cleanly as "unset", never a parse error.
+          if (onCommit) { onCommit(); }
+        } });
+      emptyMeansUnset();
+      syncUnset();
     }
     // Filesystem-path fields (backend `is_path`) get a Browse… button
     // that opens the sandbox-aware file dialog. String fields take the

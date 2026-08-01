@@ -81,6 +81,10 @@ public:
   int sr = 24000;
   int n  = 24000;   // 1 s
 
+  // The very thing Stage::reset_run_state exists for: without this the
+  // source is exhausted after run 1 and a relaunch emits nothing.
+  void reset_run_state() override { _sent = false; }
+
   Job process(RuntimeContext& ctx) override
   {
     if (_sent) { ctx.signal_done(); co_return; }
@@ -159,6 +163,38 @@ run_one_(Session& sess, FlexData cfg)
 }  // namespace
 
 // ---- Always-on config tests ------------------------------------------
+
+// A relaunch must REWRITE the configured file, not spill into the
+// per-run index (out.wav -> out-001.wav -> out-002.wav). Naming between
+// launches is the operator's business; the stage must not invent it.
+TEST(save_audio_stage, relaunch_rewrites_the_same_file) {
+  Session sess;
+  CerrSilencer hush;
+  const string dir  = make_tempdir_();
+  const string path = dir + "/out.wav";
+  const string sfx  = dir + "/out-001.wav";
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<OneSineSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->allocate_oports(1);
+  auto* src = static_cast<OneSineSource*>(pl->insert_stage(std::move(src_u)));
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_path", FlexData::make_string(path));
+  auto st_u = make_unique<SaveAudioStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(cfg));
+  pl->insert_stage(std::move(st_u));
+
+  for (int run = 0; run < 3; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  EXPECT_TRUE(!slurp_(path).empty());    // the configured file exists
+  EXPECT_TRUE(slurp_(sfx).empty());      // and no -001 sibling
+  std::filesystem::remove_all(dir);
+}
 
 TEST(save_audio_stage, type_is_registered) {
   EXPECT_TRUE(string_view(SaveAudioStage::kTypeName) == "save-audio");

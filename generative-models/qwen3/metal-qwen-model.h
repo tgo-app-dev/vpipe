@@ -22,6 +22,7 @@
 #include "generative-models/metal-token-muxer.h"
 #include "generative-models/model-exec.h"         // GpuSamplerParams
 #include "generative-models/shared/kernel-autotune.h"  // TuningReport
+#include "generative-models/shared/mma-splitk.h"        // MmaSplitK
 #include "generative-models/shared/kernel-sets/decode-gqa-attn-set.h"
 #include "generative-models/shared/kernel-sets/prefill-gqa-attn-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
@@ -44,6 +45,7 @@ namespace vpipe::genai {
 
 struct ModelConfig;
 class I8GemmContext;   // fwd (shared/i8-gemm.h)
+class WeightSet;       // generative-models/weight-set.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
@@ -204,6 +206,17 @@ public:
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second stage naming
+  // this same directory joins it instead of loading the weights again.
+  // The reads themselves are owned copies -- mapping was measured to
+  // cost MORE here, because load_mapped wraps the whole shard and this
+  // model converts most tensors anyway, so it would pay both bills.
+  static std::unique_ptr<MetalQwenModel> load(
+      std::shared_ptr<WeightSet> ws,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
   // Derive the shape-affecting Config from a parsed ModelConfig
   // (config.json). The single source of truth for mapping the HF
   // config onto this backend, shared by the production loader and the
@@ -225,6 +238,10 @@ public:
   std::vector<float> forward(std::int32_t token_id) {
     return forward(_cid, token_id);
   }
+  // Qwen3-VL deepstack injection; defined below, next to the taps forward
+  // that introduced it.
+  struct DeepstackInject;
+
   // Multimodal prefill: pre-spliced embeddings (text + image) as
   // [n*hidden] row-major f32, and 3-axis mROPE position_ids as [3*n]
   // (row 0=T, 1=H, 2=W). Returns [vocab] logits at the last position.
@@ -255,9 +272,14 @@ public:
   // [n*hidden] SharedBuffer already in the compute dtype (f16) -- skips
   // the host-f32 -> GPU upload + cast. Returns [vocab] logits at the
   // last position; empty on failure.
+  // `deepstack` (Qwen3-VL) injects the tower's per-layer features into the
+  // image rows exactly as forward_embeddings_taps does -- the stock Qwen3-VL
+  // forward applies them, so a multimodal GENERATION (Mage-Flow's edit
+  // content screen) needs them to match the reference's .generate().
   std::vector<float> prefill_multimodal_buf(
       ContextId cid, metal_compute::SharedBuffer&& x,
-      const std::vector<std::int32_t>& position_ids, int n);
+      const std::vector<std::int32_t>& position_ids, int n,
+      const DeepstackInject* deepstack = nullptr);
   std::vector<float> prefill_embeddings_buf(
       ContextId cid, metal_compute::SharedBuffer&& x, int n);
 
@@ -296,6 +318,15 @@ public:
     std::vector<int> layers;                          // LM layers to inject after
     int row0 = 0;                                     // first image-token row
     int rows = 0;                                     // # image tokens (== feat rows)
+    // MULTI-REFERENCE prompts whose vision blocks are separated by text (e.g.
+    // Qwen-Image-Edit's "Picture 1: <block>Picture 2: <block>") put the image
+    // tokens in DISJOINT runs, so one (row0, rows) span cannot address them.
+    // Each Seg is {first row in x, row count, first row in the feature buffer};
+    // the features stay CONCATENATED across references in prompt order. EMPTY
+    // (the default) keeps the single contiguous (row0, rows) above, so every
+    // existing single-reference caller is unaffected.
+    struct Seg { int row0 = 0; int rows = 0; int feat_row = 0; };
+    std::vector<Seg> segs;
   };
 
   metal_compute::SharedBuffer
@@ -938,6 +969,10 @@ private:
     // (w8 [1, H]). All affine group_size 64.
     metal_compute::SharedBuffer rgw, rgs, rgb;     // router gate (w8) [E,H]
     metal_compute::SharedBuffer eguw, egus, egub;  // experts gate|up (w4) [E,2I,H]
+    // De-fused routed up-proj [E,I,H]: built ONLY when this layer's gate and
+    // up widths disagree AND the model chose the de-fused strategy (see
+    // `moe_unfused`); then eguw/egus/egub hold gate alone (also [E,I,H]).
+    metal_compute::SharedBuffer euw, eus, eub;
     metal_compute::SharedBuffer edw, eds, edb;     // experts down (w4) [E,H,I]
     metal_compute::SharedBuffer sguw, sgus, sgub;  // shared gate|up (w4) [2S,H]
     metal_compute::SharedBuffer sdw, sds, sdb;     // shared down (w4) [H,S]
@@ -970,8 +1005,21 @@ private:
     // (kw/vw built). o_proj is always per-tensor (own o_bits).
     bool qkv_fused = false;
     // Routed-expert (MoE switch_mlp) quant width: 4 or 8. Selects the w4/w8
-    // gather + grouped expert kernels at dispatch (router/shared stay w8).
-    int eg_bits = 4;
+    // gather + grouped expert kernels at dispatch (router stays w8).
+    // Per-LAYER, not global: OptiQ varies the expert width across layers.
+    int eg_bits = 4;   // gate|up (the interleaved slab), or gate alone when
+                       // de-fused
+    int eu_bits = 4;   // up alone, de-fused layers only
+    int ed_bits = 4;   // down (its own tensor, so always its own width)
+    int se_bits = 4;   // shared expert gate|up (interleaved, so they agree)
+    int sd_bits = 4;   // shared expert down (its own tensor, own dispatch)
+    int r_bits = 8;    // router (mlp.gate); w8 in every pack seen so far
+    // Set when gate and up disagree in width: they cannot share one
+    // interleaved slab, so each keeps its own [E, I, H] slab at its NATIVE
+    // width and the mixed-width fused kernel widens in registers. Costs no
+    // extra DRAM traffic and no scratch -- unlike widening w4->w8 at load,
+    // which would double that tensor's per-token read.
+    bool moe_split = false;
 
     // ---- Native k-quant (GGUF) weights (used iff the model is _kquant) --
     // Heterogeneous per-tensor quant (Q4_K_M mixes q4/q5/q6), so each
@@ -1120,6 +1168,11 @@ private:
       // 8-bit twins of the routed-expert kernels above (selected at dispatch
       // when the experts are w8-quantized; router/shared gates stay w8).
       _fn_moe_gather_swiglu_w8, _fn_moe_gather_down_w8,
+      // Mixed-width fused expert SwiGLU (gate/up at different widths, each
+      // read natively), + the w8 shared-expert SwiGLU twins (the shared
+      // expert carries its OWN width, which OptiQ can set above the global).
+      _fn_moe_gather_swiglu_g4u8, _fn_moe_gather_swiglu_g8u4,
+      _fn_qmv_swiglu8, _fn_qmm_swiglu8,
       _fn_moe_grouped_swiglu_w8, _fn_moe_grouped_down_w8,
       _fn_moe_qmm_grouped_w8, _fn_moe_qmm_grouped_swiglu_w8,
       // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
@@ -1214,9 +1267,20 @@ private:
   bool _use_mma = false;
   // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
   std::unique_ptr<I8GemmContext> _i8;
+  // Split-K for the very deep down_proj contraction (Qwen3.6-27B, K=17408).
+  // Inert on every other checkpoint -- it keys on the exact depth.
+  MmaSplitK _splitk;
   // Min rows (M) to prefer the matrix-core GEMM. Below this the steel
   // path's lower fixed cost + no dequant pass wins. Override with
   // VPIPE_QWEN_MMA_MIN_M.
+  //
+  // Stays 64. Raising it to 128 (one full BM tile) looks right from the block
+  // bench -- at M=64 the 128-row tile is half empty and the matrix-core rate
+  // halves, so steel wins 1.27-1.39x on the LARGE OptiQ blocks -- but that is
+  // only true where the dequant pass is big relative to the GEMM. Measured end
+  // to end on Qwen3.5-4B-OptiQ at a 96-token prefill, 128 costs 29%: 515 ->
+  // 365 tok/s. The block bench and the model disagree because the block bench
+  // was swept at the 27B/31B shapes, whose weights are 4-9x larger.
   int _mma_min_m = 64;
   // Min prefill length (n) to prefer the matrix-core flash attention over
   // the scalar query-tiled kernel (attention is tiny below this; matmul2d
@@ -1640,6 +1704,12 @@ private:
   // Batched-sample (lc_sample_batch_f16) extras: _lc_ws_p is sized [K*vocab]
   // for the K concurrent rows; _lc_seed_in holds the per-row 32-bit seeds.
   metal_compute::SharedBuffer _lc_seed_in;
+
+  // The checkpoint, held for this model's whole life. The weights are
+  // owned copies rather than views, so this is the reference count that
+  // keeps the set (and the manager's record of it) alive, not a
+  // lifetime dependency of the buffers.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

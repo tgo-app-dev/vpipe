@@ -142,6 +142,40 @@ TEST(model_select, emits_one_beat_to_all_consumers)
   EXPECT_TRUE(d1.first == "/models/flux2" && d1.second == "models");
 }
 
+// A source must emit again on a RELAUNCH. Stopping a pipeline destroys
+// the runtime, not the stages, so a Stop-then-Start re-enters
+// initialize() on the same ModelSelectStage with its one-shot latch
+// still set from the previous run. Before the per-launch reset it
+// emitted nothing on run 2 and signalled done immediately -- which
+// silently killed every consumer waiting on the model beat (the whole
+// diffusion chain) while the pipeline "completed" in milliseconds.
+TEST(model_select, emits_again_on_relaunch)
+{
+  Session sess;
+  CerrSilencer hush;
+  auto pl = make_unique<Pipeline>("p", &sess);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("hf_dir", FlexData::make_string("/models/flux2"));
+  auto ms_u = make_unique<ModelSelectStage>(
+      &sess, "ms", vector<InEdge>{}, std::move(cfg));
+  auto* ms = static_cast<ModelSelectStage*>(pl->insert_stage(std::move(ms_u)));
+  auto sk_u = make_unique<SinkCapture>(
+      &sess, "s0", vector<InEdge>{{ms, 0}}, FlexData::make_object());
+  auto* sk = static_cast<SinkCapture*>(pl->insert_stage(std::move(sk_u)));
+
+  // Three launches over the SAME stage objects: one beat each time.
+  for (int run = 1; run <= 3; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    ASSERT_TRUE(sk->captured.size() == static_cast<size_t>(run));
+    const auto d = beat_dirs_(sk->captured[run - 1]);
+    EXPECT_TRUE(d.first == "/models/flux2" && d.second == "models");
+  }
+}
+
 // The shared beat parser: overrides hf_dir (string or object; "model" alias)
 // and only overrides models_db when the beat carries one.
 TEST(model_select, apply_beat_parses_forms)

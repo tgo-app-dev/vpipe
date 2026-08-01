@@ -28,6 +28,8 @@ namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
 
 namespace vpipe::genai {
 
+class WeightSet;   // generative-models/weight-set.h
+
 class MetalLlamaModel {
 public:
   struct Config {
@@ -54,6 +56,17 @@ public:
   // Returns nullptr on failure.
   static std::unique_ptr<MetalLlamaModel> load(
       const std::string& model_dir,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second stage naming
+  // this same directory joins it instead of loading the weights again.
+  // The reads themselves are owned copies -- mapping was measured to
+  // cost MORE here, because load_mapped wraps the whole shard and this
+  // model converts most tensors anyway, so it would pay both bills.
+  static std::unique_ptr<MetalLlamaModel> load(
+      std::shared_ptr<WeightSet> ws,
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
@@ -273,6 +286,12 @@ private:
   // multi-simdgroup recovers ~32x KV-scan parallelism at long ctx).
   // Override with VPIPE_SDPA_MB_MIN.
   int _sdpa_mb_min = 128;
+
+  // The checkpoint, held for this model's whole life. The weights are
+  // owned copies rather than views, so this is the reference count that
+  // keeps the set (and the manager's record of it) alive, not a
+  // lifetime dependency of the buffers.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

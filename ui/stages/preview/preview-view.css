@@ -1,0 +1,96 @@
+/* Styling for the preview stage's panel.
+ *
+ * Ships with the stage, embedded in libvpipe and injected by the host
+ * the first time the panel mounts -- it is not part of the app's
+ * stylesheet. It does use the host's DESIGN TOKENS (--bg-*, --fg-*,
+ * --line, --accent-*) and generic utilities (.btn), which are the
+ * front end's theme contract; everything preview-specific is here,
+ * including the view-control buttons (previously borrowed from the
+ * pipeline editor's .graph-ctl) and the waiting animation. */
+
+.preview-picker {
+  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.preview-picker-title { color: var(--fg-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .6px; }
+.preview-list { display: flex; flex-direction: column; gap: 6px; }
+.preview-item {
+  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
+}
+.preview-item:hover { background: var(--bg-3); border-color: #475061; }
+.preview-item-name { font-weight: 600; font-size: 12px; }
+.preview-item-sub { color: var(--fg-dim); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-hint { color: var(--fg-dim); font-size: 11.5px; padding: 6px 2px; }
+/* A designated-but-not-yet-live stage: a live stage is flagged; the waiting
+   state shows a slowly-flipping hourglass. */
+.preview-item.live { border-left: 2px solid var(--accent-2); }
+.preview-item.live .preview-item-sub { color: var(--accent-2); }
+.preview-waiting { display: flex; justify-content: center; padding: 4px 0; }
+.preview-waiting .icon {
+  animation: preview-hourglass 1.1s ease-in-out infinite;
+  transform-origin: 50% 50%; opacity: .8;
+}
+@keyframes preview-hourglass {
+  0%, 55% { transform: rotate(0deg); }
+  100%    { transform: rotate(180deg); }
+}
+/* The playing screen fills the panel body as a column so the video gets a
+   real box to letterbox into (object-fit: contain) and the status pins
+   under it -- independent of whether the host body is a flex container. */
+.preview-play {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; min-height: 0;
+}
+/* The zoom/pan viewport clips the transformed media; the media wrapper
+   stacks the MSE <video> and the still-image <img> (one visible). */
+.preview-viewport {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  overflow: hidden; background: #000;
+  touch-action: none;              /* pointer drag pans, not scrolls */
+}
+.preview-viewport.zoomable { cursor: grab; }
+.preview-viewport.panning  { cursor: grabbing; }
+/* Sized in JS to the on-screen frame rect (so the browser rasterizes at
+   the zoomed resolution -- sharp); translate-only transform pans it. */
+.preview-media {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  transform-origin: top left; will-change: transform;
+  user-select: none;
+}
+.preview-video, .preview-still {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  background: #000; object-fit: contain;
+}
+.preview-still {
+  display: none;                   /* video is the default face */
+  pointer-events: none; -webkit-user-drag: none;
+}
+.preview-media.show-still .preview-video { display: none; }
+.preview-media.show-still .preview-still { display: block; }
+/* View controls (zoom / fit / center), overlaid bottom-left. Greyed out
+   for an audio-only stream. */
+.preview-controls {
+  position: absolute; left: 10px; bottom: 10px;
+  display: flex; gap: 4px; z-index: 2;
+}
+.preview-ctl {
+  min-width: 28px; height: 26px; padding: 0 7px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 5px; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.preview-ctl:hover { background: var(--bg-3); border-color: #475061; }
+.preview-viewport.no-view .preview-controls {
+  opacity: .4; pointer-events: none;
+}
+.preview-status {
+  flex: 0 0 auto; padding: 6px 10px; color: var(--fg-dim);
+  font-size: 11px; background: var(--bg-1);
+  border-top: 1px solid var(--line);
+}
+.preview-status:empty { display: none; }

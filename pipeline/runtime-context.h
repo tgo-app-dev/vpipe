@@ -55,6 +55,27 @@ public:
     return static_cast<unsigned>(_in_readers.size());
   }
 
+private:
+  // Reading a positional iport a stage does NOT have -- `ctx.read(0)` on a
+  // stage launched with no inputs at all (e.g. `vpipe --launch-stage
+  // video-to-rgb`) -- used to index past the end of `_in_readers` and
+  // dereference garbage, segfaulting the whole process. There is a correct
+  // answer already in the model: the runtime gives a declared-but-UNWIRED
+  // iport a parent-less EdgeReader that reads as permanent EOS, so an absent
+  // port behaves the same way. Every stage's existing
+  // `if (!beat) { signal_done(); }` path then ends the stage cleanly instead
+  // of crashing.
+  EdgeReader*
+  reader_(unsigned p) const noexcept
+  {
+    if (p < _in_readers.size() && _in_readers[p] != nullptr) {
+      return _in_readers[p];
+    }
+    return &_eos_reader;
+  }
+
+public:
+
   // True iff positional iport `p` is wired to a producer. A declared
   // but DISCONNECTED (optional) iport reads as immediate EOS; this
   // distinguishes "unwired" from "wired producer that has finished".
@@ -80,7 +101,7 @@ public:
   std::uint32_t
   backlog(unsigned p) const noexcept
   {
-    return _in_readers[p]->backlog();
+    return reader_(p)->backlog();
   }
 
   // True iff iport `p` is drained AND closed -- a subsequent read()
@@ -91,7 +112,7 @@ public:
   bool
   eos(unsigned p) const
   {
-    return _in_readers[p]->at_eos();
+    return reader_(p)->at_eos();
   }
 
   unsigned num_oports() const noexcept
@@ -114,7 +135,7 @@ public:
   EdgeReader::ReadAwaiter
   read(unsigned in_port)
   {
-    return _in_readers[in_port]->read();
+    return reader_(in_port)->read();
   }
 
   // Window peek: borrow at cursor + offset. Suspends until written.
@@ -122,7 +143,7 @@ public:
   EdgeReader::PeekAwaiter
   peek(unsigned in_port, std::uint32_t offset = 0)
   {
-    return _in_readers[in_port]->peek(offset);
+    return reader_(in_port)->peek(offset);
   }
 
   // Suspend until ANY of `ports` is readable (a beat is available or
@@ -194,7 +215,7 @@ public:
   {
     std::vector<EdgeReader*> rs;
     rs.reserve(ports.size());
-    for (unsigned p : ports) { rs.push_back(_in_readers[p]); }
+    for (unsigned p : ports) { rs.push_back(reader_(p)); }
     return ReadAnyAwaiter{ std::move(rs), {} };
   }
 
@@ -205,14 +226,14 @@ public:
   EdgeReader::AcquireAwaiter
   acquire(unsigned in_port)
   {
-    return _in_readers[in_port]->acquire();
+    return reader_(in_port)->acquire();
   }
 
   // Explicit advance. Non-blocking.
   void
   release_read(unsigned in_port, std::uint32_t n = 1)
   {
-    _in_readers[in_port]->release_read(n);
+    reader_(in_port)->release_read(n);
   }
 
   // Push a payload to the oport buffer.
@@ -259,6 +280,10 @@ public:
 private:
   std::vector<EdgeReader*>  _in_readers;
   std::vector<OportBuffer*> _out_bufs;
+  // Parent-less => permanently at EOS. Stands in for any iport index the
+  // stage does not actually have (see reader_). `mutable` so the const
+  // accessors above can hand out a usable pointer.
+  mutable EdgeReader        _eos_reader{nullptr, 0};
   std::atomic<bool>*        _stop;
   bool                      _done = false;
 };

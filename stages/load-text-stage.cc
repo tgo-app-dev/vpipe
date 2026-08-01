@@ -105,6 +105,19 @@ LoadTextStage::spec() const noexcept
   return kSpec;
 }
 
+void
+LoadTextStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately -- its path list is already consumed, so
+  // nothing downstream would see a line and the pipeline would
+  // "complete" in milliseconds.
+  _next = 0;
+}
+
 Job
 LoadTextStage::process(RuntimeContext& ctx)
 {

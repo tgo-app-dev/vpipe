@@ -36,6 +36,45 @@ model_catalog()
       "text_encoder/video_preprocessor_config.json",
       "scheduler/scheduler_config.json"};
 
+  // All four Boogu-Image-0.1 repos are byte-identical in layout, so one pinned
+  // list serves them. It SKIPS the assets/ showcase images and the two
+  // `trust_remote_code` .py shims (compatibility re-exports that only point
+  // diffusers at the upstream python package -- vpipe reads the configs
+  // directly). The processor/ side carries the fast tokenizer + the chat
+  // template the conditioner renders; mllm/ keeps its own tokenizer copy for
+  // completeness. ~36 GB (10B DiT + 8B Qwen3-VL, bf16).
+  static const std::vector<std::string> kBooguFiles = {
+      "model_index.json",
+      "transformer/config.json",
+      "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+      "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+      "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+      "mllm/config.json",
+      "mllm/generation_config.json",
+      "mllm/model.safetensors.index.json",
+      "mllm/model-00001-of-00004.safetensors",
+      "mllm/model-00002-of-00004.safetensors",
+      "mllm/model-00003-of-00004.safetensors",
+      "mllm/model-00004-of-00004.safetensors",
+      "mllm/preprocessor_config.json",
+      "mllm/video_preprocessor_config.json",
+      "mllm/tokenizer.json",
+      "mllm/tokenizer_config.json",
+      "mllm/chat_template.json",
+      "vae/config.json",
+      "vae/diffusion_pytorch_model.safetensors",
+      "processor/tokenizer.json",
+      "processor/tokenizer_config.json",
+      "processor/preprocessor_config.json",
+      "processor/video_preprocessor_config.json",
+      "processor/chat_template.jinja",
+      "processor/special_tokens_map.json",
+      "processor/added_tokens.json",
+      "processor/vocab.json",
+      "processor/merges.txt",
+      "scheduler/scheduler_config.json"};
+
   static const std::vector<ModelCatalogEntry> kCatalog = {
     // ---- Evaluation datasets (model-eval stage) ----------------------
     // Fetched on demand from the HuggingFace datasets-server /rows API and
@@ -84,6 +123,18 @@ model_catalog()
      .variant = "bf16 (Qwen)",
      .hf_path = "Qwen/Qwen3.6-27B",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // The same 27B, pre-quantized OptiQ: mixed 4/8-bit per LINEAR over a
+    // group-64 affine base (the per-tensor mixed path -- q/k/v/o, the GDN
+    // in_proj group and the MLP each carry their own width; embed_tokens
+    // and lm_head are w8). Whole-repo fetch: 4 shards plus the OptiQ
+    // companions in optiq/ -- mtp.safetensors (the MTP draft head, read
+    // when VPIPE_QWEN_CTX_MTP is set) and optiq_vision.safetensors (the
+    // vision tower). The tree listing is recursive, so the subdir comes
+    // along.
+    {.family = "Qwen", .version = "3.6", .param_class = "27B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.6-27B-OptiQ-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -91,6 +142,20 @@ model_catalog()
     {.family = "Qwen", .version = "3.6", .param_class = "35B-A3B",
      .variant = "bf16 (Qwen)",
      .hf_path = "Qwen/Qwen3.6-35B-A3B",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // The same 35B-A3B, pre-quantized OptiQ mixed 4/8-bit (256 routed
+    // experts + shared expert; router / shared expert / embed / lm_head w8).
+    // Whole-repo fetch (5 shards + the optiq/ companions). Verified
+    // end-to-end. This is the mixed-precision MoE case: the routed experts
+    // disagree across gate/up/down inside layers 1, 3 and 39, and the shared
+    // expert sits at w8 on all 40 layers over a w4-global model, so every
+    // expert dispatch takes its width per TENSOR. Layers whose gate and up
+    // disagree cannot share the interleaved slab and run the mixed-width
+    // fused SwiGLU (affine_gather_qmv_swiglu_w4w8g64 / _w8w4g64), which
+    // reads each side at its native width.
+    {.family = "Qwen", .version = "3.6", .param_class = "35B-A3B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
     {.family = "Qwen", .version = "3.5", .param_class = "9B",
      .variant = "MLX 4-bit (lmstudio-community)",
@@ -187,9 +252,30 @@ model_catalog()
      .variant = "GGUF QAT q4_0 (google, gated)",
      .hf_path = "google/gemma-4-12B-it-qat-q4_0-gguf",
      .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    // Pre-quantized OptiQ: mixed 4/8-bit per LINEAR over a group-64 affine
+    // base -- the per-tensor mixed path (`_mixed` in metal-gemma-model.cc,
+    // detected by probing each layer's q/k/v + gate/up widths). Whole-repo
+    // fetch; the recursive tree walk also picks up optiq/optiq_vision.
     {.family = "Gemma", .version = "4", .param_class = "12B",
      .variant = "MLX OptiQ 4-bit (mlx-community)",
      .hf_path = "mlx-community/gemma-4-12B-it-OptiQ-4bit",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    // The dense 31B, same per-layer tensor layout as the 12B OptiQ above
+    // (60 layers, hidden 5376) -- it loads on the same mixed path.
+    {.family = "Gemma", .version = "4", .param_class = "31B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/gemma-4-31B-it-OptiQ-4bit",
+     .model_type = "gemma4_unified", .needs_tokenizer_json = false},
+    // The 26B-A4B MoE (128 experts, 30 layers). Verified end-to-end. The
+    // OptiQ pack differs from the model-quantize output in three ways the
+    // loader now handles: the routed experts are named
+    // experts.switch_glu.{gate,up,down}_proj, their width varies PER LAYER
+    // (w8 on layers 0-4 + 29, w4 on the other 24 -- gate/up/down agree
+    // within a layer), and router.proj arrives QUANTIZED (w8) where the
+    // router GEMV is dense, so it is dequantized at load.
+    {.family = "Gemma", .version = "4", .param_class = "26B-A4B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit",
      .model_type = "gemma4_unified", .needs_tokenizer_json = false},
     // Raw google bf16 Gemma-4-it releases (gated; whole-repo fetch --
     // quantize with model-quantize before running). E-series are the
@@ -579,6 +665,66 @@ model_catalog()
      .hf_path = "microsoft/Mage-Flow-Edit-Turbo",
      .model_type = "mage-flow-edit",
      .files = kMageFlowFiles,
+     .needs_tokenizer_json = false},
+    // ---- Boogu-Image (text+image -> image, NextDiT lineage) -----------
+    // Boogu-Image-0.1 (Boogu Team): a 10B flow-matching family in the same
+    // diffusers split-stage shape as Krea-2 / FLUX.2 / Mage-Flow (encoder ->
+    // DiT stage + separate VAE stages), but a NextDiT / Lumina-Image-2.0
+    // topology rather than an MMDiT. Four repos share one architecture and one
+    // code path: Base + Turbo are text-to-image ("boogu-image"), Edit +
+    // Edit-Turbo take one reference image ("boogu-image-edit"); the two Turbo
+    // variants are the SAME parameter count, DMD-distilled to 4 steps at
+    // guidance 1. Sub-models:
+    //   mllm/        = Qwen3VLForConditionalGeneration (Qwen3-VL 8B: 36L,
+    //     hidden 4096, 32q/8kv GQA head_dim 128, interleaved mrope [24,20,20]
+    //     theta 5e6, UNTIED embeds; plus a 27-layer ViT, patch 16, out_hidden
+    //     4096, deepstack taps [8,16,24]). The pipeline takes the LAST hidden
+    //     state and -- unlike every other family here -- DROPS NOTHING: the
+    //     whole templated sequence, system prompt included, is conditioning.
+    //     Reference images ride the VL tower (capped at 384x384) so the
+    //     instruction is image-grounded.
+    //   transformer/ = BooguImageTransformer2DModel, a 10B NextDiT: 3 refiner
+    //     stacks (context / noise / ref-image, 2 blocks each) -> 8 DUAL-STREAM
+    //     blocks (joint attention over [instruct; ref; noise] PLUS a second
+    //     image-only self-attention per block) -> 32 single-stream blocks over
+    //     the fused sequence, 28 heads x head_dim 120 = 3360 hidden, GQA kv=7,
+    //     in_channels 16 at patch_size 2, instruction_feat_dim 4096, 3-axis
+    //     RoPE [40,40,40] theta 10000. RMSNorm throughout with TANH-gated
+    //     residuals (Lumina RMSNormZero).
+    //   vae/         = the FLUX.1 AutoencoderKL (16 latent ch, 8x spatial, no
+    //     quant/post-quant conv, scalar shift 0.1159 / scale 0.3611) -- served
+    //     by the same code as the FLUX.2 VAE at patch 1.
+    // Scheduler: FlowMatchEulerDiscrete with the v1 logistic time shift
+    // (do_shift, static seq_len 4096) -- and note its sigma convention is
+    // INVERTED (0 = noise, 1 = clean). Base/Edit run 25-50 steps at CFG
+    // 2.0-5.0; the Turbo pair runs 4 DMD steps at CFG 1.0.
+    {.family = "Boogu-Image", .version = "0.1", .param_class = "10B",
+     .variant = "Base bf16 (Boogu)",
+     .hf_path = "Boogu/Boogu-Image-0.1-Base",
+     .model_type = "boogu-image",
+     .inputs = {"text"}, .outputs = {"image"},
+     .files = kBooguFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Boogu-Image", .version = "0.1", .param_class = "10B",
+     .variant = "Turbo 4-step distilled bf16 (Boogu)",
+     .hf_path = "Boogu/Boogu-Image-0.1-Turbo",
+     .model_type = "boogu-image",
+     .inputs = {"text"}, .outputs = {"image"},
+     .files = kBooguFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Boogu-Image", .version = "0.1-Edit", .param_class = "10B",
+     .variant = "Edit bf16 (Boogu)",
+     .hf_path = "Boogu/Boogu-Image-0.1-Edit",
+     .model_type = "boogu-image-edit",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = kBooguFiles,
+     .needs_tokenizer_json = false},
+    {.family = "Boogu-Image", .version = "0.1-Edit", .param_class = "10B",
+     .variant = "Edit-Turbo 4-step distilled bf16 (Boogu)",
+     .hf_path = "Boogu/Boogu-Image-0.1-Edit-Turbo",
+     .model_type = "boogu-image-edit",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = kBooguFiles,
      .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each

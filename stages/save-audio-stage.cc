@@ -587,6 +587,12 @@ SaveAudioStage::encode_ffmpeg_(const std::string& path, const float* pcm,
   return ok;
 }
 
+void
+SaveAudioStage::reset_run_state()
+{
+  _files_written = 0;
+}
+
 Job
 SaveAudioStage::process(RuntimeContext& ctx)
 {

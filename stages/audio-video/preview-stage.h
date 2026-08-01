@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -79,13 +80,20 @@ public:
                FlexData                  config);
   ~PreviewStage() override;
 
+  Job initialize(RuntimeContext& ctx) override;
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
   Job drain  (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
 
+  // Read from the view-backend thread while initialize() swaps in a
+  // fresh channel for a new launch, so the pointer needs the lock.
   std::shared_ptr<PreviewChannel> preview_channel() const override
-  { return _channel; }
+  {
+    std::lock_guard<std::mutex> g(_channel_mu);
+    return _channel;
+  }
 
   // Test-only inspectors.
   bool encoder_initialized() const noexcept { return _enc != nullptr; }
@@ -217,6 +225,7 @@ private:
   bool _torn  = false;
   std::uint64_t _frames_in = 0;
 
+  mutable std::mutex              _channel_mu;
   std::shared_ptr<PreviewChannel> _channel;
 };
 

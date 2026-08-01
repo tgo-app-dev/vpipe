@@ -2,12 +2,16 @@
 #define VPIPE_APPLE_SILICON_METAL_COMPUTE_COMPUTE_ENCODER_H
 
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
+#include <vector>
 
 namespace MTL {
 class Buffer;
 class CommandBuffer;
 class ComputeCommandEncoder;
+class ComputePipelineState;
+class Texture;
 }
 
 namespace vpipe::metal_compute {
@@ -205,22 +209,68 @@ private:
                  MTL::CommandBuffer* cb) noexcept;
   // End the current MTL encoder and open a fresh one on _cb with the given
   // dispatch type; used by ConcurrentScope to flip Serial<->Concurrent in
-  // place. No-op if _cb is unknown.
+  // place. No-op if _cb is unknown. Encoder state does NOT survive the swap,
+  // so anything bound since the last dispatch is replayed onto the new encoder
+  // (replay_pending_) -- a scope boundary cannot be deferred the way the auto
+  // split can, because the exit MUST restore Serial ordering before the next
+  // dependent dispatch.
   void reencode_(DispatchType dt);
+
+  // Re-bind the pending op's state (pipeline + buffers/bytes/textures/
+  // threadgroup lengths recorded since the last dispatch) onto _enc.
+  void replay_pending_();
+
+  // Record a setBytes payload (copied) for replay.
+  void record_bytes_(unsigned index, const void* bytes, std::size_t size);
+
+  // One recorded binding. Slots are the MSL argument-table indices; `bytes_off`
+  // indexes _pending_bytes, which owns a copy of every setBytes payload (the
+  // caller's source is often a stack temporary that is gone by replay time).
+  enum class PendKind : std::uint8_t { Buffer, Bytes, Texture, TgMem };
+  struct Pending {
+    PendKind      kind      = PendKind::Buffer;
+    unsigned      index     = 0;
+    MTL::Buffer*  buf       = nullptr;
+    MTL::Texture* tex       = nullptr;
+    std::size_t   off       = 0;   // buffer byte offset, or tg-memory length
+    std::size_t   bytes_off = 0;
+    std::size_t   bytes_len = 0;
+  };
 
   MTL::ComputeCommandEncoder* _enc = nullptr;
   MTL::CommandBuffer* _cb = nullptr;   // owning command buffer (for reencode_)
   long _n_dispatch = 0;
   // Auto command-buffer split (lifted from the per-model decode split): when
   // _split_every>0, dispatch() commits _cb + reopens a fresh one every
-  // _split_every dispatches (outside any concurrent_scope), so a long stream's
-  // CPU-encode pipelines against GPU-exec. Set by CommandStream::begin_compute;
-  // the rollover is done by _stream so the stream's _cb stays coherent. Tracked
-  // buffers auto-fence deps across the split, so it is correctness-safe.
+  // _split_every dispatches (outside any concurrent_scope, and only at a clean
+  // op boundary -- see _state_dirty), so a long stream's CPU-encode pipelines
+  // against GPU-exec. Set by CommandStream::begin_compute; the rollover is done
+  // by _stream so the stream's _cb stays coherent. Tracked buffers auto-fence
+  // deps across the split, so the DATA is safe; the encoder STATE is not, which
+  // is what _state_dirty guards.
   CommandStream* _stream = nullptr;
   int _split_every = 0;
   int _since_split = 0;
   int _scope_depth = 0;   // >0 inside a concurrent_scope -> suppress split
+  // Has any state (buffer / constant / texture / threadgroup length) been bound
+  // since the last dispatch? A split ENDS the MTL encoder and opens a fresh
+  // one, and encoder state does NOT carry over -- so splitting while state is
+  // pending would strand it and leave the next dispatch reading unbound slots.
+  // set_function is the split point precisely because a well-formed op sets the
+  // function FIRST; but several call sites bind buffers before naming the
+  // function (the k-quant qmv helpers among them), and for those the split has
+  // to wait for the next clean boundary. Silent wrong-answer bug otherwise --
+  // Metal does not fault on an unbound slot.
+  bool _state_dirty = false;
+  // The pending op's recorded state, for replay_pending_(). Cleared (capacity
+  // retained) by dispatch, so this only ever holds ONE op's bindings -- the
+  // same window _state_dirty describes. State does not survive a dispatch on a
+  // reopened encoder either, but no call site relies on that: every op here
+  // rebinds what it needs, which is the invariant the auto-split has always
+  // assumed.
+  std::vector<Pending> _pending;
+  std::vector<std::uint8_t> _pending_bytes;
+  MTL::ComputePipelineState* _pending_pso = nullptr;
   DispatchType _dt = DispatchType::Serial;
 };
 

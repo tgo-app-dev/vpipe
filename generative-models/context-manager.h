@@ -370,6 +370,24 @@ public:
   // Bytes between consecutive pages in a pool buffer
   // (n_kv_heads * page_tokens * head_dim * sizeof(f16)).
   std::size_t page_stride_bytes() const noexcept;
+
+  // Bytes of KV / recurrent state this manager is holding RIGHT NOW.
+  //
+  // Everything the per-layer paged pools have grown to -- they start at
+  // one page and double on demand, so this is far below what max_pages
+  // implies -- plus every live context's contiguous K/V and its GDN
+  // conv/SSM state, run-ahead shadows included.
+  //
+  // Deliberately what is HELD, not the cap. A pool reported at
+  // max_pages * page_tokens would be orders of magnitude above the truth
+  // on a short conversation, and a memory decision taking that at face
+  // value would conclude the box is full when it is nearly empty.
+  //
+  // KV is the one large allocation that grows DURING a run rather than
+  // at load, which is why it has to be queryable separately from
+  // weights: a weights-only accounting looks fine right up to the point
+  // a long context exhausts the machine.
+  std::size_t resident_bytes() const;
   // Physical pages currently held by at least one context.
   std::uint32_t pages_in_use() const;
   // True if `layer` is a linear-attention (SSM/GDN) layer.

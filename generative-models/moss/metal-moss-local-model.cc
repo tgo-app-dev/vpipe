@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,26 +33,31 @@ float bf16_to_f32(std::uint16_t b)
 
 // Load a 2-D BF16/F16 tensor as f16. Returns empty on failure.
 SharedBuffer
-load_f16_2d(const MetalLlamaWeights& wts, MetalCompute* mc,
+load_f16_2d(WeightSet& wts, MetalCompute* mc,
             const std::string& nm)
 {
-  const auto* info = wts.info(nm);
+  const auto* info = wts.src().info(nm);
   if (info == nullptr || info->shape.size() != 2) { return {}; }
-  SharedBuffer raw = wts.load(nm, mc);
-  if (raw.empty()) { return {}; }
-  const std::size_t n = (std::size_t)info->shape[0] * info->shape[1];
-  SharedBuffer out = mc->make_shared_buffer(n * 2);
-  if (out.empty()) { return {}; }
-  if (info->dtype == "F16") {
-    std::memcpy(out.contents(), raw.contents(), n * 2);
-  } else if (info->dtype == "BF16") {
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    auto* d = static_cast<_Float16*>(out.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)bf16_to_f32(s[i]); }
-  } else {
-    return {};
-  }
-  return out;
+  return wts.derived("moss-local/f16/" + nm, [&]() -> SharedBuffer {
+    // Uncached: consumed by the conversion and dropped.
+    SharedBuffer raw = wts.read(nm, mc, WeightSet::Residency::Copied);
+    if (raw.empty()) { return {}; }
+    const std::size_t n = (std::size_t)info->shape[0] * info->shape[1];
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty()) { return {}; }
+    if (info->dtype == "F16") {
+      std::memcpy(out.contents(), raw.contents(), n * 2);
+    } else if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      auto* d = static_cast<_Float16*>(out.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = (_Float16)bf16_to_f32(s[i]);
+      }
+    } else {
+      return {};
+    }
+    return out;
+  });
 }
 
 // Host sampler over logit[0..n): temperature softmax -> top_k -> top_p
@@ -119,20 +125,30 @@ std::unique_ptr<MetalMossLocalModel>
 MetalMossLocalModel::load(const std::string& model_dir, MetalCompute* mc,
                           const Config& cfg)
 {
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts.has_value()) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalMossLocalModel>
+MetalMossLocalModel::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
+                          const Config& cfg)
+{
+  if (ws == nullptr) { return nullptr; }
   auto self = std::make_unique<MetalMossLocalModel>();
-  if (!self->init_(*wts, mc, cfg)) { return nullptr; }
+  if (!self->init_(ws, mc, cfg)) { return nullptr; }
   return self;
 }
 
 bool
-MetalMossLocalModel::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
-                           const Config& cfg)
+MetalMossLocalModel::init_(const std::shared_ptr<WeightSet>& ws,
+                           MetalCompute* mc, const Config& cfg)
 {
+  _ws = ws;
+  WeightSet& wts = *ws;
   _mc = mc;
   _cfg = cfg;
-  _lt = MetalMossLocalTransformer::load(wts, mc, cfg.lt);
+  _lt = MetalMossLocalTransformer::load(ws, mc, cfg.lt);
   if (!_lt) { return false; }
 
   _heads.resize((std::size_t)cfg.n_vq);

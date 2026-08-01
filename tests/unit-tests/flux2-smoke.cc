@@ -1724,3 +1724,59 @@ TEST(flux2_calib, on_device_dit_awq_progress_and_files)
               "to %s\n", out.string().c_str());
   fs::remove_all(out, ec);
 }
+
+// The vec4 adaLN / gate twins do the SAME arithmetic per element as the scalar
+// kernels they replace -- only the thread mapping and the access width change --
+// so the velocity must come out BIT-IDENTICAL. What this actually guards is the
+// PLUMBING: the (N, total) -> (N/4, total/N) rewrite and the 4-alignment of
+// every bound element offset. An unaligned vec4 access is undefined, so a
+// wrong offset here would not be a rounding difference, it would be garbage.
+TEST(flux2_smoke, vec4_elementwise_matches_scalar)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  const int grid = 4, TS = 8, img_seq = grid * grid;
+  SharedBuffer ctx, lat;
+  auto run = [&](bool v4) -> std::vector<std::uint16_t> {
+    if (v4) { unsetenv("VPIPE_NO_ELT_V4"); }
+    else    { setenv("VPIPE_NO_ELT_V4", "1", 1); }
+    auto dit = MetalFlux2Transformer::load(
+        tdir, mc, MetalFlux2Transformer::Config{});
+    if (!dit) { return {}; }
+    const auto& c = dit->config();
+    if (ctx.empty()) {
+      ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+      lat = mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+      std::mt19937 rng(4242);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      auto* cp = static_cast<_Float16*>(ctx.contents());
+      for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+        cp[i] = (_Float16)nd(rng);
+      }
+      auto* lp = static_cast<_Float16*>(lat.contents());
+      for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+        lp[i] = (_Float16)nd(rng);
+      }
+    }
+    SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, grid, grid, 0.5f);
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return {}; }
+    std::vector<std::uint16_t> out(n);
+    std::memcpy(out.data(), v.contents(), n * 2);
+    return out;
+  };
+  const std::vector<std::uint16_t> a = run(true);
+  const std::vector<std::uint16_t> b = run(false);
+  unsetenv("VPIPE_NO_ELT_V4");
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) { diff += (a[i] != b[i]) ? 1 : 0; }
+  EXPECT_TRUE(diff == 0);
+  std::printf("[flux2_smoke] vec4 vs scalar elementwise: %zu/%zu words differ\n",
+              diff, a.size());
+}

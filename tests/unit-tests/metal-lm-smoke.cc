@@ -23,6 +23,7 @@
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/shared/gguf-file.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/media-line.h"
@@ -1750,7 +1751,11 @@ TEST(metal_lm_smoke, gemma_dense_bf16_generates) {
   spec.page_tokens = 512; spec.max_pages = 16;
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
+  // minitest's ASSERT_TRUE records the failure but does NOT return, so a
+  // failed load has to be short-circuited by hand -- otherwise the null
+  // deref below SIGSEGVs and takes the whole test binary down with it.
   ASSERT_TRUE(lm && lm->valid());
+  if (!lm || !lm->valid()) { return; }
   auto& tok = lm->tokenizer();
   auto tpl = genai::make_chat_template(lm->config().architecture, tok);
   ASSERT_TRUE((bool)tpl);
@@ -1802,7 +1807,11 @@ TEST(metal_lm_smoke, gemma12b_optiq_generates) {
   spec.page_tokens = 512; spec.max_pages = 16;
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
+  // minitest's ASSERT_TRUE records the failure but does NOT return, so a
+  // failed load has to be short-circuited by hand -- otherwise the null
+  // deref below SIGSEGVs and takes the whole test binary down with it.
   ASSERT_TRUE(lm && lm->valid());
+  if (!lm || !lm->valid()) { return; }
   auto& tok = lm->tokenizer();
   auto tpl = genai::make_chat_template(lm->config().architecture, tok);
   ASSERT_TRUE((bool)tpl);
@@ -5136,17 +5145,30 @@ TEST(metal_lm_smoke, gemma_chunked_prefill_token_exact) {
   EXPECT_TRUE(mism == 0);
 }
 
-// Bounded-ring SINGLE-PASS prefill (VPIPE_GEMMA_PREFILL_SUBBLOCK) must be greedy
-// token-exact with the GROWN one-pass prefill on a LONG prompt that wraps the
-// bounded ring many times. The bounded path runs ONE forward over the whole
-// prompt (large proj/FFN/global GEMM batch) and reads the full-batch K/V for
-// the sliding attention (ring-independent), writing the bounded ring once; the
-// grown path grows the ring to the full prompt. Both must decode identically --
-// which also proves the single full-n ring write leaves the correct trailing
-// window resident for decode at depth. ~2400 VARIED tokens (>> ring 1024) so
-// the ring wraps repeatedly and a window/decode-state bug shows. Gated on the
-// Gemma model.
-TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_token_exact) {
+// Bounded-ring SINGLE-PASS prefill (VPIPE_GEMMA_PREFILL_SUBBLOCK) must agree
+// with the GROWN one-pass prefill on a LONG prompt that wraps the bounded ring
+// many times. The bounded path runs ONE forward over the whole prompt (large
+// proj/FFN/global GEMM batch) and reads the full-batch K/V for the sliding
+// attention (ring-independent), writing the bounded ring once; the grown path
+// grows the ring to the full prompt. The bounded CHUNKED path (subblock off)
+// chunks the whole stack instead. All three must decode the same distribution
+// -- which also proves the single full-n ring write leaves the correct
+// trailing window resident for decode at depth. ~2400 VARIED tokens (>> ring
+// 1024) so the ring wraps repeatedly and a window/decode-state bug shows.
+//
+// Compares LOGITS within a tolerance, not tokens. The three schedules batch
+// their GEMMs differently, so they agree to about one f16 ULP but not bit-
+// exactly, and a token comparison escalates that into a whole-tail divergence
+// the moment two candidates are within a ULP of each other. That is exactly
+// what used to fail here: at step 10 the chunked arm had tokens 1816 and 3303
+// at 27.906250/27.859375 where grown had them at 27.906250/27.875000, so the
+// top-2 order swapped and the remaining 13 of 24 positions all differed from
+// one 2-ULP wobble. The 2400 pseudo-random ids make that likely -- they are
+// deliberately off-distribution, which flattens the logits. Every arm is
+// teacher-forced on the grown arm's tokens so all three stay on the same
+// sequence and each step's logits are directly comparable.
+// Gated on the Gemma model.
+TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_logits) {
   const char* path = std::getenv("VPIPE_GEMMA4_TEST_MODEL_PATH");
   if (!path || !*path) { return; }
 
@@ -5160,9 +5182,15 @@ TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_token_exact) {
     s = s * 1664525u + 1013904223u;
     ids.push_back((std::int32_t)(106 + (s >> 9) % 200000));
   }
+  const int kGen = 24;
 
-  auto run = [&](int mode) -> std::vector<std::int32_t> {
-    // mode 0 = grown (A); 1 = bounded subblock (C); 2 = bounded chunked (B)
+  struct Arm {
+    std::vector<std::int32_t>       toks;
+    std::vector<std::vector<float>> logits;   // [step][vocab]
+  };
+  // mode 0 = grown (A); 1 = bounded subblock (C); 2 = bounded chunked (B).
+  // `drive` teacher-forces the per-step input token; null = pick its own.
+  auto run = [&](int mode, const std::vector<std::int32_t>* drive) {
     ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
     ::setenv("VPIPE_GEMMA_SLIDING_CHUNK", "512", 1);
     if (mode == 0) {
@@ -5178,7 +5206,7 @@ TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_token_exact) {
     Session sess;
     auto* mc = sess.metal_compute();
     auto* mgr = sess.generative_model_manager();
-    std::vector<std::int32_t> out;
+    Arm out;
     if (mc == nullptr || !mc->valid() || mgr == nullptr) { return out; }
     genai::LoadSpec spec;
     spec.hf_dir = path;
@@ -5190,39 +5218,70 @@ TEST(metal_lm_smoke, gemma_bounded_subblock_matches_grown_token_exact) {
     auto ctx = lm->make_context();
     if (!ctx.valid()) { return out; }
     std::int32_t t = lm->prefill(ctx, ids);
-    for (int i = 0; i < 24 && t >= 0; ++i) {
-      out.push_back(t);
-      t = lm->next_token(ctx);
+    for (int i = 0; i < kGen && t >= 0; ++i) {
+      out.logits.push_back(lm->last_logits_host());
+      out.toks.push_back(t);
+      const bool forced = (drive != nullptr && i < (int)drive->size());
+      const std::int32_t feed = forced ? (*drive)[(std::size_t)i] : t;
+      t = lm->next_token(ctx, feed);
     }
     return out;
   };
 
-  const auto grown   = run(0);
-  const auto bounded = run(1);
-  const auto chunked = run(2);
+  const Arm A = run(0, nullptr);                 // grown drives the sequence
+  const Arm C = run(1, &A.toks);                 // bounded subblock, forced
+  const Arm B = run(2, &A.toks);                 // bounded chunked, forced
   ::unsetenv("VPIPE_LLM_BACKEND");
   ::unsetenv("VPIPE_GEMMA_SLIDING_CHUNK");
   ::unsetenv("VPIPE_GEMMA_NO_SLIDING_GROW");
   ::unsetenv("VPIPE_GEMMA_PREFILL_SUBBLOCK");
-  ASSERT_TRUE(!grown.empty());
-  ASSERT_TRUE(grown.size() == bounded.size());
-  auto cnt = [&](const std::vector<std::int32_t>& a,
-                 const std::vector<std::int32_t>& b) {
-    std::size_t m = 0;
-    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
-      if (a[i] != b[i]) { ++m; }
+  ASSERT_TRUE(!A.logits.empty());
+  ASSERT_TRUE(A.logits.size() == C.logits.size());
+  ASSERT_TRUE(A.logits.size() == B.logits.size());
+  if (A.logits.empty() || A.logits.size() != C.logits.size()
+      || A.logits.size() != B.logits.size()) {
+    return;
+  }
+  // Worst per-element gap and worst per-step relative L2 vs the grown arm.
+  auto cmp = [&](const Arm& x) {
+    double mx = 0.0, mrel = 0.0;
+    for (std::size_t st = 0; st < A.logits.size(); ++st) {
+      const auto& a = A.logits[st];
+      const auto& b = x.logits[st];
+      if (a.size() != b.size()) { return std::make_pair(1e30, 1e30); }
+      double num = 0.0, den = 0.0;
+      for (std::size_t v = 0; v < a.size(); ++v) {
+        const double d = (double)b[v] - (double)a[v];
+        if (std::fabs(d) > mx) { mx = std::fabs(d); }
+        num += d * d;
+        den += (double)a[v] * (double)a[v];
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+      if (rel > mrel) { mrel = rel; }
     }
-    return m;
+    return std::make_pair(mx, mrel);
   };
-  // Bounded-subblock (C) must equal BOTH the grown one-pass (A) and the bounded
-  // chunked (B) reference -- all three decode identically.
-  const std::size_t mism = cnt(grown, bounded);
-  std::printf("[metal_lm_smoke.gemma_bounded_subblock_matches_grown_token_exact]"
-              " %zu tokens, %zu mismatches (C-vs-A=%zu C-vs-B=%zu B-vs-A=%zu)\n",
-              grown.size(), mism, cnt(bounded, grown), cnt(bounded, chunked),
-              cnt(chunked, grown));
-  EXPECT_TRUE(mism == 0);
-  EXPECT_TRUE(cnt(bounded, chunked) == 0);
+  const auto ca = cmp(C), ba = cmp(B);
+  std::printf("[metal_lm_smoke.gemma_bounded_subblock] %zu steps | "
+              "subblock-vs-grown max|dlogit|=%.6f rel-L2=%.6g | "
+              "chunked-vs-grown max|dlogit|=%.6f rel-L2=%.6g\n",
+              A.logits.size(), ca.first, ca.second, ba.first, ba.second);
+  // f16 logits near 28 step by 0.015625. Measured on M5 across runs:
+  //   subblock vs grown -- 0.000000 (bit-identical) to 0.191, rel-L2 <= 2.8e-4
+  //   chunked  vs grown -- 0.437 to 0.519 (~30 ULP), rel-L2 <= 5.6e-4
+  // Neither arm is bit-stable run to run: the subblock arm is often exactly
+  // equal to grown but not always, so do NOT tighten this to 0 on the strength
+  // of a couple of lucky runs (it was, and it failed on the third). Chunking
+  // the stack to <= page tokens reshapes every GEMM batch and reduction order,
+  // which is why that arm drifts furthest; a rel-L2 of 5.6e-4 says the
+  // distribution is intact either way. One bound for both arms, ~3x above the
+  // worst seen and far under a real window/decode-state bug, which puts whole
+  // logits O(1) apart on a signal of O(28) and rel-L2 in the 0.1+ range --
+  // the failure this test exists to catch.
+  EXPECT_TRUE(ca.first <= 1.5);
+  EXPECT_TRUE(ca.second <= 5e-3);
+  EXPECT_TRUE(ba.first <= 1.5);
+  EXPECT_TRUE(ba.second <= 5e-3);
 }
 
 // MULTIMODAL prefill must also respect the sliding-window ring. prefill_mm
@@ -9243,13 +9302,24 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
 }
 
 // Shared-prefix batched decode attention (phase A reads the N branches' shared
-// prefix once, phase B merges each branch's private pages) must be TOKEN-EXACT
-// vs the per-branch SDPA. Uses a MULTI-PAGE shared prefix (small page_tokens)
-// so shared_pages>=2, N=4 branches at distinct positions, and toggles
+// prefix once, phase B merges each branch's private pages) must match the
+// per-branch SDPA. Uses a MULTI-PAGE shared prefix (small page_tokens) so
+// shared_pages>=2, N=4 branches at distinct positions, and toggles
 // set_shared_attn ON vs OFF in-process to isolate the shared split.
 // VPIPE_SDPA_MB_MIN=0 forces the OFF path onto the mb256 kernel too, so the
 // only difference is shared-vs-strided splitting of the same online softmax.
-TEST(metal_lm_smoke, qwen_shared_attn_token_exact) {
+//
+// Compares LOGITS within a tolerance, not tokens. The two splits sum the same
+// online softmax in a different order, so they agree to a few f16 ULP but not
+// bit-exactly -- and a token comparison turns that into a coin flip. It really
+// is a coin flip: the OFF path once put tokens 0 and 11 at EXACTLY 21.000000
+// (top-2 gap 0.000000) where ON separated them by one ULP, so the argmax
+// tie-break went different ways and the branch's whole tail diverged (6/64
+// positions from a single flip at step 10). Both arms are teacher-forced on
+// the OFF arm's tokens so their KV states stay identical the whole way and
+// every step's logits are directly comparable -- one flip can no longer
+// cascade, and what is left measures the kernels rather than the tie-break.
+TEST(metal_lm_smoke, qwen_shared_attn_logits_match) {
   const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
   if (!path || !*path) { return; }
   Session sess;
@@ -9287,49 +9357,95 @@ TEST(metal_lm_smoke, qwen_shared_attn_token_exact) {
 
   const int N = 4;
   const int n_steps = 16;
-  auto argmax_of = [&](const std::vector<float>& lg) {
-    std::int32_t best = 0; float bv = -1e30f;
-    for (std::size_t v = 0; v < lg.size(); ++v) {
-      if (lg[v] > bv) { bv = lg[v]; best = (std::int32_t)v; }
-    }
+  const int V = model->config().vocab;
+  auto argmax_of = [&](const float* lg, int n) {
+    std::int32_t best = 0; float bv = lg[0];
+    for (int v = 1; v < n; ++v) { if (lg[v] > bv) { bv = lg[v]; best = v; } }
     return best;
   };
   // Branch N off the shared prefix (distinct-length suffixes -> distinct
-  // positions) and return the per-branch argmax streams. `on` toggles the
-  // shared-prefix path; both runs start from the same untouched root.
-  auto run = [&](bool on) {
+  // positions). `drive` teacher-forces the per-step input tokens; when null
+  // the arm picks its own argmax and records what it chose. Returns the
+  // [step][branch * V] logits so the two arms can be compared row by row.
+  std::vector<std::vector<std::int32_t>> drive_toks;
+  auto run = [&](bool on, bool teacher_force) {
     model->set_shared_attn(on);
     auto br = ctxm->branch(root, N);
-    std::vector<std::int32_t> first((std::size_t)N);
+    std::vector<std::int32_t> cur((std::size_t)N);
     for (int i = 0; i < N; ++i) {
       std::vector<std::int32_t> suffix((std::size_t)(i + 1),
                                        (std::int32_t)(100 + i));
       auto l = model->prefill(br[(std::size_t)i], suffix);
-      first[(std::size_t)i] = argmax_of(l);
+      if (l.empty()) { return std::vector<std::vector<float>>{}; }
+      cur[(std::size_t)i] = teacher_force
+                                ? drive_toks[0][(std::size_t)i]
+                                : argmax_of(l.data(), (int)l.size());
     }
-    auto got = model->decode_batched_argmax(
-        std::span<const genai::ContextId>(br.data(), br.size()),
-        std::span<const std::int32_t>(first.data(), first.size()), n_steps);
+    if (!teacher_force) {
+      drive_toks.assign(1, cur);   // row 0 = the prefill-chosen input tokens
+    }
+    std::vector<std::vector<float>> steps;
+    std::vector<float> bl;
+    for (int st = 0; st < n_steps; ++st) {
+      if (!model->decode_batched_step(
+              std::span<const genai::ContextId>(br.data(), br.size()),
+              std::span<const std::int32_t>(cur.data(), cur.size()),
+              std::span<const std::int32_t>(), bl)) {
+        break;
+      }
+      steps.push_back(bl);
+      std::vector<std::int32_t> nxt((std::size_t)N);
+      for (int i = 0; i < N; ++i) {
+        nxt[(std::size_t)i] =
+            teacher_force ? drive_toks[(std::size_t)st + 1][(std::size_t)i]
+                          : argmax_of(bl.data() + (std::size_t)i * V, V);
+      }
+      if (!teacher_force) { drive_toks.push_back(nxt); }
+      cur = nxt;
+    }
     for (auto id : br) { ctxm->release(id); }
-    return got;
+    return steps;
   };
-  auto off = run(false);
-  auto onv = run(true);
-  ASSERT_TRUE((int)off.size() == N && (int)onv.size() == N);
-  int matched = 0, total = 0;
-  for (int i = 0; i < N; ++i) {
-    EXPECT_TRUE(off[(std::size_t)i].size() == onv[(std::size_t)i].size());
-    for (std::size_t s = 0;
-         s < off[(std::size_t)i].size() && s < onv[(std::size_t)i].size();
-         ++s) {
-      ++total;
-      if (off[(std::size_t)i][s] == onv[(std::size_t)i][s]) { ++matched; }
-      EXPECT_TRUE(off[(std::size_t)i][s] == onv[(std::size_t)i][s]);
+  const auto off = run(false, /*teacher_force=*/false);
+  const auto on  = run(true,  /*teacher_force=*/true);
+  ASSERT_TRUE((int)off.size() == n_steps);
+  ASSERT_TRUE(off.size() == on.size());
+
+  // Worst per-element gap and worst per-row relative L2 over every step and
+  // branch. Both arms saw the same inputs at every position, so any drift is
+  // the attention split alone.
+  double max_abs = 0.0, max_rel = 0.0;
+  int max_step = -1, max_branch = -1;
+  for (std::size_t st = 0; st < off.size(); ++st) {
+    for (int i = 0; i < N; ++i) {
+      const float* a = on[st].data() + (std::size_t)i * V;
+      const float* b = off[st].data() + (std::size_t)i * V;
+      double num = 0.0, den = 0.0;
+      for (int v = 0; v < V; ++v) {
+        const double d = (double)a[v] - (double)b[v];
+        if (std::fabs(d) > max_abs) {
+          max_abs = std::fabs(d);
+          max_step = (int)st;
+          max_branch = i;
+        }
+        num += d * d;
+        den += (double)b[v] * (double)b[v];
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+      if (rel > max_rel) { max_rel = rel; }
     }
   }
-  std::printf("[metal_lm_smoke.qwen_shared_attn] N=%d steps=%d matched %d/%d "
-              "(shared vs per-branch)\n", N, n_steps, matched, total);
-  EXPECT_TRUE(total > 0 && matched == total);
+  std::printf("[metal_lm_smoke.qwen_shared_attn] N=%d steps=%d "
+              "max|dlogit|=%.6f (step %d branch %d) max rel-L2=%.6g\n",
+              N, n_steps, max_abs, max_step, max_branch, max_rel);
+  // f16 logits at these magnitudes step by 0.015625, so a few ULP is the
+  // floor. Measured over 4 branches x 16 steps on M5: max|dlogit| 0.082-0.090
+  // (5-6 ULP) and rel-L2 6.3e-3-6.4e-3, varying a little run to run. The
+  // bounds sit ~4x above that -- room for another machine's reduction order,
+  // still far under a real divergence, which moves whole logits by O(1)
+  // against a signal of O(20-30).
+  EXPECT_TRUE(max_abs <= 0.4);
+  EXPECT_TRUE(max_rel <= 2.5e-2);
 }
 
 // Batched PIPELINED decode (bdecode_*, GPU per-branch sampler + event-chain
@@ -11682,4 +11798,195 @@ TEST(metal_lm_bench, encoder_model_teardown) {
     }
   }
   EXPECT_TRUE(true);
+}
+
+// The dedup the refactor exists for, asserted on a real model rather than
+// a fixture: an LM and the vision tower it feeds live in ONE checkpoint
+// directory, and used to open it twice over -- the LM's own mmap plus a
+// private one inside the tower. The manager should now report exactly one
+// weight set for that directory, with BOTH of them holding it.
+//
+// This is the property, not a proxy for it: a footprint delta would be
+// swamped by the model itself, whereas the holder count says directly
+// whether the tower joined the LM's checkpoint or opened its own.
+TEST(metal_lm_smoke, lm_and_vision_tower_share_one_weight_set) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc  = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.page_tokens = 256;
+  spec.max_pages = 16;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  if (!lm || !lm->valid()) { return; }
+  if (!lm->config().vision.present) { return; }   // not a VL checkpoint
+
+  const auto rep = mgr->weight_report();
+  ASSERT_TRUE(rep.size() == 1u);   // ONE checkpoint, not one per consumer
+  std::printf("[ws_share] %s: %zu tensors, %.2f GB, %ld holders\n",
+              rep[0].dir.c_str(), rep[0].tensors,
+              (double)rep[0].bytes / (1024.0 * 1024.0 * 1024.0),
+              (long)rep[0].holders);
+  // The LM's exec and the tower both hold it, so dropping one must not
+  // close the checkpoint out from under the other.
+  EXPECT_TRUE(rep[0].holders >= 2);
+  EXPECT_TRUE(rep[0].tensors > 0u);
+}
+
+// The Qwen3-ASR Conformer fuses each block's q|k|v into ONE matrix so a
+// single GEMM replaces three. That fusion was rewritten to build inside
+// the weight set's derived() cache (the three pieces are read uncached
+// and dropped; only the fused product is kept), and a mistake there --
+// wrong order, wrong widths -- would not crash: it would quietly produce
+// a plausible-looking wrong transcript. So check the bytes directly.
+//
+// Loads through the manager, so what is verified is the tensor the
+// PRODUCTION path actually built, then re-derives the expected
+// concatenation independently from the same checkpoint.
+TEST(metal_lm_smoke, asr_conformer_qkv_fusion_matches_pieces) {
+  const char* path = std::getenv("VPIPE_QWEN3_ASR_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc  = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.page_tokens = 256;
+  spec.max_pages = 16;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  if (!lm || !lm->valid()) { return; }
+  if (!lm->config().audio.present) { return; }
+
+  auto ws = genai::open_weight_set(path, &sess);
+  ASSERT_TRUE(ws != nullptr);
+
+  // Same element conversion the encoder's to_f16 does.
+  auto to_f16 = [&](const std::string& nm) -> std::vector<_Float16> {
+    const auto* info = ws->src().info(nm);
+    std::vector<_Float16> out;
+    if (info == nullptr) { return out; }
+    std::size_t n = 1;
+    for (auto d : info->shape) { n *= (std::size_t)d; }
+    auto raw = ws->read(nm, mc, genai::WeightSet::Residency::Copied);
+    if (raw.empty()) { return out; }
+    out.resize(n);
+    if (info->dtype == "F16") {
+      std::memcpy(out.data(), raw.contents(), n * 2);
+    } else if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t bits = (std::uint32_t)s[i] << 16;
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        out[i] = (_Float16)f;
+      }
+    } else if (info->dtype == "F32") {
+      const auto* s = static_cast<const float*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { out[i] = (_Float16)s[i]; }
+    } else {
+      out.clear();
+    }
+    return out;
+  };
+
+  int checked = 0;
+  for (int b = 0; b < lm->config().audio.encoder_layers; ++b) {
+    const std::string p =
+        "audio_tower.layers." + std::to_string(b) + ".";
+    for (const char* suffix : {".weight", ".bias"}) {
+      const std::string key = std::string("qwen3asr-conformer/") + p +
+                              "qkv" + suffix;
+      // A cache HIT never runs the builder, so this returns the tensor
+      // the encoder built. An empty result means the key was NOT cached
+      // -- which would itself be the bug.
+      auto fused = ws->derived(
+          key, []() { return vpipe::metal_compute::SharedBuffer{}; });
+      ASSERT_TRUE(!fused.empty());
+
+      std::vector<_Float16> want;
+      for (const char* proj : {"self_attn.q_proj", "self_attn.k_proj",
+                               "self_attn.v_proj"}) {
+        auto piece = to_f16(p + proj + suffix);
+        ASSERT_TRUE(!piece.empty());
+        want.insert(want.end(), piece.begin(), piece.end());
+      }
+      ASSERT_TRUE(fused.byte_size() == want.size() * 2);
+      EXPECT_TRUE(std::memcmp(fused.contents(), want.data(),
+                              want.size() * 2) == 0);
+      ++checked;
+    }
+  }
+  std::printf("[asr_qkv] %d fused q|k|v tensors match their pieces\n",
+              checked);
+  EXPECT_TRUE(checked > 0);
+}
+
+// KV is the one large allocation that grows DURING a run rather than at
+// load, so a weights-only accounting reads as healthy right up to the
+// point a long context exhausts the box. Assert the manager can actually
+// see it, and that it grows with the conversation -- plumbing that is
+// never exercised is plumbing that silently returns zero.
+TEST(metal_lm_smoke, manager_sees_kv_grow_with_the_context) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc  = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.page_tokens = 256;
+  spec.max_pages = 32;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  if (!lm || !lm->valid()) { return; }
+
+  const std::size_t weights = mgr->resident_weight_bytes();
+  const std::size_t kv0     = mgr->resident_kv_bytes();
+  EXPECT_TRUE(mgr->resident_bytes() == weights + kv0);
+
+  // Prefill something long enough to claim real pages.
+  std::string prompt;
+  for (int i = 0; i < 40; ++i) {
+    prompt += "The lighthouse keeper recorded the tides each evening. ";
+  }
+  auto ctx = lm->make_context();
+  auto ids = lm->tokenizer().encode(prompt);
+  if (ids.empty()) { return; }
+  lm->prefill(ctx, ids);
+  for (int i = 0; i < 8; ++i) { (void)lm->next_token(ctx); }
+
+  const std::size_t kv1 = mgr->resident_kv_bytes();
+  std::printf("[kv] weights %.2f GB, kv %zu -> %zu KB after %zu tokens\n",
+              (double)weights / (1024.0 * 1024.0 * 1024.0),
+              kv0 >> 10, kv1 >> 10, ids.size());
+  // The pools start at one page and grow on demand, so a real prefill
+  // must move the number. This is the whole point of reporting what is
+  // HELD rather than max_pages * page_tokens, which would have been a
+  // large constant from the start and told us nothing.
+  EXPECT_TRUE(kv1 > kv0);
+  // And weights must NOT have moved -- the two are separate terms.
+  EXPECT_TRUE(mgr->resident_weight_bytes() == weights);
+  EXPECT_TRUE(mgr->resident_bytes() == weights + kv1);
 }

@@ -2,6 +2,7 @@
 
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <cmath>
 #include <cstdint>
@@ -20,6 +21,12 @@ using metal_compute::ComputeEncoder;
 using metal_compute::CommandStream;
 
 namespace {
+
+// Namespace for this class's derived-tensor cache keys. A WeightSet is
+// shared by everything reading one checkpoint, so a key has to say which
+// class's transform produced the bytes, not just which tensor they came
+// from.
+constexpr const char* kKey = "krea2-vae/";
 
 // Read a raw checkpoint tensor as float (F32/F16/BF16 source).
 std::vector<float>
@@ -69,91 +76,115 @@ f16_buf_(MetalCompute* mc, const float* src, std::size_t n)
 // conv3d and keeps only the kt=2 temporal slice (single-frame decode); else a
 // [Cout,Cin,3,3] 2D conv (the upsample resample.1).
 MetalKrea2Vae::Conv
-MetalKrea2Vae::load_conv3x3_(const MetalLlamaWeights& wts, const std::string& nm,
+MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
                              bool from3d)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto* info = wts.info(nm + ".weight");
+  const auto* info = ws.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.empty()) { return c; }
   const auto& sh = info->shape;
   const int Cout = (int)sh[0];
   const int Cin = (int)sh[1];
   const int kt = from3d ? (int)sh[2] : 1;   // 3 for conv3d, absent for conv2d
   const int kty = from3d ? (kt - 1) : 0;    // kt=2 slice index (last)
   c.cin = Cin; c.cout = Cout; c.k = 9 * Cin;
-  std::vector<float> flat((std::size_t)Cout * 9 * Cin);
-  for (int o = 0; o < Cout; ++o) {
-    for (int ky = 0; ky < 3; ++ky) {
-      for (int kx = 0; kx < 3; ++kx) {
-        for (int i = 0; i < Cin; ++i) {
-          std::size_t si;
-          if (from3d) {
-            // [Cout,Cin,3,3,3]: (o,i,kt,ky,kx)
-            si = (((((std::size_t)o * Cin + i) * 3 + kty) * 3 + ky) * 3) + kx;
-          } else {
-            // [Cout,Cin,3,3]: (o,i,ky,kx)
-            si = ((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx;
+
+  // The flattened [Cout, 9*Cin] weight and its HWIO twin are DERIVED --
+  // built from the checkpoint's bytes, not copied out of them -- so they
+  // are cached under keys that name the transform AND the layout it read
+  // (3d vs 2d source), never the tensor name alone.
+  const std::string k3 = std::string(kKey) + "c3x3|" + nm +
+                         (from3d ? "|3d" : "|2d");
+  std::vector<float> flat;
+  auto build_flat = [&]() {
+    std::size_t n = 0;
+    std::vector<float> w = read_f32_(ws.src(), _mc, nm + ".weight", n);
+    if (w.empty()) { return; }
+    flat.assign((std::size_t)Cout * 9 * Cin, 0.0f);
+    for (int o = 0; o < Cout; ++o) {
+      for (int ky = 0; ky < 3; ++ky) {
+        for (int kx = 0; kx < 3; ++kx) {
+          for (int i = 0; i < Cin; ++i) {
+            std::size_t si;
+            if (from3d) {
+              // [Cout,Cin,3,3,3]: (o,i,kt,ky,kx)
+              si = (((((std::size_t)o * Cin + i) * 3 + kty) * 3 + ky) * 3)
+                   + kx;
+            } else {
+              // [Cout,Cin,3,3]: (o,i,ky,kx)
+              si = ((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx;
+            }
+            const std::size_t di =
+                ((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i;
+            flat[di] = w[si];
           }
-          const std::size_t di =
-              ((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i;
-          flat[di] = w[si];
         }
       }
     }
-  }
-  c.w = f16_buf_(_mc, flat.data(), flat.size());
+  };
+  c.w = ws.derived(k3, [&]() -> SharedBuffer {
+    build_flat();
+    if (flat.empty()) { return {}; }
+    return f16_buf_(_mc, flat.data(), flat.size());
+  }, _part);
+  if (c.w.empty()) { return Conv{}; }
   // HWIO twin for the NAX hardware conv (out-channel fastest). `flat` is
   // [Cout, 9*Cin] with (ky,kx,ci) columns -- permute from it directly so
   // the conv3d slice handling above is inherited.
   if (_use_hwconv) {
-    std::vector<float> hwio((std::size_t)9 * Cin * Cout);
-    for (int o = 0; o < Cout; ++o) {
-      for (int t = 0; t < 9; ++t) {
-        for (int i = 0; i < Cin; ++i) {
-          hwio[((std::size_t)t * Cin + i) * Cout + o] =
-              flat[((std::size_t)o * 9 + t) * Cin + i];
+    c.whwio = ws.derived(k3 + "|hwio", [&]() -> SharedBuffer {
+      // A cache hit on c.w above skips build_flat(), so re-run it here
+      // when this twin is the miss.
+      if (flat.empty()) { build_flat(); }
+      if (flat.empty()) { return {}; }
+      std::vector<float> hwio((std::size_t)9 * Cin * Cout);
+      for (int o = 0; o < Cout; ++o) {
+        for (int t = 0; t < 9; ++t) {
+          for (int i = 0; i < Cin; ++i) {
+            hwio[((std::size_t)t * Cin + i) * Cout + o] =
+                flat[((std::size_t)o * 9 + t) * Cin + i];
+          }
         }
       }
-    }
-    c.whwio = f16_buf_(_mc, hwio.data(), hwio.size());
+      return f16_buf_(_mc, hwio.data(), hwio.size());
+    }, _part);
   }
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  c.b = load_vec_(ws, nm + ".bias");
   return c;
 }
 
 // Load a 1x1 conv ([Cout,Cin,1,1,1] or [Cout,Cin,1,1]) as dense-gemm weight
 // [Cout, Cin] (the trailing singleton dims flatten away).
 MetalKrea2Vae::Conv
-MetalKrea2Vae::load_conv1x1_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalKrea2Vae::load_conv1x1_(WeightSet& ws, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;
+  const auto* info = ws.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.size() < 2) { return c; }
+  const auto& sh = info->shape;
   c.cout = (int)sh[0]; c.cin = (int)sh[1]; c.k = c.cin;
-  c.w = f16_buf_(_mc, w.data(), n);
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  c.w = load_vec_(ws, nm + ".weight");
+  if (c.w.empty()) { return Conv{}; }
+  c.b = load_vec_(ws, nm + ".bias");
   return c;
 }
 
+// Every scalar/vector/matrix tensor the VAE keeps is stored as f16
+// regardless of its on-disk dtype, so "read it as f32 and narrow" IS the
+// transform and the result is cached like any other derived tensor.
 SharedBuffer
-MetalKrea2Vae::load_vec_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalKrea2Vae::load_vec_(WeightSet& ws, const std::string& nm)
 {
-  std::size_t n = 0;
-  std::vector<float> v = read_f32_(wts, _mc, nm, n);
-  if (v.empty()) { return {}; }
-  return f16_buf_(_mc, v.data(), n);
+  return ws.derived(std::string(kKey) + "f16|" + nm, [&]() -> SharedBuffer {
+    std::size_t n = 0;
+    std::vector<float> v = read_f32_(ws.src(), _mc, nm, n);
+    if (v.empty()) { return {}; }
+    return f16_buf_(_mc, v.data(), n);
+  }, _part);
 }
 
 bool
-MetalKrea2Vae::load_resblock_(const MetalLlamaWeights& wts,
+MetalKrea2Vae::load_resblock_(WeightSet& wts,
                               const std::string& pre, ResBlock& rb, int cin,
                               int cout)
 {
@@ -172,12 +203,18 @@ std::unique_ptr<MetalKrea2Vae>
 MetalKrea2Vae::load(const std::string& model_dir, MetalCompute* mc,
                     const Config& cfg, bool with_encoder)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, with_encoder);
+}
+
+std::unique_ptr<MetalKrea2Vae>
+MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
+                    const Config& cfg, bool with_encoder)
+{
+  if (mc == nullptr || !ws_in) { return nullptr; }
+  WeightSet& wts = *ws_in;
 
   auto m = std::unique_ptr<MetalKrea2Vae>(new MetalKrea2Vae());
+  m->_ws = std::move(ws_in);
   m->_mc = mc;
   m->_cfg = cfg;
 
@@ -297,18 +334,34 @@ MetalKrea2Vae::load(const std::string& model_dir, MetalCompute* mc,
   m->_mid_attn.ng = m->load_vec_(wts, "decoder.mid_block.attentions.0.norm.gamma");
   {
     // to_qkv is one 1x1 conv [3*dim, dim]; split output channels into q/k/v.
-    std::size_t n = 0;
-    std::vector<float> qkv = read_f32_(
-        wts, mc, "decoder.mid_block.attentions.0.to_qkv.weight", n);
-    std::size_t nb = 0;
-    std::vector<float> qkvb = read_f32_(
-        wts, mc, "decoder.mid_block.attentions.0.to_qkv.bias", nb);
+    std::size_t n = 0, nb = 0;
+    std::vector<float> qkv, qkvb;
+    const std::string qbase = "decoder.mid_block.attentions.0.to_qkv";
+    auto read_qkv = [&]() {
+      if (!qkv.empty()) { return; }
+      qkv  = read_f32_(wts.src(), mc, qbase + ".weight", n);
+      qkvb = read_f32_(wts.src(), mc, qbase + ".bias", nb);
+    };
     const int C = dims0;
-    if (qkv.size() == (std::size_t)3 * C * C && qkvb.size() == (std::size_t)3 * C) {
+    {
+      // Each third of the fused to_qkv is its own derived tensor, keyed
+      // by which third it is.
       auto slice = [&](int off) {
         Conv c; c.cin = C; c.cout = C; c.k = C;
-        c.w = f16_buf_(mc, qkv.data() + (std::size_t)off * C * C, (std::size_t)C * C);
-        c.b = f16_buf_(mc, qkvb.data() + (std::size_t)off * C, (std::size_t)C);
+        const std::string k = std::string(kKey) + "qkv|" + qbase + "|" +
+                              std::to_string(off);
+        c.w = wts.derived(k + "|w", [&]() -> SharedBuffer {
+          read_qkv();
+          if (qkv.size() != (std::size_t)3 * C * C) { return {}; }
+          return f16_buf_(mc, qkv.data() + (std::size_t)off * C * C,
+                          (std::size_t)C * C);
+        }, m->_part);
+        c.b = wts.derived(k + "|b", [&]() -> SharedBuffer {
+          read_qkv();
+          if (qkvb.size() != (std::size_t)3 * C) { return {}; }
+          return f16_buf_(mc, qkvb.data() + (std::size_t)off * C,
+                          (std::size_t)C);
+        }, m->_part);
         return c;
       };
       m->_mid_attn.q = slice(0);
@@ -355,13 +408,38 @@ MetalKrea2Vae::load(const std::string& model_dir, MetalCompute* mc,
   m->_conv_out = m->load_conv3x3_(wts, "decoder.conv_out", true);
   ok = ok && !m->_norm_out_g.empty() && !m->_conv_out.w.empty();
 
-  if (with_encoder) {
-    if (!m->load_encoder_(wts)) { return nullptr; }
-    m->_has_encoder = true;
-  }
-
   if (!ok) { return nullptr; }
+  if (with_encoder && !m->ensure_encoder()) { return nullptr; }
   return m;
+}
+
+bool
+MetalKrea2Vae::ensure_encoder()
+{
+  if (_has_encoder) { return true; }
+  if (!_ws) { return false; }
+  // Through the WeightSet so the encoder half loads ONCE per checkpoint
+  // however many VAEs over it end up needing it -- and, when nobody
+  // does, never.
+  const bool ok = _ws->ensure_part("encoder", [this]() {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    return r;
+  });
+  if (!ok) { return false; }
+  // A second VAE over a checkpoint whose encoder another one already
+  // loaded still has to populate ITS OWN struct members; ensure_part
+  // reports the cached success without re-running the loader, so bind
+  // the (now cache-hit) tensors here.
+  if (_enc_conv_in.w.empty()) {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    if (!r) { return false; }
+  }
+  _has_encoder = true;
+  return true;
 }
 
 SharedBuffer
@@ -916,8 +994,9 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
 }
 
 bool
-MetalKrea2Vae::load_encoder_(const MetalLlamaWeights& wts)
+MetalKrea2Vae::load_encoder_(WeightSet& ws)
 {
+  WeightSet& wts = ws;
   MetalCompute* mc = _mc;
   const int base = _cfg.base_dim;                    // 96
   // Encoder dims = [base*u for u in [1] + dim_mult] = [96, 96, 192, 384, 384].
@@ -960,16 +1039,33 @@ MetalKrea2Vae::load_encoder_(const MetalLlamaWeights& wts)
   _enc_mid_attn.ng = load_vec_(wts, "encoder.mid_block.attentions.0.norm.gamma");
   {
     std::size_t n = 0, nb = 0;
-    std::vector<float> qkv = read_f32_(
-        wts, mc, "encoder.mid_block.attentions.0.to_qkv.weight", n);
-    std::vector<float> qkvb = read_f32_(
-        wts, mc, "encoder.mid_block.attentions.0.to_qkv.bias", nb);
+    std::vector<float> qkv, qkvb;
+    const std::string base = "encoder.mid_block.attentions.0.to_qkv";
+    auto read_qkv = [&]() {
+      if (!qkv.empty()) { return; }
+      qkv  = read_f32_(wts.src(), mc, base + ".weight", n);
+      qkvb = read_f32_(wts.src(), mc, base + ".bias", nb);
+    };
     const int C = dtop;
-    if (qkv.size() == (std::size_t)3 * C * C && qkvb.size() == (std::size_t)3 * C) {
+    {
+      // The fused to_qkv is SPLIT into three convs, so each slice is its
+      // own derived tensor keyed by which third it is.
       auto slice = [&](int off) {
         Conv c; c.cin = C; c.cout = C; c.k = C;
-        c.w = f16_buf_(mc, qkv.data() + (std::size_t)off * C * C, (std::size_t)C * C);
-        c.b = f16_buf_(mc, qkvb.data() + (std::size_t)off * C, (std::size_t)C);
+        const std::string k = std::string(kKey) + "qkv|" + base + "|" +
+                              std::to_string(off);
+        c.w = wts.derived(k + "|w", [&]() -> SharedBuffer {
+          read_qkv();
+          if (qkv.size() != (std::size_t)3 * C * C) { return {}; }
+          return f16_buf_(mc, qkv.data() + (std::size_t)off * C * C,
+                          (std::size_t)C * C);
+        }, _part);
+        c.b = wts.derived(k + "|b", [&]() -> SharedBuffer {
+          read_qkv();
+          if (qkvb.size() != (std::size_t)3 * C) { return {}; }
+          return f16_buf_(mc, qkvb.data() + (std::size_t)off * C,
+                          (std::size_t)C);
+        }, _part);
         return c;
       };
       _enc_mid_attn.q = slice(0);

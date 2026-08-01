@@ -19,17 +19,22 @@
 #include "pipeline/pipeline-spec.h"
 #include "pipeline/stage.h"
 #include "pipeline/stage-registry.h"
+#include "ui/ui-view-registry.h"
 #include "vpipe/session-intf.h"
 
 #include "common/host-net.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cxxabi.h>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <random>
 #include <system_error>
@@ -1904,6 +1909,22 @@ SessionApi::h_io_clear_(const HttpRequest&)
 }
 
 HttpResponse
+SessionApi::h_io_interrupt_(const HttpRequest&)
+{
+  if (!_ui) { return HttpResponse::error(404, "user I/O not available"); }
+  // Fire every stage-registered interrupt handler (see
+  // UiDelegateIntf::register_interrupt_handler). Always a 200: the
+  // button is unconditional, so "nothing was running" is a normal
+  // outcome, not an error -- `handled` reports how many stages
+  // actually cut work short.
+  const int handled = _ui->dispatch_interrupt();
+  FlexData o  = FlexData::make_object();
+  auto     oo = o.as_object();
+  oo.insert("handled", FlexData::make_int(handled));
+  return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
 SessionApi::h_system_status_(const HttpRequest&)
 {
   FlexData o = _status->query();
@@ -1994,113 +2015,256 @@ SessionApi::h_hls_streams_(const HttpRequest&)
   return HttpResponse::json(200, o.to_json());
 }
 
-HttpResponse
-SessionApi::h_preview_streams_(const HttpRequest&)
+// -------------------------------------------------------------------
+// Stage-provided GUI views
+// -------------------------------------------------------------------
+
+std::vector<UiViewHostIntf::StageRef>
+SessionApi::ViewHost::find_stages(std::string_view type_name) const
 {
-  lock_guard<mutex> lk(_mu);
-  FlexData o = FlexData::make_object();
-  auto oo = o.as_object();
-  FlexData arr = FlexData::make_array();
-  auto a = arr.as_array();
-
-  for (auto& up : _pipes) {
+  std::vector<StageRef> out;
+  lock_guard<mutex> lk(_api._mu);
+  for (const auto& up : _api._pipes) {
     const Pipe& p = *up;
-    // A launched (or paused) pipeline has live stages behind its channels;
-    // a stopped one serves nothing.
-    if (p.state == State::Stopped) { continue; }
-    if (!p.handle || !p.handle->valid()) { continue; }
-    Pipeline* pl = live_pipeline_(*p.handle);
-    if (!pl) { continue; }
-    for (auto it = pl->begin(); it != pl->end(); ++it) {
-      const Stage* s = dynamic_cast<const Stage*>(*it);
-      if (!s || string(s->type_name()) != "preview") { continue; }
+    // Read the editable SPEC, not the live graph: a view's picker must
+    // list stages in pipelines that are merely loaded, so it can follow
+    // one that has not been launched yet.
+    const bool live = p.state != State::Stopped && p.handle
+                      && p.handle->valid();
+    for (const auto& st : p.stages) {
+      if (st.type != type_name) { continue; }
+      StageRef r;
+      r.pipeline = p.id;
+      r.stage    = st.id;
+      r.state    = state_name_(p.state);
+      r.live     = live;
+      r.config   = st.config;
+      out.push_back(std::move(r));
+    }
+  }
+  return out;
+}
 
-      // The channel exposes best-effort media hints (populated once the
-      // first frame flows); the authoritative config reaches the browser
-      // in the stream's own config frame, so a not-yet-started stream is
-      // still listed and playable.
-      const PreviewSource* src = dynamic_cast<const PreviewSource*>(s);
-      std::shared_ptr<PreviewChannel> ch =
-          src ? src->preview_channel() : nullptr;
+Stage*
+SessionApi::ViewHost::live_stage(std::string_view pipeline,
+                                 std::string_view stage) const
+{
+  lock_guard<mutex> lk(_api._mu);
+  Pipe* p = _api.find_(string(pipeline));
+  if (p == nullptr || !p->handle || !p->handle->valid()) { return nullptr; }
+  if (p->state == State::Stopped) { return nullptr; }
+  return _api.live_stage_(*p, string(stage));
+}
 
-      // `title` config -> picker label; fall back to the stage id.
-      string title;
-      for (const auto& pr : s->config_params()) {
-        if (pr.key == "title") {
-          title = string(pr.current_value.as_string(""));
-          break;
-        }
-      }
-      if (title.empty()) { title = s->id(); }
-
+HttpResponse
+SessionApi::h_ui_views_(const HttpRequest&)
+{
+  FlexData o = FlexData::make_object();
+  FlexData arr = FlexData::make_array();
+  {
+    auto a = arr.as_array();
+    for (const UiViewSpec* v : UiViewRegistry::get().all()) {
       FlexData e = FlexData::make_object();
       auto eo = e.as_object();
-      eo.insert("pipeline", fstr_(p.id));
-      eo.insert("stage", fstr_(s->id()));
-      eo.insert("state", fstr_(state_name_(p.state)));
-      eo.insert("title", fstr_(title));
-      eo.insert("video",
-                FlexData::make_bool(ch ? ch->has_video() : false));
-      eo.insert("audio",
-                FlexData::make_bool(ch ? ch->has_audio() : false));
-      eo.insert("width", FlexData::make_uint(
-                    static_cast<uint64_t>(ch ? ch->width() : 0)));
-      eo.insert("height", FlexData::make_uint(
-                    static_cast<uint64_t>(ch ? ch->height() : 0)));
+      eo.insert("id", fstr_(string(v->id)));
+      eo.insert("stage_type", fstr_(string(v->stage_type)));
+      eo.insert("module", fstr_(string(v->module)));
+      eo.insert("styles", fstr_(string(v->styles)));
+      eo.insert("label_key", fstr_(string(v->label_key)));
+      eo.insert("icon", fstr_(string(v->icon)));
       a.push_back(std::move(e));
     }
   }
-  oo.insert("streams", std::move(arr));
+  auto oo = o.as_object();
+  oo.insert("views", std::move(arr));
   return HttpResponse::json(200, o.to_json());
 }
 
-void
-SessionApi::h_preview_ws_(const HttpRequest& req, WebSocket& ws)
-{
-  string pipeline;
-  string stage;
+namespace {
+
+// Backend -> client half of one view channel. The backend's own threads
+// ENQUEUE here; the connection thread drains and writes, so a slow
+// socket never blocks a producer and the WebSocket is only ever touched
+// by one thread (which also keeps TLS legal).
+class WsViewChannel final : public UiViewChannel {
+public:
+  // Bounds on the queue. The producer that matters -- a preview stage's
+  // media -- already sheds load upstream (PreviewChannel drops a lagging
+  // subscriber's backlog), so reaching these means the socket itself is
+  // wedged: drop the channel and let the view reconnect.
+  static constexpr size_t kMaxFrames = 512;
+  static constexpr size_t kMaxBytes  = 32u << 20;
+
+  void
+  send(const FlexData& msg) override
   {
-    auto pit = req.params.find("pipeline");
-    auto sit = req.params.find("stage");
-    if (pit != req.params.end()) { pipeline = pit->second; }
-    if (sit != req.params.end()) { stage = sit->second; }
+    enqueue_(false, msg.to_json());
   }
 
-  // Resolve the live stage's channel under _mu, then release it: the relay
-  // loop must not hold the API lock for the connection's whole life. The
-  // shared_ptr keeps the channel alive even if the pipeline is stopped
-  // (the stage's teardown then close()s it, ending this WebSocket).
-  std::shared_ptr<PreviewChannel> ch;
+  void
+  send_binary(const FlexData& header, const uint8_t* data,
+              size_t size) override
+  {
+    const string h = header.to_json();
+    const uint32_t hl = static_cast<uint32_t>(h.size());
+    string frame;
+    frame.reserve(4 + h.size() + size);
+    const char le[4] = {
+      static_cast<char>(hl & 0xff),
+      static_cast<char>((hl >> 8) & 0xff),
+      static_cast<char>((hl >> 16) & 0xff),
+      static_cast<char>((hl >> 24) & 0xff),
+    };
+    frame.append(le, 4);
+    frame.append(h);
+    if (size > 0) {
+      frame.append(reinterpret_cast<const char*>(data), size);
+    }
+    enqueue_(true, std::move(frame));
+  }
+
+  bool
+  alive() const override
   {
     lock_guard<mutex> lk(_mu);
-    Pipe* p = find_(pipeline);
-    if (p && p->handle && p->handle->valid()) {
-      Stage* s = live_stage_(*p, stage);
-      if (s) {
-        auto* src = dynamic_cast<PreviewSource*>(s);
-        if (src) { ch = src->preview_channel(); }
-      }
-    }
-  }
-  if (!ch) {
-    return;   // no such live stage: let the WebSocket close.
+    return _alive;
   }
 
-  auto sub = ch->subscribe();
-  for (;;) {
-    auto blob = ch->wait_frame(sub, 1000);
-    if (blob) {
-      if (!ws.send_binary(blob->data(), blob->size())) {
-        break;   // client gone (send failed)
-      }
-    } else if (ch->closed()) {
-      break;     // stream ended (pipeline stopped)
-    } else if (!ws.alive()) {
-      break;     // client gone
-    }
-    // else: a 1s wait timed out with nothing queued -> re-check + retry.
+  // Block up to `ms` for something to send (or for the channel to die),
+  // so an outbound message goes out immediately rather than waiting for
+  // the next inbound poll.
+  void
+  wait_for_output(int ms)
+  {
+    unique_lock<mutex> lk(_mu);
+    _cv.wait_for(lk, std::chrono::milliseconds(ms),
+                 [this] { return !_q.empty() || !_alive; });
   }
-  ch->unsubscribe(sub);
+
+  // Write everything queued. False once the peer is gone.
+  bool
+  flush(WebSocket& ws)
+  {
+    std::deque<Frame> out;
+    {
+      lock_guard<mutex> lk(_mu);
+      if (!_alive) { return false; }
+      out.swap(_q);
+      _bytes = 0;
+    }
+    for (const Frame& f : out) {
+      const bool ok =
+          f.binary
+            ? ws.send_binary(
+                  reinterpret_cast<const uint8_t*>(f.data.data()),
+                  f.data.size())
+            : ws.send_text(f.data);
+      if (!ok) { kill(); return false; }
+    }
+    return true;
+  }
+
+  // Mark dead and wake anything waiting on the channel.
+  void
+  kill()
+  {
+    {
+      lock_guard<mutex> lk(_mu);
+      _alive = false;
+      _q.clear();
+      _bytes = 0;
+    }
+    _cv.notify_all();
+  }
+
+private:
+  struct Frame {
+    bool   binary;
+    string data;
+  };
+
+  void
+  enqueue_(bool binary, string data)
+  {
+    {
+      lock_guard<mutex> lk(_mu);
+      if (!_alive) { return; }
+      _bytes += data.size();
+      _q.push_back(Frame{binary, std::move(data)});
+      if (_q.size() > kMaxFrames || _bytes > kMaxBytes) {
+        _alive = false;
+        _q.clear();
+        _bytes = 0;
+      }
+    }
+    _cv.notify_all();
+  }
+
+  mutable mutex           _mu;
+  std::condition_variable _cv;
+  std::deque<Frame>       _q;
+  size_t                  _bytes = 0;
+  bool                    _alive = true;
+};
+
+}  // namespace
+
+void
+SessionApi::h_ui_view_ws_(const HttpRequest& req, WebSocket& ws)
+{
+  string view_id;
+  if (auto it = req.params.find("view"); it != req.params.end()) {
+    view_id = it->second;
+  }
+  const UiViewSpec* spec = UiViewRegistry::get().find(view_id);
+  if (spec == nullptr || spec->make_backend == nullptr) {
+    return;   // unknown view: let the WebSocket close
+  }
+
+  // `ch` MUST outlive `backend`: the backend's worker threads write
+  // through the channel, and on_close()/destruction is what joins them.
+  WsViewChannel ch;
+  std::unique_ptr<UiViewBackendIntf> backend = spec->make_backend(_view_host);
+  if (!backend) { return; }
+  backend->on_open(ch);
+
+  // One thread, both directions: poll for client frames without
+  // blocking, then wait briefly for anything the backend queued. An
+  // outbound message leaves as soon as it is produced (the wait is
+  // woken by the enqueue); an inbound one is picked up within a tick.
+  //
+  // This handler owns its connection for as long as the browser keeps
+  // the panel open, so unlike a request/response route it CANNOT simply
+  // run to completion -- it has to watch for shutdown. stop() waits only
+  // a bounded time for handlers, and everything this one borrows (the
+  // view host, and through it the SessionApi that owns the pipelines) is
+  // destroyed right after that wait. Missing this leaves the loop
+  // dereferencing a freed SessionApi and aborting on its destroyed mutex.
+  constexpr int kTickMs = 20;
+  string in;
+  for (;;) {
+    if (_server != nullptr && _server->stopping()) { break; }
+    bool closed = false;
+    for (;;) {
+      const WebSocket::Msg m = ws.recv(in, 0);
+      if (m == WebSocket::Msg::Closed) { closed = true; break; }
+      if (m == WebSocket::Msg::None) { break; }
+      if (m != WebSocket::Msg::Text) { continue; }   // no binary uplink
+      FlexData msg;
+      try {
+        msg = FlexData::from_json(in);
+      } catch (const std::exception&) {
+        continue;   // malformed: ignore the frame, keep the channel
+      }
+      if (msg.is_object()) { backend->on_message(ch, msg); }
+    }
+    if (closed) { break; }
+    ch.wait_for_output(kTickMs);
+    if (!ch.flush(ws)) { break; }
+  }
+
+  ch.kill();
+  backend->on_close();
 }
 
 // -------------------------------------------------------------------
@@ -3102,6 +3266,7 @@ SessionApi::h_db_value_(const HttpRequest& req)
 void
 SessionApi::register_routes(HttpServer& s)
 {
+  _server = &s;
   s.route("GET", "/api/health",
           [](const HttpRequest&) {
             // Per-process instance token. The web-ui client polls
@@ -3174,6 +3339,8 @@ SessionApi::register_routes(HttpServer& s)
             [this](const HttpRequest& r) { return h_io_input_(r); });
     s.route("POST", "/api/io/clear",
             [this](const HttpRequest& r) { return h_io_clear_(r); });
+    s.route("POST", "/api/io/interrupt",
+            [this](const HttpRequest& r) { return h_io_interrupt_(r); });
     s.route("GET", "/api/io/limit",
             [this](const HttpRequest& r) { return h_io_limit_get_(r); });
     s.route("PUT", "/api/io/limit",
@@ -3213,15 +3380,15 @@ SessionApi::register_routes(HttpServer& s)
   s.route("GET", "/api/hls/streams",
           [this](const HttpRequest& r) { return h_hls_streams_(r); });
 
-  // Low-latency preview: discovery (buffered) + the long-lived binary
-  // stream (single origin, auth-gated like every /api/* route). The stream
-  // route has more path segments than the discovery route, so the two
-  // never collide.
-  s.route("GET", "/api/preview/streams",
-          [this](const HttpRequest& r) { return h_preview_streams_(r); });
-  s.route_ws("/api/preview/:pipeline/:stage/ws",
+  // Stage-provided GUI views: the catalogue, plus one long-lived
+  // bidirectional channel per mounted panel (single origin, auth-gated
+  // like every /api/* route). The view MODULES themselves are served as
+  // static assets straight out of the registry -- see serve_static_.
+  s.route("GET", "/api/ui/views",
+          [this](const HttpRequest& r) { return h_ui_views_(r); });
+  s.route_ws("/api/ui/view/:view/ws",
           [this](const HttpRequest& r, WebSocket& ws) {
-            h_preview_ws_(r, ws);
+            h_ui_view_ws_(r, ws);
           });
 
   // Performance profiler capture control + timeline retrieval.

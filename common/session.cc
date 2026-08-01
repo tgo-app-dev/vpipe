@@ -222,6 +222,34 @@ parse_language_config(const FlexData& config)
   return string(default_language());
 }
 
+// Session-wide ceiling on actively-resident model weights + KV, in
+// bytes; 0 = uncapped. Config key `memory_cap_mb` (an integer, MB), so
+// the number a user reasons about is the one they type. Same shape as
+// the other parse_*_config helpers.
+std::size_t
+parse_memory_cap_config(const FlexData& config)
+{
+  // VPIPE_MEMORY_CAP_MB overrides the config key, the same way
+  // VPIPE_RAM_LIMIT_MB overrides what the memory decisions believe the
+  // box has. It is also how the apps forward their --memory-cap-mb
+  // flag: the manager is not reachable through the public SessionIntf,
+  // and an env override is the convention here rather than a new
+  // interface method for one setting.
+  if (const char* e = std::getenv("VPIPE_MEMORY_CAP_MB")) {
+    const long long mb = std::atoll(e);
+    return mb > 0 ? (static_cast<std::size_t>(mb) << 20) : 0;
+  }
+  if (!config.is_object()) { return 0; }
+  auto root = config.as_object();
+  if (!root.contains("memory_cap_mb")) { return 0; }
+  FlexData v = root.at("memory_cap_mb");
+  const long long mb = v.is_int() ? v.as_int(0)
+                     : v.is_string()
+                           ? std::atoll(std::string(v.get_string()).c_str())
+                           : 0;
+  return mb > 0 ? (static_cast<std::size_t>(mb) << 20) : 0;
+}
+
 unique_ptr<LogDelegateIntf>
 build_delegate(const LogConfigState& state, const Session* reporter)
 {
@@ -550,6 +578,11 @@ Session::generative_model_manager() const
   // heavy lifting happens inside `load()` against a specific LoadSpec.
   std::call_once(_llm_mgr_once, [this] {
     _llm_mgr = make_unique<genai::GenerativeModelManager>(this);
+    // Applied here rather than in the manager's constructor so the
+    // config stays parsed in one place, beside the other
+    // parse_*_config helpers.
+    const std::size_t cap = parse_memory_cap_config(_config);
+    if (cap > 0) { _llm_mgr->set_memory_cap(cap); }
   });
   return _llm_mgr.get();
 #else
@@ -982,6 +1015,14 @@ unique_ptr<UiTextStream>
 Session::open_text_stream() const
 {
   return _ui_delegate->open_text_stream();
+}
+
+UiInterruptToken
+Session::register_interrupt_handler(string             label,
+                                    UiInterruptHandler fn) const
+{
+  return _ui_delegate->register_interrupt_handler(std::move(label),
+                                                  std::move(fn));
 }
 
 void

@@ -1,9 +1,13 @@
-// macOS microphone-permission probe for the web-ui startup checks.
-// Uses AVCaptureDevice's TCC authorization status -- a passive query
-// that does NOT open the device (so it can't hang or grab the mic), the
-// same status the System Settings > Privacy & Security > Microphone pane
-// reflects. Built only on Apple (see CMakeLists); the non-Apple fallback
-// lives in startup-checks.cc.
+// macOS microphone- and camera-permission probes for the web-ui startup
+// checks. Uses AVCaptureDevice's TCC authorization status -- a passive query
+// that does NOT open the device (so it can't hang or grab the mic/camera),
+// the same status the System Settings > Privacy & Security > Microphone /
+// Camera panes reflect. Built only on Apple (see CMakeLists); the non-Apple
+// fallbacks live in startup-checks.cc.
+//
+// Not opening the device matters here: an actual camera open on a system
+// that has not granted (or has denied) camera access can BLOCK rather than
+// fail, which is exactly what a startup check must not do.
 
 #import <AVFoundation/AVFoundation.h>
 #include <CoreAudio/CoreAudio.h>
@@ -95,6 +99,57 @@ audio_input_device_count()
     }
   }
   return inputs;
+}
+
+int
+camera_auth_status()
+{
+  AVAuthorizationStatus s =
+      [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+  switch (s) {
+    case AVAuthorizationStatusAuthorized:
+      return 1;
+    case AVAuthorizationStatusDenied:
+    case AVAuthorizationStatusRestricted:
+      return 0;
+    case AVAuthorizationStatusNotDetermined:
+    default:
+      return -1;
+  }
+}
+
+int
+video_input_device_count()
+{
+  // AVCaptureDeviceDiscoverySession needs an explicit device-type list, and
+  // the interesting types arrived at different releases -- so build it at
+  // runtime. `devicesWithMediaType:` would be one call, but it is deprecated
+  // and this target builds with -Wall -Werror.
+  NSMutableArray* types = [NSMutableArray array];
+  [types addObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+  if (@available(macOS 14.0, *)) {
+    // External (USB/Thunderbolt) cameras, iPhone-as-webcam, and the
+    // Desk View companion the built-in camera exposes.
+    [types addObject:AVCaptureDeviceTypeExternal];
+    [types addObject:AVCaptureDeviceTypeContinuityCamera];
+    [types addObject:AVCaptureDeviceTypeDeskViewCamera];
+  }
+  AVCaptureDeviceDiscoverySession* ds =
+      [AVCaptureDeviceDiscoverySession
+          discoverySessionWithDeviceTypes:types
+                                mediaType:AVMediaTypeVideo
+                                 position:AVCaptureDevicePositionUnspecified];
+  if (ds == nil) { return -1; }
+  const int n = static_cast<int>(ds.devices.count);
+
+  // Enumeration does not require camera permission on macOS, but be
+  // defensive the same way the audio probe is: if discovery came back empty,
+  // ask for the system default video device before reporting "none".
+  if (n == 0
+      && [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo] != nil) {
+    return 1;
+  }
+  return n;
 }
 
 }  // namespace vpipe::webui

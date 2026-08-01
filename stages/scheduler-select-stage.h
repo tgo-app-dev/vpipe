@@ -13,7 +13,7 @@ namespace vpipe {
 
 // Source stage: choose a diffusion SCHEDULER (the sigma schedule) and emit its
 // spec as a FlexData beat, once, on oport0. A `text-to-image` stage latches it
-// off its optional scheduler iport. Pairs with `sampler-select` (the
+// off its optional scheduler iport. Pairs with `diffusion-sampler-select` (the
 // integrator) -- scheduler and sampler are the two independent choices.
 //
 // The spec is:
@@ -46,6 +46,7 @@ public:
                        FlexData                  config);
   ~SchedulerSelectStage() override;
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -59,6 +60,10 @@ private:
   std::int64_t _steps = 0;
   double       _shift = 0.0;
   double       _rho = 0.0;
+  // boogu_v1 only (0 = unset -> the schedule's own default).
+  std::int64_t _seq_len = 0;
+  double       _base_shift = 0.0;
+  double       _max_shift = 0.0;
   std::uint64_t _emitted = 0;
 };
 

@@ -1,0 +1,521 @@
+/* Phone shell styling. Loaded ONLY by js/phone/phone-app.js, so the
+   desktop never parses a rule of it -- and every rule here is scoped
+   under #app.phone anyway, since both shells share index.html.
+
+   It uses the app stylesheet's design tokens (--bg-*, --fg-*, --line,
+   --accent-*) and its .btn / .icon utilities; nothing is redefined. */
+
+#app.phone { height: 100dvh; }        /* dvh: the mobile URL bar moves */
+#app.phone #nav,
+#app.phone #statusbar { display: none; }
+
+/* ---- top bar ---- */
+
+#app.phone #topbar {
+  /* The bar keeps its 50px of content and grows by whatever the device
+     hides behind a notch, so the brand and the menu button clear it. */
+  height: calc(50px + env(safe-area-inset-top, 0px));
+  padding: env(safe-area-inset-top, 0px) 6px 0 14px;
+  align-items: center;
+  gap: 0;
+}
+#app.phone #topbar .grow { flex: 1 1 auto; }
+/* 44px: the smallest reliably tappable target. */
+.ph-menu-btn {
+  flex: 0 0 auto;
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none; border-radius: 8px;
+  color: var(--fg); cursor: pointer; padding: 0;
+}
+.ph-menu-btn:active { background: var(--bg-2); }
+
+/* ---- view frame ---- */
+
+.ph-view {
+  flex: 1 1 auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.ph-view-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  min-height: 38px; padding: 4px 10px;
+  background: var(--bg-1); border-bottom: 1px solid var(--line);
+}
+.ph-view-title {
+  flex: 0 0 auto; font-weight: 600; font-size: 12px; color: var(--fg);
+  max-width: 45%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The view's own controls. A phone header cannot fit four of anything,
+   so the strip SCROLLS sideways instead of wrapping -- wrapping would
+   change the header's height and push the content around as controls
+   come and go (the text I/O attach buttons appear only while a media
+   request is pending).
+   `margin-left: auto` rather than `justify-content: flex-end`: the
+   latter, on an overflowing scroll container, parks the first items
+   past the start edge where they cannot be scrolled back to. */
+.ph-view-actions {
+  flex: 0 1 auto; min-width: 0; margin-left: auto;
+  display: flex; align-items: center; gap: 6px;
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.ph-view-actions::-webkit-scrollbar { display: none; }
+.ph-view-actions > * { flex: 0 0 auto; }
+.ph-view-body {
+  position: relative;        /* stage panels position:absolute into this */
+  flex: 1 1 auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.ph-act {
+  width: 34px; height: 30px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 6px; color: var(--fg); cursor: pointer;
+}
+.ph-act:active { background: var(--bg-3); }
+/* `display: flex` above out-specifies the UA's [hidden] rule, so a
+   button toggled with .hidden would otherwise stay visible. */
+.ph-act[hidden] { display: none; }
+
+/* ---- drawer ---- */
+
+.ph-drawer-back {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(0, 0, 0, .5);
+  display: flex; justify-content: flex-end;
+}
+.ph-drawer {
+  width: 74vw; max-width: 300px; height: 100%;
+  background: var(--bg-1); border-left: 1px solid var(--line);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, .45);
+  display: flex; flex-direction: column; gap: 2px;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 10px
+           calc(12px + env(safe-area-inset-bottom, 0px));
+  overflow-y: auto;
+}
+.ph-drawer-title {
+  color: var(--fg-dim); font-size: 10px; letter-spacing: .8px;
+  text-transform: uppercase; padding: 6px 8px 8px;
+}
+.ph-drawer-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 13px 10px; border: none; border-radius: 8px;
+  background: transparent; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 14px; text-align: left; width: 100%;
+}
+.ph-drawer-item:active { background: var(--bg-2); }
+.ph-drawer-item.active { background: var(--bg-2); color: var(--accent); }
+.ph-drawer-sep {
+  height: 1px; background: var(--line); margin: 10px 6px 6px;
+}
+/* The escape to the desktop layout. Small and quiet ON PURPOSE: it is
+   the one control in this drawer that reloads the page and lands
+   somewhere a phone can barely use, so it should not read as a peer of
+   the view buttons above it or present the same size of target. The
+   confirmation dialog is the other half of that. */
+.ph-drawer-link {
+  align-self: flex-start;
+  padding: 6px 10px; border: none; background: transparent;
+  color: var(--fg-dim); font: inherit; font-size: 11px;
+  text-decoration: underline; text-underline-offset: 2px;
+  cursor: pointer;
+}
+.ph-drawer-link:active { color: var(--fg); }
+
+/* ---- pipeline view ---- */
+
+.ph-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.ph-pick {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg-2); color: var(--fg); font: inherit; font-size: 13px;
+  cursor: pointer; text-align: left;
+}
+.ph-pick:active { background: var(--bg-3); }
+.ph-pick-id {
+  flex: 1 1 auto; min-width: 0; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-pick-id.dim { color: var(--fg-dim); font-weight: 400; }
+.ph-pick-caret { flex: 0 0 auto; color: var(--fg-dim); }
+.ph-pill {
+  flex: 0 0 auto; font-size: 10px; letter-spacing: .4px;
+  padding: 2px 7px; border-radius: 999px;
+  background: var(--bg-3); color: var(--fg-dim); text-transform: uppercase;
+}
+.ph-pill.running { color: var(--accent-2); }
+.ph-pill.paused  { color: var(--warn); }
+.ph-pill.stopped { color: var(--fg-dim); }
+.ph-pill.busy { color: var(--warn); }
+/* No detail loaded yet -> no state to name, and an empty pill is just a
+   stray box. */
+.ph-pill:empty { display: none; }
+.ph-act:disabled { opacity: .35; }
+
+.ph-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.ph-rows { display: flex; flex-direction: column; }
+
+/* One stage. Fixed height is load-bearing, not cosmetic: the lane art is
+   drawn per row into its own SVG, and the lanes only line up from row to
+   row while every row is exactly ROW_H tall (see phone-pipelines.js). */
+.ph-row {
+  display: flex; align-items: stretch; gap: 0;
+  height: 46px; flex: 0 0 46px; width: 100%;
+  padding: 0 10px 0 0; border: none; border-bottom: 1px solid var(--bg-2);
+  background: transparent; color: var(--fg); font: inherit;
+  cursor: pointer; text-align: left;
+}
+.ph-row:active { background: var(--bg-1); }
+/* A stage whose config didn't validate: it is still in the graph, but
+   the runtime skips it at launch, so say so on the row and not only in
+   the badge. */
+.ph-row.bad .ph-row-id { color: var(--danger); }
+.ph-gutter { flex: 0 0 auto; display: block; }
+.ph-lanes { display: block; }
+.ph-lanes .lane {
+  fill: none; stroke: var(--line); stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.ph-lanes .lane-dot {
+  fill: var(--accent); stroke: var(--bg); stroke-width: 1.5;
+}
+.ph-lanes .lane-dot.bad { fill: var(--danger); }
+.ph-row-text {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; justify-content: center; gap: 1px;
+  padding-left: 4px;
+}
+.ph-row-id {
+  font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-row-type {
+  font-size: 10.5px; color: var(--fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-warn {
+  flex: 0 0 auto; align-self: center;
+  width: 18px; height: 18px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--danger); color: var(--bg-1);
+  font-size: 12px; font-weight: 700;
+}
+.ph-row-caret {
+  flex: 0 0 auto; align-self: center; padding-left: 6px;
+  color: var(--fg-dim); font-size: 11px;
+  transition: transform .12s ease;
+}
+.ph-row.open .ph-row-caret { transform: rotate(90deg); }
+.ph-row.open { background: var(--bg-1); }
+
+.ph-empty {
+  margin: auto; padding: 28px 16px; text-align: center;
+  color: var(--fg-dim); font-size: 12.5px;
+}
+
+/* ---- expanded stage block ---- */
+
+.ph-detail-block {
+  position: relative;              /* anchors the lane continuations */
+  flex: 0 0 auto;                  /* a flex item: never compress it */
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+/* The gutter carried down the side of the block. A lane that runs past
+   this stage must not appear to stop at whichever row happens to be
+   open, so each still-live lane gets a rule the full height of the
+   block -- absolutely positioned rather than drawn, because the height
+   changes as the sections inside are opened and closed. */
+.ph-cont {
+  position: absolute; top: 0; bottom: 0; width: 1.6px;
+  margin-left: -0.8px; background: var(--line);
+}
+.ph-detail { padding: 4px 10px 12px 4px; }
+
+.ph-sec { border-top: 1px solid var(--bg-2); }
+.ph-sec:first-child { border-top: none; }
+.ph-sec-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 4px; border: none; background: transparent;
+  color: var(--fg-dim); cursor: pointer; font: inherit; font-size: 11px;
+  letter-spacing: .6px; text-transform: uppercase; text-align: left;
+}
+.ph-sec-caret { flex: 0 0 auto; font-size: 10px; }
+.ph-sec-body { padding: 0 4px 10px; }
+.ph-sec-body[hidden] { display: none; }
+
+.ph-ro-note {
+  color: var(--warn); font-size: 11.5px; padding: 2px 0 8px;
+}
+
+/* ---- config fields ---- */
+
+.ph-field { padding: 7px 0; border-bottom: 1px solid var(--bg-2); }
+.ph-field:last-of-type { border-bottom: none; }
+.ph-f-label {
+  display: flex; align-items: baseline; gap: 6px; padding-bottom: 4px;
+}
+.ph-f-key {
+  font-size: 12px; font-weight: 600; color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.ph-f-req { color: var(--danger); font-size: 12px; }
+.ph-f-type {
+  margin-left: auto; flex: 0 0 auto;
+  color: var(--fg-dim); font-size: 10px; letter-spacing: .4px;
+}
+.ph-f-row { display: flex; align-items: stretch; gap: 5px; }
+.ph-f-row > .ph-input { flex: 1 1 auto; min-width: 0; }
+.ph-f-btn {
+  flex: 0 0 auto; width: 34px; padding: 0;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 14px;
+}
+.ph-f-btn:active { background: var(--bg-3); }
+.ph-f-doc {
+  color: var(--fg-dim); font-size: 11px; line-height: 1.45; padding-top: 4px;
+}
+/* An UNSET field: the key is omitted entirely and the stage's own
+   default applies. Visually distinct from a field set to the empty
+   string, which is a different configuration. */
+.ph-field.unset .ph-input { border-style: dashed; opacity: .75; }
+.ph-textarea { resize: vertical; min-height: 58px; }
+.ph-select { height: 38px; }
+.ph-apply { width: 100%; justify-content: center; margin-top: 12px;
+  padding: 11px; font-size: 14px; }
+
+/* ---- system view ---- */
+
+.ph-sys {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 10px 10px calc(16px + env(safe-area-inset-bottom, 0px));
+  display: flex; flex-direction: column; gap: 10px;
+}
+.ph-sys-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding-bottom: 2px;
+}
+.ph-sys-head-label {
+  color: var(--fg-dim); font-size: 10px; letter-spacing: .7px;
+  text-transform: uppercase;
+}
+.ph-sys-machine {
+  flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-sys-card {
+  background: var(--bg-1); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 10px 6px;
+}
+.ph-sys-card-head {
+  display: flex; align-items: baseline; gap: 10px; padding-bottom: 4px;
+}
+.ph-sys-label {
+  flex: 0 0 auto; color: var(--fg-dim); font-size: 10px;
+  letter-spacing: .7px; text-transform: uppercase;
+}
+.ph-sys-val {
+  flex: 1 1 auto; min-width: 0; text-align: right;
+  font-size: 13px; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-sys-val.dim { color: var(--fg-dim); }
+/* The trace. The sparkline's viewBox is 140x28 with
+   preserveAspectRatio: none, so it stretches to whatever box it is
+   given; its line carries non-scaling-stroke so the stretch doesn't
+   thicken it (see makeSparkline). */
+.ph-sys-plot {
+  height: 76px; background: var(--bg); border-radius: 5px;
+  overflow: hidden;
+}
+.ph-sys-plot svg.sb-spark { width: 100%; height: 100%; display: block; }
+.ph-sys-foot {
+  color: var(--fg-dim); font-size: 10.5px; text-align: center;
+  padding-top: 2px;
+}
+
+/* ---- files view ---- */
+
+.ph-files-browse, .ph-files-preview {
+  flex: 1 1 auto; min-height: 0;
+  -webkit-overflow-scrolling: touch;
+}
+/* Browse: the path bar stays put and the LISTING takes the rest of the
+   screen and scrolls -- so the walker fills the view instead of ending
+   wherever its content does. (In a sheet the same two elements just
+   stack and the list carries the cap above.) */
+.ph-files-browse {
+  display: flex; flex-direction: column; overflow: hidden; padding: 8px 0;
+}
+.ph-files-browse > .ph-sheet-path { flex: 0 0 auto; padding: 0 10px 8px; }
+/* No safe-area padding here: .ph-view-body already reserves it, and
+   adding it again would count the home indicator twice. */
+.ph-files-browse > .ph-sheet-list {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: 0 10px 12px;
+}
+/* Preview scrolls as one block: it is a header plus one piece of media. */
+.ph-files-preview { overflow-y: auto; padding: 8px 10px; }
+.ph-files-browse[hidden], .ph-files-preview[hidden] { display: none; }
+.ph-file-meta {
+  display: flex; align-items: baseline; gap: 10px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.ph-file-name {
+  flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ph-file-size { flex: 0 0 auto; color: var(--fg-dim); font-size: 11px; }
+.ph-file-stage { padding: 10px 0; }
+.ph-file-img {
+  max-width: 100%; height: auto; display: block; border-radius: 6px;
+  background: #000;
+}
+.ph-file-av { width: 100%; display: block; }
+.ph-file-text {
+  margin: 0; padding: 10px; background: var(--bg); border-radius: 6px;
+  border: 1px solid var(--line); font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ph-file-raw { display: inline-flex; }
+.ph-into {
+  flex: 0 0 auto; width: 30px; padding: 0; border: none;
+  background: transparent; color: var(--fg-dim); font: inherit;
+  font-size: 18px; cursor: pointer;
+}
+.ph-sheet-item.col { flex-direction: column; align-items: flex-start;
+  gap: 2px; }
+.ph-sheet-sub { color: var(--fg-dim); font-size: 10.5px; }
+.ph-note {
+  padding: 14px 12px 24px; color: var(--fg-dim); font-size: 11px;
+  text-align: center;
+}
+
+/* ---- sheets (openModal bodies) ---- */
+
+.ph-modal { max-height: 82vh; }
+.ph-sheet-list { display: flex; flex-direction: column; gap: 2px; }
+/* The height cap belongs to the SHEET, not to the list: it exists so a
+   dialog with a filename box and buttons under the listing still fits
+   the screen. The same walker is also the whole Files view, where a cap
+   would just truncate it -- so it is scoped to a modal rather than
+   living on .ph-sheet-list. */
+.modal .ph-sheet-list { max-height: 46vh; overflow-y: auto; }
+.ph-sheet-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 12px 10px; border: none; border-radius: 7px;
+  background: transparent; color: var(--fg); font: inherit; font-size: 13px;
+  cursor: pointer; text-align: left; width: 100%;
+}
+.ph-sheet-item:active { background: var(--bg-2); }
+.ph-sheet-item.active { background: var(--bg-2); color: var(--accent); }
+.ph-sheet-name {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-sheet-label {
+  color: var(--fg-dim); font-size: 10px; letter-spacing: .7px;
+  text-transform: uppercase; padding: 12px 2px 5px;
+}
+.ph-sheet-hint { color: var(--fg-dim); font-size: 12px; padding: 10px 4px; }
+.ph-sheet-path {
+  display: flex; align-items: center; gap: 8px;
+  padding: 2px 0 8px; color: var(--fg-dim); font-size: 11.5px;
+}
+/* Plain LTR (bidi-safe, as fs-list.js's truncation is): a path is
+   nothing but neutral characters, and `direction: rtl` -- the usual
+   trick for eliding the HEAD -- reorders them at the edges. */
+.ph-sheet-pathtext {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ph-up {
+  flex: 0 0 auto; width: 30px; height: 28px; padding: 0;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
+}
+/* Sized to the text around it (rows, keys, sheet items are 12–13px). An
+   input at 16px reads as a different, louder kind of text than the
+   labels and values it sits among, which is what 16px was buying: below
+   it, iOS Safari zooms the page in on focus. The padding keeps the tap
+   target comfortably past 44px on its own, so the trade is a zoom step
+   on focus in Safari -- reversible with a pinch -- against every field
+   on the screen looking oversized all the time. */
+.ph-input {
+  width: 100%; padding: 10px; font: inherit; font-size: 13px;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 7px;
+}
+.ph-input:focus { outline: none; border-color: var(--accent); }
+
+/* ---- stage detail ---- */
+
+/* Contain the scroll: dragging a long stage detail past its end must
+   not start scrolling the pipeline list behind the sheet. */
+.ph-detail { overscroll-behavior: contain; }
+.ph-detail-type {
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  word-break: break-all;
+}
+.ph-detail-doc {
+  color: var(--fg-dim); font-size: 12px; line-height: 1.5;
+}
+.ph-detail-doc:not(:empty) { padding: 6px 0; }
+.ph-detail-err {
+  color: var(--danger); font-size: 12px; padding: 6px 0;
+}
+.ph-detail-sec { padding-top: 12px; }
+.ph-detail-h {
+  color: var(--fg-dim); font-size: 10px; letter-spacing: .7px;
+  text-transform: uppercase; padding-bottom: 4px;
+  border-bottom: 1px solid var(--line); margin-bottom: 4px;
+}
+.ph-kv {
+  display: flex; gap: 10px; padding: 5px 0; font-size: 12px;
+  border-bottom: 1px solid var(--bg-2);
+}
+.ph-kv-k {
+  flex: 0 0 42%; min-width: 0; color: var(--fg-dim);
+  word-break: break-word;
+}
+.ph-kv-v { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.ph-kv-v.dim { color: var(--fg-dim); font-style: italic; }
+
+/* ---- text I/O ---- */
+
+/* No Ctrl key on a phone, so the Ctrl+J / Enter legend is noise -- and
+   it costs a line at the bottom of a short screen. */
+#app.phone .userio .io-hint { display: none; }
+#app.phone .userio .io-input { padding: 8px; gap: 6px; }
+/* The compose box reads as the console it answers, not as a headline --
+   so it takes the console's own size rather than being bumped to 16px to
+   dodge iOS's focus zoom (see .ph-input). */
+#app.phone .userio .io-text { font-size: 12.5px; }
+#app.phone .userio .console { font-size: 12.5px; padding: 8px 10px; }
+#app.phone .io-md-toggle { font-size: 11px; white-space: nowrap; }
+/* The prompt label eats the width the input needs; it only ever says
+   "waiting" or repeats the pending request, which the placeholder and
+   the enabled state already convey. */
+#app.phone .userio .io-input .io-prompt { display: none; }
+
+/* ---- preview ---- */
+
+/* The stage panel positions itself absolute into its host, which is
+   .ph-view-body (position: relative above). Nothing else to do. */
+#app.phone .preview-controls,
+#app.phone .cmpi-controls { bottom: 8px; left: 8px; }

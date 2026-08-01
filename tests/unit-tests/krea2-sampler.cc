@@ -1,7 +1,7 @@
 // Krea-2 sampler/scheduler refactor: the interchangeable FlowSampler (euler /
 // heun / dpmpp_2m / dpmpp_sde) + FlowScheduler (simple / karras / exponential),
-// the sampler-select + scheduler-select config stages, and text-to-image
-// latching both specs off ports.
+// the diffusion-sampler-select + scheduler-select config stages, and
+// text-to-image latching both specs off ports.
 //
 //  * specs round-trip through FlexData; method/type aliases + fallbacks.
 //  * the simple euler schedule is bit-identical to the old baked-in turbo.
@@ -10,7 +10,7 @@
 //    invariant); dpmpp_2m differs from euler on a nonlinear field; dpmpp_sde is
 //    deterministic given a seed.
 //  * the select stages resolve defaults (built-in + from a model) + overrides.
-//  * [env] end-to-end: sampler-select + scheduler-select wired into
+//  * [env] end-to-end: diffusion-sampler-select + scheduler-select wired into
 //    text-to-image's ports yield a latent bit-identical to the default path.
 
 #include "minitest.h"
@@ -25,7 +25,7 @@
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
-#include "stages/sampler-select-stage.h"
+#include "stages/diffusion-sampler-select-stage.h"
 #include "stages/scheduler-select-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/text-to-image-stage.h"
@@ -105,6 +105,50 @@ TEST(krea2_sampler, scheduler_spec_roundtrips)
 }
 
 // ---- schedules ----------------------------------------------------------
+
+// Boogu-Image's schedule + the DMD student's spec. Its sigma convention is
+// INVERTED (0 = noise, 1 = clean), so unlike every other schedule here the
+// array ASCENDS and terminates at 1.
+TEST(krea2_sampler, boogu_v1_schedule_ascends_and_dmd_spec_roundtrips)
+{
+  FlowSamplerSpec s;
+  s.method = "dmd"; s.conditioning_sigma = 0.001; s.seed = 7;
+  EXPECT_TRUE(FlowSamplerSpec::from_flex(s.to_flex()) == s);
+  // Aliases canonicalize onto "dmd".
+  FlexData fd = FlexData::make_object();
+  fd.as_object().insert_or_assign("method", FlexData::make_string("turbo"));
+  EXPECT_TRUE(FlowSamplerSpec::from_flex(fd).method == "dmd");
+
+  FlowSchedulerSpec sc;
+  sc.type = "boogu_v1"; sc.steps = 4; sc.seq_len = 4096;
+  sc.base_shift = 0.5; sc.max_shift = 1.15;
+  sc.base_seq = 256; sc.max_seq = 4096;
+  EXPECT_TRUE(FlowSchedulerSpec::from_flex(sc.to_flex()) == sc);
+
+  const std::vector<double> sig = sc.sigmas();
+  EXPECT_TRUE(sig.size() == 5);
+  // Starts at 0 (pure noise), ends at 1 (clean), strictly increasing. The
+  // reference clips the flipped time to [1e-8, 1-1e-8] before the logistic, so
+  // the first sigma is that eps pushed back through it, not a hard zero.
+  EXPECT_TRUE(std::abs(sig[0]) < 1e-6);
+  EXPECT_TRUE(std::abs(sig[4] - 1.0) < 1e-9);
+  for (std::size_t i = 1; i < sig.size(); ++i) {
+    EXPECT_TRUE(sig[i] > sig[i - 1]);
+  }
+  // seq_len 4096 sits at the top of the base->max shift line, so mu = max_shift
+  // = 1.15; the logistic shift then pulls every interior step BELOW the plain
+  // linspace it started from (more time spent near the noisy end).
+  for (int i = 1; i < 4; ++i) {
+    EXPECT_TRUE(sig[(std::size_t)i] < (double)i / 4.0);
+  }
+  // A shorter sequence (smaller mu) shifts less, so its steps sit higher.
+  FlowSchedulerSpec small = sc;
+  small.seq_len = 256;                     // mu = base_shift = 0.5
+  const std::vector<double> ssig = small.sigmas();
+  for (int i = 1; i < 4; ++i) {
+    EXPECT_TRUE(ssig[(std::size_t)i] > sig[(std::size_t)i]);
+  }
+}
 
 TEST(krea2_sampler, simple_schedule_matches_baked_turbo)
 {
@@ -233,7 +277,7 @@ TEST(krea2_sampler, sampler_select_resolves_defaults_and_overrides)
 {
   Session sess;
   {
-    SamplerSelectStage st(&sess, "s", {}, FlexData::make_object());
+    DiffusionSamplerSelectStage st(&sess, "s", {}, FlexData::make_object());
     FlexData fd = st.resolved_spec();      // bind: as_object() is a view
     auto o = fd.as_object();
     EXPECT_TRUE(std::string(o.at("method").as_string("")) == "euler");
@@ -245,7 +289,7 @@ TEST(krea2_sampler, sampler_select_resolves_defaults_and_overrides)
     c.insert_or_assign("method", FlexData::make_string("dpm++_sde"));
     c.insert_or_assign("eta", FlexData::make_real(0.0));
     c.insert_or_assign("seed", FlexData::make_int(123));
-    SamplerSelectStage st(&sess, "s", {}, std::move(cfg));
+    DiffusionSamplerSelectStage st(&sess, "s", {}, std::move(cfg));
     FlexData fd = st.resolved_spec();
     auto o = fd.as_object();
     EXPECT_TRUE(std::string(o.at("method").as_string("")) == "dpmpp_sde");
@@ -301,9 +345,9 @@ TEST(krea2_sampler, select_stages_are_model_agnostic)
   FlexData ccfg = FlexData::make_object();
   ccfg.as_object().insert_or_assign("model",
                                     FlexData::make_string("/some/model/dir"));
-  SamplerSelectStage samp(&sess, "s", {}, std::move(scfg));
+  DiffusionSamplerSelectStage samp(&sess, "s", {}, std::move(scfg));
   SchedulerSelectStage sched(&sess, "c", {}, std::move(ccfg));
-  SamplerSelectStage samp0(&sess, "s0", {}, FlexData::make_object());
+  DiffusionSamplerSelectStage samp0(&sess, "s0", {}, FlexData::make_object());
   SchedulerSelectStage sched0(&sess, "c0", {}, FlexData::make_object());
   FlexData sfd = samp.resolved_spec(), cfd = sched.resolved_spec();
   auto so = sfd.as_object();
@@ -368,9 +412,10 @@ add_conditioner_(Pipeline* pl, Session& sess, Stage* src,
       &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c)));
 }
 
-// Optionally wire sampler-select (iport3) + scheduler-select (iport4), both
-// model-agnostic (their built-in euler + simple defaults). Returns the emitted
-// latent. Those defaults equal the config default path, so the two runs match.
+// Optionally wire diffusion-sampler-select (iport3) + scheduler-select
+// (iport4), both model-agnostic (their built-in euler + simple defaults).
+// Returns the emitted latent. Those defaults equal the config default path,
+// so the two runs match.
 std::vector<float>
 run_t2i(Session& sess, const std::string& root, const std::string& gdir,
         bool wire_ports)
@@ -381,13 +426,13 @@ run_t2i(Session& sess, const std::string& root, const std::string& gdir,
   su->prompt = "a fox in the snow";
   auto* src = static_cast<SrcText*>(pl->insert_stage(std::move(su)));
 
-  SamplerSelectStage* sel = nullptr;
+  DiffusionSamplerSelectStage* sel = nullptr;
   SchedulerSelectStage* sch = nullptr;
   if (wire_ports) {
-    sel = static_cast<SamplerSelectStage*>(pl->insert_stage(
-        std::make_unique<SamplerSelectStage>(&sess, "sel",
-                                             std::vector<InEdge>{},
-                                             FlexData::make_object())));
+    sel = static_cast<DiffusionSamplerSelectStage*>(pl->insert_stage(
+        std::make_unique<DiffusionSamplerSelectStage>(
+            &sess, "sel", std::vector<InEdge>{},
+            FlexData::make_object())));
     sch = static_cast<SchedulerSelectStage*>(pl->insert_stage(
         std::make_unique<SchedulerSelectStage>(&sess, "sch",
                                                std::vector<InEdge>{},
@@ -464,9 +509,9 @@ TEST(krea2_sampler, dpmpp_2m_karras_end_to_end)
 
   FlexData sa = FlexData::make_object();
   sa.as_object().insert_or_assign("method", FlexData::make_string("dpmpp_2m"));
-  auto* sel = static_cast<SamplerSelectStage*>(pl->insert_stage(
-      std::make_unique<SamplerSelectStage>(&sess, "sel",
-                                           std::vector<InEdge>{}, std::move(sa))));
+  auto* sel = static_cast<DiffusionSamplerSelectStage*>(pl->insert_stage(
+      std::make_unique<DiffusionSamplerSelectStage>(
+          &sess, "sel", std::vector<InEdge>{}, std::move(sa))));
   FlexData sc = FlexData::make_object();
   sc.as_object().insert_or_assign("type", FlexData::make_string("karras"));
   sc.as_object().insert_or_assign("steps", FlexData::make_int(8));

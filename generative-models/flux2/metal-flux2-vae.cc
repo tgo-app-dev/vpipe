@@ -3,6 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,12 @@ using metal_compute::ComputeEncoder;
 using metal_compute::CommandStream;
 
 namespace {
+
+// Namespace for this class's derived-tensor cache keys. A WeightSet is
+// shared by everything reading one checkpoint, so a key has to say which
+// class's transform produced the bytes, not just which tensor they came
+// from.
+constexpr const char* kKey = "flux2-vae/";
 
 std::vector<float>
 read_f32_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm,
@@ -70,93 +77,115 @@ f16_buf_(MetalCompute* mc, const float* src, std::size_t n)
 // 3x3 conv [Cout,Cin,3,3] -> dense-gemm weight [Cout, 9*Cin] flattened
 // (ky,kx,cin) to pair with im2col_hwc_3x3.
 MetalFlux2Vae::Conv
-MetalFlux2Vae::load_conv3x3_(const MetalLlamaWeights& wts,
-                             const std::string& nm)
+MetalFlux2Vae::load_conv3x3_(WeightSet& wts, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;
+  const auto* info = wts.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.size() < 2) { return c; }
+  const auto& sh = info->shape;
   const int Cout = (int)sh[0], Cin = (int)sh[1];
   c.cin = Cin; c.cout = Cout; c.k = 9 * Cin;
-  std::vector<float> flat((std::size_t)Cout * 9 * Cin);
-  for (int o = 0; o < Cout; ++o) {
-    for (int ky = 0; ky < 3; ++ky) {
-      for (int kx = 0; kx < 3; ++kx) {
-        for (int i = 0; i < Cin; ++i) {
-          const std::size_t si =
-              ((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx;
-          const std::size_t di = ((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i;
-          flat[di] = w[si];
-        }
-      }
-    }
-  }
-  c.w = f16_buf_(_mc, flat.data(), flat.size());
-  // HWIO twin for the NAX hardware conv (out-channel fastest).
-  if (_use_hwconv) {
-    std::vector<float> hwio((std::size_t)9 * Cin * Cout);
+
+  // The flattened [Cout, 9*Cin] weight and its HWIO twin are DERIVED --
+  // built from the checkpoint's bytes rather than copied out of them --
+  // so each is cached under a key naming the transform, not the tensor.
+  std::vector<float> w;
+  auto read_w = [&]() {
+    if (!w.empty()) { return; }
+    std::size_t n = 0;
+    w = read_f32_(wts.src(), _mc, nm + ".weight", n);
+  };
+  const std::string k3 = std::string(kKey) + "c3x3|" + nm;
+  c.w = wts.derived(k3, [&]() -> SharedBuffer {
+    read_w();
+    if (w.empty()) { return {}; }
+    std::vector<float> flat((std::size_t)Cout * 9 * Cin);
     for (int o = 0; o < Cout; ++o) {
       for (int ky = 0; ky < 3; ++ky) {
         for (int kx = 0; kx < 3; ++kx) {
           for (int i = 0; i < Cin; ++i) {
             const std::size_t si =
                 ((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx;
-            hwio[(((std::size_t)(ky * 3 + kx) * Cin) + i) * Cout + o] =
-                w[si];
+            const std::size_t di =
+                ((std::size_t)o * 9 + (ky * 3 + kx)) * Cin + i;
+            flat[di] = w[si];
           }
         }
       }
     }
-    c.whwio = f16_buf_(_mc, hwio.data(), hwio.size());
+    return f16_buf_(_mc, flat.data(), flat.size());
+  }, _part);
+  if (c.w.empty()) { return Conv{}; }
+  // HWIO twin for the NAX hardware conv (out-channel fastest).
+  if (_use_hwconv) {
+    c.whwio = wts.derived(k3 + "|hwio", [&]() -> SharedBuffer {
+      read_w();
+      if (w.empty()) { return {}; }
+      std::vector<float> hwio((std::size_t)9 * Cin * Cout);
+      for (int o = 0; o < Cout; ++o) {
+        for (int ky = 0; ky < 3; ++ky) {
+          for (int kx = 0; kx < 3; ++kx) {
+            for (int i = 0; i < Cin; ++i) {
+              const std::size_t si =
+                  ((((std::size_t)o * Cin + i) * 3 + ky) * 3) + kx;
+              hwio[(((std::size_t)(ky * 3 + kx) * Cin) + i) * Cout + o] =
+                  w[si];
+            }
+          }
+        }
+      }
+      return f16_buf_(_mc, hwio.data(), hwio.size());
+    }, _part);
   }
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  c.b = load_vec_(wts, nm + ".bias");
   return c;
 }
 
 // 1x1 conv or Linear [Cout,Cin(,1,1)] -> dense-gemm weight [Cout, Cin].
 MetalFlux2Vae::Conv
-MetalFlux2Vae::load_conv1x1_(const MetalLlamaWeights& wts,
-                             const std::string& nm)
+MetalFlux2Vae::load_conv1x1_(WeightSet& wts, const std::string& nm)
 {
   Conv c;
-  std::size_t n = 0;
-  std::vector<float> w = read_f32_(wts, _mc, nm + ".weight", n);
-  if (w.empty()) { return c; }
-  const auto& sh = wts.info(nm + ".weight")->shape;
+  const auto* info = wts.src().info(nm + ".weight");
+  if (info == nullptr || info->shape.size() < 2) { return c; }
+  const auto& sh = info->shape;
   c.cout = (int)sh[0]; c.cin = (int)sh[1]; c.k = c.cin;
-  c.w = f16_buf_(_mc, w.data(), (std::size_t)c.cout * c.cin);
-  std::size_t nb = 0;
-  std::vector<float> b = read_f32_(wts, _mc, nm + ".bias", nb);
-  if (!b.empty()) { c.b = f16_buf_(_mc, b.data(), nb); }
+  // A 1x1 conv's [Cout,Cin(,1,1)] weight flattens to [Cout, Cin] with no
+  // reordering, so it needs nothing beyond the f16 narrowing load_vec_
+  // already does -- and shares its cache entry.
+  c.w = load_vec_(wts, nm + ".weight");
+  if (c.w.empty()) { return Conv{}; }
+  c.b = load_vec_(wts, nm + ".bias");
   return c;
 }
 
 MetalFlux2Vae::GNorm
-MetalFlux2Vae::load_gnorm_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalFlux2Vae::load_gnorm_(WeightSet& wts, const std::string& nm)
 {
   GNorm gn;
   gn.g = load_vec_(wts, nm + ".weight");
   gn.b = load_vec_(wts, nm + ".bias");
-  const auto* info = wts.info(nm + ".weight");
+  const auto* info = wts.src().info(nm + ".weight");
   if (info != nullptr && !info->shape.empty()) { gn.c = (int)info->shape[0]; }
   return gn;
 }
 
+// Every tensor the VAE keeps is stored as f16 regardless of its on-disk
+// dtype, so "read as f32 and narrow" IS the transform and the result is
+// cached like any other derived tensor.
 SharedBuffer
-MetalFlux2Vae::load_vec_(const MetalLlamaWeights& wts, const std::string& nm)
+MetalFlux2Vae::load_vec_(WeightSet& wts, const std::string& nm)
 {
-  std::size_t n = 0;
-  std::vector<float> v = read_f32_(wts, _mc, nm, n);
-  if (v.empty()) { return {}; }
-  return f16_buf_(_mc, v.data(), n);
+  return wts.derived(std::string(kKey) + "f16|" + nm, [&]() -> SharedBuffer {
+    std::size_t n = 0;
+    std::vector<float> v = read_f32_(wts.src(), _mc, nm, n);
+    if (v.empty()) { return {}; }
+    return f16_buf_(_mc, v.data(), n);
+  }, _part);
 }
 
 bool
-MetalFlux2Vae::load_resblock_(const MetalLlamaWeights& wts,
+MetalFlux2Vae::load_resblock_(WeightSet& wts,
                               const std::string& pre, ResBlock& rb, int cin,
                               int cout)
 {
@@ -175,7 +204,7 @@ MetalFlux2Vae::load_resblock_(const MetalLlamaWeights& wts,
 }
 
 MetalFlux2Vae::Attn
-MetalFlux2Vae::load_attn_(const MetalLlamaWeights& wts, const std::string& pre,
+MetalFlux2Vae::load_attn_(WeightSet& wts, const std::string& pre,
                           int dim)
 {
   Attn a;
@@ -192,12 +221,19 @@ std::unique_ptr<MetalFlux2Vae>
 MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
                     const Config& cfg_in, bool with_encoder)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg_in, with_encoder);
+}
+
+std::unique_ptr<MetalFlux2Vae>
+MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
+                    const Config& cfg_in, bool with_encoder)
+{
+  if (mc == nullptr || !ws_in) { return nullptr; }
+  WeightSet& wts = *ws_in;
+  const std::string model_dir = ws_in->dir();
 
   auto m = std::unique_ptr<MetalFlux2Vae>(new MetalFlux2Vae());
+  m->_ws = std::move(ws_in);
   m->_mc = mc;
 
   // Size from vae/config.json so the same code serves every AutoencoderKLFlux2
@@ -234,6 +270,25 @@ MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
           } else if (ps.is_int()) {
             cfg.patch = (int)ps.as_int(cfg.patch);
           }
+        } else {
+          // A plain diffusers AutoencoderKL (the FLUX.1 VAE Boogu uses) has no
+          // patch_size at all: the latent IS [latent_channels, H/8, W/8].
+          cfg.patch = 1;
+        }
+        // The 1x1 moment convs are optional on the plain AutoencoderKL.
+        if (o.contains("use_quant_conv")) {
+          cfg.use_quant_conv = o.at("use_quant_conv").as_bool(true);
+        }
+        if (o.contains("use_post_quant_conv")) {
+          cfg.use_post_quant_conv = o.at("use_post_quant_conv").as_bool(true);
+        }
+        // Scalar whitening (plain AutoencoderKL); the FLUX.2 VAE carries a
+        // BatchNorm instead and leaves these absent.
+        if (o.contains("scaling_factor")) {
+          cfg.scaling_factor = (float)o.at("scaling_factor").as_real(0.0);
+        }
+        if (o.contains("shift_factor")) {
+          cfg.shift_factor = (float)o.at("shift_factor").as_real(0.0);
         }
       }
     }
@@ -325,7 +380,9 @@ MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
   bool ok = true;
 
   // ---- decoder ----
-  m->_post_quant = m->load_conv1x1_(wts, "post_quant_conv");
+  if (cfg.use_post_quant_conv) {
+    m->_post_quant = m->load_conv1x1_(wts, "post_quant_conv");
+  }
   m->_conv_in = m->load_conv3x3_(wts, "decoder.conv_in");   // latent -> top
   ok = ok && !m->_conv_in.w.empty();
   ok = ok && m->load_resblock_(wts, "decoder.mid_block.resnets.0.",
@@ -372,8 +429,8 @@ MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
   {
     const int C = cfg.dit_channels();            // 128
     std::size_t n = 0;
-    std::vector<float> mean = read_f32_(wts, mc, "bn.running_mean", n);
-    std::vector<float> var  = read_f32_(wts, mc, "bn.running_var", n);
+    std::vector<float> mean = read_f32_(wts.src(), mc, "bn.running_mean", n);
+    std::vector<float> var  = read_f32_(wts.src(), mc, "bn.running_var", n);
     m->_bn_a.assign((std::size_t)C, 1.0f);
     m->_bn_b.assign((std::size_t)C, 0.0f);
     if ((int)mean.size() == C && (int)var.size() == C) {
@@ -383,19 +440,53 @@ MetalFlux2Vae::load(const std::string& model_dir, MetalCompute* mc,
         m->_bn_a[(std::size_t)c] = a;
         m->_bn_b[(std::size_t)c] = -mean[(std::size_t)c] * a;
       }
+    } else if (cfg.scaling_factor != 0.0f) {
+      // Plain AutoencoderKL: the SCALAR whitening z = (x - shift) * scale folds
+      // into the same per-channel affine, so encode (a*x + b) and decode
+      // ((z - b)/a) need no special case.
+      for (int c = 0; c < C; ++c) {
+        m->_bn_a[(std::size_t)c] = cfg.scaling_factor;
+        m->_bn_b[(std::size_t)c] = -cfg.shift_factor * cfg.scaling_factor;
+      }
     }
   }
 
-  if (with_encoder) {
-    if (!m->load_encoder_(wts)) { return nullptr; }
-    m->_has_encoder = true;
-  }
   if (!ok) { return nullptr; }
+  if (with_encoder && !m->ensure_encoder()) { return nullptr; }
   return m;
 }
 
 bool
-MetalFlux2Vae::load_encoder_(const MetalLlamaWeights& wts)
+MetalFlux2Vae::ensure_encoder()
+{
+  if (_has_encoder) { return true; }
+  if (!_ws) { return false; }
+  // Through the WeightSet so the encoder half loads ONCE per checkpoint
+  // however many VAEs over it end up needing it -- and, when nobody
+  // does, never.
+  const bool ok = _ws->ensure_part("encoder", [this]() {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    return r;
+  });
+  if (!ok) { return false; }
+  // A second VAE over a checkpoint whose encoder another one already
+  // loaded still has to populate ITS OWN struct members; ensure_part
+  // reports the cached success without re-running the loader, so bind
+  // the (now cache-hit) tensors here.
+  if (_enc_conv_in.w.empty()) {
+    _part = "encoder";
+    const bool r = load_encoder_(*_ws);
+    _part.clear();
+    if (!r) { return false; }
+  }
+  _has_encoder = true;
+  return true;
+}
+
+bool
+MetalFlux2Vae::load_encoder_(WeightSet& wts)
 {
   const Config& cfg = _cfg;
   const int L = cfg.latent_channels;
@@ -433,9 +524,11 @@ MetalFlux2Vae::load_encoder_(const MetalLlamaWeights& wts)
   ok = ok && !_enc_mid_attn.n.g.empty() && !_enc_mid_attn.q.w.empty();
   _enc_norm_out = load_gnorm_(wts, "encoder.conv_norm_out");
   _enc_conv_out = load_conv3x3_(wts, "encoder.conv_out");   // top -> 2*L
-  _quant_conv = load_conv1x1_(wts, "quant_conv");           // 2L -> 2L
+  if (cfg.use_quant_conv) {
+    _quant_conv = load_conv1x1_(wts, "quant_conv");         // 2L -> 2L
+  }
   ok = ok && !_enc_norm_out.g.empty() && !_enc_conv_out.w.empty() &&
-       !_quant_conv.w.empty();
+       (!cfg.use_quant_conv || !_quant_conv.w.empty());
   (void)L;
   return ok;
 }
@@ -581,8 +674,10 @@ std::size_t
 MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
 {
   if (h16 <= 0 || w16 <= 0) { return 0; }
-  const std::size_t Hout = (std::size_t)h16 * 16;
-  const std::size_t Wout = (std::size_t)w16 * 16;
+  // Pixels per latent cell: the conv trunk is 8x, times the patch factor.
+  const std::size_t px = (std::size_t)8 * _cfg.patch;
+  const std::size_t Hout = (std::size_t)h16 * px;
+  const std::size_t Wout = (std::size_t)w16 * px;
   // The top up-block's FIRST resnet reads block_out[1] channels (256) at full
   // res (the upsampled level-2 output, before it reduces to block_out[0]=128),
   // so the largest full-res im2col is [Hout*Wout, 9*block_out[1]] -- TWICE the
@@ -638,7 +733,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   const int G = _cfg.norm_groups;
   const float geps = _cfg.norm_eps;
   int h8 = h16 * P, w8 = w16 * P;                // latent spatial after unpatch
-  const int Hout = h16 * 16, Wout = w16 * 16;
+  const int Hout = h8 * 8, Wout = w8 * 8;        // conv trunk is 8x
 
   std::size_t decode_headroom = 0;   // free working set, for the im2col band cap
   {
@@ -919,7 +1014,10 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       enc = stream.begin_compute();
     };
 
-    const SharedBuffer* x = &conv1x1(latent, hw8, _post_quant);
+    // post_quant_conv is optional (absent on the plain AutoencoderKL).
+    const SharedBuffer* x = _post_quant.w.empty()
+                                ? &latent
+                                : &conv1x1(latent, hw8, _post_quant);
     // Feed-forward chain: after each op, release the activation it just consumed
     // so the pool can reuse that buffer (resblock/attention release their own
     // temporaries internally; each holds its residual input through the resadd).
@@ -1201,8 +1299,14 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     silu(xn, (std::size_t)H * W * _cfg.block_out[3]);
     SharedBuffer& moments = conv3x3(xn, H, W, _enc_conv_out);   // [hw, 2L]
     release(xn);
-    mean_ptr = &conv1x1(moments, (std::size_t)H * W, _quant_conv);
-    release(moments);
+    // quant_conv is optional (absent on the plain AutoencoderKL): then the
+    // conv_out moments ARE the posterior parameters.
+    if (_quant_conv.w.empty()) {
+      mean_ptr = &moments;
+    } else {
+      mean_ptr = &conv1x1(moments, (std::size_t)H * W, _quant_conv);
+      release(moments);
+    }
   }
   if (!alloc_ok || !split_ok) { return {}; }
   std::string gpu_err;

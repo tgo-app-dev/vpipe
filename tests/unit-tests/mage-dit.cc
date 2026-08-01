@@ -287,12 +287,19 @@ TEST(mage_dit, t2i_matches_golden)
 // Edit shape: target + one clean reference in frame band 1. This is the
 // path the image-edit flow uses, and it is what checks the frame-band RoPE
 // and the reference tokens being attended but not stepped.
+//
+// The grid is env-settable (VPIPE_MAGE_DIT_GH/GW, matching the dump script's
+// MAGE_DIT_GH/GW) so the SAME case can be run at a real edit resolution. Run
+// at 96x64 -- the 1536x1024 latent, 12288 packed image tokens, 6x the default
+// 32x32 shape -- it measures 0.0315 against 0.0357 at 32x32: the DiT does NOT
+// lose accuracy as the packed sequence grows, which is what rules it out when
+// a high-resolution edit follows the instruction less well than a small one.
 TEST(mage_dit, edit_matches_golden)
 {
   const double r = run_case_("edit", 1);
   if (r == kSkip) { return; }
   ASSERT_TRUE(r != kFail);
-  EXPECT_TRUE(r < 0.20);      // measured 0.046; loose for the same reason
+  EXPECT_TRUE(r < 0.20);      // measured 0.036; loose for the same reason
 }
 
 // ---------------------------------------------------------------------------

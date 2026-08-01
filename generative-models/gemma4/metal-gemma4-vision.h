@@ -28,6 +28,7 @@ namespace vpipe::metal_compute { class MetalCompute; }
 namespace vpipe::genai {
 
 struct ModelConfig;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalGemma4VisionEncoder {
 public:
@@ -60,6 +61,16 @@ public:
 
   static std::unique_ptr<MetalGemma4VisionEncoder> load(
       const std::string& model_dir,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Preferred: the ViT's weights live in the SAME checkpoint as the LM
+  // it feeds, so passing the LM's set keeps them together instead of in
+  // a second private mmap of the same shards.
+  //
+  // The returned encoder KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalGemma4VisionEncoder> load(
+      std::shared_ptr<WeightSet> ws,
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
@@ -124,6 +135,9 @@ private:
   // (attn_steel_h_bd64); the per-encode function (align/causal constants)
   // is created in encode() from _lib_attn.
   metal_compute::SharedBuffer _attn_params;
+  // The checkpoint, held for this encoder's whole life: the weights
+  // above are aliases of buffers the set owns.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

@@ -1,4 +1,5 @@
 #include "minitest.h"
+#include <cstdlib>
 #include <cstdarg>
 #include <iostream>
 #include <unordered_map>
@@ -21,6 +22,22 @@ static unordered_map<string_view, int> __arg_counts
 
 int main(int argc, const char** argv)
 {
+  // Weight-set integrity checking is ON for every test run.
+  //
+  // Cached weight tensors are shared between models -- two models over
+  // one checkpoint alias the SAME buffer -- so a write through either
+  // corrupts the other. Nothing in the type system prevents that
+  // (SharedBuffer::contents() is a mutable pointer), and only the
+  // mmap-backed path gets it for free from PROT_READ. Arming the check
+  // here means a violation shows up the moment it is introduced rather
+  // than as corrupted output much later.
+  //
+  // Overwrite=0, so an explicit VPIPE_WEIGHT_INTEGRITY=0 in the
+  // environment still wins -- useful when timing something and the
+  // per-load hashing pass is in the way. Production binaries do not
+  // link this file and are unaffected.
+  ::setenv("VPIPE_WEIGHT_INTEGRITY", "1", 0);
+
   unordered_map<string_view, string_view> args;
   for (int i=1; i<argc; ++i) {
     auto it = __arg_counts.find(argv[i]);

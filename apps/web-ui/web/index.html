@@ -2,7 +2,10 @@
 <html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- viewport-fit=cover lets the phone shell pad against the safe-area
+       insets (notch / home indicator); it is inert on a desktop. -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>vpipe</title>
   <script>
     // Apply the saved theme before first paint to avoid a flash.

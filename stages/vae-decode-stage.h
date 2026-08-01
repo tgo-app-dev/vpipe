@@ -10,6 +10,7 @@
 // builds the stage is an inert stub (the constructor errors through session()
 // and every beat emits nothing).
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
@@ -60,6 +61,11 @@ public:
   ~VaeDecodeStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The VAE this stage loads. Small next to the DiT and the encoder,
+  // but it is resident during a decode and nothing else declares it.
+  std::vector<std::string> declare_models() const override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -93,6 +99,22 @@ private:
   // Resolve _hf_dir + load the VAE (idempotent: the _load_attempted guard runs
   // the body at most once). No-op when _hf_dir is still empty.
   void ensure_loaded_();
+
+  // ---- idle unload -------------------------------------------------------
+  // The VAE weights are small next to a DiT, but on a memory-bounded box the
+  // decode's own activation working set has to fit BESIDE whatever is still
+  // resident, and this stage is idle for the whole denoise. `unload_when_idle`
+  // (auto | always | never) drops the VAE after each beat and reloads it on the
+  // next one; auto decides from physical RAM vs the pipeline's weight bytes,
+  // the same rule the DiT and conditioner stages use.
+  model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
+  bool _unload_idle   = false;
+  bool _unload_resolved = false;
+  bool _unloaded      = false;
+  bool _quiet_reload  = false;   // reload logs at debug, not info
+  void load_note_(const VpipeFormat& msg) const;
+  void unload_vae_();
+  void reload_vae_();
 #endif
 };
 

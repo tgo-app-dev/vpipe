@@ -63,6 +63,15 @@ struct ExternalStorageHandle;
 //           video frame markers. Unwired (num_iports() < 3) disables
 //           the audio path entirely.
 //
+//   iport3  (optional) FlexDataPayload token-sampler spec from a
+//           `sampler-select` stage. Latched on the first wake and reused
+//           for every later scene. Unwired => greedy (argmax) decoding.
+//           NOTE this CHANGED the unwired default: the retired
+//           `sampler_temperature` / `sampler_top_k` config keys defaulted to
+//           0.2 / 10 (i.e. lightly sampled), whereas an unwired port is
+//           greedy. To keep the old behaviour, wire a `sampler-select` with
+//           { "temperature": 0.2, "top_k": 10 }.
+//
 //   oport0  FlexDataPayload per closed scene, with shape:
 //             { "scene_index": uint,
 //               "n_frames":    uint,
@@ -167,13 +176,6 @@ struct ExternalStorageHandle;
 //                                                  (metal). Batched decode
 //                                                  always uses the shrinking
 //                                                  path regardless.
-//   sampler_temperature (real,   default 1.0)  -- flat decode-sampler
-//   sampler_top_k       (int,    default 0)       knobs; all left at
-//   sampler_top_p       (real,   default 1.0)     their defaults == greedy
-//   sampler_min_p       (real,   default 0.0)     (argmax). Any non-default
-//   sampler_repetition_penalty (real, default 1.0)  switches to sampled
-//   sampler_presence_penalty   (real, default 0.0)  decoding.
-//   sampler_seed        (uint,   default 0 = non-deterministic)
 class RealtimeVqaStage final : public TypedStage<RealtimeVqaStage> {
 public:
   static constexpr const char* kTypeName = "realtime-vqa";
@@ -185,6 +187,12 @@ public:
   ~RealtimeVqaStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The LM this stage holds. Declared before any stage initializes so
+  // the diffusion stages -- which cannot see it from their own config --
+  // size the box against it. See Stage::declare_models.
+  std::vector<std::string> declare_models() const override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 
@@ -399,7 +407,11 @@ private:
   // Optional CoreML vision tower (host-f32 + metal-compute preproc).
   // Owned when coreml_vision_path is set; takes priority over _mvis.
   std::unique_ptr<genai::CoreMLVisionEncoder> _m_coreml;
+  // Token-sampler knobs, latched once off the OPTIONAL sampler iport3 (a
+  // `sampler-select` source). Defaults are argmax, so an unwired port
+  // decodes greedily.
   genai::SamplerParams                        _sampler_params;
+  bool                                        _sampler_latched = false;
   // Reusable per-question branch pool (reserve once, rebranch per scene):
   // avoids allocating + freeing N branch contexts (their KV pages + SSM/conv
   // buffers) every scene. Declared after _lm so it is destroyed (its pooled

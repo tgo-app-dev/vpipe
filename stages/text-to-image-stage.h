@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_TEXT_TO_IMAGE_STAGE_H
 #define VPIPE_STAGES_TEXT_TO_IMAGE_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -14,6 +15,7 @@
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
+#include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/mage/metal-mage-flow-transformer.h"
 #include "generative-models/mage/mage-watermark.h"
 #endif
@@ -26,6 +28,8 @@
 
 namespace vpipe {
 
+namespace genai { class WeightSet; }   // generative-models/weight-set.h
+
 // Text-to-image (DiT) stage: the denoiser half of the diffusion split -- it
 // consumes ready-made conditioning from a `diffusion-conditioner` stage (which
 // owns the tokenizer + text encoder + vision tower) and runs the family DiT
@@ -35,7 +39,8 @@ namespace vpipe {
 //
 //   iport0  TensorBeatPayload conditioning from the diffusion-conditioner stage
 //           (family-shaped + typed: krea2 f16 [n,12,2560]; flux2 f16
-//           [n,3*enc_hidden]; qwen-image-edit bf16 [n_real,3584]).
+//           [n,3*enc_hidden]; qwen-image-edit bf16 [n_real,3584];
+//           boogu-image bf16 [n,4096]).
 //
 //   iport1  OPTIONAL TensorBeatPayload neg_conditioning (same shape/type, the
 //           conditioner's oport1). Drives classifier-free guidance: when it is
@@ -51,8 +56,9 @@ namespace vpipe {
 //           wired, the (heavy) DiT load is DEFERRED to the first process() (the
 //           beat only arrives after the init barrier).
 //
-//   iport3  OPTIONAL FlexDataPayload sampler spec (from a `sampler-select`
-//           stage). Latched on the first beat and reused for every prompt;
+//   iport3  OPTIONAL FlexDataPayload sampler spec (from a
+//           `diffusion-sampler-select` stage -- NOT the LLM `sampler-select`).
+//           Latched on the first beat and reused for every prompt;
 //           selects the integrator (euler / heun / dpmpp_2m / dpmpp_sde) + its
 //           knobs. Unwired => the config default (euler, the token-exact turbo).
 //
@@ -99,13 +105,14 @@ namespace vpipe {
 //   init_latents (string, optional) -- debug/repro: a raw f32 file of packed
 //                                    initial latents [img_seq, z_dim*4] to use
 //                                    instead of RNG noise (for golden anchoring).
-//   adopt_latent_dims (bool, default false) -- when set (with strength>0 and a
-//                                    latent wired on iport1), the output size is
-//                                    taken from the incoming latent's H/W
-//                                    (shape[1]*8 x shape[2]*8) instead of the
-//                                    configured width/height, so an
-//                                    arbitrarily-sized reference img2img "just
-//                                    works" without matching width/height.
+//
+// OUTPUT SIZE. An explicit width/height always wins. When NEITHER is set and a
+// reference latent is wired on iport5, the size is INFERRED from it:
+// ref_latent0 is vae-encode's output for the source image, so the output is
+// its H/W times the family's VAE factor (8 for Krea-2 / Qwen-Image-Edit, 16
+// for FLUX.2 / Mage-Flow -- see latent_scale_). An edit therefore comes out at
+// the source resolution with no size config at all. Falls back to 256x256 when
+// there is no reference either.
 class TextToImageStage final : public TypedStage<TextToImageStage> {
 public:
   static constexpr const char* kTypeName = "text-to-image";
@@ -117,6 +124,19 @@ public:
   ~TextToImageStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The DiT this stage loads plus the text encoder it must coexist with
+  // -- the same two directories plan_streaming() sizes against.
+  std::vector<std::string> declare_models() const override;
+
+private:
+  // Tell the manager what a STREAMING DiT actually keeps resident, which
+  // is its pinned prefix rather than the whole checkpoint its files
+  // suggest. Without this every peer sizes the box against ~20 GB that
+  // was never there. No-op when the DiT is not streaming.
+  void revise_dit_declaration_(const std::string& dit_dir) const;
+public:
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -126,6 +146,12 @@ public:
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
 
 private:
+  // Stamp the generating model onto a latent beat's sideband. The chain
+  // text-to-image -> vae-decode -> save-image carries it through so a saved
+  // file can record WHAT produced it (save-image writes it into EXIF
+  // Software). Merges into any sideband already present.
+  void tag_model_(TensorBeat& tb) const;
+
   std::string _hf_dir;
   std::string _dit_dir;
   std::string _models_db;
@@ -135,7 +161,7 @@ private:
   int         _steps{};
   double      _strength{};      // img2img: 0 => text-to-image (pure noise)
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
-  bool        _adopt_latent_dims{};  // take output size from the img2img latent
+  bool        _infer_size{};    // no width/height configured: size from iport5
   // Mage-Flow provenance watermark (Gaussian-Shading in the initial noise).
   // ON by default -- the reference applies it unconditionally, and it is
   // distribution-preserving, so there is no quality reason to skip it.
@@ -145,8 +171,8 @@ private:
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 
-  // "krea2" | "flux2" | "qwen-image-edit" | "mage-flow" (from the transformer
-  // _class_name).
+  // "krea2" | "flux2" | "qwen-image-edit" | "mage-flow" | "boogu-image" (from
+  // the transformer _class_name).
   std::string _family = "krea2";
 
   // Model iport bookkeeping (used only when a model-select source is wired):
@@ -171,6 +197,9 @@ private:
   // Mage-Flow's NR-MMDiT IS MetalQwenImageTransformer (a different Config);
   // kept in its own handle so the two families never share load state.
   std::unique_ptr<genai::MetalMageFlowTransformer> _mage_dit;
+  // Boogu-Image's 10B NextDiT (its own class: five block kinds and three
+  // refiner stacks share nothing with the MMDiTs above).
+  std::unique_ptr<genai::MetalBooguTransformer> _boogu_dit;
   // Mage-Flow's STATIC flow shift from <root>/scheduler/scheduler_config.json
   // (6.0 in every published checkpoint; use_dynamic_shifting is false).
   double _mage_shift = 6.0;
@@ -202,6 +231,16 @@ private:
   // the shared MetalKrea2Vae's 1024px decode); reloaded on the next prompt.
   bool load_krea2_dit_();
   void free_krea2_dit_for_decode_(int gen_w, int gen_h);
+  // Same, for Boogu-Image. Its 10B NextDiT is the largest DiT here (~20 GB
+  // bf16, ~5.6 GB at 4-bit) and it shares the box with a resident Qwen3-VL
+  // mllm, so on a 16 GB box it is freed for the decode even at 4-bit.
+  std::string _boogu_dit_dir;
+  bool        _boogu_stream   = false;
+  double      _boogu_pin_frac = 0.0;
+  bool load_boogu_dit_();
+  // The manager's shared view of a checkpoint's weights (weight-set.h).
+  std::shared_ptr<genai::WeightSet> weight_set_(const std::string& dir) const;
+  void free_boogu_dit_for_decode_(int gen_w, int gen_h);
 
   // The active sampler (integrator) + scheduler (sigma schedule) specs. Seeded
   // from config (euler + simple / _steps / shift 1.15) and each overridden by
@@ -285,6 +324,24 @@ private:
                  const std::vector<RefLatent>& refs,
                  const std::function<void(const std::vector<float>&)>&
                      emit_step = {}) const;
+
+  // Boogu-Image forward: `txt` is the diffusion-conditioner's boogu-image
+  // conditioning (bf16 [n_real, 4096] mllm last-hidden POST final norm, over
+  // the WHOLE templated sequence -- Boogu drops no prefix). Runs the NextDiT
+  // over patch-packed latents with either the DMD student's ascending-sigma
+  // jump+renoise loop (the distilled Turbo default) or Euler along the v1
+  // logistic time-shift schedule (Base/Edit, with optional CFG). `refs` are
+  // vae-encode reference latents ([16, h, w] channel-first), packed 2x2 and
+  // embedded by the DiT's own ref_image_patch_embedder. Returns the unpacked,
+  // whitened latent [16, H/8, W/8] (channel-first) or empty.
+  std::vector<float>
+  generate_boogu_(const metal_compute::SharedBuffer& txt, int n_real,
+                  const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+                  int gen_h, int gen_w,
+                  const std::vector<float>* init_packed,
+                  const std::vector<RefLatent>& refs,
+                  const std::function<void(const std::vector<float>&)>&
+                      emit_step = {}) const;
 
   std::vector<float>
   generate_qie_(const metal_compute::SharedBuffer& txt, int n_real,

@@ -1366,6 +1366,190 @@ kernel void sdpa_causal_mma_qhead_f16(
   }
 }
 
+// sdpa_paged_mma_qhead_f16 -- the PAGED-KV sibling of
+// sdpa_causal_mma_qhead_f16. Same decode shape: ONE query position, a tile of
+// 8 q-HEADS that share a kv head (8|G), simdgroup_matrix for both QK^T and PV,
+// and UN-normalized [head, split, D] partials + m/l for sdpa_gqa_merge. The
+// only difference is where K/V come from -- the paged pool
+// [n_pages, Hkv, page_tokens, D] walked through the {pid,nvalid,gstart} page
+// table, instead of one contiguous [Hkv, kv_stride, D] tensor.
+//
+// This is the head_dim 512 decode attention for the gemma-4 GLOBAL layers.
+// Those layers live in the paged pool, and the paged family had causal / vec /
+// vec1 / vec2 / mb256 but no matrix-core q-head member -- so they ran the vec
+// path while the ~1.5x faster mma one existed only for contiguous KV, which
+// they are not. Measured at their geometry (D=512, Hq=32/Hkv=4 -> G=8) with
+// sdpa_mma.gqa_decode_micro, T=8192, KV byte floor 0.246 ms: mb 4.05, gtile
+// 3.07, direct 2.90, vec 1.13, mma_qhead 0.751.
+//
+// Two shape requirements, both held by gemma-4: 8|G (a tile is 8 q-heads on
+// one kv head) and page_tokens % FL_C == 0, so an FL_C-block never straddles
+// two pages and the tail over-read past `nvalid` stays inside the page -- the
+// same contract sdpa_paged_flash_f16 relies on. Over-read keys are masked to
+// -INFINITY, so they contribute 0 to both the softmax and PV.
+//
+// Splits partition the GLOBAL key range [first, last] exactly as the
+// contiguous kernel does, so a key is counted by exactly one split; pages and
+// blocks fully outside this split's [lo, hi) are skipped without being read.
+//   0:q[Hq,D] 1:kpool 2:vpool 3:o_acc 4:m_out 5:l_out 6:scale 7:D 8:Hq 9:Hkv
+//   10:q_offset 11:page_tokens 12:n_pages 13:page_table 14:window 15:split
+// grid (FL_NSG*32, Hq/8, split); threadgroup (FL_NSG*32, 1, 1).
+kernel void sdpa_paged_mma_qhead_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* kpool      [[buffer(1)]],
+    const device VPIPE_ELT* vpool      [[buffer(2)]],
+    device float*           o_acc      [[buffer(3)]],
+    device float*           m_out      [[buffer(4)]],
+    device float*           l_out      [[buffer(5)]],
+    constant float&    scale       [[buffer(6)]],
+    constant int&      D           [[buffer(7)]],
+    constant int&      Hq          [[buffer(8)]],
+    constant int&      Hkv         [[buffer(9)]],
+    constant int&      q_offset    [[buffer(10)]],
+    constant int&      page_tokens [[buffer(11)]],
+    constant int&      n_pages     [[buffer(12)]],
+    const device int*  page_table  [[buffer(13)]],
+    constant int&      window      [[buffer(14)]],
+    constant int&      split       [[buffer(15)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  lid       [[thread_index_in_threadgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  lane      [[thread_index_in_simdgroup]])
+{
+  const int ht    = (int)tid.y;            // head-tile of 8 q-heads
+  const int s     = (int)tid.z;            // KV split index
+  const int G     = Hq / Hkv;
+  const int head0 = ht * 8;                // first head of this tile
+  const int kvh   = head0 / G;             // 8 heads share this kv head (8|G)
+  const int sg    = (int)simd_gid;         // 0..7 -> head head0+sg / key octet
+  const int DV    = D;
+  const int nthreads = FL_NSG * 32;
+  const int NO    = (DV / 8) / FL_NSG;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off    = (uint)kvh * page_tokens * D;
+
+  threadgroup VPIPE_ELT sq[FL_Q * FL_DMAX];
+  threadgroup float     so[FL_Q * FL_DMAX];
+  threadgroup float     ssf[FL_Q * FL_C];
+  threadgroup VPIPE_ELT ssp[FL_Q * FL_C];
+
+  // Stage Q: the 8 rows are heads head0..head0+7 at the decode position.
+  for (uint e = lid; e < (uint)(FL_Q * D); e += (uint)nthreads) {
+    const int j = (int)e / D, d = (int)e % D;
+    sq[e] = q[(uint)(head0 + j) * D + d];
+  }
+  for (uint e = lid; e < (uint)(FL_Q * DV); e += (uint)nthreads) {
+    so[e] = 0.0f;
+  }
+  float M = -INFINITY, S = 0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const int q_pos = q_offset;
+  const int last  = q_pos;
+  const int first = (window > 0) ? max(0, q_pos - window + 1) : 0;
+  const int total = last - first + 1;
+  const int chunk = (total > 0) ? (total + split - 1) / split : 0;
+  const int lo = first + s * chunk;
+  const int hi = min(first + (s + 1) * chunk, last + 1);
+
+  for (int pg = 0; pg < n_pages; ++pg) {
+    const int pid    = page_table[pg * 3 + 0];
+    const int nvalid = page_table[pg * 3 + 1];
+    const int gstart = page_table[pg * 3 + 2];
+    if (gstart >= hi) { break; }                  // past this split (uniform)
+    if (gstart + nvalid <= lo) { continue; }      // entirely before it
+    const device VPIPE_ELT* kbase =
+        kpool + (uint)pid * page_stride + head_off;
+    const device VPIPE_ELT* vbase =
+        vpool + (uint)pid * page_stride + head_off;
+    for (int bs = 0; bs < nvalid; bs += FL_C) {
+      const int gblk = gstart + bs;               // global pos of key 0
+      if (gblk >= hi) { break; }                  // block past split (uniform)
+      if (gblk + FL_C <= lo) { continue; }        // block before split
+      const int bk = min(FL_C, nvalid - bs);
+      // ---- QK^T: SG sg contracts the full head dim for its 8 keys ----
+      {
+        simdgroup_matrix<float, 8, 8> mqk =
+            simdgroup_matrix<float, 8, 8>(0.0f);
+        const device VPIPE_ELT* pk = kbase + (uint)(bs + sg * 8) * D;
+        for (int i = 0; i < D / 8; ++i) {
+          simdgroup_matrix<VPIPE_ELT, 8, 8> mq;
+          simdgroup_load(mq, sq + i * 8, D);
+          simdgroup_matrix<VPIPE_ELT, 8, 8> mk;
+          simdgroup_load(mk, pk + i * 8, D, ulong2(0), true);
+          simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+        }
+        simdgroup_store(mqk, ssf + sg * 8, FL_C);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // ---- online softmax: SG sg owns head row j=sg; 32 lanes split C ----
+      {
+        const int jj = sg;
+        float2 s2;
+        s2[0] = ssf[jj * FL_C + 2 * (int)lane];
+        s2[1] = ssf[jj * FL_C + 2 * (int)lane + 1];
+        s2 *= scale;
+        const int k0 = 2 * (int)lane, k1 = k0 + 1;
+        const int g0 = gblk + k0, g1 = gblk + k1;
+        // k>=bk is the page tail over-read; the rest is the split range plus
+        // causal / window, identical to the contiguous kernel's mask.
+        if (k0 >= bk || g0 < lo || g0 >= hi || g0 > q_pos || g0 < first) {
+          s2[0] = -INFINITY;
+        }
+        if (k1 >= bk || g1 < lo || g1 >= hi || g1 > q_pos || g1 < first) {
+          s2[1] = -INFINITY;
+        }
+        const float lmax = simd_max(max(s2[0], s2[1]));
+        const float m_new = max(M, lmax);
+        const float ms = (m_new == -INFINITY) ? 1.0f : exp(M - m_new);
+        float2 p2;
+        p2[0] = (s2[0] == -INFINITY) ? 0.0f : exp(s2[0] - m_new);
+        p2[1] = (s2[1] == -INFINITY) ? 0.0f : exp(s2[1] - m_new);
+        S = S * ms + simd_sum(p2[0] + p2[1]);
+        M = m_new;
+        ssp[jj * FL_C + 2 * (int)lane]     = (VPIPE_ELT)p2[0];
+        ssp[jj * FL_C + 2 * (int)lane + 1] = (VPIPE_ELT)p2[1];
+        for (int d = (int)lane; d < DV; d += 32) { so[jj * DV + d] *= ms; }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // ---- PV: SG sg owns NO output-column frags ----
+      {
+        simdgroup_matrix<float, 8, 8> lacc[FL_DMAX / 8 / FL_NSG];
+        for (int ii = 0; ii < NO; ++ii) {
+          simdgroup_load(lacc[ii], so + 8 * sg + ii * 8 * FL_NSG, DV);
+        }
+        for (int cc = 0; cc < FL_C / 8; ++cc) {
+          simdgroup_matrix<VPIPE_ELT, 8, 8> vs;
+          simdgroup_load(vs, ssp + cc * 8, FL_C);
+          for (int ii = 0; ii < NO; ++ii) {
+            simdgroup_matrix<VPIPE_ELT, 8, 8> mv;
+            simdgroup_load(mv, vbase + (uint)(bs + cc * 8) * D + 8 * sg
+                               + ii * 8 * FL_NSG, D);
+            simdgroup_multiply_accumulate(lacc[ii], vs, mv, lacc[ii]);
+          }
+        }
+        for (int ii = 0; ii < NO; ++ii) {
+          simdgroup_store(lacc[ii], so + 8 * sg + ii * 8 * FL_NSG, DV);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  // ---- write UN-normalized partials: SG sg -> head head0+sg, split s ----
+  const int head = head0 + sg;
+  const uint base = ((uint)head * (uint)split + (uint)s) * (uint)DV;
+  for (int d = (int)lane; d < DV; d += 32) {
+    o_acc[base + d] = so[sg * DV + d];
+  }
+  if (lane == 0) {
+    m_out[(uint)head * split + s] = M;
+    l_out[(uint)head * split + s] = S;
+  }
+}
+
 // sdpa_paged_flash_f16 -- the PAGED-KV sibling of sdpa_causal_flash_f16: the
 // llama.cpp-style KEY-SPLIT flash attention (Q=8 rows, C=64 keys/block, NSG=8
 // simdgroups, each SG doing the FULL head-dim contraction for its own 8 keys
@@ -3134,7 +3318,6 @@ METAL_FUNC void sdpa_paged_gqa_vec2_impl(
   const int G     = Hq / Hkv;
   const int qh    = kvh * G + (int)simd_gid;
   const int N     = q_offset + 1;          // keys 0..q_offset
-  (void)n_pages;                           // walked via page_table; kept for ABI
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off    = (uint)kvh * page_tokens * D;
 
@@ -3143,10 +3326,25 @@ METAL_FUNC void sdpa_paged_gqa_vec2_impl(
   for (int j = 0; j < PER; ++j) { qv[j] = scale * (float)qp[j]; ov[j] = 0.0f; }
   float m = -INFINITY, l = 0.0f;
 
+  // Walk the page table rather than assuming page = i / page_tokens. That
+  // uniform mapping only holds when every page is exactly full, which is true
+  // for a single sequence but NOT for a BRANCHED context: the branch shares the
+  // parent's pages -- whose last one is usually partial -- and starts its own
+  // tokens on a fresh page, so global position i sits at page_table's
+  // global_start, not at i/page_tokens. Getting that wrong reads keys/values
+  // from the wrong slot (often one never written) for every position past the
+  // first partial page, which is why batched decode off a non-page-aligned
+  // prefix disagreed with the per-branch and shared-prefix kernels by whole
+  // logits. `i` only increases, so the cursor advances monotonically.
+  int pg = 0;
   for (int i = block; i < N; i += blocks) {
-    const int pg    = i / page_tokens;
+    while (pg + 1 < n_pages
+           && i >= page_table[pg * 3 + 2] + page_table[pg * 3 + 1]) {
+      ++pg;
+    }
     const int pid   = page_table[pg * 3 + 0];
-    const int local = i - pg * page_tokens;
+    const int local = i - page_table[pg * 3 + 2];
+    if (local < 0 || local >= page_table[pg * 3 + 1]) { continue; }
     const uint koff = (uint)pid * page_stride + head_off + (uint)local * D
                       + (uint)simd_lid * PER;
     const device VPIPE_ELT* kp = kpool + koff;

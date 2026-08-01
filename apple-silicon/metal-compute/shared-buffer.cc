@@ -6,8 +6,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace vpipe::metal_compute {
@@ -24,6 +27,81 @@ round_up_to_page_(std::size_t n, std::size_t page_size) noexcept
 }
 
 }  // namespace
+
+// ---- accounting counters (see MemoryStats) ------------------------------
+namespace {
+std::atomic<std::size_t> g_live_bytes{0};
+std::atomic<std::size_t> g_peak_bytes{0};
+std::atomic<std::size_t> g_total_bytes{0};
+std::atomic<std::size_t> g_live_count{0};
+std::atomic<std::size_t> g_total_count{0};
+
+// VPIPE_MC_ALLOC_LOG=<MB>: log every allocation at or above this size with the
+// running live total. Set it to attribute a footprint to specific buffers --
+// a size is usually enough to identify the caller (e.g. n*vocab*2).
+std::size_t alloc_log_threshold_()
+{
+  static const std::size_t v = [] {
+    const char* e = std::getenv("VPIPE_MC_ALLOC_LOG");
+    if (e == nullptr) { return (std::size_t)0; }
+    const double mb = std::atof(e);
+    return mb > 0.0 ? (std::size_t)(mb * 1024.0 * 1024.0) : (std::size_t)0;
+  }();
+  return v;
+}
+}  // namespace
+
+void
+account_alloc_(std::size_t bytes) noexcept
+{
+  if (bytes == 0) { return; }
+  const std::size_t live =
+      g_live_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+  g_total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  g_live_count.fetch_add(1, std::memory_order_relaxed);
+  g_total_count.fetch_add(1, std::memory_order_relaxed);
+  // Monotonic max without a lock.
+  std::size_t prev = g_peak_bytes.load(std::memory_order_relaxed);
+  while (live > prev
+         && !g_peak_bytes.compare_exchange_weak(prev, live,
+                                                std::memory_order_relaxed)) {
+  }
+  const std::size_t thr = alloc_log_threshold_();
+  if (thr != 0 && bytes >= thr) {
+    std::fprintf(stderr, "[mc-alloc] %8.1f MB  live=%8.1f MB  peak=%8.1f MB\n",
+                 (double)bytes / (1024.0 * 1024.0),
+                 (double)live / (1024.0 * 1024.0),
+                 (double)g_peak_bytes.load(std::memory_order_relaxed)
+                     / (1024.0 * 1024.0));
+  }
+}
+
+void
+account_free_(std::size_t bytes) noexcept
+{
+  if (bytes == 0) { return; }
+  g_live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  g_live_count.fetch_sub(1, std::memory_order_relaxed);
+}
+
+MemoryStats
+shared_buffer_memory_stats() noexcept
+{
+  MemoryStats m;
+  m.live_bytes  = g_live_bytes.load(std::memory_order_relaxed);
+  m.peak_bytes  = g_peak_bytes.load(std::memory_order_relaxed);
+  m.total_bytes = g_total_bytes.load(std::memory_order_relaxed);
+  m.live_count  = g_live_count.load(std::memory_order_relaxed);
+  m.total_count = g_total_count.load(std::memory_order_relaxed);
+  return m;
+}
+
+void
+shared_buffer_reset_peak() noexcept
+{
+  g_peak_bytes.store(g_live_bytes.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+}
 
 SharedBuffer::SharedBuffer(MTL::Buffer* buf, void* contents,
                            std::size_t byte_size) noexcept
@@ -65,7 +143,15 @@ SharedBuffer::SharedBuffer(SharedBuffer&& o) noexcept
     _byte_size(std::exchange(o._byte_size, 0)),
     _base_off(std::exchange(o._base_off, 0)),
     _view(o._view),
-    _wired(std::exchange(o._wired, false))
+    _wired(std::exchange(o._wired, false)),
+    // The accounting ownership moves WITH the buffer -- if it did not, the
+    // destination would never decrement on destruction and live_bytes would
+    // only ever climb (nearly every buffer is move-assigned into place).
+    _accounted(std::exchange(o._accounted, false)),
+    // Same reasoning for the parked flag: lose it and reactivate() on
+    // the destination reports "intact" for a buffer the kernel may
+    // already have discarded, which reads as silent garbage.
+    _inactive(std::exchange(o._inactive, false))
 {
   o._view = {};
 }
@@ -83,6 +169,8 @@ SharedBuffer::operator=(SharedBuffer&& o) noexcept
   _base_off  = std::exchange(o._base_off, 0);
   _view      = o._view;
   _wired     = std::exchange(o._wired, false);
+  _accounted = std::exchange(o._accounted, false);
+  _inactive  = std::exchange(o._inactive, false);
   o._view    = {};
   return *this;
 }
@@ -108,6 +196,10 @@ SharedBuffer::teardown_() noexcept
     _wired = false;
   }
   if (_buf != nullptr) {
+    if (_accounted) {
+      account_free_(_byte_size);
+      _accounted = false;
+    }
     _buf->release();
     _buf = nullptr;
   }
@@ -149,6 +241,33 @@ SharedBuffer::set_wired(bool on) noexcept
     _wired = false;
   }
   return true;
+}
+
+bool
+SharedBuffer::mark_inactive() noexcept
+{
+  if (_buf == nullptr || _byte_size == 0) { return false; }
+  // Not ours to park: a subview would evict another handle's memory,
+  // and a heap sub-allocation's residency is the heap's to manage.
+  if (!_accounted || _buf->heap() != nullptr) { return false; }
+  if (_wired) { return false; }        // deliberate "never evict this"
+  if (_inactive) { return true; }
+  _buf->setPurgeableState(MTL::PurgeableStateVolatile);
+  _inactive = true;
+  return true;
+}
+
+bool
+SharedBuffer::reactivate() noexcept
+{
+  if (!_inactive) { return true; }     // never parked -> nothing lost
+  // setPurgeableState returns the PRIOR state. Empty means the kernel
+  // reclaimed the pages while they were volatile, so whatever is there
+  // now is undefined and the caller has to reload.
+  const MTL::PurgeableState prev =
+      _buf->setPurgeableState(MTL::PurgeableStateNonVolatile);
+  _inactive = false;
+  return prev != MTL::PurgeableStateEmpty;
 }
 
 }  // namespace vpipe::metal_compute

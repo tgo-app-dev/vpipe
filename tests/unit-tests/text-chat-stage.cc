@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include <streambuf>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -327,6 +329,47 @@ private:
   std::vector<Beat> _beats;
 };
 
+// Emits a fixed list of user messages, one per beat, then signals done.
+// (OnePromptSource's multi-turn sibling.)
+class PromptListSource : public TypedStage<PromptListSource> {
+public:
+  static constexpr const char* kTypeName = "ut-chat-prompt-list-source";
+  using TypedStage::TypedStage;
+
+  std::vector<std::string> prompts;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_i >= prompts.size()) { ctx.signal_done(); co_return; }
+    const std::string p = prompts[_i++];
+    co_await ctx.write(0,
+        make_payload<FlexDataPayload>(FlexData::make_string(p)));
+  }
+
+private:
+  std::size_t _i = 0;
+};
+
+// UI delegate that swallows everything, so an end-to-end test can hold
+// a pointer to it (to fire interrupts through its handler registry)
+// without the model's streamed reply landing in the test log.
+class SilentUi final : public UiDelegateIntf {
+public:
+  void error(const VpipeFormat&) override {}
+  void warn(const VpipeFormat&) override {}
+  void info(const VpipeFormat&) override {}
+  UiInputStatus
+  getline(const VpipeFormat&, std::string&,
+          const std::function<bool()>&) override
+  {
+    return UiInputStatus::Eof;
+  }
+  unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return make_unique<NullUiTextStream>();
+  }
+};
+
 }  // namespace
 
 // The flattened `mtp` flag wires into _mtp_enabled (metal path only).
@@ -492,6 +535,162 @@ TEST(text_chat_stage, metal_chat_stream) {
               "streamed=%zuB full=%zuB\n",
               beats.size(), eor_count, streamed.size(), full.size());
   EXPECT_TRUE(streamed == full);
+}
+
+// A user interrupt (Ctrl-C / the web UI's Interrupt button) cuts a
+// running generation short. The stage registers a handler with the
+// session's UI delegate in initialize(); firing it must end the turn
+// promptly WITHOUT an EOT from the model, while still emitting the
+// partial reply on both out-ports exactly as a natural stop would.
+//
+// The budget is deliberately huge (2000 tokens) so an un-interrupted
+// run would take tens of seconds: the stop-latency assertion below is
+// what proves the interrupt was actually honoured rather than the model
+// having finished on its own.
+TEST(text_chat_stage, metal_chat_user_interrupt) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+
+  Session sess;
+  // Own the delegate so the test can fire interrupts through it, and
+  // keep the streamed essay out of the test log.
+  auto ui_owned = make_unique<SilentUi>();
+  SilentUi* ui = ui_owned.get();
+  sess.set_ui_delegate(std::move(ui_owned));
+
+  Pipeline pl("chat-interrupt-smoke", &sess);
+
+  // Two turns: the second one exercises the "leave the context as is"
+  // contract -- an interrupted turn must leave a clean turn boundary in
+  // the K/V cache, so the conversation simply continues.
+  auto src = make_unique<PromptListSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompts = {
+      "Write a long, detailed essay about the history of cartography. "
+      "Cover every era in depth.",
+      "Now do the same for the history of clockmaking, at equal length.",
+  };
+  auto* promptsrc = static_cast<PromptListSource*>(
+      pl.insert_stage(std::move(src)));
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(2000));
+    o.insert("max_pages", FlexData::make_int(200));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+
+  auto turnsk = make_unique<TurnSink>(
+      &sess, "turn", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* turnsink = static_cast<TurnSink*>(pl.insert_stage(std::move(turnsk)));
+
+  auto strsk = make_unique<StreamSink>(
+      &sess, "stream", vector<InEdge>{ { chat, 1 } },
+      FlexData::make_object());
+  auto* streamsink = static_cast<StreamSink*>(
+      pl.insert_stage(std::move(strsk)));
+
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(launched);
+
+  // Interrupt one turn: wait until the reply is genuinely under way (a
+  // streaming beat means ~20 words are already decoded, so we cut into
+  // mid-DECODE rather than racing the model load or the prefill), then
+  // fire and report how long the stage took to come to rest.
+  auto interrupt_one_turn =
+      [&](std::size_t beats_before) -> double {
+    bool streaming = false;
+    for (int i = 0; i < 2400 && !streaming; ++i) {   // up to ~120 s
+      this_thread::sleep_for(chrono::milliseconds(50));
+      streaming = streamsink->take().size() > beats_before;
+    }
+    if (!streaming) { return -1.0; }
+    // A dispatch while the stage is between turns reports 0; retry
+    // until a handler says it actually acted.
+    for (int i = 0; i < 200; ++i) {
+      if (ui->dispatch_interrupt() > 0) {
+        const auto t0 = chrono::steady_clock::now();
+        // Rest = this turn's beats stop arriving. Two consecutive
+        // quiet polls, so we don't mistake the gap between chunks for
+        // the end of the turn.
+        std::size_t last  = streamsink->take().size();
+        int         quiet = 0;
+        for (int k = 0; k < 1500 && quiet < 2; ++k) {   // up to ~15 s
+          this_thread::sleep_for(chrono::milliseconds(10));
+          const std::size_t now = streamsink->take().size();
+          quiet = (now == last) ? quiet + 1 : 0;
+          last  = now;
+        }
+        return chrono::duration<double>(
+            chrono::steady_clock::now() - t0).count();
+      }
+      this_thread::sleep_for(chrono::milliseconds(10));
+    }
+    return -1.0;
+  };
+
+  const double stop1 = interrupt_one_turn(0);
+  ASSERT_TRUE(stop1 >= 0.0);
+  const std::size_t beats_turn1 = streamsink->take().size();
+  const double stop2 = interrupt_one_turn(beats_turn1);
+  ASSERT_TRUE(stop2 >= 0.0);
+
+  rt.wait_idle();
+  rt.stop();
+
+  auto beats = streamsink->take();
+  auto turns = turnsink->take();
+
+  // One turn beat per user message, each carrying whatever was decoded
+  // before its interrupt -- emitted exactly as on a stop token.
+  ASSERT_TRUE(turns.size() == 2);
+  std::vector<std::string> texts;
+  std::vector<int64_t>     ctx_pos;
+  for (const auto& fd : turns) {
+    ASSERT_TRUE(fd.is_object());
+    auto root = fd.as_object();
+    texts.push_back(root.contains("text")
+        ? std::string(root.at("text").as_string("")) : std::string());
+    ctx_pos.push_back(root.contains("ctx_pos")
+        ? root.at("ctx_pos").as_int(0) : 0);
+  }
+  EXPECT_TRUE(!texts[0].empty());
+  EXPECT_TRUE(!texts[1].empty());
+  // The context was LEFT AS IS: turn 2 built on turn 1's cache rather
+  // than starting over, so its end position is strictly further along.
+  EXPECT_TRUE(ctx_pos[1] > ctx_pos[0]);
+
+  // Each interrupted turn closed its streaming out-port the same way a
+  // natural stop does: exactly one end_of_response beat per turn, and
+  // the turn's last beat is the one carrying it.
+  int eor_count = 0;
+  for (std::size_t i = 0; i < beats.size(); ++i) {
+    if (beats[i].eor) { ++eor_count; }
+  }
+  EXPECT_TRUE(eor_count == 2);
+  ASSERT_TRUE(!beats.empty());
+  EXPECT_TRUE(beats.back().eor);
+
+  // The whole point: decoding stopped when asked. The 2000-token budget
+  // would otherwise have run for tens of seconds per turn.
+  std::printf("[text_chat_stage.metal_chat_user_interrupt] "
+              "stop=%.2fs/%.2fs reply=%zuB/%zuB ctx_pos=%lld->%lld "
+              "beats=%zu\n",
+              stop1, stop2, texts[0].size(), texts[1].size(),
+              (long long)ctx_pos[0], (long long)ctx_pos[1], beats.size());
+  EXPECT_TRUE(stop1 < 15.0);
+  EXPECT_TRUE(stop2 < 15.0);
 }
 
 // stream_answer_only: the reasoning block is folded OUT of the streaming

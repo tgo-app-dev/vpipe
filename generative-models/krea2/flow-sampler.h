@@ -30,11 +30,25 @@ namespace genai {
 
 // ---- scheduler: the sigma schedule -------------------------------------
 struct FlowSchedulerSpec {
-  std::string type       = "simple";        // "simple" | "karras" | "exponential"
+  // "simple" | "karras" | "exponential" | "boogu_v1".
+  //
+  // "boogu_v1" is Boogu-Image's FlowMatchEulerDiscreteScheduler time-shifting:
+  // its sigma convention is INVERTED relative to every other schedule here --
+  // t runs 0 (pure noise) -> 1 (clean) and the Euler update is
+  // x += (t_next - t) * v, so `sigmas()` returns an ASCENDING [steps+1] array
+  // ending at 1 rather than a descending one ending at 0. The base grid is
+  // linspace(0,1,steps+1)[:-1] pushed through the logistic shift
+  //   t' = 1 - e^mu / (e^mu + (1/(1-t) - 1)^sigma)
+  // with mu from the base_shift/max_shift linear map evaluated at `seq_len`
+  // (the checkpoint's static token count -- 4096 for 1K).
+  std::string type       = "simple";
   int         steps      = 8;               // denoising steps
   double      shift      = 1.15;            // mu (flow-matching time-shift)
   std::string shift_type = "exponential";   // "exponential" | "linear"
   double      rho        = 7.0;             // karras curvature
+  // boogu_v1 only: the STATIC token count the shift's mu is read off (the
+  // scheduler_config `seq_len`; 0 => use the runtime img_seq_len).
+  int         seq_len    = 4096;
 
   // ---- FlowMatchEuler dynamic shifting (Qwen-Image / SD3-style) --------
   // When `dynamic_shift`, the flow-matching mu (used in place of `shift`)
@@ -76,18 +90,30 @@ struct FlowSchedulerSpec {
            dynamic_shift == o.dynamic_shift && base_shift == o.base_shift &&
            max_shift == o.max_shift && shift_terminal == o.shift_terminal &&
            base_seq == o.base_seq && max_seq == o.max_seq &&
-           num_train == o.num_train;
+           num_train == o.num_train && seq_len == o.seq_len;
   }
 };
 
 // ---- sampler: the integrator -------------------------------------------
 struct FlowSamplerSpec {
-  std::string   method  = "euler";   // "euler"|"heun"|"dpmpp_2m"|"dpmpp_sde"
+  // "euler"|"heun"|"dpmpp_2m"|"dpmpp_sde"|"dmd".
+  //
+  // "dmd" is the Boogu-Image Turbo student's few-step integrator, and it is NOT
+  // an ODE solver at all: at each ASCENDING sigma it jumps straight to the x0
+  // prediction (x <- x + (1 - sigma) * v) and then RE-NOISES back down to the
+  // next sigma (x <- (1 - sigma') * noise + sigma' * x). Four such steps replace
+  // a 25-50-step CFG trajectory. It is only meaningful on a DMD-distilled
+  // checkpoint (Turbo / Edit-Turbo) and only with guidance 1.
+  std::string   method  = "euler";
   double        eta     = 1.0;       // dpmpp_sde stochasticity (0 => deterministic)
   double        s_noise = 1.0;       // dpmpp_sde added-noise scale
-  std::uint64_t seed    = 0;         // dpmpp_sde noise seed
+  std::uint64_t seed    = 0;         // dpmpp_sde / dmd renoise seed
+  // dmd only: the sigma the schedule STARTS at (linspace(conditioning_sigma, 1,
+  // steps+1)[:-1]). The reference inference script passes 0.0 for editing and
+  // 0.001 for text-to-image.
+  double        conditioning_sigma = 0.0;
 
-  FlexData to_flex() const;   // {sampler, method, eta, s_noise, seed}
+  FlexData to_flex() const;   // {sampler, method, eta, s_noise, seed, +dmd}
   static FlowSamplerSpec from_flex(const FlexData& fd, std::string* err = nullptr);
 
   // Canonicalize aliases ("dpm++_2m" -> "dpmpp_2m"); unknown -> "euler".
@@ -96,7 +122,7 @@ struct FlowSamplerSpec {
   bool operator==(const FlowSamplerSpec& o) const noexcept
   {
     return method == o.method && eta == o.eta && s_noise == o.s_noise &&
-           seed == o.seed;
+           seed == o.seed && conditioning_sigma == o.conditioning_sigma;
   }
 };
 

@@ -6,6 +6,7 @@
 #include "common/perf-event.h"
 #include "common/perf-scope.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,93 +30,104 @@ namespace {
 
 // Convert a 2-D F32/F16/BF16 tensor to a fresh f16 [r,c] buffer.
 SharedBuffer
-to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
+to_f16_(WeightSet& wts, MetalCompute* mc, const std::string& nm)
 {
-  const auto* info = wts.info(nm);
+  const auto* info = wts.src().info(nm);
   if (info == nullptr || info->shape.empty()) { return {}; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
-  SharedBuffer raw = wts.load(nm, mc);
-  if (raw.empty()) { return {}; }
-  SharedBuffer out = mc->make_shared_buffer(n * 2);
-  if (out.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(out.contents());
-  if (info->dtype == "F32") {
-    const auto* s = static_cast<const float*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)s[i]; }
-  } else if (info->dtype == "F16") {
-    std::memcpy(d, raw.contents(), n * 2);
-  } else if (info->dtype == "BF16") {
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      std::uint32_t u = (std::uint32_t)s[i] << 16;
-      float f; std::memcpy(&f, &u, 4); d[i] = (_Float16)f;
+  return wts.derived("moss-codec2/f16/" + nm, [&]() -> SharedBuffer {
+    // Uncached: consumed by the conversion and dropped.
+    SharedBuffer raw = wts.read(nm, mc, WeightSet::Residency::Copied);
+    if (raw.empty()) { return {}; }
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty()) { return {}; }
+    auto* d = static_cast<_Float16*>(out.contents());
+    if (info->dtype == "F32") {
+      const auto* s = static_cast<const float*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)s[i]; }
+    } else if (info->dtype == "F16") {
+      std::memcpy(d, raw.contents(), n * 2);
+    } else if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        std::uint32_t u = (std::uint32_t)s[i] << 16;
+        float f; std::memcpy(&f, &u, 4); d[i] = (_Float16)f;
+      }
+    } else {
+      return {};
     }
-  } else {
-    return {};
-  }
-  return out;
+    return out;
+  });
 }
 
 // to_f16 with each output ROW scaled by scale[row] -- folds a per-channel
 // LayerScale into a [out,in] projection weight. F32 source (codec checkpoint).
 SharedBuffer
-to_f16_rowscale_(const MetalLlamaWeights& wts, MetalCompute* mc,
+to_f16_rowscale_(WeightSet& wts, MetalCompute* mc,
                  const std::string& wname, const std::string& sname)
 {
-  const auto* wi = wts.info(wname);
-  const auto* si = wts.info(sname);
+  const auto* wi = wts.src().info(wname);
+  const auto* si = wts.src().info(sname);
   if (wi == nullptr || si == nullptr || wi->shape.size() != 2) { return {}; }
   const int out = (int)wi->shape[0], in = (int)wi->shape[1];
-  SharedBuffer ws = wts.load(wname, mc), ss = wts.load(sname, mc);
-  if (ws.empty() || ss.empty()) { return {}; }
-  SharedBuffer o = mc->make_shared_buffer((std::size_t)out * in * 2);
-  if (o.empty()) { return {}; }
-  const auto* w = static_cast<const float*>(ws.contents());
-  const auto* sc = static_cast<const float*>(ss.contents());
-  auto* d = static_cast<_Float16*>(o.contents());
-  for (int r = 0; r < out; ++r) {
-    for (int c = 0; c < in; ++c) {
-      d[(std::size_t)r * in + c] =
-          (_Float16)(sc[r] * w[(std::size_t)r * in + c]);
+  return wts.derived("moss-codec2/rowscale/" + wname, [&]() -> SharedBuffer {
+    // Both sources are folded into the product below and dropped.
+    const auto cp = WeightSet::Residency::Copied;
+    SharedBuffer ws = wts.read(wname, mc, cp), ss = wts.read(sname, mc, cp);
+    if (ws.empty() || ss.empty()) { return {}; }
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)out * in * 2);
+    if (o.empty()) { return {}; }
+    const auto* w = static_cast<const float*>(ws.contents());
+    const auto* sc = static_cast<const float*>(ss.contents());
+    auto* d = static_cast<_Float16*>(o.contents());
+    for (int r = 0; r < out; ++r) {
+      for (int c = 0; c < in; ++c) {
+        d[(std::size_t)r * in + c] =
+            (_Float16)(sc[r] * w[(std::size_t)r * in + c]);
+      }
     }
-  }
-  return o;
+    return o;
+  });
 }
 
 // Fold a weight-normalized 1x1 conv into a plain [out,in] f16 matrix:
 // w_eff[o,i] = g[o] * v[o,i] / ||v[o,:]||_2 (original0=g [out,1,1],
 // original1=v [out,in,1]).
 SharedBuffer
-fold_wnconv_(const MetalLlamaWeights& wts, MetalCompute* mc,
+fold_wnconv_(WeightSet& wts, MetalCompute* mc,
              const std::string& prefix)
 {
   const std::string gn = prefix + ".parametrizations.weight.original0";
   const std::string vn = prefix + ".parametrizations.weight.original1";
-  const auto* vi = wts.info(vn);
-  const auto* gi = wts.info(gn);
+  const auto* vi = wts.src().info(vn);
+  const auto* gi = wts.src().info(gn);
   if (vi == nullptr || gi == nullptr || vi->shape.size() < 2) { return {}; }
   const int out = (int)vi->shape[0], in = (int)vi->shape[1];
-  SharedBuffer vs = wts.load(vn, mc), gs = wts.load(gn, mc);
-  if (vs.empty() || gs.empty()) { return {}; }
-  const auto* v = static_cast<const float*>(vs.contents());
-  const auto* g = static_cast<const float*>(gs.contents());
-  SharedBuffer o = mc->make_shared_buffer((std::size_t)out * in * 2);
-  if (o.empty()) { return {}; }
-  auto* d = static_cast<_Float16*>(o.contents());
-  for (int r = 0; r < out; ++r) {
-    double ss = 0.0;
-    for (int c = 0; c < in; ++c) {
-      const double x = v[(std::size_t)r * in + c];
-      ss += x * x;
+  return wts.derived("moss-codec2/wnconv/" + prefix, [&]() -> SharedBuffer {
+    // g and v are folded into the effective weight and dropped.
+    const auto cp = WeightSet::Residency::Copied;
+    SharedBuffer vs = wts.read(vn, mc, cp), gs = wts.read(gn, mc, cp);
+    if (vs.empty() || gs.empty()) { return {}; }
+    const auto* v = static_cast<const float*>(vs.contents());
+    const auto* g = static_cast<const float*>(gs.contents());
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)out * in * 2);
+    if (o.empty()) { return {}; }
+    auto* d = static_cast<_Float16*>(o.contents());
+    for (int r = 0; r < out; ++r) {
+      double ss = 0.0;
+      for (int c = 0; c < in; ++c) {
+        const double x = v[(std::size_t)r * in + c];
+        ss += x * x;
+      }
+      const float inv = (float)(1.0 / std::sqrt(ss));
+      for (int c = 0; c < in; ++c) {
+        d[(std::size_t)r * in + c] =
+            (_Float16)(g[r] * v[(std::size_t)r * in + c] * inv);
+      }
     }
-    const float inv = (float)(1.0 / std::sqrt(ss));
-    for (int c = 0; c < in; ++c) {
-      d[(std::size_t)r * in + c] =
-          (_Float16)(g[r] * v[(std::size_t)r * in + c] * inv);
-    }
-  }
-  return o;
+    return o;
+  });
 }
 
 }  // namespace
@@ -124,19 +136,27 @@ std::unique_ptr<MetalMossCodecV2>
 MetalMossCodecV2::load(const std::string& model_dir, MetalCompute* mc,
                        bool with_encoder)
 {
-  if (mc == nullptr || !mc->valid()) { return nullptr; }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts.has_value()) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, with_encoder);
+}
+
+std::unique_ptr<MetalMossCodecV2>
+MetalMossCodecV2::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
+                       bool with_encoder)
+{
+  if (mc == nullptr || !mc->valid() || ws == nullptr) { return nullptr; }
   auto self = std::unique_ptr<MetalMossCodecV2>(new MetalMossCodecV2());
+  self->_ws = ws;
   self->_mc = mc;
   self->_session = mc->session();
   self->_with_encoder = with_encoder;
-  if (!self->init_(*wts, mc, with_encoder)) { return nullptr; }
+  if (!self->init_(*ws, mc, with_encoder)) { return nullptr; }
   return self;
 }
 
 bool
-MetalMossCodecV2::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
+MetalMossCodecV2::init_(WeightSet& wts, MetalCompute* mc,
                         bool with_encoder)
 {
   // Decoder structure (config.json decoder_kwargs). 6 ProjectedTransformers,

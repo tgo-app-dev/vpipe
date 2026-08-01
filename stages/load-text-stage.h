@@ -31,6 +31,7 @@ public:
                 std::vector<InEdge>       iports,
                 FlexData                  config);
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;

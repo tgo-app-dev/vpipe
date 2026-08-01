@@ -1,12 +1,17 @@
 #include "minitest.h"
+#include "apple-silicon/metal-compute/buffer-view.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/event.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -230,4 +235,214 @@ TEST(metal_compute_stream, stream_move_transfers_open_buffer) {
   EXPECT_TRUE(f.valid());
   f.wait();
   EXPECT_TRUE(f.completed());
+}
+
+// The auto command-buffer split (armed by CommandStream::begin_compute at 50
+// dispatches) ENDS the MTL encoder and opens a fresh one, and encoder state
+// does NOT carry across that boundary. So the split may only fire at a CLEAN op
+// boundary -- with nothing bound since the last dispatch. It fires from
+// set_function() because a well-formed op names its function first; call sites
+// that bind buffers BEFORE naming the function (the k-quant qmv helpers do)
+// would otherwise have those bindings stranded on the retired encoder. Metal
+// does not fault on an unbound slot, so the dispatch just reads garbage and the
+// wrong answer propagates silently -- it cost a GGUF decode divergence that
+// looked like a broken speculative decoder.
+// This runs well past the split threshold with BOTH binding orders present: a
+// clean op every 7th so the split keeps firing, dirty ops everywhere else so a
+// split lands on one. (Strict alternation would NOT reproduce it -- the split
+// threshold is even, so every split would land on the same parity.)
+TEST(metal_compute_stream, auto_split_preserves_pending_encoder_state) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr) {
+    return;
+  }
+  ComputeLibrary lib = mc->load_library("saxpy");
+  if (!lib.valid()) {
+    return;
+  }
+  ComputeFunction fn = lib.function("saxpy");
+  if (!fn.valid()) {
+    return;
+  }
+
+  constexpr std::size_t kElems = 64;
+  constexpr int         kOps   = 240;   // >> the 50-dispatch split threshold
+  constexpr float       kA     = 3.0f;
+
+  BufferView view{};
+  view.dtype      = DType::F32;
+  view.rank       = 1;
+  view.shape[0]   = static_cast<std::int64_t>(kElems);
+  view.strides[0] = 1;
+  view.offset     = 0;
+
+  std::vector<SharedBuffer> xs, ys;
+  for (int i = 0; i < kOps; ++i) {
+    SharedBuffer x = mc->make_shared_buffer(kElems * sizeof(float));
+    SharedBuffer y = mc->make_shared_buffer(kElems * sizeof(float));
+    if (x.empty() || y.empty()) {
+      return;
+    }
+    auto* xp = static_cast<float*>(x.contents());
+    auto* yp = static_cast<float*>(y.contents());
+    for (std::size_t e = 0; e < kElems; ++e) {
+      xp[e] = static_cast<float>(i + 1);
+      yp[e] = static_cast<float>(e);
+    }
+    x.set_view(view);
+    y.set_view(view);
+    xs.push_back(std::move(x));
+    ys.push_back(std::move(y));
+  }
+
+  struct SaxpyParams { float a; };
+  SaxpyParams params{ kA };
+  const unsigned tew = fn.thread_execution_width();
+  const unsigned tg  = tew > 0 ? tew : 32;
+
+  CommandStream stream = mc->make_command_stream();
+  {
+    ComputeEncoder enc = stream.begin_compute();
+    EXPECT_TRUE(enc.valid());
+    for (int i = 0; i < kOps; ++i) {
+      if (i % 7 == 0) {
+        // Clean order -- the split is allowed to fire here.
+        enc.set_function(fn);
+        enc.set_buffer_view(/*buf*/ 0, xs[(std::size_t)i], /*meta*/ 1);
+        enc.set_buffer_view(/*buf*/ 2, ys[(std::size_t)i], /*meta*/ 3);
+        enc.set_constant(/*index*/ 4, params);
+      } else {
+        // Dirty order -- bindings first, function last.
+        enc.set_buffer_view(/*buf*/ 0, xs[(std::size_t)i], /*meta*/ 1);
+        enc.set_buffer_view(/*buf*/ 2, ys[(std::size_t)i], /*meta*/ 3);
+        enc.set_constant(/*index*/ 4, params);
+        enc.set_function(fn);
+      }
+      enc.dispatch({kElems, 1, 1}, {tg, 1, 1});
+    }
+  }
+  stream.commit().wait();
+
+  int bad_clean = 0, bad_dirty = 0;
+  for (int i = 0; i < kOps; ++i) {
+    const auto* yp =
+        static_cast<const float*>(ys[(std::size_t)i].contents());
+    for (std::size_t e = 0; e < kElems; ++e) {
+      const float want = kA * static_cast<float>(i + 1)
+                       + static_cast<float>(e);
+      if (std::fabs(yp[e] - want) > 1e-4f) {
+        if (i % 7 == 0) { ++bad_clean; } else { ++bad_dirty; }
+        break;
+      }
+    }
+  }
+  if (bad_clean != 0 || bad_dirty != 0) {
+    std::printf("[auto-split] wrong ops: %d clean-order, %d dirty-order "
+                "(of %d total)\n", bad_clean, bad_dirty, kOps);
+  }
+  EXPECT_TRUE(bad_clean == 0);
+  EXPECT_TRUE(bad_dirty == 0);
+}
+
+// Same stranding SHAPE as the auto split, but at a concurrent_scope boundary:
+// entering and leaving a scope swaps the MTL encoder (reencode_). A scope
+// boundary cannot be deferred the way the split can -- the exit has to restore
+// Serial ordering before the next dependent dispatch -- so reencode_ replays
+// the pending op's bindings instead. Two shapes: (A) bound before the scope
+// opens, dispatched inside it; (B) bound inside the scope, dispatched after it
+// closes.
+//
+// NOTE, so nobody mistakes this for a reproducer: it passes with OR without
+// that replay. reencode_ reopens an encoder on the SAME command buffer, and
+// this driver carries the argument table across that boundary -- which is why
+// concurrent_scope has always worked. The auto-split case genuinely corrupts
+// because it opens a NEW COMMAND BUFFER. Metal guarantees nothing about state
+// across encoders, so the replay removes the dependence on that detail; this
+// test pins the behaviour for a driver that stops being so forgiving.
+TEST(metal_compute_stream, concurrent_scope_preserves_pending_encoder_state) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr) {
+    return;
+  }
+  ComputeLibrary lib = mc->load_library("saxpy");
+  if (!lib.valid()) {
+    return;
+  }
+  ComputeFunction fn = lib.function("saxpy");
+  if (!fn.valid()) {
+    return;
+  }
+
+  constexpr std::size_t kElems = 64;
+  constexpr float       kA     = 4.0f;
+
+  BufferView view{};
+  view.dtype      = DType::F32;
+  view.rank       = 1;
+  view.shape[0]   = static_cast<std::int64_t>(kElems);
+  view.strides[0] = 1;
+  view.offset     = 0;
+
+  SharedBuffer xs[2], ys[2];
+  for (int i = 0; i < 2; ++i) {
+    xs[i] = mc->make_shared_buffer(kElems * sizeof(float));
+    ys[i] = mc->make_shared_buffer(kElems * sizeof(float));
+    if (xs[i].empty() || ys[i].empty()) {
+      return;
+    }
+    auto* xp = static_cast<float*>(xs[i].contents());
+    auto* yp = static_cast<float*>(ys[i].contents());
+    for (std::size_t e = 0; e < kElems; ++e) {
+      xp[e] = static_cast<float>(i + 1);
+      yp[e] = static_cast<float>(e);
+    }
+    xs[i].set_view(view);
+    ys[i].set_view(view);
+  }
+
+  struct SaxpyParams { float a; };
+  SaxpyParams params{ kA };
+  const unsigned tew = fn.thread_execution_width();
+  const unsigned tg  = tew > 0 ? tew : 32;
+
+  CommandStream stream = mc->make_command_stream();
+  {
+    ComputeEncoder enc = stream.begin_compute();
+    EXPECT_TRUE(enc.valid());
+    // (A) bound BEFORE the scope opens -- the entry reencode must keep them.
+    enc.set_function(fn);
+    enc.set_buffer_view(/*buf*/ 0, xs[0], /*meta*/ 1);
+    enc.set_buffer_view(/*buf*/ 2, ys[0], /*meta*/ 3);
+    enc.set_constant(/*index*/ 4, params);
+    {
+      ComputeEncoder::ConcurrentScope scope = enc.concurrent_scope(true);
+      enc.dispatch({kElems, 1, 1}, {tg, 1, 1});
+      // (B) bound INSIDE the scope, dispatched after it closes -- the exit
+      //     reencode must keep them too.
+      enc.set_function(fn);
+      enc.set_buffer_view(/*buf*/ 0, xs[1], /*meta*/ 1);
+      enc.set_buffer_view(/*buf*/ 2, ys[1], /*meta*/ 3);
+      enc.set_constant(/*index*/ 4, params);
+    }
+    enc.dispatch({kElems, 1, 1}, {tg, 1, 1});
+  }
+  stream.commit().wait();
+
+  for (int i = 0; i < 2; ++i) {
+    int bad = 0;
+    const auto* yp = static_cast<const float*>(ys[i].contents());
+    for (std::size_t e = 0; e < kElems; ++e) {
+      const float want = kA * static_cast<float>(i + 1)
+                       + static_cast<float>(e);
+      if (std::fabs(yp[e] - want) > 1e-4f) { ++bad; }
+    }
+    if (bad != 0) {
+      std::printf("[concurrent-scope] arm %c: %d/%zu elems wrong "
+                  "(y[0]=%g want %g)\n", i == 0 ? 'A' : 'B', bad, kElems,
+                  yp[0], kA * static_cast<float>(i + 1));
+    }
+    EXPECT_TRUE(bad == 0);
+  }
 }

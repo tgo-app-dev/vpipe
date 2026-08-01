@@ -7,6 +7,7 @@
 
 set(LOCAL_SOURCES
   # generic (always built)
+  buffer-stage.cc
   call-stage.cc
   chrono-stage.cc
   load-image-stage.cc
@@ -14,6 +15,7 @@ set(LOCAL_SOURCES
   load-video-stage.cc
   lora-fuse-stage.cc
   model-select-stage.cc
+  diffusion-sampler-select-stage.cc
   sampler-select-stage.cc
   save-image-stage.cc
   save-video-stage.cc
@@ -23,6 +25,7 @@ set(LOCAL_SOURCES
   vae-decode-stage.cc
   vae-encode-stage.cc
   model-catalog.cc
+  model-memory.cc
   model-fetch-stage.cc
   model-remove-stage.cc
   model-registry.cc
@@ -39,12 +42,15 @@ set(LOCAL_SOURCES
   vision/detection-overlay-stage.cc
   # audio-video (always built; ffmpeg dlopen'd at runtime)
   audio-video/audio-to-pcm-stage.cc
+  audio-video/compare-image-stage.cc
+  audio-video/create-mask-stage.cc
   audio-video/hls-broadcast-stage.cc
   audio-video/preview-stage.cc
   audio-video/video-to-rgb-stage.cc
 )
 set(LOCAL_HEADERS
   # generic
+  buffer-stage.h
   call-stage.h
   chrono-stage.h
   load-image-stage.h
@@ -72,6 +78,8 @@ set(LOCAL_HEADERS
   vision/detection-overlay-font5x7.h
   # audio-video
   audio-video/audio-to-pcm-stage.h
+  audio-video/compare-image-stage.h
+  audio-video/create-mask-stage.h
   audio-video/hls-broadcast-stage.h
   audio-video/preview-stage.h
   audio-video/video-to-rgb-stage.h
@@ -81,6 +89,8 @@ if(APPLE)
   # avfoundation device capture + ONVIF discovery (Apple-only APIs).
   list(APPEND LOCAL_SOURCES audio-video/audio-capture-stage.cc)
   list(APPEND LOCAL_HEADERS audio-video/audio-capture-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/video-capture-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/video-capture-stage.h)
   list(APPEND LOCAL_SOURCES audio-video/rtsp-capture-stage.cc)
   list(APPEND LOCAL_HEADERS audio-video/rtsp-capture-stage.h)
   list(APPEND LOCAL_SOURCES onvif-discovery-stage.cc)

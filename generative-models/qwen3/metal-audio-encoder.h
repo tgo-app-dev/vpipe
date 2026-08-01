@@ -34,6 +34,8 @@ namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
+class WeightSet;       // generative-models/weight-set.h
+
 class MetalAudioEncoder {
 public:
   struct Config {
@@ -63,6 +65,16 @@ public:
 
   static std::unique_ptr<MetalAudioEncoder> load(
       const std::string& model_dir,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Preferred: the Conformer's weights sit in the SAME checkpoint as the
+  // ASR decoder, so passing the LM's set keeps them together instead of
+  // in a second private mmap of the same shards.
+  //
+  // The returned encoder KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalAudioEncoder> load(
+      std::shared_ptr<WeightSet> ws,
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
@@ -120,6 +132,9 @@ private:
   metal_compute::SharedBuffer _ln_post_w, _ln_post_b;
   metal_compute::SharedBuffer _proj1_w, _proj1_b, _proj2_w, _proj2_b;
   std::unique_ptr<WhisperFeatureExtractor> _fx;
+  // The checkpoint, held for this encoder's whole life: the weights
+  // above are aliases of buffers the set owns.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 

@@ -919,3 +919,60 @@ TEST(krea2_dit, forward_dit_bench)
               best, sum / timed);
   EXPECT_TRUE(best >= 0.0);
 }
+
+// vec4 adaLN / gate twins: same arithmetic per element, so the block output
+// must be BIT-IDENTICAL. The guard is on the plumbing -- the (N, total) ->
+// (N/4, total/N) rewrite and the 4-alignment of every bound element offset (an
+// unaligned vec4 access is undefined, so a wrong offset gives garbage, not a
+// rounding difference), not on the arithmetic.
+TEST(krea2_dit, vec4_elementwise_matches_scalar)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  const int HID = cfg.hidden, IC = cfg.in_channels;
+  const int text_seq = 128, grid = 8, img_seq = grid * grid, stop = 1;
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x5eed1234u;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = (float)(s >> 9) / 4194304.0f - 1.0f;
+    }
+  };
+  fill(txt); fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+  auto run = [&](bool v4) -> std::vector<std::uint16_t> {
+    if (v4) { ::unsetenv("VPIPE_NO_ELT_V4"); }
+    else    { ::setenv("VPIPE_NO_ELT_V4", "1", 1); }
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream_blocks=*/true);
+    if (!m) { return {}; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return {}; }
+    std::vector<std::uint16_t> out(n);
+    std::memcpy(out.data(), o.contents(), n * 2);
+    return out;
+  };
+  const std::vector<std::uint16_t> a = run(true);
+  const std::vector<std::uint16_t> b = run(false);
+  ::unsetenv("VPIPE_NO_ELT_V4");
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) { diff += (a[i] != b[i]) ? 1 : 0; }
+  EXPECT_TRUE(diff == 0);
+  std::printf("[krea2_dit] vec4 vs scalar elementwise: %zu/%zu words differ\n",
+              diff, a.size());
+}

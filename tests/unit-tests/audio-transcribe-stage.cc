@@ -42,6 +42,15 @@ using namespace vpipe;
 
 namespace {
 
+// A stand-in upstream vertex: the ctor-time iport checks only look at whether
+// a slot holds a non-null Vertex*, so this is never launched or read.
+class DummyUpstream : public TypedStage<DummyUpstream> {
+public:
+  static constexpr const char* kTypeName = "ut-asr-dummy-upstream";
+  using TypedStage::TypedStage;
+  Job process(RuntimeContext& ctx) override { ctx.signal_done(); co_return; }
+};
+
 class CerrSilencer {
 public:
   CerrSilencer() : _saved(cerr.rdbuf()), _null() { cerr.rdbuf(&_null); }
@@ -158,19 +167,36 @@ TEST(audio_transcribe_stage, streaming_off_when_single_iport) {
   EXPECT_TRUE(s.pcm_buffer_s() > 14.9 && s.pcm_buffer_s() < 15.1);
 }
 
-TEST(audio_transcribe_stage, streaming_on_when_two_iports) {
-  // Wiring iport1 latches streaming mode at construction.
+TEST(audio_transcribe_stage, streaming_on_when_segment_iport_wired) {
+  // A WIRED iport1 latches streaming mode at construction.
   Session sess;
   CerrSilencer hush;
+  DummyUpstream up(&sess, "up", vector<InEdge>{}, FlexData::make_object());
   FlexData cfg = FlexData::from_json(
       R"({"hf_dir":"/p","pcm_buffer_s":60.0,"late_marker_skip":false})");
   AudioTranscribeStage s(
       &sess, "asr",
-      vector<InEdge>{ { nullptr, 0 }, { nullptr, 0 } },
+      vector<InEdge>{ { &up, 0 }, { &up, 0 } },
       std::move(cfg));
   EXPECT_TRUE(s.streaming());
   EXPECT_TRUE(s.pcm_buffer_s() > 59.9 && s.pcm_buffer_s() < 60.1);
   EXPECT_FALSE(s.late_marker_skip());
+}
+
+// Streaming mode keys off the segment-marker SLOT (iport1), not the iport
+// COUNT -- the sampler iport2 sits after it. A graph that wires only a
+// sampler has 3 iports but no marker producer; counting would flip it into
+// streaming mode, where it would then wait forever for markers that can
+// never arrive.
+TEST(audio_transcribe_stage, sampler_iport_does_not_enable_streaming) {
+  Session sess;
+  CerrSilencer hush;
+  DummyUpstream up(&sess, "up", vector<InEdge>{}, FlexData::make_object());
+  AudioTranscribeStage s(
+      &sess, "asr",
+      vector<InEdge>{ { &up, 0 }, { nullptr, 0 }, { &up, 0 } },
+      FlexData::from_json(R"({"hf_dir":"/p"})"));
+  EXPECT_FALSE(s.streaming());
 }
 
 TEST(audio_transcribe_stage, bad_pcm_buffer_s_deferred) {
@@ -244,19 +270,22 @@ TEST(audio_transcribe_stage, type_is_registered) {
               == "audio-transcribe");
 }
 
-// The StageSpec must declare BOTH iports so the web-ui composer offers the
-// optional iport1 (segment markers) -- streaming mode (audio-segment ->
-// audio-transcribe) is impossible to wire in the editor otherwise.
-TEST(audio_transcribe_stage, spec_declares_both_iports) {
+// The StageSpec must declare every iport so the web-ui composer offers the
+// optional ones -- streaming mode (audio-segment -> audio-transcribe) and
+// sampler programming are impossible to wire in the editor otherwise.
+TEST(audio_transcribe_stage, spec_declares_all_iports) {
   Session sess;
   CerrSilencer hush;
   AudioTranscribeStage s(&sess, "asr", vector<InEdge>{ { nullptr, 0 } },
                          FlexData::from_json(R"({"hf_dir":"/p"})"));
   const StageSpec& sp = s.spec();
-  EXPECT_TRUE(sp.iports.size() == 2u);   // "audio" + "segments"
-  if (sp.iports.size() == 2u) {
+  EXPECT_TRUE(sp.iports.size() == 3u);   // audio + segments + sampler
+  if (sp.iports.size() == 3u) {
     EXPECT_TRUE(sp.iports[0].name == "audio");
     EXPECT_TRUE(sp.iports[1].name == "segments");
+    // Appended AFTER segments: existing graphs keep their port indices, and
+    // the iport1 streaming check stays valid.
+    EXPECT_TRUE(sp.iports[2].name == "sampler");
   }
   EXPECT_TRUE(sp.oports.size() == 1u);   // transcript oport
   EXPECT_TRUE(sp.oports[0].name == "transcript");

@@ -12,6 +12,7 @@ namespace vpipe {
 namespace genai {
 
 class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 
 // MageVAE (microsoft/Mage-Flow), run in f16 on the metal-compute backend.
 //
@@ -61,6 +62,21 @@ class MetalMageVae {
   static std::unique_ptr<MetalMageVae>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool with_encoder = true);
+
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second VAE over the
+  // same directory reuses these tensors instead of loading its own copy.
+  // The dir overload opens a PRIVATE set (tests, and callers with no
+  // session to ask).
+  static std::unique_ptr<MetalMageVae>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool with_encoder = true);
+
+  // Materialise the encoder half now, if it is not already loaded. The
+  // point of deferring it: a graph that never receives a reference image
+  // never calls this, so the encoder's weights are never read. Cheap and
+  // idempotent once loaded. False if the encoder cannot be loaded.
+  bool ensure_encoder();
 
   ~MetalMageVae();
 
@@ -138,28 +154,36 @@ class MetalMageVae {
   };
 
   // ---- load helpers ----
-  Conv load_linear_(const MetalLlamaWeights& w, const std::string& nm);
-  Conv load_conv3x3_(const MetalLlamaWeights& w, const std::string& nm);
-  Conv load_patch_conv_(const MetalLlamaWeights& w, const std::string& nm);
-  DwConv load_dwconv_(const MetalLlamaWeights& w, const std::string& nm);
-  metal_compute::SharedBuffer load_vec_(const MetalLlamaWeights& w,
+  Conv load_linear_(WeightSet& w, const std::string& nm);
+  Conv load_conv3x3_(WeightSet& w, const std::string& nm);
+  Conv load_patch_conv_(WeightSet& w, const std::string& nm);
+  DwConv load_dwconv_(WeightSet& w, const std::string& nm);
+  metal_compute::SharedBuffer load_vec_(WeightSet& w,
                                         const std::string& nm);
-  bool load_dico_(const MetalLlamaWeights& w, const std::string& pre,
+  bool load_dico_(WeightSet& w, const std::string& pre,
                   DiCoBlock& b, int c, bool with_mod, bool with_norm_affine);
-  bool load_resblock_(const MetalLlamaWeights& w, const std::string& pre,
+  bool load_resblock_(WeightSet& w, const std::string& pre,
                       ResBlock& rb);
-  bool load_attn_(const MetalLlamaWeights& w, const std::string& pre,
+  bool load_attn_(WeightSet& w, const std::string& pre,
                   AttnBlock& a);
-  bool load_encoder_(const MetalLlamaWeights& w);
-  bool load_decoder_(const MetalLlamaWeights& w);
+  bool load_encoder_(WeightSet& w);
+  bool load_decoder_(WeightSet& w);
+
+  // The checkpoint these weights come from, held for this model's whole
+  // life: the cached tensors are aliases into buffers it owns (and
+  // mapped ones alias its mmap), so it has to outlive them.
+  std::shared_ptr<WeightSet> _ws;
+  // Part the loaders currently attribute their tensors to; "" is the
+  // always-resident trunk, "encoder" the half release_part() can drop.
+  std::string _part;
   // Host-fold the t=0 adaLN constant for one trunk: returns [6*hidden].
   // `t_pre` is the TimestepEmbedder prefix, `adaln` the block's modulation
   // Linear. Cross-checked against the reference's own folded buffers.
-  std::vector<float> fold_adaln_(const MetalLlamaWeights& w,
+  std::vector<float> fold_adaln_(WeightSet& w,
                                  const std::string& t_pre,
                                  const std::string& adaln_pre) const;
   // Host-compute t_embedder(0) -> [hidden] (shared by every block in a trunk).
-  std::vector<float> t_embed_zero_(const MetalLlamaWeights& w,
+  std::vector<float> t_embed_zero_(WeightSet& w,
                                    const std::string& t_pre) const;
 
   // ---- forward helpers ----
@@ -233,8 +257,11 @@ class MetalMageVae {
       _fn_gated, _fn_groupnorm, _fn_dw3x3, _fn_col_mean, _fn_mul_sig,
       _fn_bias_add, _fn_sdpa, _fn_copy,
       // decoder-only: tiled attention + the per-pixel MLP head
-      _fn_tile_gather, _fn_tile_scatter, _fn_ln_mod_rows, _fn_gated_rows,
-      _fn_add_rows_mod;
+      _fn_tile_gather, _fn_tile_scatter, _fn_add_rows_mod,
+      // per-pixel MLP head, f32 residual stream (see the kernel comments in
+      // llm_elementwise.metal: the residual runs past the f16 range and the
+      // resulting inf becomes NaN -> black patches on blown-out highlights).
+      _fn_widen_rows, _fn_ln_mod_rows32, _fn_gated_rows32, _fn_rms_rows32;
   // M5 matrix-core dense GEMM, as in the Krea-2 / FLUX.2 VAEs.
   metal_compute::ComputeLibrary _lib_dense_mma;
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep;

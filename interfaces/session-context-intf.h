@@ -116,6 +116,26 @@ public:
     return std::make_unique<NullUiTextStream>();
   }
 
+  // Register a handler for "the user asked to interrupt ongoing work"
+  // (Ctrl-C on the console, the web UI's Interrupt button), routed to
+  // the session's UI delegate. A stage with abandonable long-running
+  // work registers here and cuts that work short when called; it is
+  // NOT a pipeline stop, so the stage keeps its state. See
+  // UiDelegateIntf::register_interrupt_handler for the handler
+  // contract (quick, non-blocking, returns true if it actually
+  // interrupted something).
+  //
+  // Store the returned token as a member: destroying it unregisters,
+  // so the handler cannot outlive the state it captured. The default
+  // returns an inert token so adapter contexts that never service a UI
+  // need not override it.
+  virtual UiInterruptToken
+  register_interrupt_handler(std::string /*label*/,
+                             UiInterruptHandler /*fn*/) const
+  {
+    return {};
+  }
+
   // The shared worker pool that drives stage drivers and wakes
   // suspended awaiters. Always non-null on a fully-constructed
   // Session. Members schedule resumed coroutines through it.

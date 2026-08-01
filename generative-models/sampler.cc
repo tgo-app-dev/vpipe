@@ -543,4 +543,13 @@ parse_sampler_config(const FlexData& obj)
   return p;
 }
 
+bool
+is_diffusion_sampler_spec(const FlexData& obj)
+{
+  if (!obj.is_object()) { return false; }
+  auto root = obj.as_object();
+  if (!root.contains("sampler")) { return false; }
+  return root.at("sampler").as_string("") == "flow_match";
+}
+
 }

@@ -1,0 +1,162 @@
+/* Styling for the create-mask stage's panel. Ships with the stage;
+ * injected by the host on first mount. Uses the front end's design
+ * tokens (--bg-*, --fg-*, --line, --accent-*) and its .btn utility;
+ * everything else is local. */
+
+.cmk-picker {
+  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.cmk-picker-title { color: var(--fg-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .6px; }
+.cmk-list { display: flex; flex-direction: column; gap: 6px; }
+.cmk-item {
+  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
+}
+.cmk-item:hover { background: var(--bg-3); border-color: #475061; }
+.cmk-item-name { font-weight: 600; font-size: 12px; }
+.cmk-item-sub { color: var(--fg-dim); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmk-hint { color: var(--fg-dim); font-size: 11.5px; padding: 6px 2px; }
+.cmk-item.live { border-left: 2px solid var(--accent-2); }
+.cmk-item.live .cmk-item-sub { color: var(--accent-2); }
+.cmk-waiting { display: flex; justify-content: center; padding: 4px 0; }
+.cmk-waiting .icon {
+  animation: cmk-hourglass 1.1s ease-in-out infinite;
+  transform-origin: 50% 50%; opacity: .8;
+}
+@keyframes cmk-hourglass {
+  0%, 55% { transform: rotate(0deg); }
+  100%    { transform: rotate(180deg); }
+}
+
+/* The editor fills the panel body as a column. */
+.cmk-view {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; min-height: 0;
+}
+/* The reference image and the mask are drawn into ONE canvas under one
+   transform, so the mask always registers with the picture it masks --
+   including when a configured width x height is being stretched onto it. */
+.cmk-viewport {
+  position: relative; flex: 1 1 auto; min-height: 0;
+  overflow: hidden; background: #000;
+  touch-action: none;              /* pointer drag paints, not scrolls */
+}
+.cmk-canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; }
+/* Left button paints, so the cursor advertises the brush rather than a
+   grab hand. The ring drawn into the canvas is the actual footprint;
+   the crosshair just marks its centre. */
+.cmk-viewport { cursor: crosshair; }
+.cmk-viewport.no-view { cursor: default; }
+.cmk-viewport.panning { cursor: grabbing; }
+
+.cmk-status {
+  flex: 0 0 auto; padding: 4px 8px; min-height: 18px;
+  color: var(--fg-dim); font-size: 11px;
+  border-top: 1px solid var(--line); background: var(--bg-1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Floating control row, over the picture. */
+.cmk-controls {
+  position: absolute; left: 8px; top: 8px; right: 8px;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+}
+/* Only the WIDGETS take pointer events. The rows that lay them out span
+   the width of the picture, and a layout box that swallowed a click
+   would put a dead band across the top of the canvas -- which is
+   exactly where the brush needs to reach. */
+.cmk-controls, .cmk-ctl-group, .cmk-classes { pointer-events: none; }
+.cmk-ctl, .cmk-read, .cmk-swatch, .cmk-commit, .cmk-sep {
+  pointer-events: auto;
+}
+.cmk-ctl-group {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+}
+.cmk-controls.collapsed .cmk-ctl-group { display: none; }
+
+/* The host's own overlay control, character for character
+   (.graph-ctl in app.css, which .cmpi-ctl also copies). Every colour is
+   a theme token, so this follows light/dark without knowing which is
+   active -- the translucent dark plate this used to carry was legible
+   only under the dark theme. */
+.cmk-ctl {
+  min-width: 28px; height: 26px; padding: 0 7px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 5px; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.cmk-ctl:hover:not(:disabled) {
+  background: var(--bg-3); border-color: #475061;
+}
+/* Selected == the host's accent blue, as its own overlay controls do it
+   (.graph-ctl.buf-ctl.active). NOT --accent-2: that is the host's
+   RUNNING/live green, which this view uses in the picker for a live
+   stage -- keeping the two apart is what makes "selected" and "live"
+   readable at a glance. */
+.cmk-ctl.on {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+/* A control that does not apply to the current mask kind (hardness
+   outside alpha mode) is dimmed rather than removed, so the row doesn't
+   reflow as the stage's configuration changes. */
+.cmk-ctl:disabled { opacity: .4; cursor: default; }
+.cmk-ctl:disabled:hover { background: var(--bg-2); border-color: var(--line); }
+.cmk-toggle { flex: 0 0 auto; opacity: .75; }
+.cmk-toggle:hover { opacity: 1; }
+.cmk-sep {
+  width: 1px; height: 16px; background: var(--line); margin: 0 2px;
+}
+/* A read-out, not a button: the same plate at the same height so the
+   row stays aligned, minus the border that would offer a press. */
+.cmk-read {
+  height: 26px; min-width: 30px; padding: 0 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg-2); border: 1px solid transparent;
+  border-radius: 5px; color: var(--fg);
+  font: inherit; font-size: 12px;
+}
+.cmk-read.off { opacity: .4; }
+
+/* Class swatches. Their FILL is the mask palette -- stage data, not
+   theme -- so it stays literal; the white label over an arbitrary user
+   colour is a contrast device for the same reason. Only the selection
+   ring is chrome, and it takes the accent like every other selected
+   control here. */
+.cmk-classes { display: flex; align-items: center; gap: 3px; }
+.cmk-swatch {
+  font: inherit; font-size: 10px; line-height: 1; font-weight: 700;
+  width: 22px; height: 22px; padding: 0;
+  border: 1px solid rgba(0, 0, 0, .5); border-radius: 4px;
+  color: #fff; text-shadow: 0 0 3px rgba(0, 0, 0, .9); cursor: pointer;
+}
+.cmk-swatch.on {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+
+/* Commit is the only control that reaches the stage, so it reads as the
+   primary action and never collapses with the rest. Accent border and
+   accent label, which is how the host marks a primary button
+   (.btn.primary), on the same plate as the rest of the row -- FILLED
+   accent is already taken here by the selected toggles, and a button
+   that is always on would be the one thing it must not look like. */
+.cmk-commit {
+  margin-left: auto;
+  height: 26px; padding: 0 12px;
+  background: var(--bg-2); border: 1px solid var(--accent);
+  border-radius: 5px; color: var(--accent); cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+}
+.cmk-commit:hover:not(:disabled) {
+  background: var(--accent); color: #fff;
+}
+.cmk-commit:disabled {
+  opacity: .4; cursor: default;
+  background: var(--bg-2); color: var(--fg-dim); border-color: var(--line);
+}

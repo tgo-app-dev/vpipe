@@ -11,28 +11,37 @@
 
 namespace vpipe {
 
-// Source stage: choose a diffusion SAMPLER (the integrator) and emit its spec as
-// a FlexData beat, once, on oport0. A `text-to-image` stage latches the spec off
-// its optional sampler iport. Pairs with `scheduler-select` (the sigma
-// schedule) -- sampler and scheduler are the two independent choices.
+// Source stage: program the LLM TOKEN sampler and emit its spec as a FlexData
+// beat, once, on oport0. The generative LLM stages (`text-chat`, `visual-qa`,
+// `realtime-vqa`, `audio-transcribe`, `text-to-speech`) latch the spec off
+// their optional sampler iport; an unwired port leaves the stage on GREEDY
+// (argmax) decoding -- except text-to-speech's AUDIO channel, which falls
+// back to MOSS's own sampling because greedy audio degenerates.
 //
-// The spec is:
-//   { sampler:"flow_match", method, eta, s_noise, seed }
-// method  -- "euler" (default, token-exact turbo) | "heun" | "dpmpp_2m"
-//            | "dpmpp_sde"  (aliases "dpm++_2m"/"dpm++_sde" accepted).
-// eta     -- dpmpp_sde stochasticity (0 => deterministic).
-// s_noise -- dpmpp_sde added-noise scale.
-// seed    -- dpmpp_sde noise seed.
+// Mirrors `diffusion-sampler-select` (which programs the *diffusion*
+// integrator) but is a different thing entirely: this one carries the
+// token-sampling knobs and its spec is tagged `"sampler":"token"` so a
+// consumer can reject a mis-wired diffusion beat instead of silently reading
+// zeros out of it.
 //
-// This stage is MODEL-AGNOSTIC: it forwards the user's sampler choice and does
-// not read any model's scheduler config (the text-to-image stage owns the
-// model). method defaults to euler (the token-exact distilled turbo).
+// The spec is exactly what `genai::parse_sampler_config` reads:
+//   { sampler:"token", temperature, top_k, top_p, min_p,
+//     repetition_penalty, presence_penalty, seed }
 //
-// Config (FlexData object):
-//   method    (string, optional) -- sampler method (default euler).
-//   eta       (real,   optional) -- override dpmpp_sde eta (default 1.0).
-//   s_noise   (real,   optional) -- override dpmpp_sde s_noise (default 1.0).
-//   seed      (int,    optional) -- override dpmpp_sde noise seed.
+// Every knob at its default reduces to argmax, so a bare `sampler-select` with
+// no config decodes greedily -- same as not wiring one at all. Set at least
+// `temperature` (or top_k / top_p / min_p) to actually sample.
+//
+// Config (FlexData object, all optional):
+//   temperature        (real, default 1.0) -- softmax temperature; <= 0 forces
+//                                             argmax.
+//   top_k              (int,  default 0)   -- keep the top k logits; 0 = off.
+//   top_p              (real, default 1.0) -- nucleus; >= 1 = off.
+//   min_p              (real, default 0.0) -- drop below min_p * max_prob;
+//                                             <= 0 = off.
+//   repetition_penalty (real, default 1.0) -- 1.0 = off.
+//   presence_penalty   (real, default 0.0) -- 0.0 = off.
+//   seed               (uint, default 0)   -- 0 = fresh non-deterministic seed.
 class SamplerSelectStage final : public TypedStage<SamplerSelectStage> {
 public:
   static constexpr const char* kTypeName = "sampler-select";
@@ -43,6 +52,7 @@ public:
                      FlexData                  config);
   ~SamplerSelectStage() override;
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -51,13 +61,13 @@ public:
   FlexData resolved_spec() const;
 
 private:
-  std::string   _method;
-  double        _eta = 1.0;
-  double        _s_noise = 1.0;
-  std::int64_t  _seed = 0;
-  bool          _eta_set = false;      // eta=0 is valid, so track presence
-  bool          _s_noise_set = false;
-  bool          _seed_set = false;
+  double        _temperature = 1.0;
+  std::int64_t  _top_k = 0;
+  double        _top_p = 1.0;
+  double        _min_p = 0.0;
+  double        _repetition_penalty = 1.0;
+  double        _presence_penalty = 0.0;
+  std::uint64_t _seed = 0;
   std::uint64_t _emitted = 0;
 };
 

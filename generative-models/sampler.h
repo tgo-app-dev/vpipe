@@ -126,6 +126,15 @@ private:
 SamplerParams
 parse_sampler_config(const FlexData& obj);
 
+// True when `obj` is a DIFFUSION sampler spec -- what `diffusion-sampler-
+// select` emits (tagged "sampler":"flow_match"). The LLM `sampler-select`
+// tags its own spec "token". Both travel as FlexDataPayload on ports that
+// look alike, so a consumer checks this to reject a mis-wired beat instead of
+// silently parsing a spec that shares none of its keys (which would leave
+// every knob at its default and look like a no-op).
+bool
+is_diffusion_sampler_spec(const FlexData& obj);
+
 }
 
 #endif

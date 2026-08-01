@@ -39,6 +39,7 @@ public:
                  FlexData                  config);
   ~LoadImageStage() override;
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -49,6 +50,16 @@ public:
 private:
   std::unique_ptr<BeatPayloadIntf>
   decode_url_(const std::string& url) const;
+
+  // The oport-1 beat: {url, width, height} plus, when the source carries
+  // EXIF, a parsed `exif` object AND `exif_tiff_b64` -- the untouched TIFF
+  // block, base64'd. The parsed view is for reading and routing; the raw
+  // block is what makes a load -> save round trip lossless, since it also
+  // carries maker notes and tags the reader does not name. `image` is the
+  // decoded beat, read only for its dimensions.
+  std::unique_ptr<BeatPayloadIntf>
+  build_metadata_(const std::string& url, const BeatPayloadIntf& image) const;
+
   std::string av_err_(int rc) const;
 
   std::vector<std::string> _urls;

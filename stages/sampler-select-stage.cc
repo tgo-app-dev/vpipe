@@ -6,7 +6,6 @@
 #include "interfaces/session-context-intf.h"
 
 #include <cstdint>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -14,42 +13,43 @@ namespace vpipe {
 
 namespace {
 
-// Canonicalize a sampler method (accepting the "dpm++_*" spelling); returns ""
-// if unknown. Kept in sync with genai::FlowSamplerSpec::canon_method, but this
-// stage stays backend-agnostic (no genai dependency) so it builds everywhere.
-std::string
-canon_sampler_method(const std::string& m)
-{
-  if (m == "euler" || m == "heun" || m == "dpmpp_2m" || m == "dpmpp_sde") {
-    return m;
-  }
-  if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
-  if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
-  return {};
-}
-
 const ConfigKey kAttrs[] = {
-  {.key = "method", .type = ConfigType::String, .required = false,
-   .doc = "sampler method: euler (default) | heun | dpmpp_2m | dpmpp_sde"},
-  {.key = "eta", .type = ConfigType::Real, .required = false,
-   .doc = "dpmpp_sde stochasticity, 0 = deterministic (default 1.0)"},
-  {.key = "s_noise", .type = ConfigType::Real, .required = false,
-   .doc = "dpmpp_sde added-noise scale (default 1.0)"},
-  {.key = "seed", .type = ConfigType::Int, .required = false,
-   .doc = "dpmpp_sde noise seed (default 0)"},
+  {.key = "temperature", .type = ConfigType::Real, .required = false,
+   .doc = "softmax temperature; <= 0 forces argmax (greedy)",
+   .def_real = 1.0},
+  {.key = "top_k", .type = ConfigType::Int, .required = false,
+   .doc = "keep only the top-k logits; 0 = disabled", .def_int = 0},
+  {.key = "top_p", .type = ConfigType::Real, .required = false,
+   .doc = "nucleus sampling: smallest prefix summing to p; 1.0 = disabled",
+   .def_real = 1.0},
+  {.key = "min_p", .type = ConfigType::Real, .required = false,
+   .doc = "drop tokens below min_p * max_prob; 0 = disabled", .def_real = 0.0},
+  {.key = "repetition_penalty", .type = ConfigType::Real, .required = false,
+   .doc = "penalise already-seen tokens; 1.0 = disabled", .def_real = 1.0},
+  {.key = "presence_penalty", .type = ConfigType::Real, .required = false,
+   .doc = "flat penalty on already-seen tokens; 0.0 = disabled",
+   .def_real = 0.0},
+  {.key = "seed", .type = ConfigType::Uint, .required = false,
+   .doc = "sampling RNG seed; 0 = fresh non-deterministic seed",
+   .def_uint = 0},
 };
 const PortSpec kOports[] = {
   {.name = "sampler",
-   .doc = "sampler spec {sampler,method,eta,s_noise,seed}",
+   .doc = "token-sampler spec {sampler:\"token\",temperature,top_k,top_p,"
+          "min_p,repetition_penalty,presence_penalty,seed}",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "sampler-select",
-  .doc       = "Choose a diffusion sampler/integrator (euler | heun | dpmpp_2m "
-               "| dpmpp_sde) and emit its spec as a FlexData beat for a "
-               "text-to-image stage to latch. Pairs with scheduler-select. "
+  .doc       = "Program the LLM token sampler (temperature / top_k / top_p / "
+               "min_p / penalties / seed) and emit its spec as a FlexData "
+               "beat for a text-chat, visual-qa, realtime-vqa, "
+               "audio-transcribe or text-to-speech stage to latch. Every "
+               "knob at its default is "
+               "argmax, so configure at least temperature to sample. For the "
+               "diffusion integrator see diffusion-sampler-select instead. "
                "0 in / 1 out (emits once).",
-  .display_name = "Sampler Select",
+  .display_name = "Sampler",
   .category  = StageCategory::Generative,
   .iports    = {},
   .oports    = kOports,
@@ -65,20 +65,31 @@ SamplerSelectStage::SamplerSelectStage(const SessionContextIntf* s,
   : TypedStage<SamplerSelectStage>(s, std::move(id), std::move(iports),
                                    std::move(config))
 {
-  _method    = attr_str("method");
-  auto o = this->config().as_object();
-  if (o.contains("eta")) { _eta = attr_real("eta"); _eta_set = true; }
-  if (o.contains("s_noise")) {
-    _s_noise = attr_real("s_noise"); _s_noise_set = true;
+  // attr_* fall back to the ConfigKey defaults above, which are exactly
+  // genai::SamplerParams's defaults -- i.e. greedy.
+  _temperature        = attr_real("temperature");
+  _top_k              = attr_int("top_k");
+  _top_p              = attr_real("top_p");
+  _min_p              = attr_real("min_p");
+  _repetition_penalty = attr_real("repetition_penalty");
+  _presence_penalty   = attr_real("presence_penalty");
+  _seed               = attr_uint("seed");
+
+  if (_top_k < 0) {
+    fail_config(fmt("SamplerSelectStage('{}'): top_k must be >= 0 (got {})",
+                    this->id(), _top_k));
   }
-  if (o.contains("seed")) { _seed = attr_int("seed"); _seed_set = true; }
-  if (!_method.empty()) {
-    const std::string c = canon_sampler_method(_method);
-    if (c.empty()) {
-      fail_config(fmt("SamplerSelectStage('{}'): method must be euler | heun | "
-                      "dpmpp_2m | dpmpp_sde (got \"{}\")", this->id(), _method));
-    }
-    _method = c;
+  if (_top_p < 0.0 || _top_p > 1.0) {
+    fail_config(fmt("SamplerSelectStage('{}'): top_p must be in [0, 1] "
+                    "(got {})", this->id(), _top_p));
+  }
+  if (_min_p < 0.0 || _min_p > 1.0) {
+    fail_config(fmt("SamplerSelectStage('{}'): min_p must be in [0, 1] "
+                    "(got {})", this->id(), _min_p));
+  }
+  if (_repetition_penalty <= 0.0) {
+    fail_config(fmt("SamplerSelectStage('{}'): repetition_penalty must be > 0 "
+                    "(got {})", this->id(), _repetition_penalty));
   }
   allocate_oports(spec().oports.size());
 }
@@ -94,24 +105,36 @@ SamplerSelectStage::spec() const noexcept
 FlexData
 SamplerSelectStage::resolved_spec() const
 {
-  // Model-agnostic: this stage forwards the user's sampler choice and does NOT
-  // read the model's scheduler config (the text-to-image stage owns the model).
-  // The built-in distilled-turbo default (euler) applies unless `method` (already
-  // canonicalized in the ctor) overrides it.
-  std::string method = "euler";
-  if (!_method.empty()) { method = _method; }
-  const double eta = _eta_set ? _eta : 1.0;
-  const double s_noise = _s_noise_set ? _s_noise : 1.0;
-  const std::int64_t seed = _seed_set ? _seed : 0;
-
+  // Model-agnostic: every knob is the operator's choice, and the defaults are
+  // genai::SamplerParams's own, so an unconfigured stage emits the greedy
+  // spec. The "sampler" discriminator lets a consumer tell this apart from a
+  // diffusion-sampler-select beat (which tags itself "flow_match") -- both
+  // travel as FlexDataPayload, so the port type alone can't catch a swap.
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("sampler", FlexData::make_string("flow_match"));
-  o.insert_or_assign("method", FlexData::make_string(method));
-  o.insert_or_assign("eta", FlexData::make_real(eta));
-  o.insert_or_assign("s_noise", FlexData::make_real(s_noise));
-  o.insert_or_assign("seed", FlexData::make_int(seed));
+  o.insert_or_assign("sampler", FlexData::make_string("token"));
+  o.insert_or_assign("temperature", FlexData::make_real(_temperature));
+  o.insert_or_assign("top_k", FlexData::make_int(_top_k));
+  o.insert_or_assign("top_p", FlexData::make_real(_top_p));
+  o.insert_or_assign("min_p", FlexData::make_real(_min_p));
+  o.insert_or_assign("repetition_penalty",
+                     FlexData::make_real(_repetition_penalty));
+  o.insert_or_assign("presence_penalty",
+                     FlexData::make_real(_presence_penalty));
+  o.insert_or_assign("seed", FlexData::make_uint(_seed));
   return fd;
+}
+
+void
+SamplerSelectStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately, and every stage downstream of the sampler beat
+  // would sit idle while the pipeline "completed" in milliseconds.
+  _emitted = 0;
 }
 
 Job
@@ -119,14 +142,10 @@ SamplerSelectStage::process(RuntimeContext& ctx)
 {
   if (_emitted > 0) { ctx.signal_done(); co_return; }
   FlexData fd = resolved_spec();
-  {
-    auto o = fd.as_object();
-    session()->info(fmt(
-        "SamplerSelectStage('{}'): sampler = {} (eta {}, s_noise {}, seed {})",
-        this->id(), std::string(o.at("method").as_string("")),
-        o.at("eta").as_real(0.0), o.at("s_noise").as_real(0.0),
-        o.at("seed").as_int(0)));
-  }
+  session()->info(fmt(
+      "SamplerSelectStage('{}'): temperature {}, top_k {}, top_p {}, min_p {}, "
+      "rep {}, presence {}, seed {}", this->id(), _temperature, _top_k, _top_p,
+      _min_p, _repetition_penalty, _presence_penalty, _seed));
   co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(fd)));
   ++_emitted;
   ctx.signal_done();   // one-shot source: emit then close.

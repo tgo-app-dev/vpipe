@@ -752,6 +752,75 @@ PreviewStage::encode_tick_()
   }
 }
 
+void
+PreviewStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the runtime, not the
+  // stages, so a Stop-then-Start re-enters here with the whole previous
+  // stream still latched: `_torn` set, `_clock_started` set (so
+  // process() would never rebuild the encoder), and -- the visible
+  // symptom -- a CLOSED PreviewChannel. The view backend reports
+  // "waiting" for exactly `!pc || pc->closed()`, so every launch after
+  // the first sat there forever.
+  //
+  // The channel is REOPENED in place rather than replaced: the view
+  // backend and anyone else holding the shared_ptr keep the same
+  // object, so a relaunch never strands a subscriber on an orphaned
+  // channel. reopen() drops the retained config / init segment / still,
+  // which described the previous stream.
+  {
+    std::lock_guard<std::mutex> g(_channel_mu);
+    if (!_channel) { _channel = std::make_shared<PreviewChannel>(); }
+    _channel->reopen();
+  }
+  _torn  = false;
+  _fatal = false;
+
+  // Force a fresh encoder + muxer: build_pipeline_() tears down any
+  // prior ffmpeg objects itself, so this cannot leak the old ones.
+  _clock_started = false;
+
+  // Stream state that must not carry a previous run's history.
+  _have_frame         = false;
+  _first_encoded      = true;
+  _force_next_key     = false;
+  _frames_since_flush = 0;
+  _enc_pts            = 0;
+  _frames_in          = 0;
+  _init.clear();
+  _mux_buf.clear();
+  _codec_string.clear();
+  _out_w = 0;
+  _out_h = 0;
+
+  // Cadence + mode re-derive from this run's first frame.
+  _cadence_num    = 25;
+  _cadence_den    = 1;
+  _frame_dur_90k  = 3600;
+  _mode           = Mode::Video;
+  _source_is_video = false;
+  _fast_input      = false;
+  _have_arrival    = false;
+  _have_rgb        = false;
+  _png_bad         = false;
+
+  _audio_seen = false;
+  _audio_rate = 0;
+  _audio_ch   = 0;
+
+  _roles_resolved  = false;
+  _want_video      = false;
+  _want_audio      = false;
+  _video_cfg_ready = false;
+  _audio_cfg_ready = false;
+}
+
+Job
+PreviewStage::initialize(RuntimeContext&)
+{
+  co_return;
+}
+
 Job
 PreviewStage::process(RuntimeContext& ctx)
 {

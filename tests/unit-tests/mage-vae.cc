@@ -223,3 +223,67 @@ TEST(mage_vae, decode_matches_golden)
   // padding is exercised). 0.005 is a regression guard with headroom.
   EXPECT_TRUE(r < 0.005);
 }
+
+// A blown-out white region must survive the decoder's per-pixel MLP head.
+//
+// That head is a chain of gated residual adds with no normalization until the
+// very end, so its residual stream grows far past the f16 range: on a real
+// photo the row entering the three blocks peaks around |x| ~ 39 and the blocks
+// take it to ~2.7e4, ~5.7e4, then ~1.5e5 -- against f16's 65504 ceiling. When
+// the stream was kept in f16, the brightest pixels overflowed to inf, the
+// final RMS norm turned inf * rsqrt(inf) into NaN, and the u8 conversion
+// (whose clamp cannot catch NaN) emitted 0 -- a whole 16x16 latent cell came
+// out BLACK in the middle of a bright sky. The residual is f32 for exactly
+// this reason; this guards the regression without needing a golden.
+//
+// Env: VPIPE_MAGE_TEST_MODEL_PATH only.
+TEST(mage_vae, saturated_white_decodes_without_nan)
+{
+  const char* root = std::getenv("VPIPE_MAGE_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMageVae::Config cfg;
+  auto m = MetalMageVae::load(std::string(root) + "/vae", mc, cfg,
+                              /*with_encoder=*/true);
+  ASSERT_TRUE(m != nullptr);
+  ASSERT_TRUE(m->has_encoder());
+
+  // Pure white (+1 in the [-1,1] convention) over a whole image: every latent
+  // cell is then a saturated-highlight cell, so the head is driven into the
+  // range that used to overflow.
+  const int H = 256, W = 256;
+  const std::size_t n = (std::size_t)3 * H * W;
+  SharedBuffer img = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!img.empty());
+  { auto* d = static_cast<_Float16*>(img.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)1.0f; } }
+
+  std::string err;
+  SharedBuffer lat = m->encode(img, H, W, &err);
+  ASSERT_TRUE(!lat.empty());
+  const int h = H / cfg.patch, w = W / cfg.patch;
+  SharedBuffer out = m->decode(lat, h, w, &err);
+  ASSERT_TRUE(!out.empty());
+
+  const auto* op = static_cast<const _Float16*>(out.contents());
+  std::size_t nan = 0, inf = 0;
+  double lo = 1e30, hi = -1e30, sum = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float v = (float)op[i];
+    if (std::isnan(v)) { ++nan; continue; }
+    if (std::isinf(v)) { ++inf; continue; }
+    lo = v < lo ? v : lo;
+    hi = v > hi ? v : hi;
+    sum += v;
+  }
+  const double mean = sum / (double)(n - nan - inf);
+  std::printf("[mage_vae] white %dx%d decode: nan=%zu inf=%zu range [%.3f, "
+              "%.3f] mean=%.3f\n", H, W, nan, inf, lo, hi, mean);
+  EXPECT_TRUE(nan == 0);
+  EXPECT_TRUE(inf == 0);
+  // White in, white out: the codec round-trips a constant field to ~+1.
+  EXPECT_TRUE(mean > 0.9);
+}

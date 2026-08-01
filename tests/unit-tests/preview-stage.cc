@@ -220,6 +220,49 @@ run_preview_(Session& sess, Pipeline& pl, PreviewStage* pv, int run_ms)
   return drain_(ch, sub);
 }
 
+// A RELAUNCH must produce a live stream again. teardown_() closes the
+// channel when the pipeline stops, and the web-ui view backend reports
+// "waiting" for exactly `!pc || pc->closed()` -- so before
+// reset_run_state() re-armed it, every launch after the first left the
+// viewer waiting forever while the pipeline ran happily.
+//
+// The channel is reopened IN PLACE, not replaced: this test holds the
+// pointer across both runs, exactly as the view backend and a live
+// subscriber do.
+TEST(preview_stage, relaunch_reopens_the_channel_and_streams_again)
+{
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<ClosedSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->allocate_oports(1);
+  auto* src = static_cast<ClosedSource*>(
+      pl->insert_stage(std::move(src_u)));
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  // Captured ONCE, before any launch -- the pointer must stay valid.
+  auto ch = pv->preview_channel();
+  ASSERT_TRUE(ch != nullptr);
+
+  for (int run = 0; run < 2; ++run) {
+    auto sub = ch->subscribe();
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    // Live mid-run: a closed channel here is the "stuck waiting" bug.
+    EXPECT_FALSE(ch->closed());
+    EXPECT_TRUE(pv->preview_channel() == ch);   // same object, reopened
+    rt.stop();
+    const Collected c = drain_(ch, sub);
+    // Each run is a complete stream of its own: init segment + media.
+    EXPECT_TRUE(c.init > 0);
+    EXPECT_TRUE(c.fragment > 0);
+  }
+}
+
 TEST(preview_stage, black_before_input_produces_fmp4)
 {
   // No video frames ever arrive: the stage still self-clocks a black

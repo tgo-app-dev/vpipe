@@ -208,3 +208,97 @@ TEST(metal_compute_shared_buffer, default_constructed_is_empty) {
   EXPECT_TRUE(buf.mtl_buffer() == nullptr);
   EXPECT_FALSE(buf.is_wired());
 }
+
+// ---- residency: park an inactive weight buffer, take it back --------
+
+// The common case: park, reactivate, contents intact. Under no memory
+// pressure the kernel keeps volatile pages, so this is the fast path a
+// model reload is supposed to avoid -- a state flip, no I/O.
+TEST(metal_compute_shared_buffer, reactivate_reports_intact_contents) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+
+  SharedBuffer b = mc->make_shared_buffer(1 << 20);   // 1 MiB, device path
+  ASSERT_TRUE(!b.empty());
+  auto* p = static_cast<std::uint8_t*>(b.contents());
+  for (int i = 0; i < 256; ++i) { p[i] = static_cast<std::uint8_t>(i); }
+
+  EXPECT_TRUE(b.mark_inactive());
+  EXPECT_TRUE(b.is_inactive());
+  // The allocation and its CPU address survive parking -- only the
+  // pages become reclaimable.
+  EXPECT_TRUE(b.contents() == static_cast<void*>(p));
+  EXPECT_TRUE(b.byte_size() == (1u << 20));
+
+  EXPECT_TRUE(b.reactivate());          // nothing else wanted the RAM
+  EXPECT_FALSE(b.is_inactive());
+  bool same = true;
+  for (int i = 0; i < 256; ++i) {
+    if (p[i] != static_cast<std::uint8_t>(i)) { same = false; break; }
+  }
+  EXPECT_TRUE(same);
+}
+
+// reactivate() on a buffer that was never parked must report intact --
+// otherwise every caller would reload weights it still has.
+TEST(metal_compute_shared_buffer, reactivate_without_parking_is_intact) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  SharedBuffer b = mc->make_shared_buffer(4096);
+  ASSERT_TRUE(!b.empty());
+  EXPECT_FALSE(b.is_inactive());
+  EXPECT_TRUE(b.reactivate());
+}
+
+// A SUBVIEW shares another handle's allocation, so parking it would
+// evict memory it does not own. It must refuse and stay resident.
+TEST(metal_compute_shared_buffer, subview_refuses_to_park) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  SharedBuffer b = mc->make_shared_buffer(1 << 16);
+  ASSERT_TRUE(!b.empty());
+  SharedBuffer sv = b.subview(0, 4096);
+  ASSERT_TRUE(!sv.empty());
+  EXPECT_FALSE(sv.mark_inactive());
+  EXPECT_FALSE(sv.is_inactive());
+  EXPECT_TRUE(sv.reactivate());      // never parked -> intact
+}
+
+// An explicitly WIRED buffer is a deliberate "never evict this".
+TEST(metal_compute_shared_buffer, wired_buffer_refuses_to_park) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  SharedBuffer b = mc->make_shared_buffer(1 << 16);
+  ASSERT_TRUE(!b.empty());
+  if (!b.set_wired(true)) { return; }   // mlock limit -- nothing to test
+  EXPECT_FALSE(b.mark_inactive());
+  EXPECT_FALSE(b.is_inactive());
+  b.set_wired(false);
+}
+
+// The parked flag must MOVE with the buffer. If it were dropped, the
+// destination's reactivate() would report "intact" for pages the kernel
+// may already have discarded -- silent garbage, the same class of bug
+// the accounting flag hit.
+TEST(metal_compute_shared_buffer, parked_state_survives_a_move) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  SharedBuffer b = mc->make_shared_buffer(1 << 20);
+  ASSERT_TRUE(!b.empty());
+  EXPECT_TRUE(b.mark_inactive());
+
+  SharedBuffer moved = std::move(b);
+  EXPECT_TRUE(moved.is_inactive());
+  EXPECT_FALSE(b.is_inactive());        // moved-from is inert
+
+  SharedBuffer assigned;
+  assigned = std::move(moved);
+  EXPECT_TRUE(assigned.is_inactive());
+  EXPECT_TRUE(assigned.reactivate());
+  EXPECT_FALSE(assigned.is_inactive());
+}

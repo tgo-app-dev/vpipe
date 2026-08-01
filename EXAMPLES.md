@@ -278,10 +278,27 @@ stage order reflects the dependency rule the UI enforces when it serializes:
 }
 ```
 
-Useful `text-chat` knobs: `max_new_tokens` (per-turn budget, default `1024`),
-`disable_thinking` (`true`/`false` for thinking-capable models), and the
-`sampler_*` keys (`sampler_temperature`, `sampler_top_p`, `sampler_top_k`,
-`sampler_seed`, …); all samplers at their defaults means greedy decoding.
+Useful `text-chat` knobs: `max_new_tokens` (per-turn budget, default `1024`)
+and `disable_thinking` (`true`/`false` for thinking-capable models).
+
+Sampling is not a config key. Wire a **`sampler-select`** source into
+`text-chat`'s optional `sampler` in-port (in-port 1) and set `temperature`,
+`top_p`, `top_k`, `seed`, … there; the spec is latched on the first turn.
+With nothing wired the stage decodes greedily (argmax). The same source feeds
+`visual-qa`, `realtime-vqa`, `audio-transcribe` and `text-to-speech` — the
+last takes two, one per channel (audio codes and free text). Its **audio**
+port is the one exception to the greedy default: left unwired it keeps MOSS's
+own recommended sampling, because greedy audio degenerates into silent loops.
+
+(`diffusion-sampler-select` is the unrelated stage that picks a *diffusion*
+integrator for `text-to-image`.)
+
+```json
+{
+  "id": "sampler", "type": "sampler-select",
+  "config": { "temperature": 0.7, "top_p": 0.9, "seed": 1234 }
+}
+```
 
 ---
 

@@ -60,11 +60,28 @@ static inline void dense_gemm_mma_impl(
   const int m_base = (int)tgid.y * (TM * BM);
   const int n_base = (int)tgid.x * (TN * BN);
 
+  // Skip a sub-tile whose ORIGIN is already past the extent. The matmul2d
+  // tensors clamp a PARTIALLY out-of-range tile (that is what makes ragged M/N
+  // tails safe), but a tile that starts at or beyond N/M is a slice from an
+  // out-of-contract origin, and it does not stay in its lane: at TN=2 the
+  // dispatch rounds N up to TN*BN, so N=13568 with BN=256 leaves the tail
+  // threadgroup's SECOND tile beginning exactly at 13568 -- and its store
+  // landed on the following rows. Measured as rel-L2 0.19 against the same
+  // GEMM at TN=1 (boogu_perf.mma_tile_sweep, ff-gate/up), while ragged-but-
+  // overlapping cases were bit-exact -- which is why only the fully-past tile
+  // needs this. The bounds are uniform across the threadgroup (they depend on
+  // tgid and compile-time constants only), so this costs no divergence.
+  // No shipped output was ever wrong: TN=2 is the only tile that can produce a
+  // fully-past sub-tile, and the only model routing to it before now was
+  // Krea-2, whose tn2 widths (2560 / 6144 / 32768) are all exact multiples of
+  // TN*BN = 512. Boogu's 13568 is the first that is not.
   for (int tm = 0; tm < TM; ++tm) {
     const int m0 = m_base + tm * BM;
+    if (m0 >= M) { break; }
     auto mX = tX.slice(0, m0);          // rows [m0, m0+BM) of x
     for (int tn = 0; tn < TN; ++tn) {
       const int n0 = n_base + tn * BN;
+      if (n0 >= N) { break; }
       auto mW = tW.slice(0, n0);        // rows [n0, n0+BN) of W
       auto cT = op.template get_destination_cooperative_tensor<
           decltype(mX), decltype(mW), VPIPE_ELT>();
@@ -232,12 +249,117 @@ static inline void dense_gemm_mma_splitk_impl(
     dense_gemm_mma_splitk_impl<BM, BN, SG, KC>(x, W, yp, K, N, M, tgid); \
   }
 
+// f32-PLANE twin of dense_gemm_mma_splitk_impl. Identical tiling and identical
+// contraction; the only change is that the partial plane is float, so the fold
+// (splitk_fold_f32_f16) can sum in f32 and round to the compute elt exactly
+// once -- matching the single-op kernel's ONE rounding instead of paying one
+// per plane. The accumulator was always f32; this just stops throwing that
+// away between the split and the fold.
+//
+// That matters here and did not for the diffusion callers: an LM is held to
+// greedy token-exact, and the f16-plane fold perturbs ~37% of down_proj
+// outputs by up to ~5 ulp, which is exactly the kind of drift that flips a
+// near-tie argmax. With f32 planes the split output is bit-identical to the
+// single-op output at these shapes (optiq_blocks.splitk_down_proj).
+template <int BM, int BN, int SG, int KC>
+static inline void dense_gemm_mma_splitk_f32p_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device float* yp, int K, int N, int M, uint3 tgid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  using TF = tensor<device float, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  const int kz = (int)tgid.z;
+  TF tY(yp + (int64_t)kz * (int64_t)M * (int64_t)N,
+        dextents<int32_t, 2>(N, M));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int k0 = kz * KC;
+  auto mX = tX.slice(k0, m0);
+  auto mW = tW.slice(k0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), float>();
+  op.run(mX, mW, cT);
+  auto mY = tY.slice(n0, m0);
+  cT.store(mY);
+}
+
+#define DGVKF(NAME, BM, BN, SG, KC)                                      \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      device float* yp [[buffer(2)]],                                    \
+      const constant int& K [[buffer(3)]],                              \
+      const constant int& N [[buffer(4)]],                              \
+      const constant int& M [[buffer(5)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    dense_gemm_mma_splitk_f32p_impl<BM, BN, SG, KC>(                     \
+        x, W, yp, K, N, M, tgid);                                        \
+  }
+
 // KC=8192 -> Krea2 ff-down (K=16384) splits into 2 planes. 128x256 tile: a
 // single-GEMM tune of the K=8192 chunk favored a 64x256 tile (1.2x), but in the
 // model split-K runs both planes CONCURRENTLY (grid.z=2), so 64x256's doubled
 // threadgroup count just contends -- it LOST ~1.2x on the ff-down section and is
 // not shipped. 128x256 (fewer, larger tgs) is the split tile.
 DGVK(dense_gemm_mma_splitk_n128x256_k8192_f16, 128, 256, 8, 8192)
+
+// Boogu's ff-down is K=13568 (ff_inner = 4*3360 rounded up to 256), which no
+// multiple of 8192 divides -- so the KC=8192 tile above cannot serve it and the
+// shape fell through to the unsplit 128x256 path. 13568 = 2*6784 = 4*3392, so
+// both a 2-way and a 4-way split are exact. 2-way wins at every M measured
+// (11.76 vs 11.40 TFLOP/s at M=2271, 11.60 vs 11.26 at M=4104): more planes
+// shortens each reduction but multiplies the threadgroups competing for the
+// matrix units, and by 4 the second effect has taken over. The 4-way twin is
+// kept only so boogu_perf.mma_tile_sweep can re-establish that on a new GPU.
+DGVK(dense_gemm_mma_splitk_n128x256_k6784_f16, 128, 256, 8, 6784)
+DGVK(dense_gemm_mma_splitk_n128x256_k3392_f16, 128, 256, 8, 3392)
+
+// The LM down_proj shapes. Exactly the same wall the Krea2/Boogu ff-down hit,
+// reached from the language side: the two large dense OptiQ checkpoints have
+// ffn = 17408 (Qwen3.6-27B) and 21504 (gemma-4-31B), and at those depths the
+// single-op reduction runs ~4.4-5.2 TFLOP/s where the same weights in the
+// gate|up direction reach 10-11. A transpose control (N and K swapped,
+// identical FLOPs and identical weight bytes) runs 10.9-11.6, which is what
+// establishes it as contraction DEPTH and not the narrow N.
+//
+// Neither depth is a multiple of any KC above, so both need their own.
+// 17408 = 2*8704 = 4*4352 and 21504 = 2*10752 = 4*5376.
+//
+// 4-WAY SHIPS here, which is the opposite of Boogu's pick at K=13568. Not a
+// contradiction -- these have a much narrower N (5120/5376 vs 6144) so a 2-way
+// split leaves only ~320 threadgroups at M=1024, and the extra planes buy
+// occupancy that Boogu's wider N already had. Measured (S=2 vs S=4, over the
+// single-op tile): qwen 1.22x/1.54x at M=1024 and 1.67x/2.03x at M=4096;
+// gemma 1.16x/1.89x and 1.71x/1.99x. The 2-way twins stay as the re-probe.
+// f32-plane, the variant the LM path dispatches (the f16-plane twins above
+// stay for the diffusion callers, which fold with residual_add).
+DGVKF(dense_gemm_mma_splitk32_n128x256_k8704_f16, 128, 256, 8, 8704)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k10752_f16, 128, 256, 8, 10752)
+// 4-way twins (17408 = 4*4352, 21504 = 4*5376). Boogu picked 2-way over 4-way
+// at M=2271-4104, but a 2-way split of these shapes leaves only ~320
+// threadgroups at M=1024 -- under-occupied, and it shows as a much smaller win
+// there than at M=4096. Which one the model dispatches is decided by
+// measurement per (shape, M); see optiq_blocks.splitk_down_proj.
+DGVKF(dense_gemm_mma_splitk32_n128x256_k4352_f16, 128, 256, 8, 4352)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k5376_f16, 128, 256, 8, 5376)
+
+// VERIFICATION ONLY, never dispatched by default: 9216 = 4*2304 is
+// Qwen3.5-4B's ffn, which is the deepest down_proj on a checkpoint that fits
+// in 16 GB. The two depths this path actually ships for belong to models that
+// do not fit, so without this there is no machine on which the split-K wiring
+// -- planes, fold, and the token stream that comes out the other end -- can be
+// run against a real decoder at all. VPIPE_LM_SPLITK_TEST=1 turns it on.
+// 9216 is nowhere near deep enough to WANT splitting; this buys correctness
+// coverage, not rate.
+DGVKF(dense_gemm_mma_splitk32_n128x256_k2304_f16, 128, 256, 8, 2304)
 
 // Causal/windowed QK for the MATERIALIZED attention path (M5 matrix-core core
 // on top of the M4 diagonal-grid exploit). y[m=query, n=key] = Q[m,:].K[n,:]
@@ -597,5 +719,12 @@ DGV_STUB(dense_gemm_mma_t_n128_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_tn2_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k8192_f16)
+DGV_STUB(dense_gemm_mma_splitk_n128x256_k6784_f16)
+DGV_STUB(dense_gemm_mma_splitk_n128x256_k3392_f16)
+DGV_STUB(dense_gemm_mma_splitk32_n128x256_k8704_f16)
+DGV_STUB(dense_gemm_mma_splitk32_n128x256_k10752_f16)
+DGV_STUB(dense_gemm_mma_splitk32_n128x256_k4352_f16)
+DGV_STUB(dense_gemm_mma_splitk32_n128x256_k5376_f16)
+DGV_STUB(dense_gemm_mma_splitk32_n128x256_k2304_f16)
 DGV_STUB(dense_gemm_mma_t_qkcausal_n128_f16)
 #endif

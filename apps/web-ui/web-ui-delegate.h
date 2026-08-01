@@ -61,6 +61,15 @@ public:
 
   std::unique_ptr<vpipe::UiTextStream> open_text_stream() override;
 
+  // This front end IS graphical, so it presents the GUI views stages
+  // register (ui/ui-view-registry.h). The host is SessionApi's -- it
+  // owns the loaded pipelines a view backend needs to look through --
+  // and is installed at startup via set_view_host(); until then, and in
+  // any build with no API attached, this reports "no views" exactly as
+  // a text-only delegate does.
+  vpipe::UiViewHostIntf* ui_view_host() override { return _view_host; }
+  void set_view_host(vpipe::UiViewHostIntf* h) noexcept { _view_host = h; }
+
   // ---- API surface (HTTP thread) -----------------------------------
   // Everything the user sees is a console line, including live text
   // streams (level "stream", `open` true while growing) and answered
@@ -181,6 +190,10 @@ private:
   bool          _have_resp   = false;
   std::string   _resp_text;
   std::uint64_t _next_req_id = 1;
+
+  // Set once at startup (see set_view_host); read from any thread but
+  // never mutated afterwards, so a plain pointer is enough.
+  vpipe::UiViewHostIntf* _view_host = nullptr;
 };
 
 }

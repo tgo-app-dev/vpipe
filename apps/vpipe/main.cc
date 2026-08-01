@@ -7,7 +7,7 @@
 // precedes them.
 //
 // Usage:
-//   vpipe [--config CFG] LAUNCH [--stage-cfg OVERRIDE]... [LAUNCH ...]
+//   vpipe [--config CFG] [--memory-cap-mb N] LAUNCH ...
 //
 //   LAUNCH is one of:
 //     --launch <spec>              spec is a path to a pipeline JSON/binary
@@ -40,6 +40,8 @@
 // diagnostics flow through the session's default stdout delegates.
 
 #include "common/flex-data.h"
+#include "common/session.h"
+#include "common/stdio-ui-delegate.h"
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/session-intf.h"
 #include "vpipe/session-manager.h"
@@ -51,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -62,11 +65,29 @@ using namespace vpipe;
 namespace {
 
 // Set from the signal handler; the wait loop polls it to stop cleanly.
+// SIGTERM (and SIGINT when no stdio delegate is reachable) means "stop
+// now"; SIGINT otherwise goes through the delegate's two-stroke policy,
+// where the first stroke interrupts stage work and only the second
+// quits. See StdioUiDelegate::note_sigint / poll_sigint.
 std::atomic<bool> g_interrupted{false};
 
+// Published before the signal handler is installed and cleared only
+// after the wait loop is done, so the handler never touches a dead
+// delegate.
+std::atomic<StdioUiDelegate*> g_stdio_ui{nullptr};
+
 void
-on_signal(int)
+on_signal(int sig)
 {
+  if (sig == SIGINT) {
+    StdioUiDelegate* ui = g_stdio_ui.load(std::memory_order_acquire);
+    if (ui != nullptr) {
+      // Async-signal-safe: bumps an atomic, nothing else. The policy
+      // runs later, from the wait loop's poll_sigint().
+      ui->note_sigint();
+      return;
+    }
+  }
   g_interrupted.store(true);
 }
 
@@ -93,6 +114,13 @@ const char* const kUsage =
   "\n"
   "Other:\n"
   "  --config CFG                session config (inline JSON or file path).\n"
+  "  --memory-cap-mb N           ceiling on actively-resident model weights\n"
+  "                              + KV. Over it the least-recently-used\n"
+  "                              weights are PARKED (handed to the kernel as\n"
+  "                              purgeable, reclaimed only under real memory\n"
+  "                              pressure and taken back on next use), not\n"
+  "                              refused. Same as session config\n"
+  "                              memory_cap_mb; 0/unset = uncapped.\n"
   "  --plugin PATH               load a plugin .dylib at startup "
   "(repeatable).\n"
   "  --help, -h                  print this help.\n";
@@ -319,6 +347,12 @@ run(int argc, char** argv)
     } else if (a == "--config") {
       if (++i >= argc) { return arg_err("--config needs a value"); }
       config = argv[i];
+    } else if (a == "--memory-cap-mb") {
+      if (++i >= argc) { return arg_err("--memory-cap-mb needs a value"); }
+      // Forwarded through the environment: the model manager is not
+      // reachable from the public SessionIntf, and an env override is
+      // this tree's convention for memory knobs (cf VPIPE_RAM_LIMIT_MB).
+      ::setenv("VPIPE_MEMORY_CAP_MB", argv[i], 1);
     } else if (a == "--plugin") {
       if (++i >= argc) { return arg_err("--plugin needs a path"); }
       plugins.push_back(argv[i]);
@@ -368,6 +402,18 @@ run(int argc, char** argv)
   }
   SessionIntf* s = const_cast<SessionIntf*>(csess);
 
+  // Install our own stdio UI delegate (identical behaviour to the one
+  // the session builds by default) so the SIGINT handler has something
+  // to hand a Ctrl-C to. The session owns it; we keep a borrowed
+  // pointer for the duration of the wait loop below.
+  StdioUiDelegate* ui = nullptr;
+  if (Session* concrete = dynamic_cast<Session*>(s)) {
+    auto owned = std::make_unique<StdioUiDelegate>();
+    ui = owned.get();
+    concrete->set_ui_delegate(std::move(owned));
+    g_stdio_ui.store(ui, std::memory_order_release);
+  }
+
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
@@ -400,16 +446,22 @@ run(int argc, char** argv)
 
   if (built == 0) {
     std::fprintf(stderr, "vpipe: no pipelines launched\n");
+    g_stdio_ui.store(nullptr, std::memory_order_release);
     mgr.destroy_session(s);
     return 1;
   }
 
   // Wait for every launched pipeline to drain, polling so a SIGINT/SIGTERM
   // can preempt long-running (or endless) pipelines with a clean stop.
+  // A Ctrl-C is offered to the stages first (poll_sigint dispatches the
+  // registered interrupt handlers); only an unconsumed or repeated one
+  // reaches the stop path below.
   for (;;) {
     const Status w = s->wait_pipelines(250);
     if (w.code == 0) { break; }            // all reached idle
-    if (g_interrupted.load()) {
+    const bool quit =
+        g_interrupted.load() || (ui != nullptr && ui->poll_sigint());
+    if (quit) {
       std::fprintf(stderr, "\nvpipe: interrupted -- stopping pipelines...\n");
       for (auto& h : handles) { s->stop_pipeline(h); }
       break;
@@ -417,6 +469,7 @@ run(int argc, char** argv)
     // Otherwise Status{4} (timeout): keep waiting.
   }
 
+  g_stdio_ui.store(nullptr, std::memory_order_release);
   mgr.destroy_session(s);
   return failed > 0 ? 1 : 0;
 }

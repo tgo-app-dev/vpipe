@@ -87,6 +87,44 @@ public:
   bool set_wired(bool on) noexcept;
   bool is_wired() const noexcept { return _wired; }
 
+  // ---- residency: parking an INACTIVE weight buffer ----------------
+  //
+  // The pair behind "release under memory pressure, reactivate without
+  // reloading". mark_inactive() hands the pages to the kernel as
+  // reclaimable while keeping the allocation and its GPU address; the
+  // contents survive as long as nothing else needs the RAM.
+  // reactivate() takes them back and REPORTS whether they survived --
+  // that report is the whole point, since a purge is silent otherwise
+  // and the buffer would read as garbage.
+  //
+  // Only meaningful for a buffer this handle OWNS and that was
+  // allocated standalone. A subview shares another handle's allocation
+  // (parking it would evict memory it does not own) and a heap
+  // sub-allocation's residency belongs to the heap, so both refuse and
+  // stay fully resident. An explicitly wired buffer also refuses --
+  // wiring is a deliberate "never evict this".
+  //
+  //   mark_inactive() -> true  the buffer is now evictable.
+  //                   -> false it stays resident (see above).
+  //   reactivate()    -> true  contents INTACT, use as-is (the fast
+  //                            path: no I/O, just a state flip).
+  //                   -> false contents were DISCARDED; the caller must
+  //                            reload the tensor before using it.
+  //
+  // reactivate() on a buffer that was never parked returns true: there
+  // is nothing to have lost.
+  bool mark_inactive() noexcept;
+  bool reactivate()    noexcept;
+  bool is_inactive() const noexcept { return _inactive; }
+
+  // True when THIS handle is the one that put these bytes on the books
+  // -- i.e. it owns a standalone allocation rather than aliasing one
+  // (subview) or wrapping foreign memory. It is exactly the set of
+  // handles mark_inactive() will act on, so callers deciding whether a
+  // tensor is parkable can ask up front instead of inferring it from a
+  // state-changing call.
+  bool is_owned() const noexcept { return _accounted; }
+
   // Wrap an externally-allocated MTL::Buffer (e.g. one carried by a
   // TensorBeat's ExternalStorageHandle) without a copy. Caller
   // transfers ONE refcount on `buf` to the returned SharedBuffer.
@@ -117,7 +155,44 @@ private:
   std::size_t  _base_off  = 0;     // GPU byte offset for subview() handles
   BufferView   _view{};
   bool         _wired     = false;
+  // True only for the handle make_shared_buffer/wrap_no_copy minted, i.e. the
+  // one that put these bytes on the books. subview() handles share the same
+  // MTL::Buffer by refcount and must NOT be counted again, or a model that
+  // subviews heavily would report several times its real footprint.
+  bool         _accounted = false;
+  bool         _inactive  = false;   // parked via mark_inactive
 };
+
+// ---- Process-wide SharedBuffer accounting -------------------------------
+// Device allocations are the bulk of a model's footprint but are invisible to
+// max-RSS style tools (and phys_footprint only gives one aggregate number),
+// so there was no way to ask "which buffer grew?" when a footprint moved.
+// These counters answer that: cumulative and concurrent bytes, plus an
+// env-gated per-allocation log for attribution.
+//
+// `live_bytes` counts buffers whose owning handle is still alive; it drops
+// when that handle is destroyed even if a subview outlives it (the memory is
+// still held in that case, so treat live_bytes as a close lower bound rather
+// than an exact residency figure).
+struct MemoryStats {
+  std::size_t live_bytes  = 0;   // currently held by live owning handles
+  std::size_t peak_bytes  = 0;   // high-water mark of live_bytes
+  std::size_t total_bytes = 0;   // cumulative, never decremented
+  std::size_t live_count  = 0;
+  std::size_t total_count = 0;
+};
+
+// Snapshot the counters. Cheap (relaxed atomic loads); safe from any thread.
+MemoryStats shared_buffer_memory_stats() noexcept;
+
+// Internal: called by MetalCompute when it mints an owning handle, and by
+// SharedBuffer::teardown_ when that handle dies. Not for general use.
+void account_alloc_(std::size_t bytes) noexcept;
+void account_free_(std::size_t bytes) noexcept;
+
+// Re-arm peak_bytes to the current live_bytes -- call before a phase you want
+// a peak for (e.g. after load, to get the prefill-only high-water mark).
+void shared_buffer_reset_peak() noexcept;
 
 }  // namespace vpipe::metal_compute
 

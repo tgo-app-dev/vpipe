@@ -7,6 +7,7 @@
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
+#include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
 #include "generative-models/qwen-image/metal-qwen-image-calibration.h"
@@ -133,6 +134,7 @@ dit_class_family_(const std::string& class_name)
   // Mage-Flow's NR-MMDiT is the Qwen-Image dual-stream MMDiT under a different
   // config (see metal-mage-flow-transformer.h), so it shares that leaf set.
   if (class_name == "MageFlow") { return "mage-flow"; }
+  if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   return {};
 }
 
@@ -386,8 +388,55 @@ dit_quant_linears_(const std::string& family)
             "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
             "proj", "2"};
   }
+  if (family == "boogu-image") {
+    // Boogu's NextDiT. Every block kind contributes: the refiners + single
+    // stream use attn.to_{q,k,v}/to_out.0 and feed_forward.linear_{1,2,3}; the
+    // dual-stream blocks add the processor-owned joint projections
+    // (img/instruct_to_{q,k,v}, img_out, instruct_out), their shared to_out.0,
+    // the image self-attention (same to_* leaves) and the two per-stream FFs.
+    // Leaves are matched on the LAST dot-component, so "0" is to_out.0.
+    // The adaLN modulation linears (norm*.linear -> "linear") stay bf16 like
+    // every other family here -- they are what the residual scale rides on.
+    // NOTE the collision the exclude list below handles: feed_forward.linear_1
+    // /2/3 share their leaves with norm_out.linear_1/2 and the timestep
+    // embedder's linear_1/2, which must NOT be quantized.
+    return {"to_q", "to_k", "to_v", "0",
+            "img_to_q", "img_to_k", "img_to_v",
+            "instruct_to_q", "instruct_to_k", "instruct_to_v",
+            "img_out", "instruct_out",
+            "linear_1", "linear_2", "linear_3"};
+  }
   return {"to_q", "to_k", "to_v", "to_gate", "0", "gate", "up", "down",
           "linear_1", "linear_2", "img_in", "time_mod_proj", "linear"};
+}
+
+// The DiT's hidden width from transformer/config.json, 0 when unreadable. Used
+// only to sanity-check the group size against it (see the quantize path): the
+// key differs per family -- Boogu/Lumina say hidden_size, Qwen-Image/FLUX say
+// (joint_)attention_dim or num_attention_heads * attention_head_dim.
+int
+dit_hidden_size_(const std::string& src_dir)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(src_dir) / "config.json");
+  if (!in) { return 0; }
+  FlexData cfg = FlexData::from_json(in);
+  if (!cfg.is_object()) { return 0; }
+  auto obj = cfg.as_object();
+  for (const char* k : {"hidden_size", "joint_attention_dim",
+                        "attention_dim", "inner_dim"}) {
+    if (obj.contains(k)) {
+      const int v = (int)obj.at(k).as_int(0);
+      if (v > 0) { return v; }
+    }
+  }
+  if (obj.contains("num_attention_heads") &&
+      obj.contains("attention_head_dim")) {
+    const int h = (int)obj.at("num_attention_heads").as_int(0);
+    const int d = (int)obj.at("attention_head_dim").as_int(0);
+    if (h > 0 && d > 0) { return h * d; }
+  }
+  return 0;
 }
 
 // The DiT's main-block count (config.json num_layers; default 28) -- the
@@ -437,7 +486,8 @@ constexpr ConfigKey kAttrs[] = {
    .def_str = ""},
   {.key = "target", .type = ConfigType::String,
    .doc = "which part of the model to quantize. Text-to-image (Krea-2 / "
-          "FLUX.2): a component -- dit (default) | text_encoder | vae -- the "
+          "FLUX.2 / Boogu-Image): a component -- dit (default) | text_encoder "
+          "(Boogu: its mllm/) | vae -- the "
           "output is a SELF-CONTAINED pipeline (all copied, the target "
           "quantized) usable as an hf_dir; chain passes. General / multi-modal "
           "LLM: a submodule "
@@ -480,10 +530,12 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "layer count for awq/mixed; 0 => auto-detect from config.json",
    .def_uint = 0},
   {.key = "quant_modulation", .type = ConfigType::Bool,
-   .doc = "Qwen-Image-Edit DiT only: also quantize the AdaLN modulation "
-          "projections (*_mod.1). They are the largest weights (~13 GB bf16 -> "
-          "~3.4 GB at 4-bit, which lets the whole DiT fit a 16 GB box) but "
-          "precision-sensitive, so they are kept bf16 by default -- opt in here",
+   .doc = "Qwen-Image-Edit and Boogu-Image DiTs: also quantize the AdaLN "
+          "modulation projections (QIE *_mod.1; Boogu norm*.linear). They are "
+          "the largest weights left bf16 -- QIE ~13 GB -> ~3.4 GB, Boogu 2.1 GB "
+          "-> ~1.1 GB, which is what lets the whole DiT fit a 16 GB box -- but "
+          "precision-sensitive, so they are kept bf16 by default and forced to "
+          "8-bit (not the body's bit-width) when you opt in here",
    .def_bool = false},
 };
 // Trigger iport (optional, any beat) + summary oport -- see model-fetch
@@ -641,6 +693,49 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
     return true;
   }
 
+  // A diffusers PIPELINE ROOT that did not route to the DiT path above is not
+  // an LLM, and must not be diagnosed as one. Falling through runs the LM
+  // arch-detect on a directory that has no LM in it and reports
+  // `arch='unknown'` plus a `target` resolution failure ("no submodule
+  // matching target 'dit'") -- which reads as "this family is unsupported"
+  // when the actual cause is almost always that the component is not on disk
+  // yet, an interrupted or still-running download. Say which it is, here.
+  {
+    const bool has_index = fs::exists(fs::path(src_dir) / "model_index.json");
+    const fs::path tdir = fs::path(src_dir) / "transformer";
+    if (has_index || fs::is_directory(tdir, ec)) {
+      std::string why;
+      if (!fs::is_directory(tdir, ec)) {
+        why = "its 'transformer/' component is not present";
+      } else if (!fs::exists(tdir / "config.json")) {
+        why = "'transformer/config.json' is missing";
+      } else {
+        std::string cls;
+        std::ifstream in(tdir / "config.json");
+        if (in) {
+          FlexData c = FlexData::from_json(in);
+          if (c.is_object()) {
+            auto o = c.as_object();
+            if (o.contains("_class_name")) {
+              cls = std::string(o.at("_class_name").as_string(""));
+            }
+          }
+        }
+        why = cls.empty()
+                  ? std::string("its transformer config carries no _class_name")
+                  : fmt("its transformer _class_name '{}' is not a supported "
+                        "DiT", cls)();
+      }
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): '{}' looks like a text-to-image pipeline "
+          "but {}. If the model is still downloading, wait for it to finish; "
+          "otherwise this build does not support that DiT. (Not falling back "
+          "to the language-model quantizer -- there is no LM at this path.)",
+          this->id(), src_dir, why));
+      return false;
+    }
+  }
+
   // Auto-detect arch / n_layers / layer_prefix + capabilities from the source
   // (config.json + a probe of the safetensors layer layout); explicit config
   // wins over the detection.
@@ -689,24 +784,8 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // in the ctor -- it depends on the resolved source).
   if (_awq || _mixed) {
     if (eff_n_layers <= 0 || eff_layer_prefix.empty()) {
-      // A diffusion pipeline reaching the general LM path means its DiT was not
-      // recognised as a text-to-image transformer (resolve_t2i_dit_dir_ returned
-      // empty) -- typically a build that predates the model's DiT-quant support,
-      // or a transformer/ config whose _class_name is unknown. Give that hint
-      // instead of the bare auto-detect failure.
-      const bool looks_t2i =
-          fs::exists(fs::path(src_dir) / "model_index.json") ||
-          fs::exists(fs::path(src_dir) / "transformer" / "config.json");
-      if (looks_t2i) {
-        session()->warn(fmt(
-            "ModelQuantizeStage('{}'): '{}' looks like a text-to-image pipeline "
-            "(has model_index.json / transformer/), but its DiT was not routed "
-            "to the DiT-quantize path -- the build likely predates this model's "
-            "support, or its transformer _class_name is unrecognised. Rebuild "
-            "from a current tree (or point src_model at the transformer/ dir).",
-            this->id(), src_dir));
-        return false;
-      }
+      // (A diffusers pipeline root never reaches here: it is diagnosed and
+      // rejected right after resolve_t2i_dit_dir_ fails, above.)
       session()->warn(fmt(
           "ModelQuantizeStage('{}'): awq/mixed need n_layers + layer_prefix; "
           "auto-detect from '{}' failed -- set them explicitly (got "
@@ -838,6 +917,7 @@ ModelQuantizeStage::quantize_dit_component_(
 
   const bool is_flux2 = (family == "flux2");
   const bool is_mage  = (family == "mage-flow");
+  const bool is_boogu = (family == "boogu-image");
   // Mage-Flow shares Qwen-Image's block topology and tensor names, so the
   // modulation handling below applies to it too.
   const bool is_qie   = (family == "qwen-image-edit") || is_mage;
@@ -850,27 +930,73 @@ ModelQuantizeStage::quantize_dit_component_(
   genai::QuantizeOptions opt;
   opt.bits  = _bits;
   opt.group = _group_size;
+  // The group size has to DIVIDE the projections' input width or the quantizer
+  // leaves them bf16 -- a "4-bit" checkpoint the size of the source. Boogu's
+  // hidden_size is 3360, which is 52.5 groups of 64, so its attention and FF
+  // gate/up projections are all group-32 work. Pick the largest supported group
+  // that divides the DiT's hidden width and say so, rather than shipping a
+  // checkpoint that only quantized the layers that happened to fit.
+  {
+    const int hid = dit_hidden_size_(dit_dir);
+    if (hid > 0 && (hid % opt.group) != 0) {
+      int g = 0;
+      for (int cand : {64, 32}) {
+        if (cand <= opt.group && (hid % cand) == 0) { g = cand; break; }
+      }
+      if (g > 0) {
+        session()->warn(fmt(
+            "ModelQuantizeStage('{}'): hidden_size {} is not a multiple of "
+            "group_size {} -- the projections reading it would stay bf16; "
+            "using group_size {} instead", this->id(), hid, opt.group, g));
+        opt.group = g;
+      } else {
+        session()->warn(fmt(
+            "ModelQuantizeStage('{}'): hidden_size {} is not a multiple of any "
+            "supported group size (32 | 64); the projections reading it will "
+            "stay bf16", this->id(), hid));
+      }
+    }
+  }
   opt.quant_linears    = dit_quant_linears_(family);
-  // Opt-in: also quantize the QIE AdaLN modulation (*_mod.1 -> leaf "1", the
-  // largest weights, kept bf16 by default for precision). The DiT loader runs a
-  // quantized modulation through gemm_bias_q, so a model built with this flag
-  // loads + infers on a 16 GB box.
-  if (is_qie && _quant_modulation) {
-    opt.quant_linears.push_back("1");
-    // The modulation carries large-magnitude scale/gate values (they drive the
-    // ~1e7 residual), so 4-bit wrecks it (block-0 rel-L2 ~0.75) while 8-bit is
-    // fine. Force w8 for the modulation regardless of the body's bit-width; the
-    // DiT loader auto-detects per-tensor bits, so body @ bits, modulation @ 8.
-    opt.high_bit_leaves.push_back("1");
+  if (_quant_modulation && (is_qie || is_boogu)) {
+    // The adaLN modulation projections are the largest weights in these DiTs
+    // and are kept bf16 by default because they are what the residual scale
+    // rides on. This is the opt-in that quantizes them anyway, for a box that
+    // cannot otherwise hold the DiT.
+    //   Qwen-Image-Edit / Mage-Flow: `*_mod.1`             -> leaf "1"
+    //   Boogu-Image: `norm1.linear` (refiners + single) and
+    //     `img_norm{1,2,3}.linear` / `instruct_norm{1,2}.linear` (dual-stream)
+    //                                                       -> leaf "linear"
+    // On Boogu that leaf is EXACTLY the 76 modulation linears (32 single + 4
+    // modulated refiners + 8x5 dual-stream); norm_out./time_caption_embed's
+    // linear_1/linear_2 are a different leaf and stay excluded by name.
+    const char* leaf = is_boogu ? "linear" : "1";
+    opt.quant_linears.push_back(leaf);
+    // The modulation carries large-magnitude scale/gate values (on QIE they
+    // drive the ~1e7 residual), so 4-bit wrecks it (block-0 rel-L2 ~0.75) while
+    // 8-bit is fine. Force w8 for the modulation regardless of the body's
+    // bit-width; the DiT loaders derive bits PER TENSOR from the code/scale
+    // shapes, so body @ bits, modulation @ 8 loads correctly.
+    opt.high_bit_leaves.push_back(leaf);
     opt.high_bits = 8;
     session()->info(fmt(
-        "ModelQuantizeStage('{}'): quantizing the AdaLN modulation (*_mod.1) "
-        "at 8-bit (precision-sensitive; body stays {}-bit)", this->id(),
-        _bits));
+        "ModelQuantizeStage('{}'): quantizing the AdaLN modulation ({}) at "
+        "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
+        is_boogu ? "norm*.linear" : "*_mod.1", _bits));
+  }
+  if (is_boogu) {
+    // Keep the precision-sensitive heads out despite their shared leaf names
+    // (see dit_quant_linears_): the final LuminaLayerNormContinuous projection
+    // -- every velocity value flows through its 64 rows -- and the timestep
+    // embedder, which feeds every modulation vector in the model. The patch
+    // embedders are excluded on the same grounds as FLUX.2's (K = 64 is one
+    // group at g64, and all image information enters through them).
+    opt.quant_exclude = {"norm_out.", "time_caption_embed.",
+                         "x_embedder", "ref_image_patch_embedder"};
   }
   opt.quant_embeddings = false;
   opt.norm_offset      = false;
-  opt.dit_family       = family;   // "krea2" | "flux2"
+  opt.dit_family       = family;   // "krea2" | "flux2" | "boogu-image" | ...
   const int dit_layers = dit_num_layers_(dit_dir);
   fs::path tmp_cal;
   if (_mixed) {
@@ -881,7 +1007,15 @@ ModelQuantizeStage::quantize_dit_component_(
     opt.high_bits  = _high_bits;
     opt.mixed_frac = _mixed_frac;
     opt.n_layers   = dit_layers;
-    if (!is_flux2) { opt.layer_prefix = "transformer_blocks."; }
+    if (is_boogu) {
+      // Rank Boogu's single-stream tail: 32 of its 46 blocks and the bulk of
+      // the weights. (The 8 dual-stream blocks and the 6 refiners keep the
+      // base width -- the dual-stream blocks carry the joint attention that
+      // first mixes the streams, so they are the wrong place to save bits.)
+      opt.layer_prefix = "single_stream_layers.";
+    } else if (!is_flux2) {
+      opt.layer_prefix = "transformer_blocks.";
+    }
   }
   if (awq) {
     // DiT AWQ = activation-aware weight CLIPPING. On-device auto-calibrate over
@@ -905,6 +1039,7 @@ ModelQuantizeStage::quantize_dit_component_(
     } else {
       tmp_cal = vpipe::temp_root() /
                 ((is_flux2 ? "vpipe-flux2-ditcal-"
+                  : is_boogu ? "vpipe-boogu-ditcal-"
                   : is_qie ? "vpipe-qie-ditcal-"
                   : "vpipe-krea2-ditcal-") + this->id());
       fs::remove_all(tmp_cal, ec);
@@ -915,6 +1050,12 @@ ModelQuantizeStage::quantize_dit_component_(
       const bool ok = is_flux2
           ? genai::collect_flux2_calibration(
                 mc, calib_root, genai::default_dit_calibration_prompts(), 8, 256,
+                256, 0, tmp_cal.string(), &ce, stop)
+          : is_boogu
+          // 4 steps, not 8: the Boogu collector walks the DMD student's own
+          // ascending schedule, which IS 4 steps.
+          ? genai::collect_boogu_calibration(
+                mc, calib_root, genai::default_dit_calibration_prompts(), 4, 256,
                 256, 0, tmp_cal.string(), &ce, stop)
           : is_qie
           ? genai::collect_qwen_image_calibration(
@@ -1157,7 +1298,14 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
         "(want dit | text_encoder | vae)", this->id(), _target, family));
     return false;
   }
-  const std::string tgt = tgt_sub.empty() ? std::string("transformer") : tgt_sub;
+  std::string tgt = tgt_sub.empty() ? std::string("transformer") : tgt_sub;
+  // Boogu names its text encoder `mllm/` (it is a full Qwen3-VL, not a
+  // diffusers text_encoder). Accept the family-neutral `text_encoder` target
+  // and resolve it to whichever dir the checkpoint actually ships.
+  if (tgt == "text_encoder" && !fs::is_directory(fs::path(root) / tgt, ec) &&
+      fs::is_directory(fs::path(root) / "mllm", ec)) {
+    tgt = "mllm";
+  }
   const fs::path tgt_src = fs::path(root) / tgt;
   if (!fs::is_directory(tgt_src, ec)) {
     session()->warn(fmt(
@@ -1231,7 +1379,7 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
   bool ok = false;
   if (tgt == "transformer") {
     ok = quantize_dit_component_(tgt_src.string(), tgt_out, family, root, stop);
-  } else if (tgt == "text_encoder") {
+  } else if (tgt == "text_encoder" || tgt == "mllm") {
     ok = quantize_text_encoder_(tgt_src.string(), tgt_out, root, stop);
   }
   if (!ok) { return false; }

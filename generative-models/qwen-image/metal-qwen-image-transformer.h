@@ -14,6 +14,7 @@ namespace vpipe {
 namespace genai {
 
 class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 
 // Qwen-Image-Edit-2511 denoiser (QwenImageTransformer2DModel): a DUAL-STREAM
 // MMDiT flow-matching transformer, run in f16 on the metal-compute backend.
@@ -101,6 +102,14 @@ class MetalQwenImageTransformer {
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
 
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so two pipelines running
+  // this model share its weights instead of loading a copy each. The dir
+  // overload opens a PRIVATE set (tests, and callers with no session).
+  static std::unique_ptr<MetalQwenImageTransformer>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+
   ~MetalQwenImageTransformer();
 
   // Cooperative stop, polled once per block in streaming mode (a pipeline stop
@@ -153,11 +162,20 @@ class MetalQwenImageTransformer {
 
   // Load a checkpoint tensor as a bf16 SharedBuffer (BF16 memcpy'd; F16/F32
   // converted). The whole forward runs bf16.
-  metal_compute::SharedBuffer to_elt_(const MetalLlamaWeights& wts,
-                                      const std::string& name);
-  bool load_linear_(const MetalLlamaWeights& wts, const std::string& pre,
+  // Whether a load is RETAINED for the model's life or read once and
+  // thrown away. Explicit, not a mode flag: the same loaders serve the
+  // preloaded/pinned blocks AND the per-forward streamed ones, and
+  // caching a streamed block would silently undo streaming, putting the
+  // whole DiT back in RAM on the box least able to hold it.
+  enum class Retain { Cached, Streamed };
+
+  metal_compute::SharedBuffer to_elt_(WeightSet& ws,
+                                      const std::string& name,
+                                      Retain r);
+  bool load_linear_(WeightSet& ws, const std::string& pre,
                     metal_compute::SharedBuffer& w,
-                    metal_compute::SharedBuffer& b);
+                    metal_compute::SharedBuffer& b,
+                    Retain r);
 
   // A Linear's weight, dense (bf16) OR affine group-quantized (w4/w8 g64). The
   // quantizer writes `<name>.weight` as U32 packed codes (+ `.scales`/`.biases`
@@ -171,9 +189,10 @@ class MetalQwenImageTransformer {
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
   // Load a (possibly-quantized) linear's weight into `qw` and its bias into `b`.
-  bool load_linear_q_(const MetalLlamaWeights& wts, const std::string& pre,
-                      QWeight& qw, metal_compute::SharedBuffer& b);
-  QWeight load_qw_(const MetalLlamaWeights& wts, const std::string& name);
+  bool load_linear_q_(WeightSet& ws, const std::string& pre,
+                      QWeight& qw, metal_compute::SharedBuffer& b,
+                      Retain r);
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
 
   // M5 matrix-core matmul2d biasless GEMM y[M,N] = x[M,K] @ w[N,K]^T (dense
   // weight direct, or a quantized weight dequant-expanded once into _w_deq).
@@ -206,7 +225,7 @@ class MetalQwenImageTransformer {
   };
   // Load block L's per-stream weights from `wts` into `b` (dense or quantized).
   // Used both to preload and, in streaming mode, per-block inside forward().
-  bool load_block_(const MetalLlamaWeights& wts, int L, Block& b);
+  bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -226,7 +245,10 @@ class MetalQwenImageTransformer {
   // retained source mmap on demand in forward() and freed after use.
   bool _stream_blocks = false;
   int _pinned = 0;                  // pinned leading blocks (streaming only)
-  std::unique_ptr<MetalLlamaWeights> _stream_wts;
+  // The checkpoint, held for this model's whole life -- it is where the
+  // streamed blocks are read from, so streaming is the manager's
+  // business rather than a private mmap this class kept to itself.
+  std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;
 
   // One contiguous image-token segment for the RoPE build (frame band + grid).
@@ -247,7 +269,9 @@ class MetalQwenImageTransformer {
       _lib_rope, _lib_qmm, _lib_attn;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_layernorm,
       _fn_silu, _fn_gelu, _fn_residual, _fn_transpose, _fn_sdpa, _fn_rope_table,
-      _fn_adaln, _fn_gated;
+      _fn_adaln, _fn_gated,
+      // vec4 twins of adaln/gated (bit-identical; VPIPE_NO_ELT_V4 disables).
+      _fn_adaln4, _fn_gated4;
   // Fused transpose+RoPE for the q/k path (token-major -> head-major roped in one
   // pass; saves the separate rope's read+write). Best-effort: null -> the split
   // transpose + rope path. VPIPE_QIE_NO_FUSE_ROPE disables.

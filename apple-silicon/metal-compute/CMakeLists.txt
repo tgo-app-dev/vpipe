@@ -94,6 +94,12 @@ add_vpipe_metal_kernel(qwen3_5_gdn_wy
 add_vpipe_metal_kernel(dense_gemm SRC gemm/dense_gemm.metal)
 add_vpipe_metal_kernel(dense_gemm_bf16 SRC gemm/dense_gemm.metal
                        DEFINES VPIPE_ELT=bfloat)
+# Dense GEMM on the steel BlockMMA (simdgroup_multiply_accumulate), the dense
+# twin of affine_qmm_steel. Runs on EVERY Apple GPU -- unlike dense_gemm_mma,
+# which needs M5 matmul2d -- because simdgroup matrices go back to Apple7.
+add_vpipe_metal_kernel(dense_gemm_steel SRC gemm/dense_gemm_steel.metal)
+add_vpipe_metal_kernel(dense_gemm_steel_bf16 SRC gemm/dense_gemm_steel.metal
+                       DEFINES VPIPE_ELT=bfloat)
 # The matrix-core (NAX / matmul2d) kernels MISCOMPILE on M5 unless built with
 # deployment target >= 26.2 (mlx #3622: "NAX requires MACOSX_DEPLOYMENT_TARGET=
 # 26.2"). Without it the matmul2d codegen is wrong (e.g. attn_steel_nax was
@@ -132,6 +138,11 @@ add_vpipe_metal_kernel(conv2d_mma_bf16 SRC gemm/conv2d_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)
+# bf16 twin: the Mage-Flow reference runs its Qwen3-VL tower in bf16
+# (pipeline.py casts txt_enc, tower included), so the tower needs a bf16
+# storage path to reproduce the reference's numerics.
+add_vpipe_metal_kernel(qwen3_5_vision_bf16 SRC encoders/qwen3_5_vision.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_encoder SRC encoders/audio_encoder.metal)
 set(STEEL_GEMM_HDRS
     vendored/mlx/backend/metal/kernels/steel/defines.h

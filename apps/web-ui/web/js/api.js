@@ -29,6 +29,35 @@ export function setAuthKey(k) {
 }
 export function setAuthPrompt(fn) { authPrompt = fn; }
 
+// A client that scanned the console's QR code (--show-qr) is redirected
+// here as /?key=<key> -- the whole point being that nobody retypes an
+// access key on a phone. Adopt it, then STRIP it from the URL: it has
+// done its job the moment it reaches sessionStorage, and left in place
+// it would persist into the address bar, the back stack and any
+// bookmark or shared link. replaceState rather than pushState, so there
+// is no history entry holding it either.
+// Reading the key uses a regex rather than URL/URLSearchParams on
+// purpose: the part that MUST NOT fail should not depend on a Web API
+// at all. Stripping it afterwards is cosmetic, so that part is the one
+// allowed to be best-effort.
+(function adoptKeyFromUrl() {
+  const m = /[?&]key=([^&#]*)/.exec(location.search || '');
+  if (!m) { return; }
+  let k = m[1];
+  try { k = decodeURIComponent(k); } catch (e) { /* take it raw */ }
+  if (!k) { return; }
+  setAuthKey(k);
+  try {
+    const url = new URL(location.href);
+    url.searchParams.delete('key');
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+  } catch (e) { /* no URL/history: the key stays in the address bar */ }
+})();
+// The current key, for transports that can't go through req(): a
+// WebSocket cannot set headers, so a stage view's channel passes the
+// key as ?key= (see ui/sdk/view-channel.js).
+export function getAuthKey() { return authKey; }
+
 function ensureKey() {
   if (!authPrompt) { return Promise.resolve(null); }
   if (!authInflight) {
@@ -261,6 +290,9 @@ export const api = {
   ioPending:     ()        => req('GET',  '/api/io/pending'),
   ioInput:       (id, text)=> req('POST', '/api/io/input', { id, text }),
   ioClear:       ()        => req('POST', '/api/io/clear'),
+  // Fire every stage-registered interrupt handler. Resolves to
+  // {handled: N} -- how many stages actually cut work short.
+  ioInterrupt:   ()        => req('POST', '/api/io/interrupt'),
   ioGetLimit:    ()        => req('GET',  '/api/io/limit'),
   ioSetLimit:    (n)       => req('PUT',  '/api/io/limit',
                                   { max_console: n }),
@@ -291,19 +323,13 @@ export const api = {
   // workspace's HLS video view.
   hlsStreams:    ()        => req('GET',  '/api/hls/streams'),
 
-  // Active preview streams (live "preview" stages) for the low-latency
-  // Preview view.
-  previewStreams:()        => req('GET',  '/api/preview/streams'),
-  // WebSocket URL of a preview stage's live stream (fMP4 video + PCM). Same
-  // origin as the page (ws:// or wss:// per the page scheme). The access
-  // key rides as ?key= because browsers can't set headers on a WebSocket.
-  previewWsUrl:  (pipeline, stage) => {
-    const proto = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
-    let u = proto + '//' + window.location.host + '/api/preview/'
-          + pid(pipeline) + '/' + pid(stage) + '/ws';
-    if (authKey) { u += '?key=' + encodeURIComponent(authKey); }
-    return u;
-  },
+  // GUI views the STAGES registered (ui/ui-view-registry.h), which the
+  // panel registries append to their built-in app views. Each entry
+  // names an ES module this app import()s but does not otherwise
+  // understand -> {views:[{id,stage_type,module,styles,label_key,icon}]}.
+  // The per-panel channel to a view's backend is a WebSocket opened by
+  // ui/sdk/view-channel.js, not a call through here.
+  uiViews:       ()        => req('GET',  '/api/ui/views'),
 
   // Performance profiler: capture control + timeline retrieval.
   profilerStatus:()        => req('GET',  '/api/profiler/status'),

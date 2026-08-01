@@ -12,6 +12,7 @@ namespace vpipe {
 namespace genai {
 
 class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 
 // FLUX.2 VAE (AutoencoderKLFlux2), run in f16 on the metal-compute backend. A
 // standard diffusers 2D AutoencoderKL (GroupNorm-32 + SiLU ResnetBlock2D conv
@@ -22,6 +23,14 @@ class MetalLlamaWeights;   // fwd
 //     consumes is [128, H/16, W/16] (the DiT has patch_size 1, in_channels 128).
 //   * a BatchNorm2d over those 128 channels (running stats -> a per-channel
 //     affine) is the whitening; decode inverts it before unpatchifying.
+//
+// It ALSO serves the PLAIN diffusers `AutoencoderKL` -- the FLUX.1 VAE that
+// Boogu-Image uses -- which is the same conv trunk with the two wrappers turned
+// off: patch 1 (the latent IS [16, H/8, W/8]), no quant/post-quant 1x1 convs,
+// and a SCALAR whitening (z = (x - shift_factor) * scaling_factor) instead of
+// the BatchNorm. Both come straight off vae/config.json, so one code path
+// serves both: patch 1 makes the pixel-(un)shuffle an identity and the scalar
+// factors fold into the same per-channel affine the BatchNorm produces.
 //
 // Channel-last [H*W, C] activation layout (as Krea-2's VAE) so 3x3 convs are
 // im2col -> dense_gemm and 1x1/attention reuse the LM/vision kernels.
@@ -37,18 +46,44 @@ class MetalFlux2Vae {
     int block_out[4]    = {128, 256, 512, 512};
     int layers_per_block = 2;
     int norm_groups     = 32;
-    int patch           = 2;        // patch_size (per spatial dim)
+    int patch           = 2;        // patch_size (per spatial dim); 1 = plain
     float norm_eps      = 1e-6f;    // GroupNorm eps
+    // The plain AutoencoderKL can be built without the 1x1 moment convs
+    // (use_quant_conv / use_post_quant_conv false -- the FLUX.1 VAE Boogu
+    // uses); then encode/decode skip them entirely.
+    bool use_quant_conv      = true;
+    bool use_post_quant_conv = true;
+    // SCALAR latent whitening z = (x - shift) * scale. Used only when the
+    // checkpoint has no BatchNorm running stats (scale 0 = "not configured",
+    // which leaves the whitening to the bn tensors).
+    float shift_factor   = 0.0f;
+    float scaling_factor = 0.0f;
     // Channels the DiT sees = prod(patch)*latent_channels.
     int dit_channels() const { return patch * patch * latent_channels; }
   };
 
+  // Prefer the WeightSet overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second VAE over the
+  // same directory reuses these tensors instead of loading its own copy.
+  // The dir overload opens a PRIVATE set (tests, and callers with no
+  // session to ask).
   static std::unique_ptr<MetalFlux2Vae>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool with_encoder = false);
 
+  static std::unique_ptr<MetalFlux2Vae>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool with_encoder = false);
+
+  // Materialise the encoder half now, if it is not already loaded. The
+  // point of deferring it: a graph that never receives a reference image
+  // never calls this, so the encoder's weights are never read. Cheap and
+  // idempotent once loaded. False if the encoder cannot be loaded.
+  bool ensure_encoder();
+
   // Decode a latent [dit_channels, h16, w16] (the DiT-facing patchified+whitened
-  // latent) into an RGB image [3, h16*16, w16*16], channel-first, in [-1,1].
+  // latent) into an RGB image [3, h16*8*patch, w16*8*patch], channel-first, in
+  // [-1,1] (so 16x per cell at patch 2, 8x on the plain AutoencoderKL).
   // Empty on failure; *err set on an over-commit/allocation/GPU failure.
   metal_compute::SharedBuffer
   decode(const metal_compute::SharedBuffer& z, int h16, int w16,
@@ -57,7 +92,8 @@ class MetalFlux2Vae {
   std::size_t decode_peak_bytes(int h16, int w16) const noexcept;
 
   // Encode an RGB image [3, H, W] (channel-first, in [-1,1]) into the DiT-facing
-  // latent [dit_channels, H/16, W/16] (patchified + whitened posterior mode).
+  // latent [dit_channels, H/(8*patch), W/(8*patch)] (patchified + whitened
+  // posterior mode).
   metal_compute::SharedBuffer
   encode(const metal_compute::SharedBuffer& img, int H, int W);
   bool has_encoder() const { return _has_encoder; }
@@ -101,15 +137,23 @@ class MetalFlux2Vae {
     Conv down;            // downsamplers.0.conv (3x3 stride-2)
   };
 
-  Conv load_conv3x3_(const MetalLlamaWeights& w, const std::string& nm);
-  Conv load_conv1x1_(const MetalLlamaWeights& w, const std::string& nm);
-  GNorm load_gnorm_(const MetalLlamaWeights& w, const std::string& nm);
-  metal_compute::SharedBuffer load_vec_(const MetalLlamaWeights& w,
+  Conv load_conv3x3_(WeightSet& w, const std::string& nm);
+  Conv load_conv1x1_(WeightSet& w, const std::string& nm);
+  GNorm load_gnorm_(WeightSet& w, const std::string& nm);
+  metal_compute::SharedBuffer load_vec_(WeightSet& w,
                                         const std::string& nm);
-  bool load_resblock_(const MetalLlamaWeights& w, const std::string& pre,
+  bool load_resblock_(WeightSet& w, const std::string& pre,
                       ResBlock& rb, int cin, int cout);
-  Attn load_attn_(const MetalLlamaWeights& w, const std::string& pre, int dim);
-  bool load_encoder_(const MetalLlamaWeights& w);
+  Attn load_attn_(WeightSet& w, const std::string& pre, int dim);
+  bool load_encoder_(WeightSet& w);
+
+  // The checkpoint these weights come from, held for this model's whole
+  // life: the cached tensors are aliases into buffers it owns (and
+  // mapped ones alias its mmap), so it has to outlive them.
+  std::shared_ptr<WeightSet> _ws;
+  // Part the loaders currently attribute their tensors to; "" is the
+  // always-resident trunk, "encoder" the half release_part() can drop.
+  std::string _part;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

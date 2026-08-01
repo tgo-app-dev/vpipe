@@ -155,6 +155,21 @@ PreviewChannel::close()
   _cv.notify_all();
 }
 
+void
+PreviewChannel::reopen()
+{
+  std::lock_guard<std::mutex> lk(_mu);
+  _closed = false;
+  _config_json.clear();
+  _config_blob.reset();
+  _init_blob.reset();
+  _image_blob.reset();
+  _has_video = false;
+  _has_audio = false;
+  _width     = 0;
+  _height    = 0;
+}
+
 bool PreviewChannel::has_video() const noexcept
 {
   std::lock_guard<std::mutex> lk(_mu);

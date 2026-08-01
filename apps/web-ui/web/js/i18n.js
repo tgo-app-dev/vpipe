@@ -195,6 +195,73 @@ const STRINGS = {
   // ---- App shell ----
   'app.coming_soon':  ['Coming soon.', '即将推出。', '即將推出。'],
 
+  // ---- Phone shell (js/phone/) ----
+  'phone.menu':          ['Menu', '菜单', '選單'],
+  'phone.views':         ['Views', '视图', '檢視'],
+  'phone.preview':       ['Preview', '预览', '預覽'],
+  'phone.desktop_site':  ['Desktop layout', '桌面版界面', '桌面版介面'],
+  'phone.desktop_hint':  ['The full dashboard: profiler, database, '
+      + 'files, composer and pipeline editing.',
+      '完整控制台：性能分析、数据库、文件、自定义与流水线编辑。',
+      '完整儀表板：效能分析、資料庫、檔案、自訂與管線編輯。'],
+  'phone.desktop_confirm': ['It is built for a large screen and will be '
+      + 'hard to use here. The page reloads; come back with the '
+      + '"Phone layout" button in its top bar.',
+      '该界面为大屏幕设计，在手机上很难操作。页面将重新加载；'
+      + '可用其顶栏的“手机版界面”按钮返回。',
+      '該介面為大螢幕設計，在手機上很難操作。頁面將重新載入；'
+      + '可用其頂列的「手機版介面」按鈕返回。'],
+  'phone.desktop_switch': ['Switch', '切换', '切換'],
+  'phone.system':        ['System', '系统资源', '系統資源'],
+  'phone.sys_window':    ['Last {s} seconds · updated every second',
+      '最近 {s} 秒 · 每秒更新', '最近 {s} 秒 · 每秒更新'],
+  'phone.phone_layout':  ['Phone layout', '手机版界面', '手機版介面'],
+  'phone.pick_pipeline': ['Choose a pipeline', '选择流水线', '選擇管線'],
+  'phone.topology_note': ['Stage wiring is edited in the desktop layout.',
+      '流水线级的连线请在桌面版中编辑。',
+      '管線階段的連線請在桌面版中編輯。'],
+  'phone.more':          ['More actions', '更多操作', '更多操作'],
+  'phone.save_as':       ['Save as', '另存为', '另存為'],
+  'phone.busy_launch':   ['starting', '启动中', '啟動中'],
+  'phone.busy_pause':    ['pausing', '暂停中', '暫停中'],
+  'phone.busy_stop':     ['stopping', '停止中', '停止中'],
+  'phone.load_title':    ['Load pipeline', '加载流水线', '載入管線'],
+  'phone.loaded':        ['Loaded {id}', '已加载 {id}', '已載入 {id}'],
+  'phone.about':         ['About this stage', '流水线级说明', '階段說明'],
+  'phone.connections':   ['Connections', '连接', '連接'],
+  'phone.inputs':        ['Inputs', '输入端口', '輸入埠'],
+  'phone.outputs':       ['Outputs', '输出端口', '輸出埠'],
+  'phone.config':        ['Configuration', '配置', '配置'],
+  'phone.none':          ['none', '无', '無'],
+  'phone.unconnected':   ['not connected', '未连接', '未連接'],
+  'phone.no_config':     ['No configurable attributes',
+      '没有可配置的属性', '沒有可設定的屬性'],
+  'phone.stop_to_edit':  ['Stop the pipeline to edit its configuration.',
+      '停止流水线后才能编辑配置。', '停止管線後才能編輯設定。'],
+  'phone.cfg_default':   ['default ({v})', '默认（{v}）', '預設（{v}）'],
+  'phone.cfg_unset_title': ['Clear — use the stage default',
+      '清除 — 使用流水线级默认值', '清除 — 使用階段預設值'],
+  'phone.cfg_bad_json':  ['{key}: not valid JSON', '{key}：不是有效的 JSON',
+      '{key}：不是有效的 JSON'],
+  'phone.cfg_bad_number':['{key}: not a number', '{key}：不是数字',
+      '{key}：不是數字'],
+  'phone.cfg_applied':   ['{id} configuration applied', '{id} 配置已应用',
+      '{id} 設定已套用'],
+  'phone.cfg_apply_failed': ['Apply failed: {msg}', '应用失败：{msg}',
+      '套用失敗：{msg}'],
+  'phone.pick_path':     ['Choose a path', '选择路径', '選擇路徑'],
+  'phone.pick_model':    ['Choose a model', '选择模型', '選擇模型'],
+  'phone.no_models':     ['No installed models match this field.',
+      '没有符合此字段的已安装模型。', '沒有符合此欄位的已安裝模型。'],
+  'phone.no_preview':    ['This server offers no preview panel.',
+      '此服务器未提供预览面板。', '此伺服器未提供預覽面板。'],
+  'phone.back':          ['Back', '返回', '返回'],
+  'phone.open_raw':      ['Open original', '打开原文件', '開啟原始檔'],
+  'phone.no_preview_kind': ['No preview for this file type.',
+      '此文件类型无法预览。', '此檔案類型無法預覽。'],
+  'phone.text_truncated': ['Showing the first {shown} of {total}.',
+      '仅显示前 {shown}，共 {total}。', '僅顯示前 {shown}，共 {total}。'],
+
   // ---- Pipeline manager ----
   'pl.stages':         ['Stages', '阶段', '階段'],
   'pl.toolbox':        ['Toolbox', '工具箱', '工具箱'],
@@ -297,6 +364,14 @@ const STRINGS = {
       '从配置中省略此字段', '從配置中省略此欄位'],
   'pl.clear_omit':     ['clear (omit this field from the config)',
       '清除（从配置中省略此字段）', '清除（從配置中省略此欄位）'],
+  // Free-text fields are tri-state: omitted, present-but-empty, or a value.
+  // This placeholder marks the middle one -- the box looks empty either way,
+  // so it has to say which is being sent.
+  'pl.empty_value':    ['(empty value)', '（空值）', '（空值）'],
+  'pl.unset_type_value': ['unset (type a value to set it)',
+      '未设置（输入值以设置）', '未設定（輸入值以設定）'],
+  'pl.set_empty':      ['send an explicit empty value instead of omitting',
+      '发送显式空值而不是省略', '傳送顯式空值而非省略'],
   'pl.create_title':   ['Create Pipeline', '创建管线', '建立管線'],
   'pl.pipeline_id':    ['Pipeline id', '流水线 id', '管線 id'],
   'pl.id_required':    ['id required', '需要 id', '需要 id'],
@@ -538,7 +613,6 @@ const STRINGS = {
   'io.split_options':  ['Split / view options', '拆分 / 视图选项',
       '分割 / 檢視選項'],
   'io.hls':            ['HLS Video', 'HLS 视频', 'HLS 影片'],
-  'io.preview':        ['Live Preview', '实时预览', '即時預覽'],
   'io.session_log':    ['Session Log', '会话日志', '工作階段日誌'],
   'io.new_view':       ['New view', '新建视图', '新增檢視'],
   'io.add_view':       ['Add a view', '添加一个视图', '新增一個檢視'],
@@ -639,6 +713,18 @@ const STRINGS = {
       + 'Thinking toggle to view',
       '思考内容已隐藏——打开“思考过程”开关可查看',
       '思考內容已隱藏——開啟「思考過程」開關可檢視'],
+  'userio.interrupt':  ['Interrupt', '中断', '中斷'],
+  'userio.interrupt_title': ['Stop the work running right now (e.g. a '
+      + 'model’s reply) without ending the pipeline; whatever was '
+      + 'produced so far is kept',
+      '停止当前正在进行的工作（例如模型正在生成的回复），但不结束流水线；'
+      + '已生成的内容会保留',
+      '停止目前正在進行的工作（例如模型正在生成的回覆），但不結束管線；'
+      + '已產生的內容會保留'],
+  'userio.interrupted':['Interrupted {n} running task(s)',
+      '已中断 {n} 个正在运行的任务', '已中斷 {n} 個正在執行的工作'],
+  'userio.interrupt_idle': ['Nothing running to interrupt',
+      '当前没有可中断的任务', '目前沒有可中斷的工作'],
   'userio.markdown_title': ['Render console text as simple Markdown '
       + '(bold / italic / underline, headings, lists, code, tables)',
       '将控制台文本渲染为简单 Markdown'
@@ -667,43 +753,11 @@ const STRINGS = {
   'hls.load_failed':   ['hls.js failed to load', 'hls.js 加载失败',
       'hls.js 載入失敗'],
 
-  // ---- Live Preview view ----
-  'preview.select':    ['Select a preview stage', '选择一个预览阶段',
-      '選擇一個預覽階段'],
-  'preview.no_streams':['No active preview streams. Launch a pipeline with '
-      + 'a "preview" stage, then Refresh.',
-      '没有活动的预览流。请启动一个包含“preview”阶段的管线，然后刷新。',
-      '沒有作用中的預覽串流。請啟動一個包含「preview」階段的管線，'
-      + '然後重新整理。'],
-  'preview.no_stages': ['No "preview" stages in the loaded pipelines. Add '
-      + 'one to a pipeline, then Refresh.',
-      '已加载的管线中没有“preview”阶段。请先添加一个，然后刷新。',
-      '已載入的管線中沒有「preview」階段。請先新增一個，然後重新整理。'],
-  'preview.state_live':['live', '运行中', '運行中'],
-  'preview.waiting_title':['Waiting · {stage}', '等待 · {stage}',
-      '等待 · {stage}'],
-  'preview.waiting':   ['Waiting for {pipeline} / {stage} to start. It '
-      + 'connects automatically when the pipeline runs.',
-      '等待 {pipeline} / {stage} 启动。管线运行时将自动连接。',
-      '等待 {pipeline} / {stage} 啟動。管線執行時將自動連線。'],
-  'preview.list_failed':['Failed to list streams: {msg}',
-      '获取流列表失败：{msg}', '取得串流列表失敗：{msg}'],
-  'preview.playing':   ['Preview · {stage}', '预览 · {stage}',
-      '預覽 · {stage}'],
-  'preview.change_stream':['Change stream', '切换流', '切換串流'],
-  'preview.connecting':['Connecting…', '连接中…', '連線中…'],
-  'preview.reconnecting':['Reconnecting…', '重新连接中…', '重新連線中…'],
-  'preview.mse_error': ['Video playback error', '视频播放错误',
-      '視訊播放錯誤'],
-  'preview.unsupported':['This browser cannot play the preview (no Media '
-      + 'Source Extensions).',
-      '此浏览器无法播放预览（不支持 Media Source Extensions）。',
-      '此瀏覽器無法播放預覽（不支援 Media Source Extensions）。'],
-  'preview.audio_only':['Audio only', '仅音频', '僅音訊'],
-  'preview.zoom_out':  ['Zoom out', '缩小', '縮小'],
-  'preview.zoom_in':   ['Zoom in', '放大', '放大'],
-  'preview.actual_size':['Actual size', '实际大小', '實際大小'],
-  'preview.center':    ['Center', '居中', '置中'],
+  // ---- Stage-provided views (see stage-views.js) ----
+  // A view's own strings ship inside its module and are merged at load
+  // time; only the host's own failure message lives here.
+  'views.load_failed': ['Could not load the "{id}" view: {msg}',
+      '无法加载“{id}”视图：{msg}', '無法載入「{id}」檢視：{msg}'],
 
   // ---- Status bar ----
   'status.ane':          ['ANE', 'ANE', 'ANE'],
@@ -772,6 +826,8 @@ const STRINGS = {
   'stage.load-image.name':    ['Load Image', '加载图片', '載入影像'],
   'stage.save-image.name':    ['Save Image', '保存图片', '儲存影像'],
   'stage.preview.name':       ['Preview', '预览', '預覽'],
+  'stage.diffusion-sampler-select.name': ['Diffusion Sampler', '扩散采样器',
+                                          '擴散取樣器'],
   'stage.sampler-select.name': ['Sampler', '采样器', '取樣器'],
   'stage.scheduler-select.name': ['Scheduler', '噪声计划表', '雜訊排程器'],
   'stage.text-to-image.name': ['Text to Image', '文生图', '文生圖'],
@@ -865,11 +921,6 @@ const STRINGS = {
       + 'per-question turn (answer-format steer); empty disables',
       '添加到每个问题回合前的指令（用于引导答案格式）；留空则禁用。',
       '加在每個問題回合前的指令（用於引導答案格式）；留空則停用。'],
-  'cfg.realtime-vqa.sampler_temperature': ['softmax temperature; <= 0 forces '
-      + 'argmax', 'softmax 温度；<= 0 时强制取最大值（argmax）',
-      'softmax 溫度；<= 0 時強制取最大值（argmax）'],
-  'cfg.realtime-vqa.sampler_top_k': ['keep top-k logits; 0 = disabled',
-      '保留前 k 个 logits；0 = 禁用', '保留前 k 個 logits；0 = 停用'],
 
   // text-chat attribute help.
   'cfg.text-chat.hf_dir': ['model: a models-DB key (registered by model-fetch) '
@@ -890,9 +941,28 @@ const STRINGS = {
   'cfg.text-chat.disable_thinking': ['override chat-template thinking default',
       '覆盖聊天模板的思考（thinking）默认设置',
       '覆寫聊天範本的思考（thinking）預設設定'],
-  'cfg.text-chat.sampler': ['decode sampler knobs (temperature/top_k/top_p/...)',
-      '解码采样器参数（temperature/top_k/top_p/…）',
-      '解碼取樣器參數（temperature/top_k/top_p/…）'],
+  // sampler-select attribute help (the LLM token sampler; the diffusion
+  // integrator lives in diffusion-sampler-select).
+  'cfg.sampler-select.temperature': ['softmax temperature; <= 0 forces argmax '
+      + '(greedy)', 'softmax 温度；<= 0 时强制取最大值（贪心）',
+      'softmax 溫度；<= 0 時強制取最大值（貪婪）'],
+  'cfg.sampler-select.top_k': ['keep only the top-k logits; 0 = disabled',
+      '仅保留前 k 个 logits；0 = 禁用', '僅保留前 k 個 logits；0 = 停用'],
+  'cfg.sampler-select.top_p': ['nucleus sampling: smallest prefix summing to '
+      + 'p; 1.0 = disabled', '核采样：累积概率达到 p 的最短前缀；1.0 = 禁用',
+      '核取樣：累積機率達到 p 的最短前綴；1.0 = 停用'],
+  'cfg.sampler-select.min_p': ['drop tokens below min_p * max_prob; '
+      + '0 = disabled', '丢弃低于 min_p * 最大概率的 token；0 = 禁用',
+      '丟棄低於 min_p * 最大機率的 token；0 = 停用'],
+  'cfg.sampler-select.repetition_penalty': ['penalise already-seen tokens; '
+      + '1.0 = disabled', '对已出现的 token 施加惩罚；1.0 = 禁用',
+      '對已出現的 token 施加懲罰；1.0 = 停用'],
+  'cfg.sampler-select.presence_penalty': ['flat penalty on already-seen '
+      + 'tokens; 0.0 = disabled', '对已出现 token 的固定惩罚；0.0 = 禁用',
+      '對已出現 token 的固定懲罰；0.0 = 停用'],
+  'cfg.sampler-select.seed': ['sampling RNG seed; 0 = fresh non-deterministic '
+      + 'seed', '采样随机数种子；0 = 每次重新随机',
+      '取樣隨機數種子；0 = 每次重新隨機'],
 
   // Port help (seed: text-chat + realtime-vqa).
   'port.text-chat.user': ["FlexData string: the user's turn text",
@@ -909,6 +979,16 @@ const STRINGS = {
       + '+ frame/timestamp metadata',
       '每个已结束场景的 FlexData：问题 + 答案 + 帧/时间戳元数据',
       '每個已結束場景的 FlexData：問題 + 答案 + 幀/時間戳記中繼資料'],
+  'port.sampler-select.sampler': ['token-sampler spec for a text-chat, '
+      + 'visual-qa, realtime-vqa or text-to-speech stage to latch',
+      'token 采样器配置，供 text-chat / visual-qa / realtime-vqa / '
+      + 'text-to-speech 阶段锁存',
+      'token 取樣器組態，供 text-chat / visual-qa / realtime-vqa / '
+      + 'text-to-speech 階段鎖存'],
+  'port.text-chat.sampler': ['OPTIONAL token-sampler spec (sampler-select); '
+      + 'unwired = greedy decoding',
+      '可选的 token 采样器配置（sampler-select）；未连接 = 贪心解码',
+      '可選的 token 取樣器組態（sampler-select）；未連接 = 貪婪解碼'],
 };
 
 const TAGS = LOCALES.map((l) => l.tag);
@@ -968,6 +1048,20 @@ export function tOr(key, fallback) {
   const slot = SLOT[current] != null ? SLOT[current] : 0;
   const s = (row[slot] != null && row[slot] !== '') ? row[slot] : row[0];
   return (s != null && s !== '') ? s : fallback;
+}
+
+// Merge a message catalogue contributed at runtime, in the same
+// [en-us, zh-cn, zh-tw] tuple shape as STRINGS. This is how a
+// STAGE-PROVIDED view supplies its own text (see stage-views.js): its
+// strings ship inside the view module, next to the stage's C++, instead
+// of being copied into the catalogue above. Existing keys are NOT
+// overwritten, so a view can never redefine an app string.
+export function addStrings(table) {
+  if (!table || typeof table !== 'object') { return; }
+  for (const [key, row] of Object.entries(table)) {
+    if (!Array.isArray(row) || key in STRINGS) { continue; }
+    STRINGS[key] = row;
+  }
 }
 
 // Change the active locale; persists, sets <html lang>, and notifies

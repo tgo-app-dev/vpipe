@@ -25,14 +25,20 @@ import { mountProfiler } from './profiler.js';
 import { mountDatabase } from './database.js';
 import { mountFileBrowser } from './file-browser.js';
 import { mountUserIo } from './user-io.js';
-import { mountPreview } from './preview-video.js';
 import { mountHlsVideo } from './hls-video.js';
 import { mountLog } from './log.js';
+import { stageViewPanelTypes } from '../stage-views.js';
+import * as tree from './composer-tree.js';
 
 // ---- panel registry (extensible) ----------------------------------
 // mount(body, actions, config, ctx) -> cleanup | void. `ctx.onTitle(str)`
 // lets a panel rename its title bar; `config` is an opaque per-panel blob
 // that a view may read (and future views may serialize into).
+//
+// This list holds the APP's own views. Panels a STAGE provides (its
+// module embedded in libvpipe -- see stage-views.js) are discovered from
+// the backend and appended by registerStageViews() below, so a stage can
+// add a panel without this file changing.
 const PANEL_TYPES = [
   { type: 'pipelines', labelKey: 'nav.pipelines', icon: 'pipeline',
     mount: (b, a, cfg, ctx) => hostEditor(mountPipelineManager(b), ctx) },
@@ -60,22 +66,44 @@ const PANEL_TYPES = [
     mount: (b) => mountFileBrowser(b) },
   { type: 'text-io', labelKey: 'nav.io', icon: 'io',
     mount: (b, a) => mountUserIo(b, a) },
-  { type: 'preview', labelKey: 'io.preview', icon: 'video',
-    mount: (b, a, cfg, ctx) => mountPreview(b, a, {
-      onTitle: ctx.onTitle,
-      // Persisted (pipeline, stage) designation -- watched + auto-connected
-      // when it goes live; saved back to the panel config on change.
-      designation: cfg.designation,
-      onDesignate: (d) => { cfg.designation = d;
-        if (ctx.onConfigChange) { ctx.onConfigChange(); } },
-    }) },
   { type: 'hls', labelKey: 'io.hls', icon: 'video',
     mount: (b, a, cfg, ctx) => mountHlsVideo(b, a,
       { onTitle: ctx.onTitle, stream: cfg && cfg.stream }) },
   { type: 'log', labelKey: 'io.session_log', icon: 'log',
     mount: (b, a) => mountLog(b, a) },
+  // What a split produces: an empty pane offering the type chooser, exactly
+  // as the User I/O workspace does. `ctx.choose(type)` swaps this panel for
+  // a real one in the same slot. Hidden from the Add menu (`internal`) --
+  // an empty panel is only ever reached by splitting.
+  { type: 'empty', labelKey: 'io.new_view', icon: 'plus', internal: true,
+    mount: (b, a, cfg, ctx) => {
+      const grid = el('div', { class: 'cmp-empty-choices' });
+      for (const d of PANEL_TYPES) {
+        if (d.internal || d.needsPipeline) { continue; }
+        grid.append(el('button', { class: 'btn', type: 'button',
+          onclick: () => ctx.choose(d.type) },
+          makeIcon(d.icon, 'sm'), el('span', {}, t(d.labelKey))));
+      }
+      b.append(el('div', { class: 'cmp-empty-pane' },
+        el('div', { class: 'cmp-empty-title' }, t('io.add_view')), grid));
+    } },
 ];
 const typeDef = (type) => PANEL_TYPES.find((d) => d.type === type) || null;
+
+// Append the panels the STAGES registered. Discovery is kicked off at
+// module load and is awaited before the singleton is built, so a
+// restored layout referring to a stage-provided type (e.g. "preview")
+// resolves it -- and so the Add menu and the empty-pane chooser list
+// them alongside the app's own.
+const stageViewsReady = stageViewPanelTypes()
+  .then((types) => {
+    for (const d of types) {
+      if (!PANEL_TYPES.some((x) => x.type === d.type)) {
+        PANEL_TYPES.push(d);
+      }
+    }
+  })
+  .catch(() => { /* no backend views: the built-ins still work */ });
 
 // Register an editor panel's re-arm hook with the host (via ctx) and
 // return its cleanup, so the composer resumes the buffer-fullness overlay
@@ -112,22 +140,43 @@ function withExt(p, ext) {
 let singleton = null;
 
 export function mountComposer(container) {
-  if (!singleton) { singleton = build(); }
+  if (singleton) {
+    clear(container);
+    container.append(singleton.root);
+    singleton.onShow();
+    return;
+  }
+  // First mount: wait for the stage-provided panel types before building,
+  // so restoring a saved layout that uses one finds its definition
+  // instead of dropping the panel. Discovery is already in flight from
+  // module load, so on a local server this is imperceptible.
   clear(container);
-  container.append(singleton.root);
-  singleton.onShow();
+  stageViewsReady.then(() => {
+    // The user may have navigated to another view while we waited; that
+    // view mounted into this same container, so anything present now is
+    // someone else's. Build the singleton regardless (the next mount
+    // reuses it) but don't steal the container back.
+    if (!singleton) { singleton = build(); }
+    if (container.childElementCount > 0) { return; }
+    container.append(singleton.root);
+    singleton.onShow();
+  });
 }
 
 function build() {
   // ---- state ------------------------------------------------------
   const state = {
     floating: [],                       // panels in float mode
-    background: null,                   // the maximized panel, or null
+    // Every docked panel lives in a region TREE (see composer-tree.js), so
+    // any of them can be split either way instead of only along its strip.
+    // `center` is the area a MAXIMIZED panel fills -- treating it as a dock
+    // region is what makes a maximized panel splittable too.
     docks: {
-      left:   { size: 24, panels: [] }, // size = % perpendicular (of stage)
-      right:  { size: 24, panels: [] },
-      top:    { size: 30, panels: [] },
-      bottom: { size: 30, panels: [] },
+      left:   { size: 24, tree: null }, // size = % perpendicular (of stage)
+      right:  { size: 24, tree: null },
+      top:    { size: 30, tree: null },
+      bottom: { size: 30, tree: null },
+      center: { size: 0,  tree: null },
     },
     nextZ: 10,
     nextId: 1,
@@ -154,14 +203,25 @@ function build() {
     return el('button', { class: 'btn ghost mini', type: 'button' },
       makeIcon(icon, 'sm'), el('span', {}, t(labelKey)));
   }
+  const regionPanels = (r) => tree.panels(state.docks[r].tree);
   const hasPanels = () =>
-    state.floating.length > 0 || state.background !== null ||
-    SIDES.some((s) => state.docks[s].panels.length > 0);
+    state.floating.length > 0 ||
+    tree.REGIONS.some((r) => state.docks[r].tree !== null);
   function allPanels() {
-    const a = [...state.floating,
-      ...SIDES.flatMap((s) => state.docks[s].panels)];
-    if (state.background) { a.push(state.background); }
-    return a;
+    return [...state.floating,
+      ...tree.REGIONS.flatMap((r) => regionPanels(r))];
+  }
+  // A lone panel in `center` IS "maximized", and keeps the seamless
+  // background look; once it is split, its panes are ordinary docked panels.
+  function refreshModes() {
+    for (const r of tree.REGIONS) {
+      const solo = r === 'center' && tree.leafCount(state.docks[r].tree) === 1;
+      for (const p of regionPanels(r)) {
+        p.mode = solo ? 'bg' : 'dock';
+        p.region = r;
+        setMode(p);
+      }
+    }
   }
 
   function place(node, x, y, w, h, z) {
@@ -188,17 +248,14 @@ function build() {
     rafId = requestAnimationFrame(() => { rafId = 0; render(); });
   }
 
-  function layoutStrip(panels, dir, x, y, w, h) {
-    const total = panels.reduce(
-      (s, p) => s + Math.max(0.05, p.extent), 0) || 1;
-    let off = 0;
-    for (const p of panels) {
-      const frac = Math.max(0.05, p.extent) / total;
-      if (dir === 'v') {
-        const ph = frac * h; place(p.el, x, y + off, w, ph, 5); off += ph;
-      } else {
-        const pw = frac * w; place(p.el, x + off, y, pw, h, 5); off += pw;
-      }
+  // Place every panel of a region's tree inside `rect`. z 1 for a lone
+  // maximized panel (it sits behind everything), 5 for docked panes.
+  function layoutRegion(region, rect) {
+    const node = state.docks[region].tree;
+    if (!node || rect.w <= 0 || rect.h <= 0) { return; }
+    const z = (region === 'center' && tree.leafCount(node) === 1) ? 1 : 5;
+    for (const s of tree.layout(node, rect)) {
+      place(s.panel.el, s.x, s.y, s.w, s.h, z);
     }
   }
 
@@ -209,17 +266,18 @@ function build() {
     if (CW <= 0 || CH <= 0) { return; }
     const L = state.docks.left, R = state.docks.right;
     const T = state.docks.top, B = state.docks.bottom;
-    const lw = L.panels.length ? clamp(L.size, 5, 85) / 100 * CW : 0;
-    const rw = R.panels.length ? clamp(R.size, 5, 85) / 100 * CW : 0;
-    const th = T.panels.length ? clamp(T.size, 5, 85) / 100 * CH : 0;
-    const bh = B.panels.length ? clamp(B.size, 5, 85) / 100 * CH : 0;
+    const has = (d) => d.tree !== null;
+    const lw = has(L) ? clamp(L.size, 5, 85) / 100 * CW : 0;
+    const rw = has(R) ? clamp(R.size, 5, 85) / 100 * CW : 0;
+    const th = has(T) ? clamp(T.size, 5, 85) / 100 * CH : 0;
+    const bh = has(B) ? clamp(B.size, 5, 85) / 100 * CH : 0;
     const cx = lw, cy = th;
     const cw = Math.max(0, CW - lw - rw), ch = Math.max(0, CH - th - bh);
-    if (state.background) { place(state.background.el, cx, cy, cw, ch, 1); }
-    layoutStrip(L.panels, 'v', 0, 0, lw, CH);
-    layoutStrip(R.panels, 'v', CW - rw, 0, rw, CH);
-    layoutStrip(T.panels, 'h', lw, 0, cw, th);
-    layoutStrip(B.panels, 'h', lw, CH - bh, cw, bh);
+    layoutRegion('center', { x: cx, y: cy, w: cw, h: ch });
+    layoutRegion('left',   { x: 0, y: 0, w: lw, h: CH });
+    layoutRegion('right',  { x: CW - rw, y: 0, w: rw, h: CH });
+    layoutRegion('top',    { x: lw, y: 0, w: cw, h: th });
+    layoutRegion('bottom', { x: lw, y: CH - bh, w: cw, h: bh });
     // Renumber floating z-indices into a compact band starting at FLOAT_Z,
     // preserving stacking order (sort on the running z, then reassign). This
     // keeps them safely below the menu / modal layer (ctx-menu z=60) so a
@@ -252,29 +310,55 @@ function build() {
     clear(handles);
     const L = state.docks.left, R = state.docks.right;
     const T = state.docks.top, B = state.docks.bottom;
-    if (L.panels.length) {
+    if (L.tree) {
       edgeHandle('v', m.lw, 0, CH,
         (e, r) => { L.size = clamp((e.clientX - r.left) / r.width * 100,
           5, 85); scheduleRender(); });
-      dividers(L.panels, 'v', 0, 0, m.lw, CH);
     }
-    if (R.panels.length) {
+    if (R.tree) {
       edgeHandle('v', CW - m.rw, 0, CH,
         (e, r) => { R.size = clamp((r.right - e.clientX) / r.width * 100,
           5, 85); scheduleRender(); });
-      dividers(R.panels, 'v', CW - m.rw, 0, m.rw, CH);
     }
-    if (T.panels.length) {
+    if (T.tree) {
       edgeHandle('h', m.th, m.lw, m.cw,
         (e, r) => { T.size = clamp((e.clientY - r.top) / r.height * 100,
           5, 85); scheduleRender(); });
-      dividers(T.panels, 'h', m.lw, 0, m.cw, m.th);
     }
-    if (B.panels.length) {
+    if (B.tree) {
       edgeHandle('h', CH - m.bh, m.lw, m.cw,
         (e, r) => { B.size = clamp((r.bottom - e.clientY) / r.height * 100,
           5, 85); scheduleRender(); });
-      dividers(B.panels, 'h', m.lw, CH - m.bh, m.cw, m.bh);
+    }
+    treeDividers('center', { x: m.cx, y: m.cy, w: m.cw, h: m.ch });
+    treeDividers('left',   { x: 0, y: 0, w: m.lw, h: CH });
+    treeDividers('right',  { x: CW - m.rw, y: 0, w: m.rw, h: CH });
+    treeDividers('top',    { x: m.lw, y: 0, w: m.cw, h: m.th });
+    treeDividers('bottom', { x: m.lw, y: CH - m.bh, w: m.cw, h: m.bh });
+  }
+
+  // One draggable divider per split node of a region's tree. Dragging shifts
+  // that split's ratio only, so neighbouring splits stay put.
+  function treeDividers(region, rect) {
+    const node = state.docks[region].tree;
+    if (!node || rect.w <= 0 || rect.h <= 0) { return; }
+    for (const d of tree.dividers(node, rect)) {
+      const hd = el('div', { class: 'cmp-div cmp-div-' + d.dir });
+      if (d.dir === 'v') { place(hd, d.x - 3, d.y, 6, d.h, 40); }
+      else               { place(hd, d.x, d.y - 3, d.w, 6, 40); }
+      hd.addEventListener('pointerdown', (ev) => {
+        ev.preventDefault();
+        const n = d.node;
+        const r0 = typeof n.ratio === 'number' ? n.ratio : 0.5;
+        const s0 = d.dir === 'v' ? ev.clientX : ev.clientY;
+        const span = d.span || 1;
+        drag((e) => {
+          const cur = d.dir === 'v' ? e.clientX : e.clientY;
+          n.ratio = clamp(r0 + (cur - s0) / span, 0.05, 0.95);
+          scheduleRender();
+        });
+      });
+      handles.append(hd);
     }
   }
 
@@ -290,35 +374,6 @@ function build() {
       drag((e) => onDrag(e, r));
     });
     handles.append(h);
-  }
-
-  // Dividers between adjacent panels of a strip (resize the along-side
-  // split by shifting weight between the two neighbours).
-  function dividers(panels, dir, x, y, w, h) {
-    const total = panels.reduce(
-      (s, p) => s + Math.max(0.05, p.extent), 0) || 1;
-    let off = 0;
-    for (let i = 0; i < panels.length - 1; i++) {
-      const a = panels[i], b = panels[i + 1];
-      off += Math.max(0.05, a.extent) / total * (dir === 'v' ? h : w);
-      const hd = el('div', { class: 'cmp-div cmp-div-' + dir });
-      if (dir === 'v') { place(hd, x, y + off - 3, w, 6, 40); }
-      else { place(hd, x + off - 3, y, 6, h, 40); }
-      hd.addEventListener('pointerdown', (ev) => {
-        ev.preventDefault();
-        const sa = a.extent, sb = b.extent;
-        const s0 = dir === 'v' ? ev.clientY : ev.clientX;
-        const span = dir === 'v' ? h : w;
-        drag((e) => {
-          const d = ((dir === 'v' ? e.clientY : e.clientX) - s0)
-            / span * total;
-          a.extent = Math.max(0.05, sa + d);
-          b.extent = Math.max(0.05, sb - d);
-          scheduleRender();
-        });
-      });
-      handles.append(hd);
-    }
   }
 
   // ---- panel lifecycle --------------------------------------------
@@ -343,8 +398,8 @@ function build() {
 
     const p = { id, type, title: title || null, config: config || {},
       el: panelEl, bodyEl: body, titleEl, actions, cleanup: null,
-      mode: 'float', side: null,
-      x: 12, y: 10, w: 46, h: 56, z: state.nextZ++, extent: 1 };
+      mode: 'float', region: null,
+      x: 12, y: 10, w: 46, h: 56, z: state.nextZ++ };
 
     const ctx = { onTitle: (txt) => { titleEl.textContent = txt; },
       // Like onTitle, but ALSO persists the new name as the panel title
@@ -354,7 +409,10 @@ function build() {
       onConfigChange: () => persist(),
       // An editor panel registers a re-arm hook (see hostEditor); the
       // composer calls it when this view is shown again after a switch.
-      registerShow: (fn) => { p.onShow = fn; } };
+      registerShow: (fn) => { p.onShow = fn; },
+      // An empty pane picking its view: swap this panel for the chosen type
+      // in the same tree slot.
+      choose: (type) => replacePanel(p, type) };
     try {
       p.cleanup = def.mount(body, actions, p.config, ctx) || null;
     } catch (e) {
@@ -393,11 +451,12 @@ function build() {
   function detach(p) {
     const i = state.floating.indexOf(p);
     if (i >= 0) { state.floating.splice(i, 1); }
-    for (const s of SIDES) {
-      const j = state.docks[s].panels.indexOf(p);
-      if (j >= 0) { state.docks[s].panels.splice(j, 1); }
+    for (const r of tree.REGIONS) {
+      const d = state.docks[r];
+      if (d.tree && tree.findLeaf(d.tree, p)) {
+        d.tree = tree.removeLeaf(d.tree, p);
+      }
     }
-    if (state.background === p) { state.background = null; }
   }
   function assignFloatDefaults(p) {
     const n = state.floating.length;
@@ -406,43 +465,78 @@ function build() {
     p.w = 46; p.h = 56; p.z = state.nextZ++;
   }
   function toFloat(p) {
-    detach(p); p.mode = 'float'; setMode(p);
+    detach(p); p.mode = 'float'; p.region = null; setMode(p);
     assignFloatDefaults(p); state.floating.push(p);
+    // Leaving a region can change what its survivors look like -- the last
+    // panel in `center` goes back to the seamless maximized style.
+    refreshModes();
     render(); persist();
   }
-  function toDock(p, side) {
-    detach(p); p.mode = 'dock'; p.side = side; setMode(p);
-    if (!(p.extent > 0)) { p.extent = 1; }
-    state.docks[side].panels.push(p);
-    render(); persist();
-  }
-  function toBg(p) {
-    const prev = state.background;
+  // Dock into a region, appending along that region's natural direction --
+  // the placement the old flat strip gave. `center` is a region like any
+  // other, so this is also how a panel is maximized.
+  function toDock(p, region) {
     detach(p);
-    if (prev && prev !== p) {
-      prev.mode = 'float'; setMode(prev);
-      assignFloatDefaults(prev); state.floating.push(prev);
+    const d = state.docks[region];
+    d.tree = tree.appendLeaf(d.tree, p, tree.defaultDir(region));
+    refreshModes();
+    render(); persist();
+  }
+  const toBg = (p) => toDock(p, 'center');
+
+  // Split a DOCKED panel, putting a new empty pane beside it. `dir` names
+  // the divider, as in the User I/O workspace: 'v' side by side, 'h'
+  // stacked. The empty pane offers the panel-type chooser.
+  function splitPanel(p, dir) {
+    const region = p.region;
+    const d = region && state.docks[region];
+    if (!d || !d.tree || !tree.findLeaf(d.tree, p)) { return; }
+    const np = createPanel('empty', {}, null);
+    if (!np) { return; }
+    d.tree = tree.splitAt(d.tree, p, dir, np);
+    refreshModes();
+    render(); persist();
+  }
+
+  // Replace an existing panel's view in place, keeping its slot in the tree
+  // -- how an empty pane becomes a real one after the chooser is used.
+  function replacePanel(p, type) {
+    const np = createPanel(type, {}, null);
+    if (!np) { return; }
+    let swapped = false;
+    for (const r of tree.REGIONS) {
+      const leaf = state.docks[r].tree
+          && tree.findLeaf(state.docks[r].tree, p);
+      if (leaf) { leaf.panel = np; swapped = true; break; }
     }
-    p.mode = 'bg'; setMode(p); state.background = p;
+    if (!swapped) {
+      const i = state.floating.indexOf(p);
+      if (i >= 0) {
+        state.floating[i] = np;
+        np.x = p.x; np.y = p.y; np.w = p.w; np.h = p.h;
+        swapped = true;
+      }
+    }
+    if (!swapped) { removePanel(np); return; }
+    if (p.cleanup) { try { p.cleanup(); } catch (e) { /* ignore */ } }
+    p.el.remove();
+    refreshModes();
     render(); persist();
   }
   function removePanel(p) {
     detach(p);
     if (p.cleanup) { try { p.cleanup(); } catch (e) { /* ignore */ } }
     p.el.remove();
+    refreshModes();              // see toFloat
     render(); persist();
   }
   function clearAll() {
-    const all = [...state.floating,
-      ...SIDES.flatMap((s) => state.docks[s].panels)];
-    if (state.background) { all.push(state.background); }
-    for (const p of all) {
+    for (const p of allPanels()) {
       if (p.cleanup) { try { p.cleanup(); } catch (e) { /* ignore */ } }
       p.el.remove();
     }
     state.floating = [];
-    state.background = null;
-    for (const s of SIDES) { state.docks[s].panels = []; }
+    for (const r of tree.REGIONS) { state.docks[r].tree = null; }
   }
 
   function addFloating(type, config, title) {
@@ -482,6 +576,15 @@ function build() {
       onClick: () => toDock(p, 'top') });
     items.push({ label: t('composer.dock_bottom'),
       onClick: () => toDock(p, 'bottom') });
+    // Splitting applies to any DOCKED panel -- including a maximized one,
+    // which is simply the sole occupant of the `center` region.
+    if (p.mode !== 'float') {
+      items.push(null);
+      items.push({ label: t('io.split_v'),
+        onClick: () => splitPanel(p, 'v') });
+      items.push({ label: t('io.split_h'),
+        onClick: () => splitPanel(p, 'h') });
+    }
     items.push(null);
     if (p.mode === 'bg') {
       items.push({ label: t('composer.restore'), onClick: () => toFloat(p) });
@@ -519,20 +622,18 @@ function build() {
   // ---- serialize / persist ----------------------------------------
   const cfgOf = (p) => ({ type: p.type, title: p.title, config: p.config });
   function serialize() {
-    const norm = (panels) => {
-      const tot = panels.reduce(
-        (s, p) => s + Math.max(0.05, p.extent), 0) || 1;
-      return panels.map((p) => ({ ...cfgOf(p),
-        extent: +(Math.max(0.05, p.extent) / tot * 100).toFixed(2) }));
-    };
-    const dock = (d) => ({ size: +clamp(d.size, 5, 85).toFixed(2),
-      panels: norm(d.panels) });
+    // version 2: each dock region is a TREE (`tree`) rather than a flat
+    // `panels` array, and the maximized panel is the `center` region rather
+    // than a separate `background`. Version 1 layouts still LOAD -- see
+    // deserialize -- including any stored in a pipeline's `aux`.
+    const dock = (r) => ({ size: +clamp(state.docks[r].size, 5, 85).toFixed(2),
+      tree: tree.toJSON(state.docks[r].tree, cfgOf) });
     return {
-      version: 1,
+      version: 2,
       pipeline: state.pipeline || null,
-      background: state.background ? cfgOf(state.background) : null,
-      docks: { left: dock(state.docks.left), right: dock(state.docks.right),
-        top: dock(state.docks.top), bottom: dock(state.docks.bottom) },
+      docks: { left: dock('left'), right: dock('right'),
+        top: dock('top'), bottom: dock('bottom'),
+        center: { tree: tree.toJSON(state.docks.center.tree, cfgOf) } },
       floating: state.floating.map((p) => ({ ...cfgOf(p),
         x: +p.x.toFixed(2), y: +p.y.toFixed(2),
         w: +p.w.toFixed(2), h: +p.h.toFixed(2) })),
@@ -542,24 +643,26 @@ function build() {
     clearAll();
     if (!json || typeof json !== 'object') { render(); return; }
     state.pipeline = json.pipeline || null;
-    const mk = (sp) => sp && createPanel(sp.type, sp.config, sp.title);
+    const mk = (sp) => (sp ? createPanel(sp.type, sp.config, sp.title) : null);
+    // v1 `background` (a single maximized panel) becomes the center region.
     if (json.background) {
-      const p = mk(json.background);
-      if (p) { p.mode = 'bg'; setMode(p); state.background = p; }
+      state.docks.center.tree = tree.fromJSON(json.background, mk);
+    }
+    if (json.docks && json.docks.center) {
+      state.docks.center.tree =
+          tree.fromJSON(json.docks.center.tree, mk) || state.docks.center.tree;
     }
     for (const s of SIDES) {
       const d = json.docks && json.docks[s];
       if (!d) { continue; }
       state.docks[s].size = clamp(Number(d.size) || 25, 5, 85);
-      for (const sp of (d.panels || [])) {
-        const p = mk(sp);
-        if (p) {
-          p.mode = 'dock'; p.side = s; setMode(p);
-          p.extent = Math.max(0.05, Number(sp.extent) || 1);
-          state.docks[s].panels.push(p);
-        }
-      }
+      // v2 tree, else fold a v1 flat strip into one along the region's
+      // natural direction, preserving the saved extent weights.
+      state.docks[s].tree = d.tree
+          ? tree.fromJSON(d.tree, mk)
+          : tree.fromLegacy(d.panels, tree.defaultDir(s), mk);
     }
+    refreshModes();
     for (const sp of (json.floating || [])) {
       const p = mk(sp);
       if (p) {
@@ -590,8 +693,10 @@ function build() {
   // ---- toolbar actions --------------------------------------------
   addBtn.addEventListener('click', () => {
     const r = addBtn.getBoundingClientRect();
-    openMenu(r.left, r.bottom + 4, PANEL_TYPES.map((d) => ({
-      label: t(d.labelKey), onClick: () => addPanel(d.type) })));
+    openMenu(r.left, r.bottom + 4, PANEL_TYPES
+      .filter((d) => !d.internal)
+      .map((d) => ({
+        label: t(d.labelKey), onClick: () => addPanel(d.type) })));
   });
   saveBtn.addEventListener('click', () => {
     const r = saveBtn.getBoundingClientRect();

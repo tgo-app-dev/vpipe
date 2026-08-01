@@ -54,6 +54,10 @@ ComputeEncoder::ComputeEncoder(ComputeEncoder&& o) noexcept
     _split_every(std::exchange(o._split_every, 0)),
     _since_split(std::exchange(o._since_split, 0)),
     _scope_depth(std::exchange(o._scope_depth, 0)),
+    _state_dirty(std::exchange(o._state_dirty, false)),
+    _pending(std::move(o._pending)),
+    _pending_bytes(std::move(o._pending_bytes)),
+    _pending_pso(std::exchange(o._pending_pso, nullptr)),
     _dt(o._dt)
 {
 }
@@ -65,14 +69,18 @@ ComputeEncoder::operator=(ComputeEncoder&& o) noexcept
     return *this;
   }
   end();
-  _enc          = std::exchange(o._enc, nullptr);
-  _cb           = std::exchange(o._cb, nullptr);
-  _n_dispatch   = std::exchange(o._n_dispatch, 0);
-  _stream       = std::exchange(o._stream, nullptr);
-  _split_every  = std::exchange(o._split_every, 0);
-  _since_split  = std::exchange(o._since_split, 0);
-  _scope_depth  = std::exchange(o._scope_depth, 0);
-  _dt           = o._dt;
+  _enc           = std::exchange(o._enc, nullptr);
+  _cb            = std::exchange(o._cb, nullptr);
+  _n_dispatch    = std::exchange(o._n_dispatch, 0);
+  _stream        = std::exchange(o._stream, nullptr);
+  _split_every   = std::exchange(o._split_every, 0);
+  _since_split   = std::exchange(o._since_split, 0);
+  _scope_depth   = std::exchange(o._scope_depth, 0);
+  _state_dirty   = std::exchange(o._state_dirty, false);
+  _pending       = std::move(o._pending);
+  _pending_bytes = std::move(o._pending_bytes);
+  _pending_pso   = std::exchange(o._pending_pso, nullptr);
+  _dt            = o._dt;
   return *this;
 }
 
@@ -95,6 +103,42 @@ ComputeEncoder::reencode_(DispatchType dt)
   }
   _enc = e;
   pool->release();
+  // The retired encoder took the pending op's bindings with it. A scope
+  // boundary is not deferrable (see the header), so re-bind them here.
+  replay_pending_();
+}
+
+void
+ComputeEncoder::replay_pending_()
+{
+  if (_enc == nullptr) {
+    return;
+  }
+  if (_pending_pso != nullptr) {
+    _enc->setComputePipelineState(_pending_pso);
+  }
+  for (const Pending& p : _pending) {
+    switch (p.kind) {
+      case PendKind::Buffer:
+        _enc->setBuffer(p.buf,
+                        static_cast<NS::UInteger>(p.off),
+                        static_cast<NS::UInteger>(p.index));
+        break;
+      case PendKind::Bytes:
+        _enc->setBytes(_pending_bytes.data() + p.bytes_off,
+                       static_cast<NS::UInteger>(p.bytes_len),
+                       static_cast<NS::UInteger>(p.index));
+        break;
+      case PendKind::Texture:
+        _enc->setTexture(p.tex, static_cast<NS::UInteger>(p.index));
+        break;
+      case PendKind::TgMem:
+        _enc->setThreadgroupMemoryLength(
+            static_cast<NS::UInteger>(p.off),
+            static_cast<NS::UInteger>(p.index));
+        break;
+    }
+  }
 }
 
 ComputeEncoder::ConcurrentScope::ConcurrentScope(ComputeEncoder* e,
@@ -146,13 +190,19 @@ ComputeEncoder::set_function(const ComputeFunction& fn)
   // reopen a fresh one, so the CPU-encode of the next chunk pipelines against
   // the GPU-exec of this one. Must be here (before the pipeline/buffers are set
   // on the encoder), NOT in dispatch() -- splitting mid-op would strand the
-  // just-set state on the old encoder. Deferred inside a concurrent_scope.
+  // just-set state on the old encoder. Deferred inside a concurrent_scope, and
+  // deferred again when state is already pending (_state_dirty): a call site
+  // that binds its buffers BEFORE naming its function reaches here mid-op, and
+  // splitting there would strand exactly the bindings it is about to dispatch
+  // with. Waiting for the next clean boundary costs a few dispatches of
+  // pipelining and nothing else.
   if (_split_every > 0 && _scope_depth == 0 && _stream != nullptr &&
-      _since_split >= _split_every) {
+      _since_split >= _split_every && !_state_dirty) {
     _stream->split_encoder_(*this);
     _since_split = 0;
   }
   _enc->setComputePipelineState(fn.mtl_pso());
+  _pending_pso = fn.mtl_pso();
 }
 
 void
@@ -165,6 +215,13 @@ ComputeEncoder::set_buffer(unsigned index, const SharedBuffer& buf,
   _enc->setBuffer(buf.mtl_buffer(),
                   static_cast<NS::UInteger>(byte_offset + buf.byte_offset()),
                   static_cast<NS::UInteger>(index));
+  _state_dirty = true;
+  Pending p;
+  p.kind  = PendKind::Buffer;
+  p.index = index;
+  p.buf   = buf.mtl_buffer();
+  p.off   = byte_offset + buf.byte_offset();
+  _pending.push_back(p);
 }
 
 void
@@ -177,6 +234,13 @@ ComputeEncoder::set_mtl_buffer(unsigned index, MTL::Buffer* buf,
   _enc->setBuffer(buf,
                   static_cast<NS::UInteger>(byte_offset),
                   static_cast<NS::UInteger>(index));
+  _state_dirty = true;
+  Pending p;
+  p.kind  = PendKind::Buffer;
+  p.index = index;
+  p.buf   = buf;
+  p.off   = byte_offset;
+  _pending.push_back(p);
 }
 
 void
@@ -194,6 +258,14 @@ ComputeEncoder::set_buffer_view(unsigned buf_index,
   _enc->setBuffer(buf.mtl_buffer(),
                   static_cast<NS::UInteger>(buf.byte_offset()),
                   static_cast<NS::UInteger>(buf_index));
+  {
+    Pending p;
+    p.kind  = PendKind::Buffer;
+    p.index = buf_index;
+    p.buf   = buf.mtl_buffer();
+    p.off   = buf.byte_offset();
+    _pending.push_back(p);
+  }
 
   const BufferView& v = buf.view();
   BufferViewWire wire{};
@@ -206,6 +278,22 @@ ComputeEncoder::set_buffer_view(unsigned buf_index,
   }
   _enc->setBytes(&wire, sizeof(wire),
                  static_cast<NS::UInteger>(meta_index));
+  _state_dirty = true;
+  record_bytes_(meta_index, &wire, sizeof(wire));
+}
+
+void
+ComputeEncoder::record_bytes_(unsigned index, const void* bytes,
+                              std::size_t size)
+{
+  Pending p;
+  p.kind      = PendKind::Bytes;
+  p.index     = index;
+  p.bytes_off = _pending_bytes.size();
+  p.bytes_len = size;
+  const auto* src = static_cast<const std::uint8_t*>(bytes);
+  _pending_bytes.insert(_pending_bytes.end(), src, src + size);
+  _pending.push_back(p);
 }
 
 void
@@ -219,6 +307,8 @@ ComputeEncoder::set_constant_bytes(unsigned index,
   _enc->setBytes(bytes,
                  static_cast<NS::UInteger>(size),
                  static_cast<NS::UInteger>(index));
+  _state_dirty = true;
+  record_bytes_(index, bytes, size);
 }
 
 void
@@ -231,6 +321,12 @@ ComputeEncoder::set_threadgroup_memory_length(unsigned index,
   _enc->setThreadgroupMemoryLength(
       static_cast<NS::UInteger>(byte_size),
       static_cast<NS::UInteger>(index));
+  _state_dirty = true;
+  Pending p;
+  p.kind  = PendKind::TgMem;
+  p.index = index;
+  p.off   = byte_size;
+  _pending.push_back(p);
 }
 
 void
@@ -241,6 +337,12 @@ ComputeEncoder::set_texture(unsigned index, const Texture& tex)
   }
   _enc->setTexture(tex.mtl_texture(),
                    static_cast<NS::UInteger>(index));
+  _state_dirty = true;
+  Pending p;
+  p.kind  = PendKind::Texture;
+  p.index = index;
+  p.tex   = tex.mtl_texture();
+  _pending.push_back(p);
 }
 
 void
@@ -298,6 +400,13 @@ ComputeEncoder::dispatch(LaunchDims threads_per_grid,
   }
   ++_n_dispatch;
   ++_since_split;
+  // Op complete -> the encoder is at a clean boundary and nothing is pending.
+  // clear() keeps both vectors' capacity, so steady-state encoding does not
+  // allocate.
+  _state_dirty = false;
+  _pending.clear();
+  _pending_bytes.clear();
+  _pending_pso = nullptr;
   MTL::Size grid(
       static_cast<NS::UInteger>(threads_per_grid.x),
       static_cast<NS::UInteger>(threads_per_grid.y),

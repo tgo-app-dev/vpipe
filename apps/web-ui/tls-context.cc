@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <poll.h>
 #include <sys/stat.h>
 
 #include <openssl/err.h>
@@ -202,6 +204,26 @@ public:
       // SYSCALL with r==0 is an unexpected EOF (peer vanished): treat as
       // close. Anything else is a hard error.
       return (e == SSL_ERROR_SYSCALL && r == 0) ? 0 : -1;
+    }
+  }
+
+  // Readable when OpenSSL already holds decrypted bytes (SSL_pending)
+  // or the socket has more to feed it. Checking SSL_pending first
+  // matters: a record can be fully buffered inside the SSL object with
+  // nothing left on the wire, and polling the fd alone would then wait
+  // out the whole timeout on data that is already here.
+  bool
+  poll_readable(int timeout_ms) override
+  {
+    if (SSL_pending(_ssl) > 0) { return true; }
+    struct pollfd p{};
+    p.fd     = SSL_get_fd(_ssl);
+    p.events = POLLIN;
+    if (p.fd < 0) { return false; }
+    for (;;) {
+      int r = ::poll(&p, 1, timeout_ms);
+      if (r < 0 && errno == EINTR) { continue; }
+      return r > 0;
     }
   }
 

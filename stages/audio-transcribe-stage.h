@@ -38,10 +38,10 @@ namespace vpipe {
 //           Sample rate is read from sideband.sample_rate when
 //           present, otherwise from the `sample_rate` config below.
 //
-//           BLOCK MODE (one iport wired, default): each incoming beat
+//           BLOCK MODE (iport1 unwired, the default): each incoming beat
 //           is treated as ONE complete audio clip to transcribe.
 //
-//           STREAMING MODE (two iports wired): PCM frames are buffered
+//           STREAMING MODE (iport1 wired): PCM frames are buffered
 //           into a rolling timestamp-indexed window of length
 //           `pcm_buffer_s`. The stage waits for segment markers on
 //           iport1; when one arrives it slices [start_us, end_us) out
@@ -57,6 +57,13 @@ namespace vpipe {
 //           carries `start_us`, `end_us`, `index`, and `is_partial`; on
 //           arrival the stage slices the PCM in [start_us, end_us) from its
 //           rolling buffer and transcribes it.
+//
+//   iport2  (OPTIONAL) FlexDataPayload token-sampler spec from a
+//           `sampler-select` stage. Latched on the first beat and reused for
+//           every later clip. Unwired => greedy (argmax) decoding, which is
+//           what transcription wants and what this stage has always done by
+//           default. Wiring it does NOT flip streaming mode on -- that is
+//           iport1's job, checked by slot.
 //
 //   oport0  (OPTIONAL) FlexDataPayload carrying the recognized transcript as
 //           an object {text, start_us, end_us}. `text` is the decoded string;
@@ -117,35 +124,12 @@ namespace vpipe {
 //                                                 false, transcribe the
 //                                                 available tail of the
 //                                                 segment instead.
-//   sampler         (object, optional)         -- decode-side sampler
-//                                                 knobs. Same schema as
-//                                                 visual-qa / realtime-
-//                                                 vqa / text-chat
-//                                                 (parsed via
-//                                                 genai::parse_sampler_
-//                                                 config). Recognised
-//                                                 keys (all optional):
-//                                                   temperature        (real, default 1.0)
-//                                                   top_k              (int,  default 0)
-//                                                   top_p              (real, default 1.0)
-//                                                   min_p              (real, default 0.0)
-//                                                   repetition_penalty (real, default 1.0)
-//                                                   presence_penalty   (real, default 0.0)
-//                                                   seed               (uint, default 0 = non-deterministic)
-//                                                 With every field at
-//                                                 default the stage
-//                                                 routes through the
-//                                                 fast pipelined argmax
-//                                                 path; ANY non-default
-//                                                 knob switches to the
-//                                                 sampled path
-//                                                 (sync next_token +
-//                                                 host-pull logits +
-//                                                 Sampler::sample). The
-//                                                 per-clip INFO log
-//                                                 tags " [sampled]" so
-//                                                 the active path is
-//                                                 visible at runtime.
+//
+// Sampling is NOT config: it comes from a `sampler-select` stage on iport2
+// (above). Unwired, the stage routes through the fast pipelined argmax path;
+// a spec with ANY non-default knob switches it to the sampled path (sync
+// next_token + host-pull logits + Sampler::sample). The per-clip INFO log
+// tags " [sampled]" so the active path is visible at runtime.
 class AudioTranscribeStage final
     : public TypedStage<AudioTranscribeStage> {
 public:
@@ -158,6 +142,12 @@ public:
   ~AudioTranscribeStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // The LM this stage holds. Declared before any stage initializes so
+  // the diffusion stages -- which cannot see it from their own config --
+  // size the box against it. See Stage::declare_models.
+  std::vector<std::string> declare_models() const override;
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 
@@ -235,8 +225,9 @@ private:
   std::vector<float> _pcm_buf;
   std::uint64_t      _pcm_base_us  = 0;
   bool               _pcm_have_ts  = false;
-  // Latched at construction from iport_edges().size() >= 2. Fixed for
-  // the life of the stage.
+  // Latched at construction from a WIRED segment-marker iport1 SLOT (not
+  // from the port count -- the sampler iport2 sits after it). Fixed for the
+  // life of the stage.
   bool               _streaming    = false;
   std::uint64_t      _segments_seen         = 0;
   std::uint64_t      _segments_dropped_late = 0;
@@ -251,7 +242,11 @@ private:
   std::uint64_t         _cur_end_us   = 0;
   bool                  _cur_has_ts   = false;
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Token-sampler knobs, latched once off the OPTIONAL sampler iport2 (a
+  // `sampler-select` source). Defaults are argmax, so an unwired port keeps
+  // the greedy decoding transcription wants.
   genai::SamplerParams _sampler_params;
+  bool                 _sampler_latched = false;
   std::shared_ptr<genai::LoadedLanguageModel> _lm;
   bool _encoder_unavailable_warned = false;
 #endif

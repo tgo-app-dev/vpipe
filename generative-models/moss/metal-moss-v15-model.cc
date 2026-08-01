@@ -7,6 +7,7 @@
 #include "common/perf-scope.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <chrono>
 #include <cstdint>
@@ -35,12 +36,15 @@ std::uint16_t f32_to_bf16(float f)
   const std::uint32_t r = x + 0x7fffu + ((x >> 16) & 1u);   // round-to-nearest
   return (std::uint16_t)(r >> 16);
 }
-SharedBuffer load_bf16(const MetalLlamaWeights& wts, MetalCompute* mc,
+SharedBuffer load_bf16(WeightSet& wts, MetalCompute* mc,
                        const std::string& nm)
 {
-  const auto* info = wts.info(nm);
+  const auto* info = wts.src().info(nm);
   if (info == nullptr) { return {}; }
-  return wts.load(nm, mc);   // already bf16 in the checkpoint
+  // Already bf16 in the checkpoint: cache the bytes as they sit. Copied,
+  // not Mapped -- mapping wraps the whole shard, which the backbone
+  // below also reads, and it loads by copy.
+  return wts.tensor(nm, mc, WeightSet::Residency::Copied);
 }
 }  // namespace
 
@@ -48,23 +52,34 @@ std::unique_ptr<MetalMossV15Model>
 MetalMossV15Model::load(const std::string& quant_dir, MetalCompute* mc,
                         const Config& cfg)
 {
-  auto wts = MetalLlamaWeights::open_model(quant_dir);
-  if (!wts.has_value()) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(quant_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalMossV15Model>
+MetalMossV15Model::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
+                        const Config& cfg)
+{
+  if (ws == nullptr) { return nullptr; }
   auto self = std::make_unique<MetalMossV15Model>();
-  if (!self->init_(*wts, mc, cfg, quant_dir)) { return nullptr; }
+  if (!self->init_(ws, mc, cfg)) { return nullptr; }
   return self;
 }
 
 bool
-MetalMossV15Model::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
-                         const Config& cfg, const std::string& quant_dir)
+MetalMossV15Model::init_(const std::shared_ptr<WeightSet>& ws, MetalCompute* mc,
+                         const Config& cfg)
 {
+  _ws = ws;
+  WeightSet& wts = *ws;
   _mc = mc;
   _session = mc->session();
   _cfg = cfg;
-  _bb = MetalQwenModel::load(quant_dir, mc, cfg.backbone);
+  // Both from the SAME set: one checkpoint, opened once.
+  _bb = MetalQwenModel::load(ws, mc, cfg.backbone);
   if (!_bb) { return false; }
-  _lm = MetalMossLocalModel::load(quant_dir, mc, cfg.local);
+  _lm = MetalMossLocalModel::load(ws, mc, cfg.local);
   if (!_lm) { return false; }
 
   _text_embed = load_bf16(wts, mc, "transformer.embed_tokens.weight");
@@ -78,14 +93,23 @@ MetalMossV15Model::init_(const MetalLlamaWeights& wts, MetalCompute* mc,
   // local_text_lm_head is bf16 [2, hidden] -> f16.
   {
     const std::string nm = "local_text_lm_head.weight";
-    const auto* info = wts.info(nm);
-    SharedBuffer raw = wts.load(nm, mc);
-    if (info == nullptr || raw.empty()) { return false; }
+    const auto* info = wts.src().info(nm);
+    if (info == nullptr) { return false; }
     const std::size_t n = 2u * (std::size_t)cfg.local.lt.hidden;
-    _ltext_head = mc->make_shared_buffer(n * 2);
-    auto* d = static_cast<_Float16*>(_ltext_head.contents());
-    const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)bf16_to_f32(s[i]); }
+    _ltext_head = wts.derived("moss-v15/f16/" + nm, [&]() -> SharedBuffer {
+      // Uncached: consumed by the conversion and dropped.
+      SharedBuffer raw = wts.read(nm, mc, WeightSet::Residency::Copied);
+      if (raw.empty()) { return {}; }
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      if (out.empty()) { return out; }
+      auto* d = static_cast<_Float16*>(out.contents());
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = (_Float16)bf16_to_f32(s[i]);
+      }
+      return out;
+    });
+    if (_ltext_head.empty()) { return false; }
   }
 
   const int H = cfg.local.lt.hidden;

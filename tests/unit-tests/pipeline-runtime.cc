@@ -446,3 +446,144 @@ TEST(pipeline_runtime, no_process_before_all_initialize_returns) {
   EXPECT_TRUE(
     sink->observed.load(std::memory_order_acquire) == 3u);
 }
+
+// ---------------------------------------------------------------------------
+// A malformed graph must FAIL THIS PIPELINE, not the process.
+//
+// The build steps report faults by throwing (a payload type mismatch between
+// two wired ports being the one users hit, from a hand-written .vpipeline or
+// an edited layout). An escaping exception reaches std::terminate and aborts
+// the host -- for the web-ui, every other pipeline and the operator's session
+// with it. launch() therefore catches, warns, and returns false.
+
+namespace {
+
+// Two stages whose declared payload types cannot be wired together: the
+// source emits UintPayload, the sink demands a different type.
+class TypedSourceStage final : public vpipe::TypedStage<TypedSourceStage> {
+public:
+  static constexpr const char* kTypeName = "ut-typed-source";
+  TypedSourceStage(const vpipe::SessionContextIntf* s, std::string id,
+                   std::vector<vpipe::InEdge> in, vpipe::FlexData cfg)
+    : TypedStage<TypedSourceStage>(s, std::move(id), std::move(in),
+                                   std::move(cfg))
+  { allocate_oports(spec().oports.size()); }
+  vpipe::Job process(vpipe::RuntimeContext& ctx) override {
+    ctx.signal_done();
+    co_return;
+  }
+  const vpipe::StageSpec& spec() const noexcept override;
+};
+const vpipe::PortSpec kTsOports[] = {
+  {.name = "out", .doc = "uint", .type = &typeid(vpipe::test::UintPayload),
+   .clock_group = 0},
+};
+const vpipe::StageSpec kTsSpec = {
+  .type_name = "ut-typed-source",
+  .doc = "test source with a typed oport",
+  .oports = kTsOports,
+};
+const vpipe::StageSpec& TypedSourceStage::spec() const noexcept
+{ return kTsSpec; }
+VPIPE_REGISTER_STAGE(TypedSourceStage)
+VPIPE_REGISTER_SPEC(TypedSourceStage, kTsSpec)
+
+class TypedSinkStage final : public vpipe::TypedStage<TypedSinkStage> {
+public:
+  static constexpr const char* kTypeName = "ut-typed-sink";
+  TypedSinkStage(const vpipe::SessionContextIntf* s, std::string id,
+                 std::vector<vpipe::InEdge> in, vpipe::FlexData cfg)
+    : TypedStage<TypedSinkStage>(s, std::move(id), std::move(in),
+                                 std::move(cfg)) {}
+  vpipe::Job process(vpipe::RuntimeContext& ctx) override {
+    auto b = co_await ctx.read(0);
+    if (!b) { ctx.signal_done(); }
+  }
+  const vpipe::StageSpec& spec() const noexcept override;
+};
+const vpipe::PortSpec kTkIports[] = {
+  // IntPayload, NOT the source's UintPayload -- distinct types.
+  {.name = "in", .doc = "a DIFFERENT payload type",
+   .type = &typeid(vpipe::test::IntPayload), .clock_group = 0},
+};
+const vpipe::StageSpec kTkSpec = {
+  .type_name = "ut-typed-sink",
+  .doc = "test sink whose iport type cannot accept the source's",
+  .iports = kTkIports,
+};
+const vpipe::StageSpec& TypedSinkStage::spec() const noexcept
+{ return kTkSpec; }
+VPIPE_REGISTER_STAGE(TypedSinkStage)
+VPIPE_REGISTER_SPEC(TypedSinkStage, kTkSpec)
+
+}  // namespace
+
+TEST(pipeline_runtime, type_mismatch_fails_launch_without_throwing) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("mistyped", &sess);
+  auto src_u = std::make_unique<TypedSourceStage>(
+      &sess, "src", std::vector<vpipe::InEdge>{},
+      vpipe::FlexData::make_object());
+  auto* src = pl->insert_stage(std::move(src_u));
+  auto sink_u = std::make_unique<TypedSinkStage>(
+      &sess, "sink", std::vector<vpipe::InEdge>{{src, 0}},
+      vpipe::FlexData::make_object());
+  pl->insert_stage(std::move(sink_u));
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  bool threw = false;
+  bool launched = true;
+  try {
+    launched = rt.launch();
+  } catch (...) {
+    threw = true;          // the old behaviour: straight to std::terminate
+  }
+  EXPECT_FALSE(threw);
+  EXPECT_FALSE(launched);
+  // A failed launch must leave nothing running, so stop()/destruction is safe
+  // and the operator can fix the wiring and try again.
+  rt.stop();
+}
+
+// A stage that reads an iport it does NOT have must see EOS, not crash.
+//
+// `vpipe --launch-stage video-to-rgb` builds a one-stage pipeline with no
+// edges at all, so the stage has ZERO iports while its process() still does
+// `co_await ctx.read(0)`. That indexed past the end of the reader vector and
+// dereferenced garbage -- SIGSEGV, taking the whole host down (video-to-rgb,
+// audio-to-pcm and temporal-decimation all did it). An absent port now reads
+// as permanent EOS, exactly like a declared-but-unwired one, so the stage's
+// ordinary `if (!beat) { signal_done(); }` path retires it.
+TEST(pipeline_runtime, reading_an_absent_iport_reads_eos) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("no-inputs", &sess);
+  // CollectingSink declares no ports of its own and is wired to nothing, so
+  // its process() reads iport 0 on a context with an EMPTY reader list.
+  auto sink_u = std::make_unique<CollectingSink>(
+      &sess, "sink", std::vector<vpipe::InEdge>{},
+      vpipe::FlexData::make_object());
+  auto* sink = static_cast<CollectingSink*>(
+      pl->insert_stage(std::move(sink_u)));
+  ASSERT_TRUE(sink != nullptr);
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());        // launching is fine; the read is the bug
+  rt.wait_idle();
+  rt.stop();
+  // Reached EOS immediately and consumed nothing, rather than faulting.
+  std::lock_guard<std::mutex> lk(sink->mu);
+  EXPECT_TRUE(sink->received.empty());
+}
+
+// The same guard on the peek/window path, which stages like
+// temporal-decimation use instead of read().
+TEST(pipeline_runtime, peeking_an_absent_iport_reads_eos) {
+  vpipe::Session sess;
+  vpipe::RuntimeContext ctx({}, {}, nullptr);
+  EXPECT_TRUE(ctx.num_iports() == 0u);
+  EXPECT_FALSE(ctx.iport_connected(0));
+  // Out-of-range queries answer as a finished port instead of faulting.
+  EXPECT_TRUE(ctx.eos(0));
+  EXPECT_TRUE(ctx.backlog(0) == 0u);
+  ctx.release_read(0, 1);          // must be a no-op, not a crash
+}

@@ -77,6 +77,60 @@ public:
   virtual Job process   (RuntimeContext& ctx) = 0;
   virtual Job drain     (RuntimeContext& ctx);
 
+  // Called by the runtime at the start of EVERY launch, before
+  // initialize(), on every stage -- including one whose config failed
+  // validation, so a stage that will sit out this run still clears
+  // what the last one left.
+  //
+  // WHY THIS EXISTS. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage. A stage
+  // object therefore sees many launches, and any member that means
+  // "something that happened during THIS run" is wrong on the second
+  // one unless it is cleared. That has bitten repeatedly and in ways
+  // that fail silently rather than loudly -- a one-shot source that
+  // never re-emits, a latched selection that ignores the new beat, a
+  // cached reference that makes run 2 edit run 1's picture, a filename
+  // counter that stops overwriting the file the user is watching, a
+  // closed broadcast channel that leaves a viewer waiting forever.
+  //
+  // THE RULE. Every member is exactly one of:
+  //   * CONFIG or an owned resource -- set in the constructor or
+  //     initialize(), untouched here;
+  //   * PER-RUN state -- reset here, unconditionally;
+  //   * genuinely PERSISTENT across launches -- then it does not belong
+  //     in a member at all; put it in the session's LMDB env keyed by
+  //     stage id, so it survives a process restart too and is visible
+  //     rather than implicit.
+  //
+  // Default no-op: a stage with no per-run state needs nothing. Keep it
+  // cheap and non-throwing -- it runs on the driver before any I/O.
+  virtual void reset_run_state() {}
+
+  // The model directories this stage INTENDS to load, declared before
+  // any stage's initialize() runs.
+  //
+  // Why it has to be a separate phase. Every driver runs initialize()
+  // concurrently, and that is where model-holding stages both decide
+  // how much memory they may use and then load. A stage sizing the box
+  // therefore sees whatever subset of its peers happens to have loaded
+  // at that instant -- so the same graph can decide differently run to
+  // run, and a stage cannot see a model held by a peer it has no
+  // configuration link to at all. Declaring up front replaces that race
+  // with a complete picture: by the time the first initialize() runs,
+  // the model manager knows every checkpoint the graph is about to
+  // open, whoever opens it.
+  //
+  // The declarations are cleared once the init barrier opens, because
+  // from then on what each model is really holding is authoritative --
+  // and is often much less than its files weigh, a streaming DiT being
+  // the obvious case.
+  //
+  // Return the directories, not sizes; the manager estimates from disk.
+  // Directories that do not exist, or that this run will not actually
+  // load, are harmless -- an over-estimate makes a stage more cautious,
+  // which is the safe error. Default: no models.
+  virtual std::vector<std::string> declare_models() const { return {}; }
+
   // Per-port clock group. Ports with the same clock_group on the
   // same stage share a clock; the graph analyzer (see
   // pipeline/clock-domain.h) walks fanout edges and unifies

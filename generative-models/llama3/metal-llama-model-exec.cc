@@ -1,5 +1,7 @@
 #include "generative-models/llama3/metal-llama-model-exec.h"
 
+#include "generative-models/weight-set.h"
+
 
 namespace vpipe::genai {
 
@@ -22,8 +24,11 @@ MetalLlamaModelExec::MetalLlamaModelExec(
     const MetalLlamaModel::Config& cfg,
     const SessionContextIntf*      session)
 {
-  (void)session;
-  _model = MetalLlamaModel::load(model_dir, mc, cfg);
+  // Through the session's manager, so a second stage naming this same
+  // checkpoint gets the weights that are already resident instead of a
+  // second copy of them.
+  _model = MetalLlamaModel::load(open_weight_set(model_dir, session), mc,
+                                 cfg);
 }
 
 MetalLlamaModelExec::CtxState*

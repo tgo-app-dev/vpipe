@@ -1,6 +1,7 @@
 #include "generative-models/moss/metal-moss-tts-model.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -140,10 +141,21 @@ std::unique_ptr<MetalMossTtsModel>
 MetalMossTtsModel::load(const std::string& model_dir,
                         metal_compute::MetalCompute* mc)
 {
-  if (mc == nullptr || !mc->valid()) {
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc);
+}
+
+std::unique_ptr<MetalMossTtsModel>
+MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
+                        metal_compute::MetalCompute* mc)
+{
+  if (mc == nullptr || !mc->valid() || ws == nullptr) {
     return nullptr;
   }
+  const std::string model_dir = ws->dir();
   auto self = std::unique_ptr<MetalMossTtsModel>(new MetalMossTtsModel());
+  self->_ws = ws;
   self->_mc = mc;
   Config cfg;
 
@@ -219,25 +231,27 @@ MetalMossTtsModel::load(const std::string& model_dir,
   bc.max_seq           = 16384;
   bc.page_tokens       = 256;
 
-  self->_backbone = MetalQwenModel::load(model_dir, mc, bc);
+  self->_backbone = MetalQwenModel::load(ws, mc, bc);
   if (!self->_backbone) {
     return nullptr;
   }
   self->_cfg = cfg;
 
   // bf16 embedding tables + output heads (raw, unquantized in the ckpt).
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) {
-    return nullptr;
-  }
-  self->_embed_tokens = wts->load("language_model.embed_tokens.weight", mc);
+  // From the SAME set as the backbone: this used to open the checkpoint a
+  // second time. Copied, not Mapped -- mapping wraps the whole shard and
+  // the backbone reads it by copy.
+  WeightSet& wts = *ws;
+  const auto cp = WeightSet::Residency::Copied;
+  self->_embed_tokens =
+      wts.tensor("language_model.embed_tokens.weight", mc, cp);
   if (self->_embed_tokens.empty()) {
     return nullptr;
   }
   self->_emb_ext.resize((std::size_t)cfg.n_vq);
   for (int i = 0; i < cfg.n_vq; ++i) {
     const std::string nm = "emb_ext." + std::to_string(i) + ".weight";
-    self->_emb_ext[(std::size_t)i] = wts->load(nm, mc);
+    self->_emb_ext[(std::size_t)i] = wts.tensor(nm, mc, cp);
     if (self->_emb_ext[(std::size_t)i].empty()) {
       return nullptr;
     }
@@ -246,11 +260,11 @@ MetalMossTtsModel::load(const std::string& model_dir,
   self->_head_out.resize((std::size_t)cfg.n_vq + 1);
   for (int i = 0; i <= cfg.n_vq; ++i) {
     const std::string nm = "lm_heads." + std::to_string(i) + ".weight";
-    self->_heads[(std::size_t)i] = wts->load(nm, mc);
+    self->_heads[(std::size_t)i] = wts.tensor(nm, mc, cp);
     if (self->_heads[(std::size_t)i].empty()) {
       return nullptr;
     }
-    const auto* info = wts->info(nm);
+    const auto* info = wts.src().info(nm);
     self->_head_out[(std::size_t)i] =
         (info != nullptr && !info->shape.empty())
             ? (int)info->shape[0]

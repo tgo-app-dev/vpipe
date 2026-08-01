@@ -13,6 +13,9 @@ import { mountComposer } from './views/composer.js';
 import { mountProfiler } from './views/profiler.js';
 import { mountSettings } from './views/settings.js';
 import { mountStatusBar } from './status-bar.js';
+import { isPhoneUi, isPhoneDevice, uiModeOverride, setUiMode }
+  from './ui-mode.js';
+import { mountPhoneApp } from './phone/phone-app.js';
 
 // Apply the persisted theme as early as possible (index.html's inline
 // script already set it on first paint; this keeps it consistent).
@@ -141,6 +144,22 @@ const VIEWS = [
 const SETTINGS = { id: 'settings', labelKey: 'nav.settings', icon: 'settings',
   mount: mountSettings };
 
+// A phone that was sent to the desktop layout (auto-detection overridden
+// from the drawer, or a stale `?ui=desktop`) has no other way back --
+// this shell has no drawer. Offer the return trip in the top bar, and
+// ONLY in that case: on a real desktop the button would be an invitation
+// to break the dashboard.
+function phoneReturnButton() {
+  if (!isPhoneDevice() || uiModeOverride() !== 'desktop') { return; }
+  const topbar = document.getElementById('topbar');
+  if (!topbar) { return; }
+  topbar.append(
+    el('span', { style: 'flex:1 1 auto' }),
+    el('button', { class: 'btn ghost',
+      onclick: () => { setUiMode('phone'); location.reload(); } },
+      t('phone.phone_layout')));
+}
+
 function main() {
   // Suppress the browser's right-click menu across the whole UI: it
   // pops over panes (notably the live HLS video) and interrupts
@@ -154,6 +173,7 @@ function main() {
     e.preventDefault();
   });
 
+  phoneReturnButton();
   const nav = document.getElementById('nav');
   const view = document.getElementById('view');
   let current = null;
@@ -202,4 +222,16 @@ function main() {
   showStartupChecks();
 }
 
-main();
+// A phone gets the reduced shell (js/phone/) instead of the dashboard.
+// The two share this page, the API client and the i18n catalogue; they
+// part company at the shell, because the dashboard's three-pane panes
+// and drag-and-drop graph have no phone-sized form. The startup-permission
+// dialog and the localhost restart watcher are shell-independent, so both
+// paths get them.
+if (isPhoneUi()) {
+  mountPhoneApp();
+  watchServerInstance();
+  showStartupChecks();
+} else {
+  main();
+}

@@ -3,20 +3,27 @@
 // subtracts the mean (unlike the LM's RMSNorm); GELU comes in both the
 // tanh-approx (ViT MLP) and exact-erf (patch merger / DeepStack) forms;
 // 2D-RoPE uses precomputed per-patch cos/sin tables and full-head
-// rotate-half. f16 storage, f32 math.
+// rotate-half. VPIPE_ELT storage (half by default, bfloat for the
+// _bf16 twin), f32 math throughout.
 
 #include <metal_stdlib>
 using namespace metal;
+
+// Element type: half by default; -DVPIPE_ELT=bfloat builds the bf16
+// twin (same entry-point names, different library).
+#ifndef VPIPE_ELT
+#define VPIPE_ELT half
+#endif
 
 // LayerNorm with weight+bias over the last dim H, one threadgroup/row.
 //   out[r,i] = (x[r,i]-mean_r)*rsqrt(var_r+eps)*weight[i] + bias[i]
 //   0:x[R,H] 1:weight[H] 2:bias[H] 3:out[R,H] 4:H 5:eps
 #define LN_TG 256
 kernel void layer_norm_bias_f16(
-    const device half*  x      [[buffer(0)]],
-    const device half*  weight [[buffer(1)]],
-    const device half*  bias   [[buffer(2)]],
-    device half*        out    [[buffer(3)]],
+    const device VPIPE_ELT*  x      [[buffer(0)]],
+    const device VPIPE_ELT*  weight [[buffer(1)]],
+    const device VPIPE_ELT*  bias   [[buffer(2)]],
+    device VPIPE_ELT*        out    [[buffer(3)]],
     constant int&       H      [[buffer(4)]],
     constant float&     eps    [[buffer(5)]],
     uint3 tid      [[threadgroup_position_in_grid]],
@@ -26,8 +33,8 @@ kernel void layer_norm_bias_f16(
 {
   const uint row = tid.y;
   const uint lid = ltid.x;
-  const device half* xr = x + (uint)row * H;
-  device half* outr = out + (uint)row * H;
+  const device VPIPE_ELT* xr = x + (uint)row * H;
+  device VPIPE_ELT* outr = out + (uint)row * H;
 
   float s1 = 0.0f, s2 = 0.0f;
   for (int i = (int)lid; i < H; i += LN_TG) {
@@ -49,7 +56,7 @@ kernel void layer_norm_bias_f16(
   const float var = p2[0] / (float)H - mean * mean;
   const float inv = rsqrt(var + eps);
   for (int i = (int)lid; i < H; i += LN_TG) {
-    outr[i] = (half)(((float)xr[i] - mean) * inv * (float)weight[i] +
+    outr[i] = (VPIPE_ELT)(((float)xr[i] - mean) * inv * (float)weight[i] +
                      (float)bias[i]);
   }
 }
@@ -57,8 +64,8 @@ kernel void layer_norm_bias_f16(
 // GELU (tanh approx): 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))).
 //   0:x 1:out 2:n
 kernel void gelu_tanh_f16(
-    const device half* x   [[buffer(0)]],
-    device half*       out [[buffer(1)]],
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
     constant int&      n   [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
@@ -66,7 +73,7 @@ kernel void gelu_tanh_f16(
   const float v = (float)x[gid];
   const float k0 = 0.7978845608028654f;   // sqrt(2/pi)
   const float inner = k0 * (v + 0.044715f * v * v * v);
-  out[gid] = (half)(0.5f * v * (1.0f + metal::precise::tanh(inner)));
+  out[gid] = (VPIPE_ELT)(0.5f * v * (1.0f + metal::precise::tanh(inner)));
 }
 
 // Metal has no erf intrinsic; Abramowitz & Stegun 7.1.26 (max abs error
@@ -85,14 +92,15 @@ inline float erf_approx_(float x) {
 
 // GELU (exact, erf): 0.5*x*(1+erf(x/sqrt(2))).   0:x 1:out 2:n
 kernel void gelu_erf_f16(
-    const device half* x   [[buffer(0)]],
-    device half*       out [[buffer(1)]],
+    const device VPIPE_ELT* x   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
     constant int&      n   [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
   if (gid >= (uint)n) { return; }
   const float v = (float)x[gid];
-  out[gid] = (half)(0.5f * v * (1.0f + erf_approx_(v * 0.7071067811865476f)));
+  out[gid] =
+      (VPIPE_ELT)(0.5f * v * (1.0f + erf_approx_(v * 0.7071067811865476f)));
 }
 
 // Vision 2D-RoPE: q'[p,h,:] = q*cos[p] + rotate_half(q)*sin[p], where
@@ -101,10 +109,10 @@ kernel void gelu_erf_f16(
 // (rotate-half couples d and d +/- D/2, so in-place would race).
 //   0:q_in[n,Hh,D] 1:cos[n,D] 2:sin[n,D] 3:q_out[n,Hh,D] 4:Hh 5:D
 kernel void vision_rope_f16(
-    const device half*  q_in  [[buffer(0)]],
-    const device half*  cos_t [[buffer(1)]],
-    const device half*  sin_t [[buffer(2)]],
-    device half*        q_out [[buffer(3)]],
+    const device VPIPE_ELT*  q_in  [[buffer(0)]],
+    const device VPIPE_ELT*  cos_t [[buffer(1)]],
+    const device VPIPE_ELT*  sin_t [[buffer(2)]],
+    device VPIPE_ELT*        q_out [[buffer(3)]],
     constant int&       Hh    [[buffer(4)]],
     constant int&       D     [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
@@ -120,7 +128,7 @@ kernel void vision_rope_f16(
   const float qv = (float)q_in[base + d];
   const float rot = (d < hd2) ? -(float)q_in[base + d + hd2]
                               : (float)q_in[base + d - hd2];
-  q_out[base + d] = (half)(qv * (float)cos_t[(uint)p * D + d] +
+  q_out[base + d] = (VPIPE_ELT)(qv * (float)cos_t[(uint)p * D + d] +
                            rot * (float)sin_t[(uint)p * D + d]);
 }
 
@@ -132,10 +140,10 @@ kernel void vision_rope_f16(
 // first half and row freqs in the second.
 //   0:q_in[n,Hh,D] 1:cos[n,D] 2:sin[n,D] 3:q_out[n,Hh,D] 4:Hh 5:D
 kernel void gemma_vision_rope_f16(
-    const device half*  q_in  [[buffer(0)]],
-    const device half*  cos_t [[buffer(1)]],
-    const device half*  sin_t [[buffer(2)]],
-    device half*        q_out [[buffer(3)]],
+    const device VPIPE_ELT*  q_in  [[buffer(0)]],
+    const device VPIPE_ELT*  cos_t [[buffer(1)]],
+    const device VPIPE_ELT*  sin_t [[buffer(2)]],
+    device VPIPE_ELT*        q_out [[buffer(3)]],
     constant int&       Hh    [[buffer(4)]],
     constant int&       D     [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
@@ -153,6 +161,6 @@ kernel void gemma_vision_rope_f16(
   const uint base   = ((uint)p * Hh + h) * D;
   const float qv = (float)q_in[base + d];
   const float qp = (float)q_in[base + partner];
-  q_out[base + d] = (half)(qv * (float)cos_t[(uint)p * D + d] +
+  q_out[base + d] = (VPIPE_ELT)(qv * (float)cos_t[(uint)p * D + d] +
                            sign * qp * (float)sin_t[(uint)p * D + d]);
 }

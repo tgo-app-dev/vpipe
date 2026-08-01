@@ -256,10 +256,10 @@ struct QWeight {
   std::vector<std::uint16_t> biases;    // N * (K/64) bf16
   std::vector<float> deq;               // N * K  f32
 };
-QWeight make_qweight(int N, int K, std::uint32_t seed) {
-  const int G = K / 64;
+QWeight make_qweight(int N, int K, std::uint32_t seed, int group = 64) {
+  const int G = K / group;
   QWeight q;
-  q.packed.assign((std::size_t)N * (K / 2), 0);
+  q.packed.assign((std::size_t)N * (K / 2), 0);   // 4-bit: 2/byte
   q.scales.resize((std::size_t)N * G);
   q.biases.resize((std::size_t)N * G);
   q.deq.resize((std::size_t)N * K);
@@ -278,7 +278,7 @@ QWeight make_qweight(int N, int K, std::uint32_t seed) {
       const std::size_t bi = (std::size_t)n * (K / 2) + (k >> 1);
       if (k & 1) { q.packed[bi] |= (std::uint8_t)(v << 4); }
       else       { q.packed[bi] |= (std::uint8_t)v; }
-      const int g = k / 64;
+      const int g = k / group;
       const float s = bf16_to_f32(q.scales[(std::size_t)n * G + g]);
       const float b = bf16_to_f32(q.biases[(std::size_t)n * G + g]);
       q.deq[(std::size_t)n * K + k] = s * (float)v + b;
@@ -288,6 +288,101 @@ QWeight make_qweight(int N, int K, std::uint32_t seed) {
 }
 
 }  // namespace
+
+// Ragged N (N % BN != 0) through the steel qmm. The kernel used to be
+// instantiated with a compile-time aligned_N promise that let the WEIGHT loader
+// run load_unsafe() on the partial last N-tile -- reading a full BN=32 rows and
+// so up to 31 rows past the end of the codes / scales / biases. The store was
+// already bound-checked, so results were right and the over-read was a silent
+// fault risk; Boogu-Image's GQA k/v projections (N = 7*120 = 840) are the first
+// real caller with a ragged N. These widths cover the awkward cases: one row
+// past a tile boundary, one row short of one, and Boogu's own 840.
+//
+// HONEST SCOPE OF THIS TEST: the output is correct EITHER WAY -- the over-read
+// only ever polluted accumulator columns >= N, which store_result_safe drops --
+// and it was CHECKED that pre-fix and post-fix outputs are identical to the last
+// digit (2.4483e-03 for boogu-kv both ways). Metal shader validation
+// (MTL_SHADER_VALIDATION=1, incl. _GLOBAL_MEMORY) does NOT flag the pre-fix
+// read either, so no tool guards this. What this test does cover is that ragged
+// N is arithmetically right at all -- there was NO ragged-N coverage before, the
+// nearest case being N=320 -- and the over-read is now impossible by
+// construction (the loader cannot address past num_outs). If someone
+// "optimizes" the safe loader back out, this test will still pass; the guard is
+// the note on qmm_t_impl.
+TEST(qmm_mma, ragged_n_matches_reference) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib = mc->load_library("affine_qmm_steel_bf16");
+  ComputeFunction f4 = lib.function("affine_qmm_steel_w4g64");
+  ComputeFunction f4g32 = lib.function("affine_qmm_steel_w4g32");
+  ASSERT_TRUE(f4.valid() && f4g32.valid());
+
+  // group must divide K, so Boogu's K=3360 (52.5 groups of 64) rides the g32
+  // entry point -- the same reason its checkpoints are quantized at g32.
+  struct RShape { int M, N, K, group; const char* tag; };
+  const RShape shapes[] = {
+      {64, 840, 3360, 32, "boogu-kv"},   // 26.25 tiles of 32
+      {33, 33, 128, 64, "n33"},          // 1 row into the last tile
+      {64, 95, 192, 64, "n95"},          // 1 row short of a full tile
+      {96, 161, 256, 64, "n161"},
+  };
+  for (const auto& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K;
+    ComputeFunction& fn = (sh.group == 32) ? f4g32 : f4;
+    std::vector<std::uint16_t> x((std::size_t)M * K);
+    fill_bf16(x, 1234 + N);
+    QWeight q = make_qweight(N, K, 4321 + N, sh.group);
+
+    std::vector<float> ref((std::size_t)M * N, 0.0f);
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+          acc += bf16_to_f32(x[(std::size_t)m * K + k]) *
+                 q.deq[(std::size_t)n * K + k];
+        }
+        ref[(std::size_t)m * N + n] = acc;
+      }
+    }
+    // Buffers sized EXACTLY to the tensors: no slack for an over-read to land
+    // in, so shader validation has something to catch.
+    SharedBuffer wb = mc->make_shared_buffer(q.packed.size());
+    SharedBuffer sb = mc->make_shared_buffer(q.scales.size() * 2);
+    SharedBuffer bb = mc->make_shared_buffer(q.biases.size() * 2);
+    SharedBuffer xb = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
+    ASSERT_TRUE(!wb.empty() && !sb.empty() && !bb.empty() && !yb.empty());
+    std::memcpy(wb.contents(), q.packed.data(), q.packed.size());
+    std::memcpy(sb.contents(), q.scales.data(), q.scales.size() * 2);
+    std::memcpy(bb.contents(), q.biases.data(), q.biases.size() * 2);
+    std::memcpy(xb.contents(), x.data(), x.size() * 2);
+    std::memset(yb.contents(), 0, (std::size_t)M * N * 2);
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder enc = st.begin_compute();
+        enc.set_function(fn);
+        enc.set_buffer(0, wb); enc.set_buffer(1, sb); enc.set_buffer(2, bb);
+        enc.set_buffer(3, xb); enc.set_buffer(4, yb);
+        enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
+        enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                      (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
+      }
+      st.commit().wait();
+    }
+    const auto* yp = static_cast<const std::uint16_t*>(yb.contents());
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < (std::size_t)M * N; ++i) {
+      const double d = (double)bf16_to_f32(yp[i]) - (double)ref[i];
+      num += d * d; den += (double)ref[i] * (double)ref[i];
+    }
+    const double e = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    std::printf("[qmm_mma] ragged %-9s M=%d N=%d K=%d  rel-L2=%.4e\n",
+                sh.tag, M, N, K, e);
+    EXPECT_TRUE(e < 3e-2);
+  }
+}
 
 // Diagnostic: print the GPU's family / capability signals so we can pick
 // a deterministic gate for the matrix-core path.

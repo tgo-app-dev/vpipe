@@ -422,3 +422,60 @@ TEST(qwen_image_edit_dit, ref_block_bisect)
                 rel_l2_(got, gvel.data(), got.size()));
   }
 }
+
+// vec4 adaLN / gate twins: same arithmetic per element, so the staged block-0
+// output must be BIT-IDENTICAL. This covers MAGE-FLOW too -- its DiT is this
+// same class under a different Config, so the adaln/gated call sites are shared
+// code. The guard is the plumbing: the (H, total) -> (H/4, total/H) rewrite and
+// the 4-alignment of every bound element offset, including the two-range image
+// gating (generated rows vs reference rows) that only this family does. An
+// unaligned vec4 access is undefined, so a wrong offset gives garbage, not a
+// rounding difference.
+TEST(qwen_image_edit_dit, vec4_elementwise_matches_scalar)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH");
+  const char* dd   = std::getenv("VPIPE_QWEN_IMAGE_EDIT_DIT_DIR");
+  const std::string dit_dir =
+      (dd != nullptr && *dd != '\0') ? std::string(dd)
+      : (root != nullptr && *root != '\0') ? std::string(root) + "/transformer"
+      : std::string();
+  if (dit_dir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  const int gh = 16, gw = 16, gen_seq = gh * gw, txt_seq = 96;
+  const int IC = 64, TXTD = 3584;
+  auto rnd = [](std::uint32_t& s) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (float)((s >> 8) & 0xffffff) / 16777216.0f - 0.5f;
+  };
+  std::uint32_t s1 = 0x2468aceu, s2 = 0x13579bdfu;
+  std::vector<float> hidden((std::size_t)gen_seq * IC),
+                     txt((std::size_t)txt_seq * TXTD);
+  for (auto& v : hidden) { v = rnd(s1); }
+  for (auto& v : txt)    { v = rnd(s2); }
+  const SharedBuffer h = upload_(mc, hidden);
+  const SharedBuffer t = upload_(mc, txt);
+
+  auto run = [&](bool v4) -> std::vector<float> {
+    if (v4) { ::unsetenv("VPIPE_NO_ELT_V4"); }
+    else    { ::setenv("VPIPE_NO_ELT_V4", "1", 1); }
+    auto m = MetalQwenImageTransformer::load(dit_dir, mc, {});
+    if (m == nullptr) { return {}; }
+    SharedBuffer b0 = m->forward(h, gen_seq, t, txt_seq, gh, gw, 0.7f, {}, 0);
+    if (b0.empty()) { return {}; }
+    return readback_(b0, (std::size_t)gen_seq * 3072);
+  };
+  const std::vector<float> a = run(true);
+  const std::vector<float> b = run(false);
+  ::unsetenv("VPIPE_NO_ELT_V4");
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) { ++diff; }
+  }
+  EXPECT_TRUE(diff == 0);
+  std::printf("[qwen_image_edit_dit] vec4 vs scalar elementwise: %zu/%zu "
+              "values differ\n", diff, a.size());
+}

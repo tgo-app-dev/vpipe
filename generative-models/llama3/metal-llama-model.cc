@@ -1,6 +1,7 @@
 #include "generative-models/llama3/metal-llama-model.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -38,12 +39,24 @@ MetalLlamaModel::load(const std::string& model_dir,
   if (mc == nullptr || !mc->valid()) {
     return nullptr;
   }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) {
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalLlamaModel>
+MetalLlamaModel::load(std::shared_ptr<WeightSet> ws_in,
+                      metal_compute::MetalCompute* mc, const Config& cfg)
+{
+  if (mc == nullptr || !mc->valid() || !ws_in) {
     return nullptr;
   }
+  // Held for the model's lifetime below (m->_ws). This model reads its
+  // tensors as owned COPIES (see the Copied residency below), so the
+  // hold is not about keeping views alive -- it is the reference count
+  // that decides when the checkpoint is closed.
+  WeightSet& wset = *ws_in;
 
   auto m = std::unique_ptr<MetalLlamaModel>(new MetalLlamaModel());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
 
@@ -126,9 +139,12 @@ MetalLlamaModel::load(const std::string& model_dir,
 
   auto qt = [&](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
                 SharedBuffer& b) -> bool {
-    w = wts->load(pfx + ".weight", mc);
-    s = wts->load(pfx + ".scales", mc);
-    b = wts->load(pfx + ".biases", mc);
+    // Owned copies, uncached -- mapping was measured and rejected for
+    // the LMs (see the note in metal-qwen-model.cc's to_elt).
+    const auto cp = WeightSet::Residency::Copied;
+    w = wset.read(pfx + ".weight", mc, cp);
+    s = wset.read(pfx + ".scales", mc, cp);
+    b = wset.read(pfx + ".biases", mc, cp);
     return !w.empty() && !s.empty() && !b.empty();
   };
 
@@ -175,8 +191,9 @@ MetalLlamaModel::load(const std::string& model_dir,
   for (int L = 0; L < cfg.n_layers; ++L) {
     const std::string p = "model.layers." + std::to_string(L) + ".";
     Layer& ly = m->_layers[L];
-    ly.in_ln = wts->load(p + "input_layernorm.weight", mc);
-    ly.post_ln = wts->load(p + "post_attention_layernorm.weight", mc);
+    const auto cp = WeightSet::Residency::Copied;
+    ly.in_ln = wset.read(p + "input_layernorm.weight", mc, cp);
+    ly.post_ln = wset.read(p + "post_attention_layernorm.weight", mc, cp);
     bool ok = !ly.in_ln.empty() && !ly.post_ln.empty();
     ok = ok && qt(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
     ok = ok && qt(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
@@ -194,7 +211,8 @@ MetalLlamaModel::load(const std::string& model_dir,
 
   bool ok = qt("model.embed_tokens", m->_embed_w, m->_embed_s, m->_embed_b);
   ok = ok && qt("lm_head", m->_lm_w, m->_lm_s, m->_lm_b);
-  m->_final_ln = wts->load("model.norm.weight", mc);
+  m->_final_ln = wset.read("model.norm.weight", mc,
+                           WeightSet::Residency::Copied);
   if (!ok || m->_final_ln.empty()) {
     return nullptr;
   }

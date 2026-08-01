@@ -1,4 +1,5 @@
 set(LOCAL_TEST_SOURCES
+  buffer-stage.cc
   byte-track-stage.cc
   call-stage.cc
   chrono-shell-stages.cc
@@ -7,6 +8,9 @@ set(LOCAL_TEST_SOURCES
   credential-store.cc
   detection-overlay-stage.cc
   feedback-pair.cc
+  stage-relaunch-sweep.cc
+  weight-registry.cc
+  weight-set.cc
   oport-buffer-retire.cc
   oport-buffer-peek.cc
   oport-buffer-thresholds.cc
@@ -28,12 +32,15 @@ set(LOCAL_TEST_SOURCES
   media-line.cc
   text-stream-chunk.cc
   mini-http.cc
+  qr-code.cc
   command-sandbox.cc
   path-sandbox.cc
   session-sandbox.cc
   model-catalog.cc
+  model-memory.cc
   model-remove-stage.cc
   model-select-stage.cc
+  sampler-select-stage.cc
   plugin-abi.cc
   plugin-loader.cc
   onvif-soap.cc
@@ -45,6 +52,8 @@ set(LOCAL_TEST_SOURCES
   profiling.cc
   perf-buffer.cc
   hls-broadcast-stage.cc
+  compare-image-stage.cc
+  create-mask-stage.cc
   preview-stage.cc
   read-any.cc
   runtime-context-has-consumers.cc
@@ -56,9 +65,11 @@ set(LOCAL_TEST_SOURCES
   stdout-log-delegate-async.cc
   tensor-beat.cc
   ui-delegate.cc
+  ui-view-registry.cc
   tensor-storage.cc
   thread-pool.cc
   vertex-oport-policy.cc
+  image-metadata.cc
   video-stages.cc
   video-to-rgb-stage.cc
   videos-db-cleanup-stage.cc
@@ -66,6 +77,7 @@ set(LOCAL_TEST_SOURCES
 )
 if(APPLE)
     list(APPEND LOCAL_TEST_SOURCES audio-capture-stage.cc)
+    list(APPEND LOCAL_TEST_SOURCES video-capture-stage.cc)
     list(APPEND LOCAL_TEST_SOURCES credential-cipher.cc)
     list(APPEND LOCAL_TEST_SOURCES onvif-refresh.cc)
 endif()
@@ -79,6 +91,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         coreml-model-manager.cc
         metal-compute.cc
         metal-compute-gemm-mma.cc
+        optiq-block-perf.cc
         metal-compute-sdpa-mma.cc
         metal-compute-gdn-mma.cc
         metal-compute-binary-archive.cc
@@ -87,6 +100,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute-function-constants.cc
         metal-compute-heap.cc
         metal-compute-letterbox-rgb-f16.cc
+        metal-compute-vision-bf16.cc
         metal-compute-library.cc
         metal-compute-nv12.cc
         metal-compute-residency.cc
@@ -117,6 +131,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         mage-cond.cc
         mage-watermark.cc
         mage-t2i.cc
+        mage-screen.cc
         krea2-t2i.cc
         krea2-dit-quant.cc
         krea2-lora.cc
@@ -131,6 +146,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-t2i.cc
         qwen-image-edit-awq.cc
         flux2-smoke.cc
+        boogu-smoke.cc
         llm-chat-template.cc
         llm-sampler.cc
         llm-tokenizer.cc
@@ -152,6 +168,14 @@ set(LOCAL_TEST_HEADERS "")
 
 list(TRANSFORM LOCAL_TEST_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 list(TRANSFORM LOCAL_TEST_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+
+# The unit under test for qr-code.cc. It ships with vpipe-web-ui (its
+# only consumer) rather than in libvpipe, and depends on nothing but the
+# standard library -- so the test compiles it directly instead of the app
+# growing a library for one file. Appended AFTER the TRANSFORM above,
+# which would otherwise prepend this directory to an absolute path.
+list(APPEND LOCAL_TEST_SOURCES
+     "${CMAKE_SOURCE_DIR}/apps/web-ui/qr-code.cc")
 
 # Internal tests may include anything: public headers, private headers,
 # generated headers, and sources from common/.

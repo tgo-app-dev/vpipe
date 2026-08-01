@@ -1,4 +1,7 @@
 #include "minitest.h"
+#include "common/image-metadata.h"
+#include "pipeline/stage-registry.h"
+#include "vpipe/vpipe.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -50,6 +53,9 @@ public:
   int     w = 4, h = 3, n = 1;
   uint8_t r = 0xFF, g = 0x80, b = 0x40;
   bool    noisy = false;   // high-frequency fill (JPEG quality has teeth)
+  // When set, stamped onto each beat's sideband exactly as vae-decode does,
+  // so save-image sees a GENERATED image.
+  string  model_name;
 
   SolidSource(const SessionContextIntf* s, string id,
               vector<InEdge> in, FlexData cfg)
@@ -58,6 +64,10 @@ public:
   {
     allocate_oports(1);
   }
+
+  // The very thing Stage::reset_run_state exists for: without this the
+  // source is exhausted after run 1 and a relaunch emits nothing.
+  void reset_run_state() override { _emitted = 0; }
 
   Job
   process(RuntimeContext& ctx) override
@@ -84,6 +94,12 @@ public:
           d[2 * plane + i] = b;
         }
       }
+    }
+    if (!model_name.empty()) {
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign("model_name",
+                                      FlexData::make_string(model_name));
+      out->sideband = std::move(sb);
     }
     ++_emitted;
     co_await ctx.write(0, std::move(out));
@@ -137,13 +153,15 @@ tmp_path_(const string& suffix)
 void
 run_store_(Session& sess, SolidSource*& src_out, FlexData store_cfg,
            int n, uint8_t r, uint8_t g, uint8_t b,
-           bool noisy = false, int w = 4, int h = 3)
+           bool noisy = false, int w = 4, int h = 3,
+           const string& model_name = {})
 {
   auto pl = make_unique<Pipeline>("p", &sess);
   auto src_u = make_unique<SolidSource>(
       &sess, "src", vector<InEdge>{}, FlexData::make_object());
   src_u->n = n; src_u->r = r; src_u->g = g; src_u->b = b;
   src_u->noisy = noisy; src_u->w = w; src_u->h = h;
+  src_u->model_name = model_name;
   auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
   src_out = src;
 
@@ -246,6 +264,43 @@ TEST(save_image_stage, writes_png_roundtrip) {
 
 // The quality knob has teeth: a low-quality JPEG is smaller than a
 // high-quality one for the same image.
+// The filename index is PER-RUN state: it restarts every launch, so
+// each run REWRITES the same file. The stage survives a stop/relaunch,
+// so before this was reset the second run wrote `name-000001.png` and
+// the third `name-000002.png` -- the file being watched stopped
+// updating, silently.
+TEST(save_image_stage, relaunch_rewrites_the_same_file) {
+  Session sess;
+  CerrSilencer hush;
+  const string path = tmp_path_(".png");
+  const string sfx1 = path.substr(0, path.size() - 4) + "-000001.png";
+  remove(path.c_str());
+  remove(sfx1.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SolidSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->n = 1; src_u->r = 1; src_u->g = 2; src_u->b = 3;
+  auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  auto st_u = make_unique<SaveImageStage>(
+      &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg));
+  auto* st = static_cast<SaveImageStage*>(pl->insert_stage(std::move(st_u)));
+
+  for (int run = 0; run < 3; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  EXPECT_TRUE(st->images_written() == 1u);   // per-run counter, not 3
+  EXPECT_TRUE(!head_bytes_(path, 8).empty());        // the file exists
+  EXPECT_TRUE(head_bytes_(sfx1, 8).empty());         // and no -000001
+  remove(path.c_str());
+  remove(sfx1.c_str());
+}
+
 TEST(save_image_stage, jpeg_quality_affects_size) {
   Session sess;
   CerrSilencer hush;
@@ -302,4 +357,73 @@ TEST(save_image_stage, indexed_stream_paths) {
   remove(p1.c_str());
   EXPECT_TRUE(has0);
   EXPECT_TRUE(has1);
+}
+
+// The metadata iport is OPTIONAL: the stage still constructs (and stays a
+// sink) with only the image edge wired, which is how every pre-existing
+// graph is shaped.
+TEST(save_image_stage, metadata_iport_is_declared_and_optional) {
+  const StageSpec* si = StageRegistry::get().spec("save-image");
+  const StageSpec* li = StageRegistry::get().spec("load-image");
+  ASSERT_TRUE(si != nullptr && li != nullptr);
+  ASSERT_TRUE(si->iports.size() == 2 && li->oports.size() == 2);
+  // save-image's metadata iport must accept exactly what load-image's
+  // metadata oport emits, or the two cannot be wired together.
+  EXPECT_TRUE(si->iports[1].type == li->oports[1].type);
+  EXPECT_TRUE(si->oports.empty());
+
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("path", FlexData::make_string("/tmp/x.png"));
+  SaveImageStage s(&sess, "st", vector<InEdge>{}, std::move(cfg));
+  EXPECT_TRUE(s.config_error().empty());
+}
+
+// Provenance: text-to-image stamps `model_name` on the latent sideband and
+// vae-decode carries it onto the image, so a GENERATED image reaches
+// save-image knowing what produced it. That must land in EXIF Software as
+// "Vpipe <version> <hash> with <model>".
+TEST(save_image_stage, generated_image_records_the_model_in_exif_software) {
+  Session sess;
+  CerrSilencer hush;
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  SolidSource* src = nullptr;
+  run_store_(sess, src, std::move(cfg), 1, 0x12, 0xAB, 0xF0,
+             false, 4, 3, "local/Some-Model-4bit");
+  ASSERT_TRUE(src != nullptr);
+
+  const auto blob = imgmeta::read_exif_blob(path);
+  ASSERT_TRUE(!blob.empty());
+  FlexData d = imgmeta::parse_exif(blob);   // as_object() is a view
+  ASSERT_TRUE(d.is_object());
+  auto o = d.as_object();
+  ASSERT_TRUE(o.contains("Software"));
+  const string sw(o.at("Software").as_string(""));
+  std::printf("[save_image_stage] Software = %s\n", sw.c_str());
+  EXPECT_TRUE(sw.rfind("Vpipe ", 0) == 0);
+  EXPECT_TRUE(sw.find(vpipe_version_number()) != string::npos);
+  EXPECT_TRUE(sw.find(vpipe_build_hash()) != string::npos);
+  EXPECT_TRUE(sw.find(" with local/Some-Model-4bit") != string::npos);
+  remove(path.c_str());
+}
+
+// ...and an image with NO model on its sideband (a plain load -> save copy)
+// must get no Software tag at all: vpipe did not author it.
+TEST(save_image_stage, unmarked_image_gets_no_software_tag) {
+  Session sess;
+  CerrSilencer hush;
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  SolidSource* src = nullptr;
+  run_store_(sess, src, std::move(cfg), 1, 0x12, 0xAB, 0xF0);
+  ASSERT_TRUE(src != nullptr);
+  EXPECT_TRUE(imgmeta::read_exif_blob(path).empty());
+  remove(path.c_str());
 }

@@ -5,12 +5,14 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
+#include "stages/sampler-spec.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
 #include "generative-models/moss/metal-moss-tts-model.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/moss/metal-moss-codec-v2.h"
 #include "generative-models/moss/metal-moss-v15-model.h"
@@ -33,6 +35,82 @@
 using namespace std;
 
 namespace vpipe {
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+namespace {
+
+// MOSS's own recommended AUDIO-code sampling. Unlike every other channel in
+// the LLM stages, this one does NOT fall back to greedy when its sampler
+// iport is unwired: MOSS's audio head degenerates into silent loops under
+// argmax, so an unprogrammed audio channel keeps the model's defaults (the
+// MossTTSDelay-8B recommendation, shared with v1.5). A wired sampler-select
+// replaces this wholesale.
+//
+// The seed is the historical 'moss' constant: nonzero makes a given text
+// deterministic, so the same script yields the same voice every run.
+genai::SamplerParams
+moss_audio_default_sampler()
+{
+  genai::SamplerParams p;
+  p.temperature        = 1.7f;
+  p.top_k              = 25;
+  p.top_p              = 0.8f;
+  p.repetition_penalty = 1.0f;
+  p.seed               = 0x6d6f7373;   // 'moss'
+  return p;
+}
+
+// The realtime variant (moss_tts_realtime) has its OWN recommendation --
+// temp 0.8 / top_k 30 / top_p 0.6 / rep 1.1 -- distinct from the 8B/v1.5
+// numbers above. Applied only when iport2 is unwired.
+genai::SamplerParams
+moss_rt_audio_default_sampler()
+{
+  genai::SamplerParams p;
+  p.temperature        = 0.8f;
+  p.top_k              = 30;
+  p.top_p              = 0.6f;
+  p.repetition_penalty = 1.1f;
+  p.seed               = 0x6d6f7373;   // 'moss'
+  return p;
+}
+
+// SamplerParams -> MossSampling (see warn_unsupported_knobs_ for the two
+// knobs that do not survive the narrowing).
+genai::MossSampling
+moss_sampling_of(const genai::SamplerParams& p)
+{
+  genai::MossSampling m;
+  m.temperature        = p.temperature;
+  m.top_k              = p.top_k;
+  m.top_p              = p.top_p;
+  m.repetition_penalty = p.repetition_penalty;
+  return m;
+}
+
+// MossSampling carries no min_p / presence penalty, so a sampler-select spec
+// that sets either cannot be honoured here. Say so once, on latch, rather
+// than dropping the knob silently.
+void
+warn_unsupported_knobs_(const SessionContextIntf*   session,
+                        const std::string&          who,
+                        const genai::SamplerParams& p)
+{
+  if (p.min_p > 0.0f) {
+    session->warn(fmt("{}: min_p {} is not supported by the MOSS sampler "
+                      "(temperature / top_k / top_p / repetition_penalty "
+                      "only); ignoring it", who, p.min_p));
+  }
+  if (p.presence_penalty != 0.0f) {
+    session->warn(fmt("{}: presence_penalty {} is not supported by the MOSS "
+                      "sampler (temperature / top_k / top_p / "
+                      "repetition_penalty only); ignoring it", who,
+                      p.presence_penalty));
+  }
+}
+
+}  // namespace
+#endif
 
 TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
                                      string                    id,
@@ -79,21 +157,23 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
     }
     _max_frames = static_cast<int>(v);
   }
-  _audio_temp  = attr_real("audio_temperature");
-  _audio_top_p = attr_real("audio_top_p");
-  _audio_top_k = static_cast<int>(attr_int("audio_top_k"));
-  _audio_rep   = attr_real("audio_repetition_penalty");
-  _text_temp   = attr_real("text_temperature");
-  _text_top_p  = attr_real("text_top_p");
-  _text_top_k  = static_cast<int>(attr_int("text_top_k"));
-  _text_rep    = attr_real("text_repetition_penalty");
-  _sampler_seed = static_cast<std::uint64_t>(attr_uint("sampler_seed"));
+  // Sampling is programmed by two `sampler-select` stages on the OPTIONAL
+  // iports 2 (audio codes) and 3 (free text), latched on the first beat.
+  // Unwired: the TEXT channel falls back to greedy (the SamplerParams
+  // default) like every other LLM stage, but the AUDIO channel keeps MOSS's
+  // own recommendation -- greedy audio degenerates into silence.
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  _audio_sp = moss_audio_default_sampler();
+#endif
   _voice_lock        = attr_bool("voice_lock");
   _voice_ref_seconds = attr_real("voice_ref_seconds");
-  // A 2nd (PCM reference) iport means the codec needs its encode path, so a
+  // A wired PCM-reference iport1 means the codec needs its encode path, so a
   // reference voice can be analysed for cloning. iport_edges() reflects the
-  // edges this stage was constructed with (the graph is frozen post-launch).
-  _with_encoder = this->iport_edges().size() >= 2;
+  // edges this stage was constructed with (the graph is frozen post-launch);
+  // check the SLOT, not the count -- the sampler iports 2/3 sit after it, so
+  // a graph that wires only a sampler must not pay for the encoder.
+  _with_encoder = this->iport_edges().size() >= 2
+      && this->iport_edges()[1].v != nullptr;
 
   if (_hf_dir.empty()) {
     fail_config(fmt(
@@ -167,40 +247,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "language", .type = ConfigType::String,
    .doc = "v1.5-only: optional language tag (prompt field)",
    .def_str = "None"},
-  // Sampling (flattened, separate audio + text channels). Defaults are the
-  // MossTTSDelay-8B recommendations; greedy decoding (temperature <= 0)
-  // degenerates (silent loops to max_new_tokens), so sampling is the default.
-  {.key = "audio_temperature", .type = ConfigType::Real,
-   .doc = "audio-code softmax temperature; <= 0 forces greedy", .def_real = 1.7},
-  {.key = "audio_top_p", .type = ConfigType::Real,
-   .doc = "audio-code nucleus top-p (1.0 = off)", .def_real = 0.8},
-  {.key = "audio_top_k", .type = ConfigType::Int,
-   .doc = "audio-code top-k (0 = off)", .def_int = 25},
-  {.key = "audio_repetition_penalty", .type = ConfigType::Real,
-   .doc = "audio-code repetition penalty (1.0 = off)", .def_real = 1.0},
-  {.key = "text_temperature", .type = ConfigType::Real,
-   .doc = "free-text-token temperature; <= 0 forces greedy. Default greedy: "
-          "vpipe GENERATES the text channel (re-emits the transcript), so it "
-          "must follow it to reach audio_end; sampling it over-generates. The "
-          "reference's text temp 1.5 is for its teacher-forced text path.",
-   .def_real = 0.0},
-  {.key = "text_top_p", .type = ConfigType::Real,
-   .doc = "free-text-token nucleus top-p (1.0 = off)", .def_real = 1.0},
-  {.key = "text_top_k", .type = ConfigType::Int,
-   .doc = "free-text-token top-k (0 = off)", .def_int = 50},
-  {.key = "text_repetition_penalty", .type = ConfigType::Real,
-   .doc = "free-text-token repetition penalty (1.0 = off)", .def_real = 1.0},
-  {.key = "sampler_seed", .type = ConfigType::Uint,
-   .doc = "audio-sampling RNG seed = the 'voice lock'. Nonzero (default) makes "
-          "a given text deterministic -> the SAME voice every run (per-script: "
-          "different texts may still differ; for a cross-text identity use "
-          "voice_lock or voice cloning via the audio iport). 0 = fresh voice.",
-   .def_uint = 0x6d6f7373},   // 'moss'
   {.key = "voice_lock", .type = ConfigType::Bool,
    .doc = "design-once: cache the FIRST generated voice and reuse it as the "
           "clone reference for every later beat, so the timbre stays the same "
-          "across different texts (the first voice is picked by sampler_seed). "
-          "A reference on the audio iport overrides it. Needs no audio input.",
+          "across different texts (the first voice is picked by the audio "
+          "sampler's seed). A reference on the audio iport overrides it. "
+          "Needs no audio input.",
    .def_bool = false},
   {.key = "voice_ref_seconds", .type = ConfigType::Real,
    .doc = "max seconds of reference audio kept for cloning (longer = more "
@@ -225,6 +277,18 @@ const PortSpec kIports[] = {
           "group -- it arrives independently of the text stream / PCM output, "
           "not rate-locked to them.",
    .type = &typeid(TensorBeatPayload), .clock_group = 1},
+  {.name = "audio-sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select) for the "
+          "AUDIO-code channel; its seed is also the voice seed. Latched on "
+          "the first beat. Unwired keeps MOSS's own recommended sampling "
+          "(NOT greedy -- greedy audio degenerates into silent loops)",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "text-sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select) for the "
+          "free-TEXT channel. Latched on the first beat; unwired = greedy, "
+          "which is the right default here (vpipe generates the text channel "
+          "and it must follow the transcript to reach audio_end)",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "pcm",
@@ -402,6 +466,39 @@ rt_qwen_cfg_(const std::string& dir, const std::string& prefix,
 }  // namespace
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+void
+TextToSpeechStage::release_models_()
+{
+  // Streaming state first: both StreamStates hold buffers minted by
+  // their codec, so they must go before the codec they came from.
+  _stream_v15.reset();
+  _stream_v1.reset();
+  _lm_rt.reset();
+  _lm_v15.reset();
+  _codec_v15.reset();
+  _lm.reset();
+  _codec.reset();
+  _tokenizer.reset();
+  // Per-run conversation state that belongs to the weights just freed.
+  _ref_codes.clear();
+  _ref_set = false;
+}
+#endif
+
+std::vector<std::string>
+TextToSpeechStage::declare_models() const
+{
+  std::vector<std::string> out;
+  if (!_hf_dir.empty()) {
+    out.push_back(resolve_model_dir(session(), _models_db, _hf_dir));
+  }
+  if (!_codec_dir.empty()) {
+    out.push_back(resolve_model_dir(session(), _models_db, _codec_dir));
+  }
+  return out;
+}
+
 Job
 TextToSpeechStage::initialize(RuntimeContext& ctx)
 {
@@ -418,6 +515,27 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
         "VPIPE_BUILD_APPLE_SILICON); the stage is inert", this->id()));
     co_return;
   }
+  // Release anything a PREVIOUS run left resident before loading again.
+  // A stopped pipeline keeps its stages alive (PipelineRuntime::stop
+  // drains the drivers; only unload/re-materialize destroys the Stage),
+  // so a plain Stop-then-Start re-enters initialize() with the last
+  // run's weights still held. Without this the loads below would build
+  // a complete second copy -- the assignment only frees the old pointer
+  // AFTER the new model is fully constructed -- and peak briefly at 2x.
+  // Measured on MOSS-TTS v1.5 + codec v2: 10.2 GB resident, 18.5 GB
+  // peak across a relaunch, which is what makes a restart fail on a box
+  // sized for one copy. Unlike the LM-manager-backed stages (whose
+  // reload hits a shared cache and returns the same instance) and the
+  // diffusion stages (guarded by _load_attempted), nothing here dedupes
+  // the second load, so the release has to be explicit.
+  release_models_();
+  // Per-launch reset, same reason: the sampler-select sources upstream
+  // re-emit on every launch, so a stage that never clears these keeps
+  // the previous run's latch and leaves the new beats unread.
+  _audio_sp_read = false;
+  _audio_sp_set  = false;
+  _text_sp_read  = false;
+
   const std::string lm_dir =
       resolve_model_dir(session(), _models_db, _hf_dir);
   const std::string codec_dir =
@@ -437,7 +555,8 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
                                 256);
     cfg.local    = rt_qwen_cfg_(lm_dir, "local_transformer.", "model.", 4, 32,
                                 32);
-    _lm_rt = genai::MetalMossRtModel::load(lm_dir, mc, cfg);
+    _lm_rt = genai::MetalMossRtModel::load(
+        genai::open_weight_set(lm_dir, session()), mc, cfg);
     if (!_lm_rt) {
       session()->error(fmt(
           "TextToSpeechStage('{}'): failed to load MOSS-TTS-Realtime LM from "
@@ -450,8 +569,9 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
         "TextToSpeechStage('{}'): loading MOSS-Audio-Tokenizer codec from "
         "'{}'{}", this->id(), _codec_dir,
         _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
-    _codec = genai::MetalMossCodec::load(codec_dir, mc, _codec_int8,
-                                         _with_encoder);
+    _codec = genai::MetalMossCodec::load(
+        genai::open_weight_set(codec_dir, session()), mc, _codec_int8,
+        _with_encoder);
     if (!_codec || !_codec->valid()) {
       session()->error(fmt(
           "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; inert",
@@ -484,7 +604,8 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
         this->id(), _hf_dir));
     genai::MetalMossV15Model::Config cfg;
     cfg.backbone = v15_backbone_cfg_(lm_dir);
-    _lm_v15 = genai::MetalMossV15Model::load(lm_dir, mc, cfg);
+    _lm_v15 = genai::MetalMossV15Model::load(
+        genai::open_weight_set(lm_dir, session()), mc, cfg);
     if (!_lm_v15) {
       session()->error(fmt(
           "TextToSpeechStage('{}'): failed to load v1.5 LM from '{}' "
@@ -496,7 +617,8 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
         "TextToSpeechStage('{}'): loading codec-v2 from '{}'{}", this->id(),
         _codec_dir,
         _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
-    _codec_v15 = genai::MetalMossCodecV2::load(codec_dir, mc, _with_encoder);
+    _codec_v15 = genai::MetalMossCodecV2::load(
+        genai::open_weight_set(codec_dir, session()), mc, _with_encoder);
     if (!_codec_v15 || !_codec_v15->valid()) {
       session()->error(fmt(
           "TextToSpeechStage('{}'): failed to load codec-v2 from '{}'; inert",
@@ -529,7 +651,8 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
       "TextToSpeechStage('{}'): loading MOSS-TTS LM from '{}'",
       this->id(), _hf_dir));
   const auto t_lm0 = clock::now();
-  _lm = genai::MetalMossTtsModel::load(lm_dir, mc);
+  _lm = genai::MetalMossTtsModel::load(
+      genai::open_weight_set(lm_dir, session()), mc);
   if (!_lm || !_lm->valid()) {
     session()->error(fmt(
         "TextToSpeechStage('{}'): failed to load MOSS-TTS LM from '{}'; "
@@ -546,8 +669,9 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
       "'{}'{}", this->id(), _codec_dir,
       _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
   const auto t_cc0 = clock::now();
-  _codec = genai::MetalMossCodec::load(codec_dir, mc, _codec_int8,
-                                       _with_encoder);
+  _codec = genai::MetalMossCodec::load(
+      genai::open_weight_set(codec_dir, session()), mc, _codec_int8,
+      _with_encoder);
   if (!_codec || !_codec->valid()) {
     session()->error(fmt(
         "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; "
@@ -938,6 +1062,43 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Latch the two token-sampler specs off the OPTIONAL sampler iports 2
+  // (audio codes) and 3 (free text), once each: a `sampler-select` source
+  // emits a single beat at launch, which we cache and reuse for every later
+  // utterance. Read AFTER the text beat so declared-but-unwired ports never
+  // stall the first utterance. Unwired audio keeps MOSS's own sampling (set
+  // in the ctor); unwired text stays greedy.
+  if (!_audio_sp_read && ctx.num_iports() >= 3 && ctx.iport_connected(2)) {
+    auto sb = co_await ctx.read(2);
+    _audio_sp_read = true;      // beat consumed either way; never re-read
+    const std::string who =
+        "TextToSpeechStage('" + this->id() + "') audio";
+    bool ok = false;
+    const genai::SamplerParams p =
+        sampler_params_from_beat(sb.get(), session(), who, &ok);
+    // Only a GOOD beat replaces MOSS's own audio sampling. A rejected one
+    // must not fall back to the helper's greedy return here -- greedy audio
+    // degenerates into silence, which is the whole reason this channel has a
+    // non-greedy default.
+    if (ok) {
+      _audio_sp = p;
+      _audio_sp_set = true;
+      warn_unsupported_knobs_(session(), who, _audio_sp);
+    }
+  }
+  if (!_text_sp_read && ctx.num_iports() >= 4 && ctx.iport_connected(3)) {
+    auto sb = co_await ctx.read(3);
+    _text_sp_read = true;
+    const std::string who = "TextToSpeechStage('" + this->id() + "') text";
+    bool ok = false;
+    const genai::SamplerParams p =
+        sampler_params_from_beat(sb.get(), session(), who, &ok);
+    if (ok) {
+      _text_sp = p;
+      warn_unsupported_knobs_(session(), who, _text_sp);
+    }
+  }
+
   // End-of-response gating for barge-in. A streaming text producer
   // (text-chat's `stream` oport) splits ONE reply into several beats and
   // marks only the LAST with end_of_response=true; the earlier chunks
@@ -1041,13 +1202,13 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         ? genai::moss_rt_build_clone_grid(*_tokenizer, _ref_codes, pids)
         : genai::moss_rt_build_prompt_grid(*_tokenizer, pids);
     std::vector<std::int32_t> text_ids = _tokenizer->encode(rt_text);
-    // Audio codes MUST be sampled (the reference defaults: temp 0.8 / top_p
-    // 0.6 / top_k 30 / rep_pen 1.1); greedy degenerates into silence.
-    genai::MossSampling rt_sp;
-    rt_sp.temperature        = 0.8f;
-    rt_sp.top_k              = 30;
-    rt_sp.top_p              = 0.6f;
-    rt_sp.repetition_penalty = 1.1f;
+    // Audio codes MUST be sampled -- greedy degenerates into silence -- so an
+    // unwired audio sampler iport keeps the realtime variant's OWN reference
+    // defaults (temp 0.8 / top_p 0.6 / top_k 30 / rep_pen 1.1), which differ
+    // from the 8B/v1.5 numbers. A wired sampler-select replaces them.
+    const genai::SamplerParams rt_params =
+        _audio_sp_set ? _audio_sp : moss_rt_audio_default_sampler();
+    const genai::MossSampling rt_sp = moss_sampling_of(rt_params);
     const int rt_sr  = _lm_rt->sampling_rate();
     const int rt_nvq = _lm_rt->config().n_vq;   // active codebooks (16)
     const int max_f  = _max_frames > 0 ? _max_frames : 1000;
@@ -1094,11 +1255,11 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         return open && !new_text_pending();   // barge-in: stop on new text
       };
       frames = _lm_rt->generate(prompt_grid, text_ids, max_f, rt_sp,
-                                _sampler_seed, on_frame);
+                                rt_params.seed, on_frame);
       flush();
     } else {
       frames = _lm_rt->generate(
-          prompt_grid, text_ids, max_f, rt_sp, _sampler_seed,
+          prompt_grid, text_ids, max_f, rt_sp, rt_params.seed,
           [&](const std::vector<int>&) { return !new_text_pending(); });
     }
     const auto rt_gen = rtclock::now();
@@ -1242,13 +1403,9 @@ TextToSpeechStage::process(RuntimeContext& ctx)
                                            pids)
         : genai::moss_v15_build_tts_grid(*_tokenizer, v15_text, pids);
     if (grid.empty()) { co_return; }
-    // Audio RVQ codes MUST be sampled (defaults temp 1.7 / top_p 0.8 /
+    // Audio RVQ codes MUST be sampled (MOSS defaults temp 1.7 / top_p 0.8 /
     // top_k 25); greedy degenerates into silence after the first sentence.
-    genai::MossSampling v15_audio_sp;
-    v15_audio_sp.temperature        = static_cast<float>(_audio_temp);
-    v15_audio_sp.top_k              = _audio_top_k;
-    v15_audio_sp.top_p              = static_cast<float>(_audio_top_p);
-    v15_audio_sp.repetition_penalty = static_cast<float>(_audio_rep);
+    const genai::MossSampling v15_audio_sp = moss_sampling_of(_audio_sp);
     const int v15_sr = _codec_v15->sample_rate();
     const int v15_ch = _codec_v15->channels();
     // Build a PCM TensorBeat (channel-major [ch, samples]) from a wav vector.
@@ -1300,11 +1457,11 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         return open && !new_text_pending();   // barge-in: stop on new text
       };
       frames = _lm_v15->generate(grid, _max_frames, v15_audio_sp,
-                                 _sampler_seed, on_frame);
+                                 _audio_sp.seed, on_frame);
       flush();   // the final partial (< _stream_chunk) chunk
     } else {
       frames = _lm_v15->generate(
-          grid, _max_frames, v15_audio_sp, _sampler_seed,
+          grid, _max_frames, v15_audio_sp, _audio_sp.seed,
           [&](const std::vector<int>&) { return !new_text_pending(); });
     }
     const auto vt_gen = v15clock::now();
@@ -1487,18 +1644,12 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   }
 
   // 2. Sampled delay-pattern generation -> [G][1 + n_vq]. Separate audio +
-  // text sampling (config; defaults = MossTTSDelay-8B recommendation). Greedy
-  // (temperature <= 0) degenerates into silent loops, so sampling is default.
-  genai::MossSampling audio_sp;
-  audio_sp.temperature        = static_cast<float>(_audio_temp);
-  audio_sp.top_k              = _audio_top_k;
-  audio_sp.top_p              = static_cast<float>(_audio_top_p);
-  audio_sp.repetition_penalty = static_cast<float>(_audio_rep);
-  genai::MossSampling text_sp;
-  text_sp.temperature        = static_cast<float>(_text_temp);
-  text_sp.top_k              = _text_top_k;
-  text_sp.top_p              = static_cast<float>(_text_top_p);
-  text_sp.repetition_penalty = static_cast<float>(_text_rep);
+  // text sampling, each from its own sampler iport. Greedy audio
+  // (temperature <= 0) degenerates into silent loops, so the audio channel
+  // falls back to the MossTTSDelay-8B recommendation rather than to argmax;
+  // the text channel does fall back to greedy (it must follow the transcript).
+  const genai::MossSampling audio_sp = moss_sampling_of(_audio_sp);
+  const genai::MossSampling text_sp  = moss_sampling_of(_text_sp);
   // NOTE: the 8B delay-pattern path is not yet streamed -- de-delaying a real
   // frame needs its code channels from the next n_vq delayed rows, so streaming
   // it requires a rolling de-delay (a self-contained follow-up). It always
@@ -1510,7 +1661,7 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         this->id()));
   }
   auto gen = _lm->generate_delay(
-      prompt, _max_new_tokens, audio_sp, text_sp, _sampler_seed,
+      prompt, _max_new_tokens, audio_sp, text_sp, _audio_sp.seed,
       [&]() { return new_text_pending(); });   // barge-in: stop on new text
   const auto t_gen = clock::now();
   if (gen.empty()) {

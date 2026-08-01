@@ -65,6 +65,18 @@ TextPromptStage::spec() const noexcept
   return kSpec;
 }
 
+void
+TextPromptStage::reset_run_state()
+{
+  // Per-launch reset. Stopping a pipeline destroys the RUNTIME, not the
+  // stages: only unload / re-materialize destroys a Stage, so a plain
+  // Stop-then-Start re-enters initialize() with this source already
+  // exhausted from the previous run. Without this it would emit nothing
+  // and signal done immediately, and every stage downstream of the prompt beat
+  // would sit idle while the pipeline "completed" in milliseconds.
+  _done = false;
+}
+
 Job
 TextPromptStage::process(RuntimeContext& ctx)
 {

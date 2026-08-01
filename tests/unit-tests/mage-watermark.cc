@@ -111,6 +111,40 @@ TEST(mage_watermark, pad_and_pos_match_numpy)
   }
 }
 
+// The same reproduction, but far enough into the PCG64 stream to matter. The
+// case above stops at 4096 entries; a 1536x1024 edit draws 128*96*64 = 786432
+// pad values and then as many pos values, so a bounded-integer path that only
+// agrees with numpy for the first few thousand draws (numpy buffers bits for
+// the range-2 `pad` draw and uses Lemire rejection for `pos`) would pass the
+// small golden and still de-randomize the watermark at real resolutions.
+TEST(mage_watermark, pad_and_pos_match_numpy_at_edit_scale)
+{
+  const std::string G = golden_dir_();
+  if (G.empty()) { return; }
+  constexpr std::size_t kBig = 128u * 96u * 64u;
+  const std::vector<std::uint8_t> gpad =
+      read_bin_<std::uint8_t>(G + "/pad_n786432.u8");
+  const std::vector<std::uint16_t> gpos =
+      read_bin_<std::uint16_t>(G + "/pos_n786432.u16");
+  if (gpad.size() != kBig || gpos.size() != kBig) {
+    std::printf("[mage_watermark] large-n golden missing; skipping\n");
+    return;
+  }
+  std::vector<std::uint8_t> pad;
+  std::vector<std::uint16_t> pos;
+  mage_wm::pad_and_pos(kBig, "20260720", pad, pos);
+  ASSERT_TRUE(pad.size() == kBig && pos.size() == kBig);
+  std::size_t bpad = 0, bpos = 0, first = kBig;
+  for (std::size_t i = 0; i < kBig; ++i) {
+    if (pad[i] != gpad[i]) { bpad++; if (i < first) { first = i; } }
+    if (pos[i] != gpos[i]) { bpos++; if (i < first) { first = i; } }
+  }
+  std::printf("[mage_watermark] n=%zu pad mismatched=%zu pos mismatched=%zu"
+              " (first divergence at %zu)\n", kBig, bpad, bpos, first);
+  EXPECT_TRUE(bpad == 0);
+  EXPECT_TRUE(bpos == 0);
+}
+
 // End to end on our own side: the encoded noise must be detectable (raw
 // accuracy ~1) under the same key, undetectable (~0.5) under a different one,
 // and still look like standard normal noise.

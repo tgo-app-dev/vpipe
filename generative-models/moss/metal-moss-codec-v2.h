@@ -32,6 +32,7 @@ namespace vpipe { class SessionContextIntf; }
 namespace vpipe::genai {
 
 class MetalLlamaWeights;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalMossCodecV2 {
 public:
@@ -40,6 +41,16 @@ public:
   // works. Decode-only callers pass false (the default) and pay nothing.
   static std::unique_ptr<MetalMossCodecV2> load(
       const std::string& model_dir, metal_compute::MetalCompute* mc,
+      bool with_encoder = false);
+
+  // Preferred: shares the caller's checkpoint. Two codecs over one
+  // directory -- e.g. one asked for the encoder and one did not -- share
+  // every decoder tensor; the encoder half is still only built by the
+  // caller that asked for it.
+  //
+  // The returned codec KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalMossCodecV2> load(
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
       bool with_encoder = false);
 
   bool valid() const { return _ok; }
@@ -148,7 +159,7 @@ private:
     std::vector<Layer> layers;
   };
 
-  bool init_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
+  bool init_(WeightSet& wts, metal_compute::MetalCompute* mc,
              bool with_encoder);
   // Runs one decoder transformer stage. In one-shot mode (kc/vc null) T is the
   // full frame count and K/V come from the local per-call buffers. In STREAMING
@@ -220,6 +231,8 @@ private:
   bool _use_attn_mma = false;
   metal_compute::ComputeLibrary  _lib_sdpa_mma;
   metal_compute::ComputeFunction _fn_sdpa_mma;
+  // The checkpoint, held for this codec's whole life.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

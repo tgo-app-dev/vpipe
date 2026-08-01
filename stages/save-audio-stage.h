@@ -62,6 +62,7 @@ public:
                  FlexData                  config);
   ~SaveAudioStage() override;
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -95,6 +96,11 @@ private:
   int         _bitrate{};
   int         _sample_rate{};
 
+  // Per-run: `_files_written` is the filename index (2nd+ file in a RUN
+  // gets out-001.aac). The stage survives a stop/relaunch, so without a
+  // reset the next launch starts at 1 and writes out-001.aac instead of
+  // rewriting the file the user configured. Between launches, naming is
+  // the operator's business -- reconfigure the stage.
   std::uint64_t _files_written = 0;
 };
 

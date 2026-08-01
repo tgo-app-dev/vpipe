@@ -94,6 +94,17 @@ public:
   // queue drains. Idempotent.
   void close();
 
+  // Re-arm a closed channel for a NEW stream, IN PLACE. A relaunched
+  // preview stage calls this instead of minting a fresh channel: the
+  // view backend and any test holding the shared_ptr keep the same
+  // object, so nobody is stranded on an orphaned one. The retained
+  // config / init-segment / still are dropped -- they described the old
+  // stream, and a subscriber that replayed them against the new one
+  // would rebuild MediaSource from a stale init segment. Existing
+  // subscribers stay attached and pick the new stream up from its
+  // config + init. Idempotent on an already-open channel.
+  void reopen();
+
   // ---- discovery (any thread) ---------------------------------------
 
   bool has_video() const noexcept;

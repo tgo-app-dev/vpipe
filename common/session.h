@@ -94,6 +94,10 @@ public:
 
   std::unique_ptr<UiTextStream> open_text_stream() const override;
 
+  UiInterruptToken
+  register_interrupt_handler(std::string        label,
+                             UiInterruptHandler fn) const override;
+
   std::string language() const override;
 
   // Install the user-facing I/O delegate (error/warn/info + getline).

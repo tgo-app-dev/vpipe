@@ -2,6 +2,7 @@
 //
 // Usage:
 //   vpipe-web-ui [--bind ADDR] [--port N] [--config CFG]
+//                [--memory-cap-mb N]
 //
 //   --bind      interface to listen on (default: this machine's LAN
 //               address, i.e. en0's IPv4, so the UI is reachable from
@@ -10,6 +11,12 @@
 //   --port      TCP port (default 9876; 0 = pick any free port)
 //   --config    session config string forwarded to create_session
 //               (inline JSON, a path, or empty for defaults)
+//   --memory-cap-mb  ceiling on actively-resident model weights + KV.
+//               Over it the least-recently-used weights are PARKED
+//               (handed to the kernel as purgeable, reclaimed only
+//               under real pressure, taken back on next use) rather
+//               than loads refused. Same as session config
+//               memory_cap_mb; 0/unset = uncapped.
 //
 // The UI assets are embedded in the binary and served from memory.
 // Hidden override (not in --help): --doc-root DIR / $VPIPE_WEBUI_DOCROOT
@@ -21,6 +28,7 @@
 
 #include "apps/web-ui/embedded-assets.h"
 #include "apps/web-ui/http-server.h"
+#include "apps/web-ui/qr-code.h"
 #include "apps/web-ui/session-api.h"
 #include "apps/web-ui/startup-checks.h"
 #include "apps/web-ui/web-ui-delegate.h"
@@ -163,6 +171,12 @@ print_usage_(const char* prog)
     "                 works in a secure context (HTTPS or localhost). The\n"
     "                 cert is self-signed, so accept the one-time browser\n"
     "                 warning. Requires an OpenSSL-enabled build.\n"
+    "  --show-qr      Also print a QR code for a one-scan link that\n"
+    "                 carries the access key, so a phone does not have to\n"
+    "                 retype it. Scanning opens the UI already\n"
+    "                 authenticated and drops the key from the address\n"
+    "                 bar. The link is a long secret in a URL: it is only\n"
+    "                 as private as the console showing it.\n"
     "  -h, --help     Show this help and exit.\n"
     "\n"
     "Remote access: connections from other computers must supply the\n"
@@ -177,6 +191,24 @@ random_key_(size_t n = 8)
 {
   static const char alpha[] =
       "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  std::random_device rd;
+  std::uniform_int_distribution<size_t> dist(0, sizeof(alpha) - 2);
+  string out;
+  out.reserve(n);
+  for (size_t i = 0; i < n; ++i) { out.push_back(alpha[dist(rd)]); }
+  return out;
+}
+
+// The --show-qr link secret. UPPER CASE on purpose, from the alphabet a
+// QR alphanumeric segment allows: that mode packs 5.5 bits per character
+// where byte mode spends 8, which is the difference between a 25x25
+// symbol and a larger one for a typical LAN URL. 14 characters of a
+// 32-symbol alphabet is 70 bits -- far more than the 8-char console key,
+// which is what a secret living in a URL should be.
+string
+random_qr_key_(size_t n = 14)
+{
+  static const char alpha[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   std::random_device rd;
   std::uniform_int_distribution<size_t> dist(0, sizeof(alpha) - 2);
   string out;
@@ -222,6 +254,10 @@ main(int argc, char** argv)
              env_root != nullptr && *env_root != '\0') {
     doc_root = env_root;
   }
+  // Forwarded through the environment for the same reason as the CLI:
+  // the model manager is not reachable from the public SessionIntf.
+  const string cap = arg_value_(argc, argv, "--memory-cap-mb", "");
+  if (!cap.empty()) { ::setenv("VPIPE_MEMORY_CAP_MB", cap.c_str(), 1); }
   string cfg       = arg_value_(argc, argv, "--config", "");
   int    port      = static_cast<int>(strtol(port_str.c_str(), nullptr, 10));
 
@@ -353,11 +389,28 @@ main(int argc, char** argv)
     }
   }
 
+  // DECLARATION ORDER IS LOAD-BEARING. Handler threads run inside the
+  // server and borrow the api (and, through its view host, the session's
+  // pipelines), so the SERVER must be destroyed first -- its destructor
+  // stops accepting and drains the handlers. Declaring the api first
+  // makes it outlive them. Reversed, the api is torn down while handlers
+  // are still running and the first one to take its mutex aborts the
+  // process on shutdown.
+  webui::SessionApi api(session, ui, log);
   webui::HttpServer server(bind_addr, port, doc_root);
   string auth_key = random_key_();
   server.set_auth_key(auth_key);
-  webui::SessionApi api(session, ui, log);
+  const bool show_qr = has_flag_(argc, argv, "--show-qr");
+  string qr_key;
+  if (show_qr) {
+    qr_key = random_qr_key_();
+    server.set_qr_key(qr_key);
+  }
   api.register_routes(server);
+  // Publish the view host through the UI delegate, so a stage reaching
+  // for its session's delegate can tell a graphical front end is
+  // attached and enumerate stages for its own panel.
+  if (ui != nullptr) { ui->set_view_host(api.view_host()); }
 
   // HTTPS (opt-in): must be enabled before start(). A self-signed cert is
   // generated + cached under ~/.vpipe/webui-tls on first run. Required for
@@ -409,6 +462,46 @@ main(int argc, char** argv)
   printf("Remote access key: %s%s%s\n", key_c, auth_key.c_str(), rst);
   printf("  (localhost connects without a key; other computers must "
          "enter this key)\n");
+
+  // --show-qr: the same access, as something a phone camera can take.
+  // The scheme and host are UPPER-CASED for the symbol only -- both are
+  // case-insensitive per RFC 3986, and staying inside the QR
+  // alphanumeric set is what keeps a typical LAN URL down to a 25x25
+  // symbol. The path is already upper case by construction.
+  //
+  // The URL itself is NOT printed. It carries the link secret in plain
+  // text, so echoing it beside the symbol would put on the console --
+  // and into any scrollback, screen share or terminal log -- exactly
+  // what the QR exists to keep off it. The symbol is the only rendering.
+  if (show_qr) {
+    string host = bind_addr;
+    for (char& ch : host) { ch = static_cast<char>(toupper(ch)); }
+    string scheme_up = server.tls_enabled() ? "HTTPS" : "HTTP";
+    const string url = scheme_up + "://" + host + ":"
+                     + std::to_string(server.bound_port()) + "/" + qr_key;
+    const webui::QrCode qr = webui::qr_encode(url);
+    if (qr.version == 0) {
+      // Cannot happen for a v4 address at this key length, and the
+      // fallback is the key above rather than the link -- printing the
+      // link would defeat the point of hiding it.
+      printf("  (address too long for a QR symbol -- use the key above)\n");
+    } else {
+      printf("  (alternatively, scan the QR code to get authenticated)\n");
+      printf("\n");
+      fputs(webui::qr_terminal(qr, color).c_str(), stdout);
+    }
+    // Conditional, and only where the symbol would otherwise fail
+    // silently: a scan that cannot reach the host, or one that lands on
+    // a certificate warning, both look like "the QR code is broken".
+    if (bind_addr == "127.0.0.1" || bind_addr == "localhost") {
+      printf("  %sNOTE%s: bound to loopback, so only this machine can "
+             "reach it. Use --bind <lan-ip> for a phone.\n", key_c, rst);
+    }
+    if (server.tls_enabled()) {
+      printf("  NOTE: with --tls the certificate is self-signed, so the "
+             "phone shows a warning to accept first.\n");
+    }
+  }
   fflush(stdout);
 
   // Quick permission self-tests (local network / full disk / mic) -- print

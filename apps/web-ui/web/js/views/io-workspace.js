@@ -16,10 +16,22 @@
 
 import { el, clear } from '../dom.js';
 import { mountUserIo } from './user-io.js';
-import { mountPreview } from './preview-video.js';
 import { mountHlsVideo } from './hls-video.js';
 import { mountLog } from './log.js';
+import { stageViewPanelTypes } from '../stage-views.js';
 import { t } from '../i18n.js';
+
+// Panels a STAGE provides (module embedded in libvpipe, discovered from
+// the backend -- see stage-views.js). Fetched once at module load; the
+// empty-pane chooser lists whatever has arrived, and mountView resolves
+// a type against it. The app's own pane types (text I/O, HLS, log) stay
+// hard-wired below.
+let stageViews = [];
+const stageViewsReady = stageViewPanelTypes()
+  .then((types) => { stageViews = types; })
+  .catch(() => { /* no backend views: the built-ins still work */ });
+const stageViewDef = (type) =>
+  stageViews.find((d) => d.type === type) || null;
 
 // The composed workspace persists for the life of the page (until the
 // connection is lost -> a reload re-imports this module and resets it).
@@ -116,15 +128,17 @@ export function mountIoWorkspace(container) {
     clear(leaf.bodyEl);
     clear(leaf.actions);
     leaf.view = view;
-    if (view === 'text') {
+    const sv = stageViewDef(view);
+    if (sv) {
+      // A stage-provided panel. Its config is per-pane and not persisted
+      // here (this workspace has no saved layout), so it starts empty.
+      setTitle(leaf, t(sv.labelKey));
+      leaf.cleanup = sv.mount(leaf.bodyEl, leaf.actions, {}, {
+        onTitle: (title) => setTitle(leaf, title),
+      });
+    } else if (view === 'text') {
       setTitle(leaf, t('nav.io'));
       leaf.cleanup = mountUserIo(leaf.bodyEl, leaf.actions);
-    } else if (view === 'preview') {
-      setTitle(leaf, t('io.preview'));
-      leaf.cleanup = mountPreview(leaf.bodyEl, leaf.actions, {
-        stream: opts && opts.stream,
-        onTitle: (t) => setTitle(leaf, t),
-      });
     } else if (view === 'hls') {
       setTitle(leaf, t('io.hls'));
       leaf.cleanup = mountHlsVideo(leaf.bodyEl, leaf.actions, {
@@ -141,19 +155,26 @@ export function mountIoWorkspace(container) {
   }
 
   function mountEmpty(leaf) {
-    // Text I/O is a singleton and already present. HLS and Session Log
-    // may be added freely.
+    // Text I/O is a singleton and already present. Every stage-provided
+    // panel plus HLS and Session Log may be added freely.
+    const choices = el('div', { class: 'io-empty-choices' },
+      el('button', { class: 'btn',
+        onclick: () => mountView(leaf, 'hls') }, t('io.hls')),
+      el('button', { class: 'btn',
+        onclick: () => mountView(leaf, 'log') }, t('io.session_log')));
     leaf.bodyEl.append(el('div', { class: 'io-empty' },
       el('div', { class: 'io-empty-title' }, t('io.add_view')),
-      el('div', { class: 'io-empty-choices' },
-        el('button', { class: 'btn primary',
-          onclick: () => mountView(leaf, 'preview') }, t('io.preview')),
-        el('button', { class: 'btn',
-          onclick: () => mountView(leaf, 'hls') }, t('io.hls')),
-        el('button', { class: 'btn',
-          onclick: () => mountView(leaf, 'log') }, t('io.session_log'))),
-      el('div', { class: 'io-empty-hint' },
-        t('io.more_soon'))));
+      choices,
+      el('div', { class: 'io-empty-hint' }, t('io.more_soon'))));
+    // Discovery may still be in flight on a fast first paint; splice the
+    // stage panels in ahead of the built-ins once they land.
+    stageViewsReady.then(() => {
+      if (!choices.isConnected) { return; }
+      for (const d of stageViews) {
+        choices.prepend(el('button', { class: 'btn',
+          onclick: () => mountView(leaf, d.type) }, t(d.labelKey)));
+      }
+    });
   }
 
   function paneMenu(leaf, anchor) {

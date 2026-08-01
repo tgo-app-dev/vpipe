@@ -82,6 +82,10 @@ public:
   int        height        = 240;
   AVRational fps           = {30, 1};
 
+  // The very thing Stage::reset_run_state exists for: without this the
+  // source is exhausted after run 1 and a relaunch emits nothing.
+  void reset_run_state() override { _header_sent = false; _pts = 0; }
+
   Job process(RuntimeContext& ctx) override
   {
     const FFmpegLibraries& libs = *session()->ffmpeg_libraries();
@@ -226,6 +230,55 @@ TEST(video_stages, encoder_unit_with_synth_frames) {
 
   size_t sz = file_size_or_zero_(out_path);
   EXPECT_TRUE(sz > 0);
+  remove(out_path.c_str());
+}
+
+// save-video across a RELAUNCH. This is the sharpest case of the
+// per-run-state class: drain() finalizes the file and leaves
+// _video_eos / _finalized / _header_written set, so before
+// reset_run_state() a second launch saw itself as already finished and
+// wrote NOTHING AT ALL -- no file, no warning.
+TEST(video_stages, encoder_relaunch_writes_again) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string out_path = tmp_path_("enc-relaunch", ".mp4");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 10;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto enc_u = make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+  pl->insert_stage(std::move(enc_u));
+
+  size_t first = 0;
+  for (int run = 0; run < 2; ++run) {
+    remove(out_path.c_str());
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    const size_t sz = file_size_or_zero_(out_path);
+    if (run == 0) { first = sz; }
+    // Every launch must produce a real file, not just the first.
+    EXPECT_TRUE(sz > 0);
+  }
+  EXPECT_TRUE(first > 0);
   remove(out_path.c_str());
 }
 

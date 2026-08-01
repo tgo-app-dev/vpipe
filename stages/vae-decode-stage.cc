@@ -5,6 +5,8 @@
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
 
@@ -34,6 +36,18 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   _hf_dir    = attr_str("hf_dir");
   _models_db = attr_str("models_db");
   if (_models_db.empty()) { _models_db = "models"; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  {
+    bool bad = false;
+    _unload_cfg = model_memory::parse_unload_policy(
+        attr_str("unload_when_idle"), &bad);
+    if (bad) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): unload_when_idle '{}' is not auto|always|never; "
+          "using auto", this->id(), attr_str("unload_when_idle")));
+    }
+  }
+#endif
   allocate_oports(spec().oports.size());
 }
 
@@ -51,9 +65,18 @@ const ConfigKey kAttrs[] = {
           "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
           "model iport overrides it",
    .suggest_db = "models",
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
+   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "boogu-image,boogu-image-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
+  {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
+   .doc = "drop the VAE weights after each beat and reload on the next one. "
+          "This stage is idle for the whole denoise, so on a memory-bounded box "
+          "releasing it (weights AND the decode working set) is what lets a "
+          "large DiT run in the same machine. \"auto\" (default) decides from "
+          "physical RAM vs the pipeline's weight bytes; \"always\" / "
+          "\"never\" force it",
+   .def_str = "auto"},
 };
 const PortSpec kIports[] = {
   {.name = "latent", .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
@@ -96,6 +119,11 @@ vae_family_(const std::string& vae_dir)
       if (obj.contains("_class_name")) {
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "AutoencoderKLFlux2") { return "flux2"; }
+        // The PLAIN diffusers AutoencoderKL (the FLUX.1 VAE Boogu-Image uses)
+        // runs on the SAME code path -- MetalFlux2Vae is config-driven, and at
+        // patch 1 with a scalar shift/scale whitening it IS a plain
+        // AutoencoderKL. Same family string, so the branches below are shared.
+        if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
       }
     }
@@ -138,6 +166,38 @@ VaeDecodeStage::spec() const noexcept
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
+void
+VaeDecodeStage::reset_run_state()
+{
+  // If a previous run left the weights UNLOADED (the idle-unload
+  // policy drops them between beats), let this launch load them again:
+  // ensure_loaded_'s once-only guard is per-Stage, not per-launch, so
+  // without this the stage stays inert for the whole run. When the
+  // weights are still held we deliberately leave the guard set --
+  // reloading on top of a resident copy is exactly what doubles peak
+  // memory.
+  if (!_vae && !_flux2_vae && !_mage_vae) {
+    _load_attempted = false;
+    _unloaded       = false;
+  }
+
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _model_latched = false;
+
+}
+
+std::vector<std::string>
+VaeDecodeStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  return {(fs::path(root) / "vae").string()};
+}
+
 Job
 VaeDecodeStage::initialize(RuntimeContext& ctx)
 {
@@ -148,6 +208,37 @@ VaeDecodeStage::initialize(RuntimeContext& ctx)
       ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
   if (!model_from_iport) { ensure_loaded_(); }
   co_return;
+}
+
+// Loading chatter: info on the first load, debug on an idle-unload reload (a
+// bounded box reloads per beat, and one line per frame is noise).
+void
+VaeDecodeStage::load_note_(const VpipeFormat& msg) const
+{
+  if (_quiet_reload) { session()->log_debug(msg); }
+  else               { session()->info(msg); }
+}
+
+void
+VaeDecodeStage::unload_vae_()
+{
+  if (!_vae && !_flux2_vae && !_mage_vae) { return; }
+  _vae.reset();
+  _flux2_vae.reset();
+  _mage_vae.reset();
+  _unloaded = true;
+  _quiet_reload = true;
+  session()->log_debug(fmt("VaeDecodeStage('{}'): VAE decoder unloaded (idle)",
+                           this->id()));
+}
+
+void
+VaeDecodeStage::reload_vae_()
+{
+  if (!_unloaded) { return; }
+  _unloaded = false;
+  _load_attempted = false;      // let ensure_loaded_ run its body again
+  ensure_loaded_();
 }
 
 void
@@ -169,6 +260,31 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  // Idle-unload decision (auto: the DiT + text encoder of this same pipeline are
+  // resident during a run, so size the box against THEIR weights -- the VAE's
+  // own are small, it is the decode working set that has to fit beside them).
+  if (!_unload_resolved) {
+    _unload_resolved = true;
+    const std::vector<std::string> peers = {
+        (std::filesystem::path(root) / "transformer").string(),
+        (std::filesystem::path(root) / "text_encoder").string(),
+        (std::filesystem::path(root) / "mllm").string()};
+    const std::size_t fp = model_memory::weight_footprint(session(), peers);
+    switch (_unload_cfg) {
+      case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+      case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+      default:
+        _unload_idle =
+            model_memory::bounded(session(), peers, model_memory::kHeadroom);
+        break;
+    }
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): peer footprint {} MB + {} MB headroom vs {} MB "
+        "RAM, unload_when_idle={} -> {}", this->id(), fp >> 20,
+        model_memory::kHeadroom >> 20, model_memory::phys_ram() >> 20,
+        model_memory::unload_policy_name(_unload_cfg),
+        _unload_idle ? "UNLOAD after each beat" : "keep resident"));
+  }
   namespace fs = std::filesystem;
   std::string vae_dir = root;
   if (fs::exists(fs::path(root) / "vae" / "config.json")) {
@@ -176,6 +292,21 @@ VaeDecodeStage::ensure_loaded_()
   }
 
   _family = vae_family_(vae_dir);
+  // One shared, reference-counted view of this checkpoint. The peer VAE
+  // stage in the same graph (encode beside decode) names the same
+  // directory and gets the SAME set, so the two halves of the model are
+  // loaded once between them instead of once each -- and two pipelines
+  // running the same model share it too.
+  // Falls back to a private set when the session has no manager; see
+  // open_weight_set().
+  std::shared_ptr<genai::WeightSet> ws =
+      genai::open_weight_set(vae_dir, session());
+  if (!ws) {
+    session()->error(fmt(
+        "{}('{}'): no readable checkpoint under '{}'; inert",
+        "VaeDecodeStage", this->id(), vae_dir));
+    return;
+  }
   if (_family == "flux2") {
     // FLUX.2 AutoencoderKLFlux2: read the geometry from config.json; the latent
     // whitening (patch + BatchNorm) is internal, so no latents_mean/std here.
@@ -206,24 +337,25 @@ VaeDecodeStage::ensure_loaded_()
         }
       }
     }
-    session()->info(fmt(
-        "VaeDecodeStage('{}'): loading FLUX.2 VAE from '{}'", this->id(),
-        vae_dir));
-    _flux2_vae = genai::MetalFlux2Vae::load(vae_dir, mc, fcfg);
+    load_note_(fmt(
+        "VaeDecodeStage('{}'): loading 2D AutoencoderKL ({}) from '{}'",
+        this->id(), fcfg.patch > 1 ? "FLUX.2, patchified" : "plain", vae_dir));
+    _flux2_vae = genai::MetalFlux2Vae::load(ws, mc, fcfg);
     if (!_flux2_vae) {
       session()->error(fmt(
-          "VaeDecodeStage('{}'): failed to load the FLUX.2 VAE from '{}'; inert",
+          "VaeDecodeStage('{}'): failed to load the AutoencoderKL from '{}'; "
+          "inert",
           this->id(), vae_dir));
     }
     return;
   }
 
   if (_family == "mage") {
-    session()->info(fmt("VaeDecodeStage('{}'): loading MageVAE from '{}'",
+    load_note_(fmt("VaeDecodeStage('{}'): loading MageVAE from '{}'",
                         this->id(), vae_dir));
     // Decode-only here: the encoder half (student.dconv_encoder.*) is the
     // vae-encode stage's business, and skipping it saves ~67M params.
-    _mage_vae = genai::MetalMageVae::load(vae_dir, mc,
+    _mage_vae = genai::MetalMageVae::load(ws, mc,
                                           mage_vae_config_(vae_dir),
                                           /*with_encoder=*/false);
     if (!_mage_vae) {
@@ -273,10 +405,10 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
-  session()->info(fmt(
+  load_note_(fmt(
       "VaeDecodeStage('{}'): loading Qwen-Image VAE from '{}'", this->id(),
       vae_dir));
-  _vae = genai::MetalKrea2Vae::load(vae_dir, mc, cfg);
+  _vae = genai::MetalKrea2Vae::load(ws, mc, cfg);
   if (!_vae) {
     session()->error(fmt(
         "VaeDecodeStage('{}'): failed to load the VAE from '{}'; inert",
@@ -288,6 +420,29 @@ VaeDecodeStage::ensure_loaded_()
       "num_res_blocks {})", this->id(), vae_dir, cfg.z_dim, cfg.base_dim,
       cfg.num_res_blocks));
 }
+
+
+namespace {
+
+// Carry the generating model forward. text-to-image stamps `model_name` onto
+// the latent's sideband; the decoded image inherits it so a downstream
+// save-image can record what produced the pixels. Anything else already on
+// the latent's sideband is left behind -- it describes the LATENT, not the
+// image -- and nothing is invented when the producer sent no name.
+void
+forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
+{
+  if (!src.sideband.is_object()) { return; }
+  FlexData sb = src.sideband;             // as_object() is a view: keep it
+  auto o = sb.as_object();
+  if (!o.contains("model_name")) { return; }
+  FlexData out = dst.sideband.is_object() ? dst.sideband
+                                          : FlexData::make_object();
+  out.as_object().insert_or_assign("model_name", o.at("model_name"));
+  dst.sideband = std::move(out);
+}
+
+}  // namespace
 
 Job
 VaeDecodeStage::process(RuntimeContext& ctx)
@@ -307,6 +462,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   }
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }   // upstream EOS -> close oport
+  // A previous beat may have dropped the VAE to leave the denoise room.
+  if (_unloaded) { reload_vae_(); }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
   if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32 ||
       tbp->shape.size() != 3) {
@@ -315,10 +472,50 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         "got {}; skipping", this->id(), in->describe()));
     co_return;
   }
+  // ---- Content-policy refusal ------------------------------------------
+  // A prompt the Mage-Flow content screen refused never reaches a DiT, so
+  // there is no latent to decode -- the upstream beat is a marker carrying
+  // only the intended image size. Paint the reference's refusal image (a
+  // plain white frame: no text, no category, nothing that would tell a
+  // prober WHICH rule they hit) and emit it in the generated image's place.
+  // No VAE needed, so this runs even when the VAE never loaded.
+  if (tbp->sideband.is_object()) {
+    FlexData sb = tbp->sideband;          // as_object() is a view: keep it
+    auto o = sb.as_object();
+    if (o.contains("content_blocked")
+        && o.at("content_blocked").as_bool(false)) {
+      const int H = o.contains("refusal_height")
+                        ? (int)o.at("refusal_height").as_int(0) : 0;
+      const int W = o.contains("refusal_width")
+                        ? (int)o.at("refusal_width").as_int(0) : 0;
+      if (H <= 0 || W <= 0) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): refusal beat carries no image size; "
+            "dropping", this->id()));
+        co_return;
+      }
+      auto out = std::make_unique<TensorBeatPayload>();
+      out->dtype = TensorBeat::DType::U8;
+      out->shape = {3, H, W};
+      const std::size_t n = (std::size_t)3 * H * W;
+      out->resize_contiguous(n);
+      std::memset(out->as_u8(), 0xff, n);      // white
+      ++_images_emitted;
+      session()->info(fmt(
+          "VaeDecodeStage('{}'): content-policy refusal -> blank {}x{} image",
+          this->id(), W, H));
+      forward_model_name_(*tbp, *out);
+      if (_unload_idle) { unload_vae_(); }
+      co_await ctx.write(0, std::move(out));
+      co_return;
+    }
+  }
+
   auto* mc = session()->metal_compute();
 
-  // ---- FLUX.2: input [dit_channels, H/16, W/16]; decode directly (the patch +
-  // BatchNorm whitening is internal), no per-channel un-whiten. ----
+  // ---- 2D AutoencoderKL (FLUX.2 / the plain FLUX.1 VAE): input
+  // [dit_channels, H/px, W/px] with px = 8*patch; decode directly (the
+  // patch + whitening is internal), no per-channel un-whiten. ----
   if (_family == "flux2") {
     if (!_flux2_vae) {
       session()->warn(fmt(
@@ -335,6 +532,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           _flux2_vae->config().dit_channels()));
       co_return;
     }
+    // Pixels per latent cell: the conv trunk is 8x, times the VAE's patch
+    // factor (2 on AutoencoderKLFlux2, 1 on the plain AutoencoderKL).
+    const int px = 8 * _flux2_vae->config().patch;
     const std::size_t nz = (std::size_t)Cdit * h16 * w16;
     metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
     { auto* d = static_cast<_Float16*>(z.contents());
@@ -345,16 +545,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     {   // LLM-lane perf event: one VAE decode per image (value = pixel count).
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
                          kPerfLlmVaeBegin,
-                         (std::uint64_t)(h16 * 16) * (w16 * 16));
+                         (std::uint64_t)(h16 * px) * (w16 * px));
       rgb = _flux2_vae->decode(z, h16, w16, &derr);
     }
     if (rgb.empty()) {
       session()->warn(fmt(
-          "VaeDecodeStage('{}'): FLUX.2 decode failed ({}); skipping",
+          "VaeDecodeStage('{}'): AutoencoderKL decode failed ({}); skipping",
           this->id(), derr.empty() ? "unknown error" : derr));
       co_return;
     }
-    const int H = h16 * 16, W = w16 * 16;
+    const int H = h16 * px, W = w16 * px;
     const std::size_t n = (std::size_t)3 * H * W;
     auto out = std::make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::U8;
@@ -371,8 +571,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     }
     ++_images_emitted;
     session()->log_debug(fmt(
-        "VaeDecodeStage('{}'): FLUX.2 decoded + emitted image #{} [3, {}, {}]",
+        "VaeDecodeStage('{}'): AutoencoderKL decoded + emitted image #{} "
+        "[3, {}, {}]",
         this->id(), _images_emitted, H, W));
+    forward_model_name_(*tbp, *out);
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -434,6 +637,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): MageVAE decoded + emitted image #{} [3, {}, {}]",
         this->id(), _images_emitted, H, W));
+    forward_model_name_(*tbp, *out);
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -503,6 +708,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   session()->log_debug(fmt(
       "VaeDecodeStage('{}'): decoded + emitted image #{} planar U8 RGB "
       "[3, {}, {}]", this->id(), _images_emitted, H, W));
+  forward_model_name_(*tbp, *out);
+  if (_unload_idle) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));
 }
 

@@ -14,6 +14,7 @@ namespace vpipe {
 namespace genai {
 
 class MetalLlamaWeights;   // fwd
+class WeightSet;           // generative-models/weight-set.h
 class I8GemmContext;       // fwd (shared/i8-gemm.h)
 
 // FLUX.2-klein denoiser (Flux2Transformer2DModel): a FLUX-topology flow-matching
@@ -86,6 +87,14 @@ class MetalFlux2Transformer {
   // 0 => pure streaming.
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+
+  // Prefer this overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so two pipelines running
+  // this model share its weights instead of loading a copy each. The dir
+  // overload opens a PRIVATE set (tests, and callers with no session).
+  static std::unique_ptr<MetalFlux2Transformer>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
 
   ~MetalFlux2Transformer();
@@ -192,18 +201,32 @@ class MetalFlux2Transformer {
     QWeight o;                             // to_out
   };
 
-  QWeight load_qw_(const MetalLlamaWeights& wts, const std::string& name);
+  // Whether a load is RETAINED for the model's life or read once and
+  // thrown away. Explicit, not a mode flag: the same loaders serve the
+  // preloaded/pinned blocks AND the per-forward streamed ones, and
+  // caching a streamed block would silently undo streaming, putting the
+  // whole DiT back in RAM on the box least able to hold it.
+  enum class Retain { Cached, Streamed };
+
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // bf16 view of a checkpoint tensor. Cached ones go through the weight
+  // set so a second model over this checkpoint shares them; streamed
+  // ones are rebuilt per forward and retained by nobody.
+  metal_compute::SharedBuffer
+  elt_(WeightSet& ws, const std::string& nm, Retain r);
   // Reorder a fused [2*INNER,K] gate|up weight's rows from concatenated (gate
   // block then up block) to INTERLEAVED (row 2g = gate_g, 2g+1 = up_g), in
   // place, so the fused-SwiGLU epilogue reads even col = gate, odd col = up.
-  void interleave_gu_(QWeight& qw);
+  void interleave_gu_(WeightSet& ws, const std::string& key, QWeight& qw,
+                      Retain r);
   // Extract rows [start, start+count) of a QWeight into a fresh QWeight (dense
   // or quantized -- the codes/scales/biases rows are the N dimension).
-  QWeight slice_rows_(const QWeight& src, int start, int count);
-  bool load_double_(const MetalLlamaWeights& wts, const std::string& pre,
-                    DoubleBlock& b);
-  bool load_single_(const MetalLlamaWeights& wts, const std::string& pre,
-                    SingleBlock& b);
+  QWeight slice_rows_(WeightSet& ws, const std::string& key,
+                      const QWeight& src, int start, int count, Retain r);
+  bool load_double_(WeightSet& ws, const std::string& pre,
+                    DoubleBlock& b, Retain r);
+  bool load_single_(WeightSet& ws, const std::string& pre,
+                    SingleBlock& b, Retain r);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -224,20 +247,24 @@ class MetalFlux2Transformer {
   std::vector<SingleBlock> _single;   // pinned prefix (all when preloaded)
 
   // Streaming mode: blocks past the pinned prefix (_pinned_d double, _pinned_s
-  // single) are loaded on demand from the retained source mmap (_stream_wts)
-  // per forward and freed after use.
+  // single) are loaded on demand from the weight set per forward and
+  // freed after use.
   bool _stream_blocks = false;
   int _pinned_d = 0;                  // pinned leading double blocks (streaming)
   int _pinned_s = 0;                  // pinned leading single blocks (streaming)
   // Zero-copy mmap of the quantized weight tensors (codes/scales/qbias) as
-  // read-only views aliasing the retained source mmap (_stream_wts), instead of
-  // owned copies. The pages are clean + file-backed, so the OS can reclaim the
+  // read-only views aliasing the weight set's mmap, instead of owned
+  // copies. The pages are clean + file-backed, so the OS can reclaim the
   // DiT's resident footprint under memory pressure (e.g. a large VAE decode)
   // and re-fault from the file later -- the Krea-2 DiT does the same. On by
   // default when preloading; off in streaming mode (blocks already re-read JIT)
   // and via VPIPE_FLUX2_NO_MMAP_WEIGHTS. Requires the model on local SSD.
   bool _mmap_weights = false;
-  std::unique_ptr<MetalLlamaWeights> _stream_wts;
+  // The checkpoint, held for this model's whole life -- it owns the mmap
+  // the mapped weights alias AND is where the streamed blocks are read
+  // from, so streaming is the manager's business rather than a private
+  // mmap this class kept to itself.
+  std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;
 
   // Constant affine-free LayerNorm params (weight=1, bias=0), sized `hidden`.
@@ -264,6 +291,8 @@ class MetalFlux2Transformer {
       _fn_residual, _fn_transpose, _fn_sdpa, _fn_gelu_tanh, _fn_rope_table,
       _fn_transpose_rope, _fn_ln_mod,
       _fn_adaln, _fn_gated, _fn_layernorm, _fn_bias_add, _fn_qmm4, _fn_qmm8,
+      // vec4 twins of adaln/gated (bit-identical; VPIPE_NO_ELT_V4 disables).
+      _fn_adaln4, _fn_gated4,
       _fn_headslice, _fn_mulsig, _fn_concat, _fn_transpose_rs;
   // Larger-tile dense f16 GEMM twins (fewer weight re-reads at the DiT's big
   // M = seq). _gemm_tile: 0 = 32x32 base, 1 = BM64, 2 = BM64xBN64; _acc16 uses

@@ -29,6 +29,8 @@ namespace vpipe { class SessionContextIntf; }
 
 namespace vpipe::genai {
 
+class WeightSet;       // generative-models/weight-set.h
+
 class MetalMossCodec {
 public:
   // Load a MOSS-Audio-Tokenizer directory (config.json + sharded
@@ -46,6 +48,15 @@ public:
   // decoder-only cache.
   static std::unique_ptr<MetalMossCodec> load(
       const std::string& model_dir, metal_compute::MetalCompute* mc,
+      bool int8 = false, bool with_encoder = false);
+
+  // Preferred: shares the caller's checkpoint. Note this codec reads its
+  // tensors UNCACHED (see to_f16_ in the .cc -- the int8 path frees the
+  // f16 sources, and there is an on-disk weight cache besides), so what
+  // the set buys here is one open and manager visibility, not sharing of
+  // the converted weights.
+  static std::unique_ptr<MetalMossCodec> load(
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
       bool int8 = false, bool with_encoder = false);
 
   bool valid() const { return _ok; }
@@ -119,6 +130,12 @@ public:
 
 private:
   MetalMossCodec() = default;
+
+  // The two load() spellings meet here. `ws` may be null: a weight-cache
+  // hit never needs the checkpoint, so it is opened only on a miss.
+  static std::unique_ptr<MetalMossCodec> load_(
+      const std::string& model_dir, std::shared_ptr<WeightSet> ws,
+      metal_compute::MetalCompute* mc, bool int8, bool with_encoder);
 
   struct StageCfg {
     int in_dim, d_model, n_layers, n_heads, ff, out_dim, patch, context;

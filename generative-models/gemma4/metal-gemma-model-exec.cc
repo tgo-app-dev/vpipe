@@ -1,5 +1,7 @@
 #include "generative-models/gemma4/metal-gemma-model-exec.h"
 
+#include "generative-models/weight-set.h"
+
 #include <limits>
 
 
@@ -24,8 +26,11 @@ MetalGemmaModelExec::MetalGemmaModelExec(
     const MetalGemmaModel::Config& cfg,
     const SessionContextIntf*      session)
 {
-  (void)session;
-  _model = MetalGemmaModel::load(model_dir, mc, cfg);
+  // Through the session's manager, so a second stage naming this same
+  // checkpoint gets the weights that are already resident instead of a
+  // second copy of them.
+  _model = MetalGemmaModel::load(open_weight_set(model_dir, session), mc,
+                                 cfg);
 }
 
 std::int32_t

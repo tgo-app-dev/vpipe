@@ -43,7 +43,8 @@ const ConfigKey kAttrs[] = {
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
           "model-select source on the model iport overrides it",
    .suggest_db = "models",
-   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
+   .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "boogu-image,boogu-image-edit"},
   {.key = "models_db", .type = ConfigType::String, .required = false,
    .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
@@ -52,6 +53,15 @@ const ConfigKey kAttrs[] = {
           "-- so the DiT can run classifier-free guidance (CFG>1). Matches the "
           "Krea-2 edit deletion recipe (empty grounded negative). Default false "
           "(emit a negative only when a non-empty negative prompt is wired)"},
+  {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
+   .doc = "drop the text encoder (and vision tower) after each conditioning is "
+          "emitted and reload it on the next prompt. The encoder is idle for the "
+          "whole denoise, so on a memory-bounded box this is what lets a large "
+          "DiT and a large encoder share one machine (a 4-bit Boogu-Image is a "
+          "~5.6 GB DiT beside a ~4.7 GB Qwen3-VL mllm). \"auto\" (default) "
+          "decides from physical RAM vs the pipeline's weight bytes; \"always\" "
+          "/ \"never\" force it. Costs a reload per prompt",
+   .def_str = "auto"},
 };
 const PortSpec kIports[] = {
   {.name = "prompt", .doc = "prompt text (FlexData string or {text: ...})",
@@ -67,6 +77,16 @@ const PortSpec kIports[] = {
                                "TensorBeat [3,H,W], load-image format). Image-"
                                "aware families (Qwen-Image-Edit) run it through "
                                "the Qwen2.5-VL vision tower; others ignore it.",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref_image2", .doc = "OPTIONAL SECOND reference image (same format). "
+                                "Qwen-Image-Edit-2511 is multi-reference and "
+                                "Mage-Flow-Edit's template has a per-reference "
+                                "body, so on those families the VLM must see "
+                                "BOTH pictures (the DiT's ref_latent1 only "
+                                "carries the second one's spatial detail). Each "
+                                "reference gets its own vision block, mROPE band "
+                                "and deepstack run. Krea-2 is single-reference "
+                                "by design and ignores it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
@@ -87,7 +107,11 @@ const StageSpec kSpec = {
                "for a diffusion DiT. Owns the tokenizer + text encoder + (for "
                "image-aware models) the Qwen2.5-VL vision tower. The encoder "
                "half of the text-to-image split; pair it with a text-to-image "
-               "stage on the same hf_dir.",
+               "stage on the same hf_dir. On the Mage-Flow families every "
+               "prompt (and, for an edit, the source image) is first screened "
+               "by the model's own content-policy classifier -- mandatory, no "
+               "config key; a refused prompt yields a blank image instead of "
+               "a generation.",
   .display_name = "Diffusion Conditioner",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -117,15 +141,136 @@ inline float bf16_to_f32_(std::uint16_t b)
 // image already fits. The Qwen3-VL tower smart-resizes internally, but its cap
 // (~1M px area) is looser than the node's 768 grounding_px default, so bound the
 // longest side here to stay in the LoRA's 384-768px training distribution.
+// PIL-faithful separable LANCZOS-3 resample of a planar U8 RGB image. The
+// reference pipelines that preprocess a VLM conditioning image with
+// `resample="lanczos"` (Boogu-Image's BooguImageProcessor) are matched only by
+// this filter -- a box/area average differs enough that, once the 36-layer LM
+// amplifies it, the image-row conditioning lands ~3x further from the reference
+// (measured: rel-L2 0.56 box vs 0.18 lanczos on the same 1024->384 downscale).
+//
+// Mirrors Pillow's ImagingResample: filterscale = max(1, in/out), support = 3 *
+// filterscale, weights lanczos((k + 0.5 - center) / filterscale) normalised to
+// sum 1, and -- as Pillow does -- the horizontal pass is CLAMPED BACK TO U8
+// before the vertical pass, which is observable in the result.
+void resize_lanczos_(const std::uint8_t* rgb, int H, int W, int nh, int nw,
+                     std::vector<std::uint8_t>& out)
+{
+  auto lanczos = [](double x) {
+    if (x < 0.0) { x = -x; }
+    if (x < 1e-9) { return 1.0; }
+    if (x >= 3.0) { return 0.0; }
+    const double px = M_PI * x;
+    return (std::sin(px) / px) * (std::sin(px / 3.0) / (px / 3.0));
+  };
+  // Per-output-pixel weight tables for one axis.
+  struct Axis {
+    std::vector<int> lo, hi;
+    std::vector<std::vector<double>> w;
+  };
+  auto build = [&](int in, int outn) {
+    Axis ax;
+    const double scale = (double)in / (double)outn;
+    const double fs = scale < 1.0 ? 1.0 : scale;
+    const double support = 3.0 * fs;
+    ax.lo.resize((std::size_t)outn);
+    ax.hi.resize((std::size_t)outn);
+    ax.w.resize((std::size_t)outn);
+    for (int i = 0; i < outn; ++i) {
+      const double center = ((double)i + 0.5) * scale;
+      int lo = (int)std::floor(center - support);
+      int hi = (int)std::ceil(center + support);
+      if (lo < 0) { lo = 0; }
+      if (hi > in) { hi = in; }
+      if (hi <= lo) { lo = in > 0 ? std::min(in - 1, std::max(0, lo)) : 0;
+                      hi = lo + 1; }
+      std::vector<double> w((std::size_t)(hi - lo));
+      double sum = 0.0;
+      for (int k = lo; k < hi; ++k) {
+        const double t = ((double)k + 0.5 - center) / fs;
+        const double v = lanczos(t);
+        w[(std::size_t)(k - lo)] = v;
+        sum += v;
+      }
+      if (sum != 0.0) { for (double& v : w) { v /= sum; } }
+      ax.lo[(std::size_t)i] = lo;
+      ax.hi[(std::size_t)i] = hi;
+      ax.w[(std::size_t)i] = std::move(w);
+    }
+    return ax;
+  };
+  const Axis axw = build(W, nw);
+  const Axis axh = build(H, nh);
+  auto clamp8 = [](double v) {
+    const double r = std::round(v);
+    return (std::uint8_t)(r < 0.0 ? 0.0 : (r > 255.0 ? 255.0 : r));
+  };
+  out.assign((std::size_t)3 * nh * nw, 0);
+  std::vector<std::uint8_t> mid((std::size_t)H * nw);   // one plane, H x nw
+  for (int c = 0; c < 3; ++c) {
+    const std::uint8_t* src = rgb + (std::size_t)c * H * W;
+    for (int y = 0; y < H; ++y) {                       // horizontal pass
+      for (int x = 0; x < nw; ++x) {
+        const auto& w = axw.w[(std::size_t)x];
+        double acc = 0.0;
+        for (int k = axw.lo[(std::size_t)x]; k < axw.hi[(std::size_t)x]; ++k) {
+          acc += w[(std::size_t)(k - axw.lo[(std::size_t)x])] *
+                 (double)src[(std::size_t)y * W + k];
+        }
+        mid[(std::size_t)y * nw + x] = clamp8(acc);      // U8 between passes
+      }
+    }
+    std::uint8_t* dst = out.data() + (std::size_t)c * nh * nw;
+    for (int y = 0; y < nh; ++y) {                       // vertical pass
+      const auto& w = axh.w[(std::size_t)y];
+      for (int x = 0; x < nw; ++x) {
+        double acc = 0.0;
+        for (int k = axh.lo[(std::size_t)y]; k < axh.hi[(std::size_t)y]; ++k) {
+          acc += w[(std::size_t)(k - axh.lo[(std::size_t)y])] *
+                 (double)mid[(std::size_t)k * nw + x];
+        }
+        dst[(std::size_t)y * nw + x] = clamp8(acc);
+      }
+    }
+  }
+}
+
+// `max_pixels` (0 = unbounded) additionally bounds the AREA, and `align`
+// (0 = none) floors both dims to a multiple of it -- Boogu's
+// BooguImageProcessor.get_new_height_width takes the min of the pixel and
+// side-length ratios, clamps to <= 1 (never upscales) and floor-aligns to
+// vae_scale_factor 16. `lanczos` picks the filter (see resize_lanczos_);
+// false keeps the historical box average.
 void cap_longest_side_(const std::uint8_t* rgb, int H, int W, int cap,
-                       std::vector<std::uint8_t>& out, int* oh, int* ow)
+                       std::vector<std::uint8_t>& out, int* oh, int* ow,
+                       std::size_t max_pixels = 0, int align = 0,
+                       bool lanczos = false)
 {
   *oh = H; *ow = W;
+  if (H <= 0 || W <= 0) { return; }
   const int longest = std::max(H, W);
-  if (longest <= cap || longest <= 0 || H <= 0 || W <= 0) { return; }
-  const double s = (double)cap / (double)longest;
-  const int nh = std::max(1, (int)std::lround(H * s));
-  const int nw = std::max(1, (int)std::lround(W * s));
+  double s = 1.0;
+  if (cap > 0 && longest > 0) { s = std::min(s, (double)cap / (double)longest); }
+  if (max_pixels > 0) {
+    const double cur = (double)H * (double)W;
+    if (cur > 0.0) {
+      s = std::min(s, std::sqrt((double)max_pixels / cur));
+    }
+  }
+  if (s >= 1.0) { return; }                    // never upscale
+  int nh, nw;
+  if (align > 0) {
+    nh = std::max(align, (int)(H * s) / align * align);
+    nw = std::max(align, (int)(W * s) / align * align);
+  } else {
+    nh = std::max(1, (int)std::lround(H * s));
+    nw = std::max(1, (int)std::lround(W * s));
+  }
+  if (nh == H && nw == W) { return; }
+  if (lanczos) {
+    resize_lanczos_(rgb, H, W, nh, nw, out);
+    *oh = nh; *ow = nw;
+    return;
+  }
   out.assign((std::size_t)3 * nh * nw, 0);
   for (int c = 0; c < 3; ++c) {
     const std::uint8_t* src = rgb + (std::size_t)c * H * W;
@@ -175,9 +320,106 @@ constexpr int kQieDropPrefix = 64;
 // descend from the same Qwen-Image conventions. Only the multi-reference body
 // is its own: `Image {j}: <|vision_start|><|image_pad|><|vision_end|>` per
 // reference (no separator), then the instruction -- pipeline.py
-// _edit_prompt_body. Qwen-Image-Edit says "Picture 1: " instead.
-constexpr const char* kMageRefPlaceholder =
-    "<|vision_start|><|image_pad|><|vision_end|>";
+// _edit_prompt_body. Qwen-Image-Edit says "Picture {j}: " instead, and Boogu
+// uses bare unlabelled blocks; ref_blocks_() below renders all three.
+// Boogu-Image's two system prompts, verbatim from BooguImagePipeline
+// (SYSTEM_PROMPT_4_T2I_UNIFIED / SYSTEM_PROMPT_4_TI2I_UNIFIED -- the latter is
+// byte-identical to the Qwen-Image-Edit one above). The pipeline picks between
+// them by whether an input image is present. It renders through the stock
+// Qwen3-VL chat template WITHOUT a generation prompt (no trailing assistant
+// turn), and -- unlike every other family here -- DROPS NOTHING: the whole
+// templated sequence, system prompt included, is the conditioning the DiT's
+// context_refiner sees.
+constexpr const char* kBooguT2I =
+    "<|im_start|>system\nYou are a helpful assistant that generates "
+    "high-quality images based on user instructions. The instructions are as "
+    "follows.<|im_end|>\n<|im_start|>user\n";
+constexpr const char* kBooguTi2i =
+    "<|im_start|>system\nDescribe the key features of the input image (color, "
+    "shape, size, texture, objects, background), then explain how the user's "
+    "text instruction should alter or modify the image. Generate a new image "
+    "that meets the user's requirements while maintaining consistency with the "
+    "original input where appropriate.<|im_end|>\n<|im_start|>user\n";
+constexpr const char* kBooguSuffix = "<|im_end|>\n";
+
+// ---- multi-reference helpers -------------------------------------------
+// One vision block per reference, with the family's own label convention:
+// Qwen-Image-Edit says "Picture N: ", Mage-Flow "Image N: ", Boogu uses bare
+// back-to-back blocks (verified against the reference's rendered template).
+// `label` nullptr/empty => unlabelled.
+std::string
+ref_blocks_(int n_ref, const char* label)
+{
+  static const char* kBlock = "<|vision_start|><|image_pad|><|vision_end|>";
+  std::string out;
+  for (int i = 0; i < n_ref; ++i) {
+    if (label != nullptr && *label != '\0') {
+      out += fmt("{} {}: ", label, i + 1)();
+    }
+    out += kBlock;
+  }
+  return out;
+}
+
+// Expand each <|image_pad|> placeholder -- one per reference, in prompt order --
+// to THAT reference's own vision-token count, and report the resulting image
+// token RUNS as {row0, rows}. With several references the runs are DISJOINT
+// (the labels sit between the blocks), which is why the callers cannot assume
+// one contiguous image span.
+std::vector<std::pair<int, int>>
+expand_pads_(std::vector<std::int32_t>& ids, std::int32_t pad_id,
+             const int* tok, int n_ref)
+{
+  std::vector<std::pair<int, int>> runs;
+  std::vector<std::int32_t> out;
+  out.reserve(ids.size() + 64);
+  int k = 0;
+  for (const std::int32_t id : ids) {
+    if (id == pad_id && k < n_ref) {
+      const int row0 = (int)out.size();
+      const int cnt = tok[k] > 0 ? tok[k] : 0;
+      for (int j = 0; j < cnt; ++j) { out.push_back(pad_id); }
+      runs.push_back({row0, cnt});
+      ++k;
+    } else {
+      out.push_back(id);
+    }
+  }
+  ids.swap(out);
+  return runs;
+}
+
+// 3-axis mROPE position_ids [3*n] for a text+vision sequence: text advances
+// sequentially, each image run gets its OWN 2-D band (t=base, h=base+row,
+// w=base+col) and the following text resumes at base + max(mh, mw). Exactly the
+// stock Qwen3-VL / Qwen2.5-VL rule, applied per reference.
+std::vector<std::int32_t>
+mrope_positions_(int n, const std::vector<std::pair<int, int>>& runs,
+                 const int* mh, const int* mw)
+{
+  std::vector<std::int32_t> pos((std::size_t)3 * n, 0);
+  int cur = 0;
+  std::size_t nr = 0;
+  for (int i = 0; i < n;) {
+    if (nr < runs.size() && i == runs[nr].first && runs[nr].second > 0) {
+      const int base = cur;
+      const int w = mw[nr] > 0 ? mw[nr] : 1;
+      for (int j = 0; j < runs[nr].second && i < n; ++j, ++i) {
+        pos[(std::size_t)i] = base;
+        pos[(std::size_t)n + i] = base + j / w;
+        pos[(std::size_t)2 * n + i] = base + j % w;
+      }
+      cur = base + std::max(mh[nr] > 0 ? mh[nr] : 1, w);
+      ++nr;
+    } else {
+      pos[(std::size_t)i] = cur;
+      pos[(std::size_t)n + i] = cur;
+      pos[(std::size_t)2 * n + i] = cur;
+      ++cur; ++i;
+    }
+  }
+  return pos;
+}
 
 // Special-token-aware encode: split at the markers, BPE each text run, splice
 // the markers' ids (matches the HF fast tokenizer). Includes the Qwen2.5-VL
@@ -269,6 +511,65 @@ genai::MetalQwenModel::Config encoder_config_mage_()
 {
   genai::MetalQwenModel::Config c = encoder_config_krea2_();
   c.weight_prefix = "model.language_model.";
+  // NOT backbone-only, unlike every other diffusion text encoder here: the
+  // MANDATORY content screen (mage-screen.h) GENERATES a JSON verdict on
+  // these same weights, which needs the token-embedding muxer + the (tied)
+  // lm_head. The conditioning path takes its embeddings from the same muxer,
+  // so this binds one embed table rather than the stage keeping a second copy
+  // beside the model's (~780 MB at vocab 151936 x 2560 bf16).
+  c.backbone_only = false;
+  // The classifier's system prompt is the policy itself -- a few thousand
+  // tokens, far past the ~100-token conditioning prompts the other families
+  // size for. This is only a page-pool CAP (pages are allocated lazily and
+  // returned on release), not a resident allocation.
+  c.max_seq = 8192;
+  return c;
+}
+// Boogu-Image's mllm is a stock Qwen3VLForConditionalGeneration -- the 10B
+// ships an 8B Qwen3-VL (36L, hidden 4096, 32q/8kv, rope theta 5e6, UNTIED
+// embeddings) wrapped as `model.language_model.` / `model.visual.` like
+// Mage-Flow. Sized from mllm/config.json's text_config so one path serves any
+// Boogu size.
+genai::MetalQwenModel::Config encoder_config_boogu_(const std::string& enc_dir)
+{
+  genai::MetalQwenModel::Config c = encoder_config_krea2_();
+  c.n_layers = 36; c.hidden = 4096; c.n_heads = 32; c.n_kv_heads = 8;
+  c.head_dim = 128; c.rotary_dim = 128; c.ffn_inner = 12288;
+  c.rope_theta = 5.0e6f; c.tie_embeddings = false;
+  c.weight_prefix = "model.language_model.";
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(enc_dir) / "config.json");
+  if (in) {
+    FlexData fd = FlexData::from_json(in);
+    if (fd.is_object()) {
+      auto root = fd.as_object();
+      if (root.contains("text_config")) {
+        FlexData tc = root.at("text_config");
+        if (tc.is_object()) {
+          auto o = tc.as_object();
+          auto geti = [&](const char* k, int cur) {
+            return o.contains(k) ? (int)o.at(k).as_int(cur) : cur; };
+          auto getf = [&](const char* k, float cur) {
+            return o.contains(k) ? (float)o.at(k).as_real(cur) : cur; };
+          c.n_layers = geti("num_hidden_layers", c.n_layers);
+          c.hidden = geti("hidden_size", c.hidden);
+          c.n_heads = geti("num_attention_heads", c.n_heads);
+          c.n_kv_heads = geti("num_key_value_heads", c.n_kv_heads);
+          c.head_dim = geti("head_dim",
+                            c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
+          c.rotary_dim = c.head_dim;
+          c.ffn_inner = geti("intermediate_size", c.ffn_inner);
+          c.vocab = geti("vocab_size", c.vocab);
+          c.rope_theta = getf("rope_theta", c.rope_theta);
+          c.rms_eps = getf("rms_norm_eps", c.rms_eps);
+        }
+      }
+      if (root.contains("tie_word_embeddings")) {
+        c.tie_embeddings =
+            root.at("tie_word_embeddings").as_bool(c.tie_embeddings);
+      }
+    }
+  }
   return c;
 }
 genai::MetalQwenModel::Config encoder_config_qie_()
@@ -304,6 +605,11 @@ std::string family_(const std::string& transformer_dir)
         // krea2's 12-tap conditioning instead of Mage-Flow's single
         // last-hidden tap (and with the wrong weight prefix).
         if (cls == "MageFlow") { return "mage-flow"; }
+        // Boogu-Image. The t2i and edit repos ship the SAME transformer config
+        // (only the weights differ), so there is one family string; the edit
+        // path turns on when a reference image is wired, exactly as Mage-Flow
+        // switches templates.
+        if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
       }
     }
   }
@@ -338,6 +644,20 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   _models_db = attr_str("models_db");
   if (_models_db.empty()) { _models_db = "models"; }
   _grounded_negative = attr_bool("grounded_negative");
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  {
+    bool bad = false;
+    _unload_cfg = model_memory::parse_unload_policy(
+        attr_str("unload_when_idle"), &bad);
+    if (bad) {
+      // Deferred-validated config: warn and take the default rather than throw.
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): unload_when_idle '{}' is not "
+          "auto|always|never; using auto", this->id(),
+          attr_str("unload_when_idle")));
+    }
+  }
+#endif
   allocate_oports(spec().oports.size());
 }
 
@@ -361,6 +681,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       _family == "flux2" ? encoder_config_flux2_(_enc_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
       : _family == "mage-flow" ? encoder_config_mage_()
+      : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
       : encoder_config_krea2_();
   _enc_hidden = ecfg.hidden;
   // The encoder may be affine-quantized (model-quantize target=text_encoder).
@@ -384,26 +705,103 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       }
     }
   }
-  _encoder = genai::MetalQwenModel::load(_enc_dir, mc, ecfg);
+  // One set for this checkpoint, shared with the vision tower and the
+  // embedding table below and with anything else naming the same dir.
+  _enc_ws = genai::open_weight_set(_enc_dir, session());
+  if (!_enc_ws) {
+    session()->error(fmt("DiffusionConditionerStage('{}'): cannot open text "
+                         "encoder checkpoint: {}", this->id(), _enc_dir));
+    return false;
+  }
+  _encoder = genai::MetalQwenModel::load(_enc_ws, mc, ecfg);
   if (!_encoder) {
     session()->error(fmt("DiffusionConditionerStage('{}'): text encoder load "
                          "failed: {}", this->id(), _enc_dir));
     return false;
   }
-  auto wts = genai::MetalLlamaWeights::open_model(_enc_dir);
-  if (!wts.has_value()) { return false; }
+  if (_family == "mage-flow") {
+    // Mage-Flow takes its embeddings from the model's own muxer (loaded
+    // because the content screen has to generate), so there is no second
+    // table to load here. Probe it once: an encoder that cannot gather a
+    // token embedding can neither condition NOR screen, and a mage-flow
+    // encoder that cannot screen must not run at all.
+    if (_encoder->embed_text_buf(std::vector<std::int32_t>{0}).empty()) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): Mage-Flow encoder has no usable "
+          "token-embedding table -- it could neither condition nor run the "
+          "mandatory content screen; inert", this->id()));
+      return false;
+    }
+    return true;
+  }
   const std::string emb_name =
       (_family == "flux2" || _family == "qwen-image-edit")
           ? "model.embed_tokens.weight"
-      : _family == "mage-flow" ? "model.language_model.embed_tokens.weight"
-                               : "language_model.embed_tokens.weight";
-  _embed = wts->load(emb_name, mc);
+      : (_family == "boogu-image")
+          ? "model.language_model.embed_tokens.weight"
+          : "language_model.embed_tokens.weight";
+  _embed = _enc_ws->tensor(emb_name, mc,
+                           genai::WeightSet::Residency::Copied);
   return !_embed.empty();
+}
+
+void
+DiffusionConditionerStage::reset_run_state()
+{
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _model_latched    = false;
+  _negative_latched = false;
+  // Re-decided next launch: peers may differ.
+  _unload_resolved  = false;
+  // Same for the cached reference images: `_ref_rgb[i]` non-empty makes
+  // the iport3/iport4 read conditional, so a relaunch would never
+  // consume the new reference and would re-encode the previous run's
+  // picture instead.
+  for (int i = 0; i < kMaxRefs; ++i) {
+    _ref_rgb[i].clear();
+    _ref_rgb_h[i] = 0;
+    _ref_rgb_w[i] = 0;
+  }
+  _n_ref = 0;
+
+}
+
+std::vector<std::string>
+DiffusionConditionerStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  // Boogu names its text encoder `mllm/`; every other family uses
+  // text_encoder/. Detected from the filesystem rather than by parsing
+  // the family, so this stays a cheap pre-init query -- and declaring a
+  // directory that turns out to be empty is harmless (0 bytes).
+  const std::string mllm = (fs::path(root) / "mllm").string();
+  std::error_code ec;
+  const std::string enc = fs::exists(mllm, ec)
+                              ? mllm
+                              : (fs::path(root) / "text_encoder").string();
+  return {enc, (fs::path(root) / "transformer").string()};
 }
 
 Job
 DiffusionConditionerStage::initialize(RuntimeContext& ctx)
 {
+  // If a previous run left the weights UNLOADED (the idle-unload
+  // policy drops them between beats), let this launch load them again:
+  // ensure_loaded_'s once-only guard is per-Stage, not per-launch, so
+  // without this the stage stays inert for the whole run. When the
+  // weights are still held we deliberately leave the guard set --
+  // reloading on top of a resident copy is exactly what doubles peak
+  // memory.
+  if (!_encoder) {
+    _load_attempted = false;
+    _unloaded       = false;
+  }
+
   // Defer the encoder load when a model-select source feeds the model iport
   // (its beat only arrives after the init barrier, in process()). Otherwise
   // load now from the config hf_dir, as before.
@@ -432,8 +830,12 @@ DiffusionConditionerStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
-  _enc_dir = (std::filesystem::path(root) / "text_encoder").string();
   _family = family_((std::filesystem::path(root) / "transformer").string());
+  // Boogu names its text encoder `mllm/` (it is a full multimodal LLM, not a
+  // text_encoder in the diffusers sense); every other family uses
+  // text_encoder/.
+  _enc_dir = (std::filesystem::path(root) /
+              (_family == "boogu-image" ? "mllm" : "text_encoder")).string();
 
   namespace fs = std::filesystem;
   std::string tok_path = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
@@ -462,7 +864,95 @@ DiffusionConditionerStage::ensure_loaded_()
       "DiffusionConditionerStage('{}'): family {} encoder ({}), hidden {}",
       this->id(), _family,
       _family == "flux2" ? "Qwen3 dense"
-      : _family == "qwen-image-edit" ? "Qwen2.5-VL" : "Qwen3-VL", _enc_hidden));
+      : _family == "qwen-image-edit" ? "Qwen2.5-VL"
+      : _family == "boogu-image" ? "Qwen3-VL (mllm)" : "Qwen3-VL",
+      _enc_hidden));
+
+  // The component dirs the idle-unload decision sizes against. The
+  // DECISION itself is deferred to the first process() -- see
+  // resolve_unload_policy_().
+  _root_dir  = root;
+  _peer_dirs = {_enc_dir,
+                (std::filesystem::path(root) / "transformer").string()};
+}
+
+// Decided at the FIRST process(), not at load, because process() runs
+// strictly after the init barrier -- by which point every stage in the
+// graph has finished loading. Two things are only true then:
+//
+//   * every peer's weights exist, so nothing is missed. Declarations
+//     (Stage::declare_models) already cover peers this stage cannot see
+//     from its own config, but a declaration is an ESTIMATE from the
+//     files on disk.
+//   * what each model is really holding is authoritative, and is often
+//     far less. A streaming DiT holds only its pinned prefix, so sizing
+//     against its full on-disk bytes would drop this stage's encoder
+//     after every prompt to make room for weights that were never
+//     resident.
+//
+// Unlike block streaming this decision is cheap to defer: it is a
+// per-beat behaviour flag, not a constructor argument, so getting it
+// right on the first beat costs nothing.
+void
+DiffusionConditionerStage::resolve_unload_policy_()
+{
+  if (_unload_resolved) { return; }
+  _unload_resolved = true;
+  switch (_unload_cfg) {
+    case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+    case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+    default:
+      _unload_idle = model_memory::bounded(session(), _peer_dirs,
+                                           model_memory::kHeadroom);
+      break;
+  }
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): encoder + DiT footprint {} MB + {} MB "
+      "headroom vs {} MB RAM, unload_when_idle={} -> {}", this->id(),
+      model_memory::weight_footprint(session(), _peer_dirs) >> 20,
+      model_memory::kHeadroom >> 20, model_memory::phys_ram() >> 20,
+      model_memory::unload_policy_name(_unload_cfg),
+      _unload_idle ? "UNLOAD after each prompt" : "keep resident"));
+  if (_unload_idle) {
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): memory-bounded -- the encoder is "
+        "dropped after each conditioning and reloaded on the next prompt",
+        this->id()));
+  }
+}
+
+void
+DiffusionConditionerStage::unload_encoder_()
+{
+  if (!_encoder) { return; }
+  // Everything weight-sized: the LM, either vision tower, and the embedding
+  // table. The tokenizer stays (kilobytes, and it is pure CPU state).
+  _encoder.reset();
+  _vision.reset();
+  _vision3.reset();
+  _embed = metal_compute::SharedBuffer{};
+  _ds_feats.clear();
+  _unloaded = true;
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): encoder unloaded (idle)", this->id()));
+}
+
+bool
+DiffusionConditionerStage::reload_encoder_()
+{
+  auto* mc = session() ? session()->metal_compute() : nullptr;
+  if (mc == nullptr || _enc_dir.empty()) { return false; }
+  if (!load_encoder_(mc)) {
+    session()->error(fmt(
+        "DiffusionConditionerStage('{}'): encoder reload failed: {}",
+        this->id(), _enc_dir));
+    return false;
+  }
+  _unloaded = false;
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): encoder reloaded for a new prompt",
+      this->id()));
+  return true;
 }
 
 // True for the families whose conditioning is a SINGLE post-final-norm
@@ -471,7 +961,8 @@ DiffusionConditionerStage::ensure_loaded_()
 static bool
 single_tap_(const std::string& family)
 {
-  return family == "qwen-image-edit" || family == "mage-flow";
+  return family == "qwen-image-edit" || family == "mage-flow" ||
+         family == "boogu-image";
 }
 
 SharedBuffer
@@ -479,29 +970,57 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
                                           int& n_img) const
 {
   n_img = 0;
-  if (_ref_rgb.empty()) { return {}; }
+  _img_n = 0;
+  for (int i = 0; i < kMaxRefs; ++i) {
+    _img_mh[i] = 0; _img_mw[i] = 0; _img_tok[i] = 0;
+  }
+  if (_n_ref <= 0 || _ref_rgb[0].empty()) { return {}; }
 
-  // Qwen-Image-Edit: Qwen2.5-VL tower -> bf16 [n_img, 3584].
+  // Qwen-Image-Edit: Qwen2.5-VL tower -> bf16 [n_img_total, 3584]. QIE-2511 is
+  // a MULTI-reference edit model, so every wired picture is encoded and the
+  // rows are CONCATENATED in prompt order; encode_ then splices them over the
+  // pad rows of the per-reference "Picture N: " blocks in that same order.
+  // (Qwen2.5-VL has no deepstack, so multi-reference needs nothing else here.)
   if (_family == "qwen-image-edit") {
     if (!_vision) {
       genai::MetalQwen25Vision::Config vcfg;
-      _vision = genai::MetalQwen25Vision::load(_enc_dir, mc, vcfg);
+      _vision = genai::MetalQwen25Vision::load(_enc_ws, mc, vcfg);
       if (!_vision) {
         session()->warn(fmt("DiffusionConditionerStage('{}'): vision tower load "
                             "failed; text-only conditioning", this->id()));
         return {};
       }
     }
-    int vgh = 0, vgw = 0;
-    SharedBuffer vt = _vision->encode_rgb(_ref_rgb.data(), _ref_rgb_h,
-                                          _ref_rgb_w, 384 * 384, vgh, vgw);
-    if (vt.empty()) { return {}; }
+    std::vector<SharedBuffer> per;
+    int total = 0;
     const int mm = _vision->config().merge;
-    n_img = (vgh / mm) * (vgw / mm);
-    session()->info(fmt(
-        "DiffusionConditionerStage('{}'): image-aware conditioning -> {} vision "
-        "tokens (grid {}x{})", this->id(), n_img, vgh, vgw));
-    return vt;
+    for (int i = 0; i < _n_ref; ++i) {
+      int vgh = 0, vgw = 0;
+      SharedBuffer vt = _vision->encode_rgb(_ref_rgb[i].data(), _ref_rgb_h[i],
+                                            _ref_rgb_w[i], 384 * 384, vgh, vgw);
+      if (vt.empty()) { return {}; }
+      const int tok = (vgh / mm) * (vgw / mm);
+      _img_mh[i] = vgh / mm; _img_mw[i] = vgw / mm; _img_tok[i] = tok;
+      total += tok;
+      per.push_back(std::move(vt));
+      session()->info(fmt(
+          "DiffusionConditionerStage('{}'): reference {} -> {} vision tokens "
+          "(grid {}x{})", this->id(), i, tok, vgh, vgw));
+    }
+    _img_n = (int)per.size();
+    n_img = total;
+    if (per.size() == 1) { return std::move(per[0]); }
+    SharedBuffer all =
+        mc->make_shared_buffer((std::size_t)total * _enc_hidden * 2);
+    if (all.empty()) { return {}; }
+    std::size_t off = 0;
+    for (int i = 0; i < _img_n; ++i) {
+      const std::size_t nb = (std::size_t)_img_tok[i] * _enc_hidden * 2;
+      std::memcpy(static_cast<std::uint8_t*>(all.contents()) + off,
+                  per[(std::size_t)i].contents(), nb);
+      off += nb;
+    }
+    return all;
   }
 
   // Krea-2 edit (identity-edit LoRA): Qwen3-VL tower -> f16 [n_img, 2560]. The
@@ -511,8 +1030,13 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   // Mage-Flow rides the SAME Qwen3-VL tower + deepstack path as krea2; only
   // the checkpoint prefix ("model.visual." vs "visual."), the conditioning
   // long-edge cap (384 vs 768) and the processor's min_pixels differ.
-  if (_family == "krea2" || _family == "mage-flow") {
-    const bool mage = (_family == "mage-flow");
+  if (_family == "krea2" || _family == "mage-flow" ||
+      _family == "boogu-image") {
+    // Boogu's mllm shares Mage-Flow's checkpoint wrapper ("model.visual."),
+    // its bf16 pipeline dtype and its preprocessor bounds (shortest_edge
+    // 65536), and its pipeline caps the VLM conditioning image at 384x384
+    // pixels -- so it takes the same branch.
+    const bool mage = (_family == "mage-flow" || _family == "boogu-image");
     if (!_vision3) {
       genai::ModelLoader loader(session());
       const auto mcfg = loader.load_config(_enc_dir);
@@ -523,6 +1047,13 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       }
       auto vcfg = genai::MetalQwenVisionEncoder::config_from(*mcfg);
       vcfg.weight_prefix = mage ? "model.visual." : "visual.";
+      // Mage-Flow's pipeline casts its whole text encoder -- the Qwen3-VL
+      // tower included -- to bf16, so the conditioning it was tuned against
+      // carries bf16 tower numerics. Match that here. (f16 is the more
+      // ACCURATE tower, ~3x closer to an fp32 oracle; this is fidelity to
+      // the reference, which is what the goldens measure and what the DiT
+      // was trained alongside.) Krea-2 stays f16 -- its own verified state.
+      vcfg.use_bf16 = mage;
       if (mage) {
         // Mage-Flow's preprocessor_config.json sets size.shortest_edge 65536
         // (vs the Qwen processor default 3136), so a small or very wide
@@ -551,43 +1082,118 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       }
       _vision3->set_session(session());
     }
+    // Krea-2 is single-reference by design (the ComfyUI-Krea2Edit node takes
+    // one source image); the others encode every wired picture.
+    const int use_refs = (_family == "krea2") ? 1 : _n_ref;
+    if (_family == "krea2" && _n_ref > 1) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): Krea-2 grounded encode is "
+          "single-reference; ignoring {} extra reference image(s)",
+          this->id(), _n_ref - 1));
+    }
+    std::vector<SharedBuffer> per_emb;
+    std::vector<std::vector<SharedBuffer>> per_ds;
+    int total = 0;
+    for (int ri = 0; ri < use_refs; ++ri) {
     std::vector<std::uint8_t> capped;
-    int rh = _ref_rgb_h, rw = _ref_rgb_w;
+    int rh = _ref_rgb_h[ri], rw = _ref_rgb_w[ri];
     // Mage-Flow caps the VL conditioning image's long edge at 384 (its
     // training preprocessing -- pipeline.py `vl_cond_long_edge`); the VAE
     // reference path keeps the full target resolution. krea2's grounding
     // node uses 768.
-    cap_longest_side_(_ref_rgb.data(), _ref_rgb_h, _ref_rgb_w, mage ? 384 : 768,
-                      capped, &rh, &rw);
-    const std::uint8_t* rgb = capped.empty() ? _ref_rgb.data() : capped.data();
+    if (_family == "boogu-image") {
+      // BooguImagePipeline's VLM preprocessing: max_pixels 384*384, max side
+      // 768, floor-aligned to vae_scale_factor 16, LANCZOS. Matching the FILTER
+      // matters as much as the geometry -- a box average leaves the image-row
+      // conditioning ~3x further from the reference after LM amplification.
+      cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
+                        384 * 2, capped, &rh, &rw, (std::size_t)384 * 384, 16,
+                        /*lanczos=*/true);
+    } else {
+      cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
+                        mage ? 384 : 768, capped, &rh, &rw);
+    }
+    const std::uint8_t* rgb = capped.empty() ? _ref_rgb[ri].data()
+                                             : capped.data();
     auto r = _vision3->encode(rgb, rh, rw);
     if (r.embeddings.empty() || r.n_tokens <= 0) { return {}; }
-    n_img = r.n_tokens;
-    // Merged grid (mh, mw) for the image tokens' 2-D mROPE positions. The
-    // encoder returns the PATCH grid; the LM tokens are the S x S-merged set
-    // in merger (row-major mh x mw) order.
+    // Per-reference merged grid (mh, mw) for the 2-D mROPE band. The encoder
+    // returns the PATCH grid; the LM tokens are the S x S-merged set in merger
+    // (row-major mh x mw) order.
     const int S = _vision3->config().spatial_merge > 0
                       ? _vision3->config().spatial_merge : 2;
-    _img_mh = r.grid_h / S;
-    _img_mw = r.grid_w / S;
+    _img_mh[ri] = r.grid_h / S;
+    _img_mw[ri] = r.grid_w / S;
+    _img_tok[ri] = r.n_tokens;
+    total += r.n_tokens;
     // Deepstack features (f16 [n_img, EH]) -> bf16 (the encoder residual dtype),
     // for injection into the text encoder at layers 0.. (see encode_).
-    _ds_feats.clear();
+    std::vector<SharedBuffer> ds_this;
     for (auto& df : r.deepstack) {
       if (df.empty()) { continue; }
-      const std::size_t ne = (std::size_t)n_img * _enc_hidden;
+      const std::size_t ne = (std::size_t)r.n_tokens * _enc_hidden;
       SharedBuffer b = mc->make_shared_buffer(ne * 2);
       if (b.empty()) { _ds_feats.clear(); break; }
-      const auto* s = static_cast<const _Float16*>(df.contents());
+      // The tower's element type is its own business (bf16 for Mage-Flow,
+      // f16 for Krea-2); the encoder residual is bf16 either way. When they
+      // already agree this is a straight copy.
+      const auto* s = static_cast<const std::uint16_t*>(df.contents());
       auto* d = static_cast<std::uint16_t*>(b.contents());
-      for (std::size_t i = 0; i < ne; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
-      _ds_feats.push_back(std::move(b));
+      if (_vision3->is_bf16()) {
+        std::memcpy(d, s, ne * 2);
+      } else {
+        for (std::size_t i = 0; i < ne; ++i) {
+          _Float16 h; std::memcpy(&h, &s[i], 2);
+          d[i] = f32_to_bf16_((float)h);
+        }
+      }
+      ds_this.push_back(std::move(b));
     }
     session()->info(fmt(
-        "DiffusionConditionerStage('{}'): image-grounded conditioning -> {} "
-        "vision tokens (grid {}x{}), {} deepstack", this->id(), n_img,
-        r.grid_h, r.grid_w, _ds_feats.size()));
-    return std::move(r.embeddings);
+        "DiffusionConditionerStage('{}'): reference {} -> {} vision tokens "
+        "(grid {}x{}), {} deepstack", this->id(), ri, r.n_tokens,
+        r.grid_h, r.grid_w, ds_this.size()));
+    per_emb.push_back(std::move(r.embeddings));
+    per_ds.push_back(std::move(ds_this));
+    }   // for ri
+    _img_n = (int)per_emb.size();
+    if (_img_n == 0) { return {}; }
+    n_img = total;
+    // Concatenate the references' tower rows (and each deepstack level) in
+    // prompt order; encode_ splices them over the pad rows in the same order,
+    // and the deepstack Segs address the per-reference runs.
+    const bool bf = _vision3->is_bf16();
+    _ds_feats.clear();
+    const std::size_t nlev = per_ds.empty() ? 0 : per_ds[0].size();
+    for (std::size_t l = 0; l < nlev; ++l) {
+      SharedBuffer b =
+          mc->make_shared_buffer((std::size_t)total * _enc_hidden * 2);
+      if (b.empty()) { _ds_feats.clear(); break; }
+      std::size_t off = 0;
+      bool ok = true;
+      for (int i = 0; i < _img_n; ++i) {
+        if (l >= per_ds[(std::size_t)i].size()) { ok = false; break; }
+        const std::size_t nb = (std::size_t)_img_tok[i] * _enc_hidden * 2;
+        std::memcpy(static_cast<std::uint8_t*>(b.contents()) + off,
+                    per_ds[(std::size_t)i][l].contents(), nb);
+        off += nb;
+      }
+      if (!ok) { _ds_feats.clear(); break; }
+      _ds_feats.push_back(std::move(b));
+    }
+    if (_img_n == 1) { return std::move(per_emb[0]); }
+    const std::size_t esz = bf ? 2u : 2u;   // both f16 and bf16 are 2 bytes
+    SharedBuffer all =
+        mc->make_shared_buffer((std::size_t)total * _enc_hidden * esz);
+    if (all.empty()) { return {}; }
+    std::size_t off = 0;
+    for (int i = 0; i < _img_n; ++i) {
+      const std::size_t nb = (std::size_t)_img_tok[i] * _enc_hidden * esz;
+      std::memcpy(static_cast<std::uint8_t*>(all.contents()) + off,
+                  per_emb[(std::size_t)i].contents(), nb);
+      off += nb;
+    }
+    return all;
   }
 
   return {};   // flux2 etc.: text-only
@@ -689,19 +1295,16 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     const bool img_aware = (n_img > 0) && !vtok.empty();
     const std::int32_t pad_id =
         img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
+    // QIE-2511 is MULTI-reference: one "Picture N: " labelled block per wired
+    // picture, each expanded to its own vision-token count.
+    const int nref = (img_aware && pad_id >= 0) ? _img_n : 0;
     std::string tmpl =
-        std::string(kQiePrefix) +
-        (img_aware && pad_id >= 0
-             ? "Picture 1: <|vision_start|><|image_pad|><|vision_end|>" : "") +
+        std::string(kQiePrefix) + ref_blocks_(nref, "Picture") +
         text + std::string(kQieSuffix);
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
-    if (img_aware && pad_id >= 0) {
-      std::vector<std::int32_t> ex; ex.reserve(ids.size() + (std::size_t)n_img);
-      for (const std::int32_t id : ids) {
-        if (id == pad_id) { for (int j = 0; j < n_img; ++j) ex.push_back(pad_id); }
-        else { ex.push_back(id); }
-      }
-      ids.swap(ex);
+    std::vector<std::pair<int, int>> runs;
+    if (nref > 0) {
+      runs = expand_pads_(ids, pad_id, _img_tok, nref);
     }
     if ((int)ids.size() <= kQieDropPrefix) { return {}; }
     const int n = (int)ids.size();
@@ -742,12 +1345,16 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     }
     cm->release(cid);
     if (taps.empty()) { return {}; }
-    // final-RMSNorm weight (host-applied): load once per call (cheap).
+    // final-RMSNorm weight, applied on the host.
     std::vector<float> fnorm(EH, 1.0f);
     {
-      auto wts = genai::MetalLlamaWeights::open_model(_enc_dir);
-      if (wts.has_value()) {
-        SharedBuffer nw = wts->load("model.norm.weight", mc);
+      if (_enc_ws) {
+        // Through the set: this used to re-open (and re-parse the headers
+        // of) the whole checkpoint on EVERY conditioning call to read one
+        // vector. Now it is a lookup on a checkpoint already open.
+        SharedBuffer nw =
+            _enc_ws->tensor("model.norm.weight", mc,
+                            genai::WeightSet::Residency::Copied);
         if (!nw.empty()) {
           const auto* p = static_cast<const std::uint16_t*>(nw.contents());
           for (int h = 0; h < EH; ++h) { fnorm[h] = bf16_to_f32_(p[h]); }
@@ -775,32 +1382,29 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     return txt;
   }
 
-  if (_family == "mage-flow") {
-    const int NL = 36;   // Qwen3-VL 4B layers
+  if (_family == "boogu-image") {
+    // Boogu conditioning: the mllm's LAST hidden state over the WHOLE templated
+    // sequence (no prefix drop -- the DiT's context_refiner is trained on the
+    // system prompt too), image-grounded when a reference is wired. The system
+    // prompt itself switches on that: t2i vs ti2i, exactly as the pipeline
+    // picks it by "are there input images".
+    const int NL = _encoder->config().n_layers;
     const bool img_aware = (n_img > 0) && !vtok.empty();
     const std::int32_t pad_id =
         img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
     const bool grounded = img_aware && pad_id >= 0;
-    // Edit template (drop 64) when a reference rides along, t2i template
-    // (drop 34) otherwise -- the reference picks the template from the CALL
-    // (generate_edits vs generate_images), which is the same distinction.
-    const int drop = grounded ? kQieDropPrefix : kDropPrefix;
+    // Boogu renders BARE back-to-back vision blocks (no "Picture N:" label) --
+    // verified against the reference's own rendered template.
+    const int nref = grounded ? _img_n : 0;
     const std::string tmpl =
-        (grounded ? std::string(kQiePrefix) + "Image 1: " + kMageRefPlaceholder
-                  : std::string(kPrefix)) +
-        text + (grounded ? std::string(kQieSuffix) : std::string(kSuffix));
+        (grounded ? std::string(kBooguTi2i) + ref_blocks_(nref, nullptr)
+                  : std::string(kBooguT2I)) +
+        text + std::string(kBooguSuffix);
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
-    if (grounded) {   // expand the single pad id to n_img copies
-      std::vector<std::int32_t> ex; ex.reserve(ids.size() + (std::size_t)n_img);
-      for (const std::int32_t id : ids) {
-        if (id == pad_id) { for (int j = 0; j < n_img; ++j) ex.push_back(pad_id); }
-        else { ex.push_back(id); }
-      }
-      ids.swap(ex);
-    }
-    if ((int)ids.size() <= drop) { return {}; }
+    std::vector<std::pair<int, int>> runs;
+    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok, nref); }
+    if (ids.empty()) { return {}; }
     const int n = (int)ids.size();
-    const int n_real = n - drop;
     SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
     if (x.empty()) { return {}; }
     {
@@ -814,19 +1418,25 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                     (std::size_t)EH * 2);
       }
     }
-    // Splice the tower rows over the image_pad embeddings (f16 tower -> bf16
-    // encoder input, as in the krea2 path below).
+    // Splice the tower rows over the image_pad embeddings (the tower runs bf16
+    // here, matching the encoder residual -- ask it rather than assume).
     int first_pad = -1;
     if (grounded) {
-      const auto* vt = static_cast<const _Float16*>(vtok.contents());
+      const bool vt_bf16 = _vision3 && _vision3->is_bf16();
+      const auto* vt = static_cast<const std::uint16_t*>(vtok.contents());
       auto* xh = static_cast<std::uint16_t*>(x.contents());
       int j = 0;
       for (int i = 0; i < n && j < n_img; ++i) {
         if (ids[(std::size_t)i] == pad_id) {
           if (first_pad < 0) { first_pad = i; }
-          for (int h = 0; h < EH; ++h) {
-            xh[(std::size_t)i * EH + h] =
-                f32_to_bf16_((float)vt[(std::size_t)j * EH + h]);
+          const std::uint16_t* src = vt + (std::size_t)j * EH;
+          if (vt_bf16) {
+            std::memcpy(xh + (std::size_t)i * EH, src, (std::size_t)EH * 2);
+          } else {
+            for (int h = 0; h < EH; ++h) {
+              _Float16 hf; std::memcpy(&hf, &src[h], 2);
+              xh[(std::size_t)i * EH + h] = f32_to_bf16_((float)hf);
+            }
           }
           ++j;
         }
@@ -841,6 +1451,156 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
       }
       ds.row0 = first_pad;
       ds.rows = n_img;
+      if (runs.size() > 1) {
+        // Boogu's blocks are adjacent, so one span would still cover them --
+        // but be explicit rather than rely on that, since the features are
+        // concatenated per reference.
+        int feat = 0;
+        for (const auto& rn : runs) {
+          ds.segs.push_back({rn.first, rn.second, feat});
+          feat += rn.second;
+        }
+      }
+    }
+    // Boogu calls the STOCK Qwen3-VL forward, so the image rows carry the
+    // normal 2-D mROPE grid (t=base, h=base+row, w=base+col; text resumes at
+    // base + max(mh,mw)) -- NOT Mage-Flow's flat arange override. Each
+    // reference gets its OWN band.
+    const bool use_mrope = grounded && !runs.empty() && _img_mw[0] > 0;
+    std::vector<std::int32_t> pos;
+    if (use_mrope) { pos = mrope_positions_(n, runs, _img_mh, _img_mw); }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {   // LLM-lane perf event: DiT text-conditioning encoder prefill.
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = use_mrope
+                 ? _encoder->forward_embeddings_taps_mrope(
+                       cid, x, n, pos, std::vector<int>{NL - 1},
+                       /*key_valid_len=*/0, use_ds ? &ds : nullptr)
+                 : _encoder->forward_embeddings_taps(
+                       cid, x, n, std::vector<int>{NL - 1},
+                       /*key_valid_len=*/0, use_ds ? &ds : nullptr);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    // last_hidden_state is POST the model's final RMSNorm; the tap is the last
+    // layer's pre-norm output, so apply it on the host.
+    std::vector<float> fnorm((std::size_t)EH, 1.0f);
+    {
+      if (_enc_ws) {
+        // Through the set: this used to re-open (and re-parse the headers
+        // of) the whole checkpoint on EVERY conditioning call to read one
+        // vector. Now it is a lookup on a checkpoint already open.
+        SharedBuffer nw =
+            _enc_ws->tensor("model.language_model.norm.weight", mc,
+                            genai::WeightSet::Residency::Copied);
+        if (!nw.empty()) {
+          const auto* p = static_cast<const std::uint16_t*>(nw.contents());
+          for (int h = 0; h < EH; ++h) { fnorm[(std::size_t)h] = bf16_to_f32_(p[h]); }
+        }
+      }
+    }
+    const float reps = _encoder->config().rms_eps;
+    SharedBuffer txt = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (txt.empty()) { return {}; }
+    const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
+    auto* op = static_cast<std::uint16_t*>(txt.contents());
+    for (int p = 0; p < n; ++p) {
+      const auto* row = tp + (std::size_t)p * EH;
+      double ss = 0.0;
+      for (int h = 0; h < EH; ++h) {
+        const double v = bf16_to_f32_(row[h]); ss += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(ss / (double)EH + (double)reps);
+      for (int h = 0; h < EH; ++h) {
+        op[(std::size_t)p * EH + h] =
+            f32_to_bf16_((float)(bf16_to_f32_(row[h]) * inv * fnorm[(std::size_t)h]));
+      }
+    }
+    n_real_out = n;   // Boogu keeps EVERY token
+    session()->log_debug(fmt("DiffusionConditionerStage('{}'): [{}] boogu-image "
+                             "-> [{}, {}] bf16{}", this->id(), which, n, EH,
+                             grounded ? ", image-grounded (edit)" : ""));
+    return txt;
+  }
+
+  if (_family == "mage-flow") {
+    const int NL = 36;   // Qwen3-VL 4B layers
+    const bool img_aware = (n_img > 0) && !vtok.empty();
+    const std::int32_t pad_id =
+        img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
+    const bool grounded = img_aware && pad_id >= 0;
+    // Edit template (drop 64) when a reference rides along, t2i template
+    // (drop 34) otherwise -- the reference picks the template from the CALL
+    // (generate_edits vs generate_images), which is the same distinction.
+    const int drop = grounded ? kQieDropPrefix : kDropPrefix;
+    const std::string tmpl =
+        (grounded ? std::string(kQiePrefix) + ref_blocks_(_img_n, "Image")
+                  : std::string(kPrefix)) +
+        text + (grounded ? std::string(kQieSuffix) : std::string(kSuffix));
+    std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
+    std::vector<std::pair<int, int>> runs;
+    if (grounded) { runs = expand_pads_(ids, pad_id, _img_tok, _img_n); }
+    if ((int)ids.size() <= drop) { return {}; }
+    const int n = (int)ids.size();
+    const int n_real = n - drop;
+    // Gather through the model's embed muxer (the same table, the same rows:
+    // a dense gather kernel where the other families memcpy). Mage-Flow is
+    // the one family that binds the muxer -- see encoder_config_mage_().
+    for (const std::int32_t id : ids) {
+      if (id < 0 || id >= _encoder->config().vocab) { return {}; }
+    }
+    SharedBuffer x = _encoder->embed_text_buf(ids);
+    if (x.empty() || x.byte_size() < (std::size_t)n * EH * 2) { return {}; }
+    // Splice the tower rows over the image_pad embeddings (f16 tower -> bf16
+    // encoder input, as in the krea2 path below).
+    int first_pad = -1;
+    if (grounded) {
+      // Tower rows in the tower's OWN element type -> the encoder's bf16
+      // residual. Reading a bf16 tower's buffer as f16 gives values of
+      // roughly the right magnitude and entirely the wrong content, so this
+      // asks the tower rather than assuming.
+      const bool vt_bf16 = _vision3 && _vision3->is_bf16();
+      const auto* vt = static_cast<const std::uint16_t*>(vtok.contents());
+      auto* xh = static_cast<std::uint16_t*>(x.contents());
+      int j = 0;
+      for (int i = 0; i < n && j < n_img; ++i) {
+        if (ids[(std::size_t)i] == pad_id) {
+          if (first_pad < 0) { first_pad = i; }
+          const std::uint16_t* src = vt + (std::size_t)j * EH;
+          if (vt_bf16) {
+            std::memcpy(xh + (std::size_t)i * EH, src, (std::size_t)EH * 2);
+          } else {
+            for (int h = 0; h < EH; ++h) {
+              _Float16 hf; std::memcpy(&hf, &src[h], 2);
+              xh[(std::size_t)i * EH + h] = f32_to_bf16_((float)hf);
+            }
+          }
+          ++j;
+        }
+      }
+    }
+    genai::MetalQwenModel::DeepstackInject ds;
+    const bool use_ds = grounded && first_pad >= 0 && !_ds_feats.empty();
+    if (use_ds) {
+      for (int i = 0; i < (int)_ds_feats.size(); ++i) {
+        ds.feats.push_back(&_ds_feats[(std::size_t)i]);
+        ds.layers.push_back(i);
+      }
+      ds.row0 = first_pad;
+      ds.rows = n_img;
+      if (runs.size() > 1) {
+        // The "Image N: " labels sit BETWEEN the blocks, so the image-token runs
+        // are genuinely disjoint here -- one span would inject into the label
+        // tokens. Segs address each run against the concatenated features.
+        int feat = 0;
+        for (const auto& rn : runs) {
+          ds.segs.push_back({rn.first, rn.second, feat});
+          feat += rn.second;
+        }
+      }
     }
     // NOTE: SEQUENTIAL positions, NOT the 2-D mROPE grid krea2 uses. Mage-Flow
     // overrides position_ids with a per-sequence `torch.arange(length)`
@@ -862,9 +1622,13 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // Final RMSNorm on the host (the tap is the last layer's pre-norm output).
     std::vector<float> fnorm(EH, 1.0f);
     {
-      auto wts = genai::MetalLlamaWeights::open_model(_enc_dir);
-      if (wts.has_value()) {
-        SharedBuffer nw = wts->load("model.language_model.norm.weight", mc);
+      if (_enc_ws) {
+        // Through the set: this used to re-open (and re-parse the headers
+        // of) the whole checkpoint on EVERY conditioning call to read one
+        // vector. Now it is a lookup on a checkpoint already open.
+        SharedBuffer nw =
+            _enc_ws->tensor("model.language_model.norm.weight", mc,
+                            genai::WeightSet::Residency::Copied);
         if (!nw.empty()) {
           const auto* p = static_cast<const std::uint16_t*>(nw.contents());
           for (int h = 0; h < EH; ++h) { fnorm[h] = bf16_to_f32_(p[h]); }
@@ -975,7 +1739,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
   // positions and the grounded conditioning collapses (image tokens diverge
   // from the reference). Sequential path kept for the text-only case.
   const bool use_mrope = img_aware && first_pad >= 0
-                         && _img_mh > 0 && _img_mw > 0;
+                         && _img_mh[0] > 0 && _img_mw[0] > 0;
   std::vector<std::int32_t> pos;
   if (use_mrope) {
     pos.assign((std::size_t)3 * n, 0);
@@ -985,10 +1749,10 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         const int base = cur;
         for (int j = 0; j < n_img && i < n; ++j, ++i) {
           pos[(std::size_t)i] = base;                          // T
-          pos[(std::size_t)n + i] = base + j / _img_mw;        // H
-          pos[(std::size_t)2 * n + i] = base + j % _img_mw;    // W
+          pos[(std::size_t)n + i] = base + j / _img_mw[0];     // H
+          pos[(std::size_t)2 * n + i] = base + j % _img_mw[0]; // W
         }
-        cur = base + std::max(_img_mh, _img_mw);
+        cur = base + std::max(_img_mh[0], _img_mw[0]);
       } else {
         pos[(std::size_t)i] = cur;
         pos[(std::size_t)n + i] = cur;
@@ -1050,11 +1814,54 @@ to_beat_(const SharedBuffer& buf, std::vector<std::int64_t> shape,
   return out;
 }
 
+// The conditioning beat a BLOCKED prompt gets: a single zero row carrying
+// `content_blocked` on its sideband. The DiT never looks at the numbers -- it
+// checks the flag, skips the denoise entirely and passes the flag on to
+// vae-decode, which emits the blank refusal image. Emitting a beat at all (a
+// refusal is still an answer) is what keeps a blocked prompt from stalling a
+// pipeline that is blocked on the DiT's iport0.
+static std::unique_ptr<TensorBeatPayload>
+blocked_beat_(int enc_hidden)
+{
+  auto out = std::make_unique<TensorBeatPayload>();
+  out->dtype = TensorBeat::DType::Bf16;
+  out->shape = {1, enc_hidden};
+  out->resize_contiguous((std::size_t)enc_hidden);
+  std::memset(out->as_u8(), 0, (std::size_t)enc_hidden * 2);
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert_or_assign("content_blocked", FlexData::make_bool(true));
+  out->sideband = std::move(sb);
+  return out;
+}
+
+genai::MageScreenVerdict
+DiffusionConditionerStage::screen_(const std::string& prompt,
+                                   const SharedBuffer& vtok, int n_img) const
+{
+  genai::MageScreenRequest req;
+  req.prompt = prompt;
+  if (n_img > 0 && !vtok.empty()) {
+    req.vision = &vtok;
+    req.n_img  = n_img;
+    // The content screen judges the source picture(s) as one block; with
+    // several references the grids differ, so pass the FIRST (the screen only
+    // needs a consistent 2-D band, and Mage-Flow's own screen path is
+    // single-image).
+    req.img_mh = _img_mh[0];
+    req.img_mw = _img_mw[0];
+    for (const auto& f : _ds_feats) { req.deepstack.push_back(&f); }
+  }
+  return genai::mage_screen(*_encoder, *_tokenizer, req, session());
+}
+
 Job
 DiffusionConditionerStage::process(RuntimeContext& ctx)
 {
   auto* mc = session()->metal_compute();
   if (mc == nullptr) { co_return; }
+
+  // Post-barrier: every peer has loaded, so the footprint is real.
+  resolve_unload_policy_();
 
   // Latch the shared model (iport2) once -- a model-select source overrides the
   // hf_dir config -- then lazily load the encoder before we need it.
@@ -1069,6 +1876,10 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
       }
     }
   }
+  // A previous prompt may have dropped the encoder to leave the DiT room; bring
+  // it back before anything needs it. Done before the "loaded?" gate so an
+  // unloaded stage is not mistaken for an inert one.
+  if (_unloaded && !_encoder) { reload_encoder_(); }
   if (!_encoder) { co_return; }   // no model loaded -> inert
 
   // Latch the negative prompt (iport1) + reference image (iport3) once.
@@ -1081,17 +1892,38 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     }
     _negative_latched = true;
   }
-  if (_ref_rgb.empty() && (int)ctx.num_iports() > 3 && ctx.iport_connected(3)) {
-    auto rb = co_await ctx.read(3);
+  // Reference images latch independently on iport3 / iport4, then compact to a
+  // contiguous [0, _n_ref) run so "reference i" always means the i-th picture
+  // the VLM sees even if only the second port was wired.
+  for (int i = 0; i < kMaxRefs; ++i) {
+    const unsigned port = 3u + (unsigned)i;
+    if (!_ref_rgb[i].empty()) { continue; }
+    if ((int)ctx.num_iports() <= (int)port || !ctx.iport_connected(port)) {
+      continue;
+    }
+    auto rb = co_await ctx.read(port);
     const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
                         : nullptr;
     if (tb != nullptr && tb->dtype == TensorBeat::DType::U8 &&
         tb->shape.size() == 3 && tb->shape[0] == 3) {
       const auto bytes = tb->materialize_contiguous();
-      _ref_rgb.assign(bytes.begin(), bytes.end());
-      _ref_rgb_h = (int)tb->shape[1];
-      _ref_rgb_w = (int)tb->shape[2];
+      _ref_rgb[i].assign(bytes.begin(), bytes.end());
+      _ref_rgb_h[i] = (int)tb->shape[1];
+      _ref_rgb_w[i] = (int)tb->shape[2];
     }
+  }
+  {
+    int w = 0;
+    for (int i = 0; i < kMaxRefs; ++i) {
+      if (_ref_rgb[i].empty()) { continue; }
+      if (w != i) {
+        _ref_rgb[w] = std::move(_ref_rgb[i]);
+        _ref_rgb_h[w] = _ref_rgb_h[i]; _ref_rgb_w[w] = _ref_rgb_w[i];
+        _ref_rgb[i].clear();
+      }
+      ++w;
+    }
+    _n_ref = w;
   }
 
   // Read the prompt (iport0). A null beat means the upstream source is
@@ -1118,6 +1950,39 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // families (qwen-image-edit / mage-flow) -> bf16.
   const TensorBeat::DType cdt = single_tap_(_family) ? TensorBeat::DType::Bf16
                                                      : TensorBeat::DType::F16;
+
+  // ---- MANDATORY content screen (Mage-Flow) ----------------------------
+  // Runs on the encoder this stage already owns, on every prompt, with no
+  // config key to turn it off -- microsoft/Mage-Flow puts the classifier on
+  // the text encoder precisely so it cannot be skipped, and a graph that
+  // could omit it would be a bypass. FAIL-CLOSED: mage_screen() returns a
+  // BLOCKING verdict for every failure mode, so a classifier that will not
+  // run stops generation instead of waving it through.
+  if (_family == "mage-flow") {
+    const genai::MageScreenVerdict verdict = screen_(prompt, vtok, n_img);
+    if (verdict.violates) {
+      ++_blocked;
+      // Say THAT it was blocked, not WHICH category tripped: the reference
+      // surfaces nothing at all (its refusal banner is deliberately empty)
+      // because naming the category turns the gate into an oracle to probe
+      // against. The full verdict stays at debug level for diagnosis.
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): prompt blocked by the Mage-Flow "
+          "content policy; emitting a refusal", this->id()));
+      std::string cats;
+      for (const auto& c : verdict.categories) {
+        if (!cats.empty()) { cats += ","; }
+        cats += c;
+      }
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): content screen verdict: [{}] {}",
+          this->id(), cats.empty() ? "-" : cats.c_str(), verdict.reason));
+      co_await ctx.write(0, blocked_beat_(_enc_hidden));
+      ++_emitted;
+      if (_unload_idle) { unload_encoder_(); }
+      co_return;
+    }
+  }
 
   int n_real = 0;
   SharedBuffer cond = encode_(prompt, "prompt", n_real, vtok, n_img);
@@ -1146,6 +2011,10 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
       co_await ctx.write(1, to_beat_(nc, shape_for(n_neg), cdt));
     }
   }
+  // Drop the encoder BEFORE the conditioning is published: the DiT stage starts
+  // its denoise as soon as the beat lands, so releasing here is what gives it
+  // the working set. It reloads when the next prompt arrives.
+  if (_unload_idle) { unload_encoder_(); }
   co_await ctx.write(0, to_beat_(cond, shape_for(n_real), cdt));
   ++_emitted;
 }

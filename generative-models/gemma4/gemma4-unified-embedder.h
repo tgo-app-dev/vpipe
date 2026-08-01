@@ -26,6 +26,7 @@ namespace vpipe::metal_compute { class MetalCompute; }
 namespace vpipe::genai {
 
 class GgufFile;
+class WeightSet;       // generative-models/weight-set.h
 
 class Gemma4UnifiedEmbedder {
 public:
@@ -55,6 +56,17 @@ public:
   // adaptor is present.
   static std::unique_ptr<Gemma4UnifiedEmbedder>
   load_safetensors(const std::string& model_dir,
+                   metal_compute::MetalCompute* mc);
+
+  // Preferred: the adaptor tensors live in the LM's own checkpoint, so
+  // passing the LM's set reads them from the mmap already open for it
+  // rather than opening a second one.
+  //
+  // Unlike the towers, this embedder does NOT keep the set: every tensor
+  // it reads is converted into a host float vector at load and the
+  // device buffer is dropped, so it holds no view into the checkpoint.
+  static std::unique_ptr<Gemma4UnifiedEmbedder>
+  load_safetensors(const std::shared_ptr<WeightSet>& ws,
                    metal_compute::MetalCompute* mc);
 
   // True if `model_dir`'s safetensors carries the unified vision/audio

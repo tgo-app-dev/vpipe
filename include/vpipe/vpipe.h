@@ -32,6 +32,14 @@ namespace vpipe {
 // behind a deployed binary.
 const char* vpipe_version();
 
+// The same build identity, split so a caller can compose its own string
+// (e.g. an EXIF Software tag) without parsing vpipe_version()'s
+// "<version> (<hash>)" shape.
+//   vpipe_version_number() -> "0.1"
+//   vpipe_build_hash()     -> "d950473*4"  (the `*N` suffix counts dirty files)
+const char* vpipe_version_number();
+const char* vpipe_build_hash();
+
 }
 
 #endif

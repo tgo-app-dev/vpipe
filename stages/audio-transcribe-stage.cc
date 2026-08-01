@@ -6,6 +6,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
+#include "stages/sampler-spec.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/chat-template.h"
@@ -40,11 +41,14 @@ AudioTranscribeStage::AudioTranscribeStage(
   : TypedStage<AudioTranscribeStage>(s, std::move(id), std::move(iports),
                                      std::move(config))
 {
-  // Streaming mode is selected purely from the wired graph: when the
-  // pipeline spec gives us two iports (PCM + segment markers) we
-  // operate in streaming mode for the life of the stage. With one
-  // iport (the legacy default) every beat is a complete clip.
-  _streaming = this->iport_edges().size() >= 2;
+  // Streaming mode is selected purely from the wired graph: a WIRED
+  // segment-marker iport1 puts the stage in streaming mode for its life;
+  // without one (the legacy default) every beat is a complete clip. Check
+  // the SLOT, not the port count -- the sampler iport2 sits after it, so a
+  // graph that wires only a sampler must not be flipped into streaming mode
+  // (where it would then wait forever for markers that can never arrive).
+  _streaming = this->iport_edges().size() >= 2
+      && this->iport_edges()[1].v != nullptr;
   // Construction must succeed for any config (see Stage::fail_config):
   // a stage must construct so a graph can be built/edited before
   // required fields are supplied. Config problems are recorded via
@@ -98,23 +102,10 @@ AudioTranscribeStage::AudioTranscribeStage(
     _pcm_buffer_s = v;
   }
   _late_marker_skip = attr_bool("late_marker_skip");
-#ifdef VPIPE_BUILD_APPLE_SILICON
-  // Optional "sampler" sub-object (composite; no flat ConfigKey form) --
-  // same schema as visual-qa / realtime-vqa / text-chat. Empty / absent
-  // => greedy argmax (Sampler::is_argmax() returns true). When present,
-  // every decode step host-pulls the logits and runs the configured
-  // temperature / top_k / top_p / min_p / repetition_penalty /
-  // presence_penalty / seed combo via Sampler::sample().
-  {
-    const FlexData& cfg = this->config();
-    if (cfg.is_object()) {
-      auto root = cfg.as_object();
-      if (root.contains("sampler")) {
-        _sampler_params = genai::parse_sampler_config(root.at("sampler"));
-      }
-    }
-  }
-#endif
+  // Sampling is programmed by a `sampler-select` stage on the OPTIONAL
+  // sampler iport2, latched on the first beat. Unwired => _sampler_params
+  // stays at its defaults, which are argmax (this stage's historical
+  // behaviour: transcription wants the most likely token).
 
   if (_hf_dir.empty()) {
     fail_config(fmt(
@@ -158,8 +149,6 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "late_marker_skip", .type = ConfigType::Bool,
    .doc = "drop segment markers whose start is older than the buffer",
    .def_bool = true},
-  {.key = "sampler", .type = ConfigType::Object,
-   .doc = "decode sampler knobs (temperature/top_k/top_p/...)"},
 };
 const PortSpec kIports[] = {
   {.name = "audio", .doc = "mono F32 PCM TensorBeat [N] or [1,N]; one clip "
@@ -171,6 +160,11 @@ const PortSpec kIports[] = {
                               "audio-segment); connecting it switches the "
                               "stage to streaming mode (slice the rolling "
                               "PCM buffer per marker)",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select). Latched "
+          "on the first beat and reused for every later clip; unwired = "
+          "greedy (argmax) decoding",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
@@ -208,9 +202,27 @@ AudioTranscribeStage::resolve_model_dir(const std::string& ref) const
   return vpipe::resolve_model_dir(session(), _models_db, ref);
 }
 
+void
+AudioTranscribeStage::reset_run_state()
+{
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _sampler_latched = false;
+}
+
+std::vector<std::string>
+AudioTranscribeStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  return {resolve_model_dir(_hf_dir)};   // stage's own overload
+}
+
 Job
 AudioTranscribeStage::initialize(RuntimeContext& /*ctx*/)
 {
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
   if (_hf_dir.empty()) {
     co_return;  // ctor already errored.
@@ -282,6 +294,23 @@ Job
 AudioTranscribeStage::process(RuntimeContext& ctx)
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // Latch the token-sampler spec off the OPTIONAL sampler iport2, once: the
+  // `sampler-select` source emits a single beat at launch, which we cache and
+  // reuse for every later clip. Unlike the other LLM stages this reads BEFORE
+  // the audio, because process() branches on block-vs-streaming below and a
+  // single latch site is worth more here than the read ordering -- and it
+  // guarantees even the FIRST clip decodes with the configured sampler.
+  // iport_connected() keeps a declared-but-unwired port from stalling.
+  if (!_sampler_latched && ctx.num_iports() >= 3 && ctx.iport_connected(2)) {
+    auto sb = co_await ctx.read(2);
+    _sampler_latched = true;   // beat consumed either way; never re-read
+    bool ok = false;
+    const genai::SamplerParams p = sampler_params_from_beat(
+        sb.get(), session(), "AudioTranscribeStage('" + this->id() + "')",
+        &ok);
+    if (ok) { _sampler_params = p; }
+  }
+
   const bool encoder_ready = _lm && _m_audio;
   if (!encoder_ready) {
     if (!_encoder_unavailable_warned) {

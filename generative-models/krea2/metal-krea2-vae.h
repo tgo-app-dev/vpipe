@@ -11,6 +11,8 @@
 namespace vpipe {
 namespace genai {
 
+class WeightSet;   // generative-models/weight-set.h
+
 // Qwen-Image VAE decoder (AutoencoderKLQwenImage), run in f16 on the metal-
 // compute backend. The full model is a 3D causal-conv video VAE, but a still
 // image is a single-frame latent -- and for one frame every QwenImageCausal
@@ -38,9 +40,25 @@ class MetalKrea2Vae {
 
   // `with_encoder` also loads the encoder weights (for the img2img encode
   // path); the decode-only path (text-to-image) leaves it false to save RAM.
+  //
+  // Prefer the WeightSet overload: the set is the manager's shared,
+  // reference-counted view of the checkpoint, so a second VAE over the
+  // same directory reuses these tensors instead of loading its own copy.
+  // The dir overload opens a PRIVATE set (tests, and callers with no
+  // session to ask).
   static std::unique_ptr<MetalKrea2Vae>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool with_encoder = false);
+
+  static std::unique_ptr<MetalKrea2Vae>
+  load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
+       const Config& cfg, bool with_encoder = false);
+
+  // Materialise the encoder half now, if it is not already loaded. The
+  // point of deferring it: a graph that never receives a reference image
+  // never calls this, so the encoder's weights are never read. Cheap and
+  // idempotent once loaded. False if the encoder cannot be loaded.
+  bool ensure_encoder();
 
   // Decode a single-frame latent `z` laid out channel-first [z_dim, h8, w8]
   // (already unpacked + un-whitened) into an RGB image [3, h8*8, w8*8],
@@ -108,12 +126,12 @@ class MetalKrea2Vae {
     Conv down;                      // resample.1: 3x3 STRIDE-2 conv (dim->dim)
   };
 
-  Conv load_conv3x3_(const class MetalLlamaWeights& w, const std::string& nm,
+  Conv load_conv3x3_(WeightSet& ws, const std::string& nm,
                      bool from3d);
-  Conv load_conv1x1_(const class MetalLlamaWeights& w, const std::string& nm);
-  metal_compute::SharedBuffer load_vec_(const class MetalLlamaWeights& w,
+  Conv load_conv1x1_(WeightSet& ws, const std::string& nm);
+  metal_compute::SharedBuffer load_vec_(WeightSet& ws,
                                         const std::string& nm);
-  bool load_resblock_(const class MetalLlamaWeights& w, const std::string& pre,
+  bool load_resblock_(WeightSet& ws, const std::string& pre,
                       ResBlock& rb, int cin, int cout);
 
   metal_compute::MetalCompute* _mc = nullptr;
@@ -137,7 +155,15 @@ class MetalKrea2Vae {
   Conv _enc_conv_out;               // 3x3 conv base*dim_mult[-1] -> z_dim*2
   Conv _quant_conv;                 // 1x1 conv z_dim*2 -> z_dim*2
 
-  bool load_encoder_(const class MetalLlamaWeights& w);
+  bool load_encoder_(WeightSet& ws);
+
+  // The checkpoint these weights come from, held for this model's whole
+  // life: the cached tensors are aliases into buffers it owns (and
+  // mapped ones alias its mmap), so it has to outlive them.
+  std::shared_ptr<WeightSet> _ws;
+  // Part the loaders currently attribute their tensors to; "" is the
+  // always-resident trunk, "encoder" the half release_part() can drop.
+  std::string _part;
 
   // Shared conv/1x1 GEMM y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N]). On M5 (matrix
   // cores) this rides the hardware matmul2d dense GEMM when M is tall enough to

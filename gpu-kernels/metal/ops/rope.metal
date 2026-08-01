@@ -474,6 +474,44 @@ kernel void transpose_rope_pair_ftab_f16(
   out[ob + 1] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// transpose_rope_pair_ftab with a PADDED output head-dim: reads TOKEN-major
+// in[(t*H+h)*D + 2i(,+1)], applies token t's interleaved-pair rope, and writes
+// HEAD-major out[(h*T+t)*Dp + 2i(,+1)] with the [D, Dp) tail ZEROED. The pad
+// lets a head_dim the flash kernels do not support (the Boogu DiT's 120) run on
+// the steel bd128 path: zero-padded q/k leave every dot product unchanged.
+// See transpose_abd_pad_f16 / transpose_abd_unpad_f16 for the v/output twins.
+// grid (Dp/2, T, H).
+kernel void transpose_rope_pair_ftab_pad_f16(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    device VPIPE_ELT*       out  [[buffer(1)]],
+    const device float*     cosb [[buffer(2)]],
+    const device float*     sinb [[buffer(3)]],
+    constant int&           H    [[buffer(4)]],
+    constant int&           T    [[buffer(5)]],
+    constant int&           D    [[buffer(6)]],
+    constant int&           Dp   [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int i = (int)gid.x;
+  if (2 * i >= Dp) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  const uint ob = ((uint)h * T + t) * Dp + 2 * i;
+  if (2 * i >= D) {                      // padding tail
+    out[ob] = VPIPE_ELT(0.0f);
+    out[ob + 1] = VPIPE_ELT(0.0f);
+    return;
+  }
+  const uint cb = (uint)t * D + 2 * i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const uint ib = ((uint)t * H + h) * D + 2 * i;   // token-major input
+  const float x1 = float(in[ib]);
+  const float x2 = float(in[ib + 1]);
+  out[ob]     = VPIPE_ELT(x1 * c - x2 * s);
+  out[ob + 1] = VPIPE_ELT(x1 * s + x2 * c);
+}
+
 // HALF-SPLIT (NEOX) RoPE from f32 cos/sin tables [T, D/2] (Qwen2.5-VL vision:
 // rotate_half convention, out = x*cos + rotate_half(x)*sin, cos/sin duplicated
 // over the two halves so only D/2 table entries are needed). Pairs dim i with

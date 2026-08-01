@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,13 +121,15 @@ compute_windows_(int gh, int gw, int merge, int wm,
 }
 
 SharedBuffer
-to_elt_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
+to_elt_(WeightSet& wts, MetalCompute* mc, const std::string& nm)
 {
-  const auto* info = wts.info(nm);
+  const auto* info = wts.src().info(nm);
   if (info == nullptr || info->shape.empty()) { return {}; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
-  SharedBuffer raw = wts.load(nm, mc);
+  // Uncached: the raw tensor is consumed by the conversion below. The
+  // CONVERTED result is what the caller caches.
+  SharedBuffer raw = wts.read(nm, mc, WeightSet::Residency::Copied);
   if (raw.empty()) { return {}; }
   SharedBuffer out = mc->make_shared_buffer(n * 2);
   auto* d = static_cast<std::uint16_t*>(out.contents());
@@ -152,13 +155,14 @@ to_elt_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
 // empty if the tensors are missing / malformed. `group` is the quant group
 // size; the per-tensor bit width is derived from the shapes (mixed 4/8 safe).
 SharedBuffer
-dequant_affine_(const MetalLlamaWeights& wts, MetalCompute* mc,
+dequant_affine_(WeightSet& wts, MetalCompute* mc,
                 const std::string& base, int group)
 {
   // `base` is the linear name without the ".weight" suffix; the affine triple
   // is base.weight (U32 codes) + base.scales + base.biases (F16).
-  const auto* ci = wts.info(base + ".weight");   // codes [N, K*bits/32] (U32)
-  const auto* si = wts.info(base + ".scales");   // [N, K/group] (F16)
+  const auto* ci =
+      wts.src().info(base + ".weight");          // codes [N, K*bits/32] (U32)
+  const auto* si = wts.src().info(base + ".scales");   // [N, K/group] (F16)
   if (ci == nullptr || si == nullptr || ci->shape.size() != 2 ||
       si->shape.size() != 2 || group <= 0) {
     return {};
@@ -170,9 +174,11 @@ dequant_affine_(const MetalLlamaWeights& wts, MetalCompute* mc,
   if (N <= 0 || K <= 0 || cc <= 0) { return {}; }
   const int bits = (int)(cc * 32 / K);               // 4 or 8
   if (bits != 4 && bits != 8) { return {}; }
-  SharedBuffer codes = wts.load(base + ".weight", mc);
-  SharedBuffer scb   = wts.load(base + ".scales", mc);
-  SharedBuffer bib   = wts.load(base + ".biases", mc);
+  // All three are consumed by the expansion below and dropped.
+  const auto cp = WeightSet::Residency::Copied;
+  SharedBuffer codes = wts.read(base + ".weight", mc, cp);
+  SharedBuffer scb   = wts.read(base + ".scales", mc, cp);
+  SharedBuffer bib   = wts.read(base + ".biases", mc, cp);
   if (codes.empty() || scb.empty() || bib.empty()) { return {}; }
   const auto* cw = static_cast<const std::uint32_t*>(codes.contents());
   const auto* sf = static_cast<const _Float16*>(scb.contents());   // F16
@@ -209,27 +215,35 @@ dequant_affine_(const MetalLlamaWeights& wts, MetalCompute* mc,
 MetalQwen25Vision::~MetalQwen25Vision() = default;
 
 SharedBuffer
-MetalQwen25Vision::to_elt_(const MetalLlamaWeights& wts, const std::string& name)
+MetalQwen25Vision::to_elt_(WeightSet& wts, const std::string& name)
 {
-  // A quantized model may have affine-packed some of the visual linears
-  // (model-quantize's text_encoder scope). The affine scales live at
-  // <base>.scales where <base> is the linear name without ".weight"; detect that
-  // and expand back to dense bf16. Dense tensors (norms, patch_embed, biases,
-  // unquantized linears) have no such sibling and take the plain path.
-  if (_quant_bits > 0 && name.size() > 7 &&
-      name.compare(name.size() - 7, 7, ".weight") == 0) {
-    const std::string base = name.substr(0, name.size() - 7);
-    if (wts.info(base + ".scales") != nullptr) {
-      SharedBuffer dq =
-          vpipe::genai::dequant_affine_(wts, _mc, base, _quant_group);
-      if (!dq.empty()) { return dq; }
+  // Cached under this tower's own namespace: the result is dense bf16
+  // whatever the on-disk form was, so a second tower over this
+  // checkpoint takes it rather than re-expanding it. The quantization
+  // parameters that shape these bytes come from the SAME directory's
+  // config.json, so they are already fixed by the cache key's set.
+  return wts.derived("qwen25-vit/" + name, [&]() -> SharedBuffer {
+    // A quantized model may have affine-packed some of the visual linears
+    // (model-quantize's text_encoder scope). The affine scales live at
+    // <base>.scales where <base> is the linear name without ".weight";
+    // detect that and expand back to dense bf16. Dense tensors (norms,
+    // patch_embed, biases, unquantized linears) have no such sibling and
+    // take the plain path.
+    if (_quant_bits > 0 && name.size() > 7 &&
+        name.compare(name.size() - 7, 7, ".weight") == 0) {
+      const std::string base = name.substr(0, name.size() - 7);
+      if (wts.src().info(base + ".scales") != nullptr) {
+        SharedBuffer dq =
+            vpipe::genai::dequant_affine_(wts, _mc, base, _quant_group);
+        if (!dq.empty()) { return dq; }
+      }
     }
-  }
-  return vpipe::genai::to_elt_(wts, _mc, name);
+    return vpipe::genai::to_elt_(wts, _mc, name);
+  });
 }
 
 bool
-MetalQwen25Vision::load_linear_(const MetalLlamaWeights& wts,
+MetalQwen25Vision::load_linear_(WeightSet& wts,
                                 const std::string& pre, SharedBuffer& w,
                                 SharedBuffer& b)
 {
@@ -242,11 +256,20 @@ std::unique_ptr<MetalQwen25Vision>
 MetalQwen25Vision::load(const std::string& model_dir, MetalCompute* mc,
                         const Config& cfg)
 {
-  if (mc == nullptr) { return nullptr; }
-  auto wtsopt = MetalLlamaWeights::open_model(model_dir);
-  if (!wtsopt.has_value()) { return nullptr; }
-  const MetalLlamaWeights& wts = *wtsopt;
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalQwen25Vision>
+MetalQwen25Vision::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
+                        const Config& cfg)
+{
+  if (mc == nullptr || ws_in == nullptr) { return nullptr; }
+  const std::string model_dir = ws_in->dir();
+  WeightSet& wts = *ws_in;
   auto m = std::unique_ptr<MetalQwen25Vision>(new MetalQwen25Vision());
+  m->_ws = ws_in;
   m->_mc = mc; m->_cfg = cfg;
 
   // Quantized model? The text_encoder config.json `quantization {bits,

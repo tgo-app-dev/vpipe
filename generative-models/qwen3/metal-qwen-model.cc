@@ -1,8 +1,10 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/mma-tile.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -106,13 +108,23 @@ std::unique_ptr<MetalQwenModel>
 MetalQwenModel::load(const std::string& model_dir,
                      metal_compute::MetalCompute* mc, const Config& cfg_in)
 {
-  if (mc == nullptr || !mc->valid()) {
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg_in);
+}
+
+std::unique_ptr<MetalQwenModel>
+MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
+                     metal_compute::MetalCompute* mc, const Config& cfg_in)
+{
+  if (mc == nullptr || !mc->valid() || !ws_in) {
     return nullptr;
   }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) {
-    return nullptr;
-  }
+  // Held for the model's lifetime below (m->_ws). This model reads its
+  // tensors as owned COPIES (see the Copied residency below), so the
+  // hold is not about keeping views alive -- it is the reference count
+  // that decides when the checkpoint is closed.
+  WeightSet& wset = *ws_in;
+  const MetalLlamaWeights* wts = &wset.src();
+  const std::string model_dir = wset.dir();
 
   // Working copy: auto-correct the LM weight prefix for naming variants.
   // config_from() guesses "language_model." + "model." (the 4B/9B layout); a
@@ -156,6 +168,7 @@ MetalQwenModel::load(const std::string& model_dir,
   }
 
   auto m = std::unique_ptr<MetalQwenModel>(new MetalQwenModel());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
 
@@ -411,6 +424,22 @@ MetalQwenModel::load(const std::string& model_dir,
       m->_lib_qmm.function("affine_qmm_grouped_w8g64");
   m->_fn_moe_qmm_grouped_swiglu_w8 =
       m->_lib_qmm.function("affine_qmm_grouped_swiglu_w8g64");
+  // Mixed-width fused expert SwiGLU: gate and up at DIFFERENT widths, each
+  // read at its native width (no widening, so no extra DRAM traffic) and
+  // joined in registers. Two flavors cover every {4,8} pair.
+  m->_fn_moe_gather_swiglu_g4u8 =
+      m->_lib_qmv.function("affine_gather_qmv_swiglu_w4w8g64");
+  m->_fn_moe_gather_swiglu_g8u4 =
+      m->_lib_qmv.function("affine_gather_qmv_swiglu_w8w4g64");
+  // w8 shared-expert SwiGLU twins: the shared expert has its own width, so a
+  // w4-global model can still need these.
+  m->_fn_qmv_swiglu8 = m->_lib_qmv.function("affine_qmv_swiglu_w8g64");
+  m->_fn_qmm_swiglu8 = m->_lib_qmm.function("affine_qmm_swiglu_w8g64");
+  if (!m->_fn_moe_gather_swiglu_g4u8.valid() ||
+      !m->_fn_moe_gather_swiglu_g8u4.valid() ||
+      !m->_fn_qmv_swiglu8.valid() || !m->_fn_qmm_swiglu8.valid()) {
+    return nullptr;
+  }
   if (!m->_fn_moe_gather_swiglu_w8.valid() ||
       !m->_fn_moe_gather_down_w8.valid() ||
       !m->_fn_moe_grouped_swiglu_w8.valid() ||
@@ -522,6 +551,9 @@ MetalQwenModel::load(const std::string& model_dir,
     if (const char* e = std::getenv("VPIPE_QWEN_MMA_NODQ")) {
       m->_skip_dequant = (std::atoi(e) != 0);   // diagnostic only
     }
+    // Split-K for the very deep down_proj contractions (fires only at
+    // ffn = 17408 / 21504; inert on every other checkpoint).
+    m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
   }
   // The prefill GQA attention set loads its members now that mma/use_mma are
   // resolved (it's tuned later in ensure_decode_scratch_).
@@ -849,8 +881,20 @@ MetalQwenModel::load(const std::string& model_dir,
     const auto* info = wts->info(name);
     if (info == nullptr) { return {}; }
     const std::string want = bf16 ? "BF16" : "F16";
-    if (info->dtype == want) { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
+    // Already the compute dtype: an owned copy, uncached.
+    //
+    // Mapping these instead was MEASURED and rejected: load_mapped wraps
+    // the WHOLE shard, so the moment one tensor is mapped the entire
+    // checkpoint is resident -- and an LM still has to copy every tensor
+    // whose dtype needs converting, so it pays for both. On a 4-bit
+    // Qwen3.5-4B that was 3.62 -> 5.00 GB peak footprint. The DiTs map
+    // profitably because they convert almost nothing; LMs do not.
+    if (info->dtype == want) {
+      return wset.read(name, mc, WeightSet::Residency::Copied);
+    }
+    // The source is consumed here and dropped, so it is read UNCACHED --
+    // caching it would keep a redundant copy beside the converted one.
+    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
     if (raw.empty()) { return {}; }
     const std::size_t n = numel_(info->shape);
     SharedBuffer out = mc->make_shared_buffer(n * 2);
@@ -877,8 +921,10 @@ MetalQwenModel::load(const std::string& model_dir,
   auto to_f32 = [&](const std::string& name) -> SharedBuffer {
     const auto* info = wts->info(name);
     if (info == nullptr) { return {}; }
-    if (info->dtype == "F32") { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
+    if (info->dtype == "F32") {
+      return wset.read(name, mc, WeightSet::Residency::Copied);
+    }
+    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
     if (raw.empty()) { return {}; }
     const std::size_t n = numel_(info->shape);
     SharedBuffer out = mc->make_shared_buffer(n * 4);
@@ -894,7 +940,10 @@ MetalQwenModel::load(const std::string& model_dir,
   // Quantized linear: U32 weight (raw), F16 scales+biases (converted).
   auto qtri = [&](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
                   SharedBuffer& b) -> bool {
-    w = wts->load(pfx + ".weight", mc);
+    // Raw U32 codes. Uncached: several of these are row-concatenated
+    // into one fused matrix and then dropped, and a cache would hold the
+    // pieces alive next to the product.
+    w = wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
     s = to_f16(pfx + ".scales");
     b = to_f16(pfx + ".biases");
     return !w.empty() && !s.empty() && !b.empty();
@@ -1179,7 +1228,7 @@ MetalQwenModel::load(const std::string& model_dir,
       }
       return false;
     }
-    buf = wts->load(name, mc);
+    buf = wset.read(name, mc, WeightSet::Residency::Copied);
     return !buf.empty();
   };
   // Fuse two same-family raw k-quant weights by row (byte) concatenation:
@@ -1193,7 +1242,9 @@ MetalQwenModel::load(const std::string& model_dir,
     }
     ty = kq_of(i1->dtype);
     if (ty == KQ::kNone) { return false; }
-    SharedBuffer b1 = wts->load(n1, mc), b2 = wts->load(n2, mc);
+    // Consumed into the concatenated buffer below, then dropped.
+    SharedBuffer b1 = wset.read(n1, mc, WeightSet::Residency::Copied),
+                 b2 = wset.read(n2, mc, WeightSet::Residency::Copied);
     if (b1.empty() || b2.empty()) { return false; }
     buf = mc->make_shared_buffer(b1.byte_size() + b2.byte_size());
     if (buf.empty()) { return false; }
@@ -1441,8 +1492,13 @@ MetalQwenModel::load(const std::string& model_dir,
         // raw Q4_K (the affine triple is the only copy now).
         if (ly.ffn_q4k_aff) { ly.kqgate = {}; ly.kqup = {}; }
       }
-    } else if (m->_mixed) {
-      // Mixed per-tensor MLP. When gate/up share the (4-bit) width, interleave
+    } else if (m->_mixed && !cfg.is_moe()) {
+      // Mixed per-tensor MLP -- DENSE only. A mixed MoE checkpoint (OptiQ
+      // quantizes per tensor, MoE or not) has no mlp.gate_proj at all; it
+      // must fall through to the MoE branch below, which now carries its own
+      // per-tensor widths. Without the is_moe() guard the bind looked for the
+      // dense projections and failed outright.
+      // When gate/up share the (4-bit) width, interleave
       // them into guw and run the FUSED swiglu qmv/qmm (the same kernels the
       // uniform path uses -- recovers the fusion the de-fused path drops on
       // 28/32 OptiQ layers). Otherwise keep gate->guw, up->uw de-fused (the 4
@@ -1466,29 +1522,69 @@ MetalQwenModel::load(const std::string& model_dir,
       // (w4, gate|up interleaved per slab + down) + dense shared expert (w4,
       // gate|up interleaved + down) + shared-expert sigmoid gate (w8).
       const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
-      // Routed-expert quant width (4 or 8) -> w4/w8 expert kernels at dispatch.
+      // Routed-expert quant widths, PER TENSOR (OptiQ quantizes each linear on
+      // its own sensitivity, so gate/up/down within one layer can disagree).
+      // down is a standalone tensor -> always just its own width; gate|up
+      // share the interleaved slab, so they must be made to agree.
       const int egb = affine_bits(p + "mlp.switch_mlp.gate_proj", cfg.hidden);
-      ly.eg_bits = (egb == 8) ? 8 : 4;
-      ok = ok && qtri(p + "mlp.gate", ly.rgw, ly.rgs, ly.rgb);   // router w8
+      const int eub = affine_bits(p + "mlp.switch_mlp.up_proj", cfg.hidden);
+      const int edb = affine_bits(p + "mlp.switch_mlp.down_proj",
+                                  cfg.moe_inner);
+      ly.ed_bits = (edb == 8) ? 8 : 4;
+      ok = ok && qtri(p + "mlp.gate", ly.rgw, ly.rgs, ly.rgb);   // router
+      ly.r_bits = affine_bits(p + "mlp.gate", cfg.hidden) == 8 ? 8 : 4;
       {
         SharedBuffer gw, gs, gb, uw, us, ub;
         ok = ok && qtri(p + "mlp.switch_mlp.gate_proj", gw, gs, gb);
         ok = ok && qtri(p + "mlp.switch_mlp.up_proj", uw, us, ub);
-        ok = ok && interleave_moe(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
-                                  ly.eguw, ly.egus, ly.egub);
+        ly.eg_bits = (egb == 8) ? 8 : 4;
+        ly.eu_bits = (eub == 8) ? 8 : 4;
+        ly.moe_split = egb != eub;
+        if (!ly.moe_split) {
+          // Equal widths: interleave into the one gate|up slab and run the
+          // cheaper fused kernel, exactly as a uniform checkpoint does.
+          ok = ok && interleave_moe(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
+                                    ly.eguw, ly.egus, ly.egub);
+        } else {
+          // Widths disagree, so the interleaved slab (one packed row stride)
+          // is impossible. Keep BOTH tensors at their native width in their
+          // own [E, I, H] slabs and let the mixed-width kernel widen in
+          // registers: same DRAM bytes as a uniform layer, no scratch, still
+          // one fused dispatch. Widening w4->w8 at load would also be exact,
+          // but it doubles that tensor's per-token read -- the thing decode
+          // is actually bound on.
+          ly.eguw = std::move(gw); ly.egus = std::move(gs);
+          ly.egub = std::move(gb);
+          ly.euw  = std::move(uw); ly.eus  = std::move(us);
+          ly.eub  = std::move(ub);
+        }
       }
       ok = ok && qtri(p + "mlp.switch_mlp.down_proj", ly.edw, ly.eds, ly.edb);
       {
         SharedBuffer gw, gs, gb, uw, us, ub;
         ok = ok && qtri(p + "mlp.shared_expert.gate_proj", gw, gs, gb);
         ok = ok && qtri(p + "mlp.shared_expert.up_proj", uw, us, ub);
-        // Shared expert gate|up is read by the global-width qmv/qmm swiglu
-        // kernels (w8g64 iff cfg.quant_bits==8, else w4g64) -- pack to match.
-        ok = ok && interleave_w4(cfg.quant_bits == 8 ? 8 : 4,
-                                 gw, gs, gb, uw, us, ub, S,
+        // The shared expert carries its OWN width -- OptiQ keeps it at w8 on
+        // every layer of a w4-global checkpoint -- so derive it here and let
+        // the forward dispatch the matching swiglu/qmv twins, rather than
+        // assuming the model-global cfg.quant_bits (which mis-strides it).
+        // Its gate|up are interleaved like the uniform path, so the two must
+        // agree; every pack seen so far keeps the shared expert uniform, and
+        // a future one that doesn't is refused here rather than mis-read.
+        const int sgb = affine_bits(p + "mlp.shared_expert.gate_proj",
+                                    cfg.hidden);
+        const int sub = affine_bits(p + "mlp.shared_expert.up_proj",
+                                    cfg.hidden);
+        if (sgb != sub) { return nullptr; }
+        ly.se_bits = (sgb == 8) ? 8 : 4;
+        ok = ok && interleave_w4(ly.se_bits, gw, gs, gb, uw, us, ub, S,
                                  ly.sguw, ly.sgus, ly.sgub);
       }
       ok = ok && qtri(p + "mlp.shared_expert.down_proj", ly.sdw, ly.sds, ly.sdb);
+      // down is its own tensor with its own dispatch, so it may differ from
+      // the shared gate|up width.
+      ly.sd_bits = affine_bits(p + "mlp.shared_expert.down_proj",
+                               cfg.moe_shared_inner) == 8 ? 8 : 4;
       ok = ok && qtri(p + "mlp.shared_expert_gate", ly.segw, ly.segs, ly.segb);
     } else {
       SharedBuffer gw, gs, gb, uw, us, ub;
@@ -1511,10 +1607,12 @@ MetalQwenModel::load(const std::string& model_dir,
       // lm_head is the separate Q6_K output.weight loaded below.
       const std::string ep = cfg.weight_prefix + cfg.model_seg + "embed_tokens.";
       if (wts->has(ep + "q6k")) {
-        m->_embed_q6k = wts->load(ep + "q6k", mc);
+        m->_embed_q6k =
+            wset.read(ep + "q6k", mc, WeightSet::Residency::Copied);
         m->_embed_kqt = KQ::kQ6K;
       } else if (wts->has(ep + "q4k")) {
-        m->_embed_q6k = wts->load(ep + "q4k", mc);
+        m->_embed_q6k =
+            wset.read(ep + "q4k", mc, WeightSet::Residency::Copied);
         m->_embed_kqt = KQ::kQ4K;
       }
       m->_embed_is_q6k = !m->_embed_q6k.empty();
@@ -1702,11 +1800,17 @@ MetalQwenModel::load(const std::string& model_dir,
   // helpers below bind to whichever handle `W` is. Embed/lm_head are shared
   // with the main model (already loaded).
   if (!m->_kquant && !m->_dense) {   // affine MTP (sibling file OR in-shard)
-    const std::string mtp_path = model_dir + "/mtp.safetensors";
-    auto mwts = MetalLlamaWeights::open(mtp_path);
-    MetalLlamaWeights* Wp =
+    // Sibling file at the model-dir root (Qwen3.5-4B/9B OptiQ) or under an
+    // `optiq/` subdir (the newer Qwen3.6 packs) -- probe both before falling
+    // back to the in-shard mtp.* tensors.
+    auto mwts = MetalLlamaWeights::open(model_dir + "/mtp.safetensors");
+    if (!(mwts && mwts->has("mtp.fc.weight"))) {
+      auto alt = MetalLlamaWeights::open(model_dir + "/optiq/mtp.safetensors");
+      if (alt && alt->has("mtp.fc.weight")) { mwts = std::move(alt); }
+    }
+    const MetalLlamaWeights* Wp =
         (mwts && mwts->has("mtp.fc.weight")) ? &*mwts
-      : (wts->has("mtp.fc.weight"))          ? &*wts
+      : (wts->has("mtp.fc.weight"))          ? wts
                                              : nullptr;
     if (Wp != nullptr) {
       auto& W = *Wp;
@@ -2564,14 +2668,16 @@ MetalQwenModel::dense_gemm_(ComputeEncoder& enc, const SharedBuffer& w,
   // prefill runs post-dequant -- and on M5 it should ride the same matrix
   // units. Matrix-core (M5+) matmul2d when the units are present AND the
   // prompt is tall enough for the tiled kernel to amortize (M >= _mma_min_m):
-  // tile-adaptive 128x128 for K < 6144, 128x256 for deeper K (down_proj),
-  // matching the affine dense_mma path. The steel dense_gemm_t_f16 (BM/BN/
-  // BK=32 tiles, tails clamped) stays the M4 / small-M fallback. _use_mma
-  // already honours VPIPE_QWEN_NO_MMA, so that A/B toggle covers k-quant too.
-  // Both kernels take the identical buffer/constant binding; only the
-  // selected function + dispatch grid differ.
+  // tile-adaptive per mma_use_wide_tile (deep K OR wide N -> 128x256), the
+  // same rule the affine dense_mma path uses. The steel dense_gemm_t_f16
+  // (BM/BN/BK=32 tiles, tails clamped) stays the M4 / small-M fallback.
+  // _use_mma already honours VPIPE_QWEN_NO_MMA, so that A/B toggle covers
+  // k-quant too. Both kernels take the identical buffer/constant binding;
+  // only the selected function + dispatch grid differ.
   const bool mma = _use_mma && M >= _mma_min_m;
-  const bool deep = mma && K >= 6144;
+  // Very deep K (the 27B's down_proj) splits the contraction; see mma-splitk.h.
+  if (mma && _splitk.encode(_mc, enc, x, w, y, K, N, M)) { return; }
+  const bool deep = mma && mma_use_wide_tile(N, K);
   enc.set_function(mma ? (deep ? _fn_dense_mma_deep : _fn_dense_mma)
                        : _fn_dense_gemm);
   enc.set_buffer(0, x);
@@ -3538,6 +3644,29 @@ MetalQwenModel::ensure_bscratch_(BScratch& bs, int n)
     bs.moe_sout   = f16((std::size_t)n * H);
     bs.moe_gate   = f16((std::size_t)n);
   }
+  // Zero the whole batched scratch once per (re)size. The GDN decode
+  // temporaries are read before they are written -- poisoning zbuf / abuf /
+  // convout / gbuf / normout with 0xFF (f16 NaN) changes the decoded tokens,
+  // while 0x00 and 0xAA do not -- and metal-compute SUB-ALLOCATES buffers
+  // <= 64 KB from a shared heap, so those come back holding whatever the
+  // previous tenant left rather than zeros. The big buffers (logits) are
+  // direct device allocations and DO arrive zeroed, which is why this never
+  // bit: the code silently depends on zero-initialized scratch and only the
+  // small buffers can violate it. Off the hot path (only on an N change).
+  {
+    metal_compute::SharedBuffer* all[] = {
+      &bs.x, &bs.hn, &bs.qfull, &bs.q3, &bs.gate3, &bs.kbuf, &bs.vbuf,
+      &bs.at, &bs.ao, &bs.mixqkv, &bs.zbuf, &bs.abuf, &bs.bbuf, &bs.convout,
+      &bs.gbuf, &bs.betabuf, &bs.ygdn, &bs.normout, &bs.sg, &bs.upb,
+      &bs.logits, &bs.pgt, &bs.tok_in, &bs.argmax_id,
+      &bs.shacc, &bs.shm, &bs.shl,
+      &bs.moe_logits, &bs.moe_eid, &bs.moe_w, &bs.moe_act, &bs.moe_part,
+      &bs.moe_out, &bs.moe_ssg, &bs.moe_sout, &bs.moe_gate,
+    };
+    for (auto* b : all) {
+      if (!b->empty()) { std::memset(b->contents(), 0, b->byte_size()); }
+    }
+  }
   bs.n = n;
   return !bs.logits.empty() && !bs.pgt.empty();
 }
@@ -3834,6 +3963,10 @@ MetalQwenModel::encode_moe_mlp_(
   const Config& c = _cfg;
   const int H = c.hidden, E = c.n_experts, K = c.top_k, I = c.moe_inner;
   const int Sh = c.moe_shared_inner, np = M * K;
+  // The grouped (sorted-segment) expert kernels come in single-width flavors
+  // only, so a mixed-width layer takes the pair-batched form -- which serves
+  // prefill as well as decode, just without the grouped weight-reuse win.
+  if (ly.moe_split) { grp = nullptr; }
   auto ifill = [&](const SharedBuffer& b, int val, int nb) {
     enc.set_function(_fn_moe_ifill);
     enc.set_buffer(0, b); enc.set_constant(1, val); enc.set_constant(2, nb);
@@ -3854,13 +3987,15 @@ MetalQwenModel::encode_moe_mlp_(
       dense_gemm_(enc, ly.rgw, hn, logits, H, E, M);
     }
   } else if (M == 1) {
-    enc.set_function(_fn_qmv8);
+    // Router width from the tensor, not assumed: every pack so far keeps it
+    // w8, but a w4 router would otherwise be read at the wrong stride.
+    enc.set_function(ly.r_bits == 8 ? _fn_qmv8 : _fn_qmv);
     sb012(ly.rgw, ly.rgs, ly.rgb);
     enc.set_buffer(3, hn); enc.set_buffer(4, logits);
     enc.set_constant(5, H); enc.set_constant(6, E);
     enc.dispatch({32, (unsigned)(E / 4), 1}, {32, 2, 1});
   } else {
-    enc.set_function(_fn_qmm8);
+    enc.set_function(ly.r_bits == 8 ? _fn_qmm8 : _fn_qmm);
     sb012(ly.rgw, ly.rgs, ly.rgb);
     enc.set_buffer(3, hn); enc.set_buffer(4, logits);
     enc.set_constant(5, H); enc.set_constant(6, E); enc.set_constant(7, M);
@@ -3891,6 +4026,22 @@ MetalQwenModel::encode_moe_mlp_(
     enc.dispatch({32, (unsigned)(H / 4), (unsigned)np}, {32, 2, 1});
   } else if (grp == nullptr) {
     // Pair-batched: one gathered GEMV per (token,expert) pair.
+    if (ly.moe_split) {
+      // gate and up are at DIFFERENT widths, so they are not interleaved:
+      // one fused dispatch reads each at its native width (gate triple 0/1/2,
+      // up triple 3/4/5) and widens in registers. out_vec_size is the feature
+      // count I (not 2*I), so grid.y in threads is I/4, not I/2.
+      enc.set_function(ly.eg_bits == 8 ? _fn_moe_gather_swiglu_g8u4
+                                       : _fn_moe_gather_swiglu_g4u8);
+      enc.set_buffer(0, ly.eguw); enc.set_buffer(1, ly.egus);
+      enc.set_buffer(2, ly.egub);
+      enc.set_buffer(3, ly.euw); enc.set_buffer(4, ly.eus);
+      enc.set_buffer(5, ly.eub);
+      enc.set_buffer(6, hn); enc.set_buffer(7, act);
+      enc.set_constant(8, H); enc.set_constant(9, I);
+      enc.set_buffer(10, eid); enc.set_constant(11, K);
+      enc.dispatch({32, (unsigned)(I / 4), (unsigned)np}, {32, 2, 1});
+    } else {
     // gathered gate|up + SwiGLU -> act[np, I]
     enc.set_function(ly.eg_bits == 8 ? _fn_moe_gather_swiglu_w8
                                      : _fn_moe_gather_swiglu);
@@ -3899,8 +4050,9 @@ MetalQwenModel::encode_moe_mlp_(
     enc.set_constant(5, H); enc.set_constant(6, 2 * I);
     enc.set_buffer(7, eid); enc.set_constant(8, K);
     enc.dispatch({32, (unsigned)(I / 2), (unsigned)np}, {32, 2, 1});
+    }
     // gathered down -> partials[np, H]
-    enc.set_function(ly.eg_bits == 8 ? _fn_moe_gather_down_w8
+    enc.set_function(ly.ed_bits == 8 ? _fn_moe_gather_down_w8
                                      : _fn_moe_gather_down);
     sb012(ly.edw, ly.eds, ly.edb);
     enc.set_buffer(3, act); enc.set_buffer(4, part);
@@ -3952,7 +4104,7 @@ MetalQwenModel::encode_moe_mlp_(
         enc.dispatch({(unsigned)(((2 * I + 31) / 32) * 32),
                      (unsigned)(((npad + 31) / 32) * 2), 2}, {32, 2, 2});
         // down steel: partials[np, H] = gact @ edw_e^T, scattered via sdst
-        enc.set_function(ly.eg_bits == 8 ? _fn_moe_qmm_grouped_w8
+        enc.set_function(ly.ed_bits == 8 ? _fn_moe_qmm_grouped_w8
                                          : _fn_moe_qmm_grouped);
         sb012(ly.edw, ly.eds, ly.edb);
         enc.set_buffer(3, *grp->gact); enc.set_buffer(4, part);
@@ -3971,7 +4123,7 @@ MetalQwenModel::encode_moe_mlp_(
       enc.set_constant(5, H); enc.set_constant(6, 2 * I);
       enc.set_buffer(7, *grp->srow); enc.set_buffer(8, *grp->t2e);
       enc.dispatch({32, (unsigned)(I / 2), (unsigned)mt}, {32, 2, 1});
-      enc.set_function(ly.eg_bits == 8 ? _fn_moe_grouped_down_w8
+      enc.set_function(ly.ed_bits == 8 ? _fn_moe_grouped_down_w8
                                        : _fn_moe_grouped_down);
       sb012(ly.edw, ly.eds, ly.edb);
       enc.set_buffer(3, *grp->gact); enc.set_buffer(4, *grp->gdout);
@@ -4032,21 +4184,40 @@ MetalQwenModel::encode_moe_mlp_(
     enc.dispatch({32, (unsigned)M, 1}, {32, 1, 1});
   } else {
   if (M == 1) {
-    enc.set_function(_fn_qmv_swiglu);
+    // The shared expert has its OWN width (OptiQ keeps it w8 on a w4-global
+    // checkpoint), so pick the twin by ly.se_bits, not the model-global one.
+    enc.set_function(ly.se_bits == 8 ? _fn_qmv_swiglu8 : _fn_qmv_swiglu);
     sb012(ly.sguw, ly.sgus, ly.sgub);
     enc.set_buffer(3, hn); enc.set_buffer(4, ssg);
     enc.set_constant(5, H); enc.set_constant(6, 2 * Sh);
     enc.dispatch({32, (unsigned)(Sh / 2), 1}, {32, 2, 1});
   } else {
-    enc.set_function(_fn_qmm_swiglu);
+    enc.set_function(ly.se_bits == 8 ? _fn_qmm_swiglu8 : _fn_qmm_swiglu);
     sb012(ly.sguw, ly.sgus, ly.sgub);
     enc.set_buffer(3, hn); enc.set_buffer(4, ssg);
     enc.set_constant(5, H); enc.set_constant(6, 2 * Sh); enc.set_constant(7, M);
     enc.dispatch({(unsigned)(((2 * Sh + 31) / 32) * 32),
                  (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
   }
-  // shared down -> sout[M, H]  (qmm_auto_ picks qmv/batched/steel by M)
-  qmm_auto_(enc, M, ly.sdw, ly.sds, ly.sdb, ssg, sout, Sh, H);
+  // shared down -> sout[M, H]. qmm_auto_'s tuned ladder is global-width, so
+  // it only applies when the shared down matches the model width; otherwise
+  // dispatch the per-tensor w8 qmv/qmm twins directly.
+  if (ly.sd_bits == (_cfg.quant_bits == 8 ? 8 : 4)) {
+    qmm_auto_(enc, M, ly.sdw, ly.sds, ly.sdb, ssg, sout, Sh, H);
+  } else {
+    enc.set_function(M == 1 ? (ly.sd_bits == 8 ? _fn_qmv8 : _fn_qmv)
+                            : (ly.sd_bits == 8 ? _fn_qmm8 : _fn_qmm));
+    sb012(ly.sdw, ly.sds, ly.sdb);
+    enc.set_buffer(3, ssg); enc.set_buffer(4, sout);
+    enc.set_constant(5, Sh); enc.set_constant(6, H);
+    if (M == 1) {
+      enc.dispatch({32, (unsigned)(H / 4), 1}, {32, 2, 1});
+    } else {
+      enc.set_constant(7, M);
+      enc.dispatch({(unsigned)(((H + 31) / 32) * 32),
+                   (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
+    }
+  }
   // shared-expert sigmoid gate g[M]
   enc.set_function(_fn_moe_gate);
   sb012(ly.segw, ly.segs, ly.segb);
@@ -4852,7 +5023,8 @@ MetalQwenModel::prefill_multimodal(ContextId cid,
 std::vector<float>
 MetalQwenModel::prefill_multimodal_buf(
     ContextId cid, SharedBuffer&& x,
-    const std::vector<std::int32_t>& position_ids, int n)
+    const std::vector<std::int32_t>& position_ids, int n,
+    const DeepstackInject* deepstack)
 {
   const int H = _cfg.hidden;
   if (n <= 0 || x.byte_size() < (std::size_t)n * H * 2) { return {}; }
@@ -5821,13 +5993,15 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
     };
     // Tile-adaptive matrix-core dense GEMM: y[n,N] = xin[n,Kk]@wdeq[N,Kk]^T
-    // (no bias). 128x128 tile (8 simdgroups) for K <= 4096; 128x256 for
-    // deeper K (down_proj) where the square tile is bandwidth-starved on
-    // weight streaming. Both clamp M/N tails via the matmul2d tensor
+    // (no bias). 128x128 tile (8 simdgroups) by default; 128x256 for deep K
+    // (down_proj) where the square tile is bandwidth-starved on weight
+    // streaming, and for wide N (the fused gate|up, N = 2*ffn) -- see
+    // mma_use_wide_tile. Both clamp M/N tails via the matmul2d tensor
     // extents, so n and N need not be tile multiples.
     auto dense_mma = [&](const SharedBuffer& xin, const SharedBuffer& wdeq,
                          const SharedBuffer& y, int Kk, int Nn) {
-      const bool deep = (Kk >= 6144);
+      if (_splitk.encode(_mc, enc, xin, wdeq, y, Kk, Nn, n)) { return; }
+      const bool deep = mma_use_wide_tile(Nn, Kk);
       const int BN = deep ? 256 : 128;
       enc.set_function(deep ? _fn_dense_mma_deep : _fn_dense_mma);
       enc.set_buffer(0, xin);
@@ -6528,7 +6702,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       // the residual stream). Done BEFORE the tap copy so a coinciding tap layer
       // captures the injected state (HF hidden_states[L+1] includes it) and the
       // next layer reads the injected residual.
-      if (deepstack != nullptr && deepstack->rows > 0) {
+      if (deepstack != nullptr
+          && (deepstack->rows > 0 || !deepstack->segs.empty())) {
         for (std::size_t j = 0; j < deepstack->layers.size(); ++j) {
           if (deepstack->layers[j] != L
               || j >= deepstack->feats.size()
@@ -6536,14 +6711,33 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
               || deepstack->feats[j]->empty()) {
             continue;
           }
-          const std::size_t off = (std::size_t)deepstack->row0 * H * 2;
-          const int cnt = deepstack->rows * H;
-          enc.set_function(_fn_residual);
-          enc.set_buffer(0, x, off);
-          enc.set_buffer(1, *deepstack->feats[j]);
-          enc.set_buffer(2, x, off);
-          enc.set_constant(3, cnt);
-          enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+          // One add per image-token RUN: a multi-reference prompt's blocks are
+          // separated by text, so the runs are disjoint in x while the features
+          // stay concatenated (feat_row indexes into them). With no segs this
+          // is the single (row0, rows) span, byte-identical to before.
+          if (deepstack->segs.empty()) {
+            const std::size_t off = (std::size_t)deepstack->row0 * H * 2;
+            const int cnt = deepstack->rows * H;
+            enc.set_function(_fn_residual);
+            enc.set_buffer(0, x, off);
+            enc.set_buffer(1, *deepstack->feats[j]);
+            enc.set_buffer(2, x, off);
+            enc.set_constant(3, cnt);
+            enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+          } else {
+            for (const auto& sg : deepstack->segs) {
+              if (sg.rows <= 0) { continue; }
+              const std::size_t off = (std::size_t)sg.row0 * H * 2;
+              const std::size_t foff = (std::size_t)sg.feat_row * H * 2;
+              const int cnt = sg.rows * H;
+              enc.set_function(_fn_residual);
+              enc.set_buffer(0, x, off);
+              enc.set_buffer(1, *deepstack->feats[j], foff);
+              enc.set_buffer(2, x, off);
+              enc.set_constant(3, cnt);
+              enc.dispatch({(unsigned)cnt, 1, 1}, {256, 1, 1});
+            }
+          }
         }
       }
       if (kLayerDump != nullptr) { tap(x, dbgL[(std::size_t)L], n * H); }

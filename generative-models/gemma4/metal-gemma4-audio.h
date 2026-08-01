@@ -33,6 +33,7 @@ namespace vpipe::metal_compute { class MetalCompute; }
 namespace vpipe::genai {
 
 struct ModelConfig;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalGemma4AudioEncoder {
 public:
@@ -65,6 +66,16 @@ public:
 
   static std::unique_ptr<MetalGemma4AudioEncoder> load(
       const std::string& model_dir,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
+  // Preferred: the Conformer's weights live in the SAME checkpoint as
+  // the LM it feeds, so passing the LM's set keeps them together instead
+  // of in a second private mmap of the same shards.
+  //
+  // The returned encoder KEEPS the set (its tensors come from it).
+  static std::unique_ptr<MetalGemma4AudioEncoder> load(
+      std::shared_ptr<WeightSet> ws,
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
@@ -151,6 +162,9 @@ private:
   metal_compute::SharedBuffer _ev_w, _ev_s, _ev_b;
   std::vector<float> _timing;     // [span * d_model] sinusoidal table
   Gemma4AudioFeatureExtractor _fx{Gemma4AudioFeatureExtractor::Params{}};
+  // The checkpoint, held for this encoder's whole life: the GPU weights
+  // above are aliases of buffers the set owns.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

@@ -3,6 +3,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 
@@ -51,6 +53,36 @@ bf16_to_f32_(std::uint16_t b)
   float f;
   std::memcpy(&f, &bits, sizeof(f));
   return f;
+}
+
+std::uint16_t
+f32_to_bf16_(float f)
+{
+  std::uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// float <-> the tower's 2-byte storage element. `bf16` picks the encoding;
+// both dtypes are 2 bytes wide, so every buffer size and stride is the same
+// and only the bit pattern differs.
+inline std::uint16_t
+enc_elt_(float v, bool bf16)
+{
+  if (bf16) { return f32_to_bf16_(v); }
+  const _Float16 h = (_Float16)v;
+  std::uint16_t b;
+  std::memcpy(&b, &h, 2);
+  return b;
+}
+
+inline float
+dec_elt_(std::uint16_t b, bool bf16)
+{
+  if (bf16) { return bf16_to_f32_(b); }
+  _Float16 h;
+  std::memcpy(&h, &b, 2);
+  return (float)h;
 }
 // Qwen2/3-VL smart_resize: edges -> multiples of `factor`, pixels in
 // [min_px, max_px], aspect preserved.
@@ -110,33 +142,64 @@ std::unique_ptr<MetalQwenVisionEncoder>
 MetalQwenVisionEncoder::load(const std::string& model_dir,
                              metal_compute::MetalCompute* mc, const Config& cfg)
 {
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open. Callers
+  // inside a pipeline should pass the manager's set instead.
+  if (!cfg.gguf_mmproj.empty()) {
+    return load(std::shared_ptr<WeightSet>(), mc, cfg);
+  }
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalQwenVisionEncoder>
+MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
+                             metal_compute::MetalCompute* mc, const Config& cfg)
+{
   if (mc == nullptr || !mc->valid()) { return nullptr; }
-  // Weights come either from the safetensors model dir (HF tensor names) or,
+  // Weights come either from the safetensors checkpoint (HF tensor names) or,
   // when cfg.gguf_mmproj is set, from an mmproj-*.gguf (llama.cpp CLIP names,
   // BF16/F32 -- same values, just a rename + a split patch-embed conv).
   const bool gguf = !cfg.gguf_mmproj.empty();
-  std::optional<MetalLlamaWeights> wts;
   std::optional<GgufFile> gg;
   if (gguf) {
     gg = GgufFile::open(cfg.gguf_mmproj);
     if (!gg) { return nullptr; }
-  } else {
-    wts = MetalLlamaWeights::open_model(model_dir);
-    if (!wts) { return nullptr; }
+  } else if (ws_in == nullptr) {
+    return nullptr;
   }
+  WeightSet* wts = gguf ? nullptr : ws_in.get();
 
   auto m = std::unique_ptr<MetalQwenVisionEncoder>(new MetalQwenVisionEncoder());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
   m->_feat_dim = cfg.temporal_patch * cfg.patch_size * cfg.patch_size * 3;
 
-  m->_lib_gemm = mc->load_library("dense_gemm");
-  m->_lib_vis = mc->load_library("qwen3_5_vision");
-  m->_lib_elt = mc->load_library("llm_elementwise");
-  m->_lib_sdpa = mc->load_library("sdpa");
+  // The bf16 twins are the SAME sources compiled with VPIPE_ELT=bfloat, so
+  // the entry-point names below keep their _f16 suffix in both builds.
+  m->_bf16 = cfg.use_bf16;
+  // A/B overrides (either direction) so the f16-vs-bf16 tower can be measured
+  // without rebuilding or touching the caller's config.
+  if (std::getenv("VPIPE_QWEN_VISION_BF16") != nullptr) { m->_bf16 = true; }
+  if (std::getenv("VPIPE_QWEN_VISION_NO_BF16") != nullptr) { m->_bf16 = false; }
+  const char* const sfx = m->_bf16 ? "_bf16" : "";
+  auto lib = [&](const char* n) {
+    return mc->load_library(std::string(n) + sfx);
+  };
+  m->_lib_gemm = lib("dense_gemm");
+  m->_lib_vis = lib("qwen3_5_vision");
+  m->_lib_elt = lib("llm_elementwise");
+  m->_lib_sdpa = lib("sdpa");
   // Steel flash-attention (MMA) library, shared with the LM prefill path.
   // Optional: if it (or the bd64 entry point) is unavailable we fall back
   // to the scalar sdpa_full_f16 in encode().
+  // attn_steel / attn_steel_nax carry BOTH dtypes as separate ENTRY POINTS in
+  // ONE library ("attn_steel_h_bd128" vs "attn_steel_h_bd128_bf16") -- unlike
+  // this tower's own kernels, where the dtype selects the library. So the
+  // library is loaded either way; what differs is which widths exist per
+  // dtype: f16 has bd64 + bd128, bf16 has bd128 (+ the DiT's bd120). A bf16
+  // tower therefore has no NATIVE bd64, which is why the head_dim-64 towers
+  // still take the matmul2d attention below in bf16.
   m->_lib_attn = mc->load_library("attn_steel");
   m->_attn_params = mc->make_shared_buffer(sizeof(SteelAttnParams));
   m->_fn_gemm = m->_lib_gemm.function("dense_gemm_bias_f16");
@@ -156,7 +219,7 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
   // scalar path even on M5 (A/B + safety).
   if (mc->supports_matrix_cores() &&
       std::getenv("VPIPE_QWEN_VISION_NO_MMA2") == nullptr) {
-    m->_lib_dense_mma = mc->load_library("dense_gemm_mma");
+    m->_lib_dense_mma = lib("dense_gemm_mma");
     m->_fn_dense_mma = m->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
@@ -169,9 +232,12 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     // hd=64: tg staging + barriers + tg-resident softmax). Kept opt-in
     // (VPIPE_QWEN_VISION_MMA2_ATTN=1) for future retuning. NOTE: the throttled
     // bench that originally shipped this as default was a thermal artifact.
+    // In bf16 the steel/NAX flash paths are unavailable, so the matmul2d
+    // attention becomes the fastest option there and is defaulted ON; in f16
+    // it stays opt-in (the steel flash beats it, see above).
     if (cfg.head_dim() == 64 &&
-        std::getenv("VPIPE_QWEN_VISION_MMA2_ATTN") != nullptr) {
-      m->_lib_sdpa_mma = mc->load_library("sdpa_mma");
+        (m->_bf16 || std::getenv("VPIPE_QWEN_VISION_MMA2_ATTN") != nullptr)) {
+      m->_lib_sdpa_mma = lib("sdpa_mma");
       m->_fn_sdpa_mma_d64 = m->_lib_sdpa_mma.function("sdpa_full_mma2_d64_f16");
       m->_use_mma2_attn = m->_fn_sdpa_mma_d64.valid();
     }
@@ -183,10 +249,24 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     // NAX kernels are built with deployment target 26.2 (see metal-compute
     // CMakeLists / VPIPE_NAX_MIN_OS; without it the matmul2d miscompiles ~400%
     // off). VPIPE_QWEN_VISION_NO_NAX_ATTN=1 falls back to the ALU steel.
-    if (cfg.head_dim() == 64 &&
+    // bd64 is f16-only; bd128 exists in both dtypes, so the PADDED path
+    // (head_dim != 64, below) reaches NAX in bf16 too.
+    if ((cfg.head_dim() == 64 ? !m->_bf16 : cfg.head_dim() < 128) &&
         std::getenv("VPIPE_QWEN_VISION_NO_NAX_ATTN") == nullptr) {
       m->_lib_attn_nax = mc->load_library("attn_steel_nax");
       m->_use_attn_nax = m->_lib_attn_nax.valid();
+    }
+  }
+  // Zero-pad a non-native head_dim out to bd128 so the flash kernels apply at
+  // all. Only 64 is served natively (and only in f16); anything else -- 72 for
+  // the Qwen3-VL 8B/9B towers -- had no flash kernel and ran the scalar sdpa.
+  if (cfg.head_dim() != 64 && cfg.head_dim() < 128 &&
+      std::getenv("VPIPE_QWEN_VISION_NO_ATTN_PAD") == nullptr) {
+    m->_fn_tr_pad = m->_lib_elt.function("transpose_abd_pad_f16");
+    m->_fn_tr_unpad = m->_lib_elt.function("transpose_abd_unpad_f16");
+    if (m->_fn_tr_pad.valid() && m->_fn_tr_unpad.valid() &&
+        m->_lib_attn.valid()) {
+      m->_attn_pad_d = 128;
     }
   }
   if (!m->_fn_gemm.valid() || !m->_fn_ln.valid() || !m->_fn_gelu_tanh.valid() ||
@@ -220,46 +300,91 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     if (s.rfind("merger.linear_fc2.", 0) == 0) { return "mm.2." + s.substr(18); }
     return s;
   };
-  // Narrow a GGUF (BF16/F32/F16) tensor into a fresh f16 SharedBuffer.
+  // Narrow a GGUF (BF16/F32/F16) tensor into a fresh compute-dtype buffer.
+  const bool bf16 = m->_bf16;
   auto gg_f16 = [&](const GgufFile::Tensor* t) -> SharedBuffer {
     if (t == nullptr) { return {}; }
     std::size_t n = 1;
     for (auto d : t->dims) { n *= (std::size_t)d; }
     SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<_Float16*>(out.contents());
+    auto* o = static_cast<std::uint16_t*>(out.contents());
     if (t->type == GgufFile::kBF16) {
       const auto* s = reinterpret_cast<const std::uint16_t*>(t->data);
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)bf16_to_f32_(s[i]); }
+      // bf16 target: the checkpoint IS bf16, so copy the bits untouched --
+      // a round trip through float would be lossless but pointless.
+      if (bf16) { std::memcpy(o, s, n * 2); }
+      else {
+        for (std::size_t i = 0; i < n; ++i) {
+          o[i] = enc_elt_(bf16_to_f32_(s[i]), false);
+        }
+      }
     } else if (t->type == GgufFile::kF32) {
       const auto* s = reinterpret_cast<const float*>(t->data);
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
+      for (std::size_t i = 0; i < n; ++i) { o[i] = enc_elt_(s[i], bf16); }
     } else if (t->type == GgufFile::kF16) {
-      std::memcpy(o, t->data, n * 2);
+      if (!bf16) { std::memcpy(o, t->data, n * 2); }
+      else {
+        const auto* s = reinterpret_cast<const std::uint16_t*>(t->data);
+        for (std::size_t i = 0; i < n; ++i) {
+          _Float16 h; std::memcpy(&h, &s[i], 2);
+          o[i] = f32_to_bf16_((float)h);
+        }
+      }
     } else {
       return {};
     }
     return out;
   };
+  // Cache namespace for this tower's DERIVED tensors. The target dtype
+  // is part of the key because it changes the bytes: an f16 and a bf16
+  // tower over one checkpoint must not pick up each other's conversions.
+  const std::string dk =
+      std::string("qwen3vl-vit/") + (bf16 ? "bf16/" : "f16/");
   auto to_f16 = [&](const std::string& name) -> SharedBuffer {
     if (gguf) { return gg_f16(gg->tensor(clip_name(name))); }
-    const auto* info = wts->info(name);
+    const auto* info = wts->src().info(name);
     if (info == nullptr) { return {}; }
-    if (info->dtype == "F16") { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
-    if (raw.empty()) { return {}; }
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<_Float16*>(out.contents());
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)bf16_to_f32_(s[i]); }
-    } else if (info->dtype == "F32") {
-      const auto* s = static_cast<const float*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
-    } else {
-      return {};
+    // Already in the target dtype: the checkpoint's own bytes, cached
+    // under the tensor's own name. For bf16 that is the COMMON case
+    // (Qwen3-VL ships bf16), and it is what makes the bf16 tower carry
+    // the checkpoint's exact weight bits, like the reference's
+    // .to(torch.bfloat16) no-op on an already-bf16 tensor.
+    //
+    // Copied, not Mapped, and deliberately: mapping wraps the WHOLE
+    // shard, and this tower shares its shard with the LM, which loads
+    // by copy. Mapping here would make the entire LM checkpoint
+    // resident a second time to save a copy of the ViT.
+    if (info->dtype == (bf16 ? "BF16" : "F16")) {
+      return wts->tensor(name, mc, WeightSet::Residency::Copied);
     }
-    return out;
+    return wts->derived(dk + name, [&]() -> SharedBuffer {
+      // Uncached: the raw tensor is consumed by the conversion below and
+      // dropped. Caching it would keep the source alive next to the
+      // product, for nothing.
+      SharedBuffer raw = wts->read(name, mc, WeightSet::Residency::Copied);
+      if (raw.empty()) { return {}; }
+      const std::size_t n = numel_(info->shape);
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      auto* o = static_cast<std::uint16_t*>(out.contents());
+      if (info->dtype == "BF16") {
+        const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          o[i] = enc_elt_(bf16_to_f32_(s[i]), bf16);
+        }
+      } else if (info->dtype == "F16") {
+        const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          _Float16 h; std::memcpy(&h, &s[i], 2);
+          o[i] = enc_elt_((float)h, bf16);
+        }
+      } else if (info->dtype == "F32") {
+        const auto* s = static_cast<const float*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) { o[i] = enc_elt_(s[i], bf16); }
+      } else {
+        return {};
+      }
+      return out;
+    });
   };
   // Patch-embed conv weight. Safetensors: one [hidden, kT,kH,kW,in_ch] tensor
   // (channels-last per patch). GGUF CLIP splits it per temporal frame into
@@ -271,7 +396,7 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     const int inch = 3, per_frame = kHW * inch;
     const int feat = cfg.temporal_patch * per_frame;
     SharedBuffer w = mc->make_shared_buffer((std::size_t)outc * feat * 2);
-    auto* o = static_cast<_Float16*>(w.contents());
+    auto* o = static_cast<std::uint16_t*>(w.contents());
     for (int t = 0; t < cfg.temporal_patch; ++t) {
       const std::string nm = (t == 0)
           ? std::string("v.patch_embd.weight")
@@ -284,7 +409,7 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
         for (int c = 0; c < inch; ++c) {
           for (int hw = 0; hw < kHW; ++hw) {
             o[(std::size_t)oi * feat + t * per_frame + hw * inch + c] =
-                (_Float16)s[((std::size_t)oi * inch + c) * kHW + hw];
+                enc_elt_(s[((std::size_t)oi * inch + c) * kHW + hw], bf16);
           }
         }
       }
@@ -306,31 +431,46 @@ MetalQwenVisionEncoder::load(const std::string& model_dir,
     // the permute the qwen3_vl projection mixes the wrong channel/spatial lanes
     // (~0.4 rel-L2, compounding through the ViT vs HF). GGUF already reorders.
     const int Hh = cfg.hidden, Ci = 3, Tt = cfg.temporal_patch, Pp = cfg.patch_size;
-    const auto* pinfo = wts ? wts->info(r + "patch_embed.proj.weight") : nullptr;
+    const auto* pinfo =
+        wts ? wts->src().info(r + "patch_embed.proj.weight") : nullptr;
     const bool channels_first =
         pinfo != nullptr && pinfo->shape.size() == 5 &&
         (int)pinfo->shape[1] == Ci && (int)pinfo->shape[2] == Tt;
     if (channels_first &&
         (std::size_t)Hh * Ci * Tt * Pp * Pp * 2 == m->_pe_w.byte_size()) {
-      SharedBuffer re = mc->make_shared_buffer(m->_pe_w.byte_size());
-      const auto* s = static_cast<const _Float16*>(m->_pe_w.contents());
-      auto* d = static_cast<_Float16*>(re.contents());
-      for (int h = 0; h < Hh; ++h) {
-        for (int t = 0; t < Tt; ++t) {
-          for (int ph = 0; ph < Pp; ++ph) {
-            for (int pw = 0; pw < Pp; ++pw) {
-              for (int c = 0; c < Ci; ++c) {
-                const std::size_t si =   // [H, C, T, P, P]
-                    ((((std::size_t)h * Ci + c) * Tt + t) * Pp + ph) * Pp + pw;
-                const std::size_t di =   // [H, T, P, P, C]
-                    ((((std::size_t)h * Tt + t) * Pp + ph) * Pp + pw) * Ci + c;
-                d[di] = s[si];
+      // Cached under its own key: the permute is a pure function of the
+      // source tensor, so a second tower over this checkpoint takes the
+      // result rather than redoing it. Note the builder reads _pe_w and
+      // writes a NEW buffer -- it never edits bytes a peer may be
+      // reading through the cached source alias.
+      m->_pe_w = wts->derived(dk + "patch_embed.chw_to_hwc", [&]() {
+        SharedBuffer re = mc->make_shared_buffer(m->_pe_w.byte_size());
+        if (re.empty()) { return re; }
+        // A pure permute -- no arithmetic -- so it moves raw 2-byte
+        // elements and works for either dtype.
+        const auto* s = static_cast<const std::uint16_t*>(m->_pe_w.contents());
+        auto* d = static_cast<std::uint16_t*>(re.contents());
+        for (int h = 0; h < Hh; ++h) {
+          for (int t = 0; t < Tt; ++t) {
+            for (int ph = 0; ph < Pp; ++ph) {
+              for (int pw = 0; pw < Pp; ++pw) {
+                for (int c = 0; c < Ci; ++c) {
+                  // [H, C, T, P, P]
+                  const std::size_t si =
+                      ((((std::size_t)h * Ci + c) * Tt + t) * Pp + ph) * Pp
+                      + pw;
+                  // [H, T, P, P, C]
+                  const std::size_t di =
+                      ((((std::size_t)h * Tt + t) * Pp + ph) * Pp + pw) * Ci
+                      + c;
+                  d[di] = s[si];
+                }
               }
             }
           }
         }
-      }
-      m->_pe_w = std::move(re);
+        return re;
+      });
     }
   }
   m->_pe_b = to_f16(r + "patch_embed.proj.bias");
@@ -454,21 +594,22 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 
   // Patchify in merger order ([mh,mw,S,S]) with channels-last [T,P,P,c]
   // inner layout, still image tiled across the temporal axis.
-  std::vector<_Float16> feat((std::size_t)n_patches * _feat_dim);
+  std::vector<std::uint16_t> feat((std::size_t)n_patches * _feat_dim);
   const int plane = th * tw;
   for (int m = 0; m < n_patches; ++m) {
     int bi = m / (mw * S * S), rem = m % (mw * S * S);
     int bj = rem / (S * S), rem2 = rem % (S * S);
     int ii = rem2 / S, jj = rem2 % S;
     const int gi = bi * S + ii, gj = bj * S + jj;
-    _Float16* fp = feat.data() + (std::size_t)m * _feat_dim;
+    std::uint16_t* fp = feat.data() + (std::size_t)m * _feat_dim;
     int o = 0;
     for (int t = 0; t < T; ++t) {
       for (int ph = 0; ph < P; ++ph) {
         for (int pw = 0; pw < P; ++pw) {
           const int yy = gi * P + ph, xx = gj * P + pw;
           for (int ch = 0; ch < 3; ++ch) {
-            fp[o++] = (_Float16)px[(std::size_t)ch * plane + yy * tw + xx];
+            fp[o++] = enc_elt_(px[(std::size_t)ch * plane + yy * tw + xx],
+                               _bf16);
           }
         }
       }
@@ -477,10 +618,10 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 
   // Bilinear pos-embed in merger order (host) from the [G*G,hidden] table.
   const int G = (int)std::round(std::sqrt((double)c.num_pos_embed));
-  const auto* pos_tab = static_cast<const _Float16*>(_pos_w.contents());
-  std::vector<_Float16> pos((std::size_t)n_patches * hidden);
+  const auto* pos_tab = static_cast<const std::uint16_t*>(_pos_w.contents());
+  std::vector<std::uint16_t> pos((std::size_t)n_patches * hidden);
   // 2D-RoPE cos/sin tables in merger order (host).
-  std::vector<_Float16> cosb((std::size_t)n_patches * hd),
+  std::vector<std::uint16_t> cosb((std::size_t)n_patches * hd),
       sinb((std::size_t)n_patches * hd);
   const int hd4 = hd / 4;
   for (int m = 0; m < n_patches; ++m) {
@@ -497,24 +638,25 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     const int cidx[4] = {hf * G + wf, hf * G + wc, hc * G + wf, hc * G + wc};
     const float cw[4] = {(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw),
                          dh * dw};
-    _Float16* pp = pos.data() + (std::size_t)m * hidden;
+    std::uint16_t* pp = pos.data() + (std::size_t)m * hidden;
     for (int d = 0; d < hidden; ++d) {
       float acc = 0.0f;
       for (int q = 0; q < 4; ++q) {
-        acc += cw[q] * (float)pos_tab[(std::size_t)cidx[q] * hidden + d];
+        acc += cw[q] *
+               dec_elt_(pos_tab[(std::size_t)cidx[q] * hidden + d], _bf16);
       }
-      pp[d] = (_Float16)acc;
+      pp[d] = enc_elt_(acc, _bf16);
     }
     // rope
-    _Float16* cp = cosb.data() + (std::size_t)m * hd;
-    _Float16* sp = sinb.data() + (std::size_t)m * hd;
+    std::uint16_t* cp = cosb.data() + (std::size_t)m * hd;
+    std::uint16_t* sp = sinb.data() + (std::size_t)m * hd;
     for (int k = 0; k < hd4; ++k) {
       const float fr = row * _rope_inv_freq[k];
       const float fc = col * _rope_inv_freq[k];
       const float vals[4] = {fr, fc, fr, fc};
       for (int q = 0; q < 4; ++q) {
-        cp[q * hd4 + k] = (_Float16)std::cos(vals[q]);
-        sp[q * hd4 + k] = (_Float16)std::sin(vals[q]);
+        cp[q * hd4 + k] = enc_elt_(std::cos(vals[q]), _bf16);
+        sp[q * hd4 + k] = enc_elt_(std::sin(vals[q]), _bf16);
       }
     }
   }
@@ -541,10 +683,13 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
   // needs the head-major transposes into qt/kt/vt.
   SharedBuffer qr = buf((std::size_t)n_patches * hidden),
                kr = buf((std::size_t)n_patches * hidden);
-  SharedBuffer qt = buf((std::size_t)n_patches * hidden),
-               kt = buf((std::size_t)n_patches * hidden),
-               vt = buf((std::size_t)n_patches * hidden);
-  SharedBuffer atb = buf((std::size_t)n_patches * hidden),
+  // Head-major scratch is sized at the ATTENTION head width, which is the
+  // zero-pad width when the native head_dim has no flash kernel (see
+  // _attn_pad_d). att stays at the real width -- the unpad drops the tail.
+  const int ahd = _attn_pad_d > 0 ? _attn_pad_d : hd;
+  const std::size_t hmaj = (std::size_t)n_patches * heads * ahd;
+  SharedBuffer qt = buf(hmaj), kt = buf(hmaj), vt = buf(hmaj);
+  SharedBuffer atb = buf(hmaj),
                att = buf((std::size_t)n_patches * hidden);
   SharedBuffer proj = buf((std::size_t)n_patches * hidden);
   SharedBuffer hbuf = buf((std::size_t)n_patches * inter),
@@ -559,9 +704,31 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
   SharedBuffer ds_n1 = _ds.empty() ? SharedBuffer{} : buf((std::size_t)n_im * mdim);
   SharedBuffer ds_h  = _ds.empty() ? SharedBuffer{} : buf((std::size_t)n_im * mdim);
 
+  // VPIPE_VIS_TRACE=<dir>: snapshot each op of BLOCK 0 into its own buffer
+  // (copy_f16) and write them out after the stream completes. Snapshots are
+  // needed because the forward reuses buffers -- `n1` holds norm1 then norm2,
+  // and `x` is mutated in place by both residuals.
+  const char* trace_dir = std::getenv("VPIPE_VIS_TRACE");
+  struct Tap { std::string name; SharedBuffer buf; std::size_t n; };
+  std::vector<Tap> taps;
+  metal_compute::ComputeFunction fn_copy;
+  if (trace_dir != nullptr) { fn_copy = _lib_elt.function("copy_f16"); }
+
   metal_compute::CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
+    auto tap = [&](std::string name, const SharedBuffer& src, std::size_t nn) {
+      if (trace_dir == nullptr || !fn_copy.valid()) { return; }
+      SharedBuffer d = _mc->make_shared_buffer(nn * 2);
+      if (d.empty()) { return; }
+      enc.set_function(fn_copy);
+      enc.set_buffer(0, src);
+      enc.set_buffer(1, d);
+      enc.set_constant(2, 0);
+      enc.set_constant(3, (int)nn);
+      enc.dispatch({(unsigned)nn, 1, 1}, {256, 1, 1});
+      taps.push_back({std::move(name), std::move(d), nn});
+    };
     const bool use_mma_gemm = _fn_gemm_t.valid();
     auto gemm = [&](const SharedBuffer& xin, const SharedBuffer& w,
                     const SharedBuffer& bias, const SharedBuffer& y, int M,
@@ -658,8 +825,27 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       enc.set_constant(5, hd);
       enc.dispatch({(unsigned)(n_patches * heads * hd), 1, 1}, {256, 1, 1});
     };
+    // [A, Bd, hd] -> [Bd, A, ahd]. With padding on, the tail [hd, ahd) is
+    // zero-filled by transpose_abd_pad_f16, which is what makes the widened
+    // flash kernel exact rather than merely well-shaped. `pad_d` is cleared
+    // below if the flash entry point does not resolve, so the scalar fallback
+    // never sees a padded buffer it would misread (the head-major scratch is
+    // allocated at the padded width either way -- a harmless superset).
+    int pad_d = _attn_pad_d;
     auto transpose = [&](const SharedBuffer& in, const SharedBuffer& out,
                          int A, int Bd) {
+      if (pad_d > 0) {
+        enc.set_function(_fn_tr_pad);
+        enc.set_buffer(0, in);
+        enc.set_buffer(1, out);
+        enc.set_constant(2, A);
+        enc.set_constant(3, Bd);
+        enc.set_constant(4, hd);
+        enc.set_constant(5, pad_d);
+        enc.dispatch({(unsigned)pad_d, (unsigned)Bd, (unsigned)A},
+                     {(unsigned)pad_d, 1, 1});
+        return;
+      }
       enc.set_function(_fn_transpose);
       enc.set_buffer(0, in);
       enc.set_buffer(1, out);
@@ -667,6 +853,23 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       enc.set_constant(3, Bd);
       enc.set_constant(4, hd);
       enc.dispatch({(unsigned)hd, (unsigned)Bd, (unsigned)A}, {(unsigned)hd, 1, 1});
+    };
+    // The inverse: [heads, n, ahd] -> [n, heads, hd], dropping the pad tail.
+    auto untranspose = [&](const SharedBuffer& in, const SharedBuffer& out,
+                           int A, int Bd) {
+      if (pad_d > 0) {
+        enc.set_function(_fn_tr_unpad);
+        enc.set_buffer(0, in);
+        enc.set_buffer(1, out);
+        enc.set_constant(2, A);
+        enc.set_constant(3, Bd);
+        enc.set_constant(4, hd);
+        enc.set_constant(5, pad_d);
+        enc.dispatch({(unsigned)hd, (unsigned)Bd, (unsigned)A},
+                     {(unsigned)hd, 1, 1});
+        return;
+      }
+      transpose(in, out, A, Bd);
     };
     auto residual = [&](const SharedBuffer& a, const SharedBuffer& b,
                         const SharedBuffer& out, int nn) {
@@ -679,8 +882,11 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     };
 
     // Patch embed + position embed.
+    tap("00_feat", featb, (std::size_t)n_patches * _feat_dim);
     gemm(featb, _pe_w, _pe_b, x, n_patches, hidden, _feat_dim);
+    tap("01_patch_embed", x, (std::size_t)n_patches * hidden);
     residual(x, posb, x, n_patches * hidden);
+    tap("02_pos_added", x, (std::size_t)n_patches * hidden);
 
     // Steel flash-attention (MMA) setup -- shared across all blocks (same
     // n_patches/heads/hd). Non-causal (do_causal=false) bidirectional ViT
@@ -694,9 +900,18 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     const int a_bq = attn_nax ? 64 : 32;
     const int a_bk = attn_nax ? 32 : 16;
     metal_compute::ComputeFunction fn_steel;
-    if ((attn_nax || _lib_attn.valid()) && hd == 64 && !_attn_params.empty()) {
+    // Every stride below is in the ATTENTION width (ahd): when padding, the
+    // head-major buffers really are [heads, n, 128]. Only `scale` keeps the
+    // real head_dim -- the padded lanes are zero and must not change it.
+    // Which (width, dtype) pairs the flash kernels are actually instantiated
+    // at: bd128 in both, bd64 in f16 only. Asking for an entry point that does
+    // not exist is pointless work at best, so spell the matrix out rather than
+    // relying on the lookup to fail.
+    const bool steel_bd_ok = (ahd == 128) || (ahd == 64 && !_bf16);
+    if ((attn_nax || _lib_attn.valid()) && steel_bd_ok &&
+        !_attn_params.empty()) {
       auto* p = static_cast<SteelAttnParams*>(_attn_params.contents());
-      p->B = 1; p->H = heads; p->D = hd; p->qL = n_patches; p->kL = n_patches;
+      p->B = 1; p->H = heads; p->D = ahd; p->qL = n_patches; p->kL = n_patches;
       p->gqa_factor = 1; p->scale = scale;
       p->NQ = (n_patches + a_bq - 1) / a_bq;
       p->NK = (n_patches + a_bk - 1) / a_bk;
@@ -704,23 +919,26 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       p->qL_rem = n_patches - p->NQ_aligned * a_bq;
       p->kL_rem = n_patches - p->NK_aligned * a_bk;
       p->qL_off = 0;
-      p->Q_strides[0] = (std::int64_t)heads * n_patches * hd;
-      p->Q_strides[1] = (std::int64_t)n_patches * hd; p->Q_strides[2] = hd;
+      p->Q_strides[0] = (std::int64_t)heads * n_patches * ahd;
+      p->Q_strides[1] = (std::int64_t)n_patches * ahd; p->Q_strides[2] = ahd;
       p->K_strides[0] = p->Q_strides[0];
-      p->K_strides[1] = p->Q_strides[1]; p->K_strides[2] = hd;
+      p->K_strides[1] = p->Q_strides[1]; p->K_strides[2] = ahd;
       p->V_strides[0] = p->Q_strides[0];
-      p->V_strides[1] = p->Q_strides[1]; p->V_strides[2] = hd;
+      p->V_strides[1] = p->Q_strides[1]; p->V_strides[2] = ahd;
       p->O_strides[0] = p->Q_strides[0];
-      p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = hd;
+      p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = ahd;
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (n_patches % a_bq) == 0)
           .set_bool(201, (n_patches % a_bk) == 0)
           .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+      const std::string bd = "_h_bd" + std::to_string(ahd)
+                             + (_bf16 ? "_bf16" : "");
       fn_steel = attn_nax
-          ? _lib_attn_nax.function("attn_steel_nax_h_bd64", fc)
-          : _lib_attn.function("attn_steel_h_bd64", fc);
+          ? _lib_attn_nax.function("attn_steel_nax" + bd, fc)
+          : _lib_attn.function("attn_steel" + bd, fc);
     }
     const bool use_steel = fn_steel.valid();
+    if (!use_steel) { pad_d = 0; }   // scalar fallback wants the native width
     // Perf probe only: skip the attention dispatch to isolate its cost (the
     // downstream proj/MLP GPU work is unchanged, so the wall-time delta is the
     // attention kernel). NOT a correct forward -- profiling use only.
@@ -729,18 +947,30 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 
     for (int b = 0; b < c.depth; ++b) {
       Block& blk = _blocks[b];
+      const bool t0 = (b == 0);
+      const std::size_t nh = (std::size_t)n_patches * hidden;
       ln(x, blk.n1w, blk.n1b, n1, n_patches, hidden);
+      if (t0) { tap("03_norm1", n1, nh); }
       gemm(n1, blk.qkvw, blk.qkvb, qkv, n_patches, 3 * hidden, hidden);
+      if (t0) { tap("04_qkv", qkv, nh * 3); }
       hslice(qkv, q3, n_patches, 3 * hidden, hidden, 0);
       hslice(qkv, k3, n_patches, 3 * hidden, hidden, hidden);
       hslice(qkv, v3, n_patches, 3 * hidden, hidden, 2 * hidden);
       vrope(q3, qr);
       vrope(k3, kr);
+      if (t0) {
+        tap("05_q", q3, nh);
+        tap("06_k", k3, nh);
+        tap("07_v", v3, nh);
+        tap("08_q_rope", qr, nh);
+        tap("09_k_rope", kr, nh);
+      }
       // The matrix-core attn reads qr/kr/v3 straight from [n,heads,hd] and
       // writes att in the same layout -- only the steel/scalar fallback needs
       // the head-major transposes.
       if (!_use_mma2_attn) {
-        transpose(qr, qt, n_patches, heads);   // [n,heads,hd]->[heads,n,hd]
+        // [n,heads,hd] -> [heads,n,ahd], zero-filling [hd, ahd) when padding.
+        transpose(qr, qt, n_patches, heads);
         transpose(kr, kt, n_patches, heads);
         transpose(v3, vt, n_patches, heads);
       }
@@ -792,15 +1022,23 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       // Fallback attn output is head-major [heads,n,hd]; transpose back to
       // [n,heads,hd] for proj. The matrix-core attn already wrote att directly.
       if (!_use_mma2_attn && !skip_attn) {
-        transpose(atb, att, heads, n_patches);
+        untranspose(atb, att, heads, n_patches);
       }
+      if (t0) { tap("10_attn", att, nh); }
       gemm(att, blk.ow, blk.ob, proj, n_patches, hidden, hidden);
+      if (t0) { tap("11_attn_proj", proj, nh); }
       residual(x, proj, x, n_patches * hidden);
+      if (t0) { tap("12_resid1", x, nh); }
       ln(x, blk.n2w, blk.n2b, n1, n_patches, hidden);
+      if (t0) { tap("13_norm2", n1, nh); }
       gemm(n1, blk.fc1w, blk.fc1b, hbuf, n_patches, inter, hidden);
+      if (t0) { tap("14_fc1", hbuf, (std::size_t)n_patches * inter); }
       gelu(_fn_gelu_tanh, hbuf, h2, n_patches * inter);
+      if (t0) { tap("15_gelu", h2, (std::size_t)n_patches * inter); }
       gemm(h2, blk.fc2w, blk.fc2b, out2, n_patches, hidden, inter);
+      if (t0) { tap("16_fc2", out2, nh); }
       residual(x, out2, x, n_patches * hidden);
+      if (t0) { tap("17_block0_out", x, nh); }
       // Qwen3-VL deepstack: after a tapped block, merge the CURRENT [n_patches,
       // hidden] residual with the postshuffle-norm merger -> [n_im, outh]. The
       // norm is over the merged window (mdim), so the contiguous x is read as
@@ -812,6 +1050,8 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
         gemm(ds_n1, d.fc1w, d.fc1b, ds_h, n_im, mdim, mdim);
         gelu(_fn_gelu_erf, ds_h, ds_h, n_im * mdim);
         gemm(ds_h, d.fc2w, d.fc2b, ds_out[i], n_im, outh, mdim);
+        tap(("19_deepstack" + std::to_string(i)).c_str(), ds_out[i],
+            (std::size_t)n_im * outh);
       }
     }
 
@@ -823,9 +1063,36 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     gemm(n1, _mfc1w, _mfc1b, mg, n_im, mdim, mdim);
     gelu(_fn_gelu_erf, mg, mg, n_im * mdim);
     gemm(mg, _mfc2w, _mfc2b, emb, n_im, outh, mdim);
+    // The tower's FINAL output (what Result::embeddings carries).
+    tap("18_tower_out", emb, (std::size_t)n_im * outh);
   }
   const auto t_host = Clock::now();
   stream.commit().wait();
+
+  // Write the block-0 trace as f32 (decoded from the tower's own dtype), one
+  // file per op: <dir>/<name>.f32. The reference dumps the same tap names, so
+  // a per-op rel-L2 says WHICH operation diverges rather than "the tower
+  // drifted".
+  if (trace_dir != nullptr && !taps.empty()) {
+    for (const Tap& t : taps) {
+      const auto* q = static_cast<const std::uint16_t*>(t.buf.contents());
+      std::vector<float> f(t.n);
+      for (std::size_t i = 0; i < t.n; ++i) { f[i] = dec_elt_(q[i], _bf16); }
+      const std::string sub =
+          std::string(trace_dir) + "/" + (_bf16 ? "bf16" : "f16");
+      std::error_code _ec;
+      std::filesystem::create_directories(sub, _ec);
+      const std::string path = sub + "/" + t.name + ".f32";
+      std::FILE* fp = std::fopen(path.c_str(), "wb");
+      if (fp != nullptr) {
+        std::fwrite(f.data(), 4, f.size(), fp);
+        std::fclose(fp);
+      }
+    }
+    std::fprintf(stderr, "[vis-trace] wrote %zu block-0 taps to %s/%s "
+                 "(n_patches=%d hidden=%d)\n", taps.size(), trace_dir,
+                 _bf16 ? "bf16" : "f16", n_patches, hidden);
+  }
   const auto t_gpu = Clock::now();
   if (profile) {
     auto ms = [](Clock::duration d) {

@@ -234,6 +234,68 @@ TEST(model_catalog, optiq_variants_present) {
   }
 }
 
+// The Gemma-4 OptiQ 4-bit MLX variants: dense 12B/31B + the 26B-A4B MoE.
+// All three are "gemma4_unified" (like their bf16 sources -- the E-series
+// PLE models are the ones tagged "gemma4") and whole-repo fetches.
+TEST(model_catalog, gemma4_optiq_variants_present) {
+  // {OptiQ repo, param class, the gated bf16 source it sits beside}.
+  struct Row { const char* path; const char* param; const char* src; };
+  const Row rows[] = {
+      {"mlx-community/gemma-4-12B-it-OptiQ-4bit", "12B",
+       "bf16 (google, gated)"},
+      {"mlx-community/gemma-4-31B-it-OptiQ-4bit", "31B",
+       "bf16 (google, gated)"},
+      {"mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit", "26B-A4B",
+       "bf16 MoE (google, gated)"}};
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "Gemma");
+    EXPECT_TRUE(e->version == "4");
+    EXPECT_TRUE(e->param_class == r.param);
+    EXPECT_TRUE(e->variant == "MLX OptiQ 4-bit (mlx-community)");
+    EXPECT_TRUE(e->model_type == "gemma4_unified");
+    EXPECT_TRUE(e->files.empty());
+    EXPECT_FALSE(e->needs_tokenizer_json);
+    EXPECT_TRUE(catalog_category(*e) == "model");
+    // Reachable through the drill-down, beside the gated bf16 source.
+    auto vars = catalog_variants("Gemma", "4", r.param);
+    EXPECT_TRUE(has_(vars, "MLX OptiQ 4-bit (mlx-community)"));
+    EXPECT_TRUE(has_(vars, r.src));
+  }
+}
+
+// The Qwen 3.6 OptiQ 4-bit MLX variants (27B dense-hybrid + 35B-A3B MoE).
+// Both are qwen3_5-family configs -> model_type "qwen3.5" (like their bf16
+// sources), and both are whole-repo fetches -- `files` must stay empty so
+// the recursive tree walk also picks up the optiq/ companions (the MTP head
+// and the vision tower).
+TEST(model_catalog, qwen36_optiq_variants_present) {
+  struct Row { const char* path; const char* param; };
+  const Row rows[] = {
+      {"mlx-community/Qwen3.6-27B-OptiQ-4bit", "27B"},
+      {"mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit", "35B-A3B"}};
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "Qwen");
+    EXPECT_TRUE(e->version == "3.6");
+    EXPECT_TRUE(e->param_class == r.param);
+    EXPECT_TRUE(e->variant == "MLX OptiQ 4-bit (mlx-community)");
+    EXPECT_TRUE(e->model_type == "qwen3.5");
+    EXPECT_TRUE(e->files.empty());
+    EXPECT_FALSE(e->needs_tokenizer_json);
+    EXPECT_TRUE(catalog_category(*e) == "model");
+    // Reachable through the drill-down, next to the bf16 source.
+    auto vars = catalog_variants("Qwen", "3.6", r.param);
+    EXPECT_TRUE(has_(vars, "MLX OptiQ 4-bit (mlx-community)"));
+    EXPECT_TRUE(has_(vars, "bf16 (Qwen)"));
+  }
+  EXPECT_TRUE(has_(catalog_param_classes("Qwen", "3.6"), "35B-A3B"));
+}
+
 // The Qwen3.6 27B GGUF entry pins the main quant + mmproj + imatrix.
 TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   const ModelCatalogEntry* e =
@@ -252,6 +314,55 @@ TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
 // (t2i, "mage-flow", text-in) and Edit ("mage-flow-edit", text+image-in),
 // each in Base / RL-aligned / Turbo. All six pin the SAME 18-file
 // non-asset layout.
+TEST(model_catalog, boogu_image_family_present) {
+  struct Row { const char* path; const char* ver; const char* mt; };
+  const Row rows[] = {
+      {"Boogu/Boogu-Image-0.1-Base", "0.1", "boogu-image"},
+      {"Boogu/Boogu-Image-0.1-Turbo", "0.1", "boogu-image"},
+      {"Boogu/Boogu-Image-0.1-Edit", "0.1-Edit", "boogu-image-edit"},
+      {"Boogu/Boogu-Image-0.1-Edit-Turbo", "0.1-Edit", "boogu-image-edit"}};
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "Boogu-Image");
+    EXPECT_TRUE(e->version == r.ver);
+    EXPECT_TRUE(e->param_class == "10B");
+    EXPECT_TRUE(e->model_type == r.mt);
+    EXPECT_FALSE(e->needs_tokenizer_json);
+    // Pinned layout: the sharded DiT + the mllm text encoder + the VAE +
+    // processor/scheduler configs, and NO assets/ or trust_remote_code shims.
+    EXPECT_TRUE(has_(e->files, "model_index.json"));
+    EXPECT_TRUE(has_(
+        e->files, "transformer/diffusion_pytorch_model-00003-of-00003.safetensors"));
+    EXPECT_TRUE(has_(e->files, "mllm/model-00004-of-00004.safetensors"));
+    EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
+    EXPECT_TRUE(has_(e->files, "processor/chat_template.jinja"));
+    EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+    EXPECT_FALSE(has_(e->files, "transformer/transformer_boogu.py"));
+  }
+  // Both variants of each task drill down under one family.
+  auto gen = catalog_variants("Boogu-Image", "0.1", "10B");
+  EXPECT_TRUE(gen.size() == 2);
+  EXPECT_TRUE(has_(gen, "Turbo 4-step distilled bf16 (Boogu)"));
+  auto edit = catalog_variants("Boogu-Image", "0.1-Edit", "10B");
+  EXPECT_TRUE(edit.size() == 2);
+  EXPECT_TRUE(has_(edit, "Edit-Turbo 4-step distilled bf16 (Boogu)"));
+
+  // Modalities: Edit is image-conditioned, the t2i pair is not.
+  FlexData ef = catalog_entry_to_flex(
+      *catalog_by_path("Boogu/Boogu-Image-0.1-Edit-Turbo"));
+  auto ein = flex_arr_(ef, "inputs");
+  EXPECT_TRUE(has_(ein, "text"));
+  EXPECT_TRUE(has_(ein, "image"));
+  EXPECT_TRUE(has_(flex_arr_(ef, "outputs"), "image"));
+  FlexData tf = catalog_entry_to_flex(
+      *catalog_by_path("Boogu/Boogu-Image-0.1-Turbo"));
+  auto tin = flex_arr_(tf, "inputs");
+  EXPECT_TRUE(has_(tin, "text"));
+  EXPECT_FALSE(has_(tin, "image"));
+}
+
 TEST(model_catalog, mage_flow_family_present) {
   struct Row { const char* path; const char* ver; const char* mt; };
   const Row rows[] = {

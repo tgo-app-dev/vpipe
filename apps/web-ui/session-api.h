@@ -4,6 +4,7 @@
 #include "apps/web-ui/http-server.h"
 #include "apps/web-ui/startup-checks.h"
 #include "common/flex-data.h"
+#include "interfaces/ui-view-intf.h"
 #include "vpipe/pipeline-handle.h"
 
 #include <filesystem>
@@ -123,6 +124,7 @@ private:
   HttpResponse h_io_pending_(const HttpRequest&);
   HttpResponse h_io_input_(const HttpRequest&);
   HttpResponse h_io_clear_(const HttpRequest&);
+  HttpResponse h_io_interrupt_(const HttpRequest&);
   // Console history cap (terminal-style scrollback bound). Returns
   // {max_console, min, max}; setter accepts {max_console: N}.
   HttpResponse h_io_limit_get_(const HttpRequest&);
@@ -184,18 +186,24 @@ private:
   // {streams:[{pipeline,stage,state,playlist_name,port,bind_address}]}.
   HttpResponse h_hls_streams_(const HttpRequest&);
 
-  // Active preview streams (live "preview" stages) for the User I/O
-  // workspace's low-latency Preview view. Enumerates the live "preview"
-  // stages and reports each one's coordinates + best-effort media hints:
-  // {streams:[{pipeline,stage,state,title,video,audio,width,height}]}.
-  HttpResponse h_preview_streams_(const HttpRequest&);
-  // Long-lived preview WebSocket (single-origin transport; see
-  // common/preview-channel.h for the message protocol). Resolves the live
-  // "preview" stage named by the :pipeline/:stage path params, subscribes
-  // to its PreviewChannel, and relays its messages (fMP4 init/fragments +
-  // PCM) to the browser until the client disconnects or the stage stops.
-  // Closes immediately when no such live stage exists.
-  void h_preview_ws_(const HttpRequest&, WebSocket&);
+  // ---- stage-provided GUI views ----------------------------------
+  //
+  // Panels a STAGE ships with itself rather than the app shipping them
+  // (see ui/ui-view-registry.h). The app's whole role is to advertise
+  // what is registered, serve the module bytes (via serve_static_'s
+  // registry lookup), and FORWARD the FlexData protocol -- it never
+  // interprets a view's messages.
+
+  // Every registered view, for the front end's panel registry:
+  // {views:[{id,stage_type,module,styles,label_key,icon}]}.
+  HttpResponse h_ui_views_(const HttpRequest&);
+
+  // Long-lived per-panel channel. Instantiates the :view backend, then
+  // pumps in both directions on this one thread until the client goes
+  // away: inbound client frames become UiViewBackendIntf::on_message,
+  // outbound backend messages become text frames (JSON) and bulk
+  // payloads become binary frames ([u32 header_len][header][payload]).
+  void h_ui_view_ws_(const HttpRequest&, WebSocket&);
 
   // Performance profiler: start/stop the session's per-worker event
   // capture and retrieve the captured timeline. start accepts optional
@@ -284,6 +292,35 @@ private:
       const std::vector<StageSpec>& stages);
 
   static const char* state_name_(State s);
+
+  // What a view's backend may ask of this app: which stages of a type
+  // exist across the loaded pipelines, and which of them are live. Held
+  // by value; handed to every view backend and published to the session
+  // through WebUiDelegate::ui_view_host().
+  class ViewHost final : public UiViewHostIntf {
+  public:
+    explicit ViewHost(SessionApi& api) : _api(api) {}
+    std::vector<StageRef>
+    find_stages(std::string_view type_name) const override;
+    Stage*
+    live_stage(std::string_view pipeline,
+               std::string_view stage) const override;
+  private:
+    SessionApi& _api;
+  };
+  ViewHost _view_host{*this};
+
+public:
+  // The view host backing this app's stage-provided panels. Wired into
+  // the UI delegate at startup so a stage can reach it through its
+  // session (UiDelegateIntf::ui_view_host).
+  UiViewHostIntf* view_host() noexcept { return &_view_host; }
+
+private:
+  // The server these routes are registered on, so a long-lived handler
+  // can see a shutdown coming and unwind (see HttpServer::stopping).
+  // Null until register_routes.
+  HttpServer*                        _server = nullptr;
 
   SessionIntf*                       _session;
   SessionContextIntf*                _sctx;   // same object, context facet

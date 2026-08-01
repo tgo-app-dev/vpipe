@@ -1,9 +1,13 @@
 #include "stages/text-to-image-stage.h"
 
+#include "stages/model-memory.h"
+
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
 
@@ -56,19 +60,24 @@ const ConfigKey kAttrs[] = {
           "pipeline. OPTIONAL: a model-select source on the model iport "
           "overrides it",
    .suggest_db = "models", .suggest_db_type =
-       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit"},
+       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
+       "boogu-image,boogu-image-edit"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
    .suggest_db = "models",
    .suggest_db_type =
-       "krea2-dit,flux2-dit,qwen-image-edit-dit,mage-flow-dit"},
+       "krea2-dit,flux2-dit,qwen-image-edit-dit,mage-flow-dit,"
+       "boogu-image-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
           "(the init latent arrives on the `latent` iport from vae-encode)"},
   {.key = "height", .type = ConfigType::Int, .required = false,
-   .doc = "output height, multiple of 16 (default 256)"},
+   .doc = "output height, multiple of 16. Unset TOGETHER with width = infer "
+          "from ref_latent0 (iport5) at its family's VAE scale; 256 if there "
+          "is no reference either"},
   {.key = "width", .type = ConfigType::Int, .required = false,
-   .doc = "output width, multiple of 16 (default 256)"},
+   .doc = "output width, multiple of 16. Unset TOGETHER with height = infer "
+          "from ref_latent0 (iport5); 256 if there is no reference either"},
   {.key = "steps", .type = ConfigType::Int, .required = false,
    .doc = "turbo sampler steps (default 8)"},
   {.key = "seed", .type = ConfigType::Int, .required = false,
@@ -91,9 +100,6 @@ const ConfigKey kAttrs[] = {
    .doc = "Gaussian-Shading key: an integer or a passphrase. Unset => "
           "$MAGEFLOW_GS_KEY, else $MAGEFLOW_GS_KEY_FILE / ~/.mageflow/gs_key, "
           "else the published default. The detector needs the SAME key"},
-  {.key = "adopt_latent_dims", .type = ConfigType::Bool, .required = false,
-   .doc = "img2img: take output H/W from the incoming latent (shape[1]*8 x "
-          "shape[2]*8) instead of width/height (default false)"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
@@ -113,7 +119,8 @@ const PortSpec kIports[] = {
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
-  {.name = "sampler", .doc = "OPTIONAL sampler spec FlexData (sampler-select)",
+  {.name = "sampler",
+   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler", .doc = "OPTIONAL scheduler spec FlexData (scheduler-select)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
@@ -176,7 +183,6 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
   _steps  = (int)attr_int("steps");
   _strength = attr_real("strength");
   _guidance_scale = attr_real("guidance_scale");
-  _adopt_latent_dims = attr_bool("adopt_latent_dims");
   // Provenance watermark is ON unless explicitly disabled (see no_watermark).
   _watermark = !attr_bool("no_watermark");
   _watermark_key = attr_str("watermark_key");
@@ -185,8 +191,15 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
   // quality). Env VPIPE_I8_GEMM=0|1 overrides.
   _i8_gemm = attr_bool("i8_gemm");
   _seed   = (std::uint64_t)attr_int("seed");
-  if (_height <= 0) { _height = 256; }
-  if (_width  <= 0) { _width  = 256; }
+  // Neither axis configured => infer the size from ref_latent0 when a
+  // reference is wired (process()); both stay 0 so the check below is vacuous
+  // and the log reads "auto". A PARTIALLY specified size is not half-inferred
+  // -- the given axis stands and the other keeps the historical 256 default.
+  _infer_size = (_height <= 0 && _width <= 0);
+  if (!_infer_size) {
+    if (_height <= 0) { _height = 256; }
+    if (_width  <= 0) { _width  = 256; }
+  }
   if (_steps  <= 0) { _steps  = 8; }
   if (_guidance_scale <= 0.0) { _guidance_scale = 1.0; }   // <=0 => CFG off
   if (_strength < 0.0 || _strength > 1.0) {
@@ -219,6 +232,19 @@ TextToImageStage::spec() const noexcept
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 namespace {
+
+// Output pixels per ref_latent cell, i.e. the factor the paired vae-encode
+// applied when it produced ref_latent0 for this family:
+//   krea2 / qwen-image-edit   [16, H/8,  W/8 ]   -> 8
+//   boogu-image               [16, H/8,  W/8 ]   -> 8
+//   flux2 / mage-flow         [C,  H/16, W/16]   -> 16
+// (FLUX.2's VAE is 8x but vae-encode emits its 2x2-packed DiT latent, so the
+// pixels-per-cell figure is 16 there too.)
+int
+latent_scale_(const std::string& family)
+{
+  return (family == "flux2" || family == "mage-flow") ? 16 : 8;
+}
 
 // FLUX.2 empirical flow-shift mu (diffusers Flux2Pipeline.compute_empirical_mu):
 // the sigma time-shift is resolution- AND step-dependent (a fixed shift washes
@@ -256,37 +282,16 @@ t2i_family_(const std::string& transformer_dir)
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         if (cls == "MageFlow") { return "mage-flow"; }
+        if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
       }
     }
   }
   return "krea2";
 }
 
-// Total physical RAM (bytes), 0 if unknown.
-std::size_t
-phys_ram_()
-{
-  std::uint64_t mem = 0;
-  std::size_t len = sizeof(mem);
-  if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) != 0) { return 0; }
-  return (std::size_t)mem;
-}
-
-// Sum of the .safetensors bytes in a dir (proxy for the wired f16 footprint).
-std::size_t
-dir_weights_bytes_(const std::string& dir)
-{
-  namespace fs = std::filesystem;
-  std::size_t total = 0;
-  std::error_code ec;
-  for (fs::recursive_directory_iterator it(dir, ec), end; it != end;
-       it.increment(ec)) {
-    if (it->is_regular_file(ec) && it->path().extension() == ".safetensors") {
-      total += (std::size_t)it->file_size(ec);
-    }
-  }
-  return total;
-}
+// Physical RAM + component weight bytes now live in stages/model-memory.h so
+// the conditioner and the VAE stages size the box the same way this one does.
+using model_memory::phys_ram;
 
 // FLUX.2 VAE decode-peak channel count from <root>/vae/config.json. The top
 // up-block's FIRST resnet reads block_out_channels[1] (256) at FULL res (the
@@ -371,6 +376,73 @@ krea2_vae_base_(const std::string& root)
 
 }  // namespace
 
+void
+TextToImageStage::reset_run_state()
+{
+  // If a previous run left the weights UNLOADED (the idle-unload
+  // policy drops them between beats), let this launch load them again:
+  // ensure_loaded_'s once-only guard is per-Stage, not per-launch, so
+  // without this the stage stays inert for the whole run. When the
+  // weights are still held we deliberately leave the guard set --
+  // reloading on top of a resident copy is exactly what doubles peak
+  // memory.
+  if (!_dit && !_flux2_dit && !_qie_dit && !_mage_dit && !_boogu_dit) {
+    _load_attempted = false;
+    _dit_unloaded   = false;
+  }
+
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _model_latched     = false;
+  _sampler_latched   = false;
+  _scheduler_latched = false;
+  // The reference latents latch on FIRST arrival and are cached for
+  // every later prompt (`_ref[]`), which is right within a run and
+  // wrong across one: a non-empty cache makes the iport5/iport6 read
+  // conditional, so on the next launch the stage never consumes the
+  // reference beat the vae-encode upstream just produced. That beat
+  // then sits on the wire forever (the edge shows a permanent backlog)
+  // and the run silently re-uses the PREVIOUS image's reference.
+  _ref[0] = RefLatent{};
+  _ref[1] = RefLatent{};
+
+}
+
+void
+TextToImageStage::revise_dit_declaration_(const std::string& dit_dir) const
+{
+  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  if (mgr == nullptr || dit_dir.empty()) { return; }
+  // What the set holds IS the right number for a DiT: unlike the LMs,
+  // its retained tensors go through tensor()/derived() and are cached
+  // here, while the streamed blocks deliberately are not.
+  auto ws = mgr->weight_set(dit_dir);
+  if (!ws) { return; }
+  const std::size_t held = ws->stats().bytes;
+  mgr->revise_declaration(dit_dir, held);
+  session()->log_debug(fmt(
+      "TextToImageStage('{}'): streaming DiT keeps {} MB resident; revised "
+      "down from its {} MB on disk so peers do not size against weights "
+      "that are never there", this->id(), held >> 20,
+      model_memory::dir_weights_bytes(dit_dir) >> 20));
+}
+
+std::vector<std::string>
+TextToImageStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string mllm = (fs::path(root) / "mllm").string();
+  std::error_code ec;
+  const std::string enc = fs::exists(mllm, ec)
+                              ? mllm
+                              : (fs::path(root) / "text_encoder").string();
+  return {(fs::path(root) / "transformer").string(), enc};
+}
+
 Job
 TextToImageStage::initialize(RuntimeContext& ctx)
 {
@@ -406,21 +478,35 @@ TextToImageStage::ensure_loaded_()
   // The text encoder lives in the paired diffusion-conditioner stage, but its
   // weights are resident in the SAME process while the DiT runs, so the
   // encoder-coexistence streaming heuristics below still budget for it.
-  const std::string enc_dir = (fs::path(root) / "text_encoder").string();
+  // Boogu-Image calls its encoder `mllm/` (a full multimodal LLM, not a
+  // diffusers text_encoder): sizing it as text_encoder/ silently scored the
+  // encoder at ZERO bytes, so the streaming decision under-counted by the
+  // largest peer in the pipeline and a bounded box would preload instead.
+  std::string enc_dir = (fs::path(root) / "mllm").string();
+  {
+    std::error_code eec;
+    if (!fs::is_directory(enc_dir, eec)) {
+      enc_dir = (fs::path(root) / "text_encoder").string();
+    }
+  }
   const std::string dit_dir = _dit_dir.empty()
       ? (fs::path(root) / "transformer").string()
       : resolve_model_dir(session(), _models_db, _dit_dir);
   _family = t2i_family_(dit_dir);
+  const std::string size_desc =
+      _infer_size ? std::string("auto (from ref_latent0)")
+                  : std::to_string(_width) + "x" + std::to_string(_height);
   session()->log_debug(fmt(
       "TextToImageStage('{}'): init root='{}' dit='{}' family={} "
-      "(default {}x{}, {} steps, seed {}, strength {})", this->id(), root,
-      dit_dir, _family, _width, _height, _steps, _seed, _strength));
+      "(default {}, {} steps, seed {}, strength {})", this->id(), root,
+      dit_dir, _family, size_desc, _steps, _seed, _strength));
 
   session()->info(fmt(
       "TextToImageStage('{}'): loading {} DiT from '{}'", this->id(),
       _family == "flux2" ? "FLUX.2"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "mage-flow" ? "Mage-Flow NR-MMDiT"
+      : _family == "boogu-image" ? "Boogu-Image NextDiT"
       : "Krea2 MMDiT", dit_dir));
   if (_family == "flux2") {
     // Stream the DiT blocks when the box can't hold encoder + DiT together
@@ -429,23 +515,18 @@ TextToImageStage::ensure_loaded_()
     bool stream_blocks;
     double pin_frac = 0.0;
     {
-      const std::size_t dit_b = dir_weights_bytes_(dit_dir);
-      const std::size_t enc_b = dir_weights_bytes_(enc_dir);
-      const std::size_t ram = phys_ram_();
-      const std::size_t need = dit_b + enc_b + (6ull << 30);   // +6 GB headroom
-      stream_blocks = (ram != 0) && (ram < need);
+      const auto plan = model_memory::plan_streaming(
+          session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+      stream_blocks = plan.stream;
+      pin_frac      = plan.pin_frac;
       if (const char* e = std::getenv("VPIPE_FLUX2_STREAM")) {
         stream_blocks = (std::atoi(e) != 0);
-      }
-      // Pin as many leading blocks as fit alongside the resident encoder (see
-      // the Qwen-Image-Edit branch below for the encoder-coexistence rationale).
-      if (stream_blocks && ram > enc_b + (5ull << 30)) {
-        pin_frac = std::min(0.60,
-            double(ram - enc_b - (5ull << 30)) / double(ram));
+        if (!stream_blocks) { pin_frac = 0.0; }
       }
       session()->log_debug(fmt(
-          "TextToImageStage('{}'): FLUX.2 DiT {} GB + enc {} GB + 6 GB vs {} GB "
-          "RAM -> {}", this->id(), dit_b >> 30, enc_b >> 30, ram >> 30,
+          "TextToImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) + 6 "
+          "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
+          plan.others >> 30, phys_ram() >> 30,
           stream_blocks ? "STREAM blocks" : "PRELOAD"));
     }
     if (const char* e = std::getenv("VPIPE_FLUX2_PIN_FRAC")) {
@@ -454,7 +535,7 @@ TextToImageStage::ensure_loaded_()
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
     _flux2_dit = genai::MetalFlux2Transformer::load(
-        dit_dir, mc, fcfg, stream_blocks, pin_frac);
+        weight_set_(dit_dir), mc, fcfg, stream_blocks, pin_frac);
     if (!_flux2_dit) {
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
@@ -465,6 +546,7 @@ TextToImageStage::ensure_loaded_()
     // the DiT's per-forward scratch after each generation so it doesn't crowd
     // out a large downstream VAE decode.
     _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
     // Cache the load params + VAE base so a memory-driven free after a
     // generation (free_flux2_dit_for_decode_) can reload identically.
     _flux2_dit_dir  = dit_dir;
@@ -483,28 +565,26 @@ TextToImageStage::ensure_loaded_()
     // streaming, ~one block resident); a roomier box pins more. Pinned blocks
     // are read once + reused, only the tail streams. VPIPE_QIE_STREAM /
     // VPIPE_QIE_PIN_FRAC override.
-    const std::size_t dit_b = dir_weights_bytes_(dit_dir);
-    const std::size_t enc_b = dir_weights_bytes_(enc_dir);
-    const std::size_t ram = phys_ram_();
-    bool stream_blocks = (ram != 0) && (ram < dit_b + enc_b + (6ull << 30));
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool   stream_blocks = plan.stream;
+    double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_QIE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-    }
-    double pin_frac = 0.0;
-    if (stream_blocks && ram > enc_b + (5ull << 30)) {
-      pin_frac = std::min(0.60,
-          double(ram - enc_b - (5ull << 30)) / double(ram));
+      if (!stream_blocks) { pin_frac = 0.0; }
     }
     if (const char* e = std::getenv("VPIPE_QIE_PIN_FRAC")) {
       pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Qwen-Image-Edit DiT {} GB + enc {} GB + 6 GB "
-        "vs {} GB RAM -> {}", this->id(), dit_b >> 30, enc_b >> 30, ram >> 30,
+        "TextToImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
+        "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, model_memory::kStreamHeadroom >> 30,
+        plan.others >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     genai::MetalQwenImageTransformer::Config qcfg;
-    _qie_dit = genai::MetalQwenImageTransformer::load(dit_dir, mc, qcfg,
-                                                      stream_blocks, pin_frac);
+    _qie_dit = genai::MetalQwenImageTransformer::load(
+        weight_set_(dit_dir), mc, qcfg, stream_blocks, pin_frac);
     if (!_qie_dit) {
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the Qwen-Image-Edit DiT from "
@@ -518,34 +598,82 @@ TextToImageStage::ensure_loaded_()
           qcfg.n_layers));
     }
     _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+  } else if (_family == "boogu-image") {
+    // Boogu's 10B NextDiT. At ~20 GB bf16 it streams on any box that cannot
+    // hold it beside the resident Qwen3-VL mllm (~16 GB), which is every box
+    // short of ~48 GB; the three refiner stacks stay resident either way.
+    // VPIPE_BOOGU_STREAM / VPIPE_BOOGU_PIN_FRAC override.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool   stream_blocks = plan.stream;
+    double pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_BOOGU_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+      if (!stream_blocks) { pin_frac = 0.0; }
+    }
+    if (const char* e = std::getenv("VPIPE_BOOGU_PIN_FRAC")) {
+      pin_frac = std::atof(e);
+    }
+    session()->log_debug(fmt(
+        "TextToImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
+        "GB headroom vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
+        plan.others >> 30, phys_ram() >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    // Cache the load params so the stage can free the DiT for a big decode and
+    // reload it on the next prompt (free_boogu_dit_for_decode_).
+    _boogu_dit_dir = dit_dir;
+    _boogu_stream = stream_blocks;
+    _boogu_pin_frac = pin_frac;
+    _vae_base = flux2_vae_base_(root);   // Boogu's VAE is a plain AutoencoderKL
+    _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    if (stream_blocks) {
+      // DEFER the load on a bounded box. Streaming and per-prompt reload only
+      // help if the DiT is not resident WHILE the conditioner's encoder is:
+      // both stages load in initialize(), so a preloaded DiT plus a resident
+      // Qwen3-VL mllm is the peak, and it is the peak that decides whether the
+      // box copes (measured: 17.7 GB resident for a 4-bit Boogu when both load
+      // up front, 8.7 GB when they take turns). The DiT loads on its first
+      // conditioning beat -- by which time the conditioner has dropped the
+      // encoder -- and is freed again for the vae-decode.
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "TextToImageStage('{}'): memory-bounded -- the Boogu-Image DiT loads "
+          "on the first conditioning beat (block streaming on) and is freed for "
+          "the vae-decode, so it never shares the box with the text encoder",
+          this->id()));
+    } else if (!load_boogu_dit_()) {
+      session()->error(fmt(
+          "TextToImageStage('{}'): failed to load the Boogu-Image DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      return;
+    }
   } else if (_family == "mage-flow") {
     // Mage-Flow's 4B NR-MMDiT is MetalQwenImageTransformer under a different
     // Config (12 dual-stream blocks, in_channels 128 @ patch_size 1, txt_dim
     // 2560, text stream unrotated, bf16 timestep frequencies) -- see
     // mage_flow_dit_config(). At ~8 GB bf16 it streams on a box that can't
     // hold it beside the resident Qwen3-VL encoder, same rule as the others.
-    const std::size_t dit_b = dir_weights_bytes_(dit_dir);
-    const std::size_t enc_b = dir_weights_bytes_(enc_dir);
-    const std::size_t ram = phys_ram_();
-    bool stream_blocks = (ram != 0) && (ram < dit_b + enc_b + (6ull << 30));
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool   stream_blocks = plan.stream;
+    double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_MAGE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-    }
-    double pin_frac = 0.0;
-    if (stream_blocks && ram > enc_b + (5ull << 30)) {
-      pin_frac = std::min(0.60,
-          double(ram - enc_b - (5ull << 30)) / double(ram));
+      if (!stream_blocks) { pin_frac = 0.0; }
     }
     if (const char* e = std::getenv("VPIPE_MAGE_PIN_FRAC")) {
       pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Mage-Flow DiT {} GB + enc {} GB + 6 GB vs {} "
-        "GB RAM -> {}", this->id(), dit_b >> 30, enc_b >> 30, ram >> 30,
+        "TextToImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) + 6 "
+        "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
+        plan.others >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     auto mcfg = genai::mage_flow_dit_config();
-    _mage_dit = genai::MetalMageFlowTransformer::load(dit_dir, mc, mcfg,
-                                                      stream_blocks, pin_frac);
+    _mage_dit = genai::MetalMageFlowTransformer::load(
+        weight_set_(dit_dir), mc, mcfg, stream_blocks, pin_frac);
     if (!_mage_dit) {
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the Mage-Flow DiT from '{}'; "
@@ -559,11 +687,12 @@ TextToImageStage::ensure_loaded_()
           mcfg.n_layers));
     }
     _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
     _mage_shift = mage_static_shift_(root);
   } else {
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
-    _dit = genai::MetalKrea2Transformer::load(dit_dir, mc, kcfg);
+    _dit = genai::MetalKrea2Transformer::load(weight_set_(dit_dir), mc, kcfg);
     if (!_dit) {
       session()->error(fmt(
           "TextToImageStage('{}'): failed to load the DiT from '{}'; inert",
@@ -580,15 +709,14 @@ TextToImageStage::ensure_loaded_()
     // encoder + DiT + a large VAE decode at once, drop the DiT's per-forward
     // scratch after each generation so its working set doesn't crowd out the
     // downstream vae-decode stage.
-    const std::size_t dit_b = dir_weights_bytes_(dit_dir);
-    const std::size_t enc_b = dir_weights_bytes_(enc_dir);
-    const std::size_t ram = phys_ram_();
-    const std::size_t need = dit_b + enc_b + (6ull << 30);   // +6 GB headroom
-    _release_scratch = (ram != 0) && (ram < need);
+    const std::vector<std::string> peers = {dit_dir, enc_dir};
+    _release_scratch =
+        model_memory::bounded(session(), peers, model_memory::kHeadroom);
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Krea2 DiT {} GB + enc {} GB + 6 GB vs {} GB "
-        "RAM -> {} DiT scratch", this->id(), dit_b >> 30, enc_b >> 30,
-        ram >> 30, _release_scratch ? "RELEASE" : "keep"));
+        "TextToImageStage('{}'): Krea2 footprint {} GB + {} GB headroom vs {} "
+        "GB RAM -> {} DiT scratch", this->id(),
+        model_memory::weight_footprint(session(), peers) >> 30,
+        phys_ram() >> 30, _release_scratch ? "RELEASE" : "keep"));
   }
   session()->log_debug(fmt(
       "TextToImageStage('{}'): {} DiT ready{}",
@@ -605,7 +733,7 @@ TextToImageStage::load_flux2_dit_()
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
   _flux2_dit = genai::MetalFlux2Transformer::load(
-      _flux2_dit_dir, mc, fcfg, _flux2_stream, _flux2_pin_frac);
+      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream, _flux2_pin_frac);
   return (bool)_flux2_dit;
 }
 
@@ -643,6 +771,61 @@ TextToImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
   _dit_unloaded = true;
 }
 
+// The manager's shared, reference-counted view of a checkpoint. Two
+// pipelines running the same model get the same set and share its
+// weights; the DiT holds the ONLY reference from this stage, deliberately
+// -- free_*_dit_for_decode_ has to actually free, and it would not if the
+// stage kept a handle of its own.
+std::shared_ptr<genai::WeightSet>
+TextToImageStage::weight_set_(const std::string& dir) const
+{
+  if (dir.empty()) { return nullptr; }
+  // Falls back to a private set when the session has no manager; see
+  // open_weight_set().
+  return genai::open_weight_set(dir, session());
+}
+
+bool
+TextToImageStage::load_boogu_dit_()
+{
+  auto* mc = session() ? session()->metal_compute() : nullptr;
+  if (mc == nullptr || _boogu_dit_dir.empty()) { return false; }
+  genai::MetalBooguTransformer::Config bcfg;
+  bcfg.i8_gemm = _i8_gemm;
+  _boogu_dit = genai::MetalBooguTransformer::load(weight_set_(_boogu_dit_dir),
+                                                 mc, bcfg, _boogu_stream,
+                                                 _boogu_pin_frac);
+  if (_boogu_dit && _boogu_stream) {
+    session()->info(fmt(
+        "TextToImageStage('{}'): Boogu DiT streaming, pinned {} of {} blocks "
+        "resident", this->id(), _boogu_dit->pinned_blocks(),
+        _boogu_dit->config().n_double + _boogu_dit->config().n_single));
+  }
+  return (bool)_boogu_dit;
+}
+
+void
+TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_boogu_dit || gen_w <= 0 || gen_h <= 0) { return; }
+  auto* mc = session() ? session()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  const auto mb = mc->memory_budget();
+  if (mb.recommended == 0) { return; }   // budget query unavailable
+  // Boogu's VAE is the plain AutoencoderKL through MetalFlux2Vae, so the decode
+  // peak is the FLUX.2 estimate: ~7x one full-res base-channel buffer.
+  const std::size_t peak =
+      (std::size_t)gen_h * gen_w * (std::size_t)_vae_base * 2 * 7;
+  if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  session()->info(fmt(
+      "TextToImageStage('{}'): freeing the Boogu-Image DiT ({} MB working-set "
+      "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
+      "reloads on the next prompt", this->id(), mb.headroom >> 20,
+      mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
+  _boogu_dit.reset();
+  _dit_unloaded = true;
+}
+
 bool
 TextToImageStage::load_krea2_dit_()
 {
@@ -650,7 +833,8 @@ TextToImageStage::load_krea2_dit_()
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
-  _dit = genai::MetalKrea2Transformer::load(_krea2_dit_dir, mc, kcfg);
+  _dit = genai::MetalKrea2Transformer::load(weight_set_(_krea2_dit_dir), mc,
+                                            kcfg);
   return (bool)_dit;
 }
 
@@ -1129,6 +1313,266 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   return unpack(packed);
 }
 
+// Boogu-Image: NextDiT forward + the checkpoint's own sampler.
+//
+// Two integrators live here because Boogu ships two kinds of checkpoint and
+// they do NOT share a loop:
+//   * "dmd" (Base/Edit-Turbo, the distilled default) -- at each ASCENDING sigma
+//     jump straight to the x0 prediction, x <- x + (1 - s) * v, then RE-NOISE
+//     down to the next sigma, x <- (1 - s') * eps + s' * x. No CFG.
+//   * anything else (Base/Edit) -- Euler along the v1 logistic time-shift
+//     schedule, x <- x + (s_next - s) * v, optionally with classifier-free
+//     guidance from the conditioner's negative beat.
+// Both run on Boogu's INVERTED sigma convention: 0 is pure noise and 1 is
+// clean, so the schedule ASCENDS. That is why neither uses genai::FlowSampler
+// (whose integrators all assume a descending sigma with a terminal 0).
+std::vector<float>
+TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
+                                  int n_real,
+                                  const metal_compute::SharedBuffer& txt_neg,
+                                  int n_real_neg, int gen_h, int gen_w,
+                                  const std::vector<float>* init_packed,
+                                  const std::vector<RefLatent>& refs,
+                                  const std::function<void(
+                                      const std::vector<float>&)>& emit_step)
+    const
+{
+  auto* mc = session()->metal_compute();
+  using metal_compute::SharedBuffer;
+  const int H = gen_h, W = gen_w;
+  const int Z = _boogu_dit->config().in_channels;   // 16 latent channels
+  const int P = _boogu_dit->config().patch;         // 2
+  const int lh = H / 8, lw = W / 8;                 // latent grid (VAE 8x)
+  const int gh = lh / P, gw = lw / P;               // patch-token grid
+  const int img_seq = gh * gw;
+  const int IC = _boogu_dit->config().x_in();       // 64 = 16 * 2 * 2
+  const int OC = _boogu_dit->config().out_channels;
+  if (img_seq <= 0 || (lh % P) != 0 || (lw % P) != 0) {
+    session()->warn(fmt(
+        "TextToImageStage('{}'): {}x{} gives a {}x{} latent, which is not a "
+        "whole number of {}x{} patches -- use multiples of 16",
+        this->id(), W, H, lw, lh, P, P));
+    return {};
+  }
+
+  session()->log_debug(fmt(
+      "TextToImageStage('{}'): Boogu conditioning [{}, txt]; {}x{} latent {}x{} "
+      "grid {}x{} img_seq {}", this->id(), n_real, W, H, lw, lh, gw, gh,
+      img_seq));
+
+  // Schedule. The sampler/scheduler beats win when latched; otherwise the
+  // checkpoint default is the distilled 4-step DMD student.
+  genai::FlowSamplerSpec samp = _sampler_spec;
+  genai::FlowSchedulerSpec sched = _scheduler_spec;
+  if (!_sampler_latched) { samp.method = "dmd"; samp.conditioning_sigma = 0.0; }
+  if (!_scheduler_latched) {
+    sched.type = "boogu_v1";
+    sched.steps = _steps > 0 ? _steps : 4;
+    sched.base_shift = 0.5; sched.max_shift = 1.15;
+    sched.base_seq = 256; sched.max_seq = 4096;
+    sched.seq_len = 4096;
+  }
+  sched.img_seq_len = img_seq;
+  const bool dmd = (samp.method == "dmd");
+  const int S = sched.steps < 1 ? 1 : sched.steps;
+  // DMD builds its own linspace(conditioning_sigma, 1, S+1)[:-1]; the Euler
+  // path takes the shifted schedule (ascending, terminal 1.0).
+  std::vector<double> sig;
+  if (dmd) {
+    sig.resize((std::size_t)S);
+    const double c0 = samp.conditioning_sigma;
+    for (int i = 0; i < S; ++i) {
+      sig[(std::size_t)i] = c0 + (1.0 - c0) * (double)i / (double)S;
+    }
+  } else {
+    if (sched.type != "boogu_v1") {
+      session()->warn(fmt(
+          "TextToImageStage('{}'): scheduler '{}' has a DESCENDING sigma "
+          "convention, which Boogu's does not share; using boogu_v1",
+          this->id(), sched.type));
+      sched.type = "boogu_v1";
+    }
+    sig = sched.sigmas();
+  }
+
+  // Packed latents [img_seq, IC]: a supplied init (repro / golden) or noise.
+  std::vector<float> packed((std::size_t)img_seq * IC);
+  if (init_packed != nullptr && init_packed->size() == packed.size()) {
+    packed = *init_packed;
+  } else {
+    std::mt19937_64 rng(_seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : packed) { v = nd(rng); }
+  }
+  SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
+  if (latbuf.empty()) { return {}; }
+
+  // Reference conditioning: vae-encode hands us [16, rlh, rlw] channel-first;
+  // pack it 2x2 into token-major [rseq, IC] bf16, the same patchify the target
+  // uses. Boogu-Edit takes ONE reference (the model card says so outright) but
+  // the DiT carries image_index_embedding rows for up to max_ref_images, so
+  // extra references are passed through rather than dropped.
+  std::vector<genai::MetalBooguTransformer::RefImage> bri;
+  for (const auto& r : refs) {
+    if (r.empty()) { continue; }
+    if (r.c != Z || (r.h % P) != 0 || (r.w % P) != 0) {
+      session()->warn(fmt(
+          "TextToImageStage('{}'): reference latent [{}, {}, {}] must be "
+          "{}-channel with H/W divisible by {}; ignoring", this->id(), r.c,
+          r.h, r.w, Z, P));
+      continue;
+    }
+    if ((int)bri.size() >= _boogu_dit->config().max_ref_images) {
+      session()->warn(fmt(
+          "TextToImageStage('{}'): more than {} reference images; ignoring the "
+          "rest", this->id(), _boogu_dit->config().max_ref_images));
+      break;
+    }
+    const int rgh = r.h / P, rgw = r.w / P, rseq = rgh * rgw;
+    SharedBuffer rb = mc->make_shared_buffer((std::size_t)rseq * IC * 2);
+    if (rb.empty()) { continue; }
+    auto* d = static_cast<std::uint16_t*>(rb.contents());
+    std::memset(d, 0, rb.byte_size());
+    for (int cc = 0; cc < Z; ++cc) {
+      for (int y = 0; y < r.h; ++y) {
+        for (int x = 0; x < r.w; ++x) {
+          const int a = y / P, ph = y % P, bcol = x / P, pw = x % P;
+          const std::size_t t = (std::size_t)a * rgw + bcol;
+          // Boogu packs "c (h p1) (w p2) -> (h w) (p1 p2 c)": inside a token
+          // the CHANNEL is the fastest axis and the patch offsets the slower
+          // ones. (Getting this transposed still round-trips -- pack and
+          // unpack cancel -- but feeds x_embedder a permuted 64-vector, which
+          // shows up as a 2x2 lattice over an otherwise correct image.)
+          d[t * IC + ((std::size_t)ph * P + pw) * Z + cc] =
+              f32_to_bf16_(r.chw[((std::size_t)cc * r.h + y) * r.w + x]);
+        }
+      }
+    }
+    genai::MetalBooguTransformer::RefImage img;
+    img.latents = std::move(rb);
+    img.seq = rseq; img.grid_h = r.h; img.grid_w = r.w;
+    bri.push_back(std::move(img));
+  }
+  if (!bri.empty()) {
+    session()->info(fmt(
+        "TextToImageStage('{}'): Boogu-Image editing on {} reference image(s)",
+        this->id(), bri.size()));
+  }
+
+  // Classifier-free guidance (Base/Edit only -- the Turbo students are
+  // distilled to guidance 1 and the DMD path forbids it outright). Boogu's
+  // reference pipeline actually runs a THREE-way guidance (text, image and
+  // empty-instruction scales); this is the single-negative reduction the other
+  // families here use, i.e. v = v_neg + scale * (v_pos - v_neg).
+  const bool cfg = !dmd && !txt_neg.empty() && n_real_neg > 0 &&
+                   _guidance_scale != 1.0;
+  if (dmd && _guidance_scale != 1.0) {
+    session()->warn(fmt(
+        "TextToImageStage('{}'): the DMD student is distilled to guidance 1; "
+        "ignoring guidance_scale {}", this->id(), _guidance_scale));
+  }
+  const float gscale = (float)_guidance_scale;
+
+  bool dit_ok = true;
+  auto velocity = [&](const std::vector<float>& cand,
+                      double sigma) -> std::vector<float> {
+    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+    for (std::size_t k = 0; k < cand.size(); ++k) {
+      lb[k] = f32_to_bf16_(cand[k]);
+    }
+    SharedBuffer vel = _boogu_dit->forward_dit(txt_pos, n_real, latbuf, img_seq,
+                                               lh, lw, (float)sigma, bri);
+    if (vel.empty()) { dit_ok = false; return {}; }
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    std::vector<float> v((std::size_t)img_seq * OC);
+    for (std::size_t k = 0; k < v.size(); ++k) { v[k] = bf16_to_f32_(vp[k]); }
+    if (cfg) {
+      SharedBuffer vn = _boogu_dit->forward_dit(txt_neg, n_real_neg, latbuf,
+                                                img_seq, lh, lw, (float)sigma,
+                                                bri);
+      if (vn.empty()) { dit_ok = false; return {}; }
+      const auto* np = static_cast<const std::uint16_t*>(vn.contents());
+      for (std::size_t k = 0; k < v.size(); ++k) {
+        const float neg = bf16_to_f32_(np[k]);
+        v[k] = neg + gscale * (v[k] - neg);
+      }
+    }
+    return v;
+  };
+
+  // Unpack [img_seq, IC] -> channel-first latent [Z, lh, lw], the inverse of
+  // the "(h w) (p1 p2 c)" pack above (channel fastest inside a token).
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)Z * lh * lw);
+    for (int c = 0; c < Z; ++c) {
+      for (int y = 0; y < lh; ++y) {
+        for (int xx = 0; xx < lw; ++xx) {
+          const int a = y / P, ph = y % P, b = xx / P, pw = xx % P;
+          const std::size_t t = (std::size_t)a * gw + b;
+          latent[((std::size_t)c * lh + y) * lw + xx] =
+              pk[t * IC + ((std::size_t)ph * P + pw) * Z + c];
+        }
+      }
+    }
+    return latent;
+  };
+
+  const bool prof = std::getenv("VPIPE_BOOGU_PROFILE") != nullptr;
+  double dit_ms = 0.0;
+  int dit_calls = 0;
+  std::mt19937_64 renoise_rng(samp.seed != 0 ? samp.seed : _seed + 1);
+  std::normal_distribution<float> rnd(0.0f, 1.0f);
+  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
+  int last_pct = -1;
+  const auto gen_t0 = std::chrono::steady_clock::now();
+  denoise_progress_(bar.get(), 0, S, last_pct);
+  for (int i = 0; i < S; ++i) {
+    const double s = sig[(std::size_t)i];
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<float> v = velocity(packed, s);
+    if (prof) {
+      dit_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+      ++dit_calls;
+    }
+    if (!dit_ok) { bar->end(); return {}; }
+    if (dmd) {
+      // Jump to the x0 prediction, then re-noise back down to the next sigma.
+      for (std::size_t k = 0; k < packed.size() && k < v.size(); ++k) {
+        packed[k] += (float)((1.0 - s) * (double)v[k]);
+      }
+      if (i + 1 < S) {
+        const double s1 = sig[(std::size_t)i + 1];
+        for (auto& x : packed) {
+          x = (float)((1.0 - s1) * (double)rnd(renoise_rng) + s1 * (double)x);
+        }
+      }
+    } else {
+      const double dt = sig[(std::size_t)i + 1] - s;
+      for (std::size_t k = 0; k < packed.size() && k < v.size(); ++k) {
+        packed[k] += (float)(dt * (double)v[k]);
+      }
+    }
+    if (emit_step) { emit_step(unpack(packed)); }
+    denoise_progress_(bar.get(), i + 1, S, last_pct);
+  }
+  bar->end();
+  const double gen_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - gen_t0).count();
+  session()->info(fmt(
+      "TextToImageStage('{}'): latent generated in {:.2f}s ({} {} steps, "
+      "{} ms/step)", this->id(), gen_s, S, dmd ? "DMD" : "Euler",
+      S ? (long)(gen_s * 1000.0 / S) : 0));
+  if (prof) {
+    session()->log_normal(fmt(
+        "TextToImageStage('{}'): Boogu DiT {} forward calls, {} ms total, {} "
+        "ms/call (txt {} + img {} = {})", this->id(), dit_calls, (long)dit_ms,
+        dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
+        n_real + img_seq));
+  }
+  return unpack(packed);
+}
+
 std::vector<float>
 TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
                                int n_real,
@@ -1566,6 +2010,20 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
   return unpack(packed);
 }
 
+
+void
+TextToImageStage::tag_model_(TensorBeat& tb) const
+{
+  // `_hf_dir` is the reference the user actually named (a registry key like
+  // "local/Mage-Flow-Edit-Turbo-8bit", or a path), which is the meaningful
+  // identity of the generator -- not the resolved directory.
+  if (_hf_dir.empty()) { return; }
+  FlexData o = tb.sideband.is_object() ? tb.sideband : FlexData::make_object();
+  o.as_object().insert_or_assign("model_name",
+                                 FlexData::make_string(_hf_dir));
+  tb.sideband = std::move(o);
+}
+
 Job
 TextToImageStage::process(RuntimeContext& ctx)
 {
@@ -1585,6 +2043,18 @@ TextToImageStage::process(RuntimeContext& ctx)
   }
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }
+  // Did the conditioner REFUSE this prompt? Read the flag off the beat up
+  // front; the refusal itself is emitted further down, once the output size
+  // is known.
+  bool cond_blocked = false;
+  if (const auto* stb = dynamic_cast<const TensorBeatPayload*>(in.get())) {
+    if (stb->sideband.is_object()) {
+      FlexData sb = stb->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      cond_blocked = o.contains("content_blocked")
+                     && o.at("content_blocked").as_bool(false);
+    }
+  }
   // A prior generation may have freed the FLUX.2 DiT to make room for the
   // vae-decode on a memory-bounded box; reload it now a new prompt arrived.
   if (_family == "flux2" && _dit_unloaded && !_flux2_dit) {
@@ -1599,9 +2069,16 @@ TextToImageStage::process(RuntimeContext& ctx)
         this->id()));
     if (load_krea2_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
+    session()->info(fmt(
+        "TextToImageStage('{}'): reloading the Boogu-Image DiT for the next "
+        "prompt", this->id()));
+    if (load_boogu_dit_()) { _dit_unloaded = false; }
+  }
   const bool have_dit = _family == "flux2" ? (bool)_flux2_dit
       : _family == "qwen-image-edit" ? (bool)_qie_dit
       : _family == "mage-flow" ? (bool)_mage_dit
+      : _family == "boogu-image" ? (bool)_boogu_dit
       : (bool)_dit;
   if (!have_dit) {
     session()->warn(fmt(
@@ -1618,7 +2095,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     co_return;
   }
   metal_compute::SharedBuffer cond = cond_to_shared_(mc, *ctb);
-  if (cond.empty()) {
+  if (cond.empty() && !cond_blocked) {
     session()->warn(fmt(
         "TextToImageStage('{}'): conditioning upload failed; dropping beat",
         this->id()));
@@ -1700,29 +2177,80 @@ TextToImageStage::process(RuntimeContext& ctx)
     }
   }
 
+  // Output size. An explicit width/height ALWAYS wins; only a completely
+  // unconfigured size infers, and then from ref_latent0 -- vae-encode's output
+  // for the source image -- times the family's VAE scale, so an edit comes out
+  // at the source resolution with no size config at all.
+  //
+  // The multiple-of-16 test is the same one initialize() applies to a
+  // configured size. It is vacuous for the 16x families and is the real
+  // constraint for the 8x ones, whose DiTs patchify 2x2 and so need an EVEN
+  // latent grid (Krea-2 and Qwen-Image-Edit both). An odd reference warns and
+  // falls back rather than silently truncating the grid.
   int gen_h = _height, gen_w = _width;
+  if (_infer_size) {
+    const RefLatent& r0 = _ref[0];
+    if (!r0.empty()) {
+      const int s = latent_scale_(_family);
+      const int ih = r0.h * s, iw = r0.w * s;
+      if (ih % 16 == 0 && iw % 16 == 0) {
+        gen_h = ih; gen_w = iw;
+      } else {
+        session()->warn(fmt(
+            "TextToImageStage('{}'): ref_latent0 [{}, {}, {}] implies {}x{}, "
+            "not a multiple of 16 ({}x latent needs an even grid); using "
+            "256x256 -- set width/height", this->id(), r0.c, r0.h, r0.w, iw,
+            ih, s));
+      }
+    }
+    if (gen_h <= 0 || gen_w <= 0) { gen_h = 256; gen_w = 256; }
+    session()->log_debug(fmt(
+        "TextToImageStage('{}'): output size {}x{} ({})", this->id(), gen_w,
+        gen_h, r0.empty() ? "no reference, default" : "from ref_latent0"));
+  }
+  // ---- Content-policy refusal ------------------------------------------
+  // The Mage-Flow conditioner screens every prompt against the model's own
+  // policy classifier and tags a refused one `content_blocked`. Honour it
+  // HERE, once the output size is known and before any DiT work: a refusal
+  // costs no denoise. The beat carries the size explicitly so vae-decode can
+  // paint the blank refusal image without interpreting a latent that was
+  // never generated.
+  //
+  // This is not family-gated: a `content_blocked` beat is refused whatever
+  // produced it. Dropping the beat instead would stall a pipeline waiting on
+  // this stage's oport0, so a refusal still emits.
+  if (cond_blocked) {
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {1, 1, 1};
+    out->resize_contiguous(1);
+    out->as_f32()[0] = 0.0f;
+    FlexData sb = FlexData::make_object();
+    auto o = sb.as_object();
+    o.insert_or_assign("content_blocked", FlexData::make_bool(true));
+    o.insert_or_assign("refusal_height", FlexData::make_int(gen_h));
+    o.insert_or_assign("refusal_width",  FlexData::make_int(gen_w));
+    out->sideband = std::move(sb);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "TextToImageStage('{}'): conditioning refused by the content policy; "
+        "skipping the denoise and emitting a {}x{} refusal", this->id(),
+        gen_w, gen_h));
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
   int lh = gen_h / 8, lw = gen_w / 8;
   std::vector<float> latent;
   const std::vector<float>* latent_ptr = nullptr;
   // Krea-2 img2img: ref latent 0 (the whitened [z_dim, H/8, W/8] vae-encode
-  // output) is mixed into the noise at the strength-selected sigma. With
-  // adopt_latent_dims the output size is taken FROM the latent (the DiT
-  // patchifies 2x2, so H/W must be even). FLUX.2 skips this -- refs are
-  // conditioning tokens, not an init, handled in generate_flux2_.
+  // output) is mixed into the noise at the strength-selected sigma. FLUX.2
+  // skips this -- refs are conditioning tokens, not an init, handled in
+  // generate_flux2_. When the size was inferred above, rr.h/rr.w match lh/lw
+  // by construction.
   if (_family == "krea2" && _strength > 0.0 && !_ref[0].empty()) {
     const RefLatent& rr = _ref[0];
     const bool ok_type = rr.c == 16 && rr.h > 0 && rr.w > 0;
-    if (ok_type && _adopt_latent_dims) {
-      if ((rr.h % 2) == 0 && (rr.w % 2) == 0) {
-        gen_h = rr.h * 8; gen_w = rr.w * 8;
-        lh = rr.h; lw = rr.w;
-      } else {
-        session()->warn(fmt(
-            "TextToImageStage('{}'): adopt_latent_dims: latent [16, {}, {}] "
-            "needs even H and W; keeping {}x{}", this->id(), rr.h, rr.w,
-            _width, _height));
-      }
-    }
     if (ok_type && rr.h == lh && rr.w == lw) {
       latent = rr.chw;
       latent_ptr = &latent;
@@ -1735,7 +2263,8 @@ TextToImageStage::process(RuntimeContext& ctx)
   }
 
   // Latch the sampler / scheduler specs off iport3 / iport4 (once each): the
-  // `sampler-select` / `scheduler-select` sources emit a single spec beat, which
+  // `diffusion-sampler-select` / `scheduler-select` sources emit a single spec
+  // beat, which
   // we cache and reuse for every subsequent prompt.
   if (!_sampler_latched && ctx.num_iports() >= 4 && ctx.iport_connected(3)) {
     auto sb = co_await ctx.read(3);
@@ -1794,6 +2323,7 @@ TextToImageStage::process(RuntimeContext& ctx)
       so->dtype = TensorBeat::DType::F32;
       so->shape = shape;
       so->resize_contiguous(lat.size());
+      tag_model_(*so);
       std::memcpy(so->as_f32(), lat.data(), lat.size() * sizeof(float));
       step_alive = ctx.write_sync(1, std::move(so));
     };
@@ -1826,6 +2356,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     out->shape = {Cdit, fgh, fgw};
     out->resize_contiguous(fl.size());
     std::memcpy(out->as_f32(), fl.data(), fl.size() * sizeof(float));
+    tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "TextToImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
@@ -1860,11 +2391,49 @@ TextToImageStage::process(RuntimeContext& ctx)
     out->shape = {16, lh, lw};
     out->resize_contiguous(ql.size());
     std::memcpy(out->as_f32(), ql.data(), ql.size() * sizeof(float));
+    tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "TextToImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
         "({} steps @ {}x{})", this->id(), lh, lw, _scheduler_spec.steps,
         gen_h, gen_w));
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Boogu-Image: single last-hidden conditioning (the WHOLE templated
+  // sequence) + the NextDiT, with the DMD student's ascending-sigma loop.
+  // The VAE is 8x and the DiT patches 2x2 itself, so the emitted latent is
+  // [16, H/8, W/8] -- the same shape Qwen-Image-Edit emits. ----
+  if (_family == "boogu-image") {
+    std::vector<RefLatent> brefs;
+    if (!_ref[0].empty()) { brefs.push_back(_ref[0]); }
+    if (!_ref[1].empty()) { brefs.push_back(_ref[1]); }
+    _boogu_dit->set_stream_stop(stopping);
+    const std::vector<float> bl =
+        generate_boogu_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
+                        init_ptr, brefs, step_emitter({16, lh, lw}));
+    _boogu_dit->set_stream_stop({});
+    if (bl.empty()) {
+      session()->info(fmt(
+          "TextToImageStage('{}'): Boogu-Image generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {16, lh, lw};
+    out->resize_contiguous(bl.size());
+    std::memcpy(out->as_f32(), bl.data(), bl.size() * sizeof(float));
+    tag_model_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "TextToImageStage('{}'): Boogu-Image latent [16, {}, {}] ({} steps "
+        "@ {}x{})", this->id(), lh, lw, _scheduler_spec.steps, gen_h, gen_w));
+    // Before publishing: on a bounded box the resident DiT would leave the
+    // downstream vae-decode no working set. Freed here, reloaded on the next
+    // prompt (the latent is already read back, so the DiT is idle).
+    free_boogu_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
   }
@@ -1895,6 +2464,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     out->shape = {MC, mgh, mgw};
     out->resize_contiguous(ml.size());
     std::memcpy(out->as_f32(), ml.data(), ml.size() * sizeof(float));
+    tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
         "TextToImageStage('{}'): Mage-Flow latent [{}, {}, {}] ({} steps @ "
@@ -1943,6 +2513,7 @@ TextToImageStage::process(RuntimeContext& ctx)
   out->resize_contiguous(out_latent.size());
   std::memcpy(out->as_f32(), out_latent.data(),
               out_latent.size() * sizeof(float));
+  tag_model_(*out);
   ++_latents_emitted;
   session()->info(fmt(
       "TextToImageStage('{}'): latent [16, {}, {}] ({}+{} {} steps @ "

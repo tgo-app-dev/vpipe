@@ -27,6 +27,7 @@ namespace vpipe::metal_compute { class MetalCompute; }
 namespace vpipe::genai {
 
 struct ModelConfig;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalQwenVisionEncoder {
 public:
@@ -63,11 +64,27 @@ public:
     // injected into the LM at layers 0..N-1. Empty => no deepstack (the tower
     // emits only the final merger tokens). Populated from config_from.
     std::vector<int> deepstack_indexes;
+    // Storage/compute element type for the whole tower: f16 (default) or
+    // bf16. This is a FIDELITY-TO-THE-REFERENCE knob, not an accuracy one --
+    // f16 is ~3x closer to an fp32 oracle than bf16 (0.0142 vs 0.0425 rel-L2
+    // on this tower: bf16 has 8 mantissa bits to f16's 11, and its range
+    // advantage buys nothing when the tower peaks near 2238 against f16's
+    // 65504 ceiling). Set it when the point is to REPRODUCE a reference that
+    // runs bf16 -- Mage-Flow's pipeline casts its whole text encoder, tower
+    // included, so its conditioning carries bf16 tower noise that an f16
+    // tower cannot match no matter how accurate it is.
+    // NOTE: the steel / NAX flash-attention kernels are f16-only, so a bf16
+    // tower falls back to the scalar (or matmul2d) SDPA and is slower.
+    bool use_bf16 = false;
     int head_dim() const { return hidden / n_heads; }   // 64
   };
 
   struct Result {
-    // Native f16 [n_tokens * out_hidden] row-major, on the GPU (UMA).
+    // Native compute-dtype [n_tokens * out_hidden] row-major, on the GPU
+    // (UMA). The ELEMENT TYPE follows the encoder: f16, or bf16 when it was
+    // built with Config::use_bf16 -- ask is_bf16(), do not assume. Both are
+    // 2 bytes, so a consumer that guesses wrong reads plausible-looking
+    // garbage rather than crashing.
     // Splice straight into the LM via prefill_multimodal_metal -- no
     // host f32 round-trip. Empty buffer / n_tokens==0 on failure.
     metal_compute::SharedBuffer embeddings;
@@ -87,6 +104,18 @@ public:
       metal_compute::MetalCompute* mc,
       const Config& cfg);
 
+  // Preferred: the tower lives in the SAME checkpoint directory as the
+  // LM it feeds, so passing the LM's set means the ViT's weights are
+  // cached beside the LM's rather than in a second private mmap of the
+  // same shards. `ws` may be null when cfg.gguf_mmproj names an mmproj
+  // GGUF -- that path reads its own file and has no model dir at all.
+  //
+  // The returned tower KEEPS the set (its tensors are views into it).
+  static std::unique_ptr<MetalQwenVisionEncoder> load(
+      std::shared_ptr<WeightSet> ws,
+      metal_compute::MetalCompute* mc,
+      const Config& cfg);
+
   // Derive the ViT Config from a parsed ModelConfig's vision_config so
   // the tower self-sizes to any family member (the 9B ViT is depth 27 /
   // hidden 1152 / out_hidden 4096 vs the 4B's 24 / 1024 / 2560). Single
@@ -97,6 +126,10 @@ public:
   Result encode(const std::uint8_t* rgb, int H, int W);
 
   const Config& config() const { return _cfg; }
+  // The element type of Result::embeddings / deepstack (and of every weight
+  // buffer). Reflects the A/B env overrides too, so it is the truth rather
+  // than a restatement of Config::use_bf16.
+  bool is_bf16() const noexcept { return _bf16; }
 
   // Attach a session so encode() is recorded on the profiler's LLM lane
   // (vision-tower category) when no CoreML tower is configured and the
@@ -137,8 +170,25 @@ private:
   // MLX's matrix-core (NAX) steel flash attention -- the kernel MLX itself
   // dispatches on M5 (attn_steel_nax, bq=64/bk=32, register-resident softmax).
   // The preferred steel path when available; the ALU _lib_attn steel is the
-  // M4 fallback. _use_attn_nax gates it (supports_matrix_cores + hd==64).
+  // M4 fallback. _use_attn_nax gates it (supports_matrix_cores + a usable bd).
   bool _use_attn_nax = false;
+  // ZERO-PAD width for the attention head dim, or 0 for native. The flash
+  // kernels are instantiated at bd64 / bd120 / bd128 only, so a tower whose
+  // head_dim is none of those (Qwen3-VL 8B/9B: hidden 1152 / 16 heads = 72)
+  // had NO flash kernel at all and fell to the scalar O(n^2) sdpa across every
+  // block. Padding q/k/v out to bd128 with zeros is exact -- zero lanes add
+  // nothing to the QK dot, and the widened V's padding columns are dropped on
+  // the way back -- and it is the same trick the Boogu DiT uses for its
+  // head_dim 120 (see kPadAttn there, where the padded route also measured
+  // FASTER than a native bd120 instantiation, because the pad buys aligned
+  // block loads). `scale` stays 1/sqrt(head_dim), not 1/sqrt(128).
+  // VPIPE_QWEN_VISION_NO_ATTN_PAD forces the scalar path back.
+  int _attn_pad_d = 0;
+  metal_compute::ComputeFunction _fn_tr_pad, _fn_tr_unpad;
+  // Config::use_bf16, cached: selects the _bf16 metallibs and the host-side
+  // float <-> storage conversions. The kernels' ENTRY-POINT names are
+  // unchanged (they keep their _f16 suffix); only the library differs.
+  bool _bf16 = false;
   // Steel flash-attention (MMA) param block; the per-encode pipeline (with
   // align/causal function constants) is created in encode() from _lib_attn.
   metal_compute::SharedBuffer _attn_params;
@@ -157,6 +207,10 @@ private:
   std::vector<DsMerger> _ds;
   std::vector<float> _rope_inv_freq;           // [head_dim/4]
   int _feat_dim = 0;                           // temporal*patch*patch*3
+  // The checkpoint, held for this tower's whole life: every weight above
+  // is either an alias of a buffer the set owns or a view into its mmap.
+  // Null on the GGUF-mmproj path, which owns its tensors outright.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

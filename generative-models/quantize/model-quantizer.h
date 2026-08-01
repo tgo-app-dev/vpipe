@@ -31,6 +31,13 @@ struct QuantizeOptions {
   // the (precision-sensitive) vision/audio towers bf16, or scope "visual." to
   // quantize just the vision tower. Empty (default) => the whole model.
   std::string quant_scope;
+  // Tensors whose NAME contains any of these substrings are NEVER quantized
+  // (they pass through at their source dtype) even when their leaf is in
+  // `quant_linears`. Needed when a family reuses one leaf name for both a big
+  // block Linear and a small precision-sensitive head -- Boogu-Image's
+  // feed_forward.linear_1/2/3 share leaves with its norm_out.linear_1/2 and
+  // time_caption_embed.timestep_embedder.linear_1/2, which must stay bf16.
+  std::vector<std::string> quant_exclude;
   // Broadened leaf rule for a scoped submodule: when true (with quant_scope
   // set), quantize EVERY 2D fp weight in scope whose leaf is not a norm /
   // embedding (ignore quant_linears). Vision/audio towers name their linears

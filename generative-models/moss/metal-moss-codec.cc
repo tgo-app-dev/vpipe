@@ -1,6 +1,7 @@
 #include "generative-models/moss/metal-moss-codec.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -63,11 +64,19 @@ std::size_t numel_(const std::vector<std::int64_t>& s) {
 }
 // Convert an F32 checkpoint tensor to an f16 SharedBuffer (same row-major
 // layout). Empty on a missing tensor.
-SharedBuffer to_f16_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
+// UNCACHED on purpose, here and in the two folds below: this codec's
+// int8 mode quantizes each of these on the GPU and then FREES the f16
+// source (see store_qw), so retaining them in the set would hold a full
+// f16 copy of the model next to the int8 one it just built. This codec
+// also has its own on-disk converted-weight cache, which covers the
+// repeat-load case a memory cache would. What going through the set
+// still buys is that the checkpoint is opened once and the manager can
+// see it.
+SharedBuffer to_f16_(WeightSet& wts, metal_compute::MetalCompute* mc,
                      const std::string& name) {
-  const auto* info = wts.info(name);
+  const auto* info = wts.src().info(name);
   if (info == nullptr) { return {}; }
-  SharedBuffer src = wts.load(name, mc);
+  SharedBuffer src = wts.read(name, mc, WeightSet::Residency::Copied);
   if (src.empty()) { return {}; }
   const std::size_t n = numel_(info->shape);
   SharedBuffer out = mc->make_shared_buffer(n * 2);
@@ -78,15 +87,16 @@ SharedBuffer to_f16_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* 
 }
 // to_f16 with each output ROW scaled by scale[row] (folds a per-channel
 // LayerScale into the projection weight: weight is [out, in], scale is [out]).
-SharedBuffer to_f16_rowscale_(const MetalLlamaWeights& wts,
+SharedBuffer to_f16_rowscale_(WeightSet& wts,
                               metal_compute::MetalCompute* mc,
                               const std::string& wname,
                               const std::string& sname) {
-  const auto* wi = wts.info(wname);
-  const auto* si = wts.info(sname);
+  const auto* wi = wts.src().info(wname);
+  const auto* si = wts.src().info(sname);
   if (wi == nullptr || si == nullptr || wi->shape.size() != 2) { return {}; }
   const int out = (int)wi->shape[0], in = (int)wi->shape[1];
-  SharedBuffer ws = wts.load(wname, mc), ss = wts.load(sname, mc);
+  const auto cp = WeightSet::Residency::Copied;
+  SharedBuffer ws = wts.read(wname, mc, cp), ss = wts.read(sname, mc, cp);
   if (ws.empty() || ss.empty()) { return {}; }
   SharedBuffer o = mc->make_shared_buffer((std::size_t)out * in * 2);
   const auto* w = static_cast<const float*>(ws.contents());
@@ -102,16 +112,17 @@ SharedBuffer to_f16_rowscale_(const MetalLlamaWeights& wts,
 // Fold a weight-normalized 1x1 conv (kernel_size 1) into a plain [out,in]
 // f16 matrix: w_eff[o,i] = g[o] * v[o,i] / ||v[o,:]||_2  (parametrizations
 // original0=g [out,1,1], original1=v [out,in,1]).
-SharedBuffer fold_wnconv_(const MetalLlamaWeights& wts,
+SharedBuffer fold_wnconv_(WeightSet& wts,
                           metal_compute::MetalCompute* mc,
                           const std::string& prefix) {
   const std::string gn = prefix + ".parametrizations.weight.original0";
   const std::string vn = prefix + ".parametrizations.weight.original1";
-  const auto* vi = wts.info(vn);
-  const auto* gi = wts.info(gn);
+  const auto* vi = wts.src().info(vn);
+  const auto* gi = wts.src().info(gn);
   if (vi == nullptr || gi == nullptr || vi->shape.size() < 2) { return {}; }
   const int out = (int)vi->shape[0], in = (int)vi->shape[1];
-  SharedBuffer vs = wts.load(vn, mc), gs = wts.load(gn, mc);
+  const auto cp = WeightSet::Residency::Copied;
+  SharedBuffer vs = wts.read(vn, mc, cp), gs = wts.read(gn, mc, cp);
   if (vs.empty() || gs.empty()) { return {}; }
   const auto* v = static_cast<const float*>(vs.contents());
   const auto* g = static_cast<const float*>(gs.contents());
@@ -137,6 +148,26 @@ std::unique_ptr<MetalMossCodec>
 MetalMossCodec::load(const std::string& model_dir,
                      metal_compute::MetalCompute* mc, bool int8,
                      bool with_encoder) {
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open. Opened
+  // LAZILY below -- the on-disk weight cache can make it unnecessary.
+  return load_(model_dir, nullptr, mc, int8, with_encoder);
+}
+
+std::unique_ptr<MetalMossCodec>
+MetalMossCodec::load(std::shared_ptr<WeightSet> ws,
+                     metal_compute::MetalCompute* mc, bool int8,
+                     bool with_encoder) {
+  if (ws == nullptr) { return nullptr; }
+  const std::string dir = ws->dir();
+  return load_(dir, std::move(ws), mc, int8, with_encoder);
+}
+
+std::unique_ptr<MetalMossCodec>
+MetalMossCodec::load_(const std::string& model_dir,
+                      std::shared_ptr<WeightSet> ws_in,
+                      metal_compute::MetalCompute* mc, bool int8,
+                      bool with_encoder) {
   if (mc == nullptr || !mc->valid()) { return nullptr; }
   auto self = std::unique_ptr<MetalMossCodec>(new MetalMossCodec());
   self->_mc = mc;
@@ -320,9 +351,10 @@ MetalMossCodec::load(const std::string& model_dir,
   }
 
   if (!from_cache) {
-    auto wts_opt = MetalLlamaWeights::open_model(model_dir);
-    if (!wts_opt) { return nullptr; }
-    const MetalLlamaWeights& wts = *wts_opt;
+    // Only now is the checkpoint needed: a cache hit above never opens it.
+    if (ws_in == nullptr) { ws_in = WeightSet::open(model_dir, nullptr); }
+    if (ws_in == nullptr) { return nullptr; }
+    WeightSet& wts = *ws_in;
 
     // Store an f16 GEMM weight into a QuantWeight slot (N/K preset): f16 mode
     // keeps it as-is; int8 mode quantizes to uint8 g32 on the GPU and frees

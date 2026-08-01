@@ -39,6 +39,13 @@ public:
   // The metal exec owns its own KV-page pool keyed by ContextId.
   bool owns_kv() const noexcept override { return true; }
 
+  // This exec keeps its own paged KV; report what it has grown to.
+  std::size_t kv_bytes() const override
+  {
+    auto* cm = _model ? _model->context_manager() : nullptr;
+    return cm != nullptr ? cm->resident_bytes() : 0;
+  }
+
   std::int32_t
   prefill(ContextId ctx, std::span<const std::int32_t> tokens) override;
   std::int32_t decode_one(ContextId ctx, std::int32_t id) override;

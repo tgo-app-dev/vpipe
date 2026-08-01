@@ -2,6 +2,7 @@
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
@@ -92,12 +93,22 @@ MetalGemma4VisionEncoder::load(const std::string& model_dir,
                                metal_compute::MetalCompute* mc,
                                const Config& cfg)
 {
-  if (mc == nullptr || !mc->valid()) { return nullptr; }
-  auto wts = MetalLlamaWeights::open_model(model_dir);
-  if (!wts) { return nullptr; }
+  // No session to ask, so this opens a PRIVATE set: correct, just not
+  // shared with whatever else has the same checkpoint open.
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+std::unique_ptr<MetalGemma4VisionEncoder>
+MetalGemma4VisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
+                               metal_compute::MetalCompute* mc,
+                               const Config& cfg)
+{
+  if (mc == nullptr || !mc->valid() || ws_in == nullptr) { return nullptr; }
+  WeightSet* wts = ws_in.get();
 
   auto m =
       std::unique_ptr<MetalGemma4VisionEncoder>(new MetalGemma4VisionEncoder());
+  m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
 
@@ -157,27 +168,37 @@ MetalGemma4VisionEncoder::load(const std::string& model_dir,
     return nullptr;
   }
 
+  // Cache namespace for this encoder's derived tensors.
+  const std::string dk = "gemma4-vit/";
   auto to_f16 = [&](const std::string& name) -> SharedBuffer {
-    const auto* info = wts->info(name);
+    const auto* info = wts->src().info(name);
     if (info == nullptr) { return {}; }
-    if (info->dtype == "F16") { return wts->load(name, mc); }
-    SharedBuffer raw = wts->load(name, mc);
-    if (raw.empty()) { return {}; }
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<_Float16*>(out.contents());
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) {
-        o[i] = (_Float16)bf16_to_f32_(s[i]);
-      }
-    } else if (info->dtype == "F32") {
-      const auto* s = static_cast<const float*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
-    } else {
-      return {};
+    // Already f16: the checkpoint's own bytes. Copied, not Mapped --
+    // mapping wraps the whole shard, which this tower shares with the
+    // LM, and the LM loads by copy.
+    if (info->dtype == "F16") {
+      return wts->tensor(name, mc, WeightSet::Residency::Copied);
     }
-    return out;
+    return wts->derived(dk + name, [&]() -> SharedBuffer {
+      // Uncached: consumed by the conversion and dropped.
+      SharedBuffer raw = wts->read(name, mc, WeightSet::Residency::Copied);
+      if (raw.empty()) { return {}; }
+      const std::size_t n = numel_(info->shape);
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      auto* o = static_cast<_Float16*>(out.contents());
+      if (info->dtype == "BF16") {
+        const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          o[i] = (_Float16)bf16_to_f32_(s[i]);
+        }
+      } else if (info->dtype == "F32") {
+        const auto* s = static_cast<const float*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) { o[i] = (_Float16)s[i]; }
+      } else {
+        return {};
+      }
+      return out;
+    });
   };
 
   const std::string r = "vision_tower.";
@@ -210,7 +231,8 @@ MetalGemma4VisionEncoder::load(const std::string& model_dir,
 
   // embed_vision: 4-bit affine projection (weight u32 raw; scales/biases
   // bf16 -> f16).
-  m->_ev_w = wts->load("embed_vision.embedding_projection.weight", mc);
+  m->_ev_w = wts->tensor("embed_vision.embedding_projection.weight", mc,
+                         WeightSet::Residency::Copied);
   m->_ev_s = to_f16("embed_vision.embedding_projection.scales");
   m->_ev_b = to_f16("embed_vision.embedding_projection.biases");
   ok = ok && !m->_ev_w.empty() && !m->_ev_s.empty() && !m->_ev_b.empty();

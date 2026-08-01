@@ -28,6 +28,7 @@ class ComputeEncoder;
 namespace vpipe::genai {
 
 class MetalLlamaWeights;
+class WeightSet;       // generative-models/weight-set.h
 
 class MetalMossLocalTransformer {
 public:
@@ -46,8 +47,12 @@ public:
       const std::string& model_dir, metal_compute::MetalCompute* mc,
       const Config& cfg);
 
+  // Preferred: takes the caller's already-open checkpoint, so the depth
+  // transformer shares it with the model that wraps it.
+  //
+  // The returned transformer KEEPS the set (its tensors come from it).
   static std::unique_ptr<MetalMossLocalTransformer> load(
-      const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
+      std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
       const Config& cfg);
 
   // Clear the per-frame KV cache (call before each frame's codebook loop).
@@ -74,7 +79,8 @@ public:
   int pos() const { return _pos; }
 
 private:
-  bool init_(const MetalLlamaWeights& wts, metal_compute::MetalCompute* mc,
+  bool init_(const std::shared_ptr<WeightSet>& ws,
+             metal_compute::MetalCompute* mc,
              const Config& cfg);
 
   metal_compute::MetalCompute* _mc = nullptr;
@@ -96,6 +102,8 @@ private:
   metal_compute::ComputeLibrary  _lib_vis, _lib_dense, _lib_elt, _lib_rope;
   metal_compute::ComputeFunction _fn_ln, _fn_gemv, _fn_bias, _fn_residual;
   metal_compute::ComputeFunction _fn_silu, _fn_rope, _fn_attn;
+  // The checkpoint, held for this transformer's whole life.
+  std::shared_ptr<WeightSet> _ws;
 };
 
 }  // namespace vpipe::genai

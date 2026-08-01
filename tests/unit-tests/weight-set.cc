@@ -1,0 +1,904 @@
+// weight-set.cc -- the manager-owned view of a checkpoint's weights.
+//
+// What is under test is the contract models depend on: ask for the same
+// directory and get the same set (so its weights are loaded once and
+// reference-counted), ask for the same tensor and get aliases of ONE
+// buffer (so two models over one checkpoint share bytes rather than
+// copy them), and load a part only when something actually needs it.
+//
+// The fixture writes its own tiny safetensors file, so these run
+// everywhere rather than skipping on a missing model.
+//
+//   vpipe_test --filter '*weight_set*'
+
+#include "minitest.h"
+
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/session.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/weight-set.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <unistd.h>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+using namespace vpipe;
+using namespace vpipe::genai;
+using vpipe::metal_compute::MetalCompute;
+using vpipe::metal_compute::SharedBuffer;
+
+namespace {
+
+MetalCompute*
+mc_(Session& s)
+{
+  MetalCompute* mc = s.metal_compute();
+  return (mc != nullptr && mc->valid()) ? mc : nullptr;
+}
+
+// A throwaway model directory holding one `model.safetensors` with two
+// f32 tensors, "trunk.w" [4] and "encoder.w" [8]. Deleted on scope exit.
+//
+// Both tensors sit at 16-aligned file offsets and the header is padded so
+// the data blob starts 16-aligned, because load_mapped() only takes the
+// zero-copy path for bind-aligned offsets -- an unaligned fixture would
+// silently test the copying fallback instead.
+class TempCheckpoint {
+public:
+  TempCheckpoint()
+  {
+    namespace fs = std::filesystem;
+    _dir = (fs::temp_directory_path() /
+            ("vpipe-ws-test-" + to_string(::getpid()) + "-" +
+             to_string(next_id_()))).string();
+    fs::create_directories(_dir);
+
+    for (int i = 0; i < 4; ++i) { _trunk[i] = 1.0f + (float)i; }
+    for (int i = 0; i < 8; ++i) { _enc[i] = 100.0f + (float)i; }
+
+    string hdr =
+        "{\"trunk.w\":{\"dtype\":\"F32\",\"shape\":[4],"
+        "\"data_offsets\":[0,16]},"
+        "\"encoder.w\":{\"dtype\":\"F32\",\"shape\":[8],"
+        "\"data_offsets\":[16,48]}}";
+    while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
+
+    ofstream out(_dir + "/model.safetensors", ios::binary);
+    const uint64_t n = hdr.size();
+    out.write(reinterpret_cast<const char*>(&n), 8);
+    out.write(hdr.data(), (streamsize)hdr.size());
+    out.write(reinterpret_cast<const char*>(_trunk), 16);
+    out.write(reinterpret_cast<const char*>(_enc), 32);
+  }
+
+  ~TempCheckpoint()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+
+  const string& dir() const { return _dir; }
+  const float*  trunk() const { return _trunk; }
+  const float*  enc() const { return _enc; }
+
+private:
+  static int next_id_()
+  {
+    static int n = 0;
+    return ++n;
+  }
+
+  string _dir;
+  float  _trunk[4]{};
+  float  _enc[8]{};
+};
+
+// A checkpoint with ONE realistically-sized tensor, for measuring the
+// streaming path. The 32-byte tensors above are useless for that: the
+// per-read fixed costs swamp the memcpy, so the measurement says nothing
+// about how a real DiT block behaves.
+class BigCheckpoint {
+public:
+  explicit BigCheckpoint(std::size_t floats)
+  {
+    namespace fs = std::filesystem;
+    _dir = (fs::temp_directory_path() /
+            ("vpipe-ws-big-" + to_string(::getpid()) + "-" +
+             to_string(next_id_()))).string();
+    fs::create_directories(_dir);
+    std::vector<float> v(floats);
+    for (std::size_t i = 0; i < floats; ++i) { v[i] = (float)(i & 0xffff); }
+    const std::size_t nbytes = floats * 4;
+
+    string hdr = "{\"block.w\":{\"dtype\":\"F32\",\"shape\":[" +
+                 to_string(floats) + "],\"data_offsets\":[0," +
+                 to_string(nbytes) + "]}}";
+    while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
+    ofstream out(_dir + "/model.safetensors", ios::binary);
+    const uint64_t n = hdr.size();
+    out.write(reinterpret_cast<const char*>(&n), 8);
+    out.write(hdr.data(), (streamsize)hdr.size());
+    out.write(reinterpret_cast<const char*>(v.data()), (streamsize)nbytes);
+  }
+
+  ~BigCheckpoint()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+  const string& dir() const { return _dir; }
+
+private:
+  static int next_id_()
+  {
+    static int n = 1000;
+    return ++n;
+  }
+  string _dir;
+};
+
+}  // namespace
+
+// Two callers naming one directory get the SAME set -- the whole basis
+// of "the second stage bumps a reference count instead of loading".
+TEST(weight_set, manager_dedups_by_directory) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto a = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(a != nullptr);
+  auto b = mgr->weight_set(ck.dir());
+  EXPECT_TRUE(a == b);                     // same object, not just equal
+  EXPECT_TRUE(mgr->weight_set_count() == 1u);
+
+  // A different directory is a different model, even in the same family.
+  TempCheckpoint other;
+  auto c = mgr->weight_set(other.dir());
+  ASSERT_TRUE(c != nullptr);
+  EXPECT_TRUE(c != a);
+  EXPECT_TRUE(mgr->weight_set_count() == 2u);
+}
+
+// The cache holds WEAK references, so the checkpoint is unmapped when the
+// last MODEL using it goes away -- not when the first one does.
+TEST(weight_set, dies_with_its_last_holder) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck;
+
+  {
+    auto a = mgr->weight_set(ck.dir());
+    ASSERT_TRUE(a != nullptr);
+    {
+      auto b = mgr->weight_set(ck.dir());
+      EXPECT_TRUE(b == a);
+    }
+    // One holder dropped; the peer keeps it alive.
+    EXPECT_TRUE(mgr->weight_set_count() == 1u);
+  }
+  EXPECT_TRUE(mgr->weight_set_count() == 0u);
+}
+
+// Repeat requests for a tensor return ALIASES of one buffer: same GPU
+// allocation, same bytes, loaded once. This is the dedup that made the
+// old model-level attempt unnecessary -- and it does not care which
+// caller asked first.
+TEST(weight_set, tensor_hands_out_aliases_of_one_buffer) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer a = ws->tensor("trunk.w", mc);
+  SharedBuffer b = ws->tensor("trunk.w", mc);
+  ASSERT_TRUE(!a.empty());
+  ASSERT_TRUE(!b.empty());
+  EXPECT_TRUE(a.mtl_buffer() == b.mtl_buffer());
+  EXPECT_TRUE(a.contents() == b.contents());
+  EXPECT_TRUE(a.byte_size() == 16u);
+  // One cache entry, not two: the second request cost nothing.
+  EXPECT_TRUE(ws->stats().entries == 1u);
+
+  const auto* v = static_cast<const float*>(a.contents());
+  EXPECT_TRUE(v[0] == ck.trunk()[0]);
+  EXPECT_TRUE(v[3] == ck.trunk()[3]);
+}
+
+// An alias must NOT be counted as owning the bytes, or a model that holds
+// several would report multiples of its real footprint -- and parking one
+// would evict memory it does not own.
+TEST(weight_set, aliases_do_not_own_the_allocation) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  SharedBuffer a = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+  EXPECT_FALSE(a.is_owned());
+  EXPECT_FALSE(a.mark_inactive());       // declines: not ours to park
+}
+
+// A mapped tensor aliases the mmap (no copy); a copied one is an owned
+// allocation the residency policy can park. Both must read correctly --
+// the distinction is about WHERE the bytes live, not what they are.
+TEST(weight_set, mapped_and_copied_both_read_correctly) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto mapped = WeightSet::open(ck.dir(), nullptr);
+  auto copied = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(mapped != nullptr);
+  ASSERT_TRUE(copied != nullptr);
+
+  SharedBuffer m = mapped->tensor("encoder.w", mc);
+  SharedBuffer c = copied->tensor("encoder.w", mc,
+                                  WeightSet::Residency::Copied);
+  ASSERT_TRUE(!m.empty());
+  ASSERT_TRUE(!c.empty());
+  const auto* mv = static_cast<const float*>(m.contents());
+  const auto* cv = static_cast<const float*>(c.contents());
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_TRUE(mv[i] == ck.enc()[i]);
+    EXPECT_TRUE(cv[i] == ck.enc()[i]);
+  }
+  // The mapped one is a view into the shard wrap and never owns bytes,
+  // so only the copied set reports parkable (owned) bytes.
+  EXPECT_TRUE(mapped->stats().mapped_bytes == 32u);
+  EXPECT_TRUE(copied->stats().copied_bytes == 32u);
+}
+
+// A derived tensor -- one the model TRANSFORMS rather than copies -- is
+// built once and shared thereafter. Two models over a checkpoint pay for
+// the transform once between them.
+TEST(weight_set, derived_builds_once_and_is_shared) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  int builds = 0;
+  auto build = [&]() -> SharedBuffer {
+    ++builds;
+    SharedBuffer b = mc->make_shared_buffer(16);
+    static_cast<float*>(b.contents())[0] = 42.0f;
+    return b;
+  };
+
+  SharedBuffer a = ws->derived("t/flat|trunk.w", build);
+  SharedBuffer b = ws->derived("t/flat|trunk.w", build);
+  ASSERT_TRUE(!a.empty());
+  EXPECT_TRUE(builds == 1);
+  EXPECT_TRUE(a.mtl_buffer() == b.mtl_buffer());
+  EXPECT_TRUE(static_cast<const float*>(b.contents())[0] == 42.0f);
+
+  // A different transform over the same tensor is a DIFFERENT entry: the
+  // key names the transform, so two models whose configs disagree cannot
+  // pick up each other's bytes.
+  SharedBuffer c = ws->derived("t/hwio|trunk.w", build);
+  EXPECT_TRUE(builds == 2);
+  EXPECT_TRUE(c.mtl_buffer() != a.mtl_buffer());
+}
+
+// A derived tensor has no retained transform to rebuild it with, so it
+// must NOT be offered for parking -- a reclaimed one would be
+// unrecoverable. Only named, re-readable tensors are.
+TEST(weight_set, only_reloadable_tensors_are_offered_for_parking) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);   // reloadable
+  ws->tensor("encoder.w", mc);                               // mapped
+  ws->derived("t/x", [&]() { return mc->make_shared_buffer(16); });
+
+  int offered = 0;
+  ws->for_each_weight([&offered](SharedBuffer&) { ++offered; });
+  EXPECT_TRUE(offered == 1);
+}
+
+// Block streaming must NOT cache. A memory-bounded DiT re-reads every
+// block per forward precisely so the set does not hold them; caching one
+// would put the whole model back in RAM on the box least able to take
+// it, and it would do so silently.
+TEST(weight_set, streaming_reads_are_never_retained) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer a = ws->stream_tensor("encoder.w", mc);
+  SharedBuffer b = ws->stream_tensor("encoder.w", mc);
+  ASSERT_TRUE(!a.empty());
+  ASSERT_TRUE(!b.empty());
+  // Nothing retained, and nothing shared between the two reads.
+  EXPECT_TRUE(ws->stats().entries == 0u);
+  EXPECT_TRUE(ws->stats().bytes == 0u);
+  // The bytes are still correct -- uncached, not unread.
+  const auto* v = static_cast<const float*>(a.contents());
+  EXPECT_TRUE(v[0] == ck.enc()[0]);
+
+  // Counted as streaming throughput, which is how the manager sees what
+  // a bounded model is paying to stay small.
+  EXPECT_TRUE(ws->stats().streamed_reads == 2u);
+  EXPECT_TRUE(ws->stats().streamed_bytes == 64u);
+
+  int builds = 0;
+  auto d = ws->stream_derived([&]() {
+    ++builds;
+    return mc->make_shared_buffer(16);
+  });
+  ASSERT_TRUE(!d.empty());
+  ws->stream_derived([&]() {
+    ++builds;
+    return mc->make_shared_buffer(16);
+  });
+  EXPECT_TRUE(builds == 2);            // rebuilt, never cached
+  EXPECT_TRUE(ws->stats().entries == 0u);
+  EXPECT_TRUE(ws->stats().streamed_reads == 4u);
+}
+
+// A tensor read BOTH ways keeps the two paths separate: streaming must
+// not be satisfied from the cache, and must not populate it either.
+TEST(weight_set, streaming_and_caching_do_not_cross_over) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer cached = ws->tensor("trunk.w", mc);
+  SharedBuffer streamed = ws->stream_tensor("trunk.w", mc);
+  ASSERT_TRUE(!cached.empty());
+  ASSERT_TRUE(!streamed.empty());
+  EXPECT_TRUE(ws->stats().entries == 1u);       // only the cached one
+  EXPECT_TRUE(ws->stats().streamed_reads == 1u);
+  // Same bytes, independent handles.
+  EXPECT_TRUE(static_cast<const float*>(streamed.contents())[0]
+              == ck.trunk()[0]);
+}
+
+// The part machinery behind "no reference image => no VAE encoder": a
+// part loads at most once, reports ready, and releases on demand.
+TEST(weight_set, part_loads_once_and_releases) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  ws->tensor("trunk.w", mc);                        // trunk, no part
+
+  EXPECT_FALSE(ws->part_ready("encoder"));
+
+  int loads = 0;
+  auto load = [&]() {
+    ++loads;
+    return !ws->tensor("encoder.w", mc, WeightSet::Residency::Copied,
+                       "encoder").empty();
+  };
+  EXPECT_TRUE(ws->ensure_part("encoder", load));
+  EXPECT_TRUE(ws->ensure_part("encoder", load));   // cached, not re-run
+  EXPECT_TRUE(loads == 1);
+  EXPECT_TRUE(ws->part_ready("encoder"));
+  EXPECT_TRUE(ws->stats().entries == 2u);
+
+  // Releasing drops the part's tensors and lets it load again; the trunk
+  // is untouched.
+  EXPECT_TRUE(ws->release_part("encoder") == 32u);
+  EXPECT_FALSE(ws->part_ready("encoder"));
+  EXPECT_TRUE(ws->stats().entries == 1u);
+  EXPECT_TRUE(ws->ensure_part("encoder", load));
+  EXPECT_TRUE(loads == 2);
+}
+
+// A part nobody asks for is never read. This is the requirement stated
+// as "no load of the VAE encoder happens if there is no reference image
+// input" -- the encoder's bytes stay on disk.
+TEST(weight_set, an_unrequested_part_is_never_loaded) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  ws->tensor("trunk.w", mc);
+
+  EXPECT_FALSE(ws->part_ready("encoder"));
+  EXPECT_TRUE(ws->stats().parts == 0u);
+  EXPECT_TRUE(ws->stats().entries == 1u);
+  EXPECT_TRUE(ws->stats().bytes == 16u);
+}
+
+// Restoring reclaimed weights must write back into the EXISTING
+// allocation: models hold aliases of it, and replacing the buffer would
+// leave every one of them pointing at bytes nothing refreshes.
+TEST(weight_set, reload_restores_in_place) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  SharedBuffer alias =
+      ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!alias.empty());
+  auto* held = static_cast<float*>(alias.contents());
+
+  // Stand in for a purge: scribble over the contents, then reload.
+  held[0] = -1.0f;
+  held[3] = -1.0f;
+  EXPECT_TRUE(ws->reload_weights());
+  // The ALIAS -- not a fresh handle -- sees the restored bytes, which is
+  // the property a live model depends on.
+  EXPECT_TRUE(held[0] == ck.trunk()[0]);
+  EXPECT_TRUE(held[3] == ck.trunk()[3]);
+  EXPECT_TRUE(static_cast<float*>(alias.contents()) == held);
+}
+
+// A missing tensor is empty, not a crash or a zero-filled buffer that
+// would read as plausible weights.
+TEST(weight_set, missing_tensor_is_empty) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  EXPECT_FALSE(ws->has("nope.w"));
+  EXPECT_TRUE(ws->tensor("nope.w", mc).empty());
+  EXPECT_TRUE(ws->stats().entries == 0u);
+}
+
+// The manager can say what is resident: which checkpoint, how much of
+// it, how much is OS-reclaimable versus owned, and how many models are
+// keeping it alive. Routing loads through the manager is what makes
+// that question answerable at all.
+TEST(weight_set, manager_reports_what_is_resident) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  auto* mgr = s.generative_model_manager();
+  if (mc == nullptr || mgr == nullptr) { return; }
+  TempCheckpoint ck;
+
+  EXPECT_TRUE(mgr->weight_report().empty());
+
+  auto a = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(a != nullptr);
+  a->tensor("trunk.w", mc);                              // mapped
+  a->tensor("encoder.w", mc, WeightSet::Residency::Copied, "encoder");
+  a->ensure_part("encoder", []() { return true; });
+
+  auto rep = mgr->weight_report();
+  ASSERT_TRUE(rep.size() == 1u);
+  EXPECT_TRUE(rep[0].dir == a->dir());
+  EXPECT_TRUE(rep[0].tensors == 2u);
+  EXPECT_TRUE(rep[0].bytes == 48u);
+  EXPECT_TRUE(rep[0].mapped_bytes == 16u);
+  EXPECT_TRUE(rep[0].copied_bytes == 32u);
+  EXPECT_TRUE(rep[0].parts == 1u);
+  EXPECT_TRUE(rep[0].holders == 1);          // just `a`
+
+  {
+    auto b = mgr->weight_set(ck.dir());
+    (void)b;
+    EXPECT_TRUE(mgr->weight_report()[0].holders == 2);
+  }
+  EXPECT_TRUE(mgr->weight_report()[0].holders == 1);
+}
+
+// A directory with no checkpoint fails cleanly rather than producing a
+// set that yields empty tensors forever.
+TEST(weight_set, open_fails_on_a_directory_with_no_checkpoint) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const string dir =
+      (fs::temp_directory_path() / "vpipe-ws-empty-test").string();
+  fs::create_directories(dir);
+  EXPECT_TRUE(WeightSet::open(dir, nullptr) == nullptr);
+  EXPECT_TRUE(mgr->weight_set(dir) == nullptr);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// open_weight_set() is what models actually call. Given a session it must
+// hand back the manager's set -- that is the whole dedup mechanism, and a
+// model that quietly got a private one instead would still WORK, just
+// with a second copy of the weights nobody could see. So assert identity
+// with the manager's own lookup, not merely that a set came back.
+TEST(weight_set, open_weight_set_returns_the_managers_set) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto a = open_weight_set(ck.dir(), &s);
+  ASSERT_TRUE(a != nullptr);
+  EXPECT_TRUE(a == mgr->weight_set(ck.dir()));   // same object
+  EXPECT_TRUE(mgr->weight_set_count() == 1u);
+
+  // A second caller naming the same directory joins the first rather
+  // than opening the checkpoint again.
+  auto b = open_weight_set(ck.dir(), &s);
+  EXPECT_TRUE(b == a);
+  EXPECT_TRUE(mgr->weight_set_count() == 1u);
+}
+
+// Without a session there is no manager to ask. The fallback must still
+// produce a usable set -- the offline tools (quantize, calibration,
+// lora-fuse) and the tests run this way -- just an unshared one.
+TEST(weight_set, open_weight_set_falls_back_to_a_private_set) {
+  TempCheckpoint ck;
+  auto a = open_weight_set(ck.dir(), nullptr);
+  auto b = open_weight_set(ck.dir(), nullptr);
+  ASSERT_TRUE(a != nullptr && b != nullptr);
+  EXPECT_TRUE(a != b);                  // private: no sharing, by design
+  EXPECT_TRUE(a->dir() == ck.dir());
+}
+
+// Two models over one checkpoint share a tensor they BOTH want and
+// neither pays for one the other doesn't -- the property that makes the
+// per-tensor cache better than the model-level dedup it replaced, which
+// had to guess which model would be built first.
+TEST(weight_set, two_holders_share_only_what_they_both_ask_for) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  auto* mgr = s.generative_model_manager();
+  if (mc == nullptr || mgr == nullptr) { return; }
+  TempCheckpoint ck;
+
+  // First "model": wants only the trunk.
+  auto a = open_weight_set(ck.dir(), &s);
+  ASSERT_TRUE(a != nullptr);
+  SharedBuffer ta = a->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!ta.empty());
+  EXPECT_TRUE(a->stats().entries == 1u);
+
+  // Second "model": wants the trunk too, plus one the first never asked
+  // for. The shared tensor is the SAME bytes; the extra one is new.
+  auto b = open_weight_set(ck.dir(), &s);
+  ASSERT_TRUE(b == a);
+  SharedBuffer tb = b->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  SharedBuffer eb = b->tensor("encoder.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!tb.empty() && !eb.empty());
+  EXPECT_TRUE(tb.contents() == ta.contents());   // shared, not copied
+  EXPECT_TRUE(eb.contents() != ta.contents());
+  EXPECT_TRUE(a->stats().entries == 2u);
+}
+
+// The window the restore bracket closes. The registry drops ITS lock
+// between taking the buffers back and reloading them; in that gap the
+// entries are no longer marked parked but their contents were
+// discarded. A reader arriving then would hit the cache and be handed
+// an alias to garbage. begin_restore() holds _mu across the whole span,
+// so the reader WAITS for valid bytes instead.
+//
+// Asserted by observing that a concurrent tensor() genuinely does not
+// return while a restore is open.
+TEST(weight_set, a_reader_waits_for_an_open_restore) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+  ASSERT_TRUE(!ws->tensor("trunk.w", mc, WeightSet::Residency::Copied)
+                   .empty());
+
+  ws->begin_restore();          // the registry's position, mid-restore
+
+  std::atomic<bool> started{false};
+  std::atomic<bool> returned{false};
+  std::thread reader([&]() {
+    started.store(true);
+    // A cache HIT: without the bracket this returns instantly, pointing
+    // at bytes the kernel may have discarded.
+    auto t = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+    returned.store(!t.empty());
+  });
+
+  // Wait for the reader to actually be in flight first, so "it did not
+  // return" cannot pass vacuously because the thread never ran.
+  while (!started.load()) { std::this_thread::yield(); }
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  EXPECT_FALSE(returned.load());     // still blocked -- the point
+
+  ws->end_restore(true);
+  reader.join();
+  EXPECT_TRUE(returned.load());      // and it completes once bytes are good
+}
+
+// end_restore() without a matching begin_restore() must not unlock a
+// mutex this thread never took. Cheap, but the failure mode is a
+// corrupted mutex rather than a clean assert, so it is worth pinning.
+TEST(weight_set, an_unmatched_end_restore_is_inert) {
+  Session s;
+  TempCheckpoint ck;
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+  ws->end_restore(true);
+  ws->end_restore(false);
+  EXPECT_TRUE(ws->dir() == ck.dir());   // still usable
+}
+
+// Cached tensors are shared between models, so a write through one
+// holder corrupts every other. Nothing in the type system prevents that
+// -- SharedBuffer::contents() is a mutable pointer from a const method
+// -- so with VPIPE_WEIGHT_INTEGRITY=1 the set hashes what it caches and
+// can say whether the invariant actually held.
+TEST(weight_set, integrity_check_catches_a_write_after_load) {
+  ::setenv("VPIPE_WEIGHT_INTEGRITY", "1", 1);
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { ::unsetenv("VPIPE_WEIGHT_INTEGRITY"); return; }
+  TempCheckpoint ck;
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+  ASSERT_TRUE(ws->integrity_enabled());
+
+  // Copied, not Mapped: a mapped tensor is PROT_READ, so the write
+  // below would fault rather than corrupt. That asymmetry is exactly
+  // why the copied path needs this check and the mapped one does not.
+  auto a = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+  EXPECT_TRUE(ws->verify_integrity() == 0u);
+
+  // A second holder, as a real peer model would be.
+  auto b = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(b.contents() == a.contents());
+
+  // Now break the rule through one alias.
+  static_cast<unsigned char*>(a.contents())[0] ^= 0xff;
+  EXPECT_TRUE(ws->verify_integrity() == 1u);
+
+  // Put it back and the set is clean again -- the check reports the
+  // current state, it does not latch.
+  static_cast<unsigned char*>(a.contents())[0] ^= 0xff;
+  EXPECT_TRUE(ws->verify_integrity() == 0u);
+  ::unsetenv("VPIPE_WEIGHT_INTEGRITY");
+}
+
+// Off by default: hashing every tensor at load is a full pass over the
+// weights, which is seconds on a 20 GB model and buys nothing in
+// production. verify_integrity() then reports 0 because it checked
+// nothing, which is why integrity_enabled() exists to tell the two
+// apart.
+TEST(weight_set, integrity_is_off_unless_asked_for) {
+  ::unsetenv("VPIPE_WEIGHT_INTEGRITY");
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+  EXPECT_FALSE(ws->integrity_enabled());
+  auto a = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+  static_cast<unsigned char*>(a.contents())[0] ^= 0xff;
+  EXPECT_TRUE(ws->verify_integrity() == 0u);   // not checked, not clean
+}
+
+// A reload rewrites the bytes in place, so it must re-arm the hash in
+// the same critical section -- otherwise the very next verify would
+// report the registry's own legitimate write as corruption.
+TEST(weight_set, reload_rearms_the_integrity_hash) {
+  ::setenv("VPIPE_WEIGHT_INTEGRITY", "1", 1);
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { ::unsetenv("VPIPE_WEIGHT_INTEGRITY"); return; }
+  TempCheckpoint ck;
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+  auto a = ws->tensor("trunk.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+
+  // Scribble as if the pages had been discarded, then restore.
+  static_cast<unsigned char*>(a.contents())[0] ^= 0xff;
+  EXPECT_TRUE(ws->verify_integrity() == 1u);
+  EXPECT_TRUE(ws->reload_weights());
+  EXPECT_TRUE(ws->verify_integrity() == 0u);
+  ::unsetenv("VPIPE_WEIGHT_INTEGRITY");
+}
+
+// Streaming throughput under concurrency -- the case requirement (4)
+// names: two image pipelines sharing one checkpoint. Streaming implies
+// Copied (a model that streams turns mmap off), so every block read is a
+// full memcpy; if that ran under the set's lock the two pipelines would
+// take turns on each other's reads instead of overlapping.
+//
+// Reports the speedup of 2 threads over 1. Serialised, it sits near
+// 1.0x; overlapping, it climbs toward 2x (bounded by memory bandwidth,
+// so the bar is deliberately loose -- this is here to catch a
+// REGRESSION to lockstep, not to certify a number).
+//
+//   vpipe_test --filter 'weight_set.streaming_reads_run_concurrently'
+TEST(weight_set, streaming_reads_run_concurrently) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  // 4 MB: the order of a single quantised DiT block's codes, which is
+  // what the streaming path actually re-reads per layer per step.
+  BigCheckpoint ck(1024 * 1024);
+  auto ws = WeightSet::open(ck.dir(), &s);
+  ASSERT_TRUE(ws != nullptr);
+
+  const int kReads = 300;
+  auto burst = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      auto b = ws->stream_tensor("block.w", mc,
+                                 WeightSet::Residency::Copied);
+      if (b.empty()) { return false; }
+    }
+    return true;
+  };
+
+  burst(30);                               // warm allocator + page cache
+  using clk = std::chrono::steady_clock;
+
+  const auto t0 = clk::now();
+  ASSERT_TRUE(burst(kReads * 2));
+  const double serial_ms =
+      std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+
+  // Best of three: a single parallel sample swings enough on a busy
+  // machine to make a threshold either flaky or useless. The best run is
+  // the one least perturbed by whatever else the box was doing.
+  double par_ms = 1e30;
+  for (int rep = 0; rep < 3; ++rep) {
+    const auto t1 = clk::now();
+    {
+      std::thread a([&]() { burst(kReads); });
+      std::thread b([&]() { burst(kReads); });
+      a.join();
+      b.join();
+    }
+    par_ms = std::min(
+        par_ms,
+        std::chrono::duration<double, std::milli>(clk::now() - t1).count());
+  }
+
+  const double speedup = par_ms > 0.0 ? serial_ms / par_ms : 0.0;
+  std::printf("[ws_stream] %d x 4MB reads: 1 thread %.1f ms, 2 threads "
+              "%.1f ms -> %.2fx\n", kReads * 2, serial_ms, par_ms, speedup);
+
+  const auto st = ws->stats();
+  EXPECT_TRUE(st.streamed_reads >= (std::size_t)(kReads * 4));
+  EXPECT_TRUE(st.entries == 0u);           // streaming caches nothing
+
+  // Loose floor. Two threads memcpying 4 MB blocks are bandwidth-bound,
+  // so the ceiling is well under 2x. Measured on an M4 Pro: ~1.55-1.7x
+  // overlapping, ~1.10x when read() holds the set's lock across the
+  // copy. The bar sits between them, nearer the failure side, because
+  // what this needs to catch is a regression to LOCKSTEP -- not to
+  // certify any particular throughput.
+  EXPECT_TRUE(speedup > 1.25);
+}
+
+// The cap parks rather than refuses. Parking hands pages to the kernel
+// as purgeable: they survive when nothing else needs the RAM, so the
+// usual cost is nothing at all, and the next access takes them back.
+// That is why going over the cap degrades throughput instead of failing
+// a load.
+TEST(weight_set, the_memory_cap_parks_least_recently_used_first) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  auto* mgr = s.generative_model_manager();
+  if (mc == nullptr || mgr == nullptr) { return; }
+  // 4 MB each. The tiny fixture above is useless here: mark_inactive()
+  // declines heap sub-allocations, and a 32-byte buffer is one, so a
+  // small checkpoint is simply not parkable and the test would prove
+  // nothing.
+  BigCheckpoint older(1024 * 1024), newer(1024 * 1024);
+  const std::size_t kBytes = 4u * 1024 * 1024;
+
+  auto a = mgr->weight_set(older.dir());
+  auto b = mgr->weight_set(newer.dir());
+  ASSERT_TRUE(a != nullptr && b != nullptr);
+  ASSERT_TRUE(!a->tensor("block.w", mc, WeightSet::Residency::Copied)
+                   .empty());
+  ASSERT_TRUE(!b->tensor("block.w", mc, WeightSet::Residency::Copied)
+                   .empty());
+  // `b` is touched last, so `a` is the least-recently-used.
+  (void)b->tensor("block.w", mc, WeightSet::Residency::Copied);
+  EXPECT_TRUE(a->last_use() < b->last_use());
+  EXPECT_TRUE(mgr->active_bytes() == 2 * kBytes);
+
+  // A cap that fits only one of them parks exactly one, the older-touched.
+  mgr->set_memory_cap(kBytes + kBytes / 2);
+  EXPECT_TRUE(a->parked());
+  EXPECT_FALSE(b->parked());
+  // Parked bytes belong to the kernel now, so they stop counting --
+  // otherwise the policy would chase a number it can never reach.
+  EXPECT_TRUE(mgr->active_bytes() == kBytes);
+  // But they are still HELD: resident_weight_bytes() counts them.
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 2 * kBytes);
+
+  // Touching the parked set takes it back, and the bytes it hands out
+  // are still the file's -- a reactivation that silently served
+  // discarded pages is the failure this guards.
+  auto t = a->tensor("block.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!t.empty());
+  EXPECT_FALSE(a->parked());
+  const auto* v = static_cast<const float*>(t.contents());
+  EXPECT_TRUE(v[0] == 0.0f && v[5] == 5.0f);
+
+  mgr->set_memory_cap(0);
+  EXPECT_TRUE(mgr->memory_cap() == 0u);
+}
+
+// An uncapped manager must never park: the feature has to be inert
+// unless it was asked for.
+TEST(weight_set, no_cap_means_nothing_is_ever_parked) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  auto* mgr = s.generative_model_manager();
+  if (mc == nullptr || mgr == nullptr) { return; }
+  TempCheckpoint ck;
+  auto ws = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(ws != nullptr);
+  ASSERT_TRUE(!ws->tensor("encoder.w", mc, WeightSet::Residency::Copied)
+                   .empty());
+  EXPECT_TRUE(mgr->memory_cap() == 0u);
+  EXPECT_TRUE(mgr->enforce_memory_cap() == 0u);
+  EXPECT_FALSE(ws->parked());
+}
+
+// A cap smaller than anything parkable must not spin or lie: it parks
+// what it can, warns, and carries on. Mapped weights and KV cannot be
+// parked at all, so the cap is a target rather than a guarantee.
+TEST(weight_set, an_unreachable_cap_parks_what_it_can_and_stops) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  auto* mgr = s.generative_model_manager();
+  if (mc == nullptr || mgr == nullptr) { return; }
+  BigCheckpoint ck(1024 * 1024);
+  auto ws = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(ws != nullptr);
+  ASSERT_TRUE(!ws->tensor("block.w", mc, WeightSet::Residency::Copied)
+                   .empty());
+
+  mgr->set_memory_cap(1);              // unreachable
+  EXPECT_TRUE(ws->parked());
+  // Everything parkable is parked; asking again is a no-op rather than
+  // an endless retry. Mapped weights and KV cannot be parked at all,
+  // which is why the cap is a target and not a guarantee.
+  EXPECT_TRUE(mgr->enforce_memory_cap() == 0u);
+  mgr->set_memory_cap(0);
+}

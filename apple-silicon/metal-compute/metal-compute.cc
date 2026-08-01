@@ -751,6 +751,10 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   }
 
   SharedBuffer out(buf, contents, byte_size);
+  // Put it on the books: this is the owning handle (subviews of it share the
+  // MTL::Buffer by refcount and are deliberately not counted again).
+  out._accounted = true;
+  account_alloc_(byte_size);
   pool->release();
   return out;
 }

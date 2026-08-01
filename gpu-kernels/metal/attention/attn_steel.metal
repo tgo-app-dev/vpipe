@@ -99,6 +99,33 @@ template [[host_name("attn_steel_h_bd128_bf16")]] [[kernel]] decltype(attention<
                                                                  float>)
 attention<bfloat, 32, 16, 128, 4, 1, bfloat, float>;
 
+// head_dim=120 variant for the Boogu-Image NextDiT (28 heads x 120). 120 is not
+// a power of two, but every tiling constant still divides exactly, so the
+// register-resident flash path needs no padding:
+//   * MMA fragments:   TD = 120 / 8 = 15
+//   * Q BlockLoader:   n_reads = 120*32/128 = 30, TCOLS = 4,  TROWS = 32
+//   * K/V BlockLoader: n_reads = 120*16/128 = 15, TCOLS = 8,  TROWS = 16
+//   * threadgroup mem: 32*(120+8) + max(24*120, 16*128) elts = ~14 KB of 32 KB
+// The loaders read with scalar loops bounded by vec_size (no vector types), so a
+// non-multiple-of-4 width is fine.
+// MEASURED SLOWER than zero-padding to the bd128 kernel, and therefore OPT-IN
+// (VPIPE_BOOGU_ATTN_NATIVE): 0.985x at seq 2271, 0.965x at seq 8415, even
+// though it does 6.7% less arithmetic and skips a pad/unpad transpose pair.
+// vec_size 30 at 60-byte thread strides cannot widen into aligned 16-byte
+// loads the way bd128's 32 at 64-byte strides does, and the BD==128 simdgroup
+// scheduling hints in the V-load loop do not apply here. Kept because it is
+// numerically exact and makes the retest one env var on a new GPU.
+template [[host_name("attn_steel_h_bd120_bf16")]] [[kernel]] decltype(attention<
+                                                                 bfloat,
+                                                                 32,
+                                                                 16,
+                                                                 120,
+                                                                 4,
+                                                                 1,
+                                                                 bfloat,
+                                                                 float>)
+attention<bfloat, 32, 16, 120, 4, 1, bfloat, float>;
+
 // (Qwen3.5 head_dim 256 full-attention prefill uses the paged-KV variant
 // attn_steel_paged_bd256 below -- it serves both fresh and mid-context prefill
 // straight from the paged pool, so the contiguous bd256 entry point is not

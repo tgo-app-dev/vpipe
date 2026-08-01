@@ -10,6 +10,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-registry.h"
+#include "stages/sampler-spec.h"
 #include "stages/trigger-beat.h"
 // realtime-vqa-stage.cc is compiled only under VPIPE_BUILD_APPLE_SILICON
 // (see stages/CMakeLists.txt), so the TensorBeat payload (used to sense PCM
@@ -469,23 +470,6 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
     }
   }
 
-#ifdef VPIPE_BUILD_APPLE_SILICON
-  // Sampler knobs are flat `sampler_*` attributes; each defaults to the
-  // SamplerParams default (kSpec.attrs), so leaving them all unset gives
-  // greedy/argmax decoding. attr_* resolves config-else-default.
-  _sampler_params.temperature =
-      static_cast<float>(attr_real("sampler_temperature"));
-  _sampler_params.top_k  = static_cast<int>(attr_int("sampler_top_k"));
-  _sampler_params.top_p  = static_cast<float>(attr_real("sampler_top_p"));
-  _sampler_params.min_p  = static_cast<float>(attr_real("sampler_min_p"));
-  _sampler_params.repetition_penalty =
-      static_cast<float>(attr_real("sampler_repetition_penalty"));
-  _sampler_params.presence_penalty =
-      static_cast<float>(attr_real("sampler_presence_penalty"));
-  _sampler_params.seed =
-      static_cast<std::uint64_t>(attr_uint("sampler_seed"));
-#endif
-
   if (_hf_dir.empty()) {
     fail_config(fmt(
         "RealtimeVqaStage('{}'): config.hf_dir is required (non-empty "
@@ -589,21 +573,6 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "instruction prepended to every per-question turn (answer-format "
           "steer); empty disables",
    .def_str = kQuestionPreambleDefault},
-  // Flat sampler knobs; all unset -> greedy/argmax decoding.
-  {.key = "sampler_temperature", .type = ConfigType::Real,
-   .doc = "softmax temperature; <= 0 forces argmax", .def_real = 0.2},
-  {.key = "sampler_top_k", .type = ConfigType::Int,
-   .doc = "keep top-k logits; 0 = disabled", .def_int = 10},
-  {.key = "sampler_top_p", .type = ConfigType::Real,
-   .doc = "nucleus top-p; >= 1 = disabled", .def_real = 1.0},
-  {.key = "sampler_min_p", .type = ConfigType::Real,
-   .doc = "min-p floor; <= 0 = disabled", .def_real = 0.0},
-  {.key = "sampler_repetition_penalty", .type = ConfigType::Real,
-   .doc = "repetition penalty; 1.0 = disabled", .def_real = 1.0},
-  {.key = "sampler_presence_penalty", .type = ConfigType::Real,
-   .doc = "presence penalty; 0.0 = disabled", .def_real = 0.0},
-  {.key = "sampler_seed", .type = ConfigType::Uint,
-   .doc = "RNG seed; 0 = non-deterministic", .def_uint = 0},
 };
 // iport0 frames + iport1 trigger + oport0 scene answers share the video
 // clock (group 0); iport2 (optional audio tags OR PCM, hence untyped)
@@ -619,6 +588,11 @@ const PortSpec kIports[] = {
   {.name = "audio", .doc = "optional FlexData audio-tags OR PCM "
                            "TensorBeat (untyped); timestamp-gated drain",
    .type = nullptr, .clock_group = 0},
+  {.name = "sampler",
+   .doc = "OPTIONAL token-sampler spec FlexData (sampler-select). Latched "
+          "on the first frame and reused for every later scene; unwired = "
+          "greedy (argmax) decoding",
+   .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "scene", .doc = "FlexData per closed scene: questions + answers "
@@ -709,9 +683,27 @@ RealtimeVqaStage::resample_frame_(const std::uint8_t* rgb, int H, int W,
 }
 #endif
 
+void
+RealtimeVqaStage::reset_run_state()
+{
+  // Per-launch reset: the stage survives a stop/relaunch, and the
+  // select sources upstream re-emit on every launch. Without this the
+  // re-emitted beat is never latched and this stage keeps the previous
+  // run's selection.
+  _sampler_latched = false;
+}
+
+std::vector<std::string>
+RealtimeVqaStage::declare_models() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+}
+
 Job
 RealtimeVqaStage::initialize(RuntimeContext& ctx)
 {
+
   (void)ctx;
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
   auto* mgr = session() ? session()->generative_model_manager() : nullptr;
@@ -2264,6 +2256,19 @@ RealtimeVqaStage::m_process_(RuntimeContext& ctx)
     if (m_scene_active_()) { m_reset_scene_(); }
     ctx.signal_done();
     co_return;
+  }
+
+  // Latch the token-sampler spec off the OPTIONAL sampler iport3, once: the
+  // `sampler-select` source emits a single beat at launch, which we cache and
+  // reuse for every later scene. Read after the first wake so a declared-but-
+  // unwired port never stalls the frame loop. Unwired => greedy.
+  if (!_sampler_latched && ctx.num_iports() >= 4 && ctx.iport_connected(3)) {
+    auto sb = co_await ctx.read(3);
+    _sampler_latched = true;   // beat consumed either way; never re-read
+    bool ok = false;
+    const genai::SamplerParams p = sampler_params_from_beat(
+        sb.get(), session(), "RealtimeVqaStage('" + this->id() + "')", &ok);
+    if (ok) { _sampler_params = p; }
   }
 
   // 1) Encode every frame currently available (ASAP).

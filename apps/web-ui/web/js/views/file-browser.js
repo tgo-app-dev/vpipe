@@ -20,18 +20,9 @@ import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
 import { createFsList, humanSize, joinPath } from '../fs-list.js';
-
-// Extension -> preview category. Lower-case, no leading dot. Anything
-// not listed has no inline preview (the pane offers a download instead).
-const IMAGE = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'svg',
-  'tiff', 'tif', 'heic', 'ico']);
-const AUDIO = new Set(['wav', 'mp3', 'flac', 'aac', 'm4a', 'ogg', 'opus',
-  'aiff', 'aif']);
-const VIDEO = new Set(['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'ts',
-  'flv', 'mpg', 'mpeg']);
-const TEXT = new Set(['txt', 'md', 'log', 'csv', 'srt', 'vtt', 'json',
-  'xml', 'yaml', 'yml', 'html', 'htm', 'js', 'css', 'c', 'cc', 'h', 'hpp',
-  'py', 'sh', 'ini', 'conf', 'toml', 'ts', 'tsx', 'jsx']);
+// Extension -> preview category, shared with the phone browser so the
+// two can't disagree about what previews.
+import { categorize, iconFor } from '../fs-kinds.js';
 
 // One screen of text: bytes fetched for a text preview (Range-capped so a
 // huge file is never pulled whole).
@@ -42,28 +33,6 @@ const TEXT_PREVIEW_BYTES = 64 * 1024;
 // one live component across (re)mounts and destroys the prior one, since the
 // view has no unmount hook (prevents a leaked ResizeObserver per nav switch).
 let fbList = null;
-
-function extOf(name) {
-  const i = String(name || '').lastIndexOf('.');
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
-}
-
-function categorize(name) {
-  const e = extOf(name);
-  if (IMAGE.has(e)) { return 'image'; }
-  if (AUDIO.has(e)) { return 'audio'; }
-  if (VIDEO.has(e)) { return 'video'; }
-  if (TEXT.has(e))  { return 'text'; }
-  return null;
-}
-
-function iconFor(entry) {
-  if (entry.dir) { return 'folder'; }
-  const c = categorize(entry.name);
-  return c === 'image' ? 'image'
-    : c === 'audio' ? 'audio'
-    : c === 'video' ? 'video' : 'file';
-}
 
 // ---- server forward-slash path helpers (namespace-agnostic) ----------
 // joinPath / humanSize are shared from fs-list.js.

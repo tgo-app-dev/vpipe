@@ -40,6 +40,7 @@ public:
                    FlexData                  config);
   ~ModelSelectStage() override;
 
+  void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
