@@ -5,6 +5,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -58,10 +59,6 @@ AudioTranscribeStage::AudioTranscribeStage(
   allocate_oports(spec().oports.size());   // sink: 0 oports
 
   _hf_dir        = attr_str("hf_dir");
-  _models_db     = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -126,9 +123,7 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "ASR-LM model: a models-DB key (the huggingface.co path "
           "registered by model-fetch) or a filesystem path. A DB key "
           "wins over a same-named path.",
-   .suggest_db = "models"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "compute_dtype", .type = ConfigType::String,
    .doc = "bf16 | f16 | f32", .def_str = "f16"},
   {.key = "page_tokens", .type = ConfigType::Int,
@@ -199,7 +194,7 @@ AudioTranscribeStage::~AudioTranscribeStage() = default;
 std::string
 AudioTranscribeStage::resolve_model_dir(const std::string& ref) const
 {
-  return vpipe::resolve_model_dir(session(), _models_db, ref);
+  return vpipe::resolve_model_dir(session(), ref);
 }
 
 void
@@ -212,11 +207,12 @@ AudioTranscribeStage::reset_run_state()
   _sampler_latched = false;
 }
 
-std::vector<std::string>
-AudioTranscribeStage::declare_models() const
+std::vector<ResourceClaim>
+AudioTranscribeStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return {resolve_model_dir(_hf_dir)};   // stage's own overload
+  return model_memory::weight_claims(
+      {resolve_model_dir(_hf_dir)});      // stage's own overload
 }
 
 Job

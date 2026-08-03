@@ -5,6 +5,7 @@
 #include "common/media-line.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -53,10 +54,6 @@ VisualQaStage::VisualQaStage(const SessionContextIntf* s,
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _hf_dir              = attr_str("hf_dir");
-  _models_db           = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _compute_dtype       = attr_str("compute_dtype");
   _page_tokens         = static_cast<int>(attr_int("page_tokens"));
   _coreml_vision_path  = attr_str("coreml_vision_path");
@@ -190,9 +187,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "VLM model: a models-DB key (registered by model-fetch) or an "
           "HF-style model dir; a DB key wins over a same-named path",
-   .suggest_db = "models"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "coreml_vision_path", .type = ConfigType::String,
    .doc = "pre-converted CoreML vision tower path", .def_str = ""},
   {.key = "coreml_compute_units", .type = ConfigType::Int,
@@ -264,11 +259,12 @@ VisualQaStage::spec() const noexcept
 
 VisualQaStage::~VisualQaStage() = default;
 
-std::vector<std::string>
-VisualQaStage::declare_models() const
+std::vector<ResourceClaim>
+VisualQaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+  return model_memory::weight_claims(
+      {resolve_model_dir(session(), _hf_dir)});
 }
 
 Job
@@ -285,7 +281,7 @@ VisualQaStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   genai::LoadSpec spec;
-  spec.hf_dir        = resolve_model_dir(session(), _models_db, _hf_dir);
+  spec.hf_dir        = resolve_model_dir(session(), _hf_dir);
   spec.compute_dtype = _compute_dtype;
   spec.page_tokens   = _page_tokens;
   spec.max_pages     = _max_pages;
@@ -325,7 +321,12 @@ VisualQaStage::initialize(RuntimeContext& ctx)
   // letterbox preproc). When it loads it takes priority over _mvis.
   if (!_coreml_vision_path.empty()) {
     genai::CoreMLVisionEncoder::LoadSpec cm;
-    cm.mlpackage_path = _coreml_vision_path;
+    // Through the registry like every other CoreML consumer, so
+    // coreml_vision_path accepts a registry key as well as a path (a
+    // plain path passes through unchanged). realtime-vqa has done this
+    // since the registry landed; this stage was left behind.
+    cm.mlpackage_path =
+        resolve_model_dir(session(), _coreml_vision_path);
     cm.compute_units  = _coreml_compute_units;
     cm.patch_size     = _lm->config().vision.patch_size;
     cm.spatial_merge_size = _lm->config().vision.spatial_merge_size;

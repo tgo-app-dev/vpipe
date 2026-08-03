@@ -146,8 +146,8 @@ public:
 
   // The LM this stage holds. Declared before any stage initializes so
   // the diffusion stages -- which cannot see it from their own config --
-  // size the box against it. See Stage::declare_models.
-  std::vector<std::string> declare_models() const override;
+  // size the box against it. See Stage::declare_resources.
+  std::vector<ResourceClaim> declare_resources() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -181,7 +181,6 @@ private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;
-  std::string _models_db;
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};

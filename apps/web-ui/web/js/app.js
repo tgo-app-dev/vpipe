@@ -26,6 +26,29 @@ applyTheme(getTheme());
 document.documentElement.setAttribute('lang', getLocale());
 api.setLanguage(getLocale()).catch(() => { /* older backend -- ignore */ });
 
+// Ctrl/Cmd+A must not select the dashboard. "Select all" over chrome
+// highlights every button and row and yields a paste nobody wants --
+// the keyboard counterpart of the drag-selection the CSS rule above
+// suppresses, and blocked at the SAME boundary: it stays available in
+// form fields and in .allow-context-menu regions (the console, the
+// session log, a file preview), which are the parts that exist to be
+// read and copied.
+//
+// Installed at module scope, so BOTH shells get it -- the phone shell
+// does not run main(), where the right-click suppressor lives. Capture
+// phase, so a view's own keydown handler cannot swallow it first.
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey)) { return; }
+  if (e.key !== 'a' && e.key !== 'A') { return; }
+  const el = e.target;
+  const tag = el && el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) {
+    return;
+  }
+  if (el && el.closest && el.closest('.allow-context-menu')) { return; }
+  e.preventDefault();
+}, true);
+
 // Remote servers gate /api/* on an access key printed in their console.
 // When the backend returns 401, api.js calls this to collect the key.
 setAuthPrompt(() => new Promise((resolve) => {

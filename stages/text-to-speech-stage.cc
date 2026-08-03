@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -127,13 +128,9 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
   // configured value else that default.
   _hf_dir    = attr_str("hf_dir");
   _codec_dir = attr_str("codec_dir");
-  _models_db = attr_str("models_db");
   _codec_int8 = (attr_str("codec_quant") == "int8");
   _instruction = attr_str("instruction");
   _language    = attr_str("language");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   {
     int64_t v = attr_int("max_new_tokens");
     if (v < 1) {
@@ -199,15 +196,14 @@ constexpr ConfigKey kAttrs[] = {
           "model-quantize) or an HF-style model dir; a DB key wins over a "
           "same-named path. 8B (moss-tts), v1.5 (moss-tts-local), or realtime "
           "(moss-tts-realtime).",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type = "moss-tts,moss-tts-local,moss-tts-realtime"},
   {.key = "codec_dir", .type = ConfigType::String, .required = true,
    .doc = "MOSS-Audio-Tokenizer (codec) model: a models-DB key or a "
           "filesystem path; a DB key wins over a same-named path. Match the "
           "LM variant: moss-codec (8B) or moss-codec-v2 (v1.5).",
-   .suggest_db = "models", .suggest_db_type = "moss-codec,moss-codec-v2"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "moss-codec,moss-codec-v2"},
   {.key = "codec_quant", .type = ConfigType::String,
    .doc = "codec weight precision: \"int8\" stores the codec's transformer "
           "GEMM weights as int8 group-32 affine (~half the resident codec "
@@ -486,17 +482,17 @@ TextToSpeechStage::release_models_()
 }
 #endif
 
-std::vector<std::string>
-TextToSpeechStage::declare_models() const
+std::vector<ResourceClaim>
+TextToSpeechStage::declare_resources() const
 {
-  std::vector<std::string> out;
+  std::vector<std::string> dirs;
   if (!_hf_dir.empty()) {
-    out.push_back(resolve_model_dir(session(), _models_db, _hf_dir));
+    dirs.push_back(resolve_model_dir(session(), _hf_dir));
   }
   if (!_codec_dir.empty()) {
-    out.push_back(resolve_model_dir(session(), _models_db, _codec_dir));
+    dirs.push_back(resolve_model_dir(session(), _codec_dir));
   }
-  return out;
+  return model_memory::weight_claims(std::move(dirs));
 }
 
 Job
@@ -537,9 +533,9 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
   _text_sp_read  = false;
 
   const std::string lm_dir =
-      resolve_model_dir(session(), _models_db, _hf_dir);
+      resolve_model_dir(session(), _hf_dir);
   const std::string codec_dir =
-      resolve_model_dir(session(), _models_db, _codec_dir);
+      resolve_model_dir(session(), _codec_dir);
 
   // Pick the variant from the LM dir's config.json. "moss_tts_realtime" => the
   // realtime streaming path (Qwen3-1.7B backbone + depth decoder -> 24 kHz

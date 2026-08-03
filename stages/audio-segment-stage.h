@@ -168,7 +168,6 @@ private:
   // are read in the constructor via attr_*. Scalar/string declarations carry
   // no non-zero default. ----
   std::string _model_path;
-  std::string _models_db;
   int         _compute_units{};
   int         _sample_rate{};
   int         _window_samples{};

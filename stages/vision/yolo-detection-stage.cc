@@ -302,10 +302,6 @@ YoloDetectionStage::YoloDetectionStage(const SessionContextIntf* s,
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _model_path           = attr_str("model_path");
-  _models_db            = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _input_feature_name   = attr_str("input_feature_name");
   _output_feature_name  = attr_str("output_feature_name");
   _confidence_threshold = attr_real("confidence_threshold");
@@ -368,9 +364,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "model_path", .type = ConfigType::String, .required = true,
    .doc = "YOLO CoreML model: a models-DB key (registered by model-fetch) "
           "or an mlpackage path; a DB key wins over a same-named path",
-   .suggest_db = "models", .suggest_db_type = "yolo"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "yolo"},
   {.key = "input_feature_name", .type = ConfigType::String,
    .doc = "model input feature name; unset (default) auto-matches the "
           "model's sole input"},
@@ -441,7 +435,7 @@ YoloDetectionStage::initialize(RuntimeContext& /*ctx*/)
   }
   // A models-DB key (e.g. a model-fetch'd yolo model) resolves to its
   // unpacked .mlpackage; a plain path passes through unchanged.
-  _model_path = resolve_model_dir(session(), _models_db, _model_path);
+  _model_path = resolve_model_dir(session(), _model_path);
   _loaded = mgr->load(_model_path, _compute_units);
   if (!_loaded) {
     session()->error(fmt(

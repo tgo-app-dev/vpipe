@@ -52,7 +52,6 @@ namespace vpipe {
 //                                     Empty => bare DiT output.
 //   scale       (real, default 1.0) -- LoRA fusion strength (lora_scale *
 //                                      alpha/rank; alpha=rank when unspecified).
-//   models_db   (string, default "models") -- registry sub-db.
 class LoraFuseStage final : public TypedStage<LoraFuseStage> {
 public:
   static constexpr const char* kTypeName = "lora-fuse";
@@ -79,7 +78,6 @@ private:
   std::string _lora;
   std::string _output_name;
   std::string _base_pipeline;   // pipeline root -> self-contained fused model
-  std::string _models_db;
   double      _scale{};
   // Resolved output dir of the last fuse (for the summary beat).
   std::string _out_dir;

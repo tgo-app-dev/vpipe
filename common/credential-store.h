@@ -9,7 +9,16 @@ namespace vpipe {
 
 class LmdbEnv;
 
-// One row from the "cameras" LMDB sub-db. Marshaled to / from a
+// The one LMDB sub-db the IP-camera registry lives in: onvif-discovery
+// writes it, rtsp-capture reads it. Fixed system-wide rather than a
+// per-stage config key, so a discovery run and a recorder can never
+// disagree about where a camera record lives. The leading underscores
+// keep it out of the way of the user-named sub-dbs (the per-camera
+// "<name>-videos" indexes, ...).
+inline constexpr std::string_view kIpCamRegistryDb =
+    "__vpipe_ip_cam_registry";
+
+// One row from the IP-camera registry. Marshaled to / from a
 // FlexData object in load_camera / save_camera so the wire format
 // stays in one place. `password_blob` holds the AES-256-GCM output
 // from credential-cipher::seal(); decryption is the caller's
@@ -35,17 +44,14 @@ struct CameraRecord {
 // (MDB_NOTFOUND) or the value fails to deserialize as a FlexData
 // object.
 std::optional<CameraRecord>
-load_camera(LmdbEnv&            env,
-            std::string_view    db_name,
-            std::string_view    name);
+load_camera(LmdbEnv& env, std::string_view name);
 
-// Persist `rec` under key `rec.name` in `db_name`. Throws (via the
+// Persist `rec` under key `rec.name` in the registry. Throws (via the
 // session's error path) on LMDB failure. `overwrite_existing=false`
 // short-circuits with `false` if a row with the same key already
 // exists; returns `true` after a successful write.
 bool
 save_camera(LmdbEnv&             env,
-            std::string_view     db_name,
             const CameraRecord&  rec,
             bool                 overwrite_existing = true);
 

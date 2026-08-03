@@ -16,13 +16,36 @@
 #ifndef VPIPE_STAGES_MODEL_MEMORY_H
 #define VPIPE_STAGES_MODEL_MEMORY_H
 
+#include "pipeline/resource-plan.h"
+
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
 class SessionContextIntf;
 namespace model_memory {
+
+// The ResourceClaim kind consumed by the model-weight planner, which
+// turns a claimed checkpoint directory into a GenerativeModelManager
+// declaration. The constant lives here rather than in the pipeline core
+// on purpose: the runtime routes claims by kind without knowing that
+// "model weights" is one of the things a graph can want.
+inline constexpr std::string_view kWeightsKind = "model-weights";
+
+// Wrap checkpoint directories as claims, for a stage's
+// declare_resources() override:
+//
+//   std::vector<ResourceClaim>
+//   FooStage::declare_resources() const
+//   {
+//     return model_memory::weight_claims({_model_dir, _encoder_dir});
+//   }
+//
+// Empty directories are dropped, so a conditionally-configured
+// component needs no branch at the call site.
+std::vector<ResourceClaim> weight_claims(std::vector<std::string> dirs);
 
 // Working-set headroom for a decision that can be REVISED later.
 // unload_when_idle is the case: it is a per-beat behaviour flag, decided
@@ -42,7 +65,7 @@ inline constexpr std::size_t kHeadroom = 6ull << 30;
 // uncertainty the cheap error is to stream, so the irreversible decision
 // gets the bigger cushion.
 //
-// Declarations (Stage::declare_models) removed the largest source of
+// Declarations (Stage::declare_resources) removed the largest source of
 // that uncertainty -- peers this stage cannot see from its own config --
 // but not all of it: CoreML models, LMDB, and activation scratch are
 // still outside the manager's accounting.

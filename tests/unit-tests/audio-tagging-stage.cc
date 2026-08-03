@@ -13,6 +13,7 @@
 #include "stages/audio-tagging-stage.h"
 #include "stages/beats-audioset-labels.h"
 #include "stages/ced-audioset-labels.h"
+#include "stages/model-registry.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "common/flex-data.h"
 #include "common/session.h"
@@ -142,7 +143,7 @@ TEST(audio_tagging_stage, model_field_associated_with_registry_type) {
     if (k.key == "model_path") { mp = &k; break; }
   }
   ASSERT_TRUE(mp != nullptr);
-  EXPECT_TRUE(mp->suggest_db == "models");
+  EXPECT_TRUE(mp->suggest_db == kModelRegistryDb);
   EXPECT_TRUE(mp->suggest_db_type == "audio-tagging");
 }
 

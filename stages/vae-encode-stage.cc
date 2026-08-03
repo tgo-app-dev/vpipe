@@ -35,8 +35,6 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   // now -- a model-select source on the model iport can supply it instead --
   // so the "no model at all" case is reported at initialize()/process() time.
   _hf_dir    = attr_str("hf_dir");
-  _models_db = attr_str("models_db");
-  if (_models_db.empty()) { _models_db = "models"; }
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
@@ -130,11 +128,9 @@ const ConfigKey kAttrs[] = {
    .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
           "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
           "model iport overrides it",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit"},
-  {.key = "models_db", .type = ConfigType::String, .required = false,
-   .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
    .doc = "letterbox-resize the input to this width before encoding (multiple "
           "of 8; requires target_height). 0/unset = encode at native size"},
@@ -261,13 +257,14 @@ VaeEncodeStage::reset_run_state()
 
 }
 
-std::vector<std::string>
-VaeEncodeStage::declare_models() const
+std::vector<ResourceClaim>
+VaeEncodeStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
-  return {(fs::path(root) / "vae").string()};
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  return model_memory::weight_claims(
+      {(fs::path(root) / "vae").string()});
 }
 
 Job
@@ -335,7 +332,7 @@ VaeEncodeStage::ensure_loaded_()
         "the stage is inert", this->id()));
     return;
   }
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
   // Idle-unload decision (auto: the DiT + text encoder of this same pipeline are
   // resident during a run, so size the box against THEIR weights -- the VAE's
   // own are small, it is the decode working set that has to fit beside them).
@@ -618,7 +615,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
             mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
       // Records the selection only -- the weights still wait for an
       // actual image, so a model-select beat alone never loads anything.
-      apply_model_select_beat(mfd->data, _hf_dir, _models_db);
+      apply_model_select_beat(mfd->data, _hf_dir);
     }
   }
   auto in = co_await ctx.read(0);

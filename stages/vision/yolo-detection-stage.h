@@ -95,7 +95,6 @@ private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string              _model_path;
-  std::string              _models_db;
   std::string              _input_feature_name;
   std::string              _output_feature_name;
   // Model-driven; populated in initialize(). `_input_width` and

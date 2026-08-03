@@ -258,7 +258,6 @@ RtspCaptureStage::RtspCaptureStage(const SessionContextIntf* s,
   if (seg == 0) { seg = 60; }
   _segment_seconds = std::chrono::seconds(seg);
 
-  _cameras_db       = attr_str("cameras_db");
   _videos_db_suffix = attr_str("videos_db_suffix");
   _rtsp_transport   = attr_str("rtsp_transport");
   _stimeout_us = static_cast<unsigned>(attr_uint("stimeout_us"));
@@ -285,14 +284,13 @@ RtspCaptureStage::RtspCaptureStage(const SessionContextIntf* s,
 namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "camera_name", .type = ConfigType::String, .required = true,
-   .doc = "camera key in the cameras sub-db", .suggest_db = "cameras"},
+   .doc = "camera key in the IP-camera registry",
+   .suggest_db = kIpCamRegistryDb},
   {.key = "output_dir", .type = ConfigType::String, .required = true,
    .doc = "directory for finalized MP4 segments",
    .is_path = true, .path_write = true, .path_kind = "dir"},
   {.key = "segment_seconds", .type = ConfigType::Uint,
    .doc = "target segment length in seconds", .def_uint = 60},
-  {.key = "cameras_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db holding camera records", .def_str = "cameras"},
   {.key = "videos_db_suffix", .type = ConfigType::String,
    .doc = "suffix for the per-camera videos sub-db",
    .def_str = "-videos"},
@@ -1157,11 +1155,11 @@ RtspCaptureStage::capture_loop_(RuntimeContext& ctx)
   // input, segment until the stream errors out or the user stops.
   bool tried_refresh_this_cycle = false;
   while (!ctx.stop_requested()) {
-    auto opt_rec = load_camera(*env, _cameras_db, _camera_name);
+    auto opt_rec = load_camera(*env, _camera_name);
     if (!opt_rec) {
       session()->error(fmt(
-          "RtspCaptureStage('{}'): camera '{}' not in '{}' db",
-          this->id(), _camera_name, _cameras_db));
+          "RtspCaptureStage('{}'): camera '{}' not in the IP-camera "
+          "registry", this->id(), _camera_name));
     }
     CameraRecord rec = *opt_rec;
 
@@ -1215,7 +1213,7 @@ RtspCaptureStage::capture_loop_(RuntimeContext& ctx)
         // Wipe plaintext password from memory ASAP.
         std::memset(pw.data(), 0, pw.size());
         if (refreshed) {
-          save_camera(*env, _cameras_db, rec, true);
+          save_camera(*env, rec, true);
           continue;  // immediate retry with new URI
         }
       } else {

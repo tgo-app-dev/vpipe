@@ -80,10 +80,9 @@ TEST(model_quantize_stage, source_availability_check)
   std::error_code ec;
   const auto tmp = fs::temp_directory_path() / "vpipe_avail_probe";
   fs::create_directories(tmp, ec);
-  EXPECT_TRUE(model_dir_available(&sess, "models", tmp.string()));
-  EXPECT_FALSE(model_dir_available(&sess, "models",
-                                   "/no/such/vpipe/model/xyz"));
-  EXPECT_FALSE(model_dir_available(&sess, "models", ""));
+  EXPECT_TRUE(model_dir_available(&sess, tmp.string()));
+  EXPECT_FALSE(model_dir_available(&sess, "/no/such/vpipe/model/xyz"));
+  EXPECT_FALSE(model_dir_available(&sess, ""));
   fs::remove_all(tmp, ec);
 }
 

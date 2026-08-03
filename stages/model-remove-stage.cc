@@ -7,6 +7,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "pipeline/runtime-context.h"
+#include "stages/model-registry.h"
 
 #include <filesystem>
 #include <optional>
@@ -56,9 +57,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "model", .type = ConfigType::String, .required = true,
    .doc = "models-DB key to remove (the key model-fetch / model-quantize "
           "registered the model under)",
-   .suggest_db = "models"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db to remove the record from", .def_str = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "delete_files", .type = ConfigType::Bool,
    .doc = "also delete the model's recorded local_path directory from disk "
           "(opt-in; destructive -- the record alone is removed otherwise)",
@@ -107,13 +106,9 @@ ModelRemoveStage::ModelRemoveStage(const SessionContextIntf* s,
                                  std::move(config))
 {
   _model        = attr_str("model");
-  _models_db    = attr_str("models_db");
   _delete_files = attr_bool("delete_files");
   _missing_ok   = attr_bool("missing_ok");
 
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   if (_model.empty()) {
     fail_config(fmt("ModelRemoveStage('{}'): config.model is required",
                     this->id()));
@@ -146,7 +141,7 @@ ModelRemoveStage::remove_once()
 
   // Construct the db handle BEFORE any user txn (its ctor opens its own RW
   // boot txn; opening it while another RW txn is live on the env deadlocks).
-  LmdbDb db(*env, _models_db);
+  LmdbDb db(*env, kModelRegistryDb);
 
   // -------- 1. Read the record (does the model exist?) -----------------
   FlexData rec;
@@ -168,15 +163,15 @@ ModelRemoveStage::remove_once()
   if (!r.present) {
     if (_missing_ok) {
       s->info(fmt(
-          "ModelRemoveStage('{}'): '{}' not registered in sub-db '{}'; "
-          "nothing to remove", this->id(), _model, _models_db));
+          "ModelRemoveStage('{}'): '{}' not registered in the model "
+          "registry; nothing to remove", this->id(), _model));
       r.ok = true;   // desired end-state ("not registered") already holds
     } else {
       // A missing model is a failure -- halt the cascade (no summary).
       s->warn(fmt(
-          "ModelRemoveStage('{}'): '{}' is not registered in sub-db '{}'; "
-          "set missing_ok=true to treat this as a no-op", this->id(),
-          _model, _models_db));
+          "ModelRemoveStage('{}'): '{}' is not registered in the model "
+          "registry; set missing_ok=true to treat this as a no-op",
+          this->id(), _model));
     }
     return r;
   }
@@ -230,8 +225,8 @@ ModelRemoveStage::remove_once()
         this->id(), _model));
   }
   s->info(fmt(
-      "ModelRemoveStage('{}'): removed '{}' from sub-db '{}'{}",
-      this->id(), _model, _models_db,
+      "ModelRemoveStage('{}'): removed '{}' from the model registry{}",
+      this->id(), _model,
       r.files_deleted ? " (+ deleted files)" : ""));
   r.ok = true;
   return r;
@@ -265,7 +260,6 @@ ModelRemoveStage::process(RuntimeContext& ctx)
     auto so = sum.as_object();
     so.insert_or_assign("stage", FlexData::make_string("model-remove"));
     so.insert_or_assign("model", FlexData::make_string(_model));
-    so.insert_or_assign("models_db", FlexData::make_string(_models_db));
     so.insert_or_assign("present", FlexData::make_bool(r.present));
     so.insert_or_assign("removed", FlexData::make_bool(r.removed));
     so.insert_or_assign("files_deleted",
@@ -276,8 +270,8 @@ ModelRemoveStage::process(RuntimeContext& ctx)
     }
     so.insert_or_assign("text", FlexData::make_string(
         r.present
-            ? fmt("[model-remove] {}\n  <- sub-db '{}'{}",
-                  _model, _models_db,
+            ? fmt("[model-remove] {}\n  <- the model registry{}",
+                  _model,
                   _delete_files
                       ? fmt("\n  files: {}", r.delete_note.empty()
                                 ? string("(none)") : r.delete_note)()

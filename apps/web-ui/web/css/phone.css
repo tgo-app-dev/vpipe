@@ -5,9 +5,51 @@
    It uses the app stylesheet's design tokens (--bg-*, --fg-*, --line,
    --accent-*) and its .btn / .icon utilities; nothing is redefined. */
 
-#app.phone { height: 100dvh; }        /* dvh: the mobile URL bar moves */
+/* --vvh is the VISIBLE height, published by the shell from
+   visualViewport (see trackViewport). It is what makes a soft keyboard
+   work: the keyboard covers the bottom of the layout viewport without
+   shrinking it, so `100dvh` would leave every view's bottom row --
+   the compose box, an Apply button -- underneath it. Sizing to the
+   visible height instead lets the ordinary flex column absorb it: the
+   header holds, the scrolling middle gives up the space, the bottom row
+   stays put. The fallback covers a browser with no visualViewport. */
+#app.phone { height: var(--vvh, 100dvh); }
 #app.phone #nav,
 #app.phone #statusbar { display: none; }
+
+/* ---- the page itself must not scroll ----
+
+   iOS makes the DOCUMENT scrollable when a field takes focus, so it can
+   lift that field clear of the keyboard. It does this even when the
+   field is already visible -- which here it always is, because the
+   shell is sized to the visual viewport -- and the result is a
+   page-level scrollbar with a screen-height of blank space below the
+   UI, reachable by the same drag that should be scrolling the console.
+
+   Taking the body OUT OF FLOW is what fixes it: the document is then
+   left with no in-flow content, so there is no scrollable area for
+   Safari to scroll. `overflow: hidden` on the body is not enough on its
+   own -- iOS has long ignored it for exactly this case.
+
+   Safe for the overlays: a plain `position: fixed` ancestor does NOT
+   become the containing block for fixed DESCENDANTS (only transform,
+   filter and will-change do that), so the modal backdrop, the drawer
+   scrim and the toast root still resolve against the viewport. */
+/* The ROOT needs the pixel height too, not `height: 100%`. A percentage
+   resolves against the initial containing block, and that does NOT
+   shrink when the keyboard opens -- so html stayed at its full height
+   while body was correctly sized, leaving the document taller than the
+   viewport by exactly the keyboard's height, and iOS scrolled into it.
+   Measured: vv h=358, --vvh=358px, body h358, and doc=695 with
+   scrollY=337. The child was right; its parent's basis was not. */
+.phone-ui { height: var(--vvh, 100%); overflow: hidden; }
+.phone-ui body {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: var(--vvh, 100%);
+  overflow: hidden;
+  overscroll-behavior: none;
+}
 
 /* ---- top bar ---- */
 
@@ -70,6 +112,10 @@
   display: flex; flex-direction: column; overflow: hidden;
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+/* With the keyboard up, the home indicator is behind it -- the inset is
+   no longer a gap this owes anyone, and keeping it just steals a line
+   from an already short view. */
+#app.phone.kbd-open .ph-view-body { padding-bottom: 0; }
 
 .ph-act {
   width: 34px; height: 30px; padding: 0;
@@ -110,6 +156,14 @@
 }
 .ph-drawer-item:active { background: var(--bg-2); }
 .ph-drawer-item.active { background: var(--bg-2); color: var(--accent); }
+/* A settings row rather than a view: quieter than the views above it,
+   and it carries its current value on the right so the drawer answers
+   "what is it set to" without being opened a second time. */
+.ph-drawer-item.sub { font-size: 13px; color: var(--fg-dim); }
+.ph-drawer-value {
+  margin-left: auto; color: var(--fg); font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .ph-drawer-sep {
   height: 1px; background: var(--line); margin: 10px 6px 6px;
 }
@@ -184,15 +238,8 @@
    the badge. */
 .ph-row.bad .ph-row-id { color: var(--danger); }
 .ph-gutter { flex: 0 0 auto; display: block; }
-.ph-lanes { display: block; }
-.ph-lanes .lane {
-  fill: none; stroke: var(--line); stroke-width: 1.6;
-  stroke-linecap: round;
-}
-.ph-lanes .lane-dot {
-  fill: var(--accent); stroke: var(--bg); stroke-width: 1.5;
-}
-.ph-lanes .lane-dot.bad { fill: var(--danger); }
+/* The lane art itself is styled in app.css (.lane-art), shared with the
+   desktop editor's narrow fallback -- one rendering, one look. */
 .ph-row-text {
   flex: 1 1 auto; min-width: 0;
   display: flex; flex-direction: column; justify-content: center; gap: 1px;
@@ -406,6 +453,15 @@
   text-align: center;
 }
 
+/* ---- overflow menu (dom.js openMenu) ---- */
+
+/* Sized for a cursor by default. On a phone it now carries Unload, so
+   the rows need to be far enough apart that the destructive one is not
+   a near-miss for Refresh above it. */
+#app.phone .ctx-menu { min-width: 190px; padding: 6px; }
+#app.phone .ctx-item { padding: 12px 12px; font-size: 14px; }
+#app.phone .ctx-sep { margin: 4px 0; }
+
 /* ---- sheets (openModal bodies) ---- */
 
 .ph-modal { max-height: 82vh; }
@@ -449,13 +505,13 @@
   border: 1px solid var(--line); border-radius: 6px;
   background: var(--bg-2); color: var(--fg); cursor: pointer; font: inherit;
 }
-/* Sized to the text around it (rows, keys, sheet items are 12–13px). An
-   input at 16px reads as a different, louder kind of text than the
-   labels and values it sits among, which is what 16px was buying: below
-   it, iOS Safari zooms the page in on focus. The padding keeps the tap
-   target comfortably past 44px on its own, so the trade is a zoom step
-   on focus in Safari -- reversible with a pinch -- against every field
-   on the screen looking oversized all the time. */
+/* Sized to the text around it (rows, keys, sheet items are 12-13px).
+   Below 16px iOS would auto-zoom the page on focus; that is suppressed
+   at the viewport instead (suppressFocusZoom in phone-app.js), so the
+   type can match its surroundings without buying a zoom. Do not raise
+   this to 16px "to fix zoom" -- the meta already did, and 16px only
+   makes every field louder than the labels beside it. The padding keeps
+   the tap target past 44px on its own. */
 .ph-input {
   width: 100%; padding: 10px; font: inherit; font-size: 13px;
   background: var(--bg); color: var(--fg);
@@ -501,10 +557,15 @@
 /* No Ctrl key on a phone, so the Ctrl+J / Enter legend is noise -- and
    it costs a line at the bottom of a short screen. */
 #app.phone .userio .io-hint { display: none; }
+/* app.css gives the desktop workspace's pane exactly this
+   (.io-pane-body > .userio); the phone's view body needs its own, or
+   the console keeps its content height and the compose box is pushed
+   off the bottom the moment the keyboard takes half the screen. */
+#app.phone .ph-view-body > .userio { flex: 1 1 auto; min-height: 0; }
 #app.phone .userio .io-input { padding: 8px; gap: 6px; }
-/* The compose box reads as the console it answers, not as a headline --
-   so it takes the console's own size rather than being bumped to 16px to
-   dodge iOS's focus zoom (see .ph-input). */
+/* The compose box reads as the console it answers, not as a headline.
+   The focus zoom that would otherwise force 16px here is handled at the
+   viewport (see .ph-input). */
 #app.phone .userio .io-text { font-size: 12.5px; }
 #app.phone .userio .console { font-size: 12.5px; padding: 8px 10px; }
 #app.phone .io-md-toggle { font-size: 11px; white-space: nowrap; }
@@ -513,9 +574,73 @@
    the enabled state already convey. */
 #app.phone .userio .io-input .io-prompt { display: none; }
 
-/* ---- preview ---- */
+/* ---- stage panels (Preview, Compare Images) ---- */
 
-/* The stage panel positions itself absolute into its host, which is
-   .ph-view-body (position: relative above). Nothing else to do. */
+/* Both position themselves absolute into their host, which is
+   .ph-view-body (position: relative above), so they fill the view with
+   no help. What they do need is thumb-sized controls. */
 #app.phone .preview-controls,
-#app.phone .cmpi-controls { bottom: 8px; left: 8px; }
+#app.phone .cmpi-controls { bottom: 8px; left: 8px; right: 8px; }
+#app.phone .preview-ctl,
+#app.phone .cmpi-ctl {
+  min-width: 34px; height: 32px; font-size: 13px;
+}
+/* Compare carries far more chrome than Preview -- five view buttons,
+   swap, seam and six modes. On a phone that only fits by wrapping, and
+   the rows need room to be tapped apart. Its "«" toggle collapses the
+   lot when the picture is what matters. */
+#app.phone .cmpi-controls,
+#app.phone .cmpi-ctl-group,
+#app.phone .cmpi-modes { gap: 6px; }
+#app.phone .cmpi-modes { margin-left: 0; }
+/* The wipe handle is dragged with a finger, not a mouse: widen the
+   invisible hit band well past the 18px a cursor needs, while the
+   visible seam stays the same hairline. */
+#app.phone .cmpi-handle.v { width: 40px; margin-left: -20px; }
+#app.phone .cmpi-handle.v::before { left: 19px; }
+#app.phone .cmpi-handle.h { height: 40px; margin-top: -20px; }
+#app.phone .cmpi-handle.h::before { top: 19px; }
+/* The grab dot has no hover to fade it in on a touch screen, so it
+   stays up: on a phone it is the only thing that says the seam can be
+   dragged. Hidden with the seam, as before. */
+#app.phone .cmpi-handle::after { opacity: 1; }
+#app.phone .cmpi-handle.line-hidden::after { opacity: 0; }
+
+/* ---- ?debug=vv readout ---- */
+
+/* Fixed to the top-left, above everything, and never interactive: it
+   reports on the layout, so it must not be able to change it. Its
+   transform is set from visualViewport.offsetTop (see phone-debug.js)
+   so it stays legible when the page it describes slides away. */
+.ph-vvdbg {
+  position: fixed; top: 0; left: 0; z-index: 999;
+  margin: 0; padding: 4px 6px;
+  background: rgba(0, 0, 0, .82); color: #7ee0a0;
+  font: 10px/1.35 var(--mono);
+  white-space: pre;
+  pointer-events: none;
+  border-bottom-right-radius: 5px;
+  -webkit-text-size-adjust: none; text-size-adjust: none;
+}
+
+/* ---- scroll containment ----
+
+   A gesture inside a real scroller is let through by lockPageScroll,
+   which means it can still CHAIN to the page once that scroller hits
+   its end -- reaching the blank area the lock exists to keep out of
+   reach. `contain` stops the chaining at the element's own boundary, so
+   the two halves cover each other: the lock refuses gestures that would
+   never have scrolled anything, and this refuses the ones that ran out
+   of things to scroll. */
+#app.phone .ph-scroll,
+#app.phone .ph-files-browse > .ph-sheet-list,
+#app.phone .ph-files-preview,
+#app.phone .ph-sys,
+#app.phone .ph-view-actions,
+#app.phone .userio .console,
+#app.phone .userio .io-text,
+#app.phone .ph-drawer,
+.phone-ui .ph-sheet-list,
+.phone-ui .modal {
+  overscroll-behavior: contain;
+}

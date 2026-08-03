@@ -34,6 +34,18 @@ export function mount(body, actions, ctx) {
   // "waiting" when it stops. Persisted in the panel config so a saved
   // layout resumes the same stream.
   let designation = cfg.designation || null;
+  // An optional HINT from the host: the pipeline the operator was last
+  // working in. When this panel has never been pointed at anything, the
+  // first stage list is filtered through it so the panel opens on a
+  // stage from that pipeline instead of an empty picker -- which is the
+  // difference between a phone showing the stream you were just looking
+  // at and asking you to find it again.
+  //
+  // Consumed EXACTLY ONCE, and only when the panel started with no
+  // designation. Re-applying it would make "Change stream" impossible:
+  // clearing the designation shows the picker, and a hint that fired
+  // again would immediately pick something and take the picker away.
+  let hint = designation ? null : (cfg.prefer_pipeline || null);
 
   // ---- channel ------------------------------------------------------
   const channel = ctx.openChannel({
@@ -132,6 +144,21 @@ export function mount(body, actions, ctx) {
 
   function renderStageList(stages) {
     if (!listEl) { return; }
+    // Spend the host's hint on the first list that arrives, then drop it
+    // whether or not it matched -- a hint that survives its first list
+    // would keep re-selecting and the picker could never be reached.
+    if (hint) {
+      const want = hint;
+      hint = null;
+      // A LIVE stage first: with several in the pipeline, the one
+      // already producing is the one worth opening on.
+      const pick = stages.find((s) => s.pipeline === want && s.live)
+                || stages.find((s) => s.pipeline === want);
+      if (pick) {
+        setDesignation({ pipeline: pick.pipeline, stage: pick.stage });
+        return;
+      }
+    }
     clear(listEl);
     if (stages.length === 0) {
       listEl.append(el('div', { class: 'preview-hint' },
@@ -332,14 +359,32 @@ export function mount(body, actions, ctx) {
     const { video, img, media, status, view } = ui;
     const setStatus = (m) => { status.textContent = m; };
 
-    if (typeof window.MediaSource === 'undefined') {
-      setStatus(t('preview.unsupported'));
-      return { onConfig() {}, onBinary() {}, setStatus, destroy() {} };
-    }
-    setStatus(t('preview.connecting'));
+    // iPhone Safari has never exposed MediaSource -- Apple's answer for
+    // it was always HLS. iOS 17.1 added MANAGED Media Source instead:
+    // the same API surface, with the browser owning buffer eviction and
+    // telling the page when it actually wants data.
+    //
+    // The classic one is preferred WHERE IT EXISTS, so this is purely
+    // additive: every platform that plays the preview today keeps the
+    // exact path it has now, and the managed source is reached only
+    // where there was previously nothing -- which is precisely iPhone.
+    // (iPadOS and macOS Safari 17.1 expose both. Switching those over
+    // would mean disabling AirPlay on the element and attaching by
+    // srcObject, i.e. changing something that already works to gain
+    // nothing.)
+    const MSE = window.MediaSource || window.ManagedMediaSource;
+    const managed = !!window.ManagedMediaSource
+                 && MSE === window.ManagedMediaSource;
+    // No source-buffer API at all (iOS 16 and older): video cannot play,
+    // but that is NOT the end of the panel. The stage sends full-quality
+    // stills whenever its source runs below 1 fps, and PCM goes through
+    // WebAudio -- neither needs MSE. Degrading to those beats the dead
+    // end this used to be, where a perfectly playable still-image stream
+    // was refused because video happened to be unavailable.
+    setStatus(MSE ? t('preview.connecting') : t('preview.no_video'));
 
     let gone = false;
-    let ms = null;            // MediaSource
+    let ms = null;            // MediaSource / ManagedMediaSource
     let sb = null;            // SourceBuffer
     let mime = null;          // 'video/mp4; codecs="avc1.xxxx"'
     let objUrl = null;
@@ -376,16 +421,53 @@ export function mount(body, actions, ctx) {
         try { URL.revokeObjectURL(objUrl); } catch (e) {}
         objUrl = null;
       }
+      try { if (video.srcObject) { video.srcObject = null; } } catch (e) {}
       ms = null;
       queue = [];
     }
 
+    // Returns whether a source was actually built. The caller uses that
+    // to decide about the status line: clearing it on every init would
+    // wipe the "this browser cannot decode live video" explanation in
+    // exactly the case that needs it.
     function buildMse(initBytes) {
       teardownMse();
-      if (!mime) { return; }            // config must arrive first
-      ms = new MediaSource();
-      objUrl = URL.createObjectURL(ms);
-      video.src = objUrl;
+      if (!MSE || !mime) { return false; }   // no API, or config not yet
+      // Ask before building. A codec the browser will not take otherwise
+      // shows up as an addSourceBuffer throw with nothing to act on;
+      // naming it turns a "the preview is broken" report into one that
+      // says which codec, from a device nobody here can attach to.
+      if (typeof MSE.isTypeSupported === 'function'
+          && !MSE.isTypeSupported(mime)) {
+        setStatus(t('preview.codec_unsupported', { codec: mime }));
+        return false;
+      }
+      ms = new MSE();
+      if (managed) {
+        // Both are REQUIRED by the managed path. A managed source cannot
+        // be handed to AirPlay, so attaching one to an element that
+        // still allows remote playback fails; and it attaches by
+        // srcObject rather than by an object URL.
+        //
+        // Its startstreaming / endstreaming events are deliberately NOT
+        // acted on. They exist so a page that FETCHES media can stop
+        // fetching; here the frames are pushed at us either way, so
+        // dropping them would save nothing and would punch a timeline
+        // gap into the source buffer -- trading a real stall risk for no
+        // gain. Eviction is the managed source's own job, and
+        // trimBuffer() below still bounds the buffer.
+        try { video.disableRemotePlayback = true; } catch (e) {}
+        try {
+          video.srcObject = ms;
+        } catch (e) {
+          // Older managed implementations only took an object URL.
+          objUrl = URL.createObjectURL(ms);
+          video.src = objUrl;
+        }
+      } else {
+        objUrl = URL.createObjectURL(ms);
+        video.src = objUrl;
+      }
       ms.addEventListener('sourceopen', () => {
         if (gone || !ms || ms.readyState !== 'open') { return; }
         try {
@@ -397,6 +479,7 @@ export function mount(body, actions, ctx) {
       }, { once: true });
       const p = video.play();
       if (p && p.catch) { p.catch(() => {}); }
+      return true;
     }
 
     function pump() {
@@ -440,6 +523,10 @@ export function mount(body, actions, ctx) {
     }
 
     function onFragment(buf) {
+      // Without a source-buffer API there is nothing to append to. Drop
+      // the fragment and stay on whatever still was last shown -- the
+      // panel keeps working for stills and audio.
+      if (!MSE) { return; }
       if (mode === 'image') {
         // Video resumed after a still: rebuild the MediaSource from the
         // retained init so the stale pre-still buffer + the timeline gap
@@ -516,6 +603,11 @@ export function mount(body, actions, ctx) {
         // streams leave them disabled.
         if (view) { view.setEnabled(hasVideo); }
         if (!hasVideo && j.audio) { setStatus(t('preview.audio_only')); }
+        // A video stream this browser cannot decode: say so ONCE, and
+        // say what still works, rather than leaving a black frame with
+        // no explanation. Stills and audio arrive on the same channel
+        // and are unaffected.
+        if (hasVideo && !MSE) { setStatus(t('preview.no_video')); }
         if (j.audio) {
           audioCh = j.audio.channels || 1;
           audioRate = j.audio.sampleRate || 48000;
@@ -537,8 +629,9 @@ export function mount(body, actions, ctx) {
         switch (header && header.m) {
           case 'init':
             lastInit = payload;      // retained for image->video resume
-            buildMse(payload);       // (re)builds the MediaSource
-            setStatus('');
+            // Only a source that was actually built earns a cleared
+            // status; otherwise the explanation has to stand.
+            if (buildMse(payload)) { setStatus(''); }
             break;
           case 'fragment': onFragment(payload); break;
           case 'image':    onImage(payload);    break;

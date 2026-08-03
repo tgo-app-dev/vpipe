@@ -275,7 +275,7 @@ SaveAudioStage::encode_wav_(const std::string& path, const float* pcm,
         this->id(), path));
     return false;
   }
-  // 16-bit PCM WAV (see metal-lm-smoke moss_tts_end_to_end_wav). For
+  // 16-bit PCM WAV (see metal-lm/moss moss_tts_end_to_end_wav). For
   // multi-channel, samples are interleaved in `pcm` already.
   const std::uint16_t ch        = static_cast<std::uint16_t>(channels);
   const std::uint16_t bits      = 16;

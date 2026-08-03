@@ -95,7 +95,6 @@ OnvifDiscoveryStage::OnvifDiscoveryStage(
   // configured value else that default.
   _probe_timeout_ms =
       static_cast<unsigned>(attr_uint("probe_timeout_ms"));
-  _db_name            = attr_str("db_name");
   _overwrite_existing = attr_bool("overwrite_existing");
   _mask_password      = attr_bool("mask_password");
 
@@ -106,8 +105,6 @@ namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "probe_timeout_ms", .type = ConfigType::Uint,
    .doc = "WS-Discovery probe timeout in ms", .def_uint = 3000},
-  {.key = "db_name", .type = ConfigType::String,
-   .doc = "LMDB sub-db storing camera records", .def_str = "cameras"},
   {.key = "overwrite_existing", .type = ConfigType::Bool,
    .doc = "replace an already-registered camera", .def_bool = true},
   {.key = "mask_password", .type = ConfigType::Bool,
@@ -369,7 +366,7 @@ OnvifDiscoveryStage::process(RuntimeContext& ctx)
   rec.device_xaddr   = cam.xaddr;
   rec.supports_onvif = true;
 
-  bool wrote = save_camera(*env, _db_name, rec, _overwrite_existing);
+  bool wrote = save_camera(*env, rec, _overwrite_existing);
   if (!wrote) {
     session()->warn(fmt(
         "OnvifDiscoveryStage('{}'): camera '{}' already registered; "

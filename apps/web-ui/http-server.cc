@@ -996,10 +996,21 @@ HttpServer::serve_static_(const HttpRequest& req) const
     return true;
   };
 
+  // Never let a client hold a stale asset. The bytes are embedded in the
+  // binary, so "the server was rebuilt" is the only way they change --
+  // and without a validator to revalidate against, a browser's heuristic
+  // caching otherwise keeps serving the old CSS/JS after a restart, with
+  // nothing on screen to say why. They are a few hundred KB off a LAN
+  // link, which is the cheaper end of that trade by a wide margin.
+  auto fresh = [](HttpResponse& r) -> HttpResponse& {
+    r.extra_headers.emplace_back("Cache-Control", "no-store");
+    return r;
+  };
+
   HttpResponse r;
-  if (!_doc_root.empty() && read_file(_doc_root + rel, r)) { return r; }
-  if (read_embedded(rel, r)) { return r; }
-  if (read_view_asset(rel, r)) { return r; }
+  if (!_doc_root.empty() && read_file(_doc_root + rel, r)) { return fresh(r); }
+  if (read_embedded(rel, r)) { return fresh(r); }
+  if (read_view_asset(rel, r)) { return fresh(r); }
   // SPA fallback: any unknown non-asset path returns index.html so the
   // client router can render it. Excluded: /api/* (a route, not a page)
   // and /ui/* (a stage's view assets) -- an unresolved module there MUST

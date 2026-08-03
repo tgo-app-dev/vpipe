@@ -22,7 +22,6 @@ namespace vpipe {
 //
 // Config (FlexData object):
 //   model        (string, required) -- the models-DB key to remove.
-//   models_db    (string, default "models") -- LMDB sub-db to remove from.
 //   delete_files (bool, default false) -- also delete the model's recorded
 //                 `local_path` directory from disk (opt-in; destructive).
 //   missing_ok   (bool, default true) -- treat a not-registered model as a
@@ -61,13 +60,11 @@ public:
 
   // Test-only inspectors.
   const std::string& model() const noexcept { return _model; }
-  const std::string& models_db() const noexcept { return _models_db; }
   bool delete_files() const noexcept { return _delete_files; }
   bool missing_ok() const noexcept { return _missing_ok; }
 
 private:
   std::string _model;        // registry key to remove
-  std::string _models_db;    // LMDB sub-db ("models")
   bool        _delete_files{};
   bool        _missing_ok{};
 };

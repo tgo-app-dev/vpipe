@@ -389,10 +389,9 @@ public:
   bool        accounted_in_init = false;
   bool        ran_process       = false;
 
-  std::vector<std::string> declare_models() const override
+  std::vector<ResourceClaim> declare_resources() const override
   {
-    return dir.empty() ? std::vector<std::string>{}
-                       : std::vector<std::string>{dir};
+    return model_memory::weight_claims({dir});
   }
 
   Job initialize(RuntimeContext& ctx) override

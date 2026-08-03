@@ -1,7 +1,16 @@
 set(VPIPE_WEBUI_SOURCES
     main.cc
     http-server.cc
+    api-common.cc
+    file-api.cc
+    database-api.cc
+    pipeline-api.cc
+    io-api.cc
+    log-api.cc
+    profiler-api.cc
     session-api.cc
+    system-api.cc
+    view-api.cc
     web-ui-delegate.cc
     web-ui-log-delegate.cc
     db-browser.cc

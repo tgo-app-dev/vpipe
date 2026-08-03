@@ -42,11 +42,9 @@ const ConfigKey kAttrs[] = {
    .doc = "model dir (text_encoder/, transformer/, tokenizer/); the "
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
           "model-select source on the model iport overrides it",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit"},
-  {.key = "models_db", .type = ConfigType::String, .required = false,
-   .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
           "oport1 -- a GROUNDED encode of the (possibly empty) negative prompt "
@@ -641,8 +639,6 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   // instead, so "no model at all" is reported at initialize()/process() time
   // (when iport connectivity is known), not at construction.
   _hf_dir    = attr_str("hf_dir");
-  _models_db = attr_str("models_db");
-  if (_models_db.empty()) { _models_db = "models"; }
   _grounded_negative = attr_bool("grounded_negative");
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
@@ -769,12 +765,12 @@ DiffusionConditionerStage::reset_run_state()
 
 }
 
-std::vector<std::string>
-DiffusionConditionerStage::declare_models() const
+std::vector<ResourceClaim>
+DiffusionConditionerStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
   // Boogu names its text encoder `mllm/`; every other family uses
   // text_encoder/. Detected from the filesystem rather than by parsing
   // the family, so this stays a cheap pre-init query -- and declaring a
@@ -784,7 +780,8 @@ DiffusionConditionerStage::declare_models() const
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  return {enc, (fs::path(root) / "transformer").string()};
+  return model_memory::weight_claims(
+      {enc, (fs::path(root) / "transformer").string()});
 }
 
 Job
@@ -829,7 +826,7 @@ DiffusionConditionerStage::ensure_loaded_()
         this->id()));
     return;
   }
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
   _family = family_((std::filesystem::path(root) / "transformer").string());
   // Boogu names its text encoder `mllm/` (it is a full multimodal LLM, not a
   // text_encoder in the diffusers sense); every other family uses
@@ -881,7 +878,7 @@ DiffusionConditionerStage::ensure_loaded_()
 // graph has finished loading. Two things are only true then:
 //
 //   * every peer's weights exist, so nothing is missed. Declarations
-//     (Stage::declare_models) already cover peers this stage cannot see
+//     (Stage::declare_resources) already cover peers this stage cannot see
 //     from its own config, but a declaration is an ESTIMATE from the
 //     files on disk.
 //   * what each model is really holding is authoritative, and is often
@@ -1871,7 +1868,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     _model_latched = true;
     if (const auto* mfd =
             mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
-      if (apply_model_select_beat(mfd->data, _hf_dir, _models_db)) {
+      if (apply_model_select_beat(mfd->data, _hf_dir)) {
         ensure_loaded_();
       }
     }

@@ -91,7 +91,6 @@ namespace vpipe {
 //                                    selects the family + encoder. A
 //                                    model-select source on iport2 overrides it;
 //                                    required only when iport2 is unwired.
-//   models_db  (string, default "models") -- registry for resolve_model_dir.
 class DiffusionConditionerStage final
     : public TypedStage<DiffusionConditionerStage> {
 public:
@@ -108,7 +107,7 @@ public:
   // The text encoder this stage loads, plus the DiT it is paired with --
   // the same two directories its footprint query uses, so the
   // declaration and the estimate cannot disagree.
-  std::vector<std::string> declare_models() const override;
+  std::vector<ResourceClaim> declare_resources() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -123,7 +122,6 @@ public:
 private:
   std::string _hf_dir;
   std::string _enc_dir;
-  std::string _models_db;
   // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
   std::string _family = "krea2";
   std::uint64_t _emitted = 0;

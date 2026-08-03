@@ -1,6 +1,6 @@
 // ModelSelectStage + apply_model_select_beat() tests (CPU-only).
 //
-// The model-select source emits one { hf_dir, models_db } FlexData beat that
+// The model-select source emits one { hf_dir } FlexData beat that
 // the diffusion-conditioner / text-to-image / vae-encode / vae-decode stages
 // latch on their `model` iport to share a single model choice (overriding each
 // stage's hf_dir config). These tests cover the source's beat shape + one-shot
@@ -62,15 +62,14 @@ public:
   }
 };
 
-// The (hf_dir, models_db) of a captured model beat.
-pair<string, string>
-beat_dirs_(const unique_ptr<BeatPayloadIntf>& p)
+// The hf_dir of a captured model beat.
+string
+beat_dir_(const unique_ptr<BeatPayloadIntf>& p)
 {
   const auto* fd = dynamic_cast<const FlexDataPayload*>(p.get());
   if (fd == nullptr || !fd->data.is_object()) { return {}; }
   auto o = fd->data.as_object();
-  return {string(o.at("hf_dir").as_string("")),
-          string(o.at("models_db").as_string(""))};
+  return string(o.at("hf_dir").as_string(""));
 }
 
 }  // namespace
@@ -84,7 +83,9 @@ TEST(model_select, config_hf_dir_required_deferred)
   EXPECT_TRUE(s.num_oports() == 1);
 }
 
-// resolved_beat() carries hf_dir + the models_db (defaulting to "models").
+// resolved_beat() carries the hf_dir. The registry sub-db is fixed
+// (kModelRegistryDb) rather than travelling in the beat, so a consumer
+// cannot be pointed at a different db than the one model-fetch writes.
 TEST(model_select, resolved_beat_shape)
 {
   Session sess;
@@ -95,16 +96,14 @@ TEST(model_select, resolved_beat_shape)
   FlexData beat = s.resolved_beat();       // bind: as_object() is a view
   auto o = beat.as_object();
   EXPECT_TRUE(string(o.at("hf_dir").as_string("")) == "/models/krea2");
-  EXPECT_TRUE(string(o.at("models_db").as_string("")) == "models");
+  EXPECT_FALSE(o.contains("models_db"));
 
   FlexData cfg2 = FlexData::make_object();
   cfg2.as_object().insert("hf_dir", FlexData::make_string("org/repo"));
-  cfg2.as_object().insert("models_db", FlexData::make_string("my_db"));
   ModelSelectStage s2(&sess, "ms2", vector<InEdge>{}, std::move(cfg2));
   FlexData beat2 = s2.resolved_beat();
   auto o2 = beat2.as_object();
   EXPECT_TRUE(string(o2.at("hf_dir").as_string("")) == "org/repo");
-  EXPECT_TRUE(string(o2.at("models_db").as_string("")) == "my_db");
 }
 
 // End-to-end: the source emits exactly one model beat, and it fans out to
@@ -136,10 +135,8 @@ TEST(model_select, emits_one_beat_to_all_consumers)
 
   ASSERT_TRUE(s0->captured.size() == 1);
   ASSERT_TRUE(s1->captured.size() == 1);
-  const auto d0 = beat_dirs_(s0->captured[0]);
-  const auto d1 = beat_dirs_(s1->captured[0]);
-  EXPECT_TRUE(d0.first == "/models/flux2" && d0.second == "models");
-  EXPECT_TRUE(d1.first == "/models/flux2" && d1.second == "models");
+  EXPECT_TRUE(beat_dir_(s0->captured[0]) == "/models/flux2");
+  EXPECT_TRUE(beat_dir_(s1->captured[0]) == "/models/flux2");
 }
 
 // A source must emit again on a RELAUNCH. Stopping a pipeline destroys
@@ -171,45 +168,45 @@ TEST(model_select, emits_again_on_relaunch)
     rt.wait_idle();
     rt.stop();
     ASSERT_TRUE(sk->captured.size() == static_cast<size_t>(run));
-    const auto d = beat_dirs_(sk->captured[run - 1]);
-    EXPECT_TRUE(d.first == "/models/flux2" && d.second == "models");
+    EXPECT_TRUE(beat_dir_(sk->captured[run - 1]) == "/models/flux2");
   }
 }
 
-// The shared beat parser: overrides hf_dir (string or object; "model" alias)
-// and only overrides models_db when the beat carries one.
+// The shared beat parser: overrides hf_dir (string or object; "model"
+// alias). A "models_db" carried by an OLD beat is ignored -- the registry
+// sub-db is fixed system-wide.
 TEST(model_select, apply_beat_parses_forms)
 {
-  // Plain string -> hf_dir; models_db untouched.
+  // Plain string -> hf_dir.
   {
-    string hf = "old", db = "models";
+    string hf = "old";
     EXPECT_TRUE(apply_model_select_beat(
-        FlexData::make_string("/m/krea2"), hf, db));
-    EXPECT_TRUE(hf == "/m/krea2" && db == "models");
+        FlexData::make_string("/m/krea2"), hf));
+    EXPECT_TRUE(hf == "/m/krea2");
   }
-  // Object with hf_dir + models_db -> both overridden.
+  // Object with hf_dir (+ a stale models_db, which is ignored).
   {
     FlexData b = FlexData::make_object();
     b.as_object().insert("hf_dir", FlexData::make_string("org/repo"));
     b.as_object().insert("models_db", FlexData::make_string("db2"));
-    string hf = "old", db = "models";
-    EXPECT_TRUE(apply_model_select_beat(b, hf, db));
-    EXPECT_TRUE(hf == "org/repo" && db == "db2");
+    string hf = "old";
+    EXPECT_TRUE(apply_model_select_beat(b, hf));
+    EXPECT_TRUE(hf == "org/repo");
   }
-  // Object with the "model" alias, no models_db -> db kept.
+  // Object with the "model" alias.
   {
     FlexData b = FlexData::make_object();
     b.as_object().insert("model", FlexData::make_string("/m/qie"));
-    string hf = "old", db = "keepme";
-    EXPECT_TRUE(apply_model_select_beat(b, hf, db));
-    EXPECT_TRUE(hf == "/m/qie" && db == "keepme");
+    string hf = "old";
+    EXPECT_TRUE(apply_model_select_beat(b, hf));
+    EXPECT_TRUE(hf == "/m/qie");
   }
-  // Empty / no usable ref -> false, fields untouched.
+  // Empty / no usable ref -> false, hf_dir untouched.
   {
-    string hf = "old", db = "models";
-    EXPECT_FALSE(apply_model_select_beat(FlexData::make_string(""), hf, db));
-    EXPECT_FALSE(apply_model_select_beat(FlexData::make_object(), hf, db));
-    EXPECT_TRUE(hf == "old" && db == "models");
+    string hf = "old";
+    EXPECT_FALSE(apply_model_select_beat(FlexData::make_string(""), hf));
+    EXPECT_FALSE(apply_model_select_beat(FlexData::make_object(), hf));
+    EXPECT_TRUE(hf == "old");
   }
 }
 

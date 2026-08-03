@@ -3,6 +3,7 @@
 #include "common/lmdb-env.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-catalog.h"
+#include "stages/model-registry.h"
 
 #include <lmdb.h>
 
@@ -24,8 +25,7 @@ fstr(const FlexData::ConstObjectView& o, const char* key)
 }  // namespace
 
 FlexData
-list_installed_models(SessionContextIntf* sctx, const string& db_name,
-                      string& err)
+list_installed_models(SessionContextIntf* sctx, string& err)
 {
   FlexData doc = FlexData::make_object();
   FlexData arr = FlexData::make_array();
@@ -45,7 +45,7 @@ list_installed_models(SessionContextIntf* sctx, const string& db_name,
     return doc;
   }
   MDB_dbi dbi = 0;
-  if (mdb_dbi_open(txn, db_name.c_str(), 0, &dbi) != 0) {
+  if (mdb_dbi_open(txn, string(kModelRegistryDb).c_str(), 0, &dbi) != 0) {
     // No registry sub-db yet (nothing fetched) -> empty list, not an error.
     mdb_txn_abort(txn);
     doc.as_object().insert("models", std::move(arr));
@@ -84,8 +84,11 @@ list_installed_models(SessionContextIntf* sctx, const string& db_name,
       }
       // Enrich from the catalogue: by `name` first (the vpipe-supplement
       // CoreML models share one hf_path, so hf_path can't disambiguate
-      // them), else by hf_path. Misses (user-typed paths) fall back to a
-      // plain "model" with empty I/O.
+      // them), else by hf_path. A miss falls back to what the RECORD
+      // carries -- model-register detects category + I/O for a model it
+      // registers from disk, and dropping that would hide a perfectly
+      // well-described model from the compatibility filters -- and only
+      // then to a plain "model" with empty I/O.
       const string name = fstr(ro, "name");
       const string hf = fstr(ro, "hf_path");
       const ModelCatalogEntry* ce = nullptr;
@@ -110,7 +113,17 @@ list_installed_models(SessionContextIntf* sctx, const string& db_name,
           mo.insert("outputs", meo.at("outputs"));
         }
       } else {
-        mo.insert("category", FlexData::make_string("model"));
+        for (const char* f : {"category", "parent_model_type",
+                              "parent_param_class"}) {
+          if (ro.contains(f)) {
+            mo.insert(f, FlexData::make_string(string(ro.at(f).as_string(""))));
+          }
+        }
+        if (ro.contains("inputs"))  { mo.insert("inputs", ro.at("inputs")); }
+        if (ro.contains("outputs")) { mo.insert("outputs", ro.at("outputs")); }
+        if (!ro.contains("category")) {
+          mo.insert("category", FlexData::make_string("model"));
+        }
       }
       a.push_back(std::move(m));
     }

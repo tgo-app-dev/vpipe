@@ -38,6 +38,7 @@ set(LOCAL_TEST_SOURCES
   session-sandbox.cc
   model-catalog.cc
   model-memory.cc
+  model-register-stage.cc
   model-remove-stage.cc
   model-select-stage.cc
   sampler-select-stage.cc
@@ -112,7 +113,20 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         audio-transcribe-stage.cc
         gemma4-unified-embedder.cc
         gguf-convert.cc
-        metal-lm-smoke.cc
+        metal-lm/attention.cc
+        metal-lm/batched-decode.cc
+        metal-lm/bench.cc
+        metal-lm/gemma-gguf.cc
+        metal-lm/gemma-text.cc
+        metal-lm/kquant.cc
+        metal-lm/manager.cc
+        metal-lm/moss.cc
+        metal-lm/multimodal-vqa.cc
+        metal-lm/pdecode.cc
+        metal-lm/quant-gemv-bench.cc
+        metal-lm/quant-gemv.cc
+        metal-lm/qwen-text.cc
+        metal-lm/speculative-mtp.cc
         model-quantize-roundtrip.cc
         model-quantize-stage.cc
         model-eval-stage.cc

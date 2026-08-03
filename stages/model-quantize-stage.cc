@@ -19,6 +19,7 @@
 #include "generative-models/tokenizer.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/ui-delegate-intf.h"
+#include "stages/model-detect.h"
 #include "stages/model-registry.h"
 
 #include <cctype>
@@ -52,7 +53,6 @@ ModelQuantizeStage::ModelQuantizeStage(
   // the default.
   _src_model     = attr_str("src_model");
   _output_name   = attr_str("output_name");
-  _models_db     = attr_str("models_db");
   _arch          = attr_str("arch");
   _target        = attr_str("target");
   _bits          = static_cast<int>(attr_uint("bits"));
@@ -67,7 +67,6 @@ ModelQuantizeStage::ModelQuantizeStage(
   _layer_prefix  = attr_str("layer_prefix");
   _quant_modulation = attr_bool("quant_modulation");
   _n_layers      = static_cast<int>(attr_uint("n_layers"));
-  if (_models_db.empty()) { _models_db = "models"; }
 
   if (_src_model.empty()) {
     fail_config(fmt("ModelQuantizeStage('{}'): config.src_model is required",
@@ -470,13 +469,11 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "src_model", .type = ConfigType::String, .required = true,
    .doc = "source model: a models-DB key (registered by model-fetch) or a "
           "bf16/f16 safetensors directory path",
-   .suggest_db = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "output_name", .type = ConfigType::String, .required = true,
    .doc = "result name -> <cwd>/models/<output_name> (registered in the "
           "models DB under this key), or an explicit path (\"/..\", \"./..\") "
           "used verbatim and not registered"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db for src lookup + output registration", .def_str = "models"},
   {.key = "bits", .type = ConfigType::Uint,
    .doc = "backbone affine bit-width (4 | 8)", .def_uint = 8},
   {.key = "group_size", .type = ConfigType::Uint,
@@ -603,17 +600,26 @@ ModelQuantizeStage::register_output_(const std::string& key,
     ro.insert_or_assign("source", FlexData::make_string(_src_model));
     ro.insert_or_assign("quantized", FlexData::make_bool(true));
     ro.insert_or_assign("bits", FlexData::make_uint((std::uint64_t)bits));
-    if (!arch.empty()) {
+    // Describe the OUTPUT by probing it (model-detect.h), so a quantized
+    // model carries the same runtime type + I/O modalities as a fetched
+    // one. This is what gets a quantized DiT its "<family>-dit" tag --
+    // the arch-detect below is an LM probe and says nothing about a DiT.
+    const DetectedModel d = detect_model_dir(dir);
+    record_detected_fields(ro, d);
+    // Fall back to the source model's arch tag when the output itself
+    // isn't recognizable. "unknown" is arch-detect's miss value, not a
+    // family -- writing it would be a false compatibility hint.
+    if (d.model_type.empty() && !arch.empty() && arch != "unknown") {
       ro.insert_or_assign("model_type", FlexData::make_string(arch));
     }
-    LmdbDb  db(*env, _models_db);
+    LmdbDb  db(*env, kModelRegistryDb);
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadWrite);
     const std::string bytes = rec.to_binary();
     db.put(txn, key, bytes);
     txn.commit();
     session()->info(fmt(
-        "ModelQuantizeStage('{}'): registered '{}' -> '{}' in sub-db '{}'",
-        this->id(), key, dir, _models_db));
+        "ModelQuantizeStage('{}'): registered '{}' -> '{}' in the "
+        "model registry", this->id(), key, dir));
   } catch (const std::exception& e) {
     session()->warn(fmt(
         "ModelQuantizeStage('{}'): registry write for '{}' failed: {}",
@@ -629,7 +635,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
 
   // Resolve the source: a models-DB key wins over a same-named path.
   const std::string src_dir =
-      resolve_model_dir(session(), _models_db, _src_model);
+      resolve_model_dir(session(), _src_model);
 
   // Resolve the output. A bare name (or "org/name") -> <cwd>/models/<name>,
   // registered under that key; an absolute/relative path ("/..", "./..") is
@@ -1419,7 +1425,7 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
   // the upstream model-fetch may not have downloaded it at config time.
   // Missing source => log + halt WITHOUT emitting a summary, so the
   // cascade stops here instead of quantizing a nonexistent model.
-  if (!model_dir_available(session(), _models_db, _src_model)) {
+  if (!model_dir_available(session(), _src_model)) {
     session()->error(fmt(
         "ModelQuantizeStage('{}'): source model '{}' is not available "
         "(not downloaded yet?); skipping quantization",
@@ -1441,7 +1447,6 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
     so.insert_or_assign("stage", FlexData::make_string("model-quantize"));
     so.insert_or_assign("source", FlexData::make_string(_src_model));
     so.insert_or_assign("output", FlexData::make_string(_output_name));
-    so.insert_or_assign("models_db", FlexData::make_string(_models_db));
     so.insert_or_assign("bits", FlexData::make_int(_bits));
     so.insert_or_assign("group_size", FlexData::make_int(_group_size));
     so.insert_or_assign("quantized", FlexData::make_bool(ok));

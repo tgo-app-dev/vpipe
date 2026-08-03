@@ -817,6 +817,9 @@ strip_prefix_(std::string& s, const std::string& prefix)
 // Default input / output modalities by model_type, used when an entry
 // does not record them explicitly (keeps I/O correct + DRY across the
 // many same-type entries; an entry may still override via inputs/outputs).
+// Published as catalog_default_io() below: model-register derives the
+// same I/O for a model it detects on disk, so a registered model reads
+// identically to a catalogued one.
 void
 default_io_(const std::string& mt, std::vector<std::string>& in,
             std::vector<std::string>& out)
@@ -842,6 +845,12 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              || mt == "mage-flow-edit") {
     set({"text", "image"}, {"image"});
+  } else if (mt == "boogu-image-edit") {
+    set({"text", "image"}, {"image"});
+  } else if (mt == "boogu-image") {
+    // The t2i instantiation takes no reference image (the edit
+    // checkpoints, "boogu-image-edit", are the image-conditioned ones).
+    set({"text"}, {"image"});
   } else if (mt == "mage-flow") {
     // The t2i instantiation takes no reference image (the edit checkpoints,
     // "mage-flow-edit", are the image-conditioned ones).
@@ -955,6 +964,14 @@ catalog_category(const ModelCatalogEntry& e)
     return "supplement";
   }
   return "model";
+}
+
+void
+catalog_default_io(const std::string& model_type,
+                   std::vector<std::string>& in,
+                   std::vector<std::string>& out)
+{
+  default_io_(model_type, in, out);
 }
 
 FlexData

@@ -71,11 +71,9 @@ to_flex(const CameraRecord& r)
 }
 
 std::optional<CameraRecord>
-load_camera(LmdbEnv&         env,
-            std::string_view db_name,
-            std::string_view name)
+load_camera(LmdbEnv& env, std::string_view name)
 {
-  LmdbDb  db(env, db_name);
+  LmdbDb  db(env, kIpCamRegistryDb);
   LmdbTxn txn(env, LmdbTxn::Mode::ReadOnly);
   auto    view = db.get(txn, name);
   if (!view) {
@@ -95,11 +93,10 @@ load_camera(LmdbEnv&         env,
 
 bool
 save_camera(LmdbEnv&            env,
-            std::string_view    db_name,
             const CameraRecord& rec,
             bool                overwrite_existing)
 {
-  LmdbDb  db(env, db_name);
+  LmdbDb  db(env, kIpCamRegistryDb);
   LmdbTxn txn(env, LmdbTxn::Mode::ReadWrite);
 
   if (!overwrite_existing) {

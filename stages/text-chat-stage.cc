@@ -8,6 +8,7 @@
 #include "common/text-stream-chunk.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -162,10 +163,6 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _hf_dir        = attr_str("hf_dir");
-  _models_db     = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -240,12 +237,10 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "model: a models-DB key (registered by model-fetch) or an "
           "HF-style model dir; a DB key wins over a same-named path",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    // text-chat is a text->text LM: the model must accept text and emit
    // text (so the browser hides ASR/image/audio-out models).
    .need_inputs = "text", .need_outputs = "text"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
   {.key = "compute_dtype", .type = ConfigType::String,
    .doc = "bf16 | f16 | f32", .def_str = "bf16"},
   {.key = "page_tokens", .type = ConfigType::Int,
@@ -463,11 +458,12 @@ TextChatStage::reset_run_state()
   _sampler_latched = false;
 }
 
-std::vector<std::string>
-TextChatStage::declare_models() const
+std::vector<ResourceClaim>
+TextChatStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+  return model_memory::weight_claims(
+      {resolve_model_dir(session(), _hf_dir)});
 }
 
 Job
@@ -508,7 +504,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   genai::LoadSpec spec;
-  spec.hf_dir        = resolve_model_dir(session(), _models_db, _hf_dir);
+  spec.hf_dir        = resolve_model_dir(session(), _hf_dir);
   spec.compute_dtype = _compute_dtype;
   spec.page_tokens   = _page_tokens;
   spec.max_pages     = _max_pages;

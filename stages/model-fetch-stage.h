@@ -16,7 +16,8 @@ namespace vpipe {
 //      synthesizing it natively from the repo's byte-level-BPE files
 //      (vocab.json + merges.txt + tokenizer_config.json) -- no
 //      transformers/Python; a no-op when the repo already ships one;
-//   4) register the model in the active LMDB env under sub-db "models",
+//   4) register the model in the active LMDB env under the model
+//      registry sub-db (model-registry.h),
 //      keyed by the path after huggingface.co, with a FlexData record of
 //      the key facts;
 //   5) signal_done and terminate.
@@ -44,7 +45,6 @@ private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*.
   std::string   _base_path;          // download root ("" -> ./models)
-  std::string   _db_name;            // LMDB sub-db for the registry
   std::string   _model_path;         // non-interactive: a direct hf path
   std::string   _hf_token;           // optional auth ("" -> $HF_TOKEN)
   bool          _overwrite_existing{};

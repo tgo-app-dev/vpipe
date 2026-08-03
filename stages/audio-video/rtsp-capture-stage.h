@@ -10,7 +10,7 @@
 namespace vpipe {
 
 // Long-running source stage (0-or-1 iport, 2 oports). Looks up a
-// camera by `camera_name` in the LMDB "cameras" sub-db (populated by
+// camera by `camera_name` in the IP-camera registry sub-db (populated by
 // onvif-discovery-stage), decrypts the stored ONVIF password,
 // connects to the RTSP stream via FFmpeg, and writes IDR-aligned
 // MP4 segments to disk. Each finalized segment is indexed in the
@@ -87,7 +87,6 @@ private:
   std::string _camera_name;          // required
   std::string _output_dir;           // required
   std::chrono::seconds      _segment_seconds{};
-  std::string _cameras_db;
   std::string _videos_db_suffix;
   std::string _rtsp_transport;
   unsigned    _stimeout_us{};

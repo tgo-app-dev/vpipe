@@ -31,10 +31,12 @@ export const strings = {
   'preview.reconnecting':['Reconnecting…', '重新连接中…', '重新連線中…'],
   'preview.mse_error': ['Video playback error', '视频播放错误',
       '視訊播放錯誤'],
-  'preview.unsupported':['This browser cannot play the preview (no Media '
-      + 'Source Extensions).',
-      '此浏览器无法播放预览（不支持 Media Source Extensions）。',
-      '此瀏覽器無法播放預覽（不支援 Media Source Extensions）。'],
+  'preview.no_video':  ['This browser cannot decode live video — still '
+      + 'pictures and audio still play.',
+      '此浏览器无法解码实时视频 — 静态画面与音频仍可播放。',
+      '此瀏覽器無法解碼即時視訊 — 靜態畫面與音訊仍可播放。'],
+  'preview.codec_unsupported':['This browser will not play {codec}',
+      '此浏览器不支持 {codec}', '此瀏覽器不支援 {codec}'],
   'preview.audio_only':['Audio only', '仅音频', '僅音訊'],
   'preview.zoom_out':  ['Zoom out', '缩小', '縮小'],
   'preview.zoom_in':   ['Zoom in', '放大', '放大'],

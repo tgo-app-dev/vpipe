@@ -19,7 +19,7 @@ namespace vpipe {
 // separate configs. The emitted beat OVERRIDES each consumer's `hf_dir` config
 // key.
 //
-// The beat is:  { "hf_dir": <dir-or-registry-key>, "models_db": <db> }
+// The beat is:  { "hf_dir": <dir-or-registry-key> }
 // which apply_model_select_beat() (model-registry.h) parses on the consumer
 // side; each consumer then resolve_model_dir()s it as usual, so a registry key
 // or a filesystem path both work.
@@ -28,8 +28,6 @@ namespace vpipe {
 //   hf_dir     (string, required) -- the model dir/registry key shared by the
 //                                    conditioner / DiT / vae-encode / vae-decode
 //                                    stages.
-//   models_db  (string, default "models") -- the registry db the consumers pass
-//                                    to resolve_model_dir.
 class ModelSelectStage final : public TypedStage<ModelSelectStage> {
 public:
   static constexpr const char* kTypeName = "model-select";
@@ -50,7 +48,6 @@ public:
 
 private:
   std::string   _hf_dir;
-  std::string   _models_db;
   std::uint64_t _emitted = 0;
 };
 

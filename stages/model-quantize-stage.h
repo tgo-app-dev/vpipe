@@ -47,8 +47,6 @@ namespace genai { struct QuantArchInfo; }
 //                  bf16/f16 safetensors directory path.
 //   output_name   (string, required) -- result name (-> <cwd>/models/<name>,
 //                  registered) or an explicit path ("/..", "./..").
-//   models_db     (string, default "models") -- LMDB sub-db for src lookup +
-//                  output registration.
 //   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8).
 //   group_size    (uint, default 64) -- affine group size (32 | 64).
 //   arch          (string, default "") -- model family tag; empty => auto-
@@ -172,7 +170,6 @@ private:
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _src_model;
   std::string _output_name;
-  std::string _models_db;
   std::string _arch;
   std::string _target;   // krea2 component to quantize: dit|text_encoder|vae
   int         _bits{};

@@ -19,6 +19,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/audio-transcribe-stage.h"
+#include "stages/model-registry.h"
 #include "stages/save-text-stage.h"
 
 #include <cmath>
@@ -84,13 +85,13 @@ make_tempdir_()
   return tmpl;
 }
 
-// Register a models-DB record {local_path: <local>} under `key`.
+// Register a model-registry record {local_path: <local>} under `key`.
 void
 register_model_(Session& sess, const std::string& key,
                 const std::string& local)
 {
   LmdbEnv* env = sess.lmdb_env();
-  LmdbDb   db(*env, "models");
+  LmdbDb   db(*env, kModelRegistryDb);
   LmdbTxn  txn(*env, LmdbTxn::Mode::ReadWrite);
   FlexData rec = FlexData::make_object();
   rec.as_object().insert_or_assign("local_path",
@@ -123,7 +124,7 @@ TEST(audio_transcribe_stage, config_defaults) {
 // hf_dir may name a models-DB key; resolve_model_dir maps it to the
 // record's local_path. A non-key value (a path) is returned unchanged,
 // and a DB key wins even when an identically-named directory exists.
-TEST(audio_transcribe_stage, hf_dir_resolves_via_models_db) {
+TEST(audio_transcribe_stage, hf_dir_resolves_via_registry) {
   const std::string tmp = make_tempdir_();
   CerrSilencer hush;
 

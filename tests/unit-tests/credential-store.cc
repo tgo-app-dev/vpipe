@@ -57,9 +57,9 @@ TEST(credential_store, round_trip_minimal)
   in.device_xaddr   = "http://192.168.0.42/onvif/device_service";
   in.supports_onvif = true;
 
-  EXPECT_TRUE(save_camera(env, "cameras", in));
+  EXPECT_TRUE(save_camera(env, in));
 
-  auto out = load_camera(env, "cameras", "frontdoor");
+  auto out = load_camera(env, "frontdoor");
   EXPECT_TRUE(out.has_value());
   EXPECT_TRUE(out->name           == in.name);
   EXPECT_TRUE(out->rtsp_uri       == in.rtsp_uri);
@@ -76,13 +76,13 @@ TEST(credential_store, load_missing_returns_nullopt)
   Session s;
   LmdbEnv env(&s, dir.path);
 
-  // Ensure the named sub-db exists (LmdbDb constructor creates it),
+  // Ensure the registry sub-db exists (LmdbDb constructor creates it),
   // but never write the row we look up.
   {
-    LmdbDb db(env, "cameras");
+    LmdbDb db(env, kIpCamRegistryDb);
     (void)db;
   }
-  auto out = load_camera(env, "cameras", "absent");
+  auto out = load_camera(env, "absent");
   EXPECT_FALSE(out.has_value());
 }
 
@@ -95,19 +95,19 @@ TEST(credential_store, overwrite_existing_guard)
   CameraRecord rec;
   rec.name     = "frontdoor";
   rec.rtsp_uri = "rtsp://old";
-  EXPECT_TRUE(save_camera(env, "cameras", rec, /*overwrite*/true));
+  EXPECT_TRUE(save_camera(env, rec, /*overwrite*/true));
 
   rec.rtsp_uri = "rtsp://new";
   // overwrite_existing=false must short-circuit and leave the old
   // value in place.
-  EXPECT_FALSE(save_camera(env, "cameras", rec, /*overwrite*/false));
-  auto reread = load_camera(env, "cameras", "frontdoor");
+  EXPECT_FALSE(save_camera(env, rec, /*overwrite*/false));
+  auto reread = load_camera(env, "frontdoor");
   EXPECT_TRUE(reread.has_value());
   EXPECT_TRUE(reread->rtsp_uri == "rtsp://old");
 
   // overwrite_existing=true (the default) replaces.
-  EXPECT_TRUE(save_camera(env, "cameras", rec, /*overwrite*/true));
-  auto reread2 = load_camera(env, "cameras", "frontdoor");
+  EXPECT_TRUE(save_camera(env, rec, /*overwrite*/true));
+  auto reread2 = load_camera(env, "frontdoor");
   EXPECT_TRUE(reread2->rtsp_uri == "rtsp://new");
 }
 
@@ -128,13 +128,13 @@ TEST(credential_store, backward_compat_old_record)
       "password_blob", FlexData::make_string("legacy-blob"));
   std::string bytes = v.to_binary();
   {
-    LmdbDb  db(env, "cameras");
+    LmdbDb  db(env, kIpCamRegistryDb);
     LmdbTxn txn(env);
     db.put(txn, "oldcam", bytes);
     txn.commit();
   }
 
-  auto out = load_camera(env, "cameras", "oldcam");
+  auto out = load_camera(env, "oldcam");
   EXPECT_TRUE(out.has_value());
   EXPECT_TRUE(out->name           == "oldcam");
   EXPECT_TRUE(out->rtsp_uri       == "rtsp://legacy/path");

@@ -101,7 +101,6 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 //                                    DiT pass per step and pushes the velocity
 //                                    away from the negative (v_neg + scale*
 //                                    (v_pos - v_neg)); ~2x DiT cost per step.
-//   models_db  (string, default "models") -- registry for resolve_model_dir.
 //   init_latents (string, optional) -- debug/repro: a raw f32 file of packed
 //                                    initial latents [img_seq, z_dim*4] to use
 //                                    instead of RNG noise (for golden anchoring).
@@ -127,7 +126,7 @@ public:
 
   // The DiT this stage loads plus the text encoder it must coexist with
   // -- the same two directories plan_streaming() sizes against.
-  std::vector<std::string> declare_models() const override;
+  std::vector<ResourceClaim> declare_resources() const override;
 
 private:
   // Tell the manager what a STREAMING DiT actually keeps resident, which
@@ -154,7 +153,6 @@ private:
 
   std::string _hf_dir;
   std::string _dit_dir;
-  std::string _models_db;
   std::string _init_latents;
   int         _height{};
   int         _width{};

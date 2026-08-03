@@ -11,6 +11,7 @@
 #include "common/lmdb-txn.h"
 #include "common/session.h"
 #include "pipeline/stage-registry.h"
+#include "stages/model-registry.h"
 #include "stages/model-remove-stage.h"
 
 #include <filesystem>
@@ -66,17 +67,13 @@ struct TempDir {
 };
 
 FlexData
-cfg_(string_view model, bool delete_files = false, bool missing_ok = true,
-     string_view models_db = "")
+cfg_(string_view model, bool delete_files = false, bool missing_ok = true)
 {
   FlexData c = FlexData::make_object();
   auto o = c.as_object();
   o.insert_or_assign("model", FlexData::make_string(model));
   o.insert_or_assign("delete_files", FlexData::make_bool(delete_files));
   o.insert_or_assign("missing_ok", FlexData::make_bool(missing_ok));
-  if (!models_db.empty()) {
-    o.insert_or_assign("models_db", FlexData::make_string(models_db));
-  }
   return c;
 }
 
@@ -139,7 +136,6 @@ TEST(model_remove_stage, config_defaults)
   Session sess;
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{}, cfg_("some-model"));
   EXPECT_TRUE(s.model() == "some-model");
-  EXPECT_TRUE(s.models_db() == "models");
   EXPECT_FALSE(s.delete_files());
   EXPECT_TRUE(s.missing_ok());
   EXPECT_TRUE(s.config_error().empty());
@@ -149,9 +145,7 @@ TEST(model_remove_stage, config_overrides)
 {
   Session sess;
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{},
-                     cfg_("m", /*delete_files*/ true, /*missing_ok*/ false,
-                          /*models_db*/ "registry"));
-  EXPECT_TRUE(s.models_db() == "registry");
+                     cfg_("m", /*delete_files*/ true, /*missing_ok*/ false));
   EXPECT_TRUE(s.delete_files());
   EXPECT_FALSE(s.missing_ok());
 }
@@ -181,8 +175,8 @@ TEST(model_remove_stage, removes_registered_record)
   LmdbEnv* env = sess.lmdb_env();
   ASSERT_TRUE(env != nullptr);
 
-  seed_(*env, "models", "org/repo", "");
-  EXPECT_TRUE(has_record_(*env, "models", "org/repo"));
+  seed_(*env, kModelRegistryDb, "org/repo", "");
+  EXPECT_TRUE(has_record_(*env, kModelRegistryDb, "org/repo"));
 
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{}, cfg_("org/repo"));
   const auto r = s.remove_once();
@@ -190,7 +184,7 @@ TEST(model_remove_stage, removes_registered_record)
   EXPECT_TRUE(r.present);
   EXPECT_TRUE(r.removed);
   EXPECT_FALSE(r.files_deleted);
-  EXPECT_FALSE(has_record_(*env, "models", "org/repo"));
+  EXPECT_FALSE(has_record_(*env, kModelRegistryDb, "org/repo"));
 }
 
 // missing_ok (default) -> a not-registered model is a success (already
@@ -241,7 +235,7 @@ TEST(model_remove_stage, delete_files_removes_local_path)
   { std::ofstream(model_dir / "weights.bin") << "xx"; }
   ASSERT_TRUE(filesystem::exists(model_dir, ec));
 
-  seed_(*env, "models", "org/m", model_dir.string());
+  seed_(*env, kModelRegistryDb, "org/m", model_dir.string());
 
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{},
                      cfg_("org/m", /*delete_files*/ true));
@@ -251,7 +245,7 @@ TEST(model_remove_stage, delete_files_removes_local_path)
   EXPECT_TRUE(r.files_deleted);
   EXPECT_TRUE(r.local_path == model_dir.string());
   EXPECT_FALSE(filesystem::exists(model_dir, ec));
-  EXPECT_FALSE(has_record_(*env, "models", "org/m"));
+  EXPECT_FALSE(has_record_(*env, kModelRegistryDb, "org/m"));
 }
 
 // Default (delete_files=false) removes only the record; the on-disk model
@@ -268,7 +262,7 @@ TEST(model_remove_stage, keeps_files_when_delete_files_false)
   filesystem::create_directories(model_dir, ec);
   { std::ofstream(model_dir / "weights.bin") << "xx"; }
 
-  seed_(*env, "models", "org/keep", model_dir.string());
+  seed_(*env, kModelRegistryDb, "org/keep", model_dir.string());
 
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{}, cfg_("org/keep"));
   const auto r = s.remove_once();
@@ -276,27 +270,26 @@ TEST(model_remove_stage, keeps_files_when_delete_files_false)
   EXPECT_TRUE(r.removed);
   EXPECT_FALSE(r.files_deleted);
   EXPECT_TRUE(filesystem::exists(model_dir, ec));   // files survive
-  EXPECT_FALSE(has_record_(*env, "models", "org/keep"));
+  EXPECT_FALSE(has_record_(*env, kModelRegistryDb, "org/keep"));
 }
 
-// The removal is scoped to the configured sub-db; a same-keyed record in
+// The removal is scoped to the model registry; a same-keyed record in
 // another sub-db is not touched.
-TEST(model_remove_stage, only_removes_from_named_sub_db)
+TEST(model_remove_stage, only_removes_from_registry_sub_db)
 {
   TempDir tdir;
   Session sess(db_cfg_(tdir.path));
   LmdbEnv* env = sess.lmdb_env();
   ASSERT_TRUE(env != nullptr);
 
-  seed_(*env, "models", "shared/key", "");
+  seed_(*env, kModelRegistryDb, "shared/key", "");
   seed_(*env, "other",  "shared/key", "");
 
   ModelRemoveStage s(&sess, "rm", std::vector<InEdge>{},
-                     cfg_("shared/key", /*delete_files*/ false,
-                          /*missing_ok*/ true, /*models_db*/ "models"));
+                     cfg_("shared/key"));
   const auto r = s.remove_once();
   EXPECT_TRUE(r.ok);
   EXPECT_TRUE(r.removed);
-  EXPECT_FALSE(has_record_(*env, "models", "shared/key"));
+  EXPECT_FALSE(has_record_(*env, kModelRegistryDb, "shared/key"));
   EXPECT_TRUE(has_record_(*env, "other", "shared/key"));   // untouched
 }

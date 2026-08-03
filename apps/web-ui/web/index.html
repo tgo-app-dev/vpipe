@@ -14,6 +14,15 @@
       document.documentElement.dataset.theme =
         (t === 'dark' || t === 'light' || t === 'auto') ? t : 'auto';
     } catch (e) {}
+    // And the saved locale, for the same reason: the CJK font stack is
+    // picked off <html lang> (see --cjk-sans), so leaving it at "en"
+    // until the app module loads shows one frame of the wrong cut.
+    try {
+      var l = localStorage.getItem('vpipe_lang');
+      if (l === 'en-us' || l === 'zh-cn' || l === 'zh-tw') {
+        document.documentElement.setAttribute('lang', l);
+      }
+    } catch (e) {}
   </script>
   <link rel="stylesheet" href="/css/app.css">
 </head>

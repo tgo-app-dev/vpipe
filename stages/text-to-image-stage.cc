@@ -59,12 +59,12 @@ const ConfigKey kAttrs[] = {
           "tokenizer/); an original or model-quantize'd (self-contained) "
           "pipeline. OPTIONAL: a model-select source on the model iport "
           "overrides it",
-   .suggest_db = "models", .suggest_db_type =
+   .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,mage-flow-dit,"
        "boogu-image-dit"},
@@ -85,8 +85,6 @@ const ConfigKey kAttrs[] = {
   {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
    .doc = "classifier-free guidance scale; 1 (default) disables CFG. >1 with "
           "a negative prompt on iport1 runs a 2nd DiT pass per step"},
-  {.key = "models_db", .type = ConfigType::String, .required = false,
-   .doc = "model registry db for resolve_model_dir (default \"models\")"},
   {.key = "init_latents", .type = ConfigType::String, .required = false,
    .doc = "debug: raw f32 packed initial latents [img_seq, 64] (repro/golden)"},
   {.key = "no_watermark", .type = ConfigType::Bool, .required = false,
@@ -175,9 +173,7 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
 {
   _hf_dir    = attr_str("hf_dir");
   _dit_dir   = attr_str("dit_dir");
-  _models_db = attr_str("models_db");
   _init_latents = attr_str("init_latents");
-  if (_models_db.empty()) { _models_db = "models"; }
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
   _steps  = (int)attr_int("steps");
@@ -429,18 +425,19 @@ TextToImageStage::revise_dit_declaration_(const std::string& dit_dir) const
       model_memory::dir_weights_bytes(dit_dir) >> 20));
 }
 
-std::vector<std::string>
-TextToImageStage::declare_models() const
+std::vector<ResourceClaim>
+TextToImageStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
   const std::string mllm = (fs::path(root) / "mllm").string();
   std::error_code ec;
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  return {(fs::path(root) / "transformer").string(), enc};
+  return model_memory::weight_claims(
+      {(fs::path(root) / "transformer").string(), enc});
 }
 
 Job
@@ -474,7 +471,7 @@ TextToImageStage::ensure_loaded_()
     return;
   }
   namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _models_db, _hf_dir);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
   // The text encoder lives in the paired diffusion-conditioner stage, but its
   // weights are resident in the SAME process while the DiT runs, so the
   // encoder-coexistence streaming heuristics below still budget for it.
@@ -491,7 +488,7 @@ TextToImageStage::ensure_loaded_()
   }
   const std::string dit_dir = _dit_dir.empty()
       ? (fs::path(root) / "transformer").string()
-      : resolve_model_dir(session(), _models_db, _dit_dir);
+      : resolve_model_dir(session(), _dit_dir);
   _family = t2i_family_(dit_dir);
   const std::string size_desc =
       _infer_size ? std::string("auto (from ref_latent0)")
@@ -2036,7 +2033,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     _model_latched = true;
     if (const auto* mfd =
             mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
-      if (apply_model_select_beat(mfd->data, _hf_dir, _models_db)) {
+      if (apply_model_select_beat(mfd->data, _hf_dir)) {
         ensure_loaded_();
       }
     }

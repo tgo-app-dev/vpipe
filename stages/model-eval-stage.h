@@ -23,7 +23,6 @@ namespace vpipe {
 // Config (FlexData object):
 //   model_a     (string, required) -- first model: a models-DB key or a path.
 //   model_b     (string, optional) -- second model; empty => single-model eval.
-//   models_db   (string, default "models") -- LMDB sub-db for key resolution.
 //   wikitext    (string, default "wikitext-2-raw-test") -- the WikiText-2
 //               dataset: a models-DB key (fetch it with model-fetch) or a dir
 //               path. Empty / not-found => the perplexity probe is skipped.
@@ -71,7 +70,6 @@ public:
 private:
   std::string   _model_a;
   std::string   _model_b;
-  std::string   _models_db;
   std::string   _wikitext;
   std::string   _arc;
   int           _ppl_tokens{};

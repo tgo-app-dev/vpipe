@@ -11,8 +11,8 @@ class SessionContextIntf;
 
 namespace vpipe::webui {
 
-// Lists the installed (registered) models from the `db_name` LMDB sub-db
-// (the registry model-fetch writes, normally "models"), each enriched with
+// Lists the installed (registered) models from the model registry sub-db
+// (kModelRegistryDb, the one model-fetch writes), each enriched with
 // curated catalogue metadata -- derived `category` ("model" | "supplement"
 // | "dataset"), input/output modalities, and parent linkage -- so the
 // web-ui model browser can filter to models compatible with a stage field
@@ -24,8 +24,7 @@ namespace vpipe::webui {
 //                 param_class, variant, category, inputs, outputs,
 //                 parent_model_type?, parent_param_class? } ] }
 FlexData
-list_installed_models(SessionContextIntf* sctx, const std::string& db_name,
-                      std::string& err);
+list_installed_models(SessionContextIntf* sctx, std::string& err);
 
 }
 

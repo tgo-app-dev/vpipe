@@ -4,9 +4,11 @@
 import { el, clear, append, toast, openModal, openMenu, kbd }
   from '../dom.js';
 import { makeIcon } from '../icons.js';
-import { api } from '../api.js';
+import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
+import { topoOrder, assignLanes, laneArt, gutterWidth }
+  from '../lane-graph.js';
 import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
 
@@ -66,6 +68,10 @@ function mountEditor(container, opts = {}) {
     // per pipeline.
     graphPins: new Map(),
     graphContainer: null, // live element from renderGraph (overlay target)
+    // Which rendering the graph pane currently holds: the canvas, or the
+    // linearized lane list it falls back to when the pane is too narrow
+    // to draw one. The resize watcher compares against this.
+    renderedNarrow: false,
     // Buffer-utilization overlay: poll the running pipeline's per-edge
     // backlog/capacity and annotate the graph. Enabled by default so a
     // freshly-running pipeline shows depth immediately; the interval is
@@ -285,6 +291,34 @@ function mountEditor(container, opts = {}) {
     ? el('div', { class: 'pm' }, listPane, editorArea)
     : el('div', { class: 'pm no-sel' }, editorArea);
   clear(container).append(pmRoot);
+
+  // Watch the graph pane for the canvas/list crossover. Every cause of a
+  // width change lands here -- the window, the stage:config divider, the
+  // toolbox collapsing -- so there is one trigger rather than a hook per
+  // cause.
+  //
+  // It re-renders only when the MODE actually flips. A divider drag
+  // fires this on almost every frame, and rebuilding a canvas (or a
+  // list) per frame would make the drag itself stutter; comparing
+  // against the last decision makes all but one of those a no-op.
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(() => {
+      if (!document.body.contains(pmRoot)) { return; }
+      const now = isNarrow();
+      // Compared against WHAT IS ON SCREEN (recorded by renderGraphPane)
+      // rather than against the last observation. The two differ at
+      // mount: the pane is measured at 0 before layout, which isNarrow()
+      // reads as wide, so a first render can legitimately disagree with
+      // the first observation and must be allowed to correct itself --
+      // while a first observation that agrees must not cost a rebuild.
+      if (now === state.renderedNarrow) { return; }
+      // The canvas keeps its pan/zoom in state.graphView, which a trip
+      // through the list would leave pointing at a viewport of a
+      // different width. Refit on the way back to it.
+      if (!now) { state.graphView = {}; }
+      renderGraphPane();
+    }).observe(graphBody);
+  }
 
   function iconBtn(icon, label, onclick, key) {
     return el('button', {
@@ -660,8 +694,30 @@ function mountEditor(container, opts = {}) {
   }
 
   // --- middle pane --------------------------------------------------
+  // The canvas needs a NODE's width (176px) plus room to route edges
+  // around it; below roughly two of those it stops being a graph and
+  // becomes a column of boxes with the edges folded behind them. At that
+  // point the linearized rendering -- the same one the phone uses, from
+  // lane-graph.js -- says strictly more about the topology in the space
+  // available, so the pane switches to it rather than showing a canvas
+  // nobody can read.
+  const NARROW_PX = 420;
+
+  function isNarrow() {
+    // clientWidth is 0 while the pane is detached (first render, or a
+    // hidden composer panel); treat unknown as WIDE so a freshly-mounted
+    // editor never flashes the fallback before it has been laid out.
+    const w = graphBody.clientWidth;
+    return w > 0 && w < NARROW_PX;
+  }
+
   function renderGraphPane(o = {}) {
     if (state.missing) { renderRebindPane(); return; }
+    // Recorded for the resize watcher: what this render actually drew,
+    // decided once here so every branch below (including the empty
+    // ones) leaves an accurate answer behind.
+    const narrow = isNarrow();
+    state.renderedNarrow = narrow;
     clear(graphBody);
     state.graphContainer = null;   // old overlay target is gone
     // Re-dock the (persistent) canvas run/pause/stop overlay; it floats at
@@ -687,6 +743,8 @@ function mountEditor(container, opts = {}) {
         editable
           ? t('pl.empty_drag')
           : t('pl.empty')));
+    } else if (narrow) {
+      renderLaneList(g);
     } else {
       const gc = renderGraph(g, {
         selected: state.selectedStage,
@@ -736,6 +794,39 @@ function mountEditor(container, opts = {}) {
       // running pipeline's graph was just (re)built.
       pollBuffersNow();
     }
+  }
+
+  // The narrow fallback: one row per stage in dependency order, with the
+  // connections in a `git log --graph` gutter.
+  //
+  // Read-only about TOPOLOGY -- there is nowhere to drop a stage or aim
+  // at a port in this width, which is why the canvas gave up in the
+  // first place. Everything else the editor does still works: a row
+  // selects its stage, and the configuration pane beside it stays fully
+  // editable. The note at the end says how to get the canvas back,
+  // because a pane that silently changes shape owes the reader that.
+  function renderLaneList(g) {
+    const laid = assignLanes(topoOrder(g.nodes, g.edges), g.edges);
+    const gutter = gutterWidth(laid.width);
+    const list = el('div', { class: 'lane-list' });
+    for (const r of laid.rows) {
+      const n = r.node;
+      const bad = !!n.config_error;
+      list.append(el('button', {
+        class: 'lane-row' + (bad ? ' bad' : '')
+             + (n.id === state.selectedStage ? ' selected' : ''),
+        title: n.config_error || n.id,
+        onclick: () => selectStage(n.id),
+      },
+        el('span', { class: 'lane-gutter', style: `width:${gutter}px` },
+           laneArt(r, laid.width, bad)),
+        el('span', { class: 'lane-text' },
+           el('span', { class: 'lane-id' }, n.id),
+           el('span', { class: 'lane-type' }, n.type)),
+        bad ? el('span', { class: 'lane-warn' }, '!') : null));
+    }
+    list.append(el('div', { class: 'lane-note' }, t('pl.narrow_note')));
+    graphBody.append(list);
   }
 
   // --- composer: toolbox + drag-create + click-to-connect ----------
@@ -1215,7 +1306,7 @@ function mountEditor(container, opts = {}) {
   // it's absent we fall back to "show whatever current is" so the
   // editor doesn't strand the user with empty inputs against an
   // un-upgraded server.
-  // Compatibility-aware model browser for a `suggest_db="models"` field.
+  // Compatibility-aware model browser for a model-registry field.
   // Lists installed models filtered by (a) the field's model_type allow-
   // list (suggest_db_type) and (b) parent-model compatibility: a supplement
   // (vision tower / LoRA) is shown only when the parent model chosen in a
@@ -1451,9 +1542,9 @@ function mountEditor(container, opts = {}) {
       // keys as a datalist dropdown. Free text is still allowed (e.g.
       // hf_dir also accepts a filesystem path). Best-effort -- the field
       // stays usable if the keys can't be fetched.
-      // The "models" sub-db is handled by the compatibility-aware model
+      // The model registry is handled by the compatibility-aware model
       // browser instead (Browse button below), so skip the datalist there.
-      if (f.suggest_db && f.suggest_db !== 'models') {
+      if (f.suggest_db && f.suggest_db !== MODEL_REGISTRY_DB) {
         const dlId = id + '_dl';
         datalist = el('datalist', { id: dlId });
         input.setAttribute('list', dlId);
@@ -1601,11 +1692,13 @@ function mountEditor(container, opts = {}) {
         type: 'button', title: t('fs.browse'), onclick: openBrowser },
         makeIcon('folder', 'sm'));
     }
-    // Model fields (schema `suggest_db="models"`) get a compatibility-aware
+    // Model fields (schema `suggest_db` = the model registry) get a
+    // compatibility-aware
     // model browser instead of a datalist: it lists only installed models
     // matching the field's model_type(s) AND the parent model chosen in a
     // sibling field. Free text is still allowed in the input.
-    if (f.suggest_db === 'models' && f.type === 'string' && !disabled) {
+    if (f.suggest_db === MODEL_REGISTRY_DB && f.type === 'string'
+        && !disabled) {
       browseBtn = el('button', { class: 'btn ghost mini browse',
         type: 'button', title: t('pl.mb_browse'),
         onclick: () => openModelBrowser(f, input, (val) => {

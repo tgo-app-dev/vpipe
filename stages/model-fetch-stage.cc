@@ -1,5 +1,7 @@
 #include "stages/model-fetch-stage.h"
 #include "stages/model-catalog.h"
+#include "stages/model-detect.h"
+#include "stages/model-registry.h"
 #include "stages/qwen-asr-tokenizer.h"
 
 #include "common/flex-data.h"
@@ -364,25 +366,6 @@ extract_tar_(const fs::path& archive, const fs::path& dest_dir, string& err)
   return true;
 }
 
-// Find the single top-level `*.mlpackage` directory directly under `dir`
-// (the vpipe-supplement archive layout). Empty path when none is present.
-fs::path
-find_mlpackage_(const fs::path& dir)
-{
-  std::error_code ec;
-  if (!fs::exists(dir, ec)) {
-    return {};
-  }
-  for (const auto& e : fs::directory_iterator(dir, ec)) {
-    if (ec) { break; }
-    const fs::path& p = e.path();
-    if (p.extension() == ".mlpackage") {
-      return p;
-    }
-  }
-  return {};
-}
-
 }  // namespace
 
 ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
@@ -395,7 +378,6 @@ ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
   ensure_curl_global_init();
 
   _base_path           = attr_str("base_path");
-  _db_name             = attr_str("db_name");
   _model_path          = attr_str("model_path");
   _hf_token            = attr_str("hf_token");
   _overwrite_existing  = attr_bool("overwrite_existing");
@@ -403,10 +385,6 @@ ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
   _skip_existing_files = attr_bool("skip_existing_files");
   _verify_tls          = attr_bool("verify_tls");
   _timeout_seconds     = static_cast<unsigned>(attr_uint("timeout_seconds"));
-
-  if (_db_name.empty()) {
-    _db_name = "models";
-  }
 
   allocate_oports(spec().oports.size());
 }
@@ -416,8 +394,6 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "base_path", .type = ConfigType::String,
    .doc = "download root; empty -> ./models. Files land under "
           "<base>/<owner>/<repo>"},
-  {.key = "db_name", .type = ConfigType::String,
-   .doc = "LMDB sub-db the model is registered in", .def_str = "models"},
   {.key = "model_path", .type = ConfigType::String,
    .doc = "non-interactive: a direct 'owner/repo' (or full URL); empty "
           "-> prompt / browse the catalogue"},
@@ -462,8 +438,8 @@ const StageSpec kSpec = {
   .doc       = "Interactive one-shot: identify a model (browse the "
                "internal HuggingFace catalogue or type a path), download "
                "it under a base path, synthesize the Qwen3-ASR "
-               "tokenizer.json natively, and register it in LMDB sub-db "
-               "'models' keyed by the huggingface.co path. Optional "
+               "tokenizer.json natively, and register it in the model "
+               "registry keyed by the huggingface.co path. Optional "
                "trigger in / summary out.",
   .display_name = "Model Fetch",
   .category  = StageCategory::Preparation,
@@ -614,7 +590,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
                  this->id()));
   }
   {
-    LmdbDb  db(*env, _db_name);
+    LmdbDb  db(*env, kModelRegistryDb);
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadOnly);
     auto existing = db.get(txn, reg_key);
     const bool present = existing.has_value();
@@ -681,20 +657,21 @@ ModelFetchStage::process(RuntimeContext& ctx)
                         FlexData::make_string(
                             "https://huggingface.co/datasets"));
     ro.insert_or_assign("dataset", FlexData::make_bool(true));
+    record_detected_fields(ro, detect_model_dir(local_dir.string(), hf_path));
     ro.insert_or_assign("model_type",
                         FlexData::make_string(entry->model_type));
     ro.insert_or_assign("total_bytes", FlexData::make_uint(total));
     ro.insert_or_assign("files", std::move(files_arr));
     {
-      LmdbDb  db(*env, _db_name);
+      LmdbDb  db(*env, kModelRegistryDb);
       LmdbTxn txn(*env, LmdbTxn::Mode::ReadWrite);
       const string bytes = rec.to_binary();
       db.put(txn, reg_key, bytes);
       txn.commit();
     }
     s->info(fmt(
-        "ModelFetchStage('{}'): dataset '{}' ({}) registered in sub-db '{}'",
-        this->id(), reg_key, human_bytes_(total), _db_name));
+        "ModelFetchStage('{}'): dataset '{}' ({}) registered in the "
+        "model registry", this->id(), reg_key, human_bytes_(total)));
     ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
     ro.insert_or_assign("text", FlexData::make_string(
         fmt("[model-fetch] dataset {}\n  -> {}\n  {} file(s), {} bytes",
@@ -850,7 +827,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
         continue;
       }
       const fs::path archive = local_dir / f.path;
-      fs::path pkg = find_mlpackage_(extract_dir);
+      string pkg = coreml_artifact(extract_dir.string());
       // Re-unpack when nothing is there yet, or anything was (re)downloaded
       // this run (so a refreshed archive overwrites a stale extraction).
       if (pkg.empty() || downloaded > 0) {
@@ -862,17 +839,21 @@ ModelFetchStage::process(RuntimeContext& ctx)
               "ModelFetchStage('{}'): unpack of '{}' failed: {}",
               this->id(), f.path, xerr));
         }
-        pkg = find_mlpackage_(extract_dir);
+        pkg = coreml_artifact(extract_dir.string());
       }
       if (!pkg.empty()) {
-        local_path_str = pkg.string();
+        local_path_str = pkg;
         s->info(fmt("ModelFetchStage('{}'): unpacked package '{}'",
                     this->id(), local_path_str));
       } else {
+        // The record then names a directory CoreML cannot load. Say so
+        // in those terms: the stage that eventually fails is a different
+        // one, and its error names only the path it was handed.
         local_path_str = extract_dir.string();
         s->warn(fmt(
-            "ModelFetchStage('{}'): no *.mlpackage found under '{}' "
-            "after unpacking '{}'; registering the dir itself",
+            "ModelFetchStage('{}'): no *.mlpackage / *.mlmodelc found "
+            "under '{}' after unpacking '{}'; registering the dir "
+            "itself, which CoreML will not be able to load",
             this->id(), extract_dir.string(), f.path));
       }
     }
@@ -924,6 +905,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
                       FlexData::make_uint(files.size()));
   ro.insert_or_assign("total_bytes", FlexData::make_uint(total_bytes));
   ro.insert_or_assign("files", std::move(files_arr));
+  // Describe what was downloaded (runtime type + I/O modalities) by
+  // probing it, the same way model-register does. For a CATALOGUED repo
+  // this reproduces the curated fields, which the block below then
+  // rewrites verbatim; the win is the UNcatalogued repo -- a user-typed
+  // owner/repo used to register with no metadata at all, so no stage
+  // picker would offer it.
+  record_detected_fields(ro, detect_model_dir(local_path_str, hf_path));
   if (entry) {
     if (!entry->name.empty()) {
       ro.insert_or_assign("name", FlexData::make_string(entry->name));
@@ -942,15 +930,15 @@ ModelFetchStage::process(RuntimeContext& ctx)
   }
 
   {
-    LmdbDb      db(*env, _db_name);
+    LmdbDb      db(*env, kModelRegistryDb);
     LmdbTxn     txn(*env, LmdbTxn::Mode::ReadWrite);
     const string bytes = rec.to_binary();
     db.put(txn, reg_key, bytes);
     txn.commit();
   }
 
-  s->info(fmt("ModelFetchStage('{}'): registered '{}' in sub-db '{}'",
-              this->id(), reg_key, _db_name));
+  s->info(fmt("ModelFetchStage('{}'): registered '{}' in the model "
+              "registry", this->id(), reg_key));
   ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
   ro.insert_or_assign("text", FlexData::make_string(
       fmt("[model-fetch] {}\n  -> {}\n  {} file(s), {} bytes",

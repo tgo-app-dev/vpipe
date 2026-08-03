@@ -13,10 +13,9 @@ namespace vpipe {
 
 std::string
 resolve_model_dir(const SessionContextIntf* session,
-                  const std::string&        models_db,
                   const std::string&        ref)
 {
-  if (!session || models_db.empty()) {
+  if (!session) {
     return ref;
   }
   LmdbEnv* env = session->lmdb_env();
@@ -28,7 +27,7 @@ resolve_model_dir(const SessionContextIntf* session,
     // LmdbDb opens (creates if absent) the sub-db; a read txn then looks
     // up the key. No write txn is held, so the open-during-RW deadlock
     // doesn't apply.
-    LmdbDb  db(*env, models_db);
+    LmdbDb  db(*env, kModelRegistryDb);
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadOnly);
     auto    view = db.get(txn, ref);
     if (!view) {
@@ -49,32 +48,27 @@ resolve_model_dir(const SessionContextIntf* session,
   if (local.empty()) {
     return ref;
   }
-  session->info(fmt(
-      "model registry: '{}' -> '{}' (models DB '{}')",
-      ref, local, models_db));
+  session->info(fmt("model registry: '{}' -> '{}'", ref, local));
   return local;
 }
 
 bool
 model_dir_available(const SessionContextIntf* session,
-                    const std::string&        models_db,
                     const std::string&        ref)
 {
   if (ref.empty()) {
     return false;
   }
-  const std::string dir = resolve_model_dir(session, models_db, ref);
+  const std::string dir = resolve_model_dir(session, ref);
   std::error_code ec;
   return std::filesystem::exists(dir, ec) && !ec;
 }
 
 bool
 apply_model_select_beat(const FlexData& beat,
-                        std::string&    hf_dir,
-                        std::string&    models_db)
+                        std::string&    hf_dir)
 {
-  std::string ref, db;
-  bool has_db = false;
+  std::string ref;
   if (beat.is_string()) {
     ref = std::string(beat.as_string(""));
   } else if (beat.is_object()) {
@@ -84,18 +78,11 @@ apply_model_select_beat(const FlexData& beat,
     } else if (o.contains("model")) {
       ref = std::string(o.at("model").as_string(""));
     }
-    if (o.contains("models_db")) {
-      db = std::string(o.at("models_db").as_string(""));
-      has_db = !db.empty();
-    }
   }
   if (ref.empty()) {
     return false;
   }
   hf_dir = ref;
-  if (has_db) {
-    models_db = db;
-  }
   return true;
 }
 

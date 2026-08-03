@@ -26,6 +26,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/realtime-vqa-stage.h"
+#include "stages/model-registry.h"
 #include "stages/trigger-beat.h"
 
 #include <unistd.h>
@@ -106,7 +107,7 @@ TEST(realtime_vqa_stage, coreml_vision_field_offers_both_families) {
     if (k.key == "coreml_vision_path") { cv = &k; break; }
   }
   ASSERT_TRUE(cv != nullptr);
-  EXPECT_TRUE(cv->suggest_db == "models");
+  EXPECT_TRUE(cv->suggest_db == kModelRegistryDb);
   const std::string_view types = cv->suggest_db_type;
   EXPECT_TRUE(types.find("qwen3.5-vision-encoder")
               != std::string_view::npos);

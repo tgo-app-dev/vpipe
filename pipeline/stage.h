@@ -5,6 +5,7 @@
 #include "common/vertex.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/stage-config.h"
 #include "pipeline/stage-spec.h"
 #include <atomic>
@@ -106,8 +107,11 @@ public:
   // cheap and non-throwing -- it runs on the driver before any I/O.
   virtual void reset_run_state() {}
 
-  // The model directories this stage INTENDS to load, declared before
-  // any stage's initialize() runs.
+  // The scarce, process-wide things this stage INTENDS to acquire,
+  // declared before any stage's initialize() runs. Model weights are
+  // the case that motivated this; see pipeline/resource-plan.h for the
+  // phase and stages/model-memory.h for the weight planner and the
+  // model_memory::weight_claims() helper most overrides use.
   //
   // Why it has to be a separate phase. Every driver runs initialize()
   // concurrently, and that is where model-holding stages both decide
@@ -120,16 +124,29 @@ public:
   // the model manager knows every checkpoint the graph is about to
   // open, whoever opens it.
   //
-  // The declarations are cleared once the init barrier opens, because
-  // from then on what each model is really holding is authoritative --
-  // and is often much less than its files weigh, a streaming DiT being
-  // the obvious case.
+  // The declarations stand for the whole launch; they are NOT dropped
+  // when the init barrier opens. The tempting alternative -- that the
+  // real bytes are authoritative once loading is done -- is wrong here,
+  // because a weight set only accounts for what it CACHED, and the LMs
+  // read uncached (their weights live in the model's own members). So
+  // clearing would make a multi-GB checkpoint read as near-zero the
+  // instant it finished loading, which is exactly when peers start
+  // sizing the box against it. A declared checkpoint counts at the
+  // larger of its estimate and what it holds.
   //
-  // Return the directories, not sizes; the manager estimates from disk.
-  // Directories that do not exist, or that this run will not actually
-  // load, are harmless -- an over-estimate makes a stage more cautious,
-  // which is the safe error. Default: no models.
-  virtual std::vector<std::string> declare_models() const { return {}; }
+  // A model that genuinely keeps less than its files weigh says so
+  // itself, via GenerativeModelManager::revise_declaration -- the
+  // streaming DiTs do. Each planner drops the previous launch's state
+  // when the next one begins, so nothing leaks between runs.
+  //
+  // Return claims, not sizes; the planner estimates. Keys that do not
+  // resolve to anything, or that this run will not actually load, are
+  // harmless -- an over-estimate makes a stage more cautious, which is
+  // the safe error. Default: nothing claimed.
+  virtual std::vector<ResourceClaim> declare_resources() const
+  {
+    return {};
+  }
 
   // Per-port clock group. Ports with the same clock_group on the
   // same stage share a clock; the graph analyzer (see

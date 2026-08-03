@@ -1,5 +1,11 @@
 // REST client for the web-ui backend (/api/*).
 
+// The LMDB sub-db the model registry lives in. Mirrors kModelRegistryDb
+// (stages/model-registry.h): a schema field carrying this as its
+// `suggest_db` is a MODEL field, and gets the compatibility-aware model
+// browser instead of a plain key datalist.
+export const MODEL_REGISTRY_DB = '__vpipe_model_registry';
+
 // First-cut auth: a remote server gates /api/* on an 8-char key printed
 // in its console. We hold it and attach it as X-Auth-Key; on a 401 we ask
 // the UI (via the registered prompt) for the key and retry once.

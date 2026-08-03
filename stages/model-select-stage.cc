@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-registry.h"
 
 #include <string>
 #include <utility>
@@ -18,17 +19,14 @@ const ConfigKey kAttrs[] = {
    .doc = "the model dir/registry key shared by the diffusion-conditioner, "
           "text-to-image (DiT), vae-encode and vae-decode stages; emitted as a "
           "beat that overrides each of their hf_dir config keys",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit"},
-  {.key = "models_db", .type = ConfigType::String, .required = false,
-   .doc = "model registry db the consumers pass to resolve_model_dir "
-          "(default \"models\")"},
 };
 const PortSpec kOports[] = {
   {.name = "model",
-   .doc = "the shared model reference { hf_dir, models_db } as a FlexData beat "
+   .doc = "the shared model reference { hf_dir } as a FlexData beat "
           "for a diffusion stage's model iport to latch",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
@@ -57,8 +55,6 @@ ModelSelectStage::ModelSelectStage(const SessionContextIntf* s,
   // Deferred validation (Stage::fail_config): construct for any config so a
   // graph can be built/edited before the model is supplied.
   _hf_dir    = attr_str("hf_dir");
-  _models_db = attr_str("models_db");
-  if (_models_db.empty()) { _models_db = "models"; }
   if (_hf_dir.empty()) {
     fail_config(fmt("ModelSelectStage('{}'): config.hf_dir is required (the "
                     "model dir/key to share)", this->id()));
@@ -80,7 +76,6 @@ ModelSelectStage::resolved_beat() const
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
   o.insert_or_assign("hf_dir", FlexData::make_string(_hf_dir));
-  o.insert_or_assign("models_db", FlexData::make_string(_models_db));
   return fd;
 }
 
@@ -100,8 +95,8 @@ Job
 ModelSelectStage::process(RuntimeContext& ctx)
 {
   if (_emitted > 0) { ctx.signal_done(); co_return; }
-  session()->info(fmt("ModelSelectStage('{}'): model = '{}' (db '{}')",
-                      this->id(), _hf_dir, _models_db));
+  session()->info(fmt("ModelSelectStage('{}'): model = '{}'",
+                      this->id(), _hf_dir));
   co_await ctx.write(0, make_payload<FlexDataPayload>(resolved_beat()));
   ++_emitted;
   ctx.signal_done();   // one-shot source: emit then close.

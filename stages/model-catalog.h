@@ -108,6 +108,17 @@ const ModelCatalogEntry* catalog_by_name(const std::string& name);
 // "supplement" (has a parent_model_type -- a tower / LoRA), else "model".
 std::string catalog_category(const ModelCatalogEntry& e);
 
+// Default input / output modalities for a runtime `model_type`, each a
+// subset of {"text","image","audio","video"}. This is the table the
+// catalogue falls back to for entries that don't record I/O explicitly,
+// exposed so a model registered from disk (model-register, which detects
+// its model_type) derives the SAME modalities as its catalogued
+// siblings. Appends to `in` / `out`; an unknown type appends nothing.
+void
+catalog_default_io(const std::string& model_type,
+                   std::vector<std::string>& in,
+                   std::vector<std::string>& out);
+
 // Serialize an entry's curated metadata (selection fields + model_type,
 // category, inputs, outputs, parent linkage) to a FlexData object, for the
 // web-ui model browser. Fetch-only fields (files, dataset URLs) are omitted.

@@ -23,7 +23,7 @@
 // still says what it will resolve to.
 
 import { el, clear, openModal } from '../dom.js';
-import { api } from '../api.js';
+import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { t, tOr } from '../i18n.js';
 import { openFsSheet, dirOf, baseOf } from './phone-fs.js';
 
@@ -138,7 +138,7 @@ export function configField(f, opts = {}) {
             onPick: (p) => { inp.value = p; markSet(); },
           });
         } }, '…'));
-    } else if (!ro && f.suggest_db === 'models') {
+    } else if (!ro && f.suggest_db === MODEL_REGISTRY_DB) {
       row.append(el('button', { class: 'ph-f-btn',
         onclick: () => openModelPicker(f, (key) => {
           inp.value = key; markSet();
@@ -176,7 +176,7 @@ function extsFromFilter(filter) {
   return out.length ? out : null;
 }
 
-// Installed models for a `suggest_db="models"` field. Filtered by the
+// Installed models for a model-registry `suggest_db` field. Filtered by the
 // field's model_type allow-list only -- the desktop additionally hides a
 // supplement whose parent doesn't match the model picked in a SIBLING
 // field of the same form, which needs cross-field state this compact

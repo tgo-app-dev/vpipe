@@ -9,6 +9,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 #include "stages/trigger-beat.h"
@@ -397,10 +398,6 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
   // configured value else that default. Clamps repair out-of-range
   // overrides.
   _hf_dir               = attr_str("hf_dir");
-  _models_db            = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _coreml_vision_path   = attr_str("coreml_vision_path");
   _compute_dtype        = attr_str("compute_dtype");
   // UI/prompt locale for the built-in scene prompts. An explicit
@@ -487,9 +484,7 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "VLM model: a models-DB key (registered by model-fetch) or an "
           "HF-style model dir; a DB key wins over a same-named path",
-   .suggest_db = "models"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "coreml_vision_path", .type = ConfigType::String,
    .doc = "pre-converted CoreML vision tower (Qwen3.5-VL OR Gemma-4 "
           "soft-token export): a models-DB key (registered by model-fetch) "
@@ -497,7 +492,7 @@ constexpr ConfigKey kAttrs[] = {
           "set it replaces the GPU vision tower and the model's own input "
           "size/format govern preprocessing, so vlm_input_width/height and "
           "vlm_max_soft_tokens are ignored.",
-   .def_str = "", .suggest_db = "models",
+   .def_str = "", .suggest_db = kModelRegistryDb,
    .suggest_db_type = "qwen3.5-vision-encoder,gemma4-vision-encoder"},
   {.key = "compute_dtype", .type = ConfigType::String,
    .doc = "bf16 | f16 | f32", .def_str = "bf16"},
@@ -693,11 +688,12 @@ RealtimeVqaStage::reset_run_state()
   _sampler_latched = false;
 }
 
-std::vector<std::string>
-RealtimeVqaStage::declare_models() const
+std::vector<ResourceClaim>
+RealtimeVqaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return {resolve_model_dir(session(), _models_db, _hf_dir)};
+  return model_memory::weight_claims(
+      {resolve_model_dir(session(), _hf_dir)});
 }
 
 Job
@@ -713,7 +709,7 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   genai::LoadSpec spec;
-  spec.hf_dir        = resolve_model_dir(session(), _models_db, _hf_dir);
+  spec.hf_dir        = resolve_model_dir(session(), _hf_dir);
   spec.compute_dtype = _compute_dtype;
   spec.page_tokens   = _page_tokens;  session()->info(fmt(
       "RealtimeVqaStage('{}'): [metal/no-MLX] loading model from '{}' "
@@ -795,7 +791,7 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   if (!_coreml_vision_path.empty()) {
     genai::CoreMLVisionEncoder::LoadSpec cm;
     cm.mlpackage_path =
-        resolve_model_dir(session(), _models_db, _coreml_vision_path);
+        resolve_model_dir(session(), _coreml_vision_path);
     cm.compute_units  = 2;   // ComputeUnitsAll (CPU+GPU+ANE)
     cm.patch_size     = _lm->config().vision.patch_size;
     cm.spatial_merge_size = _lm->config().vision.spatial_merge_size;

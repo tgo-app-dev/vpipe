@@ -74,8 +74,6 @@ class CoreMLLoadedModel;
 //                                      supplement model) or a .mlpackage
 //                                      / .mlmodelc dir. A DB key wins
 //                                      over a same-named path.
-//   models_db            (string, default "models") -- LMDB sub-db the
-//                                      model_path key is resolved in.
 //   model_kind           (string, default "beats") -- "beats" | "ced";
 //                                      selects the label table and the
 //                                      model-shape defaults below.
@@ -141,7 +139,6 @@ private:
   // in the constructor via attr_*. Declarations carry no non-zero
   // default. ----
   std::string _model_path;
-  std::string _models_db;
   std::string _model_kind;
   int         _compute_units{};
   int         _sample_rate{};

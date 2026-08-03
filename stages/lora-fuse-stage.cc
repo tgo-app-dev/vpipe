@@ -10,6 +10,7 @@
 #include "generative-models/lora-fusion.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/ui-delegate-intf.h"
+#include "stages/model-detect.h"
 #include "stages/model-registry.h"
 
 #include <cstdint>
@@ -23,33 +24,6 @@
 namespace vpipe {
 
 namespace {
-
-// The registry model_type for a fused DiT dir, from its config.json
-// _class_name. Krea-2 is the historical default; FLUX.2 and Qwen-Image-Edit
-// fused outputs must register under their own family so downstream family
-// detection (text-to-image, quantize) picks the right loader.
-std::string
-fused_model_type_(const std::string& dir)
-{
-  namespace fs = std::filesystem;
-  // A bare-DiT output has config.json at the root; a self-contained pipeline
-  // carries the DiT config under transformer/. Check both.
-  const fs::path cfgs[] = {fs::path(dir) / "config.json",
-                           fs::path(dir) / "transformer" / "config.json"};
-  for (const fs::path& cfg : cfgs) {
-    std::ifstream in(cfg);
-    if (!in) { continue; }
-    FlexData fd = FlexData::from_json(in);
-    if (!fd.is_object()) { continue; }
-    auto o = fd.as_object();
-    if (!o.contains("_class_name")) { continue; }
-    const std::string cls(o.at("_class_name").as_string(""));
-    if (cls == "Flux2Transformer2DModel") { return "flux2"; }
-    if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
-    return "krea2";
-  }
-  return "krea2";
-}
 
 // Recursively replicate `src` into `dst`, hard-linking files where possible
 // (same filesystem -- no data duplication for the ~GB encoder/vae shards) and
@@ -117,9 +91,7 @@ LoraFuseStage::LoraFuseStage(const SessionContextIntf* s,
   _lora          = attr_str("lora");
   _output_name   = attr_str("output_name");
   _base_pipeline = attr_str("base_pipeline");
-  _models_db     = attr_str("models_db");
   _scale         = attr_real("scale");
-  if (_models_db.empty()) { _models_db = "models"; }
   if (_scale == 0.0) { _scale = 1.0; }
   if (_base_model.empty()) {
     fail_config(fmt("LoraFuseStage('{}'): config.base_model is required",
@@ -141,7 +113,7 @@ namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "base_model", .type = ConfigType::String, .required = true,
    .doc = "base model dir or models-DB key (for Krea-2, the transformer/ DiT)",
-   .suggest_db = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "lora", .type = ConfigType::String, .required = true,
    .doc = "LoRA .safetensors file, or a dir/key with one .safetensors"},
   {.key = "output_name", .type = ConfigType::String, .required = true,
@@ -153,11 +125,9 @@ constexpr ConfigKey kAttrs[] = {
           "other components (text_encoder/, vae/, tokenizer/, scheduler/, "
           "model_index.json) are hard-linked/copied alongside -> a "
           "self-contained model that chain-quantizes like the stock one. Empty "
-          "=> bare DiT output.", .suggest_db = "models"},
+          "=> bare DiT output.", .suggest_db = kModelRegistryDb},
   {.key = "scale", .type = ConfigType::Real,
    .doc = "LoRA fusion strength (default 1.0)", .def_real = 1.0},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db for base lookup + output registration", .def_str = "models"},
 };
 // Trigger iport (optional, any beat) + summary oport -- see model-fetch /
 // model-quantize for the shared "preparation recipe" rationale.
@@ -215,9 +185,19 @@ LoraFuseStage::register_output_(const std::string& key, const std::string& dir)
     ro.insert_or_assign("source", FlexData::make_string(_base_model));
     ro.insert_or_assign("lora", FlexData::make_string(_lora));
     ro.insert_or_assign("lora_fused", FlexData::make_bool(true));
-    ro.insert_or_assign("model_type",
-                        FlexData::make_string(fused_model_type_(dir)));
-    LmdbDb  db(*env, _models_db);
+    // Describe the fused output by probing it (model-detect.h): a
+    // self-contained pipeline registers under its family, a BARE DiT
+    // under "<family>-dit" -- which is the type text-to-image's `dit_dir`
+    // field filters on, and where a bare fused DiT actually belongs.
+    const DetectedModel d = detect_model_dir(dir);
+    record_detected_fields(ro, d);
+    if (d.model_type.empty()) {
+      session()->warn(fmt(
+          "LoraFuseStage('{}'): could not determine a runtime type for the "
+          "fused output '{}'; it is registered but will not be offered by "
+          "the model pickers", this->id(), key));
+    }
+    LmdbDb  db(*env, kModelRegistryDb);
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadWrite);
     db.put(txn, key, rec.to_binary());
     txn.commit();
@@ -236,11 +216,11 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
   std::error_code ec;
 
   const std::string base_dir =
-      resolve_model_dir(session(), _models_db, _base_model);
+      resolve_model_dir(session(), _base_model);
 
   // Resolve the LoRA to a single .safetensors file: a direct path, or the one
   // .safetensors inside a resolved dir.
-  std::string lora_file = resolve_model_dir(session(), _models_db, _lora);
+  std::string lora_file = resolve_model_dir(session(), _lora);
   if (fs::is_directory(lora_file, ec)) {
     std::string found;
     for (const auto& e : fs::directory_iterator(lora_file, ec)) {
@@ -281,7 +261,7 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
   std::string pipe_root;
   std::string fuse_out = out_dir;
   if (!_base_pipeline.empty()) {
-    pipe_root = resolve_model_dir(session(), _models_db, _base_pipeline);
+    pipe_root = resolve_model_dir(session(), _base_pipeline);
     if (!fs::is_directory(pipe_root, ec)) {
       session()->warn(fmt("LoraFuseStage('{}'): base_pipeline '{}' is not a "
                           "directory", this->id(), pipe_root));
@@ -363,14 +343,14 @@ LoraFuseStage::process(RuntimeContext& ctx)
   // model-fetch / model-quantize may not have produced them at config time.
   // Missing base or LoRA => log + halt WITHOUT emitting a summary, so the
   // cascade stops here instead of fusing a nonexistent model.
-  if (!model_dir_available(session(), _models_db, _base_model)) {
+  if (!model_dir_available(session(), _base_model)) {
     session()->error(fmt("LoraFuseStage('{}'): base model '{}' is not available "
                          "(not downloaded yet?); skipping fusion", this->id(),
                          _base_model));
     ctx.signal_done();
     co_return;
   }
-  if (!model_dir_available(session(), _models_db, _lora)) {
+  if (!model_dir_available(session(), _lora)) {
     session()->error(fmt("LoraFuseStage('{}'): LoRA '{}' is not available "
                          "(not downloaded yet?); skipping fusion", this->id(),
                          _lora));
@@ -388,7 +368,6 @@ LoraFuseStage::process(RuntimeContext& ctx)
     so.insert_or_assign("lora", FlexData::make_string(_lora));
     so.insert_or_assign("output", FlexData::make_string(_output_name));
     so.insert_or_assign("local_path", FlexData::make_string(_out_dir));
-    so.insert_or_assign("models_db", FlexData::make_string(_models_db));
     so.insert_or_assign("scale", FlexData::make_real(_scale));
     so.insert_or_assign("fused", FlexData::make_bool(true));
     so.insert_or_assign("text", FlexData::make_string(

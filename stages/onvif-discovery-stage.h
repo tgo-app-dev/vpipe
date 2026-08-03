@@ -12,10 +12,10 @@ namespace vpipe {
 //      on stdin
 //   3) authenticate to the camera via ONVIF SOAP, fetch the RTSP URI
 //   4) encrypt the password with a key bound to host machine UUID +
-//      OS user id, persist the result to LMDB sub-db "cameras" keyed
-//      by the user-supplied camera name (the UUID is stored as a
-//      record field so a downstream recorder can re-discover the
-//      camera if DHCP moved it)
+//      OS user id, persist the result to the IP-camera registry sub-db
+//      (credential-store.h) keyed by the user-supplied camera name
+//      (the UUID is stored as a record field so a downstream recorder
+//      can re-discover the camera if DHCP moved it)
 //   5) signal_done and terminate.
 //
 // 0 iports, 0 oports. APPLE-only in the first cut (the cipher relies
@@ -39,7 +39,6 @@ private:
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   unsigned    _probe_timeout_ms{};
-  std::string _db_name;
   bool        _overwrite_existing{};
   bool        _mask_password{};
 };

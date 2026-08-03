@@ -28,14 +28,12 @@ ModelEvalStage::ModelEvalStage(const SessionContextIntf* s,
 {
   _model_a     = attr_str("model_a");
   _model_b     = attr_str("model_b");
-  _models_db   = attr_str("models_db");
   _wikitext    = attr_str("wikitext");
   _arc         = attr_str("arc");
   _ppl_tokens  = static_cast<int>(attr_uint("ppl_tokens"));
   _arc_samples = static_cast<int>(attr_uint("arc_samples"));
   _seed        = static_cast<std::uint64_t>(attr_uint("seed"));
   _divergence  = attr_bool("divergence");
-  if (_models_db.empty()) { _models_db = "models"; }
 
   if (_model_a.empty()) {
     fail_config(fmt("ModelEvalStage('{}'): config.model_a is required",
@@ -49,23 +47,21 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "model_a", .type = ConfigType::String, .required = true,
    .doc = "first model: a models-DB key (model-fetch / model-quantize) or a "
           "model directory path",
-   .suggest_db = "models"},
+   .suggest_db = kModelRegistryDb},
   {.key = "model_b", .type = ConfigType::String,
    .doc = "OPTIONAL second model (key or path); when set, the report is a "
           "side-by-side comparison with deltas",
-   .def_str = "", .suggest_db = "models"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db for model-key resolution", .def_str = "models"},
+   .def_str = "", .suggest_db = kModelRegistryDb},
   {.key = "wikitext", .type = ConfigType::String,
    .doc = "WikiText-2 dataset: a models-DB key (fetch with model-fetch) or a "
           "dir path; empty/not-found skips the perplexity probe",
    .def_str = "wikitext-2-raw-test",
-   .suggest_db = "models", .suggest_db_type = "eval-wikitext2"},
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "eval-wikitext2"},
   {.key = "arc", .type = ConfigType::String,
    .doc = "ARC-Challenge dataset: a models-DB key or a dir path; empty/not-"
           "found skips the ARC probe",
    .def_str = "arc-challenge-test",
-   .suggest_db = "models", .suggest_db_type = "eval-arc-challenge"},
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "eval-arc-challenge"},
   {.key = "ppl_tokens", .type = ConfigType::Uint,
    .doc = "WikiText-2 tokens to score for perplexity (0 => all)",
    .def_uint = 1024},
@@ -199,7 +195,7 @@ ModelEvalStage::evaluate_once(FlexData& summary)
   std::vector<genai::ArcItem> arc_items;
   bool have_wt = false, have_arc = false;
   if (!_wikitext.empty()) {
-    const std::string dir = resolve_model_dir(session(), _models_db, _wikitext);
+    const std::string dir = resolve_model_dir(session(), _wikitext);
     std::string e;
     have_wt = genai::load_wikitext_dir(dir, wt_text, e);
     if (!have_wt) {
@@ -209,7 +205,7 @@ ModelEvalStage::evaluate_once(FlexData& summary)
     }
   }
   if (!_arc.empty()) {
-    const std::string dir = resolve_model_dir(session(), _models_db, _arc);
+    const std::string dir = resolve_model_dir(session(), _arc);
     std::string e;
     have_arc = genai::load_arc_dir(dir, arc_items, e);
     if (!have_arc) {
@@ -238,7 +234,7 @@ ModelEvalStage::evaluate_once(FlexData& summary)
 
   auto run_one = [&](const std::string& ref, bool is_a) -> Outcome {
     Outcome o; o.ref = ref;
-    const std::string dir = resolve_model_dir(session(), _models_db, ref);
+    const std::string dir = resolve_model_dir(session(), ref);
     session()->info(fmt(
         "ModelEvalStage('{}'): loading '{}' for evaluation", this->id(), ref));
     genai::LoadSpec spec;
@@ -404,7 +400,7 @@ ModelEvalStage::process(RuntimeContext& ctx)
   // the upstream model-fetch/quantize may not have produced it at config
   // time. Missing => log + halt without emitting (cascade stops). model_b
   // is optional and handled gracefully (reported as A-only) if absent.
-  if (!model_dir_available(session(), _models_db, _model_a)) {
+  if (!model_dir_available(session(), _model_a)) {
     session()->error(fmt(
         "ModelEvalStage('{}'): model_a '{}' is not available "
         "(not produced yet?); skipping evaluation",

@@ -49,7 +49,6 @@ namespace vpipe {
 //                                    hf_dir itself if it is already a vae dir).
 //                                    A model-select source on iport1 overrides
 //                                    it; required only when iport1 is unwired.
-//   models_db  (string, default "models") -- registry for resolve_model_dir.
 class VaeDecodeStage final : public TypedStage<VaeDecodeStage> {
 public:
   static constexpr const char* kTypeName = "vae-decode";
@@ -64,7 +63,7 @@ public:
 
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
-  std::vector<std::string> declare_models() const override;
+  std::vector<ResourceClaim> declare_resources() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -76,7 +75,6 @@ public:
 
 private:
   std::string _hf_dir;
-  std::string _models_db;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) | "mage" (MageVAE)
   std::string _family;
   std::uint64_t _images_emitted = 0;

@@ -26,7 +26,9 @@ set(LOCAL_SOURCES
   vae-encode-stage.cc
   model-catalog.cc
   model-memory.cc
+  model-detect.cc
   model-fetch-stage.cc
+  model-register-stage.cc
   model-remove-stage.cc
   model-registry.cc
   passthrough-stage.cc
@@ -57,7 +59,9 @@ set(LOCAL_HEADERS
   load-text-stage.h
   load-video-stage.h
   model-catalog.h
+  model-detect.h
   model-fetch-stage.h
+  model-register-stage.h
   model-remove-stage.h
   model-registry.h
   model-select-stage.h

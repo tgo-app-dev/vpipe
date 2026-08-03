@@ -258,6 +258,9 @@ sweep_table_(size_t* n)
     {"create-mask", "{}", true, "needs an interactive mask editor client"},
     {"model-fetch", "{}", true, "downloads from the network"},
     {"model-remove", "{}", true, "destructive: deletes a local model dir"},
+    {"model-register", "{}", true,
+     "writes a registry record; the sweep Session has no db.path, so it "
+     "would land in the runner's CWD models DB"},
     {"lora-fuse", "{}", true, "needs a base model + LoRA on disk"},
     {"model-quantize", "{}", true, "needs a model on disk; minutes per run"},
     {"model-eval", "{}", true, "needs a model + eval dataset on disk"},

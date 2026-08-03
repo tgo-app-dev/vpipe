@@ -145,8 +145,8 @@ public:
 
   // The LM this stage holds. Declared before any stage initializes so
   // the diffusion stages -- which cannot see it from their own config --
-  // size the box against it. See Stage::declare_models.
-  std::vector<std::string> declare_models() const override;
+  // size the box against it. See Stage::declare_resources.
+  std::vector<ResourceClaim> declare_resources() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
@@ -167,11 +167,11 @@ public:
   std::uint64_t      segments_dropped_late() const noexcept
   { return _segments_dropped_late; }
 
-  // Resolve `ref` to a model directory: when it is a key in the models
-  // sub-db (`models_db`), return that record's local_path -- a DB entry
-  // wins over a same-named filesystem path; otherwise return `ref`
-  // unchanged so it is used as a plain path. Public so tests can drive
-  // it directly (initialize() calls it before loading the LM).
+  // Resolve `ref` to a model directory: when it is a key in the model
+  // registry, return that record's local_path -- a DB entry wins over a
+  // same-named filesystem path; otherwise return `ref` unchanged so it is
+  // used as a plain path. Public so tests can drive it directly
+  // (initialize() calls it before loading the LM).
   std::string resolve_model_dir(const std::string& ref) const;
 
 private:
@@ -205,7 +205,6 @@ private:
   // in the constructor via attr_*. Declarations carry no non-zero
   // default. ----
   std::string   _hf_dir;
-  std::string   _models_db;
   std::string   _compute_dtype;
   // page_tokens default (512) matches GenerativeModelManager. Smaller
   // pages multiply per-chunk prefill dispatch overhead by k =

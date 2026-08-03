@@ -49,7 +49,6 @@ namespace vpipe {
 //                                    hf_dir itself if it is already a vae dir).
 //                                    A model-select source on iport1 overrides
 //                                    it; required only when iport1 is unwired.
-//   models_db  (string, default "models") -- registry for resolve_model_dir.
 //   target_width, target_height (int, optional) -- when BOTH are set (and
 //                                    multiples of 8), the input image is
 //                                    letterbox-resized to this size before
@@ -74,7 +73,7 @@ public:
 
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
-  std::vector<std::string> declare_models() const override;
+  std::vector<ResourceClaim> declare_resources() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -86,7 +85,6 @@ public:
 
 private:
   std::string _hf_dir;
-  std::string _models_db;
   // Optional letterbox resize target (both > 0 => enabled). Multiples of 8.
   int _target_w = 0;
   int _target_h = 0;

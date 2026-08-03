@@ -199,6 +199,9 @@ const STRINGS = {
   'phone.menu':          ['Menu', '菜单', '選單'],
   'phone.views':         ['Views', '视图', '檢視'],
   'phone.preview':       ['Preview', '预览', '預覽'],
+  'phone.compare':       ['Compare', '图像对比', '影像對比'],
+  'phone.no_stage_view': ['This server offers no "{id}" panel.',
+      '此服务器未提供“{id}”面板。', '此伺服器未提供「{id}」面板。'],
   'phone.desktop_site':  ['Desktop layout', '桌面版界面', '桌面版介面'],
   'phone.desktop_hint':  ['The full dashboard: profiler, database, '
       + 'files, composer and pipeline editing.',
@@ -227,6 +230,7 @@ const STRINGS = {
   'phone.busy_stop':     ['stopping', '停止中', '停止中'],
   'phone.load_title':    ['Load pipeline', '加载流水线', '載入管線'],
   'phone.loaded':        ['Loaded {id}', '已加载 {id}', '已載入 {id}'],
+  'phone.unloaded':      ['Unloaded {id}', '已卸载 {id}', '已卸載 {id}'],
   'phone.about':         ['About this stage', '流水线级说明', '階段說明'],
   'phone.connections':   ['Connections', '连接', '連接'],
   'phone.inputs':        ['Inputs', '输入端口', '輸入埠'],
@@ -253,8 +257,6 @@ const STRINGS = {
   'phone.pick_model':    ['Choose a model', '选择模型', '選擇模型'],
   'phone.no_models':     ['No installed models match this field.',
       '没有符合此字段的已安装模型。', '沒有符合此欄位的已安裝模型。'],
-  'phone.no_preview':    ['This server offers no preview panel.',
-      '此服务器未提供预览面板。', '此伺服器未提供預覽面板。'],
   'phone.back':          ['Back', '返回', '返回'],
   'phone.open_raw':      ['Open original', '打开原文件', '開啟原始檔'],
   'phone.no_preview_kind': ['No preview for this file type.',
@@ -281,6 +283,10 @@ const STRINGS = {
       '空流水线 — 从工具箱拖入一个阶段',
       '空管線 — 從工具箱拖入一個階段'],
   'pl.empty':          ['Empty pipeline', '空流水线', '空管線'],
+  'pl.narrow_note':    ['Pane too narrow for the canvas — widen it to '
+      + 'wire stages. Selecting one still edits its configuration.',
+      '窗格过窄，无法显示画布 — 请加宽以连接流水线级。选中某一级仍可编辑其配置。',
+      '窗格過窄，無法顯示畫布 — 請加寬以連接階段。選取某一階段仍可編輯其設定。'],
   'pl.select_stopped': ['Select a stopped pipeline to edit',
       '请选择一个已停止的流水线进行编辑',
       '請選擇一個已停止的管線進行編輯'],
@@ -880,9 +886,6 @@ const STRINGS = {
       + '模型目录；同名时数据库键优先于路径。',
       'VLM 模型：models 資料庫中的鍵（由 model-fetch 註冊）或 HF 風格的'
       + '模型目錄；同名時資料庫鍵優先於路徑。'],
-  'cfg.realtime-vqa.models_db': ['LMDB sub-db model-fetch registers into',
-      'model-fetch 注册到的 LMDB 子数据库',
-      'model-fetch 註冊到的 LMDB 子資料庫'],
   'cfg.realtime-vqa.coreml_vision_path': ['pre-converted CoreML vision tower '
       + 'path', '预转换的 CoreML 视觉塔路径', '預轉換的 CoreML 視覺塔路徑'],
   'cfg.realtime-vqa.language': ['IETF UI/prompt locale for the built-in scene '
@@ -929,9 +932,6 @@ const STRINGS = {
       + '目录；同名时数据库键优先于路径。',
       '模型：models 資料庫中的鍵（由 model-fetch 註冊）或 HF 風格的模型'
       + '目錄；同名時資料庫鍵優先於路徑。'],
-  'cfg.text-chat.models_db': ['LMDB sub-db model-fetch registers into',
-      'model-fetch 注册到的 LMDB 子数据库',
-      'model-fetch 註冊到的 LMDB 子資料庫'],
   'cfg.text-chat.page_tokens': ['ContextManager K/V page size',
       'ContextManager 的 K/V 分页大小', 'ContextManager 的 K/V 分頁大小'],
   'cfg.text-chat.max_pages': ['per-LM page pool capacity (>= 1)',

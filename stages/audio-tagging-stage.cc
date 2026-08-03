@@ -101,10 +101,6 @@ AudioTaggingStage::AudioTaggingStage(const SessionContextIntf* s,
   };
 
   _model_path    = attr_str("model_path");
-  _models_db     = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _compute_units = static_cast<int>(attr_int("compute_units"));
   {
     int64_t v = attr_int("sample_rate");
@@ -182,9 +178,7 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "AudioSet tagger: a models-DB key (registered by model-fetch, "
           "e.g. the BEATs supplement model) or a .mlpackage / .mlmodelc "
           "dir; a DB key wins over a same-named path",
-   .suggest_db = "models", .suggest_db_type = "audio-tagging"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "audio-tagging"},
   {.key = "model_kind", .type = ConfigType::String,
    .doc = "model family: \"beats\" | \"ced\" (sets label table + "
           "shape defaults)", .def_str = "beats"},
@@ -252,7 +246,7 @@ AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
   }
   // A models-DB key (e.g. the model-fetch'd BEATs supplement model)
   // resolves to its unpacked .mlpackage; a plain path passes through.
-  _model_path = resolve_model_dir(session(), _models_db, _model_path);
+  _model_path = resolve_model_dir(session(), _model_path);
   _loaded = mgr->load(_model_path, _compute_units);
   if (!_loaded) {
     session()->error(fmt(

@@ -36,7 +36,6 @@ namespace vpipe {
 //
 // Config (FlexData object):
 //   model         (string, required) -- a models-DB key or a dir path.
-//   models_db     (string, default "models") -- LMDB sub-db for keys.
 //   contexts      (string, default "1024,2048,4096") -- comma-separated
 //                 context lengths to benchmark (opt into 8k/16k by
 //                 listing them).
@@ -100,7 +99,6 @@ private:
   std::vector<std::int32_t> real_prompt_(int n) const;
 
   std::string      _model;
-  std::string      _models_db;
   std::vector<int> _contexts;
   int              _decode_tokens{};
   int              _prefill_chunk{};

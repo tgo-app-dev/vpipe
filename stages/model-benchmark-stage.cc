@@ -63,7 +63,6 @@ ModelBenchmarkStage::ModelBenchmarkStage(const SessionContextIntf* s,
                                     std::move(config))
 {
   _model         = attr_str("model");
-  _models_db     = attr_str("models_db");
   _contexts      = parse_contexts_(attr_str("contexts"));
   _decode_tokens = static_cast<int>(attr_uint("decode_tokens"));
   _prefill_chunk = static_cast<int>(attr_uint("prefill_chunk"));
@@ -78,7 +77,6 @@ ModelBenchmarkStage::ModelBenchmarkStage(const SessionContextIntf* s,
   _presence_penalty   = attr_real("presence_penalty");
   _mtp                = attr_bool("mtp");
   _mtp_require_exact  = attr_bool("mtp_require_exact");
-  if (_models_db.empty()) { _models_db = "models"; }
   if (_contexts.empty())  { _contexts = {1024, 2048, 4096}; }
 
   if (_model.empty()) {
@@ -93,10 +91,8 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "model", .type = ConfigType::String, .required = true,
    .doc = "text LLM to benchmark: a models-DB key (model-fetch / "
           "model-quantize) or a model directory path",
-   .suggest_db = "models",
+   .suggest_db = kModelRegistryDb,
    .suggest_db_type = "qwen3.5,qwen3.6,gemma4,gemma4_unified"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db for model-key resolution", .def_str = "models"},
   {.key = "contexts", .type = ConfigType::String,
    .doc = "comma-separated context lengths to benchmark (e.g. add "
           "\"8192,16384\" for longer probes)",
@@ -363,7 +359,7 @@ ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop,
   }
 
   const std::string dir =
-      resolve_model_dir(session(), _models_db, _model);
+      resolve_model_dir(session(), _model);
   session()->info(fmt(
       "ModelBenchmarkStage('{}'): loading '{}'", this->id(), _model));
   genai::LoadSpec spec;
@@ -817,7 +813,7 @@ ModelBenchmarkStage::process(RuntimeContext& ctx)
   // Availability is checked HERE, AFTER the trigger -- in a recipe the
   // upstream model-fetch/quantize may not have produced the model at
   // config time. Missing => log + halt without emitting (cascade stops).
-  if (!model_dir_available(session(), _models_db, _model)) {
+  if (!model_dir_available(session(), _model)) {
     session()->error(fmt(
         "ModelBenchmarkStage('{}'): model '{}' is not available "
         "(not produced yet?); skipping benchmark",

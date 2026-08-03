@@ -14,8 +14,34 @@
   --danger:    #ff6b6b;
   --radius:    6px;
   --nav-w:     76px;
+  /* CJK SANS, named explicitly. No monospace family covers Chinese, so
+     without this the browser falls past the whole stack below and picks
+     the system default for the script -- which on macOS and iOS is
+     Songti, a SERIF: the UI would read in a book face next to Latin
+     text in a terminal one. A font-family list is resolved PER
+     CHARACTER, so naming these after the mono families costs Latin
+     text nothing; it only catches the glyphs the mono families do not
+     have. Ordered macOS/iOS, Windows, then the Noto/Source Han names
+     Linux and Android ship. */
+  --cjk-sans: "PingFang SC", "PingFang TC", "Hiragino Sans GB",
+              "Microsoft YaHei", "Microsoft JhengHei",
+              "Noto Sans CJK SC", "Noto Sans CJK TC",
+              "Source Han Sans SC", "Heiti SC", "Heiti TC",
+              "WenQuanYi Micro Hei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-          monospace;
+          var(--cjk-sans), monospace;
+}
+
+/* Traditional Chinese: prefer the TC cuts. PingFang SC and TC cover
+   almost the same code points but draw a number of characters
+   differently, and the first family holding a glyph wins -- so on a
+   zh-tw UI the TC cut has to come first or SC forms show through.
+   `lang` is kept in sync with the UI locale by i18n.js's setLocale. */
+:root[lang^="zh-tw" i] {
+  --cjk-sans: "PingFang TC", "PingFang SC", "Microsoft JhengHei",
+              "Microsoft YaHei", "Noto Sans CJK TC", "Noto Sans CJK SC",
+              "Source Han Sans TC", "Heiti TC", "Heiti SC",
+              "WenQuanYi Micro Hei", sans-serif;
 }
 
 /* Light theme palette. Applied when the user picks "light", or picks
@@ -58,6 +84,36 @@ html, body {
   color: var(--fg);
   font: 13px/1.5 var(--mono);
   -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Selection ----
+   The dashboard is chrome, not a document: buttons, rows, headers, port
+   labels and graph nodes that are dragged, tapped and double-clicked.
+   Selecting them produces a blue smear over the controls and copies
+   nothing anyone wanted, and on a phone the long-press that starts a
+   selection fires INSTEAD of the scroll or the tap it was meant to be.
+   So selection is off by default and turned back on for the places that
+   exist to be READ.
+
+   Both shells share this rule -- app.css is loaded by the phone shell
+   too -- so there is one boundary rather than one per layout, and
+   app.js's Ctrl/Cmd+A guard draws exactly the same one.
+
+   To make a NEW region copyable, mark it .allow-context-menu (the same
+   marker that keeps the native right-click menu) rather than relaxing
+   this. `user-select` inherits, so the whole subtree comes with it. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  /* iOS: also suppress the long-press "Copy / Look Up" callout, which
+     is the touch equivalent of a selection and has the same problem. */
+  -webkit-touch-callout: none;
+}
+input, textarea, select, [contenteditable="true"],
+.allow-context-menu {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 #app {
@@ -223,6 +279,70 @@ svg.sb-spark .line {
   background: var(--bg-2);
 }
 .nav-btn .label { text-align: center; }
+
+/* ---- Linearized graph gutter (lane-graph.js) ----
+   The `git log --graph` rendering of a stage graph, drawn per row into
+   its own SVG. Shared by the phone pipeline view and by the desktop
+   editor's narrow fallback, so it is defined here rather than in
+   phone.css -- both shells load this file. */
+.lane-art { display: block; }
+.lane-art .lane {
+  fill: none; stroke: var(--line); stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.lane-art .lane-dot {
+  fill: var(--accent); stroke: var(--bg); stroke-width: 1.5;
+}
+.lane-art .lane-dot.bad { fill: var(--danger); }
+
+/* ---- Narrow pipeline editor: the canvas replaced by the lane list ---- */
+
+.lane-list {
+  position: absolute; inset: 0; overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+/* Only the STANDALONE editor floats run/pause/stop over the canvas
+   (the manager puts them on the selector rows instead), so only there
+   does the list need to start below them. */
+.pm.no-sel .lane-list { padding-top: 34px; }
+/* Fixed height is load-bearing, not cosmetic: the lane art is one SVG
+   per row, and the lanes line up from row to row only while every row
+   is exactly this tall (hence the ellipsised single-line text). */
+.lane-row {
+  display: flex; align-items: stretch; height: 46px; flex: 0 0 46px;
+  width: 100%; padding: 0 8px 0 0;
+  border: none; border-bottom: 1px solid var(--bg-2);
+  background: transparent; color: var(--fg); font: inherit;
+  cursor: pointer; text-align: left;
+}
+.lane-row:hover { background: var(--bg-1); }
+.lane-row.selected { background: var(--bg-2); }
+.lane-row.selected .lane-id { color: var(--accent); }
+.lane-row.bad .lane-id { color: var(--danger); }
+.lane-gutter { flex: 0 0 auto; display: block; }
+.lane-text {
+  flex: 1 1 auto; min-width: 0; padding-left: 4px;
+  display: flex; flex-direction: column; justify-content: center; gap: 1px;
+}
+.lane-id {
+  font-size: 12.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lane-type {
+  font-size: 10px; color: var(--fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lane-warn {
+  flex: 0 0 auto; align-self: center;
+  width: 16px; height: 16px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--danger); color: var(--bg-1);
+  font-size: 11px; font-weight: 700;
+}
+.lane-note {
+  padding: 12px 10px 20px; color: var(--fg-dim); font-size: 10.5px;
+  line-height: 1.5;
+}
 
 /* ---- 10x10 boolean-grid icons ---- */
 
@@ -711,6 +831,12 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 .modal-back {
   position: fixed; inset: 0; background: rgba(0,0,0,.55);
   display: flex; align-items: center; justify-content: center; z-index: 50;
+  /* Centred in the VISIBLE viewport, not the layout one: a soft keyboard
+     shrinks the former and not the latter, so a dialog with a text field
+     in it -- rename, save-as, a path -- would otherwise be centred
+     behind the keyboard. --vvh is published only by the phone shell, so
+     the fallback keeps the desktop exactly as it was. */
+  bottom: auto; height: var(--vvh, 100%);
 }
 /* Right-click context menu (openMenu). Floats at the cursor. */
 .ctx-menu {

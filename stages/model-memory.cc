@@ -1,15 +1,19 @@
 #include "stages/model-memory.h"
 
+#include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
 
 #include <sys/sysctl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <system_error>
+#include <utility>
 
 namespace vpipe {
 namespace model_memory {
@@ -134,6 +138,84 @@ unload_policy_name(UnloadPolicy p)
     default:                    return "auto";
   }
 }
+
+std::vector<ResourceClaim>
+weight_claims(std::vector<std::string> dirs)
+{
+  std::vector<ResourceClaim> out;
+  out.reserve(dirs.size());
+  for (std::string& d : dirs) {
+    if (d.empty()) { continue; }
+    out.push_back(ResourceClaim{std::string(kWeightsKind), std::move(d)});
+  }
+  return out;
+}
+
+namespace {
+
+// The planner behind kWeightsKind: every checkpoint the graph is about
+// to open, on the manager's books before the first stage loads one.
+//
+// This is the whole of what PipelineRuntime used to do inline, and it
+// is deliberately the only place that knows a claim key is a directory
+// and that a directory has a size.
+class ModelWeightPlanner final : public ResourcePlanner {
+public:
+  std::string_view
+  kind() const noexcept override
+  {
+    return kWeightsKind;
+  }
+
+  void
+  begin_plan(const SessionContextIntf* session) override
+  {
+    // Drop the previous launch's estimates so one run's declarations
+    // never leak into the next. Unconditional -- a graph with no
+    // weight claims at all still has to clear what the last one left.
+    if (auto* mgr = manager(session)) { mgr->clear_declarations(); }
+    _declared.store(0, std::memory_order_relaxed);
+  }
+
+  void
+  claim(const SessionContextIntf* session, const std::string& dir) override
+  {
+    auto* mgr = manager(session);
+    if (mgr == nullptr) { return; }
+    const std::size_t b = dir_weights_bytes(dir);
+    if (b == 0) { return; }        // absent component: nothing to hold
+    mgr->declare_weights(dir, b);
+    _declared.fetch_add(b, std::memory_order_relaxed);
+  }
+
+  void
+  end_plan(const SessionContextIntf* session) override
+  {
+    const std::size_t d = _declared.load(std::memory_order_relaxed);
+    if (d > 0 && session != nullptr) {
+      session->log_debug(fmt(
+          "resource-plan: declared {} MB of model weights before init",
+          d >> 20));
+    }
+  }
+
+private:
+  static genai::GenerativeModelManager*
+  manager(const SessionContextIntf* session)
+  {
+    return session != nullptr ? session->generative_model_manager()
+                              : nullptr;
+  }
+
+  // Atomic only because the planner is a process-wide singleton and two
+  // pipelines can launch at once. It feeds a debug line, so a garbled
+  // total across concurrent launches is acceptable; a data race is not.
+  std::atomic<std::size_t> _declared{0};
+};
+
+}
+
+VPIPE_REGISTER_RESOURCE_PLANNER(ModelWeightPlanner)
 
 }  // namespace model_memory
 }  // namespace vpipe

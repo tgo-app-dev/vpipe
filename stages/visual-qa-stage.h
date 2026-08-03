@@ -242,8 +242,8 @@ public:
 
   // The LM this stage holds. Declared before any stage initializes so
   // the diffusion stages -- which cannot see it from their own config --
-  // size the box against it. See Stage::declare_models.
-  std::vector<std::string> declare_models() const override;
+  // size the box against it. See Stage::declare_resources.
+  std::vector<ResourceClaim> declare_resources() const override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 
@@ -264,7 +264,6 @@ private:
   // form and is seeded once at the top of the constructor. Declarations
   // carry no non-zero default.
   std::string              _hf_dir;
-  std::string              _models_db;
   // Optional path to a pre-converted CoreML .mlpackage / .mlmodelc
   // for the vision tower. When set, the stage runs the vision
   // forward pass through CoreML (using the Metal letterbox kernel

@@ -7,11 +7,12 @@
 // behind a top-right menu button. That keeps ONE page, one asset bundle,
 // and one place where a view's mount contract is defined.
 //
-// Three views only, for now: the read-only pipeline browser, text I/O,
-// and Preview. Everything else the dashboard offers (profiler, database,
-// files, composer, settings) stays desktop-only and is reached by
-// switching layouts from the drawer -- which is also the escape hatch
-// when the phone/desktop detection guesses wrong.
+// A reduced set of views: the pipeline browser, text I/O, the two panels
+// the stages ship (Preview and Compare Images), a file browser and the
+// live system monitors. What the dashboard has and this does not --
+// profiler, database, composer, settings, and the graph CANVAS -- stays
+// desktop-only, reached by switching layouts from the drawer, which is
+// also the escape hatch when the phone/desktop detection guesses wrong.
 //
 // A view module gets { body, actions, setTitle } and returns a cleanup
 // function. `cache: true` on a view keeps its mounted DOM alive across
@@ -24,21 +25,28 @@
 
 import { el, clear, openModal } from '../dom.js';
 import { makeIcon } from '../icons.js';
-import { t, onLocaleChange } from '../i18n.js';
+import { t, onLocaleChange, getLocale, setLocale, locales }
+  from '../i18n.js';
+import { api } from '../api.js';
 import { setUiMode } from '../ui-mode.js';
 import { mountPhonePipelines } from './phone-pipelines.js';
 import { mountPhoneIo } from './phone-io.js';
-import { mountPhonePreview } from './phone-preview.js';
+import { stageViewMounter } from './phone-stage-view.js';
 import { mountPhoneFiles } from './phone-files.js';
 import { mountPhoneSystem } from './phone-system.js';
+import { mountViewportDebug } from './phone-debug.js';
 
 const VIEWS = [
   { id: 'pipelines', labelKey: 'nav.pipelines', icon: 'pipeline',
     mount: mountPhonePipelines },
   { id: 'io', labelKey: 'nav.io', icon: 'io',
     mount: mountPhoneIo, cache: true },
+  // Panels the STAGES ship with themselves; the phone side of each is
+  // just the shared host pointed at its registered view id.
   { id: 'preview', labelKey: 'phone.preview', icon: 'video',
-    mount: mountPhonePreview },
+    mount: stageViewMounter('preview', 'phone.preview') },
+  { id: 'compare', labelKey: 'phone.compare', icon: 'image',
+    mount: stageViewMounter('compare-image', 'phone.compare') },
   // Browsing the server's filesystem is already here for load and save;
   // this is the same walker with a preview on the end.
   { id: 'files', labelKey: 'nav.files', icon: 'files',
@@ -49,9 +57,193 @@ const VIEWS = [
     mount: mountPhoneSystem },
 ];
 
+// Publish the VISIBLE height of the window as --vvh, and flag whether a
+// soft keyboard is up.
+//
+// A phone keyboard does not shrink the layout viewport. iOS leaves
+// `100dvh` at its full height and simply COVERS the bottom of it, so a
+// column laid out to fill the screen puts its input row underneath the
+// keyboard, out of reach and out of sight -- and no amount of flexing
+// helps, because as far as the layout is concerned nothing changed.
+//
+// The visual viewport is the part still on screen. Sizing the shell to
+// that instead is the whole fix: every phone view is already a flex
+// column whose middle section takes the slack, so the header keeps its
+// size, the scrolling region gives up the difference, and whatever sits
+// at the bottom (the text I/O compose box, a stage's Apply button)
+// stays above the keyboard. Nothing per-view is needed.
+function trackViewport(app) {
+  const vv = window.visualViewport;
+  if (!vv) { return; }        // no API -> --vvh unset, rules fall back
+  const root = document.documentElement;
+  // Is the caret in a text field? This is the condition the soft
+  // keyboard actually follows, which makes it the primary signal: no
+  // measurement survives a ROTATION performed with the keyboard up. A
+  // rotation invalidates the height baseline, the only height left to
+  // learn from is the keyboard-shrunken one, and from then until the
+  // field is blurred the keyboard reads as absent.
+  const typing = () => {
+    const e = document.activeElement;
+    if (!e) { return false; }
+    if (e.isContentEditable) { return true; }
+    const tag = e.tagName;
+    if (tag === 'TEXTAREA') { return true; }
+    if (tag !== 'INPUT') { return false; }
+    // Buttons, checkboxes and friends take focus without a keyboard.
+    return !/^(button|checkbox|radio|range|color|file|submit|reset|image)$/i
+        .test(e.type || 'text');
+  };
+
+  // Geometry stays as a SECOND opinion, for a keyboard raised without a
+  // focused field (a browser's own find bar, an accessibility panel).
+  // Its baseline is the tallest the visible area has been -- comparing
+  // against window.innerHeight does not work, because with
+  // interactive-widget=resizes-content the layout viewport shrinks by
+  // the same amount as the visual one and the difference is zero
+  // (measured: inner=358, vv h=358, keyboard plainly up).
+  let tallest = 0;
+  let baseWidth = 0;
+  const apply = () => {
+    // A rotation changes what "tallest" means, so the baseline restarts
+    // with the width.
+    if (window.innerWidth !== baseWidth) {
+      baseWidth = window.innerWidth;
+      tallest = 0;
+    }
+    const inField = typing();
+    // Learn the baseline ONLY when no field is focused. Otherwise a
+    // rotation with the keyboard up teaches it the shrunken height and
+    // it never recovers -- which is precisely the bug above.
+    if (!inField) { tallest = Math.max(tallest, vv.height); }
+    root.style.setProperty('--vvh', Math.round(vv.height) + 'px');
+    // A URL bar sliding away also shrinks the visible area, by far less
+    // than a keyboard does; ~120px tells the two apart without having to
+    // know a device's keyboard height.
+    app.classList.toggle('kbd-open',
+        inField || (tallest > 0 && (tallest - vv.height) > 120));
+  };
+  // Focus can change with no viewport event at all (an external
+  // keyboard, or dismissing the soft one while the field keeps focus),
+  // so the flag is re-evaluated on focus moves too.
+  document.addEventListener('focusin', apply, true);
+  document.addEventListener('focusout', () => setTimeout(apply, 0), true);
+  // The scroll iOS applies at focus time is STALE by the time the
+  // layout has caught up, and nothing re-evaluates it.
+  //
+  // At focus the page is still full height, the field really is behind
+  // the keyboard, and the browser scrolls to lift it -- correct, then.
+  // A frame later --vvh shrinks everything to the visible height and
+  // the field is in view with no scroll needed, but the scroll already
+  // applied stays put, holding the UI above the screen for as long as
+  // the keyboard is up. Measured: scrollY 337 -- exactly the keyboard's
+  // height -- against content only 358 tall.
+  //
+  // So it is reset ONCE PER GEOMETRY CHANGE, and never in response to a
+  // scroll. That distinction is the whole safety argument: an earlier
+  // version compensated continuously and the UI shook, because the
+  // browser was re-deciding against a page that kept moving under it.
+  // Nothing here reacts to the browser reacting to us -- a keyboard
+  // opening fires a handful of resizes, each worth at most two
+  // corrections, and then it stops.
+  const unscroll = () => {
+    if (window.scrollY !== 0) { window.scrollTo(0, 0); }
+  };
+  vv.addEventListener('resize', () => {
+    apply();
+    unscroll();
+    // ...and once more after the keyboard's animation settles, which
+    // finishes without an event of its own.
+    setTimeout(unscroll, 250);
+  });
+  // Scroll only re-reads the numbers; it must not correct anything.
+  vv.addEventListener('scroll', apply);
+  apply();
+}
+
+// Refuse the gestures that would scroll the PAGE while a keyboard is up.
+//
+// The layout viewport stays at its full height (695 on the device this
+// was measured on) while only the visible part shrinks (358), so the
+// browser will happily scroll the page down into the 337px of nothing
+// below the UI. No stylesheet prevents it: the scrolling box is the
+// layout viewport itself, which no height set here resizes, and
+// `overflow: hidden` on the root propagates to that viewport in theory
+// while iOS scrolls it anyway in practice.
+//
+// So the gesture is refused instead -- and ONLY the gestures that would
+// move the page. A touch that begins inside something which can really
+// scroll (the console, a list, a long config form) is left completely
+// alone, found by walking up for a scroll container with room left to
+// move rather than by tagging every scroller in the app by hand. Two
+// fingers are left alone too, or this would take pinch-zoom with it.
+//
+// Armed only while the keyboard is up, because that is the only time
+// the page HAS anywhere to scroll -- with the keyboard down the visible
+// area and the layout viewport are the same size.
+function lockPageScroll(app) {
+  const canScroll = (node) => {
+    for (let e = node; e && e !== document.body; e = e.parentElement) {
+      if (!(e instanceof Element)) { continue; }
+      const oy = getComputedStyle(e).overflowY;
+      if ((oy === 'auto' || oy === 'scroll')
+          && e.scrollHeight > e.clientHeight) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // passive: false -- the whole point is to be able to refuse it.
+  document.addEventListener('touchmove', (e) => {
+    if (!app.classList.contains('kbd-open')) { return; }
+    if (e.touches && e.touches.length > 1) { return; }   // pinch-zoom
+    if (canScroll(e.target)) { return; }                 // a real scroller
+    e.preventDefault();
+  }, { passive: false });
+}
+
+// Two viewport keys the phone shell asks for, both of which have to be
+// set on the meta tag rather than in CSS.
+//
+// interactive-widget=resizes-content -- "when a soft keyboard opens,
+// shrink the LAYOUT viewport instead of covering it". That is exactly
+// the behaviour this whole file is otherwise emulating by hand with
+// --vvh: where it is honoured, the page height simply becomes correct
+// and stays correct, with nothing to track. Chrome/Android implements
+// it; browsers that do not, ignore the key, and the --vvh path carries
+// them. Unconditional, because it asks for the right thing everywhere.
+//
+// maximum-scale=1 -- stop iOS zooming the page in when a field under
+// 16px takes focus. The usual "fix" is to set every input to 16px, but
+// that makes each field read as a different, louder kind of text than
+// the labels around it, which is what the 13px sizing exists to avoid.
+//
+// maximum-scale is iOS-ONLY, and deliberately without user-scalable=no:
+//
+//   - iOS has ignored scale restrictions for USER-initiated zoom since
+//     iOS 10, so pinch-to-zoom keeps working and this costs no
+//     accessibility. user-scalable=no would add nothing here and would
+//     be a real restriction if that ever changed.
+//   - Android Chrome does not auto-zoom on focus, so there is nothing
+//     to fix there -- but it DOES honour maximum-scale, so applying it
+//     would take pinch-zoom away for no benefit at all.
+function tuneViewport() {
+  const meta = document.querySelector('meta[name="viewport"]');
+  if (!meta) { return; }
+  const add = (key, value) => {
+    if (new RegExp('\\b' + key + '\\s*=').test(meta.content)) { return; }
+    meta.content = meta.content + ', ' + key + '=' + value;
+  };
+  add('interactive-widget', 'resizes-content');
+  const ua = navigator.userAgent || '';
+  const ios = /iPhone|iPod|iPad/.test(ua)
+      || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (ios) { add('maximum-scale', '1'); }
+}
+
 export function mountPhoneApp() {
   document.head.append(
     el('link', { rel: 'stylesheet', href: '/css/phone.css' }));
+  tuneViewport();
 
   const app = document.getElementById('app');
   const topbar = document.getElementById('topbar');
@@ -62,6 +254,19 @@ export function mountPhoneApp() {
   // and status bar are hidden by it (their elements stay so the desktop
   // markup is untouched).
   app.classList.add('phone');
+  // Also on the ROOT: html and body have to be styled too (see the page
+  // pinning in phone.css), and they are outside #app.
+  document.documentElement.classList.add('phone-ui');
+  trackViewport(app);
+  lockPageScroll(app);
+  // ?debug=vv -- an on-screen readout of the viewport numbers. The
+  // keyboard-layout failures on iOS are indistinguishable by eye, and a
+  // phone has nowhere to print them otherwise.
+  try {
+    if (new URLSearchParams(location.search).get('debug') === 'vv') {
+      mountViewportDebug();
+    }
+  } catch (e) { /* no URLSearchParams -- skip the panel */ }
   if (nav) { clear(nav); }
   if (statusbar) { clear(statusbar); }
 
@@ -152,6 +357,41 @@ export function mountPhoneApp() {
     });
   }
 
+  function currentLanguageLabel() {
+    const cur = getLocale();
+    const l = locales().find((x) => x.tag === cur);
+    // The self-name ("简体中文"), not a translation of it: someone
+    // looking for their own language recognises it written its own way.
+    return l ? l.label : cur;
+  }
+
+  // Same two steps as the desktop's picker: set the client locale (whose
+  // listener re-mounts every pane below), then tell the BACKEND, so
+  // server-produced messages match what the client is now showing. An
+  // older backend without the route just leaves those in English.
+  function openLanguageSheet() {
+    closeDrawer();                 // its scrim sits above the modal layer
+    const list = el('div', { class: 'ph-sheet-list' });
+    const close = openModal({
+      title: t('settings.language'),
+      body: list,
+      actions: [{ label: t('common.cancel'), cancel: true,
+                  onClick: (c) => c() }],
+    });
+    const cur = getLocale();
+    for (const l of locales()) {
+      list.append(el('button', {
+        class: 'ph-sheet-item' + (l.tag === cur ? ' active' : ''),
+        onclick: () => {
+          close();
+          if (l.tag === cur) { return; }
+          setLocale(l.tag);
+          api.setLanguage(l.tag).catch(() => { /* older backend */ });
+        },
+      }, el('span', { class: 'ph-sheet-name' }, l.label)));
+    }
+  }
+
   function openDrawer() {
     if (drawer) { closeDrawer(); return; }
     const panel = el('div', { class: 'ph-drawer' });
@@ -163,6 +403,21 @@ export function mountPhoneApp() {
         onclick: () => select(v),
       }, makeIcon(v.icon, 'sm'), el('span', {}, t(v.labelKey))));
     }
+    panel.append(el('div', { class: 'ph-drawer-sep' }));
+    // Language. The phone shell has no Settings view to put this in, and
+    // it is the one preference that is useless where it currently lives:
+    // a reader who needs another language cannot be asked to switch to
+    // the desktop layout to find the switch. Shown as a row rather than
+    // the desktop's segmented control -- three self-named languages do
+    // not fit side by side at a tappable size -- with the current one as
+    // its value, so the drawer says what is set without being opened
+    // twice.
+    panel.append(el('button', {
+      class: 'ph-drawer-item sub', onclick: () => openLanguageSheet(),
+    },
+      el('span', {}, t('settings.language')),
+      el('span', { class: 'ph-drawer-value' }, currentLanguageLabel())));
+
     panel.append(el('div', { class: 'ph-drawer-sep' }));
     // The way out of a wrong detection -- and the only route to the
     // views this shell doesn't carry. Deliberately the smallest target

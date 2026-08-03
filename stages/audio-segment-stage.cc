@@ -68,10 +68,6 @@ AudioSegmentStage::AudioSegmentStage(const SessionContextIntf* s,
   // validated, so the ctor never throws and the runtime skips a failed
   // stage at launch.
   _model_path    = attr_str("model_path");
-  _models_db     = attr_str("models_db");
-  if (_models_db.empty()) {
-    _models_db = "models";
-  }
   _compute_units = static_cast<int>(attr_int("compute_units"));
   {
     const std::int64_t v = attr_int("sample_rate");
@@ -229,9 +225,7 @@ constexpr ConfigKey kConfigKeys[] = {
    .doc = "Silero VAD model: a models-DB key (registered by model-fetch) "
           "or a .mlpackage / .mlmodelc dir; a DB key wins over a same-named "
           "path",
-   .suggest_db = "models", .suggest_db_type = "silero-vad"},
-  {.key = "models_db", .type = ConfigType::String,
-   .doc = "LMDB sub-db model-fetch registers into", .def_str = "models"},
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "silero-vad"},
   {.key = "compute_units", .type = ConfigType::Int,
    .doc = "0=CPUOnly 1=CPU+GPU 2=All 3=CPU+ANE", .def_int = 2},
   {.key = "sample_rate", .type = ConfigType::Int,
@@ -337,7 +331,7 @@ AudioSegmentStage::initialize(RuntimeContext& /*ctx*/)
   }
   // A models-DB key (e.g. a model-fetch'd silero-vad model) resolves to
   // its unpacked .mlpackage; a plain path passes through unchanged.
-  _model_path = resolve_model_dir(session(), _models_db, _model_path);
+  _model_path = resolve_model_dir(session(), _model_path);
   _loaded = mgr->load(_model_path, _compute_units);
   if (!_loaded) {
     session()->error(fmt(

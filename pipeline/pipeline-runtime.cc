@@ -10,11 +10,10 @@
 #include "pipeline/feedback-tx-stage.h"
 #include "pipeline/oport-buffer.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
 #include "stages/call-stage.h"
-#include "generative-models/generative-model-manager.h"
-#include "stages/model-memory.h"
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -703,43 +702,58 @@ PipelineRuntime::launch_()
       std::move(in_readers), std::move(out_bufs), &_stop));
   }
 
-  // Phase 4: declare every model this run will load, then spawn drivers.
+  // Phase 4: resource planning, then spawn drivers.
   //
   // This has to happen BEFORE any driver starts, because initialize() is
-  // where model-holding stages both size the box and load. Run
+  // where resource-holding stages both size the box and acquire. Run
   // concurrently with nothing declared, each of them sees whichever
-  // peers happen to have loaded already -- so the same graph decides
-  // differently run to run, and a stage cannot account for a model held
-  // by a peer it has no configuration link to. Declaring first replaces
-  // that race with a complete picture. See Stage::declare_models.
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
-  if (mgr != nullptr) {
-    mgr->clear_declarations();             // a previous launch's, if any
-    std::size_t declared = 0;
+  // peers happen to have acquired already -- so the same graph decides
+  // differently run to run, and a stage cannot account for something
+  // held by a peer it has no configuration link to. Planning first
+  // replaces that race with a complete picture.
+  //
+  // What the runtime owns here is the ORDERING, and only that: every
+  // planner is bracketed and every claim delivered before the init
+  // barrier opens. What a claim MEANS belongs to its planner -- see
+  // pipeline/resource-plan.h and Stage::declare_resources.
+  {
+    const std::vector<ResourcePlanner*> planners =
+      ResourcePlannerRegistry::get().all();
+    // Unconditional, and on every registered planner rather than only
+    // the ones this graph claims against: begin_plan is where a planner
+    // drops the PREVIOUS launch's state, which it still has to do for a
+    // graph that claims nothing of its kind.
+    for (ResourcePlanner* p : planners) { p->begin_plan(session()); }
     for (Stage* s : stages) {
-      for (const std::string& d : s->declare_models()) {
-        if (d.empty()) { continue; }
-        const std::size_t b = model_memory::dir_weights_bytes(d);
-        if (b == 0) { continue; }          // absent component: nothing to hold
-        mgr->declare_weights(d, b);
-        declared += b;
+      for (const ResourceClaim& c : s->declare_resources()) {
+        if (c.key.empty()) { continue; }
+        ResourcePlanner* p =
+          ResourcePlannerRegistry::get().find(c.kind);
+        if (p == nullptr) {
+          // Never quietly: an unplanned claim means this stage is about
+          // to acquire something nothing is accounting for, which is
+          // exactly the race the phase exists to prevent -- and it fails
+          // as non-deterministic sizing, which no test reliably catches.
+          session()->warn(fmt(
+              "PipelineRuntime: {} stage '{}' claims resource kind '{}' "
+              "with no registered planner; it will go unaccounted",
+              _pipeline->id(), s->id(), c.kind));
+          continue;
+        }
+        p->claim(session(), c.key);
       }
     }
-    if (declared > 0) {
-      session()->log_debug(fmt(
-          "PipelineRuntime: {} declared {} MB of model weights before init",
-          _pipeline->id(), declared >> 20));
-    }
+    for (ResourcePlanner* p : planners) { p->end_plan(session()); }
   }
 
   _expected = static_cast<unsigned>(stages.size());
-  // NOTE: the declarations are NOT cleared when the barrier opens. A
-  // weight set only accounts for what it CACHED, and the LMs read
-  // uncached -- their weights live in the model's own members -- so
-  // dropping the estimates would make a multi-GB checkpoint read as
-  // near-zero the instant it finished loading. Models that genuinely
-  // hold less than their files weigh say so themselves, via
-  // GenerativeModelManager::revise_declaration.
+  // NOTE: a plan is NOT torn down when the barrier opens; it stands for
+  // the whole launch. For weights the reason is that a weight set only
+  // accounts for what it CACHED, and the LMs read uncached -- their
+  // weights live in the model's own members -- so dropping the estimates
+  // would make a multi-GB checkpoint read as near-zero the instant it
+  // finished loading. A holder that genuinely keeps less says so itself
+  // (for weights, GenerativeModelManager::revise_declaration).
   _init_barrier = std::make_unique<InitBarrier>(
       _expected, session()->thread_pool());
   // Mark every driven stage running before any driver is scheduled, so

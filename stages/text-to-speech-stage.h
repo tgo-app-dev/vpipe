@@ -162,8 +162,8 @@ public:
   Job initialize(RuntimeContext& ctx) override;
 
   // The TTS LM and its audio codec -- two checkpoints, both large.
-  // See Stage::declare_models.
-  std::vector<std::string> declare_models() const override;
+  // See Stage::declare_resources.
+  std::vector<ResourceClaim> declare_resources() const override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
@@ -187,7 +187,6 @@ private:
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;
   std::string _codec_dir;
-  std::string _models_db;
   int         _max_new_tokens{};
   int         _stream_chunk{}; // emit PCM every N codec frames (0 = one-shot)
   bool        _interrupt_on_new_text{}; // barge-in: abort in-flight on new text
