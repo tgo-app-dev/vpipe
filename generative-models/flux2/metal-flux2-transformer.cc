@@ -949,7 +949,8 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                                    const SharedBuffer& latents, int img_seq,
                                    int grid_h, int grid_w, float timestep,
                                    float guidance,
-                                   const std::vector<RefImage>& refs)
+                                   const std::vector<RefImage>& refs,
+                                   KvCache* kv)
 {
   const Config& c = _cfg;
   const int H = c.hidden, HED = c.n_heads, HD = c.head_dim;
@@ -962,9 +963,34 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // tokens. IS is the full image-token count that drives every block; IS_GEN
   // is what proj_out emits.
   const int TS = text_seq, IS_GEN = img_seq;
-  int IS_REF = 0;
-  for (const auto& r : refs) { IS_REF += r.seq; }
+  int IS_REF_ALL = 0;
+  for (const auto& r : refs) { IS_REF_ALL += r.seq; }
+  // The klein-9b-kv recipe (Config::klein_kv): reference tokens are isolated
+  // from the rest of the sequence and modulated off a fixed timestep 0. Only
+  // then is their K/V step-independent, so the cache below is a consequence
+  // of the recipe rather than an option on top of it.
+  const bool kv_recipe = c.klein_kv && IS_REF_ALL > 0;
+  const int  n_blocks  = c.n_double + c.n_single;
+  // Reuse requires a populated cache built for THIS geometry -- a resolution
+  // or reference change rebuilds it rather than silently mismatching.
+  const bool kv_reuse = kv_recipe && kv != nullptr && kv->populated()
+                        && kv->ref_seq == IS_REF_ALL && kv->text_seq == TS
+                        && kv->img_seq == IS_GEN
+                        && (int)kv->k.size() == n_blocks
+                        && (int)kv->v.size() == n_blocks;
+  const bool kv_fill  = kv_recipe && kv != nullptr && !kv_reuse;
+  // Reference tokens ride the token stream unless a populated cache lets us
+  // drop them: their contribution then enters attention purely as extra KEYS,
+  // so every projection, norm and FF over them leaves the step.
+  const int IS_REF = kv_reuse ? 0 : IS_REF_ALL;
   const int IS = IS_GEN + IS_REF, seq = TS + IS;
+  // Queries that attend over the whole key set (text + generated). Under the
+  // recipe the reference queries are the tail [QA, seq) and attend only to
+  // themselves; without it QA == seq and there is one undivided attention.
+  const int QA = (kv_recipe && !kv_reuse) ? (TS + IS_GEN) : seq;
+  // Attention key length: the live sequence plus any cached reference keys
+  // spliced onto its tail.
+  const int KL = seq + (kv_reuse ? IS_REF_ALL : 0);
   // Flux2 reference-image T (time/index) coordinate step (_prepare_image_ids
   // scale): ref i -> T = kRefPosScale*(i+1) so each reference sits in its own
   // position band, distinct from the generated image (T=0).
@@ -1048,6 +1074,26 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       ti[half + i] = f32_to_bf16_((float)std::sin(ang));
     }
   }
+  // Reference tokens are modulated off a FIXED timestep 0 (BFL
+  // ref_fixed_timestep), not the step's sigma -- a reference latent is clean,
+  // never noised. At t = 0 every angle is 0, so the sinusoid degenerates to
+  // cos = 1 / sin = 0 and needs no trig.
+  SharedBuffer te_ref, tr1, temb_r, tsilu_r;
+  if (kv_recipe) {
+    te_ref = buf((std::size_t)TD);
+    tr1 = buf((std::size_t)H);
+    temb_r = buf((std::size_t)H);
+    tsilu_r = buf((std::size_t)H);
+    if (te_ref.empty() || tr1.empty() || temb_r.empty() || tsilu_r.empty()) {
+      return {};
+    }
+    auto* ri = static_cast<std::uint16_t*>(te_ref.contents());
+    const int half = TD / 2;
+    for (int i = 0; i < half; ++i) {
+      ri[i] = f32_to_bf16_(1.0f);
+      ri[half + i] = f32_to_bf16_(0.0f);
+    }
+  }
   // Embedded guidance (guidance-distilled klein-9B): the same cos-first
   // sinusoid of guidance*1000, embedded by guidance_embedder and added to the
   // timestep embedding. Skipped when the model has no guidance_embeds or the
@@ -1072,13 +1118,22 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   SharedBuffer ge1 = buf((std::size_t)H), gemb = buf((std::size_t)H);
   SharedBuffer mimg = buf((std::size_t)6 * H), mtxt = buf((std::size_t)6 * H),
                msin = buf((std::size_t)3 * H);
+  // Reference-token modulation twins (klein_kv): the same two Linears driven
+  // by a timestep-0 embedding instead of the step's sigma.
+  SharedBuffer mimg_r, msin_r;
+  if (kv_recipe) {
+    mimg_r = buf((std::size_t)6 * H);
+    msin_r = buf((std::size_t)3 * H);
+  }
   SharedBuffer img = buf((std::size_t)IS * H), txt = buf((std::size_t)TS * H);
   SharedBuffer nrm = buf((std::size_t)seq * H);
-  SharedBuffer jq = buf((std::size_t)seq * H), jk = buf((std::size_t)seq * H),
-               jv = buf((std::size_t)seq * H);
+  // k/v carry KL rows -- the sequence plus any cached reference keys spliced
+  // onto the tail; q/out only ever cover the live sequence.
+  SharedBuffer jq = buf((std::size_t)seq * H), jk = buf((std::size_t)KL * H),
+               jv = buf((std::size_t)KL * H);
   SharedBuffer qt = buf((std::size_t)HED * seq * HD),
-               kt = buf((std::size_t)HED * seq * HD),
-               vt = buf((std::size_t)HED * seq * HD),
+               kt = buf((std::size_t)HED * KL * HD),
+               vt = buf((std::size_t)HED * KL * HD),
                atb = buf((std::size_t)HED * seq * HD);
   SharedBuffer att = buf((std::size_t)seq * H), ob = buf((std::size_t)seq * H);
   SharedBuffer ff1 = buf((std::size_t)seq * DFF);
@@ -1089,6 +1144,31 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                smlp = buf((std::size_t)seq * SMLP);
   SharedBuffer scat = buf((std::size_t)seq * ((std::size_t)H + SMLP));
   SharedBuffer velocity = buf((std::size_t)IS_GEN * OC);
+
+  // KV cache storage: per block the reference band of k and v, token-major
+  // [IS_REF_ALL, H] and PRE-RoPE. Pre-RoPE is what lets a cached step re-run
+  // the ordinary fused transpose+rope over the whole KL rows: the rope table
+  // is still built for [text, generated, refs], so the spliced band picks up
+  // exactly the rotation it had when it was extracted.
+  if (kv_fill) {
+    kv->clear();
+    kv->k.resize((std::size_t)n_blocks);
+    kv->v.resize((std::size_t)n_blocks);
+    for (int i = 0; i < n_blocks; ++i) {
+      kv->k[(std::size_t)i] = buf((std::size_t)IS_REF_ALL * H);
+      kv->v[(std::size_t)i] = buf((std::size_t)IS_REF_ALL * H);
+      if (kv->k[(std::size_t)i].empty() || kv->v[(std::size_t)i].empty()) {
+        kv->clear();   // stays unpopulated -> next step just refills
+        return {};
+      }
+    }
+    if (_mc->session() != nullptr) {
+      _mc->session()->info(fmt(
+          "MetalFlux2Transformer: KV-caching {} reference tokens over {} "
+          "blocks ({} MB)", IS_REF_ALL, n_blocks,
+          (long)((std::size_t)n_blocks * 2 * IS_REF_ALL * H * 2 / (1 << 20))));
+    }
+  }
 
   // ---- helper wrappers over a live ComputeEncoder (redefined per stream) ----
   auto make_ops = [&](ComputeEncoder& enc) {
@@ -1305,6 +1385,18 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         e->set_constant(5, off); e->set_constant(6, 0); e->set_constant(7, 0);
         e->dispatch({(unsigned)(rows * W), 1, 1}, {256, 1, 1});
       }
+      // Contiguous [rows, W] copy between two element offsets -- a slice whose
+      // input stride equals its width, bound at both ends. Used to lift the
+      // reference band of k/v into the KV cache and to splice it back.
+      void copy_rows(const SharedBuffer& in, std::size_t ie,
+                     const SharedBuffer& out, std::size_t oe, int rows,
+                     int W) {
+        e->set_function(self->_fn_headslice);
+        e->set_buffer(0, in, ie * 2); e->set_buffer(1, out, oe * 2);
+        e->set_constant(2, rows); e->set_constant(3, W); e->set_constant(4, W);
+        e->set_constant(5, 0); e->set_constant(6, 0); e->set_constant(7, 0);
+        e->dispatch({(unsigned)rows * (unsigned)W, 1, 1}, {256, 1, 1});
+      }
       // GPU [a | b] row-wise column concat -> dst[rows, wa+wb] (in-stream).
       void concat_cols(const SharedBuffer& dst, const SharedBuffer& a,
                        const SharedBuffer& b, int rows, int wa, int wb) {
@@ -1386,46 +1478,128 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   const bool nax = _use_attn_nax && _lib_attn_nax.valid();
   const int A_BQ = nax ? 64 : 32;
   const int A_BK = nax ? 32 : 16;
-  metal_compute::ComputeFunction fn_attn;
-  bool use_steel = _steel_attn_ok && !_attn_params.empty();
-  if (use_steel) {
-    auto* p = static_cast<SteelAttnParams*>(_attn_params.contents());
-    p->B = 1; p->H = HED; p->D = HD; p->qL = seq; p->kL = seq;
+  // Q/O span the live sequence; K/V span KL (sequence + spliced cached refs).
+  auto fill_params = [&](const SharedBuffer& pb, int qL, int kL) {
+    auto* p = static_cast<SteelAttnParams*>(pb.contents());
+    p->B = 1; p->H = HED; p->D = HD; p->qL = qL; p->kL = kL;
     p->gqa_factor = HED / KVH; p->scale = scale;
-    p->NQ = (seq + A_BQ - 1) / A_BQ; p->NK = (seq + A_BK - 1) / A_BK;
-    p->NQ_aligned = seq / A_BQ; p->NK_aligned = seq / A_BK;
-    p->qL_rem = seq - p->NQ_aligned * A_BQ;
-    p->kL_rem = seq - p->NK_aligned * A_BK;
+    p->NQ = (qL + A_BQ - 1) / A_BQ; p->NK = (kL + A_BK - 1) / A_BK;
+    p->NQ_aligned = qL / A_BQ; p->NK_aligned = kL / A_BK;
+    p->qL_rem = qL - p->NQ_aligned * A_BQ;
+    p->kL_rem = kL - p->NK_aligned * A_BK;
     p->qL_off = 0;
     p->Q_strides[0] = (std::int64_t)HED * seq * HD;
     p->Q_strides[1] = (std::int64_t)seq * HD; p->Q_strides[2] = HD;
-    p->K_strides[0] = (std::int64_t)KVH * seq * HD;
-    p->K_strides[1] = (std::int64_t)seq * HD; p->K_strides[2] = HD;
+    p->K_strides[0] = (std::int64_t)KVH * KL * HD;
+    p->K_strides[1] = (std::int64_t)KL * HD; p->K_strides[2] = HD;
     p->V_strides[0] = p->K_strides[0];
     p->V_strides[1] = p->K_strides[1]; p->V_strides[2] = HD;
     p->O_strides[0] = p->Q_strides[0];
     p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = HD;
+  };
+  auto attn_fn = [&](int qL, int kL) {
     metal_compute::FunctionConstants fc;
-    fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
+    fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-    fn_attn = nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
-                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+    return nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+               : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+  };
+  // Reference queries present => two groups. Each needs its OWN params buffer:
+  // both dispatches are encoded into one stream, so a single mutable buffer
+  // would hand the second group's shape to the first at execution time.
+  const bool split_attn = kv_recipe && QA < seq;
+  metal_compute::ComputeFunction fn_attn, fn_attn_ref;
+  SharedBuffer attn_params_ref;
+  bool use_steel = _steel_attn_ok && !_attn_params.empty();
+  if (use_steel) {
+    fill_params(_attn_params, QA, KL);
+    fn_attn = attn_fn(QA, KL);
     use_steel = fn_attn.valid();
   }
-  const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
+  if (use_steel && split_attn) {
+    attn_params_ref = _mc->make_shared_buffer(sizeof(SteelAttnParams));
+    if (attn_params_ref.empty()) { return {}; }
+    fill_params(attn_params_ref, IS_REF, IS_REF);
+    fn_attn_ref = attn_fn(IS_REF, IS_REF);
+    use_steel = fn_attn_ref.valid();
+  }
+  // The recipe's masking IS the pair of grouped dispatches; the scalar
+  // fallback has no way to express it, and quietly running one undivided
+  // attention would yield plausible-looking WRONG images. Fail loudly.
+  if (kv_recipe && !use_steel) {
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalFlux2Transformer: klein_kv needs the steel flash-attention "
+          "library; refusing to run reference-isolated attention on the "
+          "scalar fallback"));
+    }
+    return {};
+  }
+  const unsigned a_nqb = (unsigned)((QA + A_BQ - 1) / A_BQ);
+  const unsigned a_nqb_ref =
+      split_attn ? (unsigned)((IS_REF + A_BQ - 1) / A_BQ) : 0u;
 
-  // Joint self-attention over jq/jk/jv [seq, H] (already q/k RMSNorm'd). head-
-  // major transpose -> rope -> flash attn -> transpose the result into `out`
-  // (row stride out_rs; out_rs > 0 writes a sub-view, e.g. att -> scat[:, :H]).
+  // Per-token modulation. Under the recipe the reference tail carries its own
+  // timestep-0 modulation, so each op becomes two dispatches over contiguous
+  // row spans. Keeping the references at the END of both the image stream and
+  // the joint sequence is what holds this to a plain offset instead of a
+  // masked kernel -- BFL's [text, refs, generated] order would split the
+  // generated tokens in two.
+  const bool mod_split = kv_recipe && IS_REF > 0;
+  auto ln_mod_img = [&](auto& op, const SharedBuffer& x, std::size_t sc,
+                        std::size_t sh, const SharedBuffer& out) {
+    if (!mod_split) { op.ln_mod(x, 0, mimg, sc, sh, out, 0, H, IS); return; }
+    op.ln_mod(x, 0, mimg, sc, sh, out, 0, H, IS_GEN);
+    op.ln_mod(x, (std::size_t)IS_GEN * H, mimg_r, sc, sh, out,
+              (std::size_t)IS_GEN * H, H, IS_REF);
+  };
+  auto gated_img = [&](auto& op, const SharedBuffer& x, std::size_t g,
+                       const SharedBuffer& sub) {
+    if (!mod_split) { op.gated(x, 0, mimg, g, sub, 0, H, IS * H); return; }
+    op.gated(x, 0, mimg, g, sub, 0, H, IS_GEN * H);
+    op.gated(x, (std::size_t)IS_GEN * H, mimg_r, g, sub,
+             (std::size_t)IS_GEN * H, H, IS_REF * H);
+  };
+  auto ln_mod_joint = [&](auto& op, const SharedBuffer& x, std::size_t sc,
+                          std::size_t sh, const SharedBuffer& out) {
+    if (!mod_split) { op.ln_mod(x, 0, msin, sc, sh, out, 0, H, seq); return; }
+    op.ln_mod(x, 0, msin, sc, sh, out, 0, H, QA);
+    op.ln_mod(x, (std::size_t)QA * H, msin_r, sc, sh, out,
+              (std::size_t)QA * H, H, IS_REF);
+  };
+  auto gated_joint = [&](auto& op, const SharedBuffer& x, std::size_t g,
+                         const SharedBuffer& sub) {
+    if (!mod_split) { op.gated(x, 0, msin, g, sub, 0, H, seq * H); return; }
+    op.gated(x, 0, msin, g, sub, 0, H, QA * H);
+    op.gated(x, (std::size_t)QA * H, msin_r, g, sub, (std::size_t)QA * H, H,
+             IS_REF * H);
+  };
+
+  // Joint self-attention over jq [seq, H] / jk,jv [KL, H] (already q/k
+  // RMSNorm'd). head-major transpose -> rope -> flash attn -> transpose the
+  // result into `out` (row stride out_rs; out_rs > 0 writes a sub-view, e.g.
+  // att -> scat[:, :H]).
   auto attention = [&](auto& op, const SharedBuffer& out, int out_rs) {
     op.tr_rope(jq, qt, seq, HED, HD);   // fused transpose + rope (q)
-    op.tr_rope(jk, kt, seq, HED, HD);   // fused transpose + rope (k)
-    op.tr(jv, 0, vt, 0, seq, HED, HD);  // v: transpose only (no rope)
+    op.tr_rope(jk, kt, KL, HED, HD);    // fused transpose + rope (k)
+    op.tr(jv, 0, vt, 0, KL, HED, HD);   // v: transpose only (no rope)
     if (use_steel) {
+      // Group A: text + generated queries over every key.
       op.e->set_function(fn_attn);
       op.e->set_buffer(0, qt); op.e->set_buffer(1, kt); op.e->set_buffer(2, vt);
       op.e->set_buffer(3, atb); op.e->set_buffer(4, _attn_params);
       op.e->dispatch({32 * a_nqb, 4 * (unsigned)HED, 1}, {32, 4, 1});
+      if (split_attn) {
+        // Group B: reference queries over reference keys ONLY. Same buffers
+        // re-based on the reference band; the per-head strides stay the full
+        // row counts, so each head still lands on its own slice.
+        const std::size_t ro = (std::size_t)QA * HD * 2;
+        op.e->set_function(fn_attn_ref);
+        op.e->set_buffer(0, qt, ro); op.e->set_buffer(1, kt, ro);
+        op.e->set_buffer(2, vt, ro); op.e->set_buffer(3, atb, ro);
+        op.e->set_buffer(4, attn_params_ref);
+        op.e->dispatch({32 * a_nqb_ref, 4 * (unsigned)HED, 1}, {32, 4, 1});
+      }
     } else {
       op.sdpa(qt, kt, vt, atb, scale, seq, HD, HED);
     }
@@ -1465,12 +1639,32 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     op.gemm(tsilu, _mod_img, mimg, 0, 1, 6 * H, H);
     op.gemm(tsilu, _mod_txt, mtxt, 0, 1, 6 * H, H);
     op.gemm(tsilu, _mod_single, msin, 0, 1, 3 * H, H);
+    // The same two Linears again over the timestep-0 embedding: the reference
+    // tokens' own modulation. They take the IMAGE double-stream set (they ride
+    // the image stream) and the single-stream set, never the text one.
+    if (kv_recipe) {
+      op.gemm(te_ref, _t_emb1, tr1, 0, 1, H, TD);
+      op.bias(_t_emb1_b, tr1, 1, H);
+      op.elt(_fn_mulsig, tr1, 0, tr1, 0, tr1, 0, H);          // SiLU
+      op.gemm(tr1, _t_emb2, temb_r, 0, 1, H, H);
+      op.bias(_t_emb2_b, temb_r, 1, H);
+      // Guidance rides the reference embedding too (BFL adds the SAME
+      // guidance_in output to both vectors).
+      if (use_g) {
+        op.elt(_fn_residual, temb_r, 0, gemb, 0, temb_r, 0, H);
+      }
+      op.elt(_fn_mulsig, temb_r, 0, temb_r, 0, tsilu_r, 0, H);
+      op.gemm(tsilu_r, _mod_img, mimg_r, 0, 1, 6 * H, H);
+      op.gemm(tsilu_r, _mod_single, msin_r, 0, 1, 3 * H, H);
+    }
     // Embed image + text. The generated tokens embed into img[0:IS_GEN]; each
     // reference embeds (same x_embedder) into the tail img[IS_GEN..IS]. (Calib
     // taps the generated tokens only -- calibration runs text-only, refs empty.)
     op.tap("emb_x", 0, latents_b, 0, IS_GEN, IC);
     op.gemm(latents_b, _x_embed, img, 0, IS_GEN, H, IC);
-    {
+    // A reused cache carries the references' whole contribution as attention
+    // keys, so they are not embedded and take no place in the token stream.
+    if (!kv_reuse) {
       std::size_t ro = (std::size_t)IS_GEN;   // ref token offset into img
       for (std::size_t i = 0; i < refs.size(); ++i) {
         op.gemm(refs_b[i], _x_embed, img, ro * H, refs[i].seq, H, IC);
@@ -1499,7 +1693,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       const DoubleBlock& b =
           streaming ? streamed : _double[(std::size_t)L];
       // MSA: img (mod set 0) + txt.  mod layout [shift,scale,gate]*2 (each H).
-      op.ln_mod(img, 0, mimg, H, 0, nrm, 0, H, IS);
+      ln_mod_img(op, img, H, 0, nrm);
       op.tap("dbl_norm1_img", L, nrm, 0, IS, H);
       op.gemm(nrm, b.q, jq, (std::size_t)TS * H, IS, H, H);
       op.gemm(nrm, b.k, jk, (std::size_t)TS * H, IS, H, H);
@@ -1514,6 +1708,20 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       const std::size_t io = (std::size_t)TS * H;   // image region offset
       op.rms(jq, io, b.qn, jq, io, IS * HED, HD);
       op.rms(jk, io, b.kn, jk, io, IS * HED, HD);
+      // KV cache, post-RMSNorm: lift the reference band out on the extracting
+      // step, splice it back onto the key tail on every later one. Neither
+      // touches the live rows, so the norms above are unaffected either way.
+      if (kv_fill) {
+        op.copy_rows(jk, (std::size_t)QA * H, kv->k[(std::size_t)L], 0,
+                     IS_REF, H);
+        op.copy_rows(jv, (std::size_t)QA * H, kv->v[(std::size_t)L], 0,
+                     IS_REF, H);
+      } else if (kv_reuse) {
+        op.copy_rows(kv->k[(std::size_t)L], 0, jk, (std::size_t)seq * H,
+                     IS_REF_ALL, H);
+        op.copy_rows(kv->v[(std::size_t)L], 0, jv, (std::size_t)seq * H,
+                     IS_REF_ALL, H);
+      }
       attention(op, att, 0);                               // -> att (contiguous)
       op.tap("dbl_attn_txt", L, att, 0, TS, H);            // to_add_out input
       op.gemm(att, b.ao, ob, 0, TS, H, H);                 // text att[0:TS]
@@ -1521,10 +1729,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       // img att is att[TS:seq] -> read at input offset TS*H (xe).
       op.tap("dbl_attn_img", L, att, (std::size_t)TS * H, IS, H);
       op.gemm(att, b.o, ob, 0, IS, H, H, (std::size_t)TS * H);
-      op.gated(img, 0, mimg, 2 * H, ob, 0, H, IS * H);
+      gated_img(op, img, 2 * H, ob);
       // FF (mod set 1: shift_mlp=3H, scale_mlp=4H, gate_mlp=5H). Flux2FeedForward
       // is SwiGLU: linear_in -> [gate|up] (2*INNER) -> silu(gate)*up -> linear_out.
-      op.ln_mod(img, 0, mimg, 4 * H, 3 * H, nrm, 0, H, IS);
+      ln_mod_img(op, img, 4 * H, 3 * H, nrm);
       op.tap("dbl_norm2_img", L, nrm, 0, IS, H);
       if (_fuse_ff) {
         op.swiglu_ff(nrm, b.ff_in, smlp, IS, H, DFF);    // silu(gate)*up [IS,INNER]
@@ -1536,7 +1744,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
       op.tap("dbl_ffact_img", L, smlp, 0, IS, INNER);
       op.gemm(smlp, b.ff_out, ob, 0, IS, H, INNER);
-      op.gated(img, 0, mimg, 5 * H, ob, 0, H, IS * H);
+      gated_img(op, img, 5 * H, ob);
       op.ln_mod(txt, 0, mtxt, 4 * H, 3 * H, nrm, 0, H, TS);
       op.tap("dbl_norm2_txt", L, nrm, 0, TS, H);
       if (_fuse_ff) {
@@ -1605,7 +1813,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
     auto op = make_ops(enc);
-    op.ln_mod(joint, 0, msin, H, 0, nrm, 0, H, seq);       // (1+scale)*LN+shift
+    ln_mod_joint(op, joint, H, 0, nrm);                    // (1+scale)*LN+shift
     op.tap("sgl_norm", L, nrm, 0, seq, H);
     if (_fuse_ff) {
       // qkv-only proj [seq, 3H] + a fused-SwiGLU mlp GEMM writing smlp directly
@@ -1634,6 +1842,16 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     }
     op.rms(jq, 0, b.qn, jq, 0, seq * HED, HD);
     op.rms(jk, 0, b.kn, jk, 0, seq * HED, HD);
+    {
+      const std::size_t ci = (std::size_t)(c.n_double + L);
+      if (kv_fill) {
+        op.copy_rows(jk, (std::size_t)QA * H, kv->k[ci], 0, IS_REF, H);
+        op.copy_rows(jv, (std::size_t)QA * H, kv->v[ci], 0, IS_REF, H);
+      } else if (kv_reuse) {
+        op.copy_rows(kv->k[ci], 0, jk, (std::size_t)seq * H, IS_REF_ALL, H);
+        op.copy_rows(kv->v[ci], 0, jv, (std::size_t)seq * H, IS_REF_ALL, H);
+      }
+    }
     // Profiling barriers split the one stream into timed slices (prof only).
     if (prof) {
       enc.end(); stream.commit().wait(); t_sgl_gemm += ms_since(mk);
@@ -1654,7 +1872,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (!ff_direct) { op.concat_cols(scat, att, smlp, seq, H, SMLP); }
     op.tap("sgl_cat", L, scat, 0, seq, H + SMLP);
     op.gemm(scat, b.o, ob, 0, seq, H, H + SMLP);
-    op.gated(joint, 0, msin, 2 * H, ob, 0, H, seq * H);    // += gate * to_out
+    gated_joint(op, joint, 2 * H, ob);                     // += gate * to_out
     enc.end();
     std::string gpu_err;
     if (!stream.commit().wait_ok(&gpu_err)) {
@@ -1708,6 +1926,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           (long)tot, (long)t_dbl, (long)t_sgl_gemm, (long)t_sgl_attn,
           (long)t_sgl_cat, (long)t_sgl_out, (long)t_final));
     }
+  }
+  // Mark the cache usable only now: every earlier exit is a failure path, and
+  // a half-filled cache flagged valid would be reused as if complete.
+  if (kv_fill) {
+    kv->ref_seq  = IS_REF_ALL;
+    kv->text_seq = TS;
+    kv->img_seq  = IS_GEN;
   }
   // Downcast the bf16 velocity back to f16 for the stage/test boundary (the
   // velocity is O(1), so f16 is lossless here).

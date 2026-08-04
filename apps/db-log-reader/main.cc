@@ -60,28 +60,12 @@ public:
   {
     return 0;
   }
-  const vpipe::FFmpegLibraries* ffmpeg_libraries() const override
-  {
-    // db-log-reader is a pure log dumper -- no pipeline ever runs in
-    // this app. Return nullptr; nothing in this binary asks for it.
-    return nullptr;
-  }
-  vpipe::LmdbEnv* lmdb_env() const override
-  {
-    // db-log-reader opens its own env directly via the LmdbEnv
-    // wrapper rather than going through the session's accessor;
-    // this hook isn't part of the program flow.
-    return nullptr;
-  }
-  vpipe::CoreMLModelManager* coreml_model_manager() const override
-  {
-    return nullptr;
-  }
-  vpipe::genai::GenerativeModelManager*
-  generative_model_manager() const override
-  {
-    return nullptr;
-  }
+  // No subsystem accessors: db-log-reader is a pure log dumper, no
+  // pipeline ever runs in it, and it opens its own LmdbEnv directly
+  // rather than through the session. It therefore overrides no
+  // SessionServicesIntf accessor -- SessionContextIntf::services()
+  // hands back the inert bundle, whose answers are the nullptrs this
+  // used to spell out by hand.
 };
 
 bool

@@ -6,6 +6,8 @@
 #include "tests/unit-tests/payload-types.h"
 #include "common/vertex.h"
 #include "stages/passthrough-stage.h"
+#include "interfaces/session-services-intf.h"
+#include "common/lmdb-env.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -586,4 +588,110 @@ TEST(pipeline_runtime, peeking_an_absent_iport_reads_eos) {
   EXPECT_TRUE(ctx.eos(0));
   EXPECT_TRUE(ctx.backlog(0) == 0u);
   ctx.release_read(0, 1);          // must be a no-op, not a crash
+}
+
+// ---- declared service dependencies ----------------------------------
+//
+// A stage that needs a session service used to discover its absence by
+// getting a null pointer from services() partway through initialize(),
+// after the launch had already committed. Declaring the dependency moves
+// that to a refusal at launch which names the stage and the service.
+
+namespace {
+
+// A service no session provides, so the "missing" case is deterministic
+// rather than depending on what this box happens to have.
+struct AbsentService {};
+
+// A source that requires it. Everything else about it is ordinary.
+class NeedyStage : public vpipe::TypedStage<NeedyStage> {
+public:
+  static constexpr const char* kTypeName = "ut-needy-stage";
+  using TypedStage::TypedStage;
+  bool required = true;
+
+  std::vector<vpipe::ServiceReq> declare_services() const override
+  {
+    return {vpipe::ServiceReq{"vpipe.test.absent/1", required}};
+  }
+  vpipe::Job process(vpipe::RuntimeContext& ctx) override
+  {
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+// One that requires a service the session really does provide.
+class LmdbNeedyStage : public vpipe::TypedStage<LmdbNeedyStage> {
+public:
+  static constexpr const char* kTypeName = "ut-lmdb-needy-stage";
+  using TypedStage::TypedStage;
+
+  std::vector<vpipe::ServiceReq> declare_services() const override
+  {
+    return {vpipe::require_service<vpipe::LmdbEnv>()};
+  }
+  vpipe::Job process(vpipe::RuntimeContext& ctx) override
+  {
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+}  // namespace
+
+TEST(pipeline_runtime, missing_required_service_refuses_launch) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("needy", &sess);
+  pl->insert_stage(std::make_unique<NeedyStage>(
+      &sess, "needy", std::vector<vpipe::InEdge>{},
+      vpipe::FlexData::make_object()));
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  bool threw = false, launched = true;
+  try {
+    launched = rt.launch();
+  } catch (...) {
+    threw = true;
+  }
+  // Refused, not thrown -- same contract as the type-mismatch check, so
+  // the operator can fix the session and try again.
+  EXPECT_FALSE(threw);
+  EXPECT_FALSE(launched);
+  rt.stop();
+}
+
+// The same stage declaring the dependency as OPTIONAL launches: absence
+// is a fact the stage said it can live with, not a failure.
+TEST(pipeline_runtime, optional_service_does_not_block_launch) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("tolerant", &sess);
+  auto s_u = std::make_unique<NeedyStage>(
+      &sess, "tolerant", std::vector<vpipe::InEdge>{},
+      vpipe::FlexData::make_object());
+  s_u->required = false;
+  pl->insert_stage(std::move(s_u));
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.stop();
+}
+
+// A requirement the session DOES satisfy resolves by type, through the
+// keyed registry, and launches.
+TEST(pipeline_runtime, satisfied_service_requirement_launches) {
+  vpipe::Session sess;
+  // Prove the registry answers for a real service before relying on it.
+  EXPECT_TRUE(sess.services()->service<vpipe::LmdbEnv>() != nullptr);
+  EXPECT_TRUE(sess.services()->find_service("vpipe.lmdb/1") != nullptr);
+  EXPECT_TRUE(sess.services()->find_service("nope/1") == nullptr);
+
+  auto pl = std::make_unique<vpipe::Pipeline>("satisfied", &sess);
+  pl->insert_stage(std::make_unique<LmdbNeedyStage>(
+      &sess, "reader", std::vector<vpipe::InEdge>{},
+      vpipe::FlexData::make_object()));
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.stop();
 }

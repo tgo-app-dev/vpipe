@@ -2,6 +2,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,7 +48,7 @@ LoadVideoStage::LoadVideoStage
   : TypedStage<LoadVideoStage>(s, std::move(id),
                                       std::move(iports),
                                       std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   // Stage's _config now holds the moved-in FlexData. Read everything
   // we need up-front; throw via session()->error if `input_url` is

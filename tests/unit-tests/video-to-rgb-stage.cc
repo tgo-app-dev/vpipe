@@ -1,4 +1,5 @@
 #include "minitest.h"
+#include "interfaces/session-services-intf.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/encoded-segment.h"
@@ -79,7 +80,7 @@ public:
 
   Job process(RuntimeContext& ctx) override
   {
-    const FFmpegLibraries& libs = *session()->ffmpeg_libraries();
+    const FFmpegLibraries& libs = *session()->services()->ffmpeg_libraries();
     if (!_header_sent) {
       VideoStreamParams p{
         width, height, AV_PIX_FMT_YUV420P,

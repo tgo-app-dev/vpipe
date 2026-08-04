@@ -7,6 +7,7 @@
 #include "common/job.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 
 #include <algorithm>
@@ -275,7 +276,7 @@ Job
 TemporalDecimationStage::initialize(RuntimeContext& ctx)
 {
   if (session()) {
-    _mc = session()->metal_compute();
+    _mc = session()->services()->metal_compute();
   }
   _has_iport1 = (ctx.num_iports() >= 2);
   if (!_mc || !_mc->valid()) {

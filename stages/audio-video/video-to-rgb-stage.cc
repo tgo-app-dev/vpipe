@@ -5,6 +5,7 @@
 #include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/image-ops.h"
@@ -291,7 +292,7 @@ VideoToRgbStage::VideoToRgbStage(const SessionContextIntf* s,
                                  FlexData                  config)
   : TypedStage<VideoToRgbStage>(s, std::move(id), std::move(iports),
                                 std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
@@ -363,7 +364,7 @@ VideoToRgbStage::VideoToRgbStage(const SessionContextIntf* s,
   // apple builds) or non-null but !valid() (Metal init failed). The
   // Metal fast path only engages when valid() and the frame is a
   // videotoolbox-decoded CVPixelBuffer with u8 output.
-  _mc = s->metal_compute();
+  _mc = s->services()->metal_compute();
 #endif
 
   // Install an FFmpeg log tap that captures the most recent

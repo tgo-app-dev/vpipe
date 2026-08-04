@@ -5,6 +5,7 @@
 #include "common/media-line.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
@@ -259,6 +260,25 @@ VisualQaStage::spec() const noexcept
 
 VisualQaStage::~VisualQaStage() = default;
 
+std::vector<ServiceReq>
+VisualQaStage::declare_services() const
+{
+#if defined(VPIPE_BUILD_APPLE_SILICON)
+  // initialize() already treats a missing manager as fatal for this
+  // stage; saying so here moves the failure to a launch refusal that
+  // names the stage, instead of a pipeline that starts with one member
+  // silently doing nothing.
+  //
+  // Gated on the Apple-Silicon build for the same reason the body is:
+  // off it, the LLM subsystem is absent by construction and the stage
+  // already reports that itself, so a refusal would be a behaviour
+  // change rather than a better diagnosis.
+  return {require_service<genai::GenerativeModelManager>()};
+#else
+  return {};
+#endif
+}
+
 std::vector<ResourceClaim>
 VisualQaStage::declare_resources() const
 {
@@ -274,7 +294,7 @@ VisualQaStage::initialize(RuntimeContext& ctx)
 #if   defined(VPIPE_BUILD_APPLE_SILICON)
   // No-MLX build: load + run the VLM on the metal-compute backend.
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "VisualQaStage('{}'): no GenerativeModelManager", this->id()));
@@ -429,7 +449,7 @@ VisualQaStage::process(RuntimeContext& ctx)
       // the frame is a Shared/UMA metal-compute buffer, bind it straight
       // into the letterbox kernel (zero-copy input via from_tensor_beat);
       // else stage the host bytes.
-      auto* mc = session()->metal_compute();
+      auto* mc = session()->services()->metal_compute();
       genai::CoreMLVisionEncoder::Result cr;
       if (mc && tbp->is_contiguous()
           && tbp->storage_class() == TensorStorageClass::Shared) {

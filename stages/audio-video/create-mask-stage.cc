@@ -4,6 +4,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/stage-spec.h"
 
 #include <algorithm>
@@ -177,7 +178,7 @@ CreateMaskStage::CreateMaskStage(const SessionContextIntf* s,
                                  FlexData                  config)
   : TypedStage<CreateMaskStage>(s, std::move(id), std::move(iports),
                                 std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   const string mode = attr_str("mask_mode");
   if (mode == "alpha") {

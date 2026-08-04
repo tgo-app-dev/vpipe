@@ -8,6 +8,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #include <algorithm>
@@ -325,7 +326,7 @@ VaeEncodeStage::ensure_loaded_()
         "model-select source to the model iport; inert", this->id()));
     return;
   }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "VaeEncodeStage('{}'): no metal-compute backend on this session; "
@@ -660,7 +661,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
           sW, sH));
       co_return;
     }
-    auto* mc = session()->metal_compute();
+    auto* mc = session()->services()->metal_compute();
     const auto img = tbp->materialize_contiguous();
     const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
@@ -733,7 +734,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
           W, H, P));
       co_return;
     }
-    auto* mc = session()->metal_compute();
+    auto* mc = session()->services()->metal_compute();
     const auto img = tbp->materialize_contiguous();
     const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
@@ -806,7 +807,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         this->id(), sW, sH));
     co_return;
   }
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   session()->log_debug(fmt(
       "VaeEncodeStage('{}'): beat received, image [3, {}, {}] -> encode [3, {}, "
       "{}]{} -> latent [{}, {}, {}]", this->id(), sH, sW, H, W,

@@ -2,6 +2,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -45,7 +46,7 @@ SaveVideoStage::SaveVideoStage
   : TypedStage<SaveVideoStage>(s, std::move(id),
                                       std::move(iports_in),
                                       std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   // Nested video/audio defaults: no flat ConfigKey representation, so
   // they are seeded here (the single source) and overridden from the

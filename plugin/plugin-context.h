@@ -2,6 +2,7 @@
 #define VPIPE_PLUGIN_CONTEXT_H
 
 #include "pipeline/stage-registry.h"
+#include "interfaces/session-services-intf.h"
 
 #include <cstdint>
 #include <memory>
@@ -60,7 +61,7 @@ public:
   // ---- metal shaders -------------------------------------------------
   // Register a plugin's offline-compiled `.metallib` bytes under `name`,
   // so the plugin's stages/models resolve its kernels via
-  // session()->metal_compute()->load_library(name).function(...). The
+  // session()->services()->metal_compute()->load_library(name).function(...). The
   // bytes are copied; the caller's buffer need not outlive the call.
   // First-wins: returns false (+ warns) if `name` is already registered
   // or metal-compute is unavailable (including on non-apple builds).

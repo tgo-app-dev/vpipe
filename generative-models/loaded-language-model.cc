@@ -18,6 +18,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <random>
 
@@ -374,7 +375,7 @@ LoadedLanguageModel::LoadedLanguageModel(
     // buffers in one go. We do the same: bind first, set
     // wired_limit second.
     metal_compute::MetalCompute* mc_be =
-        session ? session->metal_compute() : nullptr;
+        session ? session->services()->metal_compute() : nullptr;
     const char* be_env = std::getenv("VPIPE_LLM_BACKEND");
     const std::string& arch_be = _impl->weights.config.architecture;
     const bool metal_llama = arch_be == "LlamaForCausalLM";
@@ -1160,7 +1161,7 @@ LoadedLanguageModel::prefill_multimodal_metal(
   // (f16), image rows memcpy'd straight from the encoder's f16 buffer
   // (no host f32 round-trip, no cast). The image tokens dominate, so the
   // f16-only copy is the big win.
-  auto* mc_dev = _impl->session ? _impl->session->metal_compute() : nullptr;
+  auto* mc_dev = _impl->session ? _impl->session->services()->metal_compute() : nullptr;
   if (mc_dev != nullptr && !_impl->metal_bf16) {
     bool all_buf = true;
     for (int i = 0; i < n; ++i) {

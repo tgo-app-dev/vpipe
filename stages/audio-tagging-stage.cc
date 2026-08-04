@@ -10,6 +10,7 @@
 #include "common/perf-event.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <algorithm>
 #include <cmath>
@@ -238,7 +239,7 @@ Job
 AudioTaggingStage::initialize(RuntimeContext& /*ctx*/)
 {
   CoreMLModelManager* mgr =
-      session() ? session()->coreml_model_manager() : nullptr;
+      session() ? session()->services()->coreml_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "AudioTaggingStage('{}'): session has no CoreML model manager "

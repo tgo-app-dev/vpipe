@@ -2,7 +2,7 @@
 #include "common/lmdb-db.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 
 using namespace std;
 
@@ -19,18 +19,18 @@ from_val(const MDB_val& v)
 }
 
 LmdbCursor::LmdbCursor(LmdbTxn& txn, const LmdbDb& db)
-  : SessionMember(txn.session())
+  : _log(txn.log())
   , _cur(nullptr)
 {
   int rc = mdb_cursor_open(txn.raw(), db.dbi(), &_cur);
   if (rc != MDB_SUCCESS) {
     _cur = nullptr;
-    session()->error(fmt("mdb_cursor_open failed: {}", mdb_strerror(rc)));
+    _log->error(fmt("mdb_cursor_open failed: {}", mdb_strerror(rc)));
   }
 }
 
 LmdbCursor::LmdbCursor(LmdbCursor&& other) noexcept
-  : SessionMember(other.session())
+  : _log(other._log)
   , _cur(other._cur)
 {
   other._cur = nullptr;
@@ -60,7 +60,7 @@ LmdbCursor::~LmdbCursor()
 namespace {
 
 bool
-step(const SessionContextIntf* s,
+step(const LogSinkIntf*       s,
      MDB_cursor*               cur,
      MDB_cursor_op             op,
      MDB_val&                  k,
@@ -87,28 +87,28 @@ bool
 LmdbCursor::first(string_view& k, string_view& v)
 {
   MDB_val ki{}, vi{};
-  return step(session(), _cur, MDB_FIRST, ki, vi, k, v);
+  return step(_log, _cur, MDB_FIRST, ki, vi, k, v);
 }
 
 bool
 LmdbCursor::last(string_view& k, string_view& v)
 {
   MDB_val ki{}, vi{};
-  return step(session(), _cur, MDB_LAST, ki, vi, k, v);
+  return step(_log, _cur, MDB_LAST, ki, vi, k, v);
 }
 
 bool
 LmdbCursor::next(string_view& k, string_view& v)
 {
   MDB_val ki{}, vi{};
-  return step(session(), _cur, MDB_NEXT, ki, vi, k, v);
+  return step(_log, _cur, MDB_NEXT, ki, vi, k, v);
 }
 
 bool
 LmdbCursor::prev(string_view& k, string_view& v)
 {
   MDB_val ki{}, vi{};
-  return step(session(), _cur, MDB_PREV, ki, vi, k, v);
+  return step(_log, _cur, MDB_PREV, ki, vi, k, v);
 }
 
 bool
@@ -118,7 +118,7 @@ LmdbCursor::seek_at_or_after(string_view  key_in,
 {
   MDB_val ki{key_in.size(), const_cast<char*>(key_in.data())};
   MDB_val vi{};
-  return step(session(), _cur, MDB_SET_RANGE, ki, vi, k_out, v_out);
+  return step(_log, _cur, MDB_SET_RANGE, ki, vi, k_out, v_out);
 }
 
 MDB_cursor*

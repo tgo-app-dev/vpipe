@@ -1,7 +1,7 @@
 #ifndef COMMON_STATIC_FILE_SERVER_H
 #define COMMON_STATIC_FILE_SERVER_H
 
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 
 #include <atomic>
 #include <cstdint>
@@ -86,21 +86,21 @@ private:
 //                       to unblock accept(), joins the thread.
 // Either call is idempotent. The destructor calls stop(). The
 // blob_store pointer, if supplied, must outlive the server.
-class StaticFileServer : public SessionMember {
+class StaticFileServer {
 public:
-  StaticFileServer(const SessionContextIntf* session,
+  StaticFileServer(const LogSinkIntf* session,
                    std::string               doc_root,
                    std::string               bind_address,
                    int                       port,
                    const InMemoryBlobStore*  blob_store = nullptr);
-  ~StaticFileServer() override;
+  ~StaticFileServer();
 
   StaticFileServer(const StaticFileServer&)            = delete;
   StaticFileServer& operator=(const StaticFileServer&) = delete;
 
   // Bind + listen + spawn accept thread. Returns false on bind /
   // listen error (port in use, permission denied, etc.). Errors
-  // are also logged via session()->warn.
+  // are also logged via the log sink's warn.
   bool start();
 
   // Idempotent. Closes the listen fd, joins the accept thread.
@@ -113,7 +113,11 @@ public:
   // Public for unit testing.
   static std::string mime_type_for(std::string_view path);
 
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   // Parsed Range request resolved against a known body length.
   // `partial` => respond with 206 + Content-Range; `unsatisfiable`
   // => respond with 416; otherwise serve [first..last] inclusive

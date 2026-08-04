@@ -6,6 +6,7 @@
 #include "common/thread-pool.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <chrono>
 #include <cmath>
@@ -212,7 +213,7 @@ HlsBroadcastStage::HlsBroadcastStage(const SessionContextIntf* s,
                                      FlexData                  config)
   : TypedStage<HlsBroadcastStage>(s, std::move(id), std::move(iports),
                                   std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   // Attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default. Post-read clamps below repair

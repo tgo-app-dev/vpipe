@@ -5,6 +5,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
@@ -225,7 +226,7 @@ AudioTranscribeStage::initialize(RuntimeContext& /*ctx*/)
   }
   // No-MLX build: transcription runs on the metal-compute backend.
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
-  auto* mgr = session()->generative_model_manager();
+  auto* mgr = session()->services()->generative_model_manager();
   if (!mgr) {
     session()->error(fmt(
         "AudioTranscribeStage('{}'): no GenerativeModelManager on this session "

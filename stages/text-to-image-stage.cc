@@ -9,6 +9,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -103,6 +104,14 @@ const ConfigKey kAttrs[] = {
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
           "without NAX matmul2d (matrix-core GPU + kernels). Default "
           "false; env VPIPE_I8_GEMM overrides"},
+  {.key = "klein_kv", .type = ConfigType::Bool, .required = false,
+   .doc = "the checkpoint is FLUX.2-klein-9b-kv rather than plain klein-9B: "
+          "reference tokens are attention-isolated and modulated at a fixed "
+          "timestep 0, and their K/V are cached across denoise steps (BFL "
+          "measure 1.21-2.66x on multi-reference edits). REQUIRED for that "
+          "checkpoint and WRONG for any other -- the two are indistinguishable "
+          "on disk (same config.json, same tensor names), so it cannot be "
+          "detected. Default false"},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning", .doc = "conditioning tensor from a diffusion-"
@@ -186,6 +195,7 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
   // big block matmuls (~2x their f16 rate on matrix-core GPUs at int8
   // quality). Env VPIPE_I8_GEMM=0|1 overrides.
   _i8_gemm = attr_bool("i8_gemm");
+  _klein_kv = attr_bool("klein_kv");
   _seed   = (std::uint64_t)attr_int("seed");
   // Neither axis configured => infer the size from ref_latent0 when a
   // reference is wired (process()); both stay 0 so the check below is vacuous
@@ -409,7 +419,7 @@ TextToImageStage::reset_run_state()
 void
 TextToImageStage::revise_dit_declaration_(const std::string& dit_dir) const
 {
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (mgr == nullptr || dit_dir.empty()) { return; }
   // What the set holds IS the right number for a DiT: unlike the LMs,
   // its retained tensors go through tensor()/derived() and are cached
@@ -463,7 +473,7 @@ TextToImageStage::ensure_loaded_()
         "model-select source to the model iport; inert", this->id()));
     return;
   }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "TextToImageStage('{}'): no metal-compute backend; the stage is inert",
@@ -531,6 +541,26 @@ TextToImageStage::ensure_loaded_()
     }
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
+    fcfg.klein_kv = _klein_kv;
+    // Nothing in the checkpoint says which recipe it wants, and getting it
+    // backwards costs plausible-looking wrong images rather than an error --
+    // so when the path LOOKS like the other variant, say so. A hint, never an
+    // override: the config key stays authoritative.
+    {
+      std::string dl = dit_dir;
+      for (auto& ch : dl) { ch = (char)std::tolower((unsigned char)ch); }
+      const bool looks_kv = dl.find("-kv") != std::string::npos
+                            || dl.find("_kv") != std::string::npos;
+      if (looks_kv != _klein_kv) {
+        session()->warn(fmt(
+            "TextToImageStage('{}'): '{}' looks like {} but klein_kv={}. The "
+            "-kv checkpoint isolates reference tokens; running either variant "
+            "under the other's attention produces wrong images silently",
+            this->id(), dit_dir,
+            looks_kv ? "FLUX.2-klein-9b-kv" : "plain FLUX.2-klein",
+            _klein_kv ? "true" : "false"));
+      }
+    }
     _flux2_dit = genai::MetalFlux2Transformer::load(
         weight_set_(dit_dir), mc, fcfg, stream_blocks, pin_frac);
     if (!_flux2_dit) {
@@ -725,10 +755,11 @@ TextToImageStage::ensure_loaded_()
 bool
 TextToImageStage::load_flux2_dit_()
 {
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
+  fcfg.klein_kv = _klein_kv;
   _flux2_dit = genai::MetalFlux2Transformer::load(
       weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream, _flux2_pin_frac);
   return (bool)_flux2_dit;
@@ -738,7 +769,7 @@ void
 TextToImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_flux2_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
   if (mb.recommended == 0) { return; }   // budget query unavailable
@@ -785,7 +816,7 @@ TextToImageStage::weight_set_(const std::string& dir) const
 bool
 TextToImageStage::load_boogu_dit_()
 {
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _boogu_dit_dir.empty()) { return false; }
   genai::MetalBooguTransformer::Config bcfg;
   bcfg.i8_gemm = _i8_gemm;
@@ -805,7 +836,7 @@ void
 TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_boogu_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
   if (mb.recommended == 0) { return; }   // budget query unavailable
@@ -826,7 +857,7 @@ TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 bool
 TextToImageStage::load_krea2_dit_()
 {
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
@@ -839,7 +870,7 @@ void
 TextToImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
   if (mb.recommended == 0) { return; }   // budget query unavailable
@@ -914,7 +945,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
                             const std::function<void(const std::vector<float>&)>&
                                 emit_step) const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   using metal_compute::SharedBuffer;
   const int H = gen_h, W = gen_w;
   const int lh = H / 8, lw = W / 8;          // latent H/W
@@ -1153,7 +1184,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
                                       const std::vector<float>&)>& emit_step)
     const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   using metal_compute::SharedBuffer;
   const int H = gen_h, W = gen_w;
   const int gh = H / 16, gw = W / 16;        // VAE latent grid (128ch @ H/16)
@@ -1243,12 +1274,24 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
         this->id(), ri.size()));
   }
   bool dit_ok = true;
+  // Reference K/V cache for the -kv checkpoint, scoped to THIS generation: the
+  // first denoise step fills it, the rest reuse it. A local means a new run
+  // (or new reference set) always starts from an empty one.
+  genai::MetalFlux2Transformer::KvCache kvc;
+  // VPIPE_FLUX2_NO_KV_CACHE recomputes the reference band every step while
+  // keeping the recipe itself intact. That is the only honest way to price the
+  // cache: turning `klein_kv` off instead would change the ATTENTION, so the
+  // two arms would not be computing the same thing.
+  genai::MetalFlux2Transformer::KvCache* kvp =
+      (_klein_kv && !ri.empty() &&
+       std::getenv("VPIPE_FLUX2_NO_KV_CACHE") == nullptr) ? &kvc : nullptr;
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
     for (std::size_t k = 0; k < cand.size(); ++k) { lb[k] = (_Float16)cand[k]; }
     SharedBuffer vel = _flux2_dit->forward_dit(context, n_real, latbuf, img_seq,
-                                               gh, gw, (float)sigma, guid, ri);
+                                               gh, gw, (float)sigma, guid, ri,
+                                               kvp);
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());
@@ -1334,7 +1377,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                                       const std::vector<float>&)>& emit_step)
     const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   using metal_compute::SharedBuffer;
   const int H = gen_h, W = gen_w;
   const int Z = _boogu_dit->config().in_channels;   // 16 latent channels
@@ -1581,7 +1624,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
                                    const std::vector<float>&)>& emit_step)
     const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   using metal_compute::SharedBuffer;
   const int H = gen_h, W = gen_w;
   const int lh = H / 8, lw = W / 8;          // latent H/W (z_dim 16)
@@ -1815,7 +1858,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
                                      const std::vector<float>&)>& emit_step)
     const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   using metal_compute::SharedBuffer;
   const int IC = _mage_dit->config().in_channels;   // 128
   // MageVAE downsamples 16x and the DiT patch_size is 1, so the latent grid IS
@@ -2024,7 +2067,7 @@ TextToImageStage::tag_model_(TensorBeat& tb) const
 Job
 TextToImageStage::process(RuntimeContext& ctx)
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   // Latch the shared model (iport2) once -- a model-select source overrides the
   // hf_dir config -- then lazily load the DiT before the first generation.
   if (!_model_latched && ctx.num_iports() > kModelPort &&

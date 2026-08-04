@@ -283,6 +283,14 @@ TEST(sdpa_mma, full_encoder_d64) {
 // latent actually produces: the dot is then ~D*s^2 rather than a random walk,
 // so it crosses 65504 and pins the range. A benign arm keeps the ordinary
 // numerics honest (the big arm's softmax is near-one-hot).
+//
+// The query tile is swept alongside, because the WIDE variants (_q16/_q32/_q64)
+// are the same math with the O accumulator moved from threadgroup memory into a
+// cooperative tensor -- and that hands the row index of each accumulator
+// element to an implementation-defined layout query. Get that axis backwards
+// and the online-softmax correction lands on the wrong row: still finite, still
+// plausible, silently wrong. n=40 is deliberately no multiple of any tile, so
+// every arm also exercises the ragged query AND key tails.
 TEST(sdpa_mma, full_mma2_matches_oracle_across_range) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -308,17 +316,22 @@ TEST(sdpa_mma, full_mma2_matches_oracle_across_range) {
     float f; std::memcpy(&f, &u, 4); return f;
   };
 
+  const int bqs[] = {8, 16, 32, 64};   // 8 = the threadgroup-accumulator kernel
   for (const Lib& L : libs) {
     ComputeLibrary lib = mc->load_library(L.name);
     for (const Case& c : cases) {
+    for (const int bq : bqs) {
       const std::string fname =
-          "sdpa_full_mma2_d" + std::to_string(c.D) + "_f16";
+          "sdpa_full_mma2_d" + std::to_string(c.D) +
+          (bq == 8 ? "" : "_q" + std::to_string(bq)) + "_f16";
       ComputeFunction fn = lib.function(fname);
       if (!fn.valid()) {
         std::printf("[full_mma2] %s/%s unavailable -- skipped\n", L.name,
                     fname.c_str());
         continue;
       }
+      const unsigned nt =
+          (bq == 8 || bq == 16) ? 128u : (bq == 32 ? 256u : 512u);
       const std::size_t nel = (std::size_t)c.H * c.n * c.D;
       std::vector<std::uint16_t> q(nel), k(nel), v(nel);
       std::mt19937 rng(7 + c.D + (c.mean ? 1 : 0));
@@ -353,8 +366,8 @@ TEST(sdpa_mma, full_mma2_matches_oracle_across_range) {
           e.set_constant(6, c.D); e.set_constant(7, c.H);
           e.set_constant(8, c.H); e.set_constant(9, c.n);
           e.set_constant(10, c.n);
-          e.dispatch({128, (unsigned)c.H, (unsigned)((c.n + 7) / 8)},
-                     {128, 1, 1}); }
+          e.dispatch({nt, (unsigned)c.H, (unsigned)((c.n + bq - 1) / bq)},
+                     {nt, 1, 1}); }
         st.commit().wait(); }
 
       double num = 0.0, den = 0.0;
@@ -392,10 +405,119 @@ TEST(sdpa_mma, full_mma2_matches_oracle_across_range) {
         }
       }
       const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
-      std::printf("[full_mma2] %-14s D=%3d n=%d %-6s (|q|~%.0f) rel-L2 = "
-                  "%.4e\n", L.name, c.D, c.n, c.tag, (double)c.s, rel);
+      std::printf("[full_mma2] %-14s D=%3d n=%d BQ=%-2d %-6s (|q|~%.0f) rel-L2 "
+                  "= %.4e\n", L.name, c.D, c.n, bq, c.tag, (double)c.s, rel);
       EXPECT_TRUE(std::isfinite(rel) && rel < L.tol);
     }
+    }
+  }
+}
+
+// Query-tile sweep at the VAE mid-block shape (one head, D = the mid channel
+// count, n_q = n_kv = the full latent grid). This attention is BANDWIDTH-bound:
+// each threadgroup streams all of K and V, so bytes moved scale as
+// ceil(n/BQ) * 2*n*D*2 and BQ is the only term that touches them. The sweep is
+// what says whether the hardware agrees.
+//
+// Arms are INTERLEAVED, one iteration each per round, and scored on the MINIMUM
+// -- on this box the GPU clock is gated by the SoC power budget, so running one
+// arm at a time hands the first the cold clock and reads back a win that is
+// really a power artifact. n defaults to a 512x512 image's latent
+// (64x64 grid); VPIPE_VAE_ATTN_BENCH_N raises it (12288 = 1024x768).
+TEST(sdpa_mma, full_mma2_vae_tile_sweep) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[vae_tiles] no matrix cores -- skipped\n"); return;
+  }
+  ComputeLibrary lib = mc->load_library("sdpa_mma");
+  const int D = 512;
+  int n = 4096;
+  if (const char* e = std::getenv("VPIPE_VAE_ATTN_BENCH_N")) {
+    n = std::atoi(e);
+  }
+  const float scale = 1.0f / std::sqrt((float)D);
+  const std::size_t nel = (std::size_t)n * D;
+  std::vector<std::uint16_t> q(nel), k(nel), v(nel);
+  std::mt19937 rng(31);
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  for (std::size_t i = 0; i < nel; ++i) {
+    q[i] = f32_to_h(0.3f * u(rng));
+    k[i] = f32_to_h(0.3f * u(rng));
+    v[i] = f32_to_h(0.5f * u(rng));
+  }
+  SharedBuffer qb = mc->make_shared_buffer(nel * 2);
+  SharedBuffer kb = mc->make_shared_buffer(nel * 2);
+  SharedBuffer vb = mc->make_shared_buffer(nel * 2);
+  if (qb.empty() || kb.empty() || vb.empty()) { return; }
+  std::memcpy(qb.contents(), q.data(), nel * 2);
+  std::memcpy(kb.contents(), k.data(), nel * 2);
+  std::memcpy(vb.contents(), v.data(), nel * 2);
+
+  struct Arm {
+    const char* sfx; int bq; unsigned nt;
+    ComputeFunction fn; SharedBuffer out; double best; double sum;
+  };
+  std::vector<Arm> arms;
+  struct Cand { const char* sfx; int bq; unsigned nt; };
+  // Suffix, query tile, and the threadgroup size its instantiation was built
+  // with -- the dispatch must match the kernel's execution_simdgroups exactly.
+  const Cand cands[] = {
+    {"", 8, 128}, {"_q16", 16, 128}, {"_q32", 32, 256}, {"_q64", 64, 512},
+  };
+  for (const Cand& c : cands) {
+    const std::string fname =
+        "sdpa_full_mma2_d" + std::to_string(D) + c.sfx + "_f16";
+    ComputeFunction fn = lib.function(fname);
+    if (!fn.valid()) { continue; }
+    SharedBuffer ob = mc->make_shared_buffer(nel * 2);
+    if (ob.empty()) { return; }
+    arms.push_back(Arm{c.sfx, c.bq, c.nt, std::move(fn), std::move(ob),
+                       1e30, 0.0});
+  }
+  ASSERT_TRUE(arms.size() >= 2);
+  auto run = [&](Arm& a) {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder e = st.begin_compute();
+      e.set_function(a.fn);
+      e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+      e.set_buffer(3, a.out);
+      e.set_constant(4, scale); e.set_constant(5, n);
+      e.set_constant(6, D); e.set_constant(7, 1);
+      e.set_constant(8, 1); e.set_constant(9, n);
+      e.set_constant(10, n);
+      e.dispatch({a.nt, 1, (unsigned)((n + a.bq - 1) / a.bq)},
+                 {a.nt, 1, 1}); }
+    st.commit().wait();
+  };
+  for (Arm& a : arms) { run(a); }               // warm every arm first
+  const int reps = 5;
+  for (int r = 0; r < reps; ++r) {
+    for (Arm& a : arms) {
+      const auto t0 = std::chrono::steady_clock::now();
+      run(a);
+      const double ms = secs_(t0, std::chrono::steady_clock::now()) * 1e3;
+      a.best = std::min(a.best, ms); a.sum += ms;
+    }
+  }
+  // Traffic model: threadgroups * (K + V) bytes, the term BQ divides.
+  const double base = arms[0].best;
+  const auto* ref = static_cast<const std::uint16_t*>(arms[0].out.contents());
+  for (const Arm& a : arms) {
+    const double gb = (double)((n + a.bq - 1) / a.bq) * 2.0 * n * D * 2.0 / 1e9;
+    double num = 0.0, den = 0.0;
+    const auto* got = static_cast<const std::uint16_t*>(a.out.contents());
+    for (std::size_t i = 0; i < nel; ++i) {
+      const double x = h_to_f32(ref[i]), y = h_to_f32(got[i]);
+      num += (y - x) * (y - x); den += x * x;
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[vae_tiles] n=%5d D=%d BQ=%-2d%-8s | %7.2f ms (mean %7.2f) | "
+                "%.2fx | K/V %6.1f GB -> %5.0f GB/s | rel-L2 vs BQ8 %.2e\n",
+                n, D, a.bq, a.sfx, a.best, a.sum / reps, base / a.best, gb,
+                gb / (a.best * 1e-3), rel);
+    EXPECT_TRUE(rel < 2e-3);
   }
 }
 

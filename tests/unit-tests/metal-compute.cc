@@ -2,6 +2,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/session.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <memory>
 
@@ -14,7 +15,7 @@ using namespace vpipe::metal_compute;
 TEST(metal_compute, exists) {
   Session sess;
   const SessionContextIntf* ctx = &sess;
-  MetalCompute* mc = ctx->metal_compute();
+  MetalCompute* mc = ctx->services()->metal_compute();
   EXPECT_TRUE(mc != nullptr);
 }
 
@@ -23,8 +24,8 @@ TEST(metal_compute, exists) {
 TEST(metal_compute, accessor_is_idempotent) {
   Session sess;
   const SessionContextIntf* ctx = &sess;
-  MetalCompute* a = ctx->metal_compute();
-  MetalCompute* b = ctx->metal_compute();
+  MetalCompute* a = ctx->services()->metal_compute();
+  MetalCompute* b = ctx->services()->metal_compute();
   EXPECT_TRUE(a == b);
 }
 

@@ -6,6 +6,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 #include "stages/model-registry.h"
 
@@ -129,7 +130,7 @@ ModelRemoveStage::remove_once()
   RemoveResult r;
   const SessionContextIntf* s = session();
 
-  LmdbEnv* env = s->lmdb_env();
+  LmdbEnv* env = s->services()->lmdb_env();
   if (!env) {
     // No registry to remove from -> failure (halt the cascade). warn (not
     // error) so process() exits cleanly without throwing through the

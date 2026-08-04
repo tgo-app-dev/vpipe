@@ -5,6 +5,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <chrono>
 #include <cstdint>
@@ -132,7 +133,7 @@ VideosDbCleanupStage::spec() const noexcept
 std::size_t
 VideosDbCleanupStage::sweep_once()
 {
-  LmdbEnv* env = session()->lmdb_env();
+  LmdbEnv* env = session()->services()->lmdb_env();
   if (!env) {
     session()->warn(fmt(
         "VideosDbCleanupStage('{}'): session lmdb_env() unavailable; "

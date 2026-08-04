@@ -5,6 +5,7 @@
 #include "common/thread-pool.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -125,7 +126,7 @@ PreviewStage::PreviewStage(const SessionContextIntf* s,
                            FlexData                  config)
   : TypedStage<PreviewStage>(s, std::move(id), std::move(iports),
                              std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   _bitrate            = attr_int("bitrate");
   _input_normalized   = attr_bool("input_normalized");

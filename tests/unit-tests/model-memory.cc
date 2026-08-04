@@ -9,6 +9,7 @@
 // pipeline that either thrashes or refuses to unload.
 
 #include "minitest.h"
+#include "interfaces/session-services-intf.h"
 
 #include "common/flex-data.h"
 #include "common/session.h"
@@ -397,7 +398,7 @@ public:
   Job initialize(RuntimeContext& ctx) override
   {
     (void)ctx;
-    if (auto* m = session()->generative_model_manager()) {
+    if (auto* m = session()->services()->generative_model_manager()) {
       saw_in_initialize = m->resident_weight_bytes();
       accounted_in_init = m->accounts_for(dir);
     }
@@ -408,7 +409,7 @@ public:
   {
     if (!ran_process) {
       ran_process = true;
-      if (auto* m = session()->generative_model_manager()) {
+      if (auto* m = session()->services()->generative_model_manager()) {
         saw_in_process = m->resident_weight_bytes();
       }
     }

@@ -8,6 +8,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #include <cmath>
@@ -249,7 +250,7 @@ VaeDecodeStage::ensure_loaded_()
         "model-select source to the model iport; inert", this->id()));
     return;
   }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "VaeDecodeStage('{}'): no metal-compute backend on this session; "
@@ -508,7 +509,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     }
   }
 
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
 
   // ---- 2D AutoencoderKL (FLUX.2 / the plain FLUX.1 VAE): input
   // [dit_channels, H/px, W/px] with px = 8*patch; decode directly (the

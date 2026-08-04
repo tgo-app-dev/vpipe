@@ -5,6 +5,7 @@
 #include "common/perf-event.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -123,7 +124,7 @@ CoreMLInferenceStage::initialize(RuntimeContext& /*ctx*/)
   // or VPIPE_BUILD_APPLE_SILICON=OFF) -- not recoverable for an
   // inference stage that was nonetheless instantiated.
   CoreMLModelManager* mgr =
-      session() ? session()->coreml_model_manager() : nullptr;
+      session() ? session()->services()->coreml_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "CoreMLInferenceStage('{}'): session has no CoreML model "

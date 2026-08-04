@@ -231,6 +231,14 @@ std::string
 dit_tag_(const std::string& cls, const std::string& name_lc)
 {
   const bool edit = has_(name_lc, "edit");
+  // FLUX.2-klein-9b-kv reports this SAME class, and its config.json and tensor
+  // names are identical to plain klein-9B's -- the two differ only in the
+  // weights and in the attention recipe those weights were distilled for. So
+  // "flux2" is the right answer for both, and the recipe is selected by the
+  // consuming stage's `klein_kv` key rather than guessed here. Deliberately
+  // NOT inferred from the name the way `edit` is below: a wrong `edit` guess
+  // picks a sibling checkpoint, while a wrong recipe guess silently produces
+  // wrong IMAGES from a model that loads and runs perfectly.
   if (cls == "Flux2Transformer2DModel")      { return "flux2"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }

@@ -1514,4 +1514,27 @@ Session::dump_profiling(string_view path_sv)
   return Status{0};
 }
 
+
+void*
+Session::find_service(std::string_view id) const
+{
+  // const_cast because the registry hands out mutable handles while the
+  // accessors are logically-const lazy getters; the constness of the
+  // returned service is re-imposed by the typed wrapper's return type.
+  if (id == ServiceId<FFmpegLibraries>::value) {
+    return const_cast<FFmpegLibraries*>(ffmpeg_libraries());
+  }
+  if (id == ServiceId<LmdbEnv>::value) { return lmdb_env(); }
+  if (id == ServiceId<CoreMLModelManager>::value) {
+    return coreml_model_manager();
+  }
+  if (id == ServiceId<genai::GenerativeModelManager>::value) {
+    return generative_model_manager();
+  }
+  if (id == ServiceId<metal_compute::MetalCompute>::value) {
+    return metal_compute();
+  }
+  return nullptr;
+}
+
 }

@@ -206,6 +206,42 @@ class MetalFlux2Vae {
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_groupnorm, _fn_mul_sigmoid,
       _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2,
       _fn_im2col_tiled, _fn_im2col_s2_tiled, _fn_upsample, _fn_bias_add;
+  // Two-pass group norm. _fn_groupnorm runs one threadgroup per group, which
+  // on a full-resolution VAE activation (~100M elements) is ~8K threads and a
+  // few GB/s -- MEASURED ~120 ms for the single norm_out at 1024x768, ~26% of
+  // a decode once every resblock's two norms are counted. These split the
+  // reduction so both passes saturate: per-channel partials over row blocks,
+  // a tiny per-group reduce, then a fully parallel apply. Falls back to
+  // _fn_groupnorm when unavailable or under VPIPE_VAE_NO_FAST_GNORM.
+  metal_compute::ComputeFunction _fn_gn_stats, _fn_gn_reduce, _fn_gn_apply;
+  bool _fast_gnorm = false;
+  // Direct 3x3 for a small output-channel count. The hardware conv needs
+  // cout % 64 == 0, so every VAE's final conv (to 3, or to 2*latent) drops to
+  // im2col AT FULL RESOLUTION and pays ~1.8 GB of materialization for a
+  // ~5 GFLOP convolution -- MEASURED 764 ms for 128->3 at 1024x768. This
+  // keeps the small output vector in registers and reads the activation
+  // directly. VPIPE_VAE_NO_SMALL_COUT_CONV falls back to im2col.
+  metal_compute::ComputeFunction _fn_conv_small_cout;
+  // Above this the im2col+GEMM path is the better trade (the register
+  // accumulators and the per-tap re-read stop paying).
+  static constexpr int kSmallCoutMax = 32;
+  // Returns false when the shape is not a fit, leaving the caller on im2col.
+  bool conv3x3_small_cout_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& in,
+                           const Conv& c,
+                           const metal_compute::SharedBuffer& out,
+                           int H, int W, int stride);
+  // Reused across every norm in a decode: partials [NB][2*C] f32 and the
+  // per-group [G][2] (mean, inv) both size off the LARGEST C in the model.
+  metal_compute::SharedBuffer _gn_part, _gn_stats;
+  static constexpr int kGnBlocks = 512;   // row blocks in the stats pass
+  // One group norm over `rows` x `C` channel-last, into `out`.
+  void group_norm_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& in,
+                   const metal_compute::SharedBuffer& gamma,
+                   const metal_compute::SharedBuffer& beta,
+                   const metal_compute::SharedBuffer& out,
+                   int rows, int C, int G, float eps);
   // Matrix-core FULL flash-attention for the mid-block self-attention (D = the
   // mid channel dim block_out[-1]). Replaces the scalar O(N^2) sdpa_full_f16
   // that dominates decode at high res. Best-effort (matrix cores + D in
@@ -217,6 +253,22 @@ class MetalFlux2Vae {
   // from _lib_sdpa. Preferred over _fn_sdpa_full_mma when no matrix cores.
   metal_compute::ComputeFunction _fn_sdpa_full_smm;
   bool _use_attn_mma2 = false;   // prefer matmul2d flash (true on M5 only)
+  // Wide-query-tile twin of the above (sdpa_full_mma2_dN_qBQ_f16). Identical
+  // math and f32 accumulators; it keeps O in registers instead of threadgroup
+  // memory, which is what lets BQ exceed 8 and so divides the K/V bandwidth
+  // this attention is bound by. Preferred over _fn_sdpa_full_mma whenever it
+  // loaded. VPIPE_FLUX2_VAE_ATTN_BQ picks the tile (8 = the narrow kernel).
+  metal_compute::ComputeFunction _fn_sdpa_full_wide;
+  int _attn_bq = 0;              // query tile of _fn_sdpa_full_wide (0 = none)
+  static constexpr int kAttnBq = 32;
+  void load_wide_attn_(int mid_d);
+  // Simdgroup count the kernel of query tile `bq` was instantiated with; the
+  // dispatch has to match it exactly (matmul2d's execution scope is UB
+  // otherwise). Mirrors the SAW_INST table in sdpa_mma.metal.
+  static unsigned attn_threads_(int bq)
+  {
+    return (bq == 16 ? 4u : bq == 32 ? 8u : 16u) * 32u;
+  }
 
   // M5 matrix-core dense GEMM (matmul2d) for the conv/1x1 GEMMs, mirroring
   // the Krea-2 VAE. The VAE runs at large M (M = H*W pixels), so the tiled

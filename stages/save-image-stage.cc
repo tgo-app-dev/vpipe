@@ -9,6 +9,7 @@
 #include "vpipe/vpipe.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -149,7 +150,7 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
                                  FlexData                  config)
   : TypedStage<SaveImageStage>(s, std::move(id), std::move(iports),
                                 std::move(config))
-  , _libs(s ? s->ffmpeg_libraries() : nullptr)
+  , _libs(s ? s->services()->ffmpeg_libraries() : nullptr)
 {
   // Deferred validation (see Stage::fail_config): construct for any config
   // so a graph can be built/edited before `path` is supplied.

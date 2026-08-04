@@ -216,9 +216,14 @@ TEST(flux2_smoke, vae_decode_shape_finite)
   // Large-resolution decode is env-selectable so the per-level command-buffer
   // split (see MetalFlux2Vae::decode) can be exercised (VPIPE_VAE_GRID=64 ->
   // 1024^2, which OOMs as a single command buffer).
+  // "N" -> N x N; "HxW" -> a non-square grid (the real aspect ratios a
+  // generation actually decodes, e.g. 64x48 -> 1024x768).
   if (const char* g = std::getenv("VPIPE_VAE_GRID")) {
     const int v = std::atoi(g);
+    const char* x = std::strchr(g, 'x');
+    const int v2 = (x != nullptr) ? std::atoi(x + 1) : 0;
     if (v >= 4) { gh = gw = v; }
+    if (v >= 4 && v2 >= 4) { gw = v2; }
   }
   const int C = vae->config().dit_channels();   // 128
   SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
@@ -248,6 +253,125 @@ TEST(flux2_smoke, vae_decode_shape_finite)
 // (matmul2d) route and with VPIPE_FLUX2_NO_MMA2 forcing steel, rel-L2 the two
 // images, and report both wall-clocks. On a non-matrix-core GPU both runs
 // take steel and the rel-L2 is ~0.
+// The direct small-cout 3x3 must agree with the im2col+GEMM it replaces.
+// Both accumulate in f32 but in a different order (register accumulators per
+// pixel vs a GEMM's K-loop), so this is a rel-L2 bound, not bit-equality.
+TEST(flux2_smoke, vae_decode_small_cout_conv_matches_im2col)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+
+  const int gh = 24, gw = 32;                   // -> 384x512, non-square
+  auto run = [&](bool no_small, double* ms) {
+    if (no_small) { ::setenv("VPIPE_VAE_NO_SMALL_COUT_CONV", "1", 1); }
+    else          { ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV"); }
+    auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+    ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV");
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    const int C = vae->config().dit_channels();
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+    if (z.empty()) { return out; }
+    std::mt19937 rng(2468);                     // same latent both runs
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+      d[i] = (_Float16)nd(rng);
+    }
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    *ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  double ms_small = 0.0, ms_i2c = 0.0;
+  const std::vector<float> v_small = run(/*no_small=*/false, &ms_small);
+  const std::vector<float> v_i2c   = run(/*no_small=*/true,  &ms_i2c);
+  ASSERT_TRUE(!v_small.empty());
+  ASSERT_TRUE(v_small.size() == v_i2c.size());
+  const double r = rel_l2_(v_small.data(), v_i2c.data(), v_small.size());
+  std::printf("[flux2_smoke] VAE small-cout conv vs im2col rel-L2 = %g "
+              "(%dx%d; direct %.0f ms, im2col %.0f ms)\n",
+              r, gh * 16, gw * 16, ms_small, ms_i2c);
+  EXPECT_TRUE(r < 2e-3);
+}
+
+// The two-pass group norm must be a pure speedup: same normalization, only
+// split so both passes saturate the GPU. It is not bit-identical (the
+// partials are summed in a different order), so this is a rel-L2 bound -- if
+// anything the block-partial sum is the better-conditioned of the two.
+TEST(flux2_smoke, vae_decode_fast_gnorm_matches_legacy)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+
+  const int gh = 24, gw = 32;                   // -> 384x512, non-square
+  auto run = [&](bool legacy, double* ms) {
+    // Read at load(), so it has to be set before the load, not the decode.
+    if (legacy) { ::setenv("VPIPE_VAE_NO_FAST_GNORM", "1", 1); }
+    else        { ::unsetenv("VPIPE_VAE_NO_FAST_GNORM"); }
+    auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+    ::unsetenv("VPIPE_VAE_NO_FAST_GNORM");
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    const int C = vae->config().dit_channels();
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+    if (z.empty()) { return out; }
+    std::mt19937 rng(4321);                     // same latent both runs
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+      d[i] = (_Float16)nd(rng);
+    }
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    *ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  double ms_fast = 0.0, ms_legacy = 0.0;
+  const std::vector<float> v_fast   = run(/*legacy=*/false, &ms_fast);
+  const std::vector<float> v_legacy = run(/*legacy=*/true,  &ms_legacy);
+  ASSERT_TRUE(!v_fast.empty());
+  ASSERT_TRUE(v_fast.size() == v_legacy.size());
+  const double r = rel_l2_(v_fast.data(), v_legacy.data(), v_fast.size());
+  std::printf("[flux2_smoke] VAE fast-gnorm vs legacy rel-L2 = %g "
+              "(%dx%d; fast %.0f ms, legacy %.0f ms)\n",
+              r, gh * 16, gw * 16, ms_fast, ms_legacy);
+  EXPECT_TRUE(r < 2e-3);
+  bool finite = true;
+  for (float v : v_fast) { if (!std::isfinite(v)) { finite = false; break; } }
+  EXPECT_TRUE(finite);
+}
+
 TEST(flux2_smoke, vae_decode_mma_matches_steel)
 {
   const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
@@ -536,7 +660,17 @@ TEST(flux2_smoke, vae_encode_hwconv_matches_im2col)
   std::string vdir = std::string(root) + "/vae";
   if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
 
-  const int H = 256, W = 256;                   // -> 16x16 latent grid
+  int H = 256, W = 256;                         // -> 16x16 latent grid
+  // VPIPE_VAE_ENC_HW=1024x768 drives the encoder at a real generation size
+  // (the encoder runs its widest convs at FULL resolution, so 256x256 hides
+  // where its time actually goes).
+  if (const char* e = std::getenv("VPIPE_VAE_ENC_HW")) {
+    const int v = std::atoi(e);
+    const char* x = std::strchr(e, 'x');
+    const int v2 = (x != nullptr) ? std::atoi(x + 1) : 0;
+    if (v >= 64) { H = W = v; }
+    if (v >= 64 && v2 >= 64) { W = v2; }
+  }
   auto run = [&](bool no_hw, double* ms) {
     if (no_hw) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
     else       { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
@@ -771,6 +905,225 @@ TEST(flux2_smoke, dit_reference_images_change_output)
               "2 refs rel-L2 %.4f (vs no-ref)\n", r1, r2);
   EXPECT_TRUE(r1 > 1e-3);          // a reference materially changes the output
   EXPECT_TRUE(r2 > 1e-3);
+}
+
+// ---- FLUX.2-klein-9b-kv recipe + cross-step reference K/V cache -----------
+// Both tests run on whatever checkpoint VPIPE_FLUX2_TEST_MODEL_PATH names,
+// including plain klein-9B, because what they assert is STRUCTURAL rather
+// than numerical: that `klein_kv` actually changes the computation, and that
+// the cache reproduces the recipe it accelerates. Those hold for any weights,
+// so the -kv checkpoint is not needed to catch a broken mask, a mis-set
+// stride or a stale splice. Verifying that the -kv WEIGHTS then produce the
+// right image still needs a diffusers golden (VPIPE_FLUX2_EDIT_GOLDEN).
+namespace {
+struct KvFixture {
+  Session sess;
+  MetalCompute* mc = nullptr;
+  std::unique_ptr<MetalFlux2Transformer> dit;
+  std::mt19937 rng{11};
+  SharedBuffer ctx, lat;
+  int TS = 8, gh = 4, gw = 4, img_seq = 16;
+  std::size_t n = 0;
+
+  bool build(bool klein_kv) {
+    const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+    if (root == nullptr || *root == '\0') { return false; }
+    // VPIPE_FLUX2_KV_BENCH=<grid> runs the REAL generation geometry (32 -> a
+    // 512x512 edit: 1024 image tokens against a 1024-token reference), where
+    // the reference is half the sequence and the cache has something to save.
+    // The default 4x4 keeps the correctness tests fast.
+    if (const char* g = std::getenv("VPIPE_FLUX2_KV_BENCH")) {
+      const int v = std::atoi(g);
+      if (v >= 4) { gh = gw = v; TS = 512; }
+    }
+    mc = sess.metal_compute();
+    if (mc == nullptr) { return false; }
+    MetalFlux2Transformer::Config cfg;
+    cfg.klein_kv = klein_kv;
+    dit = MetalFlux2Transformer::load(std::string(root) + "/transformer", mc,
+                                      cfg);
+    if (dit == nullptr) { return false; }
+    const auto& c = dit->config();
+    img_seq = gh * gw;
+    n = (std::size_t)img_seq * c.out_channels;
+    ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    lat = mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    fill(ctx, (std::size_t)TS * c.joint_dim);
+    fill(lat, (std::size_t)img_seq * c.in_channels);
+    return true;
+  }
+  void fill(SharedBuffer& b, std::size_t cnt) {
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* p = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < cnt; ++i) { p[i] = (_Float16)nd(rng); }
+  }
+  MetalFlux2Transformer::RefImage make_ref(int rgh, int rgw) {
+    MetalFlux2Transformer::RefImage r;
+    const int ic = dit->config().in_channels;
+    r.seq = rgh * rgw; r.grid_h = rgh; r.grid_w = rgw;
+    r.latents = mc->make_shared_buffer((std::size_t)r.seq * ic * 2);
+    fill(r.latents, (std::size_t)r.seq * ic);
+    return r;
+  }
+  std::vector<float> vec(const SharedBuffer& b) const {
+    std::vector<float> v(n);
+    const auto* p = static_cast<const _Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)p[i]; }
+    return v;
+  }
+};
+}  // namespace
+
+// What the cache is FOR: a cached step has to be cheaper than the step it
+// replaces. Pricing it needs the cache toggled with the RECIPE HELD FIXED --
+// turning klein_kv off would change the attention, so the two arms would not be
+// computing the same thing and the ratio would be meaningless.
+//
+// Both arms also have to run in ONE process, ALTERNATING. A cross-process A/B
+// on this box does not resolve the effect: model reload, the page cache and the
+// SoC-power-gated GPU clock all move more than the cache does. MEASURED over
+// four full generations per arm, the SAME arm landed anywhere from 32.9 s to
+// 43.9 s, and reversing which arm ran first flipped the sign of the result.
+// Alternating inside one process holds the model, the pages and the clock
+// roughly constant across the pair.
+//
+// Set VPIPE_FLUX2_KV_BENCH=32 for the real 512x512-edit geometry; at the
+// default 4x4 the reference is 12 tokens and there is nothing to save, so the
+// test only asserts that the cache does not make things WORSE.
+TEST(flux2_kv, cached_step_is_cheaper)
+{
+  KvFixture f;
+  if (!f.build(/*klein_kv=*/true)) { return; }
+  const int rg = (f.gh >= 32) ? f.gh : 3;      // reference grid
+  auto refs = [&](unsigned seed) {
+    f.rng.seed(seed);
+    std::vector<MetalFlux2Transformer::RefImage> r;
+    r.push_back(f.make_ref(rg, rg));
+    return r;
+  };
+  MetalFlux2Transformer::KvCache kv;
+  // Prime the cache (this call is the EXTRACT step, priced with the uncached
+  // arm below, not with the cached one).
+  const auto rp = refs(7);
+  SharedBuffer p = f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh, f.gw,
+                                      0.5f, -1.0f, rp, &kv);
+  ASSERT_TRUE(!p.empty() && kv.populated());
+
+  double c_best = 1e30, u_best = 1e30, c_sum = 0.0, u_sum = 0.0;
+  const int reps = 3;
+  for (int i = 0; i < reps; ++i) {
+    for (int arm = 0; arm < 2; ++arm) {
+      const auto rr = refs(7);
+      const auto t0 = std::chrono::steady_clock::now();
+      SharedBuffer v = f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh,
+                                          f.gw, 0.5f, -1.0f, rr,
+                                          arm == 0 ? &kv : nullptr);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      ASSERT_TRUE(!v.empty());
+      if (arm == 0) { c_best = std::min(c_best, ms); c_sum += ms; }
+      else          { u_best = std::min(u_best, ms); u_sum += ms; }
+    }
+  }
+  std::printf("[flux2_kv] step cost: cached %.0f ms (mean %.0f), uncached "
+              "%.0f ms (mean %.0f) -> %.2fx  (text %d + img %d + ref %d)\n",
+              c_best, c_sum / reps, u_best, u_sum / reps, u_best / c_best,
+              f.TS, f.img_seq, kv.ref_seq);
+  EXPECT_TRUE(c_best <= u_best * 1.05);
+}
+
+// A cached step must reproduce the uncached recipe step it stands in for.
+// The first call EXTRACTS (same arithmetic as uncached, plus lifting the
+// reference band out), so it should match to the bit; the second REUSES the
+// cache in place of recomputing, which is where a wrong stride, a stale band
+// or a mis-scoped mask would show up as a diverged velocity.
+TEST(flux2_kv, cached_matches_uncached)
+{
+  KvFixture f;
+  if (!f.build(/*klein_kv=*/true)) { return; }
+  // Re-seed per set so all three runs see the SAME reference latents --
+  // make_ref draws from the fixture RNG, so without this each call would
+  // condition on different references and nothing would be comparable.
+  auto refs_of = [&](unsigned seed) {
+    f.rng.seed(seed);
+    std::vector<MetalFlux2Transformer::RefImage> r;
+    r.push_back(f.make_ref(2, 3));
+    r.push_back(f.make_ref(3, 2));
+    return r;
+  };
+  const auto ra = refs_of(99), rb = refs_of(99), rc = refs_of(99);
+  SharedBuffer a = f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh,
+                                      f.gw, 0.5f, -1.0f, ra, nullptr);
+  ASSERT_TRUE(!a.empty() && all_finite_(a, f.n));
+
+  MetalFlux2Transformer::KvCache kv;
+  SharedBuffer b0 = f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh,
+                                       f.gw, 0.5f, -1.0f, rb, &kv);
+  ASSERT_TRUE(!b0.empty());
+  ASSERT_TRUE(kv.populated());     // the extracting step filled it
+  SharedBuffer b1 = f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh,
+                                       f.gw, 0.5f, -1.0f, rc, &kv);
+  ASSERT_TRUE(!b1.empty() && all_finite_(b1, f.n));
+
+  const std::vector<float> va = f.vec(a), v0 = f.vec(b0), v1 = f.vec(b1);
+  const double r0 = rel_l2_(v0.data(), va.data(), f.n);
+  const double r1 = rel_l2_(v1.data(), va.data(), f.n);
+  std::printf("[flux2_kv] extract-vs-uncached rel-L2 %.3e, "
+              "cached-vs-uncached rel-L2 %.3e (refs=%d)\n",
+              r0, r1, kv.ref_seq);
+  EXPECT_TRUE(r0 < 1e-6);          // same arithmetic
+  EXPECT_TRUE(r1 < 5e-3);          // cache stands in for recomputation
+}
+
+// A changed geometry must REBUILD the cache rather than splice a band of the
+// wrong length: the guard is what keeps a stale cache a slow step instead of
+// a wrong one.
+TEST(flux2_kv, geometry_change_rebuilds_cache)
+{
+  KvFixture f;
+  if (!f.build(/*klein_kv=*/true)) { return; }
+  std::vector<MetalFlux2Transformer::RefImage> r1, r2;
+  r1.push_back(f.make_ref(2, 3));
+  r2.push_back(f.make_ref(2, 3));
+  r2.push_back(f.make_ref(3, 2));
+  MetalFlux2Transformer::KvCache kv;
+  ASSERT_TRUE(!f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh, f.gw,
+                                  0.5f, -1.0f, r1, &kv).empty());
+  const int first = kv.ref_seq;
+  EXPECT_TRUE(first == 6);
+  // A second reference changes ref_seq; the cache must refill, not reuse.
+  ASSERT_TRUE(!f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh, f.gw,
+                                  0.5f, -1.0f, r2, &kv).empty());
+  std::printf("[flux2_kv] cache ref_seq %d -> %d on geometry change\n",
+              first, kv.ref_seq);
+  EXPECT_TRUE(kv.ref_seq == 12);
+}
+
+// The recipe must not be a silent no-op: isolating the references and
+// modulating them at timestep 0 has to move the velocity away from the plain
+// fully-joint path. If these ever match, `klein_kv` is not reaching the
+// forward and the -kv checkpoint would be running under the wrong attention.
+TEST(flux2_kv, recipe_differs_from_plain)
+{
+  KvFixture plain, recipe;
+  if (!plain.build(/*klein_kv=*/false)) { return; }
+  if (!recipe.build(/*klein_kv=*/true)) { return; }
+  // Same inputs on both: the fixtures seed identically, so ctx/lat/refs match.
+  std::vector<MetalFlux2Transformer::RefImage> rp, rr;
+  rp.push_back(plain.make_ref(2, 3));
+  rr.push_back(recipe.make_ref(2, 3));
+  SharedBuffer vp = plain.dit->forward_dit(plain.ctx, plain.TS, plain.lat,
+                                           plain.img_seq, plain.gh, plain.gw,
+                                           0.5f, -1.0f, rp);
+  SharedBuffer vr = recipe.dit->forward_dit(recipe.ctx, recipe.TS, recipe.lat,
+                                            recipe.img_seq, recipe.gh,
+                                            recipe.gw, 0.5f, -1.0f, rr);
+  ASSERT_TRUE(!vp.empty() && !vr.empty());
+  const std::vector<float> a = plain.vec(vp), b = recipe.vec(vr);
+  const double r = rel_l2_(b.data(), a.data(), plain.n);
+  std::printf("[flux2_kv] recipe-vs-plain velocity rel-L2 %.4f\n", r);
+  EXPECT_TRUE(r > 1e-3);
 }
 
 // M5 matrix-core matmul2d A/B (mirrors krea2_dit.forward_dit_mma_matches_

@@ -10,6 +10,7 @@
 #include "common/perf-event.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #include <CoreVideo/CVPixelBuffer.h>
@@ -426,7 +427,7 @@ Job
 YoloDetectionStage::initialize(RuntimeContext& /*ctx*/)
 {
   CoreMLModelManager* mgr =
-      session() ? session()->coreml_model_manager() : nullptr;
+      session() ? session()->services()->coreml_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "YoloDetectionStage('{}'): session has no CoreML model "
@@ -446,7 +447,7 @@ YoloDetectionStage::initialize(RuntimeContext& /*ctx*/)
   // Cache the session-shared metal-compute device so the hot path can
   // branch on a Shared input without walking session() every call.
   // nullptr is fine; the gate below also checks _mc->valid().
-  _mc = session()->metal_compute();
+  _mc = session()->services()->metal_compute();
 
   // Read the model's input + output feature descriptors (from the
   // manager's cached introspection) to drive the rest of the stage:

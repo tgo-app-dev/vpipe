@@ -1,17 +1,17 @@
 #include "common/library-handle.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 #include <dlfcn.h>
 
 using namespace std;
 
 namespace vpipe {
 
-LibraryHandle::LibraryHandle(const SessionContextIntf* session,
-                             string_view               path,
-                             LoadMode                  mode,
-                             int                       flags)
-  : SessionMember(session)
+LibraryHandle::LibraryHandle(const LogSinkIntf* log,
+                             string_view        path,
+                             LoadMode           mode,
+                             int                flags)
+  : _log(log)
   , _handle(nullptr)
   , _path(path)
 {
@@ -23,16 +23,16 @@ LibraryHandle::LibraryHandle(const SessionContextIntf* session,
   const char* err = ::dlerror();
   string err_msg = err ? err : "unknown error";
   if (mode == LoadMode::Required) {
-    this->session()->error(
+    _log->error(
       fmt("dlopen failed for {}: {}", _path, err_msg));
     return;
   }
-  this->session()->warn(
+  _log->warn(
     fmt("dlopen failed for {}: {}", _path, err_msg));
 }
 
 LibraryHandle::LibraryHandle(LibraryHandle&& other) noexcept
-  : SessionMember(other.session())
+  : _log(other._log)
   , _handle(other._handle)
   , _path(std::move(other._path))
 {
@@ -90,7 +90,7 @@ LibraryHandle::require_symbol(string_view name) const
   if (sym) {
     return sym;
   }
-  session()->error(
+  _log->error(
     fmt("symbol '{}' not found in {}", name, _path));
   return nullptr;
 }

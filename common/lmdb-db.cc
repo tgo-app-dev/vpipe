@@ -2,7 +2,7 @@
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 
 using namespace std;
 
@@ -25,15 +25,15 @@ from_val(const MDB_val& v)
 }
 
 LmdbDb::LmdbDb(LmdbEnv& env, string_view name, bool create_if_missing)
-  : LmdbDb(env, env.session(), name, create_if_missing)
+  : LmdbDb(env, env.log(), name, create_if_missing)
 {
 }
 
 LmdbDb::LmdbDb(LmdbEnv&                  env,
-               const SessionContextIntf* ctx,
+               const LogSinkIntf* ctx,
                string_view               name,
                bool                      create_if_missing)
-  : SessionMember(ctx)
+  : _log(ctx)
   , _dbi(0)
   , _name(name)
 {
@@ -42,7 +42,7 @@ LmdbDb::LmdbDb(LmdbEnv&                  env,
   int rc = mdb_dbi_open(boot.raw(), _name.c_str(), flags, &_dbi);
   if (rc != MDB_SUCCESS) {
     boot.abort();
-    session()->error(
+    _log->error(
       fmt("mdb_dbi_open failed for '{}': {}", _name, mdb_strerror(rc)));
     return;
   }
@@ -50,7 +50,7 @@ LmdbDb::LmdbDb(LmdbEnv&                  env,
 }
 
 LmdbDb::LmdbDb(LmdbDb&& other) noexcept
-  : SessionMember(other.session())
+  : _log(other._log)
   , _dbi(other._dbi)
   , _name(std::move(other._name))
 {
@@ -79,7 +79,7 @@ LmdbDb::get(LmdbTxn& txn, string_view key) const
     return nullopt;
   }
   if (rc != MDB_SUCCESS) {
-    session()->error(
+    _log->error(
       fmt("mdb_get failed in '{}': {}", _name, mdb_strerror(rc)));
     return nullopt;
   }
@@ -96,7 +96,7 @@ LmdbDb::put(LmdbTxn&    txn,
   MDB_val v = to_val(value);
   int rc = mdb_put(txn.raw(), _dbi, &k, &v, flags);
   if (rc != MDB_SUCCESS) {
-    session()->error(
+    _log->error(
       fmt("mdb_put failed in '{}': {}", _name, mdb_strerror(rc)));
   }
 }
@@ -110,7 +110,7 @@ LmdbDb::del(LmdbTxn& txn, string_view key)
     return false;
   }
   if (rc != MDB_SUCCESS) {
-    session()->error(
+    _log->error(
       fmt("mdb_del failed in '{}': {}", _name, mdb_strerror(rc)));
     return false;
   }

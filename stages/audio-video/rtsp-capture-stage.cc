@@ -17,6 +17,7 @@
 #include "common/thread-pool.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 #include "stages/trigger-beat.h"
 
@@ -1013,7 +1014,7 @@ struct CaptureThreadDone {
 Job
 RtspCaptureStage::process(RuntimeContext& ctx)
 {
-  LmdbEnv* env = session()->lmdb_env();
+  LmdbEnv* env = session()->services()->lmdb_env();
   if (!env) {
     session()->error(fmt(
         "RtspCaptureStage('{}'): session lmdb_env() unavailable",
@@ -1026,7 +1027,7 @@ RtspCaptureStage::process(RuntimeContext& ctx)
         this->id(), _output_dir));
   }
 
-  const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (!libs || !libs->valid()) {
     session()->error(fmt(
         "RtspCaptureStage('{}'): FFmpeg libraries unavailable",
@@ -1068,8 +1069,8 @@ RtspCaptureStage::capture_loop_(RuntimeContext& ctx)
 {
   using namespace std::chrono;
 
-  LmdbEnv*               env  = session()->lmdb_env();
-  const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+  LmdbEnv*               env  = session()->services()->lmdb_env();
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (!env || !libs || !libs->valid()) {
     return;          // process() validated these; defensive only.
   }

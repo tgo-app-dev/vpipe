@@ -4,6 +4,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/stage-spec.h"
 
 #include <algorithm>
@@ -98,7 +99,7 @@ CompareImageStage::CompareImageStage(const SessionContextIntf* s,
                                      FlexData                  config)
   : TypedStage<CompareImageStage>(s, std::move(id), std::move(iports),
                                   std::move(config))
-  , _libs(s->ffmpeg_libraries())
+  , _libs(s->services()->ffmpeg_libraries())
 {
   _input_normalized = attr_bool("input_normalized");
   _title            = attr_str("title");

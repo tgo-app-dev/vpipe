@@ -9,6 +9,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/lora-fusion.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
@@ -172,7 +173,7 @@ LoraFuseStage::spec() const noexcept
 void
 LoraFuseStage::register_output_(const std::string& key, const std::string& dir)
 {
-  LmdbEnv* env = session() ? session()->lmdb_env() : nullptr;
+  LmdbEnv* env = session() ? session()->services()->lmdb_env() : nullptr;
   if (env == nullptr) {
     session()->warn(fmt("LoraFuseStage('{}'): no lmdb_env(); not registering "
                         "'{}'", this->id(), key));
@@ -249,7 +250,7 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
       : (fs::current_path() / "models" / _output_name).string();
   _out_dir = out_dir;
 
-  metal_compute::MetalCompute* mc = session()->metal_compute();
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) {
     session()->warn(fmt("LoraFuseStage('{}'): no metal-compute backend",
                         this->id()));

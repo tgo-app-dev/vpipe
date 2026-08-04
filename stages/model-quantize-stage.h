@@ -185,6 +185,7 @@ private:
   std::string _layer_prefix;
   int         _n_layers{};
   bool        _quant_modulation{};   // QIE DiT: quantize *_mod.1 too (opt-in)
+  bool        _klein_kv{};           // flux2 source is FLUX.2-klein-9b-kv
 };
 
 }  // namespace vpipe

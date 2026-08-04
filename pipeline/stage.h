@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 #include "common/vertex.h"
 #include "common/vpipe-format.h"
+#include "interfaces/service-req.h"
 #include "interfaces/session-context-intf.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/stage-config.h"
@@ -106,6 +107,28 @@ public:
   // Default no-op: a stage with no per-run state needs nothing. Keep it
   // cheap and non-throwing -- it runs on the driver before any I/O.
   virtual void reset_run_state() {}
+
+  // The session services this stage depends on, stated before anything
+  // runs.
+  //
+  // A stage that needs metal-compute, LMDB or the model manager used to
+  // find out by getting a null pointer from services() in the middle of
+  // initialize() -- after the launch had already committed, with the
+  // failure surfacing as whatever that stage did next. Declaring turns
+  // that into a refusal at launch that NAMES the stage and the service.
+  //
+  // Build entries with require_service<T>() / optional_service<T>()
+  // from interfaces/session-services-intf.h; the type is the service's
+  // own class, so a version bump is a compile error rather than a
+  // requirement that quietly stops matching.
+  //
+  // Optional is a real answer, not a cop-out: metal-compute legitimately
+  // is not there on a non-Apple build, and a stage that degrades should
+  // say so here instead of leaving a reader to infer it.
+  //
+  // Plugins CONSUME services this way; registering one is a separate
+  // path that does not exist yet, by design.
+  virtual std::vector<ServiceReq> declare_services() const { return {}; }
 
   // The scarce, process-wide things this stage INTENDS to acquire,
   // declared before any stage's initialize() runs. Model weights are

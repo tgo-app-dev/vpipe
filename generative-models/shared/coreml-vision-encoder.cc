@@ -3,6 +3,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/coreml/coreml-model-manager.h"
@@ -373,13 +374,13 @@ CoreMLVisionEncoder::create(const LoadSpec&             spec,
   if (!session) {
     return nullptr;
   }
-  auto* coreml_mgr = session->coreml_model_manager();
+  auto* coreml_mgr = session->services()->coreml_model_manager();
   if (!coreml_mgr) {
     session->warn(fmt(
         "CoreMLVisionEncoder: no CoreMLModelManager on this session"));
     return nullptr;
   }
-  auto* mc_dev = session->metal_compute();
+  auto* mc_dev = session->services()->metal_compute();
   if (mc_dev == nullptr || !mc_dev->valid()) {
     session->warn(fmt(
         "CoreMLVisionEncoder: no metal-compute device on this session "

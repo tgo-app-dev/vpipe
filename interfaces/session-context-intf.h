@@ -1,303 +1,57 @@
 #ifndef SESSION_CONTEXT_INTF_H
 #define SESSION_CONTEXT_INTF_H
 
-#include "interfaces/ui-delegate-intf.h"
-#include "common/i18n.h"
-
-#include <chrono>
-#include <cstdint>
-#include <filesystem>
-#include <functional>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
+#include "interfaces/fs-sandbox-intf.h"
+#include "interfaces/log-sink-intf.h"
+#include "interfaces/perf-sink-intf.h"
+#include "interfaces/runtime-services-intf.h"
+#include "interfaces/ui-port-intf.h"
 
 namespace vpipe {
 
-struct VpipeFormat;
-class CoreMLModelManager;
-class FFmpegLibraries;
-class LmdbEnv;
-class ThreadPool;
-
-namespace genai { class GenerativeModelManager; }
-namespace metal_compute { class MetalCompute; }
+class SessionServicesIntf;
 
 // Resources every SessionMember (Vertex, Stage, EdgeBuffer, ...)
-// reaches for during normal operation: structured logging plus the
-// session-level thread pool and default edge-buffer capacity. Held by
-// pointer through SessionMember::session().
-class SessionContextIntf {
+// reaches for during normal operation. Held by pointer through
+// SessionMember::session().
+//
+// This is a COMPOSITION of roles, not a list of methods. Each base is a
+// separate, independently usable interface:
+//
+//   LogSinkIntf         error / warn / info / log_*
+//   UiPortIntf          getline, text streams, interrupts, i18n
+//   RuntimeServicesIntf thread pool, default edge capacity
+//   PerfSinkIntf        profiling toggles + the record_perf_event path
+//   FsSandboxIntf       confine_path and the sandbox's shape
+//
+// Take the NARROWEST one that does the job. A helper that only reports
+// should accept a LogSinkIntf&, not a whole session context -- that is
+// most of them, since roughly 90% of all calls made through this
+// interface are logging. Everything that already takes a
+// SessionContextIntf* keeps working; inheriting the roles changes no
+// call site.
+//
+// The heavyweight subsystems (FFmpeg, LMDB, CoreML, the generative-model
+// manager, metal-compute) are deliberately NOT here. They used to be,
+// which put five subsystem names in the lowest interface layer in the
+// tree and made every logging-only translation unit carry them. They
+// now live behind services(); see interfaces/session-services-intf.h.
+class SessionContextIntf : public LogSinkIntf,
+                           public UiPortIntf,
+                           public RuntimeServicesIntf,
+                           public PerfSinkIntf,
+                           public FsSandboxIntf {
 public:
   SessionContextIntf() {};
-  virtual ~SessionContextIntf() = default;
+  ~SessionContextIntf() override = default;
 
-  virtual void error(const VpipeFormat&) const = 0;
-  virtual void warn(const VpipeFormat&) const = 0;
-  virtual void info(const VpipeFormat&) const = 0;
-  virtual void log_debug(const VpipeFormat&) const = 0;
-  virtual void log_verbose(const VpipeFormat&) const = 0;
-  virtual void log_normal(const VpipeFormat&) const = 0;
-  virtual void log_always(const VpipeFormat&) const = 0;
-
-  // The address the vpipe web-ui's HTTP server bound to, when this
-  // session is being served by the web-ui; empty otherwise. Stages that
-  // host their own HTTP endpoint (e.g. hls-broadcast) read this so, by
-  // default, they bind to the same interface the UI is reachable on --
-  // matching whatever the operator chose for the UI (en0, an explicit
-  // --bind, 0.0.0.0, ...). The default returns empty: CLI sessions and
-  // adapter contexts have no web-ui and callers fall back to en0.
-  virtual std::string web_ui_bind_address() const { return {}; }
-
-  // Current UI/message locale as an IETF tag (e.g. "en-us", "zh-cn").
-  // Drives tr() and any user-facing string the session formats. The
-  // default is English; the concrete Session returns the configured or
-  // last-set tag. (Not the model/ASR language hint -- that is separate.)
-  virtual std::string language() const
-  {
-    return std::string(default_language());
-  }
-
-  // Translate an application message `key` for the current language,
-  // falling back to en-us and then to the key itself. Convenience over
-  // the free vpipe::localize(); the key catalogue lives in common/i18n.
-  virtual std::string tr(std::string_view key) const
-  {
-    return localize(language(), key);
-  }
-
-  // Blocking request for one line of interactive user input, routed to
-  // the session's UI delegate. `prompt` is shown before the read;
-  // `should_cancel` (if set) is polled while waiting so a pipeline
-  // stop is observed promptly. See UiDelegateIntf::getline. The
-  // default returns Eof (no interactive input available) so adapter
-  // contexts that never service a UI need not override it.
-  virtual UiInputStatus
-  getline(const VpipeFormat& /*prompt*/, std::string& /*out*/,
-          const std::function<bool()>& /*should_cancel*/) const
-  {
-    return UiInputStatus::Eof;
-  }
-
-  // Blocking request for one line of SECRET interactive input (a
-  // password), routed to the session's UI delegate, which masks it on
-  // screen. See UiDelegateIntf::getpasswd. The default returns Eof so
-  // adapter contexts that never service a UI need not override it.
-  virtual UiInputStatus
-  getpasswd(const VpipeFormat& /*prompt*/, std::string& /*out*/,
-            const std::function<bool()>& /*should_cancel*/) const
-  {
-    return UiInputStatus::Eof;
-  }
-
-  // Blocking request for one line of interactive user input that MAY
-  // carry inline media-line attachment markers (images/audio; see
-  // common/media-line.h and UiDelegateIntf::getmedialine), routed to
-  // the session's UI delegate. Calling this instead of getline tells
-  // the delegate the caller will parse markers, so media-capable
-  // front ends (web-ui) offer attach/drop controls. The default
-  // returns Eof so adapter contexts that never service a UI need not
-  // override it.
-  virtual UiInputStatus
-  getmedialine(const VpipeFormat& /*prompt*/, std::string& /*out*/,
-               const std::function<bool()>& /*should_cancel*/) const
-  {
-    return UiInputStatus::Eof;
-  }
-
-  // Open a live text-output stream routed to the session's UI delegate
-  // (see UiDelegateIntf::open_text_stream / UiTextStream). The default
-  // returns a no-op stream so adapter contexts that never service a UI
-  // need not override it. Never returns null.
-  virtual std::unique_ptr<UiTextStream>
-  open_text_stream() const
-  {
-    return std::make_unique<NullUiTextStream>();
-  }
-
-  // Register a handler for "the user asked to interrupt ongoing work"
-  // (Ctrl-C on the console, the web UI's Interrupt button), routed to
-  // the session's UI delegate. A stage with abandonable long-running
-  // work registers here and cuts that work short when called; it is
-  // NOT a pipeline stop, so the stage keeps its state. See
-  // UiDelegateIntf::register_interrupt_handler for the handler
-  // contract (quick, non-blocking, returns true if it actually
-  // interrupted something).
-  //
-  // Store the returned token as a member: destroying it unregisters,
-  // so the handler cannot outlive the state it captured. The default
-  // returns an inert token so adapter contexts that never service a UI
-  // need not override it.
-  virtual UiInterruptToken
-  register_interrupt_handler(std::string /*label*/,
-                             UiInterruptHandler /*fn*/) const
-  {
-    return {};
-  }
-
-  // The shared worker pool that drives stage drivers and wakes
-  // suspended awaiters. Always non-null on a fully-constructed
-  // Session. Members schedule resumed coroutines through it.
-  virtual ThreadPool* thread_pool() const noexcept = 0;
-
-  // Per-session knob. Currently used by EdgeBuffer when no explicit
-  // capacity is supplied at construction.
-  virtual unsigned default_edge_capacity() const noexcept = 0;
-
-  // Lazily-materialized FFmpeg dlopen wrapper, shared across every
-  // SessionMember in this session. The first caller pays the cost of
-  // probing sonames and resolving the curated symbol table; every
-  // subsequent caller gets the same instance back. Construction is
-  // serialized internally; safe to call concurrently.
-  //
-  // The implementation may throw on first call if a Required-mode
-  // load fails (e.g. no compatible FFmpeg on the system); subsequent
-  // calls after a successful first construction never throw and
-  // return the same non-null pointer. Callers that participate in
-  // session-bootstrap contexts where FFmpeg is intentionally
-  // unavailable (e.g. log delegates) may return nullptr instead.
-  virtual const FFmpegLibraries* ffmpeg_libraries() const = 0;
-
-  // Lazily-materialized session-shared LMDB environment. The path
-  // and map size come from the session config's top-level `db.path`
-  // and `db.map_size_mb`. When `db.path` is missing or empty the
-  // env opens at "." -- i.e. the process CWD at first-open time.
-  // Returns nullptr only if opening the env failed (the failure is
-  // reported through the session's log delegate). Concrete sub-
-  // databases (LmdbDb) live inside this single env -- both the log
-  // delegate and any application stage that needs persistent KV
-  // storage share it. Safe to call concurrently; the first call
-  // serializes construction internally.
-  virtual LmdbEnv* lmdb_env() const = 0;
-
-  // ---- Session-level performance profiling ---------------------
-  //
-  // Sessions own a small fixed set of PerfBuffers -- one per
-  // ThreadPool worker plus one shared "overflow" buffer used by
-  // non-worker callers. Stages call record_perf_event(), which
-  // routes to the right buffer based on the calling thread's
-  // worker id. Memory bound = (num_workers + 1) *
-  // max_events_per_thread * sizeof(PerfEvent); the user controls
-  // total memory via max_events_per_thread.
-  //
-  // Defaults: profiling_enabled() returns false; the other two
-  // accessors return zero / a default-constructed time_point;
-  // record_perf_event is a no-op. Sub-contexts built outside a
-  // real Session (e.g. DbLogDelegate's internal CerrSessionContext)
-  // inherit these defaults.
-
-  virtual bool
-  profiling_enabled() const noexcept { return false; }
-
-  virtual unsigned
-  profiling_max_events_per_thread() const noexcept { return 0; }
-
-  virtual std::chrono::steady_clock::time_point
-  profiling_anchor() const noexcept
-  {
-    return std::chrono::steady_clock::time_point{};
-  }
-
-  // Producer hot path. Routes the event to the calling thread's
-  // per-worker PerfBuffer (or the overflow buffer for non-worker
-  // callers). Stage::record_perf_event is the inline wrapper that
-  // forwards to this; user code reaches in here only via Stage.
-  // Default impl is a no-op so adapter contexts (CerrSessionContext)
-  // don't need to implement it.
-  virtual void
-  record_perf_event(std::uint32_t /*stage_gvid*/,
-                    std::uint32_t /*type*/,
-                    std::uint64_t /*value*/) const noexcept
-  {
-  }
-
-  // Producer hot path for an AUXILIARY (non-worker) lane -- a logical
-  // activity timeline (LLM forward pass, ANE jobs) that is not a
-  // pipeline worker thread. Unlike record_perf_event, routing is by
-  // `lane` (see perf-event.h PerfAuxLane), not the calling thread, so
-  // it works from the dedicated LLM/MLX worker or a CoreML callback
-  // thread. Callers reach this via the PerfAuxScope RAII helper
-  // (common/perf-scope.h). Default impl is a no-op so adapter contexts
-  // don't need to implement it.
-  virtual void
-  record_perf_event_aux(unsigned      /*lane*/,
-                        std::uint32_t /*gvid*/,
-                        std::uint32_t /*type*/,
-                        std::uint64_t /*value*/) const noexcept
-  {
-  }
-
-  // Session-shared CoreML model cache. Stages call
-  // `coreml_model_manager()->load(path, compute_units)` to obtain a
-  // shared_ptr to a loaded model; duplicate requests share one
-  // load. Returns nullptr on non-Apple builds (and on Apple if
-  // VPIPE_BUILD_APPLE_SILICON was disabled at build time, since the
-  // manager type is then a forward declaration with no
-  // implementation). Safe to call concurrently.
-  virtual CoreMLModelManager* coreml_model_manager() const = 0;
-
-  // Session-shared LLM manager (text + multi-modal). Lazily
-  // constructed on first call. Backed by the metal-compute LM
-  // subsystem, so the manager is only available on apple-silicon
-  // builds; on any other build configuration the accessor returns
-  // nullptr. Safe to call concurrently. See `generative-models/` for
-  // the managed types.
-  virtual genai::GenerativeModelManager* generative_model_manager() const = 0;
-
-  // Session-shared Metal compute kernel framework (CUDA-shape
-  // surface: load_library / make buffer / encode dispatch on a
-  // stream). Lazily constructed on first call. Returns nullptr on
-  // non-Apple builds. Even on Apple-Silicon the returned pointer
-  // may be valid()==false (Metal unavailable); callers must check
-  // before dispatching. Safe to call concurrently. See
-  // apple-silicon/metal-compute/metal-compute.h.
-  //
-  // Defaulted here (returns nullptr) so adapter contexts that don't
-  // need GPU resources (e.g. CerrSessionContext) need not override.
-  virtual metal_compute::MetalCompute* metal_compute() const
-  {
-    return nullptr;
-  }
-
-  // Confine a stage-supplied LOCAL file path to the session's filesystem
-  // sandbox. When the sandbox is disabled (the CLI, or the web-ui run
-  // with --expose-native-file-system) the path is returned unchanged.
-  // When enabled the path is re-rooted under the sandbox (chroot-like:
-  // the root acts as "/"), symlink/".." escapes set *err and return an
-  // empty path, and `for_write` creates the parent directory. Network
-  // URLs are NOT paths -- callers should skip this for rtsp/http(s).
-  // Model-manager file access intentionally does NOT go through here.
-  //
-  // Defaulted to passthrough so adapter contexts (e.g. CerrSessionContext)
-  // need not override.
-  virtual std::filesystem::path
-  confine_path(std::string_view user_path, bool /*for_write*/,
-               std::string* /*err*/ = nullptr) const
-  {
-    return std::filesystem::path(user_path);
-  }
-
-  // True when the filesystem sandbox is active (web-ui default). Lets a
-  // client -- e.g. the web-ui file browser -- present a chroot-like
-  // virtual namespace (root == "/") instead of native host paths.
-  // Defaulted false (native access).
-  virtual bool fs_sandboxed() const { return false; }
-
-  // The real directory the sandbox root maps to, or {} when not
-  // sandboxed. Server-side only (never surfaced to a sandboxed client),
-  // it lets a browser list the root itself -- confine_path("/") rejects
-  // the empty relative path, so the root needs this direct handle.
-  virtual std::filesystem::path fs_sandbox_root() const { return {}; }
-
-  // Real host prefixes the sandbox grants pass-through access to
-  // (web-ui --white-list-path), or empty. A browser can offer these as
-  // reachable "mounts"; confine_path() accepts absolute paths inside
-  // them unchanged. Defaulted empty.
-  virtual std::vector<std::filesystem::path> fs_whitelist() const
-  {
-    return {};
-  }
+  // The session's heavyweight subsystems. NEVER null: a context that
+  // owns none inherits an inert instance whose accessors all answer
+  // nullptr, which is the same answer they gave when they hung off this
+  // interface directly. So `services()->metal_compute()` needs no null
+  // check on the services hop -- only on the subsystem, exactly as
+  // before.
+  virtual SessionServicesIntf* services() const;
 };
 
 }

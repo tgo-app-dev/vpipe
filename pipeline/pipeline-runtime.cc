@@ -10,6 +10,7 @@
 #include "pipeline/feedback-tx-stage.h"
 #include "pipeline/oport-buffer.h"
 #include "pipeline/pipeline.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
@@ -700,6 +701,37 @@ PipelineRuntime::launch_()
 
     _contexts.push_back(make_unique<RuntimeContext>(
       std::move(in_readers), std::move(out_bufs), &_stop));
+  }
+
+  // Phase 3.5: every stage's REQUIRED services must exist.
+  //
+  // Checked here, before the resource plan and before any driver, so a
+  // graph that cannot possibly run is refused while nothing has been
+  // acquired -- rather than each stage discovering a null pointer part
+  // way through its own initialize(), by which point the launch has
+  // committed and the failure reads as whatever that stage did next.
+  //
+  // The runtime resolves these by id and never names a service type:
+  // find_service is a string lookup, so adding a service does not reach
+  // this file. See Stage::declare_services.
+  {
+    SessionServicesIntf* svc =
+      session() ? session()->services() : nullptr;
+    bool missing = false;
+    for (Stage* s : stages) {
+      for (const ServiceReq& r : s->declare_services()) {
+        if (!r.required || r.id.empty()) { continue; }
+        if (svc != nullptr && svc->find_service(r.id) != nullptr) {
+          continue;
+        }
+        session()->warn(fmt(
+            "PipelineRuntime: {} stage '{}' requires service '{}', which "
+            "this session does not provide; refusing to launch",
+            _pipeline->id(), s->id(), r.id));
+        missing = true;
+      }
+    }
+    if (missing) { return false; }
   }
 
   // Phase 4: resource planning, then spawn drivers.

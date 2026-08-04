@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
@@ -503,7 +504,7 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
   if (_hf_dir.empty() || _codec_dir.empty()) {
     co_return;  // ctor already recorded the config error.
   }
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
         "TextToSpeechStage('{}'): no metal-compute backend on this "
@@ -922,7 +923,7 @@ resample_pcm_(const SessionContextIntf* session, const float* in,
 {
   if (in == nullptr || n_in == 0 || in_sr <= 0 || out_sr <= 0) { return {}; }
   if (in_sr == out_sr) { return std::vector<float>(in, in + n_in); }
-  const FFmpegLibraries* libs = session ? session->ffmpeg_libraries() : nullptr;
+  const FFmpegLibraries* libs = session ? session->services()->ffmpeg_libraries() : nullptr;
   if (libs == nullptr) { return {}; }
   const auto& swr = libs->swresample().api;
   AVChannelLayout mono_in  = AV_CHANNEL_LAYOUT_MONO;

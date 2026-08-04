@@ -3,6 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "stages/gpu-telemetry.h"
 #include "stages/model-registry.h"
@@ -350,7 +351,7 @@ ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop,
 {
   (void)stop;
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (mgr == nullptr) {
     session()->warn(fmt(
         "ModelBenchmarkStage('{}'): no GenerativeModelManager (is this "

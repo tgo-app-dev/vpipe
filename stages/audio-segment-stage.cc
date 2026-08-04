@@ -7,6 +7,7 @@
 #include "common/perf-event.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #include <algorithm>
@@ -322,7 +323,7 @@ Job
 AudioSegmentStage::initialize(RuntimeContext& /*ctx*/)
 {
   CoreMLModelManager* mgr =
-      session() ? session()->coreml_model_manager() : nullptr;
+      session() ? session()->services()->coreml_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "AudioSegmentStage('{}'): session has no CoreML model manager "

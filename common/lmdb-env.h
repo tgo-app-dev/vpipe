@@ -1,7 +1,7 @@
 #ifndef LMDB_ENV_H
 #define LMDB_ENV_H
 
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 #include <cstddef>
 #include <lmdb.h>
 #include <string>
@@ -9,12 +9,11 @@
 
 namespace vpipe {
 
-class SessionContextIntf;
 
 // Routes an LMDB return code through the session's error path. On
 // rc != MDB_SUCCESS, calls session->error(...) (which throws). Used by all
 // lmdb-* wrappers.
-void lmdb_check(const SessionContextIntf* session,
+void lmdb_check(const LogSinkIntf* session,
                 int                       rc,
                 std::string_view          op);
 
@@ -26,7 +25,7 @@ void lmdb_check(const SessionContextIntf* session,
 // not bound to the calling thread, which matches the upcoming Session
 // thread-pool / job dispatcher. Destruction and move must be exclusive
 // (no live txns or workers).
-class LmdbEnv : public SessionMember {
+class LmdbEnv {
 public:
   // Default mmap size when the caller does not specify one. 1 GiB --
   // generous for a session-shared env, keeps room for the log
@@ -39,7 +38,7 @@ public:
   // for additional options (e.g. MDB_NOSUBDIR, MDB_NOSYNC). max_readers
   // sizes the reader-slot table; with NOTLS each *active* read txn consumes
   // one slot, so size it >= the worker pool's expected concurrent readers.
-  LmdbEnv(const SessionContextIntf* session,
+  LmdbEnv(const LogSinkIntf* session,
           std::string_view          path,
           std::size_t               map_size    = kDefaultMapSize,
           unsigned                  max_dbs     = 16,
@@ -50,14 +49,21 @@ public:
   LmdbEnv& operator=(const LmdbEnv&) = delete;
   LmdbEnv(LmdbEnv&&) noexcept;
   LmdbEnv& operator=(LmdbEnv&&) noexcept;
-  ~LmdbEnv() override;
+  ~LmdbEnv();
 
   bool             valid() const noexcept;
   std::string_view path()  const noexcept;
   MDB_env*         raw()   const noexcept;
   explicit operator bool() const noexcept { return valid(); }
 
+  // The sink these report through. Public because the sibling LMDB
+  // types chain off it (LmdbTxn(env), LmdbDb(env), LmdbCursor(txn))
+  // exactly where they used to chain off env.session().
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   MDB_env*    _env;
   std::string _path;
 };

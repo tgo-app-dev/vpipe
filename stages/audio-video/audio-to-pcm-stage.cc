@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -126,7 +127,7 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
   }
   _flush_on_eos = attr_bool("flush_on_eos");
 
-  _libs = session()->ffmpeg_libraries();
+  _libs = session()->services()->ffmpeg_libraries();
   if (!_libs) {
     fail_config(fmt(
         "AudioToPcmStage('{}'): ffmpeg libraries not available on "

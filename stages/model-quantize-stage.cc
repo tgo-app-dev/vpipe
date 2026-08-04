@@ -18,6 +18,7 @@
 #include "generative-models/quantize/model-quantizer.h"
 #include "generative-models/tokenizer.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
@@ -66,6 +67,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _mixed_frac    = static_cast<float>(attr_real("mixed_frac"));
   _layer_prefix  = attr_str("layer_prefix");
   _quant_modulation = attr_bool("quant_modulation");
+  _klein_kv      = attr_bool("klein_kv");
   _n_layers      = static_cast<int>(attr_uint("n_layers"));
 
   if (_src_model.empty()) {
@@ -507,6 +509,13 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "paired AWQ per-group weight clip search (needs awq); OFF by "
           "default -- can regress end drift on small calibration sets",
    .def_bool = false},
+  {.key = "klein_kv", .type = ConfigType::Bool, .required = false,
+   .doc = "the flux2 source is FLUX.2-klein-9b-kv rather than plain klein-9B. "
+          "Only affects on-device CALIBRATION, whose sweep conditions on a "
+          "reference image: that checkpoint isolates reference tokens, so "
+          "calibrating it under the plain joint attention would clip against "
+          "a distribution it never sees. Weight quantization itself is "
+          "identical (same tensor names/shapes). Default false"},
   {.key = "calib_dir", .type = ConfigType::String,
    .doc = "dir with calib_{qkv,o,gateup,down}.f32 activation stats; empty "
           "(default) => on-device auto-calibration for a known arch",
@@ -586,7 +595,7 @@ ModelQuantizeStage::register_output_(const std::string& key,
                                      const std::string& dir,
                                      const std::string& arch, int bits)
 {
-  LmdbEnv* env = session() ? session()->lmdb_env() : nullptr;
+  LmdbEnv* env = session() ? session()->services()->lmdb_env() : nullptr;
   if (env == nullptr) {
     session()->warn(fmt(
         "ModelQuantizeStage('{}'): no lmdb_env(); not registering '{}'",
@@ -654,7 +663,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
     return true;
   }
 
-  metal_compute::MetalCompute* mc = session()->metal_compute();
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) {
     session()->warn(fmt(
         "ModelQuantizeStage('{}'): no metal-compute backend", this->id()));
@@ -918,7 +927,7 @@ ModelQuantizeStage::quantize_dit_component_(
 {
   namespace fs = std::filesystem;
   std::error_code ec;
-  metal_compute::MetalCompute* mc = session()->metal_compute();
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) { return false; }
 
   const bool is_flux2 = (family == "flux2");
@@ -1056,7 +1065,7 @@ ModelQuantizeStage::quantize_dit_component_(
       const bool ok = is_flux2
           ? genai::collect_flux2_calibration(
                 mc, calib_root, genai::default_dit_calibration_prompts(), 8, 256,
-                256, 0, tmp_cal.string(), &ce, stop)
+                256, 0, tmp_cal.string(), &ce, stop, _klein_kv)
           : is_boogu
           // 4 steps, not 8: the Boogu collector walks the DMD student's own
           // ascending schedule, which IS 4 steps.
@@ -1112,7 +1121,7 @@ ModelQuantizeStage::quantize_text_encoder_(
 {
   namespace fs = std::filesystem;
   std::error_code ec;
-  metal_compute::MetalCompute* mc = session()->metal_compute();
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) { return false; }
 
   // The text encoder is a dense Qwen3-VL backbone under the language_model.
@@ -1203,7 +1212,7 @@ ModelQuantizeStage::auto_calibrate_backbone_(
 {
   namespace fs = std::filesystem;
   std::error_code ec;
-  metal_compute::MetalCompute* mc = session()->metal_compute();
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) { return {}; }
   if (!meta.calib_ok) {
     session()->warn(fmt(

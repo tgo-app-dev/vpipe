@@ -2,7 +2,7 @@
 #define FFMPEG_LIBRARIES_H
 
 #include "common/library-handle.h"
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -40,8 +40,8 @@ namespace vpipe {
 
 class LibAvUtil final : public LibraryHandle {
 public:
-  explicit LibAvUtil(const SessionContextIntf* session,
-                     LoadMode                  mode = LoadMode::Required);
+  explicit LibAvUtil(const LogSinkIntf* log,
+                     LoadMode           mode = LoadMode::Required);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -73,8 +73,8 @@ public:
 
 class LibAvCodec final : public LibraryHandle {
 public:
-  explicit LibAvCodec(const SessionContextIntf* session,
-                      LoadMode                  mode = LoadMode::Required);
+  explicit LibAvCodec(const LogSinkIntf* log,
+                      LoadMode           mode = LoadMode::Required);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -108,8 +108,8 @@ public:
 
 class LibAvFormat final : public LibraryHandle {
 public:
-  explicit LibAvFormat(const SessionContextIntf* session,
-                       LoadMode                  mode = LoadMode::Required);
+  explicit LibAvFormat(const LogSinkIntf* log,
+                       LoadMode           mode = LoadMode::Required);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -143,8 +143,8 @@ public:
 
 class LibSwResample final : public LibraryHandle {
 public:
-  explicit LibSwResample(const SessionContextIntf* session,
-                         LoadMode                  mode = LoadMode::Required);
+  explicit LibSwResample(const LogSinkIntf* log,
+                         LoadMode           mode = LoadMode::Required);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -163,8 +163,8 @@ public:
 
 class LibSwScale final : public LibraryHandle {
 public:
-  explicit LibSwScale(const SessionContextIntf* session,
-                      LoadMode                  mode = LoadMode::Required);
+  explicit LibSwScale(const LogSinkIntf* log,
+                      LoadMode           mode = LoadMode::Required);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -186,8 +186,8 @@ public:
 // check `valid()` before calling api.
 class LibAvDevice final : public LibraryHandle {
 public:
-  explicit LibAvDevice(const SessionContextIntf* session,
-                       LoadMode                  mode = LoadMode::Optional);
+  explicit LibAvDevice(const LogSinkIntf* log,
+                       LoadMode           mode = LoadMode::Optional);
 
   unsigned version_major() const noexcept;
   unsigned version_minor() const noexcept;
@@ -209,12 +209,12 @@ public:
 // AV_LOG_VERBOSE. The most recently constructed instance wins as
 // the routing target; multi-Session apps in the same process see
 // the latest session's verbose channel.
-class FFmpegLibraries final : public SessionMember {
+class FFmpegLibraries final {
 public:
-  explicit FFmpegLibraries(const SessionContextIntf* session,
+  explicit FFmpegLibraries(const LogSinkIntf* log,
                            LibraryHandle::LoadMode mode
                              = LibraryHandle::LoadMode::Required);
-  ~FFmpegLibraries() override;
+  ~FFmpegLibraries();
 
   FFmpegLibraries(const FFmpegLibraries&)            = delete;
   FFmpegLibraries& operator=(const FFmpegLibraries&) = delete;
@@ -230,6 +230,8 @@ public:
   const LibAvDevice&   avdevice()   const noexcept { return _avdevice; }
 
 private:
+  // Only ever used to report; see LibraryHandle.
+  const LogSinkIntf* _log;
   // Declaration order matters: avutil is the lowest-level dependency
   // and gets constructed first; the others come after.
   LibAvUtil     _avutil;

@@ -1,6 +1,6 @@
 #include "common/lmdb-env.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 #include <filesystem>
 #include <system_error>
 
@@ -9,7 +9,7 @@ using namespace std;
 namespace vpipe {
 
 void
-lmdb_check(const SessionContextIntf* session,
+lmdb_check(const LogSinkIntf* session,
            int                       rc,
            string_view               op)
 {
@@ -19,13 +19,13 @@ lmdb_check(const SessionContextIntf* session,
   session->error(fmt("lmdb {} failed: {}", op, mdb_strerror(rc)));
 }
 
-LmdbEnv::LmdbEnv(const SessionContextIntf* session,
+LmdbEnv::LmdbEnv(const LogSinkIntf* session,
                  string_view               path,
                  size_t                    map_size,
                  unsigned                  max_dbs,
                  unsigned                  max_readers,
                  unsigned                  extra_flags)
-  : SessionMember(session)
+  : _log(session)
   , _env(nullptr)
   , _path(path)
 {
@@ -39,7 +39,7 @@ LmdbEnv::LmdbEnv(const SessionContextIntf* session,
       mdb_env_close(_env);
       _env = nullptr;
     }
-    this->session()->error(
+    _log->error(
       fmt("lmdb {} failed for {}: {}", op, _path, mdb_strerror(rc)));
   };
 
@@ -47,7 +47,7 @@ LmdbEnv::LmdbEnv(const SessionContextIntf* session,
     error_code ec;
     filesystem::create_directories(_path, ec);
     if (ec) {
-      this->session()->error(
+      _log->error(
         fmt("create_directories failed for {}: {}", _path, ec.message()));
       return;
     }
@@ -69,7 +69,7 @@ LmdbEnv::LmdbEnv(const SessionContextIntf* session,
 }
 
 LmdbEnv::LmdbEnv(LmdbEnv&& other) noexcept
-  : SessionMember(other.session())
+  : _log(other._log)
   , _env(other._env)
   , _path(std::move(other._path))
 {

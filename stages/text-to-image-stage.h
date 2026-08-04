@@ -166,6 +166,7 @@ private:
   bool        _watermark{};
   std::string _watermark_key;
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  bool        _klein_kv{};           // checkpoint is FLUX.2-klein-9b-kv
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 

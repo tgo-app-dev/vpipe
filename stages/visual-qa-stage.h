@@ -243,6 +243,7 @@ public:
   // The LM this stage holds. Declared before any stage initializes so
   // the diffusion stages -- which cannot see it from their own config --
   // size the box against it. See Stage::declare_resources.
+  std::vector<ServiceReq> declare_services() const override;
   std::vector<ResourceClaim> declare_resources() const override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;

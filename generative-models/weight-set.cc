@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <cstdlib>
 
@@ -451,7 +452,7 @@ open_weight_set(const string& dir, const SessionContextIntf* session,
                 const string& variant)
 {
   if (session != nullptr) {
-    if (auto* mgr = session->generative_model_manager()) {
+    if (auto* mgr = session->services()->generative_model_manager()) {
       return mgr->weight_set(dir, variant);
     }
   }

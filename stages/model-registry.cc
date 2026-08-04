@@ -6,6 +6,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <filesystem>
 
@@ -18,7 +19,7 @@ resolve_model_dir(const SessionContextIntf* session,
   if (!session) {
     return ref;
   }
-  LmdbEnv* env = session->lmdb_env();
+  LmdbEnv* env = session->services()->lmdb_env();
   if (!env) {
     return ref;
   }

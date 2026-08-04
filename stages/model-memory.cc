@@ -3,6 +3,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <sys/sysctl.h>
 
@@ -57,7 +58,7 @@ weight_footprint(const SessionContextIntf*       session,
                  const std::vector<std::string>& dirs)
 {
   namespace fs = std::filesystem;
-  auto* mgr = session != nullptr ? session->generative_model_manager()
+  auto* mgr = session != nullptr ? session->services()->generative_model_manager()
                                  : nullptr;
   // Everything already open, counted once per checkpoint by the manager.
   std::size_t total = mgr != nullptr ? mgr->resident_weight_bytes() : 0;
@@ -203,7 +204,7 @@ private:
   static genai::GenerativeModelManager*
   manager(const SessionContextIntf* session)
   {
-    return session != nullptr ? session->generative_model_manager()
+    return session != nullptr ? session->services()->generative_model_manager()
                               : nullptr;
   }
 

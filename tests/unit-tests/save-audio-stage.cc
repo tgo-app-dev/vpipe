@@ -6,13 +6,14 @@
 // 44-byte header, assert sample_rate / channels / bits + the data chunk
 // holds ~1 s of samples).
 //
-// ffmpeg-gated: AAC + MP3 + M4A. When session()->ffmpeg_libraries() is
+// ffmpeg-gated: AAC + MP3 + M4A. When session()->services()->ffmpeg_libraries() is
 // valid the test encodes to temp files, asserts the file is non-trivially
 // sized, then RE-OPENS each with ffmpeg (avformat_open_input +
 // find_stream_info) to confirm a valid audio stream with ~1 s duration
 // and the right codec.
 
 #include "minitest.h"
+#include "interfaces/session-services-intf.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"

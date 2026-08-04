@@ -1,7 +1,7 @@
 #ifndef VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 #define VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +19,6 @@ class Model;
 
 namespace vpipe {
 
-class SessionContextIntf;
 
 // Element type on the CoreML predict() I/O boundary. Independent of
 // TensorBeat::DType -- it names the types MLMultiArray actually uses
@@ -127,21 +126,21 @@ struct CoreMLPredictOutput {
 //
 // Non-copyable, non-movable. Lifetime is managed via shared_ptr from
 // CoreMLModelManager.
-class CoreMLLoadedModel final : public SessionMember {
+class CoreMLLoadedModel final {
 public:
   // Loads `mlmodelc_path` (a directory; .mlmodel files are compiled
   // upstream in the manager). compute_units is the
   // CML::ModelConfiguration::setComputeUnits value: 0=CPUOnly,
   // 1=CPU+GPU, 2=All, 3=CPU+NeuralEngine. Errors via
   // session->error() (throws); the manager catches.
-  CoreMLLoadedModel(const SessionContextIntf* session,
+  CoreMLLoadedModel(const LogSinkIntf* session,
                     std::string_view          mlmodelc_path,
                     int                       compute_units);
 
   CoreMLLoadedModel(const CoreMLLoadedModel&)            = delete;
   CoreMLLoadedModel& operator=(const CoreMLLoadedModel&) = delete;
 
-  ~CoreMLLoadedModel() override;
+  ~CoreMLLoadedModel();
 
   // True once the underlying CoreML model bound successfully. The raw
   // CML::Model* is intentionally NOT exposed: every prediction goes
@@ -154,7 +153,7 @@ public:
   // per-model serialization happen inside -- a caller never touches
   // coreml-cpp. `cpu_only` forces CPU execution for this call
   // (overriding the load-time compute units). On any failure logs via
-  // session() and returns false (leaving `outputs` empty).
+  // the log sink and returns false (leaving `outputs` empty).
   bool predict(std::span<const CoreMLPredictInput> inputs,
                std::span<CoreMLPredictOutput>      outputs,
                bool                                cpu_only = false);
@@ -185,7 +184,11 @@ public:
   const std::string& path() const noexcept { return _path; }
   int compute_units() const noexcept { return _compute_units; }
 
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   CML::Model*                                              _model;
   std::mutex                                               _predict_mu;
   std::unordered_map<std::string, CoreMLInputDesc>         _inputs_desc;
@@ -208,14 +211,14 @@ private:
 // concurrent loads of the *same* key may both perform the load -- a
 // rare race that wastes one load, never produces UB; the cache
 // stabilises on whichever winner wins the second lock.
-class CoreMLModelManager final : public SessionMember {
+class CoreMLModelManager final {
 public:
-  explicit CoreMLModelManager(const SessionContextIntf* session);
+  explicit CoreMLModelManager(const LogSinkIntf* session);
 
   CoreMLModelManager(const CoreMLModelManager&)            = delete;
   CoreMLModelManager& operator=(const CoreMLModelManager&) = delete;
 
-  ~CoreMLModelManager() override = default;
+  ~CoreMLModelManager() = default;
 
   // Returns a shared model, loading on first request. `path` may be
   // a .mlmodel file (compiled to a tmp .mlmodelc inside) or a
@@ -227,7 +230,11 @@ public:
   // Test / diagnostics helpers.
   std::size_t cached_count() const;
 
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   struct Key {
     std::string path;
     int         compute_units;

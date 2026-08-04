@@ -4,8 +4,10 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
+#include "interfaces/session-context-intf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -312,6 +315,29 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       m->_lib_elt.function("im2col_hwc_3x3_s2_tiled_f16");
   m->_fn_upsample    = m->_lib_elt.function("upsample_nearest2x_hwc_f16");
   m->_fn_bias_add    = m->_lib_elt.function("bias_add_rows_f16");
+  // Two-pass group norm (see the header). Best-effort: any missing entry
+  // point leaves _fast_gnorm false and the single-pass kernel in charge.
+  m->_fn_conv_small_cout =
+      std::getenv("VPIPE_VAE_NO_SMALL_COUT_CONV") == nullptr
+          ? m->_lib_elt.function("conv3x3_hwc_small_cout_f16")
+          : metal_compute::ComputeFunction{};
+  m->_fn_gn_stats  = m->_lib_elt.function("group_norm_chan_stats_f16");
+  m->_fn_gn_reduce = m->_lib_elt.function("group_norm_group_stats_f32");
+  m->_fn_gn_apply  = m->_lib_elt.function("group_norm_apply_f16");
+  m->_fast_gnorm = m->_fn_gn_stats.valid() && m->_fn_gn_reduce.valid()
+                   && m->_fn_gn_apply.valid()
+                   && std::getenv("VPIPE_VAE_NO_FAST_GNORM") == nullptr;
+  if (m->_fast_gnorm) {
+    // Size off the widest channel count any norm in this model will see, so
+    // the two scratch buffers are allocated once and reused by every norm.
+    int cmax = 0;
+    for (int c : m->_cfg.block_out) { cmax = std::max(cmax, c); }
+    cmax = std::max(cmax, m->_cfg.latent_channels);
+    m->_gn_part =
+        mc->make_shared_buffer((std::size_t)kGnBlocks * 2 * cmax * 4);
+    m->_gn_stats = mc->make_shared_buffer((std::size_t)cmax * 2 * 4);
+    m->_fast_gnorm = !m->_gn_part.empty() && !m->_gn_stats.empty();
+  }
   if (!m->_fn_gemm_bias.valid() || !m->_fn_groupnorm.valid() ||
       !m->_fn_mul_sigmoid.valid() || !m->_fn_residual.valid() ||
       !m->_fn_clamp.valid() || !m->_fn_sdpa.valid() || !m->_fn_im2col.valid() ||
@@ -360,6 +386,7 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     if (fn != nullptr) {
       m->_lib_sdpa_mma = mc->load_library("sdpa_mma");
       m->_fn_sdpa_full_mma = m->_lib_sdpa_mma.function(fn);
+      m->load_wide_attn_(mid_d);
     }
     // Prefer matmul2d flash only where the matrix units make it worthwhile
     // (M5); on M4/older the simdgroup_matrix flash (_fn_sdpa_full_smm) wins.
@@ -531,6 +558,86 @@ MetalFlux2Vae::load_encoder_(WeightSet& wts)
        (!cfg.use_quant_conv || !_quant_conv.w.empty());
   (void)L;
   return ok;
+}
+
+// Pick and load the wide-query-tile mid-attention kernel. The mid-block
+// attention is BANDWIDTH-bound, not compute-bound: every threadgroup walks the
+// whole of K and V, so the traffic is ceil(hw/BQ) * 2 * hw * D * 2 bytes and BQ
+// is the only term that moves it. At 1024x768 (hw = 12288, D = 512) the BQ=8
+// kernel moves 36 GB and takes ~166 ms, in BOTH decode and encode -- the single
+// largest item in either profile. See sdpa_mma.metal for the derivation and for
+// why BQ > 8 needs the register accumulator.
+void MetalFlux2Vae::load_wide_attn_(int mid_d)
+{
+  int bq = kAttnBq;
+  if (const char* e = std::getenv("VPIPE_FLUX2_VAE_ATTN_BQ")) {
+    bq = std::atoi(e);            // 8 keeps the narrow (tg-accumulator) kernel
+  }
+  if (bq != 16 && bq != 32 && bq != 64) { return; }
+  const std::string fn = "sdpa_full_mma2_d" + std::to_string(mid_d) + "_q" +
+                         std::to_string(bq) + "_f16";
+  _fn_sdpa_full_wide = _lib_sdpa_mma.function(fn);
+  if (_fn_sdpa_full_wide.valid()) { _attn_bq = bq; }
+}
+
+void
+MetalFlux2Vae::group_norm_(ComputeEncoder& enc, const SharedBuffer& in,
+                           const SharedBuffer& gamma, const SharedBuffer& beta,
+                           const SharedBuffer& out, int rows, int C, int G,
+                           float eps)
+{
+  if (!_fast_gnorm || _gn_part.empty() || _gn_stats.empty()) {
+    enc.set_function(_fn_groupnorm);
+    enc.set_buffer(0, in); enc.set_buffer(1, gamma); enc.set_buffer(2, beta);
+    enc.set_buffer(3, out);
+    enc.set_constant(4, rows); enc.set_constant(5, C);
+    enc.set_constant(6, G); enc.set_constant(7, eps);
+    enc.dispatch({256, (unsigned)G, 1}, {256, 1, 1});
+    return;
+  }
+  // More row blocks than rows would leave empty blocks contributing zero
+  // partials -- harmless, but the reduce then averages over a `rows` that
+  // does not match what was summed, so clamp instead.
+  const int NB = std::min(kGnBlocks, std::max(1, rows));
+  enc.set_function(_fn_gn_stats);
+  enc.set_buffer(0, in); enc.set_buffer(1, _gn_part);
+  enc.set_constant(2, rows); enc.set_constant(3, C); enc.set_constant(4, NB);
+  enc.dispatch({(unsigned)(256 * NB), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_gn_reduce);
+  enc.set_buffer(0, _gn_part); enc.set_buffer(1, _gn_stats);
+  enc.set_constant(2, rows); enc.set_constant(3, C); enc.set_constant(4, G);
+  enc.set_constant(5, NB); enc.set_constant(6, eps);
+  enc.dispatch({(unsigned)(256 * G), 1, 1}, {256, 1, 1});
+  enc.set_function(_fn_gn_apply);
+  enc.set_buffer(0, in); enc.set_buffer(1, gamma); enc.set_buffer(2, beta);
+  enc.set_buffer(3, out); enc.set_buffer(4, _gn_stats);
+  enc.set_constant(5, C); enc.set_constant(6, G);
+  enc.dispatch({(unsigned)C, (unsigned)rows, 1}, {256, 1, 1});
+}
+
+bool
+MetalFlux2Vae::conv3x3_small_cout_(ComputeEncoder& enc, const SharedBuffer& in,
+                                   const Conv& c, const SharedBuffer& out,
+                                   int H, int W, int stride)
+{
+  // stride 1 only: the stride-2 downsample uses the asymmetric (0,1,0,1)
+  // padding, and every small-cout conv in these VAEs is stride 1 anyway.
+  if (!_fn_conv_small_cout.valid() || c.whwio.empty() || stride != 1) {
+    return false;
+  }
+  if (c.cout <= 0 || c.cout > kSmallCoutMax || c.cin <= 0) { return false; }
+  const int has_bias = c.b.empty() ? 0 : 1;
+  enc.set_function(_fn_conv_small_cout);
+  enc.set_buffer(0, in); enc.set_buffer(1, c.whwio);
+  // Every buffer slot must be bound even when unread; the kernel gates on
+  // has_bias, so point the unused slot at a live buffer rather than nothing.
+  enc.set_buffer(2, has_bias != 0 ? c.b : c.whwio);
+  enc.set_buffer(3, out);
+  enc.set_constant(4, W); enc.set_constant(5, H);
+  enc.set_constant(6, c.cin); enc.set_constant(7, c.cout);
+  enc.set_constant(8, has_bias);
+  enc.dispatch({(unsigned)W, (unsigned)H, 1}, {256, 1, 1});
+  return true;
 }
 
 bool
@@ -876,6 +983,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   // each boundary. VPIPE_FLUX2_NO_VAE_SPLIT keeps it all in one command buffer.
   SharedBuffer carry;
   const bool vae_split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
+  const bool vprof = std::getenv("VPIPE_FLUX2_VAE_PROFILE") != nullptr;
   bool split_ok = true;
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -886,6 +994,11 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
       // (streams the [hw, 9*cin] im2col in bands through im2col_scratch).
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
+      // Small cout (the final conv to 3 / 2*latent) never satisfies the
+      // hardware conv's cout % 64; a direct pass beats materializing im2col.
+      if (conv3x3_small_cout_(enc, in, c, out, H, W, /*stride=*/1)) {
+        return out;
+      }
       tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
                      im2col_cap);
       return out;
@@ -899,12 +1012,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     auto gnorm = [&](const SharedBuffer& in, std::size_t hw, const GNorm& n)
         -> SharedBuffer& {
       SharedBuffer& out = alloc(hw * n.c);
-      enc.set_function(_fn_groupnorm);
-      enc.set_buffer(0, in); enc.set_buffer(1, n.g); enc.set_buffer(2, n.b);
-      enc.set_buffer(3, out);
-      enc.set_constant(4, (int)hw); enc.set_constant(5, n.c);
-      enc.set_constant(6, G); enc.set_constant(7, geps);
-      enc.dispatch({256, (unsigned)G, 1}, {256, 1, 1});
+      group_norm_(enc, in, n.g, n.b, out, (int)hw, n.c, G, geps);
       return out;
     };
     auto silu = [&](const SharedBuffer& x, std::size_t n) {
@@ -980,8 +1088,13 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       const bool smm = _fn_sdpa_full_smm.valid() && (C % 64 == 0) && (C <= 512);
       const bool mma2 = _fn_sdpa_full_mma.valid() && _use_attn_mma2;
       if (mma2 && !(smm && std::getenv("VPIPE_FLUX2_VAE_ATTN_SMM"))) {
-        enc.set_function(_fn_sdpa_full_mma);           // matmul2d (M5)
-        enc.dispatch({4 * 32, 1, (unsigned)((hw + 7) / 8)}, {4 * 32, 1, 1});
+        // Wide query tile where it loaded (see load_wide_attn_): same math,
+        // fewer threadgroups, so proportionally less K/V streamed.
+        const int bq = _fn_sdpa_full_wide.valid() ? _attn_bq : 8;
+        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
+        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
+        enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)},
+                     {nt, 1, 1});
       } else if (smm) {
         enc.set_function(_fn_sdpa_full_smm);           // simdgroup_matrix
         const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
@@ -996,6 +1109,28 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       SharedBuffer& out = resadd(p, x, hw * C);
       release(p);
       return out;
+    };
+
+    // Per-section GPU timing (VPIPE_FLUX2_VAE_PROFILE). Like the DiT profiler,
+    // `mark` closes the command buffer and waits, so the sections serialize
+    // (no cross-section overlap) -- the point is per-section GPU wall time,
+    // not a faithful end-to-end number. Unlike `flush` it leaves the pool
+    // alone: the buffers stay alive and reusable across the boundary, so
+    // marking does not change what the decode allocates. No-op when unset.
+    std::vector<std::pair<std::string, double>> vmarks;
+    auto vnow = [] { return std::chrono::steady_clock::now(); };
+    auto vlast = vnow();
+    auto mark = [&](const std::string& name) {
+      if (!vprof) { return; }
+      enc.end();
+      std::string ge;
+      if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
+      vmarks.emplace_back(name,
+                          std::chrono::duration<double, std::milli>(
+                              vnow() - vlast).count());
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+      vlast = vnow();
     };
 
     // Commit the current command buffer, free the level's intermediates, and
@@ -1023,21 +1158,31 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     // temporaries internally; each holds its residual input through the resadd).
     auto step = [&](const SharedBuffer& nx) { release(*x); x = &nx; };
     step(conv3x3(*x, H, W, _conv_in));
+    mark(fmt("conv_in {}x{}", H, W)());
     step(resblock(_mid_res0, *x, H, W));
+    mark("mid_res0");
     step(attention(_mid_attn, *x, H, W));
+    mark("mid_attn");
     step(resblock(_mid_res1, *x, H, W));
+    mark("mid_res1");
     for (const UpBlock& ub : _up_blocks) {
+      const int lvl = (int)(&ub - _up_blocks.data());
       for (const ResBlock& rb : ub.resnets) { step(resblock(rb, *x, H, W)); }
+      mark(fmt("up{} res x{} {}x{}c{}", lvl, (int)ub.resnets.size(), H, W,
+               ub.resnets.empty() ? 0 : ub.resnets.back().cout)());
       if (ub.has_up) {
         step(upsample(*x, H, W, ub.up_dim));
         H *= 2; W *= 2;
         step(conv3x3(*x, H, W, ub.up));
+        mark(fmt("up{} upsample+conv -> {}x{}c{}", lvl, H, W,
+                 ub.up.cout)());
       }
       flush(x);            // pool off: bound the working set to ~one up-block
     }
     SharedBuffer& xn = gnorm(*x, (std::size_t)H * W, _norm_out);
     release(*x);
     silu(xn, (std::size_t)H * W * _cfg.block_out[0]);
+    mark(fmt("norm_out+silu {}x{}", H, W)());
     SharedBuffer& rgb = conv3x3(xn, H, W, _conv_out);
     release(xn);
     const int n = H * W * 3;
@@ -1046,7 +1191,20 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     enc.set_constant(2, n); enc.set_constant(3, -1.0f);
     enc.set_constant(4, 1.0f);
     enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    mark(fmt("norm_out+conv_out {}x{}", H, W)());
     rgb_ptr = &rgb;
+    if (vprof && mc->session() != nullptr) {
+      double tot = 0;
+      for (const auto& m : vmarks) { tot += m.second; }
+      std::string body;
+      for (const auto& m : vmarks) {
+        body += fmt("\n  {:<34} {} ms ({}%)", m.first, (long)m.second,
+                    (long)(tot > 0 ? m.second * 100.0 / tot : 0))();
+      }
+      mc->session()->log_normal(fmt(
+          "FLUX.2 VAE decode profile ({}x{} out, GPU {} ms total):{}",
+          H, W, (long)tot, body));
+    }
   }
   if (!alloc_ok) { return fail("a decode intermediate allocation failed"); }
   if (!split_ok) { return fail("GPU decode ran out of memory at a level "
@@ -1057,11 +1215,18 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   }
   SharedBuffer out = mc->make_shared_buffer((std::size_t)3 * H * W * 2);
   {
+    const auto t_rb = std::chrono::steady_clock::now();
     const auto* s = static_cast<const _Float16*>(rgb_ptr->contents());
     auto* d = static_cast<_Float16*>(out.contents());
     const std::size_t hw = (std::size_t)H * W;
     for (std::size_t p = 0; p < hw; ++p) {
       for (int c = 0; c < 3; ++c) { d[(std::size_t)c * hw + p] = s[p * 3 + c]; }
+    }
+    if (vprof && mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "FLUX.2 VAE decode: interleaved->planar readback (CPU) {} ms",
+          (long)std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t_rb).count()));
     }
   }
   return out;
@@ -1153,6 +1318,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   // Both default on for the minimum peak. `carry` crosses each boundary.
   SharedBuffer carry;
   const bool vae_split = std::getenv("VPIPE_FLUX2_NO_VAE_SPLIT") == nullptr;
+  const bool vprof = std::getenv("VPIPE_FLUX2_VAE_PROFILE") != nullptr;
   bool split_ok = true;
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -1160,6 +1326,11 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
                        const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
+      // Small cout (the final conv to 3 / 2*latent) never satisfies the
+      // hardware conv's cout % 64; a direct pass beats materializing im2col.
+      if (conv3x3_small_cout_(enc, in, c, out, H, W, /*stride=*/1)) {
+        return out;
+      }
       tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, im2col_scratch,
                      im2col_cap);
       return out;
@@ -1181,12 +1352,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
     auto gnorm = [&](const SharedBuffer& in, std::size_t hw, const GNorm& n)
         -> SharedBuffer& {
       SharedBuffer& out = alloc(hw * n.c);
-      enc.set_function(_fn_groupnorm);
-      enc.set_buffer(0, in); enc.set_buffer(1, n.g); enc.set_buffer(2, n.b);
-      enc.set_buffer(3, out);
-      enc.set_constant(4, (int)hw); enc.set_constant(5, n.c);
-      enc.set_constant(6, G); enc.set_constant(7, geps);
-      enc.dispatch({256, (unsigned)G, 1}, {256, 1, 1});
+      group_norm_(enc, in, n.g, n.b, out, (int)hw, n.c, G, geps);
       return out;
     };
     auto silu = [&](const SharedBuffer& x, std::size_t n) {
@@ -1248,8 +1414,13 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       const bool smm = _fn_sdpa_full_smm.valid() && (C % 64 == 0) && (C <= 512);
       const bool mma2 = _fn_sdpa_full_mma.valid() && _use_attn_mma2;
       if (mma2 && !(smm && std::getenv("VPIPE_FLUX2_VAE_ATTN_SMM"))) {
-        enc.set_function(_fn_sdpa_full_mma);           // matmul2d (M5)
-        enc.dispatch({4 * 32, 1, (unsigned)((hw + 7) / 8)}, {4 * 32, 1, 1});
+        // Wide query tile where it loaded (see load_wide_attn_): same math,
+        // fewer threadgroups, so proportionally less K/V streamed.
+        const int bq = _fn_sdpa_full_wide.valid() ? _attn_bq : 8;
+        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
+        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
+        enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)},
+                     {nt, 1, 1});
       } else if (smm) {
         enc.set_function(_fn_sdpa_full_smm);           // simdgroup_matrix
         const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
@@ -1280,25 +1451,63 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       enc = stream.begin_compute();
     };
 
+    // Per-section GPU timing (VPIPE_FLUX2_VAE_PROFILE); see decode().
+    std::vector<std::pair<std::string, double>> vmarks;
+    auto vnow = [] { return std::chrono::steady_clock::now(); };
+    auto vlast = vnow();
+    auto mark = [&](const std::string& name) {
+      if (!vprof) { return; }
+      enc.end();
+      std::string ge;
+      if (!stream.commit().wait_ok(&ge)) { split_ok = false; }
+      vmarks.emplace_back(name,
+                          std::chrono::duration<double, std::milli>(
+                              vnow() - vlast).count());
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+      vlast = vnow();
+    };
+
     const SharedBuffer* x = &conv3x3(x0, H, W, _enc_conv_in);
+    mark(fmt("conv_in {}x{}", H, W)());
     release(x0);
     auto step = [&](const SharedBuffer& nx) { release(*x); x = &nx; };
     for (const DownStage& st : _enc_down) {
+      const int lvl = (int)(&st - _enc_down.data());
       for (const ResBlock& rb : st.resnets) { step(resblock(rb, *x, H, W)); }
+      mark(fmt("down{} res x{} {}x{}c{}", lvl, (int)st.resnets.size(), H, W,
+               st.resnets.empty() ? 0 : st.resnets.back().cout)());
       if (st.has_down) {
         step(conv3x3_s2(*x, H, W, st.down));
         H /= 2; W /= 2;
+        mark(fmt("down{} stride2 -> {}x{}", lvl, H, W)());
       }
       flush(x);            // pool off: bound the working set to ~one down-stage
     }
     step(resblock(_enc_mid_res0, *x, H, W));
+    mark("mid_res0");
     step(attention(_enc_mid_attn, *x, H, W));
+    mark("mid_attn");
     step(resblock(_enc_mid_res1, *x, H, W));
+    mark("mid_res1");
     SharedBuffer& xn = gnorm(*x, (std::size_t)H * W, _enc_norm_out);
     release(*x);
     silu(xn, (std::size_t)H * W * _cfg.block_out[3]);
     SharedBuffer& moments = conv3x3(xn, H, W, _enc_conv_out);   // [hw, 2L]
     release(xn);
+    mark(fmt("norm_out+conv_out {}x{}", H, W)());
+    if (vprof && mc->session() != nullptr) {
+      double tot = 0;
+      for (const auto& m : vmarks) { tot += m.second; }
+      std::string body;
+      for (const auto& m : vmarks) {
+        body += fmt("\n  {:<34} {} ms ({}%)", m.first, (long)m.second,
+                    (long)(tot > 0 ? m.second * 100.0 / tot : 0))();
+      }
+      mc->session()->log_normal(fmt(
+          "FLUX.2 VAE ENCODE profile ({}x{} in, GPU {} ms total):{}",
+          H0, W0, (long)tot, body));
+    }
     // quant_conv is optional (absent on the plain AutoencoderKL): then the
     // conv_out moments ARE the posterior parameters.
     if (_quant_conv.w.empty()) {

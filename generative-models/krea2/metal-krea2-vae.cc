@@ -155,6 +155,24 @@ MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
 
 // Load a 1x1 conv ([Cout,Cin,1,1,1] or [Cout,Cin,1,1]) as dense-gemm weight
 // [Cout, Cin] (the trailing singleton dims flatten away).
+// Pick and load the wide-query-tile mid-attention kernel. The mid-block
+// attention is BANDWIDTH-bound: every threadgroup walks the whole of K and V,
+// so the traffic is ceil(hw/BQ) * 2 * hw * D * 2 bytes and BQ is the only term
+// that moves it. See sdpa_mma.metal for the tile sweep behind kAttnBq and for
+// why BQ > 8 needs the register accumulator.
+void MetalKrea2Vae::load_wide_attn_(int mid_d)
+{
+  int bq = kAttnBq;
+  if (const char* e = std::getenv("VPIPE_KREA2_VAE_ATTN_BQ")) {
+    bq = std::atoi(e);            // 8 keeps the narrow (tg-accumulator) kernel
+  }
+  if (bq != 16 && bq != 32 && bq != 64) { return; }
+  const std::string fn = "sdpa_full_mma2_d" + std::to_string(mid_d) + "_q" +
+                         std::to_string(bq) + "_f16";
+  _fn_sdpa_full_wide = _lib_sdpa_mma.function(fn);
+  if (_fn_sdpa_full_wide.valid()) { _attn_bq = bq; }
+}
+
 MetalKrea2Vae::Conv
 MetalKrea2Vae::load_conv1x1_(WeightSet& ws, const std::string& nm)
 {
@@ -296,6 +314,7 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     if (fn != nullptr) {
       m->_lib_sdpa_mma = mc->load_library("sdpa_mma");
       m->_fn_sdpa_full_mma = m->_lib_sdpa_mma.function(fn);
+      m->load_wide_attn_(mid_d);
     }
     // Prefer matmul2d flash only where the matrix units make it worthwhile
     // (M5); on M4/older the simdgroup_matrix flash (_fn_sdpa_full_smm) wins.
@@ -892,8 +911,13 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       const bool smm = _fn_sdpa_full_smm.valid() && (C % 64 == 0) && (C <= 512);
       const bool mma2 = _fn_sdpa_full_mma.valid() && _use_attn_mma2;
       if (mma2 && !(smm && std::getenv("VPIPE_KREA2_VAE_ATTN_SMM"))) {
-        enc.set_function(_fn_sdpa_full_mma);           // matmul2d (M5)
-        enc.dispatch({4 * 32, 1, (unsigned)((hw + 7) / 8)}, {4 * 32, 1, 1});
+        // Wide query tile where it loaded (see load_wide_attn_): same math,
+        // fewer threadgroups, so proportionally less K/V streamed.
+        const int bq = _fn_sdpa_full_wide.valid() ? _attn_bq : 8;
+        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
+        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
+        enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)},
+                     {nt, 1, 1});
       } else if (smm) {
         enc.set_function(_fn_sdpa_full_smm);           // simdgroup_matrix
         const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
@@ -1248,8 +1272,14 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       enc.set_constant(6, C); enc.set_constant(7, 1); enc.set_constant(8, 1);
       enc.set_constant(9, (int)hwv); enc.set_constant(10, (int)hwv);
       if (_fn_sdpa_full_mma.valid()) {         // matrix-core FULL flash attn
-        enc.set_function(_fn_sdpa_full_mma);
-        enc.dispatch({4 * 32, 1, (unsigned)((hwv + 7) / 8)}, {4 * 32, 1, 1});
+        // Wide tile only where the tile sweep behind it was run (M5). On an
+        // emulated matmul2d the wider tile is unmeasured, so keep BQ=8 there.
+        const int bq =
+            (_fn_sdpa_full_wide.valid() && _use_attn_mma2) ? _attn_bq : 8;
+        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
+        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
+        enc.dispatch({nt, 1, (unsigned)(((int)hwv + bq - 1) / bq)},
+                     {nt, 1, 1});
       } else {                                 // scalar O(N^2) fallback
         enc.set_function(_fn_sdpa);
         enc.dispatch({32, 1, (unsigned)hwv}, {32, 1, 1});

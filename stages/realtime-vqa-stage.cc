@@ -9,6 +9,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
@@ -628,7 +629,7 @@ RealtimeVqaStage::resample_frame_(const std::uint8_t* rgb, int H, int W,
   if (W == _vlm_in_w && H == _vlm_in_h) { return rgb; }
 
   namespace mcn = metal_compute;
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (!mc || !mc->valid()) {
     if (!_resample_warned) {
       session()->warn(fmt(
@@ -702,7 +703,7 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
 
   (void)ctx;
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (!mgr) {
     session()->error(fmt(
         "RealtimeVqaStage('{}'): no GenerativeModelManager", this->id()));
@@ -1050,7 +1051,7 @@ RealtimeVqaStage::sync_questions_record_(const std::string& camera_name,
   // frame; we log warns and move on.
   _questions_checked_cameras.insert(camera_name);
 
-  LmdbEnv* env = session() ? session()->lmdb_env() : nullptr;
+  LmdbEnv* env = session() ? session()->services()->lmdb_env() : nullptr;
   if (!env) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): session lmdb_env() unavailable; "
@@ -1115,7 +1116,7 @@ RealtimeVqaStage::log_scene_qa_(const std::string&              camera_name,
                                 const std::string&              description,
                                 const std::vector<std::string>& answers)
 {
-  LmdbEnv* env = session() ? session()->lmdb_env() : nullptr;
+  LmdbEnv* env = session() ? session()->services()->lmdb_env() : nullptr;
   if (!env) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): session lmdb_env() unavailable; "
@@ -2348,7 +2349,7 @@ RealtimeVqaStage::m_process_(RuntimeContext& ctx)
     const metal_compute::SharedBuffer* src_buf = nullptr;
     if (_m_coreml && tbp->is_contiguous()
         && tbp->storage_class() == TensorStorageClass::Shared) {
-      auto* mc = session()->metal_compute();
+      auto* mc = session()->services()->metal_compute();
       if (mc) {
         fsb = metal_compute::from_tensor_beat(*mc, *tbp);
         if (!fsb.empty()) { src_buf = &fsb; }

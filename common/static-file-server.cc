@@ -1,7 +1,7 @@
 #include "common/static-file-server.h"
 
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 
 #include <arpa/inet.h>
 #include <cctype>
@@ -106,12 +106,12 @@ parse_uint_(string_view s, size_t* out)
 
 }
 
-StaticFileServer::StaticFileServer(const SessionContextIntf* s,
+StaticFileServer::StaticFileServer(const LogSinkIntf* s,
                                    string                    doc_root,
                                    string                    bind_address,
                                    int                       port,
                                    const InMemoryBlobStore*  blob_store)
-  : SessionMember(s)
+  : _log(s)
   , _doc_root(std::move(doc_root))
   , _bind_address(std::move(bind_address))
   , _port(port)
@@ -229,7 +229,7 @@ StaticFileServer::start()
   }
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
-    session()->warn(fmt(
+    _log->warn(fmt(
         "StaticFileServer: socket() failed: {}", strerror(errno)));
     return false;
   }
@@ -246,7 +246,7 @@ StaticFileServer::start()
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
   } else if (::inet_pton(AF_INET, _bind_address.c_str(),
                          &addr.sin_addr) != 1) {
-    session()->warn(fmt(
+    _log->warn(fmt(
         "StaticFileServer: invalid bind_address '{}'", _bind_address));
     ::close(fd);
     return false;
@@ -254,14 +254,14 @@ StaticFileServer::start()
 
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr),
              sizeof addr) < 0) {
-    session()->warn(fmt(
+    _log->warn(fmt(
         "StaticFileServer: bind({}:{}) failed: {}",
         _bind_address, _port, strerror(errno)));
     ::close(fd);
     return false;
   }
   if (::listen(fd, 16) < 0) {
-    session()->warn(fmt(
+    _log->warn(fmt(
         "StaticFileServer: listen() failed: {}", strerror(errno)));
     ::close(fd);
     return false;

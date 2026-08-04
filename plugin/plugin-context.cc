@@ -3,6 +3,7 @@
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include "vpipe-version.h"
 
@@ -70,7 +71,7 @@ VpipePluginContext::register_metal_library(std::string_view name,
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
   metal_compute::MetalCompute* mc =
-      _session ? _session->metal_compute() : nullptr;
+      _session ? _session->services()->metal_compute() : nullptr;
   if (mc == nullptr || !mc->valid()) {
     if (_session != nullptr) {
       _session->warn(fmt(
@@ -99,7 +100,7 @@ VpipePluginContext::register_metal_library_file(std::string_view name,
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
   metal_compute::MetalCompute* mc =
-      _session ? _session->metal_compute() : nullptr;
+      _session ? _session->services()->metal_compute() : nullptr;
   if (mc == nullptr || !mc->valid()) {
     if (_session != nullptr) {
       _session->warn(fmt(

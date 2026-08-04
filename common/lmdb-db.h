@@ -1,7 +1,7 @@
 #ifndef LMDB_DB_H
 #define LMDB_DB_H
 
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 #include <lmdb.h>
 #include <optional>
 #include <string>
@@ -9,7 +9,6 @@
 
 namespace vpipe {
 
-class SessionContextIntf;
 class LmdbEnv;
 class LmdbTxn;
 
@@ -22,15 +21,15 @@ class LmdbTxn;
 // env (two concurrent constructions would queue at LMDB's writer mutex,
 // which is correct but easy to mis-time). After that, an LmdbDb may be
 // shared freely; per-call thread-safety follows the LmdbTxn passed in.
-class LmdbDb : public SessionMember {
+class LmdbDb {
 public:
   LmdbDb(LmdbEnv& env, std::string_view name, bool create_if_missing = true);
 
   // Explicit-context overload. Uses `ctx` for runtime error routing
-  // instead of `env.session()` -- see LmdbTxn for the same pattern
+  // instead of `env.log()` -- see LmdbTxn for the same pattern
   // and DbLogDelegate for the use case (recursion firewall).
   LmdbDb(LmdbEnv&                  env,
-         const SessionContextIntf* ctx,
+         const LogSinkIntf* ctx,
          std::string_view          name,
          bool                      create_if_missing = true);
 
@@ -38,7 +37,7 @@ public:
   LmdbDb& operator=(const LmdbDb&) = delete;
   LmdbDb(LmdbDb&&) noexcept;
   LmdbDb& operator=(LmdbDb&&) noexcept;
-  ~LmdbDb() override                  = default;
+  ~LmdbDb()                           = default;
 
   // get: returns nullopt on MDB_NOTFOUND. The returned view points into
   //      LMDB-managed memory and is only valid until the next op on `txn`
@@ -59,7 +58,14 @@ public:
   MDB_dbi          dbi()  const noexcept;
   std::string_view name() const noexcept;
 
+  // The sink these report through. Public because the sibling LMDB
+  // types chain off it (LmdbTxn(env), LmdbDb(env), LmdbCursor(txn))
+  // exactly where they used to chain off env.session().
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   MDB_dbi     _dbi;
   std::string _name;
 };

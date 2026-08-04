@@ -2,6 +2,7 @@
 
 #include "common/lmdb-env.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <lmdb.h>
 
@@ -320,7 +321,7 @@ fstr_get(const FlexData::ConstObjectView& o, const char* key,
 FlexData
 DbBrowser::list_databases(string& err)
 {
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) {
     err = "no database available (lmdb_env)";
     return FlexData::make_object();
@@ -388,7 +389,7 @@ DbBrowser::query_keys(const FlexData& req, string& err)
   if (page < 0) { page = 0; }
   if (dbname.empty()) { err = "no database selected"; return FlexData::make_object(); }
 
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) { err = "no database available"; return FlexData::make_object(); }
   MDB_env* e = env->raw();
   MDB_txn* txn = nullptr;
@@ -696,7 +697,7 @@ DbBrowser::stream_scan(const FlexData& req,
     }
   }
 
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) { err = "no database available"; return; }
   MDB_env* e = env->raw();
   MDB_txn* txn = nullptr;
@@ -833,7 +834,7 @@ DbBrowser::read_value(const FlexData& req, string& err)
   if (!keyOpt) { err = "bad key encoding"; return FlexData::make_object(); }
   const string key = *keyOpt;
 
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) { err = "no database available"; return FlexData::make_object(); }
   MDB_env* e = env->raw();
   MDB_txn* txn = nullptr;
@@ -902,7 +903,7 @@ DbBrowser::delete_key(const FlexData& req, string& err)
   if (!keyOpt) { err = "bad key encoding"; return FlexData::make_object(); }
   const string key = *keyOpt;
 
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) { err = "no database available"; return FlexData::make_object(); }
   MDB_env* e = env->raw();
   MDB_txn* txn = nullptr;
@@ -941,7 +942,7 @@ DbBrowser::drop_database(const FlexData& req, string& err)
   const string dbname = fstr_get(root, "db");
   if (dbname.empty()) { err = "no database selected"; return FlexData::make_object(); }
 
-  LmdbEnv* env = _sctx ? _sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = _sctx ? _sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) { err = "no database available"; return FlexData::make_object(); }
   MDB_env* e = env->raw();
   MDB_txn* txn = nullptr;

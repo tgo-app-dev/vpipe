@@ -71,6 +71,54 @@ class MetalFlux2Transformer {
     // matrix-core GPUs at int8 quality (rel-L2 ~1e-2 per GEMM). Env
     // VPIPE_I8_GEMM=0|1 overrides.
     bool  i8_gemm = false;
+    // The FLUX.2-klein-9b-kv RECIPE. It is a property of the CHECKPOINT, not
+    // an optimization: that DiT is distilled with reference tokens isolated
+    // from the rest of the sequence, so running it under the plain
+    // (fully-joint) attention produces WRONG images, and running plain
+    // klein-9B under this one is equally wrong. Two changes vs plain:
+    //   - reference tokens SELF-ATTEND ONLY; text + generated tokens still
+    //     attend over everything (BFL causal_attn_fn).
+    //   - reference tokens carry their own modulation, derived from a FIXED
+    //     timestep 0 rather than the step's sigma (BFL ref_fixed_timestep +
+    //     _blend_double_mods / _blend_single_mods), a reference latent being
+    //     clean rather than noised.
+    // NOTHING on disk distinguishes the two checkpoints -- identical
+    // model_index.json, identical transformer/config.json, identical tensor
+    // names -- so this cannot be auto-detected and must be set by the caller
+    // (text-to-image's `klein_kv` config key).
+    // Isolating the references is also what makes their K/V independent of
+    // the denoising step, which is what KvCache then exploits.
+    bool  klein_kv = false;
+  };
+
+  // Cross-step reference K/V cache -- the point of the -kv checkpoint.
+  //
+  // Under `klein_kv` reference tokens attend only to themselves, so their
+  // per-block K/V depend on the reference latents alone and NOT on the
+  // timestep or the generated tokens: computed once at the first denoising
+  // step they stay valid for every later one. A cached step then drops the
+  // reference tokens from the sequence entirely (running [text, generated]
+  // rather than [text, generated, refs]) and splices the retained K/V back in
+  // as extra attention keys, so the reference projections AND the attention
+  // work over reference tokens both leave steps 1..N-1.
+  //
+  // Usage: default-construct one, keep it alive across the sampler loop, hand
+  // the SAME cache to every forward_dit call. The first call populates it and
+  // each later one reuses it. It records the geometry it was built for and
+  // forward_dit rebuilds it when that changes, so a stale cache costs a slow
+  // step, never a wrong one. Ignored unless the model is `klein_kv` and the
+  // call passes references.
+  struct KvCache {
+    // Per block (n_double + n_single entries, double blocks first) the
+    // reference rows of the head-major K and V, [n_heads, ref_seq, head_dim]
+    // bf16 -- already q/k-RMSNorm'd and RoPE-rotated, i.e. exactly the form
+    // the attention kernel consumes.
+    std::vector<metal_compute::SharedBuffer> k, v;
+    int ref_seq  = 0;   // total reference tokens (0 = unpopulated)
+    int text_seq = 0;   // geometry this cache was built for
+    int img_seq  = 0;
+    bool populated() const { return ref_seq > 0 && !k.empty(); }
+    void clear() { k.clear(); v.clear(); ref_seq = 0; }
   };
 
   // `stream_blocks` (memory-bounded, for small boxes): the double + single
@@ -136,13 +184,18 @@ class MetalFlux2Transformer {
   // `refs` are optional reference images (up to a handful); each is embedded by
   // the same x_embedder, appended to the image-token stream with its own RoPE
   // T offset, and attended jointly. Empty (the default) = plain text-to-image.
+  // `kv` is the optional cross-step reference cache (klein_kv models only; see
+  // KvCache): pass the same one every step and the reference tokens are
+  // projected and attended once instead of per step. nullptr = recompute them
+  // every step, which is what plain klein-9B always does.
   // Returns the [img_seq, out_channels] predicted velocity (generated tokens
   // only; reference tokens are not returned). Empty on failure.
   metal_compute::SharedBuffer
   forward_dit(const metal_compute::SharedBuffer& context, int text_seq,
               const metal_compute::SharedBuffer& latents, int img_seq,
               int grid_h, int grid_w, float timestep, float guidance = -1.0f,
-              const std::vector<RefImage>& refs = {});
+              const std::vector<RefImage>& refs = {},
+              KvCache* kv = nullptr);
 
   const Config& config() const { return _cfg; }
 

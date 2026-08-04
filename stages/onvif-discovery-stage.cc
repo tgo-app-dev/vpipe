@@ -10,6 +10,7 @@
 #include "common/vpipe-format.h"
 #include "common/ws-discovery.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 
 #include <algorithm>
@@ -350,7 +351,7 @@ OnvifDiscoveryStage::process(RuntimeContext& ctx)
         this->id()));
   }
 
-  LmdbEnv* env = session()->lmdb_env();
+  LmdbEnv* env = session()->services()->lmdb_env();
   if (!env) {
     session()->error(fmt(
         "OnvifDiscoveryStage('{}'): session lmdb_env() unavailable",

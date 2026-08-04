@@ -181,7 +181,7 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
                           const std::vector<std::string>& prompts, int steps,
                           int height, int width, std::uint64_t seed,
                           const std::string& out_dir, std::string* err,
-                          const std::function<bool()>& stop)
+                          const std::function<bool()>& stop, bool klein_kv)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
@@ -310,8 +310,10 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   if (const char* e = std::getenv("VPIPE_FLUX2_CALIB_PIN_FRAC")) {
     pin_frac = std::atof(e);
   }
-  auto dit = MetalFlux2Transformer::load(
-      dit_dir, mc, MetalFlux2Transformer::Config{}, stream_blocks, pin_frac);
+  MetalFlux2Transformer::Config dcfg;
+  dcfg.klein_kv = klein_kv;
+  auto dit = MetalFlux2Transformer::load(dit_dir, mc, dcfg, stream_blocks,
+                                         pin_frac);
   if (!dit) { return fail("flux2 calib: DiT load failed: " + dit_dir); }
   dit->set_stream_stop(stop);
   if (sess && stream_blocks) {

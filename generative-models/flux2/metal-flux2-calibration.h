@@ -26,11 +26,18 @@ namespace genai {
 // boundaries. Returns false + *err on failure. Reuses
 // default_dit_calibration_prompts() (Krea-2 calibration) when the caller passes
 // none.
+//
+// `klein_kv` marks the checkpoint as FLUX.2-klein-9b-kv. It matters here
+// because the sweep conditions on a REFERENCE image, and that checkpoint
+// isolates reference tokens from the rest of the sequence: calibrating it
+// under the plain fully-joint attention would gather the abs-max of a
+// distribution the model never actually sees, and bake that into the clip.
 bool collect_flux2_calibration(
     metal_compute::MetalCompute* mc, const std::string& model_root,
     const std::vector<std::string>& prompts, int steps, int height, int width,
     std::uint64_t seed, const std::string& out_dir, std::string* err,
-    const std::function<bool()>& stop = [] { return false; });
+    const std::function<bool()>& stop = [] { return false; },
+    bool klein_kv = false);
 
 }  // namespace genai
 }  // namespace vpipe

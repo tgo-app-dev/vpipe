@@ -595,6 +595,54 @@ model_catalog()
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // FLUX.2-klein-9b-kv (black-forest-labs) -- the KV-cached sibling of
+    // klein-9B. Same PARAMETER shapes (Klein9BParams is byte-identical: the
+    // repo layout matches klein-9B file for file -- 2 transformer shards, the
+    // same 4-shard 8B Qwen3 text_encoder, one VAE) and the same
+    // guidance-distilled 4-step recipe, so the loader, quantizer and LoRA
+    // fusion need nothing new. What differs is the ATTENTION TOPOLOGY, and it
+    // is not a drop-in:
+    //   - Token order is [text, refs, image] -- references BEFORE the
+    //     generated tokens -- where plain klein-9B (and our forward_dit)
+    //     appends references AFTER them.
+    //   - Reference tokens SELF-ATTEND ONLY. In plain klein-9B they join the
+    //     full joint attention; here they see neither text nor the generated
+    //     image, which is exactly what makes their K/V independent of the
+    //     denoising step and therefore cacheable.
+    // The weights are distilled FOR that masking, so running this checkpoint
+    // through the plain flux2 forward (or the reverse) is not merely slower,
+    // it is wrong. The payoff is that a multi-reference edit computes the
+    // reference K/V once at step 0 and reuses it for the remaining steps:
+    // BFL measure 1.21-2.66x, largest with several references at small output
+    // sizes.
+    // GATED: the FLUX Non-Commercial License must be accepted on the repo
+    // page and an HF token supplied -- an unauthenticated fetch 401s.
+    // `files` mirrors the klein-9B pin: the diffusers subfolders, skipping the
+    // redundant top-level flux-2-klein-9b-kv.safetensors (a second copy of the
+    // transformer, 18.2 GB) and the three sample images (~6.3 MB).
+    {.family = "FLUX", .version = "2", .param_class = "9B",
+     .variant = "klein KV-cached guidance-distilled bf16 (black-forest-labs)",
+     .hf_path = "black-forest-labs/FLUX.2-klein-9b-kv",
+     .model_type = "flux2",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // ---- Mage-Flow (microsoft) -- native-resolution t2i + image edit --
     // A 4B flow-matching family in the SAME split-stage diffusers shape as
     // Krea-2 / FLUX.2 (encoder -> DiT stage + separate VAE stages). Two

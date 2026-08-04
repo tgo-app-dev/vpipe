@@ -7,6 +7,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
@@ -174,7 +175,7 @@ ModelRegisterStage::register_once()
                 fs::path(artifact).filename().string()));
   }
 
-  LmdbEnv* env = s->lmdb_env();
+  LmdbEnv* env = s->services()->lmdb_env();
   if (!env) {
     s->warn(fmt("ModelRegisterStage('{}'): session lmdb_env() unavailable",
                 this->id()));

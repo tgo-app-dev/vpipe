@@ -6,6 +6,7 @@
 #include "interfaces/log-delegate-intf.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "common/perf-buffer.h"
 #include "vpipe/session-intf.h"
 #include <atomic>
@@ -30,7 +31,8 @@ namespace genai { class GenerativeModelManager; }
 namespace metal_compute { class MetalCompute; }
 
 class Session final : public SessionIntf,
-                      public SessionContextIntf
+                      public SessionContextIntf,
+                      public SessionServicesIntf
 {
 public:
   // Config string is one of:
@@ -169,7 +171,7 @@ public:
   // Lazily constructs (on first call) the per-session FFmpegLibraries
   // instance under a once_flag and returns it. See SessionContextIntf
   // for the contract.
-  const FFmpegLibraries* ffmpeg_libraries() const override;
+  const FFmpegLibraries* ffmpeg_libraries() const;
 
   // Lazily opens (on first call) the per-session LmdbEnv at
   // db.path / db.map_size_mb (configured at session boot). When
@@ -178,7 +180,7 @@ public:
   // only if the env failed to open (the failure is reported
   // through the active log delegate). Concurrent first calls
   // serialise on an internal once_flag.
-  LmdbEnv* lmdb_env() const override;
+  LmdbEnv* lmdb_env() const;
 
   // Confine a stage-supplied local file path to the session filesystem
   // sandbox (see SessionContextIntf::confine_path). Passthrough when the
@@ -203,17 +205,31 @@ public:
   // Session-shared CoreML model cache. Lazily constructed on first
   // call. Returns nullptr on non-Apple builds. See SessionContextIntf
   // for the contract.
-  CoreMLModelManager* coreml_model_manager() const override;
+  CoreMLModelManager* coreml_model_manager() const;
 
   // Session-shared language-model manager. Lazily constructed on
   // first call. Returns nullptr when the metal-compute LLM subsystem
   // is unavailable. See SessionContextIntf for the contract.
-  genai::GenerativeModelManager* generative_model_manager() const override;
+  genai::GenerativeModelManager* generative_model_manager() const;
 
   // Session-shared Metal compute framework. Lazily constructed on
   // first call. Returns nullptr on non-Apple builds. See
   // SessionContextIntf for the contract.
-  metal_compute::MetalCompute* metal_compute() const override;
+  metal_compute::MetalCompute* metal_compute() const;
+
+  // This session IS its own service bundle -- the subsystems it lazily
+  // constructs are the ones callers ask for. Keeping the accessors on
+  // Session as well means the ~450 direct `sess.metal_compute()` call
+  // sites (mostly tests) are untouched by the move.
+  SessionServicesIntf* services() const override
+  {
+    return const_cast<Session*>(this);
+  }
+
+  // The keyed lookup behind SessionServicesIntf::service<T>(). Each id
+  // maps to the lazily-constructed accessor above, so a service is still
+  // built on first use whichever way it is reached.
+  void* find_service(std::string_view id) const override;
 
   // Parsed config tree. Empty object when no config was supplied.
   const FlexData& config() const noexcept { return _config; }

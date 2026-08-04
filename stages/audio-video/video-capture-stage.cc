@@ -6,6 +6,7 @@
 #include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 
 #include <atomic>
@@ -291,7 +292,7 @@ VideoCaptureStage::process(RuntimeContext& ctx)
 {
   using namespace std::chrono;
 
-  const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (!libs || !libs->valid()) {
     session()->error(fmt(
         "VideoCaptureStage('{}'): FFmpeg libraries unavailable", this->id()));

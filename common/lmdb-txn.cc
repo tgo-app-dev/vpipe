@@ -1,17 +1,17 @@
 #include "common/lmdb-txn.h"
 #include "common/lmdb-env.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 
 namespace vpipe {
 
 LmdbTxn::LmdbTxn(LmdbEnv& env, Mode mode)
-  : LmdbTxn(env, mode, env.session())
+  : LmdbTxn(env, mode, env.log())
 {
 }
 
-LmdbTxn::LmdbTxn(LmdbEnv& env, Mode mode, const SessionContextIntf* ctx)
-  : SessionMember(ctx)
+LmdbTxn::LmdbTxn(LmdbEnv& env, Mode mode, const LogSinkIntf* ctx)
+  : _log(ctx)
   , _txn(nullptr)
   , _mode(mode)
   , _done(false)
@@ -21,12 +21,12 @@ LmdbTxn::LmdbTxn(LmdbEnv& env, Mode mode, const SessionContextIntf* ctx)
   if (rc != MDB_SUCCESS) {
     _txn  = nullptr;
     _done = true;
-    session()->error(fmt("mdb_txn_begin failed: {}", mdb_strerror(rc)));
+    _log->error(fmt("mdb_txn_begin failed: {}", mdb_strerror(rc)));
   }
 }
 
 LmdbTxn::LmdbTxn(LmdbTxn&& other) noexcept
-  : SessionMember(other.session())
+  : _log(other._log)
   , _txn(other._txn)
   , _mode(other._mode)
   , _done(other._done)
@@ -63,7 +63,7 @@ void
 LmdbTxn::commit()
 {
   if (!_txn || _done) {
-    session()->error(fmt("lmdb commit on inactive txn"));
+    _log->error(fmt("lmdb commit on inactive txn"));
     return;
   }
   MDB_txn* t = _txn;
@@ -71,7 +71,7 @@ LmdbTxn::commit()
   _done = true;
   int rc = mdb_txn_commit(t);
   if (rc != MDB_SUCCESS) {
-    session()->error(fmt("mdb_txn_commit failed: {}", mdb_strerror(rc)));
+    _log->error(fmt("mdb_txn_commit failed: {}", mdb_strerror(rc)));
   }
 }
 

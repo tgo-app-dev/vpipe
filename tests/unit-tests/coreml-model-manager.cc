@@ -1,7 +1,7 @@
 // CoreMLModelManager tests.
 //
 // The unconditional tests verify cache-miss behaviour and the
-// session->coreml_model_manager() wiring. End-to-end load /
+// session->services()->coreml_model_manager() wiring. End-to-end load /
 // reference-count / serialisation tests need a real model and are
 // gated on:
 //
@@ -12,6 +12,7 @@
 // When the model env var is unset, those tests pass trivially.
 
 #include "minitest.h"
+#include "interfaces/session-services-intf.h"
 
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #ifdef VPIPE_BUILD_APPLE_SILICON

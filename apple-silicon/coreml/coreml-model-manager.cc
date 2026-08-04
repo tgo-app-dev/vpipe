@@ -2,7 +2,7 @@
 
 #include "apple-silicon/coreml/coreml-cpp/CoreML.hpp"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 
 #include <CoreVideo/CVPixelBuffer.h>
 
@@ -341,7 +341,7 @@ coreml_sweep_stale_cache_(const std::filesystem::path& cache_dir,
 }
 
 string
-canonicalize_(const SessionContextIntf* session, string_view path)
+canonicalize_(const LogSinkIntf* session, string_view path)
 {
   // canonical() throws on missing files. We preserve the original
   // path on failure so the model load can still proceed (the load
@@ -366,10 +366,10 @@ canonicalize_(const SessionContextIntf* session, string_view path)
 
 // ---- CoreMLLoadedModel ----------------------------------------------
 
-CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
+CoreMLLoadedModel::CoreMLLoadedModel(const LogSinkIntf* session,
                                      string_view               path,
                                      int                       compute_units)
-  : SessionMember(session)
+  : _log(session)
   , _model(nullptr)
   , _path(path)
   , _compute_units(compute_units)
@@ -403,14 +403,14 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
     if (cache_hit) {
       NS::String* cached_ns = ns_str_(cache_path.string());
       url = NS::URL::fileURLWithPath(cached_ns);
-      this->session()->log_debug(fmt(
+      _log->log_debug(fmt(
           "CoreMLLoadedModel: compile cache hit for '{}' -> '{}'",
           _path, cache_path.string()));
     } else {
       NS::URL* compiled = CML::Model::compileModelAtURL(url, &err);
       if (err || !compiled) {
         pool->release();
-        this->session()->error(fmt(
+        _log->error(fmt(
             "CoreMLLoadedModel: compileModelAtURL failed for '{}'",
             _path));
         return;
@@ -427,7 +427,7 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
           std::error_code ec_mk;
           std::filesystem::create_directories(cache_dir, ec_mk);
           if (ec_mk) {
-            this->session()->log_debug(fmt(
+            _log->log_debug(fmt(
                 "CoreMLLoadedModel: mkdir '{}' failed ({}); leaving "
                 "compiled bundle at tmp '{}'",
                 cache_dir.string(), ec_mk.message(),
@@ -441,7 +441,7 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
               coreml_sweep_stale_cache_(
                   cache_dir, _path,
                   cache_path.filename().string());
-              this->session()->log_debug(fmt(
+              _log->log_debug(fmt(
                   "CoreMLLoadedModel: moved compiled '{}' to cache "
                   "'{}'", _path, cache_path.string()));
             } else {
@@ -454,7 +454,7 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
                 NS::String* cached_ns = ns_str_(cache_path.string());
                 url = NS::URL::fileURLWithPath(cached_ns);
               } else {
-                this->session()->log_debug(fmt(
+                _log->log_debug(fmt(
                     "CoreMLLoadedModel: rename '{}' -> '{}' failed "
                     "({}); leaving compiled bundle at tmp",
                     tmp_path.string(), cache_path.string(),
@@ -475,7 +475,7 @@ CoreMLLoadedModel::CoreMLLoadedModel(const SessionContextIntf* session,
   cfg->release();
   if (err || !model) {
     pool->release();
-    this->session()->error(fmt(
+    _log->error(fmt(
         "CoreMLLoadedModel: modelWithContentsOfURL failed for '{}'",
         _path));
     return;
@@ -514,8 +514,8 @@ CoreMLLoadedModel::predict(span<const CoreMLPredictInput> inputs,
   }
 
   auto warn = [this](const VpipeFormat& m) {
-    if (this->session()) {
-      this->session()->warn(m);
+    if (_log) {
+      _log->warn(m);
     }
   };
 
@@ -808,15 +808,15 @@ CoreMLModelManager::KeyHash::operator()(const Key& k) const noexcept
   return h;
 }
 
-CoreMLModelManager::CoreMLModelManager(const SessionContextIntf* session)
-  : SessionMember(session)
+CoreMLModelManager::CoreMLModelManager(const LogSinkIntf* session)
+  : _log(session)
 {
 }
 
 shared_ptr<CoreMLLoadedModel>
 CoreMLModelManager::load(string_view path, int compute_units)
 {
-  Key key{ canonicalize_(session(), path), compute_units };
+  Key key{ canonicalize_(_log, path), compute_units };
 
   // Fast path: existing live entry.
   {
@@ -836,10 +836,10 @@ CoreMLModelManager::load(string_view path, int compute_units)
   shared_ptr<CoreMLLoadedModel> sp;
   try {
     sp = make_shared<CoreMLLoadedModel>(
-        session(), key.path, key.compute_units);
+        _log, key.path, key.compute_units);
   } catch (const exception& e) {
-    if (session()) {
-      session()->warn(fmt(
+    if (_log) {
+      _log->warn(fmt(
           "CoreMLModelManager::load('{}', compute_units={}): {}",
           key.path, key.compute_units, e.what()));
     }

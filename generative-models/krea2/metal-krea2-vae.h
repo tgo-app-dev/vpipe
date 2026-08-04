@@ -233,6 +233,23 @@ class MetalKrea2Vae {
   // from _lib_sdpa. Preferred over _fn_sdpa_full_mma when no matrix cores.
   metal_compute::ComputeFunction _fn_sdpa_full_smm;
   bool _use_attn_mma2 = false;   // prefer matmul2d flash (true on M5 only)
+  // Wide-query-tile twin of the above (sdpa_full_mma2_dN_qBQ_f16). Identical
+  // math and f32 accumulators; it keeps the O accumulator in registers instead
+  // of threadgroup memory, which is what lets the query tile exceed 8 and so
+  // divides the K/V bandwidth this attention is bound by. MEASURED 3.2x on the
+  // mid block at a 1024x768 latent. VPIPE_KREA2_VAE_ATTN_BQ picks the tile
+  // (8 = the narrow kernel).
+  metal_compute::ComputeFunction _fn_sdpa_full_wide;
+  int _attn_bq = 0;              // query tile of _fn_sdpa_full_wide (0 = none)
+  static constexpr int kAttnBq = 32;
+  void load_wide_attn_(int mid_d);
+  // Simdgroup count the kernel of query tile `bq` was instantiated with; the
+  // dispatch has to match it exactly (matmul2d's execution scope is UB
+  // otherwise). Mirrors the SAW_INST table in sdpa_mma.metal.
+  static unsigned attn_threads_(int bq)
+  {
+    return (bq == 16 ? 4u : bq == 32 ? 8u : 16u) * 32u;
+  }
 
   // M5-only matrix-core dense GEMM (matmul2d/NAX): the conv/1x1 GEMMs run on the
   // hardware matrix units instead of steel simdgroup_matrix. Gated on

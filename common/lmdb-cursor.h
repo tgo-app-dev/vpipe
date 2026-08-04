@@ -1,13 +1,12 @@
 #ifndef LMDB_CURSOR_H
 #define LMDB_CURSOR_H
 
-#include "common/session-member.h"
+#include "interfaces/log-sink-intf.h"
 #include <lmdb.h>
 #include <string_view>
 
 namespace vpipe {
 
-class SessionContextIntf;
 class LmdbTxn;
 class LmdbDb;
 
@@ -16,8 +15,8 @@ class LmdbDb;
 //
 // All step / seek methods return true on hit; the out views point into
 // LMDB-managed memory valid until the next cursor op or txn end. End-of-
-// range returns false. Real LMDB errors throw via session()->error().
-class LmdbCursor : public SessionMember {
+// range returns false. Real LMDB errors throw via the log sink's error().
+class LmdbCursor {
 public:
   LmdbCursor(LmdbTxn& txn, const LmdbDb& db);
 
@@ -25,7 +24,7 @@ public:
   LmdbCursor& operator=(const LmdbCursor&) = delete;
   LmdbCursor(LmdbCursor&&) noexcept;
   LmdbCursor& operator=(LmdbCursor&&) noexcept;
-  ~LmdbCursor() override;
+  ~LmdbCursor();
 
   bool first(std::string_view& k, std::string_view& v);
   bool last (std::string_view& k, std::string_view& v);
@@ -39,7 +38,14 @@ public:
 
   MDB_cursor* raw() const noexcept;
 
+  // The sink these report through. Public because the sibling LMDB
+  // types chain off it (LmdbTxn(env), LmdbDb(env), LmdbCursor(txn))
+  // exactly where they used to chain off env.session().
+  const LogSinkIntf* log() const noexcept { return _log; }
+
 private:
+  const LogSinkIntf* _log = nullptr;
+
   MDB_cursor* _cur;
 };
 

@@ -7,6 +7,7 @@
 #include "common/job.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 
 #include <algorithm>
@@ -144,7 +145,7 @@ ImageResampleStage::spec() const noexcept
 Job
 ImageResampleStage::initialize(RuntimeContext&)
 {
-  _mc = session() ? session()->metal_compute() : nullptr;
+  _mc = session() ? session()->services()->metal_compute() : nullptr;
   const string ws = _out_w > 0 ? std::to_string(_out_w) : string("auto");
   const string hs = _out_h > 0 ? std::to_string(_out_h) : string("auto");
   session()->info(fmt(

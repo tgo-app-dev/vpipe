@@ -7,6 +7,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -819,7 +820,7 @@ DiffusionConditionerStage::ensure_loaded_()
         "inert", this->id()));
     return;
   }
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   if (mc == nullptr) {
     session()->error(fmt(
         "DiffusionConditionerStage('{}'): no metal-compute backend; inert",
@@ -937,7 +938,7 @@ DiffusionConditionerStage::unload_encoder_()
 bool
 DiffusionConditionerStage::reload_encoder_()
 {
-  auto* mc = session() ? session()->metal_compute() : nullptr;
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _enc_dir.empty()) { return false; }
   if (!load_encoder_(mc)) {
     session()->error(fmt(
@@ -1201,7 +1202,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                                    int& n_real_out,
                                    const SharedBuffer& vtok, int n_img) const
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   const int EH = _enc_hidden;
 
   if (_family == "flux2") {
@@ -1854,7 +1855,7 @@ DiffusionConditionerStage::screen_(const std::string& prompt,
 Job
 DiffusionConditionerStage::process(RuntimeContext& ctx)
 {
-  auto* mc = session()->metal_compute();
+  auto* mc = session()->services()->metal_compute();
   if (mc == nullptr) { co_return; }
 
   // Post-barrier: every peer has loaded, so the footprint is real.

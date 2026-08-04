@@ -8,6 +8,7 @@
 #include "common/text-stream-chunk.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
@@ -495,7 +496,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // through the LM manager itself (MLX: Session::mlx_runtime() worker;
   // metal: inline on the metal-compute device), so we don't pin any GPU
   // stream here.
-  auto* mgr = session() ? session()->generative_model_manager()
+  auto* mgr = session() ? session()->services()->generative_model_manager()
                         : nullptr;
   if (!mgr) {
     session()->error(fmt(
@@ -787,7 +788,7 @@ TextChatStage::process(RuntimeContext& ctx)
         && (_mvis || _mgvis || (_mguni && _mguni->has_vision()));
     const bool audio_ok = tpl->audio_pad_token_id() >= 0
         && (_m_audio || _mg_audio || (_mguni && _mguni->has_audio()));
-    const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+    const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
     for (auto& seg : segs) {
       if (seg.kind == media_line::Segment::Kind::Text) {
         genai::MediaChunk c;

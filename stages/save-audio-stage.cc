@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include "apple-silicon/tensor-beat.h"
 
@@ -317,7 +318,7 @@ SaveAudioStage::encode_ffmpeg_(const std::string& path, const float* pcm,
                                  std::size_t n_frames, int channels,
                                  int sample_rate, const std::string& format)
 {
-  const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (!libs || !libs->valid()) {
     session()->error(fmt(
         "SaveAudioStage('{}'): ffmpeg unavailable for format '{}'",
@@ -681,7 +682,7 @@ SaveAudioStage::process(RuntimeContext& ctx)
   // ffmpeg is unavailable falls back to WAV (extension rewritten).
   std::string format = _format;
   if (format != "wav") {
-    const FFmpegLibraries* libs = session()->ffmpeg_libraries();
+    const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
     if (!libs || !libs->valid()) {
       session()->warn(fmt(
           "SaveAudioStage('{}'): format '{}' requested but ffmpeg is "

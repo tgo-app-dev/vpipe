@@ -1,4 +1,5 @@
 #include "common/db-log-delegate.h"
+#include "interfaces/session-services-intf.h"
 #include "common/flex-data.h"
 #include "common/lmdb-db.h"
 #include "common/lmdb-env.h"
@@ -21,7 +22,8 @@ namespace vpipe {
 // path session.error -> delegate -> LMDB write fails -> session.error
 // -> ... structurally.
 class DbLogDelegate::CerrSessionContext final
-  : public SessionContextIntf
+  : public SessionContextIntf,
+    public SessionServicesIntf
 {
 public:
   void error(const VpipeFormat& f) const override {
@@ -58,28 +60,24 @@ public:
   unsigned default_edge_capacity() const noexcept override {
     return 0;
   }
-  const FFmpegLibraries* ffmpeg_libraries() const override {
-    // No pipeline ever runs through this context, so no caller
-    // should ask for FFmpeg. Surface nullptr rather than throwing
-    // -- pointer return makes that the natural way to express
-    // "not available here".
-    return nullptr;
+  // ffmpeg_libraries / coreml_model_manager /
+  // generative_model_manager are left to SessionServicesIntf, whose
+  // defaults already answer nullptr -- which is what this context used
+  // to say in three hand-written overrides.
+  SessionServicesIntf* services() const override {
+    return const_cast<CerrSessionContext*>(this);
   }
-  LmdbEnv* lmdb_env() const override {
-    // The delegate already holds the env it needs; this hook only
-    // exists for downstream SessionMembers asking the *session*
-    // for its env. Surface a clear error if exercised.
-    throw std::logic_error(
-      "DbLogDelegate bootstrap context: lmdb_env() not "
-      "available");
-  }
-  CoreMLModelManager* coreml_model_manager() const override {
-    // No pipeline ever runs through this context.
-    return nullptr;
-  }
-  genai::GenerativeModelManager* generative_model_manager() const override {
-    // No pipeline ever runs through this context.
-    return nullptr;
+  // The delegate already holds the env it needs; this hook only exists
+  // for downstream SessionMembers asking the *session* for its env.
+  // Surface a clear error if exercised, rather than a null nobody
+  // traces back to here.
+  void* find_service(std::string_view id) const override {
+    if (id == ServiceId<LmdbEnv>::value) {
+      throw std::logic_error(
+        "DbLogDelegate bootstrap context: lmdb_env() not "
+        "available");
+    }
+    return nullptr;   // no other subsystem exists in this context
   }
 };
 

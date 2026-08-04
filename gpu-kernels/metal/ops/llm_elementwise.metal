@@ -4009,3 +4009,173 @@ kernel void ring_append_f16(
   dst[((uint)h * ring_cap + slot) * hd + e] =
       src[((uint)h * T + i) * hd + e];
 }
+
+// ---- two-pass group norm (large activations) ---------------------------
+// group_norm_f16 above runs ONE threadgroup per group: on a VAE activation
+// of ~100M elements that is ~8K threads and a few GB/s, and it reads a
+// group's channel slice (Cg of every C) so the reads are scattered as well
+// as serial. These three split it -- per-channel partial sums over row
+// blocks, a tiny reduce to per-group mean/inv, then a fully parallel apply
+// -- and read CONSECUTIVE channels of a row per lane, so both passes are
+// coalesced. Same result, same [rows, C] channel-last layout.
+//
+//   stats: 0:x 1:part(f32)[NB][2*C] 2:rows 3:C 4:NB
+//   grid {256*NB}, tg {256}: block b reduces rows [b*chunk, (b+1)*chunk).
+kernel void group_norm_chan_stats_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    device float*           part [[buffer(1)]],
+    constant int&           rows [[buffer(2)]],
+    constant int&           C    [[buffer(3)]],
+    constant int&           NB   [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
+{
+  const int  b    = (int)tgid.x;
+  const uint lid  = ltid.x;
+  const uint tgsz = tptg.x;
+  const int  chunk = (rows + NB - 1) / NB;
+  const int  rlo = b * chunk;
+  const int  rhi = min(rlo + chunk, rows);
+  for (int c0 = 0; c0 < C; c0 += (int)tgsz) {
+    const int c = c0 + (int)lid;
+    if (c >= C) { break; }
+    float s = 0.0f, sq = 0.0f;
+    for (int r = rlo; r < rhi; ++r) {
+      const float v = float(x[(long)r * (long)C + (long)c]);
+      s += v; sq += v * v;
+    }
+    part[(long)b * 2 * (long)C + (long)c]              = s;
+    part[(long)b * 2 * (long)C + (long)C + (long)c]    = sq;
+  }
+}
+
+//   reduce: 0:part 1:stats(f32)[2*G] 2:rows 3:C 4:G 5:NB 6:eps
+//   grid {256*G}, tg {256}: one threadgroup per group. NB*Cg is small.
+kernel void group_norm_group_stats_f32(
+    const device float* part  [[buffer(0)]],
+    device float*       stats [[buffer(1)]],
+    constant int&       rows  [[buffer(2)]],
+    constant int&       C     [[buffer(3)]],
+    constant int&       G     [[buffer(4)]],
+    constant int&       NB    [[buffer(5)]],
+    constant float&     eps   [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
+{
+  const int  g    = (int)tgid.x;
+  const uint lid  = ltid.x;
+  const uint tgsz = tptg.x;
+  const int  Cg   = C / G;
+  const int  c0   = g * Cg;
+  threadgroup float ssum[256];
+  threadgroup float ssq[256];
+  float s = 0.0f, sq = 0.0f;
+  for (int i = (int)lid; i < NB * Cg; i += (int)tgsz) {
+    const int b  = i / Cg;
+    const int cc = i % Cg;
+    s  += part[(long)b * 2 * (long)C + (long)(c0 + cc)];
+    sq += part[(long)b * 2 * (long)C + (long)C + (long)(c0 + cc)];
+  }
+  ssum[lid] = s; ssq[lid] = sq;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = tgsz / 2; st > 0; st >>= 1) {
+    if (lid < st) { ssum[lid] += ssum[lid + st]; ssq[lid] += ssq[lid + st]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lid == 0) {
+    const float total = (float)rows * (float)Cg;
+    const float mean  = ssum[0] / total;
+    const float var   = ssq[0] / total - mean * mean;
+    stats[2 * g]     = mean;
+    stats[2 * g + 1] = 1.0f / sqrt(var + eps);
+  }
+}
+
+//   apply: 0:x 1:gamma 2:beta 3:out 4:stats 5:C 6:G
+//   2D grid {C, rows}: gid = row*C + col (a 1D grid overflows past ~3K px).
+kernel void group_norm_apply_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* gamma [[buffer(1)]],
+    const device VPIPE_ELT* beta  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    const device float*     stats [[buffer(4)]],
+    constant int&           C     [[buffer(5)]],
+    constant int&           G     [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x;
+  if (c >= C) { return; }
+  const long idx = (long)gid.y * (long)C + (long)c;
+  const int  g   = c / (C / G);
+  const float m  = stats[2 * g];
+  const float iv = stats[2 * g + 1];
+  out[idx] = VPIPE_ELT((float(x[idx]) - m) * iv * float(gamma[c])
+                       + float(beta[c]));
+}
+
+// ---- direct 3x3 convolution for a SMALL output-channel count -----------
+// Channel-last [H, W, cin] -> [H, W, cout], stride 1, pad 1.
+//
+// Why this exists: the NAX hardware conv needs cout % 64 == 0, and the
+// im2col+GEMM fallback materializes a [H*W, 9*cin] buffer. Every VAE ends
+// in a conv to 3 (or 2*latent) channels AT FULL RESOLUTION, where that
+// buffer is ~1.8 GB for a ~5 GFLOP convolution -- pure materialization
+// cost. MEASURED 764 ms for FLUX.2's 128->3 at 1024x768.
+//
+// Here each thread owns one output pixel and keeps its whole (small) output
+// vector in registers, so the activation is read once per tap instead of
+// being written out and read back. The 3x3 window overlaps its neighbours by
+// 2/3, so the redundant taps come from cache rather than DRAM; the weight is
+// a few KB and stays resident. Reads are the dominant term, which makes this
+// bandwidth-bound rather than materialization-bound.
+//
+// Output channels are processed COUT_CHUNK at a time so the accumulators
+// stay in registers; `nt` is uniform across the threadgroup, so the tail
+// chunk costs no divergence. `whwio` is the same [9][cin][cout] layout the
+// hardware-conv path uses (out-channel fastest), so no extra weight twin.
+//   0:x 1:whwio 2:bias 3:out 4:Wd 5:Hd 6:cin 7:cout 8:has_bias
+//   grid {Wd, Hd}: one thread per output pixel.
+kernel void conv3x3_hwc_small_cout_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* whwio [[buffer(1)]],
+    const device VPIPE_ELT* bias  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&           Wd       [[buffer(4)]],
+    constant int&           Hd       [[buffer(5)]],
+    constant int&           cin      [[buffer(6)]],
+    constant int&           cout_n   [[buffer(7)]],
+    constant int&           has_bias [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int px = (int)gid.x;
+  const int py = (int)gid.y;
+  if (px >= Wd || py >= Hd) { return; }
+  constexpr int COUT_CHUNK = 4;
+  for (int o0 = 0; o0 < cout_n; o0 += COUT_CHUNK) {
+    const int nt = min(COUT_CHUNK, cout_n - o0);
+    float acc[COUT_CHUNK] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int ky = 0; ky < 3; ++ky) {
+      const int sy = py + ky - 1;
+      if (sy < 0 || sy >= Hd) { continue; }        // zero pad
+      for (int kx = 0; kx < 3; ++kx) {
+        const int sx = px + kx - 1;
+        if (sx < 0 || sx >= Wd) { continue; }
+        const long xb = ((long)sy * (long)Wd + (long)sx) * (long)cin;
+        const long wb = (long)(ky * 3 + kx) * (long)cin * (long)cout_n
+                        + (long)o0;
+        for (int ci = 0; ci < cin; ++ci) {
+          const float v = float(x[xb + (long)ci]);
+          const long wo = wb + (long)ci * (long)cout_n;
+          for (int t = 0; t < nt; ++t) { acc[t] += v * float(whwio[wo + t]); }
+        }
+      }
+    }
+    const long ob = ((long)py * (long)Wd + (long)px) * (long)cout_n + (long)o0;
+    for (int t = 0; t < nt; ++t) {
+      const float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
+      out[ob + (long)t] = VPIPE_ELT(r);
+    }
+  }
+}

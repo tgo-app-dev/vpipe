@@ -1,7 +1,7 @@
 #include "common/ffmpeg-libraries.h"
 #include "common/ffmpeg-log-tap.h"
 #include "common/vpipe-format.h"
-#include "interfaces/session-context-intf.h"
+#include "interfaces/log-sink-intf.h"
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -19,12 +19,12 @@ namespace vpipe {
 
 namespace {
 
-// Process-wide pointer to the SessionContextIntf currently chosen as
+// Process-wide pointer to the log sink currently chosen as
 // the destination for FFmpeg log lines. FFmpegLibraries' constructor
 // publishes itself here; its destructor CAS-clears. Multi-instance
 // in the same process: latest construction wins, which covers the
 // usual single-Session shape cleanly.
-std::atomic<const SessionContextIntf*> g_ff_log_target{nullptr};
+std::atomic<const LogSinkIntf*> g_ff_log_target{nullptr};
 
 void
 ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
@@ -63,7 +63,7 @@ ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
 
   std::string_view msg_view(buf, static_cast<size_t>(n));
 
-  const SessionContextIntf* s =
+  const LogSinkIntf* s =
     g_ff_log_target.load(std::memory_order_acquire);
   if (s) {
     s->log_verbose(fmt("[ffmpeg:{}] {}", class_name, msg_view));
@@ -177,9 +177,9 @@ constexpr const char* kSwScaleCandidates[] = {
 
 template <size_t N>
 string
-find_first_loadable_(const SessionContextIntf*  session,
-                     const char* const          (&candidates)[N],
-                     string_view                lib_name)
+find_first_loadable_(const LogSinkIntf*  session,
+                     const char* const   (&candidates)[N],
+                     string_view         lib_name)
 {
   for (const char* c : candidates) {
     void* h = ::dlopen(c, RTLD_NOW | RTLD_LOCAL);
@@ -200,7 +200,7 @@ find_first_loadable_(const SessionContextIntf*  session,
 // LibAvUtil
 // ---------------------------------------------------------------------
 
-LibAvUtil::LibAvUtil(const SessionContextIntf* s, LoadMode mode)
+LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvUtilCandidates,
                                           "libavutil"),
                   mode)
@@ -258,7 +258,7 @@ LibAvUtil::version_micro() const noexcept
 // LibAvCodec
 // ---------------------------------------------------------------------
 
-LibAvCodec::LibAvCodec(const SessionContextIntf* s, LoadMode mode)
+LibAvCodec::LibAvCodec(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvCodecCandidates,
                                           "libavcodec"),
                   mode)
@@ -318,7 +318,7 @@ LibAvCodec::version_micro() const noexcept
 // LibAvFormat
 // ---------------------------------------------------------------------
 
-LibAvFormat::LibAvFormat(const SessionContextIntf* s, LoadMode mode)
+LibAvFormat::LibAvFormat(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvFormatCandidates,
                                           "libavformat"),
                   mode)
@@ -378,7 +378,7 @@ LibAvFormat::version_micro() const noexcept
 // LibSwResample
 // ---------------------------------------------------------------------
 
-LibSwResample::LibSwResample(const SessionContextIntf* s, LoadMode mode)
+LibSwResample::LibSwResample(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwResampleCandidates,
                                           "libswresample"),
                   mode)
@@ -423,7 +423,7 @@ LibSwResample::version_micro() const noexcept
 // LibSwScale
 // ---------------------------------------------------------------------
 
-LibSwScale::LibSwScale(const SessionContextIntf* s, LoadMode mode)
+LibSwScale::LibSwScale(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwScaleCandidates,
                                           "libswscale"),
                   mode)
@@ -466,7 +466,7 @@ LibSwScale::version_micro() const noexcept
 // LibAvDevice
 // ---------------------------------------------------------------------
 
-LibAvDevice::LibAvDevice(const SessionContextIntf* s, LoadMode mode)
+LibAvDevice::LibAvDevice(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvDeviceCandidates,
                                           "libavdevice"),
                   mode)
@@ -506,9 +506,9 @@ LibAvDevice::version_micro() const noexcept
 // FFmpegLibraries
 // ---------------------------------------------------------------------
 
-FFmpegLibraries::FFmpegLibraries(const SessionContextIntf* s,
-                                 LibraryHandle::LoadMode   mode)
-  : SessionMember(s)
+FFmpegLibraries::FFmpegLibraries(const LogSinkIntf*      s,
+                                 LibraryHandle::LoadMode mode)
+  : _log(s)
   , _avutil(s, mode)
   , _avcodec(s, mode)
   , _swresample(s, mode)
@@ -536,7 +536,7 @@ FFmpegLibraries::~FFmpegLibraries()
   // Only clear the global pointer if it still names our session;
   // another live FFmpegLibraries (potentially on a different
   // session) may have published itself afterwards.
-  const SessionContextIntf* expected = session();
+  const LogSinkIntf* expected = _log;
   g_ff_log_target.compare_exchange_strong(expected, nullptr,
                                           std::memory_order_acq_rel,
                                           std::memory_order_relaxed);

@@ -2,6 +2,7 @@
 
 #include "common/lmdb-env.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-catalog.h"
 #include "stages/model-registry.h"
 
@@ -31,7 +32,7 @@ list_installed_models(SessionContextIntf* sctx, string& err)
   FlexData arr = FlexData::make_array();
   auto a = arr.as_array();
 
-  LmdbEnv* env = sctx ? sctx->lmdb_env() : nullptr;
+  LmdbEnv* env = sctx ? sctx->services()->lmdb_env() : nullptr;
   if (!env || !env->valid()) {
     err = "no database available";
     doc.as_object().insert("models", std::move(arr));

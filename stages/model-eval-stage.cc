@@ -3,6 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -172,7 +173,7 @@ bool
 ModelEvalStage::evaluate_once(FlexData& summary)
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  auto* mgr = session() ? session()->generative_model_manager() : nullptr;
+  auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (mgr == nullptr) {
     session()->warn(fmt(
         "ModelEvalStage('{}'): no GenerativeModelManager (is this an "

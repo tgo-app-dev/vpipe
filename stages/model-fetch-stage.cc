@@ -10,6 +10,7 @@
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/runtime-context.h"
 
 #include <algorithm>
@@ -584,7 +585,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
   const fs::path local_dir = base / hf_path;   // <base>/<owner>/<repo>
 
   // -------- 3. Registry pre-check --------------------------------------
-  LmdbEnv* env = s->lmdb_env();
+  LmdbEnv* env = s->services()->lmdb_env();
   if (!env) {
     s->error(fmt("ModelFetchStage('{}'): session lmdb_env() unavailable",
                  this->id()));

@@ -1,4 +1,5 @@
 #include "minitest.h"
+#include "interfaces/session-services-intf.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -160,7 +161,7 @@ public:
     tb.dtype = TensorBeat::DType::U8;
     tb.shape = { 3, H, W };
     uint8_t* p = nullptr;
-    auto* mc = session()->metal_compute();
+    auto* mc = session()->services()->metal_compute();
     if (mc && mc->valid()) {
       auto h = metal_compute::make_shared_storage(*mc, nbytes, session());
       if (h) { p = h->contents; tb.external = std::move(h); }
@@ -204,7 +205,7 @@ public:
     tb.dtype = TensorBeat::DType::U8;
     tb.shape = { 3, H, W };
     uint8_t* p = nullptr;
-    auto* mc = session()->metal_compute();
+    auto* mc = session()->services()->metal_compute();
     if (mc && mc->valid()) {
       auto h = metal_compute::make_shared_storage(*mc, nbytes, session());
       if (h) { p = h->contents; tb.external = std::move(h); }

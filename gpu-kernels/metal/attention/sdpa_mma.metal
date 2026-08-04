@@ -920,6 +920,193 @@ decltype(sdpa_full_mma2_tmpl<384>) sdpa_full_mma2_tmpl<384>;
 template [[host_name("sdpa_full_mma2_d512_f16")]] [[kernel]]
 decltype(sdpa_full_mma2_tmpl<512>) sdpa_full_mma2_tmpl<512>;
 
+// Wide-query-tile twin of sdpa_full_mma2_tmpl. Identical math, identical
+// buffers, identical f32 accumulators -- the ONE difference is where the
+// BQ x D output accumulator lives, and that is what sets the runtime.
+//
+// This kernel is bandwidth-bound, not compute-bound, and BQ is the only knob
+// that touches the bandwidth. Every threadgroup streams the WHOLE of K and V
+// (that is what flash attention does), so total K/V traffic is
+// ceil(n_q/BQ) * 2 * n_q * D * sizeof(elt) -- inversely proportional to BQ and
+// to nothing else. MEASURED on the FLUX.2 VAE mid-block at 1024x768
+// (n_q = 12288, D = 512, one head): BQ=8 puts 1536 threadgroups x 24 MB of K/V
+// = 38.7 GB across the fabric in 161 ms, i.e. 238 GB/s, which is the roof. The
+// same 309 GFLOP at the matrix units' ~9 TFLOP/s would be 34 ms, so the
+// arithmetic intensity (8 FLOP/byte against an M5 balance point near 45) is
+// the whole story. BK cannot substitute: it sets how many blocks each
+// threadgroup walks its K/V in, not how many bytes that walk costs.
+//
+// BQ above 8 is impossible with the accumulator in threadgroup memory: Of is
+// BQ*D floats, so D=512 hits the 32 KB threadgroup budget at BQ=16 with
+// nothing left for Ss/Sf. Hence the register accumulator -- a cooperative
+// tensor held across the whole K/V loop in mode::multiply_accumulate, spread
+// over the SG simdgroups' threads. The online-softmax rescale that the base
+// kernel does as an indexed threadgroup op becomes a walk over this thread's
+// own elements, each asking the (implementation-defined) layout which row it
+// belongs to via get_multidimensional_index. The tile is chosen so that
+// BQ*D/(SG*32) stays near 64 floats per thread at both widths.
+//
+// STILL f32 for both accumulators, deliberately. The QK^T f32 requirement
+// documented on the base kernel is a RANGE argument about this call site's
+// unnormalized conv1x1 Q/K -- it does not weaken because the tile got wider,
+// and the win here is bandwidth, which f32 accumulators do not cost (they are
+// registers and threadgroup scratch, never traffic). O accumulates in f32 for
+// the same reason it did in threadgroup memory: a 12288-key online sum in f16
+// would drift regardless of tiling.
+//   0:q[Hq,n_q,D] 1:k 2:v[Hkv,kv_stride,D] 3:out[Hq,n_q,D] 4:scale 5:T_kv 6:D
+//   7:Hq 8:Hkv 9:n_q 10:kv_stride
+// grid {SG*32, Hq, ceil(n_q/BQ)}, tg {SG*32,1,1}.
+template <int SAW_D, int SAW_BQ, int SAW_BK, int SAW_SG>
+[[kernel]] void sdpa_full_mma2_wide_tmpl(
+    const device VPIPE_ELT* q     [[buffer(0)]],
+    const device VPIPE_ELT* k     [[buffer(1)]],
+    const device VPIPE_ELT* v     [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant float& scale     [[buffer(4)]],
+    constant int&   T_kv      [[buffer(5)]],
+    constant int&   D         [[buffer(6)]],
+    constant int&   Hq        [[buffer(7)]],
+    constant int&   Hkv       [[buffer(8)]],
+    constant int&   n_q       [[buffer(9)]],
+    constant int&   kv_stride [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  (void)D;
+  constexpr int THREADS = SAW_SG * 32;
+  const int h    = (int)tgid.y;
+  const int q0   = (int)tgid.z * SAW_BQ;
+  const int kvh  = h / (Hq / Hkv);
+  const device VPIPE_ELT* kbase = k + (int64_t)kvh * kv_stride * SAW_D;
+  const device VPIPE_ELT* vbase = v + (int64_t)kvh * kv_stride * SAW_D;
+
+  threadgroup VPIPE_ELT Ss[SAW_BQ * SAW_BK];   // P (softmax output, in [0,1])
+  threadgroup float Sf[SAW_BQ * SAW_BK];       // QK^T scores (f32, see above)
+  threadgroup float mrow[SAW_BQ], lrow[SAW_BQ], corr_s[SAW_BQ];
+
+  for (int e = (int)lid; e < SAW_BQ; e += THREADS) {
+    mrow[e] = -INFINITY; lrow[e] = 0.0f;
+  }
+
+  const device VPIPE_ELT* qh = q + ((int64_t)h * n_q + q0) * SAW_D;
+  using TD = tensor<device VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TP = tensor<threadgroup VPIPE_ELT, dextents<int32_t,2>, tensor_inline>;
+  using TS = tensor<threadgroup float, dextents<int32_t,2>, tensor_inline>;
+  constexpr auto qk = matmul2d_descriptor(
+      SAW_BQ, SAW_BK, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<qk, execution_simdgroups<SAW_SG>> opQK;
+  constexpr auto pv = matmul2d_descriptor(
+      SAW_BQ, SAW_D, SAW_BK, false, false, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv, execution_simdgroups<SAW_SG>> opPV;
+  // Every device tile carries its TRUE extent, not the tile constant, so a
+  // ragged tail reads nothing past the buffer -- matmul2d clamps a partially
+  // out-of-range tile. The base kernel gets away with over-reading because
+  // BQ=8/BK=16 keeps the overshoot inside the page; at BQ=64 the same over-read
+  // would be 63 rows * D past the end, and V garbage that decodes to NaN
+  // survives the P=0 mask (0 * NaN = NaN).
+  const int qrows = min(SAW_BQ, n_q - q0);
+  TD tQ(const_cast<device VPIPE_ELT*>(qh),
+        dextents<int32_t,2>(SAW_D, qrows));
+
+  // The O accumulator, register-resident for the whole K/V walk.
+  auto cO = opPV.template get_destination_cooperative_tensor<TP, TD, float>();
+  for (auto it = cO.begin(); it != cO.end(); ++it) { *it = 0.0f; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int bs = 0; bs < T_kv; bs += SAW_BK) {
+    const int bk = min(SAW_BK, T_kv - bs);
+    TD tK(const_cast<device VPIPE_ELT*>(kbase + (int64_t)bs * SAW_D),
+          dextents<int32_t,2>(SAW_D, bk));
+    auto cS = opQK.template get_destination_cooperative_tensor<TD, TD, float>();
+    opQK.run(tQ, tK, cS);
+    TS tSf(Sf, dextents<int32_t,2>(SAW_BK, SAW_BQ));
+    cS.store(tSf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int r = (int)lid; r < SAW_BQ; r += THREADS) {
+      const bool qok = (q0 + r) < n_q;
+      float mloc = mrow[r];
+      for (int j = 0; j < SAW_BK; ++j) {
+        const bool ok = qok && j < bk;
+        const float s = ok ? Sf[r * SAW_BK + j] * scale : -INFINITY;
+        Sf[r * SAW_BK + j] = s;
+        mloc = max(mloc, s);
+      }
+      const float corr = exp(mrow[r] - mloc);
+      float lloc = lrow[r] * corr;
+      for (int j = 0; j < SAW_BK; ++j) {
+        const float s = Sf[r * SAW_BK + j];
+        const float p = (s == -INFINITY) ? 0.0f : exp(s - mloc);
+        Ss[r * SAW_BK + j] = (VPIPE_ELT)p;
+        lloc += p;
+      }
+      corr_s[r] = corr;
+      mrow[r] = mloc; lrow[r] = lloc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Rescale this thread's slice of O. index [1] is the m (query-row) axis:
+    // matmul2d's destination coordinates follow the tensor extent order
+    // (n, m), the same convention the tensors above are built with. The
+    // validity check keeps a padded capacity from indexing corr_s out of
+    // range; every shipped tile divides evenly (BQ*D/(SG*32) is exact at both
+    // widths), so on those it folds away at compile time.
+    #pragma clang loop unroll(full)
+    for (auto it = cO.begin(); it != cO.end(); ++it) {
+      if (!it.is_valid_element()) { continue; }
+      *it *= corr_s[it.get_multidimensional_index()[1]];
+    }
+
+    TP tP(Ss, dextents<int32_t,2>(SAW_BK, SAW_BQ));
+    TD tV(const_cast<device VPIPE_ELT*>(vbase + (int64_t)bs * SAW_D),
+          dextents<int32_t,2>(SAW_D, bk));
+    opPV.run(tP, tV, cO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  #pragma clang loop unroll(full)
+  for (auto it = cO.begin(); it != cO.end(); ++it) {
+    if (!it.is_valid_element()) { continue; }
+    const auto ij = it.get_multidimensional_index();
+    const int r = (int)ij[1], dd = (int)ij[0];
+    if (q0 + r < n_q) {
+      const float inv = (lrow[r] > 0.0f) ? 1.0f / lrow[r] : 0.0f;
+      out[((int64_t)h * n_q + (q0 + r)) * SAW_D + dd] = (VPIPE_ELT)(*it * inv);
+    }
+  }
+}
+#define SAW_INST(NAME, D, BQ, BK, SG)                                    \
+  template [[host_name(NAME)]] [[kernel]]                                \
+  decltype(sdpa_full_mma2_wide_tmpl<D, BQ, BK, SG>)                      \
+      sdpa_full_mma2_wide_tmpl<D, BQ, BK, SG>;
+// (BK, SG) per query tile are TUNED, not free parameters -- only BQ is a knob
+// the host passes. M5, D=512, n=12288, interleaved arms, best of 5:
+//   BQ=8 (the base kernel)            161 ms   1.00x   38.7 GB of K/V
+//   BQ=16 BK=32  SG=4                  70 ms   2.31x   19.3 GB
+//   BQ=32 BK=32  SG=8                  65 ms   2.48x    9.7 GB
+//   BQ=32 BK=64  SG=8                  55 ms   2.91x
+//   BQ=32 BK=128 SG=8                  51 ms   3.25x   <-- shipped
+//   BQ=64 BK=32  SG=8                 109 ms   1.48x    4.8 GB  (spills)
+//   BQ=64 BK=64  SG=16                 59 ms   2.81x
+// Two effects cross here. Halving the threadgroup count halves the K/V bytes,
+// which is worth ~2.3x by itself; past BQ=32 the register accumulator
+// (BQ*D/(SG*32) floats per thread) starts to cost more occupancy than the
+// traffic it saves -- BQ=64 at SG=8 is 128 floats a thread and LOSES to the
+// base kernel's bandwidth. Raising SG instead of BQ does not help either (the
+// same tile over 512 threads measured 74 ms against 55): fewer elements per
+// thread, but the matmul tile is then split too finely to keep the matrix
+// units fed. Deeper BK is nearly free -- it does not change the bytes, it
+// amortizes the per-block barriers -- and 128 is where the f32 score tile
+// (BQ*BK*4 = 16 KB, plus 8 KB of P) runs out of the 32 KB threadgroup budget.
+SAW_INST("sdpa_full_mma2_d384_q16_f16", 384, 16, 32, 4)
+SAW_INST("sdpa_full_mma2_d384_q32_f16", 384, 32, 128, 8)
+SAW_INST("sdpa_full_mma2_d384_q64_f16", 384, 64, 64, 16)
+SAW_INST("sdpa_full_mma2_d512_q16_f16", 512, 16, 32, 4)
+SAW_INST("sdpa_full_mma2_d512_q32_f16", 512, 32, 128, 8)
+SAW_INST("sdpa_full_mma2_d512_q64_f16", 512, 64, 64, 16)
+#undef SAW_INST
+
 #else
 // Tensor ops unavailable for this target: stubs so the metallib still builds.
 kernel void sdpa_mma_f16(device VPIPE_ELT* out [[buffer(3)]],
@@ -931,6 +1118,17 @@ kernel void sdpa_full_mma2_d384_f16(device VPIPE_ELT* out [[buffer(3)]],
 kernel void sdpa_full_mma2_d512_f16(device VPIPE_ELT* out [[buffer(3)]],
                                     uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+#define SAW_STUB(NAME)                                                   \
+  kernel void NAME(device VPIPE_ELT* out [[buffer(3)]],                  \
+                   uint t [[thread_position_in_grid]])                   \
+  { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+SAW_STUB(sdpa_full_mma2_d384_q16_f16)
+SAW_STUB(sdpa_full_mma2_d384_q32_f16)
+SAW_STUB(sdpa_full_mma2_d384_q64_f16)
+SAW_STUB(sdpa_full_mma2_d512_q16_f16)
+SAW_STUB(sdpa_full_mma2_d512_q32_f16)
+SAW_STUB(sdpa_full_mma2_d512_q64_f16)
+#undef SAW_STUB
 kernel void sdpa_mma_d128_f16(device VPIPE_ELT* out [[buffer(3)]],
                               uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
