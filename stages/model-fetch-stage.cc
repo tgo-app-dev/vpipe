@@ -148,63 +148,42 @@ write_to_ofstream_(char* p, size_t s, size_t n, void* u)
   return o->good() ? s * n : 0;
 }
 
-// ---- download progress bar --------------------------------------------
+// ---- download progress -------------------------------------------------
 
-// Files at least this large get a live progress bar.
+// Files at least this large get a live progress report.
 constexpr curl_off_t kBigFileBytes = curl_off_t{256} * 1024 * 1024;
-
-// Render a fixed-width bar, e.g. "[######------------------] 27%  ...".
-// Padded to a stable width so a shorter redraw fully overwrites a longer
-// one in a raw terminal (the web-ui handler clears the line itself).
-string
-render_bar_(int pct, curl_off_t now, curl_off_t total)
-{
-  if (pct < 0) { pct = 0; }
-  if (pct > 100) { pct = 100; }
-  constexpr int W = 24;
-  const int filled = pct * W / 100;
-  string bar = "[";
-  for (int i = 0; i < W; ++i) { bar += (i < filled ? '#' : '-'); }
-  bar += "] " + std::to_string(pct) + "%  "
-       + human_bytes_(static_cast<uint64_t>(now   < 0 ? 0 : now)) + " / "
-       + human_bytes_(static_cast<uint64_t>(total < 0 ? 0 : total));
-  while (bar.size() < 56) { bar += ' '; }
-  return bar;
-}
 
 // Per-download progress state handed to the libcurl xferinfo callback.
 struct ProgressCtx {
-  vpipe::UiTextStream* stream   = nullptr;
-  int                  last_pct = -1;     // throttle: redraw on % change
-  bool                 drawn    = false;  // emitted at least one frame
-  curl_off_t           total    = 0;
+  vpipe::UiProgress* progress = nullptr;
   // Poll predicate: when set and it returns true, the xferinfo callback
   // aborts the transfer mid-flight (-> CURLE_ABORTED_BY_CALLBACK).
   const std::function<bool()>* cancel = nullptr;
 };
 
-// libcurl CURLOPT_XFERINFOFUNCTION. Redraws the bar (carriage-return +
-// overwrite) only when the integer percentage changes, so an N-hundred-
-// MB file produces ~100 updates regardless of callback frequency.
+// libcurl CURLOPT_XFERINFOFUNCTION. Pushes the raw byte counts every
+// time libcurl calls -- no percentage-change throttle, because the
+// renderers coalesce on their own clocks (see UiProgressRegistry) and
+// update() is a mutex plus a few field writes.
 int
 progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
              curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
 {
   auto* c = static_cast<ProgressCtx*>(p);
   if (c && c->cancel && (*c->cancel)()) { return 1; }   // abort transfer
-  if (!c || !c->stream || dltotal <= 0) {
+  if (!c || !c->progress) {
     return 0;
   }
-  c->total = dltotal;
-  const int pct = static_cast<int>((dlnow * 100) / dltotal);
-  if (pct == c->last_pct) {
-    return 0;
-  }
-  c->last_pct = pct;
-  string line = c->drawn ? "\r" : "";   // \r overwrites the prior frame
-  line += render_bar_(pct, dlnow, dltotal);
-  c->stream->write(line);
-  c->drawn = true;
+  // dltotal is 0 until the response headers land, which the report
+  // shows as indeterminate rather than as 0%.
+  const auto now   = static_cast<std::uint64_t>(dlnow   < 0 ? 0 : dlnow);
+  const auto total = static_cast<std::uint64_t>(dltotal < 0 ? 0 : dltotal);
+  // Before the headers land there is no total, so report just what has
+  // arrived -- "1.2 GB / 0.0 B" would read as a broken denominator.
+  c->progress->update(now, total,
+                      total > 0 ? human_bytes_(now) + " / "
+                                    + human_bytes_(total)
+                                : human_bytes_(now));
   return 0;
 }
 
@@ -279,14 +258,13 @@ http_get_(const string& url, const string& token, bool verify_tls,
 
 // GET streaming to `dest` (parent dirs created). `*status` carries the
 // HTTP code; `err` set + false on failure. When `progress` is non-null,
-// a live progress bar is rendered to it for the duration of the
-// transfer. When `cancel` is non-null it is polled mid-transfer; if it
-// returns true the transfer aborts (curl error -> the partial dest is
-// removed).
+// the transfer's byte counts are pushed to it for the duration. When
+// `cancel` is non-null it is polled mid-transfer; if it returns true
+// the transfer aborts (curl error -> the partial dest is removed).
 bool
 http_download_(const string& url, const string& token, bool verify_tls,
                long timeout_s, const fs::path& dest, long& status,
-               string& err, vpipe::UiTextStream* progress,
+               string& err, vpipe::UiProgress* progress,
                const std::function<bool()>* cancel = nullptr)
 {
   std::error_code ec;
@@ -297,8 +275,8 @@ http_download_(const string& url, const string& token, bool verify_tls,
     return false;
   }
   ProgressCtx pctx;
-  pctx.stream = progress;
-  pctx.cancel = cancel;
+  pctx.progress = progress;
+  pctx.cancel   = cancel;
   CURLcode rc = curl_perform_(url, token, verify_tls, timeout_s,
                               &write_to_ofstream_, &ofs, &status,
                               (progress || cancel) ? &pctx : nullptr);
@@ -312,11 +290,6 @@ http_download_(const string& url, const string& token, bool verify_tls,
     err = fmt("HTTP {}", status)();
     fs::remove(dest, ec);
     return false;
-  }
-  // Snap the bar to a clean 100% frame (some servers omit the final
-  // callback at dlnow == dltotal).
-  if (progress && pctx.drawn) {
-    progress->write("\r" + render_bar_(100, pctx.total, pctx.total));
   }
   return true;
 }
@@ -788,22 +761,20 @@ ModelFetchStage::process(RuntimeContext& ctx)
                 f.size ? human_bytes_(f.size) : string("size unknown")));
     const string file_url = "https://huggingface.co/" + hf_path
                           + "/resolve/main/" + f.path;
-    // A live progress bar for big shards. It rides a verbatim text
-    // stream (stdout in a terminal; an in-place console line in the
-    // web-ui, which honours the \r the bar redraws with).
-    std::unique_ptr<UiTextStream> bar;
+    // A live progress report for big shards -- a bar in the console
+    // footer, an entry in the web UI's progress panel. The handle
+    // closes itself when it leaves scope, including on the error path.
+    UiProgress bar;
     if (static_cast<curl_off_t>(f.size) >= kBigFileBytes) {
-      bar = s->open_text_stream();
+      bar = s->open_progress(fs::path(f.path).filename().string());
     }
     long dl_status = 0;
     string dl_err;
     if (!http_download_(file_url, token, _verify_tls, _timeout_seconds,
-                        dest, dl_status, dl_err, bar.get(), &cancel)) {
-      if (bar) { bar->end(); }
+                        dest, dl_status, dl_err, &bar, &cancel)) {
       s->error(fmt("ModelFetchStage('{}'): download of '{}' failed: {}",
                    this->id(), f.path, dl_err));
     }
-    if (bar) { bar->end(); }
     ++downloaded;
   }
   s->info(fmt("ModelFetchStage('{}'): {} file(s) ({} downloaded, {} "

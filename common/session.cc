@@ -1017,6 +1017,12 @@ Session::open_text_stream() const
   return _ui_delegate->open_text_stream();
 }
 
+UiProgress
+Session::open_progress(string desc) const
+{
+  return _ui_delegate->open_progress(std::move(desc));
+}
+
 UiInterruptToken
 Session::register_interrupt_handler(string             label,
                                     UiInterruptHandler fn) const

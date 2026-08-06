@@ -128,14 +128,21 @@ input, textarea, select, [contenteditable="true"],
 
 #topbar {
   flex: 0 0 auto;
-  height: 46px;
   display: flex;
   align-items: baseline;
   gap: 7px;
-  padding: 0 18px;
+  /* Sized by its own text rather than a fixed height. The row carries
+     nothing but the product name, and every pixel it takes is one the
+     dashboard underneath does not get -- so it gets the brand line plus
+     enough padding to keep the rule off the descenders, and no more. */
+  padding: 3px 18px 4px;
+  line-height: 1.2;
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
 }
+/* The phone-return button (present only when a phone was forced into the
+   desktop layout) would otherwise be what decides the bar's height. */
+#topbar .btn { padding: 0 7px; font-size: 11px; line-height: 1.5; }
 #topbar .brand {
   font-weight: 700;
   font-size: 15px;
@@ -169,6 +176,10 @@ input, textarea, select, [contenteditable="true"],
   font-size: 11px;
   color: var(--fg-dim);
   user-select: none;
+  /* Anchor for the progress panel, which floats ABOVE the 42px row
+     rather than growing it -- the bar's height is fixed so the views
+     above never reflow when work starts. */
+  position: relative;
 }
 .sb-body {
   display: flex;
@@ -240,6 +251,106 @@ svg.sb-spark .line {
 .sb-val.dim { color: var(--fg-dim); }
 .sb-error {
   display: flex; align-items: center; gap: 6px;
+}
+
+/* ---- Progress: the fifth cell, and the panel it expands into ---- */
+
+/* The cell's own bar: an accent fill growing left to right behind the
+   value text. Sits under .sb-val (which is position:relative) so the
+   label stays readable at every fill level. */
+.sb-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: var(--accent);
+  opacity: .28;
+  transition: width .25s linear;
+}
+/* Indeterminate: full width, marching stripes, no width transition (the
+   width is not what is moving). */
+.sb-fill.indet {
+  opacity: .18;
+  background: repeating-linear-gradient(
+      90deg, var(--accent) 0 10px, transparent 10px 20px);
+  animation: sb-prog-march 1s linear infinite;
+  transition: none;
+}
+
+/* Only the progress cell is interactive; the four system monitors are
+   read-only, so the affordance is scoped rather than on .sb-cell. */
+.sb-cell.sb-clickable { cursor: pointer; }
+.sb-cell.sb-clickable:hover .sb-meter { border-color: var(--accent); }
+
+.sb-prog-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 42px;                 /* sit on top of the bar, not inside it */
+  width: 340px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 10px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, .28);
+  z-index: 20;
+}
+.sb-prog-panel[hidden] { display: none; }
+.sb-prog-list { display: flex; flex-direction: column; gap: 10px; }
+.sb-prog-empty { color: var(--fg-dim); font-size: 11px; }
+.sb-prog-item { display: flex; flex-direction: column; gap: 4px; }
+.sb-prog-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px;
+}
+.sb-prog-name {
+  color: var(--fg); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sb-prog-pct {
+  color: var(--fg-dim); font-variant-numeric: tabular-nums;
+}
+.sb-prog-track {
+  height: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.sb-prog-fill {
+  height: 100%;
+  background: var(--accent);
+  opacity: .75;
+  transition: width .2s linear;
+}
+/* Indeterminate: a full-width stripe animation, so "no total known yet"
+   still reads as motion instead of a stalled 0%. */
+.sb-prog-fill.indet {
+  opacity: .35;
+  background: repeating-linear-gradient(
+      90deg, var(--accent) 0 10px, transparent 10px 20px);
+  animation: sb-prog-march 1s linear infinite;
+  transition: none;
+}
+@keyframes sb-prog-march {
+  from { background-position: 0 0; }
+  to   { background-position: 20px 0; }
+}
+.sb-prog-sub {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px;
+}
+.sb-prog-detail {
+  color: var(--fg-dim);
+  font-size: 10px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sb-prog-eta {
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* ---- Navigation strip ---- */
@@ -343,6 +454,38 @@ svg.sb-spark .line {
   padding: 12px 10px 20px; color: var(--fg-dim); font-size: 10.5px;
   line-height: 1.5;
 }
+.lane-caret {
+  flex: 0 0 auto; align-self: center; padding-left: 6px;
+  color: var(--fg-dim); font-size: 11px;
+  transition: transform .12s ease;
+}
+.lane-row.open { background: var(--bg-1); }
+.lane-row.open .lane-caret { transform: rotate(90deg); }
+
+/* The configuration, inline under the row it belongs to. At this width
+   there is no second pane to put it in -- the editor is one column, the
+   same arrangement the phone shell uses. A flex ITEM of the list, so it
+   pushes the rows below it down instead of covering them. */
+.lane-detail-block {
+  position: relative;              /* anchors the lane continuations */
+  flex: 0 0 auto;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+}
+/* A lane that runs PAST this stage must not appear to stop at whichever
+   row happens to be open, so each still-live lane gets a rule the full
+   height of the block. Positioned rather than drawn: the height depends
+   on the form inside and is not known when the art is built. */
+.lane-cont {
+  position: absolute; top: 0; bottom: 0; width: 1.6px;
+  margin-left: -0.8px; background: var(--line);
+}
+.lane-detail { padding: 6px 4px 10px; }
+/* Apply / Remove ride at the TOP of the block, which is the inline
+   equivalent of the pane header pinning them above the scroll. */
+.lane-detail-actions { display: flex; gap: 6px; padding: 0 6px 2px; }
+.lane-detail-actions:empty { display: none; }
+.lane-detail-body .cfg { padding: 6px; }
 
 /* ---- 10x10 boolean-grid icons ---- */
 
@@ -392,6 +535,14 @@ svg.sb-spark .line {
   align-self: stretch;
 }
 .pe-divider:hover { background: var(--accent); }
+/* Below the canvas/list crossover the editor collapses to ONE column:
+   two side-by-side panes at this width leave neither worth having, so
+   the configuration moves inline under its lane row (see .lane-detail)
+   and its pane and divider go away. The surviving pane's flex-grow is
+   reset to 1 in JS -- being the only item does not give it the full
+   width when its grow factor is a fraction below 1. */
+.pe-editor.pe-narrow > .pe-config,
+.pe-editor.pe-narrow > .pe-divider { display: none; }
 /* Run / pause / stop overlay pinned to the stage canvas top-left. */
 .pe-canvas-ctl {
   position: absolute; top: 8px; left: 8px; z-index: 6;
@@ -846,9 +997,16 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   display: flex; flex-direction: column; gap: 1px;
 }
 .ctx-item {
-  display: block; width: 100%; text-align: left; padding: 6px 10px;
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; text-align: left; padding: 6px 10px;
   background: none; border: 0; color: var(--fg); font: inherit;
   font-size: 12.5px; border-radius: 4px; cursor: pointer;
+}
+.ctx-item-text { flex: 1 1 auto; }
+/* Marks an item that does something else while Shift is held. Always
+   visible: the point is to advertise the modifier, not to confirm it. */
+.ctx-item-mod {
+  flex: 0 0 auto; color: var(--fg-dim); font-size: 11px;
 }
 .ctx-item:hover { background: var(--bg-3); }
 .ctx-item.danger { color: var(--warn); }
@@ -1746,8 +1904,12 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
                z-index: 40; }
 .cmp-edge, .cmp-div { position: absolute; pointer-events: auto; }
 .cmp-edge:hover, .cmp-div:hover { background: var(--accent); opacity: .5; }
-.cmp-edge-v, .cmp-div-h { cursor: ew-resize; }
-.cmp-edge-h, .cmp-div-v { cursor: ns-resize; }
+/* The cursor names the direction the bar MOVES, not the bar's own
+   orientation. Both families use the same 'v'/'h' letter for the same
+   thing -- a 'v' divider is the vertical rule between side-by-side panes,
+   so dragging it redistributes width and the cursor points left/right. */
+.cmp-edge-v, .cmp-div-v { cursor: ew-resize; }
+.cmp-edge-h, .cmp-div-h { cursor: ns-resize; }
 
 /* A pane created by splitting a docked panel: the type chooser, mirroring
    the User I/O workspace's empty pane. */

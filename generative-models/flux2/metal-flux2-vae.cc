@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
+#include "generative-models/shared/kernel-autotune.h"
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
@@ -119,8 +120,23 @@ MetalFlux2Vae::load_conv3x3_(WeightSet& wts, const std::string& nm)
     return f16_buf_(_mc, flat.data(), flat.size());
   }, _part);
   if (c.w.empty()) { return Conv{}; }
-  // HWIO twin for the NAX hardware conv (out-channel fastest).
-  if (_use_hwconv) {
+  // HWIO twin (out-channel fastest). Two consumers, and they do NOT have
+  // the same availability:
+  //
+  //   * conv3x3_hw_, the NAX hardware convolution -- matrix cores (M5+).
+  //   * conv3x3_small_cout_, which keeps the short output vector in
+  //     registers -- plain arithmetic, no matrix cores needed.
+  //
+  // Building the twin only for the first left the second dead on M4: the
+  // kernel loads, then declines every call because c.whwio is empty, and
+  // conv_out (cout=3) falls back to im2col AT FULL RESOLUTION -- the
+  // multi-GB materialization for a ~5 GFLOP convolution that the small-cout
+  // path exists to avoid. So build it whenever EITHER consumer can use it.
+  // Cheap: the small-cout twin is only ever built for cout <= 32, i.e. the
+  // final conv, so it costs 9*Cin*32 halves at worst.
+  const bool want_small_cout_twin =
+      _fn_conv_small_cout.valid() && Cout > 0 && Cout <= kSmallCoutMax;
+  if (_use_hwconv || want_small_cout_twin) {
     c.whwio = wts.derived(k3 + "|hwio", [&]() -> SharedBuffer {
       read_w();
       if (w.empty()) { return {}; }
@@ -302,11 +318,44 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_lib_elt  = mc->load_library("llm_elementwise");
   m->_lib_sdpa = mc->load_library("sdpa");
   m->_fn_gemm_bias   = m->_lib_gemm.function("dense_gemm_bias_f16");
+  // Simdgroup-MMA dense GEMM, x[M,K] @ w[N,K]^T -- the SAME shape the conv
+  // im2col produces, and the same kernels the Krea-2 DiT and MOSS codec use.
+  // Without these the non-matrix-core path fell to dense_gemm_bias_f16, which
+  // is the scalar one-thread-per-output-element GEMM its own comment calls a
+  // fallback; at VAE conv shapes that is ~25x off this box's ALU roofline.
+  // VPIPE_FLUX2_VAE_NO_STEEL_GEMM=1 restores it (A/B).
+  if (std::getenv("VPIPE_FLUX2_VAE_NO_STEEL_GEMM") == nullptr) {
+    m->_fn_gemm_t_bm64     = m->_lib_gemm.function("dense_gemm_t_bm64_f16");
+    m->_fn_gemm_t_bm64bn64 =
+        m->_lib_gemm.function("dense_gemm_t_bm64bn64_f16");
+  }
+  // Direct conv: the same MMA with the im2col done on-chip. Kept behind an
+  // A/B switch because the trade is bandwidth-dependent -- the scratch
+  // round-trip this removes is cheap on a high-bandwidth part (the M5 tensor
+  // twin of this idea is SLOWER there) and expensive on M4.
+  if (std::getenv("VPIPE_VAE_NO_DIRECT_CONV") == nullptr) {
+    m->_fn_conv3x3_s1_bn64 =
+        m->_lib_gemm.function("conv3x3_gemm_s1_bn64_f16");
+    m->_fn_conv3x3_s1_bn32 =
+        m->_lib_gemm.function("conv3x3_gemm_s1_bn32_f16");
+    m->_fn_conv3x3_s2_bn64 =
+        m->_lib_gemm.function("conv3x3_gemm_s2_bn64_f16");
+    m->_fn_conv3x3_s2_bn32 =
+        m->_lib_gemm.function("conv3x3_gemm_s2_bn32_f16");
+    m->_fn_conv3x3_s1_bn128 =
+        m->_lib_gemm.function("conv3x3_gemm_s1_bn128_f16");
+    m->_fn_conv3x3_s2_bn128 =
+        m->_lib_gemm.function("conv3x3_gemm_s2_bn128_f16");
+  }
   m->_fn_groupnorm   = m->_lib_elt.function("group_norm_f16");
   m->_fn_mul_sigmoid = m->_lib_elt.function("mul_sigmoid_f16");
   m->_fn_residual    = m->_lib_elt.function("residual_add_f16");
   m->_fn_clamp       = m->_lib_elt.function("clamp_f16");
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
+  // Materialized-attention pieces (see mat_attn_band_): the row softmax lives
+  // in the sdpa lib, the V transpose in the elementwise one.
+  m->_fn_softmax_rows = m->_lib_sdpa.function("causal_softmax_rows_f16");
+  m->_fn_transpose    = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
   m->_fn_im2col      = m->_lib_elt.function("im2col_hwc_3x3_f16");
   m->_fn_im2col_tiled = m->_lib_elt.function("im2col_hwc_3x3_tiled_f16");
@@ -388,6 +437,7 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       m->_fn_sdpa_full_mma = m->_lib_sdpa_mma.function(fn);
       m->load_wide_attn_(mid_d);
     }
+    m->autotune_mid_attn_(mc, mid_d);
     // Prefer matmul2d flash only where the matrix units make it worthwhile
     // (M5); on M4/older the simdgroup_matrix flash (_fn_sdpa_full_smm) wins.
     m->_use_attn_mma2 = mc->supports_matrix_cores();
@@ -569,15 +619,339 @@ MetalFlux2Vae::load_encoder_(WeightSet& wts)
 // why BQ > 8 needs the register accumulator.
 void MetalFlux2Vae::load_wide_attn_(int mid_d)
 {
-  int bq = kAttnBq;
-  if (const char* e = std::getenv("VPIPE_FLUX2_VAE_ATTN_BQ")) {
-    bq = std::atoi(e);            // 8 keeps the narrow (tg-accumulator) kernel
+  // All three tiles load; autotune_mid_attn_ picks between them. The tile that
+  // wins is a property of the GPU (register file vs bandwidth), so a constant
+  // chosen by a sweep on one machine is the wrong default on the next.
+  const std::string base = "sdpa_full_mma2_d" + std::to_string(mid_d) + "_q";
+  _fn_sdpa_full_wide16 = _lib_sdpa_mma.function(base + "16_f16");
+  _fn_sdpa_full_wide32 = _lib_sdpa_mma.function(base + "32_f16");
+  _fn_sdpa_full_wide64 = _lib_sdpa_mma.function(base + "64_f16");
+}
+
+bool
+MetalFlux2Vae::mid_attn_available_(MidAttn k) const
+{
+  switch (k) {
+    case MidAttn::kScalar: return _fn_sdpa.valid();
+    case MidAttn::kSmm:    return _fn_sdpa_full_smm.valid();
+    case MidAttn::kMma8:   return _fn_sdpa_full_mma.valid();
+    case MidAttn::kWide16: return _fn_sdpa_full_wide16.valid();
+    case MidAttn::kWide32: return _fn_sdpa_full_wide32.valid();
+    case MidAttn::kWide64: return _fn_sdpa_full_wide64.valid();
+    case MidAttn::kMat:
+      return _fn_gemm_t_bm64bn64.valid() && _fn_softmax_rows.valid() &&
+             _fn_transpose.valid();
   }
-  if (bq != 16 && bq != 32 && bq != 64) { return; }
-  const std::string fn = "sdpa_full_mma2_d" + std::to_string(mid_d) + "_q" +
-                         std::to_string(bq) + "_f16";
-  _fn_sdpa_full_wide = _lib_sdpa_mma.function(fn);
-  if (_fn_sdpa_full_wide.valid()) { _attn_bq = bq; }
+  return false;
+}
+
+void
+MetalFlux2Vae::encode_mid_attn_(
+    ComputeEncoder& enc, MidAttn kind, const SharedBuffer& q,
+    const SharedBuffer& k, const SharedBuffer& v, const SharedBuffer& att,
+    std::size_t hw, int C, float scale,
+    const std::function<SharedBuffer&(std::size_t)>& alloc,
+    const std::function<void(const SharedBuffer&)>& release)
+{
+  if (kind == MidAttn::kMat) {
+    // dense_t computes x[M,K] @ w[N,K]^T, so PV needs V as [C, hw].
+    SharedBuffer& vT = alloc(hw * (std::size_t)C);
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, v); enc.set_buffer(1, vT);
+    enc.set_constant(2, (int)hw);           // A
+    enc.set_constant(3, C);                 // B
+    enc.set_constant(4, 1);                 // D (last dim)
+    enc.dispatch({1u, (unsigned)C, (unsigned)hw}, {1u, 32u, 8u});
+    const int bq = mat_attn_band_(hw);
+    SharedBuffer& sc = alloc((std::size_t)bq * hw);
+    auto gemm_t = [&](const SharedBuffer& xb, std::size_t xoff,
+                      const SharedBuffer& wb, const SharedBuffer& yb,
+                      std::size_t yoff, int Kk, int Nn, int Mm) {
+      enc.set_function(_fn_gemm_t_bm64bn64);
+      enc.set_buffer(0, xb, xoff * 2);
+      enc.set_buffer(1, wb); enc.set_buffer(2, wb);   // bias slot unused
+      enc.set_buffer(3, yb, yoff * 2);
+      enc.set_constant(4, Kk); enc.set_constant(5, Nn);
+      enc.set_constant(6, Mm); enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((Nn + 63) / 64) * 32),
+                    (unsigned)(((Mm + 63) / 64) * 2), 2}, {32, 2, 2});
+    };
+    for (int q0 = 0; q0 < (int)hw; q0 += bq) {
+      const int rows = std::min(bq, (int)hw - q0);
+      // scores[rows, hw] = q[q0.., C] @ k[hw, C]^T
+      gemm_t(q, (std::size_t)q0 * C, k, sc, 0, C, (int)hw, rows);
+      // Plain scaled row softmax: q_offset = hw puts every key at or below the
+      // causal bound, so the mask never fires (window/banded off).
+      enc.set_function(_fn_softmax_rows);
+      enc.set_buffer(0, sc);
+      enc.set_constant(1, rows); enc.set_constant(2, (int)hw);
+      enc.set_constant(3, (int)hw);         // q_offset -> unmasked
+      enc.set_constant(4, scale);
+      enc.set_constant(5, 0);               // window
+      enc.set_constant(6, 0);               // banded
+      enc.dispatch({256u, (unsigned)rows, 1u}, {256u, 1, 1});
+      // att[q0.., C] = P[rows, hw] @ vT[C, hw]^T
+      gemm_t(sc, 0, vT, att, (std::size_t)q0 * C, (int)hw, C, rows);
+    }
+    release(sc); release(vT);
+    return;
+  }
+  // Every flash member speaks one buffer contract; only the grid differs.
+  enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
+  enc.set_buffer(3, att);
+  enc.set_constant(4, scale); enc.set_constant(5, (int)hw);
+  enc.set_constant(6, C); enc.set_constant(7, 1); enc.set_constant(8, 1);
+  enc.set_constant(9, (int)hw); enc.set_constant(10, (int)hw);
+  switch (kind) {
+    case MidAttn::kWide16:
+    case MidAttn::kWide32:
+    case MidAttn::kWide64: {
+      const int bq = (kind == MidAttn::kWide16) ? 16
+                   : (kind == MidAttn::kWide32) ? 32 : 64;
+      enc.set_function(kind == MidAttn::kWide16 ? _fn_sdpa_full_wide16
+                     : kind == MidAttn::kWide32 ? _fn_sdpa_full_wide32
+                                                : _fn_sdpa_full_wide64);
+      const unsigned nt = attn_threads_(bq);
+      enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)}, {nt, 1, 1});
+      break;
+    }
+    case MidAttn::kMma8:
+      enc.set_function(_fn_sdpa_full_mma);
+      enc.dispatch({4 * 32, 1, (unsigned)((hw + 7) / 8)}, {4 * 32, 1, 1});
+      break;
+    case MidAttn::kSmm: {
+      enc.set_function(_fn_sdpa_full_smm);
+      const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
+      enc.dispatch({nt, 1, (unsigned)((hw + 31) / 32)}, {nt, 1, 1});
+      break;
+    }
+    default:
+      enc.set_function(_fn_sdpa);                    // scalar O(N^2)
+      enc.dispatch({32, 1, (unsigned)hw}, {32, 1, 1});
+      break;
+  }
+}
+
+// Time every available member on a synthetic mid block and keep the winner.
+// autotune_vote interleaves the candidates each round and scores the per-round
+// winner, so the SoC-power-gated clock cancels instead of handing whichever arm
+// ran first an advantage.
+void
+MetalFlux2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
+{
+  // Capability guess, used as-is when the tune is skipped or cannot run.
+  _attn_pick = MidAttn::kScalar;
+  const bool smm_ok = mid_attn_available_(MidAttn::kSmm) &&
+                      (C % 64 == 0) && (C <= 512);
+  if (smm_ok) { _attn_pick = MidAttn::kSmm; }
+  if (mc->supports_matrix_cores()) {
+    if (mid_attn_available_(MidAttn::kMma8))   { _attn_pick = MidAttn::kMma8; }
+    if (mid_attn_available_(MidAttn::kWide32)) { _attn_pick = MidAttn::kWide32; }
+  }
+  // Honour the existing manual overrides ahead of any measurement.
+  if (std::getenv("VPIPE_FLUX2_VAE_ATTN_SMM") != nullptr && smm_ok) {
+    _attn_pick = MidAttn::kSmm; return;
+  }
+  if (std::getenv("VPIPE_VAE_MAT_ATTN_MMA2") != nullptr &&
+      mid_attn_available_(MidAttn::kMat)) {
+    _attn_pick = MidAttn::kMat; return;
+  }
+  if (const char* e = std::getenv("VPIPE_FLUX2_VAE_ATTN_BQ")) {
+    const int b = std::atoi(e);
+    if (b == 8  && mid_attn_available_(MidAttn::kMma8))   { _attn_pick = MidAttn::kMma8; }
+    if (b == 16 && mid_attn_available_(MidAttn::kWide16)) { _attn_pick = MidAttn::kWide16; }
+    if (b == 32 && mid_attn_available_(MidAttn::kWide32)) { _attn_pick = MidAttn::kWide32; }
+    if (b == 64 && mid_attn_available_(MidAttn::kWide64)) { _attn_pick = MidAttn::kWide64; }
+    return;
+  }
+  // Candidates: everything that loaded, minus the scalar fallback (orders
+  // slower, and only there for a GPU with nothing else). The shared tuner
+  // times them through the SAME encode_mid_attn_ the decode uses.
+  std::vector<MidAttn> cands;
+  for (MidAttn k : {MidAttn::kSmm, MidAttn::kMma8, MidAttn::kWide16,
+                    MidAttn::kWide32, MidAttn::kWide64, MidAttn::kMat}) {
+    if (k == MidAttn::kSmm && !smm_ok) { continue; }
+    if (mid_attn_available_(k)) { cands.push_back(k); }
+  }
+  std::string detail;
+  const auto t0 = std::chrono::steady_clock::now();
+  _attn_pick = vae_mid_attn::autotune<MetalCompute, ComputeEncoder>(
+      mc, C, cands, _attn_pick,
+      [this](ComputeEncoder& enc, MidAttn kind, const SharedBuffer& qq,
+             const SharedBuffer& kk, const SharedBuffer& vv,
+             const SharedBuffer& oo, std::size_t hw, int c, float sc,
+             const vae_mid_attn::Alloc& al, const vae_mid_attn::Release& re) {
+        encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc, al, re);
+      },
+      &detail);
+  const double tune_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  if (mc->session() != nullptr && !detail.empty()) {
+    // VPIPE_VAE_ATTN_TUNE_LOG promotes this to a normal log line. Which member
+    // won is the whole point of the tune and differs per machine, so it has to
+    // be observable without a debug build when porting to a new GPU.
+    const auto line = fmt(
+        "MetalFlux2Vae: mid-attn autotune (D={}) -> {} [{}] in {} ms",
+        C, vae_mid_attn::name(_attn_pick), detail, (long long)tune_ms);
+    if (std::getenv("VPIPE_VAE_ATTN_TUNE_LOG") != nullptr) {
+      mc->session()->log_normal(line);
+    } else {
+      mc->session()->log_debug(line);
+    }
+  }
+}
+
+// Time the two 3x3 fallback routes on a synthetic conv and keep the winner.
+// The probe runs through tiled_conv3x3_ -- the SHIPPING entrance -- with
+// _conv_pick steering it, so what is measured is the route a decode would
+// actually take, im2col arm and matmul2d GEMM included. Benching the kernels
+// in isolation is what made the earlier conv-phase numbers misleading: that
+// harness compared the on-chip gather against a STEEL GEMM, not against the
+// matrix-core one an M5 really uses.
+// Will any 3x3 in this pass miss the hardware conv? That op needs whole 8x8
+// destination tiles, cout % 64, and int32-addressable extents, so it declines
+// on a grid that is not a multiple of 8 or once cin*W*H passes 2^31. If none
+// of that bites, the fallback carries nothing and the tune would be pure load
+// time. conv_out is excluded: it has its own small-cout kernel.
+void
+MetalFlux2Vae::maybe_tune_conv_(int H, int W)
+{
+  if (_conv_tuned || _mc == nullptr) { return; }
+  _conv_tuned = true;
+  // An explicit force still has to populate the map, or the override silently
+  // does nothing at a resolution where the fallback would not otherwise run --
+  // which is exactly how the direct-conv A/B went vacuous once before.
+  if (std::getenv("VPIPE_VAE_DIRECT_CONV_MMA2") != nullptr) {
+    _conv_force_onchip = true;
+    return;
+  }
+  bool needed = !_use_hwconv;
+  if (!needed) {
+    constexpr std::size_t kIdxMax = 0x7fffffffull;
+    int h = H, w = W;                       // walk the decoder's pyramid
+    for (int lvl = 3; lvl >= 0 && !needed; --lvl) {
+      const int cin = _cfg.block_out[lvl];
+      if ((h % 8) != 0 || (w % 8) != 0) { needed = true; break; }
+      if ((std::size_t)cin * w * h > kIdxMax) { needed = true; break; }
+      h /= 2; w /= 2;
+    }
+  }
+  if (!needed) { return; }
+  autotune_conv3x3_(_mc);
+}
+
+vae_conv3x3::Kind
+MetalFlux2Vae::conv_route_(int cin, int cout) const
+{
+  if (_conv_force_onchip) { return vae_conv3x3::Kind::kOnChip; }
+  const auto it = _conv_pick.find(std::make_pair(cin, cout));
+  return (it != _conv_pick.end()) ? it->second : vae_conv3x3::Kind::kIm2col;
+}
+
+void
+MetalFlux2Vae::autotune_conv3x3_(MetalCompute* mc)
+{
+  const bool have_direct =
+      _fn_conv3x3_s1_bn32.valid() || _fn_conv3x3_s1_bn64.valid();
+  if (!have_direct) { return; }                 // nothing to choose
+
+  // Every distinct (cin, cout) this decoder's 3x3s use, minus the shapes that
+  // never reach the fallback: cin % 32 != 0 (the on-chip gather declines) and
+  // cout <= kSmallCoutMax (conv_out, which has its own kernel).
+  std::vector<std::pair<int, int>> shapes;
+  auto want = [&](const Conv& c) {
+    if (c.cin <= 0 || (c.cin % 32) != 0 || c.cout <= kSmallCoutMax) { return; }
+    const auto key = std::make_pair(c.cin, c.cout);
+    for (const auto& s : shapes) { if (s == key) { return; } }
+    shapes.push_back(key);
+  };
+  auto want_rb = [&](const ResBlock& rb) {
+    want(rb.c1); want(rb.c2);
+  };
+  want(_conv_in); want_rb(_mid_res0); want_rb(_mid_res1);
+  for (const UpBlock& ub : _up_blocks) {
+    for (const ResBlock& rb : ub.resnets) { want_rb(rb); }
+    if (ub.has_up) { want(ub.up); }
+  }
+  if (shapes.empty()) { return; }
+  // The probe resolution SCALES WITH THE SHAPE, because in a U-net decoder
+  // channel count and resolution are inversely related: the 512-channel convs
+  // run at the smallest grid and the 128-channel ones at full size. Probing
+  // every shape at one resolution is wrong in both directions -- MEASURED, a
+  // flat 128x128 probe called 128->128 for im2col (2.099 vs 2.255 ms) while at
+  // the 256x256/512x512/768x768 where that conv actually runs the on-chip
+  // gather wins by 1.10x. Sizing the probe as block_out[3]/cout tracks the
+  // pyramid and, because a U-net holds work roughly constant per level, keeps
+  // every shape's tune about equally cheap.
+  int probe_base = 64;
+  if (const char* e = std::getenv("VPIPE_VAE_CONV_TUNE_HW")) {
+    probe_base = std::max(32, std::atoi(e));
+  }
+  const std::vector<vae_conv3x3::Kind> cands = {
+      vae_conv3x3::Kind::kIm2col, vae_conv3x3::Kind::kOnChip};
+  std::string detail;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const auto& sh : shapes) {
+    const int cin = sh.first, cout = sh.second;
+    const int top = _cfg.block_out[3] > 0 ? _cfg.block_out[3] : cout;
+    const int H = std::min(256, std::max(probe_base,
+                                         probe_base * (top / std::max(1, cout))));
+    const int W = H;
+    Conv c;
+    c.cin = cin; c.cout = cout; c.k = 9 * cin;
+    c.w = mc->make_shared_buffer((std::size_t)cout * 9 * cin * 2);
+    c.b = mc->make_shared_buffer((std::size_t)cout * 2);
+    SharedBuffer in  = mc->make_shared_buffer((std::size_t)H * W * cin * 2);
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)H * W * cout * 2);
+    const std::size_t cap = (std::size_t)H * W * 9 * cin;
+    SharedBuffer col = mc->make_shared_buffer(cap * 2);
+    if (c.w.empty() || c.b.empty() || in.empty() || out.empty() ||
+        col.empty()) {
+      continue;                                 // leave this shape on im2col
+    }
+    {
+      auto* pw = static_cast<_Float16*>(c.w.contents());
+      for (std::size_t i = 0; i < (std::size_t)cout * 9 * cin; ++i) {
+        pw[i] = (_Float16)(((float)(i % 37) - 18.0f) * 0.002f);
+      }
+      auto* pb = static_cast<_Float16*>(c.b.contents());
+      for (int i = 0; i < cout; ++i) { pb[i] = (_Float16)0.01f; }
+      auto* pi = static_cast<_Float16*>(in.contents());
+      for (std::size_t i = 0; i < (std::size_t)H * W * cin; ++i) {
+        pi[i] = (_Float16)(((float)(i % 53) - 26.0f) * 0.01f);
+      }
+    }
+    std::string one;
+    // The probe runs through tiled_conv3x3_, the SHIPPING entrance, with the
+    // map steering it -- so what is timed is the route a decode really takes,
+    // matmul2d GEMM included. Benching the kernels standalone is what made the
+    // conv-phase numbers misleading: that harness compared the gather against
+    // a STEEL GEMM, not the matrix-core one this path actually reaches.
+    _conv_pick[sh] = vae_conv3x3::autotune(
+        "flux2", cin, cout, /*stride=*/1, cands, vae_conv3x3::Kind::kIm2col,
+        [&](int i) -> double {
+          _conv_pick[sh] = cands[(std::size_t)i];
+          return autotune_time(mc, 1, [&](ComputeEncoder& enc) {
+            tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/1, col, cap);
+          });
+        },
+        &one);
+    if (!detail.empty()) { detail += ", "; }
+    detail += std::to_string(cin) + "->" + std::to_string(cout) + " " +
+              vae_conv3x3::name(_conv_pick[sh]);
+    if (!one.empty()) { detail += " (" + one + ")"; }
+  }
+  const double tune_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  if (mc->session() != nullptr && !detail.empty()) {
+    const auto line = fmt("MetalFlux2Vae: conv3x3 autotune -- {} in {} ms",
+                          detail, (long long)tune_ms);
+    if (std::getenv("VPIPE_VAE_ATTN_TUNE_LOG") != nullptr) {
+      mc->session()->log_normal(line);
+    } else {
+      mc->session()->log_debug(line);
+    }
+  }
 }
 
 void
@@ -734,6 +1108,33 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
     }
     return;
   }
+  // No matrix cores: the simdgroup-MMA GEMM, not the scalar one. Same
+  // math, same [M,K]x[N,K]^T shape; bias is folded afterwards by
+  // bias_add_rows exactly as the matmul2d path does (these entry points
+  // have a bias slot, but the proven-in-this-file route is the separate
+  // pass, and it costs one cheap dispatch).
+  const bool wide_n = N >= 64 && _fn_gemm_t_bm64bn64.valid();
+  const metal_compute::ComputeFunction& gt =
+      wide_n ? _fn_gemm_t_bm64bn64 : _fn_gemm_t_bm64;
+  if (gt.valid()) {
+    const int bm = 64, bn = wide_n ? 64 : 32;
+    enc.set_function(gt);
+    enc.set_buffer(0, x); enc.set_buffer(1, w); enc.set_buffer(2, w);
+    enc.set_buffer(3, y, ybase * 2);
+    enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, M);
+    enc.set_constant(7, 0);
+    enc.dispatch({(unsigned)(((N + bn - 1) / bn) * 32),
+                  (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+    if (!b.empty()) {
+      enc.set_function(_fn_bias_add);
+      enc.set_buffer(0, y, ybase * 2); enc.set_buffer(1, b);
+      enc.set_constant(2, N);
+      enc.set_constant(3, (unsigned)((std::size_t)M * N));
+      // 2D grid {N, M}: a 1D {M*N} grid overflows at VAE sizes.
+      enc.dispatch({(unsigned)N, (unsigned)M, 1}, {256, 1, 1});
+    }
+    return;
+  }
   enc.set_function(_fn_gemm_bias);
   enc.set_buffer(0, x); enc.set_buffer(1, w);
   enc.set_buffer(2, b.empty() ? w : b); enc.set_buffer(3, y, ybase * 2);
@@ -743,12 +1144,85 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
                 (unsigned)(((M + 15) / 16) * 16), 1}, {16, 16, 1});
 }
 
+int
+MetalFlux2Vae::mat_attn_band_(std::size_t hw) const noexcept
+{
+  if (hw == 0) { return 0; }
+  // Largest 64-row-aligned band whose [band, hw] f16 scores fit the cap. 64 is
+  // the GEMM's BM, so a band boundary never splits an output tile.
+  std::size_t band = kMatAttnScoreBytes / (hw * 2);
+  if (band > hw) { band = hw; }
+  band &= ~(std::size_t)63;
+  if (band < 64) { band = std::min<std::size_t>(hw, 64); }
+  return (int)band;
+}
+
+bool
+MetalFlux2Vae::direct_conv3x3_(ComputeEncoder& enc, const SharedBuffer& in,
+                               const SharedBuffer& out, int H, int W,
+                               const Conv& c, int stride)
+{
+  // Whether this GPU wants the on-chip gather at all is MEASURED in
+  // autotune_conv3x3_ (see vae-conv3x3-tune.h). It is not a capability
+  // question: this kernel runs the contraction on simdgroup MMA, and where
+  // matmul2d is available the im2col arm it replaces already reaches the
+  // matrix units -- so on an M5 stepping in front of that is a downgrade,
+  // while on an M4 Pro the round trip it removes is the whole cost.
+  if (conv_route_(c.cin, c.cout) != vae_conv3x3::Kind::kOnChip) {
+    return false;
+  }
+  // The gather only vectorizes when a K tile is one tap, i.e. cin % 32 == 0
+  // (BK). Anything else falls to the per-element divide form, which measured
+  // SLOWER than im2col -- so keep those shapes (conv_in's tiny cin) on im2col.
+  const bool s2 = (stride == 2);
+  if (c.cin % 32 != 0) { return false; }
+  // BN=64 measured FASTER than BN=128 once the gather vectorized (13.00 vs
+  // 13.90 ms at cout=128): with the gather no longer the cost, the narrower
+  // tile's lower threadgroup-memory footprint wins on occupancy. The wider
+  // entry stays for A/B under VPIPE_VAE_CONV_BN128.
+  static const bool want128 = std::getenv("VPIPE_VAE_CONV_BN128") != nullptr;
+  int bn = 32;
+  const metal_compute::ComputeFunction* fnp =
+      s2 ? &_fn_conv3x3_s2_bn32 : &_fn_conv3x3_s1_bn32;
+  if (want128 && c.cout >= 128 &&
+      (s2 ? _fn_conv3x3_s2_bn128 : _fn_conv3x3_s1_bn128).valid()) {
+    bn = 128;
+    fnp = s2 ? &_fn_conv3x3_s2_bn128 : &_fn_conv3x3_s1_bn128;
+  } else if (c.cout >= 64 &&
+             (s2 ? _fn_conv3x3_s2_bn64 : _fn_conv3x3_s1_bn64).valid()) {
+    bn = 64;
+    fnp = s2 ? &_fn_conv3x3_s2_bn64 : &_fn_conv3x3_s1_bn64;
+  }
+  const metal_compute::ComputeFunction& fn = *fnp;
+  if (!fn.valid()) { return false; }
+  const int OH = (stride == 2) ? H / 2 : H;
+  const int OW = (stride == 2) ? W / 2 : W;
+  const int M = OH * OW;
+  if (M <= 0 || c.cin <= 0 || c.cout <= 0) { return false; }
+  const int bm = 64;
+  enc.set_function(fn);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, c.w);
+  enc.set_buffer(2, c.b.empty() ? c.w : c.b);
+  enc.set_buffer(3, out);
+  enc.set_constant(4, H);      enc.set_constant(5, W);
+  enc.set_constant(6, c.cin);  enc.set_constant(7, c.cout);
+  enc.set_constant(8, OH);     enc.set_constant(9, OW);
+  enc.set_constant(10, c.b.empty() ? 0 : 1);
+  enc.dispatch({(unsigned)(((c.cout + bn - 1) / bn) * 32),
+                (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+  return true;
+}
+
 void
 MetalFlux2Vae::tiled_conv3x3_(ComputeEncoder& enc, const SharedBuffer& in,
                               const SharedBuffer& out, int H, int W,
                               const Conv& c, int stride, const SharedBuffer& col,
                               std::size_t cap)
 {
+  // No scratch, no row banding, no im2col round-trip -- the whole conv is one
+  // dispatch when the direct kernel is available.
+  if (direct_conv3x3_(enc, in, out, H, W, c, stride)) { return; }
   const int OH = (stride == 2) ? H / 2 : H;
   const int OW = (stride == 2) ? W / 2 : W;
   const std::size_t ohw = (std::size_t)OH * OW;
@@ -822,6 +1296,128 @@ MetalFlux2Vae::decode_peak_bytes(int h16, int w16) const noexcept
   return im2col * 2;
 }
 
+int
+MetalFlux2Vae::decode_tile_side_(std::size_t budget) const noexcept
+{
+  if (budget == 0) { return 0; }
+  // Walk down in 4-cell steps; decode_peak_bytes is monotone in the side, so
+  // the first fit is the largest. (A side is latent cells; one cell is
+  // patch*8 output pixels.)
+  for (int s = 128; s >= kTileMin16; s -= 4) {
+    if (decode_peak_bytes(s, s) <= budget) { return s; }
+  }
+  return 0;
+}
+
+SharedBuffer
+MetalFlux2Vae::decode_tiled_(const SharedBuffer& z, int h16, int w16,
+                             int tile16, std::string* err)
+{
+  auto fail = [&](std::string m) -> SharedBuffer {
+    if (err != nullptr) { *err = std::move(m); }
+    return {};
+  };
+  const int Cdit = _cfg.dit_channels();
+  const int px = _cfg.patch * 8;                 // output pixels per cell
+  const int H = h16 * px, W = w16 * px;
+  if (tile16 < kTileMin16) { return fail("tiled decode: window too small"); }
+  const int ov = std::max(2, tile16 * kTileOvNum / kTileOvDen);
+  const int step = tile16 - ov;
+  if (step < 1) { return fail("tiled decode: overlap exceeds the window"); }
+
+  const std::size_t hw = (std::size_t)H * W;
+  std::vector<float> acc((std::size_t)3 * hw, 0.0f);   // weighted RGB sum
+  std::vector<float> wsum(hw, 0.0f);                   // weight sum
+  const auto* zsrc = static_cast<const _Float16*>(z.contents());
+  if (zsrc == nullptr) { return fail("tiled decode: latent not host-visible"); }
+
+  // Cross-fade weight for an OUTPUT pixel: ramps up over the overlap unless the
+  // window starts at the image edge, down over it unless the window ends there,
+  // so interior windows sum to 1 across a seam. The ramp width is the overlap
+  // in PIXELS (ov is latent cells, one cell = px pixels) -- ramping over `ov`
+  // pixels instead fades across 1/16th of the overlap and leaves a visible
+  // seam, which the per-column check below catches.
+  const int ovp = ov * px;
+  auto ramp = [&](int i, int n, bool at_lo, bool at_hi) {
+    float w = 1.0f;
+    if (!at_lo && i < ovp)          { w = (float)(i + 1) / (float)(ovp + 1); }
+    if (!at_hi && i >= n - ovp) {
+      const float t = (float)(n - i) / (float)(ovp + 1);
+      w = std::min(w, t);
+    }
+    return std::max(w, 1e-3f);
+  };
+
+  int ntiles = 0;
+  for (int y0 = 0; y0 < h16; y0 += step) {
+    const int th = std::min(tile16, h16 - y0);
+    if (th <= 0) { break; }
+    const bool y_lo = (y0 == 0), y_hi = (y0 + th >= h16);
+    for (int x0 = 0; x0 < w16; x0 += step) {
+      const int tw = std::min(tile16, w16 - x0);
+      if (tw <= 0) { break; }
+      const bool x_lo = (x0 == 0), x_hi = (x0 + tw >= w16);
+      // Slice the latent window out of z[Cdit, h16, w16] (channel-first).
+      SharedBuffer zt =
+          _mc->make_shared_buffer((std::size_t)Cdit * th * tw * 2);
+      if (zt.empty()) { return fail("tiled decode: window latent alloc failed"); }
+      auto* zd = static_cast<_Float16*>(zt.contents());
+      for (int c = 0; c < Cdit; ++c) {
+        for (int y = 0; y < th; ++y) {
+          const _Float16* srow =
+              zsrc + ((std::size_t)c * h16 + (y0 + y)) * w16 + x0;
+          _Float16* drow = zd + ((std::size_t)c * th + y) * tw;
+          for (int x = 0; x < tw; ++x) { drow[x] = srow[x]; }
+        }
+      }
+      std::string terr;
+      SharedBuffer rgb = decode(zt, th, tw, &terr);
+      if (rgb.empty()) {
+        return fail(terr.empty() ? std::string("tiled decode: window failed")
+                                 : terr);
+      }
+      // Cross-fade the window into the accumulator (planar RGB, f16).
+      const int tH = th * px, tW = tw * px;
+      const std::size_t thw = (std::size_t)tH * tW;
+      const auto* rs = static_cast<const _Float16*>(rgb.contents());
+      for (int y = 0; y < tH; ++y) {
+        const float wy = ramp(y, tH, y_lo, y_hi);
+        const std::size_t orow = (std::size_t)(y0 * px + y) * W + x0 * px;
+        for (int x = 0; x < tW; ++x) {
+          const float wgt = wy * ramp(x, tW, x_lo, x_hi);
+          const std::size_t op = orow + x;
+          const std::size_t tp = (std::size_t)y * tW + x;
+          for (int c = 0; c < 3; ++c) {
+            acc[(std::size_t)c * hw + op] +=
+                wgt * (float)rs[(std::size_t)c * thw + tp];
+          }
+          wsum[op] += wgt;
+        }
+      }
+      ++ntiles;
+      if (x_hi) { break; }
+    }
+    if (y_hi) { break; }
+  }
+
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)3 * hw * 2);
+  if (out.empty()) { return fail("tiled decode: output alloc failed"); }
+  auto* od = static_cast<_Float16*>(out.contents());
+  for (std::size_t p = 0; p < hw; ++p) {
+    const float inv = (wsum[p] > 0.0f) ? 1.0f / wsum[p] : 0.0f;
+    for (int c = 0; c < 3; ++c) {
+      od[(std::size_t)c * hw + p] = (_Float16)(acc[(std::size_t)c * hw + p] * inv);
+    }
+  }
+  if (_mc->session() != nullptr) {
+    _mc->session()->log_normal(fmt(
+        "FLUX.2 VAE decode: TILED {}x{} from {} windows of {} latent cells "
+        "(overlap {}) -- per-window attention, cross-faded seams",
+        W, H, ntiles, tile16, ov));
+  }
+  return out;
+}
+
 SharedBuffer
 MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
 {
@@ -847,7 +1443,58 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
     decode_headroom = (mb.recommended != 0) ? mb.headroom : 0;
     const std::size_t need = decode_peak_bytes(h16, w16);
-    if (mb.recommended != 0 && !mb.fits(need)) {
+    bool gpu_short = (mb.recommended != 0) && !mb.fits(need);
+    bool ram_short = !mb.fits_physical(need);
+    // Test/capacity hook: pretend the decode budget is this many MB. The
+    // auto-switch is a DECISION about memory, and a 64 GB box can never take
+    // the short branch on its own -- without this the fallback would only ever
+    // be exercised on the hardware that needs it. (VPIPE_RAM_LIMIT_MB does not
+    // apply here: that one sizes model_memory against total RAM, not this live
+    // per-decode budget.)
+    std::size_t budget_override = 0;
+    if (const char* e = std::getenv("VPIPE_VAE_BUDGET_MB")) {
+      budget_override = (std::size_t)std::max(0, std::atoi(e)) << 20;
+      if (budget_override != 0) {
+        gpu_short = need > budget_override;
+        ram_short = need > budget_override;
+      }
+    }
+    // Force-tile knob (A/B and testing on a box that would otherwise fit).
+    int forced = 0;
+    if (const char* e = std::getenv("VPIPE_VAE_TILE")) { forced = std::atoi(e); }
+    if (gpu_short || ram_short || forced > 0) {
+      // Fall back to a TILED decode rather than refusing: the peak then tracks
+      // one window, not the output area. See decode_tiled_ for what this costs
+      // numerically (per-window attention). Tiling only helps if the window is
+      // actually smaller than the image -- if the whole latent already fits in
+      // one window and still does not fit in memory, there is nothing to split,
+      // so fail as before (this is also what terminates the recursion, since
+      // decode_tiled_ re-enters decode() per window).
+      // Size the window against the SAME MARGINED budgets the accept tests
+      // above use. fits()/fits_physical() keep 5%/10% back, so sizing against
+      // the raw figures hands back the largest window inside that reserve --
+      // which the window's own decode() then rejects. And because that window
+      // is the whole latent, the recursion has nowhere left to go and the
+      // decode fails outright instead of tiling. MEASURED on a 16 GB box at
+      // 2048x2048: need 7406 MB against 7796 MB reclaimable picked a 92-cell
+      // window, 10% over what fits_physical would accept, and no image above
+      // ~1.5K could decode at all.
+      std::size_t budget = (std::size_t)-1;
+      if (mb.available_physical != 0) {
+        budget = (std::size_t)((double)mb.available_physical * 0.90);
+      }
+      if (mb.recommended != 0) {
+        const auto gpu = (std::size_t)((double)mb.headroom * 0.95);
+        if (gpu < budget) { budget = gpu; }
+      }
+      if (budget_override != 0) { budget = budget_override; }
+      int tile16 = (forced > 0) ? forced : decode_tile_side_(budget);
+      if (tile16 > 0 && (tile16 < h16 || tile16 < w16) &&
+          std::getenv("VPIPE_VAE_NO_TILE") == nullptr) {
+        return decode_tiled_(z, h16, w16, tile16, err);
+      }
+    }
+    if (gpu_short) {
       return fail(fmt(
           "insufficient GPU memory for a {}x{} decode: need ~{} MB, {} MB free "
           "of {} MB working set (lower the resolution or free other resident "
@@ -857,7 +1504,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
     // True-physical-pressure backstop: reclaimable RAM (counting mmap'd/clean
     // weight pages the OS can evict) must also cover the decode, else the GPU
     // command buffer would OOM mid-flight instead of a clean rejection here.
-    if (!mb.fits_physical(need)) {
+    if (ram_short) {
       return fail(fmt(
           "insufficient free RAM for a {}x{} decode: need ~{} MB, ~{} MB "
           "reclaimable (close other apps, lower the resolution, or free "
@@ -871,6 +1518,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   // (c, ph, pw) -> channel c*P*P + ph*P + pw at (2i+ph, 2j+pw).
   // NOTE: VERIFY the unshuffle channel order + bn inversion vs a golden.
   const std::size_t hw8 = (std::size_t)h8 * w8;
+  maybe_tune_conv_(Hout, Wout);
   SharedBuffer latent = mc->make_shared_buffer(hw8 * (std::size_t)L * 2);
   if (latent.empty()) { return fail("latent allocation failed"); }
   {
@@ -1077,32 +1725,10 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
       release(n);                          // consumed by q, k, v
       SharedBuffer& att = alloc(hw * C);
       const float scale = 1.0f / std::sqrt((float)C);
-      enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
-      enc.set_buffer(3, att);
-      enc.set_constant(4, scale); enc.set_constant(5, (int)hw);
-      enc.set_constant(6, C); enc.set_constant(7, 1); enc.set_constant(8, 1);
-      enc.set_constant(9, (int)hw); enc.set_constant(10, (int)hw);
-      // matmul2d flash on M5 (hardware matrix cores); simdgroup_matrix flash
-      // (sdpa_full_mma_f16) elsewhere -- it needs no matrix cores, so it is the
-      // fast path on M4/older where emulated matmul2d is slow. Scalar last.
-      const bool smm = _fn_sdpa_full_smm.valid() && (C % 64 == 0) && (C <= 512);
-      const bool mma2 = _fn_sdpa_full_mma.valid() && _use_attn_mma2;
-      if (mma2 && !(smm && std::getenv("VPIPE_FLUX2_VAE_ATTN_SMM"))) {
-        // Wide query tile where it loaded (see load_wide_attn_): same math,
-        // fewer threadgroups, so proportionally less K/V streamed.
-        const int bq = _fn_sdpa_full_wide.valid() ? _attn_bq : 8;
-        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
-        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
-        enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)},
-                     {nt, 1, 1});
-      } else if (smm) {
-        enc.set_function(_fn_sdpa_full_smm);           // simdgroup_matrix
-        const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
-        enc.dispatch({nt, 1, (unsigned)((hw + 31) / 32)}, {nt, 1, 1});
-      } else {
-        enc.set_function(_fn_sdpa);                    // scalar O(N^2)
-        enc.dispatch({32, 1, (unsigned)hw}, {32, 1, 1});
-      }
+      // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale,
+                       [&](std::size_t n) -> SharedBuffer& { return alloc(n); },
+                       [&](const SharedBuffer& b) { release(b); });
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hw, a.proj);
       release(att);
@@ -1242,6 +1868,7 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   const float geps = _cfg.norm_eps;
   MetalCompute* mc = _mc;
   if (img.byte_size() < (std::size_t)3 * H0 * W0 * 2) { return {}; }
+  maybe_tune_conv_(H0, W0);
 
   // Buffer pool with reuse (see decode()): bounds the live set to the
   // concurrent working set. VPIPE_FLUX2_NO_VAE_POOL disables reuse.
@@ -1403,32 +2030,10 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       release(n);                          // consumed by q, k, v
       SharedBuffer& att = alloc(hw * C);
       const float scale = 1.0f / std::sqrt((float)C);
-      enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
-      enc.set_buffer(3, att);
-      enc.set_constant(4, scale); enc.set_constant(5, (int)hw);
-      enc.set_constant(6, C); enc.set_constant(7, 1); enc.set_constant(8, 1);
-      enc.set_constant(9, (int)hw); enc.set_constant(10, (int)hw);
-      // matmul2d flash on M5 (hardware matrix cores); simdgroup_matrix flash
-      // (sdpa_full_mma_f16) elsewhere -- it needs no matrix cores, so it is the
-      // fast path on M4/older where emulated matmul2d is slow. Scalar last.
-      const bool smm = _fn_sdpa_full_smm.valid() && (C % 64 == 0) && (C <= 512);
-      const bool mma2 = _fn_sdpa_full_mma.valid() && _use_attn_mma2;
-      if (mma2 && !(smm && std::getenv("VPIPE_FLUX2_VAE_ATTN_SMM"))) {
-        // Wide query tile where it loaded (see load_wide_attn_): same math,
-        // fewer threadgroups, so proportionally less K/V streamed.
-        const int bq = _fn_sdpa_full_wide.valid() ? _attn_bq : 8;
-        const unsigned nt = (bq == 8) ? 4u * 32u : attn_threads_(bq);
-        enc.set_function(bq == 8 ? _fn_sdpa_full_mma : _fn_sdpa_full_wide);
-        enc.dispatch({nt, 1, (unsigned)(((int)hw + bq - 1) / bq)},
-                     {nt, 1, 1});
-      } else if (smm) {
-        enc.set_function(_fn_sdpa_full_smm);           // simdgroup_matrix
-        const unsigned nt = 4u * (unsigned)(C / 64) * 32u;   // WM*WD*32
-        enc.dispatch({nt, 1, (unsigned)((hw + 31) / 32)}, {nt, 1, 1});
-      } else {
-        enc.set_function(_fn_sdpa);                    // scalar O(N^2)
-        enc.dispatch({32, 1, (unsigned)hw}, {32, 1, 1});
-      }
+      // The member is chosen ONCE, by measurement, in autotune_mid_attn_.
+      encode_mid_attn_(enc, _attn_pick, q, k, v, att, hw, C, scale,
+                       [&](std::size_t n) -> SharedBuffer& { return alloc(n); },
+                       [&](const SharedBuffer& b) { release(b); });
       release(q); release(k); release(v);  // consumed by the sdpa
       SharedBuffer& p = conv1x1(att, hw, a.proj);
       release(att);

@@ -36,6 +36,8 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   // (when iport connectivity is known), not here.
   _hf_dir    = attr_str("hf_dir");
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  _fps = attr_real("fps");
+  if (!(_fps > 0.0)) { _fps = 16.0; }
   {
     bool bad = false;
     _unload_cfg = model_memory::parse_unload_policy(
@@ -66,6 +68,12 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit"},
+  {.key = "fps", .type = ConfigType::Real, .required = false,
+   .doc = "frame rate stamped on each decoded VIDEO frame's sideband when the "
+          "latent does not carry one. Wan latents from generate-video do, so "
+          "this is the fallback for a latent read from elsewhere. Ignored by "
+          "the image VAEs",
+   .def_real = 16.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "This stage is idle for the whole denoise, so on a memory-bounded box "
@@ -122,6 +130,11 @@ vae_family_(const std::string& vae_dir)
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
+        // The VIDEO VAE. Same tensor names as the Qwen-Image one
+        // (it IS the general form of it), so the class name is the
+        // only thing that tells them apart -- and getting it wrong
+        // would decode a video latent as a single still.
+        if (cls == "AutoencoderKLWan") { return "wan"; }
       }
     }
   }
@@ -348,6 +361,26 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
+  if (_family == "wan") {
+    genai::MetalWanVae::Config wcfg;
+    std::string werr;
+    if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr)) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): {}; inert", this->id(), werr));
+      return;
+    }
+    load_note_(fmt("VaeDecodeStage('{}'): loading Wan video VAE from '{}'",
+                   this->id(), vae_dir));
+    // Decode-only: the encoder half is the vae-encode stage's business.
+    _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/false);
+    if (!_wan_vae) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): failed to load the Wan VAE from '{}'; inert",
+          this->id(), vae_dir));
+    }
+    return;
+  }
+
   if (_family == "mage") {
     load_note_(fmt("VaeDecodeStage('{}'): loading MageVAE from '{}'",
                         this->id(), vae_dir));
@@ -422,7 +455,7 @@ VaeDecodeStage::ensure_loaded_()
 
 namespace {
 
-// Carry the generating model forward. text-to-image stamps `model_name` onto
+// Carry the generating model forward. generate-image stamps `model_name` onto
 // the latent's sideband; the decoded image inherits it so a downstream
 // save-image can record what produced the pixels. Anything else already on
 // the latent's sideband is left behind -- it describes the LATENT, not the
@@ -463,11 +496,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // A previous beat may have dropped the VAE to leave the denoise room.
   if (_unloaded) { reload_vae_(); }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
+  // A video latent carries a time axis, so the wan family arrives 4-D
+  // ([z, T, H/8, W/8]) where every image VAE here is 3-D.
   if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32 ||
-      tbp->shape.size() != 3) {
+      (tbp->shape.size() != 3 && tbp->shape.size() != 4)) {
     session()->warn(fmt(
-        "VaeDecodeStage('{}'): expected an f32 [z,H/8,W/8] latent TensorBeat, "
-        "got {}; skipping", this->id(), in->describe()));
+        "VaeDecodeStage('{}'): expected an f32 [z,H/8,W/8] latent TensorBeat "
+        "(or [z,T,H/8,W/8] for a video VAE), got {}; skipping", this->id(),
+        in->describe()));
     co_return;
   }
   // ---- Content-policy refusal ------------------------------------------
@@ -580,6 +616,131 @@ VaeDecodeStage::process(RuntimeContext& ctx)
 
   // ---- Mage-Flow MageVAE: input [128, H/16, W/16]; decode straight to RGB in
   // [-1,1] (no per-channel un-whiten -- MageVAE has no latents_mean/std). ----
+  // ---- Wan video VAE: input [z_dim, T, h8, w8]; decode to
+  // F = 1 + 4*(T-1) RGB frames, emitted ONE BEAT PER FRAME so the whole
+  // downstream (save-image, rgb-to-video -> save-video, a preview) is the
+  // per-frame machinery that already exists. ----
+  if (_family == "wan") {
+    if (!_wan_vae) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): Wan VAE not loaded; skipping", this->id()));
+      co_return;
+    }
+    if (tbp->shape.size() != 4) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the Wan VAE decodes a VIDEO latent "
+          "[z, T, H/8, W/8]; got a {}-D tensor. Skipping", this->id(),
+          tbp->shape.size()));
+      co_return;
+    }
+    const int Cz = (int)tbp->shape[0];
+    const int T  = (int)tbp->shape[1];
+    const int h8 = (int)tbp->shape[2];
+    const int w8 = (int)tbp->shape[3];
+    if (Cz != _wan_vae->config().z_dim || T <= 0 || h8 <= 0 || w8 <= 0) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match z_dim "
+          "{}; skipping", this->id(), Cz, T, h8, w8,
+          _wan_vae->config().z_dim));
+      co_return;
+    }
+    // The producer knows the clip's rate; the config is the fallback for a
+    // latent that arrived from somewhere else (a file, a test).
+    double fps = _fps;
+    if (tbp->sideband.is_object()) {
+      FlexData sb = tbp->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
+        fps = o.at("fps").as_real(fps);
+      }
+    }
+    const int F = genai::MetalWanVae::video_frames(T);
+    const int H = h8 * 8, W = w8 * 8;
+
+    const std::size_t nz = (std::size_t)Cz * T * h8 * w8;
+    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
+    { auto* d = static_cast<_Float16*>(z.contents());
+      const float* s = tbp->as_f32();
+      for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
+    metal_compute::SharedBuffer zw = _wan_vae->unwhiten(z, T, h8, w8);
+    if (zw.empty()) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): un-whiten failed; skipping", this->id()));
+      co_return;
+    }
+
+    // The VAE streams its output a chunk at a time so a long clip never
+    // exists in f16 all at once. The beat boundary cannot stream with it:
+    // ctx.write is a coroutine and the sink is a plain callback, so the
+    // frames are converted to U8 in the sink -- where the f16 chunk is
+    // still alive and is then dropped -- and written out afterwards. What
+    // is held is the clip as planar U8 RGB, which is a THIRD of the f16 it
+    // replaces (81 frames of 480x832 = 97 MB), not the f16 working set the
+    // chunking exists to bound.
+    std::vector<std::unique_ptr<TensorBeatPayload>> frames;
+    frames.reserve((std::size_t)F);
+    auto sink = [&](const metal_compute::SharedBuffer& rgb, int frame0,
+                    int n) -> bool {
+      const auto* rp = static_cast<const _Float16*>(rgb.contents());
+      const std::size_t per = (std::size_t)3 * H * W;
+      for (int k = 0; k < n; ++k) {
+        auto out = std::make_unique<TensorBeatPayload>();
+        out->dtype = TensorBeat::DType::U8;
+        out->shape = {3, H, W};
+        out->resize_contiguous(per);
+        std::uint8_t* op = out->as_u8();
+        // The VAE hands back [3, n, H, W] (channel-first over the chunk),
+        // so frame k is a stride into each channel plane, not a contiguous
+        // block.
+        for (int c = 0; c < 3; ++c) {
+          const _Float16* src =
+              rp + ((std::size_t)c * n + k) * (std::size_t)H * W;
+          std::uint8_t* dst = op + (std::size_t)c * H * W;
+          for (std::size_t i = 0; i < (std::size_t)H * W; ++i) {
+            float v = std::round(((float)src[i] + 1.0f) * 0.5f * 255.0f);
+            if (v < 0.0f) { v = 0.0f; }
+            if (v > 255.0f) { v = 255.0f; }
+            dst[i] = (std::uint8_t)v;
+          }
+        }
+        FlexData sb = FlexData::make_object();
+        sb.as_object().insert_or_assign("frame",
+                                        FlexData::make_int((std::int64_t)(frame0 + k)));
+        sb.as_object().insert_or_assign("frames", FlexData::make_int((std::int64_t)F));
+        sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+        out->sideband = std::move(sb);
+        forward_model_name_(*tbp, *out);
+        frames.push_back(std::move(out));
+      }
+      return true;
+    };
+    std::string derr;
+    bool ok = false;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin,
+                         (std::uint64_t)F * (std::uint64_t)H * W);
+      ok = _wan_vae->decode(zw, T, h8, w8, sink, &derr);
+    }
+    if (!ok) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): video decode failed ({}); skipping",
+          this->id(), derr.empty() ? "unknown error" : derr));
+      co_return;
+    }
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): decoded [{}, {}, {}, {}] -> {} frames "
+        "[3, {}, {}] @ {:.3f} fps", this->id(), Cz, T, h8, w8,
+        frames.size(), H, W, fps));
+    if (_unload_idle) { unload_vae_(); }
+    for (auto& f : frames) {
+      ++_images_emitted;
+      co_await ctx.write(0, std::move(f));
+    }
+    co_return;
+  }
+
+
   if (_family == "mage") {
     if (!_mage_vae) {
       session()->warn(fmt(

@@ -55,7 +55,7 @@ const StageSpec kSpec = {
   .type_name = "diffusion-sampler-select",
   .doc       = "Choose a diffusion sampler/integrator (euler | heun | dpmpp_2m "
                "| dpmpp_sde | dmd) and emit its spec as a FlexData beat for a "
-               "text-to-image stage to latch. Pairs with scheduler-select. "
+               "generate-image stage to latch. Pairs with scheduler-select. "
                "For the LLM token sampler see sampler-select instead. "
                "0 in / 1 out (emits once).",
   .display_name = "Diffusion Sampler",
@@ -111,7 +111,7 @@ FlexData
 DiffusionSamplerSelectStage::resolved_spec() const
 {
   // Model-agnostic: this stage forwards the user's sampler choice and does NOT
-  // read the model's scheduler config (the text-to-image stage owns the model).
+  // read the model's scheduler config (the generate-image stage owns the model).
   // The built-in distilled-turbo default (euler) applies unless `method` (already
   // canonicalized in the ctor) overrides it.
   std::string method = "euler";

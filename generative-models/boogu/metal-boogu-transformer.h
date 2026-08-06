@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_BOOGU_METAL_BOOGU_TRANSFORMER_H
 #define GENERATIVE_MODELS_BOOGU_METAL_BOOGU_TRANSFORMER_H
 
+#include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -132,6 +133,13 @@ class MetalBooguTransformer {
   // honored within ~one block instead of a whole forward.
   void set_stream_stop(std::function<bool()> stop) {
     _stream_stop = std::move(stop);
+  }
+
+  // Per-block progress (see DitBlockProgressFn): fired as each transformer
+  // block is entered, so a caller can show movement INSIDE one denoise
+  // step -- which at high resolution is seconds of otherwise-silent work.
+  void set_block_progress(DitBlockProgressFn fn) {
+    _block_progress = std::move(fn);
   }
 
   // A reference-image conditioning input (Boogu edit). `latents` is the
@@ -321,6 +329,7 @@ class MetalBooguTransformer {
   // private mmap this class kept to itself.
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;
+  DitBlockProgressFn    _block_progress;
 
   // A [hidden] run of zeros, so an adaLN "scale only" modulation (Lumina
   // RMSNormZero has no shift) can reuse adaln_modulate_f16 with a zero shift.

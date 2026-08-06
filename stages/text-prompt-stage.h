@@ -12,9 +12,9 @@ namespace vpipe {
 
 // Source stage: 0-1 inputs, 1 output. Emits the configured `text` as a plain
 // FlexData string beat on out-port 0 -- the same format text-input produces and
-// text-to-image / text-chat consume (a bare string, no media/attachment
+// generate-image / text-chat consume (a bare string, no media/attachment
 // markers). A config-driven prompt source that fits the image-generation
-// workflow (feed a fixed prompt to text-to-image without a stdin reader).
+// workflow (feed a fixed prompt to generate-image without a stdin reader).
 //
 // With no iport it emits once and signals done. With a trigger iport wired,
 // each inbound beat re-emits the text (EOS on the iport ends the stage) -- e.g.

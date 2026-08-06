@@ -2,7 +2,7 @@
 // (stages/model-memory.h) plus the `unload_when_idle` config surface it backs.
 //
 // The point of these is that the three stages that hold a big chunk of weights
-// -- diffusion-conditioner (text encoder + vision tower), text-to-image (DiT)
+// -- diffusion-conditioner (text encoder + vision tower), generate-image (DiT)
 // and vae-encode/vae-decode -- must agree about whether the box is
 // memory-bounded. They each read the SAME two numbers (physical RAM, the
 // .safetensors bytes of a component dir), so a wrong answer in one of them is a

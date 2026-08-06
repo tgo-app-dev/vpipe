@@ -1,3 +1,4 @@
+#include "common/console-writer.h"
 #include "common/stdout-log-delegate.h"
 #include "common/thread-pool.h"
 #include "common/vpipe-format.h"
@@ -153,22 +154,14 @@ StdoutLogDelegate::emit_sync_(LogLevel level, const VpipeFormat& f)
   const bool to_err =
       (level == LogLevel::Error || level == LogLevel::Warn);
 
+  // Through the ConsoleWriter so a log line printed while a progress
+  // footer is up erases the block, scrolls, and repaints it -- without
+  // this the footer and the log tear against each other, since the two
+  // delegates have unrelated I/O mutexes. Off a tty it is the same
+  // write + flush + fflush as before (the redirected-stdout reasoning
+  // now lives in ConsoleWriter::emit_locked_).
   lock_guard<mutex> lk(_io_mu);
-  if (to_err) {
-    cerr << line;
-    cerr.flush();
-  } else {
-    // Explicit flush: when stdout is redirected to a file it is
-    // fully buffered (not line-buffered), so without this the log
-    // is invisible to an external tail-er / Python parent until the
-    // userspace buffer accumulates ~4 KiB. cout.flush() only flushes
-    // the C++ streambuf; we also fflush(stdout) so the underlying
-    // stdio FILE*'s 4 KiB buffer drops to the kernel too. Logging
-    // is low-volume so the extra syscalls per line are fine.
-    cout << line;
-    cout.flush();
-    std::fflush(stdout);
-  }
+  console_writer().write_line(to_err, line);
 }
 
 void
@@ -277,20 +270,7 @@ StdoutLogDelegate::emit_locked_(const LogEntry& entry)
 
   const bool to_err =
       (entry.level == LogLevel::Error || entry.level == LogLevel::Warn);
-  if (to_err) {
-    cerr << line;
-    cerr.flush();
-  } else {
-    // Same reasoning as emit_sync_(): without this flush a parent
-    // process reading our redirected stdout sees nothing until the
-    // 4 KiB buffer fills, which makes the chat interaction look
-    // hung even when inference is making steady progress. Flush
-    // both the C++ streambuf and stdio FILE* layer for stability
-    // across libc / libc++ implementations.
-    cout << line;
-    cout.flush();
-    std::fflush(stdout);
-  }
+  console_writer().write_line(to_err, line);
 }
 
 // ---------------------------------------------------------------------

@@ -294,6 +294,10 @@ export const api = {
   ioConsole:     (since)   => req('GET',
                        `/api/io/console?since=${since || 0}`),
   ioPending:     ()        => req('GET',  '/api/io/pending'),
+  // Live progress reports: {version, items:[{id,desc,done,total,detail,seq}]}.
+  // total === 0 means indeterminate. `version` changes only when something
+  // moved, so a poll that sees the same value can skip re-rendering.
+  ioProgress:    ()        => req('GET',  '/api/io/progress'),
   ioInput:       (id, text)=> req('POST', '/api/io/input', { id, text }),
   ioClear:       ()        => req('POST', '/api/io/clear'),
   // Fire every stage-registered interrupt handler. Resolves to

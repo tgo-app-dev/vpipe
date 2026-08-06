@@ -1,11 +1,11 @@
 // Mage-Flow end-to-end through the split diffusion stages:
 //
-//   prompt -> diffusion-conditioner -> text-to-image (NR-MMDiT + FlowMatch
+//   prompt -> diffusion-conditioner -> generate-image (NR-MMDiT + FlowMatch
 //   Euler, static shift 6.0) -> vae-decode (MageVAE) -> RGB
 //
 // and, for the EDIT flow, additionally
 //
-//   image -> vae-encode (MageVAE) -> text-to-image ref_latent0
+//   image -> vae-encode (MageVAE) -> generate-image ref_latent0
 //   image -> diffusion-conditioner ref_image
 //
 // The DiT and VAE are already verified against the reference numerically
@@ -33,7 +33,7 @@
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/load-image-stage.h"
 #include "stages/save-image-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 #include "stages/vae-encode-stage.h"
 
@@ -186,9 +186,9 @@ TEST(mage_t2i, text_to_image_end_to_end)
     te.push_back({nullptr, 0}); te.push_back({nullptr, 0});
     te.push_back({renc, 0});
   }
-  auto tu = std::make_unique<TextToImageStage>(&sess, "t2i", std::move(te),
+  auto tu = std::make_unique<GenerateImageStage>(&sess, "t2i", std::move(te),
                                                std::move(tc));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(tu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(tu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vc = FlexData::make_object();
@@ -325,9 +325,9 @@ TEST(mage_t2i, image_edit_end_to_end)
   std::vector<InEdge> te{{cond, 0}, {nullptr, 0}, {nullptr, 0},
                          {nullptr, 0}, {nullptr, 0}};
   if (!no_ref) { te.push_back({enc, 0}); }
-  auto tu = std::make_unique<TextToImageStage>(&sess, "t2i", std::move(te),
+  auto tu = std::make_unique<GenerateImageStage>(&sess, "t2i", std::move(te),
                                                std::move(tc));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(tu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(tu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vc = FlexData::make_object();
@@ -448,7 +448,7 @@ TEST(mage_t2i, vae_stage_round_trip)
   EXPECT_TRUE(image_is_coherent_(*tb, "round-trip"));
 }
 
-// Output size with NO width/height configured: text-to-image must take it from
+// Output size with NO width/height configured: generate-image must take it from
 // ref_latent0 (vae-encode's output for the source image) scaled by the
 // family's VAE factor -- 16 for Mage-Flow -- so an edit lands at the source
 // resolution with no size config at all. An explicit width/height still wins.
@@ -516,12 +516,12 @@ TEST(mage_t2i, output_size_follows_ref_latent)
                                            FlexData::make_int(cfg_w)); }
     if (cfg_h > 0) { tc.as_object().insert("height",
                                            FlexData::make_int(cfg_h)); }
-    auto tu = std::make_unique<TextToImageStage>(
+    auto tu = std::make_unique<GenerateImageStage>(
         &sess, "t2i",
         std::vector<InEdge>{{cond, 0}, {nullptr, 0}, {nullptr, 0},
                             {nullptr, 0}, {nullptr, 0}, {enc, 0}},
         std::move(tc));
-    auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(tu)));
+    auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(tu)));
     ASSERT_TRUE(t2i->config_error().empty());
 
     auto sku = std::make_unique<MageSink>(&sess, "sink",

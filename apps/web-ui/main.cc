@@ -19,14 +19,10 @@
 //               memory_cap_mb; 0/unset = uncapped.
 //
 // The UI assets are embedded in the binary and served from memory.
-// Hidden override (not in --help): --doc-root DIR / $VPIPE_WEBUI_DOCROOT
-// serve from a directory instead -- used for dev live-edit and to patch
-// a packaged build without a rebuild.
 //
 // One Session is created for the process; the Pipeline Manager (and
 // later views) drive it through the /api/* REST surface.
 
-#include "apps/web-ui/embedded-assets.h"
 #include "apps/web-ui/http-server.h"
 #include "apps/web-ui/qr-code.h"
 #include "apps/web-ui/session-api.h"
@@ -240,20 +236,6 @@ main(int argc, char** argv)
     bind_addr = lan.empty() ? "127.0.0.1" : lan;
   }
   string port_str  = arg_value_(argc, argv, "--port", "9876");
-  // doc-root precedence (first match wins). The UI assets are embedded
-  // in the binary and served from memory BY DEFAULT; a filesystem
-  // doc-root is opt-in only via the hidden --doc-root override (handy for
-  // dev live-edit or patching a packaged build without a rebuild):
-  //   1. --doc-root <dir>     explicit override
-  //   2. $VPIPE_WEBUI_DOCROOT env override
-  //   3. empty -> serve the assets embedded in the binary
-  string doc_root;
-  if (has_flag_(argc, argv, "--doc-root")) {
-    doc_root = arg_value_(argc, argv, "--doc-root", "");
-  } else if (const char* env_root = std::getenv("VPIPE_WEBUI_DOCROOT");
-             env_root != nullptr && *env_root != '\0') {
-    doc_root = env_root;
-  }
   // Forwarded through the environment for the same reason as the CLI:
   // the model manager is not reachable from the public SessionIntf.
   const string cap = arg_value_(argc, argv, "--memory-cap-mb", "");
@@ -397,7 +379,7 @@ main(int argc, char** argv)
   // are still running and the first one to take its mutex aborts the
   // process on shutdown.
   webui::SessionApi api(session, ui, log);
-  webui::HttpServer server(bind_addr, port, doc_root);
+  webui::HttpServer server(bind_addr, port);
   string auth_key = random_key_();
   server.set_auth_key(auth_key);
   const bool show_qr = has_flag_(argc, argv, "--show-qr");
@@ -445,16 +427,8 @@ main(int argc, char** argv)
   const char* key_c = color ? "\033[1;32m" : "";
   const char* rst   = color ? "\033[0m" : "";
   const char* scheme = server.tls_enabled() ? "https" : "http";
-  if (!doc_root.empty()) {
-    printf("vpipe-web-ui listening on %s%s://%s:%d/%s  (doc-root: %s)\n",
-           url_c, scheme, bind_addr.c_str(), server.bound_port(), rst,
-           doc_root.c_str());
-  } else {
-    printf("vpipe-web-ui listening on %s%s://%s:%d/%s  "
-           "(serving %zu embedded assets)\n",
-           url_c, scheme, bind_addr.c_str(), server.bound_port(), rst,
-           webui::embedded_asset_count());
-  }
+  printf("vpipe-web-ui listening on %s%s://%s:%d/%s\n",
+         url_c, scheme, bind_addr.c_str(), server.bound_port(), rst);
   if (server.tls_enabled()) {
     printf("  (HTTPS with a self-signed cert -- accept the one-time browser "
            "warning; this is what enables the Preview view on LAN clients)\n");

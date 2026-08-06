@@ -1176,3 +1176,215 @@ kernel void dense_moe_gate_f16(
     outg[tid.y] = (VPIPE_ELT)(1.0f / (1.0f + metal::exp(-acc)));
   }
 }
+
+// ---------------------------------------------------------------------
+// DIRECT (im2col-free) 3x3 conv2d: the same [M,K]x[N,K]^T simdgroup-MMA GEMM
+// as dense_gemm_t_bm64bn64_f16, but the activation tile is GATHERED from the
+// NHWC map into threadgroup memory instead of read from a materialized
+// [H*W, 9*Cin] im2col scratch. Only the X staging differs -- the weight
+// loader, the BlockMMA and the bias/store epilogue are the proven ones.
+//
+//   out[oy,ox,oc] = sum_{ky,kx,ci} in[oy*S + ky - pad, ox*S + kx - pad, ci]
+//                                  * W[oc, (ky*3+kx)*Cin + ci]
+// STRIDE 1 uses pad 1 (iy = oy + ky - 1), matching im2col_hwc_3x3_f16;
+// STRIDE 2 uses pad (0,1,0,1) (iy = oy*2 + ky), matching the _s2 twin. So a
+// caller swaps either entry point in for its im2col + dense_gemm_t pair with
+// no other change (and no `col` scratch, hence no row banding).
+//
+// Why it wins on M4: the im2col round-trip is ~0.3 GB of DRAM write + read per
+// large VAE conv that this path never touches -- the 3x3 halo is re-read from
+// the (cache-resident) activation per K-tile instead. The tap/channel split of
+// the contraction index k = tap*Cin + ci is 32-BIT math throughout; the flat
+// element index that forced 64-bit divides in the im2col kernels never exists
+// here (the tile's base is 64-bit, the in-tile offsets are not).
+//
+//   0:in[H*W,Cin] 1:W[Cout,9*Cin] 2:bias[Cout] 3:out[OH*OW,Cout]
+//   4:H 5:W 6:Cin 7:Cout 8:OH 9:OW 10:has_bias
+//   dispatch {ceil(Cout/BN)*32, ceil(OH*OW/BM)*2, 2}, tg {32,2,2}
+template <typename T, const int BM, const int BK, const int BN,
+          const int STRIDE>
+METAL_FUNC void conv3x3_gemm_impl(
+    const device T* inp,
+    const device T* Wt,
+    const device T* bias,
+    device T*       y,
+    threadgroup T*  Xs,
+    threadgroup T*  Ws,
+    const constant int& H,
+    const constant int& Wi,
+    const constant int& Cin,
+    const constant int& Cout,
+    const constant int& OH,
+    const constant int& OW,
+    const constant int& has_bias,
+    uint3 tid,
+    uint  simd_gid,
+    uint  simd_lid,
+    uint  lid) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int THREADS = WM * WN * SIMD_SIZE;
+
+  using mma_t = mlx::steel::BlockMMA<
+      T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded, float>;
+  using loader_w_t =
+      mlx::steel::BlockLoader<T, BN, BK, BK_padded, 1, THREADS>;
+
+  const int K = 9 * Cin;                 // contraction: taps * channels
+  const int M = OH * OW;                 // flattened output pixels
+  const int y_row = tid.y * BM;          // pixel-tile base
+  const int y_col = tid.x * BN;          // channel-tile base
+  if (y_row >= M || y_col >= Cout) { return; }
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, Cout - y_col);
+  loader_w_t loader_w(Wt + y_col * static_cast<int64_t>(K), K, Ws, simd_gid,
+                      simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  // Integer division is the whole cost of a gather, so hoist all of it out of
+  // the K loop -- and when the channel count allows, read the tile as VECTORS.
+  //
+  // The structural fact: with Cin % BK == 0 every column of a K tile shares one
+  // tap (k0 is a multiple of BK, so k0/Cin is constant across [k0, k0+BK)).
+  // The tile is then BK CONTIGUOUS channels of ONE input pixel per output row
+  // -- a 64-byte run. Reading it as half4 puts a row in one transaction and
+  // cuts load instructions 4x versus the scalar form.
+  //
+  // Layout: TPR threads cover a row's BK channels, RPP rows land per pass, and
+  // each thread owns ROWS_V rows whose (oy, ox) are computed ONCE here. The
+  // scalar fallback (Cin % BK != 0, i.e. the tiny conv_in) keeps its divides
+  // inline; the host does not route those here.
+  static_assert(BM * BK % THREADS == 0, "tile must divide evenly by threads");
+  static_assert(THREADS % BK == 0, "column must be thread-invariant");
+  static_assert(BK % 4 == 0, "vector gather needs BK divisible by 4");
+  constexpr int TPR = BK / 4;                  // threads per row (vector path)
+  constexpr int RPP = THREADS / TPR;           // rows staged per pass
+  constexpr int ROWS_V = BM / RPP;             // rows each thread owns
+  const int vec_ok = (Cin % BK) == 0;
+  const int rl = (int)lid / TPR;               // this thread's row slot
+  const int cl = ((int)lid % TPR) * 4;         // this thread's channel quad
+  int oyv[ROWS_V], oxv[ROWS_V];
+  for (int n = 0; n < ROWS_V; ++n) {
+    const int p = y_row + rl + n * RPP;
+    const int oy = p / OW;
+    oyv[n] = oy;
+    oxv[n] = p - oy * OW;
+  }
+
+  for (int k = 0; k < K; k += BK) {
+    const short kt = (K - k) < BK ? (short)(K - k) : (short)BK;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Stage the activation tile: Xs[i, j] is the im2col entry for output pixel
+    // (y_row + i), contraction column (k + j) -- zero outside the image (the
+    // pad the im2col kernels write explicitly) and zero past the row/col tail,
+    // so the MMA sees the same operand the materialized path would have.
+    if (vec_ok) {
+      // One tap for the whole tile: two divides here, none per element.
+      const int tap = k / Cin;
+      const int ci = k - tap * Cin + cl;
+      const int ky = tap / 3, kx = tap - ky * 3;
+      for (int n = 0; n < ROWS_V; ++n) {
+        const int i = rl + n * RPP;
+        vec<T, 4> v = vec<T, 4>(T(0));
+        if (i < num_els) {
+          const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky) : (oyv[n] + ky - 1);
+          const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx) : (oxv[n] + kx - 1);
+          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
+            // Cin and ci are multiples of 4, so this is 8-byte aligned.
+            v = *reinterpret_cast<const device vec<T, 4>*>(
+                inp + ((int64_t)iy * Wi + ix) * Cin + ci);
+          }
+        }
+        *reinterpret_cast<threadgroup vec<T, 4>*>(Xs + i * BK_padded + cl) = v;
+      }
+    } else {
+      // General fallback: Cin not a multiple of BK, so tap/ci vary within the
+      // tile and the divides stay per element. Correct, not fast -- the host
+      // keeps such shapes on im2col.
+      for (int e = (int)lid; e < BM * BK; e += THREADS) {
+        const int i = e / BK, j = e - i * BK;
+        T v = (T)0;
+        if (j < kt && i < num_els) {
+          const int p = y_row + i;
+          const int oy = p / OW, ox = p - oy * OW;
+          const int kk = k + j;
+          const int tap = kk / Cin, ci = kk - tap * Cin;
+          const int ky = tap / 3, kx = tap - ky * 3;
+          const int iy = (STRIDE == 2) ? (oy * 2 + ky) : (oy + ky - 1);
+          const int ix = (STRIDE == 2) ? (ox * 2 + kx) : (ox + kx - 1);
+          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
+            v = inp[((int64_t)iy * Wi + ix) * Cin + ci];
+          }
+        }
+        Xs[i * BK_padded + j] = v;
+      }
+    }
+    if (num_outs < BN || kt < BK) {
+      loader_w.load_safe(short2(kt, num_outs));
+    } else {
+      loader_w.load_unsafe();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device T* yp = y + y_row * static_cast<int64_t>(Cout) + y_col;
+  if (num_els < BM || num_outs < BN) {
+    if (has_bias) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue_safe(bias + y_col, 0, 1, short2(num_outs, num_els),
+                                 op);
+    }
+    mma_op.store_result_safe(yp, Cout, short2(num_outs, num_els));
+  } else {
+    if (has_bias) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue(bias + y_col, 0, 1, op);
+    }
+    mma_op.store_result(yp, Cout);
+  }
+}
+
+#define VPIPE_CONV3X3_GEMM_ENTRY(NAME, BM_, BN_, STRIDE_)                     \
+  kernel void NAME(                                                           \
+      const device VPIPE_ELT* inp  [[buffer(0)]],                             \
+      const device VPIPE_ELT* Wt   [[buffer(1)]],                             \
+      const device VPIPE_ELT* bias [[buffer(2)]],                             \
+      device VPIPE_ELT*       y    [[buffer(3)]],                             \
+      const constant int& H        [[buffer(4)]],                             \
+      const constant int& Wi       [[buffer(5)]],                             \
+      const constant int& Cin      [[buffer(6)]],                             \
+      const constant int& Cout     [[buffer(7)]],                             \
+      const constant int& OH       [[buffer(8)]],                             \
+      const constant int& OW       [[buffer(9)]],                             \
+      const constant int& has_bias [[buffer(10)]],                            \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]],                           \
+      uint  lid      [[thread_index_in_threadgroup]])                         \
+  {                                                                           \
+    constexpr int BK = 32;                                                    \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
+    threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
+    conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, STRIDE_>(                      \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, tid,    \
+        simd_gid, simd_lid, lid);                                             \
+  }
+
+// BN=128: the activation tile is re-read once per CHANNEL tile, so total
+// activation traffic scales with Cout/BN -- at the VAE's cout=128 trunk that is
+// 2 passes at BN=64 and 1 at BN=128, and at cout=512 it is 8 vs 4. The weight
+// tile grows instead, but the VAE's whole 3x3 weight matrix is <= 512*4608*2 =
+// 4.7 MB and stays cached, so this trades a cached re-read for an uncached one.
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn128_f16, 64, 128, 1)
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn128_f16, 64, 128, 2)
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn64_f16, 64, 64, 1)
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn32_f16, 64, 32, 1)
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn64_f16, 64, 64, 2)
+VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn32_f16, 64, 32, 2)

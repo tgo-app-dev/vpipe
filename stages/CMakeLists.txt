@@ -19,9 +19,11 @@ set(LOCAL_SOURCES
   sampler-select-stage.cc
   save-image-stage.cc
   save-video-stage.cc
+  rgb-to-video-stage.cc
+  generate-video-stage.cc
   scheduler-select-stage.cc
   diffusion-conditioner-stage.cc
-  text-to-image-stage.cc
+  generate-image-stage.cc
   vae-decode-stage.cc
   vae-encode-stage.cc
   model-catalog.cc
@@ -71,6 +73,8 @@ set(LOCAL_HEADERS
   save-image-stage.h
   save-text-stage.h
   save-video-stage.h
+  rgb-to-video-stage.h
+  generate-video-stage.h
   shell-stage.h
   text-input-stage.h
   text-prompt-stage.h

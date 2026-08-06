@@ -151,6 +151,140 @@ private:
   std::uint64_t                      _id = 0;
 };
 
+// ---- progress reporting ---------------------------------------------
+//
+// Long-running work (a model download, a denoise loop, a calibration
+// pass) reports progress as STATE, not as text. A producer opens a
+// handle with a short description and pushes (done, total); the front
+// end decides how to draw it -- a footer of bars pinned to the bottom
+// of the terminal, an indicator in the web UI's status bar.
+//
+// Why not open_text_stream(): a hand-drawn bar overwritten with \r is
+// text a browser cannot render as anything but console noise, and \r
+// addresses ONE line with nobody arbitrating it, so two concurrent
+// operations scribble over each other. Progress is inherently
+// concurrent -- several downloads, or a fetch during a denoise -- so
+// the registry holds N live reports and the renderer draws them all.
+//
+// Producers do NOT throttle. update() is a mutex and a few field
+// writes; every renderer coalesces on its own clock (the stdio footer
+// repaints at ~10 Hz, the web UI polls at 1 Hz). That is what lets a
+// libcurl progress callback firing hundreds of times a second call
+// straight through without a percentage-change guard.
+class UiProgressRegistry {
+public:
+  // One live report, as a renderer sees it.
+  struct Item {
+    std::uint64_t id    = 0;
+    std::string   desc;         // short label, fixed for the handle's life
+    std::uint64_t done  = 0;
+    std::uint64_t total = 0;    // 0 => INDETERMINATE (no percentage known)
+    std::string   detail;       // optional right-hand text ("1.2 / 3.0 GB")
+    std::uint64_t seq   = 0;    // bumped per update -- highest = most recent
+  };
+
+  // Returns the id to pass to update()/close(). Never 0.
+  std::uint64_t open(std::string desc);
+
+  // Ignores an id that is not live, so a handle whose registry already
+  // dropped the entry is harmless rather than a lookup failure.
+  void update(std::uint64_t id, std::uint64_t done, std::uint64_t total,
+              std::string detail);
+  // Replace the right-hand text, leaving the counts alone.
+  void set_detail(std::uint64_t id, std::string detail);
+  void close(std::uint64_t id) noexcept;
+
+  // Snapshot for a renderer, OLDEST-OPENED FIRST so a footer's rows keep
+  // a stable order as reports come and go (a row that jumps position
+  // between repaints reads as a glitch).
+  std::vector<Item> snapshot() const;
+
+  // Bumped on every open/update/close. A poller compares it and skips
+  // the repaint entirely when nothing moved -- which is the common case
+  // at 10 Hz against work that updates once a second.
+  std::uint64_t version() const;
+
+  std::size_t size() const;
+
+private:
+  mutable std::mutex _mu;
+  std::vector<Item>  _items;
+  std::uint64_t      _next_id = 1;
+  std::uint64_t      _seq     = 0;
+  std::uint64_t      _version = 0;
+};
+
+// RAII progress handle: destroying it closes the report. Move-only; a
+// default-constructed handle is INERT -- update() on it is a no-op --
+// which is what a context with no UI hands back, so a stage reports
+// progress unconditionally without null checks.
+//
+// Like UiInterruptToken this holds a weak_ptr, so a handle that outlives
+// its delegate closes into thin air instead of dangling.
+class UiProgress {
+public:
+  UiProgress() = default;
+  UiProgress(std::weak_ptr<UiProgressRegistry> reg,
+             std::uint64_t                     id) noexcept
+      : _reg(std::move(reg)), _id(id)
+  {
+  }
+  ~UiProgress() { finish(); }
+
+  UiProgress(const UiProgress&)            = delete;
+  UiProgress& operator=(const UiProgress&) = delete;
+
+  UiProgress(UiProgress&& o) noexcept : _reg(std::move(o._reg)), _id(o._id)
+  {
+    o._id = 0;
+  }
+  UiProgress& operator=(UiProgress&& o) noexcept
+  {
+    if (this != &o) {
+      finish();
+      _reg  = std::move(o._reg);
+      _id   = o._id;
+      o._id = 0;
+    }
+    return *this;
+  }
+
+  // `total` 0 means indeterminate -- a download before its first
+  // Content-Length, a loop with no known count.
+  void update(std::uint64_t done, std::uint64_t total,
+              std::string detail = {})
+  {
+    if (_id == 0) { return; }
+    if (auto r = _reg.lock()) {
+      r->update(_id, done, total, std::move(detail));
+    }
+  }
+
+  // Replace the right-hand text without touching the counts.
+  void set_detail(std::string detail)
+  {
+    if (_id == 0) { return; }
+    if (auto r = _reg.lock()) { r->set_detail(_id, std::move(detail)); }
+  }
+
+  // Close now (idempotent). A no-op once the owning registry -- and
+  // with it the delegate -- is gone.
+  void finish() noexcept
+  {
+    if (_id != 0) {
+      if (auto r = _reg.lock()) { r->close(_id); }
+      _id = 0;
+    }
+    _reg.reset();
+  }
+
+  explicit operator bool() const noexcept { return _id != 0; }
+
+private:
+  std::weak_ptr<UiProgressRegistry> _reg;
+  std::uint64_t                     _id = 0;
+};
+
 // User-facing I/O channel, distinct from LogDelegateIntf (the
 // diagnostic-logging sink for debug/verbose/normal/always). This is
 // where messages the operator is meant to read go -- error / warn /
@@ -276,11 +410,56 @@ public:
     return _interrupts->size();
   }
 
+  // ---- progress reports --------------------------------------------
+  //
+  // Concrete and shared by every delegate, for the same reason the
+  // interrupt table is: the registry is identical wherever the front
+  // end is, only the RENDERING differs -- a footer of bars on the
+  // console, a status-bar indicator in the web UI. A delegate that
+  // draws nothing (the capturing test delegates) still collects the
+  // reports and simply never reads them back.
+  //
+  // Stages reach this through SessionContextIntf::open_progress rather
+  // than touching the delegate directly. `desc` is the short label the
+  // renderer shows -- keep it to a couple of words ("fetch qwen3-4b",
+  // "denoise"), since a footer row has a terminal's width to share.
+  UiProgress open_progress(std::string desc)
+  {
+    const std::uint64_t id = _progress->open(std::move(desc));
+    on_progress_opened();
+    return UiProgress(_progress, id);
+  }
+
+  // Every live report, oldest-opened first. Called by the front end
+  // (the footer renderer, the web UI's /api/io/progress), never by
+  // stages.
+  std::vector<UiProgressRegistry::Item> progress_snapshot() const
+  {
+    return _progress->snapshot();
+  }
+
+  // Bumped on every open/update/close, so a renderer can skip a
+  // repaint when nothing moved.
+  std::uint64_t progress_version() const { return _progress->version(); }
+
+protected:
+  // Fired after a report is opened, on the opening thread. A delegate
+  // that DRAWS progress starts its renderer here rather than running
+  // one for the delegate's whole life -- most sessions never report
+  // any progress at all, and the test binary builds many of them.
+  // Called with no lock held; must not block.
+  virtual void on_progress_opened() {}
+
 private:
   // shared_ptr, not a plain member: tokens hold a weak_ptr to it, so a
   // token that outlives its delegate unregisters harmlessly.
   std::shared_ptr<UiInterruptRegistry> _interrupts =
       std::make_shared<UiInterruptRegistry>();
+
+  // Same reasoning as _interrupts: a UiProgress handle outliving its
+  // delegate must close into thin air, not into freed memory.
+  std::shared_ptr<UiProgressRegistry> _progress =
+      std::make_shared<UiProgressRegistry>();
 };
 
 }

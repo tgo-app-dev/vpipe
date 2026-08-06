@@ -527,7 +527,7 @@ SaveImageStage::process(RuntimeContext& ctx)
   }
   if (_path.empty() || !_libs || !_libs->valid()) { co_return; }   // inert.
 
-  // Provenance: text-to-image stamps the generating model onto the latent's
+  // Provenance: generate-image stamps the generating model onto the latent's
   // sideband and vae-decode carries it onto the image, so a GENERATED image
   // arrives knowing what made it. Record that in EXIF Software. Only when a
   // model name is actually present -- a plain load-image -> save-image copy

@@ -23,11 +23,18 @@
 //
 // Built ONLY for the tensor-capable target (-std=metal4.0). STATUS: correct
 // (bit-identical to im2col + matmul2d -- see conv2d_mma.matches_im2col and
-// krea2_vae.decode_conv2d_vs_im2col) but ~1.7x SLOWER than im2col + dense_gemm_
-// mma on M5: its high UMA bandwidth makes the im2col DRAM round-trip cheap while
-// this kernel re-gathers each tile's 3x3 halo per K-chunk (redundant reads +
-// index math + barriers). So the VAE keeps im2col by default and only binds this
-// under VPIPE_KREA2_CONV2D=1.
+// krea2_vae.decode_conv2d_vs_im2col) and, on M5, slower than im2col +
+// dense_gemm_mma at every VAE shape: its high UMA bandwidth makes the im2col
+// DRAM round-trip cheap while this kernel re-gathers each tile's 3x3 halo per
+// K-chunk (redundant reads + index math + barriers). How much slower is NOT
+// uniform, because the round trip it saves scales with 9*cin while the halo it
+// re-reads scales with cout -- MEASURED on M5 (scaled probes, im2col/on-chip
+// ms): 3->96 0.77/0.76, 16->384 1.72/2.70, 96->96 4.77/7.98, 192->96
+// 9.03/15.90, 192->192 3.14/6.74, 384->384 2.19/7.88. From a tie at the
+// narrowest cin to 3.6x at the widest. Which is why the VAE no longer hard-
+// codes the answer: vae-conv3x3-tune.h times both per shape at first use
+// (VPIPE_KREA2_CONV2D forces this kernel, VPIPE_KREA2_NO_CONV2D leaves it
+// unloaded).
 //
 // The MPP convolution2d HARDWARE op (below) SUPERSEDES both: its multi-tile
 // halo/offset semantics -- once undocumented and unverified -- are now probe-

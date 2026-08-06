@@ -1,9 +1,9 @@
-// Krea-2-Turbo text-to-image stage bring-up (M5), verified against the golden.
+// Krea-2-Turbo generate-image stage bring-up (M5), verified against the golden.
 //
 // Two checks:
 //  * tokenization: the prompt template [prefix | prompt | suffix] tokenizes to
 //    the exact golden encoder ids (a1_full_text_ids.i32).
-//  * end-to-end: the text-to-image stage (encode -> DiT -> 8-step sampler),
+//  * end-to-end: the generate-image stage (encode -> DiT -> 8-step sampler),
 //    seeded with the GOLDEN initial noise (a3_step0_latin), reproduces the
 //    golden final latents within the documented free-running f16 drift; and,
 //    chained into vae-decode, produces a coherent RGB image (PNG dumped).
@@ -26,7 +26,7 @@
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/load-image-stage.h"
 #include "stages/model-quantize-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 #include "stages/vae-encode-stage.h"
 
@@ -93,7 +93,7 @@ constexpr const char* kPrefix =
     "background:<|im_end|>\n<|im_start|>user\n";
 constexpr const char* kSuffix = "<|im_end|>\n<|im_start|>assistant\n";
 
-// Special-token-aware encode (mirrors TextToImageStage's helper): split at the
+// Special-token-aware encode (mirrors GenerateImageStage's helper): split at the
 // ChatML markers, encode each text run, splice the markers' special ids.
 std::vector<std::int32_t>
 encode_specials_(const Tokenizer& tok, const std::string& text)
@@ -193,7 +193,7 @@ public:
   }
 };
 
-// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// Chain a diffusion-conditioner between `src` (prompt) and the generate-image
 // (DiT) stage -- the encoder half moved there, so the DiT consumes ready-made
 // conditioning. Returns the conditioner; wire the t2i's iport0 to {cond, 0}.
 Stage*
@@ -239,7 +239,7 @@ TEST(krea2_t2i, tokenization_matches_golden)
   EXPECT_TRUE(eq);
 }
 
-// End-to-end: text-to-image (seeded with the golden initial noise) -> vae-decode
+// End-to-end: generate-image (seeded with the golden initial noise) -> vae-decode
 // -> RGB. Checks the emitted latent tracks the golden final latents (within the
 // documented free-running f16 drift) and the decoded image is coherent.
 TEST(krea2_t2i, end_to_end_from_golden_noise)
@@ -263,7 +263,7 @@ TEST(krea2_t2i, end_to_end_from_golden_noise)
   const int lh = grid * 2, lw = grid * 2;           // latent 32x32
   const int H = lh * 8, W = lw * 8;
 
-  // --- stage 1: text-to-image, seeded with the golden initial noise ---
+  // --- stage 1: generate-image, seeded with the golden initial noise ---
   auto pl = std::make_unique<Pipeline>("p", &sess);
   auto srcu = std::make_unique<SourceText>(&sess, "src",
                                            std::vector<InEdge>{},
@@ -278,9 +278,9 @@ TEST(krea2_t2i, end_to_end_from_golden_noise)
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vae_cfg = FlexData::make_object();
@@ -395,9 +395,9 @@ TEST(krea2_t2i, end_to_end_quantized_dit)
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vae_cfg = FlexData::make_object();
@@ -482,9 +482,9 @@ TEST(krea2_t2i, end_to_end_lora_dit)
   t2i_cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/a3_step0_latin.f32"));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vae_cfg = FlexData::make_object();
@@ -568,9 +568,9 @@ TEST(krea2_t2i, img2img_sampling_from_golden_init)
   cfg.as_object().insert(
       "init_latents", FlexData::make_string(gdir + "/b_init_latents.f32"));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
   auto sinku = std::make_unique<SinkCapture>(
       &sess, "sink", std::vector<InEdge>{{t2i, 0}}, FlexData::make_object());
@@ -596,7 +596,7 @@ TEST(krea2_t2i, img2img_sampling_from_golden_init)
 }
 
 // Full img2img end-to-end (eyeball): source image (the golden fox a4_image) ->
-// vae-encode -> text-to-image (strength 0.6, latent port + noise) ->
+// vae-encode -> generate-image (strength 0.6, latent port + noise) ->
 // vae-decode -> RGB. Metal uses its own noise so it differs from the golden,
 // but must be a coherent transform of the input. Saves a PPM.
 TEST(krea2_t2i, img2img_end_to_end)
@@ -649,12 +649,12 @@ TEST(krea2_t2i, img2img_end_to_end)
   // (iport1-4) DISCONNECTED; the img2img init latent (from vae-encode) on
   // iport5 (ref latent 0).
   auto* cond = add_conditioner_(pl.get(), sess, pr, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i",
       std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
                           InEdge{nullptr, 0}, InEdge{nullptr, 0}, {ve, 0}},
       std::move(cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vcfg = FlexData::make_object();
@@ -700,7 +700,7 @@ TEST(krea2_t2i, img2img_end_to_end)
 
 // End-to-end proof of the model-quantize `target=text_encoder` pass: quantize
 // the Krea-2 text encoder into a SELF-CONTAINED pipeline, then drive
-// text-to-image with that dir as hf_dir (no dit_dir override). The quantized
+// generate-image with that dir as hf_dir (no dit_dir override). The quantized
 // Qwen3-VL encoder must load + condition the DiT and produce a coherent latent.
 TEST(krea2_t2i, enc_quantized_hf_dir)
 {
@@ -735,7 +735,7 @@ TEST(krea2_t2i, enc_quantized_hf_dir)
   }
   ASSERT_TRUE(fs::exists(fs::path(qdir) / "text_encoder" / "config.json", ec));
 
-  // 2. text-to-image with hf_dir = the quantized-encoder pipeline.
+  // 2. generate-image with hf_dir = the quantized-encoder pipeline.
   auto pl = std::make_unique<Pipeline>("t2iq", &sess);
   auto srcu = std::make_unique<SourceText>(&sess, "src",
                                            std::vector<InEdge>{},
@@ -746,9 +746,9 @@ TEST(krea2_t2i, enc_quantized_hf_dir)
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string(qdir));
   auto* cond = add_conditioner_(pl.get(), sess, src, qdir.c_str());
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
   auto sinku = std::make_unique<SinkCapture>(
       &sess, "sink", std::vector<InEdge>{{t2i, 0}}, FlexData::make_object());
@@ -793,7 +793,7 @@ TEST(krea2_t2i, negative_prompt_ports_and_cfg_config)
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string("/nonexistent"));
   cfg.as_object().insert("guidance_scale", FlexData::make_real(4.5));
-  TextToImageStage s(&sess, "t2i", std::vector<InEdge>{}, std::move(cfg));
+  GenerateImageStage s(&sess, "t2i", std::vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.config_error().empty());   // guidance_scale is accepted
 
   const auto& ip = s.spec().iports;
@@ -861,10 +861,10 @@ TEST(krea2_t2i, cfg_changes_latent)
     const std::vector<InEdge> edges =
         with_cfg ? std::vector<InEdge>{{pr, 0}, {ng, 0}}
                  : std::vector<InEdge>{{pr, 0}};
-    auto t2iu = std::make_unique<TextToImageStage>(&sess, "t2i", edges,
+    auto t2iu = std::make_unique<GenerateImageStage>(&sess, "t2i", edges,
                                                    std::move(cfg));
     auto* t2i =
-        static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+        static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
     if (!t2i->config_error().empty()) { return {}; }
     auto sinku = std::make_unique<SinkCapture>(
         &sess, "sink", std::vector<InEdge>{{t2i, 0}}, FlexData::make_object());
@@ -1045,15 +1045,15 @@ TEST(krea2_t2i, edit_end_to_end)
       std::make_unique<VaeEncodeStage>(
           &sess, "vaee", std::vector<InEdge>{{img_vae, 0}}, std::move(ec))));
 
-  // text-to-image on the FUSED DiT: conditioning (iport0) + ref_latent0
+  // generate-image on the FUSED DiT: conditioning (iport0) + ref_latent0
   // (iport5). strength 0 => the source stays a clean in-context ref (not img2img).
   FlexData tc = FlexData::make_object();
   tc.as_object().insert("hf_dir", FlexData::make_string(root));
   tc.as_object().insert("dit_dir", FlexData::make_string(ldit));
   tc.as_object().insert("height", FlexData::make_int(H));
   tc.as_object().insert("width", FlexData::make_int(W));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
-      std::make_unique<TextToImageStage>(
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(
+      std::make_unique<GenerateImageStage>(
           &sess, "t2i",
           std::vector<InEdge>{{cond, 0}, {nullptr, 0}, {nullptr, 0},
                               {nullptr, 0}, {nullptr, 0}, {vaee, 0}},

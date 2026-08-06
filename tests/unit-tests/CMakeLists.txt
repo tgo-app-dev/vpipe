@@ -5,6 +5,7 @@ set(LOCAL_TEST_SOURCES
   chrono-shell-stages.cc
   save-text-stage.cc
   clock-domain.cc
+  console-writer.cc
   credential-store.cc
   detection-overlay-stage.cc
   feedback-pair.cc
@@ -72,6 +73,7 @@ set(LOCAL_TEST_SOURCES
   vertex-oport-policy.cc
   image-metadata.cc
   video-stages.cc
+  wan-video-stages.cc
   video-to-rgb-stage.cc
   videos-db-cleanup-stage.cc
   ws-discovery.cc
@@ -140,6 +142,11 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-encoder.cc
         krea2-dit.cc
         krea2-vae.cc
+        wan-vae.cc
+        wan-umt5.cc
+        wan-unipc.cc
+        wan-dit.cc
+        wan-i2v.cc
         mage-vae.cc
         mage-dit.cc
         mage-cond.cc
@@ -164,6 +171,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         llm-chat-template.cc
         llm-sampler.cc
         llm-tokenizer.cc
+        unigram-tokenizer.cc
         file-sandbox.cc
         mcp-tools.cc
         python-sandbox.cc

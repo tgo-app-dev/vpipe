@@ -291,7 +291,7 @@ port is the one exception to the greedy default: left unwired it keeps MOSS's
 own recommended sampling, because greedy audio degenerates into silent loops.
 
 (`diffusion-sampler-select` is the unrelated stage that picks a *diffusion*
-integrator for `text-to-image`.)
+integrator for `generate-image`.)
 
 ```json
 {

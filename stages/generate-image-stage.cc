@@ -1,4 +1,4 @@
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 
 #include "stages/model-memory.h"
 
@@ -6,6 +6,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/shared/dit-block-progress.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -17,6 +18,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #endif
 
+#include <type_traits>
 #include <sys/sysctl.h>
 
 #include <chrono>
@@ -159,12 +161,12 @@ const PortSpec kOports[] = {
    .tags = "latent", .clock_group = 0},
 };
 const StageSpec kSpec = {
-  .type_name = "text-to-image",
+  .type_name = "generate-image",
   .doc       = "Diffusion DiT denoiser: conditioning (from a diffusion-"
                "conditioner stage) -> family MMDiT -> FlowMatchEuler -> latent, "
                "on the metal-compute backend. The denoiser half of the split "
                "(feed vae-decode).",
-  .display_name = "Text to Image",
+  .display_name = "Generate Image",
   .category  = StageCategory::Generative,
   .iports    = kIports,
   .oports    = kOports,
@@ -173,11 +175,11 @@ const StageSpec kSpec = {
 
 }  // namespace
 
-TextToImageStage::TextToImageStage(const SessionContextIntf* s,
+GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
                                    std::string               id,
                                    std::vector<InEdge>       iports,
                                    FlexData                  config)
-  : TypedStage<TextToImageStage>(s, std::move(id), std::move(iports),
+  : TypedStage<GenerateImageStage>(s, std::move(id), std::move(iports),
                                  std::move(config))
 {
   _hf_dir    = attr_str("hf_dir");
@@ -210,7 +212,7 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
   if (_guidance_scale <= 0.0) { _guidance_scale = 1.0; }   // <=0 => CFG off
   if (_strength < 0.0 || _strength > 1.0) {
     fail_config(fmt(
-        "TextToImageStage('{}'): strength must be in [0,1] (got {})",
+        "GenerateImageStage('{}'): strength must be in [0,1] (got {})",
         this->id(), _strength));
   }
   // hf_dir is OPTIONAL: a model-select source on the model iport can supply it
@@ -218,7 +220,7 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
   // (when iport connectivity is known), not here.
   if (_height % 16 != 0 || _width % 16 != 0) {
     fail_config(fmt(
-        "TextToImageStage('{}'): height/width must be multiples of 16 (got "
+        "GenerateImageStage('{}'): height/width must be multiples of 16 (got "
         "{}x{})", this->id(), _height, _width));
   }
   allocate_oports(spec().oports.size());
@@ -227,10 +229,10 @@ TextToImageStage::TextToImageStage(const SessionContextIntf* s,
 #endif
 }
 
-TextToImageStage::~TextToImageStage() = default;
+GenerateImageStage::~GenerateImageStage() = default;
 
 const StageSpec&
-TextToImageStage::spec() const noexcept
+GenerateImageStage::spec() const noexcept
 {
   return kSpec;
 }
@@ -383,7 +385,7 @@ krea2_vae_base_(const std::string& root)
 }  // namespace
 
 void
-TextToImageStage::reset_run_state()
+GenerateImageStage::reset_run_state()
 {
   // If a previous run left the weights UNLOADED (the idle-unload
   // policy drops them between beats), let this launch load them again:
@@ -417,7 +419,7 @@ TextToImageStage::reset_run_state()
 }
 
 void
-TextToImageStage::revise_dit_declaration_(const std::string& dit_dir) const
+GenerateImageStage::revise_dit_declaration_(const std::string& dit_dir) const
 {
   auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (mgr == nullptr || dit_dir.empty()) { return; }
@@ -429,14 +431,14 @@ TextToImageStage::revise_dit_declaration_(const std::string& dit_dir) const
   const std::size_t held = ws->stats().bytes;
   mgr->revise_declaration(dit_dir, held);
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): streaming DiT keeps {} MB resident; revised "
+      "GenerateImageStage('{}'): streaming DiT keeps {} MB resident; revised "
       "down from its {} MB on disk so peers do not size against weights "
       "that are never there", this->id(), held >> 20,
       model_memory::dir_weights_bytes(dit_dir) >> 20));
 }
 
 std::vector<ResourceClaim>
-TextToImageStage::declare_resources() const
+GenerateImageStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
@@ -451,7 +453,7 @@ TextToImageStage::declare_resources() const
 }
 
 Job
-TextToImageStage::initialize(RuntimeContext& ctx)
+GenerateImageStage::initialize(RuntimeContext& ctx)
 {
   // Defer the (heavy) DiT load when a model-select source feeds the model iport
   // (its beat only arrives after the init barrier, in process()). Otherwise
@@ -463,20 +465,20 @@ TextToImageStage::initialize(RuntimeContext& ctx)
 }
 
 void
-TextToImageStage::ensure_loaded_()
+GenerateImageStage::ensure_loaded_()
 {
   if (_load_attempted) { return; }   // idempotent: load at most once
   _load_attempted = true;
   if (_hf_dir.empty()) {
     session()->error(fmt(
-        "TextToImageStage('{}'): no model -- set config.hf_dir or wire a "
+        "GenerateImageStage('{}'): no model -- set config.hf_dir or wire a "
         "model-select source to the model iport; inert", this->id()));
     return;
   }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) {
     session()->error(fmt(
-        "TextToImageStage('{}'): no metal-compute backend; the stage is inert",
+        "GenerateImageStage('{}'): no metal-compute backend; the stage is inert",
         this->id()));
     return;
   }
@@ -504,12 +506,12 @@ TextToImageStage::ensure_loaded_()
       _infer_size ? std::string("auto (from ref_latent0)")
                   : std::to_string(_width) + "x" + std::to_string(_height);
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): init root='{}' dit='{}' family={} "
+      "GenerateImageStage('{}'): init root='{}' dit='{}' family={} "
       "(default {}, {} steps, seed {}, strength {})", this->id(), root,
       dit_dir, _family, size_desc, _steps, _seed, _strength));
 
   session()->info(fmt(
-      "TextToImageStage('{}'): loading {} DiT from '{}'", this->id(),
+      "GenerateImageStage('{}'): loading {} DiT from '{}'", this->id(),
       _family == "flux2" ? "FLUX.2"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "mage-flow" ? "Mage-Flow NR-MMDiT"
@@ -531,7 +533,7 @@ TextToImageStage::ensure_loaded_()
         if (!stream_blocks) { pin_frac = 0.0; }
       }
       session()->log_debug(fmt(
-          "TextToImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) + 6 "
+          "GenerateImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) + 6 "
           "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
           plan.others >> 30, phys_ram() >> 30,
           stream_blocks ? "STREAM blocks" : "PRELOAD"));
@@ -553,7 +555,7 @@ TextToImageStage::ensure_loaded_()
                             || dl.find("_kv") != std::string::npos;
       if (looks_kv != _klein_kv) {
         session()->warn(fmt(
-            "TextToImageStage('{}'): '{}' looks like {} but klein_kv={}. The "
+            "GenerateImageStage('{}'): '{}' looks like {} but klein_kv={}. The "
             "-kv checkpoint isolates reference tokens; running either variant "
             "under the other's attention produces wrong images silently",
             this->id(), dit_dir,
@@ -565,7 +567,7 @@ TextToImageStage::ensure_loaded_()
         weight_set_(dit_dir), mc, fcfg, stream_blocks, pin_frac);
     if (!_flux2_dit) {
       session()->error(fmt(
-          "TextToImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
+          "GenerateImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
           "inert", this->id(), dit_dir));
       return;
     }
@@ -604,7 +606,7 @@ TextToImageStage::ensure_loaded_()
       pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
+        "GenerateImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
         "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
         plan.footprint >> 30, model_memory::kStreamHeadroom >> 30,
         plan.others >> 30, phys_ram() >> 30,
@@ -614,13 +616,13 @@ TextToImageStage::ensure_loaded_()
         weight_set_(dit_dir), mc, qcfg, stream_blocks, pin_frac);
     if (!_qie_dit) {
       session()->error(fmt(
-          "TextToImageStage('{}'): failed to load the Qwen-Image-Edit DiT from "
+          "GenerateImageStage('{}'): failed to load the Qwen-Image-Edit DiT from "
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
     if (stream_blocks) {
       session()->info(fmt(
-          "TextToImageStage('{}'): Qwen-Image-Edit DiT streaming, pinned {} of "
+          "GenerateImageStage('{}'): Qwen-Image-Edit DiT streaming, pinned {} of "
           "{} blocks resident", this->id(), _qie_dit->pinned_blocks(),
           qcfg.n_layers));
     }
@@ -643,7 +645,7 @@ TextToImageStage::ensure_loaded_()
       pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
+        "GenerateImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
         "GB headroom vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
         plan.others >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
@@ -666,13 +668,13 @@ TextToImageStage::ensure_loaded_()
       // encoder -- and is freed again for the vae-decode.
       _dit_unloaded = true;
       session()->info(fmt(
-          "TextToImageStage('{}'): memory-bounded -- the Boogu-Image DiT loads "
+          "GenerateImageStage('{}'): memory-bounded -- the Boogu-Image DiT loads "
           "on the first conditioning beat (block streaming on) and is freed for "
           "the vae-decode, so it never shares the box with the text encoder",
           this->id()));
     } else if (!load_boogu_dit_()) {
       session()->error(fmt(
-          "TextToImageStage('{}'): failed to load the Boogu-Image DiT from "
+          "GenerateImageStage('{}'): failed to load the Boogu-Image DiT from "
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
@@ -694,7 +696,7 @@ TextToImageStage::ensure_loaded_()
       pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) + 6 "
+        "GenerateImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) + 6 "
         "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
         plan.others >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
@@ -703,13 +705,13 @@ TextToImageStage::ensure_loaded_()
         weight_set_(dit_dir), mc, mcfg, stream_blocks, pin_frac);
     if (!_mage_dit) {
       session()->error(fmt(
-          "TextToImageStage('{}'): failed to load the Mage-Flow DiT from '{}'; "
+          "GenerateImageStage('{}'): failed to load the Mage-Flow DiT from '{}'; "
           "inert", this->id(), dit_dir));
       return;
     }
     if (stream_blocks) {
       session()->info(fmt(
-          "TextToImageStage('{}'): Mage-Flow DiT streaming, pinned {} of {} "
+          "GenerateImageStage('{}'): Mage-Flow DiT streaming, pinned {} of {} "
           "blocks resident", this->id(), _mage_dit->pinned_blocks(),
           mcfg.n_layers));
     }
@@ -722,7 +724,7 @@ TextToImageStage::ensure_loaded_()
     _dit = genai::MetalKrea2Transformer::load(weight_set_(dit_dir), mc, kcfg);
     if (!_dit) {
       session()->error(fmt(
-          "TextToImageStage('{}'): failed to load the DiT from '{}'; inert",
+          "GenerateImageStage('{}'): failed to load the DiT from '{}'; inert",
           this->id(), dit_dir));
       return;
     }
@@ -740,20 +742,20 @@ TextToImageStage::ensure_loaded_()
     _release_scratch =
         model_memory::bounded(session(), peers, model_memory::kHeadroom);
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): Krea2 footprint {} GB + {} GB headroom vs {} "
+        "GenerateImageStage('{}'): Krea2 footprint {} GB + {} GB headroom vs {} "
         "GB RAM -> {} DiT scratch", this->id(),
         model_memory::weight_footprint(session(), peers) >> 30,
         phys_ram() >> 30, _release_scratch ? "RELEASE" : "keep"));
   }
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): {} DiT ready{}",
+      "GenerateImageStage('{}'): {} DiT ready{}",
       this->id(), _family,
       _strength > 0.0 ? "; img2img init latent expected on a ref_latent iport"
                       : ""));
 }
 
 bool
-TextToImageStage::load_flux2_dit_()
+GenerateImageStage::load_flux2_dit_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
@@ -766,7 +768,7 @@ TextToImageStage::load_flux2_dit_()
 }
 
 void
-TextToImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
+GenerateImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_flux2_dit || gen_w <= 0 || gen_h <= 0) { return; }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -791,7 +793,7 @@ TextToImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
   // reloads lazily when the next prompt arrives. Done BEFORE the latent is
   // published, so the decode sees the freed working set.
   session()->info(fmt(
-      "TextToImageStage('{}'): freeing the FLUX.2 DiT ({} MB working-set "
+      "GenerateImageStage('{}'): freeing the FLUX.2 DiT ({} MB working-set "
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
@@ -805,7 +807,7 @@ TextToImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
 // -- free_*_dit_for_decode_ has to actually free, and it would not if the
 // stage kept a handle of its own.
 std::shared_ptr<genai::WeightSet>
-TextToImageStage::weight_set_(const std::string& dir) const
+GenerateImageStage::weight_set_(const std::string& dir) const
 {
   if (dir.empty()) { return nullptr; }
   // Falls back to a private set when the session has no manager; see
@@ -814,7 +816,7 @@ TextToImageStage::weight_set_(const std::string& dir) const
 }
 
 bool
-TextToImageStage::load_boogu_dit_()
+GenerateImageStage::load_boogu_dit_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _boogu_dit_dir.empty()) { return false; }
@@ -825,7 +827,7 @@ TextToImageStage::load_boogu_dit_()
                                                  _boogu_pin_frac);
   if (_boogu_dit && _boogu_stream) {
     session()->info(fmt(
-        "TextToImageStage('{}'): Boogu DiT streaming, pinned {} of {} blocks "
+        "GenerateImageStage('{}'): Boogu DiT streaming, pinned {} of {} blocks "
         "resident", this->id(), _boogu_dit->pinned_blocks(),
         _boogu_dit->config().n_double + _boogu_dit->config().n_single));
   }
@@ -833,7 +835,7 @@ TextToImageStage::load_boogu_dit_()
 }
 
 void
-TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
+GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_boogu_dit || gen_w <= 0 || gen_h <= 0) { return; }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -846,7 +848,7 @@ TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
       (std::size_t)gen_h * gen_w * (std::size_t)_vae_base * 2 * 7;
   if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
   session()->info(fmt(
-      "TextToImageStage('{}'): freeing the Boogu-Image DiT ({} MB working-set "
+      "GenerateImageStage('{}'): freeing the Boogu-Image DiT ({} MB working-set "
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
@@ -855,7 +857,7 @@ TextToImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 }
 
 bool
-TextToImageStage::load_krea2_dit_()
+GenerateImageStage::load_krea2_dit_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
@@ -867,7 +869,7 @@ TextToImageStage::load_krea2_dit_()
 }
 
 void
-TextToImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
+GenerateImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_dit || gen_w <= 0 || gen_h <= 0) { return; }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -888,7 +890,7 @@ TextToImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
   // resident and the decode just fails its own physical backstop instead.
   if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
   session()->info(fmt(
-      "TextToImageStage('{}'): freeing the Krea-2 DiT ({} MB working-set "
+      "GenerateImageStage('{}'): freeing the Krea-2 DiT ({} MB working-set "
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
@@ -911,32 +913,109 @@ cond_to_shared_(metal_compute::MetalCompute* mc, const TensorBeatPayload& tb)
   return b;
 }
 
-// Throttled in-place denoise progress bar, mirroring the model-quantize
-// stage's bar: painted to the user-facing text stream and redrawn on a
-// carriage-return only when the integer percentage changes (the frame is
-// space-padded so a shorter redraw fully overwrites a longer prior one).
-void
-denoise_progress_(UiTextStream* bar, int done, int total, int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = static_cast<int>(static_cast<long>(done) * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b(static_cast<std::size_t>(fill), '#');
-  b += std::string(static_cast<std::size_t>(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% denoise ({}/{})", b, pct, done,
-                         total)();
-  while (line.size() < 48) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
+// Turns a DiT's per-block callbacks into one smooth progress report over
+// the whole denoise loop.
+//
+// A step-granular bar is too coarse to be useful: at 1024 a single FLUX.2
+// step is ~2 s and a 20B Qwen-Image step ~12 s, so the report sits still
+// for the entire time anything is actually happening. The DiT already
+// walks its blocks one at a time, so counting those gives 25-60x the
+// resolution for a callback that costs a compare.
+//
+// Guidance runs the DiT TWICE per step, and the sampler may call the
+// denoise function more than once, so the block count alone cannot say
+// where in the loop we are. end_step() therefore RE-SYNCS to the exact
+// step boundary: within a step the bar interpolates, and at every step
+// edge it is right regardless of how many forwards actually ran.
+class DenoiseProgress {
+public:
+  DenoiseProgress(UiProgress* bar, int steps, int forwards_per_step)
+      : _bar(bar), _steps(steps), _fwds(forwards_per_step < 1
+                                            ? 1 : forwards_per_step)
+  {
+  }
+
+  // Hand this to MetalXTransformer::set_block_progress.
+  genai::DitBlockProgressFn block_fn()
+  {
+    return [this](int done, int total) { on_block_(done, total); };
+  }
+
+  // Call where a forward RETURNS: the callback fires on block ENTRY, so
+  // the last block's work is only accounted for here.
+  void end_forward()
+  {
+    if (_blocks > 0) { _base += _blocks; }
+  }
+
+  // Call at the end of denoise step `i` (0-based).
+  void end_step(int i)
+  {
+    if (_bar == nullptr || _blocks <= 0) {
+      if (_bar != nullptr) { _bar->update((std::uint64_t)(i + 1),
+                                          (std::uint64_t)_steps); }
+      return;
+    }
+    _base = (long long)(i + 1) * _fwds * _blocks;
+    _bar->update((std::uint64_t)_base, (std::uint64_t)total_());
+  }
+
+private:
+  void on_block_(int done, int total)
+  {
+    if (_bar == nullptr || total <= 0) { return; }
+    _blocks = total;
+    // Clamp: an extra forward (a sampler that evaluates more than _fwds
+    // times) would otherwise push the bar past 100%, which reads as a bug
+    // even though the step boundary re-syncs it a moment later.
+    const long long t = total_();
+    long long d = _base + done;
+    if (d > t) { d = t; }
+    _bar->update((std::uint64_t)d, (std::uint64_t)t);
+  }
+
+  long long total_() const
+  {
+    return (long long)_steps * _fwds * _blocks;
+  }
+
+  UiProgress* _bar    = nullptr;
+  int         _steps  = 0;
+  int         _fwds   = 1;
+  int         _blocks = 0;      // learned from the first callback
+  long long   _base   = 0;      // blocks completed before the current forward
+};
+
+// Installs the block hook for a scope and CLEARS it on the way out.
+//
+// Not optional bookkeeping: the callback captures a pointer to a stack
+// local, while the DiT is a stage member that outlives this function. A
+// hook left installed would be called by the next generation with a
+// dangling DenoiseProgress, and the denoise paths have several early
+// returns (a failed forward, a pipeline stop) where remembering to clear
+// it by hand is exactly the kind of thing that gets missed.
+template <class Dit>
+class ScopedBlockProgress {
+public:
+  ScopedBlockProgress(Dit* dit, DenoiseProgress& prog) : _dit(dit)
+  {
+    if (_dit != nullptr) { _dit->set_block_progress(prog.block_fn()); }
+  }
+  ~ScopedBlockProgress()
+  {
+    if (_dit != nullptr) { _dit->set_block_progress(nullptr); }
+  }
+  ScopedBlockProgress(const ScopedBlockProgress&)            = delete;
+  ScopedBlockProgress& operator=(const ScopedBlockProgress&) = delete;
+
+private:
+  Dit* _dit = nullptr;
+};
 
 }  // namespace
 
 std::vector<float>
-TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
+GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
                             const metal_compute::SharedBuffer& cond_neg,
                             int n_real_neg, int gen_h, int gen_w,
                             const std::vector<float>* init_packed,
@@ -958,7 +1037,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
   SharedBuffer fused = _dit->forward_text(cond, n_real);
   if (fused.empty()) { return {}; }
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): fused conditioning [{}, hidden]; "
+      "GenerateImageStage('{}'): fused conditioning [{}, hidden]; "
       "{}x{} grid {}x{} img_seq {}", this->id(), n_real, W, H, gh, gw,
       img_seq));
 
@@ -972,12 +1051,12 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
     fused_neg = _dit->forward_text(cond_neg, n_real_neg);
     if (fused_neg.empty()) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): negative-conditioning fuse failed; running "
+          "GenerateImageStage('{}'): negative-conditioning fuse failed; running "
           "without classifier-free guidance", this->id()));
       cfg = false;
     } else {
       session()->info(fmt(
-          "TextToImageStage('{}'): CFG on, scale {}, negative [{} rows]",
+          "GenerateImageStage('{}'): CFG on, scale {}, negative [{} rows]",
           this->id(), (float)_guidance_scale, n_real_neg));
     }
   }
@@ -999,7 +1078,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
   }
   const double sig0 = sig[(std::size_t)start];
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): sampler={} scheduler={} steps={} start={} "
+      "GenerateImageStage('{}'): sampler={} scheduler={} steps={} start={} "
       "sig0={} (strength {})", this->id(), _sampler_spec.method,
       _scheduler_spec.type, S, start, (float)sig0, _strength));
 
@@ -1052,7 +1131,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
     if (r.empty() || r.c != 16 || (r.h % 2) != 0 || (r.w % 2) != 0) {
       if (!r.empty()) {
         session()->warn(fmt(
-            "TextToImageStage('{}'): krea2 reference latent [{}, {}, {}] must be "
+            "GenerateImageStage('{}'): krea2 reference latent [{}, {}, {}] must be "
             "16-channel with even H/W; ignoring", this->id(), r.c, r.h, r.w));
       }
       continue;
@@ -1079,17 +1158,24 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
   }
   if (!ri.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): Krea-2 conditioning on {} reference image(s)",
+        "GenerateImageStage('{}'): Krea-2 conditioning on {} reference image(s)",
         this->id(), ri.size()));
   }
   bool dit_ok = true;
   const float gscale = (float)_guidance_scale;
+  // Opened before the denoise callable so the per-block hook is
+  // live for the very first forward.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S - start, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_dit)>>
+      prog_guard(_dit.get(), prog);
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
     for (std::size_t k = 0; k < cand.size(); ++k) { lb[k] = (_Float16)cand[k]; }
     SharedBuffer vel = _dit->forward_dit(fused, n_real, latbuf, img_seq, gh, gw,
                                          (float)sigma, -1, ri);
+    prog.end_forward();
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());
@@ -1100,6 +1186,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
       SharedBuffer veln = _dit->forward_dit(fused_neg, n_real_neg, latbuf,
                                             img_seq, gh, gw, (float)sigma, -1,
                                             ri);
+      prog.end_forward();
       if (veln.empty()) { dit_ok = false; return {}; }
       const auto* np = static_cast<const _Float16*>(veln.contents());
       for (std::size_t k = 0; k < v.size(); ++k) {
@@ -1141,31 +1228,27 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
     }
     return latent;
   };
-  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
   const int nsteps = S - start;
-  int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
-  denoise_progress_(bar.get(), 0, nsteps, last_pct);
   for (int i = start; i < S; ++i) {
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): denoise step {}/{} sigma {}", this->id(),
+        "GenerateImageStage('{}'): denoise step {}/{} sigma {}", this->id(),
         i + 1, S, (float)sig[(std::size_t)i]));
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
-    if (!dit_ok) { bar->end(); return {}; }
+    if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
-    denoise_progress_(bar.get(), i - start + 1, nsteps, last_pct);
+    prog.end_step(i - start);
   }
-  bar->end();
   const double gen_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - gen_t0).count();
   session()->info(fmt(
-      "TextToImageStage('{}'): latent generated in {:.2f}s ({} denoise "
+      "GenerateImageStage('{}'): latent generated in {:.2f}s ({} denoise "
       "steps, {} ms/step)", this->id(), gen_s, nsteps,
       nsteps ? (long)(gen_s * 1000.0 / nsteps) : 0));
   if (prof) {
     session()->log_normal(fmt(
-        "TextToImageStage('{}'): DiT {} forward_dit calls, {} ms total, {} "
+        "GenerateImageStage('{}'): DiT {} forward_dit calls, {} ms total, {} "
         "ms/call (seq {}+{}={})", this->id(), dit_calls, (long)dit_ms,
         dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
         n_real + img_seq));
@@ -1176,7 +1259,7 @@ TextToImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
 }
 
 std::vector<float>
-TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
+GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
                                   int n_real, int gen_h, int gen_w,
                                   const std::vector<RefLatent>& refs,
                                   const std::vector<float>* init_packed,
@@ -1203,7 +1286,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   if (!_scheduler_latched) {
     sched.shift = flux2_empirical_mu_(img_seq, sched.steps);
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): FLUX.2 flow-shift mu = {} (img_seq {}, {} "
+        "GenerateImageStage('{}'): FLUX.2 flow-shift mu = {} (img_seq {}, {} "
         "steps)", this->id(), (float)sched.shift, img_seq, sched.steps));
   }
   genai::FlowSampler sampler(_sampler_spec, sched);
@@ -1234,7 +1317,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
                          : -1.0f;
   if (guid >= 0.0f) {
     session()->info(fmt(
-        "TextToImageStage('{}'): FLUX.2 embedded guidance scale {}",
+        "GenerateImageStage('{}'): FLUX.2 embedded guidance scale {}",
         this->id(), guid));
   }
   // Reference-image conditioning (built once, constant across denoise steps):
@@ -1246,7 +1329,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
     if (r.empty()) { continue; }
     if (r.c != IC) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): reference latent has {} channels, expected "
+          "GenerateImageStage('{}'): reference latent has {} channels, expected "
           "{} (DiT in_channels); ignoring", this->id(), r.c, IC));
       continue;
     }
@@ -1270,7 +1353,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   }
   if (!ri.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): FLUX.2 conditioning on {} reference image(s)",
+        "GenerateImageStage('{}'): FLUX.2 conditioning on {} reference image(s)",
         this->id(), ri.size()));
   }
   bool dit_ok = true;
@@ -1285,6 +1368,12 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   genai::MetalFlux2Transformer::KvCache* kvp =
       (_klein_kv && !ri.empty() &&
        std::getenv("VPIPE_FLUX2_NO_KV_CACHE") == nullptr) ? &kvc : nullptr;
+  // Opened before the denoise callable so the per-block hook is
+  // live for the very first forward.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_flux2_dit)>>
+      prog_guard(_flux2_dit.get(), prog);
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
@@ -1292,6 +1381,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
     SharedBuffer vel = _flux2_dit->forward_dit(context, n_real, latbuf, img_seq,
                                                gh, gw, (float)sigma, guid, ri,
                                                kvp);
+    prog.end_forward();
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());
@@ -1326,26 +1416,22 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
     }
     return latent;
   };
-  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-  int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
-  denoise_progress_(bar.get(), 0, S, last_pct);
   for (int i = 0; i < S; ++i) {
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
-    if (!dit_ok) { bar->end(); return {}; }
+    if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
-    denoise_progress_(bar.get(), i + 1, S, last_pct);
+    prog.end_step(i);
   }
-  bar->end();
   const double gen_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - gen_t0).count();
   session()->info(fmt(
-      "TextToImageStage('{}'): FLUX.2 latent generated in {:.2f}s ({} steps)",
+      "GenerateImageStage('{}'): FLUX.2 latent generated in {:.2f}s ({} steps)",
       this->id(), gen_s, S));
   if (prof) {
     session()->log_normal(fmt(
-        "TextToImageStage('{}'): FLUX.2 DiT {} forward_dit calls, {} ms total, "
+        "GenerateImageStage('{}'): FLUX.2 DiT {} forward_dit calls, {} ms total, "
         "{} ms/call (seq {}+{}={})", this->id(), dit_calls, (long)dit_ms,
         dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
         n_real + img_seq));
@@ -1367,7 +1453,7 @@ TextToImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
 // clean, so the schedule ASCENDS. That is why neither uses genai::FlowSampler
 // (whose integrators all assume a descending sigma with a terminal 0).
 std::vector<float>
-TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
+GenerateImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                                   int n_real,
                                   const metal_compute::SharedBuffer& txt_neg,
                                   int n_real_neg, int gen_h, int gen_w,
@@ -1389,14 +1475,14 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
   const int OC = _boogu_dit->config().out_channels;
   if (img_seq <= 0 || (lh % P) != 0 || (lw % P) != 0) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): {}x{} gives a {}x{} latent, which is not a "
+        "GenerateImageStage('{}'): {}x{} gives a {}x{} latent, which is not a "
         "whole number of {}x{} patches -- use multiples of 16",
         this->id(), W, H, lw, lh, P, P));
     return {};
   }
 
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): Boogu conditioning [{}, txt]; {}x{} latent {}x{} "
+      "GenerateImageStage('{}'): Boogu conditioning [{}, txt]; {}x{} latent {}x{} "
       "grid {}x{} img_seq {}", this->id(), n_real, W, H, lw, lh, gw, gh,
       img_seq));
 
@@ -1427,7 +1513,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
   } else {
     if (sched.type != "boogu_v1") {
       session()->warn(fmt(
-          "TextToImageStage('{}'): scheduler '{}' has a DESCENDING sigma "
+          "GenerateImageStage('{}'): scheduler '{}' has a DESCENDING sigma "
           "convention, which Boogu's does not share; using boogu_v1",
           this->id(), sched.type));
       sched.type = "boogu_v1";
@@ -1457,14 +1543,14 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
     if (r.empty()) { continue; }
     if (r.c != Z || (r.h % P) != 0 || (r.w % P) != 0) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): reference latent [{}, {}, {}] must be "
+          "GenerateImageStage('{}'): reference latent [{}, {}, {}] must be "
           "{}-channel with H/W divisible by {}; ignoring", this->id(), r.c,
           r.h, r.w, Z, P));
       continue;
     }
     if ((int)bri.size() >= _boogu_dit->config().max_ref_images) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): more than {} reference images; ignoring the "
+          "GenerateImageStage('{}'): more than {} reference images; ignoring the "
           "rest", this->id(), _boogu_dit->config().max_ref_images));
       break;
     }
@@ -1495,7 +1581,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
   }
   if (!bri.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): Boogu-Image editing on {} reference image(s)",
+        "GenerateImageStage('{}'): Boogu-Image editing on {} reference image(s)",
         this->id(), bri.size()));
   }
 
@@ -1508,12 +1594,18 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                    _guidance_scale != 1.0;
   if (dmd && _guidance_scale != 1.0) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): the DMD student is distilled to guidance 1; "
+        "GenerateImageStage('{}'): the DMD student is distilled to guidance 1; "
         "ignoring guidance_scale {}", this->id(), _guidance_scale));
   }
   const float gscale = (float)_guidance_scale;
 
   bool dit_ok = true;
+  // Opened before the denoise callable so the per-block hook is
+  // live for the very first forward.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_boogu_dit)>>
+      prog_guard(_boogu_dit.get(), prog);
   auto velocity = [&](const std::vector<float>& cand,
                       double sigma) -> std::vector<float> {
     auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
@@ -1522,6 +1614,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
     }
     SharedBuffer vel = _boogu_dit->forward_dit(txt_pos, n_real, latbuf, img_seq,
                                                lh, lw, (float)sigma, bri);
+    prog.end_forward();
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
     std::vector<float> v((std::size_t)img_seq * OC);
@@ -1530,6 +1623,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
       SharedBuffer vn = _boogu_dit->forward_dit(txt_neg, n_real_neg, latbuf,
                                                 img_seq, lh, lw, (float)sigma,
                                                 bri);
+      prog.end_forward();
       if (vn.empty()) { dit_ok = false; return {}; }
       const auto* np = static_cast<const std::uint16_t*>(vn.contents());
       for (std::size_t k = 0; k < v.size(); ++k) {
@@ -1562,10 +1656,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
   int dit_calls = 0;
   std::mt19937_64 renoise_rng(samp.seed != 0 ? samp.seed : _seed + 1);
   std::normal_distribution<float> rnd(0.0f, 1.0f);
-  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-  int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
-  denoise_progress_(bar.get(), 0, S, last_pct);
   for (int i = 0; i < S; ++i) {
     const double s = sig[(std::size_t)i];
     const auto t0 = std::chrono::steady_clock::now();
@@ -1575,7 +1666,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                     std::chrono::steady_clock::now() - t0).count();
       ++dit_calls;
     }
-    if (!dit_ok) { bar->end(); return {}; }
+    if (!dit_ok) { return {}; }
     if (dmd) {
       // Jump to the x0 prediction, then re-noise back down to the next sigma.
       for (std::size_t k = 0; k < packed.size() && k < v.size(); ++k) {
@@ -1594,18 +1685,17 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
       }
     }
     if (emit_step) { emit_step(unpack(packed)); }
-    denoise_progress_(bar.get(), i + 1, S, last_pct);
+    prog.end_step(i);
   }
-  bar->end();
   const double gen_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - gen_t0).count();
   session()->info(fmt(
-      "TextToImageStage('{}'): latent generated in {:.2f}s ({} {} steps, "
+      "GenerateImageStage('{}'): latent generated in {:.2f}s ({} {} steps, "
       "{} ms/step)", this->id(), gen_s, S, dmd ? "DMD" : "Euler",
       S ? (long)(gen_s * 1000.0 / S) : 0));
   if (prof) {
     session()->log_normal(fmt(
-        "TextToImageStage('{}'): Boogu DiT {} forward calls, {} ms total, {} "
+        "GenerateImageStage('{}'): Boogu DiT {} forward calls, {} ms total, {} "
         "ms/call (txt {} + img {} = {})", this->id(), dit_calls, (long)dit_ms,
         dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
         n_real + img_seq));
@@ -1614,7 +1704,7 @@ TextToImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
 }
 
 std::vector<float>
-TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
+GenerateImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
                                int n_real,
                                const metal_compute::SharedBuffer& txt_neg,
                                int n_real_neg, int gen_h, int gen_w,
@@ -1636,7 +1726,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   // image-aware last-hidden [n_real, 3584] bf16, already POST encoder final-norm
   // (the conditioner ran the vision tower + splice + drop-64 + final-RMSNorm).
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): QIE conditioning [{}, txt]; {}x{} grid {}x{} "
+      "GenerateImageStage('{}'): QIE conditioning [{}, txt]; {}x{} grid {}x{} "
       "img_seq {}", this->id(), n_real, W, H, gh, gw, img_seq));
 
   // norm-preserving true-CFG: use the negative conditioning too and, per step,
@@ -1691,7 +1781,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
     if (r.empty() || r.c != 16 || (r.h % 2) != 0 || (r.w % 2) != 0) {
       if (!r.empty()) {
         session()->warn(fmt(
-            "TextToImageStage('{}'): reference latent [{}, {}, {}] must be "
+            "GenerateImageStage('{}'): reference latent [{}, {}, {}] must be "
             "16-channel with even H/W; ignoring", this->id(), r.c, r.h, r.w));
       }
       continue;
@@ -1699,7 +1789,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
     const int rgh = r.h / 2, rgw = r.w / 2, rseq = rgh * rgw;
     if (rgh != gh || rgw != gw) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
+          "GenerateImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
           "the centered reference will cover only part of the output and leave a "
           "rectangular artifact. Encode the reference at the output resolution "
           "(set vae-encode target to {}x{}) to avoid it.",
@@ -1726,7 +1816,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   }
   if (!ri.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): Qwen-Image-Edit conditioning on {} reference "
+        "GenerateImageStage('{}'): Qwen-Image-Edit conditioning on {} reference "
         "image(s)", this->id(), ri.size()));
   }
 
@@ -1734,6 +1824,12 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   // read the velocity back; apply norm-preserving true-CFG when enabled.
   bool dit_ok = true;
   const float gscale = (float)_guidance_scale;
+  // Opened before the denoise callable so the per-block hook is
+  // live for the very first forward.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_qie_dit)>>
+      prog_guard(_qie_dit.get(), prog);
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
@@ -1742,6 +1838,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
     }
     SharedBuffer vel = _qie_dit->forward(latbuf, img_seq, txt_pos, n_real, gh,
                                          gw, (float)sigma, ri);
+    prog.end_forward();
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
     std::vector<float> v(cand.size());
@@ -1749,6 +1846,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
     if (cfg) {
       SharedBuffer veln = _qie_dit->forward(latbuf, img_seq, txt_neg, n_real_neg,
                                             gh, gw, (float)sigma, ri);
+      prog.end_forward();
       if (veln.empty()) { dit_ok = false; return {}; }
       const auto* np = static_cast<const std::uint16_t*>(veln.contents());
       // Per-token (over IC channels): comb = neg + scale*(pos-neg), then
@@ -1810,14 +1908,11 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   // sees the sampler state exactly -- needed because the early-step state is
   // dominated by the shared init noise, which masks the velocity error ~31x.
   const char* dump_pre = std::getenv("VPIPE_QIE_DUMP_LATENT");
-  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-  int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
-  denoise_progress_(bar.get(), 0, S, last_pct);
   for (int i = 0; i < S; ++i) {
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
-    if (!dit_ok) { bar->end(); return {}; }
+    if (!dit_ok) { return {}; }
     if (dump_pre != nullptr && *dump_pre != '\0') {
       char nm[32];
       std::snprintf(nm, sizeof nm, "%02d.f32", i + 1);
@@ -1828,18 +1923,17 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
       }
     }
     if (emit_step) { emit_step(unpack(packed)); }
-    denoise_progress_(bar.get(), i + 1, S, last_pct);
+    prog.end_step(i);
   }
-  bar->end();
   const double gen_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - gen_t0).count();
   session()->info(fmt(
-      "TextToImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
+      "GenerateImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
       "{} ms/step)", this->id(), gen_s, S,
       S ? (long)(gen_s * 1000.0 / S) : 0));
   if (prof) {
     session()->log_normal(fmt(
-        "TextToImageStage('{}'): QIE DiT {} forward calls, {} ms total, {} "
+        "GenerateImageStage('{}'): QIE DiT {} forward calls, {} ms total, {} "
         "ms/call (txt {} + img {} = {})", this->id(), dit_calls, (long)dit_ms,
         dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real, img_seq,
         n_real + img_seq));
@@ -1848,7 +1942,7 @@ TextToImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
 }
 
 std::vector<float>
-TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
+GenerateImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
                                  int n_real,
                                  const metal_compute::SharedBuffer& txt_neg,
                                  int n_real_neg, int gen_h, int gen_w,
@@ -1870,7 +1964,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
   if (img_seq <= 0) { return {}; }
 
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): Mage-Flow conditioning [{} rows]; {}x{} grid "
+      "GenerateImageStage('{}'): Mage-Flow conditioning [{} rows]; {}x{} grid "
       "{}x{} img_seq {}", this->id(), n_real, gen_w, gen_h, gh, gw, img_seq));
 
   const bool cfg = !txt_neg.empty() && n_real_neg > 0 && _guidance_scale != 1.0;
@@ -1907,7 +2001,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
         IC, gh, gw, genai::mage_wm::resolve_key(_watermark_key), _seed);
     if (packed.size() != (std::size_t)img_seq * IC) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): watermark noise generation failed; falling "
+          "GenerateImageStage('{}'): watermark noise generation failed; falling "
           "back to plain noise (NO provenance mark)", this->id()));
       packed.assign((std::size_t)img_seq * IC, 0.0f);
       std::mt19937_64 rng(_seed);
@@ -1916,7 +2010,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
     }
   } else {
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): watermark DISABLED -- this image carries no "
+        "GenerateImageStage('{}'): watermark DISABLED -- this image carries no "
         "provenance mark", this->id()));
     std::mt19937_64 rng(_seed);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -1934,7 +2028,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
     if (r.empty()) { continue; }
     if (r.c != IC || r.h <= 0 || r.w <= 0) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): reference latent [{}, {}, {}] must be "
+          "GenerateImageStage('{}'): reference latent [{}, {}, {}] must be "
           "{}-channel; ignoring", this->id(), r.c, r.h, r.w, IC));
       continue;
     }
@@ -1943,7 +2037,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
     // same trap the Qwen-Image-Edit path warns about).
     if (r.h != gh || r.w != gw) {
       session()->warn(fmt(
-          "TextToImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
+          "GenerateImageStage('{}'): reference grid {}x{} != output grid {}x{} -- "
           "the centered reference will cover only part of the output. Encode "
           "the reference at the output resolution (set the vae-encode target "
           "to {}x{}).", this->id(), r.w, r.h, gw, gh, gen_w, gen_h));
@@ -1965,12 +2059,18 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
   }
   if (!ri.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): Mage-Flow edit conditioning on {} reference "
+        "GenerateImageStage('{}'): Mage-Flow edit conditioning on {} reference "
         "image(s)", this->id(), ri.size()));
   }
 
   bool dit_ok = true;
   const float gscale = (float)_guidance_scale;
+  // Opened before the denoise callable so the per-block hook is
+  // live for the very first forward.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_mage_dit)>>
+      prog_guard(_mage_dit.get(), prog);
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
@@ -1979,6 +2079,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
     }
     SharedBuffer vel = _mage_dit->forward(latbuf, img_seq, txt_pos, n_real, gh,
                                           gw, (float)sigma, ri);
+    prog.end_forward();
     if (vel.empty()) { dit_ok = false; return {}; }
     const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
     std::vector<float> v(cand.size());
@@ -1987,6 +2088,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
       SharedBuffer veln = _mage_dit->forward(latbuf, img_seq, txt_neg,
                                              n_real_neg, gh, gw, (float)sigma,
                                              ri);
+      prog.end_forward();
       if (veln.empty()) { dit_ok = false; return {}; }
       const auto* np = static_cast<const std::uint16_t*>(veln.contents());
       // Plain CFG: unc + scale*(cond - unc). The reference's CFG-renorm
@@ -2022,27 +2124,23 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
     }
     return latent;
   };
-  std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-  int last_pct = -1;
   const auto gen_t0 = std::chrono::steady_clock::now();
-  denoise_progress_(bar.get(), 0, S, last_pct);
   for (int i = 0; i < S; ++i) {
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
-    if (!dit_ok) { bar->end(); return {}; }
+    if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
-    denoise_progress_(bar.get(), i + 1, S, last_pct);
+    prog.end_step(i);
   }
-  bar->end();
   const double gen_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - gen_t0).count();
   session()->info(fmt(
-      "TextToImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
+      "GenerateImageStage('{}'): latent generated in {:.2f}s ({} denoise steps, "
       "{} ms/step)", this->id(), gen_s, S,
       S ? (long)(gen_s * 1000.0 / S) : 0));
   if (prof) {
     session()->log_normal(fmt(
-        "TextToImageStage('{}'): Mage-Flow DiT {} forward calls, {} ms total, "
+        "GenerateImageStage('{}'): Mage-Flow DiT {} forward calls, {} ms total, "
         "{} ms/call (txt {} + img {} = {})", this->id(), dit_calls,
         (long)dit_ms, dit_calls ? (long)(dit_ms / dit_calls) : 0, n_real,
         img_seq, n_real + img_seq));
@@ -2052,7 +2150,7 @@ TextToImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
 
 
 void
-TextToImageStage::tag_model_(TensorBeat& tb) const
+GenerateImageStage::tag_model_(TensorBeat& tb) const
 {
   // `_hf_dir` is the reference the user actually named (a registry key like
   // "local/Mage-Flow-Edit-Turbo-8bit", or a path), which is the meaningful
@@ -2065,7 +2163,7 @@ TextToImageStage::tag_model_(TensorBeat& tb) const
 }
 
 Job
-TextToImageStage::process(RuntimeContext& ctx)
+GenerateImageStage::process(RuntimeContext& ctx)
 {
   auto* mc = session()->services()->metal_compute();
   // Latch the shared model (iport2) once -- a model-select source overrides the
@@ -2099,19 +2197,19 @@ TextToImageStage::process(RuntimeContext& ctx)
   // vae-decode on a memory-bounded box; reload it now a new prompt arrived.
   if (_family == "flux2" && _dit_unloaded && !_flux2_dit) {
     session()->info(fmt(
-        "TextToImageStage('{}'): reloading the FLUX.2 DiT for the next prompt",
+        "GenerateImageStage('{}'): reloading the FLUX.2 DiT for the next prompt",
         this->id()));
     if (load_flux2_dit_()) { _dit_unloaded = false; }
   }
   if (_family == "krea2" && _dit_unloaded && !_dit) {
     session()->info(fmt(
-        "TextToImageStage('{}'): reloading the Krea-2 DiT for the next prompt",
+        "GenerateImageStage('{}'): reloading the Krea-2 DiT for the next prompt",
         this->id()));
     if (load_krea2_dit_()) { _dit_unloaded = false; }
   }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
-        "TextToImageStage('{}'): reloading the Boogu-Image DiT for the next "
+        "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
         "prompt", this->id()));
     if (load_boogu_dit_()) { _dit_unloaded = false; }
   }
@@ -2122,7 +2220,7 @@ TextToImageStage::process(RuntimeContext& ctx)
       : (bool)_dit;
   if (!have_dit) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): models not loaded; dropping beat", this->id()));
+        "GenerateImageStage('{}'): models not loaded; dropping beat", this->id()));
     co_return;
   }
   // iport0: the conditioning tensor from a diffusion-conditioner stage
@@ -2130,20 +2228,20 @@ TextToImageStage::process(RuntimeContext& ctx)
   const auto* ctb = dynamic_cast<const TensorBeatPayload*>(in.get());
   if (ctb == nullptr || ctb->shape.empty() || ctb->shape[0] <= 0) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): expected a conditioning TensorBeat, got {}; "
+        "GenerateImageStage('{}'): expected a conditioning TensorBeat, got {}; "
         "dropping beat", this->id(), in->describe()));
     co_return;
   }
   metal_compute::SharedBuffer cond = cond_to_shared_(mc, *ctb);
   if (cond.empty() && !cond_blocked) {
     session()->warn(fmt(
-        "TextToImageStage('{}'): conditioning upload failed; dropping beat",
+        "GenerateImageStage('{}'): conditioning upload failed; dropping beat",
         this->id()));
     co_return;
   }
   const int n_real = (int)ctb->shape[0];
   session()->log_debug(fmt(
-      "TextToImageStage('{}'): conditioning beat [{} rows, {}]", this->id(),
+      "GenerateImageStage('{}'): conditioning beat [{} rows, {}]", this->id(),
       n_real, ctb->dtype == TensorBeat::DType::Bf16 ? "bf16" : "f16"));
 
   // iport1: OPTIONAL negative conditioning (the conditioner's oport1) for
@@ -2161,7 +2259,7 @@ TextToImageStage::process(RuntimeContext& ctx)
       cond_neg = cond_to_shared_(mc, *ntb);
       if (!cond_neg.empty()) { n_real_neg = (int)ntb->shape[0]; }
       session()->log_debug(fmt(
-          "TextToImageStage('{}'): negative conditioning [{} rows]", this->id(),
+          "GenerateImageStage('{}'): negative conditioning [{} rows]", this->id(),
           n_real_neg));
     }
   }
@@ -2207,11 +2305,11 @@ TextToImageStage::process(RuntimeContext& ctx)
         _ref[r].h = (int)tb->shape[1];
         _ref[r].w = (int)tb->shape[2];
         session()->log_debug(fmt(
-            "TextToImageStage('{}'): reference latent {} = [{}, {}, {}]",
+            "GenerateImageStage('{}'): reference latent {} = [{}, {}, {}]",
             this->id(), r, _ref[r].c, _ref[r].h, _ref[r].w));
       } else if (rb) {
         session()->warn(fmt(
-            "TextToImageStage('{}'): ref_latent{} must be an f32 [C,H,W] "
+            "GenerateImageStage('{}'): ref_latent{} must be an f32 [C,H,W] "
             "TensorBeat; got {}, ignoring", this->id(), r, rb->describe()));
       }
     }
@@ -2237,7 +2335,7 @@ TextToImageStage::process(RuntimeContext& ctx)
         gen_h = ih; gen_w = iw;
       } else {
         session()->warn(fmt(
-            "TextToImageStage('{}'): ref_latent0 [{}, {}, {}] implies {}x{}, "
+            "GenerateImageStage('{}'): ref_latent0 [{}, {}, {}] implies {}x{}, "
             "not a multiple of 16 ({}x latent needs an even grid); using "
             "256x256 -- set width/height", this->id(), r0.c, r0.h, r0.w, iw,
             ih, s));
@@ -2245,7 +2343,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     }
     if (gen_h <= 0 || gen_w <= 0) { gen_h = 256; gen_w = 256; }
     session()->log_debug(fmt(
-        "TextToImageStage('{}'): output size {}x{} ({})", this->id(), gen_w,
+        "GenerateImageStage('{}'): output size {}x{} ({})", this->id(), gen_w,
         gen_h, r0.empty() ? "no reference, default" : "from ref_latent0"));
   }
   // ---- Content-policy refusal ------------------------------------------
@@ -2273,7 +2371,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     out->sideband = std::move(sb);
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): conditioning refused by the content policy; "
+        "GenerateImageStage('{}'): conditioning refused by the content policy; "
         "skipping the denoise and emitting a {}x{} refusal", this->id(),
         gen_w, gen_h));
     co_await ctx.write(0, std::move(out));
@@ -2296,7 +2394,7 @@ TextToImageStage::process(RuntimeContext& ctx)
       latent_ptr = &latent;
     } else {
       session()->warn(fmt(
-          "TextToImageStage('{}'): img2img init must be an f32 latent [16, {}, "
+          "GenerateImageStage('{}'): img2img init must be an f32 latent [16, {}, "
           "{}]; got [{}, {}, {}], ignoring", this->id(), lh, lw, rr.c, rr.h,
           rr.w));
     }
@@ -2314,11 +2412,11 @@ TextToImageStage::process(RuntimeContext& ctx)
       std::string serr;
       _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
       if (!serr.empty()) {
-        session()->warn(fmt("TextToImageStage('{}'): sampler spec: {}",
+        session()->warn(fmt("GenerateImageStage('{}'): sampler spec: {}",
                             this->id(), serr));
       }
       session()->info(fmt(
-          "TextToImageStage('{}'): sampler = {} (eta {}, s_noise {})",
+          "GenerateImageStage('{}'): sampler = {} (eta {}, s_noise {})",
           this->id(), _sampler_spec.method, _sampler_spec.eta,
           _sampler_spec.s_noise));
     }
@@ -2331,11 +2429,11 @@ TextToImageStage::process(RuntimeContext& ctx)
       std::string cerr;
       _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
       if (!cerr.empty()) {
-        session()->warn(fmt("TextToImageStage('{}'): scheduler spec: {}",
+        session()->warn(fmt("GenerateImageStage('{}'): scheduler spec: {}",
                             this->id(), cerr));
       }
       session()->info(fmt(
-          "TextToImageStage('{}'): scheduler = {} ({} steps, shift {} {})",
+          "GenerateImageStage('{}'): scheduler = {} ({} steps, shift {} {})",
           this->id(), _scheduler_spec.type, _scheduler_spec.steps,
           _scheduler_spec.shift, _scheduler_spec.shift_type));
     }
@@ -2387,7 +2485,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     _flux2_dit->set_stream_stop({});
     if (fl.empty()) {
       session()->info(fmt(
-          "TextToImageStage('{}'): FLUX.2 generation {}; dropping beat",
+          "GenerateImageStage('{}'): FLUX.2 generation {}; dropping beat",
           this->id(), ctx.stop_requested() ? "stopped" : "failed"));
       co_return;
     }
@@ -2399,7 +2497,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
+        "GenerateImageStage('{}'): FLUX.2 latent [{}, {}, {}] ({} steps @ {}x{})",
         this->id(), Cdit, fgh, fgw, _scheduler_spec.steps, gen_h, gen_w));
     // Free the DiT if the downstream vae-decode won't fit alongside it (before
     // publishing the latent, so the decode stage sees the freed working set).
@@ -2422,7 +2520,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     _qie_dit->set_stream_stop({});
     if (ql.empty()) {
       session()->info(fmt(
-          "TextToImageStage('{}'): Qwen-Image-Edit generation {}; dropping "
+          "GenerateImageStage('{}'): Qwen-Image-Edit generation {}; dropping "
           "beat", this->id(), ctx.stop_requested() ? "stopped" : "failed"));
       co_return;
     }
@@ -2434,7 +2532,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
+        "GenerateImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
         "({} steps @ {}x{})", this->id(), lh, lw, _scheduler_spec.steps,
         gen_h, gen_w));
     co_await ctx.write(0, std::move(out));
@@ -2456,7 +2554,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     _boogu_dit->set_stream_stop({});
     if (bl.empty()) {
       session()->info(fmt(
-          "TextToImageStage('{}'): Boogu-Image generation {}; dropping beat",
+          "GenerateImageStage('{}'): Boogu-Image generation {}; dropping beat",
           this->id(), ctx.stop_requested() ? "stopped" : "failed"));
       co_return;
     }
@@ -2468,7 +2566,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): Boogu-Image latent [16, {}, {}] ({} steps "
+        "GenerateImageStage('{}'): Boogu-Image latent [16, {}, {}] ({} steps "
         "@ {}x{})", this->id(), lh, lw, _scheduler_spec.steps, gen_h, gen_w));
     // Before publishing: on a bounded box the resident DiT would leave the
     // downstream vae-decode no working set. Freed here, reloaded on the next
@@ -2495,7 +2593,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     _mage_dit->set_stream_stop({});
     if (ml.empty()) {
       session()->info(fmt(
-          "TextToImageStage('{}'): Mage-Flow generation {}; dropping beat",
+          "GenerateImageStage('{}'): Mage-Flow generation {}; dropping beat",
           this->id(), ctx.stop_requested() ? "stopped" : "failed"));
       co_return;
     }
@@ -2507,7 +2605,7 @@ TextToImageStage::process(RuntimeContext& ctx)
     tag_model_(*out);
     ++_latents_emitted;
     session()->info(fmt(
-        "TextToImageStage('{}'): Mage-Flow latent [{}, {}, {}] ({} steps @ "
+        "GenerateImageStage('{}'): Mage-Flow latent [{}, {}, {}] ({} steps @ "
         "{}x{})", this->id(), MC, mgh, mgw, _scheduler_spec.steps, gen_h,
         gen_w));
     co_await ctx.write(0, std::move(out));
@@ -2532,7 +2630,7 @@ TextToImageStage::process(RuntimeContext& ctx)
   _dit->set_stream_stop({});
   if (out_latent.empty()) {
     session()->info(fmt(
-        "TextToImageStage('{}'): generation {}; dropping beat", this->id(),
+        "GenerateImageStage('{}'): generation {}; dropping beat", this->id(),
         ctx.stop_requested() ? "stopped" : "failed"));
     co_return;
   }
@@ -2556,7 +2654,7 @@ TextToImageStage::process(RuntimeContext& ctx)
   tag_model_(*out);
   ++_latents_emitted;
   session()->info(fmt(
-      "TextToImageStage('{}'): latent [16, {}, {}] ({}+{} {} steps @ "
+      "GenerateImageStage('{}'): latent [16, {}, {}] ({}+{} {} steps @ "
       "{}x{})", this->id(), lh, lw, _sampler_spec.method,
       _scheduler_spec.type, _scheduler_spec.steps, gen_h, gen_w));
   co_await ctx.write(0, std::move(out));
@@ -2565,19 +2663,19 @@ TextToImageStage::process(RuntimeContext& ctx)
 #else   // !VPIPE_BUILD_APPLE_SILICON
 
 Job
-TextToImageStage::initialize(RuntimeContext& ctx)
+GenerateImageStage::initialize(RuntimeContext& ctx)
 {
   (void)ctx;
   if (session()) {
     session()->error(fmt(
-        "TextToImageStage('{}'): built without VPIPE_BUILD_APPLE_SILICON; "
+        "GenerateImageStage('{}'): built without VPIPE_BUILD_APPLE_SILICON; "
         "inert", this->id()));
   }
   co_return;
 }
 
 Job
-TextToImageStage::process(RuntimeContext& ctx)
+GenerateImageStage::process(RuntimeContext& ctx)
 {
   auto in = co_await ctx.read(0);
   (void)in;
@@ -2587,7 +2685,7 @@ TextToImageStage::process(RuntimeContext& ctx)
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
-VPIPE_REGISTER_STAGE(TextToImageStage)
-VPIPE_REGISTER_SPEC(TextToImageStage, kSpec)
+VPIPE_REGISTER_STAGE(GenerateImageStage)
+VPIPE_REGISTER_SPEC(GenerateImageStage, kSpec)
 
 }

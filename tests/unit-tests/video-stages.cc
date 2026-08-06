@@ -139,6 +139,26 @@ private:
   int64_t _pts         = 0;
 };
 
+// Counts the FrameRefs a decoder hands out, ignoring the stream header.
+class FrameCounter : public TypedStage<FrameCounter> {
+public:
+  static constexpr const char* kTypeName = "ut-frame-counter";
+  using TypedStage::TypedStage;
+
+  unsigned frames = 0;
+
+  void reset_run_state() override { frames = 0; }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    auto t = co_await ctx.read(0);
+    if (!t) { ctx.signal_done(); co_return; }
+    if (dynamic_cast<const FrameRefPayload*>(t.get()) != nullptr) {
+      ++frames;
+    }
+  }
+};
+
 }
 
 TEST(video_stages, decoder_oport_arity_follows_config) {
@@ -280,6 +300,82 @@ TEST(video_stages, encoder_relaunch_writes_again) {
     EXPECT_TRUE(sz > 0);
   }
   EXPECT_TRUE(first > 0);
+  remove(out_path.c_str());
+}
+
+// Every frame handed to the encoder must come back out of the file.
+// It did not: the encoder leaves AVPacket::duration at 0, the mov
+// muxer derives each sample's duration from the NEXT sample's
+// timestamp and so has nothing for the last one, and the resulting
+// track is one frame short. The edit list is written to that short
+// duration, so a conformant demuxer trims the final frame and an
+// N-frame clip plays back N-1. A file-size assertion cannot see this;
+// only a count can.
+TEST(video_stages, encoder_keeps_every_frame) {
+  Session sess;
+  CerrSilencer hush;
+
+  const unsigned kFrames = 33;   // odd, and not a GOP multiple
+  const string out_path = tmp_path_("enc-count", ".mp4");
+  remove(out_path.c_str());
+
+  {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SynthVideoSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = kFrames;
+    src_u->fps = AVRational{16, 1};
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SynthVideoSource*>(
+      pl->insert_stage(std::move(src_u)));
+
+    FlexData enc_cfg = FlexData::make_object();
+    enc_cfg.as_object().insert("output_url",
+                               FlexData::make_string(out_path));
+    enc_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto enc_u = make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+    pl->insert_stage(std::move(enc_u));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+
+  ASSERT_TRUE(file_size_or_zero_(out_path) > 0);
+
+  unsigned got = 0;
+  {
+    auto pl = make_unique<Pipeline>("p2", &sess);
+    FlexData dec_cfg = FlexData::make_object();
+    dec_cfg.as_object().insert("input_url",
+                               FlexData::make_string(out_path));
+    dec_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto dec_u = make_unique<LoadVideoStage>(
+      &sess, "dec", vector<InEdge>{}, std::move(dec_cfg));
+    dec_u->allocate_oports(1);
+    auto* dec = static_cast<LoadVideoStage*>(
+      pl->insert_stage(std::move(dec_u)));
+
+    auto cnt_u = make_unique<FrameCounter>(
+      &sess, "cnt", vector<InEdge>{{dec, 0}}, FlexData::make_object());
+    auto* cnt = static_cast<FrameCounter*>(
+      pl->insert_stage(std::move(cnt_u)));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    got = cnt->frames;
+  }
+
+  if (got != kFrames) {
+    // cerr is silenced above; the COUNT is the whole diagnosis, since
+    // "one short" and "nothing at all" are entirely different bugs.
+    cout << "decoded " << got << " frames, expected " << kFrames << "\n";
+  }
+  EXPECT_TRUE(got == kFrames);
   remove(out_path.c_str());
 }
 

@@ -13,7 +13,7 @@ namespace vpipe {
 
 // Source-ish stage: 0 or 1 inputs, 1 output. Reads text files from the local
 // filesystem and emits each file's contents as a plain FlexData string beat on
-// out-port 0 -- the text-input format, consumed by text-to-image / text-chat.
+// out-port 0 -- the text-input format, consumed by generate-image / text-chat.
 // Mirrors load-image / load-audio (a file-driven source), for text.
 //
 // Pacing: when an iport is wired (typically a `chrono` stage), each upstream

@@ -25,7 +25,7 @@ namespace vpipe {
 //
 // The base is a safetensors model directory (for Krea-2-Turbo, the
 // `transformer/` DiT -- the LoRA only adapts the DiT, and the fused DiT is used
-// via the text-to-image stage's `dit_dir`, like a quantized DiT). The LoRA is a
+// via the generate-image stage's `dit_dir`, like a quantized DiT). The LoRA is a
 // single .safetensors adapter. Two formats fuse: diffusers-named lora_A/B pairs
 // and ai-toolkit / ComfyUI adapters (`diffusion_model.*` names, incl. LoKr
 // lokr_w1/lokr_w2); keys map to base weights by name (leading-prefix strip +

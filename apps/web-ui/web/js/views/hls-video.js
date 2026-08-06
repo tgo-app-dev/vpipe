@@ -9,7 +9,7 @@
 //
 // Playback: native HLS where the browser supports it (Safari / iOS --
 // zero dependencies), otherwise the vendored hls.js
-// (web/js/vendor/hls.min.js, served from the doc-root). Both paths work
+// (web/js/vendor/hls.min.js, embedded with the UI). Both paths work
 // fully offline with no external requests. If hls.js fails to load the
 // pane shows a direct link to the stream.
 
@@ -32,7 +32,7 @@ function streamUrl(s) {
 }
 
 // Lazy hls.js loader for non-native browsers. hls.js 1.5.18 is vendored
-// at web/js/vendor/hls.min.js (served from the doc-root), so playback
+// at web/js/vendor/hls.min.js (embedded with the UI), so playback
 // works fully offline with no external requests. Cached so concurrent
 // panes share one load.
 let hlsLoad = null;

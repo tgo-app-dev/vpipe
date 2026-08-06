@@ -257,7 +257,7 @@ TEST(krea2_dit_quant, stage_quantizes_dit)
   // Point at the stock Krea-2-Turbo pipeline ROOT (no top-level config.json;
   // the DiT lives under transformer/) -- the stage must produce a SELF-
   // CONTAINED output: the DiT quantized under transformer/, every other
-  // component copied, so it is usable directly as a text-to-image hf_dir.
+  // component copied, so it is usable directly as a generate-image hf_dir.
   // Output on the source's volume so the component copies hard-link (instant).
   const std::string src = root;
   const std::string out =
@@ -333,7 +333,7 @@ any_tensor_contains_(const std::string& dir, const std::string& needle)
 
 // target=text_encoder: the stage produces a SELF-CONTAINED pipeline whose
 // text_encoder is quantized (gains a quantization block) while the DiT is
-// copied through unquantized -- so the output is a valid text-to-image hf_dir
+// copied through unquantized -- so the output is a valid generate-image hf_dir
 // with a quantized encoder. Structural check (no model load).
 TEST(krea2_dit_quant, stage_quantizes_text_encoder)
 {
@@ -378,7 +378,7 @@ TEST(krea2_dit_quant, stage_quantizes_text_encoder)
   EXPECT_FALSE(has_quant_block_(
       (fs::path(out) / "transformer" / "config.json").string()));
   // The backbone linears got quantized (q_proj gains a .scales tensor), but
-  // embed_tokens stays bf16 (no .scales) -- the text-to-image stage host-
+  // embed_tokens stays bf16 (no .scales) -- the generate-image stage host-
   // gathers the embed table as a plain 2-byte-per-element buffer.
   const std::string enc = (fs::path(out) / "text_encoder").string();
   EXPECT_TRUE(any_tensor_contains_(enc, "q_proj.scales"));

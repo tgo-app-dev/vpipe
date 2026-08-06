@@ -1680,6 +1680,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       // tail) so a slow high-res step responds within ~one block on the
       // preloaded path too.
       if (_stream_stop && _stream_stop()) { return {}; }
+      if (_block_progress) {
+        _block_progress(L, c.n_double + c.n_single);
+      }
       // Pinned prefix (L < _pinned_d) is resident in _double; the tail streams.
       const bool streaming = _stream_blocks && L >= _pinned_d;
       DoubleBlock streamed;
@@ -1797,6 +1800,11 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   const bool ff_direct = _fn_transpose_rs.valid() && have_mlp_rs;
   for (int L = 0; L < c.n_single; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }   // pipeline stop, any mode
+    // Continues the double stack's numbering: one progress sequence over
+    // the whole forward, not two that each restart at zero.
+    if (_block_progress) {
+      _block_progress(c.n_double + L, c.n_double + c.n_single);
+    }
     // Pinned prefix (L < _pinned_s) is resident in _single; the tail streams.
     const bool streaming = _stream_blocks && L >= _pinned_s;
     SingleBlock streamed;

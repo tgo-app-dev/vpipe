@@ -1544,6 +1544,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // pipeline stop is honored within ~one block even on the preloaded path
       // (a slow high-res step otherwise runs all blocks before responding).
       if (_stream_stop && _stream_stop()) { return {}; }
+      if (_block_progress) { _block_progress(L, c.n_layers); }
       // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams.
       const bool streaming = _stream_blocks && L >= _pinned;
       Block streamed;

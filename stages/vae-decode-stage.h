@@ -14,6 +14,7 @@
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
+#include "generative-models/wan/metal-wan-vae.h"
 #endif
 
 #include <cstdint>
@@ -75,7 +76,8 @@ public:
 
 private:
   std::string _hf_dir;
-  // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) | "mage" (MageVAE)
+  // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
+  // "mage" (MageVAE) | "wan" (AutoencoderKLWan, the VIDEO one)
   std::string _family;
   std::uint64_t _images_emitted = 0;
 
@@ -93,6 +95,11 @@ private:
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalMageVae>  _mage_vae;
+  std::unique_ptr<genai::MetalWanVae>   _wan_vae;
+
+  // Frame rate stamped onto each emitted video frame's sideband when the
+  // producer did not supply one. Only meaningful for the "wan" family.
+  double _fps = 16.0;
 
   // Resolve _hf_dir + load the VAE (idempotent: the _load_attempted guard runs
   // the body at most once). No-op when _hf_dir is still empty.

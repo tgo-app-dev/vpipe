@@ -56,29 +56,6 @@ link_or_copy_tree_(const std::filesystem::path& src,
   return true;
 }
 
-// Throttled in-place progress bar on the user-facing text stream, mirroring the
-// model-quantize / text-to-image style: redrawn on a carriage return only when
-// the integer percentage changes, space-padded so a shorter redraw overwrites a
-// longer prior one.
-void
-fuse_progress_(UiTextStream* bar, std::size_t done, std::size_t total,
-               int& last_pct, const char* phase)
-{
-  if (bar == nullptr || total == 0) { return; }
-  int pct = (int)(done * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b(static_cast<std::size_t>(fill), '#');
-  b += std::string(static_cast<std::size_t>(W - fill), '-');
-  std::string line =
-      fmt("\r[{}] {}% {} ({}/{})", b, pct, phase, done, total)();
-  while (line.size() < 52) { line += ' '; }
-  bar->write(line);
-}
-
 }  // namespace
 
 LoraFuseStage::LoraFuseStage(const SessionContextIntf* s,
@@ -152,7 +129,7 @@ const StageSpec kSpec = {
                "dW = B@A or, for a LoKr adapter, kron(w1,w2)) into a new "
                "registered model. Handles diffusers and ai-toolkit / ComfyUI "
                "(diffusion_model.*) adapter naming. For Krea-2 point base_model "
-               "at the transformer/ DiT and use the result via text-to-image "
+               "at the transformer/ DiT and use the result via generate-image "
                "dit_dir; set base_pipeline to also copy the encoder/vae/tokenizer "
                "for a self-contained, chain-quantizable model. Optional trigger "
                "in / summary out.",
@@ -188,7 +165,7 @@ LoraFuseStage::register_output_(const std::string& key, const std::string& dir)
     ro.insert_or_assign("lora_fused", FlexData::make_bool(true));
     // Describe the fused output by probing it (model-detect.h): a
     // self-contained pipeline registers under its family, a BARE DiT
-    // under "<family>-dit" -- which is the type text-to-image's `dit_dir`
+    // under "<family>-dit" -- which is the type generate-image's `dit_dir`
     // field filters on, and where a bare fused DiT actually belongs.
     const DetectedModel d = detect_model_dir(dir);
     record_detected_fields(ro, d);
@@ -277,15 +254,14 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
                       pipe_root.empty() ? ""
                           : (" (self-contained from '" + pipe_root + "')")));
   std::string err;
-  {   // in-place fusion progress bar (per base tensor written)
-    std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-    int last_pct = -1;
+  {   // in-place fusion progress (per base tensor written)
+    UiProgress bar = session()->open_progress("fuse");
     const bool ok = genai::fuse_lora(
         mc, base_dir, lora_file, fuse_out, (float)_scale, &err, stop,
         [&](std::size_t done, std::size_t total) {
-          fuse_progress_(bar.get(), done, total, last_pct, "fuse");
+          bar.update(done, total);
         });
-    bar->end();
+    bar.finish();
     if (!ok) {
       if (stop()) {
         session()->info(fmt("LoraFuseStage('{}'): fusion stopped; output '{}' "
@@ -304,22 +280,19 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
     for (const auto& e : fs::directory_iterator(pipe_root, ec)) {
       if (e.path().filename() != "transformer") { comps.push_back(e.path()); }
     }
-    std::unique_ptr<UiTextStream> cbar = session()->open_text_stream();
-    int cpct = -1;
+    UiProgress cbar = session()->open_progress("copy components");
     for (std::size_t i = 0; i < comps.size(); ++i) {
-      fuse_progress_(cbar.get(), i, comps.size(), cpct, "copy");
-      if (stop()) { cbar->end(); return false; }
+      cbar.update(i, comps.size());
+      if (stop()) { return false; }
       if (!link_or_copy_tree_(comps[i], fs::path(out_dir) / comps[i].filename(),
                               ec, stop)) {
-        cbar->end();
         session()->warn(fmt("LoraFuseStage('{}'): failed to copy component '{}' "
                             "from '{}'", this->id(),
                             comps[i].filename().string(), pipe_root));
         return false;
       }
     }
-    fuse_progress_(cbar.get(), comps.size(), comps.size(), cpct, "copy");
-    cbar->end();
+    cbar.finish();
     session()->log_normal(fmt("LoraFuseStage('{}'): assembled self-contained "
                               "model at '{}'", this->id(), out_dir));
   }

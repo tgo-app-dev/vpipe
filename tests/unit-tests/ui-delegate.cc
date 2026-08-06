@@ -247,3 +247,136 @@ TEST(ui_delegate, stdio_sigint_idle_handlers_quit) {
   d.note_sigint();
   EXPECT_TRUE(d.poll_sigint() == true);
 }
+
+// ---- progress reports ------------------------------------------------
+
+// The basic lifecycle: a handle appears in the snapshot with the counts
+// and detail it was given, and the version advances so a renderer knows
+// to repaint.
+TEST(ui_delegate, progress_open_update_snapshot) {
+  GetlineOnlyUi d;
+  const uint64_t v0 = d.progress_version();
+  UiProgress p = d.open_progress("fetch");
+  EXPECT_TRUE(static_cast<bool>(p));
+  p.update(3, 10, "3 / 10 GB");
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].desc == "fetch");
+  EXPECT_TRUE(items[0].done == 3);
+  EXPECT_TRUE(items[0].total == 10);
+  EXPECT_TRUE(items[0].detail == "3 / 10 GB");
+  EXPECT_TRUE(d.progress_version() > v0);
+}
+
+// update() with an empty detail must not WIPE a detail already set --
+// update(done, total) is the common call and the two-argument form
+// would otherwise silently clear the text every tick.
+TEST(ui_delegate, progress_empty_detail_preserves) {
+  GetlineOnlyUi d;
+  UiProgress p = d.open_progress("quantize");
+  p.update(1, 4, "fold");
+  p.update(2, 4);
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].done == 2);
+  EXPECT_TRUE(items[0].detail == "fold");
+  p.set_detail("");                    // explicit clear still works
+  items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].detail.empty());
+}
+
+// The destructor closes the report -- what lets a call site drop its
+// explicit end() and still clean up on an early return.
+TEST(ui_delegate, progress_destructor_closes) {
+  GetlineOnlyUi d;
+  {
+    UiProgress p = d.open_progress("denoise");
+    EXPECT_TRUE(d.progress_snapshot().size() == 1);
+  }
+  EXPECT_TRUE(d.progress_snapshot().empty());
+}
+
+// finish() is idempotent and leaves the handle inert, so the
+// destructor running after an explicit finish() is harmless.
+TEST(ui_delegate, progress_finish_idempotent) {
+  GetlineOnlyUi d;
+  UiProgress p = d.open_progress("copy");
+  p.finish();
+  EXPECT_TRUE(!static_cast<bool>(p));
+  p.finish();
+  p.update(1, 2);                      // no-op, must not resurrect
+  EXPECT_TRUE(d.progress_snapshot().empty());
+}
+
+// Move leaves the source inert and transfers the live report, so a
+// handle can be assigned into an outer scope (which is how the call
+// sites conditionally open one).
+TEST(ui_delegate, progress_move_transfers) {
+  GetlineOnlyUi d;
+  UiProgress a = d.open_progress("a");
+  UiProgress b = std::move(a);
+  EXPECT_TRUE(!static_cast<bool>(a));
+  EXPECT_TRUE(static_cast<bool>(b));
+  b.update(1, 2);
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].done == 1);
+}
+
+// Concurrent reports all appear, OLDEST FIRST (a footer row that jumps
+// position between repaints reads as a glitch), and `seq` identifies
+// the most recently updated -- which is what the web-ui cell shows.
+TEST(ui_delegate, progress_concurrent_order_and_seq) {
+  GetlineOnlyUi d;
+  UiProgress first  = d.open_progress("first");
+  UiProgress second = d.open_progress("second");
+  first.update(1, 10);
+  second.update(5, 10);
+  first.update(2, 10);                 // first is now the most recent
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 2);
+  EXPECT_TRUE(items[0].desc == "first");
+  EXPECT_TRUE(items[1].desc == "second");
+  EXPECT_TRUE(items[0].seq > items[1].seq);
+  second.finish();
+  items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].desc == "first");
+}
+
+// A default-constructed handle is INERT: that is what a context with no
+// UI hands back, and it is what lets a stage report progress without
+// checking whether anyone is listening.
+TEST(ui_delegate, progress_inert_handle_is_silent) {
+  UiProgress p;
+  EXPECT_TRUE(!static_cast<bool>(p));
+  p.update(1, 2, "ignored");           // must not crash
+  p.set_detail("also ignored");
+  p.finish();
+}
+
+// A handle outliving its delegate closes into thin air rather than
+// into freed memory -- the weak_ptr contract the interrupt tokens use.
+TEST(ui_delegate, progress_outlives_delegate) {
+  UiProgress p;
+  {
+    GetlineOnlyUi d;
+    p = d.open_progress("orphan");
+    EXPECT_TRUE(static_cast<bool>(p));
+  }
+  p.update(1, 2);                      // registry is gone; no-op
+  p.finish();
+}
+
+// 0 total means INDETERMINATE and is carried through as-is -- a
+// download before its Content-Length must not read as 0%.
+TEST(ui_delegate, progress_indeterminate_total_zero) {
+  GetlineOnlyUi d;
+  UiProgress p = d.open_progress("fetch");
+  p.update(4096, 0);
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].total == 0);
+  EXPECT_TRUE(items[0].done == 4096);
+}

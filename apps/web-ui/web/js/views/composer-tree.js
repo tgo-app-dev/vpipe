@@ -62,19 +62,21 @@ export function findLeaf(node, panel) {
 // ---- surgery -------------------------------------------------------------
 
 // Replace `target`'s leaf with a split holding it plus `panel`. The new pane
-// goes SECOND (right / below), matching the workspace's "existing first".
-// Returns the (possibly new) root.
-export function splitAt(root, target, dir, panel) {
+// goes SECOND (right / below) by default, matching the workspace's "existing
+// first"; `before` puts the new pane FIRST instead, so the existing one ends
+// up on the right / at the bottom. Returns the (possibly new) root.
+export function splitAt(root, target, dir, panel, before = false) {
   const leaf = findLeaf(root, target);
   if (!leaf) { return root; }
   const moved = { kind: 'leaf', panel: leaf.panel };
+  const fresh = leafOf(panel);
   // Mutate the found node in place into a split so any parent link stays
   // valid without a rebuild.
   leaf.kind = 'split';
   leaf.dir = dir;
   leaf.ratio = 0.5;
-  leaf.a = moved;
-  leaf.b = leafOf(panel);
+  leaf.a = before ? fresh : moved;
+  leaf.b = before ? moved : fresh;
   delete leaf.panel;
   return root;
 }

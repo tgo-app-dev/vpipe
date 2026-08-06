@@ -82,28 +82,6 @@ read_file_(const std::filesystem::path& p)
   return ss.str();
 }
 
-// Throttled in-place progress bar -- redraws on a carriage-return only
-// when the integer percentage changes (the frame is space-padded so a
-// shorter redraw fully overwrites a longer prior one).
-void
-eval_progress_(vpipe::UiTextStream* bar, const char* tag, int done,
-               int total, int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = static_cast<int>(static_cast<long>(done) * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b(static_cast<std::size_t>(fill), '#');
-  b += std::string(static_cast<std::size_t>(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done,
-                         total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
-
 }  // namespace
 
 bool
@@ -235,8 +213,8 @@ eval_wikitext2_perplexity(LoadedLanguageModel& lm, std::string_view text,
   std::array<std::int32_t, 1> first{ ids[0] };
   if (lm.prefill(ctx, std::span<const std::int32_t>(first)) < 0) { return r; }
 
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (session) { bar = session->open_text_stream(); }
+  vpipe::UiProgress bar;
+  if (session) { bar = session->open_progress("perplexity"); }
   if (session) {
     session->log_normal(
         fmt("eval: WikiText-2 perplexity over {} tokens", ids.size()));
@@ -244,9 +222,8 @@ eval_wikitext2_perplexity(LoadedLanguageModel& lm, std::string_view text,
 
   double nll = 0.0;
   long long n = 0;
-  int ppl_pct = -1;
   for (std::size_t i = 1; i < ids.size(); ++i) {
-    eval_progress_(bar.get(), "perplexity", (int)i, (int)ids.size(), ppl_pct);
+    bar.update(i, ids.size());
     const std::vector<float>& lg = lm.last_logits_host();
     if (lg.empty()) { break; }
     nll += -log_prob_at_(lg, ids[i]);
@@ -256,7 +233,7 @@ eval_wikitext2_perplexity(LoadedLanguageModel& lm, std::string_view text,
       if (lm.next_token(ctx, ids[i]) < 0) { break; }
     }
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   if (n <= 0) { return r; }
   r.ok         = true;
   r.n_tokens   = n;
@@ -284,16 +261,15 @@ eval_arc_challenge(LoadedLanguageModel& lm, const std::vector<ArcItem>& items,
   const Tokenizer& tok = lm.tokenizer();
   const int bos = bos_id_(tok);
 
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (session) { bar = session->open_text_stream(); }
+  vpipe::UiProgress bar;
+  if (session) { bar = session->open_progress("ARC"); }
   if (session) {
     session->log_normal(fmt("eval: ARC-Challenge over {} samples", take));
   }
 
   int correct = 0, scored = 0;
-  int arc_pct = -1;
   for (int s = 0; s < take; ++s) {
-    eval_progress_(bar.get(), "ARC", s, take, arc_pct);
+    bar.update((std::uint64_t)s, (std::uint64_t)take);
     const ArcItem& item = items[(std::size_t)idx[(std::size_t)s]];
     const int nc = (int)item.choices.size();
     const int gold = item.answer;
@@ -341,7 +317,7 @@ eval_arc_challenge(LoadedLanguageModel& lm, const std::vector<ArcItem>& items,
                              correct_q ? "ok" : "miss"));
     }
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   if (scored <= 0) { return r; }
   r.ok       = true;
   r.n        = scored;
@@ -377,8 +353,8 @@ capture_token_logits(LoadedLanguageModel& lm, std::string_view text,
     return false;
   }
 
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (session) { bar = session->open_text_stream(); }
+  vpipe::UiProgress bar;
+  if (session) { bar = session->open_progress("capture"); }
   if (session) {
     session->log_normal(
         fmt("eval: capturing A logits over {} tokens", ids.size()));
@@ -386,9 +362,8 @@ capture_token_logits(LoadedLanguageModel& lm, std::string_view text,
 
   const int vocab = out_vocab;
   out_logits.reserve((std::size_t)(ids.size() - 1) * (std::size_t)vocab);
-  int cap_pct = -1;
   for (std::size_t i = 1; i < ids.size(); ++i) {
-    eval_progress_(bar.get(), "capture", (int)i, (int)ids.size(), cap_pct);
+    bar.update(i, ids.size());
     const std::vector<float>& lg = lm.last_logits_host();
     if ((int)lg.size() != vocab) { break; }
     out_logits.insert(out_logits.end(), lg.begin(), lg.end());
@@ -400,7 +375,7 @@ capture_token_logits(LoadedLanguageModel& lm, std::string_view text,
   }
   // Record the final input id too, so B replays the EXACT fed sequence.
   if (out_n > 0) { out_ids.push_back(ids[(std::size_t)out_n]); }
-  if (bar) { bar->end(); }
+  bar.finish();
   return out_n > 0;
 }
 
@@ -431,8 +406,8 @@ ab_divergence(LoadedLanguageModel& lm_b, const std::vector<std::int32_t>& ids,
     return r;
   }
 
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (session) { bar = session->open_text_stream(); }
+  vpipe::UiProgress bar;
+  if (session) { bar = session->open_progress("divergence"); }
   if (session) {
     session->log_normal(
         fmt("eval: A-vs-B divergence over {} positions", a_n));
@@ -440,9 +415,8 @@ ab_divergence(LoadedLanguageModel& lm_b, const std::vector<std::int32_t>& ids,
 
   double kl_sum = 0.0, rel_sum = 0.0;
   int n = 0;
-  int div_pct = -1;
   for (int t = 0; t < a_n; ++t) {
-    eval_progress_(bar.get(), "divergence", t, a_n, div_pct);
+    bar.update((std::uint64_t)t, (std::uint64_t)a_n);
     const std::vector<float>& b = lm_b.last_logits_host();
     if ((int)b.size() != vocab) { break; }
     const float* a = a_logits.data() + (std::size_t)t * vocab;
@@ -481,7 +455,7 @@ ab_divergence(LoadedLanguageModel& lm_b, const std::vector<std::int32_t>& ids,
       if (lm_b.next_token(ctx, ids[t + 1]) < 0) { break; }
     }
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   if (n <= 0) { return r; }
   r.ok     = true;
   r.n      = n;

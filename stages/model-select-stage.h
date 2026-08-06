@@ -13,7 +13,7 @@ namespace vpipe {
 
 // Source stage: pick ONE diffusion model directory and emit it as a FlexData
 // beat, once, on oport0. A text-to-image graph's diffusion-conditioner, DiT
-// (text-to-image), vae-encode and vae-decode stages all need the SAME model;
+// (generate-image), vae-encode and vae-decode stages all need the SAME model;
 // wiring this one source into each of their optional `model` iports keeps that
 // choice in a single place -- change the model here rather than in four
 // separate configs. The emitted beat OVERRIDES each consumer's `hf_dir` config

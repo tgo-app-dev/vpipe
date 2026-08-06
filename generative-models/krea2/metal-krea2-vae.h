@@ -3,9 +3,13 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
+#include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
+#include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace vpipe {
@@ -192,14 +196,47 @@ class MetalKrea2Vae {
   // Fused 3x3 conv2d on the matrix units (im2col staged in threadgroup memory ->
   // matmul2d): out[OH*OW, Cout] = conv(in[H*W, Cin], w[Cout, 9*Cin]) + bias, pad
   // 1, given stride. Skips the DRAM im2col scratch of conv_gemm_bias's path.
-  // Only used when _use_conv2d (matrix cores + kernels present); returns false
-  // so callers fall back to im2col otherwise.
+  // Only used when _use_conv2d (matrix cores + kernels present) AND
+  // conv_route_() picked it for this shape; false leaves the caller on im2col.
   bool conv2d_mma_(metal_compute::ComputeEncoder& enc,
                    const metal_compute::SharedBuffer& in,
                    const metal_compute::SharedBuffer& w,
                    const metal_compute::SharedBuffer& b,
                    const metal_compute::SharedBuffer& out, int H, int W, int Cin,
                    int Cout, int OH, int OW, int stride);
+
+  // The two ways this VAE runs a 3x3 the hardware conv declined -- the fused
+  // conv2d_mma_ above and the row-tiled im2col + GEMM below it. THE SINGLE
+  // ENTRANCE for both, so the decode/encode lambdas and the tuner's probe can
+  // never drift apart about what the fallback order is.
+  void conv3x3_fallback_(metal_compute::ComputeEncoder& enc,
+                         const metal_compute::SharedBuffer& in,
+                         const metal_compute::SharedBuffer& out, int H, int W,
+                         const Conv& c, int stride,
+                         const metal_compute::SharedBuffer& col,
+                         std::size_t cap);
+
+  // Which of the two the measured tune picked, per (cin, cout, stride). See
+  // vae-conv3x3-tune.h: the answer is a property of the GPU AND the shape, so
+  // there is nothing sound to branch on at compile time. Unlisted shapes
+  // (untuned, or a machine with no fused kernel) stay on im2col.
+  std::map<std::tuple<int, int, int>, vae_conv3x3::Kind> _conv_pick;
+  vae_conv3x3::Kind conv_route_(int cin, int cout, int stride) const;
+  // Tune every 3x3 shape in `shapes` against the caller's real im2col scratch.
+  void autotune_conv3x3_(metal_compute::MetalCompute* mc,
+                         const std::vector<std::tuple<int, int, int>>& shapes,
+                         const metal_compute::SharedBuffer& col,
+                         std::size_t cap);
+  bool _conv_tuned = false;   // the FORCE below has been read
+  // VPIPE_KREA2_CONV2D forces the fused conv for EVERY shape, tuned or not --
+  // it has to outrank the map, or the A/B goes vacuous at a shape the tune
+  // skipped (cout <= kSmallCoutMax, or one the hardware conv already takes).
+  bool _conv_force_fused = false;
+  // Tune from decode()/encode(), once the resolution is known: which shapes
+  // reach the fallback at all depends on it. Runs on every call but only ever
+  // ADDS shapes -- the encoder half can arrive after the first decode.
+  void maybe_tune_conv_(int H, int W, const metal_compute::SharedBuffer& col,
+                        std::size_t cap);
 
   // NAX hardware convolution2d (M5+, probe-established semantics): the op
   // reads the full NHWC activation itself (zero-filled pad-1 halo included)
@@ -214,6 +251,23 @@ class MetalKrea2Vae {
                    int stride);
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
+  // Direct 3x3 for a small output-channel count. The hardware conv needs
+  // cout % 64 == 0, so this VAE's final convs -- decoder.conv_out (-> 3) and
+  // encoder.conv_out (-> 2*z_dim) -- drop to im2col AT FULL RESOLUTION and pay
+  // a [H*W, 9*cin] materialization for a few GFLOP. This keeps the short
+  // output vector in registers and reads the activation directly. Shared with
+  // the FLUX.2 VAE (same kernel, same kSmallCoutMax rationale).
+  // VPIPE_VAE_NO_SMALL_COUT_CONV falls back to im2col.
+  metal_compute::ComputeFunction _fn_conv_small_cout;
+  // Above this the im2col+GEMM trade wins back (the register accumulators and
+  // the per-tap re-read stop paying).
+  static constexpr int kSmallCoutMax = 32;
+  // Returns false when the shape is not a fit, leaving the caller on im2col.
+  bool conv3x3_small_cout_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& in,
+                           const Conv& c,
+                           const metal_compute::SharedBuffer& out,
+                           int H, int W, int stride);
   bool _use_hwconv = false;
 
   // Libraries + kernel functions (all reused from the LM path except the VAE
@@ -239,10 +293,25 @@ class MetalKrea2Vae {
   // divides the K/V bandwidth this attention is bound by. MEASURED 3.2x on the
   // mid block at a 1024x768 latent. VPIPE_KREA2_VAE_ATTN_BQ picks the tile
   // (8 = the narrow kernel).
-  metal_compute::ComputeFunction _fn_sdpa_full_wide;
-  int _attn_bq = 0;              // query tile of _fn_sdpa_full_wide (0 = none)
-  static constexpr int kAttnBq = 32;
+  metal_compute::ComputeFunction _fn_sdpa_full_wide16, _fn_sdpa_full_wide32,
+      _fn_sdpa_full_wide64;
   void load_wide_attn_(int mid_d);
+  // The interchangeable mid-block attention kernels, picked by MEASUREMENT at
+  // load rather than from supports_matrix_cores(). See vae-mid-attn-tune.h:
+  // which member wins is a property of the GPU, and a query tile chosen by a
+  // sweep on one machine is not the tile the next one wants. This VAE has no
+  // materialized banded path (no gemm_t/softmax_rows/transpose here), so it
+  // never lists kMat.
+  using MidAttn = vae_mid_attn::Kind;
+  MidAttn _attn_pick = MidAttn::kScalar;
+  bool mid_attn_available_(MidAttn k) const;
+  void encode_mid_attn_(metal_compute::ComputeEncoder& enc, MidAttn kind,
+                        const metal_compute::SharedBuffer& q,
+                        const metal_compute::SharedBuffer& k,
+                        const metal_compute::SharedBuffer& v,
+                        const metal_compute::SharedBuffer& att,
+                        std::size_t hw, int C, float scale);
+  void autotune_mid_attn_(metal_compute::MetalCompute* mc, int C);
   // Simdgroup count the kernel of query tile `bq` was instantiated with; the
   // dispatch has to match it exactly (matmul2d's execution scope is UB
   // otherwise). Mirrors the SAW_INST table in sdpa_mma.metal.
@@ -274,8 +343,11 @@ class MetalKrea2Vae {
 
   // M5-only fused 3x3 conv2d (matmul2d over threadgroup-staged im2col): runs the
   // VAE 3x3 convs without materializing the [H*W, 9*Cin] im2col scratch in DRAM.
-  // Correct (bit-identical) but ~1.7x slower than im2col+matmul2d on M5's high
-  // UMA bandwidth, so OPT-IN via VPIPE_KREA2_CONV2D=1 (default keeps im2col).
+  // Bit-identical to im2col+matmul2d, and whether it is FASTER depends on the
+  // shape -- so the kernels are loaded whenever the matrix units exist and the
+  // per-shape choice is measured (autotune_conv3x3_). `_use_conv2d` now means
+  // only "the fused kernels are available to choose".
+  // VPIPE_KREA2_NO_CONV2D=1 leaves them unloaded (im2col everywhere).
   metal_compute::ComputeLibrary _lib_conv2d;
   metal_compute::ComputeFunction _fn_conv2d_s1, _fn_conv2d_s2;
   bool _use_conv2d = false;

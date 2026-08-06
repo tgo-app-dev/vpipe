@@ -1,5 +1,5 @@
-#ifndef VPIPE_STAGES_TEXT_TO_IMAGE_STAGE_H
-#define VPIPE_STAGES_TEXT_TO_IMAGE_STAGE_H
+#ifndef VPIPE_STAGES_GENERATE_IMAGE_STAGE_H
+#define VPIPE_STAGES_GENERATE_IMAGE_STAGE_H
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
@@ -112,15 +112,15 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 // for FLUX.2 / Mage-Flow -- see latent_scale_). An edit therefore comes out at
 // the source resolution with no size config at all. Falls back to 256x256 when
 // there is no reference either.
-class TextToImageStage final : public TypedStage<TextToImageStage> {
+class GenerateImageStage final : public TypedStage<GenerateImageStage> {
 public:
-  static constexpr const char* kTypeName = "text-to-image";
+  static constexpr const char* kTypeName = "generate-image";
 
-  TextToImageStage(const SessionContextIntf* session,
+  GenerateImageStage(const SessionContextIntf* session,
                    std::string               id,
                    std::vector<InEdge>       iports,
                    FlexData                  config);
-  ~TextToImageStage() override;
+  ~GenerateImageStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
 
@@ -146,7 +146,7 @@ public:
 
 private:
   // Stamp the generating model onto a latent beat's sideband. The chain
-  // text-to-image -> vae-decode -> save-image carries it through so a saved
+  // generate-image -> vae-decode -> save-image carries it through so a saved
   // file can record WHAT produced it (save-image writes it into EXIF
   // Software). Merges into any sideband already present.
   void tag_model_(TensorBeat& tb) const;

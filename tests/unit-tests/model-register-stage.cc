@@ -298,7 +298,7 @@ TEST(model_register_stage, detects_diffusers_pipeline)
 
 // A BARE DiT (diffusers weights + config, no pipeline around them --
 // model-quantize's DiT-only output) gets the "<family>-dit" tag that
-// text-to-image's `dit_dir` picker filters on, NOT the pipeline tag: it
+// generate-image's `dit_dir` picker filters on, NOT the pipeline tag: it
 // cannot be loaded as a pipeline, so offering it to hf_dir would fail.
 TEST(model_register_stage, detects_bare_dit_component)
 {

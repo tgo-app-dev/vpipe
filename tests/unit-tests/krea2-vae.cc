@@ -325,19 +325,25 @@ TEST(krea2_vae, decode_conv2d_vs_im2col)
   const int H = h8 * 8, W = w8 * 8;
   const std::size_t n = (std::size_t)3 * H * W;
 
-  // Both legs disable the NAX hardware conv: this test compares the PARKED
-  // tgmem-staged fused conv against im2col + matmul2d, and the hw op would
-  // otherwise preempt both.
+  // Both legs disable the NAX hardware conv: this test compares the tgmem-
+  // staged fused conv against im2col + matmul2d, and the hw op would otherwise
+  // preempt both. Both also disable the fallback TUNE, so each leg is one
+  // kernel rather than the per-shape mix a decode ships.
   ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1);
-  ::setenv("VPIPE_KREA2_CONV2D", "1", 1);            // opt-in the fused conv
+  ::setenv("VPIPE_VAE_CONV_NO_AUTOTUNE", "1", 1);
   auto m_conv = MetalKrea2Vae::load(vdir, mc, cfg);
-  ::unsetenv("VPIPE_KREA2_CONV2D");
   ASSERT_TRUE(m_conv != nullptr);
   auto m_im2col = MetalKrea2Vae::load(vdir, mc, cfg);  // default: im2col+matmul2d
   ::unsetenv("VPIPE_VAE_NO_HWCONV");
   ASSERT_TRUE(m_im2col != nullptr);
 
+  // VPIPE_KREA2_CONV2D is read at the FIRST DECODE (that is where the routing
+  // is resolved), so it has to stay set THROUGH it -- unsetting after load()
+  // leaves both legs on im2col and the test compares im2col with itself, which
+  // reads as a perfect rel-L2 of 0 and a 1.00x ratio.
+  ::setenv("VPIPE_KREA2_CONV2D", "1", 1);
   SharedBuffer o_conv = m_conv->decode(make_z(), h8, w8);
+  ::unsetenv("VPIPE_KREA2_CONV2D");
   SharedBuffer o_im = m_im2col->decode(make_z(), h8, w8);
   ASSERT_TRUE(!o_conv.empty() && !o_im.empty());
   const auto* a = static_cast<const _Float16*>(o_conv.contents());
@@ -359,6 +365,7 @@ TEST(krea2_vae, decode_conv2d_vs_im2col)
   };
   const double ms_conv = bench(m_conv.get());
   const double ms_im = bench(m_im2col.get());
+  ::unsetenv("VPIPE_VAE_CONV_NO_AUTOTUNE");
   std::printf("[krea2_vae] decode %dx%d: fused-conv2d %.2f ms  im2col %.2f ms  "
               "(%.2fx)\n", H, W, ms_conv, ms_im, ms_im / ms_conv);
 }
@@ -455,6 +462,12 @@ TEST(krea2_vae, decode_1024_im2col_tiled_matches_hwconv)
   }
   const int H = h8 * 8, W = w8 * 8;
   const std::size_t n = (std::size_t)3 * H * W;
+  // Pin the 3x3 fallback to im2col in BOTH arms. Without the hardware conv the
+  // tuner has every shape to choose from, and a machine that picks the fused
+  // conv2d for some of them turns the "im2col" arm into a MIX -- which is a
+  // real (if tiny) numerical difference, and no longer the banding regression
+  // this test is watching.
+  ::setenv("VPIPE_VAE_CONV_NO_AUTOTUNE", "1", 1);
   auto run = [&](bool no_hwconv) -> std::vector<float> {
     if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
     else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
@@ -474,6 +487,7 @@ TEST(krea2_vae, decode_1024_im2col_tiled_matches_hwconv)
   };
   const std::vector<float> hwc = run(/*no_hwconv=*/false);
   const std::vector<float> tld = run(/*no_hwconv=*/true);
+  ::unsetenv("VPIPE_VAE_CONV_NO_AUTOTUNE");
   ASSERT_TRUE(!hwc.empty());
   ASSERT_TRUE(hwc.size() == tld.size());
   const double r = rel_l2_(hwc.data(), tld.data(), hwc.size());
@@ -507,6 +521,8 @@ TEST(krea2_vae, encode_tiled_im2col_matches_hwconv)
     s = s * 1664525u + 1013904223u;
     v = ((float)(s >> 8) / 8388608.0f - 1.0f);      // ~[-1, 1]
   }
+  // Both arms pinned to im2col -- see the decode twin above.
+  ::setenv("VPIPE_VAE_CONV_NO_AUTOTUNE", "1", 1);
   auto run = [&](bool no_hwconv, const char* band) -> std::vector<float> {
     if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
     else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
@@ -530,6 +546,7 @@ TEST(krea2_vae, encode_tiled_im2col_matches_hwconv)
   };
   const std::vector<float> hwc = run(/*no_hwconv=*/false, nullptr);
   const std::vector<float> tld = run(/*no_hwconv=*/true, "4096");   // multi-band
+  ::unsetenv("VPIPE_VAE_CONV_NO_AUTOTUNE");
   if (hwc.empty() || tld.empty()) { return; }       // encoder unavailable -> skip
   ASSERT_TRUE(hwc.size() == tld.size());
   const double r = rel_l2_(hwc.data(), tld.data(), hwc.size());
@@ -583,6 +600,74 @@ TEST(krea2_vae, decode_flash_attn_matches_scalar)
   const double r = rel_l2_(flash.data(), scal.data(), flash.size());
   std::printf("[krea2_vae] flash-attn vs scalar rel-L2 = %.6g (512x512)\n", r);
   EXPECT_TRUE(r < 3e-2);
+}
+
+// The direct small-cout 3x3 must agree with the im2col + GEMM it replaces.
+// decoder.conv_out is base_dim -> 3, so the hardware conv declines (cout % 64)
+// and without this kernel the final conv materializes a [H*W, 9*cin] scratch at
+// FULL resolution for a few GFLOP of work.
+//
+// rel-L2 EXACTLY 0 is expected here, and is not the has-the-switch-worked
+// smell it would be elsewhere: conv_out is N=3, which _mma_min_n deliberately
+// routes to the steel GEMM, and steel accumulates over K in the same
+// (ky,kx,cin) order and the same f32 as this kernel's registers -- same
+// products, same order, same bits. The paths ARE distinct; what separates
+// them is time, not value. MEASURED at 1024x1024, best of three alternating
+// pairs: 1325 ms on im2col against 1289 with the direct kernel.
+TEST(krea2_vae, decode_small_cout_conv_matches_im2col)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string vdir = std::string(root) + "/vae";
+  const int side = 48;                            // -> 384x384
+  auto run = [&](bool no_small, double* ms) {
+    if (no_small) { ::setenv("VPIPE_VAE_NO_SMALL_COUT_CONV", "1", 1); }
+    else          { ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV"); }
+    MetalKrea2Vae::Config cfg;
+    auto m = MetalKrea2Vae::load(vdir, mc, cfg);
+    ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV");
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    const std::size_t hw = (std::size_t)side * side;
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)cfg.z_dim * hw * 2);
+    if (z.empty()) { return out; }
+    std::uint32_t st = 0x2468acedu;                // same latent both runs
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)cfg.z_dim * hw; ++i) {
+      st = st * 1664525u + 1013904223u;
+      d[i] = (_Float16)(((float)(st >> 8) / 8388608.0f) - 1.0f);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer rgb = m->decode(z, side, side);
+    *ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    const std::size_t n = (std::size_t)3 * (side * 8) * (side * 8);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  double ms_direct = 0.0, ms_i2c = 0.0;
+  const std::vector<float> v_direct = run(/*no_small=*/false, &ms_direct);
+  const std::vector<float> v_i2c    = run(/*no_small=*/true,  &ms_i2c);
+  if (v_direct.empty() || v_i2c.empty() || v_direct.size() != v_i2c.size()) {
+    std::printf("[krea2_vae] small-cout A/B unavailable -- skipped\n");
+    return;
+  }
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < v_direct.size(); ++i) {
+    const double d = v_direct[i] - v_i2c[i];
+    num += d * d; den += (double)v_i2c[i] * v_i2c[i];
+  }
+  const double r = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  std::printf("[krea2_vae] small-cout conv vs im2col rel-L2 = %g (%dx%d; "
+              "direct %.0f ms, im2col %.0f ms)\n", r, side * 8, side * 8,
+              ms_direct, ms_i2c);
+  EXPECT_TRUE(std::isfinite(r) && r < 2e-3);
 }
 
 // Decode wall-clock at 512 and 1024 (default hwconv + matmul2d path). Warm 2x,

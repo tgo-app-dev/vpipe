@@ -5,7 +5,7 @@
 // weights resident beside everybody else's, or should I drop them when idle and
 // reload on the next beat? The inputs to that decision -- physical RAM and the
 // on-disk weight bytes of a component directory -- were file-static in
-// text-to-image-stage.cc; they live here so the conditioner and the VAE stages
+// generate-image-stage.cc; they live here so the conditioner and the VAE stages
 // reach the SAME numbers rather than a second opinion.
 //
 // Weight bytes come from the .safetensors sizes, which is a good proxy for the

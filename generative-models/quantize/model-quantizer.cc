@@ -25,6 +25,41 @@
 
 namespace vpipe::genai {
 
+namespace {
+
+// Which source dtypes this quantizer can take. FP32 belongs here: a
+// checkpoint that ships full precision (the Wan A14B experts) is the case
+// that most NEEDS quantizing, and leaving it out did not refuse the pass
+// -- it silently passed every weight through, producing a checkpoint that
+// advertised 4-bit and contained none.
+inline bool
+is_fp_dtype_(const std::string& dt)
+{
+  return dt == "BF16" || dt == "F16" || dt == "F32";
+}
+
+// FP32 -> BF16. BF16 rather than F16 because it keeps FP32's exponent
+// range (nothing can overflow on the way in) and its 8-bit mantissa is
+// already far finer than the 4- or 8-bit step being quantized to.
+inline metal_compute::SharedBuffer
+narrow_f32_bf16_(metal_compute::MetalCompute* mc,
+                 const metal_compute::SharedBuffer& in, std::size_t n)
+{
+  metal_compute::SharedBuffer out = mc->make_shared_buffer(n * 2);
+  if (out.empty()) { return out; }
+  const auto* s = static_cast<const float*>(in.contents());
+  auto* d = static_cast<std::uint16_t*>(out.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    std::uint32_t u;
+    std::memcpy(&u, &s[i], 4);
+    d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+  return out;
+}
+
+}  // namespace
+
+
 using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
 
@@ -239,27 +274,6 @@ load_calib_(const std::string& dir, const std::string& tap, int nL, int ch)
   return v;
 }
 
-// Throttled in-place progress bar -- redraws on a carriage-return only
-// when the integer percentage changes (the frame is space-padded so a
-// shorter redraw fully overwrites a longer prior one).
-void quant_progress_(vpipe::UiTextStream* bar, const char* tag, int done,
-                     int total, int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = static_cast<int>(static_cast<long>(done) * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b(static_cast<std::size_t>(fill), '#');
-  b += std::string(static_cast<std::size_t>(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done,
-                         total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
-
 }  // namespace
 
 bool
@@ -281,8 +295,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     return fail("model-quantize: mixed requires bits=4 high_bits=8 group=64");
   }
   const SessionContextIntf* S = _mc->session();
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (S) { bar = S->open_text_stream(); }
+  // ONE report across every phase; the phase name rides as the detail
+  // text, so a fold -> quantize transition reuses the same row.
+  vpipe::UiProgress bar;
+  if (S) { bar = S->open_progress("quantize"); }
   AffineQuantizer q(_mc);
   if (!q.valid()) {
     return fail("model-quantize: affine quant kernels unavailable");
@@ -363,6 +379,8 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     } else if (ti->dtype == "F16") {
       const auto* s = static_cast<const _Float16*>(raw.contents());
       for (std::size_t i = 0; i < n; ++i) { out[i] = (float)s[i]; }
+    } else if (ti->dtype == "F32") {
+      std::memcpy(out.data(), raw.contents(), n * sizeof(float));
     } else {
       out.clear();
     }
@@ -474,7 +492,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       const auto* ti = src->info(name);
       if (ti == nullptr) { continue; }
       const std::string leaf = weight_leaf_(name);
-      const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
+      const bool fp = is_fp_dtype_(ti->dtype);
       bool ex_hit = false;
       for (const auto& ex : opt.quant_exclude) {
         if (!ex.empty() && name.find(ex) != std::string::npos) {
@@ -534,7 +552,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       const auto* ti = src->info(name);
       if (ti == nullptr) { continue; }
       const std::string leaf = weight_leaf_(name);
-      const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
+      const bool fp = is_fp_dtype_(ti->dtype);
       if (leaf.empty() || quant_set.count(leaf) == 0 ||
           ti->shape.size() != 2 || !fp ||
           ti->shape[1] % opt.group != 0 ||
@@ -948,11 +966,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       S->log_normal(fmt(
           "model-quantize: AWQ/SmoothQuant fold over {} layers", nL));
     }
-    int fold_pct = -1;
     for (int L = 0; L < nL; ++L) {
       if (stop()) { return fail("model-quantize: stopped by request"); }
       if (S) { S->log_verbose(fmt("  fold layer {}/{}", L + 1, nL)); }
-      quant_progress_(bar.get(), "fold", L, nL, fold_pct);
+      bar.update((std::uint64_t)L, (std::uint64_t)nL, "fold");
       const std::string p = opt.layer_prefix + std::to_string(L) + ".";
       auto qb = [&](const std::string& leaf) { return tbits(p + leaf + ".weight"); };
 
@@ -1192,9 +1209,23 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   // OPTIONAL per-input-channel column scale `col_scale[K]` (the MoE shared
   // gate/up input fold: W[:,c] *= col_scale[c], fp-equivalent to the 1/scale
   // folded into post_attention_layernorm). Writes the affine triple under pfx.
-  auto quant_2d_buf = [&](const std::string& pfx, const SharedBuffer& in,
-                          const std::string& dtype, int N, int K, int bits,
+  auto quant_2d_buf = [&](const std::string& pfx, const SharedBuffer& in_raw,
+                          const std::string& dtype_raw, int N, int K, int bits,
                           const float* col_scale) -> bool {
+    // An FP32 source (the Wan experts, and any other checkpoint that ships
+    // full precision) is narrowed to BF16 first, so every branch below sees
+    // one of the two widths it already handles. BF16 and not F16 on
+    // purpose: it keeps FP32's exponent range, so nothing can overflow on
+    // the way in, and its 8-bit mantissa is far finer than the 4- or 8-bit
+    // step this is about to quantize to -- the narrowing is invisible in
+    // the result.
+    const SharedBuffer nbuf =
+        dtype_raw == "F32" ? narrow_f32_bf16_(_mc, in_raw, (std::size_t)N * K)
+                           : SharedBuffer{};
+    if (dtype_raw == "F32" && nbuf.empty()) { return false; }
+    const SharedBuffer& in = dtype_raw == "F32" ? nbuf : in_raw;
+    const std::string dtype = dtype_raw == "F32" ? std::string("BF16")
+                                                 : dtype_raw;
     SharedBuffer w, s, b;
     bool ok;
     if (col_scale != nullptr) {
@@ -1242,7 +1273,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                         const std::string& dtype, int N, int K, int bits,
                         const float* act) -> bool {
     std::vector<float> W((std::size_t)N * K);
-    if (dtype == "BF16") {
+    if (dtype == "F32") {
+      std::memcpy(W.data(), in.contents(), W.size() * sizeof(float));
+    } else if (dtype == "BF16") {
       const auto* sp = static_cast<const std::uint16_t*>(in.contents());
       for (std::size_t i = 0; i < W.size(); ++i) { W[i] = bf16_to_f32_(sp[i]); }
     } else {
@@ -1274,13 +1307,14 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       }
       return f;
     };
-    int folded = 0, fold_pct = -1;
+    int folded = 0;
     for (int L = 0; L < opt.n_layers; ++L) {
       if (stop()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         return fail("model-quantize: stopped by request");
       }
-      quant_progress_(bar.get(), "dit-fold", L + 1, opt.n_layers, fold_pct);
+      bar.update((std::uint64_t)L + 1, (std::uint64_t)opt.n_layers,
+                 "dit-fold");
       if (S != nullptr) {
         S->log_debug(fmt("DiT fold: block {}/{} (ff.down <- ff.up)", L + 1,
                          opt.n_layers));
@@ -1554,13 +1588,11 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     return quant_2d_buf(pfx, in, ti->dtype, N, K, bits, col_scale);
   };
 
-  int quant_pct = -1;
   int idx = 0;
   for (const auto& name : names) {
     if (stop()) { return fail("model-quantize: stopped by request"); }
     ++idx;
-    quant_progress_(bar.get(), "quantize", idx, (int)names.size(),
-                    quant_pct);
+    bar.update((std::uint64_t)idx, names.size(), "quantize");
     if (handled.count(name) > 0) { continue; }
     const auto* ti = src->info(name);
     if (ti == nullptr) { continue; }
@@ -1813,7 +1845,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
 
     const std::string leaf = weight_leaf_(name);
     const bool is_2d = ti->shape.size() == 2;
-    const bool fp = ti->dtype == "BF16" || ti->dtype == "F16";
+    const bool fp = is_fp_dtype_(ti->dtype);
     // Submodule scope: only in-scope tensors are eligible (empty => all).
     const bool in_scope = opt.quant_scope.empty() ||
                           name.find(opt.quant_scope) != std::string::npos;
@@ -1887,7 +1919,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     ++n_quant;
   }
-  if (bar) { bar->end(); }   // finalize the bar line before the summary
+  bar.finish();   // close the report before the summary
 
   if (!wr.close()) { return fail("model-quantize: finalize shards failed"); }
 

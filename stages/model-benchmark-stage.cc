@@ -399,22 +399,13 @@ ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop,
   // goes to log_normal() so info() carries just the bar + final report.
   const int total = static_cast<int>(_contexts.size()) * 3;
   int step = 0;
-  // Redraw the bar in place (carriage-return) on a live text stream rather
-  // than emitting a new info() line per tick. Padded to a stable width so a
-  // shorter redraw fully overwrites a longer prior frame.
-  std::unique_ptr<UiTextStream> bar_stream = session()->open_text_stream();
+  // The label is the DETAIL text (which test is running), so the row reads
+  // "[####----] 33% benchmark  decode 2048" rather than needing its own line.
+  UiProgress bar_stream = session()->open_progress("benchmark");
   auto progress = [&](const std::string& label) {
-    constexpr int width = 24;
-    const double frac =
-        total > 0 ? static_cast<double>(step) / total : 1.0;
-    int fill = static_cast<int>(frac * width + 0.5);
-    fill = std::min(width, std::max(0, fill));
-    std::string bar(static_cast<std::size_t>(fill), '#');
-    bar += std::string(static_cast<std::size_t>(width - fill), '-');
-    std::string line = fmt("\r[{}] {:.0f}% ({}/{}) {}", bar, frac * 100.0,
-                           step, total, label)();
-    while (line.size() < 72) { line += ' '; }   // wipe stale tail
-    bar_stream->write(line);
+    bar_stream.update(static_cast<std::uint64_t>(step < 0 ? 0 : step),
+                      static_cast<std::uint64_t>(total < 0 ? 0 : total),
+                      label);
   };
 
   // Set once a stop is observed; gates the remaining tests + the report note.
@@ -674,7 +665,7 @@ ModelBenchmarkStage::benchmark_once(const std::function<bool()>& stop,
     decode_rows.push_back(std::move(r));
   }
   progress(stopped ? "stopped" : "complete");
-  bar_stream->end();   // finalize the bar line before the Markdown report
+  bar_stream.finish();   // close the report before the Markdown table
 
   // ---- Markdown report ----
   const std::string gpu = GpuTelemetrySampler::gpu_model();

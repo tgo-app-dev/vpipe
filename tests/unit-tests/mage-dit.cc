@@ -349,7 +349,7 @@ TEST(mage_dit, edit_sampler_loop_matches_golden)
 
   SharedBuffer txt = bf16_buf_(mc, gtxt.data(), gtxt.size());
   // The reference latent is channel-first [C, gh, gw]; the DiT wants
-  // token-major [lt, C] -- the same transpose the text-to-image stage does.
+  // token-major [lt, C] -- the same transpose the generate-image stage does.
   std::vector<float> rtok((std::size_t)lt * C);
   for (int c = 0; c < C; ++c) {
     for (int t = 0; t < lt; ++t) {

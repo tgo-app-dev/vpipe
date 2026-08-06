@@ -379,7 +379,7 @@ TEST(save_image_stage, metadata_iport_is_declared_and_optional) {
   EXPECT_TRUE(s.config_error().empty());
 }
 
-// Provenance: text-to-image stamps `model_name` on the latent sideband and
+// Provenance: generate-image stamps `model_name` on the latent sideband and
 // vae-decode carries it onto the image, so a GENERATED image reaches
 // save-image knowing what produced it. That must land in EXIF Software as
 // "Vpipe <version> <hash> with <model>".

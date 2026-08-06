@@ -14,7 +14,7 @@ namespace genai {
 // (`lora_path`, a single .safetensors) into `out_dir`. Each base weight
 // W[N,K] that has a matching adapter becomes W + scale * dW; every other tensor
 // passes through byte-for-byte, and config.json is copied. The output reloads
-// through the usual bf16 path (e.g. the Krea-2 DiT via a text-to-image
+// through the usual bf16 path (e.g. the Krea-2 DiT via a generate-image
 // `dit_dir`).
 //
 // Two adapter formats are recognised per module:

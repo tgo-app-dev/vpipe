@@ -25,6 +25,14 @@ engineered software systems.
 
 ---
 
+<p align="center">
+  <img src="docs/images/vpipe_img_edit_1.webp"
+       alt="Prompt-driven image editing running as a vpipe pipeline"
+       width="900">
+</p>
+
+---
+
 ## Overview
 [back to top](#top)
 

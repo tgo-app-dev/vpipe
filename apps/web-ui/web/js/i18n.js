@@ -284,6 +284,12 @@ const STRINGS = {
       '空管線 — 從工具箱拖入一個階段'],
   'pl.empty':          ['Empty pipeline', '空流水线', '空管線'],
   'pl.narrow_note':    ['Pane too narrow for the canvas — widen it to '
+      + 'wire stages. Tap a stage to edit its configuration here.',
+      '窗格过窄，无法显示画布 — 请加宽以连接流水线级。点按某一级即可在此编辑其配置。',
+      '窗格過窄，無法顯示畫布 — 請加寬以連接階段。點按某一階段即可在此編輯其設定。'],
+  // Same fallback, but the editor is still wide enough to keep its
+  // configuration PANE -- so the note points there instead of inline.
+  'pl.narrow_note_pane': ['Pane too narrow for the canvas — widen it to '
       + 'wire stages. Selecting one still edits its configuration.',
       '窗格过窄，无法显示画布 — 请加宽以连接流水线级。选中某一级仍可编辑其配置。',
       '窗格過窄，無法顯示畫布 — 請加寬以連接階段。選取某一階段仍可編輯其設定。'],
@@ -628,6 +634,11 @@ const STRINGS = {
       '垂直拆分（左 / 右）', '垂直分割（左 / 右）'],
   'io.split_h':        ['Split horizontally (top / bottom)',
       '水平拆分（上 / 下）', '水平分割（上 / 下）'],
+  // The Shift variants: same split, this panel keeps the OTHER half.
+  'io.split_v_alt':    ['Split vertically (this view right)',
+      '垂直拆分（本视图在右）', '垂直分割（本檢視在右）'],
+  'io.split_h_alt':    ['Split horizontally (this view bottom)',
+      '水平拆分（本视图在下）', '水平分割（本檢視在下）'],
   'io.close_pane':     ['Close pane', '关闭窗格', '關閉窗格'],
 
   // ---- Composer view ----
@@ -771,6 +782,10 @@ const STRINGS = {
   'status.gpu_mem':      ['GPU mem', '显存', '顯示記憶體'],
   'status.mem':          ['MEM', '内存', '記憶體'],
   'status.machine_title':['GPU / chip model', 'GPU / 芯片型号', 'GPU / 晶片型號'],
+  'status.progress':     ['WORK', '进度', '進度'],
+  'status.no_progress':  ['Nothing in progress', '暂无进行中的任务',
+      '目前沒有進行中的工作'],
+  'status.eta_left':     ['{t} left', '剩余 {t}', '剩餘 {t}'],
 
   // ---- Stage spec docs (overlay; see tOr) ----------------------------
   // These translate text authored in the C++ stage specs (config-key /
@@ -836,7 +851,7 @@ const STRINGS = {
                                           '擴散取樣器'],
   'stage.sampler-select.name': ['Sampler', '采样器', '取樣器'],
   'stage.scheduler-select.name': ['Scheduler', '噪声计划表', '雜訊排程器'],
-  'stage.text-to-image.name': ['Text to Image', '文生图', '文生圖'],
+  'stage.generate-image.name': ['Generate Image', '生成图片', '生成影像'],
   'stage.text-to-speech.name': ['Text to Speech', '语音合成', '文字轉語音'],
   'stage.vae-decode.name':     ['VAE Decode', 'VAE 解码', 'VAE 解碼'],
   'stage.vae-encode.name':     ['VAE Encode', 'VAE 编码', 'VAE 編碼'],

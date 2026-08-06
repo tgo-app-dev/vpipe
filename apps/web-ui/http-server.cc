@@ -11,13 +11,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <thread>
 #include <netinet/in.h>
 #include <sstream>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace std;
@@ -501,10 +499,9 @@ WebSocket::send_text(string_view s)
                      s.size());
 }
 
-HttpServer::HttpServer(string bind_address, int port, string doc_root)
+HttpServer::HttpServer(string bind_address, int port)
   : _bind_address(std::move(bind_address))
   , _port(port)
-  , _doc_root(std::move(doc_root))
 {
 }
 
@@ -954,26 +951,9 @@ HttpServer::serve_static_(const HttpRequest& req) const
   string rel = req.path;
   if (rel.empty() || rel == "/") { rel = "/index.html"; }
 
-  // Filesystem doc-root (when configured). Tried first so a dev running
-  // from the build tree can live-edit the web/ files.
-  auto read_file = [&](const string& full, HttpResponse& r) -> bool {
-    struct stat st{};
-    if (::stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-      return false;
-    }
-    ifstream f(full, ios::binary);
-    if (!f) { return false; }
-    ostringstream ss;
-    ss << f.rdbuf();
-    r.status       = 200;
-    r.body         = ss.str();
-    r.content_type = mime_for_(full);
-    return true;
-  };
-
-  // Assets embedded into the binary at build time. The fallback for a
-  // packaged build with no doc-root on disk; the content type comes from
-  // the request path (the bytes are not NUL-terminated).
+  // Assets embedded into the binary at build time -- the only source for
+  // the app's own front end. The content type comes from the request path
+  // (the bytes are not NUL-terminated).
   auto read_embedded = [&](const string& path, HttpResponse& r) -> bool {
     const EmbeddedAsset* a = find_embedded_asset(path);
     if (a == nullptr) { return false; }
@@ -1008,7 +988,6 @@ HttpServer::serve_static_(const HttpRequest& req) const
   };
 
   HttpResponse r;
-  if (!_doc_root.empty() && read_file(_doc_root + rel, r)) { return fresh(r); }
   if (read_embedded(rel, r)) { return fresh(r); }
   if (read_view_asset(rel, r)) { return fresh(r); }
   // SPA fallback: any unknown non-asset path returns index.html so the
@@ -1018,9 +997,6 @@ HttpServer::serve_static_(const HttpRequest& req) const
   // would try to parse as JavaScript and report as a syntax error a long
   // way from the actual cause.
   if (rel.rfind("/api/", 0) != 0 && rel.rfind("/ui/", 0) != 0) {
-    if (!_doc_root.empty() && read_file(_doc_root + "/index.html", r)) {
-      return r;
-    }
     if (read_embedded("/index.html", r)) { return r; }
   }
   return HttpResponse::error(404, "not found: " + req.path);

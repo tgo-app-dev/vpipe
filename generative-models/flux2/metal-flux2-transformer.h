@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
+#include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -85,7 +86,7 @@ class MetalFlux2Transformer {
     // NOTHING on disk distinguishes the two checkpoints -- identical
     // model_index.json, identical transformer/config.json, identical tensor
     // names -- so this cannot be auto-detected and must be set by the caller
-    // (text-to-image's `klein_kv` config key).
+    // (generate-image's `klein_kv` config key).
     // Isolating the references is also what makes their K/V independent of
     // the denoising step, which is what KvCache then exploits.
     bool  klein_kv = false;
@@ -155,6 +156,13 @@ class MetalFlux2Transformer {
   // honored within ~one block instead of a whole forward. No-op preloaded.
   void set_stream_stop(std::function<bool()> stop) {
     _stream_stop = std::move(stop);
+  }
+
+  // Per-block progress (see DitBlockProgressFn): fired as each transformer
+  // block is entered, so a caller can show movement INSIDE one denoise
+  // step -- which at high resolution is seconds of otherwise-silent work.
+  void set_block_progress(DitBlockProgressFn fn) {
+    _block_progress = std::move(fn);
   }
 
   // A reference-image conditioning input (FLUX.2 multi-reference / Kontext-
@@ -319,6 +327,7 @@ class MetalFlux2Transformer {
   // mmap this class kept to itself.
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;
+  DitBlockProgressFn    _block_progress;
 
   // Constant affine-free LayerNorm params (weight=1, bias=0), sized `hidden`.
   metal_compute::SharedBuffer _ln_w1, _ln_b0;

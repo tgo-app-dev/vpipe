@@ -39,7 +39,7 @@ constexpr int kDropPrefix = 34;
 const int kSelectLayers[12] = {2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35};
 
 // The Krea-2 text encoder config (dense Qwen3-VL, raw bf16) -- matches the
-// text-to-image stage's encoder_config_.
+// generate-image stage's encoder_config_.
 MetalQwenModel::Config
 encoder_config_()
 {
@@ -54,7 +54,7 @@ encoder_config_()
   return c;
 }
 
-// Special-token-aware encode (mirrors the text-to-image stage's helper).
+// Special-token-aware encode (mirrors the generate-image stage's helper).
 std::vector<std::int32_t>
 encode_with_specials_(const Tokenizer& tok, const std::string& text)
 {
@@ -97,26 +97,6 @@ write_calib_(const std::string& path,
               (std::streamsize)row.size() * 4);
   }
   return (bool)out;
-}
-
-// In-place throttled progress bar (mirrors model-quantizer's quant_progress_):
-// redraws on a carriage-return only when the integer percentage changes.
-void
-calib_progress_(UiTextStream* bar, const char* tag, int done, int total,
-                int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = (int)((long)done * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b((std::size_t)fill, '#');
-  b += std::string((std::size_t)(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done, total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
 }
 
 // Total physical RAM (bytes), or 0 if unknown.
@@ -318,9 +298,10 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
   };
 
   auto* sess = mc->session();
-  std::unique_ptr<UiTextStream> bar =
-      sess ? sess->open_text_stream() : std::unique_ptr<UiTextStream>();
-  int pct = -1;
+  // One report for the whole pass; "encode" and "denoise" ride as the
+  // detail text so both phases reuse the same row.
+  UiProgress bar;
+  if (sess) { bar = sess->open_progress("calibrate"); }
   if (sess) {
     sess->log_debug(fmt(
         "DiT calib: {} prompts x {} steps @ {}x{} (img_seq {}, streamed DiT), "
@@ -338,7 +319,7 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
     if (stop()) { return fail("calib: stopped by request"); }
     int n_real = 0;
     SharedBuffer fused = encode(prompts[pi], n_real);
-    calib_progress_(bar.get(), "encode", (int)pi + 1, (int)prompts.size(), pct);
+    bar.update((std::uint64_t)pi + 1, prompts.size(), "encode");
     if (fused.empty()) {
       if (sess) { sess->log_debug(fmt("DiT calib: prompt {} encode failed, "
                                       "skipped", pi)); }
@@ -369,11 +350,10 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
   SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
   std::vector<float> packed((std::size_t)img_seq * IC);
   int used = 0;
-  pct = -1;
   const int total_fwd = (int)fused_cache.size() * steps;
   for (std::size_t e = 0; e < fused_cache.size(); ++e) {
     if (stop()) {
-      if (bar) { bar->end(); }
+      bar.finish();
       dit->calib_end();
       return fail("calib: stopped by request");
     }
@@ -390,7 +370,7 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
       // Per-step stop (covers the PRELOAD path, where forward_dit runs to
       // completion without the per-block stream-stop bail).
       if (stop()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         dit->calib_end();
         return fail("calib: stopped by request");
       }
@@ -399,7 +379,7 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
       SharedBuffer vel = dit->forward_dit(fused_cache[e], n_real, latbuf, img_seq,
                                           gh, gw, (float)sig[(std::size_t)i], -1);
       if (vel.empty()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         dit->calib_end();
         // forward_dit returns empty when it bailed on the stop hook mid-block.
         return fail(stop() ? "calib: stopped by request"
@@ -410,8 +390,8 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
       for (std::size_t k = 0; k < packed.size(); ++k) {
         packed[k] += (float)(dt * (double)(float)vp[k]);
       }
-      calib_progress_(bar.get(), "denoise", (int)e * steps + i + 1, total_fwd,
-                      pct);
+      bar.update((std::uint64_t)e * steps + i + 1,
+                 (std::uint64_t)total_fwd, "denoise");
       if (sess) {
         sess->log_debug(fmt("DiT calib:   step {}/{} sigma {}", i + 1, steps,
                             (float)sig[(std::size_t)i]));
@@ -419,7 +399,7 @@ collect_dit_calibration(MetalCompute* mc, const std::string& model_root,
     }
     ++used;
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   (void)lh; (void)lw;
 
   const auto cqkv = dit->calib_qkv();

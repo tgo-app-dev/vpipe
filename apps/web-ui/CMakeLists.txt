@@ -26,12 +26,11 @@ if(APPLE)
     list(APPEND VPIPE_WEBUI_SOURCES startup-checks-mac.mm)
 endif()
 
-# Embed the web/ asset tree into the binary so a packaged build serves
-# the UI from memory (no doc-root on disk required). The filesystem
-# doc-root still wins when present, so a dev can live-edit web/ files
-# (see the precedence in main.cc). CONFIGURE_DEPENDS re-globs at build
-# time, so adding/removing an asset file is picked up automatically; an
-# edit to an existing file triggers regeneration via the DEPENDS list.
+# Embed the web/ asset tree into the binary: it is the ONLY source the
+# server reads the UI from, so a packaged build is self-contained.
+# CONFIGURE_DEPENDS re-globs at build time, so adding/removing an asset
+# file is picked up automatically; an edit to an existing file triggers
+# regeneration via the DEPENDS list.
 file(GLOB_RECURSE VPIPE_WEBUI_ASSET_FILES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/web/*")
 set(VPIPE_WEBUI_ASSETS_CC
@@ -103,13 +102,7 @@ else()
     message(STATUS "vpipe-web-ui: OpenSSL not found; --tls unavailable")
 endif()
 
+# The UI assets are embedded in the binary (above), so this is the whole
+# install: the executable is self-contained and the raw asset tree is
+# never shipped -- nothing reads it at runtime.
 install(TARGETS vpipe-web-ui RUNTIME DESTINATION bin)
-# The UI assets are embedded in the binary (above), so the installed
-# executable is self-contained -- the raw asset tree is NOT installed by
-# default. Turn this on to also ship the tree (e.g. as an override source
-# for $VPIPE_WEBUI_DOCROOT to patch the UI without a rebuild).
-option(VPIPE_WEBUI_INSTALL_ASSETS
-       "Also install the web-ui asset tree to share/vpipe/web-ui" OFF)
-if(VPIPE_WEBUI_INSTALL_ASSETS)
-    install(DIRECTORY web/ DESTINATION share/vpipe/web-ui)
-endif()

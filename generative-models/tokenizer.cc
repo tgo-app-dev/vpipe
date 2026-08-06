@@ -497,6 +497,28 @@ private:
   bool                                                      _metaspace = false;
   string                                                    _ms_marker;
 
+  // ---- SentencePiece Unigram (T5 / umT5, i.e. every T5-conditioned
+  // diffusion model) ------------------------------------------------
+  // A different MODEL from BPE, not a different pre-tokenizer: where BPE
+  // merges greedily by rank, Unigram scores every token with a log
+  // probability and picks the segmentation that MAXIMIZES the total --
+  // a Viterbi over the sentence, not a merge loop. The two disagree on
+  // real text, so this cannot be approximated with the BPE path.
+  bool                                                      _unigram = false;
+  vector<float>                                             _uni_score;   // by id
+  int32_t                                                   _unk_id = -1;
+  float                                                     _unk_score = 0.0f;
+  size_t                                                    _uni_max_piece = 0;
+  // Metaspace PRE-TOKENIZER settings (the BPE families take metaspace
+  // from the normalizer instead; see _metaspace above).
+  bool                                                      _ms_prepend = false;
+  bool                                                      _ms_split   = false;
+  // Normalizer Replace rules, applied in document order before
+  // anything else. Collected only for Unigram: the BPE families' one
+  // interesting Replace (" " -> marker) is already folded into
+  // normalize_ms_, and re-applying it here would double-substitute.
+  vector<pair<regex, string>>                               _norm_replaces;
+
   // Family-specific reasoning begin/end token ids, detected once at
   // load (Qwen3 `<think>`/`</think>`, else Gemma-4
   // `<|channel>`/`<channel|>`; -1 when the vocab has neither). decode
@@ -510,6 +532,10 @@ private:
   void detect_thinking_markers_();
 
   void bpe_(vector<string>* pieces) const;
+  // Unigram: the maximum-score segmentation of one pre-token, by
+  // Viterbi over codepoint boundaries. Appends ids to `out`.
+  void viterbi_(string_view seg, vector<int32_t>* out) const;
+  vector<int32_t> encode_unigram_(string_view text) const;
   string normalize_ms_(string_view text) const;
   string metaspace_decode_(const string& s) const;
 
@@ -610,14 +636,15 @@ Tokenizer::Impl::parse(const FlexData&            root,
   if (model.contains("type")) {
     model_type = string(model.at("type").as_string(""));
   }
-  if (model_type != "BPE") {
+  if (model_type != "BPE" && model_type != "Unigram") {
     if (session) {
       session->warn(fmt(
-          "Tokenizer({}): unsupported model.type='{}' (v1 supports "
-          "BPE only)", tag_str, model_type));
+          "Tokenizer({}): unsupported model.type='{}' (BPE and Unigram "
+          "are supported)", tag_str, model_type));
     }
     return false;
   }
+  _unigram = (model_type == "Unigram");
 
   if (!model.contains("vocab")) {
     if (session) {
@@ -627,22 +654,69 @@ Tokenizer::Impl::parse(const FlexData&            root,
     return false;
   }
   auto vocab_fd = model.at("vocab");
-  if (!vocab_fd.is_object()) {
+  // Unigram's vocab is an ARRAY of [piece, log_prob] and the id is the
+  // POSITION -- not the {piece: id} object BPE uses. The scores are the
+  // whole point of the model, so they are read here rather than
+  // reconstructed.
+  if (_unigram) {
+    if (!vocab_fd.is_array()) {
+      if (session) {
+        session->warn(fmt(
+            "Tokenizer({}): Unigram model.vocab is not an array", tag_str));
+      }
+      return false;
+    }
+    auto arr = vocab_fd.as_array();
+    _uni_score.resize(arr.size(), 0.0f);
+    float min_score = 0.0f;
+    bool have_min = false;
+    for (size_t i = 0; i < arr.size(); ++i) {
+      auto e = arr.at(i);
+      if (!e.is_array()) { continue; }
+      auto pair_v = e.as_array();
+      if (pair_v.size() < 2) { continue; }
+      string piece(pair_v.at(0).as_string(""));
+      const float score = (float)pair_v.at(1).as_real(0.0);
+      const int32_t id = (int32_t)i;
+      _uni_score[i] = score;
+      if (!have_min || score < min_score) { min_score = score; have_min = true; }
+      if (piece.size() > _uni_max_piece) { _uni_max_piece = piece.size(); }
+      _vocab.emplace(piece, id);
+      _inv_vocab.emplace(id, std::move(piece));
+      if (id + 1 > _vocab_size) { _vocab_size = id + 1; }
+    }
+    if (model.contains("unk_id")) {
+      _unk_id = (int32_t)model.at("unk_id").as_int(-1);
+    }
+    // The penalty an unknown CHARACTER pays, which is what makes the
+    // Viterbi prefer any real segmentation over falling back. 10.0 below
+    // the worst token in the vocab is the reference's constant
+    // (tokenizers' K_UNK_PENALTY); a different value would silently
+    // change segmentations near the tail of the vocab.
+    _unk_score = min_score - 10.0f;
+    if (session) {
+      session->info(fmt(
+          "Tokenizer({}): SentencePiece Unigram, {} pieces (unk id {})",
+          tag_str, _uni_score.size(), _unk_id));
+    }
+  } else if (!vocab_fd.is_object()) {
     if (session) {
       session->warn(fmt(
           "Tokenizer({}): model.vocab is not an object", tag_str));
     }
     return false;
   }
-  auto vocab = vocab_fd.as_object();
-  for (auto it = vocab.begin(); it != vocab.end(); ++it) {
-    auto entry = *it;
-    int32_t id = static_cast<int32_t>(entry.second.as_int(-1));
-    if (id < 0) { continue; }
-    string key(entry.first);
-    _vocab.emplace(key, id);
-    _inv_vocab.emplace(id, std::move(key));
-    if (id + 1 > _vocab_size) { _vocab_size = id + 1; }
+  if (!_unigram) {
+    auto vocab = vocab_fd.as_object();
+    for (auto it = vocab.begin(); it != vocab.end(); ++it) {
+      auto entry = *it;
+      int32_t id = static_cast<int32_t>(entry.second.as_int(-1));
+      if (id < 0) { continue; }
+      string key(entry.first);
+      _vocab.emplace(key, id);
+      _inv_vocab.emplace(id, std::move(key));
+      if (id + 1 > _vocab_size) { _vocab_size = id + 1; }
+    }
   }
 
   if (model.contains("merges")) {
@@ -725,10 +799,19 @@ Tokenizer::Impl::parse(const FlexData&            root,
       auto no = nrm.as_object();
       const string ty = no.contains("type")
           ? string(no.at("type").as_string("")) : "";
-      if (ty == "Sequence" && no.contains("normalizers")
-          && no.at("normalizers").is_array()) {
-        for (FlexData s : no.at("normalizers").as_array()) {
-          if (s.is_object()) { try_replace(s.as_object()); }
+      if (ty == "Sequence" && no.contains("normalizers")) {
+        // The array has to be bound to a NAMED local: at() returns a
+        // FlexData by value and as_array() is a view into it, so
+        // iterating `no.at(...).as_array()` directly walks a view whose
+        // owner has already been destroyed. (Latent until a checkpoint
+        // arrived whose normalizer is actually a Sequence.)
+        FlexData seq = no.at("normalizers");
+        if (seq.is_array()) {
+          auto arr = seq.as_array();
+          for (size_t i = 0; i < arr.size(); ++i) {
+            FlexData s = arr.at(i);
+            if (s.is_object()) { try_replace(s.as_object()); }
+          }
         }
       } else {
         try_replace(no);
@@ -739,6 +822,116 @@ Tokenizer::Impl::parse(const FlexData&            root,
                         "(marker U+2581); byte-level encoding disabled",
                         tag_str));
     }
+    // Unigram: collect the Replace rules to APPLY, rather than only
+    // sniffing them for the metaspace marker. T5's normalizer is a
+    // Replace of the regex " {2,}" with " " -- collapsing runs of
+    // spaces, which changes the token sequence of any prompt that has
+    // one. Only for Unigram: the BPE families' " " -> marker rule is
+    // already folded into normalize_ms_ and applying it twice here
+    // would substitute the marker into itself.
+    if (_unigram) {
+      auto collect_replace = [&](const FlexData::ConstObjectView& no) {
+        if (!no.contains("type")
+            || string(no.at("type").as_string("")) != "Replace") {
+          return;
+        }
+        string pat, content, kind;
+        if (no.contains("pattern")) {
+          auto p = no.at("pattern");
+          if (p.is_object()) {
+            auto po = p.as_object();
+            if (po.contains("Regex")) {
+              pat = string(po.at("Regex").as_string(""));
+              kind = "Regex";
+            } else if (po.contains("String")) {
+              pat = string(po.at("String").as_string(""));
+              kind = "String";
+            }
+          }
+        }
+        if (no.contains("content")) {
+          content = string(no.at("content").as_string(""));
+        }
+        if (pat.empty()) { return; }
+        if (kind == "String") {
+          // A literal, so escape it into a regex rather than adding a
+          // second substitution mechanism.
+          string esc;
+          for (char c : pat) {
+            if (std::strchr("\\^$.|?*+()[]{}", c) != nullptr) { esc += '\\'; }
+            esc += c;
+          }
+          pat = esc;
+        }
+        try {
+          _norm_replaces.emplace_back(regex(pat), content);
+        } catch (const std::regex_error&) {
+          if (session) {
+            session->warn(fmt(
+                "Tokenizer({}): normalizer pattern '{}' did not compile; "
+                "skipping it", tag_str, pat));
+          }
+        }
+      };
+      auto nrm2 = rootobj.at("normalizer");
+      if (nrm2.is_object()) {
+        auto no = nrm2.as_object();
+        const string ty = no.contains("type")
+            ? string(no.at("type").as_string("")) : "";
+        if (ty == "Sequence" && no.contains("normalizers")) {
+          // at() returns a FlexData BY VALUE and as_array() is a VIEW into
+          // it, so the array has to be bound to a named local first --
+          // iterating `no.at(...).as_array()` directly walks a view whose
+          // owner was already destroyed.
+          FlexData seq = no.at("normalizers");
+          if (seq.is_array()) {
+            auto arr = seq.as_array();
+            for (size_t i = 0; i < arr.size(); ++i) {
+              FlexData s = arr.at(i);
+              if (s.is_object()) { collect_replace(s.as_object()); }
+            }
+          }
+        } else {
+          collect_replace(no);
+        }
+      }
+    }
+  }
+
+  // ---- Metaspace PRE-tokenizer (SentencePiece / T5) -----------------
+  // Distinct from the metaspace NORMALIZER the BPE families use: here
+  // the space -> marker substitution, the leading-marker prepend and
+  // the split into per-word segments all come from the pre_tokenizer,
+  // and the split matters -- it bounds what a single Unigram token may
+  // span, so a piece can never straddle two words.
+  if (_unigram && rootobj.contains("pre_tokenizer")) {
+    auto pre = rootobj.at("pre_tokenizer");
+    if (pre.is_object()) {
+      auto po = pre.as_object();
+      if (po.contains("type")
+          && string(po.at("type").as_string("")) == "Metaspace") {
+        _metaspace = true;
+        _ms_marker = po.contains("replacement")
+            ? string(po.at("replacement").as_string("\xe2\x96\x81"))
+            : string("\xe2\x96\x81");
+        const string scheme = po.contains("prepend_scheme")
+            ? string(po.at("prepend_scheme").as_string("always"))
+            : string("always");
+        _ms_prepend = (scheme != "never");
+        _ms_split = po.contains("split") ? po.at("split").as_bool(true) : true;
+      }
+    }
+  }
+  if (_unigram && !_metaspace) {
+    // Every Unigram checkpoint this supports is SentencePiece-shaped.
+    // One without the metaspace pre-tokenizer would need a different
+    // pre-tokenization entirely, so refuse rather than encode it wrong.
+    if (session) {
+      session->warn(fmt(
+          "Tokenizer({}): Unigram without a Metaspace pre-tokenizer is not "
+          "supported", tag_str));
+    }
+    return false;
   }
 
   // ---- pre_tokenizer regex (optional) ------------------------------
@@ -883,6 +1076,123 @@ Tokenizer::Impl::bpe_(vector<string>* pieces) const
   }
 }
 
+// The maximum-score segmentation of one pre-token.
+//
+// This is what makes Unigram a different model rather than a different
+// pre-tokenizer: BPE commits to each merge in rank order and never
+// reconsiders, while this considers EVERY segmentation and takes the one
+// whose token log-probabilities sum highest. A greedy longest-match would
+// agree on most words and differ on exactly the ones that matter.
+//
+// Boundaries are codepoint boundaries, not byte offsets: a vocab piece is
+// a sequence of characters, and stepping by bytes would let the unknown
+// fallback split a multi-byte character in half.
+void
+Tokenizer::Impl::viterbi_(string_view seg, vector<int32_t>* out) const
+{
+  if (seg.empty()) { return; }
+  // Codepoint boundary offsets, plus the end.
+  vector<size_t> bnd;
+  bnd.reserve(seg.size() + 1);
+  for (size_t i = 0; i < seg.size();) {
+    bnd.push_back(i);
+    const unsigned char c = (unsigned char)seg[i];
+    size_t n = 1;
+    if ((c & 0xF8) == 0xF0)      { n = 4; }
+    else if ((c & 0xF0) == 0xE0) { n = 3; }
+    else if ((c & 0xE0) == 0xC0) { n = 2; }
+    i += n;
+    if (i > seg.size()) { i = seg.size(); }
+  }
+  bnd.push_back(seg.size());
+  const size_t N = bnd.size() - 1;         // characters
+
+  constexpr float kNeg = -1e30f;
+  vector<float>   best(N + 1, kNeg);
+  vector<int32_t> from(N + 1, -1);
+  vector<int32_t> tok(N + 1, -1);
+  best[0] = 0.0f;
+
+  for (size_t i = 0; i < N; ++i) {
+    if (best[i] == kNeg) { continue; }
+    bool single_char_hit = false;
+    for (size_t j = i + 1; j <= N; ++j) {
+      const size_t len = bnd[j] - bnd[i];
+      if (len > _uni_max_piece) { break; }
+      auto it = _vocab.find(string(seg.substr(bnd[i], len)));
+      if (it == _vocab.end()) { continue; }
+      if (j == i + 1) { single_char_hit = true; }
+      const float s = best[i] + _uni_score[(size_t)it->second];
+      if (s > best[j]) { best[j] = s; from[j] = (int32_t)i; tok[j] = it->second; }
+    }
+    // Unknown-character fallback, added only when the vocab has no
+    // single-character token here -- the reference's rule. Adding it
+    // unconditionally would let a heavily-penalised unk beat a real
+    // token whose score happens to be lower still.
+    if (!single_char_hit && _unk_id >= 0) {
+      const float s = best[i] + _unk_score;
+      if (s > best[i + 1]) {
+        best[i + 1] = s; from[i + 1] = (int32_t)i; tok[i + 1] = _unk_id;
+      }
+    }
+  }
+  if (best[N] == kNeg) { return; }         // nothing reached the end
+  vector<int32_t> rev;
+  for (size_t j = N; j > 0;) {
+    if (from[j] < 0) { return; }           // broken chain: emit nothing
+    rev.push_back(tok[j]);
+    j = (size_t)from[j];
+  }
+  out->insert(out->end(), rev.rbegin(), rev.rend());
+}
+
+vector<int32_t>
+Tokenizer::Impl::encode_unigram_(string_view text) const
+{
+  // 1. normalizer (T5: collapse runs of spaces).
+  string s(text);
+  for (const auto& r : _norm_replaces) {
+    s = std::regex_replace(s, r.first, r.second);
+  }
+  // 2. metaspace: space -> marker, THEN prepend one -- but only when the
+  //    result does not already start with a marker. The order and the
+  //    condition are both load-bearing. The prepend is what makes the
+  //    first word carry the same word-initial marker every later word
+  //    does ("▁the" is a different token from "the"); the condition is
+  //    what stops a leading space from producing two markers, which
+  //    would encode as a spurious extra token before the prompt.
+  string m;
+  m.reserve(s.size() + _ms_marker.size());
+  for (char c : s) {
+    if (c == ' ') { m += _ms_marker; }
+    else          { m += c; }
+  }
+  if (_ms_prepend && m.compare(0, _ms_marker.size(), _ms_marker) != 0) {
+    m.insert(0, _ms_marker);
+  }
+  // 3. split at each marker so a token cannot span two words, then
+  //    Viterbi each segment.
+  vector<int32_t> out;
+  if (!_ms_split) {
+    viterbi_(m, &out);
+    return out;
+  }
+  // Each segment runs from one marker up to (not including) the next, so
+  // the marker stays attached to the word that FOLLOWS it -- which is
+  // what makes "▁the" a different token from "the". Searching from
+  // pos + 1 steps past the current marker's first byte without being
+  // able to re-find it: the marker is a valid UTF-8 sequence, so it
+  // cannot match at a non-boundary.
+  size_t pos = 0;
+  while (pos < m.size()) {
+    const size_t next = m.find(_ms_marker, pos + 1);
+    const size_t end = (next == string::npos) ? m.size() : next;
+    viterbi_(string_view(m).substr(pos, end - pos), &out);
+    pos = end;
+  }
+  return out;
+}
+
 void
 Tokenizer::Impl::encode_chunk_(string_view chunk, vector<int32_t>* out) const
 {
@@ -1017,6 +1327,7 @@ Tokenizer::Impl::encode(string_view text) const
 {
   vector<int32_t> out;
   if (text.empty()) { return out; }
+  if (_unigram) { return encode_unigram_(text); }
   // Metaspace: normalize spaces to the marker BEFORE pre-tokenization
   // (Gemma's `Split " "` pre-tokenizer then finds nothing to split, so
   // the normalized text BPEs as one chunk -- matching SentencePiece).
@@ -1203,6 +1514,30 @@ int32_t
 Tokenizer::special_token_id(string_view name) const
 {
   return _impl->special_token_id(name);
+}
+
+string
+Tokenizer::whitespace_clean(string_view text)
+{
+  // Any ASCII whitespace, not just ' ': a tab or newline that survived
+  // to the metaspace substitution would become an unknown token rather
+  // than a word break.
+  auto is_ws = [](unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+           || c == '\v';
+  };
+  string out;
+  out.reserve(text.size());
+  bool pending = false;
+  for (char ch : text) {
+    if (is_ws((unsigned char)ch)) {
+      pending = !out.empty();       // never emit a LEADING space
+      continue;
+    }
+    if (pending) { out += ' '; pending = false; }
+    out += ch;
+  }
+  return out;                       // `pending` at the end == trailing, dropped
 }
 
 int32_t

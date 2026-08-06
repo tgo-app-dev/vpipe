@@ -2,7 +2,7 @@
 # directory and writes a generated `.cc` TU embedding every file as a
 # byte array, plus a path -> bytes lookup
 # (vpipe::webui::find_embedded_asset). This lets a packaged
-# vpipe-web-ui serve its UI from memory with no doc-root on disk.
+# vpipe-web-ui serve its UI from memory, with no asset tree on disk.
 #
 # Each file maps to a URL path relative to WEB_DIR, e.g.
 #   <WEB_DIR>/index.html   -> "/index.html"

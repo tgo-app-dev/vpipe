@@ -1596,6 +1596,7 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   // ===== double-stream blocks ==============================================
   for (int L = 0; L < c.n_double; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
+    if (_block_progress) { _block_progress(L, c.n_double + c.n_single); }
     const bool streaming = _stream_blocks && L >= _pinned_d;
     DoubleBlock streamed;
     if (streaming) {
@@ -1759,6 +1760,10 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   // ===== single-stream blocks ==============================================
   for (int L = 0; L < c.n_single; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
+    // Continues the double stack's numbering: one sequence per forward.
+    if (_block_progress) {
+      _block_progress(c.n_double + L, c.n_double + c.n_single);
+    }
     const bool streaming = _stream_blocks && L >= _pinned_s;
     Block streamed;
     if (streaming) {

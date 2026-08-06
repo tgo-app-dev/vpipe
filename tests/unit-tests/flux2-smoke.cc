@@ -6,7 +6,7 @@
 //   * flux2_golden.* -- numerical rel-L2 vs the diffusers golden
 //     (dump_flux2_golden.py): DiT velocity, embedded-guidance velocity (when the
 //     model has a guidance_embedder), and VAE decode.
-//   * flux2_e2e.*    -- the full text-to-image -> vae-decode pipeline produces a
+//   * flux2_e2e.*    -- the full generate-image -> vae-decode pipeline produces a
 //     coherent image (opt-in, heavy: loads the encoder + DiT together).
 //
 // Env: VPIPE_FLUX2_TEST_MODEL_PATH = the FLUX.2-klein model root (4B or 9B).
@@ -34,7 +34,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
 #include <algorithm>
@@ -179,7 +179,7 @@ public:
   }
 };
 
-// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// Chain a diffusion-conditioner between `src` (prompt) and the generate-image
 // (DiT) stage -- the encoder half moved there. Returns the conditioner; wire
 // the t2i's iport0 to {cond, 0}.
 Stage*
@@ -269,11 +269,21 @@ TEST(flux2_smoke, vae_decode_small_cout_conv_matches_im2col)
   if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
 
   const int gh = 24, gw = 32;                   // -> 384x512, non-square
+  // The reference arm must reach the ACTUAL im2col path, so it has to switch
+  // off the direct 3x3 conv too -- that also intercepts tiled_conv3x3_, and
+  // without this the "im2col" side silently became a second direct-conv run
+  // (the two agreed trivially, and the test verified nothing).
   auto run = [&](bool no_small, double* ms) {
-    if (no_small) { ::setenv("VPIPE_VAE_NO_SMALL_COUT_CONV", "1", 1); }
-    else          { ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV"); }
+    if (no_small) {
+      ::setenv("VPIPE_VAE_NO_SMALL_COUT_CONV", "1", 1);
+      ::setenv("VPIPE_VAE_NO_DIRECT_CONV", "1", 1);
+    } else {
+      ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV");
+      ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV");
+    }
     auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
     ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV");
+    ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV");
     std::vector<float> out;
     if (vae == nullptr) { return out; }
     const int C = vae->config().dit_channels();
@@ -308,6 +318,235 @@ TEST(flux2_smoke, vae_decode_small_cout_conv_matches_im2col)
               "(%dx%d; direct %.0f ms, im2col %.0f ms)\n",
               r, gh * 16, gw * 16, ms_small, ms_i2c);
   EXPECT_TRUE(r < 2e-3);
+}
+
+// The direct (im2col-free) 3x3 conv must agree with the im2col + GEMM pair it
+// replaces. Both run the same simdgroup MMA in f32; they differ only in where
+// the activation tile comes from (gathered on-chip vs read back from the
+// [H*W, 9*cin] scratch), so this is a tight rel-L2 bound.
+TEST(flux2_smoke, vae_decode_direct_conv_matches_im2col)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+
+  int gh = 24, gw = 32;                         // -> 384x512, non-square
+  // VPIPE_VAE_DEC_HW re-points this A/B at a bigger grid. That matters for more
+  // than timing: the im2col path's flat element index H*W*9*cin crosses 2^32 at
+  // ~2Kx2K (2048*2048*9*256 = 9.7e9), which is the regime its 64-bit index math
+  // exists for. Running the comparison THERE is what proves the 32-bit index
+  // decomposition (the addresses stay 64-bit) did not silently truncate.
+  if (const char* e = std::getenv("VPIPE_VAE_DEC_HW")) {
+    const int hpx = std::atoi(e);
+    const char* x = std::strchr(e, 'x');
+    const int wpx = (x != nullptr) ? std::atoi(x + 1) : hpx;
+    if (hpx >= 64 && wpx >= 64) { gh = hpx / 16; gw = wpx / 16; }
+  }
+  // Both arms hold the small-cout conv OFF so the ONLY difference under test is
+  // direct-gather vs materialized im2col on the big 3x3 convs.
+  auto run = [&](bool no_direct, double* ms) {
+    ::setenv("VPIPE_VAE_NO_SMALL_COUT_CONV", "1", 1);
+    if (no_direct) {
+      ::setenv("VPIPE_VAE_NO_DIRECT_CONV", "1", 1);
+      ::unsetenv("VPIPE_VAE_DIRECT_CONV_MMA2");
+    } else {
+      ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV");
+      // direct_conv3x3_ declines on a MATRIX-CORE GPU unless this is set, so
+      // without it both arms are im2col and the test compares a path against
+      // itself -- rel-L2 exactly 0, "direct" measuring SLOWER than the thing
+      // it replaces, and nothing verified. Same trap the small-cout A/B hit.
+      ::setenv("VPIPE_VAE_DIRECT_CONV_MMA2", "1", 1);
+    }
+    auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+    ::unsetenv("VPIPE_VAE_NO_SMALL_COUT_CONV");
+    ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV");
+    // NOT VPIPE_VAE_DIRECT_CONV_MMA2 -- unlike the two above (read once at
+    // load), that gate is consulted per CALL inside direct_conv3x3_, so
+    // clearing it here would close the path again before decode() runs.
+    std::vector<float> out;
+    if (vae == nullptr) { return out; }
+    const int C = vae->config().dit_channels();
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+    if (z.empty()) { return out; }
+    std::mt19937 rng(1357);                     // same latent both runs
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+      d[i] = (_Float16)nd(rng);
+    }
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    *ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  double ms_direct = 0.0, ms_i2c = 0.0;
+  const std::vector<float> v_direct = run(/*no_direct=*/false, &ms_direct);
+  ::unsetenv("VPIPE_VAE_DIRECT_CONV_MMA2");
+  const std::vector<float> v_i2c    = run(/*no_direct=*/true,  &ms_i2c);
+  ASSERT_TRUE(!v_direct.empty());
+  ASSERT_TRUE(v_direct.size() == v_i2c.size());
+  const double r = rel_l2_(v_direct.data(), v_i2c.data(), v_direct.size());
+  std::printf("[flux2_smoke] VAE direct conv vs im2col rel-L2 = %g "
+              "(%dx%d; direct %.0f ms, im2col %.0f ms)\n",
+              r, gh * 16, gw * 16, ms_direct, ms_i2c);
+  EXPECT_TRUE(r < 2e-3);
+}
+
+// Tiled decode is the MEMORY fallback (see decode_tiled_), so what matters is
+// not bit-equality -- it cannot be equal, the mid-block attention is global and
+// a window only sees itself -- but that the cross-fade leaves no visible seam
+// and the image stays close to the whole-image decode. Report PSNR, and also
+// check the seam explicitly: the worst per-column error must not spike at a
+// window boundary relative to the image's own error level.
+TEST(flux2_smoke, vae_decode_tiled_matches_whole)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+
+  const int gh = 48, gw = 48;                    // 768x768, 2x2 windows of 32
+  auto run = [&](int tile, std::vector<float>* out) {
+    if (tile > 0) { ::setenv("VPIPE_VAE_TILE", std::to_string(tile).c_str(), 1); }
+    else          { ::unsetenv("VPIPE_VAE_TILE"); }
+    // NOTE: VPIPE_VAE_TILE is read inside decode(), NOT at load -- it must stay
+    // set across the decode call. Clearing it right after load left both arms
+    // on the whole-image path, and the test reported a perfect match for
+    // comparing a run against itself.
+    auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+    struct Clear { ~Clear() { ::unsetenv("VPIPE_VAE_TILE"); } } clear_on_exit;
+    if (vae == nullptr) { return; }
+    const int C = vae->config().dit_channels();
+    SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+    if (z.empty()) { return; }
+    std::mt19937 rng(97531);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* d = static_cast<_Float16*>(z.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+      d[i] = (_Float16)nd(rng);
+    }
+    std::string err;
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+    if (rgb.empty() || rgb.byte_size() < n * 2) { return; }
+    out->resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)p[i]; }
+  };
+
+  std::vector<float> whole, tiled;
+  run(0, &whole);
+  run(32, &tiled);
+  ASSERT_TRUE(!whole.empty());
+  ASSERT_TRUE(whole.size() == tiled.size());
+
+  const int H = gh * 16, W = gw * 16;
+  double se = 0.0, pk = 0.0;
+  for (std::size_t i = 0; i < whole.size(); ++i) {
+    const double d = whole[i] - tiled[i];
+    se += d * d;
+    pk = std::max(pk, (double)std::fabs(whole[i]));
+  }
+  const double mse = se / (double)whole.size();
+  const double psnr = (mse > 0.0 && pk > 0.0)
+      ? 10.0 * std::log10(pk * pk / mse) : 99.0;
+  // Per-column mean abs error, to locate any seam. Window 32 with overlap 8
+  // steps by 24 latent cells -> the seam bands are around x = 24*16 = 384.
+  std::vector<double> col((std::size_t)W, 0.0);
+  for (int c = 0; c < 3; ++c) {
+    for (int y = 0; y < H; ++y) {
+      const std::size_t row = ((std::size_t)c * H + y) * W;
+      for (int x = 0; x < W; ++x) {
+        col[x] += std::fabs(whole[row + x] - tiled[row + x]);
+      }
+    }
+  }
+  double cmax = 0.0, csum = 0.0;
+  int cmax_x = 0;
+  for (int x = 0; x < W; ++x) {
+    col[x] /= (double)(3 * H);
+    csum += col[x];
+    if (col[x] > cmax) { cmax = col[x]; cmax_x = x; }
+  }
+  const double cmean = csum / (double)W;
+  std::printf("[flux2_smoke] VAE tiled vs whole: PSNR %.1f dB, col-err mean "
+              "%.4g worst %.4g at x=%d (ratio %.2f)\n",
+              psnr, cmean, cmax, cmax_x, cmean > 0 ? cmax / cmean : 0.0);
+  // The seam must not stand out: worst column within 4x the mean column error.
+  EXPECT_TRUE(cmean <= 0.0 || cmax / cmean < 4.0);
+  EXPECT_TRUE(psnr > 20.0);
+}
+
+// The AUTO-SWITCH itself: a decode whose peak exceeds the budget must fall back
+// to tiling and still produce an image, where it previously returned an error.
+// VPIPE_VAE_BUDGET_MB stands in for the constrained box (a 64 GB machine can
+// never take this branch on its own), and VPIPE_VAE_NO_TILE must restore the
+// old hard failure -- otherwise this test would pass on a box where the decode
+// simply fit and nothing was exercised.
+TEST(flux2_smoke, vae_decode_auto_tiles_when_short)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+  ASSERT_TRUE(vae != nullptr);
+
+  const int gh = 48, gw = 48;                    // 768x768
+  const int C = vae->config().dit_channels();
+  SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+  ASSERT_TRUE(!z.empty());
+  std::mt19937 rng(24680);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* d = static_cast<_Float16*>(z.contents());
+  for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+    d[i] = (_Float16)nd(rng);
+  }
+  const std::size_t need = vae->decode_peak_bytes(gh, gw);
+  // Budget that the whole-image decode cannot meet but a window can.
+  const int budget_mb = (int)std::max<std::size_t>(1, (need >> 20) / 3);
+  ::setenv("VPIPE_VAE_BUDGET_MB", std::to_string(budget_mb).c_str(), 1);
+
+  std::string err;
+  SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+  const bool tiled_ok = !rgb.empty();
+
+  // Same budget, tiling disabled -> must fail cleanly rather than silently fit.
+  ::setenv("VPIPE_VAE_NO_TILE", "1", 1);
+  std::string err2;
+  SharedBuffer rgb2 = vae->decode(z, gh, gw, &err2);
+  const bool refused = rgb2.empty();
+  ::unsetenv("VPIPE_VAE_NO_TILE");
+  ::unsetenv("VPIPE_VAE_BUDGET_MB");
+
+  std::printf("[flux2_smoke] VAE auto-tile: need %zu MB, budget %d MB -> "
+              "tiled %s, no-tile refused %s (%s)\n",
+              need >> 20, budget_mb, tiled_ok ? "ok" : "FAILED",
+              refused ? "yes" : "no", err2.c_str());
+  EXPECT_TRUE(refused);      // proves the budget really was binding
+  EXPECT_TRUE(tiled_ok);     // and that tiling rescued it
 }
 
 // The two-pass group norm must be a pure speedup: same normalization, only
@@ -525,8 +764,13 @@ TEST(flux2_smoke, vae_decode_1024_im2col_tiled_matches_hwconv)
   const int gh = 64, gw = 64;                   // -> 1024x1024
 
   auto run = [&](bool no_hwconv) -> std::vector<float> {
-    if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
-    else           { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
+    if (no_hwconv) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1);
+      // ...and pin the fallback to im2col. Without this the conv autotune
+      // sends some shapes to the on-chip gather, so the arm is a MIX and the
+      // exact-0 that pins the im2col kernel itself is lost (it read 2.98e-4).
+      ::setenv("VPIPE_VAE_NO_DIRECT_CONV", "1", 1); }
+    else           { ::unsetenv("VPIPE_VAE_NO_HWCONV");
+      ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV"); }
     auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
     ::unsetenv("VPIPE_VAE_NO_HWCONV");
     std::vector<float> out;
@@ -619,8 +863,22 @@ TEST(flux2_smoke, vae_decode_bench)
   auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
   ASSERT_TRUE(m != nullptr);
   const int C = m->config().dit_channels();
-  for (int side : {32, 64}) {                        // 512, 1024
-    const std::size_t hw = (std::size_t)side * side;
+  // Latent grids to bench, as {h16, w16} (image pixels / 16). Default 512
+  // and 1024 square. VPIPE_VAE_DEC_HW=1024x768 benches one real, NON-SQUARE
+  // generation size instead -- the counterpart to VPIPE_VAE_ENC_HW, and the
+  // shape a decode actually runs at.
+  std::vector<std::pair<int, int>> grids = {{32, 32}, {64, 64}};
+  if (const char* e = std::getenv("VPIPE_VAE_DEC_HW")) {
+    const int hpx = std::atoi(e);
+    const char* x = std::strchr(e, 'x');
+    const int wpx = (x != nullptr) ? std::atoi(x + 1) : hpx;
+    if (hpx >= 64 && wpx >= 64) {
+      grids = {{hpx / 16, wpx / 16}};
+    }
+  }
+  for (const auto& g : grids) {
+    const int h16 = g.first, w16 = g.second;
+    const std::size_t hw = (std::size_t)h16 * w16;
     SharedBuffer z = mc->make_shared_buffer((std::size_t)C * hw * 2);
     std::uint32_t s = 0x51ced00du;
     auto* d = static_cast<_Float16*>(z.contents());
@@ -629,18 +887,18 @@ TEST(flux2_smoke, vae_decode_bench)
       d[i] = (_Float16)(((float)(s >> 8) / 8388608.0f - 1.0f) * 3.0f);
     }
     std::string err;
-    m->decode(z, side, side, &err);                  // warm
+    m->decode(z, h16, w16, &err);                    // warm
     double best = 1e18;
     for (int i = 0; i < 3; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
-      SharedBuffer o = m->decode(z, side, side, &err);
+      SharedBuffer o = m->decode(z, h16, w16, &err);
       const double ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
       if (!o.empty() && ms < best) { best = ms; }
     }
-    std::printf("[flux2_smoke] decode %dx%d: %.1f ms (peak est %llu MB)\n",
-                side * 16, side * 16, best,
-                (unsigned long long)(m->decode_peak_bytes(side, side) >> 20));
+    std::printf("[flux2_smoke] decode %dhx%dw: %.1f ms (peak est %llu MB)\n",
+                h16 * 16, w16 * 16, best,
+                (unsigned long long)(m->decode_peak_bytes(h16, w16) >> 20));
   }
 }
 
@@ -672,8 +930,13 @@ TEST(flux2_smoke, vae_encode_hwconv_matches_im2col)
     if (v >= 64 && v2 >= 64) { W = v2; }
   }
   auto run = [&](bool no_hw, double* ms) {
-    if (no_hw) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1); }
-    else       { ::unsetenv("VPIPE_VAE_NO_HWCONV"); }
+    if (no_hw) { ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1);
+      // Pin the fallback to im2col: the conv autotune would otherwise route
+      // some shapes to the on-chip gather, making this arm a mix rather than
+      // the im2col the test names.
+      ::setenv("VPIPE_VAE_NO_DIRECT_CONV", "1", 1); }
+    else       { ::unsetenv("VPIPE_VAE_NO_HWCONV");
+      ::unsetenv("VPIPE_VAE_NO_DIRECT_CONV"); }
     auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{},
                                    /*with_encoder=*/true);
     ::unsetenv("VPIPE_VAE_NO_HWCONV");
@@ -1791,9 +2054,9 @@ TEST(flux2_e2e, text_to_image_produces_image)
   t2i_cfg.as_object().insert("steps", FlexData::make_int(steps));
   t2i_cfg.as_object().insert("seed", FlexData::make_int(0));
   auto* cond = add_conditioner_(pl.get(), sess, src, root);
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(t2i_cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vae_cfg = FlexData::make_object();
@@ -1904,10 +2167,10 @@ TEST(flux2_e2e, reference_latent_iport_changes_latent)
                                   InEdge{nullptr, 0}, InEdge{nullptr, 0},
                                   InEdge{nullptr, 0}, {rt_src, 0}};
     }
-    auto t2iu = std::make_unique<TextToImageStage>(&sess, "t2i", edges,
+    auto t2iu = std::make_unique<GenerateImageStage>(&sess, "t2i", edges,
                                                    std::move(cfg));
     auto* t2i =
-        static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+        static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
     if (!t2i->config_error().empty()) { return {}; }
     auto sinku = std::make_unique<SinkCapture>(
         &sess, "sink", std::vector<InEdge>{{t2i, 0}}, FlexData::make_object());
@@ -2132,4 +2395,130 @@ TEST(flux2_smoke, vec4_elementwise_matches_scalar)
   EXPECT_TRUE(diff == 0);
   std::printf("[flux2_smoke] vec4 vs scalar elementwise: %zu/%zu words differ\n",
               diff, a.size());
+}
+
+// ---- conv phase attribution: im2col vs GEMM ---------------------------
+//
+// The VAE decode profile shows the up-block resblock convs dominating on a
+// GPU with no matrix cores, and after routing the conv GEMM through the
+// simdgroup-MMA kernels `up3` was still ~23x off this box's ALU roofline.
+// That is not a number the GEMM alone explains, so time the two halves of
+// one conv separately at the real shape rather than reason about it.
+//
+// Shape is up3's inner conv at a 256x256 decode: [65536, 1152] x [128, 1152]^T.
+// VPIPE_VAE_CONV_PHASE=<hw> picks another square output size.
+TEST(flux2_smoke, vae_conv_phase_bench)
+{
+  if (std::getenv("VPIPE_VAE_CONV_PHASE") == nullptr) { return; }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  int HW = std::atoi(std::getenv("VPIPE_VAE_CONV_PHASE"));
+  if (HW < 32) { HW = 256; }
+  const int H = HW, W = HW, cin = 128, cout = 128;
+  const int M = H * W, K = 9 * cin, N = cout;
+
+  auto lib_elt  = mc->load_library("llm_elementwise");
+  auto lib_gemm = mc->load_library("dense_gemm");
+  auto f_im2col = lib_elt.function("im2col_hwc_3x3_tiled_f16");
+  auto f_gemm   = lib_gemm.function("dense_gemm_t_bm64bn64_f16");
+  auto f_scalar = lib_gemm.function("dense_gemm_bias_f16");
+  auto f_dc64   = lib_gemm.function("conv3x3_gemm_s1_bn64_f16");
+  auto f_dc128  = lib_gemm.function("conv3x3_gemm_s1_bn128_f16");
+  ASSERT_TRUE(f_im2col.valid() && f_gemm.valid() && f_scalar.valid());
+
+  auto act = mc->make_shared_buffer((std::size_t)M * cin * 2);
+  auto col = mc->make_shared_buffer((std::size_t)M * K * 2);
+  auto wgt = mc->make_shared_buffer((std::size_t)N * K * 2);
+  auto outb = mc->make_shared_buffer((std::size_t)M * N * 2);
+  ASSERT_TRUE(!act.empty() && !col.empty() && !wgt.empty() && !outb.empty());
+
+  auto time_it = [&](const char* what, auto&& body) {
+    double best = 1e18;
+    for (int it = 0; it < 4; ++it) {
+      auto st = mc->make_command_stream();
+      auto e  = st.begin_compute();
+      const auto t0 = std::chrono::steady_clock::now();
+      body(e);
+      e.end();
+      std::string err;
+      const bool ok = st.commit().wait_ok(&err);
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      EXPECT_TRUE(ok);
+      if (it > 0 && ms < best) { best = ms; }
+    }
+    std::printf("[flux2_smoke]   %-28s %.2f ms\n", what, best);
+    return best;
+  };
+
+  std::printf("[flux2_smoke] conv phases at %dx%d cin=%d cout=%d "
+              "(M=%d K=%d N=%d)\n", H, W, cin, cout, M, K, N);
+  const double t_im = time_it("im2col only", [&](vpipe::metal_compute::ComputeEncoder& e) {
+    e.set_function(f_im2col);
+    e.set_buffer(0, act); e.set_buffer(1, col);
+    e.set_constant(2, H); e.set_constant(3, W); e.set_constant(4, cin);
+    e.set_constant(5, 0); e.set_constant(6, M);
+    e.dispatch({(unsigned)K, (unsigned)M, 1}, {64, 1, 1});
+  });
+  const double t_gm = time_it("gemm only (simd MMA)", [&](vpipe::metal_compute::ComputeEncoder& e) {
+    e.set_function(f_gemm);
+    e.set_buffer(0, col); e.set_buffer(1, wgt); e.set_buffer(2, wgt);
+    e.set_buffer(3, outb);
+    e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+    e.set_constant(7, 0);
+    e.dispatch({(unsigned)(((N + 63) / 64) * 32),
+                (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+  });
+  time_it("gemm only (scalar)", [&](vpipe::metal_compute::ComputeEncoder& e) {
+    e.set_function(f_scalar);
+    e.set_buffer(0, col); e.set_buffer(1, wgt); e.set_buffer(2, wgt);
+    e.set_buffer(3, outb);
+    e.set_constant(4, M); e.set_constant(5, N); e.set_constant(6, K);
+    e.set_constant(7, 0);
+    e.dispatch({(unsigned)(((N + 15) / 16) * 16),
+                (unsigned)(((M + 15) / 16) * 16), 1}, {16, 16, 1});
+  });
+  // The proposed alternative: no im2col at all. A 3x3 conv is the SUM of 9
+  // 1x1 convs over shifted activations, i.e. 9 GEMMs of K=cin accumulating
+  // into the same output. Same total FLOPs, but each GEMM reads the [M,cin]
+  // activation directly (9x smaller, and warm across taps) instead of a
+  // materialized [M,9*cin]. Timed here as 9 back-to-back K=cin GEMMs -- an
+  // upper bound on the arithmetic, ignoring that a real implementation folds
+  // the shift into the tap's address and accumulates in place.
+  // The direct conv against the SAME GEMM it embeds: t_gm is the floor (the
+  // MMA with a materialized operand), so direct - t_gm is what the on-chip
+  // gather costs, and that is the number to optimize.
+  auto direct = [&](const vpipe::metal_compute::ComputeFunction& f, int bn) {
+    return [&, bn](vpipe::metal_compute::ComputeEncoder& e) {
+      e.set_function(f);
+      e.set_buffer(0, act); e.set_buffer(1, wgt); e.set_buffer(2, wgt);
+      e.set_buffer(3, outb);
+      e.set_constant(4, H);   e.set_constant(5, W);
+      e.set_constant(6, cin); e.set_constant(7, cout);
+      e.set_constant(8, H);   e.set_constant(9, W);
+      e.set_constant(10, 0);
+      e.dispatch({(unsigned)(((cout + bn - 1) / bn) * 32),
+                  (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+    };
+  };
+  if (f_dc64.valid())  { time_it("direct conv BN=64",  direct(f_dc64, 64)); }
+  if (f_dc128.valid()) { time_it("direct conv BN=128", direct(f_dc128, 128)); }
+  time_it("9x gemm K=cin (no im2col)", [&](vpipe::metal_compute::ComputeEncoder& e) {
+    for (int tap = 0; tap < 9; ++tap) {
+      e.set_function(f_gemm);
+      e.set_buffer(0, act); e.set_buffer(1, wgt); e.set_buffer(2, wgt);
+      e.set_buffer(3, outb);
+      e.set_constant(4, cin); e.set_constant(5, N); e.set_constant(6, M);
+      e.set_constant(7, 0);
+      e.dispatch({(unsigned)(((N + 63) / 64) * 32),
+                  (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+    }
+  });
+  const double gflop = 2.0 * M * N * K / 1e9;
+  const double gb_col = (double)M * K * 2 / 1e9;
+  std::printf("[flux2_smoke]   conv = %.1f GFLOP, im2col writes %.2f GB "
+              "-> im2col %.0f GB/s, gemm %.2f TFLOP/s\n",
+              gflop, gb_col, gb_col / (t_im / 1e3),
+              gflop / 1e3 / (t_gm / 1e3));
 }

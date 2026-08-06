@@ -69,6 +69,16 @@ has_field_(const FlexData& obj, const char* key)
   return obj.is_object() && obj.as_object().contains(key);
 }
 
+std::int64_t
+int_field_(const FlexData& obj, const char* key, std::int64_t dflt)
+{
+  if (!obj.is_object()) {
+    return dflt;
+  }
+  auto o = obj.as_object();
+  return o.contains(key) ? o.at(key).as_int(dflt) : dflt;
+}
+
 // Split a name on the separators HF repos use, so "gemma-4-e4b-it-4bit"
 // becomes {gemma,4,e4b,it,4bit}.
 std::vector<std::string>
@@ -174,6 +184,8 @@ family_version_(const std::string& mt, std::string& family,
       {"mage-flow-edit",         "Mage-Flow",   "Edit"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
+      {"wan-i2v",                "Wan",         "2.2-I2V"},
+      {"wan-t2v",                "Wan",         "2.2-T2V"},
       {"moss-tts",               "MOSS",        "TTS"},
       {"moss-tts-local",         "MOSS",        "TTS-Local"},
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
@@ -228,7 +240,8 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
 
 // ---- transformer/config.json (diffusers layout) -> runtime tag -------
 std::string
-dit_tag_(const std::string& cls, const std::string& name_lc)
+dit_tag_(const std::string& cls, const std::string& name_lc,
+         const FlexData& cfg)
 {
   const bool edit = has_(name_lc, "edit");
   // FLUX.2-klein-9b-kv reports this SAME class, and its config.json and tensor
@@ -250,12 +263,20 @@ dit_tag_(const std::string& cls, const std::string& name_lc)
     // weights differ), so the name is the only signal.
     return edit ? "boogu-image-edit" : "boogu-image";
   }
+  if (cls == "WanTransformer3DModel") {
+    // Wan's t2v and i2v checkpoints share this class, but NOT their input
+    // width: i2v takes 36 channels (16 noise + 4 first-frame mask + 16
+    // conditioning latent) where t2v takes the bare 16. That is a property
+    // of the weights rather than of the repo name, so read it rather than
+    // guessing from the directory.
+    return int_field_(cfg, "in_channels", 16) > 16 ? "wan-i2v" : "wan-t2v";
+  }
   return {};
 }
 
 // A BARE DiT component directory (diffusers weights + config, no
 // pipeline around it -- what model-quantize's DiT-only output is) gets
-// the "<family>-dit" tag that text-to-image's `dit_dir` picker filters
+// the "<family>-dit" tag that generate-image's `dit_dir` picker filters
 // on, NOT the pipeline tag: it is not loadable as a pipeline, and
 // claiming otherwise would offer it to hf_dir where it would fail.
 std::string
@@ -266,6 +287,10 @@ dit_component_tag_(const std::string& cls)
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
   if (cls == "MageFlow")                     { return "mage-flow-dit"; }
   if (cls == "BooguImageTransformer2DModel") { return "boogu-image-dit"; }
+  // Either Wan expert on its own (a quantized transformer/ or
+  // transformer_2/ output) is one DiT component; which noise band it
+  // covers is the pipeline's business, not the picker's.
+  if (cls == "WanTransformer3DModel")        { return "wan-dit"; }
   return {};
 }
 
@@ -509,7 +534,8 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   // ---- 2. a diffusers pipeline (transformer/ + vae/) ------------------
   const FlexData dit_cfg = read_json_(root / "transformer" / "config.json");
   if (dit_cfg.is_object()) {
-    d.model_type = dit_tag_(str_field_(dit_cfg, "_class_name"), base_lc);
+    d.model_type =
+        dit_tag_(str_field_(dit_cfg, "_class_name"), base_lc, dit_cfg);
     if (!d.model_type.empty()) {
       d.detected_by = "diffusers";
     }

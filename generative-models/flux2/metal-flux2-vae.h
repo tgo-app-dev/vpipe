@@ -3,7 +3,12 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
+#include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
+#include <functional>
+#include <map>
+#include <utility>
 #include <memory>
 #include <string>
 #include <vector>
@@ -225,6 +230,38 @@ class MetalFlux2Vae {
   // Above this the im2col+GEMM path is the better trade (the register
   // accumulators and the per-tap re-read stop paying).
   static constexpr int kSmallCoutMax = 32;
+  // Which 3x3 fallback route this GPU prefers once the hardware conv and the
+  // small-cout kernel have declined -- MEASURED at load, not branched on
+  // supports_matrix_cores(). See vae-conv3x3-tune.h: the on-chip gather wins
+  // outright on an M4 Pro and LOSES 1.24-1.28x on an M5, where the im2col arm
+  // it replaces feeds matmul2d.
+  // PER (cin, cout): the winner is not a property of the GPU alone. MEASURED
+  // on M5 at a 256x256 probe -- 128->128 and 256->128 go to the on-chip gather
+  // (1.10x), while 256->256, 512->256 and 512->512 go to im2col + matmul2d by
+  // 1.41x, 1.43x and 1.95x. cout is what swings it: the gather re-reads the
+  // activation once per output tile, so a wide cout pays for it repeatedly
+  // while im2col materializes once and hands the GEMM a wide N. A single
+  // global answer loses either way, which is why a whole-decode A/B read
+  // "on-chip is 1.24x slower" while a 128-channel probe read the opposite.
+  std::map<std::pair<int, int>, vae_conv3x3::Kind> _conv_pick;
+  vae_conv3x3::Kind conv_route_(int cin, int cout) const;
+  void autotune_conv3x3_(metal_compute::MetalCompute* mc);
+  // LAZY, and only when the fallback will actually carry work. Where the
+  // hardware conv is available every 3x3 in this decoder goes to it (all of
+  // block_out is a multiple of 64), so the tune's answer is never read at
+  // ordinary resolutions -- it starts mattering once conv3x3_hw_ declines,
+  // which is cin*W*H past 2^31 (4096x4096 at cin=128) or a grid that is not a
+  // multiple of 8. Tuning at load would spend ~0.5 s on every M5 load for a
+  // result nothing consults. Called at the top of decode()/encode(), where the
+  // resolution is finally known; the tuner memoizes, so it runs once.
+  bool _conv_tuned = false;
+  // VPIPE_VAE_DIRECT_CONV_MMA2 forces the on-chip gather for EVERY shape,
+  // including the ones autotune_conv3x3_ does not tune (cout <= kSmallCoutMax
+  // normally goes to conv3x3_small_cout_ instead). An override that only
+  // reached the tuned shapes would leave the direct-conv A/B comparing im2col
+  // against itself -- which it silently did once already.
+  bool _conv_force_onchip = false;
+  void maybe_tune_conv_(int H, int W);
   // Returns false when the shape is not a fit, leaving the caller on im2col.
   bool conv3x3_small_cout_(metal_compute::ComputeEncoder& enc,
                            const metal_compute::SharedBuffer& in,
@@ -258,9 +295,8 @@ class MetalFlux2Vae {
   // memory, which is what lets BQ exceed 8 and so divides the K/V bandwidth
   // this attention is bound by. Preferred over _fn_sdpa_full_mma whenever it
   // loaded. VPIPE_FLUX2_VAE_ATTN_BQ picks the tile (8 = the narrow kernel).
-  metal_compute::ComputeFunction _fn_sdpa_full_wide;
-  int _attn_bq = 0;              // query tile of _fn_sdpa_full_wide (0 = none)
-  static constexpr int kAttnBq = 32;
+  metal_compute::ComputeFunction _fn_sdpa_full_wide16, _fn_sdpa_full_wide32,
+      _fn_sdpa_full_wide64;
   void load_wide_attn_(int mid_d);
   // Simdgroup count the kernel of query tile `bq` was instantiated with; the
   // dispatch has to match it exactly (matmul2d's execution scope is UB
@@ -269,6 +305,38 @@ class MetalFlux2Vae {
   {
     return (bq == 16 ? 4u : bq == 32 ? 8u : 16u) * 32u;
   }
+
+  // The interchangeable mid-block attention kernels. All compute the same
+  // D=384/512 single-head full attention and are cross-verified against each
+  // other; they differ only in how they get there, and WHICH IS FASTEST IS A
+  // PROPERTY OF THE GPU, not of the shape. On an M4 Pro the materialized
+  // banded GEMM beat the flash kernel 9.1x; on an M5 the matrix-core flash
+  // beats it 1.08-1.46x at every size measured (mid tokens 16k..66k). Neither
+  // is "the" answer, and a query tile picked by a sweep on one machine is not
+  // the tile another wants, so the choice is MEASURED at load rather than
+  // predicted from supports_matrix_cores().
+  using MidAttn = vae_mid_attn::Kind;
+  MidAttn _attn_pick = MidAttn::kScalar;
+  // True when this member's kernels loaded on this GPU.
+  bool mid_attn_available_(MidAttn k) const;
+  // Encode ONE mid attention with the chosen member. `alloc`/`release` supply
+  // scratch: the decode's pool in the real path, plain buffers in the tuner --
+  // which is what lets both share this code instead of the tuner re-deriving
+  // the band loop it is supposed to be measuring.
+  void encode_mid_attn_(metal_compute::ComputeEncoder& enc, MidAttn kind,
+                        const metal_compute::SharedBuffer& q,
+                        const metal_compute::SharedBuffer& k,
+                        const metal_compute::SharedBuffer& v,
+                        const metal_compute::SharedBuffer& att,
+                        std::size_t hw, int C, float scale,
+                        const std::function<metal_compute::SharedBuffer&(
+                            std::size_t)>& alloc,
+                        const std::function<void(
+                            const metal_compute::SharedBuffer&)>& release);
+  // Time every available member on a synthetic mid block and keep the winner
+  // (vae_mid_attn::autotune). Falls back to the capability guess when the tune
+  // cannot run or an override names a member outright.
+  void autotune_mid_attn_(metal_compute::MetalCompute* mc, int C);
 
   // M5 matrix-core dense GEMM (matmul2d) for the conv/1x1 GEMMs, mirroring
   // the Krea-2 VAE. The VAE runs at large M (M = H*W pixels), so the tiled
@@ -303,6 +371,56 @@ class MetalFlux2Vae {
                    const metal_compute::SharedBuffer& in, const Conv& c,
                    const metal_compute::SharedBuffer& out, int H, int W,
                    int stride);
+  // Simdgroup-MMA dense GEMM for the non-matrix-core conv path (see
+  // conv_gemm_bias_). Best-effort: invalid leaves the scalar fallback.
+  metal_compute::ComputeFunction _fn_gemm_t_bm64, _fn_gemm_t_bm64bn64;
+  // Direct (im2col-free) 3x3 conv: gathers the 3x3 neighbourhood into
+  // threadgroup memory and runs the SAME simdgroup MMA as the GEMMs above, so
+  // the [H*W, 9*cin] scratch is never written or read back. On M4 the im2col
+  // round-trip was ~56% of a large conv even after its index math was fixed.
+  // VPIPE_VAE_NO_DIRECT_CONV falls back to im2col + conv_gemm_bias_.
+  metal_compute::ComputeFunction _fn_conv3x3_s1_bn64, _fn_conv3x3_s1_bn32,
+      _fn_conv3x3_s2_bn64, _fn_conv3x3_s2_bn32, _fn_conv3x3_s1_bn128,
+      _fn_conv3x3_s2_bn128;
+  // Returns false when the shape is not a fit, leaving the caller on im2col.
+  bool direct_conv3x3_(metal_compute::ComputeEncoder& enc,
+                       const metal_compute::SharedBuffer& in,
+                       const metal_compute::SharedBuffer& out, int H, int W,
+                       const Conv& c, int stride);
+  // MATERIALIZED attention for the mid block. The flash kernels run the whole
+  // D=512 SINGLE-head contraction in one threadgroup, which forces the D axis
+  // to be split across simdgroups and a cross-simdgroup softmax reduction per
+  // key block; MEASURED 0.65 TFLOP/s against ~4 TFLOP/s for the dense GEMM on
+  // the same box. Q.K^T -> row softmax -> P.V through those GEMMs instead.
+  // The score matrix is O(hw^2) (8.6 GB at 2Kx2K), so queries run in BANDS:
+  // mat_attn_band_ picks the largest band whose scores fit kMatAttnScoreBytes.
+  // VPIPE_VAE_NO_MAT_ATTN restores the flash path (A/B).
+  static constexpr std::size_t kMatAttnScoreBytes = 256u << 20;   // 256 MB
+  int mat_attn_band_(std::size_t hw) const noexcept;
+
+  // TILED decode. A whole-image decode's peak scales with the OUTPUT area, so
+  // a resolution that fits a 64 GB box can exceed a 16 GB one; decode() used to
+  // reject those outright. Instead, split the LATENT into overlapping windows,
+  // decode each through the normal path, and cross-fade the RGB results, which
+  // bounds the peak at one window regardless of output size.
+  //
+  // This is NOT numerically identical to a whole-image decode: the mid-block
+  // attention is GLOBAL, so per-window attention sees only its own window, and
+  // the convolutions see zero padding at window edges rather than real
+  // neighbours. The overlap cross-fade hides the conv seam; the attention
+  // difference is real and is why tiling stays a FALLBACK, entered only when
+  // the whole-image decode does not fit (or VPIPE_VAE_TILE forces it).
+  // VPIPE_VAE_NO_TILE restores the old hard failure.
+  static constexpr int kTileMin16 = 8;      // smallest useful latent window
+  static constexpr int kTileOvNum = 1;      // overlap = 1/4 of the window
+  static constexpr int kTileOvDen = 4;
+  // Largest square latent window whose decode peak fits `budget` (0 if none).
+  int decode_tile_side_(std::size_t budget) const noexcept;
+  metal_compute::SharedBuffer decode_tiled_(
+      const metal_compute::SharedBuffer& z, int h16, int w16, int tile16,
+      std::string* err);
+  metal_compute::ComputeFunction _fn_softmax_rows, _fn_transpose;
+
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
   bool _use_hwconv = false;

@@ -168,6 +168,31 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
     return sig;
   }
 
+  // ---- UniPC flow sigmas (Wan) -----------------------------------------
+  // diffusers UniPCMultistepScheduler.set_timesteps under use_flow_sigmas,
+  // which is what every Wan video checkpoint ships. Two details separate it
+  // from the dynamic_shift branch below and both matter:
+  //   * the base grid is linspace(1, 1/num_train, S+1)[:-1] -- S+1 points
+  //     with the last dropped, NOT linspace(1, 1/num_train, S). The two
+  //     agree only at the first point.
+  //   * the shift is the scheduler's own static curve
+  //     s' = shift*s / (1 + (shift-1)*s), not the exponential/linear pair
+  //     `shift_type` selects, so shift_type does not apply here.
+  // sigma[0] is nudged off an exact 1 because the first UniPC update takes
+  // log(alpha) = log(1 - sigma), which is -inf at 1.
+  if (type == "unipc_flow") {
+    std::vector<double> sig((std::size_t)S + 1);
+    const double lo = 1.0 / (double)(num_train > 0 ? num_train : 1000);
+    for (int i = 0; i < S; ++i) {
+      const double r = (double)i / (double)S;          // [:-1] of S+1 points
+      const double base = 1.0 + r * (lo - 1.0);
+      sig[(std::size_t)i] = shift * base / (1.0 + (shift - 1.0) * base);
+    }
+    if (S > 0 && std::fabs(sig[0] - 1.0) < 1e-6) { sig[0] -= 1e-6; }
+    sig[(std::size_t)S] = 0.0;                          // final_sigmas zero
+    return sig;
+  }
+
   // ---- FlowMatchEuler dynamic shifting (Qwen-Image / SD3) --------------
   // Reproduces diffusers FlowMatchEulerDiscreteScheduler.set_timesteps with
   // use_dynamic_shifting as the QwenImageEditPlus pipeline calls it: the base
@@ -243,9 +268,10 @@ FlowSamplerSpec::canon_method(const std::string& m, bool* ok)
 {
   if (ok != nullptr) { *ok = true; }
   if (m == "euler" || m == "heun" || m == "dpmpp_2m" || m == "dpmpp_sde" ||
-      m == "dmd") {
+      m == "dmd" || m == "unipc") {
     return m;
   }
+  if (m == "unipc_multistep" || m == "uni_pc") { return "unipc"; }
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
   if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
   if (m == "dmd_student" || m == "turbo") { return "dmd"; }
@@ -266,6 +292,11 @@ FlowSamplerSpec::to_flex() const
   if (method == "dmd") {
     o.insert_or_assign("conditioning_sigma",
                        FlexData::make_real(conditioning_sigma));
+  }
+  if (method == "unipc") {
+    o.insert_or_assign("order", FlexData::make_int(order));
+    o.insert_or_assign("solver_type",
+                       FlexData::make_string(solver_bh2 ? "bh2" : "bh1"));
   }
   return fd;
 }
@@ -293,6 +324,13 @@ FlowSamplerSpec::from_flex(const FlexData& fd, std::string* err)
     s.conditioning_sigma =
         o.at("conditioning_sigma").as_real(s.conditioning_sigma);
   }
+  if (o.contains("order")) {
+    s.order = (int)o.at("order").as_int(s.order);
+    if (s.order < 1) { s.order = 1; }
+  }
+  if (o.contains("solver_type")) {
+    s.solver_bh2 = std::string(o.at("solver_type").as_string("bh2")) != "bh1";
+  }
   return s;
 }
 
@@ -312,6 +350,140 @@ FlowSampler::reset()
   _have_prev = false;
   _t_prev = 0.0;
   _rng = _sampler.seed != 0 ? _sampler.seed : 0x9E3779B97F4A7C15ULL;
+  _uni_m.clear();
+  _uni_sigma.clear();
+  _uni_last_sample.clear();
+  _uni_have_last = false;
+  _uni_order = 0;
+}
+
+// One UniPC update, predictor or corrector -- they differ only in which
+// sigma pair they span and whether the newest x0 difference joins the sum,
+// so the reference's two near-identical routines are one here.
+//
+// Under flow sigmas alpha = 1 - sigma and sigma_t = sigma, so
+// lambda = log(alpha) - log(sigma) and h = lambda_to - lambda_from. With
+// predict_x0 the update is
+//     x_t = (sigma_to/sigma_from)*x - alpha_to*expm1(hh)*m0
+//           - alpha_to*B(h)*sum_k rho_k * D1_k
+// where hh = -h, B(h) = expm1(hh) for bh2 (h for bh1), and the rho are the
+// solution of R rho = b with R_ij = rks_j^(i-1). The reference special-cases
+// the two orders this solver ever reaches (predictor order 2 -> rho = 0.5,
+// corrector order 1 -> rho = 0.5); the general solve below reproduces those
+// and keeps a higher order available.
+void
+FlowSampler::unipc_update_(std::vector<float>& out, const std::vector<float>& x,
+                           const std::vector<float>& m0, double sigma_from,
+                           double sigma_to, int order, bool corrector,
+                           const std::vector<float>* d1_t) const
+{
+  const std::size_t n = x.size();
+  out.assign(n, 0.0f);
+  auto lam = [](double s) {
+    return std::log(1.0 - s) - std::log(s);
+  };
+  const double alpha_to = 1.0 - sigma_to;
+  const double h  = lam(sigma_to) - lam(sigma_from);
+  const double hh = -h;                       // predict_x0
+  const double h_phi_1 = std::expm1(hh);
+  const double B_h = _sampler.solver_bh2 ? std::expm1(hh) : hh;
+
+  // The multistep history's relative step ratios and x0 differences. The
+  // newest entry (_uni_m.back()) IS m0, so the loop walks backwards from
+  // the one before it; the corrector's history starts one step further
+  // back because its interval already consumed the newest sigma.
+  std::vector<double> rks;
+  std::vector<const std::vector<float>*> d1s;
+  const int have = (int)_uni_m.size();
+  for (int i = 1; i < order; ++i) {
+    // model_output_list[-(i+1)] in the reference -- the SAME expression for
+    // predictor and corrector. What differs is only when the list was last
+    // appended to: the corrector runs before this step's output joins it,
+    // the predictor after. Each entry's own sigma is carried alongside it,
+    // so no index arithmetic on the schedule is needed either way.
+    const int idx = have - 1 - i;
+    if (idx < 0) { break; }
+    const double rk = (lam(_uni_sigma[(std::size_t)idx]) - lam(sigma_from)) / h;
+    if (rk == 0.0) { break; }
+    rks.push_back(rk);
+    d1s.push_back(&_uni_m[(std::size_t)idx]);
+  }
+  rks.push_back(1.0);
+
+  // R rho = b, with b_i = h_phi_k * i! / B_h stepped as the reference does.
+  // The reference does NOT solve the system in its two commonest cases --
+  // it substitutes 0.5 outright (predictor at order 2, corrector at order
+  // 1). Those are not what the general solve returns, so reproducing them
+  // is not an optimization: solving instead is simply a different sampler.
+  const int K = corrector ? (int)rks.size() : (int)rks.size() - 1;
+  std::vector<double> rho;
+  const bool hardcoded_half =
+      (corrector && order == 1) || (!corrector && order == 2);
+  if (hardcoded_half) {
+    rho.assign(1, 0.5);
+  } else if (K > 0) {
+    std::vector<double> R((std::size_t)K * K), b((std::size_t)K);
+    double h_phi_k = h_phi_1 / hh - 1.0;
+    double factorial_i = 1.0;
+    for (int i = 1; i <= K; ++i) {
+      for (int j = 0; j < K; ++j) {
+        R[(std::size_t)(i - 1) * K + j] = std::pow(rks[(std::size_t)j], i - 1);
+      }
+      b[(std::size_t)(i - 1)] = h_phi_k * factorial_i / B_h;
+      factorial_i *= (double)(i + 1);
+      h_phi_k = h_phi_k / hh - 1.0 / factorial_i;
+    }
+    // Gaussian elimination with partial pivoting; K is 1 or 2 in practice.
+    rho.assign((std::size_t)K, 0.0);
+    for (int c = 0; c < K; ++c) {
+      int piv = c;
+      for (int r = c + 1; r < K; ++r) {
+        if (std::fabs(R[(std::size_t)r * K + c]) >
+            std::fabs(R[(std::size_t)piv * K + c])) {
+          piv = r;
+        }
+      }
+      if (piv != c) {
+        for (int j = 0; j < K; ++j) {
+          std::swap(R[(std::size_t)c * K + j], R[(std::size_t)piv * K + j]);
+        }
+        std::swap(b[(std::size_t)c], b[(std::size_t)piv]);
+      }
+      const double d = R[(std::size_t)c * K + c];
+      if (d == 0.0) { continue; }
+      for (int r = c + 1; r < K; ++r) {
+        const double f = R[(std::size_t)r * K + c] / d;
+        for (int j = c; j < K; ++j) {
+          R[(std::size_t)r * K + j] -= f * R[(std::size_t)c * K + j];
+        }
+        b[(std::size_t)r] -= f * b[(std::size_t)c];
+      }
+    }
+    for (int r = K - 1; r >= 0; --r) {
+      double acc = b[(std::size_t)r];
+      for (int j = r + 1; j < K; ++j) {
+        acc -= R[(std::size_t)r * K + j] * rho[(std::size_t)j];
+      }
+      const double d = R[(std::size_t)r * K + r];
+      rho[(std::size_t)r] = (d != 0.0) ? acc / d : 0.0;
+    }
+  }
+
+  const double sr = sigma_to / sigma_from;
+  for (std::size_t k = 0; k < n; ++k) {
+    double res = 0.0;
+    for (std::size_t j = 0; j < d1s.size(); ++j) {
+      // D1_j = (m_j - m0) / rk_j, as the reference forms it.
+      const double d1 =
+          ((double)(*d1s[j])[k] - (double)m0[k]) / rks[j];
+      res += rho[j] * d1;
+    }
+    if (corrector && d1_t != nullptr && !rho.empty()) {
+      res += rho.back() * ((double)(*d1_t)[k] - (double)m0[k]);
+    }
+    out[k] = (float)(sr * (double)x[k] - alpha_to * h_phi_1 * (double)m0[k]
+                     - alpha_to * B_h * res);
+  }
 }
 
 std::vector<float>
@@ -377,6 +549,62 @@ FlowSampler::step(int i, std::vector<float>& x, const DenoiseFn& denoise)
     } else {
       for (std::size_t k = 0; k < x.size(); ++k) { x[k] += (float)(dt * v1[k]); }
     }
+    return;
+  }
+
+  if (m == "unipc") {
+    // One model evaluation per step, used twice: first to CORRECT where the
+    // previous step actually landed, then to predict the next point. That
+    // is what buys second-order accuracy without a second DiT pass.
+    std::vector<float> m0 = denoised_(x, si, denoise);
+    if (m0.size() != x.size()) { return; }
+
+    const int solver_order = _sampler.order < 1 ? 1 : _sampler.order;
+    // Corrector: re-derive step i-1's landing point now that the model has
+    // been evaluated AT it. Skipped on the first step, where there is no
+    // previous interval to correct.
+    if (i > 0 && _uni_have_last && !_uni_m.empty()) {
+      std::vector<float> corrected;
+      unipc_update_(corrected, _uni_last_sample, _uni_m.back(),
+                    _sigmas[(std::size_t)i - 1], si, _uni_order,
+                    /*corrector=*/true, &m0);
+      if (corrected.size() == x.size()) {
+        x = std::move(corrected);
+        // The corrected sample changes what the model output MEANS at this
+        // sigma only through x0 = x - sigma*v, and the reference reuses the
+        // uncorrected conversion here too -- so m0 stands.
+      }
+    }
+
+    _uni_m.push_back(m0);
+    _uni_sigma.push_back(si);
+    if ((int)_uni_m.size() > solver_order + 1) {
+      _uni_m.erase(_uni_m.begin());
+      _uni_sigma.erase(_uni_sigma.begin());
+    }
+
+    // lower_order_final + the multistep warmup: the order can be no higher
+    // than the history is deep, and it winds back down as the schedule runs
+    // out of steps to look ahead to.
+    const int remaining = (int)_sigmas.size() - 1 - i;
+    int this_order = std::min(solver_order, remaining);
+    this_order = std::min(this_order, _uni_order + 1);
+    if (this_order < 1) { this_order = 1; }
+    _uni_order = this_order;
+
+    _uni_last_sample = x;
+    _uni_have_last = true;
+
+    if (sn <= 0.0) {
+      // The terminal sigma is 0, where the update reduces to landing on the
+      // x0 prediction (sigma_to/sigma_from = 0 and alpha_to = 1).
+      x = _uni_m.back();
+      return;
+    }
+    std::vector<float> next;
+    unipc_update_(next, x, _uni_m.back(), si, sn, this_order,
+                  /*corrector=*/false, nullptr);
+    if (next.size() == x.size()) { x = std::move(next); }
     return;
   }
 

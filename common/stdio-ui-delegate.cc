@@ -1,7 +1,9 @@
+#include "common/console-writer.h"
 #include "common/media-line.h"
 #include "common/stdio-ui-delegate.h"
 #include "common/vpipe-format.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -44,9 +46,11 @@ public:
       chunk = plain;
     }
     lock_guard<mutex> lk(_io_mu);
-    cout << chunk;
-    cout.flush();
-    fflush(stdout);
+    // write_text, not write_line: a token chunk rarely ends in a
+    // newline, and the ConsoleWriter has to know the cursor is left
+    // mid-line so it suppresses the progress footer until the stream
+    // finishes rather than painting bars into the middle of a sentence.
+    console_writer().write_text(/*to_err=*/false, chunk);
     _wrote = true;
   }
 
@@ -60,9 +64,7 @@ public:
       return;
     }
     lock_guard<mutex> lk(_io_mu);
-    cout << '\n';
-    cout.flush();
-    fflush(stdout);
+    console_writer().write_line(/*to_err=*/false, "\n");
   }
 
 private:
@@ -108,6 +110,139 @@ private:
 
 }  // namespace
 
+// ---- progress footer -------------------------------------------------
+
+namespace {
+
+// One report as a footer row:
+//   [########----------------]  34%  fetch qwen3-4b   1.2 / 3.0 GB
+// The bar is 24 cells, matching what the model-fetch stage drew before
+// this moved behind the UI delegate.
+constexpr int kBarCells = 24;
+
+string
+render_row_(const UiProgressRegistry::Item& it, int tick)
+{
+  string bar = "[";
+  if (it.total > 0) {
+    int pct = static_cast<int>((it.done * 100) / it.total);
+    pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    const int filled = pct * kBarCells / 100;
+    for (int i = 0; i < kBarCells; ++i) {
+      bar += (i < filled ? '#' : '-');
+    }
+    bar += "] ";
+    const string p = std::to_string(pct);
+    bar.append(3 - std::min<size_t>(3, p.size()), ' ');
+    bar += p;
+    bar += "%  ";
+  } else {
+    // INDETERMINATE: no percentage exists, so show motion instead of a
+    // fill -- a pip bouncing across the cells. Without it a download
+    // that has not yet reported a Content-Length looks frozen.
+    const int span = kBarCells * 2 - 2;          // there and back
+    int pos = span > 0 ? (tick % span) : 0;
+    if (pos >= kBarCells) { pos = span - pos; }
+    for (int i = 0; i < kBarCells; ++i) {
+      bar += (i == pos ? '#' : '-');
+    }
+    bar += "]  --  ";
+  }
+  bar += it.desc;
+  if (!it.detail.empty()) {
+    bar += "   ";
+    bar += it.detail;
+  }
+  return bar;
+}
+
+}  // namespace
+
+void
+StdioUiDelegate::on_progress_opened()
+{
+  start_progress_thread_();
+}
+
+void
+StdioUiDelegate::start_progress_thread_()
+{
+  // Nothing to pin a footer to when stdout is a file or a pipe, and
+  // painting one there would write escape sequences into a log.
+  if (!console_writer().tty()) { return; }
+  // Reap a PREVIOUS run's thread outside the lock. The thread takes
+  // _progress_mu at the top of every tick, so joining while holding it
+  // deadlocks: the joiner waits for a thread that is waiting for the
+  // joiner's mutex. Moving the handle out first means the join below
+  // touches nothing the thread still needs.
+  std::thread stale;
+  {
+    lock_guard<mutex> lk(_progress_mu);
+    if (_progress_run) { return; }             // a live thread has it
+    stale = std::move(_progress_thread);       // exited, or never started
+  }
+  if (stale.joinable()) { stale.join(); }
+  lock_guard<mutex> lk(_progress_mu);
+  if (_progress_run) { return; }               // a peer won the race
+  _progress_run = true;
+  _progress_thread = std::thread([this] {
+    std::uint64_t last_version = 0;
+    int  tick    = 0;
+    bool painted = false;
+    for (;;) {
+      {
+        unique_lock<mutex> lk(_progress_mu);
+        if (!_progress_run) { break; }
+        _progress_cv.wait_for(lk, std::chrono::milliseconds(kRepaintMs));
+        if (!_progress_run) { break; }
+      }
+      ++tick;
+      const std::uint64_t v = progress_version();
+      const auto items = progress_snapshot();
+      if (items.empty()) {
+        // Last report closed: wipe the block and let the thread go.
+        // A later report starts a fresh one through on_progress_opened.
+        if (painted) { console_writer().set_footer(this, {}); }
+        lock_guard<mutex> lk(_progress_mu);
+        _progress_run = false;
+        break;
+      }
+      // Repaint on a real change, or on every tick while an
+      // indeterminate report is live -- its pip is animated by `tick`,
+      // which the version counter knows nothing about.
+      bool animating = false;
+      for (const auto& it : items) {
+        if (it.total == 0) { animating = true; break; }
+      }
+      if (v != last_version || animating || !painted) {
+        vector<string> rows;
+        rows.reserve(items.size());
+        for (const auto& it : items) { rows.push_back(render_row_(it, tick)); }
+        console_writer().set_footer(this, std::move(rows));
+        last_version = v;
+        painted      = true;
+      }
+    }
+  });
+}
+
+void
+StdioUiDelegate::stop_progress_thread_()
+{
+  {
+    lock_guard<mutex> lk(_progress_mu);
+    _progress_run = false;
+  }
+  _progress_cv.notify_all();
+  if (_progress_thread.joinable()) { _progress_thread.join(); }
+  console_writer().set_footer(this, {});
+}
+
+StdioUiDelegate::~StdioUiDelegate()
+{
+  stop_progress_thread_();
+}
+
 void
 StdioUiDelegate::emit_(const char* tag, bool to_err, const VpipeFormat& f)
 {
@@ -129,17 +264,12 @@ StdioUiDelegate::emit_(const char* tag, bool to_err, const VpipeFormat& f)
   }
   line.push_back('\n');
 
+  // Through the ConsoleWriter, not straight to the stream: it owns the
+  // progress footer's rows and has to erase them before this line
+  // scrolls the terminal, then repaint below it. Off a tty that is
+  // exactly the old write + flush + fflush.
   lock_guard<mutex> lk(_io_mu);
-  if (to_err) {
-    cerr << line;
-    cerr.flush();
-  } else {
-    // Explicit flush + fflush so redirected/fully-buffered stdout (a
-    // file, or a Python parent reading our pipe) sees the line now.
-    cout << line;
-    cout.flush();
-    fflush(stdout);
-  }
+  console_writer().write_line(to_err, line);
 }
 
 void
@@ -233,10 +363,10 @@ StdioUiDelegate::read_line_(const VpipeFormat&           prompt,
       p.clear();
     }
     if (!p.empty()) {
+      // A prompt ends without a newline, so this leaves the cursor
+      // mid-line and the footer stays suppressed while the user types.
       lock_guard<mutex> lk(_io_mu);
-      cout << p;
-      cout.flush();
-      fflush(stdout);
+      console_writer().write_text(/*to_err=*/false, p);
     }
   }
 
@@ -296,9 +426,7 @@ StdioUiDelegate::read_line_(const VpipeFormat&           prompt,
   // newline; emit one so subsequent output starts on a fresh line.
   if (mask && echo_guard && echo_guard->active()) {
     lock_guard<mutex> lk(_io_mu);
-    cout << '\n';
-    cout.flush();
-    fflush(stdout);
+    console_writer().write_line(/*to_err=*/false, "\n");
   }
 
   return ok ? UiInputStatus::Ok : UiInputStatus::Eof;

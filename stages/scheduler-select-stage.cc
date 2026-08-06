@@ -46,7 +46,7 @@ const StageSpec kSpec = {
   .doc       = "Choose a diffusion sigma schedule (simple | karras | "
                "exponential | boogu_v1) + steps/shift and emit its spec as a "
                "FlexData beat "
-               "for a text-to-image stage to latch. Model-agnostic (forwards the "
+               "for a generate-image stage to latch. Model-agnostic (forwards the "
                "user's choice); config fields override the turbo defaults. Pairs "
                "with diffusion-sampler-select. 0 in / 1 out (emits once).",
   .display_name = "Scheduler Select",
@@ -99,7 +99,7 @@ FlexData
 SchedulerSelectStage::resolved_spec() const
 {
   // Model-agnostic: this stage forwards the user's schedule choice and does NOT
-  // read the model's scheduler config (the text-to-image stage owns the model).
+  // read the model's scheduler config (the generate-image stage owns the model).
   // The built-in distilled-turbo defaults apply unless a config field overrides.
   std::string type = "simple", shift_type = "exponential";
   std::int64_t steps = 8;

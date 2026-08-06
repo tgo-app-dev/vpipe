@@ -95,6 +95,17 @@ public:
     return std::make_unique<NullUiTextStream>();
   }
 
+  // Open a progress report routed to the session's UI delegate (see
+  // UiDelegateIntf::open_progress / UiProgress). `desc` is the short
+  // label a renderer shows. The default returns an INERT handle whose
+  // update() is a no-op, so a stage reports progress unconditionally
+  // and never checks whether anyone is watching.
+  virtual UiProgress
+  open_progress(std::string /*desc*/) const
+  {
+    return UiProgress();
+  }
+
   // Register a handler for "the user asked to interrupt ongoing work"
   // (Ctrl-C on the console, the web UI's Interrupt button), routed to
   // the session's UI delegate. A stage with abandonable long-running

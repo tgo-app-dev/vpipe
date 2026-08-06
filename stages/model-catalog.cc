@@ -36,6 +36,54 @@ model_catalog()
       "text_encoder/video_preprocessor_config.json",
       "scheduler/scheduler_config.json"};
 
+  // The Wan2.2-I2V-A14B (diffusers) files. `assets/` is the README's
+  // showcase art and is skipped; everything else is load-bearing, and the
+  // two 54 GB expert transformers dominate (they ship fp32 -- the
+  // reference runs them in bf16, which is what our loader converts to).
+  // ~126 GB total, so this is the largest catalogued model by some margin.
+  static const std::vector<std::string> kWan22I2VFiles = {
+      "model_index.json",
+      "transformer/config.json",
+      "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "transformer/diffusion_pytorch_model-00001-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00002-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00003-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00004-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00005-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00006-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00007-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00008-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00009-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00010-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00011-of-00012.safetensors",
+      "transformer/diffusion_pytorch_model-00012-of-00012.safetensors",
+      "transformer_2/config.json",
+      "transformer_2/diffusion_pytorch_model.safetensors.index.json",
+      "transformer_2/diffusion_pytorch_model-00001-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00002-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00003-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00004-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00005-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00006-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00007-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00008-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00009-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00010-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00011-of-00012.safetensors",
+      "transformer_2/diffusion_pytorch_model-00012-of-00012.safetensors",
+      "text_encoder/config.json",
+      "text_encoder/model.safetensors.index.json",
+      "text_encoder/model-00001-of-00003.safetensors",
+      "text_encoder/model-00002-of-00003.safetensors",
+      "text_encoder/model-00003-of-00003.safetensors",
+      "tokenizer/tokenizer.json",
+      "tokenizer/tokenizer_config.json",
+      "tokenizer/special_tokens_map.json",
+      "tokenizer/spiece.model",
+      "vae/config.json",
+      "vae/diffusion_pytorch_model.safetensors",
+      "scheduler/scheduler_config.json"};
+
   // All four Boogu-Image-0.1 repos are byte-identical in layout, so one pinned
   // list serves them. It SKIPS the assets/ showcase images and the two
   // `trust_remote_code` .py shims (compatibility re-exports that only point
@@ -345,7 +393,7 @@ model_catalog()
     // ---- Krea (text-to-image diffusion) ------------------------------
     // Krea-2-Turbo: a flow-matching (rectified-flow) text-to-image model,
     // model_type "krea2". Diffusers-layout repo with per-component
-    // subfolders -- three sub-models the text-to-image stages consume:
+    // subfolders -- three sub-models the generate-image stages consume:
     //   text_encoder/ = Qwen3-VL (model_type qwen3_vl, hidden 2560, 36L);
     //     the pipeline conditions on 12 SELECTED hidden layers
     //     (text_encoder_select_layers in model_index.json), not just the
@@ -410,7 +458,7 @@ model_catalog()
      .needs_tokenizer_json = false},
     // Krea-2 softwatercolor LoRA (adapts the Turbo DiT). Fuse into a DiT with
     // the lora-fuse stage (base = <Krea-2-Turbo>/transformer), then use the
-    // fused DiT via the text-to-image `dit_dir`. Trigger: "Art Deco watercolor
+    // fused DiT via the generate-image `dit_dir`. Trigger: "Art Deco watercolor
     // style". A single ~0.47 GB safetensors (lora_A/B pairs, rank 32).
     {.family = "Krea", .version = "2", .param_class = "LoRA",
      .variant = "softwatercolor LoRA (krea)",
@@ -448,7 +496,7 @@ model_catalog()
     // this is the adapter that ACTIVATES the in-context reference-edit path
     // (ComfyUI-Krea2Edit): the source image is kept as clean frame-1 tokens in
     // the DiT + the instruction is encoded image-grounded through Qwen3-VL. Wire
-    // the source VAE latent to the text-to-image `ref_latent0` iport (strength 0)
+    // the source VAE latent to the generate-image `ref_latent0` iport (strength 0)
     // and the raw source image to the diffusion-conditioner `ref_image` iport.
     // Standard low-rank LoRA (lora_A/B), ai-toolkit / ComfyUI key convention
     // (diffusion_model.{blocks,txtfusion.{layerwise,refiner}_blocks}.N.attn.
@@ -774,6 +822,49 @@ model_catalog()
      .inputs = {"text", "image"}, .outputs = {"image"},
      .files = kBooguFiles,
      .needs_tokenizer_json = false},
+    // ---- Wan (text+image -> VIDEO diffusion) --------------------------
+    // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
+    // that outputs anything but text / images / audio. Same diffusers
+    // split-stage shape as the image families (conditioner -> DiT stage +
+    // separate VAE stages), but every tensor carries a TIME axis, so it is
+    // served by `generate-video` rather than `generate-image`. Sub-models:
+    //   text_encoder/ = UMT5EncoderModel (umT5-XXL encoder: 24L, d_model
+    //     4096, d_ff 10240, 64 heads x d_kv 64, gated-GELU, RMSNorm, vocab
+    //     256384). Encoder-only -- there is no decoder half in the repo.
+    //     Unlike T5 it carries a relative-attention bias PER LAYER rather
+    //     than sharing layer 0's. The pipeline feeds the DiT a fixed
+    //     512-token context (padded / truncated), so `text_dim` 4096.
+    //   transformer/ + transformer_2/ = TWO WanTransformer3DModel experts
+    //     ("A14B" = 14B active): 40 blocks, 40 heads x head_dim 128 = 5120
+    //     hidden, ffn 13824 (GELU-approx, ungated), patch (1,2,2) over a
+    //     3D latent, 3-axis RoPE split 44/42/42 (t/h/w, interleaved),
+    //     rms_norm_across_heads on q/k, and a cross-attention to the text
+    //     context in every block. Modulation is a SHARED 6-way
+    //     scale_shift_table added to the timestep projection, and the norms
+    //     run in fp32. transformer/ is the HIGH-noise expert and
+    //     transformer_2/ the LOW-noise one; the sampler switches at
+    //     boundary_ratio 0.9 of the schedule (model_index.json), so only
+    //     one 54 GB expert is resident at a time.
+    //   vae/          = AutoencoderKLWan (16 latent ch, 8x spatial AND 4x
+    //     TEMPORAL, per-channel latents_mean/std whitening). This is the
+    //     net the Qwen-Image VAE (Krea-2 / Qwen-Image-Edit) is the
+    //     single-frame specialization of -- same base_dim 96, dim_mult
+    //     [1,2,4,4], 2 res blocks -- with the time axis restored: causal
+    //     3D convs run over frame chunks with a feature cache, and two of
+    //     the three resample stages also resample in time.
+    // I2V conditioning is CHANNEL-WISE, not cross-attention: the DiT takes
+    // 36 in_channels = 16 noise + 4 first-frame mask + 16 VAE latent of the
+    // conditioning image. There is no CLIP image tower (image_dim null) --
+    // Wan2.2 dropped the one Wan2.1-I2V had.
+    // Scheduler: UniPCMultistepScheduler on flow sigmas, shift 3.0, order
+    // 2 (bh2), ~40 steps at guidance 3.5 for both experts.
+    {.family = "Wan", .version = "2.2-I2V", .param_class = "A14B",
+     .variant = "MoE fp32 (Wan-AI, diffusers)",
+     .hf_path = "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+     .model_type = "wan-i2v",
+     .inputs = {"text", "image"}, .outputs = {"video"},
+     .files = kWan22I2VFiles,
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -893,6 +984,12 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              || mt == "mage-flow-edit") {
     set({"text", "image"}, {"image"});
+  } else if (mt == "wan-i2v") {
+    // The one family here that OUTPUTS video: a prompt plus a first-frame
+    // image in, a clip out.
+    set({"text", "image"}, {"video"});
+  } else if (mt == "wan-t2v") {
+    set({"text"}, {"video"});
   } else if (mt == "boogu-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "boogu-image") {

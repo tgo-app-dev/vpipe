@@ -12,7 +12,7 @@
 //     reference image) and 0.021 (256 img + 64 txt) -- the error SHRINKS with
 //     sequence length, i.e. bf16 noise averaging out rather than a systematic
 //     rope/masking error.
-//   * boogu_e2e.*    -- the conditioner -> text-to-image -> vae-decode pipeline
+//   * boogu_e2e.*    -- the conditioner -> generate-image -> vae-decode pipeline
 //     produces a coherent image (opt-in, heavy: the 10B DiT + the 8B mllm).
 //
 // Env: VPIPE_BOOGU_TEST_MODEL_PATH = the Boogu-Image model root.
@@ -38,7 +38,7 @@
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/load-image-stage.h"
 #include "stages/save-image-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
 #include <array>
@@ -2148,7 +2148,7 @@ TEST(boogu_golden, quantized_velocity_vs_bf16)
 }
 
 // ---- boogu_e2e: the whole model, on one box -------------------------------
-// conditioner (Qwen3-VL 8B mllm) -> text-to-image (the 10B NextDiT, 4 DMD
+// conditioner (Qwen3-VL 8B mllm) -> generate-image (the 10B NextDiT, 4 DMD
 // steps) -> vae-decode (the FLUX.1 AutoencoderKL at patch 1). Everything above
 // this line tests one component against a golden or against itself; this is
 // the only test that says the three fit together and that a 16 GB box can hold
@@ -2230,9 +2230,9 @@ TEST(boogu_e2e, text_to_image_end_to_end)
   tc.as_object().insert("width", FlexData::make_int(px));
   tc.as_object().insert("steps", FlexData::make_int(4));    // Turbo / DMD
   tc.as_object().insert("seed", FlexData::make_int(42));
-  auto tu = std::make_unique<TextToImageStage>(
+  auto tu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(tc));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(tu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(tu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   FlexData vc = FlexData::make_object();

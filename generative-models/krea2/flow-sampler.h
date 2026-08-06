@@ -22,7 +22,7 @@ namespace genai {
 //     with the stochastic knobs (eta, s_noise, seed) for the SDE variant.
 //
 // Each serializes to/from FlexData, so a `sampler-select` and a
-// `scheduler-select` stage each emit one on a port and the text-to-image stage
+// `scheduler-select` stage each emit one on a port and the generate-image stage
 // latches both -- neither the sampler nor the schedule is baked into the loop.
 //
 // The distilled Krea-2-Turbo default (sampler "euler" + scheduler "simple",
@@ -30,7 +30,21 @@ namespace genai {
 
 // ---- scheduler: the sigma schedule -------------------------------------
 struct FlowSchedulerSpec {
-  // "simple" | "karras" | "exponential" | "boogu_v1".
+  // "simple" | "karras" | "exponential" | "boogu_v1" | "unipc_flow".
+  //
+  // "unipc_flow" is the flow-sigma schedule of the diffusers
+  // UniPCMultistepScheduler, which is what every Wan video model ships
+  // with. Its base grid is linspace(1, 1/num_train, steps+1)[:-1] -- note
+  // the [:-1] of a steps+1 grid, which is NOT the linspace(1, 1/num_train,
+  // steps) the dynamic_shift mode below uses, and the two disagree at every
+  // point but the first. Each base sigma is then pushed through the STATIC
+  // flow shift
+  //     s' = shift*s / (1 + (shift-1)*s)
+  // (`shift`, 3.0 for Wan2.2-I2V; `shift_type` does not apply -- this curve
+  // is the scheduler's own, not the exponential/linear pair), a terminal 0
+  // is appended, and sigma[0] is nudged down by 1e-6 when it lands exactly
+  // on 1 so that log(alpha) = log(1 - sigma) stays finite in the first
+  // UniPC update.
   //
   // "boogu_v1" is Boogu-Image's FlowMatchEulerDiscreteScheduler time-shifting:
   // its sigma convention is INVERTED relative to every other schedule here --
@@ -96,7 +110,21 @@ struct FlowSchedulerSpec {
 
 // ---- sampler: the integrator -------------------------------------------
 struct FlowSamplerSpec {
-  // "euler"|"heun"|"dpmpp_2m"|"dpmpp_sde"|"dmd".
+  // "euler"|"heun"|"dpmpp_2m"|"dpmpp_sde"|"dmd"|"unipc".
+  //
+  // "unipc" is the UniPC multistep predictor-corrector (diffusers
+  // UniPCMultistepScheduler), the sampler every Wan video model ships
+  // with. Unlike the others here it is a PREDICTOR-CORRECTOR: each step
+  // first CORRECTS the previous step's landing point using the model
+  // evaluation just taken, then predicts the next one -- so it gets
+  // second-order accuracy out of ONE model evaluation per step, which
+  // matters when a step is a 14B DiT over a video-sized latent. It carries
+  // the previous x0 prediction and the previous sample as state, so
+  // reset() before a run is not optional.
+  //
+  // `order` is the solver order (2 in every shipped Wan config) and
+  // `solver_bh2` selects the B(h) variant: bh2 uses expm1(h) where bh1
+  // uses h. Both are the reference's, and the checkpoints say bh2.
   //
   // "dmd" is the Boogu-Image Turbo student's few-step integrator, and it is NOT
   // an ODE solver at all: at each ASCENDING sigma it jumps straight to the x0
@@ -112,6 +140,9 @@ struct FlowSamplerSpec {
   // steps+1)[:-1]). The reference inference script passes 0.0 for editing and
   // 0.001 for text-to-image.
   double        conditioning_sigma = 0.0;
+  // unipc only: the multistep solver order, and the B(h) variant.
+  int           order      = 2;
+  bool          solver_bh2 = true;
 
   FlexData to_flex() const;   // {sampler, method, eta, s_noise, seed, +dmd}
   static FlowSamplerSpec from_flex(const FlexData& fd, std::string* err = nullptr);
@@ -122,7 +153,8 @@ struct FlowSamplerSpec {
   bool operator==(const FlowSamplerSpec& o) const noexcept
   {
     return method == o.method && eta == o.eta && s_noise == o.s_noise &&
-           seed == o.seed && conditioning_sigma == o.conditioning_sigma;
+           seed == o.seed && conditioning_sigma == o.conditioning_sigma &&
+           order == o.order && solver_bh2 == o.solver_bh2;
   }
 };
 
@@ -164,11 +196,31 @@ private:
   FlowSchedulerSpec   _scheduler;
   std::vector<double> _sigmas;
 
+  // The UniPC predictor and corrector share everything but which sigma
+  // pair they sit between and where the extra D1 term comes from, so both
+  // go through one routine. `rks`/`d1s` are the multistep history's
+  // relative step ratios and x0 differences; `corrector` switches to the
+  // (step_index-1, step_index) interval and folds in `d1_t`.
+  void unipc_update_(std::vector<float>& out, const std::vector<float>& x,
+                     const std::vector<float>& m0, double sigma_from,
+                     double sigma_to, int order, bool corrector,
+                     const std::vector<float>* d1_t) const;
+
   // per-run state.
   std::vector<float> _old_denoised;   // dpmpp_2m multistep history
   double             _t_prev = 0.0;   // dpmpp_2m previous -log(sigma)
   bool               _have_prev = false;
   std::uint64_t      _rng = 0;        // dpmpp_sde xorshift state
+
+  // ---- UniPC multistep state -----------------------------------------
+  // The last `order` x0 predictions (newest last) and the sigmas they were
+  // taken at, plus the sample the previous step STARTED from -- the
+  // corrector re-derives that step's landing point, so it needs both.
+  std::vector<std::vector<float>> _uni_m;
+  std::vector<double>             _uni_sigma;
+  std::vector<float>              _uni_last_sample;
+  bool                            _uni_have_last = false;
+  int                             _uni_order     = 0;   // warmed-up order
 };
 
 }  // namespace genai

@@ -146,10 +146,10 @@ private:
 // One accept loop; each connection is read, dispatched, answered, and
 // closed (Connection: close, no keep-alive). Routes are matched by
 // method + path-segment pattern with ':name' captures. Any unmatched
-// GET/HEAD falls back to the doc_root: an existing file is served
-// verbatim, otherwise index.html is returned so the single-page app
-// can own client-side routing. Every response carries permissive CORS
-// headers and OPTIONS is answered with a preflight 204.
+// GET/HEAD falls back to the assets embedded in the binary: a matching
+// one is served verbatim, otherwise index.html is returned so the
+// single-page app can own client-side routing. Every response carries
+// permissive CORS headers and OPTIONS is answered with a preflight 204.
 //
 // This is intentionally self-contained (not a SessionMember) so the
 // app's HTTP layer stays decoupled from the vpipe session; it logs to
@@ -170,7 +170,7 @@ public:
   // messages through the WebSocket until the peer disconnects.
   using WsHandler = std::function<void(const HttpRequest&, WebSocket&)>;
 
-  HttpServer(std::string bind_address, int port, std::string doc_root);
+  HttpServer(std::string bind_address, int port);
   ~HttpServer();
 
   HttpServer(const HttpServer&)            = delete;
@@ -269,7 +269,6 @@ private:
   std::string        _bind_address;
   int                _port;
   int                _bound_port = 0;
-  std::string        _doc_root;
   std::string        _auth_key;
   std::string        _qr_key;
   // Non-null when HTTPS is enabled (enable_tls). Guarded so a build

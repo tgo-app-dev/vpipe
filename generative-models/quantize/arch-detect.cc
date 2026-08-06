@@ -276,7 +276,7 @@ detect_quant_arch(const SessionContextIntf* session, const std::string& src_dir)
                           model_type.rfind("qwen3_vl", 0) == 0)) {
     // Qwen3-VL text encoder: the LANGUAGE side is a plain dense Qwen3 decoder
     // (standard RMSNorm, full attention, `language_model.` prefix, no "model."
-    // segment) -- the same backbone the text-to-image stage runs. Build the
+    // segment) -- the same backbone the generate-image stage runs. Build the
     // calibration config directly from the probed text_config dims (config_from
     // doesn't know the qwen3_vl wrapper). backbone_only ignores the vision
     // tower, so a plain text corpus exercises exactly the encoded path.

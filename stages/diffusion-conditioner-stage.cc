@@ -90,7 +90,7 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "conditioning",
-   .doc = "conditioning tensor for the text-to-image DiT (family-shaped + typed: "
+   .doc = "conditioning tensor for the generate-image DiT (family-shaped + typed: "
           "krea2 f16 [n,12,2560]; flux2 f16 [n,3*enc_hidden]; qwen-image-edit "
           "bf16 [n_real,3584] image-aware; mage-flow bf16 [n_real,2560] "
           "image-aware)",
@@ -105,7 +105,7 @@ const StageSpec kSpec = {
   .doc       = "Prompt (+ optional reference image) -> conditioning embeddings "
                "for a diffusion DiT. Owns the tokenizer + text encoder + (for "
                "image-aware models) the Qwen2.5-VL vision tower. The encoder "
-               "half of the text-to-image split; pair it with a text-to-image "
+               "half of the generate-image split; pair it with a generate-image "
                "stage on the same hf_dir. On the Mage-Flow families every "
                "prompt (and, for an edit, the source image) is first screened "
                "by the model's own content-policy classifier -- mandatory, no "
@@ -293,7 +293,7 @@ void cap_longest_side_(const std::uint8_t* rgb, int H, int W, int cap,
   *oh = nh; *ow = nw;
 }
 
-// ---- Prompt templates (shared with the text-to-image stage) ----
+// ---- Prompt templates (shared with the generate-image stage) ----
 constexpr const char* kPrefix =
     "<|im_start|>system\nDescribe the image by detailing the color, shape, "
     "size, texture, quantity, text, spatial relationships of the objects and "
@@ -609,6 +609,11 @@ std::string family_(const std::string& transformer_dir)
         // path turns on when a reference image is wired, exactly as Mage-Flow
         // switches templates.
         if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
+        // Wan video. Its tower is a umT5-XXL ENCODER rather than a
+        // decoder-only LM, so this must be named explicitly -- falling
+        // through to the "krea2" default would try to load a Qwen3-VL out
+        // of a T5 checkpoint and fail late and confusingly.
+        if (cls == "WanTransformer3DModel") { return "wan"; }
       }
     }
   }
@@ -674,6 +679,31 @@ Job DiffusionConditionerStage::process(RuntimeContext&) { co_return; }
 bool
 DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
 {
+  if (_family == "wan") {
+    genai::MetalUmt5Encoder::Config ucfg;
+    std::string uerr;
+    if (!genai::MetalUmt5Encoder::config_from_json(_enc_dir, ucfg, &uerr)) {
+      session()->error(fmt("DiffusionConditionerStage('{}'): {}",
+                           this->id(), uerr));
+      return false;
+    }
+    _enc_hidden = ucfg.d_model;
+    _enc_ws = genai::open_weight_set(_enc_dir, session());
+    if (!_enc_ws) {
+      session()->error(fmt("DiffusionConditionerStage('{}'): cannot open text "
+                           "encoder checkpoint: {}", this->id(), _enc_dir));
+      return false;
+    }
+    _umt5 = genai::MetalUmt5Encoder::load(_enc_ws, mc, ucfg);
+    if (!_umt5) {
+      session()->error(fmt("DiffusionConditionerStage('{}'): umT5 encoder load "
+                           "failed: {}", this->id(), _enc_dir));
+      return false;
+    }
+    // No separate embedding table to cache: umT5 gathers from its own
+    // `shared.weight`, which the encoder already holds.
+    return true;
+  }
   genai::MetalQwenModel::Config ecfg =
       _family == "flux2" ? encoder_config_flux2_(_enc_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
@@ -863,7 +893,8 @@ DiffusionConditionerStage::ensure_loaded_()
       this->id(), _family,
       _family == "flux2" ? "Qwen3 dense"
       : _family == "qwen-image-edit" ? "Qwen2.5-VL"
-      : _family == "boogu-image" ? "Qwen3-VL (mllm)" : "Qwen3-VL",
+      : _family == "boogu-image" ? "Qwen3-VL (mllm)"
+      : _family == "wan" ? "umT5-XXL" : "Qwen3-VL",
       _enc_hidden));
 
   // The component dirs the idle-unload decision sizes against. The
@@ -922,10 +953,12 @@ DiffusionConditionerStage::resolve_unload_policy_()
 void
 DiffusionConditionerStage::unload_encoder_()
 {
-  if (!_encoder) { return; }
-  // Everything weight-sized: the LM, either vision tower, and the embedding
-  // table. The tokenizer stays (kilobytes, and it is pure CPU state).
+  if (!_encoder && !_umt5) { return; }
+  // Everything weight-sized: the LM (or the wan family's umT5 tower),
+  // either vision tower, and the embedding table. The tokenizer stays
+  // (kilobytes, and it is pure CPU state).
   _encoder.reset();
+  _umt5.reset();
   _vision.reset();
   _vision3.reset();
   _embed = metal_compute::SharedBuffer{};
@@ -960,7 +993,7 @@ static bool
 single_tap_(const std::string& family)
 {
   return family == "qwen-image-edit" || family == "mage-flow" ||
-         family == "boogu-image";
+         family == "boogu-image" || family == "wan";
 }
 
 SharedBuffer
@@ -1204,6 +1237,46 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
 {
   auto* mc = session()->services()->metal_compute();
   const int EH = _enc_hidden;
+  (void)mc;
+
+  if (_family == "wan") {
+    // Wan tokenizes to a FIXED 512-token window and pads with the T5 pad
+    // token, and the encoder zeroes every row past the real tokens -- so
+    // what the DiT cross-attends to beyond the prompt is zero, not the
+    // encoder's opinion of padding. That zero tail is part of the
+    // conditioning contract (see MetalUmt5Encoder::encode), which is why
+    // the full 512 rows are emitted rather than only the real ones.
+    if (!_umt5) { return {}; }
+    // The reference cleans the prompt before tokenizing (diffusers
+    // WanPipeline.prompt_clean, and transformers' own T5 preprocessing
+    // does the same): every whitespace run collapses to one space and
+    // the ends are stripped. Not cosmetic -- a trailing space becomes a
+    // real extra token and a tab or newline becomes UNKNOWN, since the
+    // metaspace substitution only knows about ' '.
+    auto ids = _tokenizer->encode(genai::Tokenizer::whitespace_clean(text));
+    const std::int32_t eos = _tokenizer->special_token_id("</s>");
+    if (eos >= 0) { ids.push_back(eos); }
+    const int kWanMaxSeq = 512;
+    if ((int)ids.size() > kWanMaxSeq) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): {} prompt is {} tokens; Wan's "
+          "text window is {} -- truncating", this->id(), which, ids.size(),
+          kWanMaxSeq));
+      ids.resize((std::size_t)kWanMaxSeq);
+    }
+    const int n_real = (int)ids.size();
+    std::int32_t pad = _tokenizer->special_token_id("<pad>");
+    if (pad < 0) { pad = 0; }
+    ids.resize((std::size_t)kWanMaxSeq, pad);
+    n_real_out = kWanMaxSeq;
+    std::string eerr;
+    SharedBuffer h = _umt5->encode(ids, n_real, &eerr);
+    if (h.empty()) {
+      session()->warn(fmt("DiffusionConditionerStage('{}'): umT5 {} encode: {}",
+                          this->id(), which, eerr));
+    }
+    return h;
+  }
 
   if (_family == "flux2") {
     const int JD = 3 * EH;
@@ -1877,8 +1950,22 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // A previous prompt may have dropped the encoder to leave the DiT room; bring
   // it back before anything needs it. Done before the "loaded?" gate so an
   // unloaded stage is not mistaken for an inert one.
-  if (_unloaded && !_encoder) { reload_encoder_(); }
-  if (!_encoder) { co_return; }   // no model loaded -> inert
+  //
+  // The wan family's tower is _umt5, not _encoder (a umT5 ENCODER rather
+  // than a decoder-only LM), so both members have to be consulted --
+  // testing only _encoder made a loaded wan conditioner look inert.
+  const bool have_enc = _encoder != nullptr || _umt5 != nullptr;
+  if (_unloaded && !have_enc) { reload_encoder_(); }
+  if (_encoder == nullptr && _umt5 == nullptr) {
+    // Inert: consume the prompt rather than returning immediately. A
+    // process() that neither blocks nor signals done is re-invoked at
+    // once, and the stage then spins a core for the life of the pipeline
+    // doing nothing but building and tearing down its own coroutine
+    // frame -- which is what this looked like when the gate was wrong.
+    auto drop = co_await ctx.read(0);
+    if (!drop) { ctx.signal_done(); }
+    co_return;
+  }
 
   // Latch the negative prompt (iport1) + reference image (iport3) once.
   if (!_negative_latched && (int)ctx.num_iports() > 1 &&
@@ -1990,7 +2077,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     co_return;
   }
   // Emit the negative conditioning (oport1) BEFORE the positive (oport0): the
-  // text-to-image stage blocks on iport0, so enqueuing the negative first
+  // generate-image stage blocks on iport0, so enqueuing the negative first
   // guarantees its paired beat is already in iport1's FIFO when the positive
   // arrives (a race-free backlog poll on the consumer side).
   // Emit the negative conditioning (oport1) for the DiT's CFG. Normally only

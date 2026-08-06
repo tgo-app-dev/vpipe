@@ -97,6 +97,12 @@ export function openModal({ title, body, actions = [], className = '' }) {
 // is a list of { label, danger?, onClick }; a null entry renders a
 // divider. The menu closes on selection, click-away, Escape, scroll or
 // resize, and is clamped to stay on-screen. Returns a close fn.
+//
+// An item may also carry a SHIFT variant -- { altLabel, onAlt } -- for a
+// second, related action that would otherwise need a second menu entry.
+// While the menu is open and Shift is held, such an item shows altLabel
+// and invokes onAlt. It is marked with a ⇧ badge whether or not Shift is
+// down, because a modifier nobody can see is a modifier nobody finds.
 export function openMenu(x, y, items) {
   const root = document.getElementById('modal-root') || document.body;
   const menu = el('div', { class: 'ctx-menu' });
@@ -104,19 +110,40 @@ export function openMenu(x, y, items) {
     menu.remove();
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('pointerdown', onAway, true);
+    document.removeEventListener('keyup', onMod, true);
+    document.removeEventListener('pointermove', onMod, true);
     window.removeEventListener('resize', close);
     window.removeEventListener('scroll', close, true);
   };
   const onKey = (e) => {
     if (e.key === 'Escape') { e.preventDefault(); close(); }
+    onMod(e);
   };
   const onAway = (e) => { if (!menu.contains(e.target)) { close(); } };
+  // Every listener here carries `shiftKey`, so the label tracks the key
+  // whether the user presses it, releases it, or was already holding it
+  // when the pointer first moved over the menu.
+  const alts = [];
+  const onMod = (e) => {
+    for (const a of alts) {
+      a.text.textContent = e.shiftKey ? a.it.altLabel : a.it.label;
+    }
+  };
   for (const it of items) {
     if (!it) { menu.append(el('div', { class: 'ctx-sep' })); continue; }
-    menu.append(el('button', {
+    const hasAlt = typeof it.onAlt === 'function' && it.altLabel;
+    const text = el('span', { class: 'ctx-item-text' }, it.label);
+    const btn = el('button', {
       class: 'ctx-item' + (it.danger ? ' danger' : ''),
-      onclick: () => { close(); it.onClick(); },
-    }, it.label));
+      // Read the modifier off the CLICK, not off the last key event: that
+      // is the state the user acted on, and it is what the label showed.
+      onclick: (e) => {
+        close();
+        if (hasAlt && e.shiftKey) { it.onAlt(); } else { it.onClick(); }
+      },
+    }, text, hasAlt ? el('span', { class: 'ctx-item-mod' }, '⇧') : null);
+    if (hasAlt) { alts.push({ it, text }); }
+    menu.append(btn);
   }
   root.append(menu);
   const r = menu.getBoundingClientRect();
@@ -127,6 +154,10 @@ export function openMenu(x, y, items) {
   document.addEventListener('keydown', onKey, true);
   // Defer the away-listener a tick so the opening click doesn't close it.
   setTimeout(() => document.addEventListener('pointerdown', onAway, true), 0);
+  if (alts.length) {
+    document.addEventListener('keyup', onMod, true);
+    document.addEventListener('pointermove', onMod, true);
+  }
   window.addEventListener('resize', close);
   window.addEventListener('scroll', close, true);
   return close;

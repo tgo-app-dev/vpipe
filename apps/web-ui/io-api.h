@@ -20,6 +20,7 @@ public:
 
 private:
   HttpResponse h_console_(const HttpRequest&);
+  HttpResponse h_progress_(const HttpRequest&);
   HttpResponse h_pending_(const HttpRequest&);
   HttpResponse h_input_(const HttpRequest&);
   HttpResponse h_clear_(const HttpRequest&);

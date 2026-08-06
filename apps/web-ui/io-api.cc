@@ -56,6 +56,38 @@ IoApi::h_console_(const HttpRequest& req)
   return HttpResponse::json(200, o.to_json());
 }
 
+// Every live progress report. Reads the registry on UiDelegateIntf
+// directly -- progress is delegate-agnostic state, so WebUiDelegate has
+// nothing to implement here; only the RENDERING is web-specific.
+//
+// `version` lets the client skip a re-render when nothing moved, the
+// same trick the console footer uses to avoid repainting at 10 Hz
+// against work that ticks once a second.
+HttpResponse
+IoApi::h_progress_(const HttpRequest&)
+{
+  if (!_ctx.ui) { return HttpResponse::error(404, "user I/O not available"); }
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("version", FlexData::make_uint(_ctx.ui->progress_version()));
+  FlexData arr = FlexData::make_array();
+  auto a = arr.as_array();
+  for (const auto& it : _ctx.ui->progress_snapshot()) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("id", FlexData::make_uint(it.id));
+    eo.insert("desc", fstr(it.desc));
+    eo.insert("done", FlexData::make_uint(it.done));
+    // 0 total means INDETERMINATE; the client draws motion, not a fill.
+    eo.insert("total", FlexData::make_uint(it.total));
+    eo.insert("detail", fstr(it.detail));
+    eo.insert("seq", FlexData::make_uint(it.seq));
+    a.push_back(std::move(e));
+  }
+  oo.insert("items", std::move(arr));
+  return HttpResponse::json(200, o.to_json());
+}
+
 HttpResponse
 IoApi::h_pending_(const HttpRequest&)
 {
@@ -170,6 +202,8 @@ IoApi::register_routes(HttpServer& s)
   if (!_ctx.ui) { return; }
   s.route("GET", "/api/io/console",
           [this](const HttpRequest& r) { return h_console_(r); });
+  s.route("GET", "/api/io/progress",
+          [this](const HttpRequest& r) { return h_progress_(r); });
   s.route("GET", "/api/io/pending",
           [this](const HttpRequest& r) { return h_pending_(r); });
   s.route("POST", "/api/io/input",

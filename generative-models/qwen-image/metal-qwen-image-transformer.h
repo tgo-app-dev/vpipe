@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
+#include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -117,6 +118,13 @@ class MetalQwenImageTransformer {
   // forward() returns an empty buffer when it fires. No effect when preloaded.
   void set_stream_stop(std::function<bool()> stop) {
     _stream_stop = std::move(stop);
+  }
+
+  // Per-block progress (see DitBlockProgressFn): fired as each transformer
+  // block is entered, so a caller can show movement INSIDE one denoise
+  // step -- which at high resolution is seconds of otherwise-silent work.
+  void set_block_progress(DitBlockProgressFn fn) {
+    _block_progress = std::move(fn);
   }
 
   // Leading blocks pinned resident in streaming mode (0 = pure streaming, or
@@ -250,6 +258,7 @@ class MetalQwenImageTransformer {
   // business rather than a private mmap this class kept to itself.
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;
+  DitBlockProgressFn    _block_progress;
 
   // One contiguous image-token segment for the RoPE build (frame band + grid).
   struct ImgSeg { int frame, grid_h, grid_w, seq; };

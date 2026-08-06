@@ -111,6 +111,19 @@ public:
   std::int32_t
   special_token_id(std::string_view name) const;
 
+  // Collapse every run of whitespace to one space and strip the ends.
+  //
+  // This is NOT part of any tokenizer.json -- it is the preprocessing
+  // the T5 family's callers apply before tokenizing, and both
+  // transformers' T5Tokenizer and diffusers' WanPipeline.prompt_clean do
+  // it. Skipping it is not cosmetic: a trailing space becomes a real
+  // extra token, and a tab or newline becomes UNKNOWN (the metaspace
+  // substitution only knows about ' '), so the model is conditioned on a
+  // prompt with a hole in it. Exposed here rather than hidden inside
+  // encode() because it is a caller's convention, not the model's --
+  // a tokenizer must still reproduce its own tokenizer.json exactly.
+  static std::string whitespace_clean(std::string_view text);
+
   // Vocab size including special tokens. The id space is dense in
   // [0, vocab_size()).
   std::int32_t vocab_size() const noexcept;

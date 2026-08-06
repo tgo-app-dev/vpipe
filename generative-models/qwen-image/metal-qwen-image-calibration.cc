@@ -78,26 +78,6 @@ std::size_t weights_bytes_(const std::filesystem::path& dir)
   return total;
 }
 
-// In-place throttled progress bar (mirrors the Krea-2 collector / the
-// model-quantizer's quant_progress_): redraw on a carriage-return only when the
-// integer percentage changes, so long calibrations don't flood the log.
-void calib_progress_(UiTextStream* bar, const char* tag, int done, int total,
-                     int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = (int)((long)done * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b((std::size_t)fill, '#');
-  b += std::string((std::size_t)(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done, total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
-
 // Qwen2.5-VL text backbone config (the M3/M7 encoder).
 MetalQwenModel::Config encoder_config_()
 {
@@ -181,9 +161,10 @@ collect_qwen_image_calibration(
   if (!tok) { return fail("qie-calib: tokenizer load failed: " + tok_path); }
 
   auto* sess = mc->session();
-  std::unique_ptr<UiTextStream> bar =
-      sess ? sess->open_text_stream() : std::unique_ptr<UiTextStream>();
-  int pct = -1;
+  // One report for the whole pass; "encode" and "denoise" ride as the
+  // detail text so both phases reuse the same row.
+  UiProgress bar;
+  if (sess) { bar = sess->open_progress("calibrate"); }
   if (sess) {
     sess->log_debug(fmt(
         "qie-calib: {} prompts x {} steps @ {}x{} (img_seq {}, seed {}) -> {}",
@@ -212,8 +193,7 @@ collect_qwen_image_calibration(
     for (std::size_t pi = 0; pi < prompts.size(); ++pi) {
       const std::string& prompt = prompts[pi];
       if (stop()) { return fail("qie-calib: stopped"); }
-      calib_progress_(bar.get(), "encode", (int)pi + 1, (int)prompts.size(),
-                      pct);
+      bar.update((std::uint64_t)pi + 1, prompts.size(), "encode");
       const std::vector<std::int32_t> ids =
           encode_specials_(*tok, std::string(kPrefix) + prompt + kSuffix);
       if ((int)ids.size() <= kDrop) {
@@ -362,11 +342,10 @@ collect_qwen_image_calibration(
 
   dit->calib_begin();
   SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
-  pct = -1;
   const int total_fwd = (int)txt_cache.size() * S;
   for (std::size_t e = 0; e < txt_cache.size(); ++e) {
     if (stop()) {
-      if (bar) { bar->end(); }
+      bar.finish();
       dit->calib_end();
       return fail("qie-calib: stopped");
     }
@@ -401,7 +380,7 @@ collect_qwen_image_calibration(
                                       nreal_cache[e], gh, gw, (float)sig[i],
                                       refs);
       if (vel.empty()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         dit->calib_end();
         // forward() returns empty when it bailed on the per-block stop hook.
         return fail(stop() ? "qie-calib: stopped" : "qie-calib: DiT step");
@@ -411,7 +390,8 @@ collect_qwen_image_calibration(
       for (std::size_t k = 0; k < packed.size(); ++k) {
         packed[k] += (float)dt * bf16_to_f32_(vp[k]);
       }
-      calib_progress_(bar.get(), "denoise", (int)e * S + i + 1, total_fwd, pct);
+      bar.update((std::uint64_t)e * S + i + 1,
+                 (std::uint64_t)total_fwd, "denoise");
       if (sess) {
         sess->log_debug(fmt("qie-calib:   step {}/{} sigma {}", i + 1, S,
                             (float)sig[(std::size_t)i]));
@@ -427,7 +407,7 @@ collect_qwen_image_calibration(
       ref_ready = true;
     }
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   const auto stats = dit->calib_stats();
   dit->calib_end();
   if (sess) {

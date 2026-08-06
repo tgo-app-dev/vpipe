@@ -136,6 +136,9 @@ dit_class_family_(const std::string& class_name)
   // config (see metal-mage-flow-transformer.h), so it shares that leaf set.
   if (class_name == "MageFlow") { return "mage-flow"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
+  // Wan video. Its two A14B experts are separate checkpoints, so each is
+  // quantized by pointing src_model at that expert's own directory.
+  if (class_name == "WanTransformer3DModel") { return "wan"; }
   return {};
 }
 
@@ -210,39 +213,6 @@ t2i_target_subdir_(const std::string& target)
   }
   if (target == "vae") { return "vae"; }
   return {};
-}
-
-// Recursively materialise `src` at `dst`, hard-linking regular files when the
-// two live on one filesystem (instant, no extra space -- the copies are
-// read-only) and falling back to a byte copy across devices. Used to assemble
-// a self-contained Krea-2 / FLUX.2 / Qwen-Image-Edit output from the un-
-// quantized (or already-quantized) components this pass does not touch.
-//
-// Polls `stop` before every file/subdir so a pipeline stop is honored PER FILE
-// (not just between top-level components): assembling a self-contained output
-// copies the sibling sub-models, and on a cross-device dst that is a real byte
-// copy of large shards (e.g. the ~20 GB w4 DiT when quantizing the text encoder
-// on top). Returns false as soon as the stop fires (a partial `dst` is left for
-// the caller to discard), true on completion.
-// Throttled in-place progress bar, matching the quantizer's own and the
-// lora-fuse one (same width + shape, so the two phases of a run read as one).
-void
-mq_progress_(UiTextStream* bar, const char* phase, std::size_t done,
-             std::size_t total, int& last_pct)
-{
-  if (bar == nullptr || total == 0) { return; }
-  int pct = (int)(done * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b((std::size_t)fill, '#');
-  b += std::string((std::size_t)(W - fill), '-');
-  std::string line =
-      fmt("\r[{}] {}% {} ({}/{})", b, pct, phase, done, total)();
-  while (line.size() < 52) { line += ' '; }
-  bar->write(line);
 }
 
 // Regular files under `p` (recursive) -- the denominator for the copy bar.
@@ -388,6 +358,24 @@ dit_quant_linears_(const std::string& family)
     return {"to_q", "to_k", "to_v", "0",
             "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
             "proj", "2"};
+  }
+  if (family == "wan") {
+    // Wan's single-stream block: self-attention, cross-attention into the
+    // text, and an UNGATED feed-forward. Leaves are matched on the last
+    // dot-component, so attn{1,2}.to_out.0 -> "0", ffn.net.0.proj ->
+    // "proj", ffn.net.2 -> "2". That is 6 Linears per block x 40 blocks x
+    // 2 experts, and it is all of the weight: everything left bf16 here
+    // is small AND precision-sensitive --
+    //   patch_embedding   every pixel of the latent enters through it, and
+    //                     at K = 144 it is barely two groups per row;
+    //   proj_out          every velocity value leaves through its 64 rows;
+    //   condition_embedder  the timestep and text projections, which feed
+    //                     the modulation of all 40 blocks;
+    //   scale_shift_table the modulation itself.
+    // None of their leaves ("patch_embedding", "proj_out", "linear_1",
+    // "linear_2", "time_proj") is in this set, so no exclude list is
+    // needed -- unlike Boogu, this family has no leaf collisions.
+    return {"to_q", "to_k", "to_v", "0", "proj", "2"};
   }
   if (family == "boogu-image") {
     // Boogu's NextDiT. Every block kind contributes: the refiners + single
@@ -570,7 +558,7 @@ const StageSpec kSpec = {
                "modules pass through. For a Krea-2 (text-to-image) model, "
                "`target` selects the component (dit | text_encoder | vae) and "
                "the output is a SELF-CONTAINED pipeline (all components copied, "
-               "the target quantized) usable directly as a text-to-image "
+               "the target quantized) usable directly as a generate-image "
                "hf_dir -- chain passes to quantize more than one component. "
                "Optional trigger in / summary out.",
   .display_name = "Model Quantize",
@@ -682,7 +670,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
       return quantize_t2i_pipeline_(src_dir, t2i_family, out_dir, stop);
     }
     // src is a bare transformer dir -> transformer-only output for the
-    // text-to-image `dit_dir` override (registered "<family>-dit"). Only the
+    // generate-image `dit_dir` override (registered "<family>-dit"). Only the
     // DiT is present, so `target` other than dit doesn't apply.
     if (!_target.empty() && t2i_target_subdir_(_target) != "transformer") {
       session()->warn(fmt(
@@ -701,7 +689,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
         "ModelQuantizeStage('{}'): quantized {} DiT '{}' -> '{}' ({}-bit "
         "g{}{}{})", this->id(), t2i_family, src_dir, out_dir, _bits,
         _group_size, _mixed ? " mixed" : "", _awq ? " awq-clip" : ""));
-    // "<family>-dit" (transformer-only) -> the text-to-image dit_dir slot.
+    // "<family>-dit" (transformer-only) -> the generate-image dit_dir slot.
     if (!explicit_path) {
       register_output_(_output_name, out_dir, t2i_family + "-dit", _bits);
     }
@@ -973,7 +961,8 @@ ModelQuantizeStage::quantize_dit_component_(
     }
   }
   opt.quant_linears    = dit_quant_linears_(family);
-  if (_quant_modulation && (is_qie || is_boogu)) {
+  const bool is_wan = (family == "wan");
+  if (_quant_modulation && (is_qie || is_boogu || is_wan)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
     // rides on. This is the opt-in that quantizes them anyway, for a box that
@@ -985,7 +974,11 @@ ModelQuantizeStage::quantize_dit_component_(
     // On Boogu that leaf is EXACTLY the 76 modulation linears (32 single + 4
     // modulated refiners + 8x5 dual-stream); norm_out./time_caption_embed's
     // linear_1/linear_2 are a different leaf and stay excluded by name.
-    const char* leaf = is_boogu ? "linear" : "1";
+    //   Wan: the 6-way modulation comes out of
+    //     condition_embedder.time_proj      -> leaf "time_proj"
+    //   (scale_shift_table is 3-D and never quantized at all, and the
+    //   per-block modulation is that table plus this projection's output).
+    const char* leaf = is_boogu ? "linear" : is_wan ? "time_proj" : "1";
     opt.quant_linears.push_back(leaf);
     // The modulation carries large-magnitude scale/gate values (on QIE they
     // drive the ~1e7 residual), so 4-bit wrecks it (block-0 rel-L2 ~0.75) while
@@ -997,7 +990,8 @@ ModelQuantizeStage::quantize_dit_component_(
     session()->info(fmt(
         "ModelQuantizeStage('{}'): quantizing the AdaLN modulation ({}) at "
         "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
-        is_boogu ? "norm*.linear" : "*_mod.1", _bits));
+        is_boogu ? "norm*.linear" : is_wan ? "condition_embedder.time_proj"
+                                            : "*_mod.1", _bits));
   }
   if (is_boogu) {
     // Keep the precision-sensitive heads out despite their shared leaf names
@@ -1127,7 +1121,7 @@ ModelQuantizeStage::quantize_text_encoder_(
   // The text encoder is a dense Qwen3-VL backbone under the language_model.
   // prefix (q/k/v/o_proj, gate/up/down_proj) -- the default linear set matches
   // it prefix-agnostically. CRITICAL: keep embed_tokens bf16 (quant_embeddings
-  // off) -- the text-to-image stage host-gathers it as a plain table.
+  // off) -- the generate-image stage host-gathers it as a plain table.
   const genai::QuantArchInfo meta =
       genai::detect_quant_arch(session(), enc_dir);
   genai::QuantizeOptions opt;
@@ -1343,14 +1337,26 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
     return true;
   }
 
+  // Wan 2.2's A14B is TWO experts -- transformer/ (high noise) and
+  // transformer_2/ (low noise) -- and both are the same DiT class. They are
+  // one MODEL, so quantizing them in one pass is the only thing that makes
+  // sense: quantizing half of a pair would produce a pipeline that silently
+  // changes precision partway down the sigma schedule.
+  std::string expert2;
+  if (family == "wan" && tgt == "transformer" &&
+      fs::exists(fs::path(root) / "transformer_2" / "config.json", ec)) {
+    expert2 = "transformer_2";
+  }
+
   session()->info(fmt(
-      "ModelQuantizeStage('{}'): {} pipeline '{}' -> '{}' (quantizing {}, "
-      "copying the other components)", this->id(), family, root, out_dir, tgt));
+      "ModelQuantizeStage('{}'): {} pipeline '{}' -> '{}' (quantizing {}{}, "
+      "copying the other components)", this->id(), family, root, out_dir, tgt,
+      expert2.empty() ? std::string() : " + " + expert2));
 
   // 1. Assemble the self-contained output: hard-link/copy every component
   //    except the target (quantized next), so the result carries all of
   //    tokenizer/scheduler/model_index.json + the other (un- or already-
-  //    quantized) sub-models -- usable directly as a text-to-image hf_dir.
+  //    quantized) sub-models -- usable directly as a generate-image hf_dir.
   fs::create_directories(out_dir, ec);
   {
     // Progress over FILES, not components: on a cross-device destination this
@@ -1360,30 +1366,30 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
     std::vector<fs::path> comps;
     std::size_t total = 0;
     for (const auto& e : fs::directory_iterator(root, ec)) {
-      if (e.path().filename().string() == tgt) { continue; }
+      const std::string leaf = e.path().filename().string();
+      if (leaf == tgt) { continue; }
+      // Wan A14B's second expert is a DiT too, and it is quantized in this
+      // same pass (below) -- so skip it here rather than copying 53 GB of
+      // fp32 only to overwrite it.
+      if (!expert2.empty() && leaf == "transformer_2") { continue; }
       comps.push_back(e.path());
       total += count_files_(e.path());
     }
-    std::unique_ptr<UiTextStream> bar = session()->open_text_stream();
-    int pct = -1;
+    UiProgress bar = session()->open_progress("copy components");
     std::size_t done = 0;
-    mq_progress_(bar.get(), "copy", 0, total, pct);
     for (const auto& c : comps) {
       if (!link_or_copy_tree_(c, fs::path(out_dir) / c.filename(), ec, stop,
                               [&] {
                                 ++done;
-                                mq_progress_(bar.get(), "copy", done, total,
-                                             pct);
+                                bar.update(done, total);
                               })) {
-        bar->end();
         session()->info(fmt(
             "ModelQuantizeStage('{}'): stopped while assembling '{}'",
             this->id(), out_dir));
         return false;
       }
     }
-    mq_progress_(bar.get(), "copy", total, total, pct);
-    bar->end();
+    bar.finish();
   }
   session()->log_debug(fmt(
       "ModelQuantizeStage('{}'): copied {} components (all but {}) into '{}'",
@@ -1394,6 +1400,14 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
   bool ok = false;
   if (tgt == "transformer") {
     ok = quantize_dit_component_(tgt_src.string(), tgt_out, family, root, stop);
+    if (ok && !expert2.empty()) {
+      session()->info(fmt(
+          "ModelQuantizeStage('{}'): quantizing the second expert ({})",
+          this->id(), expert2));
+      ok = quantize_dit_component_((fs::path(root) / expert2).string(),
+                                   (fs::path(out_dir) / expert2).string(),
+                                   family, root, stop);
+    }
   } else if (tgt == "text_encoder" || tgt == "mllm") {
     ok = quantize_text_encoder_(tgt_src.string(), tgt_out, root, stop);
   }

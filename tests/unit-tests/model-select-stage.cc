@@ -1,7 +1,7 @@
 // ModelSelectStage + apply_model_select_beat() tests (CPU-only).
 //
 // The model-select source emits one { hf_dir } FlexData beat that
-// the diffusion-conditioner / text-to-image / vae-encode / vae-decode stages
+// the diffusion-conditioner / generate-image / vae-encode / vae-decode stages
 // latch on their `model` iport to share a single model choice (overriding each
 // stage's hf_dir config). These tests cover the source's beat shape + one-shot
 // emission (incl. fan-out to several consumers) and the shared beat parser.
@@ -227,7 +227,7 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
     return "<no hf_dir key>";
   };
   const char* names[] = {"model-select", "diffusion-conditioner",
-                         "text-to-image", "vae-encode", "vae-decode"};
+                         "generate-image", "vae-encode", "vae-decode"};
   const StageRegistry& reg = StageRegistry::get();
   const StageSpec* specs[5] = {};
   for (int i = 0; i < 5; ++i) {

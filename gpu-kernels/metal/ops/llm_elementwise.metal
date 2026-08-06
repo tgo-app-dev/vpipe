@@ -806,7 +806,8 @@ kernel void im2col_hwc_3x3_f16(
     constant int&      H   [[buffer(2)]],
     constant int&      W   [[buffer(3)]],
     constant int&      C   [[buffer(4)]],
-    uint2 tpig [[thread_position_in_grid]])
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
 {
   // gid + total are ULONG (64-bit): a VAE-decode conv's flat element count
   // H*W*9*C exceeds 2^32 once the OUTPUT area passes ~1.86M px at C=256 (the top
@@ -814,12 +815,32 @@ kernel void im2col_hwc_3x3_f16(
   // signed int (>2^31 at 1024px, 1024*1024*9*256 = 2.4G) and a uint (>2^32 at 2K)
   // wrap, leaving the im2col partially written -> a tiled/gapped decode. 64-bit
   // holds it; r fits uint (H*W <= 2^32 for any real resolution).
-  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;
+  //
+  // But a 64-bit div/mod is SOFTWARE-emulated on Apple GPUs (~100+ cycles), and
+  // this kernel does three of them per thread over H*W*9*C threads -- which made
+  // the VAE's im2col run at ~3 GB/s, ~1% of the box's bandwidth and 7.7x the cost
+  // of the GEMM it feeds. Under the documented 2D grid {9*C, rows} the same
+  // indices are pure 32-bit: tpig.x IS the within-row column (< 9*C, so c/j
+  // divide a small uint) and tpig.y IS the row. Take that path when the grid
+  // says so, and keep the 64-bit flat form for the 1D dispatch shape. Both
+  // produce identical indices; only the arithmetic width differs.
+  const uint cols = (uint)(9 * C);
   const ulong total = (ulong)H * (uint)W * 9u * (uint)C;
-  if (gid >= total) { return; }
-  const uint c = (uint)(gid % (uint)C);
-  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
-  const uint r = (uint)(gid / (uint)(9 * C));
+  uint c, j, r;
+  ulong gid;
+  if (tpg.x == cols) {                       // 2D {9*C, H*W}
+    if ((uint)tpig.y >= (uint)(H * W)) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // ky*3 + kx
+    r = (uint)tpig.y;
+    gid = (ulong)tpig.y * cols + tpig.x;
+  } else {                                   // 1D flat
+    gid = (ulong)tpig.y * cols + tpig.x;
+    if (gid >= total) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 9u);
+    r = (uint)(gid / (ulong)cols);
+  }
   const int x = (int)(r % (uint)W);
   const int y = (int)(r / (uint)W);
   const int sy = y + (int)(j / 3u) - 1;
@@ -848,14 +869,28 @@ kernel void im2col_hwc_3x3_tiled_f16(
     constant int&      C       [[buffer(4)]],
     constant int&      row_off [[buffer(5)]],
     constant int&      row_cnt [[buffer(6)]],
-    uint2 tpig [[thread_position_in_grid]])
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
 {
-  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;   // tile-local
-  const ulong total = (ulong)(uint)row_cnt * 9u * (uint)C;
-  if (gid >= total) { return; }
-  const uint c = (uint)(gid % (uint)C);
-  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
-  const uint r = (uint)row_off + (uint)(gid / (uint)(9 * C));  // global out row
+  // 32-bit index math on the documented 2D grid -- see the note on
+  // im2col_hwc_3x3_f16: the 64-bit div/mod triple is software-emulated and was
+  // the VAE im2col's actual cost. tpig.x < 9*C here, so c/j divide a small uint.
+  const uint cols = (uint)(9 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {9*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // ky*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 9u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
   const int x = (int)(r % (uint)W);
   const int y = (int)(r / (uint)W);
   const int sy = y + (int)(j / 3u) - 1;
@@ -908,15 +943,27 @@ kernel void im2col_hwc_3x3_s2_f16(
     constant int&      H   [[buffer(2)]],
     constant int&      W   [[buffer(3)]],
     constant int&      C   [[buffer(4)]],
-    uint2 tpig [[thread_position_in_grid]])
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
 {
   const int OH = H / 2, OW = W / 2;
-  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;
-  const ulong total = (ulong)OH * (uint)OW * 9u * (uint)C;
-  if (gid >= total) { return; }
-  const uint c = (uint)(gid % (uint)C);
-  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
-  const uint r = (uint)(gid / (uint)(9 * C));
+  // 32-bit index math on the 2D grid -- see im2col_hwc_3x3_f16.
+  const uint cols = (uint)(9 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {9*C, OH*OW}
+    if ((uint)tpig.y >= (uint)(OH * OW)) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // ky*3 + kx
+    r = (uint)tpig.y;
+    gid = (ulong)tpig.y * cols + tpig.x;
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;
+    if (gid >= (ulong)OH * (uint)OW * 9u * (uint)C) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 9u);
+    r = (uint)(gid / (ulong)cols);
+  }
   const int ox = (int)(r % (uint)OW);
   const int oy = (int)(r / (uint)OW);
   const int iy = oy * 2 + (int)(j / 3u);    // no -1: pad is (0,1,0,1)
@@ -942,15 +989,27 @@ kernel void im2col_hwc_3x3_s2_tiled_f16(
     constant int&      C       [[buffer(4)]],
     constant int&      row_off [[buffer(5)]],
     constant int&      row_cnt [[buffer(6)]],
-    uint2 tpig [[thread_position_in_grid]])
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
 {
   const int OW = W / 2;
-  const ulong gid = (ulong)tpig.y * (uint)(9 * C) + tpig.x;   // tile-local
-  const ulong total = (ulong)(uint)row_cnt * 9u * (uint)C;
-  if (gid >= total) { return; }
-  const uint c = (uint)(gid % (uint)C);
-  const uint j = (uint)((gid / (uint)C) % 9u); // ky*3 + kx
-  const uint r = (uint)row_off + (uint)(gid / (uint)(9 * C));  // global out row
+  // 32-bit index math on the 2D grid -- see im2col_hwc_3x3_f16.
+  const uint cols = (uint)(9 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {9*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // ky*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 9u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
   const int ox = (int)(r % (uint)OW);
   const int oy = (int)(r / (uint)OW);
   const int iy = oy * 2 + (int)(j / 3u);    // no -1: pad is (0,1,0,1)
@@ -4177,5 +4236,262 @@ kernel void conv3x3_hwc_small_cout_f16(
       const float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
       out[ob + (long)t] = VPIPE_ELT(r);
     }
+  }
+}
+
+// ---- Wan VAE: causal 3D convolution ---------------------------------
+//
+// The Wan video VAE (AutoencoderKLWan) is the net the Qwen-Image VAE above
+// is the single-frame specialization of: same channel-last [H*W, C]
+// interior, same 3x3 spatial kernels, but every conv is a CAUSAL conv3d --
+// output frame t reads input frames t-2, t-1, t, with zero frames before
+// the start of the sequence.
+//
+// Rather than materialize the 3-frame window (which would mean copying the
+// two carried-over frames in front of every chunk, for every conv), the
+// three taps are bound as three SEPARATE frame views: t0/t1/t2 each point
+// at one [H*W, C] frame -- a byte offset into the activation for a tap that
+// lives in the current chunk, and into the layer's 2-frame carry for one
+// that does not. The caller therefore pays no copy at all, and the "which
+// frames exist yet" logic stays on the host where the chunking lives.
+//
+// `tap_valid` is a 3-bit mask of which taps exist: a tap before the start
+// of the sequence reads as zero. It is a mask rather than a bound zero
+// frame because that frame would have to be as large as the widest
+// activation -- ~177 MB at 720p -- to serve every layer, which is more
+// memory than the rest of the decode's working set.
+//
+// out[r, ((kt*3+ky)*3+kx)*C + c] = t{kt}[(y+ky-1)*W + (x+kx-1), c], zero
+// outside the spatial border, with r = y*W + x. A dense_gemm over
+// W[Cout, 27*C] then realizes the causal conv3d. Row-tiled like its 2D
+// twin (im2col_hwc_3x3_tiled_f16): only output rows [row_off,
+// row_off+row_cnt) are written, into a TILE-LOCAL out, so the col scratch
+// is one band rather than the full [H*W, 27*C] (three times the 2D
+// scratch, so the banding matters more here, not less).
+//   0:t0 1:t1 2:t2 (each [H*W,C]) 3:out[row_cnt,27*C]
+//   4:H 5:W 6:C 7:row_off 8:row_cnt 9:tap_valid.
+//   grid {27*C, row_cnt}.
+kernel void im2col_hwc_3x3x3_tiled_f16(
+    const device VPIPE_ELT* t0  [[buffer(0)]],
+    const device VPIPE_ELT* t1  [[buffer(1)]],
+    const device VPIPE_ELT* t2  [[buffer(2)]],
+    device VPIPE_ELT*       out [[buffer(3)]],
+    constant int&      H       [[buffer(4)]],
+    constant int&      W       [[buffer(5)]],
+    constant int&      C       [[buffer(6)]],
+    constant int&      row_off [[buffer(7)]],
+    constant int&      row_cnt [[buffer(8)]],
+    constant int&      tap_valid [[buffer(9)]],
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
+{
+  // 32-bit index math on the documented 2D grid -- see the note on
+  // im2col_hwc_3x3_f16 for why the 64-bit div/mod form is the slow path.
+  const uint cols = (uint)(27 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {27*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // (kt*3 + ky)*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 27u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
+  const uint kt = j / 9u;
+  const uint ks = j % 9u;
+  const int x = (int)(r % (uint)W);
+  const int y = (int)(r / (uint)W);
+  const int sy = y + (int)(ks / 3u) - 1;
+  const int sx = x + (int)(ks % 3u) - 1;
+  VPIPE_ELT val = (VPIPE_ELT)0;
+  if (sy >= 0 && sy < H && sx >= 0 && sx < W &&
+      (((uint)tap_valid >> kt) & 1u) != 0u) {
+    const ulong si = ((ulong)sy * W + sx) * (uint)C + c;
+    val = (kt == 0u) ? t0[si] : (kt == 1u) ? t1[si] : t2[si];
+  }
+  out[gid] = val;
+}
+
+// Channel-wise concatenation of three frame views, out[r, kt*C + c] =
+// t{kt}[r, c] over `rows` rows. Pairs with a dense_gemm over W[Cout, 3*C]
+// to realize the Wan VAE's TEMPORAL-only convolutions -- the (3,1,1)
+// `time_conv` of each upsample3d / downsample3d, which mixes three frames
+// at a single pixel and so needs no spatial halo at all. Same three-view
+// binding as im2col_hwc_3x3x3_tiled_f16 (see there), and the same reason:
+// the taps live in different buffers and copying them together would cost
+// more than the convolution. `tap_valid` masks taps before the start of
+// the sequence, as in im2col_hwc_3x3x3_tiled_f16.
+//   0:t0 1:t1 2:t2 (each [rows,C]) 3:out[rows,3*C] 4:C 5:rows 6:tap_valid.
+//   grid {3*C, rows}.
+kernel void concat3_frames_f16(
+    const device VPIPE_ELT* t0  [[buffer(0)]],
+    const device VPIPE_ELT* t1  [[buffer(1)]],
+    const device VPIPE_ELT* t2  [[buffer(2)]],
+    device VPIPE_ELT*       out [[buffer(3)]],
+    constant int&      C    [[buffer(4)]],
+    constant int&      rows [[buffer(5)]],
+    constant int&      tap_valid [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  if ((uint)tpig.y >= (uint)rows || (uint)tpig.x >= (uint)(3 * C)) { return; }
+  const uint c  = (uint)tpig.x % (uint)C;
+  const uint kt = (uint)tpig.x / (uint)C;
+  const ulong si = (ulong)tpig.y * (uint)C + c;
+  VPIPE_ELT val = (VPIPE_ELT)0;
+  if ((((uint)tap_valid >> kt) & 1u) != 0u) {
+    val = (kt == 0u) ? t0[si] : (kt == 1u) ? t1[si] : t2[si];
+  }
+  out[(ulong)tpig.y * (uint)(3 * C) + tpig.x] = val;
+}
+
+// Interleave the two halves of a doubled-channel map into twice as many
+// FRAMES: given in[t, r, 2*C] laid out as the Wan upsample3d time_conv
+// writes it (the first C channels are the even output frame, the last C
+// the odd one), produce out[2t + h, r, c] = in[t, r, h*C + c]. This is the
+// reshape-and-stack the reference does after the temporal upsample, and it
+// is the one place frame COUNT changes inside a chunk.
+//   0:in[T*rows,2*C] 1:out[2*T*rows,C] 2:C 3:rows 4:T.  grid {C, rows, 2*T}.
+kernel void wan_time_unshuffle_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      C    [[buffer(2)]],
+    constant int&      rows [[buffer(3)]],
+    constant int&      T    [[buffer(4)]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  if ((uint)tpig.x >= (uint)C || (uint)tpig.y >= (uint)rows ||
+      (uint)tpig.z >= (uint)(2 * T)) {
+    return;
+  }
+  const uint t = (uint)tpig.z / 2u;          // source frame
+  const uint h = (uint)tpig.z % 2u;          // which half
+  const ulong si = ((ulong)t * (uint)rows + tpig.y) * (uint)(2 * C)
+                   + h * (uint)C + tpig.x;
+  const ulong di = ((ulong)tpig.z * (uint)rows + tpig.y) * (uint)C + tpig.x;
+  out[di] = in[si];
+}
+
+// ---- umT5 encoder self-attention ------------------------------------
+//
+// Full bidirectional attention with T5's additive RELATIVE-POSITION bias,
+// which is why it cannot ride any of the sdpa kernels: those take no bias
+// term, and here the bias is what carries all the position information --
+// there is no rotary embedding in T5 at all.
+//
+// Two more T5 peculiarities are baked in. There is NO 1/sqrt(d) scaling of
+// the scores (T5 folds that into initialization), and the bias is looked
+// up per (head, query, key) from a bucketed distance rather than being a
+// dense table: bias[h][i][j] = rel[bucket(j - i)][h] over 32 buckets. The
+// bucket for each (i, j) is precomputed on the HOST and passed in
+// `buckets` -- both because it is loop-invariant across heads and layers,
+// and because the reference derives it through a float32 log whose
+// truncation lands on a bucket boundary often enough that reproducing it
+// exactly matters more than saving 256 KB.
+//
+// Keys at or past `n_valid` are masked out: the Wan pipeline pads the
+// prompt to a fixed 512 tokens and passes the attention mask, so the pad
+// must not participate.
+//
+// One threadgroup per (query row, head). Scores live in threadgroup
+// memory, so the sequence is capped at UMT5_MAX_L -- the host checks it.
+//   0:q 1:k 2:v (each [L, H*D]) 3:rel[32,H] 4:buckets[L*L] (uchar)
+//   5:out[L,H*D] 6:L 7:H 8:D 9:n_valid.  grid {UMT5_TG, L, H}.
+#define UMT5_TG    256
+#define UMT5_MAX_L 1024
+kernel void umt5_attn_f16(
+    const device VPIPE_ELT* q       [[buffer(0)]],
+    const device VPIPE_ELT* k       [[buffer(1)]],
+    const device VPIPE_ELT* v       [[buffer(2)]],
+    const device VPIPE_ELT* rel     [[buffer(3)]],
+    const device uchar*     buckets [[buffer(4)]],
+    device VPIPE_ELT*       out     [[buffer(5)]],
+    constant int&      L       [[buffer(6)]],
+    constant int&      H       [[buffer(7)]],
+    constant int&      D       [[buffer(8)]],
+    constant int&      n_valid [[buffer(9)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 ltid  [[thread_position_in_threadgroup]])
+{
+  const uint i = tgid.y;                 // query row
+  const uint h = tgid.z;                 // head
+  const uint t = ltid.x;
+  if ((int)i >= L || (int)h >= H || L > UMT5_MAX_L) { return; }
+
+  threadgroup float scores[UMT5_MAX_L];
+  threadgroup float red[UMT5_TG];
+  threadgroup float qv[128];             // D <= 128
+  threadgroup float part[4][64];         // pass-3 partials, D <= 64 lanes
+
+  const uint hd   = (uint)H * (uint)D;
+  const uint qoff = i * hd + h * (uint)D;
+  for (uint d = t; d < (uint)D && d < 128u; d += UMT5_TG) {
+    qv[d] = (float)q[qoff + d];
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  // 1. scores, with the relative-position bias and the pad mask.
+  float local_max = -INFINITY;
+  for (uint j = t; j < (uint)L; j += UMT5_TG) {
+    float s;
+    if ((int)j >= n_valid) {
+      s = -INFINITY;
+    } else {
+      const uint koff = j * hd + h * (uint)D;
+      float acc = 0.0f;
+      for (int d = 0; d < D; ++d) { acc += qv[d] * (float)k[koff + d]; }
+      const uint b = (uint)buckets[i * (uint)L + j];
+      s = acc + (float)rel[b * (uint)H + h];
+    }
+    scores[j] = s;
+    local_max = metal::max(local_max, s);
+  }
+  red[t] = local_max;
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (uint s = UMT5_TG / 2; s > 0; s >>= 1) {
+    if (t < s) { red[t] = metal::max(red[t], red[t + s]); }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  }
+  const float mx = red[0];
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  // 2. exponentiate + normalize (in float, as the reference softmax does).
+  float local_sum = 0.0f;
+  for (uint j = t; j < (uint)L; j += UMT5_TG) {
+    const float e = (scores[j] == -INFINITY) ? 0.0f
+                                             : metal::precise::exp(scores[j] - mx);
+    scores[j] = e;
+    local_sum += e;
+  }
+  red[t] = local_sum;
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (uint s = UMT5_TG / 2; s > 0; s >>= 1) {
+    if (t < s) { red[t] += red[t + s]; }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  }
+  const float inv = (red[0] > 0.0f) ? (1.0f / red[0]) : 0.0f;
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+  // 3. weighted sum of V. Threads split as (j-stripe, channel) so every
+  // lane works and the V reads stay contiguous across the channel axis.
+  const uint dd = t % 64u;
+  const uint jg = t / 64u;
+  if ((int)dd < D && jg < 4u) {
+    float acc = 0.0f;
+    for (uint j = jg; j < (uint)L; j += 4u) {
+      const float p = scores[j];
+      if (p != 0.0f) { acc += p * (float)v[j * hd + h * (uint)D + dd]; }
+    }
+    part[jg][dd] = acc;
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  if (t < (uint)D && t < 64u) {
+    const float r = part[0][t] + part[1][t] + part[2][t] + part[3][t];
+    out[i * hd + h * (uint)D + t] = VPIPE_ELT(r * inv);
   }
 }

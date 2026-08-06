@@ -96,6 +96,8 @@ public:
 
   std::unique_ptr<UiTextStream> open_text_stream() const override;
 
+  UiProgress open_progress(std::string desc) const override;
+
   UiInterruptToken
   register_interrupt_handler(std::string        label,
                              UiInterruptHandler fn) const override;

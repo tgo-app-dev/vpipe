@@ -1,7 +1,7 @@
-// Qwen-Image-Edit-2511 text-to-image STAGE wiring (M7) end-to-end smoke.
+// Qwen-Image-Edit-2511 generate-image STAGE wiring (M7) end-to-end smoke.
 //
-// Drives the full TextToImageStage on the "qwen-image-edit" family: SourceText
-// -> TextToImageStage -> SinkCapture. This exercises the new integration glue --
+// Drives the full GenerateImageStage on the "qwen-image-edit" family: SourceText
+// -> GenerateImageStage -> SinkCapture. This exercises the new integration glue --
 // family detection, the Qwen2.5-VL encoder load, the image-aware conditioning
 // (QwenImageEditPlus template, drop-64, sequential 1-D rope tap + host final-
 // RMSNorm), the M2 dynamic-shift sampler, the dual-stream MetalQwenImageTransformer
@@ -26,7 +26,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 
 #include <cmath>
 #include <cstdint>
@@ -160,9 +160,9 @@ TEST(qwen_image_edit_t2i, text_to_image_stage_end_to_end)
   auto* cond =
       static_cast<DiffusionConditionerStage*>(pl->insert_stage(std::move(condu)));
   ASSERT_TRUE(cond->config_error().empty());
-  auto t2iu = std::make_unique<TextToImageStage>(
+  auto t2iu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(t2iu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
   ASSERT_TRUE(t2i->config_error().empty());
 
   auto sinku = std::make_unique<SinkCapture>(

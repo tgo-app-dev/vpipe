@@ -72,16 +72,21 @@ const PANEL_TYPES = [
   { type: 'log', labelKey: 'io.session_log', icon: 'log',
     mount: (b, a) => mountLog(b, a) },
   // What a split produces: an empty pane offering the type chooser, exactly
-  // as the User I/O workspace does. `ctx.choose(type)` swaps this panel for
-  // a real one in the same slot. Hidden from the Add menu (`internal`) --
-  // an empty panel is only ever reached by splitting.
+  // as the User I/O workspace does. `ctx.choose(type, anchor)` swaps this
+  // panel for a real one in the same slot. Hidden from the Add menu
+  // (`internal`) -- an empty panel is only ever reached by splitting.
+  //
+  // needsPipeline types ARE offered here. They used to be filtered out, so
+  // a split could only ever add the whole pipeline manager and never the
+  // per-pipeline editor -- which is the panel a split is usually for. They
+  // just need one more question first, and ctx.choose asks it.
   { type: 'empty', labelKey: 'io.new_view', icon: 'plus', internal: true,
     mount: (b, a, cfg, ctx) => {
       const grid = el('div', { class: 'cmp-empty-choices' });
       for (const d of PANEL_TYPES) {
-        if (d.internal || d.needsPipeline) { continue; }
+        if (d.internal) { continue; }
         grid.append(el('button', { class: 'btn', type: 'button',
-          onclick: () => ctx.choose(d.type) },
+          onclick: (e) => ctx.choose(d.type, e.currentTarget) },
           makeIcon(d.icon, 'sm'), el('span', {}, t(d.labelKey))));
       }
       b.append(el('div', { class: 'cmp-empty-pane' },
@@ -412,7 +417,7 @@ function build() {
       registerShow: (fn) => { p.onShow = fn; },
       // An empty pane picking its view: swap this panel for the chosen type
       // in the same tree slot.
-      choose: (type) => replacePanel(p, type) };
+      choose: (type, anchor) => chooseInto(p, type, anchor) };
     try {
       p.cleanup = def.mount(body, actions, p.config, ctx) || null;
     } catch (e) {
@@ -487,21 +492,43 @@ function build() {
   // Split a DOCKED panel, putting a new empty pane beside it. `dir` names
   // the divider, as in the User I/O workspace: 'v' side by side, 'h'
   // stacked. The empty pane offers the panel-type chooser.
-  function splitPanel(p, dir) {
+  //
+  // `before` swaps the two, so THIS panel takes the right / bottom half and
+  // the new pane the left / top. Which side the existing view should end up
+  // on is a layout decision, not a property of the split, and re-dragging
+  // panels afterwards to get it is the tedious way to say it.
+  function splitPanel(p, dir, before) {
     const region = p.region;
     const d = region && state.docks[region];
     if (!d || !d.tree || !tree.findLeaf(d.tree, p)) { return; }
     const np = createPanel('empty', {}, null);
     if (!np) { return; }
-    d.tree = tree.splitAt(d.tree, p, dir, np);
+    d.tree = tree.splitAt(d.tree, p, dir, np, !!before);
     refreshModes();
     render(); persist();
   }
 
+  // An empty pane's chooser picked `type`. A type that must be told WHICH
+  // pipeline asks the same question the Add menu does, then fills the slot
+  // with the answer -- so a split and a fresh Add produce the same panel.
+  async function chooseInto(p, type, anchor) {
+    const def = typeDef(type);
+    if (!def) { return; }
+    if (!def.needsPipeline) { replacePanel(p, type); return; }
+    const list = await pipelines();
+    if (!list.length) { toast(t('composer.no_pipeline'), 'error'); return; }
+    const r = (anchor || p.el).getBoundingClientRect();
+    openMenu(r.left, r.bottom + 4, list.map((id) => ({
+      label: id,
+      onClick: () => replacePanel(p, type, { pipeline: id, split: 2 / 3 },
+                                  t(def.labelKey) + ': ' + id),
+    })));
+  }
+
   // Replace an existing panel's view in place, keeping its slot in the tree
   // -- how an empty pane becomes a real one after the chooser is used.
-  function replacePanel(p, type) {
-    const np = createPanel(type, {}, null);
+  function replacePanel(p, type, config, title) {
+    const np = createPanel(type, config || {}, title || null);
     if (!np) { return; }
     let swapped = false;
     for (const r of tree.REGIONS) {
@@ -580,10 +607,13 @@ function build() {
     // which is simply the sole occupant of the `center` region.
     if (p.mode !== 'float') {
       items.push(null);
-      items.push({ label: t('io.split_v'),
-        onClick: () => splitPanel(p, 'v') });
-      items.push({ label: t('io.split_h'),
-        onClick: () => splitPanel(p, 'h') });
+      // Shift picks which half THIS panel keeps (see splitPanel).
+      items.push({ label: t('io.split_v'), altLabel: t('io.split_v_alt'),
+        onClick: () => splitPanel(p, 'v'),
+        onAlt: () => splitPanel(p, 'v', true) });
+      items.push({ label: t('io.split_h'), altLabel: t('io.split_h_alt'),
+        onClick: () => splitPanel(p, 'h'),
+        onAlt: () => splitPanel(p, 'h', true) });
     }
     items.push(null);
     if (p.mode === 'bg') {

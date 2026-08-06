@@ -13,6 +13,7 @@
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
+#include "generative-models/wan/metal-wan-vae.h"
 #endif
 
 #include <cstdint>
@@ -24,7 +25,7 @@ namespace vpipe {
 
 // VAE encode stage: the mirror of vae-decode -- it turns an RGB image into a
 // latent. Runs the Qwen-Image VAE encoder (AutoencoderKLQwenImage) on the
-// metal-compute backend, emitting the WHITENED latent that the text-to-image
+// metal-compute backend, emitting the WHITENED latent that the generate-image
 // stage's `latent` port consumes for img2img (and that vae-decode round-trips
 // back to an image).
 //
@@ -40,7 +41,7 @@ namespace vpipe {
 //
 //   oport0  TensorBeatPayload, an f32 latent [z_dim, H/8, W/8] (channel-first,
 //           unpacked, WHITENED -- (x-mean)/std) -- the same format the
-//           text-to-image stage emits, so it flows into the `latent` port
+//           generate-image stage emits, so it flows into the `latent` port
 //           there (img2img init) or straight back into vae-decode.
 //
 // Config (FlexData object on the 4th constructor parameter):
@@ -92,7 +93,13 @@ private:
   int _pad_r = 0;
   int _pad_g = 0;
   int _pad_b = 0;
-  std::string _family;   // "krea2" | "flux2" | "mage"
+  std::string _family;   // "krea2" | "flux2" | "mage" | "wan"
+  // Video frames the wan conditioning clip spans. Must match the
+  // generate-video stage's `frames`: the conditioning latent is
+  // the VAE encoding of image-then-blanks over exactly that many
+  // frames, and the DiT concatenates it channel-wise onto a noise
+  // latent of that shape.
+  int _frames = 81;
   std::uint64_t _latents_emitted = 0;
 
   // Parse the `pad_color` config attr into _pad_r/_pad_g/_pad_b (0..255).
@@ -114,6 +121,7 @@ private:
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalMageVae>  _mage_vae;
+  std::unique_ptr<genai::MetalWanVae>   _wan_vae;
 
   // Resolve _hf_dir + load the VAE encoder (idempotent: the _load_attempted
   // guard runs the body at most once). No-op when _hf_dir is still empty.

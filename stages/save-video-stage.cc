@@ -466,6 +466,28 @@ SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
       break;
     }
     _enc_pkt->stream_index = st->index;
+    // An encoder that leaves duration at 0 costs the LAST sample its
+    // length: the mov muxer derives every other sample's duration from
+    // the next packet's dts, and there is no next packet for the final
+    // one. The track then ends one frame early, the edit list is
+    // written to that short duration, and a conformant demuxer trims
+    // the final frame -- a 33-frame clip plays back 32. Fill it in
+    // from the encoder's own rate before the rescale, which carries
+    // duration across with the timestamps.
+    if (_enc_pkt->duration <= 0) {
+      if (enc->codec_type == AVMEDIA_TYPE_VIDEO
+          && enc->framerate.num > 0 && enc->framerate.den > 0)
+      {
+        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+            1, av_inv_q(enc->framerate), enc->time_base);
+      } else if (enc->codec_type == AVMEDIA_TYPE_AUDIO
+                 && enc->frame_size > 0 && enc->sample_rate > 0)
+      {
+        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+            enc->frame_size, AVRational{1, enc->sample_rate},
+            enc->time_base);
+      }
+    }
     _libs->avcodec().api.packet_rescale_ts(_enc_pkt,
                                           enc->time_base,
                                           st->time_base);

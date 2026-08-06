@@ -7,7 +7,7 @@ import { makeIcon } from '../icons.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
-import { topoOrder, assignLanes, laneArt, gutterWidth }
+import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
   from '../lane-graph.js';
 import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
@@ -72,6 +72,16 @@ function mountEditor(container, opts = {}) {
     // linearized lane list it falls back to when the pane is too narrow
     // to draw one. The resize watcher compares against this.
     renderedNarrow: false,
+    // Whether the editor is drawn as ONE COLUMN (no configuration pane,
+    // no divider). Narrower than `renderedNarrow`: a wide editor whose
+    // divider was dragged hard left shows the lane list but keeps its
+    // pane, so the two are not the same question.
+    oneColumn: false,
+    // One-column layout only: the lane row expanded to show its stage's
+    // configuration inline. There is no configuration PANE at this width,
+    // so the form lives under its row -- the phone shell's arrangement,
+    // for the same reason.
+    laneOpen: null,
     // Buffer-utilization overlay: poll the running pipeline's per-edge
     // backlog/capacity and annotate the graph. Enabled by default so a
     // freshly-running pipeline shows depth immediately; the interval is
@@ -302,22 +312,38 @@ function mountEditor(container, opts = {}) {
   // list) per frame would make the drag itself stutter; comparing
   // against the last decision makes all but one of those a no-op.
   if (typeof ResizeObserver !== 'undefined') {
-    new ResizeObserver(() => {
+    const ro = new ResizeObserver(() => {
       if (!document.body.contains(pmRoot)) { return; }
-      const now = isNarrow();
+      const one = editorNarrow();
+      const now = one || isNarrow();
       // Compared against WHAT IS ON SCREEN (recorded by renderGraphPane)
       // rather than against the last observation. The two differ at
       // mount: the pane is measured at 0 before layout, which isNarrow()
       // reads as wide, so a first render can legitimately disagree with
       // the first observation and must be allowed to correct itself --
       // while a first observation that agrees must not cost a rebuild.
-      if (now === state.renderedNarrow) { return; }
+      if (now === state.renderedNarrow && one === state.oneColumn) { return; }
       // The canvas keeps its pan/zoom in state.graphView, which a trip
       // through the list would leave pointing at a viewport of a
       // different width. Refit on the way back to it.
       if (!now) { state.graphView = {}; }
+      // Going the other way, carry the selection into the expanded row:
+      // the configuration was on screen a moment ago, and it should not
+      // vanish merely because the editor got narrower. This is also what
+      // keeps laneOpen and selectedStage naming the same stage, which is
+      // the invariant the inline form is built on.
+      if (one) { state.laneOpen = state.selectedStage; }
       renderGraphPane();
-    }).observe(graphBody);
+      // Coming back to two panes, the configuration PANE reappears holding
+      // whatever it had before the one-column trip -- which is stale, or
+      // nothing at all, because that layout rendered the form inline
+      // instead. Fill it from the current selection.
+      if (!one) { renderConfig(); }
+    });
+    // BOTH: the editor's width decides one-column, the graph body's decides
+    // canvas-vs-list, and a resize can move either without the other.
+    ro.observe(graphBody);
+    ro.observe(editorArea);
   }
 
   function iconBtn(icon, label, onclick, key) {
@@ -415,6 +441,7 @@ function mountEditor(container, opts = {}) {
       state.selectedId = state.pipelines[0] ? state.pipelines[0].id : null;
       state.detail = null;
       state.selectedStage = null;
+      state.laneOpen = null;      // fold the inline form with its stage
       state.graphView = {};   // refit when the selected pipeline changes
       state.graphLayout = null;   // lay out the new pipeline clean (no glide)
       state.graphPins = new Map();
@@ -711,13 +738,51 @@ function mountEditor(container, opts = {}) {
     return w > 0 && w < NARROW_PX;
   }
 
+  // A configuration pane narrower than this is not worth the column it
+  // costs -- the field labels alone fill it.
+  const CFG_MIN_PX = 260;
+
+  // The SECOND crossover: below it the editor stops being two panes and
+  // becomes one column, with the configuration inline under its lane row.
+  //
+  // Measured from the EDITOR, never from the graph pane. Going one column
+  // HIDES the configuration pane, which widens the graph pane -- so a
+  // decision read off the graph pane would immediately un-decide itself
+  // and thrash between the two layouts every frame. The editor's own
+  // width is the one measurement the decision cannot move.
+  //
+  // Derived from the canvas crossover rather than picked, so the two
+  // cannot drift apart: at this width the canvas has already given up at
+  // the default split, and what is left to decide is only where the
+  // configuration goes.
+  function editorNarrow() {
+    const w = editorArea.clientWidth;
+    if (w <= 0) { return false; }        // unmeasured -> wide, as above
+    return w < NARROW_PX + toolbox.offsetWidth + CFG_MIN_PX;
+  }
+
   function renderGraphPane(o = {}) {
     if (state.missing) { renderRebindPane(); return; }
     // Recorded for the resize watcher: what this render actually drew,
     // decided once here so every branch below (including the empty
     // ones) leaves an accurate answer behind.
-    const narrow = isNarrow();
+    // ONE COLUMN: the configuration pane and its divider go away and the
+    // form is rendered inline under its lane row (see renderLaneList).
+    const one = editorNarrow();
+    // The lane list is what a one-column editor shows -- it is the only
+    // rendering the inline form has anywhere to live. A WIDE editor whose
+    // divider has been dragged hard left still reaches it on its own
+    // crossover, and keeps its configuration pane.
+    const narrow = one || isNarrow();
+    state.oneColumn = one;
     state.renderedNarrow = narrow;
+    editorArea.classList.toggle('pe-narrow', one);
+    // The surviving pane has to be TOLD to take the whole width. Being the
+    // only flex item is not enough: `split` is a fraction, and an item whose
+    // flex-grow sums to less than 1 gets only that share of the free space.
+    // MEASURED: the pane sat at 269px with 540px of the editor empty beside
+    // it.
+    graphPane.style.flexGrow = one ? '1' : String(split);
     clear(graphBody);
     state.graphContainer = null;   // old overlay target is gone
     // Re-dock the (persistent) canvas run/pause/stop overlay; it floats at
@@ -802,31 +867,80 @@ function mountEditor(container, opts = {}) {
   // Read-only about TOPOLOGY -- there is nowhere to drop a stage or aim
   // at a port in this width, which is why the canvas gave up in the
   // first place. Everything else the editor does still works: a row
-  // selects its stage, and the configuration pane beside it stays fully
-  // editable. The note at the end says how to get the canvas back,
-  // because a pane that silently changes shape owes the reader that.
+  // EXPANDS to its stage's configuration, fully editable, rendered by
+  // the same renderConfig() the wide layout puts in its own pane. The
+  // note at the end says how to get the canvas back, because a pane that
+  // silently changes shape owes the reader that.
   function renderLaneList(g) {
     const laid = assignLanes(topoOrder(g.nodes, g.edges), g.edges);
     const gutter = gutterWidth(laid.width);
     const list = el('div', { class: 'lane-list' });
+    // Rows expand only when there is no configuration PANE to fill. A wide
+    // editor dragged past the canvas crossover still has one, and clicking
+    // a row there just selects it -- as it always did.
+    const inline = state.oneColumn;
+    // An open row whose stage has since disappeared (removed, or a
+    // different pipeline selected) must not keep a block open over a row
+    // that is no longer there.
+    if (state.laneOpen && !laid.rows.some((r) => r.node.id === state.laneOpen)) {
+      state.laneOpen = null;
+    }
     for (const r of laid.rows) {
       const n = r.node;
       const bad = !!n.config_error;
+      const open = inline && n.id === state.laneOpen;
       list.append(el('button', {
-        class: 'lane-row' + (bad ? ' bad' : '')
+        class: 'lane-row' + (bad ? ' bad' : '') + (open ? ' open' : '')
              + (n.id === state.selectedStage ? ' selected' : ''),
         title: n.config_error || n.id,
-        onclick: () => selectStage(n.id),
+        onclick: () => (inline ? toggleLaneStage(n.id) : selectStage(n.id)),
       },
         el('span', { class: 'lane-gutter', style: `width:${gutter}px` },
            laneArt(r, laid.width, bad)),
         el('span', { class: 'lane-text' },
            el('span', { class: 'lane-id' }, n.id),
            el('span', { class: 'lane-type' }, n.type)),
-        bad ? el('span', { class: 'lane-warn' }, '!') : null));
+        bad ? el('span', { class: 'lane-warn' }, '!') : null,
+        inline ? el('span', { class: 'lane-caret' }, '▸') : null));
+      if (open) { list.append(laneDetail(r, gutter)); }
     }
-    list.append(el('div', { class: 'lane-note' }, t('pl.narrow_note')));
+    list.append(el('div', { class: 'lane-note' },
+      t(inline ? 'pl.narrow_note' : 'pl.narrow_note_pane')));
     graphBody.append(list);
+  }
+
+  // Expand a row, or fold it back. Selecting is part of expanding, so the
+  // rest of the editor (Delete, the shortcuts, a later trip back to the
+  // canvas) still agrees about which stage is current.
+  function toggleLaneStage(id) {
+    if (state.laneOpen === id) {
+      state.laneOpen = null;
+      renderGraphPane();
+      return;
+    }
+    state.laneOpen = id;
+    selectStage(id);
+  }
+
+  // The block a row expands into: the configuration form, indented past
+  // the gutter, with the lanes that pass this stage continuing down its
+  // side. Those continuations are absolutely-positioned rules rather than
+  // drawn art because the block's height depends on the form inside it --
+  // without them a lane would appear to stop at whichever row is open.
+  function laneDetail(row, gutter) {
+    const block = el('div', { class: 'lane-detail-block' });
+    for (const i of new Set([...row.through, ...row.branches])) {
+      block.append(el('span', { class: 'lane-cont',
+        style: `left:${laneX(i)}px` }));
+    }
+    const actions = el('div', { class: 'lane-detail-actions' });
+    const body = el('div', { class: 'lane-detail-body' });
+    block.append(el('div', { class: 'lane-detail',
+      style: `margin-left:${gutter}px` }, actions, body));
+    // Fire-and-forget: the form arrives when the config request does, and
+    // renderConfig no-ops safely if the block was folded away meanwhile.
+    renderConfig({ body, actions });
+    return block;
   }
 
   // --- composer: toolbox + drag-create + click-to-connect ----------
@@ -1195,6 +1309,9 @@ function mountEditor(container, opts = {}) {
 
   async function selectStage(sid) {
     state.selectedStage = sid;
+    // In the narrow layout, selecting IS expanding -- the form has nowhere
+    // else to go. Set this before the render below, which draws the block.
+    if (state.oneColumn) { state.laneOpen = sid; }
     // If an edge/arming overlay is showing it must be cleared, which needs
     // a real re-render; otherwise just repaint the highlight in place so
     // dragged positions are preserved.
@@ -1204,15 +1321,32 @@ function mountEditor(container, opts = {}) {
     if (hadOverlay || !patchSelection(sid)) {
       renderGraphPane();
     }
-    await renderConfig();
+    // Narrow: renderGraphPane just rebuilt the list, and the expanded row
+    // rendered the form inline. Filling the (hidden) pane too would only
+    // buy a second request for the same config.
+    if (!state.oneColumn) { await renderConfig(); }
   }
 
   // --- right pane (config) -----------------------------------------
-  async function renderConfig() {
-    clear(cfgBody);
-    clear(cfgActions);   // header Apply/Remove; refilled below when editable
+  // `target` names where the form goes: the standalone pane by default,
+  // or -- in the narrow layout, which has no such pane -- the block an
+  // expanded lane row supplies. Everything else about the form (the
+  // header Apply/Remove, auto-apply on blur, the schema fields) is
+  // identical, because it is the same function.
+  async function renderConfig(target) {
+    // The narrow layout has no configuration pane -- an expanded row
+    // renders the form itself and passes a target. An untargeted call
+    // there would fetch the same config again to fill a hidden pane.
+    if (!target && state.oneColumn) { return; }
+    const body = (target && target.body) || cfgBody;
+    const cfgHead = (target && target.actions) || cfgActions;
+    // An inline block can be folded away while its request is in flight;
+    // it is then detached and there is nothing to fill.
+    const live = () => !target || body.isConnected;
+    clear(body);
+    clear(cfgHead);   // header Apply/Remove; refilled below when editable
     if (!state.detail || !state.selectedStage) {
-      cfgBody.append(el('div', { class: 'cfg' },
+      body.append(el('div', { class: 'cfg' },
         el('div', { class: 'empty' }, t('pl.select_stage_config'))));
       return;
     }
@@ -1220,17 +1354,19 @@ function mountEditor(container, opts = {}) {
     try {
       info = await api.getStageConfig(state.selectedId, state.selectedStage);
     } catch (e) {
-      cfgBody.append(el('div', { class: 'cfg' },
+      if (!live()) { return; }
+      body.append(el('div', { class: 'cfg' },
         el('div', { class: 'empty' },
           t('pl.config_unavailable', { msg: e.message }))));
       return;
     }
+    if (!live()) { return; }
     const editable = !!info.editable;
     const wrap = el('div', { class: 'cfg' });
 
-    // Apply / Remove go in the pane HEADER (cfgActions) so they stay pinned
-    // above the scroll. `inputs` is captured by Apply's handler and filled
-    // in by the schema loop below.
+    // Apply / Remove go in the pane HEADER (or, inline, at the top of the
+    // block) so they stay pinned above the scroll. `inputs` is captured by
+    // Apply's handler and filled in by the schema loop below.
     const inputs = [];
     const applyBtn = el('button', {
       class: 'btn primary mini', disabled: !editable,
@@ -1243,7 +1379,7 @@ function mountEditor(container, opts = {}) {
                       : t('pl.stop_to_edit'),
       onclick: () => onRemoveStage(),
     }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
-    cfgActions.append(applyBtn, removeBtn);
+    cfgHead.append(applyBtn, removeBtn);
 
     // Auto-apply on blur (stopped pipelines only): when a field commits (a
     // text/number box loses focus after an edit), re-POST the whole config
@@ -1276,7 +1412,7 @@ function mountEditor(container, opts = {}) {
       inputs.push({ key: f.key, type: f.type, read });
       wrap.append(field);
     }
-    cfgBody.append(wrap);
+    body.append(wrap);
   }
 
   // Build one config field. `read()` returns:

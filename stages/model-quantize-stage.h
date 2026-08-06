@@ -55,7 +55,7 @@ namespace genai { struct QuantArchInfo; }
 //                  Krea-2 (text-to-image): a COMPONENT -- dit (default) |
 //                  text_encoder | vae. The output is a SELF-CONTAINED pipeline
 //                  (all components copied, the target quantized), usable
-//                  directly as a text-to-image hf_dir with no dit_dir override;
+//                  directly as a generate-image hf_dir with no dit_dir override;
 //                  chain passes (feed one pass's output as the next src_model)
 //                  to quantize the DiT, then the text encoder, etc. (vae not
 //                  yet supported -- it is a conv net).
@@ -130,7 +130,7 @@ private:
   // vpipe tag ("krea2" | "flux2"); `root` is the pipeline ROOT (transformer/,
   // text_encoder/, vae/, tokenizer/, ...); `out_dir` gets a SELF-CONTAINED copy
   // of every component with the configured `target` component quantized in
-  // place, so the result is usable directly as a text-to-image hf_dir (no
+  // place, so the result is usable directly as a generate-image hf_dir (no
   // dit_dir override). Chainable: `root` may be a prior pass's output, whose
   // already-quantized components copy through.
   bool quantize_t2i_pipeline_(const std::string&           root,
@@ -147,7 +147,7 @@ private:
                                const std::string&           calib_root,
                                const std::function<bool()>& stop);
   // Quantize the text encoder (a dense Qwen3 / Qwen3-VL backbone) -> out_dir.
-  // Keeps embed_tokens bf16 (the text-to-image stage host-gathers it). `root`
+  // Keeps embed_tokens bf16 (the generate-image stage host-gathers it). `root`
   // is the pipeline root -- its tokenizer/ feeds AWQ auto-calibration (the
   // encoder sub-dir has no tokenizer of its own).
   bool quantize_text_encoder_(const std::string&           enc_dir,

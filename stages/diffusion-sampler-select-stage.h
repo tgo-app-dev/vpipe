@@ -12,7 +12,7 @@
 namespace vpipe {
 
 // Source stage: choose a diffusion SAMPLER (the integrator) and emit its spec as
-// a FlexData beat, once, on oport0. A `text-to-image` stage latches the spec off
+// a FlexData beat, once, on oport0. A `generate-image` stage latches the spec off
 // its optional sampler iport. Pairs with `scheduler-select` (the sigma
 // schedule) -- sampler and scheduler are the two independent choices.
 //
@@ -29,7 +29,7 @@ namespace vpipe {
 // seed    -- dpmpp_sde noise seed.
 //
 // This stage is MODEL-AGNOSTIC: it forwards the user's sampler choice and does
-// not read any model's scheduler config (the text-to-image stage owns the
+// not read any model's scheduler config (the generate-image stage owns the
 // model). method defaults to euler (the token-exact distilled turbo).
 //
 // Config (FlexData object):

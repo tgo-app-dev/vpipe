@@ -39,7 +39,9 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
-  // downstream text-to-image latent grid needs an even latent H/W).
+  // downstream generate-image latent grid needs an even latent H/W).
+  _frames   = (int)attr_int("frames");
+  if (_frames <= 0) { _frames = 81; }
   _target_w = (int)attr_int("target_width");
   _target_h = (int)attr_int("target_height");
   if ((_target_w > 0) != (_target_h > 0)) {
@@ -125,6 +127,14 @@ namespace {
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
 
 const ConfigKey kAttrs[] = {
+  {.key = "frames", .type = ConfigType::Int, .required = false,
+   .doc = "VIDEO VAE only: how many video frames the image-to-video "
+          "conditioning clip spans. The latent is the encoding of the "
+          "conditioning image followed by that many minus one BLANK frames "
+          "-- not of the image alone, because the VAE's temporal convolutions "
+          "mix neighbouring frames, so a 1-frame encode is a different tensor. "
+          "MUST match the generate-video stage's `frames`",
+   .def_int = 81},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
           "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
@@ -168,7 +178,7 @@ const StageSpec kSpec = {
   .type_name = "vae-encode",
   .doc       = "Encodes an RGB image into a Krea-2-Turbo (Qwen-Image VAE) "
                "whitened latent on the metal-compute backend. The mirror of "
-               "vae-decode; feeds the text-to-image `latent` port (img2img).",
+               "vae-decode; feeds the generate-image `latent` port (img2img).",
   .display_name = "VAE Encode",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -197,6 +207,7 @@ vae_family_(const std::string& vae_dir)
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
+        if (cls == "AutoencoderKLWan") { return "wan"; }
       }
     }
   }
@@ -419,6 +430,25 @@ VaeEncodeStage::ensure_loaded_()
           "VaeEncodeStage('{}'): failed to load the AutoencoderKL encoder from "
           "'{}'; inert", this->id(), vae_dir));
       _flux2_vae.reset();
+    }
+    return;
+  }
+
+  if (_family == "wan") {
+    genai::MetalWanVae::Config wcfg;
+    std::string werr;
+    if (!genai::MetalWanVae::config_from_json(vae_dir, wcfg, &werr)) {
+      session()->error(fmt("VaeEncodeStage('{}'): {}; inert", this->id(),
+                           werr));
+      return;
+    }
+    load_note_(fmt("VaeEncodeStage('{}'): loading Wan video VAE (encoder) "
+                   "from '{}'", this->id(), vae_dir));
+    _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/true);
+    if (!_wan_vae) {
+      session()->error(fmt(
+          "VaeEncodeStage('{}'): failed to load the Wan VAE from '{}'; inert",
+          this->id(), vae_dir));
     }
     return;
   }
@@ -776,6 +806,106 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     session()->log_debug(fmt(
         "VaeEncodeStage('{}'): MageVAE encoded latent #{} [{}, {}, {}]",
         this->id(), _latents_emitted, Cz, lh, lw));
+    if (_unload_idle) { unload_vae_(); }
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Wan video VAE: the IMAGE-TO-VIDEO conditioning latent ---------
+  // The reference does not encode the conditioning image on its own. It
+  // builds a clip -- the image followed by `frames - 1` blank frames --
+  // and encodes THAT, because the VAE's causal temporal convolutions mix
+  // each output frame with its two predecessors. A 1-frame encode is a
+  // different tensor, and the DiT would be conditioned on something it was
+  // never trained against.
+  if (_family == "wan") {
+    if (!_wan_vae || !_wan_vae->has_encoder()) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): Wan VAE encoder not loaded; skipping",
+          this->id()));
+      co_return;
+    }
+    const int sH = (int)tbp->shape[1], sW = (int)tbp->shape[2];
+    const bool rs = _target_w > 0 && _target_h > 0;
+    const int H = rs ? _target_h : sH;
+    const int W = rs ? _target_w : sW;
+    if (H <= 0 || W <= 0 || (H % 8) != 0 || (W % 8) != 0) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): image [{}x{}] must be a positive multiple of "
+          "8 (or set target_width/target_height); skipping", this->id(), sW,
+          sH));
+      co_return;
+    }
+    if ((_frames % 4) != 1 || _frames <= 0) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): frames {} is not 4k+1; the video VAE "
+          "compresses time in 4-frame chunks after a 1-frame first chunk, so "
+          "use 81, 121, ...; skipping", this->id(), _frames));
+      co_return;
+    }
+    auto* mc = session()->services()->metal_compute();
+    const auto img = tbp->materialize_contiguous();
+    const bool u8 = tbp->dtype == TensorBeat::DType::U8;
+    const float pad[3] = {
+      (float)_pad_r / 255.0f * 2.0f - 1.0f,
+      (float)_pad_g / 255.0f * 2.0f - 1.0f,
+      (float)_pad_b / 255.0f * 2.0f - 1.0f,
+    };
+    const std::vector<float> norm =
+        normalize_and_fit_(img.data(), u8, sH, sW, H, W, pad);
+    // [3, F, H, W] channel-first: frame 0 is the image, the rest are the
+    // ZERO of the [-1,1] range (mid grey), which is what the reference's
+    // new_zeros produces on an already-normalized tensor.
+    const std::size_t plane = (std::size_t)H * W;
+    metal_compute::SharedBuffer vid =
+        mc->make_shared_buffer((std::size_t)3 * _frames * plane * 2);
+    if (vid.empty()) {
+      session()->warn(fmt("VaeEncodeStage('{}'): conditioning-clip alloc "
+                          "failed; skipping", this->id()));
+      co_return;
+    }
+    {
+      auto* d = static_cast<_Float16*>(vid.contents());
+      std::memset(d, 0, (std::size_t)3 * _frames * plane * 2);
+      for (int c = 0; c < 3; ++c) {
+        _Float16* dst = d + (std::size_t)c * _frames * plane;
+        const float* src = norm.data() + (std::size_t)c * plane;
+        for (std::size_t i = 0; i < plane; ++i) { dst[i] = (_Float16)src[i]; }
+      }
+    }
+    std::string eerr;
+    metal_compute::SharedBuffer lat;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin,
+                         (std::uint64_t)_frames * H * W);
+      lat = _wan_vae->encode(vid, _frames, H, W, &eerr);
+    }
+    if (lat.empty()) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): video encode failed ({}); skipping",
+          this->id(), eerr.empty() ? "unknown error" : eerr));
+      co_return;
+    }
+    const int Cz = _wan_vae->config().z_dim;
+    const int T = genai::MetalWanVae::latent_frames(_frames);
+    const std::size_t nz = (std::size_t)Cz * T * (H / 8) * (W / 8);
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {Cz, T, H / 8, W / 8};
+    out->resize_contiguous(nz);
+    const auto* lp = static_cast<const _Float16*>(lat.contents());
+    float* op = out->as_f32();
+    for (std::size_t i = 0; i < nz; ++i) { op[i] = (float)lp[i]; }
+    FlexData sb = FlexData::make_object();
+    sb.as_object().insert_or_assign("frames",
+                                    FlexData::make_int((std::int64_t)_frames));
+    out->sideband = std::move(sb);
+    ++_latents_emitted;
+    session()->log_debug(fmt(
+        "VaeEncodeStage('{}'): Wan conditioning latent #{} [{}, {}, {}, {}] "
+        "from a {}-frame clip", this->id(), _latents_emitted, Cz, T, H / 8,
+        W / 8, _frames));
     if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;

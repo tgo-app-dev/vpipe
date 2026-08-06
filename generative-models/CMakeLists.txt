@@ -69,6 +69,9 @@ set(LOCAL_SOURCES
   flux2/metal-flux2-calibration.cc
   boogu/metal-boogu-transformer.cc
   boogu/metal-boogu-calibration.cc
+  wan/metal-wan-vae.cc
+  wan/metal-umt5-encoder.cc
+  wan/metal-wan-transformer.cc
   lora-fusion.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
@@ -124,6 +127,9 @@ set(LOCAL_HEADERS
   moss/metal-moss-rt-model.h
   boogu/metal-boogu-transformer.h
   boogu/metal-boogu-calibration.h
+  wan/metal-wan-vae.h
+  wan/metal-umt5-encoder.h
+  wan/metal-wan-transformer.h
   mage/metal-mage-vae.h
   mage/metal-mage-flow-transformer.h
   mage/mage-watermark.h

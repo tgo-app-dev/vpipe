@@ -8,13 +8,14 @@
 // The prompt/image -> conditioning half of the diffusion split. Owns the
 // tokenizer, the text encoder, and (for image-aware families) a vision tower
 // (Qwen2.5-VL for Qwen-Image-Edit, Qwen3-VL for Krea-2 edit); emits the
-// per-family conditioning tensor the text-to-image (DiT) stage consumes. This
+// per-family conditioning tensor the generate-image (DiT) stage consumes. This
 // is the from-scratch, MLX-free metal-compute path on the
 // VPIPE_BUILD_APPLE_SILICON axis; an inert stub off it.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/mage/mage-screen.h"
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/wan/metal-umt5-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
@@ -31,11 +32,11 @@ namespace vpipe {
 // DiffusionConditionerStage: prompt text (+ optional reference image for
 // image-aware models) -> conditioning embeddings for a diffusion DiT.
 //
-// This is the encoder half pulled out of the text-to-image stage, so the raw
+// This is the encoder half pulled out of the generate-image stage, so the raw
 // reference IMAGE goes to the VLM here (semantic understanding) while the VAE
 // LATENT of that same image goes to the DiT stage (spatial detail) -- two
 // distinct consumers, no longer conflated on one stage. The conditioner and the
-// text-to-image stage are a MATCHED PAIR keyed by the same `hf_dir`: the
+// generate-image stage are a MATCHED PAIR keyed by the same `hf_dir`: the
 // conditioning tensor's shape + semantics are family-specific.
 //
 //   iport0  prompt        FlexDataPayload (string or {text: ...}), required.
@@ -81,7 +82,7 @@ namespace vpipe {
 // run through the model's own content-policy classifier (mage-screen.h) --
 // mandatory, no config key, no port to leave unwired. A refused prompt gets
 // a one-row conditioning beat tagged `content_blocked` on its sideband, which
-// text-to-image turns into a skipped denoise and vae-decode into a blank
+// generate-image turns into a skipped denoise and vae-decode into a blank
 // refusal image. With a reference image the classifier judges the SOURCE
 // PICTURE as well as the instruction. It fails CLOSED.
 //
@@ -153,6 +154,12 @@ private:
   // share this. Held for the stage's life: their tensors come from it.
   std::shared_ptr<genai::WeightSet>              _enc_ws;
   std::unique_ptr<genai::MetalQwenModel>          _encoder;
+  // The Wan family's tower is a umT5-XXL ENCODER, not a decoder-only
+  // LM, so it is its own member rather than another config of
+  // _encoder -- different weights, different attention (an additive
+  // relative-position bias, no rotary) and no embedding table to
+  // gather separately.
+  std::unique_ptr<genai::MetalUmt5Encoder>        _umt5;
   std::unique_ptr<genai::Tokenizer>               _tokenizer;
   metal_compute::SharedBuffer                     _embed;      // encoder embeds
   mutable std::unique_ptr<genai::MetalQwen25Vision> _vision;   // QIE, lazy

@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 #define GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 
+#include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -137,6 +138,13 @@ class MetalKrea2Transformer {
 
   const Config& config() const { return _cfg; }
 
+  // Per-block progress (see DitBlockProgressFn): fired as each transformer
+  // block is entered, so a caller can show movement INSIDE one denoise
+  // step -- which at high resolution is seconds of otherwise-silent work.
+  void set_block_progress(DitBlockProgressFn fn) {
+    _block_progress = std::move(fn);
+  }
+
   // Drop the per-forward scratch: the reusable DitScratch buffers (activations
   // + RoPE), the dequant/split-K scratches, and the i8 accel scratches. All
   // are lazily rebuilt on the next forward_dit (ensure_dit_scratch_ keys on
@@ -269,6 +277,7 @@ class MetalKrea2Transformer {
   // mmap this class kept to itself.
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;   // polled per block in streaming mode
+  DitBlockProgressFn    _block_progress;
   metal_compute::SharedBuffer _final_sst;              // final_layer (2, hidden)
   metal_compute::SharedBuffer _final_norm;             // final_layer.norm (+1)
   QWeight _final_lw; metal_compute::SharedBuffer _final_lb;   // final_layer.linear

@@ -43,7 +43,7 @@ model_dir_available(const SessionContextIntf* session,
 
 // Apply a `model-select` beat to a stage's hf_dir. The beat is the
 // FlexData a `model-select` source emits so the diffusion-conditioner /
-// text-to-image / vae-encode / vae-decode stages can share ONE model
+// generate-image / vae-encode / vae-decode stages can share ONE model
 // choice through their `model` iport (which OVERRIDES the hf_dir config
 // key). The beat is either a plain string (the model dir/registry key) or
 // an object with "hf_dir" (alias "model"). `hf_dir` is overwritten when

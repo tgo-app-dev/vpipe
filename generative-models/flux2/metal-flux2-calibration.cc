@@ -35,7 +35,7 @@ using metal_compute::SharedBuffer;
 namespace {
 
 // FLUX.2 klein text encoder (dense Qwen3, model. prefix) -- mirrors the
-// text-to-image stage's encoder_config_flux2_, sized from text_encoder/
+// generate-image stage's encoder_config_flux2_, sized from text_encoder/
 // config.json so both klein sizes calibrate (4B ~4B Qwen3, 9B an 8B Qwen3).
 MetalQwenModel::Config
 encoder_config_(const std::string& enc_dir)
@@ -111,7 +111,7 @@ encode_with_specials_(const Tokenizer& tok, const std::string& text)
 }
 
 // FLUX.2 empirical flow-shift mu (diffusers Flux2Pipeline.compute_empirical_mu):
-// resolution- AND step-dependent. Mirrors the copy in text-to-image-stage.cc.
+// resolution- AND step-dependent. Mirrors the copy in generate-image-stage.cc.
 double
 flux2_empirical_mu_(int image_seq_len, int num_steps)
 {
@@ -152,28 +152,6 @@ weights_bytes_(const std::filesystem::path& dir)
   return total;
 }
 
-// In-place throttled progress bar (mirrors the Krea-2 calibration + the
-// model-quantizer): redraws on a carriage-return only when the integer
-// percentage changes, the frame space-padded so a shorter redraw overwrites a
-// longer prior one.
-void
-calib_progress_(UiTextStream* bar, const char* tag, int done, int total,
-                int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = (int)((long)done * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b((std::size_t)fill, '#');
-  b += std::string((std::size_t)(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done, total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
-
 }  // namespace
 
 bool
@@ -205,11 +183,10 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   std::vector<int> tap_layers;
   for (int k : kTaps) { tap_layers.push_back(k - 1); }
 
-  // In-place progress bar spanning both phases (encode, then denoise), painted
-  // on the user-facing text stream like the Krea-2 calibration.
-  std::unique_ptr<UiTextStream> bar =
-      sess ? sess->open_text_stream() : std::unique_ptr<UiTextStream>();
-  int pct = -1;
+  // One report for the whole pass; "encode" and "denoise" ride as the
+  // detail text so both phases reuse the same row.
+  UiProgress bar;
+  if (sess) { bar = sess->open_progress("calibrate"); }
 
   // ---- Phase 1: encoder resident -> cache each prompt's context [n, 3*EH].
   std::vector<SharedBuffer> ctx_cache;
@@ -239,8 +216,7 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
                                     prompts[pi] +
                                     "<|im_end|>\n<|im_start|>assistant\n";
       std::vector<std::int32_t> ids = encode_with_specials_(*tok, templated);
-      calib_progress_(bar.get(), "encode", (int)pi + 1, (int)prompts.size(),
-                      pct);
+      bar.update((std::uint64_t)pi + 1, prompts.size(), "encode");
       if (ids.empty()) { continue; }
       const int n = (int)ids.size();
       SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
@@ -366,11 +342,10 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   dit->calib_begin();
   SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * IC * 2);
   std::vector<float> packed((std::size_t)img_seq * IC);
-  pct = -1;
   const int total_fwd = (int)ctx_cache.size() * steps;
   for (std::size_t e = 0; e < ctx_cache.size(); ++e) {
     if (stop()) {
-      if (bar) { bar->end(); }
+      bar.finish();
       dit->calib_end();
       return fail("flux2 calib: stopped");
     }
@@ -392,7 +367,7 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
     for (auto& v : packed) { v = nd(rng); }
     for (int i = 0; i < steps; ++i) {
       if (stop()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         dit->calib_end();
         return fail("flux2 calib: stopped");
       }
@@ -405,7 +380,7 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
                                           (float)sig[(std::size_t)i], -1.0f,
                                           refs);
       if (vel.empty()) {
-        if (bar) { bar->end(); }
+        bar.finish();
         dit->calib_end();
         return fail("flux2 calib: forward");
       }
@@ -414,8 +389,8 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
       for (std::size_t k = 0; k < packed.size(); ++k) {
         packed[k] += (float)(dt * (double)(float)vp[k]);
       }
-      calib_progress_(bar.get(), "denoise", (int)e * steps + i + 1, total_fwd,
-                      pct);
+      bar.update((std::uint64_t)e * steps + i + 1,
+                 (std::uint64_t)total_fwd, "denoise");
     }
     // Snapshot this prompt's now-clean generated latent as the rolling
     // reference for subsequent prompts (draw-with-reference calibration).
@@ -432,7 +407,7 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
                           refs.empty() ? "" : " (+1 reference)"));
     }
   }
-  if (bar) { bar->end(); }
+  bar.finish();
   const std::map<std::string, std::vector<float>> stats = dit->calib_stats();
   dit->calib_end();
 

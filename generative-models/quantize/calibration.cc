@@ -118,27 +118,6 @@ wrap_chat_turn_(const Tokenizer& tok, const std::vector<std::int32_t>& body,
   return false;
 }
 
-// Throttled in-place progress bar -- redraws on a carriage-return only
-// when the integer percentage changes (the frame is space-padded so a
-// shorter redraw fully overwrites a longer prior one).
-void quant_progress_(vpipe::UiTextStream* bar, const char* tag, int done,
-                     int total, int& last_pct)
-{
-  if (bar == nullptr || total <= 0) { return; }
-  int pct = static_cast<int>(static_cast<long>(done) * 100 / total);
-  if (pct < 0) { pct = 0; } else if (pct > 100) { pct = 100; }
-  if (pct == last_pct) { return; }
-  last_pct = pct;
-  constexpr int W = 24;
-  const int fill = pct * W / 100;
-  std::string b(static_cast<std::size_t>(fill), '#');
-  b += std::string(static_cast<std::size_t>(W - fill), '-');
-  std::string line = fmt("\r[{}] {}% {} ({}/{})", b, pct, tag, done,
-                         total)();
-  while (line.size() < 64) { line += ' '; }   // wipe stale tail
-  bar->write(line);
-}
-
 }  // namespace
 
 std::vector<std::vector<std::int32_t>>
@@ -223,17 +202,16 @@ collect_backbone_calibration(
         corpus.size()));
   }
 
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (S) { bar = S->open_text_stream(); }
+  vpipe::UiProgress bar;
+  if (S) { bar = S->open_progress("calibrate"); }
   bb->calib_begin();
   ContextManager* cm = bb->context_manager();
-  int cal_pct = -1;
   int si = 0;
   for (const auto& seq : corpus) {
     if (stop()) { bb->calib_end(); return fail("calib: stopped by request"); }
     ++si;
     if (S) { S->log_verbose(fmt("  calib seq {}/{}", si, corpus.size())); }
-    quant_progress_(bar.get(), "calib", si, (int)corpus.size(), cal_pct);
+    bar.update((std::uint64_t)si, corpus.size());
     const int n = (int)seq.size();
     if (n <= 0) { continue; }
     // Gather the token embeddings (bf16 compute dtype) host-side.
@@ -252,7 +230,7 @@ collect_backbone_calibration(
     if (hn.empty()) { bb->calib_end(); return fail("calib: forward failed"); }
   }
   bb->calib_end();
-  if (bar) { bar->end(); }   // finalize the bar line before any summary
+  bar.finish();   // close the report before any summary
 
   std::error_code ec;
   fs::create_directories(out_calib_dir, ec);
@@ -384,13 +362,12 @@ collect_backbone_calibration_streaming(
         "calibration (streaming): {} layers over {} sequences", nL,
         corpus.size()));
   }
-  std::unique_ptr<vpipe::UiTextStream> bar;
-  if (S) { bar = S->open_text_stream(); }
-  int cal_pct = -1;
+  vpipe::UiProgress bar;
+  if (S) { bar = S->open_progress("calibrate"); }
   for (int L = 0; L < nL; ++L) {
     if (stop()) { return fail("calib-stream: stopped by request"); }
     if (S) { S->log_verbose(fmt("  calib layer {}/{}", L + 1, nL)); }
-    quant_progress_(bar.get(), "calib", L, nL, cal_pct);
+    bar.update((std::uint64_t)L, (std::uint64_t)nL);
     const std::uint64_t freeb = host_free_ram_bytes();
     if (freeb != 0 && freeb < min_free_bytes) {
       char m[256];
@@ -439,7 +416,7 @@ collect_backbone_calibration_streaming(
     }
     bb->calib_free_layer(L);   // FREE layer L before L+1 (the invariant)
   }
-  if (bar) { bar->end(); }   // finalize the bar line before any summary
+  bar.finish();   // close the report before any summary
   std::fprintf(stderr,
       "[calib-stream] streamed %d layers; PEAK process-resident %.2f GB, "
       "PEAK system-wired %.2f GB\n", nL,

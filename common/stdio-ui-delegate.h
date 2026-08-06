@@ -4,7 +4,11 @@
 #include "interfaces/ui-delegate-intf.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace vpipe {
 
@@ -25,6 +29,8 @@ namespace vpipe {
 // it only for the prompt write, not for the (blocking) read.
 class StdioUiDelegate final : public UiDelegateIntf {
 public:
+  ~StdioUiDelegate() override;
+
   void error(const VpipeFormat&) override;
   void warn(const VpipeFormat&) override;
   void info(const VpipeFormat&) override;
@@ -73,7 +79,30 @@ public:
   void note_sigint() noexcept;
   bool poll_sigint();
 
+  // ---- progress footer ---------------------------------------------
+  //
+  // Live reports are drawn as a block of bars pinned to the bottom of
+  // the terminal, one row each, while everything else scrolls above
+  // them (see common/console-writer.h for how that is arbitrated).
+  //
+  // A repaint THREAD rather than painting from update(): a download's
+  // progress callback fires hundreds of times a second and a denoise
+  // step once every few seconds, so redrawing per update would either
+  // thrash the terminal or need every producer to throttle. The thread
+  // wakes at kRepaintMs, compares progress_version(), and repaints only
+  // when something actually moved. It starts on the first report and
+  // exits once the last one closes, so a session that never reports
+  // progress never spawns it -- and off a tty it is never started at
+  // all, since there is nothing to pin a footer to.
+  static constexpr int kRepaintMs = 100;
+
+protected:
+  void on_progress_opened() override;
+
 private:
+  void start_progress_thread_();
+  void stop_progress_thread_();
+
   // Format `[tag] msg\n` and write to stderr (to_err) or stdout.
   void emit_(const char* tag, bool to_err, const VpipeFormat&);
 
@@ -87,6 +116,14 @@ private:
              const std::function<bool()>& should_cancel, bool mask);
 
   std::mutex _io_mu;
+
+  // Repaint thread state. `_progress_run` is what the thread polls to
+  // know it should exit; `_progress_mu`/`_progress_cv` let a stop wake
+  // it immediately instead of waiting out a kRepaintMs tick.
+  std::thread             _progress_thread;
+  std::mutex              _progress_mu;
+  std::condition_variable _progress_cv;
+  bool                    _progress_run = false;
 
   // SIGINT bookkeeping. `_sigint_count` is the only field the signal
   // handler touches; the rest belong to poll_sigint()'s caller.

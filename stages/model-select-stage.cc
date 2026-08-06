@@ -17,7 +17,7 @@ namespace {
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "the model dir/registry key shared by the diffusion-conditioner, "
-          "text-to-image (DiT), vae-encode and vae-decode stages; emitted as a "
+          "generate-image (DiT), vae-encode and vae-decode stages; emitted as a "
           "beat that overrides each of their hf_dir config keys",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
@@ -33,7 +33,7 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "model-select",
   .doc       = "Pick one diffusion model dir and emit it as a FlexData beat for "
-               "the diffusion-conditioner / text-to-image / vae-encode / "
+               "the diffusion-conditioner / generate-image / vae-encode / "
                "vae-decode stages to share -- each stage's model iport overrides "
                "its hf_dir config. 0 in / 1 out (emits once).",
   .display_name = "Model Select",

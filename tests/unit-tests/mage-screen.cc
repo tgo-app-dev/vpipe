@@ -2,7 +2,7 @@
 // and the refusal path it drives:
 //
 //   diffusion-conditioner (screens; tags a refused prompt)
-//     -> text-to-image (skips the denoise, carries the size)
+//     -> generate-image (skips the denoise, carries the size)
 //       -> vae-decode (paints the blank refusal image)
 //
 // Three layers, three kinds of test:
@@ -10,7 +10,7 @@
 //  1. VERDICT PARSING + the policy text -- pure logic, always runs. This is
 //     where fail-closed lives: everything that is not an explicit
 //     {"violates": false} from the classifier must block.
-//  2. The REFUSAL PATH through text-to-image and vae-decode, driven by a
+//  2. The REFUSAL PATH through generate-image and vae-decode, driven by a
 //     SYNTHETIC tagged beat -- so it is checked independently of whatever the
 //     classifier happens to decide.
 //  3. The CLASSIFIER itself against the real Qwen3-VL weights.
@@ -34,7 +34,7 @@
 #include "pipeline/typed-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/load-image-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
 #include <cstdint>
@@ -100,7 +100,7 @@ public:
   }
 };
 
-// Emits the marker text-to-image produces for a refused prompt: a 1x1x1 f32
+// Emits the marker generate-image produces for a refused prompt: a 1x1x1 f32
 // beat carrying only the flag and the intended image size.
 class RefusalMarkerSource : public TypedStage<RefusalMarkerSource> {
 public:
@@ -345,7 +345,7 @@ TEST(mage_screen, vae_decode_paints_the_blank_refusal_at_the_carried_size)
   EXPECT_TRUE(all_white);
 }
 
-// text-to-image turns a tagged CONDITIONING beat into that marker without
+// generate-image turns a tagged CONDITIONING beat into that marker without
 // denoising. The DiT does load here (the stage would otherwise be drained),
 // but it must not RUN: a 1x1x1 marker out is the proof -- a generation would
 // have produced a [128, H/16, W/16] latent, and taken orders of magnitude
@@ -366,9 +366,9 @@ TEST(mage_screen, text_to_image_refuses_a_tagged_conditioning_without_denoising)
   tc.as_object().insert("hf_dir", FlexData::make_string(root));
   tc.as_object().insert("width", FlexData::make_int(64));
   tc.as_object().insert("height", FlexData::make_int(48));
-  auto tu = std::make_unique<TextToImageStage>(
+  auto tu = std::make_unique<GenerateImageStage>(
       &sess, "t2i", std::vector<InEdge>{{src, 0}}, std::move(tc));
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(std::move(tu)));
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(std::move(tu)));
 
   auto ku = std::make_unique<Sink>(&sess, "sink", std::vector<InEdge>{{t2i, 0}},
                                    FlexData::make_object());

@@ -12,7 +12,7 @@
 namespace vpipe {
 
 // Source stage: choose a diffusion SCHEDULER (the sigma schedule) and emit its
-// spec as a FlexData beat, once, on oport0. A `text-to-image` stage latches it
+// spec as a FlexData beat, once, on oport0. A `generate-image` stage latches it
 // off its optional scheduler iport. Pairs with `diffusion-sampler-select` (the
 // integrator) -- scheduler and sampler are the two independent choices.
 //
@@ -26,7 +26,7 @@ namespace vpipe {
 // rho        -- karras curvature (default 7).
 //
 // This stage is MODEL-AGNOSTIC: it forwards the user's schedule choice and does
-// not read any model's scheduler config (the text-to-image stage owns the
+// not read any model's scheduler config (the generate-image stage owns the
 // model). The built-in distilled turbo defaults apply unless a config field
 // overrides (simple / 8 / 1.15 / exponential / 7).
 //

@@ -1162,6 +1162,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       // streamed tail) so a slow preloaded step at high resolution responds to a
       // stop request within one block (~ms) instead of running all 60.
       if (_stream_stop && _stream_stop()) { return {}; }
+      if (_block_progress) { _block_progress(L, n_layers); }
       // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams
       // from the retained mmap into a loop-local Block, freed at the end of the
       // iteration (after the flush commits its work).

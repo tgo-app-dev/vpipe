@@ -1,5 +1,6 @@
 set(LOCAL_SOURCES
   command-sandbox.cc
+  console-writer.cc
   credential-store.cc
   db-log-delegate.cc
   ffmpeg-libraries.cc
@@ -45,6 +46,7 @@ if(APPLE)
 endif()
 set(LOCAL_HEADERS
   command-sandbox.h
+  console-writer.h
   credential-store.h
   db-log-delegate.h
   encoded-segment.h

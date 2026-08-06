@@ -1,7 +1,7 @@
 // Krea-2 sampler/scheduler refactor: the interchangeable FlowSampler (euler /
 // heun / dpmpp_2m / dpmpp_sde) + FlowScheduler (simple / karras / exponential),
 // the diffusion-sampler-select + scheduler-select config stages, and
-// text-to-image latching both specs off ports.
+// generate-image latching both specs off ports.
 //
 //  * specs round-trip through FlexData; method/type aliases + fallbacks.
 //  * the simple euler schedule is bit-identical to the old baked-in turbo.
@@ -11,7 +11,7 @@
 //    deterministic given a seed.
 //  * the select stages resolve defaults (built-in + from a model) + overrides.
 //  * [env] end-to-end: diffusion-sampler-select + scheduler-select wired into
-//    text-to-image's ports yield a latent bit-identical to the default path.
+//    generate-image's ports yield a latent bit-identical to the default path.
 
 #include "minitest.h"
 
@@ -28,7 +28,7 @@
 #include "stages/diffusion-sampler-select-stage.h"
 #include "stages/scheduler-select-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
-#include "stages/text-to-image-stage.h"
+#include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
 #include <cmath>
@@ -330,7 +330,7 @@ TEST(krea2_sampler, scheduler_select_resolves_defaults_and_overrides)
 // ---- model-agnostic select stages + end-to-end ports --------------------
 
 // The sampler/scheduler select stages forward the user's choice and DO NOT read
-// the model (the text-to-image stage owns it). With no config they emit the
+// the model (the generate-image stage owns it). With no config they emit the
 // built-in distilled-turbo defaults, and a stray `model` key is simply ignored
 // (it is no longer a declared config attr) -- so the model path can no longer
 // silently change the emitted spec.
@@ -400,7 +400,7 @@ public:
   }
 };
 
-// Chain a diffusion-conditioner between `src` (prompt) and the text-to-image
+// Chain a diffusion-conditioner between `src` (prompt) and the generate-image
 // stage -- the encoder half moved there. Returns the conditioner.
 Stage*
 add_conditioner_(Pipeline* pl, Session& sess, Stage* src,
@@ -450,8 +450,8 @@ run_t2i(Session& sess, const std::string& root, const std::string& gdir,
       ? std::vector<InEdge>{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
                             {sel, 0}, {sch, 0}}
       : std::vector<InEdge>{{cond, 0}};
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
-      std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(
+      std::make_unique<GenerateImageStage>(&sess, "t2i", std::move(ip),
                                          std::move(cfg))));
   if (!t2i->config_error().empty()) { return {}; }
   auto* sink = static_cast<SinkCap*>(pl->insert_stage(
@@ -526,8 +526,8 @@ TEST(krea2_sampler, dpmpp_2m_karras_end_to_end)
   // sampler/scheduler are iport3/iport4 (model iport2 left unwired here).
   std::vector<InEdge> ip{{cond, 0}, InEdge{nullptr, 0}, InEdge{nullptr, 0},
                          {sel, 0}, {sch, 0}};
-  auto* t2i = static_cast<TextToImageStage*>(pl->insert_stage(
-      std::make_unique<TextToImageStage>(&sess, "t2i", std::move(ip),
+  auto* t2i = static_cast<GenerateImageStage*>(pl->insert_stage(
+      std::make_unique<GenerateImageStage>(&sess, "t2i", std::move(ip),
                                          std::move(cfg))));
   ASSERT_TRUE(t2i->config_error().empty());
   FlexData vcfg = FlexData::make_object();
