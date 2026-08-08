@@ -26,6 +26,10 @@ import { makeIcon } from './icons.js';
 import { t } from './i18n.js';
 import { api } from './api.js';
 import { createFsList, joinPath } from './fs-list.js';
+import { createFsPreview } from './fs-preview.js';
+
+// Remembers the side-preview toggle across dialogs and reloads.
+const LS_PREVIEW = 'vpipe_fs_preview';
 
 // Category -> extension set. Kept in sync with the backend `path_filter`
 // keywords a stage may declare (stage-config.h). Lower-case, dot-led.
@@ -99,8 +103,14 @@ export function openFsDialog(opts = {}) {
   // or a lazily-loaded page while scrolling). Driven by the list's onLoading.
   const busyEl = el('span', { class: 'fs-busy' }, makeIcon('hourglass', 'sm'));
   busyEl.hidden = true;
+  // Side preview panel, off by default and remembered. A dialog is
+  // usually a two-second errand -- pick the file you already know -- so
+  // the panel earns its width only when the user is actually looking for
+  // something, and that is a per-user habit rather than a per-call one.
+  const previewBtn = el('button', { class: 'btn ghost mini', type: 'button',
+    title: t('fs.preview_toggle') }, makeIcon('image', 'sm'));
   const bar = el('div', { class: 'fs-bar' }, upBtn, refreshBtn, mkdirBtn,
-    pathIn, busyEl);
+    pathIn, busyEl, previewBtn);
 
   const nameIn = el('input', { type: 'text', class: 'fs-name',
     placeholder: t('fs.filename'), value: opts.defaultName || '' });
@@ -123,6 +133,10 @@ export function openFsDialog(opts = {}) {
       if (mode === 'save' && entries.length === 1 && !entries[0].dir) {
         nameIn.value = entries[0].name;
       }
+      // Preview the last of a multi-selection: it is the one the user
+      // just touched, and the panel shows one file.
+      selEntry = entries.length ? entries[entries.length - 1] : null;
+      showSelectedPreview();
       renderStatus();
     },
     onMount: (m) => navigate(m.path),
@@ -150,8 +164,47 @@ export function openFsDialog(opts = {}) {
   if (filterSel) { footRow.append(filterSel); }
 
   const statusEl = el('div', { class: 'fs-status' });
-  const body = el('div', { class: 'fs-dialog' }, bar, listBox,
+  // The list and the preview sit side by side; with the panel off the
+  // row holds only the list, so the dialog keeps exactly its old shape.
+  const preview = createFsPreview();
+  const previewBox = el('div', { class: 'fs-preview' }, preview.el);
+  const midRow = el('div', { class: 'fs-mid' }, listBox, previewBox);
+  const body = el('div', { class: 'fs-dialog' }, bar, midRow,
     footRow, statusEl);
+
+  let previewOn = false;
+  try { previewOn = localStorage.getItem(LS_PREVIEW) === '1'; }
+  catch (e) { /* storage blocked -- default off */ }
+  function applyPreview() {
+    previewBox.hidden = !previewOn;
+    // The MODAL is what widens: its max-width (92vw) then still caps the
+    // result. Sizing the inner .fs-dialog instead overrode that cap and
+    // pushed the panel's contents off the right of the window.
+    const modal = body.closest('.modal');
+    if (modal) { modal.classList.toggle('fs-wide', previewOn); }
+    previewBtn.classList.toggle('active', previewOn);
+    previewBtn.setAttribute('aria-pressed', previewOn ? 'true' : 'false');
+    // Coming back on, fill from whatever is already selected rather than
+    // waiting for the user to re-click a row they have already chosen.
+    if (previewOn) { showSelectedPreview(); }
+  }
+  previewBtn.addEventListener('click', () => {
+    previewOn = !previewOn;
+    try { localStorage.setItem(LS_PREVIEW, previewOn ? '1' : '0'); }
+    catch (e) { /* storage blocked -- the toggle still works this call */ }
+    applyPreview();
+  });
+  // The dialog's own notion of "what is selected" -- kept because the
+  // list reports selections by name and the preview needs the entry.
+  let selEntry = null;
+  function showSelectedPreview() {
+    if (!previewOn) { return; }
+    if (selEntry && !selEntry.dir) { preview.show(cur, selEntry); }
+    else { preview.empty(); }
+  }
+  // Reflect the REMEMBERED setting now; without this the stored value is
+  // read and then never applied, so the panel is off on every open.
+  applyPreview();
 
   // ---- helpers ------------------------------------------------------
   function commit(result) { onPick(result); close(); }
@@ -332,6 +385,13 @@ export function openFsDialog(opts = {}) {
     ],
   });
   close = () => { list.destroy(); closeModal(); };
+
+  // Re-apply now that the body is INSIDE the modal. The first call ran
+  // while building `body`, when closest('.modal') was still null -- so
+  // the panel appeared but the modal never widened, and the list was
+  // squeezed instead. Only visible on a viewport wide enough for the cap
+  // not to hide it.
+  applyPreview();
 
   navigate(opts.startDir || '');
   setTimeout(() => { (mode === 'save' ? nameIn : pathIn).focus(); }, 0);

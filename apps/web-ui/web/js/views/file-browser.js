@@ -19,14 +19,11 @@ import { el, clear, openModal, toast } from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
-import { createFsList, humanSize, joinPath } from '../fs-list.js';
+import { createFsList, joinPath } from '../fs-list.js';
 // Extension -> preview category, shared with the phone browser so the
 // two can't disagree about what previews.
-import { categorize, iconFor } from '../fs-kinds.js';
-
-// One screen of text: bytes fetched for a text preview (Range-capped so a
-// huge file is never pulled whole).
-const TEXT_PREVIEW_BYTES = 64 * 1024;
+import { iconFor } from '../fs-kinds.js';
+import { createFsPreview } from '../fs-preview.js';
 
 // The list pane's paging + virtualization live in the shared createFsList
 // component (fs-list.js), used by the open/save dialog too. This view keeps
@@ -35,7 +32,7 @@ const TEXT_PREVIEW_BYTES = 64 * 1024;
 let fbList = null;
 
 // ---- server forward-slash path helpers (namespace-agnostic) ----------
-// joinPath / humanSize are shared from fs-list.js.
+// joinPath is shared from fs-list.js.
 
 function isPrefix(base, full) {
   if (!base || base === '/') { return true; }
@@ -140,70 +137,12 @@ export function mountFileBrowser(container) {
   }
 
   // ---- preview ----------------------------------------------------
-  function renderPreviewEmpty() {
-    clear(prevBody);
-    prevBody.append(el('div', { class: 'fb-preview-empty' },
-      t('fb.pick_to_preview')));
-  }
-
-  function metaLine(e) {
-    return el('div', { class: 'fb-file-meta' },
-      e.name + '  ·  ' + humanSize(e.size || 0));
-  }
-
-  function showUnpreviewable(e, url) {
-    clear(prevBody);
-    prevBody.append(el('div', { class: 'fb-preview-empty' },
-      metaLine(e),
-      el('div', { class: 'fb-no-preview' }, t('fb.no_preview')),
-      el('a', { class: 'btn', href: url, download: e.name },
-        makeIcon('load', 'sm'), el('span', {}, t('fb.download')))));
-  }
-
-  function showPreview(e) {
-    const vpath = joinPath(curDir, e.name);
-    const url = api.fsFileUrl(vpath);
-    const cat = categorize(e.name);
-    clear(prevBody);
-
-    if (cat === 'image') {
-      const img = el('img', { class: 'fb-img', alt: e.name, src: url });
-      img.addEventListener('error', () => showUnpreviewable(e, url));
-      prevBody.append(el('div', { class: 'fb-preview-inner' },
-        metaLine(e), el('div', { class: 'fb-media-wrap' }, img)));
-    } else if (cat === 'video') {
-      const v = el('video', { class: 'fb-video', controls: true,
-        preload: 'metadata', src: url });
-      v.addEventListener('error', () => showUnpreviewable(e, url));
-      prevBody.append(el('div', { class: 'fb-preview-inner' },
-        metaLine(e), el('div', { class: 'fb-media-wrap' }, v)));
-    } else if (cat === 'audio') {
-      const a = el('audio', { class: 'fb-audio', controls: true,
-        preload: 'metadata', src: url });
-      a.addEventListener('error', () => showUnpreviewable(e, url));
-      prevBody.append(el('div', { class: 'fb-preview-inner audio' },
-        metaLine(e), el('div', { class: 'fb-media-wrap audio' }, a)));
-    } else if (cat === 'text') {
-      const pre = el('pre', { class: 'fb-text allow-context-menu' },
-        t('common.loading'));
-      const note = el('div', { class: 'fb-note', hidden: true });
-      prevBody.append(el('div', { class: 'fb-preview-inner' },
-        metaLine(e), note, pre));
-      api.fsText(vpath, TEXT_PREVIEW_BYTES).then((res) => {
-        clear(pre).append(document.createTextNode(res.text));
-        if (res.truncated) {
-          note.hidden = false;
-          note.textContent = t('fb.truncated',
-            { n: humanSize(TEXT_PREVIEW_BYTES) });
-        }
-      }).catch((err) => {
-        clear(pre).append(document.createTextNode(
-          t('fb.preview_failed', { msg: err.message })));
-      });
-    } else {
-      showUnpreviewable(e, url);
-    }
-  }
+  // The rendering itself is the shared component (fs-preview.js), which
+  // the open/save dialog's side panel uses too.
+  const preview = createFsPreview();
+  prevBody.append(preview.el);
+  const renderPreviewEmpty = () => preview.empty();
+  const showPreview = (e) => preview.show(curDir, e);
 
   // ---- directory tree (lazy) --------------------------------------
   function makeNode(vpath, name, depth) {

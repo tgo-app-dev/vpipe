@@ -7,6 +7,7 @@
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
@@ -67,6 +68,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _mixed_frac    = static_cast<float>(attr_real("mixed_frac"));
   _layer_prefix  = attr_str("layer_prefix");
   _quant_modulation = attr_bool("quant_modulation");
+  _quant_vision     = attr_bool("quant_vision");
   _klein_kv      = attr_bool("klein_kv");
   _n_layers      = static_cast<int>(attr_uint("n_layers"));
 
@@ -139,6 +141,11 @@ dit_class_family_(const std::string& class_name)
   // Wan video. Its two A14B experts are separate checkpoints, so each is
   // quantized by pointing src_model at that expert's own directory.
   if (class_name == "WanTransformer3DModel") { return "wan"; }
+  // MiniMax-H3: one 33B single-stream stack emitting video AND audio. Its
+  // partitions (FL2VA / Ref2VA) ship byte-identical transformer configs, so
+  // the class name is all there is to go on -- and all there needs to be,
+  // since the quant leaf set does not depend on the partition.
+  if (class_name == "MiniMaxH3DiTModel") { return "minimax-h3"; }
   return {};
 }
 
@@ -164,6 +171,30 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family)
     if (!o.contains("_class_name")) { return {}; }
     return dit_class_family_(std::string(o.at("_class_name").as_string("")));
   };
+  // A Comfy-Org single-file DiT, named directly or through the repo root
+  // / diffusion_models subdir. It has no config.json -- the transformer
+  // config is in the safetensors `__metadata__` -- so the quantizer is
+  // handed the FILE and lifts the config out of it (model-quantizer.cc),
+  // writing a directory checkpoint that records the qkv order the source
+  // was in.
+  {
+    const std::string f = genai::comfy::resolve_component(
+        src_dir, "diffusion_models", "config", {"fl2va"});
+    if (!f.empty()) {
+      FlexData md;
+      if (genai::comfy::metadata_json(f, "config", md, nullptr) &&
+          md.is_object() && md.as_object().contains("transformer")) {
+        const FlexData t = md.as_object().at("transformer");
+        auto to = t.as_object();
+        const FlexData im_fd =
+            to.contains("image_model") ? to.at("image_model") : FlexData();
+        if (std::string(im_fd.as_string("")) == "minimax_h3") {
+          if (family != nullptr) { *family = "minimax-h3"; }
+          return f;
+        }
+      }
+    }
+  }
   std::string fam = family_of(fs::path(src_dir) / "config.json");
   if (!fam.empty()) { if (family) { *family = fam; } return src_dir; }
   const fs::path sub = fs::path(src_dir) / "transformer";
@@ -212,6 +243,45 @@ t2i_target_subdir_(const std::string& target)
     return "text_encoder";
   }
   if (target == "vae") { return "vae"; }
+  return {};
+}
+
+// The fast tokenizer.json that goes WITH a text encoder, wherever its
+// publisher put it: beside the weights (a diffusers text_encoder/), in
+// the pipeline's tokenizer/ (Krea-2, FLUX.2, and the Comfy-Org repack,
+// whose borrowed companion lands there), or in processor/
+// (Qwen-Image-Edit, whose tokenizer/ holds only the slow vocab.json +
+// merges). "" when there is none.
+//
+// Shared by the two callers that need it -- AWQ auto-calibration, which
+// reads it, and the output copy, which carries it -- so they cannot
+// drift into disagreeing about where an encoder's tokenizer lives.
+// `enc_dir` is the encoder DIRECTORY or, for a Comfy-Org repack, the
+// single .safetensors FILE; only the directory form has a tokenizer
+// beside it.
+std::string
+find_tokenizer_json_(const std::string& enc_dir, const std::string& root)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::vector<fs::path> cands;
+  if (fs::is_directory(fs::path(enc_dir), ec) && !ec) {
+    cands.push_back(fs::path(enc_dir) / "tokenizer.json");
+    cands.push_back(fs::path(enc_dir) / "tokenizer" / "tokenizer.json");
+  }
+  // The first four are the encoder's OWN search
+  // (MiniMaxH3TextEncoder::load), deliberately: a tokenizer that the
+  // runtime would load and the quantizer would not find is the worst of
+  // the three outcomes, because it works until the copy leaves the repo.
+  // A bare tokenizer.json at the repo root is what dropping MiniMaxAI's
+  // beside a repack looks like when nobody made a tokenizer/ for it.
+  cands.push_back(fs::path(root) / "tokenizer.json");
+  cands.push_back(fs::path(root) / "tokenizer" / "tokenizer.json");
+  cands.push_back(fs::path(root) / "processor" / "tokenizer.json");
+  for (const fs::path& p : cands) {
+    std::error_code lec;
+    if (fs::exists(p, lec) && !lec) { return p.string(); }
+  }
   return {};
 }
 
@@ -377,6 +447,26 @@ dit_quant_linears_(const std::string& family)
     // needed -- unlike Boogu, this family has no leaf collisions.
     return {"to_q", "to_k", "to_v", "0", "proj", "2"};
   }
+  if (family == "minimax-h3") {
+    // One single-stream block kind, repeated 50 times plus 2 token-refiner
+    // blocks that share the same leaves: a FUSED qkv, the attention output,
+    // and a gated feed-forward whose fc1 carries value|gate concatenated.
+    //
+    // What is deliberately NOT here is the whole rest of the model, and all
+    // of it is both small and precision-sensitive:
+    //   video_patch_proj / audio_patch_proj / condition_proj
+    //                     every latent voxel, audio frame and text row
+    //                     enters through these (~28M params together);
+    //   time_embedder.proj_in / proj_out
+    //                     feeds the modulation of all 50 blocks -- and vpipe
+    //                     runs this MLP on the host in f32 on purpose;
+    //   final_layer.video_out / audio_out
+    //                     every velocity value leaves through them.
+    // None of their leaves collides with this set, so no exclude list is
+    // needed. `adaln_proj.linear` is handled separately: it is 40% of the
+    // model and only quantized under quant_modulation.
+    return {"qkv_proj", "out_proj", "fc1", "fc2"};
+  }
   if (family == "boogu-image") {
     // Boogu's NextDiT. Every block kind contributes: the refiners + single
     // stream use attn.to_{q,k,v}/to_out.0 and feed_forward.linear_{1,2,3}; the
@@ -523,6 +613,15 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "n_layers", .type = ConfigType::Uint,
    .doc = "layer count for awq/mixed; 0 => auto-detect from config.json",
    .def_uint = 0},
+  {.key = "quant_vision", .type = ConfigType::Bool,
+   .doc = "text-encoder passes: also quantize the checkpoint's VISION "
+          "tower (visual.*) instead of passing it through bf16. Off by "
+          "default because a tower is precision-sensitive and, for the "
+          "encoders quantized here, small next to the language stack. "
+          "Worth turning on for a multimodal encoder used TEXT-ONLY -- "
+          "MiniMax-H3 taps a Qwen3-VL backbone and never runs its tower, "
+          "so the ~1.5 GB it costs at bf16 is pure carry",
+   .def_bool = false},
   {.key = "quant_modulation", .type = ConfigType::Bool,
    .doc = "Qwen-Image-Edit and Boogu-Image DiTs: also quantize the AdaLN "
           "modulation projections (QIE *_mod.1; Boogu norm*.linear). They are "
@@ -662,12 +761,64 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   std::string t2i_family;
   const std::string dit_dir = resolve_t2i_dit_dir_(src_dir, &t2i_family);
   if (!dit_dir.empty()) {
-    const bool is_root = (dit_dir != src_dir);   // src is the pipeline ROOT
+    // src is the pipeline ROOT -- a directory holding transformer/ and
+    // its siblings. A resolution to a FILE is not that: a Comfy-Org
+    // repack ships one .safetensors per component and no pipeline
+    // manifest, so there is nothing to copy around the DiT and it takes
+    // the bare-component path below.
+    const bool is_root =
+        (dit_dir != src_dir) && fs::is_directory(fs::path(dit_dir), ec);
     if (is_root) {
       // Self-contained pass: copy every component, quantize the `target` one
       // (default the DiT), register as a full pipeline usable as an hf_dir.
       // Chainable across passes (DiT, then text_encoder, ...).
       return quantize_t2i_pipeline_(src_dir, t2i_family, out_dir, stop);
+    }
+    // A Comfy-Org repo reaches here as the DiT FILE. `target` then picks
+    // a SIBLING component out of the same repo -- the layout has no
+    // subdirectory per component for the pipeline path below to walk, so
+    // the selection happens here instead.
+    if (!_target.empty() && t2i_target_subdir_(_target) != "transformer" &&
+        !fs::is_directory(fs::path(dit_dir), ec)) {
+      const std::string sub = t2i_target_subdir_(_target);
+      if (sub == "text_encoder") {
+        const std::string enc = genai::comfy::resolve_component(
+            src_dir, "text_encoders", "minimax_h3_te", {"qwen3vl"});
+        if (enc.empty()) {
+          // The catalogue DOES pin the bf16 encoder, so reaching here
+          // means either a partial checkout or a repo holding only the
+          // int8_convrot / nvfp4_awq packings, which resolve_component
+          // skips because nothing here reads them. Name both, since the
+          // fix differs: re-fetch versus "that precision is not usable".
+          session()->warn(fmt(
+              "ModelQuantizeStage('{}'): '{}' has no READABLE text encoder "
+              "under text_encoders/ -- either the checkout is partial "
+              "(the catalogue pins the bf16 one) or it holds only "
+              "packings this build cannot read", this->id(), src_dir));
+          return false;
+        }
+        // The output is a directory checkpoint from here on, so it
+        // registers as an encoder like any other -- the quantizer writes
+        // it the config.json the repack does not have.
+        if (!quantize_text_encoder_(enc, out_dir, src_dir, stop)) {
+          return false;
+        }
+        session()->log_normal(fmt(
+            "ModelQuantizeStage('{}'): quantized Comfy-Org text encoder "
+            "'{}' -> '{}' ({}-bit g{})", this->id(), enc, out_dir, _bits,
+            _group_size));
+        if (!explicit_path) {
+          register_output_(_output_name, out_dir, "minimax-h3-text-encoder",
+                           _bits);
+        }
+        return true;
+      }
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): target='{}' is not quantizable for the "
+          "Comfy-Org repack '{}' -- VAE quantization is not supported for "
+          "any family (a diffusion VAE is a conv net, not a Linear stack)",
+          this->id(), _target, src_dir));
+      return false;
     }
     // src is a bare transformer dir -> transformer-only output for the
     // generate-image `dit_dir` override (registered "<family>-dit"). Only the
@@ -962,6 +1113,27 @@ ModelQuantizeStage::quantize_dit_component_(
   }
   opt.quant_linears    = dit_quant_linears_(family);
   const bool is_wan = (family == "wan");
+  const bool is_h3  = (family == "minimax-h3");
+  if (_quant_modulation && is_h3) {
+    // H3's modulation is not a small side projection like the others': its
+    // per-block `adaln_proj.linear` is 2688 -> 96768 (6 modulation vectors x
+    // 3 modalities x hidden), which is 260M of each block's 645M -- 13B of
+    // the 33B model. Leaving it bf16 caps a 4-bit checkpoint at ~36 GB,
+    // which is most of the reason to quantize at all, so this opt-in matters
+    // more here than anywhere else.
+    //
+    // Still w8: the modulation is what the residual scale rides on, and the
+    // per-tensor bit detection in the loader means body @ 4 + modulation @ 8
+    // loads with no config to keep in sync. The leaf is unique to the two
+    // adaln_proj sites (per-block and final_layer).
+    opt.quant_linears.push_back("linear");
+    opt.high_bit_leaves.push_back("linear");
+    opt.high_bits = 8;
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): quantizing the AdaLN modulation "
+        "(adaln_proj.linear, 13B of 33B) at 8-bit; body stays {}-bit",
+        this->id(), _bits));
+  }
   if (_quant_modulation && (is_qie || is_boogu || is_wan)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
@@ -1122,13 +1294,51 @@ ModelQuantizeStage::quantize_text_encoder_(
   // prefix (q/k/v/o_proj, gate/up/down_proj) -- the default linear set matches
   // it prefix-agnostically. CRITICAL: keep embed_tokens bf16 (quant_embeddings
   // off) -- the generate-image stage host-gathers it as a plain table.
-  const genai::QuantArchInfo meta =
-      genai::detect_quant_arch(session(), enc_dir);
+  genai::QuantArchInfo meta = genai::detect_quant_arch(session(), enc_dir);
+  // `detect_quant_arch` gets the layer prefix and depth by PROBING the
+  // weights, which works on a Comfy-Org single file -- but the family
+  // tag comes from config.json's model_type, which a repack has none of,
+  // so it lands on "unknown". The repo around the file does know: its
+  // diffusion_models/ entry names the architecture. Read that rather
+  // than shipping an encoder whose record says "unknown", which is what
+  // a picker filters on.
+  if (meta.arch.empty() || meta.arch == "unknown") {
+    for (const auto& c : genai::comfy::scan_repo(root)) {
+      if (c.role != "diffusion_models") { continue; }
+      FlexData md;
+      if (!genai::comfy::metadata_json(c.file, "config", md, nullptr) ||
+          !md.is_object() || !md.as_object().contains("transformer")) {
+        continue;
+      }
+      const FlexData t = md.as_object().at("transformer");
+      auto to = t.as_object();
+      const FlexData im =
+          to.contains("image_model") ? to.at("image_model") : FlexData();
+      if (std::string(im.as_string("")) == "minimax_h3") {
+        meta.arch = "minimax-h3";
+        break;
+      }
+    }
+  }
   genai::QuantizeOptions opt;
   opt.bits  = _bits;
   opt.group = _group_size;
   opt.quant_embeddings = false;
   opt.norm_offset      = false;   // qwen3_vl uses standard RMSNorm
+  // Record the ROLE in the output, so a bare quantized encoder is still
+  // recognizable after it leaves the pipeline it came from. Its own
+  // config only says "qwen3_vl", which is the architecture, not the job.
+  if (meta.arch == "minimax-h3") {
+    opt.component_tag = "minimax-h3-text-encoder";
+  }
+  if (_quant_vision) {
+    // The tower's linears are named nothing like the backbone's
+    // (attn.qkv / attn.proj / mlp.linear_fc{1,2} / merger.linear_fc*),
+    // so they need the wholesale rule while the backbone keeps the leaf
+    // set. Both run in ONE pass -- two passes would each write a full
+    // set of shards, and the second would not see the first's.
+    opt.quant_extra_scopes = {"visual."};
+  }
   session()->info(fmt(
       "ModelQuantizeStage('{}'): text encoder '{}' (arch '{}', {} layers, "
       "prefix '{}')", this->id(), enc_dir, meta.arch, meta.n_layers,
@@ -1158,18 +1368,10 @@ ModelQuantizeStage::quantize_text_encoder_(
     std::string calib = _calib_dir;
     if (calib.empty()) {
       // On-device auto-calibration. The text encoder is a dense Qwen3
-      // backbone, so a plain text corpus exercises exactly the encoded path;
-      // its tokenizer lives in the pipeline root (the sub-dir has none).
-      // The fast tokenizer.json lives in the encoder dir, the pipeline
-      // tokenizer/ (Krea-2 / FLUX.2), or processor/ (Qwen-Image-Edit, whose
-      // tokenizer/ holds only the slow vocab.json + merges).
-      std::string tok = (fs::path(enc_dir) / "tokenizer.json").string();
-      if (!fs::exists(tok, ec)) {
-        tok = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
-      }
-      if (!fs::exists(tok, ec)) {
-        tok = (fs::path(root) / "processor" / "tokenizer.json").string();
-      }
+      // backbone, so a plain text corpus exercises exactly the encoded
+      // path; see find_tokenizer_json_ for where the tokenizer it needs
+      // can be.
+      const std::string tok = find_tokenizer_json_(enc_dir, root);
       calib = auto_calibrate_backbone_(enc_dir, meta, meta.n_layers, tok, stop);
       if (calib.empty()) { return false; }   // logged inside
       auto_calib = calib;
@@ -1184,6 +1386,48 @@ ModelQuantizeStage::quantize_text_encoder_(
   std::string err;
   const bool ran = mq.run(enc_dir, out_dir, opt, &err, stop);
   if (!auto_calib.empty()) { fs::remove_all(auto_calib, ec); }
+  if (ran) {
+    // Carry the tokenizer into the output. The quantizer copies sidecars
+    // only from a DIRECTORY source, and a Comfy-Org repack is a single
+    // file whose tokenizer is not beside it but at the repo root -- so
+    // without this, quantizing that encoder writes a checkpoint that
+    // registers fine and then fails to load for want of a tokenizer.json,
+    // which is a setup problem wearing the mask of a bad checkpoint.
+    const fs::path have = fs::path(out_dir) / "tokenizer.json";
+    if (!fs::exists(have, ec)) {
+      const std::string tok = find_tokenizer_json_(enc_dir, root);
+      if (tok.empty()) {
+        session()->warn(fmt(
+            "ModelQuantizeStage('{}'): no tokenizer.json found for '{}' "
+            "(looked beside it, and in '{}'s tokenizer/ and processor/); "
+            "'{}' will not encode a prompt until one is copied in",
+            this->id(), enc_dir, root, out_dir));
+      } else {
+        std::error_code cec;
+        fs::copy_file(tok, have, fs::copy_options::overwrite_existing, cec);
+        // Cheap and expected beside it by anything reading the output as
+        // a stock HF tokenizer; absent upstream is not an error.
+        const fs::path cfg_src =
+            fs::path(tok).parent_path() / "tokenizer_config.json";
+        std::error_code sec;
+        if (fs::exists(cfg_src, sec) && !sec) {
+          std::error_code c2;
+          fs::copy_file(cfg_src,
+                        fs::path(out_dir) / "tokenizer_config.json",
+                        fs::copy_options::overwrite_existing, c2);
+        }
+        if (cec) {
+          session()->warn(fmt(
+              "ModelQuantizeStage('{}'): could not copy '{}' into '{}': {}",
+              this->id(), tok, out_dir, cec.message()));
+        } else {
+          session()->log_debug(fmt(
+              "ModelQuantizeStage('{}'): carried '{}' into '{}'",
+              this->id(), tok, out_dir));
+        }
+      }
+    }
+  }
   if (!ran) {
     if (stop()) {
       session()->info(fmt(

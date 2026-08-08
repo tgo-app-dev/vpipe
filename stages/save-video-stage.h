@@ -18,6 +18,20 @@ namespace vpipe {
 // `enable_video` / `enable_audio`. With both enabled, port 0 is video
 // and port 1 is audio. With only one enabled, that one is port 0.
 //
+// The audio port ALSO accepts raw PCM: a TensorBeatPayload of f32
+// samples, rank-2 [channels, n_samples] PLANAR or rank-1 [n_samples]
+// mono, with `sample_rate` (and optionally `channels`) on the
+// sideband. That is what the generative audio path emits -- there is
+// no ffmpeg decoder upstream of `audio-vae-decode` to produce a
+// header, and the alternative would be a pcm-to-audio adapter stage
+// that existed only to restate a rate this stage can read off the
+// beat. The first PCM beat both configures the encoder and carries
+// samples; the stage then chunks to the encoder's frame_size and
+// timestamps from a running sample count, so several beats
+// concatenate seamlessly. The samples must be in the encoder's
+// sample format (FLTP for the default AAC) -- there is no
+// swresample here, so a mismatch surfaces at avcodec_open2.
+//
 // Configuration (FlexData object):
 //   output_url       (string, required)
 //   format           (string, default "")     -- container; "" = inferred
@@ -85,6 +99,11 @@ private:
   void open_output_and_write_header_();
   bool ready_to_write_header_() const noexcept;
   void encode_and_mux_(unsigned port, AVFrame* frame);
+  // Raw-PCM audio: derive the stream header from a TensorBeat's shape
+  // and sideband, and encode its samples in frame_size chunks.
+  bool audio_params_from_pcm_(const class TensorBeatPayload& t,
+                              AudioStreamParams* out);
+  void encode_pcm_(const class TensorBeatPayload& t);
   void drain_encoder_(AVCodecContext* enc, AVStream* st);
   void finalize_();
   // Free the muxer/encoder objects (finalizing first if needed).
@@ -143,6 +162,14 @@ private:
   bool _audio_eos         = false;
   bool _header_written    = false;
   bool _finalized         = false;
+  // The audio port carries raw PCM TensorBeats rather than the
+  // header + FrameRef protocol. Latched from the first beat's type.
+  bool _audio_pcm         = false;
+  // Running sample count, which IS the pts in the encoder's
+  // {1, sample_rate} time base. Per-run, so a relaunch restarts at 0
+  // rather than writing a clip that begins minutes in.
+  int64_t _audio_pts      = 0;
+  AVFrame* _apcm_frame    = nullptr;   // reused frame_size scratch
 
   int _next_port = 0;
 };

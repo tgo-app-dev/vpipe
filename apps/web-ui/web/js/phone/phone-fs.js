@@ -56,7 +56,7 @@ export function mountFsBrowser(host, opts = {}) {
   // fetches in flight, and the slower one must not win.
   let gen = 0;
 
-  async function go(dir) {
+  async function go(dir, retried) {
     const mine = ++gen;
     clear(listEl).append(
       el('div', { class: 'ph-sheet-hint' }, t('common.loading')));
@@ -65,6 +65,12 @@ export function mountFsBrowser(host, opts = {}) {
       d = await api.fsList(dir, opts.exts ? { exts: opts.exts } : {});
     } catch (e) {
       if (mine !== gen) { return; }
+      // Fall back to the default directory once, so a bad SEED still
+      // opens a usable sheet -- the field may hold a path this server
+      // cannot browse (outside the sandbox, or since deleted), and the
+      // error branch never draws the path bar, so without this the only
+      // control left is Cancel. The desktop dialog does the same.
+      if (dir && !retried) { go('', true); return; }
       clear(listEl).append(el('div', { class: 'ph-sheet-hint' },
         t('fs.list_failed', { msg: e.message })));
       return;

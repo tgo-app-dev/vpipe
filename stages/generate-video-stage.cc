@@ -8,16 +8,19 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
+#include "stages/denoise-progress.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #endif
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -63,6 +66,19 @@ const ConfigKey kAttrs[] = {
    .doc = "sigma at which the low-noise expert takes over from the high-noise "
           "one. Read from the checkpoint's model_index.json when present; 0 "
           "means a single expert", .def_real = 0.9},
+  {.key = "video_shift", .type = ConfigType::Real, .required = false,
+   .doc = "sigma shift for the VIDEO schedule (minimax-h3; inert on wan, "
+          "which takes its shift from the scheduler spec)",
+   .def_real = 12.0},
+  {.key = "audio_shift", .type = ConfigType::Real, .required = false,
+   .doc = "sigma shift for the AUDIO schedule (minimax-h3)", .def_real = 3.0},
+  {.key = "condition_timestep", .type = ConfigType::Real, .required = false,
+   .doc = "the timestep the pinned keyframe rows are conditioned on "
+          "(minimax-h3); 1.0 is CLEAN in this model's t = 1 - sigma "
+          "convention", .def_real = 1.0},
+  {.key = "audio_seconds", .type = ConfigType::Real, .required = false,
+   .doc = "audio duration for minimax-h3; 0 derives it from frames / fps",
+   .def_real = 0.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the expert's weights after each clip and reload on the next "
           "one. \"auto\" (default) decides from physical RAM vs the "
@@ -93,19 +109,32 @@ const PortSpec kIports[] = {
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0",
    .doc = "OPTIONAL image-to-video conditioning latent from vae-encode: f32 "
-          "[16, T, H/8, W/8], the VAE encoding of the conditioning image "
-          "followed by blank frames. Present => image-to-video",
+          "[16, T, H/8, W/8] for wan (the conditioning image followed by "
+          "blank frames), f32 [24, 1, H/16, W/16] for minimax-h3 (the "
+          "FIRST-frame keyframe anchor). Present => image-to-video",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref_latent1",
+   .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode "
+          "(minimax-h3 only; wan's i2v latent is one clip-shaped tensor). "
+          "With ref_latent0 this is the FL2VA first-and-last mode",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
 [[maybe_unused]] constexpr unsigned kSchedPort   = 4;
 [[maybe_unused]] constexpr unsigned kRefPort     = 5;
+[[maybe_unused]] constexpr unsigned kRefPort1    = 6;
 
 const PortSpec kOports[] = {
   {.name = "latent",
-   .doc = "f32 latent VIDEO [16, T, H/8, W/8] (whitened), sideband "
-          "{fps, frames}",
+   .doc = "f32 latent VIDEO [z, T, H/r, W/r] (whitened), sideband "
+          "{fps, frames}. z/r are the family's VAE geometry: 16/8 for wan, "
+          "24/16 for minimax-h3",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "latent", .clock_group = 0},
+  {.name = "audio_latent",
+   .doc = "f32 latent AUDIO [audio_channels, audio_latents], minimax-h3 "
+          "only -- the families that generate no audio never write it",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
 };
@@ -163,6 +192,10 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _guidance   = attr_real("guidance_scale");
   _guidance_2 = attr_real("guidance_scale_2");
   _boundary   = attr_real("boundary_ratio");
+  _video_shift   = attr_real("video_shift");
+  _audio_shift   = attr_real("audio_shift");
+  _cond_timestep = attr_real("condition_timestep");
+  _audio_seconds = attr_real("audio_seconds");
   if (_height <= 0) { _height = 480; }
   if (_width  <= 0) { _width  = 832; }
   if (_frames <= 0) { _frames = 81; }
@@ -175,13 +208,19 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                     "(the VAE's 8x downsample times the DiT's 2x patch)",
                     _height, _width));
   }
-  // F % 4 == 1 is not a rounding convenience: the VAE's first chunk is a
-  // single frame and every later one is four, so any other count has no
-  // latent representation at all.
-  if ((_frames % 4) != 1) {
-    fail_config(fmt("frames {} is not 4k+1; the video VAE compresses time in "
-                    "4-frame chunks after a 1-frame first chunk, so use 81, "
-                    "121, ...", _frames));
+  // The frame count is not a rounding convenience -- a count the VAE
+  // cannot chunk has no latent representation at all -- but the rule is
+  // PER FAMILY and the family is only known once the checkpoint's
+  // config.json is read, which happens after this constructor. Wan
+  // compresses in 4-frame chunks after a 1-frame first chunk (4k+1);
+  // MiniMax-H3 uses a 17-frame clip keeping 5 latents (17n+5, i.e. 5,
+  // 22, 39, 56, ... -- `align_num_frames(n, 17, 5)`). So reject only what
+  // NEITHER family can represent here, and let the H3 path below enforce
+  // its own rule exactly once it knows it is H3.
+  if ((_frames % 4) != 1 && (_frames % 17) != 5) {
+    fail_config(fmt("frames {} has no latent representation: wan needs 4k+1 "
+                    "(81, 121, ...) and minimax-h3 needs 17n+5 (22, 39, 56, "
+                    "..., 124)", _frames));
   }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
@@ -259,6 +298,68 @@ GenerateVideoStage::resolve_config_()
   namespace fs = std::filesystem;
   _root = resolve_model_dir(session(), _hf_dir);
   const std::string t1 = (fs::path(_root) / "transformer").string();
+  // The DiT's own `_class_name` picks the family. Reading it here rather
+  // than taking it from config keeps a graph from having to be rewired
+  // to change checkpoints -- the same stage, ports and keys serve both.
+  {
+    std::ifstream tin(fs::path(t1) / "config.json");
+    if (tin) {
+      FlexData tc;
+      try {
+        tc = FlexData::from_json(tin);
+      } catch (...) {
+        tc = FlexData::make_null();
+      }
+      if (tc.is_object()) {
+        auto o = tc.as_object();
+        const std::string cls(o.contains("_class_name")
+                                  ? o.at("_class_name").as_string("")
+                                  : "");
+        if (cls == "MiniMaxH3DiTModel") { _family = "minimax-h3"; }
+      }
+    }
+  }
+  if (_family == "minimax-h3") {
+    // Now that the family is known, hold the frame count to H3's own rule
+    // (see the constructor): the video VAE takes 17-frame clips and keeps
+    // 5 latents from each, so only 17n+5 has a latent representation.
+    if ((_frames % 17) != 5) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): frames {} is not 17n+5, which is what "
+          "the minimax-h3 video VAE can chunk (5, 22, 39, 56, 73, 90, 107, "
+          "124, ...); inert", this->id(), _frames));
+      return;
+    }
+    std::string h3err;
+    if (!genai::MetalMiniMaxH3Transformer::config_from_json(t1, _h3_cfg,
+                                                            &h3err)) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): {}; inert", this->id(), h3err));
+      return;
+    }
+    _two_experts = false;
+    _boundary    = 0.0;      // one stack; nothing to switch at
+    _have_cfg    = true;
+    if (!_unload_resolved) {
+      _unload_resolved = true;
+      const std::vector<std::string> peers = {
+          (fs::path(_root) / "text_encoder").string(),
+          (fs::path(_root) / "video_vae").string()};
+      switch (_unload_cfg) {
+        case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+        case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+        default:
+          _unload_idle = model_memory::bounded(session(), peers,
+                                               model_memory::kHeadroom);
+          break;
+      }
+    }
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
+        "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
+        _frames, _steps, _video_shift, _audio_shift));
+    return;
+  }
   std::string cerr;
   if (!genai::MetalWanTransformer::config_from_json(t1, _cfg, &cerr)) {
     session()->error(fmt(
@@ -294,6 +395,69 @@ GenerateVideoStage::resolve_config_()
 bool
 GenerateVideoStage::ensure_expert_(int which)
 {
+  if (_family == "minimax-h3") {
+    resolve_config_();
+    if (!_have_cfg) { return false; }
+    if (_h3_dit) { return true; }
+    auto* h3mc = session()->services()->metal_compute();
+    if (h3mc == nullptr) { return false; }
+    // The 33B DiT is the largest here: ~33 GB at w8, which does NOT fit
+    // resident beside the 10 GB video VAE on a 64 GB box -- and it is the
+    // SEQUENCE that decides, since the model's own default is 124 frames
+    // (37 latent frames, ~19k rows at 960x544). Preloading it works only
+    // for the short, low-resolution sequences that are outside the
+    // model's supported range anyway, so this asks the same question the
+    // other DiT families ask rather than assuming the stack fits.
+    namespace fs = std::filesystem;
+    const std::string dit_dir =
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root);
+    std::string enc_dir = (fs::path(dit_dir).parent_path() /
+                           "text_encoder").string();
+    if (!fs::exists(enc_dir)) { enc_dir.clear(); }
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool   stream_blocks = plan.stream;
+    double pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+      if (!stream_blocks) { pin_frac = 0.0; }
+    }
+    if (const char* e = std::getenv("VPIPE_H3_PIN_FRAC")) {
+      pin_frac = std::atof(e);
+    }
+    session()->log_debug(fmt(
+        "GenerateVideoStage('{}'): MiniMax-H3 footprint {} GB (others {} GB) "
+        "+ {} GB headroom -> {}", this->id(), plan.footprint >> 30,
+        plan.others >> 30, model_memory::kStreamHeadroom >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    _h3_dit = genai::MetalMiniMaxH3Transformer::load(
+        genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
+        stream_blocks, pin_frac);
+    if (_h3_dit && stream_blocks) {
+      // A streamed DiT holds ~one block, not the checkpoint, so the
+      // load-time claim would keep sizing every peer against 33 GB. What
+      // the SET holds is the right number: the retained top-level
+      // tensors are cached there, the streamed blocks deliberately are
+      // not.
+      auto* mgr = session()->services()->generative_model_manager();
+      auto ws = mgr != nullptr ? mgr->weight_set(dit_dir) : nullptr;
+      if (ws) {
+        const std::size_t held = ws->stats().bytes;
+        mgr->revise_declaration(dit_dir, held);
+        session()->log_debug(fmt(
+            "GenerateVideoStage('{}'): streaming DiT keeps {} MB resident, "
+            "revised down from {} MB on disk", this->id(), held >> 20,
+            model_memory::dir_weights_bytes(dit_dir) >> 20));
+      }
+    }
+    if (!_h3_dit) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): MiniMax-H3 DiT load failed from '{}'",
+          this->id(), _root));
+      return false;
+    }
+    return true;
+  }
   if (_dit && _expert == which) { return true; }
   resolve_config_();
   if (!_have_cfg) { return false; }
@@ -341,6 +505,270 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
     resolve_config_();
   }
   co_return;
+}
+
+namespace h3 = genai::minimax_h3;
+
+// The minimax-h3 denoise: one packed sequence carrying both modalities,
+// so this produces two latents where the Wan path produces one.
+bool
+GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
+                            int ref_frames,
+                            std::vector<float>* video_out,
+                            std::vector<int>* video_shape,
+                            std::vector<float>* audio_out,
+                            std::vector<int>* audio_shape)
+{
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !_h3_dit) { return false; }
+  const auto& c = _h3_cfg;
+
+  // Latent geometry. The video VAE compresses 16x spatially and 4x in
+  // time with the causal round-UP the encoder does, so the frame count
+  // is not a plain division.
+  const int lh = _height / 16, lw = _width / 16;
+  // The video VAE encodes in 17-frame clips that yield 5 latent frames
+  // each and then drops 3, so a request has to be snapped UP to a length
+  // the chunking can actually produce. These two are the released
+  // checkpoint's `vae_clip_length` / tokens-per-chunk; a checkpoint that
+  // changed them would want them read from video_vae/config.json rather
+  // than assumed here.
+  constexpr int kFramesPerChunk = 17, kLatentsPerChunk = 5;
+  const int aligned =
+      h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
+  const int lt =
+      h3::video_latent_num_frames(aligned, kFramesPerChunk, kLatentsPerChunk);
+  if (lh <= 0 || lw <= 0 || lt <= 0) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): {}x{}x{} does not give a usable "
+        "MiniMax-H3 latent grid", this->id(), _width, _height, _frames));
+    return false;
+  }
+  // Audio latents are counted from the VIDEO frames and fps, so the two
+  // modalities stay the same duration by construction. `audio_seconds`
+  // overrides that for a clip whose audio is deliberately a different
+  // length.
+  const int alat =
+      _audio_seconds > 0.0
+          ? (int)(_audio_seconds * (double)h3::kAudioLatentsPerSecond + 0.5)
+          : h3::audio_latent_num_frames(aligned, _fps);
+
+  h3::PackedLayout L;
+  const std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
+  // One latent frame per anchor. No ref => text-to-video-and-audio; one
+  // => a first-frame anchor; two => first AND last, which is what the
+  // FL2VA partition is named for.
+  std::vector<h3::Anchor> anchors;
+  if (ref != nullptr && ref_frames > 0) {
+    anchors.push_back(h3::Anchor::kFirst);
+    if (ref_frames >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  }
+  // h3::kAudioChannels is the STEREO count (2) -- how many soundtrack
+  // channels the audio rows are packed channel-major over. It is NOT
+  // `c.audio_channels`, which is the 32-wide audio LATENT that each of
+  // those rows carries. Passing the latter here packs 16x the audio rows
+  // the model was trained with; every one of them is a real row that the
+  // 33B forward pays for, and the result still decodes, just as a
+  // soundtrack whose two "channels" are slices of one 32-way split.
+  if (!h3::build_packed_sequence(tags, lt, lh, lw, alat, c.patch_h, c.patch_w,
+                                 h3::kAudioChannels, anchors, &L)) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): could not pack a {}x{}x{} latent with {} "
+        "audio latents", this->id(), lt, lh, lw, alat));
+    return false;
+  }
+
+  const int PE = c.video_patch_elems();
+  const int AC = c.audio_channels;
+  const int vrows = (int)L.video_indices.size();
+  std::vector<float> vid((std::size_t)vrows * PE);
+  std::vector<float> aud((std::size_t)L.num_audio_rows * AC);
+  {
+    std::mt19937_64 rng(_seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : vid) { v = nd(rng); }
+    for (auto& v : aud) { v = nd(rng); }
+  }
+  // Diagnostic: take the INITIAL NOISE from files instead of the RNG.
+  // A reference implementation draws from torch's generator, not from
+  // mt19937_64, so two runs of the same prompt are different SAMPLES and
+  // can only be compared by eye. Feeding both the same noise makes the
+  // comparison elementwise. Files are raw f32 already in ROW layout:
+  // video [num_video_indices, PE], audio [num_audio_rows, AC].
+  {
+    auto slurp = [&](const char* env, std::vector<float>& dst,
+                     const char* what) {
+      const char* p = std::getenv(env);
+      if (p == nullptr) { return; }
+      std::FILE* f = std::fopen(p, "rb");
+      if (f == nullptr) {
+        session()->warn(fmt("GenerateVideoStage('{}'): cannot open {} noise "
+                            "'{}'", this->id(), what, p));
+        return;
+      }
+      const std::size_t n = std::fread(dst.data(), 4, dst.size(), f);
+      std::fclose(f);
+      if (n != dst.size()) {
+        session()->warn(fmt("GenerateVideoStage('{}'): {} noise '{}' has {} "
+                            "floats, expected {}", this->id(), what, p, n,
+                            dst.size()));
+        return;
+      }
+      session()->info(fmt("GenerateVideoStage('{}'): loaded {} initial noise "
+                          "({} floats) from {}", this->id(), what, n, p));
+    };
+    slurp("VPIPE_H3_NOISE_VID", vid, "video");
+    slurp("VPIPE_H3_NOISE_AUD", aud, "audio");
+  }
+
+  // Patchify the anchors into the CONDITIONING rows, which lead the
+  // video block one whole latent frame per anchor and in the same cell
+  // order the generated frames use. The denoise loop never writes these
+  // rows, so what is put here is what the model sees at every step.
+  if (!anchors.empty()) {
+    const int gh0 = lh / c.patch_h, gw0 = lw / c.patch_w;
+    const int rows_per_frame = gh0 * gw0;
+    const std::size_t rplane = (std::size_t)lh * lw;
+    const int ZCr = c.video_channels;
+    for (std::size_t k = 0; k < anchors.size(); ++k) {
+      for (int cell = 0; cell < rows_per_frame; ++cell) {
+        float* row = vid.data() +
+                     ((std::size_t)k * rows_per_frame + cell) * PE;
+        const int by = (cell / gw0) * c.patch_h;
+        const int bx = (cell % gw0) * c.patch_w;
+        for (int ch = 0; ch < ZCr; ++ch) {
+          for (int y = 0; y < c.patch_h; ++y) {
+            for (int x = 0; x < c.patch_w; ++x) {
+              row[((std::size_t)ch * c.patch_h + y) * c.patch_w + x] =
+                  ref[((std::size_t)ch * ref_frames + (int)k) * rplane +
+                      (std::size_t)(by + y) * lw + (bx + x)];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Diagnostic: write the text conditioning the DiT is about to read to
+  // a raw f32 file, so the REFERENCE pipeline can be driven with the
+  // exact same rows. It is the one DiT input with no golden of its own
+  // (the encoder goldens stop at tap 3), and feeding it to the reference
+  // separates "our conditioning is wrong" from "everything downstream
+  // is wrong" without needing a 32B reference encoder to fit in RAM.
+  if (const char* dp = std::getenv("VPIPE_H3_COND_DUMP")) {
+    std::FILE* f = std::fopen(dp, "wb");
+    if (f != nullptr) {
+      const auto* d = reinterpret_cast<const std::uint16_t*>(cond);
+      const std::size_t n = (std::size_t)text_rows * c.text_dim;
+      std::vector<float> v(n);
+      for (std::size_t k = 0; k < n; ++k) {
+        const std::uint32_t u = (std::uint32_t)d[k] << 16;
+        std::memcpy(&v[k], &u, 4);
+      }
+      std::fwrite(v.data(), 4, n, f);
+      std::fclose(f);
+      session()->info(fmt("GenerateVideoStage('{}'): dumped {} x {} text "
+                          "conditioning rows to {}", this->id(), text_rows,
+                          c.text_dim, dp));
+    }
+  }
+  metal_compute::SharedBuffer tb =
+      mc->make_shared_buffer((std::size_t)text_rows * c.text_dim * 2);
+  if (tb.empty()) { return false; }
+  std::memcpy(tb.contents(), cond,
+              (std::size_t)text_rows * c.text_dim * 2);
+
+  genai::DenoiseRequest req;
+  req.dit    = _h3_dit.get();
+  req.layout = &L;
+  req.text   = &tb;
+  req.video  = vid.data();
+  req.audio  = aud.data();
+  req.num_steps   = _steps;
+  req.video_shift = _video_shift;
+  req.audio_shift = _audio_shift;
+  req.condition_timestep = (float)_cond_timestep;
+  UiProgress bar = session()->open_progress("denoise");
+  // Block-granular, like the image DiTs. A step here is one forward of a
+  // 33B stack over a ~19k-row sequence -- tens of seconds at the model's
+  // own geometry -- so a step-granular bar sits still for the entire time
+  // anything is happening. H3 is guidance-distilled, so exactly ONE
+  // forward per step.
+  DenoiseProgress prog(&bar, _steps, /*forwards_per_step=*/1);
+  ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
+                                                             prog);
+  req.progress = [&](int step, int total) {
+    (void)total;
+    // `step` is 1-based on entry here; end_step takes the 0-based index
+    // it just finished, and re-syncs the bar to the exact boundary.
+    prog.end_step(step - 1);
+    return true;
+  };
+  std::string derr;
+  const bool ok = genai::denoise(req, &derr);
+  bar.finish();
+  if (!ok) {
+    session()->warn(fmt("GenerateVideoStage('{}'): {}", this->id(), derr));
+    return false;
+  }
+
+  // Unpatchify the GENERATED video rows back to a [z, T, lh, lw] grid.
+  // Each row is one (1, patch_h, patch_w) cell of z_channels, and the
+  // conditioning rows lead the block, so the generated ones start at
+  // num_condition_rows.
+  const int ZC = c.video_channels;
+  const int ph = c.patch_h, pw = c.patch_w;
+  const int gh = lh / ph, gw = lw / pw;
+  video_out->assign((std::size_t)ZC * lt * lh * lw, 0.0f);
+  *video_shape = {ZC, lt, lh, lw};
+  const std::size_t plane = (std::size_t)lh * lw;
+  for (int r = 0; r < L.num_video_rows; ++r) {
+    const float* row = vid.data() +
+                       ((std::size_t)L.num_condition_rows + r) * PE;
+    const int cell = r % (gh * gw);
+    const int t    = r / (gh * gw);
+    const int by   = (cell / gw) * ph, bx = (cell % gw) * pw;
+    for (int ch = 0; ch < ZC; ++ch) {
+      for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+          (*video_out)[(std::size_t)ch * lt * plane + (std::size_t)t * plane +
+                       (std::size_t)(by + y) * lw + (bx + x)] =
+              row[((std::size_t)ch * ph + y) * pw + x];
+        }
+      }
+    }
+  }
+  // Diagnostic: the FINAL video latent, [z, T, lh, lw] f32, so it can be
+  // compared cell-by-cell against the reference's. Spatial coherence is
+  // a property of the LATENT, so this settles "is the tile grid already
+  // in the latent" without involving the VAE at all.
+  if (const char* lp = std::getenv("VPIPE_H3_LATENT_DUMP")) {
+    std::FILE* f = std::fopen(lp, "wb");
+    if (f != nullptr) {
+      std::fwrite(video_out->data(), 4, video_out->size(), f);
+      std::fclose(f);
+      session()->info(fmt("GenerateVideoStage('{}'): dumped latent "
+                          "[{}, {}, {}, {}] to {}", this->id(), ZC, lt, lh,
+                          lw, lp));
+    }
+  }
+
+  // The audio rows come out of the packed sequence as [stereo * alat, AC]
+  // -- channel-major in time, each row a 32-wide latent. Transpose to the
+  // [stereo, AC, alat] the audio VAE decodes, so the packed-sequence
+  // layout stops at this stage's boundary the same way the video
+  // unpatchify above does.
+  audio_out->assign((std::size_t)h3::kAudioChannels * AC * alat, 0.0f);
+  for (int ch = 0; ch < h3::kAudioChannels; ++ch) {
+    for (int i = 0; i < alat; ++i) {
+      const float* row = aud.data() + (std::size_t)(ch * alat + i) * AC;
+      for (int k = 0; k < AC; ++k) {
+        (*audio_out)[((std::size_t)ch * AC + k) * alat + i] = row[k];
+      }
+    }
+  }
+  *audio_shape = {h3::kAudioChannels, AC, alat};
+  return true;
 }
 
 Job
@@ -409,12 +837,154 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   }
   const auto* ref =
       refb ? dynamic_cast<const TensorBeatPayload*>(refb.get()) : nullptr;
+  std::unique_ptr<BeatPayloadIntf> refb1;
+  if (ctx.num_iports() > kRefPort1 && ctx.iport_connected(kRefPort1)) {
+    refb1 = co_await ctx.read(kRefPort1);
+  }
+  const auto* ref1 =
+      refb1 ? dynamic_cast<const TensorBeatPayload*>(refb1.get()) : nullptr;
 
   if (!ensure_expert_(0)) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): no DiT; skipping", this->id()));
     co_return;
   }
+
+  // ---- minimax-h3: one packed sequence, two latents out ---------------
+  if (_family == "minimax-h3") {
+    if ((int)cond->shape[1] != _h3_cfg.text_dim) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): MiniMax-H3 wants [text_seq, {}] "
+          "conditioning, got [{}, {}]; skipping", this->id(),
+          _h3_cfg.text_dim, cond->shape[0], cond->shape[1]));
+      co_return;
+    }
+    if (neg != nullptr) {
+      // Not an error -- a graph wired for Wan should still run -- but
+      // silently dropping it would misrepresent what ran.
+      session()->log_debug(fmt(
+          "GenerateVideoStage('{}'): MiniMax-H3 is guidance-distilled; the "
+          "negative conditioning on iport1 is ignored", this->id()));
+    }
+    std::vector<float> vlat, alat_out;
+    std::vector<int>   vshape, ashape;
+    // The keyframe anchor arrives on the SAME port Wan's i2v latent
+    // does, from a vae-encode over the keyframe image -- so a graph
+    // changes checkpoints without being rewired.
+    const int lh0 = _height / 16, lw0 = _width / 16;
+    auto anchor_ok = [&](const TensorBeatPayload* t) {
+      return t != nullptr && t->shape.size() == 4 &&
+             (int)t->shape[0] == _h3_cfg.video_channels &&
+             (int)t->shape[2] == lh0 && (int)t->shape[3] == lw0;
+    };
+    const float* refp = nullptr;
+    int ref_frames = 0;
+    if (ref != nullptr) {
+      if (anchor_ok(ref)) {
+        refp = ref->as_f32();
+        ref_frames = (int)ref->shape[1];
+      } else {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): keyframe latent does not match "
+            "[{}, n, {}, {}]; generating without an anchor", this->id(),
+            _h3_cfg.video_channels, lh0, lw0));
+      }
+    }
+    // The LAST-frame anchor arrives as its own beat, because the stage
+    // that makes one encodes ONE image -- so first-and-last is two
+    // vae-encodes, not one that somehow emits two latent frames. They
+    // are concatenated here, on the frame axis, into the [z, k, lh, lw]
+    // block run_h3_ patchifies (anchor k -> conditioning frame k).
+    std::vector<float> stacked;
+    if (ref1 != nullptr) {
+      if (refp == nullptr) {
+        // Dropping it silently would run a plain t2v while the graph
+        // says otherwise. L2V is not a partition this model was
+        // trained for, so the honest move is to name what was ignored.
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): a LAST-frame anchor on iport{} needs "
+            "a FIRST-frame anchor on iport{} too; ignoring it", this->id(),
+            kRefPort1, kRefPort));
+      } else if (!anchor_ok(ref1)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): last-frame keyframe latent does not "
+            "match [{}, n, {}, {}]; generating with the first frame only",
+            this->id(), _h3_cfg.video_channels, lh0, lw0));
+      } else {
+        const int ZC = _h3_cfg.video_channels;
+        const int n1 = (int)ref1->shape[1];
+        const std::size_t plane = (std::size_t)lh0 * lw0;
+        const int total = ref_frames + n1;
+        stacked.resize((std::size_t)ZC * total * plane);
+        const float* a = refp;
+        const float* b = ref1->as_f32();
+        for (int c = 0; c < ZC; ++c) {
+          float* dst = stacked.data() + (std::size_t)c * total * plane;
+          std::memcpy(dst, a + (std::size_t)c * ref_frames * plane,
+                      (std::size_t)ref_frames * plane * sizeof(float));
+          std::memcpy(dst + (std::size_t)ref_frames * plane,
+                      b + (std::size_t)c * n1 * plane,
+                      (std::size_t)n1 * plane * sizeof(float));
+        }
+        refp = stacked.data();
+        ref_frames = total;
+      }
+    }
+    if (!run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
+                 &vlat, &vshape, &alat_out, &ashape)) {
+      co_return;
+    }
+    if (_unload_idle) { _h3_dit.reset(); }
+
+    auto vout = std::make_unique<TensorBeatPayload>();
+    vout->dtype = TensorBeat::DType::F32;
+    vout->shape = {vshape[0], vshape[1], vshape[2], vshape[3]};
+    vout->resize_contiguous(vlat.size());
+    std::memcpy(vout->as_f32(), vlat.data(), vlat.size() * sizeof(float));
+    {
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      sb.as_object().insert_or_assign(
+          "frames", FlexData::make_int((std::int64_t)_frames));
+      vout->sideband = std::move(sb);
+    }
+    ++_emitted;
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): emitted MiniMax-H3 latents #{} -- video "
+        "[{}, {}, {}, {}] + audio [{}, {}, {}]", this->id(), _emitted,
+        vshape[0], vshape[1], vshape[2], vshape[3], ashape[0], ashape[1],
+        ashape[2]));
+    co_await ctx.write(0, std::move(vout));
+
+    // The audio half. Written only when the port is connected: the audio
+    // VAE is a separate decode stage, and a graph that only wants video
+    // should not have to wire a sink for a beat it will not read.
+    if (ctx.num_oports() > 1 && !alat_out.empty()) {
+      auto aout = std::make_unique<TensorBeatPayload>();
+      aout->dtype = TensorBeat::DType::F32;
+      aout->shape = {ashape[0], ashape[1], ashape[2]};
+      aout->resize_contiguous(alat_out.size());
+      std::memcpy(aout->as_f32(), alat_out.data(),
+                  alat_out.size() * sizeof(float));
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign(
+          "latents_per_second",
+          FlexData::make_int((std::int64_t)h3::kAudioLatentsPerSecond));
+      aout->sideband = std::move(sb);
+      co_await ctx.write(1, std::move(aout));
+    }
+    co_return;
+  }
+
+  if (ref1 != nullptr) {
+    // Wan's i2v conditioning is ONE clip-shaped tensor that already spans
+    // every frame, so there is no second anchor to take. Debug rather than
+    // warn: a graph built for h3 should still run here.
+    session()->log_debug(fmt(
+        "GenerateVideoStage('{}'): iport{} (last-frame anchor) is minimax-h3 "
+        "only; ignoring it", this->id(), kRefPort1));
+  }
+
   auto* mc = session()->services()->metal_compute();
   const int ZC = 16;                       // the VAE's latent channels
   const int T  = latent_frames();
@@ -494,6 +1064,18 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   }
 
   bool failed = false;
+  // Block-granular denoise progress, as the image DiTs report it. A 14B
+  // step at 720p is seconds of silence, and this loop previously reported
+  // nothing at all -- only a debug log.
+  //
+  // Guidance runs the DiT a second time per step, so the bar is sized for
+  // two forwards when a negative prompt is present. When an expert's
+  // guidance is exactly 1.0 that second forward is skipped and the step
+  // fills only part way; end_step re-syncs at the boundary, so it is a
+  // pacing detail rather than a wrong number.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, sched.steps, cfg_on ? 2 : 1);
+  ScopedBlockProgress<genai::MetalWanTransformer> hook(_dit.get(), prog);
   auto denoise = [&](const std::vector<float>& xin,
                      double sigma) -> std::vector<float> {
     std::vector<float> out(nlat, 0.0f);
@@ -502,6 +1084,9 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // this swaps at most once per clip.
     const int want = (_boundary > 0.0 && sigma < _boundary) ? 1 : 0;
     if (!ensure_expert_(want)) { failed = true; return out; }
+    // Crossing the boundary rebuilds _dit, which takes the old hook with
+    // it; re-arm on whatever is loaded now. No-op when nothing swapped.
+    hook.rearm(_dit.get());
     if (_expert != expert_for_text) {
       std::string terr;
       tpos = _dit->encode_text(cond_raw, text_seq, &terr);
@@ -575,8 +1160,10 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           (_boundary > 0.0 && sigmas[(std::size_t)i] < _boundary) ? "low"
                                                                   : "high"));
       sampler.step(i, x, denoise);
+      prog.end_step(i);
     }
   }
+  bar.finish();
   if (failed) { co_return; }
 
   if (_unload_idle) {

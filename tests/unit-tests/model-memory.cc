@@ -115,6 +115,18 @@ TEST(model_memory, footprint_counts_a_shared_directory_once)
   // Named twice -> still counted once.
   EXPECT_TRUE(model_memory::weight_footprint(&s, {a, a}) == 4000u);
   EXPECT_TRUE(model_memory::weight_footprint(&s, {a, b, a, b}) == 5000u);
+  // A checkpoint named by FILE, not by directory -- a Comfy-Org repack
+  // is one .safetensors per component, so the claim a stage declares IS
+  // a file path. It has to be SIZED: a directory walk over a file
+  // silently yields 0, and a 66 GB DiT that reports as free is worse
+  // than no accounting, because every peer then sizes against a box
+  // that does not exist.
+  const std::string af = (root / "a" / "w.safetensors").string();
+  EXPECT_TRUE(model_memory::weight_footprint(&s, {af}) == 4000u);
+  // Only a weight file counts; a config or a README beside it does not.
+  write(root / "a" / "notes.txt", 777);
+  EXPECT_TRUE(model_memory::weight_footprint(
+                  &s, {(root / "a" / "notes.txt").string()}) == 0u);
   // Empty and missing directories contribute nothing rather than failing.
   EXPECT_TRUE(model_memory::weight_footprint(&s, {a, "", (root / "z")
                                                           .string()})

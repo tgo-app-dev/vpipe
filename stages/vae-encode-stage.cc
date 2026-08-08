@@ -9,6 +9,7 @@
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-detect.h"
 #include "stages/model-registry.h"
 
 #include <algorithm>
@@ -76,6 +77,13 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
 VaeEncodeStage::~VaeEncodeStage() = default;
 
 namespace {
+
+// MiniMax-H3's video VAE works in IMAGENET-normalized pixel space. The
+// reference's own constants; vae-decode undoes this on the way out.
+[[maybe_unused]] constexpr float kImagenetMean[3] = {0.485f, 0.456f,
+                                                     0.406f};
+[[maybe_unused]] constexpr float kImagenetStd[3]  = {0.229f, 0.224f,
+                                                     0.225f};
 
 // Clamp a numeric channel value into a 0..255 int.
 int
@@ -208,6 +216,7 @@ vae_family_(const std::string& vae_dir)
         if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
         if (cls == "AutoencoderKLWan") { return "wan"; }
+        if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
       }
     }
   }
@@ -275,8 +284,7 @@ VaeEncodeStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  return model_memory::weight_claims(
-      {(fs::path(root) / "vae").string()});
+  return model_memory::weight_claims({resolve_vae_dir(root)});
 }
 
 Job
@@ -371,10 +379,10 @@ VaeEncodeStage::ensure_loaded_()
         _unload_idle ? "UNLOAD after each beat" : "keep resident"));
   }
   namespace fs = std::filesystem;
-  std::string vae_dir = root;
-  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
-    vae_dir = (fs::path(root) / "vae").string();
-  }
+  // `vae/` for every diffusers checkpoint, `video_vae/source/` for
+  // MiniMax-H3. Shared with vae-encode so the two halves of one model
+  // can never resolve to different directories.
+  const std::string vae_dir = resolve_vae_dir(root);
 
   _family = vae_family_(vae_dir);
   // One shared, reference-counted view of this checkpoint. The peer VAE
@@ -384,8 +392,15 @@ VaeEncodeStage::ensure_loaded_()
   // running the same model share it too.
   // Falls back to a private set when the session has no manager; see
   // open_weight_set().
+  // MiniMax-H3 keeps the WEIGHTS one level below the config that named
+  // the family, so the set is opened on the resolved leaf. Every other
+  // family's resolver returns what it was handed.
+  const std::string ws_dir =
+      (_family == "minimax-h3")
+          ? genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(vae_dir)
+          : vae_dir;
   std::shared_ptr<genai::WeightSet> ws =
-      genai::open_weight_set(vae_dir, session());
+      genai::open_weight_set(ws_dir, session());
   if (!ws) {
     session()->error(fmt(
         "{}('{}'): no readable checkpoint under '{}'; inert",
@@ -430,6 +445,26 @@ VaeEncodeStage::ensure_loaded_()
           "VaeEncodeStage('{}'): failed to load the AutoencoderKL encoder from "
           "'{}'; inert", this->id(), vae_dir));
       _flux2_vae.reset();
+    }
+    return;
+  }
+
+  if (_family == "minimax-h3") {
+    genai::MetalMiniMaxH3VideoVae::Config h3cfg;
+    std::string h3err;
+    if (!genai::MetalMiniMaxH3VideoVae::config_from_json(vae_dir, h3cfg,
+                                                         &h3err)) {
+      session()->error(fmt("VaeEncodeStage('{}'): {}; inert", this->id(),
+                           h3err));
+      return;
+    }
+    load_note_(fmt("VaeEncodeStage('{}'): loading the MiniMax-H3 video VAE "
+                   "(encoder) from '{}'", this->id(), vae_dir));
+    _h3_vae = genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg);
+    if (!_h3_vae) {
+      session()->error(fmt(
+          "VaeEncodeStage('{}'): failed to load the MiniMax-H3 video VAE "
+          "from '{}'; inert", this->id(), vae_dir));
     }
     return;
   }
@@ -818,6 +853,116 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   // each output frame with its two predecessors. A 1-frame encode is a
   // different tensor, and the DiT would be conditioned on something it was
   // never trained against.
+  // ---- MiniMax-H3: one KEYFRAME anchor ------------------------------
+  // FL2VA conditions on real encoded frames rather than on a masked
+  // blank clip the way Wan's i2v does, so this encodes the image ALONE
+  // and emits a one-latent-frame anchor. The packing convention
+  // downstream is "one latent frame = one anchor", so a two-frame beat
+  // is a first-AND-last request; this stage sees one image and emits
+  // one.
+  if (_family == "minimax-h3") {
+    if (!_h3_vae) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): MiniMax-H3 VAE not loaded; skipping",
+          this->id()));
+      co_return;
+    }
+    const auto& vc = _h3_vae->config();
+    const int sH = (int)tbp->shape[1], sW = (int)tbp->shape[2];
+    const bool rs = _target_w > 0 && _target_h > 0;
+    const int H = rs ? _target_h : sH;
+    const int W = rs ? _target_w : sW;
+    if (H <= 0 || W <= 0 || (H % vc.patch) != 0 || (W % vc.patch) != 0) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): image [{}x{}] must be a positive multiple of "
+          "{} (or set target_width/target_height); skipping", this->id(), sW,
+          sH, vc.patch));
+      co_return;
+    }
+    auto* mc = session()->services()->metal_compute();
+    const auto img = tbp->materialize_contiguous();
+    const bool u8 = tbp->dtype == TensorBeat::DType::U8;
+    const float pad[3] = {
+      (float)_pad_r / 255.0f * 2.0f - 1.0f,
+      (float)_pad_g / 255.0f * 2.0f - 1.0f,
+      (float)_pad_b / 255.0f * 2.0f - 1.0f,
+    };
+    const std::vector<float> norm =
+        normalize_and_fit_(img.data(), u8, sH, sW, H, W, pad);
+    const std::size_t plane = (std::size_t)H * W;
+    metal_compute::SharedBuffer frame =
+        mc->make_shared_buffer((std::size_t)3 * plane * 2);
+    if (frame.empty()) { co_return; }
+    {
+      auto* d = static_cast<std::uint16_t*>(frame.contents());
+      // This VAE's pixel space is IMAGENET-NORMALIZED, not [-1, 1]:
+      // the reference encoder's first act is `(x + 1)/2` then
+      // `(. - mean)/std`. `normalize_and_fit_` only gets as far as
+      // [-1, 1], so without this the encoder sees an input ~4.4x too
+      // wide and the anchor latent it produces is wrong. vae-decode
+      // undoes exactly this on the way out.
+      for (int c = 0; c < 3; ++c) {
+        const float pm = kImagenetMean[c], ps = kImagenetStd[c];
+        for (std::size_t i = 0; i < plane; ++i) {
+          const std::size_t k = (std::size_t)c * plane + i;
+          const float v = ((norm[k] + 1.0f) * 0.5f - pm) / ps;
+          std::uint32_t u;
+          std::memcpy(&u, &v, 4);
+          d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+      }
+    }
+    int lf = 0;
+    std::string eerr;
+    metal_compute::SharedBuffer mom;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)H * W);
+      mom = _h3_vae->encode_video(frame, 1, H, W, &lf, &eerr);
+    }
+    if (mom.empty() || lf <= 0) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): keyframe encode failed ({}); skipping",
+          this->id(), eerr.empty() ? "unknown error" : eerr));
+      co_return;
+    }
+    // The MEAN half of the moments, then WHITENED into the normalized
+    // space the DiT generates in -- the same transform vae-decode
+    // undoes. Sampling the posterior instead would put noise into an
+    // anchor whose whole job is to be exact.
+    const int Cz = vc.z_channels;
+    const int lh = H / vc.patch, lw = W / vc.patch;
+    const std::size_t vox = (std::size_t)lf * lh * lw;
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {Cz, lf, lh, lw};
+    out->resize_contiguous((std::size_t)Cz * vox);
+    const auto* mp = static_cast<const std::uint16_t*>(mom.contents());
+    float* op = out->as_f32();
+    const bool whiten = (int)vc.latents_mean.size() == Cz &&
+                        (int)vc.latents_std.size() == Cz;
+    for (int c = 0; c < Cz; ++c) {
+      const float mu = whiten ? vc.latents_mean[(std::size_t)c] : 0.0f;
+      const float sd = whiten ? vc.latents_std[(std::size_t)c] : 1.0f;
+      for (std::size_t i = 0; i < vox; ++i) {
+        const std::size_t k = (std::size_t)c * vox + i;
+        const std::uint32_t u = (std::uint32_t)mp[k] << 16;
+        float x;
+        std::memcpy(&x, &u, 4);
+        op[k] = sd != 0.0f ? (x - mu) / sd : (x - mu);
+      }
+    }
+    FlexData sb = FlexData::make_object();
+    sb.as_object().insert_or_assign("anchors", FlexData::make_string("first"));
+    out->sideband = std::move(sb);
+    session()->log_debug(fmt(
+        "VaeEncodeStage('{}'): keyframe [{}x{}] -> anchor latent "
+        "[{}, {}, {}, {}]", this->id(), W, H, Cz, lf, lh, lw));
+    ++_latents_emitted;
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
   if (_family == "wan") {
     if (!_wan_vae || !_wan_vae->has_encoder()) {
       session()->warn(fmt(

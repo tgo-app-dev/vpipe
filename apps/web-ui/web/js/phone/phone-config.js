@@ -59,6 +59,20 @@ export function configField(f, opts = {}) {
   if (doc) { wrap.append(el('div', { class: 'ph-f-doc' }, doc)); }
 
   let read;
+  // What the pickers at the bottom drive. Whether a field can be BROWSED
+  // for is a property of the field (`is_path`, `suggest_db`), not of its
+  // type -- so the branches below record their input here and the pickers
+  // attach once, after the type dispatch. Doing it inside the string
+  // branch (as this did) silently skipped every array/any path field:
+  // load-image's `url` is `any` + is_path and got no picker at all on
+  // this shell, while the desktop offered one. Left null for the types no
+  // picker applies to.
+  //   el     the element holding the value
+  //   multi  the value is a JSON array -- a pick APPENDS rather than
+  //          replaces, matching the desktop's array path fields
+  //   mark   tell the field it is no longer "unset"
+  //   before insert the picker button ahead of this one (keeps ⌫ last)
+  let pick = null;
 
   if (type === 'bool') {
     // Three states, so a two-state checkbox won't do: a select says
@@ -79,6 +93,9 @@ export function configField(f, opts = {}) {
       autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
     ta.value = present ? fmtDefault(f.current) : '';
     row.append(ta);
+    // An empty box already reads back as unset here, so there is nothing
+    // for `mark` to clear.
+    pick = { el: ta, multi: true, mark: () => {}, before: null };
     read = () => {
       const s = ta.value.trim();
       if (!s) { return undefined; }
@@ -122,42 +139,83 @@ export function configField(f, opts = {}) {
     inp.addEventListener('input', markSet);
     row.append(inp);
 
-    // A picker for the two field flavours that are painful to type on a
-    // phone and that the stage already tells us how to browse for.
-    if (!ro && f.is_path) {
-      row.append(el('button', { class: 'ph-f-btn',
-        onclick: () => {
-          const kind = f.path_kind || '';
-          openFsSheet({
-            title: t('phone.pick_path'),
-            start: dirOf(inp.value) || '',
-            pickDirs: kind === 'dir' || kind === 'directory',
-            exts: extsFromFilter(f.path_filter),
-            nameField: !!f.path_write && kind !== 'dir',
-            defaultName: f.path_write ? baseOf(inp.value) : '',
-            onPick: (p) => { inp.value = p; markSet(); },
-          });
-        } }, '…'));
-    } else if (!ro && f.suggest_db === MODEL_REGISTRY_DB) {
-      row.append(el('button', { class: 'ph-f-btn',
-        onclick: () => openModelPicker(f, (key) => {
-          inp.value = key; markSet();
-        }) }, '⌄'));
-    }
-
     // The explicit way back to "unset" for a tri-state type: clearing
     // the box alone can't say it, since "" is itself a value.
+    let unsetBtn = null;
     if (!ro) {
-      row.append(el('button', { class: 'ph-f-btn',
+      unsetBtn = el('button', { class: 'ph-f-btn',
         title: t('phone.cfg_unset_title'),
         onclick: () => {
           unset = true;
           inp.value = '';
           wrap.classList.add('unset');
-        } }, '⌫'));
+        } }, '⌫');
+      row.append(unsetBtn);
     }
     if (unset) { wrap.classList.add('unset'); }
+    pick = { el: inp, multi: false, mark: markSet, before: unsetBtn };
     read = () => (unset ? undefined : inp.value);
+  }
+
+  // ---- pickers -----------------------------------------------------
+  // The two field flavours that are painful to type on a phone and that
+  // the stage already tells us how to browse for. Attached by FIELD
+  // property, so an array/any path field gets one too.
+  if (pick && !ro) {
+    const addBtn = (glyph, onclick) => {
+      const b = el('button', { class: 'ph-f-btn', onclick }, glyph);
+      if (pick.before) { row.insertBefore(b, pick.before); }
+      else { row.append(b); }
+    };
+    // The last path already in the field, so the sheet opens where the
+    // previous pick left off rather than at the sandbox root.
+    const lastPath = () => {
+      const cur = (pick.el.value || '').trim();
+      if (!cur) { return ''; }
+      if (!pick.multi) { return cur; }
+      try {
+        const v = JSON.parse(cur);
+        const arr = Array.isArray(v) ? v : [v];
+        return arr.length ? String(arr[arr.length - 1]) : '';
+      } catch (e) { return cur; }
+    };
+    // A multi field APPENDS: openFsSheet picks one path at a time, so
+    // tapping the button repeatedly is how a list gets built. Anything
+    // unparseable in the box is kept as the first element rather than
+    // discarded -- a half-typed entry is still the user's.
+    const setPath = (p) => {
+      if (!pick.multi) {
+        pick.el.value = p;
+      } else {
+        let arr = [];
+        const cur = (pick.el.value || '').trim();
+        if (cur) {
+          try {
+            const v = JSON.parse(cur);
+            arr = Array.isArray(v) ? v : [v];
+          } catch (e) { arr = [cur]; }
+        }
+        arr.push(p);
+        pick.el.value = JSON.stringify(arr, null, 2);
+      }
+      pick.mark();
+    };
+    if (f.is_path) {
+      const kind = f.path_kind || '';
+      addBtn('…', () => {
+        openFsSheet({
+          title: t('phone.pick_path'),
+          start: dirOf(lastPath()) || '',
+          pickDirs: kind === 'dir' || kind === 'directory',
+          exts: extsFromFilter(f.path_filter),
+          nameField: !!f.path_write && kind !== 'dir',
+          defaultName: f.path_write ? baseOf(lastPath()) : '',
+          onPick: setPath,
+        });
+      });
+    } else if (f.suggest_db === MODEL_REGISTRY_DB) {
+      addBtn('⌄', () => openModelPicker(f, setPath));
+    }
   }
 
   return { el: wrap, read, key: f.key };

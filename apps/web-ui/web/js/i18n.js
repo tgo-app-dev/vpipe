@@ -69,6 +69,8 @@ const STRINGS = {
   'fs.pick_folder':    ['Choose folder', '选择文件夹', '選擇資料夾'],
   'fs.select_folder':  ['Select folder', '选择此文件夹', '選擇此資料夾'],
   'fs.browse':         ['Browse…', '浏览…', '瀏覽…'],
+  'fs.preview_toggle': ['Show / hide preview', '显示 / 隐藏预览',
+                        '顯示 / 隱藏預覽'],
   'fs.up':             ['Up one level', '上一级', '上一層'],
   'fs.refresh':        ['Refresh', '刷新', '重新整理'],
   'fs.filename':       ['Filename', '文件名', '檔名'],
@@ -118,6 +120,12 @@ const STRINGS = {
                         '預覽失敗：{msg}'],
   'fb.op_failed':     ['Failed: {msg}', '操作失败：{msg}', '操作失敗：{msg}'],
   'fb.empty_folder':  ['Empty folder', '空文件夹', '空資料夾'],
+  // Preview additions: the .vpipeline stage summary, and the dialog's
+  // side-panel toggle.
+  'fb.pl_stages':     ['{n} stages', '{n} 个流水线级', '{n} 個階段'],
+  'fb.pl_unparsed':   ['Could not parse this pipeline — showing the raw '
+                       + 'file.', '无法解析此流水线 — 显示原始文件。',
+                       '無法解析此管線 — 顯示原始檔案。'],
 
   // ---- Settings view ----
   'settings.title':         ['Settings', '设置', '設定'],

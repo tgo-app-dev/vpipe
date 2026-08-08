@@ -59,6 +59,41 @@ struct ModelCatalogEntry {
   std::vector<std::string> files;  // repo files to fetch (one or more GGUF
                                    // quant(s) + mmproj/imatrix companions);
                                    // empty = fetch the whole repo
+  // Small files pulled from ANOTHER repo into this entry's directory.
+  //
+  // This exists because a Comfy-Org repack is weights-ONLY: no tokenizer,
+  // no configs. Pinning its own files alone yields a directory holding a
+  // DiT and both VAEs that still cannot encode a prompt -- a fetch that
+  // reports success and produces something unusable. The alternative, a
+  // 144 GB sibling entry fetched for 11 MB of tokenizer, is not one.
+  //
+  // Kept SMALL on purpose. This is for the few MB that complete a repo,
+  // not a way to assemble a model out of several: anything large enough
+  // to be worth choosing belongs in its own entry, where the drill-down
+  // menu can show it.
+  struct Companion {
+    std::string repo;  // an hf_path, e.g. "MiniMaxAI/MiniMax-H3"
+    std::string file;  // path within `repo`
+    std::string dest;  // where it lands under this entry's local dir
+  };
+  std::vector<Companion> companion_files;
+  // On-disk weight format, when it is NOT the upstream diffusers/HF
+  // layout. "comfyui" marks a Comfy-Org repack (the repos carrying the
+  // `comfyui` HuggingFace tag: Comfy-Org/MiniMax-H3,
+  // Comfy-Org/Wan-Animate-2, ...): one freely-named .safetensors per
+  // component under diffusion_models/ | text_encoders/ | vae/, with each
+  // component's config inside the file's safetensors `__metadata__`
+  // instead of a config.json.
+  //
+  // This is recorded rather than derived because it can change how the
+  // WEIGHTS are read, not just where the config comes from: Comfy-Org's
+  // MiniMax-H3 conversion reorders the DiT's fused qkv projection under
+  // the same tensor name and shape, so a loader that guesses wrong loads
+  // cleanly and computes nonsense. Loaders still confirm it from the
+  // file's own metadata -- this field is what lets the catalogue and the
+  // registry record SAY which repack a directory is, for a picker or a
+  // user who is choosing between two copies of one model.
+  std::string weight_format;
   bool        needs_tokenizer_json = false;
   std::string name;         // registration key + extract subdir (when several
                             // entries share one hf_path); empty -> key=hf_path

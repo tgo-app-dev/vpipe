@@ -13,7 +13,9 @@
 #include "stages/load-video-stage.h"
 #include "stages/save-video-stage.h"
 #include "stages/audio-video/video-tokens.h"
+#include "apple-silicon/tensor-beat.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -424,6 +426,204 @@ TEST(video_stages, round_trip_or_skips) {
   rt.stop();
 
   size_t sz = file_size_or_zero_(out_path);
+  EXPECT_TRUE(sz > 0);
+  remove(out_path.c_str());
+}
+
+namespace {
+
+// Emits one stereo PCM TensorBeat the way `audio-vae-decode` does:
+// planar f32 [channels, n_samples] with the rate and channel count on
+// the sideband. There is no ffmpeg header, because nothing upstream of
+// a GENERATED soundtrack has one to give.
+class SynthPcmSource : public TypedStage<SynthPcmSource> {
+public:
+  static constexpr const char* kTypeName = "ut-synth-pcm-source";
+  using TypedStage::TypedStage;
+
+  int channels    = 2;
+  int sample_rate = 32000;
+  int samples     = 32000;      // 1 s
+  bool send_rate  = true;
+
+  void reset_run_state() override { _sent = false; }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    auto b = make_unique<TensorBeatPayload>();
+    b->dtype = TensorBeat::DType::F32;
+    b->shape = {channels, samples};
+    b->resize_contiguous(static_cast<size_t>(channels) * samples);
+    float* p = b->as_f32();
+    for (int c = 0; c < channels; ++c) {
+      // A different tone per channel, so a downmix or a channel swap
+      // is visible in the decoded file rather than merely plausible.
+      const double f = (c == 0) ? 440.0 : 660.0;
+      for (int i = 0; i < samples; ++i) {
+        p[static_cast<size_t>(c) * samples + i] =
+          0.25f * static_cast<float>(
+            sin(2.0 * 3.14159265358979 * f * i / sample_rate));
+      }
+    }
+    FlexData sb = FlexData::make_object();
+    if (send_rate) {
+      sb.as_object().insert_or_assign(
+        "sample_rate", FlexData::make_int(sample_rate));
+    }
+    sb.as_object().insert_or_assign(
+      "channels", FlexData::make_int(channels));
+    b->sideband = std::move(sb);
+    co_await ctx.write(0, std::move(b));
+  }
+
+  const StageSpec& spec() const noexcept override
+  {
+    static const PortSpec op[] = {
+      {.name = "audio", .doc = "", .type = &typeid(TensorBeatPayload)}};
+    static const StageSpec s = {.type_name = "ut-synth-pcm-source",
+                                .doc = "", .display_name = "",
+                                .oports = op};
+    return s;
+  }
+private:
+  bool _sent = false;
+};
+
+}  // namespace
+
+// save-video muxing a GENERATED soundtrack: raw stereo PCM on the audio
+// port, with no AudioStreamParams header anywhere. The rate and channel
+// count come off the beat's sideband, which is the only place they
+// exist -- a sink that defaulted them would resample or downmix the
+// whole clip without saying so.
+TEST(video_stages, encoder_muxes_raw_stereo_pcm) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string out_path = tmp_path_("enc-av", ".mp4");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto vsrc_u = make_unique<SynthVideoSource>(
+    &sess, "vsrc", vector<InEdge>{}, FlexData::make_object());
+  vsrc_u->target_frames = 24;
+  vsrc_u->allocate_oports(1);
+  auto* vsrc = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(vsrc_u)));
+
+  auto asrc_u = make_unique<SynthPcmSource>(
+    &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  asrc_u->allocate_oports(1);
+  auto* asrc = static_cast<SynthPcmSource*>(
+    pl->insert_stage(std::move(asrc_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto enc_u = make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{vsrc, 0}, {asrc, 0}},
+    std::move(enc_cfg));
+  auto* enc = static_cast<SaveVideoStage*>(
+    pl->insert_stage(std::move(enc_u)));
+  EXPECT_TRUE(enc->config_error().empty());
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  const size_t sz = file_size_or_zero_(out_path);
+  printf("[video_stages] a/v mux wrote %zu bytes\n", sz);
+  EXPECT_TRUE(sz > 0);
+
+  // The file must actually carry BOTH streams. A muxer that wrote only
+  // the video track still produces a plausible, playable mp4 -- which
+  // is exactly why the size check above is not enough.
+  int n_audio = 0, n_video = 0, ach = 0, arate = 0;
+  {
+    const FFmpegLibraries& libs = *sess.services()->ffmpeg_libraries();
+    AVFormatContext* ic = nullptr;
+    if (libs.avformat().api.open_input(&ic, out_path.c_str(), nullptr,
+                                       nullptr) == 0) {
+      if (libs.avformat().api.find_stream_info(ic, nullptr) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; ++i) {
+          const AVCodecParameters* cp = ic->streams[i]->codecpar;
+          if (cp->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ++n_audio;
+            ach   = cp->ch_layout.nb_channels;
+            arate = cp->sample_rate;
+          } else if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ++n_video;
+          }
+        }
+      }
+      libs.avformat().api.close_input(&ic);
+    }
+  }
+  printf("[video_stages] streams: %d video, %d audio (%d ch @ %d Hz)\n",
+         n_video, n_audio, ach, arate);
+  EXPECT_TRUE(n_video == 1);
+  EXPECT_TRUE(n_audio == 1);
+  EXPECT_TRUE(ach == 2);
+  EXPECT_TRUE(arate == 32000);
+  remove(out_path.c_str());
+}
+
+// No sample_rate on the beat means the sink CANNOT know the rate. It
+// must refuse rather than pick one: a wrong rate retimes the whole
+// soundtrack against the picture, which plays fine and is wrong.
+TEST(video_stages, encoder_refuses_pcm_without_a_rate) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string out_path = tmp_path_("enc-norate", ".mp4");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto vsrc_u = make_unique<SynthVideoSource>(
+    &sess, "vsrc", vector<InEdge>{}, FlexData::make_object());
+  vsrc_u->target_frames = 6;
+  vsrc_u->allocate_oports(1);
+  auto* vsrc = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(vsrc_u)));
+  auto asrc_u = make_unique<SynthPcmSource>(
+    &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  asrc_u->samples   = 8000;
+  asrc_u->send_rate = false;
+  asrc_u->allocate_oports(1);
+  auto* asrc = static_cast<SynthPcmSource*>(
+    pl->insert_stage(std::move(asrc_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto enc_u = make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{vsrc, 0}, {asrc, 0}},
+    std::move(enc_cfg));
+  pl->insert_stage(std::move(enc_u));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  // The VIDEO still gets written: losing the soundtrack must not cost
+  // the picture. Before ready_to_write_header_ treated an EOS'd port as
+  // settled, the unusable audio beat held the header back forever and
+  // this produced NO FILE AT ALL.
+  const size_t sz = file_size_or_zero_(out_path);
+  printf("[video_stages] no-rate run wrote %zu bytes\n", sz);
   EXPECT_TRUE(sz > 0);
   remove(out_path.c_str());
 }

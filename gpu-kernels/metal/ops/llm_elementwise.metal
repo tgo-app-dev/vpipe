@@ -1120,6 +1120,72 @@ kernel void group_norm_f16(
   }
 }
 
+// GroupNorm over a channel-last VIDEO activation [T, rows(=H*W), C] in which
+// every FRAME normalizes on its own -- the MiniMax-H3 video encoder's
+// `use_t_isolated_gn`, where the reference folds the temporal axis into the
+// batch axis so statistics never mix across frames. Running the plain
+// group_norm_f16 over the whole clip instead is a different function: it
+// couples frames that the encoder deliberately keeps independent, and it
+// fails silently because a single frame's own statistics are a good enough
+// approximation for the output to look plausible.
+//
+// `do_silu` folds the SiLU that follows every one of these norms in the
+// encoder into the write, halving the passes over an activation that is the
+// largest thing in the encode (~285 MB for a 17-frame 256x256 tile at 128
+// channels).
+//   0:x[T,rows,C] 1:gamma[C] 2:beta[C] 3:out 4:rows 5:C 6:G 7:eps 8:do_silu
+//   grid {256, G, T}, tg {256,1,1}: one threadgroup per (frame, group).
+kernel void group_norm_frames_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* gamma [[buffer(1)]],
+    const device VPIPE_ELT* beta  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&      rows    [[buffer(4)]],
+    constant int&      C       [[buffer(5)]],
+    constant int&      G       [[buffer(6)]],
+    constant float&    eps     [[buffer(7)]],
+    constant int&      do_silu [[buffer(8)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 ltid  [[thread_position_in_threadgroup]],
+    uint3 tptg  [[threads_per_threadgroup]])
+{
+  const uint lid  = ltid.x;
+  const uint tgsz = tptg.x;
+  const int  g    = (int)tgid.y;
+  const int  Cg   = C / G;
+  const int  c0   = g * Cg;
+  const long frame = (long)tgid.z * (long)rows * (long)C;
+  const long total = (long)rows * (long)Cg;
+  threadgroup float ssum[256];
+  threadgroup float ssq[256];
+  float s = 0.0f, sq = 0.0f;
+  for (long i = (long)lid; i < total; i += (long)tgsz) {
+    const int r  = (int)(i / Cg);
+    const int cc = (int)(i % Cg);
+    const float v = float(x[frame + (long)r * C + c0 + cc]);
+    s += v; sq += v * v;
+  }
+  ssum[lid] = s; ssq[lid] = sq;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = tgsz / 2; st > 0; st >>= 1) {
+    if (lid < st) { ssum[lid] += ssum[lid + st]; ssq[lid] += ssq[lid + st]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float mean = ssum[0] / (float)total;
+  const float var  = max(ssq[0] / (float)total - mean * mean, 0.0f);
+  const float inv  = 1.0f / sqrt(var + eps);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (long i = (long)lid; i < total; i += (long)tgsz) {
+    const int r  = (int)(i / Cg);
+    const int cc = (int)(i % Cg);
+    const long idx = frame + (long)r * C + c0 + cc;
+    float v = (float(x[idx]) - mean) * inv * float(gamma[c0 + cc])
+              + float(beta[c0 + cc]);
+    if (do_silu != 0) { v = v * (1.0f / (1.0f + exp(-v))); }
+    out[idx] = VPIPE_ELT(v);
+  }
+}
+
 // Causal depthwise Conv1d, kernel K, per-channel weight w[D, K] (tap kk
 // pairs with input position t+kk-(K-1); left-padded with zeros). One
 // thread per (t, d).   0:in[T,D] 1:w[D,K] 2:out[T,D] 3:T 4:D 5:K.
@@ -4318,6 +4384,83 @@ kernel void im2col_hwc_3x3x3_tiled_f16(
   out[gid] = val;
 }
 
+// Same causal 3D im2col, but with REFLECT spatial padding and an output
+// grid that may be strided -- the MiniMax-H3 video encoder's convolution.
+//
+// Two things separate it from im2col_hwc_3x3x3_tiled_f16 above, and both are
+// silent if got wrong: H3 pads spatially by REFLECTION rather than with
+// zeros (a zero-padded border darkens the frame edge into the latent, which
+// survives the decode as a vignette), and its stride-2 downsample carries no
+// symmetric padding at all -- the reference pads one row/column onto the
+// BOTTOM and RIGHT only and then runs a valid convolution, so the output is
+// ceil(size/2) and the sampling grid is offset by half a tap from what a
+// symmetric pad would give.
+//
+// Both cases are the one expression `sy = y*stride + ky - pad_lo` reflected
+// into [0, H): stride 1 with pad_lo 1 is the symmetric pad, stride 2 with
+// pad_lo 0 is the asymmetric one (`sy` then only ever runs past the END of
+// the axis, which is exactly the row the bottom/right pad holds).
+//
+// The temporal axis is unchanged from the zero-padded twin: causal padding
+// stays a `tap_valid` mask over three separately-bound frame views, and the
+// host picks tap kt as input frame `t*temporal_stride + kt - 2`.
+//   0:t0 1:t1 2:t2 (each [H*W,C]) 3:out[row_cnt,27*C]
+//   4:H 5:W 6:C 7:row_off 8:row_cnt 9:tap_valid 10:Wo 11:stride 12:pad_lo
+//   grid {27*C, row_cnt}; rows index the OUTPUT grid, r = y*Wo + x.
+kernel void im2col_hwc_3x3x3_reflect_tiled_f16(
+    const device VPIPE_ELT* t0  [[buffer(0)]],
+    const device VPIPE_ELT* t1  [[buffer(1)]],
+    const device VPIPE_ELT* t2  [[buffer(2)]],
+    device VPIPE_ELT*       out [[buffer(3)]],
+    constant int&      H       [[buffer(4)]],
+    constant int&      W       [[buffer(5)]],
+    constant int&      C       [[buffer(6)]],
+    constant int&      row_off [[buffer(7)]],
+    constant int&      row_cnt [[buffer(8)]],
+    constant int&      tap_valid [[buffer(9)]],
+    constant int&      Wo      [[buffer(10)]],
+    constant int&      stride  [[buffer(11)]],
+    constant int&      pad_lo  [[buffer(12)]],
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
+{
+  const uint cols = (uint)(27 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {27*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // (kt*3 + ky)*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 27u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
+  const uint kt = j / 9u;
+  const uint ks = j % 9u;
+  const int x = (int)(r % (uint)Wo);
+  const int y = (int)(r / (uint)Wo);
+  int sy = y * stride + (int)(ks / 3u) - pad_lo;
+  int sx = x * stride + (int)(ks % 3u) - pad_lo;
+  // Reflection WITHOUT repeating the edge sample, matching torch's
+  // `F.pad(mode="reflect")`: index -1 is row 1, index H is row H-2.
+  if (sy < 0) { sy = -sy; }
+  if (sy >= H) { sy = 2 * H - 2 - sy; }
+  if (sx < 0) { sx = -sx; }
+  if (sx >= W) { sx = 2 * W - 2 - sx; }
+  VPIPE_ELT val = (VPIPE_ELT)0;
+  if (sy >= 0 && sy < H && sx >= 0 && sx < W &&
+      (((uint)tap_valid >> kt) & 1u) != 0u) {
+    const ulong si = ((ulong)sy * W + sx) * (uint)C + c;
+    val = (kt == 0u) ? t0[si] : (kt == 1u) ? t1[si] : t2[si];
+  }
+  out[gid] = val;
+}
+
 // Channel-wise concatenation of three frame views, out[r, kt*C + c] =
 // t{kt}[r, c] over `rows` rows. Pairs with a dense_gemm over W[Cout, 3*C]
 // to realize the Wan VAE's TEMPORAL-only convolutions -- the (3,1,1)
@@ -4494,4 +4637,126 @@ kernel void umt5_attn_f16(
     const float r = part[0][t] + part[1][t] + part[2][t] + part[3][t];
     out[i * hd + h * (uint)D + t] = VPIPE_ELT(r * inv);
   }
+}
+
+// ---------------------------------------------------------------------
+// MiniMax-H3: per-ROW modulation.
+//
+// Every other DiT here modulates a whole activation with ONE (shift,
+// scale, gate) triple, because one forward carries one timestep and one
+// modality. MiniMax-H3 carries several of both in a single packed
+// sequence -- generated video rows, generated audio rows and pinned
+// conditioning rows all sit at different noise levels -- so the
+// modulation is a TABLE and each row of the activation picks its own
+// entry. `idx` is the caller's precomputed `timestep_index * 3 + tag`
+// (0 video, 1 text, 2 audio), or the bare timestep index for the final
+// norm, which is modality-independent.
+//
+// `mod` is the block's modulation table [rows, stride]; one table row
+// holds all of that block's parameters back to back, so `scale_off` /
+// `shift_off` / `gate_off` are column offsets within it. That matches
+// the reference's `linear(silu(temb)).view(-1, 6*H).chunk(6, -1)`:
+// chunking the last axis of a (rows, 6*H) matrix leaves the six
+// parameters of one row contiguous, in the order shift_msa, scale_msa,
+// gate_msa, shift_mlp, scale_mlp, gate_mlp.
+
+// out[m,n] = (1 + scale[idx[m], n]) * x[m,n] + shift[idx[m], n]
+//   0:x[M,N] 1:mod[*,stride] 2:idx[M] (int32) 3:out[M,N] 4:N 5:stride
+//   6:scale_off 7:shift_off 8:total(=M*N).  grid (total).
+kernel void adaln_modulate_idx_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* mod   [[buffer(1)]],
+    const device int*       idx   [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&      N          [[buffer(4)]],
+    constant int&      stride     [[buffer(5)]],
+    constant int&      scale_off  [[buffer(6)]],
+    constant int&      shift_off  [[buffer(7)]],
+    constant int&      total      [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)total) { return; }
+  const int m = (int)gid / N;
+  const int n = (int)gid % N;
+  const int64_t base = (int64_t)idx[m] * stride;
+  const float sc = float(mod[base + scale_off + n]);
+  const float sh = float(mod[base + shift_off + n]);
+  out[gid] = VPIPE_ELT((1.0f + sc) * float(x[gid]) + sh);
+}
+
+// h[m,n] += gate[idx[m], n] * sub[m,n]. In place on h.
+//   0:h[M,N] 1:mod[*,stride] 2:idx[M] (int32) 3:sub[M,N] 4:N 5:stride
+//   6:gate_off 7:total(=M*N).  grid (total).
+kernel void gated_residual_idx_f16(
+    device VPIPE_ELT*       h    [[buffer(0)]],
+    const device VPIPE_ELT* mod  [[buffer(1)]],
+    const device int*       idx  [[buffer(2)]],
+    const device VPIPE_ELT* sub  [[buffer(3)]],
+    constant int&      N         [[buffer(4)]],
+    constant int&      stride    [[buffer(5)]],
+    constant int&      gate_off  [[buffer(6)]],
+    constant int&      total     [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)total) { return; }
+  const int m = (int)gid / N;
+  const int n = (int)gid % N;
+  const int64_t base = (int64_t)idx[m] * stride;
+  h[gid] = VPIPE_ELT(float(h[gid]) +
+                     float(mod[base + gate_off + n]) * float(sub[gid]));
+}
+
+// SwiGLU over a FUSED [rows, 2*D] projection split into halves, VALUE
+// first: out[r,d] = in[r,d] * silu(in[r,D+d]).
+//
+// The half order is the trap. diffusers' `SwiGLU` reads
+// `hidden, gate = proj(x).chunk(2, -1)` and returns `hidden *
+// silu(gate)`, so the FIRST half is the value and the SECOND is the
+// gate -- the opposite of the llama/Qwen convention every other SwiGLU
+// in this tree follows, where the gate leads. Feeding this kernel a
+// gate-first matrix produces a plausible, wrong activation rather than
+// anything that fails loudly, which is why it is a separate entry point
+// instead of a flag on swiglu_f16.
+//   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
+kernel void swiglu_split_value_first_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      D    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)(rows * D)) { return; }
+  const int r = (int)gid / D;
+  const int d = (int)gid % D;
+  const int64_t base = (int64_t)r * (2 * D);
+  const float v = float(in[base + d]);
+  const float g = float(in[base + D + d]);
+  out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
+}
+
+// The same split with the halves the OTHER way round -- GATE first:
+// out[r,d] = silu(in[r,d]) * in[r,D+d].
+//
+// Which of the two is right for a checkpoint is not a matter of taste,
+// and the two references disagree: diffusers' `SwiGLU` is value-first
+// (above), while ComfyUI's `_swiglu_eager` does
+// `gate, up = x.chunk(2); silu(gate) * up`. Since a wrong half order is
+// silent -- it degrades every block by a fixed amount instead of
+// failing -- both entry points exist so the question can be settled by
+// running the model rather than by reading either reference.
+//   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
+kernel void swiglu_split_gate_first_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      D    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)(rows * D)) { return; }
+  const int r = (int)gid / D;
+  const int d = (int)gid % D;
+  const int64_t base = (int64_t)r * (2 * D);
+  const float g = float(in[base + d]);
+  const float v = float(in[base + D + d]);
+  out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
 }

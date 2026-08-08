@@ -101,6 +101,22 @@ template [[host_name("attn_steel_nax_h_bd128")]] [[kernel]] decltype(attention_n
                                                                      float>)
 attention_nax<half, 64, 32, 128, 4, 1, half, float>;
 
+// bf16 twin of the head_dim-64 NAX attention, for the MiniMax-H3 video VAE:
+// its ViT half is 64-wide per head and the whole VAE runs bf16, so neither
+// the f16 bd64 entry above nor the bf16 bd128 entry below fits it. Adding the
+// instantiation is the whole of the change -- the kernel is dtype-generic and
+// accumulates in f32 either way.
+template [[host_name("attn_steel_nax_h_bd64_bf16")]] [[kernel]] decltype(attention_nax<
+                                                                    bfloat,
+                                                                    64,
+                                                                    32,
+                                                                    64,
+                                                                    4,
+                                                                    1,
+                                                                    bfloat,
+                                                                    float>)
+attention_nax<bfloat, 64, 32, 64, 4, 1, bfloat, float>;
+
 // bf16 twin of the head_dim-128 NAX (M5 matrix-core) attention, for the FLUX.2
 // DiT: its residual stream overflows f16 range, so the whole DiT runs bf16 and
 // its joint attention Q/K/V are bf16. Same kernel, T=bfloat (accumulation f32).
@@ -123,6 +139,9 @@ attention_nax<bfloat, 64, 32, 128, 4, 1, bfloat, float>;
 kernel void attn_steel_nax_h_bd64(device half* O [[buffer(3)]],
                                   uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (half)0; } }
+kernel void attn_steel_nax_h_bd64_bf16(device bfloat* O [[buffer(3)]],
+                                       uint t [[thread_position_in_grid]])
+{ if (t == 0) { O[0] = (bfloat)0; } }
 kernel void attn_steel_nax_h_bd128(device half* O [[buffer(3)]],
                                    uint t [[thread_position_in_grid]])
 { if (t == 0) { O[0] = (half)0; } }

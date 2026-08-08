@@ -147,6 +147,21 @@ template [[host_name("attn_steel_h_bd64")]] [[kernel]] decltype(attention<
                                                                 float>)
 attention<half, 32, 16, 64, 4, 1, half, float>;
 
+// bf16 head_dim-64 twin, for the MiniMax-H3 video VAE's ViT decoder. Its
+// 36 blocks run bf16 for the same reason the DiTs do -- the reference
+// ships fp32 and f16's range is the thing that bites first -- so the f16
+// entry point above cannot serve it.
+template [[host_name("attn_steel_h_bd64_bf16")]] [[kernel]] decltype(attention<
+                                                                bfloat,
+                                                                32,
+                                                                16,
+                                                                64,
+                                                                4,
+                                                                1,
+                                                                bfloat,
+                                                                float>)
+attention<bfloat, 32, 16, 64, 4, 1, bfloat, float>;
+
 // attn_steel_paged_bd256 -- the PAGED-KV port of MLX's steel register-resident
 // flash (head_dim 256). Keeps the register MMATile core verbatim (Stile/Otile
 // in registers, online softmax via row_reduce/row_bin_op, tile_matmad QK, exp2

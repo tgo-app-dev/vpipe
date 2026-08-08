@@ -9,6 +9,7 @@
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-detect.h"
 #include "stages/model-registry.h"
 
 #include <cmath>
@@ -59,6 +60,14 @@ namespace {
 // the primary `latent` input, so it is iport1. (Referenced only from the
 // Apple-gated code below; marked maybe_unused for the inert non-Apple build.)
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
+
+// MiniMax-H3's video VAE works in IMAGENET-normalized pixel space, so
+// its decoder's output has to be un-normalized before it means [0, 1].
+// These are the reference's own constants, not a preprocessing choice.
+[[maybe_unused]] constexpr float kImagenetMean[3] = {0.485f, 0.456f,
+                                                     0.406f};
+[[maybe_unused]] constexpr float kImagenetStd[3]  = {0.229f, 0.224f,
+                                                     0.225f};
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -135,6 +144,10 @@ vae_family_(const std::string& vae_dir)
         // only thing that tells them apart -- and getting it wrong
         // would decode a video latent as a single still.
         if (cls == "AutoencoderKLWan") { return "wan"; }
+        // MiniMax-H3's video VAE. Its own class because the DECODER is a
+        // 36-layer ViT -- one token per latent voxel, each projecting a
+        // whole 4x16x16 pixel block -- not an upsampling conv stack.
+        if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
       }
     }
   }
@@ -205,8 +218,7 @@ VaeDecodeStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  return model_memory::weight_claims(
-      {(fs::path(root) / "vae").string()});
+  return model_memory::weight_claims({resolve_vae_dir(root)});
 }
 
 Job
@@ -233,10 +245,11 @@ VaeDecodeStage::load_note_(const VpipeFormat& msg) const
 void
 VaeDecodeStage::unload_vae_()
 {
-  if (!_vae && !_flux2_vae && !_mage_vae) { return; }
+  if (!_vae && !_flux2_vae && !_mage_vae && !_h3_vae) { return; }
   _vae.reset();
   _flux2_vae.reset();
   _mage_vae.reset();
+  _h3_vae.reset();
   _unloaded = true;
   _quiet_reload = true;
   session()->log_debug(fmt("VaeDecodeStage('{}'): VAE decoder unloaded (idle)",
@@ -297,10 +310,10 @@ VaeDecodeStage::ensure_loaded_()
         _unload_idle ? "UNLOAD after each beat" : "keep resident"));
   }
   namespace fs = std::filesystem;
-  std::string vae_dir = root;
-  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
-    vae_dir = (fs::path(root) / "vae").string();
-  }
+  // `vae/` for every diffusers checkpoint, `video_vae/source/` for
+  // MiniMax-H3. Shared with vae-encode so the two halves of one model
+  // can never resolve to different directories.
+  const std::string vae_dir = resolve_vae_dir(root);
 
   _family = vae_family_(vae_dir);
   // One shared, reference-counted view of this checkpoint. The peer VAE
@@ -310,8 +323,15 @@ VaeDecodeStage::ensure_loaded_()
   // running the same model share it too.
   // Falls back to a private set when the session has no manager; see
   // open_weight_set().
+  // MiniMax-H3 keeps the WEIGHTS one level below the config that named
+  // the family, so the set is opened on the resolved leaf. Every other
+  // family's resolver returns what it was handed.
+  const std::string ws_dir =
+      (_family == "minimax-h3")
+          ? genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(vae_dir)
+          : vae_dir;
   std::shared_ptr<genai::WeightSet> ws =
-      genai::open_weight_set(vae_dir, session());
+      genai::open_weight_set(ws_dir, session());
   if (!ws) {
     session()->error(fmt(
         "{}('{}'): no readable checkpoint under '{}'; inert",
@@ -361,6 +381,25 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
+  if (_family == "minimax-h3") {
+    genai::MetalMiniMaxH3VideoVae::Config h3cfg;
+    std::string h3err;
+    if (!genai::MetalMiniMaxH3VideoVae::config_from_json(vae_dir, h3cfg,
+                                                         &h3err)) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): {}; inert", this->id(), h3err));
+      return;
+    }
+    load_note_(fmt("VaeDecodeStage('{}'): loading the MiniMax-H3 video VAE "
+                   "from '{}'", this->id(), vae_dir));
+    _h3_vae = genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg);
+    if (!_h3_vae) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): failed to load the MiniMax-H3 video VAE "
+          "from '{}'; inert", this->id(), vae_dir));
+    }
+    return;
+  }
   if (_family == "wan") {
     genai::MetalWanVae::Config wcfg;
     std::string werr;
@@ -617,6 +656,153 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // ---- Mage-Flow MageVAE: input [128, H/16, W/16]; decode straight to RGB in
   // [-1,1] (no per-channel un-whiten -- MageVAE has no latents_mean/std). ----
   // ---- Wan video VAE: input [z_dim, T, h8, w8]; decode to
+  // ---- MiniMax-H3: a ViT decoder over a 16x-compressed latent --------
+  if (_family == "minimax-h3") {
+    if (!_h3_vae) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): MiniMax-H3 VAE not loaded; skipping",
+          this->id()));
+      co_return;
+    }
+    if (tbp->shape.size() != 4) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the MiniMax-H3 VAE decodes a VIDEO latent "
+          "[z, T, H/16, W/16]; got a {}-D tensor. Skipping", this->id(),
+          tbp->shape.size()));
+      co_return;
+    }
+    const auto& vc = _h3_vae->config();
+    const int Cz = (int)tbp->shape[0];
+    const int LT = (int)tbp->shape[1];
+    const int lh = (int)tbp->shape[2];
+    const int lw = (int)tbp->shape[3];
+    if (Cz != vc.z_channels || LT <= 0 || lh <= 0 || lw <= 0) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match "
+          "z_channels {}; skipping", this->id(), Cz, LT, lh, lw,
+          vc.z_channels));
+      co_return;
+    }
+    double fps = _fps;
+    if (tbp->sideband.is_object()) {
+      FlexData sb = tbp->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
+        fps = o.at("fps").as_real(fps);
+      }
+    }
+
+    // Un-whiten on the way in. The DiT generates in NORMALIZED latent
+    // space, so decoding the beat as-is would feed the VAE a latent with
+    // the wrong scale AND the wrong per-channel offset -- which decodes
+    // to a plausible but washed-out clip rather than to obvious noise.
+    const std::size_t nz = (std::size_t)Cz * LT * lh * lw;
+    const std::size_t vox = (std::size_t)LT * lh * lw;
+    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
+    if (z.empty()) { co_return; }
+    {
+      auto* d = static_cast<std::uint16_t*>(z.contents());
+      const float* s2 = tbp->as_f32();
+      const bool whiten = (int)vc.latents_mean.size() == Cz &&
+                          (int)vc.latents_std.size() == Cz;
+      for (int c = 0; c < Cz; ++c) {
+        const float mu = whiten ? vc.latents_mean[(std::size_t)c] : 0.0f;
+        const float sd = whiten ? vc.latents_std[(std::size_t)c] : 1.0f;
+        for (std::size_t i = 0; i < vox; ++i) {
+          const std::size_t k = (std::size_t)c * vox + i;
+          const float v = s2[k] * sd + mu;
+          std::uint32_t u;
+          std::memcpy(&u, &v, 4);
+          d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+      }
+    }
+
+    int F = 0;
+    std::string derr;
+    metal_compute::SharedBuffer rgb;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin,
+                         (std::uint64_t)LT * vc.patch_t *
+                             (std::uint64_t)(lh * vc.patch) *
+                             (std::uint64_t)(lw * vc.patch));
+      rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+    }
+    if (rgb.empty() || F <= 0) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): MiniMax-H3 video decode failed ({}); "
+          "skipping", this->id(), derr.empty() ? "unknown error" : derr));
+      co_return;
+    }
+    const int H = lh * vc.patch, W = lw * vc.patch;
+    const auto* rp = static_cast<const std::uint16_t*>(rgb.contents());
+    const std::size_t plane = (std::size_t)H * W;
+    // Diagnostic: the decoder's own pixels, before the u8 quantize and
+    // before anything downstream can reshape them. The unit tests cover
+    // decode_video() on an ENCODER latent; the un-whiten that runs ahead
+    // of it here is covered by nothing, so this is the only way to see
+    // which side of the stage a bad frame came from.
+    if (const char* rd = std::getenv("VPIPE_H3_RGB_DUMP")) {
+      std::ofstream f(rd, std::ios::binary);
+      for (std::size_t i = 0; i < (std::size_t)3 * F * plane; ++i) {
+        const std::uint32_t u = (std::uint32_t)rp[i] << 16;
+        float x;
+        std::memcpy(&x, &u, 4);
+        f.write(reinterpret_cast<const char*>(&x), 4);
+      }
+      session()->info(fmt("VaeDecodeStage('{}'): dumped rgb [3, {}, {}, {}] "
+                          "to {}", this->id(), F, H, W, rd));
+    }
+    if (_unload_idle) { unload_vae_(); }
+    for (int f = 0; f < F; ++f) {
+      auto out = std::make_unique<TensorBeatPayload>();
+      out->dtype = TensorBeat::DType::U8;
+      out->shape = {3, H, W};
+      out->resize_contiguous(3 * plane);
+      std::uint8_t* op = out->as_u8();
+      for (int c = 0; c < 3; ++c) {
+        const std::uint16_t* src = rp + ((std::size_t)c * F + f) * plane;
+        std::uint8_t* dst = op + (std::size_t)c * plane;
+        // The ViT decoder emits IMAGENET-NORMALIZED pixels, not [-1, 1]:
+        // the encoder's first act is `(x + 1)/2` then `(. - mean)/std`,
+        // and the reference decode undoes exactly that before clamping.
+        // Treating its output as [-1, 1] leaves it ~1/std = 4.4x too
+        // wide, so the u8 conversion clips most of the frame -- and
+        // because each 16x16 token block clips against its own local
+        // statistics, the result is a BLOCK GRID rather than an
+        // obviously blown-out image.
+        const float pm = kImagenetMean[c], ps = kImagenetStd[c];
+        for (std::size_t i = 0; i < plane; ++i) {
+          const std::uint32_t u = (std::uint32_t)src[i] << 16;
+          float x;
+          std::memcpy(&x, &u, 4);
+          float unit = x * ps + pm;             // -> [0, 1]
+          if (unit < 0.0f) { unit = 0.0f; }
+          if (unit > 1.0f) { unit = 1.0f; }
+          float v = std::round(unit * 255.0f);
+          if (v < 0.0f) { v = 0.0f; }
+          if (v > 255.0f) { v = 255.0f; }
+          dst[i] = (std::uint8_t)v;
+        }
+      }
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign("frame",
+                                      FlexData::make_int((std::int64_t)f));
+      sb.as_object().insert_or_assign("frames",
+                                      FlexData::make_int((std::int64_t)F));
+      sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+      out->sideband = std::move(sb);
+      forward_model_name_(*tbp, *out);
+      ++_images_emitted;
+      co_await ctx.write(0, std::move(out));
+    }
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): decoded [{}, {}, {}, {}] -> {} frames "
+        "[3, {}, {}] @ {:.3f} fps", this->id(), Cz, LT, lh, lw, F, H, W, fps));
+    co_return;
+  }
+
   // F = 1 + 4*(T-1) RGB frames, emitted ONE BEAT PER FRAME so the whole
   // downstream (save-image, rgb-to-video -> save-video, a preview) is the
   // per-frame machinery that already exists. ----

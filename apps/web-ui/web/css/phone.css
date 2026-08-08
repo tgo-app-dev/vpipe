@@ -62,6 +62,61 @@
   gap: 0;
 }
 #app.phone #topbar .grow { flex: 1 1 auto; }
+
+/* ---- live progress line ----
+   A thin rail directly under the menu-button row, present in every view
+   because it is a sibling of the topbar in the #app column rather than
+   part of any one view. `flex: 0 0 auto` so it takes its own height from
+   the shell instead of stealing it from the view body -- and [hidden]
+   collapses it entirely, which is the usual state. */
+#app.phone .ph-prog {
+  position: relative;
+  flex: 0 0 auto;
+  height: 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+#app.phone .ph-prog[hidden] { display: none; }
+.ph-prog-fill {
+  position: absolute; inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  opacity: .55;                 /* the text rides ON the fill, so it has
+                                   to stay readable where they overlap */
+  transition: width .25s linear;
+}
+/* Indeterminate (`total` 0): a bar pinned at 0% reads as stuck, so a
+   short block sweeps instead -- motion says "working" without claiming
+   a fraction the reporter never gave. */
+#app.phone .ph-prog.indet .ph-prog-fill {
+  width: 34%;
+  transition: none;
+  animation: ph-prog-sweep 1.4s ease-in-out infinite;
+}
+@keyframes ph-prog-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(330%); }
+}
+/* The description, overlaid on the rail. Very small, single line, and
+   ellipsised: a phone width cannot hold a long stage description and a
+   wrapped one would change the rail's height as the text changed. */
+.ph-prog-text {
+  position: absolute; inset: 0;
+  display: flex; align-items: center;
+  padding: 0 8px;
+  font-size: 9px; line-height: 1;
+  letter-spacing: .02em;
+  color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  pointer-events: none;         /* never intercepts a tap meant for a view */
+}
+/* Motion-sensitive users get the rail without the sweep; an
+   indeterminate report then just shows its description. */
+@media (prefers-reduced-motion: reduce) {
+  #app.phone .ph-prog.indet .ph-prog-fill { animation: none; width: 100%; }
+}
+
 /* 44px: the smallest reliably tappable target. */
 .ph-menu-btn {
   flex: 0 0 auto;

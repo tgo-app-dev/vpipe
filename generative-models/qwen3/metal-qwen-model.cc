@@ -5,6 +5,7 @@
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/stream-pin.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 
 namespace vpipe::genai {
 
@@ -104,6 +106,458 @@ read_elt_(const void* src, float* dst, std::size_t n, bool bf16)
 }
 }  // namespace
 
+// ---- Per-layer weight builder --------------------------------------------
+// See MetalQwenModel::LayerLoad in the header for why the per-layer loader is
+// an object rather than a block of lambdas inside load(): with
+// Config::stream_layers a layer is built from the PREFILL, and the point of
+// streaming is that it is built by the SAME code as a resident layer.
+//
+// Every helper below was a lambda in load(). The bodies are unchanged; the
+// names they closed over (cfg / wts / wset / mc / m / bf16 / ...) are members
+// bound to the same things.
+struct MetalQwenModel::LayerLoad {
+  LayerLoad(MetalQwenModel* mm, metal_compute::MetalCompute* c, WeightSet& ws)
+      : m(mm), mc(c), wset(ws), wts(&ws.src()), cfg(mm->_cfg) {}
+
+  MetalQwenModel* const              m;
+  metal_compute::MetalCompute* const mc;
+  WeightSet&                         wset;
+  const MetalLlamaWeights* const     wts;
+  // The model's OWN config, not the caller's: load()'s copy is a stack
+  // local, and a streamed layer is built long after load() returns.
+  const Config&                      cfg;
+
+  int affine_bits(const std::string& pfx, int K) {
+    const auto* wi = wts->info(pfx + ".weight");
+    if (wi == nullptr || wi->shape.size() < 2 || K <= 0) { return 0; }
+    return (int)((wi->shape.back() * 32) / K);
+  }
+  // Qwen 4-bit checkpoints store scales/biases and all the non-quantized
+  // tensors (norms, conv1d, dt_bias) as BF16; our kernels want F16 (and
+  // F32 for the recurrence's A_log/dt_bias). Convert at load.
+  // Convert a tensor to the compute element type (f16 or bf16). In bf16
+  // mode the Qwen checkpoint's BF16 scales/norms/conv pass through raw
+  // (no conversion); only f32 sources are narrowed.
+  const bool bf16 = cfg.use_bf16;
+  SharedBuffer to_elt(const std::string& name) {
+    const auto* info = wts->info(name);
+    if (info == nullptr) { return {}; }
+    const std::string want = bf16 ? "BF16" : "F16";
+    // Already the compute dtype: an owned copy, uncached.
+    //
+    // Mapping these instead was MEASURED and rejected: load_mapped wraps
+    // the WHOLE shard, so the moment one tensor is mapped the entire
+    // checkpoint is resident -- and an LM still has to copy every tensor
+    // whose dtype needs converting, so it pays for both. On a 4-bit
+    // Qwen3.5-4B that was 3.62 -> 5.00 GB peak footprint. The DiTs map
+    // profitably because they convert almost nothing; LMs do not.
+    if (info->dtype == want) {
+      return wset.read(name, mc, WeightSet::Residency::Copied);
+    }
+    // The source is consumed here and dropped, so it is read UNCACHED --
+    // caching it would keep a redundant copy beside the converted one.
+    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
+    if (raw.empty()) { return {}; }
+    const std::size_t n = numel_(info->shape);
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    auto* o = static_cast<std::uint16_t*>(out.contents());
+    auto to16 = [&](float f) -> std::uint16_t {
+      if (bf16) { return f32_to_bf16_(f); }
+      _Float16 h = (_Float16)f; std::uint16_t b; std::memcpy(&b, &h, 2); return b;
+    };
+    if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = to16(bf16_to_f32_(s[i])); }
+    } else if (info->dtype == "F16") {
+      const auto* s = static_cast<const _Float16*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = to16((float)s[i]); }
+    } else if (info->dtype == "F32") {
+      const auto* s = static_cast<const float*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = to16(s[i]); }
+    } else {
+      return {};
+    }
+    return out;
+  }
+  // Alias: all callers want the compute element type.
+  SharedBuffer to_f16(const std::string& name) { return to_elt(name); }
+  SharedBuffer to_f32(const std::string& name) {
+    const auto* info = wts->info(name);
+    if (info == nullptr) { return {}; }
+    if (info->dtype == "F32") {
+      return wset.read(name, mc, WeightSet::Residency::Copied);
+    }
+    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
+    if (raw.empty()) { return {}; }
+    const std::size_t n = numel_(info->shape);
+    SharedBuffer out = mc->make_shared_buffer(n * 4);
+    auto* o = static_cast<float*>(out.contents());
+    if (info->dtype == "BF16") {
+      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = bf16_to_f32_(s[i]); }
+    } else {
+      return {};
+    }
+    return out;
+  }
+  // Quantized linear: U32 weight (raw), F16 scales+biases (converted).
+  bool qtri(const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
+            SharedBuffer& b) {
+    // Raw U32 codes. Uncached: several of these are row-concatenated
+    // into one fused matrix and then dropped, and a cache would hold the
+    // pieces alive next to the product.
+    w = wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
+    s = to_f16(pfx + ".scales");
+    b = to_f16(pfx + ".biases");
+    return !w.empty() && !s.empty() && !b.empty();
+  }
+  // Fuse several quantized projections that share the input (K = hidden)
+  // into ONE [sum(N_i), K] matrix by row-concatenation -- one wide GEMM
+  // replaces N separate ones (MLX issues them individually). Rows are
+  // contiguous in the packed/scale/bias layout so concat is a memcpy.
+  // Kc/8 u32 per weight row, Kc/64 (16-bit) per scale & bias row.
+  bool fuse_q(const std::vector<std::string>& names,
+              SharedBuffer& fw, SharedBuffer& fs, SharedBuffer& fb) {
+    // u32 words per weight row = K * bits / 32 (4-bit: K/8, 8-bit: K/4).
+    const std::size_t wrow =
+        (std::size_t)cfg.hidden * cfg.quant_bits / 32;
+    const std::size_t grow = (std::size_t)cfg.hidden / 64;  // 16-bit / scale row
+    std::vector<SharedBuffer> ws, ss, bs;
+    std::size_t Ntot = 0;
+    for (const auto& nm : names) {
+      SharedBuffer w, s, b;
+      if (!qtri(nm, w, s, b)) { return false; }
+      const auto* info = wts->info(nm + ".scales");   // [N, Kc/64]
+      if (info == nullptr) { return false; }
+      Ntot += (std::size_t)info->shape[0];
+      ws.push_back(std::move(w)); ss.push_back(std::move(s));
+      bs.push_back(std::move(b));
+    }
+    fw = mc->make_shared_buffer(Ntot * wrow * 4);
+    fs = mc->make_shared_buffer(Ntot * grow * 2);
+    fb = mc->make_shared_buffer(Ntot * grow * 2);
+    if (fw.empty() || fs.empty() || fb.empty()) { return false; }
+    std::size_t wo = 0, go = 0;
+    for (std::size_t i = 0; i < ws.size(); ++i) {
+      const std::size_t wn = ws[i].byte_size();
+      const std::size_t gn = ss[i].byte_size();
+      std::memcpy((char*)fw.contents() + wo, ws[i].contents(), wn);
+      std::memcpy((char*)fs.contents() + go, ss[i].contents(), gn);
+      std::memcpy((char*)fb.contents() + go, bs[i].contents(), gn);
+      wo += wn; go += gn;
+    }
+    return true;
+  }
+
+  // Fused interleaved gate/up (row 2g=gate g, 2g+1=up g) -- same as the
+  // Llama path; scales/biases are already F16 here.
+  const int Kc = cfg.hidden, Fc = cfg.ffn_inner;
+  const std::size_t wrow = (std::size_t)Kc * cfg.quant_bits / 32, grow = Kc / 64;
+  bool interleave(const SharedBuffer& gw, const SharedBuffer& gs,
+                  const SharedBuffer& gb, const SharedBuffer& uw,
+                  const SharedBuffer& us, const SharedBuffer& ub,
+                  SharedBuffer& ow, SharedBuffer& os,
+                  SharedBuffer& ob) {
+    ow = mc->make_shared_buffer((std::size_t)2 * Fc * wrow * 4);
+    os = mc->make_shared_buffer((std::size_t)2 * Fc * grow * 2);
+    ob = mc->make_shared_buffer((std::size_t)2 * Fc * grow * 2);
+    if (ow.empty() || os.empty() || ob.empty()) { return false; }
+    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
+    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
+    auto* owp = static_cast<std::uint32_t*>(ow.contents());
+    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
+    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
+    auto* osp = static_cast<std::uint16_t*>(os.contents());
+    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
+    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
+    auto* obp = static_cast<std::uint16_t*>(ob.contents());
+    for (std::size_t g = 0; g < (std::size_t)Fc; ++g) {
+      std::memcpy(owp + (2 * g) * wrow, gwp + g * wrow, wrow * 4);
+      std::memcpy(owp + (2 * g + 1) * wrow, uwp + g * wrow, wrow * 4);
+      std::memcpy(osp + (2 * g) * grow, gsp + g * grow, grow * 2);
+      std::memcpy(osp + (2 * g + 1) * grow, usp + g * grow, grow * 2);
+      std::memcpy(obp + (2 * g) * grow, gbp + g * grow, grow * 2);
+      std::memcpy(obp + (2 * g + 1) * grow, ubp + g * grow, grow * 2);
+    }
+    return true;
+  }
+
+  // ---- Unquantized dense f16 loaders (raw-HF bf16 checkpoint) -------
+  // Each helper narrows the raw bf16/f16 `.weight` to the compute element
+  // (2 bytes/elt) and writes the SAME fused/interleaved layout the affine
+  // path produces, but as a plain [N,K] f16 weight (no scales/biases). The
+  // forward dispatches the dense GEMM/GEMV whenever the scales slot is empty.
+  //
+  // Row-concatenate several [N_i, K] f16 weights into one [sum(N_i), K]
+  // matrix (q|k|v fuse, in_proj qkv|z|a|b fuse): the dense GEMM reads it as
+  // one taller weight. Each row is K elements = K*2 bytes.
+  bool fuse_f16(const std::vector<std::string>& names,
+                SharedBuffer& out) {
+    std::vector<SharedBuffer> ws;
+    std::size_t total_bytes = 0;
+    for (const auto& nm : names) {
+      SharedBuffer w = to_f16(nm + ".weight");
+      if (w.empty()) { return false; }
+      total_bytes += w.byte_size();
+      ws.push_back(std::move(w));
+    }
+    out = mc->make_shared_buffer(total_bytes);
+    if (out.empty()) { return false; }
+    std::size_t off = 0;
+    for (auto& w : ws) {
+      std::memcpy((char*)out.contents() + off, w.contents(), w.byte_size());
+      off += w.byte_size();
+    }
+    return true;
+  }
+  // +1 RMSNorm fold: raw-HF Qwen stores zero-centered norm weights; the model
+  // applies (1+weight) while vpipe's rms kernel multiplies by weight directly.
+  // Add 1.0 to every element of a loaded f16/bf16 norm buffer. EXCLUDES the
+  // gated GDN norm (linear_attn.norm, ones-init -- already absolute).
+  // Dense raw-HF norm fold applies only when the checkpoint is zero-centered
+  // (Qwen3.5 family). Plain-Qwen3 backbones (MOSS) use standard RMSNorm.
+  const bool fold_norm_plus_one = cfg.zero_centered_norm;
+  void add_one_f16(SharedBuffer& buf) {
+    if (buf.empty()) { return; }
+    auto* p = static_cast<std::uint16_t*>(buf.contents());
+    const std::size_t n = buf.byte_size() / 2;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (bf16) {
+        p[i] = f32_to_bf16_(bf16_to_f32_(p[i]) + 1.0f);
+      } else {
+        _Float16 h; std::memcpy(&h, &p[i], 2);
+        h = (_Float16)((float)h + 1.0f);
+        std::memcpy(&p[i], &h, 2);
+      }
+    }
+  }
+
+  // ---- Dense f16 MoE interleave (raw-HF bf16 MoE) ------------------
+  // Mirror the affine interleave/interleave_moe layouts but with plain f16
+  // rows (2 bytes/elt, no scales/biases). gate|up -> [2*rows, H] interleaved
+  // (row 2g=gate g, 2g+1=up g); the per-expert dense_gemv forward reads gate
+  // at slab row 2g, up at 2g+1. K = cfg.hidden, each row H elements.
+  const std::size_t wrowHf = (std::size_t)cfg.hidden;          // f16 elts/row
+  bool interleave_w4_f16(const SharedBuffer& gw, const SharedBuffer& uw,
+                         int rows, SharedBuffer& ow) {
+    ow = mc->make_shared_buffer((std::size_t)2 * rows * wrowHf * 2);
+    if (ow.empty() || gw.empty() || uw.empty()) { return false; }
+    const auto* gp = static_cast<const std::uint16_t*>(gw.contents());
+    const auto* up = static_cast<const std::uint16_t*>(uw.contents());
+    auto* op = static_cast<std::uint16_t*>(ow.contents());
+    for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
+      std::memcpy(op + (2 * g) * wrowHf, gp + g * wrowHf, wrowHf * 2);
+      std::memcpy(op + (2 * g + 1) * wrowHf, up + g * wrowHf, wrowHf * 2);
+    }
+    return true;
+  }
+  // Batched-expert twin: gate/up are 3D f16 [E, rows, H]; interleave each
+  // expert slab -> [E, 2*rows, H] f16. Slab e's gate rows live at
+  // e*rows*wrowHf f16 elements.
+  bool interleave_moe_f16(const SharedBuffer& gw, const SharedBuffer& uw,
+                          int E, int rows, SharedBuffer& ow) {
+    ow = mc->make_shared_buffer((std::size_t)E * 2 * rows * wrowHf * 2);
+    if (ow.empty() || gw.empty() || uw.empty()) { return false; }
+    const auto* gp = static_cast<const std::uint16_t*>(gw.contents());
+    const auto* up = static_cast<const std::uint16_t*>(uw.contents());
+    auto* op = static_cast<std::uint16_t*>(ow.contents());
+    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
+      const std::size_t ob = e * 2 * rows * wrowHf;
+      const std::size_t ib = e * rows * wrowHf;
+      for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
+        std::memcpy(op + ob + (2 * g) * wrowHf, gp + ib + g * wrowHf,
+                    wrowHf * 2);
+        std::memcpy(op + ob + (2 * g + 1) * wrowHf, up + ib + g * wrowHf,
+                    wrowHf * 2);
+      }
+    }
+    return true;
+  }
+
+  // ---- MoE weight interleave (Qwen3.5-MoE) -------------------------
+  // Interleave two affine [rows, H] matrices (gate, up) into one
+  // [2*rows, H] (row 2g=gate g, 2g+1=up g) -- the layout the SwiGLU-fused
+  // matvec/GEMM reads. K = cfg.hidden. Used for the shared expert and (slab
+  // by slab) for the batched experts. The packed weight-row width depends on
+  // the expert quant width `bw` (w4: H/8 u32, w8: H/4 u32); pass it in so
+  // 4-bit and 8-bit experts both interleave correctly (a hardcoded w4 width
+  // corrupted + under-allocated w8 slabs).
+  const std::size_t growH = (std::size_t)cfg.hidden / 64;      // 32 (g64)
+  bool interleave_w4(int bw, const SharedBuffer& gw,
+                     const SharedBuffer& gs,
+                     const SharedBuffer& gb, const SharedBuffer& uw,
+                     const SharedBuffer& us, const SharedBuffer& ub,
+                     int rows, SharedBuffer& ow, SharedBuffer& os,
+                     SharedBuffer& ob) {
+    const std::size_t wrowH = (std::size_t)cfg.hidden * bw / 32;
+    ow = mc->make_shared_buffer((std::size_t)2 * rows * wrowH * 4);
+    os = mc->make_shared_buffer((std::size_t)2 * rows * growH * 2);
+    ob = mc->make_shared_buffer((std::size_t)2 * rows * growH * 2);
+    if (ow.empty() || os.empty() || ob.empty()) { return false; }
+    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
+    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
+    auto* owp = static_cast<std::uint32_t*>(ow.contents());
+    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
+    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
+    auto* osp = static_cast<std::uint16_t*>(os.contents());
+    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
+    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
+    auto* obp = static_cast<std::uint16_t*>(ob.contents());
+    for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
+      std::memcpy(owp + (2 * g) * wrowH, gwp + g * wrowH, wrowH * 4);
+      std::memcpy(owp + (2 * g + 1) * wrowH, uwp + g * wrowH, wrowH * 4);
+      std::memcpy(osp + (2 * g) * growH, gsp + g * growH, growH * 2);
+      std::memcpy(osp + (2 * g + 1) * growH, usp + g * growH, growH * 2);
+      std::memcpy(obp + (2 * g) * growH, gbp + g * growH, growH * 2);
+      std::memcpy(obp + (2 * g + 1) * growH, ubp + g * growH, growH * 2);
+    }
+    return true;
+  }
+  // Batched-expert twin: gate/up are 3D [E, rows, H]; interleave each expert
+  // slab -> [E, 2*rows, H]. Slab e's gate rows live at e*rows*wrowH words.
+  bool interleave_moe(int bw, const SharedBuffer& gw,
+                      const SharedBuffer& gs, const SharedBuffer& gb,
+                      const SharedBuffer& uw, const SharedBuffer& us,
+                      const SharedBuffer& ub, int E, int rows,
+                      SharedBuffer& ow, SharedBuffer& os,
+                      SharedBuffer& ob) {
+    const std::size_t wrowH = (std::size_t)cfg.hidden * bw / 32;
+    ow = mc->make_shared_buffer((std::size_t)E * 2 * rows * wrowH * 4);
+    os = mc->make_shared_buffer((std::size_t)E * 2 * rows * growH * 2);
+    ob = mc->make_shared_buffer((std::size_t)E * 2 * rows * growH * 2);
+    if (ow.empty() || os.empty() || ob.empty()) { return false; }
+    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
+    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
+    auto* owp = static_cast<std::uint32_t*>(ow.contents());
+    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
+    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
+    auto* osp = static_cast<std::uint16_t*>(os.contents());
+    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
+    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
+    auto* obp = static_cast<std::uint16_t*>(ob.contents());
+    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
+      const std::size_t wob = e * 2 * rows * wrowH, gob = e * 2 * rows * growH;
+      const std::size_t wib = e * rows * wrowH,     gib = e * rows * growH;
+      for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
+        std::memcpy(owp + wob + (2 * g) * wrowH,
+                    gwp + wib + g * wrowH, wrowH * 4);
+        std::memcpy(owp + wob + (2 * g + 1) * wrowH,
+                    uwp + wib + g * wrowH, wrowH * 4);
+        std::memcpy(osp + gob + (2 * g) * growH,
+                    gsp + gib + g * growH, growH * 2);
+        std::memcpy(osp + gob + (2 * g + 1) * growH,
+                    usp + gib + g * growH, growH * 2);
+        std::memcpy(obp + gob + (2 * g) * growH,
+                    gbp + gib + g * growH, growH * 2);
+        std::memcpy(obp + gob + (2 * g + 1) * growH,
+                    ubp + gib + g * growH, growH * 2);
+      }
+    }
+    return true;
+  }
+
+  // ---- Native k-quant (GGUF) weight loaders ------------------------
+  // The .weight tensors are raw k-quant blocks (no scales/biases); the
+  // dtype tag picks the family. Q4_K_M is heterogeneous, so only same-type
+  // projections fuse (q+k); v / o / in_proj parts / mlp stay separate.
+  static KQ kq_of(const std::string& dt) {
+    if (dt == "Q4K") { return KQ::kQ4K; }
+    if (dt == "Q5K") { return KQ::kQ5K; }
+    if (dt == "Q6K") { return KQ::kQ6K; }
+    return KQ::kNone;
+  }
+  bool load_kq(const std::string& name, SharedBuffer& buf,
+               KQ& ty) {
+    const auto* info = wts->info(name);
+    if (info == nullptr) {
+      // Required k-quant tensor absent. The GGUF converter DROPS tensors of an
+      // unsupported quant type (Q2_K/Q3_K/Q4_0/Q8_0-linear/IQ*), so a missing
+      // tensor here is most often exactly that. Fail loud with the name (no
+      // direct stderr -- via the session, mirroring the affine-quant guard).
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] k-quant load failed: required tensor '{}' is "
+                    "absent -- wrong checkpoint, or an unsupported GGUF quant "
+                    "type was dropped at conversion (only Q4_K/Q5_K/Q6_K "
+                    "linears are supported)", name));
+      }
+      return false;
+    }
+    ty = kq_of(info->dtype);
+    if (ty == KQ::kNone) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] k-quant load failed: tensor '{}' has unsupported "
+                    "type '{}' (only Q4_K/Q5_K/Q6_K)", name, info->dtype));
+      }
+      return false;
+    }
+    buf = wset.read(name, mc, WeightSet::Residency::Copied);
+    return !buf.empty();
+  }
+  // Fuse two same-family raw k-quant weights by row (byte) concatenation:
+  // [N1+N2, K] -- the qmv reads it as one taller matrix. nrows = N1+N2.
+  bool fuse_kq(const std::string& n1, const std::string& n2,
+               SharedBuffer& buf, KQ& ty, int& nrows) {
+    const auto* i1 = wts->info(n1);
+    const auto* i2 = wts->info(n2);
+    if (i1 == nullptr || i2 == nullptr || i1->dtype != i2->dtype) {
+      return false;
+    }
+    ty = kq_of(i1->dtype);
+    if (ty == KQ::kNone) { return false; }
+    // Consumed into the concatenated buffer below, then dropped.
+    SharedBuffer b1 = wset.read(n1, mc, WeightSet::Residency::Copied),
+                 b2 = wset.read(n2, mc, WeightSet::Residency::Copied);
+    if (b1.empty() || b2.empty()) { return false; }
+    buf = mc->make_shared_buffer(b1.byte_size() + b2.byte_size());
+    if (buf.empty()) { return false; }
+    std::memcpy(buf.contents(), b1.contents(), b1.byte_size());
+    std::memcpy(static_cast<char*>(buf.contents()) + b1.byte_size(),
+                b2.contents(), b2.byte_size());
+    nrows = static_cast<int>(i1->shape[0] + i2->shape[0]);
+    return true;
+  }
+  // The two tiny Q8_0 alpha/beta projections come from the converter as
+  // f32; narrow to f16 and concat into one [2*Hv, H] dense GEMV weight.
+  bool load_ab(const std::string& na, const std::string& nb,
+               SharedBuffer& buf) {
+    SharedBuffer a = to_f16(na), b = to_f16(nb);
+    if (a.empty() || b.empty()) { return false; }
+    buf = mc->make_shared_buffer(a.byte_size() + b.byte_size());
+    if (buf.empty()) { return false; }
+    std::memcpy(buf.contents(), a.contents(), a.byte_size());
+    std::memcpy(static_cast<char*>(buf.contents()) + a.byte_size(),
+                b.contents(), b.byte_size());
+    return true;
+  }
+  // Repack a raw Q4_K weight [N rows, K cols] -> affine-4bit-g32 (aw/as/ab)
+  // on the GPU, for the faster affine decode matvec. Lossless. Caller keeps
+  // the raw buffer (prefill still dequant->GEMMs it).
+  bool repack_q4k(const SharedBuffer& raw, int N, int K,
+                  SharedBuffer& aw, SharedBuffer& as,
+                  SharedBuffer& ab) {
+    if (!m->_fn_repack_q4k.valid() || !m->_fn_qmv_w4g32.valid()) { return false; }
+    if (K % 256 != 0 || N % 8 != 0 || raw.empty()) { return false; }
+    aw = mc->make_shared_buffer((std::size_t)N * (K / 8) * 4);
+    as = mc->make_shared_buffer((std::size_t)N * (K / 32) * 2);
+    ab = mc->make_shared_buffer((std::size_t)N * (K / 32) * 2);
+    if (aw.empty() || as.empty() || ab.empty()) { return false; }
+    const int nsb = K / 256;
+    auto st = mc->make_command_stream();
+    { auto enc = st.begin_compute();
+      enc.set_function(m->_fn_repack_q4k);
+      enc.set_buffer(0, raw); enc.set_buffer(1, aw); enc.set_buffer(2, as);
+      enc.set_buffer(3, ab); enc.set_constant(4, K); enc.set_constant(5, N);
+      enc.dispatch({(unsigned)nsb, (unsigned)N, 1}, {(unsigned)nsb, 1, 1});
+    }
+    st.commit().wait();
+    return true;
+  }
+  // Build _layers[L] from the checkpoint. Run by load() for a resident layer
+  // and by the prefill for a streamed one -- one function, so streaming
+  // cannot drift from preloading.
+  bool build_layer(int L);
+};
+
 std::unique_ptr<MetalQwenModel>
 MetalQwenModel::load(const std::string& model_dir,
                      metal_compute::MetalCompute* mc, const Config& cfg_in)
@@ -171,6 +625,29 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_ws = std::move(ws_in);
   m->_cfg = cfg;
   m->_mc = mc;
+  // Prefill streaming: build/free layers inside the forward instead of
+  // holding the stack. Mutually exclusive with the calibration streamer,
+  // which owns the same per-layer slots on its own schedule.
+  m->_stream_layers = cfg.stream_layers && !cfg.calib_stream;
+  if (m->_stream_layers && !cfg.backbone_only) {
+    // A model with an lm_head is there to DECODE, and decode re-reading the
+    // checkpoint per token is not a trade anyone wants. Fall back to
+    // resident -- wrong on memory, never wrong on output -- and say so.
+    if (const SessionContextIntf* s = mc->session()) {
+      s->warn(fmt("[qwen] stream_layers is a prefill mechanism and needs "
+                  "backbone_only (a taps/hidden-state consumer); this "
+                  "checkpoint has an output head, so it loads resident"));
+    }
+    m->_stream_layers = false;
+  }
+
+  // The per-layer weight builder. It reads m->_cfg (assigned above), so it
+  // must come after that; a streaming model keeps it for the prefill, a
+  // preloading one drops it once the stack is built.
+  // Bound to the set the MODEL holds, not to load()'s reference: the
+  // builder outlives this frame whenever streaming is on.
+  m->_lload = std::make_unique<LayerLoad>(m.get(), mc, *m->_ws);
+  LayerLoad& H = *m->_lload;
 
   // ---- Mixed-precision affine (OptiQ) detection ----------------------
   // Infer an affine linear's bit width from its packed-weight column count
@@ -183,10 +660,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // .scales) returns 0. If a checkpoint mixes 4-bit and 8-bit linears
   // (mlx-optiq sensitivity quant), take the de-fused per-tensor path; uniform
   // 4-bit and uniform 8-bit both stay on the fused single-width path.
-  auto affine_bits = [&](const std::string& pfx, int K) -> int {
-    const auto* wi = wts->info(pfx + ".weight");
-    if (wi == nullptr || wi->shape.size() < 2 || K <= 0) { return 0; }
-    return (int)((wi->shape.back() * 32) / K);
+  auto affine_bits = [&](const std::string& pfx, int K) {
+    return H.affine_bits(pfx, K);
   };
   // Affine group size from the .scales shape [N, K/group]; 0 if not affine.
   auto affine_group = [&](const std::string& pfx, int K) -> int {
@@ -870,732 +1345,47 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     }
   }
 
-  // Qwen 4-bit checkpoints store scales/biases and all the non-quantized
-  // tensors (norms, conv1d, dt_bias) as BF16; our kernels want F16 (and
-  // F32 for the recurrence's A_log/dt_bias). Convert at load.
-  // Convert a tensor to the compute element type (f16 or bf16). In bf16
-  // mode the Qwen checkpoint's BF16 scales/norms/conv pass through raw
-  // (no conversion); only f32 sources are narrowed.
-  const bool bf16 = cfg.use_bf16;
-  auto to_elt = [&](const std::string& name) -> SharedBuffer {
-    const auto* info = wts->info(name);
-    if (info == nullptr) { return {}; }
-    const std::string want = bf16 ? "BF16" : "F16";
-    // Already the compute dtype: an owned copy, uncached.
-    //
-    // Mapping these instead was MEASURED and rejected: load_mapped wraps
-    // the WHOLE shard, so the moment one tensor is mapped the entire
-    // checkpoint is resident -- and an LM still has to copy every tensor
-    // whose dtype needs converting, so it pays for both. On a 4-bit
-    // Qwen3.5-4B that was 3.62 -> 5.00 GB peak footprint. The DiTs map
-    // profitably because they convert almost nothing; LMs do not.
-    if (info->dtype == want) {
-      return wset.read(name, mc, WeightSet::Residency::Copied);
-    }
-    // The source is consumed here and dropped, so it is read UNCACHED --
-    // caching it would keep a redundant copy beside the converted one.
-    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
-    if (raw.empty()) { return {}; }
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 2);
-    auto* o = static_cast<std::uint16_t*>(out.contents());
-    auto to16 = [&](float f) -> std::uint16_t {
-      if (bf16) { return f32_to_bf16_(f); }
-      _Float16 h = (_Float16)f; std::uint16_t b; std::memcpy(&b, &h, 2); return b;
-    };
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = to16(bf16_to_f32_(s[i])); }
-    } else if (info->dtype == "F16") {
-      const auto* s = static_cast<const _Float16*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = to16((float)s[i]); }
-    } else if (info->dtype == "F32") {
-      const auto* s = static_cast<const float*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = to16(s[i]); }
-    } else {
-      return {};
-    }
-    return out;
-  };
-  auto to_f16 = to_elt;   // alias: all callers want the compute element type
-  auto to_f32 = [&](const std::string& name) -> SharedBuffer {
-    const auto* info = wts->info(name);
-    if (info == nullptr) { return {}; }
-    if (info->dtype == "F32") {
-      return wset.read(name, mc, WeightSet::Residency::Copied);
-    }
-    SharedBuffer raw = wset.read(name, mc, WeightSet::Residency::Copied);
-    if (raw.empty()) { return {}; }
-    const std::size_t n = numel_(info->shape);
-    SharedBuffer out = mc->make_shared_buffer(n * 4);
-    auto* o = static_cast<float*>(out.contents());
-    if (info->dtype == "BF16") {
-      const auto* s = static_cast<const std::uint16_t*>(raw.contents());
-      for (std::size_t i = 0; i < n; ++i) { o[i] = bf16_to_f32_(s[i]); }
-    } else {
-      return {};
-    }
-    return out;
-  };
-  // Quantized linear: U32 weight (raw), F16 scales+biases (converted).
+  // The per-layer weight helpers live on LayerLoad (see the header) so the
+  // streaming prefill runs the same code. These aliases keep the call sites
+  // below spelled as they were.
+  const bool bf16 = H.bf16;
+  const bool fold_norm_plus_one = H.fold_norm_plus_one;
+  auto to_f16 = [&](const std::string& n) { return H.to_f16(n); };
   auto qtri = [&](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
-                  SharedBuffer& b) -> bool {
-    // Raw U32 codes. Uncached: several of these are row-concatenated
-    // into one fused matrix and then dropped, and a cache would hold the
-    // pieces alive next to the product.
-    w = wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
-    s = to_f16(pfx + ".scales");
-    b = to_f16(pfx + ".biases");
-    return !w.empty() && !s.empty() && !b.empty();
-  };
-  // Fuse several quantized projections that share the input (K = hidden)
-  // into ONE [sum(N_i), K] matrix by row-concatenation -- one wide GEMM
-  // replaces N separate ones (MLX issues them individually). Rows are
-  // contiguous in the packed/scale/bias layout so concat is a memcpy.
-  // Kc/8 u32 per weight row, Kc/64 (16-bit) per scale & bias row.
-  auto fuse_q = [&](const std::vector<std::string>& names,
-                    SharedBuffer& fw, SharedBuffer& fs, SharedBuffer& fb)
-      -> bool {
-    // u32 words per weight row = K * bits / 32 (4-bit: K/8, 8-bit: K/4).
-    const std::size_t wrow =
-        (std::size_t)cfg.hidden * cfg.quant_bits / 32;
-    const std::size_t grow = (std::size_t)cfg.hidden / 64;  // 16-bit / scale row
-    std::vector<SharedBuffer> ws, ss, bs;
-    std::size_t Ntot = 0;
-    for (const auto& nm : names) {
-      SharedBuffer w, s, b;
-      if (!qtri(nm, w, s, b)) { return false; }
-      const auto* info = wts->info(nm + ".scales");   // [N, Kc/64]
-      if (info == nullptr) { return false; }
-      Ntot += (std::size_t)info->shape[0];
-      ws.push_back(std::move(w)); ss.push_back(std::move(s));
-      bs.push_back(std::move(b));
-    }
-    fw = mc->make_shared_buffer(Ntot * wrow * 4);
-    fs = mc->make_shared_buffer(Ntot * grow * 2);
-    fb = mc->make_shared_buffer(Ntot * grow * 2);
-    if (fw.empty() || fs.empty() || fb.empty()) { return false; }
-    std::size_t wo = 0, go = 0;
-    for (std::size_t i = 0; i < ws.size(); ++i) {
-      const std::size_t wn = ws[i].byte_size();
-      const std::size_t gn = ss[i].byte_size();
-      std::memcpy((char*)fw.contents() + wo, ws[i].contents(), wn);
-      std::memcpy((char*)fs.contents() + go, ss[i].contents(), gn);
-      std::memcpy((char*)fb.contents() + go, bs[i].contents(), gn);
-      wo += wn; go += gn;
-    }
-    return true;
-  };
-
-  // Fused interleaved gate/up (row 2g=gate g, 2g+1=up g) -- same as the
-  // Llama path; scales/biases are already F16 here.
-  const int Kc = cfg.hidden, Fc = cfg.ffn_inner;
-  const std::size_t wrow = (std::size_t)Kc * cfg.quant_bits / 32, grow = Kc / 64;
-  auto interleave = [&](const SharedBuffer& gw, const SharedBuffer& gs,
-                        const SharedBuffer& gb, const SharedBuffer& uw,
-                        const SharedBuffer& us, const SharedBuffer& ub,
-                        SharedBuffer& ow, SharedBuffer& os,
-                        SharedBuffer& ob) -> bool {
-    ow = mc->make_shared_buffer((std::size_t)2 * Fc * wrow * 4);
-    os = mc->make_shared_buffer((std::size_t)2 * Fc * grow * 2);
-    ob = mc->make_shared_buffer((std::size_t)2 * Fc * grow * 2);
-    if (ow.empty() || os.empty() || ob.empty()) { return false; }
-    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
-    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
-    auto* owp = static_cast<std::uint32_t*>(ow.contents());
-    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
-    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
-    auto* osp = static_cast<std::uint16_t*>(os.contents());
-    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
-    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
-    auto* obp = static_cast<std::uint16_t*>(ob.contents());
-    for (std::size_t g = 0; g < (std::size_t)Fc; ++g) {
-      std::memcpy(owp + (2 * g) * wrow, gwp + g * wrow, wrow * 4);
-      std::memcpy(owp + (2 * g + 1) * wrow, uwp + g * wrow, wrow * 4);
-      std::memcpy(osp + (2 * g) * grow, gsp + g * grow, grow * 2);
-      std::memcpy(osp + (2 * g + 1) * grow, usp + g * grow, grow * 2);
-      std::memcpy(obp + (2 * g) * grow, gbp + g * grow, grow * 2);
-      std::memcpy(obp + (2 * g + 1) * grow, ubp + g * grow, grow * 2);
-    }
-    return true;
-  };
-
-  // ---- Unquantized dense f16 loaders (raw-HF bf16 checkpoint) -------
-  // Each helper narrows the raw bf16/f16 `.weight` to the compute element
-  // (2 bytes/elt) and writes the SAME fused/interleaved layout the affine
-  // path produces, but as a plain [N,K] f16 weight (no scales/biases). The
-  // forward dispatches the dense GEMM/GEMV whenever the scales slot is empty.
-  //
-  // Row-concatenate several [N_i, K] f16 weights into one [sum(N_i), K]
-  // matrix (q|k|v fuse, in_proj qkv|z|a|b fuse): the dense GEMM reads it as
-  // one taller weight. Each row is K elements = K*2 bytes.
+                  SharedBuffer& b) { return H.qtri(pfx, w, s, b); };
   auto fuse_f16 = [&](const std::vector<std::string>& names,
-                      SharedBuffer& out) -> bool {
-    std::vector<SharedBuffer> ws;
-    std::size_t total_bytes = 0;
-    for (const auto& nm : names) {
-      SharedBuffer w = to_f16(nm + ".weight");
-      if (w.empty()) { return false; }
-      total_bytes += w.byte_size();
-      ws.push_back(std::move(w));
-    }
-    out = mc->make_shared_buffer(total_bytes);
-    if (out.empty()) { return false; }
-    std::size_t off = 0;
-    for (auto& w : ws) {
-      std::memcpy((char*)out.contents() + off, w.contents(), w.byte_size());
-      off += w.byte_size();
-    }
-    return true;
+                      SharedBuffer& out) { return H.fuse_f16(names, out); };
+  auto add_one_f16 = [&](SharedBuffer& b) { H.add_one_f16(b); };
+  auto load_kq = [&](const std::string& n, SharedBuffer& b, KQ& t) {
+    return H.load_kq(n, b, t);
   };
-  // +1 RMSNorm fold: raw-HF Qwen stores zero-centered norm weights; the model
-  // applies (1+weight) while vpipe's rms kernel multiplies by weight directly.
-  // Add 1.0 to every element of a loaded f16/bf16 norm buffer. EXCLUDES the
-  // gated GDN norm (linear_attn.norm, ones-init -- already absolute).
-  // Dense raw-HF norm fold applies only when the checkpoint is zero-centered
-  // (Qwen3.5 family). Plain-Qwen3 backbones (MOSS) use standard RMSNorm.
-  const bool fold_norm_plus_one = cfg.zero_centered_norm;
-  auto add_one_f16 = [&](SharedBuffer& buf) {
-    if (buf.empty()) { return; }
-    auto* p = static_cast<std::uint16_t*>(buf.contents());
-    const std::size_t n = buf.byte_size() / 2;
-    for (std::size_t i = 0; i < n; ++i) {
-      if (bf16) {
-        p[i] = f32_to_bf16_(bf16_to_f32_(p[i]) + 1.0f);
-      } else {
-        _Float16 h; std::memcpy(&h, &p[i], 2);
-        h = (_Float16)((float)h + 1.0f);
-        std::memcpy(&p[i], &h, 2);
-      }
-    }
-  };
-
-  // ---- Dense f16 MoE interleave (raw-HF bf16 MoE) ------------------
-  // Mirror the affine interleave/interleave_moe layouts but with plain f16
-  // rows (2 bytes/elt, no scales/biases). gate|up -> [2*rows, H] interleaved
-  // (row 2g=gate g, 2g+1=up g); the per-expert dense_gemv forward reads gate
-  // at slab row 2g, up at 2g+1. K = cfg.hidden, each row H elements.
-  const std::size_t wrowHf = (std::size_t)cfg.hidden;          // f16 elts/row
-  auto interleave_w4_f16 = [&](const SharedBuffer& gw, const SharedBuffer& uw,
-                               int rows, SharedBuffer& ow) -> bool {
-    ow = mc->make_shared_buffer((std::size_t)2 * rows * wrowHf * 2);
-    if (ow.empty() || gw.empty() || uw.empty()) { return false; }
-    const auto* gp = static_cast<const std::uint16_t*>(gw.contents());
-    const auto* up = static_cast<const std::uint16_t*>(uw.contents());
-    auto* op = static_cast<std::uint16_t*>(ow.contents());
-    for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
-      std::memcpy(op + (2 * g) * wrowHf, gp + g * wrowHf, wrowHf * 2);
-      std::memcpy(op + (2 * g + 1) * wrowHf, up + g * wrowHf, wrowHf * 2);
-    }
-    return true;
-  };
-  // Batched-expert twin: gate/up are 3D f16 [E, rows, H]; interleave each
-  // expert slab -> [E, 2*rows, H] f16. Slab e's gate rows live at
-  // e*rows*wrowHf f16 elements.
-  auto interleave_moe_f16 = [&](const SharedBuffer& gw, const SharedBuffer& uw,
-                                int E, int rows, SharedBuffer& ow) -> bool {
-    ow = mc->make_shared_buffer((std::size_t)E * 2 * rows * wrowHf * 2);
-    if (ow.empty() || gw.empty() || uw.empty()) { return false; }
-    const auto* gp = static_cast<const std::uint16_t*>(gw.contents());
-    const auto* up = static_cast<const std::uint16_t*>(uw.contents());
-    auto* op = static_cast<std::uint16_t*>(ow.contents());
-    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
-      const std::size_t ob = e * 2 * rows * wrowHf;
-      const std::size_t ib = e * rows * wrowHf;
-      for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
-        std::memcpy(op + ob + (2 * g) * wrowHf, gp + ib + g * wrowHf,
-                    wrowHf * 2);
-        std::memcpy(op + ob + (2 * g + 1) * wrowHf, up + ib + g * wrowHf,
-                    wrowHf * 2);
-      }
-    }
-    return true;
-  };
-
-  // ---- MoE weight interleave (Qwen3.5-MoE) -------------------------
-  // Interleave two affine [rows, H] matrices (gate, up) into one
-  // [2*rows, H] (row 2g=gate g, 2g+1=up g) -- the layout the SwiGLU-fused
-  // matvec/GEMM reads. K = cfg.hidden. Used for the shared expert and (slab
-  // by slab) for the batched experts. The packed weight-row width depends on
-  // the expert quant width `bw` (w4: H/8 u32, w8: H/4 u32); pass it in so
-  // 4-bit and 8-bit experts both interleave correctly (a hardcoded w4 width
-  // corrupted + under-allocated w8 slabs).
-  const std::size_t growH = (std::size_t)cfg.hidden / 64;      // 32 (g64)
-  auto interleave_w4 = [&](int bw, const SharedBuffer& gw,
-                           const SharedBuffer& gs,
-                           const SharedBuffer& gb, const SharedBuffer& uw,
-                           const SharedBuffer& us, const SharedBuffer& ub,
-                           int rows, SharedBuffer& ow, SharedBuffer& os,
-                           SharedBuffer& ob) -> bool {
-    const std::size_t wrowH = (std::size_t)cfg.hidden * bw / 32;
-    ow = mc->make_shared_buffer((std::size_t)2 * rows * wrowH * 4);
-    os = mc->make_shared_buffer((std::size_t)2 * rows * growH * 2);
-    ob = mc->make_shared_buffer((std::size_t)2 * rows * growH * 2);
-    if (ow.empty() || os.empty() || ob.empty()) { return false; }
-    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
-    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
-    auto* owp = static_cast<std::uint32_t*>(ow.contents());
-    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
-    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
-    auto* osp = static_cast<std::uint16_t*>(os.contents());
-    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
-    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
-    auto* obp = static_cast<std::uint16_t*>(ob.contents());
-    for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
-      std::memcpy(owp + (2 * g) * wrowH, gwp + g * wrowH, wrowH * 4);
-      std::memcpy(owp + (2 * g + 1) * wrowH, uwp + g * wrowH, wrowH * 4);
-      std::memcpy(osp + (2 * g) * growH, gsp + g * growH, growH * 2);
-      std::memcpy(osp + (2 * g + 1) * growH, usp + g * growH, growH * 2);
-      std::memcpy(obp + (2 * g) * growH, gbp + g * growH, growH * 2);
-      std::memcpy(obp + (2 * g + 1) * growH, ubp + g * growH, growH * 2);
-    }
-    return true;
-  };
-  // Batched-expert twin: gate/up are 3D [E, rows, H]; interleave each expert
-  // slab -> [E, 2*rows, H]. Slab e's gate rows live at e*rows*wrowH words.
-  auto interleave_moe = [&](int bw, const SharedBuffer& gw,
-                            const SharedBuffer& gs, const SharedBuffer& gb,
-                            const SharedBuffer& uw, const SharedBuffer& us,
-                            const SharedBuffer& ub, int E, int rows,
-                            SharedBuffer& ow, SharedBuffer& os,
-                            SharedBuffer& ob) -> bool {
-    const std::size_t wrowH = (std::size_t)cfg.hidden * bw / 32;
-    ow = mc->make_shared_buffer((std::size_t)E * 2 * rows * wrowH * 4);
-    os = mc->make_shared_buffer((std::size_t)E * 2 * rows * growH * 2);
-    ob = mc->make_shared_buffer((std::size_t)E * 2 * rows * growH * 2);
-    if (ow.empty() || os.empty() || ob.empty()) { return false; }
-    const auto* gwp = static_cast<const std::uint32_t*>(gw.contents());
-    const auto* uwp = static_cast<const std::uint32_t*>(uw.contents());
-    auto* owp = static_cast<std::uint32_t*>(ow.contents());
-    const auto* gsp = static_cast<const std::uint16_t*>(gs.contents());
-    const auto* usp = static_cast<const std::uint16_t*>(us.contents());
-    auto* osp = static_cast<std::uint16_t*>(os.contents());
-    const auto* gbp = static_cast<const std::uint16_t*>(gb.contents());
-    const auto* ubp = static_cast<const std::uint16_t*>(ub.contents());
-    auto* obp = static_cast<std::uint16_t*>(ob.contents());
-    for (std::size_t e = 0; e < (std::size_t)E; ++e) {
-      const std::size_t wob = e * 2 * rows * wrowH, gob = e * 2 * rows * growH;
-      const std::size_t wib = e * rows * wrowH,     gib = e * rows * growH;
-      for (std::size_t g = 0; g < (std::size_t)rows; ++g) {
-        std::memcpy(owp + wob + (2 * g) * wrowH,
-                    gwp + wib + g * wrowH, wrowH * 4);
-        std::memcpy(owp + wob + (2 * g + 1) * wrowH,
-                    uwp + wib + g * wrowH, wrowH * 4);
-        std::memcpy(osp + gob + (2 * g) * growH,
-                    gsp + gib + g * growH, growH * 2);
-        std::memcpy(osp + gob + (2 * g + 1) * growH,
-                    usp + gib + g * growH, growH * 2);
-        std::memcpy(obp + gob + (2 * g) * growH,
-                    gbp + gib + g * growH, growH * 2);
-        std::memcpy(obp + gob + (2 * g + 1) * growH,
-                    ubp + gib + g * growH, growH * 2);
-      }
-    }
-    return true;
-  };
-
-  // ---- Native k-quant (GGUF) weight loaders ------------------------
-  // The .weight tensors are raw k-quant blocks (no scales/biases); the
-  // dtype tag picks the family. Q4_K_M is heterogeneous, so only same-type
-  // projections fuse (q+k); v / o / in_proj parts / mlp stay separate.
-  auto kq_of = [](const std::string& dt) -> KQ {
-    if (dt == "Q4K") { return KQ::kQ4K; }
-    if (dt == "Q5K") { return KQ::kQ5K; }
-    if (dt == "Q6K") { return KQ::kQ6K; }
-    return KQ::kNone;
-  };
-  auto load_kq = [&](const std::string& name, SharedBuffer& buf,
-                     KQ& ty) -> bool {
-    const auto* info = wts->info(name);
-    if (info == nullptr) {
-      // Required k-quant tensor absent. The GGUF converter DROPS tensors of an
-      // unsupported quant type (Q2_K/Q3_K/Q4_0/Q8_0-linear/IQ*), so a missing
-      // tensor here is most often exactly that. Fail loud with the name (no
-      // direct stderr -- via the session, mirroring the affine-quant guard).
-      if (const SessionContextIntf* s = mc->session()) {
-        s->warn(fmt("[qwen] k-quant load failed: required tensor '{}' is "
-                    "absent -- wrong checkpoint, or an unsupported GGUF quant "
-                    "type was dropped at conversion (only Q4_K/Q5_K/Q6_K "
-                    "linears are supported)", name));
-      }
-      return false;
-    }
-    ty = kq_of(info->dtype);
-    if (ty == KQ::kNone) {
-      if (const SessionContextIntf* s = mc->session()) {
-        s->warn(fmt("[qwen] k-quant load failed: tensor '{}' has unsupported "
-                    "type '{}' (only Q4_K/Q5_K/Q6_K)", name, info->dtype));
-      }
-      return false;
-    }
-    buf = wset.read(name, mc, WeightSet::Residency::Copied);
-    return !buf.empty();
-  };
-  // Fuse two same-family raw k-quant weights by row (byte) concatenation:
-  // [N1+N2, K] -- the qmv reads it as one taller matrix. nrows = N1+N2.
   auto fuse_kq = [&](const std::string& n1, const std::string& n2,
-                     SharedBuffer& buf, KQ& ty, int& nrows) -> bool {
-    const auto* i1 = wts->info(n1);
-    const auto* i2 = wts->info(n2);
-    if (i1 == nullptr || i2 == nullptr || i1->dtype != i2->dtype) {
-      return false;
-    }
-    ty = kq_of(i1->dtype);
-    if (ty == KQ::kNone) { return false; }
-    // Consumed into the concatenated buffer below, then dropped.
-    SharedBuffer b1 = wset.read(n1, mc, WeightSet::Residency::Copied),
-                 b2 = wset.read(n2, mc, WeightSet::Residency::Copied);
-    if (b1.empty() || b2.empty()) { return false; }
-    buf = mc->make_shared_buffer(b1.byte_size() + b2.byte_size());
-    if (buf.empty()) { return false; }
-    std::memcpy(buf.contents(), b1.contents(), b1.byte_size());
-    std::memcpy(static_cast<char*>(buf.contents()) + b1.byte_size(),
-                b2.contents(), b2.byte_size());
-    nrows = static_cast<int>(i1->shape[0] + i2->shape[0]);
-    return true;
-  };
-  // The two tiny Q8_0 alpha/beta projections come from the converter as
-  // f32; narrow to f16 and concat into one [2*Hv, H] dense GEMV weight.
-  auto load_ab = [&](const std::string& na, const std::string& nb,
-                     SharedBuffer& buf) -> bool {
-    SharedBuffer a = to_f16(na), b = to_f16(nb);
-    if (a.empty() || b.empty()) { return false; }
-    buf = mc->make_shared_buffer(a.byte_size() + b.byte_size());
-    if (buf.empty()) { return false; }
-    std::memcpy(buf.contents(), a.contents(), a.byte_size());
-    std::memcpy(static_cast<char*>(buf.contents()) + a.byte_size(),
-                b.contents(), b.byte_size());
-    return true;
-  };
-  // Repack a raw Q4_K weight [N rows, K cols] -> affine-4bit-g32 (aw/as/ab)
-  // on the GPU, for the faster affine decode matvec. Lossless. Caller keeps
-  // the raw buffer (prefill still dequant->GEMMs it).
-  auto repack_q4k = [&](const SharedBuffer& raw, int N, int K,
-                        SharedBuffer& aw, SharedBuffer& as,
-                        SharedBuffer& ab) -> bool {
-    if (!m->_fn_repack_q4k.valid() || !m->_fn_qmv_w4g32.valid()) { return false; }
-    if (K % 256 != 0 || N % 8 != 0 || raw.empty()) { return false; }
-    aw = mc->make_shared_buffer((std::size_t)N * (K / 8) * 4);
-    as = mc->make_shared_buffer((std::size_t)N * (K / 32) * 2);
-    ab = mc->make_shared_buffer((std::size_t)N * (K / 32) * 2);
-    if (aw.empty() || as.empty() || ab.empty()) { return false; }
-    const int nsb = K / 256;
-    auto st = mc->make_command_stream();
-    { auto enc = st.begin_compute();
-      enc.set_function(m->_fn_repack_q4k);
-      enc.set_buffer(0, raw); enc.set_buffer(1, aw); enc.set_buffer(2, as);
-      enc.set_buffer(3, ab); enc.set_constant(4, K); enc.set_constant(5, N);
-      enc.dispatch({(unsigned)nsb, (unsigned)N, 1}, {(unsigned)nsb, 1, 1});
-    }
-    st.commit().wait();
-    return true;
+                     SharedBuffer& b, KQ& t, int& nrows) {
+    return H.fuse_kq(n1, n2, b, t, nrows);
   };
 
   m->_layers.resize(cfg.n_layers);
+  // Pinned prefix (streaming only): as many leading layers as fit resident
+  // beside the in-flight one, so a roomy box re-reads only the tail.
+  if (m->_stream_layers && cfg.pin_frac > 0.0) {
+    std::vector<std::string> pfx;
+    pfx.reserve((std::size_t)cfg.n_layers);
+    for (int i = 0; i < cfg.n_layers; ++i) {
+      pfx.push_back(cfg.weight_prefix + cfg.model_seg + "layers." +
+                    std::to_string(i) + ".");
+    }
+    m->_pinned_layers = stream_pin_count(*wts, pfx, cfg.pin_frac);
+    if (m->_pinned_layers > cfg.n_layers) { m->_pinned_layers = cfg.n_layers; }
+  }
   for (int L = 0; L < cfg.n_layers; ++L) {
-    const std::string p =
-        cfg.weight_prefix + cfg.model_seg + "layers." + std::to_string(L) + ".";
-    Layer& ly = m->_layers[L];
+    Layer& ly = m->_layers[(std::size_t)L];
     ly.is_full = cfg.layer_is_full(L);
     // Streaming calibration: leave the layer's weights EMPTY (loaded one at a
     // time later by calib_build_layer) so the full model never resides.
     if (cfg.calib_stream) { continue; }
-    ly.in_ln = to_f16(p + "input_layernorm.weight");
-    ly.post_ln = to_f16(p + "post_attention_layernorm.weight");
-    bool ok = !ly.in_ln.empty() && !ly.post_ln.empty();
-    if (m->_dense && fold_norm_plus_one) {
-      add_one_f16(ly.in_ln); add_one_f16(ly.post_ln);
-    }
-    if (ly.is_full) {
-      if (m->_dense) {
-        // Dense f16: fuse q|k|v into ONE [2*qd+2*kd, H] weight (q_proj gated,
-        // 2*qd), o_proj plain. No scales/biases -> the forward dispatches the
-        // dense GEMM/GEMV when the s slot is empty.
-        ok = ok && fuse_f16({p + "self_attn.q_proj", p + "self_attn.k_proj",
-                             p + "self_attn.v_proj"}, ly.qw);
-        ok = ok && !(ly.ow = to_f16(p + "self_attn.o_proj.weight")).empty();
-      } else if (m->_kquant) {
-        // q+k fuse (both q4_K); v is often q6_K in Q4_K_M -> separate.
-        ok = ok && fuse_kq(p + "self_attn.q_proj.weight",
-                           p + "self_attn.k_proj.weight",
-                           ly.kqk, ly.kqk_t, ly.kqk_n);
-        ok = ok && load_kq(p + "self_attn.v_proj.weight", ly.kqv, ly.kqv_t);
-        ok = ok && load_kq(p + "self_attn.o_proj.weight", ly.kqo, ly.kqo_t);
-        static const bool kAff = q4k_affine_enabled_();
-        if (ok && kAff && ly.kqk_t == KQ::kQ4K) {
-          ly.qk_q4k_aff = repack_q4k(ly.kqk, ly.kqk_n, cfg.hidden,
-                                     ly.qk_aw, ly.qk_as, ly.qk_ab);
-          if (ly.qk_q4k_aff) { ly.kqk = {}; }
-        }
-        if (ok && kAff && ly.kqo_t == KQ::kQ4K) {
-          // o_proj: [hidden, qd]; K = qd (attention output width).
-          ly.o_q4k_aff = repack_q4k(ly.kqo, cfg.hidden, cfg.qd(),
-                                    ly.o_aw, ly.o_as, ly.o_ab);
-          if (ly.o_q4k_aff) { ly.kqo = {}; }
-        }
-      } else if (m->_mixed) {
-        const int qb = affine_bits(p + "self_attn.q_proj", cfg.hidden);
-        const int kb = affine_bits(p + "self_attn.k_proj", cfg.hidden);
-        const int vb = affine_bits(p + "self_attn.v_proj", cfg.hidden);
-        ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
-        ly.o_bits = affine_bits(p + "self_attn.o_proj", cfg.qd());
-        if (qb == kb && kb == vb && qb == cfg.quant_bits) {
-          // Uniform q/k/v at the BASE width: FUSE into one [2*qd+2*kd, H] GEMM
-          // like the non-mixed path -- the forward's fused branch (gated on
-          // !ly.qkv_fused) then dispatches it with the base-width qmv/qmm, so
-          // no per-bits handling is needed. o_proj stays per-tensor.
-          ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
-                             p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
-          ly.qkv_fused = true;
-          ly.q_bits = ly.k_bits = ly.v_bits = qb;
-        } else {
-          // Genuinely mixed q/k/v -> de-fused per-tensor: q|k|v each keep their
-          // own triple + bits, the decode writes them into the same
-          // _d_qfull[q|k|v] offsets the fused path produces, the prefill
-          // dequants each into _w_deq for one GEMM.
-          ok = ok && qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
-          ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
-          ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
-          ly.q_bits = qb; ly.k_bits = kb; ly.v_bits = vb;
-        }
-      } else {
-        // Fuse q|k|v into ONE [2*qd+2*kd, H] GEMM (q_proj is gated, 2*qd).
-        ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
-                           p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
-        ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
-      }
-      if (cfg.attention_bias) {
-        // Qwen2.5-VL (Qwen-Image-Edit encoder): q/k/v carry a bias. Fuse into
-        // one [qdo+2*kd] vector in the SAME order as the fused q|k|v weight;
-        // the forward adds it after the projection GEMM, before the head split.
-        const SharedBuffer qbb = to_f16(p + "self_attn.q_proj.bias");
-        const SharedBuffer kbb = to_f16(p + "self_attn.k_proj.bias");
-        const SharedBuffer vbb = to_f16(p + "self_attn.v_proj.bias");
-        ok = ok && !qbb.empty() && !kbb.empty() && !vbb.empty();
-        if (ok) {
-          const std::size_t nq = qbb.byte_size() / 2, nk = kbb.byte_size() / 2,
-                            nv = vbb.byte_size() / 2;
-          ly.qkv_bias = mc->make_shared_buffer((nq + nk + nv) * 2);
-          auto* d = static_cast<_Float16*>(ly.qkv_bias.contents());
-          std::memcpy(d, qbb.contents(), nq * 2);
-          std::memcpy(d + nq, kbb.contents(), nk * 2);
-          std::memcpy(d + nq + nk, vbb.contents(), nv * 2);
-        }
-      }
-      if (cfg.qk_norm) {
-        ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
-        ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
-        ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
-        if (m->_dense && fold_norm_plus_one) {
-          add_one_f16(ly.q_norm); add_one_f16(ly.k_norm);
-        }
-      }
-    } else {
-      if (m->_dense) {
-        // Dense f16: fuse the four in_proj projections into ONE
-        // [Cd+vald+2Hv, H] weight (qkv|z|a|b order), out_proj plain.
-        ok = ok && fuse_f16({p + "linear_attn.in_proj_qkv",
-                             p + "linear_attn.in_proj_z",
-                             p + "linear_attn.in_proj_a",
-                             p + "linear_attn.in_proj_b"}, ly.iqw);
-        ly.gow = to_f16(p + "linear_attn.out_proj.weight");
-        ok = ok && !ly.gow.empty();
-      } else if (m->_kquant) {
-        // in_proj is heterogeneous (qkv q5_K | z q4_K | a,b q8_0) -> the
-        // decode path runs one qmv per part into the mixqkv offsets.
-        ok = ok && load_kq(p + "linear_attn.in_proj_qkv.weight",
-                           ly.kqkv, ly.kqkv_t);
-        ok = ok && load_kq(p + "linear_attn.in_proj_z.weight",
-                           ly.kqz, ly.kqz_t);
-        ok = ok && load_ab(p + "linear_attn.in_proj_a.weight",
-                           p + "linear_attn.in_proj_b.weight", ly.kqab);
-        ok = ok && load_kq(p + "linear_attn.out_proj.weight",
-                           ly.kqout, ly.kqout_t);
-      } else if (m->_mixed) {
-        // De-fused per-tensor in_proj: qkv->iqw, z->izw, a->iaw, b->ibw, each
-        // its own triple + bits, written to the same _d_mixqkv[qkv|z|a|b]
-        // offsets the fused path produces; out_proj->gow.
-        ok = ok && qtri(p + "linear_attn.in_proj_qkv", ly.iqw, ly.iqs, ly.iqb);
-        ok = ok && qtri(p + "linear_attn.in_proj_z", ly.izw, ly.izs, ly.izb);
-        ok = ok && qtri(p + "linear_attn.in_proj_a", ly.iaw, ly.ias, ly.iab);
-        ok = ok && qtri(p + "linear_attn.in_proj_b", ly.ibw, ly.ibs, ly.ibb);
-        ok = ok && qtri(p + "linear_attn.out_proj", ly.gow, ly.gos, ly.gob);
-        ly.qkv_bits = affine_bits(p + "linear_attn.in_proj_qkv", cfg.hidden);
-        ly.z_bits = affine_bits(p + "linear_attn.in_proj_z", cfg.hidden);
-        ly.a_bits = affine_bits(p + "linear_attn.in_proj_a", cfg.hidden);
-        ly.b_bits = affine_bits(p + "linear_attn.in_proj_b", cfg.hidden);
-        ly.gout_bits = affine_bits(p + "linear_attn.out_proj", cfg.value_dim());
-      } else {
-        // Fuse the four in_proj projections into ONE [Cd+vald+2Hv, H] GEMM.
-        ok = ok && fuse_q({p + "linear_attn.in_proj_qkv",
-                           p + "linear_attn.in_proj_z",
-                           p + "linear_attn.in_proj_a",
-                           p + "linear_attn.in_proj_b"},
-                          ly.iqw, ly.iqs, ly.iqb);
-        ok = ok && qtri(p + "linear_attn.out_proj", ly.gow, ly.gos, ly.gob);
-      }
-      ly.conv_w = to_f16(p + "linear_attn.conv1d.weight");
-      ly.A_log = to_f32(p + "linear_attn.A_log");
-      ly.dt_bias = to_f32(p + "linear_attn.dt_bias");
-      ly.gdn_norm = to_f16(p + "linear_attn.norm.weight");
-      ok = ok && !ly.conv_w.empty() && !ly.A_log.empty() &&
-           !ly.dt_bias.empty() && !ly.gdn_norm.empty();
-    }
-    // MLP (every layer).
-    if (m->_dense && cfg.is_moe()) {
-      // Dense f16 Mixture-of-Experts (raw-HF bf16 MoE). Router (mlp.gate),
-      // batched experts (switch_mlp gate|up interleaved per slab + down), the
-      // dense shared expert (gate|up interleaved + down) and the shared sigmoid
-      // gate -- ALL plain f16 (no scales). The forward runs a per-expert
-      // dense_gemv loop + the existing weight-free routing/combine kernels.
-      const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
-      ok = ok && !(ly.rgw = to_f16(p + "mlp.gate.weight")).empty();  // [E,H]
-      {
-        SharedBuffer gw = to_f16(p + "mlp.switch_mlp.gate_proj.weight");
-        SharedBuffer uw = to_f16(p + "mlp.switch_mlp.up_proj.weight");
-        ok = ok && interleave_moe_f16(gw, uw, E, I, ly.eguw);   // [E,2I,H]
-      }
-      ok = ok && !(ly.edw =
-                   to_f16(p + "mlp.switch_mlp.down_proj.weight")).empty();
-      {
-        SharedBuffer gw = to_f16(p + "mlp.shared_expert.gate_proj.weight");
-        SharedBuffer uw = to_f16(p + "mlp.shared_expert.up_proj.weight");
-        ok = ok && interleave_w4_f16(gw, uw, S, ly.sguw);        // [2S,H]
-      }
-      ok = ok && !(ly.sdw =
-                   to_f16(p + "mlp.shared_expert.down_proj.weight")).empty();
-      ok = ok && !(ly.segw =
-                   to_f16(p + "mlp.shared_expert_gate.weight")).empty();
-    } else if (m->_dense) {
-      // Dense f16: gate->guw, up->uw, down->dw (de-fused, like the mixed
-      // path -- two GEMVs + plain SwiGLU, no interleaved-swiglu kernel needed
-      // so it runs on every GPU). The forward dispatches dense (s empty).
-      ok = ok && !(ly.guw = to_f16(p + "mlp.gate_proj.weight")).empty();
-      ok = ok && !(ly.uw = to_f16(p + "mlp.up_proj.weight")).empty();
-      ok = ok && !(ly.dw = to_f16(p + "mlp.down_proj.weight")).empty();
-    } else if (m->_kquant) {
-      // gate/up stay separate raw q4_K (two qmv + swiglu at decode); the
-      // affine path's interleaved-swiglu kernel has no k-quant variant.
-      ok = ok && load_kq(p + "mlp.gate_proj.weight", ly.kqgate, ly.kqgate_t);
-      ok = ok && load_kq(p + "mlp.up_proj.weight", ly.kqup, ly.kqup_t);
-      ok = ok && load_kq(p + "mlp.down_proj.weight", ly.kqdown, ly.kqdown_t);
-      // Opt-in: repack the Q4_K gate/up to affine-g32 for the ~1.9x faster
-      // affine decode matvec (decode is FFN-dominated). Prefill keeps the raw.
-      static const bool kAff = q4k_affine_enabled_();
-      if (ok && kAff && ly.kqgate_t == KQ::kQ4K && ly.kqup_t == KQ::kQ4K) {
-        ly.ffn_q4k_aff =
-            repack_q4k(ly.kqgate, cfg.ffn_inner, cfg.hidden,
-                       ly.gate_aw, ly.gate_as, ly.gate_ab) &&
-            repack_q4k(ly.kqup, cfg.ffn_inner, cfg.hidden,
-                       ly.up_aw, ly.up_as, ly.up_ab);
-        // Repacked for BOTH decode (amv_g32) and prefill (aqmm_g32_): free the
-        // raw Q4_K (the affine triple is the only copy now).
-        if (ly.ffn_q4k_aff) { ly.kqgate = {}; ly.kqup = {}; }
-      }
-    } else if (m->_mixed && !cfg.is_moe()) {
-      // Mixed per-tensor MLP -- DENSE only. A mixed MoE checkpoint (OptiQ
-      // quantizes per tensor, MoE or not) has no mlp.gate_proj at all; it
-      // must fall through to the MoE branch below, which now carries its own
-      // per-tensor widths. Without the is_moe() guard the bind looked for the
-      // dense projections and failed outright.
-      // When gate/up share the (4-bit) width, interleave
-      // them into guw and run the FUSED swiglu qmv/qmm (the same kernels the
-      // uniform path uses -- recovers the fusion the de-fused path drops on
-      // 28/32 OptiQ layers). Otherwise keep gate->guw, up->uw de-fused (the 4
-      // genuinely mixed-bit layers). down->dw always per-tensor (own bits).
-      ly.gate_bits = affine_bits(p + "mlp.gate_proj", cfg.hidden);
-      ly.up_bits = affine_bits(p + "mlp.up_proj", cfg.hidden);
-      ly.down_bits = affine_bits(p + "mlp.down_proj", cfg.ffn_inner);
-      if (ly.gate_bits == 4 && ly.up_bits == 4) {
-        SharedBuffer gw, gs, gb, uw, us, ub;
-        ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb);
-        ok = ok && qtri(p + "mlp.up_proj", uw, us, ub);
-        ok = ok && interleave(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
-        ly.mlp_fused = true;
-      } else {
-        ok = ok && qtri(p + "mlp.gate_proj", ly.guw, ly.gus, ly.gub);
-        ok = ok && qtri(p + "mlp.up_proj", ly.uw, ly.us, ly.ub);
-      }
-      ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
-    } else if (cfg.is_moe()) {
-      // Mixture-of-Experts MLP (Qwen3.5-MoE). Router (w8) + batched experts
-      // (w4, gate|up interleaved per slab + down) + dense shared expert (w4,
-      // gate|up interleaved + down) + shared-expert sigmoid gate (w8).
-      const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
-      // Routed-expert quant widths, PER TENSOR (OptiQ quantizes each linear on
-      // its own sensitivity, so gate/up/down within one layer can disagree).
-      // down is a standalone tensor -> always just its own width; gate|up
-      // share the interleaved slab, so they must be made to agree.
-      const int egb = affine_bits(p + "mlp.switch_mlp.gate_proj", cfg.hidden);
-      const int eub = affine_bits(p + "mlp.switch_mlp.up_proj", cfg.hidden);
-      const int edb = affine_bits(p + "mlp.switch_mlp.down_proj",
-                                  cfg.moe_inner);
-      ly.ed_bits = (edb == 8) ? 8 : 4;
-      ok = ok && qtri(p + "mlp.gate", ly.rgw, ly.rgs, ly.rgb);   // router
-      ly.r_bits = affine_bits(p + "mlp.gate", cfg.hidden) == 8 ? 8 : 4;
-      {
-        SharedBuffer gw, gs, gb, uw, us, ub;
-        ok = ok && qtri(p + "mlp.switch_mlp.gate_proj", gw, gs, gb);
-        ok = ok && qtri(p + "mlp.switch_mlp.up_proj", uw, us, ub);
-        ly.eg_bits = (egb == 8) ? 8 : 4;
-        ly.eu_bits = (eub == 8) ? 8 : 4;
-        ly.moe_split = egb != eub;
-        if (!ly.moe_split) {
-          // Equal widths: interleave into the one gate|up slab and run the
-          // cheaper fused kernel, exactly as a uniform checkpoint does.
-          ok = ok && interleave_moe(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
-                                    ly.eguw, ly.egus, ly.egub);
-        } else {
-          // Widths disagree, so the interleaved slab (one packed row stride)
-          // is impossible. Keep BOTH tensors at their native width in their
-          // own [E, I, H] slabs and let the mixed-width kernel widen in
-          // registers: same DRAM bytes as a uniform layer, no scratch, still
-          // one fused dispatch. Widening w4->w8 at load would also be exact,
-          // but it doubles that tensor's per-token read -- the thing decode
-          // is actually bound on.
-          ly.eguw = std::move(gw); ly.egus = std::move(gs);
-          ly.egub = std::move(gb);
-          ly.euw  = std::move(uw); ly.eus  = std::move(us);
-          ly.eub  = std::move(ub);
-        }
-      }
-      ok = ok && qtri(p + "mlp.switch_mlp.down_proj", ly.edw, ly.eds, ly.edb);
-      {
-        SharedBuffer gw, gs, gb, uw, us, ub;
-        ok = ok && qtri(p + "mlp.shared_expert.gate_proj", gw, gs, gb);
-        ok = ok && qtri(p + "mlp.shared_expert.up_proj", uw, us, ub);
-        // The shared expert carries its OWN width -- OptiQ keeps it at w8 on
-        // every layer of a w4-global checkpoint -- so derive it here and let
-        // the forward dispatch the matching swiglu/qmv twins, rather than
-        // assuming the model-global cfg.quant_bits (which mis-strides it).
-        // Its gate|up are interleaved like the uniform path, so the two must
-        // agree; every pack seen so far keeps the shared expert uniform, and
-        // a future one that doesn't is refused here rather than mis-read.
-        const int sgb = affine_bits(p + "mlp.shared_expert.gate_proj",
-                                    cfg.hidden);
-        const int sub = affine_bits(p + "mlp.shared_expert.up_proj",
-                                    cfg.hidden);
-        if (sgb != sub) { return nullptr; }
-        ly.se_bits = (sgb == 8) ? 8 : 4;
-        ok = ok && interleave_w4(ly.se_bits, gw, gs, gb, uw, us, ub, S,
-                                 ly.sguw, ly.sgus, ly.sgub);
-      }
-      ok = ok && qtri(p + "mlp.shared_expert.down_proj", ly.sdw, ly.sds, ly.sdb);
-      // down is its own tensor with its own dispatch, so it may differ from
-      // the shared gate|up width.
-      ly.sd_bits = affine_bits(p + "mlp.shared_expert.down_proj",
-                               cfg.moe_shared_inner) == 8 ? 8 : 4;
-      ok = ok && qtri(p + "mlp.shared_expert_gate", ly.segw, ly.segs, ly.segb);
-    } else {
-      SharedBuffer gw, gs, gb, uw, us, ub;
-      ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb);
-      ok = ok && qtri(p + "mlp.up_proj", uw, us, ub);
-      ok = ok && interleave(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
-      ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
-    }
-    if (!ok) {
-      return nullptr;
-    }
+    // Streamed tail: built on demand by the prefill, freed after use.
+    if (m->_stream_layers && L >= m->_pinned_layers) { continue; }
+    if (!H.build_layer(L)) { return nullptr; }
   }
 
   bool ok = true;
@@ -1647,7 +1437,17 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   if (m->_dense && fold_norm_plus_one) {           // +1 RMSNorm fold (raw-HF)
     add_one_f16(m->_final_ln);
   }
-  if (!ok || m->_final_ln.empty()) {
+  if (!ok) {
+    return nullptr;
+  }
+  // The final norm may legitimately be ABSENT on a backbone-only load.
+  // It belongs to the head, and a checkpoint published for an
+  // intermediate tap has no head: MiniMax-H3's conditioning is
+  // `hidden_states[50]`, the UN-NORMED residual stream, so Comfy-Org's
+  // repack of that encoder ships no `norm.weight` at all. Requiring it
+  // would reject a checkpoint over a tensor this configuration never
+  // applies. A model that DOES run to the head still needs it.
+  if (m->_final_ln.empty() && !cfg.backbone_only) {
     return nullptr;
   }
   if (!cfg.backbone_only) {
@@ -2231,6 +2031,9 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // in via set_i8_gemm (exec) and VPIPE_I8_GEMM=1 force-enables for
   // benches/A-B (the context handles the env override internally).
   m->set_i8_gemm(false);
+  // A resident stack has no further use for the builder; only a streaming
+  // one calls back into it.
+  if (!m->_stream_layers) { m->_lload.reset(); }
   return m;
 }
 
@@ -2640,7 +2443,345 @@ MetalQwenModel::dense_gemv_(ComputeEncoder& enc, const SharedBuffer& w,
   enc.dispatch({32, (unsigned)(((N + 7) / 8) * 2), 1}, {32, 2, 1});
 }
 
+bool
+MetalQwenModel::LayerLoad::build_layer(int L)
+{
+  const std::string p =
+      cfg.weight_prefix + cfg.model_seg + "layers." + std::to_string(L) + ".";
+  Layer& ly = m->_layers[L];
+  ly.is_full = cfg.layer_is_full(L);
+  ly.in_ln = to_f16(p + "input_layernorm.weight");
+  ly.post_ln = to_f16(p + "post_attention_layernorm.weight");
+  bool ok = !ly.in_ln.empty() && !ly.post_ln.empty();
+  if (m->_dense && fold_norm_plus_one) {
+    add_one_f16(ly.in_ln); add_one_f16(ly.post_ln);
+  }
+  if (ly.is_full) {
+    if (m->_dense) {
+      // Dense f16: fuse q|k|v into ONE [2*qd+2*kd, H] weight (q_proj gated,
+      // 2*qd), o_proj plain. No scales/biases -> the forward dispatches the
+      // dense GEMM/GEMV when the s slot is empty.
+      ok = ok && fuse_f16({p + "self_attn.q_proj", p + "self_attn.k_proj",
+                           p + "self_attn.v_proj"}, ly.qw);
+      ok = ok && !(ly.ow = to_f16(p + "self_attn.o_proj.weight")).empty();
+    } else if (m->_kquant) {
+      // q+k fuse (both q4_K); v is often q6_K in Q4_K_M -> separate.
+      ok = ok && fuse_kq(p + "self_attn.q_proj.weight",
+                         p + "self_attn.k_proj.weight",
+                         ly.kqk, ly.kqk_t, ly.kqk_n);
+      ok = ok && load_kq(p + "self_attn.v_proj.weight", ly.kqv, ly.kqv_t);
+      ok = ok && load_kq(p + "self_attn.o_proj.weight", ly.kqo, ly.kqo_t);
+      static const bool kAff = q4k_affine_enabled_();
+      if (ok && kAff && ly.kqk_t == KQ::kQ4K) {
+        ly.qk_q4k_aff = repack_q4k(ly.kqk, ly.kqk_n, cfg.hidden,
+                                   ly.qk_aw, ly.qk_as, ly.qk_ab);
+        if (ly.qk_q4k_aff) { ly.kqk = {}; }
+      }
+      if (ok && kAff && ly.kqo_t == KQ::kQ4K) {
+        // o_proj: [hidden, qd]; K = qd (attention output width).
+        ly.o_q4k_aff = repack_q4k(ly.kqo, cfg.hidden, cfg.qd(),
+                                  ly.o_aw, ly.o_as, ly.o_ab);
+        if (ly.o_q4k_aff) { ly.kqo = {}; }
+      }
+    } else if (m->_mixed) {
+      const int qb = affine_bits(p + "self_attn.q_proj", cfg.hidden);
+      const int kb = affine_bits(p + "self_attn.k_proj", cfg.hidden);
+      const int vb = affine_bits(p + "self_attn.v_proj", cfg.hidden);
+      ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
+      ly.o_bits = affine_bits(p + "self_attn.o_proj", cfg.qd());
+      if (qb == kb && kb == vb && qb == cfg.quant_bits) {
+        // Uniform q/k/v at the BASE width: FUSE into one [2*qd+2*kd, H] GEMM
+        // like the non-mixed path -- the forward's fused branch (gated on
+        // !ly.qkv_fused) then dispatches it with the base-width qmv/qmm, so
+        // no per-bits handling is needed. o_proj stays per-tensor.
+        ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
+                           p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
+        ly.qkv_fused = true;
+        ly.q_bits = ly.k_bits = ly.v_bits = qb;
+      } else {
+        // Genuinely mixed q/k/v -> de-fused per-tensor: q|k|v each keep their
+        // own triple + bits, the decode writes them into the same
+        // _d_qfull[q|k|v] offsets the fused path produces, the prefill
+        // dequants each into _w_deq for one GEMM.
+        ok = ok && qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
+        ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
+        ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
+        ly.q_bits = qb; ly.k_bits = kb; ly.v_bits = vb;
+      }
+    } else {
+      // Fuse q|k|v into ONE [2*qd+2*kd, H] GEMM (q_proj is gated, 2*qd).
+      ok = ok && fuse_q({p + "self_attn.q_proj", p + "self_attn.k_proj",
+                         p + "self_attn.v_proj"}, ly.qw, ly.qs, ly.qb);
+      ok = ok && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob);
+    }
+    if (cfg.attention_bias) {
+      // Qwen2.5-VL (Qwen-Image-Edit encoder): q/k/v carry a bias. Fuse into
+      // one [qdo+2*kd] vector in the SAME order as the fused q|k|v weight;
+      // the forward adds it after the projection GEMM, before the head split.
+      const SharedBuffer qbb = to_f16(p + "self_attn.q_proj.bias");
+      const SharedBuffer kbb = to_f16(p + "self_attn.k_proj.bias");
+      const SharedBuffer vbb = to_f16(p + "self_attn.v_proj.bias");
+      ok = ok && !qbb.empty() && !kbb.empty() && !vbb.empty();
+      if (ok) {
+        const std::size_t nq = qbb.byte_size() / 2, nk = kbb.byte_size() / 2,
+                          nv = vbb.byte_size() / 2;
+        ly.qkv_bias = mc->make_shared_buffer((nq + nk + nv) * 2);
+        auto* d = static_cast<_Float16*>(ly.qkv_bias.contents());
+        std::memcpy(d, qbb.contents(), nq * 2);
+        std::memcpy(d + nq, kbb.contents(), nk * 2);
+        std::memcpy(d + nq + nk, vbb.contents(), nv * 2);
+      }
+    }
+    if (cfg.qk_norm) {
+      ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
+      ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
+      ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
+      if (m->_dense && fold_norm_plus_one) {
+        add_one_f16(ly.q_norm); add_one_f16(ly.k_norm);
+      }
+    }
+  } else {
+    if (m->_dense) {
+      // Dense f16: fuse the four in_proj projections into ONE
+      // [Cd+vald+2Hv, H] weight (qkv|z|a|b order), out_proj plain.
+      ok = ok && fuse_f16({p + "linear_attn.in_proj_qkv",
+                           p + "linear_attn.in_proj_z",
+                           p + "linear_attn.in_proj_a",
+                           p + "linear_attn.in_proj_b"}, ly.iqw);
+      ly.gow = to_f16(p + "linear_attn.out_proj.weight");
+      ok = ok && !ly.gow.empty();
+    } else if (m->_kquant) {
+      // in_proj is heterogeneous (qkv q5_K | z q4_K | a,b q8_0) -> the
+      // decode path runs one qmv per part into the mixqkv offsets.
+      ok = ok && load_kq(p + "linear_attn.in_proj_qkv.weight",
+                         ly.kqkv, ly.kqkv_t);
+      ok = ok && load_kq(p + "linear_attn.in_proj_z.weight",
+                         ly.kqz, ly.kqz_t);
+      ok = ok && load_ab(p + "linear_attn.in_proj_a.weight",
+                         p + "linear_attn.in_proj_b.weight", ly.kqab);
+      ok = ok && load_kq(p + "linear_attn.out_proj.weight",
+                         ly.kqout, ly.kqout_t);
+    } else if (m->_mixed) {
+      // De-fused per-tensor in_proj: qkv->iqw, z->izw, a->iaw, b->ibw, each
+      // its own triple + bits, written to the same _d_mixqkv[qkv|z|a|b]
+      // offsets the fused path produces; out_proj->gow.
+      ok = ok && qtri(p + "linear_attn.in_proj_qkv", ly.iqw, ly.iqs, ly.iqb);
+      ok = ok && qtri(p + "linear_attn.in_proj_z", ly.izw, ly.izs, ly.izb);
+      ok = ok && qtri(p + "linear_attn.in_proj_a", ly.iaw, ly.ias, ly.iab);
+      ok = ok && qtri(p + "linear_attn.in_proj_b", ly.ibw, ly.ibs, ly.ibb);
+      ok = ok && qtri(p + "linear_attn.out_proj", ly.gow, ly.gos, ly.gob);
+      ly.qkv_bits = affine_bits(p + "linear_attn.in_proj_qkv", cfg.hidden);
+      ly.z_bits = affine_bits(p + "linear_attn.in_proj_z", cfg.hidden);
+      ly.a_bits = affine_bits(p + "linear_attn.in_proj_a", cfg.hidden);
+      ly.b_bits = affine_bits(p + "linear_attn.in_proj_b", cfg.hidden);
+      ly.gout_bits = affine_bits(p + "linear_attn.out_proj", cfg.value_dim());
+    } else {
+      // Fuse the four in_proj projections into ONE [Cd+vald+2Hv, H] GEMM.
+      ok = ok && fuse_q({p + "linear_attn.in_proj_qkv",
+                         p + "linear_attn.in_proj_z",
+                         p + "linear_attn.in_proj_a",
+                         p + "linear_attn.in_proj_b"},
+                        ly.iqw, ly.iqs, ly.iqb);
+      ok = ok && qtri(p + "linear_attn.out_proj", ly.gow, ly.gos, ly.gob);
+    }
+    ly.conv_w = to_f16(p + "linear_attn.conv1d.weight");
+    ly.A_log = to_f32(p + "linear_attn.A_log");
+    ly.dt_bias = to_f32(p + "linear_attn.dt_bias");
+    ly.gdn_norm = to_f16(p + "linear_attn.norm.weight");
+    ok = ok && !ly.conv_w.empty() && !ly.A_log.empty() &&
+         !ly.dt_bias.empty() && !ly.gdn_norm.empty();
+  }
+  // MLP (every layer).
+  if (m->_dense && cfg.is_moe()) {
+    // Dense f16 Mixture-of-Experts (raw-HF bf16 MoE). Router (mlp.gate),
+    // batched experts (switch_mlp gate|up interleaved per slab + down), the
+    // dense shared expert (gate|up interleaved + down) and the shared sigmoid
+    // gate -- ALL plain f16 (no scales). The forward runs a per-expert
+    // dense_gemv loop + the existing weight-free routing/combine kernels.
+    const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
+    ok = ok && !(ly.rgw = to_f16(p + "mlp.gate.weight")).empty();  // [E,H]
+    {
+      SharedBuffer gw = to_f16(p + "mlp.switch_mlp.gate_proj.weight");
+      SharedBuffer uw = to_f16(p + "mlp.switch_mlp.up_proj.weight");
+      ok = ok && interleave_moe_f16(gw, uw, E, I, ly.eguw);   // [E,2I,H]
+    }
+    ok = ok && !(ly.edw =
+                 to_f16(p + "mlp.switch_mlp.down_proj.weight")).empty();
+    {
+      SharedBuffer gw = to_f16(p + "mlp.shared_expert.gate_proj.weight");
+      SharedBuffer uw = to_f16(p + "mlp.shared_expert.up_proj.weight");
+      ok = ok && interleave_w4_f16(gw, uw, S, ly.sguw);        // [2S,H]
+    }
+    ok = ok && !(ly.sdw =
+                 to_f16(p + "mlp.shared_expert.down_proj.weight")).empty();
+    ok = ok && !(ly.segw =
+                 to_f16(p + "mlp.shared_expert_gate.weight")).empty();
+  } else if (m->_dense) {
+    // Dense f16: gate->guw, up->uw, down->dw (de-fused, like the mixed
+    // path -- two GEMVs + plain SwiGLU, no interleaved-swiglu kernel needed
+    // so it runs on every GPU). The forward dispatches dense (s empty).
+    ok = ok && !(ly.guw = to_f16(p + "mlp.gate_proj.weight")).empty();
+    ok = ok && !(ly.uw = to_f16(p + "mlp.up_proj.weight")).empty();
+    ok = ok && !(ly.dw = to_f16(p + "mlp.down_proj.weight")).empty();
+  } else if (m->_kquant) {
+    // gate/up stay separate raw q4_K (two qmv + swiglu at decode); the
+    // affine path's interleaved-swiglu kernel has no k-quant variant.
+    ok = ok && load_kq(p + "mlp.gate_proj.weight", ly.kqgate, ly.kqgate_t);
+    ok = ok && load_kq(p + "mlp.up_proj.weight", ly.kqup, ly.kqup_t);
+    ok = ok && load_kq(p + "mlp.down_proj.weight", ly.kqdown, ly.kqdown_t);
+    // Opt-in: repack the Q4_K gate/up to affine-g32 for the ~1.9x faster
+    // affine decode matvec (decode is FFN-dominated). Prefill keeps the raw.
+    static const bool kAff = q4k_affine_enabled_();
+    if (ok && kAff && ly.kqgate_t == KQ::kQ4K && ly.kqup_t == KQ::kQ4K) {
+      ly.ffn_q4k_aff =
+          repack_q4k(ly.kqgate, cfg.ffn_inner, cfg.hidden,
+                     ly.gate_aw, ly.gate_as, ly.gate_ab) &&
+          repack_q4k(ly.kqup, cfg.ffn_inner, cfg.hidden,
+                     ly.up_aw, ly.up_as, ly.up_ab);
+      // Repacked for BOTH decode (amv_g32) and prefill (aqmm_g32_): free the
+      // raw Q4_K (the affine triple is the only copy now).
+      if (ly.ffn_q4k_aff) { ly.kqgate = {}; ly.kqup = {}; }
+    }
+  } else if (m->_mixed && !cfg.is_moe()) {
+    // Mixed per-tensor MLP -- DENSE only. A mixed MoE checkpoint (OptiQ
+    // quantizes per tensor, MoE or not) has no mlp.gate_proj at all; it
+    // must fall through to the MoE branch below, which now carries its own
+    // per-tensor widths. Without the is_moe() guard the bind looked for the
+    // dense projections and failed outright.
+    // When gate/up share the (4-bit) width, interleave
+    // them into guw and run the FUSED swiglu qmv/qmm (the same kernels the
+    // uniform path uses -- recovers the fusion the de-fused path drops on
+    // 28/32 OptiQ layers). Otherwise keep gate->guw, up->uw de-fused (the 4
+    // genuinely mixed-bit layers). down->dw always per-tensor (own bits).
+    ly.gate_bits = affine_bits(p + "mlp.gate_proj", cfg.hidden);
+    ly.up_bits = affine_bits(p + "mlp.up_proj", cfg.hidden);
+    ly.down_bits = affine_bits(p + "mlp.down_proj", cfg.ffn_inner);
+    if (ly.gate_bits == 4 && ly.up_bits == 4) {
+      SharedBuffer gw, gs, gb, uw, us, ub;
+      ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb);
+      ok = ok && qtri(p + "mlp.up_proj", uw, us, ub);
+      ok = ok && interleave(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
+      ly.mlp_fused = true;
+    } else {
+      ok = ok && qtri(p + "mlp.gate_proj", ly.guw, ly.gus, ly.gub);
+      ok = ok && qtri(p + "mlp.up_proj", ly.uw, ly.us, ly.ub);
+    }
+    ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
+  } else if (cfg.is_moe()) {
+    // Mixture-of-Experts MLP (Qwen3.5-MoE). Router (w8) + batched experts
+    // (w4, gate|up interleaved per slab + down) + dense shared expert (w4,
+    // gate|up interleaved + down) + shared-expert sigmoid gate (w8).
+    const int E = cfg.n_experts, I = cfg.moe_inner, S = cfg.moe_shared_inner;
+    // Routed-expert quant widths, PER TENSOR (OptiQ quantizes each linear on
+    // its own sensitivity, so gate/up/down within one layer can disagree).
+    // down is a standalone tensor -> always just its own width; gate|up
+    // share the interleaved slab, so they must be made to agree.
+    const int egb = affine_bits(p + "mlp.switch_mlp.gate_proj", cfg.hidden);
+    const int eub = affine_bits(p + "mlp.switch_mlp.up_proj", cfg.hidden);
+    const int edb = affine_bits(p + "mlp.switch_mlp.down_proj",
+                                cfg.moe_inner);
+    ly.ed_bits = (edb == 8) ? 8 : 4;
+    ok = ok && qtri(p + "mlp.gate", ly.rgw, ly.rgs, ly.rgb);   // router
+    ly.r_bits = affine_bits(p + "mlp.gate", cfg.hidden) == 8 ? 8 : 4;
+    {
+      SharedBuffer gw, gs, gb, uw, us, ub;
+      ok = ok && qtri(p + "mlp.switch_mlp.gate_proj", gw, gs, gb);
+      ok = ok && qtri(p + "mlp.switch_mlp.up_proj", uw, us, ub);
+      ly.eg_bits = (egb == 8) ? 8 : 4;
+      ly.eu_bits = (eub == 8) ? 8 : 4;
+      ly.moe_split = egb != eub;
+      if (!ly.moe_split) {
+        // Equal widths: interleave into the one gate|up slab and run the
+        // cheaper fused kernel, exactly as a uniform checkpoint does.
+        ok = ok && interleave_moe(ly.eg_bits, gw, gs, gb, uw, us, ub, E, I,
+                                  ly.eguw, ly.egus, ly.egub);
+      } else {
+        // Widths disagree, so the interleaved slab (one packed row stride)
+        // is impossible. Keep BOTH tensors at their native width in their
+        // own [E, I, H] slabs and let the mixed-width kernel widen in
+        // registers: same DRAM bytes as a uniform layer, no scratch, still
+        // one fused dispatch. Widening w4->w8 at load would also be exact,
+        // but it doubles that tensor's per-token read -- the thing decode
+        // is actually bound on.
+        ly.eguw = std::move(gw); ly.egus = std::move(gs);
+        ly.egub = std::move(gb);
+        ly.euw  = std::move(uw); ly.eus  = std::move(us);
+        ly.eub  = std::move(ub);
+      }
+    }
+    ok = ok && qtri(p + "mlp.switch_mlp.down_proj", ly.edw, ly.eds, ly.edb);
+    {
+      SharedBuffer gw, gs, gb, uw, us, ub;
+      ok = ok && qtri(p + "mlp.shared_expert.gate_proj", gw, gs, gb);
+      ok = ok && qtri(p + "mlp.shared_expert.up_proj", uw, us, ub);
+      // The shared expert carries its OWN width -- OptiQ keeps it at w8 on
+      // every layer of a w4-global checkpoint -- so derive it here and let
+      // the forward dispatch the matching swiglu/qmv twins, rather than
+      // assuming the model-global cfg.quant_bits (which mis-strides it).
+      // Its gate|up are interleaved like the uniform path, so the two must
+      // agree; every pack seen so far keeps the shared expert uniform, and
+      // a future one that doesn't is refused here rather than mis-read.
+      const int sgb = affine_bits(p + "mlp.shared_expert.gate_proj",
+                                  cfg.hidden);
+      const int sub = affine_bits(p + "mlp.shared_expert.up_proj",
+                                  cfg.hidden);
+      if (sgb != sub) { return false; }
+      ly.se_bits = (sgb == 8) ? 8 : 4;
+      ok = ok && interleave_w4(ly.se_bits, gw, gs, gb, uw, us, ub, S,
+                               ly.sguw, ly.sgus, ly.sgub);
+    }
+    ok = ok && qtri(p + "mlp.shared_expert.down_proj", ly.sdw, ly.sds, ly.sdb);
+    // down is its own tensor with its own dispatch, so it may differ from
+    // the shared gate|up width.
+    ly.sd_bits = affine_bits(p + "mlp.shared_expert.down_proj",
+                             cfg.moe_shared_inner) == 8 ? 8 : 4;
+    ok = ok && qtri(p + "mlp.shared_expert_gate", ly.segw, ly.segs, ly.segb);
+  } else {
+    SharedBuffer gw, gs, gb, uw, us, ub;
+    ok = ok && qtri(p + "mlp.gate_proj", gw, gs, gb);
+    ok = ok && qtri(p + "mlp.up_proj", uw, us, ub);
+    ok = ok && interleave(gw, gs, gb, uw, us, ub, ly.guw, ly.gus, ly.gub);
+    ok = ok && qtri(p + "mlp.down_proj", ly.dw, ly.ds, ly.db);
+  }
+  return ok;
+}
+
 MetalQwenModel::~MetalQwenModel() = default;
+
+bool
+MetalQwenModel::build_layer_(int L)
+{
+  if (!_lload || L < 0 || L >= (int)_layers.size()) { return false; }
+  return _lload->build_layer(L);
+}
+
+bool
+MetalQwenModel::stream_decode_ok_()
+{
+  if (!_stream_decode_warned) {
+    _stream_decode_warned = true;
+    if (const SessionContextIntf* s = _mc->session()) {
+      s->error(fmt("[qwen] decode on a layer-streamed model: only the "
+                   "pinned layer prefix is resident, so the stack cannot "
+                   "be run a token at a time -- stream_layers is "
+                   "prefill-only"));
+    }
+  }
+  return false;
+}
+
+void
+MetalQwenModel::free_layer_(int L)
+{
+  if (L < 0 || L >= (int)_layers.size()) { return; }
+  Layer& ly = _layers[(std::size_t)L];
+  // is_full is topology, not weights: the forward reads it to pick the
+  // attention branch, and _ctx sized its pools from it at load. Everything
+  // else is rebuilt by build_layer_, so drop it.
+  const bool full = ly.is_full;
+  ly = Layer{};
+  ly.is_full = full;
+}
 
 void
 MetalQwenModel::set_i8_gemm(bool on)
@@ -2861,6 +3002,7 @@ MetalQwenModel::encode_decode_step_(
     const ContextManager::AppendSlot& slot,
     const SharedBuffer& pgtab, std::size_t pgtab_off, bool return_hidden)
 {
+  if (_stream_layers && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim;
   const int Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -4251,6 +4393,7 @@ MetalQwenModel::encode_batched_step_(
     const std::vector<int>& rope_pos_v,
     int shared_pages)
 {
+  if (_stream_layers && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim;
   const int Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -5970,6 +6113,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   }
 
   const auto t_alloc = std::chrono::steady_clock::now();
+  // Prefill streaming (Config::stream_layers): the streamed layer currently
+  // resident, so the loop can free its predecessor and the tail can be
+  // dropped once the GPU is done with it. -1 = none.
+  int streamed_live = -1;
   metal_compute::CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
@@ -6183,6 +6330,19 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
 
     if (kLayerDump != nullptr) { tap(x, dbgEmbed, n * H); }
     for (int L = 0; L < c.n_layers; ++L) {
+      if (_stream_layers && L >= _pinned_layers) {
+        // This layer's weights are not resident. Close the command buffer
+        // FIRST: the dispatches already encoded still read the previous
+        // layer's buffers, and freeing them under an open encoder frees
+        // memory the GPU has not finished with.
+        enc.end();
+        stream.commit().wait();
+        if (streamed_live >= 0) { free_layer_(streamed_live); }
+        streamed_live = -1;
+        if (!build_layer_(L)) { return {}; }
+        streamed_live = L;
+        enc = stream.begin_compute();
+      }
       Layer& ly = _layers[L];
       rms(x, 0, ly.in_ln, hn, 0, n, H);
       if (_calib_on) { tap(hn, ctq[(std::size_t)L], n * H); }  // qkv input
@@ -6824,6 +6984,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   }
   const auto t_enc = std::chrono::steady_clock::now();
   stream.commit().wait();
+  // The last streamed layer, now that the GPU has consumed it. Held until
+  // here rather than freed at the loop's end because the final norm +
+  // lm_head were encoded into the same command buffer.
+  if (streamed_live >= 0) { free_layer_(streamed_live); }
   if (kLayerDump != nullptr) {
     const std::string pre = kLayerDump;
     auto wr = [&](const std::string& nm, const SharedBuffer& b, int cnt) {

@@ -6,6 +6,8 @@
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -334,6 +336,27 @@ MetalWanTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + g);
     m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + g);
     if (!m->_fn_qmm4.valid() || !m->_fn_qmm8.valid()) { return nullptr; }
+    // The wide tiles, when the group size has them (only g64 does). Built
+    // unconditionally rather than on first tall GEMM: a function build is
+    // milliseconds and the denoise loop should not pay it mid-step.
+    m->_qmm_tile = 0;
+    m->_fn_qmm4_bm64 =
+        m->_lib_qmm.function("affine_qmm_steel_w4" + g + "_bm64");
+    m->_fn_qmm8_bm64 =
+        m->_lib_qmm.function("affine_qmm_steel_w8" + g + "_bm64");
+    if (m->_fn_qmm4_bm64.valid() && m->_fn_qmm8_bm64.valid()) {
+      m->_qmm_tile = 1;
+      m->_fn_qmm4_bm128 =
+          m->_lib_qmm.function("affine_qmm_steel_w4" + g + "_bm128");
+      m->_fn_qmm8_bm128 =
+          m->_lib_qmm.function("affine_qmm_steel_w8" + g + "_bm128");
+      if (m->_fn_qmm4_bm128.valid() && m->_fn_qmm8_bm128.valid()) {
+        m->_qmm_tile = 2;
+      }
+    }
+    if (const char* t = std::getenv("VPIPE_WAN_QMM_TILE")) {
+      m->_qmm_tile = std::min(m->_qmm_tile, std::atoi(t));
+    }
     if (mc->session() != nullptr) {
       mc->session()->log_debug(fmt(
           "MetalWanTransformer: quantized checkpoint (w{} {})",
@@ -363,6 +386,19 @@ MetalWanTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
 }
 
 void
+MetalWanTransformer::set_qmm_tile(int cap)
+{
+  // Only ever lowers below what load() built: asking for BM128 on a
+  // checkpoint whose group size has no BM128 twin has to stay a no-op,
+  // not an invalid function.
+  const int built = (_fn_qmm4_bm128.valid() && _fn_qmm8_bm128.valid()) ? 2
+                    : (_fn_qmm4_bm64.valid() && _fn_qmm8_bm64.valid()) ? 1
+                                                                       : 0;
+  if (cap < 0) { cap = 0; }
+  _qmm_tile = std::min(cap, built);
+}
+
+void
 MetalWanTransformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                            const Linear& l, const SharedBuffer& y, int M, int N,
                            int K)
@@ -373,7 +409,41 @@ MetalWanTransformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
     // registers, so the 4-bit codes are never expanded in memory -- which
     // is the whole point at 14B. It has no bias epilogue, so the bias is
     // a separate row-broadcast pass.
-    enc.set_function(l.bits == 8 ? _fn_qmm8 : _fn_qmm4);
+    //
+    // Tile height from M. A taller tile re-reads each weight tile fewer
+    // times; it also costs registers, and therefore occupancy, and at 4
+    // bits these GEMMs are ALU-bound rather than weight-bandwidth-bound.
+    // So the taller tile only pays once M is large enough that the
+    // re-reads dominate, and on M4 Pro that crossover is FAR later than
+    // the image DiTs' M>=128. MEASURED w4, alternating the tiles inside
+    // one process (best-of; cross-process comparison cannot resolve this
+    // -- the box has ~4% of thermal spread between runs):
+    //
+    //   seq    BM32      BM64       BM128
+    //   2304   10.68 s   +2.0%      +2.0%
+    //   5760   28.73 s   -4.8%      -5.0%
+    //
+    // Hence 4096 rather than 128: copying the Krea-2 threshold would have
+    // made the 2304-token case -- every 256px clip, and every smoke test
+    // -- 2% slower. The win grows with sequence, which is the direction
+    // video resolution moves in.
+    //
+    // The BM64 -> BM128 boundary is NOT resolved: the two are within
+    // 0.2% of each other at 5760, and above that only cross-process
+    // numbers exist (BM128 -4.1% vs BM32 at 14040), which is inside the
+    // spread. 8192 is a placeholder between two arms that measured the
+    // same. Both boundaries are per-machine anyway -- a different GPU has
+    // a different occupancy cliff -- so the real answer is an autotune
+    // over the arms at load, which is what set_qmm_tile() and the
+    // step_bench's VPIPE_WAN_BENCH_TILE_AB mode exist to drive.
+    int bm = 32;
+    if (_qmm_tile == 2 && M >= 8192)      { bm = 128; }
+    else if (_qmm_tile >= 1 && M >= 4096) { bm = 64; }
+    enc.set_function(
+        l.bits == 8
+            ? (bm == 128 ? _fn_qmm8_bm128 : bm == 64 ? _fn_qmm8_bm64 : _fn_qmm8)
+            : (bm == 128 ? _fn_qmm4_bm128 : bm == 64 ? _fn_qmm4_bm64
+                                                     : _fn_qmm4));
     enc.set_buffer(0, l.codes);
     enc.set_buffer(1, l.scales);
     enc.set_buffer(2, l.qbias);
@@ -382,8 +452,10 @@ MetalWanTransformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
     enc.set_constant(5, K);
     enc.set_constant(6, N);
     enc.set_constant(7, M);
+    // BM=128 is the WM=4 variant: 256 threads, threadgroup z 4.
+    const unsigned tgz = (bm == 128) ? 4u : 2u;
     enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
-                  (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
+                  (unsigned)(((M + bm - 1) / bm) * 2), tgz}, {32, 2, tgz});
     if (bias) {
       enc.set_function(_fn_bias_add);
       enc.set_buffer(0, y);
@@ -677,9 +749,34 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
   }
   const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
 
+  // ---- env-gated per-section GPU timing (VPIPE_WAN_DIT_PROFILE) --------
+  // The whole forward is ONE deferred stream, so there is nothing to time
+  // inside it without splitting: each psplit() ends the encoder, commits,
+  // waits, and charges the elapsed slice to a bucket. That serializes the
+  // GPU and inflates absolute step time by the per-commit overhead times
+  // ~11 splits per block, so read the SHARE, not the total. All the
+  // scratch is a _s member and outlives every commit, so splitting
+  // mid-block changes nothing but the timing.
+  const bool prof = std::getenv("VPIPE_WAN_DIT_PROFILE") != nullptr;
+  double t_cond = 0, t_patch = 0, t_qkv = 0, t_prep = 0, t_attn_s = 0,
+         t_oproj = 0, t_xqkv = 0, t_attn_x = 0, t_xoproj = 0, t_ffup = 0,
+         t_gelu = 0, t_ffdown = 0, t_elt = 0, t_final = 0;
+  const auto t_begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point mark = t_begin;
+
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();
+    auto psplit = [&](double& acc) {
+      if (!prof) { return; }
+      enc.end();
+      stream.commit().wait();
+      acc += std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - mark).count();
+      stream = _mc->make_command_stream();
+      enc = stream.begin_compute();
+      mark = std::chrono::steady_clock::now();
+    };
     auto rms = [&](const SharedBuffer& x, const SharedBuffer& gamma,
                    const SharedBuffer& y, int rows, int width) {
       enc.set_function(_fn_rms);
@@ -762,9 +859,11 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
     enc.set_constant(2, HID);
     enc.set_constant(3, 2 * HID);
     enc.dispatch({(unsigned)(2 * HID), 1, 1}, {256, 1, 1});
+    psplit(t_cond);
 
     // ---- patch embedding ---------------------------------------------
     gemm_(enc, s.x, _patch, s.joint, seq, HID, PE);
+    psplit(t_patch);
 
     // ---- blocks -------------------------------------------------------
     for (int L = 0; L < c.n_layers; ++L) {
@@ -776,9 +875,11 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
 
       // --- self-attention ---
       ln_mod(s.joint, s.mod, (std::size_t)HID, 0, s.nm, seq);
+      psplit(t_elt);
       gemm_(enc, s.nm, b.q1, s.qb, seq, HID, HID);
       gemm_(enc, s.nm, b.k1, s.kb, seq, HID, HID);
       gemm_(enc, s.nm, b.v1, s.vb, seq, HID, HID);
+      psplit(t_qkv);
       // rms_norm_across_heads: ONE RMS over the whole 5120-wide row, before
       // the head split. Per-head would be a different normalization.
       rms(s.qb, b.qn1, s.qb, seq, HID);
@@ -786,9 +887,13 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
       trope(s.qb, s.qh);
       trope(s.kb, s.kh);
       transpose(s.vb, s.vh, seq, NH, HD);
+      psplit(t_prep);
       attn(s.qh, s.kh, s.vh, s.oh, true);
+      psplit(t_attn_s);
       transpose(s.oh, s.ob, NH, seq, HD);
+      psplit(t_prep);
       gemm_(enc, s.ob, b.o1, s.qb, seq, HID, HID);
+      psplit(t_oproj);
       gated(s.joint, (std::size_t)2 * HID, s.qb, (std::size_t)seq * HID);
 
       // --- cross-attention into the text ---
@@ -797,6 +902,7 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
       enc.set_buffer(2, b.n2b); enc.set_buffer(3, s.nm);
       enc.set_constant(4, HID); enc.set_constant(5, eps);
       enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
+      psplit(t_elt);
       gemm_(enc, s.nm, b.q2, s.qb, seq, HID, HID);
       gemm_(enc, text_proj, b.k2, s.tk, text_seq, HID, HID);
       gemm_(enc, text_proj, b.v2, s.tv, text_seq, HID, HID);
@@ -805,26 +911,35 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
       transpose(s.qb, s.qh, seq, NH, HD);          // no RoPE across streams
       transpose(s.tk, s.tkh, text_seq, NH, HD);
       transpose(s.tv, s.tvh, text_seq, NH, HD);
+      psplit(t_xqkv);
       attn(s.qh, s.tkh, s.tvh, s.oh, false);
+      psplit(t_attn_x);
       transpose(s.oh, s.ob, NH, seq, HD);
       gemm_(enc, s.ob, b.o2, s.qb, seq, HID, HID);
       elt3(_fn_residual, s.joint, s.qb, s.joint, (std::size_t)seq * HID);
+      psplit(t_xoproj);
 
       // --- feed-forward (UNGATED: one 13824-wide hidden through gelu) ---
       ln_mod(s.joint, s.mod, (std::size_t)4 * HID, (std::size_t)3 * HID, s.nm,
              seq);
+      psplit(t_elt);
       gemm_(enc, s.nm, b.ff_in, s.ffb, seq, FF, HID);
+      psplit(t_ffup);
       enc.set_function(_fn_gelu);
       enc.set_buffer(0, s.ffb); enc.set_buffer(1, s.ffb);
       enc.set_constant(2, (int)((std::size_t)seq * FF));
       enc.dispatch({(unsigned)((std::size_t)seq * FF), 1, 1}, {256, 1, 1});
+      psplit(t_gelu);
       gemm_(enc, s.ffb, b.ff_out, s.qb, seq, HID, FF);
+      psplit(t_ffdown);
       gated(s.joint, (std::size_t)5 * HID, s.qb, (std::size_t)seq * HID);
+      psplit(t_elt);
     }
 
     // ---- output norm + projection -------------------------------------
     ln_mod(s.joint, s.mod2, (std::size_t)HID, 0, s.nm, seq);
     gemm_(enc, s.nm, _proj_out, s.outp, seq, OPE, HID);
+    psplit(t_final);
   }
   std::string gpu_err;
   if (!stream.commit().wait_ok(&gpu_err)) {
@@ -860,6 +975,41 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
         }
       }
     }
+  }
+  if (prof && _mc->session() != nullptr) {
+    const double host = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - mark).count();
+    const double tot = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_begin).count();
+    // The GEMM buckets in achieved GFLOP/s, so a slow kernel is visible as
+    // a rate against the box's roofline rather than only as a share. 2*M*N*K
+    // per GEMM, summed over the 40 blocks.
+    const double L = (double)c.n_layers;
+    auto rate = [](double flops, double ms) {
+      return ms > 0.0 ? flops / (ms * 1e6) : 0.0;
+    };
+    const double f_qkv  = L * 3.0 * 2.0 * seq * HID * HID;
+    const double f_op   = L * 2.0 * (double)seq * HID * HID;
+    const double f_xqkv = L * 2.0 * ((double)seq + 2.0 * text_seq) * HID * HID;
+    const double f_ffup = L * 2.0 * (double)seq * FF * HID;
+    _mc->session()->info(fmt(
+        "[wan-dit] {} tokens ({}x{}x{}), {} blocks, {:.0f} ms total\n"
+        "  cond      {:8.1f} ms  patch  {:8.1f} ms  final {:8.1f} ms\n"
+        "  qkv       {:8.1f} ms ({:6.0f} GF/s)   o-proj  {:8.1f} ms "
+        "({:6.0f} GF/s)\n"
+        "  x-qkv     {:8.1f} ms ({:6.0f} GF/s)   x-oproj {:8.1f} ms\n"
+        "  ff-up     {:8.1f} ms ({:6.0f} GF/s)   ff-down {:8.1f} ms "
+        "({:6.0f} GF/s)\n"
+        "  attn-self {:8.1f} ms  attn-cross {:8.1f} ms  ({})\n"
+        "  prep      {:8.1f} ms  gelu   {:8.1f} ms  elt   {:8.1f} ms\n"
+        "  unpatchify (HOST) {:.1f} ms",
+        seq, T, ph, pw, c.n_layers, tot,
+        t_cond, t_patch, t_final,
+        t_qkv, rate(f_qkv, t_qkv), t_oproj, rate(f_op, t_oproj),
+        t_xqkv, rate(f_xqkv, t_xqkv), t_xoproj,
+        t_ffup, rate(f_ffup, t_ffup), t_ffdown, rate(f_ffup, t_ffdown),
+        t_attn_s, t_attn_x, use_steel ? "steel flash" : "SCALAR sdpa",
+        t_prep, t_gelu, t_elt, host));
   }
   return out;
 }

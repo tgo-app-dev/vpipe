@@ -3,15 +3,33 @@
 
 **Real-time multimodal AI pipelines on Apple Silicon**
 
-**VPIPE** is a high-performance pipeline framework for building real-time AI
-applications on Apple Silicon. Instead of treating AI models as isolated
-inference calls, vpipe treats them as stages in a continuously running
-dataflow system, where video, audio, text, tensors, and user interactions
-flow through a unified pipeline with deterministic scheduling and minimal
-overhead. The result is an architecture that makes complex multimodal
-systems—from real-time video understanding and speech interaction to local
-LLM applications—feel less like collections of scripts and more like
-engineered software systems.
+**VPIPE** is a small, embeddable runtime for building local AI applications
+where video, audio, images, text, tensors, user input, and tool actions move
+through the same inspectable pipeline. It is designed for Apple Silicon
+machines and runs its on-device generative stack on a custom **metal-compute**
+backend — its own Metal kernels, with no Python and no third-party tensor
+runtime in the forward pass.
+
+- Runs **MiniMax H3** FL2VA on Apple Silicon Mac
+
+- **Built in C++** for performance and compactness
+
+- **Full modality** support packed under **25 MB**
+
+- Top-tier inference speed, enabling **realtime** visual question answering
+  (VQA), automatic speech recognition (ASR), and language-model chat with
+  text-to-speech (TTS)
+
+- Top-tier diffusion-transformer inference speed with **weight streaming**,
+  enabling image and video edits on systems with only 16 GB of memory
+
+- **Local MCP** support: sandboxed file, shell, and Python tools, plus web
+  fetch
+
+- **Mobile-friendly UI** enabling remote access from a phone
+
+- Extra acceleration from **NAX** matmul2d, convolution2d in M5 generation
+
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
@@ -21,7 +39,8 @@ engineered software systems.
 
 [**Overview**](#overview) · [**Requirements**](#requirements) ·
 [**Build**](#build) · [**Run**](#run) · [**Examples**](EXAMPLES.md) ·
-[**Tests**](#tests) · [**Layout**](#layout) · [**License**](#license)
+[**Tests**](#tests) · [**Structure**](#structure) ·
+[**Acknowledgements**](#acknowledgements) · [**License**](#license)
 
 ---
 
@@ -36,7 +55,7 @@ engineered software systems.
 ## Overview
 [back to top](#top)
 
-VPIPE has two layers:
+VPIPE has three main surfaces:
 
 - **Pipeline core** — coroutine-based `Job` stages connected by buffered ports,
   driven by a runtime that launches and drains them concurrently. Stages are
@@ -45,10 +64,18 @@ VPIPE has two layers:
   `onvif-discovery`, `rest-client`). This layer is portable C++20.
 
 - **On-device generative-model stack** *(Apple Silicon)* — a from-scratch
-  LLM/VLM/ASR inference engine (text, vision, audio, video) running on a custom
-  **metal-compute** backend, with no third-party tensor runtime in the forward
-  pass. It powers stages such as `text-chat`, `visual-qa`, `realtime-vqa`, and
-  `audio-transcribe`.
+  LLM/VLM/ASR/diffusion/video inference stack running on **metal-compute**,
+  with custom kernels, model loading, quantization support, weight streaming,
+  and resource planning for memory-constrained Macs. It powers stages such as
+  `text-chat`, `visual-qa`, `realtime-vqa`, `audio-transcribe`,
+  `generate-image`, `diffusion-conditioner`, `vae-encode`, `vae-decode`, and
+  `generate-video`.
+
+- **Web UI and Composer** — a self-contained browser UI for launching,
+  inspecting, profiling, and editing pipelines. The Composer can arrange
+  pipeline editors, previews, image comparison views, text I/O, profiler views,
+  files, logs, and stage-provided panels, then save that layout with the
+  pipeline spec so a workflow can be reopened and reproduced.
 
 Models are loaded from local directories (sharded safetensors / GGUF) and are
 not bundled with the source.
@@ -149,10 +176,6 @@ needed for the Python bindings, and metal-cpp for the Apple Silicon features:
 git submodule update --init extern/lmdb extern/pugixml extern/nanobind extern/metal-cpp
 ```
 
-> `extern/mlx` is **optional and large** — it is not used by the default build
-> (the metal-compute backend replaced it) and is kept only for occasional
-> perf/accuracy cross-checks. Skip it unless you specifically need that path.
-
 **2. Configure** (out-of-source build directory):
 
 ```sh
@@ -211,6 +234,52 @@ to the machine's LAN address so other devices can connect; remote connections
 must supply the 8-character access key printed at startup, while localhost
 connects without one. Options: `--bind ADDR`, `--port N` (`0` = any free port),
 `--config CFG` (inline JSON, a file path, or empty for defaults), `--help`.
+
+#### Connecting a phone (`--show-qr`)
+
+The UI has a phone layout, and typing an 8-character key into a phone is
+exactly the friction that stops anyone using it. `--show-qr` prints a QR code
+to the console next to the usual startup lines:
+
+```sh
+./build/apps/web-ui/vpipe-web-ui --show-qr
+```
+
+Point a phone camera at it and the UI opens **already authenticated** — no key
+to read off the screen and retype. The phone layout is selected automatically
+from the device; `?ui=desktop` (or the drawer's *Desktop layout*) overrides it,
+and `?ui=phone` is how that layout is developed on a desktop.
+
+How it works, and what it costs:
+
+- **Two different secrets.** The 8-character access key is short because a
+  human retypes it. The QR link carries its own, longer secret (14 characters
+  of an uppercase alphanumeric alphabet, ~70 bits), because nothing has to read
+  it — it only has to be unguessable.
+- **One scan, then the key is gone.** `GET /<link-secret>` redirects to
+  `/?key=<access key>`; the page adopts the key into `sessionStorage` and
+  immediately strips it from the URL, so it never lands in the address bar,
+  the history, or a bookmark. The key is tab-scoped and disappears when the
+  tab closes.
+- **The link is never printed.** Only the symbol is rendered — writing the URL
+  beside it would put the secret into the scrollback, a screen share, or a
+  terminal log, which is what the QR code exists to avoid. It is a secret in a
+  URL: treat it as **only as private as the console displaying it**, and
+  restart the server to invalidate it.
+- **Both secrets are per-run**, generated at startup, and neither is written to
+  disk.
+
+Requests from other computers carry the key as an `X-Auth-Key` header (or a
+`?key=` parameter where the browser cannot set headers, such as a WebSocket
+handshake or an `<img>` source). Only `/api/*` is gated, and only for
+non-loopback peers — static assets stay open so a remote browser can load the
+page in order to ask for the key in the first place.
+
+> **Note.** Add `--tls` if you want the low-latency Preview view on a phone or
+> any other LAN client: the browser's WebCodecs API is secure-context only, so
+> it needs HTTPS off localhost. The certificate is self-signed and cached under
+> `~/.vpipe/webui-tls`, so expect a one-time browser warning — and a QR scan
+> lands on that warning rather than the UI until it is accepted.
 
 New here? **[EXAMPLES.md](EXAMPLES.md)** walks through fetching a model and
 building text-chat and speech-transcription pipelines in the web UI.
@@ -279,7 +348,7 @@ test skips.
 
 ---
 
-## Layout
+## Structure
 [back to top](#top)
 
 | Path | Contents |
@@ -293,6 +362,43 @@ test skips.
 | `python/` | Python bindings (nanobind). |
 | `tests/` | Unit tests. |
 | `extern/`, `3rd-party/` | Vendored dependencies. |
+
+---
+
+## Acknowledgements
+[back to top](#top)
+
+VPIPE builds on these projects:
+
+- **[FFmpeg](https://ffmpeg.org)** — the multimedia framework vpipe decodes
+  and encodes audio and video with; compiled against its headers and
+  `dlopen`ed at runtime. *LGPL-2.1-or-later (some optional components are
+  GPL).*
+- **[LMDB](https://github.com/LMDB/lmdb)** — the memory-mapped key-value
+  store behind vpipe's databases: logs, the model registry, camera records.
+  *OpenLDAP Public License 2.8.*
+- **[pugixml](https://github.com/zeux/pugixml)** — a light XML parser, used
+  for the SOAP and WS-Discovery exchanges that find ONVIF cameras. *MIT.*
+- **[nanobind](https://github.com/wjakob/nanobind)** — the C++/Python
+  binding layer the `vpipe` Python extension is built with. *BSD 3-Clause.*
+- **[metal-cpp](https://github.com/bkaradzic/metal-cpp)** — header-only C++
+  bindings for Apple's Objective-C runtime; vpipe uses its `Foundation`
+  headers under the CoreML and metal-compute wrappers. *Apache-2.0.*
+- **[pocketfft](https://gitlab.mpcdf.mpg.de/mtr/pocketfft)** — a header-only
+  FFT, used by the audio feature extractors to build mel spectrograms.
+  *BSD 3-Clause.*
+
+**[MLX](https://github.com/ml-explore/mlx)** *(MIT)* is Apple's array
+framework for machine learning on Apple Silicon. VPIPE does not link MLX and
+does not use it in the forward pass, but it does vendor a small set of MLX's
+Metal kernel headers — the "steel" GEMM and attention templates and their
+supporting helpers — under
+`gpu-kernels/metal/vendored/mlx/backend/metal/kernels/steel`. Those headers
+are `#include`d by vpipe's own `.metal` sources and compiled into the
+embedded metallibs.
+
+Full copyright and license texts for everything bundled or vendored are in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 ---
 

@@ -24,6 +24,7 @@ set(LOCAL_SOURCES
   scheduler-select-stage.cc
   diffusion-conditioner-stage.cc
   generate-image-stage.cc
+  audio-vae-decode-stage.cc
   vae-decode-stage.cc
   vae-encode-stage.cc
   model-catalog.cc

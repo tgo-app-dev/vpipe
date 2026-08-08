@@ -1,6 +1,7 @@
 #include "stages/model-detect.h"
 
 #include "common/flex-data.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 #include "stages/model-catalog.h"
 
 #include <algorithm>
@@ -186,6 +187,9 @@ family_version_(const std::string& mt, std::string& family,
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
       {"wan-i2v",                "Wan",         "2.2-I2V"},
       {"wan-t2v",                "Wan",         "2.2-T2V"},
+      {"minimax-h3-fl2va",       "MiniMax",     "H3-FL2VA"},
+      {"minimax-h3-dit",         "MiniMax",     "H3-FL2VA"},
+      {"minimax-h3-text-encoder", "MiniMax",    "H3-FL2VA"},
       {"moss-tts",               "MOSS",        "TTS"},
       {"moss-tts-local",         "MOSS",        "TTS-Local"},
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
@@ -239,9 +243,13 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
 }
 
 // ---- transformer/config.json (diffusers layout) -> runtime tag -------
+// `partition` is model_index.json's `_minimax_h3.partition` (empty for
+// every other family): MiniMax-H3 ships two complete pipelines whose
+// transformer/config.json files are BYTE-IDENTICAL, so the DiT config
+// alone cannot tell FL2VA from Ref2VA and the pipeline manifest has to.
 std::string
 dit_tag_(const std::string& cls, const std::string& name_lc,
-         const FlexData& cfg)
+         const FlexData& cfg, const std::string& partition)
 {
   const bool edit = has_(name_lc, "edit");
   // FLUX.2-klein-9b-kv reports this SAME class, and its config.json and tensor
@@ -271,7 +279,84 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     // guessing from the directory.
     return int_field_(cfg, "in_channels", 16) > 16 ? "wan-i2v" : "wan-t2v";
   }
+  if (cls == "MiniMaxH3DiTModel") {
+    // Only the partition we implement gets a runnable tag. Ref2VA is a
+    // different task (up to 9 reference images / 3 video clips / 3 audio
+    // clips, and its own packed layout), so tagging it "fl2va" would
+    // claim support we do not have; leaving it untagged is the honest
+    // answer and it still registers as an uncatalogued directory.
+    return partition == "fl2va" ? "minimax-h3-fl2va" : std::string();
+  }
   return {};
+}
+
+// ---- a Comfy-Org repack ----------------------------------------------
+// One .safetensors per component under diffusion_models/ | vae/ |
+// text_encoders/, each carrying its config in the safetensors
+// `__metadata__` rather than in a config.json -- so there is no
+// transformer/config.json for the diffusers probe above to find, and the
+// directory would otherwise register as unrecognized.
+//
+// The DiT file is what names the model: its metadata's `image_model` is
+// Comfy-Org's architecture tag, and the filename carries whatever the
+// architecture alone cannot say (for MiniMax-H3, which of the two
+// partitions the weights are).
+std::string
+comfy_repo_tag_(const fs::path& root)
+{
+  for (const genai::comfy::Component& c :
+       genai::comfy::scan_repo(root.string())) {
+    if (c.role != "diffusion_models" || c.meta_key != "config") { continue; }
+    FlexData md;
+    if (!genai::comfy::metadata_json(c.file, "config", md, nullptr)) {
+      continue;
+    }
+    if (!md.is_object() || !md.as_object().contains("transformer")) {
+      continue;
+    }
+    const FlexData t = md.as_object().at("transformer");
+    if (!t.is_object()) { continue; }
+    const std::string im = str_field_(t, "image_model");
+    const std::string name_lc = lower_(fs::path(c.file).filename().string());
+    if (im == "minimax_h3") {
+      // Same policy as the diffusers path: only the partition this tree
+      // implements gets a runnable tag. Ref2VA is a different task, so
+      // tagging it would claim support we do not have.
+      if (has_(name_lc, "fl2va")) { return "minimax-h3-fl2va"; }
+      return {};
+    }
+  }
+  return {};
+}
+
+// What a Comfy-Org repo actually HOLDS, for the record's `variant`.
+// A repack is published incrementally and pinned by a `files` whitelist,
+// so a checkout is routinely a SUBSET -- and which subset decides what
+// runs. Recording it is what turns "the pipeline failed" into "this copy
+// has no text encoder", without a second walk of the tree.
+std::string
+comfy_components_(const fs::path& root)
+{
+  std::vector<std::string> roles;
+  for (const genai::comfy::Component& c :
+       genai::comfy::scan_repo(root.string())) {
+    // Roles, not filenames: two VAEs under one role is the interesting
+    // fact, not their names.
+    std::string r = c.role;
+    if (r == "diffusion_models") { r = "dit"; }
+    else if (r == "text_encoders") { r = "text_encoder"; }
+    bool seen = false;
+    for (const std::string& s : roles) {
+      if (s == r) { seen = true; break; }
+    }
+    if (!seen) { roles.push_back(r); }
+  }
+  if (roles.empty()) { return {}; }
+  std::string out = "ComfyUI single-file (";
+  for (std::size_t i = 0; i < roles.size(); ++i) {
+    out += (i != 0 ? " + " : "") + roles[i];
+  }
+  return out + ")";
 }
 
 // A BARE DiT component directory (diffusers weights + config, no
@@ -291,6 +376,9 @@ dit_component_tag_(const std::string& cls)
   // transformer_2/ output) is one DiT component; which noise band it
   // covers is the pipeline's business, not the picker's.
   if (cls == "WanTransformer3DModel")        { return "wan-dit"; }
+  // A bare H3 DiT carries no model_index.json, so which partition it
+  // came from is not knowable here -- and does not matter to a picker.
+  if (cls == "MiniMaxH3DiTModel")            { return "minimax-h3-dit"; }
   return {};
 }
 
@@ -386,6 +474,7 @@ from_catalog_(const ModelCatalogEntry& e, DetectedModel& d)
   d.parent_param_class = e.parent_param_class;
   d.inputs             = e.inputs;
   d.outputs            = e.outputs;
+  d.weight_format      = e.weight_format;
   if (d.inputs.empty() && d.outputs.empty()) {
     catalog_default_io(e.model_type, d.inputs, d.outputs);
   }
@@ -446,6 +535,7 @@ record_detected_fields(FlexData::ObjectView& rec, const DetectedModel& d)
   put("parent_model_type", d.parent_model_type);
   put("parent_param_class", d.parent_param_class);
   put("detected_by", d.detected_by);
+  put("weight_format", d.weight_format);
   auto put_list = [&](const char* k, const std::vector<std::string>& v) {
     if (v.empty()) { return; }
     FlexData arr = FlexData::make_array();
@@ -534,10 +624,65 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   // ---- 2. a diffusers pipeline (transformer/ + vae/) ------------------
   const FlexData dit_cfg = read_json_(root / "transformer" / "config.json");
   if (dit_cfg.is_object()) {
-    d.model_type =
-        dit_tag_(str_field_(dit_cfg, "_class_name"), base_lc, dit_cfg);
+    // as_object() returns a VIEW, so the manifest has to outlive the
+    // lookup -- bind it to a local rather than chaining off the call.
+    const FlexData  mi = read_json_(root / "model_index.json");
+    std::string     partition;
+    if (mi.is_object()) {
+      auto o = mi.as_object();
+      if (o.contains("_minimax_h3")) {
+        partition = str_field_(o.at("_minimax_h3"), "partition");
+      }
+    }
+    d.model_type = dit_tag_(str_field_(dit_cfg, "_class_name"), base_lc,
+                            dit_cfg, partition);
     if (!d.model_type.empty()) {
       d.detected_by = "diffusers";
+    }
+  }
+
+  // ---- 2b. a Comfy-Org repack (no transformer/config.json) ------------
+  if (d.model_type.empty()) {
+    d.model_type = comfy_repo_tag_(root);
+    if (!d.model_type.empty()) {
+      d.detected_by   = "comfyui";
+      d.weight_format = "comfyui";
+      d.variant       = comfy_components_(root);
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
+  }
+
+  // ---- 2c. a COMPONENT of an H3 pipeline ------------------------------
+  // The text encoder is a stock Qwen3-VL, so its own config.json says
+  // "qwen3_vl" and nothing more -- which is its architecture, not its
+  // role. Both spellings of it (MiniMaxAI's text_encoder/ and a
+  // quantized copy) therefore registered as "type unknown" and no picker
+  // offered them. Two things can say otherwise:
+  //   * `_vpipe_component`, stamped by model-quantize into the output of
+  //     an encoder pass. A quantized sub-model has LEFT the pipeline
+  //     that gave it meaning, so the producer is the last thing that
+  //     knows what it was, and it writes it down.
+  //   * the pipeline around it -- a `text_encoder/` whose parent carries
+  //     model_index.json's `_minimax_h3`. That covers the released
+  //     checkpoint, which predates any stamp.
+  if (d.model_type.empty()) {
+    const FlexData c0 = read_json_(root / "config.json");
+    const std::string comp = str_field_(c0, "_vpipe_component");
+    if (comp == "minimax-h3-text-encoder") {
+      d.model_type  = comp;
+      d.detected_by = "component-tag";
+    } else if (base == "text_encoder") {
+      const FlexData mi2 = read_json_(root.parent_path() / "model_index.json");
+      if (has_field_(mi2, "_minimax_h3")) {
+        d.model_type  = "minimax-h3-text-encoder";
+        d.detected_by = "pipeline";
+      }
+    }
+    if (!d.model_type.empty()) {
+      // A component, not a runnable model -- it conditions the DiT, it
+      // does not generate anything on its own.
+      d.category = "component";
+      d.param_class = "32B";
     }
   }
 
@@ -603,7 +748,11 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   if (d.param_class.empty()) {
     d.param_class = param_class_from_name_(base);
   }
-  d.variant = variant_(cfg, base_lc, gguf);
+  // `variant_` reads a config.json's quantization block plus the
+  // directory name, neither of which a Comfy-Org repack has -- so it
+  // would blank the component list step 2b already worked out. Only
+  // fill in what is still empty.
+  if (d.variant.empty()) { d.variant = variant_(cfg, base_lc, gguf); }
   if (d.category.empty()) {
     d.category = "model";
   }
@@ -620,6 +769,27 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     }
   }
   return d;
+}
+
+std::string
+resolve_vae_dir(const std::string& root)
+{
+  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
+    return (fs::path(root) / "vae").string();
+  }
+  // MiniMax-H3's video VAE. This is the OUTER directory, not the
+  // `source/` one holding the weights: the outer config.json is the
+  // one that names the class and carries latents_mean / latents_std,
+  // while `source/config.json` is the legacy geometry. The model
+  // loader descends the last level itself.
+  for (const fs::path& p : {fs::path(root) / "video_vae",
+                            fs::path(root) / "FL2VA" / "video_vae"}) {
+    if (fs::exists(p / "source" / "model.safetensors") &&
+        fs::exists(p / "config.json")) {
+      return p.string();
+    }
+  }
+  return root;
 }
 
 }

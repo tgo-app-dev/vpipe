@@ -20,6 +20,7 @@ set(LOCAL_SOURCES
   model-loader.cc
   sampler.cc
   tokenizer.cc
+  shared/comfy-checkpoint.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
   shared/i8-gemm.cc
@@ -72,6 +73,13 @@ set(LOCAL_SOURCES
   wan/metal-wan-vae.cc
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
+  minimax-h3/minimax-h3-layout.cc
+  minimax-h3/metal-minimax-h3-transformer.cc
+  minimax-h3/metal-minimax-h3-video-vae.cc
+  minimax-h3/metal-minimax-h3-audio-vae.cc
+  minimax-h3/minimax-h3-scheduler.cc
+  minimax-h3/minimax-h3-text-encoder.cc
+  minimax-h3/minimax-h3-denoise.cc
   lora-fusion.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
@@ -95,6 +103,7 @@ set(LOCAL_HEADERS
   sampler.h
   token-muxer.h
   tokenizer.h
+  shared/comfy-checkpoint.h
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/mcp/file-sandbox.h
@@ -130,6 +139,13 @@ set(LOCAL_HEADERS
   wan/metal-wan-vae.h
   wan/metal-umt5-encoder.h
   wan/metal-wan-transformer.h
+  minimax-h3/minimax-h3-layout.h
+  minimax-h3/metal-minimax-h3-transformer.h
+  minimax-h3/metal-minimax-h3-video-vae.h
+  minimax-h3/metal-minimax-h3-audio-vae.h
+  minimax-h3/minimax-h3-scheduler.h
+  minimax-h3/minimax-h3-text-encoder.h
+  minimax-h3/minimax-h3-denoise.h
   mage/metal-mage-vae.h
   mage/metal-mage-flow-transformer.h
   mage/mage-watermark.h

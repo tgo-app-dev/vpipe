@@ -566,9 +566,13 @@ svg.sb-spark .line {
   /* Fixed height (not min-height) with no vertical padding so every
      pane header is identical regardless of whether it carries buttons
      -- otherwise the Stages header (Insert/Remove) is taller than the
-     title-only Pipelines/Configuration headers. */
-  height: 40px;
-  flex: 0 0 40px;
+     title-only Pipelines/Configuration headers.
+     28px, down from 40: the row carries one line of 11px caps, and the
+     12px it gives back is 12px of graph, listing or form on EVERY pane
+     of every view. The buttons it hosts are `mini`, which fit inside
+     this comfortably. */
+  height: 28px;
+  flex: 0 0 28px;
   padding: 0 10px;
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
@@ -1043,6 +1047,25 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   border: 1px solid var(--line); border-radius: 4px;
   display: flex; flex-direction: column;   /* hosts the .fs-vlist component */
 }
+/* List + optional side preview. With the panel off this row holds only
+   the list, so the dialog keeps exactly the width it always had. */
+.fs-mid { display: flex; gap: 8px; align-items: stretch; min-width: 0; }
+.fs-mid > .fs-list { flex: 1 1 auto; min-width: 0; }
+/* Shrinkable (0 1, not 0 0): on a narrow viewport the modal's max-width
+   wins and the panel gives up width rather than pushing its contents off
+   the screen. A min-width here -- or on .fs-dialog -- would override that
+   cap and overflow the window, which is exactly what it did first. */
+.fs-preview {
+  flex: 0 1 300px; min-width: 0; height: 320px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.fs-preview[hidden] { display: none; }
+/* Widening is done on the MODAL, whose max-width: 92vw then still
+   applies. Toggled from applyPreview() rather than with :has(), so the
+   rule and the state that drives it stay in one place. */
+.modal.fs-wide { width: 820px; }
+.fs-bar .btn.active { color: var(--accent); border-color: var(--accent); }
 .fs-row {
   display: flex; align-items: center; gap: 8px; padding: 4px 9px;
   cursor: pointer; user-select: none; line-height: 1.4;
@@ -1189,10 +1212,44 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   display: flex; flex-direction: column; min-height: 0; height: 100%;
   padding: 10px; gap: 8px;
 }
+/* name · size on the left, Download always on the right -- being able
+   to SEE a file is a poor reason to be unable to fetch it, so the button
+   is not reserved for the types that have no preview. */
 .fb-file-meta {
   flex: 0 0 auto; color: var(--fg-dim); font-size: 11px;
-  word-break: break-all;
+  display: flex; align-items: center; gap: 8px;
 }
+.fb-file-meta .fb-file-name { flex: 1 1 auto; min-width: 0;
+  word-break: break-all; }
+.fb-file-meta .fb-dl { flex: 0 0 auto; text-decoration: none; }
+/* Pixel dimensions, under the media (both are only knowable after the
+   element loads, so this is filled by a load/loadedmetadata handler). */
+.fb-dims {
+  flex: 0 0 auto; text-align: center;
+  color: var(--fg-dim); font-size: 10.5px; font-family: var(--mono);
+}
+.fb-dims:empty { display: none; }
+/* .vpipeline summary: one row per stage, id then [type]. */
+.fb-pl-list {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 6px 8px;
+}
+.fb-pl-count {
+  color: var(--fg-dim); font-size: 10.5px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--line); margin-bottom: 4px;
+}
+.fb-pl-row {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 2px 0; font-size: 12px; line-height: 1.45;
+}
+.fb-pl-id { color: var(--fg); font-weight: 600; flex: 0 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Shrinks and ellipsises rather than pushing itself out of a narrow
+   panel -- a stage type is long and the dialog's panel is 300px. */
+.fb-pl-type { color: var(--accent); font-family: var(--mono);
+  font-size: 11px; margin-left: auto; flex: 0 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fb-media-wrap {
   flex: 1 1 auto; min-height: 0; display: flex;
   align-items: center; justify-content: center;

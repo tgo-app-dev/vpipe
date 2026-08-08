@@ -13,6 +13,7 @@
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #endif
 
@@ -122,6 +123,8 @@ private:
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalMageVae>  _mage_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
+  // MiniMax-H3's video VAE, encoder half: a keyframe anchor for FL2VA.
+  std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
 
   // Resolve _hf_dir + load the VAE encoder (idempotent: the _load_attempted
   // guard runs the body at most once). No-op when _hf_dir is still empty.

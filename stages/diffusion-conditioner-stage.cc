@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -614,6 +615,12 @@ std::string family_(const std::string& transformer_dir)
         // through to the "krea2" default would try to load a Qwen3-VL out
         // of a T5 checkpoint and fail late and confusingly.
         if (cls == "WanTransformer3DModel") { return "wan"; }
+        // MiniMax-H3. Its tower IS a Qwen3-VL, but tapped at layer 50 of
+        // 64 rather than run to the last hidden state, so it cannot go
+        // through the shared Qwen encoder path -- that would condition
+        // the DiT on a tensor 14 layers further along than the one it
+        // was trained against.
+        if (cls == "MiniMaxH3DiTModel") { return "minimax-h3"; }
       }
     }
   }
@@ -702,6 +709,68 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     }
     // No separate embedding table to cache: umT5 gathers from its own
     // `shared.weight`, which the encoder already holds.
+    return true;
+  }
+  if (_family == "minimax-h3") {
+    genai::MiniMaxH3TextEncoder::Config h3cfg;
+    std::string h3err;
+    if (!genai::MiniMaxH3TextEncoder::config_from_json(_enc_dir, h3cfg,
+                                                       &h3err)) {
+      session()->error(fmt("DiffusionConditionerStage('{}'): {}", this->id(),
+                           h3err));
+      return false;
+    }
+    _enc_hidden = h3cfg.text_dim;
+    // The Qwen3-VL-32B backbone is ~48 GB bf16 (~26 GB at w8) for the 50
+    // tapped layers, so on a small box it cannot be resident -- and it
+    // only ever PREFILLS, which is exactly what layer streaming serves.
+    // Same rule the DiTs use, with the encoder as the streamed component
+    // and everything else the graph declared as what stays resident.
+    {
+      // Size the COMPONENT, not what the config happened to name: a
+      // Comfy-Org repo root holds the 66 GB DiT beside the encoder, and
+      // summing the tree would decide to stream on the DiT's bytes.
+      const std::string ed =
+          genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_enc_dir);
+      const auto plan = model_memory::plan_streaming(
+          session(), ed, std::string(), model_memory::kStreamHeadroom);
+      h3cfg.lm.stream_layers = plan.stream;
+      h3cfg.lm.pin_frac      = plan.pin_frac;
+      if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
+        h3cfg.lm.stream_layers = (std::atoi(e) != 0);
+        if (!h3cfg.lm.stream_layers) { h3cfg.lm.pin_frac = 0.0; }
+      }
+      if (const char* e = std::getenv("VPIPE_H3_ENC_PIN_FRAC")) {
+        h3cfg.lm.pin_frac = std::atof(e);
+      }
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): MiniMax-H3 encoder footprint "
+          "{} GB (others {} GB) + {} GB headroom -> {}", this->id(),
+          plan.footprint >> 30, plan.others >> 30,
+          model_memory::kStreamHeadroom >> 30,
+          h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
+    }
+    _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_dir, mc,
+                                                const_cast<SessionContextIntf*>(
+                                                    session()), h3cfg);
+    if (!_h3_enc) {
+      session()->error(fmt("DiffusionConditionerStage('{}'): MiniMax-H3 text "
+                           "encoder load failed: {}", this->id(), _enc_dir));
+      return false;
+    }
+    if (_h3_enc->streaming()) {
+      session()->info(fmt(
+          "DiffusionConditionerStage('{}'): MiniMax-H3 encoder streams its "
+          "layers ({} of {} pinned) -- ~one layer resident instead of the "
+          "stack, at one command buffer per layer per prompt",
+          this->id(), _h3_enc->pinned_layers(), h3cfg.tap));
+      // Deliberately NOT revising the manager declaration down: unlike a
+      // DiT, an LM reads its tensors UNCACHED into its own buffers, so the
+      // weight set's stats report a fraction of what the model holds and
+      // would revise to a number that is wrong in the unsafe direction.
+    }
+    // The encoder owns its tokenizer and embedding table; nothing else
+    // to bind here.
     return true;
   }
   genai::MetalQwenModel::Config ecfg =
@@ -894,7 +963,8 @@ DiffusionConditionerStage::ensure_loaded_()
       _family == "flux2" ? "Qwen3 dense"
       : _family == "qwen-image-edit" ? "Qwen2.5-VL"
       : _family == "boogu-image" ? "Qwen3-VL (mllm)"
-      : _family == "wan" ? "umT5-XXL" : "Qwen3-VL",
+      : _family == "wan" ? "umT5-XXL"
+      : _family == "minimax-h3" ? "Qwen3-VL-32B (layer-50 tap)" : "Qwen3-VL",
       _enc_hidden));
 
   // The component dirs the idle-unload decision sizes against. The
@@ -953,12 +1023,13 @@ DiffusionConditionerStage::resolve_unload_policy_()
 void
 DiffusionConditionerStage::unload_encoder_()
 {
-  if (!_encoder && !_umt5) { return; }
+  if (!_encoder && !_umt5 && !_h3_enc) { return; }
   // Everything weight-sized: the LM (or the wan family's umT5 tower),
   // either vision tower, and the embedding table. The tokenizer stays
   // (kilobytes, and it is pure CPU state).
   _encoder.reset();
   _umt5.reset();
+  _h3_enc.reset();
   _vision.reset();
   _vision3.reset();
   _embed = metal_compute::SharedBuffer{};
@@ -993,7 +1064,8 @@ static bool
 single_tap_(const std::string& family)
 {
   return family == "qwen-image-edit" || family == "mage-flow" ||
-         family == "boogu-image" || family == "wan";
+         family == "boogu-image" || family == "wan" ||
+         family == "minimax-h3";
 }
 
 SharedBuffer
@@ -1275,6 +1347,25 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
       session()->warn(fmt("DiffusionConditionerStage('{}'): umT5 {} encode: {}",
                           this->id(), which, eerr));
     }
+    return h;
+  }
+
+  if (_family == "minimax-h3") {
+    // VERBATIM: no chat template, no BOS/EOS, no padding to a window.
+    // Every other family here wraps the prompt in something, so the
+    // wrong default is a live hazard rather than a hypothetical one --
+    // and a template's tokens would land in the conditioning as real
+    // rows the DiT attends to.
+    if (!_h3_enc) { return {}; }
+    int n = 0;
+    std::string eerr;
+    SharedBuffer h = _h3_enc->encode(text, &n, &eerr);
+    if (h.empty()) {
+      session()->warn(fmt("DiffusionConditionerStage('{}'): MiniMax-H3 {} "
+                          "encode: {}", this->id(), which, eerr));
+      return h;
+    }
+    n_real_out = n;
     return h;
   }
 
@@ -1869,6 +1960,16 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
   return ehs;
 }
 
+// bf16 -> f32 for the opt-in conditioning trace below.
+inline float
+bf16_to_f32_dbg_(std::uint16_t b)
+{
+  const std::uint32_t u = (std::uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
 // Wrap a 2-byte/elt metal buffer [rows, ...] as a TensorBeatPayload of `shape`.
 // `dt` records the element type the paired DiT consumes -- F16 for krea2/flux2
 // (forward_text/forward_dit read _Float16), Bf16 for qwen-image-edit.
@@ -1954,9 +2055,10 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // The wan family's tower is _umt5, not _encoder (a umT5 ENCODER rather
   // than a decoder-only LM), so both members have to be consulted --
   // testing only _encoder made a loaded wan conditioner look inert.
-  const bool have_enc = _encoder != nullptr || _umt5 != nullptr;
+  const bool have_enc =
+      _encoder != nullptr || _umt5 != nullptr || _h3_enc != nullptr;
   if (_unloaded && !have_enc) { reload_encoder_(); }
-  if (_encoder == nullptr && _umt5 == nullptr) {
+  if (_encoder == nullptr && _umt5 == nullptr && _h3_enc == nullptr) {
     // Inert: consume the prompt rather than returning immediately. A
     // process() that neither blocks nor signals done is re-invoked at
     // once, and the stage then spins a core for the life of the pipeline
@@ -2100,7 +2202,51 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // its denoise as soon as the beat lands, so releasing here is what gives it
   // the working set. It reloads when the next prompt arrives.
   if (_unload_idle) { unload_encoder_(); }
-  co_await ctx.write(0, to_beat_(cond, shape_for(n_real), cdt));
+  {
+    auto beat = to_beat_(cond, shape_for(n_real), cdt);
+    // Opt-in trace of the conditioning ITSELF. Two prompts that produce
+    // the same downstream generation are ambiguous between "the encoder
+    // emitted near-identical embeddings" and "the DiT ignored different
+    // ones", and only the tensor at this boundary separates them. The
+    // per-row spread is the load-bearing number: a mean-collapsed
+    // encoder still has a plausible global RMS.
+    if (std::getenv("VPIPE_COND_PROFILE") != nullptr) {
+      const std::size_t n = beat->element_count();
+      const int rows = n_real > 0 ? n_real : 1;
+      const int cols = rows > 0 ? (int)(n / (std::size_t)rows) : 0;
+      double s2 = 0.0, s1 = 0.0;
+      std::vector<double> rrms((std::size_t)rows, 0.0);
+      const auto* p = static_cast<const std::uint16_t*>(
+          (const void*)beat->as_u8());
+      for (int r = 0; r < rows; ++r) {
+        double rs = 0.0;
+        for (int c = 0; c < cols; ++c) {
+          const std::size_t k = (std::size_t)r * cols + c;
+          const float v = (cdt == TensorBeat::DType::Bf16)
+                              ? bf16_to_f32_dbg_(p[k])
+                              : (float)((const _Float16*)p)[k];
+          s2 += (double)v * v;
+          s1 += (double)v;
+          rs += (double)v * v;
+        }
+        rrms[(std::size_t)r] = cols > 0 ? std::sqrt(rs / cols) : 0.0;
+      }
+      const double rms = n > 0 ? std::sqrt(s2 / (double)n) : 0.0;
+      double rmin = 1e30, rmax = -1e30, rsum = 0.0;
+      for (double v : rrms) {
+        rmin = std::min(rmin, v); rmax = std::max(rmax, v); rsum += v;
+      }
+      const double rmean = rows > 0 ? rsum / rows : 0.0;
+      double rvar = 0.0;
+      for (double v : rrms) { rvar += (v - rmean) * (v - rmean); }
+      rvar = rows > 0 ? std::sqrt(rvar / rows) : 0.0;
+      session()->info(fmt(
+          "cond-profile rows {} x {}  rms {:.5f}  mean {:+.6f}  "
+          "row-rms [{:.4f} .. {:.4f}] sd {:.5f}", rows, cols, rms,
+          n > 0 ? s1 / (double)n : 0.0, rmin, rmax, rvar));
+    }
+    co_await ctx.write(0, std::move(beat));
+  }
   ++_emitted;
 }
 

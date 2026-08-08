@@ -44,6 +44,16 @@ dir_weights_bytes(const std::string& dir)
   if (dir.empty()) { return 0; }
   std::size_t total = 0;
   std::error_code ec;
+  // A checkpoint named by FILE, not by directory (a Comfy-Org repack:
+  // one .safetensors per component). Without this the iterator below
+  // just fails and reports 0 -- and a 66 GB DiT that sizes as free is
+  // worse than no accounting at all, because every peer then plans
+  // against a box that does not exist.
+  if (fs::is_regular_file(fs::path(dir), ec) && !ec) {
+    if (fs::path(dir).extension() != ".safetensors") { return 0; }
+    const std::uintmax_t n = fs::file_size(fs::path(dir), ec);
+    return ec ? 0 : (std::size_t)n;
+  }
   for (fs::recursive_directory_iterator it(dir, ec), end; it != end;
        it.increment(ec)) {
     if (it->is_regular_file(ec) && it->path().extension() == ".safetensors") {

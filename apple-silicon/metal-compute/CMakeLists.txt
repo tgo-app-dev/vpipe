@@ -78,6 +78,7 @@ add_vpipe_metal_kernel(rms_norm_bf16 SRC ops/rms_norm.metal
 add_vpipe_metal_kernel(llm_elementwise SRC ops/llm_elementwise.metal)
 add_vpipe_metal_kernel(llm_elementwise_bf16 SRC ops/llm_elementwise.metal
                        DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
                        DEFINES VPIPE_ELT=bfloat)

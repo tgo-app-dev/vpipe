@@ -28,6 +28,7 @@ import { makeIcon } from '../icons.js';
 import { t, onLocaleChange, getLocale, setLocale, locales }
   from '../i18n.js';
 import { api } from '../api.js';
+import { startProgressPoll } from '../status-bar.js';
 import { setUiMode } from '../ui-mode.js';
 import { mountPhonePipelines } from './phone-pipelines.js';
 import { mountPhoneIo } from './phone-io.js';
@@ -279,6 +280,54 @@ export function mountPhoneApp() {
     el('span', { class: 'brand' }, 'VPIPE'),
     el('span', { class: 'grow' }),
     menuBtn);
+
+  // ---- live progress line -------------------------------------------
+  // A thin bar directly under the menu-button row, carrying its own
+  // description. It is a sibling of the topbar rather than a child so it
+  // spans the full width and leaves the bar's height (and its
+  // safe-area padding) alone -- and because #app is a flex column, that
+  // position IS "just below the row" in every view. The phone shell has
+  // no status bar, so without this a long-running report is invisible
+  // here.
+  //
+  // Hidden entirely while nothing is reporting: an always-present empty
+  // rail would spend a whole line of a phone screen saying nothing.
+  const progFill = el('div', { class: 'ph-prog-fill' });
+  const progText = el('span', { class: 'ph-prog-text' });
+  const progBar = el('div', { class: 'ph-prog', hidden: true },
+    progFill, progText);
+  if (topbar && topbar.parentNode) {
+    topbar.parentNode.insertBefore(progBar, topbar.nextSibling);
+  }
+  // Not captured: this shell is mounted once and lives as long as the
+  // page, so the poll's lifetime is the page's too (as the desktop's
+  // restart watcher is). There is no teardown to hang a stop on.
+  startProgressPoll((items) => {
+    if (!items.length) {
+      progBar.hidden = true;
+      progBar.classList.remove('indet');
+      return;
+    }
+    // The most recently updated report, which is what `seq` is bumped
+    // for -- the same pick the desktop's status cell makes. Concurrent
+    // reports are counted rather than listed: there is one line here,
+    // and a phone has no room for a panel to expand into.
+    let top = items[0];
+    for (const it of items) {
+      if ((it.seq || 0) > (top.seq || 0)) { top = it; }
+    }
+    const frac = top.total
+      ? Math.max(0, Math.min(1, top.done / top.total)) : null;
+    progBar.hidden = false;
+    // total 0 means the reporter cannot say how much there is; a bar
+    // pinned at 0% would read as "stuck", so it sweeps instead.
+    progBar.classList.toggle('indet', frac === null);
+    progFill.style.width = frac === null ? '' : (frac * 100).toFixed(1) + '%';
+    const pct = frac === null ? '' : Math.round(frac * 100) + '% ';
+    const more = items.length > 1 ? ' +' + (items.length - 1) : '';
+    progText.textContent =
+      pct + (top.detail || top.desc || '') + more;
+  });
 
   // ---- view host ----------------------------------------------------
   // One pane per view: a header (title + the view's own control strip)

@@ -216,7 +216,7 @@ function makeProgressPanel() {
 // generally: the estimator needs a sample per poll even when the report
 // has not moved (a stall is exactly what it must notice), and the
 // remaining-time text ticks down on its own clock.
-function startProgressPoll(onItems) {
+export function startProgressPoll(onItems) {
   let stopped = false;
   let timer = null;
   let wasIdle = false;

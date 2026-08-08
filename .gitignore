@@ -7,3 +7,8 @@ build
 
 # app temp root (vpipe::temp_root) when a process runs from the source tree
 .vpipe-tmp/
+
+# MLX is no longer a submodule; a local checkout here is untracked and is
+# only ever an optional side-by-side reference (see the acknowledgement in
+# README.md for the kernel headers vpipe actually vendors).
+extern/mlx/

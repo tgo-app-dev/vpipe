@@ -15,6 +15,7 @@
 #include "generative-models/mage/mage-screen.h"
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/wan/metal-umt5-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/tokenizer.h"
@@ -76,6 +77,10 @@ namespace vpipe {
 //                            boogu-image [n, 4096] (last-hidden, image-aware,
 //                              POST final-norm, and n is the WHOLE templated
 //                              sequence -- Boogu drops no prefix)
+//                            minimax-h3 [n, 5120] -- Qwen3-VL-32B
+//                              hidden_states[50] of 64, UN-NORMED, over a
+//                              VERBATIM prompt (no chat template, no
+//                              special tokens, no padding)
 //   oport1  neg_conditioning  same shape, emitted only when a negative is set.
 //
 // MAGE-FLOW CONTENT SCREEN. On the `mage-flow` family every prompt is first
@@ -160,6 +165,10 @@ private:
   // relative-position bias, no rotary) and no embedding table to
   // gather separately.
   std::unique_ptr<genai::MetalUmt5Encoder>        _umt5;
+  // MiniMax-H3's tower: a Qwen3-VL-32B tapped at an INTERMEDIATE layer
+  // rather than run to its last hidden state, which is why it is its own
+  // class rather than another encoder_config_*() over _encoder.
+  std::unique_ptr<genai::MiniMaxH3TextEncoder>   _h3_enc;
   std::unique_ptr<genai::Tokenizer>               _tokenizer;
   metal_compute::SharedBuffer                     _embed;      // encoder embeds
   mutable std::unique_ptr<genai::MetalQwen25Vision> _vision;   // QIE, lazy

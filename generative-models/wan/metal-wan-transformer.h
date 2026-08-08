@@ -126,6 +126,15 @@ class MetalWanTransformer {
 
   const Config& config() const { return _cfg; }
 
+  // Cap on the quantized-GEMM tile height: 0 = BM32 only, 1 = +BM64,
+  // 2 = +BM128 (the default, when the checkpoint's group size has the
+  // wide twins). Exposed because the only way to compare two tiles
+  // without the ~4% thermal spread between processes is to ALTERNATE
+  // them inside one, which needs the choice to be settable per call.
+  // Clamped to what was actually built.
+  void set_qmm_tile(int cap);
+  int qmm_tile() const { return _qmm_tile; }
+
   // Per-block progress, fired as each block is entered. One forward of
   // this model at video resolution is minutes of otherwise-silent work,
   // so a caller showing movement inside a single denoise step is not a
@@ -214,7 +223,15 @@ class MetalWanTransformer {
 
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_rope,
       _lib_attn, _lib_qmm;
+  // The steel affine GEMM in three tile heights. Which one runs is chosen
+  // per CALL from M: the video sequence is thousands of rows, where the
+  // BM=32 tile re-reads each weight tile once per 32 rows and spends the
+  // step on weight traffic rather than arithmetic. 0 = only BM32 built
+  // (g32 checkpoints, which have no wide twins), 1 = +BM64, 2 = +BM128.
   metal_compute::ComputeFunction _fn_qmm4, _fn_qmm8;
+  metal_compute::ComputeFunction _fn_qmm4_bm64, _fn_qmm8_bm64;
+  metal_compute::ComputeFunction _fn_qmm4_bm128, _fn_qmm8_bm128;
+  int _qmm_tile = 0;
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_ln_mod, _fn_ln_affine,
       _fn_gelu, _fn_residual, _fn_gated, _fn_transpose, _fn_trope, _fn_silu,
       _fn_sdpa, _fn_bias_add;

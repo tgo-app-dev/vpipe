@@ -383,6 +383,13 @@ TEST(krea2_dit_quant, stage_quantizes_text_encoder)
   const std::string enc = (fs::path(out) / "text_encoder").string();
   EXPECT_TRUE(any_tensor_contains_(enc, "q_proj.scales"));
   EXPECT_FALSE(any_tensor_contains_(enc, "embed_tokens.scales"));
+  // A quantized encoder that cannot tokenize is not a usable output, and
+  // the failure surfaces far away -- at load, as "no tokenizer.json",
+  // which reads like a bad checkpoint rather than a missing copy. The
+  // directory source gets this from the quantizer's sidecar sweep; a
+  // Comfy-Org SINGLE-FILE source has no sidecars to sweep and takes it
+  // from the repo root instead, so assert the end state both must reach.
+  EXPECT_TRUE(fs::exists(fs::path(enc) / "tokenizer.json", ec));
   fs::remove_all(out, ec);
 }
 

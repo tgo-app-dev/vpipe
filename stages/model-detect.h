@@ -32,6 +32,11 @@ struct DetectedModel {
   std::vector<std::string> outputs;
   std::string parent_model_type;     // supplements: the model they attach to
   std::string parent_param_class;
+  // "comfyui" for a Comfy-Org repack (one .safetensors per component
+  // under diffusion_models/ | text_encoders/ | vae/, config in the
+  // safetensors __metadata__), empty for the upstream diffusers/HF
+  // layout. See ModelCatalogEntry::weight_format for why it is recorded.
+  std::string weight_format;
   // How model_type was established, for the log line + summary beat:
   //   "catalog"    -- the directory matches a catalogued repo (curated)
   //   "config"     -- HF config.json model_type
@@ -99,6 +104,24 @@ std::string coreml_artifact(const std::string& path);
 // than two components. Used both as the default registry key and as the
 // catalogue lookup for a directory laid out the way model-fetch writes.
 std::string hf_path_from_local(const std::string& dir);
+
+// The IMAGE/VIDEO VAE subdirectory of a model root, as the vae-encode /
+// vae-decode stages resolve it.
+//
+// Almost every checkpoint here follows diffusers and puts it in `vae/`.
+// MiniMax-H3 does not: its video VAE keeps the checkpoint's own layout,
+// `video_vae/` wrapping a `source/` that holds the weights, with a
+// config.json at BOTH levels. This returns the OUTER one -- the level
+// that names the class and carries latents_mean / latents_std -- and
+// the model loader descends the last step itself. A caller that
+// assumed `vae/` instead falls through to the model ROOT, finds no
+// config.json, reads the family as the default and then fails to open
+// a checkpoint: the H3 video path failing for a reason that has
+// nothing to do with H3.
+//
+// Returns `root` unchanged when neither layout is present, so the
+// caller's existing "no checkpoint here" error still fires.
+std::string resolve_vae_dir(const std::string& root);
 
 }
 

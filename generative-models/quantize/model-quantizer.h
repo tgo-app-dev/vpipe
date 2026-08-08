@@ -46,6 +46,29 @@ struct QuantizeOptions {
   // gates (right for the language backbone, whose leaves are standard).
   bool quant_all_in_scope = false;
 
+  // ADDITIONAL submodules quantized wholesale, alongside the leaf-gated
+  // main pass. `quant_scope` + `quant_all_in_scope` describe ONE region
+  // and replace the leaf rule; this is for a checkpoint that needs both
+  // conventions at once -- a multimodal encoder whose language backbone
+  // has standard leaves (so the leaf set is right for it) while its
+  // vision tower does not (qkv / linear_fc1 / proj / ...).
+  //
+  // A tensor whose name contains any of these is quantized under the
+  // same wholesale rule as quant_all_in_scope: every 2D fp weight
+  // except norms and embeddings. Note what that deliberately excludes
+  // besides those -- anything not 2D, which is how a patch-embedding
+  // CONVOLUTION (5D) stays out without being named.
+  std::vector<std::string> quant_extra_scopes;
+
+  // Stamped into the OUTPUT config.json as `_vpipe_component` when set.
+  // A quantized sub-model is a bare directory: it has left the pipeline
+  // that gave it meaning, and its own config says only what
+  // ARCHITECTURE it is ("qwen3_vl"), not what ROLE it played. Detection
+  // then has nothing to tag it with, so it registers as "type unknown"
+  // and no picker offers it. The producer is the last thing that knows,
+  // so it writes it down.
+  std::string component_tag;
+
   // Also quantize the token-embedding table + (untied) lm_head, matching the
   // MLX convention (its checkpoints quantize embed/lm_head). Needed so a
   // standard LM (Qwen/Llama) RELOADS for inference -- the affine load path

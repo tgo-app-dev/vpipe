@@ -782,6 +782,50 @@ ModelFetchStage::process(RuntimeContext& ctx)
               this->id(), files.size(), downloaded, skipped,
               human_bytes_(total_bytes)));
 
+  // -------- 6b. Companion files from another repo ---------------------
+  // What completes a weights-only repack: the tokenizer its publisher did
+  // not ship. Fetched by direct URL rather than through a second tree
+  // listing because these are a few MB of vocabulary and config -- the
+  // listing exists to pick among many candidates and to size big shards,
+  // and there is nothing to pick or size here.
+  if (entry != nullptr && !entry->companion_files.empty()) {
+    std::size_t got = 0;
+    for (const auto& c : entry->companion_files) {
+      const fs::path dest = local_dir / c.dest;
+      std::error_code cec;
+      if (_skip_existing_files && fs::exists(dest, cec) && !cec) {
+        // Presence, not size: a size check needs the other repo's tree.
+        s->info(fmt("  [companion] {} -- present, skip", c.dest));
+        files_arr.as_array().push_back(FlexData::make_string(c.dest));
+        ++got;
+        continue;
+      }
+      const string curl_url = "https://huggingface.co/" + c.repo
+                            + "/resolve/main/" + c.file;
+      long   cstatus = 0;
+      string cerr;
+      UiProgress cbar;
+      if (!http_download_(curl_url, token, _verify_tls, _timeout_seconds,
+                          dest, cstatus, cerr, &cbar, &cancel)) {
+        // WARN, not error: error() throws, and discarding a finished
+        // multi-GB fetch over a few MB is the worse outcome. Name the
+        // consequence and the file, so this reads as "top this up"
+        // rather than as a failed download of the model itself.
+        s->warn(fmt(
+            "ModelFetchStage('{}'): companion '{}' from '{}' failed ({}); "
+            "without it this copy cannot encode a prompt -- copy it to "
+            "'{}'", this->id(), c.file, c.repo, cerr, dest.string()));
+        continue;
+      }
+      files_arr.as_array().push_back(FlexData::make_string(c.dest));
+      ++got;
+      s->info(fmt("  [companion] {} <- {}", c.dest, c.repo));
+    }
+    s->info(fmt("ModelFetchStage('{}'): {}/{} companion file(s) from "
+                "outside '{}'", this->id(), got,
+                entry->companion_files.size(), hf_path));
+  }
+
   // -------- 7. Unpack archives (.tar -> *.mlpackage) ------------------
   // Catalogue archive entries (the vpipe-supplement CoreML packages) ship a
   // single *.mlpackage per .tar. Unpack each into <repo>/<name>/ and point

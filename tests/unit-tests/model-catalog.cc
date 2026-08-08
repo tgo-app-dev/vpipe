@@ -629,3 +629,71 @@ TEST(model_catalog, build_qwen_asr_tokenizer_json_no_config) {
   FlexData root = FlexData::from_json(js);
   EXPECT_TRUE(root.as_object().at("added_tokens").as_array().size() == 0);
 }
+
+// The Comfy-Org repack of MiniMax-H3: a SECOND entry for the same model,
+// pinned to the precisions this build can read.
+//
+// Comfy-Org publishes five DiT variants and three text-encoder variants
+// in one repo, most of them in their own int8_convrot / fp8_scaled /
+// nvfp4 packings that no loader here opens. An unpinned fetch would pull
+// ~250 GB of which ~180 GB is unreadable, so `files` is a whitelist --
+// the same reason the GGUF entries pin one quant. This test is the
+// guard on that whitelist: it is data, so nothing else fails when a
+// packing we cannot read creeps back in.
+TEST(model_catalog, comfy_org_minimax_h3_pins_readable_precisions) {
+  const ModelCatalogEntry* e = catalog_by_path("Comfy-Org/MiniMax-H3");
+  ASSERT_TRUE(e != nullptr);
+  EXPECT_TRUE(e->weight_format == "comfyui");
+  EXPECT_TRUE(e->model_type == "minimax-h3-fl2va");
+  EXPECT_TRUE(!e->files.empty());
+  for (const std::string& f : e->files) {
+    // Readable precision, and the FL2VA partition (Ref2VA is a different
+    // packed layout that this tree does not implement).
+    const bool ok = f.find("_bf16") != std::string::npos
+                 || f.find("_fp16") != std::string::npos
+                 || f.find("_fp32") != std::string::npos;
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(f.find("int8_convrot") == std::string::npos);
+    EXPECT_TRUE(f.find("fp8") == std::string::npos);
+    EXPECT_TRUE(f.find("nvfp4") == std::string::npos);
+    EXPECT_TRUE(f.find("ref2va") == std::string::npos);
+  }
+  // The released MiniMaxAI entry stays -- the point of this one is to be
+  // a second opinion on that one, not to replace it.
+  EXPECT_TRUE(catalog_by_path("MiniMaxAI/MiniMax-H3") != nullptr);
+}
+
+// The whitelist above says which files are READABLE; this one says the
+// set is USABLE. They are different failures: a fetch can pin nothing but
+// bf16 and still leave a directory that cannot make a video, which is
+// what this entry did before the text encoder was pinned -- a DiT and two
+// VAEs with no way to encode a prompt, reported as a successful fetch.
+TEST(model_catalog, comfy_org_minimax_h3_fetches_a_runnable_set) {
+  const ModelCatalogEntry* e = catalog_by_path("Comfy-Org/MiniMax-H3");
+  ASSERT_TRUE(e != nullptr);
+  bool dit = false, enc = false, vvae = false, avae = false;
+  for (const std::string& f : e->files) {
+    if (f.find("diffusion_models/") == 0) { dit = true; }
+    if (f.find("text_encoders/") == 0) { enc = true; }
+    if (f.find("video_vae") != std::string::npos) { vvae = true; }
+    if (f.find("audio_vae") != std::string::npos) { avae = true; }
+  }
+  // All four components. Audio is not optional here: the DiT emits both
+  // modalities from one packed sequence, so a set without the audio VAE
+  // has a latent it cannot decode.
+  EXPECT_TRUE(dit && enc && vvae && avae);
+
+  // The tokenizer the repack does not ship, landing where the encoder's
+  // own search looks (repo-root `tokenizer/`). Assert the DESTINATION,
+  // not just that a companion exists: a correct file in the wrong place
+  // fetches fine and fails at load.
+  bool tok = false;
+  for (const auto& c : e->companion_files) {
+    EXPECT_TRUE(!c.repo.empty() && !c.file.empty() && !c.dest.empty());
+    if (c.dest == "tokenizer/tokenizer.json") {
+      tok = true;
+      EXPECT_TRUE(c.repo == "MiniMaxAI/MiniMax-H3");
+    }
+  }
+  EXPECT_TRUE(tok);
+}

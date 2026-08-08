@@ -14,6 +14,7 @@
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #endif
 
@@ -96,6 +97,10 @@ private:
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalMageVae>  _mage_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
+  // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
+  // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
+  // clip at once instead of streaming chunks through a sink.
+  std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
 
   // Frame rate stamped onto each emitted video frame's sideband when the
   // producer did not supply one. Only meaningful for the "wan" family.

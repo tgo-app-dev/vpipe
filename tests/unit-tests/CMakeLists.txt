@@ -7,6 +7,7 @@ set(LOCAL_TEST_SOURCES
   clock-domain.cc
   console-writer.cc
   credential-store.cc
+  denoise-progress.cc
   detection-overlay-stage.cc
   feedback-pair.cc
   stage-relaunch-sweep.cc
@@ -147,6 +148,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         wan-unipc.cc
         wan-dit.cc
         wan-i2v.cc
+        minimax-h3-blocks.cc
+        minimax-h3-comfy.cc
+        minimax-h3-layout.cc
+        minimax-h3-dit.cc
+        minimax-h3-vvae.cc
+        minimax-h3-avae.cc
+        minimax-h3-text-encoder.cc
         mage-vae.cc
         mage-dit.cc
         mage-cond.cc

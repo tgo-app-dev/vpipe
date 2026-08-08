@@ -45,6 +45,8 @@
 #include "common/session.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -298,4 +300,132 @@ TEST(wan_dit, forward_matches_golden)
   if (qbits == 8) { bar = (gdtype == "bfloat16" ? 0.04 : 0.025); }
   if (qbits == 4) { bar = 0.20; }
   EXPECT_TRUE(r < bar);
+}
+
+// One denoise step at a chosen video geometry, timed. This is the harness
+// the DiT's own VPIPE_WAN_DIT_PROFILE breakdown is read through, and the
+// A/B for a kernel change.
+//
+// The geometry is the whole question at 720p. Self-attention over the
+// video tokens is QUADRATIC in seq = T * (h/2) * (w/2), and the frame
+// count sets T = 1 + (frames-1)/4, so 81 frames at 1280x720 is 75,600
+// tokens where 33 frames at 256x256 is 2,304. Everything about whether a
+// resolution is reachable follows from that number, which is why this
+// takes T/h/w directly rather than a "size" preset.
+//
+// Env: VPIPE_WAN_DIT_BENCH=1, VPIPE_WAN_TEST_MODEL_PATH, and optionally
+// VPIPE_WAN_BENCH_T / _H / _W (LATENT dims, i.e. pixels/8) and _ITERS.
+TEST(wan_dit, step_bench)
+{
+  const char* on   = std::getenv("VPIPE_WAN_DIT_BENCH");
+  const char* root = std::getenv("VPIPE_WAN_TEST_MODEL_PATH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int T     = envi("VPIPE_WAN_BENCH_T", 9);
+  const int h     = envi("VPIPE_WAN_BENCH_H", 32);
+  const int w     = envi("VPIPE_WAN_BENCH_W", 32);
+  const int iters = envi("VPIPE_WAN_BENCH_ITERS", 3);
+  const int text_seq = 512;
+
+  MetalWanTransformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalWanTransformer::config_from_json(
+      std::string(root) + "/transformer", cfg, &cerr));
+  auto m = MetalWanTransformer::load(std::string(root) + "/transformer", mc,
+                                     cfg);
+  ASSERT_TRUE(m != nullptr);
+
+  const std::size_t nlat = (std::size_t)cfg.in_channels * T * h * w;
+  SharedBuffer lat = mc->make_shared_buffer(nlat * 2);
+  SharedBuffer txt = mc->make_shared_buffer((std::size_t)text_seq *
+                                            cfg.text_dim * 2);
+  ASSERT_TRUE(!lat.empty() && !txt.empty());
+  {
+    auto* p = static_cast<std::uint16_t*>(lat.contents());
+    for (std::size_t i = 0; i < nlat; ++i) {
+      p[i] = f32_to_bf16_(0.01f * (float)((i % 197) - 98));
+    }
+    auto* q = static_cast<std::uint16_t*>(txt.contents());
+    const std::size_t nt = (std::size_t)text_seq * cfg.text_dim;
+    for (std::size_t i = 0; i < nt; ++i) {
+      q[i] = f32_to_bf16_(0.01f * (float)((i % 91) - 45));
+    }
+  }
+  std::string err;
+  SharedBuffer tp = m->encode_text(txt, text_seq, &err);
+  if (tp.empty()) { std::printf("[wan_dit] encode_text: %s\n", err.c_str()); }
+  ASSERT_TRUE(!tp.empty());
+
+  const int seq = T * (h / cfg.patch_h) * (w / cfg.patch_w);
+  std::printf("[wan_dit] bench %dx%d px, T=%d -> %d tokens, %d blocks\n",
+              w * 8, h * 8, T, seq, cfg.n_layers);
+
+  // VPIPE_WAN_BENCH_TILE_AB: alternate the quantized-GEMM tile cap
+  // 0,1,2,0,1,2,... across iterations INSIDE this process. Comparing two
+  // tiles across two processes cannot resolve a few percent -- the box
+  // has ~4% of thermal spread between runs -- and alternating puts both
+  // arms under the same drift. Reports best-of per arm.
+  const bool ab = std::getenv("VPIPE_WAN_BENCH_TILE_AB") != nullptr;
+  const int arms = ab ? 3 : 1;
+  std::vector<double> arm_best((std::size_t)arms, 1e30);
+
+  double best = 1e30, sum = 0;
+  for (int i = 0; i < iters; ++i) {
+    if (ab) { m->set_qmm_tile(i % arms); }
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer out = m->forward(lat, T, h, w, tp, text_seq, 750.0f, &err);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (out.empty()) { std::printf("[wan_dit] forward: %s\n", err.c_str()); }
+    ASSERT_TRUE(!out.empty());
+    // Iteration 0 pays for the scratch allocation and the steel function
+    // build, neither of which recurs inside a denoise loop.
+    if (i > 0) { best = std::min(best, ms); sum += ms; }
+    // The L2 of the velocity, so a kernel A/B is checkable and not just
+    // timeable: a GEMM tile that changes the ANSWER is not a speedup, and
+    // the goldens run at 72 tokens where the tall tiles never engage.
+    double l2 = 0.0;
+    {
+      const auto* p = static_cast<const std::uint16_t*>(out.contents());
+      const std::size_t n = out.byte_size() / 2;
+      for (std::size_t k = 0; k < n; ++k) {
+        const double v = bf16_to_f32_(p[k]);
+        l2 += v * v;
+      }
+      l2 = std::sqrt(l2);
+    }
+    if (ab) {
+      // Arm 0 of the first round still pays the scratch allocation, so
+      // the first `arms` iterations are warmup for their own arm.
+      if (i >= arms) {
+        arm_best[(std::size_t)(i % arms)] =
+            std::min(arm_best[(std::size_t)(i % arms)], ms);
+      }
+      std::printf("[wan_dit]   step %d (BM%d): %.0f ms  |out| = %.6f\n", i,
+                  m->qmm_tile() == 2 ? 128 : m->qmm_tile() == 1 ? 64 : 32, ms,
+                  l2);
+      continue;
+    }
+    std::printf("[wan_dit]   step %d: %.0f ms  |out| = %.6f\n", i, ms, l2);
+  }
+  if (ab) {
+    const char* nm[3] = {"BM32 ", "BM64 ", "BM128"};
+    for (int a = 0; a < arms; ++a) {
+      std::printf("[wan_dit] arm %s best %.0f ms  (%+.1f%% vs BM32)\n", nm[a],
+                  arm_best[(std::size_t)a],
+                  100.0 * (arm_best[(std::size_t)a] / arm_best[0] - 1.0));
+    }
+  } else if (iters > 1) {
+    std::printf("[wan_dit] best %.0f ms, mean %.0f ms (excluding step 0)\n",
+                best, sum / (double)(iters - 1));
+  }
+  EXPECT_TRUE(best < 1e29);
 }

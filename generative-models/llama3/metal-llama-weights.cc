@@ -144,6 +144,16 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   const fs::path dir(model_dir);
   std::error_code ec;
 
+  // A checkpoint named by FILE rather than by directory: the Comfy-Org
+  // repacks (Comfy-Org/MiniMax-H3, Comfy-Org/Wan-Animate-2) ship one
+  // freely-named .safetensors per component under diffusion_models/ or
+  // vae/, so there is no directory whose contents this could glob and
+  // no config.json beside it. Its own header is self-describing, which
+  // is all the single-file path needs.
+  if (fs::is_regular_file(dir, ec) && !ec) {
+    return open(model_dir);
+  }
+
   // mlx-optiq stores the (unquantized BF16) vision tower in a SIDECAR
   // (`optiq_vision.safetensors`, HF `vision_tower.*` names) that is NOT listed
   // in model.safetensors.index.json -- the index only maps the quantized LM

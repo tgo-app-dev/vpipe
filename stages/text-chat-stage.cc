@@ -563,9 +563,10 @@ TextChatStage::initialize(RuntimeContext& ctx)
         this->id(), _lm->config().architecture));
   }
   // MCP tools: seed the registry when any tool is enabled and the model's
-  // chat template renders the tool-calling scaffold (ChatML/Qwen
-  // families). A template without tool support (Llama-3, Gemma-4) warns
-  // and leaves tools off so the plain chat path is unchanged. The runtime
+  // chat template renders the tool-calling scaffold -- the ChatML/Qwen
+  // families, and Gemma-4 through its own tool DSL when those tokens are
+  // in the vocab. A template without tool support (Llama-3) warns and
+  // leaves tools off so the plain chat path is unchanged. The runtime
   // tool gate in process() is `!_tools.empty()`, so both flags feed one
   // registry.
   if (_enable_tools || _enable_python_tool || _enable_file_tools

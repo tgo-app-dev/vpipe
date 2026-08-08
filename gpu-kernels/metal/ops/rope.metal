@@ -679,3 +679,136 @@ kernel void rms_rope_partial_f16(
     xr[i + half_r] = VPIPE_ELT(x1 * s + x2 * c);
   }
 }
+
+// MiniMax-H3: fused transpose + PARTIAL rotate-half RoPE, reading out of
+// a FUSED qkv projection.
+//
+//   in  [seq, in_stride]  starting at column `in_off`
+//   out [H, seq, D]       (what the steel flash-attention kernel reads)
+//
+// `in_stride` / `in_off` are what let q, k and v come straight out of
+// the one [seq, 3*H*D] qkv_proj output with no split pass -- at video
+// sequence lengths that buffer is over a gigabyte, so materializing
+// three copies of it per block would cost more traffic than the
+// attention it feeds.
+//
+// Three things separate this from transpose_rope_pair_ftab_f16, which
+// the Wan DiT uses:
+//
+//   * the convention is ROTATE-HALF (GPT-NeoX), not adjacent-pair: the
+//     partner of channel i is i + rot/2, not i ^ 1.
+//   * only the leading `rot` channels rotate. MiniMax-H3 builds its
+//     angles from 3 axes x rope_freq_dim frequencies and then
+//     concatenates the block with itself, giving rot = 2 * 3 * 16 = 96
+//     of the 128-wide head. The remaining 32 channels are copied
+//     THROUGH unchanged -- dropping them, or rotating them with
+//     wrapped-around angles, silently changes the model.
+//   * rot = 0 is legal and makes this a pure strided transpose, which is
+//     how the V half of the same projection is laid out for attention.
+//
+// The cos/sin tables are f32 and hold rot/2 entries per row (the second
+// half of the concatenated angle block repeats the first, so storing it
+// would be redundant). f32 for the reason the sibling DiTs use it: RoPE
+// error is structured, so a bf16 table compounds across 50 blocks and
+// every denoise step instead of averaging out.
+// `in_head_stride` is how far apart two HEADS sit in the source row. It
+// is NOT always D: a fused qkv projection can be grouped either way, and
+// which one a checkpoint uses is not visible from the shapes.
+//
+//   * [q0..qH | k0..kH | v0..vH] -- head stride D, part offset i*H*D.
+//   * [h0(q,k,v) | h1(q,k,v) | ...] -- head stride 3*D, part offset i*D.
+//     MiniMax-H3's video VAE is this one; reading it as the first layout
+//     hands every head a mixture of its own q, k and v, which destroys
+//     attention while still producing plausible per-token output.
+//
+//   0:in 1:out 2:cos[seq,rot/2] 3:sin[seq,rot/2] 4:H 5:seq 6:D 7:rot
+//   8:in_stride 9:in_off 10:in_head_stride.
+//   grid {D, seq, H}, tg {D, 1, 1}.
+kernel void transpose_rope_half_part_ftab_f16(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    device VPIPE_ELT*       out  [[buffer(1)]],
+    const device float*     cosb [[buffer(2)]],
+    const device float*     sinb [[buffer(3)]],
+    constant int&      H         [[buffer(4)]],
+    constant int&      S         [[buffer(5)]],
+    constant int&      D         [[buffer(6)]],
+    constant int&      rot       [[buffer(7)]],
+    constant int&      in_stride [[buffer(8)]],
+    constant int&      in_off    [[buffer(9)]],
+    constant int&      in_head_stride [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  if (d >= D) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  // Bound the head axis for the same reason `d` is bounded: both are
+  // exact for today's dispatch ({D, S, H}), and a caller that ever pads
+  // the grid up to a threadgroup multiple would otherwise write past
+  // `out` rather than be clamped.
+  if (h >= H) { return; }
+  const uint src = (uint)t * (uint)in_stride + (uint)in_off +
+                   (uint)h * (uint)in_head_stride;
+  const uint dst = ((uint)h * (uint)S + (uint)t) * (uint)D;
+  if (d >= rot) {
+    out[dst + (uint)d] = in[src + (uint)d];   // pass-through tail
+    return;
+  }
+  const int half_r = rot / 2;
+  // Angles repeat across the two halves, so both halves index [0, half_r).
+  const int i = (d < half_r) ? d : (d - half_r);
+  const uint cb = (uint)t * (uint)half_r + (uint)i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const float x1 = float(in[src + (uint)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (uint)(d < half_r ? d + half_r : d)]);
+  // rotate_half: out[:half] = x1*c - x2*s, out[half:] = x2*c + x1*s.
+  out[dst + (uint)d] =
+      VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+}
+
+// Per-HEAD RMS norm in place over a strided fused projection: the row
+// (t, h) lives at `x[t*stride + off + h*D]` and is normalized over its
+// own D channels against a shared [D] gamma.
+//
+// MiniMax-H3's q/k normalization is per head over head_dim, which is the
+// usual convention but NOT Wan's -- Wan norms once across the whole
+// projection before the head split. In place, and on the fused buffer,
+// so the subsequent rope pass reads the normalized values without a
+// second copy of a gigabyte-scale activation.
+// `head_stride` is the distance between two HEADS in the row -- see the
+// note on transpose_rope_half_part_ftab_f16 above for why that is not
+// always D.
+//   0:x 1:gamma[D] 2:S 3:H 4:D 5:stride 6:off 7:eps 8:head_stride
+//   grid {32, S*H, 1}, tg {32, 1, 1}.
+kernel void rms_norm_heads_strided_f16(
+    device VPIPE_ELT*       x     [[buffer(0)]],
+    const device VPIPE_ELT* gamma [[buffer(1)]],
+    constant int&      S      [[buffer(2)]],
+    constant int&      H      [[buffer(3)]],
+    constant int&      D      [[buffer(4)]],
+    constant int&      stride [[buffer(5)]],
+    constant int&      off    [[buffer(6)]],
+    constant float&    eps    [[buffer(7)]],
+    constant int&      head_stride [[buffer(8)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]])
+{
+  const int row = (int)tid.y;
+  if (row >= S * H) { return; }
+  const int t = row / H;
+  const int h = row % H;
+  device VPIPE_ELT* r = x + (uint)t * (uint)stride + (uint)off +
+                        (uint)h * (uint)head_stride;
+  const uint lid = ltid.x;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(r[i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  for (int i = (int)lid; i < D; i += 32) {
+    r[i] = VPIPE_ELT(float(r[i]) * inv * float(gamma[i]));
+  }
+}

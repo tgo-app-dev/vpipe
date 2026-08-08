@@ -170,6 +170,25 @@ public:
     // Implies backbone_only behaviour (no lm_head). No effect on any non-calib
     // forward (the per-layer weights are simply never populated).
     bool  calib_stream = false;
+    // Memory-bounded PREFILL streaming: don't preload the transformer
+    // layers -- retain the weight set and build/free each layer inside
+    // the prefill loop, so ~one layer is resident instead of the whole
+    // stack. Built by the SAME per-layer loader a preloading load runs
+    // (build_layer_), so a streamed model is bit-identical to a resident
+    // one; the cost is one commit+wait per layer plus re-reading the
+    // checkpoint on every chunk.
+    //
+    // For a model that only ever PREFILLS -- a diffusion text encoder
+    // reading an intermediate hidden state, which is the whole reason
+    // this exists. Decode would re-read the stack per token, so it is
+    // refused rather than served slowly (see forward_chunk_/decode).
+    //
+    // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of
+    // layers resident so pinned + running stays within that fraction of
+    // physical RAM. Pinned layers are read once and reused by every
+    // prefill; only the tail streams. 0 => pure streaming.
+    bool   stream_layers = false;
+    double pin_frac      = 0.0;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
@@ -360,6 +379,13 @@ public:
   void calib_begin();
   void calib_end() { _calib_on = false; }
   bool calibrating() const { return _calib_on; }
+
+  // Prefill-streaming state (Config::stream_layers): whether the layer
+  // stack streams, and how many leading layers are pinned resident. For
+  // logging the RAM-for-speed decision, and for the test that runs one
+  // prompt both ways.
+  bool streaming_layers() const { return _stream_layers; }
+  int  pinned_layers()    const { return _pinned_layers; }
   // [n_layers][channels] abs-max (hidden for qkv/gateup, ffn_inner for down).
   const std::vector<std::vector<float>>& calib_qkv()    const { return _calib_qkv; }
   const std::vector<std::vector<float>>& calib_gateup() const { return _calib_gu; }
@@ -1571,6 +1597,33 @@ private:
   // lm_head -- so it replaces the full main-model re-forward the partial accept
   // used to pay.
   void gdn_replay_(ContextId cid, int keep, const GdnVerifyCache& gc);
+
+  // ---- Per-layer weight builder (shared by load() and streaming) -------
+  // The dtype / fuse / interleave helpers that turn one layer's checkpoint
+  // tensors into the buffer layout a Layer holds. Defined in the .cc.
+  //
+  // It is an OBJECT rather than a block of lambdas inside load() for one
+  // reason: with Config::stream_layers, layers are built from the PREFILL
+  // forward, long after load() has returned -- and the point of streaming
+  // is that a streamed layer is built by the same code as a resident one.
+  // Two loaders kept in lockstep by hand is exactly how a checkpoint gets
+  // read one way in one mode and another way in the other.
+  struct LayerLoad;
+  friend struct LayerLoad;
+  // Retained only while streaming (it holds the loader's context); a
+  // preloading load drops it once the stack is built.
+  std::unique_ptr<LayerLoad> _lload;
+  bool build_layer_(int L);      // build _layers[L] from the weight set
+  void free_layer_(int L);       // drop its buffers, keeping is_full
+  // False on a layer-streamed model, reporting the reason once: the decode
+  // encoders read the layer stack directly, and only the pinned prefix is
+  // built. load() already refuses stream_layers for anything with an
+  // lm_head; this closes the backbone-only-but-decoding hole (MOSS-style
+  // host-fed decode) loudly rather than with zeros.
+  bool stream_decode_ok_();
+  bool _stream_layers = false;
+  int  _pinned_layers = 0;       // leading layers kept resident
+  bool _stream_decode_warned = false;   // decode-on-streamed, reported once
 
   std::vector<Layer> _layers;
   metal_compute::SharedBuffer _embed_w, _embed_s, _embed_b;   // tied lm_head

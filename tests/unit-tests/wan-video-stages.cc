@@ -268,4 +268,50 @@ TEST(generate_video, geometry_config_validation)
   EXPECT_TRUE(s3->latent_frames() == 31);
 }
 
+// The stage is family-generic: one stage type carrying the UNION of what
+// its DiT families need, the way generate-image does. What this pins is
+// the SURFACE -- a graph must not have to be rewired to change
+// checkpoints, so the H3-only keys and the audio port have to exist
+// regardless of which family is resident (and be inert when it is wan).
+TEST(generate_video, family_generic_surface)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("height", FlexData::make_int(480));
+  cfg.as_object().insert_or_assign("width", FlexData::make_int(832));
+  cfg.as_object().insert_or_assign("frames", FlexData::make_int(81));
+  // Keys that only minimax-h3 reads. On a wan checkpoint they are inert,
+  // NOT a config error -- rejecting them would make the union useless.
+  cfg.as_object().insert_or_assign("video_shift", FlexData::make_real(12.0));
+  cfg.as_object().insert_or_assign("audio_shift", FlexData::make_real(3.0));
+  cfg.as_object().insert_or_assign("condition_timestep",
+                                   FlexData::make_real(1.0));
+  cfg.as_object().insert_or_assign("audio_seconds", FlexData::make_real(5.0));
+  auto s = make_unique<GenerateVideoStage>(&sess, "gv", vector<InEdge>{}, cfg);
+  EXPECT_TRUE(s->config_error().empty());
+
+  const StageSpec& sp = s->spec();
+  // The audio latent port exists on the type, so a graph can wire it
+  // whether or not the resident family fills it.
+  EXPECT_TRUE(sp.oports.size() == 2);
+  bool has_audio = false;
+  for (const auto& p : sp.oports) {
+    if (std::string(p.name) == "audio_latent") { has_audio = true; }
+  }
+  EXPECT_TRUE(has_audio);
+  // And the wan-side ports are all still there, with the h3 last-frame
+  // anchor appended: the five wan ports keep their INDICES, which is what
+  // lets a graph written for wan keep working unedited.
+  EXPECT_TRUE(sp.iports.size() == 7);
+  EXPECT_TRUE(std::string(sp.iports[5].name) == "ref_latent0");
+  EXPECT_TRUE(std::string(sp.iports[6].name) == "ref_latent1");
+
+  bool has_shift = false, has_audio_secs = false;
+  for (const auto& k : sp.attrs) {
+    if (std::string(k.key) == "video_shift") { has_shift = true; }
+    if (std::string(k.key) == "audio_seconds") { has_audio_secs = true; }
+  }
+  EXPECT_TRUE(has_shift && has_audio_secs);
+}
+
 #endif  // VPIPE_BUILD_APPLE_SILICON

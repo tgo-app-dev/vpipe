@@ -1,8 +1,11 @@
 #include "stages/save-video-stage.h"
+#include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -181,7 +184,9 @@ constexpr ConfigKey kAttrs[] = {
 const PortSpec kIports[] = {
   {.name = "video", .doc = "VideoStreamParams header then video FrameRefs",
    .type = nullptr, .clock_group = 0},
-  {.name = "audio", .doc = "AudioStreamParams header then audio FrameRefs",
+  {.name = "audio",
+   .doc = "AudioStreamParams header then audio FrameRefs, OR f32 PCM "
+          "TensorBeats [channels, n_samples] with a sample_rate sideband",
    .type = nullptr, .clock_group = 1},
 };
 const StageSpec kSpec = {
@@ -232,6 +237,10 @@ SaveVideoStage::release_media_()
     _libs->avformat().api.free_context(_ofctx);
     _ofctx = nullptr;
   }
+  if (_apcm_frame) {
+    _libs->avutil().api.frame_free(&_apcm_frame);
+    _apcm_frame = nullptr;
+  }
   _vstream = nullptr;
   _astream = nullptr;
 }
@@ -249,6 +258,8 @@ SaveVideoStage::reset_run_state()
   _audio_eos         = false;
   _header_written    = false;
   _finalized         = false;
+  _audio_pcm         = false;
+  _audio_pts         = 0;
   _next_port         = 0;
 }
 
@@ -415,12 +426,142 @@ SaveVideoStage::init_audio_encoder_(const AudioStreamParams& p)
   _astream->time_base = _aenc->time_base;
 }
 
+// Derive the audio stream header from a PCM TensorBeat. The rate must
+// come from the beat: nothing else in a generative graph knows it, and
+// a config default would silently retime the whole clip.
+bool
+SaveVideoStage::audio_params_from_pcm_(const TensorBeatPayload& t,
+                                       AudioStreamParams* out)
+{
+  int channels = 1;
+  int64_t samples = 0;
+  if (t.shape.size() == 2) {
+    channels = static_cast<int>(t.shape[0]);
+    samples  = t.shape[1];
+  } else if (t.shape.size() == 1) {
+    samples = t.shape[0];
+  } else {
+    session()->warn(fmt(
+      "encoder('{}'): audio PCM must be rank-1 [N] or rank-2 "
+      "[channels,N], got rank {}", this->id(), t.shape.size()));
+    return false;
+  }
+  int rate = 0;
+  if (t.sideband.is_object()) {
+    FlexData sb = t.sideband;              // as_object() is a view
+    auto o = sb.as_object();
+    if (o.contains("sample_rate")) {
+      rate = static_cast<int>(o.at("sample_rate").as_int(0));
+    }
+    // The producer may state the channel count too. When it does it
+    // WINS over the shape, so a mono clip shaped [1, N] and one shaped
+    // [N] describe themselves identically.
+    if (o.contains("channels")) {
+      const int c = static_cast<int>(o.at("channels").as_int(0));
+      if (c > 0) { channels = c; }
+    }
+  }
+  if (rate <= 0) {
+    session()->warn(fmt(
+      "encoder('{}'): audio PCM beat carries no sample_rate sideband; "
+      "refusing to guess one", this->id()));
+    return false;
+  }
+  if (channels <= 0 || samples <= 0) {
+    session()->warn(fmt(
+      "encoder('{}'): audio PCM beat is {} x {}; nothing to encode",
+      this->id(), channels, samples));
+    return false;
+  }
+  out->sample_rate = rate;
+  out->sample_fmt  = AV_SAMPLE_FMT_FLTP;   // planar f32: our layout
+  out->time_base   = AVRational{1, rate};
+  if (channels == 2) {
+    const AVChannelLayout st = AV_CHANNEL_LAYOUT_STEREO;
+    out->ch_layout = st;
+  } else if (channels == 1) {
+    const AVChannelLayout mo = AV_CHANNEL_LAYOUT_MONO;
+    out->ch_layout = mo;
+  } else {
+    out->ch_layout = AVChannelLayout{};
+    out->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    out->ch_layout.nb_channels = channels;
+  }
+  return true;
+}
+
+// Encode a whole PCM beat. The encoder wants exactly frame_size
+// samples per frame, so this chunks; the tail is zero-padded, which is
+// why a producer should send one beat per clip rather than slicing a
+// clip across beats.
+void
+SaveVideoStage::encode_pcm_(const TensorBeatPayload& t)
+{
+  if (!_aenc) { return; }
+  const int channels = _aenc->ch_layout.nb_channels;
+  const int64_t samples =
+    (t.shape.size() == 2) ? t.shape[1]
+                          : (t.shape.empty() ? 0 : t.shape[0]);
+  if (samples <= 0 || channels <= 0) { return; }
+  if (t.element_count() <
+      static_cast<size_t>(samples) * static_cast<size_t>(channels)) {
+    session()->warn(fmt(
+      "encoder('{}'): audio PCM beat holds {} elements, its shape needs "
+      "{}; dropping", this->id(), t.element_count(),
+      static_cast<size_t>(samples) * channels));
+    return;
+  }
+  const int frame_size =
+    _aenc->frame_size > 0 ? _aenc->frame_size : 1024;
+
+  if (!_apcm_frame) {
+    _apcm_frame = _libs->avutil().api.frame_alloc();
+    if (!_apcm_frame) { return; }
+    _apcm_frame->nb_samples = frame_size;
+    _apcm_frame->format     = _aenc->sample_fmt;
+    _apcm_frame->ch_layout  = _aenc->ch_layout;
+    _apcm_frame->sample_rate = _aenc->sample_rate;
+    if (_libs->avutil().api.frame_get_buffer(_apcm_frame, 0) < 0) {
+      _libs->avutil().api.frame_free(&_apcm_frame);
+      _apcm_frame = nullptr;
+      session()->warn(fmt(
+        "encoder('{}'): could not allocate the audio PCM frame",
+        this->id()));
+      return;
+    }
+  }
+
+  const float* src = t.as_f32();
+  for (int64_t off = 0; off < samples; off += frame_size) {
+    const int n =
+      static_cast<int>(std::min<int64_t>(frame_size, samples - off));
+    for (int c = 0; c < channels; ++c) {
+      auto* dst = reinterpret_cast<float*>(_apcm_frame->data[c]);
+      const float* s = src + static_cast<size_t>(c) * samples + off;
+      std::memcpy(dst, s, static_cast<size_t>(n) * sizeof(float));
+      if (n < frame_size) {
+        std::memset(dst + n, 0,
+                    static_cast<size_t>(frame_size - n) * sizeof(float));
+      }
+    }
+    _apcm_frame->pts = _audio_pts;
+    _audio_pts += n;
+    encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+  }
+}
+
 bool
 SaveVideoStage::ready_to_write_header_() const noexcept
 {
-  bool v_ok = (!_enable_video) || _video_initialized;
-  bool a_ok = (!_enable_audio) || _audio_initialized;
-  return v_ok && a_ok;
+  // A port that reached EOS without ever delivering a header counts as
+  // settled, not as still-pending. Otherwise one failed or empty stream
+  // holds the header back forever and the file is never opened AT ALL
+  // -- losing the picture because the soundtrack was unusable, with
+  // nothing written to say so.
+  bool v_ok = (!_enable_video) || _video_initialized || _video_eos;
+  bool a_ok = (!_enable_audio) || _audio_initialized || _audio_eos;
+  // ...but there has to be at least one real stream to write.
+  return v_ok && a_ok && (_video_initialized || _audio_initialized);
 }
 
 void
@@ -607,6 +748,18 @@ SaveVideoStage::process(RuntimeContext& ctx)
     } else if (static_cast<int>(port) == _audio_port) {
       _audio_eos = true;
     }
+    // This EOS may be what unblocks the header: the other stream can
+    // be initialized and waiting on a peer that turned out to be empty.
+    if (!_header_written && ready_to_write_header_()) {
+      try {
+        open_output_and_write_header_();
+        _header_written = true;
+      } catch (const exception& e) {
+        session()->warn(fmt(
+          "encoder('{}'): writing the header after port {} EOS: {}",
+          this->id(), port, e.what()));
+      }
+    }
     if (this->num_iports() > 1) {
       _next_port =
         (target + 1) % static_cast<int>(this->num_iports());
@@ -628,13 +781,44 @@ SaveVideoStage::process(RuntimeContext& ctx)
               this->id()));
         }
         init_video_encoder_(*p);
+      } else if (const auto* pcm =
+                     dynamic_cast<const TensorBeatPayload*>(t.get())) {
+        // Raw PCM: this beat is BOTH the header and the first samples.
+        // A generative graph has no ffmpeg decoder upstream to emit a
+        // real header, so the rate and channel count are read off the
+        // beat itself.
+        AudioStreamParams ap{};
+        if (pcm->dtype != TensorBeat::DType::F32 ||
+            !audio_params_from_pcm_(*pcm, &ap)) {
+          session()->warn(fmt(
+            "encoder('{}'): unusable audio PCM beat; writing the file "
+            "WITHOUT a soundtrack", this->id()));
+          _audio_eos = true;
+          if (!_header_written && ready_to_write_header_()) {
+            open_output_and_write_header_();
+            _header_written = true;
+          }
+          co_return;
+        }
+        _audio_pcm = true;
+        init_audio_encoder_(ap);
+        init = true;
+        if (ready_to_write_header_() && !_header_written) {
+          open_output_and_write_header_();
+          _header_written = true;
+        }
+        if (_header_written) { encode_pcm_(*pcm); }
+        if (this->num_iports() > 1) {
+          _next_port = (target + 1) % static_cast<int>(this->num_iports());
+        }
+        co_return;
       } else {
         const auto* p = dynamic_cast<const AudioStreamParamsPayload*>(
             t.get());
         if (!p) {
           session()->error(fmt(
-              "SaveVideoStage('{}'): expected "
-              "AudioStreamParams header on audio port",
+              "SaveVideoStage('{}'): expected an AudioStreamParams "
+              "header or an f32 PCM TensorBeat on the audio port",
               this->id()));
         }
         init_audio_encoder_(*p);
@@ -658,6 +842,15 @@ SaveVideoStage::process(RuntimeContext& ctx)
         "encoder('{}'): port {} produced a frame before all paired "
         "headers arrived; dropping",
         this->id(), port));
+    } else if (_audio_pcm && static_cast<int>(port) == _audio_port) {
+      const auto* pcm = dynamic_cast<const TensorBeatPayload*>(t.get());
+      if (!pcm || pcm->dtype != TensorBeat::DType::F32) {
+        session()->warn(fmt(
+          "encoder('{}'): non-PCM token on the raw-audio port; dropping",
+          this->id()));
+      } else {
+        encode_pcm_(*pcm);
+      }
     } else {
       const auto* fp = dynamic_cast<const FrameRefPayload*>(t.get());
       if (!fp || !fp->ref) {

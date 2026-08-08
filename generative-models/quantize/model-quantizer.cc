@@ -8,6 +8,8 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/affine-quantizer.h"
 #include "generative-models/quantize/safetensors-writer.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 
 #include <algorithm>
 #include <cmath>
@@ -272,6 +274,126 @@ load_calib_(const std::string& dir, const std::string& tap, int nL, int ch)
           (std::streamsize)v.size() * 4);
   if (!in) { v.clear(); }
   return v;
+}
+
+// The config.json to write beside a quantized Comfy-Org component.
+//
+// A repack has none -- each component's config lives in its own
+// safetensors `__metadata__`, and for the text encoder not even that
+// (only the tap; the geometry is in the tensor shapes). The OUTPUT has
+// to have one, because it is an ordinary directory checkpoint from here
+// on and every loader in this tree reads config.json.
+//
+// Which model this is comes from two places that have to agree:
+//   * the file's own `__metadata__` key, which names the component; and
+//   * the REPO around it -- `<file>/../..` -- whose diffusion_models/
+//     entry names the architecture. A bare text-encoder file carries no
+//     architecture at all, so without the repo there is nothing saying
+//     it is H3's Qwen3-VL rather than any other Comfy-Org encoder.
+// The repo check is skipped when the file was named directly out of its
+// tree (no sibling components found), since that is a deliberate act;
+// what it must never do is silently accept a MISMATCH.
+bool
+comfy_output_config_(const std::string& file, FlexData& out, std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "model-quantize: " + std::move(m); }
+    return false;
+  };
+  const fs::path repo = fs::path(file).parent_path().parent_path();
+  bool repo_is_h3 = false, repo_seen = false;
+  for (const comfy::Component& c : comfy::scan_repo(repo.string())) {
+    if (c.role != "diffusion_models") { continue; }
+    repo_seen = true;
+    FlexData md;
+    if (!comfy::metadata_json(c.file, "config", md, nullptr) ||
+        !md.is_object() || !md.as_object().contains("transformer")) {
+      continue;
+    }
+    const FlexData t = md.as_object().at("transformer");
+    auto to = t.as_object();
+    const FlexData im = to.contains("image_model") ? to.at("image_model")
+                                                   : FlexData();
+    if (std::string(im.as_string("")) == "minimax_h3") { repo_is_h3 = true; }
+  }
+  if (repo_seen && !repo_is_h3) {
+    return fail("'" + file + "' sits in a Comfy-Org repo whose DiT is not "
+                "minimax_h3; this pass does not know that architecture");
+  }
+
+  // ---- the DiT ---------------------------------------------------
+  if (comfy::is_component(file, "config")) {
+    FlexData md;
+    std::string cerr;
+    if (!comfy::metadata_json(file, "config", md, &cerr) ||
+        !md.is_object() || !md.as_object().contains("transformer")) {
+      return fail("no embedded config in " + file +
+                  (cerr.empty() ? "" : " (" + cerr + ")"));
+    }
+    out = md.as_object().at("transformer");
+    if (!out.is_object()) {
+      return fail("embedded 'transformer' is not an object");
+    }
+    auto o = out.as_object();
+    const FlexData im = o.contains("image_model") ? o.at("image_model")
+                                                  : FlexData();
+    if (std::string(im.as_string("")) != "minimax_h3") {
+      return fail("unsupported Comfy-Org image_model '" +
+                  std::string(im.as_string("")) + "'");
+    }
+    o.insert_or_assign("_class_name",
+                       FlexData::make_string("MiniMaxH3DiTModel"));
+    // MUST survive: Comfy-Org's conversion reorders the fused qkv
+    // projection, this pass copies that order through verbatim, and the
+    // names and shapes are identical either way -- so an output that
+    // does not SAY which order it is in gets read as the released one
+    // and computes nonsense.
+    o.insert_or_assign("qkv_per_head", FlexData::make_bool(false));
+    return true;
+  }
+
+  // ---- the text encoder ------------------------------------------
+  // Round-tripped through the encoder's OWN config reader rather than
+  // re-measured here: it already derives the geometry from the tensor
+  // shapes (there is no config to read), and going back out through the
+  // same fields is what guarantees the written config reloads to the
+  // Config the source produced.
+  if (comfy::is_component(file, "minimax_h3_te")) {
+    MiniMaxH3TextEncoder::Config c;
+    std::string cerr;
+    if (!MiniMaxH3TextEncoder::config_from_json(file, c, &cerr)) {
+      return fail(cerr);
+    }
+    out = FlexData::make_object();
+    FlexData tc = FlexData::make_object();
+    {
+      auto t = tc.as_object();
+      auto put = [&](const char* k, long long v) {
+        t.insert_or_assign(k, FlexData::make_int(v));
+      };
+      put("num_hidden_layers", c.total_layers);
+      put("hidden_size", c.lm.hidden);
+      put("num_attention_heads", c.lm.n_heads);
+      put("num_key_value_heads", c.lm.n_kv_heads);
+      put("head_dim", c.lm.head_dim);
+      put("intermediate_size", c.lm.ffn_inner);
+      put("vocab_size", c.lm.vocab);
+      t.insert_or_assign("rope_theta",
+                         FlexData::make_real((double)c.lm.rope_theta));
+      t.insert_or_assign("rms_norm_eps",
+                         FlexData::make_real((double)c.lm.rms_eps));
+    }
+    auto o = out.as_object();
+    o.insert_or_assign("text_config", std::move(tc));
+    // The encoder's reader keys on this to accept the file as a
+    // Qwen3-VL, and on tie_word_embeddings for the head it never loads.
+    o.insert_or_assign("model_type", FlexData::make_string("qwen3_vl"));
+    o.insert_or_assign("tie_word_embeddings", FlexData::make_bool(false));
+    return true;
+  }
+  return fail("'" + file + "' is not a Comfy-Org component this pass can "
+              "write a config for");
 }
 
 }  // namespace
@@ -1856,28 +1978,57 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       }
     }
     const bool shape_ok = is_2d && fp && (ti->shape[1] % opt.group == 0);
-    // A targeted linear whose K is not a multiple of the group size is NOT
-    // quantizable at this group and falls through to passthrough. Silence here
-    // is a trap: a model whose hidden size is not a multiple of 64 (Boogu's is
-    // 3360 = 52.5 groups) yields a "4-bit" checkpoint that is almost entirely
-    // bf16, at nearly the source size, with nothing in the log. Count them and
-    // say so at the end.
-    if (is_2d && fp && !shape_ok && !leaf.empty() &&
-        quant_set.count(leaf) > 0) {
-      ++n_group_skip;
-      if (group_skip_k == 0) { group_skip_k = (int)ti->shape[1]; }
-      group_skip_bytes += (std::size_t)ti->shape[0] * ti->shape[1] * 2;
-    }
+    // Wholesale rule: every 2D fp linear except norms + embeddings.
+    // Their leaves are non-standard in a vision/audio tower, so the leaf
+    // set cannot gate them; the 2D test is what keeps a patch-embedding
+    // convolution (5D) and a positional table (an "embed" leaf) out.
+    auto wholesale = [&]() {
+      return !excluded && shape_ok &&
+             leaf.find("norm") == std::string::npos &&
+             leaf.find("embed") == std::string::npos;
+    };
     bool quant;
     if (opt.quant_all_in_scope && !opt.quant_scope.empty()) {
-      // Scoped submodule (vision/audio tower): quantize every 2D fp linear in
-      // scope except norms + embeddings (their leaves are non-standard).
-      quant = in_scope && !excluded && shape_ok &&
-              leaf.find("norm") == std::string::npos &&
-              leaf.find("embed") == std::string::npos;
+      quant = in_scope && wholesale();
     } else {
       quant = in_scope && !excluded && !leaf.empty() &&
               quant_set.count(leaf) > 0 && shape_ok;
+    }
+    // Extra wholesale submodules, ORed on top: a multimodal encoder
+    // quantizes its language backbone by leaf and its towers wholesale
+    // in the same pass.
+    bool extra_scope = false;
+    for (const auto& s2 : opt.quant_extra_scopes) {
+      if (!s2.empty() && name.find(s2) != std::string::npos) {
+        extra_scope = true;
+        break;
+      }
+    }
+    if (!quant && extra_scope && wholesale()) { quant = true; }
+
+    // A TARGETED linear whose K is not a multiple of the group size is
+    // not quantizable at this group and falls through to passthrough.
+    // Silence here is a trap: a model whose width is not a multiple of
+    // 64 (Boogu's hidden is 3360 = 52.5 groups; Qwen3-VL's vision MLP is
+    // 4304 = 67.25) yields a checkpoint that is partly or almost
+    // entirely bf16, at nearly the source size, with nothing in the log.
+    // Counted for EVERY selection rule, not just the leaf set -- a
+    // wholesale scope is exactly where a caller has no per-tensor
+    // expectation to notice it against.
+    if (is_2d && fp && !shape_ok && !excluded) {
+      const bool wanted =
+          extra_scope
+              ? true
+              : (opt.quant_all_in_scope && !opt.quant_scope.empty()
+                     ? in_scope
+                     : (in_scope && !leaf.empty() &&
+                        quant_set.count(leaf) > 0));
+      if (wanted && leaf.find("norm") == std::string::npos &&
+          leaf.find("embed") == std::string::npos) {
+        ++n_group_skip;
+        if (group_skip_k == 0) { group_skip_k = (int)ti->shape[1]; }
+        group_skip_bytes += (std::size_t)ti->shape[0] * ti->shape[1] * 2;
+      }
     }
 
     SharedBuffer in = src->load(name, _mc);
@@ -1926,15 +2077,34 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   // Rewrite config.json with the top-level quantization block (the loader
   // reads outer.quantization.{bits,group_size}); copy everything else.
   {
-    std::string cfg_txt;
-    const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
-    if (!read_file_(cfg_in, &cfg_txt)) {
-      return fail("model-quantize: cannot read config.json");
-    }
     FlexData cfg;
-    try { cfg = FlexData::from_json(cfg_txt); }
-    catch (...) { return fail("model-quantize: bad config.json"); }
-    if (!cfg.is_object()) { return fail("model-quantize: config not object"); }
+    std::error_code fe;
+    if (fs::is_regular_file(fs::path(in_dir), fe) && !fe) {
+      // A Comfy-Org single-file source: there is no config.json to copy,
+      // the config lives in the safetensors `__metadata__`. Lift it out
+      // and write it as one, so the output is an ordinary directory
+      // checkpoint that every loader here already reads.
+      //
+      // `qkv_per_head` is the part that MUST survive: Comfy-Org's
+      // MiniMax-H3 conversion reorders the fused qkv projection, this
+      // pass copies that order through verbatim, and the tensor names
+      // and shapes are the same either way -- so an output that does not
+      // SAY which order it is in gets read as the released one and
+      // computes nonsense. Recording it is what keeps a quantized
+      // Comfy-Org DiT loadable at all.
+      if (!comfy_output_config_(in_dir, cfg, err)) { return false; }
+    } else {
+      std::string cfg_txt;
+      const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
+      if (!read_file_(cfg_in, &cfg_txt)) {
+        return fail("model-quantize: cannot read config.json");
+      }
+      try { cfg = FlexData::from_json(cfg_txt); }
+      catch (...) { return fail("model-quantize: bad config.json"); }
+      if (!cfg.is_object()) {
+        return fail("model-quantize: config not object");
+      }
+    }
     FlexData qb = FlexData::make_object();
     {
       auto o = qb.as_object();
@@ -1942,6 +2112,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       o.insert_or_assign("bits", FlexData::make_int(opt.bits));
     }
     cfg.as_object().insert_or_assign("quantization", std::move(qb));
+    if (!opt.component_tag.empty()) {
+      cfg.as_object().insert_or_assign(
+          "_vpipe_component", FlexData::make_string(opt.component_tag));
+    }
     if (!write_file_((fs::path(out_dir) / "config.json").string(),
                      cfg.to_json(true))) {
       return fail("model-quantize: cannot write config.json");
@@ -1949,15 +2123,18 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   }
 
   // Copy sidecar files (tokenizer, processor, etc.) -- everything that is
-  // not a weight file or config.json (already rewritten).
-  for (const auto& de : fs::directory_iterator(in_dir, ec)) {
-    if (!de.is_regular_file()) { continue; }
-    const std::string fn = de.path().filename().string();
-    if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
-      continue;
+  // not a weight file or config.json (already rewritten). A single-file
+  // source has no sidecars, and iterating it as a directory would fail.
+  if (fs::is_directory(fs::path(in_dir), ec)) {
+    for (const auto& de : fs::directory_iterator(in_dir, ec)) {
+      if (!de.is_regular_file()) { continue; }
+      const std::string fn = de.path().filename().string();
+      if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
+        continue;
+      }
+      fs::copy_file(de.path(), fs::path(out_dir) / fn,
+                    fs::copy_options::overwrite_existing, ec);
     }
-    fs::copy_file(de.path(), fs::path(out_dir) / fn,
-                  fs::copy_options::overwrite_existing, ec);
   }
 
   if (_mc->session() != nullptr) {

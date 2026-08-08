@@ -84,6 +84,76 @@ model_catalog()
       "vae/diffusion_pytorch_model.safetensors",
       "scheduler/scheduler_config.json"};
 
+  // The MiniMax-H3 FL2VA files. The repo is PARTITIONED: `FL2VA/` and
+  // `Ref2VA/` are each a complete pipeline (their transformer configs are
+  // byte-identical -- only `model_index.json`'s `_minimax_h3.partition`
+  // tells them apart), so pinning one partition halves the download and
+  // still yields a runnable model root at `<repo>/FL2VA`. The reference
+  // .py under video_vae/ and audio_vae/ is `trust_remote_code` plumbing
+  // for diffusers, not architecture we read, and is skipped -- but their
+  // config.json / config.yaml / metadata.json ARE the architecture, so
+  // those stay. ~144 GB: the 33B DiT and the Qwen3-VL-32B encoder are
+  // 66 GB EACH, which makes this the largest catalogued model, ahead of
+  // Wan2.2-I2V-A14B's ~126 GB.
+  static const std::vector<std::string> kMiniMaxH3FL2VAFiles = {
+      "FL2VA/model_index.json",
+      "FL2VA/transformer/config.json",
+      "FL2VA/transformer/model.safetensors.index.json",
+      "FL2VA/transformer/model-00001-of-00013.safetensors",
+      "FL2VA/transformer/model-00002-of-00013.safetensors",
+      "FL2VA/transformer/model-00003-of-00013.safetensors",
+      "FL2VA/transformer/model-00004-of-00013.safetensors",
+      "FL2VA/transformer/model-00005-of-00013.safetensors",
+      "FL2VA/transformer/model-00006-of-00013.safetensors",
+      "FL2VA/transformer/model-00007-of-00013.safetensors",
+      "FL2VA/transformer/model-00008-of-00013.safetensors",
+      "FL2VA/transformer/model-00009-of-00013.safetensors",
+      "FL2VA/transformer/model-00010-of-00013.safetensors",
+      "FL2VA/transformer/model-00011-of-00013.safetensors",
+      "FL2VA/transformer/model-00012-of-00013.safetensors",
+      "FL2VA/transformer/model-00013-of-00013.safetensors",
+      "FL2VA/text_encoder/config.json",
+      "FL2VA/text_encoder/model.safetensors.index.json",
+      "FL2VA/text_encoder/model-00001-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00002-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00003-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00004-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00005-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00006-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00007-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00008-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00009-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00010-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00011-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00012-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00013-of-00014.safetensors",
+      "FL2VA/text_encoder/model-00014-of-00014.safetensors",
+      "FL2VA/text_encoder/tokenizer.json",
+      "FL2VA/text_encoder/tokenizer_config.json",
+      "FL2VA/text_encoder/vocab.json",
+      "FL2VA/text_encoder/merges.txt",
+      "FL2VA/text_encoder/chat_template.json",
+      "FL2VA/text_encoder/preprocessor_config.json",
+      "FL2VA/text_encoder/video_preprocessor_config.json",
+      "FL2VA/video_vae/config.json",
+      "FL2VA/video_vae/source/config.json",
+      "FL2VA/video_vae/source/model.safetensors",
+      "FL2VA/audio_vae/config.json",
+      "FL2VA/audio_vae/config.yaml",
+      "FL2VA/audio_vae/metadata.json",
+      "FL2VA/audio_vae/model.safetensors",
+      "FL2VA/processor/tokenizer.json",
+      "FL2VA/processor/tokenizer_config.json",
+      "FL2VA/processor/vocab.json",
+      "FL2VA/processor/merges.txt",
+      "FL2VA/processor/chat_template.json",
+      "FL2VA/processor/preprocessor_config.json",
+      "FL2VA/processor/video_preprocessor_config.json",
+      "FL2VA/tokenizer/tokenizer.json",
+      "FL2VA/tokenizer/tokenizer_config.json",
+      "FL2VA/tokenizer/vocab.json",
+      "FL2VA/tokenizer/merges.txt"};
+
   // All four Boogu-Image-0.1 repos are byte-identical in layout, so one pinned
   // list serves them. It SKIPS the assets/ showcase images and the two
   // `trust_remote_code` .py shims (compatibility re-exports that only point
@@ -865,6 +935,121 @@ model_catalog()
      .inputs = {"text", "image"}, .outputs = {"video"},
      .files = kWan22I2VFiles,
      .needs_tokenizer_json = false},
+    // MiniMax-H3 FL2VA (MiniMaxAI): the first model here that generates
+    // VIDEO AND AUDIO from one denoise loop, and the first whose DiT is
+    // too large to hold in bf16 on any box we have (33B = 66 GB), so
+    // quantizing it is a precondition for running it at all rather than
+    // an optimization. "FL2VA" = First-and-Last-frame to Video+Audio: it
+    // takes zero, one or two images, which makes one checkpoint serve
+    // t2va, first-frame, last-frame and first-and-last-frame. Sub-models:
+    //   transformer/  = MiniMaxH3DiTModel, a 33B dense SINGLE-STREAM
+    //     transformer over ONE packed sequence holding text + audio +
+    //     video rows: 50 blocks, hidden 5376 but 56 heads x head_dim 128
+    //     = 7168 attention inner width (WIDER than the residual stream,
+    //     which is unusual), SwiGLU ffn 14336, patch (1,2,2). Attention
+    //     is plain full self-attention -- there is no cross-attention
+    //     anywhere -- and neither attention nor FFN is modality-specific.
+    //     Modality enters only at the two input patch projections, the
+    //     two output heads, and the AdaLN: each block projects the shared
+    //     timestep embedding 2688 -> 96768 = 6 modulation vectors x 3
+    //     modalities (0 video, 1 text, 2 audio), and every ROW picks its
+    //     own by `timestep_index * 3 + tag`. That one projection is 260M
+    //     parameters, so the AdaLN branches alone are ~13B of the 33B.
+    //     One forward serves rows at DIFFERENT noise levels, which is how
+    //     the keyframes stay pinned while the generated rows denoise.
+    //   text_encoder/ = the full Qwen3-VL-32B (64L, hidden 5120), read
+    //     for its layer-50 hidden states rather than for tokens, so it is
+    //     an encoder here despite being a complete VLM. `text_dim` 5120.
+    //   video_vae/    = MiniMaxH3VideoVAE, 16x SPATIAL and 4x temporal
+    //     with 24 latent channels and per-channel mean/std whitening. At
+    //     10.4 GB it is by far the largest VAE catalogued -- it carries a
+    //     ViT alongside the CNN.
+    //   audio_vae/    = MiniMaxH3AudioVAE, a DAC/BigVGAN stereo codec at
+    //     32 kHz compressing to 32 latent channels at 40 Hz.
+    // Scheduler: rectified-flow Euler with an exponential sigma shift,
+    // run as TWO schedules per request (shift 12.0 video / 3.0 audio,
+    // from model_index.json). Two traps versus every other flow model
+    // here: the velocity is DATA-ward, so `x0 = x_t + sigma * v` rather
+    // than minus, and timesteps are `t = 1 - sigma` in [0, 1] with t = 1
+    // meaning clean -- the opposite direction from the usual 1000x sigma.
+    // Output is 24 fps, 4-15 s, frame counts of the form 17n+5, on a
+    // canvas whose axes are multiples of 32 (768 short edge by default).
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "33B",
+     .variant = "bf16 omni video+audio (MiniMaxAI, diffusers)",
+     .hf_path = "MiniMaxAI/MiniMax-H3",
+     .model_type = "minimax-h3-fl2va",
+     .inputs = {"text", "image"}, .outputs = {"video", "audio"},
+     .files = kMiniMaxH3FL2VAFiles,
+     .needs_tokenizer_json = false},
+    // The SAME model, from Comfy-Org's repack -- kept as a second entry
+    // rather than replacing the one above because its value is being a
+    // SECOND OPINION on the first. The two disagree about one thing that
+    // no checkpoint states: MiniMaxAI groups the DiT's fused qkv
+    // projection per head, Comfy-Org reorders it flat, under identical
+    // names and shapes. Reading one as the other loads cleanly and
+    // scrambles attention in all 50 blocks -- which is exactly the bug
+    // that cost this bring-up, and having both copies on disk is what
+    // turns "is our loader right?" into a diff instead of a guess.
+    //
+    // A COMPLETE pipeline, and the cheaper of the two: 123.6 GB against
+    // the MiniMaxAI entry's 144.0 GB. The saving is entirely the text
+    // encoder -- 51.5 GB here against 66.7 there, for the same 33B DiT --
+    // because Comfy-Org's is TRUNCATED at the tap. Its header carries
+    // layers 0..49 and says so
+    // (`{"num_hidden_layers": 50, "output":
+    // "unnormalized_hidden_after_layer_50"}`), where the released
+    // checkpoint ships all 64 and we load 14 that never run.
+    //
+    // The one thing the repack does not ship is a tokenizer -- it is
+    // weights-only, no configs of any kind -- so 11 MB of MiniMaxAI's
+    // comes along as a companion. Without it a fetch of this entry
+    // reports success and leaves a directory that cannot encode a
+    // prompt. The encoder needs no config.json from either publisher:
+    // its geometry is measured off the tensor shapes (comfy_config_ in
+    // minimax-h3-text-encoder.cc), which is why only the tokenizer has
+    // to be borrowed.
+    //
+    // Kept as a second entry rather than replacing the one above because
+    // its other value is being a SECOND OPINION. The two disagree about
+    // one thing that no checkpoint states: MiniMaxAI groups the DiT's
+    // fused qkv projection per head, Comfy-Org reorders it flat, under
+    // identical names and shapes. Reading one as the other loads cleanly
+    // and scrambles attention in all 50 blocks -- which is exactly the
+    // bug that cost this bring-up, and having both copies on disk is
+    // what turns "is our loader right?" into a diff instead of a guess.
+    //
+    // Only the bf16 / fp16 / fp32 files are pinned, which is why `files`
+    // is a whitelist rather than "fetch the repo": the same repo holds
+    // 341.5 GB more in int8_convrot / fp8_scaled / nvfp4_awq packings
+    // this build does not read, in `pruned` DiTs (a different model, not
+    // a different packing of this one), and in the Ref2VA partition,
+    // whose packed layout this tree does not implement. Same reason the
+    // GGUF entries pin one quant instead of taking the whole repo.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "33B",
+     .variant = "bf16/fp16 single-file (Comfy-Org)",
+     .hf_path = "Comfy-Org/MiniMax-H3",
+     .model_type = "minimax-h3-fl2va",
+     .inputs = {"text", "image"}, .outputs = {"video", "audio"},
+     .files = {"diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+               "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+               "vae/minimax_h3_video_vae_fp16.safetensors",
+               "vae/minimax_h3_audio_vae_fp32.safetensors"},
+     // `tokenizer/` at the repo root is one of the four places the
+     // encoder looks (see the tokenizer search in its load()), so this
+     // lands where it is already expected to be. tokenizer.json alone is
+     // what the runtime reads -- it is self-contained, so vocab.json and
+     // merges.txt would be 4.5 MB of nothing. tokenizer_config.json
+     // comes along because it is 10 KB and makes the directory readable
+     // by anything else that expects an HF tokenizer.
+     .companion_files =
+         {{.repo = "MiniMaxAI/MiniMax-H3",
+           .file = "FL2VA/tokenizer/tokenizer.json",
+           .dest = "tokenizer/tokenizer.json"},
+          {.repo = "MiniMaxAI/MiniMax-H3",
+           .file = "FL2VA/tokenizer/tokenizer_config.json",
+           .dest = "tokenizer/tokenizer_config.json"}},
+     .weight_format = "comfyui",
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -990,6 +1175,12 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text", "image"}, {"video"});
   } else if (mt == "wan-t2v") {
     set({"text"}, {"video"});
+  } else if (mt == "minimax-h3-fl2va") {
+    // The only entry whose OUTPUT is two modalities: one denoise loop
+    // over one packed sequence emits the clip and its soundtrack
+    // together. Images are optional (zero, one or two keyframes), so the
+    // text-only t2va task is the same checkpoint.
+    set({"text", "image"}, {"video", "audio"});
   } else if (mt == "boogu-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "boogu-image") {
