@@ -90,6 +90,41 @@ TEST(denoise_progress, ends_at_exactly_one)
   EXPECT_TRUE(r.last == 1.0);
 }
 
+// The configured step count is not always the count that RUNS.
+// MiniMax-H3's `steps` is a sigma grid including the terminal zero, so it
+// drives one fewer evaluation, and the shift can collapse duplicates on
+// top of that. The sampler reports what it settled on; without adopting
+// it the bar divides by the wrong denominator and stops short -- MEASURED
+// at 74% on a 4-step H3 run, right where the user is waiting for output.
+TEST(denoise_progress, adopts_the_samplers_real_step_count)
+{
+  auto reg = std::make_shared<UiProgressRegistry>();
+  const std::uint64_t id = reg->open("denoise");
+  UiProgress bar(reg, id);
+  // Told 4; the scheduler runs 3.
+  DenoiseProgress prog(&bar, /*steps=*/4, /*forwards_per_step=*/1);
+  Run r;
+  prog.set_steps(3);
+  run_loop_(prog, *reg, id, r, 3, 1, 50);
+  EXPECT_TRUE(r.monotonic);
+  EXPECT_TRUE(r.bounded);
+  EXPECT_TRUE(r.last == 1.0);
+
+  // And adopting it MID-RUN still lands on 1.0: the totals are recomputed
+  // per update, so a callback that only learns the real count on its
+  // first fire is not too late.
+  auto reg2 = std::make_shared<UiProgressRegistry>();
+  const std::uint64_t id2 = reg2->open("denoise");
+  UiProgress bar2(reg2, id2);
+  DenoiseProgress prog2(&bar2, /*steps=*/40, /*forwards_per_step=*/1);
+  Run r2;
+  prog2.block_fn()(0, 50);            // one block tick at the wrong total
+  prog2.set_steps(3);
+  run_loop_(prog2, *reg2, id2, r2, 3, 1, 50);
+  EXPECT_TRUE(r2.bounded);
+  EXPECT_TRUE(r2.last == 1.0);
+}
+
 TEST(denoise_progress, never_exceeds_one_or_goes_backwards)
 {
   auto reg = std::make_shared<UiProgressRegistry>();

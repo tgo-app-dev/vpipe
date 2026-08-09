@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 #define GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -91,6 +92,30 @@ class MetalKrea2Transformer {
   // empty) when it returns true. Used by the AWQ calibration collector to honor
   // a pipeline stop within ~one block. No effect on the preloaded path.
   void set_stream_stop(std::function<bool()> stop) { _stream_stop = std::move(stop); }
+
+  // ---- adaptive block residency (streaming mode) -----------------------
+  // Grow the resident block set into free RAM so later steps re-read less
+  // from disk. Policy and the reasoning behind it live in
+  // shared/block-residency.h -- in particular why this is a fixed
+  // resident set and not an LRU cache.
+  //
+  // `bytes` is what must stay free for the rest of the forward. 0 (the
+  // default) disables growth, which is exactly today's pure-streaming
+  // behaviour -- so this is opt-in per caller rather than a silent
+  // change to every graph.
+  void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  int resident_block_count() const { return _resid.count(); }
+  std::size_t release_resident_blocks(std::size_t bytes);
+
+  // The per-forward activation scratch actually held right now. MEASURED,
+  // not estimated: DitScratch is a persistent struct, so this sums what
+  // was allocated rather than re-deriving it from the config. That
+  // matters -- the equivalent estimator on MiniMax-H3 under-reported by
+  // 212 MB until a test compared it against reality, and a reserve that
+  // under-reports is how residency growth eats the room the rest of the
+  // forward needs.
+  std::size_t scratch_resident_bytes() const;
 
   // M3a: run the text-fusion tower + txt_in on the (text_seq, n_text_layers,
   // text_hidden) f16 encoder-tap stack -> the (text_seq, hidden) fused text
@@ -277,6 +302,9 @@ class MetalKrea2Transformer {
   // mmap this class kept to itself.
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;   // polled per block in streaming mode
+  BlockResidency _resid;
+  static std::size_t qw_bytes_(const QWeight& w);
+  static std::size_t block_bytes_(const Block& b);
   DitBlockProgressFn    _block_progress;
   metal_compute::SharedBuffer _final_sst;              // final_layer (2, hidden)
   metal_compute::SharedBuffer _final_norm;             // final_layer.norm (+1)

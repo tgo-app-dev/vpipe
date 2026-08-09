@@ -45,6 +45,7 @@
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -648,4 +649,83 @@ TEST(minimax_h3_vvae, latent_whitening_is_read)
               "%.4f std[0] %.4f, round-trip worst %.2e\n", cfg.z_channels,
               cfg.latents_mean[0], cfg.latents_std[0], worst);
   EXPECT_TRUE(worst < 1e-5);
+}
+
+// Decode throughput at a chosen geometry, on a SYNTHETIC latent.
+//
+// Synthetic because the question is timing, not fidelity, and a golden
+// pins one small shape while the cost here is driven entirely by the
+// latent grid: the decoder is a transformer, so attention is quadratic in
+// tokens per tile and a 960x544 clip is a different regime from the
+// 256x256 the goldens use.
+//
+// Reports ms per PIXEL FRAME as well as per call, because that is the
+// number that composes -- a clip is decoded in chunks and the per-call
+// figure hides how many frames each chunk carried.
+//
+// Env: VPIPE_MINIMAX_H3_VVAE_BENCH=1 + VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+// Geometry: ..._BENCH_{LT,LH,LW} (default the production 960x544 clip).
+TEST(minimax_h3_vvae, decode_bench)
+{
+  const char* on   = std::getenv("VPIPE_MINIMAX_H3_VVAE_BENCH");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int LT = envi("VPIPE_MINIMAX_H3_VVAE_BENCH_LT", 17);
+  const int lh = envi("VPIPE_MINIMAX_H3_VVAE_BENCH_LH", 34);   // 544 / 16
+  const int lw = envi("VPIPE_MINIMAX_H3_VVAE_BENCH_LW", 60);   // 960 / 16
+
+  const std::size_t n = (std::size_t)cfg.z_channels * LT * lh * lw;
+  SharedBuffer z = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!z.empty());
+  {
+    auto* d = static_cast<std::uint16_t*>(z.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      d[i] = f32_to_bf16_(0.1f * (float)((int)(i * 37 % 19) - 9));
+    }
+  }
+  int frames = 0;
+  SharedBuffer out = vae->decode_video(z, LT, lh, lw, &frames, &err);  // warm
+  if (out.empty()) { std::printf("[minimax_h3_vvae] %s\n", err.c_str()); }
+  ASSERT_TRUE(!out.empty() && frames > 0);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  out = vae->decode_video(z, LT, lh, lw, &frames, &err);
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  ASSERT_TRUE(!out.empty());
+  // Optional dump, so a sweep can ask what a setting did to the OUTPUT
+  // and not only to the clock. Tile size is not a pure speed knob here --
+  // it decides what each tile's attention can see -- so a faster arm is
+  // only interesting alongside what it changed.
+  if (const char* dp = std::getenv("VPIPE_MINIMAX_H3_VVAE_BENCH_DUMP")) {
+    std::FILE* f = std::fopen(dp, "wb");
+    if (f != nullptr) {
+      const auto* d = static_cast<const std::uint16_t*>(out.contents());
+      const std::size_t n = out.byte_size() / 2;
+      std::vector<float> v(n);
+      for (std::size_t k = 0; k < n; ++k) { v[k] = bf16_to_f32_(d[k]); }
+      std::fwrite(v.data(), 4, n, f);
+      std::fclose(f);
+      std::printf("[minimax_h3_vvae] dumped %zu floats to %s\n", n, dp);
+    }
+  }
+  std::printf("[minimax_h3_vvae] decode %dx%dx%d latent -> %d frames of "
+              "%dx%d in %.0f ms (%.1f ms/frame, tile %d)\n",
+              LT, lh, lw, frames, lw * cfg.patch, lh * cfg.patch, ms,
+              ms / (double)frames, cfg.tile_size);
+  EXPECT_TRUE(ms > 0.0);
 }

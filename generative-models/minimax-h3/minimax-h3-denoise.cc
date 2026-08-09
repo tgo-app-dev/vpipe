@@ -66,6 +66,12 @@ denoise(const DenoiseRequest& req, std::string* err)
 
   MiniMaxH3Scheduler sv(req.video_shift);
   MiniMaxH3Scheduler sa(req.audio_shift);
+  // `res_multistep` -- the second-order sampler the reference template
+  // ships -- against the first-order Euler this loop has always used.
+  // Under measurement rather than default-on: it changes BOTH modalities'
+  // output, and the video at 4 steps is already good.
+  const bool res_ms = std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
+  std::vector<float> vprev, aprev;
   if (!sv.set_timesteps(req.num_steps) || !sa.set_timesteps(req.num_steps)) {
     return fail("denoise: bad step count " + std::to_string(req.num_steps));
   }
@@ -143,6 +149,7 @@ denoise(const DenoiseRequest& req, std::string* err)
     // between, and it would do it gradually enough to look like a weak
     // conditioning rather than a bug.
     double vrms = 0.0, arms = 0.0, xrms = 0.0, vxcorr = 0.0;
+    double xarms = 0.0, axcorr = 0.0;
     {
       const auto* g = static_cast<const std::uint16_t*>(v.video.contents());
       std::vector<float> vel((std::size_t)nvid * PE);
@@ -167,8 +174,11 @@ denoise(const DenoiseRequest& req, std::string* err)
         const double den = std::sqrt(sxx) * std::sqrt((double)vel.size()) * vrms;
         vxcorr = den > 0.0 ? sxy / den : 0.0;
       }
-      if (!sv.step(vel.data(), i, req.video + (std::size_t)ncond * PE,
-                   vel.size())) {
+      float* vx = req.video + (std::size_t)ncond * PE;
+      const bool vok =
+          res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
+                 : sv.step(vel.data(), i, vx, vel.size());
+      if (!vok) {
         return fail("denoise: video step " + std::to_string(i) + " failed");
       }
       const float* x = req.video + (std::size_t)ncond * PE;
@@ -185,9 +195,34 @@ denoise(const DenoiseRequest& req, std::string* err)
         arms += (double)vel[k] * (double)vel[k];
       }
       arms = vel.empty() ? 0.0 : std::sqrt(arms / (double)vel.size());
-      if (!sa.step(vel.data(), i, req.audio, vel.size())) {
+      // The SAME correlation the video branch takes, for the same
+      // reason. Without it the audio trace is |v| alone, and |v| ~ 1 is
+      // exactly what both a working branch and a dead one produce -- a
+      // network echoing a scaled copy of its input reads as a healthy
+      // magnitude and lands at corr near -1, whereupon x0 = x + sigma*v
+      // is just a rescaling of the input noise. Video had this from the
+      // start; audio going without is why "video fine, audio noise"
+      // could be traced this far without the trace saying anything.
+      {
+        double sxy = 0.0, sxx = 0.0;
+        for (std::size_t k = 0; k < vel.size(); ++k) {
+          sxy += (double)vel[k] * (double)req.audio[k];
+          sxx += (double)req.audio[k] * (double)req.audio[k];
+        }
+        const double den =
+            std::sqrt(sxx) * std::sqrt((double)vel.size()) * arms;
+        axcorr = den > 0.0 ? sxy / den : 0.0;
+      }
+      const bool aok =
+          res_ms ? sa.step_res(vel.data(), i, req.audio, vel.size(), &aprev)
+                 : sa.step(vel.data(), i, req.audio, vel.size());
+      if (!aok) {
         return fail("denoise: audio step " + std::to_string(i) + " failed");
       }
+      for (std::size_t k = 0; k < vel.size(); ++k) {
+        xarms += (double)req.audio[k] * (double)req.audio[k];
+      }
+      xarms = vel.empty() ? 0.0 : std::sqrt(xarms / (double)vel.size());
     }
 
     // Per-step trace. Timing alone cannot separate "the GPU work never
@@ -204,11 +239,12 @@ denoise(const DenoiseRequest& req, std::string* err)
           std::chrono::duration<double, std::milli>(t_end - t_fwd0).count();
       sess->info(fmt(
           "h3-denoise step {:2}/{}  sigma {:.4f} -> {:.4f}  fwd {:7.1f} ms  "
-          "total {:7.1f} ms  |v_vid| {:.5f}  |v_aud| {:.5f}  |x_vid| {:.5f}  "
-          "corr(v,x) {:+.5f}",
+          "total {:7.1f} ms  |v_vid| {:.5f}  |x_vid| {:.5f} "
+          "corr_vid {:+.5f}  |  |v_aud| {:.5f}  |x_aud| {:.5f} "
+          "corr_aud {:+.5f}",
           i + 1, steps, sv.sigmas()[(std::size_t)i],
-          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, vrms, arms, xrms,
-          vxcorr));
+          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, vrms, xrms,
+          vxcorr, arms, xarms, axcorr));
     }
 
     if (req.progress && !req.progress(i + 1, steps)) { break; }

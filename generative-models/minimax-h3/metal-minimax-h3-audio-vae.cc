@@ -423,7 +423,15 @@ MetalMiniMaxH3AudioVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     // released rates pair with kernels (9 for 5, 4 for 2) that no simple
     // rule reproduces, and guessing wrong changes the output LENGTH
     // rather than failing to load.
+    // `.weight_v` only exists while the weight-norm parametrization is
+    // still split (g, v); a checkpoint that has FOLDED it -- Comfy-Org's
+    // repack of this component, and anything else exported after a
+    // remove_weight_norm() -- carries the product as a plain `.weight`.
+    // conv1d_ below already tries both, and this probe reading only the
+    // parametrized name is what made a perfectly loadable audio VAE
+    // report itself missing: the shape it wants is present either way.
     const auto* ui = ws.src().info(un + ".weight_v");
+    if (ui == nullptr) { ui = ws.src().info(un + ".weight"); }
     if (ui == nullptr || ui->shape.size() != 3) { return nullptr; }
     const int k = (int)ui->shape[2];
     m->_cfg.up_kernels[(std::size_t)i] = k;

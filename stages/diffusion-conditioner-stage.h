@@ -15,6 +15,7 @@
 #include "generative-models/mage/mage-screen.h"
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/wan/metal-umt5-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"

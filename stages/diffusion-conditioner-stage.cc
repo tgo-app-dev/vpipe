@@ -46,7 +46,8 @@ const ConfigKey kAttrs[] = {
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit"},
+       "boogu-image,boogu-image-edit,"
+       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
           "oport1 -- a GROUNDED encode of the (possibly empty) negative prompt "
@@ -877,11 +878,25 @@ DiffusionConditionerStage::declare_resources() const
   // directory that turns out to be empty is harmless (0 bytes).
   const std::string mllm = (fs::path(root) / "mllm").string();
   std::error_code ec;
-  const std::string enc = fs::exists(mllm, ec)
-                              ? mllm
-                              : (fs::path(root) / "text_encoder").string();
-  return model_memory::weight_claims(
-      {enc, (fs::path(root) / "transformer").string()});
+  std::string enc = fs::exists(mllm, ec)
+                        ? mllm
+                        : (fs::path(root) / "text_encoder").string();
+  std::string dit = (fs::path(root) / "transformer").string();
+  // A Comfy-Org repack spells neither of those. Resolving both here is not
+  // cosmetic: this claim is what the resource-planning phase sizes every
+  // peer against, and a component that resolves to nothing is declared as
+  // 0 bytes -- the silent under-count the phase exists to prevent.
+  if (!fs::exists(enc, ec)) {
+    const std::string e =
+        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+    if (!e.empty() && e != root) { enc = e; }
+  }
+  if (!fs::exists(dit, ec)) {
+    const std::string d =
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+    if (!d.empty() && d != root) { dit = d; }
+  }
+  return model_memory::weight_claims({enc, dit});
 }
 
 Job
@@ -928,11 +943,33 @@ DiffusionConditionerStage::ensure_loaded_()
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
   _family = family_((std::filesystem::path(root) / "transformer").string());
+  // `transformer/` is the DIFFUSERS spelling, and MiniMax-H3 also ships as
+  // a Comfy-Org repack whose DiT is one .safetensors under
+  // `diffusion_models/` (or, after model-quantize, a directory checkpoint
+  // there). On such a root the read above finds nothing and falls through
+  // to the "krea2" default, which then looks for a Qwen3-VL 4B that is not
+  // there. Ask H3's own reader, which resolves every layout and refuses a
+  // checkpoint that is not H3.
+  if (_family != "minimax-h3") {
+    genai::MetalMiniMaxH3Transformer::Config probe;
+    if (genai::MetalMiniMaxH3Transformer::config_from_json(root, probe,
+                                                           nullptr)) {
+      _family = "minimax-h3";
+    }
+  }
   // Boogu names its text encoder `mllm/` (it is a full multimodal LLM, not a
   // text_encoder in the diffusers sense); every other family uses
   // text_encoder/.
   _enc_dir = (std::filesystem::path(root) /
               (_family == "boogu-image" ? "mllm" : "text_encoder")).string();
+  if (_family == "minimax-h3") {
+    // `text_encoders/` on a repack, `text_encoder/` on a diffusers tree,
+    // and a directory checkpoint in either once quantized -- one resolver
+    // for all of them.
+    const std::string enc =
+        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+    if (!enc.empty() && enc != root) { _enc_dir = enc; }
+  }
 
   namespace fs = std::filesystem;
   std::string tok_path = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
@@ -971,8 +1008,21 @@ DiffusionConditionerStage::ensure_loaded_()
   // DECISION itself is deferred to the first process() -- see
   // resolve_unload_policy_().
   _root_dir  = root;
-  _peer_dirs = {_enc_dir,
-                (std::filesystem::path(root) / "transformer").string()};
+  // `transformer/` is the diffusers spelling. A Comfy-Org repack keeps its
+  // DiT under `diffusion_models/`, so naming only the former left the DiT
+  // contributing ZERO to the footprint this decision sizes against -- and
+  // a decision that cannot see the largest peer in the graph always says
+  // there is room.
+  std::string dit = (std::filesystem::path(root) / "transformer").string();
+  {
+    std::error_code ec;
+    if (!std::filesystem::exists(dit, ec)) {
+      const std::string d =
+          genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+      if (!d.empty() && d != root) { dit = d; }
+    }
+  }
+  _peer_dirs = {_enc_dir, dit};
 }
 
 // Decided at the FIRST process(), not at load, because process() runs
@@ -2032,9 +2082,6 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr) { co_return; }
 
-  // Post-barrier: every peer has loaded, so the footprint is real.
-  resolve_unload_policy_();
-
   // Latch the shared model (iport2) once -- a model-select source overrides the
   // hf_dir config -- then lazily load the encoder before we need it.
   if (!_model_latched && ctx.num_iports() > kModelPort &&
@@ -2048,17 +2095,30 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
       }
     }
   }
-  // A previous prompt may have dropped the encoder to leave the DiT room; bring
-  // it back before anything needs it. Done before the "loaded?" gate so an
-  // unloaded stage is not mistaken for an inert one.
-  //
   // The wan family's tower is _umt5, not _encoder (a umT5 ENCODER rather
   // than a decoder-only LM), so both members have to be consulted --
   // testing only _encoder made a loaded wan conditioner look inert.
   const bool have_enc =
       _encoder != nullptr || _umt5 != nullptr || _h3_enc != nullptr;
-  if (_unloaded && !have_enc) { reload_encoder_(); }
-  if (_encoder == nullptr && _umt5 == nullptr && _h3_enc == nullptr) {
+  // Post-barrier AND post-load: only here are both `_peer_dirs` and the
+  // peers' resident bytes real.
+  //
+  // This used to run at the top of process(), which read as "after the
+  // init barrier, so the footprint is real" and was not: `_peer_dirs` is
+  // filled by ensure_loaded_(), which for a model-select graph runs LATER
+  // IN THIS SAME CALL. So the first resolution sized against an EMPTY dir
+  // list, measured a footprint of ~0, concluded the box was roomy, and
+  // latched that answer for the life of the stage. On a 16 GB box running
+  // MiniMax-H3 that kept ~8 GB of pinned Qwen3-VL-32B resident through a
+  // 33B denoise the encoder takes no part in, and the DiT's forward was
+  // refused for want of working set.
+  resolve_unload_policy_();
+  // NOTE: an unloaded encoder is NOT reloaded here. The reload waits until
+  // a prompt has actually been read -- see below. `_unloaded` is what
+  // distinguishes "dropped on purpose, reloadable" from genuinely inert,
+  // so the gate consults it rather than treating an absent encoder as
+  // proof of nothing to do.
+  if (!have_enc && !_unloaded) {
     // Inert: consume the prompt rather than returning immediately. A
     // process() that neither blocks nor signals done is re-invoked at
     // once, and the stage then spins a core for the life of the pipeline
@@ -2122,6 +2182,24 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   if (fp == nullptr) { co_return; }
   const std::string prompt = flex_text_(fp->data);
   if (prompt.empty()) { co_return; }
+
+  // ONLY NOW is the encoder worth having again.
+  //
+  // A previous prompt may have dropped it to leave the DiT room. The
+  // reload used to sit above the read, which meant the LAST process() of
+  // a run -- the one that exists only to observe EOS -- brought the whole
+  // encoder back to discover there was nothing to do. On MiniMax-H3 that
+  // put a streaming Qwen3-VL-32B (~1.5 GB pinned, and the disk traffic to
+  // rebuild it) back alongside a 33B denoise that had just been given
+  // room by dropping it. Reading first costs nothing: the beat is already
+  // in hand, and a null one returns above without touching the encoder.
+  if (_unloaded) { reload_encoder_(); }
+  if (_encoder == nullptr && _umt5 == nullptr && _h3_enc == nullptr) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): the encoder could not be reloaded; "
+        "dropping this prompt", this->id()));
+    co_return;
+  }
 
   // Vision tokens (QIE + ref image) -- shared by the positive + negative encode.
   int n_img = 0;

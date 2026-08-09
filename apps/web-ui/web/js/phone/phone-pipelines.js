@@ -377,38 +377,70 @@ export function mountPhonePipelines({ body, actions, setTitle }) {
       return;
     }
     const fields = [];
+    // Auto-apply, as on the desktop: a field that has fully determined
+    // its value (a blur after an edit, a tri-state flip, a picked path or
+    // model) re-PUTs the whole config without waiting for the button.
+    // Self-gates on canEdit(), so a pipeline that started while the form
+    // was open never hot-applies -- there the button stays the deliberate
+    // trigger.
+    //
+    // It applies WITHOUT rebuilding the rows. A rebuild re-expands the
+    // stage and rebuilds the form, which on a phone means the field the
+    // user just moved on to is destroyed under the soft keyboard. The
+    // row's config_error badge is then stale, and that is what
+    // collapse()'s deferred redraw is for: it already rebuilds when the
+    // key has moved, so closing the block picks the change up.
+    const commit = () => {
+      if (canEdit()) { applyCfg(node, fields, { rebuild: false }); }
+    };
     for (const f of schema) {
-      const built = configField(f, { readOnly: !editable,
-                                     stageType: node.type });
+      const built = configField(f, {
+        readOnly: !editable,
+        stageType: node.type,
+        onCommit: editable ? commit : null,
+        // The other fields of THIS form, for the model picker's
+        // parent-compatibility filter. `fields` is captured empty and
+        // filled by the loop below -- it is fully populated long before
+        // anything can be tapped.
+        peerValues: () => fields
+          .filter((x) => x.key !== f.key)
+          .map((x) => x.value())
+          .filter(Boolean),
+      });
       fields.push(built);
       host.append(built.el);
     }
     if (!editable) { return; }
+    // Still worth a button: the JSON textareas (array/object/any) have no
+    // blur-commit, so this is the only way to apply one.
     const applyBtn = el('button', { class: 'btn primary ph-apply' },
       t('common.apply'));
     applyBtn.addEventListener('click', async () => {
-      let cfg;
-      try { cfg = readConfig(fields); }
-      catch (e) { toast(e.message, 'error'); return; }
       applyBtn.disabled = true;
-      try {
-        state.detail = await api.setStageConfig(
-          state.selectedId, node.id, cfg);
-        toast(t('phone.cfg_applied', { id: node.id }), 'ok');
-        // A stage's config_error can appear or clear on apply, and the
-        // row shows it -- so redraw from the response rather than trust
-        // the pre-apply copy. The rebuild re-expands this stage, which
-        // also re-seeds every present/unset flag from what the stage
-        // actually kept (a value it rejected must not read back as set).
-        renderChrome();
-        renderRows();
-      } catch (e) {
-        toast(t('phone.cfg_apply_failed', { msg: e.message }), 'error');
-      } finally {
-        applyBtn.disabled = false;
-      }
+      try { await applyCfg(node, fields, { rebuild: true }); }
+      finally { applyBtn.disabled = false; }
     });
     host.append(applyBtn);
+  }
+
+  // PUT the whole form. `rebuild` redraws the rows from the response --
+  // a stage's config_error can appear or clear on apply and the row shows
+  // it, and the rebuild also re-seeds every present/unset flag from what
+  // the stage actually KEPT (a value it rejected must not read back as
+  // set). The auto-apply path passes false and leaves that to collapse().
+  async function applyCfg(node, fields, opts) {
+    const rebuild = !(opts && opts.rebuild === false);
+    let cfg;
+    try { cfg = readConfig(fields); }
+    catch (e) { toast(e.message, 'error'); return; }
+    try {
+      state.detail = await api.setStageConfig(state.selectedId, node.id, cfg);
+      toast(t('phone.cfg_applied', { id: node.id }), 'ok');
+      renderChrome();
+      if (rebuild) { renderRows(); }
+    } catch (e) {
+      toast(t('phone.cfg_apply_failed', { msg: e.message }), 'error');
+    }
   }
 
   // ---- lifecycle ------------------------------------------------------

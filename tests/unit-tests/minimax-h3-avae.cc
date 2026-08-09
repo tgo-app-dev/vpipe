@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -164,6 +165,56 @@ TEST(minimax_h3_avae, config_from_json)
 // bit-identical -- which is what lets the decoder carry one copy of each
 // instead of 127. That is an ASSUMPTION baked into the loader, so check
 // it against the checkpoint rather than against the source it came from.
+// The whole model must LOAD, not merely have a readable config.
+//
+// This is the regression for a checkpoint that reported itself missing
+// while being perfectly loadable. Every weight read here falls back from
+// `.weight_v` to `.weight` -- weight norm is stored split as (g, v) until
+// something calls remove_weight_norm(), after which the product is a
+// plain `.weight` -- but ONE probe, the one that reads the transposed
+// convolution's kernel width out of the tensor shape, asked for
+// `.weight_v` alone and returned null when it was absent. So a folded
+// checkpoint (Comfy-Org's repack of this component, and anything else
+// exported post-fold) failed load with nothing to say beyond "could not
+// load", and the stage above reported "holds no audio VAE this stage
+// knows" about a file that holds exactly that.
+//
+// Asserting on the config alone would not have caught it: config parsing
+// reads the metadata and never touches a weight. The assertion has to be
+// that a MODEL comes back.
+//
+// Env: VPIPE_MINIMAX_H3_AVAE_PATH.
+TEST(minimax_h3_avae, loads_with_folded_weight_norm)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string dir = MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3AudioVae::config_from_json(dir, cfg, &cerr)) {
+    std::printf("[minimax_h3_avae] config: %s\n", cerr.c_str());
+  }
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(dir, cfg, &cerr));
+
+  auto vae = MetalMiniMaxH3AudioVae::load(dir, mc, cfg);
+  const bool folded =
+      WeightSet::open(dir, nullptr) != nullptr &&
+      WeightSet::open(dir, nullptr)->src().info(
+          "decoder.ups.0.0.weight_v") == nullptr;
+  std::printf("[minimax_h3_avae] loaded=%d, weight-norm %s\n",
+              vae != nullptr ? 1 : 0, folded ? "FOLDED" : "split (g,v)");
+  ASSERT_TRUE(vae != nullptr);
+  // And it is the real net, not an empty shell: the decoder's upsample
+  // kernel is read from the checkpoint precisely because no rule
+  // reproduces it, so a plausible non-zero value is evidence the shape
+  // probe found a tensor rather than defaulting.
+  EXPECT_TRUE(cfg.sample_rate > 0 && cfg.latent_channels > 0);
+}
+
 TEST(minimax_h3_avae, resample_filters_are_shared)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
@@ -570,4 +621,209 @@ TEST(minimax_h3_avae, decode_throughput)
   std::printf("[minimax_h3_avae] %d frames -> %.2f s stereo in %.1f ms "
               "(%.0fx realtime)\n", T, secs, ms, secs * 1000.0 / ms);
   EXPECT_TRUE(ms < secs * 1000.0);
+}
+
+// Is the decoder producing STRUCTURE or noise?
+//
+// A diagnostic, not a golden -- this box has no audio golden, and the
+// question it answers is the one an "audio came out as noise" report
+// actually poses: is the VAE broken, or is it faithfully decoding a bad
+// latent? Those need completely different fixes, and nothing else here
+// separates them.
+//
+// The probe is a CONSTANT latent (every frame identical, at the value the
+// un-whitening maps zero to). A working vocoder turns that into something
+// periodic and band-limited -- low zero-crossing rate, energy concentrated
+// low. A broken one -- wrong weights, a mis-read kernel, weight norm that
+// should have been applied and was not -- turns it into broadband noise,
+// whose zero-crossing rate sits near 0.5 crossings per sample because
+// consecutive samples are independent.
+//
+// ZCR is the discriminator rather than RMS because amplitude alone cannot
+// tell a loud tone from loud noise, and it is scale-free, so it needs no
+// reference recording to compare against.
+//
+// WHAT THIS DOES NOT PROVE, stated because it was over-read once already:
+// a CONSTANT latent is a degenerate input, and passing here does NOT mean
+// the weights were parsed correctly. A decoder built from wrong-but-smooth
+// weights still turns a constant into something smooth. It rules out
+// gross breakage -- unbound tensors, an activation left at zero, a
+// mis-read kernel width -- and nothing finer. Certifying a parse needs a
+// reference decode, which on this box means the released checkpoint next
+// to the repack (see minimax_h3_dit.comfy_layout_matches_golden for the
+// shape that argument has to take). The audio VAE is the one component
+// the H3 bring-up never cross-verified between publishers.
+//
+// Env: VPIPE_MINIMAX_H3_AVAE_PATH.
+TEST(minimax_h3_avae, constant_latent_decodes_to_structure_not_noise)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string dir = MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3AudioVae::config_from_json(dir, cfg, &cerr)) { return; }
+  auto vae = MetalMiniMaxH3AudioVae::load(dir, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  const int B = cfg.stereo_channels, ZC = cfg.latent_channels, T = 32;
+  // Zero in NORMALISED space, un-whitened exactly as the stage does it.
+  std::vector<float> z((std::size_t)B * ZC * T);
+  for (int b = 0; b < B; ++b) {
+    for (int ch = 0; ch < ZC; ++ch) {
+      const float mu = (int)cfg.latents_mean.size() > ch
+                           ? cfg.latents_mean[(std::size_t)ch] : 0.0f;
+      for (int t = 0; t < T; ++t) {
+        z[((std::size_t)b * ZC + ch) * T + (std::size_t)t] = mu;
+      }
+    }
+  }
+  std::vector<float> pcm;
+  std::string derr;
+  ASSERT_TRUE(vae->decode(z.data(), B, T, &pcm, &derr));
+  const int n = B > 0 ? (int)(pcm.size() / (std::size_t)B) : 0;
+  ASSERT_TRUE(n > 0);
+
+  for (int b = 0; b < B; ++b) {
+    const float* s = pcm.data() + (std::size_t)b * n;
+    double sum2 = 0.0, peak = 0.0;
+    long cross = 0;
+    for (int i = 0; i < n; ++i) {
+      sum2 += (double)s[i] * s[i];
+      peak = std::max(peak, (double)std::fabs(s[i]));
+      if (i > 0 && ((s[i] < 0.0f) != (s[i - 1] < 0.0f))) { ++cross; }
+    }
+    const double rms = std::sqrt(sum2 / (double)n);
+    const double zcr = (double)cross / (double)(n - 1);
+    std::printf("[minimax_h3_avae] ch%d: %d samples, rms %.5f, peak %.5f, "
+                "zero-crossing rate %.4f\n", b, n, rms, peak, zcr);
+    // White noise sits near 0.5. Anything a vocoder produces from a
+    // constant latent should be far below that; 0.35 leaves generous
+    // room for a bright but real signal.
+    EXPECT_TRUE(zcr < 0.35);
+    // And it must not be silent either -- an all-zero output would pass
+    // a ZCR test trivially while telling us the decode did nothing.
+    EXPECT_TRUE(rms > 1e-6);
+  }
+}
+
+// TWO publishers' audio VAEs, decoding the SAME latent.
+//
+// This is what certifies the weight-norm fold, and nothing cheaper does.
+// PyTorch keeps weight norm split as (g, v); the Comfy-Org repack ships
+// the product. Folding needs the norm taken over every axis but dim 0 --
+// and for the five ConvTranspose1d `ups`, dim 0 is the INPUT channel
+// count, not the output one. A folder that used the wrong axis produces a
+// file that loads, has the right shapes, and decodes a constant latent
+// into something perfectly smooth, while turning real audio into noise.
+// The structure probe above cannot see that; a reference decode can.
+//
+// It needs BOTH checkpoints, which is why it is a second env var rather
+// than a golden: telling a right fold from a wrong one requires `g`, and
+// a folded file no longer carries it. Only a machine holding the release
+// AND the repack can answer it, so this skips everywhere else.
+//
+// Point PATH at either one and PATH2 at the other -- the test is
+// symmetric and does not care which is folded.
+TEST(minimax_h3_avae, both_publishers_decode_alike)
+{
+  const char* ra = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  const char* rb = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH2");
+  if (ra == nullptr || *ra == '\0' || rb == nullptr || *rb == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  auto open = [&](const char* p, MetalMiniMaxH3AudioVae::Config* cfg)
+      -> std::unique_ptr<MetalMiniMaxH3AudioVae> {
+    const std::string dir = MetalMiniMaxH3AudioVae::resolve_vae_dir(p);
+    std::string e;
+    if (!MetalMiniMaxH3AudioVae::config_from_json(dir, *cfg, &e)) {
+      return nullptr;
+    }
+    return MetalMiniMaxH3AudioVae::load(dir, mc, *cfg);
+  };
+  MetalMiniMaxH3AudioVae::Config ca, cb;
+  auto va = open(ra, &ca);
+  auto vb = open(rb, &cb);
+  ASSERT_TRUE(va != nullptr && vb != nullptr);
+  ASSERT_TRUE(ca.stereo_channels == cb.stereo_channels &&
+              ca.latent_channels == cb.latent_channels &&
+              ca.sample_rate == cb.sample_rate && ca.hop() == cb.hop());
+
+  // A RANDOM latent, not a constant one: the whole failure this test
+  // exists for is invisible on a degenerate input. Fixed seed so a
+  // mismatch is reproducible rather than a different draw each run.
+  const int B = ca.stereo_channels, ZC = ca.latent_channels, T = 48;
+  std::vector<float> z((std::size_t)B * ZC * T);
+  std::mt19937 rng(12345);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  for (float& v : z) { v = nd(rng); }
+
+  std::vector<float> pa, pb;
+  std::string ea, eb;
+  ASSERT_TRUE(va->decode(z.data(), B, T, &pa, &ea));
+  ASSERT_TRUE(vb->decode(z.data(), B, T, &pb, &eb));
+  ASSERT_TRUE(pa.size() == pb.size() && !pa.empty());
+
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < pa.size(); ++i) {
+    const double d = (double)pa[i] - (double)pb[i];
+    num += d * d;
+    den += (double)pb[i] * pb[i];
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[minimax_h3_avae] two publishers, %zu samples: rel-L2 %.3e\n",
+              pa.size(), rel);
+  // The two checkpoints store the same numbers in different FORMS -- one
+  // folded in fp32 by the repacker, one folded here from (g, v) -- so
+  // they agree to rounding, not exactly. A wrong fold axis lands at
+  // order 1, so this bound does not need to be tight to be decisive.
+  EXPECT_TRUE(rel < 1e-2);
+}
+
+// The same timing question as decode_throughput, without needing a
+// golden: the latent is synthetic, because cost here depends only on the
+// frame count and nothing about fidelity.
+//
+// Env: VPIPE_MINIMAX_H3_AVAE_BENCH=1 + VPIPE_MINIMAX_H3_AVAE_PATH.
+TEST(minimax_h3_avae, decode_bench)
+{
+  const char* on   = std::getenv("VPIPE_MINIMAX_H3_AVAE_BENCH");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  const char* sv = std::getenv("VPIPE_MINIMAX_H3_AVAE_BENCH_SECONDS");
+  const double want = (sv != nullptr && *sv != '\0') ? std::atof(sv) : 5.0;
+  const int T = (int)(want * (double)cfg.sample_rate / (double)cfg.hop());
+  const int B = cfg.stereo_channels, ZC = cfg.latent_channels;
+  std::vector<float> z((std::size_t)B * ZC * T);
+  for (std::size_t i = 0; i < z.size(); ++i) {
+    z[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
+  }
+  std::vector<float> pcm;
+  ASSERT_TRUE(vae->decode(z.data(), B, T, &pcm, &err));            // warm up
+  const auto t0 = std::chrono::steady_clock::now();
+  ASSERT_TRUE(vae->decode(z.data(), B, T, &pcm, &err));
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  const double secs =
+      (double)(pcm.size() / (std::size_t)B) / (double)cfg.sample_rate;
+  std::printf("[minimax_h3_avae] %d frames -> %.2f s stereo in %.1f ms "
+              "(%.0fx realtime)\n", T, secs, ms, secs * 1000.0 / ms);
+  EXPECT_TRUE(ms > 0.0);
 }

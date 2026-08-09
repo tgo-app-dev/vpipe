@@ -141,7 +141,8 @@ const ConfigKey kAttrs[] = {
           "conditioning image followed by that many minus one BLANK frames "
           "-- not of the image alone, because the VAE's temporal convolutions "
           "mix neighbouring frames, so a 1-frame encode is a different tensor. "
-          "MUST match the generate-video stage's `frames`",
+          "MUST match the generate-video stage's `frames`; both round UP the "
+          "same way, so giving them the same number is enough",
    .def_int = 81},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
@@ -149,7 +150,8 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit"},
+       "boogu-image,boogu-image-edit,"
+       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
    .doc = "letterbox-resize the input to this width before encoding (multiple "
           "of 8; requires target_height). 0/unset = encode at native size"},
@@ -981,12 +983,22 @@ VaeEncodeStage::process(RuntimeContext& ctx)
           sH));
       co_return;
     }
-    if ((_frames % 4) != 1 || _frames <= 0) {
-      session()->warn(fmt(
-          "VaeEncodeStage('{}'): frames {} is not 4k+1; the video VAE "
-          "compresses time in 4-frame chunks after a 1-frame first chunk, so "
-          "use 81, 121, ...; skipping", this->id(), _frames));
-      co_return;
+    // Round UP to what the chunking can represent, the same rule and the
+    // same one line of arithmetic generate-video applies. Both stages have
+    // to reach the SAME number: this clip's latent is concatenated
+    // channel-wise onto a noise latent shaped from the DiT stage's own
+    // `frames`, so if only one of them rounded, i2v would degrade to t2v
+    // on a shape mismatch -- with a warning about the latent, naming
+    // neither the frame count nor the stage that changed it.
+    {
+      const int aligned = genai::MetalWanVae::align_num_frames(_frames);
+      if (aligned != _frames) {
+        session()->info(fmt(
+            "VaeEncodeStage('{}'): frames {} -> {}, the nearest count the "
+            "wan VAE can chunk; the generate-video stage rounds the same "
+            "way", this->id(), _frames, aligned));
+        _frames = aligned;
+      }
     }
     auto* mc = session()->services()->metal_compute();
     const auto img = tbp->materialize_contiguous();

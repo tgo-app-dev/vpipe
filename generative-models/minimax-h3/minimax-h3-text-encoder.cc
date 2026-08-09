@@ -115,6 +115,14 @@ MiniMaxH3TextEncoder::resolve_encoder_dir(const std::string& path)
     if (!f.empty()) { return f; }
   }
   if (!fs::is_directory(p)) { return path; }
+  // A QUANTIZED repack: model-quantize keeps the repack's role subdirs and
+  // writes the quantized component as a directory checkpoint inside its own,
+  // so `text_encoders/` holds config.json + shards rather than one
+  // .safetensors. A source repo has no config.json there, so this and the
+  // repack probe above never both match.
+  if (fs::exists(p / "text_encoders" / "config.json")) {
+    return (p / "text_encoders").string();
+  }
   if (fs::exists(p / "config.json") &&
       (fs::exists(p / "model.safetensors.index.json") ||
        fs::exists(p / "model.safetensors"))) {

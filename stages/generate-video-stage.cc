@@ -36,18 +36,21 @@ namespace {
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
-   .doc = "Wan model root (transformer/, transformer_2/, vae/, text_encoder/). "
-          "OPTIONAL: a model-select source on the model iport overrides it",
+   .doc = "video model root -- Wan (transformer/, transformer_2/, vae/, "
+          "text_encoder/) or a MiniMax-H3 repack (diffusion_models/, vae/, "
+          "audio_vae/, text_encoders/). OPTIONAL: a model-select source on "
+          "the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "wan-i2v,wan-t2v"},
+   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va"},
   {.key = "height", .type = ConfigType::Int, .required = false,
    .doc = "video height in pixels; a multiple of 16 (the VAE's 8x times the "
           "DiT's 2x patch)", .def_int = 480},
   {.key = "width", .type = ConfigType::Int, .required = false,
    .doc = "video width in pixels; a multiple of 16", .def_int = 832},
   {.key = "frames", .type = ConfigType::Int, .required = false,
-   .doc = "video frames. F % 4 == 1 (81, 121, ...) because the VAE's temporal "
-          "chunking makes the first frame its own chunk", .def_int = 81},
+   .doc = "video frames. Rounded UP to the nearest count the resident "
+          "model's VAE can chunk, which differs per family, so any positive "
+          "number is accepted here", .def_int = 81},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on the emitted latent, for the decoder and the "
           "encoder downstream of it", .def_real = 16.0},
@@ -208,20 +211,19 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                     "(the VAE's 8x downsample times the DiT's 2x patch)",
                     _height, _width));
   }
-  // The frame count is not a rounding convenience -- a count the VAE
-  // cannot chunk has no latent representation at all -- but the rule is
-  // PER FAMILY and the family is only known once the checkpoint's
-  // config.json is read, which happens after this constructor. Wan
-  // compresses in 4-frame chunks after a 1-frame first chunk (4k+1);
-  // MiniMax-H3 uses a 17-frame clip keeping 5 latents (17n+5, i.e. 5,
-  // 22, 39, 56, ... -- `align_num_frames(n, 17, 5)`). So reject only what
-  // NEITHER family can represent here, and let the H3 path below enforce
-  // its own rule exactly once it knows it is H3.
-  if ((_frames % 4) != 1 && (_frames % 17) != 5) {
-    fail_config(fmt("frames {} has no latent representation: wan needs 4k+1 "
-                    "(81, 121, ...) and minimax-h3 needs 17n+5 (22, 39, 56, "
-                    "..., 124)", _frames));
-  }
+  // The frame count is NOT validated here, deliberately. A count the VAE
+  // cannot chunk has no latent representation -- but the rule is PER
+  // FAMILY (wan compresses in 4-frame chunks after a 1-frame first chunk,
+  // 4k+1; MiniMax-H3 takes 17-frame clips keeping 5 latents, 17n+5) and
+  // the family is only known once the checkpoint is read, which happens
+  // after this constructor. So resolve_config_ rounds UP to the resident
+  // family's rule instead, and any positive count is accepted.
+  //
+  // Rounding rather than rejecting because the two rules share almost no
+  // legal counts -- 81 is fine for wan and impossible for H3, 56 the
+  // reverse -- so a graph that names one family's number could not change
+  // checkpoints without also being re-authored, which is exactly what
+  // being family-generic is supposed to buy.
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -261,6 +263,23 @@ GenerateVideoStage::latent_frames() const noexcept
   return _frames > 0 ? 1 + (_frames - 1) / 4 : 0;
 }
 
+void
+GenerateVideoStage::align_frames_(int aligned)
+{
+  if (aligned <= 0 || aligned == _frames) { return; }
+  // SAY SO. The clip that comes back is longer than the one that was
+  // asked for, its duration at `fps` is longer to match, and a graph
+  // downstream that assumed the configured count would otherwise find out
+  // by way of a shape it did not expect. One line naming both numbers is
+  // cheaper than that, and it is info rather than a warning because
+  // rounding is the designed behaviour, not a problem being tolerated.
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): frames {} -> {}, the nearest count at or "
+      "above it that the {} VAE can chunk", this->id(), _frames, aligned,
+      _family));
+  _frames = aligned;
+}
+
 std::vector<ResourceClaim>
 GenerateVideoStage::declare_resources() const
 {
@@ -271,7 +290,17 @@ GenerateVideoStage::declare_resources() const
   // ONE expert, not both. The stage holds exactly one at a time, so
   // claiming the pair would size every peer against a peak that never
   // occurs and push them all into streaming for nothing.
-  return model_memory::weight_claims({(fs::path(root) / "transformer").string()});
+  //
+  // Through the DiT resolver, because this runs BEFORE resolve_config_ and
+  // so before the family is known -- and a repack spells its DiT
+  // `diffusion_models/`, not `transformer/`. Claiming a path that does not
+  // exist is not a harmless miss: this is the declaration every peer sizes
+  // itself against, so a 24 GB DiT reported as 0 bytes is exactly the
+  // silent under-count the resource-planning phase exists to prevent.
+  // Falls back to the diffusers spelling when nothing resolves.
+  std::string dit = genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  return model_memory::weight_claims({dit});
 #else
   return {};
 #endif
@@ -301,59 +330,34 @@ GenerateVideoStage::resolve_config_()
   // The DiT's own `_class_name` picks the family. Reading it here rather
   // than taking it from config keeps a graph from having to be rewired
   // to change checkpoints -- the same stage, ports and keys serve both.
-  {
-    std::ifstream tin(fs::path(t1) / "config.json");
-    if (tin) {
-      FlexData tc;
-      try {
-        tc = FlexData::from_json(tin);
-      } catch (...) {
-        tc = FlexData::make_null();
-      }
-      if (tc.is_object()) {
-        auto o = tc.as_object();
-        const std::string cls(o.contains("_class_name")
-                                  ? o.at("_class_name").as_string("")
-                                  : "");
-        if (cls == "MiniMaxH3DiTModel") { _family = "minimax-h3"; }
-      }
-    }
+  //
+  // H3 is asked FIRST, and through its own reader rather than by opening
+  // `transformer/config.json`, because that spelling is a diffusers one
+  // and this family also ships as a Comfy-Org repack -- one .safetensors
+  // under `diffusion_models/` with the config in its `__metadata__`, or a
+  // directory checkpoint there once model-quantize has processed it.
+  // config_from_json resolves all three and REFUSES a checkpoint that is
+  // not H3, which is what makes trying it first safe: a success is the
+  // detection and the config at once, and a failure costs one JSON parse.
+  // (Reading `transformer/config.json` directly is what left every stage
+  // in this graph inert on a repack root.)
+  std::string h3err;
+  if (genai::MetalMiniMaxH3Transformer::config_from_json(_root, _h3_cfg,
+                                                         &h3err)) {
+    _family = "minimax-h3";
   }
   if (_family == "minimax-h3") {
-    // Now that the family is known, hold the frame count to H3's own rule
-    // (see the constructor): the video VAE takes 17-frame clips and keeps
-    // 5 latents from each, so only 17n+5 has a latent representation.
-    if ((_frames % 17) != 5) {
-      session()->error(fmt(
-          "GenerateVideoStage('{}'): frames {} is not 17n+5, which is what "
-          "the minimax-h3 video VAE can chunk (5, 22, 39, 56, 73, 90, 107, "
-          "124, ...); inert", this->id(), _frames));
-      return;
-    }
-    std::string h3err;
-    if (!genai::MetalMiniMaxH3Transformer::config_from_json(t1, _h3_cfg,
-                                                            &h3err)) {
-      session()->error(fmt(
-          "GenerateVideoStage('{}'): {}; inert", this->id(), h3err));
-      return;
-    }
+    // Now that the family is known, round the frame count UP to H3's own
+    // rule (see the constructor): the video VAE takes 17-frame clips and
+    // keeps 5 latents from each, so only 17n+5 has a latent form.
+    align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    // _h3_cfg is already filled -- the detection above IS the read.
     _two_experts = false;
     _boundary    = 0.0;      // one stack; nothing to switch at
     _have_cfg    = true;
-    if (!_unload_resolved) {
-      _unload_resolved = true;
-      const std::vector<std::string> peers = {
-          (fs::path(_root) / "text_encoder").string(),
-          (fs::path(_root) / "video_vae").string()};
-      switch (_unload_cfg) {
-        case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
-        case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
-        default:
-          _unload_idle = model_memory::bounded(session(), peers,
-                                               model_memory::kHeadroom);
-          break;
-      }
-    }
+    // NOTE: the idle-unload policy is NOT decided here. It needs the
+    // streaming verdict, which only exists after the load -- see
+    // resolve_unload_policy_h3_().
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
         "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
@@ -366,6 +370,7 @@ GenerateVideoStage::resolve_config_()
         "GenerateVideoStage('{}'): {}; inert", this->id(), cerr));
     return;
   }
+  align_frames_(genai::MetalWanVae::align_num_frames(_frames));
   _two_experts = fs::exists(fs::path(_root) / "transformer_2" / "config.json");
   _boundary = boundary_from_index_(_root, _boundary);
   if (!_two_experts) { _boundary = 0.0; }
@@ -411,9 +416,14 @@ GenerateVideoStage::ensure_expert_(int which)
     namespace fs = std::filesystem;
     const std::string dit_dir =
         genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root);
-    std::string enc_dir = (fs::path(dit_dir).parent_path() /
-                           "text_encoder").string();
-    if (!fs::exists(enc_dir)) { enc_dir.clear(); }
+    // Through the encoder's own resolver, not by spelling a sibling of
+    // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
+    // encoder lives under `text_encoders/`, so building the path by hand
+    // produced a directory that does not exist and silently dropped the
+    // encoder out of the streaming decision.
+    std::string enc_dir =
+        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
+    if (enc_dir == _root || !fs::exists(enc_dir)) { enc_dir.clear(); }
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
     bool   stream_blocks = plan.stream;
@@ -433,6 +443,7 @@ GenerateVideoStage::ensure_expert_(int which)
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
         stream_blocks, pin_frac);
+    resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
       // load-time claim would keep sizing every peer against 33 GB. What
@@ -449,6 +460,21 @@ GenerateVideoStage::ensure_expert_(int which)
             "revised down from {} MB on disk", this->id(), held >> 20,
             model_memory::dir_weights_bytes(dit_dir) >> 20));
       }
+    }
+    // Say how many blocks are PINNED, the way the conditioner says it for
+    // its layers. Worth stating even when it is zero, which is the common
+    // case here and is not obvious: plan_streaming only pins when
+    // RAM > others + 5 GB, and with the text encoder counted in `others`
+    // at ~15 GB on a 16 GB box that test fails outright. Zero pinned is
+    // why the resident set below has to earn its room at runtime.
+    if (_h3_dit) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): MiniMax-H3 DiT {} of {} blocks pinned "
+          "at load{}", this->id(), _h3_dit->pinned_blocks(), _h3_cfg.n_layers,
+          _h3_dit->pinned_blocks() == 0
+              ? " (none fit beside the other models; the resident set grows "
+                "into free RAM as the denoise runs)"
+              : ""));
     }
     if (!_h3_dit) {
       session()->error(fmt(
@@ -508,6 +534,127 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
 }
 
 namespace h3 = genai::minimax_h3;
+
+// Should the DiT be dropped after each clip? Decided AFTER the load, and
+// that timing is the whole point.
+//
+// `auto` asks model_memory::bounded(peers), i.e. "does RAM cover the
+// PEERS' weights plus headroom". Asked before those peers have loaded it
+// measures a footprint of ~0 and always answers "roomy" -- and for this
+// stage the peers are the text encoder and the video VAE, both of which
+// are now loaded lazily by OTHER stages, so at any moment this stage
+// could ask, the honest answer is zero. The rule was never wrong; it was
+// being handed nothing.
+//
+// So the streaming verdict decides instead, and it is a better signal
+// anyway: plan_streaming has ALREADY compared this checkpoint against the
+// box and concluded the stack does not fit resident. A model that has to
+// stream its own blocks is not one to keep alive across a decode that
+// needs the working set -- which on MiniMax-H3 is exactly what happened:
+// the DiT stayed resident and a 251 MB video decode was refused with zero
+// headroom and 5.3 GB physically free.
+void
+GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
+{
+  if (_unload_resolved) { return; }
+  _unload_resolved = true;
+  std::vector<std::string> peers;
+  for (const std::string& p :
+       {genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root),
+        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(_root)}) {
+    if (!p.empty() && p != _root) { peers.push_back(p); }
+  }
+  switch (_unload_cfg) {
+    case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+    case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+    default:
+      _unload_idle = streamed ||
+                     model_memory::bounded(session(), peers,
+                                           model_memory::kHeadroom);
+      break;
+  }
+  if (_unload_idle) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): memory-bounded -- the DiT is dropped "
+        "after each clip so the VAE decode has working set, and reloads "
+        "on the next prompt{}", this->id(),
+        streamed ? " (its blocks stream, so the box is already tight)" : ""));
+  }
+}
+
+// Is there room for this forward's SCRATCH, and if not, can we make it?
+//
+// The image stages never needed this: a 1024x1024 DiT's activations are
+// tens of MB. A video forward's are not -- MiniMax-H3's scratch is ~200 KB
+// per row, so the 9382-row production layout wants ~1.9 GB and a 19k-row
+// one ~3.9 GB, none of which the weight accounting can see (it is
+// allocated per forward, not per checkpoint).
+//
+// Getting this wrong on a 16 GB box is not a failed allocation. Metal
+// SharedBuffers are mlock-WIRED, so they cannot be paged out or
+// compressed: the VM drains the file cache, fills the compressor, stops
+// making progress, userspace stops being scheduled, and the kernel
+// watchdog panics the machine. Two panic logs on this box say exactly
+// that ("no checkins from watchdogd in 94 seconds", free 14 MB, file
+// cache ~0, 4-5 GB wired). So refusing loudly is the SAFE outcome here,
+// and proceeding hopefully is the dangerous one.
+bool
+GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
+{
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || seq <= 0) { return true; }
+  auto mb = mc->memory_budget();
+  if (mb.recommended == 0) { return true; }   // budget query unavailable
+
+  // The distinct-timestep count is decided inside denoise(), but its
+  // buffers are sub-MB at any plausible value (mod is n_t x adaln_out),
+  // so an upper bound costs nothing and keeps this callable before the
+  // schedule exists.
+  constexpr int kTimestepsUpperBound = 4;
+  const bool dq = _h3_dit && _h3_dit->uses_matrix_cores();
+  const std::size_t need = genai::MetalMiniMaxH3Transformer::scratch_bytes(
+      _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq);
+
+  // Tell the DiT how much room to leave clear when it decides whether to
+  // keep a streamed block resident. Its growth must not eat the scratch
+  // the very next forward needs -- that would trade a disk read for an
+  // allocation failure. A further margin on top keeps room for the peers
+  // that run after the denoise (the VAE decode above all).
+  if (_h3_dit) {
+    _h3_dit->set_residency_reserve(need + (1ull << 30));
+  }
+
+  // Both budgets, for the reason generate-image gives: fits() is our Metal
+  // working set and misses other processes' resident memory; fits_physical
+  // is host-wide reclaimable RAM and catches it.
+  if (mb.fits(need) && mb.fits_physical(need)) { return true; }
+
+  // Make room. Parking hands weight pages to the kernel as purgeable --
+  // reversible, and free unless something actually takes them.
+  std::size_t parked = 0;
+  if (auto* gm = session()->services()->generative_model_manager()) {
+    parked = gm->reclaim_at_least(need);
+  }
+  mb = mc->memory_budget();
+  if (mb.fits(need) && mb.fits_physical(need)) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
+        "~{} MB of scratch", this->id(), parked >> 20, seq, need >> 20));
+    return true;
+  }
+  session()->error(fmt(
+      "GenerateVideoStage('{}'): not enough memory for a {}-row forward -- "
+      "it needs ~{} MB of scratch and there is ~{} MB of GPU working set / "
+      "~{} MB reclaimable{}. Refusing rather than thrashing: wired Metal "
+      "buffers cannot be paged out, so overcommitting here takes the whole "
+      "machine down rather than failing this stage. Use a smaller "
+      "height/width/frames, or free another model first",
+      this->id(), seq, need >> 20, mb.headroom >> 20,
+      mb.available_physical >> 20,
+      parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
+                 : std::string()));
+  return false;
+}
 
 // The minimax-h3 denoise: one packed sequence carrying both modalities,
 // so this produces two latents where the Wan path produces one.
@@ -577,6 +724,9 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
         "audio latents", this->id(), lt, lh, lw, alat));
     return false;
   }
+  // The sequence length is known now and nothing large has been allocated
+  // yet, which is the only moment a preflight is worth anything.
+  if (!preflight_h3_scratch_(L.seq_len, text_rows)) { return false; }
 
   const int PE = c.video_patch_elems();
   const int AC = c.audio_channels;
@@ -698,7 +848,11 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
                                                              prog);
   req.progress = [&](int step, int total) {
-    (void)total;
+    // `total` is the count the SCHEDULER settled on, which is not
+    // `_steps`: that is a sigma grid including the terminal zero, and the
+    // shift can collapse duplicates on top. Adopting it is what makes the
+    // bar finish at 100% instead of at (steps-1)/steps.
+    prog.set_steps(total);
     // `step` is 1-based on entry here; end_step takes the 0-based index
     // it just finished, and re-syncs the bar to the exact boundary.
     prog.end_step(step - 1);
@@ -930,8 +1084,36 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         ref_frames = total;
       }
     }
-    if (!run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
-                 &vlat, &vshape, &alat_out, &ashape)) {
+    // Cooperative stop, polled per BLOCK inside the DiT. A step is one
+    // pass over 50 blocks of a 33B stack, so stopping only between steps
+    // leaves a stop request hanging for tens of seconds; this makes it
+    // land in about a block. Cleared afterwards so a stale `ctx` is never
+    // captured past this generation -- the lambda holds a reference.
+    auto stopping = [&ctx]() { return ctx.stop_requested(); };
+    if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
+    const bool ok_h3 =
+        run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
+                &vlat, &vshape, &alat_out, &ashape);
+    if (_h3_dit) { _h3_dit->set_stream_stop({}); }
+    // What the adaptive residency actually reached. This is the number
+    // that says whether the machine got used: with 0 pinned at load, every
+    // resident block here was earned at runtime out of free headroom, and
+    // the count is what a "why was this slow" question needs first.
+    if (_h3_dit && _h3_dit->streaming()) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): DiT residency ended at {} of {} blocks "
+          "({} MB), {} pinned at load", this->id(),
+          _h3_dit->resident_block_count() + _h3_dit->pinned_blocks(),
+          _h3_cfg.n_layers,
+          (_h3_dit->resident_block_bytes()) >> 20,
+          _h3_dit->pinned_blocks()));
+    }
+    if (!ok_h3) {
+      if (ctx.stop_requested()) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): stopped mid-denoise; dropping the "
+            "partial clip", this->id()));
+      }
       co_return;
     }
     if (_unload_idle) { _h3_dit.reset(); }

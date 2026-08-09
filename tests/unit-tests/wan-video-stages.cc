@@ -20,6 +20,7 @@
 #include "stages/rgb-to-video-stage.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/wan/metal-wan-vae.h"
 #include "stages/generate-video-stage.h"
 #endif
 
@@ -251,9 +252,14 @@ TEST(generate_video, geometry_config_validation)
   };
   EXPECT_TRUE(mk(480, 832, 81)->config_error().empty());
   EXPECT_TRUE(mk(480, 832, 121)->config_error().empty());
-  // 4k+1 only.
-  EXPECT_TRUE(!mk(480, 832, 80)->config_error().empty());
-  EXPECT_TRUE(!mk(480, 832, 100)->config_error().empty());
+  // ANY positive count is accepted. The legal counts are a per-FAMILY
+  // rule (4k+1 for wan, 17n+5 for minimax-h3) that share almost no
+  // values, and the family is not known until the checkpoint is read --
+  // so the count is rounded UP at resolve time instead of rejected here,
+  // and a graph can change families without being re-authored.
+  EXPECT_TRUE(mk(480, 832, 80)->config_error().empty());
+  EXPECT_TRUE(mk(480, 832, 100)->config_error().empty());
+  EXPECT_TRUE(mk(480, 832, 56)->config_error().empty());   // an H3 count
   // 16 = the VAE's 8x spatial compression times the DiT's 2x patch, so a
   // size off that grid cannot be patchified without a partial token.
   EXPECT_TRUE(!mk(484, 832, 81)->config_error().empty());
@@ -266,6 +272,40 @@ TEST(generate_video, geometry_config_validation)
   EXPECT_TRUE(s2->latent_frames() == 1);
   auto s3 = mk(480, 832, 121);
   EXPECT_TRUE(s3->latent_frames() == 31);
+}
+
+// The two families' rounding rules. Tested on the rules THEMSELVES rather
+// than through the stage, because the stage cannot round until it has read
+// a checkpoint and named its family -- which needs a 25 GB model on disk.
+//
+// The property that matters is round UP, never down: a count rounded down
+// silently delivers less video than was asked for, where rounding up costs
+// at most three frames (wan) or sixteen (h3).
+TEST(generate_video, frame_counts_round_up_per_family)
+{
+  namespace h3 = genai::minimax_h3;
+  // wan: 4k+1, the first frame being its own chunk.
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(81) == 81);
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(80) == 81);
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(82) == 85);
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(100) == 101);
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(1) == 1);
+  // Degenerate inputs must not produce a count below 1; 0 frames is not a
+  // clip, and a negative one would size an allocation.
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(0) == 1);
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(-7) == 1);
+
+  // minimax-h3: 17n+5, a 17-frame clip keeping 5 latents.
+  EXPECT_TRUE(h3::align_num_frames(56, 17, 5) == 56);
+  EXPECT_TRUE(h3::align_num_frames(50, 17, 5) == 56);
+  EXPECT_TRUE(h3::align_num_frames(57, 17, 5) == 73);
+  EXPECT_TRUE(h3::align_num_frames(22, 17, 5) == 22);
+
+  // And the cross-family point of the whole change: each family's
+  // canonical count is illegal for the other, so both must survive being
+  // handed the other's number.
+  EXPECT_TRUE(genai::MetalWanVae::align_num_frames(56) == 57);
+  EXPECT_TRUE(h3::align_num_frames(81, 17, 5) == 90);
 }
 
 // The stage is family-generic: one stage type carrying the UNION of what

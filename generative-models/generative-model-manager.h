@@ -292,6 +292,24 @@ public:
   // large the manager cannot see.
   std::size_t enforce_memory_cap();
 
+  // Park least-recently-used weight sets until at least `bytes` have been
+  // handed to the kernel, or nothing parkable is left. Returns the bytes
+  // parked, which may be less than asked (or 0).
+  //
+  // Separate from enforce_memory_cap() because that one is a no-op
+  // without a configured cap, and the caller here has a different
+  // question: not "am I over my budget" but "I am ABOUT to allocate
+  // something large that the manager cannot see -- make room". Video
+  // activations are the case it exists for: a MiniMax-H3 forward's
+  // scratch is ~200 KB per row, so a 19k-row packed sequence needs ~3.9
+  // GB that no weight accounting knows about.
+  //
+  // Parking is cheap and reversible (pages go purgeable; the next access
+  // takes them back, re-reading from disk only if the kernel actually
+  // took them), so asking for room that turns out not to be needed costs
+  // throughput at worst. It cannot park mapped weights or KV.
+  std::size_t reclaim_at_least(std::size_t bytes);
+
   // What is resident right now, per checkpoint. The point of routing
   // loads through the manager is that this question has an answer: how
   // much each model is holding, how much of it is OS-reclaimable

@@ -10,7 +10,9 @@ machines and runs its on-device generative stack on a custom **metal-compute**
 backend — its own Metal kernels, with no Python and no third-party tensor
 runtime in the forward pass.
 
-- Runs **MiniMax H3** FL2VA on Apple Silicon Mac
+- Runs **MiniMax H3** FL2VA on Apple Silicon Mac — a 33B model generating
+  video **and its soundtrack together**, on as little as 16 GB.
+  See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
 
 - **Built in C++** for performance and compactness
 
@@ -21,7 +23,9 @@ runtime in the forward pass.
   text-to-speech (TTS)
 
 - Top-tier diffusion-transformer inference speed with **weight streaming**,
-  enabling image and video edits on systems with only 16 GB of memory
+  enabling image and video edits on systems with only 16 GB of memory —
+  walk through a reference image edit in
+  **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
 
 - **Local MCP** support: sandboxed file, shell, and Python tools, plus web
   fetch
@@ -283,6 +287,8 @@ page in order to ask for the key in the first place.
 
 New here? **[EXAMPLES.md](EXAMPLES.md)** walks through fetching a model and
 building text-chat and speech-transcription pipelines in the web UI.
+For text-to-video-and-audio, **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
+covers preparing MiniMax H3 and running it, with both pipelines to download.
 
 ### CLI
 

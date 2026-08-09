@@ -182,13 +182,18 @@ TEST(minimax_h3_dit, config_from_json)
   // rotate and 32 pass through.
   EXPECT_TRUE(cfg.rope_rot() == 96 && cfg.rope_rot() < cfg.head_dim);
   // The path resolver has to reach the DiT from the repo root, since
-  // that is what the catalogue registers. Two spellings are valid,
-  // because two publishers are: MiniMaxAI's diffusers `transformer/`
-  // dir, and Comfy-Org's `diffusion_models/*.safetensors` file. This
-  // env var names a REPO, so either may be behind it.
+  // that is what the catalogue registers. THREE spellings are valid --
+  // two publishers plus what this tree writes:
+  //   * MiniMaxAI's diffusers `transformer/` dir;
+  //   * Comfy-Org's `diffusion_models/*.safetensors` file;
+  //   * a repack model-quantize has processed, whose quantized component
+  //     is a directory checkpoint at `diffusion_models/` (no file
+  //     extension, and not spelled "transformer").
+  // This env var names a REPO, so any of the three may be behind it.
   const std::string d = MetalMiniMaxH3Transformer::resolve_dit_dir(root);
   EXPECT_TRUE(d.find("transformer") != std::string::npos ||
-              d.find(".safetensors") != std::string::npos);
+              d.find(".safetensors") != std::string::npos ||
+              d.find("diffusion_models") != std::string::npos);
 }
 
 namespace {
@@ -686,6 +691,116 @@ TEST(minimax_h3_dit, quantized_matches_golden)
 //     initial noise, and the video would still look right.
 //   * the loop is deterministic and finite.
 //
+// scratch_bytes() must equal what ensure_scratch_ actually allocates.
+//
+// The two list the same buffers in different places, so nothing but this
+// test stops them drifting -- and drift here is not cosmetic. A video
+// forward's scratch is ~200 KB per row (~1.9 GB at the production layout,
+// ~3.9 GB at 19k rows), and the stage preflights against this number to
+// decide whether the machine has room. An estimate that under-reports is
+// how the preflight passes and the box then thrashes; on 16 GB, wired
+// Metal buffers make that a watchdog kernel panic rather than a failed
+// allocation. So: exact equality, not a tolerance.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, scratch_estimate_matches_allocation)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  // Two blocks: the scratch is a function of the GEOMETRY, not the depth,
+  // and this keeps the load cheap.
+  cfg.n_layers = 2;
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  EXPECT_TRUE(m->scratch_resident_bytes() == 0);   // nothing allocated yet
+
+  // A small real layout: 2 latent frames of a 320x192 canvas plus text
+  // and audio rows. Small enough to allocate here, and it exercises the
+  // same expressions the production geometry does.
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+
+  const int n_video = (int)L.video_indices.size();
+  std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems(), 0.01f);
+  std::vector<float> ain((std::size_t)L.num_audio_rows * cfg.audio_channels,
+                         0.01f);
+  std::vector<float> tin((std::size_t)tags.size() * cfg.text_dim, 0.01f);
+  const SharedBuffer vb = to_bf16_buf_(mc, vin);
+  const SharedBuffer ab = to_bf16_buf_(mc, ain);
+  const SharedBuffer tb = to_bf16_buf_(mc, tin);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  MetalMiniMaxH3Transformer::Step step;
+  step.video = &vb;  step.audio = &ab;  step.text = &tb;
+  step.layout = &L;  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+  std::string ferr;
+  const auto v = m->forward(step, &ferr);
+  if (v.empty()) {
+    std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+  }
+  ASSERT_TRUE(!v.empty());
+
+  const std::size_t est_geo = MetalMiniMaxH3Transformer::scratch_bytes(
+      cfg, L.seq_len, (int)tags.size(), (int)uniq.size(), false);
+  const std::size_t est = MetalMiniMaxH3Transformer::scratch_bytes(
+      cfg, L.seq_len, (int)tags.size(), (int)uniq.size(),
+      m->uses_matrix_cores());
+  const std::size_t act_geo = m->scratch_resident_bytes();
+  const std::size_t act_dq  = m->dequant_scratch_bytes();
+  std::printf("[minimax_h3_dit] %d rows, n_t=%zu: geometry est %zu / act %zu"
+              " | dequant est %zu / act %zu (%.1f MB total)\n",
+              L.seq_len, uniq.size(), est_geo, act_geo, est - est_geo, act_dq,
+              (double)(act_geo + act_dq) / 1048576.0);
+  EXPECT_TRUE(est_geo == act_geo);
+  EXPECT_TRUE(est == act_geo + act_dq);
+  // And it must be the dominant term it is claimed to be: per-row, not a
+  // constant. ~200 KB/row at the released config.
+  EXPECT_TRUE(act_geo > (std::size_t)L.seq_len * 64 * 1024);
+
+  // A forced STEEL route must not touch the matrix-core path at all.
+  //
+  // This is the regression for a bug the estimate above exposed:
+  // gemm_mma_ guarded only with route_ok_, which answers "can this route
+  // run this shape" and is trivially true for a steel route -- so every
+  // steel route fell into the mma path and ran the 128x128 tile. It was
+  // invisible from outputs (the two agree numerically) and showed up only
+  // as memory: dequant scratch existing when nothing should have
+  // dequantized. The dequant buffer is the observable, so it is the
+  // assertion.
+  if (m->uses_matrix_cores()) {
+    auto m2 = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+    ASSERT_TRUE(m2 != nullptr);
+    m2->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    std::string serr;
+    const auto v2 = m2->forward(step, &serr);
+    ASSERT_TRUE(!v2.empty());
+    std::printf("[minimax_h3_dit] forced steel: dequant scratch %zu bytes\n",
+                m2->dequant_scratch_bytes());
+    EXPECT_TRUE(m2->dequant_scratch_bytes() == 0);
+    // And the geometry scratch is unchanged -- the route decides which
+    // kernel runs, never how much room the forward needs.
+    EXPECT_TRUE(m2->scratch_resident_bytes() == act_geo);
+  }
+}
+
 // The M5 fast paths must be SELECTED, not merely available.
 //
 // A silent fallback from the matrix-core GEMM to the steel one, or from the

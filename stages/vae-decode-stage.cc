@@ -6,6 +6,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -76,7 +77,8 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit"},
+       "boogu-image,boogu-image-edit,"
+       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on each decoded VIDEO frame's sideband when the "
           "latent does not carry one. Wan latents from generate-video do, so "
@@ -125,6 +127,16 @@ std::string
 vae_family_(const std::string& vae_dir)
 {
   namespace fs = std::filesystem;
+  // A Comfy-Org repack ships its VAEs as bare .safetensors under `vae/`
+  // with no config.json at all, so the `_class_name` read below finds
+  // nothing and falls through to the "krea2" default -- which then opens
+  // that directory as a Qwen-Image VAE and reports "no readable
+  // checkpoint". The architecture is in the file's `__metadata__` key
+  // instead, and probing for it costs one header read.
+  if (!genai::comfy::resolve_component(vae_dir, "vae", "minimax_h3_video_vae",
+                                       {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
   std::ifstream in(fs::path(vae_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -525,14 +537,23 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     _model_latched = true;
     if (const auto* mfd =
             mb ? dynamic_cast<const FlexDataPayload*>(mb.get()) : nullptr) {
-      if (apply_model_select_beat(mfd->data, _hf_dir)) {
-        ensure_loaded_();
-      }
+      // Record WHICH model, but do not load it yet. The model-select beat
+      // arrives at startup, and loading here would hold the VAE resident
+      // through everything upstream of the first latent -- which for a
+      // video graph is the entire denoise. That is not a rounding error:
+      // MiniMax-H3's video VAE is 10.4 GB, and holding it through a 33B
+      // denoise on a 16 GB box left the DiT with ZERO Metal working-set
+      // headroom and its forward was refused. Nothing needs a VAE before
+      // there is a latent to decode, so the load waits for one.
+      apply_model_select_beat(mfd->data, _hf_dir);
     }
   }
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }   // upstream EOS -> close oport
-  // A previous beat may have dropped the VAE to leave the denoise room.
+  // NOW there is work for it. First latent => first load (the model-select
+  // branch above deliberately only recorded the directory); a later one =>
+  // reload if a previous beat dropped the VAE to leave the denoise room.
+  ensure_loaded_();
   if (_unloaded) { reload_vae_(); }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
   // A video latent carries a time axis, so the wan family arrives 4-D
@@ -718,6 +739,84 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       }
     }
 
+    // Preflight the decode's OUTPUT before allocating it, and park to
+    // make room if it does not fit. A video decode's output is not the
+    // few MB an image decode's is: [3, frames, H, W] at bf16 is 175 MB
+    // for a 2.3 s 960x544 clip and grows linearly with length and area,
+    // and this stage then buffers the whole clip again as planar U8
+    // because ctx.write is a coroutine and the VAE's frame sink is a
+    // plain callback.
+    //
+    // SCOPE, stated rather than implied: this counts the two buffers
+    // whose size is known EXACTLY here. It does NOT include the VAE's
+    // per-chunk internal working set, which is real and unmeasured on
+    // this path -- the FLUX.2 decode OOM was exactly a peak estimate
+    // that missed the internal term, so this is deliberately called a
+    // floor and not a peak. Measure decode_video's high-water mark and
+    // fold it in before treating a pass here as a guarantee.
+    {
+      const std::size_t out_frames =
+          (std::size_t)_h3_vae->decoded_frames(LT);
+      const std::size_t px = (std::size_t)(lh * vc.patch) *
+                             (std::size_t)(lw * vc.patch) * out_frames;
+      const std::size_t need = px * 3 * 2      // decode output, bf16
+                             + px * 3;         // the stage's planar-U8 clip
+      // PHYSICAL pressure is the gate; the Metal working set is only
+      // advisory here, and conflating the two refused work that fits.
+      //
+      // This check necessarily runs AFTER the VAE has loaded -- the frame
+      // count comes from the model -- so `headroom` already has the VAE's
+      // own 10.4 GB subtracted from it. Testing fits() there asks "is
+      // there room for the output BESIDES everything, including the thing
+      // I just legitimately loaded to do this work", and the answer on a
+      // 16 GB box is no: it refused a 251 MB decode with 5.1 GB of
+      // physically reclaimable RAM sitting free. That is a false negative
+      // that blocks a working pipeline.
+      //
+      // What actually took the machine down was PHYSICAL exhaustion --
+      // free 14 MB, file cache drained to 2.7 MB, pageout unable to make
+      // progress -- not a soft working-set overrun. recommendedMaxWorking
+      // SetSize is advisory on UMA, and the documented GPU OOM (code 8)
+      // that fits() exists for was a 12-16 GB single command buffer, three
+      // orders off a quarter-gigabyte output. So: refuse on physical, warn
+      // on working set, and let a small allocation past the soft limit.
+      auto* mcb = session()->services()->metal_compute();
+      auto mb = mcb ? mcb->memory_budget() : metal_compute::MetalCompute::
+                                                 MemoryBudget{};
+      if (mb.recommended != 0 && !mb.fits_physical(need)) {
+        std::size_t parked = 0;
+        if (auto* gm = session()->services()->generative_model_manager()) {
+          parked = gm->reclaim_at_least(need);
+        }
+        mb = mcb->memory_budget();
+        if (mb.fits_physical(need)) {
+          session()->info(fmt(
+              "VaeDecodeStage('{}'): parked ~{} MB to fit a {}-frame "
+              "{}x{} decode (~{} MB of output)", this->id(), parked >> 20,
+              out_frames, lw * vc.patch, lh * vc.patch, need >> 20));
+        } else {
+          session()->error(fmt(
+              "VaeDecodeStage('{}'): not enough memory to decode {} frames "
+              "at {}x{} -- the output alone is ~{} MB and only ~{} MB is "
+              "reclaimable{}. Refusing rather than thrashing: wired Metal "
+              "buffers cannot be paged out, so overcommitting takes the "
+              "machine down rather than failing this stage",
+              this->id(), out_frames, lw * vc.patch, lh * vc.patch,
+              need >> 20, mb.available_physical >> 20,
+              parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
+                         : std::string()));
+          co_return;
+        }
+      } else if (mb.recommended != 0 && !mb.fits(need)) {
+        session()->log_debug(fmt(
+            "VaeDecodeStage('{}'): {}-frame decode needs ~{} MB with ~{} MB "
+            "of Metal working set left but ~{} MB physically reclaimable -- "
+            "proceeding; the working-set figure is advisory on UMA",
+            this->id(), out_frames, need >> 20, mb.headroom >> 20,
+            mb.available_physical >> 20));
+      }
+    }
+
     int F = 0;
     std::string derr;
     metal_compute::SharedBuffer rgb;
@@ -727,7 +826,20 @@ VaeDecodeStage::process(RuntimeContext& ctx)
                          (std::uint64_t)LT * vc.patch_t *
                              (std::uint64_t)(lh * vc.patch) *
                              (std::uint64_t)(lw * vc.patch));
+      // A minute of a 2.4B ViT with nothing else to look at. The tile is
+      // the only unit the decode passes through often enough to be worth
+      // reporting, and it is what the bar counts.
+      UiProgress bar = session()->open_progress("vae decode");
+      _h3_vae->set_tile_progress([&bar](int done, int total) {
+        bar.update((std::uint64_t)(done < 0 ? 0 : done),
+                   (std::uint64_t)(total < 0 ? 0 : total));
+      });
       rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+      // Cleared before the bar it captures leaves scope -- the VAE
+      // outlives this call and would otherwise hold a dangling reference
+      // into the next decode.
+      _h3_vae->set_tile_progress(nullptr);
+      bar.finish();
     }
     if (rgb.empty() || F <= 0) {
       session()->warn(fmt(

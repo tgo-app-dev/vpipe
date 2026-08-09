@@ -615,7 +615,11 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     }
     m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
     if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
-    m->_blocks.resize((std::size_t)m->_pinned);
+    // Sized to the FULL depth though only the pinned prefix is filled:
+    // the empty slots are where forward() promotes streamed blocks as
+    // free memory allows (set_residency_reserve). An unfilled slot reads
+    // as empty, which is what the `held` test below keys on.
+    m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < m->_pinned; ++i) {
       if (!m->load_block_(ws,
               "transformer_blocks." + std::to_string(i) + ".",
@@ -837,6 +841,66 @@ std::vector<std::vector<float>>
 MetalKrea2Transformer::calib_gateup() const { return read_calib_(_cb_gu, _cfg.hidden); }
 std::vector<std::vector<float>>
 MetalKrea2Transformer::calib_down() const { return read_calib_(_cb_dn, _cfg.ffn); }
+
+std::size_t
+MetalKrea2Transformer::scratch_resident_bytes() const
+{
+  const metal_compute::SharedBuffer* all[] = {
+      &_dit.te_in, &_dit.rcos, &_dit.rsin, &_dit.joint, &_dit.te1,
+      &_dit.temb, &_dit.tmp, &_dit.tmod, &_dit.mod, &_dit.n1, &_dit.n2,
+      &_dit.nm, &_dit.gate, &_dit.att, &_dit.o, &_dit.q, &_dit.k, &_dit.v,
+      &_dit.qt, &_dit.kt, &_dit.vt, &_dit.atb, &_dit.g, &_dit.u, &_dit.gu,
+      &_dit.modf, &_w_deq, &_splitk};
+  std::size_t n = 0;
+  for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
+  return n;
+}
+
+// Bytes one resident block holds. Summed from the buffers rather than
+// derived from the config, for the same reason scratch is: a derived
+// number drifts the moment a tensor is added.
+std::size_t
+MetalKrea2Transformer::qw_bytes_(const QWeight& w)
+{
+  return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size() +
+         w.qbias.byte_size();
+}
+
+std::size_t
+MetalKrea2Transformer::block_bytes_(const Block& b)
+{
+  return b.n1.byte_size() + b.n2.byte_size() + b.qn.byte_size() +
+         b.kn.byte_size() + qw_bytes_(b.q) + qw_bytes_(b.k) +
+         qw_bytes_(b.v) + qw_bytes_(b.gate) + qw_bytes_(b.o) +
+         qw_bytes_(b.ff_gate) + qw_bytes_(b.ff_up) + qw_bytes_(b.ff_down) +
+         qw_bytes_(b.ff_gu);
+}
+
+std::size_t
+MetalKrea2Transformer::release_resident_blocks(std::size_t bytes)
+{
+  // From the TAIL down so what remains stays a contiguous prefix; in a
+  // cyclic scan every block is worth the same. The pinned prefix is never
+  // touched.
+  int next = (int)_blocks.size() - 1;
+  const std::size_t freed = _resid.release(bytes, [&]() -> std::size_t {
+    for (; next >= _pinned; --next) {
+      Block& b = _blocks[(std::size_t)next];
+      const std::size_t n = block_bytes_(b);
+      if (n == 0) { continue; }
+      b = Block{};
+      --next;
+      return n;
+    }
+    return 0;
+  });
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalKrea2Transformer: released {} MB of resident blocks ({} left)",
+        freed >> 20, _resid.count()));
+  }
+  return freed;
+}
 
 bool
 MetalKrea2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
@@ -1538,6 +1602,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     }
     const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
     psplit(t_cond);
+    // Re-arm residency growth for this forward; the ratchet from any
+    // earlier eviction deliberately survives.
+    _resid.begin_forward();
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
     for (int L = 0; L < c.n_layers; ++L) {
       // Cooperative stop: bail EVERY block (not just the streamed tail) so a
@@ -1546,7 +1613,10 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       if (_stream_stop && _stream_stop()) { return {}; }
       if (_block_progress) { _block_progress(L, c.n_layers); }
       // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams.
-      const bool streaming = _stream_blocks && L >= _pinned;
+      // Resident if pinned at load OR promoted by an earlier pass.
+      const bool held = L < (int)_blocks.size() &&
+                        !_blocks[(std::size_t)L].q.empty();
+      const bool streaming = _stream_blocks && !held;
       Block streamed;
       if (streaming) {
         if (!load_block_(*_ws,
@@ -1649,7 +1719,27 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       gemm(g, b.ff_down, o, 0, seq, HID, FF);
       gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
       psplit(t_ff);
-      if (streaming) { flush(); }   // commit block L before its weights free
+      if (streaming) {
+        flush();   // commit block L before its weights free
+        // The flush has been WAITED for, so nothing encoded still points
+        // at this block's buffers -- which is why promotion happens here
+        // and not at the top of the iteration. Keeping it costs no extra
+        // memory (the bytes are already resident); the alternative is
+        // re-reading the same block on every remaining step.
+        if (L < (int)_blocks.size()) {
+          const std::size_t nb = block_bytes_(streamed);
+          if (_resid.admit(_mc, nb)) {
+            _blocks[(std::size_t)L] = std::move(streamed);
+            _resid.note_admitted(nb);
+            if (_mc->session() != nullptr) {
+              _mc->session()->log_debug(fmt(
+                  "MetalKrea2Transformer: block {} resident ({} of {}, "
+                  "{} MB)", L, _resid.count() + _pinned, c.n_layers,
+                  _resid.bytes() >> 20));
+            }
+          }
+        }
+      }
       if (stop_after_block == L) { break; }   // joint holds the block-L output
     }
     if (!tap) {

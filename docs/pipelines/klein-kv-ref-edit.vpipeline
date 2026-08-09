@@ -1,0 +1,217 @@
+{
+  "id": "klein-kv-ref-edit",
+  "stages": [
+    {
+      "id": "load-image",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "reference.jpg"
+        ]
+      }
+    },
+    {
+      "id": "image-resample",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 512,
+        "height": 512,
+        "fit": "crop"
+      }
+    },
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/FLUX.2-klein-9b-kv-4bit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "Paint the reference picture in Claude Monet's impressionist style. Use low-saturation shades of blue and yellow colors. Use fine horizontal strokes to paint the water. Write \"T-Go\" as the artist name in handwriting."
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "image-resample",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "steps": 4,
+        "i8_gemm": true,
+        "klein_kv": true
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-image",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "compare-image",
+      "type": "compare-image",
+      "iports": [
+        {
+          "src": "image-resample",
+          "oport": 0
+        },
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        },
+        {
+          "src": "load-image",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "path": "klein-kv-edit.jpeg"
+      }
+    }
+  ],
+  "subpipelines": [],
+  "aux": {
+    "composer": {
+      "version": 2,
+      "pipeline": "klein-kv-ref-edit",
+      "docks": {
+        "left": {
+          "size": 52.66,
+          "tree": null
+        },
+        "right": {
+          "size": 40.98,
+          "tree": null
+        },
+        "top": {
+          "size": 52.36,
+          "tree": null
+        },
+        "bottom": {
+          "size": 37.37,
+          "tree": null
+        },
+        "center": {
+          "tree": {
+            "split": "v",
+            "ratio": 0.5723,
+            "a": {
+              "type": "compare-image",
+              "title": null,
+              "config": {
+                "designation": {
+                  "pipeline": "klein-kv-ref-edit",
+                  "stage": "compare-image"
+                },
+                "wipe": 0.9436374176703687,
+                "seamHidden": true,
+                "mode": "wipev",
+                "swapped": false,
+                "collapsed": false
+              }
+            },
+            "b": {
+              "type": "pipeline-editor",
+              "title": "Pipeline editor: klein-kv-ref-edit",
+              "config": {
+                "pipeline": "klein-kv-ref-edit",
+                "split": 0.6666666666666666
+              }
+            }
+          }
+        }
+      },
+      "floating": []
+    }
+  }
+}

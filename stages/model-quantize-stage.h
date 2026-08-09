@@ -137,6 +137,28 @@ private:
                               const std::string&           family,
                               const std::string&           out_dir,
                               const std::function<bool()>& stop);
+  // The same self-contained pass for a Comfy-Org REPACK, whose components
+  // are one .safetensors per role subdir (diffusion_models/, text_encoders/,
+  // vae/, plus tokenizer/) rather than a diffusers sub-directory each. Same
+  // contract: every component copies through, `target` is quantized in
+  // place, the result is a usable model root. Chainable for the same reason
+  // -- a quantized component lands as a DIRECTORY inside its own role
+  // subdir, which is the one shape difference from the input, and both the
+  // resolvers and this function accept either.
+  bool quantize_comfy_pipeline_(const std::string&           root,
+                                const std::string&           family,
+                                const std::string&           dit_path,
+                                const std::string&           out_dir,
+                                const std::function<bool()>& stop);
+  // Whether `dir` is a Comfy-Org repo root: at least one role subdir that
+  // holds either a readable repack component or a quantized directory
+  // checkpoint this pass wrote. The second half is what makes chaining
+  // work, since a quantized component has no `__metadata__` for scan_repo
+  // to find.
+  static bool is_comfy_root_(const std::string& dir);
+  // The role subdir a `target` names in a repack ("dit" ->
+  // "diffusion_models"), or "" when the target has no repack component.
+  static std::string comfy_target_subdir_(const std::string& target);
   // Quantize one DiT (transformer) dir -> out_dir (a plain group-affine pass +
   // optional AWQ-clip / mixed). `family` selects the DiT quant leaf set
   // ("krea2" | "flux2"); `calib_root` is the pipeline root the on-device AWQ

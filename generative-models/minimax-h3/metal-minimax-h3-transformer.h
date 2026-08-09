@@ -4,9 +4,11 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -190,6 +192,87 @@ class MetalMiniMaxH3Transformer {
   // second handle alongside it.
   metal_compute::MetalCompute* metal_compute() const { return _mc; }
 
+  // ---- adaptive block residency (streaming mode) -----------------------
+  //
+  // Streaming keeps ~one block resident, which on a 16 GB box leaves most
+  // of the machine idle: the 4-bit DiT streams in ~4.5 GB of traffic per
+  // forward while 10+ GB sits free. This grows a RESIDENT SET into that
+  // slack so later steps re-read less from disk.
+  //
+  // WHY THIS IS NOT A CACHE. The access pattern is a repeating sequential
+  // scan -- blocks 0..N-1, then the next step scans 0..N-1 again. For a
+  // cyclic scan with capacity C < N, LRU has a ZERO percent hit rate: the
+  // block you evict to make room is always the one you need next time
+  // round. Recency is exactly the wrong signal here. What works for a
+  // looping scan is a FIXED subset held permanently, which gives C/N.
+  // So this grows a resident set and then leaves it alone; it never
+  // evicts in order to admit, and there is no recency bookkeeping at all.
+  //
+  // Anti-thrash, in the order the failure modes appear:
+  //   * admission only spends genuinely FREE headroom, never another
+  //     block's seat;
+  //   * it keeps `reserve_bytes` clear for the next forward's scratch --
+  //     admitting into the scratch's room would just push the scratch out;
+  //   * hysteresis: admit above the high watermark, evict below the low
+  //     one, so a budget hovering at the line does not oscillate;
+  //   * a RATCHET: after any eviction the growth ceiling drops to just
+  //     under what was resident when the pressure hit, so the set cannot
+  //     climb straight back into it.
+  //
+  // `set_residency_reserve` is how a caller tells this how much room the
+  // rest of the forward needs -- scratch_bytes() plus whatever the graph
+  // wants left over. 0 disables growth entirely (pure streaming).
+  void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+
+  // Bytes currently held by promoted blocks, and how many there are.
+  // Reported so a run can say how much of the box it actually used.
+  std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  int resident_block_count() const { return _resid.count(); }
+
+  // Give back at least `bytes` of promoted blocks, for a peer that needs
+  // the room (the VAE decode is the case this exists for). Returns what
+  // was freed, and ratchets the growth ceiling down so the set does not
+  // immediately reclaim it. Never touches the configured pinned prefix.
+  std::size_t release_resident_blocks(std::size_t bytes);
+
+  // Cooperative stop, polled once per BLOCK inside forward().
+  //
+  // The denoise loop already takes a per-STEP callback, but a step here is
+  // one forward of a 50-block 33B stack over a ~9k-row packed sequence --
+  // tens of seconds. Honouring a stop only between steps means a user who
+  // presses stop waits about a minute for it. Polled per block it lands in
+  // roughly one block, which is what "responsive" has to mean at this
+  // scale. Set it around a generation and clear it afterwards, as the
+  // image DiTs do; an empty function disables the check.
+  void set_stream_stop(std::function<bool()> stop)
+  {
+    _stream_stop = std::move(stop);
+  }
+
+  // Bytes of per-forward SCRATCH this geometry needs, BEFORE anything is
+  // allocated -- so a stage can decide whether the machine has room
+  // instead of finding out by thrashing. At video sequence lengths this
+  // is the model's largest live allocation (~200 KB per row: ~1.9 GB at
+  // the 9382-row production layout, ~3.9 GB at 19k), which is why the
+  // video stages preflight it and the image ones never needed to.
+  //
+  // `with_dequant` adds the matrix-core dequant scratch (the widest
+  // projection, 2*ffn x hidden), which gemm_mma_ allocates lazily on a
+  // quantized checkpoint with matrix cores. The caller knows whether that
+  // applies before a model exists; uses_matrix_cores() answers it after.
+  static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
+                                   int n_t, bool with_dequant);
+
+  // What the per-forward scratch buffers ACTUALLY hold right now, and
+  // what the matrix-core dequant scratch holds, kept apart because they
+  // are sized by different things -- the first by the geometry, the
+  // second by the widest projection in the checkpoint. Both zero before
+  // the first forward. They exist so scratch_bytes() can be CHECKED
+  // against reality rather than trusted; see the test named on its
+  // definition.
+  std::size_t scratch_resident_bytes() const;
+  std::size_t dequant_scratch_bytes() const;
+
   // Which kernel one block projection dispatches on.
   //
   // The steel arms are affine_qmm_steel tile heights, and run everywhere.
@@ -372,6 +455,13 @@ class MetalMiniMaxH3Transformer {
   Config _cfg;
   std::shared_ptr<WeightSet> _ws;
   DitBlockProgressFn _block_progress;
+  // Polled once per block in forward(); empty = no stop check.
+  std::function<bool()> _stream_stop;
+
+  // The shared grow-into-free-RAM policy; see block-residency.h for why
+  // this is a fixed resident set rather than a cache.
+  BlockResidency _resid;
+  static std::size_t block_bytes_(const Block& b);
 
   Linear _video_patch, _audio_patch, _cond_proj;
   Linear _time_in, _time_out;                 // read to the HOST, f32

@@ -323,6 +323,22 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
   if (out.rope_dim() % 6 != 0) {
     return fail("int(dim_head * rope_dim_ratio) must be divisible by 6");
   }
+  // Tile size, overridable for MEASUREMENT. The checkpoint's 256 is the
+  // reference's number, and the cost it buys is not obvious: at 960x544
+  // it lays 15 tiles whose union decodes 1.88x the pixels that exist, so
+  // 88% of the decode is overlap -- but tiles are also where attention is
+  // quadratic, so bigger tiles trade redundant GEMM for superlinear
+  // attention and the balance is an empirical question per machine.
+  //
+  // NOT a tuning knob to ship a different default behind: the tiling
+  // decides where the seams fall and what the cross-fade blends, so a
+  // different size is a different OUTPUT, not the same one computed
+  // faster. Anything found here has to clear the decode golden before it
+  // becomes a default.
+  if (const char* e = std::getenv("VPIPE_H3_VVAE_TILE")) {
+    const int t = std::atoi(e);
+    if (t >= out.patch) { out.tile_size = t; }
+  }
   return true;
 }
 
@@ -1595,9 +1611,27 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
   const auto xs = minimax_h3::split_tiles(W, c.tile_size, c.tile_overlap_min,
                                           c.patch);
   if (ys.start.size() <= 1 && xs.start.size() <= 1) {
-    return decode(z, LT, lh, lw, err);
+    // A clip small enough not to tile still ticks -- once per CHUNK,
+    // which is what a "tile" degenerates to here. Leaving this path
+    // silent is what made the bar render with no percentage at 256x256:
+    // the whole frame is one tile, so the loop below never runs, and the
+    // only geometry with no reporting was the small one where the
+    // untiled decode is also the only thing happening.
+    if (_prog_total <= 0) { _prog_total = 1; _prog_done = 0; }
+    if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    SharedBuffer one = decode(z, LT, lh, lw, err);
+    if (!one.empty()) { ++_prog_done; }
+    if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    return one;
   }
   const int ZC = c.z_channels;
+  // Called directly rather than through decode_video: report against this
+  // call's own tiles, so a bare decode still paces a bar instead of
+  // reporting against a total nobody set.
+  if (_prog_total <= 0) {
+    _prog_total = (int)(ys.start.size() * xs.start.size());
+    _prog_done  = 0;
+  }
   const std::size_t plane = (std::size_t)lh * lw;
   const auto* src = static_cast<const std::uint16_t*>(z.contents());
   std::vector<SharedBuffer> tiles;
@@ -1624,8 +1658,16 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
           }
         }
       }
+      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
       SharedBuffer dec = decode(sub, LT, th, tw, err);
       if (dec.empty()) { return {}; }
+      ++_prog_done;
+      // Again on the way out. Entry alone tops out at total-1, and the
+      // caller cannot make up the difference: it closes its bar as soon
+      // as the decode returns, so a completion it sets a microsecond
+      // earlier is never repainted. Reporting both edges costs one call
+      // per tile and makes the range honest for every caller.
+      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
       tiles.push_back(std::move(dec));
     }
   }
@@ -1806,6 +1848,21 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
   SharedBuffer sub =
       _mc->make_shared_buffer((std::size_t)ZC * span * lplane * 2);
   if (sub.empty()) { return fail("allocation failed"); }
+
+  // The bar spans the WHOLE clip, not one chunk: a chunk boundary is
+  // invisible to whoever is watching, and a bar that refilled per chunk
+  // would read as progress restarting. Counted here because this is the
+  // only place that knows both factors -- the tiling is decided per chunk
+  // but is identical across them, since every chunk has the same extent.
+  {
+    const int H0 = lh * c.patch, W0 = lw * c.patch;
+    const auto ys0 = minimax_h3::split_tiles(H0, c.tile_size,
+                                             c.tile_overlap_min, c.patch);
+    const auto xs0 = minimax_h3::split_tiles(W0, c.tile_size,
+                                             c.tile_overlap_min, c.patch);
+    _prog_total = chunks * (int)(ys0.start.size() * xs0.start.size());
+    _prog_done  = 0;
+  }
 
   for (int i = 0; i < chunks; ++i) {
     const int start = i * tcs;

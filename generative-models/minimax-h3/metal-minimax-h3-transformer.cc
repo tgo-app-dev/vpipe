@@ -143,6 +143,15 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path)
     if (!f.empty()) { return f; }
   }
   if (!fs::is_directory(p)) { return path; }
+  // A QUANTIZED repack: model-quantize keeps the repack's role subdirs and
+  // writes the component it quantized as a directory checkpoint inside its
+  // own, so `diffusion_models/` holds config.json + shards rather than one
+  // .safetensors. Probed after the repack file (a source repo has no
+  // config.json there, so the two never both match) and before the
+  // diffusers spellings below.
+  if (fs::exists(p / "diffusion_models" / "config.json")) {
+    return (p / "diffusion_models").string();
+  }
   if (fs::exists(p / "config.json") && !fs::exists(p / "transformer")) {
     return p.string();                       // already the transformer dir
   }
@@ -624,7 +633,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
       if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
     }
-    m->_blocks.resize((std::size_t)m->_pinned);
+    // Sized to the FULL depth even though only the pinned prefix is
+    // filled: the empty slots are where forward() promotes streamed
+    // blocks into as free memory allows (see set_residency_reserve).
+    // An unfilled slot reads as empty, which is what `held` tests.
+    m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < m->_pinned; ++i) {
       if (!m->load_block_(ws, blk_("blocks.", i, ""),
                           m->_blocks[(std::size_t)i], true, r)) {
@@ -895,6 +908,21 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
                                      const SharedBuffer& y, std::size_t y_off,
                                      int M, int N, int K, GemmRoute route)
 {
+  // Only the mma routes belong here, and this test has to come FIRST.
+  // route_ok_ answers "can this route run this shape", and for a STEEL
+  // route the answer is always yes -- so guarding with route_ok_ alone
+  // let every steel route fall into the matrix-core path and run the
+  // 128x128 tile anyway. Two consequences, both silent because the two
+  // paths agree numerically: the steel arms of the autotune measured mma
+  // (so the tuner compared one kernel against itself), and a tiny GEMM
+  // took the mma path regardless of _mma_min_m -- the M=2 AdaLN
+  // projection dequantized 520 MB to multiply two rows. Caught by
+  // scratch_estimate_matches_allocation, which noticed the dequant
+  // scratch existing at a geometry where it should not.
+  if (route != GemmRoute::kMma128 && route != GemmRoute::kMma128x256 &&
+      route != GemmRoute::kMma128x256Tn2) {
+    return false;
+  }
   if (!route_ok_(route, M, N, K)) { return false; }
   const SharedBuffer* wdense = nullptr;
   if (l.quantized) {
@@ -1174,6 +1202,162 @@ MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
 
 // ---- scratch ---------------------------------------------------------
 
+// The scratch a forward at this geometry needs, in bytes.
+//
+// It IS a second opinion about ensure_scratch_ -- the two list the same
+// buffers separately -- so what keeps them honest is
+// minimax_h3_dit.scratch_estimate_matches_allocation, which allocates at
+// a real geometry and compares this against scratch_resident_bytes(). Do
+// not add a buffer to one without the other; the test fails loudly if you
+// do, which is the point.
+//
+// That matters more here than it looks: at video sequence lengths this
+// scratch is the single largest live allocation the model makes, ~200 KB
+// PER ROW -- ~1.9 GB at the 9382-row production layout and ~3.9 GB at 19k
+// rows. An estimator that quietly under-reports is how a preflight passes
+// and the machine then thrashes, and on a 16 GB box thrashing is not an
+// OOM kill, it is a watchdog kernel panic.
+//
+// The dequant scratch is counted too. It is allocated lazily inside
+// gemm_mma_ rather than here, but it is just as resident and just as
+// large (the widest projection: 2*ffn x hidden = 308 MB at the released
+// config), so leaving it out would understate the peak by that much.
+namespace {
+
+// elems is in ELEMENTS of `esz` bytes; one row of the table per buffer
+// ensure_scratch_ allocates.
+struct ScratchItem { std::size_t mul_seq, mul_text, mul_t, esz; };
+
+std::vector<ScratchItem>
+scratch_plan_(const MetalMiniMaxH3Transformer::Config& c)
+{
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t I = (std::size_t)c.inner();
+  const std::size_t rot_half = (std::size_t)(3 * c.rope_freq_dim);
+  return {
+      {rot_half, 0, 0, sizeof(float)},           // rcos
+      {rot_half, 0, 0, sizeof(float)},           // rsin
+      {H, 0, 0, 2}, {H, 0, 0, 2}, {H, 0, 0, 2},  // x, nm, proj
+      {3 * I, 0, 0, 2},                          // qkv
+      {I, 0, 0, 2}, {I, 0, 0, 2}, {I, 0, 0, 2},  // qh, kh, vh
+      {I, 0, 0, 2}, {I, 0, 0, 2},                // oh, ob
+      {2 * (std::size_t)c.ffn, 0, 0, 2},         // ff
+      {0, H, 0, 2},                              // txt
+      {0, 0, (std::size_t)c.time_dim, 2},        // temb
+      {0, 0, (std::size_t)c.adaln_out(), 2},     // mod
+      {0, 0, 2 * H, 2},                          // fmod
+      {1, 0, 0, sizeof(int)},                    // adaln_idx
+      {1, 0, 0, sizeof(int)},                    // tstep_idx
+  };
+}
+
+}  // namespace
+
+std::size_t
+MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
+                                         int n_t, bool with_dequant)
+{
+  if (seq <= 0) { return 0; }
+  const std::size_t S = (std::size_t)seq;
+  const std::size_t T = (std::size_t)(n_text > 0 ? n_text : 0);
+  const std::size_t N = (std::size_t)(n_t > 0 ? n_t : 0);
+  std::size_t total = 0;
+  for (const ScratchItem& it : scratch_plan_(c)) {
+    total += (S * it.mul_seq + T * it.mul_text + N * it.mul_t) * it.esz;
+  }
+  if (with_dequant) {
+    // _w_deq is grown to the WIDEST projection that actually reaches
+    // gemm_mma_, and kept.
+    //
+    // Only the four whose M is the SEQUENCE length count. The two
+    // modulation projections are wider on paper -- the per-block AdaLN is
+    // [adaln_out, time_dim] = 496 MB against fc1's 294 -- but their M is
+    // the distinct-TIMESTEP count, a handful of rows, so they never clear
+    // the tile minimum and always run steel. Including them over-stated
+    // this by 212 MB.
+    //
+    // (That is also the shape of a bug this file had: gemm_mma_ once took
+    // the mma path for steel routes too, and the M=2 AdaLN really did
+    // dequantize 496 MB to multiply two rows. If _mma_min_m is dropped
+    // below the timestep count by hand, this estimate under-states again
+    // -- scratch_estimate_matches_allocation pins the default.)
+    const std::size_t H = (std::size_t)c.hidden;
+    const std::size_t I = (std::size_t)c.inner();
+    const std::size_t F = (std::size_t)c.ffn;
+    const std::size_t cand[] = {
+        3 * I * H,   // qkv
+        H * I,       // out
+        2 * F * H,   // fc1 -- the widest of these
+        H * F,       // fc2
+    };
+    std::size_t widest = 0;
+    for (std::size_t v : cand) { widest = std::max(widest, v); }
+    total += widest * 2;
+  }
+  return total;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::scratch_resident_bytes() const
+{
+  const metal_compute::SharedBuffer* all[] = {
+      &_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.qh, &_s.kh, &_s.vh,
+      &_s.oh, &_s.ob, &_s.ff, &_s.proj, &_s.txt, &_s.temb, &_s.mod,
+      &_s.fmod, &_s.adaln_idx, &_s.tstep_idx};
+  std::size_t total = 0;
+  for (const metal_compute::SharedBuffer* b : all) { total += b->byte_size(); }
+  return total;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::dequant_scratch_bytes() const
+{
+  return _w_deq.byte_size();
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
+{
+  const metal_compute::SharedBuffer* all[] = {
+      &b.n1, &b.n2, &b.qn, &b.kn,
+      &b.qkv.w, &b.qkv.b, &b.qkv.codes, &b.qkv.scales, &b.qkv.qbias,
+      &b.out.w, &b.out.b, &b.out.codes, &b.out.scales, &b.out.qbias,
+      &b.fc1.w, &b.fc1.b, &b.fc1.codes, &b.fc1.scales, &b.fc1.qbias,
+      &b.fc2.w, &b.fc2.b, &b.fc2.codes, &b.fc2.scales, &b.fc2.qbias,
+      &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
+      &b.adaln.qbias};
+  std::size_t n = 0;
+  for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
+  return n;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::release_resident_blocks(std::size_t bytes)
+{
+  // Evict from the TAIL down, so what remains stays a contiguous prefix.
+  // In a cyclic scan every block is worth the same, so there is nothing
+  // cleverer to choose and a prefix keeps the bookkeeping trivial. The
+  // pinned prefix is never touched.
+  int next = (int)_blocks.size() - 1;
+  const std::size_t freed = _resid.release(bytes, [&]() -> std::size_t {
+    for (; next >= _pinned; --next) {
+      Block& b = _blocks[(std::size_t)next];
+      const std::size_t n = block_bytes_(b);
+      if (n == 0) { continue; }
+      b = Block{};
+      --next;
+      return n;
+    }
+    return 0;
+  });
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalMiniMaxH3Transformer: released {} MB of resident blocks "
+        "({} left)", freed >> 20, _resid.count()));
+  }
+  return freed;
+}
+
 bool
 MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
 {
@@ -1269,6 +1453,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (!ensure_scratch_(seq, n_text, n_t)) {
     return fail("activation allocation failed (out of GPU memory)");
   }
+  // Re-arm growth for this forward. The per-forward flag is what stops
+  // the budget being re-queried for every one of 50 blocks once the
+  // answer is no; the RATCHET (_resid_ceiling) is what survives across
+  // forwards, so a set that was cut back does not simply refill next
+  // step. Scratch is allocated by now, so what the budget reports here
+  // already has it subtracted.
+  _resid.begin_forward();
   Scratch& s = _s;
   // Measure the GEMM tile for THIS sequence length, before the stream
   // opens -- the tuner needs its own command buffers, and the answer has
@@ -1645,6 +1836,21 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 
     // ---- 3. the block stack ------------------------------------------
     for (int Lx = 0; Lx < c.n_layers; ++Lx) {
+      // Cooperative stop, checked EVERY block rather than only on the
+      // streamed tail. The denoise loop already stops between steps, but
+      // a step here is one pass over 50 blocks of a 33B stack -- tens of
+      // seconds -- so between-step is not responsive enough for someone
+      // who has pressed stop. Per block it lands in about a block.
+      //
+      // Returning empty is how forward() reports "no velocity": the
+      // caller already treats that as a failed/abandoned step and the
+      // denoise unwinds. Anything already encoded is dropped with the
+      // stream, and the scratch is reused rather than freed, so bailing
+      // mid-stack leaks nothing.
+      if (_stream_stop && _stream_stop()) {
+        if (err != nullptr) { *err = "stopped"; }
+        return {};
+      }
       if (_block_progress) { _block_progress(Lx, c.n_layers); }
       // Pinned prefix (Lx < _pinned) is resident in _blocks; the tail is
       // read from the retained weight set into a loop-local Block and
@@ -1652,7 +1858,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // deferred stream, so the block's work has to be committed and
       // WAITED FOR before its weights go away -- an encoded GEMM holds
       // the buffer by pointer, not by reference.
-      const bool streaming = _stream_blocks && Lx >= _pinned;
+      // Resident if it was pinned at load OR promoted by a previous pass;
+      // `_blocks` is sized to n_layers in streaming mode and an unfilled
+      // slot reads as empty.
+      const bool held = Lx < (int)_blocks.size() &&
+                        !_blocks[(std::size_t)Lx].qkv.empty();
+      const bool streaming = _stream_blocks && !held;
       Block streamed;
       if (streaming) {
         if (!load_block_(*_ws, blk_("blocks.", Lx, ""), streamed, true,
@@ -1716,6 +1927,30 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
       }
+      // A RESIDENT stack encodes all 50 blocks in milliseconds and then
+      // runs for a minute, so `_block_progress` -- which fires at the top
+      // of each iteration, on the ENCODE thread -- would race to 100% and
+      // sit there. The streamed path does not have that problem only
+      // because it must already commit-and-wait per block to free the
+      // weights, which paces its callbacks against real work by accident.
+      //
+      // So take the same barrier deliberately when someone is watching.
+      // It costs a commit and a re-encode per block -- sub-millisecond
+      // against ~1.5 s of GPU per block at production geometry, and there
+      // is no CPU work to overlap with anyway, since encoding is the only
+      // thing this thread does. Gated on the callback so a run with no UI
+      // attached keeps one uninterrupted stream.
+      if (!streaming && _block_progress) {
+        enc.end();
+        std::string blk_err;
+        if (!stream.commit().wait_ok(&blk_err)) {
+          return fail("block " + std::to_string(Lx) + ": " +
+                      (blk_err.empty() ? std::string("GPU error") : blk_err));
+        }
+        stream = _mc->make_command_stream();
+        enc = stream.begin_compute();
+        mark = std::chrono::steady_clock::now();
+      }
       if (streaming) {
         enc.end();
         std::string blk_err;
@@ -1726,6 +1961,27 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+        // The commit above has been WAITED for, so nothing encoded still
+        // points at this block's buffers -- which is exactly why the
+        // promotion happens here and not at the top of the iteration.
+        // Keeping it costs nothing extra: the bytes are already resident,
+        // and the alternative is dropping them and re-reading the same
+        // block from disk on the next of 30-odd steps.
+        if (Lx < (int)_blocks.size()) {
+          const std::size_t nb = block_bytes_(streamed);
+          if (_resid.admit(_mc, nb)) {
+            _blocks[(std::size_t)Lx] = std::move(streamed);
+            _resid.note_admitted(nb);
+            if (_mc->session() != nullptr) {
+              const auto mb = _mc->memory_budget();
+              _mc->session()->log_debug(fmt(
+                  "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
+                  "{} MB; {} MB reclaimable, reserve {} MB)", Lx,
+                  _resid.count() + _pinned, c.n_layers, _resid.bytes() >> 20,
+                  mb.available_physical >> 20, _resid.reserve() >> 20));
+            }
+          }
+        }
       }
     }
 

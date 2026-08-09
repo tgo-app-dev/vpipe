@@ -453,6 +453,87 @@ TEST(model_quantize_stage, gemma_quantize_generates)
   EXPECT_TRUE(ans.find("Paris") != std::string::npos);
 }
 
+// A diffusers pipeline root must take the DIFFUSERS path, not the
+// Comfy-Org repack one.
+//
+// Both layouts are multi-component and both get a self-contained output, so
+// the only thing separating them is the discriminator -- and the first cut
+// of it got this wrong in a way no H3 test could see. It asked "does
+// comfy::scan_repo find any component?", whose role list includes `vae/`;
+// every diffusers root has one, and a diffusers VAE's safetensors carries a
+// `__metadata__` (`{"format": "pt"}`) like any other. So EVERY Krea-2 /
+// FLUX.2 / QIE / Mage-Flow / Wan checkpoint matched, went down the repack
+// path, and died looking for a `diffusion_models/` that a diffusers tree
+// never has. The discriminator is now that directory's presence and
+// nothing else.
+//
+// Runs on a synthetic tree with no weights, deliberately: what is under
+// test is the ROUTING, which happens before anything is read. The quantize
+// itself then fails (there is nothing to quantize), and that is fine --
+// what distinguishes the two paths is observable first. The diffusers path
+// assembles the output before quantizing, so `out/vae/` exists; the repack
+// path refuses before creating anything.
+TEST(model_quantize_stage, a_diffusers_root_is_not_read_as_a_repack)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  const fs::path root = fs::temp_directory_path() /
+                        ("vpipe-mq-diffusers-" + std::to_string(::getpid()));
+  const fs::path out = fs::temp_directory_path() /
+                       ("vpipe-mq-diffusers-out-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::remove_all(out, ec);
+
+  fs::create_directories(root / "transformer");
+  fs::create_directories(root / "vae");
+  {
+    std::ofstream f(root / "transformer" / "config.json");
+    f << "{\"_class_name\": \"Flux2Transformer2DModel\", \"num_layers\": 1}";
+  }
+  {
+    std::ofstream f(root / "model_index.json");
+    f << "{\"_class_name\": \"Flux2Pipeline\"}";
+  }
+  // The VAE that fooled the first discriminator: a real safetensors header
+  // carrying the `{"format": "pt"}` metadata torch writes by default.
+  {
+    const std::string hdr =
+        "{\"__metadata__\":{\"format\":\"pt\"},\"w\":{\"dtype\":\"F32\","
+        "\"shape\":[1],\"data_offsets\":[0,4]}}";
+    std::ofstream f(root / "vae" / "diffusion_pytorch_model.safetensors",
+                    std::ios::binary);
+    const std::uint64_t n = hdr.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    const float zero = 0.0f;
+    f.write(reinterpret_cast<const char*>(&zero), 4);
+  }
+
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("src_model", FlexData::make_string(root.string()));
+    o.insert("output_name", FlexData::make_string(out.string()));
+    o.insert("target", FlexData::make_string("dit"));
+    o.insert("bits", FlexData::make_int(4));
+    o.insert("skip_existing", FlexData::make_bool(false));
+  }
+  ModelQuantizeStage s(&sess, "mq-diffusers", std::vector<InEdge>{},
+                       std::move(cfg));
+  ASSERT_TRUE(s.config_error().empty());
+  if (sess.metal_compute() == nullptr) { return; }
+  s.quantize_once();   // fails on the missing weights; the ROUTING is the test
+
+  // The diffusers path copies the siblings in before it quantizes, so this
+  // is proof it ran. Under the repack misrouting nothing is created at all.
+  EXPECT_TRUE(fs::exists(out / "vae" / "diffusion_pytorch_model.safetensors",
+                         ec));
+  EXPECT_TRUE(fs::exists(out / "model_index.json", ec));
+  fs::remove_all(root, ec);
+  fs::remove_all(out, ec);
+}
+
 // Mage-Flow DiT quantization: the family is detected from the transformer's
 // `_class_name` ("MageFlow"), shares Qwen-Image's quant leaf set (identical
 // tensor names) and takes its block count from `depth`, not `num_layers`.

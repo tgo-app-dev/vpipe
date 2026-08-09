@@ -195,6 +195,22 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family)
       }
     }
   }
+  // A repack this stage has ALREADY quantized: the role subdirs survive and
+  // the quantized component is a directory checkpoint inside its own, so the
+  // DiT is at `diffusion_models/config.json` rather than being a file with
+  // an embedded config. Probed after the repack file above -- a source repo
+  // has no config.json there, so the two never both match -- and before the
+  // diffusers spellings below, which would otherwise not match at all and
+  // send a chain's second pass down the LM path to fail with "no submodule
+  // matching target 'text_encoder'".
+  {
+    const fs::path q = fs::path(src_dir) / "diffusion_models" / "config.json";
+    const std::string fam_q = family_of(q);
+    if (!fam_q.empty()) {
+      if (family != nullptr) { *family = fam_q; }
+      return q.parent_path().string();
+    }
+  }
   std::string fam = family_of(fs::path(src_dir) / "config.json");
   if (!fam.empty()) { if (family) { *family = fam; } return src_dir; }
   const fs::path sub = fs::path(src_dir) / "transformer";
@@ -623,12 +639,15 @@ constexpr ConfigKey kAttrs[] = {
           "so the ~1.5 GB it costs at bf16 is pure carry",
    .def_bool = false},
   {.key = "quant_modulation", .type = ConfigType::Bool,
-   .doc = "Qwen-Image-Edit and Boogu-Image DiTs: also quantize the AdaLN "
-          "modulation projections (QIE *_mod.1; Boogu norm*.linear). They are "
-          "the largest weights left bf16 -- QIE ~13 GB -> ~3.4 GB, Boogu 2.1 GB "
-          "-> ~1.1 GB, which is what lets the whole DiT fit a 16 GB box -- but "
-          "precision-sensitive, so they are kept bf16 by default and forced to "
-          "8-bit (not the body's bit-width) when you opt in here",
+   .doc = "Qwen-Image-Edit, Boogu-Image, Wan and MiniMax-H3 DiTs: also "
+          "quantize the AdaLN modulation projections (QIE *_mod.1; Boogu "
+          "norm*.linear; H3 adaln_proj.linear). They are the largest weights "
+          "left bf16 -- QIE ~13 GB -> ~3.4 GB, Boogu 2.1 GB -> ~1.1 GB, and "
+          "on H3 the modulation is 13B of the 33B, so leaving it bf16 holds a "
+          "4-bit checkpoint at ~36 GB -- which is what lets the whole DiT fit "
+          "a 16 GB box, but precision-sensitive, so they are kept bf16 by "
+          "default and forced to 8-bit (not the body's bit-width) when you "
+          "opt in here",
    .def_bool = false},
 };
 // Trigger iport (optional, any beat) + summary oport -- see model-fetch
@@ -761,11 +780,22 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   std::string t2i_family;
   const std::string dit_dir = resolve_t2i_dit_dir_(src_dir, &t2i_family);
   if (!dit_dir.empty()) {
+    // A Comfy-Org REPACK root is tested FIRST, and the order is
+    // load-bearing rather than stylistic. A repack's components live in
+    // role subdirs (diffusion_models/, text_encoders/, vae/), and once
+    // this pass has quantized one of them that subdir holds a DIRECTORY
+    // checkpoint -- so `resolve` returns a directory and the is_root test
+    // below would read the output of a first pass as a diffusers root,
+    // then fail looking for a `transformer/` that a repack never has.
+    // Testing the repack shape first is what makes a chain work.
+    if (is_comfy_root_(src_dir)) {
+      return quantize_comfy_pipeline_(src_dir, t2i_family, dit_dir, out_dir,
+                                      stop);
+    }
     // src is the pipeline ROOT -- a directory holding transformer/ and
-    // its siblings. A resolution to a FILE is not that: a Comfy-Org
-    // repack ships one .safetensors per component and no pipeline
-    // manifest, so there is nothing to copy around the DiT and it takes
-    // the bare-component path below.
+    // its siblings. A resolution to a FILE is not that: a bare component
+    // named directly has nothing to copy around it and takes the
+    // single-component path below.
     const bool is_root =
         (dit_dir != src_dir) && fs::is_directory(fs::path(dit_dir), ec);
     if (is_root) {
@@ -774,50 +804,18 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
       // Chainable across passes (DiT, then text_encoder, ...).
       return quantize_t2i_pipeline_(src_dir, t2i_family, out_dir, stop);
     }
-    // A Comfy-Org repo reaches here as the DiT FILE. `target` then picks
-    // a SIBLING component out of the same repo -- the layout has no
-    // subdirectory per component for the pipeline path below to walk, so
-    // the selection happens here instead.
+    // A single component named DIRECTLY (a path to one .safetensors, not
+    // to the repo around it). Sibling selection is not possible from here
+    // -- there is no repo to select out of -- and it is not a silent
+    // fallback either: naming a file and asking for a different component
+    // is a contradiction worth reporting, since the fix is to point
+    // src_model at the model root and take the self-contained path above.
     if (!_target.empty() && t2i_target_subdir_(_target) != "transformer" &&
         !fs::is_directory(fs::path(dit_dir), ec)) {
-      const std::string sub = t2i_target_subdir_(_target);
-      if (sub == "text_encoder") {
-        const std::string enc = genai::comfy::resolve_component(
-            src_dir, "text_encoders", "minimax_h3_te", {"qwen3vl"});
-        if (enc.empty()) {
-          // The catalogue DOES pin the bf16 encoder, so reaching here
-          // means either a partial checkout or a repo holding only the
-          // int8_convrot / nvfp4_awq packings, which resolve_component
-          // skips because nothing here reads them. Name both, since the
-          // fix differs: re-fetch versus "that precision is not usable".
-          session()->warn(fmt(
-              "ModelQuantizeStage('{}'): '{}' has no READABLE text encoder "
-              "under text_encoders/ -- either the checkout is partial "
-              "(the catalogue pins the bf16 one) or it holds only "
-              "packings this build cannot read", this->id(), src_dir));
-          return false;
-        }
-        // The output is a directory checkpoint from here on, so it
-        // registers as an encoder like any other -- the quantizer writes
-        // it the config.json the repack does not have.
-        if (!quantize_text_encoder_(enc, out_dir, src_dir, stop)) {
-          return false;
-        }
-        session()->log_normal(fmt(
-            "ModelQuantizeStage('{}'): quantized Comfy-Org text encoder "
-            "'{}' -> '{}' ({}-bit g{})", this->id(), enc, out_dir, _bits,
-            _group_size));
-        if (!explicit_path) {
-          register_output_(_output_name, out_dir, "minimax-h3-text-encoder",
-                           _bits);
-        }
-        return true;
-      }
       session()->warn(fmt(
-          "ModelQuantizeStage('{}'): target='{}' is not quantizable for the "
-          "Comfy-Org repack '{}' -- VAE quantization is not supported for "
-          "any family (a diffusion VAE is a conv net, not a Linear stack)",
-          this->id(), _target, src_dir));
+          "ModelQuantizeStage('{}'): src '{}' names a single component; "
+          "target='{}' selects a SIBLING, which needs the repo root -- "
+          "point src_model at the model root", this->id(), src_dir, _target));
       return false;
     }
     // src is a bare transformer dir -> transformer-only output for the
@@ -1663,6 +1661,180 @@ ModelQuantizeStage::quantize_t2i_pipeline_(
       _group_size, _mixed ? " mixed" : "", _awq ? " awq" : ""));
 
   // 3. Register as a full pipeline (usable directly as an hf_dir).
+  const bool explicit_path =
+      _output_name[0] == '/' ||
+      _output_name.rfind("./", 0) == 0 || _output_name.rfind("../", 0) == 0;
+  if (!explicit_path) {
+    register_output_(_output_name, out_dir, family, _bits);
+  }
+  return true;
+}
+
+std::string
+ModelQuantizeStage::comfy_target_subdir_(const std::string& target)
+{
+  const std::string sub = t2i_target_subdir_(target);
+  if (sub == "transformer") { return "diffusion_models"; }
+  if (sub == "text_encoder" || sub == "mllm") { return "text_encoders"; }
+  if (sub == "vae") { return "vae"; }
+  return {};
+}
+
+bool
+ModelQuantizeStage::is_comfy_root_(const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  // `diffusion_models/` is the whole test, and it is deliberately the ONLY
+  // one. A repack names its DiT role directory that; a diffusers pipeline
+  // root never does -- it uses transformer/ (or unet/).
+  //
+  // The obvious-looking alternative, "scan_repo finds any component", is
+  // WRONG and was caught by model_quantize_stage.mage_flow_dit_quantizes:
+  // scan_repo's role list includes `vae/`, which every diffusers root also
+  // has, and a diffusers VAE's safetensors carries a `__metadata__` like
+  // any other -- so every Krea-2 / FLUX.2 / QIE / Mage / Wan checkpoint
+  // matched and got routed down the repack path, which then failed
+  // looking for a diffusion_models/ that a diffusers tree never has.
+  //
+  // One check also covers the already-quantized case for free: a pass
+  // writes its output as a directory INSIDE the role dir, so
+  // `diffusion_models/` exists whether it holds the repack file or the
+  // quantized checkpoint. That is what lets a chain re-enter here.
+  return fs::is_directory(fs::path(dir) / "diffusion_models", ec) && !ec;
+}
+
+// The self-contained pass for a Comfy-Org repack.
+//
+// Structurally this is quantize_t2i_pipeline_ with one difference, and it is
+// worth naming because it is the only thing that makes the layout awkward: a
+// repack component is a FILE (`diffusion_models/minimax_h3_fl2va_bf16.
+// safetensors`) while a quantized component is a DIRECTORY checkpoint
+// (config.json + shards). So the output cannot be byte-for-byte the same
+// shape as the input -- the quantized role subdir becomes a directory.
+//
+// Everything downstream is taught to accept either, which is why that is a
+// tolerable asymmetry rather than a new format: MetalMiniMaxH3Transformer::
+// resolve_dit_dir and MiniMaxH3TextEncoder::resolve_encoder_dir both probe
+// the repack file first and the quantized directory second, so one path
+// serves an original repack, a half-quantized chain output, and a fully
+// quantized one.
+bool
+ModelQuantizeStage::quantize_comfy_pipeline_(
+    const std::string& root, const std::string& family,
+    const std::string& dit_path, const std::string& out_dir,
+    const std::function<bool()>& stop)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+
+  const std::string tgt = comfy_target_subdir_(_target);
+  if (tgt.empty()) {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): target '{}' is not a {} component "
+        "(want dit | text_encoder)", this->id(), _target, family));
+    return false;
+  }
+  if (tgt == "vae") {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): VAE quantization is not supported (the "
+        "diffusion VAE is a conv net, not a Linear stack); no pass performed",
+        this->id()));
+    return false;
+  }
+  if (!fs::is_directory(fs::path(root) / tgt, ec)) {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): {} repack '{}' has no '{}/' component to "
+        "quantize", this->id(), family, root, tgt));
+    return false;
+  }
+  // Resolve the component to read. Both arms accept the repack FILE or an
+  // already-quantized directory, so a chain can quantize in either order.
+  std::string tgt_src;
+  if (tgt == "diffusion_models") {
+    tgt_src = dit_path;
+  } else {
+    tgt_src = genai::comfy::resolve_component(root, "text_encoders",
+                                              "minimax_h3_te", {"qwen3vl"});
+    if (tgt_src.empty() &&
+        fs::exists(fs::path(root) / tgt / "config.json", ec)) {
+      tgt_src = (fs::path(root) / tgt).string();   // already quantized
+    }
+  }
+  if (tgt_src.empty()) {
+    // The catalogue pins the bf16 encoder, so an empty resolution means
+    // either a partial checkout or a repo holding only the int8_convrot /
+    // nvfp4_awq packings, which resolve_component skips because nothing
+    // here reads them. Name both: the fix differs.
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): '{}' has no READABLE {} -- either the "
+        "checkout is partial (the catalogue pins the bf16 one) or it holds "
+        "only packings this build cannot read", this->id(), root, tgt));
+    return false;
+  }
+  if (_skip_existing &&
+      fs::exists(fs::path(out_dir) / tgt / "config.json", ec)) {
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): output '{}' already has a quantized {}; "
+        "skipping", this->id(), out_dir, tgt));
+    return true;
+  }
+
+  session()->info(fmt(
+      "ModelQuantizeStage('{}'): {} repack '{}' -> '{}' (quantizing {}, "
+      "copying the other components)", this->id(), family, root, out_dir,
+      tgt));
+
+  // 1. Assemble the self-contained output: every top-level entry except the
+  //    target role, hard-linked where the destination is on the same device
+  //    so the pass-through costs no extra bytes.
+  fs::create_directories(out_dir, ec);
+  {
+    std::vector<fs::path> comps;
+    std::size_t total = 0;
+    for (const auto& e : fs::directory_iterator(root, ec)) {
+      if (e.path().filename().string() == tgt) { continue; }
+      comps.push_back(e.path());
+      total += count_files_(e.path());
+    }
+    UiProgress bar = session()->open_progress("copy components");
+    std::size_t done = 0;
+    for (const auto& c : comps) {
+      if (!link_or_copy_tree_(c, fs::path(out_dir) / c.filename(), ec, stop,
+                              [&] {
+                                ++done;
+                                bar.update(done, total);
+                              })) {
+        session()->info(fmt(
+            "ModelQuantizeStage('{}'): stopped while assembling '{}'",
+            this->id(), out_dir));
+        return false;
+      }
+    }
+    bar.finish();
+  }
+  session()->log_debug(fmt(
+      "ModelQuantizeStage('{}'): copied {} components (all but {}) into '{}'",
+      this->id(), family, tgt, out_dir));
+
+  // 2. Quantize the target into out_dir/<role>.
+  const std::string tgt_out = (fs::path(out_dir) / tgt).string();
+  bool ok = false;
+  if (tgt == "diffusion_models") {
+    // calib_root is the REPO, which is where an on-device DiT calibration
+    // would read the encoder and tokenizer from.
+    ok = quantize_dit_component_(tgt_src, tgt_out, family, root, stop);
+  } else {
+    ok = quantize_text_encoder_(tgt_src, tgt_out, root, stop);
+  }
+  if (!ok) { return false; }
+
+  session()->log_normal(fmt(
+      "ModelQuantizeStage('{}'): quantized {} {} '{}' -> self-contained "
+      "'{}' ({}-bit g{}{}{})", this->id(), family, tgt, root, out_dir, _bits,
+      _group_size, _mixed ? " mixed" : "", _awq ? " awq" : ""));
+
+  // 3. Register as a full model root, exactly as the diffusers path does.
   const bool explicit_path =
       _output_name[0] == '/' ||
       _output_name.rfind("./", 0) == 0 || _output_name.rfind("../", 0) == 0;

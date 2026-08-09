@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/dit-block-progress.h"
 
 #include <cstddef>
 #include <memory>
@@ -218,6 +219,18 @@ class MetalMiniMaxH3VideoVae {
 
   const Config& config() const { return _cfg; }
 
+  // Per-TILE progress out of decode_video / decode_tiled_. A 960x544
+  // clip is ~15 tiles per chunk of a 2.4B ViT -- around a minute during
+  // which nothing else this class does is observable -- so without it a
+  // caller can only report the decode as one indivisible step.
+  //
+  // Fires on the encode thread between tiles; must be cheap and must not
+  // re-enter the decoder. See VaeTileProgressFn for the counting rule.
+  void set_tile_progress(genai::VaeTileProgressFn fn)
+  {
+    _tile_progress = std::move(fn);
+  }
+
  private:
   MetalMiniMaxH3VideoVae() = default;
 
@@ -364,6 +377,12 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep;
   metal_compute::ComputeFunction _fn_dequant4, _fn_dequant8;
   metal_compute::SharedBuffer _w_deq;
+  // Tile progress, and the counters it reports against. `_prog_total`
+  // is set by decode_video (chunks x tiles) so the bar spans the whole
+  // clip; a bare decode_tiled_ call sets it to its own tile count.
+  genai::VaeTileProgressFn _tile_progress;
+  int _prog_done = 0;
+  int _prog_total = 0;
   bool _use_mma2 = false;
   int _mma_min_m = 64;
   bool _attn_nax = false;

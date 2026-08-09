@@ -22,6 +22,7 @@
 #include "stages/model-registry.h"
 #include "stages/model-select-stage.h"
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <streambuf>
@@ -210,12 +211,25 @@ TEST(model_select, apply_beat_parses_forms)
   }
 }
 
-// Every stage in the split diffusion flow shares ONE model, so their model
-// pickers must offer the SAME families -- a model-select that cannot pick a
-// family the conditioner/DiT/VAE support is a dead end for the user, and that
-// is exactly how the Mage-Flow families were missed when they were added to
-// the other four. This pins the set across all five specs so the next family
-// cannot be wired into some of them only.
+// Every stage in the split diffusion flow shares ONE model, so a family the
+// consumers can run must be pickable at the SOURCE -- a model-select that
+// cannot pick a family the conditioner/DiT/VAE support is a dead end for the
+// user, and that is exactly how the Mage-Flow families were missed when they
+// were added to the other four, and later how minimax-h3-fl2va was missing
+// from model-select while a whole text-to-video graph ran it.
+//
+// This used to demand that all five lists be IDENTICAL, which held only
+// while every consumer ran every family. It stopped being true once the
+// flow grew a second DiT: generate-image runs the image families and
+// generate-video the video ones, and neither can run the other's. So the
+// invariant is now the one that actually generalises --
+//
+//   model-select's list == the UNION of its consumers' lists
+//
+// which is two properties at once: nothing runnable is unpickable at the
+// source (a new family wired into a consumer only), and nothing pickable
+// at the source is unrunnable everywhere (a family removed from the last
+// consumer that had it, or a typo in one list).
 TEST(model_select, diffusion_pickers_offer_the_same_families)
 {
   auto types_of = [](const StageSpec& sp) -> std::string {
@@ -226,29 +240,72 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
     }
     return "<no hf_dir key>";
   };
-  const char* names[] = {"model-select", "diffusion-conditioner",
-                         "generate-image", "vae-encode", "vae-decode"};
+  auto split = [](const std::string& csv) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i <= csv.size()) {
+      const std::size_t k = csv.find(',', i);
+      const std::size_t e = (k == std::string::npos) ? csv.size() : k;
+      if (e > i) { out.push_back(csv.substr(i, e - i)); }
+      if (k == std::string::npos) { break; }
+      i = k + 1;
+    }
+    return out;
+  };
+  // Every stage that latches model-select's beat on a `model` iport.
+  const char* consumers[] = {"diffusion-conditioner", "generate-image",
+                             "generate-video", "vae-encode", "vae-decode",
+                             "audio-vae-decode"};
   const StageRegistry& reg = StageRegistry::get();
-  const StageSpec* specs[5] = {};
-  for (int i = 0; i < 5; ++i) {
-    specs[i] = reg.spec(names[i]);
-    ASSERT_TRUE(specs[i] != nullptr);
-  }
-  const std::string want = types_of(*specs[0]);
+  const StageSpec* src = reg.spec("model-select");
+  ASSERT_TRUE(src != nullptr);
+  const std::string want = types_of(*src);
   ASSERT_TRUE(!want.empty() && want != "<no hf_dir key>");
-  bool all_same = true;
-  for (int i = 0; i < 5; ++i) {
-    const std::string got = types_of(*specs[i]);
-    std::printf("[model_select] %-22s hf_dir suggest_db_type = %s\n", names[i],
+  std::printf("[model_select] %-22s hf_dir suggest_db_type = %s\n",
+              "model-select", want.c_str());
+
+  const std::vector<std::string> offered = split(want);
+  std::vector<std::string> seen;          // the union over the consumers
+  for (const char* nm : consumers) {
+    const StageSpec* sp = reg.spec(nm);
+    ASSERT_TRUE(sp != nullptr);
+    const std::string got = types_of(*sp);
+    std::printf("[model_select] %-22s hf_dir suggest_db_type = %s\n", nm,
                 got.c_str());
-    if (got != want) { all_same = false; }
+    for (const std::string& fam : split(got)) {
+      // A consumer offering what the shared source cannot emit is the
+      // same dead end seen from the other side.
+      const bool at_source =
+          std::find(offered.begin(), offered.end(), fam) != offered.end();
+      if (!at_source) {
+        std::printf("[model_select] '%s' offers family '%s', model-select does "
+                    "NOT\n", nm, fam.c_str());
+      }
+      EXPECT_TRUE(at_source);
+      if (std::find(seen.begin(), seen.end(), fam) == seen.end()) {
+        seen.push_back(fam);
+      }
+    }
   }
-  EXPECT_TRUE(all_same);
+  // ...and the other direction: nothing the source offers is orphaned.
+  for (const std::string& fam : offered) {
+    const bool runnable =
+        std::find(seen.begin(), seen.end(), fam) != seen.end();
+    if (!runnable) {
+      std::printf("[model_select] model-select offers '%s' but NO consumer "
+                  "runs it\n", fam.c_str());
+    }
+    EXPECT_TRUE(runnable);
+  }
   // And the set must actually contain every diffusion family the flow
   // supports, so a future family shows up here rather than silently nowhere.
+  // The video families are named for the same reason the image ones are:
+  // they were added to the DiT and the VAEs before the picker.
   for (const char* fam : {"krea2", "flux2", "qwen-image-edit", "mage-flow",
-                          "mage-flow-edit"}) {
-    const bool present = want.find(fam) != std::string::npos;
+                          "mage-flow-edit", "boogu-image", "boogu-image-edit",
+                          "wan-t2v", "wan-i2v", "minimax-h3-fl2va"}) {
+    const bool present =
+        std::find(offered.begin(), offered.end(), fam) != offered.end();
     if (!present) {
       std::printf("[model_select] MISSING family '%s' from the pickers\n", fam);
     }

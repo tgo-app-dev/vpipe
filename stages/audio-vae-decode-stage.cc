@@ -5,6 +5,7 @@
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-registry.h"
@@ -71,6 +72,15 @@ const StageSpec kSpec = {
 std::string
 audio_vae_family_(const std::string& vae_dir)
 {
+  // A Comfy-Org repack has no config.json anywhere: resolve_vae_dir hands
+  // back the .safetensors itself and the architecture is named by that
+  // file's `__metadata__` key. Checking it first is what keeps this stage
+  // from reporting "holds no audio VAE" for a checkpoint that plainly has
+  // one -- the resolver had already found it, and only the detection
+  // below assumed a directory.
+  if (genai::comfy::is_component(vae_dir, "minimax_h3_audio_vae")) {
+    return "minimax-h3";
+  }
   std::ifstream in(std::filesystem::path(vae_dir) / "config.json");
   if (!in) { return {}; }
   FlexData fd;
@@ -240,9 +250,25 @@ AudioVaeDecodeStage::ensure_loaded_()
   }
   _h3_vae = genai::MetalMiniMaxH3AudioVae::load(vae_dir, mc, cfg);
   if (!_h3_vae) {
+    // Naming the likely cause, because the config parsed a moment ago and
+    // "could not load" alone points at the path -- which by here is known
+    // good. Comfy-Org's repack of this component is not a re-encoding of
+    // the released tensors but a DIFFERENT serialization: the weight-norm
+    // parametrization is folded (no `.weight_v`) and the conv stack is
+    // nested under `decoder.` / `encoder.` instead of the flat `conv_pre`
+    // / `conv_post` this loader reads. That is a port, not a path, so it
+    // fails here rather than being guessed at.
+    const bool comfy =
+        genai::comfy::is_component(vae_dir, "minimax_h3_audio_vae");
     session()->error(fmt(
         "AudioVaeDecodeStage('{}'): could not load the MiniMax-H3 audio "
-        "VAE from '{}'; inert", this->id(), vae_dir));
+        "VAE from '{}'; inert{}", this->id(), vae_dir,
+        comfy ? " -- this is a Comfy-Org repack, whose audio VAE uses a "
+                "different tensor naming (folded weight-norm, decoder.* / "
+                "encoder.* prefixes) than the released checkpoint this "
+                "loader reads. The video path is unaffected; generate "
+                "without audio, or point hf_dir at the MiniMaxAI release"
+              : ""));
     return;
   }
   session()->info(fmt(

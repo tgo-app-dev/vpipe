@@ -108,6 +108,22 @@ class MetalWanVae {
   {
     return video_frames > 0 ? 1 + (video_frames - 1) / 4 : 0;
   }
+  // The next frame count at or above `n` that this chunking can represent.
+  // Counts that are not 4k+1 have no latent form at all -- the first frame
+  // is its own chunk and every later chunk is exactly four -- so a caller
+  // handed 80 has to become 81 rather than be truncated to 77: rounding
+  // DOWN would silently deliver less video than was asked for, where
+  // rounding up costs at most three frames nobody notices.
+  //
+  // Named beside its inverses on purpose. This rule is the VAE's, not the
+  // DiT's or a stage's, and every place that has to honour it should be
+  // reading it from the same one line. MiniMax-H3's counterpart is
+  // `minimax_h3::align_num_frames`.
+  static int align_num_frames(int n)
+  {
+    if (n <= 1) { return 1; }
+    return n + ((1 - n % 4) + 4) % 4;
+  }
 
   // Called once per decoded CHUNK with that chunk's frames, channel-first
   // [3, n, h8*8, w8*8] f16 in [-1, 1], and the index of its first frame in

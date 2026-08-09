@@ -31,6 +31,24 @@ namespace vpipe::genai {
 // model.
 using DitBlockProgressFn = std::function<void(int done, int total)>;
 
+// The same shape, out of a video VAE's decode.
+//
+// Separate name, identical signature: a VAE decode is not a stack of
+// blocks and its unit is the TILE (a clip is chunked in time and each
+// chunk tiled in space), so a caller reading `DitBlockProgressFn` on a
+// VAE would be told the wrong thing about what it counts. The H3 decoder
+// is a 2.4B ViT run once per tile, so at 960x544 a clip is ~15 tiles per
+// chunk and a minute of otherwise silent work.
+//
+// Fired on BOTH edges of each tile: once on entry with the tiles finished
+// before it, once on exit with that count incremented. So `done` starts at
+// 0 and does reach `total`, and the caller needs no completion call of its
+// own -- which matters because a caller closes its bar the instant the
+// decode returns, and a completion it sets a microsecond earlier is never
+// repainted. (The DiT's above cannot do this: its block loop has early
+// exits, so entry is the one point every block passes through.)
+using VaeTileProgressFn = std::function<void(int done, int total)>;
+
 }
 
 #endif

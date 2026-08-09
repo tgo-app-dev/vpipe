@@ -22,6 +22,7 @@
 #include "minitest.h"
 
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "common/flex-data.h"
 #include "stages/model-detect.h"
@@ -124,6 +125,82 @@ TEST(minimax_h3_comfy, resolves_from_root_subdir_or_file)
   EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
                   (root / "diffusion_models").string()) == want);
   EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(want) == want);
+  fs::remove_all(root, ec);
+}
+
+// A QUANTIZED repack resolves the same way the source does.
+//
+// model-quantize keeps the repack's role subdirs and writes the component
+// it quantized as a DIRECTORY checkpoint inside its own, because a repack
+// component is one .safetensors while a quantized one is config.json plus
+// shards. So a chain passes through three shapes -- source, half
+// quantized, fully quantized -- and every one of them has to resolve.
+//
+// The HALF-quantized state is the one worth a test. It is what the first
+// pass of a chain produces and the second pass consumes, and it is the
+// only state where the two probes could disagree: `diffusion_models/` is
+// a directory checkpoint while `text_encoders/` is still a repack file,
+// so a resolver that answered on the shape of the ROOT rather than of the
+// component would get exactly one of them wrong.
+//
+// SCOPE, because this test passing is not the whole claim: model-quantize
+// has a THIRD resolver of its own (resolve_t2i_dit_dir_, file-local to the
+// stage) that decides which family a source belongs to before any of this
+// runs. It needs the same probe and did not get it in the first cut --
+// these two agreed, the stage's did not, and a chain's second pass fell
+// through to the LM path and failed with "no submodule matching target
+// 'text_encoder'". That one is not reachable from here; it is covered by
+// actually running a quantize chain end to end.
+TEST(minimax_h3_comfy, a_quantized_repack_resolves_like_a_repack)
+{
+  const fs::path root = scratch_() / "quantized-repack";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+
+  // Writes what model-quantize leaves behind: a directory checkpoint. Only
+  // the config.json matters to the resolvers, which is the whole point --
+  // they must not have to read shards to answer.
+  auto write_quantized_ = [](const fs::path& dir) {
+    fs::create_directories(dir);
+    std::ofstream f(dir / "config.json");
+    f << "{\"_class_name\": \"MiniMaxH3DiTModel\", "
+         "\"quantization\": {\"bits\": 4, \"group_size\": 64}}";
+  };
+
+  // 1. Source repack: both components are files.
+  const fs::path dit =
+      root / "diffusion_models" / "minimax_h3_fl2va_bf16.safetensors";
+  const fs::path enc =
+      root / "text_encoders" / "qwen3vl_32b_minimax_h3_bf16.safetensors";
+  write_component_(dit, "config", kH3Config);
+  write_component_(enc, "minimax_h3_te", "{}");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string())
+              == dit.string());
+  EXPECT_TRUE(MiniMaxH3TextEncoder::resolve_encoder_dir(root.string())
+              == enc.string());
+
+  // 2. Half quantized -- the DiT pass has run, the encoder has not. Each
+  //    component answers on its OWN shape.
+  fs::remove_all(root / "diffusion_models", ec);
+  write_quantized_(root / "diffusion_models");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string())
+              == (root / "diffusion_models").string());
+  EXPECT_TRUE(MiniMaxH3TextEncoder::resolve_encoder_dir(root.string())
+              == enc.string());
+
+  // 3. Fully quantized: both are directories.
+  fs::remove_all(root / "text_encoders", ec);
+  write_quantized_(root / "text_encoders");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string())
+              == (root / "diffusion_models").string());
+  EXPECT_TRUE(MiniMaxH3TextEncoder::resolve_encoder_dir(root.string())
+              == (root / "text_encoders").string());
+
+  // The component subdir named directly still resolves to itself, which is
+  // what a `dit_dir` override in a pipeline spec passes.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  (root / "diffusion_models").string())
+              == (root / "diffusion_models").string());
   fs::remove_all(root, ec);
 }
 

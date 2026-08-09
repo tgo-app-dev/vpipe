@@ -21,6 +21,15 @@
 //
 // The schema default fills the placeholder throughout, so a blank field
 // still says what it will resolve to.
+//
+// AUTO-APPLY. `opts.onCommit` is called the moment a field fully
+// determines its own value -- a blur after an edit, a tri-state flip, a
+// picked path or model -- so an edit reaches the stage without a trip to
+// the Apply button, exactly as on the desktop. The JSON textareas
+// (array/object/any) are the one exclusion: a half-typed blob would
+// throw on every blur, so those commit only via Apply. Free-text and
+// number boxes wait for `change`, which fires on blur-AFTER-EDIT, so
+// tabbing past an untouched field costs nothing.
 
 import { el, clear, openModal } from '../dom.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
@@ -39,12 +48,22 @@ function fmtDefault(v) {
   return String(v);
 }
 
-// Build one field. Returns { el, read, key }.
+// Build one field. Returns { el, read, key, value }.
+//
+// `value()` is the field's RAW text, which is what the model picker's
+// parent-compatibility filter reads off the sibling fields of the same
+// form (see openModelPicker). It is deliberately not `read()`: that
+// answers "what goes in the PUT body" and returns undefined for unset,
+// where this only has to say what is currently typed.
 export function configField(f, opts = {}) {
   const ro = !!opts.readOnly;
   const type = f.type || 'any';
   const present = f.present !== false;
   const defTxt = fmtDefault(f.default);
+  const commit = () => { if (opts.onCommit) { opts.onCommit(); } };
+  // The element holding the field's text, for value(). Left null for the
+  // types whose value can never name a model (bool).
+  let valueEl = null;
   // Tracks the tri-state for the types that have one; for the rest it is
   // recomputed from emptiness at read() time and this is only the seed.
   let unset = !present;
@@ -84,6 +103,8 @@ export function configField(f, opts = {}) {
       el('option', { value: 'true' }, 'true'),
       el('option', { value: 'false' }, 'false'));
     sel.value = unset ? 'unset' : (f.current ? 'true' : 'false');
+    // Picking an option IS the whole edit -- there is no blur to wait for.
+    sel.addEventListener('change', commit);
     row.append(sel);
     read = () => (sel.value === 'unset' ? undefined : sel.value === 'true');
 
@@ -93,8 +114,10 @@ export function configField(f, opts = {}) {
       autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
     ta.value = present ? fmtDefault(f.current) : '';
     row.append(ta);
-    // An empty box already reads back as unset here, so there is nothing
-    // for `mark` to clear.
+    valueEl = ta;
+    // No blur-commit here: a JSON box is half-typed for most of the time
+    // it is focused, and committing on every blur would just throw. A
+    // PICKED path still commits -- it writes a complete array itself.
     pick = { el: ta, multi: true, mark: () => {}, before: null };
     read = () => {
       const s = ta.value.trim();
@@ -112,7 +135,9 @@ export function configField(f, opts = {}) {
       step: type === 'real' ? 'any' : '1',
       min: type === 'uint' ? '0' : null });
     inp.value = present ? fmtDefault(f.current) : '';
+    inp.addEventListener('change', commit);
     row.append(inp);
+    valueEl = inp;
     read = () => {
       const s = inp.value.trim();
       if (!s) { return undefined; }
@@ -137,7 +162,11 @@ export function configField(f, opts = {}) {
       if (unset) { unset = false; wrap.classList.remove('unset'); }
     };
     inp.addEventListener('input', markSet);
+    // `change` fires on blur-after-edit (and on the keyboard's Done), so
+    // an untouched field the user merely scrolled past commits nothing.
+    inp.addEventListener('change', commit);
     row.append(inp);
+    valueEl = inp;
 
     // The explicit way back to "unset" for a tri-state type: clearing
     // the box alone can't say it, since "" is itself a value.
@@ -149,6 +178,9 @@ export function configField(f, opts = {}) {
           unset = true;
           inp.value = '';
           wrap.classList.add('unset');
+          // Clearing is a complete edit on its own -- no blur follows a
+          // button tap, so this is the only chance to commit it.
+          commit();
         } }, '⌫');
       row.append(unsetBtn);
     }
@@ -199,6 +231,10 @@ export function configField(f, opts = {}) {
         pick.el.value = JSON.stringify(arr, null, 2);
       }
       pick.mark();
+      // A pick is a deliberate value commit, and a programmatic set fires
+      // no `change` -- so say so here. This is also what commits the JSON
+      // array path fields, which have no blur-commit of their own.
+      commit();
     };
     if (f.is_path) {
       const kind = f.path_kind || '';
@@ -214,11 +250,16 @@ export function configField(f, opts = {}) {
         });
       });
     } else if (f.suggest_db === MODEL_REGISTRY_DB) {
-      addBtn('⌄', () => openModelPicker(f, setPath));
+      addBtn('⌄', () => openModelPicker(f, setPath, opts.peerValues));
     }
   }
 
-  return { el: wrap, read, key: f.key };
+  return {
+    el: wrap,
+    read,
+    key: f.key,
+    value: () => (valueEl ? String(valueEl.value ?? '').trim() : ''),
+  };
 }
 
 // A stage's `path_filter` is a display string like "*.png;*.jpg"; the
@@ -234,13 +275,28 @@ function extsFromFilter(filter) {
   return out.length ? out : null;
 }
 
-// Installed models for a model-registry `suggest_db` field. Filtered by the
-// field's model_type allow-list only -- the desktop additionally hides a
-// supplement whose parent doesn't match the model picked in a SIBLING
-// field of the same form, which needs cross-field state this compact
-// editor doesn't carry. The value written is the registry key, exactly
-// as the desktop writes it.
-async function openModelPicker(f, onPick) {
+// Installed models for a model-registry `suggest_db` field, filtered by
+// the SAME three rules the desktop's model browser applies -- a phone
+// offering a choice the stage would reject is worse than a desktop doing
+// it, because there is less room to notice the mistake afterwards:
+//
+//   (a) the field's model_type allow-list (`suggest_db_type`, which may
+//       name several types comma-separated). A field that pins NO type
+//       still isn't unfiltered: it shows plain models only, hiding
+//       datasets and bare supplements, which are never a valid value for
+//       a model field.
+//   (b) the field's required I/O modalities (`need_inputs` /
+//       `need_outputs`): the model's inputs must cover every required
+//       input and its outputs every required output. This is what keeps
+//       text-chat's LM field to text->text models.
+//   (c) parent compatibility: a supplement (vision tower, LoRA) appears
+//       only when the model chosen in a SIBLING field of this form is
+//       one it attaches to. `peerValues` is what carries that cross-field
+//       state -- the desktop reads it back off the DOM by field id, which
+//       this shell has no equivalent of, so the caller passes a reader.
+//
+// The value written is the registry key, exactly as the desktop writes it.
+async function openModelPicker(f, onPick, peerValues) {
   const list = el('div', { class: 'ph-sheet-list' },
     el('div', { class: 'ph-sheet-hint' }, t('common.loading')));
   const close = openModal({
@@ -256,10 +312,40 @@ async function openModelPicker(f, onPick) {
     clear(list).append(el('div', { class: 'ph-sheet-hint' }, e.message));
     return;
   }
-  const allowed = (f.suggest_db_type || '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  const models = ((data && data.models) || []).filter(
-    (m) => !allowed.length || allowed.includes(m.model_type));
+  const all = (data && data.models) || [];
+  const csv = (s) => String(s || '').split(',')
+    .map((x) => x.trim()).filter(Boolean);
+
+  // (a) + (b): what this STAGE FIELD will accept.
+  const allowed = csv(f.suggest_db_type);
+  const needIn  = csv(f.need_inputs);
+  const needOut = csv(f.need_outputs);
+  const ioOk = (m) =>
+    needIn.every((x) => (m.inputs || []).includes(x))
+    && needOut.every((x) => (m.outputs || []).includes(x));
+  const stageOk = (m) => (allowed.length
+    ? allowed.includes(m.model_type)
+    : (m.category || 'model') === 'model') && ioOk(m);
+
+  // (c): the installed models named by the OTHER fields of this form are
+  // the candidate parents. A supplement with no parent, or a form where
+  // nothing has been chosen yet, is not filtered out -- the rule hides
+  // what is known to be incompatible, never what is merely unconfirmed.
+  const chosen = new Set(peerValues ? peerValues() : []);
+  const parents = all.filter(
+    (m) => chosen.has(m.key) || chosen.has(m.hf_path));
+  const parentOk = (m) => {
+    if (!m.parent_model_type) { return true; }   // not a supplement
+    if (!parents.length) { return true; }        // no parent chosen yet
+    return parents.some((p) => p.model_type === m.parent_model_type
+      && (!m.parent_param_class
+          // Case-insensitive: a registry record written before the
+          // catalog switched "e4b" -> "E4B" still matches the tower's.
+          || m.parent_param_class.toLowerCase()
+               === (p.param_class || '').toLowerCase()));
+  };
+
+  const models = all.filter((m) => stageOk(m) && parentOk(m));
   clear(list);
   if (!models.length) {
     list.append(el('div', { class: 'ph-sheet-hint' },

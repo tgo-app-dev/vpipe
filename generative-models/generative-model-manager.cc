@@ -381,6 +381,47 @@ GenerativeModelManager::enforce_memory_cap()
   return freed;
 }
 
+std::size_t
+GenerativeModelManager::reclaim_at_least(std::size_t bytes)
+{
+  if (bytes == 0) { return 0; }
+  // Same LRU snapshot the cap path takes: a set nobody has touched goes
+  // before one in active use, so the common case is that this costs a
+  // state flip and no re-read.
+  std::vector<std::shared_ptr<WeightSet>> live;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    live.reserve(_weight_sets.size());
+    for (const auto& [k, w] : _weight_sets) {
+      (void)k;
+      if (auto sp = w.lock()) {
+        if (!sp->parked()) { live.push_back(std::move(sp)); }
+      }
+    }
+  }
+  std::sort(live.begin(), live.end(),
+            [](const std::shared_ptr<WeightSet>& a,
+               const std::shared_ptr<WeightSet>& b) {
+              return a->last_use() < b->last_use();
+            });
+
+  std::size_t freed = 0;
+  for (const auto& ws : live) {
+    if (freed >= bytes) { break; }
+    const std::size_t got = _weights.park(ws.get());
+    if (got == 0) { continue; }        // nothing parkable (all mapped)
+    ws->set_parked(true);
+    freed += got;
+    if (session() != nullptr) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: parked {} MB of '{}' to make room "
+          "({} of {} MB requested)", got >> 20, ws->dir(), freed >> 20,
+          bytes >> 20));
+    }
+  }
+  return freed;
+}
+
 std::vector<GenerativeModelManager::WeightUsage>
 GenerativeModelManager::weight_report() const
 {

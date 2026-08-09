@@ -50,6 +50,22 @@ public:
     if (_blocks > 0) { _base += _blocks; }
   }
 
+  // Adopt the step count the SAMPLER is actually running.
+  //
+  // A stage's configured `steps` is not always that number. MiniMax-H3's
+  // is a count of sigma GRID POINTS including the terminal zero, so it
+  // drives one fewer evaluation -- and the shift collapses duplicate
+  // sigmas, which can drop more still. The stage cannot know the
+  // difference before the scheduler is built; the per-step callback
+  // carries it, and a bar told 4 while 3 run stops at 75% and reads as a
+  // hang at the end of every generation.
+  //
+  // Safe mid-run: the totals are recomputed from _steps on each update.
+  void set_steps(int n)
+  {
+    if (n > 0) { _steps = n; }
+  }
+
   // Call at the end of denoise step `i` (0-based).
   void end_step(int i)
   {

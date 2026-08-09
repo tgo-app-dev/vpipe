@@ -17,12 +17,18 @@ namespace {
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "the model dir/registry key shared by the diffusion-conditioner, "
-          "generate-image (DiT), vae-encode and vae-decode stages; emitted as a "
-          "beat that overrides each of their hf_dir config keys",
+          "generate-image / generate-video (DiT), vae-encode, vae-decode "
+          "and audio-vae-decode stages; emitted as a beat that overrides "
+          "each of their hf_dir config keys",
    .suggest_db = kModelRegistryDb,
+   // Every family whose stages latch this beat -- the IMAGE DiTs and the
+   // VIDEO ones both. The list is what the model browser filters on, so a
+   // family missing here is a model the picker will not offer even though
+   // the graph runs it: minimax-h3-fl2va was exactly that until now.
    .suggest_db_type =
        "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit"},
+       "boogu-image,boogu-image-edit,"
+       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
 };
 const PortSpec kOports[] = {
   {.name = "model",
@@ -33,9 +39,10 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "model-select",
   .doc       = "Pick one diffusion model dir and emit it as a FlexData beat for "
-               "the diffusion-conditioner / generate-image / vae-encode / "
-               "vae-decode stages to share -- each stage's model iport overrides "
-               "its hf_dir config. 0 in / 1 out (emits once).",
+               "the diffusion-conditioner / generate-image / generate-video / "
+               "vae-encode / vae-decode / audio-vae-decode stages to share -- "
+               "each stage's model iport overrides its hf_dir config. "
+               "0 in / 1 out (emits once).",
   .display_name = "Model Select",
   .category  = StageCategory::Generative,
   .iports    = {},

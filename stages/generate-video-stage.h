@@ -11,6 +11,8 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/wan/metal-wan-transformer.h"
@@ -103,7 +105,15 @@ namespace vpipe {
 // Config (FlexData object):
 //   hf_dir           (string, OPTIONAL) -- the Wan model root
 //   height / width   (int)  -- VIDEO pixels; both must be multiples of 16
-//   frames           (int)  -- video frames; F % 4 == 1 (81, 121, ...)
+//   frames           (int)  -- video frames. ROUNDED UP to the nearest
+//                              count the resident family's VAE can chunk:
+//                              4k+1 for wan (81, 121, ...), 17n+5 for
+//                              minimax-h3 (22, 39, 56, ...). The two rules
+//                              share almost no legal counts, so any
+//                              positive number is accepted and adjusted
+//                              rather than rejected -- otherwise a graph
+//                              could not change families without being
+//                              re-authored. The adjustment is logged.
 //   fps              (real) -- stamped on the latent for the decoder
 //   steps            (int)  -- denoising steps
 //   seed             (int)  -- initial-noise RNG seed
@@ -197,6 +207,11 @@ private:
   // has to happen BEFORE the load, not after: 2 x 28 GB does not fit on
   // any machine this runs on, so an overlap is not a peak, it is an OOM.
   bool ensure_expert_(int which);
+  // Adopt `aligned` as the frame count, reporting the change when there
+  // is one. The family's own rule computes the value (MetalWanVae::
+  // align_num_frames / minimax_h3::align_num_frames); this only records
+  // it, so the two callers cannot differ on how it is announced.
+  void align_frames_(int aligned);
   void resolve_config_();
   // The minimax-h3 branch of process(): builds the packed layout, runs
   // genai::denoise, and unpatchifies both modalities back to latents.
@@ -207,6 +222,13 @@ private:
   // OPTIONAL keyframe anchor latent from vae-encode, already whitened,
   // as f32 [z, ref_frames, lh, lw] -- one latent frame per anchor, so
   // 1 = first only and 2 = first AND last.
+  // Whether this forward's scratch fits, parking LRU weights if not.
+  // False => refuse the forward; see the note on its definition for why
+  // refusing beats proceeding on a 16 GB box.
+  // The idle-unload decision, made after the load so it can use the
+  // streaming verdict. See the note on its definition.
+  void resolve_unload_policy_h3_(bool streamed);
+  bool preflight_h3_scratch_(int seq, int text_rows);
   bool run_h3_(const void* cond, int text_rows, const float* ref,
                int ref_frames,
                std::vector<float>* video_out, std::vector<int>* video_shape,
