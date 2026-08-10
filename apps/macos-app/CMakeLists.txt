@@ -141,7 +141,11 @@ add_custom_command(
             ${_sparkle_swift_flags}
             ${VPIPE_APP_SWIFT_SOURCES}
             -o ${VPIPE_APP_SWIFT_EXE}
-    DEPENDS ${VPIPE_APP_SWIFT_SOURCES}
+    # This file too, not just the sources: the compile line carries
+    # -DVPIPE_SPARKLE and the deployment target, and a stale executable
+    # that still links Sparkle while the bundler no longer copies it
+    # produces a bundle that dies at launch with a dyld error.
+    DEPENDS ${VPIPE_APP_SWIFT_SOURCES} ${CMAKE_CURRENT_LIST_FILE}
     COMMENT "Compiling Vpipe Manager Swift sources"
     VERBATIM)
 

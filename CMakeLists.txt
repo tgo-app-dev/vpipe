@@ -25,9 +25,15 @@ cmake_minimum_required(VERSION 3.25)
 # inside a bundle whose Info.plist advertised 13.0. Those run only on
 # the machine that built them, and fail at helper-spawn time with a
 # dyld error rather than anything that names the cause.
+# FORCE, inside the guard. CMake creates CMAKE_OSX_DEPLOYMENT_TARGET as
+# an EMPTY cache entry on Apple, and a plain set(... CACHE ...) never
+# overwrites an entry that already exists -- so without FORCE this is a
+# no-op in any build tree configured before this line was added, and
+# the target silently stays empty. An explicit -D from the user is
+# non-empty, so the guard still leaves it alone.
 if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING
-        "Minimum macOS version the binaries support")
+        "Minimum macOS version the binaries support" FORCE)
 endif()
 
 project(vpipe VERSION 0.1 LANGUAGES CXX C)

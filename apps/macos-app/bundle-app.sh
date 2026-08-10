@@ -362,6 +362,49 @@ if [ "$leaks" -gt 0 ]; then
 fi
 echo "bundle-app.sh: no unrelocated references"
 
+# Every @rpath dependency must actually EXIST in Frameworks.
+#
+# The leak check above deliberately treats @rpath as fine -- it is the
+# spelling we rewrite everything TO. But "correctly spelled" is not
+# "present", and the two came apart badly: the GUI links
+# @rpath/Sparkle.framework/Versions/B/Sparkle, and when a build produced
+# the executable but not the framework, the bundle passed every check
+# here, signed cleanly, notarized, and then failed to launch on someone
+# else's machine with a dyld error naming a path that simply was not
+# there. It survived this far because THIS machine happened to have a
+# copy the loader could reach.
+#
+# Both rpaths we install (@executable_path/../Frameworks for the
+# executables, @loader_path for the dylibs) resolve to Frameworks, so
+# one existence test covers every case.
+missing=0
+while read -r macho; do
+  [ -n "$macho" ] || continue
+  id="$(own_id_ "$macho")"
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+    [ "$dep" = "$id" ] && continue
+    case "$dep" in
+      @rpath/*) ;;
+      *) continue ;;
+    esac
+    rel="${dep#@rpath/}"
+    if [ ! -e "$FRAMEWORKS/$rel" ]; then
+      echo "bundle-app.sh: MISSING: $(basename "$macho") needs '$dep'," \
+           "which is not in Frameworks" >&2
+      missing=$((missing + 1))
+    fi
+  done < <(deps_of_ "$macho")
+done < <(bundle_machos_)
+
+if [ "$missing" -gt 0 ]; then
+  echo "bundle-app.sh: $missing @rpath dependency(ies) absent from the" \
+       "bundle; refusing to sign. The app would launch on this machine" \
+       "and fail on a clean one." >&2
+  exit 1
+fi
+echo "bundle-app.sh: every @rpath dependency present"
+
 # ---------------------------------------------------------------------
 # 5. sign, inside out
 # ---------------------------------------------------------------------
