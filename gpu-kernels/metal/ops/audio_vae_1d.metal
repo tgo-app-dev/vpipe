@@ -186,3 +186,57 @@ kernel void resample_down2_f16(
   }
   out[(ulong)tpig.y * (uint)C + tpig.x] = VPIPE_ELT(acc);
 }
+
+// The audio encoder's causal-attention projection, output side.
+//
+// `AttnProjection` narrows the 2048-wide encoder trunk to the 32-wide
+// latent, and it does NOT do it the usual way: the heads are not
+// concatenated back together but MEAN-POOLED away, and the surviving
+// head width (in_dim / num_heads = 256) is then adaptively average-
+// pooled down to out_dim. Reading it as a concatenation loads and runs
+// perfectly and produces a different latent, which is exactly the kind
+// of thing this kernel exists to make explicit.
+//
+// in is head-major [H, T, D] as the SDPA leaves it; out is [T, O] with
+// O dividing D, so each output bin averages D/O neighbouring channels.
+//   0:in[H,T,D] 1:out[T,O] 2:H 3:T 4:D 5:O.   grid {O, T}
+kernel void attn_head_mean_pool_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H [[buffer(2)]],
+    constant int&      T [[buffer(3)]],
+    constant int&      D [[buffer(4)]],
+    constant int&      O [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  if (tpig.x >= (uint)O || tpig.y >= (uint)T) { return; }
+  const int o    = (int)tpig.x;
+  const int t    = (int)tpig.y;
+  const int span = D / O;
+  float acc = 0.0f;
+  for (int h = 0; h < H; ++h) {
+    const device VPIPE_ELT* row = in + ((ulong)h * (uint)T + t) * (uint)D;
+    for (int j = 0; j < span; ++j) { acc += float(row[o * span + j]); }
+  }
+  out[(ulong)t * (uint)O + o] = VPIPE_ELT(acc / (float)(H * span));
+}
+
+// The posterior head's GeGLU: out = gelu_tanh(gate) * up.
+//
+// Fused rather than reusing swiglu_f16, whose activation is SiLU -- the
+// two differ by a few percent per element, which is exactly the size of
+// error that survives a round trip looking like a plausible latent.
+//   0:gate 1:up 2:out 3:n.   grid {n}
+kernel void geglu_tanh_f16(
+    const device VPIPE_ELT* gate [[buffer(0)]],
+    const device VPIPE_ELT* up   [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    constant int&      n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  const float g = float(gate[gid]);
+  const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+  out[gid] = VPIPE_ELT(0.5f * g * (1.0f + metal::precise::tanh(inner)) *
+                       float(up[gid]));
+}

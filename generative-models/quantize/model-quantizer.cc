@@ -8,6 +8,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/affine-quantizer.h"
 #include "generative-models/quantize/safetensors-writer.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 
@@ -350,6 +351,21 @@ comfy_output_config_(const std::string& file, FlexData& out, std::string* err)
     // does not SAY which order it is in gets read as the released one
     // and computes nonsense.
     o.insert_or_assign("qkv_per_head", FlexData::make_bool(false));
+    // MUST survive for the same reason, and it is the reason the
+    // filename existed: `fl2va` and `ref2va` are two TASKS over one
+    // architecture with byte-identical configs, and a repack names the
+    // partition in the filename and nowhere else. This output is a
+    // DIRECTORY of shards, so that name is gone -- and a Ref2VA
+    // checkpoint read as `fl2va` loads, runs at full 33B cost and
+    // generates video conditioned on nothing.
+    {
+      const std::string part =
+          MetalMiniMaxH3Transformer::partition_of(file);
+      if (!part.empty()) {
+        o.insert_or_assign(MetalMiniMaxH3Transformer::kPartitionKey,
+                           FlexData::make_string(part));
+      }
+    }
     return true;
   }
 

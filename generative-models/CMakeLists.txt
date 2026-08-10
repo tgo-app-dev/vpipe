@@ -74,6 +74,8 @@ set(LOCAL_SOURCES
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
   minimax-h3/minimax-h3-layout.cc
+  minimax-h3/minimax-h3-references.cc
+  minimax-h3/minimax-h3-reference-encoder.cc
   minimax-h3/metal-minimax-h3-transformer.cc
   minimax-h3/metal-minimax-h3-video-vae.cc
   minimax-h3/metal-minimax-h3-audio-vae.cc
@@ -140,6 +142,8 @@ set(LOCAL_HEADERS
   wan/metal-umt5-encoder.h
   wan/metal-wan-transformer.h
   minimax-h3/minimax-h3-layout.h
+  minimax-h3/minimax-h3-references.h
+  minimax-h3/minimax-h3-reference-encoder.h
   minimax-h3/metal-minimax-h3-transformer.h
   minimax-h3/metal-minimax-h3-video-vae.h
   minimax-h3/metal-minimax-h3-audio-vae.h

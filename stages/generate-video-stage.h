@@ -56,11 +56,18 @@ namespace vpipe {
 //
 //   wan          Wan 2.1/2.2. TWO 14B experts on 2.2's A14B, switched at
 //                `boundary_ratio`; CFG against a negative prompt.
-//   minimax-h3   MiniMax-H3 FL2VA. ONE 33B stack emitting video AND
-//                audio from a single packed sequence. Guidance-DISTILLED,
-//                so it has no negative pass at all, and its two sigma
-//                schedules (video shift 12, audio shift 3) advance in
-//                lockstep.
+//   minimax-h3   MiniMax-H3, both partitions. ONE 33B stack emitting
+//                video AND audio from a single packed sequence.
+//                Guidance-DISTILLED, so it has no negative pass at all,
+//                and its two sigma schedules (video shift 12, audio
+//                shift 3) advance in lockstep. FL2VA conditions on
+//                keyframe anchors (iport5/6); REF2VA conditions on a
+//                list of references encoded by a `video-ref-encoder`
+//                (iport7/8). The two ship byte-identical DiT configs
+//                and are told apart by the packaging, so a Ref2VA
+//                checkpoint with no references wired is REFUSED rather
+//                than run -- it would generate video conditioned on
+//                nothing.
 //
 //   iport0  TensorBeatPayload conditioning from a diffusion-conditioner:
 //           bf16 [text_seq, enc_hidden] -- umT5-XXL 4096 for wan, the
@@ -91,6 +98,22 @@ namespace vpipe {
 //           two stills. Only meaningful alongside iport5: a last frame with
 //           no first frame is not a mode the model was trained for, so it
 //           warns and is dropped rather than silently becoming an L2V.
+//   iport7  OPTIONAL reference VIDEO rows from a `video-ref-encoder`
+//           (minimax-h3 REF2VA): f32 [rows, 96], the image and video
+//           references' latents already packed into DiT rows and
+//           concatenated in reference order. Ragged by nature -- every
+//           reference is encoded at a resolution of its own -- so rows
+//           are the only shape they share. Wiring it is what makes this
+//           stage a Ref2VA denoiser.
+//   iport8  OPTIONAL reference AUDIO rows from the same encoder: f32
+//           [rows, 32], channel-major within a reference. They ride at a
+//           clean timestep and are never denoised.
+//
+// The GEOMETRY those rows belong to -- how many latent frames and cells
+// each reference encoded to, and the per-row modality tags of the
+// presentation -- rides on the CONDITIONING beat's sideband, not on a
+// port of its own: it is one request, and pairing a conditioning with
+// another request's layout packs cleanly and then fails 50 layers deep.
 //
 //   oport0  TensorBeatPayload f32 [z, T, H/r, W/r] latent video (whitened,
 //           the boundary vae-decode reads), sideband {fps, frames}.
@@ -213,6 +236,32 @@ private:
   // it, so the two callers cannot differ on how it is announced.
   void align_frames_(int aligned);
   void resolve_config_();
+
+  // "fl2va" / "ref2va" / empty. The two partitions are one architecture
+  // and two TASKS, and nothing in the weights distinguishes them, so
+  // this is read from the packaging -- see
+  // MetalMiniMaxH3Transformer::partition_of.
+  std::string _h3_partition;
+
+  // The `ref2va` conditioning that arrives beside the prompt embeds,
+  // from a `video-ref-encoder`. It is one request split over three
+  // beats: the geometry and the per-row modality tags ride on the
+  // conditioning's sideband, the latent rows on their own ports (they
+  // are megabytes, and every reference is encoded at a resolution of
+  // its own, so rows are the only shape they share).
+  struct H3References {
+    std::vector<genai::minimax_h3::Reference> refs;
+    // Borrowed from the beats, which outlive the forward.
+    const float* video_rows   = nullptr;
+    int          n_video_rows = 0;
+    const float* audio_rows   = nullptr;
+    int          n_audio_rows = 0;
+    // MiniMax-H3's per-row modality tag for the conditioning rows: text
+    // is 1, but a vision block's rows are tagged 0 (video). The DiT
+    // reads this, so it cannot be assumed uniform the way a text-only
+    // prompt's can.
+    std::vector<int> text_tags;
+  };
   // The minimax-h3 branch of process(): builds the packed layout, runs
   // genai::denoise, and unpatchifies both modalities back to latents.
   // Returns false when it warned and produced nothing.
@@ -229,8 +278,22 @@ private:
   // streaming verdict. See the note on its definition.
   void resolve_unload_policy_h3_(bool streamed);
   bool preflight_h3_scratch_(int seq, int text_rows);
+  // `r2v` is the `ref2va` request when there is one; null is the
+  // `t2va` / `fl2va` path, where `ref` carries the keyframe anchors
+  // instead. The two are mutually exclusive by construction -- they are
+  // different checkpoints.
+  // Read a `ref2va` plan off the conditioning beat's sideband and pair
+  // it with the two reference-row beats. Leaves `out->refs` empty (and
+  // returns true) when the conditioning carries no references at all --
+  // that is a `t2va` / `fl2va` request, not a malformed one. False only
+  // on a plan that IS present and does not add up, after warning.
+  bool parse_h3_references_(const FlexData& sideband,
+                            const class TensorBeatPayload* video_rows,
+                            const class TensorBeatPayload* audio_rows,
+                            H3References* out) const;
+
   bool run_h3_(const void* cond, int text_rows, const float* ref,
-               int ref_frames,
+               int ref_frames, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape);
 

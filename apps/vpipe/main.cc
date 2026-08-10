@@ -41,8 +41,10 @@
 
 #include "common/flex-data.h"
 #include "common/session.h"
+#include "stages/model-catalog.h"
 #include "common/stdio-ui-delegate.h"
 #include "vpipe/pipeline-handle.h"
+#include "vpipe/vpipe.h"
 #include "vpipe/session-intf.h"
 #include "vpipe/session-manager.h"
 #include "vpipe/status.h"
@@ -123,6 +125,13 @@ const char* const kUsage =
   "                              memory_cap_mb; 0/unset = uncapped.\n"
   "  --plugin PATH               load a plugin .dylib at startup "
   "(repeatable).\n"
+  "  --version                   print the version and build identity\n"
+  "                              ('<major>.<minor> (<git-hash>*<dirty>)')\n"
+  "                              and exit.\n"
+  "  --list-models               print the built-in model catalogue as\n"
+  "                              JSON and exit. For a front end that\n"
+  "                              offers the same choices as the stages\n"
+  "                              without keeping its own copy of them.\n"
   "  --help, -h                  print this help.\n";
 
 int
@@ -343,6 +352,28 @@ run(int argc, char** argv)
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
       std::fputs(kUsage, stdout);
+      return 0;
+    } else if (a == "--version") {
+      // The identity of the libvpipe this binary is linked against,
+      // not a number baked in somewhere else -- so whatever reports it
+      // (a bug report, the app's About pane) names the build that is
+      // actually running.
+      std::printf("%s\n", vpipe_version());
+      return 0;
+    } else if (a == "--list-models") {
+      // Before any session is created: this reads a static table and
+      // must not pay for -- or be able to fail because of -- LMDB, the
+      // model manager or a plugin load.
+      //
+      // The catalogue is the single source of what a front end may
+      // offer. Copying these entries into a GUI is how a picker comes
+      // to list a model the stages cannot actually fetch.
+      FlexData arr = FlexData::make_array();
+      auto     out = arr.as_array();
+      for (const ModelCatalogEntry& e : model_catalog()) {
+        out.push_back(catalog_entry_to_flex(e));
+      }
+      std::printf("%s\n", arr.to_json().c_str());
       return 0;
     } else if (a == "--config") {
       if (++i >= argc) { return arg_err("--config needs a value"); }

@@ -120,6 +120,9 @@ const STRINGS = {
                         '預覽失敗：{msg}'],
   'fb.op_failed':     ['Failed: {msg}', '操作失败：{msg}', '操作失敗：{msg}'],
   'fb.empty_folder':  ['Empty folder', '空文件夹', '空資料夾'],
+  'fb.resize_cols':   ['Drag to resize the columns (double-click to reset)',
+                       '拖动以调整列宽（双击恢复默认）',
+                       '拖曳以調整欄寬（雙擊恢復預設）'],
   // Preview additions: the .vpipeline stage summary, and the dialog's
   // side-panel toggle.
   'fb.pl_stages':     ['{n} stages', '{n} 个流水线级', '{n} 個階段'],

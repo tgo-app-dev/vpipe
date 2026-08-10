@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <cctype>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -126,6 +127,74 @@ blk_(const char* prefix, int i, const char* rest)
 }  // namespace
 
 // ---- config ----------------------------------------------------------
+
+std::string
+MetalMiniMaxH3Transformer::partition_of(const std::string& path)
+{
+  namespace fs = std::filesystem;
+  const std::string dit = resolve_dit_dir(path);
+  auto lower = [](std::string v) {
+    for (char& c : v) { c = (char)std::tolower((unsigned char)c); }
+    return v;
+  };
+  // A repack says it in the filename and nowhere else -- the config it
+  // embeds is identical for both. `pruned` is a different MODEL, not a
+  // partition, so it is not answered for.
+  if (!dit.empty() && !fs::is_directory(fs::path(dit))) {
+    const std::string nm = lower(fs::path(dit).filename().string());
+    if (nm.find("pruned") != std::string::npos) { return {}; }
+    if (nm.find("fl2va") != std::string::npos)  { return "fl2va"; }
+    if (nm.find("ref2va") != std::string::npos) { return "ref2va"; }
+    return {};
+  }
+  // A DERIVED checkpoint -- model-quantize's output -- is a directory of
+  // shards, so the filename that carried the partition is gone. The
+  // producer records it in the config it writes, for the same reason it
+  // records `qkv_per_head`: the two partitions are byte-identical in
+  // every other respect, so an output that does not SAY which one it is
+  // runs the wrong task at full cost and conditions on nothing.
+  if (!dit.empty() && fs::is_directory(fs::path(dit))) {
+    std::ifstream in(fs::path(dit) / "config.json");
+    if (in) {
+      try {
+        FlexData fd = FlexData::from_json(in);
+        if (fd.is_object() &&
+            fd.as_object().contains(kPartitionKey)) {
+          const FlexData v = fd.as_object().at(kPartitionKey);
+          if (v.is_string()) { return std::string(v.as_string()); }
+        }
+      } catch (...) {
+        // Fall through to the manifest walk below.
+      }
+    }
+  }
+  // A diffusers checkout says it in the pipeline manifest, which sits
+  // beside the transformer directory (the partition root).
+  fs::path base(dit.empty() ? path : dit);
+  for (int up = 0; up < 3 && !base.empty(); ++up) {
+    const fs::path mi = base / "model_index.json";
+    std::error_code ec;
+    if (fs::exists(mi, ec)) {
+      std::ifstream in(mi);
+      if (in) {
+        try {
+          FlexData fd = FlexData::from_json(in);
+          if (fd.is_object() && fd.as_object().contains("_minimax_h3")) {
+            FlexData mm = fd.as_object().at("_minimax_h3");
+            if (mm.is_object() && mm.as_object().contains("partition")) {
+              return std::string(mm.as_object().at("partition").as_string());
+            }
+          }
+        } catch (...) {
+          return {};
+        }
+      }
+      return {};
+    }
+    base = base.parent_path();
+  }
+  return {};
+}
 
 std::string
 MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path)
@@ -1419,7 +1488,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const int seq = L.seq_len;
   const int n_t = (int)in.timesteps->size();
   const int n_video = (int)L.video_indices.size();
-  const int n_audio = L.num_audio_rows;
+  // TOTAL audio rows, reference and generated. `num_audio_rows` counts
+  // the GENERATED ones alone, which is all a `t2va` / `fl2va` layout
+  // has -- a `ref2va` request also carries a reference block per
+  // audio-bearing reference, and every one of them is a row the caller
+  // hands in and the head writes back.
+  const int n_audio = (int)L.audio_indices.size();
   const int n_text = L.num_text_rows;
   const int n_cond = L.num_condition_rows;
   const int H = c.hidden, I = c.inner(), NH = c.n_heads, HD = c.head_dim;
@@ -1811,17 +1885,33 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // reference's three index_copy scatters are plain destination
     // offsets here. Video is the one split: its rows are the
     // conditioning block AND the target block, which are not adjacent.
-    if (n_cond > 0) {
-      gemm_(enc, *in.video, 0, _video_patch, s.x,
-            (std::size_t)L.condition_start * H, n_cond, H, VPE);
+    // Each modality arrives as one buffer in ITS OWN row order and is
+    // scattered into the packed sequence run by run. `t2va` / `fl2va`
+    // give video two runs (the conditioning block and the target) and
+    // audio one; `ref2va` gives one run per reference plus the target,
+    // and interleaves the two modalities -- so the destination offsets
+    // are read from the layout rather than derived from a start and a
+    // count. Every run is still CONTIGUOUS, so this is the same number
+    // of GEMMs it always was, just addressed properly.
+    {
+      std::size_t src = 0;
+      for (const h3::RowRun& r : L.video_runs) {
+        if (r.count > 0) {
+          gemm_(enc, *in.video, src * VPE, _video_patch, s.x,
+                (std::size_t)r.start * H, r.count, H, VPE);
+        }
+        src += (std::size_t)r.count;
+      }
     }
-    if (L.num_video_rows > 0) {
-      gemm_(enc, *in.video, (std::size_t)n_cond * VPE, _video_patch, s.x,
-            (std::size_t)L.video_start * H, L.num_video_rows, H, VPE);
-    }
-    if (n_audio > 0) {
-      gemm_(enc, *in.audio, 0, _audio_patch, s.x,
-            (std::size_t)L.audio_start * H, n_audio, H, AC);
+    if (in.audio != nullptr) {
+      std::size_t src = 0;
+      for (const h3::RowRun& r : L.audio_runs) {
+        if (r.count > 0) {
+          gemm_(enc, *in.audio, src * AC, _audio_patch, s.x,
+                (std::size_t)r.start * H, r.count, H, AC);
+        }
+        src += (std::size_t)r.count;
+      }
     }
     gemm_(enc, *in.text, 0, _cond_proj, s.txt, 0, n_text, H, c.text_dim);
     psplit(t_in);
@@ -1992,17 +2082,27 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // the AdaLN index: this norm is modality-independent. Its two halves
     // are shift then scale, the order the Wan and LTX output layers use.
     modulate(s.proj, s.fmod, s.tstep_idx, s.proj, seq, 2 * H, H, 0);
-    if (n_cond > 0) {
-      gemm_(enc, s.proj, (std::size_t)L.condition_start * H, _video_out,
-            out.video, 0, n_cond, VPE, H);
-    }
-    if (L.num_video_rows > 0) {
-      gemm_(enc, s.proj, (std::size_t)L.video_start * H, _video_out, out.video,
-            (std::size_t)n_cond * VPE, L.num_video_rows, VPE, H);
+    // The inverse gather, run by run, so the velocity comes back in the
+    // same row order the caller handed the latents in.
+    {
+      std::size_t dst = 0;
+      for (const h3::RowRun& r : L.video_runs) {
+        if (r.count > 0) {
+          gemm_(enc, s.proj, (std::size_t)r.start * H, _video_out, out.video,
+                dst * VPE, r.count, VPE, H);
+        }
+        dst += (std::size_t)r.count;
+      }
     }
     if (n_audio > 0) {
-      gemm_(enc, s.proj, (std::size_t)L.audio_start * H, _audio_out, out.audio,
-            0, n_audio, AC, H);
+      std::size_t dst = 0;
+      for (const h3::RowRun& r : L.audio_runs) {
+        if (r.count > 0) {
+          gemm_(enc, s.proj, (std::size_t)r.start * H, _audio_out, out.audio,
+                dst * AC, r.count, AC, H);
+        }
+        dst += (std::size_t)r.count;
+      }
     }
     psplit(t_final);
   }

@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/qwen3/metal-qwen-vision.h"
 
 #include <cstdint>
 #include <memory>
@@ -70,6 +71,18 @@ class MiniMaxH3TextEncoder {
     // tell a dense checkpoint from a 4-bit one.
     bool quantized = false;
     MetalQwenModel::Config lm;
+
+    // The vision tower, for `ref2va` references. Only the ref2va task
+    // has any, which is why the tower is loaded on demand rather than
+    // with the backbone.
+    //
+    // The DEFAULTS here are the released Qwen3-VL-32B geometry, because
+    // the Comfy-Org repack's `minimax_h3_te` metadata carries only the
+    // tap depth -- there is no vision_config in it to read. A diffusers
+    // checkout has one and config_from_json prefers it; a repack falls
+    // back to these, and a mismatch shows up as a shape failure at load
+    // rather than as wrong pixels.
+    MetalQwenVisionEncoder::Config vision;
   };
 
   // `path` may be the `text_encoder` directory, the partition root, or
@@ -83,6 +96,18 @@ class MiniMaxH3TextEncoder {
   static std::unique_ptr<MiniMaxH3TextEncoder>
   load(const std::string& enc_dir, metal_compute::MetalCompute* mc,
        SessionContextIntf* session, const Config& cfg);
+
+  // The vision tower on its own, over the SAME checkpoint.
+  //
+  // Separate from load() because the two are wanted at different times:
+  // `t2va` / `fl2va` need the backbone and never the tower, and a
+  // `ref2va` request runs the tower over every reference before it has a
+  // prompt to encode. The tower is ~380M parameters next to the
+  // backbone's 32B, so building it is cheap; building the backbone to
+  // get at it would not be.
+  static std::unique_ptr<MetalQwenVisionEncoder>
+  load_vision(const std::string& enc_dir, metal_compute::MetalCompute* mc,
+              const Config& cfg, std::string* err = nullptr);
 
   ~MiniMaxH3TextEncoder();
 
@@ -106,6 +131,100 @@ class MiniMaxH3TextEncoder {
   // so the multimodal path can splice vision rows in first.
   metal_compute::SharedBuffer
   encode_ids(const std::vector<std::int32_t>& ids, std::string* err = nullptr);
+
+  // ---- ref2va: the reference presentation ----------------------------
+
+  // One reference, as the CONDITIONER sees it.
+  //
+  // The pixels are already encoded: the caller owns the media and runs
+  // the tower (see load_vision), so nothing here opens a file or knows
+  // what a frame is. An AUDIO reference reaches the conditioner as a
+  // label and nothing else -- a waveform is never encoded by it -- which
+  // is why it carries no vision at all.
+  struct Reference {
+    enum class Kind { kImage, kVideo, kAudio };
+    Kind kind = Kind::kImage;
+
+    // The tower's output for this reference. One block for an image;
+    // `vision->grid_t` blocks for a video, each labelled with its own
+    // timestamp. Null for kAudio.
+    const MetalQwenVisionEncoder::Result* vision = nullptr;
+
+    // The timestamp of every video block, in seconds -- `grid_t` of
+    // them. Rendered "<%.1f seconds>", so these are the labels the model
+    // reads and not merely metadata. See video_block_seconds().
+    std::vector<float> block_seconds;
+
+    // Whether this reference contributes a soundtrack. A video that
+    // carries one is labelled "<Audio j>: " BEFORE its "<Video k>: ",
+    // mirroring the order its ROWS are packed in.
+    bool has_audio = false;
+  };
+
+  // The timestamp of every merged block of a video read at `sample_fps`.
+  //
+  // Qwen3-VL merges the sampled frames in groups of `temporal_patch`,
+  // repeating the last one when the count does not divide, and labels a
+  // group with the MEAN of its timestamps. At 2 fps that makes the first
+  // block 0.25 s, which "%.1f" renders as "<0.2 seconds>" rather than
+  // "<0.3>" -- both C's and Python's formatting round half to even, so
+  // the two agree, but the value is surprising enough to be worth
+  // stating.
+  static std::vector<float> video_block_seconds(int num_sampled_frames,
+                                                float sample_fps = 2.0f,
+                                                int temporal_patch = 2);
+
+  // Encode MiniMax-H3's presentation of a `ref2va` request.
+  //
+  // The presentation is a label per reference, numbered PER MODALITY in
+  // the order the references are read -- "<Picture i>: " plus a vision
+  // block, "<Audio j>: " alone, "<Video k>: " plus one timestamped
+  // vision block per merged frame pair -- followed by the prompt
+  // verbatim. No chat template and no special tokens, exactly as the
+  // text-only path.
+  //
+  // `token_tags`, when non-null, receives MiniMax-H3's own per-row
+  // modality tag: text rows are tagged 1 and a VISION BLOCK's rows are
+  // tagged 0 (video). That is not the same thing as the Qwen-internal
+  // token-type ids that drive the rotary layout, and the DiT reads this
+  // one -- it is what `build_ref2va_packed_sequence` takes as
+  // `text_token_tags`.
+  //
+  // Returns [n_tokens, text_dim] bf16, the same rows encode() returns.
+  metal_compute::SharedBuffer
+  encode_references(const std::vector<Reference>& refs,
+                    std::string_view prompt,
+                    std::vector<int>* token_tags = nullptr,
+                    int* n_tokens = nullptr, std::string* err = nullptr);
+
+  // The presentation, WITHOUT running the conditioner.
+  //
+  // Split out because it is the part most likely to be wrong and the
+  // part cheapest to check: the labels, their per-modality numbering,
+  // the audio-before-video ordering, the block timestamps, the pad
+  // counts and the rotary layout are all decided here, and every one of
+  // them fails silently. Checking them needs a tokenizer and the
+  // reference GRIDS -- not 50 layers of a 32B backbone.
+  struct Presentation {
+    std::vector<std::int32_t> ids;
+    std::vector<int>          tags;    // MiniMax-H3's per-row modality tag
+    std::vector<std::int32_t> mrope;   // [3 * n], rows t / h / w
+
+    // Where each vision block's rows landed, in presentation order.
+    // `cell` selects the temporal cell within its reference's tower
+    // output, which is one buffer across the whole clip.
+    struct Run {
+      int start = 0, rows = 0, mh = 0, mw = 0, cell = 0;
+      const MetalQwenVisionEncoder::Result* vision = nullptr;
+    };
+    std::vector<Run> runs;
+
+    int size() const { return (int)ids.size(); }
+  };
+
+  bool build_presentation(const std::vector<Reference>& refs,
+                          std::string_view prompt, Presentation* out,
+                          std::string* err = nullptr) const;
 
   const Config& config() const { return _cfg; }
 

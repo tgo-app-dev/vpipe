@@ -124,6 +124,23 @@ class MetalMiniMaxH3Transformer {
   // neither of the first two.
   static std::string resolve_dit_dir(const std::string& path);
 
+  // Which TASK partition a checkpoint is: "fl2va", "ref2va", or empty
+  // when nothing says.
+  //
+  // Worth a function of its own because the two are indistinguishable
+  // from the weights: same 535 tensor names, same shapes, same embedded
+  // config, byte for byte. Only the packaging says -- `model_index.json`
+  // carries `_minimax_h3.partition` in a diffusers checkout, and a
+  // Comfy-Org repack says it in the DiT's FILENAME and nowhere else. A
+  // caller that guesses wrong loads and runs and conditions on nothing,
+  // so "empty" is a real answer and not a failure.
+  // The config.json key a DERIVED checkpoint (model-quantize's output)
+  // records its partition under. Public so the producer and the reader
+  // cannot drift apart on the spelling.
+  static constexpr const char* kPartitionKey = "_minimax_h3_partition";
+
+  static std::string partition_of(const std::string& path);
+
   // `stream_blocks` (memory-bounded): don't preload the 50 main blocks --
   // retain the weight set and load/free each block on demand inside
   // forward(), so ~one block is resident instead of the whole DiT. At w8

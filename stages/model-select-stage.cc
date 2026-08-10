@@ -28,7 +28,7 @@ const ConfigKey kAttrs[] = {
    .suggest_db_type =
        "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va"},
 };
 const PortSpec kOports[] = {
   {.name = "model",

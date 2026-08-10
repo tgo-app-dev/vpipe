@@ -2,6 +2,7 @@
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
+#include "common/ffmpeg-libraries.h"
 #include "common/job.h"
 #include "common/session.h"
 #include "common/static-file-server.h"
@@ -35,6 +36,46 @@ using namespace std;
 using namespace vpipe;
 
 namespace {
+
+// True when the host FFmpeg actually has this encoder.
+//
+// Several tests below PIN libx264: HLS mandates H.264/HEVC, and libx264
+// is a cheap software encoder present in most Homebrew and distro
+// builds, which keeps them off VideoToolbox and reproducible in CI.
+//
+// It is not always there. libx264 is GPL, so an FFmpeg built for
+// redistribution omits it -- including the LGPL build vpipe.app bundles
+// (apps/macos-app/build-lgpl-ffmpeg.sh). Against that build these tests
+// used to FAIL, which reads as "HLS is broken" when the truth is "this
+// FFmpeg has no libx264". They cover the HLS muxer, not the
+// availability of one encoder, so they skip instead.
+//
+// Deliberately a runtime probe rather than a build-time #ifdef: the
+// library is dlopen'd, so which encoders exist is a property of the
+// machine the test runs on, not of how vpipe was compiled.
+bool
+have_encoder_(Session& sess, const char* name)
+{
+  const FFmpegLibraries* libs = sess.services()->ffmpeg_libraries();
+  if (libs == nullptr) {
+    return false;
+  }
+  return libs->avcodec().api.find_encoder_by_name(name) != nullptr;
+}
+
+// Announce the skip. A test that silently returns is indistinguishable
+// from one that ran, which is how a suite comes to report all-green
+// while covering nothing.
+bool
+skip_without_encoder_(Session& sess, const char* name, const char* test)
+{
+  if (have_encoder_(sess, name)) {
+    return false;
+  }
+  std::printf("[  SKIPPED ] %s: this FFmpeg has no '%s' encoder\n",
+              test, name);
+  return true;
+}
 
 class CerrSilencer {
 public:
@@ -699,6 +740,10 @@ TEST(hls_broadcast_stage, live_start_offset_injects_ext_x_start_tag)
   // live edge instead of the default 3 × target_duration. With
   // live_start_offset=0 the tag must NOT appear.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.live_start_offset_injects_ext_x_start_tag")) {
+    return;
+  }
 
   auto run_and_get_playlist = [&](double offset, double seg_dur) {
     auto pl = make_unique<Pipeline>("p", &sess);
@@ -810,6 +855,10 @@ TEST(hls_broadcast_stage, end_to_end_publishes_playlist_and_segments)
   // NOTE: HLS mandates H.264/HEVC, so we use libx264 here. If
   // libx264 isn't built into the host FFmpeg the test is skipped.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.end_to_end_publishes_playlist_and_segments")) {
+    return;
+  }
 
   auto pl = make_unique<Pipeline>("p", &sess);
   auto src_u = make_unique<RepeatTensorSource>(
@@ -875,6 +924,10 @@ TEST(hls_broadcast_stage, serves_registered_blobs_over_http)
   // been registered, then HTTP-GET both the playlist and a
   // segment from the live server to confirm the wire path works.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.serves_registered_blobs_over_http")) {
+    return;
+  }
 
   auto pl = make_unique<Pipeline>("p", &sess);
   auto src_u = make_unique<RepeatTensorSource>(
@@ -964,6 +1017,10 @@ TEST(hls_broadcast_stage, accepts_u8_tensor_input) {
   // from video-to-rgb's output_dtype="u8"). Pinned to libx264 so
   // the test runs on hosts without VideoToolbox.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.accepts_u8_tensor_input")) {
+    return;
+  }
 
   auto pl = make_unique<Pipeline>("p", &sess);
   auto src_u = make_unique<RepeatTensorSource>(
@@ -1257,6 +1314,10 @@ TEST(hls_broadcast_stage, video_plus_audio_muxes_both_streams) {
   // Video on iport 0 + audio on iport 1 -> one HLS output carrying both
   // streams. libx264 so the test runs without VideoToolbox.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.video_plus_audio_muxes_both_streams")) {
+    return;
+  }
 
   auto pl = make_unique<Pipeline>("p", &sess);
   auto v_u = make_unique<RepeatTensorSource>(
@@ -1308,6 +1369,10 @@ TEST(hls_broadcast_stage, av_timestamp_sync_muxes_both) {
   // (the ts-sync path, active in realtime mode). Verify it muxes both
   // streams and emits at least one segment.
   Session sess;
+  if (skip_without_encoder_(sess, "libx264",
+                            "hls_broadcast_stage.av_timestamp_sync_muxes_both")) {
+    return;
+  }
 
   const uint64_t t0 = 1'700'000'000'000ull;   // arbitrary UTC epoch (us)
 

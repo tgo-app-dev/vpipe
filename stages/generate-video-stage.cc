@@ -41,7 +41,7 @@ const ConfigKey kAttrs[] = {
           "audio_vae/, text_encoders/). OPTIONAL: a model-select source on "
           "the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va"},
+   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va"},
   {.key = "height", .type = ConfigType::Int, .required = false,
    .doc = "video height in pixels; a multiple of 16 (the VAE's 8x times the "
           "DiT's 2x patch)", .def_int = 480},
@@ -121,12 +121,28 @@ const PortSpec kIports[] = {
           "(minimax-h3 only; wan's i2v latent is one clip-shaped tensor). "
           "With ref_latent0 this is the FL2VA first-and-last mode",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref_video_rows",
+   .doc = "OPTIONAL reference VIDEO rows from a video-ref-encoder: f32 "
+          "[rows, 96], MiniMax-H3's Ref2VA partition. Already packed into "
+          "DiT rows and concatenated in reference order, because every "
+          "reference is encoded at a resolution of its own and rows are the "
+          "only shape they share. Wiring it is what makes this stage a "
+          "Ref2VA denoiser; the geometry it belongs to rides on the "
+          "conditioning beat's sideband",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref_audio_rows",
+   .doc = "OPTIONAL reference AUDIO rows from the same video-ref-encoder: "
+          "f32 [rows, 32], channel-major within a reference. Rides along at "
+          "a clean timestep and is never denoised",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
 [[maybe_unused]] constexpr unsigned kSchedPort   = 4;
 [[maybe_unused]] constexpr unsigned kRefPort     = 5;
 [[maybe_unused]] constexpr unsigned kRefPort1    = 6;
+[[maybe_unused]] constexpr unsigned kRefVideoRowsPort = 7;
+[[maybe_unused]] constexpr unsigned kRefAudioRowsPort = 8;
 
 const PortSpec kOports[] = {
   {.name = "latent",
@@ -347,6 +363,20 @@ GenerateVideoStage::resolve_config_()
     _family = "minimax-h3";
   }
   if (_family == "minimax-h3") {
+    // WHICH partition. The two ship byte-identical DiT configs, so the
+    // detection above cannot tell them apart -- and running a Ref2VA
+    // checkpoint through the t2va path is the worst failure this stage
+    // has: it loads, it runs at full cost, and it generates video
+    // conditioned on nothing at all. Refuse instead.
+    // WHICH partition. The two ship byte-identical DiT configs, so the
+    // detection above cannot tell them apart, and running Ref2VA
+    // weights through the t2va path is the worst failure this stage
+    // has: it loads, it runs at full cost, and it generates video
+    // conditioned on nothing at all. What closes that is the check in
+    // initialize() -- a Ref2VA checkpoint with no reference rows wired
+    // is refused there, where iport connectivity is known.
+    _h3_partition =
+        genai::MetalMiniMaxH3Transformer::partition_of(_root);
     // Now that the family is known, round the frame count UP to H3's own
     // rule (see the constructor): the video VAE takes 17-frame clips and
     // keeps 5 latents from each, so only 17n+5 has a latent form.
@@ -530,6 +560,25 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
   if (!(ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort))) {
     resolve_config_();
   }
+  // A Ref2VA checkpoint with no reference rows wired would load, run at
+  // full 33B cost, and generate video conditioned on nothing -- the two
+  // partitions ship byte-identical DiT configs, so nothing downstream
+  // would notice. Refused here rather than in resolve_config_ because
+  // this is the first point where iport connectivity is known. (When
+  // the model arrives on the model iport the partition is not known
+  // yet; process() makes the same check per request.)
+  if (_h3_partition == "ref2va" &&
+      !(ctx.num_iports() > kRefVideoRowsPort &&
+        ctx.iport_connected(kRefVideoRowsPort))) {
+    fail_config(fmt(
+        "GenerateVideoStage('{}'): '{}' is MiniMax-H3's Ref2VA partition, "
+        "which conditions on a list of reference images, clips and "
+        "soundtracks. Wire a `video-ref-encoder` stage to iport{} "
+        "(ref_video_rows) and iport{} (ref_audio_rows), or use the FL2VA "
+        "checkpoint for text-to-video and first/last-frame work.",
+        this->id(), _root, kRefVideoRowsPort, kRefAudioRowsPort));
+    co_return;
+  }
   co_return;
 }
 
@@ -656,11 +705,96 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
   return false;
 }
 
+// Read a `ref2va` plan off the conditioning beat's sideband.
+//
+// The plan and the rows arrive on different beats and this is where
+// they are made to agree: the sideband says how many latent frames and
+// cells each reference encoded to, the row beats say how many rows were
+// packed, and the two are derived from the same encode. A disagreement
+// means the beats are from different requests, which is worth naming
+// here rather than discovering as a shape error 50 layers down.
+bool
+GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
+                                         const TensorBeatPayload* video_rows,
+                                         const TensorBeatPayload* audio_rows,
+                                         H3References* out) const
+{
+  if (!sideband.is_object()) { return true; }
+  // as_object()/as_array() return VIEWS into their owner, so every value
+  // taken out of one is bound to a local before it is read.
+  const auto so = sideband.as_object();
+  if (!so.contains("references")) { return true; }
+  const FlexData refs = so.at("references");
+  if (!refs.is_array()) { return true; }
+  const auto ra = refs.as_array();
+  if (ra.size() == 0) { return true; }
+
+  out->refs.clear();
+  out->refs.reserve(ra.size());
+  for (std::size_t i = 0; i < ra.size(); ++i) {
+    const FlexData e = ra[i];
+    if (!e.is_object()) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): reference {} of the conditioning plan "
+          "is not an object; skipping", this->id(), i + 1));
+      return false;
+    }
+    const auto eo = e.as_object();
+    auto num = [&](const char* k) -> int {
+      return eo.contains(k) ? (int)eo.at(k).as_int() : 0;
+    };
+    h3::Reference r;
+    const FlexData kd = eo.contains("kind") ? eo.at("kind") : FlexData{};
+    const std::string kind = kd.is_string() ? std::string(kd.as_string()) : "";
+    r.kind = kind == "video"   ? h3::Reference::Kind::kVideo
+             : kind == "audio" ? h3::Reference::Kind::kAudio
+                               : h3::Reference::Kind::kImage;
+    r.num_latent_frames = num("latent_frames");
+    r.latent_height     = num("latent_height");
+    r.latent_width      = num("latent_width");
+    r.num_audio_latents = num("audio_latents");
+    out->refs.push_back(r);
+  }
+
+  if (so.contains("token_tags")) {
+    const FlexData t = so.at("token_tags");
+    if (t.is_array()) {
+      const auto ta = t.as_array();
+      out->text_tags.reserve(ta.size());
+      for (std::size_t i = 0; i < ta.size(); ++i) {
+        out->text_tags.push_back((int)ta[i].as_int());
+      }
+    }
+  }
+
+  auto rows_of = [](const TensorBeatPayload* t, int want_elems,
+                    const float** data) -> int {
+    *data = nullptr;
+    if (t == nullptr || t->shape.size() != 2) { return 0; }
+    if ((int)t->shape[1] != want_elems) { return -1; }
+    if (t->shape[0] > 0) { *data = t->as_f32(); }
+    return (int)t->shape[0];
+  };
+  const int PE = _h3_cfg.video_patch_elems();
+  const int AC = _h3_cfg.audio_channels;
+  const int vr = rows_of(video_rows, PE, &out->video_rows);
+  const int ar = rows_of(audio_rows, AC, &out->audio_rows);
+  if (vr < 0 || ar < 0) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): the reference rows are not [n, {}] / "
+        "[n, {}]; skipping", this->id(), PE, AC));
+    return false;
+  }
+  out->n_video_rows = vr;
+  out->n_audio_rows = ar;
+  return true;
+}
+
 // The minimax-h3 denoise: one packed sequence carrying both modalities,
 // so this produces two latents where the Wan path produces one.
 bool
 GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
-                            int ref_frames,
+                            int ref_frames, const H3References* r2v,
                             std::vector<float>* video_out,
                             std::vector<int>* video_shape,
                             std::vector<float>* audio_out,
@@ -701,12 +835,20 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
           : h3::audio_latent_num_frames(aligned, _fps);
 
   h3::PackedLayout L;
-  const std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
+  // Text rows are tagged 1 EXCEPT the rows of a vision block, which
+  // MiniMax-H3 tags 0 (video). A `t2va` / `fl2va` prompt has no vision
+  // block so its tags are uniform; a `ref2va` presentation's are not,
+  // and the conditioner is the only thing that knows where the blocks
+  // landed -- which is why they travel with the conditioning.
+  std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
+  if (r2v != nullptr && (int)r2v->text_tags.size() == text_rows) {
+    tags = r2v->text_tags;
+  }
   // One latent frame per anchor. No ref => text-to-video-and-audio; one
   // => a first-frame anchor; two => first AND last, which is what the
   // FL2VA partition is named for.
   std::vector<h3::Anchor> anchors;
-  if (ref != nullptr && ref_frames > 0) {
+  if (r2v == nullptr && ref != nullptr && ref_frames > 0) {
     anchors.push_back(h3::Anchor::kFirst);
     if (ref_frames >= 2) { anchors.push_back(h3::Anchor::kLast); }
   }
@@ -717,11 +859,19 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // the model was trained with; every one of them is a real row that the
   // 33B forward pays for, and the result still decodes, just as a
   // soundtrack whose two "channels" are slices of one 32-way split.
-  if (!h3::build_packed_sequence(tags, lt, lh, lw, alat, c.patch_h, c.patch_w,
-                                 h3::kAudioChannels, anchors, &L)) {
+  const bool packed =
+      r2v != nullptr
+          ? h3::build_ref2va_packed_sequence(tags, r2v->refs, lt, lh, lw,
+                                             alat, c.patch_h, c.patch_w,
+                                             h3::kAudioChannels, &L)
+          : h3::build_packed_sequence(tags, lt, lh, lw, alat, c.patch_h,
+                                      c.patch_w, h3::kAudioChannels, anchors,
+                                      &L);
+  if (!packed) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): could not pack a {}x{}x{} latent with {} "
-        "audio latents", this->id(), lt, lh, lw, alat));
+        "audio latents{}", this->id(), lt, lh, lw, alat,
+        r2v != nullptr ? " and the request's references" : ""));
     return false;
   }
   // The sequence length is known now and nothing large has been allocated
@@ -731,8 +881,13 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   const int PE = c.video_patch_elems();
   const int AC = c.audio_channels;
   const int vrows = (int)L.video_indices.size();
+  // Both buffers are sized by the INDEX vectors, not by the generated
+  // counts: a `ref2va` request leads each modality with reference rows
+  // that the denoise head still writes through, and `num_audio_rows` is
+  // the generated tail alone.
+  const int arows = (int)L.audio_indices.size();
   std::vector<float> vid((std::size_t)vrows * PE);
-  std::vector<float> aud((std::size_t)L.num_audio_rows * AC);
+  std::vector<float> aud((std::size_t)arows * AC);
   {
     std::mt19937_64 rng(_seed);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -769,6 +924,38 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     };
     slurp("VPIPE_H3_NOISE_VID", vid, "video");
     slurp("VPIPE_H3_NOISE_AUD", aud, "audio");
+  }
+
+  // The `ref2va` references are ALREADY packed into rows -- the encoder
+  // did it, where each reference's own latent geometry was known -- so
+  // they are copied straight into the leading conditioning rows of both
+  // buffers. The denoise loop never writes those rows, so what lands
+  // here is what the model reads at every step.
+  //
+  // The counts are checked rather than trusted: the canvas the layout
+  // was built from is this stage's config and the one the references
+  // were encoded at is the encoder's, so a graph whose two `frames`
+  // disagree lands here with a real mismatch. Left alone it would
+  // surface as a shape error 50 layers down.
+  if (r2v != nullptr) {
+    if (r2v->n_video_rows != L.num_condition_video_rows ||
+        r2v->n_audio_rows != L.num_condition_audio_rows) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the layout reserves {} reference video "
+          "and {} reference audio rows but the encoder packed {} and {}. The "
+          "video-ref-encoder's `frames` and this stage's do not agree; "
+          "skipping", this->id(), L.num_condition_video_rows,
+          L.num_condition_audio_rows, r2v->n_video_rows, r2v->n_audio_rows));
+      return false;
+    }
+    if (r2v->video_rows != nullptr && r2v->n_video_rows > 0) {
+      std::memcpy(vid.data(), r2v->video_rows,
+                  (std::size_t)r2v->n_video_rows * PE * sizeof(float));
+    }
+    if (r2v->audio_rows != nullptr && r2v->n_audio_rows > 0) {
+      std::memcpy(aud.data(), r2v->audio_rows,
+                  (std::size_t)r2v->n_audio_rows * AC * sizeof(float));
+    }
   }
 
   // Patchify the anchors into the CONDITIONING rows, which lead the
@@ -912,10 +1099,16 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // [stereo, AC, alat] the audio VAE decodes, so the packed-sequence
   // layout stops at this stage's boundary the same way the video
   // unpatchify above does.
+  //
+  // The GENERATED rows are the tail: a `ref2va` request leads the buffer
+  // with one clean block per reference soundtrack, which is conditioning
+  // and not part of what was generated.
+  const int acond = L.num_condition_audio_rows;
   audio_out->assign((std::size_t)h3::kAudioChannels * AC * alat, 0.0f);
   for (int ch = 0; ch < h3::kAudioChannels; ++ch) {
     for (int i = 0; i < alat; ++i) {
-      const float* row = aud.data() + (std::size_t)(ch * alat + i) * AC;
+      const float* row =
+          aud.data() + (std::size_t)(acond + ch * alat + i) * AC;
       for (int k = 0; k < AC; ++k) {
         (*audio_out)[((std::size_t)ch * AC + k) * alat + i] = row[k];
       }
@@ -997,6 +1190,22 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   }
   const auto* ref1 =
       refb1 ? dynamic_cast<const TensorBeatPayload*>(refb1.get()) : nullptr;
+  // The `ref2va` reference rows. Read unconditionally when wired: a
+  // video-ref-encoder emits BOTH every request, with 0 rows when a
+  // modality is absent, so a poll would be a race where a read is not.
+  std::unique_ptr<BeatPayloadIntf> rvb, rab;
+  if (ctx.num_iports() > kRefVideoRowsPort &&
+      ctx.iport_connected(kRefVideoRowsPort)) {
+    rvb = co_await ctx.read(kRefVideoRowsPort);
+  }
+  if (ctx.num_iports() > kRefAudioRowsPort &&
+      ctx.iport_connected(kRefAudioRowsPort)) {
+    rab = co_await ctx.read(kRefAudioRowsPort);
+  }
+  const auto* rvt =
+      rvb ? dynamic_cast<const TensorBeatPayload*>(rvb.get()) : nullptr;
+  const auto* rat =
+      rab ? dynamic_cast<const TensorBeatPayload*>(rab.get()) : nullptr;
 
   if (!ensure_expert_(0)) {
     session()->warn(fmt(
@@ -1022,6 +1231,31 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     }
     std::vector<float> vlat, alat_out;
     std::vector<int>   vshape, ashape;
+    // ---- ref2va: the request's plan, off the conditioning sideband ---
+    // The geometry travels WITH the conditioning rather than on its own
+    // port because the two are one request: pairing a conditioning with
+    // another request's layout packs cleanly and then fails 50 layers
+    // deep.
+    H3References r2v;
+    bool have_r2v = false;
+    if (!parse_h3_references_(cond->sideband, rvt, rat, &r2v)) {
+      co_return;   // already warned
+    }
+    have_r2v = !r2v.refs.empty();
+    if (_h3_partition == "ref2va" && !have_r2v) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): a Ref2VA checkpoint is resident but the "
+          "conditioning carries no references; a Ref2VA forward without them "
+          "generates video conditioned on nothing. Skipping", this->id()));
+      co_return;
+    }
+    if (have_r2v && _h3_partition == "fl2va") {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the conditioning carries references but "
+          "'{}' is the FL2VA partition, which has no reference blocks; "
+          "skipping", this->id(), _root));
+      co_return;
+    }
     // The keyframe anchor arrives on the SAME port Wan's i2v latent
     // does, from a vae-encode over the keyframe image -- so a graph
     // changes checkpoints without being rewired.
@@ -1093,6 +1327,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
     const bool ok_h3 =
         run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
+                have_r2v ? &r2v : nullptr,
                 &vlat, &vshape, &alat_out, &ashape);
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
     // What the adaptive residency actually reached. This is the number

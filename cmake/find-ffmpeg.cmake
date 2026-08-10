@@ -242,3 +242,58 @@ foreach(_w IN LISTS _vpipe_ffmpeg_watch)
 endforeach()
 
 message(STATUS "FFmpeg headers: ${VPIPE_FFMPEG_INCLUDE_DIRS}")
+
+# ---- 6. an ABI tag that forces a rebuild when the ABI moves ----------
+# Read the soname majors out of the headers and hand them back so the
+# build can put them ON THE COMPILE LINE. Changing a compile definition
+# makes CMake rebuild every TU of the target, which is the point.
+#
+# WHY THIS EXISTS. vpipe dlopens FFmpeg but compiles against its
+# headers, so the struct layouts baked into our objects must match the
+# libraries loaded at run time. Header mtimes cannot be trusted to
+# enforce that: Homebrew's bottles preserve UPSTREAM mtimes, so an
+# upgrade can install headers that are OLDER than the objects already
+# built against the previous version. make then sees everything as up
+# to date and recompiles nothing.
+#
+# MEASURED, on the 7.1.1 -> 8.1.2 upgrade: the 8.1.2 headers arrived
+# dated 2026-06-16, the existing objects were from 2026-08-09, and only
+# the one file that had been edited by hand was rebuilt. The resulting
+# libvpipe mixed 7.1.1 struct layouts with 8.1.2 libraries -- which does
+# not fail at load (dlopen resolves every symbol by name) but corrupts
+# every call that passes a struct. It surfaced as avcodec_open2 refusing
+# a valid context with EINVAL, empty output files, and "decoded 0
+# frames": a full day of confusing symptoms with no error naming the
+# cause.
+set(_vpipe_ffmpeg_abi "")
+foreach(_pair "libavutil;LIBAVUTIL" "libavcodec;LIBAVCODEC"
+              "libavformat;LIBAVFORMAT" "libswresample;LIBSWRESAMPLE"
+              "libswscale;LIBSWSCALE")
+  list(GET _pair 0 _dir)
+  list(GET _pair 1 _prefix)
+  set(_major "")
+  foreach(_d IN LISTS VPIPE_FFMPEG_INCLUDE_DIRS)
+    # Newer FFmpeg splits the major out into version_major.h; older
+    # keeps it in version.h. Check both rather than assuming.
+    foreach(_f "${_d}/${_dir}/version_major.h" "${_d}/${_dir}/version.h")
+      if(NOT _major AND EXISTS "${_f}")
+        file(STRINGS "${_f}" _line
+             REGEX "^#define[ \t]+${_prefix}_VERSION_MAJOR[ \t]+[0-9]+")
+        if(_line)
+          string(REGEX MATCH "[0-9]+$" _major "${_line}")
+        endif()
+      endif()
+    endforeach()
+  endforeach()
+  if(NOT _major)
+    set(_major "x")
+  endif()
+  # NOT ";" as a separator: CMake treats a semicolon-bearing string as a
+  # LIST, so the value would expand into several -D flags and break the
+  # compile command outright ("sh: syntax error: unexpected end of
+  # file"). A dash keeps it one token.
+  string(APPEND _vpipe_ffmpeg_abi "${_dir}${_major}-")
+endforeach()
+
+set(VPIPE_FFMPEG_ABI_TAG "${_vpipe_ffmpeg_abi}")
+message(STATUS "FFmpeg ABI: ${VPIPE_FFMPEG_ABI_TAG}")

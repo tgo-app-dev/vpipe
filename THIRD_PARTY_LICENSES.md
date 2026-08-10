@@ -8,6 +8,127 @@ verbatim license text as required by that component's license.
 vpipe itself is licensed under the Apache License, Version 2.0; see the
 root `LICENSE` file.
 
+Two groups appear below. The first covers software **redistributed in
+binary form inside the macOS application bundle** (`Vpipe Manager.app`)
+-- these carry obligations that travel with every copy of the app, and
+their license texts also ship inside the bundle under
+`Contents/Resources/Licenses`. The second covers source vendored or
+linked into vpipe itself.
+
+Building vpipe from source pulls FFmpeg and OpenSSL from the host
+system instead, in which case only the second group applies.
+
+---
+
+# Redistributed in the macOS application bundle
+
+## FFmpeg
+
+Bundled as shared libraries in `Contents/Frameworks` when the app is
+built with `-DVPIPE_BUNDLE_FFMPEG=ON`. Home page: <https://ffmpeg.org/>.
+
+**License: GNU Lesser General Public License, version 2.1 or later.**
+
+The bundled build is configured `--disable-gpl --disable-nonfree
+--disable-version3`, so none of FFmpeg's GPL-licensed components
+(libx264, libx265, libpostproc, ...) are compiled in and the whole of
+the shipped build is LGPL-2.1-or-later. The exact configuration is in
+`apps/macos-app/build-lgpl-ffmpeg.sh`.
+
+### Modifications
+
+The FFmpeg **source is unmodified**. The shipped libraries differ from a
+stock build of that source only in their recorded install names, which
+`apps/macos-app/bundle-app.sh` rewrites with `install_name_tool` so the
+bundle is relocatable.
+
+### Corresponding source
+
+The complete corresponding source for the bundled libraries, together
+with the build script above, is published alongside the application
+releases. The URL is recorded in `Contents/Resources/Licenses/NOTICE.txt`
+in each build, and is configured at build time by
+`VPIPE_FFMPEG_SOURCE_URL`.
+
+### Replacing the bundled copy
+
+vpipe loads FFmpeg with `dlopen` and never links against it, so a user
+may substitute their own build **without modifying or relinking the
+application**: set the FFmpeg library path in the app's Settings, or the
+`VPIPE_FFMPEG_DIR` environment variable, to a directory containing their
+own `libavcodec.dylib` and companions. That directory is searched before
+both the bundled copy and the system install.
+
+### License
+
+The full text is in `apps/macos-app/licenses/LGPL-2.1.txt` and ships as
+`Contents/Resources/Licenses/LGPL-2.1.txt`.
+
+---
+
+## LAME (libmp3lame)
+
+Bundled alongside FFmpeg, which uses it for MP3 encoding, when LAME is
+present at FFmpeg-build time. Home page: <https://lame.sourceforge.io/>.
+
+**License: GNU Lesser General Public License, version 2.1 or later.**
+
+Unmodified, and subject to the same corresponding-source and
+replacement terms as FFmpeg above -- it is loaded only through FFmpeg,
+so substituting an FFmpeg build replaces it too.
+
+### License
+
+Full text as for FFmpeg (`LGPL-2.1.txt`); LAME's own summary of its
+terms ships as `Contents/Resources/Licenses/LAME.txt`.
+
+---
+
+## OpenSSL
+
+Bundled as `libssl` and `libcrypto` in `Contents/Frameworks`. Used by
+`vpipe-web-ui` to serve HTTPS. Home page: <https://www.openssl.org/>.
+
+**License: Apache License, Version 2.0.** Unmodified.
+
+### Copyright notice
+
+> Copyright (c) The OpenSSL Project Authors.
+
+### License
+
+The full text ships as
+`Contents/Resources/Licenses/Apache-2.0-OpenSSL.txt`.
+
+---
+
+## Sparkle
+
+Bundled as `Sparkle.framework` when the app is built with
+`-DVPIPE_SPARKLE_DIR=...`; it provides application updates. Home page:
+<https://github.com/sparkle-project/Sparkle>.
+
+**License: MIT.** Unmodified.
+
+### Copyright notice
+
+> Copyright (c) 2006-2013 Andy Matuschak.
+> Copyright (c) 2009-2013 Elgato Systems GmbH.
+> Copyright (c) 2011-2014 Kornel Lesinski.
+> Copyright (c) 2015-2017 Mayur Pawashe.
+> Copyright (c) 2014 C.W. Betts.
+> (and further contributors; see the shipped text)
+
+### License
+
+The full text, including the notices for the third-party code Sparkle
+itself carries, ships as
+`Contents/Resources/Licenses/MIT-Sparkle.txt`.
+
+---
+
+# Vendored or linked into vpipe
+
 ---
 
 ## LMDB (liblmdb)

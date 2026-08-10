@@ -1,14 +1,22 @@
 // File browser view: a three-column workspace over the session's
 // filesystem namespace (sandbox chroot-like "/"-root, or native paths --
 // same namespace the file open/save dialog speaks). The columns are
-// split 2 : 3 : 3 as { folder tree, directory listing, preview }, under a
-// top toolbar (up one level / refresh / rename / new folder).
+// { folder tree, directory listing, preview }, split 2 : 3 : 3 until the
+// user drags a handle (remembered), under a top toolbar (up one level /
+// refresh / rename / new folder).
 //
 // The tree is the jump-around navigator (lazy, expand-on-demand); the
 // listing shows the current directory's entries (dirs + files); the
 // preview renders the selected file -- image, one screen of text, or an
 // audio / video player. Selecting an entry never leaves the view; only
-// a directory drill-in (double-click / tree click) changes the listing.
+// a directory drill-in (double-click / tree click / Right arrow) changes
+// the listing.
+//
+// The keyboard drives the listing once it has focus: Up/Down (and
+// PageUp/PageDown/Home/End) walk the entries, Left leaves for the parent
+// directory and Right steps into the highlighted one. The mechanics live
+// in the shared list component; this view supplies only what "out" and
+// "into" mean here, since both also move the tree.
 //
 // All bytes come from the backend: GET /api/fs/list (one directory),
 // GET /api/fs/file (raw file bytes, Range-aware) via api.fsFileUrl /
@@ -44,6 +52,13 @@ function relSegments(base, full) {
   const b = (base === '/' || !base) ? '' : base.replace(/\/+$/, '');
   const rest = (b && full.startsWith(b)) ? full.slice(b.length) : full;
   return rest.split('/').filter(Boolean);
+}
+
+// Last segment of a server path ('' at a root), so stepping OUT of a
+// directory can land the cursor back on the one we came from.
+function baseName(p) {
+  const segs = String(p || '').split('/').filter(Boolean);
+  return segs.length ? segs[segs.length - 1] : '';
 }
 
 // ---------------------------------------------------------------------
@@ -108,20 +123,104 @@ export function mountFileBrowser(container) {
     },
     onMount: (m) => enterDir(m.path),
     onLoading: (b) => { filesBusy.hidden = !b; },
+    // Left / Right walk the hierarchy from the keyboard: out to the
+    // parent, and into the highlighted directory (the component calls
+    // onDirOpen for that, so Right and a double-click take one path).
+    onNavUp: () => goUp(),
   });
   fbList = list;
   const listBody = el('div', { class: 'pane-body fb-list' }, list.el);
 
+  const treePane = el('div', { class: 'pane fb-col-tree' },
+    el('div', { class: 'pane-head' },
+      el('span', { class: 'title' }, t('fb.folders'))), treeBody);
+  const listPane = el('div', { class: 'pane fb-col-list' },
+    el('div', { class: 'pane-head' },
+      el('span', { class: 'title' }, t('fb.files')), filesBusy), listBody);
+  const prevPane = el('div', { class: 'pane fb-col-preview' },
+    el('div', { class: 'pane-head' },
+      el('span', { class: 'title' }, t('fb.preview'))), prevBody);
+
+  // ---- column widths ----------------------------------------------
+  // The three panes are grid tracks in `fr`, with a drag handle in a
+  // fixed track between each pair. A drag moves width BETWEEN the two
+  // panes it sits between and leaves the third alone, which is what
+  // makes the gesture local: widening the preview should not also
+  // reshuffle the tree.
+  const FB_COLS_KEY = 'vpipe_fb_cols';
+  const FB_COLS_DEF = [2, 3, 3];      // the long-standing 2 : 3 : 3
+  const COL_MIN = 120;                // px a pane may not shrink past
+  let cols = FB_COLS_DEF.slice();
+  try {
+    const saved = JSON.parse(localStorage.getItem(FB_COLS_KEY));
+    if (Array.isArray(saved) && saved.length === 3
+        && saved.every((n) => Number.isFinite(n) && n > 0)) {
+      cols = saved.map(Number);
+    }
+  } catch (e) { /* no storage, or a stale value -- keep the default */ }
+
+  const panes = [treePane, listPane, prevPane];
+  const handles = [0, 1].map((i) => el('div', {
+    class: 'fb-split', 'data-i': String(i), role: 'separator',
+    'aria-orientation': 'vertical', title: t('fb.resize_cols') }));
   const bodyEl = el('div', { class: 'fb-body' },
-    el('div', { class: 'pane fb-col-tree' },
-      el('div', { class: 'pane-head' },
-        el('span', { class: 'title' }, t('fb.folders'))), treeBody),
-    el('div', { class: 'pane fb-col-list' },
-      el('div', { class: 'pane-head' },
-        el('span', { class: 'title' }, t('fb.files')), filesBusy), listBody),
-    el('div', { class: 'pane fb-col-preview' },
-      el('div', { class: 'pane-head' },
-        el('span', { class: 'title' }, t('fb.preview'))), prevBody));
+    treePane, handles[0], listPane, handles[1], prevPane);
+
+  function applyCols() {
+    bodyEl.style.gridTemplateColumns =
+      cols[0] + 'fr var(--fb-split-w) ' + cols[1]
+      + 'fr var(--fb-split-w) ' + cols[2] + 'fr';
+  }
+  function saveCols() {
+    try { localStorage.setItem(FB_COLS_KEY, JSON.stringify(cols)); }
+    catch (e) { /* storage blocked -- the drag still applies this session */ }
+  }
+  applyCols();
+
+  // Drag redistributes the PIXELS of the adjacent pair, then converts
+  // back to fr against the fr they already share. Going through pixels
+  // is what makes the pane track the pointer 1:1 whatever the fr units
+  // happen to be worth.
+  for (const h of handles) {
+    h.addEventListener('pointerdown', (ev) => {
+      const i = +h.dataset.i;
+      const w0 = panes[i].getBoundingClientRect().width;
+      const w1 = panes[i + 1].getBoundingClientRect().width;
+      const span = w0 + w1;
+      const frSum = cols[i] + cols[i + 1];
+      if (span <= 0) { return; }
+      const x0 = ev.clientX;
+      h.setPointerCapture(ev.pointerId);
+      h.classList.add('dragging');
+      ev.preventDefault();
+      const move = (e) => {
+        const want = Math.min(Math.max(w0 + (e.clientX - x0), COL_MIN),
+          span - COL_MIN);
+        cols[i] = frSum * (want / span);
+        cols[i + 1] = frSum - cols[i];
+        applyCols();
+      };
+      const end = (e) => {
+        h.removeEventListener('pointermove', move);
+        h.removeEventListener('pointerup', end);
+        h.removeEventListener('pointercancel', end);
+        h.classList.remove('dragging');
+        try { h.releasePointerCapture(e.pointerId); } catch (er) {}
+        cols = cols.map((n) => +n.toFixed(4));
+        saveCols();
+      };
+      h.addEventListener('pointermove', move);
+      h.addEventListener('pointerup', end);
+      h.addEventListener('pointercancel', end);
+    });
+    // Double-click restores 2 : 3 : 3 -- the way back from a drag that
+    // squeezed a pane to its minimum, without hunting for the handle.
+    h.addEventListener('dblclick', () => {
+      cols = FB_COLS_DEF.slice();
+      applyCols();
+      saveCols();
+    });
+  }
 
   rootEl.append(toolbar, bodyEl);
 
@@ -294,18 +393,31 @@ export function mountFileBrowser(container) {
   }
 
   // Navigate the listing into `vpath` and reveal it in the tree. `node`,
-  // when given (a tree-row click), is highlighted directly.
-  async function enterDir(vpath, node) {
+  // when given (a tree-row click), is highlighted directly. `focusName`
+  // is an entry to land the selection + keyboard cursor on afterwards.
+  async function enterDir(vpath, node, focusName) {
     const ok = await loadListing(vpath);
     if (!ok) { return; }
+    if (focusName) {
+      list.setSelection([focusName]);
+      selectedName = focusName;
+      selectedIsDir = true;      // only ever the directory we came from
+      updateToolbar();
+    }
     if (node) { setCurrentNode(node); }
     else { revealPath(curDir); }
   }
 
+  // Out to the parent, landing on the directory just left so Left and
+  // Right are each other's undo. Shared by the toolbar button and the
+  // Left arrow key.
+  function goUp() {
+    if (!curParent) { return; }
+    enterDir(curParent, null, baseName(curDir));
+  }
+
   // ---- toolbar actions --------------------------------------------
-  upBtn.addEventListener('click', () => {
-    if (curParent) { enterDir(curParent); }
-  });
+  upBtn.addEventListener('click', goUp);
 
   refreshBtn.addEventListener('click', async () => {
     await loadListing(curDir);
@@ -397,6 +509,10 @@ export function mountFileBrowser(container) {
     if (rootPath !== null) {
       await loadListing(rootPath || '');
       setCurrentNode(treeRoots[0] || null);
+      // Give the listing the keyboard straight away: the view has no
+      // other default focus, and arrow navigation that needs a click to
+      // wake up is a feature nobody finds.
+      list.focus();
     }
   })();
 }

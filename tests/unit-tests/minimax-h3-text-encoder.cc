@@ -94,7 +94,397 @@ bf16_to_f32_(std::uint16_t b)
   return f;
 }
 
+// The vision tower emits its native compute element, which is f16 unless
+// it was built bf16 -- both are two bytes, so guessing wrong reads
+// plausible garbage rather than crashing. Ask the tower.
+float
+vis_elt_(std::uint16_t v, bool bf16)
+{
+  if (bf16) { return bf16_to_f32_(v); }
+  _Float16 h;
+  std::memcpy(&h, &v, 2);
+  return (float)h;
+}
+
 }  // namespace
+
+// ---- the vision tower's VIDEO path (ref2va video references) ---------
+
+TEST(minimax_h3_text_enc, vision_video_matches_golden)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* gd   = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  std::ifstream in(std::string(gd) + "/vision_video_golden.json");
+  if (!in) {
+    std::printf("[minimax_h3_text_enc] no vision_video_golden.json\n");
+    return;
+  }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return;
+  }
+  if (!fd.is_object()) { return; }
+  auto o = fd.as_object();
+  auto geti = [&](const char* k) {
+    return o.contains(k) ? (int)o.at(k).as_int(0) : 0;
+  };
+  const int frames = geti("frames"), Hh = geti("height"), Ww = geti("width");
+  const int g_t = geti("grid_t"), g_h = geti("grid_h"), g_w = geti("grid_w");
+  const int n_tok = geti("n_tokens"), outh = geti("out_hidden");
+  std::vector<float> pix, emb;
+  {
+    FlexData p = o.at("pixels");
+    for (auto v : p.as_real_span()) { pix.push_back((float)v); }
+    FlexData e = o.at("embeddings");
+    for (auto v : e.as_real_span()) { emb.push_back((float)v); }
+  }
+  if (frames <= 0 || pix.empty() || emb.empty()) { return; }
+
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  genai::MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  if (!genai::MiniMaxH3TextEncoder::config_from_json(root, cfg, &err)) {
+    std::printf("[minimax_h3_text_enc] config: %s\n", err.c_str());
+    return;
+  }
+  auto tower = genai::MiniMaxH3TextEncoder::load_vision(root, mc, cfg, &err);
+  if (!tower) {
+    std::printf("[minimax_h3_text_enc] vision load failed: %s\n", err.c_str());
+    return;
+  }
+
+  // The golden stores frames [f, H, W, 3]; the tower wants `frames`
+  // consecutive [3, H, W] planes.
+  std::vector<std::uint8_t> rgb((std::size_t)frames * 3 * Hh * Ww);
+  for (int f = 0; f < frames; ++f) {
+    for (int y = 0; y < Hh; ++y) {
+      for (int x = 0; x < Ww; ++x) {
+        for (int c = 0; c < 3; ++c) {
+          rgb[((std::size_t)f * 3 + c) * Hh * Ww + (std::size_t)y * Ww + x] =
+              (std::uint8_t)pix[(((std::size_t)f * Hh + y) * Ww + x) * 3 + c];
+        }
+      }
+    }
+  }
+
+  genai::MetalQwenVisionEncoder::Result r =
+      tower->encode_video(rgb.data(), frames, Hh, Ww);
+  std::printf("[minimax_h3_text_enc] clip %dx%dx%d -> grid %dx%dx%d, "
+              "%d tokens (golden %d)\n", frames, Hh, Ww, r.grid_t, r.grid_h,
+              r.grid_w, r.n_tokens, n_tok);
+  // The GRID is checked before the values: a clip resized by the image
+  // rule instead of the video one lands on a different canvas, and then
+  // every token is computed from the wrong pixels while still looking
+  // like a plausible embedding.
+  EXPECT_TRUE(r.grid_t == g_t);
+  EXPECT_TRUE(r.grid_h == g_h);
+  EXPECT_TRUE(r.grid_w == g_w);
+  EXPECT_TRUE(r.n_tokens == n_tok);
+  EXPECT_TRUE(r.out_hidden == outh);
+  if (r.n_tokens != n_tok || r.out_hidden != outh) { return; }
+
+  std::vector<float> got((std::size_t)n_tok * outh, 0.0f);
+  const auto* src = static_cast<const std::uint16_t*>(r.embeddings.contents());
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    got[i] = vis_elt_(src[i], tower->is_bf16());
+  }
+
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    const double d = (double)got[i] - (double)emb[i];
+    num += d * d;
+    den += (double)emb[i] * (double)emb[i];
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 1.0;
+  std::printf("[minimax_h3_text_enc] video tower rel-L2 = %.4e\n", rel);
+  // The bar is set by the STORAGE DTYPE, not by the arithmetic. Both
+  // sides run bf16 here, because that is what the H3 pipeline runs (the
+  // whole conditioner is bf16 and the tower is part of it), and bf16's
+  // 8 mantissa bits over 27 blocks are worth a few percent on their own.
+  //
+  // MEASURED on this golden, same code, same weights:
+  //   f16 tower vs an fp32 reference   0.0141
+  //   bf16 tower vs an fp32 reference  0.0507
+  //   bf16 tower vs this bf16 golden   0.0325
+  // The 0.0141 is the one that says the LOGIC is right; a real defect
+  // does not land anywhere near it. For scale, running the attention
+  // across temporal cells instead of within each -- the bug this test
+  // was written to catch -- measured 0.79.
+  EXPECT_TRUE(rel < 6e-2);
+
+  // A clip whose temporal cells all produced the SAME tokens would pass
+  // a loose rel-L2 if the reference happened to be near-static, so check
+  // the two cells actually differ: the patchify has to be reading a
+  // different pair of frames per cell.
+  if (r.grid_t >= 2) {
+    const std::size_t per = (std::size_t)(n_tok / r.grid_t) * outh;
+    double diff = 0.0, base = 0.0;
+    for (std::size_t i = 0; i < per; ++i) {
+      const double d = (double)got[i] - (double)got[per + i];
+      diff += d * d;
+      base += (double)got[i] * (double)got[i];
+    }
+    const double sep = base > 0.0 ? std::sqrt(diff / base) : 0.0;
+    std::printf("[minimax_h3_text_enc] cell 0 vs cell 1 differ by %.4f\n", sep);
+    EXPECT_TRUE(sep > 1e-3);
+  }
+}
+
+// The IMAGE path, over the same tower.
+//
+// The video work refactored code the image path shares -- the per-cell
+// attention loop runs once for an image, and the transposes gained
+// offsets that are zero there -- so this exists to say that in a
+// measurement rather than in an argument. Image references are also
+// most of a `ref2va` request (up to 9 of them, against 3 clips).
+//
+// The geometry is chosen to land on the canvas UNCHANGED, so what is
+// compared is the tower alone: an input the resize actually moves would
+// fold in vpipe's bilinear against the processor's antialiased bicubic,
+// which is a real difference but a different one.
+TEST(minimax_h3_text_enc, vision_image_matches_golden)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* gd   = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  std::ifstream in(std::string(gd) + "/vision_image_golden.json");
+  if (!in) { return; }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return;
+  }
+  if (!fd.is_object()) { return; }
+  auto o = fd.as_object();
+  auto geti = [&](const char* k) {
+    return o.contains(k) ? (int)o.at(k).as_int(0) : 0;
+  };
+  const int Hh = geti("height"), Ww = geti("width");
+  const int g_h = geti("grid_h"), g_w = geti("grid_w");
+  const int n_tok = geti("n_tokens"), outh = geti("out_hidden");
+  std::vector<float> pix, emb;
+  for (auto v : o.at("pixels").as_real_span()) { pix.push_back((float)v); }
+  for (auto v : o.at("embeddings").as_real_span()) { emb.push_back((float)v); }
+  if (pix.empty() || emb.empty()) { return; }
+
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  genai::MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  if (!genai::MiniMaxH3TextEncoder::config_from_json(root, cfg, &err)) { return; }
+  auto tower = genai::MiniMaxH3TextEncoder::load_vision(root, mc, cfg, &err);
+  if (!tower) { return; }
+
+  std::vector<std::uint8_t> rgb((std::size_t)3 * Hh * Ww);
+  for (int y = 0; y < Hh; ++y) {
+    for (int x = 0; x < Ww; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        rgb[(std::size_t)c * Hh * Ww + (std::size_t)y * Ww + x] =
+            (std::uint8_t)pix[((std::size_t)y * Ww + x) * 3 + c];
+      }
+    }
+  }
+
+  genai::MetalQwenVisionEncoder::Result r = tower->encode(rgb.data(), Hh, Ww);
+  std::printf("[minimax_h3_text_enc] image %dx%d -> grid %dx%dx%d, %d tokens "
+              "(golden %d)\n", Hh, Ww, r.grid_t, r.grid_h, r.grid_w,
+              r.n_tokens, n_tok);
+  EXPECT_TRUE(r.grid_t == 1);
+  EXPECT_TRUE(r.grid_h == g_h);
+  EXPECT_TRUE(r.grid_w == g_w);
+  EXPECT_TRUE(r.n_tokens == n_tok);
+  if (r.n_tokens != n_tok || r.out_hidden != outh) {
+    EXPECT_TRUE(false);
+    return;
+  }
+
+  const auto* src = static_cast<const std::uint16_t*>(r.embeddings.contents());
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < emb.size(); ++i) {
+    const double d = (double)vis_elt_(src[i], tower->is_bf16()) - (double)emb[i];
+    num += d * d;
+    den += (double)emb[i] * (double)emb[i];
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 1.0;
+  std::printf("[minimax_h3_text_enc] image tower rel-L2 = %.4e\n", rel);
+  EXPECT_TRUE(rel < 6e-2);   // same bf16 bar as the video twin
+}
+
+// ---- the ref2va presentation -----------------------------------------
+//
+// Checked WITHOUT running the conditioner: the labels, their per-modality
+// numbering, the audio-before-video ordering, the block timestamps, the
+// pad counts, the modality tags and the rotary layout are all decided
+// before a single layer runs, and every one of them fails silently -- the
+// conditioner still returns a well-shaped hidden state, built from a
+// different prompt than the model was trained to read.
+//
+// The tap is truncated to one layer so this costs a load rather than a
+// 32B forward; nothing it checks depends on depth.
+TEST(minimax_h3_text_enc, ref2va_presentation_matches_golden)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* gd   = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  std::ifstream in(std::string(gd) + "/presentation_golden.json");
+  if (!in) {
+    std::printf("[minimax_h3_text_enc] no presentation_golden.json\n");
+    return;
+  }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return;
+  }
+  if (!fd.is_object()) { return; }
+  auto o = fd.as_object();
+  auto geti = [&](const char* k) {
+    return o.contains(k) ? (int)o.at(k).as_int(0) : 0;
+  };
+  const int ig_h = geti("image_grid_h"), ig_w = geti("image_grid_w");
+  const int vg_h = geti("video_grid_h"), vg_w = geti("video_grid_w");
+  const int blocks = geti("video_blocks"), sampled = geti("sampled_frames");
+  std::string prompt;
+  if (o.contains("prompt")) { prompt = std::string(o.at("prompt").as_string()); }
+  // Each span is bound to an OWNING local first: as_int_span() returns a
+  // view, so reading it straight off `o.at(...)` walks a destroyed
+  // temporary -- which reads as a golden full of zeros rather than as a
+  // crash.
+  std::vector<int> want_ids, want_tags, want_mrope;
+  std::vector<float> want_secs;
+  {
+    FlexData a = o.at("ids");
+    for (auto v : a.as_int_span()) { want_ids.push_back((int)v); }
+    FlexData b = o.at("tags");
+    for (auto v : b.as_int_span()) { want_tags.push_back((int)v); }
+    FlexData c = o.at("mrope");
+    for (auto v : c.as_int_span()) { want_mrope.push_back((int)v); }
+    FlexData d = o.at("block_seconds");
+    for (auto v : d.as_real_span()) { want_secs.push_back((float)v); }
+  }
+  if (want_ids.empty() || prompt.empty()) { return; }
+
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  genai::MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  if (!genai::MiniMaxH3TextEncoder::config_from_json(root, cfg, &err)) {
+    std::printf("[minimax_h3_text_enc] config: %s\n", err.c_str());
+    return;
+  }
+  cfg.tap = 1;                       // one layer: this test never runs it
+  auto enc = genai::MiniMaxH3TextEncoder::load(root, mc, nullptr, cfg);
+  if (!enc) {
+    std::printf("[minimax_h3_text_enc] load failed\n");
+    return;
+  }
+
+  // The timestamps are computed, not taken from the golden -- they are
+  // part of what is under test. 5 sampled frames merge into 3 blocks,
+  // the last repeating, and "%.1f" rounds 0.25 to "0.2" (half to even).
+  const std::vector<float> secs =
+      genai::MiniMaxH3TextEncoder::video_block_seconds(sampled);
+  EXPECT_TRUE((int)secs.size() == blocks);
+  bool secs_ok = secs.size() == want_secs.size();
+  for (std::size_t i = 0; i < secs.size() && secs_ok; ++i) {
+    secs_ok = std::fabs(secs[i] - want_secs[i]) < 1e-6f;
+  }
+  if (!secs_ok) {
+    std::printf("[minimax_h3_text_enc] block seconds differ\n");
+  }
+  EXPECT_TRUE(secs_ok);
+
+  // Only the GEOMETRY of a tower result is read here, so the buffers
+  // stay empty -- the presentation is built before any pixels matter.
+  genai::MetalQwenVisionEncoder::Result img;
+  img.grid_h = ig_h; img.grid_w = ig_w; img.grid_t = 1;
+  img.n_tokens = ig_h * ig_w / 4;
+  img.out_hidden = cfg.text_dim;
+  genai::MetalQwenVisionEncoder::Result vid;
+  vid.grid_h = vg_h; vid.grid_w = vg_w; vid.grid_t = blocks;
+  vid.n_tokens = blocks * vg_h * vg_w / 4;
+  vid.out_hidden = cfg.text_dim;
+
+  using Ref = genai::MiniMaxH3TextEncoder::Reference;
+  std::vector<Ref> refs(3);
+  refs[0].kind = Ref::Kind::kImage;
+  refs[0].vision = &img;
+  refs[1].kind = Ref::Kind::kVideo;
+  refs[1].vision = &vid;
+  refs[1].block_seconds = secs;
+  refs[1].has_audio = true;
+  refs[2].kind = Ref::Kind::kAudio;
+  refs[2].has_audio = true;
+
+  genai::MiniMaxH3TextEncoder::Presentation P;
+  if (!enc->build_presentation(refs, prompt, &P, &err)) {
+    std::printf("[minimax_h3_text_enc] presentation: %s\n", err.c_str());
+    EXPECT_TRUE(false);
+    return;
+  }
+  std::printf("[minimax_h3_text_enc] presentation %d tokens (golden %d), "
+              "%d vision runs\n", P.size(), (int)want_ids.size(),
+              (int)P.runs.size());
+  EXPECT_TRUE(P.size() == (int)want_ids.size());
+  if (P.size() != (int)want_ids.size()) { return; }
+
+  int bad_id = -1, bad_tag = -1, bad_pos = -1;
+  for (int i = 0; i < P.size(); ++i) {
+    if (bad_id < 0 && P.ids[(std::size_t)i] != want_ids[(std::size_t)i]) {
+      bad_id = i;
+    }
+    if (bad_tag < 0 && P.tags[(std::size_t)i] != want_tags[(std::size_t)i]) {
+      bad_tag = i;
+    }
+  }
+  for (std::size_t i = 0; i < want_mrope.size(); ++i) {
+    if (bad_pos < 0 && P.mrope[i] != want_mrope[i]) { bad_pos = (int)i; }
+  }
+  if (bad_id >= 0) {
+    std::printf("[minimax_h3_text_enc] first id mismatch at %d: %d vs %d\n",
+                bad_id, P.ids[(std::size_t)bad_id], want_ids[(std::size_t)bad_id]);
+  }
+  if (bad_pos >= 0) {
+    const int n = P.size();
+    std::printf("[minimax_h3_text_enc] first mrope mismatch at axis %d row "
+                "%d: %d vs %d\n", bad_pos / n, bad_pos % n,
+                P.mrope[(std::size_t)bad_pos], want_mrope[(std::size_t)bad_pos]);
+  }
+  EXPECT_TRUE(bad_id < 0);
+  EXPECT_TRUE(bad_tag < 0);
+  EXPECT_TRUE((int)P.mrope.size() == (int)want_mrope.size());
+  EXPECT_TRUE(bad_pos < 0);
+
+  // The runs are what the vision splice and the deepstack segments both
+  // address, so their shape matters as much as the ids: one run for the
+  // image, one per video CELL.
+  EXPECT_TRUE((int)P.runs.size() == 1 + blocks);
+  if ((int)P.runs.size() == 1 + blocks) {
+    EXPECT_TRUE(P.runs[0].rows == img.n_tokens);
+    for (int i = 0; i < blocks; ++i) {
+      EXPECT_TRUE(P.runs[(std::size_t)(1 + i)].rows == vg_h * vg_w / 4);
+      EXPECT_TRUE(P.runs[(std::size_t)(1 + i)].cell == i);
+    }
+  }
+  std::printf("[minimax_h3_text_enc] ids, tags, mrope and runs all match "
+              "the reference\n");
+}
 
 TEST(minimax_h3_text_enc, config_from_json)
 {

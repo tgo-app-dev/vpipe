@@ -3,3 +3,6 @@
 add_subdirectory(db-log-reader)
 add_subdirectory(web-ui)
 add_subdirectory(vpipe)
+# macos-app wraps the two binaries above, so it comes last: its bundling
+# target depends on both.
+add_subdirectory(macos-app)

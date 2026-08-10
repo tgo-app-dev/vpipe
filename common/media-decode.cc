@@ -18,6 +18,13 @@ namespace {
 // chat-attached clip legitimately needs sits far below this.
 constexpr size_t kMaxAudioSeconds = 20 * 60;
 
+// The same idea for video, where the cost per unit is far higher:
+// planar RGB is 6 MB a 1080p frame, so a whole-file decode of a long
+// clip is measured in gigabytes. Callers that know their bound pass
+// `max_seconds`; these are the backstop for the ones that do not.
+constexpr int64_t kMaxVideoFrames          = 4096;
+constexpr int64_t kMaxVideoPixelsPerFrame  = 4096LL * 4096LL;
+
 string
 av_err_(const FFmpegLibraries* libs, int rc)
 {
@@ -393,10 +400,15 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
                    const string*           path,
                    span<const uint8_t>     bytes,
                    int                     target_sample_rate,
+                   int                     out_channels,
                    string*                 error)
 {
   if (!libs || !libs->valid()) {
     set_err_(error, "FFmpeg libraries unavailable");
+    return nullopt;
+  }
+  if (out_channels != 1 && out_channels != 2) {
+    set_err_(error, "channels must be 1 (mono) or 2 (stereo)");
     return nullopt;
   }
   if (target_sample_rate < 1000 || target_sample_rate > 384000) {
@@ -425,12 +437,17 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
 
   DecodedAudio out;
   out.sample_rate = target_sample_rate;
+  out.channels    = out_channels;
   const size_t max_samples =
       static_cast<size_t>(target_sample_rate) * kMaxAudioSeconds;
+  // Accumulated INTERLEAVED and de-interleaved once at the end: the
+  // planar form swresample would write needs one contiguous plane per
+  // channel up front, which a stream of unknown length has not got.
+  vector<float> inter;
 
-  // Resampler to mono f32 @ target rate, built lazily on the first
-  // decoded frame (the true sample format/layout may only be known
-  // then) and rebuilt on a mid-stream format change.
+  // Resampler to f32 @ target rate, built lazily on the first decoded
+  // frame (the true sample format/layout may only be known then) and
+  // rebuilt on a mid-stream format change.
   SwrPtr swr(nullptr, SwrDeleter{libs});
   int in_rate = 0, in_ch = 0;
   enum AVSampleFormat in_fmt = AV_SAMPLE_FMT_NONE;
@@ -449,6 +466,10 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
       in_layout.nb_channels = f->ch_layout.nb_channels;
     }
     AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+    if (out_channels == 2) {
+      const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+      out_layout = stereo;
+    }
     SwrContext* sw = nullptr;
     int rc = libs->swresample().api.alloc_set_opts2(
         &sw,
@@ -480,21 +501,21 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
         + (static_cast<int64_t>(f ? f->nb_samples : 0)
            * target_sample_rate) / std::max(1, in_rate)
         + 32;
-    const size_t prev = out.pcm.size();
-    out.pcm.resize(prev + static_cast<size_t>(max_out));
-    float* dst = out.pcm.data() + prev;
+    const size_t prev = inter.size();
+    inter.resize(prev + static_cast<size_t>(max_out) * out_channels);
+    float* dst = inter.data() + prev;
     const int n = libs->swresample().api.convert(
         swr.get(), reinterpret_cast<uint8_t**>(&dst),
         static_cast<int>(max_out),
         f ? const_cast<const uint8_t**>(f->extended_data) : nullptr,
         f ? f->nb_samples : 0);
     if (n < 0) {
-      out.pcm.resize(prev);
+      inter.resize(prev);
       set_err_(error, "swr_convert failed: " + av_err_(libs, n));
       return false;
     }
-    out.pcm.resize(prev + static_cast<size_t>(n));
-    if (out.pcm.size() > max_samples) {
+    inter.resize(prev + static_cast<size_t>(n) * out_channels);
+    if (inter.size() / static_cast<size_t>(out_channels) > max_samples) {
       set_err_(error, "audio longer than the "
           + to_string(kMaxAudioSeconds) + " s decode cap");
       return false;
@@ -545,9 +566,198 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
       return nullopt;
     }
   }
-  if (out.pcm.empty()) {
+  if (inter.empty()) {
     set_err_(error, "no audio samples decoded");
     return nullopt;
+  }
+  const size_t frames = inter.size() / static_cast<size_t>(out_channels);
+  out.pcm.assign(inter.size(), 0.0f);
+  for (int c = 0; c < out_channels; ++c) {
+    float* dst = out.pcm.data() + static_cast<size_t>(c) * frames;
+    for (size_t i = 0; i < frames; ++i) {
+      dst[i] = inter[i * static_cast<size_t>(out_channels) + c];
+    }
+  }
+  return out;
+}
+
+// ---- video -----------------------------------------------------------
+
+optional<DecodedVideo>
+decode_video_impl_(const FFmpegLibraries* libs,
+                   const string&          path,
+                   double                 max_seconds,
+                   int                    audio_sample_rate,
+                   string*                error)
+{
+  if (!libs || !libs->valid()) {
+    set_err_(error, "FFmpeg libraries unavailable");
+    return nullopt;
+  }
+  OpenedInput in;
+  if (!open_input_(libs, &path, {}, &in, error)) { return nullopt; }
+  const int v_idx = find_stream_(in.fctx, AVMEDIA_TYPE_VIDEO);
+  if (v_idx < 0) {
+    set_err_(error, "no video stream");
+    return nullopt;
+  }
+  AVStream* vs = in.fctx->streams[v_idx];
+  CctxPtr cctx = open_decoder_(libs, vs, error);
+  if (!cctx) { return nullopt; }
+
+  DecodedVideo out;
+  // avg_frame_rate is what the container reports for the stream as a
+  // whole; r_frame_rate is the finest tick it can express, which for a
+  // variable-rate file is far above the real rate. Prefer the average
+  // and fall back only when it is absent.
+  const AVRational fr = (vs->avg_frame_rate.num > 0 &&
+                         vs->avg_frame_rate.den > 0)
+                            ? vs->avg_frame_rate
+                            : vs->r_frame_rate;
+  if (fr.num <= 0 || fr.den <= 0) {
+    set_err_(error, "the container reports no frame rate");
+    return nullopt;
+  }
+  out.fps = static_cast<double>(fr.num) / static_cast<double>(fr.den);
+
+  // How many frames to read. `max_seconds` is a MEMORY bound, not a
+  // nicety: planar RGB is 6 MB a frame at 1080p, so a caller that
+  // truncates the clip afterwards would pay for the whole file first.
+  int64_t frame_cap = kMaxVideoFrames;
+  if (max_seconds > 0.0) {
+    const double want = max_seconds * out.fps;
+    // Two frames of slack: the rate resample downstream places output
+    // slots by rounding, so the last one can fall just past the cut.
+    frame_cap = min<int64_t>(frame_cap,
+                             static_cast<int64_t>(want) + 2);
+  }
+
+  PktPtr pkt(libs->avcodec().api.packet_alloc(), PktDeleter{libs});
+  FramePtr frame(libs->avutil().api.frame_alloc(), FrameDeleter{libs});
+  FramePtr gbrp(libs->avutil().api.frame_alloc(), FrameDeleter{libs});
+  if (!pkt || !frame || !gbrp) {
+    set_err_(error, "packet/frame alloc failed");
+    return nullopt;
+  }
+  SwsPtr sws(nullptr, SwsDeleter{libs});
+  int sw_w = 0, sw_h = 0, sw_fmt = -1;
+
+  // One decoded frame -> one planar [3,H,W] u8 plane appended to `rgb`.
+  auto append_frame = [&](const AVFrame* f) -> bool {
+    if (f->width <= 0 || f->height <= 0) {
+      set_err_(error, "decoded frame has invalid dimensions");
+      return false;
+    }
+    if (out.num_frames == 0) {
+      out.width  = f->width;
+      out.height = f->height;
+      const int64_t px = static_cast<int64_t>(out.width) * out.height;
+      if (px > kMaxVideoPixelsPerFrame) {
+        set_err_(error, "frame is larger than the decode cap");
+        return false;
+      }
+    } else if (f->width != out.width || f->height != out.height) {
+      // A mid-stream resolution change would make `rgb` ragged, and
+      // every consumer here indexes it by a fixed plane size.
+      set_err_(error, "the video changes resolution mid-stream");
+      return false;
+    }
+    const int W = out.width, H = out.height;
+    if (!sws || sw_w != W || sw_h != H || sw_fmt != f->format) {
+      sws.reset(libs->swscale().api.get_context(
+          W, H, static_cast<AVPixelFormat>(f->format),
+          W, H, AV_PIX_FMT_GBRP, SWS_BILINEAR, nullptr, nullptr,
+          nullptr));
+      if (!sws) {
+        set_err_(error, "sws_getContext failed");
+        return false;
+      }
+      sw_w = W; sw_h = H; sw_fmt = f->format;
+      libs->avutil().api.frame_unref(gbrp.get());
+      gbrp->format = AV_PIX_FMT_GBRP;
+      gbrp->width  = W;
+      gbrp->height = H;
+      const int rc = libs->avutil().api.frame_get_buffer(gbrp.get(), 32);
+      if (rc < 0) {
+        set_err_(error, "frame_get_buffer failed: " + av_err_(libs, rc));
+        return false;
+      }
+    }
+    libs->swscale().api.scale(sws.get(), f->data, f->linesize, 0, H,
+                              gbrp->data, gbrp->linesize);
+    const size_t plane = static_cast<size_t>(3) * H * W;
+    out.rgb.resize(plane * static_cast<size_t>(out.num_frames + 1));
+    uint8_t* base = out.rgb.data() + plane * out.num_frames;
+    const int src_plane_for_channel[3] = {2, 0, 1};   // GBRP -> R,G,B
+    for (int c = 0; c < 3; ++c) {
+      const int      sp    = src_plane_for_channel[c];
+      const uint8_t* src   = gbrp->data[sp];
+      const int      pitch = gbrp->linesize[sp];
+      uint8_t*       dst   = base + static_cast<size_t>(c) * H * W;
+      for (int y = 0; y < H; ++y) {
+        std::memcpy(dst + static_cast<size_t>(y) * W,
+                    src + static_cast<size_t>(y) * pitch,
+                    static_cast<size_t>(W));
+      }
+    }
+    ++out.num_frames;
+    return true;
+  };
+
+  bool eof = false, stop = false;
+  while (!eof && !stop) {
+    int rc = libs->avformat().api.read_frame(in.fctx, pkt.get());
+    if (rc < 0) {
+      libs->avcodec().api.send_packet(cctx.get(), nullptr);   // flush
+      eof = true;
+    } else {
+      if (pkt->stream_index != v_idx) {
+        libs->avcodec().api.packet_unref(pkt.get());
+        continue;
+      }
+      const int srp = libs->avcodec().api.send_packet(cctx.get(),
+                                                      pkt.get());
+      libs->avcodec().api.packet_unref(pkt.get());
+      if (srp < 0 && srp != AVERROR(EAGAIN)) {
+        set_err_(error, "send_packet failed: " + av_err_(libs, srp));
+        return nullopt;
+      }
+    }
+    while (true) {
+      const int rrf = libs->avcodec().api.receive_frame(cctx.get(),
+                                                        frame.get());
+      if (rrf == AVERROR(EAGAIN) || rrf == AVERROR_EOF) { break; }
+      if (rrf < 0) {
+        set_err_(error, "receive_frame failed: " + av_err_(libs, rrf));
+        return nullopt;
+      }
+      const bool ok = append_frame(frame.get());
+      libs->avutil().api.frame_unref(frame.get());
+      if (!ok) { return nullopt; }
+      if (out.num_frames >= frame_cap) { stop = true; break; }
+    }
+  }
+  if (out.num_frames == 0) {
+    set_err_(error, "no frames decoded");
+    return nullopt;
+  }
+
+  // The soundtrack, from the SAME file. A video reference conditions on
+  // its own audio, so the two have to come out of one decode -- pairing
+  // a clip with a separately-opened waveform is how they end up out of
+  // sync.
+  if (audio_sample_rate > 0 &&
+      find_stream_(in.fctx, AVMEDIA_TYPE_AUDIO) >= 0) {
+    string aerr;
+    auto a = decode_audio_impl_(libs, &path, {}, audio_sample_rate, 2,
+                                &aerr);
+    if (a) {
+      out.audio_channels    = a->channels;
+      out.audio_sample_rate = a->sample_rate;
+      out.pcm               = std::move(a->pcm);
+    }
+    // A soundtrack that fails to decode is NOT an error: the clip still
+    // conditions on motion alone, which is a legitimate request.
   }
   return out;
 }
@@ -574,19 +784,33 @@ optional<DecodedAudio>
 decode_audio_file(const FFmpegLibraries* libs,
                   const string&          path,
                   int                    target_sample_rate,
-                  string*                error)
+                  string*                error,
+                  int                    channels)
 {
-  return decode_audio_impl_(libs, &path, {}, target_sample_rate, error);
+  return decode_audio_impl_(libs, &path, {}, target_sample_rate,
+                            channels, error);
 }
 
 optional<DecodedAudio>
 decode_audio_bytes(const FFmpegLibraries*  libs,
                    span<const uint8_t>     bytes,
                    int                     target_sample_rate,
-                   string*                 error)
+                   string*                 error,
+                   int                     channels)
 {
-  return decode_audio_impl_(libs, nullptr, bytes,
-                            target_sample_rate, error);
+  return decode_audio_impl_(libs, nullptr, bytes, target_sample_rate,
+                            channels, error);
+}
+
+optional<DecodedVideo>
+decode_video_file(const FFmpegLibraries* libs,
+                  const string&          path,
+                  double                 max_seconds,
+                  int                    audio_sample_rate,
+                  string*                error)
+{
+  return decode_video_impl_(libs, path, max_seconds, audio_sample_rate,
+                            error);
 }
 
 }

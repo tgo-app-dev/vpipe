@@ -40,9 +40,11 @@
 #include <memory>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <system_error>
@@ -54,6 +56,7 @@
 #include <vector>
 #include <thread>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace std;
@@ -173,6 +176,12 @@ print_usage_(const char* prog)
     "                 authenticated and drops the key from the address\n"
     "                 bar. The link is a long secret in a URL: it is only\n"
     "                 as private as the console showing it.\n"
+    "  --emit-connection-json PATH\n"
+    "                 Write {url, scheme, host, port, key, qr_link, pid}\n"
+    "                 to PATH once listening, mode 0600, and remove it on\n"
+    "                 exit. For a GUI launcher: it carries the bound port\n"
+    "                 (which --port 0 only settles at startup) and the\n"
+    "                 --show-qr link, neither of which is on stdout.\n"
     "  -h, --help     Show this help and exit.\n"
     "\n"
     "Remote access: connections from other computers must supply the\n"
@@ -211,6 +220,81 @@ random_qr_key_(size_t n = 14)
   out.reserve(n);
   for (size_t i = 0; i < n; ++i) { out.push_back(alpha[dist(rd)]); }
   return out;
+}
+
+// --emit-connection-json: the details a GUI launcher needs to present
+// this server -- the URL to open, the access key to show, the QR link
+// when there is one -- written as JSON, atomically, mode 0600.
+//
+// A front end could scrape stdout instead, but two things are not there
+// to scrape. The QR link is DELIBERATELY never printed (it carries the
+// link secret in plain text, which is precisely what the symbol exists
+// to keep out of scrollback and screen shares), and with --port 0 the
+// bound port is not known until after start(). So this file is the one
+// channel carrying all three -- and being mode 0600, it carries the key
+// no more widely than the console already does.
+//
+// Written to a fresh O_EXCL temp and renamed: a reader started at the
+// same time sees either no file or a complete one, never a half-written
+// one, and the key never exists in a file another user could open, not
+// even for the instant before a chmod.
+//
+// No JSON escaping: every value comes from a constrained alphabet -- a
+// scheme literal, an IP or hostname from the interface list, an integer,
+// and keys from the two generators above -- so none can contain a
+// character that would need it.
+bool
+write_connection_json_(const string& path,
+                       const string& scheme,
+                       const string& host,
+                       int           port,
+                       const string& key,
+                       const string& qr_link,
+                       string*       err)
+{
+  const string tmp = path + ".tmp";
+  ::unlink(tmp.c_str());
+  const int fd =
+      ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
+  if (fd < 0) {
+    if (err) { *err = string("open: ") + strerror(errno); }
+    return false;
+  }
+
+  string js = "{\n";
+  js += "  \"url\": \"" + scheme + "://" + host + ":"
+      + std::to_string(port) + "/\",\n";
+  js += "  \"scheme\": \"" + scheme + "\",\n";
+  js += "  \"host\": \"" + host + "\",\n";
+  js += "  \"port\": " + std::to_string(port) + ",\n";
+  js += "  \"key\": \"" + key + "\",\n";
+  if (!qr_link.empty()) {
+    js += "  \"qr_link\": \"" + qr_link + "\",\n";
+  }
+  js += "  \"pid\": " + std::to_string(static_cast<long>(::getpid()))
+      + "\n";
+  js += "}\n";
+
+  bool   ok  = true;
+  size_t off = 0;
+  while (off < js.size()) {
+    const ssize_t n = ::write(fd, js.data() + off, js.size() - off);
+    if (n <= 0) {
+      if (errno == EINTR) { continue; }
+      if (err) { *err = string("write: ") + strerror(errno); }
+      ok = false;
+      break;
+    }
+    off += static_cast<size_t>(n);
+  }
+  ::close(fd);
+
+  if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (ok && err) { *err = string("rename: ") + strerror(errno); }
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -478,6 +562,29 @@ main(int argc, char** argv)
   }
   fflush(stdout);
 
+  // --emit-connection-json: publish before the startup checks, not
+  // after. Those probe the network and can sit in a multi-second
+  // timeout on an unreachable LAN, and a launcher polling for this file
+  // is showing the user a spinner until it lands. The server is already
+  // accepting connections at this point, so the details are true.
+  const string conn_json =
+      arg_value_(argc, argv, "--emit-connection-json", "");
+  if (!conn_json.empty()) {
+    const string qr_link =
+        show_qr ? string(scheme) + "://" + bind_addr + ":"
+                    + std::to_string(server.bound_port()) + "/" + qr_key
+                : string();
+    string werr;
+    if (!write_connection_json_(conn_json, scheme, bind_addr,
+                                server.bound_port(), auth_key, qr_link,
+                                &werr)) {
+      // Not fatal: the server is up and the console still shows the URL
+      // and key, so a human can carry on. Only the launcher loses out.
+      fprintf(stderr, "web-ui: --emit-connection-json %s: %s\n",
+              conn_json.c_str(), werr.c_str());
+    }
+  }
+
   // Quick permission self-tests (local network / full disk / mic) -- print
   // colored, actionable warnings pointing at System Settings. The blocking
   // network probes watch g_stop so a Ctrl-C during them (e.g. when the LAN
@@ -496,6 +603,11 @@ main(int argc, char** argv)
 
   printf("\nweb-ui: shutting down...\n");
   fflush(stdout);
+  // Take the connection file down before the port closes, so a launcher
+  // never reads a live-looking key for a server that has stopped
+  // answering. Best-effort: a kill -9 leaves it behind, which is why it
+  // carries the pid a reader can check.
+  if (!conn_json.empty()) { ::unlink(conn_json.c_str()); }
   server.stop();
   SessionManager::get().destroy_session(session);
   return 0;

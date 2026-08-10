@@ -141,6 +141,10 @@ export function openFsDialog(opts = {}) {
     },
     onMount: (m) => navigate(m.path),
     onLoading: (b) => { busyEl.hidden = !b; },
+    // Left arrow == the Up button. Right (step into the directory under
+    // the cursor) needs no wiring: the list routes it through onDirOpen,
+    // which is the same navigate() a click already takes.
+    onNavUp: (p) => { if (p) { navigate(p); } },
   });
   const listBox = el('div', { class: 'fs-list' }, list.el);
 

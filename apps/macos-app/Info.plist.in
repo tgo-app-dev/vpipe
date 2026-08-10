@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>              <string>Vpipe Manager</string>
+  <key>CFBundleDisplayName</key>       <string>Vpipe Manager</string>
+  <key>CFBundleIdentifier</key>        <string>@VPIPE_APP_BUNDLE_ID@</string>
+  <key>CFBundleExecutable</key>        <string>vpipe</string>
+  <key>CFBundlePackageType</key>       <string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
+  <key>CFBundleVersion</key>           <string>@VPIPE_APP_BUILD@</string>
+  <key>LSMinimumSystemVersion</key>    <string>13.0</string>
+
+  <!-- CFBundleIconFile is the classic key and the one Finder, the Dock
+       and Get Info all honour for a plain .icns in Resources.
+       CFBundleIconName is its Asset-Catalog counterpart; some newer
+       surfaces prefer it, and it is harmless when the catalogue does not
+       exist because the .icns satisfies the lookup. Both name the same
+       file, without the extension. -->
+  <key>CFBundleIconFile</key>          <string>AppIcon</string>
+  <key>CFBundleIconName</key>          <string>AppIcon</string>
+
+  <!-- The GUI is a launcher for long-running jobs, not a document
+       editor: closing the last window must not quit and kill a running
+       generation. The menu-bar item is how it is brought back. -->
+  <key>LSUIElement</key>               <false/>
+
+  <!-- TCC usage strings. These are REQUIRED, not decorative: a request
+       for one of these permissions from a bundle whose Info.plist lacks
+       the matching string is terminated by the system rather than
+       denied, which reads as an unexplained crash.
+
+       They matter more here than in a typical app. Run from a terminal,
+       every one of these permissions is attributed to the TERMINAL, so
+       the checks in vpipe-web-ui's startup report describe whatever the
+       user happened to launch from. Inside a signed bundle the app is
+       its own TCC client: it prompts under its own name, appears under
+       its own name in System Settings, and the helpers it spawns
+       inherit that identity. -->
+  <key>NSCameraUsageDescription</key>
+  <string>vpipe uses the camera for video-capture pipeline stages and
+  live vision-model input.</string>
+
+  <key>NSMicrophoneUsageDescription</key>
+  <string>vpipe uses the microphone for audio-capture pipeline stages,
+  speech transcription and audio tagging.</string>
+
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>vpipe discovers ONVIF cameras and connects to RTSP streams on
+  your local network, and serves its web interface to other devices such
+  as your phone.</string>
+
+  <!-- Bonjour services the Local Network permission covers. ONVIF
+       discovery probes over mDNS first; without this key the browse is
+       silently empty rather than prompting. The device types are the
+       ones ONVIF and RTSP cameras advertise. -->
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_http._tcp</string>
+    <string>_rtsp._tcp</string>
+    <string>_onvif._tcp</string>
+  </array>
+
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>     <string>vpipe pipeline</string>
+      <key>CFBundleTypeRole</key>     <string>Viewer</string>
+      <key>LSHandlerRank</key>        <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array><string>@VPIPE_APP_BUNDLE_ID@.pipeline</string></array>
+    </dict>
+  </array>
+
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>@VPIPE_APP_BUNDLE_ID@.pipeline</string>
+      <key>UTTypeDescription</key>    <string>vpipe pipeline</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.json</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>vpipeline</string></array>
+      </dict>
+    </dict>
+  </array>
+
+  <!-- Sparkle auto-update. Both keys are inert when the app is built
+       without VPIPE_SPARKLE_DIR: nothing reads them, because no updater
+       is linked in.
+
+       The feed is a RELEASE ASSET, not a file in the repository. GitHub
+       serves the newest release's assets from a fixed /latest/download/
+       path, so this URL never has to change while still resolving to
+       the current appcast. A raw.githubusercontent.com path would work
+       too but is cached aggressively, which delays updates by up to
+       five minutes for no benefit.
+
+       SUPublicEDKey is the public half of the EdDSA pair whose private
+       half signs each release. An update whose signature does not match
+       is refused, so this key is what stops a tampered .dmg served from
+       anywhere being accepted as an update. -->
+  <key>SUFeedURL</key>                 <string>@VPIPE_APP_FEED_URL@</string>
+  <key>SUPublicEDKey</key>             <string>@VPIPE_APP_ED_PUBKEY@</string>
+  <key>SUEnableInstallerLauncherService</key> <false/>
+
+  <key>NSHighResolutionCapable</key>   <true/>
+  <key>NSSupportsAutomaticTermination</key>  <false/>
+  <key>NSSupportsSuddenTermination</key>     <false/>
+</dict>
+</plist>

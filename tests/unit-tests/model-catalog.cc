@@ -697,3 +697,57 @@ TEST(model_catalog, comfy_org_minimax_h3_fetches_a_runnable_set) {
   }
   EXPECT_TRUE(tok);
 }
+
+// Both MiniMax-H3 partitions, and that they are two ENTRIES rather than
+// one. They share a repo, an encoder and both VAEs, and their DiTs are
+// byte-identical in every respect but the weights -- so nothing about a
+// checkout distinguishes them except which DiT file it holds, and the
+// catalogue is where that distinction has to live.
+TEST(model_catalog, minimax_h3_has_both_partitions) {
+  const ModelCatalogEntry* fl = nullptr;
+  const ModelCatalogEntry* rf = nullptr;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type == "minimax-h3-fl2va" &&
+        e.hf_path == "Comfy-Org/MiniMax-H3") { fl = &e; }
+    if (e.model_type == "minimax-h3-ref2va") { rf = &e; }
+  }
+  ASSERT_TRUE(fl != nullptr);
+  ASSERT_TRUE(rf != nullptr);
+  EXPECT_TRUE(rf->hf_path == "Comfy-Org/MiniMax-H3");
+
+  // The two pin DIFFERENT DiTs and the SAME everything else -- a
+  // ref2va entry that pinned the fl2va DiT would fetch, load and
+  // generate, conditioned on nothing.
+  auto dit_of = [](const ModelCatalogEntry& e) {
+    for (const std::string& f : e.files) {
+      if (f.find("diffusion_models/") == 0) { return f; }
+    }
+    return std::string();
+  };
+  const std::string a = dit_of(*fl), b = dit_of(*rf);
+  EXPECT_TRUE(!a.empty() && !b.empty());
+  EXPECT_TRUE(a != b);
+  EXPECT_TRUE(b.find("ref2va") != std::string::npos);
+  // ...and NOT the pruned variant, which is a different model.
+  EXPECT_TRUE(b.find("pruned") == std::string::npos);
+
+  // Ref2VA takes reference video and audio as well as images; declaring
+  // otherwise is what the web-ui and model-select filter on.
+  bool video_in = false, audio_in = false;
+  for (const std::string& i : rf->inputs) {
+    if (i == "video") { video_in = true; }
+    if (i == "audio") { audio_in = true; }
+  }
+  EXPECT_TRUE(video_in && audio_in);
+
+  // Its tokenizer companion comes from the Ref2VA partition and lands
+  // where the encoder looks.
+  bool tok = false;
+  for (const auto& c : rf->companion_files) {
+    if (c.dest == "tokenizer/tokenizer.json") {
+      tok = true;
+      EXPECT_TRUE(c.file.find("Ref2VA/") == 0);
+    }
+  }
+  EXPECT_TRUE(tok);
+}

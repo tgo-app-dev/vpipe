@@ -262,6 +262,246 @@ TEST(minimax_h3_avae, resample_filters_are_shared)
   EXPECT_TRUE(differ == 0);
 }
 
+// The M5 matrix-core (matmul2d) route against the steel kernel it
+// replaces, over a REAL decode at full depth.
+//
+// This exists because decode_matches_golden needs an external golden and
+// skips without one, which would leave the matmul2d route with no
+// correctness check at all on a box that has no golden -- and "the suite
+// is green" would then mean nothing about the kernel that actually ran.
+// Comparing the two routes needs no reference: they compute the same
+// thing, so their outputs are the question.
+//
+// Not bit-exact, and not expected to be: matmul2d and the steel
+// simdgroup kernel tile and order the K-contraction differently, so f16
+// rounding lands elsewhere. Through 21 resblocks and seven upsampling
+// stages that accumulates. The bar is that the two agree to well inside
+// what the f16 storage itself costs -- a route that was WRONG (a stride
+// slip, a missed bias, a tile tail) does not land at 1e-3, it lands at
+// order 1.
+TEST(minimax_h3_avae, mma_matches_steel)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[minimax_h3_avae] no matrix cores; mma route not built\n");
+    return;
+  }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+
+  const int B = cfg.stereo_channels, ZC = cfg.latent_channels, T = 64;
+  std::vector<float> z((std::size_t)B * ZC * T);
+  for (std::size_t i = 0; i < z.size(); ++i) {
+    z[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
+  }
+  // The route is chosen in load(), so each arm needs its own model.
+  auto decode_with = [&](bool mma, std::vector<float>* pcm) {
+    if (mma) { unsetenv("VPIPE_H3_AVAE_NO_MMA2"); }
+    else     { setenv("VPIPE_H3_AVAE_NO_MMA2", "1", 1); }
+    auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+    unsetenv("VPIPE_H3_AVAE_NO_MMA2");
+    if (!vae) { return false; }
+    std::string e;
+    return vae->decode(z.data(), B, T, pcm, &e);
+  };
+  std::vector<float> a, b;
+  ASSERT_TRUE(decode_with(false, &a));
+  ASSERT_TRUE(decode_with(true, &b));
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+
+  double num = 0.0, den = 0.0, mx = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)b[i] - (double)a[i];
+    num += d * d;
+    den += (double)a[i] * (double)a[i];
+    if (std::fabs(d) > mx) { mx = std::fabs(d); }
+  }
+  const double rel = (den > 0.0) ? std::sqrt(num / den) : 0.0;
+  std::printf("[minimax_h3_avae] mma vs steel over %zu samples: rel-L2 %.2e, "
+              "max |diff| %.2e\n", a.size(), rel, mx);
+  EXPECT_TRUE(den > 0.0);          // a silent arm would pass any tolerance
+  EXPECT_TRUE(rel < 5e-3);
+}
+
+// ---- the encoder (ref2va reference soundtracks) -----------------------
+
+namespace {
+
+// The encoder golden carries the same field names as the decoder's, so
+// it loads through load_golden_ -- `latent` is just the OUTPUT here
+// rather than the input, in the [stereo * frames, channels] row order
+// encode() returns.
+Golden
+load_encode_golden_(const std::string& dir)
+{
+  Golden g;
+  std::ifstream in(dir + "/avae_encode_golden.json");
+  if (!in) { return g; }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return g;
+  }
+  if (!fd.is_object()) { return g; }
+  auto o = fd.as_object();
+  auto geti = [&](const char* k) {
+    return o.contains(k) ? (int)o.at(k).as_int(0) : 0;
+  };
+  g.stereo          = geti("stereo");
+  g.latent_channels = geti("latent_channels");
+  g.frames          = geti("frames");
+  g.samples         = geti("samples");
+  g.sample_rate     = geti("sample_rate");
+  auto reals = [&](const char* k, std::vector<float>* dst) {
+    if (!o.contains(k)) { return; }
+    FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    for (auto x : v.as_real_span()) { dst->push_back((float)x); }
+  };
+  reals("latent", &g.latent);
+  reals("waveform", &g.waveform);
+  g.ok = g.stereo > 0 && g.frames > 0 && !g.latent.empty() &&
+         !g.waveform.empty();
+  return g;
+}
+
+}  // namespace
+
+TEST(minimax_h3_avae, encode_matches_golden)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  const char* gd   = std::getenv("VPIPE_MINIMAX_H3_AVAE_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  const Golden g = load_encode_golden_(gd);
+  if (!g.ok) {
+    std::printf("[minimax_h3_avae] no avae_encode_golden.json under %s\n", gd);
+    return;
+  }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  // The frame count has to agree BEFORE the latents are compared: the
+  // waveform is right-PADDED to the hop, so an encoder that truncated
+  // instead would emit one frame fewer and still correlate well on the
+  // overlap.
+  const int expect = vae->encoded_frames(g.samples);
+  std::printf("[minimax_h3_avae] %d samples -> %d frames (golden %d)\n",
+              g.samples, expect, g.frames);
+  EXPECT_TRUE(expect == g.frames);
+
+  std::vector<float> z;
+  int frames = 0;
+  if (!vae->encode(g.waveform.data(), g.stereo, g.samples, &z, &frames,
+                   &err)) {
+    std::printf("[minimax_h3_avae] encode failed: %s\n", err.c_str());
+    EXPECT_TRUE(false);
+    return;
+  }
+  EXPECT_TRUE(frames == g.frames);
+  EXPECT_TRUE((int)z.size() == g.stereo * g.frames * g.latent_channels);
+
+  const double rel = rel_l2_(z, g.latent);
+  std::printf("[minimax_h3_avae] encode rel-L2 vs the reference = %.4e\n", rel);
+  // f16 activations through a 60-convolution trunk plus a softmax; the
+  // decoder's own golden sits at the same order.
+  EXPECT_TRUE(rel < 2e-2);
+}
+
+// The check that the C++ and the torch reference are not simply WRONG
+// TOGETHER.
+//
+// Both are ports of the same description, so agreeing with each other
+// says nothing about whether the description was read correctly -- a
+// mis-set dilation or a stride padded the other way would be copied
+// into both. Decoding the encoder's own output with the decoder that IS
+// verified against the reference is the independent check: the two
+// halves were trained as inverses, so a correct encoder round-trips and
+// a subtly wrong one does not.
+TEST(minimax_h3_avae, encode_round_trip)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  const char* gd   = std::getenv("VPIPE_MINIMAX_H3_AVAE_GOLDEN");
+  if (root == nullptr || *root == '\0' || gd == nullptr || *gd == '\0') {
+    return;
+  }
+  const Golden g = load_encode_golden_(gd);
+  if (!g.ok) { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  std::vector<float> z;
+  int frames = 0;
+  ASSERT_TRUE(vae->encode(g.waveform.data(), g.stereo, g.samples, &z, &frames,
+                          &err));
+
+  // encode() emits [stereo * frames, channels]; decode() wants the
+  // channel-first [stereo, channels, frames]. Both are DENORMALIZED, so
+  // the whitening cancels and is not applied here at all.
+  const int ZC = cfg.latent_channels;
+  std::vector<float> zt((std::size_t)g.stereo * ZC * frames, 0.0f);
+  for (int b = 0; b < g.stereo; ++b) {
+    for (int t = 0; t < frames; ++t) {
+      for (int ch = 0; ch < ZC; ++ch) {
+        zt[((std::size_t)b * ZC + ch) * frames + t] =
+            z[((std::size_t)b * frames + t) * ZC + ch];
+      }
+    }
+  }
+
+  std::vector<float> pcm;
+  ASSERT_TRUE(vae->decode(zt.data(), g.stereo, frames, &pcm, &err));
+
+  // The first and last hop are edge effects of a padded convolution
+  // stack at both ends; the interior is what a reconstruction claim
+  // rests on.
+  const int hop = cfg.hop();
+  const int n   = std::min((int)(pcm.size() / g.stereo), g.samples);
+  double num = 0.0, den = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
+  for (int b = 0; b < g.stereo; ++b) {
+    for (int i = hop; i + hop < n; ++i) {
+      const double a = g.waveform[(std::size_t)b * g.samples + i];
+      const double c = pcm[(std::size_t)b * (pcm.size() / g.stereo) + i];
+      num += (a - c) * (a - c);
+      den += a * a;
+      dot += a * c;
+      na += a * a;
+      nb += c * c;
+    }
+  }
+  const double rel  = den > 0.0 ? std::sqrt(num / den) : 1.0;
+  const double corr = (na > 0.0 && nb > 0.0) ? dot / std::sqrt(na * nb) : 0.0;
+  std::printf("[minimax_h3_avae] round trip: rel error %.4f, corr %.4f\n",
+              rel, corr);
+  // A VAE at 800:1 does not reconstruct a waveform sample-exactly, and
+  // this test signal (two tones plus broadband noise) is deliberately
+  // harder than speech or music. What separates a correct encoder from
+  // a broken one here is enormous: a wrong reading decodes to noise,
+  // i.e. corr near 0, not to 0.8.
+  EXPECT_TRUE(corr > 0.6);
+}
+
 TEST(minimax_h3_avae, decode_matches_golden)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");

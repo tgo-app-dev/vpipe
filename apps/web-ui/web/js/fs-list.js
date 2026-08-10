@@ -6,8 +6,9 @@
 // hourglass is signalled (onLoading) while any fetch is in flight.
 //
 // The component owns just the list (a pinned mounts block + a virtualized
-// scroll region + selection). Interaction policy is injected via options,
-// so each consumer keeps its own chrome (toolbar / filters / footer).
+// scroll region + selection + the keyboard cursor). Interaction policy is
+// injected via options, so each consumer keeps its own chrome (toolbar /
+// filters / footer).
 
 import { el, clear } from './dom.js';
 import { makeIcon } from './icons.js';
@@ -56,10 +57,13 @@ function truncateMiddle(s, max) {
 //   onSelect       (fn)    (names[], entries[]) -> void  selection changed
 //   onMount        (fn)    mount -> void   a pinned mount clicked
 //   onLoading      (fn)    busy:bool -> void  fetch in flight toggled
+//   onNavUp        (fn)    parentPath -> void  Left arrow: leave for the
+//                          parent directory (the host navigates, since it
+//                          owns whatever else a navigation updates)
 //
 // controller: { el, load(path), reload(), setExts(exts), getSelection(),
 //   getSelectionNames(), setSelection(names), clearSelection(), current(),
-//   destroy() }.
+//   focus(), destroy() }.
 export function createFsList(opts = {}) {
   const multi          = !!opts.multi;
   const selectableDirs = !!opts.selectableDirs;
@@ -71,6 +75,7 @@ export function createFsList(opts = {}) {
   const onSelect       = opts.onSelect || (() => {});
   const onMount        = opts.onMount || (() => {});
   const onLoading      = opts.onLoading || (() => {});
+  const onNavUp        = opts.onNavUp || (() => {});
 
   let exts = Array.isArray(opts.exts) ? opts.exts.slice() : [];
 
@@ -78,10 +83,17 @@ export function createFsList(opts = {}) {
   let curPath = '';
   let meta = { parent: '', sandboxed: false, mounts: [] };
   const pages   = new Map();   // pageIdx -> entries[]
-  const pending = new Set();   // pageIdx in flight
+  const pending = new Map();   // pageIdx -> in-flight fetch promise
   let total = 0, loadGen = 0, raf = 0, busy = 0;
   const selected = new Set();  // selected entry names
   const selInfo  = new Map();  // name -> entry
+  // Keyboard cursor: the row the arrow keys move from, as an INDEX into
+  // the (virtualized) listing. It is kept apart from the selection
+  // because the two can differ -- the dialog cannot select a directory,
+  // and a cursor that refused to land on one could never step into it
+  // with Right. Where directories ARE selectable the two coincide, so
+  // the file browser sees a single highlight.
+  let cursor = -1;
 
   // ---- DOM --------------------------------------------------------
   const mountsEl = el('div', { class: 'fs-mounts' });
@@ -89,7 +101,13 @@ export function createFsList(opts = {}) {
   const scroll   = el('div', { class: 'fs-scroll' }, sizer);
   const emptyEl  = el('div', { class: 'fs-empty' }, t('fs.empty'));
   emptyEl.hidden = true;
-  const root = el('div', { class: 'fs-vlist' }, mountsEl, scroll, emptyEl);
+  // tabindex: the arrow keys are handled HERE rather than on the
+  // document, so the listener dies with this DOM. The file-browser view
+  // has no unmount hook, so a document-level one would leak a handler
+  // per navigation away and back -- and stale handlers would keep
+  // driving destroyed lists.
+  const root = el('div', { class: 'fs-vlist', tabindex: '0' },
+    mountsEl, scroll, emptyEl);
 
   scroll.addEventListener('scroll', () => {
     if (raf) { return; }
@@ -118,35 +136,58 @@ export function createFsList(opts = {}) {
   }
   const extParam = () => (exts.length ? { exts } : {});
 
-  async function ensurePage(pg) {
-    if (pg < 0 || pages.has(pg) || pending.has(pg)) { return; }
+  // Awaiting an in-flight page returns the SAME promise rather than
+  // resolving immediately: the keyboard awaits this to select a row it
+  // just jumped to, and an early return would hand it a page that is
+  // still empty -- so a held-down arrow key would move the highlight
+  // and select nothing.
+  function ensurePage(pg) {
+    if (pg < 0 || pages.has(pg)) { return Promise.resolve(); }
+    const inflight = pending.get(pg);
+    if (inflight) { return inflight; }
     const gen = loadGen;
-    pending.add(pg);
     setBusy(true);
-    try {
-      const d = await api.fsList(curPath,
-        { offset: pg * PAGE, limit: PAGE, ...extParam() });
-      if (gen !== loadGen) { return; }     // navigated away
-      pages.set(pg, d.entries || []);
-      if (typeof d.total === 'number') { setTotal(d.total); }
-      renderWindow();
-    } catch (e) {
-      // Transient: leave the page unloaded; a later scroll re-attempts.
-    } finally {
-      pending.delete(pg);
-      setBusy(false);
-    }
+    const p = (async () => {
+      try {
+        const d = await api.fsList(curPath,
+          { offset: pg * PAGE, limit: PAGE, ...extParam() });
+        if (gen !== loadGen) { return; }     // navigated away
+        pages.set(pg, d.entries || []);
+        if (typeof d.total === 'number') { setTotal(d.total); }
+        renderWindow();
+      } catch (e) {
+        // Transient: leave the page unloaded; a later scroll re-attempts.
+      } finally {
+        pending.delete(pg);
+        setBusy(false);
+      }
+    })();
+    pending.set(pg, p);
+    return p;
   }
 
   // ---- selection --------------------------------------------------
   function applyHighlight() {
     for (const row of sizer.children) {
       row.classList.toggle('sel', selected.has(row.dataset.name));
+      row.classList.toggle('cur', +row.dataset.index === cursor);
     }
   }
   function emitSelect() {
     const names = [...selected];
     onSelect(names, names.map((n) => selInfo.get(n)).filter(Boolean));
+  }
+  // Make `e` the whole selection. The primitive the keyboard uses: a
+  // multi-select list must still REPLACE on an arrow key, or walking
+  // down over an already-picked file would silently drop it.
+  function selectOnly(e) {
+    if (e.dir && !selectableDirs) { applyHighlight(); return; }
+    selected.clear();
+    selInfo.clear();
+    selected.add(e.name);
+    selInfo.set(e.name, e);
+    applyHighlight();
+    emitSelect();
   }
   function selectEntry(e) {
     if (e.dir && !selectableDirs) { return; }
@@ -158,28 +199,99 @@ export function createFsList(opts = {}) {
         selected.add(e.name);
         selInfo.set(e.name, e);
       }
-    } else {
-      selected.clear();
-      selInfo.clear();
-      selected.add(e.name);
-      selInfo.set(e.name, e);
+      applyHighlight();
+      emitSelect();
+      return;
     }
-    applyHighlight();
-    emitSelect();
+    selectOnly(e);
   }
+
+  // ---- keyboard cursor ---------------------------------------------
+  const cursorEntry = () => (cursor < 0 ? null : getEntry(cursor));
+  // Index of a name among the LOADED pages, or -1. Best-effort by
+  // design: finding a name in an unloaded page would mean walking the
+  // directory a page at a time, and the callers (rename, mkdir, coming
+  // back up out of a directory) all name something the current listing
+  // has just been reloaded around.
+  function indexOfName(name) {
+    for (const [pg, ents] of pages) {
+      const i = ents.findIndex((e) => e.name === name);
+      if (i >= 0) { return pg * PAGE + i; }
+    }
+    return -1;
+  }
+  function scrollIndexIntoView(i) {
+    const top = i * FS_ROW_H;
+    const vh  = scroll.clientHeight || 0;
+    if (top < scroll.scrollTop) { scroll.scrollTop = top; }
+    else if (top + FS_ROW_H > scroll.scrollTop + vh) {
+      scroll.scrollTop = top + FS_ROW_H - vh;
+    }
+  }
+  // Move the cursor to `i` (clamped), reveal it, and select it. The
+  // target row may live in a page that has never been fetched -- a
+  // long press of ArrowDown outruns the loaded window -- so the page is
+  // awaited, and the result discarded if the cursor moved on meanwhile.
+  async function focusIndex(i) {
+    if (total === 0) { return; }
+    i = Math.max(0, Math.min(total - 1, i));
+    cursor = i;
+    scrollIndexIntoView(i);
+    let e = getEntry(i);
+    if (!e) {
+      await ensurePage(pageOf(i));
+      if (cursor !== i) { return; }
+      e = getEntry(i);
+    }
+    renderWindow();
+    if (e) { selectOnly(e); }
+    else { applyHighlight(); }   // fetch failed -- move the cursor only
+  }
+
+  // Arrow keys act on the list only while it has focus, which a click on
+  // any row gives it (the root is tabbable). Enter is deliberately NOT
+  // taken: in the dialog it belongs to the modal's confirm action.
+  root.addEventListener('keydown', (ev) => {
+    if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) { return; }
+    const page = Math.max(1,
+      Math.floor((scroll.clientHeight || 0) / FS_ROW_H) - 1);
+    const at = cursor;
+    switch (ev.key) {
+      case 'ArrowDown':  focusIndex(at < 0 ? 0 : at + 1); break;
+      case 'ArrowUp':    focusIndex(at < 0 ? 0 : at - 1); break;
+      case 'PageDown':   focusIndex(at < 0 ? 0 : at + page); break;
+      case 'PageUp':     focusIndex(at < 0 ? 0 : at - page); break;
+      case 'Home':       focusIndex(0); break;
+      case 'End':        focusIndex(total - 1); break;
+      case 'ArrowLeft':  onNavUp(meta.parent); break;
+      case 'ArrowRight': {
+        const e = cursorEntry();
+        if (e && e.dir) { onDirOpen(e); }
+        break;
+      }
+      default: return;             // not ours -- leave it to the host
+    }
+    ev.preventDefault();
+  });
 
   // ---- rows -------------------------------------------------------
   function rowFor(e, i) {
     const row = el('div', {
       class: 'fs-row fs-vrow' + (e.dir ? ' dir' : '')
-        + (selected.has(e.name) ? ' sel' : ''),
+        + (selected.has(e.name) ? ' sel' : '')
+        + (cursor === i ? ' cur' : ''),
       style: 'top:' + (i * FS_ROW_H) + 'px',
       'data-name': e.name,
+      'data-index': String(i),
     }, makeIcon(iconFor(e), 'sm'), el('span', { class: 'fs-nm' }, e.name),
        e.dir ? null : el('span', { class: 'fs-sz' }, humanSize(e.size || 0)));
     row.addEventListener('click', () => {
+      // The click is also where the keyboard picks up from, so the
+      // cursor follows it even when the row cannot be selected.
+      cursor = i;
       if (e.dir && dirClickOpens) { onDirOpen(e); return; }
       selectEntry(e);
+      applyHighlight();
     });
     row.addEventListener('dblclick', () => {
       if (e.dir) { onDirOpen(e); }
@@ -246,6 +358,7 @@ export function createFsList(opts = {}) {
     selInfo.clear();
     pages.clear();
     pending.clear();
+    cursor = -1;                            // a new directory, no cursor
     pages.set(0, d.entries || []);
     scroll.scrollTop = 0;
     setTotal(typeof d.total === 'number' ? d.total : (d.entries || []).length);
@@ -267,20 +380,30 @@ export function createFsList(opts = {}) {
     getSelection: () =>
       [...selected].map((n) => selInfo.get(n)).filter(Boolean),
     getSelectionNames: () => [...selected],
+    // Highlight `names`, and put the cursor on the first of them so the
+    // arrow keys carry on from what the caller just pointed at (the new
+    // folder, the renamed file, the directory we stepped back out of)
+    // rather than from the top of the listing. It also scrolls that row
+    // into view, since the caller's whole point is to show it.
     setSelection: (names) => {
       selected.clear();
       selInfo.clear();
       for (const n of (names || [])) { selected.add(n); }
+      const i = (names && names.length) ? indexOfName(names[0]) : -1;
+      cursor = i;
+      if (i >= 0) { scrollIndexIntoView(i); renderWindow(); }
       applyHighlight();
     },
     clearSelection: () => {
       selected.clear();
       selInfo.clear();
+      cursor = -1;
       applyHighlight();
       emitSelect();
     },
     current: () => ({ path: curPath, parent: meta.parent,
                       sandboxed: meta.sandboxed, total }),
+    focus: () => root.focus({ preventScroll: true }),
     destroy: () => ro.disconnect(),
   };
 }

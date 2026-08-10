@@ -21,10 +21,13 @@
 #include "minitest.h"
 
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace vpipe::genai;
@@ -64,6 +67,202 @@ const double kSpatial2[] = {
     18.385139175999775, 20.770278351999551, 23.155417527999326,
     25.540556703999101
 };
+// A 12x20 -> 20x32 LANCZOS resize, planar RGB, from PIL.
+const std::uint8_t kResizeSrc[] = {
+      0,   4,   3,   5,   0,   0,   8,   0,   0,   0,   0,   1,   0,   8,
+      0,   1,   0,   0,   9,   4,   8,  37,  10,  23,  25,  23,  37,  29,
+     18,  22,   9,  32,  37,  22,  19,  38,  15,  13,  25,  15,  42,  48,
+     46,  46,  43,  53,  56,  60,  31,  40,  44,  32,  54,  44,  59,  44,
+     35,  51,  31,  35,  73,  56,  70,  56,  67,  83,  63,  75,  84,  55,
+     66,  79,  77,  73,  78,  71,  67,  58,  77,  74,  84,  94, 106,  77,
+     84, 102,  97, 104,  89,  81,  87,  83,  92,  91, 105, 104,  85,  99,
+     88,  79, 103, 119, 105, 103, 123, 110, 129, 100, 118, 114, 122, 118,
+    123, 119, 108, 110, 113, 117, 111, 126, 144, 141, 131, 139, 154, 151,
+    147, 132, 152, 143, 139, 138, 128, 132, 150, 136, 126, 153, 146, 148,
+    156, 173, 159, 165, 150, 154, 177, 164, 162, 173, 176, 166, 163, 170,
+    157, 158, 152, 168, 164, 149, 180, 179, 191, 172, 175, 195, 194, 194,
+    170, 183, 191, 178, 182, 172, 194, 184, 193, 196, 189, 197, 207, 197,
+    202, 216, 222, 197, 214, 211, 204, 222, 208, 214, 223, 213, 210, 218,
+    203, 204, 199, 200, 225, 239, 245, 242, 226, 232, 216, 241, 238, 234,
+    230, 232, 230, 239, 236, 227, 244, 235, 228, 223, 255, 255, 255, 255,
+    246, 255, 247, 255, 255, 255, 255, 241, 255, 248, 255, 243, 255, 241,
+    245, 253,   6,   6,  14,  45,  44,  55,  79, 100,  93, 109, 131, 142,
+    165, 167, 192, 215, 228, 219, 233, 254,  11,   0,  37,  30,  42,  76,
+     78,  86, 122, 130, 141, 135, 149, 177, 184, 194, 223, 240, 236, 241,
+     13,  16,  35,  36,  42,  78,  71,  89, 116, 122, 135, 135, 155, 189,
+    202, 186, 214, 238, 255, 242,   0,   2,  34,  27,  40,  65,  89,  80,
+     93, 130, 136, 159, 153, 187, 187, 188, 222, 214, 232, 255,  10,   0,
+     24,  48,  61,  58,  68, 105, 101, 123, 124, 147, 151, 189, 172, 204,
+    222, 223, 230, 246,   0,   7,  39,  53,  61,  71,  70,  81,  93, 119,
+    131, 156, 151, 171, 187, 214, 210, 214, 234, 255,   0,  22,  41,  30,
+     62,  70,  95,  93, 105, 126, 140, 143, 167, 174, 202, 187, 228, 235,
+    229, 255,   5,  12,  12,  52,  63,  67,  76,  89,  97, 133, 149, 140,
+    161, 187, 186, 186, 202, 225, 247, 255,   0,   0,  37,  33,  67,  54,
+     87, 104, 110, 105, 137, 138, 162, 162, 179, 187, 222, 237, 253, 255,
+      8,   3,  40,  54,  47,  69,  65,  92,  97, 118, 126, 133, 160, 168,
+    179, 194, 216, 215, 227, 255,   0,   6,  23,  55,  58,  56,  93,  89,
+    119, 108, 135, 150, 175, 169, 180, 210, 216, 217, 251, 255,   3,  15,
+     27,  26,  42,  68,  95, 101, 115, 127, 134, 158, 153, 168, 192, 197,
+    199, 226, 247, 250,   0,   0,   1,  31,  17,  40,  46,  41,  43,  54,
+     56,  79,  66,  72,  87, 111, 106, 124, 110, 135,  14,  22,  36,  23,
+     40,  53,  48,  46,  80,  81,  64,  81,  79,  93,  95, 106, 125, 128,
+    119, 136,  13,  30,  48,  31,  49,  55,  63,  63,  69,  91, 102, 103,
+    114, 117, 130, 128, 139, 126, 145, 155,  41,  53,  35,  47,  50,  79,
+     87,  86,  97,  89,  96, 106, 121, 136, 122, 128, 152, 153, 158, 162,
+     40,  66,  48,  81,  71,  89,  99,  80, 111, 105, 128, 122, 137, 139,
+    136, 155, 138, 174, 155, 180,  69,  68,  73,  73,  71,  85, 104, 105,
+    100, 125, 111, 145, 128, 150, 136, 148, 151, 187, 182, 194,  84,  61,
+     94,  78,  84, 110,  94, 118, 111, 122, 124, 139, 142, 151, 159, 165,
+    161, 196, 177, 188,  84,  95,  90,  91, 109, 105, 112, 140, 121, 139,
+    135, 145, 154, 178, 172, 188, 185, 192, 195, 200, 104, 113, 104, 114,
+    112, 112, 121, 151, 138, 143, 153, 159, 181, 179, 171, 183, 191, 212,
+    199, 223, 114, 113, 120, 139, 126, 123, 150, 157, 166, 157, 164, 163,
+    192, 193, 187, 206, 196, 233, 221, 238, 120, 130, 124, 142, 128, 151,
+    160, 154, 177, 175, 194, 188, 182, 191, 213, 231, 217, 243, 246, 235,
+    140, 119, 155, 153, 139, 151, 164, 186, 178, 188, 191, 206, 200, 217,
+    235, 229, 231, 243, 254, 255,
+};
+const std::uint8_t kResizeDst[] = {
+      1,   1,   1,   2,   5,   4,   1,   0,   0,   2,   6,   1,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   7,   4,   0,   0,   0,   0,   0,
+      2,   8,   6,   3,   0,   7,  14,   6,   3,   9,  10,   7,   5,  11,
+     16,  11,   6,   6,   7,   5,   0,   5,  13,  13,  12,  12,   5,   5,
+     13,  11,   3,   0,   6,  15,  11,   5,   4,  22,  37,  18,   9,  22,
+     27,  24,  22,  29,  37,  34,  24,  18,  22,  20,   9,  16,  33,  39,
+     33,  23,  16,  23,  37,  31,  14,  10,  18,  25,  20,  14,  24,  36,
+     48,  37,  31,  38,  39,  37,  40,  47,  53,  56,  41,  23,  27,  37,
+     32,  27,  31,  47,  47,  35,  39,  47,  46,  34,  26,  35,  37,  26,
+     23,  25,  49,  48,  48,  51,  51,  49,  46,  49,  57,  59,  57,  64,
+     58,  41,  37,  45,  51,  44,  39,  53,  57,  49,  59,  63,  50,  40,
+     42,  51,  50,  39,  39,  44,  71,  61,  52,  62,  63,  55,  56,  68,
+     78,  71,  60,  65,  77,  77,  61,  51,  60,  69,  72,  74,  72,  68,
+     72,  74,  65,  63,  61,  55,  58,  69,  71,  69,  80,  73,  69,  84,
+     82,  64,  63,  78,  92,  85,  73,  81,  92,  91,  74,  62,  69,  79,
+     83,  84,  81,  80,  85,  91,  88,  82,  74,  70,  76,  84,  80,  74,
+     83,  86,  95, 107,  99,  78,  76,  88, 100, 101,  97, 103, 101,  90,
+     82,  82,  86,  85,  83,  90,  92,  91,  98, 107, 107,  94,  85,  95,
+     99,  89,  81,  78,  90,  99, 112, 111, 100,  91,  99, 106, 102, 111,
+    118, 107,  99, 103, 101, 103, 109, 107, 103, 110, 113, 110, 105, 105,
+    108, 105, 103, 109, 107,  99, 102, 107, 109, 116, 122, 112, 104, 108,
+    125, 130, 117, 124, 131, 109, 106, 124, 124, 120, 125, 125, 123, 124,
+    124, 122, 117, 113, 112, 113, 116, 122, 120, 118, 127, 136, 138, 138,
+    135, 127, 124, 131, 145, 153, 147, 145, 142, 126, 130, 146, 145, 136,
+    135, 135, 134, 129, 124, 127, 138, 143, 134, 124, 125, 142, 147, 141,
+    144, 149, 150, 154, 154, 144, 143, 152, 154, 153, 152, 156, 158, 148,
+    148, 158, 160, 155, 153, 152, 149, 142, 140, 147, 153, 154, 148, 136,
+    134, 152, 162, 155, 147, 144, 154, 164, 173, 163, 160, 165, 157, 148,
+    150, 166, 177, 170, 160, 162, 168, 175, 177, 172, 165, 162, 166, 170,
+    163, 156, 158, 154, 153, 163, 170, 165, 154, 148, 168, 172, 179, 183,
+    178, 168, 158, 162, 175, 186, 188, 188, 176, 165, 168, 182, 188, 181,
+    171, 173, 172, 171, 176, 178, 173, 174, 181, 186, 185, 181, 179, 179,
+    186, 182, 180, 191, 190, 178, 178, 188, 196, 198, 198, 201, 189, 175,
+    180, 192, 195, 188, 184, 189, 184, 177, 189, 199, 193, 191, 196, 199,
+    195, 191, 196, 202, 204, 198, 191, 194, 201, 206, 216, 213, 198, 200,
+    213, 212, 202, 195, 208, 215, 207, 202, 208, 216, 214, 205, 204, 210,
+    214, 208, 199, 200, 200, 196, 198, 201, 213, 213, 213, 214, 221, 229,
+    231, 222, 208, 206, 214, 221, 221, 218, 226, 227, 217, 216, 224, 227,
+    227, 227, 221, 218, 222, 221, 216, 216, 213, 208, 205, 204, 224, 230,
+    240, 244, 246, 243, 231, 226, 232, 224, 216, 233, 244, 239, 235, 233,
+    230, 231, 232, 230, 232, 239, 240, 233, 226, 234, 244, 240, 232, 228,
+    224, 223, 245, 248, 253, 255, 255, 253, 243, 240, 249, 244, 236, 247,
+    254, 252, 249, 248, 248, 243, 239, 244, 247, 246, 251, 248, 238, 245,
+    255, 247, 239, 241, 244, 245, 255, 255, 255, 255, 255, 255, 251, 249,
+    255, 254, 250, 253, 255, 255, 255, 255, 255, 248, 241, 253, 255, 248,
+    253, 254, 246, 249, 255, 245, 239, 245, 253, 255,   5,   7,   7,   6,
+     22,  46,  49,  44,  50,  62,  81,  99,  99,  90,  95, 111, 127, 134,
+    144, 162, 167, 166, 179, 199, 213, 226, 228, 219, 217, 231, 248, 255,
+      8,   4,   3,  14,  29,  39,  42,  45,  58,  70,  81,  91,  98, 102,
+    110, 120, 133, 137, 141, 154, 163, 169, 179, 191, 205, 219, 228, 227,
+    225, 231, 243, 251,  13,   3,   1,  27,  39,  31,  32,  48,  72,  80,
+     78,  80,  96, 120, 129, 132, 140, 139, 135, 142, 158, 176, 183, 184,
+    191, 205, 225, 238, 240, 236, 238, 242,  16,  10,  12,  31,  40,  34,
+     33,  49,  77,  80,  70,  78, 100, 123, 127, 128, 137, 135, 131, 141,
+    163, 184, 196, 193, 187, 195, 218, 237, 250, 252, 243, 237,  10,  11,
+     17,  30,  36,  35,  34,  46,  71,  79,  74,  80,  94, 109, 118, 125,
+    134, 137, 140, 148, 166, 187, 202, 199, 186, 195, 216, 227, 241, 253,
+    250, 243,   2,   2,   7,  29,  36,  28,  29,  43,  63,  81,  88,  82,
+     79,  93, 116, 132, 136, 146, 157, 153, 162, 185, 195, 190, 185, 201,
+    221, 218, 219, 235, 249, 254,   5,   0,   0,  20,  33,  33,  41,  50,
+     57,  70,  85,  92,  89,  93, 115, 131, 130, 143, 156, 151, 162, 187,
+    185, 177, 188, 210, 225, 219, 215, 226, 244, 253,  12,   4,   0,  14,
+     33,  47,  58,  61,  59,  58,  70,  97, 106, 101, 113, 124, 123, 134,
+    147, 147, 163, 188, 180, 173, 197, 216, 222, 223, 223, 229, 241, 247,
+      6,   1,   3,  21,  42,  56,  62,  64,  66,  63,  64,  83,  94,  95,
+    109, 121, 124, 139, 152, 148, 156, 177, 177, 183, 210, 218, 210, 213,
+    220, 232, 246, 251,   0,   0,  13,  35,  47,  48,  54,  63,  71,  75,
+     76,  78,  83,  93, 109, 123, 130, 143, 155, 154, 155, 168, 182, 196,
+    208, 213, 213, 215, 219, 231, 249, 255,   0,   4,  23,  43,  41,  32,
+     47,  65,  69,  81,  94,  92,  92, 103, 115, 127, 136, 140, 147, 160,
+    166, 170, 191, 201, 192, 204, 229, 235, 229, 227, 244, 255,   2,   8,
+     22,  27,  29,  37,  52,  64,  68,  78,  90,  93,  92, 101, 119, 137,
+    146, 141, 141, 157, 173, 181, 195, 195, 183, 195, 220, 232, 232, 233,
+    247, 255,   4,   8,  12,   8,  22,  50,  62,  63,  66,  70,  77,  86,
+     90,  96, 116, 139, 150, 144, 140, 151, 171, 186, 189, 185, 185, 191,
+    203, 218, 232, 246, 254, 255,   1,   3,   4,  18,  28,  39,  60,  67,
+     57,  65,  86,  96, 101, 107, 108, 119, 141, 143, 140, 154, 166, 172,
+    177, 180, 184, 196, 214, 228, 242, 255, 255, 255,   3,   0,   2,  32,
+     41,  33,  51,  64,  56,  64,  86, 100, 107, 109, 103, 109, 130, 136,
+    137, 155, 162, 160, 170, 180, 184, 202, 225, 233, 238, 247, 253, 255,
+      9,   2,   3,  31,  49,  49,  47,  52,  65,  66,  68,  87,  98,  98,
+    107, 119, 126, 127, 133, 151, 162, 166, 172, 181, 187, 203, 218, 220,
+    219, 227, 246, 255,   7,   2,   5,  21,  45,  60,  56,  51,  62,  68,
+     73,  82,  93, 103, 110, 117, 127, 131, 139, 160, 171, 171, 172, 182,
+    198, 212, 216, 212, 215, 231, 248, 255,   0,   1,   7,  15,  33,  54,
+     61,  55,  53,  72,  94,  89,  97, 118, 113, 110, 130, 142, 151, 170,
+    175, 170, 171, 185, 206, 216, 215, 213, 226, 249, 255, 254,   0,   4,
+     13,  21,  27,  35,  44,  50,  58,  79,  98,  97, 102, 117, 120, 121,
+    131, 145, 157, 162, 162, 167, 179, 191, 202, 203, 205, 215, 233, 249,
+    253, 251,   3,   7,  17,  27,  27,  23,  30,  45,  65,  83,  95, 101,
+    105, 113, 124, 130, 131, 145, 158, 153, 151, 166, 184, 195, 197, 192,
+    198, 216, 235, 245, 249, 250,   0,   0,   0,   0,   9,  32,  23,  15,
+     33,  45,  46,  44,  39,  38,  46,  52,  54,  68,  79,  71,  64,  70,
+     78,  93, 110, 109, 105, 120, 120, 110, 124, 139,   5,   6,   7,  11,
+     17,  28,  25,  26,  41,  48,  45,  41,  45,  56,  63,  60,  54,  65,
+     78,  71,  68,  76,  82,  90, 105, 109, 113, 125, 121, 111, 124, 137,
+     14,  16,  23,  35,  33,  23,  30,  44,  52,  53,  47,  42,  55,  78,
+     87,  77,  65,  70,  82,  80,  82,  92,  95,  96, 103, 115, 126, 130,
+    124, 119, 129, 138,  11,  15,  29,  48,  43,  26,  36,  52,  53,  55,
+     55,  53,  59,  73,  86,  92,  92,  92,  96, 101, 104, 108, 115, 120,
+    119, 127, 134, 128, 125, 134, 144, 149,  16,  21,  35,  46,  41,  33,
+     39,  52,  56,  63,  68,  70,  68,  70,  81,  93, 102, 103, 105, 113,
+    119, 122, 128, 130, 128, 136, 143, 132, 131, 149, 156, 157,  36,  42,
+     49,  41,  36,  41,  43,  52,  70,  81,  83,  84,  86,  90,  89,  89,
+     94,  99, 107, 114, 126, 134, 130, 121, 123, 138, 153, 149, 148, 158,
+    161, 160,  39,  51,  60,  41,  41,  61,  60,  61,  81,  94,  93,  83,
+     90, 107, 100,  93, 105, 109, 110, 121, 134, 138, 130, 126, 135, 142,
+    148, 160, 161, 155, 162, 169,  37,  52,  66,  51,  55,  80,  77,  71,
+     84,  98,  98,  82,  87, 110, 108, 107, 125, 127, 122, 132, 140, 139,
+    134, 139, 154, 146, 139, 165, 171, 155, 168, 183,  54,  62,  70,  64,
+     66,  78,  76,  72,  79,  96, 105,  97,  94, 103, 115, 120, 118, 128,
+    138, 133, 135, 146, 139, 137, 150, 147, 146, 173, 183, 172, 182, 193,
+     75,  69,  65,  75,  79,  72,  69,  74,  85,  96, 103, 109, 104,  99,
+    116, 124, 110, 125, 146, 134, 132, 149, 145, 139, 147, 148, 155, 181,
+    191, 183, 188, 194,  87,  71,  60,  84,  93,  77,  73,  85, 105, 102,
+     94, 110, 115, 108, 115, 122, 120, 129, 142, 141, 141, 148, 153, 156,
+    160, 155, 160, 187, 195, 179, 182, 191,  85,  77,  72,  88,  92,  82,
+     86, 100, 111, 104, 100, 120, 125, 116, 121, 129, 128, 132, 139, 143,
+    151, 160, 165, 169, 177, 173, 172, 188, 193, 183, 185, 191,  83,  89,
+     95,  93,  88,  90, 102, 110, 107, 104, 114, 136, 136, 122, 130, 140,
+    136, 138, 145, 149, 162, 178, 175, 173, 186, 188, 185, 189, 193, 195,
+    198, 200,  94, 102, 110, 101,  96, 103, 109, 111, 109, 108, 119, 143,
+    145, 131, 134, 144, 147, 149, 155, 165, 175, 180, 174, 172, 182, 188,
+    191, 200, 200, 197, 207, 215, 107, 110, 113, 108, 111, 120, 118, 112,
+    113, 116, 127, 147, 152, 144, 141, 146, 154, 155, 161, 179, 187, 182,
+    174, 173, 183, 186, 192, 213, 214, 201, 215, 231, 113, 112, 112, 114,
+    125, 136, 132, 121, 118, 129, 146, 156, 160, 162, 156, 154, 159, 159,
+    162, 183, 197, 193, 184, 185, 198, 195, 195, 222, 229, 215, 227, 240,
+    114, 117, 120, 117, 126, 141, 135, 125, 131, 146, 156, 153, 158, 172,
+    168, 164, 174, 174, 170, 181, 190, 191, 191, 201, 218, 210, 203, 228,
+    241, 232, 233, 236, 119, 125, 130, 124, 129, 142, 133, 129, 146, 159,
+    159, 153, 160, 176, 176, 177, 191, 195, 187, 183, 183, 190, 202, 218,
+    231, 224, 217, 234, 248, 247, 239, 234, 135, 129, 125, 137, 149, 150,
+    139, 136, 149, 159, 163, 172, 176, 178, 182, 186, 193, 200, 201, 195,
+    194, 206, 222, 231, 233, 228, 228, 238, 248, 254, 250, 247, 145, 129,
+    118, 145, 163, 155, 144, 140, 147, 155, 165, 185, 188, 178, 183, 190,
+    189, 197, 207, 203, 204, 218, 233, 236, 230, 228, 232, 239, 246, 254,
+    255, 255,
+};
+
 const int kSpatialDim[]  = {48, 84, 20};
 const int kSpatialPatch[]= {2, 2, 2};
 const int kSpatialLh[]   = {48, 48, 20};
@@ -444,7 +643,442 @@ TEST(minimax_h3_layout, packed_sequence_production)
   }
 }
 
-// ---- rotary grids -----------------------------------------------------
+// ---- ref2va -----------------------------------------------------------
+
+TEST(minimax_h3_layout, ref2va_packed_sequence)
+{
+  using Ref  = h3::Reference;
+  using Kind = h3::Reference::Kind;
+  auto image = [](int lh, int lw) {
+    return Ref{Kind::kImage, 1, lh, lw, 0};
+  };
+  auto video = [](int nf, int lh, int lw, int naud) {
+    return Ref{Kind::kVideo, nf, lh, lw, naud};
+  };
+  auto audio = [](int naud) { return Ref{Kind::kAudio, 0, 0, 0, naud}; };
+
+  struct Case {
+    const char*      name;
+    std::vector<Ref> refs;
+    int ntext, nlat, lh, lw, naud;
+    int seq, video_rows, audio_rows, cond_video, cond_audio, tags_sum;
+    double sum[3], mn[3], mx[3], ramp[3];
+  };
+  // From the reference `build_ref2va_packed_sequence`, via
+  // h3ref/gen_ref2va_layout.py. Summary statistics rather than whole
+  // arrays for the same reason the t2va/fl2va goldens use them -- and
+  // `ramp` (sum of i*value) is what makes them ORDER-sensitive, so two
+  // reference blocks swapped on the shared clock cannot pass.
+  const Case kCases[] = {
+      // One image: the smallest thing that is still a ref2va request. A
+      // 2048-short-edge reference dwarfs the generated canvas, which is
+      // the point -- a reference never binds the target geometry.
+      {"one_image", {image(64, 114)}, 16, 7, 16, 16, 37,
+       2362, 2272, 74, 1824, 0, 164,
+       {46230, 34772.66699, 35808.66699},
+       {0, 0, -5.354156504},
+       {53, 28, 36.60488785},
+       {63222877.67, 46557004.47, 42183307.57}},
+      // A standalone audio reference sits on the shared clock between
+      // the blocks around it, and takes the TARGET width grid.
+      {"image_audio", {image(32, 32), audio(40)}, 16, 7, 16, 16, 37,
+       874, 704, 154, 256, 80, 324,
+       {44942, 10112, 12268},
+       {0, 0, 0},
+       {93, 30, 30},
+       {25265845.67, 4874048, 5437924}},
+      // A soundtrack's rows are packed BEFORE its video rows and share
+      // their origin, so audio stops being one contiguous range.
+      {"video_with_sound", {video(7, 32, 56, 80)}, 24, 7, 32, 56, 37,
+       6530, 6272, 234, 3136, 160, 492,
+       {514952, 95610.81365, 99177.92628},
+       {0, 0, -5.166010489},
+       {140, 26.58300524, 35.6541526},
+       {2160107247, 326559707.8, 325733766.2}},
+      {"video_silent", {video(7, 32, 56, 0)}, 24, 7, 32, 56, 37,
+       6370, 6272, 74, 3136, 0, 172,
+       {365692, 95610.81365, 96738.87491},
+       {0, 0, -5.166010489},
+       {96.66666667, 26.58300524, 35.6541526},
+       {1415505857, 311261977.6, 309872479.9}},
+      // The README's Ref2VA case: a subject image, a source video with
+      // its own track, and a separate voice reference.
+      {"mixed_trio",
+       {image(48, 84), video(12, 48, 84, 120), audio(200)},
+       64, 17, 48, 84, 200,
+       31344, 30240, 1040, 13104, 640, 2144,
+       {8882968, 468600.4724, 484716.3617},
+       {0, 0, -5.166010489},
+       {584, 27.08695787, 36.15810523},
+       {1.830599786e+11, 7497481896, 7618171766}},
+      // Two images then a silent video: an image advances the clock by
+      // exactly 1.0, NOT by a latent frame's 5/3 units.
+      {"two_images_video",
+       {image(32, 32), image(32, 32), video(7, 32, 56, 0)},
+       16, 7, 32, 56, 37,
+       6874, 6784, 74, 3648, 0, 164,
+       {335908, 103290.8137, 104418.8749},
+       {0, 0, -5.166010489},
+       {90.66666667, 30, 35.6541526},
+       {1461098599, 361883107.7, 360735752.8}},
+  };
+
+  for (const Case& c : kCases) {
+    const std::vector<int> text_tags((std::size_t)c.ntext, 1);
+    h3::PackedLayout L;
+    ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+        text_tags, c.refs, c.nlat, c.lh, c.lw, c.naud, 2, 2,
+        h3::kAudioChannels, &L));
+    EXPECT_TRUE(L.seq_len == c.seq);
+    EXPECT_TRUE((int)L.video_indices.size() == c.video_rows);
+    EXPECT_TRUE((int)L.audio_indices.size() == c.audio_rows);
+    EXPECT_TRUE(L.num_condition_video_rows == c.cond_video);
+    EXPECT_TRUE(L.num_condition_audio_rows == c.cond_audio);
+
+    // The runs and the indices are two spellings of the same rows, so a
+    // consumer that walks either sees the same sequence.
+    int run_rows = 0;
+    for (const h3::RowRun& r : L.video_runs) { run_rows += r.count; }
+    EXPECT_TRUE(run_rows == (int)L.video_indices.size());
+    run_rows = 0;
+    for (const h3::RowRun& r : L.audio_runs) { run_rows += r.count; }
+    EXPECT_TRUE(run_rows == (int)L.audio_indices.size());
+
+    // Every row is claimed exactly once, by text or by one modality.
+    std::vector<int> seen((std::size_t)L.seq_len, 0);
+    for (int i = 0; i < c.ntext; ++i) { seen[(std::size_t)i]++; }
+    for (int r : L.video_indices) { seen[(std::size_t)r]++; }
+    for (int r : L.audio_indices) { seen[(std::size_t)r]++; }
+    bool once = true;
+    for (int v : seen) { once = once && v == 1; }
+    EXPECT_TRUE(once);
+
+    int tags_sum = 0;
+    for (int r = 0; r < L.seq_len; ++r) {
+      tags_sum += L.token_tags[(std::size_t)r];
+    }
+    EXPECT_TRUE(tags_sum == c.tags_sum);
+
+    for (int a = 0; a < 3; ++a) {
+      double sum = 0.0, ramp = 0.0, mn = 0.0, mx = 0.0;
+      for (int r = 0; r < L.seq_len; ++r) {
+        const double v = L.position_ids[(std::size_t)r * 3 + (std::size_t)a];
+        sum += v;
+        ramp += v * (double)r;
+        if (r == 0 || v < mn) { mn = v; }
+        if (r == 0 || v > mx) { mx = v; }
+      }
+      const double rel =
+          std::fabs(c.ramp[a]) > 1.0
+              ? std::fabs(ramp - c.ramp[a]) / std::fabs(c.ramp[a])
+              : std::fabs(ramp - c.ramp[a]);
+      const bool ok =
+          std::fabs(sum - c.sum[a]) < 1e-6 * (1.0 + std::fabs(sum)) &&
+          std::fabs(mn - c.mn[a]) < 1e-5 && std::fabs(mx - c.mx[a]) < 1e-5 &&
+          rel < 1e-9;
+      if (!ok) {
+        std::printf("[minimax_h3_layout] %s axis %d: sum %.6f vs %.6f  "
+                    "min %.6f vs %.6f  max %.6f vs %.6f  ramp %.6f vs %.6f\n",
+                    c.name, a, sum, c.sum[a], mn, c.mn[a], mx, c.mx[a], ramp,
+                    c.ramp[a]);
+      }
+      EXPECT_TRUE(ok);
+    }
+    std::printf("[minimax_h3_layout] %-17s seq=%5d video=%5d audio=%4d "
+                "(ref %d/%d) matches the reference\n",
+                c.name, L.seq_len, (int)L.video_indices.size(),
+                (int)L.audio_indices.size(), L.num_condition_video_rows,
+                L.num_condition_audio_rows);
+  }
+}
+
+TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
+{
+  using Ref  = h3::Reference;
+  using Kind = h3::Reference::Kind;
+  const std::vector<int> tags(16, 1);
+  h3::PackedLayout L;
+
+  // No references at all is a t2va request, not a degenerate ref2va.
+  EXPECT_FALSE(h3::build_ref2va_packed_sequence(tags, {}, 7, 16, 16, 37, 2, 2,
+                                                h3::kAudioChannels, &L));
+  // A reference is encoded at a resolution of ITS OWN, so the target's
+  // divisibility says nothing about whether the reference's divides.
+  EXPECT_FALSE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kImage, 1, 33, 32, 0}}, 7, 16, 16, 37, 2, 2,
+      h3::kAudioChannels, &L));
+  // An image is a single latent frame and carries no soundtrack.
+  EXPECT_FALSE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kImage, 2, 32, 32, 0}}, 7, 16, 16, 37, 2, 2,
+      h3::kAudioChannels, &L));
+  EXPECT_FALSE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kImage, 1, 32, 32, 40}}, 7, 16, 16, 37, 2, 2,
+      h3::kAudioChannels, &L));
+  // An audio reference IS its rows -- one with none is nothing.
+  EXPECT_FALSE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kAudio, 0, 0, 0, 0}}, 7, 16, 16, 37, 2, 2,
+      h3::kAudioChannels, &L));
+}
+
+TEST(minimax_h3_layout, ref2va_row_timesteps)
+{
+  using Ref  = h3::Reference;
+  using Kind = h3::Reference::Kind;
+  const std::vector<int> tags(16, 1);
+  const std::vector<Ref> refs = {Ref{Kind::kImage, 1, 32, 32, 0},
+                                 Ref{Kind::kVideo, 7, 32, 56, 80}};
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(tags, refs, 7, 32, 56, 37, 2, 2,
+                                               h3::kAudioChannels, &L));
+  EXPECT_TRUE(L.seq_len == 6778);
+  EXPECT_TRUE((int)L.audio_indices.size() == 234);
+  EXPECT_TRUE(L.num_condition_audio_rows == 160);
+
+  // Four distinct levels in ONE forward: the generated audio and video
+  // step down their own schedules while the reference video sits at its
+  // noise-augmentation level and the reference soundtrack never moves.
+  std::vector<float> ts;
+  std::vector<int>   idx;
+  h3::build_row_timesteps(L, 0.7f, 0.4f, 0.9f, &ts, &idx, 1.0f);
+  ASSERT_TRUE(ts.size() == 4);
+  EXPECT_TRUE(std::fabs(ts[0] - 0.4f) < 1e-6);
+  EXPECT_TRUE(std::fabs(ts[1] - 0.7f) < 1e-6);
+  EXPECT_TRUE(std::fabs(ts[2] - 0.9f) < 1e-6);
+  EXPECT_TRUE(std::fabs(ts[3] - 1.0f) < 1e-6);
+
+  long long sum = 0, ramp = 0;
+  for (std::size_t i = 0; i < idx.size(); ++i) {
+    sum += idx[i];
+    ramp += (long long)idx[i] * (long long)i;
+  }
+  EXPECT_TRUE(sum == 10416);
+  EXPECT_TRUE(ramp == 29120168);
+  std::printf("[minimax_h3_layout] ref2va timesteps: 4 distinct levels, "
+              "row-index sum %lld ramp %lld match the reference\n", sum, ramp);
+}
+
+// ---- reference normalization ------------------------------------------
+//
+// Putting a ref2va reference onto MiniMax-H3's own rates. Unlike the
+// layout goldens above these need a file (the pixel-exact resize case is
+// megabytes), so this one gates on the golden dir -- but the geometry
+// cases below it are embedded and always run.
+
+TEST(minimax_h3_layout, reference_frame_rate_resample)
+{
+  // The counts are per SOURCE frame: 0 is a dropped frame, >1 a held
+  // one. Whole frames only -- ffmpeg's `fps` filter never blends, so a
+  // "smoother" interpolating resample would be a different conditioning.
+  struct Case {
+    int n; double src; int total; int first_five[5];
+  };
+  // From the reference, via h3ref/gen_reference_norm.py.
+  const Case kCases[] = {
+      {30, 30.0, 24, {1, 1, 0, 1, 1}},
+      {25, 25.0, 24, {1, 1, 1, 1, 1}},
+      {12, 12.0, 24, {2, 2, 2, 2, 2}},
+      {17, 29.97, 14, {1, 1, 0, 1, 1}},
+      {9,  60.0,   4, {0, 1, 0, 1, 0}},
+  };
+  for (const Case& c : kCases) {
+    const std::vector<int> got = h3::frame_resample_counts(c.n, c.src, 24.0);
+    EXPECT_TRUE((int)got.size() == c.n);
+    int total = 0;
+    for (int v : got) { total += v; }
+    if (total != c.total) {
+      std::printf("[minimax_h3_layout] %d@%g -> %d frames, expected %d\n",
+                  c.n, c.src, total, c.total);
+    }
+    EXPECT_TRUE(total == c.total);
+    for (int i = 0; i < 5 && i < (int)got.size(); ++i) {
+      EXPECT_TRUE(got[(std::size_t)i] == c.first_five[i]);
+    }
+  }
+  // Equal rates are the parity-exact route: every frame held once, so
+  // media already at 24 fps is passed through rather than resampled.
+  const std::vector<int> same = h3::frame_resample_counts(10, 24.0, 24.0);
+  bool all_one = same.size() == 10;
+  for (int v : same) { all_one = all_one && v == 1; }
+  EXPECT_TRUE(all_one);
+  EXPECT_TRUE(h3::frame_resample_counts(10, 0.0, 24.0).empty());
+  std::printf("[minimax_h3_layout] frame-rate resample matches the "
+              "reference on %zu rates\n", sizeof(kCases) / sizeof(kCases[0]));
+}
+
+TEST(minimax_h3_layout, reference_image_size)
+{
+  // The image rule: the short edge to 2048, both axes rounded to 32, NO
+  // area cap and upscaling included. The target canvas rule would cap
+  // every one of these at 768x1344 -- that is the mistake this pins.
+  struct Case { int h, w, oh, ow; };
+  const Case kCases[] = {
+      {512, 768, 2048, 3072},      // upscaled: the short edge grows 4x
+      {2160, 3840, 2048, 3648},    // downscaled, and still far over the cap
+      {900, 900, 2048, 2048},
+      {400, 1200, 2048, 6144},     // 3:1, inside the trained 1:4..4:1
+  };
+  for (const Case& c : kCases) {
+    int oh = 0, ow = 0;
+    ASSERT_TRUE(h3::resolve_reference_image_size(c.h, c.w, 2048, 32, &oh, &ow));
+    if (oh != c.oh || ow != c.ow) {
+      std::printf("[minimax_h3_layout] image %dx%d -> %dx%d, expected %dx%d\n",
+                  c.h, c.w, oh, ow, c.oh, c.ow);
+    }
+    EXPECT_TRUE(oh == c.oh);
+    EXPECT_TRUE(ow == c.ow);
+  }
+  int oh = 0, ow = 0;
+  // Outside 1:4 .. 4:1, and non-positive geometry.
+  EXPECT_FALSE(h3::resolve_reference_image_size(100, 500, 2048, 32, &oh, &ow));
+  EXPECT_FALSE(h3::resolve_reference_image_size(500, 100, 2048, 32, &oh, &ow));
+  EXPECT_FALSE(h3::resolve_reference_image_size(0, 100, 2048, 32, &oh, &ow));
+  std::printf("[minimax_h3_layout] reference image sizing matches the "
+              "reference (no area cap, upscaling included)\n");
+}
+
+TEST(minimax_h3_layout, reference_audio_truncation)
+{
+  // Truncation at the SOURCE rate, and the mono upmix by REPEATING the
+  // channel -- a zeroed second channel would condition the right side on
+  // silence, since the VAE takes the pair as two batch items.
+  const double secs = 22.0 / 24.0;
+  {
+    const int rate = 32000, n = rate * 3;
+    std::vector<float> pcm((std::size_t)2 * n, 0.0f);
+    for (int i = 0; i < n; ++i) {
+      pcm[(std::size_t)i] = 0.5f;                       // left
+      pcm[(std::size_t)n + i] = -0.25f;                 // right
+    }
+    std::vector<float> out;
+    int kept = 0;
+    ASSERT_TRUE(h3::normalize_audio_reference(pcm.data(), 2, n, rate, secs,
+                                              &out, &kept));
+    EXPECT_TRUE(kept == 29333);                          // int(secs * rate)
+    EXPECT_TRUE((int)out.size() == 2 * kept);
+    EXPECT_TRUE(std::fabs(out[0] - 0.5f) < 1e-6f);
+    EXPECT_TRUE(std::fabs(out[(std::size_t)kept] + 0.25f) < 1e-6f);
+  }
+  {
+    const int rate = 44100, n = rate * 3;
+    std::vector<float> pcm((std::size_t)n, 0.75f);
+    std::vector<float> out;
+    int kept = 0;
+    ASSERT_TRUE(h3::normalize_audio_reference(pcm.data(), 1, n, rate, secs,
+                                              &out, &kept));
+    EXPECT_TRUE(kept == 40425);
+    EXPECT_TRUE((int)out.size() == 2 * kept);
+    // Both channels carry the mono signal.
+    EXPECT_TRUE(std::fabs(out[0] - 0.75f) < 1e-6f);
+    EXPECT_TRUE(std::fabs(out[(std::size_t)kept] - 0.75f) < 1e-6f);
+  }
+  // A source shorter than the cap is kept whole rather than padded.
+  {
+    std::vector<float> pcm(1000, 0.1f);
+    std::vector<float> out;
+    int kept = 0;
+    ASSERT_TRUE(h3::normalize_audio_reference(pcm.data(), 1, 1000, 32000, secs,
+                                              &out, &kept));
+    EXPECT_TRUE(kept == 1000);
+  }
+  std::vector<float> pcm(10, 0.0f), out;
+  EXPECT_FALSE(h3::normalize_audio_reference(pcm.data(), 3, 10, 32000, secs,
+                                             &out, nullptr));
+  std::printf("[minimax_h3_layout] soundtrack truncation + mono upmix match "
+              "the reference\n");
+}
+
+
+// The video rule is a COMPOSITION of three checked things -- the rate
+// resample, the target canvas rule and the resize -- so what this adds
+// is that they run in the reference's ORDER and that the output is
+// addressed correctly.
+//
+// Order matters twice: rescaling before the drop would resize frames
+// that are then thrown away (slow, but also a different result once the
+// truncation cuts elsewhere), and truncating before the rate resample
+// would cut the wrong frames entirely.
+TEST(minimax_h3_layout, reference_video_normalization)
+{
+  // 12 fps against 24 means every frame is HELD twice, which is what
+  // makes the duplicate check below sharp: consecutive output frames
+  // must be byte-identical in pairs.
+  const int n = 8, H = 36, W = 64;
+  std::vector<std::uint8_t> src((std::size_t)n * 3 * H * W, 0);
+  for (int f = 0; f < n; ++f) {
+    for (std::size_t i = 0; i < (std::size_t)3 * H * W; ++i) {
+      src[(std::size_t)f * 3 * H * W + i] =
+          (std::uint8_t)((i * 7 + f * 61) % 251);
+    }
+  }
+  std::vector<std::uint8_t> out;
+  int of = 0, oh = 0, ow = 0;
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 12.0,
+                                            /*target_frames=*/13, 32, 768,
+                                            768 * 1344, &out, &of, &oh, &ow));
+  // 8 frames at 12 fps become 16 at 24, truncated to the 13 asked for.
+  EXPECT_TRUE(of == 13);
+  // 36x64 is 16:9 and far under the cap, so the canvas rule scales the
+  // short edge to 768 -- the reference is UPSCALED, exactly as a small
+  // clip would be.
+  EXPECT_TRUE(oh == 768);
+  EXPECT_TRUE(ow == 1344);
+  EXPECT_TRUE(out.size() == (std::size_t)of * 3 * oh * ow);
+
+  const std::size_t plane = (std::size_t)3 * oh * ow;
+  auto same_frame = [&](int a, int b) {
+    return std::memcmp(out.data() + (std::size_t)a * plane,
+                       out.data() + (std::size_t)b * plane, plane) == 0;
+  };
+  // Held frames are byte-identical, and a frame from a DIFFERENT source
+  // is not -- which is what says the pick list is being applied rather
+  // than the frames simply being copied in order.
+  EXPECT_TRUE(same_frame(0, 1));
+  EXPECT_TRUE(same_frame(2, 3));
+  EXPECT_FALSE(same_frame(1, 2));
+
+  // A clip shorter than the target stays short: the layout is built from
+  // what this emits, so a short reference is a smaller conditioning
+  // block rather than an error or a padded one.
+  std::vector<std::uint8_t> shorter;
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 24.0,
+                                            /*target_frames=*/40, 32, 768,
+                                            768 * 1344, &shorter, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(of == 8);
+  std::printf("[minimax_h3_layout] video normalization: rate, truncate and "
+              "rescale compose in the reference's order\n");
+}
+
+// The PIL-faithful LANCZOS resize, pixel for pixel.
+//
+// LANCZOS specifically, and it is not interchangeable: the released
+// model was conditioned on ffmpeg's own, and a bilinear or box stand-in
+// is visibly softer. On the image path the tower reads these pixels
+// directly, so the difference does not wash out downstream.
+TEST(minimax_h3_layout, reference_lanczos_resize)
+{
+  std::vector<std::uint8_t> got;
+  ASSERT_TRUE(h3::resize_lanczos_planar_rgb(kResizeSrc, 12, 20, 20, 32, &got));
+  ASSERT_TRUE(got.size() == sizeof(kResizeDst));
+
+  int worst = 0, off = 0;
+  long long differ = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    const int d = (int)got[i] - (int)kResizeDst[i];
+    const int a = d < 0 ? -d : d;
+    if (a > worst) { worst = a; off = (int)i; }
+    if (a != 0) { ++differ; }
+  }
+  std::printf("[minimax_h3_layout] lanczos resize: %lld of %zu samples "
+              "differ, worst %d (at %d)\n", differ, got.size(), worst, off);
+  // Pillow rounds the accumulator to u8 once at the end, as this does,
+  // so the two agree exactly bar the last-bit ties a different summation
+  // order can flip.
+  EXPECT_TRUE(worst <= 1);
+  EXPECT_TRUE(differ * 20 <= (long long)got.size());   // under 5% off-by-one
+}
+
+// ---- rotary grids ---------------------------------------------------
 
 TEST(minimax_h3_layout, rotary_grids)
 {

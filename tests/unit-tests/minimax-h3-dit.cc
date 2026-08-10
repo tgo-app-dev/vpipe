@@ -849,6 +849,130 @@ TEST(minimax_h3_dit, m5_fastpath_engaged_guard)
 }
 
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+// The ref2va path through the REAL DiT: interleaved reference blocks.
+//
+// `t2va` / `fl2va` give every modality one contiguous range (video two),
+// which is what the transformer's scatter and its two output heads were
+// written against. `ref2va` breaks that -- a video reference's soundtrack
+// rows sit immediately before its own video rows, so the two modalities
+// interleave and neither is one range any more.
+//
+// What this pins is that the run-driven addressing puts every row where
+// the layout says. A wrong offset does not fail: it feeds the reference
+// block's latents to the target rows and back, and the model generates
+// confidently from the wrong conditioning.
+TEST(minimax_h3_dit, ref2va_denoise_holds_the_reference_blocks)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = kLayers;
+
+  // An image, then a video carrying its own soundtrack: the smallest
+  // request in which audio is NOT one contiguous block.
+  using Ref = h3::Reference;
+  const std::vector<Ref> refs = {
+      Ref{Ref::Kind::kImage, 1, kLatentH, kLatentW, 0},
+      Ref{Ref::Kind::kVideo, 3, kLatentH, kLatentW, 12},
+  };
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)kTextRows, h3::kTextTag);
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      text_tags, refs, kLatentF, kLatentH, kLatentW, kAudioLat, cfg.patch_h,
+      cfg.patch_w, h3::kAudioChannels, &L));
+  ASSERT_TRUE(L.num_condition_video_rows > 0);
+  ASSERT_TRUE(L.num_condition_audio_rows > 0);
+  ASSERT_TRUE(L.audio_runs.size() >= 2);      // reference + target
+  ASSERT_TRUE(L.video_runs.size() >= 3);      // image + clip + target
+
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+
+  const int PE = cfg.video_patch_elems();
+  const int AC = cfg.audio_channels;
+  const int vrows = (int)L.video_indices.size();
+  const int arows = (int)L.audio_indices.size();
+
+  SharedBuffer tb = mc->make_shared_buffer(
+      (std::size_t)kTextRows * cfg.text_dim * 2);
+  ASSERT_TRUE(!tb.empty());
+  {
+    auto* d = static_cast<std::uint16_t*>(tb.contents());
+    for (int i = 0; i < kTextRows * cfg.text_dim; ++i) {
+      d[i] = f32_to_bf16_(0.02f * (float)(i * 37 % 23 - 11));
+    }
+  }
+
+  std::vector<float> vid((std::size_t)vrows * PE, 0.0f);
+  std::vector<float> aud((std::size_t)arows * AC, 0.0f);
+  for (std::size_t i = 0; i < vid.size(); ++i) {
+    vid[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
+  }
+  for (std::size_t i = 0; i < aud.size(); ++i) {
+    aud[i] = 0.1f * (float)((int)(i * 17 % 13) - 6);
+  }
+  const std::vector<float> vid0 = vid, aud0 = aud;
+
+  genai::DenoiseRequest req;
+  req.dit    = m.get();
+  req.layout = &L;
+  req.text   = &tb;
+  req.video  = vid.data();
+  req.audio  = aud.data();
+  req.num_steps = 4;
+  std::string derr;
+  const bool ok = genai::denoise(req, &derr);
+  if (!ok) { std::printf("[minimax_h3_dit] ref2va denoise: %s\n",
+                         derr.c_str()); }
+  ASSERT_TRUE(ok);
+
+  // Both modalities' reference rows survive byte-identical. Audio is the
+  // new one: it has never had conditioning rows before, so a loop that
+  // stepped the whole buffer would overwrite the soundtrack it is meant
+  // to be conditioning ON.
+  bool vheld = true, aheld = true;
+  for (std::size_t i = 0; i < (std::size_t)L.num_condition_video_rows * PE;
+       ++i) {
+    if (vid[i] != vid0[i]) { vheld = false; break; }
+  }
+  for (std::size_t i = 0; i < (std::size_t)L.num_condition_audio_rows * AC;
+       ++i) {
+    if (aud[i] != aud0[i]) { aheld = false; break; }
+  }
+  EXPECT_TRUE(vheld);
+  EXPECT_TRUE(aheld);
+
+  auto moved = [](const std::vector<float>& now, const std::vector<float>& was,
+                  std::size_t from, std::size_t to) {
+    double d = 0.0, base = 0.0;
+    for (std::size_t i = from; i < to; ++i) {
+      d += (double)(now[i] - was[i]) * (now[i] - was[i]);
+      base += (double)was[i] * was[i];
+    }
+    return base > 0.0 ? std::sqrt(d / base) : 0.0;
+  };
+  const double dv =
+      moved(vid, vid0, (std::size_t)L.num_condition_video_rows * PE,
+            vid.size());
+  const double da =
+      moved(aud, aud0, (std::size_t)L.num_condition_audio_rows * AC,
+            aud.size());
+  std::printf("[minimax_h3_dit] ref2va denoise %d steps: %d video runs, %d "
+              "audio runs; references held v=%d a=%d; generated video moved "
+              "%.4f, audio moved %.4f\n", req.num_steps,
+              (int)L.video_runs.size(), (int)L.audio_runs.size(),
+              vheld ? 1 : 0, aheld ? 1 : 0, dv, da);
+  EXPECT_TRUE(dv > 0.01);
+  EXPECT_TRUE(da > 0.01);
+}
+
 TEST(minimax_h3_dit, denoise_holds_the_anchors)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");

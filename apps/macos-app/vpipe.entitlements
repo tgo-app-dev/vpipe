@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the Developer ID (outside the Mac App Store) build.
+
+  App Sandbox is deliberately ABSENT. It is not required for Developer ID
+  distribution, and it would break the run_python chat tool, which
+  sandboxes each call itself with sandbox-exec and cannot be nested.
+
+  The hardened runtime IS applied (the "runtime" codesign option, set in
+  bundle-app.sh) because notarization requires it. Each opt-out below
+  names something the hardened runtime would otherwise deny.
+
+  NOTE for editors: XML forbids a double hyphen inside a comment, and
+  AMFI rejects the entire file over one while plutil -lint still reports
+  OK. So name flags in prose here, never verbatim.
+-->
+<plist version="1.0">
+<dict>
+  <!-- REQUIRED. The hardened runtime otherwise refuses to load any
+       library not signed by the same Team ID, and vpipe dlopens two
+       kinds that never will be:
+         * FFmpeg from the host (Homebrew's, when it is not bundled);
+           the unbundled mode is a supported configuration, not a
+           fallback.
+         * plugin .dylibs built by whoever wrote them (docs/PLUGINS.md).
+       Bundling FFmpeg does not remove the need: plugins remain. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- Capture stages and live vision/audio model input. Paired with the
+       NSCameraUsageDescription / NSMicrophoneUsageDescription strings in
+       Info.plist; both halves are needed. -->
+  <key>com.apple.security.device.camera</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+
+  <!--
+    Deliberately NOT requested:
+
+    com.apple.developer.networking.multicast
+        ONVIF discovery falls back to a subnet scan when multicast is
+        unavailable, so the feature works without it. Requesting it
+        would add an Apple review cycle for no functional gain.
+
+    com.apple.security.cs.allow-dyld-environment-variables
+        The bundled FFmpeg is found through @loader_path, which the
+        hardened runtime honours. DYLD_* would need this entitlement
+        precisely because the runtime strips those variables; using
+        @loader_path avoids the question.
+
+    com.apple.security.cs.allow-unsigned-executable-memory
+    com.apple.security.cs.allow-jit
+        Nothing here JITs. Metal shaders are compiled to metallibs at
+        build time and embedded in the binary.
+  -->
+</dict>
+</plist>

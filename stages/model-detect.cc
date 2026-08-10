@@ -1,5 +1,7 @@
 #include "stages/model-detect.h"
 
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "stages/model-catalog.h"
@@ -188,6 +190,7 @@ family_version_(const std::string& mt, std::string& family,
       {"wan-i2v",                "Wan",         "2.2-I2V"},
       {"wan-t2v",                "Wan",         "2.2-T2V"},
       {"minimax-h3-fl2va",       "MiniMax",     "H3-FL2VA"},
+      {"minimax-h3-ref2va",      "MiniMax",     "H3-Ref2VA"},
       {"minimax-h3-dit",         "MiniMax",     "H3-FL2VA"},
       {"minimax-h3-text-encoder", "MiniMax",    "H3-FL2VA"},
       {"moss-tts",               "MOSS",        "TTS"},
@@ -280,12 +283,17 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     return int_field_(cfg, "in_channels", 16) > 16 ? "wan-i2v" : "wan-t2v";
   }
   if (cls == "MiniMaxH3DiTModel") {
-    // Only the partition we implement gets a runnable tag. Ref2VA is a
-    // different task (up to 9 reference images / 3 video clips / 3 audio
-    // clips, and its own packed layout), so tagging it "fl2va" would
-    // claim support we do not have; leaving it untagged is the honest
-    // answer and it still registers as an uncatalogued directory.
-    return partition == "fl2va" ? "minimax-h3-fl2va" : std::string();
+    // The two partitions ship BYTE-IDENTICAL transformer configs (same
+    // 535 tensor names, same shapes), so the DiT alone cannot tell them
+    // apart and the pipeline manifest has to -- and it matters, because
+    // they are different TASKS over the same architecture: fl2va takes
+    // an optional first/last frame, ref2va takes up to 9 reference
+    // images / 3 clips / 3 audio clips and packs a block per reference.
+    // A checkpoint tagged as the wrong one would load and run and
+    // condition on nothing.
+    if (partition == "fl2va")  { return "minimax-h3-fl2va"; }
+    if (partition == "ref2va") { return "minimax-h3-ref2va"; }
+    return {};
   }
   return {};
 }
@@ -319,10 +327,13 @@ comfy_repo_tag_(const fs::path& root)
     const std::string im = str_field_(t, "image_model");
     const std::string name_lc = lower_(fs::path(c.file).filename().string());
     if (im == "minimax_h3") {
-      // Same policy as the diffusers path: only the partition this tree
-      // implements gets a runnable tag. Ref2VA is a different task, so
-      // tagging it would claim support we do not have.
-      if (has_(name_lc, "fl2va")) { return "minimax-h3-fl2va"; }
+      // The repack embeds no partition, so the FILENAME is the only
+      // signal -- the weights themselves are indistinguishable. A
+      // `pruned` DiT is a different model rather than a different
+      // packing of this one, so it stays untagged.
+      if (has_(name_lc, "pruned")) { return {}; }
+      if (has_(name_lc, "fl2va"))  { return "minimax-h3-fl2va"; }
+      if (has_(name_lc, "ref2va")) { return "minimax-h3-ref2va"; }
       return {};
     }
   }
@@ -649,6 +660,37 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
       d.weight_format = "comfyui";
       d.variant       = comfy_components_(root);
       catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
+  }
+
+  // ---- 2b'. a QUANTIZED repack -----------------------------------
+  // model-quantize's output is repack-SHAPED (diffusion_models/ + vae/ +
+  // text_encoders/) but every component is a DIRECTORY of shards, so the
+  // scan above -- which looks for one .safetensors per role -- finds
+  // nothing, and the diffusers probe wants `transformer/config.json`
+  // that a repack never had. Both quantized H3 builds therefore
+  // registered as "type unknown" and no picker offered them.
+  //
+  // The partition comes from the config the producer wrote, for the
+  // reason it writes `qkv_per_head` there: the filename that carried it
+  // is gone, and the two partitions are byte-identical in every other
+  // respect.
+  if (d.model_type.empty()) {
+    const FlexData q = read_json_(root / "diffusion_models" / "config.json");
+    if (q.is_object()) {
+      std::string part;
+      auto qo = q.as_object();
+      if (qo.contains(genai::MetalMiniMaxH3Transformer::kPartitionKey)) {
+        const FlexData v =
+            qo.at(genai::MetalMiniMaxH3Transformer::kPartitionKey);
+        if (v.is_string()) { part = std::string(v.as_string()); }
+      }
+      d.model_type = dit_tag_(str_field_(q, "_class_name"), base_lc, q, part);
+      if (!d.model_type.empty()) {
+        d.detected_by   = "quantized-repack";
+        d.weight_format = "safetensors";
+        catalog_default_io(d.model_type, d.inputs, d.outputs);
+      }
     }
   }
 

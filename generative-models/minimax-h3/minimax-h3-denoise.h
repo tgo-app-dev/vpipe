@@ -23,11 +23,12 @@ namespace genai {
 //   * TWO schedules. Video runs at shift 12.0 and audio at 3.0, over the
 //     same step count, so step i of one always pairs with step i of the
 //     other. They are stepped on their own slices of one sequence.
-//   * The keyframe CONDITION rows are never stepped. They sit at the
-//     front of the video block, carry their own timestep in the AdaLN
-//     table, and are read by every other row through attention -- but
-//     only the generated rows are ever written, so the anchors survive
-//     the whole loop unchanged.
+//   * The CONDITION rows are never stepped. They lead their modality's
+//     buffer, carry their own timestep in the AdaLN table, and are read
+//     by every other row through attention -- but only the generated
+//     rows are ever written, so they survive the whole loop unchanged.
+//     Video has always had them (a keyframe anchor); `ref2va` adds them
+//     on the AUDIO side too, one block per reference soundtrack.
 //   * The state is float32 while the transformer is bf16. The loop runs
 //     20+ times over a latent that starts as unit noise, and the
 //     reference steps in float32 for exactly that reason; the bf16 round
@@ -58,6 +59,11 @@ struct DenoiseRequest {
   // and a checkpoint trained with noise-augmented anchors would want it
   // lower.
   float condition_timestep = 1.0f;
+  // The level a `ref2va` REFERENCE soundtrack sits at. Unused by
+  // `t2va` / `fl2va`, which carry no reference audio rows at all: those
+  // layouts report `num_condition_audio_rows == 0` and the whole audio
+  // buffer is generated.
+  float condition_audio_timestep = 1.0f;
 
   // Per-step progress. Return false to stop early; the state keeps
   // whatever steps have run.

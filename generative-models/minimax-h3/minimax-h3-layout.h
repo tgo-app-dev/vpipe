@@ -90,6 +90,24 @@ std::vector<double> temporal_position_grid(int num_latent_frames,
 // Which end of the clip a keyframe conditioning block is anchored to.
 enum class Anchor { kFirst, kLast };
 
+// A contiguous destination range of one modality's rows.
+//
+// `t2va` / `fl2va` give every modality ONE range (video two: the
+// conditioning block and the target block), which is why the layout
+// below also carries plain start/count fields for them. `ref2va` does
+// not: a video reference's soundtrack rows are packed immediately
+// before its own video rows, so with several references neither audio
+// nor video is a single range any more, and the rows of one modality
+// are interleaved with the other's.
+//
+// A run is still CONTIGUOUS, though, which is what makes this the right
+// shape rather than a per-row index: each run is one GEMM with a
+// destination offset, exactly as the single-range case already was.
+struct RowRun {
+  int start = 0;   // first packed row of the run
+  int count = 0;   // rows in it
+};
+
 struct PackedLayout {
   // Row-major [seq_len, 3] rotary coordinates, in the (t, h, w) order
   // the transformer's rope reads. Kept in DOUBLE all the way to the
@@ -118,6 +136,51 @@ struct PackedLayout {
   // ranges are not adjacent and the output head's row selection needs
   // them in this order.
   std::vector<int> video_indices;
+
+  // The same for audio, reference rows first. `t2va` / `fl2va` have no
+  // reference audio, so this is just [audio_start, +num_audio_rows) --
+  // it is materialized anyway so that everything downstream reads ONE
+  // shape whichever task built the layout.
+  std::vector<int> audio_indices;
+
+  // Each modality's rows as contiguous runs, in the order the indices
+  // above list them. Video is {conditioning, target} for `fl2va` and
+  // one run per image/video reference plus the target for `ref2va`;
+  // audio is a single target run for `fl2va`.
+  std::vector<RowRun> video_runs;
+  std::vector<RowRun> audio_runs;
+
+  // How many LEADING entries of the index vectors are conditioning
+  // rather than generated rows. `num_condition_video_rows` is
+  // `num_condition_rows` under the name the general path uses; audio
+  // conditioning exists only in `ref2va`.
+  int num_condition_video_rows = 0;
+  int num_condition_audio_rows = 0;
+};
+
+// One reference of a `ref2va` request, as the LAYOUT sees it: what
+// modality it is and the shape of what the encoders made of it. The
+// media itself never reaches here.
+//
+// `num_latent_frames` / `latent_height` / `latent_width` are the video
+// conditioning latent's own geometry -- a reference is encoded at a
+// resolution of its own and never binds the generated canvas, so these
+// are genuinely per-reference and not derivable from the target.
+struct Reference {
+  enum class Kind { kImage, kVideo, kAudio };
+
+  Kind kind = Kind::kImage;
+
+  // Video geometry, for kImage (one latent frame) and kVideo.
+  int num_latent_frames = 0;
+  int latent_height     = 0;
+  int latent_width      = 0;
+
+  // Audio latents PER CHANNEL, or 0 for a reference with no soundtrack.
+  // Always 0 for kImage; a kAudio reference is nothing but this.
+  int num_audio_latents = 0;
+
+  bool has_audio() const { return num_audio_latents > 0; }
 };
 
 // Build the `[text | keyframe conditions | target audio | target video]`
@@ -138,6 +201,33 @@ bool build_packed_sequence(const std::vector<int>& text_token_tags,
                            const std::vector<Anchor>& keyframe_anchors,
                            PackedLayout* out);
 
+// Build the `[text | reference blocks | target audio | target video]`
+// layout of the `ref2va` task.
+//
+// `references` is in the order the model READS them, which is load-
+// bearing twice over: it numbers the `<Picture i>` / `<Audio j>` /
+// `<Video k>` labels of the prompt presentation, and it advances the
+// shared audio/video rotary clock. A different order is a different
+// request, not a different spelling of one.
+//
+// The clock starts where the text rows end and every reference pushes
+// it forward by the time that reference occupies: an image takes a
+// single integer slot (NOT a latent frame's 5/3 units), a soundtrack
+// one unit per audio latent, and a video the LONGER of its own two.
+// A video reference's soundtrack rows are packed immediately before its
+// video rows and share their origin, which is why the two modalities
+// interleave and `audio_runs` exists.
+//
+// False on an inconsistent request: a reference whose geometry is not
+// positive or not divisible by the patch, or an empty list (a request
+// with no references is `t2va`, not a degenerate `ref2va`).
+bool build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
+                                  const std::vector<Reference>& references,
+                                  int num_latent_frames, int latent_height,
+                                  int latent_width, int num_audio_latents,
+                                  int patch_h, int patch_w, int audio_channels,
+                                  PackedLayout* out);
+
 // Assign a timestep to every row and reduce it to the transformer's
 // `(distinct timesteps, per-row index)` pair.
 //
@@ -148,10 +238,16 @@ bool build_packed_sequence(const std::vector<int>& text_token_tags,
 //
 // `timesteps_out` comes back sorted and distinct; `row_index_out` is
 // per-row into it, which is exactly what the AdaLN table indexes with.
+//
+// `condition_audio_timestep` is the level a `ref2va` REFERENCE
+// soundtrack sits at -- it is conditioning the model reads rather than
+// a stream it denoises, so it never moves. It is unused by `t2va` /
+// `fl2va`, which have no reference audio rows at all.
 void build_row_timesteps(const PackedLayout& layout, float video_timestep,
                          float audio_timestep, float condition_video_timestep,
                          std::vector<float>* timesteps_out,
-                         std::vector<int>* row_index_out);
+                         std::vector<int>* row_index_out,
+                         float condition_audio_timestep = 1.0f);
 
 // `timestep_index * kModalityNum + tag` for every row -- the AdaLN table
 // row each sequence row reads its six modulation parameters from.

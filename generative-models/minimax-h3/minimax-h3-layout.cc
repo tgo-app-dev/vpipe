@@ -256,6 +256,255 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   }
   for (int r : L.video_indices) { L.token_tags[(std::size_t)r] = kVideoTag; }
 
+  // 7. The same rows in the general shape, so that a consumer does not
+  // have to know which task built the layout. Here every modality is
+  // one range (video two), which is exactly what `ref2va` stops being
+  // true.
+  L.audio_indices.reserve((std::size_t)num_audio_rows);
+  for (int i = 0; i < num_audio_rows; ++i) {
+    L.audio_indices.push_back(L.audio_start + i);
+  }
+  if (num_cond > 0) {
+    L.video_runs.push_back({L.condition_start, num_cond});
+  }
+  if (num_video_rows > 0) {
+    L.video_runs.push_back({L.video_start, num_video_rows});
+  }
+  if (num_audio_rows > 0) {
+    L.audio_runs.push_back({L.audio_start, num_audio_rows});
+  }
+  L.num_condition_video_rows = num_cond;
+  L.num_condition_audio_rows = 0;
+
+  *out = std::move(L);
+  return true;
+}
+
+bool
+build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
+                             const std::vector<Reference>& references,
+                             int num_latent_frames, int latent_height,
+                             int latent_width, int num_audio_latents,
+                             int patch_h, int patch_w, int audio_channels,
+                             PackedLayout* out)
+{
+  if (out == nullptr || references.empty()) { return false; }
+  if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
+      patch_h <= 0 || patch_w <= 0 || audio_channels <= 0 ||
+      num_audio_latents < 0) {
+    return false;
+  }
+  if (latent_height % patch_h != 0 || latent_width % patch_w != 0) {
+    return false;
+  }
+  // Every reference's own geometry has to divide the patch too -- it is
+  // encoded at a resolution of its own, so the target's divisibility
+  // says nothing about it.
+  for (const Reference& r : references) {
+    const bool visual = r.kind != Reference::Kind::kAudio;
+    if (visual) {
+      if (r.num_latent_frames <= 0 || r.latent_height <= 0 ||
+          r.latent_width <= 0) {
+        return false;
+      }
+      if (r.latent_height % patch_h != 0 || r.latent_width % patch_w != 0) {
+        return false;
+      }
+      if (r.kind == Reference::Kind::kImage && r.num_latent_frames != 1) {
+        return false;                    // an image is a single frame
+      }
+    } else if (r.num_audio_latents <= 0) {
+      return false;                      // an audio reference IS its rows
+    }
+    if (r.kind == Reference::Kind::kImage && r.has_audio()) {
+      return false;                      // an image carries no soundtrack
+    }
+  }
+
+  const int num_text = (int)text_token_tags.size();
+  const int tph = latent_height / patch_h;
+  const int tpw = latent_width / patch_w;
+  const int target_rows_per_frame = tph * tpw;
+  const int num_target_video = num_latent_frames * target_rows_per_frame;
+  const int num_target_audio = num_audio_latents * audio_channels;
+
+  auto ref_video_rows = [&](const Reference& r) {
+    return r.num_latent_frames * (r.latent_height / patch_h) *
+           (r.latent_width / patch_w);
+  };
+
+  int num_ref_video = 0;
+  int num_ref_audio = 0;
+  for (const Reference& r : references) {
+    if (r.kind != Reference::Kind::kAudio) { num_ref_video += ref_video_rows(r); }
+    if (r.has_audio()) { num_ref_audio += r.num_audio_latents * audio_channels; }
+  }
+  const int seq = num_text + num_ref_video + num_ref_audio + num_target_audio +
+                  num_target_video;
+  if (seq <= 0) { return false; }
+
+  PackedLayout L;
+  L.seq_len       = seq;
+  L.num_text_rows = num_text;
+  L.position_ids.assign((std::size_t)seq * 3, 0.0);
+  L.token_tags.assign((std::size_t)seq, kVideoTag);
+  auto pos = [&](int row, int axis) -> double& {
+    return L.position_ids[(std::size_t)row * 3 + (std::size_t)axis];
+  };
+
+  // 1. Text rows on the time axis at their own index, as in every task.
+  for (int i = 0; i < num_text; ++i) { pos(i, 0) = (double)i; }
+
+  const double target_sqrt_area =
+      std::sqrt((double)latent_height * (double)latent_width);
+  const std::vector<double> target_h =
+      spatial_position_grid(latent_height, patch_h, target_sqrt_area);
+  const std::vector<double> target_w =
+      spatial_position_grid(latent_width, patch_w, target_sqrt_area);
+  if ((int)target_h.size() != tph || (int)target_w.size() != tpw) {
+    return false;
+  }
+
+  // Place one channel-major audio block. Audio rows carry no height and
+  // are pinned to the two extremes of the width grid of THEIR OWN block
+  // -- the target grid for a standalone audio reference, the video's own
+  // grid for a soundtrack -- which is how the model tells the two stereo
+  // channels apart positionally.
+  auto fill_audio = [&](int start, int latents, double clock,
+                        const std::vector<double>& w_grid) {
+    for (int c = 0; c < audio_channels; ++c) {
+      for (int i = 0; i < latents; ++i) {
+        const int row = start + c * latents + i;
+        pos(row, 0) = clock + (double)i;
+        pos(row, 2) = (c == 0) ? w_grid.front() : w_grid.back();
+      }
+    }
+  };
+
+  // 2. The reference blocks, in request order, on the shared clock.
+  int    cursor = num_text;
+  double clock  = (double)num_text;
+  for (const Reference& r : references) {
+    if (r.kind == Reference::Kind::kImage) {
+      const int rows = ref_video_rows(r);
+      const int rpw  = r.latent_width / patch_w;
+      const double area =
+          std::sqrt((double)r.latent_height * (double)r.latent_width);
+      const std::vector<double> rh =
+          spatial_position_grid(r.latent_height, patch_h, area);
+      const std::vector<double> rw =
+          spatial_position_grid(r.latent_width, patch_w, area);
+      for (int i = 0; i < rows; ++i) {
+        pos(cursor + i, 0) = clock;
+        pos(cursor + i, 1) = rh[(std::size_t)(i / rpw)];
+        pos(cursor + i, 2) = rw[(std::size_t)(i % rpw)];
+      }
+      L.video_runs.push_back({cursor, rows});
+      cursor += rows;
+      // An image is a single frame and takes a single INTEGER slot, not
+      // a latent frame's 5/3 units.
+      clock += 1.0;
+    } else if (r.kind == Reference::Kind::kAudio) {
+      const int rows = r.num_audio_latents * audio_channels;
+      fill_audio(cursor, r.num_audio_latents, clock, target_w);
+      L.audio_runs.push_back({cursor, rows});
+      cursor += rows;
+      clock += (double)r.num_audio_latents;
+    } else {
+      // A video reference's soundtrack rows are packed immediately
+      // BEFORE its video rows and share their origin, so the two are
+      // rotary-aligned exactly as the generated audio and video are.
+      const int a_rows = r.num_audio_latents * audio_channels;
+      const int v_rows = ref_video_rows(r);
+      const int rpw    = r.latent_width / patch_w;
+      const double area =
+          std::sqrt((double)r.latent_height * (double)r.latent_width);
+      const std::vector<double> rh =
+          spatial_position_grid(r.latent_height, patch_h, area);
+      const std::vector<double> rw =
+          spatial_position_grid(r.latent_width, patch_w, area);
+      if (a_rows > 0) {
+        fill_audio(cursor, r.num_audio_latents, clock, rw);
+        L.audio_runs.push_back({cursor, a_rows});
+        cursor += a_rows;
+      }
+      const std::vector<double> t_grid =
+          temporal_position_grid(r.num_latent_frames, clock);
+      const int rows_per_frame = (r.latent_height / patch_h) * rpw;
+      for (int f = 0; f < r.num_latent_frames; ++f) {
+        for (int i = 0; i < rows_per_frame; ++i) {
+          const int row = cursor + f * rows_per_frame + i;
+          pos(row, 0) = t_grid[(std::size_t)f];
+          pos(row, 1) = rh[(std::size_t)(i / rpw)];
+          pos(row, 2) = rw[(std::size_t)(i % rpw)];
+        }
+      }
+      L.video_runs.push_back({cursor, v_rows});
+      cursor += v_rows;
+      // The clock advances by the LONGER of the two streams this
+      // reference carries. Summed sequentially: the reference sums the
+      // same series with numpy's pairwise summation, and the two differ
+      // in the last ulp of a double from 16 latent frames on -- ~2e-16
+      // relative on an angle whose cosine is then stored as bf16, so it
+      // cannot reach the model. Same call as the `fl2va` anchor.
+      double span = 0.0;
+      for (int i = 0; i < r.num_latent_frames; ++i) {
+        span += kRopeFrameRescale * (double)kRopeFramesPerLatent[i % 5];
+      }
+      clock += std::max((double)r.num_audio_latents, span);
+    }
+  }
+
+  // 3. The generated rows share the origin the references left behind.
+  const int audio_start = cursor;
+  const int video_start = audio_start + num_target_audio;
+  L.audio_start    = audio_start;
+  L.num_audio_rows = num_target_audio;
+  L.video_start    = video_start;
+  L.num_video_rows = num_target_video;
+  // The `fl2va` conditioning fields describe a keyframe block that does
+  // not exist here; the reference blocks are what a `ref2va` request
+  // conditions on and they are addressed through the runs.
+  L.condition_start    = num_text;
+  L.num_condition_rows = num_ref_video;
+
+  if (num_target_audio > 0) {
+    fill_audio(audio_start, num_audio_latents, clock, target_w);
+    L.audio_runs.push_back({audio_start, num_target_audio});
+  }
+  const std::vector<double> t_grid =
+      temporal_position_grid(num_latent_frames, clock);
+  for (int f = 0; f < num_latent_frames; ++f) {
+    for (int i = 0; i < target_rows_per_frame; ++i) {
+      const int row = video_start + f * target_rows_per_frame + i;
+      pos(row, 0) = t_grid[(std::size_t)f];
+      pos(row, 1) = target_h[(std::size_t)(i / tpw)];
+      pos(row, 2) = target_w[(std::size_t)(i % tpw)];
+    }
+  }
+  L.video_runs.push_back({video_start, num_target_video});
+
+  // 4. Indices, then tags. The reference writes text, then audio, then
+  // video, and the video pass must win: a vision block's text rows are
+  // tagged VIDEO by the caller and are inside the text range, so the
+  // three passes are not disjoint the way they are in `fl2va`.
+  L.video_indices.reserve((std::size_t)(num_ref_video + num_target_video));
+  for (const RowRun& r : L.video_runs) {
+    for (int i = 0; i < r.count; ++i) { L.video_indices.push_back(r.start + i); }
+  }
+  L.audio_indices.reserve((std::size_t)(num_ref_audio + num_target_audio));
+  for (const RowRun& r : L.audio_runs) {
+    for (int i = 0; i < r.count; ++i) { L.audio_indices.push_back(r.start + i); }
+  }
+  for (int i = 0; i < num_text; ++i) {
+    L.token_tags[(std::size_t)i] = text_token_tags[(std::size_t)i];
+  }
+  for (int r : L.audio_indices) { L.token_tags[(std::size_t)r] = kAudioTag; }
+  for (int r : L.video_indices) { L.token_tags[(std::size_t)r] = kVideoTag; }
+
+  L.num_condition_video_rows = num_ref_video;
+  L.num_condition_audio_rows = num_ref_audio;
+
   *out = std::move(L);
   return true;
 }
@@ -264,19 +513,30 @@ void
 build_row_timesteps(const PackedLayout& layout, float video_timestep,
                     float audio_timestep, float condition_video_timestep,
                     std::vector<float>* timesteps_out,
-                    std::vector<int>* row_index_out)
+                    std::vector<int>* row_index_out,
+                    float condition_audio_timestep)
 {
   if (timesteps_out == nullptr || row_index_out == nullptr) { return; }
   const std::size_t seq = (std::size_t)layout.seq_len;
   std::vector<float> row(seq, video_timestep);
-  // Conditioning rows first, then the generated audio rows -- the
-  // reference's order, which matters only if the two ranges overlapped
-  // (they do not).
-  for (int i = 0; i < layout.num_condition_rows; ++i) {
-    row[(std::size_t)(layout.condition_start + i)] = condition_video_timestep;
+  // Through the INDEX vectors rather than the ranges: a `ref2va` layout
+  // interleaves the two modalities, so there is no one range to walk.
+  // The reference's order is conditioning video, generated audio, then
+  // reference audio, which matters only if those overlapped (they do
+  // not) -- it is kept anyway so a future overlap resolves the same way
+  // in both.
+  const int ncv = layout.num_condition_video_rows;
+  const int nca = layout.num_condition_audio_rows;
+  for (int i = 0; i < ncv && i < (int)layout.video_indices.size(); ++i) {
+    row[(std::size_t)layout.video_indices[(std::size_t)i]] =
+        condition_video_timestep;
   }
-  for (int i = 0; i < layout.num_audio_rows; ++i) {
-    row[(std::size_t)(layout.audio_start + i)] = audio_timestep;
+  for (int i = nca; i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] = audio_timestep;
+  }
+  for (int i = 0; i < nca && i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] =
+        condition_audio_timestep;
   }
 
   // torch.unique(sorted=True, return_inverse=True).

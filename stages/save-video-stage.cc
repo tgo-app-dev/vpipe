@@ -54,7 +54,12 @@ SaveVideoStage::SaveVideoStage
   // Nested video/audio defaults: no flat ConfigKey representation, so
   // they are seeded here (the single source) and overridden from the
   // video.* / audio.* sub-objects below.
-  _video_codec    = "libx264";
+  // h264_videotoolbox, matching hls-broadcast: it is part of the OS,
+  // hardware accelerated, and carries no licence obligation, where
+  // libx264 is GPL and so cannot be in an FFmpeg build this project
+  // redistributes. Non-Apple builds fall back to libx264 in
+  // init_video_encoder_().
+  _video_codec    = "h264_videotoolbox";
   _video_bitrate  = 2'000'000;
   _video_preset   = "medium";
   _video_gop_size = 60;
@@ -296,6 +301,25 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
 
   const AVCodec* codec = _libs->avcodec().api.find_encoder_by_name(
     _video_codec.c_str());
+
+  // The default is h264_videotoolbox, which exists only on Apple
+  // platforms. Fall back to libx264 so a Linux build of an
+  // unconfigured graph still encodes.
+  //
+  // Only for the DEFAULT: an explicitly configured encoder is a
+  // deliberate choice, and quietly substituting another would be worse
+  // than saying it is missing.
+  if (!codec && _video_codec == "h264_videotoolbox") {
+    codec = _libs->avcodec().api.find_encoder_by_name("libx264");
+    if (codec) {
+      session()->log_normal(fmt(
+          "SaveVideoStage('{}'): h264_videotoolbox is not in this FFmpeg "
+          "build; encoding with libx264 instead",
+          this->id()));
+      _video_codec = "libx264";
+    }
+  }
+
   if (!codec) {
     session()->error(fmt(
         "SaveVideoStage('{}'): video encoder '{}' not found",

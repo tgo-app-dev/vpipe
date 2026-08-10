@@ -5,9 +5,11 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <string>
 #include <string_view>
+#include <vector>
 
 extern "C" {
 #include <libavutil/log.h>
@@ -78,7 +80,7 @@ ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
 
 // Per-library candidate list: bare sonames first (so the OS dynamic
 // loader handles search paths normally), then versioned filenames
-// covering FFmpeg 4..7 ABIs, then common Homebrew / system absolute
+// covering FFmpeg 4..8 ABIs, then common Homebrew / system absolute
 // paths. The first candidate that dlopens wins.
 //
 // We probe with RTLD_NOW | RTLD_LOCAL (matches LibraryHandle's
@@ -89,6 +91,7 @@ ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
 
 constexpr const char* kAvUtilCandidates[] = {
   "libavutil.dylib",
+  "libavutil.60.dylib",
   "libavutil.59.dylib",
   "libavutil.58.dylib",
   "libavutil.57.dylib",
@@ -96,6 +99,7 @@ constexpr const char* kAvUtilCandidates[] = {
   "/opt/homebrew/lib/libavutil.dylib",
   "/usr/local/lib/libavutil.dylib",
   "libavutil.so",
+  "libavutil.so.60",
   "libavutil.so.59",
   "libavutil.so.58",
   "libavutil.so.57",
@@ -104,6 +108,7 @@ constexpr const char* kAvUtilCandidates[] = {
 
 constexpr const char* kAvCodecCandidates[] = {
   "libavcodec.dylib",
+  "libavcodec.62.dylib",
   "libavcodec.61.dylib",
   "libavcodec.60.dylib",
   "libavcodec.59.dylib",
@@ -111,6 +116,7 @@ constexpr const char* kAvCodecCandidates[] = {
   "/opt/homebrew/lib/libavcodec.dylib",
   "/usr/local/lib/libavcodec.dylib",
   "libavcodec.so",
+  "libavcodec.so.62",
   "libavcodec.so.61",
   "libavcodec.so.60",
   "libavcodec.so.59",
@@ -119,6 +125,7 @@ constexpr const char* kAvCodecCandidates[] = {
 
 constexpr const char* kAvFormatCandidates[] = {
   "libavformat.dylib",
+  "libavformat.62.dylib",
   "libavformat.61.dylib",
   "libavformat.60.dylib",
   "libavformat.59.dylib",
@@ -126,6 +133,7 @@ constexpr const char* kAvFormatCandidates[] = {
   "/opt/homebrew/lib/libavformat.dylib",
   "/usr/local/lib/libavformat.dylib",
   "libavformat.so",
+  "libavformat.so.62",
   "libavformat.so.61",
   "libavformat.so.60",
   "libavformat.so.59",
@@ -134,6 +142,7 @@ constexpr const char* kAvFormatCandidates[] = {
 
 constexpr const char* kAvDeviceCandidates[] = {
   "libavdevice.dylib",
+  "libavdevice.62.dylib",
   "libavdevice.61.dylib",
   "libavdevice.60.dylib",
   "libavdevice.59.dylib",
@@ -141,6 +150,7 @@ constexpr const char* kAvDeviceCandidates[] = {
   "/opt/homebrew/lib/libavdevice.dylib",
   "/usr/local/lib/libavdevice.dylib",
   "libavdevice.so",
+  "libavdevice.so.62",
   "libavdevice.so.61",
   "libavdevice.so.60",
   "libavdevice.so.59",
@@ -149,12 +159,14 @@ constexpr const char* kAvDeviceCandidates[] = {
 
 constexpr const char* kSwResampleCandidates[] = {
   "libswresample.dylib",
+  "libswresample.6.dylib",
   "libswresample.5.dylib",
   "libswresample.4.dylib",
   "libswresample.3.dylib",
   "/opt/homebrew/lib/libswresample.dylib",
   "/usr/local/lib/libswresample.dylib",
   "libswresample.so",
+  "libswresample.so.6",
   "libswresample.so.5",
   "libswresample.so.4",
   "libswresample.so.3",
@@ -162,6 +174,7 @@ constexpr const char* kSwResampleCandidates[] = {
 
 constexpr const char* kSwScaleCandidates[] = {
   "libswscale.dylib",
+  "libswscale.9.dylib",
   "libswscale.8.dylib",
   "libswscale.7.dylib",
   "libswscale.6.dylib",
@@ -169,11 +182,46 @@ constexpr const char* kSwScaleCandidates[] = {
   "/opt/homebrew/lib/libswscale.dylib",
   "/usr/local/lib/libswscale.dylib",
   "libswscale.so",
+  "libswscale.so.9",
   "libswscale.so.8",
   "libswscale.so.7",
   "libswscale.so.6",
   "libswscale.so.5",
 };
+
+// Locations tried BEFORE the system candidates above. Two callers want
+// this:
+//
+//   * a relocatable .app, which carries its own FFmpeg beside libvpipe.
+//     dlopen expands @loader_path against the Mach-O image that CALLS
+//     it -- libvpipe, not the executable -- so a bundled copy is found
+//     wherever the bundle is dragged to, and without DYLD_* (which a
+//     hardened runtime strips anyway).
+//   * VPIPE_FFMPEG_DIR, to aim a build at one specific install without
+//     editing the search order.
+//
+// Preferring these is the point: a bundled FFmpeg is the one this build
+// was tested against, so it must win over whatever a package manager
+// left in /opt/homebrew. Each is still only a CANDIDATE -- an
+// incomplete directory falls through to the system install rather than
+// half-loading, since the probe below requires a full dlopen.
+vector<string>
+preferred_candidates_(string_view lib_name)
+{
+  vector<string> out;
+  const string base(lib_name);
+  if (const char* dir = ::getenv("VPIPE_FFMPEG_DIR"); dir && *dir) {
+    out.push_back(string(dir) + "/" + base + ".dylib");
+    out.push_back(string(dir) + "/" + base + ".so");
+  }
+#ifdef __APPLE__
+  // Beside libvpipe (Contents/Frameworks), then the sibling-directory
+  // spelling for a layout that keeps the library elsewhere.
+  out.push_back("@loader_path/" + base + ".dylib");
+  out.push_back("@loader_path/../Frameworks/" + base + ".dylib");
+#endif
+  return out;
+}
 
 template <size_t N>
 string
@@ -181,6 +229,14 @@ find_first_loadable_(const LogSinkIntf*  session,
                      const char* const   (&candidates)[N],
                      string_view         lib_name)
 {
+  for (const string& c : preferred_candidates_(lib_name)) {
+    void* h = ::dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (h) {
+      ::dlclose(h);
+      session->log_normal(fmt("{}: using '{}'", lib_name, c));
+      return c;
+    }
+  }
   for (const char* c : candidates) {
     void* h = ::dlopen(c, RTLD_NOW | RTLD_LOCAL);
     if (h) {

@@ -51,6 +51,15 @@ public:
     // reference image is left un-upscaled where the reference upscales it.
     int min_pixels     = 56 * 56;
     int max_pixels     = 28 * 28 * 1280;
+    // The VIDEO processor's own bounds, which are a different pair from
+    // the image ones in every checkpoint that ships both (MiniMax-H3:
+    // 65536 / 16777216 for images, 4096 / 25165824 for video). They also
+    // budget differently -- the frame count multiplies into the pixel
+    // total -- so a clip resized by the image rule is silently wrong
+    // rather than merely differently sized. Defaults are the
+    // Qwen3VLVideoProcessor signature's.
+    std::int64_t video_min_pixels = 128 * 128;
+    std::int64_t video_max_pixels = 16 * 16 * 2 * 2 * 2 * 6144;
     // When non-empty, the tower loads from this mmproj-*.gguf (llama.cpp
     // CLIP layout) instead of the safetensors `model_dir`. Same BF16/F32
     // weights, just CLIP tensor names + a split patch-embed conv.
@@ -92,6 +101,17 @@ public:
     int out_hidden = 0;
     int grid_h     = 0;
     int grid_w     = 0;
+    // Temporal grid cells: 1 for an image, `frames / temporal_patch` for
+    // a clip. The consumer needs it because Qwen3-VL labels a video ONE
+    // BLOCK PER CELL, so this is the number of `<|vision_start|>` runs
+    // the prompt has to carry, not a detail of the tensor's shape.
+    int grid_t     = 1;
+    // The element type of `embeddings` and `deepstack`, carried on the
+    // RESULT so a consumer that outlives the encoder handle (or holds
+    // results from several) does not have to ask a tower which one made
+    // this. Both types are two bytes, so a wrong guess reads plausible
+    // garbage rather than crashing.
+    bool is_bf16   = false;
     // Qwen3-VL deepstack features, one per config.deepstack_indexes entry
     // (in that order): native f16 [n_tokens * out_hidden]. Empty when the
     // tower has no deepstack mergers. Added to the LM hidden states at the
@@ -125,6 +145,21 @@ public:
   // Encode one RGB image: rgb is [3, H, W] U8 channel-first contiguous.
   Result encode(const std::uint8_t* rgb, int H, int W);
 
+  // Encode a CLIP: `rgb` is `n_frames` consecutive [3, H, W] U8 planes.
+  //
+  // Frames are merged in groups of `temporal_patch` (2), so a clip of
+  // 2n frames becomes n grid cells and each cell is one vision block in
+  // the prompt. An ODD count repeats the last frame, which is what the
+  // reference's processor does rather than dropping it -- so the caller
+  // gets ceil(n_frames / 2) cells either way and never silently loses
+  // the tail.
+  //
+  // The clip is resized by the VIDEO rule (Config::video_*_pixels), in
+  // which the frame count is part of the pixel budget: the same frames
+  // passed one at a time through encode() would land on a different
+  // canvas and produce different tokens.
+  Result encode_video(const std::uint8_t* rgb, int n_frames, int H, int W);
+
   const Config& config() const { return _cfg; }
   // The element type of Result::embeddings / deepstack (and of every weight
   // buffer). Reflects the A/B env overrides too, so it is the truth rather
@@ -139,6 +174,12 @@ public:
 
 private:
   MetalQwenVisionEncoder() = default;
+
+  // The one implementation behind encode() and encode_video().
+  // `n_frames == 1` is the image path: the single frame is tiled across
+  // the temporal patch, which is what the reference does too.
+  Result encode_(const std::uint8_t* rgb, int n_frames, int H, int W,
+                 bool video);
 
   struct Block {
     metal_compute::SharedBuffer n1w, n1b, qkvw, qkvb, ow, ob;

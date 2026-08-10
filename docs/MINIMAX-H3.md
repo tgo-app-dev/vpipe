@@ -184,6 +184,68 @@ anchored to it as the opening frame; add a second `vae-encode` on port 6 and
 the model interpolates between two stills. Both anchors must be encoded at
 the same resolution the clip is generated at.
 
+### Conditioning on references (Ref2VA)
+
+MiniMax-H3 ships a **second checkpoint**, `ref2va`, that conditions on a
+*list* of reference media instead of on keyframes: up to **9 images**, **3
+video clips** and **3 soundtracks**, twelve in total, and audio can never be
+the only kind. Images carry subject and style, clips carry motion and camera,
+soundtracks carry a voice or a piece of music.
+
+The two partitions are the same architecture and ship byte-identical
+transformer configs, so **nothing in the weights tells them apart** — vpipe
+reads it off the packaging. A Ref2VA checkpoint wired as if it were FL2VA is
+refused rather than run: it would load, denoise at full 33B cost, and generate
+video conditioned on nothing.
+
+Wire a **`video-ref-encoder`** stage:
+
+| | |
+| --- | --- |
+| port 0 in | the prompt |
+| port 1 in | the reference **list** |
+| port 0 out | conditioning → `generate-video` port 0 |
+| port 1 out | reference video rows → `generate-video` port **7** |
+| port 2 out | reference audio rows → `generate-video` port **8** |
+
+The list is one input rather than a port per reference because a request's
+shape is only known when it arrives — twelve `load-image` chains cannot
+express "three clips and nine stills" without the graph being rewritten per
+request. **The order is the request**: it numbers the references in the
+prompt the model reads (`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places
+them on a shared clock, so reordering the list is a different generation.
+
+```json
+[
+  {"kind": "image", "path": "subject.png"},
+  {"kind": "video", "path": "motion.mp4"},
+  {"kind": "audio", "path": "voice.wav"}
+]
+```
+
+`kind` may be left out and is read off the container. A video reference
+conditions on **its own soundtrack** unless it sets `"audio": false` — which
+is why the stage opens the file itself rather than taking frames from
+`load-video`: a clip and its audio have to come out of one container to stay
+in sync, and the file's **frame rate** has to survive the trip. MiniMax-H3
+resamples every reference onto its own 24 fps, so a rate lost on the way in
+is a generation conditioned at the wrong speed with nothing to complain
+about.
+
+Set the stage's `frames` to the **same value** as `generate-video`'s: it is
+the duration references are truncated to as well as the size of the sequence
+the transformer packs. They are checked against each other, not trusted.
+
+References never bind the generated geometry. An image is encoded at a short
+edge of its own (2048), with no area cap and upscaling included; a clip goes
+onto the same canvas rule as the target, resolved from *its* aspect ratio.
+Two references of different shapes land on different canvases, which is
+expected.
+
+This stage holds the prompt encoder, its vision tower and both VAEs while it
+runs, so on a memory-bounded box leave `unload_when_idle` at `auto` — the
+encoders are dropped before the denoise starts.
+
 ## Memory
 
 **16 GB is the floor, and it works** — but only because the two big models are
@@ -217,8 +279,9 @@ down gracefully — it exhausts it. Let a generation finish.
 
 **The model isn't in the picker.** `model-select`'s Browse list is filtered to
 families the stages can actually run. If a model you prepared is missing,
-check its registry `model_type` is `minimax-h3-fl2va`; you can always type the
-key or an absolute path instead.
+check its registry `model_type` is `minimax-h3-fl2va` or
+`minimax-h3-ref2va`; you can always type the key or an absolute path
+instead.
 
 **It generated video but the audio is silent or wrong.** Check that
 `save-video` has `enable_audio: true` and that `audio-vae-decode` is wired to

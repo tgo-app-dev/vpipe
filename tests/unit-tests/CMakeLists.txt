@@ -155,6 +155,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-vvae.cc
         minimax-h3-avae.cc
         minimax-h3-text-encoder.cc
+        minimax-h3-refenc.cc
         mage-vae.cc
         mage-dit.cc
         mage-cond.cc

@@ -11,8 +11,9 @@
 namespace vpipe {
 
 // Receives StreamParams headers + FrameRef beats on its input ports
-// and encodes them with H.264 (libx264 by default) and AAC (default
-// audio encoder), muxing into a container written to disk.
+// and encodes them with H.264 (h264_videotoolbox by default, falling
+// back to libx264 where VideoToolbox is absent) and AAC (default audio
+// encoder), muxing into a container written to disk.
 //
 // Sink stage; 0 output ports. Input port count is 1 or 2 depending on
 // `enable_video` / `enable_audio`. With both enabled, port 0 is video
@@ -37,7 +38,7 @@ namespace vpipe {
 //   format           (string, default "")     -- container; "" = inferred
 //   enable_video     (bool,   default true)
 //   enable_audio     (bool,   default true)
-//   video.codec      (string, default "libx264")
+//   video.codec      (string, default "h264_videotoolbox")
 //   video.bitrate    (int,    default 2000000)
 //   video.preset     (string, default "medium")
 //   video.crf        (int,    optional)       -- when present overrides bitrate

@@ -54,13 +54,24 @@ denoise(const DenoiseRequest& req, std::string* err)
   const auto& cfg = req.dit->config();
   const int PE   = cfg.video_patch_elems();
   const int AC   = cfg.audio_channels;
-  const int ncond = L.num_condition_rows;
+  // Conditioning rows lead each modality's buffer and are never
+  // stepped. Video has always had them (a keyframe anchor); AUDIO has
+  // them only in `ref2va`, where a reference soundtrack rides through
+  // at its own fixed level -- so the audio slice is offset the same way
+  // the video slice always was, rather than starting at row 0.
+  const int ncond = L.num_condition_video_rows;
   const int nvid  = L.num_video_rows;         // generated rows only
-  const int naud  = L.num_audio_rows;
+  const int ncaud = L.num_condition_audio_rows;
+  const int naud  = L.num_audio_rows;         // generated rows only
   const int vrows = (int)L.video_indices.size();
+  const int arows = (int)L.audio_indices.size();
   if (vrows != ncond + nvid) {
     return fail("denoise: layout video_indices does not match "
                 "condition + generated rows");
+  }
+  if (arows != ncaud + naud) {
+    return fail("denoise: layout audio_indices does not match "
+                "reference + generated rows");
   }
   if (nvid <= 0) { return fail("denoise: nothing to generate"); }
 
@@ -86,7 +97,10 @@ denoise(const DenoiseRequest& req, std::string* err)
   metal_compute::MetalCompute* mc = req.dit->metal_compute();
   if (mc == nullptr) { return fail("denoise: no metal-compute"); }
   SharedBuffer vb = mc->make_shared_buffer((std::size_t)vrows * PE * 2);
-  SharedBuffer ab = mc->make_shared_buffer((std::size_t)naud * AC * 2);
+  // Sized by the TOTAL audio rows, not the generated ones: a `ref2va`
+  // request hands in a reference block per soundtrack ahead of them,
+  // and the head writes every row it is given.
+  SharedBuffer ab = mc->make_shared_buffer((std::size_t)arows * AC * 2);
   if (vb.empty() || (naud > 0 && ab.empty())) {
     return fail("denoise: activation allocation failed");
   }
@@ -112,7 +126,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     const float tv = sv.timesteps()[(std::size_t)i];
     const float ta = sa.timesteps()[(std::size_t)i];
     const float tc = req.condition_timestep;
-    minimax_h3::build_row_timesteps(L, tv, ta, tc, &uniq, &row_idx);
+    minimax_h3::build_row_timesteps(L, tv, ta, tc, &uniq, &row_idx,
+                                    req.condition_audio_timestep);
 
     {
       auto* d = static_cast<std::uint16_t*>(vb.contents());
@@ -120,9 +135,13 @@ denoise(const DenoiseRequest& req, std::string* err)
         d[k] = f32_to_bf16_(req.video[k]);
       }
     }
-    if (naud > 0) {
+    if (arows > 0) {
+      // Every audio row, reference blocks included -- they are what the
+      // generated rows attend to. Uploading only the generated count
+      // would leave the tail of the buffer whatever the allocation had
+      // in it, which is how a reference request turns into NaN.
       auto* d = static_cast<std::uint16_t*>(ab.contents());
-      for (std::size_t k = 0; k < (std::size_t)naud * AC; ++k) {
+      for (std::size_t k = 0; k < (std::size_t)arows * AC; ++k) {
         d[k] = f32_to_bf16_(req.audio[k]);
       }
     }
@@ -188,7 +207,12 @@ denoise(const DenoiseRequest& req, std::string* err)
       xrms = vel.empty() ? 0.0 : std::sqrt(xrms / (double)vel.size());
     }
     if (naud > 0 && !v.audio.empty()) {
-      const auto* g = static_cast<const std::uint16_t*>(v.audio.contents());
+      // The head writes every audio row it was given, reference rows
+      // included; only the generated tail is stepped, so both the
+      // velocity and the state are read from `ncaud` on.
+      const auto* g = static_cast<const std::uint16_t*>(v.audio.contents()) +
+                      (std::size_t)ncaud * AC;
+      float* ax = req.audio + (std::size_t)ncaud * AC;
       std::vector<float> vel((std::size_t)naud * AC);
       for (std::size_t k = 0; k < vel.size(); ++k) {
         vel[k] = bf16_to_f32_(g[k]);
@@ -206,21 +230,21 @@ denoise(const DenoiseRequest& req, std::string* err)
       {
         double sxy = 0.0, sxx = 0.0;
         for (std::size_t k = 0; k < vel.size(); ++k) {
-          sxy += (double)vel[k] * (double)req.audio[k];
-          sxx += (double)req.audio[k] * (double)req.audio[k];
+          sxy += (double)vel[k] * (double)ax[k];
+          sxx += (double)ax[k] * (double)ax[k];
         }
         const double den =
             std::sqrt(sxx) * std::sqrt((double)vel.size()) * arms;
         axcorr = den > 0.0 ? sxy / den : 0.0;
       }
       const bool aok =
-          res_ms ? sa.step_res(vel.data(), i, req.audio, vel.size(), &aprev)
-                 : sa.step(vel.data(), i, req.audio, vel.size());
+          res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
+                 : sa.step(vel.data(), i, ax, vel.size());
       if (!aok) {
         return fail("denoise: audio step " + std::to_string(i) + " failed");
       }
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        xarms += (double)req.audio[k] * (double)req.audio[k];
+        xarms += (double)ax[k] * (double)ax[k];
       }
       xarms = vel.empty() ? 0.0 : std::sqrt(xarms / (double)vel.size());
     }

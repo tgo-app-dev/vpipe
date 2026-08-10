@@ -27,6 +27,7 @@ set(LOCAL_SOURCES
   audio-vae-decode-stage.cc
   vae-decode-stage.cc
   vae-encode-stage.cc
+  video-ref-encoder-stage.cc
   model-catalog.cc
   model-memory.cc
   model-detect.cc

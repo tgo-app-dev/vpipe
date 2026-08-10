@@ -136,6 +136,14 @@ if(VPIPE_SOURCES)
     )
     target_link_libraries(vpipe PRIVATE lmdb pugixml ${CMAKE_DL_LIBS}
                                         CURL::libcurl)
+    # On the compile line so that an FFmpeg major-version change
+    # rebuilds every TU, whatever the headers' mtimes claim. See the
+    # long note in cmake/find-ffmpeg.cmake: without this, a package
+    # upgrade can leave objects built against the previous ABI linked
+    # into the same library, which corrupts silently instead of
+    # failing. The value is never read by any code.
+    target_compile_definitions(vpipe PRIVATE
+        VPIPE_FFMPEG_ABI_TAG="${VPIPE_FFMPEG_ABI_TAG}")
     if(APPLE)
         # Security framework supplies CCRandomGenerateBytes; CoreFoundation
         # is brought in transitively by other Apple bits but link it

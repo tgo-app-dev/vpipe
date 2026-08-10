@@ -1128,7 +1128,8 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
    top so it doesn't stretch to a tall textarea (array path fields). */
 .field-input-row .btn.browse { flex: 0 0 auto; align-self: flex-start; }
 
-/* ---- File Browser view (2 : 3 : 3 tree / list / preview) ---- */
+/* ---- File Browser view (tree / list / preview, 2 : 3 : 3 by default,
+       redistributable by the two drag handles between them) ---- */
 
 .fb {
   display: flex; flex-direction: column;
@@ -1149,11 +1150,28 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 .fb-toolbar .fs-badge { flex: 0 0 auto; }
 .fb-tb-gap { flex: 1 1 6px; }
 
+/* The `fr` tracks are written inline by the view (restored from
+   localStorage, updated during a drag); this rule is the fallback for
+   the first paint and the width of the two fixed handle tracks. */
 .fb-body {
+  --fb-split-w: 6px;
   flex: 1 1 auto; min-height: 0; display: grid;
-  grid-template-columns: 2fr 3fr 3fr;
+  grid-template-columns: 2fr var(--fb-split-w) 3fr var(--fb-split-w) 3fr;
 }
 .fb-body > .pane { min-width: 0; min-height: 0; }
+/* Column divider. The pane's own right border is the rule; the handle
+   is the grab area beside it, so dragging does not double the line. */
+.fb-split {
+  position: relative; cursor: ew-resize;
+  background: var(--bg-1); touch-action: none; user-select: none;
+}
+.fb-split::after {
+  content: ''; position: absolute; left: 50%; top: 50%;
+  width: 2px; height: 28px; transform: translate(-50%, -50%);
+  background: var(--line); border-radius: 1px;
+}
+.fb-split:hover, .fb-split.dragging { background: var(--bg-2); }
+.fb-split:hover::after, .fb-split.dragging::after { background: var(--accent); }
 
 /* tree pane (lazy, expand-on-demand) */
 .fb-tree { padding: 4px 0; user-select: none; }
@@ -1200,15 +1218,39 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 }
 .fs-vrow-ph { color: var(--fg-dim); cursor: default; }
 .fs-vlist .fs-empty { flex: 1 1 auto; }
+/* The list takes focus so the arrow keys reach it; the highlighted row
+   is the visible cursor, so the container needs no ring of its own. */
+.fs-vlist:focus { outline: none; }
+/* Cursor WITHOUT selection -- only reachable where directories are not
+   selectable (the open/save dialog), so Right still has something to
+   step into. Where they are, .sel already marks the same row. */
+.fs-row.cur:not(.sel) {
+  outline: 1px solid var(--accent); outline-offset: -1px;
+}
 
 /* preview pane */
 .fb-preview { padding: 0; overflow: hidden;
               display: flex; flex-direction: column; }
+/* The shared preview component's own root, sitting between the pane and
+   the layout inside it. It has to pass the pane's height DOWN, which as
+   a plain block it did not: an auto-height containing block leaves the
+   inner's `height: 100%` resolving to auto, so every preview grew to its
+   CONTENT's full height and the pane's `overflow: hidden` cut it off --
+   a long image or a long text file losing its bottom with no scrollbar
+   to say so. (In the dialog the host sits in a fixed-height scroller
+   instead, where the flex properties are inert and nothing changes.) */
+.fb-preview-host {
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+}
 .fb-preview-empty {
   margin: auto; padding: 24px; text-align: center; color: var(--fg-dim);
   display: flex; flex-direction: column; align-items: center; gap: 10px;
 }
+/* Fills the host by FLEX; the height: 100% is what the dialog's
+   fixed-height scroller still uses, where flex properties are inert. */
 .fb-preview-inner {
+  flex: 1 1 auto;
   display: flex; flex-direction: column; min-height: 0; height: 100%;
   padding: 10px; gap: 8px;
 }
@@ -1252,12 +1294,25 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fb-media-wrap {
   flex: 1 1 auto; min-height: 0; display: flex;
-  align-items: center; justify-content: center;
   background: var(--bg); border: 1px solid var(--line);
-  border-radius: 4px; overflow: hidden;
+  border-radius: 4px; overflow: auto;
 }
-.fb-media-wrap.audio { flex: 0 0 auto; padding: 16px; }
-.fb-img, .fb-video { max-width: 100%; max-height: 100%; object-fit: contain; }
+.fb-media-wrap.audio { flex: 0 0 auto; padding: 16px; overflow: hidden;
+  align-items: center; justify-content: center; }
+/* Centred by AUTO MARGINS rather than by the container's align-items /
+   justify-content: a centred flex item is clipped at its START edge
+   once it overflows, so the top of a tall image would be unreachable
+   however far the pane is scrolled. Auto margins collapse to 0 on the
+   overflowing axis instead. */
+.fb-img, .fb-video { margin: auto; }
+/* Fit to WIDTH and keep the aspect ratio (never upscaling past the
+   file's own pixels). A long image then overflows downwards and the
+   wrap scrolls it, instead of being letterboxed to an unreadable strip
+   -- or, with the overflow hidden, cut off with nothing to say so. */
+.fb-img { max-width: 100%; height: auto; }
+/* The video keeps both caps: a player scrolled half out of view takes
+   its transport controls with it, which is worse than letterboxing. */
+.fb-video { max-width: 100%; max-height: 100%; object-fit: contain; }
 .fb-audio { width: 100%; }
 .fb-text {
   flex: 1 1 auto; min-height: 0; margin: 0; overflow: auto;

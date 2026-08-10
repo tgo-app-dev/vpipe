@@ -312,18 +312,90 @@ TEST(minimax_h3_comfy, detects_as_fl2va_and_records_the_format)
   EXPECT_TRUE(d.detected_by == "comfyui");
   EXPECT_TRUE(!d.outputs.empty());
 
-  // Ref2VA is a different packed layout that this tree does not
-  // implement. Tagging it would claim support we do not have, so it
-  // stays untagged -- and untagged is not the same as broken: it still
-  // registers as a directory.
+  // Ref2VA is the OTHER task over the same architecture, and the repack
+  // embeds nothing that tells them apart -- the config is byte-identical
+  // and so are all 535 tensor names and shapes. So the filename is the
+  // only signal, and getting it wrong is not a load failure: the wrong
+  // partition runs perfectly and conditions on nothing.
   const fs::path r2 = scratch_() / "detect-ref2va";
   fs::remove_all(r2, ec);
   write_component_(r2 / "diffusion_models" /
                        "minimax_h3_ref2va_bf16.safetensors",
                    "config", kH3Config);
-  EXPECT_TRUE(detect_model_dir(r2.string(), "").model_type.empty());
+  EXPECT_TRUE(detect_model_dir(r2.string(), "").model_type ==
+              "minimax-h3-ref2va");
+
+  // A `pruned` DiT is a different MODEL rather than a different packing
+  // of this one, so it stays untagged -- and untagged is not the same as
+  // broken: it still registers as a directory.
+  const fs::path pr = scratch_() / "detect-pruned";
+  fs::remove_all(pr, ec);
+  write_component_(pr / "diffusion_models" /
+                       "minimax_h3_ref2va_pruned_bf16.safetensors",
+                   "config", kH3Config);
+  EXPECT_TRUE(detect_model_dir(pr.string(), "").model_type.empty());
   fs::remove_all(root, ec);
   fs::remove_all(r2, ec);
+  fs::remove_all(pr, ec);
+}
+
+// model-quantize's output is repack-SHAPED but every component is a
+// DIRECTORY of shards, so neither the diffusers probe (which wants
+// `transformer/config.json`) nor the repack scan (which wants one
+// .safetensors per role) sees it -- both quantized H3 builds registered
+// as "type unknown" and no picker offered them.
+//
+// What makes it tellable is the partition the PRODUCER recorded, for the
+// same reason it records `qkv_per_head`: the filename that carried it is
+// gone, and the two partitions are byte-identical in every other
+// respect. Absent the key the root stays UNTAGGED rather than being
+// guessed -- guessing picks the wrong task, which loads and runs and
+// conditions on nothing.
+TEST(minimax_h3_comfy, a_quantized_repack_keeps_its_partition)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  auto build = [&](const fs::path& dir, const char* part) {
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "diffusion_models", ec);
+    fs::create_directories(dir / "vae", ec);
+    std::ofstream f(dir / "diffusion_models" / "config.json");
+    f << "{\"_class_name\": \"MiniMaxH3DiTModel\", \"hidden_size\": 5376, "
+         "\"num_attention_heads\": 56, \"attention_head_dim\": 128, "
+         "\"adaln_out_features\": 96768, \"final_adaln_out_features\": 10752, "
+         "\"qkv_per_head\": false";
+    if (part != nullptr) {
+      f << ", \"" << MetalMiniMaxH3Transformer::kPartitionKey << "\": \""
+        << part << "\"";
+    }
+    f << "}";
+  };
+
+  const fs::path r2 = scratch_() / "quant-ref2va";
+  build(r2, "ref2va");
+  EXPECT_TRUE(detect_model_dir(r2.string(), "").model_type ==
+              "minimax-h3-ref2va");
+  // The same reader the DiT loader uses has to agree, or the stage and
+  // the picker would disagree about what is resident.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(r2.string()) ==
+              "ref2va");
+
+  const fs::path fl = scratch_() / "quant-fl2va";
+  build(fl, "fl2va");
+  EXPECT_TRUE(detect_model_dir(fl.string(), "").model_type ==
+              "minimax-h3-fl2va");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(fl.string()) ==
+              "fl2va");
+
+  // No key: untagged, NOT guessed.
+  const fs::path un = scratch_() / "quant-untagged";
+  build(un, nullptr);
+  EXPECT_TRUE(detect_model_dir(un.string(), "").model_type.empty());
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(un.string()).empty());
+
+  fs::remove_all(r2, ec);
+  fs::remove_all(fl, ec);
+  fs::remove_all(un, ec);
 }
 
 // A checkpoint DERIVED from the repack -- model-quantize's output. It is

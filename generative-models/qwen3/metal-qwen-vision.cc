@@ -104,6 +104,35 @@ smart_resize_(int h, int w, int factor, int min_px, int max_px,
   *oh = hb;
   *ow = wb;
 }
+// The VIDEO twin, which is not the same function with different bounds.
+//
+// Qwen3-VL's video processor budgets `t_bar * h_bar * w_bar` against
+// max_pixels -- the frame count is IN the budget, so a longer clip is
+// resized smaller -- and it rounds the edges before testing rather than
+// clamping each one to `factor` afterwards. Reusing the image rule here
+// gives a canvas that is merely plausible: it loads, it runs, and every
+// vision token is computed from the wrong pixels.
+void
+smart_resize_video_(int frames, int h, int w, int factor, int temporal_factor,
+                    std::int64_t min_px, std::int64_t max_px, int* oh, int* ow)
+{
+  int hb = (int)std::round((double)h / factor) * factor;
+  int wb = (int)std::round((double)w / factor) * factor;
+  const int tb =
+      ((frames + temporal_factor - 1) / temporal_factor) * temporal_factor;
+  const std::int64_t budget = (std::int64_t)tb * hb * wb;
+  if (budget > max_px) {
+    const double beta = std::sqrt(((double)frames * h * w) / (double)max_px);
+    hb = std::max(factor, (int)std::floor(h / beta / factor) * factor);
+    wb = std::max(factor, (int)std::floor(w / beta / factor) * factor);
+  } else if (budget < min_px) {
+    const double beta = std::sqrt((double)min_px / ((double)frames * h * w));
+    hb = (int)std::ceil(h * beta / factor) * factor;
+    wb = (int)std::ceil(w * beta / factor) * factor;
+  }
+  *oh = std::max(factor, hb);
+  *ow = std::max(factor, wb);
+}
 // Bilinear resize + per-channel normalize, U8 [3,H,W] -> f32 [3,th,tw].
 void
 preprocess_(const std::uint8_t* rgb, int H, int W, int th, int tw,
@@ -555,6 +584,21 @@ MetalQwenVisionEncoder::config_from(const ModelConfig& c)
 MetalQwenVisionEncoder::Result
 MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 {
+  return encode_(rgb, 1, H, W, false);
+}
+
+MetalQwenVisionEncoder::Result
+MetalQwenVisionEncoder::encode_video(const std::uint8_t* rgb, int n_frames,
+                                     int H, int W)
+{
+  if (n_frames <= 0) { return {}; }
+  return encode_(rgb, n_frames, H, W, true);
+}
+
+MetalQwenVisionEncoder::Result
+MetalQwenVisionEncoder::encode_(const std::uint8_t* rgb, int n_frames, int H,
+                                int W, bool video)
+{
   // Record this GPU ViT pass on the profiler's LLM lane (vision-tower
   // category) so it's categorized like the MLX and CoreML towers. When
   // no CoreML model is configured the vision tower runs here on the GPU;
@@ -580,35 +624,62 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 
   const int factor = P * S;
   int th, tw;
-  smart_resize_(H, W, factor, c.min_pixels, c.max_pixels, &th, &tw);
+  if (video) {
+    smart_resize_video_(n_frames, H, W, factor, T, c.video_min_pixels,
+                        c.video_max_pixels, &th, &tw);
+  } else {
+    smart_resize_(H, W, factor, c.min_pixels, c.max_pixels, &th, &tw);
+  }
   const int grid_h = th / P, grid_w = tw / P;
-  const int mh = grid_h / S, mw = grid_w / S;
-  const int n_patches = grid_h * grid_w;
-  const int n_im = mh * mw;
+  const int mw = grid_w / S;
+  // An image tiles its one frame across the temporal patch; a clip
+  // merges consecutive frames in groups of T, repeating the last one
+  // when the count does not divide.
+  const int grid_t = video ? (n_frames + T - 1) / T : 1;
+  const int per_cell = grid_h * grid_w;
+  const int n_patches = grid_t * per_cell;
+  const int n_im = n_patches / (S * S);
   res.n_tokens = n_im;
   res.grid_h = grid_h;
   res.grid_w = grid_w;
+  res.grid_t = grid_t;
+  res.is_bf16 = _bf16;
 
-  std::vector<float> px((std::size_t)3 * th * tw);
-  preprocess_(rgb, H, W, th, tw, c.image_mean, c.image_std, px.data());
-
-  // Patchify in merger order ([mh,mw,S,S]) with channels-last [T,P,P,c]
-  // inner layout, still image tiled across the temporal axis.
-  std::vector<std::uint16_t> feat((std::size_t)n_patches * _feat_dim);
+  // Every frame is resized onto the SAME canvas, so the per-frame planes
+  // are contiguous and the patchify below indexes them by frame.
+  const int n_src = video ? n_frames : 1;
   const int plane = th * tw;
+  std::vector<float> px((std::size_t)3 * plane * n_src);
+  for (int f = 0; f < n_src; ++f) {
+    preprocess_(rgb + (std::size_t)f * 3 * H * W, H, W, th, tw, c.image_mean,
+                c.image_std, px.data() + (std::size_t)f * 3 * plane);
+  }
+
+  // Patchify in merger order ([grid_t, mh, mw, S, S]) with channels-last
+  // [T,P,P,c] inner layout. The temporal cell is the OUTERMOST axis,
+  // which is what makes each cell's tokens a contiguous run and so one
+  // labelled vision block in the prompt.
+  std::vector<std::uint16_t> feat((std::size_t)n_patches * _feat_dim);
   for (int m = 0; m < n_patches; ++m) {
-    int bi = m / (mw * S * S), rem = m % (mw * S * S);
+    const int tg = m / per_cell;
+    int rem0 = m % per_cell;
+    int bi = rem0 / (mw * S * S), rem = rem0 % (mw * S * S);
     int bj = rem / (S * S), rem2 = rem % (S * S);
     int ii = rem2 / S, jj = rem2 % S;
     const int gi = bi * S + ii, gj = bj * S + jj;
     std::uint16_t* fp = feat.data() + (std::size_t)m * _feat_dim;
     int o = 0;
     for (int t = 0; t < T; ++t) {
+      // The image path reads its single frame for every t (index 0);
+      // the video path reads frame tg*T + t, clamped so an odd count
+      // repeats the last rather than running off the end.
+      const int f = video ? std::min(tg * T + t, n_frames - 1) : 0;
+      const float* fpx = px.data() + (std::size_t)f * 3 * plane;
       for (int ph = 0; ph < P; ++ph) {
         for (int pw = 0; pw < P; ++pw) {
           const int yy = gi * P + ph, xx = gj * P + pw;
           for (int ch = 0; ch < 3; ++ch) {
-            fp[o++] = enc_elt_(px[(std::size_t)ch * plane + yy * tw + xx],
+            fp[o++] = enc_elt_(fpx[(std::size_t)ch * plane + yy * tw + xx],
                                _bf16);
           }
         }
@@ -624,8 +695,13 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
   std::vector<std::uint16_t> cosb((std::size_t)n_patches * hd),
       sinb((std::size_t)n_patches * hd);
   const int hd4 = hd / 4;
+  // Both the position table and the 2D rope are functions of (row, col)
+  // ALONE -- Qwen3-VL's ViT gives every temporal cell the same spatial
+  // grid and lets full attention carry the time relationship -- so each
+  // cell repeats the first cell's values.
   for (int m = 0; m < n_patches; ++m) {
-    int bi = m / (mw * S * S), rem = m % (mw * S * S);
+    int rem0 = m % per_cell;
+    int bi = rem0 / (mw * S * S), rem = rem0 % (mw * S * S);
     int bj = rem / (S * S), rem2 = rem % (S * S);
     int ii = rem2 / S, jj = rem2 % S;
     const int row = bi * S + ii, col = bj * S + jj;
@@ -832,12 +908,13 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     // never sees a padded buffer it would misread (the head-major scratch is
     // allocated at the padded width either way -- a harmless superset).
     int pad_d = _attn_pad_d;
-    auto transpose = [&](const SharedBuffer& in, const SharedBuffer& out,
+    auto transpose = [&](const SharedBuffer& in, std::size_t in_off,
+                         const SharedBuffer& out, std::size_t out_off,
                          int A, int Bd) {
       if (pad_d > 0) {
         enc.set_function(_fn_tr_pad);
-        enc.set_buffer(0, in);
-        enc.set_buffer(1, out);
+        enc.set_buffer(0, in, in_off * 2);
+        enc.set_buffer(1, out, out_off * 2);
         enc.set_constant(2, A);
         enc.set_constant(3, Bd);
         enc.set_constant(4, hd);
@@ -847,20 +924,21 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
         return;
       }
       enc.set_function(_fn_transpose);
-      enc.set_buffer(0, in);
-      enc.set_buffer(1, out);
+      enc.set_buffer(0, in, in_off * 2);
+      enc.set_buffer(1, out, out_off * 2);
       enc.set_constant(2, A);
       enc.set_constant(3, Bd);
       enc.set_constant(4, hd);
       enc.dispatch({(unsigned)hd, (unsigned)Bd, (unsigned)A}, {(unsigned)hd, 1, 1});
     };
     // The inverse: [heads, n, ahd] -> [n, heads, hd], dropping the pad tail.
-    auto untranspose = [&](const SharedBuffer& in, const SharedBuffer& out,
+    auto untranspose = [&](const SharedBuffer& in, std::size_t in_off,
+                           const SharedBuffer& out, std::size_t out_off,
                            int A, int Bd) {
       if (pad_d > 0) {
         enc.set_function(_fn_tr_unpad);
-        enc.set_buffer(0, in);
-        enc.set_buffer(1, out);
+        enc.set_buffer(0, in, in_off * 2);
+        enc.set_buffer(1, out, out_off * 2);
         enc.set_constant(2, A);
         enc.set_constant(3, Bd);
         enc.set_constant(4, hd);
@@ -869,7 +947,7 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
                      {(unsigned)hd, 1, 1});
         return;
       }
-      transpose(in, out, A, Bd);
+      transpose(in, in_off, out, out_off, A, Bd);
     };
     auto residual = [&](const SharedBuffer& a, const SharedBuffer& b,
                         const SharedBuffer& out, int nn) {
@@ -899,6 +977,18 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     const bool attn_nax = _use_attn_nax && _lib_attn_nax.valid();
     const int a_bq = attn_nax ? 64 : 32;
     const int a_bk = attn_nax ? 32 : 16;
+    // The ViT's attention does NOT span temporal cells. The reference
+    // passes `cu_seqlens = repeat_interleave(h*w, t)`, i.e. one segment
+    // per cell, so a clip is `grid_t` independent attentions over
+    // `per_cell` patches -- not one attention over all of them. Running
+    // it as one produces tokens that look entirely reasonable and are
+    // wrong from the second cell on (MEASURED: rel-L2 0.79 vs 0.06 for
+    // the same tower on a single cell).
+    //
+    // Every cell is the same length, so the steel parameter block and
+    // the grid below are built ONCE at the segment length and the cells
+    // differ only by a buffer offset.
+    const int attn_len = per_cell;
     metal_compute::ComputeFunction fn_steel;
     // Every stride below is in the ATTENTION width (ahd): when padding, the
     // head-major buffers really are [heads, n, 128]. Only `scale` keeps the
@@ -911,16 +1001,16 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     if ((attn_nax || _lib_attn.valid()) && steel_bd_ok &&
         !_attn_params.empty()) {
       auto* p = static_cast<SteelAttnParams*>(_attn_params.contents());
-      p->B = 1; p->H = heads; p->D = ahd; p->qL = n_patches; p->kL = n_patches;
+      p->B = 1; p->H = heads; p->D = ahd; p->qL = attn_len; p->kL = attn_len;
       p->gqa_factor = 1; p->scale = scale;
-      p->NQ = (n_patches + a_bq - 1) / a_bq;
-      p->NK = (n_patches + a_bk - 1) / a_bk;
-      p->NQ_aligned = n_patches / a_bq; p->NK_aligned = n_patches / a_bk;
-      p->qL_rem = n_patches - p->NQ_aligned * a_bq;
-      p->kL_rem = n_patches - p->NK_aligned * a_bk;
+      p->NQ = (attn_len + a_bq - 1) / a_bq;
+      p->NK = (attn_len + a_bk - 1) / a_bk;
+      p->NQ_aligned = attn_len / a_bq; p->NK_aligned = attn_len / a_bk;
+      p->qL_rem = attn_len - p->NQ_aligned * a_bq;
+      p->kL_rem = attn_len - p->NK_aligned * a_bk;
       p->qL_off = 0;
-      p->Q_strides[0] = (std::int64_t)heads * n_patches * ahd;
-      p->Q_strides[1] = (std::int64_t)n_patches * ahd; p->Q_strides[2] = ahd;
+      p->Q_strides[0] = (std::int64_t)heads * attn_len * ahd;
+      p->Q_strides[1] = (std::int64_t)attn_len * ahd; p->Q_strides[2] = ahd;
       p->K_strides[0] = p->Q_strides[0];
       p->K_strides[1] = p->Q_strides[1]; p->K_strides[2] = ahd;
       p->V_strides[0] = p->Q_strides[0];
@@ -928,8 +1018,8 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       p->O_strides[0] = p->Q_strides[0];
       p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = ahd;
       metal_compute::FunctionConstants fc;
-      fc.set_bool(200, (n_patches % a_bq) == 0)
-          .set_bool(201, (n_patches % a_bk) == 0)
+      fc.set_bool(200, (attn_len % a_bq) == 0)
+          .set_bool(201, (attn_len % a_bk) == 0)
           .set_bool(300, false).set_bool(301, false).set_bool(302, false);
       const std::string bd = "_h_bd" + std::to_string(ahd)
                              + (_bf16 ? "_bf16" : "");
@@ -943,7 +1033,7 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
     // downstream proj/MLP GPU work is unchanged, so the wall-time delta is the
     // attention kernel). NOT a correct forward -- profiling use only.
     const bool skip_attn = std::getenv("VPIPE_VISION_SKIP_ATTN") != nullptr;
-    const unsigned nqb = (unsigned)((n_patches + a_bq - 1) / a_bq);
+    const unsigned nqb = (unsigned)((attn_len + a_bq - 1) / a_bq);
 
     for (int b = 0; b < c.depth; ++b) {
       Block& blk = _blocks[b];
@@ -968,61 +1058,72 @@ MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
       // The matrix-core attn reads qr/kr/v3 straight from [n,heads,hd] and
       // writes att in the same layout -- only the steel/scalar fallback needs
       // the head-major transposes.
-      if (!_use_mma2_attn) {
-        // [n,heads,hd] -> [heads,n,ahd], zero-filling [hd, ahd) when padding.
-        transpose(qr, qt, n_patches, heads);
-        transpose(kr, kt, n_patches, heads);
-        transpose(v3, vt, n_patches, heads);
-      }
-      if (skip_attn) {
-        // probe: leave atb/att untouched (no attention compute)
-      } else if (_use_mma2_attn) {
-        // Matrix-core (matmul2d) non-causal flash attention, head_dim 64.
-        // Reads q/k/v in [n,heads,hd] and writes att in [n,heads,hd] (no
-        // transposes); full MHA (Hkv==Hq).
-        enc.set_function(_fn_sdpa_mma_d64);
-        enc.set_buffer(0, qr);
-        enc.set_buffer(1, kr);
-        enc.set_buffer(2, v3);
-        enc.set_buffer(3, att);
-        enc.set_constant(4, scale);
-        enc.set_constant(5, n_patches);   // T_kv
-        enc.set_constant(6, hd);          // D (== 64)
-        enc.set_constant(7, heads);       // Hq
-        enc.set_constant(8, heads);       // Hkv (full MHA)
-        enc.set_constant(9, n_patches);   // n_q
-        enc.set_constant(10, 0);          // q_offset
-        enc.set_constant(11, n_patches);  // (unused)
-        enc.dispatch({128, (unsigned)heads, (unsigned)((n_patches + 31) / 32)},
-                     {128, 1, 1});
-      } else if (use_steel) {
-        // Steel MMA flash attention: Q/K/V/O all [heads, n_patches, hd].
-        enc.set_function(fn_steel);
-        enc.set_buffer(0, qt);
-        enc.set_buffer(1, kt);
-        enc.set_buffer(2, vt);
-        enc.set_buffer(3, atb);
-        enc.set_buffer(4, _attn_params);
-        enc.dispatch({32 * nqb, 4 * (unsigned)heads, 1}, {32, 4, 1});
-      } else {
-        enc.set_function(_fn_sdpa_full);
-        enc.set_buffer(0, qt);
-        enc.set_buffer(1, kt);
-        enc.set_buffer(2, vt);
-        enc.set_buffer(3, atb);
-        enc.set_constant(4, scale);
-        enc.set_constant(5, n_patches);   // T_kv
-        enc.set_constant(6, hd);
-        enc.set_constant(7, heads);
-        enc.set_constant(8, heads);
-        enc.set_constant(9, n_patches);   // n_q
-        enc.set_constant(10, n_patches);  // kv_stride
-        enc.dispatch({32, (unsigned)heads, (unsigned)n_patches}, {32, 1, 1});
-      }
-      // Fallback attn output is head-major [heads,n,hd]; transpose back to
-      // [n,heads,hd] for proj. The matrix-core attn already wrote att directly.
-      if (!_use_mma2_attn && !skip_attn) {
-        untranspose(atb, att, heads, n_patches);
+      // One attention per temporal cell. `grid_t == 1` for an image, so
+      // this is a single pass and the offsets are all zero.
+      for (int cell = 0; cell < grid_t; ++cell) {
+        // Token-major buffers (qr/kr/v3/att) advance a whole cell of
+        // patches; the head-major scratch is laid out per cell, so each
+        // cell's [heads, attn_len, ahd] block is contiguous.
+        const std::size_t tok = (std::size_t)cell * attn_len * heads * hd;
+        const std::size_t hmj = (std::size_t)cell * heads * attn_len * ahd;
+        if (!_use_mma2_attn) {
+          // [n,heads,hd] -> [heads,n,ahd], zero-filling [hd, ahd) when
+          // padding.
+          transpose(qr, tok, qt, hmj, attn_len, heads);
+          transpose(kr, tok, kt, hmj, attn_len, heads);
+          transpose(v3, tok, vt, hmj, attn_len, heads);
+        }
+        if (skip_attn) {
+          // probe: leave atb/att untouched (no attention compute)
+        } else if (_use_mma2_attn) {
+          // Matrix-core (matmul2d) non-causal flash attention, head_dim
+          // 64. Reads q/k/v in [n,heads,hd] and writes att in the same
+          // layout (no transposes); full MHA (Hkv==Hq).
+          enc.set_function(_fn_sdpa_mma_d64);
+          enc.set_buffer(0, qr, tok * 2);
+          enc.set_buffer(1, kr, tok * 2);
+          enc.set_buffer(2, v3, tok * 2);
+          enc.set_buffer(3, att, tok * 2);
+          enc.set_constant(4, scale);
+          enc.set_constant(5, attn_len);   // T_kv
+          enc.set_constant(6, hd);         // D (== 64)
+          enc.set_constant(7, heads);      // Hq
+          enc.set_constant(8, heads);      // Hkv (full MHA)
+          enc.set_constant(9, attn_len);   // n_q
+          enc.set_constant(10, 0);         // q_offset
+          enc.set_constant(11, attn_len);  // (unused)
+          enc.dispatch({128, (unsigned)heads,
+                        (unsigned)((attn_len + 31) / 32)}, {128, 1, 1});
+        } else if (use_steel) {
+          // Steel MMA flash attention: Q/K/V/O all [heads, attn_len, hd].
+          enc.set_function(fn_steel);
+          enc.set_buffer(0, qt, hmj * 2);
+          enc.set_buffer(1, kt, hmj * 2);
+          enc.set_buffer(2, vt, hmj * 2);
+          enc.set_buffer(3, atb, hmj * 2);
+          enc.set_buffer(4, _attn_params);
+          enc.dispatch({32 * nqb, 4 * (unsigned)heads, 1}, {32, 4, 1});
+        } else {
+          enc.set_function(_fn_sdpa_full);
+          enc.set_buffer(0, qt, hmj * 2);
+          enc.set_buffer(1, kt, hmj * 2);
+          enc.set_buffer(2, vt, hmj * 2);
+          enc.set_buffer(3, atb, hmj * 2);
+          enc.set_constant(4, scale);
+          enc.set_constant(5, attn_len);   // T_kv
+          enc.set_constant(6, hd);
+          enc.set_constant(7, heads);
+          enc.set_constant(8, heads);
+          enc.set_constant(9, attn_len);   // n_q
+          enc.set_constant(10, attn_len);  // kv_stride
+          enc.dispatch({32, (unsigned)heads, (unsigned)attn_len}, {32, 1, 1});
+        }
+        // Fallback attn output is head-major [heads,n,hd]; transpose back
+        // to [n,heads,hd] for proj. The matrix-core attn already wrote
+        // att directly.
+        if (!_use_mma2_attn && !skip_attn) {
+          untranspose(atb, hmj, att, tok, heads, attn_len);
+        }
       }
       if (t0) { tap("10_attn", att, nh); }
       gemm(att, blk.ow, blk.ob, proj, n_patches, hidden, hidden);

@@ -1021,10 +1021,10 @@ model_catalog()
     // Only the bf16 / fp16 / fp32 files are pinned, which is why `files`
     // is a whitelist rather than "fetch the repo": the same repo holds
     // 341.5 GB more in int8_convrot / fp8_scaled / nvfp4_awq packings
-    // this build does not read, in `pruned` DiTs (a different model, not
-    // a different packing of this one), and in the Ref2VA partition,
-    // whose packed layout this tree does not implement. Same reason the
-    // GGUF entries pin one quant instead of taking the whole repo.
+    // this build does not read and in `pruned` DiTs (a different model,
+    // not a different packing of this one). Same reason the GGUF
+    // entries pin one quant instead of taking the whole repo. The
+    // Ref2VA partition is its own entry below.
     {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "33B",
      .variant = "bf16/fp16 single-file (Comfy-Org)",
      .hf_path = "Comfy-Org/MiniMax-H3",
@@ -1047,6 +1047,38 @@ model_catalog()
            .dest = "tokenizer/tokenizer.json"},
           {.repo = "MiniMaxAI/MiniMax-H3",
            .file = "FL2VA/tokenizer/tokenizer_config.json",
+           .dest = "tokenizer/tokenizer_config.json"}},
+     .weight_format = "comfyui",
+     .needs_tokenizer_json = false},
+    // The Ref2VA partition: the OTHER half of MiniMax-H3.
+    //
+    // Same architecture as FL2VA down to the byte -- 535 tensors, same
+    // names, same shapes, same embedded config -- and different WEIGHTS,
+    // trained for a different task: text plus up to 9 reference images,
+    // 3 video clips and 3 audio clips (12 files in total, and audio
+    // never on its own), each packed as its own block ahead of the
+    // generated rows.
+    //
+    // It shares this repo's encoder and both VAEs with the entry above,
+    // so a checkout that already has FL2VA pays only for the 66 GB DiT;
+    // the fetcher skips files it already holds. Only the DiT is pinned
+    // here for that reason -- the shared components are not repeated.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "33B",
+     .variant = "bf16 single-file (Comfy-Org)",
+     .hf_path = "Comfy-Org/MiniMax-H3",
+     .model_type = "minimax-h3-ref2va",
+     .inputs = {"text", "image", "video", "audio"},
+     .outputs = {"video", "audio"},
+     .files = {"diffusion_models/minimax_h3_ref2va_bf16.safetensors",
+               "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+               "vae/minimax_h3_video_vae_fp16.safetensors",
+               "vae/minimax_h3_audio_vae_fp32.safetensors"},
+     .companion_files =
+         {{.repo = "MiniMaxAI/MiniMax-H3",
+           .file = "Ref2VA/tokenizer/tokenizer.json",
+           .dest = "tokenizer/tokenizer.json"},
+          {.repo = "MiniMaxAI/MiniMax-H3",
+           .file = "Ref2VA/tokenizer/tokenizer_config.json",
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
      .needs_tokenizer_json = false},

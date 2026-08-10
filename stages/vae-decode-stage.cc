@@ -78,7 +78,7 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va"},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on each decoded VIDEO frame's sideband when the "
           "latent does not carry one. Wan latents from generate-video do, so "

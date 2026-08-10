@@ -22,6 +22,7 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/wan/metal-wan-vae.h"
 #include "stages/generate-video-stage.h"
+#include "stages/video-ref-encoder-stage.h"
 #endif
 
 #include <cstdint>
@@ -339,12 +340,15 @@ TEST(generate_video, family_generic_surface)
     if (std::string(p.name) == "audio_latent") { has_audio = true; }
   }
   EXPECT_TRUE(has_audio);
-  // And the wan-side ports are all still there, with the h3 last-frame
-  // anchor appended: the five wan ports keep their INDICES, which is what
-  // lets a graph written for wan keep working unedited.
-  EXPECT_TRUE(sp.iports.size() == 7);
+  // And the wan-side ports are all still there, with the h3 anchors and
+  // then the Ref2VA reference rows appended: the five wan ports keep
+  // their INDICES, which is what lets a graph written for wan keep
+  // working unedited.
+  EXPECT_TRUE(sp.iports.size() == 9);
   EXPECT_TRUE(std::string(sp.iports[5].name) == "ref_latent0");
   EXPECT_TRUE(std::string(sp.iports[6].name) == "ref_latent1");
+  EXPECT_TRUE(std::string(sp.iports[7].name) == "ref_video_rows");
+  EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_audio_rows");
 
   bool has_shift = false, has_audio_secs = false;
   for (const auto& k : sp.attrs) {
@@ -352,6 +356,73 @@ TEST(generate_video, family_generic_surface)
     if (std::string(k.key) == "audio_seconds") { has_audio_secs = true; }
   }
   EXPECT_TRUE(has_shift && has_audio_secs);
+}
+
+// The ref2va half of the split: a `video-ref-encoder` feeding
+// generate-video's reference-row ports.
+//
+// What this pins is the SHAPE OF THE SEAM, which is the decision that
+// would be expensive to walk back: a ref2va request carries a VARIABLE
+// list of up to twelve heterogeneous references, so the list is one
+// FlexData input rather than a port per reference -- twelve load-image /
+// vae-encode chains cannot express "three clips and nine stills" without
+// the graph being re-authored per request. Everything downstream of that
+// (the latents' ragged geometry collapsing into rows, the plan riding on
+// the conditioning's sideband) follows from it.
+TEST(video_ref_encoder, request_surface)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("frames", FlexData::make_int(121));
+  auto s = make_unique<VideoRefEncoderStage>(&sess, "vre", vector<InEdge>{},
+                                             cfg);
+  // Deferred-validated: no hf_dir is not a construction error, because a
+  // model-select source on the model iport can supply one.
+  EXPECT_TRUE(s->config_error().empty());
+  EXPECT_TRUE(s->requests_encoded() == 0);
+
+  const StageSpec& sp = s->spec();
+  EXPECT_TRUE(std::string(sp.type_name) == "video-ref-encoder");
+  // The list is ONE input. If this ever grows a port per reference, the
+  // stage has stopped being able to serve a request whose shape is only
+  // known at run time.
+  EXPECT_TRUE(sp.iports.size() == 3);
+  EXPECT_TRUE(std::string(sp.iports[0].name) == "prompt");
+  EXPECT_TRUE(std::string(sp.iports[1].name) == "references");
+  EXPECT_TRUE(std::string(sp.iports[2].name) == "model");
+
+  // Three outputs, and the pairing with generate-video is by NAME:
+  // conditioning -> its iport0 (the same contract diffusion-conditioner
+  // emits, so either can drive it), and the two row ports -> iport7/8.
+  EXPECT_TRUE(sp.oports.size() == 3);
+  EXPECT_TRUE(std::string(sp.oports[0].name) == "conditioning");
+  EXPECT_TRUE(std::string(sp.oports[1].name) == "ref_video");
+  EXPECT_TRUE(std::string(sp.oports[2].name) == "ref_audio");
+
+  auto dit = make_unique<GenerateVideoStage>(&sess, "gv", vector<InEdge>{},
+                                             FlexData::make_object());
+  const StageSpec& dsp = dit->spec();
+  EXPECT_TRUE(std::string(dsp.iports[0].name) == "conditioning");
+  EXPECT_TRUE(dsp.iports[0].type == sp.oports[0].type);
+  EXPECT_TRUE(dsp.iports[7].type == sp.oports[1].type);
+  EXPECT_TRUE(dsp.iports[8].type == sp.oports[2].type);
+
+  // `frames` is duplicated on both stages on purpose -- it is the
+  // duration every reference is truncated to AND the size of the layout
+  // the DiT builds -- so it has to be a key here, and generate-video
+  // checks the two agree rather than trusting them.
+  bool has_frames = false, has_short_edge = false, has_sample_fps = false;
+  for (const auto& k : sp.attrs) {
+    if (std::string(k.key) == "frames") { has_frames = true; }
+    if (std::string(k.key) == "reference_image_short_edge") {
+      has_short_edge = true;
+    }
+    if (std::string(k.key) == "video_sample_fps") { has_sample_fps = true; }
+  }
+  EXPECT_TRUE(has_frames && has_short_edge && has_sample_fps);
+  std::printf("[video_ref_encoder] %zu iports / %zu oports; the reference "
+              "LIST is one input, not a port per reference\n",
+              sp.iports.size(), sp.oports.size());
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
