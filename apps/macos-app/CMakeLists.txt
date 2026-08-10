@@ -124,14 +124,17 @@ endif()
 # it swiftc treats a file named main-ish as a script and the attribute
 # is rejected.
 #
-# The deployment target is 13.0 (Ventura): MenuBarExtra needs it, and it
-# is old enough to cover every Mac that can run the Apple-Silicon
-# inference path anyway.
+# The deployment target comes from CMAKE_OSX_DEPLOYMENT_TARGET, the same
+# value the C++ side uses and the same one written into
+# LSMinimumSystemVersion. Three places that must agree, one source: they
+# HAVE disagreed, and a bundle whose plist promises an older macOS than
+# its binaries accept fails at spawn time with a dyld error, not at
+# launch with a clear message.
 add_custom_command(
     OUTPUT ${VPIPE_APP_SWIFT_EXE}
     COMMAND ${VPIPE_SWIFTC}
             -O
-            -target arm64-apple-macos13.0
+            -target arm64-apple-macos${CMAKE_OSX_DEPLOYMENT_TARGET}
             -sdk ${VPIPE_MACOS_SDK}
             -parse-as-library
             -module-name VpipeApp

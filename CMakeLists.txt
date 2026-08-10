@@ -1,4 +1,35 @@
 cmake_minimum_required(VERSION 3.25)
+
+# Minimum macOS. Must be set BEFORE project(), which is when the
+# compiler is probed and the value baked into every object.
+#
+# Set to 26.0 DELIBERATELY, and it is not the floor the code imposes.
+# The tree compiles and its tests pass at 13.3 (MEASURED: 482 tests
+# across 60 suites). What has not been done is running it on a machine
+# older than the build host -- availability annotations catch API
+# misuse at compile time, not whatever the Metal and CoreML paths do at
+# run time on an older OS. Advertising support nobody has exercised is
+# a promise this cannot keep, so the claim stays at the version we
+# actually test on until someone can try a real older Mac. Lowering it
+# is this one line.
+#
+# When lowering, 13.3 is the true floor, not 13.0, and the .3 is
+# load-bearing: std::to_chars for FLOATING-POINT types arrived in macOS
+# 13.3 and libc++'s std::format uses it to format doubles, which vpipe
+# does everywhere. std::from_chars for floating point is worse still --
+# unavailable before macOS 26 -- which is why common/flex-data.cc parses
+# doubles with strtod_l on Apple rather than from_chars.
+#
+# Leaving it UNSET is the one thing that must not happen: clang then
+# targets the build host, which shipped binaries stamped minos 26.0
+# inside a bundle whose Info.plist advertised 13.0. Those run only on
+# the machine that built them, and fail at helper-spawn time with a
+# dyld error rather than anything that names the cause.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING
+        "Minimum macOS version the binaries support")
+endif()
+
 project(vpipe VERSION 0.1 LANGUAGES CXX C)
 
 # Default to an optimized build so a plain `cmake -S . -B build` yields peak

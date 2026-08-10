@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <charconv>
+#include <clocale>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 #include <istream>
 #include <limits>
 #include <ostream>
@@ -1124,6 +1130,73 @@ private:
     throw FlexData::ParseError(_line, _col, msg);
   }
 
+  // Parse the WHOLE of `s` as a double. True on success.
+  //
+  // std::from_chars would be the obvious tool, and is what the integer
+  // path above still uses -- but libc++ marks the FLOATING-POINT
+  // overloads as introduced in macOS 26.0, and vpipe targets 13.3. So
+  // Apple takes strtod_l instead; every other platform keeps the
+  // standard path (glibc's from_chars for double has been complete for
+  // years).
+  //
+  // strtod_l, not strtod: plain strtod honours LC_NUMERIC, so an
+  // embedder who has set a comma-decimal locale would parse "3.14" as
+  // 3. from_chars is immune to that by definition, and this has to be
+  // too -- JSON's decimal point is always '.'.
+  static bool parse_double_(string_view s, double& out) {
+#if defined(__APPLE__)
+    if (s.empty()) return false;
+    // strtod_l needs a NUL terminator, and `s` views into the source
+    // buffer. Stack buffer for the overwhelmingly common short case.
+    char        stack[64];
+    string      heap;
+    const char* c_str;
+    if (s.size() < sizeof(stack)) {
+      std::memcpy(stack, s.data(), s.size());
+      stack[s.size()] = '\0';
+      c_str           = stack;
+    } else {
+      heap.assign(s);
+      c_str = heap.c_str();
+    }
+
+    static locale_t c_locale = ::newlocale(LC_ALL_MASK, "C", nullptr);
+    if (c_locale == nullptr) return false;
+
+    errno      = 0;
+    char*  end = nullptr;
+    double v   = ::strtod_l(c_str, &end, c_locale);
+
+    // Trailing garbage: the equivalent of from_chars' ptr check.
+    if (end != c_str + s.size()) return false;
+
+    // ERANGE is NOT simply failure. from_chars and strtod disagree
+    // about denormals, and treating every ERANGE as an error rejects
+    // numbers the old code accepted. MEASURED, comparing the two on the
+    // same inputs:
+    //
+    //   1e-320    from_chars OK            strtod ERANGE, 9.9999e-321
+    //   4.9e-324  from_chars OK            strtod ERANGE, 4.9407e-324
+    //   1e400     from_chars out_of_range  strtod ERANGE, inf
+    //   1e-400    from_chars out_of_range  strtod ERANGE, 0
+    //
+    // So the rule that reproduces from_chars exactly is: reject only
+    // when the result saturated to infinity or collapsed to zero. A
+    // denormal is a representable value and stays.
+    if (errno == ERANGE && (std::isinf(v) || v == 0.0)) return false;
+
+    out = v;
+    return true;
+#else
+    double     v   = 0.0;
+    const auto res = std::from_chars(s.data(), s.data() + s.size(), v,
+                                     std::chars_format::general);
+    if (res.ec != errc{} || res.ptr != s.data() + s.size()) return false;
+    out = v;
+    return true;
+#endif
+  }
+
   static bool is_hex_digit(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
            (c >= 'A' && c <= 'F');
@@ -1534,11 +1607,10 @@ private:
       return p;
     }
 
-    // Real -- normalize ".5" / "5." / "5.e10" if from_chars rejects them
-    double v   = 0.0;
-    auto   res = std::from_chars(num.data(), num.data() + num.size(), v,
-                                 std::chars_format::general);
-    if (res.ec != errc{} || res.ptr != num.data() + num.size()) {
+    // Real -- normalize ".5" / "5." / "5.e10" if the first parse rejects
+    // them.
+    double v = 0.0;
+    if (!parse_double_(num, v)) {
       string norm{num};
       if (!norm.empty() && norm.front() == '.') norm.insert(norm.begin(), '0');
       size_t dot = norm.find('.');
@@ -1548,10 +1620,7 @@ private:
           norm.insert(after, "0");
         }
       }
-      res = std::from_chars(norm.data(), norm.data() + norm.size(), v,
-                            std::chars_format::general);
-      if (res.ec != errc{} || res.ptr != norm.data() + norm.size())
-        fail("invalid real literal");
+      if (!parse_double_(norm, v)) fail("invalid real literal");
     }
     if (neg) v = -v;
     auto p  = make_unique<FlexData::Impl>();
