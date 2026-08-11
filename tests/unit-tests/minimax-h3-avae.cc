@@ -279,6 +279,13 @@ TEST(minimax_h3_avae, resample_filters_are_shared)
 // what the f16 storage itself costs -- a route that was WRONG (a stride
 // slip, a missed bias, a tile tail) does not land at 1e-3, it lands at
 // order 1.
+//
+// Run at TWO clip lengths, because the route is chosen per GEMM by a
+// SHAPE gate (M >= 256, N >= 64) and M scales with the clip: a short
+// probe cannot speak for a long one. 64 latents is 1.6 s; 208 is the
+// 5.2 s a `frames: 120` request generates, which is what production
+// actually decodes and where the upsampling tail's M reaches the
+// hundreds of thousands.
 TEST(minimax_h3_avae, mma_matches_steel)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
@@ -294,38 +301,42 @@ TEST(minimax_h3_avae, mma_matches_steel)
   std::string err;
   ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
 
-  const int B = cfg.stereo_channels, ZC = cfg.latent_channels, T = 64;
-  std::vector<float> z((std::size_t)B * ZC * T);
-  for (std::size_t i = 0; i < z.size(); ++i) {
-    z[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
-  }
-  // The route is chosen in load(), so each arm needs its own model.
-  auto decode_with = [&](bool mma, std::vector<float>* pcm) {
-    if (mma) { unsetenv("VPIPE_H3_AVAE_NO_MMA2"); }
-    else     { setenv("VPIPE_H3_AVAE_NO_MMA2", "1", 1); }
-    auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
-    unsetenv("VPIPE_H3_AVAE_NO_MMA2");
-    if (!vae) { return false; }
-    std::string e;
-    return vae->decode(z.data(), B, T, pcm, &e);
-  };
-  std::vector<float> a, b;
-  ASSERT_TRUE(decode_with(false, &a));
-  ASSERT_TRUE(decode_with(true, &b));
-  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  const int B = cfg.stereo_channels, ZC = cfg.latent_channels;
+  for (const int T : {64, 208}) {
+    std::vector<float> z((std::size_t)B * ZC * T);
+    for (std::size_t i = 0; i < z.size(); ++i) {
+      z[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
+    }
+    // The route is chosen in load(), so each arm needs its own model.
+    auto decode_with = [&](bool mma, std::vector<float>* pcm) {
+      if (mma) { unsetenv("VPIPE_H3_AVAE_NO_MMA2"); }
+      else     { setenv("VPIPE_H3_AVAE_NO_MMA2", "1", 1); }
+      auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+      unsetenv("VPIPE_H3_AVAE_NO_MMA2");
+      if (!vae) { return false; }
+      std::string e;
+      return vae->decode(z.data(), B, T, pcm, &e);
+    };
+    std::vector<float> a, b;
+    ASSERT_TRUE(decode_with(false, &a));
+    ASSERT_TRUE(decode_with(true, &b));
+    ASSERT_TRUE(!a.empty() && a.size() == b.size());
 
-  double num = 0.0, den = 0.0, mx = 0.0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = (double)b[i] - (double)a[i];
-    num += d * d;
-    den += (double)a[i] * (double)a[i];
-    if (std::fabs(d) > mx) { mx = std::fabs(d); }
+    double num = 0.0, den = 0.0, mx = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)b[i] - (double)a[i];
+      num += d * d;
+      den += (double)a[i] * (double)a[i];
+      if (std::fabs(d) > mx) { mx = std::fabs(d); }
+    }
+    const double rel = (den > 0.0) ? std::sqrt(num / den) : 0.0;
+    std::printf("[minimax_h3_avae] mma vs steel, %d latents (%.1f s), "
+                "%zu samples: rel-L2 %.2e, max |diff| %.2e\n", T,
+                (double)(a.size() / (std::size_t)B) / (double)cfg.sample_rate,
+                a.size(), rel, mx);
+    EXPECT_TRUE(den > 0.0);        // a silent arm would pass any tolerance
+    EXPECT_TRUE(rel < 5e-3);
   }
-  const double rel = (den > 0.0) ? std::sqrt(num / den) : 0.0;
-  std::printf("[minimax_h3_avae] mma vs steel over %zu samples: rel-L2 %.2e, "
-              "max |diff| %.2e\n", a.size(), rel, mx);
-  EXPECT_TRUE(den > 0.0);          // a silent arm would pass any tolerance
-  EXPECT_TRUE(rel < 5e-3);
 }
 
 // ---- the encoder (ref2va reference soundtracks) -----------------------

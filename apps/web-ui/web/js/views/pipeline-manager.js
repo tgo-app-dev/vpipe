@@ -9,6 +9,8 @@ import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
 import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
   from '../lane-graph.js';
+import { openConnectEditor } from '../connect-editor.js';
+import { typesCompatible, tagsCompatible } from '../port-compat.js';
 import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
 
@@ -889,24 +891,57 @@ function mountEditor(container, opts = {}) {
       const n = r.node;
       const bad = !!n.config_error;
       const open = inline && n.id === state.laneOpen;
-      list.append(el('button', {
-        class: 'lane-row' + (bad ? ' bad' : '') + (open ? ' open' : '')
-             + (n.id === state.selectedStage ? ' selected' : ''),
+      // The gutter (the graph NODE) and the row text are separate
+      // controls: the node edits connections, the text opens the stage.
+      // Hence a div holding two buttons -- a button inside a button is
+      // invalid HTML, and the outer one swallows the inner.
+      const gut = el('button', {
+        class: 'lane-gutter', type: 'button', style: `width:${gutter}px`,
+        title: t('conn.edit_hint'),
+      }, laneArt(r, laid.width, bad));
+      gut.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        openStageConnections(n);
+      });
+      const text = el('button', {
+        class: 'lane-body', type: 'button',
         title: n.config_error || n.id,
         onclick: () => (inline ? toggleLaneStage(n.id) : selectStage(n.id)),
       },
-        el('span', { class: 'lane-gutter', style: `width:${gutter}px` },
-           laneArt(r, laid.width, bad)),
         el('span', { class: 'lane-text' },
            el('span', { class: 'lane-id' }, n.id),
            el('span', { class: 'lane-type' }, n.type)),
         bad ? el('span', { class: 'lane-warn' }, '!') : null,
-        inline ? el('span', { class: 'lane-caret' }, '▸') : null));
+        inline ? el('span', { class: 'lane-caret' }, '▸') : null);
+      list.append(el('div', {
+        class: 'lane-row' + (bad ? ' bad' : '') + (open ? ' open' : '')
+             + (n.id === state.selectedStage ? ' selected' : ''),
+      }, gut, text));
       if (open) { list.append(laneDetail(r, gutter)); }
     }
     list.append(el('div', { class: 'lane-note' },
       t(inline ? 'pl.narrow_note' : 'pl.narrow_note_pane')));
     graphBody.append(list);
+  }
+
+  // The lane graph's answer to the canvas's aim-at-a-port editing: pick
+  // an input from a list, then pick the output to feed it. Selecting the
+  // stage first keeps the rest of the editor pointed at what is being
+  // changed, exactly as expanding a row does.
+  function openStageConnections(node) {
+    selectStage(node.id);
+    openConnectEditor({
+      pipelineId: state.selectedId,
+      node,
+      graph: (state.detail && state.detail.graph) || { nodes: [], edges: [] },
+      specFor: specForType,
+      editable: canEdit(),
+      onChanged: (detail) => {
+        state.detail = detail;
+        renderGraphPane();
+        refreshList();
+      },
+    });
   }
 
   // Expand a row, or fold it back. Selecting is part of expanding, so the
@@ -1031,9 +1066,9 @@ function mountEditor(container, opts = {}) {
     const decl = sp ? (kind === 'in' ? sp.iports : sp.oports) : null;
     return (decl && decl[idx] && decl[idx].type) || 'any';
   }
-  function typesCompatible(a, b) {
-    return !a || !b || a === 'any' || b === 'any' || a === b;
-  }
+  // typesCompatible / tagsCompatible come from port-compat.js: the
+  // connection editor asks the same question about the same ports, and a
+  // second copy of the rule is one that can fall behind the runtime's.
   // Parse a comma-separated tag list into a trimmed, non-empty array.
   function parseTags(s) {
     return (s || '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -1050,11 +1085,6 @@ function mountEditor(container, opts = {}) {
     const sp = specForType(node.type);
     const decl = sp ? (kind === 'in' ? sp.iports : sp.oports) : null;
     return parseTags(decl && decl[idx] && decl[idx].tags);
-  }
-  // Tag compatibility (OR semantics): compatible when either side is
-  // untagged, else when the two tag sets intersect.
-  function tagsCompatible(a, b) {
-    return !a.length || !b.length || a.some((x) => b.includes(x));
   }
 
   // Input-port slots to render for a node: the stage spec's declared

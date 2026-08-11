@@ -283,16 +283,28 @@
 .ph-row {
   display: flex; align-items: stretch; gap: 0;
   height: 46px; flex: 0 0 46px; width: 100%;
-  padding: 0 10px 0 0; border: none; border-bottom: 1px solid var(--bg-2);
+  border-bottom: 1px solid var(--bg-2);
   background: transparent; color: var(--fg); font: inherit;
-  cursor: pointer; text-align: left;
+  text-align: left;
 }
-.ph-row:active { background: var(--bg-1); }
+/* Two tap targets across the row: the gutter (the graph node) opens the
+   connection editor, the rest opens the stage. Both are full-height, so
+   each is a 46px target -- the lane dot alone is 9px, which is not one. */
+.ph-row-body {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch;
+  padding: 0 10px 0 0; border: none; background: transparent;
+  color: inherit; font: inherit; cursor: pointer; text-align: left;
+}
+.ph-row-body:active { background: var(--bg-1); }
+.ph-gutter:active { background: var(--bg-2); }
 /* A stage whose config didn't validate: it is still in the graph, but
    the runtime skips it at launch, so say so on the row and not only in
    the badge. */
 .ph-row.bad .ph-row-id { color: var(--danger); }
-.ph-gutter { flex: 0 0 auto; display: block; }
+.ph-gutter {
+  flex: 0 0 auto; display: block; padding: 0; border: none;
+  background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
 /* The lane art itself is styled in app.css (.lane-art), shared with the
    desktop editor's narrow fallback -- one rendering, one look. */
 .ph-row-text {

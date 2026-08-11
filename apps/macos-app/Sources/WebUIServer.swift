@@ -22,12 +22,28 @@ struct ConnectionInfo: Decodable {
 final class WebUIServer: ObservableObject {
     @Published private(set) var connection: ConnectionInfo?
     @Published private(set) var starting = false
+    // Shutting down but not gone yet. Tracked because stop() used to
+    // clear the connection and return, so the button flipped straight
+    // back to "Start Server" while the process was still alive -- and
+    // pressing it did nothing, because start() guards on isRunning.
+    @Published private(set) var stopping = false
     @Published private(set) var lastError: String?
 
     let proc = HelperProcess()
 
     private var connFile: URL?
     private var pollTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
+
+    // How long a stop waits before SIGKILL.
+    //
+    // 15s, shorter than the 30 a pipeline's Stop button allows. A
+    // pipeline may legitimately sit in one long Metal dispatch. A
+    // server that will not shut down is usually wedged BECAUSE a stage
+    // is not checking its stop flag often enough, and the server cannot
+    // exit until that pipeline drains -- so waiting longer does not
+    // make it likelier to finish, it just makes the app look broken.
+    static let stopGrace: Double = 15
 
     var isRunning: Bool { proc.isRunning }
 
@@ -121,11 +137,43 @@ final class WebUIServer: ObservableObject {
         }
     }
 
-    func stop(graceSeconds: Double = 30) {
+    func stop(graceSeconds: Double = WebUIServer.stopGrace) {
         pollTask?.cancel()
         pollTask = nil
-        proc.stop(graceSeconds: graceSeconds)
+        starting = false
+        // The connection is dead the moment we ask it to stop, whatever
+        // the process does next.
         connection = nil
+
+        guard proc.isRunning else { finishStop(); return }
+
+        stopping = true
+        // Arms SIGINT now and SIGKILL after the grace period.
+        proc.stop(graceSeconds: graceSeconds)
+
+        stopTask?.cancel()
+        stopTask = Task { @MainActor in
+            // Only observes -- the escalation is already armed above.
+            // The extra margin covers the gap between SIGKILL landing
+            // and the termination handler running.
+            let deadline = Date().addingTimeInterval(graceSeconds + 5)
+            while Date() < deadline {
+                if !self.proc.isRunning { break }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            self.finishStop()
+        }
+    }
+
+    // SIGKILL right now, for the user who does not want to wait out the
+    // grace period.
+    func forceStop() {
+        proc.kill()
+    }
+
+    private func finishStop() {
+        stopping = false
+        stopTask = nil
         if let f = connFile { try? FileManager.default.removeItem(at: f) }
         connFile = nil
     }

@@ -72,6 +72,59 @@ endif()
 # function invocation, so we must capture it at include time.
 set(_VPIPE_METAL_KERNEL_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
+# A stamp file carrying the Metal compiler version, added to every .air
+# command's DEPENDS.
+#
+# Without it the only dependencies are the .metal source and its headers,
+# so updating Xcode's Metal Toolchain rebuilds NOTHING: every .air is
+# newer than its unchanged source, and the build silently keeps shipping
+# objects from the old compiler. That is not hypothetical -- the matrix-
+# core kernels are the ones most likely to need a toolchain fix, and they
+# are also the ones no pre-M5 machine can test, so a stale metallib would
+# reach a release with nothing in between to catch it.
+#
+# file(WRITE) only touches the stamp when the content differs, so this
+# costs a full metallib rebuild exactly when the compiler changed and
+# nothing otherwise. It updates at CONFIGURE time: after a toolchain
+# update, re-run cmake (the release script does).
+if(NOT VPIPE_METAL_RUNTIME_COMPILE AND XCRUN_EXECUTABLE)
+  set(VPIPE_METAL_TOOLCHAIN_STAMP
+      "${CMAKE_BINARY_DIR}/metal-toolchain-version.stamp")
+  execute_process(COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal --version
+      RESULT_VARIABLE _vp_ver_rc
+      OUTPUT_VARIABLE _vp_metal_ver ERROR_VARIABLE _vp_metal_err
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REGEX MATCH "metalfe-[0-9.]+" _vp_metal_tag "${_vp_metal_ver}")
+
+  # Only a version we actually PARSED may touch the stamp. xcrun fails in
+  # ways that still print to stdout -- an un-accepted Xcode licence after
+  # an update is the common one -- and writing that text into the stamp
+  # would both force a spurious full rebuild and record a "toolchain"
+  # that is really an error message.
+  if(_vp_ver_rc EQUAL 0 AND _vp_metal_tag)
+    set(_vp_stamp_old "")
+    if(EXISTS "${VPIPE_METAL_TOOLCHAIN_STAMP}")
+      file(READ "${VPIPE_METAL_TOOLCHAIN_STAMP}" _vp_stamp_old)
+    endif()
+    if(NOT _vp_stamp_old STREQUAL "${_vp_metal_ver}")
+      file(WRITE "${VPIPE_METAL_TOOLCHAIN_STAMP}" "${_vp_metal_ver}")
+      if(_vp_stamp_old)
+        message(STATUS
+            "vpipe Metal kernels: toolchain changed -- rebuilding all metallibs")
+      endif()
+    endif()
+    message(STATUS "vpipe Metal compiler: ${_vp_metal_tag}")
+  else()
+    if(NOT EXISTS "${VPIPE_METAL_TOOLCHAIN_STAMP}")
+      file(WRITE "${VPIPE_METAL_TOOLCHAIN_STAMP}" "unknown")
+    endif()
+    message(WARNING
+        "vpipe: could not read the Metal compiler version -- metallibs will "
+        "NOT rebuild if the toolchain changed. Fix and re-run cmake.\n"
+        "${_vp_metal_ver}${_vp_metal_err}")
+  endif()
+endif()
+
 function(add_vpipe_metal_kernel KERNEL_NAME)
   cmake_parse_arguments(K "" "SRC;STD" "DEPENDS;DEFINES;FLAGS" ${ARGN})
   if(NOT K_SRC)
@@ -157,7 +210,7 @@ function(add_vpipe_metal_kernel KERNEL_NAME)
               -I "${VPIPE_METAL_KERNEL_DIR}"
               -I "${VPIPE_METAL_KERNEL_DIR}/vendored"
               -c "${SRC}" -o "${AIR}"
-      DEPENDS "${SRC}" ${DEPENDS_ABS}
+      DEPENDS "${SRC}" ${DEPENDS_ABS} "${VPIPE_METAL_TOOLCHAIN_STAMP}"
       COMMENT "Compiling Metal kernel ${KERNEL_NAME}.metal -> .air"
       VERBATIM
     )

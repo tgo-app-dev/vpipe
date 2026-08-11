@@ -58,6 +58,21 @@ public:
   // valid() == false.
   bool supports_matrix_cores() const noexcept;
 
+  // The individual inputs supports_matrix_cores() decided from.
+  //
+  // Reported by `vpipe --gpu-info`. A matrix-core fault shows up as a
+  // wedged GPU on someone else's machine, where the only thing anyone
+  // can send back is text -- and "matrix_cores: false" alone does not
+  // say whether the hardware, the OS or an env var decided it. Each of
+  // those implies a different next step.
+  struct MatrixCoreGate {
+    bool device_family = false;   // GPU is Apple10 (M5) or newer
+    bool macos         = false;   // runtime is macOS 26.2 or newer
+    bool env_disabled  = false;   // VPIPE_NO_MATRIX_CORES is set
+    bool env_forced    = false;   // VPIPE_FORCE_MATRIX_CORES is set
+  };
+  MatrixCoreGate matrix_core_gate() const noexcept;
+
   // Cumulative allocator counters. Useful for tests / telemetry to
   // verify the heap-vs-direct path is being chosen as expected.
   // Monotonically increasing across the life of the MetalCompute.

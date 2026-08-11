@@ -1,17 +1,19 @@
 import SwiftUI
 import AppKit
 
+// Order is the sidebar order, and Web UI leads: it is the surface most
+// sessions start from, and several pipelines cannot finish without it.
 enum Pane: String, CaseIterable, Identifiable {
-    case pipelines = "Pipelines"
     case webui     = "Web UI"
+    case pipelines = "Pipelines"
     case perms     = "Permissions"
     case settings  = "Settings"
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .pipelines: return "play.rectangle"
         case .webui:     return "globe"
+        case .pipelines: return "play.rectangle"
         case .perms:     return "lock.shield"
         case .settings:  return "gearshape"
         }
@@ -66,10 +68,13 @@ struct VpipeApp: App {
                 }
                 Divider()
                 Button("Stop Server") { server.stop() }
+            } else if server.stopping {
+                Text("Stopping…")
+                Button("Force Quit Server") { server.forceStop() }
             } else if server.starting {
                 Text("Starting…")
             } else {
-                Text("Server stopped")
+                Text("Server Stopped")
                 Button("Start Server") { server.start(model: model) }
             }
 
@@ -79,7 +84,7 @@ struct VpipeApp: App {
                 Text("Running \(r.name)")
                 Button("Stop Pipeline") { runner.stop() }
             } else {
-                Text("No pipeline running").foregroundStyle(.secondary)
+                Text("No Pipeline Running").foregroundStyle(.secondary)
             }
 
             Divider()
@@ -193,7 +198,7 @@ struct RootView: View {
     @ObservedObject var server: WebUIServer
     @ObservedObject var runner: PipelineRunner
     @ObservedObject var perms: Permissions
-    @State private var pane: Pane = .pipelines
+    @State private var pane: Pane = .webui
 
     var body: some View {
         NavigationSplitView {
@@ -206,7 +211,7 @@ struct RootView: View {
                 switch pane {
                 case .pipelines:
                     PipelinePane(model: model, runner: runner,
-                                 proc: runner.proc)
+                                 proc: runner.proc, server: server)
                 case .webui:
                     WebUIPane(model: model, server: server, proc: server.proc)
                 case .perms:

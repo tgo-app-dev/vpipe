@@ -408,6 +408,56 @@ svg.sb-spark .line {
 
 /* ---- Narrow pipeline editor: the canvas replaced by the lane list ---- */
 
+/* ---- Connection editor (connect-editor.js) ----
+   The lane graph's node opens this in BOTH shells, so it lives in
+   app.css rather than phone.css -- the phone shell adds phone.css on top
+   of this one, and a rule only it loaded would leave the desktop's
+   narrow fallback unstyled. */
+.modal.conn-modal { width: 420px; }
+.conn-body { display: flex; flex-direction: column; gap: 8px; }
+.conn-step {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--fg-dim);
+}
+.conn-back {
+  flex: 0 0 auto; padding: 2px 8px; font: inherit; font-size: 11.5px;
+  background: var(--bg); color: var(--accent);
+  border: 1px solid var(--line); border-radius: 4px; cursor: pointer;
+}
+.conn-back:hover { border-color: var(--accent); }
+/* Capped and scrolled: a graph with many stages produces a long source
+   list, and the modal must not grow past the window on a phone. */
+.conn-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 52vh; overflow-y: auto;
+}
+.conn-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  width: 100%; padding: 7px 9px; text-align: left;
+  background: var(--bg); color: var(--fg); font: inherit;
+  border: 1px solid var(--line); border-radius: 4px; cursor: pointer;
+}
+.conn-item:hover:not(:disabled) { border-color: var(--accent); }
+.conn-item:disabled { cursor: default; opacity: .55; }
+/* An offer the runtime would refuse. Shown rather than hidden: "the
+   stage you want is missing from the list" is a worse answer than "it is
+   here, and this is why it will not fit". */
+.conn-item.bad { cursor: not-allowed; opacity: .6; }
+.conn-item.bad .conn-item-sub { color: var(--warn); }
+.conn-item.danger .conn-item-main { color: var(--danger); }
+.conn-item-main {
+  font-size: 12.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 100%;
+}
+.conn-item-sub {
+  font-size: 10.5px; color: var(--fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 100%;
+}
+.conn-note { font-size: 11px; color: var(--warn); }
+.conn-empty { font-size: 11.5px; color: var(--fg-dim); padding: 6px 2px; }
+
 .lane-list {
   position: absolute; inset: 0; overflow-y: auto;
   display: flex; flex-direction: column;
@@ -421,16 +471,32 @@ svg.sb-spark .line {
    is exactly this tall (hence the ellipsised single-line text). */
 .lane-row {
   display: flex; align-items: stretch; height: 46px; flex: 0 0 46px;
-  width: 100%; padding: 0 8px 0 0;
-  border: none; border-bottom: 1px solid var(--bg-2);
+  width: 100%;
+  border-bottom: 1px solid var(--bg-2);
   background: transparent; color: var(--fg); font: inherit;
-  cursor: pointer; text-align: left;
+  text-align: left;
 }
 .lane-row:hover { background: var(--bg-1); }
 .lane-row.selected { background: var(--bg-2); }
 .lane-row.selected .lane-id { color: var(--accent); }
 .lane-row.bad .lane-id { color: var(--danger); }
-.lane-gutter { flex: 0 0 auto; display: block; }
+/* The GUTTER is its own control: the node in the lane art opens the
+   connection editor, where the row text opens the stage. Two buttons
+   side by side rather than one button with a nested one, which is not
+   valid HTML and loses the inner control to the outer one. */
+.lane-gutter {
+  flex: 0 0 auto; display: block; padding: 0; border: none;
+  background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
+.lane-gutter:hover { background: var(--bg-2); }
+.lane-gutter:hover .lane-dot { stroke: var(--accent); stroke-width: 3; }
+/* The rest of the row: everything that is not the gutter, as one
+   control. Carries the padding the row used to. */
+.lane-body {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch;
+  padding: 0 8px 0 0; border: none; background: transparent;
+  color: inherit; font: inherit; cursor: pointer; text-align: left;
+}
 .lane-text {
   flex: 1 1 auto; min-width: 0; padding-left: 4px;
   display: flex; flex-direction: column; justify-content: center; gap: 1px;

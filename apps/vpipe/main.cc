@@ -42,12 +42,18 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "stages/model-catalog.h"
+#include "ui/ui-view-registry.h"
 #include "common/stdio-ui-delegate.h"
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/vpipe.h"
 #include "vpipe/session-intf.h"
 #include "vpipe/session-manager.h"
 #include "vpipe/status.h"
+
+#if defined(VPIPE_BUILD_APPLE_SILICON)
+#include "apple-silicon/metal-compute/metal-compute.h"
+#include <sys/sysctl.h>
+#endif
 
 #include <atomic>
 #include <cctype>
@@ -128,6 +134,11 @@ const char* const kUsage =
   "  --version                   print the version and build identity\n"
   "                              ('<major>.<minor> (<git-hash>*<dirty>)')\n"
   "                              and exit.\n"
+  "  --gpu-info                  print the GPU/OS facts that decide whether\n"
+  "                              the matrix-core (M5 NAX) kernels are used.\n"
+  "  --list-views                print the stage types that have a web-UI\n"
+  "                              panel, as JSON. A pipeline containing one\n"
+  "                              needs someone at the browser to finish.\n"
   "  --list-models               print the built-in model catalogue as\n"
   "                              JSON and exit. For a front end that\n"
   "                              offers the same choices as the stages\n"
@@ -359,6 +370,71 @@ run(int argc, char** argv)
       // (a bug report, the app's About pane) names the build that is
       // actually running.
       std::printf("%s\n", vpipe_version());
+      return 0;
+    } else if (a == "--gpu-info") {
+      // What a bug report from someone else's Mac needs to carry. The
+      // matrix-core path depends on BOTH the GPU family and the OS
+      // version, and "it hangs on my M5" is unactionable without
+      // knowing which of those was true.
+#if !defined(VPIPE_BUILD_APPLE_SILICON)
+      std::printf("{\"metal_valid\":false,"
+                  "\"note\":\"not an Apple Silicon build\"}\n");
+      return 0;
+#else
+      Session sess;
+      const metal_compute::MetalCompute* mc = sess.metal_compute();
+      char osbuf[64] = {0};
+      size_t osn = sizeof(osbuf) - 1;
+      ::sysctlbyname("kern.osproductversion", osbuf, &osn, nullptr, 0);
+      char cpu[128] = {0};
+      size_t cn = sizeof(cpu) - 1;
+      ::sysctlbyname("machdep.cpu.brand_string", cpu, &cn, nullptr, 0);
+      FlexData o  = FlexData::make_object();
+      auto     oo = o.as_object();
+      oo.insert_or_assign("cpu", FlexData::make_string(cpu));
+      oo.insert_or_assign("macos", FlexData::make_string(osbuf));
+      oo.insert_or_assign("metal_valid",
+                          FlexData::make_bool(mc != nullptr && mc->valid()));
+      oo.insert_or_assign(
+        "matrix_cores",
+        FlexData::make_bool(mc != nullptr && mc->supports_matrix_cores()));
+      if (mc != nullptr) {
+        // Why, not just what: each of these implies a different fix.
+        auto g = mc->matrix_core_gate();
+        FlexData why  = FlexData::make_object();
+        auto     wo   = why.as_object();
+        wo.insert_or_assign("device_family_apple10",
+                            FlexData::make_bool(g.device_family));
+        wo.insert_or_assign("macos_26_2_or_newer",
+                            FlexData::make_bool(g.macos));
+        wo.insert_or_assign("env_VPIPE_NO_MATRIX_CORES",
+                            FlexData::make_bool(g.env_disabled));
+        wo.insert_or_assign("env_VPIPE_FORCE_MATRIX_CORES",
+                            FlexData::make_bool(g.env_forced));
+        oo.insert_or_assign("matrix_cores_gate", std::move(why));
+      }
+      std::printf("%s\n", o.to_json().c_str());
+      return 0;
+#endif
+    } else if (a == "--list-views") {
+      // The stage types that have a GUI panel in the web UI. A front
+      // end needs this to tell a pipeline that runs unattended from one
+      // that will sit waiting for someone to draw a mask or pick a
+      // region -- and it must come from the registry, because a list
+      // copied into a GUI goes stale the moment a view is added.
+      FlexData arr = FlexData::make_array();
+      auto     out = arr.as_array();
+      for (const UiViewSpec* v : UiViewRegistry::get().all()) {
+        FlexData o = FlexData::make_object();
+        auto     oo = o.as_object();
+        oo.insert_or_assign("id", FlexData::make_string(std::string(v->id)));
+        oo.insert_or_assign("stage_type",
+                            FlexData::make_string(std::string(v->stage_type)));
+        oo.insert_or_assign("label_key",
+                            FlexData::make_string(std::string(v->label_key)));
+        out.push_back(std::move(o));
+      }
+      std::printf("%s\n", arr.to_json().c_str());
       return 0;
     } else if (a == "--list-models") {
       // Before any session is created: this reads a static table and

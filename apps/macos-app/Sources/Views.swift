@@ -19,6 +19,8 @@ import AppKit
 // Only the tail is rendered; see maxRendered.
 private struct ConsoleText: NSViewRepresentable {
     let lines: [String]
+    // Usually a prompt: shown so a question is visible while unanswered.
+    let partial: String
     static let maxRendered = 4000
 
     // The line height at which half-block characters tile with no seam.
@@ -78,6 +80,9 @@ private struct ConsoleText: NSViewRepresentable {
         let shown = lines.count > Self.maxRendered
             ? Array(lines.suffix(Self.maxRendered)) : lines
         var body = shown.joined(separator: "\n")
+        if !partial.isEmpty {
+            body += (body.isEmpty ? "" : "\n") + partial
+        }
         if lines.count > Self.maxRendered {
             body = "… \(lines.count - Self.maxRendered) earlier lines not "
                  + "shown\n" + body
@@ -133,7 +138,7 @@ struct ConsoleBlock: View {
                 // ConsoleText is its own NSScrollView (it has to be, to
                 // scroll horizontally without wrapping), so it is placed
                 // directly rather than inside a SwiftUI ScrollView.
-                ConsoleText(lines: proc.lines)
+                ConsoleText(lines: proc.lines, partial: proc.partialLine)
                     .frame(minHeight: 180, idealHeight: 260)
                 if acceptsInput && proc.isRunning {
                     Divider()
@@ -518,9 +523,13 @@ struct PipelinePane: View {
     @ObservedObject var model: AppModel
     @ObservedObject var runner: PipelineRunner
     @ObservedObject var proc: HelperProcess
+    // Only so the composer confirmation can offer to start the server;
+    // the pane does nothing else with it.
+    @ObservedObject var server: WebUIServer
     @State private var files: [PipelineFile] = []
     @State private var selection: PipelineFile?
     @State private var consoleExpanded = false
+    @State private var confirmComposer = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -532,84 +541,10 @@ struct PipelinePane: View {
                     Button("Reload") { reload() }
                 }
                 List(files, selection: $selection) { f in
-                    HStack(spacing: 6) {
-                        Image(systemName: f.inSandbox
-                              ? "shippingbox" : "doc.text")
-                            .foregroundStyle(.secondary)
-                        Text(f.name)
-                        if f.inSandbox {
-                            Text("sandbox").font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(Color(nsColor: .separatorColor)
-                                    .opacity(0.5))
-                                .clipShape(Capsule())
-                        }
-                        if runner.running?.id == f.id, proc.isRunning {
-                            ProgressView().controlSize(.small)
-                                .scaleEffect(0.6)
-                        }
-                        Spacer()
-                        // .borderless so a click lands on the button
-                        // rather than being swallowed as a row selection.
-                        Button { revealFile(f) } label: {
-                            Image(systemName: "folder")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Show in Finder")
-
-                        Button { editFile(f) } label: {
-                            Image(systemName: "square.and.pencil")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Open in TextEdit")
-                    }
-                    .tag(f)
-                    .contextMenu {
-                        Button("Edit in TextEdit") { editFile(f) }
-                        Button("Show in Finder") { revealFile(f) }
-                    }
+                    pipelineRow(f).tag(f)
                 }
-                HStack {
-                    Button(proc.isRunning ? "Running…" : "Run") {
-                        if let s = selection { try? runner.run(s, model: model) }
-                    }
-                    .disabled(selection == nil || proc.isRunning)
-                    .keyboardShortcut(.return)
-
-                    Button("Stop") { runner.stop() }
-                        .disabled(!proc.isRunning)
-
-                    Spacer()
-                    if let s = proc.exitStatus, !proc.isRunning {
-                        Text(s == 0 ? "Finished." : "Exited with status \(s).")
-                            .font(.caption)
-                            .foregroundStyle(s == 0 ? Color.secondary
-                                                    : Color.red)
-                    }
-                    Button("Open Work Folder") {
-                        NSWorkspace.shared.open(model.workDirURL)
-                    }
-                }
-
-                // For anything that genuinely needs a terminal. The
-                // console below takes a line at a time, which covers the
-                // prompts vpipe issues, but it is a pipe and not a TTY:
-                // no raw keys, no cursor addressing, and a stage that
-                // checks isatty behaves differently. Handing the same
-                // command to Terminal costs one button and removes the
-                // whole question.
-                HStack {
-                    Button("Run in Terminal…") {
-                        if let s = selection { runInTerminal(s) }
-                    }
-                    .disabled(selection == nil)
-                    Text("Runs the same command in Terminal, for "
-                         + "pipelines that need a real terminal.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                }
+                controlsBar
+                terminalHintRow
             }
             .padding()
 
@@ -617,6 +552,24 @@ struct PipelinePane: View {
                          expanded: $consoleExpanded, acceptsInput: true)
                 .padding(.horizontal)
                 .padding(.bottom)
+        }
+        // Launching one of these from here is not wrong, but it will sit
+        // waiting for a person at the browser, and from this pane that
+        // looks like a hang. Say so once, and offer the thing that
+        // actually unblocks it.
+        .confirmationDialog(composerTitle,
+                            isPresented: $confirmComposer,
+                            titleVisibility: .visible) {
+            Button("Start Web UI and Run") {
+                if !server.isRunning { server.start(model: model) }
+                if let s = selection { try? runner.run(s, model: model) }
+            }
+            Button("Run Anyway") {
+                if let s = selection { try? runner.run(s, model: model) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(composerMessage)
         }
         // Pin the ideal width, for the reason spelled out on
         // PermissionsPane: NavigationSplitView sizes its columns from
@@ -676,6 +629,125 @@ struct PipelinePane: View {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    private var composerTitle: String {
+        (selection?.name ?? "This pipeline") + " needs the web UI"
+    }
+
+    private var composerMessage: String {
+        let which = selection?.composerStages.joined(separator: ", ") ?? ""
+        return "It contains " + which + ", which draws its own panel in "
+             + "the web UI. Run on its own, the pipeline will start and "
+             + "then wait for input that has nowhere to arrive from."
+    }
+
+    // Extracted for the same reason as the row: body as one expression
+    // exceeded what the type checker will solve.
+    @ViewBuilder
+    private var controlsBar: some View {
+        HStack {
+            Button(proc.isRunning ? "Running…" : "Run") {
+                guard let s = selection else { return }
+                if s.needsComposer { confirmComposer = true }
+                else { try? runner.run(s, model: model) }
+            }
+            .disabled(selection == nil || proc.isRunning)
+            .keyboardShortcut(.return)
+
+            Button(runner.stopping ? "Stopping…" : "Stop") { runner.stop() }
+                .disabled(!proc.isRunning || runner.stopping)
+
+            if runner.stopping {
+                Button("Force Quit") { runner.forceStop() }
+                Text("Force-quit automatically after "
+                     + "\(Int(PipelineRunner.stopGrace))s.")
+                    .font(.caption).foregroundStyle(Color.secondary)
+            }
+
+            Spacer()
+            if let s = proc.exitStatus, !proc.isRunning {
+                Text(s == 0 ? "Finished." : "Exited with status \(s).")
+                    .font(.caption)
+                    .foregroundStyle(s == 0 ? Color.secondary : Color.red)
+            }
+            Button("Open Work Folder") {
+                NSWorkspace.shared.open(model.workDirURL)
+            }
+        }
+    }
+
+    // For anything that genuinely needs a terminal. The console below
+    // takes a line at a time, which covers the prompts vpipe issues, but
+    // it is a pipe and not a TTY.
+    @ViewBuilder
+    private var terminalHintRow: some View {
+        HStack {
+            Button("Run in Terminal…") {
+                if let s = selection { runInTerminal(s) }
+            }
+            .disabled(selection == nil)
+            Text("Runs the same command in Terminal, for pipelines that "
+                 + "need a real terminal.")
+                .font(.caption).foregroundStyle(Color.secondary)
+            Spacer()
+        }
+    }
+
+    // Extracted from the List closure: inline, the row grew past what
+    // SwiftUI's type checker will solve ("unable to type-check this
+    // expression in reasonable time").
+    @ViewBuilder
+    private func pipelineRow(_ f: PipelineFile) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: f.inSandbox ? "shippingbox" : "doc.text")
+                .foregroundStyle(.secondary)
+            Text(f.name)
+            if f.needsComposer { composerBadge(f) }
+            if f.inSandbox { sandboxBadge() }
+            if runner.running?.id == f.id, proc.isRunning {
+                ProgressView().controlSize(.small).scaleEffect(0.6)
+            }
+            Spacer()
+            // .borderless so a click lands on the button rather than
+            // being swallowed as a row selection.
+            Button { revealFile(f) } label: { Image(systemName: "folder") }
+                .buttonStyle(.borderless)
+                .help("Show in Finder")
+            Button { editFile(f) } label: {
+                Image(systemName: "square.and.pencil")
+            }
+            .buttonStyle(.borderless)
+            .help("Open in TextEdit")
+        }
+        .contextMenu {
+            Button("Edit in TextEdit") { editFile(f) }
+            Button("Show in Finder") { revealFile(f) }
+        }
+    }
+
+    @ViewBuilder
+    private func composerBadge(_ f: PipelineFile) -> some View {
+        Label("composer", systemImage: "hand.tap")
+            .font(.caption2)
+            .foregroundStyle(Color.orange)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Color.orange.opacity(0.15))
+            .clipShape(Capsule())
+            .help("Contains " + f.composerStages.joined(separator: ", ")
+                  + " — needs the web UI to finish.")
+    }
+
+    @ViewBuilder
+    private func sandboxBadge() -> some View {
+        Text("sandbox")
+            .font(.caption2)
+            .foregroundStyle(Color.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Color(nsColor: .separatorColor).opacity(0.5))
+            .clipShape(Capsule())
+    }
+
     private func reload() {
         files = runner.discover(workDir: model.workDirURL)
         if let sel = selection,
@@ -724,11 +796,28 @@ struct WebUIPane: View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Button(server.isRunning ? "Stop Server" : "Start Server") {
+                    Button(server.stopping ? "Stopping…"
+                           : (server.isRunning ? "Stop Server" : "Start Server")) {
                         server.isRunning ? server.stop() : server.start(model: model)
                     }
-                    .disabled(server.starting)
-                    if server.starting { ProgressView().controlSize(.small) }
+                    .disabled(server.starting || server.stopping)
+                    if server.starting || server.stopping {
+                        ProgressView().controlSize(.small)
+                    }
+                    // A wedged shutdown is the case this exists for: a
+                    // stage that checks its stop flag rarely keeps the
+                    // pipeline draining, and the server cannot exit
+                    // until it does. Rather than make the user wait out
+                    // the grace period wondering whether it is stuck,
+                    // offer the escalation directly.
+                    if server.stopping {
+                        Button("Force Quit") { server.forceStop() }
+                        Text("Waiting for the server to shut down. It "
+                             + "will be force-quit automatically after "
+                             + "\(Int(WebUIServer.stopGrace)) seconds.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Spacer()
                     Button("Open Work Folder") {
                         NSWorkspace.shared.open(model.workDirURL)

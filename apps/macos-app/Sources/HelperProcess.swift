@@ -13,6 +13,16 @@ final class HelperProcess: ObservableObject {
     @Published private(set) var lines: [String] = []
     @Published private(set) var exitStatus: Int32?
 
+    // Output received but not yet terminated by a newline.
+    //
+    // Published, because it is usually a PROMPT. vpipe writes "…: " and
+    // then blocks reading stdin, with no trailing newline -- so a buffer
+    // that only surfaces completed lines shows nothing at all, and a
+    // pipeline waiting for an answer is indistinguishable from one that
+    // has hung. The console renders this after the lines so the question
+    // is visible while it is being asked.
+    @Published private(set) var partialLine = ""
+
     private var process: Process?
     private var pipe: Pipe?
     private var stdinPipe: Pipe?
@@ -45,6 +55,7 @@ final class HelperProcess: ObservableObject {
 
         lines.removeAll()
         pending = ""
+        partialLine = ""
         exitStatus = nil
 
         let p = Process()
@@ -105,6 +116,7 @@ final class HelperProcess: ObservableObject {
             append(String(last))
             pending = ""
         }
+        partialLine = pending
     }
 
     private func append(_ line: String) {
@@ -135,6 +147,7 @@ final class HelperProcess: ObservableObject {
 
     private func finish(status: Int32) {
         if !pending.isEmpty { append(pending); pending = "" }
+        partialLine = ""
         pipe?.fileHandleForReading.readabilityHandler = nil
         pipe = nil
         try? stdinPipe?.fileHandleForWriting.close()
@@ -144,17 +157,26 @@ final class HelperProcess: ObservableObject {
         exitStatus = status
     }
 
+    // SIGKILL now, no grace. For a helper that has already been asked
+    // to stop and has not: SIGINT is a request a wedged process is by
+    // definition not answering, so there is nothing to wait for.
+    func kill() {
+        guard let p = process, p.isRunning else { return }
+        append("[force quit]")
+        Darwin.kill(p.processIdentifier, SIGKILL)
+    }
+
     func stop(graceSeconds: Double = 30) {
         guard let p = process, p.isRunning else { return }
         let target = p.processIdentifier
-        kill(target, SIGINT)
+        Darwin.kill(target, SIGINT)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(graceSeconds * 1e9))
             // Re-check identity, not just liveness: by now the original
             // may have exited and the pid been reused.
             if let cur = self.process, cur.isRunning,
                cur.processIdentifier == target {
-                kill(target, SIGKILL)
+                Darwin.kill(target, SIGKILL)
             }
         }
     }

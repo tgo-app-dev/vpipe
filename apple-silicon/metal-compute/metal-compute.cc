@@ -20,7 +20,10 @@
 
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iterator>
@@ -316,6 +319,21 @@ MetalCompute::device() const noexcept
   return _impl->device;
 }
 
+// Running macOS version as major*100+minor ("26.2.1" -> 2602), or 0 if
+// it cannot be read.
+static int
+macos_version_() noexcept
+{
+  char   buf[64] = {0};
+  size_t n       = sizeof(buf) - 1;
+  if (::sysctlbyname("kern.osproductversion", buf, &n, nullptr, 0) != 0) {
+    return 0;
+  }
+  int major = 0, minor = 0;
+  if (std::sscanf(buf, "%d.%d", &major, &minor) < 1) { return 0; }
+  return major * 100 + minor;
+}
+
 bool
 MetalCompute::supports_matrix_cores() const noexcept
 {
@@ -323,7 +341,58 @@ MetalCompute::supports_matrix_cores() const noexcept
   // Families are cumulative supersets, so supportsFamily(Apple10) is true
   // on M5 and any newer Apple GPU and false on M4 / M3 / earlier.
   if (!_impl->valid || _impl->device == nullptr) { return false; }
-  return _impl->device->supportsFamily(MTL::GPUFamilyApple10);
+
+  // One switch that takes the WHOLE matrix-core path out, ahead of every
+  // other check. The per-family kill-switches (VPIPE_QWEN_NO_MMA,
+  // VPIPE_GEMMA_NO_MMA, VPIPE_KREA2_NO_MMA2, ...) each disable one
+  // consumer; a GPU hang does not announce which kernel caused it, so
+  // bisecting a wedge with them costs a reboot per guess. This is also
+  // the workaround to hand someone whose machine hangs: it puts them on
+  // the pre-M5 path, which is the one the whole test suite covers.
+  static const bool disabled =
+    std::getenv("VPIPE_NO_MATRIX_CORES") != nullptr;
+  if (disabled) { return false; }
+
+  if (!_impl->device->supportsFamily(MTL::GPUFamilyApple10)) { return false; }
+
+  // ...AND macOS 26.2 or newer. The hardware is not the only condition.
+  //
+  // The NAX kernels are compiled -mmacosx-version-min=26.2 because below
+  // that target the matmul2d codegen is wrong (mlx #3622; see
+  // apple-silicon/metal-compute/CMakeLists.txt). Their metallibs
+  // therefore record air64_v28-apple-macosx26.2.0, while the rest of the
+  // build records the app's own, lower deployment target.
+  //
+  // Loading 26.2-targeted AIR on an older runtime does NOT fail cleanly.
+  // OBSERVED on an M5 running an earlier 26.x: the app started, took the
+  // matrix-core path because the family check passed, and hung the GPU
+  // hard -- 100% utilisation that outlived the process and needed a
+  // reboot. A wrong answer would have been bad; a wedged GPU is worse,
+  // and nothing in the process can recover from it.
+  //
+  // So the OS is part of the capability, not an assumption. Below 26.2
+  // every caller keeps the steel/ALU path, which is correct everywhere
+  // and merely slower.
+  //
+  // VPIPE_FORCE_MATRIX_CORES=1 overrides, for bringing the NAX path up
+  // on a machine where the mismatch is understood and a reboot is
+  // acceptable. It is not a supported configuration.
+  static const int  os     = macos_version_();
+  static const bool forced =
+    std::getenv("VPIPE_FORCE_MATRIX_CORES") != nullptr;
+  return forced || os >= 2602;
+}
+
+MetalCompute::MatrixCoreGate
+MetalCompute::matrix_core_gate() const noexcept
+{
+  MatrixCoreGate g;
+  g.env_disabled = std::getenv("VPIPE_NO_MATRIX_CORES") != nullptr;
+  g.env_forced   = std::getenv("VPIPE_FORCE_MATRIX_CORES") != nullptr;
+  g.macos        = macos_version_() >= 2602;
+  g.device_family = _impl->valid && _impl->device != nullptr &&
+                    _impl->device->supportsFamily(MTL::GPUFamilyApple10);
+  return g;
 }
 
 MetalCompute::AllocStats

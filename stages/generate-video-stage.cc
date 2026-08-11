@@ -43,10 +43,13 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va"},
   {.key = "height", .type = ConfigType::Int, .required = false,
-   .doc = "video height in pixels; a multiple of 16 (the VAE's 8x times the "
-          "DiT's 2x patch)", .def_int = 480},
+   .doc = "video height in pixels; a multiple of the family's VAE stride "
+          "times its DiT patch -- 16 for wan (8x VAE, 2x patch), 32 for "
+          "minimax-h3 (16x VAE, 2x patch). 16 is what this stage checks up "
+          "front, since the family is not known until the model resolves",
+   .def_int = 480},
   {.key = "width", .type = ConfigType::Int, .required = false,
-   .doc = "video width in pixels; a multiple of 16", .def_int = 832},
+   .doc = "video width in pixels; same multiple as height", .def_int = 832},
   {.key = "frames", .type = ConfigType::Int, .required = false,
    .doc = "video frames. Rounded UP to the nearest count the resident "
           "model's VAE can chunk, which differs per family, so any positive "
@@ -59,16 +62,18 @@ const ConfigKey kAttrs[] = {
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "initial-noise RNG seed (default 0)"},
   {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
-   .doc = "classifier-free guidance for the HIGH-noise expert. Needs a "
-          "negative conditioning on iport1; without one, guidance is forced "
-          "to 1", .def_real = 3.5},
+   .doc = "classifier-free guidance (wan; on a two-expert checkpoint this is "
+          "the HIGH-noise expert's). Needs a negative conditioning on iport1; "
+          "without one, guidance is forced to 1. Inert on a guidance-"
+          "distilled family (minimax-h3)", .def_real = 3.5},
   {.key = "guidance_scale_2", .type = ConfigType::Real, .required = false,
-   .doc = "classifier-free guidance for the LOW-noise expert (A14B only)",
-   .def_real = 3.5},
+   .doc = "classifier-free guidance for the LOW-noise expert (wan's "
+          "two-expert checkpoints, e.g. A14B)", .def_real = 3.5},
   {.key = "boundary_ratio", .type = ConfigType::Real, .required = false,
    .doc = "sigma at which the low-noise expert takes over from the high-noise "
-          "one. Read from the checkpoint's model_index.json when present; 0 "
-          "means a single expert", .def_real = 0.9},
+          "one (wan). Read from the checkpoint's model_index.json when "
+          "present; 0 means a single expert, which is what every other family "
+          "here is", .def_real = 0.9},
   {.key = "video_shift", .type = ConfigType::Real, .required = false,
    .doc = "sigma shift for the VIDEO schedule (minimax-h3; inert on wan, "
           "which takes its shift from the scheduler spec)",
@@ -83,32 +88,39 @@ const ConfigKey kAttrs[] = {
    .doc = "audio duration for minimax-h3; 0 derives it from frames / fps",
    .def_real = 0.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
-   .doc = "drop the expert's weights after each clip and reload on the next "
-          "one. \"auto\" (default) decides from physical RAM vs the "
+   .doc = "drop the resident model's weights after each clip and reload on "
+          "the next one. \"auto\" (default) decides from physical RAM vs the "
           "pipeline's weight bytes; \"always\" / \"never\" force it",
    .def_str = "auto"},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning",
-   .doc = "umT5-XXL hidden states from a diffusion-conditioner: bf16 "
-          "[text_seq, 4096]",
+   .doc = "text hidden states from a diffusion-conditioner: bf16 [text_seq, "
+          "dim] at the resident family's own encoder width -- 4096 for wan "
+          "(umT5-XXL), 5120 for minimax-h3 (the Qwen3-VL tap)",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "neg_conditioning",
    .doc = "OPTIONAL negative conditioning (the conditioner's oport1) for "
-          "classifier-free guidance. Wan is not distilled, so without this "
-          "guidance is forced to 1",
+          "classifier-free guidance, for the families that take it: wan is "
+          "not distilled, so without this its guidance is forced to 1. "
+          "Ignored by a guidance-distilled family (minimax-h3), which runs "
+          "one forward per step",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "sampler",
-   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select); the "
-          "default is UniPC multistep, which is what Wan ships",
+   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read by "
+          "the families that sample from a spec (wan, defaulting to the UniPC "
+          "multistep it ships); inert for a family that carries its own "
+          "sampler (minimax-h3 runs rectified-flow Euler over two shifted "
+          "schedules -- see video_shift / audio_shift)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler",
-   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select)",
+   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select). Inert for the "
+          "same families the sampler port is inert for",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0",
    .doc = "OPTIONAL image-to-video conditioning latent from vae-encode: f32 "
@@ -159,9 +171,11 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "generate-video",
-  .doc       = "Wan video DiT denoiser: conditioning (+ an optional image "
-               "latent) -> UniPC over a two-expert 14B transformer -> a latent "
-               "video, on the metal-compute backend. Feed vae-decode.",
+  .doc       = "Video DiT denoiser: conditioning (+ optional keyframe or "
+               "reference latents) -> the resident family's sampler over its "
+               "transformer -> a latent VIDEO, and a latent SOUNDTRACK from "
+               "the families that generate one, on the metal-compute backend. "
+               "Feed vae-decode (and audio-vae-decode).",
   .display_name = "Generate Video",
   .category  = StageCategory::Generative,
   .iports    = kIports,

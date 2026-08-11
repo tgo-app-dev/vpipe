@@ -31,6 +31,7 @@ import { openFsSheet, dirOf, baseOf } from './phone-fs.js';
 import { configField, readConfig } from './phone-config.js';
 import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
   from '../lane-graph.js';
+import { openConnectEditor } from '../connect-editor.js';
 import { lastPipeline, setLastPipeline } from './phone-recent.js';
 
 // How often the read-only view re-reads state other clients can change.
@@ -139,6 +140,27 @@ export function mountPhonePipelines({ body, actions, setTitle }) {
   const pipelineState = () => (state.detail ? state.detail.state : null);
   const canEdit = () => pipelineState() === 'stopped';
 
+  // Tapping the lane art opens the connection editor for that node. The
+  // specs are awaited FIRST rather than passed as a promise: without
+  // them the editor can only offer the ports already wired, so a stage
+  // whose inputs are mostly unconnected would look like it had none to
+  // pick. They are cached after the first call, so this is a round trip
+  // once per session.
+  async function openConnections(node) {
+    const list = await specs();
+    openConnectEditor({
+      pipelineId: state.selectedId,
+      node,
+      graph: (state.detail && state.detail.graph) || { nodes: [], edges: [] },
+      specFor: (ty) => (list || []).find((s) => s.type === ty) || null,
+      editable: canEdit(),
+      onChanged: (detail) => {
+        state.detail = detail;
+        renderRows();
+      },
+    });
+  }
+
   // ---- render -------------------------------------------------------
   function render() {
     renderChrome();
@@ -219,18 +241,28 @@ export function mountPhonePipelines({ body, actions, setTitle }) {
     for (const r of laid.rows) {
       const n = r.node;
       const bad = !!n.config_error;
-      const row = el('button', {
-        class: 'ph-row' + (bad ? ' bad' : ''),
-        onclick: () => toggleStage(n.id),
-      },
-        el('span', { class: 'ph-gutter', style: `width:${gutter}px` },
-           laneArt(r, laid.width, bad)),
-        el('span', { class: 'ph-row-text' },
-           el('span', { class: 'ph-row-id' }, n.id),
-           el('span', { class: 'ph-row-type' }, n.type)),
-        bad ? el('span', { class: 'ph-warn', title: n.config_error }, '!')
-            : null,
-        el('span', { class: 'ph-row-caret' }, '▸'));
+      // Two controls, not one: the gutter IS the graph node and opens
+      // the connection editor; the text opens the stage. Nesting one
+      // button in the other is invalid HTML and the outer one wins, so
+      // the row is a plain div holding both.
+      const gut = el('button', {
+        class: 'ph-gutter', type: 'button', style: `width:${gutter}px`,
+        'aria-label': t('conn.edit_hint'),
+      }, laneArt(r, laid.width, bad));
+      gut.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        openConnections(n);
+      });
+      const row = el('div', { class: 'ph-row' + (bad ? ' bad' : '') },
+        gut,
+        el('button', { class: 'ph-row-body', type: 'button',
+                       onclick: () => toggleStage(n.id) },
+          el('span', { class: 'ph-row-text' },
+             el('span', { class: 'ph-row-id' }, n.id),
+             el('span', { class: 'ph-row-type' }, n.type)),
+          bad ? el('span', { class: 'ph-warn', title: n.config_error }, '!')
+              : null,
+          el('span', { class: 'ph-row-caret' }, '▸')));
       listEl.append(row);
       rowEls.set(n.id, { row, lay: r, node: n, gutter, width: laid.width });
     }

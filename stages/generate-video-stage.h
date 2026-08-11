@@ -5,9 +5,9 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 
-// The Wan denoiser (MetalWanTransformer) is a from-scratch, MLX-free
-// metal-compute module on the VPIPE_BUILD_APPLE_SILICON axis. On non-Apple
-// builds the stage is an inert stub.
+// The video denoisers (MetalWanTransformer, MetalMiniMaxH3Transformer) are
+// from-scratch metal-compute modules on the VPIPE_BUILD_APPLE_SILICON axis.
+// On non-Apple builds the stage is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
@@ -26,27 +26,31 @@
 
 namespace vpipe {
 
-// Video DiT denoiser: text (and optionally an image) -> a latent VIDEO,
-// for the Wan 2.1/2.2 family. The video counterpart of `generate-image`,
-// and deliberately its mirror -- same conditioning input from a
+// Video DiT denoiser: text (and optionally keyframe or reference latents)
+// -> a latent VIDEO, plus a latent SOUNDTRACK from the families that
+// generate one. The video counterpart of `generate-image`, and
+// deliberately its mirror -- same conditioning input from a
 // `diffusion-conditioner`, same optional sampler / scheduler / model
 // sources, same "emit a latent and let vae-decode make pixels" split.
 //
 // Two things make it its own stage rather than a mode of generate-image.
 //
 // The first is the TIME AXIS: everything it touches is 4-D. The latent is
-// [z, T, H/8, W/8] with T = 1 + (F-1)/4, the DiT patchifies over (frame,
-// row, column) with a 3-axis RoPE, and the emitted beat is 4-D where every
-// image stage emits 3-D.
+// [z, T, H/r, W/r] over a family-specific temporal rule, the DiT
+// patchifies over (frame, row, column) with a 3-axis RoPE, and the emitted
+// beat is 4-D where every image stage emits 3-D.
 //
-// The second is that Wan 2.2's A14B is TWO 14B experts -- a high-noise one
-// and a low-noise one -- switched partway down the sigma schedule at
-// `boundary_ratio`, each with its own guidance scale. At bf16 one expert
-// is ~28 GB, so they cannot both be resident: this stage holds exactly one
-// and swaps at the boundary. That swap is a load from disk, so it happens
-// at most ONCE per generation (the schedule is monotonically decreasing,
-// so the boundary is crossed once), and it is why the two guidance scales
-// are separate config keys rather than one.
+// The second is that a video model can be too large to hold at once. Wan
+// 2.2's A14B is TWO 14B experts -- a high-noise one and a low-noise one --
+// switched partway down the sigma schedule at `boundary_ratio`, each with
+// its own guidance scale. At bf16 one expert is ~28 GB, so they cannot
+// both be resident: this stage holds exactly one and swaps at the
+// boundary. That swap is a load from disk, so it happens at most ONCE per
+// generation (the schedule is monotonically decreasing, so the boundary is
+// crossed once), and it is why the two guidance scales are separate config
+// keys rather than one. MiniMax-H3 answers the same pressure differently
+// -- one 33B stack whose blocks STREAM -- which is why the residency
+// policy is per family rather than one rule here.
 //
 // FAMILIES. The stage is family-generic the way `generate-image` is: one
 // stage, a `_family` tag read from the DiT's `_class_name`, and the UNION
