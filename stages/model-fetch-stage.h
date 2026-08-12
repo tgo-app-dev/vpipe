@@ -46,6 +46,11 @@ private:
   // constructor via attr_*.
   std::string   _base_path;          // download root ("" -> ./models)
   std::string   _model_path;         // non-interactive: a direct hf path
+  // Which catalogue entry, when several are published from one repo.
+  std::string   _model_variant;
+  // Registration key override, so two such models can share a directory
+  // on disk and still be distinct records in the models DB.
+  std::string   _model_key;
   std::string   _hf_token;           // optional auth ("" -> $HF_TOKEN)
   bool          _overwrite_existing{};
   bool          _prepare_tokenizer{};

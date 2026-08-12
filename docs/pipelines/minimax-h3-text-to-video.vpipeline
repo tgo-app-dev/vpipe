@@ -14,7 +14,7 @@
       "type": "text-prompt",
       "iports": [],
       "config": {
-        "text": "A red paper boat drifting down a rain-slicked gutter at dusk, street light reflections rippling on the water. Sound of the rain is heard with occasional sound of individual water drops."
+        "text": "An Asian musician playing classical music on a grand piano."
       }
     },
     {
@@ -36,6 +36,17 @@
       ],
       "config": {
         "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12.0,
+        "audio_shift": 3.0,
+        "condition_timestep": 1.0,
+        "audio_seconds": 0.0
       }
     },
     {
@@ -68,6 +79,18 @@
         },
         {
           "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "minimax-h3-model-config",
           "oport": 0
         }
       ],

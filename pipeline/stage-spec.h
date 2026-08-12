@@ -14,16 +14,25 @@ namespace vpipe {
 // declared category is Generic.
 enum class StageCategory : unsigned char {
   Generic, Audio, Visual, Vision, Generative, Text, Control, Database,
-  Network, Preparation
+  Network, Preparation, ModelSpecificConfig
 };
 
 // Stable lower-case name ("generic", "audio", "visual", "vision",
 // "generative", "text", "control", "database", "network",
-// "preparation"). Never returns null. "visual" is media I/O and frame
-// transforms (image/video load/save, decode/encode, rgb, decimation);
-// "vision" is perception/understanding (detection, tracking, overlay,
-// visual QA); "generative" is model-driven synthesis (text-to-image /
-// -speech, VAE codec, sampler/scheduler selection).
+// "preparation", "model-specific-config"). Never returns null. "visual"
+// is media I/O and frame transforms (image/video load/save,
+// decode/encode, rgb, decimation); "vision" is perception/understanding
+// (detection, tracking, overlay, visual QA); "generative" is
+// model-driven synthesis (text-to-image / -speech, VAE codec,
+// sampler/scheduler selection).
+//
+// "model-specific-config" is its own category rather than a corner of
+// "generative" because these stages are the only ones whose
+// APPLICABILITY is decided by the checkpoint: a `wan2-model-config` is
+// meaningless in a MiniMax-H3 graph, where every generative stage is
+// meaningful in both. Grouping them apart is what lets tooling offer the
+// one that matches the resident family instead of a flat list where
+// picking wrong looks like picking right. See stages/model-config-source.h.
 std::string_view stage_category_name(StageCategory) noexcept;
 
 // Static, type-level declaration of one stage port (input or output).

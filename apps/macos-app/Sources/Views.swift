@@ -242,12 +242,13 @@ struct SettingsPane: View {
                         Button("Choose…") { chooseWorkDir() }
                     }
                 }
-                Text("vpipe uses this directory as its workspace: "
+                Text(LocalizedStringKey(
+                     "vpipe uses this directory as its workspace: "
                      + "**models/** for everything downloaded or quantized, "
                      + "**data.mdb** / **lock.mdb** for the registry and "
                      + "logs, and **sandbox/** for files the web UI lets "
                      + "stages write. Pick a volume with room — prepared "
-                     + "models run to tens of gigabytes.")
+                     + "models run to tens of gigabytes."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !freeSpace.isEmpty {
@@ -267,8 +268,6 @@ struct SettingsPane: View {
                                   + "parked, not refused.")
                 zeroableField("LMDB Map Size (MB)", $model.dbMapSizeMB,
                               hint: "0 = default")
-                zeroableField("Default Edge Capacity", $model.defaultEdgeCapacity,
-                              hint: "0 = default (4)")
                 // The locales the session actually has translations for
                 // (common/i18n.cc). A free-text field could name one
                 // that does not exist, which silently falls back rather
@@ -297,12 +296,13 @@ struct SettingsPane: View {
                     .font(.caption)
                     .foregroundStyle(probe.ok ? Color.secondary : Color.red)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("The copy inside the app is a minimal LGPL build, so "
+                Text(LocalizedStringKey(
+                     "The copy inside the app is a minimal LGPL build, so "
                      + "it has no libx264/x265 and few extra decoders. Point "
                      + "this at a fuller install — Homebrew's is normally "
                      + "**/opt/homebrew/lib** — to use that instead. Takes "
                      + "effect the next time a pipeline or the server is "
-                     + "started.")
+                     + "started."))
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -320,7 +320,8 @@ struct SettingsPane: View {
                 }
                 if model.bindIsRemote {
                     Label {
-                        Text("Other devices on this network will be able to "
+                        Text(LocalizedStringKey(
+                             "Other devices on this network will be able to "
                              + "reach the web UI. It can start and stop "
                              + "pipelines, browse files in the sandbox and "
                              + "drive models on this Mac — an access key is "
@@ -328,7 +329,7 @@ struct SettingsPane: View {
                              + "control. Prefer **This Mac only** unless you "
                              + "actually need a phone or another computer to "
                              + "connect, and avoid it on networks you do not "
-                             + "trust.")
+                             + "trust."))
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
@@ -356,12 +357,13 @@ struct SettingsPane: View {
             Section("Web UI File Access") {
                 Toggle("Allow Access to the Whole Filesystem",
                        isOn: $model.exposeNativeFS)
-                Text(model.exposeNativeFS
+                Text(LocalizedStringKey(
+                     model.exposeNativeFS
                      ? "Stages can read and write anywhere you can. "
                      + "Anyone who reaches the web UI has that reach too."
                      : "Stage file I/O is confined to the **sandbox** "
                      + "folder in your work directory. Model files are "
-                     + "exempt.")
+                     + "exempt."))
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -392,19 +394,21 @@ struct SettingsPane: View {
 
                 Toggle("Add an OS Sandbox (Seatbelt)", isOn: $model.osSandbox)
                     .disabled(model.exposeNativeFS)
-                Text("A whole-process write backstop underneath the "
+                Text(LocalizedStringKey(
+                     "A whole-process write backstop underneath the "
                      + "confinement above. It cannot be nested, so it "
                      + "**disables the run_python chat tool**, which "
                      + "sandboxes each call itself. Enable it only if you "
-                     + "do not use that tool.")
+                     + "do not use that tool."))
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             Section("About") {
                 LabeledContent("Version", value: AppModel.versionString)
-                Text("The digits after ***** count files that were "
-                     + "uncommitted when this build was made.")
+                Text(LocalizedStringKey(
+                     "The digits after the `*` count files that were "
+                     + "uncommitted when this build was made."))
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 LabeledContent("Command-Line Tools") {
@@ -918,9 +922,25 @@ struct WebUIPane: View {
                         }
                     }
                 } else if !server.isRunning {
-                    Text("Start the server to get a link, an access key and "
-                         + "a QR code for connecting a phone.")
+                    // Do not promise a QR code the run will not produce:
+                    // bound to loopback there is no device to scan it.
+                    // LocalizedStringKey(...) explicitly: a Text built
+                    // from CONCATENATED strings picks the StringProtocol
+                    // overload, which does not parse markdown, and the
+                    // asterisks render literally. MEASURED: the same
+                    // sentence is 122pt as a literal and 144pt once
+                    // concatenated, the difference being four visible
+                    // asterisks.
+                    Text(LocalizedStringKey(
+                         model.bindIsRemote
+                         ? "Start the server to get a link, an access key "
+                         + "and a QR code for connecting a phone."
+                         : "Start the server to get a link and an access "
+                         + "key. Bound to this Mac only, so there is no "
+                         + "QR code — change **Bind To** in Settings to "
+                         + "connect a phone."))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding()

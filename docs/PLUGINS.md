@@ -102,6 +102,51 @@ The stage then appears in `/api/stage-types` and the web-ui composer, and
 is usable in any pipeline spec by its `kTypeName`. (Do **not** also use the
 in-tree `VPIPE_REGISTER_STAGE` macro — `register_stage` is the plugin path.)
 
+### Model-specific configuration
+
+A plugin that adds a **model family** usually also has knobs that belong to
+that family and to nothing else. Do not add them to the generic stage that
+runs the model: `generate-image` / `generate-video` / `diffusion-conditioner`
+each serve several families, and a key that applies to only one of them is
+inert — *silently* inert — on all the others.
+
+Ship a **config source** instead. Derive from `ModelConfigSourceStage<T>`
+(`stages/model-config-source.h`), supply a `kSpec` in
+`StageCategory::ModelSpecificConfig` with an oport tagged `model-config`, and
+implement one method:
+
+```cpp
+class AcmeModelConfigStage
+  : public vpipe::ModelConfigSourceStage<AcmeModelConfigStage> {
+ public:
+  static constexpr const char* kTypeName = "acme-model-config";
+  using ModelConfigSourceStage::ModelConfigSourceStage;
+
+  vpipe::FlexData resolved_config() const {
+    vpipe::FlexData fd = vpipe::model_config::make_config("acme");
+    fd.as_object().insert_or_assign("shift", vpipe::FlexData::make_real(_s));
+    return fd;
+  }
+};
+```
+
+The base supplies the trigger contract every source shares: unwired, one beat
+for the run; wired, one beat per inbound beat. The `model_family` string is
+what the consuming stage matches against the resident checkpoint, so a config
+wired to the wrong model is reported rather than half-applied.
+
+Two rules make the difference between a knob that works and one that looks
+like it does:
+
+- **Emit a key only when it was set.** The consuming stage starts from the
+  model layer's own defaults for the family; a source that helpfully emits
+  its defaults overwrites them with something that merely looks configured.
+- **Parse in the model layer, not the stage.** Give the family a
+  `GenerationParams`-style struct with a `from_flex()`, and let the stage
+  pass the object down unread. Then a knob added later needs no change in
+  any stage — which is what lets a plugin extend a family the host does not
+  know about.
+
 ## Extension point 2 — Metal shaders
 
 Compile a self-contained `.metal` offline and embed its bytes with the

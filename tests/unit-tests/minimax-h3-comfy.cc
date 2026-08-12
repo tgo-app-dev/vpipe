@@ -586,3 +586,66 @@ TEST(minimax_h3_comfy, an_h3_text_encoder_is_recognized_either_way)
   EXPECT_TRUE(d.family == "MiniMax");
   fs::remove_all(root, ec);
 }
+
+// A tree holding BOTH partitions is the case the models DB exists for.
+// Nothing in it can say which model a caller meant -- the filenames say
+// what the FILES are, not what the REFERENCE was -- so resolve_dit_dir
+// falls back to `fl2va`. Told the partition, it picks the other, and a
+// caller that says nothing keeps the historical answer so every graph
+// written before Ref2VA existed resolves as it did.
+TEST(minimax_h3_comfy, a_told_partition_beats_the_filename)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path root = scratch_() / "both-partitions";
+  fs::remove_all(root, ec);
+  write_component_(root / "diffusion_models" /
+                       "minimax_h3_fl2va_bf16.safetensors",
+                   "config", kH3Config);
+  write_component_(root / "diffusion_models" /
+                       "minimax_h3_ref2va_bf16.safetensors",
+                   "config", kH3Config);
+
+  auto names = [](const std::string& p) {
+    return fs::path(p).filename().string();
+  };
+  // Untold: the historical preference, which is what keeps a graph that
+  // predates Ref2VA working.
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  root.string())) ==
+              "minimax_h3_fl2va_bf16.safetensors");
+  // Told: the file the caller actually meant. This is the 66 GB choice.
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  root.string(), "ref2va")) ==
+              "minimax_h3_ref2va_bf16.safetensors");
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  root.string(), "fl2va")) ==
+              "minimax_h3_fl2va_bf16.safetensors");
+
+  // partition_of takes the hint as authoritative: probing this tree
+  // cannot answer, which is exactly why the hint exists.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(root.string(),
+                                                      "ref2va") == "ref2va");
+  // And the Config records what it was read AS, so the load() that
+  // follows resolves the same file rather than re-guessing.
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(
+      root.string(), cfg, &err, "ref2va"));
+  EXPECT_TRUE(cfg.partition == "ref2va");
+
+  // The models DB speaks model_type; one mapping, both directions used.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type(
+                  "minimax-h3-ref2va") == "ref2va");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type(
+                  "minimax-h3-fl2va") == "fl2va");
+  // Anything else is EMPTY, never a guess -- an unknown type must not
+  // silently select a partition.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type(
+                  "wan-t2v").empty());
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type("").empty());
+
+  std::printf("[minimax_h3_comfy] a tree with both DiTs resolves fl2va "
+              "untold, ref2va when told\n");
+  fs::remove_all(root, ec);
+}

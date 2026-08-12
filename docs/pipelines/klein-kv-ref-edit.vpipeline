@@ -77,6 +77,14 @@
       "config": {}
     },
     {
+      "id": "flux2-model-config",
+      "type": "flux2-model-config",
+      "iports": [],
+      "config": {
+        "klein_kv": true
+      }
+    },
+    {
       "id": "generate-image",
       "type": "generate-image",
       "iports": [
@@ -103,12 +111,19 @@
         {
           "src": "vae-encode",
           "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "flux2-model-config",
+          "oport": 0
         }
       ],
       "config": {
         "steps": 4,
-        "i8_gemm": true,
-        "klein_kv": true
+        "i8_gemm": true
       }
     },
     {

@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "generative-models/shared/dit-block-progress.h"
 
 #include <memory>
@@ -85,6 +86,57 @@ class MetalWanTransformer {
   // the file is missing or is not a WanTransformer3DModel config.
   static bool config_from_json(const std::string& dit_dir, Config& out,
                                std::string* err = nullptr);
+
+  // What a CALLER chooses per generation, as against Config, which is what
+  // the checkpoint IS. It lives here rather than in the driving stage
+  // because every field is a fact about this family: a stage that also
+  // drives other video DiTs would otherwise carry Wan's guidance rules,
+  // Wan's expert boundary and the next family's knobs side by side, and
+  // have to know which apply to what is resident.
+  struct GenerationParams {
+    // Classifier-free guidance. Wan is NOT distilled: without a negative
+    // conditioning there is nothing to guide away from, and the caller
+    // forces this to 1 rather than running a second forward for nothing.
+    double guidance_scale   = 3.5;
+    // The LOW-noise expert's, on a two-expert checkpoint (A14B). Two
+    // scales rather than one because the pair is trained that way -- the
+    // experts see different sigma ranges and want different guidance.
+    double guidance_scale_2 = 3.5;
+    // The sigma at which the low-noise expert takes over. 0 = a single
+    // expert, which is what every other family here is.
+    double boundary_ratio   = 0.9;
+    // Whether `boundary_ratio` above was ASKED for or is just the
+    // default. It decides who wins against the checkpoint's own
+    // model_index.json: an explicit choice does, a default does not.
+    // Without this the file would always win and the key would be inert.
+    bool boundary_ratio_set = false;
+
+    // Parse the `wan2-model-config` beat. Absent keys keep the defaults
+    // above; `err` collects what was ignored, and is not fatal.
+    static GenerationParams from_flex(const FlexData& fd,
+                                      std::string* err = nullptr);
+
+    // Which expert `sigma` belongs to: 0 = high noise (`transformer`),
+    // 1 = low noise (`transformer_2`). Always 0 when there is no
+    // boundary. The schedule descends, so a loop asking this every step
+    // crosses at most once.
+    int expert_for(double sigma) const
+    {
+      return (boundary_ratio > 0.0 && sigma < boundary_ratio) ? 1 : 0;
+    }
+    double guidance_for(int expert) const
+    {
+      return expert == 1 ? guidance_scale_2 : guidance_scale;
+    }
+  };
+
+  // `boundary_ratio` as the CHECKPOINT states it. It lives in the
+  // pipeline's model_index.json rather than in either expert's own
+  // config, because it is a property of the pair; an explicit null there
+  // means a single-expert pipeline and reads as 0. Returns `fallback`
+  // when the file is missing or unreadable.
+  static double boundary_ratio_from_index(const std::string& root,
+                                          double fallback);
 
   // Prefer the WeightSet overload: the set is the manager's shared,
   // reference-counted view of the checkpoint. The dir overload opens a

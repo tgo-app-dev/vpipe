@@ -984,9 +984,12 @@ function mountEditor(container, opts = {}) {
   }
 
   // Category display order + labels for the toolbox sections.
+  // model-specific-config sits right after generative: the stages in it
+  // exist to feed the generative ones, and they are the only group whose
+  // applicability depends on which checkpoint is resident.
   const CATEGORY_ORDER = ['preparation', 'visual', 'vision', 'generative',
-                          'audio', 'text', 'network', 'control', 'database',
-                          'generic'];
+                          'model-specific-config', 'audio', 'text',
+                          'network', 'control', 'database', 'generic'];
 
   function stageChip(s) {
     const ins = (s.iports || []).length;

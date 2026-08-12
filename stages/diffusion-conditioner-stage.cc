@@ -8,6 +8,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-config-source.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -89,7 +90,18 @@ const PortSpec kIports[] = {
                                 "and deepstack run. Krea-2 is single-reference "
                                 "by design and ignores it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "model_config",
+   .doc = "OPTIONAL model-specific parameters from the resident family's own "
+          "config source (krea2-model-config, mage-flow-model-config, "
+          "boogu-image-model-config, qwen-image-edit-model-config). Today "
+          "that means how a REFERENCE IMAGE is prepared for the grounded "
+          "encode: each family's reference pipeline bounds it differently "
+          "and the numbers are not interchangeable. Unwired, the family's "
+          "own numbers apply",
+   .type = &typeid(FlexDataPayload),
+   .tags = "model-config", .clock_group = 0},
 };
+[[maybe_unused]] constexpr unsigned kModelCfgPort = 5;
 const PortSpec kOports[] = {
   {.name = "conditioning",
    .doc = "conditioning tensor for the generate-image DiT (family-shaped + typed: "
@@ -850,6 +862,8 @@ DiffusionConditionerStage::reset_run_state()
   // re-emitted beat is never latched and this stage keeps the previous
   // run's selection.
   _model_latched    = false;
+  _cfg_latched      = false;
+  _model_cfg        = FlexData{};
   _negative_latched = false;
   // Re-decided next launch: peers may differ.
   _unload_resolved  = false;
@@ -923,6 +937,36 @@ DiffusionConditionerStage::initialize(RuntimeContext& ctx)
   co_return;
 }
 
+// Re-seed the grounded-encode parameters for the family that is now
+// resident and overlay whatever the config beat set. Both directions of
+// one question, run on every change to either, because a config beat and
+// a model reference arrive on different ports and either can be first.
+void
+DiffusionConditionerStage::apply_model_config_()
+{
+  // The FAMILY's numbers first, ALWAYS -- not merged onto whatever was
+  // there. A previous family's bounds surviving a checkpoint change is
+  // the failure this ordering exists to prevent, and it would be
+  // invisible: the encode succeeds either way, just at a resolution the
+  // model was not trained against.
+  _ground = genai::GroundedEncodeParams::for_family(_family);
+  const std::string want = model_config::family_of(_model_cfg);
+  if (!want.empty() && want != _family) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): the model_config beat is for the "
+        "'{}' family but the resident checkpoint is '{}'; IGNORING it and "
+        "using the family's own numbers. Wire the config stage that matches "
+        "the checkpoint", this->id(), want, _family));
+    return;
+  }
+  std::string perr;
+  _ground.merge_flex(_model_cfg, &perr);
+  if (!perr.empty() && !_model_cfg.is_null()) {
+    session()->warn(fmt("DiffusionConditionerStage('{}'): model_config: {}",
+                        this->id(), perr));
+  }
+}
+
 void
 DiffusionConditionerStage::ensure_loaded_()
 {
@@ -943,6 +987,9 @@ DiffusionConditionerStage::ensure_loaded_()
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
   _family = family_((std::filesystem::path(root) / "transformer").string());
+  // Seeded here and again below: the H3 probe can still change the
+  // family, and `_ground` has to describe whichever one wins.
+  apply_model_config_();
   // `transformer/` is the DIFFUSERS spelling, and MiniMax-H3 also ships as
   // a Comfy-Org repack whose DiT is one .safetensors under
   // `diffusion_models/` (or, after model-quantize, a directory checkpoint
@@ -955,6 +1002,7 @@ DiffusionConditionerStage::ensure_loaded_()
     if (genai::MetalMiniMaxH3Transformer::config_from_json(root, probe,
                                                            nullptr)) {
       _family = "minimax-h3";
+      apply_model_config_();
     }
   }
   // Boogu names its text encoder `mllm/` (it is a full multimodal LLM, not a
@@ -1149,8 +1197,16 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
     const int mm = _vision->config().merge;
     for (int i = 0; i < _n_ref; ++i) {
       int vgh = 0, vgw = 0;
+      // Qwen2.5-VL takes the pixel budget directly and smart-resizes from
+      // it, so this family has no separate long-edge cap. A budget of 0
+      // would mean "no image at all" rather than "unbounded", so the
+      // family's own number stands in -- 0 here is a config mistake, not
+      // a mode.
+      const std::size_t budget = _ground.pixel_budget > 0
+                                     ? _ground.pixel_budget
+                                     : (std::size_t)384 * 384;
       SharedBuffer vt = _vision->encode_rgb(_ref_rgb[i].data(), _ref_rgb_h[i],
-                                            _ref_rgb_w[i], 384 * 384, vgh, vgw);
+                                            _ref_rgb_w[i], budget, vgh, vgw);
       if (vt.empty()) { return {}; }
       const int tok = (vgh / mm) * (vgw / mm);
       _img_mh[i] = vgh / mm; _img_mw[i] = vgw / mm; _img_tok[i] = tok;
@@ -1207,15 +1263,14 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       // the reference, which is what the goldens measure and what the DiT
       // was trained alongside.) Krea-2 stays f16 -- its own verified state.
       vcfg.use_bf16 = mage;
-      if (mage) {
-        // Mage-Flow's preprocessor_config.json sets size.shortest_edge 65536
-        // (vs the Qwen processor default 3136), so a small or very wide
-        // reference is UPSCALED before patching. Past ~2.25:1 aspect the
-        // 384-capped image falls under 65536 px and the default bound would
-        // silently skip that upscale.
-        vcfg.min_pixels = 65536;
-        vcfg.max_pixels = 16777216;
-      }
+      // The processor bounds, from the model layer rather than from
+      // literals here. `min_pixels` is what makes a small or very wide
+      // reference get UPSCALED before patching: past ~2.25:1 aspect a
+      // 384-capped image falls under Mage-Flow's 65536 and the Qwen
+      // default of 3136 would silently skip that upscale. 0 means the
+      // family did not set one, so the tower's own default stands.
+      if (_ground.min_pixels > 0) { vcfg.min_pixels = _ground.min_pixels; }
+      if (_ground.max_pixels > 0) { vcfg.max_pixels = _ground.max_pixels; }
       // Qwen3-VL normalizes images to [-1,1] (mean/std 0.5), NOT the OpenAI-CLIP
       // defaults the loader assumes when the repo ships no preprocessor_config.
       // With CLIP normalization the vision tokens -- hence the grounded image
@@ -1254,17 +1309,21 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
     // training preprocessing -- pipeline.py `vl_cond_long_edge`); the VAE
     // reference path keeps the full target resolution. krea2's grounding
     // node uses 768.
+    // The GEOMETRY comes from the model layer (_ground); the FILTER and
+    // the alignment stay per-family code. That split is deliberate: a
+    // bound is a number someone might reasonably tune for a fine-tune,
+    // while "LANCZOS, floor-aligned to 16" is Boogu's algorithm, and
+    // matching the filter matters as much as the geometry -- a box
+    // average leaves the image-row conditioning ~3x further from the
+    // reference after LM amplification.
     if (_family == "boogu-image") {
-      // BooguImagePipeline's VLM preprocessing: max_pixels 384*384, max side
-      // 768, floor-aligned to vae_scale_factor 16, LANCZOS. Matching the FILTER
-      // matters as much as the geometry -- a box average leaves the image-row
-      // conditioning ~3x further from the reference after LM amplification.
       cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
-                        384 * 2, capped, &rh, &rw, (std::size_t)384 * 384, 16,
-                        /*lanczos=*/true);
+                        _ground.long_edge, capped, &rh, &rw,
+                        _ground.pixel_budget, 16, /*lanczos=*/true);
     } else {
       cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
-                        mage ? 384 : 768, capped, &rh, &rw);
+                        _ground.long_edge, capped, &rh, &rw,
+                        _ground.pixel_budget);
     }
     const std::uint8_t* rgb = capped.empty() ? _ref_rgb[ri].data()
                                              : capped.data();
@@ -2082,6 +2141,25 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr) { co_return; }
 
+  // The model config. Latched, but RE-READ whenever another beat is
+  // waiting: a config source with no trigger emits once for the whole
+  // run, while a trigger-driven one emits per request. Blocking on the
+  // first beat and polling after serves both -- the first prompt waits
+  // for the parameters it was wired to use, later ones pick up a change
+  // without waiting for one that may never come. Unlike the DiT's, every
+  // parameter here is read per encode, so a late change simply applies.
+  if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
+      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+    auto gb = co_await ctx.read(kModelCfgPort);
+    _cfg_latched = true;
+    if (const auto* gfd =
+            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+      _model_cfg = gfd->data;
+      // Only once the family is known; otherwise ensure_loaded_ applies
+      // it at the moment it becomes known.
+      if (_load_attempted) { apply_model_config_(); }
+    }
+  }
   // Latch the shared model (iport2) once -- a model-select source overrides the
   // hf_dir config -- then lazily load the encoder before we need it.
   if (!_model_latched && ctx.num_iports() > kModelPort &&

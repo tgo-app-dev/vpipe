@@ -76,6 +76,72 @@ human_bytes_(uint64_t n)
   return fmt("{:.1f} {}", v, u[i])();
 }
 
+// Which of the catalogue entries published from one repo the caller
+// meant, from the `model_variant` config key.
+//
+// The browse flow disambiguates these by walking version -> parameter
+// class -> variant; a configured `model_path` names only the REPO, so
+// without this the fetch silently takes the first entry -- which for
+// MiniMax-H3 means asking for Ref2VA and downloading FL2VA, since the
+// two pin different files out of one repo and differ in nothing else a
+// path can express.
+//
+// Exact hits beat substrings so a fully-spelled selector is never
+// ambiguous, and anything that does not resolve to exactly one entry is
+// an ERROR listing the candidates -- the one outcome worse than
+// refusing is guessing.
+const ModelCatalogEntry*
+pick_catalog_entry_(const SessionContextIntf* s,
+                    const vector<const ModelCatalogEntry*>& cands,
+                    const string& hf_path, const string& want)
+{
+  auto lower = [](string v) {
+    for (char& c : v) { c = (char)tolower((unsigned char)c); }
+    return v;
+  };
+  auto describe = [&]() {
+    string out;
+    for (const ModelCatalogEntry* e : cands) {
+      out += "\n  - ";
+      out += e->version.empty() ? "(no version)" : e->version;
+      if (!e->param_class.empty()) { out += " " + e->param_class; }
+      if (!e->variant.empty())     { out += " [" + e->variant + "]"; }
+      if (!e->name.empty())        { out += " name=" + e->name; }
+      if (!e->model_type.empty())  { out += " type=" + e->model_type; }
+    }
+    return out;
+  };
+
+  if (want.empty()) {
+    s->error(fmt("ModelFetchStage: '{}' publishes {} models and "
+                 "model_path cannot say which; set model_variant to one "
+                 "of:{}", hf_path, cands.size(), describe()));
+    return nullptr;
+  }
+  const string w = lower(want);
+  vector<const ModelCatalogEntry*> exact, part;
+  for (const ModelCatalogEntry* e : cands) {
+    const string fields[] = {lower(e->version), lower(e->variant),
+                             lower(e->name), lower(e->model_type)};
+    bool is_exact = false, is_part = false;
+    for (const string& f : fields) {
+      if (f.empty()) { continue; }
+      if (f == w) { is_exact = true; }
+      else if (f.find(w) != string::npos) { is_part = true; }
+    }
+    if (is_exact)     { exact.push_back(e); }
+    else if (is_part) { part.push_back(e); }
+  }
+  const vector<const ModelCatalogEntry*>& hits =
+      exact.empty() ? part : exact;
+  if (hits.size() == 1) { return hits.front(); }
+  s->error(fmt("ModelFetchStage: model_variant '{}' matches {} of the {} "
+               "models published from '{}'; it has to select exactly one "
+               "of:{}", want, hits.size(), cands.size(), hf_path,
+               describe()));
+  return nullptr;
+}
+
 // ---- interactive selection --------------------------------------------
 
 // Outcome of one interactive level pick.
@@ -353,6 +419,8 @@ ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
 
   _base_path           = attr_str("base_path");
   _model_path          = attr_str("model_path");
+  _model_variant       = attr_str("model_variant");
+  _model_key           = attr_str("model_key");
   _hf_token            = attr_str("hf_token");
   _overwrite_existing  = attr_bool("overwrite_existing");
   _prepare_tokenizer   = attr_bool("prepare_tokenizer");
@@ -371,6 +439,31 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "model_path", .type = ConfigType::String,
    .doc = "non-interactive: a direct 'owner/repo' (or full URL); empty "
           "-> prompt / browse the catalogue"},
+  {.key = "model_key", .type = ConfigType::String,
+   .doc = "register under THIS key in the models DB instead of the "
+          "catalogue name / hf path. Lets two models published from one "
+          "repo share a directory on disk and still be separate DB "
+          "entries: fetch Comfy-Org/MiniMax-H3 twice, once with "
+          "model_variant=fl2va + model_key=Comfy-Org/MiniMax-H3-FL2VA and "
+          "once with ref2va, and each record carries its OWN model_type, "
+          "version and file list while the bytes are downloaded once "
+          "(skip_existing_files keeps the shared encoder and VAEs from "
+          "being fetched twice). Empty -> the catalogue name, else the hf "
+          "path, as before",
+   .def_str = ""},
+  {.key = "model_variant", .type = ConfigType::String,
+   .doc = "WHICH model, when several are published from one repo and "
+          "`model_path` cannot say. Matched (case-insensitively) against "
+          "the catalogue entry's version, variant, name and model_type; an "
+          "exact hit on any of those wins over a substring. This is the "
+          "non-interactive form of the version/variant menu the browse "
+          "flow shows -- e.g. Comfy-Org/MiniMax-H3 publishes both the "
+          "FL2VA and the Ref2VA partition, which pin DIFFERENT files, so "
+          "\"ref2va\" is what asks for the second. Empty is fine when the "
+          "repo publishes one model; when it publishes several the fetch "
+          "is refused with the candidates listed, rather than quietly "
+          "taking the first",
+   .def_str = ""},
   {.key = "hf_token", .type = ConfigType::String,
    .doc = "HuggingFace token for gated/private repos; empty -> $HF_TOKEN "
           "(prompted via getpasswd if a download is gated)"},
@@ -532,13 +625,37 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
   }
   if (!entry) {
-    entry = catalog_by_path(hf_path);   // enrich a typed path if known
+    // Enrich a typed path if the catalogue knows it. One repo can publish
+    // SEVERAL models -- MiniMax-H3's two partitions come out of one
+    // Comfy-Org repo and pin different files, and the supplement repo
+    // holds six archives -- so taking the first match would download the
+    // wrong one and register it under the right name. `model_variant` is
+    // the non-interactive form of the menu the browse flow shows.
+    const vector<const ModelCatalogEntry*> cands =
+        catalog_all_by_path(hf_path);
+    if (cands.size() == 1 && _model_variant.empty()) {
+      entry = cands.front();
+    } else if (!cands.empty()) {
+      entry = pick_catalog_entry_(s, cands, hf_path, _model_variant);
+    }
   }
 
-  // Registration key: a catalogue `name` (so several archives sharing one
-  // hf_path repo register under distinct keys) else the hf_path itself.
+  // Registration key: `model_key` when the caller named one, else a
+  // catalogue `name` (so several archives sharing one hf_path repo
+  // register under distinct keys), else the hf_path itself.
+  //
+  // Naming it is what lets two models published from ONE repo share a
+  // directory and still be separate DB entries -- MiniMax-H3's two
+  // partitions are the case: they differ only in which DiT file they
+  // pin, so the bytes want to be downloaded once while the records want
+  // to carry different model_types. The record below takes its
+  // descriptive fields from the chosen catalogue ENTRY, not from
+  // re-probing the shared directory, which is what keeps the two
+  // records distinct.
   const string reg_key =
-      (entry && !entry->name.empty()) ? entry->name : hf_path;
+      !_model_key.empty()
+          ? _model_key
+          : ((entry && !entry->name.empty()) ? entry->name : hf_path);
 
   // -------- 2. Resolve the download location ---------------------------
   string base_in = _base_path;

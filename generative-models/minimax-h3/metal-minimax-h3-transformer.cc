@@ -129,10 +129,15 @@ blk_(const char* prefix, int i, const char* rest)
 // ---- config ----------------------------------------------------------
 
 std::string
-MetalMiniMaxH3Transformer::partition_of(const std::string& path)
+MetalMiniMaxH3Transformer::partition_of(const std::string& path,
+                                       const std::string& hint)
 {
   namespace fs = std::filesystem;
-  const std::string dit = resolve_dit_dir(path);
+  // A hint from the models DB is authoritative -- see the header. Two
+  // records can share one directory exactly so that probing it cannot
+  // answer, which is the case this exists for.
+  if (!hint.empty()) { return hint; }
+  const std::string dit = resolve_dit_dir(path, hint);
   auto lower = [](std::string v) {
     for (char& c : v) { c = (char)std::tolower((unsigned char)c); }
     return v;
@@ -197,7 +202,17 @@ MetalMiniMaxH3Transformer::partition_of(const std::string& path)
 }
 
 std::string
-MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path)
+MetalMiniMaxH3Transformer::partition_of_model_type(
+    const std::string& model_type)
+{
+  if (model_type == "minimax-h3-fl2va")  { return "fl2va"; }
+  if (model_type == "minimax-h3-ref2va") { return "ref2va"; }
+  return {};
+}
+
+std::string
+MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path,
+                                          const std::string& partition)
 {
   namespace fs = std::filesystem;
   fs::path p(path);
@@ -207,8 +222,14 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path)
   // self-describing file rather than to a config.json that would not
   // describe those bytes' qkv grouping.
   {
+    // The asked-for partition ranks first; the historical `fl2va`
+    // preference stays as the fallback so every graph written before
+    // Ref2VA existed keeps resolving the way it did.
+    const std::vector<std::string> prefer =
+        partition.empty() ? std::vector<std::string>{"fl2va"}
+                          : std::vector<std::string>{partition, "fl2va"};
     const std::string f = comfy::resolve_component(path, "diffusion_models",
-                                                   kComfyKey, {"fl2va"});
+                                                   kComfyKey, prefer);
     if (!f.empty()) { return f; }
   }
   if (!fs::is_directory(p)) { return path; }
@@ -239,16 +260,76 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path)
   return path;
 }
 
+MetalMiniMaxH3Transformer::GenerationParams
+MetalMiniMaxH3Transformer::GenerationParams::from_flex(const FlexData& fd,
+                                                       std::string* err)
+{
+  GenerationParams p;
+  if (!fd.is_object()) {
+    if (err != nullptr) { *err = "not a JSON object; using the defaults"; }
+    return p;
+  }
+  auto o = fd.as_object();
+  if (o.contains("video_shift")) {
+    p.video_shift = o.at("video_shift").as_real(p.video_shift);
+  }
+  if (o.contains("audio_shift")) {
+    p.audio_shift = o.at("audio_shift").as_real(p.audio_shift);
+  }
+  if (o.contains("condition_timestep")) {
+    p.condition_timestep =
+        o.at("condition_timestep").as_real(p.condition_timestep);
+  }
+  if (o.contains("condition_audio_timestep")) {
+    p.condition_audio_timestep =
+        o.at("condition_audio_timestep").as_real(p.condition_audio_timestep);
+  }
+  if (o.contains("audio_seconds")) {
+    p.audio_seconds = o.at("audio_seconds").as_real(p.audio_seconds);
+  }
+  // A shift multiplies the schedule, so a non-positive one collapses it
+  // to a single sigma and generates noise. The timesteps are levels in
+  // t = 1 - sigma and live in [0, 1].
+  if (!(p.video_shift > 0.0)) { p.video_shift = 12.0; }
+  if (!(p.audio_shift > 0.0)) { p.audio_shift = 3.0; }
+  auto clamp01 = [](double v) {
+    return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+  };
+  p.condition_timestep = clamp01(p.condition_timestep);
+  p.condition_audio_timestep = clamp01(p.condition_audio_timestep);
+  if (p.audio_seconds < 0.0) { p.audio_seconds = 0.0; }
+  return p;
+}
+
+int
+MetalMiniMaxH3Transformer::GenerationParams::audio_latents(int num_frames,
+                                                           double fps) const
+{
+  if (audio_seconds > 0.0) {
+    return (int)(audio_seconds * (double)minimax_h3::kAudioLatentsPerSecond +
+                 0.5);
+  }
+  return minimax_h3::audio_latent_num_frames(num_frames, fps);
+}
+
 bool
 MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
-                                            Config& out, std::string* err)
+                                            Config& out, std::string* err,
+                                            const std::string& partition)
 {
   namespace fs = std::filesystem;
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
-  fs::path p(resolve_dit_dir(dit_dir));
+  fs::path p(resolve_dit_dir(dit_dir, partition));
+  // Record WHICH partition this config describes, so the load() that
+  // follows resolves the same file this was read from. Without it a
+  // caller could read a Ref2VA config and then load the FL2VA weights
+  // out of the same directory -- the configs are byte-identical, so
+  // nothing downstream would notice.
+  out.partition =
+      partition.empty() ? partition_of(p.string()) : partition;
   const bool is_comfy = comfy::is_component(p.string(), kComfyKey);
   FlexData cfg;
   // ---- the Comfy-Org single file -------------------------------------
@@ -463,8 +544,9 @@ MetalMiniMaxH3Transformer::load(const std::string& dit_dir, MetalCompute* mc,
                                 const Config& cfg, bool stream_blocks,
                                 double pin_frac)
 {
-  return load(WeightSet::open(resolve_dit_dir(dit_dir), nullptr), mc, cfg,
-              stream_blocks, pin_frac);
+  return load(WeightSet::open(resolve_dit_dir(dit_dir, cfg.partition),
+                             nullptr),
+              mc, cfg, stream_blocks, pin_frac);
 }
 
 std::unique_ptr<MetalMiniMaxH3Transformer>

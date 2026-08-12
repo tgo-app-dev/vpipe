@@ -16,6 +16,7 @@
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-memory.h"
+#include "stages/model-registry.h"
 #endif
 
 #include <cstdint>
@@ -65,27 +66,21 @@ namespace vpipe {
 //   iport0  prompt       FlexDataPayload (string or {text: ...}),
 //                        required. Used VERBATIM -- no chat template,
 //                        no special tokens.
-//   iport1  references   FlexDataPayload, required: the reference list
-//                        IN THE ORDER THE MODEL SHOULD READ IT. The
-//                        order labels the references in the
-//                        presentation and lays them out on the shared
-//                        rotary clock, so a different order is a
-//                        different request, not a different spelling
-//                        of one. Either an array or an object with a
-//                        `references` array -- or a JSON STRING of
-//                        either, so the list can come from the same
-//                        `text-prompt` / `load-text` sources the prompt
-//                        does. Each entry is
-//                        `{kind: "image"|"video"|"audio", path: "..."}`
-//                        or a bare path string. `kind` may be left out
-//                        and is then read off the container. A video
-//                        entry conditions on its own soundtrack unless
-//                        it sets `audio: false`.
-//   iport2  model        OPTIONAL FlexDataPayload model reference (a
+//   iport1  model        OPTIONAL FlexDataPayload model reference (a
 //                        `model-select` source); overrides hf_dir so
 //                        the encoder / DiT / vae stages of a graph
 //                        share one model. When wired, the load is
 //                        DEFERRED to the first process().
+//
+// THE REFERENCES ARE CONFIG, not a port. They are files to open, which
+// is what a `references` config key is and what the composer's file
+// browser fills in -- it multi-selects straight into the list. The list
+// arrived as a beat first, and as a JSON STRING at that (no stage in
+// this tree emits a structured FlexData literal, so it had to be
+// authored as text somewhere and parsed here); that made the one input
+// a user actually edits the one input they could not pick with a file
+// dialog, and made a typo in a quoted path a runtime warning instead of
+// something the browser could not produce.
 //
 //   oport0  conditioning TensorBeatPayload bf16 [n_tokens, 5120] -- the
 //                        Qwen3-VL-32B layer-50 tap over the whole
@@ -110,9 +105,34 @@ namespace vpipe {
 //                        none.
 //
 // Config (FlexData object):
+//   references       (string or array of strings, REQUIRED) -- the
+//                              reference files IN THE ORDER THE MODEL
+//                              SHOULD READ THEM. The order labels them
+//                              in the presentation ("<Picture 1>",
+//                              "<Video 2>", ...) and lays them out on
+//                              the shared rotary clock, so a different
+//                              order is a different request, not a
+//                              different spelling of one.
+//
+//                              WHAT each file is -- image, video or
+//                              audio -- is read from the FILE, not from
+//                              its name or from a `kind` the caller
+//                              states. See probe_media_file: an
+//                              extension is a claim and the bytes are
+//                              the fact, and a browser hands over
+//                              whatever the user picked. A container
+//                              with one frame is an IMAGE reference,
+//                              not a one-frame clip: the two rules
+//                              genuinely differ (2048 short edge and no
+//                              area cap, against the target's canvas
+//                              rule), so reading a still as video would
+//                              encode it at a quarter the detail.
+//
+//                              A video reference conditions on its own
+//                              soundtrack when it has one.
 //   hf_dir           (string, OPTIONAL) -- the MiniMax-H3 model dir. A
 //                                          model-select source on
-//                                          iport2 overrides it.
+//                                          iport1 overrides it.
 //   frames           (int)  -- the GENERATED frame count, snapped up to
 //                              `17n + 5`. MUST MATCH the generate-video
 //                              stage's `frames`: it is the duration
@@ -165,6 +185,10 @@ public:
 private:
   std::string   _hf_dir;
   std::string   _enc_dir;
+  // The reference files, in read order, resolved from the config once.
+  // Paths only: WHAT each one is comes from the file when it is opened,
+  // not from anything held here.
+  std::vector<std::string> _references;
   int           _frames = 121;
   int           _ref_short_edge = 2048;
   double        _video_sample_fps = 2.0;
@@ -196,13 +220,13 @@ private:
   void ensure_loaded_();
   bool load_models_(metal_compute::MetalCompute* mc);
 
-  // Parse the reference list off an iport1 beat and DECODE the media it
-  // names, bringing the rates along. False (with a warned reason) on a
-  // malformed list or an undecodable file -- a reference that silently
+  // DECODE the configured reference files, classifying each by content
+  // and bringing its rates along. False (with a warned reason) on an
+  // undecodable or unclassifiable file -- a reference that silently
   // dropped out would change the presentation's numbering and every
-  // label after it.
-  bool decode_request_(
-      const FlexData& spec,
+  // label after it, which is a quietly different request rather than a
+  // failed one.
+  bool decode_references_(
       std::vector<genai::minimax_h3::MediaReference>* out);
 
   // ---- idle unload -------------------------------------------------
@@ -215,6 +239,10 @@ private:
   bool _unload_resolved = false;
   bool _unloaded        = false;
   std::string _root;
+  // "ref2va" / "fl2va" from the models DB, empty when it did not say.
+  // A repo holding both partitions resolves by FILENAME otherwise, and
+  // the filename prefers fl2va.
+  std::string _partition;
   // The dirs the idle-unload heuristic weighs: this stage's own
   // components plus the DiT it is paired with. Filled at load.
   std::vector<std::string> _peer_dirs;

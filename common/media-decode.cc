@@ -764,6 +764,92 @@ decode_video_impl_(const FFmpegLibraries* libs,
 
 }  // namespace
 
+string_view
+media_kind_name(MediaKind k) noexcept
+{
+  switch (k) {
+    case MediaKind::Image: return "image";
+    case MediaKind::Video: return "video";
+    case MediaKind::Audio: return "audio";
+    case MediaKind::Unknown: break;
+  }
+  return "unknown";
+}
+
+optional<MediaProbe>
+probe_media_file(const FFmpegLibraries* libs, const string& path,
+                 string* error)
+{
+  if (!libs || !libs->valid()) {
+    set_err_(error, "FFmpeg libraries unavailable");
+    return nullopt;
+  }
+  OpenedInput in;
+  if (!open_input_(libs, &path, {}, &in, error)) { return nullopt; }
+
+  MediaProbe p;
+  const int v_idx = find_stream_(in.fctx, AVMEDIA_TYPE_VIDEO);
+  const int a_idx = find_stream_(in.fctx, AVMEDIA_TYPE_AUDIO);
+  p.has_video = v_idx >= 0;
+  p.has_audio = a_idx >= 0;
+  if (in.fctx->duration > 0) {
+    p.duration_seconds = (double)in.fctx->duration / (double)AV_TIME_BASE;
+  }
+  if (v_idx >= 0) {
+    const AVStream* vs = in.fctx->streams[v_idx];
+    p.width  = vs->codecpar->width;
+    p.height = vs->codecpar->height;
+    p.nb_frames = (long long)vs->nb_frames;
+    const AVRational fr = (vs->avg_frame_rate.num > 0 &&
+                           vs->avg_frame_rate.den > 0)
+                              ? vs->avg_frame_rate
+                              : vs->r_frame_rate;
+    if (fr.num > 0 && fr.den > 0) {
+      p.fps = (double)fr.num / (double)fr.den;
+    }
+  }
+
+  // A still image IS a one-frame video stream to FFmpeg, so the question
+  // is never "is there video" but "does it move". Three signals, in
+  // order of how much they can be trusted:
+  //
+  //   1. The DEMUXER. FFmpeg routes stills through dedicated image
+  //      demuxers -- `image2`, `png_pipe`, `jpeg_pipe`, `webp_pipe`,
+  //      ... -- and picking one is a statement about the file, not a
+  //      guess from its name: it comes from probing the bytes.
+  //   2. nb_frames == 1. A container that counted its frames and got 1.
+  //   3. No rate and no duration. What is left when the container says
+  //      nothing at all, which is the case for a raw single frame.
+  //
+  // The `_pipe` demuxers are the interesting case: they also serve
+  // ANIMATED webp/gif, so the demuxer alone would call a short animation
+  // a still. It is therefore only decisive when the frame count agrees
+  // -- 0 (not counted) or 1 -- and a demuxer that reports 12 frames wins
+  // over its own name.
+  if (v_idx >= 0) {
+    const char* fmt = (in.fctx->iformat && in.fctx->iformat->name)
+                          ? in.fctx->iformat->name : "";
+    const string fname(fmt);
+    const bool image_demuxer =
+        fname == "image2" || fname == "image2pipe" ||
+        (fname.size() > 5 &&
+         fname.compare(fname.size() - 5, 5, "_pipe") == 0);
+    const bool says_one   = p.nb_frames == 1;
+    const bool says_none  = p.nb_frames <= 0 && p.duration_seconds <= 0.0;
+    p.kind = ((image_demuxer && p.nb_frames <= 1) || says_one || says_none)
+                 ? MediaKind::Image
+                 : MediaKind::Video;
+    // A still with a soundtrack is not a thing; if the container really
+    // carries audio, believe the audio and call it a video.
+    if (p.kind == MediaKind::Image && p.has_audio) {
+      p.kind = MediaKind::Video;
+    }
+  } else if (a_idx >= 0) {
+    p.kind = MediaKind::Audio;
+  }
+  return p;
+}
+
 optional<DecodedImage>
 decode_image_file(const FFmpegLibraries* libs,
                   const string&          path,

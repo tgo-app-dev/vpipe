@@ -7,6 +7,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-config-source.h"
 #include "stages/model-registry.h"
 #include "stages/denoise-progress.h"
 
@@ -61,32 +62,6 @@ const ConfigKey kAttrs[] = {
    .doc = "denoising steps", .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "initial-noise RNG seed (default 0)"},
-  {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
-   .doc = "classifier-free guidance (wan; on a two-expert checkpoint this is "
-          "the HIGH-noise expert's). Needs a negative conditioning on iport1; "
-          "without one, guidance is forced to 1. Inert on a guidance-"
-          "distilled family (minimax-h3)", .def_real = 3.5},
-  {.key = "guidance_scale_2", .type = ConfigType::Real, .required = false,
-   .doc = "classifier-free guidance for the LOW-noise expert (wan's "
-          "two-expert checkpoints, e.g. A14B)", .def_real = 3.5},
-  {.key = "boundary_ratio", .type = ConfigType::Real, .required = false,
-   .doc = "sigma at which the low-noise expert takes over from the high-noise "
-          "one (wan). Read from the checkpoint's model_index.json when "
-          "present; 0 means a single expert, which is what every other family "
-          "here is", .def_real = 0.9},
-  {.key = "video_shift", .type = ConfigType::Real, .required = false,
-   .doc = "sigma shift for the VIDEO schedule (minimax-h3; inert on wan, "
-          "which takes its shift from the scheduler spec)",
-   .def_real = 12.0},
-  {.key = "audio_shift", .type = ConfigType::Real, .required = false,
-   .doc = "sigma shift for the AUDIO schedule (minimax-h3)", .def_real = 3.0},
-  {.key = "condition_timestep", .type = ConfigType::Real, .required = false,
-   .doc = "the timestep the pinned keyframe rows are conditioned on "
-          "(minimax-h3); 1.0 is CLEAN in this model's t = 1 - sigma "
-          "convention", .def_real = 1.0},
-  {.key = "audio_seconds", .type = ConfigType::Real, .required = false,
-   .doc = "audio duration for minimax-h3; 0 derives it from frames / fps",
-   .def_real = 0.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
@@ -147,6 +122,15 @@ const PortSpec kIports[] = {
           "f32 [rows, 32], channel-major within a reference. Rides along at "
           "a clean timestep and is never denoised",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "model_config",
+   .doc = "OPTIONAL model-specific parameters from the resident family's own "
+          "config source -- wan2-model-config (guidance, expert boundary) or "
+          "minimax-h3-model-config (sigma shifts, condition timesteps, audio "
+          "duration). Passed to that family's GenerationParams UNREAD, so "
+          "this stage carries none of the knobs. Unwired, the family runs "
+          "its documented defaults",
+   .type = &typeid(FlexDataPayload),
+   .tags = "model-config", .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
@@ -155,6 +139,23 @@ const PortSpec kIports[] = {
 [[maybe_unused]] constexpr unsigned kRefPort1    = 6;
 [[maybe_unused]] constexpr unsigned kRefVideoRowsPort = 7;
 [[maybe_unused]] constexpr unsigned kRefAudioRowsPort = 8;
+[[maybe_unused]] constexpr unsigned kModelCfgPort     = 9;
+
+// The keys that MOVED to the per-family config stages. Named here so a
+// pipeline written against the old union says what to do instead of
+// silently running the defaults -- an unknown key is not an error
+// anywhere in this runtime, which is exactly what makes a quiet removal
+// the wrong way to do this.
+struct MovedKey { const char* key; const char* to; };
+constexpr MovedKey kMovedKeys[] = {
+  {"guidance_scale",     "wan2-model-config"},
+  {"guidance_scale_2",   "wan2-model-config"},
+  {"boundary_ratio",     "wan2-model-config"},
+  {"video_shift",        "minimax-h3-model-config"},
+  {"audio_shift",        "minimax-h3-model-config"},
+  {"condition_timestep", "minimax-h3-model-config"},
+  {"audio_seconds",      "minimax-h3-model-config"},
+};
 
 const PortSpec kOports[] = {
   {.name = "latent",
@@ -183,29 +184,6 @@ const StageSpec kSpec = {
   .attrs     = kAttrs,
 };
 
-#ifdef VPIPE_BUILD_APPLE_SILICON
-// boundary_ratio lives in the PIPELINE config (model_index.json), not in
-// either expert's own config, because it is a property of the pair.
-double
-boundary_from_index_(const std::string& root, double fallback)
-{
-  std::ifstream in(std::filesystem::path(root) / "model_index.json");
-  if (!in) { return fallback; }
-  FlexData fd;
-  try {
-    fd = FlexData::from_json(in);
-  } catch (...) {
-    return fallback;
-  }
-  if (!fd.is_object()) { return fallback; }
-  auto o = fd.as_object();
-  if (!o.contains("boundary_ratio")) { return fallback; }
-  FlexData br = o.at("boundary_ratio");
-  if (br.is_null()) { return 0.0; }   // explicitly a single-expert pipeline
-  return br.as_real(fallback);
-}
-#endif
-
 }  // namespace
 
 GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
@@ -222,13 +200,22 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _fps    = attr_real("fps");
   _steps  = (int)attr_int("steps");
   _seed   = (std::uint64_t)attr_int("seed");
-  _guidance   = attr_real("guidance_scale");
-  _guidance_2 = attr_real("guidance_scale_2");
-  _boundary   = attr_real("boundary_ratio");
-  _video_shift   = attr_real("video_shift");
-  _audio_shift   = attr_real("audio_shift");
-  _cond_timestep = attr_real("condition_timestep");
-  _audio_seconds = attr_real("audio_seconds");
+  // The family-specific keys are gone from this stage; a pipeline still
+  // carrying one gets told where it went. Warning rather than failing
+  // because the key is now inert, not wrong -- the graph runs, it just
+  // runs on defaults, and that is precisely the outcome that needs to be
+  // said out loud.
+  {
+    auto o = this->config().as_object();
+    for (const auto& mk : kMovedKeys) {
+      if (o.contains(mk.key)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): config key '{}' moved to the '{}' "
+            "stage and is IGNORED here; wire one to the model_config iport "
+            "or the family runs its defaults", this->id(), mk.key, mk.to));
+      }
+    }
+  }
   if (_height <= 0) { _height = 480; }
   if (_width  <= 0) { _width  = 832; }
   if (_frames <= 0) { _frames = 81; }
@@ -328,7 +315,14 @@ GenerateVideoStage::declare_resources() const
   // itself against, so a 24 GB DiT reported as 0 bytes is exactly the
   // silent under-count the resource-planning phase exists to prevent.
   // Falls back to the diffusers spelling when nothing resolves.
-  std::string dit = genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+  // Declared BEFORE anything loads, so the partition can only come from
+  // the reference itself -- resolve_model() reads the record without
+  // touching the weights.
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
   if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
   return model_memory::weight_claims({dit});
 #else
@@ -343,6 +337,8 @@ GenerateVideoStage::reset_run_state()
   _model_latched = false;
   _sampler_latched = false;
   _scheduler_latched = false;
+  _cfg_latched = false;
+  _model_cfg = FlexData{};
 }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -355,7 +351,10 @@ GenerateVideoStage::resolve_config_()
 {
   if (_have_cfg || _hf_dir.empty()) { return; }
   namespace fs = std::filesystem;
-  _root = resolve_model_dir(session(), _hf_dir);
+  // The whole record, not just the path: `model_type` is what tells the
+  // two MiniMax-H3 partitions apart when they share a directory.
+  _resolved = resolve_model(session(), _hf_dir);
+  _root = _resolved.dir;
   const std::string t1 = (fs::path(_root) / "transformer").string();
   // The DiT's own `_class_name` picks the family. Reading it here rather
   // than taking it from config keeps a graph from having to be rewired
@@ -372,8 +371,16 @@ GenerateVideoStage::resolve_config_()
   // (Reading `transformer/config.json` directly is what left every stage
   // in this graph inert on a repack root.)
   std::string h3err;
+  // What the models DB says this reference IS, which the DIRECTORY may
+  // not be able to say: two records can share one local_path so that a
+  // repo holding both partitions downloads once, and then only the
+  // record distinguishes them.
+  const std::string want_partition =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          _resolved.model_type);
   if (genai::MetalMiniMaxH3Transformer::config_from_json(_root, _h3_cfg,
-                                                         &h3err)) {
+                                                         &h3err,
+                                                         want_partition)) {
     _family = "minimax-h3";
   }
   if (_family == "minimax-h3") {
@@ -390,22 +397,34 @@ GenerateVideoStage::resolve_config_()
     // initialize() -- a Ref2VA checkpoint with no reference rows wired
     // is refused there, where iport connectivity is known.
     _h3_partition =
-        genai::MetalMiniMaxH3Transformer::partition_of(_root);
+        genai::MetalMiniMaxH3Transformer::partition_of(_root, want_partition);
+    // Which partition, and on whose authority. Worth a line: when a
+    // directory holds both, "probed" and "the models DB" can disagree,
+    // and the DB is the one that knows.
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): MiniMax-H3 partition '{}' (models DB "
+        "says model_type '{}', so {})", this->id(),
+        _h3_partition.empty() ? "unknown" : _h3_partition,
+        _resolved.model_type.empty() ? "-" : _resolved.model_type,
+        want_partition.empty() ? "probed the checkpoint"
+                               : "taken from the record"));
     // Now that the family is known, round the frame count UP to H3's own
     // rule (see the constructor): the video VAE takes 17-frame clips and
     // keeps 5 latents from each, so only 17n+5 has a latent form.
     align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
     // _h3_cfg is already filled -- the detection above IS the read.
-    _two_experts = false;
-    _boundary    = 0.0;      // one stack; nothing to switch at
+    _two_experts = false;   // one stack; nothing to switch at
     _have_cfg    = true;
+    // The family is only now known, so this is the first moment a config
+    // beat that already arrived can be parsed by anything.
+    apply_model_config_();
     // NOTE: the idle-unload policy is NOT decided here. It needs the
     // streaming verdict, which only exists after the load -- see
     // resolve_unload_policy_h3_().
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
         "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
-        _frames, _steps, _video_shift, _audio_shift));
+        _frames, _steps, _h3_params.video_shift, _h3_params.audio_shift));
     return;
   }
   std::string cerr;
@@ -416,9 +435,8 @@ GenerateVideoStage::resolve_config_()
   }
   align_frames_(genai::MetalWanVae::align_num_frames(_frames));
   _two_experts = fs::exists(fs::path(_root) / "transformer_2" / "config.json");
-  _boundary = boundary_from_index_(_root, _boundary);
-  if (!_two_experts) { _boundary = 0.0; }
   _have_cfg = true;
+  apply_model_config_();   // as above: the family is only now known
   if (!_unload_resolved) {
     _unload_resolved = true;
     const std::vector<std::string> peers = {
@@ -438,7 +456,56 @@ GenerateVideoStage::resolve_config_()
       "in_channels {}{}", this->id(),
       _two_experts ? "A14B (two experts)" : "single-expert",
       _width, _height, _frames, _steps, _cfg.in_channels,
-      _two_experts ? fmt(", boundary {:.2f}", _boundary)() : std::string()));
+      _two_experts ? fmt(", boundary {:.2f}", _wan_params.boundary_ratio)()
+                   : std::string()));
+}
+
+// Both directions of one question: what did the caller ask for, and what
+// does the checkpoint say. It runs on every change to either because a
+// config beat and a model reference arrive on different ports and either
+// can be first -- parsing at only one of those moments loses whichever
+// came earlier.
+void
+GenerateVideoStage::apply_model_config_()
+{
+  if (!_have_cfg) { return; }   // the family is not known yet
+  // Report a config wired to the wrong family rather than applying it.
+  // The two share no keys, so nothing would be read and the graph would
+  // run on defaults while showing a config stage that says otherwise.
+  const std::string want = model_config::family_of(_model_cfg);
+  if (!want.empty() && want != _family) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): the model_config beat is for the '{}' "
+        "family but the resident checkpoint is '{}'; IGNORING it and using "
+        "the defaults. Wire the config stage that matches the checkpoint",
+        this->id(), want, _family));
+    return;
+  }
+  std::string perr;
+  if (_family == "minimax-h3") {
+    _h3_params =
+        genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
+            _model_cfg, &perr);
+  } else {
+    _wan_params =
+        genai::MetalWanTransformer::GenerationParams::from_flex(_model_cfg,
+                                                                &perr);
+    // The checkpoint's own boundary, UNLESS the graph asked for one. A
+    // stock A14B states it in model_index.json and every graph that never
+    // mentions the key must keep getting it; a graph that does mention it
+    // means it.
+    if (!_wan_params.boundary_ratio_set) {
+      _wan_params.boundary_ratio =
+          genai::MetalWanTransformer::boundary_ratio_from_index(
+              _root, _wan_params.boundary_ratio);
+    }
+    // One expert has nothing to switch to, whatever anyone asked for.
+    if (!_two_experts) { _wan_params.boundary_ratio = 0.0; }
+  }
+  if (!perr.empty() && !_model_cfg.is_null()) {
+    session()->warn(fmt("GenerateVideoStage('{}'): model_config: {}",
+                        this->id(), perr));
+  }
 }
 
 bool
@@ -459,7 +526,8 @@ GenerateVideoStage::ensure_expert_(int which)
     // other DiT families ask rather than assuming the stack fits.
     namespace fs = std::filesystem;
     const std::string dit_dir =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root);
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root,
+                                                          _h3_partition);
     // Through the encoder's own resolver, not by spelling a sibling of
     // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
     // encoder lives under `text_encoders/`, so building the path by hand
@@ -577,21 +645,27 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
   // A Ref2VA checkpoint with no reference rows wired would load, run at
   // full 33B cost, and generate video conditioned on nothing -- the two
   // partitions ship byte-identical DiT configs, so nothing downstream
-  // would notice. Refused here rather than in resolve_config_ because
-  // this is the first point where iport connectivity is known. (When
-  // the model arrives on the model iport the partition is not known
-  // yet; process() makes the same check per request.)
+  // would notice.
+  //
+  // WARNED here, ENFORCED in process(). fail_config() cannot be used at
+  // this point: the runtime reads config_error() BEFORE launch and a
+  // stage that sets it during initialize() is never re-checked, so the
+  // refusal would be dead code. This is the first moment iport
+  // connectivity is known, which is why the notice lives here and the
+  // per-request refusal -- the one that actually stops a wrong
+  // generation -- lives where the beat arrives.
   if (_h3_partition == "ref2va" &&
       !(ctx.num_iports() > kRefVideoRowsPort &&
         ctx.iport_connected(kRefVideoRowsPort))) {
-    fail_config(fmt(
+    session()->warn(fmt(
         "GenerateVideoStage('{}'): '{}' is MiniMax-H3's Ref2VA partition, "
         "which conditions on a list of reference images, clips and "
-        "soundtracks. Wire a `video-ref-encoder` stage to iport{} "
-        "(ref_video_rows) and iport{} (ref_audio_rows), or use the FL2VA "
-        "checkpoint for text-to-video and first/last-frame work.",
-        this->id(), _root, kRefVideoRowsPort, kRefAudioRowsPort));
-    co_return;
+        "soundtracks, but iport{} (ref_video_rows) is unwired -- every "
+        "request will be refused. Wire a `video-ref-encoder` to iport{} "
+        "and iport{}, or use the FL2VA checkpoint for text-to-video and "
+        "first/last-frame work.",
+        this->id(), _root, kRefVideoRowsPort, kRefVideoRowsPort,
+        kRefAudioRowsPort));
   }
   co_return;
 }
@@ -840,13 +914,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     return false;
   }
   // Audio latents are counted from the VIDEO frames and fps, so the two
-  // modalities stay the same duration by construction. `audio_seconds`
-  // overrides that for a clip whose audio is deliberately a different
-  // length.
-  const int alat =
-      _audio_seconds > 0.0
-          ? (int)(_audio_seconds * (double)h3::kAudioLatentsPerSecond + 0.5)
-          : h3::audio_latent_num_frames(aligned, _fps);
+  // modalities stay the same duration by construction -- unless the
+  // config asked for a soundtrack of its own length. The rule is the
+  // model's, so the model layer states it.
+  const int alat = _h3_params.audio_latents(aligned, _fps);
 
   h3::PackedLayout L;
   // Text rows are tagged 1 EXCEPT the rows of a vision block, which
@@ -1036,9 +1107,9 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   req.video  = vid.data();
   req.audio  = aud.data();
   req.num_steps   = _steps;
-  req.video_shift = _video_shift;
-  req.audio_shift = _audio_shift;
-  req.condition_timestep = (float)_cond_timestep;
+  // The shifts and both condition levels in one move, so a knob added to
+  // GenerationParams reaches the loop without this call site changing.
+  req.set_params(_h3_params);
   UiProgress bar = session()->open_progress("denoise");
   // Block-granular, like the image DiTs. A step here is one forward of a
   // 33B stack over a ~19k-row sequence -- tens of seconds at the model's
@@ -1170,6 +1241,26 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         session()->warn(fmt("GenerateVideoStage('{}'): scheduler spec: {}",
                             this->id(), cerr));
       }
+    }
+  }
+
+  // The model config. Latched like the sampler and scheduler, but
+  // RE-READ whenever another beat is waiting: a config source with no
+  // trigger emits once for the whole run, while one driven by a trigger
+  // emits per request. Blocking on the first beat and polling after
+  // serves both -- the first request waits for the parameters it was
+  // wired to use, and later ones pick up a change without waiting for
+  // one that may never come.
+  if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
+      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+    auto gb = co_await ctx.read(kModelCfgPort);
+    _cfg_latched = true;
+    if (const auto* gfd =
+            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+      _model_cfg = gfd->data;
+      // Only if the family is already known; otherwise resolve_config_
+      // applies it the moment it is.
+      apply_model_config_();
     }
   }
 
@@ -1513,7 +1604,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (failed) { return out; }
     // Two experts, one boundary, one crossing: the schedule descends, so
     // this swaps at most once per clip.
-    const int want = (_boundary > 0.0 && sigma < _boundary) ? 1 : 0;
+    const int want = _wan_params.expert_for(sigma);
     if (!ensure_expert_(want)) { failed = true; return out; }
     // Crossing the boundary rebuilds _dit, which takes the old hook with
     // it; re-arm on whatever is loaded now. No-op when nothing swapped.
@@ -1544,7 +1635,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // The scheduler's timestep is sigma on its native 0..num_train scale,
     // which is what the DiT's sinusoidal embedding was trained against.
     const float ts = (float)(sigma * (double)sched.num_train);
-    const double g = (_expert == 1) ? _guidance_2 : _guidance;
+    const double g = _wan_params.guidance_for(_expert);
     std::string derr;
     SharedBuffer vp =
         _dit->forward(dit_in, T, h8, w8, tpos, text_seq, ts, &derr);
@@ -1588,8 +1679,8 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       session()->log_debug(fmt(
           "GenerateVideoStage('{}'): step {}/{} sigma {:.4f} ({}-noise "
           "expert)", this->id(), i + 1, sched.steps, sigmas[(std::size_t)i],
-          (_boundary > 0.0 && sigmas[(std::size_t)i] < _boundary) ? "low"
-                                                                  : "high"));
+          _wan_params.expert_for(sigmas[(std::size_t)i]) == 1 ? "low"
+                                                             : "high"));
       sampler.step(i, x, denoise);
       prog.end_step(i);
     }

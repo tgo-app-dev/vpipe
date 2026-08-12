@@ -160,13 +160,7 @@ private:
   double      _strength{};      // img2img: 0 => text-to-image (pure noise)
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
-  // Mage-Flow provenance watermark (Gaussian-Shading in the initial noise).
-  // ON by default -- the reference applies it unconditionally, and it is
-  // distribution-preserving, so there is no quality reason to skip it.
-  bool        _watermark{};
-  std::string _watermark_key;
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
-  bool        _klein_kv{};           // checkpoint is FLUX.2-klein-9b-kv
   std::uint64_t _seed{};
   std::uint64_t _latents_emitted = 0;
 
@@ -179,8 +173,24 @@ private:
   // beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
+  bool _cfg_latched    = false;
+
+  // The last model-config beat, held UNPARSED. Which family's parser
+  // reads it is not known until the checkpoint resolves, and the two
+  // beats arrive on different ports in either order.
+  FlexData _model_cfg;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // The resident family's own parameters, as ITS model layer defines
+  // them. Both held rather than one variant: the families share no keys,
+  // and a struct wide enough for both would describe neither.
+  genai::MetalFlux2Transformer::GenerationParams _flux2_params;
+  genai::mage_wm::Params _wm_params;
+  // Re-parse `_model_cfg` for the family that is now resident. Called
+  // when either input changes -- a new config beat, or a model that just
+  // resolved. Returns false when the beat is for another family, which
+  // is reported and then ignored.
+  bool apply_model_config_();
   // Resolve _hf_dir + load the family DiT (idempotent: the _load_attempted
   // guard runs the body at most once). Called from initialize() when the model
   // comes from config, or from the first process() when it arrives on the model

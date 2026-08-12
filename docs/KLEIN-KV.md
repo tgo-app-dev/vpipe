@@ -20,6 +20,13 @@ with several references at modest output sizes.
 > running one checkpoint through the other's forward pass is not slower, it
 > is **wrong**. Both shipped pipelines set `klein_kv: true`; leave it set for
 > this checkpoint and unset for any other.
+>
+> It is set on a **`flux2-model-config`** stage wired to `generate-image`'s
+> `model_config` iport, not in `generate-image`'s own config. Model-specific
+> settings live in per-family stages so a graph shows which checkpoint it was
+> built for — and so a key that does not apply to the resident model is a
+> visible wiring mistake rather than a line of config that is quietly
+> ignored.
 
 ## What you need
 
@@ -207,7 +214,7 @@ It logs what it chose. On a larger machine everything simply stays resident.
 | stage | key | shipped | notes |
 |---|---|---|---|
 | `generate-image` | `steps` | 4 | The checkpoint is guidance-distilled. 4 is the recipe, not a corner cut. |
-| `generate-image` | `klein_kv` | `true` | **Required** for this checkpoint, wrong for any other. See the note at the top. |
+| `flux2-model-config` | `klein_kv` | `true` | **Required** for this checkpoint, wrong for any other. See the note at the top. Wired to `generate-image`'s `model_config` iport. |
 | `generate-image` | `i8_gemm` | `true` | Dynamic-int8 GEMMs for the DiT's big matmuls — about **2×** their f16 rate, and **lossy**. Ignored on a GPU without NAX matrix cores, so it is safe to leave on. Turn it off to compare quality. |
 | `image-resample` | `width`/`height` | 512 × 512 | Sets the **output** size too, since `generate-image` infers it from the reference latent. `fit: crop` fills the frame; `pad` would letterbox grey into the reference. |
 | `model-select` | `hf_dir` | `local/FLUX.2-klein-9b-kv-4bit` | Names the model once; the conditioner, VAEs and DiT all latch it. |

@@ -30,8 +30,10 @@ class Stage;
 // drivers are guaranteed to be at final_suspend before their Job
 // objects are destroyed.
 //
-// Pool and default-edge-capacity are reached through SessionMember's
-// `session()->thread_pool()` / `session()->default_edge_capacity()`.
+// The worker pool is reached through SessionMember's
+// `session()->thread_pool()`. Edge-buffer depth is NOT a session knob:
+// each oport's OportPolicy decides it, defaulting to soft-threshold
+// mode (warn at 1024 active Beats, throw at 2048).
 class PipelineRuntime : public SessionMember {
 public:
   PipelineRuntime(Pipeline*                 pipeline,

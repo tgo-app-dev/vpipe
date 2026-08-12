@@ -12,18 +12,20 @@
 
 namespace vpipe {
 
-std::string
-resolve_model_dir(const SessionContextIntf* session,
-                  const std::string&        ref)
+ResolvedModel
+resolve_model(const SessionContextIntf* session, const std::string& ref)
 {
+  ResolvedModel out;
+  out.dir = ref;
   if (!session) {
-    return ref;
+    return out;
   }
   LmdbEnv* env = session->services()->lmdb_env();
   if (!env) {
-    return ref;
+    return out;
   }
   std::string local;
+  std::string mtype;
   try {
     // LmdbDb opens (creates if absent) the sub-db; a read txn then looks
     // up the key. No write txn is held, so the open-during-RW deadlock
@@ -32,7 +34,7 @@ resolve_model_dir(const SessionContextIntf* session,
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadOnly);
     auto    view = db.get(txn, ref);
     if (!view) {
-      return ref;
+      return out;
     }
     const std::string bytes(*view);   // copy before the txn ends
     txn.abort();
@@ -42,15 +44,29 @@ resolve_model_dir(const SessionContextIntf* session,
       if (obj.contains("local_path")) {
         local = std::string(obj.at("local_path").as_string(""));
       }
+      if (obj.contains("model_type")) {
+        mtype = std::string(obj.at("model_type").as_string(""));
+      }
     }
   } catch (...) {
-    return ref;
+    return out;
   }
   if (local.empty()) {
-    return ref;
+    return out;
   }
   session->info(fmt("model registry: '{}' -> '{}'", ref, local));
-  return local;
+  out.dir           = local;
+  out.key           = ref;
+  out.model_type    = mtype;
+  out.from_registry = true;
+  return out;
+}
+
+std::string
+resolve_model_dir(const SessionContextIntf* session,
+                  const std::string&        ref)
+{
+  return resolve_model(session, ref).dir;
 }
 
 bool

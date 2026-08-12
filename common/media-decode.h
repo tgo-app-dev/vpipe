@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // One-shot FFmpeg decode helpers for single media items -- the glue
@@ -34,6 +35,47 @@ struct DecodedImage {
   int                       height = 0;
   std::vector<std::uint8_t> rgb;   // planar [3,H,W], contiguous
 };
+
+// What a media file IS, decided from the file rather than from its name.
+//
+// A name is a claim and the bytes are the fact, and the two part company
+// often enough to matter: a `.mp4` a phone recorded with the camera
+// covered is an audio-only container, an animated `.webp` is a video, a
+// `.gif` may be either, and a file a browser handed over can carry any
+// extension at all. A caller that classifies by extension therefore
+// hands a still to a video decoder -- which succeeds, at one frame --
+// or a soundtrack to an image decoder, which fails late.
+enum class MediaKind { Unknown, Image, Video, Audio };
+
+std::string_view media_kind_name(MediaKind) noexcept;   // "image", ...
+
+struct MediaProbe {
+  MediaKind kind = MediaKind::Unknown;
+  bool      has_video = false;   // a video stream is present...
+  bool      has_audio = false;   // ...which does NOT make it kind Video
+  int       width  = 0;
+  int       height = 0;
+  // The container's reported rate and length. 0 when it does not say --
+  // which is normal for a still and for some streamed containers, so
+  // neither is a reliable classifier on its own.
+  double    fps = 0.0;
+  double    duration_seconds = 0.0;
+  // Frames the container CLAIMS, 0 when unknown. A claim of 1 is the
+  // single strongest still-image signal there is.
+  long long nb_frames = 0;
+};
+
+// Classify `path` by opening it. nullopt only when it cannot be opened
+// or demuxed at all; a file FFmpeg understands but that carries neither
+// video nor audio comes back as MediaKind::Unknown rather than a
+// failure, so a caller can report it per file instead of aborting a
+// batch.
+//
+// Cheap: it demuxes headers and does not decode a frame.
+std::optional<MediaProbe>
+probe_media_file(const FFmpegLibraries* libs,
+                 const std::string&     path,
+                 std::string*           error = nullptr);
 
 struct DecodedAudio {
   int                sample_rate = 0;   // == requested target rate

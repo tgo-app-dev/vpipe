@@ -75,6 +75,7 @@ set(LOCAL_TEST_SOURCES
   image-metadata.cc
   video-stages.cc
   wan-video-stages.cc
+  model-config-stages.cc
   video-to-rgb-stage.cc
   videos-db-cleanup-stage.cc
   ws-discovery.cc

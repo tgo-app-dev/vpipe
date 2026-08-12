@@ -4,6 +4,7 @@
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 
 #include <functional>
 #include <map>
@@ -90,6 +91,28 @@ class MetalFlux2Transformer {
     // Isolating the references is also what makes their K/V independent of
     // the denoising step, which is what KvCache then exploits.
     bool  klein_kv = false;
+  };
+
+  // What a CALLER chooses for a FLUX.2 run, as against Config, which is
+  // read from the checkpoint. It lives here rather than in the driving
+  // stage because it is a fact about this family: no other DiT in this
+  // tree has a distilled variant that is indistinguishable from its
+  // sibling on disk.
+  //
+  // `klein_kv` is the awkward one, and it is why this struct exists at
+  // all rather than being folded into Config. It is a property of the
+  // WEIGHTS -- so it has to be known before load() -- but nothing on
+  // disk says it, so it can only come from the caller. It therefore
+  // arrives as configuration and is then applied to Config.
+  struct GenerationParams {
+    bool klein_kv = false;
+
+    // Parse the `flux2-model-config` beat. Absent keys keep the defaults
+    // above; `err` collects what was ignored, and is not fatal.
+    static GenerationParams from_flex(const FlexData& fd,
+                                      std::string* err = nullptr);
+
+    void apply_to(Config& cfg) const { cfg.klein_kv = klein_kv; }
   };
 
   // Cross-step reference K/V cache -- the point of the -kv checkpoint.

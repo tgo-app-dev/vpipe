@@ -6,6 +6,7 @@
       "type": "model-fetch",
       "config": {
         "model_path": "Comfy-Org/MiniMax-H3",
+        "model_variant": "fl2va",
         "hf_token": "",
         "base_path": "./models",
         "skip_existing_files": true,
@@ -15,7 +16,12 @@
     {
       "id": "quant-dit",
       "type": "model-quantize",
-      "iports": [ { "src": "fetch", "oport": 0 } ],
+      "iports": [
+        {
+          "src": "fetch",
+          "oport": 0
+        }
+      ],
       "config": {
         "src_model": "Comfy-Org/MiniMax-H3",
         "output_name": "local/MiniMax-H3-FL2VA-4bit-dit",
@@ -29,7 +35,12 @@
     {
       "id": "quant-enc",
       "type": "model-quantize",
-      "iports": [ { "src": "quant-dit", "oport": 0 } ],
+      "iports": [
+        {
+          "src": "quant-dit",
+          "oport": 0
+        }
+      ],
       "config": {
         "src_model": "local/MiniMax-H3-FL2VA-4bit-dit",
         "output_name": "local/MiniMax-H3-FL2VA-4bit",
@@ -42,7 +53,12 @@
     {
       "id": "remove-dit-intermediate",
       "type": "model-remove",
-      "iports": [ { "src": "quant-enc", "oport": 0 } ],
+      "iports": [
+        {
+          "src": "quant-enc",
+          "oport": 0
+        }
+      ],
       "config": {
         "model": "local/MiniMax-H3-FL2VA-4bit-dit",
         "delete_files": true,

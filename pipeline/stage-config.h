@@ -98,6 +98,12 @@ struct ConfigKey {
   // When is_path: an optional filter category the browser maps to a set
   // of extensions ("image", "audio", "video", "text"); empty = no
   // filter (all files). Static storage.
+  //
+  // COMMA-SEPARATED for a field that takes more than one kind
+  // ("image,video,audio"): the dialog offers the union first and the
+  // individual categories after it. Used where the field cannot say
+  // which kind a given file is -- video-ref-encoder's reference list
+  // reads that from the file itself.
   std::string_view path_filter = {};
 };
 

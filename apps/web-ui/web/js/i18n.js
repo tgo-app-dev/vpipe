@@ -837,6 +837,7 @@ const STRINGS = {
   'cat.database': ['Database', '数据库', '資料庫'],
   'cat.network':  ['Network', '网络', '網路'],
   'cat.preparation': ['Preparation', '准备', '準備'],
+  'cat.model-specific-config': ['Model Config', '模型配置', '模型設定'],
   'cat.generic':  ['Generic', '通用', '通用'],
 
   // Stage display names + descriptions.

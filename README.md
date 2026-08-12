@@ -10,20 +10,23 @@ machines and runs its on-device generative stack on a custom **metal-compute**
 backend — its own Metal kernels, with no Python and no third-party tensor
 runtime in the forward pass.
 
-- Runs **MiniMax H3** FL2VA on Apple Silicon Mac — a 33B model generating
-  video **and its soundtrack together**, on as little as 16 GB.
+- Runs **MiniMax H3** FL2VA and REF2VA on an Apple Silicon Mac — a 33B model
+  generating video **and its soundtrack together**, on as little as 16 GB.
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
+
+  * 3.75s @ 0.5 MP 24p, 8 steps takes **13 minutes** on a fanless
+    15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
 - **Built in C++** for performance and compactness
 
-- **Full modality** support packed under **25 MB**
+- **Full modality** support packed under **25 MB** [^2]
 
 - Top-tier inference speed, enabling **realtime** visual question answering
   (VQA), automatic speech recognition (ASR), and language-model chat with
   text-to-speech (TTS)
 
 - Top-tier diffusion-transformer inference speed with **weight streaming**,
-  enabling image and video edits on systems with only 16 GB of memory —
+  enabling image and video edits on base-model systems with 16 GB of memory —
   walk through a reference image edit in
   **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
 
@@ -32,8 +35,14 @@ runtime in the forward pass.
 
 - **Mobile-friendly UI** enabling remote access from a phone
 
-- Extra acceleration from **NAX** matmul2d, convolution2d in M5 generation
+- Extra acceleration from the **NAX** matmul2d and convolution2d units on
+  M5-generation hardware
 
+[^1]: Fanless, and this run was helped by an ice pack under the
+      chassis — a stock Air will throttle sooner and take longer.
+
+[^2]: Build from source artifact size, not counting dynamically linked
+      dependencies like FFmpeg, libcurl.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
@@ -41,8 +50,14 @@ runtime in the forward pass.
 ![Python](https://img.shields.io/badge/Python-bindings-green)
 ![Status](https://img.shields.io/badge/Status-alpha-orange)
 
-[**Overview**](#overview) · [**Requirements**](#requirements) ·
-[**Build**](#build) · [**Run**](#run) · [**Examples**](EXAMPLES.md) ·
+[**Install**](#install) · [**Quickstart**](#quickstart) ·
+[**First example**](#first-example) · [**Overview**](#overview) ·
+[**Examples**](EXAMPLES.md)
+
+
+
+For developers: [**Requirements**](#requirements) ·
+[**Build from source**](#build-from-source) · [**Run**](#run) ·
 [**Tests**](#tests) · [**Structure**](#structure) ·
 [**Acknowledgements**](#acknowledgements) · [**License**](#license)
 
@@ -53,6 +68,208 @@ runtime in the forward pass.
        alt="Prompt-driven image editing running as a vpipe pipeline"
        width="900">
 </p>
+
+&emsp;&emsp;*Los Angeles Zoo, Nov 2019*
+
+&emsp;&emsp;*SONY ILCE-7RM3, FE 135mm F1.8 GM @ 1/160s, F/1.8*
+
+---
+
+## Install
+[back to top](#top)
+
+### The macOS app
+
+**[Download the latest release ▸](https://github.com/tgo-app-dev/vpipe/releases/latest)**
+Open the `.dmg`, drag **Vpipe Manager** to Applications, and launch it.
+Requires an **Apple Silicon Mac** running **macOS 26 or later**.
+
+Two builds are published. They are the same app; they differ only in
+whether FFmpeg travels with it:
+
+| Download | Size | Pick this if |
+| --- | --- | --- |
+| `VpipeManager-<version>-with-ffmpeg.dmg` | ~26 MB | You want it to work immediately. Nothing else to install. |
+| `VpipeManager-<version>-slim.dmg` | ~15 MB | You already have FFmpeg installed — Homebrew's, say — and would rather use it. |
+
+The bundled copy is a minimal **LGPL** build: it covers the common
+formats and keeps hardware H.264/HEVC/ProRes through VideoToolbox, but
+it has no libx264/x265. If you take the slim build, point the app at
+your own FFmpeg — [Quickstart](#quickstart) covers where.
+
+The app is signed and notarized, so it opens without a Gatekeeper
+warning, and it updates itself: **Vpipe Manager ▸ Check for Updates…**
+
+> **What you get.** The app is a launcher around the same two binaries
+> the command line uses — it does not reimplement anything. Its real
+> advantage is **permissions**: Camera, Microphone and Local Network
+> access are granted to the app under its own name, instead of to
+> whichever terminal you happened to run from.
+
+### Build it yourself
+
+Everything also builds from source. The pipeline core and the non-Apple
+stages are portable C++20 and build on Linux and Intel macOS; the on-device
+model stack needs an Apple Silicon Mac.
+
+```sh
+git clone --recursive https://github.com/tgo-app-dev/vpipe.git
+cd vpipe && cmake -S . -B build && cmake --build build -j
+```
+
+That is the whole story when the dependencies are already in place. For
+prerequisites, build options, the Metal toolchain and the rest, see
+**[Requirements](#requirements)** and
+**[Build from source](#build-from-source)** below.
+
+---
+
+## Quickstart
+[back to top](#top)
+
+Getting from a fresh install to a working browser UI. Everything here
+is in the app; the command-line equivalents are under [Run](#run).
+
+**1. Choose a work directory.** *Settings ▸ Work Directory ▸ Path ▸
+Choose…* — it defaults to `~/vpipe`.
+
+This is where everything lives: `models/` for anything downloaded or
+quantized, `sandbox/` for files pipelines are allowed to write, and the
+LMDB registry and logs. **Pick a volume with room.** Prepared models
+run to tens of gigabytes — MiniMax H3 downloads ~115 GB and peaks near
+~155 GB while it quantizes — and the app shows the free space on the
+volume you select. Moving it later means moving all of that.
+
+**2. Point at FFmpeg — only if you took the slim build.** *Settings ▸
+FFmpeg ▸ Library Path ▸ Choose…*
+
+Homebrew's is normally **`/opt/homebrew/lib`**. The row above the
+button says whether a usable FFmpeg was found, so you are not guessing.
+**Use Default** returns to the bundled copy. Either way the change
+takes effect the next time you start a pipeline or the server — it is
+not picked up by something already running.
+
+<p align="center">
+  <img src="docs/images/app-settings.png"
+       alt="Vpipe Manager Settings: work directory and FFmpeg library path"
+       width="720">
+</p>
+
+**3. Decide who can reach the web UI.** *Settings ▸ Web UI ▸ Bind To*
+
+- **This Mac only (127.0.0.1)** — nothing else on the network can
+  connect, and no access key is needed. Start here.
+- **Automatic (this Mac's LAN address)**, or a specific interface — so
+  a phone or another computer can connect.
+
+Anything other than *This Mac only* makes the web UI reachable from your
+network, and anyone who reaches it can start and stop pipelines, browse
+the sandbox and drive models on this Mac. An 8-character access key is
+the only thing in front of that, so use a LAN binding only when you actually
+need another device, and not on networks you do not trust. The app
+warns you in place when you select one.
+
+**Port** defaults to `9876`; change it if something else is using it.
+**HTTPS (Self-Signed)** is only needed for the low-latency Preview view
+on another device — browsers restrict WebCodecs to secure contexts —
+and costs a one-time certificate warning.
+
+<p align="center">
+  <img src="docs/images/app-settings-webui.png"
+       alt="Vpipe Manager Settings: bind address, port and HTTPS"
+       width="720">
+</p>
+
+**4. Start it.** Open the **Web UI** pane and press **Start Server**,
+then **Open in Browser**.
+
+If you chose a LAN address in step 3, the pane also shows a **QR
+code**: point a phone camera at it and the UI opens already
+authenticated, with no key to retype. If you kept *This Mac only*,
+there is no QR code — a phone could not reach `127.0.0.1` anyway. The
+access key is still shown, but this Mac connects without it.
+**Open Work Folder** and **Open Sandbox Folder** reveal those
+directories in Finder.
+
+<p align="center">
+  <img src="docs/images/app-webui.png"
+       alt="Vpipe Manager running the web UI, with link, access key and QR code"
+       width="720">
+</p>
+
+> **What the QR code contains.** Only a URL:
+> `http://<this Mac's LAN address>:<port>/<token>`. The token is 14
+> random characters, generated fresh at every start and never written
+> to disk. Nothing about you, your files, your models or your machine
+> is encoded in it — the single identifying detail is the LAN address,
+> and that is a private one like `192.168.x.x` which means nothing
+> outside your own network.
+>
+> Treat it as a password anyway, because the token is not merely
+> information. Scanning it redirects to `/?key=<access key>` and hands
+> the access key over, so anyone who can both see the code *and* reach
+> that address gets exactly the control you have: starting and stopping
+> pipelines, browsing the sandbox, driving models on this Mac. A photo,
+> a screenshot or a screen share is enough for someone on the same
+> network. Restarting the server invalidates it.
+
+The status row along the bottom shows the machine's **thermal state**.
+Sustained image or video generation heat-soaks a Mac, a fanless MacBook
+Air especially. When it reads *Throttling*, steps are taking longer
+because of the hardware, not because something has stalled.
+
+**Next:** the first example, below.
+
+---
+
+<a id="first-example"></a>
+## First example — chat with a 9B model
+[back to top](#top)
+
+The shortest path from a working install to a model answering you: two
+pipeline files, **~7.7 GB** on disk, and no conversion step to sit through —
+this checkpoint arrives already quantized.
+
+1. **Get both pipelines** —
+   [`prepare-qwen35-9b-optiq-4bit.vpipeline`](docs/pipelines/prepare-qwen35-9b-optiq-4bit.vpipeline)
+   and [`qwen35-9b-chat.vpipeline`](docs/pipelines/qwen35-9b-chat.vpipeline)
+   (**Raw ▸ Save as**, or straight from `docs/pipelines/` in a clone).
+2. **In the web UI from the Quickstart**, open the Pipeline Manager, **Load**
+   the `prepare-` one and press **Start**. It downloads the model into your
+   work directory and registers it there. Once, and never again.
+3. **Load the chat pipeline, Start it, open the User I/O panel** — and type
+   at the `you>` prompt.
+
+```
+you> In one sentence, what is the Pacific Ocean?
+The Pacific Ocean is the largest and deepest ocean on Earth, covering more
+than 30% of the planet's surface area and separating the continents of Asia
+and Australia to the east from North and South America to the west.
+```
+
+Five stages: a text input, the chat stage, a **sampler** stage carrying the
+values this checkpoint recommends for itself, and a feedback pair that makes
+it turn-by-turn. You can attach a picture to a turn — this model reads
+images too.
+
+From a source build the same two files run on the command line, which is
+where a chat prompt is most at home:
+
+```sh
+cd ~/vpipe                                        # your work directory
+./build/apps/vpipe/vpipe --launch prepare-qwen35-9b-optiq-4bit.vpipeline
+./build/apps/vpipe/vpipe --launch qwen35-9b-chat.vpipeline
+```
+
+**▸ [docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** — the walkthrough: what each
+stage is for, why sampling is a stage rather than a config key, and the knobs
+worth knowing.
+
+**Then:** **[EXAMPLES.md](EXAMPLES.md)** builds the same chat by hand in the
+web UI, and adds speech transcription. For image editing from a reference
+photo, **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**; for text-to-video *with
+sound*, **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the
+pipelines it describes.
 
 ---
 
@@ -88,6 +305,16 @@ not bundled with the source.
 > and Intel macOS, but the generative-model stack and the CoreML/Metal stages
 > require an **Apple Silicon Mac**. On arm64 macOS these features are detected
 > and enabled automatically.
+
+---
+
+<a id="developers"></a>
+## For developers and power users
+[back to top](#top)
+
+Everything above describes the app. The rest of this file is the source
+tree: what it needs to build, how to drive the same session from the
+command line, from Python or from a test binary, and where things live.
 
 ---
 
@@ -170,7 +397,7 @@ not bundled with the source.
 
 ---
 
-## Build
+## Build from source
 [back to top](#top)
 
 **1. Fetch dependencies.** LMDB and pugixml are always required; nanobind is
@@ -242,8 +469,8 @@ connects without one. Options: `--bind ADDR`, `--port N` (`0` = any free port),
 #### Connecting a phone (`--show-qr`)
 
 The UI has a phone layout, and typing an 8-character key into a phone is
-exactly the friction that stops anyone using it. `--show-qr` prints a QR code
-to the console next to the usual startup lines:
+exactly the friction that stops anyone from using it. `--show-qr` prints a
+QR code to the console next to the usual startup lines:
 
 ```sh
 ./build/apps/web-ui/vpipe-web-ui --show-qr
@@ -285,11 +512,6 @@ page in order to ask for the key in the first place.
 > `~/.vpipe/webui-tls`, so expect a one-time browser warning — and a QR scan
 > lands on that warning rather than the UI until it is accepted.
 
-New here? **[EXAMPLES.md](EXAMPLES.md)** walks through fetching a model and
-building text-chat and speech-transcription pipelines in the web UI.
-For text-to-video-and-audio, **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
-covers preparing MiniMax H3 and running it, with both pipelines to download.
-
 ### CLI
 
 `vpipe` launches pipelines straight from the terminal — a thin command-line
@@ -325,14 +547,6 @@ PYTHONPATH=build/python python3 -c "import vpipe; print(vpipe.vpipe_version())"
 Startup configuration is resolved from `VPIPE_CONFIG` / `VPIPE_CONFIG_FILE`, an
 `./init.vpipe` file, or built-in defaults. Call `vpipe.create_session(config=...)`
 to make your own session.
-
-### Log reader
-
-`vpipe-db-log-reader` dumps (or prunes) records from a VPIPE LMDB log database:
-
-```sh
-./build/apps/db-log-reader/vpipe-db-log-reader <db-path> [--from TS] [--to TS]
-```
 
 ---
 
@@ -376,8 +590,8 @@ test skips.
 
 VPIPE builds on these projects:
 
-- **[FFmpeg](https://ffmpeg.org)** — the multimedia framework vpipe decodes
-  and encodes audio and video with; compiled against its headers and
+- **[FFmpeg](https://ffmpeg.org)** — the multimedia framework vpipe uses to
+  decode and encode audio and video; compiled against its headers and
   `dlopen`ed at runtime. *LGPL-2.1-or-later (some optional components are
   GPL).*
 - **[LMDB](https://github.com/LMDB/lmdb)** — the memory-mapped key-value
@@ -416,4 +630,4 @@ VPIPE is licensed under the **Apache License, Version 2.0** — see
 licenses are documented in
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
-Brought to you by T-Go LLC.
+Brought to you by T-Go LLC, registered in California.

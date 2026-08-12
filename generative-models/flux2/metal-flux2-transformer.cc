@@ -92,6 +92,22 @@ to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
 
 }  // namespace
 
+MetalFlux2Transformer::GenerationParams
+MetalFlux2Transformer::GenerationParams::from_flex(const FlexData& fd,
+                                                   std::string* err)
+{
+  GenerationParams p;
+  if (!fd.is_object()) {
+    if (err != nullptr) { *err = "not a JSON object; using the defaults"; }
+    return p;
+  }
+  auto o = fd.as_object();
+  if (o.contains("klein_kv")) {
+    p.klein_kv = o.at("klein_kv").as_bool(p.klein_kv);
+  }
+  return p;
+}
+
 SharedBuffer
 MetalFlux2Transformer::elt_(WeightSet& ws, const std::string& nm, Retain r)
 {

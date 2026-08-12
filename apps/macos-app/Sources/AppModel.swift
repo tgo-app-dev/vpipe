@@ -92,9 +92,6 @@ final class AppModel: ObservableObject {
     @Published var numWorkers: Int {
         didSet { defaults.set(numWorkers, forKey: "numWorkers") }
     }
-    @Published var defaultEdgeCapacity: Int {
-        didSet { defaults.set(defaultEdgeCapacity, forKey: "edgeCapacity") }
-    }
     @Published var memoryCapMB: Int {
         didSet { defaults.set(memoryCapMB, forKey: "memoryCapMB") }
     }
@@ -177,7 +174,6 @@ final class AppModel: ObservableObject {
             ?? .normal
         dbMapSizeMB = d.object(forKey: "dbMapSizeMB") as? Int ?? 0
         numWorkers = d.object(forKey: "numWorkers") as? Int ?? 0
-        defaultEdgeCapacity = d.object(forKey: "edgeCapacity") as? Int ?? 0
         memoryCapMB = d.object(forKey: "memoryCapMB") as? Int ?? 0
         language = d.string(forKey: "language") ?? ""
         plugins = d.stringArray(forKey: "plugins") ?? []
@@ -304,9 +300,9 @@ final class AppModel: ObservableObject {
     //
     // Zero means "unset" for every numeric field, and an unset field is
     // OMITTED rather than sent as 0. The helpers each have a considered
-    // default (worker count from the core count, edge capacity 4,
-    // uncapped memory); writing a 0 over one of those is not the same as
-    // staying quiet, and for num_workers it would be clamped to 1 -- a
+    // default (worker count from the core count, uncapped memory);
+    // writing a 0 over one of those is not the same as staying quiet,
+    // and for num_workers it would be clamped to 1 -- a
     // single-threaded pipeline nobody asked for.
     func sessionConfigJSON() -> String {
         var root: [String: Any] = [:]
@@ -318,9 +314,6 @@ final class AppModel: ObservableObject {
         }
         root["log"] = ["level": logLevel.rawValue]
         if numWorkers > 0 { root["pool"] = ["num_workers": numWorkers] }
-        if defaultEdgeCapacity > 0 {
-            root["pipeline"] = ["default_edge_capacity": defaultEdgeCapacity]
-        }
         if memoryCapMB > 0 { root["memory_cap_mb"] = memoryCapMB }
         if !language.isEmpty { root["language"] = language }
         if !plugins.isEmpty { root["plugins"] = plugins }

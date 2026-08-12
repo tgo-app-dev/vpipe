@@ -232,6 +232,25 @@ ndtri(double p)
 
 }  // namespace
 
+Params
+Params::from_flex(const FlexData& fd, std::string* err)
+{
+  Params p;
+  if (!fd.is_object()) {
+    if (err != nullptr) { *err = "not a JSON object; using the defaults"; }
+    return p;
+  }
+  auto o = fd.as_object();
+  // Negative key, positive field -- see the note on Params.
+  if (o.contains("no_watermark")) {
+    p.enabled = !o.at("no_watermark").as_bool(false);
+  }
+  if (o.contains("watermark_key")) {
+    p.key = std::string(o.at("watermark_key").as_string(""));
+  }
+  return p;
+}
+
 std::string
 resolve_key(const std::string& explicit_key)
 {

@@ -76,6 +76,7 @@ stage_category_name(StageCategory c) noexcept
     case StageCategory::Database: return "database";
     case StageCategory::Network:  return "network";
     case StageCategory::Preparation: return "preparation";
+    case StageCategory::ModelSpecificConfig: return "model-specific-config";
   }
   return "generic";
 }

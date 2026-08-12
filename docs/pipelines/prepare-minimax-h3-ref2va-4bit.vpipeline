@@ -1,0 +1,55 @@
+{
+  "id": "prepare-minimax-h3-ref2va-4bit",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Comfy-Org/MiniMax-H3",
+        "model_variant": "ref2va",
+        "model_key": "Comfy-Org/MiniMax-H3-Ref2VA",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "quant-dit",
+      "type": "model-quantize",
+      "iports": [ { "src": "fetch", "oport": 0 } ],
+      "config": {
+        "src_model": "Comfy-Org/MiniMax-H3-Ref2VA",
+        "output_name": "local/MiniMax-H3-Ref2VA-4bit-dit",
+        "target": "dit",
+        "bits": 4,
+        "group_size": 64,
+        "quant_modulation": true,
+        "skip_existing": false
+      }
+    },
+    {
+      "id": "quant-enc",
+      "type": "model-quantize",
+      "iports": [ { "src": "quant-dit", "oport": 0 } ],
+      "config": {
+        "src_model": "local/MiniMax-H3-Ref2VA-4bit-dit",
+        "output_name": "local/MiniMax-H3-Ref2VA-4bit",
+        "target": "text_encoder",
+        "bits": 4,
+        "group_size": 64,
+        "skip_existing": false
+      }
+    },
+    {
+      "id": "remove-dit-intermediate",
+      "type": "model-remove",
+      "iports": [ { "src": "quant-enc", "oport": 0 } ],
+      "config": {
+        "model": "local/MiniMax-H3-Ref2VA-4bit-dit",
+        "delete_files": true,
+        "missing_ok": true
+      }
+    }
+  ]
+}

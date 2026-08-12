@@ -26,6 +26,8 @@
 // own generator for the magnitudes (still seed-reproducible), and the
 // inverse-normal-CDF accuracy only shapes the magnitude distribution.
 
+#include "common/flex-data.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -44,6 +46,27 @@ inline constexpr int         kMsgBits        = 256;
 // ~/.mageflow/gs_key, else the published default. Returned verbatim (still a
 // string) so key_to_entropy can classify it as integer vs passphrase.
 std::string resolve_key(const std::string& explicit_key);
+
+// What a CALLER chooses about the watermark, parsed from the
+// `mage-flow-model-config` beat. It lives with the watermark rather than
+// in the driving stage because it is entirely this family's: no other
+// model here puts provenance in its initial noise.
+//
+// `enabled` is a POSITIVE field over a negative config key
+// (`no_watermark`), on purpose. The reference applies the watermark
+// unconditionally and it is distribution-preserving, so the safe state
+// is on and the config should have to say otherwise -- but code reading
+// `if (!no_watermark)` at every use is how a double negative eventually
+// gets read wrong.
+struct Params {
+  bool        enabled = true;
+  // Empty means resolve_key()'s precedence chain decides. Held unresolved
+  // so the environment is read when the noise is built, not when the
+  // config beat happens to arrive.
+  std::string key;
+
+  static Params from_flex(const FlexData& fd, std::string* err = nullptr);
+};
 
 // numpy SeedSequence entropy for `key`: a pure (optionally signed) decimal
 // string is the integer itself, taken as |n|; anything else is a passphrase

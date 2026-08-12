@@ -347,41 +347,6 @@ attach_if_stdout_(LogDelegateIntf* d, const SessionContextIntf* sess)
   }
 }
 
-unsigned
-read_default_edge_capacity(const FlexData& config) noexcept
-{
-  constexpr unsigned kDefault = 4;
-  if (!config.is_object()) {
-    return kDefault;
-  }
-  try {
-    auto root = config.as_object();
-    if (!root.contains("pipeline")) {
-      return kDefault;
-    }
-    FlexData pl_val = root.at("pipeline");
-    if (!pl_val.is_object()) {
-      return kDefault;
-    }
-    auto pl_obj = pl_val.as_object();
-    if (!pl_obj.contains("default_edge_capacity")) {
-      return kDefault;
-    }
-    FlexData v = pl_obj.at("default_edge_capacity");
-    if (v.is_uint()) {
-      uint64_t n = v.get_uint();
-      return n > 0 ? static_cast<unsigned>(n) : 1u;
-    }
-    if (v.is_int()) {
-      int64_t n = v.get_int();
-      return n > 0 ? static_cast<unsigned>(n) : 1u;
-    }
-  } catch (...) {
-  }
-  return kDefault;
-}
-
-
 }
 
 // Collect plugin .dylib paths to load: the session config's `plugins`
@@ -463,8 +428,7 @@ Session::Session(string_view cfg)
 
   // Phase 4: read pool / pipeline knobs and construct the pool. The
   // pool logs through `this` so the delegate must be in place first.
-  unsigned workers       = read_pool_workers(_config);
-  _default_edge_capacity = read_default_edge_capacity(_config);
+  unsigned workers = read_pool_workers(_config);
   _pool = make_unique<ThreadPool>(workers, this);
   // Pool is up; switch a StdoutLogDelegate (bootstrap or chosen)
   // from sync to per-worker async logging.

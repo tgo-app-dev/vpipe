@@ -27,12 +27,13 @@ struct VpipeApp: App {
     @StateObject private var runner  = PipelineRunner()
     @StateObject private var perms   = Permissions()
     @StateObject private var updater = Updater()
+    @StateObject private var thermal = ThermalMonitor()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
         Window("Vpipe Manager", id: "main") {
             RootView(model: model, server: server, runner: runner,
-                     perms: perms)
+                     perms: perms, thermal: thermal)
                 .frame(minWidth: 820, minHeight: 560)
                 .onAppear { delegate.server = server; delegate.runner = runner }
         }
@@ -198,6 +199,7 @@ struct RootView: View {
     @ObservedObject var server: WebUIServer
     @ObservedObject var runner: PipelineRunner
     @ObservedObject var perms: Permissions
+    @ObservedObject var thermal: ThermalMonitor
     @State private var pane: Pane = .webui
 
     var body: some View {
@@ -221,6 +223,13 @@ struct RootView: View {
                 }
             }
             .navigationTitle(pane.rawValue)
+            // Inset the DETAIL column, not the split view. Spanning the
+            // whole window puts the row underneath the sidebar too,
+            // squaring off the rounded bottom corners the sidebar draws
+            // for itself. The sidebar keeps its full height this way.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                StatusRow(thermal: thermal)
+            }
         }
         .overlay(alignment: .top) { missingHelperBanner }
     }

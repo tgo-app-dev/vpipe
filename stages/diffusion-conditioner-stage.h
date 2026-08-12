@@ -19,6 +19,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/wan/metal-umt5-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
+#include "generative-models/shared/grounded-encode-params.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-memory.h"
@@ -141,12 +142,26 @@ private:
   // since the beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
+  bool _cfg_latched    = false;
+  // The last model-config beat, held UNPARSED: which family reads it is
+  // not known until the checkpoint resolves, and the two beats arrive on
+  // different ports in either order.
+  FlexData _model_cfg;
   // The idle-unload decision is taken at the first process() (post
   // init-barrier), not at load; see resolve_unload_policy_().
   bool _unload_resolved = false;
   std::vector<std::string> _peer_dirs;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // How the resident family wants a reference image prepared before its
+  // vision tower sees it. Seeded from the model layer's per-family
+  // numbers the moment the family is known, then overlaid with whatever
+  // the config beat set. See genai::GroundedEncodeParams.
+  genai::GroundedEncodeParams _ground;
+  // Re-seed `_ground` for the resident family and re-apply `_model_cfg`.
+  // Runs on every change to either, because the two arrive on different
+  // ports in either order.
+  void apply_model_config_();
   // Resolve _hf_dir + load the tokenizer / text encoder / embeds (idempotent:
   // the _load_attempted guard runs the body at most once). Called from
   // initialize() (config model) or the first process() (model iport). No-op

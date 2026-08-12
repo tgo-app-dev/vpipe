@@ -23,6 +23,7 @@ set(LOCAL_SOURCES
   shared/comfy-checkpoint.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/grounded-encode-params.cc
   shared/i8-gemm.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc
@@ -108,6 +109,7 @@ set(LOCAL_HEADERS
   shared/comfy-checkpoint.h
   shared/gguf-convert.h
   shared/gguf-file.h
+  shared/grounded-encode-params.h
   shared/mcp/file-sandbox.h
   shared/mcp/mcp-tools.h
   shared/mcp/python-sandbox.h

@@ -133,6 +133,18 @@ catalog_find(const std::string& family, const std::string& version,
 // the curated metadata).
 const ModelCatalogEntry* catalog_by_path(const std::string& hf_path);
 
+// EVERY catalogue entry published from `hf_path`, in catalogue order.
+//
+// One repo can hold several distinct models -- MiniMax-H3 ships its
+// FL2VA and Ref2VA partitions from one Comfy-Org repo, and the
+// vpipe-supplement repo holds six CoreML archives -- and the entries
+// differ in which FILES they pin. `catalog_by_path` answers with the
+// first, which is the right answer only when there is one; a caller
+// that must not silently take the wrong partition asks for all of them
+// and disambiguates.
+std::vector<const ModelCatalogEntry*>
+catalog_all_by_path(const std::string& hf_path);
+
 // Look up a catalogue entry by its `name` (the registration key used when
 // several entries share ONE hf_path -- the vpipe-supplement CoreML models).
 // catalog_by_path can't disambiguate those (they share hf_path), so the

@@ -185,7 +185,7 @@ TEST(read_any, drains_both_ports_p0_then_p1) {
 // Small edge buffers force the source to backpressure and the probe to
 // suspend on read_any repeatedly -- stressing register/notify/deregister.
 TEST(read_any, drains_both_ports_under_backpressure) {
-  Session sess(R"({"pipeline":{"default_edge_capacity":4}})");
+  Session sess;
   auto w = build(sess, 64, 48, TwoPortSource::Order::Interleaved);
   ASSERT_TRUE(run_pipeline(sess, w));
   lock_guard<mutex> lk(w.probe->mu);
@@ -205,7 +205,7 @@ TEST(read_any, wakes_on_second_port_only) {
 
 // Interleaved writes across both ports, tight buffers.
 TEST(read_any, interleaved_both_ports) {
-  Session sess(R"({"pipeline":{"default_edge_capacity":2}})");
+  Session sess;
   auto w = build(sess, 40, 40, TwoPortSource::Order::Interleaved);
   ASSERT_TRUE(run_pipeline(sess, w));
   lock_guard<mutex> lk(w.probe->mu);

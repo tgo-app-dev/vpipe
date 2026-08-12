@@ -91,6 +91,56 @@ blk_(int i, const char* rest)
 
 }  // namespace
 
+MetalWanTransformer::GenerationParams
+MetalWanTransformer::GenerationParams::from_flex(const FlexData& fd,
+                                                 std::string* err)
+{
+  GenerationParams p;
+  if (!fd.is_object()) {
+    if (err != nullptr) { *err = "not a JSON object; using the defaults"; }
+    return p;
+  }
+  auto o = fd.as_object();
+  if (o.contains("guidance_scale")) {
+    p.guidance_scale = o.at("guidance_scale").as_real(p.guidance_scale);
+  }
+  if (o.contains("guidance_scale_2")) {
+    p.guidance_scale_2 = o.at("guidance_scale_2").as_real(p.guidance_scale_2);
+  }
+  if (o.contains("boundary_ratio")) {
+    p.boundary_ratio = o.at("boundary_ratio").as_real(p.boundary_ratio);
+    p.boundary_ratio_set = true;
+  }
+  // Guidance below 1 points AWAY from the prompt, which is never what a
+  // caller means; clamping keeps a typo from producing an expensive
+  // nonsense clip. The boundary is a sigma, so it lives in [0, 1].
+  if (p.guidance_scale < 1.0)   { p.guidance_scale = 1.0; }
+  if (p.guidance_scale_2 < 1.0) { p.guidance_scale_2 = 1.0; }
+  if (p.boundary_ratio < 0.0)   { p.boundary_ratio = 0.0; }
+  if (p.boundary_ratio > 1.0)   { p.boundary_ratio = 1.0; }
+  return p;
+}
+
+double
+MetalWanTransformer::boundary_ratio_from_index(const std::string& root,
+                                               double fallback)
+{
+  std::ifstream in(std::filesystem::path(root) / "model_index.json");
+  if (!in) { return fallback; }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return fallback;
+  }
+  if (!fd.is_object()) { return fallback; }
+  auto o = fd.as_object();
+  if (!o.contains("boundary_ratio")) { return fallback; }
+  FlexData br = o.at("boundary_ratio");
+  if (br.is_null()) { return 0.0; }   // explicitly a single-expert pipeline
+  return br.as_real(fallback);
+}
+
 bool
 MetalWanTransformer::config_from_json(const std::string& dit_dir, Config& out,
                                       std::string* err)

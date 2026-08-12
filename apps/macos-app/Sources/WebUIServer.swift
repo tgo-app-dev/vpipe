@@ -71,13 +71,20 @@ final class WebUIServer: ObservableObject {
         try? FileManager.default.removeItem(at: f)
 
         var args = ["--port", String(model.port),
-                    "--show-qr",
                     "--emit-connection-json", f.path]
         // Empty means "let vpipe-web-ui choose", which is its own
         // default (this Mac's LAN address) -- so send nothing.
         if !model.bindAddress.isEmpty {
             args += ["--bind", model.bindAddress]
         }
+        // A QR code only makes sense for a server another device can
+        // reach. Bound to loopback the link would encode 127.0.0.1,
+        // which resolves on the phone to the phone -- offering it
+        // invites a scan that silently fails. Not asking for it also
+        // means no second secret is minted for a run that cannot use
+        // one. Omitting the flag leaves qr_link absent from the
+        // connection JSON, which is what hides it in the UI.
+        if model.bindIsRemote { args.append("--show-qr") }
         if model.useTLS { args.append("--tls") }
 
         // Mirrors vpipe-web-ui's own precedence: --white-list-path and

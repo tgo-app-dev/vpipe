@@ -17,6 +17,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 #include "stages/model-memory.h"
+#include "stages/model-registry.h"
 #endif
 
 #include <cstdint>
@@ -112,6 +113,23 @@ namespace vpipe {
 //   iport8  OPTIONAL reference AUDIO rows from the same encoder: f32
 //           [rows, 32], channel-major within a reference. They ride at a
 //           clean timestep and are never denoised.
+//   iport9  OPTIONAL model-specific parameters from the resident family's
+//           config source -- `wan2-model-config` (guidance, expert
+//           boundary) or `minimax-h3-model-config` (sigma shifts,
+//           condition timesteps, audio duration). One FlexData object
+//           tagged `model-config`, passed to the family's own
+//           GenerationParams::from_flex UNREAD, so this stage carries
+//           none of the knobs and a family can add one without touching
+//           it. Unwired, every family runs its documented defaults.
+//
+// WHY THE KNOBS LEFT THIS STAGE'S CONFIG. Serving several families from
+// one stage made its config the UNION of what they need, where each key
+// was inert on the family that was not resident -- and inert SILENTLY, so
+// a `video_shift` set on a Wan graph did nothing and said nothing. Which
+// keys apply is now a wiring decision: what is connected is what applies,
+// the graph shows which family it was built for, and a mismatch is a
+// warning instead of a no-op. What stays here is what every video model
+// answers to -- geometry, length, steps, seed, residency.
 //
 // The GEOMETRY those rows belong to -- how many latent frames and cells
 // each reference encoded to, and the per-row modality tags of the
@@ -144,20 +162,10 @@ namespace vpipe {
 //   fps              (real) -- stamped on the latent for the decoder
 //   steps            (int)  -- denoising steps
 //   seed             (int)  -- initial-noise RNG seed
-//   guidance_scale   (real) -- CFG for the HIGH-noise expert
-//   guidance_scale_2 (real) -- CFG for the LOW-noise expert
-//   boundary_ratio   (real) -- sigma below which the low-noise expert takes
-//                              over; 0 => single expert          [wan]
-//   video_shift      (real) -- sigma shift for the video schedule
-//                              (minimax-h3, default 12.0)
-//   audio_shift      (real) -- sigma shift for the audio schedule
-//                              (minimax-h3, default 3.0)
-//   condition_timestep (real) -- the timestep the pinned keyframe rows
-//                              are conditioned on (minimax-h3, default
-//                              1.0 = clean)
-//   audio_seconds    (real) -- audio duration; 0 => derive it from
-//                              frames / fps                [minimax-h3]
 //   unload_when_idle (string) -- auto|always|never
+//
+// Everything family-specific lives on iport9 instead; see the config
+// stages named above.
 class GenerateVideoStage final : public TypedStage<GenerateVideoStage> {
 public:
   static constexpr const char* kTypeName = "generate-video";
@@ -196,22 +204,33 @@ private:
   double        _fps    = 16.0;
   int           _steps  = 40;
   std::uint64_t _seed   = 0;
-  double        _guidance   = 3.5;
-  double        _guidance_2 = 3.5;
-  double        _boundary   = 0.9;
-  double        _video_shift = 12.0;
-  double        _audio_shift = 3.0;
-  double        _cond_timestep = 1.0;
-  double        _audio_seconds = 0.0;
   std::uint64_t _emitted = 0;
 
   bool _model_latched     = false;
   bool _sampler_latched   = false;
   bool _scheduler_latched = false;
+  bool _cfg_latched       = false;
+
+  // The last model-config beat, held UNPARSED. Which family's parser
+  // reads it is not known until the checkpoint resolves, and a config
+  // beat can arrive before the model does.
+  FlexData _model_cfg;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;
   genai::FlowSchedulerSpec _scheduler_spec;
+
+  // The resident family's per-generation parameters, as ITS model layer
+  // defines them. Both are held for the same reason the two DiTs are:
+  // the families share no knobs, and one struct wide enough for both
+  // would describe neither.
+  genai::MetalWanTransformer::GenerationParams _wan_params;
+  genai::MetalMiniMaxH3Transformer::GenerationParams _h3_params;
+  // Re-parse `_model_cfg` into the family that is now resident, and
+  // reconcile it with what the checkpoint itself says. Called whenever
+  // either input changes -- a new config beat, or a model that just
+  // resolved -- because a beat can arrive on either side first.
+  void apply_model_config_();
 
   // Exactly one expert is resident. `_expert` is which one (0 = high
   // noise / `transformer`, 1 = low noise / `transformer_2`, -1 = none).
@@ -226,6 +245,10 @@ private:
   // interface wide enough for both would describe neither.
   std::unique_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
   genai::MetalMiniMaxH3Transformer::Config _h3_cfg;
+  // What the models DB said about `_hf_dir`. Held because the DIRECTORY
+  // cannot always answer which model a reference meant -- see
+  // ResolvedModel.
+  ResolvedModel _resolved;
   bool _have_cfg    = false;
   bool _two_experts = false;
   std::string _root;

@@ -21,10 +21,6 @@ public:
   // suspended awaiters. Always non-null on a fully-constructed
   // Session. Members schedule resumed coroutines through it.
   virtual ThreadPool* thread_pool() const noexcept = 0;
-
-  // Per-session knob. Currently used by EdgeBuffer when no explicit
-  // capacity is supplied at construction.
-  virtual unsigned default_edge_capacity() const noexcept = 0;
 };
 
 }

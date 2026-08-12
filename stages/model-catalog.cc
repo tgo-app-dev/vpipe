@@ -1308,6 +1308,16 @@ catalog_by_path(const std::string& hf_path)
   return nullptr;
 }
 
+std::vector<const ModelCatalogEntry*>
+catalog_all_by_path(const std::string& hf_path)
+{
+  std::vector<const ModelCatalogEntry*> out;
+  for (const auto& e : model_catalog()) {
+    if (e.hf_path == hf_path) { out.push_back(&e); }
+  }
+  return out;
+}
+
 const ModelCatalogEntry*
 catalog_by_name(const std::string& name)
 {

@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
@@ -106,23 +107,78 @@ class MetalMiniMaxH3Transformer {
     {
       return video_channels * patch_t * patch_h * patch_w;  // 96
     }
+    // Which TASK partition these weights are ("fl2va" / "ref2va", empty
+    // when nothing said). Carried on the Config because it decides
+    // WHICH FILE load() reads from a tree holding both -- a 66 GB
+    // choice that no property of the bytes can settle.
+    std::string partition;
+
     // 2 * 3 * rope_freq_dim: three axes share one inv_freq table and the
     // concatenated block is then concatenated with itself.
     int rope_rot() const { return 6 * rope_freq_dim; }      // 96
     int adaln_out() const { return 6 * hidden * minimax_h3::kModalityNum; }
   };
 
+  // What a CALLER chooses per generation, as against Config, which is
+  // what the checkpoint IS. It lives here rather than in the driving
+  // stage because every field is a fact about this family -- two
+  // schedules, two condition levels, a soundtrack -- and none of them
+  // means anything to a video DiT that generates no audio.
+  struct GenerationParams {
+    // The two sigma schedules. Video and audio are stepped in lockstep
+    // over the same step count but with DIFFERENT shifts: the released
+    // checkpoint's are 12 and 3, and they are not interchangeable.
+    double video_shift = 12.0;
+    double audio_shift = 3.0;
+    // The timestep the pinned CONDITION rows sit at. They are real
+    // encoded frames, so 1.0 -- CLEAN in this model's convention, where
+    // t = 1 - sigma. Exposed because it is the reference's
+    // `condition_video_timestep` rather than a constant, and a
+    // checkpoint trained with noise-augmented anchors would want it
+    // lower.
+    double condition_timestep = 1.0;
+    // The same, for a `ref2va` reference SOUNDTRACK. Separate from the
+    // video one because the two conditionings are independent: a
+    // reference video's frames and its audio are encoded by different
+    // VAEs and enter as different rows.
+    double condition_audio_timestep = 1.0;
+    // Soundtrack duration. 0 derives it from the video, which is what
+    // keeps the two modalities the same length by construction; a
+    // positive value is for a clip whose audio is deliberately not.
+    double audio_seconds = 0.0;
+
+    // Parse the `minimax-h3-model-config` beat. Absent keys keep the
+    // defaults above; `err` collects what was ignored, and is not fatal.
+    static GenerationParams from_flex(const FlexData& fd,
+                                      std::string* err = nullptr);
+
+    // How many audio latents this request generates for `num_frames`
+    // video frames at `fps` -- `audio_seconds` when one was asked for,
+    // the video's own duration otherwise. The rounding rule is the
+    // model's, so it belongs beside it rather than in each caller.
+    int audio_latents(int num_frames, double fps) const;
+  };
+
   // Read a Config out of the checkpoint's `transformer/config.json`.
   // False when the file is missing or is not a MiniMaxH3DiTModel config.
+  // `partition` ("fl2va" / "ref2va", empty = probe) says WHICH of the two
+  // task partitions is meant, for a tree that holds both. It is
+  // authoritative: a caller who read it from the models DB knows
+  // something the bytes do not say.
   static bool config_from_json(const std::string& dit_dir, Config& out,
-                               std::string* err = nullptr);
+                               std::string* err = nullptr,
+                               const std::string& partition = {});
 
   // `dit_dir` may be the transformer directory itself, the partition
   // root that holds it (`.../FL2VA`), or the repository root -- the
   // catalogue registers the REPO, whose pipeline lives one level down in
   // a partition subdirectory, so a caller holding a registry path has
   // neither of the first two.
-  static std::string resolve_dit_dir(const std::string& path);
+  // `partition` picks between the two DiT files when a repo holds both.
+  // Empty keeps the historical preference (`fl2va`), which is the right
+  // default only because every graph that predates Ref2VA meant it.
+  static std::string resolve_dit_dir(const std::string& path,
+                                     const std::string& partition = {});
 
   // Which TASK partition a checkpoint is: "fl2va", "ref2va", or empty
   // when nothing says.
@@ -139,7 +195,17 @@ class MetalMiniMaxH3Transformer {
   // cannot drift apart on the spelling.
   static constexpr const char* kPartitionKey = "_minimax_h3_partition";
 
-  static std::string partition_of(const std::string& path);
+  // `hint` (from the models DB) WINS: two records can share one
+  // directory precisely so that the tree cannot answer this, and a
+  // caller holding the record knows what probing cannot find out.
+  static std::string partition_of(const std::string& path,
+                                  const std::string& hint = {});
+
+  // "minimax-h3-fl2va" / "minimax-h3-ref2va" -> "fl2va" / "ref2va";
+  // anything else -> empty. The models DB speaks in model_type and this
+  // class in partitions, and one spelling of the mapping keeps the two
+  // from drifting.
+  static std::string partition_of_model_type(const std::string& model_type);
 
   // `stream_blocks` (memory-bounded): don't preload the 50 main blocks --
   // retain the weight set and load/free each block on demand inside
@@ -158,6 +224,9 @@ class MetalMiniMaxH3Transformer {
   // Prefer the WeightSet overload: the set is the manager's shared,
   // reference-counted view of the checkpoint. The dir overload opens a
   // PRIVATE set (tests, and callers with no session to ask).
+  // Resolves the DiT through `cfg.partition`, so a directory holding
+  // both partitions loads the one the caller asked for rather than the
+  // one whose filename sorts first.
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);

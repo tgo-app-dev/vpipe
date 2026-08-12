@@ -4,6 +4,7 @@
 #include "common/flex-data.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -750,4 +751,50 @@ TEST(model_catalog, minimax_h3_has_both_partitions) {
     }
   }
   EXPECT_TRUE(tok);
+}
+
+// One repo, several models: `catalog_by_path` answers with the FIRST,
+// which is the right answer only when there is one. The two places this
+// bites are MiniMax-H3 (two partitions pinning different DiT files out
+// of one Comfy-Org repo) and the supplement repo (six archives) -- and
+// on the H3 pair the first-match answer is silently wrong, because a
+// caller asking for Ref2VA gets FL2VA's file list under Ref2VA's name.
+TEST(model_catalog, several_models_can_share_one_repo) {
+  const auto h3 = catalog_all_by_path("Comfy-Org/MiniMax-H3");
+  EXPECT_TRUE(h3.size() == 2);
+  // Neither carries a `name`, so the registration key cannot tell them
+  // apart either -- the disambiguator has to be version/variant/type.
+  bool fl = false, ref = false;
+  for (const auto* e : h3) {
+    if (e->model_type == "minimax-h3-fl2va")  { fl = true; }
+    if (e->model_type == "minimax-h3-ref2va") { ref = true; }
+    EXPECT_TRUE(e->name.empty());
+  }
+  EXPECT_TRUE(fl && ref);
+
+  // And they pin DIFFERENT files, which is why picking the wrong one is
+  // a wrong download rather than a cosmetic mislabel.
+  auto pins = [](const ModelCatalogEntry* e, const char* frag) {
+    for (const auto& f : e->files) {
+      if (f.find(frag) != std::string::npos) { return true; }
+    }
+    return false;
+  };
+  for (const auto* e : h3) {
+    const bool is_ref = e->model_type == "minimax-h3-ref2va";
+    EXPECT_TRUE(pins(e, is_ref ? "ref2va" : "fl2va"));
+    EXPECT_FALSE(pins(e, is_ref ? "fl2va" : "ref2va"));
+  }
+
+  const auto sup = catalog_all_by_path("tgo-app-dev/vpipe-supplement");
+  EXPECT_TRUE(sup.size() > 1);
+
+  // A repo publishing exactly one model still answers with one, so the
+  // fetch stage's "no ambiguity, no key needed" path stays the norm.
+  const auto one = catalog_all_by_path("MiniMaxAI/MiniMax-H3");
+  EXPECT_TRUE(one.size() == 1);
+  EXPECT_TRUE(catalog_all_by_path("no/such-repo").empty());
+
+  std::printf("[model_catalog] Comfy-Org/MiniMax-H3 publishes %zu models, "
+              "vpipe-supplement %zu\n", h3.size(), sup.size());
 }

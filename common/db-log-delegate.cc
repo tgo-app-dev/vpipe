@@ -52,13 +52,9 @@ public:
   }
   // Bootstrap context only services logging during DbLogDelegate's
   // own LMDB operations; pipelines never see this context, so the
-  // pool / capacity / ffmpeg / env hooks are not exercised from
-  // here.
+  // pool / ffmpeg / env hooks are not exercised from here.
   ThreadPool* thread_pool() const noexcept override {
     return nullptr;
-  }
-  unsigned default_edge_capacity() const noexcept override {
-    return 0;
   }
   // ffmpeg_libraries / coreml_model_manager /
   // generative_model_manager are left to SessionServicesIntf, whose

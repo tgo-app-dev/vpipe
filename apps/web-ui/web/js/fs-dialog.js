@@ -44,13 +44,32 @@ const CATEGORY_EXTS = {
           '.xml', '.srt', '.vtt'],
 };
 
-// Build a filter list for a backend `path_filter` category keyword.
-// Returns [] for an unknown/empty category (dialog shows all files).
+// Build a filter list for a backend `path_filter` keyword, which may be
+// a COMMA-SEPARATED list of categories ("image,video,audio") for a field
+// that takes more than one kind -- video-ref-encoder's reference list
+// being the case that needs it: its entries are images, clips and
+// soundtracks, and which one a file is comes from the file rather than
+// from the field.
+//
+// A multi-category filter leads with the union, so the default view
+// shows everything the field accepts, and keeps the per-category entries
+// after it so a user can still narrow to one. Returns [] for an
+// unknown/empty keyword (dialog shows all files).
 export function filterForCategory(cat) {
-  const exts = CATEGORY_EXTS[cat];
-  if (!exts) { return []; }
-  return [{ label: t('fs.filter_' + cat) + ' (' + exts.slice(0, 4).join(' ')
-              + '…)', exts }];
+  const names = String(cat || '').split(',')
+    .map((s) => s.trim()).filter((s) => CATEGORY_EXTS[s]);
+  if (!names.length) { return []; }
+  const one = (n) => ({
+    label: t('fs.filter_' + n) + ' (' + CATEGORY_EXTS[n].slice(0, 4).join(' ')
+             + '…)',
+    exts: CATEGORY_EXTS[n],
+  });
+  if (names.length === 1) { return [one(names[0])]; }
+  const union = [...new Set(names.flatMap((n) => CATEGORY_EXTS[n]))];
+  return [
+    { label: names.map((n) => t('fs.filter_' + n)).join(' / '), exts: union },
+    ...names.map(one),
+  ];
 }
 
 // Split a path value into { dir, name } for seeding the dialog. A value

@@ -26,6 +26,33 @@ inline constexpr std::string_view kModelRegistryDb = "__vpipe_model_registry";
 //
 // Shared by the LM stages (audio-transcribe, text-chat, visual-qa,
 // realtime-vqa) so a configured hf_dir may name a registered model.
+// A model reference resolved through the registry.
+//
+// The directory alone is not always enough to say WHICH model was meant.
+// Two records can share one `local_path` on purpose -- MiniMax-H3's two
+// task partitions are published from one repo and differ only in which
+// DiT file they pin, so `model-fetch --model_key` registers them
+// separately over one download. A consumer handed only the path then
+// re-probes the tree and cannot tell them apart; what disambiguates is
+// the record, so this carries it.
+//
+// `model_type` is the record's own field (the catalogue's, when the
+// fetch was catalogued), and is EMPTY for a plain filesystem path or an
+// unrecognised repo -- an empty answer means "nothing said", never a
+// guess.
+struct ResolvedModel {
+  std::string dir;          // local_path, or `ref` when not a DB key
+  std::string key;          // the registry key hit, else empty
+  std::string model_type;   // the record's model_type, else empty
+  bool from_registry = false;
+};
+
+// Resolve `ref` to a directory AND whatever the registry says about it.
+// Same lookup and same fallbacks as resolve_model_dir; a miss returns
+// `{ref, "", "", false}`.
+ResolvedModel
+resolve_model(const SessionContextIntf* session, const std::string& ref);
+
 std::string
 resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        ref);

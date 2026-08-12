@@ -311,3 +311,65 @@ TEST(media_decode, video_file_frames_rate_and_bound) {
               cut->num_frames);
   std::filesystem::remove(path);
 }
+
+// The classifier the reference encoder leans on: what a file IS, decided
+// from the file rather than from its name.
+//
+// The three cases are the whole matrix a caller has to get right, and
+// each fails differently if it does not. A still read as video decodes
+// one frame and conditions a video model on a frozen clip; a clip read
+// as a still silently drops every frame but the first; a soundtrack read
+// as either fails late, after the model is already loaded.
+//
+// Synthesized rather than fixtures, so the test says what makes each
+// case that kind: a PPM has one frame and no rate, a Y4M has ten frames
+// and states 24 fps, a WAV has no video stream at all.
+TEST(media_decode, probe_classifies_by_content) {
+  Session s;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = s.ffmpeg_libraries();
+  } catch (...) {
+    return;
+  }
+  if (!libs || !libs->valid()) { return; }
+
+  string err;
+  {
+    const string path = write_temp_(make_ppm_(), "vpipe-probe-test.ppm");
+    ASSERT_TRUE(!path.empty());
+    auto p = probe_media_file(libs, path, &err);
+    ASSERT_TRUE(p.has_value());
+    EXPECT_TRUE(p->kind == MediaKind::Image);
+    EXPECT_TRUE(p->has_video);          // a still IS a 1-frame video stream
+    EXPECT_FALSE(p->has_audio);
+    EXPECT_TRUE(p->width == 4 && p->height == 2);
+    std::filesystem::remove(path);
+  }
+  {
+    const auto y4m = make_y4m_(/*frames=*/10, /*w=*/8, /*h=*/4, 24, 1);
+    const string path = write_temp_(y4m, "vpipe-probe-test.y4m");
+    ASSERT_TRUE(!path.empty());
+    auto p = probe_media_file(libs, path, &err);
+    ASSERT_TRUE(p.has_value());
+    EXPECT_TRUE(p->kind == MediaKind::Video);
+    EXPECT_TRUE(p->has_video);
+    EXPECT_TRUE(p->fps > 23.9 && p->fps < 24.1);
+    std::filesystem::remove(path);
+  }
+  {
+    const string path = write_temp_(make_wav_(), "vpipe-probe-test.wav");
+    ASSERT_TRUE(!path.empty());
+    auto p = probe_media_file(libs, path, &err);
+    ASSERT_TRUE(p.has_value());
+    EXPECT_TRUE(p->kind == MediaKind::Audio);
+    EXPECT_FALSE(p->has_video);
+    EXPECT_TRUE(p->has_audio);
+    std::filesystem::remove(path);
+  }
+  // The names, which go into user-facing messages.
+  EXPECT_TRUE(media_kind_name(MediaKind::Image) == "image");
+  EXPECT_TRUE(media_kind_name(MediaKind::Video) == "video");
+  EXPECT_TRUE(media_kind_name(MediaKind::Audio) == "audio");
+  EXPECT_TRUE(media_kind_name(MediaKind::Unknown) == "unknown");
+}

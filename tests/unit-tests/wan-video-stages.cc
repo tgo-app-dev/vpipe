@@ -17,9 +17,15 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/audio-video/video-tokens.h"
+#include "stages/minimax-h3-model-config-stage.h"
+#include "stages/model-config-source.h"
 #include "stages/rgb-to-video-stage.h"
+#include "stages/trigger-beat.h"
+#include "stages/wan2-model-config-stage.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/wan/metal-wan-transformer.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "stages/generate-video-stage.h"
 #include "stages/video-ref-encoder-stage.h"
@@ -121,7 +127,133 @@ public:
   }
 };
 
+// Emits `count` empty trigger beats, then closes. The payload does not
+// matter to a config source -- receipt is the signal -- so this is the
+// cheapest thing that can drive one.
+class TickSource : public TypedStage<TickSource> {
+public:
+  static constexpr const char* kTypeName = "ut-tick-source";
+  using TypedStage::TypedStage;
+
+  int count = 3;
+
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    for (int i = 0; i < count; ++i) {
+      co_await ctx.write(0, make_payload<TriggerPayload>());
+    }
+    ctx.signal_done();
+  }
+
+  const StageSpec&
+  spec() const noexcept override
+  {
+    static const PortSpec op[] = {
+      {.name = "trigger", .doc = "", .type = &typeid(TriggerPayload)}};
+    static const StageSpec s = {.type_name = "ut-tick-source", .doc = "",
+                                .display_name = "", .oports = op};
+    return s;
+  }
+};
+
+// Counts FlexData beats and keeps the last one.
+class FlexSink : public TypedStage<FlexSink> {
+public:
+  static constexpr const char* kTypeName = "ut-flex-sink";
+  using TypedStage::TypedStage;
+
+  int      beats = 0;
+  FlexData last;
+
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    auto b = co_await ctx.read(0);
+    if (!b) { ctx.signal_done(); co_return; }
+    if (const auto* f = dynamic_cast<const FlexDataPayload*>(b.get())) {
+      ++beats;
+      last = f->data;
+    }
+  }
+
+  const StageSpec&
+  spec() const noexcept override
+  {
+    static const PortSpec ip[] = {
+      {.name = "in", .doc = "", .type = &typeid(FlexDataPayload)}};
+    static const StageSpec s = {.type_name = "ut-flex-sink", .doc = "",
+                                .display_name = "", .iports = ip};
+    return s;
+  }
+};
+
+// Run one config source into a counting sink and report how many beats
+// came out. `ticks < 0` leaves the trigger iport UNWIRED.
+template <typename ConfigStage>
+int
+run_config_source(Session& sess, FlexData cfg, int ticks, FlexData* last)
+{
+  auto pl = make_unique<Pipeline>("p", &sess);
+  vector<InEdge> in;
+  if (ticks >= 0) {
+    auto src_u = make_unique<TickSource>(&sess, "tick", vector<InEdge>{},
+                                         FlexData::make_object());
+    src_u->count = ticks;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<TickSource*>(pl->insert_stage(std::move(src_u)));
+    in.push_back({src, 0});
+  }
+  auto cs_u = make_unique<ConfigStage>(&sess, "cfg", in, std::move(cfg));
+  auto* cs = pl->insert_stage(std::move(cs_u));
+
+  auto sink_u = make_unique<FlexSink>(&sess, "sink", vector<InEdge>{{cs, 0}},
+                                      FlexData::make_object());
+  auto* sink = static_cast<FlexSink*>(pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  // -1 rather than an assertion: EXPECT_* only works inside a TEST body,
+  // and a launch failure is a distinct answer from "emitted nothing".
+  if (!rt.launch()) { return -1; }
+  rt.wait_idle();
+  rt.stop();
+  if (last != nullptr) { *last = sink->last; }
+  return sink->beats;
+}
+
 }  // namespace
+
+// The trigger contract, which is the same one text-prompt follows and the
+// reason a config source can serve a continuously generating graph:
+// unwired it is a one-shot, wired it emits once per inbound beat.
+//
+// Both halves matter and they fail differently. A one-shot that emitted
+// per read would deadlock the second request (nothing else will ever
+// arrive); a triggered source that emitted once would leave the consumer
+// on stale parameters while the graph says they changed.
+TEST(model_config, trigger_gates_emission)
+{
+  Session sess;
+  FlexData last;
+  // Unwired: exactly one beat for the run, whatever else happens.
+  EXPECT_TRUE(run_config_source<Wan2ModelConfigStage>(
+                  sess, FlexData::make_object(), -1, &last) == 1);
+  EXPECT_TRUE(model_config::family_of(last) == "wan");
+  EXPECT_TRUE(run_config_source<MiniMaxH3ModelConfigStage>(
+                  sess, FlexData::make_object(), -1, &last) == 1);
+  EXPECT_TRUE(model_config::family_of(last) == "minimax-h3");
+
+  // Wired: one beat per trigger, and EOS upstream ends the stage rather
+  // than leaving it emitting forever.
+  EXPECT_TRUE(run_config_source<Wan2ModelConfigStage>(
+                  sess, FlexData::make_object(), 4, &last) == 4);
+  EXPECT_TRUE(run_config_source<MiniMaxH3ModelConfigStage>(
+                  sess, FlexData::make_object(), 3, &last) == 3);
+  // A trigger source that emits nothing must not produce a config beat
+  // either -- the count is the trigger's, not a minimum of one.
+  EXPECT_TRUE(run_config_source<MiniMaxH3ModelConfigStage>(
+                  sess, FlexData::make_object(), 0, &last) == 0);
+}
 
 // One header then one frame per image, with the rate taken from the
 // producer rather than the config. The header cannot precede the first
@@ -309,11 +441,16 @@ TEST(generate_video, frame_counts_round_up_per_family)
   EXPECT_TRUE(h3::align_num_frames(81, 17, 5) == 90);
 }
 
-// The stage is family-generic: one stage type carrying the UNION of what
-// its DiT families need, the way generate-image does. What this pins is
-// the SURFACE -- a graph must not have to be rewired to change
-// checkpoints, so the H3-only keys and the audio port have to exist
-// regardless of which family is resident (and be inert when it is wan).
+// The stage is family-generic, but NOT by carrying the union of what its
+// families need. It carries what every video model answers to -- geometry,
+// length, steps, seed, residency -- and takes each family's own knobs as a
+// BEAT on the model_config iport.
+//
+// What this pins is that surface, because the failure it replaced was
+// silent: with a union config, a key belonging to the family that was not
+// resident did nothing and said nothing. So: none of the moved keys may
+// come back as an attr, and a stale pipeline that still sets one must be
+// TOLD rather than quietly run on defaults.
 TEST(generate_video, family_generic_surface)
 {
   Session sess;
@@ -321,13 +458,6 @@ TEST(generate_video, family_generic_surface)
   cfg.as_object().insert_or_assign("height", FlexData::make_int(480));
   cfg.as_object().insert_or_assign("width", FlexData::make_int(832));
   cfg.as_object().insert_or_assign("frames", FlexData::make_int(81));
-  // Keys that only minimax-h3 reads. On a wan checkpoint they are inert,
-  // NOT a config error -- rejecting them would make the union useless.
-  cfg.as_object().insert_or_assign("video_shift", FlexData::make_real(12.0));
-  cfg.as_object().insert_or_assign("audio_shift", FlexData::make_real(3.0));
-  cfg.as_object().insert_or_assign("condition_timestep",
-                                   FlexData::make_real(1.0));
-  cfg.as_object().insert_or_assign("audio_seconds", FlexData::make_real(5.0));
   auto s = make_unique<GenerateVideoStage>(&sess, "gv", vector<InEdge>{}, cfg);
   EXPECT_TRUE(s->config_error().empty());
 
@@ -340,22 +470,45 @@ TEST(generate_video, family_generic_surface)
     if (std::string(p.name) == "audio_latent") { has_audio = true; }
   }
   EXPECT_TRUE(has_audio);
-  // And the wan-side ports are all still there, with the h3 anchors and
-  // then the Ref2VA reference rows appended: the five wan ports keep
-  // their INDICES, which is what lets a graph written for wan keep
-  // working unedited.
-  EXPECT_TRUE(sp.iports.size() == 9);
+  // The wan-side ports keep their INDICES, with the h3 anchors, the
+  // Ref2VA reference rows and now the config port appended -- which is
+  // what lets a graph written for an earlier port set keep working.
+  EXPECT_TRUE(sp.iports.size() == 10);
   EXPECT_TRUE(std::string(sp.iports[5].name) == "ref_latent0");
   EXPECT_TRUE(std::string(sp.iports[6].name) == "ref_latent1");
   EXPECT_TRUE(std::string(sp.iports[7].name) == "ref_video_rows");
   EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_audio_rows");
+  EXPECT_TRUE(std::string(sp.iports[9].name) == "model_config");
+  // The tag is the whole compatibility check between a config source and
+  // this port: the composer offers a source only if it matches.
+  EXPECT_TRUE(port_tags_compatible("model-config",
+                                   sp.iports[9].tags));
 
-  bool has_shift = false, has_audio_secs = false;
+  // No family-specific key survives as an attr of this stage.
   for (const auto& k : sp.attrs) {
-    if (std::string(k.key) == "video_shift") { has_shift = true; }
-    if (std::string(k.key) == "audio_seconds") { has_audio_secs = true; }
+    const std::string key(k.key);
+    EXPECT_FALSE(key == "video_shift" || key == "audio_shift" ||
+                 key == "condition_timestep" || key == "audio_seconds" ||
+                 key == "guidance_scale" || key == "guidance_scale_2" ||
+                 key == "boundary_ratio");
   }
-  EXPECT_TRUE(has_shift && has_audio_secs);
+}
+
+// A pipeline written against the old union still LOADS -- an unknown
+// config key is not an error anywhere in this runtime -- so the only
+// thing standing between it and silently running on defaults is that the
+// stage says so. Constructing with a moved key must not be a config
+// error (the graph is still valid) and must not be silent either.
+TEST(generate_video, a_moved_config_key_is_reported_not_rejected)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("frames", FlexData::make_int(81));
+  cfg.as_object().insert_or_assign("video_shift", FlexData::make_real(12.0));
+  cfg.as_object().insert_or_assign("guidance_scale", FlexData::make_real(4.0));
+  auto s = make_unique<GenerateVideoStage>(&sess, "gv", vector<InEdge>{}, cfg);
+  // Still constructs and still runs: the key is inert, not wrong.
+  EXPECT_TRUE(s->config_error().empty());
 }
 
 // The ref2va half of the split: a `video-ref-encoder` feeding
@@ -374,6 +527,12 @@ TEST(video_ref_encoder, request_surface)
   Session sess;
   auto cfg = FlexData::make_object();
   cfg.as_object().insert_or_assign("frames", FlexData::make_int(121));
+  {
+    auto refs = FlexData::make_array();
+    refs.as_array().push_back(FlexData::make_string("/a.png"));
+    refs.as_array().push_back(FlexData::make_string("/b.mp4"));
+    cfg.as_object().insert_or_assign("references", std::move(refs));
+  }
   auto s = make_unique<VideoRefEncoderStage>(&sess, "vre", vector<InEdge>{},
                                              cfg);
   // Deferred-validated: no hf_dir is not a construction error, because a
@@ -383,13 +542,28 @@ TEST(video_ref_encoder, request_surface)
 
   const StageSpec& sp = s->spec();
   EXPECT_TRUE(std::string(sp.type_name) == "video-ref-encoder");
-  // The list is ONE input. If this ever grows a port per reference, the
-  // stage has stopped being able to serve a request whose shape is only
-  // known at run time.
-  EXPECT_TRUE(sp.iports.size() == 3);
+  // The references are CONFIG, not a port: they are files to open, which
+  // is what a file browser fills in. Two ports left, and `model` moved
+  // down to 1 when the reference port went.
+  EXPECT_TRUE(sp.iports.size() == 2);
   EXPECT_TRUE(std::string(sp.iports[0].name) == "prompt");
-  EXPECT_TRUE(std::string(sp.iports[1].name) == "references");
-  EXPECT_TRUE(std::string(sp.iports[2].name) == "model");
+  EXPECT_TRUE(std::string(sp.iports[1].name) == "model");
+
+  // The key the browser drives: a path field that is NOT a single
+  // string, which is what makes the dialog multi-select, and a filter
+  // naming every kind a reference may be -- the field cannot know which
+  // one a given file is, so it must not exclude any of them.
+  bool has_refs = false;
+  for (const auto& k : sp.attrs) {
+    if (std::string(k.key) != "references") { continue; }
+    has_refs = true;
+    EXPECT_TRUE(k.required);
+    EXPECT_TRUE(k.is_path);
+    EXPECT_FALSE(k.path_write);
+    EXPECT_TRUE(k.type != ConfigType::String);
+    EXPECT_TRUE(std::string(k.path_filter) == "image,video,audio");
+  }
+  EXPECT_TRUE(has_refs);
 
   // Three outputs, and the pairing with generate-video is by NAME:
   // conditioning -> its iport0 (the same contract diffusion-conditioner
@@ -421,8 +595,168 @@ TEST(video_ref_encoder, request_surface)
   }
   EXPECT_TRUE(has_frames && has_short_edge && has_sample_fps);
   std::printf("[video_ref_encoder] %zu iports / %zu oports; the reference "
-              "LIST is one input, not a port per reference\n",
+              "LIST is config, not a port per reference\n",
               sp.iports.size(), sp.oports.size());
+}
+
+// The reference list is the one thing this stage cannot run without, so
+// an empty or malformed one is a CONFIG error caught at launch rather
+// than a warning at the first beat. A Ref2VA forward with no references
+// generates video conditioned on nothing, at the full cost of a 33B
+// model -- so failing the graph beats running it.
+TEST(video_ref_encoder, references_are_required_and_must_be_paths)
+{
+  Session sess;
+  {
+    auto cfg = FlexData::make_object();
+    VideoRefEncoderStage s(&sess, "a", vector<InEdge>{}, cfg);
+    EXPECT_FALSE(s.config_error().empty());
+  }
+  {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references", FlexData::make_array());
+    VideoRefEncoderStage s(&sess, "b", vector<InEdge>{}, cfg);
+    EXPECT_FALSE(s.config_error().empty());
+  }
+  {
+    // A non-path entry: caught here rather than as "will not open" per
+    // file, because it cannot be a path at all.
+    auto refs = FlexData::make_array();
+    refs.as_array().push_back(FlexData::make_int(7));
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references", std::move(refs));
+    VideoRefEncoderStage s(&sess, "c", vector<InEdge>{}, cfg);
+    EXPECT_FALSE(s.config_error().empty());
+  }
+  {
+    // ONE path as a bare string is the same request as a one-element
+    // list -- a hand-written pipeline writes the first, the browser
+    // writes the second, and neither is the spelling that works.
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references",
+                                     FlexData::make_string("/one.png"));
+    VideoRefEncoderStage s(&sess, "d", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(s.config_error().empty());
+  }
+}
+
+// The other end of the model_config seam: the beat each config source
+// emits has to be what its family's own parser reads back. This is the
+// whole contract between the two stages, and neither one can check it
+// alone -- so it is checked here, on the real parsers.
+TEST(model_config, each_family_reads_back_its_own_beat)
+{
+  Session sess;
+  {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("guidance_scale",
+                                     FlexData::make_real(5.0));
+    cfg.as_object().insert_or_assign("guidance_scale_2",
+                                     FlexData::make_real(2.5));
+    cfg.as_object().insert_or_assign("boundary_ratio",
+                                     FlexData::make_real(0.875));
+    Wan2ModelConfigStage s(&sess, "wc", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(s.config_error().empty());
+    const auto p =
+        genai::MetalWanTransformer::GenerationParams::from_flex(
+            s.resolved_config());
+    EXPECT_TRUE(p.guidance_scale == 5.0);
+    EXPECT_TRUE(p.guidance_scale_2 == 2.5);
+    EXPECT_TRUE(p.boundary_ratio == 0.875);
+    // Set explicitly, so it must WIN against the checkpoint's
+    // model_index.json rather than being overwritten by it.
+    EXPECT_TRUE(p.boundary_ratio_set);
+    // The expert split follows from the boundary and nothing else.
+    EXPECT_TRUE(p.expert_for(0.9) == 0);
+    EXPECT_TRUE(p.expert_for(0.5) == 1);
+    EXPECT_TRUE(p.guidance_for(0) == 5.0);
+    EXPECT_TRUE(p.guidance_for(1) == 2.5);
+  }
+  {
+    // Omitting boundary_ratio must leave the key OUT of the beat: the
+    // consumer falls back to the checkpoint's own model_index.json, and
+    // a default emitted as if it were a choice would override it on
+    // every graph that never mentioned the key.
+    auto cfg = FlexData::make_object();
+    Wan2ModelConfigStage s(&sess, "wc2", vector<InEdge>{}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("boundary_ratio"));
+    const auto p =
+        genai::MetalWanTransformer::GenerationParams::from_flex(fd);
+    EXPECT_FALSE(p.boundary_ratio_set);
+  }
+  {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("video_shift", FlexData::make_real(9.0));
+    cfg.as_object().insert_or_assign("audio_shift", FlexData::make_real(4.0));
+    cfg.as_object().insert_or_assign("condition_timestep",
+                                     FlexData::make_real(0.75));
+    cfg.as_object().insert_or_assign("condition_audio_timestep",
+                                     FlexData::make_real(0.5));
+    cfg.as_object().insert_or_assign("audio_seconds",
+                                     FlexData::make_real(2.0));
+    MiniMaxH3ModelConfigStage s(&sess, "hc", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(s.config_error().empty());
+    const auto p =
+        genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
+            s.resolved_config());
+    EXPECT_TRUE(p.video_shift == 9.0);
+    EXPECT_TRUE(p.audio_shift == 4.0);
+    EXPECT_TRUE(p.condition_timestep == 0.75);
+    EXPECT_TRUE(p.condition_audio_timestep == 0.5);
+    // 40 latents a second, so an explicit duration is exactly that many.
+    EXPECT_TRUE(p.audio_latents(124, 24.0) == 80);
+    // And 0 means "as long as the video", which is the default and the
+    // only setting that keeps the two modalities in step.
+    genai::MetalMiniMaxH3Transformer::GenerationParams d;
+    EXPECT_TRUE(d.audio_latents(124, 24.0) ==
+                genai::minimax_h3::audio_latent_num_frames(124, 24.0));
+  }
+  // Each source stamps the family its keys belong to, which is what lets
+  // the consumer refuse a config wired to the wrong checkpoint instead
+  // of applying nothing and running defaults.
+  {
+    Wan2ModelConfigStage w(&sess, "w", vector<InEdge>{},
+                           FlexData::make_object());
+    MiniMaxH3ModelConfigStage h(&sess, "h", vector<InEdge>{},
+                                FlexData::make_object());
+    EXPECT_TRUE(model_config::family_of(w.resolved_config()) == "wan");
+    EXPECT_TRUE(model_config::family_of(h.resolved_config()) ==
+                "minimax-h3");
+  }
+}
+
+// Nonsense numbers are refused at LAUNCH, not by throwing from a ctor --
+// the deferred-validation rule every stage here follows. Worth pinning
+// because a shift of 0 collapses the schedule to a single sigma: the run
+// would cost a full 33B generation and return noise.
+TEST(model_config, out_of_range_values_are_deferred_config_errors)
+{
+  Session sess;
+  auto bad_shift = FlexData::make_object();
+  bad_shift.as_object().insert_or_assign("video_shift",
+                                         FlexData::make_real(0.0));
+  MiniMaxH3ModelConfigStage h(&sess, "h", vector<InEdge>{}, bad_shift);
+  EXPECT_FALSE(h.config_error().empty());
+
+  auto bad_t = FlexData::make_object();
+  bad_t.as_object().insert_or_assign("condition_timestep",
+                                     FlexData::make_real(1.5));
+  MiniMaxH3ModelConfigStage h2(&sess, "h2", vector<InEdge>{}, bad_t);
+  EXPECT_FALSE(h2.config_error().empty());
+
+  auto bad_g = FlexData::make_object();
+  bad_g.as_object().insert_or_assign("guidance_scale",
+                                     FlexData::make_real(0.5));
+  Wan2ModelConfigStage w(&sess, "w", vector<InEdge>{}, bad_g);
+  EXPECT_FALSE(w.config_error().empty());
+
+  auto bad_b = FlexData::make_object();
+  bad_b.as_object().insert_or_assign("boundary_ratio",
+                                     FlexData::make_real(2.0));
+  Wan2ModelConfigStage w2(&sess, "w2", vector<InEdge>{}, bad_b);
+  EXPECT_FALSE(w2.config_error().empty());
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

@@ -265,17 +265,41 @@ git rev-parse --short=8 HEAD          # this is what the app will show
 1. **Snapshot and commit the public tree.** `tools/make_release.sh`
    from the private repo, then review `git -C <dest> diff` and commit
    there. Push it before building: the hash must exist upstream.
-2. **Build both variants** (bundled FFmpeg and not) from that tree:
+2. **Check out the submodules in the public tree.** The snapshot strips
+   submodule *contents* and re-registers only the gitlinks, so a fresh
+   clone or a freshly synced tree has empty `extern/*` directories and
+   the configure fails inside `nanobind_add_module` — which reads as a
+   nanobind problem rather than a missing checkout.
    ```sh
-   tools/release-macos-app.sh --src-dir /Users/wfang/projects/vpipe-release/github/vpipe
+   git -C /Users/wfang/projects/vpipe-release/github/vpipe \
+       submodule update --init --recursive
    ```
-3. **Verify on this Mac** — `--no-notarize` first if iterating; check
+3. **Build both variants** (bundled FFmpeg and not) from that tree.
+   Each needs its own build tree AND its own output directory:
+   `generate_appcast` signs every `.dmg` in the directory it is given,
+   so two variants sharing one would both land in the feed.
+   ```sh
+   PUB=/Users/wfang/projects/vpipe-release/github/vpipe
+   cmake -S "$PUB" -B ~/dump/vpipe-pub-full -DCMAKE_BUILD_TYPE=Release \
+         -DVPIPE_BUNDLE_FFMPEG=ON \
+         -DVPIPE_FFMPEG_BUNDLE_DIR=~/dump/ffmpeg-lgpl/lib \
+         -DVPIPE_SPARKLE_DIR=~/dump/sparkle/Sparkle-2.9.5
+   cmake -S "$PUB" -B ~/dump/vpipe-pub-slim -DCMAKE_BUILD_TYPE=Release \
+         -DVPIPE_BUNDLE_FFMPEG=OFF \
+         -DVPIPE_SPARKLE_DIR=~/dump/sparkle/Sparkle-2.9.5
+
+   tools/release-macos-app.sh --src-dir "$PUB" \
+       --build-dir ~/dump/vpipe-pub-full                 # appcast here
+   tools/release-macos-app.sh --src-dir "$PUB" \
+       --build-dir ~/dump/vpipe-pub-slim --no-appcast
+   ```
+4. **Verify on this Mac** — `--no-notarize` first if iterating; check
    the dmg mounts, the app launches from `/Applications`, and
    `spctl -a -vv` accepts it.
-4. **Verify on the M5** — the step above cannot substitute for this.
+5. **Verify on the M5** — the step above cannot substitute for this.
    Expect to reboot; a failure here wedges the GPU.
    - `xcrun metal --version` on both machines. If the M5's is newer,
-     the release should be built on the M5 (step 2 there instead).
+     the release should be built on the M5 (step 3 there instead).
    - Install the `.dmg` and run `vpipe --gpu-info` from inside the
      bundle; record it. `matrix_cores: false` means the run proves
      nothing about NAX, so fix that before continuing.
@@ -289,17 +313,18 @@ git rev-parse --short=8 HEAD          # this is what the app will show
    - Then one model end to end (`realtime-vqa` or `text-chat`; both
      hit the NAX GEMM), watching GPU utilisation return to idle after
      the process exits.
-   - If anything wedges: reboot, re-run with
-     `VPIPE_FORCE_MATRIX_CORES` unset and the gate forced off to
-     confirm the M4 path is clean, and do not publish.
-5. **Publish** — `gh release create` with both dmgs and `appcast.xml`,
+   - If anything wedges: reboot, re-run the identical command with
+     `VPIPE_NO_MATRIX_CORES=1` to confirm the pre-M5 path is clean,
+     and do not publish. That one switch isolates the fault to the
+     matrix-core kernels rather than anything else in the app.
+6. **Publish** — `gh release create` with both dmgs and `appcast.xml`,
    using the command the script prints.
 
-Steps 1–3 can happen on any Mac. Step 4 requires the M5 and is the
+Steps 1–4 can happen on any Mac. Step 5 requires the M5 and is the
 gate: it is the only point in the process where the matrix-core code is
 executed by anything at all. Building on the M5 is *not* required — the
 one time it appeared to be, the real difference was the compiler
-version, which is now checked in step 4 and enforced by the rebuild
+version, which is now checked in step 5 and enforced by the rebuild
 stamp. If it ever is convenient, `release-macos-app.sh --src-dir` takes
 the public tree from wherever it is checked out; the only extra
 requirements are the signing identity and notary profile in that

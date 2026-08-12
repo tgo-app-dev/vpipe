@@ -31,11 +31,21 @@ namespace vpipe {
 namespace {
 
 // The model iport (a model-select source) overrides hf_dir. It follows
-// the prompt and the reference list. (Referenced only from the
-// Apple-gated code.)
-[[maybe_unused]] constexpr unsigned kModelPort = 2;
+// the prompt. (Referenced only from the Apple-gated code.)
+[[maybe_unused]] constexpr unsigned kModelPort = 1;
 
 const ConfigKey kAttrs[] = {
+  {.key = "references", .type = ConfigType::Any, .required = true,
+   .doc = "the reference files IN THE ORDER THE MODEL SHOULD READ THEM: one "
+          "path, or an array of paths. The order labels them in the "
+          "presentation (<Picture 1>, <Video 2>, ...) and lays them out on "
+          "the shared rotary clock, so a different order is a different "
+          "request. WHAT each file is -- image, video or audio -- is read "
+          "from the FILE, not from its name: a container with one frame is "
+          "an image reference, an .mp4 with no video stream is an audio one. "
+          "At most 9 images, 3 videos and 3 audios, 12 in total, and audio "
+          "cannot be the only kind",
+   .is_path = true, .path_filter = "image,video,audio"},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the MiniMax-H3 model dir (text_encoder/, video_vae/, audio_vae/). "
           "OPTIONAL: a model-select source on the model iport overrides it",
@@ -84,14 +94,6 @@ const PortSpec kIports[] = {
    .doc = "prompt text (FlexData string or {text: ...}), used VERBATIM -- no "
           "chat template and no special tokens",
    .type = &typeid(FlexDataPayload), .tags = "text", .clock_group = 0},
-  {.name = "references",
-   .doc = "the reference list IN READ ORDER (FlexData array, or an object "
-          "with a `references` array). Each entry is {kind: image|video|"
-          "audio, path: ...} or a bare path; `kind` may be omitted and is "
-          "then read off the container. A video conditions on its own "
-          "soundtrack unless it sets audio:false. At most 9 images, 3 videos "
-          "and 3 audios, 12 in total, and audio cannot be the only kind",
-   .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "model",
    .doc = "OPTIONAL shared model reference from a model-select source; "
           "overrides the hf_dir config",
@@ -185,6 +187,41 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   // "no model at all" is reported at initialize()/process() time, when
   // iport connectivity is known, rather than at construction.
   _hf_dir           = attr_str("hf_dir");
+  // One path or a list of them. The composer's file browser appends
+  // into a JSON array, and a single pick left as a bare string is what
+  // a hand-written pipeline looks like -- both are the same request, so
+  // both are accepted rather than one being the spelling that works.
+  {
+    auto o = this->config().as_object();
+    FlexData refs = o.contains("references") ? o.at("references")
+                                             : FlexData::make_null();
+    if (refs.is_string()) {
+      _references.push_back(std::string(refs.as_string("")));
+    } else if (refs.is_array()) {
+      auto arr = refs.as_array();
+      for (std::size_t i = 0; i < arr.size(); ++i) {
+        if (arr[i].is_string()) {
+          _references.push_back(std::string(arr[i].as_string("")));
+        } else {
+          fail_config(fmt(
+              "VideoRefEncoderStage('{}'): references[{}] is not a path "
+              "string", this->id(), i));
+        }
+      }
+    } else if (!refs.is_null()) {
+      fail_config(fmt(
+          "VideoRefEncoderStage('{}'): references must be a path or an array "
+          "of paths", this->id()));
+    }
+    // Empty is a config error and not a runtime warning: a `ref2va`
+    // checkpoint with no references generates video conditioned on
+    // nothing, at full cost. Better to refuse the graph at launch.
+    if (_references.empty() && config_error().empty()) {
+      fail_config(fmt(
+          "VideoRefEncoderStage('{}'): references is required and must name "
+          "at least one file", this->id()));
+    }
+  }
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
   _video_sample_fps = attr_real("video_sample_fps");
@@ -247,7 +284,14 @@ VideoRefEncoderStage::declare_resources() const
   // declares the DiT it is paired with: this claim is what every peer
   // sizes itself against, and a 66 GB component nobody declared is the
   // silent under-count the resource-planning phase exists to prevent.
-  std::string dit = genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
+  // Which partition the reference names, from the models DB: a repo
+  // holding both resolves to fl2va by filename, and this claim is what
+  // every peer sizes itself against.
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
   if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
   return model_memory::weight_claims({enc, vvae, dit});
 }
@@ -286,7 +330,12 @@ VideoRefEncoderStage::ensure_loaded_()
         this->id()));
     return;
   }
-  _root = resolve_model_dir(session(), _hf_dir);
+  {
+    const ResolvedModel rm = resolve_model(session(), _hf_dir);
+    _root = rm.dir;
+    _partition = genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+        rm.model_type);
+  }
   if (!load_models_(mc)) {
     session()->error(fmt(
         "VideoRefEncoderStage('{}'): reference encoders failed to load; "
@@ -402,7 +451,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   if (!adir.empty()) { _peer_dirs.push_back(adir); }
   {
     const std::string d =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root);
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root, _partition);
     if (!d.empty()) { _peer_dirs.push_back(d); }
   }
   session()->info(fmt(
@@ -416,8 +465,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
 // ---- the request ----------------------------------------------------
 
 bool
-VideoRefEncoderStage::decode_request_(const FlexData& spec,
-                                      std::vector<h3::MediaReference>* out)
+VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 {
   const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (libs == nullptr || !libs->valid()) {
@@ -426,52 +474,6 @@ VideoRefEncoderStage::decode_request_(const FlexData& spec,
         "media can be decoded", this->id()));
     return false;
   }
-  // Bind the owning FlexData to a local before taking a view: as_array()
-  // and as_object() return VIEWS into their owner, and a view of a
-  // temporary dangles.
-  const FlexData* list = &spec;
-  FlexData held;
-  // A reference list is authored as JSON -- a `load-text` of a request
-  // file, a `text-prompt`, a web-ui field -- and all three deliver it as
-  // a STRING. Parsing it here is what lets the list come from the same
-  // sources the prompt does, rather than needing a stage that can emit a
-  // structured FlexData literal.
-  if (spec.is_string()) {
-    try {
-      held = FlexData::from_json(spec.as_string());
-    } catch (...) {
-      session()->warn(fmt(
-          "VideoRefEncoderStage('{}'): the references beat is a string that "
-          "is not JSON", this->id()));
-      return false;
-    }
-    FlexData inner;
-    if (held.is_object() && obj_get_(held, "references", &inner)) {
-      held = std::move(inner);
-    }
-    if (!held.is_array()) {
-      session()->warn(fmt(
-          "VideoRefEncoderStage('{}'): the references JSON is neither an "
-          "array nor an object carrying one", this->id()));
-      return false;
-    }
-    list = &held;
-  } else if (spec.is_object()) {
-    if (!obj_get_(spec, "references", &held)) {
-      session()->warn(fmt(
-          "VideoRefEncoderStage('{}'): the references beat is an object with "
-          "no `references` array", this->id()));
-      return false;
-    }
-    list = &held;
-  }
-  if (!list->is_array()) {
-    session()->warn(fmt(
-        "VideoRefEncoderStage('{}'): the references beat is neither an array "
-        "nor an object carrying one", this->id()));
-    return false;
-  }
-
   const int audio_rate =
       _audio_vae ? _audio_vae->config().sample_rate : 32000;
   // Every reference is truncated to the GENERATED duration, so nothing
@@ -480,40 +482,38 @@ VideoRefEncoderStage::decode_request_(const FlexData& spec,
   const int aligned = h3::align_num_frames(_frames, 17, 5);
   const double max_seconds = (double)aligned / h3::kFps;
 
-  const auto arr = list->as_array();
-  for (std::size_t i = 0; i < arr.size(); ++i) {
-    const FlexData& e = arr[i];
-    std::string path, kind;
-    bool want_audio = true;
-    if (e.is_string()) {
-      path = std::string(e.as_string());
-    } else if (e.is_object()) {
-      for (const char* k : {"path", "file", "url"}) {
-        FlexData v;
-        if (obj_get_(e, k, &v) && v.is_string()) {
-          path = std::string(v.as_string());
-          break;
-        }
-      }
-      FlexData v;
-      if (obj_get_(e, "kind", &v) && v.is_string()) {
-        kind = std::string(v.as_string());
-      }
-      FlexData a;
-      if (obj_get_(e, "audio", &a) && a.is_bool()) {
-        want_audio = a.as_bool();
-      }
-    }
-    if (path.empty()) {
+  for (std::size_t i = 0; i < _references.size(); ++i) {
+    const std::string& path = _references[i];
+    std::string derr;
+    // WHAT IT IS, from the file. One header read, no frame decoded --
+    // and the answer decides which decoder runs, which matters because
+    // the wrong one does not fail: an image read as video comes back as
+    // a one-frame clip, and a clip read as an image comes back as its
+    // first frame.
+    auto probe = probe_media_file(libs, path, &derr);
+    if (!probe) {
       session()->warn(fmt(
-          "VideoRefEncoderStage('{}'): reference {} names no path",
-          this->id(), i + 1));
+          "VideoRefEncoderStage('{}'): reference {} ('{}') will not open: {}",
+          this->id(), i + 1, path, derr));
       return false;
     }
+    if (probe->kind == MediaKind::Unknown) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): reference {} ('{}') carries neither "
+          "video nor audio", this->id(), i + 1, path));
+      return false;
+    }
+    session()->log_debug(fmt(
+        "VideoRefEncoderStage('{}'): reference {} ('{}') is {} ({}x{}"
+        "{})", this->id(), i + 1, path, media_kind_name(probe->kind),
+        probe->width, probe->height,
+        probe->kind == MediaKind::Video
+            ? fmt(", {:.2f} fps, {:.2f} s", probe->fps,
+                  probe->duration_seconds)()
+            : std::string()));
 
     h3::MediaReference m;
-    std::string derr;
-    if (kind == "audio") {
+    if (probe->kind == MediaKind::Audio) {
       auto a = decode_audio_file(libs, path, audio_rate, &derr, 2);
       if (!a) {
         session()->warn(fmt(
@@ -528,7 +528,7 @@ VideoRefEncoderStage::decode_request_(const FlexData& spec,
       out->push_back(std::move(m));
       continue;
     }
-    if (kind == "image") {
+    if (probe->kind == MediaKind::Image) {
       auto im = decode_image_file(libs, path, &derr);
       if (!im) {
         session()->warn(fmt(
@@ -545,38 +545,23 @@ VideoRefEncoderStage::decode_request_(const FlexData& spec,
       continue;
     }
 
-    // "video", or an unstated kind: try the container. A file with one
-    // frame IS an image reference -- the two rules differ (2048 short
-    // edge and no cap, against the target's canvas rule), so guessing
-    // video for a still would encode it at a quarter the detail.
+    // A video reference conditions on its own soundtrack when it has
+    // one: the two came out of ONE open container, which is the only
+    // way their clocks stay in sync.
     auto v = decode_video_file(libs, path, max_seconds,
-                               want_audio ? audio_rate : 0, &derr);
-    if (!v && kind.empty()) {
-      // No video stream and no stated kind: a bare soundtrack.
-      auto a = decode_audio_file(libs, path, audio_rate, &derr, 2);
-      if (a) {
-        m.kind        = h3::MediaReference::Kind::kAudio;
-        m.channels    = a->channels;
-        m.sample_rate = a->sample_rate;
-        m.pcm         = std::move(a->pcm);
-        out->push_back(std::move(m));
-        continue;
-      }
-    }
+                               probe->has_audio ? audio_rate : 0, &derr);
     if (!v) {
       session()->warn(fmt(
-          "VideoRefEncoderStage('{}'): reference {} ('{}') would not decode: "
-          "{}", this->id(), i + 1, path, derr));
+          "VideoRefEncoderStage('{}'): reference {} ('{}') would not decode "
+          "as video: {}", this->id(), i + 1, path, derr));
       return false;
     }
-    // A container with ONE frame is an image reference, not a
-    // one-frame clip: the two rules genuinely differ (2048 short edge
-    // and no area cap, against the target's canvas rule), so guessing
-    // video for a still would encode it at a quarter the detail. An
-    // explicit `kind: video` is honoured either way.
-    m.kind = (kind == "video" || v->num_frames > 1)
-                 ? h3::MediaReference::Kind::kVideo
-                 : h3::MediaReference::Kind::kImage;
+    // The probe said video, but the truncation above can leave ONE
+    // frame -- a 1/24 s `frames` on a long clip. One frame is a still by
+    // every rule that follows (no rate to condition on, no motion to
+    // read), so it is demoted rather than encoded as a clip of length 1.
+    m.kind = v->num_frames > 1 ? h3::MediaReference::Kind::kVideo
+                               : h3::MediaReference::Kind::kImage;
     m.num_frames  = v->num_frames;
     m.height      = v->height;
     m.width       = v->width;
@@ -591,11 +576,16 @@ VideoRefEncoderStage::decode_request_(const FlexData& spec,
       m.fps        = h3::kFps;
       m.channels   = 0;
       m.pcm.clear();
+      session()->log_debug(fmt(
+          "VideoRefEncoderStage('{}'): reference {} truncated to a single "
+          "frame at {} frames; conditioning on it as a still", this->id(),
+          i + 1, aligned));
     }
     out->push_back(std::move(m));
   }
   return true;
 }
+
 
 // ---- idle unload ----------------------------------------------------
 
@@ -678,16 +668,6 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   }
   const std::string prompt = prompt_of_(pfd->data);
 
-  auto rb = co_await ctx.read(1);
-  if (!rb) { ctx.signal_done(); co_return; }
-  const auto* rfd = dynamic_cast<const FlexDataPayload*>(rb.get());
-  if (rfd == nullptr) {
-    session()->warn(fmt(
-        "VideoRefEncoderStage('{}'): expected a FlexData reference list, got "
-        "{}; skipping", this->id(), rb->describe()));
-    co_return;
-  }
-
   resolve_unload_policy_();
   if (_unloaded && !reload_models_()) {
     session()->warn(fmt(
@@ -703,7 +683,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   }
 
   std::vector<h3::MediaReference> refs;
-  if (!decode_request_(rfd->data, &refs)) { co_return; }
+  if (!decode_references_(&refs)) { co_return; }
   std::string verr;
   if (!h3::validate_reference_request(refs, _limits, &verr)) {
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
@@ -721,7 +701,8 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     // them, so a patch mismatch is not a fidelity question.
     genai::MetalMiniMaxH3Transformer::Config dcfg;
     if (genai::MetalMiniMaxH3Transformer::config_from_json(_root, dcfg,
-                                                           nullptr)) {
+                                                           nullptr,
+                                                           _partition)) {
       plan.patch_h = dcfg.patch_h;
       plan.patch_w = dcfg.patch_w;
     }

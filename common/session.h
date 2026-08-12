@@ -141,10 +141,6 @@ public:
   {
     return _pool.get();
   }
-  unsigned default_edge_capacity() const noexcept override
-  {
-    return _default_edge_capacity;
-  }
 
   // Live profiling state. record_perf_event is the producer hot
   // path; stages reach it via their inline Stage::record_perf_event
@@ -288,7 +284,6 @@ private:
   std::string                      _web_ui_bind_address;
 
   std::unique_ptr<ThreadPool>      _pool;
-  unsigned                         _default_edge_capacity = 4;
 
   // UI/message locale (normalized IETF tag). Seeded from the "language"
   // config key (default en-us) and mutable at runtime via set_language;

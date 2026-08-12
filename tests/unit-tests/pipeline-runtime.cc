@@ -4,6 +4,7 @@
 #include "common/thread-pool.h"
 #include "common/beat-payload-intf.h"
 #include "tests/unit-tests/payload-types.h"
+#include "common/oport-policy.h"
 #include "common/vertex.h"
 #include "stages/passthrough-stage.h"
 #include "interfaces/session-services-intf.h"
@@ -88,8 +89,13 @@ struct Wired {
 
 // Build a 3-stage pipeline: src -> passthrough -> sink. The Pipeline
 // owns the stages; raw pointers in Wired are non-owning.
+// edge_depth == 0 leaves every oport on the default OportPolicy
+// (soft-threshold mode: warn at 1024 active Beats, throw at 2048).
+// A non-zero value sets a fixed ring depth on each producer, which is
+// the only way to get a small buffer -- there is no session-wide knob.
 Wired
-build_pipeline(vpipe::Session& sess, unsigned target)
+build_pipeline(vpipe::Session& sess, unsigned target,
+               unsigned edge_depth = 0)
 {
   auto pl = std::make_unique<vpipe::Pipeline>("p", &sess);
 
@@ -109,6 +115,13 @@ build_pipeline(vpipe::Session& sess, unsigned target)
     &sess, "sink", std::vector<vpipe::InEdge>{{mid, 0}});
   auto* sink = static_cast<CollectingSink*>(
     pl->insert_stage(std::move(sink_u)));
+
+  if (edge_depth > 0) {
+    const vpipe::OportPolicy pol{edge_depth,
+                                 vpipe::OverrunPolicy::Backpressure};
+    src->set_oport_policy(0, pol);
+    mid->set_oport_policy(0, pol);
+  }
 
   return Wired{std::move(pl), src, mid, sink};
 }
@@ -136,18 +149,39 @@ TEST(pipeline_runtime, passthrough_basic) {
 }
 
 TEST(pipeline_runtime, backpressure_small_buffer) {
-  vpipe::Session sess(R"({"pipeline":{"default_edge_capacity":1}})");
-  auto w = build_pipeline(sess, 50);
-  // Slow consumer so the producer is forced to suspend on the
-  // 1-slot edge buffers.
+  vpipe::Session sess;
+  // Depth 1 on both producers, so a slow sink forces the source to
+  // suspend rather than run ahead.
+  //
+  // The assertion has to be about HOW FAR AHEAD the source got, not
+  // about what eventually arrived. "All N items, in order" holds at
+  // any depth, so the earlier version of this test passed without ever
+  // reaching the backpressure path it names: it selected the depth
+  // through a session config key that nothing read, and the
+  // assertions could not tell the difference either way.
+  auto w = build_pipeline(sess, 400, /*edge_depth=*/1);
   w.sink->slow = std::chrono::microseconds(200);
 
   vpipe::PipelineRuntime rt(w.pipeline.get(), &sess);
   EXPECT_TRUE(rt.launch());
+
+  // Sample mid-run. Unbuffered the source would already be at 400
+  // while the sink is a handful of items in; held to depth 1 it can
+  // only be a couple of Beats ahead of what the sink has taken.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  unsigned produced = w.src->next;
+  size_t   consumed = 0;
+  {
+    std::lock_guard<std::mutex> lk(w.sink->mu);
+    consumed = w.sink->received.size();
+  }
+  EXPECT_TRUE(produced < 400u);
+  EXPECT_TRUE(produced - consumed <= 8u);
+
   rt.wait_idle();
 
   std::lock_guard<std::mutex> lk(w.sink->mu);
-  EXPECT_TRUE(w.sink->received.size() == 50);
+  EXPECT_TRUE(w.sink->received.size() == 400);
   bool ordered = true;
   for (size_t i = 0; i < w.sink->received.size(); ++i) {
     if (w.sink->received[i] != static_cast<unsigned>(i)) {
@@ -159,7 +193,7 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
 }
 
 TEST(pipeline_runtime, stop_mid_stream) {
-  vpipe::Session sess(R"({"pipeline":{"default_edge_capacity":2}})");
+  vpipe::Session sess;
   // Large target so the source can't finish naturally before stop().
   auto w = build_pipeline(sess, 1000000);
   w.sink->slow = std::chrono::microseconds(100);
@@ -192,7 +226,7 @@ TEST(pipeline_runtime, self_completed_when_all_stages_done) {
 }
 
 TEST(pipeline_runtime, not_self_completed_after_external_stop) {
-  vpipe::Session sess(R"({"pipeline":{"default_edge_capacity":2}})");
+  vpipe::Session sess;
   // Large target so the source can't finish naturally before stop().
   auto w = build_pipeline(sess, 1000000);
   w.sink->slow = std::chrono::microseconds(100);
@@ -259,7 +293,7 @@ TEST(pipeline_runtime, edge_buffer_stats_labels_and_depth) {
 // concurrent read is crash-free and stays coherent (the relaxed/locked
 // snapshots never tear into a bad size or null label).
 TEST(pipeline_runtime, edge_buffer_stats_concurrent_safe) {
-  vpipe::Session sess(R"({"pipeline":{"default_edge_capacity":4}})");
+  vpipe::Session sess;
   auto w = build_pipeline(sess, 300000);     // long enough to poll mid-run
   w.sink->slow = std::chrono::microseconds(40);   // keep buffers non-empty
 

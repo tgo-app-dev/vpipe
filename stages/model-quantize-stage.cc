@@ -23,6 +23,7 @@
 #include "interfaces/ui-delegate-intf.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 
 #include <cctype>
 #include <cstdint>
@@ -159,7 +160,8 @@ dit_class_family_(const std::string& class_name)
 // tokenizer), so returning the transformer/ subdir keeps that invariant for the
 // root case too.
 std::string
-resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family)
+resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family,
+                     const std::string& partition = {})
 {
   namespace fs = std::filesystem;
   auto family_of = [](const fs::path& cfg) -> std::string {
@@ -178,8 +180,16 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family)
   // writing a directory checkpoint that records the qkv order the source
   // was in.
   {
+    // `partition` is what the models DB said this reference is. It has
+    // to rank first: MiniMax-H3's two partitions live in one repo and
+    // differ only in the DiT filename, so without it a quantize of the
+    // Ref2VA record reads FL2VA's 66 GB and writes it out under the
+    // Ref2VA name. The historical `fl2va` preference stays behind it.
+    const std::vector<std::string> prefer =
+        partition.empty() ? std::vector<std::string>{"fl2va"}
+                          : std::vector<std::string>{partition, "fl2va"};
     const std::string f = genai::comfy::resolve_component(
-        src_dir, "diffusion_models", "config", {"fl2va"});
+        src_dir, "diffusion_models", "config", prefer);
     if (!f.empty()) {
       FlexData md;
       if (genai::comfy::metadata_json(f, "config", md, nullptr) &&
@@ -778,7 +788,13 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
 
   // ---- Text-to-image (Krea-2 / FLUX.2): a multi-component pipeline. ----
   std::string t2i_family;
-  const std::string dit_dir = resolve_t2i_dit_dir_(src_dir, &t2i_family);
+  // Which model the REFERENCE meant, from the record rather than from
+  // the directory -- two records can share one local_path.
+  const std::string h3_part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _src_model).model_type);
+  const std::string dit_dir =
+      resolve_t2i_dit_dir_(src_dir, &t2i_family, h3_part);
   if (!dit_dir.empty()) {
     // A Comfy-Org REPACK root is tested FIRST, and the order is
     // load-bearing rather than stylistic. A repack's components live in

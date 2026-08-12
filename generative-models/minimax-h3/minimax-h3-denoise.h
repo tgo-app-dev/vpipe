@@ -68,6 +68,19 @@ struct DenoiseRequest {
   // Per-step progress. Return false to stop early; the state keeps
   // whatever steps have run.
   std::function<bool(int step, int total)> progress;
+
+  // Adopt a caller's per-generation choices. Here rather than at each
+  // call site so a field added to GenerationParams reaches the loop
+  // without every driver having to be found and updated -- which is the
+  // failure mode a knob silently keeping its default looks like.
+  void
+  set_params(const MetalMiniMaxH3Transformer::GenerationParams& p)
+  {
+    video_shift = p.video_shift;
+    audio_shift = p.audio_shift;
+    condition_timestep = (float)p.condition_timestep;
+    condition_audio_timestep = (float)p.condition_audio_timestep;
+  }
 };
 
 // Run the loop. False on failure, with a reason in `err`. On success the

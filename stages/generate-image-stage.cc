@@ -12,6 +12,7 @@
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-config-source.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -91,30 +92,25 @@ const ConfigKey kAttrs[] = {
           "a negative prompt on iport1 runs a 2nd DiT pass per step"},
   {.key = "init_latents", .type = ConfigType::String, .required = false,
    .doc = "debug: raw f32 packed initial latents [img_seq, 64] (repro/golden)"},
-  {.key = "no_watermark", .type = ConfigType::Bool, .required = false,
-   .doc = "Mage-Flow only: DISABLE the Gaussian-Shading provenance watermark "
-          "in the initial noise. The watermark is ON by default -- the "
-          "reference applies it unconditionally and it is distribution-"
-          "preserving, so it costs no image quality. Negative-named so the "
-          "safe default needs no config. Ignored by the other families, and "
-          "by any run pinned to init_latents"},
-  {.key = "watermark_key", .type = ConfigType::String, .required = false,
-   .doc = "Gaussian-Shading key: an integer or a passphrase. Unset => "
-          "$MAGEFLOW_GS_KEY, else $MAGEFLOW_GS_KEY_FILE / ~/.mageflow/gs_key, "
-          "else the published default. The detector needs the SAME key"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
           "without NAX matmul2d (matrix-core GPU + kernels). Default "
           "false; env VPIPE_I8_GEMM overrides"},
-  {.key = "klein_kv", .type = ConfigType::Bool, .required = false,
-   .doc = "the checkpoint is FLUX.2-klein-9b-kv rather than plain klein-9B: "
-          "reference tokens are attention-isolated and modulated at a fixed "
-          "timestep 0, and their K/V are cached across denoise steps (BFL "
-          "measure 1.21-2.66x on multi-reference edits). REQUIRED for that "
-          "checkpoint and WRONG for any other -- the two are indistinguishable "
-          "on disk (same config.json, same tensor names), so it cannot be "
-          "detected. Default false"},
+};
+
+// The keys that MOVED to the per-family config stages. Named so a
+// pipeline written against the old union says what to do instead of
+// silently running the defaults -- an unknown key is not an error
+// anywhere in this runtime, which is what makes a quiet removal the
+// wrong way to do this. `klein_kv` is the one that matters most: it
+// selects a RECIPE, so ignoring it does not degrade the image, it makes
+// a different one.
+struct MovedKey { const char* key; const char* to; };
+constexpr MovedKey kMovedKeys[] = {
+  {"klein_kv",      "flux2-model-config"},
+  {"no_watermark",  "mage-flow-model-config"},
+  {"watermark_key", "mage-flow-model-config"},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning", .doc = "conditioning tensor from a diffusion-"
@@ -142,6 +138,16 @@ const PortSpec kIports[] = {
                                  "f32 from vae-encode); FLUX.2/QIE 2nd reference "
                                  "(distinct RoPE position); ignored by Krea-2",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "model_config",
+   .doc = "OPTIONAL model-specific parameters from the resident family's own "
+          "config source -- flux2-model-config (the klein-kv recipe) or "
+          "mage-flow-model-config (the provenance watermark). Passed to that "
+          "family's own params struct UNREAD, so this stage carries none of "
+          "the knobs. Wiring it DEFERS the DiT load to the first beat, "
+          "because a recipe like klein_kv has to be known before the weights "
+          "are read",
+   .type = &typeid(FlexDataPayload),
+   .tags = "model-config", .clock_group = 0},
 };
 
 // The model iport (a model-select source) overrides hf_dir. Inserted after the
@@ -149,6 +155,7 @@ const PortSpec kIports[] = {
 // ref_latent0 / ref_latent1 follow at iports 3 / 4 / 5 / 6. (Referenced only
 // from the Apple-gated code; maybe_unused for the inert non-Apple build.)
 [[maybe_unused]] constexpr unsigned kModelPort = 2;
+[[maybe_unused]] constexpr unsigned kModelCfgPort = 7;
 const PortSpec kOports[] = {
   {.name = "latent",
    .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
@@ -191,15 +198,33 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _steps  = (int)attr_int("steps");
   _strength = attr_real("strength");
   _guidance_scale = attr_real("guidance_scale");
-  // Provenance watermark is ON unless explicitly disabled (see no_watermark).
-  _watermark = !attr_bool("no_watermark");
-  _watermark_key = attr_str("watermark_key");
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 GEMMs for the DiT's
   // big block matmuls (~2x their f16 rate on matrix-core GPUs at int8
   // quality). Env VPIPE_I8_GEMM=0|1 overrides.
+  //
+  // This one STAYS here, unlike klein_kv beside it, and the line
+  // between them is worth stating: i8_gemm chooses a KERNEL, so it is
+  // a property of the machine and the caller's quality budget, and a
+  // family without int8 kernels simply runs f16 -- no worse, just not
+  // faster. klein_kv chooses a RECIPE, so on the wrong checkpoint it
+  // does not run slower, it runs wrong.
   _i8_gemm = attr_bool("i8_gemm");
-  _klein_kv = attr_bool("klein_kv");
   _seed   = (std::uint64_t)attr_int("seed");
+  // The family-specific keys are gone from this stage; a pipeline still
+  // carrying one gets told where it went. Warning rather than failing
+  // because the key is now inert, not wrong -- the graph runs, it just
+  // runs on defaults.
+  {
+    auto o = this->config().as_object();
+    for (const auto& mk : kMovedKeys) {
+      if (o.contains(mk.key)) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): config key '{}' moved to the '{}' "
+            "stage and is IGNORED here; wire one to the model_config iport "
+            "or the family runs its defaults", this->id(), mk.key, mk.to));
+      }
+    }
+  }
   // Neither axis configured => infer the size from ref_latent0 when a
   // reference is wired (process()); both stay 0 so the check below is vacuous
   // and the log reads "auto". A PARTIALLY specified size is not half-inferred
@@ -407,6 +432,8 @@ GenerateImageStage::reset_run_state()
   _model_latched     = false;
   _sampler_latched   = false;
   _scheduler_latched = false;
+  _cfg_latched       = false;
+  _model_cfg         = FlexData{};
   // The reference latents latch on FIRST arrival and are cached for
   // every later prompt (`_ref[]`), which is right within a run and
   // wrong across one: a non-empty cache makes the iport5/iport6 read
@@ -453,6 +480,39 @@ GenerateImageStage::declare_resources() const
       {(fs::path(root) / "transformer").string(), enc});
 }
 
+// Both directions of one question: what did the caller ask for, and
+// which family is resident. It runs on every change to either, because a
+// config beat and a model reference arrive on different ports and either
+// can be first -- parsing at only one of those moments loses whichever
+// came earlier. False when the beat is for a DIFFERENT family, which is
+// reported and then ignored.
+bool
+GenerateImageStage::apply_model_config_()
+{
+  const std::string want = model_config::family_of(_model_cfg);
+  if (!want.empty() && want != _family) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the model_config beat is for the '{}' "
+        "family but the resident checkpoint is '{}'; IGNORING it and using "
+        "the defaults. Wire the config stage that matches the checkpoint",
+        this->id(), want, _family));
+    return false;
+  }
+  std::string perr;
+  if (_family == "flux2") {
+    _flux2_params =
+        genai::MetalFlux2Transformer::GenerationParams::from_flex(_model_cfg,
+                                                                  &perr);
+  } else if (_family == "mage-flow") {
+    _wm_params = genai::mage_wm::Params::from_flex(_model_cfg, &perr);
+  }
+  if (!perr.empty() && !_model_cfg.is_null()) {
+    session()->warn(fmt("GenerateImageStage('{}'): model_config: {}",
+                        this->id(), perr));
+  }
+  return true;
+}
+
 Job
 GenerateImageStage::initialize(RuntimeContext& ctx)
 {
@@ -461,7 +521,15 @@ GenerateImageStage::initialize(RuntimeContext& ctx)
   // load now from the config hf_dir, as before.
   const bool model_from_iport =
       ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
-  if (!model_from_iport) { ensure_loaded_(); }
+  // The SAME deferral for a wired model_config, and for a sharper
+  // reason: `klein_kv` selects the attention recipe, so load() has to
+  // know it. Loading here and reading the config afterwards would build
+  // the DiT under the wrong recipe and then never rebuild it -- and
+  // FLUX.2's two variants both load cleanly either way, so the mistake
+  // would surface as wrong images rather than as an error.
+  const bool cfg_from_iport =
+      ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort);
+  if (!model_from_iport && !cfg_from_iport) { ensure_loaded_(); }
   co_return;
 }
 
@@ -503,6 +571,10 @@ GenerateImageStage::ensure_loaded_()
       ? (fs::path(root) / "transformer").string()
       : resolve_model_dir(session(), _dit_dir);
   _family = t2i_family_(dit_dir);
+  // The family is only now known, so this is the first moment a config
+  // beat that already arrived can be parsed by anything -- and it has to
+  // happen BEFORE the load below, since klein_kv is an argument to it.
+  apply_model_config_();
   const std::string size_desc =
       _infer_size ? std::string("auto (from ref_latent0)")
                   : std::to_string(_width) + "x" + std::to_string(_height);
@@ -544,7 +616,7 @@ GenerateImageStage::ensure_loaded_()
     }
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
-    fcfg.klein_kv = _klein_kv;
+    _flux2_params.apply_to(fcfg);
     // Nothing in the checkpoint says which recipe it wants, and getting it
     // backwards costs plausible-looking wrong images rather than an error --
     // so when the path LOOKS like the other variant, say so. A hint, never an
@@ -554,14 +626,14 @@ GenerateImageStage::ensure_loaded_()
       for (auto& ch : dl) { ch = (char)std::tolower((unsigned char)ch); }
       const bool looks_kv = dl.find("-kv") != std::string::npos
                             || dl.find("_kv") != std::string::npos;
-      if (looks_kv != _klein_kv) {
+      if (looks_kv != _flux2_params.klein_kv) {
         session()->warn(fmt(
             "GenerateImageStage('{}'): '{}' looks like {} but klein_kv={}. The "
             "-kv checkpoint isolates reference tokens; running either variant "
             "under the other's attention produces wrong images silently",
             this->id(), dit_dir,
             looks_kv ? "FLUX.2-klein-9b-kv" : "plain FLUX.2-klein",
-            _klein_kv ? "true" : "false"));
+            _flux2_params.klein_kv ? "true" : "false"));
       }
     }
     _flux2_dit = genai::MetalFlux2Transformer::load(
@@ -762,7 +834,7 @@ GenerateImageStage::load_flux2_dit_()
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
-  fcfg.klein_kv = _klein_kv;
+  _flux2_params.apply_to(fcfg);
   _flux2_dit = genai::MetalFlux2Transformer::load(
       weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream, _flux2_pin_frac);
   return (bool)_flux2_dit;
@@ -1268,7 +1340,7 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   // cache: turning `klein_kv` off instead would change the ATTENTION, so the
   // two arms would not be computing the same thing.
   genai::MetalFlux2Transformer::KvCache* kvp =
-      (_klein_kv && !ri.empty() &&
+      (_flux2_params.klein_kv && !ri.empty() &&
        std::getenv("VPIPE_FLUX2_NO_KV_CACHE") == nullptr) ? &kvc : nullptr;
   // Opened before the denoise callable so the per-block hook is
   // live for the very first forward.
@@ -1896,11 +1968,11 @@ GenerateImageStage::generate_mage_(const metal_compute::SharedBuffer& txt_pos,
   std::vector<float> packed((std::size_t)img_seq * IC);
   if (init_packed != nullptr && init_packed->size() == packed.size()) {
     packed = *init_packed;   // pinned noise: never watermarked (repro/golden)
-  } else if (_watermark) {
+  } else if (_wm_params.enabled) {
     // encode_noise lays the mark out CHANNEL-first (the order the detector
     // reshapes into) and returns it token-major, which is what the DiT wants.
     packed = genai::mage_wm::encode_noise(
-        IC, gh, gw, genai::mage_wm::resolve_key(_watermark_key), _seed);
+        IC, gh, gw, genai::mage_wm::resolve_key(_wm_params.key), _seed);
     if (packed.size() != (std::size_t)img_seq * IC) {
       session()->warn(fmt(
           "GenerateImageStage('{}'): watermark noise generation failed; falling "
@@ -2068,6 +2140,39 @@ Job
 GenerateImageStage::process(RuntimeContext& ctx)
 {
   auto* mc = session()->services()->metal_compute();
+  // The model config FIRST, before anything can load: `klein_kv` is an
+  // argument to the DiT's construction, not a per-step knob, so a beat
+  // read after ensure_loaded_ would arrive too late to matter and would
+  // do so silently.
+  //
+  // Latched, but RE-READ whenever another beat is waiting: a config
+  // source with no trigger emits once for the whole run, while a
+  // trigger-driven one emits per request. Blocking on the first and
+  // polling after serves both. (A later beat cannot change `klein_kv` on
+  // an already-built DiT -- see the note where that is reported.)
+  if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
+      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+    auto gb = co_await ctx.read(kModelCfgPort);
+    const bool first = !_cfg_latched;
+    _cfg_latched = true;
+    if (const auto* gfd =
+            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+      const bool kv_before = _flux2_params.klein_kv;
+      _model_cfg = gfd->data;
+      // Only if the family is already known; otherwise ensure_loaded_
+      // applies it the moment it is.
+      if (_load_attempted) { apply_model_config_(); }
+      if (!first && _family == "flux2" &&
+          _flux2_params.klein_kv != kv_before) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): klein_kv changed after the DiT was "
+            "built; it selects the attention recipe at LOAD time, so this "
+            "run keeps the old one. Restart the pipeline to change it",
+            this->id()));
+        _flux2_params.klein_kv = kv_before;
+      }
+    }
+  }
   // Latch the shared model (iport2) once -- a model-select source overrides the
   // hf_dir config -- then lazily load the DiT before the first generation.
   if (!_model_latched && ctx.num_iports() > kModelPort &&
@@ -2081,6 +2186,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
       }
     }
   }
+  // A config wired but no model-select source: initialize() deferred the
+  // load so the config could be read first, so nothing has loaded yet.
+  ensure_loaded_();
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }
   // Did the conditioner REFUSE this prompt? Read the flag off the beat up

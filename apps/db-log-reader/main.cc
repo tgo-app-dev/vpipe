@@ -56,10 +56,6 @@ public:
   {
     return nullptr;
   }
-  unsigned default_edge_capacity() const noexcept override
-  {
-    return 0;
-  }
   // No subsystem accessors: db-log-reader is a pure log dumper, no
   // pipeline ever runs in it, and it opens its own LmdbEnv directly
   // rather than through the session. It therefore overrides no

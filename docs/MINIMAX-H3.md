@@ -33,6 +33,7 @@ once, up front. Both copies exist while that runs:
 | Source repack (`Comfy-Org/MiniMax-H3`, bf16) | **~115 GB** |
 | Peak while preparing (source + output) | **~155 GB** |
 | 4-bit model, source deleted | **~45 GB** |
+| Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+24 GB** 4-bit |
 
 Once preparation finishes you can delete the source repack and keep the
 ~45 GB. The 115 GB is a one-time cost, not a standing one.
@@ -47,6 +48,10 @@ Once preparation finishes you can delete the source repack and keep the
 
 - **[`prepare-minimax-h3-4bit.vpipeline`](pipelines/prepare-minimax-h3-4bit.vpipeline)**
   — download the checkpoint and quantize it. Run once.
+- **[`prepare-minimax-h3-ref2va-4bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)**
+  — the same for the **Ref2VA** partition (see
+  [Conditioning on references](#conditioning-on-references-ref2va)). Only if
+  you want it; the two share a download.
 - **[`minimax-h3-text-to-video.vpipeline`](pipelines/minimax-h3-text-to-video.vpipeline)**
   — prompt in, `.mp4` with sound out.
 
@@ -95,6 +100,12 @@ Four stages, in order:
    `skip_existing_files` is on, so re-running after an interruption skips
    every shard already on disk at the right size and re-fetches only the one
    that was cut off.
+
+   **`model_variant: fl2va` is required, not decorative.** That one repo
+   publishes *two* models — the FL2VA and Ref2VA partitions — and they pin
+   different transformer files and different tokenizers. A fetch that does
+   not say which is refused, with both listed, rather than quietly taking
+   the first.
 2. **`model-quantize`** (`target: dit`) — the 33B transformer to 4-bit,
    group size 64. **Leave `quant_modulation: true` alone.** H3's per-block
    AdaLN modulation is not a small side projection the way other DiTs' is —
@@ -129,14 +140,14 @@ registry holding your model lives. Then open the URL it prints, load
 `minimax-h3-text-to-video.vpipeline`, edit the `text-prompt` stage, and press
 Start. The shipped prompt asks for both halves at once:
 
-> *A red paper boat drifting down a rain-slicked gutter at dusk, street light
-> reflections rippling on the water. Sound of the rain is heard with
-> occasional sound of individual water drops.*
+> *An Asian musician playing classical music on a grand piano.*
 
-Describe the **sound** as well as the picture. There is no separate audio
-prompt — the soundtrack comes from the same text, so a prompt that mentions
-only what things look like will get you whatever the model thinks that scene
-sounds like.
+The soundtrack is in that sentence: naming what is being *played* is what
+gives the model the music. There is no separate audio prompt — the sound
+comes from the same text — so describe the **sound** as well as the picture.
+Either name it outright (*"sound of the rain, with the occasional individual
+drop"*) or, as here, name the thing making it. A prompt that says only what a
+scene looks like gets you whatever the model thinks that scene sounds like.
 
 The graph is eight stages:
 
@@ -173,8 +184,45 @@ From the `generate-video` stage:
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
-Audio length follows from `frames` and `fps`; set `audio_seconds` only to
-override that.
+And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
+`model_config` iport (port 9):
+
+| key | shipped | notes |
+|---|---|---|
+| `video_shift` / `audio_shift` | 12.0 / 3.0 | The two sigma schedules. Not interchangeable — these are the released checkpoint's. |
+| `condition_timestep` | 1.0 | The level the pinned keyframe rows sit at. `1.0` is **clean** in this model's `t = 1 − sigma` convention. |
+| `condition_audio_timestep` | 1.0 | The same, for a Ref2VA reference **soundtrack**. |
+| `audio_seconds` | 0 | Audio length follows from `frames` and `fps`; set this only to override that. |
+
+These are H3's own knobs, so they live in an H3 stage rather than in
+`generate-video`, which keeps only what every video model answers to
+(geometry, length, steps, seed, residency). Leave the stage out and the
+defaults above apply. Give it a **trigger** iport and it re-emits once per
+inbound beat, so the settings can change per clip in a graph that generates
+continuously; with no trigger it emits once for the run.
+
+There is deliberately **no guidance scale** here: H3 is distilled, and a
+distilled model has no unconditional pass to guide against. Wan's guidance
+and expert boundary live in `wan2-model-config` for the same reason — each
+family carries its own.
+
+### How long it takes
+
+Measured on the smallest machine that runs this at all — a **fanless 2025
+MacBook Air 15-inch**, 10-core CPU / 10-core GPU, 16 GB — generating a clip a
+little shorter than the shipped default:
+
+| 960 × 544 (0.5 MP) · 24 fps · 90 frames (**3.75 s**) · 8 steps | |
+|---|---|
+| sitting on an ice pack | **13 min** |
+| sitting on a desk | **18 min** |
+
+Same settings, same machine: that five-minute spread is **thermal**. A 33B
+model holds the GPU flat out from the first step to the last, and a passively
+cooled chassis clocks down long before the run is over — so on a fanless Mac,
+where the machine sits matters about as much as what you set. Of the settings
+themselves `steps` moves this most: the model is distilled, so a 4-step draft
+costs roughly half.
 
 ### More than text in
 
@@ -203,28 +251,36 @@ Wire a **`video-ref-encoder`** stage:
 | | |
 | --- | --- |
 | port 0 in | the prompt |
-| port 1 in | the reference **list** |
+| port 1 in | optional `model-select` |
 | port 0 out | conditioning → `generate-video` port 0 |
 | port 1 out | reference video rows → `generate-video` port **7** |
 | port 2 out | reference audio rows → `generate-video` port **8** |
 
-The list is one input rather than a port per reference because a request's
-shape is only known when it arrives — twelve `load-image` chains cannot
-express "three clips and nine stills" without the graph being rewritten per
-request. **The order is the request**: it numbers the references in the
-prompt the model reads (`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places
-them on a shared clock, so reordering the list is a different generation.
+The references are the stage's **`references` config**, not a port: they are
+files to open, so the composer's file browser fills them in — **select
+several at once** and they land in the list in the order you picked them.
 
 ```json
-[
-  {"kind": "image", "path": "subject.png"},
-  {"kind": "video", "path": "motion.mp4"},
-  {"kind": "audio", "path": "voice.wav"}
-]
+"references": ["subject.png", "motion.mp4", "voice.wav"]
 ```
 
-`kind` may be left out and is read off the container. A video reference
-conditions on **its own soundtrack** unless it sets `"audio": false` — which
+A single path may be written bare, without the brackets. **The order is the
+request**: it numbers the references in the prompt the model reads
+(`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places them on a shared clock,
+so reordering the list is a different generation. That is also why they are
+one list rather than a port per reference — a request's shape is only known
+when it arrives, and twelve `load-image` chains cannot express "three clips
+and nine stills" without the graph being rewritten per request.
+
+**You do not say what each file is.** vpipe opens it and reads that from the
+file: a container with one frame is an *image* reference, an `.mp4` carrying
+no video stream is an *audio* one, and an animated `.webp` is a clip. An
+extension is a claim and the bytes are the fact — and a file picker hands
+over whatever the user chose. Getting it wrong is not loud: a still read as
+video conditions the model on a frozen clip, and a clip read as a still
+quietly keeps only its first frame.
+
+A video reference conditions on **its own soundtrack** when it has one. That
 is why the stage opens the file itself rather than taking frames from
 `load-video`: a clip and its audio have to come out of one container to stay
 in sync, and the file's **frame rate** has to survive the trip. MiniMax-H3
@@ -245,6 +301,31 @@ expected.
 This stage holds the prompt encoder, its vision tower and both VAEs while it
 runs, so on a memory-bounded box leave `unload_when_idle` at `auto` — the
 encoders are dropped before the denoise starts.
+
+#### Preparing the Ref2VA checkpoint
+
+Run
+[`prepare-minimax-h3-ref2va-4bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)
+exactly as step 1, and it produces `local/MiniMax-H3-Ref2VA-4bit`. Point the
+generation pipeline's `model-select` at that instead.
+
+The two partitions **share one repo and one download**. Ref2VA adds only its
+own 66 GB transformer; the 51 GB prompt encoder and both VAEs are already on
+disk from step 1 and are skipped. If you only ever want Ref2VA, run this
+pipeline alone — it fetches what it needs.
+
+Two config keys make that sharing safe, and both are in the pipeline:
+
+| key | why |
+|---|---|
+| `model_variant: ref2va` | *which* of the repo's two models to fetch. The files differ; the repo path does not. |
+| `model_key: Comfy-Org/MiniMax-H3-Ref2VA` | *what to call it* in the models DB, so the two records coexist over one directory on disk. |
+
+Everything downstream then resolves through that key rather than by
+inspecting the directory — which matters because the directory holds **both**
+transformers and cannot say which one you meant. Left to guess it picks
+FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
+video conditioned on nothing.
 
 ## Memory
 
@@ -294,7 +375,7 @@ instead.
 - One packed sequence carries video and audio rows together; the per-row AdaLN
   modulation that conditions it is 13B of the 33B.
 - Two sigma schedules advance in lockstep — video shifted 12, audio 3
-  (`video_shift` / `audio_shift`).
+  (`video_shift` / `audio_shift` on `minimax-h3-model-config`).
 - The video VAE is 24-channel at 1/16 resolution; audio decodes through a
   separate VAE to **32 kHz stereo**.
 - On **M5**, the GEMMs and attention run on the GPU's matrix cores
