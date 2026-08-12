@@ -214,6 +214,45 @@ open the **User I/O** panel — the `you>` prompt appears there, and replies
 stream into it as they are decoded. Everything above applies identically; only
 the console changes.
 
+## On a phone
+
+Same server, same pipeline, same model on your Mac. The phone is only the
+console — the UI picks its phone layout from the device.
+
+<p align="center">
+  <img src="images/vpipe_phone_ui_1.webp"
+       alt="The qwen35-9b-chat pipeline running in the vpipe phone UI: the
+            stage list, then a photographed receipt transcribed and questioned
+            in User I/O"
+       width="320">
+</p>
+
+Connecting takes one scan, and the README covers it in full:
+
+- **From the app** — *Settings ▸ Web UI ▸ Bind To ▸ Automatic (this Mac's LAN
+  address)*, then **Start Server**. The Web UI pane shows a **QR code**; point
+  the phone's camera at it and the UI opens **already authenticated**, with no
+  key to retype. See [Quickstart](../README.md#quickstart), steps 3–4.
+- **From the terminal** — `vpipe-web-ui --show-qr` prints the same code beside
+  the startup lines. See
+  [Connecting a phone](../README.md#connecting-a-phone---show-qr).
+
+A LAN binding makes the UI reachable by anything on your network, and the
+access key is the only thing in front of it. Scanning the code hands that key
+over, so treat the code as you would treat the key: a photo or a screen share
+is enough for someone else on the same network. Restarting the server
+invalidates it. The README's note on **what the QR code contains** is worth
+the minute it takes to read.
+
+The recording above is this pipeline running. The stage list is the same five
+stages; `User I/O` carries the conversation. The turn attaches a **photograph
+of a receipt** — on a phone the attach control opens the camera or the photo
+library, which is the case the media-line markers exist for — and asks for it
+as text. The follow-up question is answered from the same context, with no
+second upload: the log line shows a 20-token prefill against a `ctx_pos` that
+carries on from the previous turn. Decode holds ~19.7 tok/s throughout, on the
+Mac, while the phone does nothing but display it.
+
 ## What to expect
 
 Measured on an **M5, 16 GB**, at the shipped settings:

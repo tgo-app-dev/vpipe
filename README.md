@@ -252,6 +252,18 @@ values this checkpoint recommends for itself, and a feedback pair that makes
 it turn-by-turn. You can attach a picture to a turn — this model reads
 images too.
 
+<p align="center">
+  <img src="docs/images/vpipe_phone_ui_1.webp"
+       alt="The same pipeline in the vpipe phone UI: the stage list, then a
+            photographed receipt transcribed and questioned in User I/O"
+       width="300">
+</p>
+
+&emsp;&emsp;*The same pipeline from a phone — scan the QR code the server
+prints and the browser opens already authenticated. Here a photographed
+receipt is transcribed, then questioned: the follow-up answers from the same
+context, and the Mac decodes at ~19.7 tok/s throughout.*
+
 From a source build the same two files run on the command line, which is
 where a chat prompt is most at home:
 
