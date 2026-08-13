@@ -1,4 +1,5 @@
 #include "stages/minimax-h3-model-config-stage.h"
+#include "stages/model-registry.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -35,6 +36,29 @@ const ConfigKey kAttrs[] = {
    .doc = "soundtrack duration; 0 derives it from the video's frames / fps, "
           "which is what keeps the two modalities the same length by "
           "construction", .def_real = 0.0},
+  {.key = "lora", .type = ConfigType::String, .required = false,
+   .doc = "a LoRA applied AT RUNTIME -- every adapted projection computes "
+          "W x + scale * B (A x) rather than having the delta folded into "
+          "the weights. A registered model (the key a `model-fetch` of a "
+          "Turbo adapter writes), a directory holding one .safetensors, "
+          "or a direct path to one. Preferred over lora-fuse for a "
+          "few-step adapter: the MiniMax-H3 Turbo update is 2-4e-4 "
+          "relative to the weights where bf16's step is ~4e-3, so merging "
+          "rounds most of it away (46-78% of the delta survives) and a "
+          "4-bit base is coarser again. Costs ~1.5% of the projections' "
+          "FLOPs. LOAD-time: it is read before the DiT is built, and a "
+          "beat that changes it afterwards is reported and ignored",
+   .suggest_db = kModelRegistryDb,
+   // Without this the picker shows NOTHING: a field with no type falls
+   // back to plain models only, and every LoRA is catalogued as a
+   // `supplement` (it attaches to a parent rather than standing alone).
+   // Naming the type is also what keeps a Krea-2 or Wan adapter out of
+   // an H3 field.
+   .suggest_db_type = "minimax-h3-lora"},
+  {.key = "lora_scale", .type = ConfigType::Real, .required = false,
+   .doc = "adapter strength, folded into A at load. 1.0 is as trained and "
+          "is what the Turbo adapter is tuned for; nudge up for blurry "
+          "ghosting, down for over-sharp grain", .def_real = 1.0},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -84,6 +108,8 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _cond_timestep = attr_real("condition_timestep");
   _cond_audio_timestep = attr_real("condition_audio_timestep");
   _audio_seconds = attr_real("audio_seconds");
+  _lora          = attr_str("lora");
+  _lora_scale    = attr_real("lora_scale");
   // Deferred validation: the ctor never throws, so a nonsense number is
   // reported and the runtime skips the stage at launch. A non-positive
   // shift collapses the schedule to a single sigma, which generates
@@ -127,6 +153,14 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   o.insert_or_assign("condition_audio_timestep",
                      FlexData::make_real(_cond_audio_timestep));
   o.insert_or_assign("audio_seconds", FlexData::make_real(_audio_seconds));
+  // Emitted only when SET. An empty `lora` key would read as "the graph
+  // asked for no adapter", which is indistinguishable from "the graph
+  // said nothing" at the consumer -- and the consumer's default is
+  // already no adapter.
+  if (!_lora.empty()) {
+    o.insert_or_assign("lora", FlexData::make_string(_lora));
+    o.insert_or_assign("lora_scale", FlexData::make_real(_lora_scale));
+  }
   return fd;
 }
 
@@ -136,10 +170,12 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
   (void)fd;
   session()->info(fmt(
       "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
-      "t {:.3f}/{:.3f}, audio {}", this->id(), _video_shift, _audio_shift,
+      "t {:.3f}/{:.3f}, audio {}{}", this->id(), _video_shift, _audio_shift,
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
-                           : std::string("as long as the video")));
+                           : std::string("as long as the video"),
+      _lora.empty() ? std::string()
+                    : fmt(", runtime LoRA at {:.2f}", _lora_scale)()));
 }
 
 VPIPE_REGISTER_STAGE(MiniMaxH3ModelConfigStage)

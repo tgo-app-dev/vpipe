@@ -19,6 +19,7 @@
 #include "generative-models/weight-set.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -62,6 +63,19 @@ const ConfigKey kAttrs[] = {
    .doc = "denoising steps", .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "initial-noise RNG seed (default 0)"},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
+          "block matmuls instead of bf16, at int8 quality. Taken only by a "
+          "family whose forward materializes a dense weight for the matrix "
+          "cores -- minimax-h3 today; wan is steel-only and IGNORES it, as "
+          "does any box without NAX matmul2d. It also self-gates on ROWS "
+          "(>= 1024), so a short clip keeps the bf16 tiles either way, and "
+          "on how much a projection would have to be zero-padded to reach a "
+          "whole int8 chunk (refused past 10% extra MACs). "
+          "MEASURED on minimax-h3, 2 blocks at production geometry: 2.02-2.11 "
+          "s/step -> 1.52-1.55 s (1.35x), with the step's velocity rms moving "
+          "0.11%. Default false; env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
@@ -199,6 +213,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _frames = (int)attr_int("frames");
   _fps    = attr_real("fps");
   _steps  = (int)attr_int("steps");
+  _i8_gemm = attr_bool("i8_gemm");
   _seed   = (std::uint64_t)attr_int("seed");
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
@@ -486,6 +501,52 @@ GenerateVideoStage::apply_model_config_()
     _h3_params =
         genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
             _model_cfg, &perr);
+    // The LoRA is read here but consumed at LOAD, so a beat that names
+    // one after the DiT is already built cannot take effect -- say so
+    // rather than run the un-adapted model while the graph claims
+    // otherwise. Wiring the port defers the load, so this only bites a
+    // trigger-driven config that CHANGES the adapter mid-run.
+    //
+    // `_have_cfg` says the FAMILY is known, not that a beat has arrived:
+    // this runs the moment the checkpoint is identified, which is before
+    // the first config beat is read. So `_model_cfg` is routinely a
+    // default FlexData here, and as_object() on one THROWS -- which is
+    // what took the whole stage down rather than leaving it inert.
+    // family_of() and from_flex() above already tolerate it; this has to
+    // as well.
+    std::string lp;
+    double      ls = _h3_lora_scale;
+    if (_model_cfg.is_object()) {
+      const auto o = _model_cfg.as_object();
+      lp = o.contains("lora") ? std::string(o.at("lora").as_string("")) : "";
+      ls = o.contains("lora_scale") ? o.at("lora_scale").as_real(1.0) : 1.0;
+    } else {
+      lp = _h3_lora;   // nothing said; keep what a previous beat set
+    }
+    // The two halves of "which adapter, how strong" have different
+    // lifetimes and this is where that shows. The PATH is load-time --
+    // an adapted mlp.fc1 rules out the fused-SwiGLU kernel, which is
+    // chosen before the blocks load -- so changing it under a built DiT
+    // is refused rather than half-applied. The STRENGTH is not: it rides
+    // the accumulating GEMM as a per-forward constant, so a trigger-
+    // driven config can sweep it across beats for the cost of a setter.
+    if (_h3_dit != nullptr && lp != _h3_lora) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the DiT is already built, so the "
+          "model_config beat's `lora` is IGNORED -- it is a load-time "
+          "argument. `lora_scale` still applies", this->id()));
+    } else {
+      _h3_lora = lp;
+    }
+    if (ls != _h3_lora_scale) {
+      _h3_lora_scale = ls;
+      if (_h3_dit != nullptr && _h3_dit->lora_modules() > 0) {
+        _h3_dit->set_lora_scale((float)ls);
+        session()->log_debug(fmt(
+            "GenerateVideoStage('{}'): runtime LoRA strength -> {:.3f}",
+            this->id(), ls));
+      }
+    }
   } else {
     _wan_params =
         genai::MetalWanTransformer::GenerationParams::from_flex(_model_cfg,
@@ -552,9 +613,36 @@ GenerateVideoStage::ensure_expert_(int which)
         "+ {} GB headroom -> {}", this->id(), plan.footprint >> 30,
         plan.others >> 30, model_memory::kStreamHeadroom >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    _h3_cfg.i8_gemm = _i8_gemm;
+    // The runtime LoRA, when the model_config beat named one. It is a
+    // LOAD-time argument and not a per-step knob: an adapted mlp.fc1
+    // rules out the fused-SwiGLU kernel, which is decided before the
+    // blocks are built. Wiring the config port therefore defers this
+    // load to the first beat, exactly as generate-image does for
+    // FLUX.2's klein_kv.
+    //
+    // Independent of the int8 route above: that one picks how the BASE
+    // projection multiplies and applies on the matrix-core path only,
+    // while the adapter is a bf16 side GEMM either way.
+    // The config names a MODEL (a registry key), a directory or a file;
+    // this is the one place that turns any of those into the single
+    // .safetensors the loader opens. A key beats a directory scan
+    // because both Turbo checkpoints of a repo land side by side, and
+    // only the record says which one the key meant.
+    genai::MetalMiniMaxH3Transformer::LoraSpec lora;
+    if (!_h3_lora.empty()) {
+      std::string lerr;
+      lora.path = resolve_adapter_file(session(), _h3_lora, &lerr);
+      if (lora.path.empty()) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): {} -- generating WITHOUT the "
+            "adapter", this->id(), lerr));
+      }
+    }
+    lora.scale = (float)_h3_lora_scale;
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
-        stream_blocks, pin_frac);
+        stream_blocks, pin_frac, lora.path.empty() ? nullptr : &lora);
     resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
@@ -1040,6 +1128,27 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     if (r2v->audio_rows != nullptr && r2v->n_audio_rows > 0) {
       std::memcpy(aud.data(), r2v->audio_rows,
                   (std::size_t)r2v->n_audio_rows * AC * sizeof(float));
+    }
+    // Diagnostic: blank the reference rows, leaving the layout, the
+    // presentation and the noise byte-identical. "Do the reference
+    // LATENTS reach the picture" cannot be answered by changing the
+    // reference FILE -- that moves the conditioning tokens and the row
+    // counts with it -- so the only clean ablation is the values alone.
+    // `video` / `audio` / `all`.
+    if (const char* ab = std::getenv("VPIPE_H3_REF_ABLATE")) {
+      const std::string what(ab);
+      const bool all = what == "1" || what == "all";
+      if ((all || what == "video") && r2v->n_video_rows > 0) {
+        std::fill(vid.begin(),
+                  vid.begin() + (std::size_t)r2v->n_video_rows * PE, 0.0f);
+      }
+      if ((all || what == "audio") && r2v->n_audio_rows > 0) {
+        std::fill(aud.begin(),
+                  aud.begin() + (std::size_t)r2v->n_audio_rows * AC, 0.0f);
+      }
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): ABLATION -- reference {} rows zeroed",
+          this->id(), what));
     }
   }
 

@@ -1082,6 +1082,104 @@ model_catalog()
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
      .needs_tokenizer_json = false},
+    // MiniMax-H3 Turbo: a few-step distillation LoRA for the FL2VA
+    // partition. 4 steps instead of ~20 for joint video + synchronized
+    // audio, and it keeps improving to about 8; past that it
+    // over-sharpens, so 4-8 is the useful range at strength 1.0.
+    //
+    // Fuse it with the lora-fuse stage (base_model = the FL2VA DiT
+    // FILE -- a Comfy-Org repack is one file per component and the
+    // repo's diffusion_models/ holds BOTH partitions, so naming the
+    // directory would merge two 66 GB models under one set of names),
+    // then quantize the result and point generate-video at it.
+    //
+    // No name remap is needed and that is worth recording: this adapter
+    // is keyed on the model's OWN module names (blocks.N.attn.qkv_proj,
+    // mlp.fc1/fc2, adaln_proj.linear, token_refiner.blocks.N.*), so all
+    // 259 modules resolve through lora-fuse's first rule. It carries no
+    // `alpha` siblings either -- upstream states alpha = rank, i.e.
+    // W + B@A with no rescaling -- which is exactly what a missing alpha
+    // already means here.
+    //
+    // It is trained against Comfy-Org's repack, so it assumes the FLAT
+    // qkv grouping. Fusing it into MiniMaxAI's released weights would
+    // add the delta of one head's q to another head's k in every block,
+    // silently. That is why the entry pins the Comfy-Org parent rather
+    // than the family.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo few-step v4-600 EMA (larryvrh)",
+     .hf_path = "larryvrh/MiniMax-H3-Turbo-Lora",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_turbo_v4_step600_ema.safetensors"},
+     .needs_tokenizer_json = false,
+     // Both Turbo entries pin ONE file out of a repo holding eleven, so
+     // they need distinct registration keys the way the vpipe-supplement
+     // archives do -- without them the two would share the hf_path key
+     // and a graph could not say which checkpoint it meant. Kept in the
+     // `owner/name` shape every other key here has, so a reference reads
+     // as a model wherever it appears and the browse flow and a scripted
+     // fetch agree on one spelling. (`name` doubles as an extract subdir,
+     // but only for `extract_archive` entries -- these are plain files.)
+     .name = "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema"},
+    // The v1 line's last checkpoint, kept as its own entry because the
+    // choice between them is real rather than a version bump: v4 is
+    // better everywhere EXCEPT 4 steps with large, fast motion, where it
+    // can trail/smear and this one does not. At 6-8 steps take v4.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo few-step v1-850 EMA (larryvrh)",
+     .hf_path = "larryvrh/MiniMax-H3-Turbo-Lora",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_turbo_4step_ema_ckpt850.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema"},
+    // lightx2v's Turbo line, the OTHER few-step distillation of FL2VA.
+    //
+    // Only the `_comfyui_` spellings are catalogued, and the omission is
+    // deliberate rather than an oversight: the repo publishes each
+    // adapter twice, and the diffusers copy is not a renaming but a
+    // different DECOMPOSITION -- separate to_q/to_k/to_v that would have
+    // to be stacked block-diagonally into this model's fused qkv_proj,
+    // and an ff.net.0.proj in diffusers' value-first order whose halves
+    // would need swapping. Both transforms produce a well-shaped WRONG
+    // model if guessed at, so the files that would need them are not
+    // offered.
+    //
+    // The ComfyUI copies key on `diffusion_model.<module>`, which both
+    // the fuse and the runtime path resolve, and carry per-module alpha
+    // (alpha == rank here, so no rescaling). Their fused qkv adapter is
+    // rank 384 -- three rank-128 adapters stacked -- and its B is
+    // block-diagonal in the [all q | all k | all v] sense, i.e. it
+    // targets Comfy-Org's FLAT grouping and NOT the per-head release
+    // that this repo's `base_model` tag names. On the released weights
+    // it would add one head's q delta onto another head's k in all 50
+    // blocks, silently.
+    //
+    // SCHEDULE: the 4-step was distilled at video shift 6 (and 768p),
+    // where this model's default and every other adapter here is 12.
+    // That is not a preference -- it is the grid the distillation was
+    // fit to, so it belongs in the same `minimax-h3-model-config` beat
+    // as the adapter itself.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.0 768p, shift 6 (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p"},
+    // The 8-step, distilled at 544p on the checkpoint's own 12/3 shifts;
+    // upstream runs it at 8 steps or 4.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 544p (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step"},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /

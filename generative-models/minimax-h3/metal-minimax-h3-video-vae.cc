@@ -1,5 +1,7 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 
+#include "generative-models/shared/kernel-autotune.h"
+
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -548,6 +550,13 @@ MetalMiniMaxH3VideoVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // [GATE | up] -- gate FIRST. (The value-first spelling is the other
   // convention for the same weights and silently halves the FFN into
   // nonsense rather than failing.)
+  //
+  // Same swap as the DiT's fc1: diffusers implements [up; gate] and
+  // `scripts/convert_minimax_h3_to_diffusers.py` reorders the halves as
+  // it converts, stating it for this tensor too -- "the two halves of
+  // `w1` are swapped because diffusers' SwiGLU reads [up; gate] where
+  // the reference stores [gate; up]". Which is independent confirmation
+  // of the gate-first reading here, from the same file.
   m->_fn_swiglu    = m->_lib_elt.function("swiglu_split_gate_first_f16");
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_ln        = m->_lib_elt.function("layer_norm_affine_f16");
@@ -627,6 +636,7 @@ MetalMiniMaxH3VideoVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
     m->_use_mma2 = m->_fn_dense_mma.valid() && m->_fn_dense_mma_deep.valid();
+    m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
     if (m->_use_mma2 && m->_quant_bits > 0) {
       const std::string g = "g" + std::to_string(m->_quant_group);
       m->_lib_dequant = mc->load_library("affine_dequant_bf16");
@@ -773,7 +783,20 @@ MetalMiniMaxH3VideoVae::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   } else {
     wdense = &l.w;
   }
-  const bool wide = mma_use_wide_tile(N, K);
+  // Deep contraction: split it across planes and fold. Declines unless a
+  // tuned entry says otherwise, which for this tower is the usual answer --
+  // see the tune loop in encode() for why the band size decides it.
+  if (_splitk.encode(_mc, enc, x, *wdense, y, K, N, M, x_off, y_off)) {
+    return true;
+  }
+  bool wide = mma_use_wide_tile(N, K);
+  if (_force_tile != 0) {
+    wide = (_force_tile == 2);
+  } else {
+    for (const TileTune& t : _tile_tuned) {
+      if (t.N == N && t.K == K && t.M == M) { wide = t.wide; break; }
+    }
+  }
   const int RN = wide ? 256 : 128;
   enc.set_function(wide ? _fn_dense_mma_deep : _fn_dense_mma);
   enc.set_buffer(0, x, x_off * 2);
@@ -1256,10 +1279,21 @@ MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
                   (std::size_t)t * h * w * (std::size_t)(2 * c.z_channels));
   EncScratch s;
   s.T = T; s.H = H; s.W = W;
-  // 16 MB of im2col band. The gather is 27x the activation, so a full
-  // frame of it would be larger than the whole encode's working set at
-  // any real tile size; banding is what keeps it a fixed cost.
-  s.col_cap = 8u << 20;
+  // The im2col band. The gather is 27x the activation, so a full frame of it
+  // would be larger than the whole encode's working set at any real tile
+  // size; banding is what keeps it a fixed cost.
+  //
+  // 32 MB, not the 16 MB this shipped with. The band is col_cap/(27*cin), so
+  // the cap sets the GEMM's M, and M has an optimum rather than a direction:
+  // MEASURED at the deepest level (cin=1024, K=27648), best GF/s by band --
+  // 303: 8880, 606: 10216, 808: 10150, 1213: 9456, 2427: 7960, 4096: 6649.
+  // The band is itself an operand competing for cache, so past ~800 rows it
+  // costs more than the better shape buys. 32 MB puts cin=1024 at 606, its
+  // peak. It also moves cin=512 from 606 to 1213, which measures ~5% below
+  // ITS peak -- one cap cannot put both levels at 606, and the deeper level
+  // is the one that was furthest from its optimum. A per-level band is the
+  // real answer and wants its own tuner; this is the bounded version.
+  s.col_cap = 16u << 20;
   s.a = _mc->make_shared_buffer(need * 2);
   s.b = _mc->make_shared_buffer(need * 2);
   s.c = _mc->make_shared_buffer(need * 2);
@@ -1343,6 +1377,68 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
   const int ZC2o = out_ch;
 
   int t = T, h = H, w = W;
+  // Split-K tuning, before the stream opens (it runs its own).
+  //
+  // The GEMM this tower cares about is a 3x3x3 conv's im2col matmul, whose
+  // K is 27*cin -- 27648 at the deepest level, deeper than anything in the
+  // DiT. What decides whether splitting that pays is not K, though, but M,
+  // and M here is the IM2COL BAND, not the level's voxel count: the band is
+  // capped at col_cap/(27*cin) so the gather stays a fixed 16 MB, which
+  // means the deeper the level, the FEWER rows per GEMM. At cin=1024 that
+  // is ~303 rows, and a split wants ~512+.
+  //
+  // So the banding inverts the regime: the levels whose weights are large
+  // enough to want a split are exactly the ones whose band is too short to
+  // get one. That is a real result rather than a reason to skip the tuner --
+  // it is measured per shape here, so raising col_cap (or a level's band)
+  // flips these decisions automatically instead of needing this comment to
+  // be re-read.
+  if (_use_mma2 && _splitk.enabled) {
+    int tt = T, hh = H, ww = W;
+    for (const EncLevel& lv : _enc_levels) {
+      for (const EncResnet& r : lv.res) {
+        for (const Conv3d* cv : {&r.c1, &r.c2}) {
+          if (cv->empty() || cv->k != 3) { continue; }
+          const std::size_t per_row = (std::size_t)27 * cv->cin;
+          const std::size_t ohw = (std::size_t)hh * ww;
+          std::size_t band = per_row > 0 ? _es.col_cap / per_row : ohw;
+          band = std::min(std::max<std::size_t>(band, 1), ohw);
+          band = std::min<std::size_t>(band, 4096);
+          const int M = (int)band, N = cv->cout, K = (int)per_row;
+          if (M < 128 || _es.a.byte_size() < (std::size_t)M * N * 2) {
+            continue;
+          }
+          auto run = [&](ComputeEncoder& enc) {
+            gemm_mma_(enc, _es.col, 0, cv->l, _es.a, 0, M, N, K);
+          };
+          // Tile first, with the split held off: the two decisions are not
+          // independent (a split changes how much work each tile does), and
+          // measuring them together would confound them. Same order the DiT
+          // tuner uses.
+          bool have = false;
+          for (const TileTune& t : _tile_tuned) {
+            if (t.N == N && t.K == K && t.M == M) { have = true; break; }
+          }
+          if (!have) {
+            _splitk.bypass = true;
+            const int wt = autotune_vote(2, /*rounds=*/3, /*reps_for_us=*/1,
+                [&](int i) {
+                  _force_tile = (i == 0) ? 1 : 2;
+                  const double t = autotune_time(_mc, 1, run);
+                  _force_tile = 0;
+                  return t;
+                });
+            _splitk.bypass = false;
+            _tile_tuned.push_back(TileTune{N, K, M, wt == 1});
+          }
+          _splitk.tune(_mc, K, N, M, run);
+        }
+      }
+      if (lv.space > 1) { hh = (hh - 2) / 2 + 1; ww = (ww - 2) / 2 + 1; }
+      if (lv.time > 1) { tt = (tt - 1) / lv.time + 1; }
+    }
+    (void)tt;
+  }
   CommandStream stream = _mc->make_command_stream();
   {
     ComputeEncoder enc = stream.begin_compute();

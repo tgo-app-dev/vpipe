@@ -510,6 +510,73 @@ kernel void quant_f16_i8_row_g512(
   }
 }
 
+// K-PADDING twin of quant_f16_i8_row_g512: reads a row of Ksrc elements and
+// writes Kpad of them, zero-filling the tail, where Kpad is Ksrc rounded up
+// to 512.
+//
+// This exists so a projection whose contraction is NOT a multiple of 512 can
+// still take the int8 GEMM. MiniMax-H3 is the case: its hidden is 5376, so
+// qkv and fc1 (K = hidden) missed the i8 path entirely while fc2 (K = ffn =
+// 14336) took it -- half the block's GEMM FLOPs excluded by an alignment
+// rule rather than by anything about the math.
+//
+// Zero padding is EXACT here, which is why it is padding and not a
+// resampling: the added elements contribute nothing to the dot product, and
+// they cannot move the group's scale either, since the scale is an absmax
+// and |0| never wins. The tail group therefore quantizes exactly as it would
+// have over its real elements alone.
+//
+// The bounds test is per element pair and not per group on purpose: the row
+// stride differs between source and destination, so the last group of EVERY
+// row straddles the boundary, and reading past Ksrc would pull in the next
+// row (or run off the buffer on the last one).
+//   0:x[M,Ksrc] 1:q[M,Kpad] 2:scales[M,Kpad/512] 3:Ksrc 4:Kpad
+//   dispatch (threads): {256, M, 1}, tg {256, 1, 1}
+kernel void quant_f16_i8_row_g512_pad(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device char*            q      [[buffer(1)]],
+    device VPIPE_ELT*       scales [[buffer(2)]],
+    const constant int& Ksrc  [[buffer(3)]],
+    const constant int& Kpad  [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int row = (int)tgid.y;
+  const int G = Kpad / 512;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int col0 = g * 512 + (int)lane * 16;
+    const int64_t src = (int64_t)row * Ksrc + col0;
+    const int64_t dst = (int64_t)row * Kpad + col0;
+    float am = 0.0f;
+    vec<VPIPE_ELT, 2> h[8];
+    for (int i = 0; i < 8; ++i) {
+      const int c = col0 + i * 2;
+      if (c + 1 < Ksrc) {
+        h[i] = *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(
+            x + src + i * 2);
+      } else if (c < Ksrc) {
+        h[i] = vec<VPIPE_ELT, 2>((VPIPE_ELT)x[src + i * 2], (VPIPE_ELT)0);
+      } else {
+        h[i] = vec<VPIPE_ELT, 2>((VPIPE_ELT)0, (VPIPE_ELT)0);
+      }
+      am = max(am, max(fabs((float)h[i].x), fabs((float)h[i].y)));
+    }
+    am = simd_max(am);
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    device char* qp = q + dst;
+    for (int i = 0; i < 8; ++i) {
+      char2 o;
+      o.x = (char)clamp((int)rint((float)h[i].x * inv), -127, 127);
+      o.y = (char)clamp((int)rint((float)h[i].y * inv), -127, 127);
+      *reinterpret_cast<device char2*>(qp + i * 2) = o;
+    }
+    if (lane == 0) {
+      scales[(int64_t)row * G + g] = (VPIPE_ELT)(am * (1.0f / 127.0f));
+    }
+  }
+}
+
 // POW2-scale (block-floating-point) twin of quant_f16_i8_row_g512, for
 // the SHIFT-ALIGNED integer accumulation GEMM: per-(row, 512-group)
 // scale = 2^(Emax - 21) (Emax = the group's max f16 exponent field),

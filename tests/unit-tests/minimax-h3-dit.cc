@@ -759,10 +759,11 @@ TEST(minimax_h3_dit, scratch_estimate_matches_allocation)
   ASSERT_TRUE(!v.empty());
 
   const std::size_t est_geo = MetalMiniMaxH3Transformer::scratch_bytes(
-      cfg, L.seq_len, (int)tags.size(), (int)uniq.size(), false);
+      cfg, L.seq_len, (int)tags.size(), (int)uniq.size(), false,
+      m->ff_scratch_narrow());
   const std::size_t est = MetalMiniMaxH3Transformer::scratch_bytes(
       cfg, L.seq_len, (int)tags.size(), (int)uniq.size(),
-      m->uses_matrix_cores());
+      m->uses_matrix_cores(), m->ff_scratch_narrow());
   const std::size_t act_geo = m->scratch_resident_bytes();
   const std::size_t act_dq  = m->dequant_scratch_bytes();
   std::printf("[minimax_h3_dit] %d rows, n_t=%zu: geometry est %zu / act %zu"
@@ -1246,4 +1247,133 @@ TEST(minimax_h3_dit, step_bench)
               best / (double)(cfg.n_layers ? cfg.n_layers : 1));
   EXPECT_TRUE(l2_stable);
   EXPECT_TRUE(best < 1e29);
+}
+
+// The fused-SwiGLU FF must be the same function as the GEMM-then-split
+// pair it replaces, on the REAL checkpoint and through a whole stack of
+// blocks.
+//
+// This is where the fusion is actually checked, and it has to be here
+// rather than at the end of a generation: the sampler is chaotic, so a
+// last-ulp difference in one forward and a genuinely wrong FF both come
+// out as two unrelated videos. Only the velocity out of one forward
+// separates them.
+//
+// The bar is the one rounding the two paths genuinely differ by -- the
+// split path stores fc1's gate and up as bf16 and reads them back, the
+// fused one keeps the pair in the accumulator -- carried through the
+// block stack. A gate/up mix-up, the interleave written the other way
+// round, or a stale weight scores O(1) here, three orders clear.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a quantized g64 DiT; nothing
+// else can fuse, and the test says so rather than passing vacuously).
+TEST(minimax_h3_dit, fused_ff_matches_split)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  // Eight blocks: enough that a per-block difference accumulates the way
+  // it would over fifty, cheap enough to load twice.
+  cfg.n_layers = 8;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  // Deterministic non-constant inputs: a constant one would hide a
+  // column permutation, which is exactly the mistake the interleave can
+  // make.
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const std::vector<float> vin =
+      ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f);
+  const std::vector<float> ain =
+      ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f);
+  const std::vector<float> tin =
+      ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f);
+  const SharedBuffer vb = to_bf16_buf_(mc, vin);
+  const SharedBuffer ab = to_bf16_buf_(mc, ain);
+  const SharedBuffer tb = to_bf16_buf_(mc, tin);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  // One arm. The env is read at LOAD, so each arm is its own load --
+  // which is also what makes `narrow` below a real check that the arms
+  // differ rather than two runs of the same path.
+  auto arm = [&](bool fused, std::vector<float>* vel_v,
+                 std::vector<float>* vel_a, bool* narrow) {
+    if (fused) { ::unsetenv("VPIPE_H3_NO_FUSED_FF"); }
+    else       { ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1); }
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+    if (m == nullptr) { return false; }
+    *narrow = m->ff_scratch_narrow();
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    auto copy = [](const SharedBuffer& b, std::size_t n) {
+      std::vector<float> out(n);
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) { out[i] = bf16_to_f32_(p[i]); }
+      return out;
+    };
+    *vel_v = copy(v.video, (std::size_t)n_video * cfg.video_patch_elems());
+    *vel_a = copy(v.audio,
+                  (std::size_t)L.audio_indices.size() * cfg.audio_channels);
+    return true;
+  };
+
+  std::vector<float> fv, fa, sv, sa;
+  bool f_narrow = false, s_narrow = true;
+  const bool ok_f = arm(true, &fv, &fa, &f_narrow);
+  const bool ok_s = arm(false, &sv, &sa, &s_narrow);
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  ASSERT_TRUE(ok_f && ok_s);
+  // A quantized g64 checkpoint fuses; anything else cannot, and then
+  // this test has compared one path with itself. Say so instead.
+  if (!f_narrow) {
+    std::printf("[minimax_h3_dit] fused FF unavailable for this "
+                "checkpoint; nothing compared\n");
+    return;
+  }
+  EXPECT_TRUE(!s_narrow);
+
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  const double rv = rel(fv, sv), ra = rel(fa, sa);
+  std::printf("[minimax_h3_dit] fused vs split over %d blocks: video "
+              "rel-L2 %.3e, audio %.3e\n", cfg.n_layers, rv, ra);
+  EXPECT_TRUE(rv < 2e-2);
+  EXPECT_TRUE(ra < 2e-2);
 }

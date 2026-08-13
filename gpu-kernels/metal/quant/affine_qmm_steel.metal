@@ -481,6 +481,13 @@ kernel void affine_qmm_steel_w4g64(
       /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
 }
 
+// A BM=16 arm (WM=2, WN=2 -> TM=1) was built and measured on M4 Pro and is
+// NOT here: it was the slowest tile at every (M, K) tried on both FF GEMMs --
+// 15-22% behind BM=64 on the down projection, 20-30% behind on the fused
+// gate|up -- with no crossover at either end of the M or K ladder. Smaller
+// than 32 does not pay on this GPU; do not re-add it without a machine whose
+// occupancy story differs.
+//
 // BM=64 tile twin of affine_qmm_steel_w4g64 for tall-M GEMMs (M ~= seq,
 // e.g. the Krea-2 DiT blocks). Same 128 threads compute a 64-row output
 // tile, so each dequantized [BN,BK] weight tile serves twice the output
@@ -518,9 +525,17 @@ kernel void affine_qmm_steel_w4g64_bm64(
 // M=4106/1024px (see the host _qmm_tile note): these GEMMs are compute/
 // occupancy-bound, not weight-bandwidth-bound, so fewer weight re-reads
 // doesn't pay while the bigger 128-row/256-thread tile halves the threadgroup
-// count and cuts latency-hiding. Kept opt-in (host gates on M >= 1024, tile
-// 2) only for an M5 matrix-core retest. Grid: x=ceil(N/32)*32, y=ceil(M/128)
-// *2, z=4 (threadgroup {32,2,4}).
+// count and cuts latency-hiding. Re-measured on the H3 shapes: still behind
+// BM=64 everywhere on M4 (down projection 6.1-6.4 vs 6.5-6.9 TF/s), and the
+// gap NARROWS as M grows -- 0.97x of BM=64 at M=602, 0.96x at 9382, but only
+// 1.5% behind at 19008 on the fused gate|up.
+//
+// KEPT, and not as a formality. Halving the threadgroup count is a loss on a
+// GPU whose cores this already saturates and a win on one with more of them
+// to fill, so the tile that loses here is the one that plausibly wins on a
+// larger part -- which is exactly the case a laptop measurement cannot
+// settle. Opt-in (host gates on M >= 1024, tile 2), so nothing takes it by
+// accident. Grid: x=ceil(N/32)*32, y=ceil(M/128)*2, z=4 (tg {32,2,4}).
 kernel void affine_qmm_steel_w4g64_bm128(
     const device uint32_t* w      [[buffer(0)]],
     const device VPIPE_ELT*     scales [[buffer(1)]],

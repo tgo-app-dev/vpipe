@@ -3,6 +3,14 @@
 
 **Real-time multimodal AI pipelines on Apple Silicon**
 
+## TL;DR
+
+**[Download the Latest macOS App Release](https://github.com/tgo-app-dev/vpipe/releases/latest)**
+
+Choose the largest file if you are not sure.
+
+---
+
 **VPIPE** is a small, embeddable runtime for building local AI applications
 where video, audio, images, text, tensors, user input, and tool actions move
 through the same inspectable pipeline. It is designed for Apple Silicon
@@ -12,6 +20,7 @@ runtime in the forward pass.
 
 - Runs **MiniMax H3** FL2VA and REF2VA on an Apple Silicon Mac — a 33B model
   generating video **and its soundtrack together**, on as little as 16 GB.
+  Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
 
   * 3.75s @ 0.5 MP 24p, 8 steps takes **13 minutes** on a fanless
@@ -44,6 +53,8 @@ runtime in the forward pass.
 [^2]: Build from source artifact size, not counting dynamically linked
       dependencies like FFmpeg, libcurl.
 
+---
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-black)
@@ -53,7 +64,6 @@ runtime in the forward pass.
 [**Install**](#install) · [**Quickstart**](#quickstart) ·
 [**First example**](#first-example) · [**Overview**](#overview) ·
 [**Examples**](EXAMPLES.md)
-
 
 
 For developers: [**Requirements**](#requirements) ·

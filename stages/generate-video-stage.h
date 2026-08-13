@@ -203,6 +203,8 @@ private:
   int           _frames = 81;
   double        _fps    = 16.0;
   int           _steps  = 40;
+  // LOSSY dynamic-int8 block GEMMs (opt-in; minimax-h3 only)
+  bool        _i8_gemm{};
   std::uint64_t _seed   = 0;
   std::uint64_t _emitted = 0;
 
@@ -215,6 +217,10 @@ private:
   // reads it is not known until the checkpoint resolves, and a config
   // beat can arrive before the model does.
   FlexData _model_cfg;
+  // A runtime LoRA for the MiniMax-H3 DiT, off the model_config beat.
+  // Load-time, not per-step: see the LoraSpec note in the transformer.
+  std::string _h3_lora;
+  double      _h3_lora_scale = 1.0;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;

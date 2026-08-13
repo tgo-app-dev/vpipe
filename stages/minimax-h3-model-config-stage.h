@@ -67,6 +67,8 @@ private:
   double _cond_timestep = 1.0;
   double _cond_audio_timestep = 1.0;
   double _audio_seconds = 0.0;
+  std::string _lora;
+  double _lora_scale = 1.0;
 };
 
 }  // namespace vpipe

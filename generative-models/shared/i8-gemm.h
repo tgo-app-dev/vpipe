@@ -42,10 +42,26 @@ class I8GemmContext {
   bool enabled() const { return _on; }
 
   // Shape gate: the win regime is big-M compute-bound GEMMs (measured
-  // crossover ~1k rows on M5); K must split into whole 512-groups.
+  // crossover ~1k rows on M5). K must split into whole 512-groups, OR the
+  // padding quantizer must be available to make it so -- see kpad_() -- and
+  // the padding must be CHEAP, which is the last clause.
+  //
+  // Padding is exact but not free: it is (KP-K)/K extra int8 MACs on every
+  // call, and the int8 rate has to beat bf16 by more than that for the mode
+  // to still pay. Capped at _max_pad_pct (10 by default).
+  //
+  // Where the cap bites: the pad is at most 511, so any K >= 10*512 = 5120
+  // passes whatever its remainder (511/5120 = 9.98%). Below that it depends
+  // entirely on K % 512 -- K=2816 pads 256 (9.1%, taken), K=1600 pads 448
+  // (28%, refused). So the rule reads as "shallow contractions must be
+  // nearly aligned already; deep ones need not care".
   bool accepts(int M, int N, int K) const
   {
-    return _on && M >= _min_m && (K % 512) == 0 && K >= 1024 && N >= 16;
+    if (!_on || M < _min_m || K < 1024 || N < 16) { return false; }
+    const int KP = kpad_(K);
+    if (KP == K) { return true; }
+    if (!_fn_quant_pad.valid()) { return false; }
+    return (KP - K) * 100 <= K * _max_pad_pct;
   }
 
   // Encode act-quant + weight-quant + the i8 GEMM (element type = the ctor's
@@ -68,8 +84,16 @@ class I8GemmContext {
   metal_compute::MetalCompute* _mc = nullptr;
   bool _on = false;
   int _min_m = 1024;
+  int _max_pad_pct = 10;   // VPIPE_I8_MAX_PAD_PCT
   metal_compute::ComputeLibrary _lib_q, _lib_g;
-  metal_compute::ComputeFunction _fn_quant, _fn_gemm;
+  metal_compute::ComputeFunction _fn_quant, _fn_quant_pad, _fn_gemm;
+
+  // K rounded up to a whole number of 512-groups. The int8 GEMM contracts
+  // in 512-wide chunks, so a K that is not a multiple of 512 has no chunk
+  // to sit in; the quantizer zero-fills up to here instead, which is exact
+  // (zeros add nothing to the dot product and cannot move an absmax scale)
+  // and costs (kpad-K)/K extra int8 MACs -- 4.8% at H3's hidden 5376.
+  static int kpad_(int K) { return ((K + 511) / 512) * 512; }
   // Grow-only scratches: xq[M,K] i8 + as[M,G] scales (activations),
   // wq[N,K] i8 + ws[N,G] scales (per-call weight re-quant). Scales are the
   // element type (2 bytes either way), so the byte sizes are format-agnostic.

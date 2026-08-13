@@ -21,6 +21,7 @@ set(LOCAL_SOURCES
   sampler.cc
   tokenizer.cc
   shared/comfy-checkpoint.cc
+  shared/comfy-output-config.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
   shared/grounded-encode-params.cc
@@ -107,6 +108,7 @@ set(LOCAL_HEADERS
   token-muxer.h
   tokenizer.h
   shared/comfy-checkpoint.h
+  shared/comfy-output-config.h
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/grounded-encode-params.h

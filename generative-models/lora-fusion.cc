@@ -2,14 +2,17 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/safetensors-writer.h"
+#include "generative-models/shared/comfy-output-config.h"
 #include "interfaces/session-context-intf.h"
 
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -157,7 +160,17 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   namespace fs = std::filesystem;
   if (mc == nullptr) { return fail("lora-fuse: null metal-compute"); }
 
-  auto baseopt = MetalLlamaWeights::open_model(base_dir);
+  // A Comfy-Org repack is ONE file per component, and a repo's
+  // diffusion_models/ holds several of them -- MiniMax-H3's holds both
+  // task partitions, 66 GB each. open_model() over that directory would
+  // merge two models under one set of tensor names, so a single file is
+  // named directly and opened as itself. `is_comfy_file` also decides
+  // where the output's config.json comes from: a repack has none.
+  std::error_code fec;
+  const bool is_comfy_file = fs::is_regular_file(fs::path(base_dir), fec) &&
+                             !fec;
+  auto baseopt = is_comfy_file ? MetalLlamaWeights::open(base_dir)
+                               : MetalLlamaWeights::open_model(base_dir);
   if (!baseopt.has_value()) {
     return fail("lora-fuse: cannot open base model: " + base_dir);
   }
@@ -389,12 +402,32 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   if (progress) { progress(names.size(), names.size()); }
   if (!wr.close()) { return fail("lora-fuse: finalize shards failed"); }
 
-  // Copy config.json (+ any other small json sidecars) verbatim.
-  for (const char* sc : {"config.json"}) {
-    const fs::path src = fs::path(base_dir) / sc;
-    if (fs::exists(src)) {
-      fs::copy_file(src, fs::path(out_dir) / sc,
-                    fs::copy_options::overwrite_existing, ec);
+  // The output's config.json.
+  //
+  // A directory base has one to copy. A Comfy-Org single file does not:
+  // its config rides in the safetensors `__metadata__`, and the output
+  // here is a DIRECTORY of shards, so it needs a real config.json or no
+  // loader can read it. Same lift the quantizer does, and for the same
+  // two load-bearing fields -- `qkv_per_head` and, for MiniMax-H3, the
+  // task partition, both of which are invisible in the tensors and both
+  // of which lived only in the source filename.
+  if (is_comfy_file) {
+    FlexData cfg;
+    std::string cerr;
+    if (!comfy_output_config(base_dir, cfg, &cerr)) {
+      return fail("lora-fuse: " + cerr);
+    }
+    std::ofstream co(fs::path(out_dir) / "config.json");
+    if (!co) { return fail("lora-fuse: cannot write config.json"); }
+    co << cfg.to_json();
+    if (!co) { return fail("lora-fuse: writing config.json failed"); }
+  } else {
+    for (const char* sc : {"config.json"}) {
+      const fs::path src = fs::path(base_dir) / sc;
+      if (fs::exists(src)) {
+        fs::copy_file(src, fs::path(out_dir) / sc,
+                      fs::copy_options::overwrite_existing, ec);
+      }
     }
   }
 

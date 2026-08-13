@@ -5,6 +5,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/mma-splitk.h"
 
 #include <cstddef>
 #include <memory>
@@ -35,7 +36,7 @@ class WeightSet;
 //     tokens. This class decodes whatever grid it is handed; laying out
 //     the tiles and cross-fading them is the caller's job.
 //   * it reuses the DiT's kernels almost exactly -- partial rotate-half
-//     rope, per-head q/k RMS, the value-first SwiGLU. The differences
+//     rope, per-head q/k RMS, the gate-first SwiGLU. The differences
 //     are that q/k/v/out carry BIASES, the q/k norms have no affine at
 //     all, the residual gate is a learned per-CHANNEL vector rather than
 //     a per-row modulation, and the output norm is a LayerNorm.
@@ -56,7 +57,7 @@ class MetalMiniMaxH3VideoVae {
     int n_heads      = 32;
     int head_dim     = 64;
     int n_layers     = 36;
-    int ffn_inner    = 8192;   // w1 is 2x this wide (fused value|gate)
+    int ffn_inner    = 8192;   // w1 is 2x this wide (fused gate|up)
     int patch        = 16;     // spatial compression
     int patch_t      = 4;      // temporal compression
     int n_register   = 4;
@@ -377,6 +378,21 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep;
   metal_compute::ComputeFunction _fn_dequant4, _fn_dequant8;
   metal_compute::SharedBuffer _w_deq;
+  // Deep-K split for the encoder's conv GEMMs (a 3x3x3 conv is an im2col
+  // GEMM with K = 27*cin, so the deep levels contract over 13824 / 27648).
+  // Tuned per shape in encode(), which is the only place the band size --
+  // and therefore M -- is known before a stream opens.
+  MmaSplitK _splitk;
+  // Tile choice per conv shape, MEASURED. The shared rule is K-only
+  // (mma_use_wide_tile: K >= 6144 -> the 256-wide tile), and for this
+  // tower's narrow-N convs it is wrong: at N=512, K=13824 the 128-wide tile
+  // runs 13867 GF/s against the wide tile's 10151. Two threadgroups across
+  // the output width is not enough to fill the machine, and no rule keyed on
+  // K can see that. Empty until encode() tunes; `_force_tile` is how the
+  // tuner drives this same dispatch (0 = decide, 1 = n128, 2 = n256).
+  struct TileTune { int N, K, M; bool wide; };
+  std::vector<TileTune> _tile_tuned;
+  int _force_tile = 0;
   // Tile progress, and the counters it reports against. `_prog_total`
   // is set by decode_video (chunks x tiles) so the bar spans the whole
   // clip; a bare decode_tiled_ call sets it to its own tile count.

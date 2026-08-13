@@ -97,6 +97,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute.cc
         metal-compute-gemm-mma.cc
         optiq-block-perf.cc
+        mlp-fuse-ab.cc
         metal-compute-sdpa-mma.cc
         metal-compute-gdn-mma.cc
         metal-compute-binary-archive.cc
@@ -150,6 +151,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         wan-dit.cc
         wan-i2v.cc
         minimax-h3-blocks.cc
+        minimax-h3-lora.cc
         minimax-h3-comfy.cc
         minimax-h3-layout.cc
         minimax-h3-dit.cc

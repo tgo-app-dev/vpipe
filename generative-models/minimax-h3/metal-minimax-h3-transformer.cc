@@ -118,6 +118,49 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
   return true;
 }
 
+// One scalar tensor as f32 (a kohya `alpha`). Empty when it is not a
+// scalar this can read; the caller then treats the module as
+// alpha == rank, which is the no-rescale case.
+std::vector<float>
+scalar_f32_(const MetalLlamaWeights& w, const std::string& name,
+            const MetalLlamaWeights::TensorInfo* ti, MetalCompute* mc)
+{
+  std::size_t n = 1;
+  for (auto d : ti->shape) { n *= (std::size_t)d; }
+  if (n != 1) { return {}; }
+  SharedBuffer b = w.load(name, mc);
+  if (b.empty()) { return {}; }
+  if (ti->dtype == "F32") {
+    return {*static_cast<const float*>(b.contents())};
+  }
+  if (ti->dtype == "F16") {
+    return {(float)*static_cast<const _Float16*>(b.contents())};
+  }
+  if (ti->dtype == "BF16") {
+    return {bf16_to_f32_(*static_cast<const std::uint16_t*>(b.contents()))};
+  }
+  return {};
+}
+
+// Does this adapter touch any `mlp.fc1`?
+//
+// Asked by opening the header only -- no tensor is read -- because the
+// answer decides how the BLOCKS are built, and that happens before there
+// is a model to bind an adapter to. A file that cannot be opened answers
+// "no": bind_lora_ runs later and reports the real error, and refusing
+// the fusion on a file that turns out to be unreadable would be a
+// slowdown chosen for a reason that never materialized.
+bool
+lora_touches_fc1_(const std::string& path)
+{
+  auto w = MetalLlamaWeights::open(path);
+  if (!w.has_value()) { return false; }
+  for (const std::string& n : w->tensor_names()) {
+    if (n.find(".mlp.fc1.lora_") != std::string::npos) { return true; }
+  }
+  return false;
+}
+
 std::string
 blk_(const char* prefix, int i, const char* rest)
 {
@@ -516,6 +559,143 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
   return l;
 }
 
+// fc1 in the interleaved gate/up layout, for a block the model KEEPS.
+//
+// Through derived() with read() sources, and that combination is the
+// whole point of the function. A cached tensor stays cached whether or
+// not this model still points at it, so transforming one would hold BOTH
+// layouts -- 77 MB per block, 3.9 GB over the stack, four times what the
+// fused path saves in scratch. read() does not cache, so only the layout
+// the model runs on is retained, and derived() means two models over one
+// checkpoint still share the one interleave.
+//
+// Falls back to the plain cached load whenever the checkpoint is not the
+// shape this can permute; the caller then takes the split path, which is
+// correct, just unfused.
+MetalMiniMaxH3Transformer::Linear
+MetalMiniMaxH3Transformer::fc1_gu_(WeightSet& ws, const std::string& nm)
+{
+  const MetalLlamaWeights& src = ws.src();
+  const auto* si = src.info(nm + ".scales");
+  const auto* ci = src.info(nm + ".weight");
+  if (_quant_bits <= 0 || si == nullptr || ci == nullptr ||
+      si->shape.size() != 2 || ci->shape.size() != 2) {
+    return linear_(ws, nm, false, Retain::Cached);
+  }
+  const long N = ci->shape[0];
+  const long K = si->shape[1] * (long)_quant_group;
+  const int  b0 = K > 0 ? (int)(ci->shape[1] * 32 / K) : 0;
+  const int  bits = (b0 == 8) ? 8 : 4;
+  if (N != 2 * (long)_cfg.ffn || K != (long)_cfg.hidden) {
+    return linear_(ws, nm, false, Retain::Cached);
+  }
+  const int half = (int)N / 2;
+  // The key names the transform AND the width, because the bytes differ
+  // between a w4 and a w8 checkpoint of the same tensor.
+  const std::string key =
+      "h3-fc1-gu/w" + std::to_string(bits) + "/g" +
+      std::to_string(_quant_group) + "/";
+  auto permute = [&](const char* suffix, std::size_t row_bytes) {
+    return ws.derived(key + nm + suffix, [&]() -> SharedBuffer {
+      // The SOURCE goes through the same conversion weight_() applies,
+      // not through a raw read. This checkpoint stores `.scales` and
+      // `.biases` as F16 while the forward is bf16, and the two are the
+      // same WIDTH -- so a raw read permutes cleanly, matches every size
+      // check here, and hands the kernel numbers off by an exponent
+      // bias. That is what this cost the first time: the isolated kernel
+      // agreed at 3.3e-3 and the real model came out at rel-L2 1.07.
+      const auto* si2 = ws.src().info(nm + suffix);
+      if (si2 == nullptr) { return {}; }
+      SharedBuffer s =
+          si2->dtype == "BF16" || si2->dtype == "U32"
+              ? ws.read(nm + suffix, _mc, WeightSet::Residency::Copied)
+              : to_bf16_(ws.src(), _mc, nm + suffix);
+      if (s.empty() || s.byte_size() < (std::size_t)N * row_bytes) {
+        return {};
+      }
+      SharedBuffer d = _mc->make_shared_buffer((std::size_t)N * row_bytes);
+      if (d.empty()) { return {}; }
+      const auto* sp = static_cast<const std::uint8_t*>(s.contents());
+      auto* dp = static_cast<std::uint8_t*>(d.contents());
+      for (int j = 0; j < half; ++j) {
+        std::memcpy(dp + (std::size_t)(2 * j) * row_bytes,
+                    sp + (std::size_t)j * row_bytes, row_bytes);
+        std::memcpy(dp + (std::size_t)(2 * j + 1) * row_bytes,
+                    sp + (std::size_t)(half + j) * row_bytes, row_bytes);
+      }
+      return d;
+    });
+  };
+  Linear l;
+  l.bits = bits;
+  l.codes  = permute(".weight", (std::size_t)K * (std::size_t)bits / 8);
+  l.scales = permute(".scales", (std::size_t)K / _quant_group * 2);
+  l.qbias  = permute(".biases", (std::size_t)K / _quant_group * 2);
+  if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+    return linear_(ws, nm, false, Retain::Cached);
+  }
+  l.quantized = true;
+  l.gu_inter  = true;
+  return l;
+}
+
+// The same permutation for a block already in hand -- the streamed one
+// being promoted to resident. Its buffers came from stream_tensor and are
+// cached nowhere, so transforming them holds no second copy and there is
+// nothing for derived() to share.
+//
+// fc1's [all gate | all up] rows -> the [g0,u0,g1,u1,...] pairing the
+// fused epilogue reads.
+//
+// Rows are the OUTER dimension of the codes AND of the per-group scales
+// and biases, so this is whole-row copies and no quantization group is
+// ever split -- which is the whole reason the fusion can be a load-time
+// transform instead of a kernel that understands two layouts.
+//
+// Into FRESH buffers rather than in place: the source may be a cached
+// WeightSet tensor, which is shared with every other holder of that
+// checkpoint and must never be written through (see the WeightSet
+// immutability contract; VPIPE_WEIGHT_INTEGRITY=1 catches a violation).
+bool
+MetalMiniMaxH3Transformer::interleave_gu_(Linear& l) const
+{
+  if (!l.quantized || l.gu_inter || l.codes.empty()) { return false; }
+  const int N = 2 * _cfg.ffn, K = _cfg.hidden;
+  const std::size_t row_codes = (std::size_t)K * (std::size_t)l.bits / 8;
+  const std::size_t row_grp   = (std::size_t)K / (std::size_t)_quant_group;
+  if (l.codes.byte_size() < (std::size_t)N * row_codes ||
+      l.scales.byte_size() < (std::size_t)N * row_grp * 2 ||
+      l.qbias.byte_size() < (std::size_t)N * row_grp * 2) {
+    return false;
+  }
+  SharedBuffer codes = _mc->make_shared_buffer((std::size_t)N * row_codes);
+  SharedBuffer scales = _mc->make_shared_buffer((std::size_t)N * row_grp * 2);
+  SharedBuffer qbias = _mc->make_shared_buffer((std::size_t)N * row_grp * 2);
+  if (codes.empty() || scales.empty() || qbias.empty()) { return false; }
+  const auto* sc = static_cast<const std::uint8_t*>(l.codes.contents());
+  const auto* ss = static_cast<const std::uint16_t*>(l.scales.contents());
+  const auto* sb = static_cast<const std::uint16_t*>(l.qbias.contents());
+  auto* dc = static_cast<std::uint8_t*>(codes.contents());
+  auto* ds = static_cast<std::uint16_t*>(scales.contents());
+  auto* db = static_cast<std::uint16_t*>(qbias.contents());
+  const int half = N / 2;
+  for (int j = 0; j < half; ++j) {
+    const int from[2] = {j, half + j};          // gate row, then up row
+    for (int h = 0; h < 2; ++h) {
+      const std::size_t d = (std::size_t)(2 * j + h);
+      const std::size_t s = (std::size_t)from[h];
+      std::memcpy(dc + d * row_codes, sc + s * row_codes, row_codes);
+      std::memcpy(ds + d * row_grp, ss + s * row_grp, row_grp * 2);
+      std::memcpy(db + d * row_grp, sb + s * row_grp, row_grp * 2);
+    }
+  }
+  l.codes = std::move(codes);
+  l.scales = std::move(scales);
+  l.qbias = std::move(qbias);
+  l.gu_inter = true;
+  return true;
+}
+
 bool
 MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
                                        const std::string& prefix, Block& b,
@@ -527,7 +707,14 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
   b.out = linear_(ws, prefix + "attn.out_proj", false, r);
   b.qn  = weight_(ws, prefix + "attn.q_norm.weight", r);
   b.kn  = weight_(ws, prefix + "attn.k_norm.weight", r);
-  b.fc1 = linear_(ws, prefix + "mlp.fc1", false, r);
+  // A block that is KEPT is built straight into the interleaved layout.
+  // A STREAMED one is not: it is re-read every forward, so the
+  // permutation would be paid 50 times a step and cost more than the
+  // fusion saves. A streamed block later promoted to resident is
+  // interleaved at the promotion, where it is paid once.
+  b.fc1 = (_fuse_ff && r == Retain::Cached)
+              ? fc1_gu_(ws, prefix + "mlp.fc1")
+              : linear_(ws, prefix + "mlp.fc1", false, r);
   b.fc2 = linear_(ws, prefix + "mlp.fc2", false, r);
   if (with_adaln) {
     b.adaln = linear_(ws, prefix + "adaln_proj.linear", true, r);
@@ -537,22 +724,336 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
          !b.qn.empty() && !b.kn.empty() && !b.fc1.empty() && !b.fc2.empty();
 }
 
+// y += B (A x), as two dense GEMMs through an [M, rank] scratch.
+//
+// Both factors are used in the checkpoint's own orientation -- A is
+// [rank, K] and B is [N, rank] -- which is exactly the transposed-weight
+// layout `dense_gemm_t_*` wants, so neither needs a transpose. The
+// SECOND one accumulates: the base projection has already written y, and
+// the delta lands on top of it in place. Encoded after the base GEMM into
+// the same stream, so Metal's hazard tracking orders the two.
+bool
+MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
+                                        const SharedBuffer& x,
+                                        std::size_t x_off,
+                                        const LoraFactors& lf, int M, int K)
+{
+  const int r = lf.rank;
+  const bool mma = _use_mma2 && M >= _mma_min_m;
+  const metal_compute::ComputeFunction* fa = mma ? lora_route_a_(r) : nullptr;
+  // The strength rides HERE on the matrix-core route and on the second
+  // GEMM on the steel one, because that is where each has room for it:
+  // steel's epilogue is a scalar expression (acc * s + y) while
+  // matmul2d's accumulate is a mode with nowhere to put a coefficient, so
+  // the mma pair scales its smaller intermediate instead. Same product
+  // either way; what must never happen is both, which is why this
+  // reports back which one took it.
+  enc.set_function(fa != nullptr ? *fa : _fn_gemm);
+  enc.set_buffer(0, x, x_off * 2);
+  enc.set_buffer(1, lf.a);
+  enc.set_buffer(2, lf.a);          // bias slot unused (has_bias = 0)
+  enc.set_buffer(3, _s.lora);
+  enc.set_constant(4, K);
+  enc.set_constant(5, r);
+  enc.set_constant(6, M);
+  enc.set_constant(7, 0);
+  if (fa != nullptr) {
+    enc.set_constant(8, _lora_scale);
+    const int BN = (fa == &_fn_lora_a128) ? 128 : 64;
+    const unsigned tw = (BN == 128) ? 256u : 128u;
+    enc.dispatch({(unsigned)(((r + BN - 1) / BN) * tw),
+                  (unsigned)((M + BN - 1) / BN), 1}, {tw, 1, 1});
+    return true;
+  }
+  enc.dispatch({(unsigned)(((r + 31) / 32) * 32),
+                (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+  return false;
+}
+
+void
+MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
+                                        const LoraFactors& lf,
+                                        const SharedBuffer& y,
+                                        std::size_t y_off, int M, int N,
+                                        bool scale_applied)
+{
+  const int r = lf.rank;
+  const bool mma = _use_mma2 && M >= _mma_min_m;
+  // The accumulating tiles have no scale of their own, so this route is
+  // legal only once the FIRST GEMM applied the strength.
+  const metal_compute::ComputeFunction* fb =
+      (mma && scale_applied) ? lora_route_b_(r, N) : nullptr;
+  enc.set_function(fb != nullptr ? *fb : _fn_gemm_acc);
+  enc.set_buffer(0, _s.lora);
+  enc.set_buffer(1, lf.b);
+  enc.set_buffer(2, lf.b);
+  enc.set_buffer(3, y, y_off * 2);
+  enc.set_constant(4, r);
+  enc.set_constant(5, N);
+  enc.set_constant(6, M);
+  enc.set_constant(7, 0);
+  enc.set_constant(8, scale_applied ? 1.0f : _lora_scale);
+  if (fb != nullptr) {
+    const int BN = (fb == &_fn_lora_b256) ? 256 : 128;
+    enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
+                  (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+    return;
+  }
+  enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+}
+
+void
+MetalMiniMaxH3Transformer::lora_apply_(ComputeEncoder& enc,
+                                       const SharedBuffer& x,
+                                       std::size_t x_off,
+                                       const LoraFactors& lf,
+                                       const SharedBuffer& y,
+                                       std::size_t y_off, int M, int N, int K)
+{
+  if (lf.empty() || _s.lora.empty() || !_fn_gemm_acc.valid()) { return; }
+  // Strength 0 is a legitimate request (an A/B against the un-adapted
+  // model) and the cheapest way to serve it is not to encode the two
+  // GEMMs at all -- which also makes "off" exactly off rather than a
+  // pair of roundings that happen to cancel.
+  if (_lora_scale == 0.0f) { return; }
+  const bool scaled = lora_gemm_a_(enc, x, x_off, lf, M, K);
+  lora_gemm_b_(enc, lf, y, y_off, M, N, scaled);
+}
+
+// Which tile runs t = x A^T. Its N is the RANK, so this is purely a rank
+// question: the 64-wide tile fits rank 64 without half of it hanging past
+// N, and the 128-wide one takes over as soon as there is a second tile's
+// worth of rank to fill.
+//
+// MEASURED on M5 at H3's four projection shapes, 9382 rows
+// (minimax_h3_blocks.lora_route_sweep, arms interleaved and all warmed
+// before any is timed). ms for the four shapes SUMMED, steel -> best mma:
+//
+//   rank  64   11.47 -> 7.11 ms  (1.61x, 64-wide)
+//   rank 128   21.67 -> 7.42 ms  (2.92x, 128-wide)
+//   rank 384   64.75 -> 26.02 ms (2.49x, 128-wide)
+//
+// This half wins at EVERY rank and every shape, which is what makes it
+// the unconditional part: the GEMM reads the whole [M, K] activation to
+// produce [M, rank], so its ceiling is that one stream (~9.6 TFLOP/s at
+// rank 64 on this machine's bandwidth) and steel's 32-wide output tile
+// re-reads x once per tile to get nowhere near it.
+//
+// The 64/128 threshold is worth its own line because the wrong side of
+// it gives most of the win back: at rank 128 the 64-wide tile totals
+// 13.77 ms against the 128-wide tile's 7.42, and nearly all of that gap
+// is fc2 alone (8.25 vs 3.31), whose K = ffn = 14336 is the deepest
+// contraction here. A half-empty tile costs least where K is shallow.
+const metal_compute::ComputeFunction*
+MetalMiniMaxH3Transformer::lora_route_a_(int rank) const
+{
+  if (_lora_mma_off) { return nullptr; }
+  const metal_compute::ComputeFunction* f =
+      (rank <= 64) ? &_fn_lora_a64 : &_fn_lora_a128;
+  if (!f->valid()) { f = &_fn_lora_a128; }
+  return f->valid() ? f : nullptr;
+}
+
+// Which tile runs y += t B^T as its OWN dispatch -- or none, which means
+// steel. Reached only where the fold in gemm_mma_ declined: an i8 or
+// split-K base, a tn2 tile, a contraction past the fold's K ceiling, or
+// no matrix cores at all. Where the fold applies there is no second
+// dispatch to route.
+//
+// Here the contraction depth IS the rank, and at rank 64 that is too
+// shallow for the matrix units to beat a kernel that is simply streaming
+// y. This GEMM reads and writes the full [M, N] output, so at rank 64 its
+// arithmetic intensity is r/2 = 32 flops/byte and steel already runs it
+// at ~107 GB/s -- about 70% of what this machine has. There is no
+// headroom for a different multiplier to find, and matmul2d's wider tiles
+// re-read the operands enough to LOSE:
+//
+//   rank  64  qkv  steel 7.51 ms | mma128 13.49 | mma256 12.30
+//   rank  64  fc1  steel 10.61   | mma128 19.77 | mma256 19.69
+//   rank 128  qkv  steel 14.01   | mma128 13.11 | mma256  7.89
+//   rank 384  qkv  steel 40.93   | mma128 11.88 | mma256 13.98
+//
+// so rank 64 stays on steel and rank >= 128 goes to matmul2d.
+//
+// Not taken, and measured: at rank 64 the two NARROW-N shapes (o and
+// fc2, N = 5376) do give matmul2d a 6-9% edge -- it is only the wide
+// ones that lose, and they lose by 1.8x. A rule with N in it would
+// collect that, and it is left out on purpose: 6-9% of the second GEMM
+// at half the shapes is 0.3 ms in a block that spends 694, and the
+// second dimension would have to be re-measured on every future GPU
+// alongside the first. The tile
+// then INVERTS with rank -- 256-wide leads at 128 by 1.17-1.66x over the
+// four shapes, 128-wide leads at 384 by 1.15-1.19x -- consistently enough
+// at both ranks and all four shapes to be a rank effect rather than
+// noise. Where between 128 and 384 it crosses is NOT measured; 256 is the
+// midpoint and the only ranks that ship today are 64, 128 and the stacked
+// 384, so nothing in the tree currently lands on the guess.
+const metal_compute::ComputeFunction*
+MetalMiniMaxH3Transformer::lora_route_b_(int rank, int N) const
+{
+  (void)N;   // shape-independent so far: all four projections agreed.
+  if (rank < 128) { return nullptr; }
+  const metal_compute::ComputeFunction* f =
+      (rank >= 256) ? &_fn_lora_b128 : &_fn_lora_b256;
+  return f->valid() ? f : nullptr;
+}
+
+// Read the adapter and bind its factors to the modules they name.
+//
+// The module names are the MODEL's own -- blocks.N.attn.qkv_proj,
+// mlp.fc1/fc2, adaln_proj.linear, token_refiner.blocks.N.* -- so this is
+// a lookup rather than a remap. A module the checkpoint does not carry is
+// SKIPPED and counted, not an error: an adapter trained on a subset of
+// the projections is normal, and refusing one would be refusing the
+// common case.
+bool
+MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "minimax-h3 lora: " + m; }
+    return false;
+  };
+  auto w = MetalLlamaWeights::open(spec.path);
+  if (!w.has_value()) { return fail("cannot open " + spec.path); }
+  _lora_scale = spec.scale;
+
+  // One factor, converted to bf16 and (for A) pre-scaled -- folding the
+  // strength into A here keeps the kernels scale-free and costs one pass
+  // over the smaller of the two matrices.
+  auto take = [&](const std::string& name, float mul) -> SharedBuffer {
+    const auto* ti = w->info(name);
+    if (ti == nullptr || ti->shape.size() != 2) { return {}; }
+    std::size_t n = (std::size_t)ti->shape[0] * (std::size_t)ti->shape[1];
+    SharedBuffer src = w->load(name, _mc);
+    if (src.empty()) { return {}; }
+    SharedBuffer dst = _mc->make_shared_buffer(n * 2);
+    if (dst.empty()) { return {}; }
+    auto* d = static_cast<std::uint16_t*>(dst.contents());
+    if (ti->dtype == "BF16") {
+      const auto* p = static_cast<const std::uint16_t*>(src.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = mul == 1.0f ? p[i] : f32_to_bf16_(bf16_to_f32_(p[i]) * mul);
+      }
+    } else if (ti->dtype == "F16") {
+      const auto* p = static_cast<const _Float16*>(src.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = f32_to_bf16_((float)p[i] * mul);
+      }
+    } else if (ti->dtype == "F32") {
+      const auto* p = static_cast<const float*>(src.contents());
+      for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_(p[i] * mul); }
+    } else {
+      return {};
+    }
+    return dst;
+  };
+
+  // Publishers disagree about one thing only: whether the module names
+  // carry a container prefix. ComfyUI-convention adapters key on
+  // `diffusion_model.<module>` where the model's own names have no
+  // prefix at all, and the shapes and the ORDER are otherwise identical
+  // -- so this is a lookup with two spellings rather than a conversion.
+  // An adapter that needs more than a prefix (diffusers' split
+  // to_q/to_k/to_v, its value-first ff.net.0.proj) is NOT one of these
+  // and must not be coerced into looking like one.
+  static const char* const kPrefixes[] = {"", "diffusion_model."};
+
+  int skipped = 0;
+  auto bind = [&](const std::string& mod, int N, int K, LoraFactors& out) {
+    std::string key;
+    const MetalLlamaWeights::TensorInfo* ai = nullptr;
+    const MetalLlamaWeights::TensorInfo* bi = nullptr;
+    for (const char* pre : kPrefixes) {
+      const std::string k = std::string(pre) + mod;
+      const auto* a = w->info(k + ".lora_A.weight");
+      const auto* b = w->info(k + ".lora_B.weight");
+      if (a != nullptr && b != nullptr) { key = k; ai = a; bi = b; break; }
+    }
+    if (ai == nullptr || bi == nullptr) { return; }
+    if (ai->shape.size() != 2 || bi->shape.size() != 2 ||
+        ai->shape[1] != K || bi->shape[0] != N ||
+        ai->shape[0] != bi->shape[1]) {
+      // A shape that does not fit is the one thing worth counting
+      // separately from absence: it means the adapter was trained
+      // against a DIFFERENT model, and applying the parts that happen to
+      // fit would be worse than applying none.
+      ++skipped;
+      return;
+    }
+    out.rank = (int)ai->shape[0];
+    // kohya / ai-toolkit ship a per-module `alpha` and the update is
+    // scaled by alpha/rank. Absent (diffusers, and larryvrh's adapter)
+    // means the factors are already at strength, which is the same thing
+    // as alpha == rank. This is a property of the FILE, so it folds into
+    // A once, here. The caller's strength does NOT: it is a per-forward
+    // constant, so it can be turned without rebuilding 33B of weights.
+    float mul = 1.0f;
+    if (const auto* al = w->info(key + ".alpha")) {
+      std::vector<float> v = scalar_f32_(*w, key + ".alpha", al, _mc);
+      if (!v.empty() && out.rank > 0) { mul *= v[0] / (float)out.rank; }
+    }
+    out.a = take(key + ".lora_A.weight", mul);
+    out.b = take(key + ".lora_B.weight", 1.0f);
+    if (out.empty()) { out = LoraFactors{}; ++skipped; return; }
+    _lora_max_rank = std::max(_lora_max_rank, out.rank);
+    ++_lora_modules;
+  };
+
+  const Config& c = _cfg;
+  const int H = c.hidden, I = c.inner(), F = c.ffn;
+  _lora_blocks.resize((std::size_t)c.n_layers);
+  for (int i = 0; i < c.n_layers; ++i) {
+    BlockLora& bl = _lora_blocks[(std::size_t)i];
+    const std::string p = blk_("blocks.", i, "");
+    bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
+    bind(p + "attn.out_proj", H, I, bl.out);
+    bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
+    bind(p + "mlp.fc2", H, F, bl.fc2);
+    bind(p + "adaln_proj.linear", c.adaln_out(), c.time_dim, bl.adaln);
+  }
+  _lora_refiner.resize((std::size_t)c.n_refiner);
+  for (int i = 0; i < c.n_refiner; ++i) {
+    BlockLora& bl = _lora_refiner[(std::size_t)i];
+    const std::string p = blk_("token_refiner.blocks.", i, "");
+    bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
+    bind(p + "attn.out_proj", H, I, bl.out);
+    bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
+    bind(p + "mlp.fc2", H, F, bl.fc2);
+  }
+  bind("final_layer.adaln_proj.linear", 2 * H, c.time_dim, _lora_final);
+
+  if (_lora_modules == 0) {
+    return fail("'" + spec.path + "' adapts none of this model's modules");
+  }
+  if (_mc->session() != nullptr) {
+    _mc->session()->log_normal(fmt(
+        "MetalMiniMaxH3Transformer: runtime LoRA '{}' -- {} modules at "
+        "scale {}, rank <= {}{}",
+        spec.path, _lora_modules, _lora_scale, _lora_max_rank,
+        skipped > 0 ? fmt(", {} SKIPPED (shape mismatch)", skipped)()
+                    : std::string()));
+  }
+  return true;
+}
+
 MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer() = default;
 
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(const std::string& dit_dir, MetalCompute* mc,
                                 const Config& cfg, bool stream_blocks,
-                                double pin_frac)
+                                double pin_frac, const LoraSpec* lora)
 {
   return load(WeightSet::open(resolve_dit_dir(dit_dir, cfg.partition),
                              nullptr),
-              mc, cfg, stream_blocks, pin_frac);
+              mc, cfg, stream_blocks, pin_frac, lora);
 }
 
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                                 MetalCompute* mc, const Config& cfg,
-                                bool stream_blocks, double pin_frac)
+                                bool stream_blocks, double pin_frac,
+                                const LoraSpec* lora)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   WeightSet& ws = *ws_in;
@@ -584,17 +1085,38 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_lib_rms  = mc->load_library("rms_norm_bf16");
   m->_lib_rope = mc->load_library("rope_bf16");
   m->_fn_gemm      = m->_lib_gemm.function("dense_gemm_t_bm64_f16");
+  // The accumulating twin, for a runtime LoRA's second factor. Optional:
+  // a build without it simply cannot attach one, which bind_lora_ reports
+  // rather than silently applying half an adapter.
+  m->_fn_gemm_acc  = m->_lib_gemm.function("dense_gemm_t_bm64_acc_f16");
   m->_fn_rms       = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_rms_heads = m->_lib_rope.function("rms_norm_heads_strided_f16");
   m->_fn_trope = m->_lib_rope.function("transpose_rope_half_part_ftab_f16");
   m->_fn_modulate  = m->_lib_elt.function("adaln_modulate_idx_f16");
   m->_fn_gated     = m->_lib_elt.function("gated_residual_idx_f16");
   // The fused fc1 is [GATE | up] and the block computes silu(gate)*up.
-  // The two references disagreed on this (diffusers' SwiGLU chunks as
-  // [value | gate]); ComfyUI is right, and the checkpoint SETTLES it --
-  // gate-first scores 0.0058 against a ComfyUI golden where value-first
-  // scores 0.2524. A wrong choice here is silent: a plausible, wrong
+  // Measured against a ComfyUI golden: gate-first 0.0058, value-first
+  // 0.2524. A wrong choice here is silent -- a plausible, wrong
   // activation in every block. The video VAE's decoder is the same.
+  //
+  // The two references LOOK like they disagree and do not.
+  //
+  // diffusers implements [value; gate] -- its generic `SwiGLU` chunks
+  // the fused projection and returns `value * silu(gate)` -- and it
+  // never sees these bytes, because
+  // `scripts/convert_minimax_h3_to_diffusers.py` SWAPS the two halves as
+  // it writes `mlp.fc1` out as `ff.net.0.proj`. Upstream states the raw
+  // layout there in as many words: "the reference computes
+  // fc2(silu(gate) * value) from a fused [gate; value]; diffusers'
+  // SwiGLU computes value * silu(gate) from a fused [value; gate], so
+  // the two halves swap places."
+  //
+  // So a diffusers-FORMAT checkpoint is value-first, the raw MiniMaxAI
+  // release is gate-first, and both are right about their own bytes.
+  // Re-checked on diffusers main 175fe6b2 (2026-08-12): unchanged, and
+  // nothing to report upstream. What the raw layout is was never in
+  // dispute; only our reading of a file that describes the CONVERTED
+  // one was.
   m->_fn_swiglu = m->_lib_elt.function("swiglu_split_gate_first_f16");
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_residual  = m->_lib_elt.function("residual_add_f16");
@@ -682,6 +1204,34 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (const char* t = std::getenv("VPIPE_H3_QMM_TILE")) {
       m->_qmm_tile = std::min(m->_qmm_tile, std::atoi(t));
     }
+    // The fused-SwiGLU FF. Group 64 only -- that is the width the fused
+    // entry points are built for, and a g32 checkpoint has no g32 twin to
+    // fall back to. Decided BEFORE any block loads, because load_block_
+    // interleaves fc1 when it is set.
+    if (m->_quant_group == 64 &&
+        std::getenv("VPIPE_H3_NO_FUSED_FF") == nullptr) {
+      m->_fn_qmm_swiglu4 = m->_lib_qmm.function("affine_qmm_swiglu_w4g64");
+      m->_fn_qmm_swiglu8 = m->_lib_qmm.function("affine_qmm_swiglu_w8g64");
+      m->_fn_qmm_swiglu4_bm64 =
+          m->_lib_qmm.function("affine_qmm_swiglu_w4g64_bm64");
+      m->_fn_qmm_swiglu8_bm64 =
+          m->_lib_qmm.function("affine_qmm_swiglu_w8g64_bm64");
+      m->_fuse_ff = m->_fn_qmm_swiglu4.valid() && m->_fn_qmm_swiglu8.valid();
+    }
+    // A runtime LoRA on `mlp.fc1` and the fused SwiGLU are mutually
+    // exclusive: the fused epilogue writes silu(gate)*up straight out of
+    // the accumulator, so there is no [rows, 2*ffn] pre-activation for a
+    // delta to be added to. This has to be settled HERE, before any block
+    // loads -- load_block_ interleaves fc1's rows when the fusion is on,
+    // and an interleaved weight cannot then take the split path.
+    if (m->_fuse_ff && lora != nullptr && lora_touches_fc1_(lora->path)) {
+      m->_fuse_ff = false;
+      if (mc->session() != nullptr) {
+        mc->session()->log_debug(fmt(
+            "MetalMiniMaxH3Transformer: fused SwiGLU off -- the LoRA adapts "
+            "mlp.fc1, whose delta has to land before the activation"));
+      }
+    }
   }
 
   // ---- M5 matrix cores: dequant-once -> dense matmul2d ------------------
@@ -710,6 +1260,31 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
     m->_fn_dense_mma_tn2 =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
+    m->_fn_lora_a64 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_scaled_f16");
+    m->_fn_lora_a128 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128_scaled_f16");
+    m->_fn_lora_b128 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128_acc_f16");
+    m->_fn_lora_b256 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_acc_f16");
+    m->_fn_lora_fused128 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128_lora_f16");
+    m->_fn_lora_fused256 =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_lora_f16");
+    // Forces the ADAPTER back onto the steel pair while leaving the base
+    // projections on the matrix cores. That separation is the point:
+    // VPIPE_H3_NO_MMA2 moves the base too, so the difference it produces
+    // is not the adapter's. Read at load rather than per encode so two
+    // models in ONE process can take different routes -- which is what
+    // minimax_h3_lora.runtime_adapter_routes_agree needs.
+    m->_lora_mma_off = std::getenv("VPIPE_H3_NO_LORA_MMA") != nullptr;
+    // Keeps the adapter on the matrix cores but encodes its second GEMM
+    // as its own dispatch, which is the A/B for the FOLD alone.
+    m->_lora_fuse_off = std::getenv("VPIPE_H3_NO_LORA_FUSE") != nullptr;
+    if (const char* e = std::getenv("VPIPE_H3_LORA_FUSE_MAX_K")) {
+      m->_lora_fuse_max_k = std::atoi(e);
+    }
     m->_use_mma2 = m->_fn_dense_mma.valid() && m->_fn_dense_mma_deep.valid();
     // A quantized checkpoint additionally needs the dequant kernels; a
     // dense one feeds the same tiles its bf16 weight directly.
@@ -725,7 +1300,22 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (const char* e = std::getenv("VPIPE_H3_MMA_MIN_M")) {
       m->_mma_min_m = std::atoi(e);
     }
+    // Dynamic-int8 accelerated GEMMs (opt-in, LOSSY), tried first in
+    // gemm_mma_ once the dense weight exists. bf16 kernels: this DiT's
+    // activations, dequant scratch and output are all bf16.
+    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
+    if (i8->enabled()) { m->_i8 = std::move(i8); }
+    // Deep-K split for the FF down projection. bf16 libraries: the fold
+    // writes this DiT's element type.
+    m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
   }
+  // The matrix-core path takes precedence and keeps the FF it has. See
+  // the _fuse_ff comment in the header for why this is a refusal rather
+  // than a second arm: folding the epilogue is exactly what matmul2d
+  // cannot do, so fusing there costs the interleaved weight's bytes and
+  // returns nothing. Both routes are decided by now, so this is the one
+  // place that can see the conflict.
+  if (m->_use_mma2) { m->_fuse_ff = false; }
 
   m->_video_patch = m->linear_(ws, "video_patch_proj", true, r);
   m->_audio_patch = m->linear_(ws, "audio_patch_proj", true, r);
@@ -796,14 +1386,38 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       }
     }
   }
+  if (lora != nullptr && !lora->path.empty()) {
+    std::string lerr;
+    if (!m->bind_lora_(*lora, &lerr)) {
+      if (mc->session() != nullptr) { mc->session()->error(fmt("{}", lerr)); }
+      return nullptr;
+    }
+  }
+  // The ff scratch can only shrink when NOTHING can present an unfused
+  // fc1: streaming can, at any step, and so can a block whose interleave
+  // failed to allocate. Asked of the blocks that exist rather than
+  // assumed from `_fuse_ff`, because the interleave is allowed to fail.
+  m->_ff_needs_wide = !m->_fuse_ff || stream_blocks;
+  if (!m->_ff_needs_wide) {
+    for (const Block& b : m->_refiner) {
+      if (!b.fc1.gu_inter) { m->_ff_needs_wide = true; }
+    }
+    for (const Block& b : m->_blocks) {
+      if (!b.fc1.gu_inter) { m->_ff_needs_wide = true; }
+    }
+  }
   if (mc->session() != nullptr) {
     mc->session()->log_debug(
         fmt("MetalMiniMaxH3Transformer: {} blocks + {} refiner, hidden {}, "
-            "attn inner {}, {}",
+            "attn inner {}, {}{}",
             cfg.n_layers, cfg.n_refiner, cfg.hidden, cfg.inner(),
             m->_quant_bits > 0
                 ? fmt("w{} g{}", m->_quant_bits, m->_quant_group)()
-                : std::string("bf16")));
+                : std::string("bf16"),
+            m->_fuse_ff
+                ? fmt(", fused SwiGLU FF ({} ff scratch)",
+                      m->_ff_needs_wide ? "wide" : "narrow")()
+                : std::string()));
   }
   return m;
 }
@@ -1019,9 +1633,13 @@ void
 MetalMiniMaxH3Transformer::gemm_route_dispatch_(
     ComputeEncoder& enc, const SharedBuffer& x, std::size_t x_off,
     const Linear& l, const SharedBuffer& y, std::size_t y_off,
-    int M, int N, int K, GemmRoute route)
+    int M, int N, int K, GemmRoute route, const LoraFactors* lora,
+    bool* lora_folded)
 {
-  if (gemm_mma_(enc, x, x_off, l, y, y_off, M, N, K, route)) { return; }
+  if (gemm_mma_(enc, x, x_off, l, y, y_off, M, N, K, route, lora,
+                lora_folded)) {
+    return;
+  }
   if (l.quantized) {
     const int bm = (route == GemmRoute::kSteelBm128) ? 128
                  : (route == GemmRoute::kSteelBm64)  ? 64
@@ -1057,7 +1675,9 @@ bool
 MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
                                      std::size_t x_off, const Linear& l,
                                      const SharedBuffer& y, std::size_t y_off,
-                                     int M, int N, int K, GemmRoute route)
+                                     int M, int N, int K, GemmRoute route,
+                                     const LoraFactors* lora,
+                                     bool* lora_folded)
 {
   // Only the mma routes belong here, and this test has to come FIRST.
   // route_ok_ answers "can this route run this shape", and for a STEEL
@@ -1100,6 +1720,76 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   } else {
     wdense = &l.w;
   }
+  // Accelerated mode: int8 activations x int8 weight, quantized per call.
+  // Takes the same dense weight the matmul2d tile would have read, so it
+  // sits after the dequant and before the tile choice; a shape it does not
+  // accept falls through to bf16 with nothing encoded.
+  if (_i8 && _i8->gemm(enc, x, x_off, *wdense, y, y_off, M, N, K)) {
+    return true;
+  }
+  // Deep contraction (fc2, K = ffn): split it across planes and fold. Same
+  // dense weight, so it sits beside the i8 arm and before the single-op
+  // tile; declines on every other projection here, whose K is hidden or
+  // inner and far short of the floor.
+  if (_splitk.encode(_mc, enc, x, *wdense, y, K, N, M, x_off, y_off)) {
+    return true;
+  }
+  // The adapter's second factor, folded into this tile. Deliberately the
+  // LAST thing tried: i8 and split-K are worth more on the BASE than the
+  // fold is worth on the delta (1.35x and ~2x against a delta that is a
+  // few percent of the projection), so a shape either of them accepts
+  // keeps them and pays for a separate second GEMM. Only the two plain
+  // tiles have a fused twin -- tn2's software TN grid would need the
+  // delta sliced per sub-tile, and split-K would have to add it to
+  // exactly one plane.
+  //
+  // The K CEILING is not caution, it is a measured cliff. Carrying a
+  // second contraction in the tile costs something that scales with the
+  // BASE contraction's depth, not with the delta's -- which is not where
+  // one would look for it, since the delta is 64 deep either way.
+  // MEASURED at 9382 rows, rank 64, ms added to the projection by the
+  // adapter's second GEMM (minimax_h3_blocks.lora_fused_rate):
+  //
+  //   qkv  N=21504 K= 5376   separate +7.62   fused +3.46   (2.2x)
+  //   fc1  N=28672 K= 5376   separate +10.31  fused +3.21   (3.2x)
+  //   o    N= 5376 K= 7168   separate +2.15   fused free
+  //   fc2  N= 5376 K=14336   separate +0.59   fused +56.17  (a 39% LOSS
+  //                                                    on the projection)
+  //
+  // fc2 also happens to be split-K's shape, so in the tuned model the
+  // fold never reaches it -- but "another rule gets there first" is not a
+  // guarantee, and split-K declines below its own row floor. So the gate
+  // is explicit. 8192 sits just past the deepest K measured GOOD rather
+  // than midway to the bad one, because the two sides are not
+  // symmetrical: declining a fold costs a few ms, taking a bad one costs
+  // 39% of a projection. Where it actually crosses between 7168 and
+  // 14336 is unmeasured; VPIPE_H3_LORA_FUSE_MAX_K re-probes it.
+  if (lora != nullptr && lora_folded != nullptr && !_lora_fuse_off &&
+      K <= _lora_fuse_max_k &&
+      (route == GemmRoute::kMma128 || route == GemmRoute::kMma128x256)) {
+    const metal_compute::ComputeFunction* ff =
+        (route == GemmRoute::kMma128x256) ? &_fn_lora_fused256
+                                          : &_fn_lora_fused128;
+    if (ff->valid()) {
+      const int FRN = (route == GemmRoute::kMma128x256) ? 256 : 128;
+      enc.set_function(*ff);
+      enc.set_buffer(0, x, x_off * 2);
+      enc.set_buffer(1, *wdense);
+      enc.set_buffer(2, *wdense);    // bias slot, unread (has_bias = 0)
+      enc.set_buffer(3, y, y_off * 2);
+      enc.set_constant(4, K);
+      enc.set_constant(5, N);
+      enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.set_buffer(8, _s.lora);
+      enc.set_buffer(9, lora->b);
+      enc.set_constant(10, lora->rank);
+      enc.dispatch({(unsigned)(((N + FRN - 1) / FRN) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+      *lora_folded = true;
+      return true;
+    }
+  }
   // RN is the N-region one threadgroup owns (TN*BN), which is what the
   // grid divides N by -- 512 for the tn2 tile, else BN.
   int RN = 128;
@@ -1133,11 +1823,34 @@ void
 MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                                  std::size_t x_off, const Linear& l,
                                  const SharedBuffer& y, std::size_t y_off,
-                                 int M, int N, int K)
+                                 int M, int N, int K, const LoraFactors* lora)
 {
   const bool bias = !l.b.empty();
+  // An adapter that cannot or should not run is dropped HERE, so nothing
+  // downstream has to re-check it. Strength 0 is a legitimate request and
+  // the cheapest way to serve it is to encode nothing, which also makes
+  // "off" exactly off rather than a pair of roundings that cancel.
+  if (lora != nullptr &&
+      (lora->empty() || _s.lora.empty() || !_fn_gemm_acc.valid() ||
+       _lora_scale == 0.0f)) {
+    lora = nullptr;
+  }
+  // t = [scale *] x A^T, BEFORE the projection: the fused tile reads it,
+  // and the unfused path does not care which order the two are in.
+  bool scaled = false;
+  if (lora != nullptr) {
+    scaled = lora_gemm_a_(enc, x, x_off, *lora, M, K);
+  }
+  bool folded = false;
   gemm_route_dispatch_(enc, x, x_off, l, y, y_off, M, N, K,
-                       gemm_route_(M, N, K));
+                       gemm_route_(M, N, K),
+                       // The fused tile has no scale, so offering it an
+                       // adapter whose strength never reached t would run
+                       // that adapter at 1.0.
+                       (lora != nullptr && scaled) ? lora : nullptr, &folded);
+  if (lora != nullptr && !folded) {
+    lora_gemm_b_(enc, *lora, y, y_off, M, N, scaled);
+  }
   if (bias) {
     enc.set_function(_fn_bias_add);
     enc.set_buffer(0, y, y_off * 2);
@@ -1212,6 +1925,11 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   const SharedBuffer& xin  = _s.qkv;
   const SharedBuffer& yout = _s.ff;
   if (xin.empty() || yout.empty() || _s.seq != M) { return; }
+  // With a fused FF, `yout` is only as wide as 3*inner and fc1 has no
+  // route to choose anyway -- it is the fused kernel at its own tile. So
+  // it is skipped, and skipping it is REQUIRED, not an optimization:
+  // tuning it would write 2*ffn columns into a row that is not that wide.
+  const bool skip_fc1 = !_ff_needs_wide;
 
   static const GemmRoute kAll[] = {
       GemmRoute::kSteelBm32, GemmRoute::kSteelBm64, GemmRoute::kSteelBm128,
@@ -1223,6 +1941,7 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   std::string detail;
   const auto t0 = std::chrono::steady_clock::now();
   for (const Shape& sh : shapes) {
+    if (skip_fc1 && sh.N == 2 * F) { continue; }
     // Candidates are filtered per SHAPE, not once: route_ok_ takes
     // (M, N, K), and the tn2 tile in particular is legal for some of this
     // model's widths and not others.
@@ -1238,14 +1957,33 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
         /*reps_for_us=*/1,
         [&](int i) {
           return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
+            // No adapter: the tuner measures the BASE projection. The
+            // fold adds ~1% of a tile's work and only to the two plain
+            // tiles, which is far short of flipping a route, and giving
+            // the tuner an adapter would make its choice depend on which
+            // LoRA happened to be loaded.
             gemm_route_dispatch_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
-                                 cands[(std::size_t)i]);
+                                 cands[(std::size_t)i], nullptr, nullptr);
           });
         });
     const GemmRoute win = cands[(std::size_t)w];
     tuned.push_back(QmmTune{sh.N, sh.K, win});
     if (!detail.empty()) { detail += " "; }
     detail += std::string(sh.name) + "=" + route_name_(win);
+    // Second decision, only where a split is possible at all: with the tile
+    // settled, is the contraction better split? Driven through the same
+    // dispatcher, so the tuner compares the winning route against itself
+    // with and without the split rather than against a stand-in. The route
+    // has to be pinned first -- measuring both at once would confound them.
+    if (win == GemmRoute::kMma128 || win == GemmRoute::kMma128x256 ||
+        win == GemmRoute::kMma128x256Tn2) {
+      const int sp = _splitk.tune(_mc, sh.K, sh.N, M,
+          [&](ComputeEncoder& enc) {
+            gemm_route_dispatch_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
+                                 win, nullptr, nullptr);
+          });
+      if (sp > 0) { detail += "+split" + std::to_string(sp); }
+    }
   }
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
@@ -1380,7 +2118,7 @@ namespace {
 struct ScratchItem { std::size_t mul_seq, mul_text, mul_t, esz; };
 
 std::vector<ScratchItem>
-scratch_plan_(const MetalMiniMaxH3Transformer::Config& c)
+scratch_plan_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
 {
   const std::size_t H = (std::size_t)c.hidden;
   const std::size_t I = (std::size_t)c.inner();
@@ -1392,7 +2130,7 @@ scratch_plan_(const MetalMiniMaxH3Transformer::Config& c)
       {3 * I, 0, 0, 2},                          // qkv
       {I, 0, 0, 2}, {I, 0, 0, 2}, {I, 0, 0, 2},  // qh, kh, vh
       {I, 0, 0, 2}, {I, 0, 0, 2},                // oh, ob
-      {2 * (std::size_t)c.ffn, 0, 0, 2},         // ff
+      {narrow_ff ? 3 * I : 2 * (std::size_t)c.ffn, 0, 0, 2},   // ff
       {0, H, 0, 2},                              // txt
       {0, 0, (std::size_t)c.time_dim, 2},        // temb
       {0, 0, (std::size_t)c.adaln_out(), 2},     // mod
@@ -1406,14 +2144,15 @@ scratch_plan_(const MetalMiniMaxH3Transformer::Config& c)
 
 std::size_t
 MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
-                                         int n_t, bool with_dequant)
+                                         int n_t, bool with_dequant,
+                                         bool narrow_ff)
 {
   if (seq <= 0) { return 0; }
   const std::size_t S = (std::size_t)seq;
   const std::size_t T = (std::size_t)(n_text > 0 ? n_text : 0);
   const std::size_t N = (std::size_t)(n_t > 0 ? n_t : 0);
   std::size_t total = 0;
-  for (const ScratchItem& it : scratch_plan_(c)) {
+  for (const ScratchItem& it : scratch_plan_(c, narrow_ff)) {
     total += (S * it.mul_seq + T * it.mul_text + N * it.mul_t) * it.esz;
   }
   if (with_dequant) {
@@ -1533,7 +2272,18 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
   s.vh   = mk(S * I);
   s.oh   = mk(S * I);
   s.ob   = mk(S * I);
-  s.ff   = mk(S * 2 * (std::size_t)c.ffn);
+  // The [seq, 2*ffn] fc1 intermediate -- the single largest scratch this
+  // model holds. A fused FF never writes it, so when every block is
+  // interleaved it shrinks to what its OTHER user needs: tune_qmm_'s
+  // destination, whose widest remaining shape is qkv's 3*inner. The
+  // public scratch_bytes() still quotes the wide figure, so the stage's
+  // preflight over-estimates rather than under-estimates.
+  s.ff   = mk(S * (_ff_needs_wide ? 2 * (std::size_t)c.ffn : 3 * I));
+  // A runtime LoRA's [M, rank] intermediate. Rank 64 at 19k rows is
+  // 2.4 MB -- the whole reason applying an adapter at runtime is
+  // affordable is that this is the only extra buffer it needs.
+  s.lora = _lora_max_rank > 0 ? mk(S * (std::size_t)_lora_max_rank)
+                              : SharedBuffer{};
   s.txt  = mk((std::size_t)n_text * H);
   s.temb = mk((std::size_t)n_t * (std::size_t)c.time_dim);
   s.mod  = mk((std::size_t)n_t * (std::size_t)c.adaln_out());
@@ -1900,7 +2650,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // One block. `modulated` selects the 50 main blocks (per-row AdaLN
     // and rope) from the 2 refiner blocks (neither).
     auto block = [&](const Block& b, const SharedBuffer& x, int rows,
-                     bool modulated) {
+                     bool modulated, const BlockLora* lo) {
       rms(x, 0, b.n1, s.nm, 0, rows, H, c.norm_eps);
       bdump("n1", s.nm, H);
       if (modulated) {
@@ -1908,7 +2658,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       bdump("n1+mod", s.nm, H);
       psplit(t_elt);
-      gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H);
+      gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H,
+            lo != nullptr ? &lo->qkv : nullptr);
       bdump("qkv", s.qkv, 3 * I);
       psplit(t_qkv);
       // Per-HEAD RMS over head_dim, in place on the fused buffer, BEFORE
@@ -1929,7 +2680,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
                    {(unsigned)HD, 1, 1});
       bdump("attn_out", s.ob, I);
-      gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I);
+      gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I,
+            lo != nullptr ? &lo->out : nullptr);
       bdump("o_proj", s.nm, H);
       psplit(t_oproj);
       if (modulated) { gated(x, s.nm, rows, 2 * H); }
@@ -1942,18 +2694,45 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       bdump("n2+mod", s.nm, H);
       psplit(t_elt);
-      gemm_(enc, s.nm, 0, b.fc1, s.ff, 0, rows, 2 * FF, H);
-      bdump("fc1", s.ff, 2 * FF);
-      // fc1 is FUSED [value | gate], value FIRST -- the diffusers SwiGLU
-      // convention, not the llama one the rest of this tree follows.
-      // s.qkv is free by now and is the only scratch wide enough.
-      enc.set_function(_fn_swiglu);
-      enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
-      enc.set_constant(2, rows);
-      enc.set_constant(3, FF);
-      enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
+      // s.qkv is free by now and is the only scratch wide enough to take
+      // the activation, whichever path writes it.
+      if (b.fc1.gu_inter) {
+        // One GEMM: the epilogue holds each (gate, up) pair in one
+        // accumulator fragment and stores silu(gate)*up straight into
+        // s.qkv. No [rows, 2*ffn] intermediate is written and none is
+        // read back -- which is the whole saving, since the arithmetic is
+        // identical either way.
+        const bool bm64 = _qmm_tile >= 1 &&
+                          (b.fc1.bits == 8 ? _fn_qmm_swiglu8_bm64.valid()
+                                           : _fn_qmm_swiglu4_bm64.valid());
+        enc.set_function(b.fc1.bits == 8
+                             ? (bm64 ? _fn_qmm_swiglu8_bm64 : _fn_qmm_swiglu8)
+                             : (bm64 ? _fn_qmm_swiglu4_bm64
+                                     : _fn_qmm_swiglu4));
+        enc.set_buffer(0, b.fc1.codes); enc.set_buffer(1, b.fc1.scales);
+        enc.set_buffer(2, b.fc1.qbias); enc.set_buffer(3, s.nm);
+        enc.set_buffer(4, s.qkv);
+        enc.set_constant(5, H);
+        enc.set_constant(6, 2 * FF);     // the FUSED width, not the output
+        enc.set_constant(7, rows);
+        const int bm = bm64 ? 64 : 32;
+        enc.dispatch({(unsigned)(((2 * FF + 31) / 32) * 32),
+                      (unsigned)(((rows + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+      } else {
+        gemm_(enc, s.nm, 0, b.fc1, s.ff, 0, rows, 2 * FF, H,
+              lo != nullptr ? &lo->fc1 : nullptr);
+        bdump("fc1", s.ff, 2 * FF);
+        // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
+        // convention, not the llama one the rest of this tree follows.
+        enc.set_function(_fn_swiglu);
+        enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
+        enc.set_constant(2, rows);
+        enc.set_constant(3, FF);
+        enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
+      }
       bdump("swiglu", s.qkv, FF);
-      gemm_(enc, s.qkv, 0, b.fc2, s.nm, 0, rows, H, FF);
+      gemm_(enc, s.qkv, 0, b.fc2, s.nm, 0, rows, H, FF,
+            lo != nullptr ? &lo->fc2 : nullptr);
       bdump("fc2", s.nm, H);
       psplit(t_ff);
       if (modulated) { gated(x, s.nm, rows, 5 * H); }
@@ -1999,7 +2778,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     psplit(t_in);
 
     // ---- 2. the text refiner -----------------------------------------
-    for (const Block& b : _refiner) { block(b, s.txt, n_text, false); }
+    for (std::size_t ri = 0; ri < _refiner.size(); ++ri) {
+      block(_refiner[ri], s.txt, n_text, false,
+            ri < _lora_refiner.size() ? &_lora_refiner[ri] : nullptr);
+    }
     // Its final norm writes straight into the packed sequence's text
     // rows, which are rows [0, n_text) -- no separate copy.
     rms(s.txt, 0, _refiner_final_norm, s.x, 0, n_text, H, c.final_norm_eps);
@@ -2056,6 +2838,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // step's table once and never keep them resident. That is the
       // memory lever on this model; it is not taken yet.
       gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(), c.time_dim);
+      if ((std::size_t)Lx < _lora_blocks.size()) {
+        lora_apply_(enc, s.temb, 0, _lora_blocks[(std::size_t)Lx].adaln, s.mod,
+                    0, n_t, c.adaln_out(), c.time_dim);
+      }
       psplit(t_adaln);
       // The modulation VALUES, per modality tag. s.mod is [n_t*3, 6*H]
       // with row = timestep_index*3 + tag, so the three tags are three
@@ -2094,7 +2880,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         mark = std::chrono::steady_clock::now();
       }
       bprobe = xprobe && Lx == 0;
-      block(b, s.x, seq, true);
+      block(b, s.x, seq, true,
+            (std::size_t)Lx < _lora_blocks.size() ? &_lora_blocks[(std::size_t)Lx]
+                                                  : nullptr);
       bprobe = false;
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
@@ -2143,6 +2931,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           const std::size_t nb = block_bytes_(streamed);
           if (_resid.admit(_mc, nb)) {
             _blocks[(std::size_t)Lx] = std::move(streamed);
+            // Now that it is KEPT, the fc1 interleave is paid once
+            // instead of per forward, so every later step takes the
+            // fused FF for this block. The scratch stays wide (it was
+            // sized for a streaming run and blocks below this one may
+            // still be unfused), so the two paths coexist.
+            if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
             _resid.note_admitted(nb);
             if (_mc->session() != nullptr) {
               const auto mb = _mc->memory_budget();
@@ -2159,6 +2953,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 
     // ---- 4. the shared output norm and the two heads ------------------
     gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H, c.time_dim);
+    lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
+                c.time_dim);
     rms(s.x, 0, _final_norm, s.proj, 0, seq, H, c.final_norm_eps);
     // The final modulation is indexed by the bare TIMESTEP index, not by
     // the AdaLN index: this norm is modality-independent. Its two halves

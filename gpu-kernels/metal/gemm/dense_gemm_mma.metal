@@ -194,6 +194,210 @@ DGVR(dense_gemm_mma_t_n128x256_rp_f16, 128, 256, 8)
 // K in [6144, 12288) here and keeps plain 128x256 for deeper unsplit K.
 DGVT(dense_gemm_mma_t_n128x256_tn2_f16, 128, 256, 8, 1, 2)
 
+// ---- the two tiles a runtime LoRA needs --------------------------------
+//
+// An adapted projection computes y = W x + s * B (A x), which the model
+// encodes as t = x A^T followed by y += s * t B^T. Both halves are dense
+// bf16 GEMMs that the DENSE tiles above can already serve -- except for
+// the two things that make them a LoRA rather than a projection: the
+// second one ACCUMULATES onto a y the base GEMM has already written, and
+// the strength `s` is a per-forward constant that must not be baked into
+// either factor (it is the request's knob, not the adapter's property).
+//
+// Both ride the register tile, so neither costs a pass over y:
+//
+//   SCALED   multiplies the accumulator by s before the store. It goes on
+//            the FIRST GEMM -- t is [M, rank], the smallest buffer in the
+//            pair, so scaling there touches ~rank/N as many elements as
+//            scaling the result would, and s*(x A^T) B^T is the same
+//            product either way. That is what leaves the second tile free
+//            to be a plain accumulate, which is the only form matmul2d
+//            offers: mode::multiply_accumulate adds into the cooperative
+//            tensor, and there is nowhere in it to put a coefficient.
+//   ACC      seeds the cooperative tensor from y instead of starting at
+//            zero, so the existing value is folded in the register file
+//            and the tile stores once. The steel twin
+//            (dense_gemm_t_bm64_acc_f16) does the same thing through its
+//            ScaleAddEpilogue, and carries the scale itself because a
+//            scalar epilogue has room for one.
+//
+// Precision matches the overwriting tiles: relaxed_precision stays false,
+// so the contraction accumulates in f32 whatever the cooperative tensor's
+// storage type is, and y's bf16 round-trip is the one it already had.
+template <int BM, int BN, int SG, bool ACC>
+static inline void dense_gemm_mma_lora_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M, float scale, uint3 tgid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+
+  // Each half takes the mode that MEANS what it is doing: the scaled
+  // tile overwrites, the accumulating one folds y in and needs the
+  // cooperative tensor seeded. A single multiply_accumulate descriptor
+  // with the tile zeroed first computes the same thing and MEASURED the
+  // same -- so this split is about the contract, not about a number.
+  // Worth stating because the reverse was assumed here for a while: the
+  // accumulate mode does NOT demote the contraction to the cooperative
+  // tensor's element type, since relaxed_precision is what governs that
+  // and it is false on both.
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      ACC ? matmul2d_descriptor::mode::multiply_accumulate
+          : matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  // Same rule as dense_gemm_mma_impl: a partially out-of-range tile is
+  // clamped by the tensor extents, but one whose ORIGIN is past M/N is a
+  // slice from outside the contract and its store does not stay in lane.
+  if (m0 >= M || n0 >= N) { return; }
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  if (ACC) { cT.load(mY); }
+  op.run(mX, mW, cT);
+  if (!ACC) {
+    for (auto it = cT.begin(); it != cT.end(); ++it) {
+      *it = (VPIPE_ELT)((float)*it * scale);
+    }
+  }
+  cT.store(mY);
+}
+
+// The base projection and the adapter's second factor in ONE tile:
+//
+//   y = x W^T + t B^T          K for the first, RANK for the second
+//
+// This is the form that makes a runtime LoRA nearly free, and the reason
+// it is possible at all is that matmul2d accumulates into a REGISTER
+// tile. Two op.run() calls against one cooperative tensor contract over
+// different depths and land in the same accumulator, so the delta costs
+// its own MACs and nothing else.
+//
+// What it removes is not arithmetic but traffic. Run separately, the
+// second GEMM has to READ y, add, and WRITE y -- 2*M*N*2 bytes against
+// only 2*M*r*N flops, which at rank 64 is 32 flops/byte and lands it
+// squarely on the memory roofline (measured ~107 GB/s of this machine's
+// ~150, i.e. already near the limit, so no faster multiplier helps).
+// Folded here it reads t[BM, r] and B[BN, r] per tile instead, and y is
+// written exactly once by the projection that was writing it anyway.
+//
+// t carries the STRENGTH: the caller's first GEMM scales it. There is
+// nowhere to put a coefficient in a multiply_accumulate, and this tile
+// deliberately does not grow one -- an adapter whose strength did not
+// reach t must not take this path, or it would silently run at 1.0.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_lora_fused_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* t, const device VPIPE_ELT* Bf,
+    device VPIPE_ELT* y, int K, int N, int M, int R, uint3 tgid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x),  dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W),  dextents<int32_t, 2>(K, N));
+  TX tT(const_cast<device VPIPE_ELT*>(t),  dextents<int32_t, 2>(R, M));
+  TX tB(const_cast<device VPIPE_ELT*>(Bf), dextents<int32_t, 2>(R, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+
+  // TWO descriptors, differing only in mode, and WHICH run gets which is
+  // the whole performance of this kernel. multiply_accumulate is not free
+  // on a deep contraction: running the base under it cost fc2 (K=14336,
+  // 128x256 tile) 252 ms against the plain tile's 163 -- a 55% loss on
+  // the projection to save 12 ms on the delta, while the same arrangement
+  // was a clear win at K=5376 and K=7168. Whatever it costs scales with
+  // the contraction, so the BASE keeps the plain mode (its tile is
+  // written first, unconditioned, exactly as dense_gemm_mma_impl does it)
+  // and only the rank-deep delta accumulates on top. That also removes
+  // the zero-init the other order needs.
+  constexpr auto desc_mul = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  constexpr auto desc_acc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc_mul, execution_simdgroups<SG>> op;
+  matmul2d<desc_acc, execution_simdgroups<SG>> op_acc;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto mT = tT.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  // Both pairs slice to the same types, so ONE cooperative tensor serves
+  // both contractions; only the depth differs, and the descriptors take
+  // that from the tensors because K is dynamic_extent.
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  op_acc.run(mT, mB, cT);
+  cT.store(mY);
+}
+
+#define DGVF(NAME, BM, BN, SG)                                           \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const device VPIPE_ELT* t [[buffer(8)]],                           \
+      const device VPIPE_ELT* Bf [[buffer(9)]],                          \
+      const constant int& R [[buffer(10)]],                             \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_lora_fused_impl<BM, BN, SG>(                          \
+        x, W, t, Bf, y, K, N, M, R, tgid);                               \
+  }
+
+// Buffers 0-7 match the plain tiles exactly, so the host binds the same
+// projection and only adds the adapter on 8-10.
+DGVF(dense_gemm_mma_t_n128_lora_f16,     128, 128, 8)
+DGVF(dense_gemm_mma_t_n128x256_lora_f16, 128, 256, 8)
+
+#define DGVL(NAME, BM, BN, SG, ACC)                                      \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const constant float& scale [[buffer(8)]],                        \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_lora_impl<BM, BN, SG, ACC>(                           \
+        x, W, y, K, N, M, scale, tgid);                                  \
+  }
+
+// The A half (t = s * x A^T). Its N is the RANK, so the 64-wide tile is
+// the one that fits rank 64 without half of it hanging past N; rank 128
+// and the stacked rank-384 qkv take the 128-wide tile.
+DGVL(dense_gemm_mma_t_scaled_f16,      64,  64, 4, false)
+DGVL(dense_gemm_mma_t_n128_scaled_f16, 128, 128, 8, false)
+// The B half (y += t B^T). Its K is the rank -- a very shallow
+// contraction -- and its N is the projection's full width.
+DGVL(dense_gemm_mma_t_n128_acc_f16,    128, 128, 8, true)
+DGVL(dense_gemm_mma_t_n128x256_acc_f16, 128, 256, 8, true)
+
 // Split-K deep-reduction tile. A single-op full-K reduction underutilizes the
 // matrix units once K gets very deep (Krea2 ff-down, K=16384 runs ~0.7x the
 // K<=9728 rate): too few threadgroups (N/BN of them) each walking a long serial
@@ -333,14 +537,17 @@ DGVK(dense_gemm_mma_splitk_n128x256_k3392_f16, 128, 256, 8, 3392)
 // Neither depth is a multiple of any KC above, so both need their own.
 // 17408 = 2*8704 = 4*4352 and 21504 = 2*10752 = 4*5376.
 //
-// 4-WAY SHIPS here, which is the opposite of Boogu's pick at K=13568. Not a
-// contradiction -- these have a much narrower N (5120/5376 vs 6144) so a 2-way
-// split leaves only ~320 threadgroups at M=1024, and the extra planes buy
-// occupancy that Boogu's wider N already had. Measured (S=2 vs S=4, over the
-// single-op tile): qwen 1.22x/1.54x at M=1024 and 1.67x/2.03x at M=4096;
-// gemma 1.16x/1.89x and 1.71x/1.99x. The 2-way twins stay as the re-probe.
 // f32-plane, the variant the LM path dispatches (the f16-plane twins above
 // stay for the diffusion callers, which fold with residual_add).
+//
+// These two widths are no longer the choice -- mma-splitk.h picks a split by
+// CHUNK WIDTH, aiming near 2048, so at these depths it takes kc2176 (S=8)
+// and kc1792 (S=12) from the ladder below instead. Re-measured on M5 with
+// the clock held at ~1.4 GHz, kc4352 reaches 5933 GF/s at M=4096 where
+// kc2176 reaches 10566 against a 12176 gate|up reference: the 4-way widths
+// recover about a quarter of the deficit and the narrow ones nearly all of
+// it. They stay instantiated because the chooser can still land on them
+// when a plane budget rules the deeper split out.
 DGVKF(dense_gemm_mma_splitk32_n128x256_k8704_f16, 128, 256, 8, 8704)
 DGVKF(dense_gemm_mma_splitk32_n128x256_k10752_f16, 128, 256, 8, 10752)
 // 4-way twins (17408 = 4*4352, 21504 = 4*5376). Boogu picked 2-way over 4-way
@@ -350,6 +557,40 @@ DGVKF(dense_gemm_mma_splitk32_n128x256_k10752_f16, 128, 256, 8, 10752)
 // measurement per (shape, M); see optiq_blocks.splitk_down_proj.
 DGVKF(dense_gemm_mma_splitk32_n128x256_k4352_f16, 128, 256, 8, 4352)
 DGVKF(dense_gemm_mma_splitk32_n128x256_k5376_f16, 128, 256, 8, 5376)
+
+// The rest of the ladder. mma-splitk.h resolves a chunk kernel BY NAME from
+// the width it wants, so this list is the menu the chooser picks from -- a
+// depth whose target width is missing here silently gets a worse split, or
+// none. These cover K/S for S = 2..16 over the ffn depths in this tree
+// (9216, 12288, 13568, 14336, 16384, 17408, 21504).
+DGVKF(dense_gemm_mma_splitk32_n128x256_k7168_f16, 128, 256, 8, 7168)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k3584_f16, 128, 256, 8, 3584)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k6144_f16, 128, 256, 8, 6144)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k3072_f16, 128, 256, 8, 3072)
+
+// The band the chooser actually lands in. Measured best width per depth
+// (M5, M=4096-9382): 12288 -> 4096-2048, 14336 -> 2048-1792, 17408 -> 2176,
+// 21504 -> 1792-1536. Below ~1300 the extra weight re-reads start costing
+// more than the shortened reduction buys (kc1024 loses to kc2048 at every
+// depth measured), which is what bounds the ladder at the narrow end.
+DGVKF(dense_gemm_mma_splitk32_n128x256_k2176_f16, 128, 256, 8, 2176)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k2688_f16, 128, 256, 8, 2688)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1792_f16, 128, 256, 8, 1792)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1536_f16, 128, 256, 8, 1536)
+
+// The rest of the chunk-width ladder. The host picks a split by CHUNK WIDTH
+// (mma-splitk.h): given K it walks the split counts whose chunk is exact and
+// takes the width nearest the target, so which widths exist here is what
+// bounds the choice. These fill the band a real ffn depth can land in --
+// every ffn in this tree is a multiple of 256, and K/S for S = 2..16 over
+// {9216, 12288, 13568, 14336, 16384, 17408, 21504} lands on these.
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1024_f16, 128, 256, 8, 1024)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1088_f16, 128, 256, 8, 1088)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1344_f16, 128, 256, 8, 1344)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k1696_f16, 128, 256, 8, 1696)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k2048_f16, 128, 256, 8, 2048)
+DGVKF(dense_gemm_mma_splitk32_n128x256_k4096_f16, 128, 256, 8, 4096)
+// (kc 2304 is instantiated below, for the 9216 verification depth.)
 
 // VERIFICATION ONLY, never dispatched by default: 9216 = 4*2304 is
 // Qwen3.5-4B's ffn, which is the deepest down_proj on a checkpoint that fits
@@ -718,6 +959,12 @@ DGV_STUB(dense_gemm_mma_t_n128x256_f16)
 DGV_STUB(dense_gemm_mma_t_n128_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_tn2_f16)
+DGV_STUB(dense_gemm_mma_t_scaled_f16)
+DGV_STUB(dense_gemm_mma_t_n128_scaled_f16)
+DGV_STUB(dense_gemm_mma_t_n128_acc_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_acc_f16)
+DGV_STUB(dense_gemm_mma_t_n128_lora_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_lora_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k8192_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k6784_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k3392_f16)

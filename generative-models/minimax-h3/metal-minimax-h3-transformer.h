@@ -6,6 +6,8 @@
 #include "common/flex-data.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
 
 #include <cstddef>
@@ -51,8 +53,15 @@ class WeightSet;   // generative-models/weight-set.h
 //     56 heads x 128 = 7168 against hidden 5376. Deriving hidden from
 //     heads*head_dim, which is right for every other model here, gives a
 //     model that loads and produces nonsense.
-//   * the SwiGLU is VALUE-FIRST: fc1 is [value | gate], the diffusers
-//     convention, not the llama one this tree otherwise follows.
+//   * fc1 is FUSED: one [2*ffn, hidden] matrix holding [gate; up], gate
+//     first, and the block computes silu(gate)*up. The halves are not
+//     labelled anywhere -- reading them the other way round is a model
+//     that loads and generates smooth nonsense. diffusers implements the
+//     OTHER order, [value; gate], and reconciles it at conversion time:
+//     `scripts/convert_minimax_h3_to_diffusers.py` swaps the two halves
+//     when it writes `ff.net.0.proj`. So a diffusers-FORMAT checkpoint
+//     is value-first and the raw MiniMaxAI one is gate-first, and this
+//     reads the raw layout.
 //   * RoPE rotates only 96 of the 128 head channels, rotate-half, and
 //     passes the other 32 through.
 //   * q/k RMS is PER HEAD over head_dim (Wan's is across the whole
@@ -101,6 +110,19 @@ class MetalMiniMaxH3Transformer {
     // checkpoint came from: config_from_json() leaves it true for a
     // diffusers directory and clears it for a Comfy-Org component.
     bool qkv_per_head = true;
+
+    // ACCELERATED MODE (lossy, opt-in): run the block GEMMs as dynamic
+    // int8 instead of bf16 -- quantize the activation and the (dequanted)
+    // weight per call and multiply in int8. Only the matrix-core route can
+    // take it, since it is the only one that materializes a dense weight,
+    // and I8GemmContext self-gates on rows (M >= 1024), so a short clip
+    // silently keeps the bf16 tiles. All four projections qualify: hidden
+    // 5376 is not a multiple of the int8 GEMM's 512-wide chunk, and the
+    // context zero-pads the contraction to 5632 rather than refusing the
+    // shape (exact -- mlp_fuse.i8_kpad pins it bit-identical to padding by
+    // hand) at a cost of 4.8% extra int8 MACs, inside its 10% cap.
+    // Set from generate-video's `i8_gemm`; VPIPE_I8_GEMM overrides.
+    bool i8_gemm = false;
 
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
@@ -227,13 +249,50 @@ class MetalMiniMaxH3Transformer {
   // Resolves the DiT through `cfg.partition`, so a directory holding
   // both partitions loads the one the caller asked for rather than the
   // one whose filename sorts first.
+  // A LoRA adapter applied AT RUNTIME: every adapted projection computes
+  // y = W x + scale * B (A x) instead of having the delta folded into W.
+  //
+  // Why not just fuse it into the weights. MEASURED on the MiniMax-H3
+  // Turbo adapter against its bf16 base: the update is 2-4e-4 relative to
+  // the weights while bf16's step is ~4e-3 relative, so `W + dW` rounds
+  // straight back to `W` for 94% of elements and the merge keeps 46-78%
+  // of the delta's norm. A 4-bit base is coarser again. Rank 64 against
+  // K=5376 costs ~1.5% of the projection's FLOPs and is immune to the
+  // base's storage precision -- so for a few-step distillation, where the
+  // whole point is a small, precise correction, runtime is the accurate
+  // path and fusing is the cheap one.
+  //
+  // Named at LOAD because it changes how the weights are BUILT: an
+  // adapted `mlp.fc1` cannot take the fused-SwiGLU kernel, whose epilogue
+  // writes silu(gate)*up straight out of the accumulator and leaves
+  // nowhere for a pre-activation delta to land.
+  struct LoraSpec {
+    std::string path;          // a single .safetensors of lora_A/B pairs
+    float       scale = 1.0f;  // folded into A at load; 1.0 = as trained
+  };
+
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0,
+       const LoraSpec* lora = nullptr);
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0,
+       const LoraSpec* lora = nullptr);
+
+  // How many projections carry a runtime adapter (0 = none attached).
+  int lora_modules() const { return _lora_modules; }
+
+  // The adapter's strength, per FORWARD. Live because it can be: the
+  // factors are the adapter's and the strength is the request's, so it
+  // rides the accumulating GEMM as a constant rather than being folded
+  // into A. Turning it costs nothing and needs no reload -- which is the
+  // difference between a knob and a rebuild, and the reason to prefer
+  // the runtime path when a strength has to be swept. 0 skips the two
+  // GEMMs entirely, so "off" is exactly off.
+  void set_lora_scale(float s) { _lora_scale = s; }
+  float lora_scale() const { return _lora_scale; }
 
   // Leading blocks pinned resident in streaming mode (0 = pure streaming,
   // or preloaded). For logging the RAM-for-speed decision.
@@ -346,8 +405,15 @@ class MetalMiniMaxH3Transformer {
   // projection, 2*ffn x hidden), which gemm_mma_ allocates lazily on a
   // quantized checkpoint with matrix cores. The caller knows whether that
   // applies before a model exists; uses_matrix_cores() answers it after.
+  // `narrow_ff` drops the [seq, 2*ffn] fc1 intermediate to the width the
+  // fused-SwiGLU path leaves it at. It defaults to the WIDE figure so a
+  // caller that cannot know over-estimates: refusing a forward that would
+  // have fit costs a smaller canvas, and under-estimating one that does
+  // not costs the machine. ff_scratch_narrow() answers it once a model
+  // exists.
   static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
-                                   int n_t, bool with_dequant);
+                                   int n_t, bool with_dequant,
+                                   bool narrow_ff = false);
 
   // What the per-forward scratch buffers ACTUALLY hold right now, and
   // what the matrix-core dequant scratch holds, kept apart because they
@@ -410,6 +476,9 @@ class MetalMiniMaxH3Transformer {
   // like the Qwen fast-path guard: a silent fallback to steel is 2-3x
   // slower but numerically fine, so no correctness test can see it.
   bool uses_matrix_cores() const { return _use_mma2; }
+  // True when every block runs the fused-SwiGLU FF, so the ff scratch is
+  // the narrow one. Pair with scratch_bytes()'s `narrow_ff`.
+  bool ff_scratch_narrow() const { return !_ff_needs_wide; }
   // Whether the DiT's flash attention is the matrix-core (NAX) kernel.
   bool uses_nax_attention() const { return _attn_nax; }
 
@@ -426,6 +495,10 @@ class MetalMiniMaxH3Transformer {
   }
 
  private:
+  // Defined with the runtime-LoRA members below; declared here because
+  // gemm_ and its dispatchers take one by pointer.
+  struct LoraFactors;
+
   MetalMiniMaxH3Transformer() = default;
 
   // A Linear: either a dense bf16 [N, K] matrix or an MLX-affine
@@ -437,6 +510,12 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer codes, scales, qbias;
     bool quantized = false;
     int  bits = 0;
+    // fc1 only: the gate and up rows have been interleaved into the
+    // [g0,u0,g1,u1,...] pairing `affine_qmm_swiglu`'s epilogue reads out
+    // of one accumulator fragment. A block whose fc1 is NOT interleaved
+    // takes the split path, so the two can coexist within one forward --
+    // which is what a streamed block that has not been promoted yet is.
+    bool gu_inter = false;
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
@@ -463,10 +542,15 @@ class MetalMiniMaxH3Transformer {
   // modality writes into its own contiguous slice of the one packed
   // sequence -- the reference's index_copy scatters are destination
   // offsets here.
+  // `lora`, when given, is applied to this projection: the adapter's
+  // first GEMM is encoded BEFORE the base one (the fused tile consumes
+  // its output), and its second is folded into the base tile where the
+  // route allows and encoded separately where it does not.
   void gemm_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
-             std::size_t y_off, int M, int N, int K);
+             std::size_t y_off, int M, int N, int K,
+             const LoraFactors* lora = nullptr);
 
   // The [seq, rot/2] f32 cos/sin tables for a packed layout's (t, h, w)
   // grid. Rebuilt whenever the layout changes, which in a denoise loop
@@ -490,6 +574,7 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer x, nm, qkv, qh, kh, vh, oh, ob, ff, proj;
     metal_compute::SharedBuffer txt, temb, mod, fmod;
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
+    metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
   };
   bool ensure_scratch_(int seq, int n_text, int n_t);
   Scratch _s;
@@ -524,7 +609,8 @@ class MetalMiniMaxH3Transformer {
                             std::size_t x_off, const Linear& l,
                             const metal_compute::SharedBuffer& y,
                             std::size_t y_off, int M, int N, int K,
-                            GemmRoute route);
+                            GemmRoute route, const LoraFactors* lora,
+                            bool* lora_folded);
   void qmm_dispatch_(metal_compute::ComputeEncoder& enc,
                      const metal_compute::SharedBuffer& x, std::size_t x_off,
                      const Linear& l, const metal_compute::SharedBuffer& y,
@@ -532,10 +618,14 @@ class MetalMiniMaxH3Transformer {
   // Dequant-once into _w_deq (quantized) or the weight as-is (dense),
   // then one dense matmul2d tile. False when the route cannot run, which
   // leaves the caller on steel.
+  // `lora_folded` is set when the adapter's second GEMM was absorbed
+  // into the tile, which tells the caller not to encode it separately.
   bool gemm_mma_(metal_compute::ComputeEncoder& enc,
                  const metal_compute::SharedBuffer& x, std::size_t x_off,
                  const Linear& l, const metal_compute::SharedBuffer& y,
-                 std::size_t y_off, int M, int N, int K, GemmRoute route);
+                 std::size_t y_off, int M, int N, int K, GemmRoute route,
+                 const LoraFactors* lora = nullptr,
+                 bool* lora_folded = nullptr);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -574,6 +664,105 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_qmm4_bm128, _fn_qmm8_bm128;
   int _qmm_tile = 0;
 
+  // ---- fused SwiGLU feed-forward (steel qmm only) -----------------------
+  // One GEMM whose register-local epilogue writes silu(gate)*up, in place
+  // of fc1-into-[rows, 2*ffn] plus a separate elementwise pass. Costs a
+  // load-time interleave of fc1's rows (see Linear::gu_inter) and buys
+  // both the pass and the double-width intermediate.
+  //
+  // Steel only, ON PURPOSE. matmul2d cannot fold the epilogue, so on the
+  // M5 path it would dequantize the interleaved weight, run the same
+  // matmul, and then need a swiglu fold anyway -- the same traffic plus a
+  // second copy of the widest weight. Krea-2 measured that as neutral and
+  // defaults it off there; H3 does not offer it at all rather than ship
+  // an untested arm on hardware this was not measured on.
+  metal_compute::ComputeFunction _fn_qmm_swiglu4, _fn_qmm_swiglu8;
+  metal_compute::ComputeFunction _fn_qmm_swiglu4_bm64, _fn_qmm_swiglu8_bm64;
+  bool _fuse_ff = false;
+
+  // ---- runtime LoRA ------------------------------------------------
+  // One projection's factors. A [rank, K] and B [N, rank], both bf16 and
+  // both in the checkpoint's own orientation, so the same transposed-W
+  // GEMM serves them: t = x A^T, then y += t B^T.
+  struct LoraFactors {
+    metal_compute::SharedBuffer a, b;
+    int rank = 0;
+    bool empty() const { return rank <= 0 || a.empty() || b.empty(); }
+  };
+  struct BlockLora {
+    LoraFactors qkv, out, fc1, fc2, adaln;
+    bool any() const
+    {
+      return !qkv.empty() || !out.empty() || !fc1.empty() || !fc2.empty() ||
+             !adaln.empty();
+    }
+  };
+  std::vector<BlockLora> _lora_blocks;    // per main block
+  std::vector<BlockLora> _lora_refiner;   // per refiner block (no adaln)
+  LoraFactors            _lora_final;     // final_layer.adaln_proj.linear
+  int                    _lora_modules = 0;
+  float                  _lora_scale = 1.0f;
+  int                    _lora_max_rank = 0;
+  metal_compute::ComputeFunction _fn_gemm_acc;
+  // The matrix-core twins of that pair. `_a64`/`_a128` scale on store and
+  // serve the rank-wide first GEMM; `_b128`/`_b256` seed their register
+  // tile from y and serve the rank-deep second one. Bound only where the
+  // dense mma tiles are, so a non-M5 build leaves them invalid and
+  // lora_apply_ falls through to steel.
+  metal_compute::ComputeFunction _fn_lora_a64, _fn_lora_a128;
+  metal_compute::ComputeFunction _fn_lora_b128, _fn_lora_b256;
+  // The base-projection tiles that also carry the adapter's second
+  // factor, so `y = W x + B (A x)` is one store instead of three.
+  metal_compute::ComputeFunction _fn_lora_fused128, _fn_lora_fused256;
+  bool _lora_mma_off = false;    // VPIPE_H3_NO_LORA_MMA
+  bool _lora_fuse_off = false;   // VPIPE_H3_NO_LORA_FUSE
+  // Deepest base contraction the fold is allowed on; see gemm_mma_ for
+  // the cliff this is protecting against. VPIPE_H3_LORA_FUSE_MAX_K.
+  int _lora_fuse_max_k = 8192;
+
+  // Read the adapter and bind its factors to the modules above. Called
+  // from load() once the blocks exist.
+  bool bind_lora_(const LoraSpec& spec, std::string* err);
+  // Which matrix-core tile serves each half of the adapter, or nullptr
+  // for "stay on steel". Split in two because the two GEMMs are skinny in
+  // different dimensions and do not flip together -- see the measured
+  // tables at the definitions.
+  const metal_compute::ComputeFunction* lora_route_a_(int rank) const;
+  const metal_compute::ComputeFunction* lora_route_b_(int rank, int N) const;
+  // The adapter as its two halves, because the second one has two homes.
+  //
+  // `lora_gemm_a_` writes t = [scale *] x A^T into the shared scratch and
+  // returns whether it APPLIED the strength -- only the matrix-core tile
+  // can, and the answer decides both where the scale goes and whether the
+  // fused base tile is legal at all (that tile has no scale of its own).
+  bool lora_gemm_a_(metal_compute::ComputeEncoder& enc,
+                    const metal_compute::SharedBuffer& x, std::size_t x_off,
+                    const LoraFactors& lf, int M, int K);
+  void lora_gemm_b_(metal_compute::ComputeEncoder& enc, const LoraFactors& lf,
+                    const metal_compute::SharedBuffer& y, std::size_t y_off,
+                    int M, int N, bool scale_applied);
+  // Both halves back to back. The standalone form, for the modulation
+  // projections that do not go through gemm_.
+  void lora_apply_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t x_off,
+                   const LoraFactors& lf,
+                   const metal_compute::SharedBuffer& y, std::size_t y_off,
+                   int M, int N, int K);
+  // Whether the ff scratch still has to hold a [seq, 2*ffn] fc1 output.
+  // True unless EVERY block that can run is interleaved -- a streaming
+  // stack can present an unfused block at any step, and one such block
+  // writing into a buffer sized for the fused path is a heap overrun,
+  // not a slow forward.
+  bool _ff_needs_wide = true;
+
+  // Rewrite `l` (an fc1) into the interleaved gate/up layout, in place.
+  // False when the layout is not one this can express, and `l` is then
+  // untouched and still correct on the split path.
+  bool interleave_gu_(Linear& l) const;
+  // The same layout for a block being loaded to KEEP, built through the
+  // weight set so the source layout is never cached alongside it.
+  Linear fc1_gu_(WeightSet& ws, const std::string& nm);
+
   // ---- M5 matrix cores: dequant-once + dense matmul2d -------------------
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep,
       _fn_dense_mma_tn2;
@@ -583,6 +772,15 @@ class MetalMiniMaxH3Transformer {
   // released config), grown on demand and kept -- regrowing it per block
   // would be an allocation inside the denoise loop.
   metal_compute::SharedBuffer _w_deq;
+  // Dynamic-int8 accelerated GEMMs (Config::i8_gemm). Null unless enabled
+  // AND available; the DiT runs bf16, so it holds the bf16 i8 kernels --
+  // the f16 ones would misread these buffers into NaN.
+  std::unique_ptr<I8GemmContext> _i8;
+  // Deep-K split for fc2 (K = ffn = 14336). Its own gate|up direction runs
+  // ~11 TFLOP/s where the single-op reduction over ffn manages ~5.3, and the
+  // chooser closes that; see mma-splitk.h. Self-gates on K, on rows, and on
+  // a chunk kernel existing, so every other projection here is untouched.
+  MmaSplitK _splitk;
   bool _use_mma2 = false;
   // M below which the 128-row tile is not amortized and steel wins. Only
   // a FLOOR on what the autotune may pick; the tuner still measures above

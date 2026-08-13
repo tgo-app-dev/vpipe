@@ -8,6 +8,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
+#include <algorithm>
 #include <filesystem>
 
 namespace vpipe {
@@ -26,6 +27,7 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
   }
   std::string local;
   std::string mtype;
+  std::vector<std::string> pinned;
   try {
     // LmdbDb opens (creates if absent) the sub-db; a read txn then looks
     // up the key. No write txn is held, so the open-during-RW deadlock
@@ -47,6 +49,16 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
       if (obj.contains("model_type")) {
         mtype = std::string(obj.at("model_type").as_string(""));
       }
+      if (obj.contains("files")) {
+        const FlexData fl = obj.at("files");
+        if (fl.is_array()) {
+          const auto fa = fl.as_array();
+          for (std::size_t i = 0; i < fa.size(); ++i) {
+            const std::string f(fa[i].as_string(""));
+            if (!f.empty()) { pinned.push_back(f); }
+          }
+        }
+      }
     }
   } catch (...) {
     return out;
@@ -58,6 +70,7 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
   out.dir           = local;
   out.key           = ref;
   out.model_type    = mtype;
+  out.files         = std::move(pinned);
   out.from_registry = true;
   return out;
 }
@@ -67,6 +80,63 @@ resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        ref)
 {
   return resolve_model(session, ref).dir;
+}
+
+std::string
+resolve_adapter_file(const SessionContextIntf* session,
+                     const std::string& ref, std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return std::string();
+  };
+  if (ref.empty()) { return fail("no adapter named"); }
+  std::error_code ec;
+  if (fs::is_regular_file(fs::path(ref), ec) && !ec) { return ref; }
+
+  const ResolvedModel rm = resolve_model(session, ref);
+  if (!rm.from_registry && !fs::exists(fs::path(rm.dir), ec)) {
+    return fail("'" + ref + "' is neither a file, a registered model, nor a "
+                "directory");
+  }
+  // The record's OWN pinned file wins. Two records can share a directory
+  // -- both MiniMax-H3 Turbo checkpoints are published from one repo --
+  // and only the record says which of them this key meant.
+  for (const std::string& f : rm.files) {
+    const fs::path p = fs::path(rm.dir) / f;
+    if (p.extension() == ".safetensors" && fs::is_regular_file(p, ec)) {
+      return p.string();
+    }
+  }
+  if (fs::is_regular_file(fs::path(rm.dir), ec)) { return rm.dir; }
+  if (!fs::is_directory(fs::path(rm.dir), ec)) {
+    return fail("'" + ref + "' resolves to '" + rm.dir + "', which is not a "
+                "file or a directory");
+  }
+  // A bare directory. One .safetensors is an answer; several are not --
+  // directory-iteration order is not a choice anybody made, so this
+  // names them and refuses rather than picking.
+  std::vector<std::string> hits;
+  for (const auto& e : fs::directory_iterator(fs::path(rm.dir), ec)) {
+    if (e.path().extension() == ".safetensors") {
+      hits.push_back(e.path().string());
+    }
+  }
+  if (hits.empty()) {
+    return fail("no .safetensors in '" + rm.dir + "'");
+  }
+  if (hits.size() > 1) {
+    std::sort(hits.begin(), hits.end());
+    std::string list;
+    for (const std::string& h : hits) {
+      list += "\n  - " + fs::path(h).filename().string();
+    }
+    return fail("'" + rm.dir + "' holds " + std::to_string(hits.size()) +
+                " .safetensors and nothing says which one is meant; name the "
+                "file, or use the registry key that pinned it:" + list);
+  }
+  return hits[0];
 }
 
 bool

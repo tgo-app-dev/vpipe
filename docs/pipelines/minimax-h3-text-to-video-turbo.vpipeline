@@ -1,5 +1,5 @@
 {
-  "id": "minimax-h3-text-to-video",
+  "id": "minimax-h3-text-to-video-turbo",
   "stages": [
     {
       "id": "model-select",
@@ -46,7 +46,9 @@
         "video_shift": 12.0,
         "audio_shift": 3.0,
         "condition_timestep": 1.0,
-        "audio_seconds": 0.0
+        "audio_seconds": 0.0,
+        "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+        "lora_scale": 1.0
       }
     },
     {
@@ -99,7 +101,7 @@
         "width": 960,
         "frames": 120,
         "fps": 24,
-        "steps": 8,
+        "steps": 6,
         "seed": 6,
         "i8_gemm": true,
         "unload_when_idle": "always"
@@ -162,7 +164,7 @@
         }
       ],
       "config": {
-        "output_url": "/minimax-h3-text-to-video.mp4",
+        "output_url": "/minimax-h3-text-to-video-turbo.mp4",
         "enable_video": true,
         "enable_audio": true
       }

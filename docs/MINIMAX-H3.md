@@ -12,7 +12,7 @@ it afterwards. Ask for rain and you get rain you can hear.
 
 It is also **guidance-distilled**, which is what makes it practical here:
 there is no second unconditional forward pass per step, and useful output
-arrives in **4–8 steps** instead of 30+.
+arrives in **8–16 steps** instead of 30+.
 
 ## What you need
 
@@ -180,7 +180,7 @@ From the `generate-video` stage:
 | `width` / `height` | 960 × 544 | Both must be multiples of 16. |
 | `frames` | 120 | **Rounded up** to the nearest count the VAE can chunk — 5, 22, 39, 56, 73, 90, 107, **124**, … So 120 becomes 124. The stage logs the change. |
 | `fps` | 24 | 124 frames ≈ 5.2 s; 56 ≈ 2.3 s. |
-| `steps` | 8 | The model is distilled: **4 is enough** to see what a prompt does, 8 for a final. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
+| `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
@@ -208,21 +208,27 @@ family carries its own.
 
 ### How long it takes
 
-Measured on the smallest machine that runs this at all — a **fanless 2025
-MacBook Air 15-inch**, 10-core CPU / 10-core GPU, 16 GB — generating a clip a
-little shorter than the shipped default:
+Measured on the smallest machine that runs this at all — a **fanless
+MacBook Air 15-inch (M5)**, 10-core CPU / 10-core GPU, 16 GB — generating a
+clip a little shorter than the shipped default:
 
 | 960 × 544 (0.5 MP) · 24 fps · 90 frames (**3.75 s**) · 8 steps | |
 |---|---|
 | sitting on an ice pack | **13 min** |
 | sitting on a desk | **18 min** |
 
-Same settings, same machine: that five-minute spread is **thermal**. A 33B
-model holds the GPU flat out from the first step to the last, and a passively
-cooled chassis clocks down long before the run is over — so on a fanless Mac,
-where the machine sits matters about as much as what you set. Of the settings
-themselves `steps` moves this most: the model is distilled, so a 4-step draft
-costs roughly half.
+That is 8 steps, i.e. **draft** quality; 16 steps for a good final clip costs
+about twice as much.
+
+Same settings, same machine: the five-minute spread above is **thermal**. This
+model holds the GPU flat out for the whole run, and a fanless Mac clocks down
+long before it ends — so where the machine sits matters about as much as what
+you set. On a fan-cooled Mac expect the faster figure.
+
+`steps` is the setting that moves this most, and the
+[Turbo LoRA](#fewer-steps--the-turbo-lora) is the way to cut it: on the same
+Air, 6 steps with the adapter produce **124 frames in 13 min 54 s** — a third
+more video for about the same wait.
 
 ### More than text in
 
@@ -326,6 +332,228 @@ inspecting the directory — which matters because the directory holds **both**
 transformers and cannot say which one you meant. Left to guess it picks
 FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
 video conditioned on nothing.
+
+### Fewer steps — the Turbo LoRA
+
+Steps are the bulk of what this model costs, and good quality from the raw
+model takes 16 of them.
+The community [Turbo LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+distils that down: usable video **and** synchronized audio at **4 steps**, and
+better still at 6–8. Past 8 it stops helping and starts to over-sharpen, so
+4–8 is the range. Keep `scale` at **1.0** — the adapter is tuned for it.
+
+It adapts the **FL2VA** partition (text-to-video and image-to-video), not
+Ref2VA. Two checkpoints are catalogued because the choice between them is
+real rather than a version bump:
+
+| entry | steps | shifts (v/a) | trained at | when |
+|---|---|---|---|---|
+| `Turbo few-step v4-600 EMA` (larryvrh) | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
+| `Turbo few-step v1-850 EMA` (larryvrh) | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
+| `Turbo 4-step v1.0 768p` (lightx2v) | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
+| `Turbo 8-step v1.0 544p` (lightx2v) | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
+
+**The shifts are part of the adapter, not a preference.** lightx2v's 4-step
+was distilled on a video shift of **6** where this model's default — and every
+other adapter here — is 12. A distillation is fit to the sigma grid it was
+trained on, so running it on the wrong one is not a style difference; it is a
+different schedule, and nothing will report it. `video_shift` lives on the same
+`minimax-h3-model-config` stage as `lora`, which is exactly why the two travel
+in one beat.
+
+#### Get it
+
+One `model-fetch` stage —
+[`prepare-minimax-h3-turbo-lora.vpipeline`](pipelines/prepare-minimax-h3-turbo-lora.vpipeline):
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-turbo-lora.vpipeline
+```
+
+~744 MB, about ten seconds against the hours step 1 costs — a LoRA is used as
+it ships, so there is nothing to quantize afterwards.
+
+lightx2v's line is
+[`prepare-minimax-h3-turbo-lora-lightx2v.vpipeline`](pipelines/prepare-minimax-h3-turbo-lora-lightx2v.vpipeline),
+same shape, pinning `lightx2v/Minimax-h3-Turbo-4step-768p` (swap in
+`lightx2v/Minimax-h3-Turbo-8step` for the other). Only the **ComfyUI**
+spellings of that repo are catalogued: it publishes each adapter twice and the
+diffusers copy needs a conversion this build does not do — see *Which Turbo
+adapters work* below.
+
+`model_variant` is not optional here and its value is the catalogue **name**,
+not a word from the title. Both Turbo checkpoints are published from the one
+repo, so a bare `"turbo"` matches both and the fetch is refused with the
+candidates listed rather than quietly taking the first. Swap in
+`larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema` for the other one; they share a
+directory on disk and register under separate keys.
+
+The fetch **registers** the adapter under its catalogue name — an `owner/name`
+key like `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` — and that key is what the
+run pipeline names, not a path. It is also what the config stage's **Browse**
+button offers, so the usual flow is: run the prepare pipeline once, then pick
+the adapter from the list. `lora` takes a registered model, a
+directory holding one `.safetensors`, or a direct path, in that order of
+preference. Prefer the key: both Turbo checkpoints of a repo land in one
+directory, so a key is the only form that says which of them you meant.
+
+#### Run it
+
+[`minimax-h3-text-to-video-turbo.vpipeline`](pipelines/minimax-h3-text-to-video-turbo.vpipeline)
+is the step-2 graph with two edits that matter: the adapter named on the
+config stage, and `steps` down from 8 to **6**.
+
+```sh
+vpipe --launch docs/pipelines/minimax-h3-text-to-video-turbo.vpipeline
+```
+
+It still needs the base model from step 1 (`local/MiniMax-H3-FL2VA-4bit`) —
+the adapter replaces the step count, not the checkpoint. Everything else in
+the graph is untouched, which is the point: applying a LoRA is a config edit
+on one stage, not a different pipeline.
+
+**What it costs.** 960 × 544 · 24 fps · **124 frames** (5.17 s) · 6 steps,
+end to end from `vpipe --launch` to the muxed mp4. The pipeline asks for 120
+and the stage rounds **up to 124** — the video VAE takes 17-frame clips and
+keeps 5 latents from each, so only 17n+5 has a latent form, and it says so in
+the log.
+
+| machine | |
+|---|---|
+| **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 50 s** |
+| **M5** MacBook Air 15", 16 GB, fanless | **13 min 54 s** |
+
+Both rows are the same pipeline file, so they are directly comparable: the
+fanless M5 finishes **1.57× faster** than the fan-cooled M4 Pro, and does it
+on a quarter of the RAM. On 16 GB the DiT streams its weights, which is what
+keeps that machine from going faster still.
+
+Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
+mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on
+the M4 Pro, and an M5 run without it will be slower than 13 min 54 s. It works
+with the adapter, but it changes the picture by about as much as the adapter
+does, so turn one at a time when you are judging output rather than speed.
+
+There are two ways to apply it, and for this adapter they are not
+equivalent.
+
+#### Runtime (recommended)
+
+Name it on the `minimax-h3-model-config` stage and the DiT applies it as it
+runs — every adapted projection computes `W x + scale * B (A x)`:
+
+```json
+{
+  "id": "h3-config", "type": "minimax-h3-model-config", "iports": [],
+  "config": {
+    "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+    "lora_scale": 1.0
+  }
+}
+```
+
+Wire its output to `generate-video`'s `model_config` iport, set `steps` to 4–8,
+and that is the whole change. Nothing is written to disk and the base
+checkpoint is untouched, so switching adapters — or turning one off — is a
+config edit rather than a 66 GB pass.
+
+Applying it costs a few percent of a step and one small scratch buffer, so
+what you save in steps you keep.
+
+**`lora_scale` is live.** It rides a GEMM constant as a per-forward value
+rather than being folded into the factors, so a trigger-driven config
+stage can sweep it across beats and each change costs a setter, not a reload
+of 33B of weights. `0` skips the adapter's two GEMMs entirely, so *off* is
+exactly off and an A/B against the un-adapted model is one config edit. The
+adapter's own `alpha/rank` (kohya-convention files carry it; these two do not)
+is a property of the FILE and is folded in once at load, so the two never get
+confused. Upstream tunes for `1.0`: nudge up (~1.05–1.2) for blurry ghosting,
+down (~0.8–0.95) for over-sharp grain.
+
+The `lora` path itself is a **load-time** argument, and the asymmetry with
+`lora_scale` is real rather than an oversight: an adapted `mlp.fc1` changes
+which kernels the blocks are built with, so it cannot be swapped under a
+running DiT. A beat that changes the adapter after the DiT is built is
+reported and ignored rather than silently applied to the next clip; one that
+changes only the strength is applied.
+
+#### Merging, and why it loses most of this adapter
+
+`lora-fuse` writes a new checkpoint with the delta folded in. That is the right
+tool for a *stylistic* LoRA, and the wrong one here. **Measured** on the Turbo
+adapter against its bf16 base:
+
+| tensor | intended \|dW\|/\|W\| | survived the merge | elements changed |
+|---|---|---|---|
+| `blocks.7.mlp.fc1` | 2.26e-4 | 46% | 5.8% |
+| `blocks.23.attn.qkv_proj` | 2.65e-4 | 51% | 6.4% |
+| `blocks.40.adaln_proj.linear` | 3.87e-4 | 78% | 13.8% |
+
+The update is 2–4e-4 relative to the weights; bf16's step is ~4e-3 relative.
+For **94% of elements `W + dW` rounds straight back to `W`** — the correction
+is an order of magnitude below the storage resolution. A 4-bit base, which is
+what a 16 GB box runs, is coarser again. Upstream says the same thing in
+passing: its ComfyUI node applies the LoRA at run time by default and calls
+merging "a bit softer".
+
+If you do want a merged checkpoint anyway:
+
+```json
+{
+  "id": "fuse", "type": "lora-fuse", "iports": [],
+  "config": {
+    "base_model": "<models>/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+    "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+    "output_name": "MiniMax-H3-FL2VA-Turbo-bf16",
+    "scale": 1.0
+  }
+}
+```
+
+`lora-fuse`'s `scale` is the same strength knob, applied once when the delta
+is written. It is not live — changing it means another 66 GB pass — which is
+the other reason to prefer the runtime path while you are still choosing a
+number.
+
+**`base_model` is the DiT FILE, not its directory.** A Comfy-Org repack is one
+file per component and that repo's `diffusion_models/` holds *both* task
+partitions at 66 GB each; naming the directory would merge two models under
+one set of tensor names. Naming the file also preserves the partition — the
+fused output is a directory of shards, so `fl2va` survives only because the
+fuse lifts it out of the source filename and writes it into the output's
+`config.json`, alongside the `qkv_per_head` flag that records Comfy-Org's flat
+qkv grouping. Neither is visible in the tensors. Budget the disk: it reads
+66 GB and writes 62 GB, in about nine minutes on an SSD.
+
+#### Which Turbo adapters work
+
+Both paths key on the model's own module names, and tolerate a
+`diffusion_model.` container prefix (the ComfyUI convention) on top of them.
+Measured against the FL2VA base:
+
+| adapter | modules | works |
+|---|---|---|
+| `larryvrh/MiniMax-H3-Turbo-Lora` | 259 (adds `adaln_proj`, `final_layer`) | yes, both paths |
+| `lightx2v/Minimax-h3-Turbo`, the `_comfyui_` files | 208 | yes, both paths |
+| `lightx2v/Minimax-h3-Turbo`, the diffusers files | 312 | **no** |
+
+The diffusers spelling is not a naming difference but a different
+decomposition: separate `to_q`/`to_k`/`to_v` adapters that would have to be
+stacked block-diagonally into the fused `qkv_proj`, and an `ff.net.0.proj`
+in diffusers' **value-first** order whose halves would need swapping. Both
+transforms produce a well-shaped, wrong model if guessed at, so they are
+refused rather than approximated.
+
+lightx2v's `_comfyui_` `qkv_proj` is rank 384 — three rank-128 adapters
+stacked — and that stacking is how you can tell which base it assumes: its
+`B` is block-diagonal in the `[all q | all k | all v]` sense, so it targets
+the Comfy-Org flat grouping, not the per-head release its `base_model` tag
+names.
+
+**On the released MiniMaxAI weights either path would be wrong.** The adapter
+is trained against Comfy-Org's repack, so its `attn.qkv_proj` delta assumes the
+flat grouping. Applied to the per-head release it would add one head's `q`
+delta onto another head's `k`, in all 50 blocks, with nothing to report.
 
 ## Memory
 

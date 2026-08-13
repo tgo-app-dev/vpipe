@@ -3,6 +3,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace vpipe {
 
@@ -44,6 +45,11 @@ struct ResolvedModel {
   std::string dir;          // local_path, or `ref` when not a DB key
   std::string key;          // the registry key hit, else empty
   std::string model_type;   // the record's model_type, else empty
+  // Repo-relative paths the record PINNED, in catalogue order; empty for
+  // a plain path or a whole-repo fetch. This is what says which of two
+  // records sharing a directory is meant -- the case a directory scan
+  // cannot answer, and answers WRONGLY rather than loudly.
+  std::vector<std::string> files;
   bool from_registry = false;
 };
 
@@ -67,6 +73,22 @@ resolve_model_dir(const SessionContextIntf* session,
 bool
 model_dir_available(const SessionContextIntf* session,
                     const std::string&        ref);
+
+// Resolve a reference to ONE `.safetensors` -- an adapter, which is a
+// file where every other model reference here is a directory.
+//
+// Three shapes, in order: a direct path to a file; a registry key, whose
+// record NAMES its file (the only thing that disambiguates two records
+// over one directory -- both MiniMax-H3 Turbo checkpoints are published
+// from one repo and land side by side); and a bare directory, scanned
+// for a single .safetensors. The scan is last because it is the only one
+// that can be ambiguous, and it REFUSES rather than picking when it is:
+// a directory-iteration order is not a choice a user made.
+//
+// Empty + *err on any failure. `what` names the caller in the message.
+std::string
+resolve_adapter_file(const SessionContextIntf* session,
+                     const std::string& ref, std::string* err);
 
 // Apply a `model-select` beat to a stage's hf_dir. The beat is the
 // FlexData a `model-select` source emits so the diffusion-conditioner /

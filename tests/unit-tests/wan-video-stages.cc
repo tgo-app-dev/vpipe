@@ -12,6 +12,8 @@
 #include "common/flex-data.h"
 #include "common/job.h"
 #include "common/session.h"
+#include "interfaces/ui-delegate-intf.h"
+#include <mutex>
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -760,3 +762,111 @@ TEST(model_config, out_of_range_values_are_deferred_config_errors)
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
+
+// generate-video must survive resolving its checkpoint with NO config
+// beat in hand.
+//
+// This is a REGRESSION, and the shape of it is worth keeping: the stage
+// learns its family the moment the checkpoint is identified, and it
+// re-applies the model_config beat right there -- which is BEFORE the
+// first beat can have arrived, since the config stage emits during
+// process(). `_model_cfg` is therefore routinely a default FlexData at
+// that point, and FlexData::as_object() on a default THROWS. An uncaught
+// throw out of a stage does not make it inert; it takes the pipeline
+// down mid-run, which is how this first showed up -- a Turbo graph that
+// died at "FlexData::as_object: kind is not Object" after logging four
+// healthy lines.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (an H3 DiT dir). Only the
+// config.json is read here -- the 33B of weights load lazily at the
+// first denoise, which never happens -- so this costs milliseconds.
+namespace {
+
+// Records what a stage SAID. Both halves of what this test asserts on --
+// a stage's own info() and the runtime's warn() when initialize() throws
+// -- go through the UI delegate, not the log one.
+//
+// It has to be the log rather than the outcome, because the runtime
+// CATCHES a throw out of initialize(), reports it, and marks the stage
+// inert: launch() still returns true and the graph still drains, so a
+// test that only checks those passes over a stage that has silently
+// stopped existing.
+class UiCapture final : public UiDelegateIntf {
+public:
+  std::mutex               mu;
+  std::vector<std::string> lines;
+  void error(const VpipeFormat& f) override { add(f); }
+  void warn(const VpipeFormat& f) override { add(f); }
+  void info(const VpipeFormat& f) override { add(f); }
+  UiInputStatus getline(const VpipeFormat&, std::string& out,
+                        const std::function<bool()>&) override
+  {
+    out.clear();
+    return UiInputStatus::Eof;
+  }
+  std::unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return std::make_unique<NullUiTextStream>();
+  }
+  bool saw(const char* needle)
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (const std::string& l : lines) {
+      if (l.find(needle) != std::string::npos) { return true; }
+    }
+    return false;
+  }
+private:
+  void add(const VpipeFormat& f)
+  {
+    std::lock_guard<std::mutex> g(mu);
+    lines.push_back(f());
+  }
+};
+
+}  // namespace
+
+TEST(model_config, generate_video_survives_a_missing_beat)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  auto cap_u = make_unique<UiCapture>();
+  auto* cap = cap_u.get();
+  sess.set_ui_delegate(std::move(cap_u));
+
+  auto cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert_or_assign("hf_dir", FlexData::make_string(root));
+    o.insert_or_assign("width", FlexData::make_int(384));
+    o.insert_or_assign("height", FlexData::make_int(256));
+    o.insert_or_assign("frames", FlexData::make_int(41));
+    o.insert_or_assign("steps", FlexData::make_int(1));
+  }
+  auto pl = make_unique<Pipeline>("p", &sess);
+  // Every port UNWIRED, model_config included -- the case the crash
+  // needed. With no conditioning beat the stage resolves its checkpoint
+  // at init and then has nothing to do, which is the window the throw
+  // happened in.
+  auto gv_u = make_unique<GenerateVideoStage>(&sess, "gv", vector<InEdge>{},
+                                              cfg);
+  auto* gv = static_cast<GenerateVideoStage*>(
+      pl->insert_stage(std::move(gv_u)));
+  EXPECT_TRUE(gv->config_error().empty());
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  // launch() succeeding is NOT the bar. The runtime catches a throw out
+  // of initialize(), logs it and marks the stage inert -- so the graph
+  // drains cleanly and every assertion above still passes while the
+  // stage has silently stopped existing. What the bug looks like is this
+  // line, and nothing else.
+  EXPECT_FALSE(cap->saw("as_object"));
+  EXPECT_FALSE(cap->saw("entering drain"));
+  // And the positive: it got far enough to identify the checkpoint.
+  EXPECT_TRUE(cap->saw("MiniMax-H3 partition"));
+}

@@ -1,0 +1,18 @@
+{
+  "id": "prepare-minimax-h3-turbo-lora-lightx2v",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "lightx2v/Minimax-h3-Turbo",
+        "model_variant": "lightx2v/Minimax-h3-Turbo-4step-768p",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

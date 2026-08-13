@@ -196,27 +196,19 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
   const std::string base_dir =
       resolve_model_dir(session(), _base_model);
 
-  // Resolve the LoRA to a single .safetensors file: a direct path, or the one
-  // .safetensors inside a resolved dir.
-  std::string lora_file = resolve_model_dir(session(), _lora);
-  if (fs::is_directory(lora_file, ec)) {
-    std::string found;
-    for (const auto& e : fs::directory_iterator(lora_file, ec)) {
-      if (e.path().extension() == ".safetensors") {
-        if (!found.empty()) {
-          session()->warn(fmt("LoraFuseStage('{}'): multiple .safetensors in "
-                              "'{}'; using '{}'", this->id(), lora_file, found));
-          break;
-        }
-        found = e.path().string();
-      }
-    }
-    if (found.empty()) {
-      session()->warn(fmt("LoraFuseStage('{}'): no .safetensors in '{}'",
-                          this->id(), lora_file));
-      return false;
-    }
-    lora_file = found;
+  // Resolve the LoRA to a single .safetensors: a direct path, a registry
+  // key whose record names its file, or a directory holding exactly one.
+  //
+  // Shared with generate-video's runtime adapter rather than scanned here,
+  // and the difference is not cosmetic: this used to take the FIRST
+  // .safetensors the directory iterator produced and warn. Two Turbo
+  // checkpoints published from one repo land side by side, so that was a
+  // coin flip between two adapters, decided by directory order.
+  std::string lerr;
+  std::string lora_file = resolve_adapter_file(session(), _lora, &lerr);
+  if (lora_file.empty()) {
+    session()->warn(fmt("LoraFuseStage('{}'): {}", this->id(), lerr));
+    return false;
   }
 
   const bool explicit_path =

@@ -109,6 +109,19 @@ typedef metal::conditional<
     VPIPE_ACC16_T;
 
 // Binary epilogue: add a (broadcast) bias element to the f32 accumulator.
+// acc * s + c. The ACC path's epilogue when the caller scales its update
+// -- a runtime LoRA's strength, which has to be changeable per forward
+// without rebuilding the factors (they belong to the adapter; the
+// strength belongs to the request).
+struct ScaleAddEpilogue {
+  float s;
+  template <typename AccumT, typename CT>
+  METAL_FUNC AccumT apply(AccumT x, CT c) const {
+    return static_cast<AccumT>(static_cast<float>(x) * s) +
+           static_cast<AccumT>(c);
+  }
+};
+
 struct BiasAddEpilogue {
   template <typename AccumT, typename CT>
   METAL_FUNC AccumT apply(AccumT x, CT c) const {
@@ -142,7 +155,15 @@ template <
     const int BK = 32,
     const int BN = 32,
     const int CAUSAL = 0,
-    typename AccumT = float>
+    typename AccumT = float,
+    // ACC folds the EXISTING y into the accumulator before the store, so
+    // the tile computes y += x @ W^T. It rides the same epilogue the bias
+    // uses, with y read as a full [BM, BN] block (ldc = N) rather than a
+    // broadcast row -- one extra load per output element and no extra
+    // buffer. A runtime LoRA needs exactly this: its second factor has to
+    // land ON TOP of the base projection, and materializing the delta in
+    // its own [M, N] buffer would cost 817 MB at H3's qkv width.
+    const bool ACC = false>
 METAL_FUNC void dense_gemm_t_impl(
     const device T* x,
     const device T* W,
@@ -158,7 +179,8 @@ METAL_FUNC void dense_gemm_t_impl(
     const int window,
     uint3 tid,
     uint  simd_gid,
-    uint  simd_lid) {
+    uint  simd_lid,
+    const float acc_scale = 1.0f) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   constexpr int WM = 2;
@@ -244,11 +266,19 @@ METAL_FUNC void dense_gemm_t_impl(
       mma_op.apply_epilogue_safe(bias + y_col, 0, 1, short2(num_outs, num_els),
                                  op);
     }
+    if (ACC) {
+      ScaleAddEpilogue op{acc_scale};
+      mma_op.apply_epilogue_safe(y, N, 1, short2(num_outs, num_els), op);
+    }
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
   } else {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue(bias + y_col, 0, 1, op);
+    }
+    if (ACC) {
+      ScaleAddEpilogue op{acc_scale};
+      mma_op.apply_epilogue(y, N, 1, op);
     }
     mma_op.store_result(y, N);
   }
@@ -303,6 +333,38 @@ kernel void dense_gemm_t_bm64_f16(
   dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN>(
       x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
       tid, simd_gid, simd_lid);
+}
+
+// ACCUMULATING twin of dense_gemm_t_bm64_f16: y += scale * (x @ W^T).
+//
+// For a runtime LoRA's second factor -- y is the base projection's output
+// and this adds B @ (A @ x) on top of it in place. Same grid and same
+// tile as the overwrite twin; the only difference is that the existing y
+// is folded into the accumulator before the store, so the base GEMM must
+// have been encoded FIRST (Metal's hazard tracking serializes the two on
+// the same buffer).
+kernel void dense_gemm_t_bm64_acc_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    const constant float& scale  [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid, scale);
 }
 
 // FP16-pipe (AccumT=half) twin of dense_gemm_t_bm64_f16 (see the AccumT
