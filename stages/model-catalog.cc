@@ -3,11 +3,19 @@
 
 #include <algorithm>
 #include <cctype>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
+#include <utility>
 
 namespace vpipe {
 
+namespace {
+
+// The models that ship WITH vpipe. `model_catalog()` below returns this
+// followed by whatever plugins contributed; see register_catalog_entries.
 const std::vector<ModelCatalogEntry>&
-model_catalog()
+builtin_catalog_()
 {
   // ==================================================================
   // MODEL CATALOGUE -- single edit point. Append an entry to add a
@@ -232,6 +240,80 @@ model_catalog()
        {"https://datasets-server.huggingface.co/rows?dataset=allenai/"
         "ai2_arc&config=ARC-Challenge&split=test&offset=200&length=100",
         "rows-0200.json"}}},
+    // ---- Qwen 3.8 ------------------------------------------------------
+    //
+    // Qwen3.8-27B is the SAME ARCHITECTURE as Qwen3.6-27B below, retrained:
+    // the two config.json files are identical field for field apart from
+    // `transformers_version`, and the two checkpoints carry the same 1199
+    // tensors under the same names for the same 55.56 GB. So it runs the
+    // qwen3.5 family path unchanged -- hence `model_type = "qwen3.5"`, as
+    // the 3.6 entries also use. The version here is a DISPLAY label
+    // (from_catalog_ takes family/version from the entry, not from the
+    // runtime tag), which is what keeps the drill-down honest without a
+    // new runtime tag that every consumer would have to learn.
+    //
+    // ONE THING IS NOT THE SAME, and it is in the chat template rather
+    // than the weights: 3.8 adds a `reasoning_effort` control
+    // (xhigh | medium | low, DEFAULT xhigh) that prepends an instruction
+    // paragraph to the system turn, and flips `preserve_thinking` to
+    // default-true. See Qwen3ChatTemplate in chat-template.cc -- the
+    // renderer is a hand-written ChatML scaffold, not a Jinja
+    // interpreter, so it emits neither. A chat runs correctly; it just
+    // runs without the reasoning-effort nudge the published template
+    // sends by default.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen3.8-27B",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // The same 27B at MLX 4-bit (uniform group-affine, NOT OptiQ -- there
+    // are no optiq/ companions in this repo, so no MTP draft head and no
+    // separate vision tower file; the tower is in the three shards).
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "MLX 4-bit (lmstudio-community)",
+     .hf_path = "lmstudio-community/Qwen3.8-27B-MLX-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // GGUF. The repo ships ~23 quantization points plus two projectors,
+    // so the entry pins ONE quant and the projector rather than pulling
+    // all of them.
+    //
+    // The projector is the **F16** twin. It is not interchangeable with
+    // the BF16 one at the loader: llama.cpp leaves `v.patch_embd.weight`
+    // at F32 in the BF16 mmproj but narrows it to F16 in this one, and
+    // the tower's patch-embed reader used to accept only F32 (it now
+    // takes F32/F16/BF16 -- see patch_embed_gguf in
+    // qwen3/metal-qwen-vision.cc). Either projector converts into the
+    // run's own 2-byte compute dtype, so an F16 projector in a bf16 run
+    // costs one register conversion at LOAD and then runs at 16-bit
+    // width; nothing widens to f32.
+    //
+    // Two quantization points, one row each. Q4_K_M is all k-quant
+    // (Q4_K 294 / Q5_K 48 / Q6_K 67) and passes through raw; Q8_0 is
+    // repacked to affine 8-bit group 64, the only affine shape the metal
+    // Qwen accepts (see GgufQwen35Converter). Both share the projector.
+    //
+    // Both land in the SAME directory (<base>/unsloth/Qwen3.8-27B-GGUF),
+    // so a caller that fetches both and then points hf_dir at the
+    // directory gets whichever sorts first -- Q4_K_M. Name the .gguf to
+    // pick: hf_dir accepts a file.
+    //
+    // MEASURED, both against the same 27B quantized from the bf16
+    // original to w8g64, layer-0 residual / final-layer residual:
+    // Q8_0 4.3e-03 / 3.9e-02, Q4_K_M 1.1e-02 / 5.2e-02 at layer 32.
+    // Q8_0 costs 29 GB against Q4_K_M's 17 GB, and its requant to
+    // group 64 (Q8_0's own block is 32) puts it ~1.4x above the Q8_0
+    // floor -- so it is the accuracy option, not the free one.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "Q4_K_M GGUF +mmproj (unsloth)",
+     .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
+     .files = {"Qwen3.8-27B-Q4_K_M.gguf",  // main quant
+               "mmproj-F16.gguf"},         // F16 multimodal projector
+     .needs_tokenizer_json = false},
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "Q8_0 GGUF +mmproj (unsloth)",
+     .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
+     .files = {"Qwen3.8-27B-Q8_0.gguf",    // main quant
+               "mmproj-F16.gguf"},         // F16 multimodal projector
+     .needs_tokenizer_json = false},
     // Qwen3.6-27B: a Qwen3.5-family hybrid VLM (model_type "qwen3_5",
     // full-attn + gated-DeltaNet, 64 layers, hidden 5120). bf16 source
     // (15 safetensors shards, ~54 GB) -- whole-repo fetch; quantize with
@@ -1233,6 +1315,86 @@ model_catalog()
      .extract_archive = true},
   };
   return kCatalog;
+}
+
+// The identity two entries must not share: the registration KEY (an
+// explicit `name`, else the repo path) plus the file subset, because one
+// repo legitimately publishes several models and they differ only in
+// which files they pin (the two MiniMax-H3 partitions, the six
+// vpipe-supplement archives).
+std::string
+catalog_identity_(const ModelCatalogEntry& e)
+{
+  std::string id = e.name.empty() ? e.hf_path : e.name;
+  id += '\n';
+  for (const auto& f : e.files) { id += f; id += '\x1f'; }
+  return id;
+}
+
+// The published catalogue. Registration swaps in a new snapshot and
+// RETAINS the old one, so a reference or element pointer handed out
+// before the swap stays valid for the life of the process -- see the
+// lifetime note on register_catalog_entries.
+std::mutex&
+catalog_mu_()
+{
+  static std::mutex mu;
+  return mu;
+}
+
+const std::vector<ModelCatalogEntry>*& catalog_current_()   // guarded by mu
+{
+  static const std::vector<ModelCatalogEntry>* cur = nullptr;
+  return cur;
+}
+
+std::vector<std::unique_ptr<const std::vector<ModelCatalogEntry>>>&
+catalog_snapshots_()                                        // guarded by mu
+{
+  static std::vector<std::unique_ptr<const std::vector<ModelCatalogEntry>>> v;
+  return v;
+}
+
+}  // namespace
+
+const std::vector<ModelCatalogEntry>&
+model_catalog()
+{
+  std::lock_guard<std::mutex> lk(catalog_mu_());
+  const auto*& cur = catalog_current_();
+  // Until a plugin contributes anything there is nothing to compose, so
+  // the built-in table IS the catalogue -- no copy in the common case.
+  if (cur == nullptr) { return builtin_catalog_(); }
+  return *cur;
+}
+
+std::size_t
+register_catalog_entries(std::vector<ModelCatalogEntry> entries)
+{
+  if (entries.empty()) { return 0; }
+  std::lock_guard<std::mutex> lk(catalog_mu_());
+  const auto*& cur = catalog_current_();
+  const std::vector<ModelCatalogEntry>& base =
+      cur != nullptr ? *cur : builtin_catalog_();
+
+  std::unordered_set<std::string> seen;
+  seen.reserve(base.size() * 2);
+  for (const auto& e : base) { seen.insert(catalog_identity_(e)); }
+
+  auto next = std::make_unique<std::vector<ModelCatalogEntry>>(base);
+  std::size_t taken = 0;
+  for (auto& e : entries) {
+    if (e.hf_path.empty() && e.name.empty()) { continue; }
+    if (!seen.insert(catalog_identity_(e)).second) { continue; }  // first-wins
+    next->push_back(std::move(e));
+    ++taken;
+  }
+  if (taken == 0) { return 0; }        // nothing new; keep the snapshot
+
+  const std::vector<ModelCatalogEntry>* published = next.get();
+  catalog_snapshots_().push_back(std::move(next));
+  cur = published;
+  return taken;
 }
 
 namespace {

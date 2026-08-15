@@ -113,7 +113,13 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   // under each candidate and adopt whichever exists (keep the default if
   // neither/ambiguous). All subsequent binds read m->_cfg.weight_prefix.
   {
-    const char* cand[] = {"language_model.model.", "model.language_model."};
+    // "model." is the plain text-only HF layout, which is also what a
+    // repack that drops the multimodal wrapper produces (LTX-2.5's
+    // Gemma-4 text encoder ships its layers as `model.layers.N.*`).
+    // Probed LAST because it is a PREFIX of nothing here but is the
+    // least specific of the three.
+    const char* cand[] = {"language_model.model.", "model.language_model.",
+                          "model."};
     for (const char* pfx : cand) {
       if (wts->info(std::string(pfx) + "layers.0.input_layernorm.weight")
           != nullptr) {
@@ -574,6 +580,19 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
       return nullptr;
     }
   }
+  // The embedding table on its own: a plain `.weight` with no affine
+  // triple beside it, on a model that is otherwise quantized. Detected
+  // from the TENSOR NAMES rather than from the config, because the
+  // config's `quantization` block describes the checkpoint as a whole
+  // and cannot say that one table opted out.
+  if (!m->_dense && !m->_embed_is_q6k) {
+    const std::string eb = m->_cfg.weight_prefix + "embed_tokens";
+    m->_dense_embed = wts->has(eb + ".weight") && !wts->has(eb + ".scales");
+    if (m->_dense_embed) {
+      m->_fn_embed_dense = m->_lib_elt.function("embed_gather_f16");
+      if (!m->_fn_embed_dense.valid()) { return nullptr; }
+    }
+  }
   // 4-bit per_layer_projection (plp) by default: the checkpoint ships plp
   // 4-bit, but vpipe dequantized it to f16 -> read 4x the bytes (55MB vs 14MB
   // /tok across 42 layers). Native qmv/qmm matches omlx. (plm is BF16 in the
@@ -862,6 +881,10 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_embed_q6k = wset.read(P + "embed_tokens.q6k", mc,
                               WeightSet::Residency::Copied);
     if (m->_embed_q6k.empty()) { return nullptr; }
+  } else if (m->_dense_embed) {
+    // Full-precision table over an affine backbone -- see _dense_embed.
+    m->_embed_dense = to_f16(P + "embed_tokens.weight");
+    if (m->_embed_dense.empty()) { return nullptr; }
   } else if (!qtri(P + "embed_tokens", m->_embed_w, m->_embed_s,
                    m->_embed_b)) {
     return nullptr;
@@ -2185,9 +2208,13 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
   // ---- embeddings + per-layer inputs (once per token) -------------
   if (skip_embed) {
     // embed gather stripped (timing-only): _d_x left stale
-  } else if (_dense) { embed_gather_dense(_embed_dense, _d_x, H); }
-  else if (_embed_is_q6k) { embed_q6k(tokbuf, toff, _d_x, H, 1); }
-  else { embed_gather(_embed_w, _embed_s, _embed_b, _d_x, H); }
+  } else if (_dense || _dense_embed) {
+    embed_gather_dense(_embed_dense, _d_x, H);
+  } else if (_embed_is_q6k) {
+    embed_q6k(tokbuf, toff, _d_x, H, 1);
+  } else {
+    embed_gather(_embed_w, _embed_s, _embed_b, _d_x, H);
+  }
   scale(_d_x, H, std::sqrt((float)H));                     // embed_scale
   // Diagnostic: fire N extra no-op dispatches/token to measure the per-launch
   // GPU idle (decode is a dependent-dispatch chain; this isolates the idle
@@ -4115,6 +4142,136 @@ MetalGemmaModel::pdecode_end(ContextId cid)
 // Batched prefill: one command buffer of steel GEMMs (M=n) + batched
 // attention over the n tokens. Amortises the weight reads across n
 // tokens (the per-token forward() loop re-reads every weight per token).
+// ---- hidden-state taps -------------------------------------------------
+
+void
+MetalGemmaModel::tap_(ComputeEncoder& enc, int hf_index,
+                      const SharedBuffer& src, std::size_t src_off, int rows)
+{
+  if (_taps == nullptr) { return; }
+  if (hf_index < 0 || hf_index >= (int)_taps->slot_of.size()) { return; }
+  const int slot = _taps->slot_of[(std::size_t)hf_index];
+  if (slot < 0) { return; }
+  if (rows != _taps->n) {
+    _taps->partial = true;
+    return;
+  }
+  const std::size_t N = (std::size_t)rows * _taps->hidden;
+  enc.set_function(_fn_copy);
+  enc.set_buffer(0, src, src_off);
+  enc.set_buffer(1, *_taps->out);
+  enc.set_constant(2, (int)((std::size_t)slot * N));
+  enc.set_constant(3, (int)N);
+  enc.dispatch({(unsigned)N, 1, 1}, {256, 1, 1});
+}
+
+metal_compute::SharedBuffer
+MetalGemmaModel::forward_embeddings_taps(
+    ContextId cid, const std::vector<std::int32_t>& ids,
+    const std::vector<int>& hf_indices, int key_valid_len, std::string* err)
+{
+  const Config& c = _cfg;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return metal_compute::SharedBuffer{};
+  };
+  const int n = (int)ids.size();
+  const int H = c.hidden, nl = c.n_layers;
+  if (n <= 0) { return fail("no tokens to encode"); }
+  if (hf_indices.empty()) { return fail("no hidden-state indices requested"); }
+  if (!_fn_copy.valid()) {
+    return fail("the elementwise copy kernel is unavailable, so no state "
+                "can be read out");
+  }
+  // No prefix key-mask exists on this model. Ignoring the argument would
+  // return states computed over the PADDING as well -- the right shape,
+  // quietly conditioned on tokens the reference masks off.
+  if (key_valid_len > 0 && key_valid_len < n) {
+    return fail("this model has no prefix key-mask, so key_valid_len "
+                "cannot be honoured; encode the real tokens only and pad "
+                "the returned states afterwards");
+  }
+  // The shared-KV tail collapses the stream to its LAST ROW. The taps
+  // are taken at the TOP of each iteration, before that collapse, so
+  // index first_shared is still full width and everything ABOVE it is
+  // not -- which is the boundary this refuses at, rather than refusing
+  // the whole checkpoint. A {10,20,30}-style tap on a model with a tail
+  // is perfectly well defined and stays available.
+  const int tap_limit = (c.num_kv_shared > 0) ? c.first_shared() : nl;
+
+  std::vector<int> slot_of((std::size_t)nl + 1, -1);
+  for (std::size_t j = 0; j < hf_indices.size(); ++j) {
+    const int ix = hf_indices[j];
+    if (ix < 0 || ix > nl) {
+      return fail("hidden-state index " + std::to_string(ix) +
+                  " is outside [0, " + std::to_string(nl) + "]");
+    }
+    if (ix > tap_limit) {
+      return fail("hidden-state index " + std::to_string(ix) +
+                  " is inside this checkpoint's " +
+                  std::to_string(c.num_kv_shared) + "-layer KV-shared "
+                  "tail, whose residual is computed for the LAST POSITION "
+                  "only; per-token states are available up to index " +
+                  std::to_string(tap_limit));
+    }
+    if (slot_of[(std::size_t)ix] >= 0) {
+      return fail("hidden-state index " + std::to_string(ix) +
+                  " was requested twice");
+    }
+    slot_of[(std::size_t)ix] = (int)j;
+  }
+
+  // Single chunk only: prefill() splits a prompt that would wrap the
+  // sliding ring, and its intermediate chunks skip layers on purpose.
+  // Same relaxations prefill() applies, so a prompt it runs in one shot
+  // is a prompt this accepts.
+  const int B = _sliding_chunk;
+  ContextId cm = cm_for_(cid);
+  int kv_off = 0;
+  if (B > 0 && cm.valid()) { kv_off = _ctx->kv_seq_len(cm); }
+  const int ring_cap = std::min(c.max_seq, c.sliding_window + B);
+  bool wraps = (B > 0) && (kv_off + n > ring_cap);
+  if (_sliding_grow && wraps && kv_off == 0 && n <= c.max_seq && cm.valid()
+      && _ctx->ensure_sliding_capacity(cm, n)) {
+    wraps = false;
+  }
+  if (wraps) {
+    return fail(std::to_string(n) + " tokens would wrap the sliding-window "
+                "ring (capacity " + std::to_string(ring_cap) + " from "
+                "offset " + std::to_string(kv_off) + "), which forces a "
+                "chunked prefill whose intermediate states are incomplete; "
+                "encode on a fresh context, or shorten the prompt");
+  }
+
+  const std::size_t slots = hf_indices.size();
+  const std::size_t elems = slots * (std::size_t)n * (std::size_t)H;
+  metal_compute::SharedBuffer out = _mc->make_shared_buffer(elems * 2);
+  if (out.empty()) {
+    return fail("could not allocate " + std::to_string(elems * 2) +
+                " bytes for " + std::to_string(slots) + " hidden states");
+  }
+
+  TapState st;
+  st.out = &out;
+  st.slot_of = std::move(slot_of);
+  st.n = n;
+  st.hidden = H;
+  _taps = &st;
+  // want_logits = false: a text encoder never reads them, and the tap for
+  // index n_layers runs BEFORE the logits block and does its own
+  // all-rows final norm, so skipping the 262k-wide head costs nothing.
+  const std::vector<float> sentinel =
+      forward_chunk_(cid, ids, nullptr, nullptr, /*want_logits=*/false);
+  _taps = nullptr;
+
+  if (sentinel.empty()) { return fail("the forward pass failed"); }
+  if (st.partial) {
+    return fail("a requested hidden state was reached with a narrowed "
+                "stream and was dropped");
+  }
+  return out;
+}
+
 std::vector<float>
 MetalGemmaModel::forward_chunk_(ContextId cid,
                                const std::vector<std::int32_t>& ids,
@@ -4122,6 +4279,22 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
                                const std::vector<int>* mm_pos,
                                bool want_logits)
 {
+  // The PERSISTENT scratch, which this function does not allocate but
+  // does read: _d_pgtab (the full-layer page table) and the materialized
+  // -global _d_scores/_d_vT all live in ensure_scratch_().
+  //
+  // Without it, fill_page_table() is handed a null pointer, returns 0,
+  // and the paged full-attention kernels then loop over ZERO pages and
+  // write zeros -- so every global layer contributes exactly nothing
+  // while every matmul around it still runs. That is silent: the model
+  // still produces fluent-looking output, just conditioned on the
+  // sliding layers alone. It also forces mat_ok false (_scores_cap 0),
+  // so the faster materialized path is skipped as a side effect.
+  //
+  // forward(), decode_step_fast() and pdecode_begin() all call this; the
+  // prefill path reaches forward_chunk_ WITHOUT going through any of
+  // them, so it has to call it here. Idempotent (_scratch_ready).
+  if (!ensure_scratch_()) { return {}; }
   const Config& c = _cfg;
   const int n = (int)ids.size();
   const int H = c.hidden, Hq = c.n_heads;
@@ -4554,7 +4727,15 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
                    {(unsigned)D, 1, 1});
     };
     // ---- embeddings + per-layer inputs (batched) -------------------
-    if (_dense) {
+    // `_dense_embed` takes the dense gather here for the same reason the
+    // decode step does: the affine triple was never loaded, so the
+    // alternative reads three EMPTY buffers and writes zeros -- which is
+    // not a failure anywhere, just a hidden state of zeros that stays
+    // zero through every layer. MEASURED before this line existed: the
+    // conditioning came out at 6e-5 of its norm and BYTE-IDENTICAL
+    // between a 4-bit and an 8-bit backbone, which is what a result that
+    // does not depend on the weights looks like.
+    if (_dense || _dense_embed) {
       embed_dense(_embed_dense, x, H);
     } else if (_embed_is_q6k) {
       enc.set_function(_fn_embed_q6k);
@@ -4621,6 +4802,18 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       // writes no K/V and its residual/logits are discarded, so stop after
       // the own-KV bulk layers. The bulk layers (incl. their PLE gate) must
       // still run -- they populate the cache the later chunks' tail reads.
+      // Hidden-state tap. Taken at the TOP of the iteration, where *xcur
+      // is the INPUT to layer L -- which is HuggingFace's index L, and
+      // index 0 for L == 0 (the embedding output). Tapping here rather
+      // than at the layer's tail is what keeps this to one insertion
+      // point: the tail has a `continue` for the final layer and several
+      // per-variant shapes, all of which a tail tap would have to repeat.
+      //
+      // ABOVE the break, not below it: index first_shared is the input to
+      // the first shared-KV layer and is still full width, so it is the
+      // LAST state a tap can serve per token -- and the break is exactly
+      // where a tap placed below would lose it.
+      tap_(enc, L, *xcur, 0, rows);
       if (!want_logits && L >= first_shared) { break; }
       Layer& ly = _layers[L];
       const int Hkv = ly.n_kv;
@@ -4889,6 +5082,26 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       const bool mat_ok = rows > 1 && _materialized_global && qpos == 0
           && T_kv <= _scores_cap && _fn_causal_softmax.valid();
 
+      // Which SDPA path each layer takes. An attention path that silently
+      // does nothing (an unvalidated ComputeFunction is a NO-OP, not an
+      // error) leaves `at` at whatever it held -- zeros on the first use --
+      // and the layer then contributes exactly nothing while every matmul
+      // around it still runs. That is invisible without this.
+      if (std::getenv("VPIPE_GEMMA_ATTN_PATH") != nullptr) {
+        const char* path =
+            skip_attn ? "skip"
+          : !paged_full ? (rows == 1 ? "sdpa_mb" : "non-paged")
+          : (mat_ok && ly.is_full && D == 512) ? "materialized"
+          : (rows > 1 && _pmma2_attn) ? "pmma2"
+          : (rows > 1 && _pflash_attn && D == 512) ? "pflash"
+          : "paged_causal";
+        std::fprintf(stderr,
+            "[gemma-attn] L=%2d full=%d D=%3d Hq=%2d Hkv=%d rows=%d T_kv=%d "
+            "paged=%d mat_ok=%d n_pages=%d ptok=%d pstride=%zu path=%s\n",
+            L, (int)ly.is_full, D, Hq, Hkv, rows, T_kv, (int)paged_full,
+            (int)mat_ok, n_pages, page_tokens,
+            _ctx ? _ctx->page_stride_bytes() : (std::size_t)0, path);
+      }
       if (skip_attn) {
         // intentionally no SDPA dispatch (probe)
       } else if (paged_full) {
@@ -5474,6 +5687,15 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         scale(*xcur, rows * H, ly.layer_scalar);
       }
       }   // end dense (non-MoE) hybrid-FFN branch
+    }
+
+    // Index n_layers is the residual AFTER THE FINAL NORM, not the raw
+    // residual -- HF appends once more after `self.norm`. The logits path
+    // below norms the LAST ROW only, so this is a second, all-rows norm
+    // rather than a reuse of it, and it runs only when a tap wants it.
+    if (_taps != nullptr && _taps->slot_of[(std::size_t)nl] >= 0) {
+      rms(*xcur, 0, _final_ln, hn, 0, rows, H);
+      tap_(enc, nl, hn, 0, rows);
     }
 
     // ---- final norm (last token) + lm_head + softcap ---------------

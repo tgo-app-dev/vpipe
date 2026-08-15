@@ -3,7 +3,9 @@
 
 #include "pipeline/stage-registry.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-catalog.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -14,6 +16,9 @@
 namespace vpipe {
 
 class SessionContextIntf;
+
+namespace genai { class VideoModelFamily; }
+namespace genai { class VaeModelFamily; }
 
 // The C++ registration facade handed to a plugin's vpipe_plugin_register.
 // Thin by design: it forwards to the process-wide registries (StageRegistry
@@ -69,6 +74,48 @@ public:
                               const void* bytes, std::size_t n);
   bool register_metal_library_file(std::string_view name,
                                    std::string_view path);
+
+  // ---- video model families ------------------------------------------
+  // Contribute a VIDEO model family, so `generate-video` can run a
+  // checkpoint this build has never heard of. The family owns its whole
+  // denoise loop -- scheduler, guidance, residency, patchify -- and the
+  // stage keeps the ports, the beats and the geometry. See
+  // generative-models/video-model-registry.h for what a family answers.
+  //
+  // Takes ownership; the registry outlives every stage. First-wins on
+  // the family's `tag()`: a second family for a tag already present is
+  // refused (returns false + warns) rather than silently shadowing the
+  // first, because two plugins shipping one model is a deployment
+  // mistake worth seeing.
+  bool register_video_family(std::unique_ptr<genai::VideoModelFamily> family);
+
+  // ---- VAE families ----------------------------------------------------
+  // Contribute a VAE DECODER, so the stock `vae-decode` stage can turn a
+  // latent from an out-of-tree checkpoint into RGB frames. The family
+  // owns its un-whitening, its tiling, its colour space and its
+  // residency; the stage keeps the ports, the U8 quantisation, the
+  // per-frame beat and the idle-unload policy.
+  //
+  // This is the COUNTERPART to register_video_family: a plugin adding a
+  // video model registers BOTH -- one family generates the latent, the
+  // other decodes it -- and needs a stage of its own for neither. See
+  // generative-models/vae-model-registry.h.
+  //
+  // Takes ownership; the registry outlives every stage. First-wins on
+  // `tag()`, and a tag colliding with a built-in family name
+  // ("wan", "minimax-h3", "flux2", "mage", "krea2") is refused outright:
+  // dispatch is pointer-guarded so it would still run the right code,
+  // but every log line would read as a built-in.
+  bool register_vae_family(std::unique_ptr<genai::VaeModelFamily> family);
+
+  // ---- model catalogue -------------------------------------------------
+  // Contribute downloadable-model entries, so a family this plugin adds
+  // is fetchable and browsable the way a built-in one is (the drill-down
+  // menu, `model-fetch`, the web-ui model browser). Returns how many
+  // entries were taken; duplicates of what the catalogue already lists
+  // are dropped. See stages/model-catalog.h for the lifetime rule.
+  std::size_t
+  register_catalog_entries(std::vector<ModelCatalogEntry> entries);
 
 private:
   // A non-capturing factory (convertible to StageRegistry::Factory) that

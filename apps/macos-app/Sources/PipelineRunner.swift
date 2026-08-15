@@ -119,6 +119,10 @@ final class PipelineRunner: ObservableObject {
         var args = ["--launch", file.url.path]
         let cfg = model.sessionConfigJSON()
         if cfg != "{}" { args += ["--config", cfg] }
+        // Repeatable, and folded into VPIPE_PLUGINS before the session
+        // is built, so the stages a plugin registers exist by the time
+        // the spec is parsed. Order against --launch does not matter.
+        for p in model.enabledPluginPaths() { args += ["--plugin", p] }
 
         try proc.start(executable: BundlePaths.cli,
                        arguments: args,

@@ -81,6 +81,27 @@ hashes `Copied` entries at load and reports any that changed.
 > **Trap.** The accessor you choose decides whether mechanism 5 can ever
 > see your weights. See "Parking cannot reach uncached weights" below.
 
+> **Bigger trap: `Mapped` is a REQUEST, and the file can refuse it.**
+> Zero-copy wrapping hands Metal a subview of the mapped shard, and a
+> Metal buffer offset must be **16-byte aligned**. A safetensors file is
+> `[u64 length][JSON header][data]`, so `8 + header_len` fixes the
+> alignment of *every tensor in the shard at once* — get it wrong and the
+> loader falls back to a copy for all of them.
+>
+> This is not hypothetical and it is not rare. MEASURED on a 22B DiT
+> whose data section began at 677624 (≡ 8 mod 16): **4349 of 4349
+> tensors, 39.1 GB, copied** — anonymous memory, where the model asked
+> for file-backed pages. It surfaced as a box thrashing with 36 GB in the
+> compressor, a long way from the cause, because the fallback used to be
+> silent. It now warns once per shard.
+>
+> Two consequences: **check the log** before believing a model is mapped,
+> and note that many published checkpoints land on `%16 == 8` (the
+> safetensors header is padded to 8, and the 8-byte length prefix then
+> lands the data on an odd 16-boundary). vpipe's own `SafetensorsWriter`
+> pads to 16, so anything `model-quantize` or `lora-fuse` writes is
+> mappable; what you downloaded may not be.
+
 ---
 
 ## 2. Declarations — sizing before anything loads

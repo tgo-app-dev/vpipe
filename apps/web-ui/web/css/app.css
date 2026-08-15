@@ -894,6 +894,16 @@ svg.graph { display: block; width: 100%; height: 100%;
   text-transform: uppercase; letter-spacing: .04em;
   padding: 9px 4px 3px; position: sticky; top: 0; background: var(--bg-1);
 }
+/* A plugin's section: same header, tinted so "this came from a .dylib"
+   reads at a glance rather than only from the label. */
+.tb-cat.tb-plugin { color: var(--accent); }
+/* "disabled, still resident" -- a warning tint rather than an error one:
+   nothing is broken, the plugin is simply not being offered. */
+.plugin-off { color: var(--warn, #c93); font-size: 11px; font-weight: 500; }
+/* Used by the plugin panel for paths and plugin ids. There was no
+   general-purpose .mono before this; the settings rows all styled their
+   own. */
+.mono { font-family: var(--mono); }
 .tb-empty { color: var(--fg-dim); font: 11px var(--mono); padding: 8px 4px; }
 .graph-wrap.drop-target {
   outline: 2px dashed var(--accent); outline-offset: -4px;

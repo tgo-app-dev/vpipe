@@ -14,6 +14,7 @@
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #endif
 
@@ -43,7 +44,18 @@ namespace vpipe {
 //   oport0  TensorBeatPayload, an f32 latent [z_dim, H/8, W/8] (channel-first,
 //           unpacked, WHITENED -- (x-mean)/std) -- the same format the
 //           generate-image stage emits, so it flows into the `latent` port
-//           there (img2img init) or straight back into vae-decode.
+//           there (img2img init) or straight back into vae-decode. A video
+//           family emits [z_dim, T, h, w]; the shape is the ENCODER's, not
+//           one predicted here.
+//
+// OUT-OF-TREE FAMILIES are consulted first, through VaeModelRegistry --
+// the same order and the same reason as vae-decode. The built-in
+// `_class_name` chain below cannot be joined from a plugin, and its
+// FALLBACK is "krea2", so a checkpoint it does not recognise is not
+// refused but misread: a family whose latent is 32x at 128 channels
+// would be encoded at 8x and 16, and the beat would look fine. A family
+// that claims a checkpoint and supplies no encoder therefore leaves this
+// stage INERT rather than falling through.
 //
 // Config (FlexData object on the 4th constructor parameter):
 //   hf_dir     (string, OPTIONAL) -- the Krea-2-Turbo model directory; the VAE
@@ -125,6 +137,12 @@ private:
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
   // MiniMax-H3's video VAE, encoder half: a keyframe anchor for FL2VA.
   std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+
+  // An OUT-OF-TREE family (VaeModelRegistry), consulted BEFORE the
+  // built-in `_class_name` chain -- the same order vae-decode uses. Null
+  // for every built-in checkpoint, and then nothing here costs anything.
+  genai::VaeModelFamily*             _vae_family = nullptr;
+  std::unique_ptr<genai::VaeEncoder> _plugin_enc;
 
   // Resolve _hf_dir + load the VAE encoder (idempotent: the _load_attempted
   // guard runs the body at most once). No-op when _hf_dir is still empty.

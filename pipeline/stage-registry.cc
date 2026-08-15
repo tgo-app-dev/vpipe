@@ -122,6 +122,41 @@ StageRegistry::create(string_view               type_name,
   }
 }
 
+StageTypeId
+StageRegistry::next_id() const noexcept
+{
+  lock_guard<mutex> lk(_mu);
+  return static_cast<StageTypeId>(_entries.size() + 1);
+}
+
+void
+StageRegistry::attribute_since(StageTypeId first, string_view origin)
+{
+  if (origin.empty()) { return; }
+  lock_guard<mutex> lk(_mu);
+  // ids are 1-based and index = id - 1.
+  const unsigned f = static_cast<unsigned>(first);
+  for (size_t i = (f >= 1 ? static_cast<size_t>(f) - 1 : 0);
+       i < _entries.size(); ++i) {
+    // First writer wins, matching register_type/set_spec: if two plugins
+    // somehow both cover a span, the one that registered the type keeps
+    // the credit rather than the later one overwriting it.
+    if (_entries[i].origin.empty()) { _entries[i].origin = origin; }
+  }
+}
+
+string_view
+StageRegistry::origin(string_view type_name) const noexcept
+{
+  lock_guard<mutex> lk(_mu);
+  auto it = _by_name.find(type_name);
+  if (it == _by_name.end()) { return {}; }
+  const size_t idx = static_cast<size_t>(
+      static_cast<unsigned>(it->second)) - 1;
+  if (idx >= _entries.size()) { return {}; }
+  return _entries[idx].origin;
+}
+
 vector<pair<StageTypeId, string>>
 StageRegistry::all() const
 {

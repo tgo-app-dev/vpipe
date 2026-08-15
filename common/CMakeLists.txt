@@ -35,6 +35,7 @@ set(LOCAL_SOURCES
   static-file-server.cc
   stdio-ui-delegate.cc
   stdout-log-delegate.cc
+  plugins-root.cc
   temp-root.cc
   thread-pool.cc
   vertex.cc
@@ -80,6 +81,7 @@ set(LOCAL_HEADERS
   segment-writer.h
   session-config.h
   session-member.h
+  plugins-root.h
   session.h
   static-file-server.h
   stdio-ui-delegate.h

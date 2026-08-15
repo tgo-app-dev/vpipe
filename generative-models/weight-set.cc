@@ -216,14 +216,21 @@ WeightSet::read(const string& name, metal_compute::MetalCompute* mc,
   }
   // Plain safetensors copy: a fresh allocation plus a memcpy out of a
   // read-only mmap, touching nothing this set owns. Deliberately done
-  // OUTSIDE the lock.
+  // OUTSIDE the lock -- which is also why the cost split below is
+  // accumulated with relaxed atomics rather than under it.
   //
   // This is the block-streaming path, and streaming implies Copied (a
   // model that streams turns mmap OFF -- see the DiTs' _mmap_weights).
   // Holding the lock across the memcpy would make two pipelines sharing
   // one checkpoint take turns on every block read, which is exactly the
   // concurrency the sharing exists to enable.
-  return _wts->load(name, mc);
+  MetalLlamaWeights::LoadCost cost;
+  metal_compute::SharedBuffer out = _wts->load(name, mc, &cost);
+  _streamed_alloc_us.fetch_add((std::uint64_t)(cost.alloc_ms * 1000.0),
+                               std::memory_order_relaxed);
+  _streamed_fetch_us.fetch_add((std::uint64_t)(cost.fetch_ms * 1000.0),
+                               std::memory_order_relaxed);
+  return out;
 }
 
 metal_compute::SharedBuffer
@@ -444,6 +451,10 @@ WeightSet::stats() const
   }
   s.streamed_reads = _streamed_reads.load(std::memory_order_relaxed);
   s.streamed_bytes = _streamed_bytes.load(std::memory_order_relaxed);
+  s.streamed_alloc_ms =
+      (double)_streamed_alloc_us.load(std::memory_order_relaxed) / 1000.0;
+  s.streamed_fetch_ms =
+      (double)_streamed_fetch_us.load(std::memory_order_relaxed) / 1000.0;
   return s;
 }
 

@@ -68,6 +68,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _high_bits     = static_cast<int>(attr_uint("high_bits"));
   _mixed_frac    = static_cast<float>(attr_real("mixed_frac"));
   _layer_prefix  = attr_str("layer_prefix");
+  _quant_exclude = attr_str("quant_exclude");
   _quant_modulation = attr_bool("quant_modulation");
   _quant_vision     = attr_bool("quant_vision");
   _klein_kv      = attr_bool("klein_kv");
@@ -639,6 +640,18 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "n_layers", .type = ConfigType::Uint,
    .doc = "layer count for awq/mixed; 0 => auto-detect from config.json",
    .def_uint = 0},
+  {.key = "quant_exclude", .type = ConfigType::String,
+   .doc = "comma-separated tensor-name substrings to LEAVE dense. Needed "
+          "whenever `target` names a wholesale scope, because that rule "
+          "takes every 2D floating-point tensor whose leaf is not a norm "
+          "or an embedding -- which is right for linears and wrong for "
+          "anything else shaped like one. Two kinds get caught: modulation "
+          "TABLES (a DiT's f32 scale/shift rows are 2D and are not "
+          "matrices), and tiny gating projections, where a per-group "
+          "affine over a handful of rows is all error and no saving. "
+          "Neither shows up as a load failure -- the checkpoint quantizes, "
+          "loads and generates something wrong",
+   .def_str = ""},
   {.key = "quant_vision", .type = ConfigType::Bool,
    .doc = "text-encoder passes: also quantize the checkpoint's VISION "
           "tower (visual.*) instead of passing it through bf16. Off by "
@@ -1036,6 +1049,24 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   }
   opt.quant_scope        = quant_scope;         // "" => the whole model
   opt.quant_all_in_scope = quant_all_in_scope;
+  // Comma-separated, whitespace trimmed. Appended to whatever a family
+  // branch below sets rather than replacing it: the built-in exclusions
+  // are architectural facts, not defaults to override.
+  {
+    std::string cur;
+    auto flush = [&]() {
+      std::size_t a = cur.find_first_not_of(" \t");
+      std::size_t b = cur.find_last_not_of(" \t");
+      if (a != std::string::npos) {
+        opt.quant_exclude.push_back(cur.substr(a, b - a + 1));
+      }
+      cur.clear();
+    };
+    for (char c : _quant_exclude) {
+      if (c == ',') { flush(); } else { cur.push_back(c); }
+    }
+    flush();
+  }
 
   if (stop()) {
     if (!auto_calib.empty()) { fs::remove_all(auto_calib, ec); }

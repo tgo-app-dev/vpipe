@@ -324,6 +324,37 @@ const STRINGS = {
   'pl.no_pipelines':   ['No pipelines. Create or load one.',
       '没有流水线。请创建或加载一个。', '沒有管線。請建立或載入一個。'],
   'pl.no_matches':     ['No matches', '没有匹配项', '沒有相符項目'],
+  // Prefixes a toolbox section named after the plugin that contributed
+  // the stages under it; the plugin's own name follows, untranslated.
+  'pl.plugin_group':   ['Plugin', '插件', '外掛'],
+  'nav.plugins':       ['Plugins', '插件', '外掛'],
+  'plugins.title':     ['Plugins', '插件', '外掛'],
+  'plugins.root':      ['Plugins directory', '插件目录', '外掛目錄'],
+  'plugins.root_missing': [
+    'This directory does not exist yet. Create it and put plugin dylibs in it.',
+    '此目录尚不存在。请创建它并将插件动态库放入其中。',
+    '此目錄尚不存在。請建立它並將外掛動態庫放入其中。'],
+  // The single most important sentence in this panel: Disable is not an
+  // unload, and a user who assumes otherwise will expect memory back.
+  'plugins.no_unload': [
+    'Plugins are never unloaded: a loaded plugin stays mapped for the life '
+    + 'of the process. Disable only stops its stages being offered. Restart '
+    + 'to remove one.',
+    '插件永不卸载：已加载的插件在进程存续期间始终驻留内存。停用仅停止提供其阶段。'
+    + '需重启才能真正移除。',
+    '外掛永不卸載：已載入的外掛在行程存續期間始終駐留記憶體。停用僅停止提供其階段。'
+    + '需重新啟動才能真正移除。'],
+  'plugins.loaded':    ['Loaded', '已加载', '已載入'],
+  'plugins.available': ['Available', '可用', '可用'],
+  'plugins.none_loaded':    ['No plugins loaded', '未加载插件', '未載入外掛'],
+  'plugins.none_available': ['No plugins found', '未找到插件', '未找到外掛'],
+  'plugins.load':      ['Load', '加载', '載入'],
+  'plugins.loaded_ok': ['Plugin loaded', '插件已加载', '外掛已載入'],
+  'plugins.enable':    ['Enable', '启用', '啟用'],
+  'plugins.disable':   ['Disable', '停用', '停用'],
+  'plugins.disabled_resident': [
+    '(disabled, still resident)', '（已停用，仍驻留内存）', '（已停用，仍駐留記憶體）'],
+  'plugins.stages':    ['stages', '阶段', '階段'],
   'pl.stages_total':   ['{n} stage{s} in total', '共 {n} 个流水线级',
       '共 {n} 個階段'],
   'pl.chip_ports':     ['{ins} in / {outs} out', '{ins} 入 / {outs} 出',

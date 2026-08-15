@@ -378,6 +378,44 @@ public:
                          is_first_turn, dst);
   }
 
+  // ---- Reasoning effort --------------------------------------------
+  //
+  // Qwen3.8 added a `reasoning_effort` control to its published chat
+  // template: xhigh | medium | low, which prepends an instruction
+  // paragraph to the SYSTEM turn telling the model how much thinking to
+  // spend. The template gates it on thinking being ON, and `medium`
+  // resolves to no paragraph at all -- so a renderer that emits nothing
+  // is exactly the reference at `medium`, and the reference's own
+  // default is `xhigh`.
+  //
+  // The paragraph is a system instruction, so it has to reach the model
+  // in ONE system turn together with the tool advertisement when tools
+  // are in play -- which is why there are two seams rather than one:
+  //
+  //   * tools ON  -- render_tools_system_turn prepends it itself, and
+  //                  the caller must NOT also call the method below, or
+  //                  the model gets it twice;
+  //   * tools OFF -- the caller emits it alone via the method below.
+  //
+  // Anything without a reasoning-effort concept returns false and
+  // appends nothing, so a caller can invoke it unconditionally on the
+  // no-tools path.
+  virtual bool
+  render_reasoning_system_turn(std::vector<std::int32_t>* dst) const
+  {
+    (void)dst;
+    return false;
+  }
+
+  // The instruction paragraph this template will emit, empty when none
+  // applies. Exposed as TEXT, separately from the rendering, because
+  // the paragraph's exact wording is the contract -- it is what the
+  // checkpoint was tuned against -- and a caller (or a test) that can
+  // only see token ids cannot check it without round-tripping through
+  // a tokenizer that may not carry the characters.
+  virtual std::string_view reasoning_instructions() const noexcept
+  { return {}; }
+
   // ---- Tool / function calling (MCP) -------------------------------
   // True when this family renders the tool-calling scaffold below (the
   // Hermes/Qwen `<tools>` advertisement + `<tool_response>` result
@@ -523,10 +561,27 @@ protected:
 // thinking-OFF; Qwen3-VL is family-default thinking-ON. Passing an
 // explicit value flips the bit. Ignored on families without a
 // thinking concept (Llama-3, vanilla ChatML / Qwen2).
+//
+// `reasoning_effort` is Qwen3.8's control (see
+// ChatTemplate::render_reasoning_system_turn): "xhigh" | "medium" |
+// "low", or EMPTY for the default of emitting nothing.
+//
+// Empty is the default rather than the reference's own `xhigh` on
+// purpose. vpipe cannot tell a 3.8 checkpoint from a 3.5 or 3.6 one --
+// all three declare model_type "qwen3_5" and 3.6 and 3.8 have
+// field-identical configs -- so defaulting to xhigh would inject an
+// instruction into two families whose published templates never had
+// it. Unset renders exactly as before, and as the reference does at
+// `medium`; a caller that knows it is on 3.8 asks for xhigh.
+//
+// Ignored, with nothing emitted, when thinking is off -- which is what
+// the reference template does too (its whole block is inside
+// `if enable_thinking`).
 std::unique_ptr<ChatTemplate>
 make_chat_template(const std::string&    architecture,
                    const Tokenizer&      tokenizer,
-                   std::optional<bool>   disable_thinking = std::nullopt);
+                   std::optional<bool>   disable_thinking = std::nullopt,
+                   std::string_view      reasoning_effort = {});
 
 }
 

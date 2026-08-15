@@ -4760,3 +4760,4 @@ kernel void swiglu_split_gate_first_f16(
   const float v = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
 }
+

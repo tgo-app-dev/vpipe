@@ -184,6 +184,17 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
     }
     _max_new_tokens = static_cast<int>(v);
   }
+  // Validated here rather than silently downgraded: an unrecognised
+  // effort renders as no instruction, which looks exactly like the
+  // default and would hide the typo for the life of the pipeline.
+  _reasoning_effort = attr_str("reasoning_effort");
+  if (!_reasoning_effort.empty() && _reasoning_effort != "xhigh"
+      && _reasoning_effort != "medium" && _reasoning_effort != "low") {
+    fail_config(fmt(
+        "TextChatStage('{}'): reasoning_effort must be \"xhigh\", "
+        "\"medium\" or \"low\" (got '{}')",
+        this->id(), _reasoning_effort));
+  }
   _enable_tools = attr_bool("enable_tools");
   _enable_python_tool = attr_bool("enable_python_tool");
   _enable_file_tools = attr_bool("enable_file_tools");
@@ -252,6 +263,21 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "per-turn generation budget (>= 1)", .def_int = 1024},
   {.key = "disable_thinking", .type = ConfigType::Bool,
    .doc = "override chat-template thinking default", .def_bool = false},
+  {.key = "reasoning_effort", .type = ConfigType::String,
+   .doc = "how much thinking to ask the model for: \"xhigh\", "
+          "\"medium\" or \"low\". Qwen3.8's chat-template control -- it "
+          "prepends an instruction paragraph to the system turn (merged "
+          "into the tools turn when tools are on), verbatim from the "
+          "published template. \"medium\" is the un-instructed "
+          "rendering, exactly as the reference defines it, so it emits "
+          "nothing. Empty (the default) also emits nothing, which is "
+          "what every earlier Qwen3 build did -- the reference's own "
+          "default is \"xhigh\", but vpipe cannot tell a 3.8 checkpoint "
+          "from a 3.5/3.6 one (all three declare model_type "
+          "\"qwen3_5\"), so asking for xhigh is opt-in rather than "
+          "assumed. Ignored, with a warning, when thinking is off or "
+          "the family has no reasoning-effort concept",
+   .def_str = ""},
   {.key = "enable_tools", .type = ConfigType::Bool,
    .doc = "enable MCP tool calling: advertise the built-in tools "
           "(get_current_time) and run any <tool_call> the model emits, "
@@ -554,7 +580,25 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // default (Qwen3-VL: thinking-ON, Qwen3 text-only: OFF, others: n/a).
   _chat_tpl = genai::make_chat_template(
       _lm->config().architecture, _lm->tokenizer(),
-      _disable_thinking);
+      _disable_thinking, _reasoning_effort);
+  // An effort that reached no instruction is reported, not dropped: the
+  // two ways that happens -- thinking off, or a family with no such
+  // control -- both render identically to not asking, so silence would
+  // leave a configured knob looking like it worked.
+  if (!_reasoning_effort.empty() && _reasoning_effort != "medium"
+      && _chat_tpl) {
+    std::vector<std::int32_t> probe;
+    if (!_chat_tpl->render_reasoning_system_turn(&probe)) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): reasoning_effort '{}' has no effect here "
+          "-- {}",
+          this->id(), _reasoning_effort,
+          (_disable_thinking.has_value() && *_disable_thinking)
+              ? "thinking is off, and the reference template gates the "
+                "instruction on thinking being on"
+              : "this chat template has no reasoning-effort control"));
+    }
+  }
   if (!_chat_tpl) {
     session()->warn(fmt(
         "TextChatStage('{}'): no chat template registered for "
@@ -914,9 +958,21 @@ TextChatStage::process(RuntimeContext& ctx)
   // back for another round (see the tool loop below).
   if (tools_seed) {
     vector<int32_t> sys;
+    // The tools turn CARRIES the reasoning-effort instruction when one
+    // is set (the template merges them into one system turn, as the
+    // published one does), so the reasoning-only branch below is an
+    // else -- emitting both would send the instruction twice.
     if (tpl->render_tools_system_turn(_tools.tools_json(),
                                       /*is_first_turn=*/true, &sys)
         && !sys.empty()) {
+      ids.insert(ids.begin(), sys.begin(), sys.end());
+    }
+  } else if (!_seeded) {
+    // No tools: the instruction gets a system turn of its own, once per
+    // fresh context, ahead of the first user turn. A no-op (and cheap)
+    // when no effort is set or the family has no such control.
+    vector<int32_t> sys;
+    if (tpl->render_reasoning_system_turn(&sys) && !sys.empty()) {
       ids.insert(ids.begin(), sys.begin(), sys.end());
     }
   }

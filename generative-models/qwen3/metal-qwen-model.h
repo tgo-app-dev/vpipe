@@ -1638,6 +1638,23 @@ private:
   // (q4_K/q5_K/q6_K), no requant. Set at load when the weights are a
   // qwen35 GGUF; selects the kqmv_/kqmm_ dispatch + the q6_K embed/lm_head.
   bool _kquant = false;
+  // GDN value-head order. llama.cpp writes every v-head-indexed GDN tensor
+  // (the v slice of in_proj_qkv, in_proj_z, in_proj_a/b, A_log, dt_bias,
+  // the v slice of conv1d, and out_proj's input columns) STRIDED --
+  // v-head j*Hk+k belongs to key head k -- where HF/safetensors groups
+  // them contiguously (v-head k*(Hv/Hk)+j belongs to key head k). The GDN
+  // step kernel takes a negative Hk to switch to the strided mapping, so
+  // a GGUF is consumed in its own order rather than repacked.
+  //
+  // This is a property of the FILE FORMAT, not of the quantization: it
+  // holds for a k-quant GGUF and an all-Q8_0 one alike, and the Q8_0 one
+  // is repacked to affine so it is not `_kquant`. Keying the flag off
+  // _kquant (as this did) therefore ran an all-Q8_0 checkpoint's strided
+  // weights through the contiguous mapping -- every v-head paired with
+  // the wrong key head. MEASURED on Qwen3.8-27B Q8_0: layer-0 residual
+  // 0.196 rel vs the same model quantized from HF, against 0.011 for the
+  // Q4_K_M sibling that got the strided flag.
+  bool _gdn_strided_v = false;
   // q6_K decode qmv tuning: the loaded qmv_q6k_v2 variant's NSG (simdgroups/
   // threadgroup) and rows-per-threadgroup (RPS*NSG). Tuned to r2n8 (nsg=8,
   // rpt=16); fallbacks set nsg=2/rpt=8. Used by kqmv_'s q6_K dispatch.

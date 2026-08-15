@@ -297,6 +297,72 @@ TEST(model_catalog, qwen36_optiq_variants_present) {
   EXPECT_TRUE(has_(catalog_param_classes("Qwen", "3.6"), "35B-A3B"));
 }
 
+// Qwen 3.8 is its own DISPLAY version over the qwen3.5 runtime family --
+// its config.json is Qwen3.6-27B's field for field bar the transformers
+// version, so it runs the same path and must be labelled apart from it.
+TEST(model_catalog, qwen38_27b_family) {
+  EXPECT_TRUE(has_(catalog_versions("Qwen"), "3.8"));
+  auto p = catalog_param_classes("Qwen", "3.8");
+  EXPECT_TRUE(p.size() == 1);
+  EXPECT_TRUE(has_(p, "27B"));
+  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 4);
+
+  struct Row { const char* path; const char* variant; };
+  const Row rows[] = {
+      {"Qwen/Qwen3.8-27B", "bf16 (Qwen)"},
+      {"lmstudio-community/Qwen3.8-27B-MLX-4bit",
+       "MLX 4-bit (lmstudio-community)"},
+      {"unsloth/Qwen3.8-27B-GGUF", "Q4_K_M GGUF +mmproj (unsloth)"},
+  };
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "Qwen");
+    EXPECT_TRUE(e->version == "3.8");
+    EXPECT_TRUE(e->param_class == "27B");
+    EXPECT_TRUE(e->variant == r.variant);
+    // The RUNTIME tag is the 3.5 family's, deliberately: every consumer
+    // of the tag treats 3.5 and 3.6 alike, and a third spelling would be
+    // one more thing each of them has to learn for no behaviour change.
+    EXPECT_TRUE(e->model_type == "qwen3.5");
+    EXPECT_FALSE(e->needs_tokenizer_json);
+  }
+
+  // Only the GGUF entry pins files; the two safetensors repos fetch whole.
+  EXPECT_TRUE(catalog_by_path("Qwen/Qwen3.8-27B")->files.empty());
+  EXPECT_TRUE(
+      catalog_by_path("lmstudio-community/Qwen3.8-27B-MLX-4bit")
+          ->files.empty());
+  // TWO GGUF rows share the repo -- one per quantization point -- so the
+  // by-path lookup answers with the first (documented) and the caller
+  // that must not take the wrong one asks for all of them.
+  auto gs = catalog_all_by_path("unsloth/Qwen3.8-27B-GGUF");
+  EXPECT_TRUE(gs.size() == 2);
+  const ModelCatalogEntry* g = catalog_by_path("unsloth/Qwen3.8-27B-GGUF");
+  EXPECT_TRUE(g == gs[0]);
+  const char* quants[] = {"Qwen3.8-27B-Q4_K_M.gguf", "Qwen3.8-27B-Q8_0.gguf"};
+  for (std::size_t i = 0; i < gs.size() && i < 2; ++i) {
+    EXPECT_TRUE(gs[i]->files.size() == 2);
+    EXPECT_TRUE(gs[i]->files[0] == quants[i]);
+    // The F16 projector, NOT the BF16 one: they differ in how
+    // v.patch_embd.weight is stored (F16 vs F32) and the tower reads both.
+    EXPECT_TRUE(has_(gs[i]->files, "mmproj-F16.gguf"));
+    EXPECT_FALSE(has_(gs[i]->files, "mmproj-BF16.gguf"));
+  }
+}
+
+// It is a VLM, so the derived modalities take images and video in and
+// text out -- the same defaulting the 3.5/3.6 entries rely on.
+TEST(model_catalog, qwen38_io_modalities) {
+  std::vector<std::string> in, out;
+  catalog_default_io("qwen3.5", in, out);
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_TRUE(has_(in, "video"));
+  EXPECT_TRUE(out.size() == 1 && out[0] == "text");
+}
+
 // The Qwen3.6 27B GGUF entry pins the main quant + mmproj + imatrix.
 TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   const ModelCatalogEntry* e =

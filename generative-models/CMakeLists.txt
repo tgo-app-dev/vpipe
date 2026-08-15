@@ -17,6 +17,9 @@ set(LOCAL_SOURCES
   loaded-language-model.cc
   metal-token-muxer.cc
   model-exec-registry.cc
+  vae-model-registry.cc
+  video-model-registry.cc
+  hidden-state-encoder.cc
   model-loader.cc
   sampler.cc
   tokenizer.cc
@@ -34,6 +37,7 @@ set(LOCAL_SOURCES
   shared/kernel-sets/decode-gqa-attn-set.cc
   shared/kernel-sets/prefill-gqa-attn-set.cc
   shared/whisper-feature-extractor.cc
+  gemma4/gemma-hidden-state-encoder.cc
   gemma4/gemma4-audio-feature-extractor.cc
   gemma4/gemma4-unified-embedder.cc
   gemma4/metal-gemma-model.cc
@@ -103,6 +107,8 @@ set(LOCAL_HEADERS
   metal-token-muxer.h
   model-exec.h
   model-exec-registry.h
+  vae-model-registry.h
+  video-model-registry.h
   model-loader.h
   sampler.h
   token-muxer.h

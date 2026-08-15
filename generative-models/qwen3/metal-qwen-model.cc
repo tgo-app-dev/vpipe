@@ -1166,6 +1166,11 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_kquant = probe != nullptr &&
         (probe->dtype == "Q4K" || probe->dtype == "Q5K" ||
          probe->dtype == "Q6K");
+    // GDN v-head order follows the FILE, not the quantization -- see
+    // _gdn_strided_v. Every GGUF is strided; an all-Q8_0 one is repacked
+    // to affine and so is NOT _kquant, which is why this is a separate
+    // probe rather than a reuse of the flag above.
+    m->_gdn_strided_v = wts != nullptr && wts->is_gguf();
   }
   // Unquantized dense (raw-HF bf16/f16) detection: a representative linear has
   // a `.weight` but NO `.scales` (the affine triple). Probe the last layer's
@@ -3547,11 +3552,12 @@ MetalQwenModel::encode_decode_step_(
       enc.set_buffer(6, _d_ygdn);
       enc.set_buffer(7, *ss_w);
       enc.set_constant(8, one);
-      // Negative Hk selects strided GQA (hk = hv % Hk): the GGUF (llama.cpp)
-      // stores GDN v-heads de-interleaved [0,2,..,30,1,3,..,31], vs the HF/
-      // safetensors interleaved order that the contiguous mapping
-      // (hk = hv / (Hv/Hk)) assumes. No-op when Hv == Hk (2B).
-      enc.set_constant(9, _kquant ? -Hk : Hk);
+      // Negative Hk selects strided GQA (hk = hv % Hk): a GGUF stores its
+      // GDN v-heads strided over the key heads, where HF/safetensors
+      // groups them contiguously (hk = hv / (Hv/Hk)), which is what the
+      // positive form assumes. No-op when Hv == Hk (2B). Keyed on the
+      // FILE FORMAT, not the quantization -- see _gdn_strided_v.
+      enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
       enc.set_constant(10, Hv);
       GREP(4, {32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
       enc.set_function(_fn_gdn_gated_rms);
@@ -4695,7 +4701,8 @@ MetalQwenModel::encode_batched_step_(
           enc.set_buffer(6, bs.ygdn, (std::size_t)i * vald * 2);
           enc.set_buffer(7, *ss);
           enc.set_constant(8, one);
-          enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
+          // strided GQA for a GGUF -- see _gdn_strided_v
+          enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
           enc.set_constant(10, Hv);
           enc.dispatch({32, (unsigned)Dv, (unsigned)Hv}, {32, 4, 1});
         }
@@ -6648,7 +6655,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         enc.set_buffer(6, ygdn);
         enc.set_buffer(7, *ssb);
         enc.set_constant(8, n);                       // T = n
-        enc.set_constant(9, _kquant ? -Hk : Hk);      // strided GQA for GGUF
+        // strided GQA for a GGUF -- see _gdn_strided_v
+        enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
         enc.set_constant(10, Hv);
         const unsigned gdn_dvy = gdn4 ? (unsigned)(Dv / 4) : (unsigned)Dv;
         if (kSkipMode != 2) {     // VPIPE_QWEN_SKIP_ATTN=gdn step probe
@@ -7698,7 +7706,7 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
             enc.set_buffer(6, ygdn, (std::size_t)p * vald * 2);
             enc.set_buffer(7, *sw);
             enc.set_constant(8, 1);
-            enc.set_constant(9, _kquant ? -Hk : Hk);
+            enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
             enc.set_constant(10, Hv);
             enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
           }
@@ -7723,7 +7731,8 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
           enc.set_buffer(4, betabuf_c); enc.set_buffer(5, *ssb);
           enc.set_buffer(6, ygdn); enc.set_buffer(7, *ssb);
           enc.set_constant(8, n);
-          enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
+          // strided GQA for a GGUF -- see _gdn_strided_v
+          enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
           enc.set_constant(10, Hv);
           enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});
         }
@@ -8123,7 +8132,8 @@ MetalQwenModel::gdn_replay_(ContextId cid, int keep, const GdnVerifyCache& gc)
       enc.set_buffer(4, gc.betabuf[gi]); enc.set_buffer(5, *ssb);
       enc.set_buffer(6, ygdn); enc.set_buffer(7, *ssb);
       enc.set_constant(8, keep);
-      enc.set_constant(9, _kquant ? -Hk : Hk);   // strided GQA for GGUF
+      // strided GQA for a GGUF -- see _gdn_strided_v
+      enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);
       enc.set_constant(10, Hv);
       const unsigned gdn_dvy = gdn4 ? (unsigned)(Dv / 4) : (unsigned)Dv;
       enc.dispatch({32, gdn_dvy, (unsigned)Hv}, {32, 4, 1});

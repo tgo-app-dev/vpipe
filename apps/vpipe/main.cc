@@ -41,6 +41,7 @@
 
 #include "common/flex-data.h"
 #include "common/session.h"
+#include "plugin/plugin-manager.h"
 #include "stages/model-catalog.h"
 #include "ui/ui-view-registry.h"
 #include "common/stdio-ui-delegate.h"
@@ -437,13 +438,37 @@ run(int argc, char** argv)
       std::printf("%s\n", arr.to_json().c_str());
       return 0;
     } else if (a == "--list-models") {
-      // Before any session is created: this reads a static table and
-      // must not pay for -- or be able to fail because of -- LMDB, the
-      // model manager or a plugin load.
+      // Before any SESSION is created: this must not pay for -- or be
+      // able to fail because of -- LMDB or the model manager.
       //
-      // The catalogue is the single source of what a front end may
-      // offer. Copying these entries into a GUI is how a picker comes
-      // to list a model the stages cannot actually fetch.
+      // Plugins are the exception, and they have to be. The catalogue is
+      // the single source of what a front end may offer, and a plugin
+      // can now contribute entries to it (register_catalog_entries), so
+      // a listing that skipped plugins would tell a picker that a model
+      // the very same command line just loaded does not exist. That is
+      // the failure this flag exists to prevent, pointed the other way.
+      //
+      // Loading is still cheap and session-free: a dlopen and the
+      // plugin's own register call, with a null session (every
+      // registration path tolerates one -- it is used for logging).
+      // argv is PRE-SCANNED because --plugin may appear after this flag
+      // and this branch returns without finishing the parse.
+      {
+        std::vector<std::string> pre;
+        if (const char* env = std::getenv("VPIPE_PLUGINS")) {
+          std::stringstream ss(env);
+          std::string one;
+          while (std::getline(ss, one, ':')) {
+            if (!one.empty()) { pre.push_back(one); }
+          }
+        }
+        for (int j = 1; j < argc; ++j) {
+          if (std::string(argv[j]) == "--plugin" && j + 1 < argc) {
+            pre.push_back(argv[j + 1]);
+          }
+        }
+        if (!pre.empty()) { PluginManager::get().load_all(nullptr, pre); }
+      }
       FlexData arr = FlexData::make_array();
       auto     out = arr.as_array();
       for (const ModelCatalogEntry& e : model_catalog()) {

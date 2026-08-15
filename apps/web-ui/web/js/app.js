@@ -12,6 +12,7 @@ import { mountFileBrowser } from './views/file-browser.js';
 import { mountComposer } from './views/composer.js';
 import { mountProfiler } from './views/profiler.js';
 import { mountSettings } from './views/settings.js';
+import { mountPlugins } from './views/plugins.js';
 import { mountStatusBar } from './status-bar.js';
 import { isPhoneUi, isPhoneDevice, uiModeOverride, setUiMode }
   from './ui-mode.js';
@@ -163,6 +164,8 @@ const VIEWS = [
     mount: mountFileBrowser },
   { id: 'composer', labelKey: 'nav.composer', icon: 'composer',
     mount: mountComposer },
+  { id: 'plugins', labelKey: 'nav.plugins', icon: 'plugin',
+    mount: mountPlugins },
 ];
 const SETTINGS = { id: 'settings', labelKey: 'nav.settings', icon: 'settings',
   mount: mountSettings };

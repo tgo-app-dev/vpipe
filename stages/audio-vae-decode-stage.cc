@@ -152,8 +152,16 @@ AudioVaeDecodeStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  return model_memory::weight_claims(
-      {genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root)});
+  const std::string vae_dir =
+      genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  // The registry, not `_vae_family`: this is const and runs before
+  // ensure_loaded_ has latched anything.
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, vae_dir,
+          resolve_model(session(), _hf_dir).model_type)) {
+    return f->declare_resources(root, vae_dir);
+  }
+  return model_memory::weight_claims({vae_dir});
 }
 
 void
@@ -161,6 +169,7 @@ AudioVaeDecodeStage::unload_vae_()
 {
   if (!_h3_vae) { return; }
   _h3_vae.reset();
+  _plugin_dec.reset();
   _unloaded = true;
   session()->log_debug(fmt(
       "AudioVaeDecodeStage('{}'): audio VAE unloaded (idle)", this->id()));
@@ -196,6 +205,53 @@ AudioVaeDecodeStage::ensure_loaded_()
   const std::string root = resolve_model_dir(session(), _hf_dir);
   const std::string vae_dir =
       genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  // An out-of-tree family FIRST, and before audio_vae_family_ below:
+  // that resolver looks for `audio_vae/config.json`, which a Comfy-style
+  // pack does not have -- LTX-2.5 keeps its audio VAE as a bare
+  // `vae/*audio-vae*.safetensors` with the config in `__metadata__`.
+  if (!_family_probed) {
+    _family_probed = true;
+    _vae_family = genai::VaeModelRegistry::get().claim_for(
+        session(), root, vae_dir,
+        resolve_model(session(), _hf_dir).model_type);
+  }
+  if (_vae_family != nullptr) {
+    _family = std::string(_vae_family->tag());
+    genai::VaeModelCreateArgs args;
+    args.root       = root;
+    args.vae_dir    = vae_dir;
+    args.model_type = resolve_model(session(), _hf_dir).model_type;
+    args.metal      = mc;
+    args.session    = session();
+    try {
+      _plugin_dec = _vae_family->load_audio_decoder(args);
+    } catch (const std::exception& e) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): VAE family '{}' threw loading '{}': "
+          "{}; inert", this->id(), _family, root, e.what()));
+      return;
+    } catch (...) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): VAE family '{}' threw a non-standard "
+          "exception loading '{}'; inert", this->id(), _family, root));
+      return;
+    }
+    if (!_plugin_dec) {
+      // The family declined -- it generates no soundtrack, or has not
+      // ported its audio VAE. Either way the stage stays inert rather
+      // than emitting silence.
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): family '{}' has no audio decoder; "
+          "inert", this->id(), _family));
+      return;
+    }
+    session()->info(fmt(
+        "AudioVaeDecodeStage('{}'): audio VAE family '{}' loaded ({} Hz, "
+        "{:.1f} MB)", this->id(), _family, _plugin_dec->sample_rate(),
+        (double)_plugin_dec->resident_bytes() / (1024.0 * 1024.0)));
+    return;                        // NOT the built-in chain below
+  }
+
   _family = audio_vae_family_(vae_dir);
   if (_family.empty()) {
     session()->error(fmt(
@@ -303,6 +359,93 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
   auto in = co_await ctx.read(0);
   if (!in) { ctx.signal_done(); co_return; }
   if (_unloaded) { reload_vae_(); }
+
+  // ---- an out-of-tree family --------------------------------------------
+  //
+  // Guarded on the POINTER and placed before the built-in branch, so a
+  // family that tagged itself like a built-in still cannot fall through.
+  // The FAMILY owns un-whitening, the vocoder and the sample rate; the
+  // stage keeps the port, the beat and the sideband -- the same split
+  // vae-decode draws.
+  if (_vae_family != nullptr) {
+    const auto* atb = dynamic_cast<const TensorBeatPayload*>(in.get());
+    if (!_plugin_dec) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): family '{}' has no audio decoder; "
+          "skipping", this->id(), _family));
+      co_return;
+    }
+    if (atb == nullptr || atb->dtype != TensorBeat::DType::F32 ||
+        atb->shape.size() != 3) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): expected an f32 3-D latent, got {}; "
+          "skipping", this->id(), in->describe()));
+      co_return;
+    }
+    genai::AudioVaeDecodeRequest areq;
+    areq.latent = atb->as_f32();
+    areq.shape.reserve(atb->shape.size());
+    for (std::int64_t d : atb->shape) { areq.shape.push_back((int)d); }
+    areq.sideband = &atb->sideband;
+    if (atb->sideband.is_object()) {
+      FlexData sb = atb->sideband;          // as_object() is a view
+      auto o = sb.as_object();
+      if (o.contains("latents_per_second")) {
+        areq.latents_per_second = o.at("latents_per_second").as_real(0.0);
+      }
+    }
+    areq.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+
+    std::vector<float> apcm;
+    std::vector<int> ashape;
+    std::string aerr;
+    bool aok = false;
+    try {
+      aok = _plugin_dec->decode(areq, &apcm, &ashape, &aerr);
+    } catch (const std::exception& e) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): family '{}' threw decoding: {}; "
+          "skipping", this->id(), _family, e.what()));
+      co_return;
+    } catch (...) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): family '{}' threw a non-standard "
+          "exception decoding; skipping", this->id(), _family));
+      co_return;
+    }
+    if (!aok || ashape.size() != 2) {
+      session()->warn(fmt(
+          "AudioVaeDecodeStage('{}'): decode failed ({}); skipping",
+          this->id(), aerr.empty() ? "unknown error" : aerr));
+      co_return;
+    }
+    const int ach = ashape[0], asamp = ashape[1];
+    const int arate = _plugin_dec->sample_rate();
+    auto aout = std::make_unique<TensorBeatPayload>();
+    aout->dtype = TensorBeat::DType::F32;
+    aout->shape = {(std::int64_t)ach, (std::int64_t)asamp};
+    aout->resize_contiguous(apcm.size());
+    std::memcpy(aout->as_f32(), apcm.data(), apcm.size() * sizeof(float));
+    {
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign(
+          "sample_rate", FlexData::make_int((std::int64_t)arate));
+      sb.as_object().insert_or_assign(
+          "channels", FlexData::make_int((std::int64_t)ach));
+      sb.as_object().insert_or_assign(
+          "samples", FlexData::make_int((std::int64_t)asamp));
+      aout->sideband = std::move(sb);
+    }
+    ++_clips;
+    session()->info(fmt(
+        "AudioVaeDecodeStage('{}'): family '{}' decoded clip #{} -- {} x {} "
+        "samples ({:.2f} s at {} Hz)", this->id(), _family, _clips, ach,
+        asamp, arate > 0 ? (double)asamp / arate : 0.0, arate));
+    if (_unload_idle) { unload_vae_(); }
+    co_await ctx.write(0, std::move(aout));
+    co_return;
+  }
+
   if (!_h3_vae) {
     session()->warn(fmt(
         "AudioVaeDecodeStage('{}'): no audio VAE loaded; skipping",

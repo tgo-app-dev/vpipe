@@ -12,6 +12,7 @@
 
 namespace vpipe {
 class SessionContextIntf;
+class FlexData;
 }
 
 namespace vpipe::genai {
@@ -354,6 +355,19 @@ public:
   // family. Returns nullopt if config.json is missing or malformed.
   std::optional<ModelConfig>
   load_config(std::string_view hf_dir) const;
+
+  // The same parse, on a config that is ALREADY IN HAND rather than on
+  // disk. Comfy-style packs carry theirs in the safetensors
+  // `__metadata__` and ship no config.json at all -- LTX-2.5's Gemma-4
+  // text encoder is one file with the config nested under a
+  // `gemma_config` key -- so a caller that has unwrapped it needs a way
+  // in that does not involve writing a temporary file.
+  //
+  // Static because it reads nothing but `cfg`: no session, no directory,
+  // no preprocessor sidecar. A VLM's image mean/std come from that
+  // sidecar and so are NOT filled here; a caller that needs them uses
+  // load_config().
+  static std::optional<ModelConfig> parse_config(const vpipe::FlexData& cfg);
 };
 
 }

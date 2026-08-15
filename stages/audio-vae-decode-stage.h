@@ -7,6 +7,7 @@
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "stages/model-memory.h"
+#include "generative-models/vae-model-registry.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 #endif
 
@@ -79,6 +80,16 @@ private:
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   std::unique_ptr<genai::MetalMiniMaxH3AudioVae> _h3_vae;
+
+  // ---- an out-of-tree family (VaeModelRegistry) -------------------------
+  // The SAME registry `vae-decode` consults -- a family that generates
+  // both modalities answers for both, so this is load_audio_decoder() on
+  // VaeModelFamily rather than a second registry. BORROWED; the registry
+  // outlives every stage. Dispatch below is guarded on the POINTER, not
+  // on the `_family` string.
+  genai::VaeModelFamily*                  _vae_family = nullptr;
+  std::unique_ptr<genai::AudioVaeDecoder> _plugin_dec;
+  bool _family_probed = false;
 
   void ensure_loaded_();
 

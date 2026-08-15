@@ -52,6 +52,9 @@ struct ConvertedTensorSpec {
     kFloatPass,     // f32/f16/bf16/q8_0 source -> f32 (norms, a/b, conv, dt)
     kKQuantRaw,     // any k-quant source -> raw k-quant bytes (Qwen native)
     kSsmALog,       // f32 ssm_a (= -exp(A_log)) -> A_log = log(-ssm_a)
+    kQ8Weight,      // q8_0 source -> affine8 g64 packed u32 codes
+    kQ8Scales,      // q8_0 source -> affine8 g64 scales (f16)
+    kQ8Biases,      // q8_0 source -> affine8 g64 biases (f16)
   };
   std::string               hf_name;
   std::string               dtype;     // "U32"/"F16"/"F32"/"Q4K"/"Q5K"/"Q6K"
@@ -60,6 +63,26 @@ struct ConvertedTensorSpec {
   std::string               gguf_name;
   Op                        op = Op::kFloatPass;
 };
+
+// A NOTE ON GDN VALUE-HEAD ORDER, because it looks like a bug and is not.
+//
+// Every v-head-indexed gated-DeltaNet tensor -- the v slice of
+// `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_a`,
+// `ssm_dt.bias`, the v slice of `ssm_conv1d`, and `ssm_out`'s input
+// columns -- is written by llama.cpp STRIDED over the key heads: GGUF
+// v-head `j * n_k + k` is HF v-head `k * (n_v / n_k) + j`. Reading one
+// of them in GGUF order and comparing against the HF original therefore
+// lands ~1.3 rel-L2 away, which reads as a layout bug.
+//
+// It is not one, and these tensors are deliberately NOT reordered here.
+// The metal GDN step kernel takes a negative key-head count to switch to
+// the strided mapping (`hk = hv % Hk`), and MetalQwenModel sets that for
+// any GGUF -- so the checkpoint is consumed in its own order, whole.
+// Reordering a SUBSET (the four per-head scalars are the tempting ones,
+// being the only tensors where the permutation is visible in isolation)
+// pairs those heads with the wrong key head. MEASURED on Qwen3.8-27B:
+// doing exactly that took the Q4_K_M layer-0 residual from 0.011 to
+// 0.071 rel vs the same model quantized from HF.
 
 // Polymorphic GGUF->vpipe tensor converter. open_model() picks the
 // arch-specific implementation; MetalLlamaWeights drives it uniformly

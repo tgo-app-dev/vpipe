@@ -5,6 +5,8 @@
 // single user turn.
 
 #include "minitest.h"
+
+#include <algorithm>
 #include "generative-models/chat-template.h"
 #include "generative-models/tokenizer.h"
 #include "common/flex-data.h"
@@ -374,6 +376,160 @@ TEST(llm_chat_template, qwen3_disable_thinking_override_flips_preamble)
   auto off_ids = tok->encode("<think>\n\n</think>\n\n");
   auto on_ids  = tok->encode("<think>\n");
   EXPECT_TRUE(c.size() == b.size() + off_ids.size() - on_ids.size());
+}
+
+// ---- reasoning effort (Qwen3.8's chat-template control) -------------
+//
+// The WORDING is the contract -- it is what the checkpoint was tuned
+// against -- so it is asserted as text, through reasoning_instructions().
+// The synthetic ChatML tokenizer here has no capitals and no
+// punctuation, so decoding the rendered ids back would check nothing;
+// the token stream is asserted structurally instead.
+TEST(llm_chat_template, qwen3_reasoning_effort_emits_system_turn)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+
+  // Thinking must be ON: the reference gates the whole block on it.
+  auto xhigh = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok,
+      /*disable_thinking=*/std::optional<bool>(false), "xhigh");
+  auto low = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok,
+      /*disable_thinking=*/std::optional<bool>(false), "low");
+  if (!xhigh || !low) { return; }
+
+  // Verbatim from the published chat_template.jinja.
+  EXPECT_TRUE(xhigh->reasoning_instructions() ==
+      "Reasoning effort is set to xhigh. Please think carefully through "
+      "the task, validate key assumptions, consider plausible "
+      "alternatives, and prioritize correctness, consistency, and "
+      "clarity in the final answer.");
+  EXPECT_TRUE(low->reasoning_instructions() ==
+      "Reasoning effort is set to low. Keep your thinking brief and "
+      "focused, moving directly to the conclusion without unnecessary "
+      "elaboration.");
+
+  vector<int32_t> a, b;
+  EXPECT_TRUE(xhigh->render_reasoning_system_turn(&a));
+  EXPECT_TRUE(low->render_reasoning_system_turn(&b));
+  EXPECT_TRUE(!a.empty());
+  EXPECT_TRUE(!b.empty());
+  EXPECT_TRUE(a != b);
+
+  // One complete system turn: <|im_start|>system\n{text}<|im_end|>\n.
+  const int32_t im_start = tok->special_token_id("<|im_start|>");
+  const int32_t im_end   = tok->special_token_id("<|im_end|>");
+  EXPECT_TRUE(a.front() == im_start);
+  EXPECT_TRUE(std::count(a.begin(), a.end(), im_start) == 1);
+  EXPECT_TRUE(std::count(a.begin(), a.end(), im_end) == 1);
+  // Body == header + the instruction's own tokens + the closer.
+  vector<int32_t> want;
+  want.push_back(im_start);
+  for (int32_t id : tok->encode("system\n"))      { want.push_back(id); }
+  for (int32_t id : tok->encode(
+           std::string(xhigh->reasoning_instructions()))) {
+    want.push_back(id);
+  }
+  want.push_back(im_end);
+  for (int32_t id : tok->encode("\n"))            { want.push_back(id); }
+  EXPECT_TRUE(a == want);
+}
+
+// Three ways to get NO instruction, and they must all render alike:
+// unset, "medium" (which the reference itself leaves un-instructed),
+// and any effort at all while thinking is off.
+TEST(llm_chat_template, qwen3_reasoning_effort_silent_cases)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto mk = [&](bool think_off, const char* effort) {
+    return genai::make_chat_template(
+        "Qwen3_5ForConditionalGeneration", *tok,
+        std::optional<bool>(think_off), effort);
+  };
+  auto unset  = mk(false, "");
+  auto medium = mk(false, "medium");
+  auto off    = mk(true,  "xhigh");   // thinking off beats the effort
+  if (!unset || !medium || !off) { return; }
+
+  vector<int32_t> a, b, c;
+  EXPECT_FALSE(unset->render_reasoning_system_turn(&a));
+  EXPECT_FALSE(medium->render_reasoning_system_turn(&b));
+  EXPECT_FALSE(off->render_reasoning_system_turn(&c));
+  EXPECT_TRUE(a.empty() && b.empty() && c.empty());
+
+  // And the user turn is byte-identical to a build that never heard of
+  // reasoning effort -- this is what keeps 3.5 / 3.6 pipelines unchanged.
+  auto plain = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok,
+      std::optional<bool>(false));
+  if (!plain) { return; }
+  vector<int32_t> p, m;
+  plain ->render_user_turn("hello", true, &p);
+  medium->render_user_turn("hello", true, &m);
+  EXPECT_TRUE(p == m);
+}
+
+// With tools on, the instruction and the tool advertisement must arrive
+// as ONE system turn -- the model was not trained to read two in a row.
+TEST(llm_chat_template, qwen3_reasoning_effort_merges_into_tools_turn)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok,
+      std::optional<bool>(false), "xhigh");
+  auto plain = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok,
+      std::optional<bool>(false));
+  if (!tpl || !plain) { return; }
+
+  const char* tools = "{\"name\": \"get_current_time\"}";
+  vector<int32_t> withr, without;
+  EXPECT_TRUE(tpl->render_tools_system_turn(tools, true, &withr));
+  EXPECT_TRUE(plain->render_tools_system_turn(tools, true, &without));
+
+  // ONE system turn: the open/close appear exactly once, so the
+  // instruction did NOT arrive as a second turn.
+  const int32_t im_start = tok->special_token_id("<|im_start|>");
+  const int32_t im_end   = tok->special_token_id("<|im_end|>");
+  EXPECT_TRUE(std::count(withr.begin(), withr.end(), im_start) == 1);
+  EXPECT_TRUE(std::count(withr.begin(), withr.end(), im_end) == 1);
+
+  // Exactly the plain tools turn with the instruction spliced in after
+  // the `<|im_start|>system\n` header -- an ADDITION, not a rewrite, and
+  // ahead of the tool block as the published template composes them.
+  vector<int32_t> head;
+  head.push_back(im_start);
+  for (int32_t id : tok->encode("system\n")) { head.push_back(id); }
+  vector<int32_t> want(head.begin(), head.end());
+  for (int32_t id : tok->encode(
+           std::string(tpl->reasoning_instructions()) + "\n\n")) {
+    want.push_back(id);
+  }
+  want.insert(want.end(), without.begin() + (long)head.size(),
+              without.end());
+  EXPECT_TRUE(withr == want);
+  EXPECT_TRUE(withr.size() > without.size());
+}
+
+// Families with no reasoning-effort concept ignore it rather than
+// failing, so a caller can pass one uniformly.
+TEST(llm_chat_template, reasoning_effort_ignored_off_family)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto qwen2 = genai::make_chat_template("Qwen2ForCausalLM", *tok,
+                                         std::nullopt, "xhigh");
+  if (!qwen2) { return; }
+  vector<int32_t> a;
+  EXPECT_FALSE(qwen2->render_reasoning_system_turn(&a));
+  EXPECT_TRUE(a.empty());
 }
 
 TEST(llm_chat_template, chatml_qwen3_stop_and_close_match_chatml)

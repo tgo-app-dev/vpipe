@@ -64,6 +64,7 @@ SessionApi::register_routes(HttpServer& s)
   _files.register_routes(s);
   _io.register_routes(s);
   _logs.register_routes(s);
+  _plugins.register_routes(s);
   _profiler.register_routes(s);
   _system.register_routes(s);
   _views.register_routes(s);

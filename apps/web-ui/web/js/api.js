@@ -181,6 +181,12 @@ async function ndjsonStream(url, body, cbs, signal, retried) {
 export const api = {
   health:        ()        => req('GET',  '/api/health'),
   stageTypes:    ()        => req('GET',  '/api/stage-types'),
+  // Plugins: discovery + the two actions a session may take. There is no
+  // unload -- see views/plugins.js.
+  plugins:       ()        => req('GET',  '/api/plugins'),
+  pluginLoad:    (path)    => req('POST', '/api/plugins/load', { path }),
+  pluginEnabled: (name, on) => req('POST', '/api/plugins/enabled',
+                                   { name, on }),
   listPipelines: ()        => req('GET',  '/api/pipelines'),
   createPipeline:(id)      => req('POST', '/api/pipelines', { id }),
   renamePipeline:(id, to)  => req('POST',

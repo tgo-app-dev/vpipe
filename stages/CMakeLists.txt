@@ -10,6 +10,7 @@ set(LOCAL_SOURCES
   buffer-stage.cc
   call-stage.cc
   chrono-stage.cc
+  load-audio-stage.cc
   load-image-stage.cc
   load-text-stage.cc
   load-video-stage.cc
@@ -32,6 +33,7 @@ set(LOCAL_SOURCES
   diffusion-conditioner-stage.cc
   generate-image-stage.cc
   audio-vae-decode-stage.cc
+  audio-vae-encode-stage.cc
   vae-decode-stage.cc
   vae-encode-stage.cc
   video-ref-encoder-stage.cc
@@ -66,6 +68,7 @@ set(LOCAL_HEADERS
   buffer-stage.h
   call-stage.h
   chrono-stage.h
+  load-audio-stage.h
   load-image-stage.h
   load-text-stage.h
   load-video-stage.h

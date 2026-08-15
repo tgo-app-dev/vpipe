@@ -1,0 +1,286 @@
+#ifndef VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
+#define VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
+
+#include "common/flex-data.h"
+#include "pipeline/resource-plan.h"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace vpipe {
+class SessionContextIntf;
+namespace metal_compute { class MetalCompute; }
+}
+
+namespace vpipe::genai {
+
+// An out-of-tree VIDEO model family, for `generate-video`.
+//
+// WHY THIS IS NOT A VIRTUAL BASE OVER THE DiTs. generate-video holds its
+// two built-in denoisers side by side rather than behind one base, and
+// the reason is written down in its header: Wan takes a 4-D latent with
+// one timestep, MiniMax-H3 takes a packed sequence with per-row
+// timesteps, and an interface wide enough for both describes neither.
+// That argument is about the PER-STEP forward, and it still holds -- so
+// this interface is not drawn there.
+//
+// It is drawn one level up, at the GENERATION. Every video family
+// answers the same question -- given conditioning, geometry, a step
+// count and a seed, produce a latent video and (for the families that
+// have one) a latent soundtrack -- and the built-in H3 branch already
+// has exactly that shape internally (`run_h3_`). A family owns its whole
+// denoise loop: its scheduler, its guidance rule, its residency policy,
+// its patchify/unpatchify. The stage owns the ports, the beats and the
+// geometry bookkeeping. Nothing about a step is in the contract, so a
+// family whose step looks like nothing else here still fits.
+//
+// The registry is consulted BEFORE the built-in wan / minimax-h3
+// dispatch, mirroring how LoadedLanguageModel consults ModelExecRegistry
+// before its built-in arch if-chain (see model-exec-registry.h). The
+// built-in families are unchanged and unregistered: this adds a path,
+// it does not reroute the existing ones.
+
+// One generation's inputs. Every pointer is BORROWED from a beat that
+// outlives the call; nothing here is owned.
+struct VideoGenRequest {
+  // ---- geometry, after the stage applied the family's frame rule ----
+  int           height = 0;      // pixels, multiple of 16
+  int           width  = 0;
+  int           frames = 0;      // already aligned by align_frames()
+  double        fps    = 16.0;
+  int           steps  = 0;
+  std::uint64_t seed   = 0;
+
+  // ---- conditioning (iport0 / iport1) -------------------------------
+  // Raw bf16 rows as the diffusion-conditioner emitted them, plus the
+  // beat's sideband -- which is where a family that splits one request
+  // over several beats (H3's ref2va geometry) puts the plan.
+  const void*     cond      = nullptr;   // bf16 [cond_rows, cond_dim]
+  int             cond_rows = 0;
+  int             cond_dim  = 0;
+  const FlexData* cond_sideband = nullptr;
+  // OPTIONAL negative conditioning for classifier-free guidance. Null on
+  // a guidance-distilled family, or when the graph wired none -- a
+  // family that needs one and did not get it must say so and refuse,
+  // not silently generate unguided.
+  const void*     neg       = nullptr;
+  int             neg_rows  = 0;
+
+  // ---- OPTIONAL second-modality conditioning (iport10) --------------
+  // An AUDIO cross-attention context, for the families that generate a
+  // soundtrack from its own projection of the caption rather than from
+  // the video context. Null when the graph wired none, which for such a
+  // family means video-only -- and a family that wants one must SAY so
+  // and fall back, not invent a zero context, because a zero context is
+  // conditioning that says something (silence) rather than nothing.
+  //
+  // Separate from `cond` because it is a different WIDTH from a
+  // different projection: LTX-2.5 is 4096 video / 2048 audio out of the
+  // same hidden states. Packing both into one beat would make the split
+  // a convention rather than a type.
+  const void*     audio_cond      = nullptr;   // bf16 [rows, dim]
+  int             audio_cond_rows = 0;
+  int             audio_cond_dim  = 0;
+
+  // ---- optional conditioning latents (iport5 / iport6) --------------
+  // f32, as a vae-encode emitted them (already whitened). `ref` is the
+  // first-frame / image-to-video latent, `ref_last` the closing anchor.
+  // Shapes are the encoder's, NOT normalised here: a family that wants
+  // [z, T, h, w] and got something else knows its own rule.
+  const float*            ref = nullptr;
+  std::vector<int>        ref_shape;
+  const float*            ref_last = nullptr;
+  std::vector<int>        ref_last_shape;
+
+  // ---- optional reference rows (iport7 / iport8) --------------------
+  const float*     ref_video_rows   = nullptr;
+  int              n_ref_video_rows = 0;
+  int              ref_video_dim    = 0;
+  const float*     ref_audio_rows   = nullptr;
+  int              n_ref_audio_rows = 0;
+  int              ref_audio_dim    = 0;
+
+  // ---- the family's own knobs (iport9), UNPARSED --------------------
+  // Passed down exactly as the config source emitted it, so a knob added
+  // later needs no change in generate-video. Null / non-object means the
+  // graph wired no config source and the family runs its documented
+  // defaults. See stages/model-config-source.h.
+  const FlexData* model_config = nullptr;
+
+  // Sampler / scheduler selections (iport3 / iport4) when the graph made
+  // one, else empty -- a family reads what it understands and ignores
+  // the rest, the way the built-ins do.
+  const FlexData* sampler_spec   = nullptr;
+  const FlexData* scheduler_spec = nullptr;
+
+  // Returns false to ABORT the generation (the pipeline is stopping).
+  // Called between steps; a family that never calls it cannot be
+  // interrupted, which on a 22B model means a Stop that takes minutes.
+  std::function<bool(int step, int total)> progress;
+};
+
+// What a generation produced. A family that generates no audio simply
+// leaves the audio fields empty -- an unconnected oport1 is not an error.
+struct VideoGenResult {
+  std::vector<float> video;        // f32, row-major over `video_shape`
+  std::vector<int>   video_shape;  // [z, T, H/r, W/r]
+  std::vector<float> audio;        // f32 [stereo, channels, latents]
+  std::vector<int>   audio_shape;
+  double latents_per_second = 0.0; // stamped on the audio beat
+};
+
+// ONE resident checkpoint of a family. Built by VideoModelFamily::load()
+// and held by the stage for as long as that checkpoint is the model.
+class VideoGenerator {
+public:
+  virtual ~VideoGenerator() = default;
+
+  // The latent geometry this checkpoint emits, for the log line the
+  // stage writes before it spends minutes generating. The SHAPE the
+  // stage publishes is the one `generate` returns, never these -- a
+  // family that mispredicts its own geometry should produce a confusing
+  // log, not a mislabelled beat.
+  virtual int latent_channels() const = 0;
+  virtual int spatial_compression() const = 0;
+
+  // Run one generation. False means it warned and produced nothing --
+  // the stage then writes no beat, which is what every refusal in this
+  // graph does. Never throws across this boundary; a family that lets an
+  // exception out takes the host down with it.
+  virtual bool generate(const VideoGenRequest& req, VideoGenResult* out) = 0;
+
+  // Drop what can be dropped between requests. Called when the stage's
+  // idle-unload policy resolved to `always`, or when a peer needs the
+  // room. A family with nothing to release does nothing.
+  virtual void release_idle() {}
+
+  // Bytes this generator is currently holding, for the model manager's
+  // session-wide view. 0 when the family cannot answer cheaply -- but a
+  // family whose weights are invisible to a WeightSet (because it read
+  // them uncached, like every LM does) SHOULD answer, or the graph sizes
+  // itself against a checkpoint it cannot see. See
+  // docs/MODEL-MEMORY.md, "Declarations".
+  virtual std::uint64_t resident_bytes() const { return 0; }
+};
+
+// Everything a family's `load` receives. Mirrors ModelExecCreateArgs.
+struct VideoModelCreateArgs {
+  std::string                  root;        // the resolved checkpoint dir
+  std::string                  model_type;  // the models-DB record's hint,
+                                            // empty when there is none
+  metal_compute::MetalCompute* metal   = nullptr;
+  const SessionContextIntf*    session = nullptr;
+  // The stage's residency verdict, so a family need not re-derive it:
+  // true means "the box is tight, stream your blocks". A family is free
+  // to disagree -- it knows its own sizes -- but it should say so.
+  bool                         prefer_streaming = false;
+
+  // The `model_config` beat, for the keys a family must answer BEFORE it
+  // has a model -- null when no config stage is wired.
+  //
+  // VideoGenRequest carries this too, and that is the one to read for
+  // anything per-generation. This copy exists for the strictly smaller
+  // set of keys that decide WHAT TO LOAD, which the request sees too
+  // late: by then the checkpoint is chosen and, for a streamed DiT,
+  // irrevocably so.
+  //
+  // The case that forced it: a family whose root holds more than one DiT
+  // (LTX-2.5 ships `distilled` and `dev`, and a quantized pack may sit
+  // beside either). Its config stage declared a `variant` key, the beat
+  // carried it, and the family could not see it at load -- so selecting
+  // `dev` silently loaded `distilled`. A key that names what to load has
+  // to arrive before the load.
+  //
+  // Borrowed, and only for the duration of the call: the stage owns the
+  // FlexData. A family that wants it later must copy it.
+  const FlexData*              model_config = nullptr;
+};
+
+// A video model FAMILY: process-wide, stateless, one per architecture.
+class VideoModelFamily {
+public:
+  virtual ~VideoModelFamily() = default;
+
+  // The family tag, as it appears in a model-config beat's
+  // `model_family` key and in this stage's logs ("ltx-2.5"). Must match
+  // what the family's ModelConfigSourceStage stamps, or every config
+  // wired to it is reported as a mismatch and dropped.
+  virtual std::string_view tag() const noexcept = 0;
+
+  // Does `root` hold a checkpoint of this family? `model_type` is what
+  // the models DB recorded, which the DIRECTORY may not be able to say
+  // (two records can share one local_path). Must be CHEAP -- it runs for
+  // every family on every model resolve -- and must be SURE: claiming a
+  // checkpoint that is not yours loads at full cost and computes
+  // nonsense, which is the worst failure this stage has.
+  virtual bool claims(const std::string& root,
+                      const std::string& model_type) const = 0;
+
+  // Round `frames` up to a count this checkpoint's VAE can actually
+  // chunk (Wan's 4k+1, H3's 17n+5, LTX-2.5's 8k+1). Asked of the FAMILY
+  // rather than the generator because the stage settles geometry when it
+  // resolves the checkpoint, which is before anything is loaded -- and a
+  // family that had to load 22B of weights to answer "how many frames"
+  // would make every graph pay for the question. Returning `frames`
+  // unchanged means any count is legal. The stage REPORTS the change;
+  // rejecting instead would mean a graph could not change families
+  // without being re-authored.
+  virtual int align_frames(const std::string& /*root*/, int frames) const
+  {
+    return frames;
+  }
+
+  // What loading this checkpoint will take, for the planning phase that
+  // runs before any stage initialises. Weight claims (see
+  // stages/model-memory.h) are the usual answer; empty means the family
+  // declines to declare, which makes it invisible to peers sizing
+  // themselves -- see docs/MODEL-MEMORY.md.
+  virtual std::vector<ResourceClaim>
+  declare_resources(const std::string& /*root*/) const { return {}; }
+
+  // Build the generator. Null (after warning through `args.session`)
+  // leaves the stage inert rather than taking the pipeline down.
+  virtual std::unique_ptr<VideoGenerator>
+  load(const VideoModelCreateArgs& args) = 0;
+};
+
+// Process-wide family set. Same singleton discipline as StageRegistry
+// and ResourcePlannerRegistry: a plugin MUST link the host libvpipe
+// shared so it registers into THIS instance rather than forking a
+// second one.
+class VideoModelRegistry {
+public:
+  static VideoModelRegistry& get() noexcept;
+
+  // Takes ownership. First-wins on `tag()`: a second family claiming a
+  // tag already present is ignored and returns false, so two plugins
+  // shipping the same model cannot silently shadow each other.
+  bool add(std::unique_ptr<VideoModelFamily> f);
+
+  // The first registered family that claims `root`, or null. Order is
+  // registration order, which for plugins is load order -- so a
+  // deliberately narrow `claims` is a family's own responsibility.
+  // Never throws: a family whose `claims` throws is skipped and warned.
+  VideoModelFamily* claim_for(const SessionContextIntf* session,
+                              const std::string&        root,
+                              const std::string&        model_type) const;
+
+  VideoModelFamily* find(std::string_view tag) const noexcept;
+
+  std::vector<VideoModelFamily*> all() const;
+
+private:
+  VideoModelRegistry() = default;
+
+  mutable std::mutex                             _mu;
+  std::vector<std::unique_ptr<VideoModelFamily>> _families;
+};
+
+}
+
+#endif

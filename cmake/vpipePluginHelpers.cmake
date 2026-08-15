@@ -1,6 +1,16 @@
 # CMake helpers for building vpipe plugins against an installed vpipe SDK
 # (pulled in by find_package(vpipe)). See docs/PLUGINS.md.
 
+# Where THIS file lives, captured at include time.
+#
+# Not CMAKE_CURRENT_LIST_DIR inside the function bodies below: inside a
+# CMake *function* that variable is evaluated when the function RUNS, so
+# it names the caller's directory -- the plugin's source tree -- and the
+# helper then looks there for a script that ships beside this file. That
+# is a build error naming a path in the plugin's own tree, which reads
+# like the plugin is missing something it never had.
+set(VPIPE_PLUGIN_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
 # vpipe_add_plugin(<name> SOURCES <a.cc> [b.cc ...] [METAL] [COREML])
 #
 # Build a dlopen-loadable plugin: a MODULE .dylib linked against
@@ -20,6 +30,27 @@ function(vpipe_add_plugin name)
   endif()
   add_library(${name} MODULE ${P_SOURCES})
   set_target_properties(${name} PROPERTIES PREFIX "" MACOSX_RPATH ON)
+  # No RPATH on the plugin. Linking vpipe::vpipe otherwise makes CMake
+  # bake the BUILDING machine's libvpipe directory in as an absolute
+  # LC_RPATH, which is the one thing that would stop an otherwise
+  # portable .so from loading elsewhere -- and it buys nothing, because a
+  # plugin is only ever dlopened INTO a process that has already loaded
+  # libvpipe. dyld resolves the plugin's `@rpath/libvpipe.0.dylib`
+  # against that image by install name; the host binary found it through
+  # its own relocatable `@loader_path/../lib`. VERIFIED by deleting the
+  # RPATH from a built plugin with install_name_tool: it still loads and
+  # still registers its models.
+  #
+  # BUILD_WITH_INSTALL_RPATH makes the build-tree artifact carry the
+  # install RPATH (empty) rather than the dependency-derived one, so the
+  # .so is portable where it is built, not only once installed.
+  #
+  # Scoped to the MODULE deliberately. A plugin's own test executables
+  # link libvpipe and run standalone, so they DO need an RPATH to find
+  # it; stripping theirs would break them at exec.
+  set_target_properties(${name} PROPERTIES
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "")
   target_link_libraries(${name} PRIVATE vpipe::vpipe)
   target_compile_features(${name} PRIVATE cxx_std_20)
   if(APPLE AND P_METAL)
@@ -64,9 +95,9 @@ function(vpipe_add_metal_library objlib name)
     COMMAND xcrun -sdk macosx metallib "${_air}" -o "${_lib}"
     COMMAND ${CMAKE_COMMAND}
             -DINPUT=${_lib} -DOUTPUT=${_cc} -DNAME=${name}
-            -P "${CMAKE_CURRENT_LIST_DIR}/vpipe-embed-metallib.cmake"
+            -P "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
     DEPENDS "${_src_abs}"
-            "${CMAKE_CURRENT_LIST_DIR}/vpipe-embed-metallib.cmake"
+            "${VPIPE_PLUGIN_CMAKE_DIR}/vpipe-embed-metallib.cmake"
     COMMENT "vpipe_add_metal_library: ${name}.metal -> embedded metallib"
     VERBATIM)
   add_library(${objlib} OBJECT "${_cc}")

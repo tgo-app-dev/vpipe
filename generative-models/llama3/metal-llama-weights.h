@@ -79,10 +79,30 @@ public:
   // quantizer to enumerate + classify every tensor.
   std::vector<std::string> tensor_names() const;
 
+  // Where a load's wall time went. The two halves answer different
+  // questions for a streaming model: `alloc` is the SharedBuffer, which
+  // on a fresh anonymous allocation includes the kernel zero-filling it,
+  // and `fetch` is the memcpy out of the read-only shard mmap -- which
+  // is a pure copy when the source pages are already in the file cache
+  // and a demand-paged DISK read when they are not.
+  //
+  // The distinction decides what a weight prefetch can buy. Real IO
+  // overlaps GPU work on another thread; a memcpy on unified memory
+  // mostly relocates memory-bandwidth contention instead of hiding it.
+  // The two are fused inside the memcpy (the fault happens there), so
+  // this does not try to separate them by bracketing -- the achieved
+  // rate does that: ~1.5 GB/s is a disk, ~12 GB/s is the page cache.
+  struct LoadCost {
+    double alloc_ms = 0.0;
+    double fetch_ms = 0.0;
+  };
+
   // Allocate a SharedBuffer and copy the tensor's bytes into it.
-  // Returns an empty SharedBuffer if the tensor is missing.
+  // Returns an empty SharedBuffer if the tensor is missing. `cost`, when
+  // non-null, receives the split above (added to, not overwritten).
   metal_compute::SharedBuffer load(
-      const std::string& name, metal_compute::MetalCompute* mc) const;
+      const std::string& name, metal_compute::MetalCompute* mc,
+      LoadCost* cost = nullptr) const;
 
   // Zero-copy variant: return a READ-ONLY SharedBuffer that is a view into
   // the mmapped shard (newBufferWithBytesNoCopy over the whole shard, then a
@@ -135,6 +155,12 @@ private:
   // ~MetalLlamaWeights munmaps the pages they reference. `mutable`: the wraps
   // are a lazy cache built by the const load_mapped().
   mutable std::vector<metal_compute::SharedBuffer> _shard_maps;
+  // Has this shard already reported that zero-copy mapping is off for
+  // it? One shard's data offset decides EVERY tensor in it, so the first
+  // fallback is the whole story and the other four thousand would be
+  // noise. `mutable` for the same reason as _shard_maps: load_mapped is
+  // const and this is bookkeeping, not state a caller can observe.
+  mutable std::vector<bool>                       _shard_unmappable_said;
   std::unordered_map<std::string, TensorInfo> _tensors;
   // Non-null when this checkpoint was loaded from a `.gguf`; owns the
   // GgufFile + converter and backs the shard==-2 tensors in load().

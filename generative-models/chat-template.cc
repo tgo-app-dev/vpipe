@@ -713,6 +713,20 @@ public:
 
 protected:
   const Tokenizer& tok_() const noexcept { return _tok; }
+  std::int32_t im_start_() const noexcept { return _im_start; }
+
+  // A complete standalone system turn:
+  //   <|im_start|>system\n{text}<|im_end|>\n
+  void
+  render_system_turn_(std::string_view           text,
+                      std::vector<std::int32_t>* dst) const
+  {
+    (void)push_sp_(_im_start, dst);
+    append_text_(_tok, "system\n", dst);
+    append_text_(_tok, text, dst);
+    (void)push_sp_(_im_end, dst);
+    append_text_(_tok, "\n", dst);
+  }
 
   // Override hook. Default (vanilla ChatML, Qwen2.5) emits nothing.
   // Qwen3-family subclasses inject the thinking-disabled
@@ -741,9 +755,12 @@ private:
 class Qwen3ChatTemplate : public ChatMLChatTemplate {
 public:
   explicit Qwen3ChatTemplate(const Tokenizer& tok,
-                             bool             disable_thinking = true)
+                             bool             disable_thinking = true,
+                             std::string_view reasoning_effort = {})
     : ChatMLChatTemplate(tok)
     , _disable_thinking(disable_thinking)
+    , _reasoning(reasoning_instructions_(reasoning_effort,
+                                         disable_thinking))
     , _think_open (sp_(tok, "<think>"))
     , _think_close(sp_(tok, "</think>"))
   {}
@@ -751,6 +768,60 @@ public:
   std::string_view family_name() const override { return "qwen3-chatml"; }
 
   bool thinking_disabled() const noexcept { return _disable_thinking; }
+
+  std::string_view reasoning_instructions() const noexcept override
+  { return _reasoning; }
+
+  bool
+  render_reasoning_system_turn(
+      std::vector<std::int32_t>* dst) const override
+  {
+    if (_reasoning.empty() || dst == nullptr) { return false; }
+    render_system_turn_(_reasoning, dst);
+    return true;
+  }
+
+  // Tools + reasoning share ONE system turn, instruction first, exactly
+  // as the published template composes them. Overridden rather than
+  // emitted separately because two consecutive system turns is not what
+  // the model was trained to read.
+  bool
+  render_tools_system_turn(std::string_view              tools_json,
+                           bool                          is_first_turn,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    if (_reasoning.empty()) {
+      return ChatMLChatTemplate::render_tools_system_turn(
+          tools_json, is_first_turn, dst);
+    }
+    // The base emits a complete system turn, so the instruction cannot
+    // simply be appended before it -- render the base into a scratch
+    // buffer and splice the paragraph in after the `system\n` header.
+    std::vector<std::int32_t> base;
+    if (!ChatMLChatTemplate::render_tools_system_turn(
+            tools_json, is_first_turn, &base)) {
+      return false;
+    }
+    // The header is `<|im_start|>` + the tokens of "system\n"; re-render
+    // that prefix so the split point is computed, not guessed.
+    std::vector<std::int32_t> head;
+    (void)push_sp_(im_start_(), &head);
+    append_text_(tok_(), "system\n", &head);
+    if (base.size() < head.size()
+        || !std::equal(head.begin(), head.end(), base.begin())) {
+      // The base changed shape under us. Emit the instruction as its own
+      // turn rather than splicing at a wrong offset -- a duplicated
+      // system turn is recoverable, a corrupted one is not.
+      render_system_turn_(_reasoning, dst);
+      dst->insert(dst->end(), base.begin(), base.end());
+      return true;
+    }
+    dst->insert(dst->end(), base.begin(), base.begin() + head.size());
+    append_text_(tok_(), _reasoning, dst);
+    append_text_(tok_(), "\n\n", dst);
+    dst->insert(dst->end(), base.begin() + head.size(), base.end());
+    return true;
+  }
 
   // Thinking-ON extras end with `<think>\n`, so generation starts
   // inside the reasoning block; the opening token never streams
@@ -795,7 +866,36 @@ protected:
   }
 
 private:
+  // The paragraphs are the published template's, verbatim -- they are
+  // what the checkpoint was tuned against, so paraphrasing them would
+  // be sending a different instruction under the same config value.
+  //
+  // `medium` deliberately resolves to NOTHING: the reference has no
+  // branch for it, so medium IS the un-instructed rendering. Anything
+  // unrecognised also resolves to nothing here; the stage validates the
+  // spelling so a typo is a config error rather than a silent downgrade.
+  static std::string
+  reasoning_instructions_(std::string_view effort, bool disable_thinking)
+  {
+    // The reference wraps the whole block in `if enable_thinking`, so a
+    // thinking-off render carries no instruction whatever was asked for.
+    if (disable_thinking) { return {}; }
+    if (effort == "xhigh") {
+      return "Reasoning effort is set to xhigh. Please think carefully "
+             "through the task, validate key assumptions, consider "
+             "plausible alternatives, and prioritize correctness, "
+             "consistency, and clarity in the final answer.";
+    }
+    if (effort == "low") {
+      return "Reasoning effort is set to low. Keep your thinking brief "
+             "and focused, moving directly to the conclusion without "
+             "unnecessary elaboration.";
+    }
+    return {};
+  }
+
   bool         _disable_thinking;
+  std::string  _reasoning;
   std::int32_t _think_open;
   std::int32_t _think_close;
 };
@@ -832,12 +932,13 @@ private:
 class Qwen3VLChatTemplate final : public Qwen3ChatTemplate {
 public:
   explicit Qwen3VLChatTemplate(const Tokenizer& tok,
-                               bool             disable_thinking = false)
+                               bool             disable_thinking = false,
+                               std::string_view reasoning_effort = {})
     // Qwen3-VL was primarily trained / served with thinking-ON; pass
     // the inverse default to the Qwen3 base so the family-default for
     // VLM users is `<think>\n`. The base class's
     // append_assistant_extras_ handles both modes uniformly.
-    : Qwen3ChatTemplate(tok, disable_thinking)
+    : Qwen3ChatTemplate(tok, disable_thinking, reasoning_effort)
     , _vision_start(sp_(tok, "<|vision_start|>"))
     , _vision_end  (sp_(tok, "<|vision_end|>"))
     , _image_pad   (sp_(tok, "<|image_pad|>"))
@@ -1835,8 +1936,12 @@ private:
 std::unique_ptr<ChatTemplate>
 make_chat_template(const std::string&    architecture,
                    const Tokenizer&      tokenizer,
-                   std::optional<bool>   disable_thinking)
+                   std::optional<bool>   disable_thinking,
+                   std::string_view      reasoning_effort)
 {
+  // Only the Qwen3 family carries a reasoning-effort control; every
+  // other branch below ignores it, and the stage warns when it was set
+  // on a family that cannot use it rather than dropping it silently.
   // Llama family (and ALSO Qwen2 dense / Mistral 7B variants, which
   // all use the Llama-3 header tokens because their tokenizers extend
   // the Llama vocab). Mirror the dispatch table used by
@@ -1893,11 +1998,11 @@ make_chat_template(const std::string&    architecture,
     if (is_vlm) {
       // Qwen3-VL family default: thinking-ON.
       return std::make_unique<Qwen3VLChatTemplate>(
-          tokenizer, disable_thinking.value_or(false));
+          tokenizer, disable_thinking.value_or(false), reasoning_effort);
     }
     // Qwen3 text-only family default: thinking-OFF.
     return std::make_unique<Qwen3ChatTemplate>(
-        tokenizer, disable_thinking.value_or(true));
+        tokenizer, disable_thinking.value_or(true), reasoning_effort);
   }
   return nullptr;
 }

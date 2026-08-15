@@ -1,6 +1,7 @@
 #ifndef STAGES_MODEL_CATALOG_H
 #define STAGES_MODEL_CATALOG_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -108,9 +109,38 @@ struct ModelCatalogEntry {
   std::vector<std::pair<std::string, std::string>> dataset_files;
 };
 
-// The full catalogue. Definition order is the display order within each
-// drill-down group.
+// The full catalogue: the built-in table followed by whatever plugins
+// contributed, in registration order. Definition order is the display
+// order within each drill-down group, so a plugin's models appear after
+// the built-ins rather than interleaved with them.
 const std::vector<ModelCatalogEntry>& model_catalog();
+
+// Contribute catalogue entries from a PLUGIN.
+//
+// The built-in table in model-catalog.cc stays the single edit point for
+// models that ship with vpipe; this is the seam for a model that does
+// not, so a separately-licensed family can be downloadable, registrable
+// and browsable without the entry living in this tree. Returns how many
+// entries were taken.
+//
+// FIRST-WINS, per (name-or-hf_path, files) identity: an entry that would
+// duplicate one already in the catalogue is dropped and NOT counted, so
+// two plugins shipping the same repo cannot produce two menu rows for
+// one model.
+//
+// LIFETIME. `model_catalog()` hands out a reference, and `catalog_by_*`
+// hand out pointers to its elements, so registration must never move
+// what a caller is already holding. It does not: each registration
+// publishes a NEW snapshot and the previous ones are retained for the
+// life of the process. Snapshots are a few hundred entries, and this is
+// called a handful of times at plugin load, so the retained copies cost
+// nothing measurable and no reference ever dangles.
+//
+// Call it from a plugin's vpipe_plugin_register. Plugins load before any
+// pipeline is built, so entries are present before anything reads the
+// catalogue -- but a later call is still safe, it just will not appear
+// in a menu already rendered.
+std::size_t register_catalog_entries(std::vector<ModelCatalogEntry> entries);
 
 // Drill-down helpers: each returns the distinct values present at that
 // level, in first-seen (catalogue) order, filtered by the levels already

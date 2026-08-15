@@ -211,6 +211,35 @@ public:
                                 const std::vector<float>& mm_rows, int n_mm,
                                 const std::vector<int>& positions);
 
+  // ---- hidden-state taps (diffusion text encoders) -----------------
+  //
+  // Snapshot the residual stream at the requested HuggingFace
+  // `output_hidden_states` indices and return them as one
+  // [slots][n][hidden] compute-dtype buffer, slot j == hf_indices[j].
+  // Empty on failure, with `err` set.
+  //
+  // The index convention -- and the reason index n_layers is NOT the
+  // raw residual -- is stated once in
+  // generative-models/hidden-state-encoder.h. In short: 0 is the
+  // embedding output, k in 1..L-1 is layer k-1's output, and L is that
+  // output AFTER the final norm.
+  //
+  // SINGLE CHUNK ONLY. A prompt long enough to wrap the sliding window
+  // is split by prefill(), and the intermediate chunks deliberately skip
+  // the shared-KV tail -- so their residual for those layers is never
+  // computed and a tap there would be silently partial. This refuses
+  // such a prompt instead. Diffusion captions are short (LTX-2.5 pads to
+  // 256), so the limit is not one a text encoder meets.
+  //
+  // key_valid_len > 0 applies a PREFIX KEY-MASK, matching HF's
+  // attention_mask over a right-padded prompt.
+  metal_compute::SharedBuffer
+  forward_embeddings_taps(ContextId cid,
+                          const std::vector<std::int32_t>& ids,
+                          const std::vector<int>& hf_indices,
+                          int key_valid_len = 0,
+                          std::string* err = nullptr);
+
   // Own-KV lifecycle (the exec calls these on branch / release).
   bool branch_kv(ContextId parent, ContextId child);
   void release_kv(ContextId cid);
@@ -301,6 +330,29 @@ private:
   // skip the shared-KV tail + final norm + lm_head (their residual/logits are
   // discarded for non-final chunks -- the tail writes no KV). Returns a
   // 1-element success sentinel. Halves the per-intermediate-chunk weight read.
+  // Set only for the duration of a forward_embeddings_taps() call; null
+  // on every other path, so the taps cost one null check per layer.
+  struct TapState {
+    metal_compute::SharedBuffer* out = nullptr;
+    std::vector<int> slot_of;   // HF index -> slot, or -1
+    int n = 0;
+    int hidden = 0;
+    // Set when a requested state was reached with fewer rows than the
+    // caller asked for (the shared-KV tail). The tap is then DROPPED and
+    // the whole call fails, rather than handing back a buffer with a
+    // silently stale slot.
+    bool partial = false;
+  };
+  TapState* _taps = nullptr;
+  // Copy [n*hidden] from `src` into slot `slot` of the tap buffer.
+  // Copies one hidden state into the tap buffer. `rows` is what the
+  // caller actually has; a mismatch against the tap's expected count is
+  // DROPPED with a warning rather than copied short, because a partial
+  // state is a plausible tensor of the right shape that is wrong.
+  void tap_(metal_compute::ComputeEncoder& enc, int hf_index,
+            const metal_compute::SharedBuffer& src, std::size_t src_off,
+            int rows);
+
   std::vector<float> forward_chunk_(ContextId cid,
                                     const std::vector<std::int32_t>& ids,
                                     const metal_compute::SharedBuffer* mm_emb
@@ -635,6 +687,21 @@ private:
   // shared layers). Sizes the shared MLP decode/prefill scratch.
   int  _ffn_max = 0;
   metal_compute::SharedBuffer _embed_dense;                     // dense tied embed
+  // A FULL-PRECISION embedding table over a QUANTIZED backbone.
+  //
+  // `model-quantize` treats the embedding as a lookup table rather than
+  // a linear and leaves it alone, so a checkpoint whose layers are
+  // affine can still carry a bf16 `embed_tokens.weight` with no
+  // `.scales` beside it. That is the right shape for a text ENCODER --
+  // every conditioning token starts life as one of these rows, and the
+  // table is 1.88 GB against the backbone's 20.3 GB, so quantizing it
+  // would buy little and cost that. Without this the load simply failed:
+  // an affine backbone sent the embed down qtri(), which wants a triple
+  // that is not there.
+  //
+  // Mirrors MetalQwenModel::_dense_embed, which exists for the same
+  // reason on a different artifact.
+  bool _dense_embed = false;
   metal_compute::ComputeFunction _fn_embed_dense;               // embed_gather_f16
 
   std::vector<Layer> _layers;

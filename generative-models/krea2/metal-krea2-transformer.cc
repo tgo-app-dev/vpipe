@@ -1368,6 +1368,29 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   // safe (buffers outlive each commit; commit().wait() preserves ordering).
   const bool prof = !_stream_blocks
                     && std::getenv("VPIPE_KREA2_DIT_PROFILE") != nullptr;
+  // ---- env-gated streaming split (VPIPE_KREA2_STREAM_PROFILE) ----------
+  // What a weight PREFETCH could hide. The streamed path loads a block
+  // serially and then commits-and-waits before the weights free, so the
+  // disk and the GPU take strict turns; both ends are already on the
+  // critical path, so timing them adds no barriers of its own. Unlike the
+  // section profile above this is NOT disabled while streaming -- the
+  // streamed run is the only one it has anything to say about.
+  const bool sprof = std::getenv("VPIPE_KREA2_STREAM_PROFILE") != nullptr;
+  double sp_read_ms = 0, sp_gpu_ms = 0;
+  std::size_t sp_read_bytes = 0;
+  int sp_blocks = 0;
+  const double sp_alloc0 = sprof && _ws ? _ws->stats().streamed_alloc_ms : 0.0;
+  const double sp_fetch0 = sprof && _ws ? _ws->stats().streamed_fetch_ms : 0.0;
+  auto sp_now = [&]() {
+    return sprof ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
+  };
+  auto sp_add = [&](double& sink, std::chrono::steady_clock::time_point t0) {
+    if (sprof) {
+      sink += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+    }
+  };
   double t_cond = 0, t_qkv = 0, t_attn = 0, t_oproj = 0, t_ff = 0, t_norm = 0,
          t_final = 0, t_ffup = 0, t_ffact = 0;
   std::chrono::steady_clock::time_point mark;
@@ -1695,11 +1718,14 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       const bool streaming = _stream_blocks && !held;
       Block streamed;
       if (streaming) {
+        const auto rd0 = sp_now();
         if (!load_block_(*_ws,
                          "transformer_blocks." + std::to_string(L) + ".",
                          streamed, true, Retain::Streamed)) {
           return {};
         }
+        sp_add(sp_read_ms, rd0);
+        if (sprof) { sp_read_bytes += block_bytes_(streamed); ++sp_blocks; }
         if (_mc->session() != nullptr) {
           _mc->session()->log_debug(fmt(
               "DiT forward: streamed block {}/{} (seq {})", L + 1, c.n_layers,
@@ -1796,7 +1822,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
       psplit(t_ff);
       if (streaming) {
+        const auto gp0 = sp_now();
         flush();   // commit block L before its weights free
+        sp_add(sp_gpu_ms, gp0);
         // The flush has been WAITED for, so nothing encoded still points
         // at this block's buffers -- which is why promotion happens here
         // and not at the top of the iteration. Keeping it costs no extra
@@ -1834,6 +1862,27 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       gemm_bias(nm, _final_lw, _final_lb, noise, 0, IS_GEN, IC, HID);
       psplit(t_final);
     }
+  }
+  if (sprof && sp_blocks > 0 && _mc->session() != nullptr) {
+    const double tot = sp_read_ms + sp_gpu_ms;
+    const double sp_alloc_ms =
+        (_ws ? _ws->stats().streamed_alloc_ms : 0.0) - sp_alloc0;
+    const double sp_fetch_ms =
+        (_ws ? _ws->stats().streamed_fetch_ms : 0.0) - sp_fetch0;
+    const double gbs = sp_read_ms > 0.0
+        ? (double)sp_read_bytes / (sp_read_ms / 1000.0) / 1e9 : 0.0;
+    _mc->session()->log_normal(fmt(
+        "MetalKrea2Transformer: streamed {} blocks -- read {:.0f} ms ({} MB "
+        "at {:.2f} GB/s, {:.1f} ms/block), gpu {:.0f} ms ({:.0f} ms/block); "
+        "a perfect prefetch hides at most {:.1f}% of this pass [read = {:.0f} ms alloc + {:.0f} ms fetch at {:.2f} GB/s]",
+        sp_blocks, sp_read_ms, sp_read_bytes >> 20, gbs,
+        sp_read_ms / (double)sp_blocks, sp_gpu_ms,
+        sp_gpu_ms / (double)sp_blocks,
+        tot > 0.0 ? 100.0 * sp_read_ms / tot : 0.0,
+        sp_alloc_ms, sp_fetch_ms,
+        sp_fetch_ms > 0.0
+            ? (double)sp_read_bytes / (sp_fetch_ms / 1000.0) / 1e9
+            : 0.0));
   }
   {
     // Backstop for GPU over-commit (OOM / page-fault on non-resident memory):

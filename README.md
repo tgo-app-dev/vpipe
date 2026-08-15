@@ -1,48 +1,54 @@
 <a id="top"></a>
 # VPIPE
 
-**Real-time multimodal AI pipelines on Apple Silicon**
+**Lightweight local multimodal AI pipelines and custom Metal inference for Apple Silicon Macs.**
 
-## TL;DR
+- **Multimodal graph:** video, audio, images, text, and tool actions in one pipeline.
+- **Native Metal inference:** custom kernels and no third-party tensor runtime, for optimal speed.
+- **Base-model Mac friendly:** weight streaming and 4-bit model preparation for image/video generation on 16 GB machines.
+- **Out-of-the-box workflows:** image editing, MiniMax H3 video, Qwen chat, realtime VQA, ASR/TTS, and local tool calling.
+- **Reproducible Composer:** save layouts, prompts, params, and model config with each pipeline spec.
+- **Easy to use:** macOS app, web UI control, and remote access from a phone browser.
 
-**[Download the Latest macOS App Release](https://github.com/tgo-app-dev/vpipe/releases/latest)**
+**[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
+· **[Run the first example](#first-example)**
+· **[Try image editing](docs/KLEIN-KV.md)**
+· **[Try MiniMax H3 video](docs/MINIMAX-H3.md)**
 
-Choose the largest file if you are not sure.
+For the easiest install, choose the largest `.dmg` in the latest release.
 
----
+<p align="center">
+  <img src="docs/images/vpipe_img_edit_1.webp"
+       alt="VPIPE local AI runtime for Apple Silicon showing prompt-driven image editing, custom Metal inference, live multimodal pipeline graph, profiler, preview panels, and model configuration controls"
+       width="900">
+</p>
 
-**VPIPE** is a small, embeddable runtime for building local AI applications
-where video, audio, images, text, tensors, user input, and tool actions move
-through the same inspectable pipeline. It is designed for Apple Silicon
-machines and runs its on-device generative stack on a custom **metal-compute**
-backend — its own Metal kernels, with no Python and no third-party tensor
-runtime in the forward pass.
+&emsp;&emsp;*Prompt-driven image editing in Composer: live pipeline graph,
+preview panels, profiler, and reproducible model configuration.*
+
+## Why VPIPE
 
 - Runs **MiniMax H3** FL2VA and REF2VA on an Apple Silicon Mac — a 33B model
   generating video **and its soundtrack together**, on as little as 16 GB.
   Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
 
-  * 3.75s @ 0.5 MP 24p, 8 steps takes **13 minutes** on a fanless
+  * 5s @ 0.5 MP 24p, 6 steps takes **13 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
-- **Built in C++** for performance and compactness
+- Runs **LTX-2.5** on an Apple Silicon Mac — a 22B model generating video
+  and its soundtrack together, again on as little as 16 GB, through the
+  [vpipe-ltx-2.5 plugin](https://github.com/tgo-app-dev/vpipe-ltx-2.5).
 
-- **Full modality** support packed under **25 MB** [^2]
-
-- Top-tier inference speed, enabling **realtime** visual question answering
-  (VQA), automatic speech recognition (ASR), and language-model chat with
-  text-to-speech (TTS)
-
-- Top-tier diffusion-transformer inference speed with **weight streaming**,
-  enabling image and video edits on base-model systems with 16 GB of memory —
+- **Image and video generation on base-model Macs** with weight streaming —
   walk through a reference image edit in
   **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
 
-- **Local MCP** support: sandboxed file, shell, and Python tools, plus web
-  fetch
+- **Realtime multimodal pipelines** for VQA, ASR, chat, TTS, image editing,
+  video generation, and tool use.
+  Now with **Qwen 3.8 27B** support!
 
-- **Mobile-friendly UI** enabling remote access from a phone
+- **Full-modality runtime under 30 MB** [^2], with a mobile-friendly web UI
 
 - Extra acceleration from the **NAX** matmul2d and convolution2d units on
   M5-generation hardware
@@ -53,11 +59,42 @@ runtime in the forward pass.
 [^2]: Build from source artifact size, not counting dynamically linked
       dependencies like FFmpeg, libcurl.
 
+## Local AI use cases
+
+| Use case | What VPIPE provides |
+| --- | --- |
+| Local image editing | Prompt tuning, image comparison, mask/reference pipelines, and reproducible Composer layouts. |
+| Text-to-video and image-to-video | MiniMax H3 pipelines with video and soundtrack generation on Apple Silicon. |
+| Multimodal chat | Stateful local chat that can read images without re-prefilling the whole thread. |
+| Realtime VQA and video monitoring | Video capture, detection, tracking, audio tagging, overlays, preview, and profiling in one graph. |
+| Local AI agents | Sandboxed file, shell, Python, and web tools exposed through local MCP-style stages. |
+| Developer integration | A compact embeddable C++ runtime plus ready-to-run pipeline specs and reference workflows. |
+
+## FAQ
+
+**What is VPIPE?** VPIPE is a local multimodal AI runtime for Apple Silicon
+Macs. It turns models, media streams, user input, and tool actions into
+inspectable C++ pipeline graphs.
+
+**Does VPIPE use MPS, MLX, or Python for inference?** No. VPIPE's generative
+model forward pass runs through Metal kernels directly via its own
+**metal-compute** backend. Python support exists only outside that forward path.
+
+**Can VPIPE run local image and video generation on a 16 GB Mac?** Yes, for
+supported workflows. VPIPE uses weight streaming and 4-bit model preparation
+to make image editing and video generation practical on base-model Apple
+Silicon machines.
+
+**Is VPIPE a ComfyUI alternative for Mac?** For some local image and video
+workflows, yes. VPIPE focuses on ready-to-run, reproducible pipelines with
+saved UI layouts and a native Apple Silicon compute backend, rather than a
+large general-purpose node ecosystem.
+
 ---
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
-![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-black)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-red)
 ![Python](https://img.shields.io/badge/Python-bindings-green)
 ![Status](https://img.shields.io/badge/Status-alpha-orange)
 
@@ -65,23 +102,10 @@ runtime in the forward pass.
 [**First example**](#first-example) · [**Overview**](#overview) ·
 [**Examples**](EXAMPLES.md)
 
-
 For developers: [**Requirements**](#requirements) ·
 [**Build from source**](#build-from-source) · [**Run**](#run) ·
 [**Tests**](#tests) · [**Structure**](#structure) ·
 [**Acknowledgements**](#acknowledgements) · [**License**](#license)
-
----
-
-<p align="center">
-  <img src="docs/images/vpipe_img_edit_1.webp"
-       alt="Prompt-driven image editing running as a vpipe pipeline"
-       width="900">
-</p>
-
-&emsp;&emsp;*Los Angeles Zoo, Nov 2019*
-
-&emsp;&emsp;*SONY ILCE-7RM3, FE 135mm F1.8 GM @ 1/160s, F/1.8*
 
 ---
 
@@ -99,8 +123,8 @@ whether FFmpeg travels with it:
 
 | Download | Size | Pick this if |
 | --- | --- | --- |
-| `VpipeManager-<version>-with-ffmpeg.dmg` | ~26 MB | You want it to work immediately. Nothing else to install. |
-| `VpipeManager-<version>-slim.dmg` | ~15 MB | You already have FFmpeg installed — Homebrew's, say — and would rather use it. |
+| `VpipeManager-<version>-with-ffmpeg.dmg` | ~28 MB | You want it to work immediately. Nothing else to install. |
+| `VpipeManager-<version>-slim.dmg` | ~16 MB | You already have FFmpeg installed — Homebrew's, say — and would rather use it. |
 
 The bundled copy is a minimal **LGPL** build: it covers the common
 formats and keeps hardware H.264/HEVC/ProRes through VideoToolbox, but
@@ -147,7 +171,7 @@ This is where everything lives: `models/` for anything downloaded or
 quantized, `sandbox/` for files pipelines are allowed to write, and the
 LMDB registry and logs. **Pick a volume with room.** Prepared models
 run to tens of gigabytes — MiniMax H3 downloads ~115 GB and peaks near
-~155 GB while it quantizes — and the app shows the free space on the
+155 GB while it quantizes — and the app shows the free space on the
 volume you select. Moving it later means moving all of that.
 
 **2. Point at FFmpeg — only if you took the slim build.** *Settings ▸
@@ -212,7 +236,7 @@ directories in Finder.
 > random characters, generated fresh at every start and never written
 > to disk. Nothing about you, your files, your models or your machine
 > is encoded in it — the single identifying detail is the LAN address,
-> and that is a private one like `192.168.x.x` which means nothing
+> and that is a private one like `192.168.x.x`, which means nothing
 > outside your own network.
 >
 > Treat it as a password anyway, because the token is not merely
@@ -278,10 +302,13 @@ From a source build the same two files run on the command line, which is
 where a chat prompt is most at home:
 
 ```sh
-cd ~/vpipe                                        # your work directory
-./build/apps/vpipe/vpipe --launch prepare-qwen35-9b-optiq-4bit.vpipeline
-./build/apps/vpipe/vpipe --launch qwen35-9b-chat.vpipeline
+cd ~/vpipe                    # your work directory, with both files in it
+/path/to/vpipe --launch prepare-qwen35-9b-optiq-4bit.vpipeline
+/path/to/vpipe --launch qwen35-9b-chat.vpipeline
 ```
+
+`/path/to/vpipe` is the binary from your build — `build/apps/vpipe/vpipe`
+inside the source tree.
 
 **▸ [docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** — the walkthrough: what each
 stage is for, why sampling is a stage rather than a config key, and the knobs

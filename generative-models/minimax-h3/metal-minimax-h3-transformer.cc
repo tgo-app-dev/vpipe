@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -2797,6 +2798,26 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const bool prof = std::getenv("VPIPE_H3_DIT_PROFILE") != nullptr;
   double t_in = 0, t_adaln = 0, t_qkv = 0, t_prep = 0, t_attn = 0,
          t_oproj = 0, t_ff = 0, t_elt = 0, t_final = 0;
+
+  // ---- env-gated streaming split (VPIPE_H3_STREAM_PROFILE) ------------
+  // How much of a streamed block's wall time is the DISK read and how
+  // much is the GPU. Unlike the section profile above this adds NO
+  // barriers: the streamed path already loads serially and already
+  // commits-and-waits per block (it must, before the weights go away),
+  // so both ends are on the critical path whether or not we time them.
+  //
+  // It answers one question -- what a weight PREFETCH could hide. The
+  // read is hideable under the GPU only up to min(read, gpu), so the
+  // ceiling on prefetch is read/(read+gpu) and there is no point
+  // building it until that number is worth having. Both terms move with
+  // the machine: block bytes with the quantization, read rate with the
+  // storage (internal NVMe, Thunderbolt, USB), gpu with the geometry.
+  const bool sprof = std::getenv("VPIPE_H3_STREAM_PROFILE") != nullptr;
+  double sp_read_ms = 0, sp_gpu_ms = 0;
+  std::size_t sp_read_bytes = 0;
+  int sp_blocks = 0;
+  const double sp_alloc0 = sprof && _ws ? _ws->stats().streamed_alloc_ms : 0.0;
+  const double sp_fetch0 = sprof && _ws ? _ws->stats().streamed_fetch_ms : 0.0;
   const auto t_begin = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point mark = t_begin;
 
@@ -3121,6 +3142,48 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     psplit(t_in);
     xdump("after refiner write");
 
+    // ---- weight prefetch (VPIPE_H3_NO_PREFETCH=1 disables) -----------
+    // The streamed path reads block L, encodes it, then commits AND
+    // WAITS before the weights free -- so the disk and the GPU take
+    // strict turns. MEASURED at 960x544: ~160 ms of read against ~2.6 s
+    // of GPU per block, all of it real disk (1.4-1.6 GB/s, on EVERY
+    // pass, because 8.9 GB of streamed weights cannot stay cached).
+    //
+    // Issuing block L+1's read between the commit and the wait overlaps
+    // it with GPU work already in flight. Nothing about the encoded work
+    // changes -- same bytes, same order, same output. This is
+    // scheduling, not arithmetic.
+    //
+    // Depth is structurally ONE: a single outstanding read into a single
+    // spare Block. That is what keeps a tight box safe -- no queue can
+    // run away, and the extra live memory is exactly one block.
+    //
+    // DECLARATION ORDER MATTERS. Members destroy in reverse, so `fut`
+    // goes FIRST and its destructor blocks until the reader finishes --
+    // which is what keeps `blk`, the buffer that reader is writing into,
+    // alive until then. Reordering these is a use-after-free on every
+    // early return out of this loop (stop, GPU error, alloc failure).
+    struct PrefetchSlot {
+      Block             blk;
+      int               layer = -1;
+      std::future<bool> fut;
+    } pf;
+    const bool pf_on = _stream_blocks &&
+                       std::getenv("VPIPE_H3_NO_PREFETCH") == nullptr;
+    int pf_started = 0, pf_hit = 0;
+    // The next layer that will actually be STREAMED. Resident blocks are
+    // skipped -- prefetching one would read bytes the forward already
+    // has. Safe to look ahead: promotion only ever adds the block just
+    // finished, never one further down the stack.
+    auto pf_next = [&](int from) {
+      for (int n = from; n < c.n_layers; ++n) {
+        const bool h = n < (int)_blocks.size() &&
+                       !_blocks[(std::size_t)n].qkv.empty();
+        if (!h) { return n; }
+      }
+      return -1;
+    };
+
     // ---- 3. the block stack ------------------------------------------
     for (int Lx = 0; Lx < c.n_layers; ++Lx) {
       // Cooperative stop, checked EVERY block rather than only on the
@@ -3157,9 +3220,30 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // block's bytes and nothing reads them any more, so a streaming
         // run stops paying for them on every step. This is the whole
         // point of baking.
-        if (!load_block_(*_ws, blk_("blocks.", Lx, ""), streamed, !baked,
-                         Retain::Streamed)) {
+        const auto rd0 = sprof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+        bool have = false;
+        if (pf.layer == Lx && pf.fut.valid()) {
+          // This block's read was issued under the PREVIOUS block's GPU
+          // work, so waiting here costs only the part that did not fit
+          // under that window.
+          const bool ok = pf.fut.get();
+          pf.layer = -1;
+          if (!ok) { return {}; }
+          streamed = std::move(pf.blk);
+          pf.blk = Block{};
+          have = true;
+          ++pf_hit;
+        }
+        if (!have && !load_block_(*_ws, blk_("blocks.", Lx, ""), streamed,
+                                  !baked, Retain::Streamed)) {
           return {};
+        }
+        if (sprof) {
+          sp_read_ms += std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - rd0).count();
+          sp_read_bytes += block_bytes_(streamed);
+          ++sp_blocks;
         }
       }
       const Block& b = streaming ? streamed : _blocks[(std::size_t)Lx];
@@ -3287,9 +3371,39 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (streaming) {
         enc.end();
         std::string blk_err;
-        if (!stream.commit().wait_ok(&blk_err)) {
+        const auto gp0 = sprof ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+        metal_compute::CommandStream::Fence fence = stream.commit();
+        // Between the commit and the wait is the whole opportunity: the
+        // GPU is busy with block Lx and this thread has nothing to do.
+        //
+        // Gated on the SAME budget question growth asks, because on a
+        // box that fits one block the failure mode is not slowness but
+        // thrash: a second live block tips the machine into the
+        // compressor, the prefetched pages are evicted before the GPU
+        // reads them, and a hidden read becomes read + compress +
+        // decompress. Asked per block and never queued, so the moment it
+        // stops being affordable the next iteration is serial again.
+        if (pf_on && pf.layer < 0) {
+          const int nxt = pf_next(Lx + 1);
+          const auto mbp = _mc->memory_budget();
+          if (nxt >= 0 && mbp.recommended != 0 &&
+              mbp.fits_growth(block_bytes_(streamed))) {
+            pf.layer = nxt;
+            ++pf_started;
+            pf.fut = std::async(std::launch::async, [this, &pf, nxt, baked]() {
+              return load_block_(*_ws, blk_("blocks.", nxt, ""), pf.blk,
+                                 !baked, Retain::Streamed);
+            });
+          }
+        }
+        if (!fence.wait_ok(&blk_err)) {
           return fail("streamed block " + std::to_string(Lx) + ": " +
                       (blk_err.empty() ? std::string("GPU error") : blk_err));
+        }
+        if (sprof) {
+          sp_gpu_ms += std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - gp0).count();
         }
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
@@ -3323,6 +3437,30 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           }
         }
       }
+    }
+
+    if (sprof && sp_blocks > 0 && _mc->session() != nullptr) {
+      const double tot = sp_read_ms + sp_gpu_ms;
+      const double sp_alloc_ms =
+        (_ws ? _ws->stats().streamed_alloc_ms : 0.0) - sp_alloc0;
+    const double sp_fetch_ms =
+        (_ws ? _ws->stats().streamed_fetch_ms : 0.0) - sp_fetch0;
+    const double gbs = sp_read_ms > 0.0
+          ? (double)sp_read_bytes / (sp_read_ms / 1000.0) / 1e9 : 0.0;
+      _mc->session()->log_normal(fmt(
+          "MetalMiniMaxH3Transformer: streamed {} of {} blocks -- read "
+          "{:.0f} ms ({} MB at {:.2f} GB/s, {:.1f} ms/block), gpu {:.0f} ms "
+          "({:.0f} ms/block); prefetch {}/{} hit, a perfect one hides at "
+          "most {:.1f}% of "
+          "this pass [read = {:.0f} ms alloc + {:.0f} ms fetch at {:.2f} GB/s]", sp_blocks, c.n_layers, sp_read_ms,
+          sp_read_bytes >> 20, gbs, sp_read_ms / (double)sp_blocks,
+          sp_gpu_ms, sp_gpu_ms / (double)sp_blocks,
+          pf_hit, pf_started,
+          tot > 0.0 ? 100.0 * sp_read_ms / tot : 0.0,
+        sp_alloc_ms, sp_fetch_ms,
+        sp_fetch_ms > 0.0
+            ? (double)sp_read_bytes / (sp_fetch_ms / 1000.0) / 1e9
+            : 0.0));
     }
 
     // ---- 4. the shared output norm and the two heads ------------------

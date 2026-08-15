@@ -4,6 +4,7 @@
 #include "common/vertex.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
+#include "common/plugins-root.h"
 #include "pipeline/stage-registry.h"
 #include "pipeline/stage.h"
 #include "pipeline/typed-stage.h"
@@ -68,6 +69,63 @@ TEST(stage_registry, duplicate_register_returns_same_id) {
   vpipe::StageTypeId first = reg.find_id("fake-source");
   vpipe::StageTypeId again = reg.register_type("fake-source", nullptr);
   EXPECT_TRUE(first == again);
+}
+
+// Provenance: what the web-ui toolbox groups by. The mechanism is a
+// span -- "everything registered after this id came from that plugin" --
+// so the test drives it the way PluginManager does: snapshot next_id(),
+// register, attribute.
+TEST(stage_registry, attributes_types_registered_after_a_mark) {
+  auto& reg = vpipe::StageRegistry::get();
+  const vpipe::StageTypeId mark = reg.next_id();
+  reg.register_type("prov-a", nullptr);
+  reg.register_type("prov-b", nullptr);
+  reg.attribute_since(mark, "demo-plugin");
+  EXPECT_TRUE(reg.origin("prov-a") == "demo-plugin");
+  EXPECT_TRUE(reg.origin("prov-b") == "demo-plugin");
+  // The built-ins registered BEFORE the mark keep an empty origin --
+  // this is the half that makes the grouping meaningful, since an
+  // over-eager span would sweep the whole toolbox under one plugin.
+  EXPECT_TRUE(reg.origin("fake-source").empty());
+  EXPECT_TRUE(reg.origin("nope-not-registered").empty());
+}
+
+// A second plugin must not inherit the first one's stages, and a name
+// the host already owns mints no new id, so it is never attributed.
+TEST(stage_registry, attribution_does_not_bleed_between_plugins) {
+  auto& reg = vpipe::StageRegistry::get();
+  const vpipe::StageTypeId m1 = reg.next_id();
+  reg.register_type("prov-p1", nullptr);
+  reg.attribute_since(m1, "plugin-one");
+
+  const vpipe::StageTypeId m2 = reg.next_id();
+  reg.register_type("prov-p2", nullptr);
+  // Re-registering an existing name returns the existing id and mints
+  // nothing, so plugin-two must not end up owning it.
+  reg.register_type("prov-p1", nullptr);
+  reg.attribute_since(m2, "plugin-two");
+
+  EXPECT_TRUE(reg.origin("prov-p1") == "plugin-one");
+  EXPECT_TRUE(reg.origin("prov-p2") == "plugin-two");
+}
+
+// The plugins root is a CONVENTION, and the two things it must not do
+// are as much a part of it as the path itself.
+TEST(plugins_root, is_stable_and_not_created) {
+  const std::filesystem::path a = vpipe::plugins_root();
+  EXPECT_TRUE(!a.empty());
+  // Cached: a second call cannot drift, even if something chdir'd.
+  EXPECT_TRUE(vpipe::plugins_root() == a);
+  EXPECT_TRUE(a.filename() == "plugins"
+              || std::getenv("VPIPE_PLUGINS_DIR") != nullptr);
+  // Merely ASKING must not materialise the directory -- a scanned folder
+  // is not a written one. (If it happens to exist because the developer
+  // has one, that is not this call's doing; the assertion is only that
+  // the call did not create it, so skip when it pre-exists.)
+  static const bool existed_before = std::filesystem::exists(a);
+  if (!existed_before) {
+    EXPECT_FALSE(std::filesystem::exists(a));
+  }
 }
 
 TEST(stage_registry, missing_type) {

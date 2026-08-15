@@ -62,6 +62,30 @@ public:
 
   std::vector<std::pair<StageTypeId, std::string>> all() const;
 
+  // ---- provenance ----------------------------------------------------
+  //
+  // Which PLUGIN contributed a stage type, empty for the built-ins. The
+  // web-ui groups its toolbox by it, so "where did this stage come from"
+  // is answerable without reading a log.
+  //
+  // OBSERVED, not declared. `attribute_since` takes the id the registry
+  // was about to hand out before a plugin was dlopen'd and stamps
+  // everything registered after it. That is exact -- ids are assigned
+  // sequentially and never reused -- and, more to the point, it is the
+  // only formulation that cannot MISS a stage: a TypedStage<T> registers
+  // its own factory from a static initialiser at dlopen, BEFORE
+  // vpipe_plugin_register runs, so attributing inside
+  // VpipePluginContext::register_stage would silently skip any stage the
+  // plugin did not also hand to the context (which is optional -- see
+  // the note on register_stage in plugin-context.h).
+  //
+  // A name the host already registered keeps its first-wins id, mints no
+  // new one, and is therefore NOT attributed to the plugin. Correct: the
+  // plugin did not contribute that type.
+  StageTypeId next_id() const noexcept;
+  void        attribute_since(StageTypeId first, std::string_view origin);
+  std::string_view origin(std::string_view type_name) const noexcept;
+
 private:
   StageRegistry() = default;
 
@@ -87,6 +111,7 @@ private:
   struct Entry {
     std::string name;
     Factory     factory;
+    std::string origin;     // contributing plugin, empty for built-ins
   };
 
   // Index is (id - 1). Entry::name owns the canonical string and

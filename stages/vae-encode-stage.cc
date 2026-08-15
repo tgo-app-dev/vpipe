@@ -386,6 +386,40 @@ VaeEncodeStage::ensure_loaded_()
   // can never resolve to different directories.
   const std::string vae_dir = resolve_vae_dir(root);
 
+  // An OUT-OF-TREE family first, exactly as vae-decode does it: a
+  // plugin's latent geometry is its own, and asking the built-in
+  // `_class_name` chain first would resolve a Comfy-style pack to
+  // "krea2" (the fallback) and encode nonsense at the wrong scale.
+  _vae_family = genai::VaeModelRegistry::get().claim_for(
+      session(), root, vae_dir, /*model_type=*/std::string());
+  if (_vae_family != nullptr) {
+    genai::VaeModelCreateArgs pargs;
+    pargs.root = root;
+    pargs.vae_dir = vae_dir;
+    pargs.metal = session()->services()->metal_compute();
+    pargs.session = session();
+    _plugin_enc = _vae_family->load_encoder(pargs);
+    if (!_plugin_enc) {
+      // CLAIMED but has no encoder: leave the stage inert rather than
+      // falling through to a built-in that would misread the same
+      // checkpoint. The family said this VAE is its own.
+      session()->error(fmt(
+          "VaeEncodeStage('{}'): the '{}' family claims '{}' but supplies no "
+          "encoder; the stage is inert. Falling back to a built-in family "
+          "here would encode at the wrong latent geometry.",
+          this->id(), std::string(_vae_family->tag()), vae_dir));
+      return;
+    }
+    _family = std::string(_vae_family->tag());
+    load_note_(fmt(
+        "VaeEncodeStage('{}'): {} encoder from '{}' -- {} latent channels, "
+        "{}x spatial / {}x temporal, {:.1f} MB", this->id(), _family, vae_dir,
+        _plugin_enc->latent_channels(), _plugin_enc->spatial_compression(),
+        _plugin_enc->temporal_compression(),
+        (double)_plugin_enc->resident_bytes() / (1024.0 * 1024.0)));
+    return;
+  }
+
   _family = vae_family_(vae_dir);
   // One shared, reference-counted view of this checkpoint. The peer VAE
   // stage in the same graph (encode beside decode) names the same
@@ -703,6 +737,78 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   ensure_loaded_();
   // A previous beat may have dropped the encoder to leave the DiT room.
   if (_unloaded) { reload_vae_(); }
+
+  // ---- an out-of-tree family (VaeModelRegistry) ------------------------
+  //
+  // Ahead of every built-in branch, matching the order ensure_loaded_
+  // resolved them in. The family owns its own geometry, so this publishes
+  // the shape the encoder REPORTS rather than one predicted here -- an
+  // encoder that mispredicts its own latent should produce a confusing
+  // log, not a mislabelled beat.
+  if (_plugin_enc) {
+    const int sH = (int)tbp->shape[1], sW = (int)tbp->shape[2];
+    if (sH <= 0 || sW <= 0) { co_return; }
+    const bool resize = _target_w > 0 && _target_h > 0;
+    const int H = resize ? _target_h : sH;
+    const int W = resize ? _target_w : sW;
+    const auto img = tbp->materialize_contiguous();
+    const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
+    const float pad[3] = {
+      (float)_pad_r / 255.0f * 2.0f - 1.0f,
+      (float)_pad_g / 255.0f * 2.0f - 1.0f,
+      (float)_pad_b / 255.0f * 2.0f - 1.0f,
+    };
+    const std::vector<float> norm =
+        normalize_and_fit_(img.data(), is_u8, sH, sW, H, W, pad);
+
+    genai::VaeEncodeRequest req;
+    req.pixels = norm.data();
+    req.frames = 1;
+    req.height = H;
+    req.width  = W;
+    std::vector<float> lat;
+    std::vector<int> lshape;
+    std::string eerr;
+    bool ok = false;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)H * W);
+      ok = _plugin_enc->encode(req, &lat, &lshape, &eerr);
+    }
+    if (!ok || lat.empty() || lshape.empty()) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): the {} encoder produced nothing ({}); "
+          "skipping", this->id(), _family,
+          eerr.empty() ? "no reason given" : eerr));
+      co_return;
+    }
+    std::size_t want = 1;
+    for (int d : lshape) { want *= (std::size_t)std::max(0, d); }
+    if (want != lat.size()) {
+      session()->warn(fmt(
+          "VaeEncodeStage('{}'): the {} encoder returned {} values for a "
+          "shape holding {}; skipping", this->id(), _family, lat.size(),
+          want));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape.assign(lshape.begin(), lshape.end());
+    out->resize_contiguous(lat.size());
+    std::memcpy(out->as_f32(), lat.data(), lat.size() * sizeof(float));
+    ++_latents_emitted;
+    std::string dims;
+    for (std::size_t i = 0; i < lshape.size(); ++i) {
+      dims += (i ? ", " : "") + std::to_string(lshape[i]);
+    }
+    session()->log_debug(fmt(
+        "VaeEncodeStage('{}'): {} latent #{} [{}] from [3, {}, {}]{}",
+        this->id(), _family, _latents_emitted, dims, H, W,
+        resize ? " (letterbox)" : ""));
+    if (_unload_idle) { _plugin_enc->release_idle(); }
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
 
   // ---- 2D AutoencoderKL: encode to [dit_channels, H/px, W/px] with px =
   // 8*patch -- 16 on FLUX.2 (8x VAE + 2x patch), 8 on the plain FLUX.1 VAE

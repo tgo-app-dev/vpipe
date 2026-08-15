@@ -66,6 +66,13 @@ namespace genai { struct QuantArchInfo; }
 //                  the LM backbone, keep a precision-sensitive vision tower
 //                  full precision). Resolved against the model's tensor names;
 //                  vision/audio scopes are plain-quant only (no awq/mixed).
+//   quant_exclude (string, default "") -- comma-separated tensor-name
+//                  substrings to leave dense. Required with a wholesale
+//                  `target` scope: that rule takes every 2D fp tensor whose
+//                  leaf is not a norm/embedding, which also catches f32
+//                  modulation TABLES and tiny gate projections. Excluding
+//                  them is not tuning -- quantizing them produces a
+//                  checkpoint that loads and generates the wrong thing.
 //   skip_existing (bool, default true) -- skip if the output config.json
 //                  already exists.
 //   awq           (bool, default false) -- AWQ activation-aware smoothing
@@ -205,6 +212,7 @@ private:
   int         _high_bits{};
   float       _mixed_frac{};
   std::string _layer_prefix;
+  std::string _quant_exclude;   // comma-separated name substrings
   int         _n_layers{};
   bool        _quant_modulation{};   // QIE DiT: quantize *_mod.1 too (opt-in)
   bool        _quant_vision{};       // text encoder: quantize its vision

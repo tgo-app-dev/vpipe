@@ -432,13 +432,39 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
           : "v.patch_embd.weight." + std::to_string(t);
       const GgufFile::Tensor* tn = gg->tensor(nm);
       if (tn == nullptr) { return {}; }
-      const float* s = reinterpret_cast<const float*>(tn->data);  // F32
-      if (tn->type != GgufFile::kF32) { return {}; }
+      // F32 / F16 / BF16, because WHICH one it is varies with the
+      // projector twin: llama.cpp's BF16 mmproj leaves patch_embd at
+      // F32, its F16 mmproj narrows it to F16. Reading only F32 made
+      // the F16 projector return an empty weight -- a tower that fails
+      // to load rather than one that loads wrong, but a failure the
+      // catalogue would have walked straight into.
+      //
+      // Whatever the source, the destination is the 2-byte compute
+      // dtype below: no f32 staging buffer is allocated and nothing
+      // downstream widens, so an F16 projector in a bf16 run costs one
+      // per-element register conversion at LOAD and then runs at
+      // 16-bit width exactly like a BF16 one.
+      if (tn->type != GgufFile::kF32 && tn->type != GgufFile::kF16
+          && tn->type != GgufFile::kBF16) {
+        return {};
+      }
+      auto elem = [&](std::size_t i) -> float {
+        if (tn->type == GgufFile::kF32) {
+          return reinterpret_cast<const float*>(tn->data)[i];
+        }
+        const auto* h =
+            reinterpret_cast<const std::uint16_t*>(tn->data);
+        if (tn->type == GgufFile::kBF16) { return bf16_to_f32_(h[i]); }
+        _Float16 v;
+        std::memcpy(&v, &h[i], 2);
+        return (float)v;
+      };
       for (int oi = 0; oi < outc; ++oi) {
         for (int c = 0; c < inch; ++c) {
           for (int hw = 0; hw < kHW; ++hw) {
             o[(std::size_t)oi * feat + t * per_frame + hw * inch + c] =
-                enc_elt_(s[((std::size_t)oi * inch + c) * kHW + hw], bf16);
+                enc_elt_(elem(((std::size_t)oi * inch + c) * kHW + hw),
+                         bf16);
           }
         }
       }

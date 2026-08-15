@@ -534,6 +534,8 @@ struct PipelinePane: View {
     @State private var selection: PipelineFile?
     @State private var consoleExpanded = false
     @State private var confirmComposer = false
+    @State private var plugins: [PluginFile] = []
+    @State private var pluginsExpanded = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -547,6 +549,8 @@ struct PipelinePane: View {
                 List(files, selection: $selection) { f in
                     pipelineRow(f).tag(f)
                 }
+                // Above Run, because it changes what Run does.
+                pluginsSection
                 controlsBar
                 terminalHintRow
             }
@@ -608,6 +612,9 @@ struct PipelinePane: View {
         script += shellQuote(BundlePaths.cli.path)
         script += " --launch " + shellQuote(file.url.path)
         if cfg != "{}" { script += " --config " + shellQuote(cfg) }
+        for p in model.enabledPluginPaths() {
+            script += " --plugin " + shellQuote(p)
+        }
         script += "\n"
 
         let dir = FileManager.default.temporaryDirectory
@@ -677,6 +684,133 @@ struct PipelinePane: View {
                 NSWorkspace.shared.open(model.workDirURL)
             }
         }
+    }
+
+    // MARK: plugins
+    //
+    // Listing only. A file appearing in <work>/plugins does not load it;
+    // ticking it here and running a pipeline does. That is the runtime's
+    // own rule (common/plugins-root.h) and it is worth preserving in the
+    // UI, because a folder that is scanned must not become a folder that
+    // is trusted.
+    //
+    // Not shown for the web UI, which loads and unloads plugins itself
+    // while it runs -- these boxes would fight it.
+    @ViewBuilder
+    private var pluginsSection: some View {
+        DisclosureGroup(isExpanded: $pluginsExpanded) {
+            pluginsBody
+        } label: {
+            pluginsLabel
+        }
+    }
+
+    @ViewBuilder
+    private var pluginsLabel: some View {
+        HStack(spacing: 6) {
+            Text("Plugins").font(.subheadline.weight(.semibold))
+            Text(pluginsSummary)
+                .font(.caption).foregroundStyle(Color.secondary)
+            Spacer()
+            Button("Open Folder") {
+                NSWorkspace.shared.open(model.pluginsDirURL)
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .disabled(!pluginsDirExists)
+        }
+    }
+
+    @ViewBuilder
+    private var pluginsBody: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if plugins.isEmpty {
+                Text(pluginsEmptyHint)
+                    .font(.caption).foregroundStyle(Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(plugins) { p in
+                    Toggle(isOn: pluginBinding(p)) {
+                        Text(p.name).font(.callout)
+                    }
+                    .toggleStyle(.checkbox)
+                }
+                Text("Checked plugins are passed to the run and stay "
+                     + "loaded for it. Changing them applies to the next "
+                     + "run, not the one going now.")
+                    .font(.caption).foregroundStyle(Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            missingPluginsRow
+        }
+        .padding(.leading, 4)
+        .padding(.top, 2)
+    }
+
+    // A selection outlives the file it names -- a plugin rebuilt
+    // elsewhere, a work directory moved. Those are dropped from the run
+    // rather than handed to vpipe as a path that is not there, so say
+    // which, instead of quietly running with fewer plugins than the
+    // boxes show.
+    @ViewBuilder
+    private var missingPluginsRow: some View {
+        if !missingPlugins.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Not in this folder: "
+                     + missingPlugins.joined(separator: ", ")
+                     + " — skipped when running.")
+                    .font(.caption).foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Forget") {
+                    let have = Set(plugins.map(\.name))
+                    model.enabledPlugins =
+                        model.enabledPlugins.filter { have.contains($0) }
+                }
+                .buttonStyle(.borderless).font(.caption)
+            }
+        }
+    }
+
+    private func pluginBinding(_ p: PluginFile) -> Binding<Bool> {
+        Binding(
+            get: { model.enabledPlugins.contains(p.name) },
+            set: { on in
+                var s = model.enabledPlugins.filter { $0 != p.name }
+                if on { s.append(p.name) }
+                model.enabledPlugins = s.sorted()
+            })
+    }
+
+    private var pluginsDirExists: Bool {
+        var isDir: ObjCBool = false
+        let ok = FileManager.default.fileExists(
+            atPath: model.pluginsDirURL.path, isDirectory: &isDir)
+        return ok && isDir.boolValue
+    }
+
+    // Counted against what is PRESENT, so the summary and the run agree.
+    private var selectedPluginCount: Int {
+        let have = Set(plugins.map(\.name))
+        return model.enabledPlugins.filter { have.contains($0) }.count
+    }
+
+    private var missingPlugins: [String] {
+        let have = Set(plugins.map(\.name))
+        return model.enabledPlugins.filter { !have.contains($0) }
+    }
+
+    private var pluginsSummary: String {
+        plugins.isEmpty ? "none found"
+                        : "\(selectedPluginCount) of \(plugins.count) selected"
+    }
+
+    private var pluginsEmptyHint: String {
+        pluginsDirExists
+            ? "No plugin files here. Put .so or .dylib plugins in "
+              + model.pluginsDirURL.path + "."
+            : "No plugins folder yet. Create "
+              + model.pluginsDirURL.path
+              + " and put .so or .dylib plugins in it."
     }
 
     // For anything that genuinely needs a terminal. The console below
@@ -754,6 +888,7 @@ struct PipelinePane: View {
 
     private func reload() {
         files = runner.discover(workDir: model.workDirURL)
+        plugins = PluginCatalog.discover(in: model.pluginsDirURL)
         if let sel = selection,
            !files.contains(where: { $0.id == sel.id }) { selection = nil }
     }

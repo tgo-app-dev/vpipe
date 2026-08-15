@@ -1022,14 +1022,34 @@ function mountEditor(container, opts = {}) {
   function renderToolbox() {
     clear(toolboxBody);
     const q = (toolboxFilter.value || '').toLowerCase();
-    const match = state.stageTypes.filter((s) => !s.hidden && (
+    // `plugin_enabled === false` means a loaded plugin the session has
+    // switched off: its stages stay in state.stageTypes so an
+    // already-placed instance still renders with its spec, and drop out
+    // of the toolbox so nothing new can be built from them.
+    const match = state.stageTypes.filter((s) => !s.hidden
+      && s.plugin_enabled !== false && (
       s.type.toLowerCase().includes(q)
       || (s.doc || '').toLowerCase().includes(q)
       || (s.category || '').toLowerCase().includes(q)));
-    // Bucket by category, then render in CATEGORY_ORDER (unknown
-    // categories fall to the end, alphabetically).
+    // Built-ins bucket by category; anything a PLUGIN contributed gets a
+    // section of its own, named after the plugin, after the built-ins.
+    //
+    // Grouped by origin rather than category on purpose. A plugin stage's
+    // category says what it does, which the built-in sections already
+    // cover -- what a reader cannot otherwise tell is that the stage
+    // exists only because a .dylib was loaded, and will vanish from a
+    // deployment that does not load it. That is the property worth a
+    // heading. Plugin stages therefore appear ONCE, under their plugin,
+    // not also under their category.
     const byCat = new Map();
+    const byPlugin = new Map();
     for (const s of match) {
+      const p = s.plugin || '';
+      if (p) {
+        if (!byPlugin.has(p)) { byPlugin.set(p, []); }
+        byPlugin.get(p).push(s);
+        continue;
+      }
       const c = s.category || 'generic';
       if (!byCat.has(c)) { byCat.set(c, []); }
       byCat.get(c).push(s);
@@ -1043,6 +1063,15 @@ function mountEditor(container, opts = {}) {
       const items = byCat.get(c).sort((a, b) => a.type.localeCompare(b.type));
       toolboxBody.append(el('div', { class: 'tb-cat' },
         tOr('cat.' + c, c) + ' (' + items.length + ')'));
+      for (const s of items) { toolboxBody.append(stageChip(s)); }
+    }
+    for (const p of [...byPlugin.keys()].sort((a, b) => a.localeCompare(b))) {
+      const items = byPlugin.get(p).sort(
+        (a, b) => a.type.localeCompare(b.type));
+      // The plugin NAME is not translated -- it is a proper noun the
+      // plugin chose. Only the "plugin" label around it is.
+      toolboxBody.append(el('div', { class: 'tb-cat tb-plugin' },
+        t('pl.plugin_group') + ' ' + p + ' (' + items.length + ')'));
       for (const s of items) { toolboxBody.append(stageChip(s)); }
     }
     if (match.length === 0) {

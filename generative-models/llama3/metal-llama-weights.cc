@@ -5,6 +5,8 @@
 #include "generative-models/model-loader.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
+#include "common/vpipe-format.h"
+#include "interfaces/session-context-intf.h"
 
 #include <cstdio>
 #include <cstring>
@@ -150,7 +152,15 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // vae/, so there is no directory whose contents this could glob and
   // no config.json beside it. Its own header is self-describing, which
   // is all the single-file path needs.
-  if (fs::is_regular_file(dir, ec) && !ec) {
+  //
+  // A `.gguf` named by file is NOT that case -- it falls through to the
+  // GGUF branch below, whose find_gguf_in_dir() takes a file path as
+  // well as a directory. Sending it here instead mmapped a GGUF as
+  // safetensors and failed, which read as "the model does not load"
+  // even though the tokenizer (which resolves the path itself) had
+  // already come up. Naming the file is how a caller picks ONE quant out
+  // of a repo directory that holds several, so it has to work.
+  if (fs::is_regular_file(dir, ec) && !ec && dir.extension() != ".gguf") {
     return open(model_dir);
   }
 
@@ -385,13 +395,20 @@ MetalLlamaWeights::is_gguf() const noexcept
 
 metal_compute::SharedBuffer
 MetalLlamaWeights::load(const std::string& name,
-                        metal_compute::MetalCompute* mc) const
+                        metal_compute::MetalCompute* mc,
+                        LoadCost* cost) const
 {
   const TensorInfo* ti = info(name);
   if (ti == nullptr || mc == nullptr) {
     return {};
   }
+  const auto t_a0 = cost != nullptr ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   metal_compute::SharedBuffer buf = mc->make_shared_buffer(ti->nbytes);
+  if (cost != nullptr) {
+    cost->alloc_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_a0).count();
+  }
   if (buf.empty()) {
     return buf;
   }
@@ -408,7 +425,13 @@ MetalLlamaWeights::load(const std::string& name,
   const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
   const auto* src =
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
+  const auto t_f0 = cost != nullptr ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   std::memcpy(buf.contents(), src, ti->nbytes);
+  if (cost != nullptr) {
+    cost->fetch_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_f0).count();
+  }
   return buf;
 }
 
@@ -468,6 +491,36 @@ MetalLlamaWeights::load_mapped(const std::string& name,
   const std::size_t goff = sh.data_start + ti->offset;
   const std::size_t end  = goff + ti->nbytes;
   if ((goff & 0xF) != 0 || sh.base == nullptr || end > sh.map_size) {
+    // SAY SO, once per shard.
+    //
+    // This fallback is correct and it used to be silent, which made it
+    // the most expensive quiet decision in the loader: a checkpoint
+    // whose data section is misaligned copies EVERY tensor, so a model
+    // asking for `Mapped` gets gigabytes of anonymous memory and no
+    // indication that it did. MEASURED on a 22B DiT: 4349 of 4349
+    // tensors, 39.1 GB, all copied because the file's data begins at
+    // 677624 -- 8 mod 16. The symptom reached the operator as a box
+    // thrashing with 36 GB in the compressor, which is a long way from
+    // the cause.
+    //
+    // Per shard rather than per tensor because one data_start decides
+    // them all; the count of tensors would add nothing the alignment
+    // does not already say.
+    if ((goff & 0xF) != 0 && mc->session() != nullptr) {
+      if (_shard_unmappable_said.size() < _shards.size()) {
+        _shard_unmappable_said.resize(_shards.size(), false);
+      }
+      if (!_shard_unmappable_said[si]) {
+        _shard_unmappable_said[si] = true;
+        mc->session()->warn(fmt(
+            "weights: shard {} is NOT zero-copy mappable -- its data "
+            "section starts at {} ({} mod 16, and a Metal buffer offset "
+            "must be 16-byte aligned), so every tensor in it is COPIED "
+            "into anonymous memory instead. Residency::Mapped is a no-op "
+            "for this shard; size the box for the copies",
+            si, sh.data_start, sh.data_start & 0xF));
+      }
+    }
     return load(name, mc);
   }
 

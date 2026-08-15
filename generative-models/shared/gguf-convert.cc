@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 namespace vpipe::genai {
 
@@ -47,6 +50,7 @@ find_gguf_in_dir(const std::string& dir)
     return {};
   }
   std::string best;
+  int candidates = 0;
   for (const auto& e : fs::directory_iterator(dir, ec)) {
     if (ec) { break; }
     if (!e.is_regular_file()) { continue; }
@@ -55,9 +59,25 @@ find_gguf_in_dir(const std::string& dir)
     const std::string fn = p.filename().string();
     // Skip the multimodal projector; pick the main model shard.
     if (fn.rfind("mmproj", 0) == 0) { continue; }
+    ++candidates;
     if (best.empty() || fn < fs::path(best).filename().string()) {
       best = p.string();
     }
+  }
+  // One repo can publish several quantization points, and the fetch
+  // stage puts them all in <base>/<owner>/<repo> -- so a directory CAN
+  // hold more than one runnable model and this lexicographic pick is
+  // then a guess (Q4_K_M sorts before Q8_0, so the smaller one wins).
+  // Say so: silently loading a different quant than the one asked for is
+  // the kind of thing that gets read as a quality regression. The caller
+  // pins a specific one by pointing hf_dir at the .gguf FILE, which the
+  // branch above accepts.
+  if (candidates > 1) {
+    std::fprintf(stderr,
+                 "[gguf] %s holds %d model .gguf files; using '%s'. "
+                 "Point hf_dir at a specific .gguf to choose.\n",
+                 dir.c_str(), candidates,
+                 fs::path(best).filename().string().c_str());
   }
   return best;
 }
@@ -153,11 +173,21 @@ gguf_to_qwen35_config_(const GgufFile& g, ModelConfig* out)
         static_cast<int>(g.array_len("tokenizer.ggml.tokens"));
   }
 
-  // Native k-quant payloads -- not a single uniform affine bit-width. The
-  // metal Qwen GGUF path keys off per-tensor ggml types, not this field;
-  // left at the affine default so non-k-quant code paths stay sane.
-  out->quantization.bits = 4;
-  out->quantization.group_size = 0;
+  // Native k-quant payloads are not a single uniform affine bit-width, and
+  // the metal Qwen keys off per-tensor ggml types there -- so for those
+  // this field is decorative and stays at the affine default.
+  //
+  // A Q8_0 file is different: its linears are REPACKED to affine 8-bit
+  // group 64 (see GgufQwen35Converter), and the model picks its whole
+  // fused kernel family from this one number (`quant_bits == 8 ? w8g64 :
+  // w4g64`). Leaving it at 4 binds 4-bit kernels over 8-bit weights,
+  // which is a mis-bind the loader cannot detect -- so read it off the
+  // payload instead of assuming.
+  const GgufFile::Tensor* probe = g.tensor("blk.0.ffn_gate.weight");
+  if (probe == nullptr) { probe = g.tensor("blk.0.ffn_up.weight"); }
+  const bool q8 = probe != nullptr && probe->type == GgufFile::kQ8_0;
+  out->quantization.bits = q8 ? 8 : 4;
+  out->quantization.group_size = q8 ? 64 : 0;
   return out->n_layers > 0 && out->hidden > 0;
 }
 
@@ -507,6 +537,9 @@ GgufGemma4Converter::convert(const ConvertedTensorSpec& spec,
     }
     case Op::kKQuantRaw:
     case Op::kSsmALog:
+    case Op::kQ8Weight:
+    case Op::kQ8Scales:
+    case Op::kQ8Biases:
       return false;   // qwen35-only ops; never produced by this converter
   }
   return false;
@@ -544,13 +577,69 @@ GgufQwen35Converter::build_specs_()
   // the metal qmv reads it row-major as [N, K-blocked] -- byte-identical
   // to the GGUF payload, so this is a pure passthrough (dtype tags the
   // k-quant family for the loader's per-tensor dispatch).
+  // Emit the MLX-affine 8-bit group-64 triple for one Q8_0 tensor of
+  // GGUF shape [in, out]. Shared by the linears, the embedding table and
+  // an untied lm_head -- a whole-file Q8_0 checkpoint has all three in
+  // this type, and the loader reads all three through the same
+  // `.weight` / `.scales` / `.biases` probe.
+  auto add_q8_affine = [&](const std::string& gname, const std::string& base,
+                           std::int64_t in, std::int64_t out) {
+    // 64 must divide the input width (one scale/bias per group) and the
+    // code packing is 4 per u32. A shape this cannot represent is left
+    // out, exactly as an unsupported k-quant is -- the missing tensor
+    // then fails the load loudly rather than loading something wrong.
+    if (in % 64 != 0) { return; }
+    _specs.push_back({base + ".weight", "U32", {out, in / 4},
+                      static_cast<std::uint64_t>(out) * (in / 4) * 4,
+                      gname, Op::kQ8Weight});
+    _specs.push_back({base + ".scales", "F16", {out, in / 64},
+                      static_cast<std::uint64_t>(out) * (in / 64) * 2,
+                      gname, Op::kQ8Scales});
+    _specs.push_back({base + ".biases", "F16", {out, in / 64},
+                      static_cast<std::uint64_t>(out) * (in / 64) * 2,
+                      gname, Op::kQ8Biases});
+  };
   auto add_kq = [&](const std::string& gname, const std::string& hf) {
     const GgufFile::Tensor* t = _g->tensor(gname);
     if (t == nullptr || t->dims.size() != 2) { return; }
-    const char* dt = kquant_dtype_(t->type);
-    if (dt == nullptr) { return; }
     const std::int64_t in = t->dims[0], out = t->dims[1];
-    _specs.push_back({hf, dt, {out, in}, t->nbytes, gname, Op::kKQuantRaw});
+    if (const char* dt = kquant_dtype_(t->type); dt != nullptr) {
+      _specs.push_back({hf, dt, {out, in}, t->nbytes, gname, Op::kKQuantRaw});
+      return;
+    }
+    // Q8_0 -> MLX-affine 8-bit, group 64. A whole-file Q8_0 checkpoint
+    // (llama.cpp's `-q8_0`) has every linear in this type, so without
+    // this the model converts to NO weights at all.
+    //
+    // WHY GROUP 64 AND NOT 32. Q8_0's block is 32 values with one f16
+    // scale `d` and dequant `d*q`, which maps onto affine EXACTLY at
+    // group 32 -- code = q + 128, scale = d, bias = -128*d, all three
+    // exact in f16. Group 64 straddles two blocks with different scales
+    // and cannot be exact, so this is a requant. It is group 64 anyway
+    // because the metal Qwen accepts only 4/8-bit group-64 affine (it
+    // rejects anything else at load), and because the g64 kernel family
+    // is the complete one -- the fused qkv/swiglu and batched-decode
+    // variants every Qwen decode path reaches exist only at g64, while
+    // g32 ships just a plain qmv, a steel qmm and a dequant.
+    //
+    // MEASURED on Qwen3.8-27B blk.0.attn_qkv (9 rows, 46080 values)
+    // against the bf16 original this GGUF was made from:
+    //     Q8_0 itself vs bf16      5.37e-03
+    //     this repack vs Q8_0      5.31e-03
+    //     this repack vs bf16      7.55e-03
+    // So the requant costs about as much again as Q8_0's own error, and
+    // lands 41% above it in total. That is the honest price of running
+    // Q8_0 with no new kernels; the lossless alternative is group 32,
+    // which needs the loader to accept it and the de-fused dispatch to
+    // cover decode.
+    if (t->type != GgufFile::kQ8_0) { return; }
+    // add_kq is handed the name WITH ".weight"; the affine triple hangs
+    // off the base, which is what the loader probes for.
+    const std::string base =
+        (hf.size() > 7 && hf.compare(hf.size() - 7, 7, ".weight") == 0)
+            ? hf.substr(0, hf.size() - 7)
+            : hf;
+    add_q8_affine(gname, base, in, out);
   };
   // An f32 side-tensor (norm / conv1d / dt_bias / dequant of a tiny Q8_0
   // alpha/beta projection): GgufFile::dequant_all_f32 handles f32 + q8_0.
@@ -562,6 +651,40 @@ GgufQwen35Converter::build_specs_()
                       static_cast<std::uint64_t>(t->numel()) * 4, gname, op});
   };
 
+  // Is the WHOLE file Q8_0 (so every linear takes the affine path above)?
+  // Probe a tensor every checkpoint has; it decides how the two tiny
+  // alpha/beta projections are emitted.
+  const GgufFile::Tensor* aprobe = _g->tensor("blk.0.ffn_gate.weight");
+  const bool all_affine =
+      aprobe != nullptr && aprobe->type == GgufFile::kQ8_0;
+
+  // in_proj_a / in_proj_b are Q8_0 in EVERY qwen35 GGUF, k-quant file or
+  // not -- llama.cpp keeps these two [hidden, 48] projections at 8 bits
+  // whatever the rest is quantized to. Which form they must take depends
+  // on the path the LAYER takes, not on their own type:
+  //   * k-quant file -- the layer loads its four in_proj tensors
+  //     separately and a/b go through load_ab as dense f16, so f32 here;
+  //   * Q8_0 file -- the layer FUSES all four into ONE affine slab
+  //     (fuse_q), so a/b must be affine triples like their siblings.
+  // Emitting f32 in the second case is what made a Q8_0 checkpoint fail
+  // to build layer 0 with no message at all: fuse_q just found no
+  // `.scales` and returned false into an accumulated `ok`.
+  auto add_ab = [&](const std::string& gname, const std::string& hf) {
+    const GgufFile::Tensor* t = _g->tensor(gname);
+    if (t == nullptr) { return; }
+    if (all_affine && t->type == GgufFile::kQ8_0 && t->dims.size() == 2) {
+      const std::string base =
+          (hf.size() > 7 && hf.compare(hf.size() - 7, 7, ".weight") == 0)
+              ? hf.substr(0, hf.size() - 7)
+              : hf;
+      add_q8_affine(gname, base, t->dims[0], t->dims[1]);
+      return;
+    }
+    _specs.push_back({hf, "F32", t->dims,
+                      static_cast<std::uint64_t>(t->numel()) * 4, gname,
+                      Op::kFloatPass});
+  };
+
   const std::string P = "language_model.model.";
 
   // token_embd: raw k-quant table, gathered + matvec'd natively (no affine
@@ -571,9 +694,9 @@ GgufQwen35Converter::build_specs_()
   // the raw copy is the same lossless super-block memcpy for all three.
   if (const GgufFile::Tensor* emb = _g->tensor("token_embd.weight");
       emb != nullptr && emb->dims.size() == 2) {
+    const std::int64_t hidden = emb->dims[0], vocab = emb->dims[1];
     const char* dt = kquant_dtype_(emb->type);
     if (dt != nullptr) {
-      const std::int64_t hidden = emb->dims[0], vocab = emb->dims[1];
       const char* sfx = emb->type == GgufFile::kQ6_K ? "embed_tokens.q6k"
                       : emb->type == GgufFile::kQ4_K ? "embed_tokens.q4k"
                                                      : "embed_tokens.q5k";
@@ -581,6 +704,11 @@ GgufQwen35Converter::build_specs_()
                                                  : Op::kKQuantRaw;
       _specs.push_back({P + sfx, dt, {vocab, hidden},
                         emb->nbytes, "token_embd.weight", op});
+    } else if (emb->type == GgufFile::kQ8_0) {
+      // The AFFINE embed the loader already understands (it probes
+      // embed_tokens for `.scales` and reads its width per tensor), so
+      // the gather and the tied-lm_head matvec both come for free.
+      add_q8_affine("token_embd.weight", P + "embed_tokens", hidden, vocab);
     }
   }
   // Untied lm_head: GGUF output.weight -> language_model.lm_head.weight, a raw
@@ -588,11 +716,13 @@ GgufQwen35Converter::build_specs_()
   // natively (qmv_q6k). Absent on tied checkpoints (lm_head == token_embd).
   if (const GgufFile::Tensor* ow = _g->tensor("output.weight");
       ow != nullptr && ow->dims.size() == 2) {
+    const std::int64_t in = ow->dims[0], outd = ow->dims[1];
     const char* dt = kquant_dtype_(ow->type);
     if (dt != nullptr) {
-      const std::int64_t in = ow->dims[0], outd = ow->dims[1];
       _specs.push_back({"language_model.lm_head.weight", dt, {outd, in},
                         ow->nbytes, "output.weight", Op::kKQuantRaw});
+    } else if (ow->type == GgufFile::kQ8_0) {
+      add_q8_affine("output.weight", "language_model.lm_head", in, outd);
     }
   }
   add_f32("output_norm.weight", P + "norm.weight");
@@ -609,9 +739,10 @@ GgufQwen35Converter::build_specs_()
       add_kq(bp + "attn_qkv.weight",  hp + "linear_attn.in_proj_qkv.weight");
       add_kq(bp + "attn_gate.weight", hp + "linear_attn.in_proj_z.weight");
       add_kq(bp + "ssm_out.weight",   hp + "linear_attn.out_proj.weight");
-      // The two tiny Q8_0 alpha/beta projections -> f32 (loader -> f16).
-      add_f32(bp + "ssm_alpha.weight", hp + "linear_attn.in_proj_a.weight");
-      add_f32(bp + "ssm_beta.weight",  hp + "linear_attn.in_proj_b.weight");
+      // The two tiny Q8_0 alpha/beta projections: f32 for a k-quant
+      // file, affine for an all-Q8_0 one -- see add_ab.
+      add_ab(bp + "ssm_alpha.weight", hp + "linear_attn.in_proj_a.weight");
+      add_ab(bp + "ssm_beta.weight",  hp + "linear_attn.in_proj_b.weight");
       add_f32(bp + "ssm_conv1d.weight", hp + "linear_attn.conv1d.weight");
       add_f32(bp + "ssm_dt.bias",       hp + "linear_attn.dt_bias");
       add_f32(bp + "ssm_norm.weight",   hp + "linear_attn.norm.weight");
@@ -674,8 +805,10 @@ GgufQwen35Converter::convert(const ConvertedTensorSpec& spec,
       std::memcpy(dst, t->data, spec.nbytes);
       return true;
     }
-    case Op::kFloatPass:
-      return _g->dequant_all_f32(*t, reinterpret_cast<float*>(dst));
+    case Op::kFloatPass: {
+      auto* out = reinterpret_cast<float*>(dst);
+      return _g->dequant_all_f32(*t, out);
+    }
     case Op::kSsmALog: {
       // ssm_a = -exp(A_log); recover A_log = log(-ssm_a). The metal GDN
       // step re-derives -exp(A_log) inside the kernel (matching HF).
@@ -686,6 +819,76 @@ GgufQwen35Converter::convert(const ConvertedTensorSpec& spec,
       for (std::size_t i = 0; i < n; ++i) {
         const float a = tmp[i];
         out[i] = (a < 0.0f) ? std::log(-a) : 0.0f;
+      }
+      return true;
+    }
+    case Op::kQ8Weight:
+    case Op::kQ8Scales:
+    case Op::kQ8Biases: {
+      if (t->type != GgufFile::kQ8_0 || t->dims.size() != 2) {
+        return false;
+      }
+      const std::int64_t K = t->dims[0], N = t->dims[1];
+      if (K % 64 != 0) { return false; }
+      constexpr int kG = 64;
+      const std::int64_t ngrp = K / kG;
+      const std::int64_t row_bytes = (K / 32) * 34;   // q8_0 block = 2 + 32
+
+      // The scale/bias pass needs only each group's min and max, so it
+      // skips the rounding the weight pass does. All three ops walk the
+      // tensor once; the source unpack is a multiply, which is why this
+      // is not worth a cross-spec cache the way the q6_K embed was.
+      const bool want_w = (spec.op == Op::kQ8Weight);
+      std::vector<float> row((std::size_t)K);
+      auto* dw = reinterpret_cast<std::uint8_t*>(dst);
+      auto* dh = reinterpret_cast<std::uint16_t*>(dst);
+
+      for (std::int64_t r = 0; r < N; ++r) {
+        const std::uint8_t* rp = t->data + r * row_bytes;
+        for (std::int64_t b = 0; b < K / 32; ++b) {
+          const std::uint8_t* blk = rp + b * 34;
+          std::uint16_t d16;
+          std::memcpy(&d16, blk, 2);
+          const float d = f16_to_f32_(d16);
+          const auto* q = reinterpret_cast<const std::int8_t*>(blk + 2);
+          for (int j = 0; j < 32; ++j) {
+            row[(std::size_t)(b * 32 + j)] = d * (float)q[j];
+          }
+        }
+        for (std::int64_t g = 0; g < ngrp; ++g) {
+          const float* s = row.data() + g * kG;
+          float lo = s[0], hi = s[0];
+          for (int j = 1; j < kG; ++j) {
+            lo = std::min(lo, s[j]);
+            hi = std::max(hi, s[j]);
+          }
+          // scale and bias are STORED as f16 and the kernel dequantizes
+          // with the stored values, so the codes must be solved against
+          // the f16-rounded pair -- rounding them afterwards would shift
+          // every value by up to half a step.
+          const std::uint16_t sc16 = f32_to_f16_((hi - lo) / 255.0f);
+          const std::uint16_t bi16 = f32_to_f16_(lo);
+          const float sc = f16_to_f32_(sc16);
+          const float bi = f16_to_f32_(bi16);
+          if (!want_w) {
+            dh[(std::size_t)r * ngrp + g] =
+                (spec.op == Op::kQ8Scales) ? sc16 : bi16;
+            continue;
+          }
+          // 8-bit codes are ONE BYTE per value in K order; the kernel
+          // reads them as `p & 0x00ff` / `p >> 8` out of a little-endian
+          // pack, so a sequential byte write is the packing.
+          std::uint8_t* o = dw + (std::size_t)r * K + g * kG;
+          if (sc <= 0.0f) {
+            // A constant group: every value is `bias`, code 0.
+            std::memset(o, 0, kG);
+            continue;
+          }
+          for (int j = 0; j < kG; ++j) {
+            const float c = std::round((s[j] - bi) / sc);
+            o[j] = (std::uint8_t)std::min(255.0f, std::max(0.0f, c));
+          }
+        }
       }
       return true;
     }

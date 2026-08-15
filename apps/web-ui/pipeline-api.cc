@@ -12,6 +12,7 @@
 #include "pipeline/pipeline-spec.h"
 #include "pipeline/stage.h"
 #include "pipeline/stage-registry.h"
+#include "plugin/plugin-manager.h"
 #include "vpipe/session-intf.h"
 
 #include <algorithm>
@@ -494,6 +495,19 @@ PipelineApi::h_stage_types_(const HttpRequest&)
     FlexData o = FlexData::make_object();
     auto oo = o.as_object();
     oo.insert("type", fstr(n));
+    // Which plugin contributed this type, "" for the built-ins. The
+    // toolbox groups by it, so a stage that appeared because a .dylib
+    // was passed on the command line says so instead of sitting
+    // anonymously among the built-ins.
+    const std::string origin(StageRegistry::get().origin(n));
+    oo.insert("plugin", FlexData::make_string(origin));
+    // A DISABLED plugin's stages stay in the list -- an already-placed
+    // instance still needs its spec to render -- but the composer omits
+    // them from the toolbox, exactly as it does for `hidden`. The plugin
+    // itself is still loaded and mapped; vpipe does not unload plugins.
+    oo.insert("plugin_enabled",
+              FlexData::make_bool(
+                  origin.empty() || PluginManager::get().enabled(origin)));
     // Qualify: SessionApi has its own private `StageSpec` (the editable
     // spec entry), so the registry's vpipe::StageSpec needs the prefix.
     const vpipe::StageSpec* sp = StageRegistry::get().spec(n);

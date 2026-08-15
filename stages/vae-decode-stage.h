@@ -15,6 +15,7 @@
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #endif
 
@@ -101,6 +102,19 @@ private:
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
   // clip at once instead of streaming chunks through a sink.
   std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+
+  // ---- an out-of-tree family (VaeModelRegistry) -------------------------
+  // Consulted BEFORE the built-in `_class_name` chain, mirroring how
+  // generate-video consults VideoModelRegistry before its built-in
+  // dispatch. BORROWED: the registry is process-wide and outlives every
+  // stage. `_family` is set from the family's tag() so the log lines read
+  // like a built-in's, but every dispatch below is guarded on the
+  // POINTER, never on the string.
+  genai::VaeModelFamily*             _vae_family = nullptr;
+  std::unique_ptr<genai::VaeDecoder> _plugin_dec;
+  // The probe reads a checkpoint header, so it runs once rather than on
+  // every idle-unload reload.
+  bool _family_probed = false;
 
   // Frame rate stamped onto each emitted video frame's sideband when the
   // producer did not supply one. Only meaningful for the "wan" family.

@@ -137,6 +137,9 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         model-quantize-stage.cc
         model-eval-stage.cc
         model-exec-registry.cc
+        vae-model-registry.cc
+        video-model-registry.cc
+        hidden-state-encoder.cc
         plugin-metal-library.cc
         model-benchmark-stage.cc
         gemma-bench-driver.cc
@@ -158,6 +161,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-dit.cc
         minimax-h3-vvae.cc
         minimax-h3-avae.cc
+        audio-vae-encode.cc
+        load-audio-stage.cc
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
         mage-vae.cc

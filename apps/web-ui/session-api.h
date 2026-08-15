@@ -8,6 +8,7 @@
 #include "apps/web-ui/io-api.h"
 #include "apps/web-ui/log-api.h"
 #include "apps/web-ui/pipeline-api.h"
+#include "apps/web-ui/plugin-api.h"
 #include "apps/web-ui/profiler-api.h"
 #include "apps/web-ui/startup-checks.h"
 #include "apps/web-ui/system-api.h"
@@ -38,7 +39,7 @@ class WebUiLogDelegate;
 // /api/fs and /api/cwd-pipelines -> FileApi; /api/io -> IoApi;
 // /api/log -> LogApi; /api/profiler -> ProfilerApi; /api/system,
 // /api/startup-checks, /api/i18n and /api/hls -> SystemApi;
-// /api/ui/views -> ViewApi.
+// /api/ui/views -> ViewApi; /api/plugins -> PluginApi.
 //
 // All operations are still serialized by ONE mutex, which lives in the
 // ApiContext -- see api-context.h for why that was not split up.
@@ -82,6 +83,7 @@ private:
   IoApi                              _io{_ctx};
   LogApi                             _logs{_ctx};
   ProfilerApi                        _profiler{_ctx};
+  PluginApi                          _plugins{_ctx};
   SystemApi                          _system{_ctx, _pipelines};
   ViewApi                            _views{_ctx, _pipelines};
 };

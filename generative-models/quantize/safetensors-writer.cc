@@ -135,6 +135,38 @@ SafetensorsWriter::finalize_shard_(int idx, int total, std::string& out_name)
   }
   hdr += '}';
 
+  // ---- PAD SO THE DATA SECTION IS 16-BYTE ALIGNED --------------------
+  //
+  // The file layout is [u64 header length][header JSON][data], so the
+  // data begins at 8 + hdr.size(). Tensors are packed contiguously from
+  // there, which means that one number decides the alignment of EVERY
+  // tensor in the shard.
+  //
+  // Why 16: the zero-copy read path (MetalLlamaWeights::load_mapped)
+  // wraps a whole shard in one Metal buffer and hands out subviews at
+  // each tensor's offset, and a Metal buffer offset must be 16-byte
+  // aligned. A tensor that is not falls back to a COPY -- correct, but
+  // it allocates and it is silent.
+  //
+  // MEASURED before this: an unpadded header put the data at an
+  // arbitrary offset (five shards of one checkpoint came out at 7, 8,
+  // 12, 11 and 15 mod 16), so **100% of tensors copied** and `Mapped`
+  // was a no-op for everything this writer produced. The published
+  // checkpoints are no better by default -- safetensors pads its header
+  // to 8, and the 8-byte length prefix then lands the data on an odd
+  // 16-boundary, which is why so many read as `%16 == 8`.
+  //
+  // Trailing SPACES after the closing brace: the header is JSON, so
+  // whitespace is insignificant, and every reader (including this
+  // tree's) takes the length from the prefix rather than by parsing to
+  // the end. That makes the padding invisible to anything that reads it
+  // and free to anything that does not care.
+  {
+    const std::size_t data_at = 8 + hdr.size();
+    const std::size_t pad     = (16 - (data_at % 16)) % 16;
+    hdr.append(pad, ' ');
+  }
+
   out_name = fmt_shard_name_(idx, total);
   const std::string final_path =
       (std::filesystem::path(_out_dir) / out_name).string();

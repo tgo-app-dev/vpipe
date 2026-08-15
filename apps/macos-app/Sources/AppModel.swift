@@ -98,8 +98,16 @@ final class AppModel: ObservableObject {
     @Published var language: String {
         didSet { defaults.set(language, forKey: "language") }
     }
-    @Published var plugins: [String] {
-        didSet { defaults.set(plugins, forKey: "plugins") }
+    // Plugins ticked in the Pipelines pane, by FILE NAME within
+    // <work>/plugins. Names rather than paths so the selection follows
+    // the work directory instead of pinning the old one.
+    //
+    // These are passed as `--plugin` on the pipeline run, and NOT put in
+    // the session config: the config goes to the web-UI helper too, and
+    // the web UI loads and unloads plugins itself while it runs. Sending
+    // them both ways would preload behind its back.
+    @Published var enabledPlugins: [String] {
+        didSet { defaults.set(enabledPlugins, forKey: "enabledPlugins") }
     }
 
     // Directory to load FFmpeg from, or empty for the built-in search
@@ -176,7 +184,7 @@ final class AppModel: ObservableObject {
         numWorkers = d.object(forKey: "numWorkers") as? Int ?? 0
         memoryCapMB = d.object(forKey: "memoryCapMB") as? Int ?? 0
         language = d.string(forKey: "language") ?? ""
-        plugins = d.stringArray(forKey: "plugins") ?? []
+        enabledPlugins = d.stringArray(forKey: "enabledPlugins") ?? []
         ffmpegDir = d.string(forKey: "ffmpegDir") ?? ""
         exposeNativeFS = d.bool(forKey: "exposeNativeFS")
         whitelistPaths = d.stringArray(forKey: "whitelistPaths") ?? []
@@ -200,6 +208,32 @@ final class AppModel: ObservableObject {
     // file_sandbox.root), and creates it at startup. It may not exist
     // until the server has run once.
     var sandboxURL: URL { workDirURL.appendingPathComponent("sandbox") }
+
+    // Where vpipe looks for plugin dylibs. The helpers are launched with
+    // the work directory as their CWD, and plugins_root() resolves to
+    // "<cwd>/plugins", so this is the same folder the runtime and the
+    // web UI's plugin panel see. Not created here -- the runtime does
+    // not create it either, and a `plugins/` folder conjured into
+    // someone's workspace is litter until they have a plugin to put in
+    // it.
+    var pluginsDirURL: URL { workDirURL.appendingPathComponent("plugins") }
+
+    // Absolute paths for the ticked plugins that are ACTUALLY THERE.
+    //
+    // Filtered rather than passed through, because a selection outlives
+    // the file it names: a plugin gets rebuilt elsewhere, or the work
+    // directory moves. Handing vpipe a path that is not there costs a
+    // warning per run and no plugin, which reads as "plugins are
+    // broken". The Pipelines pane shows what it dropped, so this is not
+    // silent.
+    func enabledPluginPaths() -> [String] {
+        let fm = FileManager.default
+        let dir = pluginsDirURL
+        return enabledPlugins.compactMap { name in
+            let u = dir.appendingPathComponent(name)
+            return fm.fileExists(atPath: u.path) ? u.path : nil
+        }
+    }
 
     // True when the server will answer to something other than this
     // machine. Empty means vpipe-web-ui picks the LAN address, so that
@@ -316,7 +350,6 @@ final class AppModel: ObservableObject {
         if numWorkers > 0 { root["pool"] = ["num_workers": numWorkers] }
         if memoryCapMB > 0 { root["memory_cap_mb"] = memoryCapMB }
         if !language.isEmpty { root["language"] = language }
-        if !plugins.isEmpty { root["plugins"] = plugins }
 
         guard let data = try? JSONSerialization.data(withJSONObject: root),
               let s = String(data: data, encoding: .utf8) else {

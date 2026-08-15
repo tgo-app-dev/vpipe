@@ -95,6 +95,35 @@ TEST(text_chat_stage, config_defaults) {
   EXPECT_FALSE(s.tools_enabled());
 }
 
+// reasoning_effort accepts the three the published template accepts,
+// and REFUSES anything else. Refusing matters more than it looks: an
+// unrecognised effort renders as no instruction, which is
+// indistinguishable from the default, so a typo would otherwise be
+// invisible for the life of the pipeline.
+TEST(text_chat_stage, reasoning_effort_config) {
+  Session sess;
+  CerrSilencer hush;
+  for (const char* ok : {"xhigh", "medium", "low"}) {
+    FlexData cfg = FlexData::from_json(
+        string(R"({"hf_dir":"/tmp/chat-fake-model","reasoning_effort":")")
+        + ok + "\"}");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  // Unset is fine (and is what every pre-3.8 pipeline has).
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  for (const char* bad : {"high", "XHIGH", "none", "1"}) {
+    FlexData cfg = FlexData::from_json(
+        string(R"({"hf_dir":"/tmp/chat-fake-model","reasoning_effort":")")
+        + bad + "\"}");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_FALSE(s.config_error().empty());
+  }
+}
+
 TEST(text_chat_stage, enable_tools_config) {
   Session sess;
   CerrSilencer hush;

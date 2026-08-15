@@ -366,9 +366,22 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vertex.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-format.h
     DESTINATION include/common)
+# The interface closure, not just the entry points. Every header below
+# is reached TRANSITIVELY from plugin/plugin-context.h or pipeline/stage.h
+# -- session-services-intf.h from the plugin context itself, service-req.h
+# and the three sink interfaces from Stage -- so omitting them left the
+# installed SDK unable to compile even examples/plugin-sdk. A missing
+# transitive header is not a smaller SDK, it is a broken one.
 install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/fs-sandbox-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/log-sink-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/perf-sink-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/runtime-services-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/service-req.h
     ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/session-context-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/session-services-intf.h
     ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/ui-delegate-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/ui-port-intf.h
     ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/ui-view-intf.h
     DESTINATION include/interfaces)
 # A plugin stage may ship its own GUI view (registry + spec macro); its
@@ -382,6 +395,7 @@ install(FILES
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/edge-reader.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/oport-buffer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/resource-plan.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/runtime-context.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-registry.h
@@ -389,6 +403,17 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/typed-stage.h
     DESTINATION include/pipeline)
+# Stage-level SDK for a plugin that adds a MODEL FAMILY: the catalogue
+# entry type (so its models are fetchable), the config-source base (so
+# its knobs are a stage rather than dead keys on a shared one), and the
+# memory helpers every model-holding stage sizes itself with. See
+# docs/PLUGINS.md, "Model-specific configuration".
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-catalog.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-config-source.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-memory.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-registry.h
+    DESTINATION include/stages)
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-abi.h
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-context.h
@@ -403,7 +428,77 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-loader.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/vae-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/hidden-state-encoder.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-set.h
         DESTINATION include/generative-models)
+    # Reading a Comfy-Org / Comfy-aligned single-file pack (config in the
+    # safetensors __metadata__, no config.json). A plugin shipping a model
+    # published that way -- which is most new video models -- cannot even
+    # detect its own checkpoint without this.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/comfy-checkpoint.h
+        DESTINATION include/generative-models/shared)
+    # Kernel SELECTION on M5. These carry measurements and, more valuable,
+    # recorded NEGATIVE results -- and a plugin that cannot read them does
+    # not merely reimplement the picker, it re-runs the experiments and
+    # can repeat a mistake this tree already wrote down. That is not
+    # hypothetical: an out-of-tree DiT tuned its matmul2d tile with the
+    # arms measured SEQUENTIALLY, which is the precise error mma-tile.h
+    # records as having turned a 7% regression into an apparent 1.2x win.
+    # mma-tile.h is also the rule itself, so an in-tree change to it
+    # reaches plugins instead of leaving them on a stale copy.
+    #
+    # kernel-autotune.h is the keystone: header-only, standard library
+    # only, and the dependency of every other file here. It is also the
+    # answer to the general problem these encode -- that the fastest
+    # kernel is a property of the GPU and the shape, so it should be
+    # TIMED rather than predicted from a capability bit.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-autotune.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-tile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-splitk.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.h
+        DESTINATION include/generative-models/shared)
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-sets/vae-conv3x3-tune.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-sets/vae-mid-attn-tune.h
+        DESTINATION include/generative-models/shared/kernel-sets)
+    # Large-model plumbing. docs/MODEL-MEMORY.md ships as the contract for
+    # out-of-tree models and describes block streaming and block residency
+    # as things a loader MUST get right; block-residency.h and stream-pin.h
+    # are where both actually live, so without them the document describes
+    # machinery the reader cannot call. dit-block-progress.h is the reason
+    # a high-resolution denoise does not read as a stall -- per-STEP is
+    # tens of seconds of silence at 1024px, and every DiT already walks its
+    # blocks one at a time.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-residency.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-pin.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
+        DESTINATION include/generative-models/shared)
+    # weight-set.h's own dependencies. The SDK's header set has to be
+    # CLOSED under #include or it does not compile -- a plugin cannot
+    # supply a header that lives only in this tree. Verified by walking
+    # the closure, not by adding one file per build failure.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-registry.h
+        DESTINATION include/generative-models)
+    # The model manager. docs/MODEL-MEMORY.md is explicitly the contract
+    # for out-of-tree stages too, and two of the things it REQUIRES of a
+    # model-holding stage are only reachable through this header:
+    # revise_declaration() -- without which a stage that frees a model
+    # leaves peers sizing an irreversible streaming decision against
+    # weights that are gone -- and park_weights(), the whole middle
+    # state of the idle policy. Its include closure (session-member.h,
+    # weight-registry.h) is already installed above.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/generative-model-manager.h
+        DESTINATION include/generative-models)
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/llama3/metal-llama-weights.h
+        DESTINATION include/generative-models/llama3)
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/buffer-view.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/command-stream.h
@@ -415,6 +510,19 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/shared-buffer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/texture.h
         DESTINATION include/apple-silicon/metal-compute)
+    # TensorBeat / TensorBeatPayload. A plugin STAGE that carries tensors
+    # -- a conditioner, an encoder, anything feeding generate-video's
+    # iport0 -- cannot emit or read a beat without this, so leaving it
+    # out made register_stage a promise the SDK could not keep for the
+    # numeric stages that most want it.
+    # ...with the two headers it includes. The SDK's header set has to be
+    # CLOSED under #include, as the weight-set.h block above says; both
+    # of these pull in nothing further of their own.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/tensor-beat.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/aligned-allocator.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/tensor-storage.h
+        DESTINATION include/apple-silicon)
     # CoreML SDK: the model manager ONLY. A CoreML plugin is just a stage
     # that loads a model via session()->coreml_model_manager()->load() and
     # runs it through CoreMLLoadedModel::predict() (neutral CoreMLPredict*

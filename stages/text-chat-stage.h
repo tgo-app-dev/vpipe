@@ -235,6 +235,9 @@ private:
   McpToolRegistry _tools;
   // Unset => use family default; set => override.
   std::optional<bool> _disable_thinking;
+  // "" | "xhigh" | "medium" | "low" -- Qwen3.8's chat-template control.
+  // "" and "medium" both render nothing; see make_chat_template.
+  std::string _reasoning_effort;
   // Loaded lazily in initialize(); cleared on shutdown.
   std::shared_ptr<genai::LoadedLanguageModel> _lm;
 #ifdef VPIPE_BUILD_APPLE_SILICON

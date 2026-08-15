@@ -931,6 +931,14 @@ ModelLoader::load(string_view hf_dir) const
 }
 
 optional<ModelConfig>
+ModelLoader::parse_config(const FlexData& cfg)
+{
+  ModelConfig out;
+  if (!parse_config_(cfg, &out)) { return nullopt; }
+  return out;
+}
+
+optional<ModelConfig>
 ModelLoader::load_config(string_view hf_dir) const
 {
   const string dir_str(hf_dir);

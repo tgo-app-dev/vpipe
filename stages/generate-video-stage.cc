@@ -145,6 +145,19 @@ const PortSpec kIports[] = {
           "its documented defaults",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
+  {.name = "audio_conditioning",
+   .doc = "OPTIONAL second-modality conditioning for a family that "
+          "generates a soundtrack from its own projection of the caption "
+          "-- LTX-2.5's 2048-wide audio context, beside the 4096-wide "
+          "video one on iport0. A separate port because it is a different "
+          "WIDTH from a different projection, so packing both into one "
+          "beat would make the split a convention rather than a type. "
+          "Unwired, such a family generates VIDEO ONLY and says so; it "
+          "must not invent a zero context, which would be conditioning "
+          "that says silence rather than nothing. Ignored by wan and "
+          "minimax-h3, which take no second context",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "conditioning", .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
@@ -154,6 +167,7 @@ const PortSpec kIports[] = {
 [[maybe_unused]] constexpr unsigned kRefVideoRowsPort = 7;
 [[maybe_unused]] constexpr unsigned kRefAudioRowsPort = 8;
 [[maybe_unused]] constexpr unsigned kModelCfgPort     = 9;
+[[maybe_unused]] constexpr unsigned kAudioCondPort    = 10;
 
 // The keys that MOVED to the per-family config stages. Named here so a
 // pipeline written against the old union says what to do instead of
@@ -346,6 +360,16 @@ GenerateVideoStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  // A plugin family declares its own, for the same reason the built-ins
+  // do: this runs BEFORE any driver starts, and a checkpoint that
+  // declares nothing is invisible to every peer sizing itself against
+  // it. Asked of the registry rather than of `_plugin_family`, because
+  // this is const and runs before resolve_config_ has latched anything.
+  if (genai::VideoModelFamily* f =
+          genai::VideoModelRegistry::get().claim_for(
+              session(), root, resolve_model(session(), _hf_dir).model_type)) {
+    return f->declare_resources(root);
+  }
   // ONE expert, not both. The stage holds exactly one at a time, so
   // claiming the pair would size every peer against a peak that never
   // occurs and push them all into streaming for nothing.
@@ -398,6 +422,33 @@ GenerateVideoStage::resolve_config_()
   _resolved = resolve_model(session(), _hf_dir);
   _root = _resolved.dir;
   const std::string t1 = (fs::path(_root) / "transformer").string();
+  // ---- plugin families first ----------------------------------------
+  // Asked BEFORE the two built-ins, mirroring how LoadedLanguageModel
+  // consults ModelExecRegistry before its own arch if-chain: a
+  // checkpoint an out-of-tree family claims is that family's, and the
+  // built-in probes below never see it. On the common graph the
+  // registry is empty and this costs one null check.
+  //
+  // A family's `claims` is required to be sure of itself (see
+  // video-model-registry.h) precisely because it is asked first --
+  // claiming someone else's checkpoint here would shadow a working
+  // built-in path.
+  _plugin_family = genai::VideoModelRegistry::get().claim_for(
+      session(), _root, _resolved.model_type);
+  if (_plugin_family != nullptr) {
+    _family = std::string(_plugin_family->tag());
+    align_frames_(_plugin_family->align_frames(_root, _frames));
+    _two_experts = false;
+    _have_cfg    = true;
+    // The family is only now known, so this is the first moment a config
+    // beat that already arrived can be handed to it.
+    apply_model_config_();
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): plugin family '{}' at {}x{}x{} frames, "
+        "{} steps (checkpoint {})", this->id(), _family, _width, _height,
+        _frames, _steps, _root));
+    return;
+  }
   // The DiT's own `_class_name` picks the family. Reading it here rather
   // than taking it from config keeps a graph from having to be rewired
   // to change checkpoints -- the same stage, ports and keys serve both.
@@ -533,6 +584,13 @@ GenerateVideoStage::apply_model_config_()
         this->id(), want, _family));
     return;
   }
+  // A plugin family parses its own beat, at generate time, from the
+  // request -- which is the whole point of passing it down UNREAD: a
+  // knob the family adds later needs no change here. So there is
+  // nothing to do but keep `_model_cfg`, which the caller already did.
+  // The family match above still ran, so a config wired to the wrong
+  // checkpoint is still reported rather than handed over.
+  if (_plugin_family != nullptr) { return; }
   std::string perr;
   if (_family == "minimax-h3") {
     _h3_params =
@@ -606,9 +664,137 @@ GenerateVideoStage::apply_model_config_()
   }
 }
 
+// Assemble the request from the beats process() already read and hand it
+// to the family. Everything here is BORROWED -- the beats outlive the
+// call -- which is what keeps a 22B generation from copying its own
+// conditioning.
+bool
+GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
+                                       const void* cond, int cond_rows,
+                                       int cond_dim,
+                                       const FlexData* cond_sideband,
+                                       const void* neg, int neg_rows,
+                                       const TensorBeatPayload* ref,
+                                       const TensorBeatPayload* ref_last,
+                                       const TensorBeatPayload* ref_video_rows,
+                                       const TensorBeatPayload* ref_audio_rows,
+                                       const TensorBeatPayload* audio_cond,
+                                       genai::VideoGenResult* out)
+{
+  if (!_plugin_gen) { return false; }
+  genai::VideoGenRequest req;
+  req.height = _height;
+  req.width  = _width;
+  req.frames = _frames;
+  req.fps    = _fps;
+  req.steps  = _steps;
+  req.seed   = _seed;
+
+  req.cond          = cond;
+  req.cond_rows     = cond_rows;
+  req.cond_dim      = cond_dim;
+  req.cond_sideband = cond_sideband;
+  req.neg           = neg;
+  req.neg_rows      = neg_rows;
+  if (audio_cond != nullptr && audio_cond->shape.size() == 2) {
+    req.audio_cond      = audio_cond->data.data();
+    req.audio_cond_rows = (int)audio_cond->shape[0];
+    req.audio_cond_dim  = (int)audio_cond->shape[1];
+  }
+
+  // Shapes go across as the encoder wrote them. Normalising here would
+  // mean this stage deciding what a family's conditioning latent looks
+  // like, which is exactly the knowledge that does not belong to it.
+  auto take = [](const TensorBeatPayload* t, const float** p,
+                 std::vector<int>* shape) {
+    if (t == nullptr) { return; }
+    *p = t->as_f32();
+    shape->assign(t->shape.begin(), t->shape.end());
+  };
+  take(ref, &req.ref, &req.ref_shape);
+  take(ref_last, &req.ref_last, &req.ref_last_shape);
+  if (ref_video_rows != nullptr && ref_video_rows->shape.size() == 2) {
+    req.ref_video_rows   = ref_video_rows->as_f32();
+    req.n_ref_video_rows = (int)ref_video_rows->shape[0];
+    req.ref_video_dim    = (int)ref_video_rows->shape[1];
+  }
+  if (ref_audio_rows != nullptr && ref_audio_rows->shape.size() == 2) {
+    req.ref_audio_rows   = ref_audio_rows->as_f32();
+    req.n_ref_audio_rows = (int)ref_audio_rows->shape[0];
+    req.ref_audio_dim    = (int)ref_audio_rows->shape[1];
+  }
+  // UNREAD, on purpose: see the note in apply_model_config_.
+  req.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+
+  // A 22B DiT spends minutes per generation, so a Stop that only lands
+  // between generations is a Stop that appears to hang. The family calls
+  // this between steps; one that never does simply cannot be
+  // interrupted, and that is its own choice to answer for.
+  req.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+
+  try {
+    return _plugin_gen->generate(req, out);
+  } catch (const std::exception& e) {
+    session()->error(fmt(
+        "GenerateVideoStage('{}'): family '{}' threw during generation: {}",
+        this->id(), _family, e.what()));
+    return false;
+  } catch (...) {
+    session()->error(fmt(
+        "GenerateVideoStage('{}'): family '{}' threw a non-standard "
+        "exception during generation", this->id(), _family));
+    return false;
+  }
+}
+
 bool
 GenerateVideoStage::ensure_expert_(int which)
 {
+  // A plugin family owns its own residency, so there is no expert to
+  // switch: build the generator once and keep it. The streaming verdict
+  // is computed here rather than inside the family so every video model
+  // in the process answers the memory question the same way -- the
+  // family may still overrule it, but it starts from the graph's view.
+  if (_plugin_family != nullptr) {
+    resolve_config_();
+    if (!_have_cfg) { return false; }
+    if (_plugin_gen) { return true; }
+    auto* pmc = session()->services()->metal_compute();
+    if (pmc == nullptr) { return false; }
+    genai::VideoModelCreateArgs args;
+    args.root       = _root;
+    args.model_type = _resolved.model_type;
+    args.metal      = pmc;
+    args.session    = session();
+    args.prefer_streaming =
+        !model_memory::bounded(session(), {_root},
+                               model_memory::kStreamHeadroom);
+    // The config beat, for the keys that decide WHAT to load. Available
+    // here because iport9 is read before iport0 and this load is driven
+    // by iport0's conditioning -- so a config source that emitted once at
+    // launch has already landed. Null when nothing was wired.
+    args.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    try {
+      _plugin_gen = _plugin_family->load(args);
+    } catch (const std::exception& e) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): family '{}' threw loading '{}': {}; "
+          "inert", this->id(), _family, _root, e.what()));
+      return false;
+    }
+    if (!_plugin_gen) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): family '{}' could not load '{}'; inert",
+          this->id(), _family, _root));
+      return false;
+    }
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): '{}' loaded -- latent {} channels at 1/{} "
+        "spatial{}", this->id(), _family, _plugin_gen->latent_channels(),
+        _plugin_gen->spatial_compression(),
+        args.prefer_streaming ? ", box is tight (streaming advised)" : ""));
+    return true;
+  }
   if (_family == "minimax-h3") {
     resolve_config_();
     if (!_have_cfg) { return false; }
@@ -1453,6 +1639,13 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       ctx.iport_connected(kRefAudioRowsPort)) {
     rab = co_await ctx.read(kRefAudioRowsPort);
   }
+  std::unique_ptr<BeatPayloadIntf> acb;
+  if (ctx.num_iports() > kAudioCondPort &&
+      ctx.iport_connected(kAudioCondPort)) {
+    acb = co_await ctx.read(kAudioCondPort);
+  }
+  const auto* act =
+      acb ? dynamic_cast<const TensorBeatPayload*>(acb.get()) : nullptr;
   const auto* rvt =
       rvb ? dynamic_cast<const TensorBeatPayload*>(rvb.get()) : nullptr;
   const auto* rat =
@@ -1461,6 +1654,76 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   if (!ensure_expert_(0)) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): no DiT; skipping", this->id()));
+    co_return;
+  }
+
+  // ---- a plugin family: it owns the whole generation ------------------
+  if (_plugin_family != nullptr && _plugin_gen) {
+    genai::VideoGenResult res;
+    if (!run_plugin_family_(ctx, cond->data.data(), (int)cond->shape[0],
+                            (int)cond->shape[1], &cond->sideband,
+                            neg ? neg->data.data() : nullptr,
+                            neg ? (int)neg->shape[0] : 0,
+                            ref, ref1, rvt, rat, act, &res)) {
+      if (ctx.stop_requested()) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): stopped mid-denoise; dropping the "
+            "partial clip", this->id()));
+      }
+      co_return;                       // the family already said why
+    }
+    if (res.video.empty() || res.video_shape.size() != 4) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): family '{}' returned success but no "
+          "4-D video latent; nothing to publish", this->id(), _family));
+      co_return;
+    }
+    if (_unload_idle) { _plugin_gen->release_idle(); }
+
+    auto vout = std::make_unique<TensorBeatPayload>();
+    vout->dtype = TensorBeat::DType::F32;
+    vout->shape = {res.video_shape[0], res.video_shape[1],
+                   res.video_shape[2], res.video_shape[3]};
+    vout->resize_contiguous(res.video.size());
+    std::memcpy(vout->as_f32(), res.video.data(),
+                res.video.size() * sizeof(float));
+    {
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      sb.as_object().insert_or_assign(
+          "frames", FlexData::make_int((std::int64_t)_frames));
+      vout->sideband = std::move(sb);
+    }
+    ++_emitted;
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): emitted '{}' latents #{} -- video "
+        "[{}, {}, {}, {}]{}", this->id(), _family, _emitted,
+        res.video_shape[0], res.video_shape[1], res.video_shape[2],
+        res.video_shape[3],
+        res.audio.empty() ? std::string() : std::string(" + audio")));
+    co_await ctx.write(0, std::move(vout));
+
+    // As for the built-in audio family: only when the port is wired. A
+    // graph that wants video from an audio-video model should not have
+    // to sink a beat it will not read.
+    if (ctx.num_oports() > 1 && !res.audio.empty() &&
+        res.audio_shape.size() == 3) {
+      auto aout = std::make_unique<TensorBeatPayload>();
+      aout->dtype = TensorBeat::DType::F32;
+      aout->shape = {res.audio_shape[0], res.audio_shape[1],
+                     res.audio_shape[2]};
+      aout->resize_contiguous(res.audio.size());
+      std::memcpy(aout->as_f32(), res.audio.data(),
+                  res.audio.size() * sizeof(float));
+      if (res.latents_per_second > 0.0) {
+        FlexData sb = FlexData::make_object();
+        sb.as_object().insert_or_assign(
+            "latents_per_second",
+            FlexData::make_real(res.latents_per_second));
+        aout->sideband = std::move(sb);
+      }
+      co_await ctx.write(1, std::move(aout));
+    }
     co_return;
   }
 

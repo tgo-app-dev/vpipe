@@ -15,6 +15,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
@@ -113,6 +114,11 @@ namespace vpipe {
 //   iport8  OPTIONAL reference AUDIO rows from the same encoder: f32
 //           [rows, 32], channel-major within a reference. They ride at a
 //           clean timestep and are never denoised.
+//   iport10 OPTIONAL second-modality conditioning: LTX-2.5's 2048-wide
+//           AUDIO context, beside the 4096-wide video one on iport0.
+//           Unwired, such a family generates video only and says so.
+//           Ignored by wan and minimax-h3.
+//
 //   iport9  OPTIONAL model-specific parameters from the resident family's
 //           config source -- `wan2-model-config` (guidance, expert
 //           boundary) or `minimax-h3-model-config` (sigma shifts,
@@ -251,6 +257,34 @@ private:
   // interface wide enough for both would describe neither.
   std::unique_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
   genai::MetalMiniMaxH3Transformer::Config _h3_cfg;
+
+  // A family contributed by a PLUGIN, from genai::VideoModelRegistry.
+  // Consulted BEFORE the two built-in families, the way
+  // LoadedLanguageModel consults ModelExecRegistry before its built-in
+  // arch dispatch -- so an out-of-tree checkpoint resolves to its own
+  // family and the built-in path is not touched. Null on every graph
+  // that runs a built-in checkpoint, which is the common case.
+  //
+  // `_plugin_family` is process-wide and borrowed (the registry owns it
+  // and outlives every stage); `_plugin_gen` is THIS stage's resident
+  // checkpoint. A family owns its whole denoise loop, so there is
+  // nothing here that mirrors _wan_params / _h3_params: the model-config
+  // beat goes down unread in the request. See video-model-registry.h.
+  genai::VideoModelFamily*              _plugin_family = nullptr;
+  std::unique_ptr<genai::VideoGenerator> _plugin_gen;
+  // The plugin branch of process(), mirroring run_h3_: builds the
+  // request from the beats already read and publishes what came back.
+  // False means the family warned and produced nothing.
+  bool run_plugin_family_(RuntimeContext& ctx,
+                          const void* cond, int cond_rows, int cond_dim,
+                          const FlexData* cond_sideband,
+                          const void* neg, int neg_rows,
+                          const class TensorBeatPayload* ref,
+                          const class TensorBeatPayload* ref_last,
+                          const class TensorBeatPayload* ref_video_rows,
+                          const class TensorBeatPayload* ref_audio_rows,
+                          const class TensorBeatPayload* audio_cond,
+                          genai::VideoGenResult* out);
   // What the models DB said about `_hf_dir`. Held because the DIRECTORY
   // cannot always answer which model a reference meant -- see
   // ResolvedModel.

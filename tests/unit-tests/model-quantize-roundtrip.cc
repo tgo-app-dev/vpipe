@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -169,6 +170,69 @@ TEST(model_quantize_roundtrip, affine_writer_reader_dequant)
 // out_proj, never exercised by the dense MOSS verification). Env:
 //   VPIPE_Q27_BF16  = the bf16 source dir
 //   VPIPE_Q27_8BIT  = the model-quantize 8-bit output dir
+// The writer must leave the DATA SECTION 16-byte aligned, because that
+// one number decides whether every tensor in the shard can be handed to
+// Metal as a zero-copy subview or has to be COPIED.
+//
+// It regressed silently before it was noticed: five shards of one
+// checkpoint came out at 7, 8, 12, 11 and 15 mod 16, so `Mapped` was a
+// no-op for everything this writer produced and a 22B DiT quietly
+// allocated 39 GB of anonymous memory. Nothing failed; the box just
+// thrashed. Hence a test on the BYTES rather than on a log line.
+TEST(model_quantize_roundtrip, writer_aligns_the_data_section)
+{
+  namespace fs = std::filesystem;
+  auto mc = std::make_unique<MetalCompute>(nullptr);
+  if (!mc->valid()) { return; }               // no device: vacuous, not failed
+
+  const fs::path tmp =
+      fs::temp_directory_path() / "vpipe-st-align-test";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+
+  // Names of DIFFERENT lengths, so the header length is not a round
+  // number by luck -- an unpadded writer then lands wherever it lands.
+  for (int variant = 0; variant < 4; ++variant) {
+    const fs::path dir = tmp / ("v" + std::to_string(variant));
+    std::vector<std::uint16_t> data(64, 0x3c00);
+    {
+      SafetensorsWriter wr(dir.string());
+      for (int t = 0; t <= variant; ++t) {
+        const std::string nm =
+            "block." + std::to_string(t) + std::string((std::size_t)t + 1, 'x')
+            + ".weight";
+        ASSERT_TRUE(wr.add(nm, "F16", {8, 8}, data.data(),
+                           data.size() * sizeof(std::uint16_t)));
+      }
+      ASSERT_TRUE(wr.close());
+    }
+
+    // Read the 8-byte length prefix straight off the file.
+    fs::path shard;
+    for (const auto& de : fs::directory_iterator(dir)) {
+      if (de.path().extension() == ".safetensors") { shard = de.path(); }
+    }
+    ASSERT_TRUE(!shard.empty());
+    std::ifstream f(shard.string(), std::ios::binary);
+    ASSERT_TRUE(f.good());
+    std::uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    const std::uint64_t data_at = 8 + hlen;
+    EXPECT_TRUE((data_at % 16) == 0);
+
+    // And the consequence that actually matters: the reader maps it
+    // instead of copying. An owned buffer means it fell back.
+    auto wts = MetalLlamaWeights::open_model(dir.string());
+    ASSERT_TRUE(wts.has_value());
+    const std::string first = "block.0x.weight";
+    ASSERT_TRUE(wts->has(first));
+    SharedBuffer m = wts->load_mapped(first, mc.get());
+    ASSERT_TRUE(!m.empty());
+    EXPECT_FALSE(m.is_owned());
+  }
+  fs::remove_all(tmp);
+}
+
 TEST(model_quantize_roundtrip, real_gdn_dequant_vs_source)
 {
   const char* srcdir = std::getenv("VPIPE_Q27_BF16");

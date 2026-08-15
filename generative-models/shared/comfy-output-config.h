@@ -29,6 +29,16 @@ namespace genai {
 // and computes nonsense, so there should be exactly one implementation
 // to forget it in.
 //
+// ARCHITECTURE COVERAGE. A DiT whose embedded config already carries
+// `_class_name` -- the field every reader in this tree dispatches on --
+// is passed through VERBATIM, so this works for any Comfy-packed family
+// including out-of-tree plugin ones (LTX-2.5's `AVTransformer3DModel`).
+// MiniMax-H3 is special-cased only because its repack omits
+// `_class_name` and hides the two facts above. A DiT with neither an
+// `image_model` this knows nor a `_class_name` is REFUSED, not guessed:
+// a checkpoint written without its identity loads as whatever the
+// reader defaults to.
+//
 // `file` is the source component. False + *err when it is not a
 // Comfy-Org component this can describe.
 bool comfy_output_config(const std::string& file, FlexData& out,

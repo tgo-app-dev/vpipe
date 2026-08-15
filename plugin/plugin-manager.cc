@@ -1,6 +1,7 @@
 #include "plugin/plugin-manager.h"
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-context.h"
+#include "pipeline/stage-registry.h"
 
 #include "common/library-handle.h"
 #include "common/vpipe-format.h"
@@ -59,6 +60,13 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   if (_loaded_paths.count(canon) != 0) {
     return true;                       // already loaded this process
   }
+
+  // The stage-type id the registry is ABOUT to hand out. Everything
+  // registered from here on belongs to this plugin -- captured BEFORE
+  // the dlopen because a TypedStage<T> registers its own factory from a
+  // static initialiser as the dylib maps, well before
+  // vpipe_plugin_register is called. See StageRegistry::attribute_since.
+  const StageTypeId first_type = StageRegistry::get().next_id();
 
   // dlopen (Optional: warns + valid()==false on failure, never throws).
   auto handle = std::make_unique<LibraryHandle>(
@@ -120,6 +128,19 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   // down the host: demote to a warning. Registrations that succeeded
   // before a throw stay in the registries; the handle is kept alive.
   VpipePluginContext ctx(session, pname);
+  // Stamp provenance on EVERY exit path, including the throwing ones --
+  // the comment below is explicit that partial registrations stay in the
+  // registries, so a stage that made it in must still say where it came
+  // from. A guard rather than three call sites, because the one that
+  // gets forgotten is always the error path.
+  struct AttributeOnExit {
+    StageTypeId first;
+    const std::string& name;
+    ~AttributeOnExit()
+    {
+      StageRegistry::get().attribute_since(first, name);
+    }
+  } attribute_guard{first_type, pname};
   try {
     reg_fn(&ctx);
   } catch (const std::exception& e) {
@@ -141,6 +162,58 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   _loaded_paths.insert(canon);
   _handles.push_back(std::move(handle));
   _names.push_back(pname);
+  {
+    Record r;
+    r.path    = canon;
+    r.name    = pname;
+    if (info != nullptr) {
+      r.version     = info->version     ? info->version     : "";
+      r.vendor      = info->vendor      ? info->vendor      : "";
+      r.license     = info->license     ? info->license     : "";
+      r.description = info->description ? info->description : "";
+    }
+    r.enabled = true;
+    _records.push_back(std::move(r));
+  }
+  return true;
+}
+
+std::vector<PluginManager::Record>
+PluginManager::records() const
+{
+  std::lock_guard<std::mutex> lk(_mu);
+  return _records;
+}
+
+bool
+PluginManager::is_loaded_path(std::string_view path) const
+{
+  // Through the SAME canonicaliser load() dedups with -- a listing that
+  // answered "not loaded" for a path load() would treat as already
+  // loaded would offer a button that does nothing.
+  const std::string canon = canonical_(path);
+  std::lock_guard<std::mutex> lk(_mu);
+  return _loaded_paths.count(canon) != 0;
+}
+
+void
+PluginManager::set_enabled(std::string_view name, bool on)
+{
+  std::lock_guard<std::mutex> lk(_mu);
+  for (Record& r : _records) {
+    if (r.name == name) { r.enabled = on; }
+  }
+}
+
+bool
+PluginManager::enabled(std::string_view name) const
+{
+  std::lock_guard<std::mutex> lk(_mu);
+  for (const Record& r : _records) {
+    if (r.name == name) { return r.enabled; }
+  }
+  // Not a plugin we loaded -- the built-ins, whose stages carry an empty
+  // origin. Never withheld.
   return true;
 }
 

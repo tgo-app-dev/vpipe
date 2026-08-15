@@ -1163,6 +1163,32 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // (removing any overlap) but the per-section GPU wall time is what we want.
   // No effect unless the env var is set.
   const bool prof = std::getenv("VPIPE_FLUX2_DIT_PROFILE") != nullptr;
+  // ---- env-gated streaming split (VPIPE_FLUX2_STREAM_PROFILE) ----------
+  // What a weight PREFETCH could hide. The streamed path loads a block
+  // serially and then commits-and-waits before the weights free, so the
+  // disk and the GPU take strict turns; both ends are already on the
+  // critical path, so timing them adds no barriers of its own. The
+  // ceiling on any prefetch is read/(read+gpu) -- measured rather than
+  // assumed, because every term moves with the machine: block bytes with
+  // the quantization, read rate with the storage medium, gpu with the
+  // geometry. Covers the double AND single stacks, which stream
+  // separately but compete for the same disk.
+  const bool sprof = std::getenv("VPIPE_FLUX2_STREAM_PROFILE") != nullptr;
+  double sp_read_ms = 0, sp_gpu_ms = 0;
+  std::size_t sp_read_bytes = 0;
+  int sp_blocks = 0;
+  const double sp_alloc0 = sprof && _ws ? _ws->stats().streamed_alloc_ms : 0.0;
+  const double sp_fetch0 = sprof && _ws ? _ws->stats().streamed_fetch_ms : 0.0;
+  auto sp_now = [&]() {
+    return sprof ? std::chrono::steady_clock::now()
+                 : std::chrono::steady_clock::time_point{};
+  };
+  auto sp_add = [&](double& sink, std::chrono::steady_clock::time_point t0) {
+    if (sprof) {
+      sink += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+    }
+  };
   double t_dbl = 0, t_sgl_gemm = 0, t_sgl_attn = 0, t_sgl_cat = 0,
          t_sgl_out = 0, t_final = 0;
   auto tnow = [] { return std::chrono::steady_clock::now(); };
@@ -1854,11 +1880,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       const bool streaming = _stream_blocks && !held;
       DoubleBlock streamed;
       if (streaming) {
+        const auto rd0 = sp_now();
         if (!load_double_(*_ws,
                           "transformer_blocks." + std::to_string(L) + ".",
                           streamed, Retain::Streamed)) {
           return {};
         }
+        sp_add(sp_read_ms, rd0);
+        if (sprof) { sp_read_bytes += double_bytes_(streamed); ++sp_blocks; }
       }
       const DoubleBlock& b =
           streaming ? streamed : _double[(std::size_t)L];
@@ -1929,7 +1958,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.gemm(smlp, b.cff_out, ob, 0, TS, H, INNER);
       op.gated(txt, 0, mtxt, 5 * H, ob, 0, H, TS * H);
       if (streaming) {
+        const auto gp0 = sp_now();
         flush();                    // commit block L before it frees
+        sp_add(sp_gpu_ms, gp0);
         // The flush above has been WAITED for, so nothing encoded still
         // points at this block's buffers -- which is why the promotion
         // happens here and not at the top of the iteration. Keeping it
@@ -1990,12 +2021,15 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     const bool streaming = _stream_blocks && !held;
     SingleBlock streamed;
     if (streaming) {
+      const auto rd0 = sp_now();
       if (!load_single_(*_ws,
                         "single_transformer_blocks." + std::to_string(L)
                             + ".",
                         streamed, Retain::Streamed)) {
         return {};
       }
+      sp_add(sp_read_ms, rd0);
+      if (sprof) { sp_read_bytes += single_bytes_(streamed); ++sp_blocks; }
     }
     const SingleBlock& b = streaming ? streamed : _single[(std::size_t)L];
     if (prof) { mk = tnow(); }
@@ -2064,6 +2098,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     gated_joint(op, joint, 2 * H, ob);                     // += gate * to_out
     enc.end();
     std::string gpu_err;
+    const auto sgl_gp0 = sp_now();
     if (!stream.commit().wait_ok(&gpu_err)) {
       if (_mc->session() != nullptr) {
         _mc->session()->warn(fmt("MetalFlux2Transformer::forward_dit: {}",
@@ -2071,6 +2106,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
       return {};
     }
+    if (streaming) { sp_add(sp_gpu_ms, sgl_gp0); }
     if (streaming) {
       // Same safe point as the double stack: this block's stream has
       // been committed AND waited for just above.
@@ -2081,6 +2117,28 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
     }
     if (prof) { t_sgl_out += ms_since(mk); }
+  }
+
+  if (sprof && sp_blocks > 0 && _mc->session() != nullptr) {
+    const double tot = sp_read_ms + sp_gpu_ms;
+    const double sp_alloc_ms =
+        (_ws ? _ws->stats().streamed_alloc_ms : 0.0) - sp_alloc0;
+    const double sp_fetch_ms =
+        (_ws ? _ws->stats().streamed_fetch_ms : 0.0) - sp_fetch0;
+    const double gbs = sp_read_ms > 0.0
+        ? (double)sp_read_bytes / (sp_read_ms / 1000.0) / 1e9 : 0.0;
+    _mc->session()->log_normal(fmt(
+        "MetalFlux2Transformer: streamed {} blocks -- read {:.0f} ms ({} MB "
+        "at {:.2f} GB/s, {:.1f} ms/block), gpu {:.0f} ms ({:.0f} ms/block); "
+        "a perfect prefetch hides at most {:.1f}% of this pass [read = {:.0f} ms alloc + {:.0f} ms fetch at {:.2f} GB/s]",
+        sp_blocks, sp_read_ms, sp_read_bytes >> 20, gbs,
+        sp_read_ms / (double)sp_blocks, sp_gpu_ms,
+        sp_gpu_ms / (double)sp_blocks,
+        tot > 0.0 ? 100.0 * sp_read_ms / tot : 0.0,
+        sp_alloc_ms, sp_fetch_ms,
+        sp_fetch_ms > 0.0
+            ? (double)sp_read_bytes / (sp_fetch_ms / 1000.0) / 1e9
+            : 0.0));
   }
 
   // ===== final: AdaLayerNormContinuous(image tail, temb) + proj_out =====

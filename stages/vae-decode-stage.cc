@@ -211,7 +211,13 @@ VaeDecodeStage::reset_run_state()
   // weights are still held we deliberately leave the guard set --
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
-  if (!_vae && !_flux2_vae && !_mage_vae) {
+  // EVERY decoder, not three of them. _wan_vae and _h3_vae used to be
+  // missing here, so a relaunch with a resident wan or H3 VAE saw all
+  // the tested pointers null, cleared the guard, and let the next
+  // ensure_loaded_() build a second decoder ON TOP of the live one --
+  // momentarily 2x peak, which for H3's 10.4 GB is 20.8 GB.
+  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+      !_plugin_dec) {
     _load_attempted = false;
     _unloaded       = false;
   }
@@ -230,7 +236,14 @@ VaeDecodeStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  return model_memory::weight_claims({resolve_vae_dir(root)});
+  const std::string vae_dir = resolve_vae_dir(root);
+  // The registry, not `_vae_family`: this runs BEFORE ensure_loaded_ has
+  // latched anything, and it is const.
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, vae_dir, resolve_model(session(), _hf_dir).model_type)) {
+    return f->declare_resources(root, vae_dir);
+  }
+  return model_memory::weight_claims({vae_dir});
 }
 
 Job
@@ -257,11 +270,19 @@ VaeDecodeStage::load_note_(const VpipeFormat& msg) const
 void
 VaeDecodeStage::unload_vae_()
 {
-  if (!_vae && !_flux2_vae && !_mage_vae && !_h3_vae) { return; }
+  // _wan_vae was in neither the guard nor the resets, so the idle policy
+  // never unloaded a Wan VAE at all: with only _wan_vae held every
+  // tested pointer was null and this returned early.
+  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+      !_plugin_dec) {
+    return;
+  }
   _vae.reset();
   _flux2_vae.reset();
   _mage_vae.reset();
+  _wan_vae.reset();
   _h3_vae.reset();
+  _plugin_dec.reset();
   _unloaded = true;
   _quiet_reload = true;
   session()->log_debug(fmt("VaeDecodeStage('{}'): VAE decoder unloaded (idle)",
@@ -296,15 +317,34 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
+  // An out-of-tree family gets asked FIRST, and it has to happen here --
+  // before the unload verdict and before open_weight_set below. Both of
+  // those assume the diffusers layout: resolve_vae_dir returns `root`
+  // unchanged for a pack with no `vae/config.json`, vae_family_ then
+  // falls through to "krea2", and open_weight_set(root) would index
+  // whatever else lives in that tree (for LTX-2.5, 39 GB of DiT).
+  const std::string probe_vae_dir = resolve_vae_dir(root);
+  if (!_family_probed) {
+    _family_probed = true;
+    _vae_family = genai::VaeModelRegistry::get().claim_for(
+        session(), root, probe_vae_dir, resolve_model(session(), _hf_dir).model_type);
+  }
   // Idle-unload decision (auto: the DiT + text encoder of this same pipeline are
   // resident during a run, so size the box against THEIR weights -- the VAE's
   // own are small, it is the decode working set that has to fit beside them).
   if (!_unload_resolved) {
     _unload_resolved = true;
-    const std::vector<std::string> peers = {
-        (std::filesystem::path(root) / "transformer").string(),
-        (std::filesystem::path(root) / "text_encoder").string(),
-        (std::filesystem::path(root) / "mllm").string()};
+    // The built-in guess is the DIFFUSERS spelling, which sums to ZERO on
+    // a Comfy-style pack -- and a zero peer footprint reads as "roomy,
+    // keep the VAE resident", which beside a 39 GB DiT is the exact wrong
+    // answer. A registered family names its own peers instead.
+    const std::vector<std::string> peers =
+        (_vae_family != nullptr)
+            ? _vae_family->idle_peers(root)
+            : std::vector<std::string>{
+                  (std::filesystem::path(root) / "transformer").string(),
+                  (std::filesystem::path(root) / "text_encoder").string(),
+                  (std::filesystem::path(root) / "mllm").string()};
     const std::size_t fp = model_memory::weight_footprint(session(), peers);
     switch (_unload_cfg) {
       case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
@@ -325,7 +365,44 @@ VaeDecodeStage::ensure_loaded_()
   // `vae/` for every diffusers checkpoint, `video_vae/source/` for
   // MiniMax-H3. Shared with vae-encode so the two halves of one model
   // can never resolve to different directories.
-  const std::string vae_dir = resolve_vae_dir(root);
+  const std::string vae_dir = probe_vae_dir;
+
+  if (_vae_family != nullptr) {
+    // `_family` carries the tag so the log lines read like a built-in's,
+    // but every dispatch is guarded on the POINTER -- a family that
+    // tagged itself "wan" still cannot fall into the wan branch.
+    _family = std::string(_vae_family->tag());
+    genai::VaeModelCreateArgs args;
+    args.root       = root;
+    args.vae_dir    = vae_dir;
+    args.model_type = resolve_model(session(), _hf_dir).model_type;
+    args.metal      = mc;
+    args.session    = session();
+    try {
+      _plugin_dec = _vae_family->load_decoder(args);
+    } catch (const std::exception& e) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): VAE family '{}' threw loading '{}': {}; "
+          "inert", this->id(), _family, root, e.what()));
+      return;
+    } catch (...) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): VAE family '{}' threw a non-standard "
+          "exception loading '{}'; inert", this->id(), _family, root));
+      return;
+    }
+    if (!_plugin_dec) {
+      // The family already said why through args.session.
+      return;
+    }
+    load_note_(fmt(
+        "VaeDecodeStage('{}'): VAE family '{}' loaded -- {} latent channels, "
+        "1/{} spatial, {}x temporal ({:.1f} MB)", this->id(), _family,
+        _plugin_dec->latent_channels(), _plugin_dec->spatial_compression(),
+        _plugin_dec->temporal_compression(),
+        (double)_plugin_dec->resident_bytes() / (1024.0 * 1024.0)));
+    return;                        // NOT the built-in chain below
+  }
 
   _family = vae_family_(vae_dir);
   // One shared, reference-counted view of this checkpoint. The peer VAE
@@ -912,6 +989,131 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): decoded [{}, {}, {}, {}] -> {} frames "
         "[3, {}, {}] @ {:.3f} fps", this->id(), Cz, LT, lh, lw, F, H, W, fps));
+    co_return;
+  }
+
+  // ---- an out-of-tree family (VaeModelRegistry) ------------------------
+  //
+  // Guarded on the POINTER, and placed before every built-in branch: a
+  // family that tagged itself like a built-in still cannot fall through
+  // into one. The family owns un-whitening, tiling and colour space; the
+  // U8 quantisation, the per-frame beat and the sideband stay here so
+  // there is exactly one place pixels are made.
+  if (_vae_family != nullptr) {
+    if (!_plugin_dec) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): VAE family '{}' has no decoder loaded; "
+          "skipping", this->id(), _family));
+      co_return;
+    }
+    const bool is_video = tbp->shape.size() == 4;
+    const int Cz = (int)tbp->shape[0];
+    const int T  = is_video ? (int)tbp->shape[1] : 1;
+    if (Cz != _plugin_dec->latent_channels()) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the latent has {} channels but family '{}' "
+          "wants {}; skipping", this->id(), Cz, _family,
+          _plugin_dec->latent_channels()));
+      co_return;
+    }
+    // The producer knows the clip's rate; the config is the fallback for
+    // a latent that arrived from somewhere else (a file, a test).
+    double fps = _fps;
+    if (tbp->sideband.is_object()) {
+      FlexData sb = tbp->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
+        fps = o.at("fps").as_real(fps);
+      }
+    }
+    genai::VaeDecodeRequest req;
+    req.latent = tbp->as_f32();
+    req.shape.reserve(tbp->shape.size());
+    for (std::int64_t d : tbp->shape) { req.shape.push_back((int)d); }
+    req.fps      = fps;
+    req.sideband = &tbp->sideband;
+    req.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+
+    // The frames are collected and written AFTERWARDS for the reason the
+    // wan branch gives above: ctx.write is a coroutine and the sink is a
+    // plain callback. What is held is the clip as planar U8, a third of
+    // the f32 the family handed over.
+    std::vector<std::unique_ptr<TensorBeatPayload>> frames;
+    int seen = 0;
+    auto sink = [&](const genai::VaeFrameChunk& c) -> bool {
+      if (c.rgb == nullptr || c.n <= 0 || c.height <= 0 || c.width <= 0) {
+        return false;
+      }
+      const std::size_t plane = (std::size_t)c.height * c.width;
+      for (int k = 0; k < c.n; ++k) {
+        auto out = std::make_unique<TensorBeatPayload>();
+        out->dtype = TensorBeat::DType::U8;
+        out->shape = {3, c.height, c.width};
+        out->resize_contiguous((std::size_t)3 * plane);
+        std::uint8_t* op = out->as_u8();
+        for (int ch = 0; ch < 3; ++ch) {
+          // A family with fewer than 3 channels comes out greyscale
+          // rather than read past the end of its own chunk.
+          const int sc = (ch < c.channels) ? ch : (c.channels - 1);
+          const float* src =
+              c.rgb + ((std::size_t)sc * c.n + k) * plane;
+          std::uint8_t* dst = op + (std::size_t)ch * plane;
+          for (std::size_t i = 0; i < plane; ++i) {
+            float v = std::round((src[i] + 1.0f) * 0.5f * 255.0f);
+            if (!(v > 0.0f)) { v = 0.0f; }        // also catches NaN
+            if (v > 255.0f) { v = 255.0f; }
+            dst[i] = (std::uint8_t)v;
+          }
+        }
+        // Video stamps {frame, frames, fps}; an image VAE stamps nothing,
+        // which is the split the built-in branches already draw.
+        if (is_video) {
+          FlexData sb = FlexData::make_object();
+          sb.as_object().insert_or_assign(
+              "frame", FlexData::make_int((std::int64_t)(c.frame0 + k)));
+          sb.as_object().insert_or_assign(
+              "frames", FlexData::make_int((std::int64_t)c.frames_total));
+          sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+          out->sideband = std::move(sb);
+        }
+        forward_model_name_(*tbp, *out);
+        frames.push_back(std::move(out));
+        ++seen;
+      }
+      return !ctx.stop_requested();
+    };
+    const int want = is_video ? _plugin_dec->decoded_frames(T) : 1;
+    std::string derr;
+    bool ok = false;
+    try {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
+                         kPerfLlmVaeBegin, (std::uint64_t)want);
+      ok = _plugin_dec->decode(req, sink, &derr);
+    } catch (const std::exception& e) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): VAE family '{}' threw decoding: {}; "
+          "skipping", this->id(), _family, e.what()));
+      co_return;
+    } catch (...) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): VAE family '{}' threw a non-standard "
+          "exception decoding; skipping", this->id(), _family));
+      co_return;
+    }
+    if (!ok) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): decode failed ({}); skipping", this->id(),
+          derr.empty() ? "unknown error" : derr));
+      co_return;
+    }
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): family '{}' decoded {} -> {} frames",
+        this->id(), _family, tbp->describe(), seen));
+    if (_unload_idle) { unload_vae_(); }
+    for (auto& f : frames) {
+      ++_images_emitted;
+      co_await ctx.write(0, std::move(f));
+    }
     co_return;
   }
 

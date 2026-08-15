@@ -9,6 +9,11 @@
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
+// The whole generative-models subsystem -- the video family registry with
+// it -- builds under VPIPE_BUILD_APPLE_SILICON, so this include and the
+// registry call below carry the same gate metal libraries do.
+#include "generative-models/vae-model-registry.h"
+#include "generative-models/video-model-registry.h"
 #endif
 
 namespace vpipe {
@@ -62,6 +67,103 @@ VpipePluginContext::register_stage(std::string_view       type_name,
     _session->log_normal(fmt(
         "plugin '{}': registered stage type '{}'", _plugin, type_name));
   }
+}
+
+bool
+VpipePluginContext::register_video_family(
+    std::unique_ptr<genai::VideoModelFamily> family)
+{
+  if (!family) { return false; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Read the tag BEFORE the move: after it, `family` is null.
+  const std::string tag(family->tag());
+  const bool ok =
+      genai::VideoModelRegistry::get().add(std::move(family));
+  if (_session != nullptr) {
+    if (ok) {
+      _session->log_normal(fmt(
+          "plugin '{}': registered video model family '{}'", _plugin, tag));
+    } else {
+      _session->warn(fmt(
+          "plugin '{}': video model family '{}' was NOT registered -- that "
+          "tag is already taken (or the family could not name itself). The "
+          "family already present keeps the tag", _plugin, tag));
+    }
+  }
+  return ok;
+#else
+  // `family` is destroyed here, which needs the type complete -- and on
+  // a non-apple build it is not. Leak the pointer rather than pretend:
+  // this branch cannot be reached by a working plugin (there is no
+  // generate-video to register with), and a plugin that gets here is
+  // already misbuilt.
+  (void)family.release();
+  if (_session != nullptr) {
+    _session->warn(fmt(
+        "plugin '{}': video model families are unsupported in this build",
+        _plugin));
+  }
+  return false;
+#endif
+}
+
+bool
+VpipePluginContext::register_vae_family(
+    std::unique_ptr<genai::VaeModelFamily> family)
+{
+  if (!family) { return false; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Read the tag BEFORE the move: after it, `family` is null.
+  const std::string tag(family->tag());
+  const bool ok =
+      genai::VaeModelRegistry::get().add(std::move(family));
+  if (_session != nullptr) {
+    if (ok) {
+      _session->log_normal(fmt(
+          "plugin '{}': registered VAE family '{}'", _plugin, tag));
+    } else {
+      _session->warn(fmt(
+          "plugin '{}': VAE family '{}' was NOT registered -- that "
+          "tag is already taken, collides with a built-in family name, (or the family could not name itself). The "
+          "family already present keeps the tag", _plugin, tag));
+    }
+  }
+  return ok;
+#else
+  // `family` is destroyed here, which needs the type complete -- and on
+  // a non-apple build it is not. Leak the pointer rather than pretend:
+  // this branch cannot be reached by a working plugin (there is no
+  // vae-decode to register with), and a plugin that gets here is
+  // already misbuilt.
+  (void)family.release();
+  if (_session != nullptr) {
+    _session->warn(fmt(
+        "plugin '{}': VAE families are unsupported in this build",
+        _plugin));
+  }
+  return false;
+#endif
+}
+
+std::size_t
+VpipePluginContext::register_catalog_entries(
+    std::vector<ModelCatalogEntry> entries)
+{
+  const std::size_t asked = entries.size();
+  const std::size_t taken = ::vpipe::register_catalog_entries(std::move(entries));
+  if (_session != nullptr) {
+    if (taken == asked) {
+      _session->log_normal(fmt(
+          "plugin '{}': added {} model catalogue entries", _plugin, taken));
+    } else {
+      // Not an error -- two plugins can legitimately ship the same repo --
+      // but a silent drop would leave a menu row missing with no reason.
+      _session->log_normal(fmt(
+          "plugin '{}': added {} of {} model catalogue entries ({} already "
+          "catalogued)", _plugin, taken, asked, asked - taken));
+    }
+  }
+  return taken;
 }
 
 bool

@@ -5,6 +5,7 @@ set(VPIPE_WEBUI_SOURCES
     file-api.cc
     database-api.cc
     pipeline-api.cc
+    plugin-api.cc
     io-api.cc
     log-api.cc
     profiler-api.cc

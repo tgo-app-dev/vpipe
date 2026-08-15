@@ -261,6 +261,13 @@ public:
     // exactly what someone reading a memory report needs to see.
     std::size_t streamed_reads = 0;
     std::size_t streamed_bytes = 0;
+    // Where that streaming time went, split at the one seam that is
+    // real: allocating the destination buffer, versus the memcpy that
+    // fills it. See MetalLlamaWeights::LoadCost -- the fetch half is a
+    // disk read or a page-cache copy depending on the source, and the
+    // achieved rate is what tells them apart.
+    double      streamed_alloc_ms = 0.0;
+    double      streamed_fetch_ms = 0.0;
   };
   Stats stats() const;
 
@@ -321,6 +328,9 @@ private:
   // would serialise concurrent streamers on the counters alone.
   std::atomic<std::size_t>             _streamed_reads{0};
   std::atomic<std::size_t>             _streamed_bytes{0};
+  // Microseconds, so the accumulator stays integral and lock-free.
+  std::atomic<std::uint64_t>           _streamed_alloc_us{0};
+  std::atomic<std::uint64_t>           _streamed_fetch_us{0};
   std::string                          _dir;
   mutable std::recursive_mutex         _mu;
   std::optional<MetalLlamaWeights>     _wts;
