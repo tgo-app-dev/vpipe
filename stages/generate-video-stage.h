@@ -268,6 +268,8 @@ private:
   // align_num_frames / minimax_h3::align_num_frames); this only records
   // it, so the two callers cannot differ on how it is announced.
   void align_frames_(int aligned);
+  // Round the frame size up to the resident family's tiling grid.
+  void align_size_(int gh, int gw);
   void resolve_config_();
 
   // "fl2va" / "ref2va" / empty. The two partitions are one architecture

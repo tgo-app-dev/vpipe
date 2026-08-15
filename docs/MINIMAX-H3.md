@@ -227,7 +227,7 @@ you set. On a fan-cooled Mac expect the faster figure.
 
 `steps` is the setting that moves this most, and the
 [Turbo LoRA](#fewer-steps--the-turbo-lora) is the way to cut it: on the same
-Air, 6 steps with the adapter produce **124 frames in 13 min 54 s** — a third
+Air, 6 steps with the adapter produce **124 frames in 13 min 36 s** — a third
 more video for about the same wait.
 
 ### More than text in
@@ -421,16 +421,21 @@ the log.
 | machine | |
 |---|---|
 | **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 50 s** |
-| **M5** MacBook Air 15", 16 GB, fanless | **13 min 54 s** |
+| **M5** MacBook Air 15", 16 GB, fanless, on an ice pack | **13 min 36 s** |
 
 Both rows are the same pipeline file, so they are directly comparable: the
-fanless M5 finishes **1.57× faster** than the fan-cooled M4 Pro, and does it
+fanless M5 finishes **1.6× faster** than the fan-cooled M4 Pro, and does it
 on a quarter of the RAM. On 16 GB the DiT streams its weights, which is what
 keeps that machine from going faster still.
 
+Each row is that chassis at its best — a fan for one, an ice pack for the
+other. The **same M5 run on a desk takes about 15 minutes**, so on a fanless
+Mac, cooling is worth roughly a tenth of the wall clock and is the first thing
+to check before reading anything else into a timing.
+
 Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
 mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on
-the M4 Pro, and an M5 run without it will be slower than 13 min 54 s. It works
+the M4 Pro, and an M5 run without it will be slower than 13 min 36 s. It works
 with the adapter, but it changes the picture by about as much as the adapter
 does, so turn one at a time when you are judging output rather than speed.
 

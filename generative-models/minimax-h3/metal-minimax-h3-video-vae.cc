@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -31,6 +32,11 @@ using metal_compute::SharedBuffer;
 namespace {
 
 constexpr const char* kKey = "minimax-h3-vvae/bf16|";
+
+// Elements one elementwise dispatch is handed. The kernels take their
+// count as an int, so the band keeps that honest at any extent; it is
+// far above every shape that tiles, so nothing real splits.
+constexpr std::size_t kEltBand = 1u << 30;
 
 // The Comfy-Org single-file video VAE keeps the wrapper config (and,
 // nested under "source_config", the net's) under this `__metadata__`
@@ -689,12 +695,45 @@ MetalMiniMaxH3VideoVae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   return m;
 }
 
+int
+MetalMiniMaxH3VideoVae::row_band_(int N) const
+{
+  // VPIPE_H3_VVAE_ROW_BAND forces a band, which is how a shape that
+  // fits can be tested against its own banded self.
+  static const int kForced = [] {
+    const char* e = std::getenv("VPIPE_H3_VVAE_ROW_BAND");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (kForced > 0) { return kForced; }
+  if (N <= 0) { return 1 << 30; }
+  // The last row a 32-bit BYTE offset reaches, floored to the 128-row
+  // tile the mma kernels step in: a band ending mid-tile would still
+  // hand one tile a base past the line.
+  const long long lim = (((long long)1 << 31) - 1) / ((long long)N * 2);
+  long long band = (lim / 128) * 128;
+  if (band < 128) { band = 128; }
+  if (band > (1 << 30)) { band = 1 << 30; }
+  return (int)band;
+}
+
 void
 MetalMiniMaxH3VideoVae::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                               std::size_t x_off, const Linear& l,
                               const SharedBuffer& y, std::size_t y_off, int M,
                               int N, int K)
 {
+  // Rows in bands narrow enough that no dispatch addresses past 2^31,
+  // each rebased through the buffer offset so the kernel's own
+  // arithmetic stays small. Below the line -- the decode, and every
+  // tiled encode -- the band IS M and this is the single pass it was.
+  const int band = row_band_(N);
+  if (M > band) {
+    for (int m0 = 0; m0 < M; m0 += band) {
+      gemm_(enc, x, x_off + (std::size_t)m0 * K, l, y,
+            y_off + (std::size_t)m0 * N, std::min(band, M - m0), N, K);
+    }
+    return;
+  }
   const bool bias = !l.b.empty();
   if (gemm_mma_(enc, x, x_off, l, y, y_off, M, N, K)) {
     if (bias) {
@@ -1201,8 +1240,13 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
   if (Ti <= 0 || H <= 0 || W <= 0) { return 0; }
   if (!c.spatial) {
     // 1x1x1: no spatial gather and no temporal reach, so it is a plain
-    // Linear over every voxel of the clip at once.
-    gemm_(enc, in, 0, c.l, out, 0, Ti * H * W, c.cout, c.cin);
+    // Linear over every voxel of the clip at once. The voxel count is
+    // the ONE quantity here that an extent could push past an int on
+    // its own -- gemm_ bands everything downstream of it -- so it is
+    // computed wide and refused rather than wrapped.
+    const std::size_t voxels = (std::size_t)Ti * H * W;
+    if (voxels > (std::size_t)INT_MAX) { return 0; }
+    gemm_(enc, in, 0, c.l, out, 0, (int)voxels, c.cout, c.cin);
     return Ti;
   }
   const int Ho = (stride_s == 2) ? (H - 2) / 2 + 1 : H;
@@ -1458,25 +1502,30 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
         enc_gn_(enc, *buf[s2], r.n2w, r.n2b, *buf[s1], t, (int)rows, r.cout,
                 true);
         enc_conv_(enc, r.c2, *buf[s1], t, h, w, *buf[s2], 1, 1);
-        const int n = (int)((std::size_t)t * rows * (std::size_t)r.cout);
+        const std::size_t n = (std::size_t)t * rows * (std::size_t)r.cout;
+        // Elementwise over the whole activation, which at a full-frame
+        // encode is 2.2e9 elements -- past the int this used to narrow
+        // to. Banded, so the count the kernel is handed is always one
+        // it can index.
+        auto residual = [&](int a, int b, int o) {
+          for (std::size_t i = 0; i < n; i += kEltBand) {
+            const int m = (int)std::min((std::size_t)kEltBand, n - i);
+            enc.set_function(_fn_residual);
+            enc.set_buffer(0, *buf[a], i * 2);
+            enc.set_buffer(1, *buf[b], i * 2);
+            enc.set_buffer(2, *buf[o], i * 2);
+            enc.set_constant(3, m);
+            enc.dispatch({(unsigned)m, 1, 1}, {256, 1, 1});
+          }
+        };
         if (r.skip.empty()) {
-          enc.set_function(_fn_residual);
-          enc.set_buffer(0, *buf[cur]);
-          enc.set_buffer(1, *buf[s2]);
-          enc.set_buffer(2, *buf[s1]);
-          enc.set_constant(3, n);
-          enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+          residual(cur, s2, s1);
         } else {
           // The 1x1x1 shortcut has to run BEFORE the add, and it reads
           // the resnet's input -- which is why three buffers are the
           // minimum here and not two.
           enc_conv_(enc, r.skip, *buf[cur], t, h, w, *buf[s1], 1, 1);
-          enc.set_function(_fn_residual);
-          enc.set_buffer(0, *buf[s1]);
-          enc.set_buffer(1, *buf[s2]);
-          enc.set_buffer(2, *buf[cur]);
-          enc.set_constant(3, n);
-          enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+          residual(s1, s2, cur);
           continue;                    // the sum landed back in `cur`
         }
         cur = s1;

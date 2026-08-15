@@ -114,6 +114,48 @@ denoise(const DenoiseRequest& req, std::string* err)
 
   std::vector<float> uniq;
   std::vector<int>   row_idx;
+
+  // Precompute every step's modulation before the loop, which is the one
+  // place that can: the two schedules are fully built by now and the
+  // condition timesteps are constants, so every timestep this run will
+  // ever ask for is known. That lets the DiT drop the 50 AdaLN
+  // projections -- 55% of the 4-bit checkpoint -- and a streaming run
+  // stops re-reading them on every step.
+  //
+  // Advisory. A refusal (a schedule long enough that the tables cost
+  // more than they save) is logged and the loop runs exactly as before,
+  // because this is a memory optimization and not a correctness step.
+  bool baked = false;
+  {
+    std::vector<std::vector<float>> sched;
+    sched.reserve((std::size_t)steps);
+    for (int i = 0; i < steps; ++i) {
+      std::vector<float> u;
+      std::vector<int>   ri;
+      minimax_h3::build_row_timesteps(
+          L, sv.timesteps()[(std::size_t)i], sa.timesteps()[(std::size_t)i],
+          req.condition_timestep, &u, &ri, req.condition_audio_timestep);
+      sched.push_back(std::move(u));
+    }
+    std::string berr;
+    // The A/B. Baking trades a per-step read of 55% of the checkpoint for
+    // one up-front read, which is unambiguously less I/O -- but on a
+    // passively cooled box less I/O means the GPU stops waiting and
+    // starts drawing power, and the clock it loses to that can cost more
+    // than the reads. Whether it is a win is therefore a property of the
+    // MACHINE, and this switch is how to find out on a given one.
+    if (std::getenv("VPIPE_H3_NO_ADALN_BAKE") != nullptr) {
+      berr = "disabled by VPIPE_H3_NO_ADALN_BAKE";
+      baked = false;
+    } else {
+      baked = req.dit->bake_adaln(sched, &berr);
+    }
+    if (!baked && sess != nullptr) {
+      sess->log_normal(fmt("denoise: AdaLN not baked ({}); running the "
+                           "projections per step", berr));
+    }
+  }
+
   for (int i = 0; i < steps; ++i) {
     // Every row's timestep, this step. The conditioning rows keep their
     // own value while the generated video and audio rows walk their two
@@ -153,6 +195,7 @@ denoise(const DenoiseRequest& req, std::string* err)
     st.layout = &L;
     st.timesteps          = &uniq;
     st.row_timestep_index = &row_idx;
+    st.schedule_index     = baked ? i : -1;
     std::string ferr;
     const auto t_fwd0 = std::chrono::steady_clock::now();
     MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);

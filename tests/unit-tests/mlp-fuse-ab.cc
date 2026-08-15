@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1083,4 +1084,62 @@ TEST(mlp_fuse, vae_band)
       EXPECT_TRUE(best > 0.0);
     }
   }
+}
+
+// A telemetry WATCHER, not a benchmark: samples the GPU while something
+// else runs and prints a line per window.
+//
+// It exists because the interesting runs on this machine are whole
+// generations driven by `vpipe`, and a fanless box's numbers are
+// uninterpretable without the clock beside them -- a slow step and a
+// throttled step look identical in a wall clock. This does no GPU work
+// of its own (IOReport/SMC reads only), so it can sit alongside a real
+// run without competing for the device, which matters here: two heavy
+// GPU tasks on this box wedge it rather than merely sharing it.
+//
+// VPIPE_GPU_WATCH=<seconds> turns it on; VPIPE_GPU_WATCH_EVERY=<seconds>
+// sets the window (default 10).
+TEST(mlp_fuse, gpu_watch)
+{
+  const char* on = std::getenv("VPIPE_GPU_WATCH");
+  if (on == nullptr || *on == '\0') { return; }
+  const double total = std::atof(on);
+  const char* ev = std::getenv("VPIPE_GPU_WATCH_EVERY");
+  const double win = (ev != nullptr && *ev != '\0') ? std::atof(ev) : 10.0;
+  if (total <= 0.0 || win <= 0.0) { return; }
+
+  std::printf("[gpu] %s, %.0f cores | watching %.0fs in %.0fs windows\n",
+              GpuTelemetrySampler::gpu_model().c_str(),
+              (double)GpuTelemetrySampler::gpu_core_count(), total, win);
+  std::fflush(stdout);
+  const auto t0 = std::chrono::steady_clock::now();
+  int n = 0;
+  while (std::chrono::duration<double>(
+             std::chrono::steady_clock::now() - t0).count() < total) {
+    GpuTelemetrySampler tel;
+    tel.start();
+    const auto w0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(
+               std::chrono::steady_clock::now() - w0).count() < win) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const GpuTelemetry t = tel.stop();
+    const double el = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[gpu] t=%6.0fs  clock %4.0f/%4.0f/%4.0f MHz  util %3.0f%%  "
+                "power %5.1f W  temp %4.1f C  rss %6.0f MB  thermal %s\n",
+                el,
+                t.freq_mhz.ok ? t.freq_mhz.min : 0.0,
+                t.freq_mhz.ok ? t.freq_mhz.avg : 0.0,
+                t.freq_mhz.ok ? t.freq_mhz.max : 0.0,
+                t.util_pct.ok ? t.util_pct.avg : 0.0,
+                t.power_w.ok ? t.power_w.avg : 0.0,
+                t.temp_c.ok ? t.temp_c.avg : 0.0,
+                t.footprint_mb.ok ? t.footprint_mb.avg : 0.0,
+                t.thermal_state.c_str());
+    std::fflush(stdout);
+    ++n;
+  }
+  std::printf("[gpu] %d windows\n", n);
+  EXPECT_TRUE(n > 0);
 }

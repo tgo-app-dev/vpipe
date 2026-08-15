@@ -1788,3 +1788,223 @@ TEST(minimax_h3_blocks, lora_fused_rate)
   }
   EXPECT_TRUE(true);
 }
+
+// ---- the >2 GB fc1 destination -----------------------------------------
+//
+// A user reported the tail of a 1344x768 / 124-frame clip coming back
+// corrupt -- the last four pixel frames, bottom of the image. Video is
+// packed LAST in this model's sequence, so "the tail of the picture" and
+// "the tail of the packed sequence" are the same rows, which is what an
+// index that stops counting would look like.
+//
+// At that geometry the sequence is 38222 rows and the fc1 intermediate is
+// [38222, 2*14336] bf16 = 2,191,802,368 bytes: the ONE buffer this model
+// allocates that crosses 2^31. Row 37449 is where a byte offset would
+// wrap, leaving the last 773 rows -- the bottom ~77% of the final latent
+// frame -- reading from somewhere else. At 960x544, the geometry that
+// works, the same buffer is 1.13 GB and the question never arises.
+//
+// So: run the real fc1 shape into a real 2.19 GB destination and check
+// every row. y[m][n] = f(m) * g(n) with both factors carried in K = 0,
+// which makes a row that picked up another row's data, or none at all,
+// a wrong number rather than a plausible one.
+//
+// Gated: it allocates ~2.9 GB, which is not a default suite's business.
+TEST(minimax_h3_blocks, fc1_destination_past_2gb)
+{
+  if (std::getenv("VPIPE_H3_BIG_GEMM") == nullptr) {
+    std::printf("[ SKIP     ] set VPIPE_H3_BIG_GEMM=1 (allocates ~2.9 GB)\n");
+    return;
+  }
+  auto session = std::make_shared<Session>();
+  MetalCompute* mc = session->metal_compute();
+  if (mc == nullptr) { EXPECT_TRUE(false); return; }
+  Kernels kn;
+  kn.load(mc);
+  if (!kn.have_mma) {
+    std::printf("[ SKIP     ] no matrix cores\n");
+    return;
+  }
+  // 38222 = the packed sequence of 1344x768 at 124 frames; 37449 is
+  // floor(2^31 / (2*14336*2)), the row a 32-bit BYTE offset stops at.
+  const int M = 38222, N = 2 * kFfn, K = kHidden;
+  const int kWrapRow = (int)((1LL << 31) / ((long long)N * 2));
+  const std::size_t elems = (std::size_t)M * N;
+  std::printf("  fc1 [%d, %d] = %zu elems, %.3f GB (2^31 = 2.147 GB), "
+              "wrap row %d\n", M, N, elems, (double)(elems * 2) / 1e9,
+              kWrapRow);
+
+  SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+  SharedBuffer w = mc->make_shared_buffer((std::size_t)N * K * 2);
+  SharedBuffer y = mc->make_shared_buffer(elems * 2);
+  if (x.empty() || w.empty() || y.empty()) {
+    std::printf("  allocation failed -- not enough memory for this test\n");
+    EXPECT_TRUE(false);
+    return;
+  }
+  auto fm = [](int m) { return 1.0f + (float)(m % 128) / 128.0f; };
+  auto gn = [](int n) { return 1.0f + (float)(n % 128) / 128.0f; };
+  {
+    auto* p = static_cast<std::uint16_t*>(x.contents());
+    std::memset(p, 0, (std::size_t)M * K * 2);
+    for (int m = 0; m < M; ++m) { p[(std::size_t)m * K] = to_bf16_(fm(m)); }
+    auto* q = static_cast<std::uint16_t*>(w.contents());
+    std::memset(q, 0, (std::size_t)N * K * 2);
+    for (int n = 0; n < N; ++n) { q[(std::size_t)n * K] = to_bf16_(gn(n)); }
+  }
+  // A distinctive poison, so a row the GEMM never reached is a loud
+  // failure rather than a zero that some other bug could also explain.
+  {
+    auto* p = static_cast<std::uint16_t*>(y.contents());
+    for (std::size_t i = 0; i < elems; ++i) { p[i] = 0xFF7F; }   // -3.4e38
+  }
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const ComputeFunction& fn = arm == 0 ? kn.dense128 : kn.dense256;
+    const int RN = arm == 0 ? 128 : 256;
+    const char* name = arm == 0 ? "mma128" : "mma128x256";
+    if (!fn.valid()) { continue; }
+    CommandStream stream = mc->make_command_stream();
+    {
+      ComputeEncoder enc = stream.begin_compute();
+      enc.set_function(fn);
+      enc.set_buffer(0, x);
+      enc.set_buffer(1, w);
+      enc.set_buffer(2, w);            // bias slot, unread
+      enc.set_buffer(3, y);
+      enc.set_constant(4, K);
+      enc.set_constant(5, N);
+      enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+    }
+    stream.commit().wait();
+
+    // Every row, at a spread of columns: a band that wrapped shows up
+    // wherever it is, and 38222 x 8 is cheap to check on the host.
+    const int cols[] = {0, 1, 127, 4096, 12345, N / 2, N - 129, N - 1};
+    const auto* p = static_cast<const std::uint16_t*>(y.contents());
+    int bad = 0, first_bad = -1, last_good = -1;
+    double worst = 0.0;
+    for (int m = 0; m < M; ++m) {
+      bool row_ok = true;
+      for (int c : cols) {
+        const float got = from_bf16_(p[(std::size_t)m * N + c]);
+        const float want = fm(m) * gn(c);
+        const double e = std::fabs((double)got - (double)want);
+        if (e > worst) { worst = e; }
+        if (!(e <= 0.05)) { row_ok = false; }
+      }
+      if (!row_ok) {
+        ++bad;
+        if (first_bad < 0) { first_bad = m; }
+      } else {
+        last_good = m;
+      }
+    }
+    std::printf("  %-11s bad rows %d/%d  first bad %d  last good %d  "
+                "worst |err| %.4f\n", name, bad, M, first_bad, last_good,
+                worst);
+    if (bad > 0) {
+      std::printf("  >>> first bad row %d vs the 2^31-byte wrap row %d "
+                  "(%+d, the 128-row tile it sits in)\n", first_bad,
+                  kWrapRow, first_bad - kWrapRow);
+    }
+  }
+  // REPORTED, not asserted. What is asserted is that the banded encoding
+  // the transformer emits gets it right -- see the test below. Failing
+  // here on the day MPP starts addressing past 2^31 would be a platform
+  // improvement reported as a regression.
+  EXPECT_TRUE(true);
+}
+
+// The same shape through the BANDED encoding the transformer now emits:
+// each dispatch rebased so no tile ever computes an offset past the line.
+// Same kernel, same arithmetic, one extra dispatch -- so this passing
+// while the test above fails is the whole of the fix.
+TEST(minimax_h3_blocks, fc1_destination_past_2gb_banded)
+{
+  if (std::getenv("VPIPE_H3_BIG_GEMM") == nullptr) {
+    std::printf("[ SKIP     ] set VPIPE_H3_BIG_GEMM=1 (allocates ~2.9 GB)\n");
+    return;
+  }
+  auto session = std::make_shared<Session>();
+  MetalCompute* mc = session->metal_compute();
+  if (mc == nullptr) { EXPECT_TRUE(false); return; }
+  Kernels kn;
+  kn.load(mc);
+  if (!kn.have_mma) {
+    std::printf("[ SKIP     ] no matrix cores\n");
+    return;
+  }
+  const int M = 38222, N = 2 * kFfn, K = kHidden;
+  const std::size_t elems = (std::size_t)M * N;
+  // mma_row_band_(28672): floor((2^31 - 1) / 57344 / 128) * 128.
+  const int band = (int)(((((long long)1 << 31) - 1) /
+                          ((long long)N * 2)) / 128) * 128;
+  std::printf("  band %d rows -> %d dispatches (base of the last: "
+              "%.3f GB)\n", band, (M + band - 1) / band,
+              (double)((std::size_t)(M / band * band) * N * 2) / 1e9);
+
+  SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+  SharedBuffer w = mc->make_shared_buffer((std::size_t)N * K * 2);
+  SharedBuffer y = mc->make_shared_buffer(elems * 2);
+  if (x.empty() || w.empty() || y.empty()) {
+    std::printf("  allocation failed -- not enough memory for this test\n");
+    EXPECT_TRUE(false);
+    return;
+  }
+  auto fm = [](int m) { return 1.0f + (float)(m % 128) / 128.0f; };
+  auto gn = [](int n) { return 1.0f + (float)(n % 128) / 128.0f; };
+  {
+    auto* p = static_cast<std::uint16_t*>(x.contents());
+    std::memset(p, 0, (std::size_t)M * K * 2);
+    for (int m = 0; m < M; ++m) { p[(std::size_t)m * K] = to_bf16_(fm(m)); }
+    auto* q = static_cast<std::uint16_t*>(w.contents());
+    std::memset(q, 0, (std::size_t)N * K * 2);
+    for (int n = 0; n < N; ++n) { q[(std::size_t)n * K] = to_bf16_(gn(n)); }
+    auto* r = static_cast<std::uint16_t*>(y.contents());
+    for (std::size_t i = 0; i < elems; ++i) { r[i] = 0xFF7F; }
+  }
+
+  const int RN = 128;
+  CommandStream stream = mc->make_command_stream();
+  {
+    ComputeEncoder enc = stream.begin_compute();
+    for (int m0 = 0; m0 < M; m0 += band) {
+      const int rows = std::min(band, M - m0);
+      enc.set_function(kn.dense128);
+      enc.set_buffer(0, x, (std::size_t)m0 * K * 2);
+      enc.set_buffer(1, w);
+      enc.set_buffer(2, w);
+      enc.set_buffer(3, y, (std::size_t)m0 * N * 2);
+      enc.set_constant(4, K);
+      enc.set_constant(5, N);
+      enc.set_constant(6, rows);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                    (unsigned)((rows + 127) / 128), 1}, {256, 1, 1});
+    }
+  }
+  stream.commit().wait();
+
+  const int cols[] = {0, 1, 127, 4096, 12345, N / 2, N - 129, N - 1};
+  const auto* p = static_cast<const std::uint16_t*>(y.contents());
+  int bad = 0, first_bad = -1;
+  double worst = 0.0;
+  for (int m = 0; m < M; ++m) {
+    for (int c : cols) {
+      const float got = from_bf16_(p[(std::size_t)m * N + c]);
+      const double e = std::fabs((double)got - (double)(fm(m) * gn(c)));
+      if (e > worst) { worst = e; }
+      if (!(e <= 0.05)) {
+        ++bad;
+        if (first_bad < 0) { first_bad = m; }
+      }
+    }
+  }
+  std::printf("  banded     bad %d  first bad row %d  worst |err| %.4f\n",
+              bad, first_bad, worst);
+  EXPECT_TRUE(bad == 0);
+}

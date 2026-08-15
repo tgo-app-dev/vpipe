@@ -974,3 +974,145 @@ TEST(minimax_h3_lora, runtime_adapter_survives_i8_gemm)
   // claim that the two accelerations compose rather than interact.
   EXPECT_TRUE(moved_i8 > 0.5 * moved_bf && moved_i8 < 2.0 * moved_bf);
 }
+
+// A baked schedule and a runtime adapter, together.
+//
+// They meet on the AdaLN projection, which is the one module both want.
+// bake_adaln precomputes its output for the whole schedule and drops the
+// weights; the Turbo adapter has a rank-16 factor on that same module in
+// every block. Baking the adapter IN would have been simpler and is
+// deliberately not done -- it would turn `lora_scale` from a knob into a
+// 33B reload, which is the property the runtime path exists for. So the
+// baked table is the BASE, and the adapter is added to a copy of this
+// step's slice, per forward.
+//
+// Two claims, and the second is the one that costs something to keep:
+// the adapter must still move the velocity by what it moved before, and
+// the strength must still be live -- an adapter loaded at 0 and turned
+// up has to land exactly where one loaded at 1 does.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_MINIMAX_H3_TURBO_LORA.
+TEST(minimax_h3_lora, baked_adaln_keeps_the_adapter_live)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_MINIMAX_H3_TURBO_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    return;
+  }
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 5, 20, 12, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  const float kV[] = {0.9f, 0.4f};
+  const float kA[] = {0.8f, 0.35f};
+  const int kSteps = 2;
+  std::vector<std::vector<float>> sched, uniqs((std::size_t)kSteps);
+  std::vector<std::vector<int>> ridx((std::size_t)kSteps);
+  for (int i = 0; i < kSteps; ++i) {
+    h3::build_row_timesteps(L, kV[i], kA[i], 1.0f, &uniqs[(std::size_t)i],
+                            &ridx[(std::size_t)i]);
+    sched.push_back(uniqs[(std::size_t)i]);
+  }
+
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  // `turn_to` >= 0 loads at 0 and turns the strength up afterwards,
+  // which is what a folded-in adapter could not do.
+  auto run = [&](bool bake, bool lora, float scale, float turn_to,
+                 std::vector<float>* out) {
+    MetalMiniMaxH3Transformer::LoraSpec spec{lp, turn_to >= 0.0f ? 0.0f
+                                                                : scale};
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0,
+                                             lora ? &spec : nullptr);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(kPin);
+    if (bake) {
+      std::string berr;
+      if (!m->bake_adaln(sched, &berr)) { return false; }
+    }
+    if (turn_to >= 0.0f) { m->set_lora_scale(turn_to); }
+    out->clear();
+    for (int i = 0; i < kSteps; ++i) {
+      MetalMiniMaxH3Transformer::Step st;
+      st.video = &vb;  st.audio = &ab;  st.text = &tb;
+      st.layout = &L;
+      st.timesteps          = &uniqs[(std::size_t)i];
+      st.row_timestep_index = &ridx[(std::size_t)i];
+      st.schedule_index     = bake ? i : -1;
+      std::string ferr;
+      const auto v = m->forward(st, &ferr);
+      if (v.empty()) { return false; }
+      const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+      const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+      for (std::size_t k = 0; k < n; ++k) { out->push_back(from_bf16_(p[k])); }
+    }
+    return true;
+  };
+
+  std::vector<float> base_p, lora_p, base_b, lora_b, turned_b;
+  ASSERT_TRUE(run(false, false, 1.0f, -1.0f, &base_p));
+  ASSERT_TRUE(run(false, true,  1.0f, -1.0f, &lora_p));
+  ASSERT_TRUE(run(true,  false, 1.0f, -1.0f, &base_b));
+  ASSERT_TRUE(run(true,  true,  1.0f, -1.0f, &lora_b));
+  ASSERT_TRUE(run(true,  true,  1.0f,  1.0f, &turned_b));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  const double moved_p = rel(lora_p, base_p);
+  const double moved_b = rel(lora_b, base_b);
+  const double agree   = rel(lora_b, lora_p);
+  // The same comparison WITHOUT the adapter, which localizes any
+  // difference: baking alone is bit-exact
+  // (minimax_h3_dit.baked_adaln_matches_the_projections), so anything
+  // here that is not zero belongs to the adapter path.
+  const double agree0  = rel(base_b, base_p);
+  const double live    = rel(turned_b, lora_b);
+  std::printf("[minimax_h3_lora] baked+adapter | adapter moves: projections "
+              "%.3e, baked %.3e | baked vs projections: with adapter %.3e, "
+              "without %.3e | turned-up vs loaded-at-1 %.3e\n",
+              moved_p, moved_b, agree, agree0, live);
+  // The adapter has to be doing something, on both paths.
+  EXPECT_TRUE(moved_p > 1e-3 && moved_b > 1e-3);
+  // EXACT, both ways. Baking moves WHERE the base modulation is computed
+  // and the copy is bf16-to-bf16, so nothing rounds differently -- and
+  // an exact bar is what caught the adapter reading an uninitialized
+  // temb, which a tolerance would have passed as "close enough".
+  EXPECT_TRUE(agree == 0.0);
+  EXPECT_TRUE(agree0 == 0.0);
+  // And the strength is still a per-forward constant: exactly equal, not
+  // approximately, because scale 0 encodes no adapter kernels at all.
+  EXPECT_TRUE(live == 0.0);
+}

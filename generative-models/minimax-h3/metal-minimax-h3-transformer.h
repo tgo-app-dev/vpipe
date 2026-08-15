@@ -318,6 +318,10 @@ class MetalMiniMaxH3Transformer {
     // minimax_h3::build_row_timesteps.
     const std::vector<float>* timesteps         = nullptr;
     const std::vector<int>*   row_timestep_index = nullptr;
+    // Which entry of a baked schedule this evaluation is, or -1 for
+    // "not baked" (then `timesteps` drives the AdaLN projection as
+    // before). See bake_adaln.
+    int schedule_index = -1;
   };
 
   struct Velocity {
@@ -329,6 +333,40 @@ class MetalMiniMaxH3Transformer {
 
   // One denoiser evaluation. Empty on failure, with a reason in `err`.
   Velocity forward(const Step& in, std::string* err = nullptr);
+
+  // Precompute every step's modulation and drop the projections that
+  // produce it. `schedule` is one entry per step: that step's distinct
+  // timesteps, exactly as build_row_timesteps returns them, and a Step
+  // then names its entry through `schedule_index`.
+  //
+  // This is THE memory decision on this model, and it is a lopsided one.
+  // The 50 per-block AdaLN projections are 12.9 GB of the 23.5 GB 4-bit
+  // checkpoint -- 55% of it -- and they exist to multiply the handful of
+  // DISTINCT timesteps a sequence carries (three, typically). Measured,
+  // they are 1.3% of a step's GPU time and 55% of the bytes it streams.
+  // So the arithmetic is not worth removing and the residency is.
+  //
+  // Baked, each block keeps a [total_rows, adaln_out] bf16 table instead
+  // of a [adaln_out, time_dim] projection: 2.5 MB against 258 MB at six
+  // steps. The weights are then released and, in streaming mode, never
+  // re-read -- which is the whole point, since a streaming run pays for
+  // them on EVERY step.
+  //
+  // Two things this does not do. It does not fold a runtime LoRA's adaln
+  // adapter in: those factors are rank 16 and ~3 MB a block, so keeping
+  // them applied per step costs almost nothing and keeps `lora_scale` a
+  // knob rather than a rebuild. And it refuses rather than degrades when
+  // the table would be too large -- the size grows with the step count,
+  // and at some point holding it is worse than recomputing.
+  //
+  // Idempotent per schedule; calling it with a different schedule
+  // rebuilds. Requires the adaln weights to still be reachable, so it
+  // must run before anything releases them.
+  bool bake_adaln(const std::vector<std::vector<float>>& schedule,
+                  std::string* err = nullptr);
+  bool adaln_baked() const { return !_adaln_tab.empty(); }
+  // What the tables cost, for the memory report. 0 when not baked.
+  std::size_t adaln_table_bytes() const;
 
   const Config& config() const { return _cfg; }
 
@@ -610,7 +648,27 @@ class MetalMiniMaxH3Transformer {
                             const metal_compute::SharedBuffer& y,
                             std::size_t y_off, int M, int N, int K,
                             GemmRoute route, const LoraFactors* lora,
-                            bool* lora_folded);
+                            bool* lora_folded, std::size_t lora_off = 0);
+  // `route`, over rows banded by mma_row_band_ -- the base projection
+  // only, which is what the autotune measures.
+  void dispatch_row_bands_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& x,
+                           std::size_t x_off, const Linear& l,
+                           const metal_compute::SharedBuffer& y,
+                           std::size_t y_off, int M, int N, int K,
+                           GemmRoute route);
+  // Rows one matmul2d dispatch may write into an N-wide destination.
+  //
+  // The mma tiles address through `dextents<int32_t, 2>`, so the tile
+  // whose base crosses 2^31 BYTES stops storing -- silently, leaving
+  // whatever was in the buffer. MEASURED at H3's fc1 shape
+  // ([38222, 28672] bf16 = 2.19 GB, the 1344x768 x 124-frame sequence):
+  // rows 37504..38221 came back exactly as they went in. Banding M
+  // rebases each dispatch, which keeps every offset the kernel computes
+  // small; below the line the band is the whole thing and nothing about
+  // the encoding changes. VPIPE_H3_MMA_ROW_BAND forces a band, which is
+  // how a small shape can be tested against its own unbanded self.
+  int mma_row_band_(int N) const;
   void qmm_dispatch_(metal_compute::ComputeEncoder& enc,
                      const metal_compute::SharedBuffer& x, std::size_t x_off,
                      const Linear& l, const metal_compute::SharedBuffer& y,
@@ -625,7 +683,7 @@ class MetalMiniMaxH3Transformer {
                  const Linear& l, const metal_compute::SharedBuffer& y,
                  std::size_t y_off, int M, int N, int K, GemmRoute route,
                  const LoraFactors* lora = nullptr,
-                 bool* lora_folded = nullptr);
+                 bool* lora_folded = nullptr, std::size_t lora_off = 0);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -714,6 +772,17 @@ class MetalMiniMaxH3Transformer {
   // The base-projection tiles that also carry the adapter's second
   // factor, so `y = W x + B (A x)` is one store instead of three.
   metal_compute::ComputeFunction _fn_lora_fused128, _fn_lora_fused256;
+  // ---- baked AdaLN (see bake_adaln) ---------------------------------
+  // Per block, [total_rows, adaln_out] bf16; plus the final layer's
+  // [total_rows, 2*hidden]. Empty = not baked.
+  std::vector<metal_compute::SharedBuffer> _adaln_tab;
+  metal_compute::SharedBuffer _final_adaln_tab;
+  // Per step: where its rows start in the tables, and how many. A step's
+  // rows are CONTIGUOUS, which is what lets a block bind its slice
+  // directly instead of gathering.
+  std::vector<int> _adaln_row0, _adaln_nt;
+  metal_compute::ComputeFunction _fn_copy;
+
   bool _lora_mma_off = false;    // VPIPE_H3_NO_LORA_MMA
   bool _lora_fuse_off = false;   // VPIPE_H3_NO_LORA_FUSE
   // Deepest base contraction the fold is allowed on; see gemm_mma_ for
@@ -737,10 +806,12 @@ class MetalMiniMaxH3Transformer {
   // fused base tile is legal at all (that tile has no scale of its own).
   bool lora_gemm_a_(metal_compute::ComputeEncoder& enc,
                     const metal_compute::SharedBuffer& x, std::size_t x_off,
-                    const LoraFactors& lf, int M, int K);
+                    const LoraFactors& lf, int M, int K,
+                    std::size_t lora_off = 0);
   void lora_gemm_b_(metal_compute::ComputeEncoder& enc, const LoraFactors& lf,
                     const metal_compute::SharedBuffer& y, std::size_t y_off,
-                    int M, int N, bool scale_applied);
+                    int M, int N, bool scale_applied,
+                    std::size_t lora_off = 0);
   // Both halves back to back. The standalone form, for the modulation
   // projections that do not go through gemm_.
   void lora_apply_(metal_compute::ComputeEncoder& enc,

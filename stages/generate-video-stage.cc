@@ -45,10 +45,10 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va"},
   {.key = "height", .type = ConfigType::Int, .required = false,
-   .doc = "video height in pixels; a multiple of the family's VAE stride "
+   .doc = "video height in pixels. ROUNDED UP to the family's VAE stride "
           "times its DiT patch -- 16 for wan (8x VAE, 2x patch), 32 for "
-          "minimax-h3 (16x VAE, 2x patch). 16 is what this stage checks up "
-          "front, since the family is not known until the model resolves",
+          "minimax-h3 (16x VAE, 2x patch) -- so any positive value is "
+          "accepted and the stage logs what it used",
    .def_int = 480},
   {.key = "width", .type = ConfigType::Int, .required = false,
    .doc = "video width in pixels; same multiple as height", .def_int = 832},
@@ -236,13 +236,18 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   if (_frames <= 0) { _frames = 81; }
   if (_steps  <= 0) { _steps  = 40; }
   if (!(_fps > 0.0)) { _fps = 16.0; }
-  // Deferred validation: never throw from a constructor, so a geometry the
-  // model cannot represent is reported and the runtime skips the stage.
-  if ((_height % 16) != 0 || (_width % 16) != 0) {
-    fail_config(fmt("height {} and width {} must both be multiples of 16 "
-                    "(the VAE's 8x downsample times the DiT's 2x patch)",
-                    _height, _width));
-  }
+  if (_height <= 0) { _height = 480; }
+  if (_width  <= 0) { _width  = 832; }
+  // The frame SIZE is not validated here either, and for exactly the
+  // reason the frame COUNT is not (see below): the legal grid is the
+  // family's VAE stride times its DiT patch -- 16 for wan, 32 for
+  // MiniMax-H3 -- and the family is not known until the checkpoint is
+  // read. resolve_config_ rounds UP to the resident family's grid.
+  //
+  // This used to refuse anything that was not a multiple of 16, which was
+  // both too strict (a caller should not have to know) and too loose (it
+  // passed H3 sizes that are illegal, e.g. 1360, whose latent width 85 is
+  // odd and cannot be patched).
   // The frame count is NOT validated here, deliberately. A count the VAE
   // cannot chunk has no latent representation -- but the rule is PER
   // FAMILY (wan compresses in 4-frame chunks after a 1-frame first chunk,
@@ -310,6 +315,28 @@ GenerateVideoStage::align_frames_(int aligned)
       "above it that the {} VAE can chunk", this->id(), _frames, aligned,
       _family));
   _frames = aligned;
+}
+
+// Round the frame SIZE up to what the resident family can tile, same
+// contract as align_frames_ and for the same reason: the rule is the
+// VAE's spatial stride times the DiT's patch, both of which are
+// properties of the checkpoint.
+void
+GenerateVideoStage::align_size_(int gh, int gw)
+{
+  if (gh <= 0 || gw <= 0) { return; }
+  const int h = ((_height + gh - 1) / gh) * gh;
+  const int w = ((_width  + gw - 1) / gw) * gw;
+  if (h == _height && w == _width) { return; }
+  // SAY SO, for the reason align_frames_ does: the clip that comes back
+  // is a different shape from the one that was asked for, and a graph
+  // downstream would otherwise discover that as a surprise.
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): {}x{} -> {}x{}, the nearest size at or "
+      "above it that the {} VAE and DiT patch can tile", this->id(),
+      _width, _height, w, h, _family));
+  _height = h;
+  _width  = w;
 }
 
 std::vector<ResourceClaim>
@@ -427,6 +454,14 @@ GenerateVideoStage::resolve_config_()
     // rule (see the constructor): the video VAE takes 17-frame clips and
     // keeps 5 latents from each, so only 17n+5 has a latent form.
     align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    // ...and the same for the frame SIZE. H3's video VAE is 16x spatial
+    // and the DiT patches 2x on top, so the legal grid is 32 -- one
+    // factor coarser than the multiple-of-16 a caller naturally reaches
+    // for. A width like 1360 IS a multiple of 16 and gives an odd latent
+    // (85), which the packer cannot patch and used to refuse deep inside
+    // build_packed_sequence, reporting a latent geometry rather than the
+    // pixel size that produced it.
+    align_size_(16 * _h3_cfg.patch_h, 16 * _h3_cfg.patch_w);
     // _h3_cfg is already filled -- the detection above IS the read.
     _two_experts = false;   // one stack; nothing to switch at
     _have_cfg    = true;
@@ -449,6 +484,8 @@ GenerateVideoStage::resolve_config_()
     return;
   }
   align_frames_(genai::MetalWanVae::align_num_frames(_frames));
+  // Wan's VAE is 8x spatial against H3's 16, so its grid is 16.
+  align_size_(8 * _cfg.patch_h, 8 * _cfg.patch_w);
   _two_experts = fs::exists(fs::path(_root) / "transformer_2" / "config.json");
   _have_cfg = true;
   apply_model_config_();   // as above: the family is only now known

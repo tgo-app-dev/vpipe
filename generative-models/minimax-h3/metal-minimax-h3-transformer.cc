@@ -736,7 +736,8 @@ bool
 MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
                                         const SharedBuffer& x,
                                         std::size_t x_off,
-                                        const LoraFactors& lf, int M, int K)
+                                        const LoraFactors& lf, int M, int K,
+                                        std::size_t lora_off)
 {
   const int r = lf.rank;
   const bool mma = _use_mma2 && M >= _mma_min_m;
@@ -752,7 +753,7 @@ MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
   enc.set_buffer(0, x, x_off * 2);
   enc.set_buffer(1, lf.a);
   enc.set_buffer(2, lf.a);          // bias slot unused (has_bias = 0)
-  enc.set_buffer(3, _s.lora);
+  enc.set_buffer(3, _s.lora, lora_off * 2);
   enc.set_constant(4, K);
   enc.set_constant(5, r);
   enc.set_constant(6, M);
@@ -775,7 +776,8 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
                                         const LoraFactors& lf,
                                         const SharedBuffer& y,
                                         std::size_t y_off, int M, int N,
-                                        bool scale_applied)
+                                        bool scale_applied,
+                                        std::size_t lora_off)
 {
   const int r = lf.rank;
   const bool mma = _use_mma2 && M >= _mma_min_m;
@@ -784,7 +786,7 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
   const metal_compute::ComputeFunction* fb =
       (mma && scale_applied) ? lora_route_b_(r, N) : nullptr;
   enc.set_function(fb != nullptr ? *fb : _fn_gemm_acc);
-  enc.set_buffer(0, _s.lora);
+  enc.set_buffer(0, _s.lora, lora_off * 2);
   enc.set_buffer(1, lf.b);
   enc.set_buffer(2, lf.b);
   enc.set_buffer(3, y, y_off * 2);
@@ -1121,6 +1123,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_residual  = m->_lib_elt.function("residual_add_f16");
   m->_fn_bias_add  = m->_lib_elt.function("bias_add_rows_f16");
+  // The blit a baked AdaLN needs when an adapter has to be added on top.
+  m->_fn_copy      = m->_lib_elt.function("copy_f16");
   {
     metal_compute::ComputeLibrary sdpa = mc->load_library("sdpa_bf16");
     m->_fn_sdpa = sdpa.function("sdpa_full_f16");
@@ -1634,10 +1638,10 @@ MetalMiniMaxH3Transformer::gemm_route_dispatch_(
     ComputeEncoder& enc, const SharedBuffer& x, std::size_t x_off,
     const Linear& l, const SharedBuffer& y, std::size_t y_off,
     int M, int N, int K, GemmRoute route, const LoraFactors* lora,
-    bool* lora_folded)
+    bool* lora_folded, std::size_t lora_off)
 {
   if (gemm_mma_(enc, x, x_off, l, y, y_off, M, N, K, route, lora,
-                lora_folded)) {
+                lora_folded, lora_off)) {
     return;
   }
   if (l.quantized) {
@@ -1677,7 +1681,7 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
                                      const SharedBuffer& y, std::size_t y_off,
                                      int M, int N, int K, GemmRoute route,
                                      const LoraFactors* lora,
-                                     bool* lora_folded)
+                                     bool* lora_folded, std::size_t lora_off)
 {
   // Only the mma routes belong here, and this test has to come FIRST.
   // route_ok_ answers "can this route run this shape", and for a STEEL
@@ -1781,7 +1785,7 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
       enc.set_constant(5, N);
       enc.set_constant(6, M);
       enc.set_constant(7, 0);
-      enc.set_buffer(8, _s.lora);
+      enc.set_buffer(8, _s.lora, lora_off * 2);
       enc.set_buffer(9, lora->b);
       enc.set_constant(10, lora->rank);
       enc.dispatch({(unsigned)(((N + FRN - 1) / FRN) * 256),
@@ -1820,6 +1824,43 @@ MetalMiniMaxH3Transformer::qmm_tuning() const
 }
 
 void
+MetalMiniMaxH3Transformer::dispatch_row_bands_(ComputeEncoder& enc,
+                                               const SharedBuffer& x,
+                                               std::size_t x_off,
+                                               const Linear& l,
+                                               const SharedBuffer& y,
+                                               std::size_t y_off, int M,
+                                               int N, int K, GemmRoute route)
+{
+  const int band = mma_row_band_(N);
+  for (int m0 = 0; m0 < M; m0 += band) {
+    gemm_route_dispatch_(enc, x, x_off + (std::size_t)m0 * K, l, y,
+                         y_off + (std::size_t)m0 * N,
+                         std::min(band, M - m0), N, K, route, nullptr,
+                         nullptr);
+  }
+}
+
+int
+MetalMiniMaxH3Transformer::mma_row_band_(int N) const
+{
+  static const int kForced = [] {
+    const char* e = std::getenv("VPIPE_H3_MMA_ROW_BAND");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (kForced > 0) { return kForced; }
+  if (N <= 0) { return 1 << 30; }
+  // The last row a 32-bit BYTE offset can reach, floored to the 128-row
+  // tile the mma kernels step in -- a band that ended mid-tile would
+  // still hand one tile an offset past the line.
+  const long long lim = (((long long)1 << 31) - 1) / ((long long)N * 2);
+  long long band = (lim / 128) * 128;
+  if (band < 128) { band = 128; }
+  if (band > (1 << 30)) { band = 1 << 30; }
+  return (int)band;
+}
+
+void
 MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                                  std::size_t x_off, const Linear& l,
                                  const SharedBuffer& y, std::size_t y_off,
@@ -1835,29 +1876,43 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
        _lora_scale == 0.0f)) {
     lora = nullptr;
   }
-  // t = [scale *] x A^T, BEFORE the projection: the fused tile reads it,
-  // and the unfused path does not care which order the two are in.
-  bool scaled = false;
-  if (lora != nullptr) {
-    scaled = lora_gemm_a_(enc, x, x_off, *lora, M, K);
-  }
-  bool folded = false;
-  gemm_route_dispatch_(enc, x, x_off, l, y, y_off, M, N, K,
-                       gemm_route_(M, N, K),
-                       // The fused tile has no scale, so offering it an
-                       // adapter whose strength never reached t would run
-                       // that adapter at 1.0.
-                       (lora != nullptr && scaled) ? lora : nullptr, &folded);
-  if (lora != nullptr && !folded) {
-    lora_gemm_b_(enc, *lora, y, y_off, M, N, scaled);
-  }
-  if (bias) {
-    enc.set_function(_fn_bias_add);
-    enc.set_buffer(0, y, y_off * 2);
-    enc.set_buffer(1, l.b);
-    enc.set_constant(2, N);
-    enc.set_constant(3, M * N);
-    enc.dispatch({(unsigned)(M * N), 1, 1}, {256, 1, 1});
+  // One route for the WHOLE projection, chosen at the full M so a band
+  // never lands on a kernel the tuner did not measure, then the rows in
+  // bands narrow enough for the mma tiles' 32-bit addressing. Below the
+  // 2^31-byte line -- everything this model ran before 1344x768 -- the
+  // band IS M and this is the single pass it always was.
+  const GemmRoute route = gemm_route_(M, N, K);
+  const int band = mma_row_band_(N);
+  for (int m0 = 0; m0 < M; m0 += band) {
+    const int rows = std::min(band, M - m0);
+    const std::size_t xo = x_off + (std::size_t)m0 * K;
+    const std::size_t yo = y_off + (std::size_t)m0 * N;
+    const std::size_t lo =
+        lora != nullptr ? (std::size_t)m0 * lora->rank : 0;
+    // t = [scale *] x A^T, BEFORE the projection: the fused tile reads
+    // it, and the unfused path does not care which order the two are in.
+    bool scaled = false;
+    if (lora != nullptr) {
+      scaled = lora_gemm_a_(enc, x, xo, *lora, rows, K, lo);
+    }
+    bool folded = false;
+    gemm_route_dispatch_(enc, x, xo, l, y, yo, rows, N, K, route,
+                         // The fused tile has no scale, so offering it an
+                         // adapter whose strength never reached t would
+                         // run that adapter at 1.0.
+                         (lora != nullptr && scaled) ? lora : nullptr,
+                         &folded, lo);
+    if (lora != nullptr && !folded) {
+      lora_gemm_b_(enc, *lora, y, yo, rows, N, scaled, lo);
+    }
+    if (bias) {
+      enc.set_function(_fn_bias_add);
+      enc.set_buffer(0, y, yo * 2);
+      enc.set_buffer(1, l.b);
+      enc.set_constant(2, N);
+      enc.set_constant(3, rows * N);
+      enc.dispatch({(unsigned)(rows * N), 1, 1}, {256, 1, 1});
+    }
   }
 }
 
@@ -1962,8 +2017,13 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
             // tiles, which is far short of flipping a route, and giving
             // the tuner an adapter would make its choice depend on which
             // LoRA happened to be loaded.
-            gemm_route_dispatch_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
-                                 cands[(std::size_t)i], nullptr, nullptr);
+            //
+            // Banded exactly as the forward encodes it. Unbanded, an mma
+            // route past 2^31 bytes would silently skip its last tiles
+            // and be timed for work it did not do, while steel -- which
+            // addresses in 64 bits -- did all of it.
+            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
+                                cands[(std::size_t)i]);
           });
         });
     const GemmRoute win = cands[(std::size_t)w];
@@ -1979,8 +2039,8 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
         win == GemmRoute::kMma128x256Tn2) {
       const int sp = _splitk.tune(_mc, sh.K, sh.N, M,
           [&](ComputeEncoder& enc) {
-            gemm_route_dispatch_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
-                                 win, nullptr, nullptr);
+            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
+                                win);
           });
       if (sp > 0) { detail += "+split" + std::to_string(sp); }
     }
@@ -2085,6 +2145,150 @@ MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
       const float sv = acc / (1.0f + std::exp(-acc));
       dst[(std::size_t)t * D + (std::size_t)o] = f32_to_bf16_(sv);
     }
+  }
+  return true;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::adaln_table_bytes() const
+{
+  std::size_t n = _final_adaln_tab.byte_size();
+  for (const SharedBuffer& b : _adaln_tab) { n += b.byte_size(); }
+  return n;
+}
+
+bool
+MetalMiniMaxH3Transformer::bake_adaln(
+    const std::vector<std::vector<float>>& schedule, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "minimax-h3 bake_adaln: " + m; }
+    return false;
+  };
+  if (schedule.empty()) { return fail("empty schedule"); }
+  if (_mc == nullptr || _ws == nullptr) { return fail("no weights"); }
+  const Config& c = _cfg;
+  const int D = c.adaln_out();
+  const int FD = 2 * c.hidden;
+
+  // A step's timesteps land CONTIGUOUSLY, so a block binds its slice at
+  // an offset rather than gathering rows. The condition timestep repeats
+  // in every step's group; deduplicating it would save one row in three
+  // and cost a gather, which is the wrong trade at these sizes.
+  std::vector<float> all;
+  _adaln_row0.clear();
+  _adaln_nt.clear();
+  for (const std::vector<float>& st : schedule) {
+    if (st.empty()) { return fail("a step with no timesteps"); }
+    _adaln_row0.push_back((int)all.size());
+    _adaln_nt.push_back((int)st.size());
+    all.insert(all.end(), st.begin(), st.end());
+  }
+  const int T = (int)all.size();
+
+  // The size grows with the step count, and past some point holding the
+  // table is worse than recomputing it -- so this REFUSES rather than
+  // silently taking a bad trade. The default budget is generous next to
+  // what it replaces (12.9 GB of weights at the released config) and
+  // still bounds a long schedule: 32 steps is ~930 MB.
+  static const std::size_t kBudget = []() {
+    const char* e = std::getenv("VPIPE_H3_ADALN_BAKE_MAX_MB");
+    const long v = (e != nullptr) ? std::atol(e) : 0;
+    return (std::size_t)(v > 0 ? v : 1536) << 20;
+  }();
+  const std::size_t want =
+      (std::size_t)T * (std::size_t)D * 2 * (std::size_t)c.n_layers +
+      (std::size_t)T * (std::size_t)FD * 2;
+  if (want > kBudget) {
+    return fail(fmt("{} steps would need {} MB of tables, over the {} MB "
+                    "budget (VPIPE_H3_ADALN_BAKE_MAX_MB)",
+                    schedule.size(), want >> 20, kBudget >> 20)());
+  }
+
+  // The timestep MLP for EVERY row at once, on the host in f32 exactly
+  // as a single step would do it.
+  SharedBuffer temb =
+      _mc->make_shared_buffer((std::size_t)T * (std::size_t)c.time_dim * 2);
+  if (temb.empty()) { return fail("temb allocation failed"); }
+  if (!time_embed_(all, temb)) { return fail("time embedding failed"); }
+
+  auto lin_bytes = [](const Linear& l) {
+    return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
+           l.scales.byte_size() + l.qbias.byte_size();
+  };
+  std::size_t freed = 0;
+  _adaln_tab.clear();
+  _adaln_tab.resize((std::size_t)c.n_layers);
+  for (int i = 0; i < c.n_layers; ++i) {
+    // Take the projection from wherever it is. A resident block already
+    // holds it; a streamed one does not, and reading JUST this tensor is
+    // the point -- the bake never needs the rest of the block, so it
+    // touches the 12.9 GB once and nothing else.
+    Linear held;
+    const Linear* ada = nullptr;
+    if ((std::size_t)i < _blocks.size() && !_blocks[(std::size_t)i].adaln.empty()) {
+      ada = &_blocks[(std::size_t)i].adaln;
+    } else {
+      held = linear_(*_ws, blk_("blocks.", i, "") + "adaln_proj.linear", true,
+                     Retain::Streamed);
+      if (held.empty()) { return fail(fmt("block {} has no adaln", i)()); }
+      ada = &held;
+    }
+    SharedBuffer tab =
+        _mc->make_shared_buffer((std::size_t)T * (std::size_t)D * 2);
+    if (tab.empty()) { return fail(fmt("table {} allocation failed", i)()); }
+    {
+      CommandStream st = _mc->make_command_stream();
+      {
+        ComputeEncoder enc = st.begin_compute();
+        gemm_(enc, temb, 0, *ada, tab, 0, T, D, c.time_dim);
+      }
+      st.commit().wait();
+    }
+    _adaln_tab[(std::size_t)i] = std::move(tab);
+    // Release the weights. For a resident model this IS the win; for a
+    // streamed one the win is that load_block_ stops asking for them.
+    freed += lin_bytes(*ada);
+    if ((std::size_t)i < _blocks.size()) {
+      _blocks[(std::size_t)i].adaln = Linear{};
+    }
+  }
+
+  // Same two cases as the blocks, and the final layer needs them for the
+  // same reason the blocks do: a SECOND bake (a new schedule on a model
+  // that already baked one) finds this released and has to re-read it.
+  // Missing that made re-baking silently project against an empty
+  // weight, which minimax_h3_dit.denoise_holds_the_anchors caught as two
+  // denoise runs disagreeing -- not as a failure at the bake.
+  Linear fheld;
+  const Linear* fada = &_final_adaln;
+  if (_final_adaln.empty()) {
+    fheld = linear_(*_ws, "final_layer.adaln_proj.linear", true,
+                    Retain::Streamed);
+    if (fheld.empty()) { return fail("final_layer has no adaln"); }
+    fada = &fheld;
+  }
+  _final_adaln_tab =
+      _mc->make_shared_buffer((std::size_t)T * (std::size_t)FD * 2);
+  if (_final_adaln_tab.empty()) { return fail("final table alloc failed"); }
+  {
+    CommandStream st = _mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      gemm_(enc, temb, 0, *fada, _final_adaln_tab, 0, T, FD, c.time_dim);
+    }
+    st.commit().wait();
+  }
+  freed += lin_bytes(*fada);
+  _final_adaln = Linear{};
+
+  if (_mc->session() != nullptr) {
+    _mc->session()->log_normal(fmt(
+        "MetalMiniMaxH3Transformer: baked AdaLN for {} steps ({} rows) -- "
+        "{} projections ({} MB) replaced by {} MB of tables{}",
+        schedule.size(), T, c.n_layers + 1, freed >> 20,
+        adaln_table_bytes() >> 20,
+        _stream_blocks ? ", and no longer streamed per step" : ""));
   }
   return true;
 }
@@ -2382,6 +2586,25 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   }
 
   build_rope_(L, s.rcos, s.rsin);
+  // A baked schedule replaces every AdaLN projection with a slice of a
+  // precomputed table. It needs the step to say WHICH slice, so a Step
+  // that does not name its schedule entry falls back to computing the
+  // modulation, whatever the model holds.
+  const bool baked = adaln_baked() && in.schedule_index >= 0 &&
+                     (std::size_t)in.schedule_index < _adaln_row0.size() &&
+                     _adaln_nt[(std::size_t)in.schedule_index] == n_t;
+  if (adaln_baked() && !baked) {
+    return fail(fmt("schedule_index {} does not name a baked step with {} "
+                    "timesteps (the schedule has {})", in.schedule_index,
+                    n_t, _adaln_row0.size())());
+  }
+  // ALWAYS, even baked. Baking removes the AdaLN projection's need for
+  // it, but not the adaln ADAPTER's: that is applied per forward (so
+  // lora_scale stays live) and reads temb as its input. Skipping it here
+  // left the adapter projecting from an uninitialized scratch -- which
+  // produced plausible numbers, not a crash, and showed up only as the
+  // baked and unbaked paths disagreeing once an adapter was attached.
+  // It costs a host pass over n_t rows, which is nothing.
   if (!time_embed_(*in.timesteps, s.temb)) {
     return fail("timestep embedding failed");
   }
@@ -2567,11 +2790,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(4, eps);
       enc.dispatch({256, (unsigned)rows, 1}, {256, 1, 1});
     };
+    // Where this block reads its modulation from. Unbaked that is always
+    // the s.mod scratch the AdaLN GEMM just wrote; baked it is a SLICE of
+    // the block's table, bound at an offset so nothing is copied. The
+    // block lambda sets both before using them.
+    const SharedBuffer* mod_buf = &s.mod;
+    std::size_t mod_off = 0;
     auto modulate = [&](const SharedBuffer& x, const SharedBuffer& mod,
+                        std::size_t mod_byte_off,
                         const SharedBuffer& idx, const SharedBuffer& y,
                         int rows, int stride, int scale_off, int shift_off) {
       enc.set_function(_fn_modulate);
-      enc.set_buffer(0, x); enc.set_buffer(1, mod); enc.set_buffer(2, idx);
+      enc.set_buffer(0, x); enc.set_buffer(1, mod, mod_byte_off);
+      enc.set_buffer(2, idx);
       enc.set_buffer(3, y);
       enc.set_constant(4, H);
       enc.set_constant(5, stride);
@@ -2583,7 +2814,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     auto gated = [&](const SharedBuffer& x, const SharedBuffer& sub, int rows,
                      int gate_off) {
       enc.set_function(_fn_gated);
-      enc.set_buffer(0, x); enc.set_buffer(1, s.mod);
+      enc.set_buffer(0, x); enc.set_buffer(1, *mod_buf, mod_off * 2);
       enc.set_buffer(2, s.adaln_idx); enc.set_buffer(3, sub);
       enc.set_constant(4, H);
       enc.set_constant(5, 6 * H);
@@ -2654,7 +2885,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       rms(x, 0, b.n1, s.nm, 0, rows, H, c.norm_eps);
       bdump("n1", s.nm, H);
       if (modulated) {
-        modulate(s.nm, s.mod, s.adaln_idx, s.nm, rows, 6 * H, H, 0);
+        modulate(s.nm, *mod_buf, mod_off * 2, s.adaln_idx, s.nm, rows,
+                 6 * H, H, 0);
       }
       bdump("n1+mod", s.nm, H);
       psplit(t_elt);
@@ -2690,7 +2922,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 
       rms(x, 0, b.n2, s.nm, 0, rows, H, c.norm_eps);
       if (modulated) {
-        modulate(s.nm, s.mod, s.adaln_idx, s.nm, rows, 6 * H, 4 * H, 3 * H);
+        modulate(s.nm, *mod_buf, mod_off * 2, s.adaln_idx, s.nm, rows,
+                 6 * H, 4 * H, 3 * H);
       }
       bdump("n2+mod", s.nm, H);
       psplit(t_elt);
@@ -2820,7 +3053,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       const bool streaming = _stream_blocks && !held;
       Block streamed;
       if (streaming) {
-        if (!load_block_(*_ws, blk_("blocks.", Lx, ""), streamed, true,
+        // `with_adaln` false once baked: those tensors are 55% of a
+        // block's bytes and nothing reads them any more, so a streaming
+        // run stops paying for them on every step. This is the whole
+        // point of baking.
+        if (!load_block_(*_ws, blk_("blocks.", Lx, ""), streamed, !baked,
                          Retain::Streamed)) {
           return {};
         }
@@ -2831,16 +3068,52 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // tag` addresses. M is the number of DISTINCT timesteps, so this
       // is a very tall, very thin GEMM.
       //
-      // NOTE: this reads the block's 260M-parameter AdaLN projection on
-      // EVERY denoise step, and those 50 projections are ~13B of the
-      // model's 33B parameters. They depend only on the timestep, so a
-      // caller that knows its whole schedule up front could bake every
-      // step's table once and never keep them resident. That is the
-      // memory lever on this model; it is not taken yet.
-      gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(), c.time_dim);
-      if ((std::size_t)Lx < _lora_blocks.size()) {
-        lora_apply_(enc, s.temb, 0, _lora_blocks[(std::size_t)Lx].adaln, s.mod,
-                    0, n_t, c.adaln_out(), c.time_dim);
+      // Unbaked this reads the block's 260M-parameter AdaLN projection on
+      // EVERY denoise step, and those 50 projections are 55% of the 4-bit
+      // checkpoint. bake_adaln replaces the GEMM with a slice of a table
+      // computed once for the whole schedule -- see its comment for why
+      // that is a memory decision rather than a speed one.
+      const LoraFactors* ada_lo =
+          ((std::size_t)Lx < _lora_blocks.size() &&
+           !_lora_blocks[(std::size_t)Lx].adaln.empty())
+              ? &_lora_blocks[(std::size_t)Lx].adaln
+              : nullptr;
+      if (baked) {
+        const std::size_t row0 =
+            (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
+            (std::size_t)c.adaln_out();
+        if (ada_lo == nullptr) {
+          // Nothing to add: point the modulation kernels straight at
+          // this step's rows. No GEMM, no copy, no scratch.
+          mod_buf = &_adaln_tab[(std::size_t)Lx];
+          mod_off = row0;
+        } else {
+          // An adapted AdaLN still has to be ADDED to something
+          // writable, so the slice is copied into the scratch first.
+          // That copy is 580 KB against the 258 MB projection it
+          // replaced, and it is what keeps `lora_scale` live: the
+          // adapter is applied per forward rather than baked in.
+          mod_buf = &s.mod;
+          mod_off = 0;
+          const int n_el = n_t * c.adaln_out();
+          enc.set_function(_fn_copy);
+          enc.set_buffer(0, _adaln_tab[(std::size_t)Lx], row0 * 2);
+          enc.set_buffer(1, s.mod);
+          enc.set_constant(2, 0);
+          enc.set_constant(3, n_el);
+          enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
+          lora_apply_(enc, s.temb, 0, *ada_lo, s.mod, 0, n_t, c.adaln_out(),
+                      c.time_dim);
+        }
+      } else {
+        mod_buf = &s.mod;
+        mod_off = 0;
+        gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(),
+              c.time_dim);
+        if (ada_lo != nullptr) {
+          lora_apply_(enc, s.temb, 0, *ada_lo, s.mod, 0, n_t, c.adaln_out(),
+                      c.time_dim);
+        }
       }
       psplit(t_adaln);
       // The modulation VALUES, per modality tag. s.mod is [n_t*3, 6*H]
@@ -2952,14 +3225,37 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     }
 
     // ---- 4. the shared output norm and the two heads ------------------
-    gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H, c.time_dim);
-    lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
-                c.time_dim);
+    const SharedBuffer* fmod_buf = &s.fmod;
+    std::size_t fmod_off = 0;
+    if (baked) {
+      const std::size_t row0 =
+          (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
+          (std::size_t)(2 * H);
+      if (_lora_final.empty()) {
+        fmod_buf = &_final_adaln_tab;
+        fmod_off = row0;
+      } else {
+        const int n_el = n_t * 2 * H;
+        enc.set_function(_fn_copy);
+        enc.set_buffer(0, _final_adaln_tab, row0 * 2);
+        enc.set_buffer(1, s.fmod);
+        enc.set_constant(2, 0);
+        enc.set_constant(3, n_el);
+        enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
+        lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
+                    c.time_dim);
+      }
+    } else {
+      gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H, c.time_dim);
+      lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
+                  c.time_dim);
+    }
     rms(s.x, 0, _final_norm, s.proj, 0, seq, H, c.final_norm_eps);
     // The final modulation is indexed by the bare TIMESTEP index, not by
     // the AdaLN index: this norm is modality-independent. Its two halves
     // are shift then scale, the order the Wan and LTX output layers use.
-    modulate(s.proj, s.fmod, s.tstep_idx, s.proj, seq, 2 * H, H, 0);
+    modulate(s.proj, *fmod_buf, fmod_off * 2, s.tstep_idx, s.proj, seq,
+             2 * H, H, 0);
     // The inverse gather, run by run, so the velocity comes back in the
     // same row order the caller handed the latents in.
     {

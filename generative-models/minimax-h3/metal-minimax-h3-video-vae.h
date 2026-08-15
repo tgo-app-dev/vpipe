@@ -282,6 +282,23 @@ class MetalMiniMaxH3VideoVae {
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
              std::size_t y_off, int M, int N, int K);
+  // Rows one dispatch may write into an N-wide destination.
+  //
+  // Two limits, and the tighter one is the same number. The mma tiles
+  // address through `dextents<int32_t, 2>`, so a destination past 2^31
+  // BYTES makes the tile whose base crosses the line stop storing --
+  // silently, leaving what was already there. And `M * N` is an int in
+  // the bias and steel dispatches, which is the ELEMENT count. Bytes
+  // bind first, so a band under 2^31 bytes is under 2^31 elements too.
+  //
+  // The DECODE never comes near either: it runs per 256x256 tile, so M
+  // is ~10^4 whatever the canvas. The ENCODE can, because encode() is
+  // documented to take whatever extent it is handed and encode_tiled_
+  // hands it the WHOLE frame when the frame does not tile. A 1344x768
+  // clip through that path is [17547264, 128] = 4.5 GB, twice over the
+  // line, and `t * rows * cout` overflows the int it was narrowed to.
+  // VPIPE_H3_VVAE_ROW_BAND forces one.
+  int row_band_(int N) const;
   // Dequant-once into _w_deq (quantized) or the weight as-is (dense), then
   // one dense matmul2d tile. False when the shape or the machine does not
   // take it, which leaves gemm_ on its existing path.

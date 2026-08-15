@@ -27,6 +27,7 @@
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "stages/generate-video-stage.h"
@@ -395,10 +396,17 @@ TEST(generate_video, geometry_config_validation)
   EXPECT_TRUE(mk(480, 832, 80)->config_error().empty());
   EXPECT_TRUE(mk(480, 832, 100)->config_error().empty());
   EXPECT_TRUE(mk(480, 832, 56)->config_error().empty());   // an H3 count
-  // 16 = the VAE's 8x spatial compression times the DiT's 2x patch, so a
-  // size off that grid cannot be patchified without a partial token.
-  EXPECT_TRUE(!mk(484, 832, 81)->config_error().empty());
-  EXPECT_TRUE(!mk(480, 830, 81)->config_error().empty());
+  // The SIZE is accepted the same way and for the same reason: the legal
+  // grid is the family's VAE stride times its DiT patch -- 16 for wan, 32
+  // for minimax-h3 -- and the family is not known here either, so
+  // resolve_config_ rounds UP once the checkpoint has been read. This
+  // used to refuse anything off a 16 grid, which was both too strict (a
+  // caller should not have to know the family's stride) and too loose: it
+  // ACCEPTED H3 sizes that are illegal, and they failed much later with a
+  // message about latent geometry. See the test below.
+  EXPECT_TRUE(mk(484, 832, 81)->config_error().empty());
+  EXPECT_TRUE(mk(480, 830, 81)->config_error().empty());
+  EXPECT_TRUE(mk(768, 1360, 85)->config_error().empty());
 
   // The frame arithmetic itself: F = 1 + 4*(T-1) inverted.
   auto s = mk(480, 832, 81);
@@ -441,6 +449,52 @@ TEST(generate_video, frame_counts_round_up_per_family)
   // handed the other's number.
   EXPECT_TRUE(genai::MetalWanVae::align_num_frames(56) == 57);
   EXPECT_TRUE(h3::align_num_frames(81, 17, 5) == 90);
+}
+
+// What a rounded frame size has to BE, checked against the packer that
+// used to refuse it.
+//
+// The reported failure was a 1360x768 request dying with "could not pack
+// a 27x48x85 latent" -- a message about the latent, from a stage that had
+// accepted the pixel size. 1360 is a multiple of 16, so the old check
+// passed it; H3's VAE is 16x spatial, so its latent width is 85, which is
+// ODD and cannot be split by the DiT's 2x patch. The grid is therefore 32
+// for this family, not 16, and the fix is to round up to it rather than
+// to explain any of that to the caller.
+//
+// Tested against build_packed_sequence itself, not against the rounding
+// arithmetic, which would only confirm that ceil() is ceil().
+TEST(generate_video, frame_sizes_round_up_to_a_patchable_latent)
+{
+  namespace h3 = genai::minimax_h3;
+  genai::MetalMiniMaxH3Transformer::Config c;   // released patch_h/w = 2
+  const int grid_w = 16 * c.patch_w, grid_h = 16 * c.patch_h;
+  EXPECT_TRUE(grid_w == 32 && grid_h == 32);
+
+  auto packs = [&](int px_h, int px_w) {
+    h3::PackedLayout L;
+    const std::vector<int> tags(8, h3::kTextTag);
+    return h3::build_packed_sequence(tags, 27, px_h / 16, px_w / 16, 150,
+                                     c.patch_h, c.patch_w,
+                                     h3::kAudioChannels, {}, &L);
+  };
+  auto up = [](int v, int g) { return ((v + g - 1) / g) * g; };
+
+  // The reported request, and why it failed.
+  EXPECT_TRUE((1360 / 16) % c.patch_w != 0);   // latent width 85, odd
+  EXPECT_TRUE(!packs(768, 1360));
+  // Rounded to the family's grid it packs, and the height -- already a
+  // multiple of 32 -- must not move.
+  EXPECT_TRUE(up(1360, grid_w) == 1376);
+  EXPECT_TRUE(up(768, grid_h) == 768);
+  EXPECT_TRUE(packs(768, 1376));
+  // The shipped geometry is untouched by the rounding, which is the
+  // regression that would matter most.
+  EXPECT_TRUE(up(960, grid_w) == 960 && up(544, grid_h) == 544);
+  EXPECT_TRUE(packs(544, 960));
+  // Round UP, never down: a size rounded down silently delivers a smaller
+  // picture than was asked for.
+  EXPECT_TRUE(up(1361, grid_w) == 1376 && up(1377, grid_w) == 1408);
 }
 
 // The stage is family-generic, but NOT by carrying the union of what its

@@ -1377,3 +1377,137 @@ TEST(minimax_h3_dit, fused_ff_matches_split)
   EXPECT_TRUE(rv < 2e-2);
   EXPECT_TRUE(ra < 2e-2);
 }
+
+// A baked schedule has to produce the SAME velocity as the projections
+// it replaces.
+//
+// This is a memory optimization, so the bar is exact agreement, not a
+// tolerance: baking changes WHERE the modulation is computed, not how.
+// Both arms run the same GEMM against the same weights over the same
+// timesteps -- the baked one just does it once for every step up front,
+// at M = all rows instead of M = this step's rows. The only way that
+// moves a bit is if the GEMM's route depends on M, which it does (the
+// tuner keys on it), so the route is pinned in both arms and what is
+// left must be bit-identical.
+//
+// What it is really guarding is the INDEXING. A step's rows sit at an
+// offset in the table, blocks bind their slice rather than copying it,
+// and the modulation kernels read it through an adaln index built per
+// step -- so an off-by-one in row0, a stale n_t, or a table laid out
+// per-distinct-value instead of per-step all produce a plausible video
+// made from another step's noise level.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, baked_adaln_matches_the_projections)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 5, 20, 12, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  // Three steps at DIFFERENT noise levels, so a table read at the wrong
+  // offset lands on a different timestep rather than on a copy of the
+  // right one.
+  const float kV[] = {0.9f, 0.5f, 0.15f};
+  const float kA[] = {0.8f, 0.45f, 0.1f};
+  const int kSteps = 3;
+
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  std::vector<std::vector<float>> sched;
+  std::vector<std::vector<float>> uniqs(kSteps);
+  std::vector<std::vector<int>>   ridx(kSteps);
+  for (int i = 0; i < kSteps; ++i) {
+    h3::build_row_timesteps(L, kV[i], kA[i], 1.0f, &uniqs[(std::size_t)i],
+                            &ridx[(std::size_t)i]);
+    sched.push_back(uniqs[(std::size_t)i]);
+  }
+
+  // The GEMM route is chosen by measurement and keys on M, and the two
+  // arms run the AdaLN projection at DIFFERENT M (all rows at once vs
+  // one step's). Pinned, so the comparison is about the table.
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  auto run = [&](bool bake, std::vector<std::vector<float>>* out) {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(kPin);
+    if (bake) {
+      std::string berr;
+      if (!m->bake_adaln(sched, &berr)) {
+        std::printf("[minimax_h3_dit] bake: %s\n", berr.c_str());
+        return false;
+      }
+      if (!m->adaln_baked()) { return false; }
+      std::printf("[minimax_h3_dit] baked %zu MB of AdaLN tables\n",
+                  (std::size_t)(m->adaln_table_bytes() >> 20));
+    }
+    out->assign((std::size_t)kSteps, {});
+    for (int i = 0; i < kSteps; ++i) {
+      MetalMiniMaxH3Transformer::Step st;
+      st.video = &vb;  st.audio = &ab;  st.text = &tb;
+      st.layout = &L;
+      st.timesteps          = &uniqs[(std::size_t)i];
+      st.row_timestep_index = &ridx[(std::size_t)i];
+      st.schedule_index     = bake ? i : -1;
+      std::string ferr;
+      const auto v = m->forward(st, &ferr);
+      if (v.empty()) {
+        std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+        return false;
+      }
+      const std::size_t n =
+          (std::size_t)n_video * cfg.video_patch_elems();
+      auto& dst = (*out)[(std::size_t)i];
+      dst.resize(n);
+      const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+      for (std::size_t k = 0; k < n; ++k) { dst[k] = bf16_to_f32_(p[k]); }
+    }
+    return true;
+  };
+
+  std::vector<std::vector<float>> plain, baked;
+  ASSERT_TRUE(run(false, &plain));
+  ASSERT_TRUE(run(true, &baked));
+  for (int i = 0; i < kSteps; ++i) {
+    const auto& a = plain[(std::size_t)i];
+    const auto& b = baked[(std::size_t)i];
+    ASSERT_TRUE(a.size() == b.size() && !a.empty());
+    std::size_t diff = 0;
+    double num = 0.0, den = 0.0;
+    for (std::size_t k = 0; k < a.size(); ++k) {
+      if (a[k] != b[k]) { ++diff; }
+      const double d = (double)a[k] - (double)b[k];
+      num += d * d;
+      den += (double)a[k] * (double)a[k];
+    }
+    std::printf("[minimax_h3_dit] step %d (t_v=%.2f): %zu/%zu elements "
+                "differ, rel-L2 %.3e\n", i, (double)kV[i], diff, a.size(),
+                den > 0.0 ? std::sqrt(num / den) : 0.0);
+    EXPECT_TRUE(diff == 0);
+  }
+}
