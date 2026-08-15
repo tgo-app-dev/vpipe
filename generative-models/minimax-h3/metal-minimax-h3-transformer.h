@@ -417,6 +417,13 @@ class MetalMiniMaxH3Transformer {
   // was freed, and ratchets the growth ceiling down so the set does not
   // immediately reclaim it. Never touches the configured pinned prefix.
   std::size_t release_resident_blocks(std::size_t bytes);
+  // Free the highest resident block; its bytes, or 0 when there is
+  // nothing left. `allow_pinned` lets it take one out of the pinned
+  // prefix (shrinking `_pinned` to match), which is only right when a
+  // measurement says that prefix is no longer in RAM.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // Pages of the resident set examined, and how many are still in RAM.
+  void resident_pages_(std::size_t* examined, std::size_t* incore) const;
 
   // Cooperative stop, polled once per BLOCK inside forward().
   //

@@ -143,11 +143,45 @@ StreamPlan plan_streaming(const SessionContextIntf* session,
                           const std::string&        enc_dir,
                           std::size_t               headroom);
 
-// The `unload_when_idle` config value shared by the model-holding stages:
-//   auto (default) -- decide from RAM vs the pipeline's weight footprint
-//   always         -- drop the weights after every beat
-//   never          -- keep them resident
-enum class UnloadPolicy { kAuto, kAlways, kNever };
+// The `unload_when_idle` config value shared by the model-holding stages.
+// THREE things can happen to idle weights, not two:
+//
+//   destroy -- free them. The bytes are gone, the accounting shrinks, and
+//              the next beat pays a full reload from disk. The only one
+//              that reliably gives a peer room RIGHT NOW.
+//   park    -- hand them to the kernel as purgeable. They survive unless
+//              something else needs the RAM, and the next beat reactivates
+//              without touching the disk if they did. Never worse than
+//              destroy: same reclaim value, cheaper when the pages live.
+//   keep    -- hold them pinned. A second run is free, but nothing can
+//              reclaim them, so under pressure the OS compresses and
+//              swaps them instead -- paid in both directions, for weights
+//              that are read-only and could have been re-read from a file.
+//   auto    -- resolve from the box (see the stages' resolve_*_policy_).
+//
+// `park` is the state this vocabulary existed to name and could not: the
+// old spelling had only always/never, so a stage that wanted "let go IF
+// somebody needs it" had to choose between two wrong answers. The legacy
+// names are kept as aliases so existing pipeline JSON keeps working.
+enum class UnloadPolicy {
+  kAuto,
+  kDestroy,
+  kPark,
+  kKeep,
+  kAlways = kDestroy,        // legacy spelling
+  kNever  = kKeep,           // legacy spelling
+};
+
+// True when any model in this run decided to stream its blocks -- i.e.
+// somebody is already paying per-step disk reads for want of RAM.
+//
+// The signal a stage should weigh before keeping anything resident, and
+// it does NOT come from arithmetic: it is recorded by plan_streaming()
+// when a DiT actually takes that decision. See
+// GenerativeModelManager::note_streaming for why the footprint numbers
+// alone cannot see it (a streaming DiT revises its declaration down, and
+// the revision reads as roominess).
+bool peer_streams(const SessionContextIntf* session);
 
 // Parse a config string; unknown values return kAuto and set `*bad` so the
 // caller can warn (stage config is deferred-validated -- never throw).

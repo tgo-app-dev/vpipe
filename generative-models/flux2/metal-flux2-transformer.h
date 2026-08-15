@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -175,6 +176,24 @@ class MetalFlux2Transformer {
   // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
   int pinned_blocks() const { return _pinned_d + _pinned_s; }
 
+  // ---- adaptive block residency (streaming mode) ----------------------
+  //
+  // The shared policy (generative-models/shared/block-residency.h). Two
+  // stacks rather than one, which changes only the eviction ORDER: the
+  // singles go first, so what survives is a prefix of the doubles --
+  // they carry the joint text/image attention and are the more expensive
+  // half to re-read.
+  //
+  // `set_residency_reserve` tells it how much room the rest of the
+  // forward still needs; 0 (the default) disables growth entirely, which
+  // is the pure-streaming behaviour this model had before.
+  void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  int resident_block_count() const { return _resid.count(); }
+  // Hand back at least `bytes` of promoted blocks. Never touches the
+  // configured pinned prefix; returns what was actually freed.
+  std::size_t release_resident_blocks(std::size_t bytes);
+
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
   // honored within ~one block instead of a whole forward. No-op preloaded.
   void set_stream_stop(std::function<bool()> stop) {
@@ -334,8 +353,18 @@ class MetalFlux2Transformer {
   // single) are loaded on demand from the weight set per forward and
   // freed after use.
   bool _stream_blocks = false;
+  BlockResidency _resid;
   int _pinned_d = 0;                  // pinned leading double blocks (streaming)
   int _pinned_s = 0;                  // pinned leading single blocks (streaming)
+  // Free the highest resident block -- singles before doubles. Returns
+  // its bytes, or 0 when nothing is left. `allow_pinned` lets it take one
+  // out of the pinned prefix (shrinking the count to match), which is
+  // only right when a measurement says that prefix is no longer in RAM.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // Pages of the resident set examined, and how many are still in RAM.
+  void resident_pages_(std::size_t* examined, std::size_t* incore) const;
+  static std::size_t double_bytes_(const DoubleBlock& b);
+  static std::size_t single_bytes_(const SingleBlock& b);
   // Zero-copy mmap of the quantized weight tensors (codes/scales/qbias) as
   // read-only views aliasing the weight set's mmap, instead of owned
   // copies. The pages are clean + file-backed, so the OS can reclaim the

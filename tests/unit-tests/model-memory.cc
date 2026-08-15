@@ -223,10 +223,31 @@ TEST(model_memory, unload_policy_parses)
   EXPECT_TRUE(model_memory::parse_unload_policy("sometimes", &bad) ==
               UnloadPolicy::kAuto);
   EXPECT_TRUE(bad);
+  // The canonical vocabulary is destroy/park/keep. "always" and "never"
+  // are still ACCEPTED (existing pipeline JSON says them) but they are
+  // aliases, so they no longer name themselves back.
+  EXPECT_TRUE(model_memory::parse_unload_policy("destroy", &bad) ==
+              UnloadPolicy::kDestroy);
+  EXPECT_TRUE(model_memory::parse_unload_policy("park", &bad) ==
+              UnloadPolicy::kPark);
+  EXPECT_TRUE(model_memory::parse_unload_policy("keep", &bad) ==
+              UnloadPolicy::kKeep);
+  EXPECT_TRUE(!bad);
+  // The legacy spellings are the SAME states, not neighbouring ones --
+  // an alias that drifted would silently change what a shipped pipeline
+  // does to its weights.
+  EXPECT_TRUE(model_memory::parse_unload_policy("always", &bad) ==
+              UnloadPolicy::kDestroy);
+  EXPECT_TRUE(model_memory::parse_unload_policy("never", &bad) ==
+              UnloadPolicy::kKeep);
   EXPECT_TRUE(std::string(model_memory::unload_policy_name(
-                  UnloadPolicy::kAlways)) == "always");
+                  UnloadPolicy::kDestroy)) == "destroy");
   EXPECT_TRUE(std::string(model_memory::unload_policy_name(
-                  UnloadPolicy::kNever)) == "never");
+                  UnloadPolicy::kPark)) == "park");
+  EXPECT_TRUE(std::string(model_memory::unload_policy_name(
+                  UnloadPolicy::kKeep)) == "keep");
+  EXPECT_TRUE(std::string(model_memory::unload_policy_name(
+                  UnloadPolicy::kAuto)) == "auto");
   EXPECT_TRUE(std::string(model_memory::unload_policy_name(
                   UnloadPolicy::kAuto)) == "auto");
 }

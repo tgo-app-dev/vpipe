@@ -39,6 +39,7 @@ set(LOCAL_TEST_SOURCES
   path-sandbox.cc
   session-sandbox.cc
   model-catalog.cc
+  block-residency.cc
   model-memory.cc
   model-register-stage.cc
   model-remove-stage.cc

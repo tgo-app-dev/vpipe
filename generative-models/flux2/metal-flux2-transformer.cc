@@ -717,7 +717,11 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       if (pin > (int)prefixes.size()) { pin = (int)prefixes.size(); }
       m->_pinned_d = pin < m->_cfg.n_double ? pin : m->_cfg.n_double;
       m->_pinned_s = pin - m->_pinned_d;
-      m->_double.resize((std::size_t)m->_pinned_d);
+      // Sized to the FULL depth even though only the pinned prefix is
+      // filled: the empty slots are where forward() promotes streamed
+      // blocks as free memory allows (see set_residency_reserve). An
+      // unfilled slot reads as empty, which is what `held` tests.
+      m->_double.resize((std::size_t)m->_cfg.n_double);
       for (int i = 0; i < m->_pinned_d; ++i) {
         if (!m->load_double_(ws,
                 "transformer_blocks." + std::to_string(i) + ".",
@@ -725,7 +729,7 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
           return nullptr;
         }
       }
-      m->_single.resize((std::size_t)m->_pinned_s);
+      m->_single.resize((std::size_t)m->_cfg.n_single);
       for (int i = 0; i < m->_pinned_s; ++i) {
         if (!m->load_single_(ws,
                 "single_transformer_blocks." + std::to_string(i) + ".",
@@ -958,6 +962,108 @@ MetalFlux2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   enc.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
                 (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
   return true;
+}
+
+std::size_t
+MetalFlux2Transformer::double_bytes_(const DoubleBlock& b)
+{
+  auto qb = [](const QWeight& w) {
+    return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size()
+         + w.qbias.byte_size();
+  };
+  const QWeight* q[] = {&b.q, &b.k, &b.v, &b.o, &b.aq, &b.ak, &b.av,
+                        &b.ao, &b.ff_in, &b.ff_out, &b.cff_in, &b.cff_out};
+  std::size_t n = b.qn.byte_size() + b.kn.byte_size() + b.aqn.byte_size()
+                + b.akn.byte_size();
+  for (const QWeight* w : q) { n += qb(*w); }
+  return n;
+}
+
+std::size_t
+MetalFlux2Transformer::single_bytes_(const SingleBlock& b)
+{
+  auto qb = [](const QWeight& w) {
+    return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size()
+         + w.qbias.byte_size();
+  };
+  const QWeight* q[] = {&b.qkv_mlp, &b.qkv, &b.mlp_gu, &b.o};
+  std::size_t n = b.qn.byte_size() + b.kn.byte_size();
+  for (const QWeight* w : q) { n += qb(*w); }
+  return n;
+}
+
+// Singles before doubles.
+//
+// The two stacks are not interchangeable: a double block carries the
+// joint text/image attention and is the more expensive half to re-read,
+// so what survives an eviction should be a prefix of THOSE. Within a
+// stack it is the tail, as everywhere else -- in a cyclic scan every
+// block is worth the same, and a prefix keeps the bookkeeping trivial.
+std::size_t
+MetalFlux2Transformer::evict_tail_block_(bool allow_pinned)
+{
+  const int sfloor = allow_pinned ? 0 : _pinned_s;
+  for (int i = (int)_single.size() - 1; i >= sfloor; --i) {
+    SingleBlock& b = _single[(std::size_t)i];
+    const std::size_t n = single_bytes_(b);
+    if (n == 0) { continue; }
+    b = SingleBlock{};
+    if (i < _pinned_s) { _pinned_s = i; }
+    return n;
+  }
+  const int dfloor = allow_pinned ? 0 : _pinned_d;
+  for (int i = (int)_double.size() - 1; i >= dfloor; --i) {
+    DoubleBlock& b = _double[(std::size_t)i];
+    const std::size_t n = double_bytes_(b);
+    if (n == 0) { continue; }
+    b = DoubleBlock{};
+    if (i < _pinned_d) { _pinned_d = i; }
+    return n;
+  }
+  return 0;
+}
+
+// How much of the RESIDENT set is still in RAM. Sampled inside each
+// buffer: a pin either holds or it does not, so every 64th page finds
+// it. See BlockResidency property 5 -- free-memory arithmetic cannot
+// answer this, and it is the question that actually matters.
+void
+MetalFlux2Transformer::resident_pages_(std::size_t* examined,
+                                       std::size_t* incore) const
+{
+  *examined = 0;
+  *incore = 0;
+  auto add = [&](const metal_compute::SharedBuffer& p) {
+    if (p.byte_size() == 0) { return; }
+    const auto r = p.page_residency(64);
+    if (!r.valid) { return; }
+    *examined += r.examined;
+    *incore += r.incore;
+  };
+  auto addq = [&](const QWeight& w) { add(w.w); add(w.codes); };
+  for (const DoubleBlock& b : _double) {
+    addq(b.q); addq(b.k); addq(b.v); addq(b.o);
+    addq(b.aq); addq(b.ak); addq(b.av); addq(b.ao);
+    addq(b.ff_in); addq(b.ff_out); addq(b.cff_in); addq(b.cff_out);
+  }
+  for (const SingleBlock& b : _single) {
+    addq(b.qkv_mlp); addq(b.qkv); addq(b.mlp_gu); addq(b.o);
+  }
+}
+
+std::size_t
+MetalFlux2Transformer::release_resident_blocks(std::size_t bytes)
+{
+  const std::size_t freed =
+      _resid.release(bytes, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalFlux2Transformer: released {} MB of resident blocks "
+        "({} left)", freed >> 20, _resid.count()));
+  }
+  return freed;
 }
 
 SharedBuffer
@@ -1690,7 +1796,47 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     op.tap("emb_ctx", 0, context_b, 0, TS, c.joint_dim);
     op.gemm(context_b, _ctx_embed, txt, 0, TS, H, c.joint_dim);
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
+    // Re-arm residency growth for this forward; the ratchet from any
+    // earlier eviction deliberately survives. Then the measurement that
+    // actually finds the limit -- are the blocks we kept still in RAM?
+    // Gated on our OWN compressed footprint moving, because the page
+    // walk costs ~57 ms per 4.3 GB and a healthy run would pay it every
+    // step to be told nothing.
+    const auto mbudget = _mc->memory_budget();
+    _resid.begin_forward(mbudget, [this]() -> std::size_t {
+      return evict_tail_block_();
+    });
+    bool shortfall = false;
+    if ((_resid.count() > 0 || _pinned_d + _pinned_s > 0) &&
+        _resid.self_compression_grew(mbudget.self_compressed)) {
+      std::size_t examined = 0, incore = 0;
+      resident_pages_(&examined, &incore);
+      if (examined > 0 && incore < examined) {
+        shortfall = true;
+        std::size_t freed = _resid.note_weight_residency(
+            examined, incore, [this]() -> std::size_t {
+              return evict_tail_block_();
+            });
+        // Nothing left outside the pinned prefix and the pages are still
+        // leaving RAM: the prefix itself is what does not fit.
+        if (freed == 0 && _pinned_d + _pinned_s > 0) {
+          freed = evict_tail_block_(/*allow_pinned=*/true);
+        }
+        if (_mc->session() != nullptr) {
+          _mc->session()->log_normal(fmt(
+              "MetalFlux2Transformer: resident weights are only {}% in "
+              "RAM -- released {} MB, now {} blocks resident",
+              (int)(100.0 * (double)incore / (double)examined), freed >> 20,
+              _resid.count() + _pinned_d + _pinned_s));
+        }
+      }
+    }
 
+    // Nothing of ours had left RAM this step -- either the walk said
+    // so or there was no compression to make it worth walking.
+    // Enough in a row lifts the ratchet by a block, so a shed taken
+    // during a momentary squeeze is not the last word on the run.
+    if (!shortfall) { _resid.note_healthy_forward(); }
     for (int L = 0; L < c.n_double; ++L) {
       // Pipeline stop -> abandon: checked EVERY block (not just the streamed
       // tail) so a slow high-res step responds within ~one block on the
@@ -1699,8 +1845,13 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       if (_block_progress) {
         _block_progress(L, c.n_double + c.n_single);
       }
-      // Pinned prefix (L < _pinned_d) is resident in _double; the tail streams.
-      const bool streaming = _stream_blocks && L >= _pinned_d;
+      // Resident if it was pinned at load OR promoted by an earlier pass;
+      // the vector is sized to n_double in streaming mode and an unfilled
+      // slot reads as empty. Index would be the wrong test now that the
+      // resident set grows past the prefix.
+      const bool held = L < (int)_double.size() &&
+                        !_double[(std::size_t)L].q.empty();
+      const bool streaming = _stream_blocks && !held;
       DoubleBlock streamed;
       if (streaming) {
         if (!load_double_(*_ws,
@@ -1777,7 +1928,19 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       op.tap("dbl_ffact_txt", L, smlp, 0, TS, INNER);
       op.gemm(smlp, b.cff_out, ob, 0, TS, H, INNER);
       op.gated(txt, 0, mtxt, 5 * H, ob, 0, H, TS * H);
-      if (streaming) { flush(); }   // commit block L before it frees
+      if (streaming) {
+        flush();                    // commit block L before it frees
+        // The flush above has been WAITED for, so nothing encoded still
+        // points at this block's buffers -- which is why the promotion
+        // happens here and not at the top of the iteration. Keeping it
+        // costs nothing extra: the bytes are already resident, and the
+        // alternative is re-reading the same block on every later step.
+        const std::size_t nb = double_bytes_(streamed);
+        if (_resid.admit(_mc, nb)) {
+          _double[(std::size_t)L] = std::move(streamed);
+          _resid.note_admitted(nb);
+        }
+      }
     }
     enc.end();
     std::string gpu_err;
@@ -1821,8 +1984,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (_block_progress) {
       _block_progress(c.n_double + L, c.n_double + c.n_single);
     }
-    // Pinned prefix (L < _pinned_s) is resident in _single; the tail streams.
-    const bool streaming = _stream_blocks && L >= _pinned_s;
+    // As above: resident if pinned at load or promoted since.
+    const bool held = L < (int)_single.size() &&
+                      !_single[(std::size_t)L].o.empty();
+    const bool streaming = _stream_blocks && !held;
     SingleBlock streamed;
     if (streaming) {
       if (!load_single_(*_ws,
@@ -1905,6 +2070,15 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                                  gpu_err.empty() ? "GPU failed" : gpu_err));
       }
       return {};
+    }
+    if (streaming) {
+      // Same safe point as the double stack: this block's stream has
+      // been committed AND waited for just above.
+      const std::size_t nb = single_bytes_(streamed);
+      if (_resid.admit(_mc, nb)) {
+        _single[(std::size_t)L] = std::move(streamed);
+        _resid.note_admitted(nb);
+      }
     }
     if (prof) { t_sgl_out += ms_since(mk); }
   }

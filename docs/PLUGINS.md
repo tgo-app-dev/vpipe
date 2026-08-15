@@ -181,6 +181,14 @@ Provide a `ModelExec` (a thin adapter over a model that owns a
 `ContextManager`, `owns_kv()==true`) and register a factory keyed by the
 checkpoint's `config.json` `architecture` string:
 
+> **Before writing a loader, read [MODEL-MEMORY.md](MODEL-MEMORY.md).**
+> A plugin's model shares one machine with every other model in the
+> graph, and the contract for that — how weights are read, how a stage
+> declares them before anything loads, when blocks stream, and what
+> happens to weights while they are idle — is not optional. A model that
+> skips it works on the box it was written on and thrashes elsewhere. An
+> exec that owns its K/V must also override `kv_bytes()`.
+
 ```cpp
 #include "generative-models/model-exec-registry.h"
 

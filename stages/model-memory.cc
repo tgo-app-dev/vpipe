@@ -118,6 +118,17 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   p.footprint = weight_footprint(session, {dit_dir, enc_dir});
   p.others    = weight_footprint(session, {enc_dir});
   p.stream    = ram < p.footprint + headroom;
+  // Record the decision where peers can see it. Deliberately here and
+  // not at the five call sites: this is the single streaming rule for
+  // every DiT family, so it is also the only place that cannot drift
+  // out of step with what was actually decided. That makes this a
+  // decision function rather than a pure query -- every caller acts on
+  // what it returns.
+  if (p.stream && session != nullptr &&
+      session->services() != nullptr &&
+      session->services()->generative_model_manager() != nullptr) {
+    session->services()->generative_model_manager()->note_streaming(dit_dir);
+  }
   // Pin as many leading blocks as fit beside everything else that stays
   // resident. 5 GB covers activation scratch plus the in-flight block
   // and its double-buffer margin; 0.60 is the ceiling stream-pin.h
@@ -129,13 +140,25 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   return p;
 }
 
+bool
+peer_streams(const SessionContextIntf* session)
+{
+  if (session == nullptr || session->services() == nullptr) { return false; }
+  const auto* mgr = session->services()->generative_model_manager();
+  return mgr != nullptr && mgr->any_streaming();
+}
+
 UnloadPolicy
 parse_unload_policy(const std::string& s, bool* bad)
 {
   if (bad != nullptr) { *bad = false; }
   if (s.empty() || s == "auto") { return UnloadPolicy::kAuto; }
-  if (s == "always") { return UnloadPolicy::kAlways; }
-  if (s == "never") { return UnloadPolicy::kNever; }
+  // Legacy spellings first, since they are what existing pipeline JSON
+  // says: "always" meant destroy and "never" meant keep, back when park
+  // had no name.
+  if (s == "always" || s == "destroy") { return UnloadPolicy::kDestroy; }
+  if (s == "never"  || s == "keep")    { return UnloadPolicy::kKeep; }
+  if (s == "park") { return UnloadPolicy::kPark; }
   if (bad != nullptr) { *bad = true; }
   return UnloadPolicy::kAuto;
 }
@@ -144,9 +167,10 @@ const char*
 unload_policy_name(UnloadPolicy p)
 {
   switch (p) {
-    case UnloadPolicy::kAlways: return "always";
-    case UnloadPolicy::kNever:  return "never";
-    default:                    return "auto";
+    case UnloadPolicy::kDestroy: return "destroy";
+    case UnloadPolicy::kPark:    return "park";
+    case UnloadPolicy::kKeep:    return "keep";
+    default:                     return "auto";
   }
 }
 

@@ -87,6 +87,38 @@ public:
   bool set_wired(bool on) noexcept;
   bool is_wired() const noexcept { return _wired; }
 
+  // ---- is this buffer actually still in RAM? -----------------------
+  //
+  // A weight buffer kept resident so it need not be re-read is only
+  // worth its RAM while it IS in RAM. Once the OS has compressed or
+  // swapped its pages the buffer costs everything a streamed block
+  // costs -- a fault, a decompress or a disk read -- plus the memory it
+  // is still nominally occupying. That is the failure this reports, and
+  // it reports it about THIS buffer rather than about the machine, so a
+  // policy does not have to infer it from free-memory arithmetic that
+  // cannot tell a hot cache from a cold one.
+  //
+  // `stride_pages` samples: 1 reads every page, N reads every Nth. A
+  // pin either holds or it does not, so a sample finds it -- and the
+  // vector mincore() needs is one byte per page examined, which at
+  // stride 1 over a 1.2 GB block is 75 KB.
+  struct PageResidency {
+    std::size_t examined  = 0;   // pages the query looked at
+    std::size_t incore    = 0;   // of those, still in RAM
+    std::size_t paged_out = 0;   // of those, known to have been evicted
+    bool        valid     = false;
+    // Nothing of this buffer has left RAM.
+    bool fully_resident() const noexcept
+    {
+      return !valid || (examined > 0 && incore == examined);
+    }
+    double resident_fraction() const noexcept
+    {
+      return examined > 0 ? (double)incore / (double)examined : 1.0;
+    }
+  };
+  PageResidency page_residency(std::size_t stride_pages = 1) const noexcept;
+
   // ---- residency: parking an INACTIVE weight buffer ----------------
   //
   // The pair behind "release under memory pressure, reactivate without

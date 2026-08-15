@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 namespace vpipe::metal_compute {
 
@@ -241,6 +242,43 @@ SharedBuffer::set_wired(bool on) noexcept
     _wired = false;
   }
   return true;
+}
+
+SharedBuffer::PageResidency
+SharedBuffer::page_residency(std::size_t stride_pages) const noexcept
+{
+  PageResidency out;
+  if (_contents == nullptr || _byte_size == 0) { return out; }
+  if (stride_pages == 0) { stride_pages = 1; }
+  const std::size_t page =
+      static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  if (page == 0) { return out; }
+  // mincore() wants a page-aligned base, and contents() of a subview
+  // need not be one. Round DOWN and shorten to match, so the query
+  // covers this handle's own bytes and no more.
+  auto addr = reinterpret_cast<std::uintptr_t>(_contents);
+  const std::size_t slack = addr % page;
+  addr -= slack;
+  const std::size_t len =
+      round_up_to_page_(_byte_size + slack, page);
+  const std::size_t npages = len / page;
+  if (npages == 0) { return out; }
+
+  // One byte per page for the whole range; mincore() has no stride, so
+  // sampling saves the WALK, not the vector. At 16 KB pages a 1.2 GB
+  // block needs 75 KB of stack-free heap, which is why this is not on
+  // the stack.
+  std::vector<char> vec(npages, 0);
+  if (::mincore(reinterpret_cast<void*>(addr), len, vec.data()) != 0) {
+    return out;                        // ENOMEM: unmapped, report nothing
+  }
+  for (std::size_t i = 0; i < npages; i += stride_pages) {
+    ++out.examined;
+    if ((vec[i] & MINCORE_INCORE) != 0) { ++out.incore; }
+    if ((vec[i] & MINCORE_PAGED_OUT) != 0) { ++out.paged_out; }
+  }
+  out.valid = true;
+  return out;
 }
 
 bool

@@ -1014,6 +1014,130 @@ MetalKrea2Vae::decode_peak_bytes(int h8, int w8) const noexcept
   return _use_hwconv ? top * 10 : top * 9 * 2;
 }
 
+int
+MetalKrea2Vae::decode_tile_side_(std::size_t budget) const noexcept
+{
+  if (budget == 0) { return 0; }
+  // Walk down in 8-cell steps; decode_peak_bytes is monotone in the side,
+  // so the first fit is the largest. A side is latent cells (8 px each),
+  // so 256 is a 2048^2 window -- the whole image at the size that made
+  // tiling necessary, and the right place to start looking down from.
+  for (int s = 256; s >= kTileMin8; s -= 8) {
+    if (decode_peak_bytes(s, s) <= budget) { return s; }
+  }
+  return 0;
+}
+
+SharedBuffer
+MetalKrea2Vae::decode_tiled_(const SharedBuffer& z, int h8, int w8,
+                             int tile8, std::string* err)
+{
+  auto fail = [&](std::string m) -> SharedBuffer {
+    if (err != nullptr) { *err = std::move(m); }
+    return {};
+  };
+  const int Cz = _cfg.z_dim;
+  const int px = 8;                              // output pixels per cell
+  const int H = h8 * px, W = w8 * px;
+  if (tile8 < kTileMin8) { return fail("tiled decode: window too small"); }
+  const int ov = std::max(2, tile8 * kTileOvNum / kTileOvDen);
+  const int step = tile8 - ov;
+  if (step < 1) { return fail("tiled decode: overlap exceeds the window"); }
+
+  const std::size_t hw = (std::size_t)H * W;
+  std::vector<float> acc((std::size_t)3 * hw, 0.0f);   // weighted RGB sum
+  std::vector<float> wsum(hw, 0.0f);                   // weight sum
+  const auto* zsrc = static_cast<const _Float16*>(z.contents());
+  if (zsrc == nullptr) { return fail("tiled decode: latent not host-visible"); }
+
+  // Cross-fade weight for an OUTPUT pixel: ramps up over the overlap unless
+  // the window starts at the image edge, down over it unless it ends there,
+  // so interior windows sum to 1 across a seam. The ramp width is the
+  // overlap in PIXELS -- ramping over `ov` cells instead would fade across
+  // an eighth of the overlap and leave a visible seam.
+  const int ovp = ov * px;
+  auto ramp = [&](int i, int n, bool at_lo, bool at_hi) {
+    float w = 1.0f;
+    if (!at_lo && i < ovp)      { w = (float)(i + 1) / (float)(ovp + 1); }
+    if (!at_hi && i >= n - ovp) {
+      const float t = (float)(n - i) / (float)(ovp + 1);
+      w = std::min(w, t);
+    }
+    return std::max(w, 1e-3f);
+  };
+
+  int ntiles = 0;
+  for (int y0 = 0; y0 < h8; y0 += step) {
+    const int th = std::min(tile8, h8 - y0);
+    if (th <= 0) { break; }
+    const bool y_lo = (y0 == 0), y_hi = (y0 + th >= h8);
+    for (int x0 = 0; x0 < w8; x0 += step) {
+      const int tw = std::min(tile8, w8 - x0);
+      if (tw <= 0) { break; }
+      const bool x_lo = (x0 == 0), x_hi = (x0 + tw >= w8);
+      // Slice the latent window out of z[Cz, h8, w8] (channel-first).
+      SharedBuffer zt = _mc->make_shared_buffer((std::size_t)Cz * th * tw * 2);
+      if (zt.empty()) {
+        return fail("tiled decode: window latent alloc failed");
+      }
+      auto* zd = static_cast<_Float16*>(zt.contents());
+      for (int c = 0; c < Cz; ++c) {
+        for (int y = 0; y < th; ++y) {
+          const _Float16* srow =
+              zsrc + ((std::size_t)c * h8 + (y0 + y)) * w8 + x0;
+          _Float16* drow = zd + ((std::size_t)c * th + y) * tw;
+          for (int x = 0; x < tw; ++x) { drow[x] = srow[x]; }
+        }
+      }
+      std::string terr;
+      SharedBuffer rgb = decode(zt, th, tw, &terr);
+      if (rgb.empty()) {
+        return fail(terr.empty() ? std::string("tiled decode: window failed")
+                                 : terr);
+      }
+      // Cross-fade the window into the accumulator (planar RGB, f16).
+      const int tH = th * px, tW = tw * px;
+      const std::size_t thw = (std::size_t)tH * tW;
+      const auto* rs = static_cast<const _Float16*>(rgb.contents());
+      for (int y = 0; y < tH; ++y) {
+        const float wy = ramp(y, tH, y_lo, y_hi);
+        const std::size_t orow = (std::size_t)(y0 * px + y) * W + x0 * px;
+        for (int x = 0; x < tW; ++x) {
+          const float wgt = wy * ramp(x, tW, x_lo, x_hi);
+          const std::size_t op = orow + x;
+          const std::size_t tp = (std::size_t)y * tW + x;
+          for (int c = 0; c < 3; ++c) {
+            acc[(std::size_t)c * hw + op] +=
+                wgt * (float)rs[(std::size_t)c * thw + tp];
+          }
+          wsum[op] += wgt;
+        }
+      }
+      ++ntiles;
+      if (x_hi) { break; }
+    }
+    if (y_hi) { break; }
+  }
+
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)3 * hw * 2);
+  if (out.empty()) { return fail("tiled decode: output alloc failed"); }
+  auto* od = static_cast<_Float16*>(out.contents());
+  for (std::size_t p = 0; p < hw; ++p) {
+    const float inv = (wsum[p] > 0.0f) ? 1.0f / wsum[p] : 0.0f;
+    for (int c = 0; c < 3; ++c) {
+      od[(std::size_t)c * hw + p] =
+          (_Float16)(acc[(std::size_t)c * hw + p] * inv);
+    }
+  }
+  if (_mc->session() != nullptr) {
+    _mc->session()->log_normal(fmt(
+        "Krea-2 VAE decode: TILED {}x{} from {} windows of {} latent cells "
+        "(overlap {}) -- per-window attention, cross-faded seams",
+        W, H, ntiles, tile8, ov));
+  }
+  return out;
+}
+
 SharedBuffer
 MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
 {
@@ -1039,7 +1163,32 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     const MetalCompute::MemoryBudget mb = mc->memory_budget();
     decode_headroom = (mb.recommended != 0) ? mb.headroom : 0;
     const std::size_t need = decode_peak_bytes(h8, w8);
-    if (mb.recommended != 0 && !mb.fits(need)) {
+    const bool gpu_short = mb.recommended != 0 && !mb.fits(need);
+    const bool ram_short = !mb.fits_physical(need);
+    // Before failing, try to make it fit. The window is sized against
+    // whichever budget is tighter, so a shortfall on either becomes a
+    // smaller window rather than a rejection after the denoise has
+    // already been paid for.
+    const char* forced_env = std::getenv("VPIPE_VAE_TILE");
+    const int   forced     = (forced_env != nullptr) ? std::atoi(forced_env) : 0;
+    if (gpu_short || ram_short || forced > 0) {
+      std::size_t budget = (std::size_t)-1;
+      if (mb.available_physical != 0) {
+        budget = (std::size_t)((double)mb.available_physical * 0.90);
+      }
+      if (mb.recommended != 0) {
+        const auto gpu = (std::size_t)((double)mb.headroom * 0.95);
+        if (gpu < budget) { budget = gpu; }
+      }
+      const int tile8 = (forced > 0) ? forced : decode_tile_side_(budget);
+      // Strictly smaller than the image in at least one axis, or the
+      // window decode would recurse into this same branch forever.
+      if (tile8 > 0 && (tile8 < h8 || tile8 < w8) &&
+          std::getenv("VPIPE_VAE_NO_TILE") == nullptr) {
+        return decode_tiled_(z, h8, w8, tile8, err);
+      }
+    }
+    if (gpu_short) {
       return fail(fmt(
           "insufficient GPU memory for a {}x{} decode: need ~{} MB, {} MB "
           "free of {} MB working set (lower the resolution, tile, or free "
@@ -1048,7 +1197,7 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     }
     // True-physical-pressure backstop (reclaimable RAM incl. evictable mmap'd
     // weights) so a shortfall rejects cleanly instead of a mid-decode GPU OOM.
-    if (!mb.fits_physical(need)) {
+    if (ram_short) {
       return fail(fmt(
           "insufficient free RAM for a {}x{} decode: need ~{} MB, ~{} MB "
           "reclaimable (close other apps, lower the resolution, or free "

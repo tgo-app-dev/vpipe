@@ -2282,6 +2282,12 @@ MetalMiniMaxH3Transformer::bake_adaln(
   freed += lin_bytes(*fada);
   _final_adaln = Linear{};
 
+  // 13.2 GB of per-step projections just stopped existing, and that is
+  // not something the residency policy can see or predict. Anything it
+  // concluded about this box a moment ago was measured against a load
+  // this model no longer carries, so the ratchet starts over.
+  _resid.note_landscape_changed();
+
   if (_mc->session() != nullptr) {
     _mc->session()->log_normal(fmt(
         "MetalMiniMaxH3Transformer: baked AdaLN for {} steps ({} rows) -- "
@@ -2425,25 +2431,67 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
   return n;
 }
 
+// How much of the RESIDENT set is still in RAM.
+//
+// Every held block, but sampled inside each buffer: a pin either holds
+// or it does not, so every 64th page finds it, and at 16 KB pages that
+// is one byte of vector per megabyte examined. The pinned prefix counts
+// too -- it is the part whose eviction hurts most, since nothing will
+// ever re-admit it.
+void
+MetalMiniMaxH3Transformer::resident_pages_(std::size_t* examined,
+                                           std::size_t* incore) const
+{
+  *examined = 0;
+  *incore = 0;
+  for (const Block& b : _blocks) {
+    const metal_compute::SharedBuffer* all[] = {
+        &b.qkv.w, &b.qkv.codes, &b.out.w, &b.out.codes,
+        &b.fc1.w, &b.fc1.codes, &b.fc2.w, &b.fc2.codes,
+        &b.adaln.w, &b.adaln.codes};
+    for (const metal_compute::SharedBuffer* p : all) {
+      if (p->byte_size() == 0) { continue; }
+      const auto r = p->page_residency(64);
+      if (!r.valid) { continue; }
+      *examined += r.examined;
+      *incore += r.incore;
+    }
+  }
+}
+
+// Evict from the TAIL down, so what remains stays a contiguous prefix.
+// In a cyclic scan every block is worth the same, so there is nothing
+// cleverer to choose and a prefix keeps the bookkeeping trivial. The
+// pinned prefix is never touched. Rescanning per call is 50 empty tests
+// against a disk read, so the descending cursor this replaced bought
+// nothing and could not be shared.
+std::size_t
+MetalMiniMaxH3Transformer::evict_tail_block_(bool allow_pinned)
+{
+  const int floor = allow_pinned ? 0 : _pinned;
+  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+    Block& b = _blocks[(std::size_t)i];
+    const std::size_t n = block_bytes_(b);
+    if (n == 0) { continue; }
+    b = Block{};
+    // Taking one out of the PINNED prefix un-pins it: that prefix was
+    // sized at load against what the box was believed to hold, and a
+    // measurement saying its pages are no longer in RAM is that belief
+    // being wrong. The forward decides resident-or-streamed by whether
+    // the slot is EMPTY, not by this count, so it simply streams now.
+    if (i < _pinned) { _pinned = i; }
+    return n;
+  }
+  return 0;
+}
+
 std::size_t
 MetalMiniMaxH3Transformer::release_resident_blocks(std::size_t bytes)
 {
-  // Evict from the TAIL down, so what remains stays a contiguous prefix.
-  // In a cyclic scan every block is worth the same, so there is nothing
-  // cleverer to choose and a prefix keeps the bookkeeping trivial. The
-  // pinned prefix is never touched.
-  int next = (int)_blocks.size() - 1;
-  const std::size_t freed = _resid.release(bytes, [&]() -> std::size_t {
-    for (; next >= _pinned; --next) {
-      Block& b = _blocks[(std::size_t)next];
-      const std::size_t n = block_bytes_(b);
-      if (n == 0) { continue; }
-      b = Block{};
-      --next;
-      return n;
-    }
-    return 0;
-  });
+  const std::size_t freed =
+      _resid.release(bytes, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
   if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
         "MetalMiniMaxH3Transformer: released {} MB of resident blocks "
@@ -2569,7 +2617,59 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // forwards, so a set that was cut back does not simply refill next
   // step. Scratch is allocated by now, so what the budget reports here
   // already has it subtracted.
-  _resid.begin_forward();
+  // Also where the box gets to answer back: nothing else in the process
+  // can tell this that the OS has started swapping, and by the time it
+  // has, every admission since is costing more than it saves.
+  // ensure_scratch_() ran above, so the activations the stage told us to
+  // reserve for are ALREADY allocated and already out of the budget read
+  // on the next line. Declaring them keeps the gate from demanding room
+  // for them twice; what is left of the reserve is the part still to be
+  // found, which is the peers after the denoise (the VAE decode).
+  _resid.note_reserve_allocated(
+      scratch_bytes(c, seq, n_text, n_t, uses_matrix_cores()));
+  const auto mbudget = _mc->memory_budget();
+  _resid.begin_forward(mbudget, [this]() -> std::size_t {
+    return evict_tail_block_();
+  });
+  // Then the measurement that actually finds the limit: are the blocks
+  // we kept still in RAM? Anything less means a pin has failed and this
+  // box holds less than it was asked to, so one block goes back.
+  //
+  // Gated on the cheap signal -- our OWN compressed footprint moving --
+  // because the walk costs ~57 ms per 4.3 GB and a healthy run would pay
+  // it every step to be told nothing.
+  bool shortfall = false;
+  if ((_resid.count() > 0 || _pinned > 0) &&
+      _resid.self_compression_grew(mbudget.self_compressed)) {
+    std::size_t examined = 0, incore = 0;
+    resident_pages_(&examined, &incore);
+    if (examined > 0 && incore < examined) {
+      shortfall = true;
+      std::size_t freed = _resid.note_weight_residency(
+          examined, incore, [this]() -> std::size_t {
+            return evict_tail_block_();
+          });
+      // Nothing left outside the pinned prefix and the pages are still
+      // leaving RAM: the prefix itself is what does not fit, so give one
+      // of it back rather than sit in the thrash it was meant to prevent.
+      if (freed == 0 && _pinned > 0) {
+        freed = evict_tail_block_(/*allow_pinned=*/true);
+      }
+      if (_mc->session() != nullptr) {
+        _mc->session()->log_normal(fmt(
+            "MetalMiniMaxH3Transformer: resident weights are only {}% in "
+            "RAM -- released {} MB, now {} blocks resident",
+            (int)(100.0 * (double)incore / (double)examined), freed >> 20,
+            _resid.count() + _pinned));
+      }
+    }
+  }
+  // Nothing of ours had left RAM this step -- either the walk said so or
+  // there was no compression to make it worth walking. Enough of these
+  // in a row lifts the ratchet by a block, so a shed taken during a
+  // momentary squeeze (the AdaLN bake is the worst of them, and it ENDS
+  // by handing back 13 GB) is not the last word on the whole run.
+  if (!shortfall) { _resid.note_healthy_forward(); }
   Scratch& s = _s;
   // Measure the GEMM tile for THIS sequence length, before the stream
   // opens -- the tuner needs its own command buffers, and the answer has
@@ -3215,9 +3315,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               const auto mb = _mc->memory_budget();
               _mc->session()->log_debug(fmt(
                   "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
-                  "{} MB; {} MB reclaimable, reserve {} MB)", Lx,
+                  "{} MB; {} MB idle, {} MB compressed, reserve {} MB)", Lx,
                   _resid.count() + _pinned, c.n_layers, _resid.bytes() >> 20,
-                  mb.available_physical >> 20, _resid.reserve() >> 20));
+                  mb.free_physical >> 20, mb.compressed >> 20,
+                  _resid.reserve() >> 20));
             }
           }
         }

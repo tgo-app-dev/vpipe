@@ -876,24 +876,62 @@ MetalKrea2Transformer::block_bytes_(const Block& b)
          qw_bytes_(b.ff_gu);
 }
 
+// How much of the RESIDENT set is still in RAM. Sampled inside each
+// buffer: a pin either holds or it does not, so every 64th page finds
+// it. See BlockResidency property 5 -- free-memory arithmetic cannot
+// answer this, and this is the question that actually matters.
+void
+MetalKrea2Transformer::resident_pages_(std::size_t* examined,
+                                       std::size_t* incore) const
+{
+  *examined = 0;
+  *incore = 0;
+  for (const Block& b : _blocks) {
+    const metal_compute::SharedBuffer* all[] = {
+        &b.q.w, &b.q.codes, &b.k.w, &b.k.codes, &b.v.w, &b.v.codes,
+        &b.o.w, &b.o.codes, &b.ff_gate.w, &b.ff_gate.codes,
+        &b.ff_up.w, &b.ff_up.codes, &b.ff_down.w, &b.ff_down.codes,
+        &b.ff_gu.w, &b.ff_gu.codes};
+    for (const metal_compute::SharedBuffer* p : all) {
+      if (p->byte_size() == 0) { continue; }
+      const auto r = p->page_residency(64);
+      if (!r.valid) { continue; }
+      *examined += r.examined;
+      *incore += r.incore;
+    }
+  }
+}
+
+// From the TAIL down so what remains stays a contiguous prefix; in a
+// cyclic scan every block is worth the same. The pinned prefix is never
+// touched.
+std::size_t
+MetalKrea2Transformer::evict_tail_block_(bool allow_pinned)
+{
+  const int floor = allow_pinned ? 0 : _pinned;
+  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+    Block& b = _blocks[(std::size_t)i];
+    const std::size_t n = block_bytes_(b);
+    if (n == 0) { continue; }
+    b = Block{};
+    // Taking one out of the PINNED prefix un-pins it: that prefix was
+    // sized at load against what the box was believed to hold, and a
+    // measurement saying its pages are no longer in RAM is that belief
+    // being wrong. The forward decides resident-or-streamed by whether
+    // the slot is EMPTY, not by this count, so it simply streams now.
+    if (i < _pinned) { _pinned = i; }
+    return n;
+  }
+  return 0;
+}
+
 std::size_t
 MetalKrea2Transformer::release_resident_blocks(std::size_t bytes)
 {
-  // From the TAIL down so what remains stays a contiguous prefix; in a
-  // cyclic scan every block is worth the same. The pinned prefix is never
-  // touched.
-  int next = (int)_blocks.size() - 1;
-  const std::size_t freed = _resid.release(bytes, [&]() -> std::size_t {
-    for (; next >= _pinned; --next) {
-      Block& b = _blocks[(std::size_t)next];
-      const std::size_t n = block_bytes_(b);
-      if (n == 0) { continue; }
-      b = Block{};
-      --next;
-      return n;
-    }
-    return 0;
-  });
+  const std::size_t freed =
+      _resid.release(bytes, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
   if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
         "MetalKrea2Transformer: released {} MB of resident blocks ({} left)",
@@ -1603,8 +1641,46 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     const unsigned a_nqb = (unsigned)((seq + A_BQ - 1) / A_BQ);
     psplit(t_cond);
     // Re-arm residency growth for this forward; the ratchet from any
-    // earlier eviction deliberately survives.
-    _resid.begin_forward();
+    // earlier eviction deliberately survives. Also the one place the OS
+    // gets to answer back that it has started swapping.
+    const auto mbudget = _mc->memory_budget();
+    _resid.begin_forward(mbudget, [this]() -> std::size_t {
+      return evict_tail_block_();
+    });
+    // And the measurement behind the cheap gate: only when our own
+    // compressed footprint has moved is the page walk worth its ~57 ms
+    // per 4.3 GB.
+    bool shortfall = false;
+    if ((_resid.count() > 0 || _pinned > 0) &&
+        _resid.self_compression_grew(mbudget.self_compressed)) {
+      std::size_t examined = 0, incore = 0;
+      resident_pages_(&examined, &incore);
+      if (examined > 0 && incore < examined) {
+        shortfall = true;
+        std::size_t freed = _resid.note_weight_residency(
+            examined, incore, [this]() -> std::size_t {
+              return evict_tail_block_();
+            });
+        // Nothing left outside the pinned prefix and the pages are still
+        // leaving RAM: the prefix itself is what does not fit, so give one
+        // of it back rather than sit in the thrash it was meant to prevent.
+        if (freed == 0 && _pinned > 0) {
+          freed = evict_tail_block_(/*allow_pinned=*/true);
+        }
+        if (_mc->session() != nullptr) {
+          _mc->session()->log_normal(fmt(
+              "MetalKrea2Transformer: resident weights are only {}% in "
+              "RAM -- released {} MB, now {} blocks resident",
+              (int)(100.0 * (double)incore / (double)examined), freed >> 20,
+              _resid.count() + _pinned));
+        }
+      }
+    }
+    // Nothing of ours had left RAM this step -- either the walk said
+    // so or there was no compression to make it worth walking.
+    // Enough in a row lifts the ratchet by a block, so a shed taken
+    // during a momentary squeeze is not the last word on the run.
+    if (!shortfall) { _resid.note_healthy_forward(); }
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
     for (int L = 0; L < c.n_layers; ++L) {
       // Cooperative stop: bail EVERY block (not just the streamed tail) so a

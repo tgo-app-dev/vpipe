@@ -222,16 +222,23 @@ private:
   // is needed only while a prompt is being encoded -- the DiT then runs for
   // seconds to minutes with the encoder sitting idle. On a box that cannot hold
   // both, drop it once the conditioning beats are out and reload it when the
-  // next prompt arrives. `unload_when_idle`: auto (RAM heuristic) | always |
-  // never. Resolved once, at load, into _unload_idle.
+  // next prompt arrives. `unload_when_idle`: auto (RAM heuristic) |
+  // destroy | park | keep (legacy: always = destroy, never = keep).
+  // Resolved once, after the init barrier, into _idle_action.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
-  bool _unload_idle = false;
+  // What happens to the encoder between prompts. Never kAuto after
+  // resolve_unload_policy_() has run.
+  model_memory::UnloadPolicy _idle_action = model_memory::UnloadPolicy::kKeep;
   bool _unloaded    = false;   // dropped; reload before the next encode
   std::string _root_dir;       // resolved pipeline root (peer weight sizing)
 
-  // Resolve `_unload_idle` from the post-barrier footprint. Idempotent;
+  // Resolve `_idle_action` from the post-barrier footprint. Idempotent;
   // called at the top of every process().
   void resolve_unload_policy_();
+  // Whichever of destroy/park/keep was resolved, applied at an idle
+  // point. The single call site for "the prompt is done with me".
+  void release_encoder_when_idle_();
+  void park_encoder_();
   void unload_encoder_();
   bool reload_encoder_();
 

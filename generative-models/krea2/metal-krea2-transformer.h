@@ -107,6 +107,13 @@ class MetalKrea2Transformer {
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   std::size_t release_resident_blocks(std::size_t bytes);
+  // Free the highest resident block; its bytes, or 0 when there is
+  // nothing left. `allow_pinned` lets it take one out of the pinned
+  // prefix (shrinking `_pinned` to match), which is only right when a
+  // measurement says that prefix is no longer in RAM.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // Pages of the resident set examined, and how many are still in RAM.
+  void resident_pages_(std::size_t* examined, std::size_t* incore) const;
 
   // The per-forward activation scratch actually held right now. MEASURED,
   // not estimated: DitScratch is a persistent struct, so this sums what

@@ -15,6 +15,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/context-manager.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
 
@@ -61,8 +62,12 @@ const ConfigKey kAttrs[] = {
           "whole denoise, so on a memory-bounded box this is what lets a large "
           "DiT and a large encoder share one machine (a 4-bit Boogu-Image is a "
           "~5.6 GB DiT beside a ~4.7 GB Qwen3-VL mllm). \"auto\" (default) "
-          "decides from physical RAM vs the pipeline's weight bytes; \"always\" "
-          "/ \"never\" force it. Costs a reload per prompt",
+          "decides from physical RAM, whether a peer decided to stream, and "
+          "the pipeline's weight bytes. Force it with \"destroy\" (free the "
+          "bytes; costs a reload per prompt), \"park\" (hand them to the "
+          "kernel as purgeable -- reclaimed only if the box needs the RAM, "
+          "reused without a reload if not) or \"keep\" (hold them pinned). "
+          "Legacy: \"always\" = destroy, \"never\" = keep",
    .def_str = "auto"},
 };
 const PortSpec kIports[] = {
@@ -1096,25 +1101,94 @@ DiffusionConditionerStage::resolve_unload_policy_()
   if (_unload_resolved) { return; }
   _unload_resolved = true;
   switch (_unload_cfg) {
-    case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
-    case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
-    default:
-      _unload_idle = model_memory::bounded(session(), _peer_dirs,
-                                           model_memory::kHeadroom);
+    case model_memory::UnloadPolicy::kDestroy:
+    case model_memory::UnloadPolicy::kPark:
+    case model_memory::UnloadPolicy::kKeep:
+      _idle_action = _unload_cfg;
       break;
+    default: {
+      // Two independent reasons to let go, and they want DIFFERENT
+      // answers.
+      //
+      // A peer that decided to stream is the harder of the two. It is
+      // already paying per-step disk reads for want of RAM, and the
+      // only thing that gives it room deterministically is DESTROYING
+      // this encoder: parked bytes are still held bytes as far as
+      // weight_footprint() and the manager's accounting are concerned,
+      // and they only come back to the box if the kernel gets round to
+      // reclaiming them. A DiT that has to decide, this step, whether to
+      // keep a block cannot wait on that.
+      //
+      // Absent a streaming peer, the box is merely tight-ish, and PARK
+      // is the better trade: the second prompt reuses the encoder for
+      // free if the pages survived, and the kernel takes them if
+      // something genuinely needs the RAM. Keeping it pinned is the one
+      // answer that is never right here -- unreclaimable read-only
+      // weights just push the pressure onto the compressor, which pays
+      // to put them back.
+      const bool streaming = model_memory::peer_streams(session());
+      const bool tight     = model_memory::bounded(session(), _peer_dirs,
+                                                   model_memory::kHeadroom);
+      _idle_action = streaming ? model_memory::UnloadPolicy::kDestroy
+                   : tight     ? model_memory::UnloadPolicy::kDestroy
+                               : model_memory::UnloadPolicy::kPark;
+      break;
+    }
   }
   session()->log_debug(fmt(
       "DiffusionConditionerStage('{}'): encoder + DiT footprint {} MB + {} MB "
-      "headroom vs {} MB RAM, unload_when_idle={} -> {}", this->id(),
+      "headroom vs {} MB RAM, a peer streams={}, unload_when_idle={} -> {}",
+      this->id(),
       model_memory::weight_footprint(session(), _peer_dirs) >> 20,
       model_memory::kHeadroom >> 20, model_memory::phys_ram() >> 20,
+      model_memory::peer_streams(session()) ? "yes" : "no",
       model_memory::unload_policy_name(_unload_cfg),
-      _unload_idle ? "UNLOAD after each prompt" : "keep resident"));
-  if (_unload_idle) {
+      model_memory::unload_policy_name(_idle_action)));
+  if (_idle_action == model_memory::UnloadPolicy::kDestroy) {
     session()->info(fmt(
         "DiffusionConditionerStage('{}'): memory-bounded -- the encoder is "
         "dropped after each conditioning and reloaded on the next prompt",
         this->id()));
+  } else if (_idle_action == model_memory::UnloadPolicy::kPark) {
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): the encoder is parked after each "
+        "conditioning -- reclaimable if the box needs the RAM, and reused "
+        "without a reload if it does not", this->id()));
+  }
+}
+
+// Park rather than destroy: the weights go purgeable and the next
+// prompt reactivates them, re-reading from disk only if the kernel
+// actually took the pages.
+//
+// Parking walks the weight SET's cached tensors, so what this reports
+// is a property of the loader, not of the box: a model that reads its
+// weights uncached (every LM does -- see WeightSet::read) holds them in
+// its own members, which the registry cannot see, and parks 0. That is
+// logged rather than hidden, because a park that frees nothing looks
+// exactly like a park that worked until someone measures the box.
+void
+DiffusionConditionerStage::park_encoder_()
+{
+  if (_enc_dir.empty()) { return; }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const std::size_t got = mgr->park_weights(_enc_dir);
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): parked {} MB of the encoder{}",
+      this->id(), got >> 20,
+      got == 0 ? " -- nothing parkable; its loader reads uncached, so the "
+                 "bytes live in the model, not the weight set"
+               : ""));
+}
+
+void
+DiffusionConditionerStage::release_encoder_when_idle_()
+{
+  switch (_idle_action) {
+    case model_memory::UnloadPolicy::kDestroy: unload_encoder_(); break;
+    case model_memory::UnloadPolicy::kPark:    park_encoder_();   break;
+    default: break;                            // kKeep: hold it pinned
   }
 }
 
@@ -2322,7 +2396,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
           this->id(), cats.empty() ? "-" : cats.c_str(), verdict.reason));
       co_await ctx.write(0, blocked_beat_(_enc_hidden));
       ++_emitted;
-      if (_unload_idle) { unload_encoder_(); }
+      release_encoder_when_idle_();
       co_return;
     }
   }
@@ -2357,7 +2431,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // Drop the encoder BEFORE the conditioning is published: the DiT stage starts
   // its denoise as soon as the beat lands, so releasing here is what gives it
   // the working set. It reloads when the next prompt arrives.
-  if (_unload_idle) { unload_encoder_(); }
+  release_encoder_when_idle_();
   {
     auto beat = to_beat_(cond, shape_for(n_real), cdt);
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce

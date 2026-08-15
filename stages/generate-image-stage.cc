@@ -1006,6 +1006,38 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
   const int img_seq = gh * gw;
   const int IC = 64;                         // z_dim(16) * patch(2) * patch(2)
 
+  // How much room the streamed DiT must leave clear to keep a block
+  // resident. Krea-2 has carried the residency machinery -- measurement,
+  // eviction, ratchet -- since it was written, and never grew a single
+  // block, because nothing ever set this: a reserve left at its default
+  // means "this model was never taught what its activations cost", and
+  // growth stays off. Wired here so the policy is live rather than
+  // decorative.
+  //
+  // Same rule as FLUX.2, against Krea-2's own decode peak
+  // (free_krea2_dit_for_decode_): reserve the VAE decode only when it
+  // would actually run beside us. When it would not, that free drops the
+  // whole DiT first, which is strictly more than a reserve could hold
+  // clear -- so reserving it there protects a coexistence that never
+  // happens and costs every block of every step.
+  if (_vae_base > 0 && _dit) {
+    const std::size_t im2col =
+        (std::size_t)H * W * 9 * (std::size_t)_vae_base * 2;
+    const std::size_t peak = im2col + im2col / 2;
+    const auto mb = mc->memory_budget();
+    // No budget to read -> the free bails out too, so the DiT survives.
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Krea-2 residency reserve {} MB -- the "
+        "{}x{} vae-decode wants {} MB and {}",
+        this->id(), (decode_runs_beside_us ? peak : 0) >> 20, W, H,
+        peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+  }
+
   // The conditioner emits the 12-tap f16 conditioning [n_real, 12, EH]; the
   // DiT's text-fusion tower fuses it into the DiT-facing text [n_real, hidden].
   SharedBuffer fused = _dit->forward_text(cond, n_real);
@@ -1247,6 +1279,40 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   const int gh = H / 16, gw = W / 16;        // VAE latent grid (128ch @ H/16)
   const int img_seq = gh * gw;
   const int IC = _flux2_dit->config().in_channels;   // 128
+  // How much room the DiT must leave clear when it decides whether to keep
+  // a streamed block resident. Its own activations are allocated before
+  // the budget it grows against is read, so what is left to protect is the
+  // VAE DECODE that runs after the denoise -- but ONLY where the decode
+  // runs beside us.
+  //
+  // When it does not fit beside us, free_flux2_dit_for_decode_ drops the
+  // whole ~9 GB DiT before the latent is published. It re-asks with the
+  // grown set resident, and it frees strictly more than any reserve could
+  // have held clear, so the decode cannot be starved by growth. Reserving
+  // its peak on that path protects a coexistence that never happens, and
+  // pays for it by streaming every block of every step.
+  //
+  // So reserve it only where it is real -- where the decode WOULD fit
+  // beside us, and growth is the one thing that could tip us into a free
+  // we did not need (which costs a reload on the next prompt, not a
+  // failure). Same predicate as the free, measured rather than assumed;
+  // the post-denoise check stays the authority on a borderline box.
+  if (_vae_base > 0) {
+    const std::size_t peak =
+        (std::size_t)H * W * (std::size_t)_vae_base * 2 * 7;
+    const auto mb = mc->memory_budget();
+    // No budget to read -> the free bails out too, so the DiT survives.
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _flux2_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): FLUX.2 residency reserve {} MB -- the "
+        "{}x{} vae-decode wants {} MB and {}",
+        this->id(), (decode_runs_beside_us ? peak : 0) >> 20, W, H,
+        peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+  }
   // `context` is the diffusion-conditioner's flux2 conditioning: the {9,18,27}
   // encoder taps concatenated per token -> f16 [n_real, joint_dim=3*enc_hidden].
 

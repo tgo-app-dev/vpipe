@@ -160,6 +160,78 @@ public:
     // decode running alongside mmap'd DiT weights. 0 when the query is
     // unavailable; callers should skip the check then.
     std::size_t available_physical = 0;
+    // Genuinely IDLE physical memory: free + purgeable + speculative. The
+    // file cache is deliberately NOT here, and that is the whole point of
+    // the field existing next to `available_physical`.
+    //
+    // A durable decision -- keeping a weight block for the rest of a run --
+    // converts memory the OS can reclaim for free (clean file pages) into
+    // memory it can only reclaim through the compressor and swap (an
+    // anonymous buffer). Counting the file cache as room to grow into
+    // therefore spends the very thing the decision destroys, and on a
+    // streaming model the cache is mostly the checkpoint that model just
+    // read -- so the signal is self-generated and rises the more it
+    // streams. MEASURED on a 64 GB box: `available_physical` read ~18.5 GB
+    // (of which 18.54 GB was file cache) while the machine held 33 GB
+    // compressed and 28.7 GB of swap.
+    //
+    // VPIPE_RESIDENCY_CACHE_PCT adds back that percentage of the file
+    // cache, for a box whose cache is genuinely cold. Default 0.
+    std::size_t free_physical = 0;
+    // What the compressor holds, and what has reached the swap file. Both
+    // are evidence the box is ALREADY paying to page; neither appears in
+    // the two figures above.
+    std::size_t compressed = 0;
+    std::size_t swap_used  = 0;
+    // What the compressor holds OF THIS PROCESS (task_info TASK_VM_INFO).
+    // The system-wide `compressed` above cannot say whose memory it is;
+    // this can, and a non-zero figure that GROWS across a forward is the
+    // model's own weights being squeezed out -- direct evidence that a
+    // resident block is no longer paying for its RAM.
+    std::size_t self_compressed = 0;
+    // This process's physical footprint, for the same query.
+    std::size_t self_footprint = 0;
+    // hw.memsize, or VPIPE_RAM_LIMIT_MB when set -- the same believed-RAM
+    // figure model_memory::phys_ram() reports, so the planning phase and
+    // the live check cannot disagree about the size of the box.
+    std::size_t total_physical = 0;
+
+    // The box is in real distress -- not merely using the compressor,
+    // which every macOS machine does all the time. MEASURED on an idle
+    // 16 GB M5: 2.36 GB compressed and 0.97 GB of swap with nothing
+    // running, so a threshold anywhere near "any" reads as permanent
+    // distress and would refuse to grow on a perfectly healthy box.
+    //
+    // These are also SYSTEM-WIDE figures, which cannot say whose memory
+    // is being squeezed, so they are deliberately a coarse backstop and
+    // not the control. The control is the measurement -- see
+    // SharedBuffer::page_residency.
+    bool paging() const noexcept
+    {
+      if (total_physical == 0) { return false; }
+      return compressed > total_physical / 4
+             || swap_used > total_physical / 8;
+    }
+    // The gate for growth that will be held for the rest of a run.
+    //
+    // Cache-INCLUSIVE, deliberately: macOS keeps `free` small on purpose
+    // -- spare RAM becomes file cache -- so a rule that spent only idle
+    // pages would refuse to grow on a box whose cache is merely cold, and
+    // under-growing costs throughput on every box that was fine. What it
+    // adds over fits_physical is the one thing that arithmetic cannot
+    // say: the box is ALREADY paging, so more of this makes it worse.
+    //
+    // This is a sanity gate, not the control. Free-memory arithmetic
+    // cannot tell a cache that is about to be dropped from one that is
+    // being actively used, so it cannot be trusted to find the limit --
+    // finding it is the job of watching whether the blocks we kept are
+    // still in RAM. See SharedBuffer::page_residency and
+    // BlockResidency::note_weight_residency.
+    bool fits_growth(std::size_t need, double margin = 0.10) const noexcept
+    {
+      if (paging()) { return false; }
+      return fits_physical(need, margin);
+    }
     // True when `need` bytes fit in the current headroom (with an optional
     // safety margin, default 5%). A quick preflight before a big alloc. Does
     // NOT consult available_physical -- check that separately where relevant so

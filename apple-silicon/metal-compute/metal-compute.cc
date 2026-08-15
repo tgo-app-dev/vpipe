@@ -740,6 +740,67 @@ MetalCompute::memory_budget() const noexcept
                               + (std::size_t)vm.purgeable_count
                               + (std::size_t)vm.external_page_count;
       out.available_physical = pages * (std::size_t)page;
+      // The same query, without the file cache: what a DURABLE allocation
+      // can take without turning reclaimable pages into anonymous ones.
+      // Speculative pages are read-ahead the OS drops for free, so they
+      // count; external pages do not.
+      std::size_t idle = (std::size_t)vm.free_count
+                       + (std::size_t)vm.purgeable_count
+                       + (std::size_t)vm.speculative_count;
+      // macOS deliberately keeps `free` small -- spare RAM becomes file
+      // cache -- so a box with a large COLD cache (someone else's file
+      // activity, not this model's re-reads) reads as having no room and
+      // would under-grow. VPIPE_RESIDENCY_CACHE_PCT lets a machine count
+      // that fraction of the cache as growable. It defaults to 0 because
+      // the two cases are not distinguishable from here and the costs are
+      // not symmetric: under-growing streams a few more blocks, while
+      // over-growing is the swap storm this figure exists to prevent.
+      static const int cache_pct = [] {
+        const char* e = std::getenv("VPIPE_RESIDENCY_CACHE_PCT");
+        if (e == nullptr) { return 0; }
+        const int v = std::atoi(e);
+        return v < 0 ? 0 : (v > 100 ? 100 : v);
+      }();
+      if (cache_pct > 0) {
+        idle += (std::size_t)vm.external_page_count * (std::size_t)cache_pct
+                / 100;
+      }
+      out.free_physical = idle * (std::size_t)page;
+      out.compressed =
+          (std::size_t)vm.compressor_page_count * (std::size_t)page;
+    }
+  }
+  {
+    task_vm_info_data_t ti;
+    mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (::task_info(mach_task_self(), TASK_VM_INFO,
+                    reinterpret_cast<task_info_t>(&ti), &c) == KERN_SUCCESS) {
+      out.self_compressed = (std::size_t)ti.compressed;
+      out.self_footprint  = (std::size_t)ti.phys_footprint;
+    }
+  }
+  {
+    struct xsw_usage sw;
+    std::size_t n = sizeof(sw);
+    if (::sysctlbyname("vm.swapusage", &sw, &n, nullptr, 0) == 0) {
+      out.swap_used = (std::size_t)sw.xsu_used;
+    }
+  }
+  // Mirrors model_memory::phys_ram(): the planning phase sizes the box
+  // against VPIPE_RAM_LIMIT_MB when it is set, and a live check that
+  // disagreed would undo exactly the bounded-box configuration the
+  // variable exists to make reproducible.
+  {
+    if (const char* e = std::getenv("VPIPE_RAM_LIMIT_MB")) {
+      const long long mb = std::atoll(e);
+      if (mb > 0) { out.total_physical = (std::size_t)mb << 20; }
+    }
+    if (out.total_physical == 0) {
+      std::uint64_t mem = 0;
+      std::size_t n = sizeof(mem);
+      if (::sysctlbyname("hw.memsize", &mem, &n, nullptr, 0) == 0) {
+        out.total_physical = (std::size_t)mem;
+      }
     }
   }
   return out;

@@ -202,6 +202,47 @@ GenerativeModelManager::clear_declarations()
 {
   lock_guard<mutex> lk(_ws_mu);
   _declared.clear();
+  // Cleared with the declarations, and for the same reason: it is a fact
+  // about THIS run's sizing. A relaunch at a different resolution, or
+  // with a peer removed from the graph, may not stream at all, and a
+  // stale flag would keep every conditioner unloading for the rest of
+  // the process.
+  _streaming.clear();
+}
+
+void
+GenerativeModelManager::note_streaming(const string& dir)
+{
+  if (dir.empty()) { return; }
+  const string key = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_ws_mu);
+  _streaming.insert(key);
+}
+
+bool
+GenerativeModelManager::any_streaming() const
+{
+  lock_guard<mutex> lk(_ws_mu);
+  return !_streaming.empty();
+}
+
+size_t
+GenerativeModelManager::park_weights(const string& dir)
+{
+  if (dir.empty()) { return 0; }
+  const string key = canonicalize_(session(), dir);
+  shared_ptr<WeightSet> ws;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    auto it = _weight_sets.find(key);
+    if (it == _weight_sets.end()) { return 0; }
+    ws = it->second.lock();
+  }
+  if (!ws || ws->parked()) { return 0; }
+  const size_t got = _weights.park(ws.get());
+  if (got == 0) { return 0; }        // nothing parkable (mapped/uncached)
+  ws->set_parked(true);
+  return got;
 }
 
 bool

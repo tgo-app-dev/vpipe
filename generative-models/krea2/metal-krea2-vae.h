@@ -141,6 +141,34 @@ class MetalKrea2Vae {
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
 
+  // TILED decode. A whole-image decode's peak scales with the OUTPUT area,
+  // so a resolution that fits a 64 GB box can exceed a 16 GB one; decode()
+  // used to reject those outright (MEASURED on the M5 16 GB box: a 2048^2
+  // decode wants ~10368 MB against 9192 MB free and simply failed, after
+  // the denoise had already run). Instead, split the LATENT into
+  // overlapping windows, decode each through the normal path, and
+  // cross-fade the RGB results, which bounds the peak at one window
+  // regardless of output size.
+  //
+  // NOT numerically identical to a whole-image decode: the mid-block
+  // attention is GLOBAL, so per-window attention sees only its own window,
+  // and the convolutions see zero padding at window edges rather than real
+  // neighbours. The overlap cross-fade hides the conv seam; the attention
+  // difference is real, which is why tiling stays a FALLBACK entered only
+  // when the whole-image decode does not fit (or VPIPE_VAE_TILE forces
+  // it). VPIPE_VAE_NO_TILE restores the old hard failure.
+  //
+  // One latent cell is 8 output pixels here -- Krea-2 decodes [z_dim, h8,
+  // w8] directly, with no patch dimension to unshuffle first.
+  static constexpr int kTileMin8  = 16;     // smallest useful latent window
+  static constexpr int kTileOvNum = 1;      // overlap = 1/4 of the window
+  static constexpr int kTileOvDen = 4;
+  // Largest square latent window whose decode peak fits `budget` (0 if none).
+  int decode_tile_side_(std::size_t budget) const noexcept;
+  metal_compute::SharedBuffer decode_tiled_(
+      const metal_compute::SharedBuffer& z, int h8, int w8, int tile8,
+      std::string* err);
+
   Conv _post_quant;                 // 1x1 conv z_dim -> z_dim
   Conv _conv_in;                    // 3x3 conv z_dim -> dims[0]
   ResBlock _mid_res0, _mid_res1;

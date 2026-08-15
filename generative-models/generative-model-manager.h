@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vpipe {
@@ -240,6 +241,54 @@ public:
   // on-disk size, so it does not count the same checkpoint twice.
   bool accounts_for(const std::string& dir) const;
 
+  // ---- the streaming signal ------------------------------------------
+  //
+  // A model reporting that it decided to STREAM `dir` block by block
+  // rather than hold it. Recorded by model_memory::plan_streaming(), so
+  // every DiT family raises it from one place.
+  //
+  // Why a peer needs to know. A streaming DiT immediately calls
+  // revise_declaration() down to its pinned prefix, which is honest --
+  // that IS all it holds -- but it erases the evidence that the box was
+  // tight, and the revised number then reads as roominess to whoever
+  // sizes next. MEASURED on the M5 16 GB box: the FLUX.2 DiT concluded
+  // "footprint 11 GB + 6 GB vs 16 GB RAM -> STREAM blocks" and, seconds
+  // later, the conditioner sized against its revised 3321 MB, concluded
+  // there was room, and kept a 1.2 GB text encoder resident. The run
+  // then spent the whole denoise at 9.3 GB compressed with 3.8 GB of
+  // swap, and the DiT could not keep a single block.
+  //
+  // So this is the one fact the revision throws away, kept explicitly:
+  // somebody in this graph is already paying per-step disk reads for
+  // want of RAM. It is a MEASUREMENT of a decision that was taken, not a
+  // prediction -- which is what makes it safe to act on after the init
+  // barrier.
+  void note_streaming(const std::string& dir);
+
+  // Did any model in this run decide to stream? The question a stage
+  // asks before choosing to keep something resident.
+  bool any_streaming() const;
+
+  // ---- parking -------------------------------------------------------
+  //
+  // Hand one checkpoint's owned weights to the kernel as purgeable,
+  // outside the memory-cap policy. Returns the bytes parked, which is 0
+  // when the set holds nothing parkable.
+  //
+  // That zero is not an error and is the common case for a language
+  // model: parking walks a set's CACHED tensors, and an LM reads its
+  // weights uncached (WeightSet::read) into its own members, where the
+  // registry cannot see them. A caller that wants an LM parked has to
+  // make the MODEL a WeightOwner; until then this reports 0 and the
+  // weights simply stay resident.
+  //
+  // Distinct from enforce_memory_cap(), which parks least-recently-used
+  // sets to chase a global cap. This is a stage saying "I am done with
+  // this one for now" -- the reclaimable middle between keeping weights
+  // pinned and destroying them. The next access reactivates, re-reading
+  // from disk only if the kernel actually took the pages.
+  std::size_t park_weights(const std::string& dir);
+
   // ---- KV -----------------------------------------------------------
   //
   // KV / recurrent-state bytes across every language model this manager
@@ -370,6 +419,8 @@ private:
   std::unordered_map<std::string, std::weak_ptr<WeightSet>>   _weight_sets;
   // canonical dir -> estimated bytes; see declare_weights().
   std::unordered_map<std::string, std::size_t>                _declared;
+  // canonical dirs a model decided to stream; see note_streaming().
+  std::unordered_set<std::string>                             _streaming;
   WeightRegistry                                              _weights;
   std::atomic<std::size_t>                                    _memory_cap{0};
   mutable std::mutex                                          _mu;
