@@ -502,6 +502,74 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
 
 // ---- weight loading --------------------------------------------------
 
+// Copied or Mapped for the bytes this model KEEPS, decided by the
+// residency verdict rather than per call.
+//
+//   PRELOADING -> Mapped. Everything is resident either way, so owning
+//     the bytes buys nothing and costs their KIND: clean file pages the
+//     kernel drops for free become anonymous memory it can only
+//     compress. load_mapped() wrapping the whole shard is the usual
+//     objection to mapping and does not apply here -- the whole
+//     checkpoint being resident is what preloading MEANS.
+//   STREAMING  -> Copied, for the pinned prefix as well as the tail. A
+//     prefix the kernel can evict is not a prefix, and a forward is a
+//     cyclic scan: the one access pattern an LRU page cache handles
+//     worst, dropping each block exactly before it comes round again.
+//
+// MEASURED on the sibling LTX-2.5 DiT at 960x544x121, preloaded on a
+// 64 GB box: 409.7 s of denoise mapped against 473.5 s owning the same
+// bytes, the copied arm at 36 GB compressed with its own weights 2-3%
+// resident.
+//
+// A shard the file cannot map falls back to a copy regardless, so this
+// is never worse than Copied -- but the log, not this rule, is what says
+// whether a preload actually mapped.
+static WeightSet::Residency
+kept_residency_(bool stream_blocks)
+{
+  return stream_blocks ? WeightSet::Residency::Copied
+                       : WeightSet::Residency::Mapped;
+}
+
+// The budget bake_adaln checks its tables against. One definition, so
+// the prediction below and the refusal there cannot drift apart.
+static std::size_t
+adaln_table_budget_()
+{
+  const char* e = std::getenv("VPIPE_H3_ADALN_BAKE_MAX_MB");
+  const long v = (e != nullptr) ? std::atol(e) : 0;
+  return (std::size_t)(v > 0 ? v : 1536) << 20;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::adaln_retired_bytes(const std::string& dit_dir)
+{
+  auto wts = MetalLlamaWeights::open_model(dit_dir);
+  if (!wts.has_value()) { return 0; }
+  std::size_t n = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.find("adaln_proj") == std::string::npos) { continue; }
+    const auto* ti = wts->info(nm);
+    if (ti != nullptr) { n += (std::size_t)ti->nbytes; }
+  }
+  return n;
+}
+
+bool
+MetalMiniMaxH3Transformer::adaln_bake_certain(const Config& cfg, int max_rows)
+{
+  if (max_rows <= 0) { return false; }
+  if (std::getenv("VPIPE_H3_NO_ADALN_BAKE") != nullptr) { return false; }
+  // The same arithmetic bake_adaln refuses on, with the caller's WORST
+  // case for the row count. Certain only when even that fits.
+  const std::size_t T = (std::size_t)max_rows;
+  const std::size_t D = (std::size_t)cfg.adaln_out();
+  const std::size_t FD = (std::size_t)(2 * cfg.hidden);
+  const std::size_t want =
+      T * D * 2 * (std::size_t)cfg.n_layers + T * FD * 2;
+  return want <= adaln_table_budget_();
+}
+
 SharedBuffer
 MetalMiniMaxH3Transformer::weight_(WeightSet& ws, const std::string& nm,
                                    Retain r)
@@ -509,13 +577,12 @@ MetalMiniMaxH3Transformer::weight_(WeightSet& ws, const std::string& nm,
   const auto* info = ws.src().info(nm);
   if (info == nullptr) { return {}; }
   if (info->dtype == "BF16") {
-    // Already the forward's dtype, so the model keeps it AS IS -- a
-    // plain cached tensor(). Copied rather than Mapped: load_mapped()
-    // wraps the whole shard, and at 66 GB over 13 shards mapping one
-    // tensor would make the entire checkpoint resident.
+    // Already the forward's dtype, so the model keeps it AS IS; whose
+    // memory it is follows kept_residency_ above.
+    const auto res = kept_residency_(_stream_blocks);
     return r == Retain::Streamed
-               ? ws.stream_tensor(nm, _mc, WeightSet::Residency::Copied)
-               : ws.tensor(nm, _mc, WeightSet::Residency::Copied);
+               ? ws.stream_tensor(nm, _mc, res)
+               : ws.tensor(nm, _mc, res);
   }
   // F32 in the checkpoint: a genuine transform the model then keeps, and
   // the source bytes are dropped -- which is exactly a derived entry.
@@ -543,11 +610,15 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     const long K = scols * (long)_quant_group;
     const int bits = K > 0 ? (int)(gcols * 32 / K) : 0;
     l.bits = (bits == 8) ? 8 : 4;
+    // The packed codes are the dominant bytes of a quantized pack, so
+    // they take the same residency rule as everything else the model
+    // KEEPS -- see kept_residency_(). Read separately from weight_()
+    // only because they are raw u32 rather than the compute dtype.
     l.codes  = r == Retain::Streamed
                    ? ws.stream_tensor(nm + ".weight", _mc,
-                                      WeightSet::Residency::Copied)
+                                      kept_residency_(_stream_blocks))
                    : ws.tensor(nm + ".weight", _mc,
-                               WeightSet::Residency::Copied);
+                               kept_residency_(_stream_blocks));
     l.scales = weight_(ws, nm + ".scales", r);
     l.qbias  = weight_(ws, nm + ".biases", r);
     if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
@@ -2192,11 +2263,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
   // silently taking a bad trade. The default budget is generous next to
   // what it replaces (12.9 GB of weights at the released config) and
   // still bounds a long schedule: 32 steps is ~930 MB.
-  static const std::size_t kBudget = []() {
-    const char* e = std::getenv("VPIPE_H3_ADALN_BAKE_MAX_MB");
-    const long v = (e != nullptr) ? std::atol(e) : 0;
-    return (std::size_t)(v > 0 ? v : 1536) << 20;
-  }();
+  const std::size_t kBudget = adaln_table_budget_();
   const std::size_t want =
       (std::size_t)T * (std::size_t)D * 2 * (std::size_t)c.n_layers +
       (std::size_t)T * (std::size_t)FD * 2;
@@ -2213,6 +2280,20 @@ MetalMiniMaxH3Transformer::bake_adaln(
   if (temb.empty()) { return fail("temb allocation failed"); }
   if (!time_embed_(all, temb)) { return fail("time embedding failed"); }
 
+  // CAVEAT ON THIS NUMBER, which is a byte count and not a measurement.
+  //
+  // Releasing a weight that was MAPPED drops a view into the shard and
+  // frees no physical memory -- the mapping is whole-shard and stays --
+  // so in the preloading arm (see kept_residency_) this over-reports.
+  // It is left as a byte count anyway because there is no cheap
+  // predicate for "was this backed by a file": SharedBuffer::is_owned()
+  // answers a DIFFERENT question (did this handle allocate the bytes, or
+  // is it an alias of a cached tensor), and filtering on it reports 0 MB
+  // in every arm -- including the streamed one, where the bytes really
+  // are released. Measured that mistake before believing it.
+  //
+  // The bake's other win -- not running 51 projections per step -- is
+  // real in both arms and is not what this number is about.
   auto lin_bytes = [](const Linear& l) {
     return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
            l.scales.byte_size() + l.qbias.byte_size();
@@ -2292,7 +2373,7 @@ MetalMiniMaxH3Transformer::bake_adaln(
   if (_mc->session() != nullptr) {
     _mc->session()->log_normal(fmt(
         "MetalMiniMaxH3Transformer: baked AdaLN for {} steps ({} rows) -- "
-        "{} projections ({} MB) replaced by {} MB of tables{}",
+        "{} projections ({} MB of weights) replaced by {} MB of tables{}",
         schedule.size(), T, c.n_layers + 1, freed >> 20,
         adaln_table_bytes() >> 20,
         _stream_blocks ? ", and no longer streamed per step" : ""));

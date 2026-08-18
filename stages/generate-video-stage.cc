@@ -353,6 +353,100 @@ GenerateVideoStage::align_size_(int gh, int gw)
   _width  = w;
 }
 
+void
+GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  // Pre-launch twin of the runtime latch in process(): the same
+  // beat and the same parse, early enough that declare_resources()
+  // sees the model. Bookkeeping only -- nothing loads here; the
+  // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport != kModelPort) { return; }
+  apply_model_select_beat(beat, _hf_dir);
+}
+
+// Geometry as the family will actually produce it, for the plan-time
+// arena estimate. False when the family's rounding rule could not be
+// determined -- the caller must NOT then treat the geometry as a bound.
+//
+// Every video model constrains its latent shape, so the clip that comes
+// back is rounded UP from what config asked for, and the accounting has
+// to use the rounded numbers or it describes a clip nobody will make.
+// MEASURED on MiniMax-H3: config 9 frames, produced 22, so the
+// unrounded estimate was 2.4x short -- and an arena that under-declares
+// reads as room that is not there.
+//
+// The same rules resolve_config_ applies, from the same sources. Each
+// arm is a cheap query by construction: a registered family answers
+// without loading, and both built-ins read one JSON (or, for a
+// Comfy-Org repack, the safetensors __metadata__ that stands in for it).
+//
+// RETURNING FALSE MATTERS AS MUCH AS THE ROUNDING. A source none of
+// these arms recognises -- a GGUF DiT, say, which has no config.json and
+// no metadata envelope -- would otherwise fall through with the
+// unrounded numbers, which is not a conservative bound but an
+// optimistic one, and it is exactly the bug this function exists to fix
+// returning silently.
+bool
+GenerateVideoStage::planned_geometry_(const std::string& root, int* out_w,
+                                      int* out_h, int* out_frames) const
+{
+  int w = _width, h = _height, frames = _frames;
+  bool known = false;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto round_up = [](int v, int g) {
+    return g > 0 ? ((v + g - 1) / g) * g : v;
+  };
+  if (genai::VideoModelFamily* f =
+          genai::VideoModelRegistry::get().claim_for(
+              session(), root, resolve_model(session(), _hf_dir).model_type)) {
+    const int af = f->align_frames(root, frames);
+    if (af > 0) { frames = af; }
+    int gh = 0, gw = 0;
+    f->size_grid(root, &gh, &gw);
+    h = round_up(h, gh);
+    w = round_up(w, gw);
+    known = true;
+  } else {
+    // PROBE, do not ask the record. The models DB commonly says nothing
+    // -- the shipped H3 graph logs "model_type '-', so probed the
+    // checkpoint" -- so a family test keyed on model_type never fires
+    // and the rounding silently does not happen. config_from_json is
+    // the same probe resolve_config_ uses and refuses a checkpoint that
+    // is not its own, so a success is the detection and the patch sizes
+    // at once. It reads a diffusers config.json OR a Comfy-Org repack's
+    // __metadata__, which is why no separate repack arm is needed.
+    namespace fs = std::filesystem;
+    std::string err;
+    genai::MetalMiniMaxH3Transformer::Config h3;
+    genai::MetalWanTransformer::Config wan;
+    const std::string part =
+        genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+            resolve_model(session(), _hf_dir).model_type);
+    if (genai::MetalMiniMaxH3Transformer::config_from_json(root, h3, &err,
+                                                           part)) {
+      // 17-frame chunks keeping 5 latents each, so only 17n+5 has a
+      // latent form -- 9 becomes 22, which is the whole of the 2.4x.
+      frames = genai::minimax_h3::align_num_frames(frames, 17, 5);
+      h = round_up(h, 16 * h3.patch_h);      // 16x VAE times the patch
+      w = round_up(w, 16 * h3.patch_w);
+      known = true;
+    } else if (genai::MetalWanTransformer::config_from_json(
+                   (fs::path(root) / "transformer").string(), wan, &err)) {
+      frames = genai::MetalWanVae::align_num_frames(frames);
+      h = round_up(h, 8 * wan.patch_h);      // wan's VAE is 8x spatial
+      w = round_up(w, 8 * wan.patch_w);
+      known = true;
+    }
+  }
+#else
+  (void)root;
+#endif
+  if (out_w != nullptr)      { *out_w = w; }
+  if (out_h != nullptr)      { *out_h = h; }
+  if (out_frames != nullptr) { *out_frames = frames; }
+  return known;
+}
+
 std::vector<ResourceClaim>
 GenerateVideoStage::declare_resources() const
 {
@@ -365,10 +459,44 @@ GenerateVideoStage::declare_resources() const
   // declares nothing is invisible to every peer sizing itself against
   // it. Asked of the registry rather than of `_plugin_family`, because
   // this is const and runs before resolve_config_ has latched anything.
+  // The decode ARENA this stage's output implies, declared here because
+  // nothing downstream can: vae-decode sizes from whatever latent
+  // arrives, so at planning time it cannot name a number. For a clip the
+  // dominant transient is the OUTPUT, and it grows linearly with length
+  // -- 9 bytes per output pixel across the decode's bf16 frames and the
+  // planar-U8 clip buffered behind them.
+  //
+  // A BOUND. The true figure needs the pixel-frame count the VAE
+  // expands the latent into, which is a property of the loaded model, so
+  // vae-decode revises this on every beat. Declaring the config geometry
+  // first is what gives peers something to size against before the first
+  // clip exists -- and what gives the revise something to correct.
+  // A bound only when the geometry is known to be the produced one.
+  // Otherwise the MARKER: an unrounded estimate is not a conservative
+  // bound, it is an optimistic one, and a presence marker that the
+  // first beat replaces is the honest answer to "how big will this be".
+  int aw = _width, ah = _height, af = _frames;
+  std::size_t arena_bytes = model_memory::kUnknownArena;
+  if (planned_geometry_(root, &aw, &ah, &af)) {
+    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af);
+  } else {
+    session()->log_debug(fmt(
+        "GenerateVideoStage('{}'): no rounding rule for '{}', so the decode "
+        "arena is declared as present-but-unsized and corrected on the "
+        "first clip", this->id(), root));
+  }
+  // No geometry to size from: a presence marker, so the per-beat figure
+  // has an entry to revise. See model_memory::kUnknownArena.
+  if (arena_bytes == 0) { arena_bytes = model_memory::kUnknownArena; }
+  std::vector<ResourceClaim> arena = model_memory::scratch_claims(
+      "vae-decode", arena_bytes, model_memory::kPhaseDecode);
+
   if (genai::VideoModelFamily* f =
           genai::VideoModelRegistry::get().claim_for(
               session(), root, resolve_model(session(), _hf_dir).model_type)) {
-    return f->declare_resources(root);
+    std::vector<ResourceClaim> out = f->declare_resources(root);
+    for (auto& c : arena) { out.push_back(std::move(c)); }
+    return out;
   }
   // ONE expert, not both. The stage holds exactly one at a time, so
   // claiming the pair would size every peer against a peak that never
@@ -390,7 +518,9 @@ GenerateVideoStage::declare_resources() const
   std::string dit =
       genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
   if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
-  return model_memory::weight_claims({dit});
+  std::vector<ResourceClaim> out = model_memory::weight_claims({dit});
+  for (auto& c : arena) { out.push_back(std::move(c)); }
+  return out;
 #else
   return {};
 #endif
@@ -438,6 +568,11 @@ GenerateVideoStage::resolve_config_()
   if (_plugin_family != nullptr) {
     _family = std::string(_plugin_family->tag());
     align_frames_(_plugin_family->align_frames(_root, _frames));
+    {
+      int gh = 0, gw = 0;
+      _plugin_family->size_grid(_root, &gh, &gw);
+      align_size_(gh, gw);
+    }
     _two_experts = false;
     _have_cfg    = true;
     // The family is only now known, so this is the first moment a config
@@ -726,14 +861,45 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   // UNREAD, on purpose: see the note in apply_model_config_.
   req.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
 
+  // THE SAME BAR THE BUILT-IN FAMILIES GET. This branch used to wire
+  // `progress` as a bare stop check and open no bar at all, so a plugin
+  // family reported NOTHING for the whole generation -- and a 22B DiT
+  // streaming its weights on a bounded box is minutes per step, which is
+  // indistinguishable from a hang. It is also the one thing that makes a
+  // slow run diagnosable, so the absence cost more than the report.
+  //
+  // Block-granular where the family offers it, exactly as MiniMax-H3 is
+  // driven below: a step-granular bar on a stack this size sits still for
+  // the entire time anything is happening.
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, _steps, /*forwards_per_step=*/1);
+  auto block_fn = prog.block_fn();
+  // No end_forward() here: the host cannot see where a plugin's forward
+  // returns (the callback fires on block ENTRY, so `done` never reaches
+  // `total`). end_step re-syncs the bar to the exact boundary anyway, so
+  // the cost is the bar trailing by one block within a step.
+  req.block_progress = [&block_fn, &ctx](int done, int total) {
+    block_fn(done, total);
+    return !ctx.stop_requested();
+  };
   // A 22B DiT spends minutes per generation, so a Stop that only lands
   // between generations is a Stop that appears to hang. The family calls
   // this between steps; one that never does simply cannot be
   // interrupted, and that is its own choice to answer for.
-  req.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+  req.progress = [&prog, &ctx](int step, int total) {
+    // `total` is the count the family's SCHEDULER settled on, not the
+    // configured `steps`; adopting it is what makes the bar finish at
+    // 100%. `step` is 1-based on entry, end_step takes the 0-based index
+    // it just finished.
+    prog.set_steps(total);
+    prog.end_step(step - 1);
+    return !ctx.stop_requested();
+  };
 
   try {
-    return _plugin_gen->generate(req, out);
+    const bool ok = _plugin_gen->generate(req, out);
+    bar.finish();
+    return ok;
   } catch (const std::exception& e) {
     session()->error(fmt(
         "GenerateVideoStage('{}'): family '{}' threw during generation: {}",
@@ -774,6 +940,17 @@ GenerateVideoStage::ensure_expert_(int which)
     // by iport0's conditioning -- so a config source that emitted once at
     // launch has already landed. Null when nothing was wired.
     args.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    // The clip this graph intends to make, through the family's own
+    // rounding, so a load-time decision that scales with the beat has the
+    // right order of magnitude instead of a constant. Left at 0 when the
+    // family states no rule -- which a family must read as "unknown",
+    // not as "empty".
+    {
+      int gw = _width, gh = _height, gf = _frames;
+      if (planned_geometry_(_root, &gw, &gh, &gf)) {
+        args.width = gw; args.height = gh; args.frames = gf;
+      }
+    }
     try {
       _plugin_gen = _plugin_family->load(args);
     } catch (const std::exception& e) {
@@ -820,8 +997,32 @@ GenerateVideoStage::ensure_expert_(int which)
     std::string enc_dir =
         genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
     if (enc_dir == _root || !fs::exists(enc_dir)) { enc_dir.clear(); }
+    // What the AdaLN bake will retire, before anything loads.
+    //
+    // The bake runs moments after this and drops every adaln_proj -- 39%
+    // of a bf16 checkpoint. Those weights are read once and never
+    // coexist with anything, so counting them here decides an
+    // IRREVERSIBLE question against a model that is about to shed them.
+    //
+    // Subtracted only when the bake is CERTAIN: it refuses a schedule
+    // whose tables would blow its budget, and a refusal leaves the
+    // projections resident on a model that has already declined to
+    // stream -- the one direction that thrashes. `kTimestepsUpperBound`
+    // is the same worst case the scratch sizing below uses, so the row
+    // count fed to the check is an upper bound rather than a guess.
+    std::size_t dit_retires = 0;
+    {
+      constexpr int kRowsPerStep = 4;      // == kTimestepsUpperBound below
+      const int max_rows = _steps > 0 ? _steps * kRowsPerStep : 0;
+      if (genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
+                                                              max_rows)) {
+        dit_retires =
+            genai::MetalMiniMaxH3Transformer::adaln_retired_bytes(dit_dir);
+      }
+    }
     const auto plan = model_memory::plan_streaming(
-        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom,
+        dit_retires);
     bool   stream_blocks = plan.stream;
     double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
@@ -831,10 +1032,13 @@ GenerateVideoStage::ensure_expert_(int which)
     if (const char* e = std::getenv("VPIPE_H3_PIN_FRAC")) {
       pin_frac = std::atof(e);
     }
-    session()->log_debug(fmt(
-        "GenerateVideoStage('{}'): MiniMax-H3 footprint {} GB (others {} GB) "
-        "+ {} GB headroom -> {}", this->id(), plan.footprint >> 30,
-        plan.others >> 30, model_memory::kStreamHeadroom >> 30,
+    // At info, not debug: this is the irreversible decision, and when a
+    // run turns out slow it is the first number anyone needs.
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): MiniMax-H3 footprint {} GB (others {} GB, "
+        "less {} GB the AdaLN bake retires) + {} GB headroom -> {}",
+        this->id(), plan.footprint >> 30, plan.others >> 30,
+        plan.retires >> 30, model_memory::kStreamHeadroom >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     _h3_cfg.i8_gemm = _i8_gemm;
     // The runtime LoRA, when the model_config beat named one. It is a
@@ -863,6 +1067,13 @@ GenerateVideoStage::ensure_expert_(int which)
       }
     }
     lora.scale = (float)_h3_lora_scale;
+    // NOTE for the pinned prefix: stream_pin_count now measures the
+    // trunk but still assumes 1 GB of activation scratch, and this model
+    // holds ~4 GB at its own sizes. It is not passed here because the
+    // figure needs `seq`, which comes out of the packing and does not
+    // exist until a beat -- and H3 already covers that where it can be
+    // known: preflight_h3_scratch_ computes the real number at the first
+    // beat and parks, or refuses, if the prefix turned out too generous.
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
         stream_blocks, pin_frac, lora.path.empty() ? nullptr : &lora);

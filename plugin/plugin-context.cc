@@ -12,6 +12,7 @@
 // The whole generative-models subsystem -- the video family registry with
 // it -- builds under VPIPE_BUILD_APPLE_SILICON, so this include and the
 // registry call below carry the same gate metal libraries do.
+#include "generative-models/quantize-family-registry.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/video-model-registry.h"
 #endif
@@ -139,6 +140,44 @@ VpipePluginContext::register_vae_family(
   if (_session != nullptr) {
     _session->warn(fmt(
         "plugin '{}': VAE families are unsupported in this build",
+        _plugin));
+  }
+  return false;
+#endif
+}
+
+bool
+VpipePluginContext::register_quantize_family(
+    std::unique_ptr<genai::QuantizableFamily> family)
+{
+  if (!family) { return false; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Read the tag BEFORE the move: after it, `family` is null.
+  const std::string tag(family->tag());
+  const bool ok =
+      genai::QuantizeFamilyRegistry::get().add(std::move(family));
+  if (_session != nullptr) {
+    if (ok) {
+      _session->log_normal(fmt(
+          "plugin '{}': registered quantizable family '{}'", _plugin, tag));
+    } else {
+      _session->warn(fmt(
+          "plugin '{}': quantizable family '{}' was NOT registered -- that "
+          "tag is already taken, collides with a built-in family name, (or "
+          "the family could not name itself). The family already present "
+          "keeps the tag", _plugin, tag));
+    }
+  }
+  return ok;
+#else
+  // Destroying `family` needs the type complete, which it is not on a
+  // non-apple build. Leak rather than pretend: there is no
+  // model-quantize to register with here, so a plugin reaching this is
+  // already misbuilt.
+  (void)family.release();
+  if (_session != nullptr) {
+    _session->warn(fmt(
+        "plugin '{}': quantizable families are unsupported in this build",
         _plugin));
   }
   return false;

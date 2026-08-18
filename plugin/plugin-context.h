@@ -19,6 +19,7 @@ class SessionContextIntf;
 
 namespace genai { class VideoModelFamily; }
 namespace genai { class VaeModelFamily; }
+namespace genai { class QuantizableFamily; }
 
 // The C++ registration facade handed to a plugin's vpipe_plugin_register.
 // Thin by design: it forwards to the process-wide registries (StageRegistry
@@ -107,6 +108,27 @@ public:
   // dispatch is pointer-guarded so it would still run the right code,
   // but every log line would read as a built-in.
   bool register_vae_family(std::unique_ptr<genai::VaeModelFamily> family);
+
+  // ---- quantizable families --------------------------------------------
+  // Contribute a QUANTIZE recipe, so `model-quantize` can package this
+  // plugin's checkpoint the way it packages a built-in one: copy every
+  // component, quantize the one `target` names, register the result as a
+  // whole model. Without it an out-of-tree repo falls through to the
+  // single-component path, which quantizes one FILE at a time and writes
+  // beside it -- workable, but it cannot produce one directory holding a
+  // quantized DiT, a quantized encoder and untouched VAEs.
+  //
+  // What a family supplies is DATA -- where each component lives and
+  // which of its tensors are matrices. The assembly, the quantization
+  // and the registration stay with the stage, so a family cannot get
+  // wrong the parts that are not its business. See
+  // generative-models/quantize-family-registry.h.
+  //
+  // Takes ownership; the registry outlives every stage. First-wins on
+  // `tag()`, and a tag colliding with a built-in family name is refused
+  // for the same reason it is on the two registries above.
+  bool
+  register_quantize_family(std::unique_ptr<genai::QuantizableFamily> family);
 
   // ---- model catalogue -------------------------------------------------
   // Contribute downloadable-model entries, so a family this plugin adds

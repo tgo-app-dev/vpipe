@@ -119,9 +119,27 @@ struct VideoGenRequest {
   const FlexData* scheduler_spec = nullptr;
 
   // Returns false to ABORT the generation (the pipeline is stopping).
-  // Called between steps; a family that never calls it cannot be
-  // interrupted, which on a 22B model means a Stop that takes minutes.
+  //
+  // Call it at the END of each step with a ONE-BASED index, which is what
+  // the stage's progress bar re-syncs on -- `step` is the step that just
+  // finished, and `total` is the count the family's own scheduler settled
+  // on, which need not be the configured `steps`. A family that never
+  // calls this cannot be interrupted and reports nothing, which on a 22B
+  // model is a Stop that takes minutes and a bar that never moves.
   std::function<bool(int step, int total)> progress;
+
+  // The same, per BLOCK of the transformer stack. Optional, and the
+  // reason it exists is resolution: a step here is one forward of a 22B
+  // stack that may be streaming its weights, so a step-granular bar sits
+  // still for the entire time anything is happening. A stack of 48
+  // blocks gives ~50x the resolution for a callback that costs a
+  // compare. The built-in DiTs report at this granularity through
+  // set_block_progress; this is the same thing reachable from a plugin.
+  //
+  // `done` is blocks entered so far and `total` the stack depth. False
+  // ABORTS, so a family that calls this also gets cancellation inside a
+  // step rather than only between steps.
+  std::function<bool(int done, int total)> block_progress;
 };
 
 // What a generation produced. A family that generates no audio simply
@@ -199,6 +217,20 @@ struct VideoModelCreateArgs {
   // Borrowed, and only for the duration of the call: the stage owns the
   // FlexData. A family that wants it later must copy it.
   const FlexData*              model_config = nullptr;
+
+  // The clip the graph INTENDS to generate, already through the family's
+  // own align_frames / size_grid. 0 when the stage could not settle it.
+  //
+  // For families that must size something at LOAD against a term that
+  // scales with the BEAT -- a pinned block prefix against the activation
+  // scratch, above all. Sizing that against a constant is wrong at every
+  // geometry but one, and on a bounded box it is the difference between
+  // a prefix that fits and one that evicts itself.
+  //
+  // It is the PLAN, not a promise: the first request may differ, and a
+  // family that cares must re-check. What it buys is a load-time
+  // decision made against the right order of magnitude instead of none.
+  int width = 0, height = 0, frames = 0;
 };
 
 // A video model FAMILY: process-wide, stateless, one per architecture.
@@ -233,6 +265,22 @@ public:
   virtual int align_frames(const std::string& /*root*/, int frames) const
   {
     return frames;
+  }
+
+  // The frame SIZE grid this family can tile, as (height, width)
+  // multiples -- the VAE's spatial stride times the DiT's patch. The
+  // stage rounds the requested size UP to it, so a caller asks for the
+  // picture it wants rather than for one it had to derive from the
+  // checkpoint's compression ratios.
+  //
+  // Same contract, and the same reasoning, as align_frames above: asked
+  // of the FAMILY so it can be answered before 22B of weights load, and
+  // reported rather than rejected so a graph can change families without
+  // being re-authored. (0, 0) -- the default -- means any size is legal.
+  virtual void size_grid(const std::string& /*root*/, int* gh, int* gw) const
+  {
+    if (gh != nullptr) { *gh = 0; }
+    if (gw != nullptr) { *gw = 0; }
   }
 
   // What loading this checkpoint will take, for the planning phase that

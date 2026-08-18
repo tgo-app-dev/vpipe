@@ -173,6 +173,11 @@ public:
   // with -- the same dirs its own sizing uses, so the declaration and
   // the estimate cannot disagree.
   std::vector<ResourceClaim> declare_resources() const override;
+
+  // Latch a `model-select` constant before the planning phase, so
+  // the claim above is made against the model this graph will
+  // actually run rather than against an empty hf_dir.
+  void apply_constant(unsigned iport, const FlexData& beat) override;
   void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 

@@ -527,14 +527,21 @@ TEST(generate_video, family_generic_surface)
   }
   EXPECT_TRUE(has_audio);
   // The wan-side ports keep their INDICES, with the h3 anchors, the
-  // Ref2VA reference rows and now the config port appended -- which is
-  // what lets a graph written for an earlier port set keep working.
-  EXPECT_TRUE(sp.iports.size() == 10);
+  // Ref2VA reference rows, the config port and the audio conditioning
+  // appended -- which is what lets a graph written for an earlier port
+  // set keep working.
+  //
+  // The COUNT is asserted last on purpose: it is the part that moves
+  // every time a port is appended, while the indices below are the
+  // invariant the test exists to protect. Read a failure here as "a port
+  // was added" and check the indices before changing the number.
   EXPECT_TRUE(std::string(sp.iports[5].name) == "ref_latent0");
   EXPECT_TRUE(std::string(sp.iports[6].name) == "ref_latent1");
   EXPECT_TRUE(std::string(sp.iports[7].name) == "ref_video_rows");
   EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_audio_rows");
   EXPECT_TRUE(std::string(sp.iports[9].name) == "model_config");
+  EXPECT_TRUE(std::string(sp.iports[10].name) == "audio_conditioning");
+  EXPECT_TRUE(sp.iports.size() == 11);
   // The tag is the whole compatibility check between a config source and
   // this port: the composer offers a source only if it matches.
   EXPECT_TRUE(port_tags_compatible("model-config",

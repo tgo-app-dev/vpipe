@@ -1,6 +1,8 @@
 #ifndef VPIPE_STAGES_MODEL_QUANTIZE_STAGE_H
 #define VPIPE_STAGES_MODEL_QUANTIZE_STAGE_H
 
+#include "generative-models/quantize-family-registry.h"
+
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -157,6 +159,15 @@ private:
                                 const std::string&           dit_path,
                                 const std::string&           out_dir,
                                 const std::function<bool()>& stop);
+  // The same contract as quantize_comfy_pipeline_, driven by a REGISTERED
+  // family's component list instead of by this file's built-in detection
+  // -- the path an out-of-tree model takes to be packaged the way an
+  // in-tree one is. See generative-models/quantize-family-registry.h for
+  // why a family supplies data rather than behaviour.
+  bool quantize_registered_pipeline_(const std::string& root,
+                                     const genai::QuantizableFamily& fam,
+                                     const std::string&           out_dir,
+                                     const std::function<bool()>& stop);
   // Whether `dir` is a Comfy-Org repo root: at least one role subdir that
   // holds either a readable repack component or a quantized directory
   // checkpoint this pass wrote. The second half is what makes chaining

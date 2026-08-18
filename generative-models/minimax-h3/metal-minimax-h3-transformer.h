@@ -365,6 +365,27 @@ class MetalMiniMaxH3Transformer {
   bool bake_adaln(const std::vector<std::vector<float>>& schedule,
                   std::string* err = nullptr);
   bool adaln_baked() const { return !_adaln_tab.empty(); }
+
+  // Bytes the AdaLN bake will RETIRE, read from the checkpoint index
+  // without loading anything -- the sum of every `adaln_proj` tensor.
+  //
+  // Static and knowable before any run, which is the point: the block-
+  // streaming decision is irreversible and is taken at construction,
+  // while the bake happens moments later and removes 39% of a bf16
+  // checkpoint (24.3 of 61.7 GB). Sizing that decision against weights
+  // this model is about to stop holding is how a box with room ends up
+  // streaming.
+  //
+  // Returns 0 when the checkpoint cannot be opened, so an unreadable
+  // index is simply not counted rather than guessed at.
+  static std::size_t adaln_retired_bytes(const std::string& dit_dir);
+
+  // Will the bake certainly happen for a schedule of at most
+  // `max_rows` rows? The bake REFUSES a schedule whose tables would
+  // exceed its budget, and a refusal leaves every projection resident --
+  // so this answers with the WORST case, and a caller may subtract
+  // adaln_retired_bytes() only when it is true.
+  static bool adaln_bake_certain(const Config& cfg, int max_rows);
   // What the tables cost, for the memory report. 0 when not baked.
   std::size_t adaln_table_bytes() const;
 

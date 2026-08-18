@@ -34,7 +34,7 @@
 // symbol and no facade method, yet moves the vtable: a plugin built
 // against the older header passes every check and then calls through the
 // wrong slot. That has already happened once here.
-#define VPIPE_PLUGIN_ABI_VERSION 1u
+#define VPIPE_PLUGIN_ABI_VERSION 2u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

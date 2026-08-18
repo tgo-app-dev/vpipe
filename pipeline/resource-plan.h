@@ -40,6 +40,18 @@ class SessionContextIntf;
 struct ResourceClaim {
   std::string kind;   // planner selector, e.g. model_memory::kWeightsKind
   std::string key;    // planner-defined, e.g. a checkpoint directory
+
+  // Optional LIFETIME, in the planner's vocabulary. Two claims carrying
+  // DIFFERENT non-empty phases assert that they are never held at the
+  // same time, so a planner may take their maximum where it would
+  // otherwise take their sum. Empty -- the default -- means "held for
+  // the whole run", which is always the safe answer.
+  //
+  // The runtime does not interpret this any more than it interprets
+  // `key`. What it is worth, and what the names mean, is entirely up to
+  // the planner for `kind`; see model_memory::kPhaseCondition and the
+  // ordering constraint documented with it.
+  std::string phase;
 };
 
 // Consumes the claims of ONE kind across a launch.
@@ -67,9 +79,21 @@ public:
   virtual void begin_plan(const SessionContextIntf* /*session*/) {}
 
   // One claim of this planner's kind. Called once per claiming stage,
-  // in graph order, between begin_plan and end_plan.
+  // in graph order, between begin_plan and end_plan. `phase` is the
+  // claim's declared lifetime, empty for the usual "whole run"; what it
+  // means is this planner's business (see ResourceClaim::phase).
   virtual void claim(const SessionContextIntf* session,
-                     const std::string&        key) = 0;
+                     const std::string&        key,
+                     const std::string&        phase) = 0;
+
+  // A refinement of an already-claimed key, from Stage::decide_resources,
+  // delivered after EVERY stage has claimed. A planner that lets these
+  // change what it reports must buffer them until end_plan: applying one
+  // as it arrives would make it visible to the next stage's decision,
+  // which is the order-dependence the two-pass split exists to remove.
+  virtual void decide(const SessionContextIntf* /*session*/,
+                      const std::string&        /*key*/,
+                      const std::string&        /*phase*/) {}
 
   virtual void end_plan(const SessionContextIntf* /*session*/) {}
 };

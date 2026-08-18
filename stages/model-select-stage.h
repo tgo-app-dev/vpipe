@@ -6,6 +6,7 @@
 #include "pipeline/typed-stage.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,10 @@ public:
 
   void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
+
+  // This source's one beat, known before anything runs: the consumers'
+  // declare_resources() needs the model choice, and it arrives here.
+  std::optional<FlexData> constant_output(unsigned oport) const override;
 
   const StageSpec& spec() const noexcept override;
 

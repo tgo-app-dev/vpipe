@@ -47,6 +47,155 @@ inline constexpr std::string_view kWeightsKind = "model-weights";
 // component needs no branch at the call site.
 std::vector<ResourceClaim> weight_claims(std::vector<std::string> dirs);
 
+// ---- phases ----------------------------------------------------------
+//
+// A generation graph runs in stages that do not overlap: the text
+// encoder produces one conditioning and is done, THEN a DiT denoises
+// for minutes, THEN a VAE turns the latent into pixels. Summing all
+// three sizes the box for a moment that never happens -- and on a
+// MiniMax-H3 graph the sum is 94 GB where the largest single phase is
+// 78 GB, which is the difference between streaming a 33B DiT and
+// holding it.
+//
+// So a claim may name the phase it belongs to, and the planner takes
+// the maximum across phases rather than their sum (see
+// GenerativeModelManager::phase_footprint). Empty -- the default and
+// what weight_claims() above produces -- means held for the whole run.
+//
+// THE VOCABULARY IS FIXED, and deliberately: an unrecognised phase is
+// warned about and treated as persistent. A typo that quietly became
+// its own phase would be counted apart from the claims it actually
+// coexists with, and that error UNDER-counts, which is the direction
+// that thrashes.
+inline constexpr std::string_view kPhaseCondition = "condition";
+inline constexpr std::string_view kPhaseDenoise   = "denoise";
+inline constexpr std::string_view kPhaseDecode    = "decode";
+
+// Claims for weights this stage holds only during `phase`.
+//
+// TWO CONDITIONS, both required, and neither is checkable by the
+// planner:
+//
+//   1. The release must be certain from CONFIG, before anything loads.
+//      An idle policy of `destroy` qualifies. `park` does NOT --
+//      park_weights() returns 0 for a set that reads uncached, which is
+//      every text encoder today, so a parked encoder is still entirely
+//      resident and a peer that subtracted it is short by its whole
+//      size.
+//
+//   2. The decision to release must not itself be taken by consulting a
+//      phased figure. `auto` resolves against bounded(), which sums
+//      everything on purpose; were it to read the phased number it
+//      would see the room its own claim invented and conclude it need
+//      not release after all.
+//
+// The release is reported at unload via
+// GenerativeModelManager::note_phase_released, and a phase claim whose
+// release never arrives is warned about at the end of the run.
+std::vector<ResourceClaim>
+weight_claims_in_phase(std::vector<std::string> dirs,
+                       std::string_view         phase);
+
+// ---- activation scratch ----------------------------------------------
+//
+// The second thing that has to fit, and until now the one nothing
+// declared. Weights are what a model HOLDS; scratch is what it
+// ALLOCATES to run, and for a VAE decode the second dwarfs the first --
+// FLUX.2's VAE weighs 160 MB on disk and its decode peaks around 2.8 GB
+// at 1024x1024. A graph accounted purely by weights therefore reads as
+// roomy right up to the allocation that does not fit.
+//
+// Declared as an ordinary claim so it is on the books before anything
+// runs, and PHASED like weights, because scratch exists only while its
+// stage is running: a decode's arena is not resident during the
+// denoise, so `kPhaseDecode` keeps it out of the DiT's sizing and in the
+// box-level peak.
+inline constexpr std::string_view kScratchKind = "activation-scratch";
+
+// A PRESENCE marker for an arena whose size is not knowable at plan
+// time -- an image edit's geometry comes from the reference image, so
+// there is no height/width in any config to estimate from.
+//
+// Declaring this rather than nothing is what keeps the plan
+// authoritative about WHAT exists while leaving runtime to supply HOW
+// MUCH, which is exactly the contract weights already have
+// (declare_weights / revise_declaration, where revise also refuses to
+// create). Without it a stage would have to introduce an arena the plan
+// never saw, and then nothing distinguishes a legitimate late truth
+// from a typo'd label.
+//
+// Negligible by construction: 4 KB cannot move any sizing decision, and
+// the first beat replaces it with the real figure before the decision
+// it feeds is acted on.
+inline constexpr std::size_t kUnknownArena = 4096;
+
+// `label` names the allocation for the log (e.g. "vae-decode"); it does
+// not have to be unique, but two claims sharing one label are counted
+// ONCE, at the larger, on the assumption they describe the same arena.
+std::vector<ResourceClaim>
+scratch_claims(std::string label, std::size_t bytes, std::string_view phase);
+
+// Declared scratch for `phase`, or with an empty phase the widest single
+// phase -- the same peak rule weights use. Kept separate from
+// weight_footprint() rather than folded into it: a caller sizing a
+// decode wants both, but a caller asking what a CHECKPOINT costs must
+// not silently get an arena as well.
+std::size_t scratch_footprint(const SessionContextIntf* session,
+                              std::string_view          phase = {});
+
+// What a VAE decode of `width` x `height` will allocate, estimated from
+// `<root>/vae/config.json` alone -- no model load, so it is answerable
+// during the planning phase.
+//
+// The formula is the VAE's own, selected by `_class_name`: the FLUX.2
+// AutoencoderKL peaks at ~7 full-resolution base-channel buffers, the
+// Qwen-Image one at an im2col scratch plus ~50% for the level's I/O.
+// Both mirror the decode_peak_bytes() on the corresponding VAE class,
+// and the runtime reclaim checks in generate-image use those directly --
+// this is the plan-time estimate of the same quantity.
+//
+// An UNRECOGNISED VAE gets the larger of the two, deliberately: a decode
+// arena that is under-declared reads as room that is not there, and the
+// stage that believed it has already decided something it cannot undo.
+// 0 only when there is no readable VAE config at all.
+std::size_t vae_decode_scratch_bytes(const std::string& root,
+                                     int width, int height);
+
+// The same for a VIDEO decode, where the dominant transient is not the
+// convolution arena but the OUTPUT: [3, frames, H, W] at bf16 plus the
+// planar-U8 clip the stage buffers behind it, which is 9 bytes per
+// output pixel and grows linearly with length.
+//
+// A BOUND, not the truth. The real figure depends on how many pixel
+// frames the VAE expands the latent into, which is a property of the
+// loaded model -- so vae-decode revises this to the exact number on
+// every beat (GenerativeModelManager::revise_scratch). Declaring the
+// config geometry first is what gives peers something to size against
+// before the first clip exists.
+std::size_t video_decode_scratch_bytes(int width, int height, int frames);
+
+// Should a stage drop its weights between beats, given what this beat
+// actually needs?
+//
+// Re-asked per beat, in BOTH directions, because the arena is a property
+// of the beat: a run of image edits at mixed sizes has one large frame
+// and several small ones, and a rule that could only tighten would make
+// every small frame after the large one pay a reload it did not need.
+// The decision is taken after a decode completes, so it is never on the
+// critical path -- what it costs is the reload before the NEXT beat.
+//
+// The band is what stops that becoming churn. An arena sitting on the
+// threshold would otherwise flip every beat, and a flip is not free:
+// MiniMax-H3's video VAE is 10.4 GB, so a needless drop-and-reload is
+// seconds of disk. So: unload when it genuinely does not fit, keep when
+// it fits with room to spare, and HOLD the current answer in between.
+// The band is proportional (bytes/8) rather than a constant, so it
+// scales with whatever the stage is actually decoding.
+//
+// `current` is the answer in force, returned unchanged inside the band.
+bool resolve_idle_unload(std::size_t ram, std::size_t peers,
+                         std::size_t arena, bool current);
+
 // Working-set headroom for a decision that can be REVISED later.
 // unload_when_idle is the case: it is a per-beat behaviour flag, decided
 // after the init barrier when every peer has loaded, and changing it
@@ -98,8 +247,16 @@ std::size_t dir_weights_bytes(const std::string& dir);
 //
 // With no session or no manager this degrades to the old behaviour: the
 // on-disk sum of `dirs`, deduped against itself.
+//
+// `phase` is the caller's own phase, when it has one. Naming it drops
+// the peers that will not be resident while this stage runs; leaving it
+// empty asks for the box-level peak instead (persistent plus the widest
+// single phase), which is what a stage that does not know when it runs
+// has to assume. Either way `dirs` are always added -- they are what
+// this caller is about to hold, whatever anybody else does.
 std::size_t weight_footprint(const SessionContextIntf*        session,
-                             const std::vector<std::string>&  dirs);
+                             const std::vector<std::string>&  dirs,
+                             std::string_view                 phase = {});
 
 // Would keeping `dirs` resident, plus `headroom` for working set, fail to
 // fit in physical RAM? False when RAM is unknown, so an unreadable sysctl
@@ -136,12 +293,27 @@ struct StreamPlan {
   double      pin_frac  = 0.0;
   std::size_t footprint = 0;   // DiT + encoder + everything resident
   std::size_t others    = 0;   // the same, minus the DiT's own bytes
+  std::size_t retires   = 0;   // what `dit_retires` took off the footprint
+  std::size_t transient = 0;   // peers that let go before this model runs
 };
 
+// `dit_retires` is what the DiT will RELEASE after load and before the
+// denoise -- weights it reads once and then drops, so they are never
+// part of the set that has to coexist. MiniMax-H3's AdaLN bake is the
+// case this exists for: it retires every `adaln_proj` projection, 24.3 GB
+// of a 61.7 GB bf16 checkpoint (39% of it), and without this the
+// irreversible streaming decision is taken against a model 39% of which
+// is about to stop existing.
+//
+// Pass it ONLY when the release is certain. Being wrong in this
+// direction is the expensive one: a model that declines to stream and
+// then holds more than predicted thrashes, and nothing later can undo
+// the decision. Zero -- the default -- is always safe.
 StreamPlan plan_streaming(const SessionContextIntf* session,
                           const std::string&        dit_dir,
                           const std::string&        enc_dir,
-                          std::size_t               headroom);
+                          std::size_t               headroom,
+                          std::size_t               dit_retires = 0);
 
 // The `unload_when_idle` config value shared by the model-holding stages.
 // THREE things can happen to idle weights, not two:

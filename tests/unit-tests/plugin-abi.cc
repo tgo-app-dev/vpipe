@@ -51,6 +51,17 @@ TEST(plugin_abi, version_gate)
   EXPECT_FALSE(
       PluginManager::is_abi_compatible(VPIPE_PLUGIN_ABI_VERSION + 1u));
   EXPECT_FALSE(PluginManager::is_abi_compatible(0u));
+  // BELOW the host's version is refused too, which is the half a
+  // "+1" check cannot see. Strict equality gives the number no
+  // ordering, so an older plugin is not an older-but-workable
+  // plugin -- it is one built against different vtables.
+  EXPECT_FALSE(
+      PluginManager::is_abi_compatible(VPIPE_PLUGIN_ABI_VERSION - 1u));
+  // ABI 1 by name: the only version ever released, and no longer
+  // loadable. Spelled as a literal rather than derived from the
+  // macro so a future bump cannot quietly turn this into a restatement
+  // of the line above.
+  EXPECT_FALSE(PluginManager::is_abi_compatible(1u));
 }
 
 TEST(plugin_abi, context_introspection)

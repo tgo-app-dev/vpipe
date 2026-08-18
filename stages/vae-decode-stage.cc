@@ -199,6 +199,17 @@ VaeDecodeStage::spec() const noexcept
   return kSpec;
 }
 
+void
+VaeDecodeStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  // Pre-launch twin of the runtime latch in process(): the same
+  // beat and the same parse, early enough that declare_resources()
+  // sees the model. Bookkeeping only -- nothing loads here; the
+  // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport != kModelPort) { return; }
+  apply_model_select_beat(beat, _hf_dir);
+}
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 void
@@ -228,6 +239,13 @@ VaeDecodeStage::reset_run_state()
   // run's selection.
   _model_latched = false;
 
+  // Both are measurements of the PREVIOUS run's beats. The ratchet in
+  // particular: a 2048^2 clip in run 1 must not keep this stage
+  // unloading through a run 2 of thumbnails, and the manager has
+  // dropped the declaration those numbers refined anyway.
+  _arena_decided = 0;
+  _arena_stated  = 0;
+  _idle_peers.clear();
 }
 
 std::vector<ResourceClaim>
@@ -265,6 +283,77 @@ VaeDecodeStage::load_note_(const VpipeFormat& msg) const
 {
   if (_quiet_reload) { session()->log_debug(msg); }
   else               { session()->info(msg); }
+}
+
+// Publish the arena this beat actually needs, and re-decide the idle
+// policy against it.
+//
+// Two things are going on, and they want the same thing.
+//
+// The LEDGER wants the truth: `bytes` is exact for this beat, where the
+// plan-time claim was a bound from config geometry -- and for video it
+// is a loose one, since the pixel frame count is the VAE's expansion of
+// the latent and only the loaded model knows it. Peers reading
+// scratch_footprint() should see this.
+//
+// The DECISION follows it in BOTH directions. An earlier version only
+// tightened, on the theory that a stable answer avoids churn, and that
+// was wrong for the case this mechanism is shared with: a run of image
+// edits at mixed sizes has one large frame and several small ones, and
+// a one-way rule makes every small frame after the large one pay a
+// reload it did not need. Nothing about the decision is on the critical
+// path -- it is taken after a decode completes and decides only whether
+// to hold the weights until the next beat. resolve_idle_unload carries
+// the band that keeps a boundary-sitting arena from flipping every beat.
+// The image half of the same publication, keyed on pixel size.
+//
+// Resolves the checkpoint itself because the decode branches do not
+// carry it -- one registry lookup per beat, against a decode measured
+// in hundreds of milliseconds.
+void
+VaeDecodeStage::publish_image_arena_(int px_w, int px_h)
+{
+  if (px_w <= 0 || px_h <= 0 || _hf_dir.empty()) { return; }
+  revise_decode_arena_(model_memory::vae_decode_scratch_bytes(
+      resolve_model_dir(session(), _hf_dir), px_w, px_h));
+}
+
+void
+VaeDecodeStage::revise_decode_arena_(std::size_t bytes)
+{
+  if (bytes == 0 || session() == nullptr ||
+      session()->services() == nullptr) {
+    return;
+  }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr != nullptr) { mgr->revise_scratch("vae-decode", bytes); }
+
+  if (bytes != _arena_stated) {
+    session()->log_debug(fmt(
+        "VaeDecodeStage('{}'): decode arena {} MB -> {} MB (this beat's real "
+        "geometry; the plan could only bound it)", this->id(),
+        _arena_stated >> 20, bytes >> 20));
+    _arena_stated = bytes;
+  }
+
+  // Only `auto` is ours to revisit: an explicit keep/always is the
+  // user's answer and a measurement does not overrule it.
+  if (_unload_cfg != model_memory::UnloadPolicy::kAuto) { return; }
+  if (bytes == _arena_decided) { return; }
+  _arena_decided = bytes;
+
+  const std::size_t ram = model_memory::phys_ram();
+  const std::size_t fp  = model_memory::weight_footprint(session(),
+                                                         _idle_peers);
+  const bool want =
+      model_memory::resolve_idle_unload(ram, fp, bytes, _unload_idle);
+  if (want == _unload_idle) { return; }
+  _unload_idle = want;
+  session()->log_debug(fmt(
+      "VaeDecodeStage('{}'): this beat needs {} MB beside {} MB of peers "
+      "on a {} MB box -> {} from now on", this->id(), bytes >> 20,
+      fp >> 20, ram >> 20,
+      _unload_idle ? "UNLOAD after each beat" : "keep resident"));
 }
 
 void
@@ -345,19 +434,37 @@ VaeDecodeStage::ensure_loaded_()
                   (std::filesystem::path(root) / "transformer").string(),
                   (std::filesystem::path(root) / "text_encoder").string(),
                   (std::filesystem::path(root) / "mllm").string()};
+    _idle_peers = peers;
     const std::size_t fp = model_memory::weight_footprint(session(), peers);
+    // The decode ARENA, if the stage that has the geometry declared one.
+    //
+    // This is the quantity the decision was always about and could not
+    // name: the VAE's own weights are small, and what has to fit beside
+    // the peers is the working set. Until it was declared the only
+    // stand-in was kHeadroom -- a flat 6 GB that is wildly wrong in both
+    // directions, being ~3x the FLUX.2 arena at 1024^2 and less than
+    // half of it at 2K.
+    //
+    // 0 when nothing declared one (no generate-image in the graph, an
+    // unreadable VAE config), and then this falls back to exactly the
+    // old behaviour rather than to a guess of its own.
+    const std::size_t arena =
+        model_memory::scratch_footprint(session(), model_memory::kPhaseDecode);
+    const std::size_t need = arena > 0 ? arena : model_memory::kHeadroom;
     switch (_unload_cfg) {
       case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
       case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
-      default:
-        _unload_idle =
-            model_memory::bounded(session(), peers, model_memory::kHeadroom);
+      default: {
+        const std::size_t ram = model_memory::phys_ram();
+        _unload_idle = ram != 0 && ram < fp + need;
         break;
+      }
     }
     session()->log_debug(fmt(
-        "VaeDecodeStage('{}'): peer footprint {} MB + {} MB headroom vs {} MB "
-        "RAM, unload_when_idle={} -> {}", this->id(), fp >> 20,
-        model_memory::kHeadroom >> 20, model_memory::phys_ram() >> 20,
+        "VaeDecodeStage('{}'): peer footprint {} MB + {} MB {} vs {} MB "
+        "RAM, unload_when_idle={} -> {}", this->id(), fp >> 20, need >> 20,
+        arena > 0 ? "declared decode arena" : "headroom (no arena declared)",
+        model_memory::phys_ram() >> 20,
         model_memory::unload_policy_name(_unload_cfg),
         _unload_idle ? "UNLOAD after each beat" : "keep resident"));
   }
@@ -706,6 +813,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // Pixels per latent cell: the conv trunk is 8x, times the VAE's patch
     // factor (2 on AutoencoderKLFlux2, 1 on the plain AutoencoderKL).
     const int px = 8 * _flux2_vae->config().patch;
+    // Publish the arena from the geometry actually in hand. The image
+    // branches need this as much as the video ones: an EDIT graph takes
+    // its size from the reference image, so generate-image had no
+    // config geometry to declare from -- and Qwen-Image-Edit has no
+    // free_*_dit_for_decode_ at all, so nothing upstream states it
+    // either. Same estimator the plan used, at the real pixel size.
+    publish_image_arena_(w16 * px, h16 * px);
     const std::size_t nz = (std::size_t)Cdit * h16 * w16;
     metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
     { auto* d = static_cast<_Float16*>(z.contents());
@@ -857,6 +971,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // that fits() exists for was a 12-16 GB single command buffer, three
       // orders off a quarter-gigabyte output. So: refuse on physical, warn
       // on working set, and let a small allocation past the soft limit.
+      // Publish it. `need` is a function of the BEAT -- it scales with
+      // out_frames -- so it is the one figure the plan could not have
+      // held: a config-derived estimate has no frame term and cannot
+      // acquire one. Revising here is what makes the ledger describe
+      // this clip rather than a guess about clips in general, and it is
+      // the same declare-then-revise the streaming DiTs use for weights.
+      revise_decode_arena_(need);
+
       auto* mcb = session()->services()->metal_compute();
       auto mb = mcb ? mcb->memory_budget() : metal_compute::MetalCompute::
                                                  MemoryBudget{};
@@ -1083,6 +1205,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       return !ctx.stop_requested();
     };
     const int want = is_video ? _plugin_dec->decoded_frames(T) : 1;
+    // Same publication the built-in video branch makes, and needed more
+    // here: a registered family's frame expansion is entirely its own
+    // (LTX-2.5 compresses time by 8), so the plan's config-derived bound
+    // is the furthest from the truth exactly where it cannot be checked.
+    {
+      const int sc = _plugin_dec->spatial_compression();
+      const std::size_t px =
+          (std::size_t)((int)tbp->shape[tbp->shape.size() - 2] * sc) *
+          (std::size_t)((int)tbp->shape[tbp->shape.size() - 1] * sc) *
+          (std::size_t)(want > 0 ? want : 1);
+      revise_decode_arena_(px * 3 * 2 + px * 3);
+    }
     std::string derr;
     bool ok = false;
     try {
@@ -1214,6 +1348,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       }
       return true;
     };
+    {
+      const std::size_t px =
+          (std::size_t)F * (std::size_t)H * (std::size_t)W;
+      revise_decode_arena_(px * 3 * 2 + px * 3);
+    }
     std::string derr;
     bool ok = false;
     {
@@ -1327,6 +1466,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     const float* s = tbp->as_f32();
     for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
 
+    // Publish the arena from the geometry actually in hand. The image
+    // branches need this as much as the video ones: an EDIT graph takes
+    // its size from the reference image, so generate-image had no
+    // config geometry to declare from -- and Qwen-Image-Edit has no
+    // free_*_dit_for_decode_ at all, so nothing upstream states it
+    // either. Same estimator the plan used, at the real pixel size.
+  publish_image_arena_(w8 * 8, h8 * 8);
   metal_compute::SharedBuffer zw = _vae->unwhiten(z, h8, w8);
   if (zw.empty()) {
     session()->warn(fmt(

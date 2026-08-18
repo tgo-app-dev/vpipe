@@ -696,6 +696,17 @@ DiffusionConditionerStage::spec() const noexcept
   return kSpec;
 }
 
+void
+DiffusionConditionerStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  // Pre-launch twin of the runtime latch in process(): the same
+  // beat and the same parse, early enough that declare_resources()
+  // sees the model. Bookkeeping only -- nothing loads here; the
+  // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport != kModelPort) { return; }
+  apply_model_select_beat(beat, _hf_dir);
+}
+
 #ifndef VPIPE_BUILD_APPLE_SILICON
 Job DiffusionConditionerStage::initialize(RuntimeContext&) { co_return; }
 Job DiffusionConditionerStage::process(RuntimeContext&) { co_return; }
@@ -885,10 +896,15 @@ DiffusionConditionerStage::reset_run_state()
 
 }
 
-std::vector<ResourceClaim>
-DiffusionConditionerStage::declare_resources() const
+// The encoder and DiT directories this stage's model resolves to.
+//
+// Shared by both planning passes so they cannot disagree about which
+// checkpoint is being talked about: the declare pass puts them on the
+// books and the decide pass refines one of them, keyed by path.
+void
+DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
+                                                   std::string* dit_out) const
 {
-  if (_hf_dir.empty()) { return {}; }
   namespace fs = std::filesystem;
   const std::string root = resolve_model_dir(session(), _hf_dir);
   // Boogu names its text encoder `mllm/`; every other family uses
@@ -915,7 +931,62 @@ DiffusionConditionerStage::declare_resources() const
         genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root);
     if (!d.empty() && d != root) { dit = d; }
   }
+  if (enc_out != nullptr) { *enc_out = std::move(enc); }
+  if (dit_out != nullptr) { *dit_out = std::move(dit); }
+}
+
+std::vector<ResourceClaim>
+DiffusionConditionerStage::declare_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  std::string enc, dit;
+  resolve_component_dirs_(&enc, &dit);
+  // Both, unconditionally. Whether the encoder is phase-limited is a
+  // DECISION and belongs in decide_resources() below -- taken here it
+  // would read a half-built picture, and a graph would size itself
+  // differently depending on where the flattener put this stage.
   return model_memory::weight_claims({enc, dit});
+}
+
+std::vector<ResourceClaim>
+DiffusionConditionerStage::decide_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  std::string enc, dit;
+  resolve_component_dirs_(&enc, &dit);
+  if (enc.empty()) { return {}; }
+
+  // The ENCODER is claimed for the CONDITION phase when this stage will
+  // certainly let go of it, and left persistent when it might not.
+  //
+  // Why it has to be said in the PLAN rather than at unload time: a DiT
+  // takes its block-streaming decision, which is irreversible, on the
+  // first conditioning beat. That is after this stage has produced its
+  // output and before it has dropped the encoder, so an announcement at
+  // unload arrives one decision too late. MEASURED on a 64 GB box with
+  // the bf16 MiniMax-H3: the DiT streamed against a footprint of 57 GB,
+  // of which 20 GB was an encoder that no longer existed by the first
+  // denoise step, and the verdict turned on 1 GB.
+  //
+  // ONLY `destroy` counts, and `auto` only when it will resolve to
+  // destroy. `park` releases NOTHING here: park_weights() walks a weight
+  // set's CACHED entries, and every text encoder in this stage reads
+  // uncached into the model's own members -- so it parks 0 bytes and the
+  // encoder stays entirely resident. A peer that subtracted it would be
+  // short by the encoder's whole size and would preload into a box that
+  // cannot hold it.
+  //
+  // bounded() is unphased on purpose, and by this point it is also
+  // COMPLETE: every stage has declared, and no refinement from this pass
+  // has been applied yet, so every stage deciding gets the same answer.
+  const bool releases =
+      _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
+      (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
+       model_memory::bounded(session(), {enc, dit},
+                             model_memory::kHeadroom));
+  if (!releases) { return {}; }
+  return model_memory::weight_claims_in_phase(
+      {enc}, model_memory::kPhaseCondition);
 }
 
 Job
@@ -1023,6 +1094,15 @@ DiffusionConditionerStage::ensure_loaded_()
         genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
     if (!enc.empty() && enc != root) { _enc_dir = enc; }
   }
+  // NOTE: the encoder's phase claim is made in declare_resources(),
+  // which is where it belongs and where the planning phase can see it.
+  // It used to be repeated here as well, because declare_resources()
+  // returned nothing for a graph whose `hf_dir` arrives on the model
+  // iport from `model-select` -- which is how the shipped pipelines are
+  // written. Stage::apply_constant now delivers that choice before
+  // planning, so the declaration is real and this second site is gone.
+  // Do not restore it: two places stating one intent means only one of
+  // them is exercised by any given graph shape.
 
   namespace fs = std::filesystem;
   std::string tok_path = (fs::path(root) / "tokenizer" / "tokenizer.json").string();
@@ -1207,8 +1287,40 @@ DiffusionConditionerStage::unload_encoder_()
   _embed = metal_compute::SharedBuffer{};
   _ds_feats.clear();
   _unloaded = true;
+
+  // SAY SO to the manager, which is what makes this a memory decision
+  // rather than a private one.
+  //
+  // A declaration PERSISTS for the run at max(held, estimate) -- on
+  // purpose, so a peer never sizes against weights that are merely
+  // between uses. Destroying is the case that rule cannot see: the bytes
+  // are gone and will not come back until the next prompt, but the claim
+  // still reads as this stage's full encoder, and every peer sizing
+  // after this point adds it.
+  //
+  // That matters most for the one decision that cannot be revisited. A
+  // DiT takes its block-streaming decision at construction, on the first
+  // conditioning beat -- i.e. strictly AFTER this -- and it counts the
+  // encoder as a coexisting peer. So an encoder this stage has already
+  // released can push a DiT into streaming for RAM that is free, and
+  // nothing later can undo it. Revising to 0 is how the encoder stops
+  // being the DiT's constraint. Reloading needs no matching call: it
+  // opens the weight set again, and the manager counts what it holds.
+  if (!_enc_dir.empty() && session() != nullptr &&
+      session()->services() != nullptr) {
+    auto* mgr = session()->services()->generative_model_manager();
+    if (mgr != nullptr) {
+      mgr->revise_declaration(_enc_dir, 0);
+      // And redeem the promise the phase claim made. A claim whose
+      // release never arrives is warned about at the end of the run --
+      // see GenerativeModelManager::clear_declarations -- because a DiT
+      // has already spent an irreversible decision on it.
+      mgr->note_phase_released(_enc_dir);
+    }
+  }
   session()->log_debug(fmt(
-      "DiffusionConditionerStage('{}'): encoder unloaded (idle)", this->id()));
+      "DiffusionConditionerStage('{}'): encoder unloaded (idle), declaration "
+      "revised to 0", this->id()));
 }
 
 bool

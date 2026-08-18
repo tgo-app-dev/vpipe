@@ -55,6 +55,11 @@ struct ModelConfig;
 
 class MetalGemmaModel {
 public:
+  // Out-of-line so `LayerLoad` may stay an incomplete type here: the
+  // unique_ptr member below needs its size only where the destructor is
+  // defined, which is in the .cc beside the struct itself.
+  ~MetalGemmaModel();
+
   struct Config {
     int   n_layers        = 42;
     int   hidden          = 2560;
@@ -122,6 +127,26 @@ public:
     bool  is_moe() const { return enable_moe && n_experts > 0; }
     std::string weight_prefix = "language_model.model.";
     int   max_seq         = 4096;   // per-context KV preallocation
+
+    // ---- layer streaming, for a model that only ever PREFILLS --------
+    //
+    // Build each decoder layer INSIDE the prefill and free it after,
+    // holding one layer plus whatever the pinned prefix keeps, instead of
+    // the whole stack. A 12B Gemma-4 text encoder at w8 is 15.3 GB
+    // resident and 16.14 GB at its load PEAK, which on a 16 GB box is the
+    // machine -- and the diffusion text encoders that read a hidden-state
+    // stack never decode, so they pay only the re-read.
+    //
+    // DECODE IS REFUSED, not served slowly: a token at a time would
+    // re-read the stack per token, and only the pinned prefix is ever
+    // resident. See stream_decode_ok_().
+    //
+    // `pin_frac` (streaming only): pin a LEADING prefix of layers so
+    // pinned + running stays inside that fraction of physical RAM. 0 =>
+    // pure streaming. It is the graph's answer, not the model's -- what
+    // the prefix has to coexist with is whatever else the run holds.
+    bool   stream_layers  = false;
+    double pin_frac       = 0.0;
     int   page_tokens     = 256;    // bookkeeping ctx manager
     int   max_pages       = 0;
     // Per-layer attention kind (true = full_attention). Size == n_layers.
@@ -703,6 +728,22 @@ private:
   // reason on a different artifact.
   bool _dense_embed = false;
   metal_compute::ComputeFunction _fn_embed_dense;               // embed_gather_f16
+
+  // ---- per-layer builder, shared by load() and streaming ------------
+  // A callable the model KEEPS, so a streamed layer is built by the same
+  // code as a resident one. See the note where load() defines it: two
+  // loaders kept in lockstep by hand is how a checkpoint gets read one
+  // way in one mode and another in the other.
+  struct LayerLoad;
+  std::unique_ptr<LayerLoad> _lload;   // held only while streaming
+  bool build_layer_(int L);            // build _layers[L] from the set
+  void free_layer_(int L);             // drop its buffers, keep topology
+  // False on a layer-streamed model, reporting the reason ONCE: only the
+  // pinned prefix is built, so the stack cannot be run a token at a time.
+  bool stream_decode_ok_();
+  bool _stream_layers = false;
+  int  _pinned_layers = 0;
+  bool _stream_decode_warned = false;
 
   std::vector<Layer> _layers;
   metal_compute::SharedBuffer _embed_w, _embed_s, _embed_b;      // tied lm_head

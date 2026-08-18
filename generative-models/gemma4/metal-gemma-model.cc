@@ -1,5 +1,7 @@
 #include "generative-models/gemma4/metal-gemma-model.h"
 
+#include "generative-models/shared/stream-pin.h"
+
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/model-loader.h"
@@ -8,6 +10,8 @@
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/vpipe-format.h"
+#include "interfaces/session-context-intf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,10 +20,44 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <vector>
 
 namespace vpipe::genai {
+
+namespace {
+
+// Copied or Mapped for this model's own weight reads.
+//
+// COPIED is the default and the tree-wide rule for language models (see
+// docs/MODEL-MEMORY.md, "Tensor residency"): a loader that converts on a
+// dtype mismatch allocates the converted copy anyway, and load_mapped()
+// wraps the WHOLE shard, so mapping then pays both bills at once.
+//
+// It is a knob rather than a constant because that argument does not
+// hold for a QUANTIZED checkpoint used as a text encoder: the dominant
+// bytes are raw packed codes read as they sit, with nothing converted
+// beside them. MEASURED on LTX-2.5's Gemma-4 12B encoder at w4g64,
+// physical footprint of the conditioning phase: 10.3 GB copied -> 7.3 GB
+// mapped, with the emitted conditioning BYTE-IDENTICAL.
+//
+// Still off by default, for one reason: that 3 GB is only reachable on a
+// checkpoint whose tensors are individually 16-byte aligned, which is
+// new (the writer used to interleave 2-byte scalars and misalign 85% of
+// the file, and mapping such a shard is a silent no-op plus overhead --
+// it MEASURED worse). Flipping the default means re-taking the +38%
+// reading behind the rule above on files that can actually be mapped,
+// which has not been done.
+WeightSet::Residency
+weight_residency_()
+{
+  static const bool kMap =
+      std::getenv("VPIPE_GEMMA_MAP_WEIGHTS") != nullptr;
+  return kMap ? WeightSet::Residency::Mapped : WeightSet::Residency::Copied;
+}
+
+}  // namespace
 
 using metal_compute::ComputeEncoder;
 using metal_compute::SharedBuffer;
@@ -83,6 +121,61 @@ MetalGemmaModel::load(const std::string& model_dir,
                       metal_compute::MetalCompute* mc, const Config& cfg)
 {
   return load(WeightSet::open(model_dir, nullptr), mc, cfg);
+}
+
+// The per-layer builder, kept alive past load() so a streamed layer is
+// built by the same code as a resident one.
+struct MetalGemmaModel::LayerLoad {
+  std::function<bool(int)> build;
+};
+
+MetalGemmaModel::~MetalGemmaModel() = default;
+
+bool
+MetalGemmaModel::build_layer_(int L)
+{
+  if (!_lload || !_lload->build || L < 0 || L >= (int)_layers.size()) {
+    return false;
+  }
+  return _lload->build(L);
+}
+
+void
+MetalGemmaModel::free_layer_(int L)
+{
+  if (L < 0 || L >= (int)_layers.size()) { return; }
+  Layer& ly = _layers[(std::size_t)L];
+  // TOPOLOGY SURVIVES, weights do not. The forward reads is_full to pick
+  // its attention branch, head_dim / n_kv / k_eq_v to shape it, kv_source
+  // to find the layer whose K/V a shared tail reads, and ffn for the
+  // double-wide MLP -- and the context sized its pools from those at
+  // load. Everything else build_layer_ puts back.
+  const bool full = ly.is_full;
+  const int  hd = ly.head_dim, nkv = ly.n_kv, src = ly.kv_source;
+  const int  ffn = ly.ffn;
+  const bool keqv = ly.k_eq_v;
+  ly = Layer{};
+  ly.is_full = full;
+  ly.head_dim = hd;
+  ly.n_kv = nkv;
+  ly.kv_source = src;
+  ly.ffn = ffn;
+  ly.k_eq_v = keqv;
+}
+
+bool
+MetalGemmaModel::stream_decode_ok_()
+{
+  if (!_stream_decode_warned) {
+    _stream_decode_warned = true;
+    if (const SessionContextIntf* sc = _mc->session()) {
+      sc->error(fmt("[gemma4] decode on a layer-streamed model: only the "
+                    "pinned layer prefix is resident, so the stack cannot "
+                    "be run a token at a time -- stream_layers is "
+                    "prefill-only"));
+    }
+  }
+  return false;
 }
 
 std::unique_ptr<MetalGemmaModel>
@@ -778,7 +871,20 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     }
   }
   // ---- conversion helpers (mirror MetalQwenModel) -----------------
-  auto to_elt = [&](const std::string& name) -> SharedBuffer {
+  // ---- what the per-layer builder may outlive ---------------------
+  //
+  // From here down, the helpers and the layer builder are captured by
+  // a std::function the MODEL keeps (Config::stream_layers rebuilds a
+  // layer from the PREFILL, long after load() has returned). So they
+  // must not reach load()'s own frame: `m` is a unique_ptr about to be
+  // moved out and `cfg` is the CALLER's reference. These two name the
+  // same things through storage the model owns, and every capture list
+  // below is explicit so a missed one is a compile error rather than a
+  // dangling read.
+  MetalGemmaModel* const mm   = m.get();
+  const Config&          mcfg = mm->_cfg;   // == cfg, with the prefix fixed
+
+  auto to_elt = [wts, bf16, &wset, mc](const std::string& name) -> SharedBuffer {
     const auto* info = wts->info(name);
     if (info == nullptr) { return {}; }
     const std::string want = bf16 ? "BF16" : "F16";
@@ -786,7 +892,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     // measured and rejected for the LMs -- see the note in
     // metal-qwen-model.cc's to_elt.
     if (info->dtype == want) {
-      return wset.read(name, mc, WeightSet::Residency::Copied);
+      return wset.read(name, mc, weight_residency_());
     }
     // Consumed here and dropped, so read UNCACHED rather than keep a
     // redundant copy beside the converted one.
@@ -810,10 +916,10 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     return out;
   };
   auto to_f16 = to_elt;
-  auto qtri = [&](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
+  auto qtri = [&wset, mc, to_f16](const std::string& pfx, SharedBuffer& w, SharedBuffer& s,
                   SharedBuffer& b) -> bool {
     // Raw packed codes, uncached (see the note in metal-qwen-model.cc).
-    w = wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
+    w = wset.read(pfx + ".weight", mc, weight_residency_());
     s = to_f16(pfx + ".scales");
     b = to_f16(pfx + ".biases");
     return !w.empty() && !s.empty() && !b.empty();
@@ -822,7 +928,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   // for the dense_gemm_t path. Used for per_layer_projection whose in dim
   // (hpli=256) is < the qmv block_size (512). MLX g64 packing: 8 nibbles
   // per u32 (low-nibble first), scales/biases per group of 64.
-  auto dequant_dense = [&](const std::string& pfx, int out_dim,
+  auto dequant_dense = [&wset, wts, qg, bf16, mc](const std::string& pfx, int out_dim,
                            int in_dim) -> SharedBuffer {
     SharedBuffer wq =
         wset.read(pfx + ".weight", mc, WeightSet::Residency::Copied);
@@ -955,14 +1061,14 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   // hidden/4). The interleave is byte-level so this is the only bit-width
   // dependency. scales/biases are per group-of-64 regardless of bits.
   const std::size_t gu_wrow =
-      (std::size_t)cfg.hidden * (std::size_t)mlp_bits / 32;    // u32/row
+      (std::size_t)mcfg.hidden * (std::size_t)mlp_bits / 32;    // u32/row
   const std::size_t gu_grow =
-      (std::size_t)cfg.hidden / (std::size_t)qg;               // f16/row
+      (std::size_t)mcfg.hidden / (std::size_t)qg;               // f16/row
   // ffn_rows = the per-layer MLP intermediate (rows of gate/up). Uniform
-  // (== cfg.ffn_inner) for e4b / gemma4_unified, but the raw-HF E2B DOUBLES
+  // (== mcfg.ffn_inner) for e4b / gemma4_unified, but the raw-HF E2B DOUBLES
   // it on the KV-shared layers (use_double_wide_mlp) -- the interleave must
   // size to the actual gate rows or it truncates the double-wide layers.
-  auto interleave_gu = [&](const SharedBuffer& gw, const SharedBuffer& gs,
+  auto interleave_gu = [mc, gu_wrow, gu_grow](const SharedBuffer& gw, const SharedBuffer& gs,
                            const SharedBuffer& gb, const SharedBuffer& uw,
                            const SharedBuffer& us, const SharedBuffer& ub,
                            SharedBuffer& ow, SharedBuffer& os,
@@ -999,14 +1105,14 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   // affine twin interleaves two per-expert affine triples (gate, up) from the
   // quantizer (each [E, I, H-packed]); the dense twin interleaves the raw-HF
   // CONCATENATED slab [E, 2I, H] (gate rows [0:I], up rows [I:2I]).
-  auto interleave_moe_q = [&](int bits, const SharedBuffer& gw,
+  auto interleave_moe_q = [mc, &mcfg, qg](int bits, const SharedBuffer& gw,
                               const SharedBuffer& gs, const SharedBuffer& gb,
                               const SharedBuffer& uw, const SharedBuffer& us,
                               const SharedBuffer& ub, int E, int I,
                               SharedBuffer& ow, SharedBuffer& os,
                               SharedBuffer& ob) -> bool {
-    const std::size_t wr = (std::size_t)cfg.hidden * (std::size_t)bits / 32;
-    const std::size_t gr = (std::size_t)cfg.hidden / (std::size_t)qg;
+    const std::size_t wr = (std::size_t)mcfg.hidden * (std::size_t)bits / 32;
+    const std::size_t gr = (std::size_t)mcfg.hidden / (std::size_t)qg;
     ow = mc->make_shared_buffer((std::size_t)E * 2 * I * wr * 4);
     os = mc->make_shared_buffer((std::size_t)E * 2 * I * gr * 2);
     ob = mc->make_shared_buffer((std::size_t)E * 2 * I * gr * 2);
@@ -1034,9 +1140,9 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     }
     return true;
   };
-  auto interleave_moe_dense = [&](const SharedBuffer& gu_cat, int E, int I,
+  auto interleave_moe_dense = [mc, &mcfg](const SharedBuffer& gu_cat, int E, int I,
                                   SharedBuffer& ow) -> bool {
-    const std::size_t Hs = (std::size_t)cfg.hidden;
+    const std::size_t Hs = (std::size_t)mcfg.hidden;
     ow = mc->make_shared_buffer((std::size_t)E * 2 * I * Hs * 2);
     if (ow.empty() || gu_cat.empty()) { return false; }
     const auto* sp = static_cast<const std::uint16_t*>(gu_cat.contents());
@@ -1058,9 +1164,9 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   // (k_eq_v). Skips (per-layer fallback) if any byte size is not a clean
   // multiple of the base-bits row stride (mixed-precision safety).
   const std::size_t qkv_wrow_b =
-      (std::size_t)cfg.hidden * (std::size_t)cfg.quant_bits / 8;   // bytes/row
-  const std::size_t qkv_grow_b = (std::size_t)(cfg.hidden / qg) * 2;  // f16/row
-  auto build_qkv = [&](Layer& ly) -> void {
+      (std::size_t)mcfg.hidden * (std::size_t)mcfg.quant_bits / 8;   // bytes/row
+  const std::size_t qkv_grow_b = (std::size_t)(mcfg.hidden / qg) * 2;  // f16/row
+  auto build_qkv = [qkv_wrow_b, qkv_grow_b, mc, &mcfg](Layer& ly) -> void {
     if (qkv_wrow_b == 0 || ly.qw.empty() || ly.kw.empty()) { return; }
     const bool vok = !ly.vw.empty();
     if ((ly.qw.byte_size() % qkv_wrow_b) || (ly.kw.byte_size() % qkv_wrow_b) ||
@@ -1074,7 +1180,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     // Reject mixed precision (e.g. OptiQ 8-bit q/k/v): the derived row counts
     // must match the expected output dims, else an 8-bit tensor would parse as
     // 2x the rows at the base 4-bit stride and corrupt the concat.
-    const int qd_exp = cfg.n_heads * ly.head_dim;
+    const int qd_exp = mcfg.n_heads * ly.head_dim;
     const int kd_exp = ly.n_kv * ly.head_dim;
     if (qr != qd_exp || kr != kd_exp || (vr && vr != kd_exp)) { return; }
     const int rows = qr + kr + vr;
@@ -1119,22 +1225,55 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
   };
 
   // ---- per-layer bind ---------------------------------------------
-  m->_layers.resize(cfg.n_layers);   // Layer is move-only (SharedBuffer)
-  const int first_shared = cfg.first_shared();
-  for (int L = 0; L < cfg.n_layers; ++L) {
-    Layer& ly = m->_layers[L];
-    ly.is_full = cfg.layer_is_full(L);
-    ly.head_dim = cfg.head_dim(L);
-    ly.n_kv = cfg.n_kv(L);
-    ly.ffn = cfg.ffn_inner;     // dense overrides per-layer (double-wide)
-    ly.k_eq_v = cfg.k_eq_v(L);
-    const bool shared = (cfg.num_kv_shared > 0) && (L >= first_shared);
+  mm->_layers.resize(mcfg.n_layers);   // Layer is move-only (SharedBuffer)
+  const int first_shared = mcfg.first_shared();
+  // TOPOLOGY FOR EVERY LAYER, before any weights are bound.
+  //
+  // These are not weights and they are not per-build: the ContextManager
+  // sizes its KV pools from layer_kind / head_dim below, and the forward
+  // reads them to pick its attention branch -- so they must be right for
+  // layers a streaming load never builds. free_layer_ preserves them for
+  // exactly the same reason. build_one recomputes them identically when
+  // it runs, which is harmless and keeps it a complete description of a
+  // layer.
+  for (int L = 0; L < mcfg.n_layers; ++L) {
+    Layer& ly = mm->_layers[(std::size_t)L];
+    ly.is_full  = mcfg.layer_is_full(L);
+    ly.head_dim = mcfg.head_dim(L);
+    ly.n_kv     = mcfg.n_kv(L);
+    ly.ffn      = mcfg.ffn_inner;   // dense may widen it per layer
+    ly.k_eq_v   = mcfg.k_eq_v(L);
+    if (mcfg.num_kv_shared > 0 && L >= first_shared) {
+      int src = -1;
+      for (int j = first_shared - 1; j >= 0; --j) {
+        if (mcfg.layer_is_full(j) == ly.is_full) { src = j; break; }
+      }
+      if (src < 0) { return nullptr; }
+      ly.kv_source = src;
+    }
+  }
+  // ONE LAYER, from the checkpoint, by the SAME code whether it is built
+  // here or rebuilt from the prefill under Config::stream_layers. Two
+  // loaders kept in lockstep by hand is exactly how a checkpoint gets
+  // read one way in one mode and another way in the other, so there is
+  // only ever this one.
+  auto build_one = [mm, &mcfg, &P, has_ple, first_shared, mlp_bits,
+                    bf16, mc, wts, to_f16, qtri, dequant_dense,
+                    interleave_gu, interleave_moe_q, interleave_moe_dense,
+                    build_qkv](int L) -> bool {
+    Layer& ly = mm->_layers[L];
+    ly.is_full = mcfg.layer_is_full(L);
+    ly.head_dim = mcfg.head_dim(L);
+    ly.n_kv = mcfg.n_kv(L);
+    ly.ffn = mcfg.ffn_inner;     // dense overrides per-layer (double-wide)
+    ly.k_eq_v = mcfg.k_eq_v(L);
+    const bool shared = (mcfg.num_kv_shared > 0) && (L >= first_shared);
     if (shared) {
       int src = -1;
       for (int j = first_shared - 1; j >= 0; --j) {
-        if (cfg.layer_is_full(j) == ly.is_full) { src = j; break; }
+        if (mcfg.layer_is_full(j) == ly.is_full) { src = j; break; }
       }
-      if (src < 0) { return nullptr; }
+      if (src < 0) { return false; }
       ly.kv_source = src;
     }
     const std::string p = P + "layers." + std::to_string(L) + ".";
@@ -1147,7 +1286,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     }
     ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
     bool ok;
-    if (m->_dense) {
+    if (mm->_dense) {
       // Raw-HF dense bf16/f16: load each linear's plain [out,in] .weight into an
       // elt buffer (no scales/biases). q/k/v/o/down/plg/plp reuse the affine
       // slots; gate/up go to the dedicated dgate/dup (no interleave). No qkv
@@ -1161,8 +1300,8 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
            !ly.dup.empty() && !ly.dw.empty();
       // Per-layer MLP intermediate from the gate weight [ffn, H] byte size
       // (the E2B KV-shared layers DOUBLE it -- use_double_wide_mlp).
-      if (ok && cfg.hidden > 0) {
-        ly.ffn = (int)(ly.dgate.byte_size() / ((std::size_t)cfg.hidden * 2));
+      if (ok && mcfg.hidden > 0) {
+        ly.ffn = (int)(ly.dgate.byte_size() / ((std::size_t)mcfg.hidden * 2));
       }
       if (has_ple) {
         ly.plg_w = to_f16(p + "per_layer_input_gate.weight");
@@ -1178,7 +1317,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
           ok = ok && !ly.vw.empty();
         }
       }
-    } else if (m->_mixed) {
+    } else if (mm->_mixed) {
     // Per-tensor mixed-precision (OptiQ): bind each projection separately and
     // record its OWN bit width (4 or 8). gate|up are interleaved into guw only
     // when both equal mlp_bits (the fused geglu kernel runs at mlp_bits), else
@@ -1194,11 +1333,11 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
       const auto* gi = wts->info(p + "mlp.gate_proj.weight");
       if (gi != nullptr && !gi->shape.empty()) { ly.ffn = (int)gi->shape[0]; }
     }
-    const int qd = cfg.n_heads * ly.head_dim;
-    ly.q_bits    = mbits(p + "self_attn.q_proj", cfg.hidden);
+    const int qd = mcfg.n_heads * ly.head_dim;
+    ly.q_bits    = mbits(p + "self_attn.q_proj", mcfg.hidden);
     ly.o_bits    = mbits(p + "self_attn.o_proj", qd);
-    ly.gate_bits = mbits(p + "mlp.gate_proj", cfg.hidden);
-    ly.up_bits   = mbits(p + "mlp.up_proj", cfg.hidden);
+    ly.gate_bits = mbits(p + "mlp.gate_proj", mcfg.hidden);
+    ly.up_bits   = mbits(p + "mlp.up_proj", mcfg.hidden);
     ly.down_bits = mbits(p + "mlp.down_proj", ly.ffn);
     ok = qtri(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb)
            && qtri(p + "self_attn.o_proj", ly.ow, ly.os, ly.ob)
@@ -1218,24 +1357,24 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     if (has_ple) {
       ok = ok
         && qtri(p + "per_layer_input_gate", ly.plg_w, ly.plg_s, ly.plg_b);
-      if (m->_ple_quant) {
+      if (mm->_ple_quant) {
         ok = ok && qtri(p + "per_layer_projection", ly.plp_w, ly.plp_s,
                         ly.plp_b);
       } else {
-        ly.plp_w = dequant_dense(p + "per_layer_projection", cfg.hidden,
-                                 cfg.hpli);
+        ly.plp_w = dequant_dense(p + "per_layer_projection", mcfg.hidden,
+                                 mcfg.hpli);
       }
     }
     if (ly.kv_source < 0) {
-      ly.k_bits = mbits(p + "self_attn.k_proj", cfg.hidden);
+      ly.k_bits = mbits(p + "self_attn.k_proj", mcfg.hidden);
       ok = ok && qtri(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
       if (!ly.k_eq_v) {
-        ly.v_bits = mbits(p + "self_attn.v_proj", cfg.hidden);
+        ly.v_bits = mbits(p + "self_attn.v_proj", mcfg.hidden);
         ok = ok && qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb);
       }
       ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
-      if (ly.k_norm.empty()) { return nullptr; }
-      if (m->_qkv_fuse && ly.q_bits == ly.k_bits &&
+      if (ly.k_norm.empty()) { return false; }
+      if (mm->_qkv_fuse && ly.q_bits == ly.k_bits &&
           (ly.k_eq_v || ly.q_bits == ly.v_bits)) {
         build_qkv(ly);   // self-guards on the packing stride
       }
@@ -1244,7 +1383,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     SharedBuffer gw, gs, gb, uw, us, ub;   // freed after interleave
     // Per-layer MLP intermediate from the packed gate rows (E2B DOUBLES it on
     // the KV-shared layers -- use_double_wide_mlp). shape[0] = ffn out rows;
-    // uniform (== cfg.ffn_inner) for e4b / gemma4_unified.
+    // uniform (== mcfg.ffn_inner) for e4b / gemma4_unified.
     {
       const auto* gi = wts->info(p + "mlp.gate_proj.weight");
       if (gi != nullptr && !gi->shape.empty()) { ly.ffn = (int)gi->shape[0]; }
@@ -1261,12 +1400,12 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
         && qtri(p + "per_layer_input_gate", ly.plg_w, ly.plg_s, ly.plg_b);
       // per_layer_projection: native 4-bit qmv/qmm (qmv handles K=hpli=256 <
       // block_size via the partial-block safe load) or f16 dense (A/B).
-      if (m->_ple_quant) {
+      if (mm->_ple_quant) {
         ok = ok && qtri(p + "per_layer_projection", ly.plp_w, ly.plp_s,
                         ly.plp_b);
       } else {
-        ly.plp_w = dequant_dense(p + "per_layer_projection", cfg.hidden,
-                                 cfg.hpli);
+        ly.plp_w = dequant_dense(p + "per_layer_projection", mcfg.hidden,
+                                 mcfg.hpli);
       }
     }
     if (ly.kv_source < 0) {
@@ -1275,14 +1414,14 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
               && (ly.k_eq_v
                   || qtri(p + "self_attn.v_proj", ly.vw, ly.vs, ly.vb));
       ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
-      if (ly.k_norm.empty()) { return nullptr; }
-      if (m->_qkv_fuse) { build_qkv(ly); }   // concat for the fused decode GEMV
+      if (ly.k_norm.empty()) { return false; }
+      if (mm->_qkv_fuse) { build_qkv(ly); }   // concat for the fused decode GEMV
     }
     }
     // layer_scalar [1] -> host float.
     {
       SharedBuffer ls = to_f16(p + "layer_scalar");
-      if (ls.empty()) { return nullptr; }
+      if (ls.empty()) { return false; }
       ly.layer_scalar =
           elt_to_f32_(*static_cast<const std::uint16_t*>(ls.contents()), bf16);
     }
@@ -1292,8 +1431,8 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     // weight router_norm_w = scale/sqrt(H) + per_expert_scale [E]), and the
     // routed experts (gate|up interleaved [E,2I,H] + down [E,H,I]) -- affine
     // (quantizer output) or raw-HF dense f16.
-    if (cfg.is_moe()) {
-      const int E = cfg.n_experts, I = cfg.moe_inner, Hh = cfg.hidden;
+    if (mcfg.is_moe()) {
+      const int E = mcfg.n_experts, I = mcfg.moe_inner, Hh = mcfg.hidden;
       ly.pre_ffn_ln_2   = to_f16(p + "pre_feedforward_layernorm_2.weight");
       ly.post_ffn_ln_1  = to_f16(p + "post_feedforward_layernorm_1.weight");
       ly.post_ffn_ln_2  = to_f16(p + "post_feedforward_layernorm_2.weight");
@@ -1324,7 +1463,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
           }
         }
       }
-      if (m->_dense) {
+      if (mm->_dense) {
         // Raw-HF: experts.gate_up_proj [E,2I,H] CONCATENATED -> interleave;
         // experts.down_proj [E,H,I] straight to f16.
         SharedBuffer gu = to_f16(p + "experts.gate_up_proj");
@@ -1341,7 +1480,7 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
                                    : p + "experts.switch_glu.";
         // Routed-expert quant width, read off the packed gate tensor PER
         // LAYER: OptiQ varies it across layers (gemma-4-26B-A4B is w8 on
-        // layers 0-4 + 29, w4 on the other 24), so the global cfg.quant_bits
+        // layers 0-4 + 29, w4 on the other 24), so the global mcfg.quant_bits
         // would mis-stride those layers' slabs. gate/up/down agree within a
         // layer, so one width per layer covers all three.
         {
@@ -1358,14 +1497,55 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
                                   ly.eguw, ly.egus, ly.egub) &&
                  qtri(ep + "down_proj", ly.edw2, ly.eds2, ly.edb2);
       }
-      if (!moe_ok) { return nullptr; }
+      if (!moe_ok) { return false; }
     }
     if (!ok || ly.in_ln.empty() || ly.post_attn_ln.empty() ||
         ly.pre_ffn_ln.empty() || ly.post_ffn_ln.empty() ||
         (has_ple && (ly.post_pli_ln.empty() || ly.plp_w.empty())) ||
         ly.q_norm.empty()) {
-      return nullptr;
+      return false;
     }
+    return true;
+  };
+  // ---- streaming, or not -------------------------------------------
+  //
+  // Streaming builds only a LEADING PREFIX here and rebuilds the rest
+  // inside each prefill. Refused for anything that will DECODE: the
+  // decode path walks the whole stack per token and only the prefix is
+  // resident, so serving it would re-read the checkpoint per token.
+  // Refused for MoE too -- a routed layer's experts are the bulk of it
+  // and nothing has measured that re-read.
+  mm->_stream_layers = mcfg.stream_layers && !mcfg.is_moe();
+  if (mcfg.stream_layers && mcfg.is_moe() && mc->session() != nullptr) {
+    mc->session()->warn(fmt(
+        "[gemma4] stream_layers is not supported on a MoE checkpoint; "
+        "loading the whole stack"));
+  }
+  mm->_pinned_layers = mcfg.n_layers;
+  if (mm->_stream_layers) {
+    mm->_pinned_layers = 0;
+    if (mcfg.pin_frac > 0.0) {
+      std::vector<std::string> pfx((std::size_t)mcfg.n_layers);
+      for (int L = 0; L < mcfg.n_layers; ++L) {
+        pfx[(std::size_t)L] = P + "layers." + std::to_string(L) + ".";
+      }
+      mm->_pinned_layers = stream_pin_count(*wts, pfx, mcfg.pin_frac);
+    }
+    if (mm->_pinned_layers < 0) { mm->_pinned_layers = 0; }
+    if (mm->_pinned_layers > mcfg.n_layers) {
+      mm->_pinned_layers = mcfg.n_layers;
+    }
+    // Held for the model's life: this is what rebuilds the tail.
+    mm->_lload = std::make_unique<LayerLoad>();
+    mm->_lload->build = build_one;
+    if (mc->session() != nullptr) {
+      mc->session()->log_normal(fmt(
+          "[gemma4] streaming layers: {} of {} pinned resident, the rest "
+          "built per prefill and freed", mm->_pinned_layers, mcfg.n_layers));
+    }
+  }
+  for (int L = 0; L < mm->_pinned_layers; ++L) {
+    if (!build_one(L)) { return nullptr; }
   }
 
   // Max MLP intermediate across layers (E2B double-wide shared layers), used to
@@ -1831,6 +2011,11 @@ MetalGemmaModel::encode_step_(ComputeEncoder& enc, ContextId cid, int kv_off,
                               const SharedBuffer* tok_src, std::size_t tok_off,
                               std::size_t pgtab_off)
 {
+  // A layer-streamed model has only its pinned prefix resident, so the
+  // per-token path cannot run the stack at all. Refused loudly and once
+  // rather than served with whatever happens to be built -- which would
+  // be a forward over default-constructed buffers, i.e. silence.
+  if (_stream_layers && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
   const int H = c.hidden, Hq = c.n_heads;
   const bool has_ple = c.hpli > 0;
@@ -3236,6 +3421,11 @@ MetalGemmaModel::encode_batched_step_(
     const std::vector<int>& kv_off_v,
     const std::vector<int>& rope_pos_v)
 {
+  // A layer-streamed model has only its pinned prefix resident, so the
+  // per-token path cannot run the stack at all. Refused loudly and once
+  // rather than served with whatever happens to be built -- which would
+  // be a forward over default-constructed buffers, i.e. silence.
+  if (_stream_layers && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
   const int H = c.hidden, Hq = c.n_heads, ffn = c.ffn_inner;
   const int hpli = c.hpli, nl = c.n_layers;
@@ -4797,6 +4987,9 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
 
     // ---- layer loop ------------------------------------------------
     const SharedBuffer* xcur = &x;     // current hidden buffer
+    // The one streamed layer currently built, or -1. See the release
+    // below the loop: an early exit must not leave it resident.
+    int streamed_live = -1;
     for (int L = 0; L < nl; ++L) {
       // KV-only intermediate chunk: the shared-KV tail (L >= first_shared)
       // writes no K/V and its residual/logits are discarded, so stop after
@@ -4815,6 +5008,27 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       // where a tap placed below would lose it.
       tap_(enc, L, *xcur, 0, rows);
       if (!want_logits && L >= first_shared) { break; }
+      // ---- streamed layers: built on entry, dropped on the way out ----
+      //
+      // Freeing the PREVIOUS one here rather than at the tail of the
+      // iteration is what makes this correct against the `break` above
+      // and the several `continue`s below: whichever way an iteration
+      // leaves, the next entry -- or the release after the loop -- is
+      // what lets go. At most one streamed layer is ever live.
+      if (_stream_layers && L >= _pinned_layers) {
+        if (streamed_live >= 0) {
+          free_layer_(streamed_live);
+          streamed_live = -1;
+        }
+        if (!build_layer_(L)) {
+          if (_mc->session() != nullptr) {
+            _mc->session()->error(fmt(
+                "[gemma4] streaming layer {} could not be rebuilt", L));
+          }
+          return {};
+        }
+        streamed_live = L;
+      }
       Layer& ly = _layers[L];
       const int Hkv = ly.n_kv;
       const int D = ly.head_dim, qd = Hq * D, kd = Hkv * D;
@@ -5688,6 +5902,12 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
       }
       }   // end dense (non-MoE) hybrid-FFN branch
     }
+    // However the loop left -- the shared-KV break, a per-variant
+    // continue, or the end -- the last streamed layer is still
+    // built. Dropping it here is what bounds a streaming forward to
+    // one layer instead of leaving the deepest one resident for the
+    // life of the model.
+    if (streamed_live >= 0) { free_layer_(streamed_live); }
 
     // Index n_layers is the residual AFTER THE FINAL NORM, not the raw
     // residual -- HF appends once more after `self.norm`. The logits path

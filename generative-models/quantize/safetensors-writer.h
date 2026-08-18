@@ -46,12 +46,41 @@ private:
     std::uint64_t             offset;   // within the shard data blob
     std::uint64_t             nbytes;
   };
+  // A tensor whose SIZE is not a multiple of 16, held back to the end of
+  // its shard. See the note on `deferred` below.
+  struct Deferred {
+    Entry                     e;
+    std::vector<std::uint8_t> bytes;
+  };
   struct Shard {
     std::string        tmp_path;
     int                fd = -1;         // temp data file (append)
     std::uint64_t      size = 0;        // running data bytes
     std::vector<Entry> entries;
+    // Tensors are packed CONTIGUOUSLY, so one whose size is not a
+    // multiple of 16 shifts every tensor after it off the 16-byte
+    // boundary the zero-copy read path needs -- and the offenders are
+    // small and numerous. MEASURED on a quantized Gemma-4 12B: one
+    // 2-byte `layer_scalar` per layer, 48 of them interleaved with the
+    // weights, plus four JSON asset blobs -- 53 tensors that between
+    // them misaligned 85% of the file.
+    //
+    // Writing them LAST fixes every tensor before them and costs
+    // nothing: the format says only that the byte ranges tile the blob,
+    // not in which order the header lists them. Gaps would be the
+    // obvious alternative and are not available -- the reference
+    // safetensors reader validates that the ranges are contiguous.
+    //
+    // Bounded, because this is the one place the writer stops being
+    // streaming: only a SMALL odd tensor is held in RAM. A large one is
+    // written in place and the tensors after it are misaligned, which
+    // the loader reports at read time.
+    std::vector<Deferred> deferred;
+    std::uint64_t         deferred_bytes = 0;
   };
+  // Per-tensor and per-shard ceilings on what `deferred` will hold.
+  static constexpr std::uint64_t kDeferMax      = 1ull << 20;   // 1 MB
+  static constexpr std::uint64_t kDeferTotalMax = 64ull << 20;  // 64 MB
 
   bool ensure_shard_();
   bool finalize_shard_(int idx, int total, std::string& out_name);

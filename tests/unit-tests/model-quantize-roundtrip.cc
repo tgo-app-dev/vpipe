@@ -233,6 +233,97 @@ TEST(model_quantize_roundtrip, writer_aligns_the_data_section)
   fs::remove_all(tmp);
 }
 
+// An aligned data section is not enough: tensors are packed CONTIGUOUSLY,
+// so one whose SIZE is not a multiple of 16 shifts every tensor after it
+// off the boundary, and those are copied too.
+//
+// MEASURED on a quantized Gemma-4 12B before the writer held them back:
+// one 2-byte `layer_scalar` per layer, 48 of them interleaved with the
+// weights, plus four JSON asset blobs -- 53 tensors that between them
+// misaligned 1181 of 1344. The section start was a clean 0 mod 16 the
+// whole time, which is what made the old warning read as a
+// contradiction.
+//
+// The fix is ordering, not padding, and the test pins BOTH halves of
+// that: every 16-multiple-sized tensor aligned, and the byte ranges
+// still tiling the blob with no gaps -- because the reference
+// safetensors reader validates contiguity, so a writer that "fixed"
+// alignment by leaving holes would produce files nothing else can read.
+TEST(model_quantize_roundtrip, writer_defers_odd_sized_tensors)
+{
+  namespace fs = std::filesystem;
+  auto mc = std::make_unique<MetalCompute>(nullptr);
+  if (!mc->valid()) { return; }
+
+  const fs::path dir = fs::temp_directory_path() / "vpipe-st-odd-test";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  std::vector<std::uint16_t> big(64, 0x3c00);      // 128 bytes, 16-multiple
+  const std::uint16_t        scalar = 0x3c00;      // 2 bytes, the offender
+  {
+    SafetensorsWriter wr(dir.string());
+    // Interleaved exactly as a real checkpoint has them.
+    for (int t = 0; t < 6; ++t) {
+      const std::string p = "block." + std::to_string(t) + ".";
+      ASSERT_TRUE(wr.add(p + "weight", "F16", {8, 8}, big.data(),
+                         big.size() * sizeof(std::uint16_t)));
+      ASSERT_TRUE(wr.add(p + "layer_scalar", "F16", {1}, &scalar, 2));
+    }
+    ASSERT_TRUE(wr.close());
+  }
+
+  fs::path shard;
+  for (const auto& de : fs::directory_iterator(dir)) {
+    if (de.path().extension() == ".safetensors") { shard = de.path(); }
+  }
+  ASSERT_TRUE(!shard.empty());
+
+  // Every WEIGHT maps; the 2-byte scalars are what pays for it.
+  auto wts = MetalLlamaWeights::open_model(dir.string());
+  ASSERT_TRUE(wts.has_value());
+  for (int t = 0; t < 6; ++t) {
+    const std::string nm = "block." + std::to_string(t) + ".weight";
+    ASSERT_TRUE(wts->has(nm));
+    SharedBuffer m = wts->load_mapped(nm, mc.get());
+    ASSERT_TRUE(!m.empty());
+    EXPECT_FALSE(m.is_owned());
+  }
+
+  // The bytes still tile the blob: sorted ranges start at 0, each begins
+  // where the last ended. A gap here is a file the reference reader
+  // rejects, which no amount of alignment makes up for.
+  {
+    std::ifstream f(shard.string(), std::ios::binary);
+    ASSERT_TRUE(f.good());
+    std::uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    std::string hdr((std::size_t)hlen, '\0');
+    f.read(hdr.data(), (std::streamsize)hlen);
+    // Ranges as [begin,end) pairs, pulled out of the header text.
+    std::vector<std::pair<long long, long long>> rs;
+    for (std::size_t i = hdr.find("\"data_offsets\":[");
+         i != std::string::npos;
+         i = hdr.find("\"data_offsets\":[", i + 1)) {
+      long long b = 0, e = 0;
+      if (std::sscanf(hdr.c_str() + i, "\"data_offsets\":[%lld,%lld]",
+                      &b, &e) == 2) {
+        rs.emplace_back(b, e);
+      }
+    }
+    EXPECT_TRUE(rs.size() == 12);
+    std::sort(rs.begin(), rs.end());
+    long long last = 0;
+    bool tiled = true;
+    for (const auto& r : rs) {
+      if (r.first != last) { tiled = false; }
+      last = r.second;
+    }
+    EXPECT_TRUE(tiled);
+  }
+  fs::remove_all(dir);
+}
+
 TEST(model_quantize_roundtrip, real_gdn_dequant_vs_source)
 {
   const char* srcdir = std::getenv("VPIPE_Q27_BF16");

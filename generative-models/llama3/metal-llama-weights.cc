@@ -503,22 +503,46 @@ MetalLlamaWeights::load_mapped(const std::string& name,
     // thrashing with 36 GB in the compressor, which is a long way from
     // the cause.
     //
-    // Per shard rather than per tensor because one data_start decides
-    // them all; the count of tensors would add nothing the alignment
-    // does not already say.
+    // Once per shard, and it has to name WHICH alignment failed.
+    //
+    // There are two, and only one of them is about the data section. A
+    // shard whose section start is misaligned copies everything; a shard
+    // whose section start is FINE can still copy most of itself, because
+    // tensors are packed contiguously and one whose size is not a
+    // multiple of 16 shifts every tensor after it. Reporting the section
+    // start alone then produces a message that contradicts itself --
+    // "not mappable ... starts at 69888 (0 mod 16)" -- and sends the
+    // reader looking at the wrong number. So say which it is, and for
+    // the per-tensor case count them.
     if ((goff & 0xF) != 0 && mc->session() != nullptr) {
       if (_shard_unmappable_said.size() < _shards.size()) {
         _shard_unmappable_said.resize(_shards.size(), false);
       }
       if (!_shard_unmappable_said[si]) {
         _shard_unmappable_said[si] = true;
-        mc->session()->warn(fmt(
-            "weights: shard {} is NOT zero-copy mappable -- its data "
-            "section starts at {} ({} mod 16, and a Metal buffer offset "
-            "must be 16-byte aligned), so every tensor in it is COPIED "
-            "into anonymous memory instead. Residency::Mapped is a no-op "
-            "for this shard; size the box for the copies",
-            si, sh.data_start, sh.data_start & 0xF));
+        if ((sh.data_start & 0xF) != 0) {
+          mc->session()->warn(fmt(
+              "weights: shard {} is NOT zero-copy mappable -- its data "
+              "section starts at {} ({} mod 16, and a Metal buffer offset "
+              "must be 16-byte aligned), so EVERY tensor in it is COPIED "
+              "into anonymous memory instead. Residency::Mapped is a "
+              "no-op for this shard; size the box for the copies",
+              si, sh.data_start, sh.data_start & 0xF));
+        } else {
+          std::size_t bad = 0, all = 0;
+          for (const auto& kv : _tensors) {
+            if (kv.second.shard != static_cast<int>(si)) { continue; }
+            ++all;
+            if (((sh.data_start + kv.second.offset) & 0xF) != 0) { ++bad; }
+          }
+          mc->session()->warn(fmt(
+              "weights: shard {} is only PARTLY zero-copy mappable -- its "
+              "data section is 16-byte aligned but {} of its {} tensors "
+              "are not, so those are COPIED into anonymous memory. A "
+              "tensor whose SIZE is not a multiple of 16 shifts every "
+              "tensor after it; writing those last is what avoids it",
+              si, bad, all));
+        }
       }
     }
     return load(name, mc);

@@ -67,6 +67,11 @@ public:
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
   std::vector<ResourceClaim> declare_resources() const override;
+
+  // Latch a `model-select` constant before the planning phase, so
+  // the claim above is made against the model this graph will
+  // actually run rather than against an empty hf_dir.
+  void apply_constant(unsigned iport, const FlexData& beat) override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -77,6 +82,15 @@ public:
   std::uint64_t      images_emitted()  const noexcept { return _images_emitted; }
 
 private:
+  // The arena the idle policy was last decided against, and the peers it
+  // was weighed with. Not a high-water mark: the policy follows the beat
+  // down as well as up. See revise_decode_arena_.
+  std::size_t              _arena_decided = 0;
+  // The last arena PUT ON THE BOOKS, so a restatement is logged once
+  // rather than on every beat of a fixed-size run.
+  std::size_t              _arena_stated  = 0;
+  std::vector<std::string> _idle_peers;
+
   std::string _hf_dir;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
   // "mage" (MageVAE) | "wan" (AutoencoderKLWan, the VIDEO one)
@@ -138,6 +152,10 @@ private:
   bool _quiet_reload  = false;   // reload logs at debug, not info
   void load_note_(const VpipeFormat& msg) const;
   void unload_vae_();
+  // Publish this beat's real arena and ratchet the idle policy.
+  void revise_decode_arena_(std::size_t bytes);
+  // The same, for an image decode, from its pixel size.
+  void publish_image_arena_(int px_w, int px_h);
   void reload_vae_();
 #endif
 };

@@ -116,6 +116,16 @@ public:
   // the same two directories its footprint query uses, so the
   // declaration and the estimate cannot disagree.
   std::vector<ResourceClaim> declare_resources() const override;
+
+  // Whether the encoder is phase-limited -- a decision, so it is taken
+  // in the second planning pass where the whole graph has declared and
+  // every stage gets the same answer. See Stage::decide_resources.
+  std::vector<ResourceClaim> decide_resources() const override;
+
+  // Latch a `model-select` constant before the planning phase, so
+  // the claim above is made against the model this graph will
+  // actually run rather than against an empty hf_dir.
+  void apply_constant(unsigned iport, const FlexData& beat) override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
@@ -241,6 +251,12 @@ private:
   void park_encoder_();
   void unload_encoder_();
   bool reload_encoder_();
+
+  // Encoder / DiT directories for this stage's model. Shared by both
+  // planning passes so they name the same checkpoints -- the decide
+  // pass refines a declaration keyed by path.
+  void resolve_component_dirs_(std::string* enc_out,
+                               std::string* dit_out) const;
 
   // Encode `text` (+ the cached reference image, for image-aware families) into
   // the family conditioning tensor; returns the bf16 buffer + sets `n_real`.

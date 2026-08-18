@@ -128,6 +128,11 @@ public:
   // -- the same two directories plan_streaming() sizes against.
   std::vector<ResourceClaim> declare_resources() const override;
 
+  // Latch a `model-select` constant before the planning phase, so
+  // the claim above is made against the model this graph will
+  // actually run rather than against an empty hf_dir.
+  void apply_constant(unsigned iport, const FlexData& beat) override;
+
 private:
   // Tell the manager what a STREAMING DiT actually keeps resident, which
   // is its pinned prefix rather than the whole checkpoint its files
@@ -235,6 +240,9 @@ private:
   bool load_flux2_dit_();
   // Free the FLUX.2 DiT if the pending gen_w x gen_h vae-decode won't fit the
   // current GPU working-set headroom alongside it. No-op otherwise / non-flux2.
+  // Put this image's decode arena on the books. See the definition:
+  // an edit graph has no config geometry to declare from.
+  void publish_decode_arena_(std::size_t peak) const;
   void free_flux2_dit_for_decode_(int gen_w, int gen_h);
   // Same, for the Krea-2 DiT (its ~7 GB of resident weights otherwise starve
   // the shared MetalKrea2Vae's 1024px decode); reloaded on the next prompt.

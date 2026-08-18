@@ -132,8 +132,13 @@ make_(const HiddenStateEncoderArgs& args)
     warn("could not open '" + args.dir + "'");
     return nullptr;
   }
-  auto model = MetalGemmaModel::load(ws, args.metal,
-                                     MetalGemmaModel::config_from(mc));
+  // The caller's streaming hint, passed through. Honoured only where the
+  // model supports it (load() refuses MoE and says so); a backbone that
+  // ignores it loads exactly as it did.
+  MetalGemmaModel::Config gcfg = MetalGemmaModel::config_from(mc);
+  gcfg.stream_layers = args.stream_layers;
+  gcfg.pin_frac      = args.pin_frac;
+  auto model = MetalGemmaModel::load(ws, args.metal, gcfg);
   if (!model) {
     warn("could not build the model from '" + args.dir + "'");
     return nullptr;

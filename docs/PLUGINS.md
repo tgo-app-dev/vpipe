@@ -577,7 +577,7 @@ method.
 ## Versioning
 
 - `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the plugin
-  contract version, currently **1**. The host loads a plugin only when the
+  contract version, currently **2**. The host loads a plugin only when the
   plugin's reported value **equals** the host's — strict equality, no
   backward compatibility.
 
@@ -604,6 +604,17 @@ method.
 
 The practical rule: **rebuild your plugin against the vpipe you deploy
 with.** A mismatch is reported and refused, not crashed.
+
+  With one trap in the way of actually doing it: `cmake --install`
+  **preserves each header's source mtime**, so a freshly installed
+  `plugin-abi.h` can look OLDER than the plugin object built minutes
+  earlier. The build then reports success, relinks, and quietly keeps the
+  stale object — the rebuild you just ran did nothing. `touch` the file
+  defining `VPIPE_PLUGIN_DEFINE` (or delete the build tree) if the loader
+  still reports the version you just moved away from. This is exactly the
+  case the strict-equality check catches; it is also why the check has to
+  exist, because the same stale object with an UNCHANGED version number
+  loads and calls through the wrong slot.
 
 ## Where your stages show up
 

@@ -19,6 +19,7 @@ set(LOCAL_SOURCES
   model-exec-registry.cc
   vae-model-registry.cc
   video-model-registry.cc
+  quantize-family-registry.cc
   hidden-state-encoder.cc
   model-loader.cc
   sampler.cc
@@ -109,6 +110,7 @@ set(LOCAL_HEADERS
   model-exec-registry.h
   vae-model-registry.h
   video-model-registry.h
+  quantize-family-registry.h
   model-loader.h
   sampler.h
   token-muxer.h

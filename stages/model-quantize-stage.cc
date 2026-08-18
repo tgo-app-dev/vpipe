@@ -799,6 +799,15 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
     return false;
   }
 
+  // ---- A REGISTERED out-of-tree family, before the built-in detection.
+  // Mirrors how VideoModelRegistry sits ahead of the built-in wan /
+  // minimax-h3 dispatch: this adds a path, it reroutes none. A family
+  // that does not claim `src_dir` costs one cheap probe.
+  if (const genai::QuantizableFamily* fam =
+          genai::QuantizeFamilyRegistry::get().claim_for(src_dir)) {
+    return quantize_registered_pipeline_(src_dir, *fam, out_dir, stop);
+  }
+
   // ---- Text-to-image (Krea-2 / FLUX.2): a multi-component pipeline. ----
   std::string t2i_family;
   // Which model the REFERENCE meant, from the record rather than from
@@ -1766,6 +1775,174 @@ ModelQuantizeStage::is_comfy_root_(const std::string& dir)
 // the repack file first and the quantized directory second, so one path
 // serves an original repack, a half-quantized chain output, and a fully
 // quantized one.
+bool
+ModelQuantizeStage::quantize_registered_pipeline_(
+    const std::string& root, const genai::QuantizableFamily& fam,
+    const std::string& out_dir, const std::function<bool()>& stop)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const std::string family(fam.tag());
+
+  // Pick the component `target` names. Case-insensitive, and an empty
+  // target takes the family's FIRST -- which is why the interface says
+  // to order the list with the likely one first.
+  std::string want;
+  for (char c : _target) {
+    want.push_back((char)std::tolower((unsigned char)c));
+  }
+  const std::vector<genai::QuantizableComponent> comps = fam.components();
+  const genai::QuantizableComponent* comp = nullptr;
+  for (const auto& c : comps) {
+    std::string t;
+    for (char ch : c.target) {
+      t.push_back((char)std::tolower((unsigned char)ch));
+    }
+    if (want.empty() || t == want) { comp = &c; break; }
+  }
+  if (comp == nullptr) {
+    std::string have;
+    for (const auto& c : comps) {
+      if (!have.empty()) { have += " | "; }
+      have += c.target;
+    }
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): '{}' is not a {} component (want {})",
+        this->id(), _target, family, have.empty() ? "<none>" : have));
+    return false;
+  }
+  if (comp->role.empty()) {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): {} component '{}' names no role subdir",
+        this->id(), family, comp->target));
+    return false;
+  }
+
+  // Resolve what to read. Either the published repack FILE, or -- when a
+  // previous pass already quantized this component -- the directory
+  // checkpoint it left in the same place. Accepting both is what lets a
+  // chain quantize the components in any order.
+  std::string tgt_src = genai::comfy::resolve_component(
+      root, comp->role, comp->meta_key, comp->prefer);
+  if (tgt_src.empty() &&
+      fs::exists(fs::path(root) / comp->role / "config.json", ec)) {
+    tgt_src = (fs::path(root) / comp->role).string();
+  }
+  if (tgt_src.empty()) {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): '{}' has no readable {} component in "
+        "'{}/' (looked for `{}` in the safetensors metadata, preferring {})",
+        this->id(), root, family, comp->role, comp->meta_key,
+        comp->prefer.empty() ? "any" : comp->prefer.front()));
+    return false;
+  }
+  if (_skip_existing &&
+      fs::exists(fs::path(out_dir) / comp->role / "config.json", ec)) {
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): output '{}' already has a quantized {}; "
+        "skipping", this->id(), out_dir, comp->role));
+    return true;
+  }
+
+  session()->info(fmt(
+      "ModelQuantizeStage('{}'): {} repack '{}' -> '{}' (quantizing {}, "
+      "copying the other components)", this->id(), family, root, out_dir,
+      comp->role));
+
+  // 1. Assemble the self-contained output. Hard-linked where the
+  //    destination is on the same device, so the components this pass
+  //    does not touch cost no bytes -- which is what makes chaining a
+  //    second component affordable.
+  fs::create_directories(out_dir, ec);
+  {
+    std::vector<fs::path> others;
+    std::size_t total = 0;
+    for (const auto& e : fs::directory_iterator(root, ec)) {
+      if (e.path().filename().string() == comp->role) { continue; }
+      others.push_back(e.path());
+      total += count_files_(e.path());
+    }
+    UiProgress bar = session()->open_progress("copy components");
+    std::size_t done = 0;
+    for (const auto& c : others) {
+      if (!link_or_copy_tree_(c, fs::path(out_dir) / c.filename(), ec, stop,
+                              [&] {
+                                ++done;
+                                bar.update(done, total);
+                              })) {
+        session()->info(fmt(
+            "ModelQuantizeStage('{}'): stopped while assembling '{}'",
+            this->id(), out_dir));
+        return false;
+      }
+    }
+    bar.finish();
+  }
+
+  // 2. Quantize the component into out_dir/<role>, with the family's own
+  //    scope. The stage's `quant_exclude` is APPENDED to the family's
+  //    rather than replacing it: the family's entries are architectural
+  //    facts about its own weights, not defaults for a caller to drop.
+  metal_compute::MetalCompute* mc = session()->services()->metal_compute();
+  if (mc == nullptr) { return false; }
+  genai::QuantizeOptions opt;
+  opt.bits              = _bits;
+  opt.group             = _group_size;
+  opt.quant_embeddings  = false;
+  opt.quant_scope       = comp->scope;
+  opt.quant_all_in_scope = comp->all_in_scope;
+  opt.component_tag     = comp->component_tag;
+  {
+    auto add_csv = [&opt](const std::string& csv) {
+      std::string cur;
+      auto flush = [&]() {
+        const std::size_t a = cur.find_first_not_of(" \t");
+        const std::size_t b = cur.find_last_not_of(" \t");
+        if (a != std::string::npos) {
+          opt.quant_exclude.push_back(cur.substr(a, b - a + 1));
+        }
+        cur.clear();
+      };
+      for (char c : csv) {
+        if (c == ',') { flush(); } else { cur.push_back(c); }
+      }
+      flush();
+    };
+    add_csv(comp->exclude);
+    add_csv(_quant_exclude);
+  }
+
+  const std::string tgt_out = (fs::path(out_dir) / comp->role).string();
+  genai::ModelQuantizer mq(mc);
+  std::string err;
+  if (!mq.run(tgt_src, tgt_out, opt, &err, stop)) {
+    if (stop()) {
+      session()->info(fmt(
+          "ModelQuantizeStage('{}'): {} quantize stopped; '{}' is incomplete "
+          "-- remove it before reuse", this->id(), family, tgt_out));
+    } else {
+      session()->warn(fmt("ModelQuantizeStage('{}'): {} {}: {}", this->id(),
+                          family, comp->role, err));
+    }
+    return false;
+  }
+
+  session()->log_normal(fmt(
+      "ModelQuantizeStage('{}'): quantized {} {} '{}' -> self-contained "
+      "'{}' ({}-bit g{}{})", this->id(), family, comp->role, root, out_dir,
+      _bits, _group_size,
+      comp->scope.empty() ? "" : (", scope '" + comp->scope + "'")));
+
+  // 3. Register as a full model root, exactly as the built-in paths do.
+  const bool explicit_path =
+      _output_name[0] == '/' ||
+      _output_name.rfind("./", 0) == 0 || _output_name.rfind("../", 0) == 0;
+  if (!explicit_path) {
+    register_output_(_output_name, out_dir, family, _bits);
+  }
+  return true;
+}
+
 bool
 ModelQuantizeStage::quantize_comfy_pipeline_(
     const std::string& root, const std::string& family,

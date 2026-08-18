@@ -101,6 +101,22 @@ SafetensorsWriter::add(const std::string& name, const std::string& dtype,
   e.shape  = shape;
   e.offset = cur.size;
   e.nbytes = nbytes;
+
+  // A tensor whose size is not a multiple of 16 shifts EVERY tensor
+  // after it off the boundary the zero-copy read path needs, so hold it
+  // back to the end of the shard (Shard::deferred). Its own offset is
+  // assigned in finalize_shard_.
+  if (nbytes > 0 && (nbytes % 16) != 0 && nbytes <= kDeferMax &&
+      cur.deferred_bytes + nbytes <= kDeferTotalMax) {
+    Deferred d;
+    d.e = std::move(e);
+    d.bytes.assign(static_cast<const std::uint8_t*>(data),
+                   static_cast<const std::uint8_t*>(data) + nbytes);
+    cur.deferred_bytes += nbytes;
+    cur.deferred.push_back(std::move(d));
+    return true;
+  }
+
   if (nbytes > 0 && !write_all_(cur.fd, data, nbytes)) { return false; }
   cur.size += nbytes;
   cur.entries.push_back(std::move(e));
@@ -111,6 +127,28 @@ bool
 SafetensorsWriter::finalize_shard_(int idx, int total, std::string& out_name)
 {
   Shard& sh = _shards[static_cast<std::size_t>(idx)];
+
+  // Flush the held-back odd-sized tensors, in order, at the END of the
+  // blob -- after which every tensor written in place sits on a 16-byte
+  // boundary and these few do not. The append has to reopen the temp
+  // file when this shard was ROLLED, since add() closes a full shard's
+  // fd the moment it rolls.
+  if (!sh.deferred.empty()) {
+    if (sh.fd < 0) {
+      sh.fd = ::open(sh.tmp_path.c_str(), O_WRONLY | O_APPEND);
+      if (sh.fd < 0) { return false; }
+    }
+    for (auto& d : sh.deferred) {
+      d.e.offset = sh.size;
+      if (!write_all_(sh.fd, d.bytes.data(), d.bytes.size())) {
+        return false;
+      }
+      sh.size += d.e.nbytes;
+      sh.entries.push_back(std::move(d.e));
+    }
+    sh.deferred.clear();
+    sh.deferred_bytes = 0;
+  }
 
   // Build the JSON header (insertion order; the reader is order-agnostic).
   std::string hdr = "{";

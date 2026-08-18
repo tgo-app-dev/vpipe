@@ -86,6 +86,22 @@ ModelSelectStage::resolved_beat() const
   return fd;
 }
 
+std::optional<FlexData>
+ModelSelectStage::constant_output(unsigned oport) const
+{
+  // The beat is a pure function of config and this source has no
+  // iports, so it is settled at construction -- which is what lets the
+  // consumers' declare_resources() see the model choice at all. See
+  // Stage::constant_output.
+  //
+  // Nothing when the config is missing: fail_config has already refused
+  // the stage, and handing peers an empty hf_dir would have them size
+  // the box against a checkpoint that resolves to 0 bytes, which is a
+  // worse answer than the silence they get today.
+  if (oport != 0 || _hf_dir.empty()) { return std::nullopt; }
+  return resolved_beat();
+}
+
 void
 ModelSelectStage::reset_run_state()
 {

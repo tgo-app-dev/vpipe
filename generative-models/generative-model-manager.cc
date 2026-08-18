@@ -172,7 +172,8 @@ GenerativeModelManager::holds_weights(const string& dir) const
 
 void
 GenerativeModelManager::declare_weights(const string& dir,
-                                        std::size_t   expected_bytes)
+                                        std::size_t   expected_bytes,
+                                        const string& phase)
 {
   if (dir.empty()) { return; }
   const string key = canonicalize_(session(), dir);
@@ -181,6 +182,36 @@ GenerativeModelManager::declare_weights(const string& dir,
   // Two stages naming one checkpoint declare it once, at the larger
   // estimate -- they are describing the same bytes, not two copies.
   if (expected_bytes > e) { e = expected_bytes; }
+  // The WIDER lifetime wins when two stages disagree. A checkpoint one
+  // stage will drop after conditioning and another holds all run is
+  // held all run; believing the shorter claim would subtract bytes that
+  // are still there. First declaration wins only in that it seeds the
+  // entry -- an unphased claim overwrites a phased one, never the
+  // reverse.
+  auto [it, fresh] = _phase.try_emplace(key, phase);
+  if (!fresh && phase.empty()) { it->second.clear(); }
+}
+
+void
+GenerativeModelManager::set_declaration_phase(const string& dir,
+                                              const string& phase)
+{
+  if (dir.empty() || phase.empty()) { return; }
+  const string key = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_ws_mu);
+  if (_declared.find(key) == _declared.end()) { return; }
+  auto [it, fresh] = _phase.try_emplace(key, phase);
+  if (fresh) { return; }
+  // An EMPTY entry is what the declare pass leaves: "not yet decided",
+  // not a competing answer. Refining it is the whole point of this
+  // call, so it must not be read as a disagreement -- doing so silently
+  // discarded every refinement, and the arithmetic still looked
+  // plausible because it fell back to the safe, conservative total.
+  if (it->second.empty()) { it->second = phase; return; }
+  // A different phase already decided: two stages disagree about when
+  // this checkpoint is held, so it is held throughout. Persistent is
+  // the only reading consistent with both, and it is the safe one.
+  if (it->second != phase) { it->second.clear(); }
 }
 
 void
@@ -200,8 +231,47 @@ GenerativeModelManager::revise_declaration(const string& dir,
 void
 GenerativeModelManager::clear_declarations()
 {
+  // AUDIT the launch that is ending, before its state goes.
+  //
+  // A phase declaration is a promise that these bytes are gone before
+  // the peers that sized against them run, and a DiT has already spent
+  // an irreversible streaming decision on it. Nothing else in the
+  // system can falsify that promise: if the encoder is never dropped,
+  // the run simply thrashes, and no line in the log connects the thrash
+  // to the claim that caused it. So the promise is checked here -- one
+  // launch late, which is the earliest moment the whole run is over and
+  // still cheap.
+  //
+  // Warned, never silently tolerated, for the same reason an unplanned
+  // ResourceClaim is warned about: a wrong lifetime does not fail as a
+  // wrong answer, it fails as non-deterministic sizing that no test
+  // reliably catches.
+  {
+    std::vector<string> broken;
+    {
+      lock_guard<mutex> lk(_ws_mu);
+      for (const auto& [dir, phase] : _phase) {
+        if (phase.empty()) { continue; }
+        if (_released.count(dir) != 0) { continue; }
+        broken.push_back(dir);
+      }
+    }
+    for (const string& dir : broken) {
+      if (session() == nullptr) { break; }
+      session()->warn(fmt(
+          "GenerativeModelManager: '{}' was declared for phase-limited use "
+          "but never reported being released; peers that sized against that "
+          "promise were given memory this run never freed", dir));
+    }
+  }
+
   lock_guard<mutex> lk(_ws_mu);
   _declared.clear();
+  // Same scope, same reason as the declarations they qualify: a phase
+  // is stated per launch from the owning stage's policy, and a graph
+  // without that stage must not inherit its claim.
+  _phase.clear();
+  _released.clear();
   // Cleared with the declarations, and for the same reason: it is a fact
   // about THIS run's sizing. A relaunch at a different resolution, or
   // with a peer removed from the graph, may not stream at all, and a
@@ -224,6 +294,71 @@ GenerativeModelManager::any_streaming() const
 {
   lock_guard<mutex> lk(_ws_mu);
   return !_streaming.empty();
+}
+
+void
+GenerativeModelManager::declare_scratch(const string& label, size_t bytes,
+                                        const string& phase)
+{
+  if (label.empty() || bytes == 0) { return; }
+  lock_guard<mutex> lk(_ws_mu);
+  ScratchClaim& c = _scratch[label];
+  if (bytes > c.bytes) { c.bytes = bytes; }
+  // Same widening rule as a weight declaration: two stages disagreeing
+  // about when an arena is live means it is live throughout.
+  if (c.phase.empty() && c.bytes == bytes) { c.phase = phase; }
+  else if (c.phase != phase) { c.phase.clear(); }
+}
+
+size_t
+GenerativeModelManager::scratch_bytes(const string& phase) const
+{
+  lock_guard<mutex> lk(_ws_mu);
+  size_t unphased = 0;
+  unordered_map<string, size_t> by_phase;
+  for (const auto& [label, c] : _scratch) {
+    (void)label;
+    if (c.phase.empty()) { unphased += c.bytes; continue; }
+    by_phase[c.phase] += c.bytes;
+  }
+  if (!phase.empty()) {
+    auto it = by_phase.find(phase);
+    return unphased + (it == by_phase.end() ? 0 : it->second);
+  }
+  size_t widest = 0;
+  for (const auto& [p, b] : by_phase) {
+    (void)p;
+    if (b > widest) { widest = b; }
+  }
+  return unphased + widest;
+}
+
+void
+GenerativeModelManager::revise_scratch(const string& label, size_t bytes)
+{
+  if (label.empty()) { return; }
+  lock_guard<mutex> lk(_ws_mu);
+  auto it = _scratch.find(label);
+  if (it == _scratch.end()) { return; }   // never declared: nothing to fix
+  // SET, not max: this is the arena in flight, and a ledger that only
+  // ever grew would describe the largest beat of the run forever.
+  it->second.bytes = bytes;
+}
+
+void
+GenerativeModelManager::clear_scratch()
+{
+  lock_guard<mutex> lk(_ws_mu);
+  _scratch.clear();
+}
+
+void
+GenerativeModelManager::note_phase_released(const string& dir)
+{
+  if (dir.empty()) { return; }
+  const string key = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_ws_mu);
+  _released.insert(key);
 }
 
 size_t
@@ -259,8 +394,12 @@ GenerativeModelManager::accounts_for(const string& dir) const
   return false;
 }
 
-std::size_t
-GenerativeModelManager::resident_weight_bytes() const
+// Bytes per canonical directory: what each checkpoint costs right now,
+// counting a declared one at its estimate while its load is in flight.
+// Shared by resident_weight_bytes() and phase_footprint(), which differ
+// only in how they add the result up.
+std::unordered_map<string, std::size_t>
+GenerativeModelManager::per_dir_bytes_() const
 {
   // Snapshot under the lock, measure outside it -- stats() takes each
   // set's own mutex and holding this one across that would put the
@@ -292,9 +431,55 @@ GenerativeModelManager::resident_weight_bytes() const
     std::size_t& have = per_dir[dir];
     if (want > have) { have = want; }
   }
+  return per_dir;
+}
+
+std::size_t
+GenerativeModelManager::resident_weight_bytes() const
+{
+  const auto per_dir = per_dir_bytes_();
   std::size_t total = 0;
   for (const auto& [dir, b] : per_dir) { (void)dir; total += b; }
   return total;
+}
+
+std::size_t
+GenerativeModelManager::phase_footprint(const string& phase) const
+{
+  const auto per_dir = per_dir_bytes_();
+  std::unordered_map<string, string> phase_of;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    phase_of = _phase;
+  }
+
+  std::size_t persistent = 0;                 // held for the whole run
+  std::unordered_map<string, std::size_t> by_phase;
+  for (const auto& [dir, b] : per_dir) {
+    auto it = phase_of.find(dir);
+    // Undeclared, or declared without a phase: it is there the whole
+    // time. Anything this function does not KNOW to be phased has to
+    // land here, because the alternative is dropping real bytes from
+    // somebody's estimate.
+    if (it == phase_of.end() || it->second.empty()) {
+      persistent += b;
+      continue;
+    }
+    by_phase[it->second] += b;
+  }
+
+  if (!phase.empty()) {
+    auto it = by_phase.find(phase);
+    return persistent + (it == by_phase.end() ? 0 : it->second);
+  }
+  // No phase named: the peak the box must survive, which is persistent
+  // plus whichever single phase is largest.
+  std::size_t widest = 0;
+  for (const auto& [p, b] : by_phase) {
+    (void)p;
+    if (b > widest) { widest = b; }
+  }
+  return persistent + widest;
 }
 
 std::size_t

@@ -19,6 +19,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -734,6 +735,58 @@ PipelineRuntime::launch_()
     if (missing) { return false; }
   }
 
+  // Phase 3.6: constant folding.
+  //
+  // A source whose beat is fixed by configuration is knowable before
+  // anything runs, so its consumers can have it before they are asked
+  // what they intend to acquire. Without this, a graph that names its
+  // model once in a `model-select` source leaves every model-holding
+  // stage with an empty hf_dir at declare_resources() time, and the
+  // planning phase below plans nothing at all -- see
+  // Stage::constant_output for the full argument.
+  //
+  // Ordering: strictly before Phase 4, because the whole point is that
+  // declare_resources() has already seen these.
+  //
+  // Iterated to a fixpoint rather than done in one sweep, so a stage
+  // that becomes constant only AFTER receiving a constant propagates
+  // too. `applied` keys each delivery by edge, which both makes
+  // apply_constant fire at most once per iport and bounds the loop:
+  // every pass either delivers something new or is the last. Cycles
+  // need no special case -- a stage on a feedback edge cannot answer
+  // constant_output, so the constant subgraph is acyclic by
+  // construction -- but the pass count is bounded by the edge count
+  // regardless, so a stage that wrongly reports a varying output
+  // cannot spin here.
+  {
+    set<pair<Stage*, unsigned>> applied;
+    size_t                      folded = 0;
+    for (bool progress = true; progress;) {
+      progress = false;
+      for (size_t si = 0; si < stages.size(); ++si) {
+        Stage* s = stages[si];
+        for (unsigned i = 0; i < s->num_iports(); ++i) {
+          if (applied.count({s, i}) != 0) { continue; }
+          Endpoint src = iport_src[si][i];
+          if (!src.v) { continue; }          // unwired optional iport
+          Stage* prod = dynamic_cast<Stage*>(src.v);
+          if (prod == nullptr) { continue; }
+          std::optional<FlexData> k = prod->constant_output(src.p);
+          if (!k) { continue; }
+          s->apply_constant(i, *k);
+          applied.insert({s, i});
+          ++folded;
+          progress = true;
+        }
+      }
+    }
+    if (folded > 0) {
+      session()->log_debug(fmt(
+          "constant-fold: delivered {} constant beat(s) to consumers "
+          "before planning", folded));
+    }
+  }
+
   // Phase 4: resource planning, then spawn drivers.
   //
   // This has to happen BEFORE any driver starts, because initialize() is
@@ -772,7 +825,26 @@ PipelineRuntime::launch_()
               _pipeline->id(), s->id(), c.kind));
           continue;
         }
-        p->claim(session(), c.key);
+        p->claim(session(), c.key, c.phase);
+      }
+    }
+    // Second sweep: decisions, once every stage's declaration is on the
+    // record. Separate from the first for one reason -- a stage that
+    // sizes the box must not get a different answer depending on where
+    // the flattener put it. See Stage::decide_resources.
+    for (Stage* s : stages) {
+      for (const ResourceClaim& c : s->decide_resources()) {
+        if (c.key.empty()) { continue; }
+        ResourcePlanner* p =
+          ResourcePlannerRegistry::get().find(c.kind);
+        if (p == nullptr) {
+          session()->warn(fmt(
+              "PipelineRuntime: {} stage '{}' decides resource kind '{}' "
+              "with no registered planner; it will go unaccounted",
+              _pipeline->id(), s->id(), c.kind));
+          continue;
+        }
+        p->decide(session(), c.key, c.phase);
       }
     }
     for (ResourcePlanner* p : planners) { p->end_plan(session()); }

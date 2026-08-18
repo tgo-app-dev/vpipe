@@ -148,6 +148,24 @@ struct HiddenStateEncoderArgs {
   // say. Only consulted by open(); create() is already told.
   std::string                  arch;
 
+  // Stream the backbone's layers instead of holding them, for a caller
+  // that only ever PREFILLS -- which every consumer of this interface
+  // does, by construction: it reads a stack of hidden states out of one
+  // forward and never decodes.
+  //
+  // A 12B text encoder at w8 is 15.3 GB resident and peaks at 16.14 GB
+  // loading, which on a 16 GB box is the machine; streamed it is one
+  // layer plus the pinned prefix. The cost is re-reading the stack per
+  // prefill, which for one caption is a fraction of what the diffusion
+  // model beside it spends per STEP.
+  //
+  // `pin_frac` sizes that prefix as a fraction of RAM; 0 is pure
+  // streaming. Both are HINTS -- a backbone with no streaming support
+  // ignores them and loads as it always did, because refusing here
+  // would make a memory optimisation into a compatibility break.
+  bool                         stream_layers = false;
+  double                       pin_frac      = 0.0;
+
   // Where a factory reports WHY it could not open the checkpoint.
   //
   // Not redundant with `session`: an offline tool or a plugin test has

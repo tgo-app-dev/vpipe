@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -166,9 +167,84 @@ public:
   // resolve to anything, or that this run will not actually load, are
   // harmless -- an over-estimate makes a stage more cautious, which is
   // the safe error. Default: nothing claimed.
+  // DESCRIBE ONLY. This runs while the picture is still being
+  // assembled, so it must not read the manager, size the box, or
+  // resolve a policy -- a stage visited first would see an empty graph
+  // and one visited last would see all of it, and the same graph would
+  // decide differently depending on the order the flattener happened to
+  // emit. Anything conditional belongs in decide_resources() below.
   virtual std::vector<ResourceClaim> declare_resources() const
   {
     return {};
+  }
+
+  // Refine those claims once EVERY stage has declared.
+  //
+  // This is where a decision goes. By the time it runs the whole
+  // graph's intent is on the record, so every stage asking "does this
+  // box fit what we are about to load" gets the SAME answer, whatever
+  // order they are visited in -- which is the property declare_resources
+  // cannot offer and the reason the two are separate.
+  //
+  // Return claims whose `phase` refines what was declared; the key must
+  // name something already declared, and only the phase is read. The
+  // refinements are BUFFERED and applied together after every stage has
+  // been asked, so one stage's refinement can never be visible to
+  // another's decision. That is what keeps this pass order-free too:
+  // pass 1 writes and does not read, pass 2 reads and does not write.
+  //
+  // Default: nothing to refine.
+  virtual std::vector<ResourceClaim> decide_resources() const
+  {
+    return {};
+  }
+
+  // CONSTANT OUTPUTS -- the beat this stage will emit on `oport` when
+  // that beat is invariant for the whole run and already determined by
+  // configuration, so it can be known before anything executes.
+  //
+  // `model-select` is the motivating case: it is a source (no iports)
+  // whose single beat is a pure function of its `hf_dir` config, and
+  // four downstream stages take their model choice from it. Those
+  // stages therefore had an EMPTY hf_dir at declare_resources() time
+  // and every one of them declared nothing -- so on the shipped
+  // MiniMax-H3 graph the resource-planning phase ran, bracketed every
+  // planner, and put ZERO bytes on the manager's books. The whole
+  // mechanism was inert in exactly the pipelines it exists for.
+  //
+  // Folding is an ANALYSIS, not a rewrite: the constant is delivered to
+  // consumers before planning, and the stage still emits the beat at
+  // run time exactly as before. In a compiler, propagating a constant
+  // lets you delete the instruction that computed it; here it does not,
+  // because a beat is both a value and an EVENT -- its arrival is what
+  // releases the consumer's process(). Removing the edge would change
+  // control flow, so nothing about the data path changes.
+  //
+  // Contract: return a value only if this stage would emit exactly this
+  // beat on this oport, for every beat, for the life of the run. A
+  // stage whose output depends on an iport, on wall clock, or on
+  // anything it discovers while running is NOT constant and must
+  // return nullopt -- a wrong answer here is read as configuration by
+  // stages that then size the box against it.
+  virtual std::optional<FlexData> constant_output(unsigned /*oport*/) const
+  {
+    return std::nullopt;
+  }
+
+  // Receive a constant an upstream source WILL emit on `iport`,
+  // delivered before the resource-planning phase and before any
+  // driver starts. Implement it on any stage that latches something
+  // from an iport which later decisions -- declare_resources() above,
+  // most of all -- need to have seen.
+  //
+  // Called at most once per iport per launch, from the launching
+  // thread with no drivers running, so an implementation needs no
+  // locking. It must be pure bookkeeping: the pipeline is not yet
+  // assembled, so do NOT load, allocate or touch a device here. The
+  // runtime latch that reads the same beat at run time stays in place
+  // and must remain idempotent with this.
+  virtual void apply_constant(unsigned /*iport*/, const FlexData& /*beat*/)
+  {
   }
 
   // Per-port clock group. Ports with the same clock_group on the

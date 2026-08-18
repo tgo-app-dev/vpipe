@@ -223,7 +223,30 @@ public:
   // So the estimate stands unless the model itself says otherwise --
   // see revise_declaration(), which the streaming DiTs use to report
   // the much smaller amount they actually keep.
-  void declare_weights(const std::string& dir, std::size_t expected_bytes);
+  // `phase` names a lifetime this checkpoint is held for (see
+  // ResourceClaim::phase and model_memory's vocabulary). Empty -- the
+  // default -- means held for the whole run, which is what every
+  // ordinary declaration says. Two dirs in DIFFERENT non-empty phases
+  // assert they are never resident together, which is what lets
+  // phase_footprint() take a maximum instead of a sum.
+  //
+  // A dir declared twice with different phases keeps the WIDER answer
+  // (persistent wins over any phase), because two stages disagreeing
+  // about a checkpoint's lifetime is not a reason to believe the
+  // shorter one.
+  void declare_weights(const std::string& dir, std::size_t expected_bytes,
+                       const std::string& phase = std::string());
+
+  // Set the phase of an ALREADY-declared checkpoint. The second half of
+  // the planning split: declarations describe, this decides. A dir that
+  // was never declared is ignored -- there is nothing to refine, and the
+  // declare pass dropped it for a reason (usually an absent component).
+  //
+  // Two stages naming DIFFERENT phases for one checkpoint fall back to
+  // persistent. They disagree about when it is held, and the only
+  // answer consistent with both is that it is held throughout.
+  void set_declaration_phase(const std::string& dir,
+                             const std::string& phase);
 
   // Correct a declaration downward (or upward) once the model knows what
   // it really holds. The streaming DiTs are the case that needs it: a
@@ -268,6 +291,73 @@ public:
   // Did any model in this run decide to stream? The question a stage
   // asks before choosing to keep something resident.
   bool any_streaming() const;
+
+  // ---- phased footprint ----------------------------------------------
+  //
+  // What a stage running in `phase` has to coexist with: everything
+  // declared for the whole run, plus only the claims of its OWN phase.
+  // Weights belonging to another phase are excluded, which is the whole
+  // value of declaring one.
+  //
+  // With an EMPTY phase this is the box-level peak instead: persistent
+  // plus the LARGEST single phase. That is the right answer for a stage
+  // that does not know when it runs, and it is what the accounting says
+  // the machine must survive.
+  //
+  // NOT the same as resident_weight_bytes(), and the difference is the
+  // point. That one sums everything -- the no-release worst case -- and
+  // remains what bounded() asks, deliberately: a stage deciding WHETHER
+  // to release must not consult a number that already assumes it did.
+  // Reading the phased figure there would make the assumption prove
+  // itself.
+  std::size_t phase_footprint(const std::string& phase) const;
+
+  // ---- activation scratch ---------------------------------------------
+  //
+  // Memory a stage ALLOCATES to run, as opposed to the weights it holds.
+  // Declared before anything runs, phased like weights (an arena exists
+  // only while its stage is running), and kept in its own ledger so
+  // resident_weight_bytes() keeps meaning what it says.
+  //
+  // Two claims under one label are the same arena named twice and count
+  // ONCE, at the larger -- the same rule declare_weights uses for a
+  // checkpoint two stages both name.
+  void declare_scratch(const std::string& label, std::size_t bytes,
+                       const std::string& phase);
+
+  // Declared scratch for `phase`; with an empty phase, the widest single
+  // phase plus anything unphased -- the peak rule weights use.
+  std::size_t scratch_bytes(const std::string& phase) const;
+
+  // Correct a declared arena to its real size.
+  //
+  // An arena's size is a function of the BEAT, not of configuration: a
+  // video decode's transient scales with the pixel frame count, which
+  // is the VAE's expansion of the latent, and an image EDIT's geometry
+  // comes from the reference image and is in no config at all. So the
+  // plan declares what it can compute, or model_memory::kUnknownArena
+  // when it can compute nothing, and this supplies the truth.
+  //
+  // Refuses to CREATE, exactly as revise_declaration does for weights.
+  // The plan stays authoritative about what exists and runtime only
+  // supplies magnitudes -- which is also what makes a mistyped label a
+  // no-op rather than a phantom entry nobody planned for.
+  void revise_scratch(const std::string& label, std::size_t bytes);
+
+  // Drop every scratch declaration, at the start of each launch.
+  void clear_scratch();
+
+  // A stage reporting that it has actually let go of `dir` -- the
+  // release its phase declaration promised.
+  //
+  // The promise is otherwise unfalsifiable, and it is load-bearing: a
+  // peer took an IRREVERSIBLE streaming decision on the strength of it.
+  // So a phase-declared checkpoint that is never released has the run
+  // sized against memory that was never freed, and the symptom is
+  // thrash with no line in the log connecting it to a cause. Recording
+  // the release lets clear_declarations() say so at the end of the run;
+  // see the audit there.
+  void note_phase_released(const std::string& dir);
 
   // ---- parking -------------------------------------------------------
   //
@@ -413,6 +503,13 @@ private:
   std::shared_ptr<void> store_shared_(const std::string&           key,
                                       const std::shared_ptr<void>& v);
 
+  // Bytes per canonical checkpoint dir -- live sets plus declarations,
+  // each counted at max(held, estimate). The one computation behind
+  // both resident_weight_bytes() and phase_footprint(), so the two can
+  // never disagree about what a checkpoint costs, only about which ones
+  // to add together.
+  std::unordered_map<std::string, std::size_t> per_dir_bytes_() const;
+
   mutable std::mutex                                          _shared_mu;
   std::unordered_map<std::string, std::weak_ptr<void>>        _shared;
   mutable std::mutex                                          _ws_mu;
@@ -421,6 +518,13 @@ private:
   std::unordered_map<std::string, std::size_t>                _declared;
   // canonical dirs a model decided to stream; see note_streaming().
   std::unordered_set<std::string>                             _streaming;
+  // canonical dir -> phase it was declared for ("" = whole run).
+  std::unordered_map<std::string, std::string>                _phase;
+  // canonical dirs whose owner reported the release its phase promised.
+  std::unordered_set<std::string>                             _released;
+  // label -> {bytes, phase}, for declared activation scratch.
+  struct ScratchClaim { std::size_t bytes = 0; std::string phase; };
+  std::unordered_map<std::string, ScratchClaim>               _scratch;
   WeightRegistry                                              _weights;
   std::atomic<std::size_t>                                    _memory_cap{0};
   mutable std::mutex                                          _mu;

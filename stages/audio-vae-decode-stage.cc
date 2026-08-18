@@ -135,6 +135,17 @@ AudioVaeDecodeStage::spec() const noexcept
   return kSpec;
 }
 
+void
+AudioVaeDecodeStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  // Pre-launch twin of the runtime latch in process(): the same
+  // beat and the same parse, early enough that declare_resources()
+  // sees the model. Bookkeeping only -- nothing loads here; the
+  // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport != kModelPort) { return; }
+  apply_model_select_beat(beat, _hf_dir);
+}
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 void

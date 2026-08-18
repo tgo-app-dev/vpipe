@@ -188,6 +188,11 @@ public:
   // so what it declares is ONE expert -- declaring both would size the box
   // against a peak that never happens and push every peer into streaming.
   std::vector<ResourceClaim> declare_resources() const override;
+
+  // Latch a `model-select` constant before the planning phase, so
+  // the claim above is made against the model this graph will
+  // actually run rather than against an empty hf_dir.
+  void apply_constant(unsigned iport, const FlexData& beat) override;
   void reset_run_state() override;
   Job process(RuntimeContext& ctx) override;
 
@@ -301,6 +306,11 @@ private:
   // is one. The family's own rule computes the value (MetalWanVae::
   // align_num_frames / minimax_h3::align_num_frames); this only records
   // it, so the two callers cannot differ on how it is announced.
+  // Geometry as the family will actually produce it -- config rounded up
+  // to the model's latent constraints. The arena estimate must use these
+  // or it describes a clip nobody will make; see the definition.
+  bool planned_geometry_(const std::string& root, int* out_w, int* out_h,
+                         int* out_frames) const;
   void align_frames_(int aligned);
   // Round the frame size up to the resident family's tiling grid.
   void align_size_(int gh, int gw);

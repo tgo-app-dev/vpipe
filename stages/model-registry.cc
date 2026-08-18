@@ -21,6 +21,16 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
   if (!session) {
     return out;
   }
+  // An empty reference cannot name a model, and LMDB will not be asked
+  // whether it does: mdb_get rejects a zero-length key with
+  // MDB_BAD_VALSIZE, which surfaces as a registry ERROR naming neither
+  // the caller nor what it was looking for. A stage whose model arrives
+  // on an iport has an empty hf_dir until that beat lands, so reaching
+  // here with "" is ordinary rather than exceptional -- it deserves an
+  // empty answer, not a database error.
+  if (ref.empty()) {
+    return out;
+  }
   LmdbEnv* env = session->services()->lmdb_env();
   if (!env) {
     return out;

@@ -432,6 +432,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/hidden-state-encoder.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-set.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-family-registry.h
         DESTINATION include/generative-models)
     # Reading a Comfy-Org / Comfy-aligned single-file pack (config in the
     # safetensors __metadata__, no config.json). A plugin shipping a model

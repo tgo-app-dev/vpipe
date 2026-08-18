@@ -263,6 +263,17 @@ GenerateImageStage::spec() const noexcept
   return kSpec;
 }
 
+void
+GenerateImageStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  // Pre-launch twin of the runtime latch in process(): the same
+  // beat and the same parse, early enough that declare_resources()
+  // sees the model. Bookkeeping only -- nothing loads here; the
+  // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport != kModelPort) { return; }
+  apply_model_select_beat(beat, _hf_dir);
+}
+
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 namespace {
@@ -476,8 +487,40 @@ GenerateImageStage::declare_resources() const
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  return model_memory::weight_claims(
+  std::vector<ResourceClaim> out = model_memory::weight_claims(
       {(fs::path(root) / "transformer").string(), enc});
+
+  // The DECODE ARENA this stage's output implies.
+  //
+  // Declared HERE, by the stage that has the geometry, because nothing
+  // else in the graph does: vae-decode takes its size from whatever
+  // latent arrives, so at planning time it cannot name a number, and
+  // sizing itself against peer WEIGHTS is the proxy it has been using.
+  // The arena is the larger quantity for every image family -- FLUX.2's
+  // VAE weighs 160 MB and its decode peaks near 2.8 GB at 1024^2.
+  //
+  // kPhaseDecode, so it is not charged to the denoise: the arena does
+  // not exist while the DiT runs. It still lands in the box-level peak,
+  // which is where it belongs -- generate-image frees its DiT for a
+  // decode that will not fit (free_flux2_dit_for_decode_ and its
+  // siblings), and the peak is what says whether that will be needed.
+  //
+  // An over-estimate here costs caution; the geometry is config, so it
+  // is settled before anything loads.
+  //
+  // With NO geometry -- an edit graph takes its size from the reference
+  // image, so height/width are absent -- this is kUnknownArena: a
+  // presence marker, negligible by construction, that gives the runtime
+  // figure something to revise. Declaring nothing would leave
+  // publish_decode_arena_ with no entry to correct.
+  std::size_t arena =
+      model_memory::vae_decode_scratch_bytes(root, _width, _height);
+  if (arena == 0) { arena = model_memory::kUnknownArena; }
+  for (auto& c : model_memory::scratch_claims("vae-decode", arena,
+                                              model_memory::kPhaseDecode)) {
+    out.push_back(std::move(c));
+  }
+  return out;
 }
 
 // Both directions of one question: what did the caller ask for, and
@@ -840,10 +883,42 @@ GenerateImageStage::load_flux2_dit_()
   return (bool)_flux2_dit;
 }
 
+// State the decode arena this image implies, before deciding anything
+// about it.
+//
+// The plan could only bound this, and for an EDIT graph it could not
+// even do that: the output geometry comes from the reference image, so
+// there is no height/width in any config to estimate from and
+// declare_resources() correctly declares nothing. This is where the
+// number becomes known -- the same expression the reclaim check below
+// uses, so the ledger and the decision cannot drift apart.
+//
+// Published BEFORE the budget guards, and unconditionally: whether THIS
+// stage needs to free its DiT is a different question from how much
+// vae-decode is about to allocate, and a roomy box must still put the
+// arena on the books for whoever sizes next.
+//
+// A REVISION, so declare_resources must have claimed the label -- with
+// kUnknownArena when it had no geometry to size from. That is what
+// keeps the plan authoritative about what exists.
+void
+GenerateImageStage::publish_decode_arena_(std::size_t peak) const
+{
+  if (peak == 0 || session() == nullptr ||
+      session()->services() == nullptr) {
+    return;
+  }
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch("vae-decode", peak);
+  }
+}
+
 void
 GenerateImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_flux2_dit || gen_w <= 0 || gen_h <= 0) { return; }
+  publish_decode_arena_((std::size_t)gen_h * gen_w *
+                        (std::size_t)_vae_base * 2 * 7);
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
@@ -911,6 +986,8 @@ void
 GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_boogu_dit || gen_w <= 0 || gen_h <= 0) { return; }
+  publish_decode_arena_((std::size_t)gen_h * gen_w *
+                        (std::size_t)_vae_base * 2 * 7);
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
@@ -945,6 +1022,11 @@ void
 GenerateImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_dit || gen_w <= 0 || gen_h <= 0) { return; }
+  {
+    const std::size_t im2col =
+        (std::size_t)gen_h * gen_w * 9 * (std::size_t)_vae_base * 2;
+    publish_decode_arena_(im2col + im2col / 2);
+  }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
