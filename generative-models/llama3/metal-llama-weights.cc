@@ -8,6 +8,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -85,6 +86,13 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
   const int shard_idx = static_cast<int>(_shards.size());
   Shard sh;
   sh.fd = fd;
+  // The streaming descriptor. Its absence is not an error -- pread_into()
+  // simply reports it cannot serve, and every caller has a mapped
+  // fallback.
+  sh.fd_stream = ::open(safetensors_path.c_str(), O_RDONLY);
+#ifdef F_NOCACHE
+  if (sh.fd_stream >= 0) { (void)::fcntl(sh.fd_stream, F_NOCACHE, 1); }
+#endif
   sh.base = base;
   sh.map_size = file_size;
   sh.data_start = 8 + header_len;
@@ -344,6 +352,7 @@ MetalLlamaWeights::operator=(MetalLlamaWeights&& o) noexcept
     for (auto& sh : _shards) {
       if (sh.base != nullptr) { ::munmap(sh.base, sh.map_size); }
       if (sh.fd >= 0) { ::close(sh.fd); }
+      if (sh.fd_stream >= 0) { ::close(sh.fd_stream); }
     }
     _shards = std::move(o._shards);
     _shard_maps = std::move(o._shard_maps);
@@ -362,6 +371,7 @@ MetalLlamaWeights::~MetalLlamaWeights()
   for (auto& sh : _shards) {
     if (sh.base != nullptr) { ::munmap(sh.base, sh.map_size); }
     if (sh.fd >= 0) { ::close(sh.fd); }
+    if (sh.fd_stream >= 0) { ::close(sh.fd_stream); }
   }
 }
 
@@ -391,6 +401,41 @@ bool
 MetalLlamaWeights::is_gguf() const noexcept
 {
   return _gguf != nullptr;
+}
+
+bool
+MetalLlamaWeights::pread_into(const std::string& name, void* dst,
+                              std::size_t cap, bool uncached) const
+{
+  const TensorInfo* ti = info(name);
+  if (ti == nullptr || dst == nullptr || cap < ti->nbytes) {
+    return false;
+  }
+  // GGUF tensors are CONVERTED on the way out, so the file holds no bytes
+  // this could place. shard == -2 marks them; anything else out of range
+  // is a malformed entry.
+  if (ti->shard < 0 ||
+      static_cast<std::size_t>(ti->shard) >= _shards.size()) {
+    return false;
+  }
+  const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
+  const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
+  if (fd < 0) { return false; }
+  const std::uint64_t base = sh.data_start + ti->offset;
+  std::size_t done = 0;
+  auto* out = static_cast<std::uint8_t*>(dst);
+  while (done < ti->nbytes) {
+    const ssize_t n = ::pread(fd, out + done, ti->nbytes - done,
+                              static_cast<off_t>(base + done));
+    if (n < 0 && errno == EINTR) { continue; }
+    // A short read that is not EINTR is a truncated or racing file. The
+    // destination is left partly written, which is why this returns
+    // false rather than trying to paper over it -- the caller must fall
+    // back to a path that rewrites the whole buffer, not top this one up.
+    if (n <= 0) { return false; }
+    done += static_cast<std::size_t>(n);
+  }
+  return true;
 }
 
 metal_compute::SharedBuffer
@@ -427,6 +472,27 @@ MetalLlamaWeights::load(const std::string& name,
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
   const auto t_f0 = cost != nullptr ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
+  // Tell the kernel what this memcpy is about to touch. Faulting a
+  // mapping one cluster at a time is what makes the mapped read slow --
+  // MEASURED on an M5 at 0.69-1.09 GB/s against 6.8 GB/s for a pread of
+  // the same bytes -- and a single WILLNEED over the range recovers most
+  // of the gap (to 3.7-5.3 GB/s) without changing who owns the memory.
+  // Advisory: if the kernel declines, this is exactly the read it was.
+  //
+  // pread_into() is the rest of that gap, but it needs a destination the
+  // caller already owns; this helps every streaming model that still
+  // allocates per block.
+  //
+  // Only for reads big enough to be worth a syscall. A checkpoint has
+  // thousands of small tensors and the hint buys nothing on a range the
+  // kernel's own clustering already covers in one fault.
+  if (ti->nbytes >= (1u << 20)) {
+    const auto page = static_cast<std::uintptr_t>(::getpagesize());
+    const auto lo = reinterpret_cast<std::uintptr_t>(src) & ~(page - 1);
+    const std::size_t span =
+        ti->nbytes + (reinterpret_cast<std::uintptr_t>(src) - lo);
+    (void)::madvise(reinterpret_cast<void*>(lo), span, MADV_WILLNEED);
+  }
   std::memcpy(buf.contents(), src, ti->nbytes);
   if (cost != nullptr) {
     cost->fetch_ms += std::chrono::duration<double, std::milli>(

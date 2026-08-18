@@ -6,6 +6,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
+#include <chrono>
 #include <cstdlib>
 
 #include <utility>
@@ -243,6 +244,42 @@ WeightSet::stream_tensor(const string& name, metal_compute::MetalCompute* mc,
     _streamed_bytes.fetch_add(buf.byte_size(), std::memory_order_relaxed);
   }
   return buf;
+}
+
+bool
+WeightSet::stream_into(const string& name, void* dst, std::size_t cap)
+{
+  if (dst == nullptr) { return false; }
+  std::size_t nbytes = 0;
+  {
+    lock_guard<recursive_mutex> lk(_mu);
+    if (!_wts) { return false; }
+    ensure_active_();
+    // GGUF converts on the way out, so there are no raw bytes to place.
+    // Asked here rather than inside pread_into so the answer is taken
+    // under the same lock that guards a reactivating set.
+    if (_wts->is_gguf()) { return false; }
+    const auto* ti = _wts->info(name);
+    if (ti == nullptr) { return false; }
+    nbytes = ti->nbytes;
+  }
+  // Outside the lock, for the reason read() spells out: this is the block
+  // stream, and holding the lock across it makes two pipelines sharing one
+  // checkpoint take turns on every block.
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!_wts->pread_into(name, dst, cap)) { return false; }
+  // All FETCH and no alloc, which is the whole point -- and it has to be
+  // charged so the streaming profile keeps meaning what it says. Left
+  // uncounted, a run that took this path would report its reads as free
+  // and the alloc/fetch split would describe only whichever blocks
+  // happened to go the other way.
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  _streamed_fetch_us.fetch_add((std::uint64_t)(ms * 1000.0),
+                               std::memory_order_relaxed);
+  _streamed_reads.fetch_add(1, std::memory_order_relaxed);
+  _streamed_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+  return true;
 }
 
 metal_compute::SharedBuffer

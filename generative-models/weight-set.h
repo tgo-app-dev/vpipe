@@ -166,6 +166,32 @@ public:
                 metal_compute::MetalCompute* mc,
                 Residency                    res = Residency::Mapped);
 
+  // Refill a buffer the CALLER already owns with a streamed tensor's raw
+  // bytes. Counted as streaming throughput exactly like stream_tensor(),
+  // and the only read path here that allocates nothing.
+  //
+  // This is the one WeightSet read whose result may legitimately be
+  // WRITTEN through, because the memory is not this set's: `dst` came
+  // from the caller and no cache entry aliases it. Everything the set
+  // hands out is shared and therefore immutable (see the integrity check
+  // in the class comment); this hands out nothing.
+  //
+  // It exists so a block-streamed model can keep TWO destinations for
+  // the whole run and alternate them, instead of allocating and freeing
+  // a block's worth of buffers on every block of every forward. The read
+  // itself is also several times faster -- see
+  // MetalLlamaWeights::pread_into, which this forwards to.
+  //
+  // NO CONVERSION. The bytes arrive as the checkpoint stores them, so a
+  // caller whose compute dtype differs has to convert afterwards, which
+  // is only possible in place when the widths match (F16 -> BF16 does,
+  // F32 -> BF16 does not). Returns false -- having possibly written part
+  // of `dst` -- when the tensor is missing, `cap` is too small, the
+  // checkpoint is GGUF (converted, not copied), or the read failed. A
+  // false means the caller must rewrite the whole buffer by another
+  // route, not top this one up.
+  bool stream_into(const std::string& name, void* dst, std::size_t cap);
+
   // Same, for a tensor the caller must TRANSFORM before use. `build`
   // runs every time -- there is no cache to hit -- and its result is
   // counted as streamed. Exists so a streaming model reaches for one

@@ -768,6 +768,112 @@ MetalMiniMaxH3Transformer::interleave_gu_(Linear& l) const
   return true;
 }
 
+// f16 -> bf16 where the bytes already lie. Legitimate only because the
+// two are the SAME WIDTH, which is why the refill below can pread a
+// checkpoint's F16 scales straight into a destination the forward reads
+// as bf16 and convert afterwards. F32 has no such luxury and is why
+// refill_block_ refuses it rather than guessing.
+static void
+f16_to_bf16_inplace_(const SharedBuffer& buf)
+{
+  const std::size_t n = buf.byte_size() / 2;
+  auto* p = static_cast<std::uint16_t*>(buf.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    // Through memcpy, not a _Float16* aliasing the same memory. Two
+    // pointers of different types over one buffer is exactly the pattern
+    // the optimiser is allowed to assume cannot happen, and it would be
+    // free to hoist the reads above the writes -- at -O2, on a loop this
+    // simple, that is a vectorisation away from reading values this pass
+    // has already overwritten.
+    _Float16 h;
+    std::memcpy(&h, &p[i], sizeof(h));
+    p[i] = f32_to_bf16_((float)h);
+  }
+}
+
+bool
+MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
+                                        bool copy_bytes) const
+{
+  bool ok = true;
+  auto one = [&](const SharedBuffer& s, SharedBuffer& d) {
+    if (!ok || s.empty()) { d = SharedBuffer{}; return; }
+    d = _mc->make_shared_buffer(s.byte_size());
+    if (d.empty()) { ok = false; return; }
+    if (copy_bytes) {
+      std::memcpy(d.contents(), s.contents(), s.byte_size());
+    }
+  };
+  auto lin = [&](const Linear& s, Linear& d) {
+    d.quantized = s.quantized;
+    d.bits      = s.bits;
+    d.gu_inter  = s.gu_inter;
+    one(s.w, d.w);
+    one(s.b, d.b);
+    one(s.codes, d.codes);
+    one(s.scales, d.scales);
+    one(s.qbias, d.qbias);
+  };
+  one(src.n1, dst.n1);
+  one(src.n2, dst.n2);
+  one(src.qn, dst.qn);
+  one(src.kn, dst.kn);
+  lin(src.qkv, dst.qkv);
+  lin(src.out, dst.out);
+  lin(src.fc1, dst.fc1);
+  lin(src.fc2, dst.fc2);
+  lin(src.adaln, dst.adaln);
+  if (!ok) { dst = Block{}; }
+  return ok;
+}
+
+bool
+MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
+                                         const std::string& prefix, Block& b,
+                                         bool with_adaln)
+{
+  bool ok = true;
+  // One tensor into the buffer that already holds its predecessor. The
+  // size check is against the CHECKPOINT rather than an expectation:
+  // a slot allocated for one block only fits another if the shapes
+  // genuinely agree, and on a stack where they did not this would
+  // otherwise write the wrong number of bytes and run.
+  auto one = [&](const std::string& nm, SharedBuffer& dst) {
+    if (!ok) { return; }
+    if (dst.empty()) { return; }          // this slot has no such tensor
+    const auto* ti = ws.src().info(nm);
+    if (ti == nullptr || ti->nbytes != dst.byte_size()) { ok = false; return; }
+    const bool raw = ti->dtype == "BF16" || ti->dtype == "U32";
+    const bool f16 = ti->dtype == "F16";
+    if (!raw && !f16) { ok = false; return; }   // F32: widths disagree
+    if (!ws.stream_into(nm, dst.contents(), dst.byte_size())) {
+      ok = false;
+      return;
+    }
+    if (f16) { f16_to_bf16_inplace_(dst); }
+  };
+  auto lin = [&](const std::string& nm, Linear& l) {
+    if (l.quantized) {
+      one(nm + ".weight", l.codes);
+      one(nm + ".scales", l.scales);
+      one(nm + ".biases", l.qbias);
+    } else {
+      one(nm + ".weight", l.w);
+    }
+    one(nm + ".bias", l.b);
+  };
+  one(prefix + "norm1.weight", b.n1);
+  one(prefix + "norm2.weight", b.n2);
+  one(prefix + "attn.q_norm.weight", b.qn);
+  one(prefix + "attn.k_norm.weight", b.kn);
+  lin(prefix + "attn.qkv_proj", b.qkv);
+  lin(prefix + "attn.out_proj", b.out);
+  lin(prefix + "mlp.fc1", b.fc1);
+  lin(prefix + "mlp.fc2", b.fc2);
+  if (with_adaln) { lin(prefix + "adaln_proj.linear", b.adaln); }
+  return ok;
+}
+
 bool
 MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
                                        const std::string& prefix, Block& b,
@@ -3244,9 +3350,16 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // which is what keeps `blk`, the buffer that reader is writing into,
     // alive until then. Reordering these is a use-after-free on every
     // early return out of this loop (stop, GPU error, alloc failure).
+    //
+    // `slot` is which of the two reusable destinations the outstanding
+    // read is filling, or -1 when it is filling `blk` -- the per-block
+    // allocation this falls back to for a checkpoint the slots cannot
+    // serve. The two modes never run at once, but the same outstanding
+    // read has to be joinable either way, so both destinations live here.
     struct PrefetchSlot {
       Block             blk;
       int               layer = -1;
+      int               slot  = -1;
       std::future<bool> fut;
     } pf;
     const bool pf_on = _stream_blocks &&
@@ -3295,7 +3408,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       const bool held = Lx < (int)_blocks.size() &&
                         !_blocks[(std::size_t)Lx].qkv.empty();
       const bool streaming = _stream_blocks && !held;
+      // The per-block allocation, used only when the slots cannot serve
+      // this checkpoint. Empty in the ordinary case.
       Block streamed;
+      // Whichever destination this block ended up in.
+      const Block* bp = nullptr;
       if (streaming) {
         // `with_adaln` false once baked: those tensors are 55% of a
         // block's bytes and nothing reads them any more, so a streaming
@@ -3303,31 +3420,127 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // point of baking.
         const auto rd0 = sprof ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-        bool have = false;
-        if (pf.layer == Lx && pf.fut.valid()) {
-          // This block's read was issued under the PREVIOUS block's GPU
-          // work, so waiting here costs only the part that did not fit
-          // under that window.
-          const bool ok = pf.fut.get();
-          pf.layer = -1;
-          if (!ok) { return {}; }
-          streamed = std::move(pf.blk);
-          pf.blk = Block{};
-          have = true;
-          ++pf_hit;
+        // Allocate the slot pair on the first streamed block, and again
+        // if `baked` has changed which tensors a block carries since.
+        // The first read doubles as the allocation -- load_block_ builds
+        // the shapes and fills them, so this costs nothing extra -- and
+        // the second slot is cloned from those shapes without bytes.
+        // VPIPE_H3_NO_SLOTS forces the per-block allocations back, which
+        // is what makes the slot path A/B-able against the thing it
+        // replaced -- the two must be the same function, and the only way
+        // to show that is to run one forward each way.
+        if (_slots_first) {
+          _slots_first = false;
+          _slots_off = std::getenv("VPIPE_H3_NO_SLOTS") != nullptr;
         }
-        if (!have && !load_block_(*_ws, blk_("blocks.", Lx, ""), streamed,
-                                  !baked, Retain::Streamed)) {
-          return {};
+        if (!_slots_off && (!_slots_ready || _slots_adaln != !baked)) {
+          _slot[0] = Block{};
+          _slot[1] = Block{};
+          _slot_pair = false;
+          if (!load_block_(*_ws, blk_("blocks.", Lx, ""), _slot[0], !baked,
+                           Retain::Streamed)) {
+            return {};
+          }
+          // The second slot is a durable allocation, so it is asked for
+          // on the same terms as any other growth. Refused, this runs
+          // single-slot: no prefetch, but still no per-block allocation
+          // and no memcpy out of the mapping, which is the larger half.
+          const auto mbs = _mc->memory_budget();
+          _slot_pair = mbs.recommended != 0 &&
+                       mbs.fits_growth(block_bytes_(_slot[0])) &&
+                       clone_block_(_slot[0], _slot[1], false);
+          if (!_slot_pair) { _slot[1] = Block{}; }
+          _slots_ready = true;
+          _slots_adaln = !baked;
+          _slot_cur    = 0;
+          bp           = &_slot[0];
+          if (_mc->session() != nullptr) {
+            _mc->session()->log_debug(fmt(
+                "MetalMiniMaxH3Transformer: block slots ready ({} x {} MB{})",
+                _slot_pair ? 2 : 1, block_bytes_(_slot[0]) >> 20,
+                _slot_pair ? "" : ", single -- prefetch off"));
+          }
+        }
+        if (bp == nullptr && _slots_ready && !_slots_off) {
+          int use = -1;
+          if (pf.layer == Lx && pf.slot >= 0 && pf.fut.valid()) {
+            // This block's read was issued under the PREVIOUS block's GPU
+            // work, so waiting here costs only the part that did not fit
+            // under that window.
+            const bool ok = pf.fut.get();
+            use      = pf.slot;
+            pf.layer = -1;
+            pf.slot  = -1;
+            // A prefetch that could not serve is not a failed forward:
+            // the same refusal on the synchronous path below turns the
+            // slots off and falls back, and it means the same thing
+            // here. Falling through costs this block a second read and
+            // the run its slots -- both of which beat abandoning a step.
+            if (!ok) { _slots_off = true; }
+            else { ++pf_hit; }
+          } else {
+            // Never the slot an outstanding read is writing into.
+            use = pf.slot >= 0 ? (pf.slot ^ 1) : _slot_cur;
+            if (!refill_block_(*_ws, blk_("blocks.", Lx, ""), _slot[use],
+                               !baked)) {
+              // A dtype or a shape no raw read can place. Sticky, and
+              // said once: a fallback that came and went would read as an
+              // unexplained slowdown rather than a property of the
+              // checkpoint.
+              _slots_off = true;
+              if (_mc->session() != nullptr) {
+                _mc->session()->log_debug(fmt(
+                    "MetalMiniMaxH3Transformer: block slots cannot serve "
+                    "this checkpoint -- streaming per-block allocations"));
+              }
+            }
+          }
+          if (!_slots_off) {
+            _slot_cur = use;
+            bp        = &_slot[use];
+          } else {
+            // Hand the slots back. They are a block each and nothing
+            // will read them again this run.
+            //
+            // JOIN FIRST. A prefetch may be in flight into one of these,
+            // and freeing a buffer a reader thread is writing into is a
+            // use-after-free -- the one way this fallback could turn a
+            // recoverable refusal into a crash. Its result is discarded
+            // either way: the block is about to be rebuilt from scratch.
+            if (pf.fut.valid()) { (void)pf.fut.get(); }
+            pf.layer   = -1;
+            pf.slot    = -1;
+            _slot[0]   = Block{};
+            _slot[1]   = Block{};
+            _slot_pair = false;
+          }
+        }
+        if (bp == nullptr) {
+          // The pre-slot path, unchanged.
+          bool have = false;
+          if (pf.layer == Lx && pf.slot < 0 && pf.fut.valid()) {
+            const bool ok = pf.fut.get();
+            pf.layer = -1;
+            if (!ok) { return {}; }
+            streamed = std::move(pf.blk);
+            pf.blk = Block{};
+            have = true;
+            ++pf_hit;
+          }
+          if (!have && !load_block_(*_ws, blk_("blocks.", Lx, ""), streamed,
+                                    !baked, Retain::Streamed)) {
+            return {};
+          }
+          bp = &streamed;
         }
         if (sprof) {
           sp_read_ms += std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - rd0).count();
-          sp_read_bytes += block_bytes_(streamed);
+          sp_read_bytes += block_bytes_(*bp);
           ++sp_blocks;
         }
       }
-      const Block& b = streaming ? streamed : _blocks[(std::size_t)Lx];
+      const Block& b = streaming ? *bp : _blocks[(std::size_t)Lx];
       // The modulation table for this block: [n_t, 6*H*3], which is the
       // same bytes as [n_t*3, 6*H] -- the layout `timestep_index * 3 +
       // tag` addresses. M is the number of DISTINCT timesteps, so this
@@ -3467,15 +3680,37 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // stops being affordable the next iteration is serial again.
         if (pf_on && pf.layer < 0) {
           const int nxt = pf_next(Lx + 1);
-          const auto mbp = _mc->memory_budget();
-          if (nxt >= 0 && mbp.recommended != 0 &&
-              mbp.fits_growth(block_bytes_(streamed))) {
+          const bool slots = _slots_ready && !_slots_off && _slot_pair;
+          // In slot mode the destination is memory this model ALREADY
+          // holds, so there is no growth to gate -- the budget question
+          // was asked once, when the second slot was allocated. The gate
+          // stays on the fallback path, where a prefetch really does put
+          // a second block's worth of buffers in the air.
+          //
+          // That also removes the reason a prefetch used to come and go
+          // between blocks: the gate consults system-wide paging, which
+          // moves under a streaming run, so on a tight box it would serve
+          // some blocks and not others and the GPU would idle on exactly
+          // the ones it refused.
+          bool room = slots;
+          if (!slots) {
+            const auto mbp = _mc->memory_budget();
+            room = mbp.recommended != 0 &&
+                   mbp.fits_growth(block_bytes_(*bp));
+          }
+          if (nxt >= 0 && room) {
             pf.layer = nxt;
+            pf.slot  = slots ? (_slot_cur ^ 1) : -1;
             ++pf_started;
-            pf.fut = std::async(std::launch::async, [this, &pf, nxt, baked]() {
-              return load_block_(*_ws, blk_("blocks.", nxt, ""), pf.blk,
-                                 !baked, Retain::Streamed);
-            });
+            const int dst = pf.slot;
+            pf.fut = std::async(
+                std::launch::async, [this, &pf, nxt, baked, dst]() {
+                  return dst >= 0
+                             ? refill_block_(*_ws, blk_("blocks.", nxt, ""),
+                                             _slot[dst], !baked)
+                             : load_block_(*_ws, blk_("blocks.", nxt, ""),
+                                           pf.blk, !baked, Retain::Streamed);
+                });
           }
         }
         if (!fence.wait_ok(&blk_err)) {
@@ -3496,24 +3731,43 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // and the alternative is dropping them and re-reading the same
         // block from disk on the next of 30-odd steps.
         if (Lx < (int)_blocks.size()) {
-          const std::size_t nb = block_bytes_(streamed);
+          const std::size_t nb = block_bytes_(*bp);
           if (_resid.admit(_mc, nb)) {
-            _blocks[(std::size_t)Lx] = std::move(streamed);
-            // Now that it is KEPT, the fc1 interleave is paid once
-            // instead of per forward, so every later step takes the
-            // fused FF for this block. The scratch stays wide (it was
-            // sized for a streaming run and blocks below this one may
-            // still be unfused), so the two paths coexist.
-            if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
-            _resid.note_admitted(nb);
-            if (_mc->session() != nullptr) {
-              const auto mb = _mc->memory_budget();
-              _mc->session()->log_debug(fmt(
-                  "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
-                  "{} MB; {} MB idle, {} MB compressed, reserve {} MB)", Lx,
-                  _resid.count() + _pinned, c.n_layers, _resid.bytes() >> 20,
-                  mb.free_physical >> 20, mb.compressed >> 20,
-                  _resid.reserve() >> 20));
+            // Out of a SLOT the block has to be copied -- the slot is the
+            // streamer's own destination and the next read needs it back.
+            // A move would hand it away and leave the stream writing into
+            // the resident set. Paid at most once per block for a whole
+            // run, against the per-step read it retires.
+            //
+            // The fallback path owns its block outright, so it still
+            // moves.
+            bool kept = true;
+            if (bp == &streamed) {
+              _blocks[(std::size_t)Lx] = std::move(streamed);
+            } else {
+              kept = clone_block_(*bp, _blocks[(std::size_t)Lx], true);
+              if (!kept) { _blocks[(std::size_t)Lx] = Block{}; }
+            }
+            // A failed copy is simply not a promotion: the slot still
+            // holds the block, the forward has already run it, and the
+            // next step streams it again. Nothing is booked.
+            if (kept) {
+              // Now that it is KEPT, the fc1 interleave is paid once
+              // instead of per forward, so every later step takes the
+              // fused FF for this block. The scratch stays wide (it was
+              // sized for a streaming run and blocks below this one may
+              // still be unfused), so the two paths coexist.
+              if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
+              _resid.note_admitted(nb);
+              if (_mc->session() != nullptr) {
+                const auto mb = _mc->memory_budget();
+                _mc->session()->log_debug(fmt(
+                    "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
+                    "{} MB; {} MB idle, {} MB compressed, reserve {} MB)", Lx,
+                    _resid.count() + _pinned, c.n_layers, _resid.bytes() >> 20,
+                    mb.free_physical >> 20, mb.compressed >> 20,
+                    _resid.reserve() >> 20));
+              }
             }
           }
         }

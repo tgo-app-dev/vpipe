@@ -1378,6 +1378,139 @@ TEST(minimax_h3_dit, fused_ff_matches_split)
   EXPECT_TRUE(ra < 2e-2);
 }
 
+// The streamed block stack reads into TWO reusable destinations and
+// refills them in place, instead of allocating a block's worth of buffers
+// per block and filling them out of the shard mapping. This is where that
+// is checked to be the same function.
+//
+// BIT-EXACT, not a tolerance. Slots change where the bytes land and how
+// they get there -- a pread off the shard rather than a memcpy out of the
+// mapping -- and nothing about which bytes they are or what is computed
+// over them. Any difference at all is a bug, and the interesting bugs
+// here all produce SMALL ones: a stale tensor left over from the previous
+// block in a slot that was not fully refilled, the f16 scales converted
+// twice (or not at all) because a refill ran over an already-converted
+// buffer, or the prefetch writing the slot the GPU is reading. Every one
+// of those yields a plausible video with slightly wrong numbers, which a
+// tolerance would wave through.
+//
+// Both arms STREAM. Preloading does not touch this path at all, so an arm
+// that preloaded would compare the slot path against nothing.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, streamed_slots_match_per_block_loads)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  // Four blocks: the slot pair alternates every block, so four covers
+  // both slots twice and the wrap between them three times, which is
+  // where an off-by-one in the alternation would show.
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  // Raw bf16 words, not floats: this is an exactness check, so nothing
+  // should pass through a conversion that could round two different
+  // values to one.
+  auto arm = [&](bool slots, std::vector<std::uint16_t>* out_v,
+                 std::vector<std::uint16_t>* out_a) {
+    ::setenv("VPIPE_H3_STREAM", "1", 1);
+    if (slots) { ::unsetenv("VPIPE_H3_NO_SLOTS"); }
+    else       { ::setenv("VPIPE_H3_NO_SLOTS", "1", 1); }
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+    if (m == nullptr) { return false; }
+    // The GEMM route is chosen by MEASUREMENT, so two loads of the same
+    // model can pick different winners for the same shape and the
+    // forward is not reproducible run to run. MEASURED on the bf16
+    // checkpoint: the slot arm compared against ITSELF came out at
+    // rel-L2 3.2e-03 over half the words, which is the same spread as
+    // any other pair -- so without pinning, this test measures the
+    // tuner's noise floor and can say nothing about the weights.
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    auto raw = [](const SharedBuffer& b, std::size_t n) {
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      return std::vector<std::uint16_t>(p, p + n);
+    };
+    *out_v = raw(v.video, (std::size_t)n_video * cfg.video_patch_elems());
+    *out_a = raw(v.audio,
+                 (std::size_t)L.audio_indices.size() * cfg.audio_channels);
+    return true;
+  };
+
+  std::vector<std::uint16_t> sv, sa, pv, pa;
+  const bool ok_s = arm(true, &sv, &sa);
+  const bool ok_p = arm(false, &pv, &pa);
+  ::unsetenv("VPIPE_H3_NO_SLOTS");
+  ::unsetenv("VPIPE_H3_STREAM");
+  ASSERT_TRUE(ok_s && ok_p);
+  ASSERT_TRUE(!sv.empty() && !sa.empty());
+  EXPECT_TRUE(sv.size() == pv.size());
+  EXPECT_TRUE(sa.size() == pa.size());
+
+  std::size_t diff = 0;
+  double num = 0.0, den = 0.0, worst = 0.0;
+  auto cmp = [&](const std::vector<std::uint16_t>& a,
+                 const std::vector<std::uint16_t>& b) {
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      if (a[i] != b[i]) { ++diff; }
+      const double x = bf16_to_f32_(a[i]), y = bf16_to_f32_(b[i]);
+      num += (x - y) * (x - y);
+      den += y * y;
+      worst = std::max(worst, std::fabs(x - y));
+    }
+  };
+  cmp(sv, pv);
+  cmp(sa, pa);
+  const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  std::printf("[minimax_h3_dit] slots vs per-block loads over %d streamed "
+              "blocks: %zu of %zu words differ, rel-L2 %.3e, max |d| "
+              "%.3e\n", cfg.n_layers, diff, sv.size() + sa.size(), rel,
+              worst);
+  EXPECT_TRUE(diff == 0);
+}
+
 // A baked schedule has to produce the SAME velocity as the projections
 // it replaces.
 //

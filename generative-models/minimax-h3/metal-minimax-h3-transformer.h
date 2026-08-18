@@ -598,6 +598,61 @@ class MetalMiniMaxH3Transformer {
   // and put the whole stack back in RAM.
   enum class Retain { Cached, Streamed };
 
+  // ---- the streamed block's reusable destinations --------------------
+  //
+  // Two Blocks, allocated ONCE and refilled in place for the whole run,
+  // the way h3.c's two BF16 slots work. What they replace is a block's
+  // worth of SharedBuffers allocated and freed on every block of every
+  // forward -- 16 tensors x 50 blocks x every step -- which cost both the
+  // allocation itself and, far more, the demand-faulted memcpy out of the
+  // shard mapping that filled them.
+  //
+  // Two and not more: the depth that matters is one outstanding read,
+  // which is what the prefetch already issues. A deeper ring would buy
+  // nothing here (the GPU still takes the blocks strictly in order) and
+  // would cost a block of live memory per extra slot on a box that is
+  // streaming precisely because it has none to spare.
+  //
+  // These do NOT change what is resident. A promoted block is COPIED out
+  // of its slot (see clone_block_), because the slot has to stay put for
+  // the next read -- so the residency set, its growth and its ratchet all
+  // work exactly as before.
+  Block _slot[2];
+  // Which slot holds the block the forward is currently running. The
+  // prefetch always targets the other one.
+  int   _slot_cur = 0;
+  // Whether the slots are allocated, and for WHICH tensor set: `baked`
+  // decides whether a block carries its AdaLN projection, and a slot
+  // allocated without it cannot be refilled with it. Re-allocated rather
+  // than assumed when the answer changes.
+  bool  _slots_ready = false;
+  bool  _slots_adaln = false;
+  // Whether the SECOND slot exists. Refused when the box will not take a
+  // durable block-sized allocation, and the run is then single-slot: no
+  // prefetch, but the read shape and the absence of per-block allocation
+  // -- the larger half of the win -- are unaffected.
+  bool  _slot_pair   = false;
+  // Set when a refill could not serve (a dtype no raw read can place, a
+  // size that disagrees with the checkpoint) and the forward fell back to
+  // allocating per block. Sticky for the run and logged once: a fallback
+  // that flapped would be a performance mystery rather than a fact.
+  bool  _slots_off = false;
+  // Whether the env kill-switch still has to be read. Once, on the first
+  // streamed block, rather than per block.
+  bool  _slots_first = true;
+
+  // Allocate `dst` with the same shapes and flags as `src`, optionally
+  // copying the bytes. Both uses are one function because a promotion and
+  // a second slot differ only in whether the contents come along.
+  bool clone_block_(const Block& src, Block& dst, bool copy_bytes) const;
+
+  // Refill an already-allocated block IN PLACE from the checkpoint.
+  // Returns false without having produced a usable block when any tensor
+  // cannot be served by a raw read -- the caller must then rebuild it
+  // with load_block_, not patch this one up.
+  bool refill_block_(WeightSet& ws, const std::string& prefix, Block& b,
+                     bool with_adaln);
+
   metal_compute::SharedBuffer weight_(WeightSet& ws, const std::string& nm,
                                       Retain r);
   Linear linear_(WeightSet& ws, const std::string& nm, bool bias, Retain r);

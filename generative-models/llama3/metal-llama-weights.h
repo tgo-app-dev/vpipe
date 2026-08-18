@@ -97,6 +97,47 @@ public:
     double fetch_ms = 0.0;
   };
 
+  // Read a tensor's RAW bytes straight from the shard into memory the
+  // CALLER owns, with pread(2) -- no allocation, and not a byte through
+  // the shard's mmap.
+  //
+  // The point is the read shape, not the destination. MEASURED on an M5
+  // over a MiniMax-H3 shard, 206 MB per block, arms interleaved and their
+  // ORDER rotated: a fresh allocation plus a memcpy out of the mapping
+  // runs at 0.86-1.48 GB/s and a pread into a warm buffer at 6.7-6.9
+  // GB/s. The variance is the other half of it -- the mapped path's rate
+  // moves by 2x between rounds while pread does not, and a block-streamed
+  // forward turns that into GPU occupancy that will not sit still.
+  //
+  // That also corrects what the streaming rate was taken to mean: ~1.5
+  // GB/s is not this machine's disk, it is the cost of demand-faulting a
+  // mapping. The same files read at 6.8 GB/s through this path.
+  //
+  // Source alignment does not matter -- measured flat across page-,
+  // 8-byte- and mid-page-aligned tensor offsets, which is what makes this
+  // usable on safetensors at all. Nor does read size punish the small
+  // tensors: 27 us at 10 KB, so a block's norms and scales can come the
+  // same way as its matrices.
+  //
+  // `uncached` sets F_NOCACHE, which does NOT make the read faster (a
+  // cached pread measured identically) -- it keeps the read from growing
+  // the file cache. For a model that re-reads its whole checkpoint every
+  // forward that cache is pure pressure, and it is the pressure that
+  // squeezes out the blocks a resident set is trying to keep.
+  //
+  // Returns false, having written NOTHING, when the tensor is missing,
+  // when it is not backed by a plain safetensors shard (GGUF is converted
+  // rather than copied, so there are no raw bytes to place), or when
+  // `cap` is smaller than the tensor. The caller then takes read_into()
+  // or load(), which are always correct and merely slower.
+  //
+  // No conversion, deliberately: the bytes land exactly as the file holds
+  // them. A caller wanting a dtype the checkpoint does not store has to
+  // convert after the fact, which is only in-place-able when the widths
+  // agree.
+  bool pread_into(const std::string& name, void* dst, std::size_t cap,
+                  bool uncached = true) const;
+
   // Allocate a SharedBuffer and copy the tensor's bytes into it.
   // Returns an empty SharedBuffer if the tensor is missing. `cost`, when
   // non-null, receives the split above (added to, not overwritten).
@@ -139,6 +180,14 @@ private:
   // relative.
   struct Shard {
     int           fd = -1;
+    // A SECOND descriptor on the same file, opened F_NOCACHE, for
+    // pread_into(). Separate from `fd` because F_NOCACHE is a property of
+    // the descriptor and `fd` owns the mmap every other reader goes
+    // through -- a checkpoint that is both streamed and mapped must not
+    // have one mode decide the other. Opened eagerly at map time so the
+    // streaming path needs no lazy init and is therefore thread-safe
+    // without a lock.
+    int           fd_stream = -1;
     void*         base = nullptr;
     std::size_t   map_size = 0;
     std::uint64_t data_start = 0;

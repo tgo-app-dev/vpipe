@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <unistd.h>
 #include <filesystem>
 #include <fstream>
@@ -365,6 +366,81 @@ TEST(weight_set, streaming_reads_are_never_retained) {
   EXPECT_TRUE(builds == 2);            // rebuilt, never cached
   EXPECT_TRUE(ws->stats().entries == 0u);
   EXPECT_TRUE(ws->stats().streamed_reads == 4u);
+}
+
+// The no-allocation streaming read. What matters is that it is the SAME
+// bytes as the path it replaces -- it takes a completely different route
+// to them (pread off the shard rather than a memcpy out of the mapping),
+// so "faster" is only worth anything if "identical" holds.
+//
+// Both tensors are read, and deliberately: "trunk.w" starts at data
+// offset 0 and "encoder.w" at 16, so one of the two is not page-aligned
+// in the file. That is the ordinary case for safetensors and the one
+// thing that could have made a raw read unusable here.
+TEST(weight_set, stream_into_reads_the_same_bytes) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  for (const char* nm : {"trunk.w", "encoder.w"}) {
+    SharedBuffer want = ws->read(nm, mc, WeightSet::Residency::Copied);
+    ASSERT_TRUE(!want.empty());
+    SharedBuffer got = mc->make_shared_buffer(want.byte_size());
+    ASSERT_TRUE(!got.empty());
+    ASSERT_TRUE(ws->stream_into(nm, got.contents(), got.byte_size()));
+    EXPECT_TRUE(std::memcmp(got.contents(), want.contents(),
+                            want.byte_size()) == 0);
+  }
+}
+
+// The destination is the caller's, so nothing is retained -- and the
+// bytes are still counted, because a model that streams this way is
+// paying exactly the same throughput as one that streams the old way and
+// the manager has to see it.
+TEST(weight_set, stream_into_is_counted_and_retains_nothing) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer slot = mc->make_shared_buffer(32);
+  ASSERT_TRUE(!slot.empty());
+  // The same destination, twice: this is the whole point of the call.
+  ASSERT_TRUE(ws->stream_into("encoder.w", slot.contents(), 32));
+  ASSERT_TRUE(ws->stream_into("encoder.w", slot.contents(), 32));
+  EXPECT_TRUE(ws->stats().entries == 0u);
+  EXPECT_TRUE(ws->stats().bytes == 0u);
+  EXPECT_TRUE(ws->stats().streamed_reads == 2u);
+  EXPECT_TRUE(ws->stats().streamed_bytes == 64u);
+  EXPECT_TRUE(static_cast<const float*>(slot.contents())[0] == ck.enc()[0]);
+}
+
+// It refuses rather than half-serves. Each of these is a case where a
+// caller must rebuild the buffer by another route, and a `true` that
+// left the destination stale or short would be a wrong answer that runs.
+TEST(weight_set, stream_into_refuses_what_it_cannot_serve) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  TempCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer slot = mc->make_shared_buffer(32);
+  ASSERT_TRUE(!slot.empty());
+  EXPECT_FALSE(ws->stream_into("nope.w", slot.contents(), 32));
+  EXPECT_FALSE(ws->stream_into("encoder.w", slot.contents(), 31));
+  EXPECT_FALSE(ws->stream_into("encoder.w", nullptr, 32));
+  // A refusal is not a read.
+  EXPECT_TRUE(ws->stats().streamed_reads == 0u);
 }
 
 // A tensor read BOTH ways keeps the two paths separate: streaming must
