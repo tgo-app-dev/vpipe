@@ -5,6 +5,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/streamed-refill.h"
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
@@ -768,29 +769,6 @@ MetalMiniMaxH3Transformer::interleave_gu_(Linear& l) const
   return true;
 }
 
-// f16 -> bf16 where the bytes already lie. Legitimate only because the
-// two are the SAME WIDTH, which is why the refill below can pread a
-// checkpoint's F16 scales straight into a destination the forward reads
-// as bf16 and convert afterwards. F32 has no such luxury and is why
-// refill_block_ refuses it rather than guessing.
-static void
-f16_to_bf16_inplace_(const SharedBuffer& buf)
-{
-  const std::size_t n = buf.byte_size() / 2;
-  auto* p = static_cast<std::uint16_t*>(buf.contents());
-  for (std::size_t i = 0; i < n; ++i) {
-    // Through memcpy, not a _Float16* aliasing the same memory. Two
-    // pointers of different types over one buffer is exactly the pattern
-    // the optimiser is allowed to assume cannot happen, and it would be
-    // free to hoist the reads above the writes -- at -O2, on a loop this
-    // simple, that is a vectorisation away from reading values this pass
-    // has already overwritten.
-    _Float16 h;
-    std::memcpy(&h, &p[i], sizeof(h));
-    p[i] = f32_to_bf16_((float)h);
-  }
-}
-
 bool
 MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
                                         bool copy_bytes) const
@@ -833,24 +811,22 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
                                          bool with_adaln)
 {
   bool ok = true;
-  // One tensor into the buffer that already holds its predecessor. The
-  // size check is against the CHECKPOINT rather than an expectation:
-  // a slot allocated for one block only fits another if the shapes
-  // genuinely agree, and on a stack where they did not this would
-  // otherwise write the wrong number of bytes and run.
+  // One tensor into the buffer that already holds its predecessor, via
+  // the shared rule (generative-models/shared/streamed-refill.h).
+  //
+  // EVERY tensor of an H3 block is servable -- the checkpoint is BF16,
+  // U32 codes and F16 scales throughout -- so kUnservable here is not
+  // the ordinary case it is for a stack carrying f32 tables, and the
+  // honest thing is to stop rather than to half-fill a slot the forward
+  // is about to read. A model whose blocks mix the two builds the odd
+  // tensor its own way instead; see the LTX-2.5 plug-in.
   auto one = [&](const std::string& nm, SharedBuffer& dst) {
     if (!ok) { return; }
     if (dst.empty()) { return; }          // this slot has no such tensor
-    const auto* ti = ws.src().info(nm);
-    if (ti == nullptr || ti->nbytes != dst.byte_size()) { ok = false; return; }
-    const bool raw = ti->dtype == "BF16" || ti->dtype == "U32";
-    const bool f16 = ti->dtype == "F16";
-    if (!raw && !f16) { ok = false; return; }   // F32: widths disagree
-    if (!ws.stream_into(nm, dst.contents(), dst.byte_size())) {
+    if (refill_streamed_tensor(ws, nm, dst, RefillDst::kBf16)
+        != Refill::kFilled) {
       ok = false;
-      return;
     }
-    if (f16) { f16_to_bf16_inplace_(dst); }
   };
   auto lin = [&](const std::string& nm, Linear& l) {
     if (l.quantized) {

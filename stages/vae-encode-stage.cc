@@ -6,6 +6,7 @@
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -203,6 +204,23 @@ std::string
 vae_family_(const std::string& vae_dir)
 {
   namespace fs = std::filesystem;
+  // The same probe the vae-decode twin runs, and for the same reason: a
+  // Comfy-Org repack ships its VAEs as bare .safetensors under `vae/`
+  // with no config.json at all, so the `_class_name` read below finds
+  // nothing and falls through to the "krea2" default -- which then opens
+  // that directory as a Qwen-Image VAE and reports "no readable
+  // checkpoint". The architecture is in the file's `__metadata__` key
+  // instead, and probing for it costs one header read.
+  //
+  // Missing HERE and not there is what a self-contained MiniMax-H3 pack
+  // hits the moment a graph encodes anything: decode resolved, encode
+  // did not, so FL2VA -- whose whole input is two encoded keyframes --
+  // went inert on a checkpoint whose decoder had just loaded from the
+  // same directory.
+  if (!genai::comfy::resolve_component(vae_dir, "vae", "minimax_h3_video_vae",
+                                       {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
   std::ifstream in(fs::path(vae_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -328,10 +346,32 @@ VaeEncodeStage::load_note_(const VpipeFormat& msg) const
 void
 VaeEncodeStage::unload_vae_()
 {
-  if (!_vae && !_flux2_vae && !_mage_vae) { return; }
+  // EVERY family this stage can hold, in the guard and in the resets.
+  // _wan_vae, _h3_vae and _plugin_enc were in neither, so for those the
+  // idle policy unloaded nothing at all: with only one of them held,
+  // every pointer the guard tested was null and this returned early.
+  //
+  // What that cost is not subtle on a bounded box. MiniMax-H3's video
+  // VAE is 5.2 GB and its encoder is what a first-last-frame graph
+  // needs FIRST -- so the two keyframes were encoded, the 5.2 GB stayed
+  // held for the whole denoise, and the DiT then had ~265 MB of GPU
+  // working set to find its scratch in. MEASURED on a 16 GB M5: the
+  // forward was refused at 960x544x90 (needing ~3255 MB) and refused
+  // again at 512x288x39 (~729 MB) with the working set unchanged at
+  // 265 MB, which is the signature of a wall that is not the geometry.
+  //
+  // The decode twin carries the same list and the same note about
+  // _wan_vae; the two are meant to be read together.
+  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+      !_plugin_enc) {
+    return;
+  }
   _vae.reset();
   _flux2_vae.reset();
   _mage_vae.reset();
+  _wan_vae.reset();
+  _h3_vae.reset();
+  _plugin_enc.reset();
   _unloaded = true;
   _quiet_reload = true;
   session()->log_debug(fmt("VaeEncodeStage('{}'): VAE encoder unloaded (idle)",
@@ -1078,6 +1118,12 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         "VaeEncodeStage('{}'): keyframe [{}x{}] -> anchor latent "
         "[{}, {}, {}, {}]", this->id(), W, H, Cz, lf, lh, lw));
     ++_latents_emitted;
+    // Before the write, as every other family here does it. This branch
+    // was the one that did not, and MiniMax-H3 is the worst family to
+    // miss: its video VAE is 5.2 GB, and a first-last-frame graph
+    // encodes its two keyframes FIRST -- so the encoder stayed held for
+    // the entire denoise, on exactly the run that had least room for it.
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }

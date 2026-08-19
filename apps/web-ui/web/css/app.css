@@ -1166,7 +1166,7 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   /* Plain LTR: the leading "/" must stay put. Long paths are shortened in
      JS with a middle ellipsis (see truncateMiddle), not a direction:rtl
      left-ellipsis -- that reordered the leading neutral "/" to the wrong
-     end so "/Volumes/wfang/temp" rendered as "Volumes/wfang/temp". */
+     end so "/Volumes/media/temp" rendered as "Volumes/media/temp". */
 }
 .fs-row.sel .fs-mount-path { color: rgba(255,255,255,.8); }
 /* Directory-listing progress: an hourglass that flips while the backend

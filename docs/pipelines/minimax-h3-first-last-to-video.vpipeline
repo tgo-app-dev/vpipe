@@ -1,5 +1,5 @@
 {
-  "id": "minimax-h3-text-to-video-turbo",
+  "id": "minimax-h3-first-last-to-video",
   "stages": [
     {
       "id": "model-select",
@@ -10,11 +10,90 @@
       }
     },
     {
+      "id": "load-image",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "reference.jpg"
+        ]
+      }
+    },
+    {
+      "id": "first-frame",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 960,
+        "height": 544,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "last-frame",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 960,
+        "height": 544,
+        "fit": "manual",
+        "scale": 1.6875,
+        "src_x": 455,
+        "src_y": 239,
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "vae-encode-first",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "first-frame",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-encode-last",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "last-frame",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
       "id": "text-prompt",
       "type": "text-prompt",
       "iports": [],
       "config": {
-        "text": "Cinematic video of a young Asian female pianist passionately playing a grand piano."
+        "text": "A slow cinematic dolly-in across a calm lake toward a tiered pagoda tower on a wooded hill, painted in thick impressionist oil strokes; the water ripples and glints with scattered gold, clouds drift across a pale sky, the brushwork shimmers as the camera closes in. Gentle lapping water, a soft breeze through pines, distant birdsong."
       }
     },
     {
@@ -76,11 +155,11 @@
           "oport": 0
         },
         {
-          "src": "",
+          "src": "vae-encode-first",
           "oport": 0
         },
         {
-          "src": "",
+          "src": "vae-encode-last",
           "oport": 0
         },
         {
@@ -99,21 +178,21 @@
       "config": {
         "height": 544,
         "width": 960,
-        "frames": 120,
+        "frames": 124,
         "fps": 24,
         "steps": 6,
-        "seed": 6,
+        "seed": 11,
         "i8_gemm": true,
         "unload_when_idle": "always"
       }
     },
     {
-      "id": "audio-vae-decode",
-      "type": "audio-vae-decode",
+      "id": "vae-decode",
+      "type": "vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 1
+          "oport": 0
         },
         {
           "src": "model-select",
@@ -123,12 +202,12 @@
       "config": {}
     },
     {
-      "id": "vae-decode",
-      "type": "vae-decode",
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 0
+          "oport": 1
         },
         {
           "src": "model-select",
@@ -164,7 +243,7 @@
         }
       ],
       "config": {
-        "output_url": "minimax-h3-text-to-video-turbo.mp4",
+        "output_url": "minimax-h3-first-last-to-video.mp4",
         "enable_video": true,
         "enable_audio": true
       }

@@ -405,7 +405,27 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
         areq.latents_per_second = o.at("latents_per_second").as_real(0.0);
       }
     }
-    areq.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+    // The same lazy bar the video twin opens, and for the same reason:
+    // `progress` carries counts as well as the cancel answer, and
+    // discarding them left a registered family with no way to say
+    // anything. Lazy because a family that never reports would otherwise
+    // show a bar stuck at zero.
+    //
+    // An audio decode is the shorter of the two by far, so this will
+    // often open and close inside a second -- which is the right outcome,
+    // not a reason to skip it: what it costs when there is nothing to
+    // report is one inert object.
+    UiProgress abar;
+    bool abar_open = false;
+    areq.progress = [&ctx, &abar, &abar_open, this](int done, int total) {
+      if (!abar_open) {
+        abar_open = true;
+        abar = session()->open_progress("audio vae decode");
+      }
+      abar.update(done < 0 ? 0 : (std::uint64_t)done,
+                  total < 0 ? 0 : (std::uint64_t)total);
+      return !ctx.stop_requested();
+    };
 
     std::vector<float> apcm;
     std::vector<int> ashape;
@@ -413,6 +433,7 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
     bool aok = false;
     try {
       aok = _plugin_dec->decode(areq, &apcm, &ashape, &aerr);
+      abar.finish();
     } catch (const std::exception& e) {
       session()->warn(fmt(
           "AudioVaeDecodeStage('{}'): family '{}' threw decoding: {}; "

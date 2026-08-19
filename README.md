@@ -10,6 +10,12 @@
 - **Reproducible Composer:** save layouts, prompts, params, and model config with each pipeline spec.
 - **Easy to use:** macOS app, web UI control, and remote access from a phone browser.
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-red)
+![Python](https://img.shields.io/badge/Python-bindings-green)
+![Status](https://img.shields.io/badge/Status-alpha-orange)
+
 **[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
 · **[Run the first example](#first-example)**
 · **[Try image editing](docs/KLEIN-KV.md)**
@@ -33,7 +39,7 @@ preview panels, profiler, and reproducible model configuration.*
   Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
 
-  * 5s @ 0.5 MP 24p, 6 steps takes **13 minutes** on a fanless
+  * 5s @ 0.5 MP 24p, 6 steps takes **~13 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
 - Runs **LTX-2.5** on an Apple Silicon Mac — a 22B model generating video
@@ -58,6 +64,37 @@ preview panels, profiler, and reproducible model configuration.*
 
 [^2]: Build from source artifact size, not counting dynamically linked
       dependencies like FFmpeg, libcurl.
+
+## Flagship workloads / performance
+
+### MiniMax H3 Turbo LoRA — matched runs
+
+Matched MiniMax H3 runs using the same **960 × 544, 124-frame, 6-DiT-step**
+workload and settings for both runtimes:
+
+| Hardware | VPIPE | h3.c |
+| --- | ---: | ---: |
+| M4 Pro Mac mini, 64 GB RAM | **21 min 50 sec** | 27 min 40 sec |
+| Base M5 MacBook Air 15", 16 GB RAM | **12 min 15 sec** | 16 min 22 sec |
+
+These numbers are workload-specific measurements, not a universal runtime
+speed claim. [^3]
+
+**[Watch the VPIPE vs h3.c speed & quality comparison on YouTube →](https://www.youtube.com/shorts/i3F_Fzgt1UM)**
+
+| Workload family | Verified status |
+| --- | --- |
+| Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
+| Image generation / editing | **FLUX.2-klein-9b-kv:** 4-bit reference image editing with 4-step default pipeline and compare-image UI on Apple Silicon. |
+| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. |
+
+See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
+settings, caveats, and Turbo LoRA notes; see
+**[docs/KLEIN-KV.md](docs/KLEIN-KV.md)** and
+**[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
+workflows.
+
+[^3]: These are matched MiniMax H3 runs, not a general speed claim.
 
 ## Local AI use cases
 
@@ -91,12 +128,6 @@ saved UI layouts and a native Apple Silicon compute backend, rather than a
 large general-purpose node ecosystem.
 
 ---
-
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
-![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-GPU%20%2B%20ANE-red)
-![Python](https://img.shields.io/badge/Python-bindings-green)
-![Status](https://img.shields.io/badge/Status-alpha-orange)
 
 [**Install**](#install) · [**Quickstart**](#quickstart) ·
 [**First example**](#first-example) · [**Overview**](#overview) ·

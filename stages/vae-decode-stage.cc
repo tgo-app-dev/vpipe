@@ -1148,13 +1148,39 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         fps = o.at("fps").as_real(fps);
       }
     }
+    // The bar the family's `progress` feeds. Declared BEFORE the request
+    // so it outlives the callback that captures it.
+    //
+    // OPENED LAZILY, on the first report. `progress` is optional -- a
+    // family may never call it -- and a bar opened up front would then
+    // sit at zero for the whole decode, which reads worse than the
+    // silence it replaced. A default-constructed UiProgress is inert, so
+    // a family that stays quiet costs nothing and shows nothing.
+    UiProgress bar;
+    bool bar_open = false;
     genai::VaeDecodeRequest req;
     req.latent = tbp->as_f32();
     req.shape.reserve(tbp->shape.size());
     for (std::int64_t d : tbp->shape) { req.shape.push_back((int)d); }
     req.fps      = fps;
     req.sideband = &tbp->sideband;
-    req.progress = [&ctx](int, int) { return !ctx.stop_requested(); };
+    // BOTH of the things this callback is for. It was wired as a
+    // cancellation predicate alone, with `done` and `total` discarded --
+    // so a registered family had no way to publish progress at all, and
+    // the only "vae decode" bar in the tree was the built-in MiniMax-H3
+    // one driven by a method the plugin interface does not have. A VAE
+    // decode is tens of seconds to a minute at production geometry; that
+    // is exactly the wait a bar exists for, and there was no reason it
+    // should have depended on which side of the registry the model sat.
+    req.progress = [&ctx, &bar, &bar_open, this](int done, int total) {
+      if (!bar_open) {
+        bar_open = true;
+        bar = session()->open_progress("vae decode");
+      }
+      bar.update(done < 0 ? 0 : (std::uint64_t)done,
+                 total < 0 ? 0 : (std::uint64_t)total);
+      return !ctx.stop_requested();
+    };
 
     // The frames are collected and written AFTERWARDS for the reason the
     // wan branch gives above: ctx.write is a coroutine and the sink is a
@@ -1223,6 +1249,10 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
                          kPerfLlmVaeBegin, (std::uint64_t)want);
       ok = _plugin_dec->decode(req, sink, &derr);
+      // Closed here rather than at scope exit: what follows is the frame
+      // write-out, and a bar left open across it reports the decode as
+      // still running when it is not.
+      bar.finish();
     } catch (const std::exception& e) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): VAE family '{}' threw decoding: {}; "

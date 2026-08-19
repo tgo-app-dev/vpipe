@@ -473,11 +473,15 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     # machinery the reader cannot call. dit-block-progress.h is the reason
     # a high-resolution denoise does not read as a stall -- per-STEP is
     # tens of seconds of silence at 1024px, and every DiT already walks its
-    # blocks one at a time.
+    # blocks one at a time. streamed-refill.h is the read itself: block
+    # streaming as documented costs a block-sized allocation and a
+    # demand-faulted copy per block per step, and this is how a loader
+    # stops paying both.
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-residency.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-pin.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/streamed-refill.h
         DESTINATION include/generative-models/shared)
     # weight-set.h's own dependencies. The SDK's header set has to be
     # CLOSED under #include or it does not compile -- a plugin cannot

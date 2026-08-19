@@ -6,7 +6,7 @@
       "type": "model-select",
       "iports": [],
       "config": {
-        "hf_dir": "local/MiniMax-H3-FL2VA-4bit"
+        "hf_dir": "local/MiniMax-H3-FL2VA-8bit"
       }
     },
     {
@@ -162,7 +162,7 @@
         }
       ],
       "config": {
-        "output_url": "/minimax-h3-text-to-video.mp4",
+        "output_url": "minimax-h3-text-to-video.mp4",
         "enable_video": true,
         "enable_audio": true
       }

@@ -141,6 +141,7 @@ Which accessor to use:
 | keeping a *transform* of it | `derived(key, build, part)` | yes, not parkable |
 | consuming it and dropping it | `read(name, mc, res)` | no |
 | re-reading it per forward | `stream_tensor` / `stream_derived` | no, counted |
+| re-reading it into a buffer you already own | `stream_into` | no, counted |
 
 The rule is **cache what the model keeps; read uncached what it consumes.**
 Pieces row-concatenated into a fused matrix, bytes copied into a host
@@ -548,6 +549,64 @@ actually pins, so peers do not size against weights that are never there.
 > keeping anything resident. It is a record of a decision that was taken,
 > not a prediction.
 
+### Reading a streamed block
+
+Having decided to stream, *how* the bytes arrive is the rest of the cost.
+The obvious shape — allocate a destination per tensor, fill it with
+`stream_tensor` — pays twice: for the allocation, and for demand-faulting
+the shard's mapping a cluster at a time.
+
+MEASURED on an Apple Silicon laptop over a 206 MB block, arms interleaved
+and their **order rotated** (rotating only the file region flatters
+whichever arm runs first):
+
+| Read shape | Rate |
+|---|---|
+| fresh allocation + `memcpy` from the mapping | 0.86–1.48 GB/s |
+| `pread` into a destination that already exists | 6.7–6.9 GB/s |
+
+The spread matters as much as the mean: the mapped rate moves by 2× between
+rounds where `pread`'s does not, and a streamed forward turns that into GPU
+occupancy that will not sit still.
+
+So keep the destinations. Two blocks' worth, alternating, refilled in
+place — which is also what makes a prefetch free, since the buffer the
+reader fills is already allocated and no longer a growth question.
+`generative-models/shared/streamed-refill.h` is the read:
+
+```cpp
+switch (refill_streamed_tensor(ws, name, dst, RefillDst::kRaw)) {
+  case Refill::kFilled:     break;                  // ready
+  case Refill::kUnservable: build_it_the_old_way(); break;
+  case Refill::kFailed:     return false;           // dst is unusable
+}
+```
+
+**`kUnservable` is about one tensor, not the block.** It means "build this
+one however you did before" — not "give up". Blocks are rarely uniform:
+a released video DiT's block is 140 tensors of which 78 are servable raw
+(387 MB) and 62 are not (24 MB of f16 scales and f32 modulation tables).
+A rule that abandoned the block for the awkward 24 MB would buy nothing.
+`kFailed` is the separate case where the checkpoint and the destination
+disagree and the buffer is now partly written.
+
+**Ask `refill_serves()` before allocating**, if you still allocate per
+tensor. Otherwise the tensors that fall back each cost a buffer that is
+immediately dropped.
+
+> **Trap: the destination dtype is yours to state, and there is no
+> default.** `kRaw` places the checkpoint's own bytes; `kBf16` also
+> converts f16, which is possible only because f16 and bf16 are the same
+> width. The two differ *only* for f16 — and a wrong answer there is
+> silent, because the buffer is the right size and full of plausible
+> numbers that are off by an exponent bias. If your loader converts f16 by
+> some other route, ask for `kRaw`, or it will be converted twice.
+
+A model that is not ready to restructure who owns its buffers can still
+change only the *fill* and keep the per-block allocation. That is most of
+the win — of the mapped path's cost above, the allocation was roughly a
+fifth and the faulting the rest.
+
 ---
 
 ## 5. Block residency — growing back into free RAM
@@ -806,6 +865,16 @@ budget on the strength of it — if you want your model excluded from a
 peer's sizing, the mechanism is a phase claim, which carries a promise
 the host audits.
 
+**`req.progress` is not optional either, and not only about progress.**
+The same callback carries the counts a progress bar shows *and* the
+host's answer to "should I still be running?". A `decode()` that never
+calls it publishes nothing — and, more to the point, **cannot be
+cancelled**: a stop pressed during a minute-long decode does nothing
+until the decode has finished anyway. Call it wherever your decode
+already synchronises — per tile, per block, per chunk — and treat `false`
+as "return now". Nothing else can stop you, because nothing else is
+looking.
+
 ### What the host will not do for you
 
 - It will not discover a checkpoint you did not declare.
@@ -866,6 +935,9 @@ For a stage that holds one:
 
 If it streams blocks:
 
+- [ ] Blocks are read into destinations the model keeps, refilled in place
+      — not allocated and mapped-copied per block. State the destination
+      dtype (`kRaw` / `kBf16`) rather than taking a default; there is none.
 - [ ] `set_residency_reserve()` is actually called — with a real figure, or
       with an explicit `0`.
 - [ ] `note_reserve_allocated()` if activations are allocated before the

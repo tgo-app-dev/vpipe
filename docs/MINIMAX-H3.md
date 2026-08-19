@@ -25,18 +25,26 @@ arrives in **8–16 steps** instead of 30+.
 
 ### Disk space
 
-The published checkpoint is bf16 and very large; vpipe quantizes it to 4-bit
+The published checkpoint is bf16 and very large; vpipe quantizes it to 8-bit
 once, up front. Both copies exist while that runs:
 
 | | |
 |---|---|
 | Source repack (`Comfy-Org/MiniMax-H3`, bf16) | **~115 GB** |
-| Peak while preparing (source + output) | **~155 GB** |
-| 4-bit model, source deleted | **~45 GB** |
+| Peak while preparing (source + output) | **~180 GB** |
+| 8-bit model, source deleted | **~65 GB** |
 | Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+24 GB** 4-bit |
 
 Once preparation finishes you can delete the source repack and keep the
-~45 GB. The 115 GB is a one-time cost, not a standing one.
+~65 GB. The 115 GB is a one-time cost, not a standing one.
+
+**Why 8-bit and not 4.** Quality, at the price of disk and very little else.
+Both widths stream, so neither has to fit in RAM, and the transformer spends
+its time on weights it is reading from storage rather than on how wide they
+are — so moving to 8-bit costs about 20 GB and does not meaningfully change
+how long a clip takes. The 4-bit path still works and is the one to take if
+the disk matters more: set `bits` to 4 in both `model-quantize` stages and
+name the output to match.
 
 > **Keep the download and the output on one filesystem.** Components that
 > quantization does not touch (the VAEs) are **hard-linked** into the output
@@ -44,9 +52,9 @@ Once preparation finishes you can delete the source repack and keep the
 > look. Across two volumes the link fails, vpipe falls back to a real copy,
 > and you pay for those bytes twice.
 
-## The two pipelines
+## The pipelines
 
-- **[`prepare-minimax-h3-4bit.vpipeline`](pipelines/prepare-minimax-h3-4bit.vpipeline)**
+- **[`prepare-minimax-h3-8bit.vpipeline`](pipelines/prepare-minimax-h3-8bit.vpipeline)**
   — download the checkpoint and quantize it. Run once.
 - **[`prepare-minimax-h3-ref2va-4bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)**
   — the same for the **Ref2VA** partition (see
@@ -54,6 +62,9 @@ Once preparation finishes you can delete the source repack and keep the
   you want it; the two share a download.
 - **[`minimax-h3-text-to-video.vpipeline`](pipelines/minimax-h3-text-to-video.vpipeline)**
   — prompt in, `.mp4` with sound out.
+- **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
+  — the same, anchored to an image at both ends (see
+  [More than text in](#more-than-text-in)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
 from `docs/pipelines/` in your clone. Either can be run from the terminal with
@@ -85,8 +96,8 @@ it.
 
 ```sh
 cd ~/vpipe-work                                    # your work directory
-cp ~/src/vpipe/docs/pipelines/prepare-minimax-h3-4bit.vpipeline .
-~/src/vpipe/build/apps/vpipe/vpipe --launch prepare-minimax-h3-4bit.vpipeline
+cp ~/src/vpipe/docs/pipelines/prepare-minimax-h3-8bit.vpipeline .
+~/src/vpipe/build/apps/vpipe/vpipe --launch prepare-minimax-h3-8bit.vpipeline
 ```
 
 The CLI suits this job better than the web UI: it is long, unattended and
@@ -106,22 +117,22 @@ Four stages, in order:
    different transformer files and different tokenizers. A fetch that does
    not say which is refused, with both listed, rather than quietly taking
    the first.
-2. **`model-quantize`** (`target: dit`) — the 33B transformer to 4-bit,
+2. **`model-quantize`** (`target: dit`) — the 33B transformer to 8-bit,
    group size 64. **Leave `quant_modulation: true` alone.** H3's per-block
    AdaLN modulation is not a small side projection the way other DiTs' is —
-   it is **13B of the 33B**, and left at bf16 it holds the "4-bit" checkpoint
-   at ~36 GB, which is most of the reason to quantize at all. vpipe puts it
-   at **8-bit** while the body goes to 4, because the modulation is what the
-   residual scale rides on; the loader detects the per-tensor bit width, so
-   the mix needs no configuration to stay in sync.
+   it is **13B of the 33B**, so leaving it at bf16 would keep 26 GB of the
+   transformer unquantized inside an otherwise-8-bit pack, which is most of
+   the reason to quantize at all. The loader reads the per-tensor bit width
+   out of the checkpoint, so nothing downstream has to be told what was
+   quantized to what.
 3. **`model-quantize`** (`target: text_encoder`) — the Qwen3-VL-32B prompt
-   encoder to 4-bit. Its output, `local/MiniMax-H3-FL2VA-4bit`, is a
+   encoder to 8-bit. Its output, `local/MiniMax-H3-FL2VA-8bit`, is a
    **complete model**: the quantized parts plus everything untouched.
 4. **`model-remove`** — deletes the intermediate from step 2, which exists
    only to feed step 3.
 
 Everything lands under `models/` in the work directory. This takes a while and
-is mostly disk-bound. When it finishes, `local/MiniMax-H3-FL2VA-4bit` is the
+is mostly disk-bound. When it finishes, `local/MiniMax-H3-FL2VA-8bit` is the
 only thing you need; the `Comfy-Org/MiniMax-H3` download can go.
 
 > **Gated repo.** If `model-fetch` reports an authorization failure, accept
@@ -165,11 +176,16 @@ so you point **one** stage at a checkpoint rather than four.
 which decode separately and meet again at `save-video`, muxed into one
 `.mp4`.
 
-The shipped `output_url` is `/minimax-h3-text-to-video.mp4`, and that leading
-`/` is the **sandbox** root, not your filesystem root: under the web UI the
-clip lands at `sandbox/minimax-h3-text-to-video.mp4` in the work directory.
-Run the same graph from the CLI, which has no sandbox, and `/` means what it
-usually does — give it a real path there.
+The shipped `output_url` is **relative** — `minimax-h3-text-to-video.mp4` —
+so the clip lands next to wherever you started vpipe, and the same file works
+from the CLI and the web UI without editing.
+
+Worth knowing if you see the other form: a **leading `/` is the sandbox
+root** under the web UI, not your filesystem root, so `/clip.mp4` there means
+`sandbox/clip.mp4` in the work directory. The CLI has no sandbox, and `/`
+means what it usually does — which on a Mac is a read-only volume, so a graph
+carrying an absolute path from the UI will generate a whole clip and then
+fail to write it.
 
 ### The settings worth knowing
 
@@ -209,26 +225,24 @@ family carries its own.
 ### How long it takes
 
 Measured on the smallest machine that runs this at all — a **fanless
-MacBook Air 15-inch (M5)**, 10-core CPU / 10-core GPU, 16 GB — generating a
-clip a little shorter than the shipped default:
+MacBook Air 15-inch (M5)**, 10-core CPU / 10-core GPU, 16 GB — on the 8-bit
+model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with the
+[Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time:
 
-| 960 × 544 (0.5 MP) · 24 fps · 90 frames (**3.75 s**) · 8 steps | |
-|---|---|
-| sitting on an ice pack | **13 min** |
-| sitting on a desk | **18 min** |
+| frames | clip | |
+|---|---|---|
+| 90 | 3.75 s | **9 min 26 s** |
+| 124 | 5.2 s | **12 min 15 s** |
 
-That is 8 steps, i.e. **draft** quality; 16 steps for a good final clip costs
-about twice as much.
+`steps` is the setting that moves this most, and the Turbo adapter is what
+buys the low count: without it, plan on 8 steps for a draft and 16 for a
+final clip, at roughly proportional cost.
 
-Same settings, same machine: the five-minute spread above is **thermal**. This
-model holds the GPU flat out for the whole run, and a fanless Mac clocks down
-long before it ends — so where the machine sits matters about as much as what
-you set. On a fan-cooled Mac expect the faster figure.
-
-`steps` is the setting that moves this most, and the
-[Turbo LoRA](#fewer-steps--the-turbo-lora) is the way to cut it: on the same
-Air, 6 steps with the adapter produce **124 frames in 13 min 36 s** — a third
-more video for about the same wait.
+> **Both figures were measured with the chassis sitting on an ice pack.**
+> That is not a tuning tip so much as a warning about what the numbers are:
+> this model holds the GPU flat out for the whole run, and a fanless Mac
+> clocks down long before it ends. On a warm desk expect slower — how much
+> slower has not been measured here, so no figure for it is quoted.
 
 ### More than text in
 
@@ -237,6 +251,64 @@ The checkpoint is named **FL2VA** — *first-and-last to video and audio*. Feed
 anchored to it as the opening frame; add a second `vae-encode` on port 6 and
 the model interpolates between two stills. Both anchors must be encoded at
 the same resolution the clip is generated at.
+
+[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)
+is that graph, worked through. Drop a `reference.jpg` beside it and run it the
+way you ran the text-to-video one:
+
+```sh
+cd ~/vpipe-work                                    # the work directory again
+cp ~/src/vpipe/docs/pipelines/minimax-h3-first-last-to-video.vpipeline .
+cp <your picture> reference.jpg
+~/src/vpipe/build/apps/vpipe/vpipe --launch minimax-h3-first-last-to-video.vpipeline
+```
+
+Run it from that directory, not from anywhere else: `models/` and the model
+registry are both resolved relative to where vpipe starts, so a graph naming
+`local/MiniMax-H3-FL2VA-8bit` from the wrong place reports every stage
+inert.
+
+It builds **both anchors from one picture**, which is what turns a still into
+a camera move rather than a cross-fade. `load-image` fans out to two
+`image-resample` stages:
+
+| stage | `fit` | what it frames |
+|---|---|---|
+| `first-frame` | `crop` | the whole picture, centre-cropped to 960x544 |
+| `last-frame` | `manual` | a tighter window inside it, at `scale` 1.6875 |
+
+The model fills in the ~5 seconds between them, so the clip reads as a slow
+push-in. Swap the two and it pulls out.
+
+**Both resamplers use `algorithm: lanczos`.** The anchors are the only place
+the source picture's detail enters the model — everything after them is
+latents — so this is the one resize in the graph worth paying for. Bilinear
+softens the fine texture (brush strokes, foliage, fabric) and the VAE then
+encodes the softening as if you had meant it.
+
+**The `manual` numbers describe a 1024x1024 source.** `src_x`/`src_y` are
+absolute pixels into your own image and `scale` is the resample ratio, so the
+window is `width / scale` by `height / scale` pixels starting at that corner —
+960 / 1.6875 = 569 wide here. Point it at a picture of another size and you
+will frame something else. Two ways out: retune the three numbers, or give the
+two `image-resample` stages **two different pictures** with `fit: crop` on
+both, which needs no arithmetic and is the plain reading of *first and last*.
+
+**It applies the Turbo LoRA**, which is what lets it run at 6 steps — so
+fetch the adapter first (see [Fewer steps](#fewer-steps--the-turbo-lora)).
+If you would rather not, delete the `lora` and `lora_scale` keys from
+`minimax-h3-model-config` and put `steps` back up to 8; everything else in
+the graph is the same.
+
+`frames` is **124**, not the 120 the text-to-video examples use, because H3
+chunks video 17 frames at a time keeping 5 latents — any count is rounded up
+to the next `17n + 5`. Naming one that already fits means the number in the
+file is the number you get.
+
+The two `vae-encode` stages release the VAE as soon as their keyframe is
+encoded, which matters more than it sounds: H3's video VAE is 5.2 GB and the
+DiT wants its scratch immediately afterwards. On a 16 GB machine holding both
+at once is the difference between a clip and a refusal.
 
 ### Conditioning on references (Ref2VA)
 
@@ -407,7 +479,7 @@ config stage, and `steps` down from 8 to **6**.
 vpipe --launch docs/pipelines/minimax-h3-text-to-video-turbo.vpipeline
 ```
 
-It still needs the base model from step 1 (`local/MiniMax-H3-FL2VA-4bit`) —
+It still needs the base model from step 1 (`local/MiniMax-H3-FL2VA-8bit`) —
 the adapter replaces the step count, not the checkpoint. Everything else in
 the graph is untouched, which is the point: applying a LoRA is a config edit
 on one stage, not a different pipeline.
@@ -496,8 +568,8 @@ adapter against its bf16 base:
 
 The update is 2–4e-4 relative to the weights; bf16's step is ~4e-3 relative.
 For **94% of elements `W + dW` rounds straight back to `W`** — the correction
-is an order of magnitude below the storage resolution. A 4-bit base, which is
-what a 16 GB box runs, is coarser again. Upstream says the same thing in
+is an order of magnitude below the storage resolution. A quantized base —
+8-bit here, 4-bit if you chose it — is coarser again. Upstream says the same thing in
 passing: its ComfyUI node applies the LoRA at run time by default and calls
 merging "a bit softer".
 
@@ -566,18 +638,20 @@ delta onto another head's `k`, in all 50 blocks, with nothing to report.
 never fully resident. vpipe decides this per run and says what it chose in the
 log.
 
-**Weight streaming.** At 4-bit the transformer is ~24 GB and the prompt
-encoder ~15 GB, on a machine with 16 GB. Both stream their layers from disk
+**Weight streaming.** At 8-bit the transformer is ~33 GB and the prompt
+encoder ~27 GB, on a machine with 16 GB. Both stream their layers from disk
 instead of loading whole, so peak memory is set by the *working set*, not by
 the checkpoint. `unload_when_idle: always` on the conditioner also means the
 prompt encoder is gone before the denoise starts — the two never share the
 machine.
 
-**Adaptive residency.** Streaming everything, every step, re-reads ~4.5 GB per
-forward pass. So the transformer *keeps* blocks after using them for as long
-as free memory allows, growing its resident set into whatever the box has
-spare and giving it back under pressure. On a 16 GB Mac it settles around
-10 GB resident.
+**Adaptive residency.** Streaming everything, every step, re-reads ~8.9 GB per
+forward pass at 8-bit. So the transformer *keeps* blocks after using them for
+as long as free memory allows, growing its resident set into whatever the box
+has spare and giving it back under pressure. How much that is depends on what
+else is in the machine: on a 16 GB Air with both VAEs also loaded it settles
+at a handful of blocks — a few GB — and sheds when it measures its own pages
+leaving RAM.
 
 **This is where more memory pays.** The resident set is bounded by free RAM
 and nothing else, so a 32 or 64 GB machine holds proportionally more of the

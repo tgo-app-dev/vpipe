@@ -17,6 +17,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/streamed-refill.h"
 #include "generative-models/weight-set.h"
 
 #include <algorithm>
@@ -146,6 +147,64 @@ private:
     return ++n;
   }
   string _dir;
+};
+
+
+// A checkpoint holding one tensor of each dtype a streamed block meets:
+// BF16 and U32 (raw), F16 (same width, converted in place) and F32 (half
+// the width of its bf16 destination, so unservable). Sizes are tiny --
+// what is under test is the DECISION, not the throughput.
+class MixedCheckpoint {
+public:
+  MixedCheckpoint()
+  {
+    namespace fs = std::filesystem;
+    _dir = (fs::temp_directory_path() /
+            ("vpipe-ws-mixed-" + to_string(::getpid()) + "-" +
+             to_string(next_id_()))).string();
+    fs::create_directories(_dir);
+    for (int i = 0; i < 8; ++i) {
+      _bf[i] = (uint16_t)(0x3f80 + i);            // ~1.0 upward, bf16
+      _u32[i] = 0x01020304u + (uint32_t)i;
+      _h[i] = (_Float16)(0.5f + 0.125f * (float)i);
+      _f32[i] = 1.5f + (float)i;
+    }
+    string hdr =
+        "{\"raw.bf16\":{\"dtype\":\"BF16\",\"shape\":[8],"
+        "\"data_offsets\":[0,16]},"
+        "\"raw.u32\":{\"dtype\":\"U32\",\"shape\":[8],"
+        "\"data_offsets\":[16,48]},"
+        "\"conv.f16\":{\"dtype\":\"F16\",\"shape\":[8],"
+        "\"data_offsets\":[48,64]},"
+        "\"wide.f32\":{\"dtype\":\"F32\",\"shape\":[8],"
+        "\"data_offsets\":[64,96]}}";
+    while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
+    ofstream out(_dir + "/model.safetensors", ios::binary);
+    const uint64_t n = hdr.size();
+    out.write(reinterpret_cast<const char*>(&n), 8);
+    out.write(hdr.data(), (streamsize)hdr.size());
+    out.write(reinterpret_cast<const char*>(_bf), 16);
+    out.write(reinterpret_cast<const char*>(_u32), 32);
+    out.write(reinterpret_cast<const char*>(_h), 16);
+    out.write(reinterpret_cast<const char*>(_f32), 32);
+  }
+  ~MixedCheckpoint()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+  const string&   dir() const { return _dir; }
+  const uint16_t* bf()  const { return _bf; }
+  const uint32_t* u32() const { return _u32; }
+  const _Float16* h()   const { return _h; }
+
+private:
+  static int next_id_() { static int n = 2000; return ++n; }
+  string   _dir;
+  uint16_t _bf[8]{};
+  uint32_t _u32[8]{};
+  _Float16 _h[8]{};
+  float    _f32[8]{};
 };
 
 }  // namespace
@@ -441,6 +500,118 @@ TEST(weight_set, stream_into_refuses_what_it_cannot_serve) {
   EXPECT_FALSE(ws->stream_into("encoder.w", nullptr, 32));
   // A refusal is not a read.
   EXPECT_TRUE(ws->stats().streamed_reads == 0u);
+}
+
+// The per-tensor refill rule, which is what a block-streamed DiT reaches
+// for once it keeps its destinations instead of allocating them.
+//
+// Raw dtypes land byte-for-byte; f16 is converted where it lies, because
+// it is the same WIDTH as the bf16 the forward reads.
+TEST(weight_set, refill_places_raw_and_converts_f16) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  MixedCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  SharedBuffer bf = mc->make_shared_buffer(16);
+  SharedBuffer u32 = mc->make_shared_buffer(32);
+  SharedBuffer h = mc->make_shared_buffer(16);
+  ASSERT_TRUE(!bf.empty() && !u32.empty() && !h.empty());
+
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "raw.bf16", bf, RefillDst::kBf16)
+              == Refill::kFilled);
+  EXPECT_TRUE(std::memcmp(bf.contents(), ck.bf(), 16) == 0);
+
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "raw.u32", u32, RefillDst::kBf16)
+              == Refill::kFilled);
+  EXPECT_TRUE(std::memcmp(u32.contents(), ck.u32(), 32) == 0);
+
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "conv.f16", h, RefillDst::kBf16)
+              == Refill::kFilled);
+  const auto* got = static_cast<const std::uint16_t*>(h.contents());
+  for (int i = 0; i < 8; ++i) {
+    // Computed here rather than with the same helper, so this compares
+    // the conversion against its definition and not against itself.
+    const float f = (float)ck.h()[i];
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const std::uint16_t want =
+        (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    EXPECT_TRUE(got[i] == want);
+  }
+
+  // REFILLING IS REPEATABLE. The whole point of a reusable destination is
+  // that the next block writes over the last one, and an f16 tensor
+  // converted twice would compound -- so the second pass has to land on
+  // the same bytes as the first.
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "conv.f16", h, RefillDst::kBf16)
+              == Refill::kFilled);
+  const auto* again = static_cast<const std::uint16_t*>(h.contents());
+  for (int i = 0; i < 8; ++i) {
+    const float f = (float)ck.h()[i];
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    EXPECT_TRUE(again[i] ==
+                (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+  }
+}
+
+// The two refusals, which mean opposite things to a caller: one says
+// "build this tensor the way you always did", the other says "the buffer
+// is not usable, rebuild it".
+TEST(weight_set, refill_separates_unservable_from_failed) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  MixedCheckpoint ck;
+
+  auto ws = WeightSet::open(ck.dir(), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+
+  // f32 into a half-width destination: expected, cheap, and NOT a
+  // failure -- this is the case that must not turn a whole block's
+  // refill off. LTX-2.5 blocks carry six such tensors among 140.
+  SharedBuffer half = mc->make_shared_buffer(16);
+  ASSERT_TRUE(!half.empty());
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "wide.f32", half,
+                                     RefillDst::kBf16)
+              == Refill::kUnservable);
+
+  // An empty destination is nothing to fill, not an error.
+  SharedBuffer none;
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "raw.bf16", none,
+                                     RefillDst::kBf16)
+              == Refill::kUnservable);
+
+  // A size that disagrees with the checkpoint IS an error: filling it
+  // would write the wrong number of bytes and run.
+  SharedBuffer wrong = mc->make_shared_buffer(24);
+  ASSERT_TRUE(!wrong.empty());
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "raw.bf16", wrong,
+                                     RefillDst::kBf16)
+              == Refill::kFailed);
+
+  // So is a tensor that is not there.
+  SharedBuffer ok = mc->make_shared_buffer(16);
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "nope", ok, RefillDst::kBf16)
+              == Refill::kFailed);
+
+  // f16 under kRaw is unservable too, and THAT is the one worth pinning:
+  // the same tensor is servable as bf16 and not as raw bytes, so a
+  // caller that converts f16 by another route gets its own bytes back
+  // rather than a second conversion.
+  SharedBuffer h = mc->make_shared_buffer(16);
+  ASSERT_TRUE(!h.empty());
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "conv.f16", h, RefillDst::kRaw)
+              == Refill::kUnservable);
+  EXPECT_TRUE(refill_streamed_tensor(*ws, "conv.f16", h, RefillDst::kBf16)
+              == Refill::kFilled);
+
+  // Only the servable one counted as a read.
+  EXPECT_TRUE(ws->stats().streamed_reads == 1u);
 }
 
 // A tensor read BOTH ways keeps the two paths separate: streaming must

@@ -1,5 +1,5 @@
 {
-  "id": "prepare-minimax-h3-4bit",
+  "id": "prepare-minimax-h3-8bit",
   "stages": [
     {
       "id": "fetch",
@@ -24,9 +24,9 @@
       ],
       "config": {
         "src_model": "Comfy-Org/MiniMax-H3",
-        "output_name": "local/MiniMax-H3-FL2VA-4bit-dit",
+        "output_name": "local/MiniMax-H3-FL2VA-8bit-dit",
         "target": "dit",
-        "bits": 4,
+        "bits": 8,
         "group_size": 64,
         "quant_modulation": true,
         "skip_existing": false
@@ -42,10 +42,10 @@
         }
       ],
       "config": {
-        "src_model": "local/MiniMax-H3-FL2VA-4bit-dit",
-        "output_name": "local/MiniMax-H3-FL2VA-4bit",
+        "src_model": "local/MiniMax-H3-FL2VA-8bit-dit",
+        "output_name": "local/MiniMax-H3-FL2VA-8bit",
         "target": "text_encoder",
-        "bits": 4,
+        "bits": 8,
         "group_size": 64,
         "skip_existing": false
       }
@@ -60,7 +60,7 @@
         }
       ],
       "config": {
-        "model": "local/MiniMax-H3-FL2VA-4bit-dit",
+        "model": "local/MiniMax-H3-FL2VA-8bit-dit",
         "delete_files": true,
         "missing_ok": true
       }
