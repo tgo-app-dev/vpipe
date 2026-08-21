@@ -1,5 +1,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
+#include "generative-models/shared/stream-pin.h"
+
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/context-manager.h"
@@ -152,6 +154,14 @@ comfy_config_(const std::string& file, MiniMaxH3TextEncoder::Config& out,
 }
 
 }  // namespace
+
+std::size_t
+MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
+{
+  auto wts = MetalLlamaWeights::open_model(enc_dir);
+  if (!wts.has_value()) { return 0; }
+  return stream_floor_bytes(*wts, "model.layers.");
+}
 
 std::string
 MiniMaxH3TextEncoder::resolve_encoder_dir(const std::string& path)

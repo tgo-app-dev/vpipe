@@ -7,6 +7,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/audio-video/video-tokens.h"
+#include "stages/model-provenance.h"
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -178,7 +179,12 @@ RgbToVideoStage::process(RuntimeContext& ctx)
     const long long num = (long long)std::llround(fps * 1000.0);
     p.frame_rate = AVRational{(int)num, 1000};
     p.time_base  = AVRational{1000, (int)num};
-    co_await ctx.write(0, std::make_unique<VideoStreamParamsPayload>(p));
+    auto hdr = std::make_unique<VideoStreamParamsPayload>(p);
+    // Provenance rides on the HEADER because there is nowhere else for
+    // it: a FrameRef is a bare AVFrame with no sideband, and the sink
+    // needs the name before it writes the container header anyway.
+    hdr->model_name = provenance::model_name(tbp->sideband);
+    co_await ctx.write(0, std::move(hdr));
     _header_sent = true;
     session()->log_debug(fmt(
         "RgbToVideoStage('{}'): stream header {}x{} {} @ {:.3f} fps",

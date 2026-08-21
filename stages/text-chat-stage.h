@@ -148,6 +148,8 @@ public:
   // the diffusion stages -- which cannot see it from their own config --
   // size the box against it. See Stage::declare_resources.
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 

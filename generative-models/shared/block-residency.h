@@ -253,14 +253,34 @@ class BlockResidency {
     if (block_bytes > _block_hint) { _block_hint = block_bytes; }
   }
 
-  // How many blocks a single forward may add. Default 8: enough that a
-  // short schedule still reaches a useful resident set within a few
-  // steps, small enough that an overshoot is a few blocks rather than a
-  // whole checkpoint.
+  // The PROBE: how many blocks the first forward may add, before any
+  // measurement of this box exists. Every healthy forward then DOUBLES
+  // it, and any shed puts it back here.
+  //
+  // Why a probe-and-ramp rather than a fixed number, and why not a
+  // number spread over the schedule. What this bounds is the commitment
+  // made before the first evidence arrives -- which is a question about
+  // how much ROOM there is, not about how many steps are left. Sizing it
+  // from the schedule holds a nearly empty box back for no reason (a
+  // 5-step run would reach full residency only on its last forward,
+  // where nothing can use it) and lets a long one commit the whole
+  // checkpoint on evidence it has not gathered yet.
+  //
+  // Doubling is what makes "as much as fits, as early as possible"
+  // compatible with "learn before committing": the probe is one
+  // forward's worth of risk, and two or three healthy forwards reach the
+  // whole stack. Retreat stays multiplicative in the other direction --
+  // a shed drops straight back to the probe rather than decaying -- so
+  // the ramp cannot walk back up into pressure it has just been told
+  // about.
   void set_per_forward_cap(int blocks)
   {
-    _per_forward_cap = blocks > 0 ? blocks : 1;
+    _cap_probe = blocks > 0 ? blocks : 1;
+    _per_forward_cap = _cap_probe;
   }
+
+  // The cap in force right now, after any ramping. For reporting.
+  int per_forward_cap() const { return _per_forward_cap; }
 
   // Has THIS PROCESS's compressed footprint grown since the last
   // forward? One task_info read by the caller, and the gate on the page
@@ -329,6 +349,12 @@ class BlockResidency {
   void note_healthy_forward()
   {
     if (_shed_this_forward) { return; }
+    // The ramp, and it is deliberately OUTSIDE the ceiling test below:
+    // a box that has never shed has no ceiling, and that is exactly the
+    // box that should be opening up fastest. Saturating rather than
+    // wrapping -- an int that laps is a cap of nothing.
+    if (_per_forward_cap < kCapMax / 2) { _per_forward_cap *= 2; }
+    else { _per_forward_cap = kCapMax; }
     if (_ceiling == kNoCeiling || _block_hint == 0) { return; }
     if (++_quiet < _quiet_forwards) { return; }
     _quiet = 0;
@@ -380,6 +406,10 @@ class BlockResidency {
       if (got > _block_hint) { _block_hint = got; }
     }
     if (freed > 0) {
+      // Back to one forward's worth of risk. The ceiling below says how
+      // much may be held; this says how fast to approach it again, and
+      // after a shed the answer is "from the beginning".
+      _per_forward_cap = _cap_probe;
       // Whatever level we were at was too high for the box as it is now.
       // Floored at ONE block: a ceiling of zero is a claim that this box
       // cannot hold a single block, which no measurement taken while
@@ -408,7 +438,9 @@ class BlockResidency {
   bool        _paged   = false;
   bool        _evicted_from_ram = false;
   int         _admitted_this_forward = 0;
+  static constexpr int kCapMax = 1 << 20;
   int         _per_forward_cap = 8;
+  int         _cap_probe = 8;
   std::size_t _self_compressed = 0;
   std::size_t _block_hint = 0;
   bool        _shed_this_forward = false;

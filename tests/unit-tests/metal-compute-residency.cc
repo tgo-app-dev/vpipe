@@ -3,10 +3,13 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "apple-silicon/metal-compute/texture.h"
 #include "common/session.h"
+#include "common/vpipe-format.h"
 #include "generative-models/weight-set.h"
 
 #include <Metal/Metal.hpp>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -254,4 +257,63 @@ TEST(metal_compute_residency, streamed_copy_is_fully_incore)
   EXPECT_TRUE(r.valid);
   EXPECT_TRUE(r.examined > 0);
   EXPECT_TRUE(r.fully_resident());
+}
+
+// WHERE DOES THE FILE CACHE COME FROM ON A CHECKPOINT READ?
+//
+// MEASURED on the M4 Pro: loading the 48 GB text encoder took file-backed
+// pages 24 -> 56 GB, which is memory competing with everything the new
+// management is trying to hold. WeightSet::read(Copied) is supposed to
+// take an uncached pread, so either it does not or something else does
+// -- and a standalone F_NOCACHE pread of the same file (with and without
+// a live mmap) grows the cache by ZERO, so the answer is in this path
+// rather than in the syscall.
+//
+// Reads a bounded slice of a real checkpoint through the REAL loader and
+// reports the delta. Env-gated: it needs a model and moves gigabytes.
+TEST(metal_compute_residency, a_copied_read_does_not_grow_the_file_cache)
+{
+  const char* dir = std::getenv("VPIPE_CACHE_PROBE_MODEL");
+  if (dir == nullptr || *dir == '\0') { return; }
+  auto session = std::make_shared<Session>();
+  MetalCompute* mc = get_mc_(*session);
+  if (mc == nullptr) { return; }
+  auto ws = genai::WeightSet::open(dir, session.get());
+  if (!ws) { return; }
+
+  auto file_mb = [] {
+    FILE* p = popen("vm_stat | awk '/File-backed/{print $3}'", "r");
+    if (p == nullptr) { return (long)-1; }
+    long pages = 0;
+    if (std::fscanf(p, "%ld", &pages) != 1) { pages = 0; }
+    pclose(p);
+    return pages / 64;                    // 16 KB pages -> MB
+  };
+
+  // Biggest-first, so a bounded budget covers real tensors rather than
+  // a long tail of norms.
+  std::vector<std::pair<std::size_t, std::string>> by_size;
+  for (const std::string& nm : ws->src().tensor_names()) {
+    const auto* ti = ws->src().info(nm);
+    if (ti != nullptr) { by_size.emplace_back((std::size_t)ti->nbytes, nm); }
+  }
+  std::sort(by_size.begin(), by_size.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+  const long before = file_mb();
+  std::size_t read = 0;
+  const std::size_t budget = 6ull << 30;
+  for (const auto& [nb, nm] : by_size) {
+    if (read >= budget) { break; }
+    SharedBuffer b = ws->read(nm, mc, genai::WeightSet::Residency::Copied);
+    if (b.empty()) { continue; }
+    read += nb;
+  }
+  const long after = file_mb();
+  session->log_normal(fmt(
+      "copied-read probe: {} MB read, file-backed {} -> {} MB (delta {} MB)",
+      read >> 20, before, after, after - before));
+  // The read is uncached, so the cache must not grow by anything like
+  // what was read. A little movement is other processes.
+  EXPECT_TRUE(after - before < (long)((read >> 20) / 4));
 }

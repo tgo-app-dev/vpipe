@@ -11,6 +11,7 @@
 #include "pipeline/oport-buffer.h"
 #include "pipeline/pipeline.h"
 #include "interfaces/session-services-intf.h"
+#include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
@@ -114,6 +115,84 @@ PipelineRuntime::PipelineRuntime(Pipeline*                 pipeline,
   : SessionMember(session)
   , _pipeline(pipeline)
 {
+}
+
+void
+PipelineRuntime::close_plan()
+{
+  std::lock_guard<std::mutex> lk(_plan_mu);
+  _plan_live = false;
+}
+
+void
+PipelineRuntime::revise(const Stage* stage, const StageMemory& m)
+{
+  std::lock_guard<std::mutex> lk(_plan_mu);
+  // Clearing the sink at stop closes the door, but a revision already in
+  // flight can be past it -- the stage read a non-null sink and has not
+  // called through yet. This is the second half of that: after the plan
+  // is closed a late arrival is dropped rather than recomputing against
+  // a graph that is no longer running.
+  if (stage == nullptr) { return; }
+  if (!_plan_live) {
+    session()->log_debug(fmt(
+        "memory-plan: revision from '{}' arrived after the plan closed; "
+        "dropped", stage->id()));
+    return;
+  }
+  for (std::size_t i = 0; i < _plan_stages.size(); ++i) {
+    if (_plan_stages[i] != stage) { continue; }
+    if (i >= _plan_mem.size()) { return; }
+    _plan_mem[i] = m;
+    // Vertex::id() returns BY VALUE; binding it to the reference
+    // parameter keeps it alive for the call without a .c_str() on a
+    // temporary, which is correct here but reads like a bug.
+    replan_locked_(stage->id());
+    return;
+  }
+  // SAID, never dropped quietly. A revision that reaches nothing is a
+  // stage correcting a figure the plan will keep reporting wrong, and
+  // the symptom -- a plan that stays at its declared guess -- looks
+  // exactly like a stage that had nothing to correct.
+  session()->log_debug(fmt(
+      "memory-plan: revision from '{}' names no stage in this plan; "
+      "dropped", stage->id()));
+}
+
+void
+PipelineRuntime::replan_locked_(const std::string& why)
+{
+  const std::size_t was_floor = _plan.peak_floor;
+  const std::size_t was_preload = _plan.peak_preload;
+  const bool first = _plan.steps.empty();
+  _plan = compute_memory_plan(_plan_stages, _plan_edges, _plan_mem);
+
+  // Reported when the PEAK moves, not on every revision. A graph whose
+  // stages each correct themselves once would otherwise produce a line
+  // per stage saying nothing changed, and the number worth watching is
+  // the one the box has to survive.
+  //
+  // Compared in MEGABYTES, which is the hysteresis: the figures are
+  // reported in megabytes, so a revision that does not move the printed
+  // number has nothing to say.
+  if (!first && (_plan.peak_floor >> 20) == (was_floor >> 20) &&
+      (_plan.peak_preload >> 20) == (was_preload >> 20)) {
+    return;
+  }
+  std::ostringstream by;
+  for (const MemoryPlanStep& st : _plan.steps) {
+    if (st.at_floor == 0 && st.at_preload == 0) { continue; }
+    if (by.tellp() > 0) { by << ", "; }
+    by << st.stage_id << ' ' << (st.at_floor >> 20) << " MB";
+  }
+  session()->info(fmt(
+      "memory-plan ({}): peak {} MB at '{}' streaming, {} MB at '{}' "
+      "preloaded, over {} stages in running order{} ({})",
+      why, _plan.peak_floor >> 20, _plan.tightest_floor,
+      _plan.peak_preload >> 20, _plan.tightest_preload, _plan.steps.size(),
+      _plan.ordered ? "" : " -- NOT ordered, the graph has a cycle, so this "
+                           "is declaration order and not a bound",
+      by.str()));
 }
 
 PipelineRuntime::~PipelineRuntime()
@@ -825,7 +904,7 @@ PipelineRuntime::launch_()
               _pipeline->id(), s->id(), c.kind));
           continue;
         }
-        p->claim(session(), c.key, c.phase);
+        p->claim(session(), c.key, c.phase, c.last_phase, c.floor_bytes);
       }
     }
     // Second sweep: decisions, once every stage's declaration is on the
@@ -847,7 +926,52 @@ PipelineRuntime::launch_()
         p->decide(session(), c.key, c.phase);
       }
     }
-    for (ResourcePlanner* p : planners) { p->end_plan(session()); }
+    // Every planner gets its end_plan, even after one refuses: they
+    // report as well as decide, and a refusal that suppressed the other
+    // planners' figures would hide the numbers a user needs to see WHY.
+    bool planned = true;
+    for (ResourcePlanner* p : planners) {
+      if (!p->end_plan(session())) { planned = false; }
+    }
+    // The TOPOLOGICAL plan, beside the phase one.
+    //
+    // Reported rather than enforced while the two are being compared:
+    // this one derives lifetimes from the edges instead of from phase
+    // names a stage asserts, so where they disagree it is the phase
+    // model that is guessing -- but only stages that have been ported to
+    // declare_memory() contribute, and an unported graph reads as empty
+    // rather than as free.
+    {
+      std::vector<StageMemory> mem;
+      mem.reserve(stages.size());
+      bool any = false;
+      for (Stage* s : stages) {
+        mem.push_back(s->declare_memory());
+        const StageMemory& m = mem.back();
+        if (!m.holdings.empty() || m.scratch > 0 || !m.outputs.empty()) {
+          any = true;
+        }
+      }
+      if (any) {
+        // KEPT for the launch, not computed and dropped. Half of what
+        // the plan wants to know is not knowable before a beat -- an
+        // arena's geometry, a streaming model's real resident set -- so
+        // the snapshot has to be correctable, and a correction is only
+        // worth making if something holds the result.
+        std::lock_guard<std::mutex> lk(_plan_mu);
+        _plan_stages = stages;
+        _plan_edges = logical_edges;
+        _plan_mem = std::move(mem);
+        _plan_live = true;
+        replan_locked_(std::string("declared"));
+      }
+    }
+    if (!planned) {
+      session()->error(fmt(
+          "PipelineRuntime: pipeline '{}' refused by the resource plan; "
+          "nothing was loaded", _pipeline->id()));
+      return false;
+    }
   }
 
   _expected = static_cast<unsigned>(stages.size());
@@ -866,6 +990,10 @@ PipelineRuntime::launch_()
   _live_stages = stages;
   for (Stage* s : _live_stages) {
     StageLifecycleAccess::set_running(s, true);
+    // The revise channel, for exactly the span the plan exists over. A
+    // stage outlives the launch it ran in, so a sink left behind would
+    // be a dangling pointer the next beat writes through.
+    StageLifecycleAccess::set_memory_sink(s, this);
   }
   _running.store(true, memory_order_release);
   _drivers.reserve(stages.size());
@@ -921,7 +1049,9 @@ PipelineRuntime::stop()
   // again, so drop the running flag we set at launch.
   for (Stage* s : _live_stages) {
     StageLifecycleAccess::set_running(s, false);
+    StageLifecycleAccess::set_memory_sink(s, nullptr);
   }
+  close_plan();
 }
 
 // Spin until every driver coroutine is officially at final_suspend.

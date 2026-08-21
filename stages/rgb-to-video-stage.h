@@ -33,7 +33,11 @@ namespace vpipe {
 //
 //   oport0  the video stream: exactly one VideoStreamParamsPayload,
 //           emitted when the FIRST frame arrives and its size is known,
-//           then one FrameRefPayload per frame.
+//           then one FrameRefPayload per frame. The generating model,
+//           when the producer named one, is copied onto that header --
+//           a FrameRef is a bare AVFrame and has no sideband to carry
+//           it, and the sink wants it before the container header goes
+//           out. See stages/model-provenance.h.
 //
 // The header cannot be sent before the first frame because nothing else
 // knows the frame size: a generative graph's dimensions come from the

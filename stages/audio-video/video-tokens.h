@@ -62,6 +62,16 @@ using FrameRef = std::shared_ptr<AVFrame>;
 class VideoStreamParamsPayload : public VideoStreamParams,
                                  public BeatPayloadIntf {
 public:
+  // What produced this clip, when a model did ("local/Wan2.2-T2V-A14B").
+  // Empty for a stream read off a file, which is how a sink knows not to
+  // claim vpipe authored it.
+  //
+  // It rides on the PAYLOAD rather than in VideoStreamParams because it
+  // describes the CLIP, not the encoder: every field of that struct is
+  // something ffmpeg needs to open a codec, and a stage that only wants
+  // those must still be able to slice one off.
+  std::string model_name;
+
   VideoStreamParamsPayload() = default;
   explicit
   VideoStreamParamsPayload(const VideoStreamParams& p)
@@ -71,8 +81,10 @@ public:
   std::unique_ptr<BeatPayloadIntf>
   clone() const override
   {
-    return std::make_unique<VideoStreamParamsPayload>(
+    auto c = std::make_unique<VideoStreamParamsPayload>(
         static_cast<const VideoStreamParams&>(*this));
+    c->model_name = model_name;
+    return c;
   }
 
   std::string

@@ -224,9 +224,22 @@ SharedBuffer::set_wired(bool on) noexcept
       static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
   const std::size_t lock_size =
       round_up_to_page_(_byte_size, page_size);
+  // NOT rounded down to a page first, and it does not need to be:
+  // mlock() locks every page CONTAINING [addr, addr+len), so an
+  // unaligned subview base and a page-rounded length already cover the
+  // same pages a rounded-down base would. (page_residency() below does
+  // round down, because mincore() writes one byte per page examined and
+  // the vector has to line up with the pages it describes -- a
+  // different requirement, not the same one.)
+  //
+  // What IS worth knowing: locking is page-granular, so two subviews
+  // sharing a page share its lock, and unwiring one unlocks the page
+  // the other still relies on. Nothing in this tree wires overlapping
+  // subviews today.
+  void* base = _contents;
 
   if (on) {
-    if (::mlock(_contents, lock_size) != 0) {
+    if (::mlock(base, lock_size) != 0) {
       // errno preserved by mlock(); caller can inspect.
       return false;
     }
@@ -237,8 +250,25 @@ SharedBuffer::set_wired(bool on) noexcept
     // may unwire automatically when the address is released. We
     // flip the flag regardless so a subsequent set_wired(true)
     // re-attempts the lock.
-    ::munlock(_contents, lock_size);
-    _buf->setPurgeableState(MTL::PurgeableStateVolatile);
+    ::munlock(base, lock_size);
+    // BACK TO NonVolatile, which is where a live buffer sits -- NOT to
+    // Volatile.
+    //
+    // Unwiring means "the pool no longer protects this". It does not
+    // mean the kernel may discard it, and saying so was wrong three
+    // ways. It put the buffer in a state its owner never asked for; it
+    // set none of the bookkeeping mark_inactive() keeps, so nothing
+    // would ever reactivate() it and a reclaim yielded garbage rather
+    // than a reload; and it bypassed that method's guards, one of which
+    // exists because marking a SUBVIEW volatile evicts memory another
+    // handle owns.
+    //
+    // That last one was a crash, not a theory: unwiring a streamed
+    // transformer block on the way to destroying it discarded pages of
+    // the shard mapping its neighbours were still reading, and the
+    // block's own destructor took SIGBUS. Parking is mark_inactive()'s
+    // job and has always been separate.
+    _buf->setPurgeableState(MTL::PurgeableStateNonVolatile);
     _wired = false;
   }
   return true;

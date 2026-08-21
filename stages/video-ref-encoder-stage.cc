@@ -281,6 +281,38 @@ VideoRefEncoderStage::reset_run_state()
   _unload_resolved = false;
 }
 
+StageMemory
+VideoRefEncoderStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
+  std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+  if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
+  // ONLY what this stage HOLDS.
+  //
+  // declare_resources also names the DiT, because a claim is what every
+  // peer sizes itself against and a 66 GB component nobody declared is
+  // the silent under-count the planning phase exists to prevent. This
+  // is a different question: StageMemory describes one stage's own
+  // holdings, and the DiT belongs to generate-video, which declares it.
+  // Counting it here as well would charge the graph for it twice --
+  // this plan dedups by nothing, since it deliberately knows bytes and
+  // not checkpoints.
+  const bool destroys = _unload_cfg == model_memory::UnloadPolicy::kDestroy;
+  const bool reclaims  = _unload_cfg == model_memory::UnloadPolicy::kAuto;
+  // The encoder streams its layers here (ecfg.lm.stream_layers), so it
+  // has a real floor; the VAE has none and counts at its size.
+  m.hold(enc, model_memory::dir_weights_bytes(enc),
+         genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc),
+         destroys, reclaims);
+  m.hold(vvae, model_memory::dir_weights_bytes(vvae), 0, destroys, reclaims);
+  return m;
+}
+
 std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const
 {

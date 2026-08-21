@@ -485,6 +485,17 @@ TextChatStage::reset_run_state()
   _sampler_latched = false;
 }
 
+StageMemory
+TextChatStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string dir = resolve_model_dir(session(), _hf_dir);
+  m.hold(dir, model_memory::dir_weights_bytes(dir));
+  // Held for the run, and no smaller form -- see RealtimeVqaStage.
+  return m;
+}
+
 std::vector<ResourceClaim>
 TextChatStage::declare_resources() const
 {

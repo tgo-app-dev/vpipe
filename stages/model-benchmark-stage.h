@@ -70,6 +70,9 @@ public:
 
   // Test-only inspectors.
   const std::string&      model()        const noexcept { return _model; }
+
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
   const std::vector<int>& contexts()     const noexcept
   { return _contexts; }
   int decode_tokens() const noexcept { return _decode_tokens; }

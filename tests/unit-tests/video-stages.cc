@@ -13,6 +13,8 @@
 #include "stages/load-video-stage.h"
 #include "stages/save-video-stage.h"
 #include "stages/audio-video/video-tokens.h"
+#include "stages/model-provenance.h"
+#include "vpipe/vpipe.h"
 #include "apple-silicon/tensor-beat.h"
 
 #include <cmath>
@@ -29,6 +31,8 @@
 #include <vector>
 
 extern "C" {
+#include <libavformat/avformat.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/pixfmt.h>
 }
@@ -71,6 +75,27 @@ file_size_or_zero_(const string& path)
   return static_cast<size_t>(in.tellg());
 }
 
+// One container-level metadata value out of a written file, read back
+// through the same dynamically-loaded libavformat the stage muxed with
+// -- there is no other ffmpeg in this process, and reading it any other
+// way would be testing a different library than the one that wrote it.
+string
+container_tag_(Session& sess, const string& path, const char* key)
+{
+  const FFmpegLibraries* libs = sess.services()->ffmpeg_libraries();
+  if (libs == nullptr || !libs->valid()) { return {}; }
+  AVFormatContext* ic = nullptr;
+  if (libs->avformat().api.open_input(&ic, path.c_str(), nullptr,
+                                      nullptr) < 0) {
+    return {};
+  }
+  string out;
+  const auto* e = libs->avutil().api.dict_get(ic->metadata, key, nullptr, 0);
+  if (e != nullptr && e->value != nullptr) { out = e->value; }
+  libs->avformat().api.close_input(&ic);
+  return out;
+}
+
 // Test-only stage that emits one VideoStreamParams header followed by
 // `target_frames` plain-grey YUV420P AVFrames, then closes its
 // output. Used to drive the real SaveVideoStage end-to-end
@@ -84,6 +109,9 @@ public:
   int        width         = 320;
   int        height        = 240;
   AVRational fps           = {30, 1};
+  // What rgb-to-video puts on the header when a generative graph made
+  // the frames. Empty is the file-sourced case.
+  string     model_name;
 
   // The very thing Stage::reset_run_state exists for: without this the
   // source is exhausted after run 1 and a relaunch emits nothing.
@@ -98,8 +126,9 @@ public:
         AVRational{fps.den, fps.num},   // time_base
         fps                             // frame_rate
       };
-      co_await ctx.write(0,
-        make_payload<VideoStreamParamsPayload>(p));
+      auto hdr = make_unique<VideoStreamParamsPayload>(p);
+      hdr->model_name = model_name;
+      co_await ctx.write(0, std::move(hdr));
       _header_sent = true;
       co_return;
     }
@@ -445,6 +474,8 @@ public:
   int sample_rate = 32000;
   int samples     = 32000;      // 1 s
   bool send_rate  = true;
+  // What audio-vae-decode carries forward from the latent it decoded.
+  string model_name;
 
   void reset_run_state() override { _sent = false; }
 
@@ -475,6 +506,7 @@ public:
     sb.as_object().insert_or_assign(
       "channels", FlexData::make_int(channels));
     b->sideband = std::move(sb);
+    provenance::set_model_name(b->sideband, model_name);
     co_await ctx.write(0, std::move(b));
   }
 
@@ -625,5 +657,140 @@ TEST(video_stages, encoder_refuses_pcm_without_a_rate) {
   const size_t sz = file_size_or_zero_(out_path);
   printf("[video_stages] no-rate run wrote %zu bytes\n", sz);
   EXPECT_TRUE(sz > 0);
+  remove(out_path.c_str());
+}
+
+// Provenance: generate-video stamps `model_name`, vae-decode carries it
+// and rgb-to-video copies it onto the stream header, so a GENERATED clip
+// reaches save-video knowing what produced it. That has to survive into
+// the container, and MP4 makes it awkward: the default iTunes-style
+// metadata holds a fixed set of atoms and drops an unknown key without a
+// word, so the muxer is asked for the QuickTime `mdta` form on the way
+// past. The tag being readable back is the whole point -- a file-size
+// assertion cannot see a dropped key.
+TEST(video_stages, generated_clip_records_the_model_in_the_container) {
+  Session sess;
+  CerrSilencer hush;
+  const string out_path = tmp_path_("enc-prov", ".mp4");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 4;
+  src_u->width = 64;
+  src_u->height = 48;
+  src_u->model_name = "local/Some-Video-Model-8bit";
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  pl->insert_stage(make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  const string sw = container_tag_(sess, out_path,
+                                   "com.tgous.vpipe.software");
+  printf("[video_stages] com.tgous.vpipe.software = %s\n", sw.c_str());
+  EXPECT_TRUE(sw.rfind("Vpipe ", 0) == 0);
+  EXPECT_TRUE(sw.find(vpipe_version_number()) != string::npos);
+  EXPECT_TRUE(sw.find(vpipe_build_hash()) != string::npos);
+  EXPECT_TRUE(sw.find(" with local/Some-Video-Model-8bit") != string::npos);
+  remove(out_path.c_str());
+}
+
+// ...and a clip with no model on its header -- a plain transcode -- gets
+// no tag at all. vpipe did not author that footage, and the same rule
+// keeps the container's metadata layout untouched for every graph that
+// was working before this existed.
+TEST(video_stages, transcoded_clip_gets_no_provenance_tag) {
+  Session sess;
+  CerrSilencer hush;
+  const string out_path = tmp_path_("enc-noprov", ".mp4");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 4;
+  src_u->width = 64;
+  src_u->height = 48;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  pl->insert_stage(make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(file_size_or_zero_(out_path) > 0);
+  EXPECT_TRUE(container_tag_(sess, out_path,
+                             "com.tgous.vpipe.software").empty());
+  remove(out_path.c_str());
+}
+
+// A soundtrack-only save has no video header, so the audio beat's
+// sideband is the ONLY place the model name can arrive. It is read there
+// too -- otherwise a generated audio file would be the one output of the
+// stack that came out anonymous.
+TEST(video_stages, generated_audio_only_records_the_model) {
+  Session sess;
+  CerrSilencer hush;
+  const string out_path = tmp_path_("enc-prov-audio", ".m4a");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto asrc_u = make_unique<SynthPcmSource>(
+    &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  asrc_u->samples = 8000;
+  asrc_u->model_name = "local/Some-Audio-Model";
+  asrc_u->allocate_oports(1);
+  auto* asrc = static_cast<SynthPcmSource*>(
+    pl->insert_stage(std::move(asrc_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_video", FlexData::make_bool(false));
+  }
+  pl->insert_stage(make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{asrc, 0}}, std::move(enc_cfg)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  const string sw = container_tag_(sess, out_path,
+                                   "com.tgous.vpipe.software");
+  printf("[video_stages] audio-only tag = %s\n", sw.c_str());
+  EXPECT_TRUE(sw.find(" with local/Some-Audio-Model") != string::npos);
   remove(out_path.c_str());
 }

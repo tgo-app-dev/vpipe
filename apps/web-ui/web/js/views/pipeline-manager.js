@@ -5,6 +5,7 @@ import { el, clear, append, toast, openModal, openMenu, kbd }
   from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
+import { modelMatches, modalitiesPresent } from '../model-filter.js';
 import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
 import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
@@ -1569,20 +1570,105 @@ function mountEditor(container, opts = {}) {
       ['dataset', t('pl.mb_g_datasets')],
     ];
     const bodyEl = el('div', { class: 'model-browser' });
-    if (!compatible.length) {
-      bodyEl.append(el('div', { class: 'mb-empty' }, t('pl.mb_empty')));
-    } else {
+
+    // ---- narrowing, on top of the compatibility rules above ---------
+    //
+    // Those decide what the FIELD can accept and are not negotiable.
+    // These are the operator's: with a few dozen installed models the
+    // list is longer than a glance, and the thing being looked for is
+    // usually known by a fragment of its name or by what it consumes
+    // and produces.
+    //
+    // Only offered when there is something to narrow. A filter bar over
+    // three rows is furniture.
+    const wantIn = new Set();
+    const wantOut = new Set();
+    let query = '';
+    const inKinds = modalitiesPresent(compatible, 'inputs');
+    const outKinds = modalitiesPresent(compatible, 'outputs');
+    const matches = (m) => modelMatches(m, { query, wantIn, wantOut });
+
+    const listWrap = el('div', { class: 'mb-results' });
+    const count = el('div', { class: 'mb-count' });
+    const renderList = () => {
+      clear(listWrap);
+      const shown = compatible.filter(matches);
+      count.textContent = shown.length === compatible.length
+        ? t('pl.mb_count', { n: compatible.length })
+        : t('pl.mb_count_filtered',
+            { n: shown.length, total: compatible.length });
+      if (!shown.length) {
+        // Distinct from "nothing is compatible": there ARE models, the
+        // filter is what hid them, and the fix is to relax it.
+        listWrap.append(el('div', { class: 'mb-empty' },
+          t('pl.mb_no_match')));
+        return;
+      }
       for (const [cat, label] of groups) {
-        const items = compatible.filter(
-          (m) => (m.category || 'model') === cat);
+        const items = shown.filter((m) => (m.category || 'model') === cat);
         if (!items.length) { continue; }
-        bodyEl.append(el('div', { class: 'mb-group' }, label));
+        listWrap.append(el('div', { class: 'mb-group' }, label));
         const list = el('div', { class: 'mb-list' });
         for (const m of items) {
           list.append(modelCard(m, () => { onPick(m.key); closeModal(); }));
         }
-        bodyEl.append(list);
+        listWrap.append(list);
       }
+    };
+
+    // One row of modality chips. `want` is the live Set it toggles.
+    const chipRow = (label, kinds, want) => {
+      if (!kinds.length) { return null; }
+      const row = el('div', { class: 'mb-chips' },
+        el('span', { class: 'mb-chips-label' }, label));
+      for (const x of kinds) {
+        const b = el('button', { class: 'mb-chip mb-' + x, type: 'button' },
+          x);
+        b.addEventListener('click', () => {
+          if (want.has(x)) { want.delete(x); } else { want.add(x); }
+          b.classList.toggle('active', want.has(x));
+          renderList();
+        });
+        row.append(b);
+      }
+      return row;
+    };
+
+    if (!compatible.length) {
+      bodyEl.append(el('div', { class: 'mb-empty' }, t('pl.mb_empty')));
+    } else {
+      // The threshold is deliberately low. Six rows already overflow the
+      // modal on a laptop, and a search box that is present sometimes is
+      // harder to rely on than one that is always there -- but a bar
+      // over two or three rows is noise, so it is not unconditional.
+      const search = el('input', { type: 'search', class: 'mb-search',
+        placeholder: t('pl.mb_search'), autocomplete: 'off' });
+      search.addEventListener('input', () => {
+        query = search.value.trim().toLowerCase();
+        renderList();
+      });
+      // Escape CLEARS a non-empty box before the modal's own handler
+      // closes the dialog. Losing a whole browse to a keystroke meant
+      // for the filter is the wrong outcome, and an operator who wants
+      // out presses it twice.
+      search.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && search.value) {
+          e.stopPropagation();
+          search.value = '';
+          query = '';
+          renderList();
+        }
+      });
+      if (compatible.length > 4) {
+        bodyEl.append(el('div', { class: 'mb-filter' },
+          search,
+          chipRow(t('pl.mb_in'), inKinds, wantIn),
+          chipRow(t('pl.mb_out'), outKinds, wantOut)));
+        setTimeout(() => search.focus(), 0);
+      }
+      bodyEl.append(count);
+      renderList();
+      bodyEl.append(listWrap);
     }
     closeModal = openModal({
       title: t('pl.mb_title'),
@@ -1593,8 +1679,17 @@ function mountEditor(container, opts = {}) {
     });
   }
 
-  // One model row in the browser: name/variant, model_type + size, the
-  // parent it attaches to (supplements), and in→out modality badges.
+  // One model row in the browser: the registry KEY, then the variant,
+  // model_type + size, the parent it attaches to (supplements), and
+  // in→out modality badges.
+  //
+  // The key is the title because it is the only field guaranteed to
+  // identify the row -- it is what picking writes into the config, and
+  // it is unique by construction. The variant is a LABEL for a pack
+  // ("bf16 single-file (Comfy-Org)") and several models legitimately
+  // share one: MiniMax-H3 publishes its FL2VA and Ref2VA partitions
+  // from a single repo, so showing `variant || key` drew two different
+  // models as two identical cards, distinguishable only by a tooltip.
   function modelCard(m, onClick) {
     const io = (arr) => ((arr && arr.length)
       ? arr.map((x) => el('span', { class: 'mb-badge mb-' + x }, x))
@@ -1607,9 +1702,13 @@ function mountEditor(container, opts = {}) {
           t('pl.mb_attaches', { p: m.parent_model_type
             + (m.parent_param_class ? ' ' + m.parent_param_class : '') }))
       : null;
+    const variantNote = m.variant
+      ? el('div', { class: 'mb-variant' }, m.variant)
+      : null;
     return el('button', { class: 'mb-card', type: 'button', onclick: onClick },
       el('div', { class: 'mb-card-main' },
-        el('div', { class: 'mb-name', title: m.key }, m.variant || m.key),
+        el('div', { class: 'mb-name', title: m.variant || m.key }, m.key),
+        variantNote,
         el('div', { class: 'mb-sub' }, sub, parentNote)),
       el('div', { class: 'mb-io' },
         el('span', { class: 'mb-io-set' }, io(m.inputs)),

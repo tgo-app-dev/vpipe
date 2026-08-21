@@ -47,6 +47,19 @@ inline constexpr std::string_view kWeightsKind = "model-weights";
 // component needs no branch at the call site.
 std::vector<ResourceClaim> weight_claims(std::vector<std::string> dirs);
 
+// One weight claim that also states the FLOOR this component can be
+// reduced to -- what a block-streaming DiT holds when it streams: its
+// trunk plus the in-flight slots, not the checkpoint.
+//
+// Separate from weight_claims() rather than an extra argument on it,
+// because a floor is per-DIRECTORY and the plural form takes a list. A
+// caller with two streamable components makes two claims.
+//
+// `floor` above the checkpoint's own size is clamped by the planner: it
+// would otherwise report a streamed total larger than the preloaded one,
+// and this figure is meant to decide whether a graph can run at all.
+ResourceClaim weight_claim_streamable(std::string dir, std::size_t floor);
+
 // ---- phases ----------------------------------------------------------
 //
 // A generation graph runs in stages that do not overlap: the text
@@ -67,9 +80,55 @@ std::vector<ResourceClaim> weight_claims(std::vector<std::string> dirs);
 // its own phase would be counted apart from the claims it actually
 // coexists with, and that error UNDER-counts, which is the direction
 // that thrashes.
-inline constexpr std::string_view kPhaseCondition = "condition";
-inline constexpr std::string_view kPhaseDenoise   = "denoise";
-inline constexpr std::string_view kPhaseDecode    = "decode";
+// THE PHASES ARE ORDERED, and a claim spans an INTERVAL of them.
+//
+// A single phase per claim can only express "this is resident while its
+// own stage runs", and the thing that actually sizes a constrained box
+// is not that -- it is what COEXISTS at each moment, and the largest
+// term is usually something produced by one phase and consumed by a
+// later one. The output latent is alive from the denoise that writes it
+// until the last decode that reads it; the conditioning is alive from
+// the encoder that produces it until the denoise that consumes it.
+// Neither belongs to one phase, and counting them as persistent (the
+// old answer for anything not single-phase) puts them in every phase
+// including the ones they are absent from.
+//
+// So what a memory-constrained box must hold is
+//
+//   max over phases p of ( sum of every claim alive during p )
+//
+// which for a generation graph reads as the four terms below -- and no
+// two of them are ever live together:
+//
+//   condition     encoder floor + encoder scratch + conditioning
+//   denoise       conditioning + DiT floor + DiT scratch + latent
+//   decode-audio  latent + audio VAE floor + its scratch + PCM
+//   decode        latent + video VAE floor + its scratch + frames
+//
+// On an ABUNDANT box the same graph may keep all of it resident at once
+// so a second launch pays no reload, which is the sum rather than the
+// max. Both are reported; the max is what decides whether a graph can
+// run, the sum is what it costs to make relaunches free.
+//
+// The ORDER below is the order phases run in, and intervals are
+// inclusive of both ends. Adding a phase means putting it in the right
+// place here -- see phase_order().
+inline constexpr std::string_view kPhaseCondition   = "condition";
+inline constexpr std::string_view kPhaseDenoise     = "denoise";
+// The two decodes are separate phases because on a constrained box they
+// do not overlap either: an audio VAE and a video VAE are loaded and
+// dropped independently, and summing them sizes a moment that does not
+// happen. Both read the same latent, which is why the latent's interval
+// has to REACH both rather than belong to one.
+inline constexpr std::string_view kPhaseDecodeAudio = "decode-audio";
+inline constexpr std::string_view kPhaseDecode      = "decode";
+
+// Position of `phase` in the running order, or -1 when it is not a
+// known phase. An unphased claim is alive throughout and has no index.
+int phase_order(std::string_view phase);
+
+// How many phases there are, for a caller walking all of them.
+int phase_count();
 
 // Claims for weights this stage holds only during `phase`.
 //
@@ -135,6 +194,23 @@ inline constexpr std::size_t kUnknownArena = 4096;
 std::vector<ResourceClaim>
 scratch_claims(std::string label, std::size_t bytes, std::string_view phase);
 
+// A PAYLOAD: bytes that outlive the phase producing them.
+//
+// Same machinery as an arena -- a label, a size, a lifetime -- and a
+// separate name because the two are different facts and a reader sizing
+// a graph needs to tell them apart. A scratch arena is torn down when
+// its stage finishes; a payload is handed DOWNSTREAM, so it is alive
+// from the phase that writes it through the last phase that reads it.
+//
+// These are the terms a weights-and-scratch accounting cannot see, and
+// on a constrained box they are often the largest thing in the moment
+// they exist: a video latent sits through both decodes, the decoded
+// frame buffer is larger than the VAE that produced it, and a
+// conditioning outlives the encoder that made it by the whole denoise.
+std::vector<ResourceClaim>
+payload_claims(std::string label, std::size_t bytes,
+               std::string_view first_phase, std::string_view last_phase);
+
 // Declared scratch for `phase`, or with an empty phase the widest single
 // phase -- the same peak rule weights use. Kept separate from
 // weight_footprint() rather than folded into it: a caller sizing a
@@ -142,6 +218,7 @@ scratch_claims(std::string label, std::size_t bytes, std::string_view phase);
 // not silently get an arena as well.
 std::size_t scratch_footprint(const SessionContextIntf* session,
                               std::string_view          phase = {});
+
 
 // What a VAE decode of `width` x `height` will allocate, estimated from
 // `<root>/vae/config.json` alone -- no model load, so it is answerable
@@ -227,6 +304,26 @@ std::size_t phys_ram();
 // Sum of the .safetensors bytes under `dir`, recursively. 0 if unreadable.
 std::size_t dir_weights_bytes(const std::string& dir);
 
+// The floor a checkpoint under `dir` can be reduced to if it streams its
+// repeating unit: everything outside that unit, plus the two in-flight
+// slots a streamer refills into.
+//
+// `stems` are the prefixes to try, WITHOUT the index -- "blocks." for a
+// MiniMax-H3 DiT, "model.layers." for an LM -- and the first that
+// matches anything wins. Trying several is safe because a stem that
+// matches nothing yields 0, and a prefix match from position 0 cannot
+// confuse "blocks." with "transformer_blocks.".
+//
+// Returns 0 when no stem matches, which means nothing here streams and
+// the checkpoint has no smaller form. A model with TWO stacks (FLUX.2's
+// double and single) is measured against whichever stem is tried first
+// and counts the other stack as trunk -- an OVER-estimate of the floor,
+// which is the safe direction: it claims the model can be reduced less
+// than it can.
+std::size_t streaming_floor_bytes(const std::string&                   dir,
+                                  const std::vector<std::string_view>& stems,
+                                  std::string_view exclude = {});
+
 // The weight footprint of keeping `dirs` resident, in bytes.
 //
 // A UNION, not a sum, and that distinction is the whole point. Two things
@@ -290,6 +387,16 @@ bool bounded(const SessionContextIntf*       session,
 // with. Both are 0/false when RAM is unknown.
 struct StreamPlan {
   bool        stream    = false;
+  // LM LAYER pinning ONLY. Every DiT that used this is retired: the five
+  // block-streaming families grow a resident set by measuring instead
+  // (BlockResidency), which is what a fraction of total RAM decided
+  // before the run could never do.
+  //
+  // The language models are not retired because they have nothing to
+  // grow into -- metal-qwen-model and metal-gemma-model pin a prefix of
+  // layers and have no residency policy behind it, so removing this
+  // would leave the text encoders streaming everything with no way back.
+  // Give them BlockResidency and this field goes too.
   double      pin_frac  = 0.0;
   std::size_t footprint = 0;   // DiT + encoder + everything resident
   std::size_t others    = 0;   // the same, minus the DiT's own bytes

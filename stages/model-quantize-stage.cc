@@ -817,6 +817,34 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
           resolve_model(session(), _src_model).model_type);
   const std::string dit_dir =
       resolve_t2i_dit_dir_(src_dir, &t2i_family, h3_part);
+  // THE PARTITION IS A RANKING, NOT A FILTER, so a repo that holds only
+  // the other one resolves to it silently. That is right for a repo with
+  // one file and wrong here: this pass is about to write a DERIVED
+  // checkpoint, and the output records the partition it actually
+  // quantized -- so a mismatch produces a self-consistent pack whose
+  // NAME says the opposite, and the first symptom is generate-video
+  // refusing the forward one pipeline later.
+  //
+  // MEASURED: a repo left holding only `minimax_h3_ref2va_bf16` after an
+  // FL2VA fetch was skipped produced 'MiniMax-H3-FL2VA-8bit' containing
+  // Ref2VA. Warned rather than refused -- the bytes are valid and the
+  // config describes them correctly, so the artifact is usable under its
+  // real partition, and failing here would strand a two-hour job over a
+  // name.
+  if (!h3_part.empty() && !dit_dir.empty()) {
+    const std::string got =
+        genai::MetalMiniMaxH3Transformer::partition_of(dit_dir);
+    if (!got.empty() && got != h3_part) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): '{}' names the {} partition, but the "
+          "only MiniMax-H3 weights under '{}' are {} -- quantizing THOSE. "
+          "The output will record '{}', so it is a {} checkpoint whatever "
+          "output_name says. Fetch the {} file first if that is not what "
+          "you meant",
+          this->id(), _src_model, h3_part, src_dir, got, got, got,
+          h3_part));
+    }
+  }
   if (!dit_dir.empty()) {
     // A Comfy-Org REPACK root is tested FIRST, and the order is
     // load-bearing rather than stylistic. A repack's components live in

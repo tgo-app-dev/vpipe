@@ -287,20 +287,15 @@ collect_qwen_image_calibration(
   // Pinned-prefix: in streaming mode, pin as many leading blocks as fit in 60%
   // of physical RAM (pinned + running) so they are read once and reused across
   // every forward, streaming only the tail. VPIPE_QIE_CALIB_PIN_FRAC overrides.
-  double pin_frac = stream_blocks ? 0.60 : 0.0;
-  if (const char* e = std::getenv("VPIPE_QIE_CALIB_PIN_FRAC")) {
-    pin_frac = std::atof(e);
-  }
   MetalQwenImageTransformer::Config qcfg;
   auto dit =
-      MetalQwenImageTransformer::load(dit_dir, mc, qcfg, stream_blocks, pin_frac);
+      MetalQwenImageTransformer::load(dit_dir, mc, qcfg, stream_blocks);
   if (!dit) { return fail("qie-calib: DiT load failed: " + dit_dir); }
   dit->set_stream_stop(stop);   // honor a pipeline stop within ~one block
   if (sess && stream_blocks) {
     sess->log_debug(fmt(
-        "qie-calib: pinned {} of {} DiT blocks resident ({}% RAM budget), "
-        "streaming the rest", dit->pinned_blocks(), qcfg.n_layers,
-        (int)(pin_frac * 100)));
+        "qie-calib: streaming the block stack; the resident "
+        "set grows into free RAM as the calibration runs"));
   }
 
   // Dynamic-shift sigmas (match inference; M2-verified).

@@ -393,7 +393,14 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/ui/cmake/embed-ui-assets.cmake
     DESTINATION lib/cmake/vpipe)
 install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/clock-domain.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/edge-reader.h
+    # Stage::declare_memory() returns a StageMemory and stage.h includes
+    # it, so a plugin that includes stage.h -- which is every plugin --
+    # does not compile without these two. clock-domain.h is here only as
+    # memory-plan.h's own include; the closure has to be complete or the
+    # SDK does not build at all.
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/memory-plan.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/oport-buffer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/resource-plan.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/runtime-context.h

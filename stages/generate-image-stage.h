@@ -127,6 +127,8 @@ public:
   // The DiT this stage loads plus the text encoder it must coexist with
   // -- the same two directories plan_streaming() sizes against.
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will
@@ -231,7 +233,6 @@ private:
   // load params are cached here so process() can reload without re-deriving.
   std::string _flux2_dit_dir;            // resolved transformer dir (reload)
   bool        _flux2_stream   = false;   // streaming mode used at load
-  double      _flux2_pin_frac = 0.0;     // pinned-block fraction at load
   std::string _krea2_dit_dir;            // resolved Krea-2 DiT dir (reload)
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
@@ -253,7 +254,6 @@ private:
   // mllm, so on a 16 GB box it is freed for the decode even at 4-bit.
   std::string _boogu_dit_dir;
   bool        _boogu_stream   = false;
-  double      _boogu_pin_frac = 0.0;
   bool load_boogu_dit_();
   // The manager's shared view of a checkpoint's weights (weight-set.h).
   std::shared_ptr<genai::WeightSet> weight_set_(const std::string& dir) const;

@@ -122,6 +122,11 @@ public:
   // every stage gets the same answer. See Stage::decide_resources.
   std::vector<ResourceClaim> decide_resources() const override;
 
+  // See Stage::declare_memory. The encoder plus the conditioning on
+  // oport 0; the DiT is generate-video's to declare, not this stage's,
+  // even though this stage names its directory in a claim.
+  StageMemory declare_memory() const override;
+
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will
   // actually run rather than against an empty hf_dir.

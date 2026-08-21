@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -95,13 +96,21 @@ class MetalQwenImageTransformer {
   // stay. Slower (a commit+wait per block), but fits AWQ calibration / a full
   // denoise on 16GB. Mirrors the Krea-2 / FLUX-2 streaming path.
   //
-  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of blocks
-  // resident so pinned + running stays within that fraction of physical RAM
-  // (e.g. 0.60). Pinned blocks are read once and reused across every forward;
-  // only the tail streams -- trades spare RAM for speed. 0 => pure streaming.
+  // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
+  //
+  // It was a fraction of TOTAL ram decided before the run, so it could
+  // not see the machine it landed on: not another process, not this
+  // graph's peers, not the moment a peer let go. On a tight box that is
+  // where it did most harm -- plan_streaming's own note records a 16 GB
+  // run taken from no swap at all to 11 GB resident with 3 GB of swap
+  // moving continuously, by a prefix sized exactly that way.
+  //
+  // What replaces it measures: admission against the live budget, a
+  // probe read off the room actually free, doubling while the box stays
+  // healthy, and a shed the moment the pages kept are found outside RAM.
   static std::unique_ptr<MetalQwenImageTransformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -109,7 +118,7 @@ class MetalQwenImageTransformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalQwenImageTransformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   ~MetalQwenImageTransformer();
 
@@ -130,6 +139,24 @@ class MetalQwenImageTransformer {
   // Leading blocks pinned resident in streaming mode (0 = pure streaming, or
   // preloaded). For logging the RAM-for-speed decision.
   int pinned_blocks() const { return _pinned; }
+
+  // ---- the resident set, grown by measuring -----------------------------
+  //
+  // The same policy the other streaming DiTs run (see
+  // generative-models/shared/block-residency.h). A streamed block is KEPT
+  // after it has been used, as free memory allows, so the re-read this
+  // model pays every forward shrinks toward nothing on a box with room --
+  // and is given back the moment the pages it kept are found outside RAM.
+  //
+  // What it replaces is the pinned prefix, which is a fraction of TOTAL
+  // ram decided before the run and therefore blind to the machine it
+  // lands on.
+  void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  int resident_block_count() const { return _resid.count(); }
+  // Give back at least `bytes` of resident blocks, for a peer that needs
+  // the room now.
+  std::size_t release_resident_blocks(std::size_t bytes);
 
   // True when the M5 matrix-core matmul2d (NAX) path is active for the block
   // GEMMs (supports_matrix_cores() + kernels loaded + VPIPE_QIE_NO_MMA2 unset).
@@ -235,6 +262,18 @@ class MetalQwenImageTransformer {
   // Used both to preload and, in streaming mode, per-block inside forward().
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
 
+  static std::size_t qw_bytes_(const QWeight& w);
+  static std::size_t block_bytes_(const Block& b);
+  // How much of the RESIDENT set is still in RAM. Sampled inside each
+  // buffer: a pin either holds or it does not, so every 64th page finds
+  // it. See BlockResidency::note_weight_residency.
+  void resident_pages_(std::size_t* examined, std::size_t* incore,
+                       std::size_t* paged_out = nullptr) const;
+  // Drop the LAST resident block, returning its bytes. Evicting from the
+  // tail keeps what remains a contiguous prefix, which for a cyclic scan
+  // is as good as any other choice and keeps the bookkeeping trivial.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
+
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
   int _quant_bits = 0;      // 0 = dense bf16; 4 / 8 = affine group-quant
@@ -253,6 +292,7 @@ class MetalQwenImageTransformer {
   // retained source mmap on demand in forward() and freed after use.
   bool _stream_blocks = false;
   int _pinned = 0;                  // pinned leading blocks (streaming only)
+  BlockResidency _resid;
   // The checkpoint, held for this model's whole life -- it is where the
   // streamed blocks are read from, so streaming is the manager's
   // business rather than a private mmap this class kept to itself.

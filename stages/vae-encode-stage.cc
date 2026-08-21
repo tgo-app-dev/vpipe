@@ -308,6 +308,48 @@ VaeEncodeStage::reset_run_state()
   _model_latched = false;
 
 }
+std::string
+VaeEncodeStage::vae_dir_for_release_() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string vae_dir = resolve_vae_dir(root);
+  // resolve_vae_dir() returns `root` UNCHANGED for a pack with no
+  // vae/config.json, and naming THAT would attribute the whole
+  // repository to a VAE -- the trap vae-decode fell into, where a 5 GB
+  // component was credited 117 GB of DiT and text encoder. Empty is the
+  // honest answer when the component cannot be located.
+  if (vae_dir != root) { return vae_dir; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Unless a registered family can say where its own file is, which is
+  // the one thing that turns "cannot be located" into a real answer on
+  // a single-file pack.
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, vae_dir,
+          resolve_model(session(), _hf_dir).model_type)) {
+    const std::string p = f->vae_path(root,
+                                      genai::VaeModelFamily::Role::kVideo);
+    if (!p.empty()) { return p; }
+  }
+#endif
+  return {};
+}
+
+
+StageMemory
+VaeEncodeStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string vae_dir = vae_dir_for_release_();
+  if (vae_dir.empty()) { return m; }
+  // A VAE holds what it weighs: no streaming form, so no floor.
+  m.hold(vae_dir, model_memory::dir_weights_bytes(vae_dir), 0,
+         _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+         _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  return m;
+}
 
 std::vector<ResourceClaim>
 VaeEncodeStage::declare_resources() const
@@ -365,6 +407,21 @@ VaeEncodeStage::unload_vae_()
   if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
       !_plugin_enc) {
     return;
+  }
+  // TO THE POOL when the policy is `auto`, and BEFORE the resets:
+  // pool_weights() finds the set through a WEAK reference, so once these
+  // models drop their last strong one there is nothing left to pool.
+  //
+  // `auto` is the case the pool exists for -- a VAE dropped because the
+  // box was tight, wanted again on the very next clip. Pooled, it stays
+  // purgeable: a peer that genuinely needs the room takes it through
+  // reclaim_at_least(), and one that does not leaves the next decode
+  // nothing to reload. `destroy` is the caller asking for the bytes back
+  // now, so it keeps dropping them.
+  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->pool_weights(vae_dir_for_release_());
+    }
   }
   _vae.reset();
   _flux2_vae.reset();

@@ -1,6 +1,7 @@
 #include "stages/generate-image-stage.h"
 
 #include "stages/model-memory.h"
+#include "stages/model-provenance.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -476,6 +477,37 @@ GenerateImageStage::revise_dit_declaration_(const std::string& dit_dir) const
       model_memory::dir_weights_bytes(dit_dir) >> 20));
 }
 
+StageMemory
+GenerateImageStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string mllm = (fs::path(root) / "mllm").string();
+  std::error_code ec;
+  const std::string enc = fs::exists(mllm, ec)
+                              ? mllm
+                              : (fs::path(root) / "text_encoder").string();
+  const std::string dit = (fs::path(root) / "transformer").string();
+  // NAMED SEPARATELY, both of them. A DiT and an encoder have different
+  // sizes, different streaming forms and -- on other stages -- different
+  // lifetimes, and collapsing them to one number loses the distinction
+  // the plan exists to make. Naming them is also what keeps a second
+  // generate-image over the same model from being billed twice.
+  const std::size_t dit_floor = model_memory::streaming_floor_bytes(
+      dit, {"transformer_blocks.", "double_stream_layers.",
+            "double_blocks.", "blocks."});
+  m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor);
+  m.hold(enc, model_memory::dir_weights_bytes(enc));
+  // No unload policy on this stage: it holds both for the run. Freeing
+  // the DiT for a decode that would not otherwise fit
+  // (free_flux2_dit_for_decode_ and its siblings) is a TRANSIENT, not a
+  // lifetime, and saying `releases` here would tell peers the weights
+  // are gone after this stage runs when they are not.
+  return m;
+}
+
 std::vector<ResourceClaim>
 GenerateImageStage::declare_resources() const
 {
@@ -638,24 +670,18 @@ GenerateImageStage::ensure_loaded_()
     // (e.g. the 18 GB 9B DiT + a 16 GB encoder on a 16/32 GB box); ~2-3x slower
     // per step but bounds peak RAM to ~one block. VPIPE_FLUX2_STREAM forces it.
     bool stream_blocks;
-    double pin_frac = 0.0;
     {
       const auto plan = model_memory::plan_streaming(
           session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
       stream_blocks = plan.stream;
-      pin_frac      = plan.pin_frac;
       if (const char* e = std::getenv("VPIPE_FLUX2_STREAM")) {
         stream_blocks = (std::atoi(e) != 0);
-        if (!stream_blocks) { pin_frac = 0.0; }
       }
       session()->log_debug(fmt(
           "GenerateImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) + 6 "
           "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
           plan.others >> 30, phys_ram() >> 30,
           stream_blocks ? "STREAM blocks" : "PRELOAD"));
-    }
-    if (const char* e = std::getenv("VPIPE_FLUX2_PIN_FRAC")) {
-      pin_frac = std::atof(e);
     }
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
@@ -680,7 +706,7 @@ GenerateImageStage::ensure_loaded_()
       }
     }
     _flux2_dit = genai::MetalFlux2Transformer::load(
-        weight_set_(dit_dir), mc, fcfg, stream_blocks, pin_frac);
+        weight_set_(dit_dir), mc, fcfg, stream_blocks);
     if (!_flux2_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
@@ -696,7 +722,6 @@ GenerateImageStage::ensure_loaded_()
     // generation (free_flux2_dit_for_decode_) can reload identically.
     _flux2_dit_dir  = dit_dir;
     _flux2_stream   = stream_blocks;
-    _flux2_pin_frac = pin_frac;
     _vae_base       = flux2_vae_base_(root);
   } else if (_family == "qwen-image-edit") {
     // Dual-stream Qwen-Image-Edit DiT (20B). Stream the blocks when the box
@@ -713,13 +738,8 @@ GenerateImageStage::ensure_loaded_()
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
     bool   stream_blocks = plan.stream;
-    double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_QIE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-      if (!stream_blocks) { pin_frac = 0.0; }
-    }
-    if (const char* e = std::getenv("VPIPE_QIE_PIN_FRAC")) {
-      pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
@@ -729,7 +749,7 @@ GenerateImageStage::ensure_loaded_()
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     genai::MetalQwenImageTransformer::Config qcfg;
     _qie_dit = genai::MetalQwenImageTransformer::load(
-        weight_set_(dit_dir), mc, qcfg, stream_blocks, pin_frac);
+        weight_set_(dit_dir), mc, qcfg, stream_blocks);
     if (!_qie_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the Qwen-Image-Edit DiT from "
@@ -752,13 +772,8 @@ GenerateImageStage::ensure_loaded_()
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
     bool   stream_blocks = plan.stream;
-    double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_BOOGU_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-      if (!stream_blocks) { pin_frac = 0.0; }
-    }
-    if (const char* e = std::getenv("VPIPE_BOOGU_PIN_FRAC")) {
-      pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
@@ -769,7 +784,6 @@ GenerateImageStage::ensure_loaded_()
     // reload it on the next prompt (free_boogu_dit_for_decode_).
     _boogu_dit_dir = dit_dir;
     _boogu_stream = stream_blocks;
-    _boogu_pin_frac = pin_frac;
     _vae_base = flux2_vae_base_(root);   // Boogu's VAE is a plain AutoencoderKL
     _release_scratch = stream_blocks;
     if (stream_blocks) { revise_dit_declaration_(dit_dir); }
@@ -803,13 +817,8 @@ GenerateImageStage::ensure_loaded_()
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
     bool   stream_blocks = plan.stream;
-    double pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_MAGE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-      if (!stream_blocks) { pin_frac = 0.0; }
-    }
-    if (const char* e = std::getenv("VPIPE_MAGE_PIN_FRAC")) {
-      pin_frac = std::atof(e);
     }
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) + 6 "
@@ -818,7 +827,7 @@ GenerateImageStage::ensure_loaded_()
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     auto mcfg = genai::mage_flow_dit_config();
     _mage_dit = genai::MetalMageFlowTransformer::load(
-        weight_set_(dit_dir), mc, mcfg, stream_blocks, pin_frac);
+        weight_set_(dit_dir), mc, mcfg, stream_blocks);
     if (!_mage_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the Mage-Flow DiT from '{}'; "
@@ -879,7 +888,7 @@ GenerateImageStage::load_flux2_dit_()
   fcfg.i8_gemm = _i8_gemm;
   _flux2_params.apply_to(fcfg);
   _flux2_dit = genai::MetalFlux2Transformer::load(
-      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream, _flux2_pin_frac);
+      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream);
   return (bool)_flux2_dit;
 }
 
@@ -945,6 +954,21 @@ GenerateImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
+  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
+  // pool_weights() finds the set through a WEAK reference and there is
+  // nothing left to pool once this model has released its last strong
+  // one.
+  //
+  // This free is the pool's best case. The DiT is being given up to make
+  // room for a decode that may or may not actually need it: pooled, the
+  // pages stay purgeable, so if the decode does need them
+  // reclaim_at_least() spends the pool first and they go -- and if it
+  // does not, the next prompt recycles the checkpoint instead of
+  // re-reading it. Dropping outright took the reload every time and
+  // could not tell the two cases apart.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_flux2_dit_dir);
+  }
   _flux2_dit.reset();
   _dit_unloaded = true;
 }
@@ -971,8 +995,7 @@ GenerateImageStage::load_boogu_dit_()
   genai::MetalBooguTransformer::Config bcfg;
   bcfg.i8_gemm = _i8_gemm;
   _boogu_dit = genai::MetalBooguTransformer::load(weight_set_(_boogu_dit_dir),
-                                                 mc, bcfg, _boogu_stream,
-                                                 _boogu_pin_frac);
+                                                 mc, bcfg, _boogu_stream);
   if (_boogu_dit && _boogu_stream) {
     session()->info(fmt(
         "GenerateImageStage('{}'): Boogu DiT streaming, pinned {} of {} blocks "
@@ -996,12 +1019,36 @@ GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
   // peak is the FLUX.2 estimate: ~7x one full-res base-channel buffer.
   const std::size_t peak =
       (std::size_t)gen_h * gen_w * (std::size_t)_vae_base * 2 * 7;
-  if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  const bool decode_runs_beside_us = mb.fits(peak) && mb.fits_physical(peak);
+  // Tell the DiT how much to leave clear when it decides whether to keep
+  // a streamed block. Growth must not eat the arena the decode needs --
+  // that trades a disk read for an allocation failure. ZERO when the DiT
+  // is about to be freed for the decode: reserving room for a
+  // coexistence that does not happen costs the whole denoise, and
+  // BlockResidency reads a zero reserve as an ANSWER rather than as
+  // never having been told.
+  _boogu_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+  if (decode_runs_beside_us) { return; }
   session()->info(fmt(
       "GenerateImageStage('{}'): freeing the Boogu-Image DiT ({} MB working-set "
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
+  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
+  // pool_weights() finds the set through a WEAK reference and there is
+  // nothing left to pool once this model has released its last strong
+  // one.
+  //
+  // This free is the pool's best case. The DiT is being given up to make
+  // room for a decode that may or may not actually need it: pooled, the
+  // pages stay purgeable, so if the decode does need them
+  // reclaim_at_least() spends the pool first and they go -- and if it
+  // does not, the next prompt recycles the checkpoint instead of
+  // re-reading it. Dropping outright took the reload every time and
+  // could not tell the two cases apart.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_boogu_dit_dir);
+  }
   _boogu_dit.reset();
   _dit_unloaded = true;
 }
@@ -1049,6 +1096,21 @@ GenerateImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
       "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
       "reloads on the next prompt", this->id(), mb.headroom >> 20,
       mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
+  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
+  // pool_weights() finds the set through a WEAK reference and there is
+  // nothing left to pool once this model has released its last strong
+  // one.
+  //
+  // This free is the pool's best case. The DiT is being given up to make
+  // room for a decode that may or may not actually need it: pooled, the
+  // pages stay purgeable, so if the decode does need them
+  // reclaim_at_least() spends the pool first and they go -- and if it
+  // does not, the next prompt recycles the checkpoint instead of
+  // re-reading it. Dropping outright took the reload every time and
+  // could not tell the two cases apart.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_krea2_dit_dir);
+  }
   _dit.reset();
   _dit_unloaded = true;
 }
@@ -1844,6 +1906,24 @@ GenerateImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   const int img_seq = gh * gw;
   const int IC = _qie_dit->config().in_channels;   // 64 = 16 * 2 * 2
 
+  // How much the DiT must leave clear when it decides whether to keep a
+  // streamed block resident. Its growth must not eat the arena the
+  // vae-decode needs right after -- that trades a disk read for an
+  // allocation failure.
+  //
+  // Set HERE rather than at load, because the figure is a function of
+  // the geometry and the geometry arrives with the beat. It is also the
+  // only place that can: unlike the other image families, this one has
+  // no free-the-DiT-for-the-decode path, so nothing else would ever
+  // declare a reserve -- and BlockResidency keeps growth OFF until one
+  // is declared, which is deliberate: a model that has not been told
+  // what its peers cost should not grow against a guess.
+  if (mc != nullptr) {
+    const std::size_t peak =
+        (std::size_t)H * W * (std::size_t)_vae_base * 2 * 7;
+    _qie_dit->set_residency_reserve(peak);
+  }
+
   // `txt_pos` is the diffusion-conditioner's qwen-image-edit conditioning: the
   // image-aware last-hidden [n_real, 3584] bf16, already POST encoder final-norm
   // (the conditioner ran the vision tower + splice + drop-64 + final-RMSNorm).
@@ -2277,11 +2357,7 @@ GenerateImageStage::tag_model_(TensorBeat& tb) const
   // `_hf_dir` is the reference the user actually named (a registry key like
   // "local/Mage-Flow-Edit-Turbo-8bit", or a path), which is the meaningful
   // identity of the generator -- not the resolved directory.
-  if (_hf_dir.empty()) { return; }
-  FlexData o = tb.sideband.is_object() ? tb.sideband : FlexData::make_object();
-  o.as_object().insert_or_assign("model_name",
-                                 FlexData::make_string(_hf_dir));
-  tb.sideband = std::move(o);
+  provenance::set_model_name(tb.sideband, _hf_dir);
 }
 
 Job

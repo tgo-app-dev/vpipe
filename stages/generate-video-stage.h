@@ -28,6 +28,8 @@
 
 namespace vpipe {
 
+struct TensorBeat;
+
 // Video DiT denoiser: text (and optionally keyframe or reference latents)
 // -> a latent VIDEO, plus a latent SOUNDTRACK from the families that
 // generate one. The video counterpart of `generate-image`, and
@@ -188,6 +190,24 @@ public:
   // so what it declares is ONE expert -- declaring both would size the box
   // against a peak that never happens and push every peer into streaming.
   std::vector<ResourceClaim> declare_resources() const override;
+  // The DiT is claimed for the DENOISE phase when this stage will
+  // certainly drop it after each clip. Same two conditions the
+  // conditioner's encoder claim satisfies (see
+  // model_memory::weight_claims_in_phase): the release has to be certain
+  // from CONFIG, and the decision to release must not itself consult a
+  // phased figure.
+  //
+  // It matters more here than anywhere: a 63 GB DiT counted as
+  // persistent appears in the conditioning and both decode columns as
+  // well as its own, and those are the phases a constrained box is
+  // usually tightest in.
+  std::vector<ResourceClaim> decide_resources() const override;
+
+  // The topological plan's view of this stage. Same facts as the claims
+  // above, minus the phase: what the DiT weighs, what it weighs
+  // streaming, whether it lets go, and how big the latents on its two
+  // oports are. Who consumes those is the runtime's business.
+  StageMemory declare_memory() const override;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will
@@ -316,6 +336,13 @@ private:
   void align_size_(int gh, int gw);
   void resolve_config_();
 
+  // Stamp the generating model onto an output beat's sideband, video
+  // and audio alike. The chain generate-video -> vae-decode ->
+  // rgb-to-video -> save-video (and its audio twin) carries it through
+  // to the container, so a saved clip records what produced it. Merges
+  // into any sideband already there.
+  void tag_model_(TensorBeat& tb) const;
+
   // "fl2va" / "ref2va" / empty. The two partitions are one architecture
   // and two TASKS, and nothing in the weights distinguishes them, so
   // this is read from the packaging -- see
@@ -377,6 +404,10 @@ private:
                std::vector<float>* audio_out, std::vector<int>* audio_shape);
 
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
+  // What decide_resources() named in its phase claim. Mutable because
+  // that method is const by the Stage contract and this is a note to
+  // self, not state the plan reads back.
+  mutable std::string _dit_dir_declared_;
   bool _unload_idle     = false;
   bool _unload_resolved = false;
 #endif

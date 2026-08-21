@@ -208,6 +208,19 @@ AudioTranscribeStage::reset_run_state()
   _sampler_latched = false;
 }
 
+StageMemory
+AudioTranscribeStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string dir = resolve_model_dir(_hf_dir);
+  m.hold(dir, model_memory::dir_weights_bytes(dir));
+  // An ASR decoder held for the run, with no streaming form. `releases`
+  // false is the fact here rather than the safe default: the stage
+  // transcribes a continuing stream.
+  return m;
+}
+
 std::vector<ResourceClaim>
 AudioTranscribeStage::declare_resources() const
 {

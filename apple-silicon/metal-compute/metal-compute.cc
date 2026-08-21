@@ -768,6 +768,9 @@ MetalCompute::memory_budget() const noexcept
       out.free_physical = idle * (std::size_t)page;
       out.compressed =
           (std::size_t)vm.compressor_page_count * (std::size_t)page;
+      out.wired = (std::size_t)vm.wire_count * (std::size_t)page;
+      out.file_cache =
+          (std::size_t)vm.external_page_count * (std::size_t)page;
     }
   }
   {

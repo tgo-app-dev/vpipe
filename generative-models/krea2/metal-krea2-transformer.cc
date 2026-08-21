@@ -266,17 +266,14 @@ MetalKrea2Transformer::~MetalKrea2Transformer() = default;
 
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
-              pin_frac);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
 }
 
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -595,10 +592,9 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_tmp_b  = m->elt_(ws, "time_mod_proj.bias", r);
   // Main blocks: preload all 28 (default), or stream them on demand from the
   // retained mmap (memory-bounded mode; loaded per-block in forward_dit). In
-  // streaming mode with pin_frac > 0, preload a LEADING prefix (as many blocks
-  // as fit in pin_frac of RAM) and stream only the tail. Loaded from `wts` here
-  // (read from the weight set); the pinned buffers survive the
-  // move (owned copies keep their refcount; mmap views keep the base alive).
+  // Streaming mode preloads NOTHING: the resident set is grown by
+  // BlockResidency as free memory allows, which is what replaced the
+  // pinned prefix. Loaded from `wts` here (read from the weight set).
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
@@ -608,25 +604,12 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
         return nullptr;
       }
     }
-  } else if (pin_frac > 0.0) {
-    std::vector<std::string> prefixes((std::size_t)cfg.n_layers);
-    for (int i = 0; i < cfg.n_layers; ++i) {
-      prefixes[(std::size_t)i] = "transformer_blocks." + std::to_string(i) + ".";
-    }
-    m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
-    if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
-    // Sized to the FULL depth though only the pinned prefix is filled:
-    // the empty slots are where forward() promotes streamed blocks as
-    // free memory allows (set_residency_reserve). An unfilled slot reads
-    // as empty, which is what the `held` test below keys on.
+  } else {
+    // Sized to the FULL depth though nothing is preloaded: the empty
+    // slots are where forward() promotes streamed blocks as free memory
+    // allows (set_residency_reserve). An unfilled slot reads as empty,
+    // which is what the `held` test below keys on.
     m->_blocks.resize((std::size_t)cfg.n_layers);
-    for (int i = 0; i < m->_pinned; ++i) {
-      if (!m->load_block_(ws,
-              "transformer_blocks." + std::to_string(i) + ".",
-              m->_blocks[(std::size_t)i], true, r)) {
-        return nullptr;
-      }
-    }
   }
   m->_final_sst  = m->elt_(ws, "final_layer.scale_shift_table", r);
   m->_final_norm = m->elt_(ws, "final_layer.norm.weight", r, true);
@@ -919,7 +902,6 @@ MetalKrea2Transformer::evict_tail_block_(bool allow_pinned)
     // measurement saying its pages are no longer in RAM is that belief
     // being wrong. The forward decides resident-or-streamed by whether
     // the slot is EMPTY, not by this count, so it simply streams now.
-    if (i < _pinned) { _pinned = i; }
     return n;
   }
   return 0;

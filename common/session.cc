@@ -226,6 +226,99 @@ parse_language_config(const FlexData& config)
 // bytes; 0 = uncapped. Config key `memory_cap_mb` (an integer, MB), so
 // the number a user reasons about is the one they type. Same shape as
 // the other parse_*_config helpers.
+// The WIRED POOL, as a percentage of believed physical RAM. Config key
+// `wired_pool_pct`; VPIPE_WIRED_POOL_PCT overrides it, the same way the
+// memory cap works and for the same reason (the manager is not reachable
+// through the public SessionIntf).
+//
+// The DEFAULT is deliberately stated here rather than in the manager:
+// this is the one place a reader can see what an unconfigured session
+// does. 75 is a share of the box that leaves a quarter of it
+// reclaimable; a dedicated machine can go higher, and above 80 is a
+// statement that nothing else on this box matters, which is why it has
+// to be typed rather than arrived at.
+//
+// 0 turns wiring off, which is the right answer for a shared machine.
+int
+parse_wired_pool_config(const FlexData& config)
+{
+  constexpr int kDefaultPct = 75;
+  if (const char* e = std::getenv("VPIPE_WIRED_POOL_PCT")) {
+    const long long v = std::atoll(e);
+    return v < 0 ? 0 : (v > 95 ? 95 : (int)v);
+  }
+  if (!config.is_object()) { return kDefaultPct; }
+  auto root = config.as_object();
+  if (!root.contains("wired_pool_pct")) { return kDefaultPct; }
+  FlexData v = root.at("wired_pool_pct");
+  const long long pct = v.is_int() ? v.as_int(kDefaultPct)
+                      : v.is_string()
+                            ? std::atoll(std::string(v.get_string()).c_str())
+                            : kDefaultPct;
+  return pct < 0 ? 0 : (pct > 95 ? 95 : (int)pct);
+}
+
+// Whether the plan REFUSES a graph that does not fit the pool, or merely
+// says so. Config key `wired_pool_enforce`, default FALSE.
+//
+// Off by default because a refusal is only as good as the accounting
+// behind it, and the accounting is not yet complete: a component that
+// can stream but does not declare its floor is counted at full size, so
+// a graph that fits is reported as one that cannot. MEASURED on the bf16
+// MiniMax-H3 graph, which runs on a 64 GB box: the DiT declares a 3 GB
+// floor against 63 GB, the 48 GB text encoder declares none, and the
+// plan concludes 58 GB against a 49 GB pool -- a refusal that would have
+// blocked a working run.
+//
+// So the numbers ship first and the veto follows once every streamable
+// component states its floor. Turn it on to get the deterministic
+// early-refusal behaviour on a box where the graph is known to be
+// declared completely.
+bool
+parse_wired_pool_enforce_config(const FlexData& config)
+{
+  if (const char* e = std::getenv("VPIPE_WIRED_POOL_ENFORCE")) {
+    return std::atoi(e) != 0;
+  }
+  if (!config.is_object()) { return false; }
+  auto root = config.as_object();
+  if (!root.contains("wired_pool_enforce")) { return false; }
+  FlexData v = root.at("wired_pool_enforce");
+  if (v.is_bool()) { return v.as_bool(false); }
+  if (v.is_int()) { return v.as_int(0) != 0; }
+  return false;
+}
+
+// The wired pool as an ABSOLUTE ceiling, in megabytes. Config key
+// `wired_pool_mb`; VPIPE_WIRED_POOL_MB overrides it, and both apps
+// forward their --wired-pool-mb flag through that variable for the same
+// reason --memory-cap-mb does: the manager is not reachable through the
+// public SessionIntf at construction time.
+//
+// 0 -- the default -- leaves `wired_pool_pct` in force. Set, it replaces
+// the percentage rather than combining with it; see
+// GenerativeModelManager::set_wired_pool_bytes for why a min() of the
+// two would be worse than either.
+std::size_t
+parse_wired_pool_mb_config(const FlexData& config)
+{
+  auto mb_to_bytes = [](long long mb) -> std::size_t {
+    return mb <= 0 ? 0 : (std::size_t)mb << 20;
+  };
+  if (const char* e = std::getenv("VPIPE_WIRED_POOL_MB")) {
+    return mb_to_bytes(std::atoll(e));
+  }
+  if (!config.is_object()) { return 0; }
+  auto root = config.as_object();
+  if (!root.contains("wired_pool_mb")) { return 0; }
+  FlexData v = root.at("wired_pool_mb");
+  const long long mb = v.is_int() ? v.as_int(0)
+                     : v.is_string()
+                           ? std::atoll(std::string(v.get_string()).c_str())
+                           : 0;
+  return mb_to_bytes(mb);
+}
+
 std::size_t
 parse_memory_cap_config(const FlexData& config)
 {
@@ -547,6 +640,14 @@ Session::generative_model_manager() const
     // parse_*_config helpers.
     const std::size_t cap = parse_memory_cap_config(_config);
     if (cap > 0) { _llm_mgr->set_memory_cap(cap); }
+    _llm_mgr->set_wired_pool_pct(parse_wired_pool_config(_config));
+    // AFTER the percentage, because set_wired_pool_bytes replaces it and
+    // set_wired_pool_pct clears the absolute form -- so the later call
+    // is the one in force, and an explicit megabyte figure should win
+    // over a percentage that may only be the built-in default.
+    const std::size_t wired = parse_wired_pool_mb_config(_config);
+    if (wired > 0) { _llm_mgr->set_wired_pool_bytes(wired); }
+    _llm_mgr->set_wired_pool_enforced(parse_wired_pool_enforce_config(_config));
   });
   return _llm_mgr.get();
 #else
@@ -1057,6 +1158,73 @@ Session::any_pipeline_launched() const
     }
   }
   return false;
+}
+
+Status
+Session::set_wired_pool_mb(std::size_t mb)
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mgr = generative_model_manager();
+  if (mgr == nullptr) {
+    warn(fmt("wired_pool_mb: rejected -- no model manager in this build"));
+    return Status{2};
+  }
+  const std::size_t want = mb << 20;
+  const std::size_t now  = mgr->wired_pool_limit();
+  // WHAT WOULD THE LIMIT BECOME. Not `want`: an absolute ask is clamped
+  // by what the GPU can keep resident, and 0 restores the percentage
+  // form -- so a naive want-vs-now compare would call a clamped raise a
+  // shrink, and would call "back to the default" whatever the default
+  // happens to be today. Ask the manager instead, then put it back if
+  // the answer is one this moment cannot accept.
+  const std::size_t prev_bytes = mgr->wired_pool_bytes();
+  if (want > 0) { mgr->set_wired_pool_bytes(want); }
+  else { mgr->set_wired_pool_pct(mgr->wired_pool_pct()); }
+  const std::size_t next = mgr->wired_pool_limit();
+
+  if (next < now && any_pipeline_launched()) {
+    // PUT IT BACK, exactly as it was. See SessionIntf: making a lower
+    // limit true again means unwiring buffers a model is still reading,
+    // and unwiring also marks them purgeable volatile -- reclaimable
+    // underneath their owner. Raising is always safe; lowering waits
+    // for the run to stop.
+    if (prev_bytes > 0) { mgr->set_wired_pool_bytes(prev_bytes); }
+    else { mgr->set_wired_pool_pct(mgr->wired_pool_pct()); }
+    warn(fmt(
+        "wired_pool_mb: rejected -- {} MB would shrink the pool from {} MB "
+        "while a pipeline is running, and the bytes already wired can only "
+        "be given back by unwiring buffers a model is still reading. Stop "
+        "the pipeline to lower it; raising it is accepted at any time",
+        mb, now >> 20));
+    return Status{3};
+  }
+  if (next != now) {
+    info(fmt("wired pool limit {} MB -> {} MB{}", now >> 20, next >> 20,
+             want > 0 && next < want
+                 ? fmt(" (asked {} MB, capped by what the GPU can keep "
+                       "resident)", mb)()
+                 : std::string()));
+  }
+  return Status{0};
+#else
+  (void)mb;
+  return Status{2};
+#endif
+}
+
+std::size_t
+Session::wired_pool_mb() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // const_cast because the manager is created lazily on first use and
+  // this is a read-only question about it. Constructing it to answer is
+  // the right behaviour -- the alternative is reporting 0 for a pool
+  // that is configured and merely not touched yet.
+  auto* mgr = const_cast<Session*>(this)->generative_model_manager();
+  return mgr != nullptr ? mgr->wired_pool_limit() >> 20 : 0;
+#else
+  return 0;
+#endif
 }
 
 Status

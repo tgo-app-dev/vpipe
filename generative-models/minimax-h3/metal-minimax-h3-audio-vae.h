@@ -120,6 +120,25 @@ class MetalMiniMaxH3AudioVae {
 
   ~MetalMiniMaxH3AudioVae();
 
+  // What a decode of `latent_frames` costs the box, from the DEFAULT
+  // config -- the ratios are the model's, and a repack ships no
+  // config.json to read them from.
+  //
+  //   `pcm` is the OUTPUT this stage hands downstream: planar f32 at
+  //   `stereo_channels` x frames x hop(). A payload, not scratch -- it
+  //   outlives the decode that made it.
+  //   `arena` is what the decode ALLOCATES to produce it, which for a
+  //   vocoder is dominated by the widest intermediate rather than by
+  //   the weights.
+  //
+  // Both zero when `latent_frames` is not positive.
+  static void decode_cost(int latent_frames, std::size_t* pcm,
+                          std::size_t* arena);
+
+  // Latent frames for `seconds` of soundtrack, which is what a plan has
+  // before any latent exists.
+  static int latent_frames_for_seconds(double seconds);
+
   // Decode `[stereo, latent_channels, frames]` DENORMALIZED latents into
   // `[stereo, frames * hop()]` PLANAR f32 samples, clamped to [-1, 1].
   //

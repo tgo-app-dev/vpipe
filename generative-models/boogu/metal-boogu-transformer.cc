@@ -208,6 +208,111 @@ MetalBooguTransformer::fuse_gu_(WeightSet& ws, const std::string& key,
   return d;
 }
 
+std::size_t
+MetalBooguTransformer::qw_bytes_(const QWeight& w)
+{
+  return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size() +
+         w.qbias.byte_size();
+}
+
+std::size_t
+MetalBooguTransformer::double_bytes_(const DoubleBlock& b)
+{
+  return qw_bytes_(b.jq_i) + qw_bytes_(b.jk_i) + qw_bytes_(b.jv_i) +
+         qw_bytes_(b.jq_t) + qw_bytes_(b.jk_t) + qw_bytes_(b.jv_t) +
+         qw_bytes_(b.jout_i) + qw_bytes_(b.jout_t) + qw_bytes_(b.jo) +
+         b.jqn.byte_size() + b.jkn.byte_size() +
+         qw_bytes_(b.sq) + qw_bytes_(b.sk) + qw_bytes_(b.sv) +
+         qw_bytes_(b.so) + b.sqn.byte_size() + b.skn.byte_size() +
+         qw_bytes_(b.iff_gate) + qw_bytes_(b.iff_up) + qw_bytes_(b.iff_down) +
+         qw_bytes_(b.iff_gu) + qw_bytes_(b.tff_gate) + qw_bytes_(b.tff_up) +
+         qw_bytes_(b.tff_down) + qw_bytes_(b.tff_gu) +
+         qw_bytes_(b.mi1) + qw_bytes_(b.mi2) + qw_bytes_(b.mi3) +
+         qw_bytes_(b.mt1) + qw_bytes_(b.mt2);
+}
+
+std::size_t
+MetalBooguTransformer::single_bytes_(const Block& b)
+{
+  return qw_bytes_(b.q) + qw_bytes_(b.k) + qw_bytes_(b.v) + qw_bytes_(b.o) +
+         qw_bytes_(b.ff_gate) + qw_bytes_(b.ff_up) + qw_bytes_(b.ff_down) +
+         qw_bytes_(b.ff_gu) + qw_bytes_(b.mod) +
+         b.qn.byte_size() + b.kn.byte_size() + b.mod_b.byte_size() +
+         b.n1.byte_size() + b.n2.byte_size() + b.fn1.byte_size() +
+         b.fn2.byte_size();
+}
+
+void
+MetalBooguTransformer::resident_pages_(std::size_t* examined,
+                                       std::size_t* incore,
+                                       std::size_t* paged_out) const
+{
+  *examined = 0;
+  *incore = 0;
+  if (paged_out != nullptr) { *paged_out = 0; }
+  auto add = [&](const metal_compute::SharedBuffer& p) {
+    if (p.byte_size() == 0) { return; }
+    const auto r = p.page_residency(64);
+    if (!r.valid) { return; }
+    *examined += r.examined;
+    *incore += r.incore;
+    if (paged_out != nullptr) { *paged_out += r.paged_out; }
+  };
+  // The DOMINANT buffers only: a block's bytes are almost all in the
+  // projections, and walking the norms as well would double the syscalls
+  // to sharpen a fraction the answer does not turn on.
+  auto addq = [&](const QWeight& w) { add(w.w); add(w.codes); };
+  for (const DoubleBlock& b : _double) {
+    addq(b.jq_i); addq(b.jk_i); addq(b.jv_i);
+    addq(b.jq_t); addq(b.jk_t); addq(b.jv_t);
+    addq(b.jout_i); addq(b.jout_t); addq(b.jo);
+    addq(b.sq); addq(b.sk); addq(b.sv); addq(b.so);
+    addq(b.iff_gate); addq(b.iff_up); addq(b.iff_down); addq(b.iff_gu);
+    addq(b.tff_gate); addq(b.tff_up); addq(b.tff_down); addq(b.tff_gu);
+  }
+  for (const Block& b : _single) {
+    addq(b.q); addq(b.k); addq(b.v); addq(b.o);
+    addq(b.ff_gate); addq(b.ff_up); addq(b.ff_down); addq(b.ff_gu);
+  }
+}
+
+std::size_t
+MetalBooguTransformer::evict_tail_block_(bool allow_pinned)
+{
+  const int sfloor = allow_pinned ? 0 : _pinned_s;
+  for (int i = (int)_single.size() - 1; i >= sfloor; --i) {
+    Block& b = _single[(std::size_t)i];
+    const std::size_t n = single_bytes_(b);
+    if (n == 0) { continue; }
+    b = Block{};
+    return n;
+  }
+  const int dfloor = allow_pinned ? 0 : _pinned_d;
+  for (int i = (int)_double.size() - 1; i >= dfloor; --i) {
+    DoubleBlock& b = _double[(std::size_t)i];
+    const std::size_t n = double_bytes_(b);
+    if (n == 0) { continue; }
+    b = DoubleBlock{};
+    return n;
+  }
+  return 0;
+}
+
+std::size_t
+MetalBooguTransformer::release_resident_blocks(std::size_t bytes)
+{
+  const std::size_t freed =
+      _resid.release(bytes, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalBooguTransformer: released {} MB of resident blocks "
+        "({} left)", freed >> 20, _resid.count()));
+  }
+  return freed;
+}
+
 bool
 MetalBooguTransformer::load_block_(WeightSet& ws,
                                    const std::string& pre, Block& b,
@@ -330,17 +435,14 @@ MetalBooguTransformer::~MetalBooguTransformer() = default;
 
 std::unique_ptr<MetalBooguTransformer>
 MetalBooguTransformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
-              pin_frac);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
 }
 
 std::unique_ptr<MetalBooguTransformer>
 MetalBooguTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -729,36 +831,12 @@ MetalBooguTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       }
       return nullptr;
     }
-    if (pin_frac > 0.0) {
-      std::vector<std::string> prefixes;
-      prefixes.reserve((std::size_t)(m->_cfg.n_double + m->_cfg.n_single));
-      for (int i = 0; i < m->_cfg.n_double; ++i) {
-        prefixes.push_back("double_stream_layers." + std::to_string(i) + ".");
-      }
-      for (int i = 0; i < m->_cfg.n_single; ++i) {
-        prefixes.push_back("single_stream_layers." + std::to_string(i) + ".");
-      }
-      int pin = stream_pin_count(ws.src(), prefixes, pin_frac);
-      if (pin > (int)prefixes.size()) { pin = (int)prefixes.size(); }
-      m->_pinned_d = pin < m->_cfg.n_double ? pin : m->_cfg.n_double;
-      m->_pinned_s = pin - m->_pinned_d;
-      m->_double.resize((std::size_t)m->_pinned_d);
-      for (int i = 0; i < m->_pinned_d; ++i) {
-        if (!m->load_double_(ws,
-                "double_stream_layers." + std::to_string(i) + ".",
-                m->_double[(std::size_t)i], r)) {
-          return nullptr;
-        }
-      }
-      m->_single.resize((std::size_t)m->_pinned_s);
-      for (int i = 0; i < m->_pinned_s; ++i) {
-        if (!m->load_block_(ws,
-                "single_stream_layers." + std::to_string(i) + ".",
-                m->_single[(std::size_t)i], /*modulated=*/true, r)) {
-          return nullptr;
-        }
-      }
-    }
+    // Streaming preloads NOTHING. Both stacks are sized to FULL depth
+    // all the same: the empty slots are where forward() promotes
+    // streamed blocks as free memory allows. An unfilled slot reads as
+    // empty, which is what `held` tests.
+    m->_double.resize((std::size_t)m->_cfg.n_double);
+    m->_single.resize((std::size_t)m->_cfg.n_single);
     if (mc->session() != nullptr) {
       mc->session()->info(fmt(
           "MetalBooguTransformer: streaming {}+{} blocks (memory-bounded)",
@@ -1597,7 +1675,9 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   for (int L = 0; L < c.n_double; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
     if (_block_progress) { _block_progress(L, c.n_double + c.n_single); }
-    const bool streaming = _stream_blocks && L >= _pinned_d;
+    const bool held = L < (int)_double.size() &&
+                      !_double[(std::size_t)L].jq_i.empty();
+    const bool streaming = _stream_blocks && !held;
     DoubleBlock streamed;
     if (streaming) {
       if (!load_double_(*_ws,
@@ -1746,6 +1826,16 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
       }
       return {};
     }
+    // The commit above has been WAITED for, so nothing encoded still
+    // points at this block's buffers -- which is why the promotion is
+    // here and not at the top of the iteration.
+    if (streaming && L < (int)_double.size()) {
+      const std::size_t nb = double_bytes_(streamed);
+      if (_resid.admit(_mc, nb)) {
+        _double[(std::size_t)L] = std::move(streamed);
+        _resid.note_admitted(nb);
+      }
+    }
     if (prof) { t_dbl_ff += ms_since(mk); }
   }
 
@@ -1764,7 +1854,9 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     if (_block_progress) {
       _block_progress(c.n_double + L, c.n_double + c.n_single);
     }
-    const bool streaming = _stream_blocks && L >= _pinned_s;
+    const bool held = L < (int)_single.size() &&
+                      !_single[(std::size_t)L].q.empty();
+    const bool streaming = _stream_blocks && !held;
     Block streamed;
     if (streaming) {
       if (!load_block_(*_ws,
@@ -1800,6 +1892,14 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
                                  gpu_err.empty() ? "GPU failed" : gpu_err));
       }
       return {};
+    }
+    // Waited above, so nothing encoded still points at this block.
+    if (streaming && L < (int)_single.size()) {
+      const std::size_t nb = single_bytes_(streamed);
+      if (_resid.admit(_mc, nb)) {
+        _single[(std::size_t)L] = std::move(streamed);
+        _resid.note_admitted(nb);
+      }
     }
   }
 

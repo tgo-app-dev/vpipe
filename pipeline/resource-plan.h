@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <mutex>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,6 +53,39 @@ struct ResourceClaim {
   // the planner for `kind`; see model_memory::kPhaseCondition and the
   // ordering constraint documented with it.
   std::string phase;
+
+  // The LAST phase this claim is alive in, when it outlives the one that
+  // created it. Empty means it ends where it began.
+  //
+  // The interval is what makes a peak computable. An output latent is
+  // written by the denoise and read by every decode after it; a
+  // conditioning is written by the encoder and read by the denoise.
+  // Neither is resident for the whole run, and neither belongs to a
+  // single phase -- and both are usually larger than the weights they
+  // sit beside on a constrained box.
+  //
+  // Meaningless without `phase`, and ignored when it names a phase
+  // EARLIER than `phase`: an interval that runs backwards is a caller
+  // mistake, and honouring it would silently narrow a claim to nothing.
+  std::string last_phase;
+
+  // The FLOOR this component can be made to hold, when it has a way of
+  // holding less than `key` weighs -- a DiT that can stream its blocks
+  // reports the trunk plus its in-flight slots here, not the checkpoint.
+  // Zero, the default, means "no way to hold less", which is always the
+  // safe answer.
+  //
+  // Two numbers rather than one because the planner cannot derive the
+  // second: whether a component can stream, and what it costs when it
+  // does, is a property of the loader, while whether it SHOULD is a
+  // property of the box -- and that question cannot be answered by
+  // whoever asks it first. A single number forces each loader to decide
+  // for itself, before it can see its peers, which is the ordering
+  // problem the planning phase exists to remove.
+  //
+  // A planner reports both totals so a graph that does not fit preloaded
+  // but does fit streamed is distinguishable from one that fits neither.
+  std::size_t floor_bytes = 0;
 };
 
 // Consumes the claims of ONE kind across a launch.
@@ -82,9 +116,14 @@ public:
   // in graph order, between begin_plan and end_plan. `phase` is the
   // claim's declared lifetime, empty for the usual "whole run"; what it
   // means is this planner's business (see ResourceClaim::phase).
+  // `floor` is the claim's ResourceClaim::floor_bytes -- the least this
+  // component can be made to hold. 0 means it has no way of holding less
+  // than `key` weighs.
   virtual void claim(const SessionContextIntf* session,
                      const std::string&        key,
-                     const std::string&        phase) = 0;
+                     const std::string&        phase,
+                     const std::string&        last_phase,
+                     std::size_t               floor) = 0;
 
   // A refinement of an already-claimed key, from Stage::decide_resources,
   // delivered after EVERY stage has claimed. A planner that lets these
@@ -95,7 +134,15 @@ public:
                       const std::string&        /*key*/,
                       const std::string&        /*phase*/) {}
 
-  virtual void end_plan(const SessionContextIntf* /*session*/) {}
+  // The complete picture. Returns FALSE to refuse the launch, which the
+  // runtime propagates out of launch() -- the point of a planning phase
+  // is to find out before anything loads, and a graph that cannot fit is
+  // better told so than left to discover it as a swap storm ten minutes
+  // in. A planner that only reports returns true.
+  virtual bool end_plan(const SessionContextIntf* /*session*/)
+  {
+    return true;
+  }
 };
 
 // Process-wide planner set, populated at static-init time by

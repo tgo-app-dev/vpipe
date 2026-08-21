@@ -313,6 +313,29 @@ public:
   void set_parked(bool p) noexcept;
   bool parked() const noexcept;
 
+  // ---- may this outlive the launch that opened it? ---------------------
+  //
+  // The removable pool keeps a released checkpoint alive across launches
+  // so a relaunch over the same model pays no reload. That is only sound
+  // for a set that is still a plain checkpoint. A set SPECIALISED to a
+  // run's parameters is not: handing it to a launch that does not share
+  // them gives that launch weights which are silently wrong for it.
+  //
+  // Said by whoever does the specialising, because nothing else can know
+  // -- by the time the pool sees the set, the only thing left is a byte
+  // count.
+  //
+  // Default TRUE, which is the safe default HERE and not the dangerous
+  // one: a set nobody specialised is a plain checkpoint. A caller that
+  // specialises one and forgets to say so is a thing to catch in review,
+  // not to guess at by refusing to pool anything.
+  bool recyclable() const noexcept;
+  // `why` is recorded so a set that will not be pooled can say what
+  // stopped it -- a checkpoint quietly reloading every launch otherwise
+  // looks exactly like one the pool never saw.
+  void set_not_recyclable(std::string why);
+  const std::string& unrecyclable_reason() const noexcept;
+
   // Monotonic tick of the last time a tensor was asked for. The cap
   // policy parks least-recently-used first, so that a set nothing has
   // touched for a while goes before one in active use.
@@ -347,6 +370,10 @@ private:
   // object's _mu is held by the restoring thread.
   std::atomic<bool>                    _restoring{false};
   std::atomic<bool>                    _parked{false};
+  // See recyclable(). Default true: a set nobody specialised may be
+  // handed to the next launch.
+  std::atomic<bool>                    _recyclable{true};
+  std::string                          _unrecyclable_why;
   std::atomic<std::uint64_t>           _last_use{0};
   WeightRegistry*                      _registry = nullptr;
   // Atomic, not _mu-guarded: these are pure bookkeeping on the

@@ -88,6 +88,13 @@ public:
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
+
+  // The VAE directory this stage names, resolved ONE way so the claim,
+  // the plan and the pool cannot name different things. See the twin in
+  // VaeDecodeStage for why the generic resolver is not enough.
+  std::string vae_dir_for_release_() const;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will

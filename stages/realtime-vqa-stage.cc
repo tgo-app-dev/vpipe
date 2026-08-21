@@ -689,6 +689,25 @@ RealtimeVqaStage::reset_run_state()
   _sampler_latched = false;
 }
 
+StageMemory
+RealtimeVqaStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string dir = resolve_model_dir(session(), _hf_dir);
+  m.hold(dir, model_memory::dir_weights_bytes(dir));
+  // No floor: this stage does not enable layer streaming -- it answers
+  // questions about a live scene and holds the model to do it. Claiming
+  // a floor it cannot reach would UNDER-count, which is the direction
+  // that thrashes.
+  //
+  // `releases` stays false for the same reason, and it is not a
+  // conservative default here but the fact: the stage is resident for
+  // the whole run, which is exactly what a continuously running graph
+  // needs the plan to say.
+  return m;
+}
+
 std::vector<ResourceClaim>
 RealtimeVqaStage::declare_resources() const
 {

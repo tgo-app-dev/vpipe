@@ -176,6 +176,55 @@ const STRINGS = {
       '已保存 · 当前 {n} 行', '已儲存 · 目前 {n} 行'],
   'settings.current_range': ['current {n} lines (range {min}–{max})',
       '当前 {n} 行（范围 {min}–{max}）', '目前 {n} 行（範圍 {min}–{max}）'],
+  'settings.wired_pool':    ['Unswappable memory (wired pool)',
+      '不可交换内存（锁定池）', '不可交換記憶體（鎖定池）'],
+  'settings.wired_pool_desc': ['Ceiling on memory this process makes '
+      + 'unswappable: model weights, a streaming model\u2019s resident '
+      + 'blocks, activation scratch. Wired pages cannot be compressed or '
+      + 'swapped, so this is what the process genuinely keeps. It can be '
+      + 'RAISED while a pipeline runs, but not lowered \u2014 giving wired '
+      + 'bytes back means unwiring buffers a model is still reading. 0 '
+      + 'restores the default share of RAM.',
+      '本进程可锁定为不可交换的内存上限：模型权重、流式模型常驻的层块、'
+      + '激活暂存区。锁定的页面无法被压缩或换出，因此这是本进程真正持有的内存。'
+      + '流水线运行期间只能调高，不能调低——归还已锁定的内存意味着解锁模型'
+      + '正在读取的缓冲区。填 0 则恢复按内存比例的默认值。',
+      '本行程可鎖定為不可交換的記憶體上限：模型權重、串流模型常駐的層塊、'
+      + '啟動暫存區。鎖定的頁面無法被壓縮或換出，因此這是本行程真正持有的'
+      + '記憶體。管線執行期間只能調高，不能調低——歸還已鎖定的記憶體意味著'
+      + '解鎖模型正在讀取的緩衝區。填 0 則恢復按記憶體比例的預設值。'],
+  'settings.mb':            ['MB', 'MB', 'MB'],
+  'settings.wired_updated': ['Wired pool updated', '锁定池已更新',
+      '鎖定池已更新'],
+  'settings.wired_current': ['current {n} MB · {used} MB wired now',
+      '当前 {n} MB · 已锁定 {used} MB', '目前 {n} MB · 已鎖定 {used} MB'],
+  'settings.wired_capped':  ['capped at {max} MB by what the GPU can keep '
+      + 'resident', '受 GPU 可常驻内存限制，上限为 {max} MB',
+      '受 GPU 可常駐記憶體限制，上限為 {max} MB'],
+  // Shown whether or not the cap is currently binding: the limit above
+  // cannot be read without it. 48 GB is roomy or already clamped
+  // depending on this number.
+  'settings.wired_device_max': ['GPU maximum {max} MB',
+      'GPU 上限 {max} MB', 'GPU 上限 {max} MB'],
+  'settings.wired_sysctl':  ['The GPU maximum is a hard ceiling: a larger '
+      + 'figure is accepted and clamped to it. To raise it, '
+      + 'sudo sysctl iogpu.wired_limit_mb=N (N in MB; 0 restores the '
+      + 'default, and it does not survive a reboot).',
+      'GPU 上限是硬性上限：填入更大的数值会被自动截断到该上限。如需提高，'
+      + '可执行 sudo sysctl iogpu.wired_limit_mb=N（N 以 MB 为单位；填 0 '
+      + '恢复默认值，且重启后失效）。',
+      'GPU 上限是硬性上限：填入更大的數值會被自動截斷到該上限。如需提高，'
+      + '可執行 sudo sysctl iogpu.wired_limit_mb=N（N 以 MB 為單位；填 0 '
+      + '恢復預設值，且重新開機後失效）。'],
+  'settings.wired_running': ['a pipeline is running \u2014 the limit can be '
+      + 'raised but not lowered',
+      '流水线正在运行——上限只能调高，不能调低',
+      '管線正在執行——上限只能調高，不能調低'],
+  'settings.wired_off':     ['wiring is off; nothing is protected from the '
+      + 'compressor', '未启用锁定；没有内存受压缩器保护',
+      '未啟用鎖定；沒有記憶體受壓縮器保護'],
+  'settings.limit_nonneg':  ['limit must be 0 or a positive integer',
+      '上限必须为 0 或正整数', '上限必須為 0 或正整數'],
   'settings.no_endpoint':   ['server does not expose the limit endpoint',
       '服务器未提供该上限接口', '伺服器未提供該上限端點'],
 
@@ -434,6 +483,17 @@ const STRINGS = {
   'pl.mb_g_supplements': ['Supplements', '附属模型', '附屬模型'],
   'pl.mb_g_datasets':  ['Datasets', '数据集', '資料集'],
   'pl.mb_attaches':    ['attaches to {p}', '附属于 {p}', '附屬於 {p}'],
+  'pl.mb_search':      ['Filter by name, variant or type…',
+      '按名称、变体或类型筛选…', '依名稱、變體或類型篩選…'],
+  'pl.mb_in':          ['takes', '输入', '輸入'],
+  'pl.mb_out':         ['makes', '输出', '輸出'],
+  'pl.mb_count':       ['{n} models', '{n} 个模型', '{n} 個模型'],
+  'pl.mb_count_filtered': ['{n} of {total} models',
+      '{total} 个模型中的 {n} 个', '{total} 個模型中的 {n} 個'],
+  'pl.mb_no_match':    ['Nothing matches this filter. Clear it to see the '
+      + 'compatible models again.',
+      '没有符合此筛选条件的模型。清除筛选可重新查看兼容模型。',
+      '沒有符合此篩選條件的模型。清除篩選可重新查看相容模型。'],
   'pl.btn_unset':      ['⊘ unset', '⊘ 未设置', '⊘ 未設定'],
   'pl.btn_clear':      ['× clear', '× 清除', '× 清除'],
   'pl.omit_field':     ['omit this field from the config',

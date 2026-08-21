@@ -64,14 +64,21 @@ class MetalKrea2Transformer {
   // memory is ~1 block (~0.85 GB bf16) instead of all 28 (~24 GB). The small
   // parts (text-fusion tower, conditioning, final layer) are still preloaded.
   //
-  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of the main
-  // blocks resident so pinned + running stays within that fraction of physical
-  // RAM (e.g. 0.60). Pinned blocks are read once and reused across every
-  // forward; only the tail streams -- trades spare RAM for speed. 0 => pure
-  // streaming.
+  // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
+  //
+  // It was a fraction of TOTAL ram decided before the run, so it could
+  // not see the machine it landed on: not another process, not this
+  // graph's peers, not the moment a peer let go. On a tight box that is
+  // where it did most harm -- plan_streaming's own note records a 16 GB
+  // run taken from no swap at all to 11 GB resident with 3 GB of swap
+  // moving continuously, by a prefix sized exactly that way.
+  //
+  // What replaces it measures: admission against the live budget, a
+  // probe read off the room actually free, doubling while the box stays
+  // healthy, and a shed the moment the pages kept are found outside RAM.
   static std::unique_ptr<MetalKrea2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -79,7 +86,7 @@ class MetalKrea2Transformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalKrea2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   ~MetalKrea2Transformer();   // out-of-line: _ws is a fwd-declared type
 

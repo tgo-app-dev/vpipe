@@ -7,7 +7,8 @@
 // precedes them.
 //
 // Usage:
-//   vpipe [--config CFG] [--memory-cap-mb N] LAUNCH ...
+//   vpipe [--config CFG] [--memory-cap-mb N] [--wired-pool-mb N]
+//         LAUNCH ...
 //
 //   LAUNCH is one of:
 //     --launch <spec>              spec is a path to a pipeline JSON/binary
@@ -130,6 +131,16 @@ const char* const kUsage =
   "                              pressure and taken back on next use), not\n"
   "                              refused. Same as session config\n"
   "                              memory_cap_mb; 0/unset = uncapped.\n"
+  "  --wired-pool-mb N           ceiling on memory made UNSWAPPABLE\n"
+  "                              (mlock'd): weights, a streaming model's\n"
+  "                              resident blocks, activation scratch.\n"
+  "                              Wired pages cannot be compressed or\n"
+  "                              swapped, so this is what the process\n"
+  "                              GENUINELY keeps. Clamped to what the GPU\n"
+  "                              can keep resident. Same as session config\n"
+  "                              wired_pool_mb; unset = the wired_pool_pct\n"
+  "                              share of RAM (default 75%), 0 = no\n"
+  "                              wiring at all.\n"
   "  --plugin PATH               load a plugin .dylib at startup "
   "(repeatable).\n"
   "  --version                   print the version and build identity\n"
@@ -485,6 +496,13 @@ run(int argc, char** argv)
       // reachable from the public SessionIntf, and an env override is
       // this tree's convention for memory knobs (cf VPIPE_RAM_LIMIT_MB).
       ::setenv("VPIPE_MEMORY_CAP_MB", argv[i], 1);
+    } else if (a == "--wired-pool-mb") {
+      if (++i >= argc) { return arg_err("--wired-pool-mb needs a value"); }
+      // Same forwarding as --memory-cap-mb above, and for the same
+      // reason. The two are different questions: this one bounds what
+      // the process makes UNSWAPPABLE, that one bounds what it insists
+      // on holding at all.
+      ::setenv("VPIPE_WIRED_POOL_MB", argv[i], 1);
     } else if (a == "--plugin") {
       if (++i >= argc) { return arg_err("--plugin needs a path"); }
       plugins.push_back(argv[i]);

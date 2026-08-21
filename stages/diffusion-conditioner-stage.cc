@@ -945,7 +945,51 @@ DiffusionConditionerStage::declare_resources() const
   // DECISION and belongs in decide_resources() below -- taken here it
   // would read a half-built picture, and a graph would size itself
   // differently depending on where the flattener put this stage.
-  return model_memory::weight_claims({enc, dit});
+  //
+  // The encoder's FLOOR, though, is not a decision: it is a fact about
+  // the checkpoint -- what it holds if it streams its layers -- and it
+  // is the term that decides the peak of a generation graph, because the
+  // conditioning phase carries the encoder at whatever size it is
+  // counted at. A 48 GB encoder with no floor makes every such graph
+  // report a requirement it does not have.
+  std::vector<ResourceClaim> out;
+  const std::size_t enc_floor =
+      enc.empty() ? 0
+                  : genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc);
+  if (!enc.empty()) {
+    out.push_back(model_memory::weight_claim_streamable(enc, enc_floor));
+  }
+  if (!dit.empty()) {
+    for (auto& c : model_memory::weight_claims({dit})) {
+      out.push_back(std::move(c));
+    }
+  }
+  return out;
+}
+
+StageMemory
+DiffusionConditionerStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  std::string enc, dit;
+  resolve_component_dirs_(&enc, &dit);
+  if (enc.empty()) { return m; }
+  m.hold(enc, model_memory::dir_weights_bytes(enc),
+         genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc),
+         // `destroy` only, for the reason decide_resources gives.
+         _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+         _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  // The conditioning it emits is deliberately NOT declared here.
+  //
+  // Its shape is built per beat from the prompt -- rows are tokens, and
+  // an image reference adds its own -- so there is no honest plan-time
+  // figure, and it is ~10 MB at any plausible caption length against a
+  // peak measured in gigabytes. Declaring a guess would put a number in
+  // the plan that nothing checks; leaving it out leaves the plan short
+  // by an amount smaller than its own rounding. The revise path is
+  // where this belongs once declare_memory has one.
+  return m;
 }
 
 std::vector<ResourceClaim>
@@ -1279,6 +1323,19 @@ DiffusionConditionerStage::unload_encoder_()
   // Everything weight-sized: the LM (or the wan family's umT5 tower),
   // either vision tower, and the embedding table. The tokenizer stays
   // (kilobytes, and it is pure CPU state).
+  // TO THE POOL when the policy is `auto`, and BEFORE the resets:
+  // pool_weights() finds the set through a WEAK reference, so once these
+  // models drop their last strong one there is nothing left to pool.
+  //
+  // The encoder is the checkpoint a relaunch most wants back -- it is
+  // the largest thing this graph loads and is dropped after every
+  // conditioning by design. `destroy` is the caller asking for the bytes
+  // now, so it keeps dropping them.
+  if (_unload_cfg == model_memory::UnloadPolicy::kAuto && !_enc_dir.empty()) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->pool_weights(_enc_dir);
+    }
+  }
   _encoder.reset();
   _umt5.reset();
   _h3_enc.reset();

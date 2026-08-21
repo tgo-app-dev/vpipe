@@ -152,15 +152,21 @@ class MetalFlux2Transformer {
   // block instead of the whole DiT (the embedders / modulation / final layer
   // are still preloaded). ~2-3x slower per step (weights re-read per forward).
   //
-  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of blocks (in
-  // stream order: the double blocks first, then the single blocks) resident so
-  // pinned + running stays within that fraction of physical RAM (e.g. 0.60).
-  // Pinned blocks are read once and reused; only the tail streams -- trades
-  // spare RAM for speed. Greedy over the actual (heterogeneous) block sizes.
-  // 0 => pure streaming.
+  // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
+  //
+  // It was a fraction of TOTAL ram decided before the run, so it could
+  // not see the machine it landed on: not another process, not this
+  // graph's peers, not the moment a peer let go. On a tight box that is
+  // where it did most harm -- plan_streaming's own note records a 16 GB
+  // run taken from no swap at all to 11 GB resident with 3 GB of swap
+  // moving continuously, by a prefix sized exactly that way.
+  //
+  // What replaces it measures: admission against the live budget, a
+  // probe read off the room actually free, doubling while the box stays
+  // healthy, and a shed the moment the pages kept are found outside RAM.
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -168,7 +174,7 @@ class MetalFlux2Transformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalFlux2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   ~MetalFlux2Transformer();
 

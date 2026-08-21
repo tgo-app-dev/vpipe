@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-detect.h"
+#include "stages/model-provenance.h"
 #include "stages/model-registry.h"
 
 #include <cmath>
@@ -261,7 +262,17 @@ VaeDecodeStage::declare_resources() const
           session(), root, vae_dir, resolve_model(session(), _hf_dir).model_type)) {
     return f->declare_resources(root, vae_dir);
   }
-  return model_memory::weight_claims({vae_dir});
+  // PHASED to the decode. A VAE is loaded when a latent arrives and
+  // dropped after -- it never coexists with the encoder or the DiT on a
+  // box where that matters -- so counting it as persistent puts its
+  // whole size into the conditioning and denoise columns, where it is
+  // not. It declares no FLOOR because it has no streaming form: a VAE
+  // holds what it weighs.
+  // Through the same resolver the release uses, so the claim and its
+  // release cannot name different things -- and so a repack does not
+  // claim its whole repository.
+  return model_memory::weight_claims_in_phase({vae_dir_for_release_()},
+                                              model_memory::kPhaseDecode);
 }
 
 Job
@@ -327,6 +338,17 @@ VaeDecodeStage::revise_decode_arena_(std::size_t bytes)
   }
   auto* mgr = session()->services()->generative_model_manager();
   if (mgr != nullptr) { mgr->revise_scratch("vae-decode", bytes); }
+  // And on the topological plan, where this stage's arena is its OWN
+  // scratch rather than a claim generate-video made on its behalf. That
+  // indirection exists in the claim model because a phase name has to be
+  // chosen by someone who knows the geometry; here the plan asks the
+  // stage that allocates, and it answers once it has a beat to answer
+  // from.
+  {
+    StageMemory m = declare_memory();
+    m.scratch = bytes;
+    revise_memory(m);
+  }
 
   if (bytes != _arena_stated) {
     session()->log_debug(fmt(
@@ -356,15 +378,107 @@ VaeDecodeStage::revise_decode_arena_(std::size_t bytes)
       _unload_idle ? "UNLOAD after each beat" : "keep resident"));
 }
 
+StageMemory
+VaeDecodeStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string vae_dir = vae_dir_for_release_();
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // A registered family answers for itself. Its holding is already
+  // named by the path IT owns, which on a single-file pack is the file
+  // rather than the root.
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, resolve_vae_dir(root),
+          resolve_model(session(), _hf_dir).model_type)) {
+    m.holdings = f->declare_holdings(root,
+                                     genai::VaeModelFamily::Role::kVideo);
+    if (!m.holdings.empty()) {
+      // The POLICY is this stage's: a decode's weights go at its idle
+      // point, which is what `releases` means here.
+      for (StageHolding& h : m.holdings) { h.releases = true; }
+      return m;
+    }
+  }
+#endif
+  // A VAE has no streaming form: it holds what it weighs, so `floor`
+  // stays 0 and is read as `preload`.
+  m.hold(vae_dir, model_memory::dir_weights_bytes(vae_dir), 0,
+         /*releases=*/true);
+  // The arena and the frames it produces are sized by the clip's
+  // geometry, which arrives on a beat -- generate-video declares both,
+  // because it is the stage that knows the geometry at plan time.
+  return m;
+}
+
+std::string
+VaeDecodeStage::vae_dir_for_release_() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string generic = resolve_vae_dir(root);
+  // resolve_vae_dir() returns `root` UNCHANGED for a pack with no
+  // `vae/config.json`, which is every Comfy-Org repack -- and naming the
+  // root here would claim, and later release, the whole repository. On
+  // the MiniMax-H3 repack that is 117 GB of DiT and text encoder
+  // attributed to a 5 GB VAE.
+  //
+  // So ask the family that CAN find its own single file. Only when the
+  // generic answer degenerated, so a diffusers layout keeps taking the
+  // path it always did.
+  if (generic != root) { return generic; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // A registered family first, for exactly the same reason the built-in
+  // arm below exists: it is the only thing that knows where its own
+  // weights sit in a pack with no vae/config.json. Without it every
+  // release, pool and phase-release this stage performs names the ROOT,
+  // and a plugin VAE credits itself with the DiT beside it.
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, generic, resolve_model(session(), _hf_dir)
+                                        .model_type)) {
+    const std::string p =
+        f->vae_path(root, genai::VaeModelFamily::Role::kVideo);
+    if (!p.empty()) { return p; }
+  }
+  const std::string h3 = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+  if (h3 != root) { return h3; }
+#endif
+  return generic;
+}
+
 void
 VaeDecodeStage::unload_vae_()
 {
+  // The phase claim's other half. declare_resources() promised these
+  // bytes are gone before the peers that sized against them run; this is
+  // where that promise is kept, and reporting it is what stops the
+  // manager warning at the end of the launch that it was not.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->note_phase_released(vae_dir_for_release_());
+  }
+
   // _wan_vae was in neither the guard nor the resets, so the idle policy
   // never unloaded a Wan VAE at all: with only _wan_vae held every
   // tested pointer was null and this returned early.
   if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
       !_plugin_dec) {
     return;
+  }
+  // TO THE POOL when the policy is `auto`, and BEFORE the resets:
+  // pool_weights() finds the set through a WEAK reference, so once these
+  // models drop their last strong one there is nothing left to pool.
+  //
+  // `auto` is the case the pool exists for -- a VAE dropped because the
+  // box was tight, wanted again on the very next clip. Pooled, it stays
+  // purgeable: a peer that genuinely needs the room takes it through
+  // reclaim_at_least(), and one that does not leaves the next decode
+  // nothing to reload. `destroy` is the caller asking for the bytes back
+  // now, so it keeps dropping them.
+  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->pool_weights(vae_dir_for_release_());
+    }
   }
   _vae.reset();
   _flux2_vae.reset();
@@ -698,14 +812,7 @@ namespace {
 void
 forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
 {
-  if (!src.sideband.is_object()) { return; }
-  FlexData sb = src.sideband;             // as_object() is a view: keep it
-  auto o = sb.as_object();
-  if (!o.contains("model_name")) { return; }
-  FlexData out = dst.sideband.is_object() ? dst.sideband
-                                          : FlexData::make_object();
-  out.as_object().insert_or_assign("model_name", o.at("model_name"));
-  dst.sideband = std::move(out);
+  provenance::carry_model_name(src.sideband, dst.sideband);
 }
 
 }  // namespace

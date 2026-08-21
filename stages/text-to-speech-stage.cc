@@ -483,6 +483,24 @@ TextToSpeechStage::release_models_()
 }
 #endif
 
+StageMemory
+TextToSpeechStage::declare_memory() const
+{
+  StageMemory m;
+  // BOTH, and each NAMED: this stage holds the LM and the codec at once,
+  // and naming them is what stops a second stage over either one being
+  // billed for the same bytes.
+  if (!_hf_dir.empty()) {
+    const std::string d = resolve_model_dir(session(), _hf_dir);
+    m.hold(d, model_memory::dir_weights_bytes(d));
+  }
+  if (!_codec_dir.empty()) {
+    const std::string d = resolve_model_dir(session(), _codec_dir);
+    m.hold(d, model_memory::dir_weights_bytes(d));
+  }
+  return m;
+}
+
 std::vector<ResourceClaim>
 TextToSpeechStage::declare_resources() const
 {

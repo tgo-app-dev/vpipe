@@ -3,7 +3,9 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
+#include "apple-silicon/metal-compute/metal-compute.h"
 #include "interfaces/session-services-intf.h"
 
 #include <sys/sysctl.h>
@@ -23,6 +25,32 @@
 
 namespace vpipe {
 namespace model_memory {
+
+namespace {
+
+// The running order. One list, so phase_order() and phase_count() cannot
+// disagree about what exists or in what sequence.
+constexpr std::string_view kPhasesInOrder[] = {
+    kPhaseCondition, kPhaseDenoise, kPhaseDecodeAudio, kPhaseDecode,
+};
+
+}  // namespace
+
+int
+phase_order(std::string_view phase)
+{
+  for (int i = 0; i < (int)(sizeof(kPhasesInOrder) / sizeof(*kPhasesInOrder));
+       ++i) {
+    if (kPhasesInOrder[i] == phase) { return i; }
+  }
+  return -1;
+}
+
+int
+phase_count()
+{
+  return (int)(sizeof(kPhasesInOrder) / sizeof(*kPhasesInOrder));
+}
 
 std::size_t
 phys_ram()
@@ -66,6 +94,21 @@ dir_weights_bytes(const std::string& dir)
     }
   }
   return total;
+}
+
+std::size_t
+streaming_floor_bytes(const std::string&                   dir,
+                      const std::vector<std::string_view>& stems,
+                      std::string_view                     exclude)
+{
+  if (dir.empty()) { return 0; }
+  auto wts = genai::MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  for (std::string_view stem : stems) {
+    const std::size_t f = genai::stream_floor_bytes(*wts, stem, exclude);
+    if (f > 0) { return f; }
+  }
+  return 0;
 }
 
 std::size_t
@@ -170,9 +213,66 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   // anything, so they are not what this decision is about. Clamped
   // rather than trusted: a caller that over-states cannot drive the
   // footprint below what remains.
+  // WHAT THE VERDICT WAS COMPUTED FROM, at debug level.
+  //
+  // The decision below is irreversible and the number behind it is a
+  // sum over things this caller cannot see, so a wrong verdict is
+  // otherwise a bare "STREAM" with nothing to check it against. That is
+  // not hypothetical: an LTX-2.5 DiT read 43868 MB where the truth was
+  // 18821 MB, because it named a peer's encoder that the peer had not
+  // loaded -- and the only visible symptom was a model streaming a pack
+  // that fitted four times over.
+  //
+  // `dirs` are what this caller is ABOUT TO HOLD. Naming a peer's
+  // component here adds its on-disk size on top of whatever the peer
+  // really declared, so the two figures below diverging by roughly a
+  // checkpoint is the signature of that mistake.
+  if (session != nullptr) {
+    const auto* mgr = session->services() != nullptr
+                          ? session->services()->generative_model_manager()
+                          : nullptr;
+    session->log_debug(fmt(
+        "plan_streaming: {} MB RAM; this caller holds dit '{}' ({} MB) + "
+        "enc '{}' ({} MB); footprint in '{}' {} MB, of which the manager "
+        "already accounts {} MB; unphased {} MB",
+        ram >> 20, dit_dir, dir_weights_bytes(dit_dir) >> 20,
+        enc_dir, dir_weights_bytes(enc_dir) >> 20,
+        kPhaseDenoise, p.footprint >> 20,
+        mgr != nullptr
+            ? mgr->phase_footprint(std::string(kPhaseDenoise)) >> 20 : 0,
+        weight_footprint(session, {dit_dir, enc_dir}) >> 20));
+  }
   p.retires   = std::min(dit_retires, p.footprint);
   p.footprint -= p.retires;
-  p.stream    = ram < p.footprint + headroom;
+  // STREAM UNLESS THE MODEL IS SMALL AGAINST THE BOX.
+  //
+  // The two paths used to be near-equals, chosen by whether the
+  // checkpoint fit with headroom to spare. They are not equals. Preload
+  // is the fragile one: it is decided once, before the run, from an
+  // estimate, and it cannot be walked back -- a model that declines to
+  // stream and then holds more than predicted thrashes, and nothing
+  // later can undo it. Streaming has a floor it can always fall to, and
+  // BlockResidency grows the resident set back up as the box allows, so
+  // on a machine with room the streamed path CONVERGES on what preload
+  // would have held anyway. MEASURED on the M4 Pro 64 GB with the bf16
+  // MiniMax-H3: growth reached 50 of 50 blocks and forwards 2-5 read
+  // nothing at all.
+  //
+  // So preload is kept only where it is obviously safe -- a checkpoint
+  // that is a small fraction of the box -- and streaming is the default
+  // everywhere else. `headroom` still has to be there on top: a third of
+  // a 16 GB box is 5.3 GB, which is small as a fraction and not small
+  // beside everything else running.
+  //
+  // Against TOTAL ram rather than what is free right now, deliberately
+  // and for the reason bounded() gives: every stage in a graph must
+  // answer this the same way and it has to be reproducible, so the
+  // figure cannot move underfoot between the first stage to ask and the
+  // last.
+  const bool small_against_box =
+      p.footprint > 0 && p.footprint <= ram / 3 &&
+      ram >= p.footprint + headroom;
+  p.stream    = !small_against_box;
   // Record the decision where peers can see it. Deliberately here and
   // not at the five call sites: this is the single streaming rule for
   // every DiT family, so it is also the only place that cannot drift
@@ -327,6 +427,20 @@ scratch_claims(std::string label, std::size_t bytes, std::string_view phase)
                         std::string(phase)}};
 }
 
+std::vector<ResourceClaim>
+payload_claims(std::string label, std::size_t bytes,
+               std::string_view first_phase, std::string_view last_phase)
+{
+  if (bytes == 0) { return {}; }
+  ResourceClaim c;
+  c.kind = std::string(kScratchKind);
+  c.key = std::move(label) + "|" + std::to_string(bytes);
+  c.phase = std::string(first_phase);
+  c.last_phase = std::string(last_phase);
+  return {std::move(c)};
+}
+
+
 std::size_t
 scratch_footprint(const SessionContextIntf* session, std::string_view phase)
 {
@@ -346,6 +460,16 @@ weight_claims(std::vector<std::string> dirs)
     out.push_back(ResourceClaim{std::string(kWeightsKind), std::move(d)});
   }
   return out;
+}
+
+ResourceClaim
+weight_claim_streamable(std::string dir, std::size_t floor)
+{
+  ResourceClaim c;
+  c.kind = std::string(kWeightsKind);
+  c.key = std::move(dir);
+  c.floor_bytes = floor;
+  return c;
 }
 
 std::vector<ResourceClaim>
@@ -384,20 +508,92 @@ public:
     // Drop the previous launch's estimates so one run's declarations
     // never leak into the next. Unconditional -- a graph with no
     // weight claims at all still has to clear what the last one left.
-    if (auto* mgr = manager(session)) { mgr->clear_declarations(); }
+    if (auto* mgr = manager(session)) {
+      mgr->clear_declarations();
+      // The vocabulary lives here; the manager evaluates intervals over
+      // it. Set every plan, so a manager reused across launches cannot
+      // be left ordering by a stale list.
+      std::vector<std::string> order;
+      for (int i = 0; i < phase_count(); ++i) {
+        order.push_back(std::string(
+            i == 0   ? kPhaseCondition
+            : i == 1 ? kPhaseDenoise
+            : i == 2 ? kPhaseDecodeAudio
+                     : kPhaseDecode));
+      }
+      mgr->set_phase_order(std::move(order));
+    }
+    report_landscape_(session);
     _declared.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(_mu);
     _pending.clear();
   }
 
+  // WHAT THE BOX LOOKS LIKE BEFORE ANYTHING LOADS.
+  //
+  // Every figure the planning phase reports afterwards is a claim about
+  // what a graph will take; none of them says what was already there.
+  // That is the missing half whenever a run turns out badly: a graph
+  // sized correctly against a machine that was already holding 30 GB of
+  // somebody else's memory reads, in the log, exactly like one sized
+  // wrongly against an empty one.
+  //
+  // At INFO and once per launch. Deliberately a SNAPSHOT and labelled as
+  // one -- these numbers move under the run, and the decisions below are
+  // taken against total RAM precisely so they do not depend on them.
+  static void
+  report_landscape_(const SessionContextIntf* session)
+  {
+    if (session == nullptr || session->services() == nullptr) { return; }
+    auto* mc = session->services()->metal_compute();
+    if (mc == nullptr || !mc->valid()) { return; }
+    const auto mb = mc->memory_budget();
+    if (mb.total_physical == 0) { return; }
+    const auto m = [](std::size_t b) { return b >> 20; };
+    session->info(fmt(
+        "memory landscape at launch: {} MB RAM -- {} MB idle, {} MB file "
+        "cache, {} MB wired system-wide, {} MB compressed, {} MB swap; this "
+        "process holds {} MB",
+        m(mb.total_physical), m(mb.free_physical), m(mb.file_cache),
+        m(mb.wired), m(mb.compressed), m(mb.swap_used),
+        m(mb.self_footprint)));
+    // The pool's own starting point, beside the ceiling the GPU sets. A
+    // limit reported without the device maximum cannot be read: 48 GB is
+    // roomy or already clamped depending on a number that is not there.
+    if (auto* mgr = manager(session)) {
+      const std::size_t lim = mgr->wired_pool_limit();
+      if (lim == 0) {
+        session->info(fmt(
+            "memory landscape: the wired pool is OFF (wired_pool_pct=0), so "
+            "nothing this run holds is protected from the compressor"));
+      } else {
+        const std::size_t dev = mgr->wired_pool_device_max();
+        session->info(fmt(
+            "memory landscape: wired pool {} MB{}, {} MB of it already in "
+            "use{}",
+            m(lim),
+            dev > 0 ? fmt(" of {} MB the GPU can keep resident", m(dev))()
+                    : std::string(),
+            m(mgr->wired_pool_used()),
+            mb.paging() ? " -- and the box is ALREADY paging, so growth "
+                          "will be refused until that clears"
+                        : ""));
+      }
+    }
+  }
+
   void
   claim(const SessionContextIntf* session, const std::string& dir,
-        const std::string& phase) override
+        const std::string& phase, const std::string& last_phase,
+        std::size_t floor) override
   {
     auto* mgr = manager(session);
     if (mgr == nullptr) { return; }
     const std::size_t b = dir_weights_bytes(dir);
     if (b == 0) { return; }        // absent component: nothing to hold
+    // A floor bigger than the checkpoint is a caller mistake, and taking
+    // it would report a streamed total ABOVE the preloaded one. Clamp
+    // rather than trust: this figure decides whether a graph is refused.
     // A phase on a DECLARATION is ignored, and said out loud. This pass
     // runs while the picture is still being assembled, so honouring one
     // here would make it visible to whichever stages are visited next
@@ -408,7 +604,8 @@ public:
           "resource-plan: '{}' names phase '{}' in declare_resources, where "
           "it is ignored; move it to decide_resources", dir, phase));
     }
-    mgr->declare_weights(dir, b);
+    mgr->declare_weights(dir, b, phase, last_phase,
+                         floor > 0 && floor < b ? floor : 0);
     _declared.fetch_add(b, std::memory_order_relaxed);
   }
 
@@ -438,7 +635,7 @@ public:
     _pending.push_back({dir, phase});
   }
 
-  void
+  bool
   end_plan(const SessionContextIntf* session) override
   {
     auto* mgr = manager(session);
@@ -459,17 +656,108 @@ public:
     }
 
     const std::size_t d = _declared.load(std::memory_order_relaxed);
-    if (d == 0 || session == nullptr) { return; }
+    if (d == 0 || session == nullptr) { return true; }
     // `d` sums CLAIMS and a checkpoint two stages name is claimed
     // twice, so it is always the larger, cruder number. What the box
     // has to hold is the manager's deduped view.
     const std::size_t total = mgr != nullptr ? mgr->resident_weight_bytes() : d;
-    session->log_debug(fmt(
+    const std::size_t fl =
+        mgr != nullptr ? mgr->phase_footprint_floor({}) : 0;
+    session->info(fmt(
         "resource-plan: {} MB of model weights declared before init ({} MB "
         "of claims, before shared checkpoints are counted once)",
         total >> 20, d >> 20));
+    // BOTH numbers, because they answer different questions and a graph
+    // can fit one and not the other. The preloaded figure is what the
+    // box must hold if nothing streams; the streamed one is the sum of
+    // what each component says it can be reduced to. A graph above the
+    // first and below the second does not need refusing -- it needs its
+    // streamable components told to stream.
+    //
+    // Both figures come from the manager's deduped, phase-narrowed view,
+    // so they are comparable and their DIFFERENCE is what streaming is
+    // worth on this graph. A floor summed beside a deduped total is not
+    // comparable to it -- it reads larger, and the smaller of the two is
+    // then always the total, which makes the floor do nothing at all.
+    const std::size_t peak_full =
+        mgr != nullptr ? mgr->phase_footprint({}) : d;
+    if (fl > 0 && fl != peak_full) {
+      session->info(fmt(
+          "resource-plan: {} MB preloaded / {} MB if every streamable "
+          "component streams", peak_full >> 20, fl >> 20));
+    }
 
-    if (phased == 0) { return; }
+    if (phased != 0) { report_phases_(session, mgr, total, phased); }
+
+    // ---- THE POOL CHECK, and the only place a graph is refused -------
+    //
+    // Refused only when the OPTIMISTIC reading does not fit: every
+    // streamable component at its floor, weights counted once and
+    // narrowed to their widest phase, plus the activation scratch. A
+    // refusal has to be a fact, not an estimate -- this accounting has
+    // been wrong before (a root-dir claim double-counting its own
+    // subdirectories reported 230781 MB against a true 118452), and a
+    // confident refusal computed from a number like that turns a working
+    // run into a support ticket. Erring toward admitting leaves the
+    // existing behaviour, which is merely slow.
+    if (mgr == nullptr) { return true; }
+    const std::size_t pool = mgr->wired_pool_limit();
+    if (pool == 0) { return true; }        // wiring off: nothing to refuse
+    // The PEAK -- the largest sum of everything alive at once, walking
+    // the phases in order -- rather than weights-plus-widest-scratch.
+    // The two differ by exactly the terms that outlive their producer:
+    // the conditioning, the latent, the decoded audio and frames. On a
+    // constrained box those are frequently the largest thing in the
+    // moment they are live, and the old shape had nowhere to put them.
+    std::vector<std::pair<std::string, std::size_t>> per_phase;
+    const std::size_t need = mgr->phase_peak(&per_phase);
+    if (need == 0) { return true; }
+    std::string tight;
+    std::size_t tight_b = 0;
+    std::string breakdown;
+    for (const auto& [p, b] : per_phase) {
+      if (b > tight_b) { tight_b = b; tight = p; }
+      if (!breakdown.empty()) { breakdown += ", "; }
+      breakdown += fmt("{} {} MB", p, b >> 20)();
+    }
+    session->info(fmt(
+        "resource-plan: peak {} MB in phase '{}' ({})",
+        need >> 20, tight, breakdown));
+    if (need <= pool) { return true; }
+    // What percentage WOULD hold it, against the same believed RAM the
+    // pool is a fraction of. Above 95 there is no such percentage --
+    // saying "raise it to 723%" is worse than saying it cannot fit,
+    // because the first reads like a setting and the second is the fact.
+    const std::size_t ram =
+        mgr->wired_pool_pct() > 0
+            ? pool / (std::size_t)mgr->wired_pool_pct() * 100
+            : 0;
+    const int want = ram > 0 ? (int)((need * 100 + ram - 1) / ram) : 0;
+    // Reported either way; refused only when asked to be. An
+    // incompletely declared graph reads as too big, and a veto on that
+    // basis blocks runs that work -- see parse_wired_pool_enforce_config.
+    const bool enforce = mgr->wired_pool_enforced();
+    const VpipeFormat msg = fmt(
+        "resource-plan: this graph needs at least {} MB resident at its "
+        "peak -- phase '{}', with everything streamable at its floor -- "
+        "and the wired pool is {} MB at wired_pool_pct={}. {}",
+        need >> 20, tight, pool >> 20,
+        mgr->wired_pool_pct(),
+        (want > 0 && want <= 95)
+            ? fmt("Set wired_pool_pct to {} or more.", want)()
+            : std::string("It does not fit this machine at any setting -- "
+                          "use a smaller model, a smaller geometry, or a "
+                          "quantized checkpoint."));
+    if (enforce) { session->error(msg); } else { session->warn(msg); }
+    return !enforce;
+  }
+
+private:
+  void
+  report_phases_(const SessionContextIntf* session,
+                 genai::GenerativeModelManager* mgr, std::size_t total,
+                 std::size_t phased) const
+  {
     const std::size_t peak = mgr != nullptr ? mgr->phase_footprint({}) : total;
     // The peak differs from the total only once TWO phases are
     // declared -- with one, its maximum and its sum are the same
@@ -477,12 +765,11 @@ public:
     // a single phase is elsewhere: peers in a DIFFERENT phase stop
     // counting these bytes at all, which is what plan_streaming asks
     // for and what no total can express.
-    session->log_debug(fmt(
+    session->info(fmt(
         "resource-plan: {} MB of that is phase-limited; peak across phases "
         "{} MB", phased >> 20, peak >> 20));
   }
 
-private:
   static genai::GenerativeModelManager*
   manager(const SessionContextIntf* session)
   {
@@ -526,8 +813,13 @@ public:
 
   void
   claim(const SessionContextIntf* session, const std::string& key,
-        const std::string& phase) override
+        const std::string& phase, const std::string& last_phase,
+        std::size_t /*floor*/) override
   {
+    // No floor: an activation arena has no smaller form to fall back
+    // to. It is the size the geometry makes it or the forward does not
+    // run, which is why vae-decode revises the figure rather than
+    // offering a range.
     auto* mgr = manager(session);
     if (mgr == nullptr) { return; }
     const std::size_t bar = key.rfind('|');
@@ -546,16 +838,16 @@ public:
       bytes = 0;
     }
     if (bytes == 0) { return; }
-    mgr->declare_scratch(key.substr(0, bar), bytes, phase);
+    mgr->declare_scratch(key.substr(0, bar), bytes, phase, last_phase);
     _total.fetch_add(bytes, std::memory_order_relaxed);
     _arenas.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void
+  bool
   end_plan(const SessionContextIntf* session) override
   {
     const unsigned n = _arenas.load(std::memory_order_relaxed);
-    if (n == 0 || session == nullptr) { return; }
+    if (n == 0 || session == nullptr) { return true; }
     const std::size_t t = _total.load(std::memory_order_relaxed);
     auto* mgr = manager(session);
     const std::size_t peak = mgr != nullptr ? mgr->scratch_bytes({}) : t;
@@ -563,9 +855,10 @@ public:
     // until the first beat is declared at kUnknownArena and rounds to
     // 0 MB, and a line reading "0 MB declared" would say the opposite of
     // what happened.
-    session->log_debug(fmt(
+    session->info(fmt(
         "resource-plan: {} activation arena(s) declared, {} MB; peak across "
         "phases {} MB", n, t >> 20, peak >> 20));
+    return true;
   }
 
 private:

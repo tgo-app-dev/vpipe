@@ -1199,10 +1199,16 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
 int
 MetalMiniMaxH3VideoVae::encoded_frames(int T) const
 {
+  return encoded_frames_for(_cfg, T);
+}
+
+int
+MetalMiniMaxH3VideoVae::encoded_frames_for(const Config& cfg, int T)
+{
   if (T <= 0) { return 0; }
   int t = T;
-  for (std::size_t i = 0; i < _cfg.time_down.size(); ++i) {
-    const int s = _cfg.time_down[i];
+  for (std::size_t i = 0; i < cfg.time_down.size(); ++i) {
+    const int s = cfg.time_down[i];
     // Causal padding prepends 2 frames, so a stride-s convolution over
     // T frames emits floor((T-1)/s)+1 -- 17 -> 9 -> 5, where a plain
     // division would say 17 -> 8 -> 4 and silently lose the last frame.
@@ -1825,17 +1831,39 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
 int
 MetalMiniMaxH3VideoVae::video_latent_frames(int T) const
 {
+  return video_latent_frames_for(_cfg, T);
+}
+
+int
+MetalMiniMaxH3VideoVae::video_latent_frames_for(const Config& cfg, int T)
+{
   if (T <= 0) { return 0; }
   // A single frame has no temporal extent to chunk, and no tail is
   // dropped from it.
-  if (T == 1) { return encoded_frames(1); }
-  const int cl = _cfg.clip_length;
+  if (T == 1) { return encoded_frames_for(cfg, 1); }
+  const int cl = cfg.clip_length;
   if (cl <= 0) { return 0; }
   const int pad = ((-T % cl) + cl) % cl;
   const int n = (T + pad) / cl;
-  const int per = encoded_frames(cl);
-  const int total = n * per - _cfg.token_drop;
+  const int per = encoded_frames_for(cfg, cl);
+  const int total = n * per - cfg.token_drop;
   return total > 0 ? total : 0;
+}
+
+std::size_t
+MetalMiniMaxH3VideoVae::latent_bytes(int width, int height, int frames)
+{
+  if (width <= 0 || height <= 0 || frames <= 0) { return 0; }
+  const Config cfg;                       // the model's own ratios
+  if (cfg.patch <= 0) { return 0; }
+  const int lf = video_latent_frames_for(cfg, frames);
+  if (lf <= 0) { return 0; }
+  const std::size_t w = (std::size_t)((width + cfg.patch - 1) / cfg.patch);
+  const std::size_t h = (std::size_t)((height + cfg.patch - 1) / cfg.patch);
+  // bf16, and z_channels rather than 2*z_channels: an ENCODE emits mean
+  // and logvar, but what travels between the denoise and the decodes is
+  // the sampled latent, which is half of that.
+  return w * h * (std::size_t)lf * (std::size_t)cfg.z_channels * 2;
 }
 
 int

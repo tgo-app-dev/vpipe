@@ -1473,6 +1473,16 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // together. Images are optional (zero, one or two keyframes), so the
     // text-only t2va task is the same checkpoint.
     set({"text", "image"}, {"video", "audio"});
+  } else if (mt == "minimax-h3-ref2va") {
+    // The reference-conditioned partition of the same checkpoint: it
+    // takes VIDEO and AUDIO references besides the prompt and stills.
+    //
+    // Absent from this table until now, and the gap only showed on a
+    // model registered FROM DISK -- a fetched one carries the I/O its
+    // catalogue entry records. So every locally quantized Ref2VA had no
+    // modalities at all, and a picker that filters on need_inputs hid
+    // it from exactly the stages that would use it.
+    set({"text", "image", "video", "audio"}, {"video", "audio"});
   } else if (mt == "boogu-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "boogu-image") {

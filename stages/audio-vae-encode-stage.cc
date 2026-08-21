@@ -1,4 +1,5 @@
 #include "stages/audio-vae-encode-stage.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -218,6 +219,40 @@ AudioVaeEncodeStage::reset_run_state()
   _pcm.clear();
   _rate = 0;
   _overflowed = false;
+}
+
+StageMemory
+AudioVaeEncodeStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  // Through the audio VAE's OWN resolver, not the root. declare_resources
+  // hands the family (root, root) and lets it answer; that works because
+  // a family sizes itself, but a byte figure derived from `root` would
+  // be the whole repository. When the component cannot be located,
+  // nothing is the honest answer.
+  std::string vae = genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  // A registered family knows where its own audio VAE sits, which on a
+  // single-file pack is the only way this is answerable at all.
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, vae,
+          resolve_model(session(), _hf_dir).model_type)) {
+    const std::string a =
+        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+    if (!a.empty()) { vae = a; }
+  }
+  if (vae.empty() || vae == root) { return m; }
+  // No streaming form; a VAE holds what it weighs.
+  //
+  // NEITHER `releases` NOR `reclaimable`, whatever the config says, and
+  // the config is what makes that worth stating: this stage parses
+  // `unload_when_idle` but has no unload path -- it never drops the
+  // encoder. A declaration is a promise peers size against, so claiming
+  // a release this stage does not perform would leave them short by the
+  // encoder's whole size. Give it an unload path and these come back.
+  m.hold(vae, model_memory::dir_weights_bytes(vae));
+  return m;
 }
 
 std::vector<ResourceClaim>

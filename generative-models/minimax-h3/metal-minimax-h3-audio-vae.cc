@@ -67,6 +67,46 @@ MetalMiniMaxH3AudioVae::Config::hop() const
   return h;
 }
 
+int
+MetalMiniMaxH3AudioVae::latent_frames_for_seconds(double seconds)
+{
+  if (seconds <= 0.0) { return 0; }
+  const Config cfg;
+  const int hop = cfg.hop();
+  if (hop <= 0 || cfg.sample_rate <= 0) { return 0; }
+  // The latent rate is sample_rate / hop -- 40 Hz at 32 kHz over an 800
+  // sample hop. Rounded UP, because a partial frame is still a frame.
+  const double rate = (double)cfg.sample_rate / (double)hop;
+  return (int)(seconds * rate + 0.999);
+}
+
+void
+MetalMiniMaxH3AudioVae::decode_cost(int latent_frames, std::size_t* pcm,
+                                    std::size_t* arena)
+{
+  if (pcm != nullptr) { *pcm = 0; }
+  if (arena != nullptr) { *arena = 0; }
+  if (latent_frames <= 0) { return; }
+  const Config cfg;
+  const std::size_t hop = (std::size_t)cfg.hop();
+  const std::size_t ch  = (std::size_t)cfg.stereo_channels;
+  const std::size_t lf  = (std::size_t)latent_frames;
+  if (hop == 0 || ch == 0) { return; }
+  // Planar f32, the shape decode() documents: [stereo, frames * hop()].
+  if (pcm != nullptr) { *pcm = ch * lf * hop * sizeof(float); }
+  if (arena == nullptr) { return; }
+  // Every upsample stage trades channels for time at a roughly constant
+  // product, so each intermediate is about `width x latent_frames`
+  // elements whatever stage it is -- the trunk starts at `latent_dim`
+  // and the stages run at `decoder_dim`, so the widest is the bound.
+  // Two are live at once, a stage's input and its output. f32
+  // throughout, because this path runs F32 rather than bf16.
+  const std::size_t width =
+      (std::size_t)(cfg.latent_dim > cfg.decoder_dim ? cfg.latent_dim
+                                                     : cfg.decoder_dim);
+  *arena = 2 * width * lf * sizeof(float);
+}
+
 std::string
 MetalMiniMaxH3AudioVae::resolve_vae_dir(const std::string& path)
 {

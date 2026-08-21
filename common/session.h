@@ -68,6 +68,10 @@ public:
   Status log_to_stdout() override;
   Status log_to_db() override;
   Status set_language(std::string_view) override;
+  // See SessionIntf: an absolute megabyte ceiling on unswappable
+  // memory, raisable while a pipeline runs and not lowerable.
+  Status set_wired_pool_mb(std::size_t mb) override;
+  std::size_t wired_pool_mb() const override;
 
   Status enable_profiling(unsigned max_events_per_stage) override;
   Status disable_profiling() override;

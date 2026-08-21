@@ -71,6 +71,54 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
     }
     return nullptr;
   }
+  // SAY SO IF THE PACK IS MISALIGNED, once per checkpoint and here
+  // rather than where it bites.
+  //
+  // THE COST THIS NAMES IS THE READ, not the mapping.
+  //
+  // A misaligned tensor also cannot be used where it lies -- a Metal
+  // buffer offset must be 16-byte aligned -- and that used to be the
+  // headline here. It is deliberately not any more: zero-copy mapping is
+  // not the direction. Asking the OS to manage 4 KB pages over a 10+ GB
+  // checkpoint costs more than owning the bytes does, and a mapped
+  // weight can be neither wired, parked nor pooled (see
+  // docs/MODEL-MEMORY.md), so a loader that maps is outside every
+  // mechanism that protects memory. Leading with a penalty on the path
+  // this tree is leaving would point an operator at the wrong repair.
+  //
+  // What is left is the one that is paid on EVERY path: F_NOCACHE only
+  // bypasses the buffer cache on a page-aligned offset, so a misaligned
+  // checkpoint's reads silently fall back to buffered I/O and grow the
+  // file cache one-for-one with what they read. That memory comes out of
+  // the weights themselves.
+  //
+  // The remedy is the one the operator can act on, so it is part of the
+  // message: vpipe's own quantizer used to write tensors in an order
+  // that shifted everything after the first odd-sized one, and re-running
+  // it lays the same weights down aligned.
+  if (session != nullptr) {
+    const auto a = wts->alignment();
+    if (a.misaligned > 0 || a.bad_shards > 0) {
+      const bool whole = a.bad_shards > 0;
+      session->warn(fmt(
+          "weights: '{}' is not aligned ({}). Every UNCACHED read of it "
+          "silently falls back to buffered I/O, because F_NOCACHE only "
+          "bypasses the cache on a page-aligned offset -- MEASURED, "
+          "6.2 GB read from a misaligned checkpoint grew the file cache "
+          "by 6.2 GB, which is memory taken from the weights themselves. "
+          "vpipe reads it on page boundaries and copies, so the cache "
+          "stays clean at the price of a memcpy. If this model was "
+          "quantized by an earlier version of vpipe, re-running the "
+          "quantization is recommended: it writes the same weights "
+          "aligned and costs neither",
+          dir,
+          whole ? fmt("{} of {} shard data sections start off-boundary, "
+                      "which shifts every tensor in them",
+                      a.bad_shards, a.shards)()
+                : fmt("{} of {} tensors start off-boundary",
+                      a.misaligned, a.tensors)()));
+    }
+  }
   // make_shared is not usable: the constructor is private.
   return shared_ptr<WeightSet>(
       new WeightSet(dir, std::move(*wts), session));
@@ -80,6 +128,28 @@ void
 WeightSet::set_parked(bool p) noexcept
 {
   _parked.store(p, std::memory_order_relaxed);
+}
+
+bool
+WeightSet::recyclable() const noexcept
+{
+  return _recyclable.load(std::memory_order_relaxed);
+}
+
+void
+WeightSet::set_not_recyclable(string why)
+{
+  _recyclable.store(false, std::memory_order_relaxed);
+  // FIRST reason wins: it is the one that made the set unrecyclable, and
+  // a later caller overwriting it would report the symptom rather than
+  // the cause.
+  if (_unrecyclable_why.empty()) { _unrecyclable_why = std::move(why); }
+}
+
+const string&
+WeightSet::unrecyclable_reason() const noexcept
+{
+  return _unrecyclable_why;
 }
 
 bool

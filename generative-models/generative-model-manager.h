@@ -81,7 +81,23 @@ public:
   GenerativeModelManager(const GenerativeModelManager&)            = delete;
   GenerativeModelManager& operator=(const GenerativeModelManager&) = delete;
 
-  ~GenerativeModelManager() override = default;
+  // NOT defaulted: the removable pool has to go first.
+  //
+  // Members destruct in REVERSE declaration order, so `_weights` -- the
+  // WeightRegistry every set deregisters from -- dies before `_pool`.
+  // A defaulted destructor therefore has the pooled sets deregistering
+  // against a destroyed registry, which aborts on a lock of a dead mutex
+  // ("mutex lock failed: Invalid argument") AFTER the run has finished
+  // its work, at teardown, where it reads as a crash with no cause.
+  //
+  // This was unreachable until the pool existed: `_weight_sets` holds
+  // WEAK references, so the manager owned no set and none of them
+  // outlived the models. Pooling is what made the manager an owner.
+  //
+  // Clearing here rather than reordering the members, because the order
+  // that fixes it is not visibly load-bearing and the next person to
+  // tidy the declarations would undo it.
+  ~GenerativeModelManager() override;
 
   // Returns a shared model handle, loading on first request for this
   // spec. Returns nullptr on failure (the failure is reported through
@@ -234,8 +250,16 @@ public:
   // (persistent wins over any phase), because two stages disagreeing
   // about a checkpoint's lifetime is not a reason to believe the
   // shorter one.
+  // `floor_bytes` is the least this checkpoint can be made to hold -- a
+  // block-streaming DiT's trunk plus its slots. 0 means it has no
+  // smaller form. Stored PER DIRECTORY so it goes through the same
+  // dedup and phase narrowing the sizes do: a floor summed beside a
+  // deduped total is not comparable to it, and the smaller of the two
+  // is then always the total, which makes the floor do nothing.
   void declare_weights(const std::string& dir, std::size_t expected_bytes,
-                       const std::string& phase = std::string());
+                       const std::string& phase = std::string(),
+                       const std::string& last_phase = std::string(),
+                       std::size_t floor_bytes = 0);
 
   // Set the phase of an ALREADY-declared checkpoint. The second half of
   // the planning split: declarations describe, this decides. A dir that
@@ -312,6 +336,36 @@ public:
   // itself.
   std::size_t phase_footprint(const std::string& phase) const;
 
+  // The same figure with every streamable checkpoint counted at its
+  // FLOOR instead of its size -- what the graph must hold if everything
+  // that can stream does. Deduped and phase-narrowed exactly as
+  // phase_footprint() is, which is the whole point: the two are then
+  // comparable, and their difference is what streaming is worth.
+  std::size_t phase_footprint_floor(const std::string& phase) const;
+
+  // The PEAK a constrained box must hold: the largest sum of everything
+  // alive at once, walking the phases in order, with every streamable
+  // component at its floor and the activation scratch included.
+  //
+  // Distinct from phase_footprint({}) in what it does with an interval:
+  // that one asks "persistent plus the widest single phase", which
+  // cannot express a latent alive across three of them. `by_phase`, when
+  // given, is filled with the per-phase totals so a caller can say WHICH
+  // moment is the tight one.
+  std::size_t phase_peak(std::vector<std::pair<std::string, std::size_t>>*
+                             by_phase = nullptr) const;
+
+  // The RUNNING ORDER of the phase vocabulary, handed in rather than
+  // known here.
+  //
+  // The manager stores phases as opaque strings on purpose -- it is the
+  // thing that dedups checkpoints, not the thing that knows what a
+  // denoise is -- but an INTERVAL cannot be evaluated without an order.
+  // Taking it as data keeps the vocabulary in the one place that
+  // documents it (model_memory's kPhase* constants) while letting the
+  // peak be computed here, where the claims live.
+  void set_phase_order(std::vector<std::string> phases);
+
   // ---- activation scratch ---------------------------------------------
   //
   // Memory a stage ALLOCATES to run, as opposed to the weights it holds.
@@ -323,7 +377,8 @@ public:
   // ONCE, at the larger -- the same rule declare_weights uses for a
   // checkpoint two stages both name.
   void declare_scratch(const std::string& label, std::size_t bytes,
-                       const std::string& phase);
+                       const std::string& phase,
+                       const std::string& last_phase = std::string());
 
   // Declared scratch for `phase`; with an empty phase, the widest single
   // phase plus anything unphased -- the peak rule weights use.
@@ -416,6 +471,144 @@ public:
   // What it does not cover: activations, the Metal heap, CoreML models
   // and LMDB are outside the manager entirely. It is a cap on the
   // dominant term.
+  // ---- the WIRED POOL --------------------------------------------------
+  //
+  // One pool for everything vpipe plans to hold: streamed blocks, the
+  // trunk, activation scratch, the VAE. Wired (mlock'd) memory cannot be
+  // compressed or swapped, so what is in the pool is what this process
+  // will genuinely keep -- and what is outside it is what the OS may
+  // take back at any moment.
+  //
+  // WHY A POOL AND NOT A BUDGET PER MODEL. A per-model ceiling is a
+  // guess about how the box divides, made by each model separately and
+  // therefore never adding up to the box. MEASURED on the M4 Pro: the
+  // DiT alone wired 32 GB against its own half-of-RAM ceiling while the
+  // scratch, the trunk and the VAE stayed reclaimable beside it, which
+  // is the wrong half to protect -- those are the allocations a forward
+  // cannot proceed without.
+  //
+  // `pct` is an UP-TO, not a reservation. When mlock refuses -- another
+  // process holds wired memory, or the system limit is nearer than the
+  // fraction implies -- the pool collapses to what was actually granted
+  // (note_pool_refused) and callers stop asking for more. So the figure
+  // is a ceiling on ambition, never a promise.
+  //
+  // 0 turns wiring off entirely and is the answer for a box where
+  // nothing should be made unreclaimable.
+  void        set_wired_pool_pct(int pct);
+  int         wired_pool_pct() const;
+
+  // An ABSOLUTE ask, in bytes, instead of a share of the box. 0 -- the
+  // default -- means "use the percentage".
+  //
+  // Both spellings exist because they answer different questions. A
+  // percentage travels: the same session config is sensible on a 16 GB
+  // laptop and a 64 GB desktop, which is what a shipped default needs.
+  // An absolute figure is what an operator reaches for when the box is
+  // shared with something the percentage cannot see -- another vpipe, a
+  // database, a build -- and "leave 20 GB alone" is the only statement
+  // that means the same thing tomorrow.
+  //
+  // Set, it REPLACES the percentage rather than combining with it. A min
+  // of the two would make one of them silently inert and leave no way to
+  // tell which was in force, and this figure is reported and edited at
+  // run time.
+  void        set_wired_pool_bytes(std::size_t bytes);
+  std::size_t wired_pool_bytes() const;
+
+  // What the GPU can keep resident before Metal starts paging --
+  // device()->recommendedMaxWorkingSetSize(). 0 when there is no device
+  // to ask, which is every non-Apple build and every unit test.
+  //
+  // A HARD CAP on the ask above, not advice. Everything the pool holds
+  // is a Metal buffer, so wiring past this point does not buy residency
+  // -- it buys a working set the driver has to page against, which is
+  // the cost the pool exists to avoid, paid twice. On Apple Silicon it
+  // tracks the usable slice of system RAM and follows an
+  // `iogpu.wired_limit_mb` override, so an operator who has raised that
+  // gets the higher ceiling without vpipe having to know.
+  //
+  // Cached after the first successful query: it is a device property,
+  // and wired_pool_limit() is asked once per BUFFER on the wiring path.
+  std::size_t wired_pool_device_max() const;
+
+  // What the pool will actually hold: the ask (absolute, or pct% of
+  // believed physical RAM), capped by the device maximum, and then by
+  // the smaller ceiling the box turned out to grant if mlock ever
+  // refused. 0 when wiring is off.
+  std::size_t wired_pool_limit() const;
+  std::size_t wired_pool_used() const;
+
+  // Would `bytes` more fit? Asked before an allocation the caller could
+  // still decline to make, so it does not have to be undone.
+  bool        wired_pool_can_take(std::size_t bytes) const;
+
+  // Wire `b` and charge it to the pool, returning the bytes actually
+  // wired (0 when wiring is off, the pool is full, or mlock refused).
+  // A refusal COLLAPSES the pool to what is held, because a box that
+  // said no once will say no again and the alternative is a caller
+  // spinning against a ceiling it can never reach.
+  std::size_t wire_into_pool(metal_compute::SharedBuffer& b);
+
+  // Give `b`'s pages back: munlock, and drop the pool's charge for them.
+  //
+  // Safe on a buffer that is still in use. It used to be the opposite --
+  // set_wired(false) also flipped the buffer to purgeable VOLATILE, so
+  // unwiring something a model was still reading let the kernel discard
+  // it underneath its owner, and on a mapped SUBVIEW it discarded pages
+  // belonging to other handles as well. set_wired now restores
+  // NonVolatile; parking is mark_inactive()'s separate, tracked path.
+  //
+  // What is still true is that unwiring is not free to do speculatively:
+  // it gives back protection the next allocation may not get again.
+  void        unwire_from_pool(metal_compute::SharedBuffer& b);
+
+  // TRY THE FULL ASK AGAIN after a refusal.
+  //
+  // wire_into_pool() collapses the ceiling to what was granted when
+  // mlock refuses, because a box that said no once will usually say no
+  // again and the alternative is a caller spinning against a limit it
+  // cannot reach. But "usually" is not "always": the refusal may have
+  // been another process's momentary spike, and without this the pool
+  // stays collapsed for the whole run on the strength of one syscall --
+  // MEASURED, a 9 GB pool that granted 5857 MB held a resident set at 16
+  // of 50 blocks for the rest of the run.
+  //
+  // The caller decides WHEN, because only it knows what a cheap retry
+  // costs: a model calls this at a forward boundary, so a genuinely
+  // full box pays one failed mlock per forward and no more.
+  void        reopen_wired_pool();
+
+  // Whether a graph that does not fit the pool is REFUSED or merely
+  // reported. See parse_wired_pool_enforce_config for why the default is
+  // to report.
+  void        set_wired_pool_enforced(bool on);
+  bool        wired_pool_enforced() const;
+
+  // ---- the REMOVABLE POOL, which outlives a launch ---------------------
+  //
+  // A checkpoint a stage is finished with, kept alive and purgeable
+  // instead of dropped. Two things fall out of that:
+  //
+  //   * A RELAUNCH over the same model pays no reload. This is why the
+  //     pool is on the manager and not on the runtime -- a launch-scoped
+  //     pool could not do the one thing it exists for.
+  //   * Under pressure the pages go, because pooling marks them
+  //     purgeable. Nothing pooled is holding the box hostage; it is
+  //     spare capacity that happens to still be useful.
+  //
+  // Only a RECYCLABLE set is pooled. A set specialised to a run's
+  // parameters would be silently wrong for a launch that does not share
+  // them, so it is dropped instead -- see WeightSet::recyclable().
+  void        pool_weights(const std::string& dir,
+                           const std::string& variant = std::string());
+  // Bytes the pool is holding. Reclaimable in full, so this is capacity
+  // rather than occupancy -- report it as such.
+  std::size_t pooled_bytes() const;
+  // Drop pooled sets until `want` bytes have been given back. Returns
+  // what was actually freed.
+  std::size_t pool_evict(std::size_t want);
+
   void        set_memory_cap(std::size_t bytes);
   std::size_t memory_cap() const;
 
@@ -508,14 +701,33 @@ private:
   // both resident_weight_bytes() and phase_footprint(), so the two can
   // never disagree about what a checkpoint costs, only about which ones
   // to add together.
-  std::unordered_map<std::string, std::size_t> per_dir_bytes_() const;
+  // `use_floor` counts a checkpoint that declared one at its floor.
+  std::unordered_map<std::string, std::size_t>
+  per_dir_bytes_(bool use_floor = false) const;
+  std::size_t phase_footprint_(const std::string& phase,
+                               bool use_floor) const;
 
   mutable std::mutex                                          _shared_mu;
   std::unordered_map<std::string, std::weak_ptr<void>>        _shared;
   mutable std::mutex                                          _ws_mu;
   std::unordered_map<std::string, std::weak_ptr<WeightSet>>   _weight_sets;
+  // The removable pool: a STRONG reference, which is the whole
+  // difference -- it is what keeps a set alive once its last model has
+  // gone, and what lets the next launch find it.
+  std::unordered_map<std::string, std::shared_ptr<WeightSet>>  _pool;
   // canonical dir -> estimated bytes; see declare_weights().
   std::unordered_map<std::string, std::size_t>                _declared;
+  // canonical dir -> the floor it can be reduced to, when it has one.
+  std::unordered_map<std::string, std::size_t>                _declared_floor;
+  // canonical dir -> the LAST phase it is alive in; see
+  // ResourceClaim::last_phase. Absent means it ends where it began.
+  std::unordered_map<std::string, std::string>                _phase_last;
+  // Phase name -> position in the running order, from set_phase_order.
+  std::vector<std::string>                                    _phase_order;
+  // -1 when `p` is empty or not in the order: an unphased claim is alive
+  // throughout, and an unrecognised one is treated the same way, which
+  // is the direction that over-counts rather than under-counts.
+  int phase_index_(const std::string& p) const;
   // canonical dirs a model decided to stream; see note_streaming().
   std::unordered_set<std::string>                             _streaming;
   // canonical dir -> phase it was declared for ("" = whole run).
@@ -523,10 +735,27 @@ private:
   // canonical dirs whose owner reported the release its phase promised.
   std::unordered_set<std::string>                             _released;
   // label -> {bytes, phase}, for declared activation scratch.
-  struct ScratchClaim { std::size_t bytes = 0; std::string phase; };
+  struct ScratchClaim {
+    std::size_t bytes = 0;
+    std::string phase;
+    std::string last_phase;
+  };
   std::unordered_map<std::string, ScratchClaim>               _scratch;
   WeightRegistry                                              _weights;
   std::atomic<std::size_t>                                    _memory_cap{0};
+  // The wired pool. `_pool_pct` is what was asked for; `_pool_granted`
+  // is the ceiling after the box refused, 0 meaning "not refused yet".
+  std::atomic<int>                                            _pool_pct{0};
+  // The absolute ask, 0 when the percentage is in force.
+  std::atomic<std::size_t>                                    _pool_bytes{0};
+  // recommendedMaxWorkingSetSize, cached on first successful query.
+  mutable std::atomic<std::size_t>                            _pool_devmax{0};
+  std::atomic<std::size_t>                                    _pool_used{0};
+  std::atomic<std::size_t>                                    _pool_granted{0};
+  std::atomic<bool>                                           _pool_enforce{false};
+  // Said-once guards for the two ways wiring stops (see wire_into_pool).
+  mutable std::atomic<bool>                                   _pool_full_said{false};
+  mutable std::atomic<bool>                                   _pool_refused_said{false};
   mutable std::mutex                                          _mu;
   std::unordered_map<Key,
                      std::weak_ptr<LoadedLanguageModel>,

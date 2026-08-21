@@ -76,6 +76,18 @@ public:
   std::uint64_t      clips_emitted() const noexcept { return _clips; }
 
 private:
+  // See VaeDecodeStage::vae_dir_for_release_.
+  std::string vae_dir_for_release_() const;
+
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
+
+  // Pass TWO. The phase belongs HERE, not in declare_resources: a
+  // phased claim in pass one is ignored (and warned about), because a
+  // stage deciding a phase must be able to see every peer's
+  // declaration, and in pass one only some have arrived.
+  std::vector<ResourceClaim> decide_resources() const override;
+
   std::string _hf_dir;
   std::string _family;              // "minimax-h3"
   std::uint64_t _clips = 0;

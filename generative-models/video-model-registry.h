@@ -2,8 +2,10 @@
 #define VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 
 #include "common/flex-data.h"
+#include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -290,6 +292,66 @@ public:
   // themselves -- see docs/MODEL-MEMORY.md.
   virtual std::vector<ResourceClaim>
   declare_resources(const std::string& /*root*/) const { return {}; }
+
+  // The same checkpoints again, in the TOPOLOGICAL plan's terms rather
+  // than the phase vocabulary's.
+  //
+  // Two ledgers, and a family has to answer both -- see
+  // docs/MODEL-MEMORY.md, "Which ledger do I use?". This one is derived
+  // from the graph's edges instead of from a phase name a stage
+  // asserts, so it is the one that stays right in a graph nobody
+  // anticipated.
+  //
+  // Answer with `source` naming the checkpoint (the directory or file
+  // that will be opened -- the plan merges two stages holding one
+  // checkpoint by that name), `preload` what it costs resident, and
+  // `floor` the least it can be held at while still being held. Leave
+  // `releases` and `reclaimable` alone: whether idle weights are
+  // dropped is the STAGE's `unload_when_idle` policy, and the stage
+  // stamps it onto whatever comes back from here.
+  //
+  // Empty -- the default -- means the family declines, and the stage
+  // then has nothing to put in the plan for it. That is not the same as
+  // costing nothing; it is a hole, and it reads as room that is not
+  // there.
+  virtual std::vector<StageHolding>
+  declare_holdings(const std::string& /*root*/) const { return {}; }
+
+  // Bytes of the LATENT this family emits for a clip of this geometry,
+  // which the stage declares as a payload alive from the denoise that
+  // writes it to the last decode that reads it.
+  //
+  // Asked of the family because the shape is the family's: channel
+  // count, spatial compression and temporal compression all differ, and
+  // a host that substituted a built-in's formula would report a
+  // confident number for the wrong model. 0 -- the default -- means
+  // "cannot say", and the stage then declares nothing rather than
+  // something plausible.
+  //
+  // `frames` is the PIXEL frame count after align_frames, not the
+  // latent count.
+  virtual std::size_t latent_bytes(const std::string& /*root*/, int /*width*/,
+                                   int /*height*/, int /*frames*/) const
+  {
+    return 0;
+  }
+
+  // The soundtrack terms, for a family that generates one alongside the
+  // video. False -- the default -- means this family emits no audio, and
+  // the stage declares none.
+  //
+  // `latent` is what leaves the stage on its audio oport, `pcm` what the
+  // audio decode produces from it, and `arena` what that decode
+  // allocates while running. They have three different lifetimes, which
+  // is why they are three numbers: the latent spans denoise to
+  // decode-audio, the PCM spans decode-audio to decode (the mux reads it
+  // after the frames exist), and the arena is gone when the decode ends.
+  virtual bool audio_cost(const std::string& /*root*/, int /*frames*/,
+                          double /*fps*/, std::size_t* /*latent*/,
+                          std::size_t* /*pcm*/, std::size_t* /*arena*/) const
+  {
+    return false;
+  }
 
   // Build the generator. Null (after warning through `args.session`)
   // leaves the stage inert rather than taking the pipeline down.

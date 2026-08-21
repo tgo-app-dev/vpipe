@@ -187,6 +187,22 @@ class MetalMiniMaxH3VideoVae {
   // plain division: 17 frames become 9, then 5.
   int encoded_frames(int T) const;
 
+  // The same two answers over an EXPLICIT config, so the planning phase
+  // can have them before any checkpoint is opened. The instance methods
+  // are these with `_cfg`, so the two cannot drift.
+  static int encoded_frames_for(const Config& c, int T);
+  static int video_latent_frames_for(const Config& c, int T);
+
+  // Bytes of the LATENT this VAE's geometry implies for a clip.
+  //
+  // From the DEFAULT config, which is what a plan can know: the ratios
+  // are the model's, not the checkpoint's, and a repack ships no
+  // config.json to read them from. Replacing a hand-written bound --
+  // 8x spatial and 4x temporal with 32 channels was wrong in every term
+  // for this family (16x, a chunked temporal rule, and 24 channels) and
+  // over-stated the latent ~4x.
+  static std::size_t latent_bytes(int width, int height, int frames);
+
   // Encode a WHOLE video: `clip_length`-frame chunks, each spatially
   // tiled and stitched, with the trailing `token_drop` latent frames
   // dropped from the result. `x` is channel-first

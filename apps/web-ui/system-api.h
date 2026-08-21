@@ -55,6 +55,23 @@ private:
   HttpResponse h_i18n_get_(const HttpRequest&);
   HttpResponse h_i18n_set_(const HttpRequest&);
 
+  // The WIRED POOL ceiling -- how much memory this process is allowed to
+  // make unswappable. GET returns {mb, used_mb, device_max_mb, pct,
+  // running}; PUT {mb} sets it and returns the same document, so the
+  // browser always renders what was actually taken rather than what it
+  // asked for (an absolute figure is clamped to what the GPU can keep
+  // resident).
+  //
+  // A SHRINK IS REFUSED (409) while any pipeline is running: making a
+  // lower limit true means unwiring buffers a model is still reading,
+  // and unwiring also marks them purgeable volatile. Raising is accepted
+  // at any time -- nothing has to be given back. See
+  // SessionIntf::set_wired_pool_mb.
+  HttpResponse h_wired_pool_get_(const HttpRequest&);
+  HttpResponse h_wired_pool_set_(const HttpRequest&);
+  // True while any pipeline is not "stopped".
+  bool any_running_() const;
+
   // Active HLS streams across every launched pipeline. Enumerates the
   // live "hls-broadcast" stages and reports each one's serving
   // coordinates so the User I/O workspace can embed a player.

@@ -1,4 +1,5 @@
 #include "stages/save-image-stage.h"
+#include "stages/model-provenance.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -535,18 +536,11 @@ SaveImageStage::process(RuntimeContext& ctx)
   // tag (if any) is left exactly as it was.
   {
     const auto* itb = dynamic_cast<const TensorBeatPayload*>(in.get());
-    std::string model;
-    if (itb != nullptr && itb->sideband.is_object()) {
-      FlexData sb = itb->sideband;          // as_object() is a view
-      auto o = sb.as_object();
-      if (o.contains("model_name")) {
-        model = std::string(o.at("model_name").as_string(""));
-      }
-    }
+    const std::string model = itb != nullptr
+        ? provenance::model_name(itb->sideband) : std::string();
     if (!model.empty()) {
-      const std::string sw = std::string("Vpipe ") + vpipe_version_number()
-          + " " + vpipe_build_hash() + " with " + model;
-      exif_tiff = imgmeta::exif_set_software(exif_tiff, sw);
+      exif_tiff = imgmeta::exif_set_software(
+          exif_tiff, provenance::software_string(model));
     }
   }
 

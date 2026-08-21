@@ -326,6 +326,14 @@ export const api = {
   // System status (GPU util / memory) for the bottom status bar.
   systemStatus:  ()        => req('GET',  '/api/system/status'),
 
+  // The wired-pool ceiling: how much memory this process may make
+  // unswappable. {mb, used_mb, device_max_mb, pct, running}. A PUT that
+  // would LOWER it while a pipeline runs comes back 409 -- see
+  // SessionIntf::set_wired_pool_mb for why that is a refusal and not a
+  // failure.
+  wiredPoolGet:  ()        => req('GET',  '/api/system/wired-pool'),
+  wiredPoolSet:  (mb)      => req('PUT',  '/api/system/wired-pool', { mb }),
+
   // Startup permission self-test report, shown in a dialog on connect.
   // {ready, has_warnings, checks:[{name,status,detail,hints:[...]}]}.
   startupChecks: ()        => req('GET',  '/api/startup-checks'),

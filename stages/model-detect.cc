@@ -804,8 +804,19 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   // Derived from the runtime tag (the same table the catalogue uses, so a
   // registered model reads identically to a fetched one), then trimmed to
   // what this particular checkpoint actually carries.
+  //
+  // ONLY WHEN STILL EMPTY, exactly as the variant and category above.
+  // catalog_default_io APPENDS, and the detection steps that already know
+  // their tag -- the Comfy repack and the QUANTIZED repack -- call it
+  // themselves, so running it again here appended the same list twice:
+  // a quantized MiniMax-H3 registered as
+  // inputs ["text","image","text","image"]. The compatibility filter uses
+  // includes() and survived that, which is why it went unnoticed; the
+  // badges in the model picker did not.
   if (!d.model_type.empty()) {
-    catalog_default_io(d.model_type, d.inputs, d.outputs);
+    if (d.inputs.empty() && d.outputs.empty()) {
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
     if (io_trim_is_meaningful_(d.model_type)) {
       trim_io_to_config_(cfg, d.inputs);
     }

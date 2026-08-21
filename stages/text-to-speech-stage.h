@@ -164,6 +164,8 @@ public:
   // The TTS LM and its audio codec -- two checkpoints, both large.
   // See Stage::declare_resources.
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;

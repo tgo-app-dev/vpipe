@@ -252,6 +252,57 @@ TEST(session, log_overrides_blocked_while_launched) {
   filesystem::current_path(saved_cwd, ec);
 }
 
+// The wired pool is RAISABLE while a pipeline runs and not lowerable.
+//
+// The asymmetry is the whole point and it is not a policy preference:
+// making a lower limit true means unwiring buffers a model is still
+// reading, and a raise costs nothing because nothing has to be given
+// back. So a shrink is Status{3} -- the same "busy" code the log
+// mutators use -- and the limit is left exactly as it was.
+TEST(session, wired_pool_shrinks_only_while_idle) {
+  SessionTempDir dir;
+  error_code ec;
+  filesystem::path saved_cwd = filesystem::current_path(ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  filesystem::current_path(dir.path, ec);
+
+  vpipe::Session sess;
+  if (sess.generative_model_manager() == nullptr) {
+    filesystem::current_path(saved_cwd, ec);
+    return;                       // no manager in this build
+  }
+  // A middling absolute figure, so there is room to move both ways.
+  ASSERT_TRUE(sess.set_wired_pool_mb(4096).code == 0u);
+  const size_t base = sess.wired_pool_mb();
+  EXPECT_TRUE(base == 4096u);
+
+  auto handle = sess.create_pipeline("wp");
+  auto* pl    = vpipe::HandleAccess::impl(handle)->pipeline();
+  pl->insert_stage(std::make_unique<NoopSourceStage>(
+      &sess, "src", std::vector<vpipe::InEdge>{}));
+  EXPECT_TRUE(sess.launch_pipeline(handle).code == 0u);
+
+  {
+    CerrCapture cap;              // the refusal warns to stderr
+    EXPECT_TRUE(sess.set_wired_pool_mb(512).code == 3u);
+  }
+  // UNCHANGED, not partially applied: a rejected request must leave the
+  // limit where it was, or a front end that retries compounds it.
+  EXPECT_TRUE(sess.wired_pool_mb() == base);
+
+  // Raising is accepted mid-run.
+  EXPECT_TRUE(sess.set_wired_pool_mb(6144).code == 0u);
+  EXPECT_TRUE(sess.wired_pool_mb() == 6144u);
+
+  // ...and once stopped, lowering works again.
+  EXPECT_TRUE(sess.stop_pipeline(handle).code == 0u);
+  EXPECT_TRUE(sess.set_wired_pool_mb(512).code == 0u);
+  EXPECT_TRUE(sess.wired_pool_mb() == 512u);
+  EXPECT_TRUE(sess.unload_pipeline(handle).code == 0u);
+
+  filesystem::current_path(saved_cwd, ec);
+}
+
 TEST(session, lmdb_env_defaults_to_cwd_without_db_path) {
   // No db.path in config => lmdb_env() opens "." (the process
   // CWD). To avoid sprinkling data.mdb / lock.mdb files into the

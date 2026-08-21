@@ -245,6 +245,8 @@ public:
   // size the box against it. See Stage::declare_resources.
   std::vector<ServiceReq> declare_services() const override;
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
   Job process   (RuntimeContext& ctx) override;
   Job drain     (RuntimeContext& ctx) override;
 

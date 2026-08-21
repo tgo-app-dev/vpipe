@@ -282,21 +282,15 @@ collect_flux2_calibration(MetalCompute* mc, const std::string& model_root,
   // Pinned-prefix: in streaming mode, pin as many leading blocks (double first,
   // then single) as fit in 60% of physical RAM (pinned + running), read once +
   // reused; only the tail streams. VPIPE_FLUX2_CALIB_PIN_FRAC overrides.
-  double pin_frac = stream_blocks ? 0.60 : 0.0;
-  if (const char* e = std::getenv("VPIPE_FLUX2_CALIB_PIN_FRAC")) {
-    pin_frac = std::atof(e);
-  }
   MetalFlux2Transformer::Config dcfg;
   dcfg.klein_kv = klein_kv;
-  auto dit = MetalFlux2Transformer::load(dit_dir, mc, dcfg, stream_blocks,
-                                         pin_frac);
+  auto dit = MetalFlux2Transformer::load(dit_dir, mc, dcfg, stream_blocks);
   if (!dit) { return fail("flux2 calib: DiT load failed: " + dit_dir); }
   dit->set_stream_stop(stop);
   if (sess && stream_blocks) {
     sess->log_debug(fmt(
-        "flux2 calib: pinned {} of {} DiT blocks resident ({}% RAM budget), "
-        "streaming the rest", dit->pinned_blocks(),
-        dit->config().n_double + dit->config().n_single, (int)(pin_frac * 100)));
+        "flux2 calib: streaming the block stack; the resident "
+        "set grows into free RAM as the calibration runs"));
   }
 
   const int gh = height / 16, gw = width / 16;

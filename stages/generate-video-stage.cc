@@ -10,11 +10,13 @@
 #include "stages/model-config-source.h"
 #include "stages/model-registry.h"
 #include "stages/denoise-progress.h"
+#include "stages/model-provenance.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #endif
@@ -490,11 +492,76 @@ GenerateVideoStage::declare_resources() const
   if (arena_bytes == 0) { arena_bytes = model_memory::kUnknownArena; }
   std::vector<ResourceClaim> arena = model_memory::scratch_claims(
       "vae-decode", arena_bytes, model_memory::kPhaseDecode);
+  // The LATENT this stage emits, alive from the denoise that writes it
+  // through the last decode that reads it.
+  //
+  // It is the clearest case of a term no weights-and-scratch accounting
+  // can see: nothing HOLDS it -- it is a payload in flight between
+  // stages -- and yet on a constrained box it is resident across three
+  // phases and is frequently larger than the VAE decoding it. Sized from
+  // the same rounded geometry the arena uses, so the two cannot describe
+  // different clips.
+  // Whose formulas size the beat-shaped terms. A registered family's
+  // latent and soundtrack are ITS shape -- channel count, spatial and
+  // temporal compression all differ -- so a built-in's formula over a
+  // plugin's geometry is a confident number for the wrong model. Asked
+  // once, here, and used for both the payload sizes below and the
+  // holdings in declare_memory().
+  genai::VideoModelFamily* fam = genai::VideoModelRegistry::get().claim_for(
+      session(), root, resolve_model(session(), _hf_dir).model_type);
 
-  if (genai::VideoModelFamily* f =
-          genai::VideoModelRegistry::get().claim_for(
-              session(), root, resolve_model(session(), _hf_dir).model_type)) {
-    std::vector<ResourceClaim> out = f->declare_resources(root);
+  if (arena_bytes != model_memory::kUnknownArena && aw > 0 && ah > 0 &&
+      af > 0) {
+    // 0 from a family that declines to size its own latent, and the
+    // claim is then skipped rather than filled in from a built-in.
+    const std::size_t latent =
+        fam != nullptr
+            ? fam->latent_bytes(root, aw, ah, af)
+            : genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
+    if (latent > 0) {
+      for (auto& c : model_memory::payload_claims(
+               fmt("{}-latent", this->id())(), latent,
+               model_memory::kPhaseDenoise, model_memory::kPhaseDecode)) {
+        arena.push_back(std::move(c));
+      }
+    }
+    // The SOUNDTRACK, on the same principle: its length comes from this
+    // stage's frames/fps, so the audio decode downstream cannot size
+    // itself and this is the only place that can. Plan-time seconds are
+    // the clip's own length -- what `audio_seconds: 0` means -- and the
+    // model-config beat that could shorten it does not arrive until
+    // after the barrier, so the runtime revises rather than the plan
+    // guessing.
+    std::size_t alat = 0, pcm = 0, aarena = 0;
+    bool has_audio = false;
+    if (_fps > 0.0) {
+      if (fam != nullptr) {
+        has_audio = fam->audio_cost(root, af, _fps, &alat, &pcm, &aarena);
+      } else {
+        const int alf =
+            genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
+                (double)af / _fps);
+        genai::MetalMiniMaxH3AudioVae::decode_cost(alf, &pcm, &aarena);
+        has_audio = true;
+      }
+    }
+    if (has_audio) {
+      for (auto& c : model_memory::scratch_claims(
+               fmt("{}-audio-decode", this->id())(), aarena,
+               model_memory::kPhaseDecodeAudio)) {
+        arena.push_back(std::move(c));
+      }
+      // Alive until the mux reads it, which is after the video decode.
+      for (auto& c : model_memory::payload_claims(
+               fmt("{}-pcm", this->id())(), pcm,
+               model_memory::kPhaseDecodeAudio, model_memory::kPhaseDecode)) {
+        arena.push_back(std::move(c));
+      }
+    }
+  }
+
+  if (fam != nullptr) {
+    std::vector<ResourceClaim> out = fam->declare_resources(root);
     for (auto& c : arena) { out.push_back(std::move(c)); }
     return out;
   }
@@ -518,9 +585,133 @@ GenerateVideoStage::declare_resources() const
   std::string dit =
       genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
   if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
-  std::vector<ResourceClaim> out = model_memory::weight_claims({dit});
+  // BOTH numbers: what this DiT weighs, and the floor it can be reduced
+  // to by streaming its blocks. A graph that does not fit the first and
+  // does fit the second is not one to refuse -- it is one to stream.
+  std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
+      dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit))};
   for (auto& c : arena) { out.push_back(std::move(c)); }
   return out;
+#else
+  return {};
+#endif
+}
+
+StageMemory
+GenerateVideoStage::declare_memory() const
+{
+  StageMemory m;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_hf_dir.empty()) { return m; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+
+  // A registered family answers for itself, in both ledgers. Without
+  // this arm the built-in resolvers below run over a plugin's root and
+  // produce not a gap but a WRONG holding -- an H3-shaped directory
+  // guess, sized by H3's formulas, named as the source the pooling path
+  // will later look for. A hole is recoverable; a confident wrong number
+  // is what a peer sizes an irreversible decision against.
+  genai::VideoModelFamily* fam = genai::VideoModelRegistry::get().claim_for(
+      session(), root, resolve_model(session(), _hf_dir).model_type);
+
+  if (fam != nullptr) {
+    m.holdings = fam->declare_holdings(root);
+    // The POLICY is the stage's, not the family's: `unload_when_idle` is
+    // this stage's config key, and a family cannot see it. The family
+    // said what it holds and how small it can get; this says what
+    // happens to it when idle.
+    for (StageHolding& h : m.holdings) {
+      h.releases    = _unload_cfg == model_memory::UnloadPolicy::kDestroy;
+      h.reclaimable = _unload_cfg == model_memory::UnloadPolicy::kAuto;
+    }
+    // The first holding names the checkpoint the pooling path releases.
+    // Same reason as the built-in below: this method runs for every
+    // policy where decide_resources() returns early unless it is
+    // `destroy`.
+    if (!m.holdings.empty()) { _dit_dir_declared_ = m.holdings.front().source; }
+    int fw = _width, fh = _height, ff = _frames;
+    if (!planned_geometry_(root, &fw, &fh, &ff)) { return m; }
+    m.outputs.resize(2, 0);
+    m.outputs[0] = fam->latent_bytes(root, fw, fh, ff);
+    std::size_t alat = 0, apcm = 0, aarena = 0;
+    if (_fps > 0.0 &&
+        fam->audio_cost(root, ff, _fps, &alat, &apcm, &aarena)) {
+      m.outputs[1] = alat;
+    }
+    return m;
+  }
+
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
+  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  // NAMED by its directory, so two stages over one checkpoint are one
+  // set of weights in the plan rather than two.
+  // Remembered HERE as well as in decide_resources, because this method
+  // runs for every policy and that one returns early unless the policy
+  // is `destroy` -- so under `auto` the pooling below had an empty
+  // string and did nothing, silently.
+  _dit_dir_declared_ = dit;
+  m.hold(dit, model_memory::dir_weights_bytes(dit),
+         genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit),
+         // `destroy` only, the same condition the phase claim carries:
+         // `auto` resolves against a figure this would itself change.
+         _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+         // ...and `auto` is the RECLAIMABLE case -- held while there is
+         // room, given back under pressure, found still there or
+         // reloaded when next used.
+         _unload_cfg == model_memory::UnloadPolicy::kAuto);
+
+  int aw = _width, ah = _height, af = _frames;
+  if (!planned_geometry_(root, &aw, &ah, &af)) { return m; }
+  // oport 0 is the video latent, oport 1 the audio latent. Sized from
+  // the same rounded geometry the arena uses, so the two cannot
+  // describe different clips.
+  m.outputs.resize(2, 0);
+  m.outputs[0] = genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
+  if (_fps > 0.0) {
+    const int alf = genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
+        (double)af / _fps);
+    std::size_t pcm = 0, aarena = 0;
+    genai::MetalMiniMaxH3AudioVae::decode_cost(alf, &pcm, &aarena);
+    (void)aarena;
+    // The audio LATENT, not the PCM: what leaves this stage is what the
+    // audio VAE will decode, and it is the decode that produces samples.
+    m.outputs[1] = (std::size_t)alf * 2 * 32 * 2;    // [stereo, 32, frames]
+  }
+#endif
+  return m;
+}
+
+std::vector<ResourceClaim>
+GenerateVideoStage::decide_resources() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // ONLY when the release is certain from config. `destroy` qualifies;
+  // `auto` does not, because it resolves against a figure this claim
+  // would itself change -- the stage would see the room its own phase
+  // invented and conclude it need not drop the DiT after all.
+  if (_hf_dir.empty() ||
+      _unload_cfg != model_memory::UnloadPolicy::kDestroy) {
+    return {};
+  }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
+  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  // Remembered, so the release below names exactly what was claimed --
+  // the resolver can answer differently once the model has loaded, and
+  // a release under a different name reads as a promise never kept.
+  _dit_dir_declared_ = dit;
+  return model_memory::weight_claims_in_phase({dit},
+                                              model_memory::kPhaseDenoise);
 #else
   return {};
 #endif
@@ -970,6 +1161,38 @@ GenerateVideoStage::ensure_expert_(int which)
         "spatial{}", this->id(), _family, _plugin_gen->latent_channels(),
         _plugin_gen->spatial_compression(),
         args.prefer_streaming ? ", box is tight (streaming advised)" : ""));
+    // CORRECT THE PLAN, now that the family has decided what it keeps.
+    //
+    // The plan-time holding was the checkpoint's size on disk, which is
+    // what a stage can know from configuration; a family that streamed
+    // its blocks now holds a small fraction of it. The family cannot
+    // revise this itself -- revise_memory is a Stage method and a family
+    // is not a stage -- so the correction goes through the number it
+    // already owes the host: resident_bytes(), which docs/MODEL-MEMORY.md
+    // requires of any family whose weights a WeightSet cannot see.
+    //
+    // Both columns, because a streaming family has no larger form left
+    // to grow back into within this launch. Skipped at 0, which is the
+    // documented "cannot answer cheaply" -- overwriting a real plan-time
+    // figure with a decline would report the checkpoint as free.
+    // ONE holding only. resident_bytes() is the generator's TOTAL, so a
+    // family that declared several cannot have it apportioned between
+    // them -- and splitting it by a guess would replace figures that
+    // were at least individually honest. Left alone in that case, which
+    // means the correction is available to any family that wants it by
+    // declaring the checkpoint it streams as one entry.
+    const std::uint64_t held = _plugin_gen->resident_bytes();
+    StageMemory m = declare_memory();
+    if (held > 0 && m.holdings.size() == 1 &&
+        m.holdings[0].preload != (std::size_t)held) {
+      m.holdings[0].preload = (std::size_t)held;
+      m.holdings[0].floor   = (std::size_t)held;
+      revise_memory(m);
+      session()->log_debug(fmt(
+          "GenerateVideoStage('{}'): '{}' holds {} MB after loading; the "
+          "plan is corrected from what the checkpoint weighs",
+          this->id(), _family, (std::size_t)held >> 20));
+    }
     return true;
   }
   if (_family == "minimax-h3") {
@@ -1023,15 +1246,14 @@ GenerateVideoStage::ensure_expert_(int which)
     const auto plan = model_memory::plan_streaming(
         session(), dit_dir, enc_dir, model_memory::kStreamHeadroom,
         dit_retires);
-    bool   stream_blocks = plan.stream;
-    double pin_frac      = plan.pin_frac;
+    bool stream_blocks = plan.stream;
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
-      if (!stream_blocks) { pin_frac = 0.0; }
     }
-    if (const char* e = std::getenv("VPIPE_H3_PIN_FRAC")) {
-      pin_frac = std::atof(e);
-    }
+    // The pinned prefix is retired -- see
+    // MetalMiniMaxH3Transformer::load. BlockResidency supersedes it:
+    // admission against the live budget instead of a fraction of total
+    // RAM computed before the run.
     // At info, not debug: this is the irreversible decision, and when a
     // run turns out slow it is the first number anyone needs.
     session()->info(fmt(
@@ -1076,7 +1298,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // beat and parks, or refuses, if the prefix turned out too generous.
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
-        stream_blocks, pin_frac, lora.path.empty() ? nullptr : &lora);
+        stream_blocks, lora.path.empty() ? nullptr : &lora);
     resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
@@ -1089,6 +1311,21 @@ GenerateVideoStage::ensure_expert_(int which)
       if (ws) {
         const std::size_t held = ws->stats().bytes;
         mgr->revise_declaration(dit_dir, held);
+        // The same correction on the topological plan. What the plan
+        // could only bound -- the checkpoint's size on disk -- the model
+        // now knows exactly, because it has finished deciding what to
+        // keep. Both floors are set to what is actually held: a
+        // streaming DiT has no larger form left to grow back into
+        // within this launch.
+        {
+          StageMemory m = declare_memory();
+          for (StageHolding& h : m.holdings) {
+            if (h.source != dit_dir) { continue; }
+            h.preload = held;
+            h.floor = held;
+          }
+          revise_memory(m);
+        }
         session()->log_debug(fmt(
             "GenerateVideoStage('{}'): streaming DiT keeps {} MB resident, "
             "revised down from {} MB on disk", this->id(), held >> 20,
@@ -1096,19 +1333,25 @@ GenerateVideoStage::ensure_expert_(int which)
       }
     }
     // Say how many blocks are PINNED, the way the conditioner says it for
-    // its layers. Worth stating even when it is zero, which is the common
-    // case here and is not obvious: plan_streaming only pins when
-    // RAM > others + 5 GB, and with the text encoder counted in `others`
-    // at ~15 GB on a 16 GB box that test fails outright. Zero pinned is
-    // why the resident set below has to earn its room at runtime.
+    // WHICH OF THE TWO IT ACTUALLY DID.
+    //
+    // This said "streams its N blocks" unconditionally, including on a
+    // preload run that had just been told PRELOAD three lines earlier --
+    // and the residency probe printed by the AdaLN bake reads as a
+    // streaming figure whatever the model does, so a preloaded run
+    // looked like a streaming one that had pinned a fraction of its
+    // stack. Two lines that contradict the verdict above them are worse
+    // than no line at all.
     if (_h3_dit) {
-      session()->info(fmt(
-          "GenerateVideoStage('{}'): MiniMax-H3 DiT {} of {} blocks pinned "
-          "at load{}", this->id(), _h3_dit->pinned_blocks(), _h3_cfg.n_layers,
-          _h3_dit->pinned_blocks() == 0
-              ? " (none fit beside the other models; the resident set grows "
-                "into free RAM as the denoise runs)"
-              : ""));
+      session()->info(stream_blocks
+          ? fmt("GenerateVideoStage('{}'): MiniMax-H3 DiT streams its {} "
+                "blocks; the resident set grows into free RAM as the "
+                "denoise runs and is given back when the box needs it",
+                this->id(), _h3_cfg.n_layers)
+          : fmt("GenerateVideoStage('{}'): MiniMax-H3 DiT is PRELOADED -- "
+                "all {} blocks resident, no per-step reads and nothing "
+                "for block residency to grow", this->id(),
+                _h3_cfg.n_layers));
     }
     if (!_h3_dit) {
       session()->error(fmt(
@@ -1249,14 +1492,19 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
 // one ~3.9 GB, none of which the weight accounting can see (it is
 // allocated per forward, not per checkpoint).
 //
-// Getting this wrong on a 16 GB box is not a failed allocation. Metal
-// SharedBuffers are mlock-WIRED, so they cannot be paged out or
-// compressed: the VM drains the file cache, fills the compressor, stops
-// making progress, userspace stops being scheduled, and the kernel
-// watchdog panics the machine. Two panic logs on this box say exactly
-// that ("no checkins from watchdogd in 94 seconds", free 14 MB, file
-// cache ~0, 4-5 GB wired). So refusing loudly is the SAFE outcome here,
-// and proceeding hopefully is the dangerous one.
+// Getting this wrong on a 16 GB box is not a failed allocation. Two
+// panic logs on this box record the end state -- "no checkins from
+// watchdogd in 94 seconds", free 14 MB, file cache ~0, 4-5 GB wired --
+// where the VM has nothing left to reclaim, userspace stops being
+// scheduled and the kernel watchdog fires. So refusing loudly is the
+// SAFE outcome here, and proceeding hopefully is the dangerous one.
+//
+// The scratch is what makes that reachable, and NOT because a Metal
+// SharedBuffer is unpageable. It is not: MEASURED on the M4 Pro, a 5.9
+// GB resident set of them read 100% in-core when written and 0% one
+// forward later, every sampled page carrying MINCORE_PAGED_OUT, with
+// 9.9 GB of this process compressed. SharedBuffer::set_wired() is what
+// would pin them, and the block-residency path is its only caller.
 bool
 GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
 {
@@ -1746,6 +1994,15 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   return true;
 }
 
+void
+GenerateVideoStage::tag_model_(TensorBeat& tb) const
+{
+  // `_hf_dir` is the reference the USER named (a registry key like
+  // "local/MiniMax-H3-FL2VA-8bit", or a path), which is the meaningful
+  // identity of the generator -- not the directory it resolved to.
+  provenance::set_model_name(tb.sideband, _hf_dir);
+}
+
 Job
 GenerateVideoStage::process(RuntimeContext& ctx)
 {
@@ -1912,6 +2169,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         res.video_shape[0], res.video_shape[1], res.video_shape[2],
         res.video_shape[3],
         res.audio.empty() ? std::string() : std::string(" + audio")));
+    tag_model_(*vout);
     co_await ctx.write(0, std::move(vout));
 
     // As for the built-in audio family: only when the port is wired. A
@@ -1933,6 +2191,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
             FlexData::make_real(res.latents_per_second));
         aout->sideband = std::move(sb);
       }
+      tag_model_(*aout);
       co_await ctx.write(1, std::move(aout));
     }
     co_return;
@@ -2076,7 +2335,35 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
       co_return;
     }
-    if (_unload_idle) { _h3_dit.reset(); }
+    if (_unload_idle) {
+      // POOLED BEFORE THE RESET, and the order is the whole thing:
+      // pool_weights() finds the set through a WEAK reference, so once
+      // this model has dropped its last strong one there is nothing left
+      // to pool and the call is a silent no-op.
+      //
+      // `auto` means REMOVABLE, not gone: the checkpoint stays alive and
+      // purgeable so a relaunch pays no reload, and the kernel may take
+      // the pages meanwhile. `destroy` is the caller asking for the bytes
+      // back now, so it keeps dropping them.
+      //
+      // The pool refuses a set the AdaLN bake specialised, which is this
+      // model on every schedule -- so today this reports the refusal
+      // rather than pooling. That is the correct outcome and not a
+      // wasted call: it is what makes the reload visible.
+      if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
+        if (auto* mgr = session()->services()->generative_model_manager()) {
+          mgr->pool_weights(_dit_dir_declared_);
+        }
+      }
+      _h3_dit.reset();
+      // The other half of the denoise-phase claim. Peers sized against
+      // the promise that these bytes are gone by the time the decodes
+      // run; this is where it is kept, and saying so is what stops the
+      // manager reporting it broken at the end of the launch.
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->note_phase_released(_dit_dir_declared_);
+      }
+    }
 
     auto vout = std::make_unique<TensorBeatPayload>();
     vout->dtype = TensorBeat::DType::F32;
@@ -2096,6 +2383,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         "[{}, {}, {}, {}] + audio [{}, {}, {}]", this->id(), _emitted,
         vshape[0], vshape[1], vshape[2], vshape[3], ashape[0], ashape[1],
         ashape[2]));
+    tag_model_(*vout);
     co_await ctx.write(0, std::move(vout));
 
     // The audio half. Written only when the port is connected: the audio
@@ -2113,6 +2401,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           "latents_per_second",
           FlexData::make_int((std::int64_t)h3::kAudioLatentsPerSecond));
       aout->sideband = std::move(sb);
+      tag_model_(*aout);
       co_await ctx.write(1, std::move(aout));
     }
     co_return;
@@ -2329,6 +2618,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       "GenerateVideoStage('{}'): emitted latent video #{} [{}, {}, {}, {}] "
       "({} frames at {}x{}, {:.3f} fps)", this->id(), _emitted, ZC, T, h8, w8,
       _frames, _width, _height, _fps));
+  tag_model_(*out);
   co_await ctx.write(0, std::move(out));
 }
 

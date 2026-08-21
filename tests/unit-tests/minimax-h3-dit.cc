@@ -36,6 +36,8 @@
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "generative-models/shared/streamed-refill.h"
+#include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
 #include "common/session.h"
@@ -53,6 +55,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <cstring>
+#include <memory>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -1531,6 +1534,111 @@ TEST(minimax_h3_dit, streamed_slots_match_per_block_loads)
 // made from another step's noise level.
 //
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+// The AdaLN bake's READ, against the read it replaces.
+//
+// The bake is the largest single read in a run -- 13.86 GB at the
+// released 8-bit config, 39.3% of the checkpoint -- and it now takes it
+// through one reusable destination per tensor (pread) instead of
+// allocating a fresh set per block and copying out of the shard's mmap.
+// Same bytes by a different route, so the bytes are what to check, on
+// every dtype an AdaLN projection carries.
+//
+// It also pins the REUSE, which is what makes the fast read available:
+// a destination sized for block 0 has to serve block 1 and block 2. If
+// the projections were not shape-identical the refill would refuse and
+// the bake would silently fall back to the slow path -- correct, and
+// none of the point.
+//
+// No model is loaded and nothing runs on the GPU: this is about the
+// weight set, and the equivalent forward-level test
+// (baked_adaln_matches_the_projections) cannot run on a 16 GB box
+// against a 35 GB checkpoint, because its UNBAKED arm is the thing the
+// bake exists to avoid.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, adaln_refill_matches_the_mapped_read)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::shared_ptr<genai::WeightSet> ws = genai::WeightSet::open(root, nullptr);
+  if (!ws) {
+    std::printf("[minimax_h3_dit] no weight set at %s\n", root);
+    return;
+  }
+  // bf16 is what the model reads a projection as, so it is what the
+  // refill is asked for: the u32 codes land raw and the f16 scales and
+  // biases are converted in place, which is what to_bf16_() does on the
+  // route this replaces.
+  const char* kSuffix[] = {".weight", ".scales", ".biases", ".bias"};
+  std::vector<metal_compute::SharedBuffer> slot(4);
+  int checked = 0, reused = 0;
+  std::size_t bytes = 0, differ = 0;
+
+  for (int b = 0; b < 3; ++b) {
+    for (int k = 0; k < 4; ++k) {
+      const std::string nm =
+          "blocks." + std::to_string(b) + ".adaln_proj.linear" + kSuffix[k];
+      const auto* ti = ws->src().info(nm);
+      if (ti == nullptr) { continue; }
+
+      // The reference: the read this replaces. F16 is converted on the
+      // host exactly as to_bf16_ does -- f16 -> f32 -> round-to-nearest-
+      // even bf16 -- because that is the value the forward consumed
+      // before and has to consume now.
+      metal_compute::SharedBuffer raw =
+          ws->stream_tensor(nm, mc, genai::WeightSet::Residency::Copied);
+      if (raw.empty()) { continue; }
+      std::vector<std::uint16_t> want;
+      const std::size_t nbytes = ti->nbytes;
+      if (ti->dtype == "F16") {
+        const std::size_t n = nbytes / 2;
+        want.resize(n);
+        const auto* src = static_cast<const _Float16*>(raw.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          float f = (float)src[i];
+          std::uint32_t u;
+          std::memcpy(&u, &f, 4);
+          want[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+      } else {
+        want.resize(nbytes / 2);
+        std::memcpy(want.data(), raw.contents(), nbytes);
+      }
+
+      // Block 0 allocates; 1 and 2 must fit the SAME buffer.
+      if (slot[(std::size_t)k].empty()) {
+        slot[(std::size_t)k] = mc->make_shared_buffer(nbytes);
+      } else {
+        ++reused;
+      }
+      ASSERT_TRUE(!slot[(std::size_t)k].empty());
+      const genai::Refill r = genai::refill_streamed_tensor(
+          *ws, nm, slot[(std::size_t)k], genai::RefillDst::kBf16);
+      EXPECT_TRUE(r == genai::Refill::kFilled);
+      if (r != genai::Refill::kFilled) { continue; }
+      ++checked;
+      bytes += nbytes;
+      if (std::memcmp(slot[(std::size_t)k].contents(), want.data(),
+                      nbytes) != 0) {
+        ++differ;
+        std::printf("[minimax_h3_dit] MISMATCH %s (%s)\n", nm.c_str(),
+                    ti->dtype.c_str());
+      }
+    }
+  }
+  std::printf("[minimax_h3_dit] adaln refill: %d tensors (%.1f MB), %d into "
+              "a reused destination, %zu differ\n", checked,
+              (double)bytes / 1e6, reused, differ);
+  EXPECT_TRUE(checked >= 8);
+  // The reuse is the mechanism, not an incidental: without it there is
+  // no destination to pread into.
+  EXPECT_TRUE(reused >= 4);
+  EXPECT_TRUE(differ == 0);
+}
+
 TEST(minimax_h3_dit, baked_adaln_matches_the_projections)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
@@ -1586,7 +1694,7 @@ TEST(minimax_h3_dit, baked_adaln_matches_the_projections)
   // one step's). Pinned, so the comparison is about the table.
   const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
   auto run = [&](bool bake, std::vector<std::vector<float>>* out) {
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     if (bake) {

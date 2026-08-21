@@ -10,6 +10,8 @@
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
+#include "generative-models/generative-model-manager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -517,19 +519,46 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
 //     cyclic scan: the one access pattern an LRU page cache handles
 //     worst, dropping each block exactly before it comes round again.
 //
+//   PRELOADING WITH THE WIRED POOL ON -> Copied, which reverses the
+//     first case and is the point of the pool. Mapped weights can be
+//     neither wired, parked nor pooled: mlock refuses read-only file
+//     mappings (MEASURED on the M4 Pro: ENOMEM after ~4 GB against a
+//     49 GB pool and a 53.7 GB vm.user_wire_limit, while the same call
+//     wires 12-15 GB of anonymous buffers), and for_each_weight()
+//     enumerates cached COPIED entries only. So a mapped preload is
+//     invisible to every mechanism in docs/MODEL-MEMORY.md except the
+//     accounting -- 33 GB the model holds, the pool cannot protect and
+//     a peer cannot reclaim.
+//
 // MEASURED on the sibling LTX-2.5 DiT at 960x544x121, preloaded on a
 // 64 GB box: 409.7 s of denoise mapped against 473.5 s owning the same
 // bytes, the copied arm at 36 GB compressed with its own weights 2-3%
 // resident.
 //
+// READ THAT NUMBER WITH ITS OWN SECOND CLAUSE. The copied arm lost
+// because it was BEING COMPRESSED -- 36 GB of it, 2-3% resident -- which
+// is the exact failure wiring exists to prevent, and it was measured
+// with no pool to wire into. It says owning bytes the compressor can
+// take is worse than mapping them. It does not say owning bytes the
+// compressor CANNOT take is worse, and that is the arm this enables.
+//
+// RE-MEASURED with the pool on, H3 at 960x544x21 / 4 steps on the M4
+// Pro, arms INTERLEAVED (copied, mapped, copied, mapped) so a thermal
+// drift cannot be read as a result: 186 / 174 s wired against 198 /
+// 238 s mapped -- 1.21x, and the mapped arm's 40 s spread against the
+// wired arm's 12 s is the page cache being unpredictable in exactly the
+// way wiring removes. The box got HEALTHIER, not tighter: compression
+// fell from 2060 to 991 MB across the run and swap fell with it, while
+// 35 GB sat wired.
+//
 // A shard the file cannot map falls back to a copy regardless, so this
 // is never worse than Copied -- but the log, not this rule, is what says
 // whether a preload actually mapped.
 static WeightSet::Residency
-kept_residency_(bool stream_blocks)
+kept_residency_(bool stream_blocks, bool wire_resident)
 {
-  return stream_blocks ? WeightSet::Residency::Copied
-                       : WeightSet::Residency::Mapped;
+  return (stream_blocks || wire_resident) ? WeightSet::Residency::Copied
+                                          : WeightSet::Residency::Mapped;
 }
 
 // The budget bake_adaln checks its tables against. One definition, so
@@ -540,6 +569,17 @@ adaln_table_budget_()
   const char* e = std::getenv("VPIPE_H3_ADALN_BAKE_MAX_MB");
   const long v = (e != nullptr) ? std::atol(e) : 0;
   return (std::size_t)(v > 0 ? v : 1536) << 20;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::streaming_floor_bytes(const std::string& dit_dir)
+{
+  auto wts = MetalLlamaWeights::open_model(dit_dir);
+  if (!wts.has_value()) { return 0; }
+  // AdaLN excluded: the bake retires it before the first forward, so a
+  // slot never carries it for long and counting it would make the floor
+  // 1.6x what the model settles at.
+  return stream_floor_bytes(*wts, "blocks.", "adaln");
 }
 
 std::size_t
@@ -580,7 +620,7 @@ MetalMiniMaxH3Transformer::weight_(WeightSet& ws, const std::string& nm,
   if (info->dtype == "BF16") {
     // Already the forward's dtype, so the model keeps it AS IS; whose
     // memory it is follows kept_residency_ above.
-    const auto res = kept_residency_(_stream_blocks);
+    const auto res = kept_residency_(_stream_blocks, _wire_resident);
     return r == Retain::Streamed
                ? ws.stream_tensor(nm, _mc, res)
                : ws.tensor(nm, _mc, res);
@@ -617,9 +657,11 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     // only because they are raw u32 rather than the compute dtype.
     l.codes  = r == Retain::Streamed
                    ? ws.stream_tensor(nm + ".weight", _mc,
-                                      kept_residency_(_stream_blocks))
+                                      kept_residency_(_stream_blocks,
+                                                      _wire_resident))
                    : ws.tensor(nm + ".weight", _mc,
-                               kept_residency_(_stream_blocks));
+                               kept_residency_(_stream_blocks,
+                                               _wire_resident));
     l.scales = weight_(ws, nm + ".scales", r);
     l.qbias  = weight_(ws, nm + ".biases", r);
     if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
@@ -811,42 +853,90 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
                                          bool with_adaln)
 {
   bool ok = true;
-  // One tensor into the buffer that already holds its predecessor, via
-  // the shared rule (generative-models/shared/streamed-refill.h).
+  int repaired = 0;
+  // PER TENSOR, not per block. A tensor a raw read cannot place is
+  // rebuilt the way load_block_ builds it, into the slot, and everything
+  // around it still takes the fast path.
   //
-  // EVERY tensor of an H3 block is servable -- the checkpoint is BF16,
-  // U32 codes and F16 scales throughout -- so kUnservable here is not
-  // the ordinary case it is for a stack carrying f32 tables, and the
-  // honest thing is to stop rather than to half-fill a slot the forward
-  // is about to read. A model whose blocks mix the two builds the odd
-  // tensor its own way instead; see the LTX-2.5 plug-in.
-  auto one = [&](const std::string& nm, SharedBuffer& dst) {
+  // This used to answer for the whole block, and any refusal anywhere
+  // turned the slots off FOR THE RUN -- which sent every block of every
+  // forward back through per-block allocations. That fallback is the
+  // expensive one: it allocates a block's worth of buffers per block per
+  // step, and before the reads were made uncached it also left the whole
+  // checkpoint in the buffer cache, which is how a 24 GB box ends up
+  // swapping without making progress. An old quantized pack whose blocks
+  // are not byte-identical to block 0 is exactly the checkpoint that
+  // triggered it, and it does not deserve the whole mechanism.
+  //
+  // `kUnservable` and `kFailed` are repaired the SAME way here, which
+  // reads odd until you notice what the repair is: it does not top the
+  // buffer up, it builds a new one and replaces it. That is the correct
+  // response to a partly-written destination as well as to a dtype no
+  // raw read can place -- and it is what makes a slot whose SIZE no
+  // longer fits recover, since the replacement is sized from the
+  // checkpoint.
+  auto one = [&](const std::string& nm, SharedBuffer& dst, bool raw) {
     if (!ok) { return; }
     if (dst.empty()) { return; }          // this slot has no such tensor
-    if (refill_streamed_tensor(ws, nm, dst, RefillDst::kBf16)
-        != Refill::kFilled) {
-      ok = false;
+    if (refill_streamed_tensor(ws, nm, dst, RefillDst::kBf16) ==
+        Refill::kFilled) {
+      return;
     }
+    // Codes are the checkpoint's own u32 words and are copied; anything
+    // else is read as bf16, which is what weight_() delivers.
+    SharedBuffer rebuilt =
+        raw ? ws.stream_tensor(
+                  nm, _mc, kept_residency_(_stream_blocks, _wire_resident))
+            : weight_(ws, nm, Retain::Streamed);
+    if (rebuilt.empty()) { ok = false; return; }
+    dst = std::move(rebuilt);
+    ++repaired;
   };
   auto lin = [&](const std::string& nm, Linear& l) {
-    if (l.quantized) {
-      one(nm + ".weight", l.codes);
-      one(nm + ".scales", l.scales);
-      one(nm + ".biases", l.qbias);
-    } else {
-      one(nm + ".weight", l.w);
+    if (!ok) { return; }
+    // The one thing the per-tensor path cannot repair, because it is not
+    // a tensor: a Linear whose quantized-ness or bit width has changed
+    // under the slot. Rebuild the whole Linear so its buffers and its
+    // metadata cannot disagree.
+    if (!linear_matches_(ws, nm, l)) {
+      Linear fresh = linear_(ws, nm, !l.b.empty(), Retain::Streamed);
+      const bool built = fresh.quantized
+                             ? !fresh.codes.empty()
+                             : !fresh.w.empty();
+      if (!built) { ok = false; return; }
+      l = std::move(fresh);
+      ++repaired;
+      return;
     }
-    one(nm + ".bias", l.b);
+    if (l.quantized) {
+      one(nm + ".weight", l.codes, /*raw=*/true);
+      one(nm + ".scales", l.scales, /*raw=*/false);
+      one(nm + ".biases", l.qbias, /*raw=*/false);
+    } else {
+      one(nm + ".weight", l.w, /*raw=*/false);
+    }
+    one(nm + ".bias", l.b, /*raw=*/false);
   };
-  one(prefix + "norm1.weight", b.n1);
-  one(prefix + "norm2.weight", b.n2);
-  one(prefix + "attn.q_norm.weight", b.qn);
-  one(prefix + "attn.k_norm.weight", b.kn);
+  one(prefix + "norm1.weight", b.n1, /*raw=*/false);
+  one(prefix + "norm2.weight", b.n2, /*raw=*/false);
+  one(prefix + "attn.q_norm.weight", b.qn, /*raw=*/false);
+  one(prefix + "attn.k_norm.weight", b.kn, /*raw=*/false);
   lin(prefix + "attn.qkv_proj", b.qkv);
   lin(prefix + "attn.out_proj", b.out);
   lin(prefix + "mlp.fc1", b.fc1);
   lin(prefix + "mlp.fc2", b.fc2);
   if (with_adaln) { lin(prefix + "adaln_proj.linear", b.adaln); }
+  // Said once, and at debug: a checkpoint that repairs every block is
+  // paying for it on every forward, and that is worth being able to see
+  // without it turning into a mechanism that silently switched itself
+  // off.
+  if (repaired > 0 && !_refill_repaired && _mc->session() != nullptr) {
+    _refill_repaired = true;
+    _mc->session()->log_debug(fmt(
+        "MetalMiniMaxH3Transformer: {} tensor(s) of a streamed block are "
+        "not raw-readable into a slot and are rebuilt per forward; the "
+        "rest still refill", repaired));
+  }
   return ok;
 }
 
@@ -1193,22 +1283,35 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
   return true;
 }
 
-MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer() = default;
+MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer()
+{
+  // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
+  // so the machine recovers either way -- but the pool's own counter
+  // would not, and a DiT that is destroyed after every clip (the
+  // ordinary `unload_when_idle: destroy` path) would leak its whole
+  // share of the budget per clip until nothing could wire at all.
+  if (_wire_resident) {
+    wire_fixed_(false);
+    for (Block& b : _blocks) { wire_block_(b, false); }
+    _slot[0] = Block{};
+    _slot[1] = Block{};
+  }
+}
 
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(const std::string& dit_dir, MetalCompute* mc,
                                 const Config& cfg, bool stream_blocks,
-                                double pin_frac, const LoraSpec* lora)
+                                const LoraSpec* lora)
 {
   return load(WeightSet::open(resolve_dit_dir(dit_dir, cfg.partition),
                              nullptr),
-              mc, cfg, stream_blocks, pin_frac, lora);
+              mc, cfg, stream_blocks, lora);
 }
 
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                                 MetalCompute* mc, const Config& cfg,
-                                bool stream_blocks, double pin_frac,
+                                bool stream_blocks,
                                 const LoraSpec* lora)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
@@ -1224,7 +1327,6 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // golden both ways.
   if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
     stream_blocks = (std::atoi(e) != 0);
-    if (!stream_blocks) { pin_frac = 0.0; }
   }
   m->_stream_blocks = stream_blocks;
   // Everything loaded HERE is kept for the model's life, so it is cached
@@ -1513,6 +1615,40 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       return nullptr;
     }
   }
+  // WHETHER THIS MODEL'S PAGES GO IN THE WIRED POOL.
+  //
+  // Restored here after the prefix retirement deleted it by accident:
+  // the assignment lived inside the block that sized the pinned prefix,
+  // that block went, and the five places that READ these two fields
+  // stayed. The effect was silent and total -- `_wire_resident` is
+  // false-initialised, so wire_fixed_() never ran, no block was ever
+  // wired, and the only visible trace was "wire budget 0 MB" in the
+  // residency probe line.
+  //
+  // From the MANAGER now rather than from this model's own percentage.
+  // The old form asked what share of RAM one DiT could wire, which is
+  // the per-model budget the pool exists to replace: a ceiling each
+  // model guesses separately never adds up to the box. The pool is the
+  // one accounting, and wire_into_pool() is what enforces it -- this
+  // flag only says whether to ask.
+  //
+  // `_wire_budget` is what is still UNUSED, since the probe below asks
+  // how many more blocks can be wired, not how large the pool is.
+  {
+    const auto* sess = mc != nullptr ? mc->session() : nullptr;
+    auto* mgr = sess != nullptr && sess->services() != nullptr
+                    ? sess->services()->generative_model_manager()
+                    : nullptr;
+    const std::size_t lim = mgr != nullptr ? mgr->wired_pool_limit() : 0;
+    if (lim > 0) {
+      const std::size_t used = mgr->wired_pool_used();
+      m->_wire_resident = true;
+      m->_wire_budget = lim > used ? lim - used : 0;
+    }
+    if (const char* e = std::getenv("VPIPE_WIRE_RESIDENT")) {
+      m->_wire_resident = std::atoi(e) != 0;
+    }
+  }
   // The 50 main blocks: preloaded (default), or -- streaming -- only the
   // pinned prefix, with forward() reading and freeing the tail per block.
   if (!stream_blocks) {
@@ -1523,26 +1659,27 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         return nullptr;
       }
     }
+    // NOT WIRED HERE, AND NOT BECAUSE IT CANNOT BE.
+    //
+    // With the pool on these blocks are Copied (kept_residency_), so
+    // they are cached entries of the weight set -- which means
+    // wire_fixed_() already reaches them through for_each_weight(), and
+    // it runs on the first forward where the SCRATCH exists. That
+    // ordering is the reason to leave it there: the scratch goes into
+    // the pool first, then the trunk and the blocks, so a pool that
+    // runs out runs out on the blocks, which are the half a forward can
+    // proceed without.
+    //
+    // Wiring them here instead inverts exactly that. MEASURED when this
+    // was tried at the load site: 4315 MB of blocks wired, the pool
+    // collapsed on the first refusal, and NOTHING was left for the
+    // trunk and the scratch -- against ~17 GB wired and both protected
+    // when the forward does it.
   } else {
-    if (pin_frac > 0.0) {
-      std::vector<std::string> prefixes((std::size_t)cfg.n_layers);
-      for (int i = 0; i < cfg.n_layers; ++i) {
-        prefixes[(std::size_t)i] = blk_("blocks.", i, "");
-      }
-      m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
-      if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
-    }
-    // Sized to the FULL depth even though only the pinned prefix is
-    // filled: the empty slots are where forward() promotes streamed
-    // blocks into as free memory allows (see set_residency_reserve).
-    // An unfilled slot reads as empty, which is what `held` tests.
+    // No prefix: growth fills these as the box allows. See the note on
+    // load() -- a fraction of total RAM decided before the run cannot
+    // see the machine, and BlockResidency measures instead.
     m->_blocks.resize((std::size_t)cfg.n_layers);
-    for (int i = 0; i < m->_pinned; ++i) {
-      if (!m->load_block_(ws, blk_("blocks.", i, ""),
-                          m->_blocks[(std::size_t)i], true, r)) {
-        return nullptr;
-      }
-    }
   }
   if (lora != nullptr && !lora->path.empty()) {
     std::string lerr;
@@ -2096,6 +2233,87 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
 // costs roughly three blocks' worth of GEMM -- ~10 s at the production
 // geometry -- against a denoise loop of 20+ steps x 50 blocks, so under
 // 1%. VPIPE_H3_NO_QMM_AUTOTUNE=1 skips it and keeps the fallback rule.
+
+namespace {
+
+using H3Route = MetalMiniMaxH3Transformer::GemmRoute;
+
+// Does this route's RANKING move with the row count, or only its
+// absolute time? Marked here, statically, per kernel -- it is a property
+// of what the kernel does and not of the checkpoint or the machine.
+//
+// FALSE (steel). qmm walks the quantized weight inline, one output tile
+// at a time, and every byte it touches it touches per tile. Double the
+// rows and it does the same thing twice, so two steel routes keep their
+// ratio all the way up.
+//
+// TRUE (mma). The matrix-core routes DEQUANTIZE the whole [N, K] weight
+// into a dense bf16 buffer before they multiply -- 308 MB at the widest
+// projection here -- and they pay that once per call whatever M is.
+// Their time is therefore fixed + proportional, and at too few rows the
+// fixed half dominates: MEASURED against the GEMM it is ~1% of a
+// production-height call and ~11% of a 1k-row one. Timing them short
+// charges them a cost the forward amortizes away, which is exactly how
+// a tuner talks itself out of the faster kernel.
+bool
+route_m_sensitive_(H3Route r)
+{
+  switch (r) {
+    case H3Route::kSteelBm32:
+    case H3Route::kSteelBm64:
+    case H3Route::kSteelBm128:
+      return false;
+    case H3Route::kMma128:
+    case H3Route::kMma128x256:
+    case H3Route::kMma128x256Tn2:
+      return true;
+    case H3Route::kAuto:
+      break;
+  }
+  return true;      // unknown: assume the expensive answer
+}
+
+// The rows a route has to be timed over. Both numbers are floors on the
+// MEASUREMENT, never on what runs.
+//
+// 1024 for the flat routes is about filling the machine, and it is
+// generous for that: the grid is two-dimensional and N alone already
+// supplies 42 tiles at the narrowest projection here.
+//
+// 4096 for the fixed-cost ones is where the dequant has fallen to a few
+// percent of the call -- close enough to its production share that it
+// cannot reorder a field the run-to-run noise does not already reorder.
+//
+// That is also where it stops drifting, MEASURED on an M5 against the
+// full-height answer at 16990 rows (67.5 s of tuning):
+//
+//   4096  qkv/o/fc1 = mma 128x256 tn2, fc2 = mma 128x256 + split7
+//         -- the full-height answer exactly, in 16.5 s
+//   2048  same tiles, split7 -> split4
+//   1024  every shape drops to the plain 128x128 tile
+//    512  ...and split-K disappears
+//
+// So the drift is real and it is one-directional: too few rows and the
+// WIDE tiles and the deep split, which are the two things that need
+// rows to pay for themselves, both lose to something narrower. A cap
+// picked for cheapness rather than measured would have quietly tuned
+// this model onto slower kernels and reported a tuned answer.
+//
+// VPIPE_H3_TUNE_ROWS overrides both, which is how the ladder above was
+// taken and how to re-take it on a machine this was not tuned on.
+int
+route_tune_rows_(H3Route r)
+{
+  static const int kForced = [] {
+    const char* e = std::getenv("VPIPE_H3_TUNE_ROWS");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  if (kForced > 0) { return kForced; }
+  return route_m_sensitive_(r) ? 4096 : 1024;
+}
+
+}  // namespace
+
 void
 MetalMiniMaxH3Transformer::tune_qmm_(int M)
 {
@@ -2146,8 +2364,10 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
       GemmRoute::kMma128x256Tn2,
   };
 
+
   std::vector<QmmTune> tuned;
   std::string detail;
+  int tune_rows = 0;
   const auto t0 = std::chrono::steady_clock::now();
   for (const Shape& sh : shapes) {
     if (skip_fc1 && sh.N == 2 * F) { continue; }
@@ -2162,6 +2382,33 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
       if (!cands.empty()) { tuned.push_back(QmmTune{sh.N, sh.K, cands[0]}); }
       continue;
     }
+    // How many rows this set has to be TIMED over. Not the caller's M:
+    // at production geometry that is ~17k rows, and timing six routes
+    // over four shapes there costs a minute of GPU before the first block
+    // of the first step reports anything.
+    //
+    // Every route tiles the output and loops. Rows past the point where
+    // the grid is full multiply every candidate's time by the same
+    // factor, so the RANKING stops moving long before the row count does
+    // -- and the grid is full from N alone here, since the narrowest tile
+    // is 128 wide against a 5376-wide projection.
+    //
+    // What that argument does NOT cover is a route with an M-INDEPENDENT
+    // cost, which is why the floor is a static property of the KERNEL
+    // (route_m_sensitive_) rather than one number for the model.
+    int tune_m = 0;
+    bool any_mma = false;
+    for (GemmRoute r : cands) {
+      tune_m = std::max(tune_m, route_tune_rows_(r));
+      any_mma = any_mma || route_m_sensitive_(r);
+    }
+    // An mma route below _mma_min_m does not merely score badly -- it is
+    // refused and silently dispatched as steel, which would time one
+    // kernel in two arms. Never below the floor that decides that.
+    if (any_mma) { tune_m = std::max(tune_m, _mma_min_m); }
+    tune_m = ((tune_m + 127) / 128) * 128;    // whole tiles, no tail
+    if (tune_m > M) { tune_m = M; }
+    tune_rows = tune_m;
     const int w = autotune_vote((int)cands.size(), /*rounds=*/2,
         /*reps_for_us=*/1,
         [&](int i) {
@@ -2175,9 +2422,11 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
             // Banded exactly as the forward encodes it. Unbanded, an mma
             // route past 2^31 bytes would silently skip its last tiles
             // and be timed for work it did not do, while steel -- which
-            // addresses in 64 bits -- did all of it.
-            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
-                                cands[(std::size_t)i]);
+            // addresses in 64 bits -- did all of it. (At `tune_m` the
+            // band never fires; it is here because what is timed has to
+            // be what runs.)
+            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N,
+                                sh.K, cands[(std::size_t)i]);
           });
         });
     const GemmRoute win = cands[(std::size_t)w];
@@ -2191,10 +2440,16 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     // has to be pinned first -- measuring both at once would confound them.
     if (win == GemmRoute::kMma128 || win == GemmRoute::kMma128x256 ||
         win == GemmRoute::kMma128x256Tn2) {
+      // Keyed on the REAL M -- plan() matches the row count the forward
+      // asks with -- but MEASURED at tune_m like everything else. The
+      // split path already walks M in row blocks of its own choosing
+      // (MmaSplitK::rows_per_block), so above one block the decision no
+      // longer moves with M; tune_m is at least one such block at every
+      // shape here.
       const int sp = _splitk.tune(_mc, sh.K, sh.N, M,
           [&](ComputeEncoder& enc) {
-            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, M, sh.N, sh.K,
-                                win);
+            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N,
+                                sh.K, win);
           });
       if (sp > 0) { detail += "+split" + std::to_string(sp); }
     }
@@ -2209,7 +2464,8 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   _qmm_tuning_desc = std::to_string(M) + ": " + detail;
   if (_mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
-        "[h3-dit] qmm autotune at {} rows: {} ({:.0f} ms)", M, detail, ms));
+        "[h3-dit] qmm autotune for {} rows, timed over {}: {} ({:.0f} ms)",
+        M, tune_rows, detail, ms));
   }
 }
 
@@ -2311,6 +2567,54 @@ MetalMiniMaxH3Transformer::adaln_table_bytes() const
   return n;
 }
 
+// The AdaLN bake is the one reader in this model whose tensors are all
+// the SAME SHAPE -- 50 projections of [96768, time_dim], byte for byte
+// identical in size. That is what makes the fast read available to it:
+// refill_streamed_tensor needs a destination the caller already owns,
+// and the route this replaces allocated a fresh set per block and threw
+// it away, so there was never a buffer to refill.
+//
+// It matters because the bake is the single largest read in a run. At
+// the released 8-bit config the projections are 13.86 GB, 39.3% of the
+// checkpoint, and MEASURED on an M5 over the real tensors (arms
+// interleaved, order rotated, no block read by both) the mapped memcpy
+// this used runs at 1.32-1.36 GB/s against 5.97-5.98 GB/s for a pread
+// into a buffer that exists. That is ~10 s against ~2 s, before the
+// first step reports anything.
+//
+// Block 0 still goes through linear_(): that is where `quantized` and
+// `bits` are derived from the shapes, and one block on the old path
+// against forty-nine is not worth a second copy of that reasoning. It
+// also makes the fallback trivial -- anything the refill will not serve
+// rebuilds here and becomes the destination for the blocks after it, so
+// a checkpoint with a shape or dtype this route cannot place is slower
+// and not wrong.
+bool
+MetalMiniMaxH3Transformer::adaln_into_(const std::string& nm, Linear& dst)
+{
+  if (!dst.empty()) {
+    // bf16, because that is what this model reads a projection as: the
+    // f16 scales and biases are converted by to_bf16_() on the old path
+    // and in place here, to the same bits.
+    const SharedBuffer* parts[] = {
+        dst.quantized ? &dst.codes : &dst.w,
+        &dst.scales, &dst.qbias, &dst.b,
+    };
+    const char* suffix[] = {".weight", ".scales", ".biases", ".bias"};
+    bool all = true;
+    for (int i = 0; i < 4 && all; ++i) {
+      // A Linear that never had this part (an unquantized projection has
+      // no scales) is not a refusal -- there is nothing to refill.
+      if (parts[i]->empty()) { continue; }
+      all = refill_streamed_tensor(*_ws, nm + suffix[i], *parts[i],
+                                   RefillDst::kBf16) == Refill::kFilled;
+    }
+    if (all) { return true; }
+  }
+  dst = linear_(*_ws, nm, true, Retain::Streamed);
+  return !dst.empty();
+}
+
 bool
 MetalMiniMaxH3Transformer::bake_adaln(
     const std::vector<std::vector<float>>& schedule, std::string* err)
@@ -2383,19 +2687,23 @@ MetalMiniMaxH3Transformer::bake_adaln(
   std::size_t freed = 0;
   _adaln_tab.clear();
   _adaln_tab.resize((std::size_t)c.n_layers);
+  // ONE set of destinations for all 50, refilled in place -- see
+  // adaln_into_. Released at the end of the bake; holding 276 MB for the
+  // rest of a run on the box this streams for would give back a good
+  // part of what the bake just freed.
+  Linear held;
   for (int i = 0; i < c.n_layers; ++i) {
     // Take the projection from wherever it is. A resident block already
     // holds it; a streamed one does not, and reading JUST this tensor is
     // the point -- the bake never needs the rest of the block, so it
-    // touches the 12.9 GB once and nothing else.
-    Linear held;
+    // touches the 13.9 GB once and nothing else.
     const Linear* ada = nullptr;
     if ((std::size_t)i < _blocks.size() && !_blocks[(std::size_t)i].adaln.empty()) {
       ada = &_blocks[(std::size_t)i].adaln;
     } else {
-      held = linear_(*_ws, blk_("blocks.", i, "") + "adaln_proj.linear", true,
-                     Retain::Streamed);
-      if (held.empty()) { return fail(fmt("block {} has no adaln", i)()); }
+      if (!adaln_into_(blk_("blocks.", i, "") + "adaln_proj.linear", held)) {
+        return fail(fmt("block {} has no adaln", i)());
+      }
       ada = &held;
     }
     SharedBuffer tab =
@@ -2424,6 +2732,10 @@ MetalMiniMaxH3Transformer::bake_adaln(
   // Missing that made re-baking silently project against an empty
   // weight, which minimax_h3_dit.denoise_holds_the_anchors caught as two
   // denoise runs disagreeing -- not as a failure at the bake.
+  // The blocks are done with it. The final layer is a different shape
+  // and reads its own.
+  held = Linear{};
+
   Linear fheld;
   const Linear* fada = &_final_adaln;
   if (_final_adaln.empty()) {
@@ -2451,6 +2763,132 @@ MetalMiniMaxH3Transformer::bake_adaln(
   // concluded about this box a moment ago was measured against a load
   // this model no longer carries, so the ratchet starts over.
   _resid.note_landscape_changed();
+
+  // NOT RECYCLABLE from here on.
+  //
+  // The bake reads every adaln_proj uncached and replaces it with a
+  // table built for THIS schedule, then releases the projections. The
+  // checkpoint on disk is untouched -- and if the pool held only the
+  // checkpoint this would not matter. What it holds is the set a model
+  // was built from, and a relaunch that recycled it would find a model
+  // whose tables are right for a step count it does not share, and whose
+  // projections are gone.
+  //
+  // Said here rather than at the pool, because here is the only place
+  // that knows the specialisation happened.
+  if (_ws) {
+    _ws->set_not_recyclable(fmt(
+        "AdaLN baked for a {}-step schedule", schedule.size())());
+  }
+
+  // Both of BlockResidency's rates are tuned for a 30-step schedule and
+  // are wrong for a 5-step turbo one, in the same direction.
+  //
+  // The per-forward cap exists so the residency MEASUREMENT gets a look
+  // before the whole checkpoint has been admitted -- so what it should
+  // bound is "blocks per look", and the number of looks is the number of
+  // steps. A constant 8 lets a 30-step run reach 50 blocks with 20 looks
+  // to spare and caps a 5-step run at 40 it can never use. Sized so the
+  // set converges by the penultimate step, every schedule gets the same
+  // number of chances to react rather than the same number of blocks.
+  //
+  // Recovery has the same defect: one block per three quiet forwards
+  // cannot undo a shed inside a 5-step run at all, which is how a single
+  // sample taken during the bake decided the whole of it.
+  //
+  // ALL OF THIS IS STREAMING-ONLY. Under preload every block is already
+  // resident, so `streaming` is false for every block of every forward
+  // and admit() is never reached -- the cap would gate nothing. It was
+  // computed and PRINTED anyway, which put "residency probe 26 blocks of
+  // 50" under a run that had just announced PRELOAD and read as a
+  // streaming model that had pinned half its stack.
+  if (_stream_blocks) {
+    const int steps = (int)schedule.size();
+    // The PROBE is a question about ROOM, not about the schedule.
+    //
+    // On a box with space free, the right first forward is a large one:
+    // a block admitted on forward 1 is reused by every forward after it,
+    // one admitted on the last is reused by nothing. So this asks how
+    // many blocks fit RIGHT NOW and commits half of them, then
+    // BlockResidency doubles per healthy forward -- which reaches the
+    // whole stack in two or three forwards on a roomy box and stays
+    // small on a tight one, without either answer being written down in
+    // advance.
+    //
+    // THREE QUARTERS rather than all of it, because the measurement
+    // that would say this was too much does not exist until the next
+    // forward. That is the safe margin -- and it is a margin on top of
+    // two others, which is why it can be this generous: the figure is
+    // already 90% of RECLAIMABLE physical memory, and already clamped
+    // to what can be wired. Spreading over the schedule was not a
+    // margin at all, it was just slower everywhere.
+    //
+    // A ONE-step schedule is the exception: it has no second forward, so
+    // nothing kept is ever reused and every admission is a block-sized
+    // memcpy plus an mlock paid for nothing.
+    int probe = 1;
+    if (steps > 1 && _wire_resident) {
+      // WIRING ON: NO RATE LIMIT. Take everything the box will give on
+      // the first pass.
+      //
+      // The cap exists because admit()'s gate is arithmetic over
+      // `available_physical`, which counts file cache -- on a streaming
+      // model mostly the checkpoint that model just read, so the signal
+      // says "room" the more it streams. The true signal was the
+      // mincore walk, which arrives once per forward, so the cap bounded
+      // what could be committed before the first evidence.
+      //
+      // Wiring replaces that evidence with a SYNCHRONOUS one. mlock
+      // either takes the block or refuses it, per block, before it is
+      // kept -- and a refusal collapses `_wire_budget` to what was
+      // granted, so admissions stop on the spot. There is no window
+      // between committing and finding out, which is the only thing the
+      // cap was buying. (And since the walk now skips wired buffers,
+      // waiting for it would be waiting for a measurement that reports
+      // nothing.)
+      //
+      // What it COSTS is a whole extra pass of reads. A block not
+      // admitted on forward 1 was still read from disk, used and
+      // dropped -- so capping at 26 of 50 means 24 blocks re-read on
+      // forward 2 for nothing, ~9.4 GB at this model's sizes.
+      probe = c.n_layers;
+    } else if (steps > 1) {
+      const std::size_t blk = resident_block_bytes_();
+      const auto mb = _mc->memory_budget();
+      std::size_t room = (std::size_t)((double)mb.available_physical * 0.9);
+      const std::size_t keep = _resid.reserve();
+      room = room > keep ? room - keep : 0;
+      if (blk > 0) {
+        const std::size_t fits = room / blk * 3 / 4;
+        probe = fits > (std::size_t)c.n_layers ? c.n_layers
+                                               : (int)fits;
+      }
+      if (probe < 1) { probe = 1; }
+    }
+    // Forcing the probe is what makes the cap MEASURABLE. Its whole
+    // effect is on the first forward or two, so an A/B needs the two
+    // arms in one binary -- otherwise the only comparison available is
+    // against a different build on a different day.
+    if (const char* e = std::getenv("VPIPE_H3_PROBE")) {
+      const int v = std::atoi(e);
+      if (v > 0) { probe = v > c.n_layers ? c.n_layers : v; }
+    }
+    _resid.set_per_forward_cap(probe);
+    _resid.set_quiet_forwards(steps / 4 > 0 ? (steps / 4 > 3 ? 3 : steps / 4)
+                                            : 1);
+    if (_mc->session() != nullptr) {
+      _mc->session()->info(fmt(
+          "MetalMiniMaxH3Transformer: residency probe {} blocks of {} "
+          "({} MB each, {} MB reclaimable, wire budget {} MB){}",
+          probe, c.n_layers,
+          resident_block_bytes_() >> 20,
+          _mc->memory_budget().available_physical >> 20,
+          _wire_budget >> 20,
+          _wire_resident
+              ? " -- uncapped, the wire budget is the gate"
+              : ", doubling per healthy forward"));
+    }
+  }
 
   if (_mc->session() != nullptr) {
     _mc->session()->log_normal(fmt(
@@ -2604,10 +3042,12 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
 // ever re-admit it.
 void
 MetalMiniMaxH3Transformer::resident_pages_(std::size_t* examined,
-                                           std::size_t* incore) const
+                                           std::size_t* incore,
+                                           std::size_t* paged_out) const
 {
   *examined = 0;
   *incore = 0;
+  if (paged_out != nullptr) { *paged_out = 0; }
   for (const Block& b : _blocks) {
     const metal_compute::SharedBuffer* all[] = {
         &b.qkv.w, &b.qkv.codes, &b.out.w, &b.out.codes,
@@ -2615,12 +3055,144 @@ MetalMiniMaxH3Transformer::resident_pages_(std::size_t* examined,
         &b.adaln.w, &b.adaln.codes};
     for (const metal_compute::SharedBuffer* p : all) {
       if (p->byte_size() == 0) { continue; }
+      // A WIRED BUFFER CANNOT HAVE LEFT RAM, so asking is spending the
+      // walk to be told what mlock already guarantees. Skipped PER
+      // BUFFER rather than per block, because wire_block_ stops at the
+      // first refusal and leaves the rest of that block unwired -- the
+      // remainder is exactly what still needs measuring.
+      //
+      // With everything wired `examined` stays 0, and the caller reads
+      // that as "no evidence" rather than as a shortfall (it tests
+      // examined > 0 first), which is the correct answer: there is
+      // nothing this walk could have found.
+      //
+      // Worth the branch: the walk costs ~57 ms per 4.3 GB, so a fully
+      // wired 35 GB stack would pay ~460 ms per look for a guaranteed
+      // answer.
+      if (p->is_wired()) { continue; }
       const auto r = p->page_residency(64);
       if (!r.valid) { continue; }
       *examined += r.examined;
       *incore += r.incore;
+      if (paged_out != nullptr) { *paged_out += r.paged_out; }
     }
   }
+}
+
+bool
+MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
+                                           const std::string& nm,
+                                           const Linear& l) const
+{
+  const MetalLlamaWeights& src = ws.src();
+  const auto* si = src.info(nm + ".scales");
+  const auto* ci = src.info(nm + ".weight");
+  if (ci == nullptr) { return false; }
+  const bool ckpt_quant = _quant_bits > 0 && si != nullptr &&
+                          si->shape.size() == 2 && ci->shape.size() == 2;
+  if (ckpt_quant != l.quantized) { return false; }
+  if (!ckpt_quant) { return true; }
+  // The same derivation linear_() uses, so the two cannot disagree
+  // about what this Linear is.
+  const long K = si->shape[1] * (long)_quant_group;
+  const int bits = K > 0 ? (int)(ci->shape[1] * 32 / K) : 0;
+  return ((bits == 8) ? 8 : 4) == l.bits;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::resident_block_bytes_() const
+{
+  if (!_ws) { return 0; }
+  // Block 0 stands for all of them: the stack is uniform, and the one
+  // place it is not (a first or last block carrying extra) is what
+  // BlockResidency's own largest-seen _block_hint corrects for once real
+  // admissions start.
+  const std::string pfx = blk_("blocks.", 0, "");
+  std::size_t total = 0;
+  for (const std::string& n : _ws->src().tensor_names()) {
+    if (n.rfind(pfx, 0) != 0) { continue; }
+    if (n.find("adaln") != std::string::npos) { continue; }
+    const auto* ti = _ws->src().info(n);
+    if (ti != nullptr) { total += (std::size_t)ti->nbytes; }
+  }
+  return total;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
+{
+  metal_compute::SharedBuffer* all[] = {
+      &b.n1, &b.n2, &b.qn, &b.kn,
+      &b.qkv.w, &b.qkv.b, &b.qkv.codes, &b.qkv.scales, &b.qkv.qbias,
+      &b.out.w, &b.out.b, &b.out.codes, &b.out.scales, &b.out.qbias,
+      &b.fc1.w, &b.fc1.b, &b.fc1.codes, &b.fc1.scales, &b.fc1.qbias,
+      &b.fc2.w, &b.fc2.b, &b.fc2.codes, &b.fc2.scales, &b.fc2.qbias,
+      &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
+      &b.adaln.qbias};
+  auto* mgr = _mc != nullptr && _mc->session() != nullptr
+                  ? _mc->session()->services()->generative_model_manager()
+                  : nullptr;
+  if (mgr == nullptr) { return 0; }
+  std::size_t changed = 0;
+  for (metal_compute::SharedBuffer* p : all) {
+    if (p->byte_size() == 0 || p->is_wired() == on) { continue; }
+    if (!on) {
+      mgr->unwire_from_pool(*p);
+      changed += p->byte_size();
+      continue;
+    }
+    if (mgr->wire_into_pool(*p) == 0) {
+      // The pool is full, or the box refused. STOP, and keep what is
+      // already wired rather than unwinding it. A partly wired block is
+      // partly protected, which is strictly better than none -- and
+      // giving protection back on the way out means competing for it
+      // again on the next block, against a pool that just said no.
+      break;
+    }
+    changed += p->byte_size();
+  }
+  return changed;
+}
+
+std::vector<metal_compute::SharedBuffer*>
+MetalMiniMaxH3Transformer::scratch_buffers_()
+{
+  return {&_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.qh, &_s.kh,
+          &_s.vh, &_s.oh, &_s.ob, &_s.ff, &_s.proj, &_s.txt, &_s.temb,
+          &_s.mod, &_s.fmod, &_s.adaln_idx, &_s.tstep_idx, &_s.lora};
+}
+
+// Wire the TRUNK and the SCRATCH -- everything this model holds that is
+// not a streamed block.
+//
+// They belong in the pool ahead of the blocks, not after: a resident
+// block is an optimisation the model can shed and stream instead, while
+// the scratch is what a forward cannot proceed without and the trunk is
+// read on every block of every forward. Protecting the optional half
+// first is how a run ends up with 32 GB of wired blocks beside an
+// activation buffer the compressor is free to take.
+std::size_t
+MetalMiniMaxH3Transformer::wire_fixed_(bool on)
+{
+  auto* mgr = _mc != nullptr && _mc->session() != nullptr
+                  ? _mc->session()->services()->generative_model_manager()
+                  : nullptr;
+  if (mgr == nullptr) { return 0; }
+  std::size_t changed = 0;
+  auto one = [&](metal_compute::SharedBuffer& b) {
+    if (b.byte_size() == 0 || b.is_wired() == on) { return; }
+    if (!on) { mgr->unwire_from_pool(b); changed += b.byte_size(); return; }
+    changed += mgr->wire_into_pool(b);
+  };
+  for (metal_compute::SharedBuffer* b : scratch_buffers_()) { one(*b); }
+  // The TRUNK: everything the weight set cached for this model, which
+  // for a streaming DiT is the non-block tensors it holds for the whole
+  // run. Read on every block of every forward and never shed, so it has
+  // a better claim on the pool than any single resident block does.
+  if (_ws) {
+    _ws->for_each_weight([&](metal_compute::SharedBuffer& b) { one(b); });
+  }
+  return changed;
 }
 
 // Evict from the TAIL down, so what remains stays a contiguous prefix.
@@ -2630,20 +3202,24 @@ MetalMiniMaxH3Transformer::resident_pages_(std::size_t* examined,
 // against a disk read, so the descending cursor this replaced bought
 // nothing and could not be shared.
 std::size_t
-MetalMiniMaxH3Transformer::evict_tail_block_(bool allow_pinned)
+MetalMiniMaxH3Transformer::evict_tail_block_()
 {
-  const int floor = allow_pinned ? 0 : _pinned;
+  const int floor = 0;
   for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
     Block& b = _blocks[(std::size_t)i];
     const std::size_t n = block_bytes_(b);
     if (n == 0) { continue; }
+    // Before the buffers go: give the wiring back. Dropping a wired
+    // mapping would unwire it anyway, but doing it here keeps
+    // _wired_bytes honest without having to infer it from destructors.
+    const std::size_t unwired = wire_block_(b, false);
+    _wired_bytes -= (unwired > _wired_bytes) ? _wired_bytes : unwired;
     b = Block{};
     // Taking one out of the PINNED prefix un-pins it: that prefix was
     // sized at load against what the box was believed to hold, and a
     // measurement saying its pages are no longer in RAM is that belief
     // being wrong. The forward decides resident-or-streamed by whether
     // the slot is EMPTY, not by this count, so it simply streams now.
-    if (i < _pinned) { _pinned = i; }
     return n;
   }
   return 0;
@@ -2772,9 +3348,20 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (in.text->byte_size() < (std::size_t)n_text * c.text_dim * 2) {
     return fail("text conditioning is smaller than num_text_rows * text_dim");
   }
+  // What the FIRST forward spends before it can report a single block.
+  // It is not small and it was not visible: the bar opens, the AdaLN
+  // bake logs, and then nothing says anything until block 0. Every term
+  // below is paid once per run, and each is a different thing to fix, so
+  // they are reported apart rather than as one number.
+  using PClock = std::chrono::steady_clock;
+  const auto p_t0 = PClock::now();
+  auto p_ms = [](PClock::time_point a, PClock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   if (!ensure_scratch_(seq, n_text, n_t)) {
     return fail("activation allocation failed (out of GPU memory)");
   }
+  const auto p_scratch = PClock::now();
   // Re-arm growth for this forward. The per-forward flag is what stops
   // the budget being re-queried for every one of 50 blocks once the
   // answer is no; the RATCHET (_resid_ceiling) is what survives across
@@ -2789,6 +3376,86 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // on the next line. Declaring them keeps the gate from demanding room
   // for them twice; what is left of the reserve is the part still to be
   // found, which is the peers after the denoise (the VAE decode).
+  // The scratch is allocated by now, so it can take its place in the
+  // pool BEFORE this forward's block admissions start asking for room.
+  // Order matters: the blocks are the shed-able half.
+  if (_wire_resident) {
+    // RETRY THE WIRED POOL, at the top of each forward.
+    //
+    // wire_into_pool() collapses the pool to what was granted when mlock
+    // refuses, which is right for a box that is full and wrong for one
+    // that was momentarily busy -- another process spiking during load.
+    // Without a retry the second case holds a small resident set for the
+    // whole schedule on the strength of one syscall: MEASURED, a 9 GB
+    // pool that granted 5857 MB sat at 16 of 50 blocks for the rest of
+    // the run.
+    //
+    // The flag stays set until a retry actually RAISES the budget, so a
+    // box busy at forward 2 is still asked again at forward 5. A single
+    // attempt would have spent itself against the same spike that
+    // caused the refusal.
+    //
+    // GATED on the box having demonstrably freed a block's worth since
+    // the refusal, so a genuinely full box is never asked: reopening the
+    // ceiling makes wired_pool_can_take() pass, and the mlock behind it
+    // would then fail and leave that block resident but UNWIRED -- one
+    // per forward, exactly the state the wirable gate exists to avoid.
+    // A peer holding wired memory shows up in this reading, since its
+    // pages are unavailable while it holds them and return when it lets
+    // go.
+    //
+    // A forward is the granularity because it is where the resident set
+    // is reconsidered anyway, and the check costs one budget read when
+    // the flag is clear.
+    const std::size_t avail =
+        _wire_retry ? _mc->memory_budget().available_physical : 0;
+    if (_wire_retry && avail > _wire_retry_at + resident_block_bytes_()) {
+      const std::size_t now = avail;
+      auto* mgr = _mc->session() != nullptr &&
+                          _mc->session()->services() != nullptr
+                      ? _mc->session()->services()->generative_model_manager()
+                      : nullptr;
+      if (mgr != nullptr) {
+        mgr->reopen_wired_pool();
+        const std::size_t lim = mgr->wired_pool_limit();
+        const std::size_t used = mgr->wired_pool_used();
+        const std::size_t room = lim > used ? lim - used : 0;
+        // Only ever RAISED here. The budget also bounds what this model
+        // has already wired, and lowering it below `_wired_bytes` would
+        // read as an over-spend that nothing can give back.
+        //
+        // CLAMPED TO THE POOL, belt and braces. The arithmetic already
+        // gives `_wired_bytes + (lim - used) <= lim` because this
+        // model's wired bytes are part of the manager's `used` -- but
+        // that holds only while the two counters agree, and the failure
+        // mode if they ever drift is not a slow run. Wired memory is the
+        // one allocation the kernel cannot reclaim, so an over-budget
+        // here panics the box rather than degrading it. One min() is a
+        // cheap way to never find out.
+        std::size_t want = _wired_bytes + room;
+        if (want > lim) { want = lim; }
+        if (want > _wire_budget) {
+          if (_mc->session() != nullptr) {
+            _mc->session()->log_debug(fmt(
+                "MetalMiniMaxH3Transformer: retrying the wired pool -- "
+                "budget {} -> {} MB", _wire_budget >> 20, want >> 20));
+          }
+          _wire_budget = want;
+          _wire_retry  = false;
+          // The residency policy stopped growing when the budget ran
+          // out, and it cannot see that the budget moved. This is the
+          // same "the ground moved" case the AdaLN bake uses.
+          _resid.note_landscape_changed();
+        } else {
+          // The ceiling did not move after all -- the pool is full
+          // rather than the box being busy. Re-arm against the CURRENT
+          // reading so the next look asks about a fresh block's worth.
+          _wire_retry_at = now;
+        }
+      }
+    }
+    wire_fixed_(true);
+  }
   _resid.note_reserve_allocated(
       scratch_bytes(c, seq, n_text, n_t, uses_matrix_cores()));
   const auto mbudget = _mc->memory_budget();
@@ -2803,10 +3470,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // because the walk costs ~57 ms per 4.3 GB and a healthy run would pay
   // it every step to be told nothing.
   bool shortfall = false;
-  if ((_resid.count() > 0 || _pinned > 0) &&
+  if (_resid.count() > 0 &&
       _resid.self_compression_grew(mbudget.self_compressed)) {
-    std::size_t examined = 0, incore = 0;
-    resident_pages_(&examined, &incore);
+    std::size_t examined = 0, incore = 0, paged_out = 0;
+    resident_pages_(&examined, &incore, &paged_out);
     if (examined > 0 && incore < examined) {
       shortfall = true;
       std::size_t freed = _resid.note_weight_residency(
@@ -2816,15 +3483,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // Nothing left outside the pinned prefix and the pages are still
       // leaving RAM: the prefix itself is what does not fit, so give one
       // of it back rather than sit in the thrash it was meant to prevent.
-      if (freed == 0 && _pinned > 0) {
-        freed = evict_tail_block_(/*allow_pinned=*/true);
-      }
       if (_mc->session() != nullptr) {
         _mc->session()->log_normal(fmt(
             "MetalMiniMaxH3Transformer: resident weights are only {}% in "
-            "RAM -- released {} MB, now {} blocks resident",
-            (int)(100.0 * (double)incore / (double)examined), freed >> 20,
-            _resid.count() + _pinned));
+            "RAM ({} of {} sampled pages paged out, {} MB wired) -- "
+            "released {} MB, now {} blocks resident",
+            (int)(100.0 * (double)incore / (double)examined),
+            paged_out, examined, _wired_bytes >> 20, freed >> 20,
+            _resid.count()));
       }
     }
   }
@@ -2834,11 +3500,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // momentary squeeze (the AdaLN bake is the worst of them, and it ENDS
   // by handing back 13 GB) is not the last word on the whole run.
   if (!shortfall) { _resid.note_healthy_forward(); }
+  const auto p_resid = PClock::now();
   Scratch& s = _s;
   // Measure the GEMM tile for THIS sequence length, before the stream
   // opens -- the tuner needs its own command buffers, and the answer has
   // to be in hand before the first block encodes.
   tune_qmm_(seq);
+  const auto p_tune = PClock::now();
 
   Velocity out;
   out.video = _mc->make_shared_buffer((std::size_t)n_video * VPE * 2);
@@ -2983,6 +3651,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const double sp_fetch0 = sprof && _ws ? _ws->stats().streamed_fetch_ms : 0.0;
   const auto t_begin = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point mark = t_begin;
+
+  if (!_prologue_logged && _mc->session() != nullptr) {
+    _prologue_logged = true;
+    const auto p_end = PClock::now();
+    _mc->session()->log_normal(fmt(
+        "[h3-dit] first forward at {} rows: {:.0f} ms before block 0 "
+        "(scratch {:.0f}, residency+wire {:.0f}, gemm autotune {:.0f}, "
+        "rope/temb/attn setup {:.0f})", seq, p_ms(p_t0, p_end),
+        p_ms(p_t0, p_scratch), p_ms(p_scratch, p_resid),
+        p_ms(p_resid, p_tune), p_ms(p_tune, p_end)));
+  }
 
   CommandStream stream = _mc->make_command_stream();
   {
@@ -3452,7 +4131,23 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             // slots off and falls back, and it means the same thing
             // here. Falling through costs this block a second read and
             // the run its slots -- both of which beat abandoning a step.
-            if (!ok) { _slots_off = true; }
+            if (!ok) {
+              // Said here too, and not only on the synchronous path
+              // below. This is the branch that fires FIRST -- a prefetch
+              // is issued for the next block before the next block is
+              // reached -- so leaving it silent is what turns a
+              // checkpoint the slots cannot serve into an unexplained
+              // slowdown, which is the one outcome the sticky fallback
+              // was meant to avoid.
+              _slots_off = true;
+              if (_mc->session() != nullptr) {
+                _mc->session()->log_debug(fmt(
+                    "MetalMiniMaxH3Transformer: block slots cannot serve "
+                    "this checkpoint (prefetch of block {}) -- streaming "
+                    "per-block allocations, which re-read through the "
+                    "shard mapping rather than uncached", Lx));
+              }
+            }
             else { ++pf_hit; }
           } else {
             // Never the slot an outstanding read is writing into.
@@ -3708,7 +4403,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // block from disk on the next of 30-odd steps.
         if (Lx < (int)_blocks.size()) {
           const std::size_t nb = block_bytes_(*bp);
-          if (_resid.admit(_mc, nb)) {
+          // Past the wire budget there is nothing to gain: the block
+          // would be kept unprotected, the compressor would take it (it
+          // is the coldest memory in the process), and the next walk
+          // would shed a block and ratchet the ceiling over the whole
+          // resident set. Better not to hold it at all.
+          const bool wirable = !_wire_resident ||
+                               _wired_bytes + nb <= _wire_budget;
+          if (wirable && _resid.admit(_mc, nb)) {
             // Out of a SLOT the block has to be copied -- the slot is the
             // streamer's own destination and the next read needs it back.
             // A move would hand it away and leave the stream writing into
@@ -3734,15 +4436,52 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               // sized for a streaming run and blocks below this one may
               // still be unfused), so the two paths coexist.
               if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
+              // Wired LAST, after every write this block will ever get:
+              // mlock pins the pages that exist now, and interleave_gu_
+              // above replaces buffers outright.
+              if (_wire_resident) {
+                const std::size_t got =
+                    wire_block_(_blocks[(std::size_t)Lx], true);
+                _wired_bytes += got;
+                // The percentage is an UP-TO, not a reservation. When
+                // mlock refuses, the box is not going to give us the
+                // rest of it -- another process holds wired memory, or
+                // the system limit is nearer than the fraction implied
+                // -- so the pool becomes what was actually granted and
+                // growth stops here rather than continuing to admit
+                // blocks nothing can protect.
+                if (got < nb) {
+                  // Hold HERE, for the rest of this forward only. The
+                  // box has just said no, so asking again on the next
+                  // block would be one failed syscall per block -- but
+                  // the refusal may have been another process spiking,
+                  // and a run that never asks again holds a small
+                  // resident set for the rest of the schedule on the
+                  // strength of one syscall. `_wire_retry` is what makes
+                  // the next forward ask again.
+                  _wire_budget = _wired_bytes;
+                  _wire_retry  = true;
+                  _wire_retry_at = _mc->memory_budget().available_physical;
+                  if (_mc->session() != nullptr) {
+                    _mc->session()->log_debug(fmt(
+                        "MetalMiniMaxH3Transformer: the box granted {} MB "
+                        "of the wired pool and refused more; holding there "
+                        "for this forward and retrying on the next",
+                        _wired_bytes >> 20));
+                  }
+                }
+              }
               _resid.note_admitted(nb);
               if (_mc->session() != nullptr) {
                 const auto mb = _mc->memory_budget();
                 _mc->session()->log_debug(fmt(
                     "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
-                    "{} MB; {} MB idle, {} MB compressed, reserve {} MB)", Lx,
-                    _resid.count() + _pinned, c.n_layers, _resid.bytes() >> 20,
+                    "{} MB, {} MB wired; {} MB idle, {} MB compressed, "
+                    "{} MB swap, reserve {} MB)", Lx,
+                    _resid.count(), c.n_layers, _resid.bytes() >> 20,
+                    _wired_bytes >> 20,
                     mb.free_physical >> 20, mb.compressed >> 20,
-                    _resid.reserve() >> 20));
+                    mb.swap_used >> 20, _resid.reserve() >> 20));
               }
             }
           }

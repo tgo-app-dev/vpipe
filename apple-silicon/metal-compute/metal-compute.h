@@ -191,6 +191,18 @@ public:
     std::size_t self_compressed = 0;
     // This process's physical footprint, for the same query.
     std::size_t self_footprint = 0;
+    // SYSTEM-WIDE wired (unswappable) memory -- vm_statistics64's
+    // wire_count. Everything mlock'd by every process plus the kernel's
+    // own, so it is not this process's pool: it is the ceiling that pool
+    // competes for. A box already holding a lot of wired memory is one
+    // where mlock will start refusing, which is the failure the pool
+    // reports as a collapsed limit rather than as an error.
+    std::size_t wired = 0;
+    // The file cache -- external (file-backed) pages. Counted inside
+    // `available_physical` and deliberately NOT inside `free_physical`,
+    // and reported separately because the gap between those two is
+    // almost entirely this and is otherwise unexplained.
+    std::size_t file_cache = 0;
     // hw.memsize, or VPIPE_RAM_LIMIT_MB when set -- the same believed-RAM
     // figure model_memory::phys_ram() reports, so the planning phase and
     // the live check cannot disagree about the size of the box.

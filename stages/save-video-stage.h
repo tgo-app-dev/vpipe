@@ -98,6 +98,11 @@ private:
   void init_video_encoder_(const VideoStreamParams& p);
   void init_audio_encoder_(const AudioStreamParams& p);
   void open_output_and_write_header_();
+  // Record what generated this clip in the container's metadata, and
+  // ask the muxer for a form that can carry it. Called with the muxer
+  // option dict, which it may add to, immediately before the header is
+  // written -- after that the boxes are already on disk.
+  void write_provenance_(AVDictionary** mux_opts);
   bool ready_to_write_header_() const noexcept;
   void encode_and_mux_(unsigned port, AVFrame* frame);
   // Raw-PCM audio: derive the stream header from a TensorBeat's shape
@@ -170,6 +175,12 @@ private:
   // {1, sample_rate} time base. Per-run, so a relaunch restarts at 0
   // rather than writing a clip that begins minutes in.
   int64_t _audio_pts      = 0;
+  // The model that generated this clip, off whichever port said so
+  // (the video header, or the audio PCM beat's sideband). Read at
+  // header time and written into the container -- see
+  // open_output_and_write_header_(). Empty for anything vpipe did not
+  // generate, and then nothing is written.
+  std::string _model_name;
   AVFrame* _apcm_frame    = nullptr;   // reused frame_size scratch
 
   int _next_port = 0;

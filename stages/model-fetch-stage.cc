@@ -685,8 +685,65 @@ ModelFetchStage::process(RuntimeContext& ctx)
     LmdbTxn txn(*env, LmdbTxn::Mode::ReadOnly);
     auto existing = db.get(txn, reg_key);
     const bool present = existing.has_value();
+    // COPIED OUT before the abort. db.get() hands back a view into
+    // LMDB-managed memory that dies with the transaction, which is why
+    // the flag above is captured rather than the value.
+    string reg_local_path;
+    if (present) {
+      try {
+        FlexData rec = FlexData::from_binary(*existing);
+        if (rec.is_object() && rec.as_object().contains("local_path")) {
+          reg_local_path = string(
+              rec.as_object().at("local_path").as_string(""));
+        }
+      } catch (...) { /* unreadable record: fall back to local_dir */ }
+    }
     txn.abort();
-    if (present && !_overwrite_existing) {
+    // A REGISTERED KEY IS NOT THE SAME AS THE FILES BEING THERE.
+    //
+    // One repo can publish several models -- MiniMax-H3 ships its FL2VA
+    // and Ref2VA partitions from one Comfy-Org repo, pinning a different
+    // file each -- and `model_variant` is how a fetch says which. The
+    // registry key does not carry the variant unless the caller sets
+    // `model_key`, so a repo fetched once for Ref2VA satisfies this
+    // check for an FL2VA fetch, whose file was never downloaded.
+    //
+    // What that cost, MEASURED on a real prepare job: the FL2VA fetch
+    // skipped, the repo held only `minimax_h3_ref2va_bf16.safetensors`,
+    // and the quantizer -- which ranks the asked-for partition first but
+    // falls back to what is there -- quantized Ref2VA into a directory
+    // named FL2VA-8bit. The output config recorded `ref2va` faithfully,
+    // so the pack was self-consistent and WRONG, and the only symptom
+    // was generate-video refusing a Ref2VA forward with no references,
+    // three stages and one pipeline later.
+    //
+    // So when the entry pins files, the pinned files decide. Missing
+    // ones fall through to the download, which already skips what is
+    // present byte-for-byte (`skip_existing_files`).
+    std::vector<string> missing;
+    if (present && !_overwrite_existing && entry != nullptr
+        && !entry->files.empty()) {
+      // Against the REGISTERED path when there is one: a previous fetch
+      // may have used a different `base_path`, and testing the path this
+      // run would compute would then report every file missing and
+      // re-download a repo that is entirely present.
+      const fs::path where =
+          reg_local_path.empty() ? local_dir : fs::path(reg_local_path);
+      for (const string& want : entry->files) {
+        std::error_code ec;
+        if (!fs::exists(where / want, ec)) { missing.push_back(want); }
+      }
+    }
+    if (present && !_overwrite_existing && !missing.empty()) {
+      s->warn(fmt(
+          "ModelFetchStage('{}'): '{}' is registered, but {} of the {} "
+          "files this variant pins are not on disk (first: '{}'). Another "
+          "variant of the same repo was probably fetched under this key -- "
+          "set model_key to keep them apart. Fetching the missing files "
+          "rather than skipping",
+          this->id(), reg_key, missing.size(), entry->files.size(),
+          missing.front()));
+    } else if (present && !_overwrite_existing) {
       s->info(fmt(
           "ModelFetchStage('{}'): '{}' already registered; set "
           "overwrite_existing=true to refresh. Done.",

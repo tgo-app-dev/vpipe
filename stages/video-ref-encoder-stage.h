@@ -173,6 +173,8 @@ public:
   // with -- the same dirs its own sizing uses, so the declaration and
   // the estimate cannot disagree.
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will

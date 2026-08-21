@@ -2,6 +2,7 @@
 #define VPIPE_GENERATIVE_MODELS_VAE_MODEL_REGISTRY_H
 
 #include "common/flex-data.h"
+#include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 
 #include <cstdint>
@@ -355,6 +356,41 @@ public:
   virtual std::vector<ResourceClaim>
   declare_resources(const std::string& /*root*/,
                     const std::string& /*vae_dir*/) const { return {}; }
+
+  // WHICH of a family's VAEs is being asked about. A family that
+  // generates a soundtrack ships two, in two files, with two lifetimes
+  // -- they are loaded and dropped by different stages, in different
+  // phases -- so every question below has to name one.
+  enum class Role { kVideo, kAudio };
+
+  // WHERE this family's weights actually live under `root`, when that
+  // is not a directory the host can find on its own.
+  //
+  // The host resolves a VAE by looking for `vae/config.json` and falls
+  // back to `root` when there is none -- which is every Comfy-style
+  // single-file pack. `root` is then the name it releases, pools and
+  // reports a phase release for, and on a repack that is the whole
+  // repository: a 5 GB VAE crediting itself with the 39 GB DiT beside
+  // it. Naming the file here keeps every one of those operations on the
+  // bytes this decoder owns.
+  //
+  // Empty -- the default -- means "the host's answer is right", which it
+  // is for any diffusers layout.
+  virtual std::string vae_path(const std::string& /*root*/, Role /*role*/) const
+  {
+    return {};
+  }
+
+  // The same checkpoint in the TOPOLOGICAL plan's terms. See
+  // VideoModelFamily::declare_holdings and docs/MODEL-MEMORY.md; a VAE
+  // normally has no streaming form, so `floor` stays 0 and is read as
+  // `preload`. `releases` and `reclaimable` are the STAGE's policy and
+  // are stamped on afterwards.
+  virtual std::vector<StageHolding>
+  declare_holdings(const std::string& /*root*/, Role /*role*/) const
+  {
+    return {};
+  }
 
   // Directories whose weights are resident BESIDE this decode, for the
   // stage's idle-unload verdict.

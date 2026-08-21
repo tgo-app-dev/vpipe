@@ -389,7 +389,7 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
   auto arm_turned = [&](const MetalMiniMaxH3Transformer::LoraSpec* spec,
                         float to, std::vector<float>* out, int* mods) {
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0, spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, spec);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     *mods = m->lora_modules();
@@ -398,7 +398,7 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   };
   auto arm = [&](const MetalMiniMaxH3Transformer::LoraSpec* spec,
                  std::vector<float>* out, int* mods) {
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0, spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, spec);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     *mods = m->lora_modules();
@@ -551,7 +551,7 @@ TEST(minimax_h3_lora, runtime_adapter_routes_agree)
     if (steel_lora) { ::setenv("VPIPE_H3_NO_LORA_MMA", "1", 1); }
     else            { ::unsetenv("VPIPE_H3_NO_LORA_MMA"); }
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, kScale};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0, &spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, &spec);
     if (m == nullptr) { return false; }
     if (base != Route::kAuto) { m->set_gemm_route(base); }
     *mods = m->lora_modules();
@@ -576,7 +576,7 @@ TEST(minimax_h3_lora, runtime_adapter_routes_agree)
   // would agree perfectly.
   auto base_arm = [&](std::vector<float>* out) {
     ::unsetenv("VPIPE_H3_NO_LORA_MMA");
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0,
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false,
                                              nullptr);
     if (m == nullptr) { return false; }
     m->set_gemm_route(Route::kMma128);
@@ -922,7 +922,7 @@ TEST(minimax_h3_lora, runtime_adapter_survives_i8_gemm)
     MetalMiniMaxH3Transformer::Config c = cfg;
     c.i8_gemm = i8;
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, 1.0f};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, c, false, 0.0,
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, c, false,
                                              lora ? &spec : nullptr);
     if (m == nullptr) { return false; }
     // Pin the base tile: the route tuner's own vote moves the velocity by
@@ -1047,7 +1047,7 @@ TEST(minimax_h3_lora, baked_adaln_keeps_the_adapter_live)
                  std::vector<float>* out) {
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, turn_to >= 0.0f ? 0.0f
                                                                 : scale};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, 0.0,
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false,
                                              lora ? &spec : nullptr);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);

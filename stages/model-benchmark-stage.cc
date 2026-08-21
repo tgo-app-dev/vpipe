@@ -1,4 +1,5 @@
 #include "stages/model-benchmark-stage.h"
+#include "stages/model-memory.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -168,6 +169,24 @@ const StageSpec kSpec = {
   .attrs     = kAttrs,
 };
 }  // namespace
+StageMemory
+ModelBenchmarkStage::declare_memory() const
+{
+  // Declared where nothing was declared before. This stage loads a
+  // language model and held neither a claim nor a memory figure, so
+  // every peer in a graph with it sized the box as though it were not
+  // there -- which is the silent under-count the planning phase exists
+  // to prevent, and it is worse here than elsewhere because a benchmark
+  // is usually run BESIDE the thing it measures.
+  StageMemory m;
+  if (_model.empty()) { return m; }
+  const std::string dir = resolve_model_dir(session(), _model);
+  m.hold(dir, model_memory::dir_weights_bytes(dir), 0, /*releases=*/true);
+  // No streaming form is enabled on this path, and the model is held
+  // for the whole measurement.
+  return m;
+}
+
 
 const StageSpec&
 ModelBenchmarkStage::spec() const noexcept

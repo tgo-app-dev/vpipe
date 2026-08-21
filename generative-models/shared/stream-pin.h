@@ -62,6 +62,50 @@ inline std::size_t stream_physical_ram()
   return (std::size_t)mem;
 }
 
+// The LEAST a layer-streaming model holds: everything that is not a
+// layer, plus the two in-flight slots it refills into.
+//
+// `stem` is the repeating prefix WITHOUT the index -- "blocks." for a
+// DiT, "model.layers." for an LM -- and anything whose name contains
+// `exclude` is left out of the layer figure (MiniMax-H3's AdaLN, which
+// its bake retires before the first forward).
+//
+// This is a FLOOR, not a prediction: a resident set grows on top of it
+// as free memory allows and is shed when it does not. That is exactly
+// what a "will this graph fit" question wants, and it is why the number
+// belongs in the plan while the growth does not.
+inline std::size_t
+stream_floor_bytes(const MetalLlamaWeights& wts, std::string_view stem,
+                   std::string_view exclude = {})
+{
+  std::size_t trunk = 0;
+  std::vector<std::size_t> layers;
+  for (const std::string& nm : wts.tensor_names()) {
+    const auto* ti = wts.info(nm);
+    const std::size_t nb = ti != nullptr ? (std::size_t)ti->nbytes : 0;
+    if (nm.rfind(std::string(stem), 0) != 0) { trunk += nb; continue; }
+    if (!exclude.empty() &&
+        nm.find(std::string(exclude)) != std::string::npos) {
+      continue;
+    }
+    // The index runs from the end of the stem to the next '.'.
+    const std::size_t i0 = stem.size();
+    const std::size_t dot = nm.find('.', i0);
+    if (dot == std::string::npos) { trunk += nb; continue; }
+    const std::size_t idx =
+        (std::size_t)std::atol(nm.substr(i0, dot - i0).c_str());
+    if (layers.size() <= idx) { layers.resize(idx + 1, 0); }
+    layers[idx] += nb;
+  }
+  std::size_t widest = 0;
+  for (std::size_t b : layers) { if (b > widest) { widest = b; } }
+  // No layers under this stem: nothing streams, so the floor is the
+  // whole thing. Reporting trunk alone would promise a reduction that
+  // cannot happen.
+  if (widest == 0) { return 0; }
+  return trunk + 2 * widest;
+}
+
 // Given the streamed blocks' prefixes IN STREAM ORDER (each ending in the
 // separator '.', so "transformer_blocks.1." does not also match block 10) and a
 // budget FRACTION of physical RAM (e.g. 0.60 => "pinned + running <= 60% of

@@ -89,6 +89,16 @@ class MiniMaxH3TextEncoder {
   // the repository root.
   static std::string resolve_encoder_dir(const std::string& path);
 
+  // The LEAST this encoder holds when it streams its layers: everything
+  // outside `model.layers.N.` plus the two in-flight slots.
+  //
+  // Read from the checkpoint before anything loads, because that is when
+  // the planning phase asks. Without it a 48 GB encoder is counted at
+  // full size in the conditioning phase, and since that is usually the
+  // widest phase of a generation graph it decides the whole peak -- a
+  // graph whose real requirement is ~9 GB reports 58 GB and is refused.
+  static std::size_t streaming_floor_bytes(const std::string& enc_dir);
+
   // Size a Config from the encoder's `config.json` (`text_config`).
   static bool config_from_json(const std::string& enc_dir, Config& out,
                                std::string* err = nullptr);

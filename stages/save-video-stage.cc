@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-provenance.h"
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -37,6 +38,28 @@ fill_dict_from_options_(const FlexData& opts,
     string val(entry.second.get_string());
     avu.api.dict_set(out, key.c_str(), val.c_str(), 0);
   }
+}
+
+// Where the provenance string lands. Reverse-DNS, which is how
+// QuickTime's own vendor metadata is named (com.apple.quicktime.software
+// is the tag this one stands in for), under the same prefix as the macOS
+// app bundle -- see VPIPE_APP_BUNDLE_ID in apps/macos-app/CMakeLists.txt.
+// Changing it orphans the tag in every file already written.
+constexpr const char* kProvenanceKey = "com.tgous.vpipe.software";
+
+// The muxers that share movenc.c, and so the `use_metadata_tags` flag
+// below. Matched by name rather than probed: the option exists only on
+// this family, and elsewhere it is ignored SILENTLY, which would leave a
+// flag in the dict that reads as doing something and does not.
+bool
+is_mov_family_(const AVOutputFormat* f)
+{
+  if (f == nullptr || f->name == nullptr) {
+    return false;
+  }
+  const string n(f->name);
+  return n == "mp4" || n == "mov" || n == "ipod" || n == "3gp" ||
+         n == "3g2" || n == "psp" || n == "f4v" || n == "ismv";
 }
 
 }
@@ -266,6 +289,7 @@ SaveVideoStage::reset_run_state()
   _audio_pcm         = false;
   _audio_pts         = 0;
   _next_port         = 0;
+  _model_name.clear();
 }
 
 string
@@ -589,6 +613,42 @@ SaveVideoStage::ready_to_write_header_() const noexcept
 }
 
 void
+SaveVideoStage::write_provenance_(AVDictionary** mux_opts)
+{
+  // Only for a clip a model made. A plain load-video -> save-video
+  // transcode must not come out claiming vpipe authored the footage --
+  // and saying nothing also leaves the container's metadata layout
+  // exactly as it would have been.
+  if (_model_name.empty() || _ofctx == nullptr) {
+    return;
+  }
+  const string sw = provenance::software_string(_model_name);
+  _libs->avutil().api.dict_set(&_ofctx->metadata, kProvenanceKey,
+                               sw.c_str(), 0);
+  if (!is_mov_family_(_ofctx->oformat)) {
+    // Matroska needs nothing further: it carries arbitrary tag names
+    // natively. Containers that carry none drop the entry, which is
+    // the same as not having written it.
+    return;
+  }
+  // MP4 will not carry a key it does not recognise. Its default `mdir`
+  // metadata holds a fixed set of iTunes atoms and drops everything
+  // else without a word; `use_metadata_tags` switches moov/udta/meta to
+  // the QuickTime `mdta` form, whose `keys` box holds arbitrary
+  // reverse-DNS names.
+  //
+  // The obvious slot -- (c)too, "encoding tool", which is where an
+  // `encoder` tag goes and the nearest thing MP4 has to EXIF Software
+  // -- is NOT available: avformat_write_header overwrites that tag
+  // with its own Lavf<version> whatever the caller set.
+  //
+  // APPEND rather than assign, because movflags is a single string and
+  // the muxer_options config may already have put faststart in it.
+  _libs->avutil().api.dict_set(mux_opts, "movflags",
+                               "+use_metadata_tags", AV_DICT_APPEND);
+}
+
+void
 SaveVideoStage::open_output_and_write_header_()
 {
   // For non-NOFILE muxers we need to open the IO context.
@@ -607,6 +667,9 @@ SaveVideoStage::open_output_and_write_header_()
 
   AVDictionary* mux_opts = nullptr;
   fill_dict_from_options_(_muxer_options, _libs->avutil(), &mux_opts);
+  // After the config's own options, so the APPEND inside can add to a
+  // movflags the user already set rather than replacing it.
+  write_provenance_(&mux_opts);
   int rc = _libs->avformat().api.write_header(_ofctx, &mux_opts);
   _libs->avutil().api.dict_free(&mux_opts);
   if (rc < 0) {
@@ -804,6 +867,9 @@ SaveVideoStage::process(RuntimeContext& ctx)
               "VideoStreamParams header on video port",
               this->id()));
         }
+        // Before the encoder, because init_video_encoder_ takes the
+        // params SLICE and provenance is not in it.
+        if (!p->model_name.empty()) { _model_name = p->model_name; }
         init_video_encoder_(*p);
       } else if (const auto* pcm =
                      dynamic_cast<const TensorBeatPayload*>(t.get())) {
@@ -825,6 +891,12 @@ SaveVideoStage::process(RuntimeContext& ctx)
           co_return;
         }
         _audio_pcm = true;
+        // The audio port is the ONLY source of provenance when the
+        // picture is disabled, so read it here too. First non-empty
+        // wins; the two ports of one graph carry the same name.
+        if (_model_name.empty()) {
+          _model_name = provenance::model_name(pcm->sideband);
+        }
         init_audio_encoder_(ap);
         init = true;
         if (ready_to_write_header_() && !_header_written) {

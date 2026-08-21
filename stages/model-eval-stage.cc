@@ -1,4 +1,5 @@
 #include "stages/model-eval-stage.h"
+#include "stages/model-memory.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -19,6 +20,42 @@
 #include <vector>
 
 namespace vpipe {
+
+StageMemory
+ModelEvalStage::declare_memory() const
+{
+  // NOT the sum. The two models run in SEQUENCE and the first is
+  // released before the second loads -- run_one() ends with lm.reset(),
+  // "peak memory = 1 model" -- so the box only ever holds one of them,
+  // and a sum would refuse an evaluation that fits.
+  //
+  // The larger of the two, therefore, held for this stage's position.
+  // Naming each is still worth it: an evaluation whose A is also the
+  // model some other stage in the graph holds is the same bytes, and
+  // the plan should say so.
+  StageMemory m;
+  std::size_t a = 0, b = 0;
+  std::string a_dir, b_dir;
+  if (!_model_a.empty()) {
+    a_dir = resolve_model_dir(session(), _model_a);
+    a = model_memory::dir_weights_bytes(a_dir);
+  }
+  if (!_model_b.empty()) {
+    b_dir = resolve_model_dir(session(), _model_b);
+    b = model_memory::dir_weights_bytes(b_dir);
+  }
+  // Only the larger is held at once, but which one is which matters to
+  // the merge: naming the SMALLER as well, at zero, would be a lie about
+  // a checkpoint a peer may also hold. So the bigger is declared and the
+  // other is left to whoever actually holds it for longer.
+  if (a >= b) {
+    if (a > 0) { m.hold(a_dir, a, 0, /*releases=*/true); }
+  } else {
+    if (b > 0) { m.hold(b_dir, b, 0, /*releases=*/true); }
+  }
+  return m;
+}
+
 
 ModelEvalStage::ModelEvalStage(const SessionContextIntf* s,
                                std::string               id,

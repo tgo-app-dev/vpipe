@@ -26,6 +26,7 @@
 
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/status.h"
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -165,6 +166,37 @@ public:
   // back via SessionContextIntf::language(). This is the application UI
   // locale, NOT a per-stage model/ASR language hint.
   virtual Status set_language(std::string_view tag) = 0;
+
+  // ---- The wired pool ------------------------------------------
+  //
+  // The ceiling on memory this process makes UNSWAPPABLE -- model
+  // weights, the blocks a streaming transformer keeps, activation
+  // scratch. Wired pages cannot be compressed or swapped, so this is
+  // the one setting that says what the process will genuinely hold
+  // rather than what it would like to. See docs/MODEL-MEMORY.md.
+  //
+  // `mb` is an absolute figure in megabytes and REPLACES the
+  // `wired_pool_pct` share-of-the-box form; 0 restores that form. The
+  // effective limit is additionally capped by what the GPU can keep
+  // resident (recommendedMaxWorkingSetSize), so a larger number is
+  // accepted and clamped rather than refused -- read it back to see
+  // what was actually taken.
+  //
+  // MUTABLE WHILE A PIPELINE RUNS, but only UPWARDS. Lowering it mid-run
+  // would leave more wired than the new limit allows, and the only way
+  // to make that true again is to unwire buffers a model is still
+  // reading -- which on this platform also marks them purgeable
+  // volatile, i.e. reclaimable underneath their owner. So a shrink
+  // during a run is rejected with Status{3} and the limit is left
+  // unchanged; stop the pipeline to lower it. Raising it is always safe:
+  // nothing has to be given back.
+  //
+  // Status{2} when there is no model manager (a non-Apple build).
+  virtual Status set_wired_pool_mb(std::size_t mb) = 0;
+
+  // The effective limit in megabytes -- after the device cap and after
+  // any ceiling the box turned out to grant. 0 when wiring is off.
+  virtual std::size_t wired_pool_mb() const = 0;
 
   // ---- Performance profiling -----------------------------------
   //

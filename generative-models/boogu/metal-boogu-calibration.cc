@@ -296,19 +296,14 @@ collect_boogu_calibration(MetalCompute* mc, const std::string& model_root,
           dit_b >> 30, ram >> 30, stream_blocks ? "STREAM" : "PRELOAD"));
     }
   }
-  double pin_frac = stream_blocks ? 0.60 : 0.0;
-  if (const char* e = std::getenv("VPIPE_BOOGU_CALIB_PIN_FRAC")) {
-    pin_frac = std::atof(e);
-  }
   auto dit = MetalBooguTransformer::load(
-      dit_dir, mc, MetalBooguTransformer::Config{}, stream_blocks, pin_frac);
+      dit_dir, mc, MetalBooguTransformer::Config{}, stream_blocks);
   if (!dit) { return fail("boogu calib: DiT load failed: " + dit_dir); }
   dit->set_stream_stop(stop);
   if (sess && stream_blocks) {
     sess->log_debug(fmt(
-        "boogu calib: pinned {} of {} DiT blocks resident ({}% RAM budget), "
-        "streaming the rest", dit->pinned_blocks(),
-        dit->config().n_double + dit->config().n_single, (int)(pin_frac * 100)));
+        "boogu calib: streaming the block stack; the resident "
+        "set grows into free RAM as the calibration runs"));
   }
 
   const int P = dit->config().patch;

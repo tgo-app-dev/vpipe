@@ -522,3 +522,68 @@ TEST(block_residency, a_landscape_change_clears_the_ratchet)
   r.note_admitted(blk);
   EXPECT_TRUE(r.count() == grown);
 }
+
+// The probe RAMPS: doubling per healthy forward, straight back to the
+// probe on a shed.
+//
+// What the per-forward cap bounds is the commitment made before any
+// measurement of this box exists, which is a question about room rather
+// than about how many steps remain. Sizing it from the schedule -- the
+// spread this replaced -- held a nearly empty box back for no reason: a
+// 5-step run reached full residency only on its last forward, where
+// nothing could use it. Doubling makes "as much as fits, as early as
+// possible" compatible with "learn before committing".
+TEST(block_residency, the_cap_doubles_while_healthy_and_resets_on_a_shed)
+{
+  const std::size_t block = kGB;
+  const Budget roomy = box_(64 * kGB, /*free=*/48 * kGB, /*cache=*/0);
+
+  BlockResidency r;
+  r.set_reserve(kGB);
+  r.set_per_forward_cap(4);
+  EXPECT_TRUE(r.per_forward_cap() == 4);
+
+  // Forward 1 spends exactly the probe, however much room there is.
+  r.begin_forward();
+  EXPECT_TRUE(grow_(r, roomy, block, 50) == 4 * block);
+
+  // A forward that found nothing wrong doubles it -- and does so with no
+  // ceiling ever set, which is precisely the box that should open up.
+  r.begin_forward();
+  r.note_healthy_forward();
+  EXPECT_TRUE(r.per_forward_cap() == 8);
+  EXPECT_TRUE(grow_(r, roomy, block, 50) == 12 * block);
+
+  r.begin_forward();
+  r.note_healthy_forward();
+  EXPECT_TRUE(r.per_forward_cap() == 16);
+  EXPECT_TRUE(grow_(r, roomy, block, 50) == 28 * block);
+
+  // A shed drops the RATE back to one forward's worth of risk, on top of
+  // the ceiling that bounds the level. Retreat is multiplicative in both.
+  r.note_weight_residency(1000, 900,
+                          [&]() -> std::size_t { return block; });
+  EXPECT_TRUE(r.per_forward_cap() == 4);
+  EXPECT_TRUE(r.count() == 27);
+
+  // And it climbs again from the probe rather than from where it was.
+  r.begin_forward();
+  r.note_healthy_forward();
+  EXPECT_TRUE(r.per_forward_cap() == 8);
+}
+
+// A shed is not a healthy forward, so it must not ramp on the way down.
+TEST(block_residency, a_shedding_forward_does_not_double_the_cap)
+{
+  const std::size_t block = kGB;
+  BlockResidency r;
+  r.set_reserve(kGB);
+  r.set_per_forward_cap(4);
+  grow_(r, box_(64 * kGB, 48 * kGB, 0), block, 4);
+
+  r.begin_forward();
+  r.note_weight_residency(1000, 900,
+                          [&]() -> std::size_t { return block; });
+  r.note_healthy_forward();          // same forward: must be ignored
+  EXPECT_TRUE(r.per_forward_cap() == 4);
+}

@@ -73,6 +73,23 @@ public:
   // shard. Callers that want to parallelise loads need this: the
   // converter is not re-entrant, while the safetensors memcpy is.
   bool is_gguf() const noexcept;
+
+  // How much of this checkpoint is 16-byte aligned, which is what a
+  // Metal buffer offset must be for a tensor to be used where it lies.
+  //
+  // Reported at OPEN rather than only where it bites. load_mapped() has
+  // said so for a while, but only a caller asking for Residency::Mapped
+  // ever reaches it -- and the models that suffer most are the ones
+  // reading Copied, which never do. A misaligned pack costs them a copy
+  // per tensor per read with nothing in the log to connect the cost to
+  // the cause.
+  struct Alignment {
+    std::size_t tensors    = 0;
+    std::size_t misaligned = 0;
+    int         shards     = 0;
+    int         bad_shards = 0;   // shards whose data section is itself off
+  };
+  Alignment alignment() const;
   const TensorInfo* info(const std::string& name) const;
 
   // All tensor names in the checkpoint (unordered). Used by the model

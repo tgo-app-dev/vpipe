@@ -3,6 +3,7 @@
 
 #include "common/job.h"
 #include "common/session-member.h"
+#include "pipeline/memory-plan.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -34,7 +35,7 @@ class Stage;
 // `session()->thread_pool()`. Edge-buffer depth is NOT a session knob:
 // each oport's OportPolicy decides it, defaulting to soft-threshold
 // mode (warn at 1024 active Beats, throw at 2048).
-class PipelineRuntime : public SessionMember {
+class PipelineRuntime : public SessionMember, public MemoryPlanSink {
 public:
   PipelineRuntime(Pipeline*                 pipeline,
                   const SessionContextIntf* session);
@@ -139,6 +140,29 @@ private:
   // launch. Used by stop() to clear each stage's running flag once the
   // drivers have drained, so post-stop topology edits are permitted.
   std::vector<Stage*>                          _live_stages;
+
+  // ---- the topological memory plan, and its revisions ------------------
+  //
+  // Held for the launch rather than computed and dropped, because the
+  // snapshot's unknowns -- an arena sized by the first beat, a streaming
+  // model's real resident set -- are corrected by the stages as they
+  // learn them, and a correction is only worth making if something keeps
+  // the result.
+  //
+  // MemoryPlanSink::revise arrives on the revising stage's own thread
+  // while its peers are running, so all of this is under _plan_mu.
+  void revise(const Stage* stage, const StageMemory& m) override;
+  // Stop accepting revisions. Called when the launch ends.
+  void close_plan();
+  // Recompute and report if the peak moved. Caller holds _plan_mu.
+  void replan_locked_(const std::string& why);
+
+  mutable std::mutex                           _plan_mu;
+  std::vector<Stage*>                          _plan_stages;
+  std::vector<LogicalEdge>                     _plan_edges;
+  std::vector<StageMemory>                     _plan_mem;
+  MemoryPlan                                   _plan;
+  bool                                         _plan_live = false;
 
   std::vector<std::unique_ptr<OportBuffer>>    _oport_bufs;
   std::vector<std::unique_ptr<EdgeReader>>     _readers;

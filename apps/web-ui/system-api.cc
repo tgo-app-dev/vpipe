@@ -5,11 +5,20 @@
 #include "common/host-net.h"
 #include "common/i18n.h"
 #include "common/vpipe-format.h"
+// NOT under VPIPE_BUILD_APPLE_SILICON. That macro is PRIVATE to the
+// `vpipe` library target, so predicating on it here compiles the block
+// away silently in this one -- which read as a working endpoint
+// reporting zeros. services()->generative_model_manager() already
+// answers nullptr where there is no manager, so the null check IS the
+// portability check and there is nothing for an ifdef to add.
+#include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/stage.h"
 #include "vpipe/session-intf.h"
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -109,6 +118,83 @@ SystemApi::h_i18n_set_(const HttpRequest& req)
     return HttpResponse::error(400, "unsupported language '" + tag + "'");
   }
   return h_i18n_get_(req);
+}
+
+// Whether any pipeline is RUNNING, which is what decides if a shrink is
+// allowed. Asked of PipelineApi rather than of the session, because
+// SessionIntf does not publish it and this controller already holds the
+// lock its _locked query wants.
+bool
+SystemApi::any_running_() const
+{
+  bool running = false;
+  _pipelines.for_each_live_locked(
+      [&](const std::string&, const char* state, Pipeline&) {
+        if (std::string(state) != "stopped") { running = true; }
+      });
+  return running;
+}
+
+HttpResponse
+SystemApi::h_wired_pool_get_(const HttpRequest&)
+{
+  lock_guard<mutex> lk(_ctx.mu);
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  const std::size_t mb =
+      _ctx.session != nullptr ? _ctx.session->wired_pool_mb() : 0;
+  std::size_t used = 0, devmax = 0;
+  int pct = 0;
+  if (_ctx.sctx != nullptr && _ctx.sctx->services() != nullptr) {
+    if (auto* mgr = _ctx.sctx->services()->generative_model_manager()) {
+      used   = mgr->wired_pool_used() >> 20;
+      devmax = mgr->wired_pool_device_max() >> 20;
+      pct    = mgr->wired_pool_pct();
+    }
+  }
+  oo.insert("mb", FlexData::make_int((long long)mb));
+  oo.insert("used_mb", FlexData::make_int((long long)used));
+  // 0 when there is no device to ask. The browser shows it as the
+  // ceiling a larger request is clamped to, and says nothing when it is
+  // unknown rather than implying there is no cap.
+  oo.insert("device_max_mb", FlexData::make_int((long long)devmax));
+  oo.insert("pct", FlexData::make_int((long long)pct));
+  oo.insert("running", FlexData::make_bool(any_running_()));
+  return HttpResponse::json(200, o.to_json());
+}
+
+HttpResponse
+SystemApi::h_wired_pool_set_(const HttpRequest& req)
+{
+  auto body = parse_json_body(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "expected object {mb: N}");
+  }
+  auto bo = body->as_object();
+  if (!bo.contains("mb")) { return HttpResponse::error(400, "missing 'mb'"); }
+  const long long mb = bo.at("mb").as_int(-1);
+  if (mb < 0) {
+    return HttpResponse::error(400, "'mb' must be 0 or more (0 restores the "
+                                    "wired_pool_pct share of RAM)");
+  }
+  if (_ctx.session == nullptr) {
+    return HttpResponse::error(404, "session not available");
+  }
+  const Status st = _ctx.session->set_wired_pool_mb((std::size_t)mb);
+  // 3 is the shrink-while-running refusal, and it is the one a browser
+  // must be able to tell apart: nothing is wrong, the request simply has
+  // to wait for the run to stop. 409 rather than 400 says exactly that.
+  if (st.code == 3) {
+    return HttpResponse::error(409,
+        "a pipeline is running: the wired pool can be raised but not "
+        "lowered, because giving wired bytes back means unwiring buffers a "
+        "model is still reading. Stop the pipeline to lower it.");
+  }
+  if (st.code != 0) {
+    return HttpResponse::error(400, "the wired pool is not available in "
+                                    "this build");
+  }
+  return h_wired_pool_get_(req);
 }
 
 HttpResponse
@@ -213,6 +299,10 @@ SystemApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_i18n_get_(r); });
   s.route("PUT", "/api/i18n",
           [this](const HttpRequest& r) { return h_i18n_set_(r); });
+  s.route("GET", "/api/system/wired-pool",
+          [this](const HttpRequest& r) { return h_wired_pool_get_(r); });
+  s.route("PUT", "/api/system/wired-pool",
+          [this](const HttpRequest& r) { return h_wired_pool_set_(r); });
   s.route("GET", "/api/hls/streams",
           [this](const HttpRequest& r) { return h_hls_streams_(r); });
 }

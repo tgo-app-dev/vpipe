@@ -192,6 +192,20 @@ StageLifecycleAccess::set_running(Stage* s, bool running)
 }
 
 void
+Stage::revise_memory(const StageMemory& m) const
+{
+  if (MemoryPlanSink* sink = _mem_sink.load(std::memory_order_acquire)) {
+    sink->revise(this, m);
+  }
+}
+
+void
+StageLifecycleAccess::set_memory_sink(Stage* s, MemoryPlanSink* sink)
+{
+  if (s != nullptr) { s->_mem_sink.store(sink, std::memory_order_release); }
+}
+
+void
 StageLifecycleAccess::set_needs_init(Stage* s, bool needs_init)
 {
   s->_needs_init.store(needs_init, memory_order_release);

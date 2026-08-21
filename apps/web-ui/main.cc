@@ -2,7 +2,7 @@
 //
 // Usage:
 //   vpipe-web-ui [--bind ADDR] [--port N] [--config CFG]
-//                [--memory-cap-mb N]
+//                [--memory-cap-mb N] [--wired-pool-mb N]
 //
 //   --bind      interface to listen on (default: this machine's LAN
 //               address, i.e. en0's IPv4, so the UI is reachable from
@@ -12,6 +12,8 @@
 //   --config    session config string forwarded to create_session
 //               (inline JSON, a path, or empty for defaults)
 //   --memory-cap-mb  ceiling on actively-resident model weights + KV.
+//   --wired-pool-mb  ceiling on memory made unswappable (mlock'd). Also
+//                    editable at run time from the Settings panel.
 //               Over it the least-recently-used weights are PARKED
 //               (handed to the kernel as purgeable, reclaimed only
 //               under real pressure, taken back on next use) rather
@@ -162,6 +164,18 @@ print_usage_(const char* prog)
     "                 default: it cannot be nested, so it DISABLES the\n"
     "                 run_python chat tool (which sandboxes each call\n"
     "                 itself). Enable only without the python tool.\n"
+    "  --memory-cap-mb N\n"
+    "                 Ceiling on actively-resident model weights + KV.\n"
+    "                 Over it the least-recently-used weights are PARKED\n"
+    "                 (purgeable), not refused. 0/unset = uncapped.\n"
+    "  --wired-pool-mb N\n"
+    "                 Ceiling on memory made UNSWAPPABLE (mlock'd):\n"
+    "                 weights, a streaming model's resident blocks,\n"
+    "                 activation scratch. Clamped to what the GPU can\n"
+    "                 keep resident. Unset = the wired_pool_pct share of\n"
+    "                 RAM (default 75 percent), 0 = no wiring. Also\n"
+    "                 editable at run time from the Settings panel --\n"
+    "                 raisable while a pipeline runs, not lowerable.\n"
     "  --plugin PATH  Load a plugin .dylib at startup (adds stages /\n"
     "                 shaders / models). Repeatable. See docs/PLUGINS.md.\n"
     "  --tls          Serve over HTTPS with a cached self-signed cert\n"
@@ -324,6 +338,11 @@ main(int argc, char** argv)
   // the model manager is not reachable from the public SessionIntf.
   const string cap = arg_value_(argc, argv, "--memory-cap-mb", "");
   if (!cap.empty()) { ::setenv("VPIPE_MEMORY_CAP_MB", cap.c_str(), 1); }
+  // The wired pool's ceiling. Editable afterwards from the Settings
+  // panel, which is why this is only the STARTING value -- see
+  // SessionIntf::set_wired_pool_mb for what a running pipeline allows.
+  const string wired = arg_value_(argc, argv, "--wired-pool-mb", "");
+  if (!wired.empty()) { ::setenv("VPIPE_WIRED_POOL_MB", wired.c_str(), 1); }
   string cfg       = arg_value_(argc, argv, "--config", "");
   int    port      = static_cast<int>(strtol(port_str.c_str(), nullptr, 10));
 

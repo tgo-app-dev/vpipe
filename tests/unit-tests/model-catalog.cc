@@ -363,6 +363,63 @@ TEST(model_catalog, qwen38_io_modalities) {
   EXPECT_TRUE(out.size() == 1 && out[0] == "text");
 }
 
+// BOTH MiniMax-H3 partitions derive their modalities, not just FL2VA.
+//
+// The two ship from one repo and differ in what they CONSUME: FL2VA
+// takes a prompt and up to two keyframes, Ref2VA also takes video and
+// audio references. Only FL2VA was in the table, so a Ref2VA registered
+// from disk -- which is every locally quantized one -- derived nothing,
+// and a picker filtering on need_inputs hid it from the stages that
+// would use it. A fetched one was unaffected, because its catalogue
+// entry records the I/O explicitly, which is why the gap survived.
+TEST(model_catalog, both_h3_partitions_derive_their_modalities) {
+  std::vector<std::string> in, out;
+  catalog_default_io("minimax-h3-fl2va", in, out);
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_FALSE(has_(in, "video"));
+  EXPECT_TRUE(has_(out, "video") && has_(out, "audio"));
+
+  std::vector<std::string> rin, rout;
+  catalog_default_io("minimax-h3-ref2va", rin, rout);
+  EXPECT_TRUE(has_(rin, "text"));
+  EXPECT_TRUE(has_(rin, "image"));
+  EXPECT_TRUE(has_(rin, "video"));
+  EXPECT_TRUE(has_(rin, "audio"));
+  EXPECT_TRUE(has_(rout, "video") && has_(rout, "audio"));
+
+  // And the derived list matches what the CATALOGUE entry for the same
+  // partition records, so a registered model and a fetched one describe
+  // themselves identically.
+  const ModelCatalogEntry* e = nullptr;
+  for (const ModelCatalogEntry& c : model_catalog()) {
+    if (c.model_type == "minimax-h3-ref2va" && !c.inputs.empty()) {
+      e = &c;
+      break;
+    }
+  }
+  EXPECT_TRUE(e != nullptr);
+  if (e != nullptr) { EXPECT_TRUE(e->inputs == rin && e->outputs == rout); }
+}
+
+// No catalogue entry repeats a modality.
+//
+// catalog_default_io APPENDS, and a detection path that already filled
+// its I/O and then ran it again produced ["text","image","text","image"]
+// on a quantized MiniMax-H3. The compatibility filters use includes()
+// and survived it; the picker drew one badge per entry and did not.
+TEST(model_catalog, no_entry_repeats_a_modality) {
+  for (const ModelCatalogEntry& c : model_catalog()) {
+    for (const auto* list : {&c.inputs, &c.outputs}) {
+      for (std::size_t i = 0; i < list->size(); ++i) {
+        for (std::size_t j = i + 1; j < list->size(); ++j) {
+          EXPECT_FALSE((*list)[i] == (*list)[j]);
+        }
+      }
+    }
+  }
+}
+
 // The Qwen3.6 27B GGUF entry pins the main quant + mmproj + imatrix.
 TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   const ModelCatalogEntry* e =

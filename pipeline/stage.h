@@ -6,6 +6,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/service-req.h"
 #include "interfaces/session-context-intf.h"
+#include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/stage-config.h"
 #include "pipeline/stage-spec.h"
@@ -198,6 +199,47 @@ public:
   {
     return {};
   }
+
+  // What this stage costs the box, in its own terms, for the plan the
+  // runtime derives from the TOPOLOGY rather than from a phase name.
+  //
+  // Same discipline as declare_resources: DESCRIBE ONLY. It runs while
+  // the picture is being assembled, so it must not read the manager or
+  // size the box -- a stage visited first would see an empty graph.
+  //
+  // The difference is what it does NOT have to say. It states what it
+  // holds, what it holds at least, whether it lets go, what it allocates
+  // while running, and how big its outputs are. It does not say when any
+  // of that is live relative to anyone else, because the runtime works
+  // that out from the edges -- which is the part a stage cannot know:
+  // it has no idea whether it is the only DiT in the graph or the second
+  // of three.
+  //
+  // Default: nothing, which is what every stage that holds nothing
+  // durable should say.
+  virtual StageMemory declare_memory() const
+  {
+    return {};
+  }
+
+  // What this stage ACTUALLY costs, now that it is running and knows.
+  //
+  // The counterpart to declare_memory: that one is asked before anything
+  // loads, from configuration alone, so its unknowns -- an arena sized by
+  // the first beat's geometry, a streaming model's real resident set --
+  // are unknowable rather than merely unknown. This is where they are
+  // corrected, and the plan is recomputed against every peer's figures
+  // rather than only this stage's.
+  //
+  // Safe to call from process(): the sink is thread-safe, and a stage
+  // with no sink (one constructed outside a launch, which every unit
+  // test does) simply drops the revision.
+  //
+  // Report the WHOLE StageMemory, not a delta. A revision that adjusted
+  // one field would have to be merged against a snapshot the caller
+  // cannot see, and two revisions racing would interleave into a figure
+  // neither stage stated.
+  void revise_memory(const StageMemory& m) const;
 
   // CONSTANT OUTPUTS -- the beat this stage will emit on `oport` when
   // that beat is invariant for the whole run and already determined by
@@ -481,6 +523,11 @@ private:
   // Fetch the raw config value for `key` into `out`; true iff present.
   bool attr_present_(std::string_view key, FlexData& out) const;
 
+  // Set by the runtime for the span of a launch; null otherwise. Atomic
+  // because a revision comes from the stage's own thread while stop() may
+  // be clearing it from another.
+  std::atomic<MemoryPlanSink*> _mem_sink{nullptr};
+
   FlexData          _config;
   std::string       _config_error;
   std::atomic<bool> _running{false};
@@ -499,6 +546,11 @@ class StageLifecycleAccess {
 public:
   static void set_running(Stage* s, bool running);
   static void set_needs_init(Stage* s, bool needs_init);
+  // The runtime hands each stage the plan to revise into at launch, and
+  // takes it back at stop -- a stage outlives the launch it ran in, and
+  // a revision arriving after the plan is gone must not find a dangling
+  // one.
+  static void set_memory_sink(Stage* s, MemoryPlanSink* sink);
 };
 
 }

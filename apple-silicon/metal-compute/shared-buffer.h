@@ -77,7 +77,12 @@ public:
   // Wired memory toggle. Idempotent.
   //   set_wired(true)  -> mlock(page-rounded contents range) +
   //                       setPurgeableState:NonVolatile.
-  //   set_wired(false) -> munlock + setPurgeableState:Volatile.
+  //   set_wired(false) -> munlock + setPurgeableState:NonVolatile
+  //                       (i.e. back to where a live buffer sits --
+  //                       unwiring withdraws protection, it does not
+  //                       make the buffer discardable; that is
+  //                       mark_inactive()'s job and is tracked
+  //                       separately so reactivate() can restore it).
   // Returns false (with errno preserved) if mlock() failed; the
   // buffer is still usable, just not wired. The most common failure
   // is RLIMIT_MEMLOCK exhaustion -- macOS defaults to 64KB for

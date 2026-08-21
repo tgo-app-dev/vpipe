@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_BOOGU_METAL_BOOGU_TRANSFORMER_H
 #define GENERATIVE_MODELS_BOOGU_METAL_BOOGU_TRANSFORMER_H
 
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -108,12 +109,21 @@ class MetalBooguTransformer {
   // and the embedders stay resident -- they are <2% of the weights. ~2-3x
   // slower per step (weights re-read per forward).
   //
-  // `pin_frac` (streaming only): pin a LEADING prefix of blocks (double first,
-  // then single) resident so pinned + running stays within that fraction of
-  // physical RAM. 0 => pure streaming.
+  // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
+  //
+  // It was a fraction of TOTAL ram decided before the run, so it could
+  // not see the machine it landed on: not another process, not this
+  // graph's peers, not the moment a peer let go. On a tight box that is
+  // where it did most harm -- plan_streaming's own note records a 16 GB
+  // run taken from no swap at all to 11 GB resident with 3 GB of swap
+  // moving continuously, by a prefix sized exactly that way.
+  //
+  // What replaces it measures: admission against the live budget, a
+  // probe read off the room actually free, doubling while the box stays
+  // healthy, and a shed the moment the pages kept are found outside RAM.
   static std::unique_ptr<MetalBooguTransformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -121,13 +131,26 @@ class MetalBooguTransformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalBooguTransformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0);
+       const Config& cfg, bool stream_blocks = false);
 
   ~MetalBooguTransformer();
 
   // Leading blocks pinned resident in streaming mode (double + single;
   // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
   int pinned_blocks() const { return _pinned_d + _pinned_s; }
+
+  // ---- the resident set, grown by measuring -----------------------------
+  //
+  // See generative-models/shared/block-residency.h. A streamed block is
+  // KEPT after it has been used, as free memory allows, so the re-read
+  // this model pays every forward shrinks toward nothing on a box with
+  // room -- and is given back the moment the pages it kept are found
+  // outside RAM. It replaces the pinned prefix, which was a fraction of
+  // TOTAL ram decided before the run and blind to the machine.
+  void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  int resident_block_count() const { return _resid.count(); }
+  std::size_t release_resident_blocks(std::size_t bytes);
 
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
   // honored within ~one block instead of a whole forward.
@@ -318,6 +341,17 @@ class MetalBooguTransformer {
   bool _stream_blocks = false;
   int _pinned_d = 0;
   int _pinned_s = 0;
+  BlockResidency _resid;
+
+  static std::size_t qw_bytes_(const QWeight& w);
+  static std::size_t double_bytes_(const DoubleBlock& b);
+  static std::size_t single_bytes_(const Block& b);
+  void resident_pages_(std::size_t* examined, std::size_t* incore,
+                       std::size_t* paged_out = nullptr) const;
+  // SINGLE blocks first, then double. Both stacks stream, and the single
+  // stack is the tail of the forward -- giving back what runs LAST keeps
+  // what remains a contiguous prefix of the pass.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
   // Zero-copy mmap of the quantized weight tensors as read-only views aliasing
   // the retained source mmap, so the DiT's resident footprint stays reclaimable
   // under memory pressure (a 1024px VAE decode). On by default when preloading;

@@ -279,6 +279,17 @@ VisualQaStage::declare_services() const
 #endif
 }
 
+StageMemory
+VisualQaStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string dir = resolve_model_dir(session(), _hf_dir);
+  m.hold(dir, model_memory::dir_weights_bytes(dir));
+  // Held for the run, and no smaller form -- see RealtimeVqaStage.
+  return m;
+}
+
 std::vector<ResourceClaim>
 VisualQaStage::declare_resources() const
 {

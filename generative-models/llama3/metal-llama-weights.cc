@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -397,6 +399,25 @@ MetalLlamaWeights::tensor_names() const
   return names;
 }
 
+MetalLlamaWeights::Alignment
+MetalLlamaWeights::alignment() const
+{
+  Alignment a;
+  a.shards = (int)_shards.size();
+  for (const Shard& sh : _shards) {
+    if ((sh.data_start & 0xF) != 0) { ++a.bad_shards; }
+  }
+  for (const auto& kv : _tensors) {
+    const TensorInfo& ti = kv.second;
+    if (ti.shard < 0 || (std::size_t)ti.shard >= _shards.size()) { continue; }
+    ++a.tensors;
+    const std::uint64_t off =
+        _shards[(std::size_t)ti.shard].data_start + ti.offset;
+    if ((off & 0xF) != 0) { ++a.misaligned; }
+  }
+  return a;
+}
+
 bool
 MetalLlamaWeights::is_gguf() const noexcept
 {
@@ -422,8 +443,60 @@ MetalLlamaWeights::pread_into(const std::string& name, void* dst,
   const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
   if (fd < 0) { return false; }
   const std::uint64_t base = sh.data_start + ti->offset;
-  std::size_t done = 0;
   auto* out = static_cast<std::uint8_t*>(dst);
+
+  // F_NOCACHE ONLY BYPASSES THE BUFFER CACHE ON A PAGE-ALIGNED OFFSET.
+  //
+  // Unbuffered I/O has alignment requirements, and a read that does not
+  // meet them does not fail -- it silently falls back to the buffered
+  // path and fills the cache with exactly the bytes the caller asked not
+  // to keep. MEASURED, 4 GB read from one file with F_NOCACHE set: a
+  // page-aligned offset grows file-backed pages by 0 MB, the SAME read
+  // at offset+8 grows them by 1813 MB.
+  //
+  // That matters because a safetensors data section is 8 + header_len
+  // into the file, so its alignment is whatever the header length
+  // happened to be -- and every tensor inherits it. On a checkpoint
+  // whose section is off-boundary (Comfy-Org repacks, and anything an
+  // older vpipe quantizer wrote) EVERY streamed read was cached, which
+  // is where the tens of gigabytes of file cache came from that the
+  // wired pool then had to compete with.
+  //
+  // So read on page boundaries and copy the wanted bytes out. The extra
+  // memcpy runs at memory bandwidth; the cache it avoids was costing the
+  // model its resident set.
+  if (uncached && sh.fd_stream >= 0) {
+    const std::size_t page =
+        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    if (page != 0 && (base % page) != 0) {
+      // One page-aligned staging buffer per thread: the streamer calls
+      // this from a prefetch thread while the forward calls it from its
+      // own, and a per-call allocation would be a megabyte-scale malloc
+      // in the middle of every block read.
+      constexpr std::size_t kChunk = 8ull << 20;      // page multiple
+      static thread_local std::vector<std::uint8_t> stage(kChunk + 16384);
+      std::size_t done = 0;
+      std::uint64_t cur = base;
+      while (done < ti->nbytes) {
+        const std::uint64_t off = cur & ~(std::uint64_t)(page - 1);
+        const std::size_t slack = (std::size_t)(cur - off);
+        std::size_t want = kChunk - slack;
+        if (want > ti->nbytes - done) { want = ti->nbytes - done; }
+        const ssize_t n = ::pread(fd, stage.data(), slack + want,
+                                  static_cast<off_t>(off));
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n <= 0 || (std::size_t)n <= slack) { return false; }
+        const std::size_t got = (std::size_t)n - slack;
+        const std::size_t take = got < want ? got : want;
+        std::memcpy(out + done, stage.data() + slack, take);
+        done += take;
+        cur += take;
+      }
+      return true;
+    }
+  }
+
+  std::size_t done = 0;
   while (done < ti->nbytes) {
     const ssize_t n = ::pread(fd, out + done, ti->nbytes - done,
                               static_cast<off_t>(base + done));
@@ -472,6 +545,31 @@ MetalLlamaWeights::load(const std::string& name,
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
   const auto t_f0 = cost != nullptr ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
+  // An UNCACHED pread wherever the tensor is big enough to be worth the
+  // syscall, in preference to faulting it through the mapping.
+  //
+  // It is faster -- the numbers below are why the hint underneath it
+  // exists -- but the reason it is the default is what it does NOT do:
+  // a mapped read leaves the bytes in the unified buffer cache, so a
+  // model that re-reads its stack every forward grows file-backed pages
+  // without bound. On a big box that is invisible. On a 24 GB one it is
+  // the whole failure: the cache competes with the model's own
+  // activations, the compressor takes what it can, and the run swaps
+  // without making progress. Nothing here needs the pages to persist --
+  // the bytes are being copied into a buffer this process owns.
+  //
+  // The threshold is the same one the hint uses, and for the same
+  // reason: a checkpoint holds thousands of small tensors, a syscall
+  // each would cost more than the fault, and they are not what fills a
+  // cache.
+  if (ti->nbytes >= (1u << 20) &&
+      pread_into(name, buf.contents(), buf.byte_size())) {
+    if (cost != nullptr) {
+      cost->fetch_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_f0).count();
+    }
+    return buf;
+  }
   // Tell the kernel what this memcpy is about to touch. Faulting a
   // mapping one cluster at a time is what makes the mapped read slow --
   // MEASURED on an M5 at 0.69-1.09 GB/s against 6.8 GB/s for a pread of
@@ -523,6 +621,12 @@ MetalLlamaWeights::read_into(const std::string& name, void* dst,
     return false;
   }
   const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
+  // Uncached first, for the reason load() gives: these bytes are being
+  // copied into the caller's memory, so leaving a cached copy behind
+  // buys nothing and costs a 24 GB box its working set.
+  if (ti->nbytes >= (1u << 20) && pread_into(name, dst, cap)) {
+    return true;
+  }
   if (sh.base == nullptr) { return false; }
   const auto* src =
       static_cast<const std::uint8_t*>(sh.base) + sh.data_start + ti->offset;
@@ -592,7 +696,9 @@ MetalLlamaWeights::load_mapped(const std::string& name,
               "section starts at {} ({} mod 16, and a Metal buffer offset "
               "must be 16-byte aligned), so EVERY tensor in it is COPIED "
               "into anonymous memory instead. Residency::Mapped is a "
-              "no-op for this shard; size the box for the copies",
+              "no-op for this shard; size the box for the copies. If "
+              "this model was quantized by an earlier version of vpipe, "
+              "re-running the quantization lays it down aligned",
               si, sh.data_start, sh.data_start & 0xF));
         } else {
           std::size_t bad = 0, all = 0;
@@ -606,7 +712,9 @@ MetalLlamaWeights::load_mapped(const std::string& name,
               "data section is 16-byte aligned but {} of its {} tensors "
               "are not, so those are COPIED into anonymous memory. A "
               "tensor whose SIZE is not a multiple of 16 shifts every "
-              "tensor after it; writing those last is what avoids it",
+              "tensor after it; writing those last is what avoids it. If "
+              "this model was quantized by an earlier version of vpipe, "
+              "re-running the quantization does exactly that",
               si, bad, all));
         }
       }

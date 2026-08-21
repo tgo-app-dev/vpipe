@@ -346,6 +346,85 @@ TEST(model_memory, a_declared_model_counts_before_it_loads)
   fs::remove_all(root, ec);
 }
 
+// A claim on a directory that CONTAINS another claim is counted ONCE.
+//
+// dir_weights_bytes() is recursive but the manager keys declarations by
+// exact path, so a stage claiming a repo ROOT and a peer claiming the
+// DiT inside it described the same bytes twice. MEASURED on a Comfy-Org
+// MiniMax-H3 repack: 230781 MB declared against a true 118452 MB, which
+// every peer then sized itself against.
+TEST(model_memory, a_claim_inside_another_claim_counts_once)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-nested-test";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  // The repack shape: components in siblings, no weights at the root.
+  put("diffusion_models/dit.safetensors", 6000);
+  put("text_encoders/enc.safetensors", 3000);
+  put("vae/vae.safetensors", 1000);
+
+  const std::string r   = root.string();
+  const std::string dit = (root / "diffusion_models").string();
+  const std::string enc = (root / "text_encoders").string();
+
+  // The root's own recursive scan already IS the sum of the three.
+  EXPECT_TRUE(model_memory::dir_weights_bytes(r) == 10000u);
+
+  mgr->declare_weights(r, model_memory::dir_weights_bytes(r));
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 10000u);
+
+  // Two peers naming components inside it must not add their bytes again.
+  mgr->declare_weights(dit, model_memory::dir_weights_bytes(dit));
+  mgr->declare_weights(enc, model_memory::dir_weights_bytes(enc));
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 10000u);
+
+  // The inner claim is the one kept, so a PHASE on it still applies --
+  // folding it into an unphased root would hold the encoder through a
+  // denoise it is not resident for.
+  mgr->set_declaration_phase(enc,
+                             std::string(model_memory::kPhaseCondition));
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDenoise)) == 7000u);
+
+  // Nested three deep -- root, component dir, and the file named inside
+  // it, all legal claims on a repack. The file's bytes are inside the
+  // component, which is inside the root, so subtracting it from BOTH
+  // would report less than the checkpoint weighs.
+  const std::string dit_file =
+      (root / "diffusion_models" / "dit.safetensors").string();
+  mgr->declare_weights(dit_file, model_memory::dir_weights_bytes(dit_file));
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 10000u);
+
+  // A sibling that merely shares a prefix is NOT inside it.
+  const fs::path other = fs::temp_directory_path() /
+                         "vpipe-mm-nested-test-sibling";
+  fs::remove_all(other, ec);
+  fs::create_directories(other, ec);
+  {
+    std::ofstream f(other / "w.safetensors", std::ios::binary);
+    std::string blob(500, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  mgr->declare_weights(other.string(),
+                       model_memory::dir_weights_bytes(other.string()));
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 10500u);
+
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+  fs::remove_all(other, ec);
+}
+
 // The declaration is an upper bound while a load is in flight, and the
 // real bytes win once they exceed it. A peer 30% through loading a big
 // checkpoint genuinely holds 30% of it -- sizing against that number
@@ -1289,4 +1368,256 @@ TEST(model_memory, the_idle_rule_follows_the_beat_both_ways)
   // An unknown box never churns: whatever was in force stays.
   EXPECT_TRUE(model_memory::resolve_idle_unload(0, peers, 9000, true));
   EXPECT_TRUE(!model_memory::resolve_idle_unload(0, peers, 9000, false));
+}
+
+// THE REMOVABLE POOL, which outlives a launch.
+//
+// A checkpoint a stage is finished with is kept alive and purgeable
+// rather than dropped, so a relaunch over the same model pays no reload
+// -- and under pressure it goes first, because it is spare capacity by
+// construction where a live model's weights are not.
+// THE LIMIT IS A COMPOSITION, and each layer has to be able to bind.
+//
+// ask (absolute, or pct% of RAM) -> capped by what the GPU can keep
+// resident -> capped by whatever the box turned out to grant. Reported
+// as one number, which is why the pieces are worth pinning separately:
+// a run that streams because its pool is small has no other way to say
+// WHICH of the three decided that.
+TEST(model_memory, the_wired_pool_limit_composes_ask_and_device_cap)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+
+  // The absolute form REPLACES the percentage rather than combining
+  // with it, so a tiny ask wins over a large share of a large box.
+  mgr->set_wired_pool_pct(75);
+  mgr->set_wired_pool_bytes(64ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_bytes() == (64ull << 20));
+  EXPECT_TRUE(mgr->wired_pool_limit() == (64ull << 20));
+
+  // ...and setting the percentage clears it again, so which one is in
+  // force never depends on the order they were set in.
+  mgr->set_wired_pool_pct(50);
+  EXPECT_TRUE(mgr->wired_pool_bytes() == 0u);
+  EXPECT_TRUE(mgr->wired_pool_limit() > (64ull << 20));
+
+  // 0 turns wiring off outright -- a setting, not a failure.
+  mgr->set_wired_pool_pct(0);
+  EXPECT_TRUE(mgr->wired_pool_limit() == 0u);
+
+  // THE DEVICE CAP. An ask far above what the GPU can keep resident is
+  // clamped rather than attempted: wiring past that point does not buy
+  // residency, it buys a working set the driver pages against. Skipped
+  // where there is no device to ask, which is every headless build.
+  const std::size_t devmax = mgr->wired_pool_device_max();
+  if (devmax > 0) {
+    mgr->set_wired_pool_bytes(devmax * 4);
+    EXPECT_TRUE(mgr->wired_pool_limit() == devmax);
+    // And an ask BELOW the cap is left alone -- the cap is a ceiling,
+    // not a target.
+    mgr->set_wired_pool_bytes(devmax / 2);
+    EXPECT_TRUE(mgr->wired_pool_limit() == devmax / 2);
+  }
+  mgr->set_wired_pool_pct(0);
+}
+
+// THE POOL IS A HARD CEILING, AND THE RETRY MUST NOT LIFT IT.
+//
+// Wired memory is the one allocation the kernel cannot take back, so an
+// accounting bug here does not degrade throughput -- it panics the box.
+// reopen_wired_pool() exists so a momentarily busy machine gets asked
+// again, and the thing to prove about it is that it restores the
+// CONFIGURED ask and nothing more.
+TEST(model_memory, reopening_the_wired_pool_never_lifts_the_ceiling)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  // Small enough to sit under RLIMIT_MEMLOCK on any box, and under the
+  // device maximum so the ask is what binds.
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  const std::size_t lim0 = mgr->wired_pool_limit();
+  EXPECT_TRUE(lim0 == kAsk);
+
+  // Fill it. Each buffer is charged, and the total never passes the ask.
+  std::vector<metal_compute::SharedBuffer> held;
+  for (int i = 0; i < 16; ++i) {
+    auto b = mc->make_shared_buffer(1ull << 20);
+    if (b.empty()) { break; }
+    mgr->wire_into_pool(b);
+    held.push_back(std::move(b));
+    EXPECT_TRUE(mgr->wired_pool_used() <= mgr->wired_pool_limit());
+  }
+  const std::size_t used = mgr->wired_pool_used();
+  EXPECT_TRUE(used <= kAsk);
+
+  // Whatever happened above -- the pool filling, or the box refusing and
+  // collapsing the ceiling to what it granted -- reopening restores the
+  // ASK and never more than it.
+  mgr->reopen_wired_pool();
+  EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+  EXPECT_TRUE(mgr->wired_pool_used() == used);   // reopen wires nothing
+
+  // And the gate still holds afterwards: nothing may be taken past the
+  // ceiling, which is what stops a retry loop from growing without
+  // bound.
+  const std::size_t room = kAsk > used ? kAsk - used : 0;
+  EXPECT_FALSE(mgr->wired_pool_can_take(room + (1ull << 20)));
+
+  // Repeated reopens are idempotent -- a per-forward retry on a box that
+  // never frees anything must not accumulate.
+  for (int i = 0; i < 8; ++i) {
+    mgr->reopen_wired_pool();
+    EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+    EXPECT_TRUE(mgr->wired_pool_used() == used);
+  }
+
+  for (auto& b : held) { mgr->unwire_from_pool(b); }
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
+}
+
+// The device maximum outranks the ask, and reopening does not escape it
+// either. Wiring past what the GPU can keep resident is the case that
+// takes the machine down rather than merely slowing it.
+TEST(model_memory, reopening_still_respects_the_device_cap)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const std::size_t devmax = mgr->wired_pool_device_max();
+  if (devmax == 0) { return; }              // no device to ask
+
+  mgr->set_wired_pool_bytes(devmax * 4);
+  EXPECT_TRUE(mgr->wired_pool_limit() == devmax);
+  mgr->reopen_wired_pool();
+  EXPECT_TRUE(mgr->wired_pool_limit() == devmax);
+  EXPECT_FALSE(mgr->wired_pool_can_take(devmax + 1));
+  mgr->set_wired_pool_pct(0);
+}
+
+TEST(model_memory, a_pooled_checkpoint_survives_its_last_model)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-pool-test";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+  {
+    std::ofstream f(root / "w.safetensors", std::ios::binary);
+    // A minimal safetensors: 8-byte header length, then the header.
+    const std::string hdr = "{\"__metadata__\":{}}";
+    std::uint64_t n = hdr.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+  }
+  const std::string dir = root.string();
+
+  auto ws = mgr->weight_set(dir);
+  if (!ws) { fs::remove_all(root, ec); return; }
+  const genai::WeightSet* raw = ws.get();
+
+  // Released to the pool, then dropped by its last holder. Without the
+  // pool's strong reference the set would be gone here.
+  mgr->pool_weights(dir);
+  ws.reset();
+  auto again = mgr->weight_set(dir);
+  EXPECT_TRUE(again != nullptr);
+  EXPECT_TRUE(again.get() == raw);        // the SAME set, not a reopen
+
+  // And taking it back removes it from the pool: a set in use is not
+  // spare capacity, and an eviction must not drop pages a model reads.
+  EXPECT_TRUE(mgr->pooled_bytes() == 0u);
+
+  fs::remove_all(root, ec);
+}
+
+// A set specialised to a run's parameters is DROPPED rather than pooled:
+// handing it to a launch that does not share them would give that launch
+// weights which are silently wrong for it.
+TEST(model_memory, an_unrecyclable_checkpoint_is_not_pooled)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-pool-norecycle";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+  {
+    std::ofstream f(root / "w.safetensors", std::ios::binary);
+    const std::string hdr = "{\"__metadata__\":{}}";
+    std::uint64_t n = hdr.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+  }
+  const std::string dir = root.string();
+
+  auto ws = mgr->weight_set(dir);
+  if (!ws) { fs::remove_all(root, ec); return; }
+  EXPECT_TRUE(ws->recyclable());          // a plain checkpoint is
+  ws->set_not_recyclable("AdaLN baked for a 5-step schedule");
+  EXPECT_TRUE(!ws->recyclable());
+  EXPECT_TRUE(!ws->unrecyclable_reason().empty());
+
+  mgr->pool_weights(dir);
+  EXPECT_TRUE(mgr->pooled_bytes() == 0u);   // refused, not pooled
+  fs::remove_all(root, ec);
+}
+
+// POOLING AFTER THE LAST HOLDER LET GO DOES NOTHING, and does not say so.
+//
+// pool_weights() finds the set through a WEAK reference, so a caller that
+// drops its model first has nothing left to pool -- the call returns
+// having done neither the pooling nor the "not recyclable" report. This
+// shipped once: generate-video reset its DiT and then pooled, and the
+// silence looked exactly like a checkpoint the pool had refused.
+TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-pool-order";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+  {
+    std::ofstream f(root / "w.safetensors", std::ios::binary);
+    const std::string hdr = "{\"__metadata__\":{}}";
+    std::uint64_t n = hdr.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+  }
+  const std::string dir = root.string();
+
+  // WRONG ORDER: drop, then pool. Nothing is pooled.
+  {
+    auto ws = mgr->weight_set(dir);
+    if (!ws) { fs::remove_all(root, ec); return; }
+    ws.reset();
+    mgr->pool_weights(dir);
+    EXPECT_TRUE(mgr->pooled_bytes() == 0u);
+  }
+  // RIGHT ORDER: pool while it is still held, then drop.
+  {
+    auto ws = mgr->weight_set(dir);
+    if (!ws) { fs::remove_all(root, ec); return; }
+    const genai::WeightSet* raw = ws.get();
+    mgr->pool_weights(dir);
+    ws.reset();
+    auto again = mgr->weight_set(dir);
+    EXPECT_TRUE(again != nullptr);
+    EXPECT_TRUE(again.get() == raw);   // recycled, not reopened
+  }
+  fs::remove_all(root, ec);
 }

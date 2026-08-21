@@ -40,6 +40,7 @@ set(LOCAL_TEST_SOURCES
   session-sandbox.cc
   model-catalog.cc
   block-residency.cc
+  memory-plan.cc
   model-memory.cc
   model-register-stage.cc
   model-remove-stage.cc

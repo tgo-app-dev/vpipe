@@ -8,6 +8,7 @@ set(LOCAL_SOURCES
   pipeline-runtime.cc
   pipeline-spec.cc
   pipeline.cc
+  memory-plan.cc
   resource-plan.cc
   stage-config.cc
   stage-registry.cc

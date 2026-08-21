@@ -318,17 +318,14 @@ MetalFlux2Transformer::~MetalFlux2Transformer() = default;
 
 std::unique_ptr<MetalFlux2Transformer>
 MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
-              pin_frac);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
 }
 
 std::unique_ptr<MetalFlux2Transformer>
 MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks,
-                            double pin_frac)
+                            const Config& cfg, bool stream_blocks)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -699,45 +696,12 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       }
       return nullptr;
     }
-    // Pinned-prefix: pin as many LEADING blocks as fit in pin_frac of RAM, in
-    // stream order (double blocks first, then single). Greedy over the actual
-    // per-block bytes (double blocks are larger). Loaded from `wts` before it is
-    // read from the weight set; the pinned buffers stay resident.
-    if (pin_frac > 0.0) {
-      std::vector<std::string> prefixes;
-      prefixes.reserve((std::size_t)(m->_cfg.n_double + m->_cfg.n_single));
-      for (int i = 0; i < m->_cfg.n_double; ++i) {
-        prefixes.push_back("transformer_blocks." + std::to_string(i) + ".");
-      }
-      for (int i = 0; i < m->_cfg.n_single; ++i) {
-        prefixes.push_back("single_transformer_blocks." + std::to_string(i) +
-                           ".");
-      }
-      int pin = stream_pin_count(ws.src(), prefixes, pin_frac);
-      if (pin > (int)prefixes.size()) { pin = (int)prefixes.size(); }
-      m->_pinned_d = pin < m->_cfg.n_double ? pin : m->_cfg.n_double;
-      m->_pinned_s = pin - m->_pinned_d;
-      // Sized to the FULL depth even though only the pinned prefix is
-      // filled: the empty slots are where forward() promotes streamed
-      // blocks as free memory allows (see set_residency_reserve). An
-      // unfilled slot reads as empty, which is what `held` tests.
-      m->_double.resize((std::size_t)m->_cfg.n_double);
-      for (int i = 0; i < m->_pinned_d; ++i) {
-        if (!m->load_double_(ws,
-                "transformer_blocks." + std::to_string(i) + ".",
-                m->_double[(std::size_t)i], r)) {
-          return nullptr;
-        }
-      }
-      m->_single.resize((std::size_t)m->_cfg.n_single);
-      for (int i = 0; i < m->_pinned_s; ++i) {
-        if (!m->load_single_(ws,
-                "single_transformer_blocks." + std::to_string(i) + ".",
-                m->_single[(std::size_t)i], r)) {
-          return nullptr;
-        }
-      }
-    }
+    // Streaming preloads NOTHING. Both stacks are sized to FULL depth
+    // all the same: the empty slots are where forward() promotes
+    // streamed blocks as free memory allows (see set_residency_reserve).
+    // An unfilled slot reads as empty, which is what `held` tests.
+    m->_double.resize((std::size_t)m->_cfg.n_double);
+    m->_single.resize((std::size_t)m->_cfg.n_single);
     // Retain the source mmap so forward_dit can re-read each block on demand.
     if (mc->session() != nullptr) {
       mc->session()->info(fmt(
@@ -1008,7 +972,6 @@ MetalFlux2Transformer::evict_tail_block_(bool allow_pinned)
     const std::size_t n = single_bytes_(b);
     if (n == 0) { continue; }
     b = SingleBlock{};
-    if (i < _pinned_s) { _pinned_s = i; }
     return n;
   }
   const int dfloor = allow_pinned ? 0 : _pinned_d;
@@ -1017,7 +980,6 @@ MetalFlux2Transformer::evict_tail_block_(bool allow_pinned)
     const std::size_t n = double_bytes_(b);
     if (n == 0) { continue; }
     b = DoubleBlock{};
-    if (i < _pinned_d) { _pinned_d = i; }
     return n;
   }
   return 0;

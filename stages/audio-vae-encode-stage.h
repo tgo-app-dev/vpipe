@@ -82,6 +82,8 @@ public:
   Job initialize(RuntimeContext& ctx) override;
 
   std::vector<ResourceClaim> declare_resources() const override;
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will

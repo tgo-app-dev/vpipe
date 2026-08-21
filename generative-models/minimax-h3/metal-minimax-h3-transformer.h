@@ -238,10 +238,18 @@ class MetalMiniMaxH3Transformer {
   // projections, time MLP, refiner, norm_out heads) stay. Slower (a
   // commit+wait per block). Mirrors the Krea-2 / FLUX-2 / QIE path.
   //
-  // `pin_frac` (streaming only): when > 0, pin a LEADING prefix of blocks
-  // resident so pinned + running stays within that fraction of physical
-  // RAM. Pinned blocks are read once and reused by every forward; only
-  // the tail streams. 0 => pure streaming.
+  // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
+  //
+  // It was a fraction of TOTAL ram decided before the run, so it could
+  // not see the machine it landed on: not another process, not this
+  // graph's peers, not the moment a peer let go. On a tight box that is
+  // where it did most harm -- plan_streaming's own note records a 16 GB
+  // run taken from no swap at all to 11 GB resident with 3 GB of swap
+  // moving continuously, by a prefix sized exactly that way.
+  //
+  // What replaces it measures: admission against the live budget, a
+  // probe read off the room actually free, doubling while the box stays
+  // healthy, and a shed the moment the pages kept are found outside RAM.
   //
   // Prefer the WeightSet overload: the set is the manager's shared,
   // reference-counted view of the checkpoint. The dir overload opens a
@@ -273,12 +281,12 @@ class MetalMiniMaxH3Transformer {
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0,
+       const Config& cfg, bool stream_blocks = false,
        const LoraSpec* lora = nullptr);
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false, double pin_frac = 0.0,
+       const Config& cfg, bool stream_blocks = false,
        const LoraSpec* lora = nullptr);
 
   // How many projections carry a runtime adapter (0 = none attached).
@@ -296,7 +304,9 @@ class MetalMiniMaxH3Transformer {
 
   // Leading blocks pinned resident in streaming mode (0 = pure streaming,
   // or preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned; }
+  // Always 0 now; kept so callers that report it need not all change
+  // in one commit. Remove once nothing asks.
+  int pinned_blocks() const { return 0; }
   bool streaming() const { return _stream_blocks; }
 
   ~MetalMiniMaxH3Transformer();   // out-of-line: _ws is fwd-declared
@@ -380,6 +390,16 @@ class MetalMiniMaxH3Transformer {
   // index is simply not counted rather than guessed at.
   static std::size_t adaln_retired_bytes(const std::string& dit_dir);
 
+  // The LEAST this DiT holds when it streams its blocks: everything that
+  // is not a block, plus the two in-flight slots.
+  //
+  // Read from the checkpoint, before anything loads, because that is
+  // when the planning phase asks. The resident set grows ON TOP of this
+  // as free memory allows and is shed when it does not, so this is a
+  // floor and not a prediction -- which is exactly what a "will this
+  // graph fit" question wants.
+  static std::size_t streaming_floor_bytes(const std::string& dit_dir);
+
   // Will the bake certainly happen for a schedule of at most
   // `max_rows` rows? The bake REFUSES a schedule whose tables would
   // exceed its budget, and a refusal leaves every projection resident --
@@ -439,12 +459,14 @@ class MetalMiniMaxH3Transformer {
   // immediately reclaim it. Never touches the configured pinned prefix.
   std::size_t release_resident_blocks(std::size_t bytes);
   // Free the highest resident block; its bytes, or 0 when there is
-  // nothing left. `allow_pinned` lets it take one out of the pinned
-  // prefix (shrinking `_pinned` to match), which is only right when a
-  // measurement says that prefix is no longer in RAM.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // nothing left.
+  //
+  std::size_t evict_tail_block_();
+
+
   // Pages of the resident set examined, and how many are still in RAM.
-  void resident_pages_(std::size_t* examined, std::size_t* incore) const;
+  void resident_pages_(std::size_t* examined, std::size_t* incore,
+                       std::size_t* paged_out = nullptr) const;
 
   // Cooperative stop, polled once per BLOCK inside forward().
   //
@@ -585,6 +607,16 @@ class MetalMiniMaxH3Transformer {
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
+  // Put `nm`'s tensors into `dst`, reusing its buffers when they already
+  // fit and building them when they do not. Only the AdaLN bake wants
+  // this: it is the one reader whose tensors are all the same shape.
+  bool adaln_into_(const std::string& nm, Linear& dst);
+
+  // The per-run startup report in forward() fires once. Everything
+  // it measures -- scratch, wiring, the GEMM autotune -- is paid on
+  // the first forward and never again.
+  bool _prologue_logged = false;
+
   struct Block {
     metal_compute::SharedBuffer n1, n2;   // RMSNorm gammas
     Linear qkv, out;
@@ -597,6 +629,49 @@ class MetalMiniMaxH3Transformer {
   // per forward and dropped, so caching it would silently undo streaming
   // and put the whole stack back in RAM.
   enum class Retain { Cached, Streamed };
+
+  // Wire (mlock) or unwire every buffer of a resident block, returning
+  // the bytes whose state actually changed.
+  //
+  // A kept block is written ONCE and thereafter read only by the GPU, so
+  // it accrues no CPU reference bits and is the coldest anonymous memory
+  // in the process. MEASURED on the M4 Pro 64 GB box: a 5.9 GB resident
+  // set read 100% in-core at every admission and 0% -- paged_out on
+  // every sampled page, 9.9 GB of self_compressed -- one forward later,
+  // while 46 GB of clean file cache went untrimmed. The compressor
+  // harvests cold anonymous pages opportunistically; being cold is the
+  // whole of the problem, and wiring is the statement that these pages
+  // are not spare.
+  //
+  // Unwiring is safe on a live buffer: set_wired(false) munlocks and
+  // restores NonVolatile, so nothing becomes discardable. (It used to
+  // flip the buffer to PURGEABLE VOLATILE, which made unwiring correct
+  // only on the way to destruction -- that was a crash on mapped
+  // subviews and is fixed in SharedBuffer.) What it still costs is the
+  // protection itself, which the next allocation may not get back.
+  std::size_t wire_block_(Block& b, bool on);
+
+  // What ONE resident block weighs, from the checkpoint rather than from
+  // a Block that may not exist yet -- the residency probe is sized
+  // before the first block is admitted.
+  //
+  // AdaLN is excluded because the bake retires it: a resident block is
+  // the post-bake shape, and counting the projections would make a block
+  // read 1.6x its real cost and the probe correspondingly timid.
+  std::size_t resident_block_bytes_() const;
+
+  // Does the checkpoint still describe the Linear this SLOT was built
+  // for? Sizes are the refill's own business -- it compares against the
+  // destination and reports kFailed -- but quantized-ness and bit width
+  // are not, and they are per-LINEAR facts a mixed 4/8 pack varies from
+  // layer to layer.
+  //
+  // Getting this wrong is silent. A slot built quantized whose block is
+  // dense would refill the dense weight into the codes buffer and still
+  // dispatch the quantized kernel over it, which produces numbers rather
+  // than an error.
+  bool linear_matches_(WeightSet& ws, const std::string& nm,
+                       const Linear& l) const;
 
   // ---- the streamed block's reusable destinations --------------------
   //
@@ -700,6 +775,14 @@ class MetalMiniMaxH3Transformer {
   bool ensure_scratch_(int seq, int n_text, int n_t);
   Scratch _s;
 
+  // Every buffer of the scratch, so the wired pool can take them all
+  // without a second list that drifts from the struct above.
+  std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+
+  // Wire (or give back) the model's FIXED holdings -- the activation
+  // scratch. Charged to the shared pool like everything else.
+  std::size_t wire_fixed_(bool on);
+
   // The measured GEMM route for one projection shape at the tuned
   // sequence length. Keyed on (N, K) rather than on a name because that
   // is what gemm_ has in hand, and two projections that share a shape
@@ -786,12 +869,28 @@ class MetalMiniMaxH3Transformer {
   std::vector<float> _inv_freq;               // [rope_freq_dim], f32
   std::vector<Block> _refiner;                // 2 blocks, no AdaLN
   metal_compute::SharedBuffer _refiner_final_norm;
-  // Preloaded: all 50. Streaming: only the pinned prefix (_pinned,
-  // possibly 0); blocks L >= _pinned are read from the retained weight
+  // Preloaded: all 50. Streaming: empty at load and filled by growth as
+  // free memory allows; blocks not resident are read from the retained weight
   // set on demand in forward() and freed after use.
   std::vector<Block> _blocks;
   bool _stream_blocks = false;
-  int  _pinned = 0;
+  // Wiring the resident set, and the ceiling on it. Wired pages cannot
+  // be reclaimed AT ALL, so this is bounded by a fraction of RAM rather
+  // than by the admission gate alone: admission spends `available_
+  // physical`, which counts file cache, and cache yields to an
+  // allocation -- wired memory yields to nothing.
+  // Said once when a checkpoint needs per-tensor repair on the refill
+  // path, so a pack that pays for it every forward is visible.
+  bool        _refill_repaired = false;
+  bool        _wire_resident = false;
+  std::size_t _wired_bytes   = 0;
+  std::size_t _wire_budget   = 0;
+  // The box refused mid-forward; ask again at the next one. See the
+  // retry in forward() and GenerativeModelManager::reopen_wired_pool.
+  bool        _wire_retry    = false;
+  // available_physical when the box refused, so a retry can ask whether
+  // it has actually freed anything since rather than asking blind.
+  std::size_t _wire_retry_at = 0;
   metal_compute::SharedBuffer _final_norm;
   Linear _final_adaln, _video_out, _audio_out;
 

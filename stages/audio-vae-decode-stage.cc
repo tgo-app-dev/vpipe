@@ -1,4 +1,6 @@
 #include "stages/audio-vae-decode-stage.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/weight-set.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -8,6 +10,7 @@
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-provenance.h"
 #include "stages/model-registry.h"
 
 #include <filesystem>
@@ -170,15 +173,114 @@ AudioVaeDecodeStage::declare_resources() const
   if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
           session(), root, vae_dir,
           resolve_model(session(), _hf_dir).model_type)) {
+    // The AUDIO one. A family that generates a soundtrack ships two
+    // VAEs in two files, and declare_resources() below answers for the
+    // VIDEO decode -- so delegating to it here declared the video VAE
+    // twice, in two phases, and the audio VAE not at all. Asking by
+    // ROLE is what tells them apart.
+    const std::string a =
+        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+    if (!a.empty()) { return model_memory::weight_claims({a}); }
+    // No separate audio file: the family's single answer is the right
+    // one, which is what a checkpoint with one VAE for both means.
     return f->declare_resources(root, vae_dir);
   }
+  // UNPHASED here. The phase is decided in decide_resources() below --
+  // pass one describes and must not assert a lifetime, and a phase named
+  // here is ignored and warned about. It had been named here since this
+  // stage was written, which meant the audio VAE was never actually
+  // phase-limited: it counted as resident for the whole run, in every
+  // phase including the two decodes it is absent from.
+  //
+  // The arena and the PCM are declared by generate-video, not here:
+  // the soundtrack's length comes from that stage's frames/fps, and
+  // this one has no way to know it at plan time. Same reason the video
+  // decode arena is declared there.
   return model_memory::weight_claims({vae_dir});
+}
+
+// Pass TWO: WHEN those weights are resident.
+//
+// Only when the release is certain from config. `destroy` qualifies;
+// `auto` does not -- it resolves against a figure this claim would
+// itself change, so the stage would see the room its own phase invented
+// and conclude it need not drop the VAE after all. `park` never
+// qualifies: it hands pages over as purgeable and they are still held.
+std::vector<ResourceClaim>
+AudioVaeDecodeStage::decide_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  if (_unload_cfg != model_memory::UnloadPolicy::kDestroy) { return {}; }
+  const std::string vae = vae_dir_for_release_();
+  if (vae.empty()) { return {}; }
+  return model_memory::weight_claims_in_phase(
+      {vae}, model_memory::kPhaseDecodeAudio);
+}
+
+StageMemory
+AudioVaeDecodeStage::declare_memory() const
+{
+  StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root,
+          genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root),
+          resolve_model(session(), _hf_dir).model_type)) {
+    m.holdings = f->declare_holdings(root,
+                                     genai::VaeModelFamily::Role::kAudio);
+    if (!m.holdings.empty()) {
+      for (StageHolding& h : m.holdings) { h.releases = true; }
+      return m;
+    }
+  }
+  const std::string vae = vae_dir_for_release_();
+  m.hold(vae, model_memory::dir_weights_bytes(vae), 0, /*releases=*/true);
+  return m;
+}
+
+// The name every release, pool and phase-release in this stage uses. A
+// family that ships its audio VAE as a file beside the video one is the
+// only thing that knows where it is -- without asking, this resolved to
+// the ROOT on any pack with no `vae/config.json`, and the stage then
+// pooled and phase-released the whole repository under the audio VAE's
+// name.
+std::string
+AudioVaeDecodeStage::vae_dir_for_release_() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  const std::string h3 = genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+          session(), root, h3,
+          resolve_model(session(), _hf_dir).model_type)) {
+    const std::string a =
+        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+    if (!a.empty()) { return a; }
+  }
+  return h3;
 }
 
 void
 AudioVaeDecodeStage::unload_vae_()
 {
+  // The phase claim's other half. declare_resources() promised these
+  // bytes are gone before the peers that sized against them run; this is
+  // where that promise is kept, and reporting it is what stops the
+  // manager warning at the end of the launch that it was not.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->note_phase_released(vae_dir_for_release_());
+  }
+
   if (!_h3_vae) { return; }
+  // TO THE POOL when the policy is `auto`, and BEFORE the reset:
+  // pool_weights() finds the set through a WEAK reference, so there is
+  // nothing left to pool once this model drops its last strong one.
+  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->pool_weights(vae_dir_for_release_());
+    }
+  }
   _h3_vae.reset();
   _plugin_dec.reset();
   _unloaded = true;
@@ -315,7 +417,16 @@ AudioVaeDecodeStage::ensure_loaded_()
         cfg.latent_channels));
     return;
   }
-  _h3_vae = genai::MetalMiniMaxH3AudioVae::load(vae_dir, mc, cfg);
+  // THROUGH THE MANAGER, not the dir overload.
+  //
+  // MetalMiniMaxH3AudioVae::load(dir, ...) wraps WeightSet::open(), which
+  // builds a PRIVATE set the manager never sees -- the spelling the
+  // contract reserves for offline tools and tests. A production stage on
+  // that path gets a checkpoint nothing can account for, share, park or
+  // pool: MEASURED, this stage unloaded its VAE and pool_weights() found
+  // no such set to pool, silently, because the key was never registered.
+  _h3_vae = genai::MetalMiniMaxH3AudioVae::load(
+      genai::open_weight_set(vae_dir, session()), mc, cfg);
   if (!_h3_vae) {
     // Naming the likely cause, because the config parsed a moment ago and
     // "could not load" alone points at the path -- which by here is known
@@ -468,6 +579,10 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
           "samples", FlexData::make_int((std::int64_t)asamp));
       aout->sideband = std::move(sb);
     }
+    // Carry the generating model onto the soundtrack, the way the video
+    // twin does: a save-video whose picture port is disabled has the
+    // audio beat as its ONLY source of provenance.
+    provenance::carry_model_name(atb->sideband, aout->sideband);
     ++_clips;
     session()->info(fmt(
         "AudioVaeDecodeStage('{}'): family '{}' decoded clip #{} -- {} x {} "
@@ -563,6 +678,7 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
         "samples", FlexData::make_int((std::int64_t)samples));
     out->sideband = std::move(sb);
   }
+  provenance::carry_model_name(tbp->sideband, out->sideband);
   ++_clips;
   session()->info(fmt(
       "AudioVaeDecodeStage('{}'): decoded clip #{} -- {} latent frames -> "

@@ -22,6 +22,7 @@
 #include "stages/minimax-h3-model-config-stage.h"
 #include "stages/model-config-source.h"
 #include "stages/rgb-to-video-stage.h"
+#include "stages/model-provenance.h"
 #include "stages/trigger-beat.h"
 #include "stages/wan2-model-config-stage.h"
 
@@ -57,6 +58,8 @@ public:
   int w = 64;
   int h = 32;
   double fps = 24.0;
+  // What vae-decode carries onto a decoded frame when a model made it.
+  string model_name;
 
   Job
   process(RuntimeContext& ctx) override
@@ -74,6 +77,7 @@ public:
       sb.as_object().insert_or_assign("frames", FlexData::make_int(count));
       sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
       b->sideband = std::move(sb);
+      provenance::set_model_name(b->sideband, model_name);
       co_await ctx.write(0, std::move(b));
     }
     ctx.signal_done();
@@ -100,6 +104,7 @@ public:
   int frames = 0;
   int last_w = 0, last_h = 0, last_fmt = 0;
   int rate_num = 0, rate_den = 0;
+  string last_model;
 
   Job
   process(RuntimeContext& ctx) override
@@ -114,6 +119,7 @@ public:
       last_fmt = hp->pix_fmt;
       rate_num = hp->frame_rate.num;
       rate_den = hp->frame_rate.den;
+      last_model = hp->model_name;
     } else if (dynamic_cast<const FrameRefPayload*>(b.get()) != nullptr) {
       ++frames;
     }
@@ -303,6 +309,66 @@ TEST(rgb_to_video, header_then_one_frame_each)
   const double got = (double)sink->rate_num / (double)sink->rate_den;
   EXPECT_TRUE(got > 23.99 && got < 24.01);
   EXPECT_TRUE(cvt->frames_emitted() == 5u);
+}
+
+// The generating model rides from the frames' sideband onto the STREAM
+// HEADER. It has to change currency here: a FrameRef is a bare AVFrame
+// with no sideband, so the header is the only beat on this edge that can
+// carry it -- and it is also the one save-video reads before it writes
+// the container header. Losing it here would leave every generated clip
+// anonymous with nothing failing.
+TEST(rgb_to_video, carries_the_model_name_onto_the_header)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                      FlexData::make_object());
+  src_u->count = 2;
+  src_u->model_name = "local/Some-Video-Model-8bit";
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                            vector<InEdge>{{src, 0}},
+                                            FlexData::make_object());
+  auto* cvt = static_cast<RgbToVideoStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+  auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                       vector<InEdge>{{cvt, 0}},
+                                       FlexData::make_object());
+  auto* sink = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(sink->headers == 1);
+  EXPECT_TRUE(sink->last_model == "local/Some-Video-Model-8bit");
+
+  // A stream nobody claimed stays unclaimed: no name in, none out.
+  Session s2;
+  auto pl2 = make_unique<Pipeline>("p2", &s2);
+  auto s2_u = make_unique<RgbSource>(&s2, "src", vector<InEdge>{},
+                                     FlexData::make_object());
+  s2_u->count = 2;
+  s2_u->allocate_oports(1);
+  auto* src2 = static_cast<RgbSource*>(pl2->insert_stage(std::move(s2_u)));
+  auto cvt2_u = make_unique<RgbToVideoStage>(&s2, "cvt",
+                                             vector<InEdge>{{src2, 0}},
+                                             FlexData::make_object());
+  auto* cvt2 = static_cast<RgbToVideoStage*>(
+      pl2->insert_stage(std::move(cvt2_u)));
+  auto sink2_u = make_unique<VideoSink>(&s2, "sink",
+                                        vector<InEdge>{{cvt2, 0}},
+                                        FlexData::make_object());
+  auto* sink2 = static_cast<VideoSink*>(pl2->insert_stage(std::move(sink2_u)));
+  PipelineRuntime rt2(pl2.get(), &s2);
+  EXPECT_TRUE(rt2.launch());
+  rt2.wait_idle();
+  rt2.stop();
+  EXPECT_TRUE(sink2->headers == 1);
+  EXPECT_TRUE(sink2->last_model.empty());
 }
 
 // yuv420p has no representation for an odd dimension -- its chroma planes

@@ -167,6 +167,94 @@ MetalQwenImageTransformer::load_linear_q_(WeightSet& ws,
   return !qw.empty() && !b.empty();
 }
 
+std::size_t
+MetalQwenImageTransformer::qw_bytes_(const QWeight& w)
+{
+  return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size() +
+         w.qbias.byte_size();
+}
+
+std::size_t
+MetalQwenImageTransformer::block_bytes_(const Block& b)
+{
+  return qw_bytes_(b.img_mod_w) + qw_bytes_(b.txt_mod_w) +
+         b.img_mod_b.byte_size() + b.txt_mod_b.byte_size() +
+         qw_bytes_(b.qw) + qw_bytes_(b.kw) + qw_bytes_(b.vw) +
+         qw_bytes_(b.ow) + b.qb.byte_size() + b.kb.byte_size() +
+         b.vb.byte_size() + b.ob.byte_size() +
+         qw_bytes_(b.aqw) + qw_bytes_(b.akw) + qw_bytes_(b.avw) +
+         qw_bytes_(b.aow) + b.aqb.byte_size() + b.akb.byte_size() +
+         b.avb.byte_size() + b.aob.byte_size() +
+         b.nq.byte_size() + b.nk.byte_size() + b.naq.byte_size() +
+         b.nak.byte_size() +
+         qw_bytes_(b.img_fc1_w) + qw_bytes_(b.img_fc2_w) +
+         qw_bytes_(b.txt_fc1_w) + qw_bytes_(b.txt_fc2_w) +
+         b.img_fc1_b.byte_size() + b.img_fc2_b.byte_size() +
+         b.txt_fc1_b.byte_size() + b.txt_fc2_b.byte_size();
+}
+
+void
+MetalQwenImageTransformer::resident_pages_(std::size_t* examined,
+                                           std::size_t* incore,
+                                           std::size_t* paged_out) const
+{
+  *examined = 0;
+  *incore = 0;
+  if (paged_out != nullptr) { *paged_out = 0; }
+  // The DOMINANT buffers only. A block's bytes are almost all in the
+  // projections; walking the norms too would double the syscalls to
+  // sharpen a fraction the answer does not turn on.
+  for (const Block& b : _blocks) {
+    const metal_compute::SharedBuffer* all[] = {
+        &b.qw.w,  &b.qw.codes,  &b.kw.w,  &b.kw.codes,
+        &b.vw.w,  &b.vw.codes,  &b.ow.w,  &b.ow.codes,
+        &b.img_fc1_w.w, &b.img_fc1_w.codes,
+        &b.img_fc2_w.w, &b.img_fc2_w.codes,
+        &b.txt_fc1_w.w, &b.txt_fc1_w.codes,
+        &b.txt_fc2_w.w, &b.txt_fc2_w.codes};
+    for (const metal_compute::SharedBuffer* p : all) {
+      if (p->byte_size() == 0) { continue; }
+      const auto r = p->page_residency(64);
+      if (!r.valid) { continue; }
+      *examined += r.examined;
+      *incore += r.incore;
+      if (paged_out != nullptr) { *paged_out += r.paged_out; }
+    }
+  }
+}
+
+std::size_t
+MetalQwenImageTransformer::evict_tail_block_(bool allow_pinned)
+{
+  const int floor = allow_pinned ? 0 : _pinned;
+  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+    Block& b = _blocks[(std::size_t)i];
+    const std::size_t n = block_bytes_(b);
+    if (n == 0) { continue; }
+    b = Block{};
+    // Taking one out of the pinned prefix UN-pins it: that prefix was
+    // sized against what the box was believed to hold, and a measurement
+    // saying its pages have left RAM is that belief being wrong.
+    return n;
+  }
+  return 0;
+}
+
+std::size_t
+MetalQwenImageTransformer::release_resident_blocks(std::size_t bytes)
+{
+  const std::size_t freed =
+      _resid.release(bytes, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
+  if (freed > 0 && _mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalQwenImageTransformer: released {} MB of resident blocks "
+        "({} left)", freed >> 20, _resid.count()));
+  }
+  return freed;
+}
+
 bool
 MetalQwenImageTransformer::load_block_(WeightSet& ws, int L,
                                        Block& b, Retain r)
@@ -204,17 +292,15 @@ MetalQwenImageTransformer::load_block_(WeightSet& ws, int L,
 
 std::unique_ptr<MetalQwenImageTransformer>
 MetalQwenImageTransformer::load(const std::string& model_dir, MetalCompute* mc,
-                                const Config& cfg, bool stream_blocks,
-                                double pin_frac)
+                                const Config& cfg, bool stream_blocks)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
-              pin_frac);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
 }
 
 std::unique_ptr<MetalQwenImageTransformer>
 MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
                                 MetalCompute* mc, const Config& cfg,
-                                bool stream_blocks, double pin_frac)
+                                bool stream_blocks)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -438,23 +524,11 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
       }
     }
   } else {
-    // Pinned-prefix: pin as many LEADING blocks as fit in pin_frac of RAM;
-    // forward() reuses them and streams only the tail (blocks >= _pinned).
-    if (pin_frac > 0.0) {
-      std::vector<std::string> prefixes((std::size_t)cfg.n_layers);
-      for (int L = 0; L < cfg.n_layers; ++L) {
-        prefixes[(std::size_t)L] =
-            "transformer_blocks." + std::to_string(L) + ".";
-      }
-      m->_pinned = stream_pin_count(ws.src(), prefixes, pin_frac);
-      if (m->_pinned > cfg.n_layers) { m->_pinned = cfg.n_layers; }
-      m->_blocks.resize((std::size_t)m->_pinned);
-      for (int L = 0; L < m->_pinned; ++L) {
-        if (!m->load_block_(ws, L, m->_blocks[(std::size_t)L], r)) {
-          return nullptr;
-        }
-      }
-    }
+    // Streaming preloads NOTHING. Sized to the FULL depth all the same:
+    // the empty slots are where forward() promotes streamed blocks as
+    // free memory allows. An unfilled slot reads as empty, which is what
+    // `held` tests.
+    m->_blocks.resize((std::size_t)cfg.n_layers);
   }
   return m;
 }
@@ -1127,6 +1201,43 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     const unsigned a_nqb = (unsigned)((JT + A_BQ - 1) / A_BQ);
 
     // ---- transformer blocks ----
+    //
+    // Re-arm growth for this forward, and let the box answer back: the
+    // arithmetic that admits cannot see the limit -- it is a sum over a
+    // cache whose future it cannot read -- so what finds it is checking
+    // whether the blocks already kept are still in RAM. See
+    // BlockResidency::note_weight_residency.
+    if (_stream_blocks) {
+      const auto mbudget = _mc->memory_budget();
+      _resid.begin_forward(mbudget, [this]() -> std::size_t {
+        return evict_tail_block_();
+      });
+      bool shortfall = false;
+      if ((_resid.count() > 0 || _pinned > 0) &&
+          _resid.self_compression_grew(mbudget.self_compressed)) {
+        std::size_t examined = 0, incore = 0, paged_out = 0;
+        resident_pages_(&examined, &incore, &paged_out);
+        if (examined > 0 && incore < examined) {
+          shortfall = true;
+          std::size_t freed = _resid.note_weight_residency(
+              examined, incore, [this]() -> std::size_t {
+                return evict_tail_block_();
+              });
+          if (freed == 0 && _pinned > 0) {
+            freed = evict_tail_block_(/*allow_pinned=*/true);
+          }
+          if (_mc->session() != nullptr) {
+            _mc->session()->log_normal(fmt(
+                "MetalQwenImageTransformer: resident weights are only {}% in "
+                "RAM ({} of {} sampled pages paged out) -- released {} MB, "
+                "now {} blocks resident",
+                (int)(100.0 * (double)incore / (double)examined),
+                paged_out, examined, freed >> 20, _resid.count() + _pinned));
+          }
+        }
+      }
+      if (!shortfall) { _resid.note_healthy_forward(); }
+    }
     const int n_layers =
         (stop_after_block == -2 || stop_after_block == -5) ? 0 : _cfg.n_layers;
     // Streaming mode: commit the embedders before the first streamed block so
@@ -1166,7 +1277,11 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams
       // from the retained mmap into a loop-local Block, freed at the end of the
       // iteration (after the flush commits its work).
-      const bool streaming = _stream_blocks && L >= _pinned;
+      // Resident if it was pinned at load OR promoted by a previous
+      // pass; `_blocks` is sized to n_layers in streaming mode.
+      const bool held = L < (int)_blocks.size() &&
+                        !_blocks[(std::size_t)L].qw.empty();
+      const bool streaming = _stream_blocks && !held;
       Block streamed;
       if (streaming) {
         if (!load_block_(*_ws, L, streamed, Retain::Streamed)) { return {}; }
@@ -1306,7 +1421,27 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
 
       // Commit block L before `streamed` (its weights) frees at iteration end.
       // Pinned blocks stay resident, so no per-block flush is needed for them.
-      if (streaming) { flush(); }
+      if (streaming) {
+        flush();
+        // The flush above has RETIRED this block's GPU work, which is
+        // why the promotion happens here and not at the top of the
+        // iteration: an encoded GEMM holds these buffers by pointer.
+        // Keeping them costs nothing extra -- the bytes are already
+        // resident -- against the per-step re-read it retires.
+        if (L < (int)_blocks.size()) {
+          const std::size_t nb = block_bytes_(streamed);
+          if (_resid.admit(_mc, nb)) {
+            _blocks[(std::size_t)L] = std::move(streamed);
+            _resid.note_admitted(nb);
+            if (_mc->session() != nullptr) {
+              _mc->session()->log_debug(fmt(
+                  "MetalQwenImageTransformer: block {} resident ({} of {}, "
+                  "{} MB)", L, _resid.count() + _pinned, _cfg.n_layers,
+                  _resid.bytes() >> 20));
+            }
+          }
+        }
+      }
       if (stop_after_block == L) { break; }
     }
 

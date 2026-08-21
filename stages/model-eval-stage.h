@@ -55,6 +55,9 @@ public:
   // Test-only inspectors.
   const std::string& model_a() const noexcept { return _model_a; }
   const std::string& model_b() const noexcept { return _model_b; }
+
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
   int ppl_tokens()  const noexcept { return _ppl_tokens; }
   int arc_samples() const noexcept { return _arc_samples; }
   bool divergence() const noexcept { return _divergence; }

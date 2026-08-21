@@ -277,13 +277,11 @@ TEST(qwen_image_edit_dit, step_matches_golden)
   {
     const std::vector<float> got_pre = got;   // preloaded velocity
     m.reset();                                 // release the preloaded DiT
-    // (a) pure streaming (pin_frac = 0): one block resident, tail streamed.
+    // (a) pure streaming: one block resident, the rest read per forward.
     {
       auto ms = MetalQwenImageTransformer::load(dit_dir, mc, {},
-                                                /*stream_blocks=*/true,
-                                                /*pin_frac=*/0.0);
+                                                /*stream_blocks=*/true);
       ASSERT_TRUE(ms != nullptr);
-      EXPECT_TRUE(ms->pinned_blocks() == 0);
       SharedBuffer vs = ms->forward(h, gen_seq, t, txt_seq, gh, gw, sigma);
       ASSERT_TRUE(!vs.empty());
       const auto got_s = readback_(vs, (std::size_t)gen_seq * 64);
@@ -291,21 +289,33 @@ TEST(qwen_image_edit_dit, step_matches_golden)
       std::printf("[qwen_image_edit_dit] STREAM vs PRELOAD rel-L2 = %.3e\n", rs);
       EXPECT_TRUE(rs < 1e-5);   // bit-identical up to GPU nondeterminism
     }
-    // (b) pinned-prefix streaming (60% RAM budget): pins a leading block prefix
-    // resident and streams the rest. Pinning changes only residency, not the
-    // math, so it must ALSO be bit-identical to preload.
+    // (b) streaming WITH GROWTH: the resident set keeps blocks as free
+    // memory allows, so the SECOND forward runs partly on promoted
+    // blocks where the first streamed them.
+    //
+    // This is the arm that used to pin a prefix, and it asks a sharper
+    // question than pinning did. A pinned block was loaded by the same
+    // code path as a preloaded one; a PROMOTED block was streamed into a
+    // per-forward buffer and then kept, so if promotion moved or copied
+    // anything wrongly this is where it shows. Residency must change
+    // WHICH memory the weights are in and nothing about the math.
     {
       auto mp = MetalQwenImageTransformer::load(dit_dir, mc, {},
-                                                /*stream_blocks=*/true,
-                                                /*pin_frac=*/0.60);
+                                                /*stream_blocks=*/true);
       ASSERT_TRUE(mp != nullptr);
-      EXPECT_TRUE(mp->pinned_blocks() > 0);   // spare RAM -> some blocks pinned
+      // Growth stays off until a reserve is declared -- deliberately, so
+      // a model nobody told what its peers cost does not grow against a
+      // guess. Zero is the honest answer here: nothing else is running.
+      mp->set_residency_reserve(0);
+      SharedBuffer v1 = mp->forward(h, gen_seq, t, txt_seq, gh, gw, sigma);
+      ASSERT_TRUE(!v1.empty());
+      const int kept = mp->resident_block_count();
       SharedBuffer vp = mp->forward(h, gen_seq, t, txt_seq, gh, gw, sigma);
       ASSERT_TRUE(!vp.empty());
       const auto got_p = readback_(vp, (std::size_t)gen_seq * 64);
       const double rp = rel_l2_(got_p, got_pre.data(), got_pre.size());
-      std::printf("[qwen_image_edit_dit] STREAM+PIN(%d/%d) vs PRELOAD "
-                  "rel-L2 = %.3e\n", mp->pinned_blocks(), 60, rp);
+      std::printf("[qwen_image_edit_dit] STREAM+GROW(%d resident) vs PRELOAD "
+                  "rel-L2 = %.3e\n", kept, rp);
       EXPECT_TRUE(rp < 1e-5);
     }
   }

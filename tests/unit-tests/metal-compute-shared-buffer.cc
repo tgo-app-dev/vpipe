@@ -175,6 +175,76 @@ TEST(metal_compute_shared_buffer, set_wired_round_trip) {
   EXPECT_FALSE(buf.is_wired());
 }
 
+// UNWIRING MUST NOT MAKE THE BUFFER DISCARDABLE.
+//
+// set_wired(false) used to also flip the buffer to purgeable VOLATILE,
+// which is a state its owner never asked for and which nothing tracked
+// -- mark_inactive()/reactivate() keep their own `_inactive` flag, so a
+// buffer volatile'd this way would never be restored and a reclaim would
+// yield garbage instead of a reload.
+//
+// It was a crash, not a theory. Unwiring a streamed transformer block on
+// the way to destroying it discarded pages of a shard mapping its
+// neighbours were still reading; the block's own destructor took SIGBUS.
+// The buffer must be as usable after an unwire as before the wire.
+TEST(metal_compute_shared_buffer, unwiring_leaves_the_buffer_usable) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  SharedBuffer buf = mc->make_shared_buffer(4096);
+  auto* p = static_cast<unsigned char*>(buf.contents());
+  for (int i = 0; i < 4096; ++i) { p[i] = (unsigned char)(i & 0xff); }
+
+  if (!buf.set_wired(true)) { return; }   // RLIMIT_MEMLOCK: self-skip
+  EXPECT_TRUE(buf.set_wired(false));
+  EXPECT_FALSE(buf.is_wired());
+
+  // Readable, and still holding what was written. A volatile buffer the
+  // kernel had reclaimed would not be.
+  bool intact = true;
+  for (int i = 0; i < 4096; ++i) {
+    if (p[i] != (unsigned char)(i & 0xff)) { intact = false; break; }
+  }
+  EXPECT_TRUE(intact);
+
+  // And parking still works afterwards -- the flag it keeps was never
+  // touched by the wire/unwire round trip, so this is a real park and
+  // not a no-op on a buffer that was already volatile.
+  if (buf.mark_inactive()) {
+    EXPECT_TRUE(buf.reactivate());
+  }
+}
+
+// A SUBVIEW's contents() need not be page-aligned -- 8 bytes in is
+// exactly the shape a safetensors tensor takes inside a mapped shard,
+// and it is the shape a streaming transformer wires per block.
+//
+// A SMOKE TEST, and it is worth being clear about what it does not do:
+// mlock's extent is not observable from here, so this cannot pin the
+// locked range. It pins that the operation succeeds and leaves the view
+// readable at both ends, which is what a caller depends on.
+TEST(metal_compute_shared_buffer, wiring_an_unaligned_subview_is_safe) {
+  Session sess;
+  MetalCompute* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  SharedBuffer base = mc->make_shared_buffer(64 * 1024);
+  auto* bp = static_cast<unsigned char*>(base.contents());
+  for (int i = 0; i < 64 * 1024; ++i) { bp[i] = (unsigned char)(i & 0x7f); }
+
+  // 8 bytes in: never page-aligned, which is exactly the shape a
+  // safetensors tensor takes inside a mapped shard.
+  SharedBuffer view = base.subview(8, 4096);
+  if (view.empty()) { return; }           // no subview support: skip
+  auto* vp = static_cast<const unsigned char*>(view.contents());
+  if (!view.set_wired(true)) { return; }
+  EXPECT_TRUE(view.is_wired());
+  EXPECT_TRUE(vp[0] == (unsigned char)(8 & 0x7f));
+  // The TAIL is the part the old length left out.
+  EXPECT_TRUE(vp[4095] == (unsigned char)((8 + 4095) & 0x7f));
+  EXPECT_TRUE(view.set_wired(false));
+  EXPECT_TRUE(vp[4095] == (unsigned char)((8 + 4095) & 0x7f));
+}
+
 TEST(metal_compute_shared_buffer, destructor_unwires_automatically) {
   Session sess;
   MetalCompute* mc = get_mc_(sess);

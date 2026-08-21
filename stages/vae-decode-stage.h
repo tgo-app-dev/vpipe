@@ -91,6 +91,14 @@ private:
   std::size_t              _arena_stated  = 0;
   std::vector<std::string> _idle_peers;
 
+  // The VAE directory this stage's phase claim named, recomputed the
+  // same way declare_resources() computes it -- one expression, so the
+  // claim and its release cannot name different things.
+  std::string vae_dir_for_release_() const;
+
+  // See Stage::declare_memory.
+  StageMemory declare_memory() const override;
+
   std::string _hf_dir;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
   // "mage" (MageVAE) | "wan" (AutoencoderKLWan, the VIDEO one)
