@@ -39,7 +39,7 @@ preview panels, profiler, and reproducible model configuration.*
   Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
 
-  * 5s @ 0.5 MP 24p, 6 steps takes **~13 minutes** on a fanless
+  * 5s @ 0.5 MP 24p, 6 steps takes **~11 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
 - Runs **LTX-2.5** on an Apple Silicon Mac — a 22B model generating video
@@ -74,8 +74,8 @@ workload and settings for both runtimes:
 
 | Hardware | VPIPE | h3.c |
 | --- | ---: | ---: |
-| M4 Pro Mac mini, 64 GB RAM | **21 min 50 sec** | 27 min 40 sec |
-| Base M5 MacBook Air 15", 16 GB RAM | **12 min 15 sec** | 16 min 22 sec |
+| M4 Pro Mac mini, 64 GB RAM | **21 min 44 sec** | 27 min 40 sec |
+| Base M5 MacBook Air 15", 16 GB RAM | **11 min 25 sec** | 16 min 22 sec |
 
 These numbers are workload-specific measurements, not a universal runtime
 speed claim. [^3]
@@ -706,8 +706,9 @@ Full copyright and license texts for everything bundled or vendored are in
 [back to top](#top)
 
 VPIPE is licensed under the **Apache License, Version 2.0** — see
-[`LICENSE`](LICENSE). Bundled and vendored third-party components and their
-licenses are documented in
-[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+[`LICENSE`](LICENSE). Redistributions must also carry the attribution
+notice in [`NOTICE`](NOTICE), as Apache-2.0 section 4(d) requires.
+Bundled and vendored third-party components and their licenses are
+documented in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 Brought to you by T-Go LLC, registered in California.

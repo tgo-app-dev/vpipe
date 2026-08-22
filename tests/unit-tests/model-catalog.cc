@@ -675,6 +675,33 @@ TEST(model_catalog, hf_tree_files_parses_and_filters) {
   EXPECT_TRUE(files[1].size == 999u);
 }
 
+// The tree API is the only place the checksums come from, and they are
+// what a resumed download is checked against. A parser that quietly
+// dropped them would leave every check reporting "nothing published"
+// and passing -- which reads exactly like a check that ran.
+TEST(model_catalog, hf_tree_files_carries_the_published_checksums) {
+  const char* json = R"([
+    {"type":"file","path":"config.json","size":3366,
+     "oid":"cb3e1a878a5c4a0505e0c9967da45820b2ca6bd3"},
+    {"type":"file","path":"model.safetensors","size":135,
+     "oid":"8dca545f7a23dbc24af451db83a558c31a97ef09",
+     "lfs":{"oid":"52dc943eaf6093a2313271a7a0abc36d127b2a166","size":3034301037,
+            "pointerSize":135}}
+  ])";
+  FlexData tree = FlexData::from_json(json);
+  auto files = hf_tree_files(tree);
+  ASSERT_TRUE(files.size() == 2);
+  // A small file git stores itself: a blob id and no LFS object.
+  EXPECT_TRUE(files[0].git_oid == "cb3e1a878a5c4a0505e0c9967da45820b2ca6bd3");
+  EXPECT_TRUE(files[0].sha256.empty());
+  EXPECT_TRUE(files[0].size == 3366u);
+  // A shard: the LFS object id is the content SHA-256, and the LFS size
+  // is the real one -- the outer `size` is the pointer file's.
+  EXPECT_TRUE(files[1].sha256 == "52dc943eaf6093a2313271a7a0abc36d127b2a166");
+  EXPECT_TRUE(files[1].git_oid == "8dca545f7a23dbc24af451db83a558c31a97ef09");
+  EXPECT_TRUE(files[1].size == 3034301037ull);
+}
+
 TEST(model_catalog, hf_tree_files_non_array_is_empty) {
   FlexData obj = FlexData::make_object();
   EXPECT_TRUE(hf_tree_files(obj).empty());
@@ -833,7 +860,11 @@ TEST(model_catalog, minimax_h3_has_both_partitions) {
   for (const ModelCatalogEntry& e : model_catalog()) {
     if (e.model_type == "minimax-h3-fl2va" &&
         e.hf_path == "Comfy-Org/MiniMax-H3") { fl = &e; }
-    if (e.model_type == "minimax-h3-ref2va") { rf = &e; }
+    // The repack's, explicitly: both publishers offer this partition, so
+    // "the last one that matched" would be whichever the table lists
+    // second and the file-list claims below would follow the wrong one.
+    if (e.model_type == "minimax-h3-ref2va" &&
+        e.hf_path == "Comfy-Org/MiniMax-H3") { rf = &e; }
   }
   ASSERT_TRUE(fl != nullptr);
   ASSERT_TRUE(rf != nullptr);
@@ -876,24 +907,97 @@ TEST(model_catalog, minimax_h3_has_both_partitions) {
   EXPECT_TRUE(tok);
 }
 
-// One repo, several models: `catalog_by_path` answers with the FIRST,
-// which is the right answer only when there is one. The two places this
-// bites are MiniMax-H3 (two partitions pinning different DiT files out
-// of one Comfy-Org repo) and the supplement repo (six archives) -- and
-// on the H3 pair the first-match answer is silently wrong, because a
-// caller asking for Ref2VA gets FL2VA's file list under Ref2VA's name.
-TEST(model_catalog, several_models_can_share_one_repo) {
-  const auto h3 = catalog_all_by_path("Comfy-Org/MiniMax-H3");
-  EXPECT_TRUE(h3.size() == 2);
-  // Neither carries a `name`, so the registration key cannot tell them
-  // apart either -- the disambiguator has to be version/variant/type.
-  bool fl = false, ref = false;
-  for (const auto* e : h3) {
-    if (e->model_type == "minimax-h3-fl2va")  { fl = true; }
-    if (e->model_type == "minimax-h3-ref2va") { ref = true; }
-    EXPECT_TRUE(e->name.empty());
+// BOTH publishers offer BOTH partitions.
+//
+// Ref2VA was catalogued from the repack first, and an entry offered in
+// only one publisher's spelling reads as a partition only that publisher
+// has -- where in fact MiniMaxAI ships `FL2VA/` and `Ref2VA/` side by
+// side, each a complete pipeline. The released weights are also the
+// reference the repack is diffed against, so the one that cannot be
+// selected is the one a disagreement would be settled with.
+TEST(model_catalog, minimaxai_publishes_both_partitions_too) {
+  const ModelCatalogEntry* fl = nullptr;
+  const ModelCatalogEntry* rf = nullptr;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.hf_path != "MiniMaxAI/MiniMax-H3") { continue; }
+    if (e.model_type == "minimax-h3-fl2va")  { fl = &e; }
+    if (e.model_type == "minimax-h3-ref2va") { rf = &e; }
   }
-  EXPECT_TRUE(fl && ref);
+  ASSERT_TRUE(fl != nullptr);
+  ASSERT_TRUE(rf != nullptr);
+  EXPECT_TRUE(rf->version == "H3-Ref2VA");
+  // Reference video and audio, like the repack's Ref2VA and unlike
+  // either FL2VA -- this is what model-select and the web-ui filter on.
+  EXPECT_TRUE(has_(rf->inputs, "video"));
+  EXPECT_TRUE(has_(rf->inputs, "audio"));
+
+  // The two subtrees are MIRRORS: same names, same shard counts, one
+  // prefix apart. Asserted as a mapping rather than as a count, because
+  // what breaks a fetch is a MISSING file, and a count matches just as
+  // well when a path is wrong.
+  EXPECT_TRUE(!fl->files.empty());
+  EXPECT_TRUE(fl->files.size() == rf->files.size());
+  for (size_t i = 0; i < fl->files.size(); ++i) {
+    EXPECT_TRUE(fl->files[i].rfind("FL2VA/", 0) == 0);
+    EXPECT_TRUE(rf->files[i].rfind("Ref2VA/", 0) == 0);
+    EXPECT_TRUE(fl->files[i].substr(6) == rf->files[i].substr(7));
+  }
+  // A COMPLETE pipeline each: the DiT, the encoder and both VAEs. A
+  // partition pinning only its DiT would fetch 66 GB that cannot encode
+  // a prompt, since these are distinct paths from the other partition's
+  // rather than the same file under a shared name.
+  auto pins_ = [](const ModelCatalogEntry* e, const char* frag) {
+    for (const auto& f : e->files) {
+      if (f.find(frag) != std::string::npos) { return true; }
+    }
+    return false;
+  };
+  EXPECT_TRUE(pins_(rf, "/transformer/model-00013-of-00013.safetensors"));
+  EXPECT_TRUE(pins_(rf, "/text_encoder/model-00014-of-00014.safetensors"));
+  EXPECT_TRUE(pins_(rf, "/video_vae/source/model.safetensors"));
+  EXPECT_TRUE(pins_(rf, "/audio_vae/model.safetensors"));
+  EXPECT_TRUE(pins_(rf, "/tokenizer/tokenizer.json"));
+  // ...and NOTHING from the other partition, which is the whole point of
+  // pinning a subset of a repo that holds both.
+  EXPECT_FALSE(pins_(rf, "FL2VA/"));
+  EXPECT_FALSE(pins_(fl, "Ref2VA/"));
+
+  std::printf("[model_catalog] MiniMaxAI/MiniMax-H3 publishes both "
+              "partitions, %zu files each\n", rf->files.size());
+}
+
+// One repo, several models: `catalog_by_path` answers with the FIRST,
+// which is the right answer only when there is one. The places this
+// bites are the two MiniMax-H3 repos (each publishing both partitions,
+// pinning different DiTs out of one directory) and the supplement repo
+// (six archives) -- and on an H3 pair the first-match answer is
+// silently wrong, because a caller asking for Ref2VA gets FL2VA's file
+// list under Ref2VA's name.
+//
+// Which is why each of those entries carries a `name`: the registration
+// key is what a consumer resolves, and two records over ONE directory
+// can only be told apart by it.
+TEST(model_catalog, several_models_can_share_one_repo) {
+  for (const char* repo : {"Comfy-Org/MiniMax-H3", "MiniMaxAI/MiniMax-H3"}) {
+    const auto h3 = catalog_all_by_path(repo);
+    EXPECT_TRUE(h3.size() == 2);
+    bool fl = false, ref = false;
+    std::vector<std::string> keys;
+    for (const auto* e : h3) {
+      if (e->model_type == "minimax-h3-fl2va")  { fl = true; }
+      if (e->model_type == "minimax-h3-ref2va") { ref = true; }
+      // NAMED, and named DISTINCTLY. Empty would put both records under
+      // the repo path, where the second fetch overwrites the first and
+      // the surviving record carries one partition's model_type for
+      // both.
+      EXPECT_FALSE(e->name.empty());
+      EXPECT_TRUE(e->name != e->hf_path);
+      EXPECT_TRUE(!has_(keys, e->name));
+      keys.push_back(e->name);
+    }
+    EXPECT_TRUE(fl && ref);
+  }
+  const auto h3 = catalog_all_by_path("Comfy-Org/MiniMax-H3");
 
   // And they pin DIFFERENT files, which is why picking the wrong one is
   // a wrong download rather than a cosmetic mislabel.
@@ -914,7 +1018,7 @@ TEST(model_catalog, several_models_can_share_one_repo) {
 
   // A repo publishing exactly one model still answers with one, so the
   // fetch stage's "no ambiguity, no key needed" path stays the norm.
-  const auto one = catalog_all_by_path("MiniMaxAI/MiniMax-H3");
+  const auto one = catalog_all_by_path("Qwen/Qwen3.8-27B");
   EXPECT_TRUE(one.size() == 1);
   EXPECT_TRUE(catalog_all_by_path("no/such-repo").empty());
 

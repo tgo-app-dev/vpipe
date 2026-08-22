@@ -422,7 +422,9 @@ encode_references(const std::vector<MediaReference>& refs,
                  : Reference::Kind::kAudio;
     r.layout.push_back(L);
     if (models.progress) {
-      models.progress((int)i + 1, (int)refs.size());
+      // +1: the presentation below is a step of its own. See the
+      // declaration of ReferenceEncoders::progress.
+      models.progress((int)i + 1, (int)refs.size() + 1);
     }
   }
 
@@ -455,6 +457,13 @@ encode_references(const std::vector<MediaReference>& refs,
       return fail("the conditioner failed (" +
                   (cerr.empty() ? "unknown error" : cerr) + ")");
     }
+  }
+
+  // The presentation is done -- reported here rather than inside the
+  // `models.text` branch above, because reaching this line is what makes
+  // the request finished whether or not a conditioner was attached.
+  if (models.progress) {
+    models.progress((int)refs.size() + 1, (int)refs.size() + 1);
   }
 
   *out = std::move(r);

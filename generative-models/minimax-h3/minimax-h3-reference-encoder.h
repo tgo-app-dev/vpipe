@@ -142,7 +142,15 @@ struct ReferenceEncoders {
   MetalMiniMaxH3AudioVae* audio_vae = nullptr;
   MiniMaxH3TextEncoder*   text      = nullptr;
 
-  // Called as each reference is finished, for a progress line. Optional.
+  // Called as each reference is finished, and once more when the
+  // presentation is built. Optional.
+  //
+  // `total` is therefore refs.size() + 1, not refs.size(): the
+  // presentation is ONE conditioner call over the whole request, made
+  // AFTER the last reference has reported, so a total that stopped at
+  // the references would reach 100% and then leave the caller waiting at
+  // it. Counting it keeps that last stretch legible as unfinished work
+  // rather than as a hang.
   std::function<void(int done, int total)> progress;
 };
 

@@ -995,6 +995,9 @@ PipelineRuntime::launch_()
     // be a dangling pointer the next beat writes through.
     StageLifecycleAccess::set_memory_sink(s, this);
   }
+  // Stamped with the flag that makes the pipeline live, so the span
+  // stop() reports is exactly the span _running is true for.
+  _started = std::chrono::steady_clock::now();
   _running.store(true, memory_order_release);
   _drivers.reserve(stages.size());
   for (size_t i = 0; i < stages.size(); ++i) {
@@ -1044,7 +1047,11 @@ PipelineRuntime::stop()
     buf->close();
   }
   wait_idle();
-  _running.store(false, memory_order_release);
+  // EXCHANGED, not stored: this is also the test for whether there is
+  // anything to report. stop() is reachable on a runtime that never
+  // launched, and again from the destructor after an explicit stop, and
+  // neither of those is a run that ended.
+  const bool was_running = _running.exchange(false, memory_order_acq_rel);
   // Drivers have drained: the stages are quiescent and safe to rewire
   // again, so drop the running flag we set at launch.
   for (Stage* s : _live_stages) {
@@ -1052,6 +1059,24 @@ PipelineRuntime::stop()
     StageLifecycleAccess::set_memory_sink(s, nullptr);
   }
   close_plan();
+  // HOW LONG IT RAN, at INFO and once per launch.
+  //
+  // Launch to stop, which is wall clock and includes any pause: what
+  // this answers is "how long has this been up", and a paused pipeline
+  // is still up, still holding its models and still occupying the box.
+  // The stages' own throughput figures are the place a caller asks how
+  // much of that time was spent working.
+  //
+  // Last in stop(), after the drivers are drained and the plan closed,
+  // so it reads as the end of the run rather than as one more step in
+  // it.
+  if (was_running) {
+    const std::chrono::duration<double> ran =
+        std::chrono::steady_clock::now() - _started;
+    session()->info(fmt(
+        "PipelineRuntime: pipeline '{}' ran for {}",
+        _pipeline->id(), human_duration(ran.count())));
+  }
 }
 
 // Spin until every driver coroutine is officially at final_suspend.

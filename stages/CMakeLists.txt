@@ -47,6 +47,8 @@ set(LOCAL_SOURCES
   passthrough-stage.cc
   qwen-asr-tokenizer.cc
   rest-client-stage.cc
+  resumable-fetch.cc
+  xet-fetch.cc
   save-text-stage.cc
   shell-stage.cc
   text-input-stage.cc

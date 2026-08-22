@@ -72,7 +72,8 @@ picking a pre-quantized checkpoint for a first example: the heavier docs here
 converting tens of gigabytes, and this one just downloads.
 
 `skip_existing_files` is on, so `Ctrl-C` and re-run picks up where it left
-off rather than starting the download again.
+off rather than starting the download again — including partway through a
+shard, which resumes from the byte it stopped at.
 
 What lands under `models/` is ~7.7 GB: two safetensors shards, the tokenizer,
 and an `optiq/` subdirectory that the recursive repo listing brings along —

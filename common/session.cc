@@ -265,10 +265,15 @@ parse_wired_pool_config(const FlexData& config)
 // behind it, and the accounting is not yet complete: a component that
 // can stream but does not declare its floor is counted at full size, so
 // a graph that fits is reported as one that cannot. MEASURED on the bf16
-// MiniMax-H3 graph, which runs on a 64 GB box: the DiT declares a 3 GB
-// floor against 63 GB, the 48 GB text encoder declares none, and the
-// plan concludes 58 GB against a 49 GB pool -- a refusal that would have
-// blocked a working run.
+// MiniMax-H3 graph, which runs on a 64 GB box: a floor query that missed
+// the released checkpoint's layer naming credited its 63624 MB text
+// encoder with no floor, and the conditioning phase came out at 64201 MB
+// -- a refusal that would have blocked a run which then completed,
+// streaming that encoder a layer at a time.
+//
+// It also refuses at the POOL rather than at RAM, which is stricter than
+// the default reporting: over the pool is pageable, over the box is not.
+// Asking for the veto is asking for the stricter of the two.
 //
 // So the numbers ship first and the veto follows once every streamable
 // component states its floor. Turn it on to get the deterministic

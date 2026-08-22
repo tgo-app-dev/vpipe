@@ -14,6 +14,12 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
 #include "pipeline/typed-stage.h"
+#include "common/vpipe-format.h"
+#include "interfaces/ui-delegate-intf.h"
+
+#include <cstdio>
+#include <functional>
+#include <string>
 
 #include <atomic>
 #include <chrono>
@@ -190,6 +196,95 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
     }
   }
   EXPECT_TRUE(ordered);
+}
+
+// ---- how long it ran --------------------------------------------------
+
+// The one line a stop leaves behind. It is the only record of how long a
+// pipeline was up: a long-lived graph is started once and looked at
+// later, and "when did this start" is not in the log by the time anyone
+// asks.
+//
+// Asserted as a COUNT as well as a match, because the two ways to get
+// this wrong are both silent -- stop() is reachable from the destructor
+// after an explicit stop (two lines for one run) and on a runtime that
+// never launched (a line for a run that never happened).
+TEST(pipeline_runtime, stop_reports_how_long_it_ran) {
+  vpipe::Session sess;
+  struct RanLines final : public vpipe::UiDelegateIntf {
+    std::mutex               mu;
+    std::vector<std::string> ran;
+    void error(const vpipe::VpipeFormat&) override {}
+    void warn(const vpipe::VpipeFormat&) override {}
+    void info(const vpipe::VpipeFormat& f) override {
+      const std::string s = f();
+      if (s.find("ran for") == std::string::npos) { return; }
+      std::lock_guard<std::mutex> lk(mu);
+      ran.push_back(s);
+    }
+    vpipe::UiInputStatus getline(const vpipe::VpipeFormat&, std::string&,
+                                 const std::function<bool()>&) override {
+      return vpipe::UiInputStatus::Eof;
+    }
+    std::unique_ptr<vpipe::UiTextStream> open_text_stream() override {
+      return std::make_unique<vpipe::NullUiTextStream>();
+    }
+  };
+  auto owned = std::make_unique<RanLines>();
+  RanLines* ui = owned.get();
+  sess.set_ui_delegate(std::move(owned));
+
+  {
+    auto w = build_pipeline(sess, 100);
+    vpipe::PipelineRuntime rt(w.pipeline.get(), &sess);
+    // A runtime that never launched has no run to report, and stop() on
+    // one is a normal call -- PipelineHandleImpl makes it on any handle.
+    rt.stop();
+    {
+      std::lock_guard<std::mutex> lk(ui->mu);
+      EXPECT_TRUE(ui->ran.empty());
+    }
+  }
+
+  auto w = build_pipeline(sess, 100);
+  vpipe::PipelineRuntime rt(w.pipeline.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  rt.stop();          // idempotent: the second one ended nothing
+  {
+    std::lock_guard<std::mutex> lk(ui->mu);
+    ASSERT_TRUE(ui->ran.size() == 1);
+    const std::string& line = ui->ran.front();
+    // It names the pipeline, because a session runs several at once and
+    // a bare duration belongs to none of them.
+    EXPECT_TRUE(line.find("'p'") != std::string::npos);
+    std::printf("[pipeline_runtime] %s\n", line.c_str());
+  }
+}
+
+// The scale the line has to cover, which is the whole reason it is not
+// a bare second count: the same graph is a 40 ms unit test and a camera
+// that has been up since spring.
+TEST(pipeline_runtime, a_duration_reads_at_every_scale) {
+  using vpipe::human_duration;
+  EXPECT_TRUE(human_duration(0.0)        == "0 ms");
+  EXPECT_TRUE(human_duration(-1.0)       == "0 ms");   // never negative
+  EXPECT_TRUE(human_duration(0.0004)     == "0.40 ms");
+  EXPECT_TRUE(human_duration(0.847)      == "847 ms");
+  EXPECT_TRUE(human_duration(42.34)      == "42.3 s");
+  // Rounded ONCE: 59.96 s must not print as "60.0 s".
+  EXPECT_TRUE(human_duration(59.96)      == "1 m 00 s");
+  EXPECT_TRUE(human_duration(90.0)       == "1 m 30 s");
+  EXPECT_TRUE(human_duration(3660.0)     == "1 h 01 m");
+  EXPECT_TRUE(human_duration(86400 + 3600.0)     == "1 d 1 h");
+  EXPECT_TRUE(human_duration(30.0 * 86400)       == "1 mo 0 d");
+  EXPECT_TRUE(human_duration(75.0 * 86400)       == "2 mo 15 d");
+  // A year is TWELVE of those months, so the remainder can never read
+  // "1 y 12 mo".
+  EXPECT_TRUE(human_duration(360.0 * 86400)      == "1 y 0 mo");
+  EXPECT_TRUE(human_duration(359.9 * 86400)      == "11 mo 29 d");
+  EXPECT_TRUE(human_duration(400.0 * 86400)      == "1 y 1 mo");
 }
 
 TEST(pipeline_runtime, stop_mid_stream) {

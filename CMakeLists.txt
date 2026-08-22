@@ -186,9 +186,15 @@ if(VPIPE_SOURCES)
         # is brought in transitively by other Apple bits but link it
         # explicitly so the onvif-discovery stage's KDF/AEAD code works
         # even in builds where APPLE_SILICON is OFF.
+        #
+        # libcompression is the system LZ4: COMPRESSION_LZ4_RAW decodes
+        # the raw blocks inside the frames the HuggingFace content store
+        # wraps its chunks in, so the model fetch needs no third-party
+        # LZ4 to read them.
         target_link_libraries(vpipe PRIVATE
             "-framework Security"
-            "-framework CoreFoundation")
+            "-framework CoreFoundation"
+            compression)
     endif()
     if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND VPIPE_MC_KERNEL_OBJS)
         # Per-kernel OBJECT libraries produced by
@@ -242,6 +248,10 @@ target_include_directories(vpipe_test
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(vpipe_test PRIVATE vpipe lmdb pugixml CURL::libcurl)
+if(APPLE)
+    # The xet-fetch tests build their own LZ4 frames to decode.
+    target_link_libraries(vpipe_test PRIVATE compression)
+endif()
 if(APPLE)
     target_link_libraries(vpipe_test PRIVATE
         "-framework Security"

@@ -33,7 +33,7 @@ once, up front. Both copies exist while that runs:
 | Source repack (`Comfy-Org/MiniMax-H3`, bf16) | **~115 GB** |
 | Peak while preparing (source + output) | **~180 GB** |
 | 8-bit model, source deleted | **~65 GB** |
-| Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+24 GB** 4-bit |
+| Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+33 GB** 8-bit or **+24 GB** 4-bit |
 
 Once preparation finishes you can delete the source repack and keep the
 ~65 GB. The 115 GB is a one-time cost, not a standing one.
@@ -56,7 +56,8 @@ name the output to match.
 
 - **[`prepare-minimax-h3-8bit.vpipeline`](pipelines/prepare-minimax-h3-8bit.vpipeline)**
   — download the checkpoint and quantize it. Run once.
-- **[`prepare-minimax-h3-ref2va-4bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)**
+- **[`prepare-minimax-h3-ref2va-8bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-8bit.vpipeline)**
+  / **[`…-4bit`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)**
   — the same for the **Ref2VA** partition (see
   [Conditioning on references](#conditioning-on-references-ref2va)). Only if
   you want it; the two share a download.
@@ -65,6 +66,10 @@ name the output to match.
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   — the same, anchored to an image at both ends (see
   [More than text in](#more-than-text-in)).
+- **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
+  — the **Ref2VA** partition instead: a list of reference images, clips and
+  soundtracks in, `.mp4` out (see
+  [Conditioning on references](#conditioning-on-references-ref2va)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
 from `docs/pipelines/` in your clone. Either can be run from the terminal with
@@ -109,8 +114,21 @@ Four stages, in order:
 
 1. **`model-fetch`** — pulls `Comfy-Org/MiniMax-H3` into `./models`.
    `skip_existing_files` is on, so re-running after an interruption skips
-   every shard already on disk at the right size and re-fetches only the one
-   that was cut off.
+   every shard already on disk at the right size, and the one that was cut
+   off resumes from the byte it stopped at rather than starting over — the
+   partial sits next to it as `<name>.part` until it is complete and its
+   checksum matches. A shard here is 30–60 GB, so that difference is hours.
+
+   Shards over 256 MB are pulled from HuggingFace's **content store**
+   rather than streamed: the repo publishes a hash the file can be
+   rebuilt from, and the store holds it as deduplicated, compressed
+   chunks that come down several ranges at a time. For bf16 weights that
+   is 0.873× the bytes — the store separates the byte planes before
+   compressing, which is what makes floats compress at all. Measured
+   end to end on a 5.2 GB shard it was 1.07× faster here (94.4 vs 88.3
+   MB/s median), because one stream was already close to this link's
+   ceiling; on a link where a single stream is the constraint it is
+   worth closer to 2×. `xet_streams: 0` turns it off.
 
    **`model_variant: fl2va` is required, not decorative.** That one repo
    publishes *two* models — the FL2VA and Ref2VA partitions — and they pin
@@ -193,7 +211,7 @@ From the `generate-video` stage:
 
 | key | shipped | notes |
 |---|---|---|
-| `width` / `height` | 960 × 544 | Both must be multiples of 16. |
+| `width` / `height` | 960 × 544 | **Rounded up** to the nearest multiple of **32** — the video VAE's 16× spatial stride times the DiT's 2× patch. A multiple of 16 is not enough: 1360 is one, and its latent is an odd 85 that the packer cannot patch. The stage logs the change. |
 | `frames` | 120 | **Rounded up** to the nearest count the VAE can chunk — 5, 22, 39, 56, 73, 90, 107, **124**, … So 120 becomes 124. The stage logs the change. |
 | `fps` | 24 | 124 frames ≈ 5.2 s; 56 ≈ 2.3 s. |
 | `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
@@ -232,7 +250,7 @@ model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with the
 | frames | clip | |
 |---|---|---|
 | 90 | 3.75 s | **9 min 26 s** |
-| 124 | 5.2 s | **12 min 15 s** |
+| 124 | 5.2 s | **11 min 25 s** |
 
 `steps` is the setting that moves this most, and the Turbo adapter is what
 buys the low count: without it, plan on 8 steps for a draft and 16 for a
@@ -342,6 +360,57 @@ several at once** and they land in the list in the order you picked them.
 "references": ["subject.png", "motion.mp4", "voice.wav"]
 ```
 
+[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)
+is that graph, and it runs on assets you already have:
+
+| reference | carries | where it comes from |
+|---|---|---|
+| `minimax-h3-reference-subject.jpg` | the subject | [ships in this repo](images/minimax-h3-reference-subject.jpg) — made with vpipe's own FLUX.2 text-to-image graph, so it comes with no licence question attached |
+| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip that carries its own audio is two references in one — it is labelled `<Audio 1>` and `<Video 1>` and its soundtrack is encoded separately |
+
+```sh
+cd ~/vpipe-work                                    # the work directory again
+cp ~/src/vpipe/docs/pipelines/minimax-h3-reference-to-video.vpipeline .
+cp ~/src/vpipe/docs/images/minimax-h3-reference-subject.jpg .
+~/src/vpipe/build/apps/vpipe/vpipe --launch minimax-h3-reference-to-video.vpipeline
+```
+
+The `.mp4` is already beside them if you ran step 2 from this directory; any
+clip with a soundtrack will do. Point `model-select` at your Ref2VA directory
+if you named it something else, and note the two `frames` settings — the
+encoder's and `generate-video`'s — which already agree at 39 and have to.
+
+**Ref2VA costs more than its output suggests**, and the example is sized
+around that rather than around the clip it makes. A reference is packed into
+the SAME sequence as the thing being generated, and a reference clip goes onto
+its own canvas: the 960 × 544 file from step 2 resolves to **1344 × 768**,
+more pixels than the output. MEASURED on the 16 GB M5, asking for 56 frames:
+
+| | rows | |
+|---|---|---|
+| the reference clip | 18,160 | 58% |
+| conditioning (text + vision) | 4,131 | 13% |
+| **what is being generated** (960 × 544, 56 frames) | 8,856 | 28% |
+| the reference soundtrack | 188 | <1% |
+
+31,335 rows wants ~6.3 GB of activation scratch, and `generate-video`
+**refuses** at that size on a 16 GB box rather than thrash — wired Metal
+buffers cannot be paged out, so overcommitting takes the machine down instead
+of failing one stage.
+
+So `frames` is the lever, not the frame size: a reference clip is truncated to
+the generated length, so shortening the output shortens the reference with it.
+Dropping to 39 moves both halves and fits — 22,615 rows, of which 13,120 are
+the clip. Making only `width`/`height` smaller would cut the 28% and leave the
+58% exactly where it is.
+
+As shipped — 960 × 544, 39 frames, 8 steps, one still and one clip — that is
+**24 min 15 s** on the fanless 16 GB M5. Around a third of it happens before
+the first denoise step: the 32B conditioner is loaded and streamed, and both
+references are read twice, once by the vision tower at its own canvas and once
+by the video VAE at MiniMax-H3's. Raising `frames` from here raises the
+reference rows with it, so the next size up is a bigger jump than it looks.
+
 A single path may be written bare, without the brackets. **The order is the
 request**: it numbers the references in the prompt the model reads
 (`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places them on a shared clock,
@@ -383,27 +452,56 @@ encoders are dropped before the denoise starts.
 #### Preparing the Ref2VA checkpoint
 
 Run
-[`prepare-minimax-h3-ref2va-4bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline)
-exactly as step 1, and it produces `local/MiniMax-H3-Ref2VA-4bit`. Point the
+[`prepare-minimax-h3-ref2va-8bit.vpipeline`](pipelines/prepare-minimax-h3-ref2va-8bit.vpipeline)
+exactly as step 1, and it produces `local/MiniMax-H3-Ref2VA-8bit`. Point the
 generation pipeline's `model-select` at that instead.
+[`…-4bit`](pipelines/prepare-minimax-h3-ref2va-4bit.vpipeline) is the same
+job at half the disk, on the trade described under
+[Why 8-bit and not 4](#disk-space).
 
 The two partitions **share one repo and one download**. Ref2VA adds only its
 own 66 GB transformer; the 51 GB prompt encoder and both VAEs are already on
 disk from step 1 and are skipped. If you only ever want Ref2VA, run this
 pipeline alone — it fetches what it needs.
 
-Two config keys make that sharing safe, and both are in the pipeline:
+One config key makes that sharing safe, and it is in the pipeline:
 
 | key | why |
 |---|---|
-| `model_variant: ref2va` | *which* of the repo's two models to fetch. The files differ; the repo path does not. |
-| `model_key: Comfy-Org/MiniMax-H3-Ref2VA` | *what to call it* in the models DB, so the two records coexist over one directory on disk. |
+| `model_variant: ref2va` | *which* of the repo's two models to fetch. The files differ; the repo path does not. A fetch that does not say is refused, with both listed. |
+
+Each partition also carries its own **registration key** —
+`Comfy-Org/MiniMax-H3-Ref2VA` here — so the two records coexist over one
+directory on disk without one overwriting the other. That is the catalogue's
+own name for the entry, so `model_key` only has to be set to override it.
 
 Everything downstream then resolves through that key rather than by
 inspecting the directory — which matters because the directory holds **both**
 transformers and cannot say which one you meant. Left to guess it picks
 FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
 video conditioned on nothing.
+
+### The released weights, either partition
+
+Both partitions are also catalogued from **`MiniMaxAI/MiniMax-H3`**, the
+publisher's own diffusers checkout, where each lives in a complete pipeline
+of its own — `FL2VA/` and `Ref2VA/`, transformer and prompt encoder and both
+VAEs under each. Select one the same way, with `model_variant: fl2va` or
+`ref2va`; that repo publishes two models now, so a fetch of it must say which.
+
+It is the larger download: about **134 GB per partition**, against ~115 GB
+for the whole repack. The encoder and both VAEs are *repeated* under each
+partition rather than shared, so wanting both partitions from here costs two
+copies of them — and its encoder ships all 64 layers where the repack's is
+truncated at the tap this model actually reads. What it buys is the
+reference: these are the weights the repack was converted from, and the two
+group the transformer's fused qkv projection differently — a difference with no signature in the
+tensor names or shapes, so having both on disk turns "is our loader right?"
+into a diff.
+
+Which partition a directory holds is read from that partition's own
+`model_index.json`, and the model's registration key is what says which one
+you asked for.
 
 ### Fewer steps — the Turbo LoRA
 
@@ -492,11 +590,11 @@ the log.
 
 | machine | |
 |---|---|
-| **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 50 s** |
-| **M5** MacBook Air 15", 16 GB, fanless, on an ice pack | **13 min 36 s** |
+| **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 44 s** |
+| **M5** MacBook Air 15", 16 GB, fanless, on an ice pack | **11 min 25 s** |
 
 Both rows are the same pipeline file, so they are directly comparable: the
-fanless M5 finishes **1.6× faster** than the fan-cooled M4 Pro, and does it
+fanless M5 finishes **1.9× faster** than the fan-cooled M4 Pro, and does it
 on a quarter of the RAM. On 16 GB the DiT streams its weights, which is what
 keeps that machine from going faster still.
 
@@ -507,7 +605,7 @@ to check before reading anything else into a timing.
 
 Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
 mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on
-the M4 Pro, and an M5 run without it will be slower than 13 min 36 s. It works
+the M4 Pro, and an M5 run without it will be slower than 11 min 25 s. It works
 with the adapter, but it changes the picture by about as much as the adapter
 does, so turn one at a time when you are judging output rather than speed.
 

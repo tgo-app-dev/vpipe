@@ -19,8 +19,10 @@
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -175,6 +177,58 @@ TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
   EXPECT_TRUE(idx.size() == 2 && blocks.size() == 1);
   std::printf("[minimax_h3_refenc] a 11-frame clip is refused (\"%s\"), 13 "
               "frames sample %zu\n", err.c_str(), idx.size());
+}
+
+// The progress contract, without a single model loaded.
+//
+// Reference encoding is the longest stretch of a `ref2va` run that is
+// not the denoise -- the conditioner is streamed and every reference is
+// read twice -- so video-ref-encoder drives a progress bar off this
+// callback. What makes the bar honest is the COUNT: `total` is one more
+// than the number of references, because the presentation is a single
+// conditioner call over the whole request and is routinely the longest
+// thing in the phase. Reporting refs.size() would put the bar at 100%
+// and leave it there for the part people actually wait through.
+//
+// Checkable with every model pointer null: the per-reference work is all
+// guarded, so what is left is exactly the traversal and its reports.
+TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+
+  // Two stills, sized to what the loop checks (num_frames * 3 * h * w).
+  std::vector<h3::MediaReference> refs;
+  for (int k = 0; k < 2; ++k) {
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1;
+    m.height     = 64;
+    m.width      = 64;
+    m.rgb.assign((std::size_t)3 * 64 * 64, (std::uint8_t)(40 * k + 10));
+    refs.push_back(std::move(m));
+  }
+
+  std::vector<std::pair<int, int>> seen;
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  models.progress = [&seen](int done, int total) {
+    seen.emplace_back(done, total);
+  };
+
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references(refs, "a prompt", plan, models,
+                                        &enc, &err);
+  std::printf("[minimax_h3_refenc] progress:");
+  for (const auto& p : seen) { std::printf(" %d/%d", p.first, p.second); }
+  std::printf("%s%s\n", err.empty() ? "" : "  err: ", err.c_str());
+  ASSERT_TRUE(ok);
+  ASSERT_TRUE(seen.size() == 3);
+  // One per reference, then the presentation -- and every report carries
+  // the SAME total, or a bar rescales itself mid-phase.
+  EXPECT_TRUE(seen[0] == std::make_pair(1, 3));
+  EXPECT_TRUE(seen[1] == std::make_pair(2, 3));
+  EXPECT_TRUE(seen[2] == std::make_pair(3, 3));
 }
 
 TEST(minimax_h3_refenc, request_limits)

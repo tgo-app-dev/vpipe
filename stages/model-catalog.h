@@ -213,6 +213,19 @@ std::string normalize_hf_path(const std::string& input);
 struct HfFile {
   std::string   path;       // repo-relative, e.g. "model.safetensors"
   std::uint64_t size = 0;   // bytes (0 when the API omits it)
+  // What the repo publishes to check the downloaded bytes against.
+  // HuggingFace stores anything big in LFS and names the object by the
+  // SHA-256 of its CONTENT (`lfs.oid`); everything small enough to live
+  // in git itself is named by the git blob id, a SHA-1 over
+  // "blob <size>\0" followed by the content (`oid`). So every file
+  // carries exactly one of these, and the API publishes no MD5 for any
+  // of them.
+  std::string   sha256;     // lfs.oid; empty when the file is not LFS
+  std::string   git_oid;    // oid; empty when the API omits it
+  // `xetHash`: the id the content-addressed store knows the file by, so
+  // it can be rebuilt from deduplicated chunks instead of streamed
+  // whole. Empty for a file the store does not hold.
+  std::string   xet_hash;
 };
 
 // Extract the downloadable files (type == "file") from a HuggingFace

@@ -119,8 +119,12 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
   if (fs::exists(p / "video_vae" / "source" / "model.safetensors")) {
     return (p / "video_vae" / "source").string();      // a partition root
   }
-  if (fs::exists(p / "FL2VA" / "video_vae" / "source" / "model.safetensors")) {
-    return (p / "FL2VA" / "video_vae" / "source").string();
+  // Either partition's copy -- see the audio VAE: the two subtrees are
+  // complete pipelines over the same VAEs, so Ref2VA must resolve and
+  // either copy is the same net.
+  for (const char* part : {"FL2VA", "Ref2VA"}) {
+    const fs::path src = p / part / "video_vae" / "source";
+    if (fs::exists(src / "model.safetensors")) { return src.string(); }
   }
   return path;
 }

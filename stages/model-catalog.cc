@@ -162,6 +162,32 @@ builtin_catalog_()
       "FL2VA/tokenizer/vocab.json",
       "FL2VA/tokenizer/merges.txt"};
 
+  // The Ref2VA partition is the FL2VA list under the other prefix. The
+  // two subtrees are MIRRORS -- same file names, same shard counts (13
+  // DiT + 14 encoder), same ~133 GB -- because each is a COMPLETE
+  // pipeline for its own task, encoder and both VAEs included.
+  //
+  // Derived rather than duplicated, so the two cannot drift: a 60-line
+  // copy is one shard-count change away from a fetch that reports
+  // success and leaves a directory missing a shard.
+  //
+  // It costs a user who wants BOTH partitions a second copy of the
+  // encoder and the VAEs (~72 GB of the 133), which is the publisher's
+  // layout and not something the catalogue can net out: unlike the
+  // Comfy-Org repack, where both partitions name the SAME encoder file
+  // and the fetcher skips what it already holds, these are distinct
+  // paths. Pinning only the DiT would halve the download and produce a
+  // directory that cannot encode a prompt.
+  static const std::vector<std::string> kMiniMaxH3Ref2VAFiles = [] {
+    constexpr std::size_t kPfx = sizeof("FL2VA/") - 1;
+    std::vector<std::string> v;
+    v.reserve(kMiniMaxH3FL2VAFiles.size());
+    for (const std::string& f : kMiniMaxH3FL2VAFiles) {
+      v.push_back("Ref2VA/" + f.substr(kPfx));
+    }
+    return v;
+  }();
+
   // All four Boogu-Image-0.1 repos are byte-identical in layout, so one pinned
   // list serves them. It SKIPS the assets/ showcase images and the two
   // `trust_remote_code` .py shims (compatibility re-exports that only point
@@ -1062,7 +1088,16 @@ builtin_catalog_()
      .model_type = "minimax-h3-fl2va",
      .inputs = {"text", "image"}, .outputs = {"video", "audio"},
      .files = kMiniMaxH3FL2VAFiles,
-     .needs_tokenizer_json = false},
+     .needs_tokenizer_json = false,
+     // NAMED, because the Ref2VA entry below is published from this same
+     // repo and lands in this same directory. Without a name both would
+     // register under the repo path and the second fetch would overwrite
+     // the first's record -- one key, one model_type, and no way for a
+     // consumer to say which of the two partitions it meant. The
+     // directory is still shared (local_dir is the repo path either
+     // way), which is the point: 133 GB downloaded once per partition,
+     // two records over it.
+     .name = "MiniMaxAI/MiniMax-H3-FL2VA"},
     // The SAME model, from Comfy-Org's repack -- kept as a second entry
     // rather than replacing the one above because its value is being a
     // SECOND OPINION on the first. The two disagree about one thing that
@@ -1131,7 +1166,8 @@ builtin_catalog_()
            .file = "FL2VA/tokenizer/tokenizer_config.json",
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
-     .needs_tokenizer_json = false},
+     .needs_tokenizer_json = false,
+     .name = "Comfy-Org/MiniMax-H3-FL2VA"},
     // The Ref2VA partition: the OTHER half of MiniMax-H3.
     //
     // Same architecture as FL2VA down to the byte -- 535 tensors, same
@@ -1141,7 +1177,33 @@ builtin_catalog_()
     // never on its own), each packed as its own block ahead of the
     // generated rows.
     //
-    // It shares this repo's encoder and both VAEs with the entry above,
+    // MiniMaxAI's release first, the repack after, mirroring how the
+    // two FL2VA entries are ordered: the released weights are the
+    // reference the repack is checked against, and a partition offered
+    // in only one publisher's spelling reads as a partition that only
+    // that publisher has.
+    //
+    // Its DiT is the per-head qkv grouping, like every MiniMaxAI file
+    // and unlike the repack -- resolved from `Ref2VA/model_index.json`'s
+    // `_minimax_h3.partition`, which is the only thing in the tree that
+    // distinguishes the two: the transformer configs are identical.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "33B",
+     .variant = "bf16 omni video+audio (MiniMaxAI, diffusers)",
+     .hf_path = "MiniMaxAI/MiniMax-H3",
+     .model_type = "minimax-h3-ref2va",
+     .inputs = {"text", "image", "video", "audio"},
+     .outputs = {"video", "audio"},
+     .files = kMiniMaxH3Ref2VAFiles,
+     .needs_tokenizer_json = false,
+     // The other half of the shared-repo pair -- see the FL2VA entry
+     // above for why both are named. One directory, two records.
+     .name = "MiniMaxAI/MiniMax-H3-Ref2VA"},
+    // The same partition from Comfy-Org's repack, the second opinion on
+    // the entry above for the same reason the FL2VA pair are two
+    // entries: the two publishers disagree about the DiT's fused qkv
+    // grouping, and having both on disk is what makes that a diff.
+    //
+    // It shares this repo's encoder and both VAEs with the FL2VA entry,
     // so a checkout that already has FL2VA pays only for the 66 GB DiT;
     // the fetcher skips files it already holds. Only the DiT is pinned
     // here for that reason -- the shared components are not repeated.
@@ -1163,7 +1225,8 @@ builtin_catalog_()
            .file = "Ref2VA/tokenizer/tokenizer_config.json",
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
-     .needs_tokenizer_json = false},
+     .needs_tokenizer_json = false,
+     .name = "Comfy-Org/MiniMax-H3-Ref2VA"},
     // MiniMax-H3 Turbo: a few-step distillation LoRA for the FL2VA
     // partition. 4 steps instead of ~20 for joint video + synchronized
     // audio, and it keeps improving to about 8; past that it
@@ -1734,6 +1797,28 @@ hf_tree_files(const FlexData& tree_json)
     HfFile f;
     f.path = std::move(path);
     f.size = obj.contains("size") ? obj.at("size").as_uint(0) : 0;
+    f.git_oid = obj.contains("oid")
+        ? std::string(obj.at("oid").as_string("")) : "";
+    f.xet_hash = obj.contains("xetHash")
+        ? std::string(obj.at("xetHash").as_string("")) : "";
+    // The LFS block is present only for the files git does not store
+    // itself -- which is to say, exactly the multi-GB shards where a
+    // truncated or resumed download is worth checking.
+    if (obj.contains("lfs")) {
+      FlexData lfs = obj.at("lfs");        // own it; the view dangles
+      if (lfs.is_object()) {
+        auto lo = lfs.as_object();
+        if (lo.contains("oid")) {
+          f.sha256 = std::string(lo.at("oid").as_string(""));
+        }
+        // The LFS size is the authority when both are given: `size` on
+        // the outer entry is the pointer file's for some revisions.
+        if (lo.contains("size")) {
+          const std::uint64_t n = lo.at("size").as_uint(0);
+          if (n > 0) { f.size = n; }
+        }
+      }
+    }
     out.push_back(std::move(f));
   }
   return out;

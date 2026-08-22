@@ -757,18 +757,44 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   models.video_vae = _video_vae.get();
   models.audio_vae = _audio_vae.get();
   models.text      = _enc.get();
+  // The phase the user actually waits through. The conditioner is loaded
+  // and streamed, and every reference is read TWICE -- once by the vision
+  // tower at its own canvas, once by the video VAE at MiniMax-H3's -- so
+  // on a memory-bounded box this is minutes. It reported to the debug log
+  // and nowhere else, which left a default run silent between "encoders
+  // ready" and the conditioning beat, over the longest stretch in the
+  // graph that is not the denoise.
+  //
+  // Opened BEFORE the encode rather than on the first report, which is
+  // the opposite of the lazy bars in the two VAE stages and for a reason
+  // particular to this one: the first report does not arrive until the
+  // first reference is FINISHED, so a lazy bar would still be invisible
+  // through exactly the stretch it exists to cover. The counts are set
+  // here too -- an un-updated handle reads as indeterminate, and the
+  // number of references is already known.
+  UiProgress bar = session()->open_progress("encoding references");
+  bar.update(0, (std::uint64_t)refs.size() + 1);
   {
     auto* ui = session();
     const std::string label = "encoding " + std::to_string(refs.size()) +
                               " reference(s)";
-    models.progress = [ui, label](int done, int total) {
+    // The debug line stays: a bar leaves nothing behind, and this phase
+    // is one people come back to a log about.
+    models.progress = [&bar, ui, label](int done, int total) {
+      bar.update(done < 0 ? 0 : (std::uint64_t)done,
+                 total < 0 ? 0 : (std::uint64_t)total);
       ui->log_debug(fmt("{}: {}/{}", label, done, total));
     };
   }
 
   h3::EncodedReferences enc;
   std::string eerr;
-  if (!h3::encode_references(refs, prompt, plan, models, &enc, &eerr)) {
+  const bool encoded = h3::encode_references(refs, prompt, plan, models,
+                                             &enc, &eerr);
+  // Before the warn, so a failure does not leave a part-filled bar
+  // sitting under the message that explains it.
+  bar.finish();
+  if (!encoded) {
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
                         this->id(), eerr));
     co_return;

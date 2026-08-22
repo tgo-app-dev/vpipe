@@ -1110,34 +1110,53 @@ resource-plan: peak 5527 MB in phase 'decode' (condition 4479,
   denoise 3116, decode-audio 585, decode 5527)
 ```
 
-When the peak does not fit, it says so, names the phase, and computes the
-percentage that *would* hold it:
+**Over the pool is not over the box**, and the two are reported
+differently because only one of them is a problem. The pool caps what the
+process *wires*; bytes above it are pageable, never refused. So a peak
+above the pool but within RAM is said once, at INFO, naming whichever
+setting is in force:
 
 ```
-resource-plan: this graph needs at least 59392 MB resident at its peak --
-  phase 'denoise', with everything streamable at its floor -- and the
-  wired pool is 49010 MB at wired_pool_pct=75. Set wired_pool_pct to 91
-  or more.
+resource-plan: peak 10833 MB in phase 'decode' is beyond the 8000 MB
+  wired pool, so 2833 MB of it stays pageable -- this machine's 65536 MB
+  holds the graph. Set wired_pool_mb to 10833 or more to protect all of
+  it.
 ```
 
-Above 95 there is no such percentage, and it says *that* instead — "raise
-it to 723%" reads like a setting where "it does not fit this machine at
-any setting" is the fact.
+An absolute `wired_pool_mb` *replaces* `wired_pool_pct` rather than
+combining with it, so the advice names the one that would actually
+change something — and a percentage target is only offered when there is
+one at or below 95. Above that there is no such setting, and saying
+"raise it to 723%" reads like one.
 
-**`wired_pool_enforce` is FALSE by default**, so this is reported and not
-refused. A refusal is only as good as the accounting behind it, and the
-accounting is not yet complete: a component that can stream but does not
-declare its floor is counted at full size, so a graph that fits reads as
-one that cannot. MEASURED on a bf16 MiniMax-H3 graph that runs fine on a
-64 GB box — the DiT declares a 3 GB floor against 63 GB, the 48 GB text
-encoder declares none, and the plan concludes 58 GB against a 49 GB pool.
-That veto would have blocked a working run.
+A peak above **believed RAM** is the reading that warns, because that is
+the graph no setting holds:
 
-So the numbers ship first and the veto follows, per component, as each
-streamable thing states its floor. Turn it on with `wired_pool_enforce`
-(or `VPIPE_WIRED_POOL_ENFORCE=1`) on a box where the graph is known to be
+```
+resource-plan: this graph needs at least 10833 MB resident at its peak --
+  phase 'decode', with everything streamable at its floor -- and this
+  machine has 8192 MB. It does not fit at any setting -- use a smaller
+  model, a smaller geometry, or a quantized checkpoint.
+```
+
+**`wired_pool_enforce` is FALSE by default**, so a graph the pool cannot
+hold is reported and not refused. A refusal is only as good as the
+accounting behind it: a component that can stream but does not declare
+its floor is counted at full size, so a graph that fits reads as one that
+cannot. MEASURED on a bf16 MiniMax-H3 graph on a 64 GB box — a 63624 MB
+text encoder whose floor query missed the checkpoint's layer naming
+reported no floor at all, putting the conditioning phase at 64201 MB
+against a 12000 MB pool. The graph then ran to completion, streaming its
+encoder a layer at a time. **A floor of 0 is not "unknown" — it means
+"this cannot be reduced"**, so a floor query that misses is the one
+accounting error that turns a working graph into a refusal.
+
+Turn the veto on with `wired_pool_enforce` (or
+`VPIPE_WIRED_POOL_ENFORCE=1`) on a box where the graph is known to be
 declared completely — and note what it buys: an **early** refusal, before
-minutes of loading, instead of a box discovering the problem by thrashing.
+minutes of loading, instead of a box discovering the problem by
+thrashing. It refuses at the **pool**, which is the stricter of the two
+thresholds and the point of asking for it.
 
 ---
 

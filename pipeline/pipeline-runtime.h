@@ -5,6 +5,7 @@
 #include "common/session-member.h"
 #include "pipeline/memory-plan.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -177,6 +178,21 @@ private:
   std::atomic<bool>                            _stop{false};
   std::atomic<bool>                            _running{false};
   bool                                         _launched = false;
+
+  // When the drivers were released, for the one line stop() reports.
+  //
+  // STEADY, not system, and the choice has a cost worth naming. A
+  // system clock can STEP -- NTP correcting a box that booted with a
+  // wrong date moves it by years -- and a duration measured across that
+  // is not merely inaccurate, it is absurd, which is the one thing a
+  // reported figure must never be. The steady clock cannot do that.
+  //
+  // What it does instead, on Apple platforms, is stop while the machine
+  // is asleep. So a pipeline left up on a laptop over a week of nightly
+  // sleeps reports the time it was AWAKE for, which is less than the
+  // calendar span and is the honest reading of "running" anyway: a
+  // suspended process is not processing.
+  std::chrono::steady_clock::time_point        _started{};
 
   std::atomic<unsigned>                        _completed{0};
   unsigned                                     _expected = 0;

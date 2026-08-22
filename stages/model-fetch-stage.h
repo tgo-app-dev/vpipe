@@ -56,7 +56,11 @@ private:
   bool          _prepare_tokenizer{};
   bool          _skip_existing_files{};
   bool          _verify_tls{};
+  bool          _verify_checksums{};
   unsigned      _timeout_seconds{};
+  unsigned      _stall_seconds{};
+  unsigned      _download_retries{};
+  unsigned      _xet_streams{};
 };
 
 }

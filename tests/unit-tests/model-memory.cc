@@ -1482,6 +1482,61 @@ TEST(model_memory, reopening_the_wired_pool_never_lifts_the_ceiling)
   mgr->set_wired_pool_pct(0);
 }
 
+// A BUFFER THAT IS FREED WHILE WIRED LEAKS THE POOL'S BUDGET.
+//
+// Destroying a wired SharedBuffer unwires it in the kernel, so the
+// machine recovers -- but `_pool_used` is decremented only by
+// unwire_from_pool(), so the pool goes on believing those bytes are
+// held. It then wires less of whatever comes next, and the resident set
+// shrinks for a reason nothing in the log names.
+//
+// This pins the property so the accounting cannot drift back: the two
+// models that reallocate wired scratch on a geometry change
+// (MiniMax-H3's ensure_scratch_, LTX-2.5's set_geometry) both unwire
+// first, and this is what says why they must.
+TEST(model_memory, freeing_a_wired_buffer_without_unwiring_leaks_the_pool)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  mgr->set_wired_pool_bytes(8ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  // THE CORRECT ORDER: unwire, then drop. The pool comes back.
+  {
+    auto b = mc->make_shared_buffer(1ull << 20);
+    if (b.empty() || mgr->wire_into_pool(b) == 0) {
+      mgr->set_wired_pool_pct(0);
+      return;                       // RLIMIT_MEMLOCK: self-skip
+    }
+    EXPECT_TRUE(mgr->wired_pool_used() == (1ull << 20));
+    mgr->unwire_from_pool(b);
+  }
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  // THE MISTAKE: dropped while still wired. The counter does NOT come
+  // back, which is the leak -- asserted rather than wished away, because
+  // a test that pretended otherwise would pass on a fix that never
+  // happened.
+  {
+    auto b = mc->make_shared_buffer(1ull << 20);
+    if (b.empty() || mgr->wire_into_pool(b) == 0) {
+      mgr->set_wired_pool_pct(0);
+      return;
+    }
+    EXPECT_TRUE(mgr->wired_pool_used() == (1ull << 20));
+  }
+  EXPECT_TRUE(mgr->wired_pool_used() == (1ull << 20));   // still charged
+
+  // And the budget really is gone: what is left is the pool minus the
+  // phantom, so a caller sizing against it gets less than it asked for.
+  EXPECT_FALSE(mgr->wired_pool_can_take(8ull << 20));
+  mgr->set_wired_pool_pct(0);
+}
+
 // The device maximum outranks the ask, and reopening does not escape it
 // either. Wiring past what the GPU can keep resident is the case that
 // takes the machine down rather than merely slowing it.

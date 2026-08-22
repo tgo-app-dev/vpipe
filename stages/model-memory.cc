@@ -724,35 +724,105 @@ public:
         "resource-plan: peak {} MB in phase '{}' ({})",
         need >> 20, tight, breakdown));
     if (need <= pool) { return true; }
-    // What percentage WOULD hold it, against the same believed RAM the
-    // pool is a fraction of. Above 95 there is no such percentage --
-    // saying "raise it to 723%" is worse than saying it cannot fit,
-    // because the first reads like a setting and the second is the fact.
-    const std::size_t ram =
-        mgr->wired_pool_pct() > 0
-            ? pool / (std::size_t)mgr->wired_pool_pct() * 100
-            : 0;
-    const int want = ram > 0 ? (int)((need * 100 + ram - 1) / ram) : 0;
-    // Reported either way; refused only when asked to be. An
-    // incompletely declared graph reads as too big, and a veto on that
-    // basis blocks runs that work -- see parse_wired_pool_enforce_config.
+
+    // OVER THE POOL IS NOT OVER THE BOX, and only one of the two is a
+    // problem the operator did not ask for.
+    //
+    // The pool is a ceiling on what this process WIRES, never on what it
+    // may hold: bytes above it are pageable, which costs throughput and
+    // not correctness. So a deliberately small pool on a large machine
+    // -- `--wired-pool-mb 12000` on a 64 GB box -- is a setting being
+    // honoured, and "it does not fit this machine" is then simply false.
+    // MEASURED on the bf16 MiniMax-H3 FL2VA graph, which was told
+    // exactly that and ran to completion.
+    //
+    // What genuinely cannot fit is a peak above believed RAM with every
+    // streamable component already at its floor, and that is the only
+    // reading this WARNS about. The pool shortfall is worth saying --
+    // part of the run is exposed to the compressor -- so it is said at
+    // INFO, where a number nobody has to act on belongs.
+    //
+    // 0 from phys_ram() is UNKNOWN, not small: the roomier reading is
+    // the one that does not invent a refusal out of a failed sysctl.
+    const std::size_t ram = phys_ram();
+    const bool over_box = ram > 0 && need > ram;
+    // Reported either way; refused only when asked to be, and then at
+    // the POOL rather than the box -- that is what wired_pool_enforce
+    // buys. An incompletely declared graph reads as too big, and a veto
+    // on that basis blocks runs that work -- see
+    // parse_wired_pool_enforce_config.
     const bool enforce = mgr->wired_pool_enforced();
+
+    if (!over_box) {
+      if (!enforce) {
+        session->info(fmt(
+            "resource-plan: peak {} MB in phase '{}' is beyond the {} MB "
+            "wired pool, so {} MB of it stays pageable{}. {}",
+            need >> 20, tight, pool >> 20, (need - pool) >> 20,
+            ram > 0 ? fmt(" -- this machine's {} MB holds the graph",
+                          ram >> 20)()
+                    : std::string(),
+            pool_advice_(mgr, need, ram)));
+        return true;
+      }
+      // The opt-in veto, and it says which setting turned a report into
+      // a refusal -- the same numbers reach INFO without it.
+      session->error(fmt(
+          "resource-plan: peak {} MB in phase '{}' is beyond the {} MB "
+          "wired pool and wired_pool_enforce is on, so the graph is "
+          "refused rather than run with {} MB of it pageable. {}",
+          need >> 20, tight, pool >> 20, (need - pool) >> 20,
+          pool_advice_(mgr, need, ram)));
+      return false;
+    }
     const VpipeFormat msg = fmt(
         "resource-plan: this graph needs at least {} MB resident at its "
         "peak -- phase '{}', with everything streamable at its floor -- "
-        "and the wired pool is {} MB at wired_pool_pct={}. {}",
-        need >> 20, tight, pool >> 20,
-        mgr->wired_pool_pct(),
-        (want > 0 && want <= 95)
-            ? fmt("Set wired_pool_pct to {} or more.", want)()
-            : std::string("It does not fit this machine at any setting -- "
-                          "use a smaller model, a smaller geometry, or a "
-                          "quantized checkpoint."));
+        "and this machine has {} MB. It does not fit at any setting -- "
+        "use a smaller model, a smaller geometry, or a quantized "
+        "checkpoint.",
+        need >> 20, tight, ram >> 20);
     if (enforce) { session->error(msg); } else { session->warn(msg); }
     return !enforce;
   }
 
 private:
+  // WHICH KNOB, and only when turning it would do something.
+  //
+  // An absolute `wired_pool_mb` REPLACES the percentage rather than
+  // combining with it, so naming `wired_pool_pct` to an operator who
+  // typed the absolute form recommends a setting that changes nothing.
+  // Worse, a percentage recovered by dividing the pool by a pct it did
+  // not come from invents a machine: 12000 MB "at 75%" reads as a 16 GB
+  // box on a 64 GB one, and every figure derived from it is then wrong
+  // in the same direction. Ask phys_ram(), never the pool.
+  //
+  // The device cap comes first because it outranks both forms -- the
+  // pool is clamped to what the GPU can keep resident before anything is
+  // wired, so an ask above it is not a setting, it is a wish.
+  static std::string
+  pool_advice_(genai::GenerativeModelManager* mgr, std::size_t need,
+               std::size_t ram)
+  {
+    const std::size_t devmax = mgr->wired_pool_device_max();
+    if (devmax > 0 && need > devmax) {
+      return fmt("The GPU can keep {} MB resident, so no pool setting "
+                 "protects all of it.", devmax >> 20)();
+    }
+    if (mgr->wired_pool_bytes() > 0) {
+      return fmt("Set wired_pool_mb to {} or more to protect all of it.",
+                 need >> 20)();
+    }
+    const int want = ram > 0 ? (int)((need * 100 + ram - 1) / ram) : 0;
+    // Above 95 there is no such percentage -- saying "raise it to 723%"
+    // is worse than saying nothing, because it reads like a setting.
+    if (want > 0 && want <= 95) {
+      return fmt("Set wired_pool_pct to {} or more to protect all of it.",
+                 want)();
+    }
+    return "No wired_pool_pct covers all of it on this box.";
+  }
+
   void
   report_phases_(const SessionContextIntf* session,
                  genai::GenerativeModelManager* mgr, std::size_t total,

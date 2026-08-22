@@ -171,6 +171,28 @@ blk_(const char* prefix, int i, const char* rest)
   return std::string(prefix) + std::to_string(i) + "." + rest;
 }
 
+std::string
+lower_(std::string v)
+{
+  for (char& c : v) { c = (char)std::tolower((unsigned char)c); }
+  return v;
+}
+
+// Does the FILENAME of `file` carry `needle`? The partition is spelled
+// in the name and nowhere else in a repack, so this is how a resolved
+// component is checked against the partition that was asked for.
+// Case-insensitive, and the DIRECTORY is excluded on purpose: a
+// `.../Ref2VA/` parent says nothing about which file was picked out of
+// it.
+bool
+filename_has_(const std::string& file, const std::string& needle)
+{
+  if (needle.empty()) { return true; }
+  const std::string nm = lower_(std::filesystem::path(file).filename()
+                                    .string());
+  return nm.find(lower_(needle)) != std::string::npos;
+}
+
 }  // namespace
 
 // ---- config ----------------------------------------------------------
@@ -269,15 +291,26 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path,
   // self-describing file rather than to a config.json that would not
   // describe those bytes' qkv grouping.
   {
-    // The asked-for partition ranks first; the historical `fl2va`
-    // preference stays as the fallback so every graph written before
-    // Ref2VA existed keeps resolving the way it did.
+    // The asked-for partition, ALONE. The historical `fl2va` preference
+    // stays for a caller that asks for nothing, so every graph written
+    // before Ref2VA existed keeps resolving the way it did.
+    //
+    // It must not trail an explicit partition as a fallback, and the
+    // check below is the other half of that: resolve_component RANKS by
+    // `prefer` but still accepts a file matching none of it, so a repack
+    // carrying only the OTHER half answers with it. Those bytes load
+    // cleanly -- the two partitions share every name and shape -- and
+    // condition on the wrong task, which is the failure this whole
+    // partition argument exists to prevent. Resolving to nothing instead
+    // fails at load with a missing-config error.
     const std::vector<std::string> prefer =
         partition.empty() ? std::vector<std::string>{"fl2va"}
-                          : std::vector<std::string>{partition, "fl2va"};
+                          : std::vector<std::string>{partition};
     const std::string f = comfy::resolve_component(path, "diffusion_models",
                                                    kComfyKey, prefer);
-    if (!f.empty()) { return f; }
+    if (!f.empty() && (partition.empty() || filename_has_(f, partition))) {
+      return f;
+    }
   }
   if (!fs::is_directory(p)) { return path; }
   // A QUANTIZED repack: model-quantize keeps the repack's role subdirs and
@@ -296,13 +329,31 @@ MetalMiniMaxH3Transformer::resolve_dit_dir(const std::string& path,
     return (p / "transformer").string();     // a partition root
   }
   // A repository root: the pipeline lives one level down in a partition
-  // subdirectory. FL2VA is the partition this class implements; Ref2VA is
-  // a different task with a different packed layout, so it is NOT a
-  // fallback -- a repo with only Ref2VA resolves to nothing and fails at
-  // load with a missing-config error rather than running the wrong
-  // layout.
-  if (fs::exists(p / "FL2VA" / "transformer" / "config.json")) {
-    return (p / "FL2VA" / "transformer").string();
+  // subdirectory, and MiniMaxAI publishes BOTH -- `FL2VA/` and `Ref2VA/`
+  // are each a complete pipeline, distinguished by nothing but the
+  // directory name and their own model_index.json (the transformer
+  // configs are byte-identical).
+  //
+  // So `partition` picks, and neither is a fallback for the other: a
+  // repo holding only the one that was not asked for resolves to nothing
+  // and fails at load with a missing-config error, rather than running
+  // the wrong task at full cost. A caller that asks for nothing PREFERS
+  // the historical FL2VA and settles for whatever single partition the
+  // checkout has.
+  {
+    const std::string want = lower_(partition);
+    for (const char* part : {"FL2VA", "Ref2VA"}) {
+      // Told: that one only. A checkout holding just the other half
+      // resolves to nothing, which fails at load, where answering with
+      // it would run the wrong task at full cost.
+      if (!want.empty() && want != lower_(part)) { continue; }
+      const fs::path sub = p / part / "transformer";
+      if (fs::exists(sub / "config.json")) { return sub.string(); }
+    }
+    // Untold, the loop above has already preferred FL2VA and fallen
+    // back to Ref2VA -- "whatever this checkout is" -- which is what the
+    // repack path does with the same question, and what keeps a graph
+    // written before Ref2VA existed resolving as it did.
   }
   return path;
 }
@@ -3289,7 +3340,30 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
       s.adaln_idx.empty() || s.tstep_idx.empty()) {
     return false;
   }
+  // UNWIRE THE OLD ONE FIRST. Destroying a wired buffer unwires it in
+  // the kernel but does NOT decrement the pool's counter -- only
+  // unwire_from_pool does -- so replacing the scratch on a geometry
+  // change left the pool believing those bytes were still held. Every
+  // change leaked a scratch's worth, and a pool that has lost budget to
+  // bytes nothing holds wires less of what comes next: the resident set
+  // shrinks for a reason nothing in the log names.
+  //
+  // Before the assignment rather than after, because after it the old
+  // buffers are gone and there is nothing left to unwire.
+  if (_wire_resident) {
+    auto* mgr = _mc != nullptr && _mc->session() != nullptr
+                    ? _mc->session()->services()->generative_model_manager()
+                    : nullptr;
+    if (mgr != nullptr) {
+      for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+        mgr->unwire_from_pool(*b);
+      }
+    }
+  }
   _s = std::move(s);
+  // The new scratch is wired by the forward, which calls wire_fixed_()
+  // right after this -- see the note there on why the scratch goes into
+  // the pool before any block does.
   return true;
 }
 

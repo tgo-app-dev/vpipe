@@ -160,7 +160,25 @@ MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
 {
   auto wts = MetalLlamaWeights::open_model(enc_dir);
   if (!wts.has_value()) { return 0; }
-  return stream_floor_bytes(*wts, "model.layers.");
+  // BOTH spellings, for the same reason load() binds the embedding under
+  // two names: the diffusers checkpoint nests the text stack under
+  // `model.language_model.`, Comfy-Org's conversion drops that segment.
+  // A stem that matches nothing yields 0, so trying both cannot
+  // mis-measure either layout -- but measuring only the repack's
+  // spelling reports NO floor for the RELEASED checkpoint, and a floor
+  // of zero is not "unknown", it is "this cannot be reduced".
+  //
+  // MEASURED on MiniMaxAI/MiniMax-H3 FL2VA: the 63624 MB encoder
+  // streams to 5963, and counting it whole put the conditioning phase
+  // at 64201 MB -- a peak reported against a graph that then ran to
+  // completion, because the encoder had been streaming its layers all
+  // along.
+  for (const char* stem : {"model.language_model.layers.",
+                           "model.layers."}) {
+    const std::size_t f = stream_floor_bytes(*wts, stem);
+    if (f > 0) { return f; }
+  }
+  return 0;
 }
 
 std::string
@@ -190,8 +208,20 @@ MiniMaxH3TextEncoder::resolve_encoder_dir(const std::string& path)
   if (fs::exists(p / "text_encoder" / "config.json")) {
     return (p / "text_encoder").string();               // a partition root
   }
-  if (fs::exists(p / "FL2VA" / "text_encoder" / "config.json")) {
-    return (p / "FL2VA" / "text_encoder").string();
+  // EITHER partition's copy of the encoder. MiniMaxAI publishes `FL2VA/`
+  // and `Ref2VA/` as complete pipelines, so each ships its own 62 GB
+  // Qwen3-VL-32B -- the same encoder, at the same shard count, for both
+  // tasks. Which copy answers therefore does not matter; that a Ref2VA-
+  // only checkout resolves at all does. Probing FL2VA alone reported no
+  // encoder for one, and a conditioner with no encoder is a graph that
+  // cannot start.
+  //
+  // No partition argument for the same reason: unlike the DiT, there is
+  // no wrong answer here to protect against.
+  for (const char* part : {"FL2VA", "Ref2VA"}) {
+    if (fs::exists(p / part / "text_encoder" / "config.json")) {
+      return (p / part / "text_encoder").string();
+    }
   }
   return path;
 }

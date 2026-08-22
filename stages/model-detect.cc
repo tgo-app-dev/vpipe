@@ -835,8 +835,12 @@ resolve_vae_dir(const std::string& root)
   // one that names the class and carries latents_mean / latents_std,
   // while `source/config.json` is the legacy geometry. The model
   // loader descends the last level itself.
+  // Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
+  // complete pipelines, and detection over a Ref2VA-only checkout that
+  // probed FL2VA alone found no VAE at all.
   for (const fs::path& p : {fs::path(root) / "video_vae",
-                            fs::path(root) / "FL2VA" / "video_vae"}) {
+                            fs::path(root) / "FL2VA" / "video_vae",
+                            fs::path(root) / "Ref2VA" / "video_vae"}) {
     if (fs::exists(p / "source" / "model.safetensors") &&
         fs::exists(p / "config.json")) {
       return p.string();

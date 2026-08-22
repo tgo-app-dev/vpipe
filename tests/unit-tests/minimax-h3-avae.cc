@@ -215,6 +215,67 @@ TEST(minimax_h3_avae, loads_with_folded_weight_norm)
   EXPECT_TRUE(cfg.sample_rate > 0 && cfg.latent_channels > 0);
 }
 
+// ...and the SAME probe hazard in the other direction, on the encoder.
+//
+// build_encoder_ gates on whether the checkpoint has an encoder at all,
+// and it asked for `encoder.block.0.weight` -- the FOLDED spelling. The
+// released audio VAE is weight-NORMALIZED: `weight_g` / `weight_v`, with
+// thirteen plain `.weight` tensors in a file of more than a thousand. So
+// the probe found nothing, reported a complete 147-tensor encoder as
+// absent, and every `ref2va` reference carrying a soundtrack was skipped
+// with a warning that blamed the checkpoint. conv1d_ has resolved both
+// spellings all along -- only the probe was written against one of them,
+// which is why the decoder never noticed.
+//
+// This test takes NO GOLDEN, and that is the whole reason it exists.
+// Every other test that reaches the encoder also requires
+// VPIPE_MINIMAX_H3_AVAE_GOLDEN and returns early without it, so with the
+// path set and no golden the entire encoder path reported OK while
+// checking nothing -- which is exactly how this survived. That encode()
+// SUCCEEDS is worth asserting on its own, and it costs a checkpoint and
+// a synthetic waveform.
+//
+// Env: VPIPE_MINIMAX_H3_AVAE_PATH.
+TEST(minimax_h3_avae, encoder_builds_from_a_weight_normed_checkpoint)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string dir = MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(dir, cfg, &err));
+  auto vae = MetalMiniMaxH3AudioVae::load(dir, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+
+  // Half a second of stereo tone. What it IS does not matter -- the
+  // assertion is that the encoder half BUILDS and runs; the numbers are
+  // what encode_matches_golden is for.
+  const int rate = cfg.sample_rate > 0 ? cfg.sample_rate : 32000;
+  const int samples = rate / 2;
+  std::vector<float> pcm((std::size_t)2 * samples, 0.0f);
+  for (int c = 0; c < 2; ++c) {
+    const double f = (c == 0) ? 440.0 : 660.0;
+    for (int i = 0; i < samples; ++i) {
+      pcm[(std::size_t)c * samples + i] =
+          0.25f * (float)std::sin(2.0 * 3.14159265358979 * f * i / rate);
+    }
+  }
+  std::vector<float> z;
+  int frames = 0;
+  const bool ok = vae->encode(pcm.data(), 2, samples, &z, &frames, &err);
+  std::printf("[minimax_h3_avae] encoder build: ok=%d, %d latent frames, "
+              "has_encoder=%d%s%s\n", ok ? 1 : 0, frames,
+              vae->has_encoder() ? 1 : 0, err.empty() ? "" : ", err: ",
+              err.c_str());
+  ASSERT_TRUE(ok);
+  EXPECT_TRUE(vae->has_encoder());
+  EXPECT_TRUE(frames == vae->encoded_frames(samples));
+  EXPECT_TRUE(z.size() == (std::size_t)2 * frames * cfg.latent_channels);
+}
+
 TEST(minimax_h3_avae, resample_filters_are_shared)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");

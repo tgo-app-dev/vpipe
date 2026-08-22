@@ -49,6 +49,7 @@ using namespace vpipe;
 using namespace vpipe::genai;
 using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -106,7 +107,99 @@ vis_elt_(std::uint16_t v, bool bf16)
   return (float)h;
 }
 
+// A safetensors file of NAMED, EMPTY-ish tensors. Only the header is
+// read by the floor query -- it sums `nbytes` from the shapes -- so the
+// bodies are zeros and the file stays small enough to write per run.
+bool
+write_named_st_(const fs::path& p,
+                const std::vector<std::pair<std::string, int>>& ts)
+{
+  std::string hdr = "{";
+  std::uint64_t off = 0;
+  for (std::size_t i = 0; i < ts.size(); ++i) {
+    const std::uint64_t n = (std::uint64_t)ts[i].second * 2;
+    hdr += (i ? "," : "");
+    hdr += "\"" + ts[i].first + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+           std::to_string(ts[i].second) + "],\"data_offsets\":[" +
+           std::to_string(off) + "," + std::to_string(off + n) + "]}";
+    off += n;
+  }
+  hdr += "}";
+  std::ofstream f(p, std::ios::binary);
+  if (!f) { return false; }
+  const std::uint64_t hl = hdr.size();
+  f.write(reinterpret_cast<const char*>(&hl), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const std::vector<char> zero((std::size_t)off, 0);
+  f.write(zero.data(), (std::streamsize)zero.size());
+  return (bool)f;
+}
+
+// One synthetic encoder checkpoint under `stem`: a trunk, and four
+// layers of which the last is the widest.
+bool
+write_encoder_(const fs::path& file, const std::string& stem)
+{
+  std::vector<std::pair<std::string, int>> ts = {
+      {"model.visual.patch_embed.proj.weight", 64},
+      {stem.rfind("model.language_model.", 0) == 0
+           ? "model.language_model.embed_tokens.weight"
+           : "model.embed_tokens.weight", 256},
+  };
+  for (int l = 0; l < 4; ++l) {
+    const std::string p = stem + std::to_string(l) + ".";
+    ts.push_back({p + "self_attn.q_proj.weight", 32 * (l + 1)});
+    ts.push_back({p + "mlp.gate_proj.weight", 64 * (l + 1)});
+  }
+  return write_named_st_(file, ts);
+}
+
 }  // namespace
+
+// ---- the streaming FLOOR, under both name spellings ------------------
+//
+// The floor is what the resource plan credits a streaming encoder with,
+// and a floor of 0 does not mean "unknown" -- it means "this cannot be
+// reduced", so the whole checkpoint is counted resident for the whole
+// conditioning phase.
+//
+// The stem is therefore load-bearing, and there are TWO of them: the
+// diffusers checkpoint nests the text stack under
+// `model.language_model.`, Comfy-Org's conversion drops that segment.
+// Measuring only the repack's spelling reported no floor for the
+// RELEASED checkpoint -- MEASURED on MiniMaxAI/MiniMax-H3 FL2VA, 63624
+// MB counted where the encoder streams to 5963, which put a graph that
+// runs at a 64201 MB peak and warned it could not fit.
+//
+// No model and no GPU: the query reads a safetensors header.
+TEST(minimax_h3_text_enc, streaming_floor_sees_both_layer_spellings)
+{
+  const fs::path root = fs::temp_directory_path() / "vpipe-h3-encfloor";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+
+  for (const char* stem : {"model.language_model.layers.",
+                           "model.layers."}) {
+    const fs::path f = root / "model.safetensors";
+    fs::remove(f, ec);
+    ASSERT_TRUE(write_encoder_(f, stem));
+
+    const std::size_t floor =
+        MiniMaxH3TextEncoder::streaming_floor_bytes(f.string());
+    const std::size_t total = (std::size_t)fs::file_size(f, ec);
+    std::printf("[minimax_h3_text_enc] stem '%s': floor %zu of %zu bytes\n",
+                stem, floor, total);
+    // A floor at all -- this is what the diffusers spelling did not get.
+    EXPECT_TRUE(floor > 0);
+    // trunk (64+256 elems) + two widest layers (2 * 96 * 4 elems), in
+    // bytes, and it must be strictly under the whole checkpoint or it
+    // is not a reduction.
+    EXPECT_TRUE(floor == (std::size_t)(64 + 256 + 2 * (32 * 4 + 64 * 4)) * 2);
+    EXPECT_TRUE(floor < total);
+  }
+  fs::remove_all(root, ec);
+}
 
 // ---- the vision tower's VIDEO path (ref2va video references) ---------
 

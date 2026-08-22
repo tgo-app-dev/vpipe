@@ -21,7 +21,9 @@
 
 #include "minitest.h"
 
+#include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "common/flex-data.h"
@@ -587,6 +589,108 @@ TEST(minimax_h3_comfy, an_h3_text_encoder_is_recognized_either_way)
   fs::remove_all(root, ec);
 }
 
+// THE RELEASED LAYOUT'S version of the same question, which is why it
+// sits beside the repack's: MiniMaxAI publishes `FL2VA/` and `Ref2VA/`
+// as two complete pipelines in ONE repo, and the transformer configs
+// under them are byte-identical. So the directory NAME is the only thing
+// that distinguishes the DiTs, exactly as the FILE name is the only
+// thing that distinguishes the repack's, and both are resolved from the
+// partition the models DB carries.
+//
+// Empty files throughout: every probe here is an existence test, and the
+// bytes would be 133 GB.
+TEST(minimax_h3_comfy, a_released_checkout_resolves_the_told_partition)
+{
+  std::error_code ec;
+  const fs::path root = scratch_() / "released-both";
+  fs::remove_all(root, ec);
+  auto touch = [&](const fs::path& p, const char* body = "{}") {
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream f(p);
+    f << body;
+  };
+  auto pipeline = [&](const char* part, const char* partition) {
+    const fs::path d = root / part;
+    touch(d / "model_index.json",
+          partition[0] == 'f'
+              ? "{\"_minimax_h3\": {\"partition\": \"fl2va\"}}"
+              : "{\"_minimax_h3\": {\"partition\": \"ref2va\"}}");
+    touch(d / "transformer" / "config.json");
+    touch(d / "text_encoder" / "config.json");
+    touch(d / "video_vae" / "config.json");
+    touch(d / "video_vae" / "source" / "model.safetensors");
+    touch(d / "audio_vae" / "config.json");
+    touch(d / "audio_vae" / "model.safetensors");
+  };
+  pipeline("FL2VA", "fl2va");
+  pipeline("Ref2VA", "ref2va");
+
+  // The DiT: told, and told the other way. Getting this wrong is not a
+  // load error -- the two partitions share every name and shape -- it is
+  // a run that conditions on the wrong task.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  root.string(), "ref2va") ==
+              (root / "Ref2VA" / "transformer").string());
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  root.string(), "fl2va") ==
+              (root / "FL2VA" / "transformer").string());
+  // Untold: the historical FL2VA, so a graph written before Ref2VA
+  // existed resolves as it did.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string()) ==
+              (root / "FL2VA" / "transformer").string());
+  // And the partition each one reports comes from its own
+  // model_index.json, which is the only file in the tree that says.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(root.string()) ==
+              "fl2va");
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(root.string(),
+                                                      "ref2va") == "ref2va");
+
+  // ---- a Ref2VA-ONLY checkout -------------------------------------
+  //
+  // The case a FL2VA-only probe answered with NOTHING: the encoder and
+  // both VAEs live under the partition directory too, so a conditioner
+  // and both decoders had no weights to find.
+  const fs::path only = scratch_() / "released-ref-only";
+  fs::remove_all(only, ec);
+  {
+    const fs::path d = only / "Ref2VA";
+    touch(d / "model_index.json",
+          "{\"_minimax_h3\": {\"partition\": \"ref2va\"}}");
+    touch(d / "transformer" / "config.json");
+    touch(d / "text_encoder" / "config.json");
+    touch(d / "video_vae" / "config.json");
+    touch(d / "video_vae" / "source" / "model.safetensors");
+    touch(d / "audio_vae" / "config.json");
+    touch(d / "audio_vae" / "model.safetensors");
+  }
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  only.string(), "ref2va") ==
+              (only / "Ref2VA" / "transformer").string());
+  // Untold, an unambiguous checkout answers itself -- there is no other
+  // partition for it to be.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(only.string()) ==
+              (only / "Ref2VA" / "transformer").string());
+  // Told FL2VA, it must NOT hand back the Ref2VA DiT. Nothing resolves,
+  // and the load that follows says so.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  only.string(), "fl2va") !=
+              (only / "Ref2VA" / "transformer").string());
+  // The shared components resolve from whichever partition is present:
+  // both subtrees carry the same encoder and the same two VAEs, so
+  // there is no wrong answer here -- only a missing one.
+  EXPECT_TRUE(MiniMaxH3TextEncoder::resolve_encoder_dir(only.string()) ==
+              (only / "Ref2VA" / "text_encoder").string());
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(only.string()) ==
+              (only / "Ref2VA" / "video_vae" / "source").string());
+  EXPECT_TRUE(MetalMiniMaxH3AudioVae::resolve_vae_dir(only.string()) ==
+              (only / "Ref2VA" / "audio_vae").string());
+
+  std::printf("[minimax_h3_comfy] released checkout: told partitions "
+              "resolve, a ref2va-only tree resolves whole\n");
+  fs::remove_all(root, ec);
+  fs::remove_all(only, ec);
+}
+
 // A tree holding BOTH partitions is the case the models DB exists for.
 // Nothing in it can say which model a caller meant -- the filenames say
 // what the FILES are, not what the REFERENCE was -- so resolve_dit_dir
@@ -644,6 +748,27 @@ TEST(minimax_h3_comfy, a_told_partition_beats_the_filename)
   EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type(
                   "wan-t2v").empty());
   EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of_model_type("").empty());
+
+  // A repack carrying only ONE partition. Told the other, it must
+  // resolve to nothing: `prefer` RANKS, it does not filter, so the
+  // remaining file would otherwise be handed back -- and it loads
+  // cleanly, because the two partitions share every tensor name and
+  // shape. Untold, the same tree still answers with what it has, which
+  // is what "no partition was asked for" means.
+  const fs::path onef = scratch_() / "fl2va-only";
+  fs::remove_all(onef, ec);
+  write_component_(onef / "diffusion_models" /
+                       "minimax_h3_fl2va_bf16.safetensors",
+                   "config", kH3Config);
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  onef.string(), "ref2va")) !=
+              "minimax_h3_fl2va_bf16.safetensors");
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  onef.string(), "fl2va")) ==
+              "minimax_h3_fl2va_bf16.safetensors");
+  EXPECT_TRUE(names(MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  onef.string())) == "minimax_h3_fl2va_bf16.safetensors");
+  fs::remove_all(onef, ec);
 
   std::printf("[minimax_h3_comfy] a tree with both DiTs resolves fl2va "
               "untold, ref2va when told\n");

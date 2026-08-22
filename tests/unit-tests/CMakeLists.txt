@@ -54,6 +54,8 @@ set(LOCAL_TEST_SOURCES
   pipeline-spec.cc
   pipeline.cc
   rest-client-stage.cc
+  resumable-fetch.cc
+  xet-fetch.cc
   profiling.cc
   perf-buffer.cc
   hls-broadcast-stage.cc

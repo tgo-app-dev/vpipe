@@ -128,8 +128,13 @@ MetalMiniMaxH3AudioVae::resolve_vae_dir(const std::string& path)
   if (fs::exists(p / "audio_vae" / "model.safetensors")) {
     return (p / "audio_vae").string();                   // a partition root
   }
-  if (fs::exists(p / "FL2VA" / "audio_vae" / "model.safetensors")) {
-    return (p / "FL2VA" / "audio_vae").string();
+  // Either partition's copy: both `FL2VA/` and `Ref2VA/` are complete
+  // pipelines carrying the same codec, so a Ref2VA-only checkout has to
+  // resolve here too and which copy answers does not matter.
+  for (const char* part : {"FL2VA", "Ref2VA"}) {
+    if (fs::exists(p / part / "audio_vae" / "model.safetensors")) {
+      return (p / part / "audio_vae").string();
+    }
   }
   return path;
 }
@@ -837,7 +842,17 @@ MetalMiniMaxH3AudioVae::build_encoder_(std::string* err)
   if (_enc_loaded) { return true; }
   if (!_ws) { return fail("no weight set"); }
   WeightSet& ws = *_ws;
-  if (ws.src().info("encoder.block.0.weight") == nullptr) {
+  // Probed the way conv1d_ RESOLVES it, not the way an un-normed
+  // checkpoint would spell it. Every convolution in this VAE is weight-
+  // normalized -- the released audio VAE stores `weight_g` / `weight_v`
+  // for every convolution it has -- so asking for the folded name found
+  // nothing and reported a checkpoint with a complete 147-tensor encoder
+  // as carrying none. The decoder never noticed because it goes straight
+  // through conv1d_, which has handled both spellings all along; only
+  // this probe was written against the other one, and its cost was that
+  // every `ref2va` reference with a soundtrack was silently skipped.
+  if (ws.src().info("encoder.block.0.weight_v") == nullptr &&
+      ws.src().info("encoder.block.0.weight") == nullptr) {
     return fail("this checkpoint carries no audio encoder");
   }
   const Config& c = _cfg;

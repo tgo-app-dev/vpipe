@@ -2,6 +2,7 @@
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
+#include "stages/resumable-fetch.h"
 #include "stages/qwen-asr-tokenizer.h"
 
 #include "common/flex-data.h"
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -26,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include <curl/curl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -36,15 +37,6 @@ namespace fs = std::filesystem;
 namespace vpipe {
 
 namespace {
-
-// One-shot global curl init (idempotent; rest-client uses the same
-// pattern). Safe to call from any thread.
-void
-ensure_curl_global_init()
-{
-  static std::once_flag once;
-  std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
-}
 
 void
 trim_(string& s)
@@ -64,16 +56,6 @@ expand_user_(const string& p)
     }
   }
   return p;
-}
-
-string
-human_bytes_(uint64_t n)
-{
-  const char* u[] = { "B", "KB", "MB", "GB", "TB" };
-  double v = static_cast<double>(n);
-  int i = 0;
-  while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
-  return fmt("{:.1f} {}", v, u[i])();
 }
 
 // Which of the catalogue entries published from one repo the caller
@@ -197,169 +179,6 @@ select_from_(const SessionContextIntf* s, const string& title,
   }
 }
 
-// ---- libcurl GET ------------------------------------------------------
-
-size_t
-write_to_string_(char* p, size_t s, size_t n, void* u)
-{
-  static_cast<string*>(u)->append(p, s * n);
-  return s * n;
-}
-
-size_t
-write_to_ofstream_(char* p, size_t s, size_t n, void* u)
-{
-  auto* o = static_cast<std::ofstream*>(u);
-  o->write(p, static_cast<std::streamsize>(s * n));
-  return o->good() ? s * n : 0;
-}
-
-// ---- download progress -------------------------------------------------
-
-// Files at least this large get a live progress report.
-constexpr curl_off_t kBigFileBytes = curl_off_t{256} * 1024 * 1024;
-
-// Per-download progress state handed to the libcurl xferinfo callback.
-struct ProgressCtx {
-  vpipe::UiProgress* progress = nullptr;
-  // Poll predicate: when set and it returns true, the xferinfo callback
-  // aborts the transfer mid-flight (-> CURLE_ABORTED_BY_CALLBACK).
-  const std::function<bool()>* cancel = nullptr;
-};
-
-// libcurl CURLOPT_XFERINFOFUNCTION. Pushes the raw byte counts every
-// time libcurl calls -- no percentage-change throttle, because the
-// renderers coalesce on their own clocks (see UiProgressRegistry) and
-// update() is a mutex plus a few field writes.
-int
-progress_cb_(void* p, curl_off_t dltotal, curl_off_t dlnow,
-             curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
-{
-  auto* c = static_cast<ProgressCtx*>(p);
-  if (c && c->cancel && (*c->cancel)()) { return 1; }   // abort transfer
-  if (!c || !c->progress) {
-    return 0;
-  }
-  // dltotal is 0 until the response headers land, which the report
-  // shows as indeterminate rather than as 0%.
-  const auto now   = static_cast<std::uint64_t>(dlnow   < 0 ? 0 : dlnow);
-  const auto total = static_cast<std::uint64_t>(dltotal < 0 ? 0 : dltotal);
-  // Before the headers land there is no total, so report just what has
-  // arrived -- "1.2 GB / 0.0 B" would read as a broken denominator.
-  c->progress->update(now, total,
-                      total > 0 ? human_bytes_(now) + " / "
-                                    + human_bytes_(total)
-                                : human_bytes_(now));
-  return 0;
-}
-
-// Shared easy-handle perform. `wcb`/`wdata` sink the body. Fills
-// `*http_status` with the response code. When `progress` is non-null the
-// transfer runs with the xferinfo callback (it draws the bar when a stream
-// is set and/or polls the cancel predicate). Returns the CURLcode.
-CURLcode
-curl_perform_(const string& url, const string& token, bool verify_tls,
-              long timeout_s, size_t (*wcb)(char*, size_t, size_t, void*),
-              void* wdata, long* http_status, ProgressCtx* progress)
-{
-  CURL* c = curl_easy_init();
-  if (!c) {
-    return CURLE_FAILED_INIT;
-  }
-  struct curl_slist* hdrs = nullptr;
-  hdrs = curl_slist_append(hdrs, "User-Agent: vpipe-model-fetch/1");
-  string auth;
-  if (!token.empty()) {
-    auth = "Authorization: Bearer " + token;
-    hdrs = curl_slist_append(hdrs, auth.c_str());
-  }
-  curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
-  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-  if (progress) {
-    // Attach the xferinfo callback whenever a ProgressCtx is present -- it
-    // carries the bar stream and/or the cancel predicate (the callback
-    // no-ops the bar when no stream is set).
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, &progress_cb_);
-    curl_easy_setopt(c, CURLOPT_XFERINFODATA, progress);
-  } else {
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 1L);
-  }
-  curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, verify_tls ? 1L : 0L);
-  curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, verify_tls ? 2L : 0L);
-  curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout_s);
-  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
-  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wcb);
-  curl_easy_setopt(c, CURLOPT_WRITEDATA, wdata);
-  CURLcode rc = curl_easy_perform(c);
-  if (http_status) {
-    *http_status = 0;
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, http_status);
-  }
-  curl_slist_free_all(hdrs);
-  curl_easy_cleanup(c);
-  return rc;
-}
-
-// GET into a string. `err` set + false on transport / HTTP error;
-// `*status` carries the HTTP code (so the caller can detect 401/403).
-bool
-http_get_(const string& url, const string& token, bool verify_tls,
-          long timeout_s, string& out, long& status, string& err)
-{
-  out.clear();
-  CURLcode rc = curl_perform_(url, token, verify_tls, timeout_s,
-                              &write_to_string_, &out, &status, nullptr);
-  if (rc != CURLE_OK) {
-    err = curl_easy_strerror(rc);
-    return false;
-  }
-  if (status < 200 || status >= 300) {
-    err = fmt("HTTP {}", status)();
-    return false;
-  }
-  return true;
-}
-
-// GET streaming to `dest` (parent dirs created). `*status` carries the
-// HTTP code; `err` set + false on failure. When `progress` is non-null,
-// the transfer's byte counts are pushed to it for the duration. When
-// `cancel` is non-null it is polled mid-transfer; if it returns true
-// the transfer aborts (curl error -> the partial dest is removed).
-bool
-http_download_(const string& url, const string& token, bool verify_tls,
-               long timeout_s, const fs::path& dest, long& status,
-               string& err, vpipe::UiProgress* progress,
-               const std::function<bool()>* cancel = nullptr)
-{
-  std::error_code ec;
-  fs::create_directories(dest.parent_path(), ec);
-  std::ofstream ofs(dest, std::ios::binary | std::ios::trunc);
-  if (!ofs) {
-    err = fmt("cannot open '{}' for writing", dest.string())();
-    return false;
-  }
-  ProgressCtx pctx;
-  pctx.progress = progress;
-  pctx.cancel   = cancel;
-  CURLcode rc = curl_perform_(url, token, verify_tls, timeout_s,
-                              &write_to_ofstream_, &ofs, &status,
-                              (progress || cancel) ? &pctx : nullptr);
-  ofs.close();
-  if (rc != CURLE_OK) {
-    err = curl_easy_strerror(rc);
-    fs::remove(dest, ec);
-    return false;
-  }
-  if (status < 200 || status >= 300) {
-    err = fmt("HTTP {}", status)();
-    fs::remove(dest, ec);
-    return false;
-  }
-  return true;
-}
-
 // ---- archive extraction -----------------------------------------------
 
 // Unpack `archive` into `dest_dir` with the system tar (no shell, so paths
@@ -427,6 +246,11 @@ ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
   _skip_existing_files = attr_bool("skip_existing_files");
   _verify_tls          = attr_bool("verify_tls");
   _timeout_seconds     = static_cast<unsigned>(attr_uint("timeout_seconds"));
+  _stall_seconds       = static_cast<unsigned>(attr_uint("stall_seconds"));
+  _download_retries    =
+      static_cast<unsigned>(attr_uint("download_retries"));
+  _verify_checksums    = attr_bool("verify_checksums");
+  _xet_streams         = static_cast<unsigned>(attr_uint("xet_streams"));
 
   allocate_oports(spec().oports.size());
 }
@@ -479,8 +303,50 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "verify_tls", .type = ConfigType::Bool,
    .doc = "enforce TLS certificate validation", .def_bool = true},
   {.key = "timeout_seconds", .type = ConfigType::Uint,
-   .doc = "per-file network timeout (large shards need headroom)",
+   .doc = "deadline for the metadata calls (the repo file listing). A "
+          "FILE transfer is bounded by stall_seconds instead: a total "
+          "deadline cannot tell a slow link from a dead one, and a 20 "
+          "GB shard at 2 MB/s is three hours of perfectly healthy "
+          "download",
    .def_uint = 1800},
+  {.key = "stall_seconds", .type = ConfigType::Uint,
+   .doc = "abandon a file transfer after this long below 1 KB/s and "
+          "retry it FROM WHERE IT STOPPED. This is the timeout that "
+          "matters for big shards -- it fires on a connection that has "
+          "died, never on one that is merely slow. 0 -> no stall "
+          "detection (a hung transfer then blocks until the peer drops "
+          "it)",
+   .def_uint = 120},
+  {.key = "download_retries", .type = ConfigType::Uint,
+   .doc = "extra attempts per file after the first, each resuming from "
+          "the partial file on disk (waits 2/5/15/30/60s between). The "
+          "partial survives the stage either way, so a fetch that runs "
+          "out of attempts continues rather than restarts when it is "
+          "run again",
+   .def_uint = 5},
+  {.key = "xet_streams", .type = ConfigType::Uint,
+   .doc = "how many ranges to pull at once for a big file the repo "
+          "publishes a content-store hash for. Such a file is stored as "
+          "deduplicated, compressed chunks that can be fetched in "
+          "parallel and reassembled, rather than streamed down one "
+          "connection, which can be the ceiling well before the link "
+          "is. MEASURED on a 5.2 GB bf16 shard, three interleaved "
+          "pairs: 88.3 MB/s median as one stream, 94.4 at 8 -- 1.07x, "
+          "mostly the 0.873x bytes the store needs for bf16 weights "
+          "rather than the parallelism, because one stream was already "
+          "near this link's ceiling. Worth much more where a single "
+          "stream is the constraint. 0 -> always take the plain single "
+          "stream. Files under 256 MB take it regardless: two extra "
+          "round trips is not worth it for them",
+   .def_uint = 8},
+  {.key = "verify_checksums", .type = ConfigType::Bool,
+   .doc = "check every downloaded file against the checksum its repo "
+          "publishes -- SHA-256 for the LFS shards, the git blob SHA-1 "
+          "for the small files -- and re-fetch it whole if it does not "
+          "match. HuggingFace publishes no MD5 for any file, so there "
+          "is no MD5 to check against. A file whose repo publishes "
+          "nothing is reported as unchecked rather than passed",
+   .def_bool = true},
 };
 // One trigger iport (optional, any beat type) + one summary oport shared
 // by all four "preparation" stages so they can be cascaded into a recipe
@@ -767,6 +633,16 @@ ModelFetchStage::process(RuntimeContext& ctx)
   s->info(fmt("ModelFetchStage('{}'): fetching '{}' -> '{}'",
               this->id(), hf_path, local_dir.string()));
 
+  // How every file below is fetched: no total deadline, a stall window,
+  // retries that resume, the content store for the big ones, and a
+  // checksum check at the end.
+  FetchOpts fopts;
+  fopts.verify_tls  = _verify_tls;
+  fopts.stall_s     = static_cast<long>(_stall_seconds);
+  fopts.retries     = _download_retries;
+  fopts.verify      = _verify_checksums;
+  fopts.xet_streams = _xet_streams;
+
   // -------- 3b. Dataset fetch (eval datasets) -------------------------
   // A catalogue entry carrying explicit dataset_files is fetched VERBATIM from
   // the given URLs (the HF datasets-server /rows pages) into local_dir and
@@ -788,9 +664,12 @@ ModelFetchStage::process(RuntimeContext& ctx)
                   i + 1, entry->dataset_files.size(), dest));
       long st = 0;
       string derr;
-      // Datasets-server is public -- no auth token needed.
-      if (!http_download_(url, string(), _verify_tls, _timeout_seconds, out,
-                          st, derr, nullptr, &cancel)) {
+      // Datasets-server is public -- no auth token needed. It publishes
+      // no checksum either, so these retry but never resume: a part
+      // with nothing to check it against is not worth continuing.
+      FetchRequest dreq;
+      dreq.url = url;
+      if (!fetch_file(s, dreq, fopts, out, st, derr, nullptr, &cancel)) {
         s->error(fmt("ModelFetchStage('{}'): dataset fetch '{}' failed: {}",
                      this->id(), dest, derr));
       }
@@ -819,7 +698,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
     s->info(fmt(
         "ModelFetchStage('{}'): dataset '{}' ({}) registered in the "
-        "model registry", this->id(), reg_key, human_bytes_(total)));
+        "model registry", this->id(), reg_key, human_bytes(total)));
     ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
     ro.insert_or_assign("text", FlexData::make_string(
         fmt("[model-fetch] dataset {}\n  -> {}\n  {} file(s), {} bytes",
@@ -849,7 +728,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
       + "/tree/main?recursive=true";
   string body, err;
   long   status = 0;
-  bool   ok = http_get_(tree_url, token, _verify_tls,
+  bool   ok = http_get_text(tree_url, token, _verify_tls,
                         _timeout_seconds, body, status, err);
   // Gated/private repo without a usable token: prompt once (masked) and
   // retry. This is where getpasswd earns its keep.
@@ -862,7 +741,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
       trim_(t);
       if (!t.empty()) {
         token = t;
-        ok = http_get_(tree_url, token, _verify_tls, _timeout_seconds,
+        ok = http_get_text(tree_url, token, _verify_tls, _timeout_seconds,
                        body, status, err);
       }
     }
@@ -911,6 +790,12 @@ ModelFetchStage::process(RuntimeContext& ctx)
   uint64_t total_bytes = 0;
   uint64_t downloaded  = 0;
   uint64_t skipped     = 0;
+  // How much of what we fetched the repo let us check. Worth counting
+  // separately: "checked" and "publishes nothing to check against" are
+  // very different assurances, and a fetch that silently did neither
+  // reads the same as one that did both.
+  uint64_t checked     = 0;
+  uint64_t unchecked   = 0;
   FlexData files_arr = FlexData::make_array();
   for (size_t i = 0; i < files.size(); ++i) {
     if (ctx.stop_requested()) {
@@ -926,35 +811,62 @@ ModelFetchStage::process(RuntimeContext& ctx)
     if (_skip_existing_files && f.size > 0 && fs::exists(dest)
         && fs::file_size(dest, ec) == f.size && !ec) {
       s->info(fmt("  [{}/{}] {} ({}) -- present, skip",
-                  i + 1, files.size(), f.path, human_bytes_(f.size)));
+                  i + 1, files.size(), f.path, human_bytes(f.size)));
       ++skipped;
       continue;
     }
     s->info(fmt("  [{}/{}] {} ({}) ...",
                 i + 1, files.size(), f.path,
-                f.size ? human_bytes_(f.size) : string("size unknown")));
+                f.size ? human_bytes(f.size) : string("size unknown")));
     const string file_url = "https://huggingface.co/" + hf_path
                           + "/resolve/main/" + f.path;
     // A live progress report for big shards -- a bar in the console
     // footer, an entry in the web UI's progress panel. The handle
     // closes itself when it leaves scope, including on the error path.
     UiProgress bar;
-    if (static_cast<curl_off_t>(f.size) >= kBigFileBytes) {
+    if (f.size >= kBigFileBytes) {
       bar = s->open_progress(fs::path(f.path).filename().string());
     }
     long dl_status = 0;
     string dl_err;
-    if (!http_download_(file_url, token, _verify_tls, _timeout_seconds,
-                        dest, dl_status, dl_err, &bar, &cancel)) {
+    FetchRequest freq;
+    freq.url          = file_url;
+    freq.token        = token;
+    freq.want.size    = f.size;
+    freq.want.sha256  = f.sha256;
+    freq.want.git_oid = f.git_oid;
+    // A repo that publishes a xet hash can be rebuilt from the content
+    // store instead of streamed, which is many ranges at once rather
+    // than one. Only worth the extra round trips on a big file.
+    if (!f.xet_hash.empty() && f.size >= kBigFileBytes) {
+      freq.xet.repo     = hf_path;
+      freq.xet.revision = "main";
+      freq.xet.hash     = f.xet_hash;
+    }
+    FileCheck fc = FileCheck::NotPublished;
+    if (!fetch_file(s, freq, fopts, dest, dl_status, dl_err, &bar,
+                    &cancel, &fc)) {
       s->error(fmt("ModelFetchStage('{}'): download of '{}' failed: {}",
                    this->id(), f.path, dl_err));
     }
     ++downloaded;
+    if (fc == FileCheck::Ok) { ++checked; } else { ++unchecked; }
   }
   s->info(fmt("ModelFetchStage('{}'): {} file(s) ({} downloaded, {} "
               "already present), {} total",
               this->id(), files.size(), downloaded, skipped,
-              human_bytes_(total_bytes)));
+              human_bytes(total_bytes)));
+  if (!_verify_checksums) {
+    s->info(fmt("ModelFetchStage('{}'): verify_checksums is off -- "
+                "nothing downloaded was checked", this->id()));
+  } else if (downloaded > 0) {
+    s->info(fmt("ModelFetchStage('{}'): {} of {} downloaded file(s) "
+                "matched the checksum '{}' publishes{}",
+                this->id(), checked, downloaded, hf_path,
+                unchecked > 0
+                    ? fmt("; {} publish none", unchecked)()
+                    : string()));
+  }
 
   // -------- 6b. Companion files from another repo ---------------------
   // What completes a weights-only repack: the tokenizer its publisher did
@@ -979,8 +891,14 @@ ModelFetchStage::process(RuntimeContext& ctx)
       long   cstatus = 0;
       string cerr;
       UiProgress cbar;
-      if (!http_download_(curl_url, token, _verify_tls, _timeout_seconds,
-                          dest, cstatus, cerr, &cbar, &cancel)) {
+      // No tree listing for the other repo, so no published size or
+      // checksum to hold these to -- so, as above, they retry but do
+      // not resume. These are a few MB of vocabulary and config.
+      FetchRequest creq;
+      creq.url   = curl_url;
+      creq.token = token;
+      if (!fetch_file(s, creq, fopts, dest, cstatus, cerr, &cbar,
+                      &cancel)) {
         // WARN, not error: error() throws, and discarding a finished
         // multi-GB fetch over a few MB is the worse outcome. Name the
         // consequence and the file, so this reads as "top this up"
