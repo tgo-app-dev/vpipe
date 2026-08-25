@@ -408,27 +408,31 @@ VaeEncodeStage::unload_vae_()
       !_plugin_enc) {
     return;
   }
-  // TO THE POOL when the policy is `auto`, and BEFORE the resets:
-  // pool_weights() finds the set through a WEAK reference, so once these
-  // models drop their last strong one there is nothing left to pool.
-  //
-  // `auto` is the case the pool exists for -- a VAE dropped because the
-  // box was tight, wanted again on the very next clip. Pooled, it stays
-  // purgeable: a peer that genuinely needs the room takes it through
-  // reclaim_at_least(), and one that does not leaves the next decode
-  // nothing to reload. `destroy` is the caller asking for the bytes back
-  // now, so it keeps dropping them.
-  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
-    if (auto* mgr = session()->services()->generative_model_manager()) {
-      mgr->pool_weights(vae_dir_for_release_());
-    }
-  }
+  // SETTLED when the policy is `auto`. The manager owns the checkpoint,
+  // so dropping these models only ends this stage's borrow; what the
+  // call does is ask for it to be settled now -- parked if nobody else
+  // is borrowing it, left alone if someone is. The order against the
+  // resets below no longer matters (it did when the manager's reference
+  // was weak and there was nothing left to pool afterwards).
   _vae.reset();
   _flux2_vae.reset();
   _mage_vae.reset();
   _wan_vae.reset();
   _h3_vae.reset();
   _plugin_enc.reset();
+  // SETTLE IT NOW that the borrow has ended. `destroy` is the caller
+  // asking for the bytes back, which parking does not do; anything else
+  // keeps the checkpoint for the next clip, purgeable, so a peer that
+  // genuinely needs the room takes it through reclaim_at_least() and one
+  // that does not leaves the next decode nothing to reload.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    const std::string vdir = vae_dir_for_release_();
+    if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+      mgr->drop_weights(vdir);
+    } else {
+      mgr->pool_weights(vdir);
+    }
+  }
   _unloaded = true;
   _quiet_reload = true;
   session()->log_debug(fmt("VaeEncodeStage('{}'): VAE encoder unloaded (idle)",

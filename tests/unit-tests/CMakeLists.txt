@@ -188,6 +188,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-t2i.cc
         qwen-image-edit-awq.cc
         flux2-smoke.cc
+        image-memory-plan.cc
         boogu-smoke.cc
         llm-chat-template.cc
         llm-sampler.cc
@@ -202,6 +203,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc
         image-resample-stage.cc
+        temporal-stack-stage.cc
         text-chat-stage.cc
         text-to-speech-stage.cc
         visual-qa-stage.cc

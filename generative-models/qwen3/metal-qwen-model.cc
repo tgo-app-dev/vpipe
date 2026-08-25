@@ -5,7 +5,7 @@
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"

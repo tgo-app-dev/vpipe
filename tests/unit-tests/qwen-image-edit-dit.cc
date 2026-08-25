@@ -14,6 +14,7 @@
 #include "common/session.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -173,6 +174,102 @@ TEST(qwen_image_edit_dit, mma_matches_steel)
   EXPECT_TRUE(rb < 0.01);
   // Velocity is diagnostic only: bound it loosely to still catch NaN/garbage.
   EXPECT_TRUE(std::isfinite(rv) && rv < 0.2);
+}
+
+
+// STREAMED must equal PRELOADED, byte for byte.
+//
+// The streaming path reads each block into a reusable slot with pread
+// and issues the next block's read under the current block's GPU work
+// (shared/block-slots.h). That moves where the bytes come from and when
+// they arrive; it must not move a single bit of the result.
+//
+// Bit-identity is available here and is the right bar. A tolerance
+// would pass a port that skipped a block, ran one twice, read the wrong
+// index, or raced a prefetch against the slot the GPU was reading --
+// which are exactly the failures this mechanism can have, and all of
+// them produce plausible-looking numbers.
+//
+// Nothing declares a residency reserve in a unit test, so growth stays
+// off and every block of every forward really does stream. That is the
+// configuration the slots exist for, and the one a roomy box would
+// otherwise never reach (it promotes the whole stack on the first pass).
+//
+// VPIPE_QIE_STREAM_DUMP writes the streamed velocity to a file, so the
+// same test on two builds can be diffed against each other rather than
+// only against itself.
+TEST(qwen_image_edit_dit, streamed_matches_preloaded)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH");
+  const char* dd   = std::getenv("VPIPE_QWEN_IMAGE_EDIT_DIT_DIR");
+  const std::string dit_dir =
+      (dd != nullptr && *dd != '\0') ? std::string(dd)
+      : (root != nullptr && *root != '\0') ? std::string(root) + "/transformer"
+      : std::string();
+  if (dit_dir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  const int gh = 16, gw = 16, gen_seq = gh * gw, txt_seq = 96;
+  const int IC = 64, TXTD = 3584;
+  auto rnd = [](std::uint32_t& s) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (float)((s >> 8) & 0xffffff) / 16777216.0f - 0.5f;
+  };
+  std::uint32_t s1 = 0x1234567u, s2 = 0x89abcdefu;
+  std::vector<float> hidden((std::size_t)gen_seq * IC),
+                     txt((std::size_t)txt_seq * TXTD);
+  for (auto& v : hidden) { v = rnd(s1); }
+  for (auto& v : txt)    { v = rnd(s2); }
+  const SharedBuffer h = upload_(mc, hidden);
+  const SharedBuffer t = upload_(mc, txt);
+  const float sigma = 0.7f;
+
+  // One at a time: two of these is ~20 GB and the point is not to
+  // measure what a box does under that.
+  // The FORWARD is timed, not the load: the load is one 38 GB read
+  // either way and would bury the thing under test. One streamed
+  // forward reads the whole stack, so this is the read path's number.
+  double fwd_s = 0.0;
+  auto run = [&](bool stream, std::vector<float>& vel) -> bool {
+    auto m = MetalQwenImageTransformer::load(dit_dir, mc, {}, stream);
+    if (m == nullptr) { return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer v = m->forward(h, gen_seq, t, txt_seq, gh, gw, sigma);
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (v.empty()) { return false; }
+    vel = readback_(v, (std::size_t)gen_seq * IC);
+    return true;
+  };
+
+  std::vector<float> pre, str;
+  ASSERT_TRUE(run(false, pre));
+  const double pre_s = fwd_s;
+  ASSERT_TRUE(run(true, str));
+  std::printf("[qwen_image_edit_dit] forward: preloaded %.1f s, streamed "
+              "%.1f s (slots %s)\n", pre_s, fwd_s,
+              std::getenv("VPIPE_QIE_NO_SLOTS") != nullptr ? "OFF" : "on");
+  ASSERT_TRUE(pre.size() == str.size() && !pre.empty());
+
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[qwen_image_edit_dit] streamed vs preloaded: %zu of %zu "
+              "floats differ (worst %.3e)\n", diff, pre.size(), worst);
+  EXPECT_TRUE(diff == 0);
+
+  if (const char* out = std::getenv("VPIPE_QIE_STREAM_DUMP")) {
+    std::ofstream f(out, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(str.data()),
+            (std::streamsize)(str.size() * sizeof(float)));
+  }
 }
 
 TEST(qwen_image_edit_dit, step_matches_golden)

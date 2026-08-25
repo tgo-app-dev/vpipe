@@ -1,6 +1,6 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"

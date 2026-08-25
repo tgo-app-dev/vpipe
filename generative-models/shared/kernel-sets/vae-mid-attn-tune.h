@@ -15,6 +15,12 @@
 // its GPU clock on the SoC power budget, so a sequential arm-at-a-time layout
 // reads back whichever arm ran coldest).
 //
+// AND THEY ARE VERIFIED FIRST. Timing alone picks a member that is fast and
+// WRONG and reports nothing -- which is exactly what happened: see the
+// correctness gate below. The members are not numerically interchangeable at
+// this call site, so a candidate that cannot reproduce the reference at
+// realistic score magnitudes never reaches the stopwatch.
+//
 // The caller owns the kernels and the dispatch -- it passes an `encode` that
 // runs one attention with a given member, the same entry point its decode uses,
 // so the tuner measures the shipping path rather than a re-derivation of it.
@@ -28,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <deque>
 #include <functional>
@@ -88,7 +95,7 @@ inline constexpr int kProbeN = 2048;
 template <class Mc, class Enc>
 inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
                      Kind fallback, const EncodeFn& encode,
-                     std::string* detail = nullptr)
+                     std::string* detail = nullptr, bool verify = true)
 {
   if (std::getenv("VPIPE_VAE_ATTN_NO_AUTOTUNE") != nullptr) { return fallback; }
   if (cands.size() < 2) { return fallback; }
@@ -120,15 +127,8 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
   metal_compute::SharedBuffer v = mc->make_shared_buffer(n * 2);
   metal_compute::SharedBuffer att = mc->make_shared_buffer(n * 2);
   if (q.empty() || k.empty() || v.empty() || att.empty()) { return fallback; }
-  {   // non-degenerate values: a constant input makes the softmax uniform
-    auto* pq = static_cast<_Float16*>(q.contents());
-    auto* pk = static_cast<_Float16*>(k.contents());
-    auto* pv = static_cast<_Float16*>(v.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      const float t = (float)(i % 61) * 0.01f - 0.3f;
-      pq[i] = (_Float16)t; pk[i] = (_Float16)(-t); pv[i] = (_Float16)(t * 0.5f);
-    }
-  }
+  // Values are written by fill_probe below -- non-degenerate, because a
+  // constant input makes the softmax uniform and every member agrees.
   // Scratch is REUSED across bench calls, not reallocated: these buffers are
   // UMA and mlock-wired, and the materialized member asks for tens of MB of
   // score band per call. Wiring that per dispatch cost more than the kernels
@@ -150,7 +150,111 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
   };
   Release rel = [](const metal_compute::SharedBuffer&) {};
   const float scale = 1.0f / std::sqrt((float)C);
+
+  // ---- CORRECTNESS GATE, before anything is timed --------------------
+  //
+  // A tuner that ranks by time alone will pick a member that is fast and
+  // WRONG, and say nothing. MEASURED: on an M4 Pro the materialized
+  // member won this tune at 3 ms against the flash members' 4-8 ms and
+  // took the Boogu-Image VAE round-trip from 37.8 dB to 5.79 -- because
+  // it MATERIALIZES QK^T in f16, and this call site's Q/K are raw
+  // conv1x1 outputs, not normalized projections. In that VAE's DECODER
+  // max|q| = 975 and max|k| = 428 at D = 512, so the scores reach
+  // 1.24e8: every one of them is outside f16's 65504 and the softmax
+  // collapses to an average. The ENCODER of the same model peaks at
+  // 5885 and is fine, which is why the failure looked intermittent.
+  //
+  // So each candidate is CHECKED against a reference before it is
+  // allowed to compete. The probe deliberately drives the scores past
+  // f16 -- a positive-mean Q/K, so the dot is ~D*A^2 rather than a
+  // random walk -- because that is the property that separates the
+  // members. The timing probe below stays small and cheap; this one runs
+  // once per candidate and is O(N^2) at the same N.
+  //
+  // The reference is whatever the caller can encode most simply and is
+  // known good at any magnitude: the scalar O(N^2) member accumulates in
+  // f32 per query row. If the caller has no scalar member, the gate is
+  // skipped rather than guessed at.
+  auto fill_probe = [&](float amp) {
+    auto* pq = static_cast<_Float16*>(q.contents());
+    auto* pk = static_cast<_Float16*>(k.contents());
+    auto* pv = static_cast<_Float16*>(v.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const float t = (float)(i % 61) * 0.01f - 0.3f;
+      pq[i] = (_Float16)(amp + t);
+      pk[i] = (_Float16)(amp - t);
+      pv[i] = (_Float16)(t * 0.5f);
+    }
+  };
   std::vector<Kind> live = cands;
+  if (verify) {
+    // AMPLITUDE. The dot is ~D*A^2, so A=20 at D=512 puts the scores near
+    // 2.0e5 -- 3x past f16's 65504 -- while every INPUT stays comfortably
+    // inside it. A member is therefore judged on where it keeps the
+    // SCORES and on nothing else. MEASURED at A=10 (dot ~5.1e4, just
+    // UNDER the limit) the materialized member still failed, but only at
+    // rel-L2 0.14 against a 0.05 bar; A=20 makes it unambiguous without
+    // driving the softmax so peaked that correct members disagree on
+    // which key wins.
+    fill_probe(20.0f);
+    std::vector<float> ref;
+    double worst_kept = 0.0;
+    auto capture = [&](Kind kind, std::vector<float>* out) {
+      next = 0;
+      std::memset(att.contents(), 0, n * 2);
+      autotune_time(mc, 1, [&](Enc& enc) {
+        encode(enc, kind, q, k, v, att, hw, C, scale, alloc, rel);
+      });
+      const auto* pa = static_cast<const _Float16*>(att.contents());
+      out->resize(n);
+      for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)pa[i]; }
+    };
+    capture(Kind::kScalar, &ref);
+    double den = 0.0;
+    for (float f : ref) { den += (double)f * (double)f; }
+    if (den > 0.0) {
+      std::vector<Kind> ok;
+      std::vector<float> got;
+      for (Kind kind : live) {
+        capture(kind, &got);
+        double num = 0.0;
+        bool finite = true;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double d = (double)got[i] - (double)ref[i];
+          if (!std::isfinite(got[i])) { finite = false; break; }
+          num += d * d;
+        }
+        const double r = finite ? std::sqrt(num / den) : 1e9;
+        if (r < 0.05) {
+          ok.push_back(kind);
+          if (r > worst_kept) { worst_kept = r; }
+          continue;
+        }
+        // Named, always. A member silently dropped is a performance
+        // change nobody can account for later, and the number is the
+        // only thing that says whether the bar was close.
+        if (detail != nullptr) {
+          *detail += std::string(name(kind)) + " REJECTED(rel-L2 " +
+                     std::to_string(r) + ") ";
+        }
+      }
+      // Never reject everything: a gate that empties the candidate list
+      // has told us the REFERENCE is what disagrees, and falling back is
+      // the only answer that cannot make things worse.
+      if (!ok.empty()) { live = ok; }
+      if (detail != nullptr && !ok.empty()) {
+        *detail += "verified(worst rel-L2 " + std::to_string(worst_kept) +
+                   ") ";
+      }
+    }
+    fill_probe(0.0f);            // back to the timing probe's values
+    if (live.size() < 2) {
+      const Kind won = live.empty() ? fallback : live[0];
+      std::lock_guard<std::mutex> lk(memo_mu);
+      memo[key] = won;
+      return won;
+    }
+  }
   auto bench = [&](int i) -> double {
     if (!alloc_ok) { return 0.0; }
     next = 0;                                  // rewind the scratch ring

@@ -126,27 +126,28 @@ GenerativeModelManager::weight_set(const string& dir, const string& variant)
   if (dir.empty()) { return nullptr; }
   const string key = canonicalize_(session(), dir) + "|" + variant;
 
+  // Anything nobody borrows any more is settled first, so a set this
+  // call is about to hand out is never sitting in the released state
+  // while a model reads it.
+  release_unheld_();
+
   {
     lock_guard<mutex> lk(_ws_mu);
-    // The POOL first, and it is taken OUT of it: a set in use is not
-    // spare capacity, and leaving it there would let a later eviction
-    // drop pages a live model is reading.
-    auto p = _pool.find(key);
-    if (p != _pool.end()) {
-      shared_ptr<WeightSet> sp = std::move(p->second);
-      _pool.erase(p);
-      _weight_sets[key] = sp;
-      if (session() != nullptr) {
-        session()->log_debug(fmt(
-            "GenerativeModelManager: recycled '{}' from the removable pool "
-            "({} MB, no reload)", key, sp->stats().bytes >> 20));
-      }
-      return sp;
-    }
     auto it = _weight_sets.find(key);
     if (it != _weight_sets.end()) {
-      if (auto sp = it->second.lock()) { return sp; }
-      _weight_sets.erase(it);
+      shared_ptr<WeightSet> sp = it->second;
+      if (session() != nullptr && sp->parked()) {
+        // NOT "no reload". A set the manager kept while nobody borrowed
+        // it is PARKED, so what this saves for certain is re-OPENING the
+        // checkpoint. The pages come back on the first read -- free if
+        // the kernel left them alone, a re-read if it did not. Claiming
+        // otherwise is how a reader learns to trust bytes nobody
+        // promised.
+        session()->log_debug(fmt(
+            "GenerativeModelManager: '{}' borrowed again ({} MB, parked -- "
+            "reactivated on first read)", key, sp->stats().bytes >> 20));
+      }
+      return sp;
     }
   }
 
@@ -163,7 +164,7 @@ GenerativeModelManager::weight_set(const string& dir, const string& variant)
       // Someone else won the race. Hand back THEIR set and drop ours,
       // so everyone converges on one copy of the weights -- the whole
       // point. Ours has nothing materialised yet, so nothing is lost.
-      if (auto sp = it->second.lock()) { return sp; }
+      return it->second;
     }
     _weight_sets[key] = ws;
   }
@@ -187,7 +188,7 @@ GenerativeModelManager::holds_weights(const string& dir) const
   const string pfx = canonicalize_(session(), dir) + "|";
   lock_guard<mutex> lk(_ws_mu);
   for (const auto& [k, w] : _weight_sets) {
-    if (k.rfind(pfx, 0) == 0 && !w.expired()) { return true; }
+    if (k.rfind(pfx, 0) == 0 && w != nullptr) { return true; }
   }
   return false;
 }
@@ -195,7 +196,7 @@ GenerativeModelManager::holds_weights(const string& dir) const
 namespace {
 
 // Believed physical RAM, honouring VPIPE_RAM_LIMIT_MB exactly as
-// model_memory::phys_ram() and stream-pin.h do -- the pool has to agree
+// model_memory::phys_ram() and stream-sizing.h do -- the pool has to agree
 // with the planning phase about the size of the box, or a graph that
 // planned against a simulated 16 GB machine would wire against a real
 // 64 GB one.
@@ -268,69 +269,189 @@ GenerativeModelManager::wired_pool_device_max() const
 
 GenerativeModelManager::~GenerativeModelManager()
 {
-  // See the declaration: the pooled sets must be released while the
-  // registry they deregister from is still alive.
-  std::unordered_map<string, shared_ptr<WeightSet>> pool;
+  // See the declaration: the sets must be released while the registry
+  // they deregister from is still alive.
+  std::unordered_map<string, shared_ptr<WeightSet>> sets;
   {
     lock_guard<mutex> lk(_ws_mu);
-    pool.swap(_pool);
+    sets.swap(_weight_sets);
   }
-  pool.clear();
+  sets.clear();
+}
+
+// How many BORROWERS a set has: everything holding it except this
+// manager's own reference.
+//
+// Racy by construction -- a peer may take a reference the instant after
+// this reads -- and that is tolerable in exactly one direction. Reading
+// one too many defers a park, which costs memory the box may want.
+// Reading one too FEW parks a set somebody is using, and the reader is
+// then handed pages the kernel is free to discard. So every caller here
+// treats a nonzero answer as "in use" and never rounds it down.
+static long
+borrowers_(const shared_ptr<WeightSet>& ws)
+{
+  const long n = (long)ws.use_count() - 1;   // minus the manager's own
+  return n < 0 ? 0 : n;
+}
+
+// THE BORROW RULE, in the one place every park in this file goes
+// through: a set anything is borrowing is never parked.
+//
+// Parking makes pages purgeable, and the reader that loses them is the
+// one holding cached SharedBuffer handles -- aliases of the very buffers
+// the set would reactivate, read in a forward pass that never asks the
+// set for anything and so never triggers the reactivation. There is no
+// way to make that safe from here: the manager cannot know a live model
+// is idle, and the model has no hook that fires before it reads. So the
+// answer is not to.
+//
+// `borrowers` is passed IN rather than derived here, and that is
+// load-bearing. use_count() is only true before the caller has taken a
+// copy of its own; every site computes it under _ws_mu, in the same
+// walk that selects the set, and hands it over. Deriving it inside this
+// function would see the caller's temporary and report one borrower too
+// many for every set -- which is to say it would park nothing, ever.
+std::size_t
+GenerativeModelManager::park_if_unborrowed_(const shared_ptr<WeightSet>& ws,
+                                            long borrowers)
+{
+  if (ws == nullptr || ws->parked() || borrowers > 0) { return 0; }
+  return _weights.park(ws.get());
+}
+
+std::size_t
+GenerativeModelManager::release_unheld_()
+{
+  std::vector<shared_ptr<WeightSet>> to_park;
+  std::vector<pair<string, shared_ptr<WeightSet>>> to_drop;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end();) {
+      const shared_ptr<WeightSet>& ws = it->second;
+      if (ws == nullptr || borrowers_(ws) > 0) { ++it; continue; }
+      if (!ws->recyclable()) {
+        // A set SPECIALISED to a run's parameters must not outlive the
+        // run: handing it to a launch that does not share them gives
+        // that launch weights which are silently wrong for it. Keeping
+        // it is the one thing worse than re-reading it.
+        to_drop.emplace_back(it->first, std::move(it->second));
+        it = _weight_sets.erase(it);
+        continue;
+      }
+      if (!ws->parked()) { to_park.push_back(ws); }
+      ++it;
+    }
+  }
+  // BOTH outside the lock. Parking walks the set's buffers and takes the
+  // registry's mutex; dropping the last reference unmaps a checkpoint.
+  // Holding _ws_mu across either would put every other model's open
+  // behind it.
+  std::size_t parked = 0;
+  for (const shared_ptr<WeightSet>& ws : to_park) {
+    // 0 borrowers by construction -- that is what put it in this list,
+    // measured under the lock before `to_park` took its own reference.
+    parked += park_if_unborrowed_(ws, 0);
+  }
+  if (session() != nullptr) {
+    if (parked > 0) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: parked {} MB across {} checkpoint(s) "
+          "nothing is borrowing (kept, purgeable, reactivated on the next "
+          "read)", parked >> 20, to_park.size()));
+    }
+    for (const auto& [k, ws] : to_drop) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: dropped '{}' rather than keeping it -- "
+          "not recyclable ({})", k,
+          ws->unrecyclable_reason().empty() ? std::string("unstated")
+                                            : ws->unrecyclable_reason()));
+    }
+  }
+  to_drop.clear();
+  return parked;
 }
 
 void
 GenerativeModelManager::pool_weights(const string& dir, const string& variant)
 {
   if (dir.empty()) { return; }
-  const string key = canonicalize_(session(), dir) + "|" + variant;
-  shared_ptr<WeightSet> ws;
+  // NOTHING TO HAND OVER any more: the manager already owns every set it
+  // opened, so a stage that is finished has only to drop its own
+  // reference. What this call still does -- and the reason it is worth
+  // keeping at the call sites -- is ask the manager to SETTLE the
+  // checkpoint now rather than at whatever unrelated moment happens to
+  // reach release_unheld_() next.
+  //
+  // It is therefore safe in either order. The old contract required
+  // pooling BEFORE the models were reset, because the manager's
+  // reference was weak and there was nothing left to pool afterwards;
+  // called before, this now finds the caller's own models still
+  // borrowing and settles nothing, and the next manager call settles it
+  // instead. Called AFTER, it settles immediately. Both are correct;
+  // only the timing differs.
+  (void)variant;
+  release_unheld_();
+}
+
+std::size_t
+GenerativeModelManager::drop_weights(const string& dir)
+{
+  if (dir.empty()) { return 0; }
+  // THE BYTES BACK NOW, which is the one thing release_unheld_() will
+  // not do for a recyclable checkpoint. Parking makes pages reclaimable;
+  // it does not return them, and a caller freeing a text encoder so a
+  // 1024px VAE decode fits needs them returned. `unload_when_idle:
+  // destroy` is that caller, and it meant this before the manager owned
+  // anything -- dropping the last reference used to unmap the
+  // checkpoint, and now it does not.
+  //
+  // Still refuses a BORROWED set, for the same reason park does: one
+  // stage does not get to unmap a checkpoint a peer is reading. A
+  // borrowed one is left alone and settles when the last borrower goes.
+  const string pfx = canonicalize_(session(), dir) + "|";
+  std::vector<pair<string, shared_ptr<WeightSet>>> dropped;
+  std::size_t freed = 0;
   {
     lock_guard<mutex> lk(_ws_mu);
-    auto it = _weight_sets.find(key);
-    if (it == _weight_sets.end()) { return; }
-    ws = it->second.lock();
-  }
-  if (!ws) { return; }
-  if (!ws->recyclable()) {
-    // NOT an error, and said rather than silent: a checkpoint that
-    // reloads every launch looks exactly like one the pool never saw,
-    // and the difference is the whole reason the flag exists.
-    if (session() != nullptr) {
-      session()->log_debug(fmt(
-          "GenerativeModelManager: '{}' is not recyclable ({}), so it is "
-          "dropped rather than pooled", key,
-          ws->unrecyclable_reason().empty() ? std::string("unstated")
-                                            : ws->unrecyclable_reason()));
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end();) {
+      if (it->first.rfind(pfx, 0) != 0 || it->second == nullptr ||
+          borrowers_(it->second) > 0) {
+        ++it;
+        continue;
+      }
+      freed += it->second->stats().bytes;
+      dropped.emplace_back(it->first, std::move(it->second));
+      it = _weight_sets.erase(it);
     }
-    return;
   }
-  // Purgeable on the way in. The pool holds the set so a relaunch can
-  // find it; marking it lets the kernel take the pages meanwhile, which
-  // is what makes pooling free rather than a claim on the box.
-  const size_t parked = _weights.park(ws.get());
-  {
-    lock_guard<mutex> lk(_ws_mu);
-    _pool[key] = std::move(ws);
-  }
-  if (session() != nullptr) {
+  // Outside the lock: the last reference going unmaps a checkpoint.
+  if (!dropped.empty() && session() != nullptr) {
     session()->log_debug(fmt(
-        "GenerativeModelManager: '{}' released to the removable pool "
-        "({} MB purgeable, recycled free by a relaunch)", key,
-        parked >> 20));
+        "GenerativeModelManager: dropped {} checkpoint(s) under '{}', {} MB "
+        "-- asked for outright, not parked", dropped.size(), dir,
+        freed >> 20));
   }
+  dropped.clear();
+  return freed;
 }
 
 std::size_t
 GenerativeModelManager::pooled_bytes() const
 {
-  std::vector<shared_ptr<WeightSet>> live;
+  std::vector<shared_ptr<WeightSet>> spare;
   {
     lock_guard<mutex> lk(_ws_mu);
-    live.reserve(_pool.size());
-    for (const auto& [k, w] : _pool) { (void)k; live.push_back(w); }
+    for (const auto& [k, w] : _weight_sets) {
+      (void)k;
+      if (w != nullptr && borrowers_(w) == 0) { spare.push_back(w); }
+    }
   }
+  // Counted AFTER the copies above are made, so `borrowers_` inside the
+  // loop would see this vector's own references. It does not run again:
+  // membership was decided under the lock.
   std::size_t n = 0;
-  for (const auto& w : live) { n += w->stats().bytes; }
+  for (const auto& w : spare) { n += w->stats().bytes; }
   return n;
 }
 
@@ -342,10 +463,28 @@ GenerativeModelManager::pool_evict(std::size_t want)
   std::size_t freed = 0;
   {
     lock_guard<mutex> lk(_ws_mu);
-    for (auto it = _pool.begin(); it != _pool.end() && freed < want;) {
+    // LEAST RECENTLY USED first, because these are all equally droppable
+    // and the one nobody has touched is the one least likely to be
+    // wanted next. The pool this replaced had no order at all -- it was
+    // an unordered_map walked front to back -- which meant a caller
+    // asking for one block's worth could take the checkpoint another
+    // pipeline was about to reuse.
+    std::vector<std::unordered_map<string, shared_ptr<WeightSet>>::iterator>
+        spare;
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end(); ++it) {
+      if (it->second != nullptr && borrowers_(it->second) == 0) {
+        spare.push_back(it);
+      }
+    }
+    std::sort(spare.begin(), spare.end(),
+              [](const auto& a, const auto& b) {
+                return a->second->last_use() < b->second->last_use();
+              });
+    for (auto& it : spare) {
+      if (freed >= want) { break; }
       freed += it->second->stats().bytes;
       dropped.emplace_back(it->first, std::move(it->second));
-      it = _pool.erase(it);
+      _weight_sets.erase(it);
     }
   }
   // Released OUTSIDE the lock: dropping the last reference unmaps a
@@ -353,8 +492,8 @@ GenerativeModelManager::pool_evict(std::size_t want)
   // every other model's open behind it.
   if (!dropped.empty() && session() != nullptr) {
     session()->log_debug(fmt(
-        "GenerativeModelManager: dropped {} pooled checkpoint(s), {} MB, to "
-        "make room", dropped.size(), freed >> 20));
+        "GenerativeModelManager: dropped {} unborrowed checkpoint(s), {} MB, "
+        "to make room", dropped.size(), freed >> 20));
   }
   dropped.clear();
   return freed;
@@ -717,19 +856,59 @@ size_t
 GenerativeModelManager::park_weights(const string& dir)
 {
   if (dir.empty()) { return 0; }
-  const string key = canonicalize_(session(), dir);
-  shared_ptr<WeightSet> ws;
+  // BY PREFIX, because `_weight_sets` is keyed by canonical dir AND
+  // variant ("<canon>|<variant>", see weight_set()). Looking the bare
+  // canonical dir up in that map cannot match anything -- not even the
+  // ordinary empty-variant case, whose key still carries the separator
+  // -- so this returned 0 for every checkpoint that ever existed, and
+  // `unload_when_idle: park` reclaimed nothing anywhere.
+  //
+  // That zero was visible and was attributed to the other reason a park
+  // gives back nothing (a model that reads UNCACHED has nothing in the
+  // set to park). Both are real; this one came first and hid the other.
+  // The memory-cap path was never affected: enforce_memory_cap() walks
+  // `_weight_sets` itself and never asks by name.
+  //
+  // One directory may hold several variants (a quantized twin of the
+  // same checkpoint); parking is per SET, so park them all and report
+  // the total -- the caller asked about a directory.
+  //
+  // AND ONLY WHAT NOBODY IS BORROWING, which is the third reason this
+  // can return 0 and the only one that is a refusal rather than an
+  // absence. The manager owns these checkpoints; a stage asking to park
+  // one is speaking for itself, and it cannot speak for a peer whose
+  // model is mid-forward over the same bytes. Parking under that peer
+  // hands it pages the kernel may discard, and nothing on its read path
+  // would notice. So a borrowed set is skipped and SAID, and it settles
+  // on its own through release_unheld_() once the last borrower lets go.
+  const string pfx = canonicalize_(session(), dir) + "|";
+  vector<pair<shared_ptr<WeightSet>, long>> sets;
   {
     lock_guard<mutex> lk(_ws_mu);
-    auto it = _weight_sets.find(key);
-    if (it == _weight_sets.end()) { return 0; }
-    ws = it->second.lock();
+    for (const auto& [k, w] : _weight_sets) {
+      if (k.rfind(pfx, 0) != 0 || w == nullptr) { continue; }
+      // Counted HERE, under the lock and before the copy below adds a
+      // reference of its own. Reading it afterwards would report one
+      // borrower too many for every set and park nothing, ever.
+      sets.emplace_back(w, borrowers_(w));
+    }
   }
-  if (!ws || ws->parked()) { return 0; }
-  const size_t got = _weights.park(ws.get());
-  if (got == 0) { return 0; }        // nothing parkable (mapped/uncached)
-  ws->set_parked(true);
-  return got;
+  size_t total = 0;
+  size_t borrowed = 0;
+  for (const auto& [ws, holders] : sets) {
+    if (ws->parked()) { continue; }
+    if (holders > 0) { ++borrowed; continue; }
+    const size_t got = park_if_unborrowed_(ws, holders);
+    if (got == 0) { continue; }      // nothing parkable (mapped/uncached)
+    total += got;
+  }
+  if (borrowed > 0 && session() != nullptr) {
+    session()->log_debug(fmt(
+        "GenerativeModelManager: '{}' is still borrowed by {} model(s), so "
+        "it is not parked; it settles when the last one lets go", dir,
+        borrowed));
+  }
+  return total;
 }
 
 bool
@@ -741,7 +920,7 @@ GenerativeModelManager::accounts_for(const string& dir) const
   lock_guard<mutex> lk(_ws_mu);
   if (_declared.find(canon) != _declared.end()) { return true; }
   for (const auto& [k, w] : _weight_sets) {
-    if (k.rfind(pfx, 0) == 0 && !w.expired()) { return true; }
+    if (k.rfind(pfx, 0) == 0 && w != nullptr) { return true; }
   }
   return false;
 }
@@ -763,7 +942,7 @@ GenerativeModelManager::per_dir_bytes_(bool use_floor) const
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
-      if (auto sp = w.lock()) {
+      if (const shared_ptr<WeightSet>& sp = w; sp != nullptr) {
         // Key back to the plain directory: two variants of one
         // checkpoint are two sets but must be summed under one dir so
         // a declaration for it compares against the whole.
@@ -1058,7 +1237,7 @@ GenerativeModelManager::active_bytes() const
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) { live.push_back(std::move(sp)); }
+      if (w != nullptr) { live.push_back(w); }
     }
   }
   std::size_t total = 0;
@@ -1083,29 +1262,29 @@ GenerativeModelManager::enforce_memory_cap()
   // has touched for a while goes before one in active use, so the
   // common case is that the cap costs nothing: the parked pages are
   // never reclaimed and the next access is a state flip.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  std::vector<pair<std::shared_ptr<WeightSet>, long>> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) {
-        if (!sp->parked()) { live.push_back(std::move(sp)); }
-      }
+      // Borrowers counted HERE, before `live` takes a reference of its
+      // own; see park_if_unborrowed_.
+      if (w != nullptr && !w->parked()) { live.emplace_back(w, borrowers_(w)); }
     }
   }
   std::sort(live.begin(), live.end(),
-            [](const std::shared_ptr<WeightSet>& a,
-               const std::shared_ptr<WeightSet>& b) {
-              return a->last_use() < b->last_use();
+            [](const auto& a, const auto& b) {
+              return a.first->last_use() < b.first->last_use();
             });
 
   std::size_t freed = 0;
-  for (const auto& ws : live) {
+  std::size_t in_use = 0;
+  for (const auto& [ws, holders] : live) {
     if (active <= cap) { break; }
-    const std::size_t got = _weights.park(ws.get());
+    if (holders > 0) { in_use += ws->stats().bytes; continue; }
+    const std::size_t got = park_if_unborrowed_(ws, holders);
     if (got == 0) { continue; }        // nothing parkable (all mapped)
-    ws->set_parked(true);
     freed  += got;
     active -= (got > active) ? active : got;
     if (session() != nullptr) {
@@ -1114,12 +1293,26 @@ GenerativeModelManager::enforce_memory_cap()
           "now ~{} MB)", got >> 20, ws->dir(), cap >> 20, active >> 20));
     }
   }
-  if (freed > 0 && active > cap && session() != nullptr) {
-    session()->warn(fmt(
-        "GenerativeModelManager: still ~{} MB active after parking "
-        "everything parkable (cap {} MB). Mapped weights and KV cannot be "
-        "parked -- the cap is a target, not a guarantee",
-        active >> 20, cap >> 20));
+  if (active > cap && session() != nullptr) {
+    // WHY it fell short, because the two reasons want different
+    // responses. Mapped weights and KV are the cap's standing
+    // limitation. Bytes a model is still BORROWING are a different
+    // thing: they are not unreclaimable, they are in use, and what
+    // returns them is the stage letting go -- an `unload_when_idle`
+    // policy, not a bigger cap.
+    if (in_use > 0) {
+      session()->warn(fmt(
+          "GenerativeModelManager: still ~{} MB active after parking "
+          "everything it could (cap {} MB); ~{} MB of that is borrowed by "
+          "live models and is not the manager's to park -- a stage has to "
+          "let go of it first", active >> 20, cap >> 20, in_use >> 20));
+    } else if (freed > 0) {
+      session()->warn(fmt(
+          "GenerativeModelManager: still ~{} MB active after parking "
+          "everything parkable (cap {} MB). Mapped weights and KV cannot be "
+          "parked -- the cap is a target, not a guarantee",
+          active >> 20, cap >> 20));
+    }
   }
   return freed;
 }
@@ -1135,32 +1328,36 @@ GenerativeModelManager::reclaim_at_least(std::size_t bytes)
   const std::size_t from_pool = pool_evict(bytes);
   if (from_pool >= bytes) { return from_pool; }
   bytes -= from_pool;
-  // Same LRU snapshot the cap path takes: a set nobody has touched goes
-  // before one in active use, so the common case is that this costs a
-  // state flip and no re-read.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  // Then whatever is left UNBORROWED, least-recently-used first. What
+  // this pass cannot do is take from a live model: parking a set a model
+  // is reading hands it pages the kernel may discard, and it has no way
+  // to notice (park_if_unborrowed_). So the honest ceiling on this call
+  // is "everything nobody is using", and a caller that still does not
+  // fit has to make room by dropping something of its own -- which is
+  // exactly what the image and video stages do, freeing their DiT before
+  // a decode rather than hoping this call covers it.
+  std::vector<pair<std::shared_ptr<WeightSet>, long>> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) {
-        if (!sp->parked()) { live.push_back(std::move(sp)); }
-      }
+      // Borrowers counted HERE; see park_if_unborrowed_.
+      if (w != nullptr && !w->parked()) { live.emplace_back(w, borrowers_(w)); }
     }
   }
   std::sort(live.begin(), live.end(),
-            [](const std::shared_ptr<WeightSet>& a,
-               const std::shared_ptr<WeightSet>& b) {
-              return a->last_use() < b->last_use();
+            [](const auto& a, const auto& b) {
+              return a.first->last_use() < b.first->last_use();
             });
 
   std::size_t freed = 0;
-  for (const auto& ws : live) {
+  std::size_t in_use = 0;
+  for (const auto& [ws, holders] : live) {
     if (freed >= bytes) { break; }
-    const std::size_t got = _weights.park(ws.get());
+    if (holders > 0) { in_use += ws->stats().bytes; continue; }
+    const std::size_t got = park_if_unborrowed_(ws, holders);
     if (got == 0) { continue; }        // nothing parkable (all mapped)
-    ws->set_parked(true);
     freed += got;
     if (session() != nullptr) {
       session()->log_debug(fmt(
@@ -1168,6 +1365,12 @@ GenerativeModelManager::reclaim_at_least(std::size_t bytes)
           "({} of {} MB requested)", got >> 20, ws->dir(), freed >> 20,
           bytes >> 20));
     }
+  }
+  if (freed + from_pool < bytes && in_use > 0 && session() != nullptr) {
+    session()->log_debug(fmt(
+        "GenerativeModelManager: {} MB short of the {} MB asked for; ~{} MB "
+        "is borrowed by live models and is not the manager's to park",
+        (bytes - freed) >> 20, (bytes + from_pool) >> 20, in_use >> 20));
   }
   // BOTH, or a caller that asked for 8 GB and got 6 from the pool and 2
   // from parking would be told 2 and conclude it had failed.
@@ -1180,18 +1383,23 @@ GenerativeModelManager::weight_report() const
   // Snapshot the live sets under the lock, then measure OUTSIDE it: a
   // set's stats() takes its own mutex, and holding the cache lock
   // across that would put the report in the way of a concurrent load.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  //
+  // The borrower count is taken HERE, under the lock, because it is the
+  // one field that stops being true the moment it is copied: the manager
+  // holds a reference of its own and `live` is about to hold a second,
+  // so measuring it later reports two holders for a set one model has.
+  std::vector<pair<std::shared_ptr<WeightSet>, long>> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) { live.push_back(std::move(sp)); }
+      if (w != nullptr) { live.emplace_back(w, borrowers_(w)); }
     }
   }
   std::vector<WeightUsage> out;
   out.reserve(live.size());
-  for (const auto& ws : live) {
+  for (const auto& [ws, holders] : live) {
     const auto st = ws->stats();
     WeightUsage u;
     u.dir          = ws->dir();
@@ -1200,9 +1408,10 @@ GenerativeModelManager::weight_report() const
     u.copied_bytes = st.copied_bytes;
     u.tensors      = st.entries;
     u.parts        = st.parts;
-    // Minus the reference this snapshot itself holds, so the number
-    // reads as "models using it", which is what a caller means.
-    u.holders      = ws.use_count() - 1;
+    // "Models using it", which is what a caller means -- not counting
+    // the manager, which holds every set it ever opened.
+    u.holders      = holders;
+    u.parked       = ws->parked();
     out.push_back(std::move(u));
   }
   return out;
@@ -1215,7 +1424,7 @@ GenerativeModelManager::weight_set_count() const
   std::size_t n = 0;
   for (const auto& [k, w] : _weight_sets) {
     (void)k;
-    if (!w.expired()) { ++n; }
+    if (w != nullptr) { ++n; }
   }
   return n;
 }

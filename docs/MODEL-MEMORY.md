@@ -816,14 +816,31 @@ accounting. Implement both; they are a few lines each, and the numbers
 they produce should agree — when they do not, that disagreement is the
 most useful diagnostic on the page.
 
+> **Trap: a streaming FLOOR must be on the CLAIM, not only in the plan.**
+> Both ledgers take one, and they look interchangeable. They are not:
+> `StageMemory::hold(source, preload, floor)` is what a run *reports*,
+> while `ResourceClaim::floor_bytes` is what `phase_footprint_floor()`
+> and `phase_peak()` read — and those are the only place a graph is
+> turned away. A model claimed with `weight_claims()` instead of
+> `weight_claim_streamable()` is judged at its full on-disk size however
+> carefully the plan describes its floor, so "everything streamable at
+> its floor" reads identically to "everything preloaded". MEASURED on a
+> two-model image graph: **15064 MB / 15064 MB before, 15064 MB / 2902 MB
+> after**, same graph, same box.
+>
+> The error over-states, so it warns about graphs that would run rather
+> than admitting ones that cannot. That makes it quiet — the number is
+> merely large, never obviously wrong.
+
 ---
 
 ## 5. Block streaming — the irreversible one
 
 A model that cannot fit reads its blocks from disk per forward, keeping
-only a pinned prefix. This is an argument to the transformer's `load()`,
-so it must be right at construction — changing it later means destroying
-and rebuilding the model.
+back only whatever block residency (mechanism 6) later grows into. This
+is an argument to the transformer's `load()`, so it must be right at
+construction — changing it later means destroying and rebuilding the
+model.
 
 Take the decision from `plan_streaming()`, never by hand. It also records
 the fact that streaming was chosen, which peers depend on (below).
@@ -837,7 +854,18 @@ model 39% of which is about to stop existing. Pass it **only** when the
 release is certain; zero is always safe.
 
 A streaming model must then call `revise_declaration()` down to what it
-actually pins, so peers do not size against weights that are never there.
+actually holds, so peers do not size against weights that are never
+there.
+
+> **Trap: name EVERY stack, not the first one.** `streaming_floor_bytes()`
+> takes a list of block stems, and a model with two stacks streams both
+> and keeps a slot pair for each — so a list naming one leaves the other
+> in the trunk. The result is a floor that is technically an
+> over-estimate and practically useless. MEASURED on a 17316 MB
+> two-stack DiT: naming one stem gave **12324 MB**, naming both gave
+> **3172 MB**. Across four image DiTs the complete list reduces the
+> declared floor to between a fifth and a twenty-eighth of the
+> checkpoint; an incomplete one reported close to the whole of it.
 
 > **Trap: the revision erases the evidence.** A streaming model correctly
 > reports a small number, and that small number reads as *roominess* to
@@ -911,7 +939,192 @@ immediately dropped.
 A model that is not ready to restructure who owns its buffers can still
 change only the *fill* and keep the per-block allocation. That is most of
 the win — of the mapped path's cost above, the allocation was roughly a
-fifth and the faulting the rest.
+fifth and the faulting the rest. What it does **not** get is the
+prefetch: a read ahead needs a destination the current block is not
+using, and a per-block allocation has exactly one. See the trap at the
+end of the next section.
+
+### Two slots and a prefetch
+
+Keeping the destinations is worth more than the refill alone, because it
+makes a **prefetch** free: the buffer a reader thread fills is already
+allocated, so issuing the next block's read costs no memory and asks no
+growth question. Between the commit that hands block *i* to the GPU and
+the wait for it, this thread has nothing to do — that window is the
+whole opportunity.
+
+`generative-models/shared/block-slots.h` is that policy, so a model
+supplies only what the policy cannot know:
+
+```cpp
+BlockSlots<Block>::Ops ops;
+ops.each        = ...;  // every (name, destination, Placement) of block i
+ops.rebuild_one = ...;  // one tensor a raw read could not place
+ops.build       = ...;  // allocate and fill from scratch
+ops.clone       = ...;  // allocate dst like src, optionally copying
+ops.bytes       = ...;
+ops.empty       = ...;
+ops.post_refill = ...;      // OPTIONAL, see "derived tensors" below
+ops.fill_unservable = ...;  // OPTIONAL, for an f32 source
+slots.set_weight_set(ws.get());
+slots.configure(mc, std::move(ops), "MyModel", "VPIPE_MYMODEL_NO_SLOTS");
+```
+
+and the forward becomes:
+
+```cpp
+slots.begin_forward();
+for (int i = 0; i < n; ++i) {
+  if (resident(i)) { ...; continue; }
+  const Block* b = slots.acquire(i);
+  if (b == nullptr) { return fail(...); }
+  ... encode ...
+  Fence f = stream.commit();
+  slots.prefetch(next_streamed_after(i));   // under the GPU's work
+  f.wait();
+  // Ask with what promotion KEEPS -- see the trap below.
+  if (admit(kept_bytes(*b))) { slots.promote_into(resident[i]); }
+}
+```
+
+**How much this is worth depends on the drive, and on a slow one it is
+nothing.** MEASURED cold over four image and video DiT checkpoints, four
+arms interleaved with byte-balanced groups and the arm-to-group
+assignment rotated:
+
+| | internal SSD | external Thunderbolt |
+|---|---:|---:|
+| allocate per block, fill from the mapping | 3.1–4.0 GB/s | 0.77–0.78 GB/s |
+| `pread` into a buffer that already exists | 4.5–6.3 GB/s | 0.78–0.82 GB/s |
+| map and fault, no copy at all | 0.7–1.0 GB/s | 0.24–0.29 GB/s |
+
+At 0.84 GB/s the device is so far the slowest term that every arm ties.
+So this is a win on the drive a checkpoint should be on and no loss
+anywhere — and the third row is the reminder that a zero-copy mapping is
+not a saving: it copies nothing and is still four times slower than
+copying, because the kernel tracks residency at 4 KB granularity over a
+file of tens of gigabytes.
+
+End to end, one streamed forward, checkpoint on internal SSD,
+byte-for-byte identical output in every case:
+
+| stack | without | with | |
+|---|---:|---:|---:|
+| 8 + 24 blocks, 17 GB, bf16 | 6.6 / 6.7 s | 4.5 / 4.6 s | **1.47x** |
+| 60 blocks, 38 GB, bf16 | 12.9 / 12.9 / 12.9 s | 9.6 / 10.0 / 9.7 s | **1.31x** |
+| 8 + 32 blocks, 19 GB, bf16 | 6.2 / 6.2 s | 4.5 / 5.2 s | **1.19-1.38x** |
+| 28 blocks, 24 GB, bf16 | 7.9 / 7.6 s | 7.3 / 7.5 s | ~1.0x |
+
+The last is a reminder that this is not free money. It ties, and the
+most likely reason is the page cache again: 24 GB on a 64 GB box is
+mostly warm for the mapped arm while `pread_into`'s `F_NOCACHE` goes to
+the device every time. The first, at the other end, is a 17 GB
+checkpoint that cannot be cached on any box it would ever stream on —
+its read alone went 2.97-2.99 to 4.81-5.03 GB/s. **Adopt it for the
+equality and the prefetch; expect the read gain only where the
+checkpoint is large against the box.**
+
+> **Measure the model, not the read.** A synthetic A/B of the read alone,
+> on a checkpoint SMALLER than the box, gave ratios from 0.97 to 1.30
+> across five runs of the same binary: the mapped arm was reading mostly
+> warm page cache and was stable, while `pread_into`'s `F_NOCACHE` went
+> to the device every time. The end-to-end number above is stable
+> because that checkpoint does not fit the cache and because the
+> prefetch has real GPU work to hide behind. If your A/B swings, check
+> whether the file fits in RAM before believing either end of it.
+
+> **Trap: book what promotion KEEPS, not what the slot holds.** A slot
+> that carries a raw source alongside the products built from it is
+> bigger than the block promotion will keep, because promotion drops the
+> source. Ask admission and the wired pool for the KEPT size. Getting
+> this wrong is quiet and expensive: a grant smaller than the ask is how
+> the pool learns the box refused more, so a slot-sized ask books a
+> refusal that never happened and growth stops at the first promoted
+> block. MEASURED on a 32-block stack: 9 of 32 kept before, 32 of 32
+> after, same box, same run.
+
+**Promotion COPIES out of the slot.** The slot has to stay put for the
+next read, so a block being kept resident is cloned rather than moved.
+That is not the waste it looks like — the resident block needs its own
+allocation either way, so what the clone adds is one memcpy, against a
+read that is faster for every block that is *not* promoted.
+`promote_into()` makes the choice for you, because it is also the case
+where getting it wrong is a use-after-free rather than a slowdown.
+
+> **Trap: join before every early return.** A read may be in flight into
+> a slot, and freeing or reading that slot while a reader thread writes
+> into it is a use-after-free. A forward returns from many places — a
+> stop request, a GPU error, an allocation that failed — so use a scope
+> guard rather than auditing them:
+>
+> ```cpp
+> struct SlotJoin { BlockSlots<Block>* s; ~SlotJoin() { s->join(); } }
+>     guard{&_slots};
+> ```
+
+**Derived tensors — the ones with no single checkpoint name.** A block
+that fuses two projections into one interleaved matrix, splits one into
+two, or folds a norm at load has a tensor a refill cannot address.
+There are three answers, in increasing cost:
+
+* **Transform the destination IN PLACE after a raw read.** Available
+  whenever the product is a permutation of one source tensor into a
+  buffer of the same size — an interleave of gate and up rows is the
+  common case. The read stays on the fast path and the slot costs
+  nothing extra. Do this where you can.
+* **Keep the raw SOURCE in the slot and build the products out of it**
+  in `post_refill`. Needed when one tensor has several products (a fused
+  qkv+mlp projection sliced into two) or several tensors have one. It
+  costs each slot a copy of that tensor; have promotion drop the source,
+  so the price is paid by the two slots and not by the resident set.
+* **Rebuild it per refill** (`Placement::kDerived`), which allocates.
+  Right for a handful of small tensors — a folded norm — and wrong for
+  anything that is a meaningful share of a block's bytes.
+
+Whichever you pick, **enumerate every tensor**: a destination skipped in
+`ops.each` and not rebuilt in `post_refill` keeps the FIRST block's
+values for the whole run, which is the quietest possible way to be
+wrong. And resist the alternative of moving the fuse to promotion
+instead: that changes which kernel a *streamed* block runs through,
+which is a numerics change wearing a performance change's clothes.
+
+> **State the placement per tensor, and get it right.** `Placement`
+> says whether a destination takes the checkpoint's own words
+> (`kRaw`), is read as bf16 with f16 converted in place (`kBf16`), or
+> is never addressable at all (`kDerived`). A wrong answer is silent:
+> the buffer ends up the right size and full of plausible numbers.
+
+**The fallback is sticky and says so once.** A checkpoint the slots
+cannot serve — a block whose shapes disagree with block 0 — turns them
+off for the run and logs it at debug. A fallback that came and went
+would read as an unexplained slowdown rather than a property of the
+checkpoint. The `env_off` name passed to `configure()` is the kill
+switch, read once, on the first streamed block.
+
+**Two stacks means two slot pairs, and both stay allocated.** A model
+with a double and a single stack keeps four slots for its whole life,
+even though only one pair is in use at a time — they exist precisely to
+survive between forwards, and rebuilding a pair costs two block reads.
+On a large stack that is gigabytes held idle while the other half runs;
+it is a real cost and it has not been traded off against the rebuild,
+so size the box against four slots, not two.
+
+**A second slot is not guaranteed.** It is refused when the box will not
+take a durable block-sized allocation, and the run is then single-slot:
+no prefetch, but the read shape and the absence of per-block allocation —
+the larger half of the win — are unaffected.
+
+> **Trap: a prefetch needs a destination the current block is not
+> using.** The read runs under the GPU work of the block just committed
+> — that is the entire point — so it must not land in that block's
+> buffers, and a build assigns fresh handles over the old ones, freeing
+> them underneath the GPU. Only a slot PAIR has a free destination;
+> with one slot, or with the mechanism off, the honest answer is to read
+> serially. `prefetch()` enforces this, so a caller cannot get it wrong
+> — but a model rolling its own must. The failure mode is a GPU fault
+> partway down the stack, not a wrong answer, and it only appears on
+> the paths a normal run never takes: **run the `env_off` A/B on every
+> port.**
 
 ---
 
@@ -1028,6 +1241,13 @@ only in the accounting.
 The fix is mechanism 7. With the same blocks wired into the pool, the same
 run reached **49 of 50**.
 
+This is why the two mechanisms are one contract in practice: a model that
+implements residency without wiring has built the accounting and not the
+thing being accounted for. `BlockResidency::set_schedule()` says the same
+in code — with wiring on it removes the per-forward growth cap entirely,
+because `mlock` is a *synchronous* answer (the block is taken or refused
+before it is kept) where the page walk is one that arrives a forward late.
+
 Be honest about what that buys. On the same run the GPU spends ~4146 ms
 per block against ~22 ms of exposed read, with the prefetch hiding 49 of
 49 — so a perfect resident set hides at most ~0.5% of that pass. The gains
@@ -1092,12 +1312,63 @@ actually granted and callers stop asking for more. So the figure is a
 ceiling on ambition, never a promise. `0` turns wiring off entirely, which
 is the right answer on a shared machine.
 
-**A refusal must not be rolled back.** `SharedBuffer::set_wired(false)`
-also flips the buffer to purgeable *volatile*, which is the one state a
-block still in use must never be in. When the pool refuses mid-block,
-**stop and keep what is already wired**: a partly wired block is merely
-partly protected, where a rolled-back one can be reclaimed under the
-model's feet.
+**A refusal must not be rolled back.** When the pool refuses mid-block,
+**stop and keep what is already wired**. A partly wired block is partly
+protected, which is strictly better than none — and giving the protection
+back on the way out only means competing for it again on the next block,
+against a pool that has just said no.
+
+### The model's side of the pool
+
+`WiredPool` (`generative-models/shared/wired-pool.h`) is the per-model
+window onto it, and it is the piece a loader actually calls. It holds the
+budget, decides whether one more block may be kept, books what the pool
+granted, and knows when to ask again:
+
+```cpp
+// at load, BEFORE the first weight is read -- it decides how they are read
+_wire.open(mc);
+const bool mapped = weights_may_be_mapped(stream_blocks, _wire.on());
+
+// top of each forward
+if (_wire.on()) {
+  if (_wire.retry(mc, block_bytes)) { _resid.note_landscape_changed(); }
+  wire_fixed_(true);                    // scratch, then trunk
+}
+
+// per block, after the commit that retires its GPU work
+if (_wire.wirable(nb) && _resid.admit(mc, nb)) {
+  keep_the_block();                     // finish every write to it first
+  _wire.note_wired(mc, wire_block_(b, true), nb);
+  _resid.note_admitted(nb);
+}
+
+// on eviction, and on destruction
+_wire.note_unwired(wire_block_(b, false));
+```
+
+**`wirable()` gates ADMISSION, not just wiring.** Past the budget there is
+nothing to gain from keeping the block: it would be held unprotected, the
+compressor would take it — it is the coldest memory in the process — and
+the next residency walk would shed a block and ratchet the ceiling over
+the whole resident set. Better not to hold it at all.
+
+**Mapping and wiring are one decision.** A mapped tensor aliases the
+weight set's shard `mmap`, so it can be neither wired (`mlock` on
+file-backed pages is refused well before the pool's ceiling — MEASURED at
+~4 GB) nor parked. `weights_may_be_mapped()` is the rule: **Copied
+whenever the model streams, or whenever the pool is on.** Getting it
+backwards is silent — the load succeeds, the `mlock` refuses, and the run
+reads as merely slow.
+
+**A buffer that is reallocated must be unwired BEFORE the assignment that
+drops it.** Destroying a wired buffer unwires it in the kernel but does
+NOT decrement the pool's counter; only `unwire_from_pool()` does. A
+geometry change that replaces the scratch therefore leaks a scratch's
+worth per change, and a pool that has lost budget to bytes nothing holds
+wires less of whatever comes next — for a reason nothing in the log
+names. The same applies on destruction: a DiT freed for the VAE decode and
+reloaded per prompt leaks its whole share of the budget per prompt.
 
 ### The refusal check — and why it is off by default
 
@@ -1530,6 +1801,13 @@ For a stage that holds one:
 - [ ] Buffers handed downstream are declared with `payload_claims()`,
       spanning from the phase that writes them to the last that reads them.
 - [ ] Streaming decided by `plan_streaming()`, with `kStreamHeadroom`.
+- [ ] Anything that can stream is claimed with `weight_claim_streamable()`
+      — a floor in `declare_memory()` alone is invisible to the refusal.
+      And the stem list names EVERY block stack, not the first.
+- [ ] A component declared with a floor can actually REACH it. A floor is
+      a promise the resource phase may admit a graph on; declaring one
+      for a model that then loads resident is the one error in this
+      section that admits a graph instead of refusing it.
 - [ ] `revise_declaration()` and `revise_memory()` after load if it keeps
       less than it declared; `revise_scratch()` per beat once the geometry
       is known.
@@ -1541,10 +1819,26 @@ For a stage that holds one:
 If it streams blocks:
 
 - [ ] Blocks are read into destinations the model keeps, refilled in place
-      — not allocated and mapped-copied per block. State the destination
-      dtype (`kRaw` / `kBf16`) rather than taking a default; there is none.
+      — not allocated and mapped-copied per block.
+- [ ] **Every** tensor of a block is accounted for: enumerated in
+      `ops.each`, or rebuilt in `ops.post_refill`. One that is neither
+      keeps the FIRST block's values for the whole run.
+- [ ] Each one states its `Placement` (`kRaw` / `kBf16` / `kDerived`)
+      rather than taking a default; there is none, because the wrong
+      answer is silent.
 - [ ] The refill fallback is decided **per tensor**, not latched for the
       block.
+- [ ] Admission and the wired pool are asked for what promotion **keeps**,
+      which is smaller than the slot whenever the slot holds a raw source
+      alongside products built from it.
+- [ ] Every early return from the forward joins outstanding reads first —
+      with a scope guard, not by auditing the returns.
+- [ ] The `env_off` A/B has actually been RUN. It is the only thing that
+      exercises the no-slot path, and a defect there is a GPU fault
+      partway down the stack rather than a wrong answer.
+- [ ] Streamed output is **byte-identical** to preloaded output. Every
+      transform after a read — a permutation, a split, a fold — is silent
+      when it is wrong, so closeness is not a bar.
 - [ ] `set_residency_reserve()` is actually called — with a real figure, or
       with an explicit `0`.
 - [ ] `note_reserve_allocated()` if activations are allocated before the

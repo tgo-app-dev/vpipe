@@ -8,7 +8,9 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <ctime>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <poll.h>
@@ -156,7 +158,124 @@ render_row_(const UiProgressRegistry::Item& it, int tick)
   return bar;
 }
 
+string
+local_stamp_()
+{
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  ::localtime_r(&now, &tm);
+  char stamp[16] = "??:??:??";
+  std::strftime(stamp, sizeof(stamp), "%H:%M:%S", &tm);
+  return stamp;
+}
+
+// One report as a plain line for a destination that is not a terminal:
+//   40% of 'denoise 1024x1024' completed at 00:52:14 (640/1600)
+//
+// Local time, not elapsed: the reader of a redirected log is asking
+// "is this still moving", and the answer is the gap between two stamps
+// -- which they can only take if the stamps are absolute. The counts
+// ride along because they are what substantiates the percentage; there
+// is no bar to draw here.
+string
+render_milestone_(const string& desc, int pct, std::uint64_t done,
+                  std::uint64_t total)
+{
+  string line = std::to_string(pct);
+  line += "% of '";
+  line += desc;
+  line += "' completed at ";
+  line += local_stamp_();
+  line += " (";
+  line += std::to_string(done);
+  line += "/";
+  line += std::to_string(total);
+  line += ")";
+  return line;
+}
+
+// A report that closed without ever reporting 100%.
+//
+// Needed for the milestone lines to answer the question they exist for.
+// A stage is free to stop updating before the end -- the LM benchmark
+// ticks its bar BEFORE each test, so its last word is 8/9 -- and a log
+// that simply stops at 88% leaves the reader exactly where they were
+// with no output at all: unable to tell finished from wedged. This says
+// which it was, and says nothing about SUCCESS, because the registry
+// cannot distinguish a normal finish from an abandoned one.
+string
+render_ended_(const string& desc, std::uint64_t done, std::uint64_t total)
+{
+  string line = "'";
+  line += desc;
+  line += "' ended at ";
+  line += local_stamp_();
+  if (total > 0) {
+    int pct = static_cast<int>((done * 100) / total);
+    pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    line += ", last reported ";
+    line += std::to_string(pct);
+    line += "% (";
+    line += std::to_string(done);
+    line += "/";
+    line += std::to_string(total);
+    line += ")";
+  }
+  return line;
+}
+
 }  // namespace
+
+void
+StdioUiDelegate::emit_milestones_(
+    const std::vector<UiProgressRegistry::Item>& items,
+    std::map<std::uint64_t, Announced>&          seen)
+{
+  auto say = [this](string line) {
+    emit_("PROGRESS", /*to_err=*/false,
+          VpipeFormat([l = std::move(line)] { return l; }));
+  };
+
+  for (const auto& it : items) {
+    auto& a = seen[it.id];
+    a.desc  = it.desc;
+    a.done  = it.done;
+    a.total = it.total;
+    // INDETERMINATE reports have no percentage to cross a milestone
+    // with, so they say nothing here. A download whose server sent no
+    // Content-Length is therefore still silent off a tty -- the tty
+    // path answers it with a bouncing pip, and there is no equivalent
+    // that would not be a timer writing lines about nothing.
+    if (it.total == 0) { continue; }
+    int pct = static_cast<int>((it.done * 100) / it.total);
+    pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    // 0 and 100 each get their own bucket, so a report announces itself
+    // as soon as it knows its size and again when it finishes: 11 lines
+    // at most for a whole report, however many times it updates.
+    const int bucket = pct / kMilestonePct;
+    if (bucket <= a.bucket) { continue; }
+    a.bucket = bucket;
+    say(render_milestone_(it.desc, pct, it.done, it.total));
+  }
+
+  // Ids that have gone away. Ids are never reused, so an erased entry
+  // cannot be resurrected by a later report -- and the erase is what
+  // keeps this from growing across a long run of back-to-back reports.
+  for (auto i = seen.begin(); i != seen.end();) {
+    const bool live = std::any_of(
+        items.begin(), items.end(),
+        [id = i->first](const auto& it) { return it.id == id; });
+    if (live) { ++i; continue; }
+    // Silent when the report already announced 100%: that line said
+    // everything this one would.
+    const bool complete = i->second.total > 0
+                          && i->second.done >= i->second.total;
+    if (!complete) {
+      say(render_ended_(i->second.desc, i->second.done, i->second.total));
+    }
+    i = seen.erase(i);
+  }
+}
 
 void
 StdioUiDelegate::on_progress_opened()
@@ -167,9 +286,6 @@ StdioUiDelegate::on_progress_opened()
 void
 StdioUiDelegate::start_progress_thread_()
 {
-  // Nothing to pin a footer to when stdout is a file or a pipe, and
-  // painting one there would write escape sequences into a log.
-  if (!console_writer().tty()) { return; }
   // Reap a PREVIOUS run's thread outside the lock. The thread takes
   // _progress_mu at the top of every tick, so joining while holding it
   // deadlocks: the joiner waits for a thread that is waiting for the
@@ -185,7 +301,11 @@ StdioUiDelegate::start_progress_thread_()
   lock_guard<mutex> lk(_progress_mu);
   if (_progress_run) { return; }               // a peer won the race
   _progress_run = true;
-  _progress_thread = std::thread([this] {
+  // Decided ONCE, here rather than per tick: the two halves are
+  // different renderings of the same poll, and a stream cannot become a
+  // terminal midway through a run.
+  const bool tty = console_writer().tty();
+  _progress_thread = std::thread([this, tty] {
     std::uint64_t last_version = 0;
     int  tick    = 0;
     bool painted = false;
@@ -203,9 +323,25 @@ StdioUiDelegate::start_progress_thread_()
         // Last report closed: wipe the block and let the thread go.
         // A later report starts a fresh one through on_progress_opened.
         if (painted) { console_writer().set_footer(this, {}); }
+        // Off a tty the same moment is the ONLY chance to say that the
+        // last report ended -- one more pass over an empty list, which
+        // closes out everything still in the map. Skipping it is how
+        // the terminating line goes missing for exactly the report the
+        // reader is waiting on.
+        if (!tty) { emit_milestones_(items, _milestones); }
         lock_guard<mutex> lk(_progress_mu);
         _progress_run = false;
         break;
+      }
+      if (!tty) {
+        // No footer, and no animation to keep alive either -- a
+        // milestone can only be crossed by something actually moving,
+        // which is exactly what the version counter reports.
+        if (v != last_version) {
+          emit_milestones_(items, _milestones);
+          last_version = v;
+        }
+        continue;
       }
       // Repaint on a real change, or on every tick while an
       // indeterminate report is live -- its pip is animated by `tick`,
@@ -236,6 +372,13 @@ StdioUiDelegate::stop_progress_thread_()
   _progress_cv.notify_all();
   if (_progress_thread.joinable()) { _progress_thread.join(); }
   console_writer().set_footer(this, {});
+  // The thread is joined, so _milestones is ours alone. Anything still
+  // in it is a report that closed inside the last tick -- which is the
+  // NORMAL case for the last report of a run, since a stage tends to
+  // finish its bar and return within a few milliseconds of the session
+  // going away. Without this the run's final report is the one that
+  // never gets a terminating line.
+  if (!_milestones.empty()) { emit_milestones_({}, _milestones); }
 }
 
 StdioUiDelegate::~StdioUiDelegate()

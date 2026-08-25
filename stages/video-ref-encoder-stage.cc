@@ -16,6 +16,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -33,9 +34,33 @@ namespace {
 // The model iport (a model-select source) overrides hf_dir. It follows
 // the prompt. (Referenced only from the Apple-gated code.)
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
+// The tensor reference iports sit after it, so a graph written against
+// the two original ports keeps working unchanged.
+[[maybe_unused]] constexpr unsigned kFirstRefPort = 2;
+[[maybe_unused]] constexpr unsigned kNumRefPorts  = 6;
+
+// The reference iports all carry the same contract, so it is written
+// once. It is long because every one of these is a silent failure when
+// it is guessed at instead of stated.
+constexpr const char* kRefPortDoc =
+    "OPTIONAL reference media as a tensor, ONE BEAT PER REFERENCE, "
+    "numbered AFTER the `references` list. The KIND is the tensor's rank: "
+    "[N] or [channels, N] f32 is audio, [3, H, W] u8 is a picture, "
+    "[frames, 3, H, W] u8 is a clip -- which also settles the case a file "
+    "cannot state, since a one-frame clip is [1, 3, H, W] and a still is "
+    "[3, H, W]. The SIDEBAND carries the rates, and their absence is an "
+    "error rather than a default: `fps` for a clip, `sr` (or "
+    "`sample_rate`) for audio. Optional sideband keys: `short_edge` for "
+    "this one reference's canvas (0, the default here, encodes it at the "
+    "size it arrived), and `attach` on an audio beat to override the "
+    "stage's `attach_audio` for that beat -- true to make it the SOUNDTRACK "
+    "of the preceding reference, false to decline where the config asked. "
+    "A WIRED port must beat every request -- an empty tensor is how "
+    "you say \"nothing this time\", because a silent port would renumber "
+    "every reference after it and quietly change the request";
 
 const ConfigKey kAttrs[] = {
-  {.key = "references", .type = ConfigType::Any, .required = true,
+  {.key = "references", .type = ConfigType::Any, .required = false,
    .doc = "the reference files IN THE ORDER THE MODEL SHOULD READ THEM: one "
           "path, or an array of paths. The order labels them in the "
           "presentation (<Picture 1>, <Video 2>, ...) and lays them out on "
@@ -64,6 +89,53 @@ const ConfigKey kAttrs[] = {
           "cap and upscales a small picture -- an image reference is read at "
           "high detail and never binds the generated geometry",
    .def_int = 2048},
+  {.key = "reference_image_max_pixels", .type = ConfigType::Int,
+   .required = false,
+   .doc = "an area cap for image references, in pixels. 0 (the default) is "
+          "UNCAPPED, which is the released checkpoint's rule -- an image is "
+          "read at high detail and `reference_image_short_edge` is its only "
+          "bound. That stops being a bound the moment a short edge of 0 says "
+          "to take a picture at the size it arrived, so a graph feeding raw "
+          "pictures through the reference iports wants this set: an uncapped "
+          "4K still is ~220 VAE tiles and 8160 DiT rows, half the packed "
+          "sequence of a typical request, plus the vision tokens to match",
+   .def_int = 0},
+  {.key = "reference_video_short_edge", .type = ConfigType::Int,
+   .required = false,
+   .doc = "what a video reference's short edge is scaled to before it is "
+          "encoded (768 for the released checkpoint), capped by "
+          "`reference_video_max_pixels`. 0 means THE CLIP'S OWN short edge -- "
+          "the same rule, started from what the file carries, so a clip is "
+          "never scaled UP. At 768 a 960x544 reference lands on a 1344x768 "
+          "canvas, 1.98x the pixels with no more information in them. "
+          "Lowering it moves THREE things: the VAE encode, the reference "
+          "rows the DiT attends to on every step, and -- the one that is "
+          "easy to miss -- the CONDITIONER, since the vision tower is given "
+          "these same pixels and so contributes fewer tokens for the clip. "
+          "MEASURED on the two-reference example, 768 -> 0: 13120 -> 7144 "
+          "reference rows, 3115 -> 2119 conditioning rows, 23 m 07 s -> "
+          "14 m 17 s. It is a fidelity decision on both channels and not a "
+          "free speed one, so compare before keeping it",
+   .def_int = 768},
+  {.key = "reference_video_max_pixels", .type = ConfigType::Int,
+   .required = false,
+   .doc = "the area cap a video reference's canvas is held under, in pixels "
+          "(768 * 1344 for the released checkpoint). Applied after the short "
+          "edge and before the rounding, so it is what binds a reference "
+          "LARGER than the canvas whatever `reference_video_short_edge` says",
+   .def_int = 768 * 1344},
+  {.key = "attach_audio", .type = ConfigType::Array, .required = false,
+   .doc = "reference iport numbers (1..6) whose AUDIO is the soundtrack of "
+          "the reference before it rather than a reference of its own -- so "
+          "a clip demuxed into frames and PCM arrives on two ports and stays "
+          "ONE reference, labelled <Video k> and <Audio j> together, exactly "
+          "as a file with a soundtrack is. Positional: it folds onto "
+          "whichever reference immediately precedes it, which may be one "
+          "from the `references` LIST, since those are read first. Per port "
+          "and not a single switch, because a request may legitimately carry "
+          "both an attached soundtrack and a standalone piece of music. A "
+          "beat's own `attach` sideband overrides this for that beat",
+   .def_str = ""},
   {.key = "video_sample_fps", .type = ConfigType::Real, .required = false,
    .doc = "the rate the CONDITIONER reads a video reference at -- every "
           "24/this-th of the normalized frames, merged in pairs into "
@@ -98,6 +170,18 @@ const PortSpec kIports[] = {
    .doc = "OPTIONAL shared model reference from a model-select source; "
           "overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "ref1", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref2", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref3", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref4", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref5", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref6", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 
 const PortSpec kOports[] = {
@@ -172,6 +256,31 @@ prompt_of_(const FlexData& d)
   return {};
 }
 
+// Read one number out of a beat's sideband object.
+bool
+sideband_num_(const FlexData& sb, const char* key, double* out)
+{
+  FlexData v;
+  if (!obj_get_(sb, key, &v)) { return false; }
+  if (v.is_int())  { *out = (double)v.as_int(0);  return true; }
+  if (v.is_real()) { *out = v.as_real(0.0);       return true; }
+  return false;
+}
+
+// Tri-state: did the beat SAY anything about `key`, and if so what.
+// The distinction matters for `attach`, where absent means "defer to the
+// stage's config" and an explicit false means "not this one" -- a beat
+// cannot override a config it cannot tell itself apart from.
+bool
+sideband_bool_(const FlexData& sb, const char* key, bool* out)
+{
+  FlexData v;
+  if (!obj_get_(sb, key, &v)) { return false; }
+  if (v.is_bool()) { *out = v.as_bool(false); return true; }
+  if (v.is_int())  { *out = v.as_int(0) != 0; return true; }
+  return false;
+}
+
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
 }  // namespace
@@ -213,19 +322,69 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
           "VideoRefEncoderStage('{}'): references must be a path or an array "
           "of paths", this->id()));
     }
-    // Empty is a config error and not a runtime warning: a `ref2va`
-    // checkpoint with no references generates video conditioned on
-    // nothing, at full cost. Better to refuse the graph at launch.
-    if (_references.empty() && config_error().empty()) {
-      fail_config(fmt(
-          "VideoRefEncoderStage('{}'): references is required and must name "
-          "at least one file", this->id()));
-    }
+    // An empty list is no longer a config error, because it is no
+    // longer the only source: a graph may feed every reference through
+    // the tensor iports instead, and whether those are wired is not
+    // knowable here -- iport_connected() is a RuntimeContext question.
+    // The "conditioned on nothing" check therefore moved to process(),
+    // where the combined list is known. It costs a load before the
+    // refusal, which is the price of the ports being optional.
   }
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
   _video_sample_fps = attr_real("video_sample_fps");
   _max_prompt_tokens = attr_int("max_prompt_tokens");
+  _vid_short_edge   = attr_int("reference_video_short_edge");
+  _vid_max_pixels   = attr_int("reference_video_max_pixels");
+  _img_max_pixels   = attr_int("reference_image_max_pixels");
+  {
+    auto c = this->config().as_object();
+    if (c.contains("attach_audio")) {
+      FlexData v = c.at("attach_audio");
+      if (v.is_array()) {
+        auto arr = v.as_array();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+          const FlexData& e = arr[i];
+          const long long n = e.is_int()  ? e.as_int(0)
+                            : e.is_uint() ? (long long)e.as_uint(0) : -1;
+          if (n < 1 || n > (long long)kNumRefPorts) {
+            fail_config(fmt(
+                "VideoRefEncoderStage('{}'): attach_audio[{}] is {}; it must "
+                "be a reference iport number, 1..{}", this->id(), i,
+                e.is_int() || e.is_uint() ? std::to_string(n)
+                                          : std::string("not a number"),
+                kNumRefPorts));
+            break;
+          }
+          _attach_audio.push_back((int)n);
+        }
+      } else if (!v.is_null()) {
+        fail_config(fmt(
+            "VideoRefEncoderStage('{}'): attach_audio must be an array of "
+            "reference iport numbers", this->id()));
+      }
+    }
+  }
+  if (_img_max_pixels < 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_image_max_pixels is {}; it "
+        "must be positive, or 0 for uncapped", this->id(), _img_max_pixels));
+  }
+  // Refused at launch rather than warned at the first request: a
+  // non-positive cap or a negative short edge reaches resolve_canvas_size,
+  // which reports EVERY failure as an aspect-ratio one -- so the graph
+  // would run to the first reference and then blame the clip.
+  if (_vid_short_edge < 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_video_short_edge is {}; it "
+        "must be positive, or 0 for the clip's own short edge", this->id(),
+        _vid_short_edge));
+  }
+  if (_vid_max_pixels <= 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_video_max_pixels is {}; it "
+        "must be positive", this->id(), _vid_max_pixels));
+  }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -632,6 +791,181 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 
 // ---- idle unload ----------------------------------------------------
 
+// A reference iport beat -> a MediaReference.
+//
+// The KIND is the tensor's RANK, which is the one thing a tensor states
+// about itself that a container does not. It also settles the case the
+// file path has to infer from content -- a single-frame clip is
+// [1, 3, H, W] and a still is [3, H, W], and those are different
+// requests to this model.
+//
+// The RATES come from the sideband and their absence is an ERROR, never
+// a default. A clip conditioned at the wrong speed generates video with
+// nothing to complain about; that failure is what this stage's whole
+// decode-it-here design exists to prevent, and guessing 24 one port over
+// would put it straight back.
+//
+// U8 for pixels and F32 for audio, matching every producer in the tree
+// (`rgb-frames` is planar u8 [3,H,W]; `pcm-samples` is f32). A float
+// image is refused rather than guessed at, because 0..1 and -1..1 are
+// both plausible and picking wrong is a brightness bug nothing reports.
+bool
+VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
+                                      h3::MediaReference* out,
+                                      std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "reference iport " + std::to_string(n) +
+                                 ": " + std::move(m); }
+    return false;
+  };
+  const auto& sh = tb.shape;
+  const int rank = (int)sh.size();
+  if (rank < 1 || rank > 4) {
+    return fail("a reference tensor must be rank 1..4, got rank " +
+                std::to_string(rank));
+  }
+  for (long long d : sh) {
+    if (d < 0) { return fail("a reference tensor has a negative extent"); }
+  }
+
+  double v = 0.0;
+  if (sideband_num_(tb.sideband, "short_edge", &v) && v >= 0.0) {
+    out->short_edge = (int)v;
+  } else {
+    // The port default is 0 -- encode it at the size it arrived. A
+    // caller reaching for a tensor port has already decided the size
+    // (a resample stage, a crop, a generator), so re-resolving it
+    // against a per-kind default would undo exactly that decision.
+    out->short_edge = 0;
+  }
+
+  if (rank <= 2) {                       // audio
+    const int ch = rank == 2 ? (int)sh[0] : 1;
+    const int ns = rank == 2 ? (int)sh[1] : (int)sh[0];
+    if (ch <= 0 || ns <= 0) { return fail("an audio reference is empty"); }
+    if (tb.dtype != TensorBeat::DType::F32) {
+      return fail("audio must be f32 PCM, got " +
+                  std::string(TensorBeat::name_of(tb.dtype)));
+    }
+    if (!sideband_num_(tb.sideband, "sr", &v) &&
+        !sideband_num_(tb.sideband, "sample_rate", &v)) {
+      return fail("audio carries no `sr` in its sideband, and a sample rate "
+                  "cannot be guessed -- a soundtrack read at the wrong rate "
+                  "conditions on the wrong sound");
+    }
+    if (!(v > 0.0)) { return fail("`sr` must be positive"); }
+    out->kind        = h3::MediaReference::Kind::kAudio;
+    out->channels    = ch;
+    out->sample_rate = (int)v;
+    out->pcm.assign(tb.as_f32(), tb.as_f32() + (std::size_t)ch * ns);
+    return true;
+  }
+
+  const int frames = rank == 4 ? (int)sh[0] : 1;
+  const int c      = rank == 4 ? (int)sh[1] : (int)sh[0];
+  const int h      = (int)sh[(std::size_t)rank - 2];
+  const int w      = (int)sh[(std::size_t)rank - 1];
+  if (c != 3) {
+    return fail("pixels must be planar RGB with 3 channels, got " +
+                std::to_string(c));
+  }
+  if (frames <= 0 || h <= 0 || w <= 0) {
+    return fail("a picture reference is empty");
+  }
+  if (tb.dtype != TensorBeat::DType::U8) {
+    return fail("pixels must be planar u8 RGB (the `rgb-frames` contract), "
+                "got " + std::string(TensorBeat::name_of(tb.dtype)));
+  }
+  out->kind       = rank == 4 ? h3::MediaReference::Kind::kVideo
+                              : h3::MediaReference::Kind::kImage;
+  out->num_frames = frames;
+  out->height     = h;
+  out->width      = w;
+  const std::size_t n_px = (std::size_t)frames * 3 * h * w;
+  out->rgb.assign(tb.as_u8(), tb.as_u8() + n_px);
+  if (rank == 4) {
+    if (!sideband_num_(tb.sideband, "fps", &v) || !(v > 0.0)) {
+      return fail("a clip carries no positive `fps` in its sideband, and a "
+                  "frame rate cannot be guessed -- MiniMax-H3 resamples every "
+                  "reference onto its own 24 fps, so a wrong rate is a "
+                  "reference conditioned at the wrong speed");
+    }
+    out->fps = v;
+  } else {
+    out->fps = h3::kFps;
+  }
+  return true;
+}
+
+void
+VideoRefEncoderStage::report_fits_(const h3::EncodedReferences& enc)
+{
+  // What the encoder had to do to each reference to make it fit.
+  //
+  // WARN and not debug when something was actually lost, because none of
+  // it is visible anywhere else: the canvas is resolved from the
+  // reference rather than configured, the rate resample and the
+  // truncation happen inside one call, and the result is a generation
+  // that is merely different rather than broken. A user who handed this
+  // stage a 4K 60 fps clip and got a 1344x768 24 fps one deserves to be
+  // told which of those the model asked for.
+  //
+  // Percentages are what was KEPT -- spatially by area, temporally by
+  // frame count -- which is the shape of the question people ask.
+  for (std::size_t i = 0; i < enc.fits.size(); ++i) {
+    const auto& f = enc.fits[i];
+    std::vector<std::string> notes;
+    // fmt() is a LAZY formatter, so it is rendered here rather than
+    // stored.
+    auto add = [&notes](const VpipeFormat& v) { notes.push_back(v()); };
+
+    if (f.rescaled() && f.src_h > 0 && f.src_w > 0) {
+      const double kept = (double)f.canvas_h * f.canvas_w /
+                          ((double)f.src_h * f.src_w) * 100.0;
+      add(fmt("{} {}x{} -> {}x{} ({:.0f}% of the pixels)",
+              f.upscaled() ? "UPSCALED" : "rescaled", f.src_w, f.src_h,
+              f.canvas_w, f.canvas_h, kept));
+    }
+    if (f.rate_frames > 0 && f.src_frames > 0 &&
+        f.rate_frames != f.src_frames) {
+      const int d = f.src_frames - f.rate_frames;
+      add(fmt("resampled {:.4g} -> {:.0f} fps ({} frame(s) {})", f.src_fps,
+              h3::kFps, d < 0 ? -d : d, d > 0 ? "dropped" : "held"));
+    }
+    if (f.used_frames > 0 && f.rate_frames > f.used_frames) {
+      const double kept =
+          (double)f.used_frames / (double)f.rate_frames * 100.0;
+      add(fmt("truncated {} -> {} frames ({:.0f}% of the clip)",
+              f.rate_frames, f.used_frames, kept));
+    }
+    if (f.vae_frames > 0 && f.used_frames > f.vae_frames) {
+      add(fmt("{} of {} frames encoded (a whole number of 17n+5 chunks)",
+              f.vae_frames, f.used_frames));
+    }
+    if (f.audio_src_seconds > 0.0 &&
+        f.audio_kept_seconds < f.audio_src_seconds - 1e-3) {
+      add(fmt("soundtrack cut {:.2f}s -> {:.2f}s", f.audio_src_seconds,
+              f.audio_kept_seconds));
+    }
+
+    if (notes.empty()) {
+      session()->log_debug(fmt(
+          "VideoRefEncoderStage('{}'): reference {} taken as given ({}x{})",
+          this->id(), i + 1, f.canvas_w, f.canvas_h));
+      continue;
+    }
+    std::string joined;
+    for (std::size_t k = 0; k < notes.size(); ++k) {
+      if (k > 0) { joined += ", "; }
+      joined += notes[k];
+    }
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference {} fitted -- {}", this->id(),
+        i + 1, joined));
+  }
+}
+
 void
 VideoRefEncoderStage::resolve_unload_policy_()
 {
@@ -727,6 +1061,103 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
 
   std::vector<h3::MediaReference> refs;
   if (!decode_references_(&refs)) { co_return; }
+
+  // ---- the tensor reference iports ----------------------------------
+  // Read unconditionally when WIRED, in port order, appended after the
+  // config list. Not polled: a wired producer beats every request (an
+  // empty tensor is how it says "nothing this time"), so a poll would be
+  // a race where a read is not -- the same rule generate-video applies
+  // to the reference-row ports it reads from this stage. It is also what
+  // keeps the NUMBERING static, and the numbering is the request: a port
+  // that could fall silent would renumber every reference after it.
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    if (ctx.num_iports() <= p || !ctx.iport_connected(p)) { continue; }
+    auto rb = co_await ctx.read(p);
+    const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb.get());
+    if (tb == nullptr) {
+      if (rb) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} carried {}, "
+            "expected a tensor; skipping", this->id(),
+            p - kFirstRefPort + 1, rb->describe()));
+      }
+      continue;
+    }
+    // An empty tensor is the declared way to say "no reference here".
+    // byte_size(), not `data`: a Shared (Metal-buffer) beat leaves
+    // `data` empty and holds its bytes externally, so reading `data`
+    // would take a full picture for an absent one -- and absent
+    // renumbers every reference after it.
+    if (tb->shape.empty() || tb->byte_size() == 0) { continue; }
+    h3::MediaReference m;
+    std::string merr;
+    if (!media_from_beat(*tb, (int)(p - kFirstRefPort + 1), &m, &merr)) {
+      session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
+                          this->id(), merr));
+      co_return;
+    }
+    // `attach` folds a soundtrack onto the reference before it instead
+    // of adding one of its own -- a clip demuxed into frames and pcm
+    // arrives on two ports but is ONE reference, labelled <Video k> and
+    // <Audio j> together, exactly as a file with a soundtrack is.
+    //
+    // The stage's config decides it, so the switch is reachable from the
+    // stage whose behaviour it is; a beat may still override for itself,
+    // which is how a producer that knows better than the graph says so.
+    const int refno = (int)(p - kFirstRefPort + 1);
+    bool attach = std::find(_attach_audio.begin(), _attach_audio.end(),
+                            refno) != _attach_audio.end();
+    {
+      bool said = false;
+      if (sideband_bool_(tb->sideband, "attach", &said)) { attach = said; }
+    }
+    if (m.kind == h3::MediaReference::Kind::kAudio && attach) {
+      if (refs.empty()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its audio but nothing precedes it; skipping", this->id(),
+            refno));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.has_audio()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its audio but reference {} already carries a soundtrack; "
+            "skipping", this->id(), refno, refs.size()));
+        co_return;
+      }
+      // Warned, not refused, when the target is not a clip. A still
+      // with a soundtrack is almost always a wiring slip -- but it is
+      // reachable from the `references` list too, where a one-frame
+      // .mp4 with an audio track is classified as an image and keeps
+      // its PCM, so refusing it here would make the same media legal
+      // through one door and not the other.
+      if (prev.kind != h3::MediaReference::Kind::kVideo) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} attached its "
+            "audio to reference {}, which is a STILL, not a clip. That is "
+            "a valid request and probably not the one you meant -- a "
+            "soundtrack usually belongs to the clip it was demuxed from, "
+            "so check the port order", this->id(), refno, refs.size()));
+      }
+      prev.pcm         = std::move(m.pcm);
+      prev.channels    = m.channels;
+      prev.sample_rate = m.sample_rate;
+      continue;
+    }
+    refs.push_back(std::move(m));
+  }
+
+  if (refs.empty()) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): no references -- `references` is empty "
+        "and no reference iport delivered one. A ref2va checkpoint with "
+        "nothing to condition on denoises at full cost and generates from "
+        "the prompt alone; skipping", this->id()));
+    co_return;
+  }
+
   std::string verr;
   if (!h3::validate_reference_request(refs, _limits, &verr)) {
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
@@ -737,6 +1168,9 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   h3::ReferencePlan plan;
   plan.target_frames = h3::align_num_frames(_frames, 17, 5);
   plan.reference_image_short_edge = _ref_short_edge;
+  plan.canvas_short_edge = _vid_short_edge;
+  plan.canvas_max_pixels = (std::int64_t)_vid_max_pixels;
+  plan.reference_image_max_pixels = (std::int64_t)_img_max_pixels;
   plan.video_sample_fps = _video_sample_fps;
   {
     // The DiT's patch, from the checkpoint rather than assumed: the
@@ -887,6 +1321,13 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       "VideoRefEncoderStage('{}'): {} reference(s) -> {} conditioning rows, "
       "{} reference video rows, {} reference audio rows", this->id(),
       refs.size(), enc.n_tokens, vrows, arows));
+  // What each visual reference was actually encoded at. The canvas is
+  // resolved from the reference's own aspect and never appears in the
+  // config, so an upscale -- which costs here AND in every denoise step,
+  // since these rows lead the DiT's video buffer -- is otherwise
+  // invisible. Reported as pixels, from the latent geometry the layout
+  // carries, so it says what ran rather than what was asked for.
+  report_fits_(enc);
   ++_emitted;
   if (_unload_idle) { unload_models_(); }
 }

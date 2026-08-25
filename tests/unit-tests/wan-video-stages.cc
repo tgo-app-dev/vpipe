@@ -671,12 +671,21 @@ TEST(video_ref_encoder, request_surface)
 
   const StageSpec& sp = s->spec();
   EXPECT_TRUE(std::string(sp.type_name) == "video-ref-encoder");
-  // The references are CONFIG, not a port: they are files to open, which
-  // is what a file browser fills in. Two ports left, and `model` moved
-  // down to 1 when the reference port went.
-  EXPECT_TRUE(sp.iports.size() == 2);
+  // The FILE references are config, not a port: they are paths to open,
+  // which is what a file browser fills in. The six tensor iports sit
+  // AFTER prompt and model, so a graph written against the original two
+  // is unaffected, and they exist for the references a file list cannot
+  // name -- a generated still, a cropped frame, a clip that was never
+  // written to disk.
+  EXPECT_TRUE(sp.iports.size() == 8);
   EXPECT_TRUE(std::string(sp.iports[0].name) == "prompt");
   EXPECT_TRUE(std::string(sp.iports[1].name) == "model");
+  for (int i = 0; i < 6; ++i) {
+    const std::string want = "ref" + std::to_string(i + 1);
+    EXPECT_TRUE(std::string(sp.iports[(std::size_t)i + 2].name) == want);
+    EXPECT_TRUE(*sp.iports[(std::size_t)i + 2].type ==
+                typeid(TensorBeatPayload));
+  }
 
   // The key the browser drives: a path field that is NOT a single
   // string, which is what makes the dialog multi-select, and a filter
@@ -686,7 +695,9 @@ TEST(video_ref_encoder, request_surface)
   for (const auto& k : sp.attrs) {
     if (std::string(k.key) != "references") { continue; }
     has_refs = true;
-    EXPECT_TRUE(k.required);
+    // No longer REQUIRED: the tensor iports are a second source, and
+    // whether they are wired is not knowable at construction.
+    EXPECT_FALSE(k.required);
     EXPECT_TRUE(k.is_path);
     EXPECT_FALSE(k.path_write);
     EXPECT_TRUE(k.type != ConfigType::String);
@@ -733,19 +744,176 @@ TEST(video_ref_encoder, request_surface)
 // than a warning at the first beat. A Ref2VA forward with no references
 // generates video conditioned on nothing, at the full cost of a 33B
 // model -- so failing the graph beats running it.
-TEST(video_ref_encoder, references_are_required_and_must_be_paths)
+// The tensor reference ports' contract: kind from RANK, rates from the
+// sideband, and a missing rate refused rather than guessed.
+//
+// This is the part of the port design that fails silently when it is
+// wrong. A clip taken for a still conditions on one frozen frame; a
+// soundtrack read at the wrong rate conditions on the wrong sound; and
+// neither raises anything downstream -- the shapes are all still valid.
+// attach_audio names the ports whose audio is a SOUNDTRACK rather than a
+// reference of its own -- refused at launch when it names a port that
+// does not exist, because a typo there is silently a different request:
+// the soundtrack becomes an extra <Audio k> and renumbers nothing
+// visible until the model is conditioned on it.
+TEST(video_ref_encoder, attach_audio_names_reference_ports)
+{
+  Session sess;
+  auto with = [&](std::vector<int> ports, const char* id) {
+    auto arr = FlexData::make_array();
+    for (int n : ports) { arr.as_array().push_back(FlexData::make_int(n)); }
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("attach_audio", std::move(arr));
+    return std::string(
+        VideoRefEncoderStage(&sess, id, vector<InEdge>{}, cfg)
+            .config_error());
+  };
+  EXPECT_TRUE(with({3}, "a").empty());
+  EXPECT_TRUE(with({1, 6}, "b").empty());
+  // 0 and 7 are not reference iports -- 1..6 are.
+  EXPECT_FALSE(with({0}, "c").empty());
+  EXPECT_FALSE(with({7}, "d").empty());
+  {
+    // Not an array at all.
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("attach_audio", FlexData::make_int(3));
+    VideoRefEncoderStage s(&sess, "e", vector<InEdge>{}, cfg);
+    EXPECT_FALSE(s.config_error().empty());
+  }
+  // Absent is the default, and the default is nothing attached: an audio
+  // beat with no instruction is a reference of its own.
+  {
+    auto cfg = FlexData::make_object();
+    VideoRefEncoderStage s(&sess, "f", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  std::printf("[video_ref_encoder] attach_audio: 1..6 accepted, 0 and 7 "
+              "refused at launch\n");
+}
+
+TEST(video_ref_encoder, reference_beats_are_typed_by_rank)
+{
+  namespace h3 = vpipe::genai::minimax_h3;
+  auto beat = [](std::vector<long long> shape, TensorBeat::DType dt) {
+    TensorBeatPayload tb;
+    tb.dtype = dt;
+    tb.shape = std::move(shape);
+    std::size_t n = 1;
+    for (long long d : tb.shape) { n *= (std::size_t)d; }
+    tb.resize_contiguous(n);
+    tb.sideband = FlexData::make_object();
+    return tb;
+  };
+  auto put = [](TensorBeatPayload& tb, const char* k, FlexData v) {
+    tb.sideband.as_object().insert_or_assign(k, std::move(v));
+  };
+  h3::MediaReference m;
+  std::string err;
+
+  // [N] f32 + sr -> mono audio.
+  {
+    auto tb = beat({800}, TensorBeat::DType::F32);
+    put(tb, "sr", FlexData::make_int(32000));
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 1, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kAudio);
+    EXPECT_TRUE(m.channels == 1 && m.sample_rate == 32000);
+    EXPECT_TRUE(m.pcm.size() == 800);
+  }
+  // [C, N] f32 -> that many channels.
+  {
+    auto tb = beat({2, 400}, TensorBeat::DType::F32);
+    put(tb, "sample_rate", FlexData::make_int(32000));
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 2, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kAudio);
+    EXPECT_TRUE(m.channels == 2 && m.pcm.size() == 800);
+  }
+  // [3, H, W] u8 -> a still, and the port default is short_edge 0 --
+  // encode it at the size it arrived, which is the whole point of
+  // handing pixels over a port instead of a path.
+  {
+    auto tb = beat({3, 64, 128}, TensorBeat::DType::U8);
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 3, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kImage);
+    EXPECT_TRUE(m.num_frames == 1 && m.height == 64 && m.width == 128);
+    EXPECT_TRUE(m.short_edge == 0);
+  }
+  // ...and a per-reference short edge overrides that.
+  {
+    auto tb = beat({3, 64, 128}, TensorBeat::DType::U8);
+    put(tb, "short_edge", FlexData::make_int(768));
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 3, &m, &err));
+    EXPECT_TRUE(m.short_edge == 768);
+  }
+  // [T, 3, H, W] u8 + fps -> a clip. Rank is what separates this from a
+  // still, which is the case a container cannot state: [1, 3, H, W] is a
+  // one-frame CLIP and [3, H, W] is a picture.
+  {
+    auto tb = beat({5, 3, 64, 128}, TensorBeat::DType::U8);
+    put(tb, "fps", FlexData::make_real(30.0));
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 4, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kVideo);
+    EXPECT_TRUE(m.num_frames == 5 && m.fps > 29.9 && m.fps < 30.1);
+  }
+  {
+    auto tb = beat({1, 3, 64, 128}, TensorBeat::DType::U8);
+    put(tb, "fps", FlexData::make_real(24.0));
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 4, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kVideo);
+  }
+
+  // The refusals. A rate that is not stated is NOT defaulted: 24 fps
+  // would look right and condition the clip at the wrong speed.
+  {
+    auto tb = beat({5, 3, 64, 128}, TensorBeat::DType::U8);
+    m = h3::MediaReference{};
+    EXPECT_FALSE(VideoRefEncoderStage::media_from_beat(tb, 4, &m, &err));
+    EXPECT_FALSE(err.empty());
+  }
+  {
+    auto tb = beat({800}, TensorBeat::DType::F32);
+    m = h3::MediaReference{};
+    EXPECT_FALSE(VideoRefEncoderStage::media_from_beat(tb, 1, &m, &err));
+  }
+  // Float pixels are refused rather than guessed at: 0..1 and -1..1 are
+  // both plausible and picking wrong is a brightness bug nothing reports.
+  {
+    auto tb = beat({3, 64, 128}, TensorBeat::DType::F32);
+    m = h3::MediaReference{};
+    EXPECT_FALSE(VideoRefEncoderStage::media_from_beat(tb, 3, &m, &err));
+  }
+  // Not planar RGB.
+  {
+    auto tb = beat({4, 64, 128}, TensorBeat::DType::U8);
+    m = h3::MediaReference{};
+    EXPECT_FALSE(VideoRefEncoderStage::media_from_beat(tb, 3, &m, &err));
+  }
+  std::printf("[video_ref_encoder] reference beats: rank types them, a "
+              "missing rate is refused\n");
+}
+
+TEST(video_ref_encoder, references_may_be_empty_but_must_be_paths)
 {
   Session sess;
   {
+    // No `references` at all is NO LONGER a config error: a graph may
+    // feed every reference through the tensor iports, and construction
+    // cannot see whether those are wired (iport_connected is a
+    // RuntimeContext question). The "conditioned on nothing" refusal
+    // moved to process(), where the combined list is known.
     auto cfg = FlexData::make_object();
     VideoRefEncoderStage s(&sess, "a", vector<InEdge>{}, cfg);
-    EXPECT_FALSE(s.config_error().empty());
+    EXPECT_TRUE(s.config_error().empty());
   }
   {
     auto cfg = FlexData::make_object();
     cfg.as_object().insert_or_assign("references", FlexData::make_array());
     VideoRefEncoderStage s(&sess, "b", vector<InEdge>{}, cfg);
-    EXPECT_FALSE(s.config_error().empty());
+    EXPECT_TRUE(s.config_error().empty());
   }
   {
     // A non-path entry: caught here rather than as "will not open" per

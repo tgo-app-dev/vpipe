@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -147,10 +149,18 @@ class MetalFlux2Transformer {
   };
 
   // `stream_blocks` (memory-bounded, for small boxes): the double + single
-  // blocks are NOT preloaded; each is re-read from the retained source mmap
-  // just before use in forward_dit and freed after, so peak block RAM is ~one
-  // block instead of the whole DiT (the embedders / modulation / final layer
+  // blocks are NOT preloaded; each is re-read from the checkpoint just
+  // before use in forward_dit, so peak block RAM is a couple of blocks per
+  // stack instead of the whole DiT (the embedders / modulation / final layer
   // are still preloaded). ~2-3x slower per step (weights re-read per forward).
+  //
+  // The read goes through shared/block-slots.h: two reusable destinations
+  // per stack, refilled in place with pread(2), with the next block's read
+  // issued under the current block's GPU work. Two stacks means two slot
+  // pairs, and the single-block pair also holds the raw to_qkv_mlp_proj its
+  // fused halves are built from -- see each_single_tensor_. On a 17 GB
+  // checkpoint on internal SSD that is 1.47x the forward against the
+  // per-block-allocation route (VPIPE_FLUX2_NO_SLOTS), byte-identical.
   //
   // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
   //
@@ -178,9 +188,6 @@ class MetalFlux2Transformer {
 
   ~MetalFlux2Transformer();
 
-  // Leading blocks pinned resident in streaming mode (double + single;
-  // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned_d + _pinned_s; }
 
   // ---- adaptive block residency (streaming mode) ----------------------
   //
@@ -194,10 +201,16 @@ class MetalFlux2Transformer {
   // forward still needs; 0 (the default) disables growth entirely, which
   // is the pure-streaming behaviour this model had before.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   // Hand back at least `bytes` of promoted blocks. Never touches the
-  // configured pinned prefix; returns what was actually freed.
+  // returns what was actually freed.
   std::size_t release_resident_blocks(std::size_t bytes);
 
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
@@ -334,8 +347,13 @@ class MetalFlux2Transformer {
                       const QWeight& src, int start, int count, Retain r);
   bool load_double_(WeightSet& ws, const std::string& pre,
                     DoubleBlock& b, Retain r);
+  // `keep_split` suppresses the release of the raw to_qkv_mlp_proj that
+  // the fused path normally drops once qkv + mlp_gu exist. A REFILLABLE
+  // block has to keep it: the two fused halves are a slice and a row
+  // permutation of it, so they have no checkpoint name of their own and
+  // must be rebuilt out of the raw tensor after every read.
   bool load_single_(WeightSet& ws, const std::string& pre,
-                    SingleBlock& b, Retain r);
+                    SingleBlock& b, Retain r, bool keep_split = false);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -352,25 +370,93 @@ class MetalFlux2Transformer {
   QWeight _mod_img, _mod_txt, _mod_single;   // Flux2Modulation.linear (no bias)
   QWeight _proj_out;                                 // proj_out (hidden->out_ch)
   QWeight _norm_out_lin;      // AdaLayerNormContinuous.linear (hidden->2*hidden)
-  std::vector<DoubleBlock> _double;   // pinned prefix (all when preloaded)
-  std::vector<SingleBlock> _single;   // pinned prefix (all when preloaded)
+  std::vector<DoubleBlock> _double;   // promoted blocks (all when preloaded)
+  std::vector<SingleBlock> _single;   // promoted blocks (all when preloaded)
 
-  // Streaming mode: blocks past the pinned prefix (_pinned_d double, _pinned_s
+  // Streaming mode: blocks not yet promoted by residency (both stacks
   // single) are loaded on demand from the weight set per forward and
   // freed after use.
   bool _stream_blocks = false;
   BlockResidency _resid;
-  int _pinned_d = 0;                  // pinned leading double blocks (streaming)
-  int _pinned_s = 0;                  // pinned leading single blocks (streaming)
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::size_t wire_block_(DoubleBlock& b, bool on);
+  std::size_t wire_block_(SingleBlock& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
   // Free the highest resident block -- singles before doubles. Returns
-  // its bytes, or 0 when nothing is left. `allow_pinned` lets it take one
-  // out of the pinned prefix (shrinking the count to match), which is
-  // only right when a measurement says that prefix is no longer in RAM.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // its bytes, or 0 when nothing is left.
+  std::size_t evict_tail_block_();
   // Pages of the resident set examined, and how many are still in RAM.
   void resident_pages_(std::size_t* examined, std::size_t* incore) const;
   static std::size_t double_bytes_(const DoubleBlock& b);
   static std::size_t single_bytes_(const SingleBlock& b);
+  // THREE ANSWERS FOR A SINGLE BLOCK, because a slot holds the raw
+  // to_qkv_mlp_proj as well as the qkv and gate|up split out of it and
+  // the three questions have different answers. (A double block riffles
+  // in place, so there they all agree and double_bytes_ serves.)
+  //
+  //   single_bytes_          what this block holds RIGHT NOW. Wiring
+  //                          and eviction, which act on what exists.
+  //   single_read_bytes_     what a refill READS: the raw one only.
+  //                          Counting the held bytes here would report
+  //                          the drive running at twice its rate, which
+  //                          is the one number this path exists to move.
+  //   single_resident_bytes_ what promotion KEEPS: the raw one is
+  //                          dropped. Admission and the wired pool ask
+  //                          this, because a grant smaller than the ask
+  //                          is how the pool learns the box refused --
+  //                          and reporting a refusal that never happened
+  //                          stops residency growing at the first
+  //                          promoted block.
+  static std::size_t single_read_bytes_(const SingleBlock& b);
+  static std::size_t single_resident_bytes_(const SingleBlock& b);
+
+  // ---- two reusable destinations per stack (shared/block-slots.h) -----
+  //
+  // Two sets rather than one because the stacks hold different types,
+  // and the singles run only after every double is done -- so the two
+  // never have a read outstanding at the same time and each keeps its
+  // own pair.
+  //
+  // Enumerate every (checkpoint name, destination, placement) of block
+  // L. The four lists that describe a block -- these, double_bytes_/
+  // single_bytes_, wire_block_ and clone -- must agree, or a tensor is
+  // read into a buffer nothing counts or counted into one nothing fills.
+  void each_double_tensor_(int L, DoubleBlock& b,
+                           const BlockSlots<DoubleBlock>::TensorFn& fn) const;
+  void each_single_tensor_(int L, SingleBlock& b,
+                           const BlockSlots<SingleBlock>::TensorFn& fn) const;
+  bool clone_double_(const DoubleBlock& s, DoubleBlock& d, bool copy) const;
+  bool clone_single_(const SingleBlock& s, SingleBlock& d, bool copy) const;
+  metal_compute::SharedBuffer rebuild_one_(const std::string& nm,
+                                           Placement how);
+  // Turn a [2*INNER, K] weight that a raw read just landed in the
+  // checkpoint's own gate-then-up order into the INTERLEAVED order the
+  // fused-SwiGLU epilogue reads -- IN PLACE, so a refillable block pays
+  // no staging buffer for the largest tensor it holds.
+  bool riffle_rows_(QWeight& qw) const;
+  // Rebuild a single block's fused halves out of the raw to_qkv_mlp_proj
+  // it kept: rows [0, 3H) become qkv, the rest becomes the interleaved
+  // gate|up. Both destinations already exist, which is the point.
+  bool split_single_(SingleBlock& b) const;
+  void configure_slots_();
+  BlockSlots<DoubleBlock> _double_slots;
+  BlockSlots<SingleBlock> _single_slots;
   // Zero-copy mmap of the quantized weight tensors (codes/scales/qbias) as
   // read-only views aliasing the weight set's mmap, instead of owned
   // copies. The pages are clean + file-backed, so the OS can reclaim the

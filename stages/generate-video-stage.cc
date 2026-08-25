@@ -2336,26 +2336,29 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       co_return;
     }
     if (_unload_idle) {
-      // POOLED BEFORE THE RESET, and the order is the whole thing:
-      // pool_weights() finds the set through a WEAK reference, so once
-      // this model has dropped its last strong one there is nothing left
-      // to pool and the call is a silent no-op.
+      // SETTLED with the manager, which owns the checkpoint: the reset
+      // below only ends this stage's borrow, and the call asks for it to
+      // be parked now if nobody else is borrowing it. The order against
+      // the reset used to be the whole thing -- the manager's reference
+      // was weak, so pooling after it was a silent no-op -- and is now
+      // free either way.
       //
       // `auto` means REMOVABLE, not gone: the checkpoint stays alive and
       // purgeable so a relaunch pays no reload, and the kernel may take
       // the pages meanwhile. `destroy` is the caller asking for the bytes
       // back now, so it keeps dropping them.
       //
-      // The pool refuses a set the AdaLN bake specialised, which is this
-      // model on every schedule -- so today this reports the refusal
-      // rather than pooling. That is the correct outcome and not a
-      // wasted call: it is what makes the reload visible.
-      if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
-        if (auto* mgr = session()->services()->generative_model_manager()) {
+      // Settling REFUSES a set the AdaLN bake specialised, which is this
+      // model on every schedule -- it is dropped rather than kept, so
+      // the reload is real and visible either way.
+      _h3_dit.reset();
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+          mgr->drop_weights(_dit_dir_declared_);
+        } else {
           mgr->pool_weights(_dit_dir_declared_);
         }
       }
-      _h3_dit.reset();
       // The other half of the denoise-phase claim. Peers sized against
       // the promise that these bytes are gone by the time the decodes
       // run; this is where it is kept, and saying so is what stops the

@@ -21,6 +21,7 @@ import { api } from './api.js';
 import { t } from './i18n.js';
 import { humanSize, joinPath } from './fs-list.js';
 import { categorize } from './fs-kinds.js';
+import { getLocale } from './i18n.js';
 
 // One screen of text: bytes fetched for a text preview (Range-capped so
 // a huge file is never pulled whole).
@@ -85,6 +86,41 @@ export function createFsPreview() {
         makeIcon('load', 'sm'), el('span', {}, t('fb.download'))));
   }
 
+  // The last-modified stamp, pinned to the BOTTOM of the panel: it is
+  // the least urgent thing here, and putting it under the content keeps
+  // the meta row from growing a third field that pushes the Download
+  // button around.
+  //
+  // Rendered in the locale the UI is set to rather than the browser's,
+  // so a user who switched the app to 简体中文 does not get their dates
+  // back in en-US. An entry with no stamp -- a stat that failed -- gets
+  // NO row rather than a placeholder date, because a wrong date here is
+  // worse than a missing one.
+  function modifiedRow(entry) {
+    const secs = entry ? entry.mtime : null;
+    if (typeof secs !== 'number' || !isFinite(secs) || secs <= 0) {
+      return null;
+    }
+    let when;
+    try {
+      when = new Date(secs * 1000).toLocaleString(getLocale());
+    } catch (e) {
+      when = new Date(secs * 1000).toLocaleString();
+    }
+    return el('div', { class: 'fb-file-modified' },
+              t('fb.modified', { t: when }));
+  }
+
+  // The panel body. Built here rather than at each of the six call
+  // sites so a category added later cannot quietly ship without the
+  // footer -- which is exactly how the previous per-branch duplication
+  // would have gone wrong.
+  function panel(entry, url, cls, ...children) {
+    return el('div',
+      { class: cls ? 'fb-preview-inner ' + cls : 'fb-preview-inner' },
+      metaRow(entry, url), ...children, modifiedRow(entry));
+  }
+
   // The pixel dimensions, under the media. Written once the element
   // knows them -- an <img> only has naturalWidth after it decodes, and a
   // <video> only has videoWidth after metadata arrives, so neither can
@@ -97,8 +133,7 @@ export function createFsPreview() {
   };
 
   function unpreviewable(entry, url, why) {
-    clear(root).append(el('div', { class: 'fb-preview-inner' },
-      metaRow(entry, url),
+    clear(root).append(panel(entry, url, '',
       el('div', { class: 'fb-preview-empty' },
         el('div', { class: 'fb-no-preview' }, why || t('fb.no_preview')))));
   }
@@ -114,8 +149,7 @@ export function createFsPreview() {
 
     if (isPipeline(entry.name)) {
       const list = el('div', { class: 'fb-pl-list' }, t('common.loading'));
-      root.append(el('div', { class: 'fb-preview-inner' },
-        metaRow(entry, url), list));
+      root.append(panel(entry, url, '', list));
       api.fsText(vpath, PIPELINE_BYTES).then((res) => {
         if (mine !== gen) { return; }
         const stages = summarizePipeline(res.text);
@@ -151,8 +185,7 @@ export function createFsPreview() {
       img.addEventListener('load',
         () => setDims(dims, img.naturalWidth, img.naturalHeight));
       img.addEventListener('error', () => unpreviewable(entry, url));
-      root.append(el('div', { class: 'fb-preview-inner' },
-        metaRow(entry, url),
+      root.append(panel(entry, url, '',
         el('div', { class: 'fb-media-wrap' }, img), dims));
 
     } else if (cat === 'video') {
@@ -162,24 +195,21 @@ export function createFsPreview() {
       v.addEventListener('loadedmetadata',
         () => setDims(dims, v.videoWidth, v.videoHeight));
       v.addEventListener('error', () => unpreviewable(entry, url));
-      root.append(el('div', { class: 'fb-preview-inner' },
-        metaRow(entry, url),
+      root.append(panel(entry, url, '',
         el('div', { class: 'fb-media-wrap' }, v), dims));
 
     } else if (cat === 'audio') {
       const a = el('audio', { class: 'fb-audio', controls: true,
         preload: 'metadata', src: url });
       a.addEventListener('error', () => unpreviewable(entry, url));
-      root.append(el('div', { class: 'fb-preview-inner audio' },
-        metaRow(entry, url),
+      root.append(panel(entry, url, 'audio',
         el('div', { class: 'fb-media-wrap audio' }, a)));
 
     } else if (cat === 'text') {
       const pre = el('pre', { class: 'fb-text allow-context-menu' },
         t('common.loading'));
       const note = el('div', { class: 'fb-note', hidden: true });
-      root.append(el('div', { class: 'fb-preview-inner' },
-        metaRow(entry, url), note, pre));
+      root.append(panel(entry, url, '', note, pre));
       api.fsText(vpath, TEXT_PREVIEW_BYTES).then((res) => {
         if (mine !== gen) { return; }
         clear(pre).append(document.createTextNode(res.text));

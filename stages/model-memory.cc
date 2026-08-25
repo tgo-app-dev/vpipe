@@ -3,7 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 #include "interfaces/session-context-intf.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "interfaces/session-services-intf.h"
@@ -59,7 +59,8 @@ phys_ram()
   // box has. That makes a bounded-box configuration reproducible on a big
   // machine (the 16 GB streaming/unload path is otherwise only testable on a
   // 16 GB machine), and it doubles as a way to leave headroom for other work.
-  // stream-pin.h honours the same variable so the pinned-block count agrees.
+  // stream-sizing.h honours the same variable so the pinned-block count
+  // agrees.
   if (const char* e = std::getenv("VPIPE_RAM_LIMIT_MB")) {
     const long long mb = std::atoll(e);
     if (mb > 0) { return (std::size_t)mb << 20; }
@@ -104,11 +105,11 @@ streaming_floor_bytes(const std::string&                   dir,
   if (dir.empty()) { return 0; }
   auto wts = genai::MetalLlamaWeights::open_model(dir);
   if (!wts.has_value()) { return 0; }
-  for (std::string_view stem : stems) {
-    const std::size_t f = genai::stream_floor_bytes(*wts, stem, exclude);
-    if (f > 0) { return f; }
-  }
-  return 0;
+  // ALL the stems at once, not the first that matches. A model with two
+  // block stacks streams both and keeps a slot pair for each, so
+  // measuring it against one stem and letting the other stack fall into
+  // the trunk over-states the floor by most of the checkpoint.
+  return genai::stream_floor_bytes(*wts, stems, exclude);
 }
 
 std::size_t
@@ -286,7 +287,7 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   }
   // Pin as many leading blocks as fit beside everything else that stays
   // resident. 5 GB covers activation scratch plus the in-flight block
-  // and its double-buffer margin; 0.60 is the ceiling stream-pin.h
+  // and its double-buffer margin; 0.60 is the ceiling stream-sizing.h
   // budgets against.
   if (p.stream && ram > p.others + (5ull << 30)) {
     p.pin_frac = std::min(0.60,

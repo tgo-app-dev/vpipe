@@ -314,12 +314,14 @@ std::size_t dir_weights_bytes(const std::string& dir);
 // matches nothing yields 0, and a prefix match from position 0 cannot
 // confuse "blocks." with "transformer_blocks.".
 //
-// Returns 0 when no stem matches, which means nothing here streams and
-// the checkpoint has no smaller form. A model with TWO stacks (FLUX.2's
-// double and single) is measured against whichever stem is tried first
-// and counts the other stack as trunk -- an OVER-estimate of the floor,
-// which is the safe direction: it claims the model can be reduced less
-// than it can.
+// Returns 0 when NO stem matches, which means nothing here streams and
+// the checkpoint has no smaller form.
+//
+// A model with TWO stacks (an image DiT's double and single) is measured
+// against BOTH: it streams both and keeps a slot pair for each, so the
+// floor is the trunk plus a pair per stack. Stems are tried in order and
+// the first prefix match wins, so a list holding one stem that is a
+// prefix of another must put the longer first.
 std::size_t streaming_floor_bytes(const std::string&                   dir,
                                   const std::vector<std::string_view>& stems,
                                   std::string_view exclude = {});

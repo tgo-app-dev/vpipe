@@ -43,6 +43,13 @@ ConsoleWriter::ConsoleWriter()
   _tty = ::isatty(::fileno(stdout)) != 0;
 }
 
+void
+ConsoleWriter::set_tty_for_test(bool tty)
+{
+  std::lock_guard<std::mutex> lk(_mu);
+  _tty = tty;
+}
+
 int
 ConsoleWriter::width() const
 {

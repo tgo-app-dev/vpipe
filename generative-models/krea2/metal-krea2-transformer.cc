@@ -7,7 +7,6 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
-#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
@@ -186,7 +185,8 @@ MetalKrea2Transformer::load_qw_(WeightSet& ws, const std::string& name,
 bool
 MetalKrea2Transformer::load_block_(WeightSet& ws,
                                    const std::string& pre, Block& b,
-                                   bool main_block, Retain r)
+                                   bool main_block, Retain r,
+                                   bool keep_split)
 {
   if (main_block) {
     b.sst = elt_(ws, pre + "scale_shift_table", r);
@@ -251,8 +251,10 @@ MetalKrea2Transformer::load_block_(WeightSet& ws,
       gu.quantized = true;
       gu.bits = b.ff_gate.bits;
       b.ff_gu = std::move(gu);
-      b.ff_gate = QWeight{};
-      b.ff_up = QWeight{};
+      if (!keep_split) {
+        b.ff_gate = QWeight{};
+        b.ff_up = QWeight{};
+      }
     }
   }
   const bool ff_in_ok = !b.ff_gu.empty()
@@ -262,7 +264,185 @@ MetalKrea2Transformer::load_block_(WeightSet& ws,
          !b.o.empty() && ff_in_ok && !b.ff_down.empty();
 }
 
-MetalKrea2Transformer::~MetalKrea2Transformer() = default;
+
+// ---- the streamed blocks' reusable destinations ------------------------
+
+// Shorthand for the per-tensor placement the refill needs stated.
+using P = vpipe::genai::Placement;
+
+// Every (checkpoint name, destination, placement) of block L, in a fixed
+// order.
+//
+// THE NORMS ARE `kDerived` AND THAT IS THE WHOLE TRAP HERE. This model
+// stores its RMSNorm weights zero-centred and folds the +1 at load
+// (to_f16_norm_), so the bytes in the destination are NOT the bytes in
+// the checkpoint. A raw refill would place the checkpoint's and be
+// silently wrong -- the buffer is the right size and full of plausible
+// numbers, and the only visible symptom would be a slightly different
+// picture. `ff_gu` is derived for the same reason and is rebuilt by
+// weave_into_ after the refill, so it is not enumerated at all.
+void
+MetalKrea2Transformer::each_block_tensor_(
+    int L, Block& b, const BlockSlots<Block>::TensorFn& fn) const
+{
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  const auto qw = [&fn](const std::string& base, QWeight& w) {
+    if (w.quantized) {
+      // Codes are the checkpoint's own u32 words; the group scales and
+      // minima are read as bf16 (F16 in the pack, converted in place).
+      fn(base + ".weight", w.codes, P::kRaw);
+      fn(base + ".scales", w.scales, P::kBf16);
+      fn(base + ".biases", w.qbias, P::kBf16);
+    } else {
+      fn(base + ".weight", w.w, P::kBf16);
+    }
+  };
+  // Empty in a non-main block, and BlockSlots skips an empty
+  // destination -- so naming it unconditionally is safe.
+  fn(p + "scale_shift_table", b.sst, P::kBf16);
+  fn(p + "norm1.weight", b.n1, P::kDerived);
+  fn(p + "norm2.weight", b.n2, P::kDerived);
+  qw(p + "attn.to_q", b.q);
+  qw(p + "attn.to_k", b.k);
+  qw(p + "attn.to_v", b.v);
+  qw(p + "attn.to_gate", b.gate);
+  fn(p + "attn.norm_q.weight", b.qn, P::kDerived);
+  fn(p + "attn.norm_k.weight", b.kn, P::kDerived);
+  qw(p + "attn.to_out.0", b.o);
+  qw(p + "ff.gate", b.ff_gate);
+  qw(p + "ff.up", b.ff_up);
+  qw(p + "ff.down", b.ff_down);
+}
+
+// Re-interleave gate|up into a destination that ALREADY exists. The
+// fused weight has no checkpoint name -- it is a transform of two
+// tensors -- so a refill cannot address it and this runs after one.
+bool
+MetalKrea2Transformer::weave_into_(const QWeight& gate, const QWeight& up,
+                                   QWeight& dst) const
+{
+  if (dst.empty()) { return true; }        // not fused: nothing to rebuild
+  if (gate.empty() || up.empty()) { return false; }
+  const std::size_t FF = (std::size_t)_cfg.ffn;
+  if (FF == 0) { return false; }
+  bool ok = true;
+  const auto one = [&](const SharedBuffer& g, const SharedBuffer& u,
+                       SharedBuffer& d) {
+    if (!ok || d.empty()) { return; }
+    if (g.empty() || u.empty()) { ok = false; return; }
+    const std::size_t rb = g.byte_size() / FF;
+    if (rb == 0 || u.byte_size() / FF != rb ||
+        d.byte_size() != 2 * FF * rb) {
+      ok = false;
+      return;
+    }
+    const auto* gs = static_cast<const std::uint8_t*>(g.contents());
+    const auto* us = static_cast<const std::uint8_t*>(u.contents());
+    auto* dd = static_cast<std::uint8_t*>(d.contents());
+    for (std::size_t i = 0; i < FF; ++i) {
+      std::memcpy(dd + (2 * i) * rb, gs + i * rb, rb);
+      std::memcpy(dd + (2 * i + 1) * rb, us + i * rb, rb);
+    }
+  };
+  one(gate.codes, up.codes, dst.codes);
+  one(gate.scales, up.scales, dst.scales);
+  one(gate.qbias, up.qbias, dst.qbias);
+  return ok;
+}
+
+// Allocate `dst` with `src`'s shapes and flags, optionally copying the
+// bytes. One function for two uses: a promotion and the second slot
+// differ only in whether the contents come along.
+bool
+MetalKrea2Transformer::clone_block_(const Block& src, Block& dst,
+                                    bool copy) const
+{
+  bool ok = true;
+  const auto one = [&](const SharedBuffer& s, SharedBuffer& d) {
+    if (!ok || s.empty()) { d = SharedBuffer{}; return; }
+    d = _mc->make_shared_buffer(s.byte_size());
+    if (d.empty()) { ok = false; return; }
+    if (copy) { std::memcpy(d.contents(), s.contents(), s.byte_size()); }
+  };
+  const auto qw = [&](const QWeight& s, QWeight& d) {
+    d.quantized = s.quantized;
+    d.bits      = s.bits;
+    one(s.w, d.w); one(s.codes, d.codes);
+    one(s.scales, d.scales); one(s.qbias, d.qbias);
+  };
+  one(src.n1, dst.n1); one(src.n2, dst.n2);
+  qw(src.q, dst.q); qw(src.k, dst.k); qw(src.v, dst.v);
+  qw(src.gate, dst.gate);
+  one(src.qn, dst.qn); one(src.kn, dst.kn);
+  qw(src.o, dst.o);
+  qw(src.ff_gate, dst.ff_gate); qw(src.ff_up, dst.ff_up);
+  qw(src.ff_down, dst.ff_down); qw(src.ff_gu, dst.ff_gu);
+  one(src.sst, dst.sst);
+  if (!ok) { dst = Block{}; }
+  return ok;
+}
+
+SharedBuffer
+MetalKrea2Transformer::rebuild_one_(const std::string& nm, P how)
+{
+  if (!_ws) { return {}; }
+  if (how == P::kRaw) {
+    const auto res = _mmap_weights ? WeightSet::Residency::Mapped
+                                   : WeightSet::Residency::Copied;
+    return _ws->stream_tensor(nm, _mc, res);
+  }
+  // A DERIVED tensor is a norm: the (1 + w) fold. Everything else that
+  // could not be placed raw is the plain narrowing. The two produce
+  // DIFFERENT bytes, which is why elt_ keys them apart, and why the
+  // placement has to travel with the name rather than be guessed here.
+  return elt_(*_ws, nm, Retain::Streamed, how == P::kDerived);
+}
+
+void
+MetalKrea2Transformer::configure_slots_()
+{
+  BlockSlots<Block>::Ops o;
+  o.each = [this](int L, Block& b, const BlockSlots<Block>::TensorFn& fn) {
+    each_block_tensor_(L, b, fn);
+  };
+  o.rebuild_one = [this](const std::string& nm, P how) {
+    return rebuild_one_(nm, how);
+  };
+  o.build = [this](int L, Block& b) {
+    // KEEP THE SPLIT gate|up in a slot. The ordinary load releases them
+    // once the fused weight exists, which is right for a resident block
+    // and impossible for a refillable one: the fuse has to be rebuilt
+    // from them after every read.
+    return _ws && load_block_(*_ws,
+                              "transformer_blocks." + std::to_string(L) + ".",
+                              b, /*main_block=*/true, Retain::Streamed,
+                              /*keep_split=*/true);
+  };
+  o.clone = [this](const Block& s, Block& d, bool copy) {
+    return clone_block_(s, d, copy);
+  };
+  o.bytes = [](const Block& b) { return block_bytes_(b); };
+  o.empty = [](const Block& b) { return b.q.empty(); };
+  o.post_refill = [this](int, Block& b) {
+    return weave_into_(b.ff_gate, b.ff_up, b.ff_gu);
+  };
+  _slots.set_weight_set(_ws.get());
+  _slots.configure(_mc, std::move(o), "MetalKrea2Transformer",
+                   "VPIPE_KREA2_NO_SLOTS");
+}
+
+MetalKrea2Transformer::~MetalKrea2Transformer()
+{
+  // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
+  // so the machine recovers either way -- but the pool's own counter
+  // would not, and a DiT freed for the vae-decode and reloaded on the
+  // next prompt (free_krea2_dit_for_decode_) would leak its whole share
+  // of the budget per prompt until nothing could wire at all.
+  if (_wire.on()) {
+    wire_fixed_(false);
+    for (Block& b : _blocks) { wire_block_(b, false); }
+  }
+}
 
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
@@ -288,12 +468,25 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_mc = mc;
   m->_cfg = cfg;
   m->_stream_blocks = stream_blocks;
+  // BEFORE the first weight is read, because it decides how they are read.
+  m->_wire.open(mc);
+  // The reusable read destinations. Configured whether or not this run
+  // streams: they cost nothing until the first streamed block asks for
+  // one, and a model that preloads never gets there.
+  m->configure_slots_();
   // Zero-copy (mmap) quantized weights -- see _mmap_weights. On by default;
   // VPIPE_KREA2_NO_MMAP_WEIGHTS reverts to copying loads (e.g. for a model on a
   // slow/network mount, where GPU page-faults into the file could stall).
-  // Retains the source mmap for the model's lifetime (below); streaming mode
-  // already does.
-  m->_mmap_weights = std::getenv("VPIPE_KREA2_NO_MMAP_WEIGHTS") == nullptr;
+  // Retains the source mmap for the model's lifetime (below).
+  //
+  // OFF WHEN STREAMING, which it was not before. A streamed block that is a
+  // mapped view is not this model's memory at all: keeping it "resident"
+  // keeps the page CACHE warm, which is the self-generated signal
+  // block-residency.h exists to avoid trusting -- and page_residency() then
+  // measures the cache rather than anything the model owns. It also cannot
+  // be wired. Off with the pool on for the same reason (shared/wired-pool.h).
+  m->_mmap_weights = weights_may_be_mapped(stream_blocks, m->_wire.on()) &&
+                     std::getenv("VPIPE_KREA2_NO_MMAP_WEIGHTS") == nullptr;
 
   // Detect an affine-quantized checkpoint via config.json's `quantization`
   // block ({bits, group_size}); the quantizable Linears then load as
@@ -721,6 +914,18 @@ MetalKrea2Transformer::ensure_dit_scratch_(int text_seq, int grid_h, int grid_w,
       _dit.sig == sig) {
     return;
   }
+  // UNWIRE THE OLD SCRATCH FIRST, before the assignments below drop it.
+  // Destroying a wired buffer unwires it in the kernel but does NOT
+  // decrement the pool's counter -- only unwire_from_pool does -- so a
+  // geometry change would leave the pool believing those bytes were still
+  // held. Every change would leak a scratch's worth, and a pool that has
+  // lost budget to bytes nothing holds wires less of what comes next: the
+  // resident set shrinks for a reason nothing in the log names.
+  if (_wire.on()) {
+    for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+      _wire.wire_one(_mc, *b, false);
+    }
+  }
   const Config& c = _cfg;
   const int HID = c.hidden, FF = c.ffn, TD = c.timestep_dim;
   const int qd = c.n_heads * c.head_dim, kd = c.n_kv_heads * c.head_dim;
@@ -775,6 +980,13 @@ MetalKrea2Transformer::release_forward_scratch()
 {
   // Reset the shape key to -1 so ensure_dit_scratch_ rebuilds every buffer on
   // the next forward; dropping the struct frees the held activation scratch.
+  // Unwired first, for the reason in ensure_dit_scratch_: the kernel
+  // recovers on free, the pool's counter does not.
+  if (_wire.on()) {
+    for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+      _wire.wire_one(_mc, *b, false);
+    }
+  }
   _dit = DitScratch{};
   _w_deq = {};                         // dequant scratch (regrows in gemm_mma_)
   _splitk = {};                        // split-K partial planes
@@ -849,6 +1061,81 @@ MetalKrea2Transformer::qw_bytes_(const QWeight& w)
          w.qbias.byte_size();
 }
 
+// ---- the wired pool ---------------------------------------------------
+//
+// One buffer at a time, STOPPING at the first refusal rather than
+// unwinding: a partly wired block is partly protected, which is strictly
+// better than none -- and giving protection back on the way out means
+// competing for it again on the next block, against a pool that has just
+// said no.
+//
+// The list mirrors block_bytes_ exactly. It has to: wirable() gates
+// admission on the byte count that returns, so a buffer counted there and
+// not wired here is a block the model believes is protected and is not.
+std::size_t
+MetalKrea2Transformer::wire_block_(Block& b, bool on)
+{
+  std::size_t changed = 0;
+  bool stop = false;
+  auto one = [&](metal_compute::SharedBuffer& p) {
+    if (stop) { return; }
+    const std::size_t n = _wire.wire_one(_mc, p, on);
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+      stop = true;
+      return;
+    }
+    changed += n;
+  };
+  auto qw = [&](QWeight& w) {
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+  };
+  QWeight* q[] = {&b.q, &b.k, &b.v, &b.gate, &b.o,
+                  &b.ff_gate, &b.ff_up, &b.ff_down, &b.ff_gu};
+  for (QWeight* w : q) { qw(*w); }
+  one(b.n1); one(b.n2); one(b.qn); one(b.kn);
+  return changed;
+}
+
+// Everything this model holds that is NOT a streamed block, in the order
+// that matters: the persistent activation scratch first, then the TRUNK
+// (everything the weight set cached for this model). Both are read on
+// every block of every forward and neither is ever shed, so they have a
+// better claim on the pool than any single resident block -- which is why
+// the forward wires this BEFORE it starts admitting blocks. Protecting
+// the optional half first is how a run ends up with wired blocks beside
+// an activation buffer the compressor is free to take.
+//
+// Unlike the other image DiTs, this one's activations live in a
+// persistent DitScratch, so they can be wired at all. Every buffer of it
+// is replaced wholesale by ensure_dit_scratch_ and dropped by
+// release_forward_scratch, and BOTH unwire first -- a buffer replaced
+// while wired leaks its bytes from the pool's counter, since only
+// unwire_from_pool() decrements it.
+std::vector<metal_compute::SharedBuffer*>
+MetalKrea2Transformer::scratch_buffers_()
+{
+  return {&_dit.te_in, &_dit.rcos, &_dit.rsin, &_dit.joint, &_dit.te1,
+          &_dit.temb, &_dit.tmp, &_dit.tmod, &_dit.mod, &_dit.n1, &_dit.n2,
+          &_dit.nm, &_dit.gate, &_dit.att, &_dit.o, &_dit.q, &_dit.k,
+          &_dit.v, &_dit.qt, &_dit.kt, &_dit.vt, &_dit.atb, &_dit.g,
+          &_dit.u, &_dit.gu, &_dit.modf};
+}
+
+std::size_t
+MetalKrea2Transformer::wire_fixed_(bool on)
+{
+  std::size_t changed = 0;
+  for (metal_compute::SharedBuffer* b : scratch_buffers_()) {
+    changed += _wire.wire_one(_mc, *b, on);
+  }
+  if (_ws) {
+    _ws->for_each_weight([&](metal_compute::SharedBuffer& b) {
+      changed += _wire.wire_one(_mc, b, on);
+    });
+  }
+  return changed;
+}
+
 std::size_t
 MetalKrea2Transformer::block_bytes_(const Block& b)
 {
@@ -857,6 +1144,22 @@ MetalKrea2Transformer::block_bytes_(const Block& b)
          qw_bytes_(b.v) + qw_bytes_(b.gate) + qw_bytes_(b.o) +
          qw_bytes_(b.ff_gate) + qw_bytes_(b.ff_up) + qw_bytes_(b.ff_down) +
          qw_bytes_(b.ff_gu);
+}
+
+std::size_t
+MetalKrea2Transformer::resident_bytes_(const Block& b)
+{
+  std::size_t n = block_bytes_(b);
+  if (!b.ff_gu.empty()) { n -= qw_bytes_(b.ff_gate) + qw_bytes_(b.ff_up); }
+  return n;
+}
+
+std::size_t
+MetalKrea2Transformer::read_bytes_(const Block& b)
+{
+  std::size_t n = block_bytes_(b);
+  if (!b.ff_gate.empty()) { n -= qw_bytes_(b.ff_gu); }
+  return n;
 }
 
 // How much of the RESIDENT set is still in RAM. Sampled inside each
@@ -877,6 +1180,14 @@ MetalKrea2Transformer::resident_pages_(std::size_t* examined,
         &b.ff_gu.w, &b.ff_gu.codes};
     for (const metal_compute::SharedBuffer* p : all) {
       if (p->byte_size() == 0) { continue; }
+      // A WIRED BUFFER CANNOT HAVE LEFT RAM, so asking is spending the
+      // walk to be told what mlock already guarantees. Skipped PER BUFFER
+      // rather than per block, because wire_block_ stops at the first
+      // refusal and leaves the rest of that block unwired -- the
+      // remainder is exactly what still needs measuring. With everything
+      // wired `examined` stays 0, which the caller reads as "no evidence"
+      // rather than as a shortfall, and that is the correct answer.
+      if (p->is_wired()) { continue; }
       const auto r = p->page_residency(64);
       if (!r.valid) { continue; }
       *examined += r.examined;
@@ -889,13 +1200,17 @@ MetalKrea2Transformer::resident_pages_(std::size_t* examined,
 // cyclic scan every block is worth the same. The pinned prefix is never
 // touched.
 std::size_t
-MetalKrea2Transformer::evict_tail_block_(bool allow_pinned)
+MetalKrea2Transformer::evict_tail_block_()
 {
-  const int floor = allow_pinned ? 0 : _pinned;
-  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+  for (int i = (int)_blocks.size() - 1; i >= 0; --i) {
     Block& b = _blocks[(std::size_t)i];
     const std::size_t n = block_bytes_(b);
     if (n == 0) { continue; }
+    // Before the buffers go: give the wiring back. Dropping a wired
+    // buffer unwires it in the kernel anyway, but only unwire_from_pool()
+    // decrements the pool's counter -- so doing it here is what keeps the
+    // budget honest instead of leaking a block's worth per eviction.
+    _wire.note_unwired(wire_block_(b, false));
     b = Block{};
     // Taking one out of the PINNED prefix un-pins it: that prefix was
     // sized at load against what the box was believed to hold, and a
@@ -905,6 +1220,56 @@ MetalKrea2Transformer::evict_tail_block_(bool allow_pinned)
     return n;
   }
   return 0;
+}
+
+// How much the box must have freed since a wiring refusal before it is
+// worth asking again -- one block's worth, so a genuinely full box is
+// never asked. Reopening the pool's ceiling makes its own check pass, and
+// the mlock behind it would then fail and leave that block resident but
+// UNWIRED, one per forward, which is exactly the state the wirable gate
+// exists to avoid.
+//
+// The checkpoint figure when the schedule has been set, the resident
+// average otherwise. Never zero if anything is known: a zero slack
+// re-opens on any increase at all.
+std::size_t
+MetalKrea2Transformer::wire_retry_slack_() const
+{
+  if (_wire_block_hint > 0) { return _wire_block_hint; }
+  if (_resid.count() > 0) {
+    return _resid.bytes() / (std::size_t)_resid.count();
+  }
+  return 0;
+}
+
+void
+MetalKrea2Transformer::set_residency_schedule(int steps)
+{
+  if (!_ws) { return; }
+  const MetalLlamaWeights& src = _ws->src();
+  const std::size_t blk = widest_block_bytes(
+      src.tensor_names(),
+      [&](const std::string& n) {
+        const auto* ti = src.info(n);
+        return ti != nullptr ? (std::size_t)ti->nbytes : (std::size_t)0;
+      },
+      {"transformer_blocks."});
+  const int nl = _cfg.n_layers;
+  _wire_block_hint = blk;
+  _resid.set_schedule(steps, nl, blk, _wire.on(),
+                      _mc != nullptr ? _mc->memory_budget()
+                                     : metal_compute::MetalCompute::
+                                           MemoryBudget{});
+  if (_mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalKrea2Transformer: residency probe {} blocks of {} "
+        "({} MB each, {} MB reclaimable, wire budget {} MB){}",
+        _resid.per_forward_cap(), nl, blk >> 20,
+        _mc->memory_budget().available_physical >> 20,
+        _wire.budget() >> 20,
+        _wire.on() ? " -- uncapped, the wire budget is the gate"
+                   : ", doubling per healthy forward"));
+  }
 }
 
 std::size_t
@@ -1648,6 +2013,20 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // Re-arm residency growth for this forward; the ratchet from any
     // earlier eviction deliberately survives. Also the one place the OS
     // gets to answer back that it has started swapping.
+    if (_wire.on()) {
+      // Retry a pool that refused earlier -- the refusal may have been
+      // another process spiking, and a run that never asks again holds a
+      // small resident set for the whole schedule on the strength of one
+      // syscall. Growth stopped when the budget ran out and cannot see
+      // that the budget moved, so a successful retry has to say so.
+      if (_wire.retry(_mc, wire_retry_slack_())) {
+        _resid.note_landscape_changed();
+      }
+      // Scratch and trunk take their place in the pool BEFORE this
+      // forward's block admissions start asking for room: the blocks are
+      // the shed-able half, so a pool that runs out should run out there.
+      wire_fixed_(true);
+    }
     const auto mbudget = _mc->memory_budget();
     _resid.begin_forward(mbudget, [this]() -> std::size_t {
       return evict_tail_block_();
@@ -1656,7 +2035,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // compressed footprint has moved is the page walk worth its ~57 ms
     // per 4.3 GB.
     bool shortfall = false;
-    if ((_resid.count() > 0 || _pinned > 0) &&
+    if (_resid.count() > 0 &&
         _resid.self_compression_grew(mbudget.self_compressed)) {
       std::size_t examined = 0, incore = 0;
       resident_pages_(&examined, &incore);
@@ -1666,18 +2045,13 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
             examined, incore, [this]() -> std::size_t {
               return evict_tail_block_();
             });
-        // Nothing left outside the pinned prefix and the pages are still
-        // leaving RAM: the prefix itself is what does not fit, so give one
-        // of it back rather than sit in the thrash it was meant to prevent.
-        if (freed == 0 && _pinned > 0) {
-          freed = evict_tail_block_(/*allow_pinned=*/true);
-        }
         if (_mc->session() != nullptr) {
           _mc->session()->log_normal(fmt(
               "MetalKrea2Transformer: resident weights are only {}% in "
-              "RAM -- released {} MB, now {} blocks resident",
-              (int)(100.0 * (double)incore / (double)examined), freed >> 20,
-              _resid.count() + _pinned));
+              "RAM ({} MB wired) -- released {} MB, now {} blocks resident",
+              (int)(100.0 * (double)incore / (double)examined),
+              _wire.wired_bytes() >> 20, freed >> 20,
+              _resid.count()));
         }
       }
     }
@@ -1686,6 +2060,16 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // Enough in a row lifts the ratchet by a block, so a shed taken
     // during a momentary squeeze is not the last word on the run.
     if (!shortfall) { _resid.note_healthy_forward(); }
+    // JOIN ANY OUTSTANDING READ ON EVERY EXIT FROM THE STACK. A prefetch
+    // may be filling a slot, and this forward returns from a dozen
+    // places. Freeing or reading a slot while a reader thread writes
+    // into it is a use-after-free, and a scope guard is the only version
+    // of this that cannot be forgotten at the thirteenth return.
+    struct SlotJoin {
+      BlockSlots<Block>* s;
+      ~SlotJoin() { s->join(); }
+    } slot_join{&_slots};
+    _slots.begin_forward();
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
     for (int L = 0; L < c.n_layers; ++L) {
       // Cooperative stop: bail EVERY block (not just the streamed tail) so a
@@ -1693,28 +2077,28 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // (a slow high-res step otherwise runs all blocks before responding).
       if (_stream_stop && _stream_stop()) { return {}; }
       if (_block_progress) { _block_progress(L, c.n_layers); }
-      // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams.
-      // Resident if pinned at load OR promoted by an earlier pass.
+      // Resident in _blocks once residency has promoted it, and
+      // streamed until then. An unfilled slot reads as empty.
       const bool held = L < (int)_blocks.size() &&
                         !_blocks[(std::size_t)L].q.empty();
       const bool streaming = _stream_blocks && !held;
-      Block streamed;
+      const Block* streamed = nullptr;
       if (streaming) {
         const auto rd0 = sp_now();
-        if (!load_block_(*_ws,
-                         "transformer_blocks." + std::to_string(L) + ".",
-                         streamed, true, Retain::Streamed)) {
-          return {};
-        }
+        // Two reusable destinations, refilled in place with pread and
+        // with the next block's read already issued under the previous
+        // block's GPU work. See shared/block-slots.h.
+        streamed = _slots.acquire(L);
+        if (streamed == nullptr) { return {}; }
         sp_add(sp_read_ms, rd0);
-        if (sprof) { sp_read_bytes += block_bytes_(streamed); ++sp_blocks; }
+        if (sprof) { sp_read_bytes += read_bytes_(*streamed); ++sp_blocks; }
         if (_mc->session() != nullptr) {
           _mc->session()->log_debug(fmt(
               "DiT forward: streamed block {}/{} (seq {})", L + 1, c.n_layers,
               seq));
         }
       }
-      const Block& b = streaming ? streamed : _blocks[(std::size_t)L];
+      const Block& b = streaming ? *streamed : _blocks[(std::size_t)L];
       elt3(_fn_residual, tmod, b.sst, mod, 6 * HID);          // mod = temb_mod+sst
       rms(joint, 0, b.n1, n1, 0, seq, HID);
       adaln(n1, mod, 0, HID, nm, HID, seq * HID);             // (1+pre_s)*n1+pre_sh
@@ -1805,7 +2189,23 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       psplit(t_ff);
       if (streaming) {
         const auto gp0 = sp_now();
-        flush();   // commit block L before its weights free
+        // COMMIT, then issue the next block's read, then WAIT. Between
+        // the two the GPU is busy with block L and this thread has
+        // nothing to do, which is the whole opportunity.
+        enc.end();
+        {
+          metal_compute::CommandStream::Fence bf = stream.commit();
+          int nxt = -1;
+          for (int n = L + 1; n < c.n_layers; ++n) {
+            const bool h = n < (int)_blocks.size() &&
+                           !_blocks[(std::size_t)n].q.empty();
+            if (!h) { nxt = n; break; }
+          }
+          _slots.prefetch(nxt);
+          bf.wait();
+        }
+        stream = _mc->make_command_stream();
+        enc = stream.begin_compute();
         sp_add(sp_gpu_ms, gp0);
         // The flush has been WAITED for, so nothing encoded still points
         // at this block's buffers -- which is why promotion happens here
@@ -1813,15 +2213,36 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         // memory (the bytes are already resident); the alternative is
         // re-reading the same block on every remaining step.
         if (L < (int)_blocks.size()) {
-          const std::size_t nb = block_bytes_(streamed);
-          if (_resid.admit(_mc, nb)) {
-            _blocks[(std::size_t)L] = std::move(streamed);
+          // What promotion will KEEP, not what the slot holds: the
+          // split gate/up are dropped just below and are neither wired
+          // nor admitted. See resident_bytes_.
+          const std::size_t nb = resident_bytes_(*streamed);
+          // Past the wire budget there is nothing to gain: the block would
+          // be kept unprotected, the compressor would take it (it is the
+          // coldest memory in the process), and the next residency walk
+          // would shed a block and ratchet the ceiling over the whole
+          // resident set. Better not to hold it at all.
+          if (_wire.wirable(nb) && _resid.admit(_mc, nb) &&
+              _slots.promote_into(_blocks[(std::size_t)L])) {
+            // A RESIDENT block does not need the split gate|up -- the
+            // fused weight is what the forward reads, and the slot keeps
+            // its own copies for the next refill. Dropping them here is
+            // what stops promotion costing 25% more than it used to.
+            if (!_blocks[(std::size_t)L].ff_gu.empty()) {
+              _blocks[(std::size_t)L].ff_gate = QWeight{};
+              _blocks[(std::size_t)L].ff_up = QWeight{};
+            }
+            // Wired LAST, after every write this block will ever get:
+            // mlock pins the pages that exist NOW.
+            _wire.note_wired(_mc,
+                             wire_block_(_blocks[(std::size_t)L], true), nb);
             _resid.note_admitted(nb);
             if (_mc->session() != nullptr) {
               _mc->session()->log_debug(fmt(
                   "MetalKrea2Transformer: block {} resident ({} of {}, "
-                  "{} MB)", L, _resid.count() + _pinned, c.n_layers,
-                  _resid.bytes() >> 20));
+                  "{} MB, {} MB wired)", L, _resid.count(),
+                  c.n_layers, _resid.bytes() >> 20,
+                  _wire.wired_bytes() >> 20));
             }
           }
         }

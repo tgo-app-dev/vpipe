@@ -67,6 +67,12 @@ WeightRegistry::park(WeightOwner* owner)
   });
   e->parked = true;
   e->bytes  = bytes;
+  // Both halves of the fact, under one lock. Told even when `bytes` is
+  // 0 -- nothing was parkable, but `e->parked` is set either way, and an
+  // owner whose flag disagreed with this entry is the failure this hook
+  // exists to prevent. The cost of the honest answer is one reactivate
+  // walk on next use that finds everything already non-volatile.
+  owner->note_parked(true);
   if (_session != nullptr && bytes > 0) {
     _session->log_debug(fmt(
         "WeightRegistry: parked {} MB of '{}' (reclaimable under "
@@ -106,6 +112,7 @@ WeightRegistry::reactivate(WeightOwner* owner, bool* reloaded)
         });
     e->parked = false;
     e->bytes  = 0;
+    owner->note_parked(false);
   }
   if (intact) {
     owner->end_restore(true);

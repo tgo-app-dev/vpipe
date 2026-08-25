@@ -82,9 +82,52 @@
 #include "interfaces/session-context-intf.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace vpipe::genai {
+
+// The bytes of ONE block, read from the checkpoint's tensor table rather
+// than from a loaded block -- which is the only source available at the
+// moment the schedule is sized, since a streaming model has loaded none.
+//
+// The WIDEST block under the stem, not block 0: the stacks are near
+// uniform but the one place they are not (a first or last block carrying
+// extra) would make an average optimistic, and BlockResidency's own
+// largest-seen `_block_hint` corrects toward the widest anyway once real
+// admissions start.
+//
+// Takes the tensor table through a callback so this header does not have
+// to know about MetalLlamaWeights.
+inline std::size_t
+widest_block_bytes(
+    const std::vector<std::string>& names,
+    const std::function<std::size_t(const std::string&)>& nbytes,
+    const std::vector<std::string>& stems)
+{
+  std::map<std::pair<std::size_t, long>, std::size_t> per_block;
+  for (const std::string& nm : names) {
+    for (std::size_t si = 0; si < stems.size(); ++si) {
+      const std::string& stem = stems[si];
+      if (nm.rfind(stem, 0) != 0) { continue; }
+      const std::size_t dot = nm.find('.', stem.size());
+      if (dot == std::string::npos) { break; }
+      const long idx = std::atol(nm.substr(stem.size(),
+                                           dot - stem.size()).c_str());
+      per_block[{si, idx}] += nbytes(nm);
+      break;
+    }
+  }
+  std::size_t widest = 0;
+  for (const auto& kv : per_block) {
+    if (kv.second > widest) { widest = kv.second; }
+  }
+  return widest;
+}
 
 class BlockResidency {
  public:
@@ -368,6 +411,57 @@ class BlockResidency {
   // that a shed is not undone by the next step, short enough that a
   // 30-step schedule can still recover a useful set.
   void set_quiet_forwards(int n) { _quiet_forwards = n > 0 ? n : 1; }
+
+  // SIZE BOTH SCHEDULE-DEPENDENT RATES FROM THE RUN THAT IS ABOUT TO
+  // HAPPEN. The defaults above are tuned for a ~30-step schedule and are
+  // wrong for a 5-step turbo one, in the same direction: a probe of 8
+  // doubling every healthy forward reaches full residency only near the
+  // end of a short run, where nothing is left to use it, and a ratchet
+  // that lifts one block per three quiet forwards cannot recover inside
+  // one at all.
+  //
+  // `block_bytes` is a representative block, `n_layers` the whole stack.
+  //
+  // WIRED: NO RATE LIMIT -- take everything the box will give on the
+  // first pass. The cap exists because admit()'s gate is arithmetic over
+  // `available_physical`, which counts file cache -- on a streaming model
+  // mostly the checkpoint that model just read, so the signal says "room"
+  // the more it streams. The true signal is the mincore walk, which
+  // arrives once per forward, so the cap bounded what could be committed
+  // before the first evidence. Wiring replaces that evidence with a
+  // SYNCHRONOUS one: mlock either takes the block or refuses it, per
+  // block, before it is kept, and a refusal collapses the wire budget so
+  // admissions stop on the spot. There is no window between committing
+  // and finding out, which is the only thing the cap was buying. (And
+  // since the walk skips wired buffers, waiting for it would be waiting
+  // for a measurement that reports nothing.)
+  //
+  // What the cap COSTS is a whole extra pass of reads: a block not
+  // admitted on forward 1 was still read, used and dropped, so capping
+  // at half the stack means half of it re-read on forward 2 for nothing.
+  //
+  // A ONE-step schedule is the exception either way: it has no second
+  // forward, so nothing kept is ever reused and every admission is a
+  // block-sized copy plus an mlock paid for nothing.
+  void set_schedule(int steps, int n_layers, std::size_t block_bytes,
+                    bool wired,
+                    const metal_compute::MetalCompute::MemoryBudget& mb)
+  {
+    if (n_layers < 1) { n_layers = 1; }
+    int probe = 1;
+    if (steps > 1 && wired) {
+      probe = n_layers;
+    } else if (steps > 1 && block_bytes > 0) {
+      std::size_t room = (std::size_t)((double)mb.available_physical * 0.9);
+      const std::size_t keep = reserve_now();
+      room = room > keep ? room - keep : 0;
+      const std::size_t fits = room / block_bytes * 3 / 4;
+      probe = fits > (std::size_t)n_layers ? n_layers : (int)fits;
+      if (probe < 1) { probe = 1; }
+    }
+    set_per_forward_cap(probe);
+    set_quiet_forwards(steps / 4 > 0 ? (steps / 4 > 3 ? 3 : steps / 4) : 1);
+  }
 
   // The ground moved in a way no measurement of ours could have
   // predicted, so everything the ratchet concluded is stale: drop it.

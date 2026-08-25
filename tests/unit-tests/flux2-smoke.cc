@@ -25,6 +25,7 @@
 #include "generative-models/context-manager.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/model-quantizer.h"
@@ -190,6 +191,69 @@ add_conditioner_(Pipeline* pl, Session& sess, Stage* src, const char* root)
   auto u = std::make_unique<DiffusionConditionerStage>(
       &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c));
   return pl->insert_stage(std::move(u));
+}
+
+// The FLUX.2 text encoder's Config, exactly as diffusion-conditioner
+// builds it (encoder_config_flux2_): sized from config.json so the 8B
+// validates as well as the 4B, backbone-only because this encoder taps
+// hidden states and never decodes.
+//
+// Hoisted so the streaming-equality test runs against the SAME encoder
+// the pipeline loads. Two copies of a forty-field config drift, and a
+// drifted copy would compare streaming against a model no stage builds.
+MetalQwenModel::Config
+flux2_encoder_config_(const std::string& edir, bool* quantized)
+{
+  namespace fs = std::filesystem;
+  MetalQwenModel::Config c;
+  c.n_layers = 36; c.hidden = 2560; c.n_heads = 32; c.n_kv_heads = 8;
+  c.head_dim = 128; c.ffn_inner = 9728; c.vocab = 151936; c.rope_theta = 1.0e6f;
+  c.rms_eps = 1e-6f; c.rotary_dim = 128; c.full_attn_interval = 1;
+  c.tie_embeddings = true; c.use_bf16 = true; c.dense = true;
+  c.zero_centered_norm = false; c.attn_output_gate = false;
+  c.backbone_only = true; c.weight_prefix = "model."; c.max_seq = 1024;
+  c.page_tokens = 256;
+  bool declared_quant = false;   // config.json carries a quantization block
+  { std::ifstream in(fs::path(edir) / "config.json");
+    if (in) {
+      FlexData fd = FlexData::from_json(in);
+      if (fd.is_object()) {
+        auto obj = fd.as_object();               // bind view to a local
+        auto geti = [&](const char* k, int cur) -> int {
+          return obj.contains(k) ? (int)obj.at(k).as_int(cur) : cur;
+        };
+        auto getf = [&](const char* k, float cur) -> float {
+          return obj.contains(k) ? (float)obj.at(k).as_real(cur) : cur;
+        };
+        // Size from config.json so the 8B (9B pipeline) encoder validates too.
+        c.n_layers   = geti("num_hidden_layers", c.n_layers);
+        c.hidden     = geti("hidden_size", c.hidden);
+        c.n_heads    = geti("num_attention_heads", c.n_heads);
+        c.n_kv_heads = geti("num_key_value_heads", c.n_kv_heads);
+        c.head_dim   = geti("head_dim",
+                            c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
+        c.rotary_dim = c.head_dim;
+        c.ffn_inner  = geti("intermediate_size", c.ffn_inner);
+        c.vocab      = geti("vocab_size", c.vocab);
+        c.rope_theta = getf("rope_theta", c.rope_theta);
+        c.rms_eps    = getf("rms_norm_eps", c.rms_eps);
+        if (obj.contains("tie_word_embeddings")) {
+          c.tie_embeddings = obj.at("tie_word_embeddings").as_bool(true);
+        }
+        if (obj.contains("quantization")) {
+          FlexData q = obj.at("quantization");
+          if (q.is_object()) {
+            auto qo = q.as_object();             // bind view to a local
+            if (qo.contains("bits")) {
+              const int b = (int)qo.at("bits").as_int(0);
+              if (b == 4 || b == 8) { c.quant_bits = b; declared_quant = true; }
+            }
+          }
+        }
+      }
+    } }
+  if (quantized != nullptr) { *quantized = declared_quant; }
+  return c;
 }
 
 }  // namespace
@@ -1089,6 +1153,118 @@ TEST(flux2_smoke, dit_forward_shape_finite)
               img_seq, c.out_channels);
 }
 
+// BLOCK STREAMING MUST NOT CHANGE A SINGLE BIT.
+//
+// The streamed path reads every block off disk per forward into two
+// reusable slots (shared/block-slots.h) instead of allocating one per
+// block, and both of this model's stacks rebuild something after the
+// read: the double blocks riffle ff.linear_in / ff_context.linear_in
+// into the fused-SwiGLU order, and the single blocks slice
+// to_qkv_mlp_proj into qkv + an interleaved gate|up. Any of that done
+// even slightly differently from the load-time route is SILENT -- right
+// shapes, plausible numbers, a slightly different picture -- so the bar
+// is byte equality with the preloaded forward, not closeness.
+//
+// It reads the whole checkpoint twice, which is the price of the only
+// check that can catch a wrong permutation.
+TEST(flux2_smoke, streamed_matches_preloaded)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  const int TS = 16, gh = 4, gw = 4, img_seq = gh * gw;
+
+  std::vector<float> pre, str, grown;
+  double fwd_s = 0.0;
+  int nd_blocks = 0, ns_blocks = 0, kept = 0;
+  // `grow` runs the streamed model with residency ON and takes the
+  // SECOND forward, where some blocks come out of the resident set and
+  // the rest are still refilled. That is the arm that exercises
+  // promotion -- a block copied out of a slot -- and a mixed pass; with
+  // growth off nothing is ever promoted and clone(copy=true) is dead
+  // code.
+  auto run = [&](bool stream, bool grow, std::vector<float>& out) -> bool {
+    auto dit = MetalFlux2Transformer::load(
+        tdir, mc, MetalFlux2Transformer::Config{}, stream);
+    if (dit == nullptr) { return false; }
+    // Growth OFF by default: a promoted block would be served out of
+    // _double / _single on the later forwards, which is a different
+    // question and would hide the refill this test exists to check.
+    dit->set_residency_reserve(grow ? (2ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    nd_blocks = c.n_double;
+    ns_blocks = c.n_single;
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    std::mt19937 rng(20260823);
+    std::normal_distribution<float> ndist(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)ndist(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)ndist(rng);
+    }
+    SharedBuffer v;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    kept = dit->resident_block_count();
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return false; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return true;
+  };
+
+  ASSERT_TRUE(run(false, false, pre));
+  const double pre_s = fwd_s;
+  ASSERT_TRUE(run(true, false, str));
+  std::printf("[flux2_smoke] %d+%d blocks -- forward: preloaded %.1f s, "
+              "streamed %.1f s (slots %s)\n", nd_blocks, ns_blocks, pre_s,
+              fwd_s,
+              std::getenv("VPIPE_FLUX2_NO_SLOTS") != nullptr ? "OFF" : "on");
+
+  ASSERT_TRUE(pre.size() == str.size() && !pre.empty());
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[flux2_smoke] streamed vs preloaded: %zu of %zu differ "
+              "(worst %.3e)\n", diff, pre.size(), worst);
+  EXPECT_TRUE(diff == 0);
+
+  ASSERT_TRUE(run(true, true, grown));
+  ASSERT_TRUE(grown.size() == pre.size());
+  std::size_t gdiff = 0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != grown[i]) { ++gdiff; }
+  }
+  std::printf("[flux2_smoke] resident-grown (%d of %d blocks kept) vs "
+              "preloaded: %zu of %zu differ\n", kept,
+              nd_blocks + ns_blocks, gdiff, pre.size());
+  EXPECT_TRUE(gdiff == 0);
+}
+
 // Reference-image conditioning: forward_dit with reference latents (a) still
 // emits ONLY the generated-token velocity [img_seq, out_channels] (refs dropped
 // from the output), (b) stays finite with one and two references, and (c)
@@ -1945,53 +2121,8 @@ TEST(flux2_golden, text_encoder_loads_runs)
   const std::string edir = (eov != nullptr && *eov != '\0')
       ? std::string(eov) : std::string(root) + "/text_encoder";
 
-  MetalQwenModel::Config c;
-  c.n_layers = 36; c.hidden = 2560; c.n_heads = 32; c.n_kv_heads = 8;
-  c.head_dim = 128; c.ffn_inner = 9728; c.vocab = 151936; c.rope_theta = 1.0e6f;
-  c.rms_eps = 1e-6f; c.rotary_dim = 128; c.full_attn_interval = 1;
-  c.tie_embeddings = true; c.use_bf16 = true; c.dense = true;
-  c.zero_centered_norm = false; c.attn_output_gate = false;
-  c.backbone_only = true; c.weight_prefix = "model."; c.max_seq = 1024;
-  c.page_tokens = 256;
-  bool declared_quant = false;   // config.json carries a quantization block
-  { std::ifstream in(fs::path(edir) / "config.json");
-    if (in) {
-      FlexData fd = FlexData::from_json(in);
-      if (fd.is_object()) {
-        auto obj = fd.as_object();               // bind view to a local
-        auto geti = [&](const char* k, int cur) -> int {
-          return obj.contains(k) ? (int)obj.at(k).as_int(cur) : cur;
-        };
-        auto getf = [&](const char* k, float cur) -> float {
-          return obj.contains(k) ? (float)obj.at(k).as_real(cur) : cur;
-        };
-        // Size from config.json so the 8B (9B pipeline) encoder validates too.
-        c.n_layers   = geti("num_hidden_layers", c.n_layers);
-        c.hidden     = geti("hidden_size", c.hidden);
-        c.n_heads    = geti("num_attention_heads", c.n_heads);
-        c.n_kv_heads = geti("num_key_value_heads", c.n_kv_heads);
-        c.head_dim   = geti("head_dim",
-                            c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
-        c.rotary_dim = c.head_dim;
-        c.ffn_inner  = geti("intermediate_size", c.ffn_inner);
-        c.vocab      = geti("vocab_size", c.vocab);
-        c.rope_theta = getf("rope_theta", c.rope_theta);
-        c.rms_eps    = getf("rms_norm_eps", c.rms_eps);
-        if (obj.contains("tie_word_embeddings")) {
-          c.tie_embeddings = obj.at("tie_word_embeddings").as_bool(true);
-        }
-        if (obj.contains("quantization")) {
-          FlexData q = obj.at("quantization");
-          if (q.is_object()) {
-            auto qo = q.as_object();             // bind view to a local
-            if (qo.contains("bits")) {
-              const int b = (int)qo.at("bits").as_int(0);
-              if (b == 4 || b == 8) { c.quant_bits = b; declared_quant = true; }
-            }
-          }
-        }
-      }
-    } }
+  bool declared_quant = false;
+  const MetalQwenModel::Config c = flux2_encoder_config_(edir, &declared_quant);
 
   auto enc = MetalQwenModel::load(edir, mc, c);
   ASSERT_TRUE(enc != nullptr);
@@ -2521,4 +2652,194 @@ TEST(flux2_smoke, vae_conv_phase_bench)
               "-> im2col %.0f GB/s, gemm %.2f TFLOP/s\n",
               gflop, gb_col, gb_col / (t_im / 1e3),
               gflop / 1e3 / (t_gm / 1e3));
+}
+
+
+// ---- streamed residency, wired ------------------------------------------
+//
+// The end of the policy every DiT shares: a streamed block that is KEPT
+// gets mlock'd through the manager's pool, and admission is gated on the
+// pool having room for it. What this pins is the pair of properties that
+// bound memory rather than the ones that make it fast.
+//
+//   1. THE RESULT DOES NOT MOVE. Keeping a block and streaming it must
+//      produce the same velocity to the bit -- a resident block is the
+//      same bytes read once instead of every step, so anything else is a
+//      bug in the promotion (a buffer aliased where it should be copied,
+//      a fused weight kept unfused).
+//   2. NOTHING GROWS WITHOUT A CEILING. Wired memory is the one
+//      allocation the kernel cannot take back, so the resident set must
+//      stop at the pool's limit and the process must never pass it --
+//      the failure mode is a panicked box, not a slow one.
+//
+// Run against a small pool on purpose: with the box's real pool a 9B DiT
+// fits entirely and the gate never fires, which is the case that proves
+// nothing.
+// LAYER STREAMING MUST NOT CHANGE A SINGLE BIT, for the text encoder as
+// much as for the DiT.
+//
+// declare_resources() claims this encoder with a floor -- what it holds
+// if it streams -- and the resource phase may admit a graph on the
+// strength of that. The claim is only honest if the encoder really can
+// stream, and the trade is only acceptable if the answer does not move.
+// Because a streamed layer is built by the SAME build_layer_ a resident
+// load runs, the bar is BIT-IDENTICAL rather than close; anything else
+// means the two paths read the checkpoint differently.
+//
+// Runs the {9,18,27} MULTI-LAYER tap FLUX.2 actually conditions on,
+// which the single-tap encoders elsewhere do not cover: what streaming
+// can break is the build/free/commit protocol around a tap, and a tap
+// at layer 9 that is later freed is a different case from the last one.
+// The two loads are SEQUENTIAL -- the first is destroyed before the
+// second is built -- so this never holds two copies.
+TEST(flux2_smoke, encoder_layer_streaming_matches_resident)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const char* eov = std::getenv("VPIPE_FLUX2_ENC_DIR");
+  const std::string edir = (eov != nullptr && *eov != '\0')
+      ? std::string(eov) : (fs::path(root) / "text_encoder").string();
+  if (!fs::exists(fs::path(edir) / "config.json")) { return; }
+
+  const MetalQwenModel::Config base = flux2_encoder_config_(edir, nullptr);
+  auto wts = MetalLlamaWeights::open_model(edir);
+  ASSERT_TRUE(wts.has_value());
+  SharedBuffer embed = wts->load("model.embed_tokens.weight", mc);
+  ASSERT_TRUE(!embed.empty());
+
+  const int EH = base.hidden, n = 8;
+  const std::vector<int> taps_l = {8, 17, 26};
+  auto make_x = [&]() {
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    const auto* tbl = static_cast<const std::uint8_t*>(embed.contents());
+    auto* xb = static_cast<std::uint8_t*>(x.contents());
+    for (int i = 0; i < n; ++i) {
+      std::memcpy(xb + (std::size_t)i * EH * 2,
+                  tbl + (std::size_t)(i + 100) * EH * 2, (std::size_t)EH * 2);
+    }
+    return x;
+  };
+  auto run = [&](bool stream, std::vector<std::uint16_t>& out) -> bool {
+    MetalQwenModel::Config c = base;
+    c.stream_layers = stream;
+    c.pin_frac      = 0.0;   // pure streaming: every layer takes the path
+    auto enc = MetalQwenModel::load(edir, mc, c);
+    if (enc == nullptr) { return false; }
+    // Without this the streamed arm can pass vacuously: load() DOWNGRADES
+    // streaming to resident for anything with an output head, and a silent
+    // downgrade would compare a model against itself.
+    if (enc->streaming_layers() != stream) { return false; }
+    genai::ContextManager* cm = enc->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer t = enc->forward_embeddings_taps(cid, make_x(), n, taps_l);
+    cm->release(cid);
+    if (t.empty()) { return false; }
+    const auto* p = static_cast<const std::uint16_t*>(t.contents());
+    out.assign(p, p + t.byte_size() / 2);
+    return true;
+  };
+
+  std::vector<std::uint16_t> want, got;
+  ASSERT_TRUE(run(false, want));
+  ASSERT_TRUE(run(true, got));
+  ASSERT_TRUE(want.size() == got.size() && !want.empty());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    if (want[i] != got[i]) { ++diff; }
+  }
+  std::printf("[flux2_smoke] encoder {9,18,27} taps, streamed vs resident: "
+              "%zu of %zu words differ\n", diff, want.size());
+  EXPECT_TRUE(diff == 0);
+}
+
+TEST(flux2_smoke, kept_blocks_are_wired_and_bounded_by_the_pool)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto* mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  const int TS = 64, gh = 8, gw = 8, img_seq = gh * gw;
+
+  // Small enough that the gate binds well before the stack is resident,
+  // and small enough to sit under RLIMIT_MEMLOCK on any box.
+  const std::size_t kPool = 512ull << 20;
+  mgr->set_wired_pool_bytes(kPool);
+  const std::size_t limit = mgr->wired_pool_limit();
+
+  auto dit = MetalFlux2Transformer::load(
+      tdir, mc, MetalFlux2Transformer::Config{}, /*stream_blocks=*/true);
+  if (dit == nullptr) { mgr->set_wired_pool_pct(0); return; }
+  // A zero reserve is an ANSWER, not a default: this test frees the DiT
+  // itself, so there is no peer to hold room clear for. Without one,
+  // BlockResidency keeps growth off entirely.
+  dit->set_residency_reserve(0);
+  dit->set_residency_schedule(4);
+
+  const auto& c = dit->config();
+  SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+  SharedBuffer lat =
+      mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+  ASSERT_TRUE(!ctx.empty() && !lat.empty());
+  std::mt19937 rng(9182);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* cp = static_cast<_Float16*>(ctx.contents());
+  for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+    cp[i] = (_Float16)nd(rng);
+  }
+  auto* lp = static_cast<_Float16*>(lat.contents());
+  for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+    lp[i] = (_Float16)nd(rng);
+  }
+
+  auto forward = [&]() {
+    std::vector<std::uint16_t> out;
+    SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    out.assign(static_cast<const std::uint16_t*>(v.contents()),
+               static_cast<const std::uint16_t*>(v.contents()) + n);
+    return out;
+  };
+
+  // Forward 1 streams every block and keeps what the pool allows;
+  // forwards 2-3 run against a partly resident stack.
+  const std::vector<std::uint16_t> a = forward();
+  ASSERT_TRUE(!a.empty());
+  const int kept1 = dit->resident_block_count();
+  EXPECT_TRUE(mgr->wired_pool_used() <= limit);
+
+  for (int i = 0; i < 2; ++i) {
+    const std::vector<std::uint16_t> b = forward();
+    ASSERT_TRUE(b.size() == a.size());
+    // BIT-identical, not close: same weights, same inputs, same kernels.
+    EXPECT_TRUE(std::memcmp(a.data(), b.data(), a.size() * 2) == 0);
+    EXPECT_TRUE(mgr->wired_pool_used() <= limit);
+  }
+  const int kept3 = dit->resident_block_count();
+  std::printf("[flux2_smoke] wired residency: %d -> %d blocks kept, "
+              "pool %zu of %zu MB\n", kept1, kept3,
+              (std::size_t)(mgr->wired_pool_used() >> 20),
+              (std::size_t)(limit >> 20));
+  // The set may stop at zero on a box already under pressure -- that is
+  // the policy working, not a failure. What must hold is that it never
+  // outran the ceiling and that it did not shrink the answer.
+  EXPECT_TRUE(dit->resident_block_bytes() <= limit);
+
+  // And the pool comes BACK when the model goes. A DiT freed for the
+  // vae-decode and reloaded per prompt would otherwise leak its whole
+  // share of the budget every prompt until nothing could wire at all.
+  dit.reset();
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
 }

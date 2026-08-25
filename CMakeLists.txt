@@ -485,20 +485,34 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         DESTINATION include/generative-models/shared/kernel-sets)
     # Large-model plumbing. docs/MODEL-MEMORY.md ships as the contract for
     # out-of-tree models and describes block streaming and block residency
-    # as things a loader MUST get right; block-residency.h and stream-pin.h
-    # are where both actually live, so without them the document describes
-    # machinery the reader cannot call. dit-block-progress.h is the reason
+    # as things a loader MUST get right; block-residency.h is where the
+    # latter lives, so without it the document describes machinery the
+    # reader cannot call. stream-sizing.h answers the two questions a
+    # model puts to the CHECKPOINT before it loads anything: the
+    # streaming FLOOR (trunk + one block -- every streaming model wants
+    # this) and, for a language model with no residency policy to grow
+    # into, how long a PREFIX to pin. No DiT uses the second half. dit-block-progress.h is the reason
     # a high-resolution denoise does not read as a stall -- per-STEP is
     # tens of seconds of silence at 1024px, and every DiT already walks its
     # blocks one at a time. streamed-refill.h is the read itself: block
     # streaming as documented costs a block-sized allocation and a
     # demand-faulted copy per block per step, and this is how a loader
-    # stops paying both.
+    # stops paying both. wired-pool.h is the half of block residency that
+    # makes it hold: a kept block is the coldest memory in the process, so
+    # without mlock it is the first thing the compressor takes and the run
+    # spends the schedule admitting and shedding the same blocks.
+    # block-slots.h is the policy on top of streamed-refill.h -- two
+    # reusable destinations and the prefetch that keeping them makes
+    # free -- and without it every out-of-tree model writes that state
+    # machine again, including the join-before-early-return discipline
+    # that is a use-after-free when it is missed.
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-residency.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-pin.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-slots.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-sizing.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/streamed-refill.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/wired-pool.h
         DESTINATION include/generative-models/shared)
     # weight-set.h's own dependencies. The SDK's header set has to be
     # CLOSED under #include or it does not compile -- a plugin cannot

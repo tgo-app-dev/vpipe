@@ -232,6 +232,11 @@ private:
   // latent is published, then reload lazily when the next prompt arrives. The
   // load params are cached here so process() can reload without re-deriving.
   std::string _flux2_dit_dir;            // resolved transformer dir (reload)
+  // Same pair for Qwen-Image-Edit. The 20B DiT is the largest of the
+  // image families, so it is the one a 1024px vae-decode is most likely
+  // to need the room from -- see free_qie_dit_for_decode_.
+  std::string _qie_dit_dir;
+  bool        _qie_stream = false;
   bool        _flux2_stream   = false;   // streaming mode used at load
   std::string _krea2_dit_dir;            // resolved Krea-2 DiT dir (reload)
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
@@ -249,6 +254,11 @@ private:
   // the shared MetalKrea2Vae's 1024px decode); reloaded on the next prompt.
   bool load_krea2_dit_();
   void free_krea2_dit_for_decode_(int gen_w, int gen_h);
+  // Qwen-Image-Edit's pair of the same. The DiT is idle once its latent
+  // is read back, so on a box that cannot hold 20B of weights beside the
+  // decode arena it is given to the pool and reloaded on the next prompt.
+  bool load_qie_dit_();
+  void free_qie_dit_for_decode_(int gen_w, int gen_h);
   // Same, for Boogu-Image. Its 10B NextDiT is the largest DiT here (~20 GB
   // bf16, ~5.6 GB at 4-bit) and it shares the box with a resident Qwen3-VL
   // mllm, so on a 16 GB box it is freed for the decode even at 4-bit.

@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
+
 using namespace std;
 
 namespace vpipe::webui {
@@ -378,10 +380,22 @@ FileApi::h_list_(const HttpRequest& req)
     x.insert("name", fstr(e.name));
     x.insert("dir",  FlexData::make_bool(e.dir));
     if (!e.dir) {
-      std::error_code ze;
-      const auto sz = fs::file_size(real / e.name, ze);
+      // ONE stat for both fields, rather than fs::file_size plus
+      // fs::last_write_time: this runs per visible entry (which is why
+      // it is down here in the slice and not in the walk above), and
+      // the second call would double that cost to learn something the
+      // first already had. st_mtime is seconds since the epoch, which
+      // the client renders in its own local time -- converting
+      // fs::file_time_type to a wall clock is the thing this avoids.
+      struct ::stat st {};
+      const bool ok = ::stat((real / e.name).c_str(), &st) == 0;
       x.insert("size",
-               FlexData::make_uint(ze ? 0 : static_cast<uint64_t>(sz)));
+               FlexData::make_uint(ok ? static_cast<uint64_t>(st.st_size)
+                                      : 0));
+      if (ok) {
+        x.insert("mtime",
+                 FlexData::make_uint(static_cast<uint64_t>(st.st_mtime)));
+      }
     }
     av.push_back(std::move(eo));
   }

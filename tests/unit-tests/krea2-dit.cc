@@ -187,6 +187,110 @@ TEST(krea2_dit, text_fusion_mma_matches_steel)
 // mma path writes into `joint` at an ELEMENT OFFSET) plus the block q/k/v/gate/
 // o + SwiGLU projections through gemm_mma_. stream_blocks=true keeps the full
 // 28-block DiT off the heap; only blocks 0..1 are read from the source mmap.
+// STREAMED must equal PRELOADED, byte for byte.
+//
+// The streaming path reads each block into a reusable slot with pread
+// and issues the next block's read under the current block's GPU work
+// (shared/block-slots.h). That moves where the bytes come from and when
+// they arrive; it must not move a single bit of the result.
+//
+// This model is the case with the sharpest trap in it: its RMSNorm
+// weights are stored ZERO-CENTRED and folded to (1 + w) at load, so
+// the bytes in the destination are not the bytes in the checkpoint. A
+// raw refill would place the checkpoint's and be silently wrong -- the
+// buffer is the right size and full of plausible numbers. Those tensors
+// are marked kDerived; this test is what says so.
+//
+// Runs blocks 0..1 in tap mode: enough to exercise the slot pair, the
+// prefetch and the refill without the 28-block residual compounding
+// that random inputs amplify.
+TEST(krea2_dit, streamed_matches_preloaded)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  const int HID = cfg.hidden, IC = cfg.in_channels;
+  const int text_seq = 128, grid = 8;
+  const int img_seq = grid * grid;
+  // Two blocks by default -- enough to exercise the slot pair, the
+  // prefetch and the refill without a 28-block read on every run.
+  // VPIPE_KREA2_STREAM_BLOCKS=-1 runs the whole stack, which is what a
+  // TIMING comparison needs: with two blocks the one-off allocation of
+  // the second slot is most of what is being measured.
+  int stop = 1;
+  if (const char* sb = std::getenv("VPIPE_KREA2_STREAM_BLOCKS")) {
+    stop = std::atoi(sb);
+  }
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x0badf00du;
+  auto fill = [&](std::vector<float>& v, float amp) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f) * amp;
+    }
+  };
+  fill(txt, 1.0f);
+  fill(lat, 1.0f);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = stop >= 0
+      ? (std::size_t)(text_seq + img_seq) * HID
+      : (std::size_t)img_seq * cfg.in_channels;
+
+  double fwd_s = 0.0;
+  auto run = [&](bool stream, std::vector<float>& out) -> bool {
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, stream);
+    if (m == nullptr) { return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (o.empty() || o.byte_size() < n * 2) { return false; }
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return true;
+  };
+
+  std::vector<float> pre, str;
+  ASSERT_TRUE(run(false, pre));
+  const double pre_s = fwd_s;
+  ASSERT_TRUE(run(true, str));
+  std::printf("[krea2_dit] forward: preloaded %.1f s, streamed %.1f s "
+              "(slots %s)\n", pre_s, fwd_s,
+              std::getenv("VPIPE_KREA2_NO_SLOTS") != nullptr ? "OFF" : "on");
+
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[krea2_dit] streamed vs preloaded: %zu of %zu differ "
+              "(worst %.3e)\n", diff, n, worst);
+  EXPECT_TRUE(diff == 0);
+
+  if (const char* out = std::getenv("VPIPE_KREA2_STREAM_DUMP")) {
+    std::ofstream f(out, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(str.data()),
+            (std::streamsize)(str.size() * sizeof(float)));
+  }
+}
+
 TEST(krea2_dit, forward_dit_mma_matches_steel)
 {
   const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");

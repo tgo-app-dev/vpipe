@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -51,14 +52,19 @@ class SourceText : public vpipe::TypedStage<SourceText> {
       : TypedStage(s, std::move(id), std::move(ip), std::move(c))
   { allocate_oports(1); }
   std::string prompt;
-  bool done = false;
+  // How many beats to emit. More than one drives the stage through its
+  // per-prompt lifecycle -- which is where the DiT is freed for a big
+  // vae-decode and reloaded -- rather than only its first generation.
+  int  beats = 1;
+  int  sent  = 0;
   vpipe::Job
   process(vpipe::RuntimeContext& ctx) override
   {
-    if (!done) {
-      done = true;
+    if (sent < beats) {
+      ++sent;
       co_await ctx.write(0, std::make_unique<vpipe::FlexDataPayload>(
                                 vpipe::FlexData::make_string(prompt)));
+      if (sent < beats) { co_return; }
     }
     ctx.signal_done();
     co_return;
@@ -228,4 +234,105 @@ TEST(qwen_image_edit_t2i, text_to_image_stage_end_to_end)
 
     }
   }
+}
+
+
+// ---- free the DiT for the decode, then reload it -------------------------
+//
+// The 20B Qwen-Image-Edit DiT is the largest of the image families, so on
+// a bounded box it is the one a 1024px vae-decode most needs the room
+// from. This is the cycle that gives it up and gets it back: the latent
+// is read back, the checkpoint goes TO THE WEIGHT POOL (not simply
+// dropped), the model is destroyed -- which is also what returns its
+// share of the wired pool -- and the next prompt reloads it, recycling
+// the pooled checkpoint instead of re-reading 20B of weights.
+//
+// FORCED via VPIPE_IMAGE_DIT_RECLAIM, because the decision is a memory
+// read: the path is reachable only on a box tight enough to need it,
+// which is exactly the box a test is least likely to run on. Without the
+// override this cycle had no coverage at all on any family.
+//
+// What it proves is that the reload is FAITHFUL. A model rebuilt from a
+// cached dir + streaming flag has plenty of ways to come back subtly
+// different -- a Config field read from the beat rather than the
+// checkpoint, a quantization detection that ran once, a fused weight
+// that was fused in place -- and every one of them is silent. Same seed,
+// same prompt, so the two latents must be identical to the bit.
+TEST(qwen_image_edit_t2i, the_dit_survives_being_freed_for_the_decode)
+{
+  const char* root = std::getenv("VPIPE_QWEN_IMAGE_EDIT_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  const int H = 256, W = 256;
+  const int lh = H / 8, lw = W / 8;
+
+  ::setenv("VPIPE_IMAGE_DIT_RECLAIM", "1", 1);
+  struct Unset {
+    ~Unset() { ::unsetenv("VPIPE_IMAGE_DIT_RECLAIM"); }
+  } unset_guard;
+
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto srcu = std::make_unique<SourceText>(&sess, "src", std::vector<InEdge>{},
+                                           FlexData::make_object());
+  srcu->prompt = "a red fox sitting in fresh snow, photorealistic";
+  srcu->beats  = 2;                      // generate, free, reload, generate
+  auto* src = static_cast<SourceText*>(pl->insert_stage(std::move(srcu)));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+  cfg.as_object().insert("height", FlexData::make_int(H));
+  cfg.as_object().insert("width", FlexData::make_int(W));
+  cfg.as_object().insert("steps", FlexData::make_int(2));
+  cfg.as_object().insert("seed", FlexData::make_int(42));
+  if (const char* dd = std::getenv("VPIPE_QWEN_IMAGE_EDIT_DIT_DIR")) {
+    if (*dd != '\0') { cfg.as_object().insert("dit_dir",
+                                              FlexData::make_string(dd)); }
+  }
+
+  FlexData cond_cfg = FlexData::make_object();
+  cond_cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+  auto condu = std::make_unique<DiffusionConditionerStage>(
+      &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(cond_cfg));
+  auto* cond = static_cast<DiffusionConditionerStage*>(
+      pl->insert_stage(std::move(condu)));
+  ASSERT_TRUE(cond->config_error().empty());
+  auto t2iu = std::make_unique<GenerateImageStage>(
+      &sess, "t2i", std::vector<InEdge>{{cond, 0}}, std::move(cfg));
+  auto* t2i =
+      static_cast<GenerateImageStage*>(pl->insert_stage(std::move(t2iu)));
+  ASSERT_TRUE(t2i->config_error().empty());
+  auto sinku = std::make_unique<SinkCapture>(
+      &sess, "sink", std::vector<InEdge>{{t2i, 0}}, FlexData::make_object());
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(std::move(sinku)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  if (t2i->latents_emitted() == 0) {
+    std::printf("[qwen_image_edit_t2i] no latent emitted (model not "
+                "loaded?); skipping\n");
+    return;
+  }
+  // BOTH generations completed -- the second one only exists if the
+  // reload found a working model where the free had left nothing.
+  EXPECT_TRUE(t2i->latents_emitted() == 2);
+  ASSERT_TRUE(sink->captured.size() == 2);
+
+  const auto* a = dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+  const auto* b = dynamic_cast<const TensorBeatPayload*>(sink->captured[1].get());
+  ASSERT_TRUE(a != nullptr && b != nullptr);
+  ASSERT_TRUE(a->shape.size() == 3 && a->shape[0] == 16 &&
+              a->shape[1] == lh && a->shape[2] == lw);
+  ASSERT_TRUE(b->shape == a->shape);
+  const auto ba = a->materialize_contiguous();
+  const auto bb = b->materialize_contiguous();
+  ASSERT_TRUE(ba.size() == bb.size());
+  const bool same = std::memcmp(ba.data(), bb.data(), ba.size()) == 0;
+  std::printf("[qwen_image_edit_t2i] freed + reloaded DiT: second latent is "
+              "%s\n", same ? "BIT-IDENTICAL" : "DIFFERENT");
+  EXPECT_TRUE(same);
 }

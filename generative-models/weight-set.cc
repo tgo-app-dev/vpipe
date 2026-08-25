@@ -125,9 +125,9 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
 }
 
 void
-WeightSet::set_parked(bool p) noexcept
+WeightSet::note_parked(bool on)
 {
-  _parked.store(p, std::memory_order_relaxed);
+  _parked.store(on, std::memory_order_relaxed);
 }
 
 bool
@@ -183,6 +183,11 @@ WeightSet::ensure_active_()
   // Safe to call with _mu already held (every caller holds it): the
   // mutex is recursive, and the begin_restore()/end_restore() bracket
   // reactivate() runs just nests one level deeper.
+  //
+  // Cleared HERE, before reactivate() -- which clears it again through
+  // note_parked(false), and that repetition is deliberate. reload_weights()
+  // reads through these same accessors, so a flag still set at that point
+  // would recurse.
   _parked.store(false, std::memory_order_relaxed);
   if (_registry != nullptr) {
     bool reloaded = false;

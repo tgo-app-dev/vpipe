@@ -85,6 +85,16 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
     _output_sample_rate = v;
   }
   {
+    int v = static_cast<int>(attr_int("channels"));
+    if (v != 1 && v != 2) {
+      fail_config(fmt(
+          "AudioToPcmStage('{}'): channels {} is not 1 or 2", this->id(),
+          v));
+      return;
+    }
+    _channels = v;
+  }
+  {
     double v = attr_real("chunk_duration_s");
     if (v <= 0.0 || v > 600.0) {
       fail_config(fmt(
@@ -143,10 +153,11 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
     return;
   }
   // Pre-reserve enough room for ~max chunk to avoid mid-stream
-  // reallocations. mono float32 at _output_sample_rate.
+  // reallocations. float32 at _output_sample_rate, times the channels.
   _chunk_buf.reserve(
       static_cast<std::size_t>(_output_sample_rate)
-      * static_cast<std::size_t>(_max_chunk_duration_s + 1.0));
+      * static_cast<std::size_t>(_max_chunk_duration_s + 1.0)
+      * static_cast<std::size_t>(_channels));
   session()->info(fmt(
       "AudioToPcmStage('{}'): output_sample_rate={} Hz, "
       "chunk_duration_s={}, max_chunk_duration_s={}, "
@@ -159,6 +170,16 @@ namespace {
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_sample_rate", .type = ConfigType::Int,
    .doc = "resampler target Hz, [1000,384000]", .def_int = 16000},
+  {.key = "channels", .type = ConfigType::Int,
+   .doc = "output channel count, 1 (mono, the default) or 2 (stereo). Mono "
+          "emits [N]; stereo emits PLANAR [2, N] -- channel-major, the "
+          "layout every planar-PCM consumer in this tree reads, and not the "
+          "interleaved LRLR the resampler produces internally. Downmixing to "
+          "mono is lossy in a way that matters to some consumers: a "
+          "reference soundtrack fed to MiniMax-H3 as mono is upmixed again "
+          "by duplication, so L and R arrive identical where the file itself "
+          "had a stereo image",
+   .def_int = 1},
   {.key = "chunk_duration_s", .type = ConfigType::Real,
    .doc = "min emitted chunk seconds, (0,600]", .def_real = 10.0},
   {.key = "max_chunk_duration_s", .type = ConfigType::Real,
@@ -179,16 +200,18 @@ const PortSpec kIports[] = {
    .tags = "audio-encoder-segments", .clock_group = 0},
 };
 const PortSpec kOports[] = {
-  {.name = "pcm", .doc = "mono F32 PCM TensorBeat [N] at "
-                         "output_sample_rate; sideband ts/sr/duration",
+  {.name = "pcm", .doc = "F32 PCM TensorBeat at output_sample_rate -- [N] "
+                         "mono, or PLANAR [2, N] when channels=2; sideband "
+                         "ts/sr/duration",
    .type = &typeid(TensorBeatPayload),
    .tags = "pcm-samples", .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "audio-to-pcm",
-  .doc       = "Decodes audio EncodedSegments and resamples to mono F32 "
-               "PCM at output_sample_rate, emitting fixed-duration "
-               "chunks. Crosses packet-rate -> chunk-rate clocks.",
+  .doc       = "Decodes audio EncodedSegments and resamples to F32 PCM at "
+               "output_sample_rate (mono, or planar stereo), emitting "
+               "fixed-duration chunks. Crosses packet-rate -> chunk-rate "
+               "clocks.",
   .display_name = "Audio → PCM",
   .category  = StageCategory::Audio,
   .iports    = kIports,
@@ -348,7 +371,13 @@ AudioToPcmStage::ensure_resampler_(int             in_sample_rate,
   } else {
     in_layout.nb_channels = in_channels;
   }
-  AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+  // Packed FLT either way: swresample writes interleaved LRLR into one
+  // buffer, which keeps the accumulate path a single growing vector. The
+  // de-interleave to the planar [2, N] the oport promises happens once,
+  // at emit, rather than per decoded frame.
+  AVChannelLayout out_layout =
+      _channels == 2 ? AVChannelLayout(AV_CHANNEL_LAYOUT_STEREO)
+                     : AVChannelLayout(AV_CHANNEL_LAYOUT_MONO);
   SwrContext* sw = nullptr;
   int rc = _libs->swresample().api.alloc_set_opts2(
       &sw,
@@ -433,8 +462,11 @@ AudioToPcmStage::decode_one_(const EncodedSegment& seg)
         delay + (static_cast<int64_t>(_frame->nb_samples)
                  * _output_sample_rate)
                 / std::max(1, _frame->sample_rate) + 32;
+    // `max_out` / `n_out` count samples PER CHANNEL; the packed buffer
+    // holds `_channels` floats for each of them.
+    const std::size_t ch = static_cast<std::size_t>(_channels);
     std::size_t prev = _chunk_buf.size();
-    _chunk_buf.resize(prev + static_cast<std::size_t>(max_out));
+    _chunk_buf.resize(prev + static_cast<std::size_t>(max_out) * ch);
     float* dst = _chunk_buf.data() + prev;
     int n_out = _libs->swresample().api.convert(
         _swr, reinterpret_cast<uint8_t**>(&dst),
@@ -451,7 +483,7 @@ AudioToPcmStage::decode_one_(const EncodedSegment& seg)
       _libs->avutil().api.frame_unref(_frame);
       break;
     }
-    _chunk_buf.resize(prev + static_cast<std::size_t>(n_out));
+    _chunk_buf.resize(prev + static_cast<std::size_t>(n_out) * ch);
     _libs->avutil().api.frame_unref(_frame);
   }
   if (any_decoded) {
@@ -471,15 +503,34 @@ Job
 AudioToPcmStage::emit_chunk_(RuntimeContext& ctx)
 {
   if (_chunk_buf.empty()) { co_return; }
+  const std::size_t ch = static_cast<std::size_t>(_channels);
+  const std::size_t n  = chunk_frames_();
   TensorBeat tb;
   tb.dtype = TensorBeat::DType::F32;
-  tb.shape = { static_cast<int64_t>(_chunk_buf.size()) };
-  tb.strides.clear();  // row-major contiguous 1-D
+  // Mono keeps the [N] it always emitted; stereo is PLANAR [2, N]. Not
+  // the interleaved [N, 2] the resampler hands back -- planar is what
+  // every consumer of a multi-channel PCM tensor here reads, and the two
+  // spell the same rank with the axes swapped, so an interleaved buffer
+  // under a planar contract is read as N channels of 2 samples rather
+  // than failing.
+  tb.shape = ch == 1 ? std::vector<int64_t>{ static_cast<int64_t>(n) }
+                     : std::vector<int64_t>{ static_cast<int64_t>(ch),
+                                             static_cast<int64_t>(n) };
+  tb.strides.clear();  // row-major contiguous
   const std::size_t nbytes = _chunk_buf.size() * sizeof(float);
   tb.data.resize(nbytes);
-  std::memcpy(tb.data.data(), _chunk_buf.data(), nbytes);
+  if (ch == 1) {
+    std::memcpy(tb.data.data(), _chunk_buf.data(), nbytes);
+  } else {
+    auto* d = reinterpret_cast<float*>(tb.data.data());
+    for (std::size_t c = 0; c < ch; ++c) {
+      for (std::size_t i = 0; i < n; ++i) {
+        d[c * n + i] = _chunk_buf[i * ch + c];
+      }
+    }
+  }
   const std::uint64_t duration_us = static_cast<std::uint64_t>(
-      _chunk_buf.size() * 1'000'000ULL / _output_sample_rate);
+      static_cast<std::uint64_t>(n) * 1'000'000ULL / _output_sample_rate);
   attach_sideband_(tb, _chunk_first_ts_us,
                    _output_sample_rate, duration_us);
   if (_emit_log_every == 1
@@ -487,8 +538,8 @@ AudioToPcmStage::emit_chunk_(RuntimeContext& ctx)
     session()->log_verbose(fmt(
         "AudioToPcmStage('{}'): emit chunk #{} samples={} dur={:.2f}s "
         "ts_us={}",
-        this->id(), _chunks_emitted, _chunk_buf.size(),
-        _chunk_buf.size() / static_cast<double>(_output_sample_rate),
+        this->id(), _chunks_emitted, n,
+        n / static_cast<double>(_output_sample_rate),
         _chunk_first_ts_us));
   }
   _chunk_buf.clear();
@@ -537,8 +588,8 @@ AudioToPcmStage::process(RuntimeContext& ctx)
     co_return;
   }
   decode_one_(*esp);
-  const double cur_s =
-      static_cast<double>(_chunk_buf.size()) / _output_sample_rate;
+  const double cur_s = static_cast<double>(chunk_frames_())
+                       / _output_sample_rate;
   if (cur_s >= _chunk_duration_s) {
     co_await emit_chunk_(ctx);
   } else if (cur_s >= _max_chunk_duration_s) {

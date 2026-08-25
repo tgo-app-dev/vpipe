@@ -4,21 +4,33 @@
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "common/encoded-segment.h"
 #include "common/ffmpeg-libraries.h"
 #include "stages/audio-video/video-tokens.h"
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace vpipe {
 
-// Reads a video file (or network URL: rtsp://, http://, ...), demuxes,
-// decodes, and emits decoded frames downstream. Source stage; 0 input
+// Reads a video file (or network URL: rtsp://, http://, ...), demuxes
+// it, and emits its ENCODED packets downstream. Source stage; 0 input
 // ports, 1 or 2 output ports depending on `enable_video` /
 // `enable_audio`.
 //
-// Per port, the contract is the StreamParams header followed by N
-// FrameRef beats followed by EOS (driver closes the buffer when this
-// stage signals done). Receivers distinguish header vs frame via
-// Beat::try_get<T>.
+// One EncodedSegment per packet, the same contract rtsp-capture
+// publishes -- so the file and the camera are interchangeable sources
+// for everything downstream, and `video-to-rgb` / `audio-to-pcm` own the
+// decode for both.
+//
+// It decoded, once, and emitted FrameRefs. Nothing consumed them: the
+// only FrameRef consumer in the tree is save-video, which is fed by
+// rgb-to-video, so a file could reach no stage that works in tensors.
+// Decoding here also duplicated video-to-rgb's decoder without its
+// hardware path, its format conversion, or its cadence sideband. Moving
+// the decode downstream is what gives a file the whole existing chain --
+// resample, decimate, stack, encode -- instead of a private one.
 //
 // Configuration (FlexData object on the 4th constructor parameter):
 //   input_url            (string, required)
@@ -44,7 +56,6 @@ public:
 
   Job initialize(RuntimeContext& ctx) override;
   Job process   (RuntimeContext& ctx) override;
-  Job drain     (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
 
@@ -71,16 +82,15 @@ public:
 private:
   void open_input_();
   int  pick_stream_(int media_type, int requested) const noexcept;
-  void open_codec_(int stream_idx, AVCodecContext** out);
+  // Cache the per-stream metadata every emitted segment repeats:
+  // codec_id, extradata and the geometry or rate. Read once at open,
+  // because codecpar lives in _fctx and a segment must be readable
+  // after this stage is gone.
+  void cache_stream_(int stream_idx, bool video);
   std::string av_err_(int rc) const;
 
-  // Drains the receive_frame loop after a send_packet. `pkt == nullptr`
-  // means flush. Yields each decoded frame downstream on `port`.
-  Job drain_codec_(RuntimeContext& ctx, AVCodecContext* cctx,
-                   unsigned port, AVPacket* pkt);
-
-  VideoStreamParams make_video_params_() const noexcept;
-  AudioStreamParams make_audio_params_() const noexcept;
+  // Build one segment from the packet currently in `_pkt`.
+  std::unique_ptr<EncodedSegmentPayload> segment_(bool video);
 
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
@@ -106,11 +116,26 @@ private:
   AVFormatContext*       _fctx          = nullptr;
   int              _v_stream_idx  = -1;
   int              _a_stream_idx  = -1;
-  AVCodecContext*  _vctx          = nullptr;
-  AVCodecContext*  _actx          = nullptr;
   AVPacket*        _pkt           = nullptr;
 
+  // Per-stream metadata, cached at open (see cache_stream_).
+  struct StreamMeta {
+    unsigned codec_id = 0;
+    unsigned width = 0, height = 0;
+    unsigned fps_num = 0, fps_den = 0;
+    unsigned sample_rate = 0, channels = 0;
+    std::vector<std::uint8_t> extradata;
+    AVRational time_base { 0, 1 };
+    // MEDIA time of the next packet, in microseconds from the start of
+    // the file. A packet with no pts repeats the previous one's end,
+    // which keeps the stream monotonic where a zero would jump it back
+    // to the start mid-clip.
+    std::int64_t last_us = 0;
+  };
+  StreamMeta _vmeta, _ameta;
+
   bool _eof = false;
+  std::uint64_t _v_packets = 0, _a_packets = 0;
 };
 
 }

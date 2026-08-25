@@ -69,6 +69,59 @@ struct MediaReference {
   int sample_rate = 0;
 
   bool has_audio() const { return channels > 0 && !pcm.empty(); }
+
+  // This reference's own canvas short edge, overriding the plan's for
+  // this one reference. Negative uses the plan's; 0 is the never-
+  // upsample rule (resolve_canvas_within).
+  //
+  // Per REFERENCE and not per kind, because the reason to set it is a
+  // property of the picture rather than of the checkpoint: a caller that
+  // has already sized one -- through a resample stage, a crop, or a
+  // generator -- is telling the encoder to leave that one alone, and it
+  // may be telling it about only one of nine.
+  int short_edge = -1;
+};
+
+// What the encoder had to do to a reference to make it fit.
+//
+// REPORTED here rather than warned about, because this is a library:
+// which of these deserves a user's attention is the caller's judgement,
+// and a test wants the numbers rather than a sentence. A stage turns
+// them into warnings.
+//
+// The temporal counts are kept separate on purpose -- there are three
+// distinct reductions and they have different remedies. A 30 fps clip
+// loses frames to the RATE resample whether or not it is also too long;
+// `target_frames` then truncates; and the VAE additionally snaps down to
+// a whole number of `17n + 5` chunks. Collapsing them into one
+// percentage tells a user that something was lost without telling them
+// which knob gets it back.
+struct ReferenceFit {
+  MediaReference::Kind kind = MediaReference::Kind::kImage;
+
+  // Pixels in, pixels encoded. Equal when the reference was already on
+  // the grid -- the pass-through route, and the only one that reproduces
+  // the caller's pixels exactly.
+  int src_h = 0, src_w = 0;
+  int canvas_h = 0, canvas_w = 0;
+
+  double src_fps     = 0.0;
+  int    src_frames  = 0;   // as handed in
+  int    rate_frames = 0;   // after the 24 fps resample
+  int    used_frames = 0;   // after truncation to target_frames
+  int    vae_frames  = 0;   // after the 17n+5 snap, what the VAE saw
+
+  double audio_src_seconds  = 0.0;
+  double audio_kept_seconds = 0.0;
+
+  bool rescaled() const
+  {
+    return canvas_h > 0 && (canvas_h != src_h || canvas_w != src_w);
+  }
+  bool upscaled() const
+  {
+    return canvas_h > src_h || canvas_w > src_w;
+  }
 };
 
 // The limits MiniMax-H3 documents for the released checkpoint. They
@@ -90,10 +143,31 @@ struct ReferencePlan {
 
   // The reference-image rule (its own short edge, no area cap) and the
   // canvas rule a reference VIDEO shares with the target.
+  //
+  // `canvas_short_edge` of 0 means the source clip's own short edge --
+  // the never-upscale route, which is not a different rule but the same
+  // one started from what the file actually carries. See
+  // normalize_video_reference; the area cap still binds a large source
+  // either way.
+  //
+  // It moves THREE things, not two. The reference rows the DiT attends
+  // to and the VAE encode that produced them are the obvious pair; the
+  // third is the CONDITIONER, because the vision tower is handed the
+  // same normalized pixels and smart-resizes from them, so this canvas
+  // also decides how many vision tokens a clip contributes. MEASURED on
+  // the two-reference ref2va example, 1344x768 -> 960x544: 13120 -> 7144
+  // reference rows AND 3115 -> 2119 conditioning rows. Lowering it is a
+  // fidelity decision on both channels, not a pure cost one.
   int          reference_image_short_edge = 2048;
   int          canvas_multiple            = 32;
   int          canvas_short_edge          = 768;
   std::int64_t canvas_max_pixels          = 768LL * 1344LL;
+  // The image path's area cap. 0 -- uncapped -- is the released
+  // checkpoint's rule, where `reference_image_short_edge` is the only
+  // bound. It stops being a bound the moment a caller says 0 to take a
+  // picture as it arrived, and an uncapped 4K still is 8160 DiT rows and
+  // ~220 VAE tiles, so a graph that feeds raw pictures wants this set.
+  std::int64_t reference_image_max_pixels = 0;
 
   // The rate the CONDITIONER reads a video reference at -- every
   // `fps / video_sample_fps`-th of the normalized frames. Not the rate
@@ -130,6 +204,9 @@ struct EncodedReferences {
   metal_compute::SharedBuffer conditioning;
   std::vector<int>            token_tags;
   int                         n_tokens = 0;
+
+  // One per reference, in read order, parallel to `layout`.
+  std::vector<ReferenceFit> fits;
 };
 
 // The models. Each may be null when the corresponding work is not

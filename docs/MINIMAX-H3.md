@@ -67,8 +67,8 @@ name the output to match.
   — the same, anchored to an image at both ends (see
   [More than text in](#more-than-text-in)).
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
-  — the **Ref2VA** partition instead: a list of reference images, clips and
-  soundtracks in, `.mp4` out (see
+  — the **Ref2VA** partition instead: reference images, clips and soundtracks
+  in, `.mp4` out, each one prepared to a size you choose (see
   [Conditioning on references](#conditioning-on-references-ref2va)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
@@ -348,25 +348,82 @@ Wire a **`video-ref-encoder`** stage:
 | --- | --- |
 | port 0 in | the prompt |
 | port 1 in | optional `model-select` |
+| ports 2–7 in | optional `ref1`..`ref6` — a reference as a tensor |
 | port 0 out | conditioning → `generate-video` port 0 |
 | port 1 out | reference video rows → `generate-video` port **7** |
 | port 2 out | reference audio rows → `generate-video` port **8** |
 
-The references are the stage's **`references` config**, not a port: they are
-files to open, so the composer's file browser fills them in — **select
-several at once** and they land in the list in the order you picked them.
+#### Two ways to hand it a reference
+
+**A list of files**, in the stage's `references` config. They are paths to
+open, so the composer's file browser fills them in — **select several at
+once** and they land in the list in the order you picked them:
 
 ```json
 "references": ["subject.png", "motion.mp4", "voice.wav"]
 ```
 
+**Or a tensor**, on one of the six `ref` iports. That is for the references a
+path cannot name — a still your graph just generated, a cropped frame, a clip
+that was never written to disk — and for choosing each reference's geometry
+yourself. The contract is in
+[References that are not files](#references-that-are-not-files) below.
+
+The two mix freely: port references are numbered *after* the list, and the
+limits (9 images, 3 clips, 3 soundtracks, 12 total) apply to the union. Reach
+for the list when the references are files you have and are happy for the
+model's own rule to size; reach for the ports when a stage produces the
+reference, or when you want to set its size.
+
+#### The example
+
 [`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)
-is that graph, and it runs on assets you already have:
+runs on assets you already have:
 
 | reference | carries | where it comes from |
 |---|---|---|
 | `minimax-h3-reference-subject.jpg` | the subject | [ships in this repo](images/minimax-h3-reference-subject.jpg) — made with vpipe's own FLUX.2 text-to-image graph, so it comes with no licence question attached |
-| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip that carries its own audio is two references in one — it is labelled `<Audio 1>` and `<Video 1>` and its soundtrack is encoded separately |
+| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip with audio stays ONE reference carrying both, labelled `<Video 2>` and `<Audio 2>`, however you feed it |
+
+It takes the **ports** route, preparing each reference through ordinary stages:
+
+```
+load-image → image-resample(1024×1024)                              → ref1
+load-video ┬→ video-to-rgb → image-resample(1344×768) → temporal-stack → ref2
+           └→ audio-to-pcm(32000, stereo) → temporal-stack             → ref3
+```
+
+Seventeen stages where the list would need three lines, and it buys one thing:
+the two `image-resample` sizes are yours. The ports default to
+`short_edge: 0`, so the encoder takes what it is handed instead of re-resolving
+it — change those numbers and the reference geometry changes with them. Swap
+the whole chain for a `references` list if you would rather have the three
+lines; the stage takes either.
+
+Four details in that shape are load-bearing. **One `load-video` feeds both
+streams**, so the clip and its soundtrack still leave one container together —
+the sync argument the `references` list was built on, kept rather than traded.
+**`attach_audio: [3]`** on the encoder makes port 3's audio the soundtrack of
+the reference before it, so it stays one `<Video 2>` + `<Audio 2>` pair instead
+of becoming a third, independent reference. **`channels: 2`** carries true stereo, which the
+`references` path also does and a mono chain would silently give up.
+And **`max_mb: 384`** on the clip stacker is sized on purpose: 90 frames at
+1344 × 768 is 279 MB, over the 256 MB default, which would otherwise cap the
+group at 86 frames and warn.
+
+MEASURED: this produces a request identical to the `references` list at every
+count that exists — 2 references, 3,115 conditioning rows, 13,120 reference
+video rows, 130 audio rows, a 22,615-row packed sequence. It is not the same
+*video*, at the same seed: the resize now happens in `image-resample` rather
+than inside the encoder, and two implementations landing on the same dimensions
+do not land on the same bytes. If you want bit-equivalence with the file list
+instead of the size control, leave the resamples at the source size and put
+`short_edge: 768` in the clip stacker's `sideband`.
+
+One inefficiency worth knowing: the encoder truncates a clip to `frames`, so
+this chain resizes all 90 frames and uses 39. The `references` list truncates
+first and resizes only what it keeps. Bound the source rather than raise
+`max_mb` if that matters.
 
 ```sh
 cd ~/vpipe-work                                    # the work directory again
@@ -379,6 +436,8 @@ The `.mp4` is already beside them if you ran step 2 from this directory; any
 clip with a soundtrack will do. Point `model-select` at your Ref2VA directory
 if you named it something else, and note the two `frames` settings — the
 encoder's and `generate-video`'s — which already agree at 39 and have to.
+
+#### What it costs
 
 **Ref2VA costs more than its output suggests**, and the example is sized
 around that rather than around the clip it makes. A reference is packed into
@@ -404,46 +463,191 @@ Dropping to 39 moves both halves and fits — 22,615 rows, of which 13,120 are
 the clip. Making only `width`/`height` smaller would cut the 28% and leave the
 58% exactly where it is.
 
+The **other** lever is the reference canvas itself. That 1344 × 768 is an
+*upscale* of a 960 × 544 file — 1.98× the pixels, interpolated from the same
+information — and `reference_video_short_edge: 0` declines it, encoding the
+clip at its own size instead. MEASURED on the shipped example, back to back on
+an idle 16 GB M5 at the same seed:
+
+| | `768` (default) | `0` (the clip's own) |
+|---|---|---|
+| reference clip canvas | 1344 × 768 | 960 × 544 |
+| VAE tiles per chunk | 28 | 15 |
+| reference rows | 13,120 | 7,144 |
+| **conditioning rows** | **3,115** | **2,119** |
+| packed sequence | 22,615 | 15,643 |
+| wall clock | 23 m 07 s | 14 m 17 s |
+
+**It moves three things, and the third one surprises people.** The VAE encode
+and the reference rows are the obvious pair. The third is the *conditioner*:
+the vision tower is handed the same normalized pixels and smart-resizes from
+them, so this canvas also decides how many vision tokens a clip contributes —
+996 fewer here, all of them the clip's (the still is encoded at its own short
+edge and does not move). Lowering it is a fidelity decision on **both**
+channels, not a free 1.6×.
+
+And on the shipped example it is visibly not free. At `768` the generated cat
+wears the reference still's navy jacket and sits in the concert hall the
+prompt asks for; at `0`, at the same seed, it wears no jacket and the setting
+collapses toward the reference *clip's* dark room. Different sequence shapes
+give different samples, so one seed is not proof of a systematic loss — but it
+is proof that `0` is a different generation and not a cheaper spelling of the
+same one.
+
+So `768` stays the default: it is the released checkpoint's rule, and a
+reference the model was trained to see upscaled is what it gives. `0` is worth
+*trying* where references are already smaller than 768 and the budget is
+tight — and worth **comparing side by side** before you keep it. The area cap
+still binds a clip larger than the canvas either way.
+
 As shipped — 960 × 544, 39 frames, 8 steps, one still and one clip — that is
-**24 min 15 s** on the fanless 16 GB M5. Around a third of it happens before
+**23 min 54 s** on the fanless 16 GB M5 (the `references` list, same geometry,
+measured 23 min 07 s: the ports chain resizes every decoded frame and the list
+resizes only the ones it keeps). Around a third of it happens before
 the first denoise step: the 32B conditioner is loaded and streamed, and both
 references are read twice, once by the vision tower at its own canvas and once
 by the video VAE at MiniMax-H3's. Raising `frames` from here raises the
 reference rows with it, so the next size up is a bigger jump than it looks.
 
+#### How a reference is read
+
 A single path may be written bare, without the brackets. **The order is the
 request**: it numbers the references in the prompt the model reads
 (`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places them on a shared clock,
-so reordering the list is a different generation. That is also why they are
-one list rather than a port per reference — a request's shape is only known
-when it arrives, and twelve `load-image` chains cannot express "three clips
-and nine stills" without the graph being rewritten per request.
+so reordering the list is a different generation — and port references
+continue that numbering after the last file.
 
-**You do not say what each file is.** vpipe opens it and reads that from the
-file: a container with one frame is an *image* reference, an `.mp4` carrying
+That ordering is why the list exists at all rather than a port per reference.
+A request's shape is only known when it arrives, and twelve `load-image`
+chains cannot express "three clips and nine stills" without the graph being
+rewritten per request. The six ports are the other half of the same argument,
+not a reversal of it: a *path* cannot name a still that does not exist yet.
+Six, and not more, because the numbering has to be static — a port that could
+fall silent would renumber every reference behind it.
+
+**A file does not say what it is.** vpipe opens it and reads that from the
+bytes: a container with one frame is an *image* reference, an `.mp4` carrying
 no video stream is an *audio* one, and an animated `.webp` is a clip. An
 extension is a claim and the bytes are the fact — and a file picker hands
 over whatever the user chose. Getting it wrong is not loud: a still read as
 video conditions the model on a frozen clip, and a clip read as a still
-quietly keeps only its first frame.
+quietly keeps only its first frame. A tensor has no such ambiguity, which is
+one reason the ports type by rank: `[1, 3, H, W]` is a one-frame clip and
+`[3, H, W]` is a still, and nothing has to be inferred.
 
-A video reference conditions on **its own soundtrack** when it has one. That
-is why the stage opens the file itself rather than taking frames from
-`load-video`: a clip and its audio have to come out of one container to stay
-in sync, and the file's **frame rate** has to survive the trip. MiniMax-H3
-resamples every reference onto its own 24 fps, so a rate lost on the way in
-is a generation conditioned at the wrong speed with nothing to complain
-about.
+A video reference conditions on **its own soundtrack** when it has one, and a
+clip and its audio have to leave one container together to stay in sync. The
+`references` list gets that by opening the file itself; the ports route gets
+it from one `load-video` feeding both its streams. Either way the file's
+**frame rate** has to survive the trip: MiniMax-H3 resamples every reference
+onto its own 24 fps, so a rate lost on the way in is a generation conditioned
+at the wrong speed with nothing to complain about. That is why a clip on a
+port must state `fps` and is refused without one.
 
 Set the stage's `frames` to the **same value** as `generate-video`'s: it is
 the duration references are truncated to as well as the size of the sequence
 the transformer packs. They are checked against each other, not trusted.
 
 References never bind the generated geometry. An image is encoded at a short
-edge of its own (2048), with no area cap and upscaling included; a clip goes
-onto the same canvas rule as the target, resolved from *its* aspect ratio.
-Two references of different shapes land on different canvases, which is
-expected.
+edge of its own (`reference_image_short_edge`, 2048), with no area cap and
+upscaling included; a clip goes onto the same canvas rule as the target
+(`reference_video_short_edge` 768, under `reference_video_max_pixels`
+1032192), resolved from *its* aspect ratio. Two references of different shapes
+land on different canvases, which is expected.
+
+Those defaults are the released checkpoint's, and all of them are worth knowing
+about because none is visible in the output. `reference_image_short_edge` in
+particular: at 2048 a single still is 121 VAE tiles, and nine are allowed. The
+example lowers it to 1024, which is 25.
+
+You do not have to accept any of it silently. **Every reference the encoder
+had to reshape is warned about**, naming what was kept:
+
+```
+reference 1 fitted -- rescaled 1920x1080 -> 1344x736 (48% of the pixels),
+  resampled 30 -> 24 fps (18 frame(s) dropped),
+  truncated 72 -> 39 frames (54% of the clip)
+```
+
+Three reductions, counted apart on purpose, because they have different
+remedies: the rate resample drops whole frames whether or not the clip is also
+too long, `frames` is what fixes the truncation, and the canvas keys are what
+fix the rescale. A reference that needed nothing is logged at debug as *taken
+as given* — which is the outcome to aim for when you have sized it yourself.
+
+#### References that are not files
+
+Six **tensor iports** (`ref1`..`ref6`) sit after `prompt` and `model`, for the
+references a file list cannot name: a still your graph just generated, a
+cropped frame, a clip that was never written to disk. They supplement the
+`references` list rather than replacing it, and are numbered after it.
+
+| what you send | rank | sideband |
+|---|---|---|
+| audio | `[N]` or `[channels, N]` f32 | `sr` (or `sample_rate`) — **required** |
+| a picture | `[3, H, W]` u8 | — |
+| a clip | `[frames, 3, H, W]` u8 | `fps` — **required** |
+
+Rank is what types it, which also settles the one case a container cannot
+state: a one-frame clip is `[1, 3, H, W]` and a still is `[3, H, W]`, and those
+are different requests. The rates are **required and never defaulted** — a
+soundtrack read at the wrong rate conditions on the wrong sound, and a clip at
+the wrong speed generates video with nothing to complain about.
+
+One optional sideband key: `short_edge` sets *this one reference's* canvas.
+
+##### Audio that belongs to a clip
+
+A clip demuxed into frames and PCM arrives on **two** ports and should stay
+**one** reference. `attach_audio` on the encoder names the ports whose audio is
+a soundtrack rather than a reference of its own:
+
+```json
+"attach_audio": [3]
+```
+
+It is **positional**: the audio folds onto whichever reference immediately
+precedes it. With one clip that is unambiguous; with two, order the ports so
+each soundtrack follows its own clip. There is no way to name a target.
+
+It is a list and not a single switch because a request may legitimately carry
+both an attached soundtrack and a standalone piece of music, and those are
+different references.
+
+**It can attach to a reference from the `references` list.** Files are read
+before any port, so the reference it folds onto may be one of them — which
+makes `references: ["motion.mp4"]` plus a generated soundtrack on a port a
+perfectly good request, and the neatest way to score a clip you already have.
+
+An audio beat's own `attach` sideband overrides the config for that beat, so a
+producer that knows better than the graph can say so — `true` to attach where
+the config did not ask, `false` to decline where it did.
+
+Attaching to a **still** is allowed and warned about. It is a real request —
+a one-frame `.mp4` with an audio track comes through the `references` list the
+same way — but it is far more often a port wired in the wrong order, so the run
+says so rather than refusing something the other route permits.
+
+A **wired port must beat every request**; send an empty tensor to say "nothing
+this time". A port that could fall silent would renumber every reference after
+it, and the numbering is the request.
+
+The port default is `short_edge: 0` — **encode it at the size it arrived**.
+That is the point of the ports: if you have resampled to 768 with an
+`image-resample` stage, or cropped to a framing you chose, re-resolving it
+against a per-kind default would scale it straight back up and undo the work
+(and cost you a second Lanczos pass). At `0` the encoder may only **reduce**,
+never enlarge — it brings a picture under the area cap, floors both axes to
+the multiple of 32 the DiT patch and VAE stride demand, and otherwise leaves it
+alone. Three things it still cannot skip: that grid (a 1080-tall frame becomes
+1056), the 1:4 … 4:1 aspect bound, which is a refusal rather than a fit, and
+for clips the 24 fps resample plus the `17n + 5` snap.
+
+Because a short edge of `0` removes the only bound an image reference had, set
+**`reference_image_max_pixels`** on a graph that feeds raw pictures. It is
+uncapped by default, matching the checkpoint, and an uncapped 4K still is
+~220 VAE tiles and 8,160 DiT rows — half the packed sequence of a typical
+request, before its vision tokens.
 
 This stage holds the prompt encoder, its vision tower and both VAEs while it
 runs, so on a memory-bounded box leave `unload_when_idle` at `auto` — the

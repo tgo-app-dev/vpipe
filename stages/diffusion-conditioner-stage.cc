@@ -830,6 +830,40 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       }
     }
   }
+  // LAYER STREAMING, on the same rule the DiTs use.
+  //
+  // declare_resources() puts this encoder on the books with a FLOOR --
+  // what it holds if it streams -- and that floor is what the resource
+  // phase judges the graph against. Until this decision existed the
+  // floor was a promise nothing kept: the encoder loaded resident
+  // whatever the box, so a graph could be admitted on the strength of a
+  // reduction that never happened. This is the other half of that
+  // claim.
+  //
+  // BACKBONE-ONLY ONLY, which is not a limitation so much as the
+  // mechanism's definition: a streamed layer is built inside the
+  // PREFILL and freed after it, so decode would re-read the stack per
+  // token. Every conditioning encoder here taps hidden states and never
+  // decodes -- except mage-flow, whose content screen generates a
+  // verdict through the lm_head. MetalQwenModel::load refuses the
+  // combination anyway; asking only when it can be served keeps a
+  // warning off a path that is behaving correctly.
+  if (ecfg.backbone_only) {
+    const auto plan = model_memory::plan_streaming(
+        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom);
+    ecfg.stream_layers = plan.stream;
+    ecfg.pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_ENC_STREAM")) {
+      ecfg.stream_layers = (std::atoi(e) != 0);
+      if (!ecfg.stream_layers) { ecfg.pin_frac = 0.0; }
+    }
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): text encoder footprint {} MB "
+        "(others {} MB) + {} MB headroom -> {}", this->id(),
+        plan.footprint >> 20, plan.others >> 20,
+        model_memory::kStreamHeadroom >> 20,
+        ecfg.stream_layers ? "STREAM layers" : "PRELOAD"));
+  }
   // One set for this checkpoint, shared with the vision tower and the
   // embedding table below and with anything else naming the same dir.
   _enc_ws = genai::open_weight_set(_enc_dir, session());
@@ -843,6 +877,18 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     session()->error(fmt("DiffusionConditionerStage('{}'): text encoder load "
                          "failed: {}", this->id(), _enc_dir));
     return false;
+  }
+  if (_encoder->streaming_layers()) {
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): text encoder streams its layers -- "
+        "~one layer resident instead of the stack, rebuilt inside each "
+        "prefill", this->id()));
+    // Deliberately NOT revising the manager declaration down. An LM reads
+    // its tensors UNCACHED into its own buffers, so the weight set's
+    // stats report a fraction of what the model holds and a revision
+    // would move the declared figure in the unsafe direction. The
+    // streamable claim declare_resources() made already says what this
+    // reduces to; there is nothing to correct.
   }
   if (_family == "mage-flow") {
     // Mage-Flow takes its embeddings from the model's own muxer (loaded
@@ -1297,6 +1343,19 @@ DiffusionConditionerStage::park_encoder_()
   if (_enc_dir.empty()) { return; }
   auto* mgr = session()->services()->generative_model_manager();
   if (mgr == nullptr) { return; }
+  // THE BORROW HAS TO END FIRST, and that is why this drops the models
+  // rather than parking around them. The manager owns the checkpoint and
+  // refuses to park one anything is still borrowing -- it cannot know a
+  // live model is idle, and a park under one hands its reader pages the
+  // kernel may discard. This stage parking its own encoder while holding
+  // it was exactly that case: the embedding table is a cached tensor,
+  // held here across the park and read on the next prompt.
+  //
+  // So `park` and `destroy` differ in what the MANAGER does with the
+  // bytes, not in what this stage does with its models. Both let go;
+  // park keeps them (purgeable, reactivated on the next read), destroy
+  // hands them back.
+  unload_encoder_();
   const std::size_t got = mgr->park_weights(_enc_dir);
   session()->log_debug(fmt(
       "DiffusionConditionerStage('{}'): parked {} MB of the encoder{}",
@@ -1323,19 +1382,17 @@ DiffusionConditionerStage::unload_encoder_()
   // Everything weight-sized: the LM (or the wan family's umT5 tower),
   // either vision tower, and the embedding table. The tokenizer stays
   // (kilobytes, and it is pure CPU state).
-  // TO THE POOL when the policy is `auto`, and BEFORE the resets:
-  // pool_weights() finds the set through a WEAK reference, so once these
-  // models drop their last strong one there is nothing left to pool.
+  // SETTLED when the policy is `auto`. The manager owns the checkpoint,
+  // so dropping these models only ends this stage's borrow; what the
+  // call does is ask for it to be settled now -- parked if nobody else
+  // is borrowing it, left alone if someone is. The order against the
+  // resets below no longer matters (it did when the manager's reference
+  // was weak and there was nothing left to pool afterwards).
   //
   // The encoder is the checkpoint a relaunch most wants back -- it is
   // the largest thing this graph loads and is dropped after every
   // conditioning by design. `destroy` is the caller asking for the bytes
   // now, so it keeps dropping them.
-  if (_unload_cfg == model_memory::UnloadPolicy::kAuto && !_enc_dir.empty()) {
-    if (auto* mgr = session()->services()->generative_model_manager()) {
-      mgr->pool_weights(_enc_dir);
-    }
-  }
   _encoder.reset();
   _umt5.reset();
   _h3_enc.reset();
@@ -1343,7 +1400,27 @@ DiffusionConditionerStage::unload_encoder_()
   _vision3.reset();
   _embed = metal_compute::SharedBuffer{};
   _ds_feats.clear();
+  // AND THE BORROW ITSELF. Keeping `_enc_ws` across an unload used to be
+  // harmless bookkeeping; with the manager owning the checkpoint it is
+  // the difference between released and not, because a set this stage
+  // still holds is one the manager will not park or drop. It is
+  // reopened by load_encoder_() on the next prompt, which is where it
+  // came from.
+  _enc_ws.reset();
   _unloaded = true;
+  // SETTLE IT NOW rather than at whatever unrelated moment the manager
+  // is next doing work. `destroy` is the caller asking for the bytes
+  // back, which parking does not do; anything else keeps the checkpoint
+  // for the next prompt, purgeable.
+  if (!_enc_dir.empty()) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+        mgr->drop_weights(_enc_dir);
+      } else {
+        mgr->pool_weights(_enc_dir);
+      }
+    }
+  }
 
   // SAY SO to the manager, which is what makes this a memory decision
   // rather than a private one.

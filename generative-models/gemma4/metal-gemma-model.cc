@@ -1,6 +1,6 @@
 #include "generative-models/gemma4/metal-gemma-model.h"
 
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"

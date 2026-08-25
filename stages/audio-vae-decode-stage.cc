@@ -273,16 +273,20 @@ AudioVaeDecodeStage::unload_vae_()
   }
 
   if (!_h3_vae) { return; }
-  // TO THE POOL when the policy is `auto`, and BEFORE the reset:
-  // pool_weights() finds the set through a WEAK reference, so there is
-  // nothing left to pool once this model drops its last strong one.
-  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
-    if (auto* mgr = session()->services()->generative_model_manager()) {
-      mgr->pool_weights(vae_dir_for_release_());
-    }
-  }
   _h3_vae.reset();
   _plugin_dec.reset();
+  // SETTLE IT NOW that the borrow has ended. The manager owns the
+  // checkpoint, so the resets above only ended this stage's; `destroy`
+  // is the caller asking for the bytes back, which parking does not do,
+  // and anything else keeps it purgeable for the next clip.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    const std::string vdir = vae_dir_for_release_();
+    if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+      mgr->drop_weights(vdir);
+    } else {
+      mgr->pool_weights(vdir);
+    }
+  }
   _unloaded = true;
   session()->log_debug(fmt(
       "AudioVaeDecodeStage('{}'): audio VAE unloaded (idle)", this->id()));

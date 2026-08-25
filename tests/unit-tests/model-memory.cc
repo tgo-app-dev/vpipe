@@ -16,6 +16,7 @@
 #include "common/session.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "pipeline/pipeline-runtime.h"
@@ -1580,16 +1581,17 @@ TEST(model_memory, a_pooled_checkpoint_survives_its_last_model)
   if (!ws) { fs::remove_all(root, ec); return; }
   const genai::WeightSet* raw = ws.get();
 
-  // Released to the pool, then dropped by its last holder. Without the
-  // pool's strong reference the set would be gone here.
-  mgr->pool_weights(dir);
+  // Dropped by its last holder, WITHOUT being handed over first: the
+  // manager owns every checkpoint it opened, so there is nothing to hand
+  // over. This is the case the old weak-reference cache re-read from
+  // disk, however comfortably the model fitted in RAM.
   ws.reset();
   auto again = mgr->weight_set(dir);
   EXPECT_TRUE(again != nullptr);
   EXPECT_TRUE(again.get() == raw);        // the SAME set, not a reopen
 
-  // And taking it back removes it from the pool: a set in use is not
-  // spare capacity, and an eviction must not drop pages a model reads.
+  // And a BORROWED set is not spare capacity: an eviction must not drop
+  // pages a model is reading.
   EXPECT_TRUE(mgr->pooled_bytes() == 0u);
 
   fs::remove_all(root, ec);
@@ -1624,18 +1626,36 @@ TEST(model_memory, an_unrecyclable_checkpoint_is_not_pooled)
   EXPECT_TRUE(!ws->recyclable());
   EXPECT_TRUE(!ws->unrecyclable_reason().empty());
 
-  mgr->pool_weights(dir);
-  EXPECT_TRUE(mgr->pooled_bytes() == 0u);   // refused, not pooled
+  // The manager keeps what nobody is borrowing -- EXCEPT this. Dropped
+  // outright, so the next launch opens the checkpoint afresh rather than
+  // inheriting a set baked for a run it knows nothing about.
+  ws.reset();
+  mgr->pool_weights(dir);                   // settle it now
+  EXPECT_TRUE(mgr->weight_set_count() == 0u);
+
+  // Re-opening gives a FRESH set, which is what "not recyclable" has to
+  // mean: the specialisation did not come back with it. Checked by the
+  // flag rather than by address, since a new allocation may reuse the
+  // old one's.
+  auto again = mgr->weight_set(dir);
+  ASSERT_TRUE(again != nullptr);
+  if (again != nullptr) {
+    EXPECT_TRUE(again->recyclable());
+    EXPECT_TRUE(again->unrecyclable_reason().empty());
+  }
   fs::remove_all(root, ec);
 }
 
-// POOLING AFTER THE LAST HOLDER LET GO DOES NOTHING, and does not say so.
+// EITHER ORDER WORKS, which it did not used to.
 //
-// pool_weights() finds the set through a WEAK reference, so a caller that
-// drops its model first has nothing left to pool -- the call returns
-// having done neither the pooling nor the "not recyclable" report. This
-// shipped once: generate-video reset its DiT and then pooled, and the
-// silence looked exactly like a checkpoint the pool had refused.
+// pool_weights() found the set through a WEAK reference, so a caller
+// that dropped its model first had nothing left to pool -- the call
+// returned having done neither the pooling nor the "not recyclable"
+// report. That shipped once: generate-video reset its DiT and then
+// pooled, and the silence looked exactly like a checkpoint the pool had
+// refused. The manager owns the set now, so the order is free; what the
+// call still does is ask for the checkpoint to be settled NOW rather
+// than whenever the manager is next doing work.
 TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
 {
   Session s;
@@ -1655,15 +1675,20 @@ TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
   }
   const std::string dir = root.string();
 
-  // WRONG ORDER: drop, then pool. Nothing is pooled.
+  // DROP, THEN POOL: settles immediately, and the set is still there.
   {
     auto ws = mgr->weight_set(dir);
     if (!ws) { fs::remove_all(root, ec); return; }
+    const genai::WeightSet* raw = ws.get();
     ws.reset();
     mgr->pool_weights(dir);
-    EXPECT_TRUE(mgr->pooled_bytes() == 0u);
+    auto again = mgr->weight_set(dir);
+    EXPECT_TRUE(again != nullptr);
+    EXPECT_TRUE(again != nullptr && again.get() == raw);
   }
-  // RIGHT ORDER: pool while it is still held, then drop.
+  // POOL, THEN DROP: the caller is still borrowing at the call, so
+  // nothing settles there; the set is kept regardless and settles on the
+  // next manager call.
   {
     auto ws = mgr->weight_set(dir);
     if (!ws) { fs::remove_all(root, ec); return; }
@@ -1675,4 +1700,145 @@ TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
     EXPECT_TRUE(again.get() == raw);   // recycled, not reopened
   }
   fs::remove_all(root, ec);
+}
+
+
+// ---- WiredPool: the per-model window onto the pool -----------------------
+//
+// The state machine every streamed DiT now shares (MiniMax-H3, LTX-2.5,
+// FLUX.2, Krea-2, Qwen-Image-Edit/Mage-Flow, Boogu-Image). What it
+// decides is whether a block may be KEPT at all, so the properties worth
+// pinning are the ones that bound memory rather than the ones that make
+// it fast: the budget is never exceeded, a refusal STOPS admission, and
+// the counter can neither underflow nor drift upward on its own.
+//
+// Wired memory is the one allocation the kernel cannot reclaim, so
+// "uncapped growth" here is not a slow run, it is a panicked box.
+TEST(model_memory, the_wire_budget_bounds_what_a_model_will_keep)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) { mgr->set_wired_pool_pct(0); return; }   // pool unavailable
+  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit());
+
+  // A block that fits is admissible; one that does not is refused BEFORE
+  // it is kept -- which is the whole point. Growth that outruns the pool
+  // leaves blocks resident but unprotected, and those are exactly the
+  // pages the compressor takes first.
+  const std::size_t budget = w.budget();
+  EXPECT_TRUE(w.wirable(budget));
+  EXPECT_FALSE(w.wirable(budget + 1));
+
+  // Wire real buffers through it, one "block" at a time, and check the
+  // two invariants after every one: this model never claims more than
+  // its budget, and the process never passes the pool's ceiling.
+  std::vector<metal_compute::SharedBuffer> held;
+  for (int i = 0; i < 24; ++i) {
+    const std::size_t nb = 1ull << 20;
+    if (!w.wirable(nb)) { break; }
+    auto b = mc->make_shared_buffer(nb);
+    if (b.empty()) { break; }
+    const std::size_t got = w.wire_one(mc, b, true);
+    w.note_wired(mc, got, nb);
+    held.push_back(std::move(b));
+    EXPECT_TRUE(w.wired_bytes() <= w.budget());
+    EXPECT_TRUE(mgr->wired_pool_used() <= mgr->wired_pool_limit());
+  }
+  EXPECT_TRUE(w.wired_bytes() <= kAsk);
+
+  // Giving blocks back is what an eviction does, and it must land on
+  // zero rather than wrapping: note_unwired takes a byte count, and a
+  // count larger than what is held is the ordinary case when a partly
+  // wired block is dropped whole.
+  for (auto& b : held) { w.note_unwired(w.wire_one(mc, b, false)); }
+  w.note_unwired(1ull << 40);                    // deliberate over-give
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+  held.clear();
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  mgr->set_wired_pool_pct(0);
+}
+
+// A REFUSAL COLLAPSES THE BUDGET, and the retry cannot raise it past the
+// pool. The first half is what stops a run admitting blocks nothing can
+// protect; the second is what stops the retry becoming a way around the
+// ceiling.
+TEST(model_memory, a_refused_wiring_stops_growth_and_the_retry_is_capped)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  mgr->set_wired_pool_bytes(8ull << 20);
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on() || w.budget() == 0) { mgr->set_wired_pool_pct(0); return; }
+
+  // A partial grant -- the box gave less than the block asked for.
+  const std::size_t want = 4ull << 20, got = 1ull << 20;
+  w.note_wired(mc, got, want);
+  EXPECT_TRUE(w.wired_bytes() == got);
+  // Budget is now exactly what was granted, so nothing further is
+  // admissible: growth stops on the spot rather than one failed mlock
+  // per block for the rest of the schedule.
+  EXPECT_TRUE(w.budget() == got);
+  EXPECT_FALSE(w.wirable(1));
+
+  // The retry is gated on the box having freed a block's worth SINCE the
+  // refusal, so asking with a huge block never fires -- a genuinely full
+  // box is never asked, because reopening the ceiling would let the mlock
+  // behind it fail and leave a block resident but unwired.
+  EXPECT_FALSE(w.retry(mc, (std::size_t)1 << 60));
+  EXPECT_TRUE(w.budget() == got);
+
+  // And however it goes, the budget never passes the pool's own limit.
+  w.retry(mc, 0);
+  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit());
+  EXPECT_TRUE(w.wired_bytes() <= w.budget());
+
+  mgr->set_wired_pool_pct(0);
+}
+
+// WITH THE POOL OFF, NOTHING CHANGES. The gate has to be transparent:
+// wirable() is what sits in front of every admission, so a false here
+// would turn the pool being unavailable into a model that streams
+// everything.
+TEST(model_memory, a_closed_pool_gates_nothing)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  mgr->set_wired_pool_pct(0);
+  genai::WiredPool w;
+  w.open(mc);
+  EXPECT_FALSE(w.on());
+  EXPECT_TRUE(w.wirable((std::size_t)1 << 60));   // admission unaffected
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+}
+
+// A MAPPED WEIGHT CAN BE NEITHER WIRED NOR PARKED, so the residency
+// choice and the pool are one decision, not two. This is the rule every
+// DiT loader now shares; getting it backwards is silent (the load
+// succeeds, the mlock refuses, and the run reads as merely slow).
+TEST(model_memory, mapping_is_off_whenever_streaming_or_wiring)
+{
+  EXPECT_TRUE(genai::weights_may_be_mapped(false, false));
+  EXPECT_FALSE(genai::weights_may_be_mapped(true, false));    // streaming
+  EXPECT_FALSE(genai::weights_may_be_mapped(false, true));    // pool on
+  EXPECT_FALSE(genai::weights_may_be_mapped(true, true));
 }

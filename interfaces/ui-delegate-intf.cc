@@ -60,9 +60,10 @@ UiProgressRegistry::open(std::string desc)
 {
   std::lock_guard<std::mutex> lk(_mu);
   Item it;
-  it.id   = _next_id++;
-  it.desc = std::move(desc);
-  it.seq  = ++_seq;
+  it.id      = _next_id++;
+  it.desc    = std::move(desc);
+  it.seq     = ++_seq;
+  it.started = std::chrono::steady_clock::now();
   _items.push_back(std::move(it));
   ++_version;
   return _items.back().id;

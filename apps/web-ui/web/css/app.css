@@ -341,16 +341,24 @@ svg.sb-spark .line {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 8px;
 }
+/* The middle slot, and the only one that may shrink: the two clocks
+   stay pinned to the edges of the row and a long detail ellipsizes
+   between them rather than pushing either off. */
 .sb-prog-detail {
   color: var(--fg-dim);
   font-size: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.sb-prog-elapsed,
 .sb-prog-eta {
   color: var(--fg-dim);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 /* ---- Navigation strip ---- */
@@ -1347,6 +1355,21 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   color: var(--fg-dim); font-size: 10.5px; font-family: var(--mono);
 }
 .fb-dims:empty { display: none; }
+/* Last modified, under the content at the bottom of the pane. Kept OUT
+   of the meta row on purpose: a third item there competes with the name
+   for width and shoves the Download button around, and this is the
+   least urgent field in the panel.
+   `margin-top: auto` is what pins it to the bottom in the panels whose
+   content does not stretch (audio, and a short unpreviewable notice);
+   where the content is flex:1 it collapses to nothing. */
+.fb-file-modified {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  text-align: right;
+  color: var(--fg-dim); font-size: 10.5px;
+}
 /* .vpipeline summary: one row per stage, id then [type]. */
 .fb-pl-list {
   flex: 1 1 auto; min-height: 0; overflow: auto;

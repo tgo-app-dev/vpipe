@@ -67,6 +67,15 @@ public:
 
   bool tty() const { return _tty; }
 
+  // TEST SEAM. The progress renderer picks one of two entirely
+  // different outputs from this flag, so a test of the non-tty half has
+  // to be able to assert it -- vpipe_test is redirected under CI and a
+  // terminal on a developer's box, and a test that runs in one of those
+  // and quietly skips in the other is worse than no test. Not for
+  // production code: nothing outside a test should care what stdout is
+  // beyond what this class already decides.
+  void set_tty_for_test(bool tty);
+
   // Current terminal width in columns (80 when unknown), for callers
   // that elide their rows to fit. Re-queried per call so a resized
   // window is picked up without a restart.

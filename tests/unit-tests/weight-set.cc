@@ -57,7 +57,14 @@ mc_(Session& s)
 // silently test the copying fallback instead.
 class TempCheckpoint {
 public:
-  TempCheckpoint()
+  // `big` adds one tensor LARGER than MetalCompute's small-allocation
+  // heap threshold (64 KB). Below it a Copied load sub-allocates from
+  // the shared heap, and a heap sub-allocation declines to park -- its
+  // residency is the heap's to manage -- so a parking test built on the
+  // 16-byte tensors below measures that rule rather than the one it
+  // means to. Off by default: every other test here wants the small
+  // fixture.
+  explicit TempCheckpoint(bool big = false)
   {
     namespace fs = std::filesystem;
     _dir = (fs::temp_directory_path() /
@@ -72,7 +79,13 @@ public:
         "{\"trunk.w\":{\"dtype\":\"F32\",\"shape\":[4],"
         "\"data_offsets\":[0,16]},"
         "\"encoder.w\":{\"dtype\":\"F32\",\"shape\":[8],"
-        "\"data_offsets\":[16,48]}}";
+        "\"data_offsets\":[16,48]}";
+    if (big) {
+      hdr += ",\"big.w\":{\"dtype\":\"F32\",\"shape\":[" +
+             to_string(kBigElems) + "],\"data_offsets\":[48," +
+             to_string(48 + kBigElems * 4) + "]}";
+    }
+    hdr += "}";
     while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
 
     ofstream out(_dir + "/model.safetensors", ios::binary);
@@ -81,7 +94,15 @@ public:
     out.write(hdr.data(), (streamsize)hdr.size());
     out.write(reinterpret_cast<const char*>(_trunk), 16);
     out.write(reinterpret_cast<const char*>(_enc), 32);
+    if (big) {
+      const vector<float> blob((size_t)kBigElems, 7.5f);
+      out.write(reinterpret_cast<const char*>(blob.data()),
+                (streamsize)kBigElems * 4);
+    }
   }
+
+  // 512 KB: comfortably past the 64 KB heap threshold.
+  static constexpr int kBigElems = 131072;
 
   ~TempCheckpoint()
   {
@@ -231,25 +252,78 @@ TEST(weight_set, manager_dedups_by_directory) {
   EXPECT_TRUE(mgr->weight_set_count() == 2u);
 }
 
-// The cache holds WEAK references, so the checkpoint is unmapped when the
-// last MODEL using it goes away -- not when the first one does.
-TEST(weight_set, dies_with_its_last_holder) {
+// THE MANAGER OWNS THE CHECKPOINT; a model BORROWS it.
+//
+// This used to read the other way round -- the cache held weak
+// references, so the first stage to load was the owner and the last to
+// let go was the undertaker. Sharing then worked only for OVERLAPPING
+// lifetimes: a second pipeline over the same model, opened a second
+// after the first ended, re-read the whole checkpoint from disk however
+// comfortably it fitted in RAM.
+//
+// Now the set outlives every borrower, and what happens when the last
+// one lets go is a POLICY the manager applies (release_unheld_): kept
+// and parked, so the next borrower pays neither a reopen nor -- unless
+// the box actually took the pages -- a re-read.
+TEST(weight_set, outlives_its_last_holder) {
   Session s;
   auto* mgr = s.generative_model_manager();
   if (mgr == nullptr) { return; }
   TempCheckpoint ck;
 
+  const WeightSet* raw = nullptr;
   {
     auto a = mgr->weight_set(ck.dir());
     ASSERT_TRUE(a != nullptr);
+    if (a == nullptr) { return; }
+    raw = a.get();
     {
       auto b = mgr->weight_set(ck.dir());
-      EXPECT_TRUE(b == a);
+      EXPECT_TRUE(b == a);              // one set, two borrowers
     }
-    // One holder dropped; the peer keeps it alive.
     EXPECT_TRUE(mgr->weight_set_count() == 1u);
   }
-  EXPECT_TRUE(mgr->weight_set_count() == 0u);
+  // Every borrower gone, and the checkpoint is still the manager's.
+  EXPECT_TRUE(mgr->weight_set_count() == 1u);
+  auto again = mgr->weight_set(ck.dir());
+  EXPECT_TRUE(again != nullptr && again.get() == raw);   // not a reopen
+}
+
+// ...and settling it PARKS it, which is the half that makes owning it
+// affordable: the bytes stay reclaimable by the kernel, so a checkpoint
+// nobody is using is not a claim on the box.
+TEST(weight_set, an_unborrowed_set_is_parked_not_held_hard) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck(/*big=*/true);
+
+  {
+    auto ws = mgr->weight_set(ck.dir());
+    ASSERT_TRUE(ws != nullptr);
+    if (ws == nullptr) { return; }
+    SharedBuffer a = ws->tensor("big.w", mc, WeightSet::Residency::Copied);
+    ASSERT_TRUE(!a.empty());
+    EXPECT_FALSE(ws->parked());
+    // Asking while still borrowing must NOT park: the manager cannot
+    // know this borrower is idle, and parking under it would hand it
+    // pages the kernel may discard.
+    EXPECT_TRUE(mgr->park_weights(ck.dir()) == 0u);
+    EXPECT_FALSE(ws->parked());
+  }
+  // Borrower gone. `pool_weights` is the "settle it now" verb.
+  mgr->pool_weights(ck.dir());
+  auto back = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(back != nullptr);
+  if (back == nullptr) { return; }
+  EXPECT_TRUE(back->parked());
+  // And borrowing it again does not un-park it -- only a READ does,
+  // which is what re-reads from disk if the kernel took the pages.
+  SharedBuffer b = back->tensor("big.w", mc, WeightSet::Residency::Copied);
+  EXPECT_FALSE(back->parked());
+  EXPECT_TRUE(!b.empty());
 }
 
 // Repeat requests for a tensor return ALIASES of one buffer: same GPU
@@ -295,6 +369,129 @@ TEST(weight_set, aliases_do_not_own_the_allocation) {
   ASSERT_TRUE(!a.empty());
   EXPECT_FALSE(a.is_owned());
   EXPECT_FALSE(a.mark_inactive());       // declines: not ours to park
+}
+
+// park_weights() is the BY-DIRECTORY entry point -- what a stage's
+// `unload_when_idle: park` reaches for -- and it has to find the set
+// that directory opened.
+//
+// It did not. `_weight_sets` is keyed "<canonical dir>|<variant>" and
+// this looked the bare canonical dir up in it, which cannot match even
+// in the ordinary empty-variant case, so every call returned 0. Nothing
+// caught it because the registry-level park is tested with a synthetic
+// owner (weight-registry.cc) and this path had no test at all -- and
+// the zero it returned was indistinguishable from the legitimate zero a
+// set that reads uncached gives back.
+TEST(weight_set, park_weights_finds_the_set_by_directory) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck(/*big=*/true);
+
+  auto ws = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(ws != nullptr);
+  // CACHED and Copied: the only combination the registry can park. And
+  // the BIG tensor, so the allocation is its own MTL::Buffer rather than
+  // a sub-range of the small-allocation heap.
+  SharedBuffer a = ws->tensor("big.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+  const WeightSet* raw = ws.get();
+  // Stop BORROWING before asking: the manager owns the checkpoint and
+  // will not park one a model still holds. That refusal has its own
+  // test (an_unborrowed_set_is_parked_not_held_hard); what this one is
+  // about is whether the by-directory lookup finds the set at all.
+  ws.reset();
+
+  const std::size_t got = mgr->park_weights(ck.dir());
+  EXPECT_TRUE(got > 0u);
+
+  // Idempotent: a set already parked has nothing further to give.
+  EXPECT_TRUE(mgr->park_weights(ck.dir()) == 0u);
+
+  // And a directory nobody opened is still 0 -- the fix widens the
+  // lookup, it does not make it match anything.
+  TempCheckpoint other;
+  EXPECT_TRUE(mgr->park_weights(other.dir()) == 0u);
+
+  auto back = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(back != nullptr);
+  if (back == nullptr) { return; }
+  EXPECT_TRUE(back.get() == raw);
+  EXPECT_TRUE(back->parked());
+  // The bytes are still readable: parking makes pages purgeable, it does
+  // not discard them, and nothing here created memory pressure.
+  back->reload_weights();
+}
+
+// POOLING MUST ARM THE WAY BACK, not just hand the pages over.
+//
+// pool_weights() marks a released checkpoint purgeable so the box may
+// take it and keeps the set so a relaunch pays no re-open. It recorded
+// only the KERNEL's half of that: the set's own parked flag stayed
+// false, so ensure_active_() -- the one thing that ever takes those
+// pages back -- short-circuited on every later read. A checkpoint that
+// had been pooled once then served whatever the kernel had left of
+// those buffers, and served ZEROS where it had taken them, in silence:
+// the "parked weights were reclaimed" warning keys off the very flag
+// that was never set.
+//
+// It reached a picture through the diffusion conditioner, which pools
+// `<root>/text_encoder` after each conditioning while keeping its
+// `_enc_ws` -- so the next prompt rebuilt the encoder and its embedding
+// table out of emptied buffers and the DiT denoised from garbage. The
+// second generation in a process was wrong and the first was not.
+//
+// What a test cannot arrange is the memory pressure that decides
+// whether the kernel actually takes the pages, so this pins the
+// invariant underneath it instead: parked in the kernel and parked on
+// the set are ONE fact, and a read is what undoes both.
+TEST(weight_set, pooling_arms_the_reactivate) {
+  Session s;
+  MetalCompute* mc = mc_(s);
+  if (mc == nullptr) { return; }
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  TempCheckpoint ck(/*big=*/true);
+
+  auto ws = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(ws != nullptr);
+  if (ws == nullptr) { return; }
+  // Cached + Copied + past the 64 KB heap threshold: the only shape the
+  // registry can actually park -- see the test above, which first passed
+  // while proving nothing for want of the last of those.
+  SharedBuffer a = ws->tensor("big.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!a.empty());
+  EXPECT_FALSE(ws->parked());
+  const WeightSet* raw = ws.get();
+  ws.reset();                     // stop borrowing; the manager keeps it
+
+  mgr->pool_weights(ck.dir());
+  // Recycling does NOT reactivate, and should not: it hands back the
+  // same set without re-opening the checkpoint, and whether the pages
+  // survived is not known until something reads them.
+  auto again = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(again != nullptr);
+  if (again == nullptr) { return; }
+  EXPECT_TRUE(again.get() == raw);
+  // THE REGRESSION. Without it the pages are volatile and nothing is
+  // left in the process that will ever ask for them back.
+  EXPECT_TRUE(again->parked());
+
+  // The READ is what takes them back -- re-reading from disk if the
+  // kernel did take them, which is why the bytes below are the ones the
+  // fixture wrote either way.
+  SharedBuffer b = again->tensor("big.w", mc, WeightSet::Residency::Copied);
+  ASSERT_TRUE(!b.empty());
+  EXPECT_FALSE(again->parked());
+  const float* p = b.empty() ? nullptr
+                             : static_cast<const float*>(b.contents());
+  EXPECT_TRUE(p != nullptr);
+  if (p != nullptr) {
+    EXPECT_TRUE(p[0] == 7.5f);
+    EXPECT_TRUE(p[TempCheckpoint::kBigElems - 1] == 7.5f);
+  }
 }
 
 // A mapped tensor aliases the mmap (no copy); a copied one is an owned
@@ -1087,15 +1284,37 @@ TEST(weight_set, the_memory_cap_parks_least_recently_used_first) {
   EXPECT_TRUE(a->last_use() < b->last_use());
   EXPECT_TRUE(mgr->active_bytes() == 2 * kBytes);
 
+  // LET GO OF BOTH before the cap runs. Nothing parks a set a model is
+  // borrowing -- see an_unreachable_cap_parks_what_it_can_and_stops --
+  // so holding these here would test the refusal rather than the order.
+  // The manager keeps them either way, which is what makes observing
+  // them afterwards possible at all.
+  const std::string adir = a->dir(), bdir = b->dir();
+  a.reset();
+  b.reset();
+
   // A cap that fits only one of them parks exactly one, the older-touched.
   mgr->set_memory_cap(kBytes + kBytes / 2);
-  EXPECT_TRUE(a->parked());
-  EXPECT_FALSE(b->parked());
+  bool a_parked = false, b_parked = false;
+  for (const auto& u : mgr->weight_report()) {
+    if (u.dir == adir) { a_parked = u.parked; }
+    if (u.dir == bdir) { b_parked = u.parked; }
+  }
+  EXPECT_TRUE(a_parked);
+  EXPECT_FALSE(b_parked);
   // Parked bytes belong to the kernel now, so they stop counting --
   // otherwise the policy would chase a number it can never reach.
   EXPECT_TRUE(mgr->active_bytes() == kBytes);
   // But they are still HELD: resident_weight_bytes() counts them.
   EXPECT_TRUE(mgr->resident_weight_bytes() == 2 * kBytes);
+
+  // Measured BEFORE borrowing again, because borrowing is manager work
+  // and manager work settles whatever nobody is holding: `b` is
+  // unborrowed and unparked here, so the next call parks it too and
+  // active_bytes() goes to 0. That is the policy working, not a leak.
+  a = mgr->weight_set(adir);
+  ASSERT_TRUE(a != nullptr);
+  if (a == nullptr) { mgr->set_memory_cap(0); return; }
 
   // Touching the parked set takes it back, and the bytes it hands out
   // are still the file's -- a reactivation that silently served
@@ -1127,9 +1346,22 @@ TEST(weight_set, no_cap_means_nothing_is_ever_parked) {
   EXPECT_FALSE(ws->parked());
 }
 
-// A cap smaller than anything parkable must not spin or lie: it parks
-// what it can, warns, and carries on. Mapped weights and KV cannot be
-// parked at all, so the cap is a target rather than a guarantee.
+// THE CAP OBEYS THE BORROW RULE TOO, and this is the last place that
+// did not.
+//
+// The cap parks least-recently-used weights to get under its target,
+// and the least-recently-used set is very often one a live model is
+// still holding -- an idle pipeline's DiT, a VAE between clips. Parking
+// under that model makes its cached tensors purgeable, and what reads
+// them next is a forward pass over aliases it already holds: it never
+// asks the set for anything, so nothing reactivates, and if the kernel
+// took the pages it reads zeros. The manager cannot tell a live model
+// that is idle from one mid-forward, so it does not try.
+//
+// The cap is therefore a target twice over: mapped weights and KV are
+// unparkable, and borrowed weights are not the manager's to park. What
+// returns those is a stage letting go -- an `unload_when_idle` policy,
+// not a smaller cap.
 TEST(weight_set, an_unreachable_cap_parks_what_it_can_and_stops) {
   Session s;
   MetalCompute* mc = mc_(s);
@@ -1138,14 +1370,21 @@ TEST(weight_set, an_unreachable_cap_parks_what_it_can_and_stops) {
   BigCheckpoint ck(1024 * 1024);
   auto ws = mgr->weight_set(ck.dir());
   ASSERT_TRUE(ws != nullptr);
+  if (ws == nullptr) { return; }
   ASSERT_TRUE(!ws->tensor("block.w", mc, WeightSet::Residency::Copied)
                    .empty());
 
   mgr->set_memory_cap(1);              // unreachable
-  EXPECT_TRUE(ws->parked());
-  // Everything parkable is parked; asking again is a no-op rather than
-  // an endless retry. Mapped weights and KV cannot be parked at all,
-  // which is why the cap is a target and not a guarantee.
+  // BORROWED, so the cap leaves it alone however far over it is...
+  EXPECT_FALSE(ws->parked());
+  // ...and asking again is a no-op rather than an endless retry.
   EXPECT_TRUE(mgr->enforce_memory_cap() == 0u);
+
+  // Let go, and the same cap now has something it may take.
+  ws.reset();
+  EXPECT_TRUE(mgr->enforce_memory_cap() > 0u);
+  auto back = mgr->weight_set(ck.dir());
+  ASSERT_TRUE(back != nullptr);
+  if (back != nullptr) { EXPECT_TRUE(back->parked()); }
   mgr->set_memory_cap(0);
 }

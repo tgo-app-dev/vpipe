@@ -259,6 +259,12 @@ encode_references(const std::vector<MediaReference>& refs,
     const MediaReference& m = refs[i];
     const std::string where = "reference " + std::to_string(i + 1);
     Reference L;
+    ReferenceFit fit;
+    fit.kind       = m.kind;
+    fit.src_h      = m.height;
+    fit.src_w      = m.width;
+    fit.src_fps    = m.fps;
+    fit.src_frames = m.num_frames;
     vision_of.push_back(-1);
 
     // ---- the soundtrack, FIRST ---------------------------------------
@@ -271,6 +277,9 @@ encode_references(const std::vector<MediaReference>& refs,
                             "loaded");
       }
       const int n_samp = (int)(m.pcm.size() / (std::size_t)m.channels);
+      if (m.sample_rate > 0) {
+        fit.audio_src_seconds = (double)n_samp / (double)m.sample_rate;
+      }
       std::vector<float> pcm;
       int kept = 0;
       std::string nerr;
@@ -301,6 +310,9 @@ encode_references(const std::vector<MediaReference>& refs,
         r.audio_rows[base + k] =
             sd != 0.0f ? (lat[k] - mu) / sd : (lat[k] - mu);
       }
+      if (m.sample_rate > 0) {
+        fit.audio_kept_seconds = (double)kept / (double)m.sample_rate;
+      }
       L.num_audio_latents = frames;
     }
 
@@ -318,28 +330,55 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<std::uint8_t> px;
       int nf = 0, th = 0, tw = 0;
       std::string nerr;
+      // A reference's own short edge wins over the plan's. Negative
+      // means it did not state one.
       if (m.kind == MediaReference::Kind::kImage) {
-        if (!normalize_image_reference(m.rgb.data(), m.height, m.width,
-                                       plan.reference_image_short_edge,
-                                       plan.canvas_multiple, &px, &th, &tw,
-                                       &nerr)) {
+        const int edge = m.short_edge >= 0 ? m.short_edge
+                                           : plan.reference_image_short_edge;
+        if (!normalize_image_reference(m.rgb.data(), m.height, m.width, edge,
+                                       plan.canvas_multiple,
+                                       plan.reference_image_max_pixels, &px,
+                                       &th, &tw, &nerr)) {
           return fail(where + ": " + nerr);
         }
         nf = 1;
+        fit.rate_frames = 1;
       } else {
+        const int edge =
+            m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
         if (!normalize_video_reference(m.rgb.data(), m.num_frames, m.height,
                                        m.width, m.fps, plan.target_frames,
-                                       plan.canvas_multiple,
-                                       plan.canvas_short_edge,
+                                       plan.canvas_multiple, edge,
                                        plan.canvas_max_pixels, &px, &nf, &th,
                                        &tw, kFps, &nerr)) {
           return fail(where + ": " + nerr);
         }
+        // What the RATE resample produced, before the truncation. The
+        // two losses have different remedies, so they are counted apart
+        // rather than as one shortfall against the source.
+        const std::vector<int> counts =
+            frame_resample_counts(m.num_frames, m.fps, kFps);
+        int total = 0;
+        for (int c : counts) { total += c; }
+        fit.rate_frames = total;
       }
+      fit.canvas_h    = th;
+      fit.canvas_w    = tw;
+      fit.used_frames = nf;
 
       // The CONDITIONER's read: 2 fps for a video, the whole (single)
-      // frame for an image. Its canvas is the tower's own smart-resize,
-      // not this one -- the two models genuinely see different pixels.
+      // frame for an image. The tower smart-resizes to a canvas of its
+      // own, so the two models genuinely see different pixels -- but it
+      // resizes FROM `px`, at the canvas resolved above, so that canvas
+      // still sets how much the tower is given to look at.
+      //
+      // Which makes the canvas a CONDITIONING knob and not only a latent
+      // one, and it is the half that is easy to miss: the reference rows
+      // and the VAE cost are visible in the layout, while the token count
+      // just quietly moves. MEASURED on the two-reference ref2va example,
+      // changing only the video canvas 1344x768 -> 960x544: 3115 -> 2119
+      // conditioning rows, all of it the clip's vision blocks (the still
+      // is encoded at its own short edge and did not move).
       if (models.vision != nullptr) {
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
@@ -387,6 +426,7 @@ encode_references(const std::vector<MediaReference>& refs,
             use = std::min(use, nf);
           }
         }
+        fit.vae_frames = use;
         metal_compute::SharedBuffer in =
             to_vae_input_(mc, px.data(), use, th, tw);
         if (in.empty()) { return fail(where + ": VAE input alloc failed"); }
@@ -421,6 +461,7 @@ encode_references(const std::vector<MediaReference>& refs,
                  ? Reference::Kind::kVideo
                  : Reference::Kind::kAudio;
     r.layout.push_back(L);
+    r.fits.push_back(fit);
     if (models.progress) {
       // +1: the presentation below is a step of its own. See the
       // declaration of ReferenceEncoders::progress.

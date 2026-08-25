@@ -919,7 +919,8 @@ TEST(minimax_h3_layout, reference_image_size)
   };
   for (const Case& c : kCases) {
     int oh = 0, ow = 0;
-    ASSERT_TRUE(h3::resolve_reference_image_size(c.h, c.w, 2048, 32, &oh, &ow));
+    ASSERT_TRUE(
+        h3::resolve_reference_image_size(c.h, c.w, 2048, 32, 0, &oh, &ow));
     if (oh != c.oh || ow != c.ow) {
       std::printf("[minimax_h3_layout] image %dx%d -> %dx%d, expected %dx%d\n",
                   c.h, c.w, oh, ow, c.oh, c.ow);
@@ -929,9 +930,11 @@ TEST(minimax_h3_layout, reference_image_size)
   }
   int oh = 0, ow = 0;
   // Outside 1:4 .. 4:1, and non-positive geometry.
-  EXPECT_FALSE(h3::resolve_reference_image_size(100, 500, 2048, 32, &oh, &ow));
-  EXPECT_FALSE(h3::resolve_reference_image_size(500, 100, 2048, 32, &oh, &ow));
-  EXPECT_FALSE(h3::resolve_reference_image_size(0, 100, 2048, 32, &oh, &ow));
+  EXPECT_FALSE(
+      h3::resolve_reference_image_size(100, 500, 2048, 32, 0, &oh, &ow));
+  EXPECT_FALSE(
+      h3::resolve_reference_image_size(500, 100, 2048, 32, 0, &oh, &ow));
+  EXPECT_FALSE(h3::resolve_reference_image_size(0, 100, 2048, 32, 0, &oh, &ow));
   std::printf("[minimax_h3_layout] reference image sizing matches the "
               "reference (no area cap, upscaling included)\n");
 }
@@ -1047,6 +1050,134 @@ TEST(minimax_h3_layout, reference_video_normalization)
   EXPECT_TRUE(of == 8);
   std::printf("[minimax_h3_layout] video normalization: rate, truncate and "
               "rescale compose in the reference's order\n");
+}
+
+// A video reference's canvas comes from a rule the config never sees, so
+// this pins BOTH answers: the released checkpoint's short edge, which
+// scales a small clip up, and the 0 that declines to.
+//
+// The upscale is not free anywhere. At 768 a 960x544 reference lands on
+// 1344x768 -- 1.98x the pixels, interpolated from the same information --
+// and those pixels are paid for twice, once in the VAE encode and again
+// in every denoise step, because the rows they become lead the DiT's
+// video buffer.
+TEST(minimax_h3_layout, reference_video_canvas_short_edge)
+{
+  const int n = 2, H = 64, W = 128;
+  std::vector<std::uint8_t> src((std::size_t)n * 3 * H * W, 0);
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    src[i] = (std::uint8_t)((i * 13) % 251);
+  }
+  std::vector<std::uint8_t> out;
+  int of = 0, oh = 0, ow = 0;
+
+  // The DEFAULT is unchanged: 768 takes a 64x128 clip to the biggest
+  // 2:1 canvas the area cap allows, an 11x upscale.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 24.0, 2, 32,
+                                            768, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 704 && ow == 1440);
+
+  // 0 means the clip's own short edge. 64x128 is already a whole number
+  // of 32s, so the canvas IS the source and the pixels come through
+  // untouched -- the parity-exact route, and the point of the option.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 24.0, 2, 32,
+                                            0, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 64 && ow == 128);
+  ASSERT_TRUE(out.size() == src.size());
+  EXPECT_TRUE(std::memcmp(out.data(), src.data(), src.size()) == 0);
+
+  // And 0 does not disable the area cap -- a source LARGER than the
+  // canvas is still brought under it. 800x1600 would resolve to itself;
+  // the cap takes it to 704x1408.
+  const int BH = 800, BW = 1600;
+  std::vector<std::uint8_t> big((std::size_t)3 * BH * BW, 17);
+  ASSERT_TRUE(h3::normalize_video_reference(big.data(), 1, BH, BW, 24.0, 1, 32,
+                                            0, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 704 && ow == 1408);
+  EXPECT_TRUE((std::int64_t)oh * ow <= 768LL * 1344);
+  EXPECT_TRUE(oh <= BH && ow <= BW);
+
+  // The floor is the whole point, and rounding to NEAREST would miss it:
+  // 1080 is 33.75 grid lines, whose nearest is 34 -- an upsample to 1088
+  // by the rule that exists to refuse one. Uncapped, so only the grid is
+  // acting here.
+  int fh = 0, fw = 0;
+  ASSERT_TRUE(h3::resolve_canvas_within(1080, 1920, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 1056 && fw == 1920);
+  // The one upward move it cannot refuse: under a single grid line there
+  // is nowhere else to go, because a latent the DiT patch does not
+  // divide is refused 50 layers later.
+  ASSERT_TRUE(h3::resolve_canvas_within(20, 40, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 32 && fw == 32);
+  // Aspect is a refusal, not a fit.
+  EXPECT_FALSE(h3::resolve_canvas_within(100, 500, 32, 0, &fh, &fw));
+  // The IMAGE path takes the same 0, which is what lets a caller that has
+  // already sized a picture -- a resample stage, a crop, a generated
+  // still -- have it encoded at that size instead of re-resolved against
+  // a per-kind default that would scale it back up.
+  int ih = 0, iw = 0;
+  ASSERT_TRUE(h3::resolve_reference_image_size(768, 768, 0, 32, 0, &ih, &iw));
+  EXPECT_TRUE(ih == 768 && iw == 768);
+  // Against the example's 1024, that same picture is scaled UP -- the
+  // behaviour a pre-sized caller is asking to be spared.
+  ASSERT_TRUE(h3::resolve_reference_image_size(768, 768, 1024, 32, 0, &ih,
+                                               &iw));
+  EXPECT_TRUE(ih == 1024 && iw == 1024);
+  // And the image path's new area cap binds when it is set.
+  ASSERT_TRUE(h3::resolve_reference_image_size(2160, 3840, 0, 32,
+                                               768LL * 1344, &ih, &iw));
+  EXPECT_TRUE((std::int64_t)ih * iw <= 768LL * 1344);
+  EXPECT_TRUE(ih <= 2160 && iw <= 3840);
+  std::printf("[minimax_h3_layout] video canvas: 768 -> 1440x704, 0 -> the "
+              "clip's own (floored), cap holds either way\n");
+}
+
+// The prepared resize against the one-shot, frame for frame.
+//
+// normalize_video_reference builds ONE PlanarResize for the clip and
+// runs every frame through it, straight into the destination; the
+// one-shot spelling rebuilds the coefficients, the intermediate and the
+// tap bounds per frame and stages through a scratch buffer. That is a
+// restructure of the same filter and the two must agree BYTE for byte --
+// "close enough" here is a reference conditioned on pixels the golden
+// never saw.
+TEST(minimax_h3_layout, prepared_resize_matches_the_one_shot)
+{
+  const int n = 4, H = 36, W = 64;
+  std::vector<std::uint8_t> src((std::size_t)n * 3 * H * W, 0);
+  for (int f = 0; f < n; ++f) {
+    for (std::size_t i = 0; i < (std::size_t)3 * H * W; ++i) {
+      src[(std::size_t)f * 3 * H * W + i] =
+          (std::uint8_t)((i * 7 + f * 61) % 251);
+    }
+  }
+  std::vector<std::uint8_t> out;
+  int of = 0, oh = 0, ow = 0;
+  // 12 fps, so every frame is held twice and the run-forward copy is
+  // exercised alongside the resize itself.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 12.0, 8, 32,
+                                            128, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  ASSERT_TRUE(of == 8);
+  const std::size_t plane = (std::size_t)3 * oh * ow;
+  ASSERT_TRUE(out.size() == (std::size_t)of * plane);
+
+  std::size_t diff = 0;
+  std::vector<std::uint8_t> one;
+  for (int o = 0; o < of; ++o) {
+    ASSERT_TRUE(h3::resize_lanczos_planar_rgb(
+        src.data() + (std::size_t)(o / 2) * 3 * H * W, H, W, oh, ow, &one));
+    ASSERT_TRUE(one.size() == plane);
+    for (std::size_t i = 0; i < plane; ++i) {
+      if (one[i] != out[(std::size_t)o * plane + i]) { ++diff; }
+    }
+  }
+  EXPECT_TRUE(diff == 0);
+  std::printf("[minimax_h3_layout] prepared vs one-shot resize: %zu of %zu "
+              "bytes differ\n", diff, (std::size_t)of * plane);
 }
 
 // The PIL-faithful LANCZOS resize, pixel for pixel.

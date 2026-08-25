@@ -81,18 +81,19 @@ public:
   GenerativeModelManager(const GenerativeModelManager&)            = delete;
   GenerativeModelManager& operator=(const GenerativeModelManager&) = delete;
 
-  // NOT defaulted: the removable pool has to go first.
+  // NOT defaulted: the weight sets have to go first.
   //
   // Members destruct in REVERSE declaration order, so `_weights` -- the
-  // WeightRegistry every set deregisters from -- dies before `_pool`.
-  // A defaulted destructor therefore has the pooled sets deregistering
-  // against a destroyed registry, which aborts on a lock of a dead mutex
-  // ("mutex lock failed: Invalid argument") AFTER the run has finished
-  // its work, at teardown, where it reads as a crash with no cause.
+  // WeightRegistry every set deregisters from -- dies before
+  // `_weight_sets`. A defaulted destructor therefore has the sets
+  // deregistering against a destroyed registry, which aborts on a lock
+  // of a dead mutex ("mutex lock failed: Invalid argument") AFTER the
+  // run has finished its work, at teardown, where it reads as a crash
+  // with no cause.
   //
-  // This was unreachable until the pool existed: `_weight_sets` holds
-  // WEAK references, so the manager owned no set and none of them
-  // outlived the models. Pooling is what made the manager an owner.
+  // This was unreachable while the map held WEAK references: the manager
+  // owned no set, and none of them outlived the models. Owning them is
+  // what made it reachable.
   //
   // Clearing here rather than reordering the members, because the order
   // that fixes it is not visibly load-bearing and the next person to
@@ -172,8 +173,13 @@ public:
   // The single place a checkpoint's weights are opened and cached. Ask
   // for a directory and get the ONE WeightSet for it; a second caller
   // naming the same directory gets the same object, so its weights are
-  // reference-counted rather than loaded again. The set is unmapped
-  // when the last holder drops it.
+  // loaded once and borrowed by everyone who names it.
+  //
+  // The MANAGER owns it. A caller holds a borrow, and dropping the last
+  // borrow does not unmap the checkpoint -- it hands the decision to
+  // release_unheld_(), which parks a recyclable set and drops one that
+  // is not. So two pipelines over one model share its bytes whether or
+  // not their lifetimes overlap.
   //
   // This is dedup at the TENSOR level, which is what makes it robust:
   // two models over one checkpoint share every tensor they have in
@@ -585,25 +591,68 @@ public:
   void        set_wired_pool_enforced(bool on);
   bool        wired_pool_enforced() const;
 
-  // ---- the REMOVABLE POOL, which outlives a launch ---------------------
+  // ---- letting go of a checkpoint --------------------------------------
   //
-  // A checkpoint a stage is finished with, kept alive and purgeable
-  // instead of dropped. Two things fall out of that:
+  // The manager owns every set it opened (see `_weight_sets`), so a
+  // stage that is finished has only to drop its own reference. What
+  // happens next is release_unheld_()'s to decide, and there are exactly
+  // two answers:
   //
-  //   * A RELAUNCH over the same model pays no reload. This is why the
-  //     pool is on the manager and not on the runtime -- a launch-scoped
-  //     pool could not do the one thing it exists for.
-  //   * Under pressure the pages go, because pooling marks them
-  //     purgeable. Nothing pooled is holding the box hostage; it is
-  //     spare capacity that happens to still be useful.
+  //   * RECYCLABLE -> kept and PARKED. A relaunch, or a second pipeline
+  //     over the same model, pays neither a reopen nor -- unless the box
+  //     actually took the pages -- a re-read. Nothing is holding the box
+  //     hostage either: parked pages are purgeable, so an unborrowed
+  //     checkpoint is spare capacity that happens to still be useful.
+  //   * NOT RECYCLABLE -> dropped. A set specialised to a run's
+  //     parameters would be silently wrong for a launch that does not
+  //     share them; see WeightSet::recyclable().
   //
-  // Only a RECYCLABLE set is pooled. A set specialised to a run's
-  // parameters would be silently wrong for a launch that does not share
-  // them, so it is dropped instead -- see WeightSet::recyclable().
+  // pool_weights() asks for that settling to happen NOW rather than at
+  // whatever unrelated moment reaches release_unheld_() next. It is safe
+  // in either order against the caller's own resets -- before, it finds
+  // the caller still borrowing and settles nothing; after, it settles
+  // immediately -- and it can no longer be the only thing standing
+  // between a checkpoint and oblivion, which is what it was when this
+  // map held weak references.
+  //
+  // NOTHING PARKS A BORROWED SET -- not this, not park_weights(), not
+  // the memory cap, not reclaim_at_least(). They all go through
+  // park_if_unborrowed_(), which is the only thing in this class that
+  // parks.
+  //
+  // The rule exists because a borrower holds ALIASES of the very buffers
+  // a park makes purgeable, and reads them in a forward pass that never
+  // asks the set for anything. Any access through the SET repairs every
+  // alias at once; a forward pass that reads one first is unordered with
+  // that, and if the kernel took the pages it reads zeros with nothing
+  // on its path to notice. The manager cannot tell a live model that is
+  // idle from one mid-forward, so it does not try.
+  //
+  // The cost is that the cap and reclaim_at_least() can only take what
+  // nobody is using, and they SAY so when they fall short rather than
+  // reporting the standing mapped-and-KV excuse. What returns borrowed
+  // bytes is a stage letting go -- an `unload_when_idle` policy, or the
+  // explicit free the image and video stages do before a large decode --
+  // not a smaller cap.
+  //
+  // The other way to close it would be a model registering as its own
+  // WeightOwner and reactivating at a forward boundary, which is the
+  // shape WeightOwner::note_parked() makes possible. That buys back
+  // reclaim from a loaded-but-idle model, at the price of a hook every
+  // model has to remember; the borrow rule needs nothing remembered.
   void        pool_weights(const std::string& dir,
                            const std::string& variant = std::string());
-  // Bytes the pool is holding. Reclaimable in full, so this is capacity
-  // rather than occupancy -- report it as such.
+  // Give a checkpoint's bytes BACK, rather than merely making them
+  // reclaimable. What `unload_when_idle: destroy` means, and the one
+  // thing release_unheld_() will not do for a recyclable set.
+  //
+  // Refuses a BORROWED set for the same reason parking does: a stage
+  // does not get to unmap a checkpoint a peer is reading. Returns the
+  // bytes actually dropped.
+  std::size_t drop_weights(const std::string& dir);
+
+  // Bytes of checkpoints NOBODY is borrowing -- reclaimable in full, so
+  // this is capacity rather than occupancy. Report it as such.
   std::size_t pooled_bytes() const;
   // Drop pooled sets until `want` bytes have been given back. Returns
   // what was actually freed.
@@ -655,7 +704,11 @@ public:
     std::size_t copied_bytes = 0;   // owned; parkable + reloadable
     std::size_t tensors      = 0;
     std::size_t parts        = 0;
-    long        holders      = 0;   // models keeping this set alive
+    long        holders      = 0;   // models BORROWING it; 0 = idle
+    // Handed to the kernel as purgeable. The main residency fact about
+    // a checkpoint, and the only one a caller cannot work out from the
+    // byte counts: a parked set still shows its full `bytes`.
+    bool        parked       = false;
   };
   std::vector<WeightUsage> weight_report() const;
 
@@ -707,14 +760,52 @@ private:
   std::size_t phase_footprint_(const std::string& phase,
                                bool use_floor) const;
 
+  // The BORROW RULE, and the only place in this class that parks.
+  // Declines a set anything is borrowing; see the definition for why
+  // `borrowers` is passed in rather than derived.
+  std::size_t park_if_unborrowed_(const std::shared_ptr<WeightSet>& ws,
+                                  long borrowers);
+
+  // Settle every checkpoint nobody is borrowing: PARK it if it is
+  // recyclable, DROP it if it is not. Returns the bytes parked.
+  //
+  // This is what replaces "dies with its last holder". A shared_ptr has
+  // no hook for "the count just fell", and polling for one would cost
+  // more than the sweep does, so it runs wherever the manager is already
+  // doing work -- an open, a release, a cap pass. The consequence worth
+  // knowing is that a checkpoint stays UNPARKED between the moment its
+  // last borrower lets go and the next such moment; pool_weights() is
+  // how a stage that has just finished asks for it to be settled now.
+  //
+  // Parks nothing that is still borrowed, which is the whole point: the
+  // manager cannot know a live model is idle, and a set parked under one
+  // hands its reader pages the kernel may discard.
+  std::size_t release_unheld_();
+
   mutable std::mutex                                          _shared_mu;
   std::unordered_map<std::string, std::weak_ptr<void>>        _shared;
   mutable std::mutex                                          _ws_mu;
-  std::unordered_map<std::string, std::weak_ptr<WeightSet>>   _weight_sets;
-  // The removable pool: a STRONG reference, which is the whole
-  // difference -- it is what keeps a set alive once its last model has
-  // gone, and what lets the next launch find it.
-  std::unordered_map<std::string, std::shared_ptr<WeightSet>>  _pool;
+  // THE MANAGER OWNS EVERY CHECKPOINT IT OPENED -- a STRONG reference,
+  // and the single fact the rest of this file's residency policy rests
+  // on. A stage that loads a model borrows from here; a stage that is
+  // finished lets go of its borrow. Neither can take a checkpoint away
+  // from a peer, and neither has to re-read one a peer already paid for.
+  //
+  // It used to be weak, which made the FIRST stage to load the owner and
+  // the last to let go the undertaker. Sharing then worked only for
+  // OVERLAPPING lifetimes: a second pipeline over the same model, opened
+  // one second after the first ended, re-read the whole checkpoint from
+  // disk. The removable pool was a strong reference bolted alongside to
+  // recover that one case, entered only when a stage explicitly handed a
+  // set over; it is gone, because this map now is it.
+  //
+  // What replaces "dies with its last holder" is release_unheld_():
+  // a set nothing borrows is PARKED (kept, purgeable, reactivated on the
+  // next read) if it is recyclable, and DROPPED if it is not. So the
+  // bytes are still reclaimable -- by the kernel, or by evict_unheld_()
+  // under an explicit ask -- but they are reclaimable on the manager's
+  // terms rather than on whichever stage happened to finish last.
+  std::unordered_map<std::string, std::shared_ptr<WeightSet>> _weight_sets;
   // canonical dir -> estimated bytes; see declare_weights().
   std::unordered_map<std::string, std::size_t>                _declared;
   // canonical dir -> the floor it can be reduced to, when it has one.

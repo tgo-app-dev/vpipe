@@ -3,6 +3,7 @@
 
 #include "interfaces/ui-view-intf.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -181,6 +182,14 @@ public:
     std::uint64_t total = 0;    // 0 => INDETERMINATE (no percentage known)
     std::string   detail;       // optional right-hand text ("1.2 / 3.0 GB")
     std::uint64_t seq   = 0;    // bumped per update -- highest = most recent
+    // When open() was called, so a renderer can show ELAPSED time.
+    //
+    // The INSTANT rather than a running duration: nothing updates an
+    // entry between its own update() calls, so a stored duration would
+    // freeze exactly when a report stalls -- which is when a moving
+    // clock is the only thing telling the user the UI is still alive.
+    // Steady, not system, since it is only ever read as a difference.
+    std::chrono::steady_clock::time_point started{};
   };
 
   // Returns the id to pass to update()/close(). Never 0.

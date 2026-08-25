@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_VIDEO_REF_ENCODER_STAGE_H
 #define VPIPE_STAGES_VIDEO_REF_ENCODER_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -71,16 +72,36 @@ namespace vpipe {
 //                        the encoder / DiT / vae stages of a graph
 //                        share one model. When wired, the load is
 //                        DEFERRED to the first process().
+//   iport2  ref1         OPTIONAL TensorBeatPayload reference media,
+//   ...                  ONE BEAT PER REFERENCE, numbered after the
+//   iport7  ref6         `references` list. Kind from the tensor's
+//                        RANK -- [N] or [channels, N] f32 audio,
+//                        [3, H, W] u8 picture, [frames, 3, H, W] u8
+//                        clip -- and the rates from the sideband
+//                        (`fps`, `sr`), which are REQUIRED and never
+//                        defaulted. Optional sideband: `short_edge`
+//                        for this one reference, `attach` to override
+//                        the stage's `attach_audio` for this beat. A
+//                        WIRED port beats every request; an empty
+//                        tensor is how it says "nothing this time".
 //
-// THE REFERENCES ARE CONFIG, not a port. They are files to open, which
-// is what a `references` config key is and what the composer's file
-// browser fills in -- it multi-selects straight into the list. The list
-// arrived as a beat first, and as a JSON STRING at that (no stage in
-// this tree emits a structured FlexData literal, so it had to be
+// THE FILE REFERENCES ARE CONFIG, not a port. They are files to open,
+// which is what a `references` config key is and what the composer's
+// file browser fills in -- it multi-selects straight into the list. The
+// list arrived as a beat first, and as a JSON STRING at that (no stage
+// in this tree emits a structured FlexData literal, so it had to be
 // authored as text somewhere and parsed here); that made the one input
 // a user actually edits the one input they could not pick with a file
 // dialog, and made a typo in a quoted path a runtime warning instead of
 // something the browser could not produce.
+//
+// The tensor iports are the OTHER half of that argument rather than a
+// reversal of it: a path cannot name a still that does not exist yet, a
+// crop, or a clip that was never written to disk, and those are exactly
+// the references a graph produces rather than picks. Six of them,
+// because the request's shape has to be static for the numbering to be
+// -- a port that could fall silent would renumber every reference after
+// it, and the numbering IS the request.
 //
 //   oport0  conditioning TensorBeatPayload bf16 [n_tokens, 5120] -- the
 //                        Qwen3-VL-32B layer-50 tap over the whole
@@ -144,6 +165,50 @@ namespace vpipe {
 //                              reference's short edge is scaled to. It
 //                              has NO area cap and never binds the
 //                              generated canvas.
+//   reference_video_short_edge (int, default 768) -- what a video
+//                              reference's short edge is scaled to,
+//                              under the area cap below. 0 means the
+//                              CLIP'S OWN, which is how a graph declines
+//                              an upscale: at 768 a 960x544 reference
+//                              lands on 1344x768, 1.98x the pixels
+//                              interpolated from the same information.
+//                              It is charged for three times, not twice
+//                              -- the VAE encode, the reference rows the
+//                              DiT attends to on every step, AND the
+//                              conditioner, because the vision tower is
+//                              handed these same pixels and so gets
+//                              fewer tokens for the clip. MEASURED on
+//                              the two-reference example, 768 -> 0:
+//                              13120 -> 7144 reference rows and
+//                              3115 -> 2119 conditioning rows. Both are
+//                              fidelity channels; compare, do not assume.
+//   attach_audio     (array of int) -- reference iport numbers (1..6)
+//                              whose AUDIO is the soundtrack of the
+//                              reference before it rather than a
+//                              reference of its own. POSITIONAL: it
+//                              folds onto whichever reference precedes
+//                              it, which may be one from the
+//                              `references` LIST, since files are read
+//                              first. A list and not a switch, because
+//                              a request may carry both an attached
+//                              soundtrack and a standalone piece of
+//                              music. A beat's own `attach` sideband
+//                              overrides it either way.
+//   reference_image_max_pixels (int, default 0 = UNCAPPED) -- an area
+//                              cap for image references. Uncapped is the
+//                              released checkpoint's rule, where
+//                              reference_image_short_edge is the only
+//                              bound -- which it stops being the moment
+//                              a short edge of 0 takes a picture at the
+//                              size it arrived. A graph feeding raw
+//                              pictures through the reference iports
+//                              wants this set: an uncapped 4K still is
+//                              ~220 VAE tiles and 8160 DiT rows.
+//   reference_video_max_pixels (int, default 768*1344) -- the area cap
+//                              that canvas is held under. Applied after
+//                              the short edge, so it is what binds a
+//                              reference LARGER than the canvas whatever
+//                              the short edge says.
 //   video_sample_fps (real, default 2.0) -- the rate the CONDITIONER
 //                              reads a video reference at. Not the rate
 //                              the VAE encodes it at, which is 24.
@@ -157,6 +222,20 @@ namespace vpipe {
 //                              a token), which is why it is a knob and
 //                              not a global default.
 //   unload_when_idle (string) -- auto|always|never
+//
+// Six TENSOR reference iports (2..7) sit after prompt and model, for the
+// references a file list cannot name: a generated still, a cropped
+// frame, a clip that was never written to disk. One beat per reference,
+// numbered after the `references` list, kind taken from the tensor's
+// RANK and rates from its sideband. A wired port must beat every
+// request -- an empty tensor says "nothing this time" -- because a port
+// that could fall silent would renumber every reference after it, and
+// the numbering IS the request. See kRefPortDoc in the .cc.
+//
+// Their default short edge is 0: encode the picture at the size it
+// arrived. A caller reaching for a port has already decided the size,
+// and re-resolving it against a per-kind default would undo exactly
+// that decision.
 class VideoRefEncoderStage final : public TypedStage<VideoRefEncoderStage> {
 public:
   static constexpr const char* kTypeName = "video-ref-encoder";
@@ -189,6 +268,19 @@ public:
   const std::string& hf_dir() const noexcept { return _hf_dir; }
   std::uint64_t requests_encoded() const noexcept { return _emitted; }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // One reference iport beat -> a MediaReference: kind from the tensor's
+  // RANK, rates from the sideband. Public and static because it is the
+  // part of the port contract that fails SILENTLY when it is wrong -- a
+  // clip taken for a still, a soundtrack read at the wrong rate -- and
+  // that deserves a test that does not need a model or a runtime. `n` is
+  // the 1-based port number, for the message only. False with a reason
+  // in `err`.
+  static bool
+  media_from_beat(const TensorBeatPayload& tb, int n,
+                  genai::minimax_h3::MediaReference* out, std::string* err);
+#endif
+
 private:
   std::string   _hf_dir;
   std::string   _enc_dir;
@@ -198,6 +290,15 @@ private:
   std::vector<std::string> _references;
   int           _frames = 121;
   int           _ref_short_edge = 2048;
+  // The video-reference canvas. 0 short edge = the clip's own, which is
+  // how a graph declines an upscale (see normalize_video_reference).
+  int           _vid_short_edge = 768;
+  int           _vid_max_pixels = 768 * 1344;
+  // 0 = uncapped, the released checkpoint's image rule.
+  int           _img_max_pixels = 0;
+  // Reference iport numbers (1-based) whose audio is the SOUNDTRACK of
+  // the reference before it. A beat's own `attach` sideband overrides.
+  std::vector<int> _attach_audio;
   double        _video_sample_fps = 2.0;
   int           _max_prompt_tokens = 16384;
   std::uint64_t _emitted = 0;
@@ -235,6 +336,10 @@ private:
   // failed one.
   bool decode_references_(
       std::vector<genai::minimax_h3::MediaReference>* out);
+
+  // Warn about every reference the encoder had to reshape, and log the
+  // ones it took as given. See the definition for why this is WARN.
+  void report_fits_(const genai::minimax_h3::EncodedReferences& enc);
 
   // ---- idle unload -------------------------------------------------
   // The conditioner is the largest resident block in a `ref2va` graph

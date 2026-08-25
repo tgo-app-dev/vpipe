@@ -20,6 +20,16 @@
 // silent. This class applies that across models and adds the policy:
 // who is parked, when, and what happens on the way back.
 //
+// WHO DECIDES. This class parks whatever it is handed and asks no
+// questions -- the caller owns the judgement. There is one caller,
+// GenerativeModelManager::park_if_unborrowed_(), and one rule: a
+// checkpoint anything is still BORROWING is never parked, because the
+// borrower reads aliases of these very buffers in a forward pass that
+// never asks the set for anything and so never reactivates them. An
+// owner that wants to be reclaimable while it is loaded has to say so
+// itself, through a hook it calls at a forward boundary; none does
+// today, and until one does, "idle" means "nobody is holding it".
+//
 // Registration, not ownership. A model keeps owning its buffers and
 // implements for_each_weight(); the registry stores no buffer pointers
 // and calls the enumerator each time instead, so nothing dangles when a
@@ -30,7 +40,7 @@
 //     file-backed pages already evict and re-fault under pressure --
 //     the OS does this better than we can, for free. mark_inactive()
 //     declines them anyway (they are subviews of a shard wrap).
-//   * per-model block streaming (shared/stream-pin.h). Its pinned
+//   * per-model block streaming (shared/stream-sizing.h). Its pinned
 //     prefix is greedy over per-block byte sizes in stream order, which
 //     needs the model's own layout knowledge; the registry has none.
 
@@ -93,6 +103,30 @@ public:
   // or one that reloads atomically, needs nothing here.
   virtual void begin_restore() {}
   virtual void end_restore(bool ok) { (void)ok; }
+
+  // The registry has just handed this owner's pages to the kernel
+  // (`parked` true) or taken them back (false).
+  //
+  // WHY THIS IS A HOOK AND NOT THE CALLER'S JOB. The kernel's purgeable
+  // state and the owner's record of it are two halves of one fact, and
+  // an owner that reactivates itself on next use keys that off its own
+  // half. Set only the first and the pages are volatile with nothing
+  // left that will ever take them back: the next reader is handed
+  // buffers the kernel may have emptied and gets ZEROS, silently,
+  // because the warning for exactly that case keys off the flag that
+  // was never set.
+  //
+  // MEASURED: three of the four call sites that parked a WeightSet
+  // remembered to set it and the fourth -- the removable pool -- did
+  // not, so any checkpoint that had been pooled once served emptied
+  // buffers from that point on. Driving both halves from park() and
+  // reactivate() removes the opportunity to set one without the other.
+  //
+  // Called with the registry's lock HELD, so that the two halves flip
+  // together: do not re-enter the registry from here, and keep it to
+  // bookkeeping. Default no-op -- an owner with no reactivate-on-use
+  // path of its own needs nothing.
+  virtual void note_parked(bool parked) { (void)parked; }
 
   // Short name for logs ("krea2 DiT /path/to/transformer").
   virtual std::string weight_label() const { return {}; }

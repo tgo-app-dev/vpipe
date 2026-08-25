@@ -147,13 +147,23 @@ function makeEtaTracker() {
   };
 }
 
-function formatEta(sec) {
+// Shared by the remaining-time and elapsed texts, so the two ends of a
+// sub-row are never in different units.
+function formatDur(sec) {
   if (sec === null || !isFinite(sec) || sec < 0) { return null; }
   const s = Math.round(sec);
   if (s < 60) { return `${s}s`; }
   const m = Math.floor(s / 60);
   if (m < 60) { return `${m}m ${String(s % 60).padStart(2, '0')}s`; }
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+// Seconds since the report was OPENED, as the backend measured it.
+// Absent (an older backend) reads as "no figure" rather than as zero.
+function elapsedOf(item) {
+  const ms = item ? item.elapsed_ms : null;
+  if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) { return null; }
+  return ms / 1000;
 }
 
 function makeProgressPanel() {
@@ -189,14 +199,23 @@ function makeProgressPanel() {
                        p === null ? '—' : `${p}%`);
         const head = el('div', { class: 'sb-prog-head' }, name, val);
         const rows = [head, track];
-        // Detail on the left, remaining-time on the right of one line --
-        // both are secondary to the bar, so they share a row instead of
-        // pushing every item taller.
-        const left = it.detail || '';
-        const right = eta ? (formatEta(eta.seconds(it)) || '') : '';
-        if (left || right) {
+        // One secondary line under the bar, reading left to right as
+        // time spent, what is happening, time left. All three are
+        // secondary to the bar, so they share a row instead of pushing
+        // every item taller.
+        //
+        // The two clocks are pinned to the edges and the detail takes
+        // (and ellipsizes into) whatever is between them: a long detail
+        // must not be what pushes the remaining-time text off the row.
+        const spent = formatDur(elapsedOf(it));
+        const mid = it.detail || '';
+        const right = eta ? (formatDur(eta.seconds(it)) || '') : '';
+        if (spent || mid || right) {
           rows.push(el('div', { class: 'sb-prog-sub' },
-                       el('span', { class: 'sb-prog-detail' }, left),
+                       el('span', { class: 'sb-prog-elapsed' },
+                          spent ? t('status.elapsed').replace('{t}', spent)
+                                : ''),
+                       el('span', { class: 'sb-prog-detail' }, mid),
                        el('span', { class: 'sb-prog-eta' },
                           right ? t('status.eta_left').replace('{t}', right)
                                 : '')));
@@ -297,7 +316,7 @@ export function mountStatusBar(container) {
                    p === null ? null : p / 100);
       // The meter is 140px, so the ETA rides in the tooltip rather than
       // crowding the value out of the cell; the panel shows it inline.
-      const left = formatEta(eta.seconds(cur));
+      const left = formatDur(eta.seconds(cur));
       if (left) {
         progCell.root.setAttribute(
             'title', t('status.eta_left').replace('{t}', left));

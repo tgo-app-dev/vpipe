@@ -10,6 +10,9 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "common/encoded-segment.h"
+#include "stages/audio-video/video-to-rgb-stage.h"
+#include "stages/audio-video/temporal-stack-stage.h"
 #include "stages/load-video-stage.h"
 #include "stages/save-video-stage.h"
 #include "stages/audio-video/video-tokens.h"
@@ -171,6 +174,44 @@ private:
 };
 
 // Counts the FrameRefs a decoder hands out, ignoring the stream header.
+// Counts what load-video emits. It emits ENCODED PACKETS now, not
+// decoded FrameRefs -- for this fixture (H.264, one access unit per
+// picture) the two counts are the same number, and the thing being
+// guarded is the demuxer's, not the decoder's: a track whose edit list
+// is written to a short duration hands back N-1 packets for N frames.
+// Counts planar RGB tensors, and remembers the geometry of the last.
+class RgbCounter : public TypedStage<RgbCounter> {
+public:
+  static constexpr const char* kTypeName = "ut-rgb-counter";
+  using TypedStage::TypedStage;
+
+  unsigned frames = 0, groups = 0;
+  std::int64_t stacked = 0, w = 0, h = 0;
+
+  void reset_run_state() override
+  {
+    frames = 0; groups = 0; stacked = 0; w = 0; h = 0;
+  }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    auto t = co_await ctx.read(0);
+    if (!t) { ctx.signal_done(); co_return; }
+    if (const auto* tb = dynamic_cast<const TensorBeatPayload*>(t.get())) {
+      ++frames;
+      if (tb->shape.size() == 3) {
+        h = tb->shape[1];
+        w = tb->shape[2];
+      } else if (tb->shape.size() == 4) {
+        ++groups;
+        stacked = tb->shape[0];
+        h = tb->shape[2];
+        w = tb->shape[3];
+      }
+    }
+  }
+};
+
 class FrameCounter : public TypedStage<FrameCounter> {
 public:
   static constexpr const char* kTypeName = "ut-frame-counter";
@@ -184,7 +225,7 @@ public:
   {
     auto t = co_await ctx.read(0);
     if (!t) { ctx.signal_done(); co_return; }
-    if (dynamic_cast<const FrameRefPayload*>(t.get()) != nullptr) {
+    if (dynamic_cast<const EncodedSegmentPayload*>(t.get()) != nullptr) {
       ++frames;
     }
   }
@@ -404,9 +445,106 @@ TEST(video_stages, encoder_keeps_every_frame) {
   if (got != kFrames) {
     // cerr is silenced above; the COUNT is the whole diagnosis, since
     // "one short" and "nothing at all" are entirely different bugs.
-    cout << "decoded " << got << " frames, expected " << kFrames << "\n";
+    cout << "demuxed " << got << " packets, expected " << kFrames << "\n";
   }
   EXPECT_TRUE(got == kFrames);
+  remove(out_path.c_str());
+}
+
+// The chain the payload change exists for: a FILE reaching the tensor
+// world.
+//
+// load-video used to decode and emit FrameRefs, and the only consumer of
+// those in the tree is save-video -- so no file could reach video-to-rgb,
+// image-resample, temporal-decimation or anything else that works in
+// tensors, and the whole rgb-frames half of the graph was reachable only
+// from a live camera. Emitting rtsp-capture's EncodedSegments instead
+// makes the file and the camera the same input.
+//
+// The count is still the assertion: 33 frames in, 33 planar u8 RGB
+// tensors out, through a decoder this stage no longer owns.
+TEST(video_stages, a_file_reaches_the_tensor_chain) {
+  Session sess;
+  CerrSilencer hush;
+
+  const unsigned kFrames = 33;
+  const string out_path = tmp_path_("chain-src", ".mp4");
+  remove(out_path.c_str());
+  {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SynthVideoSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = kFrames;
+    src_u->fps = AVRational{16, 1};
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SynthVideoSource*>(
+      pl->insert_stage(std::move(src_u)));
+    FlexData enc_cfg = FlexData::make_object();
+    enc_cfg.as_object().insert("output_url", FlexData::make_string(out_path));
+    enc_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto enc_u = make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+    pl->insert_stage(std::move(enc_u));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(file_size_or_zero_(out_path) > 0);
+
+  unsigned tensors = 0;
+  std::int64_t stacked = 0, w = 0, h = 0;
+  {
+    auto pl = make_unique<Pipeline>("p2", &sess);
+    FlexData lv_cfg = FlexData::make_object();
+    lv_cfg.as_object().insert("input_url", FlexData::make_string(out_path));
+    lv_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto lv_u = make_unique<LoadVideoStage>(
+      &sess, "lv", vector<InEdge>{}, std::move(lv_cfg));
+    lv_u->allocate_oports(1);
+    auto* lv = static_cast<LoadVideoStage*>(pl->insert_stage(std::move(lv_u)));
+
+    FlexData vr_cfg = FlexData::make_object();
+    vr_cfg.as_object().insert("output_dtype", FlexData::make_string("u8"));
+    auto vr_u = make_unique<VideoToRgbStage>(
+      &sess, "vr", vector<InEdge>{{lv, 0}}, std::move(vr_cfg));
+    auto* vr = static_cast<VideoToRgbStage*>(pl->insert_stage(std::move(vr_u)));
+
+    // Through temporal-stack, because that is where the storage class
+    // bites: video-to-rgb's metal fast path emits SHARED (Metal-buffer)
+    // beats, whose `data` vector is empty and whose bytes live in the
+    // external handle. A consumer that reads `data` sees every frame as
+    // an empty tensor and silently stacks nothing -- which is what this
+    // chain did the first time it ran.
+    FlexData ts_cfg = FlexData::make_object();
+    ts_cfg.as_object().insert("mode", FlexData::make_string("video"));
+    auto ts_u = make_unique<TemporalStackStage>(
+      &sess, "ts", vector<InEdge>{{vr, 0}}, std::move(ts_cfg));
+    auto* ts = static_cast<TemporalStackStage*>(
+      pl->insert_stage(std::move(ts_u)));
+
+    auto cnt_u = make_unique<RgbCounter>(
+      &sess, "cnt", vector<InEdge>{{ts, 0}}, FlexData::make_object());
+    auto* cnt = static_cast<RgbCounter*>(pl->insert_stage(std::move(cnt_u)));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    // A REFUSED LAUNCH is the failure to watch for: the edge is checked
+    // by payload type AND tag, so the old FrameRef contract would fail
+    // here rather than at the first beat.
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    tensors = cnt->groups;
+    stacked = cnt->stacked;
+    w = cnt->w;
+    h = cnt->h;
+  }
+  cout << "load-video -> video-to-rgb -> temporal-stack: " << tensors
+       << " group(s) of " << stacked << " frame(s) " << w << "x" << h
+       << ", expected 1 of " << kFrames << "\n";
+  EXPECT_TRUE(tensors == 1);
+  EXPECT_TRUE(stacked == kFrames);
+  EXPECT_TRUE(w > 0 && h > 0);
   remove(out_path.c_str());
 }
 

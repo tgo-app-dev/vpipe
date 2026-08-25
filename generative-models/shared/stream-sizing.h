@@ -1,5 +1,5 @@
-#ifndef GENERATIVE_MODELS_SHARED_STREAM_PIN_H
-#define GENERATIVE_MODELS_SHARED_STREAM_PIN_H
+#ifndef GENERATIVE_MODELS_SHARED_STREAM_SIZING_H
+#define GENERATIVE_MODELS_SHARED_STREAM_SIZING_H
 
 #include "generative-models/llama3/metal-llama-weights.h"
 
@@ -9,18 +9,49 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
-// Pinned-prefix streaming policy, shared by the diffusion DiTs (Krea-2, FLUX.2,
-// Qwen-Image-Edit). In stream_blocks mode a DiT re-reads every block from the
-// retained mmap on each forward -- ~one block resident, but the whole weight set
-// is re-touched per pass. When there is spare RAM (but not enough to preload the
-// whole DiT), pinning a LEADING prefix of blocks resident cuts that re-read
-// proportionally: pinned blocks are read once and reused, only the tail streams.
+// Two questions a model has to answer from the CHECKPOINT, before it has
+// loaded anything: how little can it hold, and -- if it has no residency
+// policy -- how much should it pin.
+//
+// They share a file because they share the pass: both walk the tensor
+// table once, bucket every tensor by block prefix, and are then a sum or
+// a greedy scan over the result. Nothing else here is common to them.
+//
+//   stream_floor_bytes()   THE FLOOR: trunk + one block, the least a
+//                          streaming model can run on. Every streaming
+//                          model wants this, DiTs included -- MiniMax-H3
+//                          calls it directly and model_memory::
+//                          streaming_floor_bytes() is the wrapper stages
+//                          and plug-ins go through.
+//
+//   stream_pin_count()     THE PINNED PREFIX, and this half is LANGUAGE
+//                          MODELS ONLY. No DiT uses it: a prefix sized
+//                          before the run from a fraction of total RAM
+//                          cannot sense the machine it lands on, so
+//                          every block-streaming image and video DiT
+//                          replaced it with shared/block-residency.h,
+//                          which grows a resident set by MEASURING and
+//                          sheds when it finds its own pages outside
+//                          RAM. metal-qwen-model and metal-gemma-model
+//                          keep it because they have nothing to grow
+//                          into. Give them BlockResidency and this half
+//                          goes.
+//
+// ---- the pinned prefix ------------------------------------------------
+//
+// In stream_blocks mode a model re-reads every block from the checkpoint
+// on each forward -- ~one block resident, but the whole weight set is
+// re-touched per pass. When there is spare RAM (but not enough to
+// preload the whole model), pinning a LEADING prefix cuts that re-read
+// proportionally: pinned blocks are read once and reused, only the tail
+// streams.
 //
 // `stream_pin_count` sizes the prefix so that pinned + running stays within a
 // fraction (e.g. 0.60) of physical RAM. It is greedy over the ACTUAL per-block
-// byte sizes, so heterogeneous stacks (FLUX.2's big double blocks + smaller
+// byte sizes, so heterogeneous stacks (a DiT's big double blocks + smaller
 // single blocks) pin correctly by memory, not by a uniform count.
 //
 // WHAT ELSE THE MODEL HOLDS is two terms, and neither used to be counted.
@@ -106,6 +137,63 @@ stream_floor_bytes(const MetalLlamaWeights& wts, std::string_view stem,
   return trunk + 2 * widest;
 }
 
+// THE MULTI-STACK FORM, for a model whose blocks come in more than one
+// kind -- an image DiT's dual-stream and single-stream stacks, which it
+// streams BOTH of and keeps a slot pair for EACH.
+//
+// Measuring such a model against one stem and letting the other stack
+// fall into the trunk is safe in the sense that it over-states, and
+// useless in practice: MEASURED on a 17316 MB two-stack DiT, one stem
+// gives 12324 MB against a true 2848 -- a floor so close to the whole
+// checkpoint that declaring it says almost nothing.
+//
+// Stems are tried IN ORDER and the first prefix match wins, so a list
+// holding one stem that is a prefix of another must put the longer
+// first. The stems in use do not overlap ("blocks." does not match
+// "transformer_blocks.0.x", which starts with 't'), but a new one might.
+inline std::size_t
+stream_floor_bytes(const MetalLlamaWeights& wts,
+                   const std::vector<std::string_view>& stems,
+                   std::string_view exclude = {})
+{
+  if (stems.empty()) { return 0; }
+  if (stems.size() == 1) { return stream_floor_bytes(wts, stems[0], exclude); }
+  std::size_t trunk = 0;
+  std::vector<std::vector<std::size_t>> stacks(stems.size());
+  for (const std::string& nm : wts.tensor_names()) {
+    const auto* ti = wts.info(nm);
+    const std::size_t nb = ti != nullptr ? (std::size_t)ti->nbytes : 0;
+    std::size_t si = stems.size();
+    for (std::size_t i = 0; i < stems.size(); ++i) {
+      if (nm.rfind(std::string(stems[i]), 0) == 0) { si = i; break; }
+    }
+    if (si == stems.size()) { trunk += nb; continue; }
+    if (!exclude.empty() &&
+        nm.find(std::string(exclude)) != std::string::npos) {
+      continue;
+    }
+    const std::size_t i0 = stems[si].size();
+    const std::size_t dot = nm.find('.', i0);
+    if (dot == std::string::npos) { trunk += nb; continue; }
+    const std::size_t idx =
+        (std::size_t)std::atol(nm.substr(i0, dot - i0).c_str());
+    std::vector<std::size_t>& blocks = stacks[si];
+    if (blocks.size() <= idx) { blocks.resize(idx + 1, 0); }
+    blocks[idx] += nb;
+  }
+  std::size_t slots = 0;
+  for (const std::vector<std::size_t>& blocks : stacks) {
+    std::size_t widest = 0;
+    for (std::size_t b : blocks) { if (b > widest) { widest = b; } }
+    slots += 2 * widest;      // a pair per stack, both alive for the run
+  }
+  // Nothing matched any stem: nothing streams, and the floor is the
+  // whole thing. Reporting the trunk alone would promise a reduction
+  // that cannot happen.
+  if (slots == 0) { return 0; }
+  return trunk + slots;
+}
+
 // Given the streamed blocks' prefixes IN STREAM ORDER (each ending in the
 // separator '.', so "transformer_blocks.1." does not also match block 10) and a
 // budget FRACTION of physical RAM (e.g. 0.60 => "pinned + running <= 60% of
@@ -162,4 +250,4 @@ inline int stream_pin_count(const MetalLlamaWeights& wts,
 }  // namespace genai
 }  // namespace vpipe
 
-#endif  // GENERATIVE_MODELS_SHARED_STREAM_PIN_H
+#endif  // GENERATIVE_MODELS_SHARED_STREAM_SIZING_H

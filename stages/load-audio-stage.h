@@ -28,12 +28,17 @@ namespace vpipe {
 //
 // ---- WHY IT DEMUXES AND DOES NOT DECODE ----
 //
-// `load-video` decodes, because a video graph wants frames. This one
-// stops at packets on purpose: `audio-to-pcm` already owns the decode,
-// the resample to a configured rate and the accumulation into
-// chunk-sized beats, and it is the stage every PCM consumer in the tree
-// is written against. Decoding here would either duplicate that or
-// produce a second, subtly different PCM contract.
+// `audio-to-pcm` already owns the decode, the resample to a configured
+// rate and the accumulation into chunk-sized beats, and it is the stage
+// every PCM consumer in the tree is written against. Decoding here would
+// either duplicate that or produce a second, subtly different PCM
+// contract.
+//
+// `load-video` stops at packets for the same reason, and it did not
+// always: it decoded to FrameRefs, which no tensor-side stage could
+// read. Both file sources now publish rtsp-capture's EncodedSegments, so
+// a file and a camera are interchangeable inputs and the decode lives in
+// one place per modality.
 //
 // It is also why the beat granularity is ONE PACKET rather than one
 // file: audio-to-pcm feeds `seg.data` to the decoder as a single

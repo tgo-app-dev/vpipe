@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -136,9 +138,6 @@ class MetalQwenImageTransformer {
     _block_progress = std::move(fn);
   }
 
-  // Leading blocks pinned resident in streaming mode (0 = pure streaming, or
-  // preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned; }
 
   // ---- the resident set, grown by measuring -----------------------------
   //
@@ -152,6 +151,12 @@ class MetalQwenImageTransformer {
   // ram decided before the run and therefore blind to the machine it
   // lands on.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   // Give back at least `bytes` of resident blocks, for a peer that needs
@@ -262,6 +267,25 @@ class MetalQwenImageTransformer {
   // Used both to preload and, in streaming mode, per-block inside forward().
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
 
+  // ---- the streamed block's reusable destinations --------------------
+  //
+  // See shared/block-slots.h. The four callbacks below are everything
+  // that class cannot know about this model's blocks.
+  //
+  // NOTE the three tensor lists this model now carries -- block_bytes_,
+  // wire_block_ and each_block_tensor_ -- must agree about what a block
+  // is made of. They are checked against each other by the streaming
+  // equality test rather than by the type system.
+  void each_block_tensor_(
+      int L, Block& b,
+      const BlockSlots<Block>::TensorFn& fn) const;
+  bool clone_block_(const Block& src, Block& dst, bool copy) const;
+  metal_compute::SharedBuffer rebuild_one_(
+      const std::string& nm, Placement how);
+  void configure_slots_();
+
+  BlockSlots<Block> _slots;
+
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t block_bytes_(const Block& b);
   // How much of the RESIDENT set is still in RAM. Sampled inside each
@@ -272,7 +296,7 @@ class MetalQwenImageTransformer {
   // Drop the LAST resident block, returning its bytes. Evicting from the
   // tail keeps what remains a contiguous prefix, which for a cyclic scan
   // is as good as any other choice and keeps the bookkeeping trivial.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  std::size_t evict_tail_block_();
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -288,11 +312,29 @@ class MetalQwenImageTransformer {
   std::vector<Block> _blocks;                            // empty when streaming
 
   // Streaming mode (stream_blocks): _blocks holds only the pinned prefix
-  // (_pinned blocks, possibly 0); blocks L >= _pinned are loaded from the
+  // nothing at load; every block not yet promoted is loaded from the
   // retained source mmap on demand in forward() and freed after use.
   bool _stream_blocks = false;
-  int _pinned = 0;                  // pinned leading blocks (streaming only)
   BlockResidency _resid;
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::size_t wire_block_(Block& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
   // The checkpoint, held for this model's whole life -- it is where the
   // streamed blocks are read from, so streaming is the manager's
   // business rather than a private mmap this class kept to itself.

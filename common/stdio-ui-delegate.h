@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -92,9 +94,17 @@ public:
   // wakes at kRepaintMs, compares progress_version(), and repaints only
   // when something actually moved. It starts on the first report and
   // exits once the last one closes, so a session that never reports
-  // progress never spawns it -- and off a tty it is never started at
-  // all, since there is nothing to pin a footer to.
+  // progress never spawns it.
   static constexpr int kRepaintMs = 100;
+
+  // OFF A TTY there is nothing to pin a footer to, but silence is not
+  // the right answer either: a redirected stdout -- a log file, or an
+  // agent reading our pipe -- then shows nothing whatsoever between the
+  // line before a long generation and the line after it, which reads as
+  // a hang. The same reports are emitted there as plain lines instead,
+  // one per ~10% of a report's span, so the destination gains bounded,
+  // greppable evidence of progress rather than a repaint stream.
+  static constexpr int kMilestonePct = 10;
 
 protected:
   void on_progress_opened() override;
@@ -105,6 +115,25 @@ private:
 
   // Format `[tag] msg\n` and write to stderr (to_err) or stdout.
   void emit_(const char* tag, bool to_err, const VpipeFormat&);
+
+  // Off a tty, what has already been said about one report: the last
+  // ~10% milestone announced, and the last state seen -- which is all
+  // there is left to report with once the id disappears, since a
+  // closed report is gone from the registry entirely.
+  struct Announced {
+    int           bucket = -1;
+    std::string   desc;
+    std::uint64_t done  = 0;
+    std::uint64_t total = 0;
+  };
+
+  // The non-tty half of the progress thread: emit a line for every live
+  // report that has crossed into a new ~10% milestone since the last
+  // call, and a closing line for every id that has gone away without
+  // reaching 100%. `seen` is the per-id state above, pruned as reports
+  // close.
+  void emit_milestones_(const std::vector<UiProgressRegistry::Item>& items,
+                        std::map<std::uint64_t, Announced>& seen);
 
   // Shared body of getline()/getpasswd(): prints the prompt, masks
   // SIGINT/SIGTERM/SIGHUP, poll()s stdin with cancel re-checks, then
@@ -124,6 +153,15 @@ private:
   std::mutex              _progress_mu;
   std::condition_variable _progress_cv;
   bool                    _progress_run = false;
+
+  // Off-tty milestone state. A MEMBER rather than a thread local
+  // because the thread is not always the one that gets to close a
+  // report out: the last report of a run typically closes within a
+  // tick of the session tearing down, and the thread is joined before
+  // it can observe the empty list. stop_progress_thread_() flushes it
+  // after the join, where the thread is provably gone and no lock is
+  // needed to touch it.
+  std::map<std::uint64_t, Announced> _milestones;
 
   // SIGINT bookkeeping. `_sigint_count` is the only field the signal
   // handler touches; the rest belong to poll_sigint()'s caller.

@@ -1,13 +1,17 @@
 #include "minitest.h"
+#include "common/console-writer.h"
 #include "common/stdio-ui-delegate.h"
 #include "common/vpipe-format.h"
 #include "interfaces/ui-delegate-intf.h"
 
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <streambuf>
 #include <string>
+#include <thread>
 
 using namespace std;
 using namespace vpipe;
@@ -266,6 +270,157 @@ TEST(ui_delegate, progress_open_update_snapshot) {
   EXPECT_TRUE(items[0].total == 10);
   EXPECT_TRUE(items[0].detail == "3 / 10 GB");
   EXPECT_TRUE(d.progress_version() > v0);
+}
+
+// open() stamps the start instant, which is what a renderer turns into
+// an ELAPSED figure. Two things matter and neither is the exact value:
+// the stamp is real (not a default-constructed epoch, which would read
+// as decades elapsed), and it does NOT move when the report is updated
+// -- elapsed measures the report, not the last tick.
+TEST(ui_delegate, progress_start_time_stamped_and_stable) {
+  GetlineOnlyUi d;
+  const auto before = std::chrono::steady_clock::now();
+  UiProgress p = d.open_progress("denoise");
+  const auto after = std::chrono::steady_clock::now();
+  auto items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  const auto t0 = items[0].started;
+  EXPECT_TRUE(t0 >= before && t0 <= after);
+  p.update(1, 20);
+  p.set_detail("step 1");
+  items = d.progress_snapshot();
+  ASSERT_TRUE(items.size() == 1);
+  EXPECT_TRUE(items[0].started == t0);
+}
+
+// ---- off-tty progress milestones -------------------------------------
+//
+// Off a terminal there is no footer to pin, and silence there reads as
+// a hang to whoever is watching a redirected log. The same reports are
+// emitted as plain lines instead, throttled to one per ~10%.
+
+namespace {
+
+// Swap stdout's streambuf so the delegate's lines can be read back, and
+// force the console into its non-tty rendering. Both are restored on
+// destruction; the delegate under test must be built and DESTROYED
+// inside this scope, since it is the join in its destructor that makes
+// the captured text final.
+class OffTtyCapture {
+public:
+  OffTtyCapture()
+      : _saved(cout.rdbuf(_buf.rdbuf())),
+        _was_tty(vpipe::console_writer().tty())
+  {
+    vpipe::console_writer().set_tty_for_test(false);
+  }
+  ~OffTtyCapture()
+  {
+    vpipe::console_writer().set_tty_for_test(_was_tty);
+    cout.rdbuf(_saved);
+  }
+  string str() const { return _buf.str(); }
+
+private:
+  ostringstream _buf;
+  streambuf*    _saved;
+  bool          _was_tty;
+};
+
+// The repaint thread polls at kRepaintMs; give it a few ticks to see an
+// update before asserting on what it said.
+void settle_()
+{
+  std::this_thread::sleep_for(std::chrono::milliseconds(
+      StdioUiDelegate::kRepaintMs * 3));
+}
+
+size_t count_of_(const string& hay, const string& needle)
+{
+  size_t n = 0;
+  for (size_t i = hay.find(needle); i != string::npos;
+       i = hay.find(needle, i + 1)) {
+    ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+// One line per ~10% crossed, and no line for an update that stays
+// inside a bucket -- the throttle is the whole point, since a download
+// updates hundreds of times a second.
+//
+// Every assertion happens AFTER the capture is released: while it is
+// alive it owns stdout, so a failure message would be written into the
+// very buffer under test and never reach the terminal.
+TEST(ui_delegate, progress_milestones_off_tty) {
+  string out;
+  {
+    OffTtyCapture cap;
+    {
+      StdioUiDelegate d;
+      UiProgress p = d.open_progress("fetch");
+      p.update(0, 100);
+      settle_();
+      p.update(55, 100);
+      settle_();
+      p.update(57, 100);      // same bucket -- must stay silent
+      settle_();
+      p.update(100, 100);
+      settle_();
+    }                         // the join in ~StdioUiDelegate lands here
+    out = cap.str();
+  }
+  // Anchored on the tag's "] " -- bare "0% of" also matches inside the
+  // 100% line, which counts one report twice.
+  EXPECT_TRUE(count_of_(out, "] 0% of 'fetch' completed at") == 1);
+  EXPECT_TRUE(count_of_(out, "] 55% of 'fetch' completed at") == 1);
+  EXPECT_TRUE(out.find("57%") == string::npos);
+  EXPECT_TRUE(count_of_(out, "] 100% of 'fetch' completed at") == 1);
+  // A report that reached 100% has already said everything the closing
+  // line would, so it does not also get one.
+  EXPECT_TRUE(out.find("ended at") == string::npos);
+}
+
+// A report that closes BELOW 100% still gets a terminating line. A
+// stage is free to stop updating before the end (the LM benchmark ticks
+// its bar before each test, so its last word is 8/9), and a log that
+// just stops mid-percentage leaves the reader unable to tell a finish
+// from a wedge -- which is the thing these lines exist to answer.
+TEST(ui_delegate, progress_incomplete_report_still_ends) {
+  string out;
+  {
+    OffTtyCapture cap;
+    {
+      StdioUiDelegate d;
+      UiProgress p = d.open_progress("benchmark");
+      p.update(8, 9);
+      settle_();
+    }
+    out = cap.str();
+  }
+  EXPECT_TRUE(out.find("88% of 'benchmark' completed at") != string::npos);
+  EXPECT_TRUE(out.find("'benchmark' ended at") != string::npos);
+  EXPECT_TRUE(out.find("last reported 88% (8/9)") != string::npos);
+}
+
+// An INDETERMINATE report has no percentage to cross a milestone with,
+// so it reports none. Pinned because the tempting fix -- a timer
+// writing lines about a figure that does not exist -- is worse.
+TEST(ui_delegate, progress_indeterminate_says_nothing_off_tty) {
+  string out;
+  {
+    OffTtyCapture cap;
+    {
+      StdioUiDelegate d;
+      UiProgress p = d.open_progress("stream");
+      p.update(1234, 0, "1.2 GB");
+      settle_();
+    }
+    out = cap.str();
+  }
+  EXPECT_TRUE(out.find("% of 'stream' completed") == string::npos);
 }
 
 // update() with an empty detail must not WIPE a detail already set --

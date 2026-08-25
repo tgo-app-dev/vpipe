@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_KREA2_METAL_KREA2_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -90,9 +92,6 @@ class MetalKrea2Transformer {
 
   ~MetalKrea2Transformer();   // out-of-line: _ws is a fwd-declared type
 
-  // Leading main blocks pinned resident in streaming mode (0 = pure streaming,
-  // or preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned; }
 
   // Cooperative-stop hook for the (long, disk-bound) streaming-blocks forward:
   // forward_dit polls this before each main block and bails early (returns
@@ -111,14 +110,19 @@ class MetalKrea2Transformer {
   // behaviour -- so this is opt-in per caller rather than a silent
   // change to every graph.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   std::size_t release_resident_blocks(std::size_t bytes);
   // Free the highest resident block; its bytes, or 0 when there is
-  // nothing left. `allow_pinned` lets it take one out of the pinned
-  // prefix (shrinking `_pinned` to match), which is only right when a
-  // measurement says that prefix is no longer in RAM.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // nothing left.
+  std::size_t evict_tail_block_();
+
   // Pages of the resident set examined, and how many are still in RAM.
   void resident_pages_(std::size_t* examined, std::size_t* incore) const;
 
@@ -253,11 +257,31 @@ class MetalKrea2Transformer {
   // whole DiT back in RAM on the box least able to hold it.
   enum class Retain { Cached, Streamed };
 
+  // `keep_split` suppresses the release of ff_gate/ff_up after the fused
+  // weight is built. A resident block does not need them; a REFILLABLE
+  // one does, because the fuse is rebuilt from them after every read.
   bool load_block_(WeightSet& ws, const std::string& pre,
-                   Block& b, bool main_block, Retain r);
+                   Block& b, bool main_block, Retain r,
+                   bool keep_split = false);
   // Load a Linear weight: quantized (affine triple) when `<name>.scales` is
   // present, else dense f16.
   QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // ---- the streamed blocks' reusable destinations --------------------
+  //
+  // See shared/block-slots.h. NOTE the tensor lists this model carries --
+  // block_bytes_, wire_block_ and each_block_tensor_ -- must agree about
+  // what a block is made of. They are checked against each other by the
+  // streaming equality test rather than by the type system.
+  void each_block_tensor_(
+      int L, Block& b, const BlockSlots<Block>::TensorFn& fn) const;
+  bool clone_block_(const Block& src, Block& dst, bool copy) const;
+  bool weave_into_(const QWeight& gate, const QWeight& up,
+                   QWeight& dst) const;
+  metal_compute::SharedBuffer rebuild_one_(const std::string& nm,
+                                           Placement how);
+  void configure_slots_();
+
+  BlockSlots<Block> _slots;
   // bf16 view of a checkpoint tensor. Cached ones go through the weight
   // set so a second model over this checkpoint shares them; streamed
   // ones are rebuilt per forward and retained by nobody. `norm` selects
@@ -299,11 +323,10 @@ class MetalKrea2Transformer {
   metal_compute::SharedBuffer _te_l1b, _te_l2b;              // time_embed
   QWeight _tmp_w; metal_compute::SharedBuffer _tmp_b;        // time_mod_proj
   std::vector<Block> _blocks;                          // 28 transformer_blocks
-  // Streaming-blocks mode: _blocks holds only the pinned prefix (_pinned
-  // blocks, possibly 0); blocks L >= _pinned come from the weight set (the
+  // Streaming-blocks mode: _blocks starts EMPTY and holds only what
+  // residency has promoted; every other block comes from the weight set (the
   // retained source mmap) on demand in forward_dit and freed after use.
   bool _stream_blocks = false;
-  int _pinned = 0;                       // pinned leading blocks (streaming)
   // Zero-copy weights: quantized Linears load as READ-ONLY views into the
   // retained source mmap (newBufferWithBytesNoCopy) rather than owned copies,
   // so the OS reclaims those clean file pages under memory pressure. On by
@@ -317,8 +340,40 @@ class MetalKrea2Transformer {
   std::shared_ptr<WeightSet> _ws;
   std::function<bool()> _stream_stop;   // polled per block in streaming mode
   BlockResidency _resid;
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+  std::size_t wire_block_(Block& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t block_bytes_(const Block& b);
+  // What promotion KEEPS, as against what the block holds now. A slot
+  // holds the split gate/up as well as the fused weight built from
+  // them, and drops the split on promotion -- so admission and the
+  // wired pool must ask this, not block_bytes_. A grant smaller than
+  // the ask is how the pool learns the box refused, and reporting a
+  // refusal that never happened clamps the budget at the first
+  // promoted block.
+  static std::size_t resident_bytes_(const Block& b);
+  // What a REFILL reads: the fused gate|up is woven out of the split
+  // pair after the read, never read itself. Counting it would report
+  // the drive running faster than it is.
+  static std::size_t read_bytes_(const Block& b);
   DitBlockProgressFn    _block_progress;
   metal_compute::SharedBuffer _final_sst;              // final_layer (2, hidden)
   metal_compute::SharedBuffer _final_norm;             // final_layer.norm (+1)

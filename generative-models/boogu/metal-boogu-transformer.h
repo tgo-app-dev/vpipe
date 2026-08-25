@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_BOOGU_METAL_BOOGU_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -135,9 +137,6 @@ class MetalBooguTransformer {
 
   ~MetalBooguTransformer();
 
-  // Leading blocks pinned resident in streaming mode (double + single;
-  // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned_d + _pinned_s; }
 
   // ---- the resident set, grown by measuring -----------------------------
   //
@@ -148,6 +147,12 @@ class MetalBooguTransformer {
   // outside RAM. It replaces the pinned prefix, which was a fraction of
   // TOTAL ram decided before the run and blind to the machine.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   std::size_t release_resident_blocks(std::size_t bytes);
@@ -333,15 +338,33 @@ class MetalBooguTransformer {
   QWeight _out_lin1, _out_lin2;                    // norm_out.linear_1/2 (+bias)
   metal_compute::SharedBuffer _out_lin1_b, _out_lin2_b;
   std::vector<Block> _ctx_refiner, _noise_refiner, _ref_refiner;
-  std::vector<DoubleBlock> _double;   // pinned prefix (all when preloaded)
-  std::vector<Block> _single;         // pinned prefix (all when preloaded)
+  std::vector<DoubleBlock> _double;   // promoted blocks (all when preloaded)
+  std::vector<Block> _single;         // promoted blocks (all when preloaded)
 
-  // Streaming mode: blocks past the pinned prefix (_pinned_d double, _pinned_s
+  // Streaming mode: blocks not yet promoted by residency (both stacks
   // single) are loaded on demand from the retained source mmap per forward.
   bool _stream_blocks = false;
-  int _pinned_d = 0;
-  int _pinned_s = 0;
   BlockResidency _resid;
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::size_t wire_block_(DoubleBlock& b, bool on);
+  std::size_t wire_block_(Block& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
 
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t double_bytes_(const DoubleBlock& b);
@@ -351,7 +374,36 @@ class MetalBooguTransformer {
   // SINGLE blocks first, then double. Both stacks stream, and the single
   // stack is the tail of the forward -- giving back what runs LAST keeps
   // what remains a contiguous prefix of the pass.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  std::size_t evict_tail_block_();
+
+  // ---- the streamed blocks' reusable destinations --------------------
+  //
+  // See shared/block-slots.h. TWO sets, because this model has two block
+  // shapes and one destination can only serve blocks it fits.
+  //
+  // NOTE the tensor lists this model carries -- the byte counters, the
+  // wired-pool walks, and the each_*_tensor_ enumerations below -- must
+  // agree about what a block is made of. They are checked against each
+  // other by the streaming equality test rather than by the type system.
+  void each_single_tensor_(
+      int L, Block& b,
+      const BlockSlots<Block>::TensorFn& fn) const;
+  void each_double_tensor_(
+      int L, DoubleBlock& b,
+      const BlockSlots<DoubleBlock>::TensorFn& fn) const;
+  bool clone_single_(const Block& src, Block& dst, bool copy) const;
+  bool clone_double_(const DoubleBlock& src, DoubleBlock& dst,
+                     bool copy) const;
+  metal_compute::SharedBuffer rebuild_one_(
+      const std::string& nm, Placement how);
+  // Re-interleave gate|up into a destination that ALREADY exists. The
+  // fused weight has no checkpoint name -- it is a transform of two
+  // tensors -- so a refill cannot address it and this runs after one.
+  bool weave_into_(const QWeight& gate, const QWeight& up, QWeight& dst) const;
+  void configure_slots_();
+
+  BlockSlots<Block>       _single_slots;
+  BlockSlots<DoubleBlock> _double_slots;
   // Zero-copy mmap of the quantized weight tensors as read-only views aliasing
   // the retained source mmap, so the DiT's resident footprint stays reclaimable
   // under memory pressure (a 1024px VAE decode). On by default when preloading;

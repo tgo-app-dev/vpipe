@@ -218,6 +218,89 @@ TEST(boogu_smoke, dit_forward_shape_finite)
 // from the output), and DIFFER from the reference-less forward. A dead ref path
 // (weights not loaded, tokens not embedded, rope band not applied) would give a
 // byte-identical result.
+// STREAMED must equal PRELOADED, byte for byte.
+//
+// Both stacks read each block into a reusable slot with pread and issue
+// the next block's read under the current block's GPU work
+// (shared/block-slots.h). That moves where the bytes come from and when
+// they arrive; it must not move a single bit of the result.
+//
+// This model is the harder case for that mechanism: two block shapes,
+// so two slot sets, and a FUSED gate|up in each -- a tensor with no
+// checkpoint name, rebuilt from the refilled halves after every read.
+// A fuse that ran on stale bytes, or a slot sized for the other stack,
+// produces plausible numbers and nothing else would catch it.
+//
+// VPIPE_BOOGU_STREAM_DUMP writes the streamed velocity, so the same
+// test on two builds can be diffed against each other.
+TEST(boogu_smoke, streamed_matches_preloaded)
+{
+  const std::string root = model_root_();
+  if (root.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  const int grid = 4, TS = 8;
+  std::vector<float> pre, str;
+  double fwd_s = 0.0;
+
+  auto run = [&](bool stream, std::vector<float>& out) -> bool {
+    auto dit = MetalBooguTransformer::load(root + "/transformer", mc,
+                                           MetalBooguTransformer::Config{},
+                                           stream);
+    if (dit == nullptr) { return false; }
+    const auto& c = dit->config();
+    const int lh = grid * c.patch, lw = grid * c.patch;
+    const int img_seq = grid * grid;
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.instruct_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.x_in() * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    // The SAME deterministic inputs either way -- both paths process
+    // identical bytes, so agreement is the invariant.
+    fill_normal_bf16_(ctx, (std::size_t)TS * c.instruct_dim, 99);
+    fill_normal_bf16_(lat, (std::size_t)img_seq * c.x_in(), 7);
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, lh, lw, 0.5f);
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (v.empty()) { return false; }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    out.resize(n);
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = bf16_to_f32_(vp[i]); }
+    return true;
+  };
+
+  BOOGU_REQUIRE(run(false, pre));
+  const double pre_s = fwd_s;
+  BOOGU_REQUIRE(run(true, str));
+  std::printf("[boogu_smoke] forward: preloaded %.1f s, streamed %.1f s "
+              "(slots %s)\n", pre_s, fwd_s,
+              std::getenv("VPIPE_BOOGU_NO_SLOTS") != nullptr ? "OFF" : "on");
+  BOOGU_REQUIRE(pre.size() == str.size() && !pre.empty());
+
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[boogu_smoke] streamed vs preloaded: %zu of %zu differ "
+              "(worst %.3e)\n", diff, pre.size(), worst);
+  EXPECT_TRUE(diff == 0);
+
+  if (const char* out = std::getenv("VPIPE_BOOGU_STREAM_DUMP")) {
+    std::ofstream f(out, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(str.data()),
+            (std::streamsize)(str.size() * sizeof(float)));
+  }
+}
+
 TEST(boogu_smoke, dit_reference_image_changes_output)
 {
   const std::string root = model_root_();
@@ -433,7 +516,10 @@ TEST(boogu_smoke, vae_roundtrip_psnr)
 // The VAE's mid-block self-attention runs on the matrix-core FULL flash kernel
 // (sdpa_full_mma2_d512) on a matrix-core GPU and on the simdgroup-matrix flash
 // (sdpa_full_mma_f16) elsewhere; the two must agree, in the ENCODER and in the
-// DECODER. Boogu's VAE is a plain AutoencoderKL at latent 16 -- its mid block is
+// DECODER. NOTE the matrix-core skip below, and see
+// vae_selected_mid_attn_matches_scalar at the end of this file for the check
+// that covers the member the autotune ACTUALLY picked on any GPU -- this one
+// is blind on the machines where that is neither of the two named above. Boogu's VAE is a plain AutoencoderKL at latent 16 -- its mid block is
 // 16x16 = 256 tokens, a shape flux2_smoke.vae_decode_flash_attn_matches_scalar
 // (patch 2, latent 32, 4096 mid tokens, decode only) never reaches. The two
 // halves are reported SEPARATELY because they fail independently: the encoder's
@@ -2458,5 +2544,96 @@ TEST(boogu_smoke, padded_tower_attention_matches_scalar)
     const double rd = rel(da[d], db[d]);
     std::printf("[boogu_smoke]   deepstack%zu rel-L2 %.6g\n", d, rd);
     EXPECT_TRUE(std::isfinite(rd) && rd < 8e-2);
+  }
+}
+
+// THE MEMBER THE AUTOTUNE ACTUALLY PICKED, against the scalar reference.
+//
+// vae_flash_attn_matches_scalar above skips without matrix cores, so on an M4
+// Pro -- where the tuner picks the MATERIALIZED member, which the matrix-core
+// boxes never see -- nothing checked the mid attention at all. The tuner
+// itself cannot: it ranks candidates by TIME, on a synthetic block whose
+// scores are tiny (q.k ~ -15 at D=512), so a member that is fast and wrong
+// wins and says nothing.
+//
+// Swept over mid-block token counts, because the SHAPE of the error is what
+// names the cause: flat across 256/1024/4096 is a range or algebra failure,
+// while an error that tracks the tile count is a tiling bug.
+TEST(boogu_smoke, vae_selected_mid_attn_matches_scalar)
+{
+  const std::string root = model_root_();
+  if (root.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  for (const int px : {128, 256, 512}) {
+    const int H = px, W = px, lh = H / 8, lw = W / 8;
+    std::vector<float> img((std::size_t)3 * H * W);
+    for (std::size_t i = 0; i < img.size(); ++i) {
+      img[i] = std::sin((float)i * 0.017f);
+    }
+    std::vector<float> lat((std::size_t)16 * lh * lw);
+    { std::mt19937 rng(4242);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      for (float& v : lat) { v = nd(rng); } }
+
+    auto run = [&](bool scalar, std::vector<float>* z_out,
+                   std::vector<float>* rgb_out) {
+      if (scalar) { ::setenv("VPIPE_FLUX2_NO_MMA_ATTN", "1", 1); }
+      auto vae = MetalFlux2Vae::load(root + "/vae", mc,
+                                     MetalFlux2Vae::Config{},
+                                     /*with_encoder=*/true);
+      if (scalar) { ::unsetenv("VPIPE_FLUX2_NO_MMA_ATTN"); }
+      if (vae == nullptr) { return; }
+      SharedBuffer in = mc->make_shared_buffer(img.size() * 2);
+      if (in.empty()) { return; }
+      { auto* d = static_cast<_Float16*>(in.contents());
+        for (std::size_t i = 0; i < img.size(); ++i) {
+          d[i] = (_Float16)img[i];
+        } }
+      SharedBuffer z = vae->encode(in, H, W);
+      if (!z.empty() && z.byte_size() >= lat.size() * 2) {
+        const auto* p = static_cast<const _Float16*>(z.contents());
+        z_out->resize(lat.size());
+        for (std::size_t i = 0; i < lat.size(); ++i) {
+          (*z_out)[i] = (float)p[i];
+        }
+      }
+      SharedBuffer zin = mc->make_shared_buffer(lat.size() * 2);
+      if (zin.empty()) { return; }
+      { auto* d = static_cast<_Float16*>(zin.contents());
+        for (std::size_t i = 0; i < lat.size(); ++i) {
+          d[i] = (_Float16)lat[i];
+        } }
+      std::string derr;
+      SharedBuffer rgb = vae->decode(zin, lh, lw, &derr);
+      const std::size_t n = img.size();
+      if (!rgb.empty() && rgb.byte_size() >= n * 2) {
+        const auto* p = static_cast<const _Float16*>(rgb.contents());
+        rgb_out->resize(n);
+        for (std::size_t i = 0; i < n; ++i) { (*rgb_out)[i] = (float)p[i]; }
+      }
+    };
+
+    std::vector<float> z_sel, rgb_sel, z_ref, rgb_ref;
+    run(/*scalar=*/false, &z_sel, &rgb_sel);
+    run(/*scalar=*/true, &z_ref, &rgb_ref);
+    BOOGU_REQUIRE(!z_sel.empty() && z_sel.size() == z_ref.size());
+    BOOGU_REQUIRE(!rgb_sel.empty() && rgb_sel.size() == rgb_ref.size());
+    auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+      double num = 0.0, den = 0.0;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        const double d = (double)a[i] - (double)b[i];
+        num += d * d; den += (double)b[i] * (double)b[i];
+      }
+      return den > 0.0 ? std::sqrt(num / den) : (num == 0.0 ? 0.0 : 1.0);
+    };
+    const double re = rel(z_sel, z_ref), rd = rel(rgb_sel, rgb_ref);
+    std::printf("[boogu_smoke] selected mid-attn vs scalar: encode rel-L2 "
+                "%.6g, decode rel-L2 %.6g (%d mid tokens)\n",
+                re, rd, (lh / 2) * (lw / 2) * 4);
+    EXPECT_TRUE(re < 0.02);
+    EXPECT_TRUE(rd < 0.02);
   }
 }

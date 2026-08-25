@@ -30,6 +30,7 @@ set(LOCAL_SOURCES
   shared/gguf-file.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
+  shared/wired-pool.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc
   shared/mcp/python-sandbox.cc
@@ -120,6 +121,7 @@ set(LOCAL_HEADERS
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/grounded-encode-params.h
+  shared/wired-pool.h
   shared/mcp/file-sandbox.h
   shared/mcp/mcp-tools.h
   shared/mcp/python-sandbox.h

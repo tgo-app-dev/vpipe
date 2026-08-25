@@ -107,6 +107,7 @@ const STRINGS = {
   'fb.no_preview':    ['No preview for this file type', '此文件类型无法预览',
                         '此檔案類型無法預覽'],
   'fb.download':      ['Download', '下载', '下載'],
+  'fb.modified':      ['Modified {t}', '修改于 {t}', '修改於 {t}'],
   'fb.new_folder_name':['Folder name', '文件夹名称', '資料夾名稱'],
   'fb.rename_to':     ['New name', '新名称', '新名稱'],
   'fb.folder_created':['Folder created', '文件夹已创建', '資料夾已建立'],
@@ -909,6 +910,7 @@ const STRINGS = {
   'status.progress':     ['WORK', '进度', '進度'],
   'status.no_progress':  ['Nothing in progress', '暂无进行中的任务',
       '目前沒有進行中的工作'],
+  'status.elapsed':      ['{t} elapsed', '已用 {t}', '已用 {t}'],
   'status.eta_left':     ['{t} left', '剩余 {t}', '剩餘 {t}'],
 
   // ---- Stage spec docs (overlay; see tOr) ----------------------------

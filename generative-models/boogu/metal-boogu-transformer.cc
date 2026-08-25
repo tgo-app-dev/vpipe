@@ -7,7 +7,6 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
-#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
@@ -208,6 +207,90 @@ MetalBooguTransformer::fuse_gu_(WeightSet& ws, const std::string& key,
   return d;
 }
 
+// ---- the wired pool ---------------------------------------------------
+//
+// One buffer at a time, STOPPING at the first refusal rather than
+// unwinding: a partly wired block is partly protected, which is strictly
+// better than none -- and giving protection back on the way out means
+// competing for it again on the next block, against a pool that has just
+// said no.
+//
+// The lists mirror double_bytes_/single_bytes_ exactly. They have to:
+// wirable() gates admission on the byte count those return, so a buffer
+// counted there and not wired here is a block the model believes is
+// protected and is not.
+std::size_t
+MetalBooguTransformer::wire_block_(DoubleBlock& b, bool on)
+{
+  std::size_t changed = 0;
+  bool stop = false;
+  auto one = [&](metal_compute::SharedBuffer& p) {
+    if (stop) { return; }
+    const std::size_t n = _wire.wire_one(_mc, p, on);
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+      stop = true;
+      return;
+    }
+    changed += n;
+  };
+  auto qw = [&](QWeight& w) {
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+  };
+  QWeight* q[] = {&b.jq_i, &b.jk_i, &b.jv_i, &b.jq_t, &b.jk_t, &b.jv_t,
+                  &b.jout_i, &b.jout_t, &b.jo, &b.sq, &b.sk, &b.sv, &b.so,
+                  &b.iff_gate, &b.iff_up, &b.iff_down, &b.iff_gu,
+                  &b.tff_gate, &b.tff_up, &b.tff_down, &b.tff_gu,
+                  &b.mi1, &b.mi2, &b.mi3, &b.mt1, &b.mt2};
+  for (QWeight* w : q) { qw(*w); }
+  one(b.jqn); one(b.jkn); one(b.sqn); one(b.skn);
+  return changed;
+}
+
+std::size_t
+MetalBooguTransformer::wire_block_(Block& b, bool on)
+{
+  std::size_t changed = 0;
+  bool stop = false;
+  auto one = [&](metal_compute::SharedBuffer& p) {
+    if (stop) { return; }
+    const std::size_t n = _wire.wire_one(_mc, p, on);
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired()) {
+      stop = true;
+      return;
+    }
+    changed += n;
+  };
+  auto qw = [&](QWeight& w) {
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+  };
+  QWeight* q[] = {&b.q, &b.k, &b.v, &b.o, &b.ff_gate, &b.ff_up,
+                  &b.ff_down, &b.ff_gu, &b.mod};
+  for (QWeight* w : q) { qw(*w); }
+  one(b.qn); one(b.kn); one(b.mod_b);
+  one(b.n1); one(b.n2); one(b.fn1); one(b.fn2);
+  return changed;
+}
+
+// The TRUNK: everything the weight set cached for this model -- the five
+// refiner stacks, the embedders, the caption tower. Read on every forward
+// and never shed, so it has a better claim on the pool than any single
+// resident block does, which is why the forward wires this BEFORE it
+// starts admitting blocks.
+//
+// The activation scratch is deliberately not here: this model allocates
+// it as locals inside forward_dit, so there is nothing that persists to
+// wire. See the note in shared/wired-pool.h.
+std::size_t
+MetalBooguTransformer::wire_fixed_(bool on)
+{
+  if (!_ws) { return 0; }
+  std::size_t changed = 0;
+  _ws->for_each_weight([&](metal_compute::SharedBuffer& b) {
+    changed += _wire.wire_one(_mc, b, on);
+  });
+  return changed;
+}
+
 std::size_t
 MetalBooguTransformer::qw_bytes_(const QWeight& w)
 {
@@ -252,6 +335,14 @@ MetalBooguTransformer::resident_pages_(std::size_t* examined,
   if (paged_out != nullptr) { *paged_out = 0; }
   auto add = [&](const metal_compute::SharedBuffer& p) {
     if (p.byte_size() == 0) { return; }
+    // A WIRED BUFFER CANNOT HAVE LEFT RAM, so asking is spending the walk
+    // to be told what mlock already guarantees. Skipped PER BUFFER rather
+    // than per block, because wire_block_ stops at the first refusal and
+    // leaves the rest of that block unwired -- the remainder is exactly
+    // what still needs measuring. With everything wired `examined` stays
+    // 0, which the caller reads as "no evidence" rather than as a
+    // shortfall, and that is the correct answer.
+    if (p.is_wired()) { return; }
     const auto r = p.page_residency(64);
     if (!r.valid) { return; }
     *examined += r.examined;
@@ -277,25 +368,79 @@ MetalBooguTransformer::resident_pages_(std::size_t* examined,
 }
 
 std::size_t
-MetalBooguTransformer::evict_tail_block_(bool allow_pinned)
+MetalBooguTransformer::evict_tail_block_()
 {
-  const int sfloor = allow_pinned ? 0 : _pinned_s;
-  for (int i = (int)_single.size() - 1; i >= sfloor; --i) {
+  for (int i = (int)_single.size() - 1; i >= 0; --i) {
     Block& b = _single[(std::size_t)i];
     const std::size_t n = single_bytes_(b);
     if (n == 0) { continue; }
+    // Before the buffers go: give the wiring back. Dropping a wired
+    // buffer unwires it in the kernel anyway, but only unwire_from_pool()
+    // decrements the pool's counter -- so doing it here is what keeps the
+    // budget honest instead of leaking a block's worth per eviction.
+    _wire.note_unwired(wire_block_(b, false));
     b = Block{};
     return n;
   }
-  const int dfloor = allow_pinned ? 0 : _pinned_d;
-  for (int i = (int)_double.size() - 1; i >= dfloor; --i) {
+  for (int i = (int)_double.size() - 1; i >= 0; --i) {
     DoubleBlock& b = _double[(std::size_t)i];
     const std::size_t n = double_bytes_(b);
     if (n == 0) { continue; }
+    _wire.note_unwired(wire_block_(b, false));
     b = DoubleBlock{};
     return n;
   }
   return 0;
+}
+
+// How much the box must have freed since a wiring refusal before it is
+// worth asking again -- one block's worth, so a genuinely full box is
+// never asked. Reopening the pool's ceiling makes its own check pass, and
+// the mlock behind it would then fail and leave that block resident but
+// UNWIRED, one per forward, which is exactly the state the wirable gate
+// exists to avoid.
+//
+// The checkpoint figure when the schedule has been set, the resident
+// average otherwise. Never zero if anything is known: a zero slack
+// re-opens on any increase at all.
+std::size_t
+MetalBooguTransformer::wire_retry_slack_() const
+{
+  if (_wire_block_hint > 0) { return _wire_block_hint; }
+  if (_resid.count() > 0) {
+    return _resid.bytes() / (std::size_t)_resid.count();
+  }
+  return 0;
+}
+
+void
+MetalBooguTransformer::set_residency_schedule(int steps)
+{
+  if (!_ws) { return; }
+  const MetalLlamaWeights& src = _ws->src();
+  const std::size_t blk = widest_block_bytes(
+      src.tensor_names(),
+      [&](const std::string& n) {
+        const auto* ti = src.info(n);
+        return ti != nullptr ? (std::size_t)ti->nbytes : (std::size_t)0;
+      },
+      {"double_stream_layers.", "single_stream_layers."});
+  const int nl = _cfg.n_double + _cfg.n_single;
+  _wire_block_hint = blk;
+  _resid.set_schedule(steps, nl, blk, _wire.on(),
+                      _mc != nullptr ? _mc->memory_budget()
+                                     : metal_compute::MetalCompute::
+                                           MemoryBudget{});
+  if (_mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalBooguTransformer: residency probe {} blocks of {} "
+        "({} MB each, {} MB reclaimable, wire budget {} MB){}",
+        _resid.per_forward_cap(), nl, blk >> 20,
+        _mc->memory_budget().available_physical >> 20,
+        _wire.budget() >> 20,
+        _wire.on() ? " -- uncapped, the wire budget is the gate"
+                   : ", doubling per healthy forward"));
+  }
 }
 
 std::size_t
@@ -431,7 +576,328 @@ MetalBooguTransformer::load_double_(WeightSet& ws,
          (!_fuse_ff || (!b.iff_gu.empty() && !b.tff_gu.empty()));
 }
 
-MetalBooguTransformer::~MetalBooguTransformer() = default;
+
+// Shorthand for the per-tensor placement the refill needs stated.
+using P = vpipe::genai::Placement;
+
+// ---- the streamed blocks' reusable destinations ------------------------
+
+// A MATRIX is three tensors when quantized and one when dense, and which
+// it is was decided when the slot was built -- so the layout comes from
+// the QWeight, not from the checkpoint. A pack that disagrees fails the
+// refill's size check and forces a rebuild, which is the right answer to
+// "these are not the same weights".
+namespace {
+template <class Fn, class QW>
+void
+boogu_qw_(const std::string& base, QW& w, const Fn& fn)
+{
+  if (w.quantized) {
+    fn(base + ".weight", w.codes, P::kRaw);
+    fn(base + ".scales", w.scales, P::kBf16);
+    fn(base + ".biases", w.qbias, P::kBf16);
+  } else {
+    fn(base + ".weight", w.w, P::kBf16);
+  }
+}
+}  // namespace
+
+void
+MetalBooguTransformer::each_single_tensor_(
+    int L, Block& b, const BlockSlots<Block>::TensorFn& fn) const
+{
+  const std::string p = "single_stream_layers." + std::to_string(L) + ".";
+  boogu_qw_(p + "attn.to_q", b.q, fn);
+  boogu_qw_(p + "attn.to_k", b.k, fn);
+  boogu_qw_(p + "attn.to_v", b.v, fn);
+  boogu_qw_(p + "attn.to_out.0", b.o, fn);
+  fn(p + "attn.norm_q.weight", b.qn, P::kBf16);
+  fn(p + "attn.norm_k.weight", b.kn, P::kBf16);
+  boogu_qw_(p + "feed_forward.linear_1", b.ff_gate, fn);
+  boogu_qw_(p + "feed_forward.linear_3", b.ff_up, fn);
+  boogu_qw_(p + "feed_forward.linear_2", b.ff_down, fn);
+  if (b.modulated) {
+    boogu_qw_(p + "norm1.linear", b.mod, fn);
+    fn(p + "norm1.linear.bias", b.mod_b, P::kBf16);
+    fn(p + "norm1.norm.weight", b.n1, P::kBf16);
+  } else {
+    fn(p + "norm1.weight", b.n1, P::kBf16);
+  }
+  fn(p + "norm2.weight", b.n2, P::kBf16);
+  fn(p + "ffn_norm1.weight", b.fn1, P::kBf16);
+  fn(p + "ffn_norm2.weight", b.fn2, P::kBf16);
+  // ff_gu is DERIVED -- an interleave of gate|up with no checkpoint name
+  // -- and is rebuilt by weave_into_ after the refill, not here.
+}
+
+void
+MetalBooguTransformer::each_double_tensor_(
+    int L, DoubleBlock& b, const BlockSlots<DoubleBlock>::TensorFn& fn) const
+{
+  const std::string p = "double_stream_layers." + std::to_string(L) + ".";
+  const std::string jp = p + "img_instruct_attn.";
+  const std::string pp = jp + "processor.";
+  boogu_qw_(pp + "img_to_q", b.jq_i, fn);
+  boogu_qw_(pp + "img_to_k", b.jk_i, fn);
+  boogu_qw_(pp + "img_to_v", b.jv_i, fn);
+  boogu_qw_(pp + "instruct_to_q", b.jq_t, fn);
+  boogu_qw_(pp + "instruct_to_k", b.jk_t, fn);
+  boogu_qw_(pp + "instruct_to_v", b.jv_t, fn);
+  boogu_qw_(pp + "img_out", b.jout_i, fn);
+  boogu_qw_(pp + "instruct_out", b.jout_t, fn);
+  boogu_qw_(jp + "to_out.0", b.jo, fn);
+  fn(jp + "norm_q.weight", b.jqn, P::kBf16);
+  fn(jp + "norm_k.weight", b.jkn, P::kBf16);
+
+  const std::string sp = p + "img_self_attn.";
+  boogu_qw_(sp + "to_q", b.sq, fn);
+  boogu_qw_(sp + "to_k", b.sk, fn);
+  boogu_qw_(sp + "to_v", b.sv, fn);
+  boogu_qw_(sp + "to_out.0", b.so, fn);
+  fn(sp + "norm_q.weight", b.sqn, P::kBf16);
+  fn(sp + "norm_k.weight", b.skn, P::kBf16);
+
+  boogu_qw_(p + "img_feed_forward.linear_1", b.iff_gate, fn);
+  boogu_qw_(p + "img_feed_forward.linear_3", b.iff_up, fn);
+  boogu_qw_(p + "img_feed_forward.linear_2", b.iff_down, fn);
+  boogu_qw_(p + "instruct_feed_forward.linear_1", b.tff_gate, fn);
+  boogu_qw_(p + "instruct_feed_forward.linear_3", b.tff_up, fn);
+  boogu_qw_(p + "instruct_feed_forward.linear_2", b.tff_down, fn);
+
+  const auto mod = [&](const char* nm, QWeight& w,
+                       metal_compute::SharedBuffer& bias,
+                       metal_compute::SharedBuffer& nw) {
+    boogu_qw_(p + nm + ".linear", w, fn);
+    fn(p + std::string(nm) + ".linear.bias", bias, P::kBf16);
+    fn(p + std::string(nm) + ".norm.weight", nw, P::kBf16);
+  };
+  mod("img_norm1", b.mi1, b.mi1_b, b.ni1);
+  mod("img_norm2", b.mi2, b.mi2_b, b.ni2);
+  mod("img_norm3", b.mi3, b.mi3_b, b.ni3);
+  mod("instruct_norm1", b.mt1, b.mt1_b, b.nt1);
+  mod("instruct_norm2", b.mt2, b.mt2_b, b.nt2);
+
+  fn(p + "img_attn_norm.weight", b.i_attn_n, P::kBf16);
+  fn(p + "img_self_attn_norm.weight", b.i_self_n, P::kBf16);
+  fn(p + "img_ffn_norm1.weight", b.i_ffn1, P::kBf16);
+  fn(p + "img_ffn_norm2.weight", b.i_ffn2, P::kBf16);
+  fn(p + "instruct_attn_norm.weight", b.t_attn_n, P::kBf16);
+  fn(p + "instruct_ffn_norm1.weight", b.t_ffn1, P::kBf16);
+  fn(p + "instruct_ffn_norm2.weight", b.t_ffn2, P::kBf16);
+  // iff_gu / tff_gu are DERIVED -- see weave_into_.
+}
+
+bool
+MetalBooguTransformer::weave_into_(const QWeight& gate, const QWeight& up,
+                                   QWeight& dst) const
+{
+  if (dst.empty()) { return true; }        // not fused: nothing to rebuild
+  if (gate.empty() || up.empty() || gate.n <= 0 || gate.n != up.n) {
+    return false;
+  }
+  bool ok = true;
+  const int inner = gate.n;
+  const auto one = [&](const metal_compute::SharedBuffer& g,
+                       const metal_compute::SharedBuffer& u,
+                       metal_compute::SharedBuffer& d) {
+    if (!ok || d.empty()) { return; }
+    if (g.empty() || u.empty()) { ok = false; return; }
+    const std::size_t rb = g.byte_size() / (std::size_t)inner;
+    if (rb == 0 || u.byte_size() / (std::size_t)inner != rb ||
+        d.byte_size() != (std::size_t)2 * inner * rb) {
+      ok = false;
+      return;
+    }
+    const auto* gs = static_cast<const std::uint8_t*>(g.contents());
+    const auto* us = static_cast<const std::uint8_t*>(u.contents());
+    auto* dd = static_cast<std::uint8_t*>(d.contents());
+    for (int i = 0; i < inner; ++i) {
+      std::memcpy(dd + (std::size_t)(2 * i) * rb,
+                  gs + (std::size_t)i * rb, rb);
+      std::memcpy(dd + (std::size_t)(2 * i + 1) * rb,
+                  us + (std::size_t)i * rb, rb);
+    }
+  };
+  one(gate.w, up.w, dst.w);
+  one(gate.codes, up.codes, dst.codes);
+  one(gate.scales, up.scales, dst.scales);
+  one(gate.qbias, up.qbias, dst.qbias);
+  return ok;
+}
+
+
+// Allocate `dst` with `src`'s shapes and flags, optionally copying the
+// bytes. One function for two uses: a promotion and the second slot
+// differ only in whether the contents come along.
+//
+// Unlike the each_*_tensor_ walks, these cover the DERIVED fused
+// weights too -- a slot without them would have nowhere for
+// weave_into_ to write.
+bool
+MetalBooguTransformer::clone_single_(const Block& src, Block& dst,
+                                     bool copy) const
+{
+  bool ok = true;
+  const auto one = [&](const metal_compute::SharedBuffer& s,
+                       metal_compute::SharedBuffer& d) {
+    if (!ok || s.empty()) { d = metal_compute::SharedBuffer{}; return; }
+    d = _mc->make_shared_buffer(s.byte_size());
+    if (d.empty()) { ok = false; return; }
+    if (copy) { std::memcpy(d.contents(), s.contents(), s.byte_size()); }
+  };
+  const auto qw = [&](const QWeight& s, QWeight& d) {
+    d.quantized = s.quantized; d.bits = s.bits; d.n = s.n; d.k = s.k;
+    one(s.w, d.w); one(s.codes, d.codes);
+    one(s.scales, d.scales); one(s.qbias, d.qbias);
+  };
+  dst.modulated = src.modulated;
+  qw(src.q, dst.q); qw(src.k, dst.k); qw(src.v, dst.v); qw(src.o, dst.o);
+  one(src.qn, dst.qn); one(src.kn, dst.kn);
+  qw(src.ff_gate, dst.ff_gate); qw(src.ff_up, dst.ff_up);
+  qw(src.ff_down, dst.ff_down); qw(src.ff_gu, dst.ff_gu);
+  qw(src.mod, dst.mod); one(src.mod_b, dst.mod_b);
+  one(src.n1, dst.n1); one(src.n2, dst.n2);
+  one(src.fn1, dst.fn1); one(src.fn2, dst.fn2);
+  if (!ok) { dst = Block{}; }
+  return ok;
+}
+
+bool
+MetalBooguTransformer::clone_double_(const DoubleBlock& src, DoubleBlock& dst,
+                                     bool copy) const
+{
+  bool ok = true;
+  const auto one = [&](const metal_compute::SharedBuffer& s,
+                       metal_compute::SharedBuffer& d) {
+    if (!ok || s.empty()) { d = metal_compute::SharedBuffer{}; return; }
+    d = _mc->make_shared_buffer(s.byte_size());
+    if (d.empty()) { ok = false; return; }
+    if (copy) { std::memcpy(d.contents(), s.contents(), s.byte_size()); }
+  };
+  const auto qw = [&](const QWeight& s, QWeight& d) {
+    d.quantized = s.quantized; d.bits = s.bits; d.n = s.n; d.k = s.k;
+    one(s.w, d.w); one(s.codes, d.codes);
+    one(s.scales, d.scales); one(s.qbias, d.qbias);
+  };
+  qw(src.jq_i, dst.jq_i); qw(src.jk_i, dst.jk_i); qw(src.jv_i, dst.jv_i);
+  qw(src.jq_t, dst.jq_t); qw(src.jk_t, dst.jk_t); qw(src.jv_t, dst.jv_t);
+  qw(src.jout_i, dst.jout_i); qw(src.jout_t, dst.jout_t); qw(src.jo, dst.jo);
+  one(src.jqn, dst.jqn); one(src.jkn, dst.jkn);
+  qw(src.sq, dst.sq); qw(src.sk, dst.sk); qw(src.sv, dst.sv);
+  qw(src.so, dst.so);
+  one(src.sqn, dst.sqn); one(src.skn, dst.skn);
+  qw(src.iff_gate, dst.iff_gate); qw(src.iff_up, dst.iff_up);
+  qw(src.iff_down, dst.iff_down); qw(src.iff_gu, dst.iff_gu);
+  qw(src.tff_gate, dst.tff_gate); qw(src.tff_up, dst.tff_up);
+  qw(src.tff_down, dst.tff_down); qw(src.tff_gu, dst.tff_gu);
+  qw(src.mi1, dst.mi1); qw(src.mi2, dst.mi2); qw(src.mi3, dst.mi3);
+  qw(src.mt1, dst.mt1); qw(src.mt2, dst.mt2);
+  one(src.mi1_b, dst.mi1_b); one(src.mi2_b, dst.mi2_b);
+  one(src.mi3_b, dst.mi3_b); one(src.mt1_b, dst.mt1_b);
+  one(src.mt2_b, dst.mt2_b);
+  one(src.ni1, dst.ni1); one(src.ni2, dst.ni2); one(src.ni3, dst.ni3);
+  one(src.nt1, dst.nt1); one(src.nt2, dst.nt2);
+  one(src.i_attn_n, dst.i_attn_n); one(src.i_self_n, dst.i_self_n);
+  one(src.i_ffn1, dst.i_ffn1); one(src.i_ffn2, dst.i_ffn2);
+  one(src.t_attn_n, dst.t_attn_n); one(src.t_ffn1, dst.t_ffn1);
+  one(src.t_ffn2, dst.t_ffn2);
+  if (!ok) { dst = DoubleBlock{}; }
+  return ok;
+}
+
+metal_compute::SharedBuffer
+MetalBooguTransformer::rebuild_one_(const std::string& nm,
+                                        vpipe::genai::Placement how)
+{
+  if (!_ws) { return {}; }
+  if (how == P::kRaw) {
+    // The same residency load_qw_ uses for a STREAMED read, which is
+    // Copied whenever the model streams (weights_may_be_mapped is false
+    // then) -- so this never hands back a read-only shard view.
+    const auto res = _mmap_weights ? WeightSet::Residency::Mapped
+                                   : WeightSet::Residency::Copied;
+    return _ws->stream_tensor(nm, _mc, res);
+  }
+  return bf16_(*_ws, nm, Retain::Streamed);
+}
+
+void
+MetalBooguTransformer::configure_slots_()
+{
+  {
+    BlockSlots<Block>::Ops o;
+    o.each = [this](int L, Block& b,
+                    const BlockSlots<Block>::TensorFn& fn) {
+      each_single_tensor_(L, b, fn);
+    };
+    o.rebuild_one = [this](const std::string& nm,
+                           vpipe::genai::Placement how) {
+      return rebuild_one_(nm, how);
+    };
+    o.build = [this](int L, Block& b) {
+      return _ws && load_block_(*_ws,
+                                "single_stream_layers." + std::to_string(L) +
+                                    ".",
+                                b, /*modulated=*/true, Retain::Streamed);
+    };
+    o.clone = [this](const Block& s, Block& d, bool copy) {
+      return clone_single_(s, d, copy);
+    };
+    o.bytes = [](const Block& b) { return single_bytes_(b); };
+    o.empty = [](const Block& b) { return b.q.empty(); };
+    o.post_refill = [this](int, Block& b) {
+      return weave_into_(b.ff_gate, b.ff_up, b.ff_gu);
+    };
+    _single_slots.set_weight_set(_ws.get());
+    _single_slots.configure(_mc, std::move(o),
+                            "MetalBooguTransformer(single)",
+                            "VPIPE_BOOGU_NO_SLOTS");
+  }
+  {
+    BlockSlots<DoubleBlock>::Ops o;
+    o.each = [this](int L, DoubleBlock& b,
+                    const BlockSlots<DoubleBlock>::TensorFn& fn) {
+      each_double_tensor_(L, b, fn);
+    };
+    o.rebuild_one = [this](const std::string& nm,
+                           vpipe::genai::Placement how) {
+      return rebuild_one_(nm, how);
+    };
+    o.build = [this](int L, DoubleBlock& b) {
+      return _ws && load_double_(*_ws,
+                                 "double_stream_layers." + std::to_string(L) +
+                                     ".",
+                                 b, Retain::Streamed);
+    };
+    o.clone = [this](const DoubleBlock& s, DoubleBlock& d, bool copy) {
+      return clone_double_(s, d, copy);
+    };
+    o.bytes = [](const DoubleBlock& b) { return double_bytes_(b); };
+    o.empty = [](const DoubleBlock& b) { return b.jq_i.empty(); };
+    o.post_refill = [this](int, DoubleBlock& b) {
+      return weave_into_(b.iff_gate, b.iff_up, b.iff_gu) &&
+             weave_into_(b.tff_gate, b.tff_up, b.tff_gu);
+    };
+    _double_slots.set_weight_set(_ws.get());
+    _double_slots.configure(_mc, std::move(o),
+                            "MetalBooguTransformer(double)",
+                            "VPIPE_BOOGU_NO_SLOTS");
+  }
+}
+
+MetalBooguTransformer::~MetalBooguTransformer()
+{
+  // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
+  // so the machine recovers either way -- but the pool's own counter
+  // would not, and a DiT freed for the vae-decode and reloaded on the
+  // next prompt (free_boogu_dit_for_decode_) would leak its whole share
+  // of the budget per prompt until nothing could wire at all.
+  if (_wire.on()) {
+    wire_fixed_(false);
+    for (DoubleBlock& b : _double) { wire_block_(b, false); }
+    for (Block& b : _single) { wire_block_(b, false); }
+  }
+}
 
 std::unique_ptr<MetalBooguTransformer>
 MetalBooguTransformer::load(const std::string& model_dir, MetalCompute* mc,
@@ -452,8 +918,16 @@ MetalBooguTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_mc = mc;
   m->_cfg = cfg;
   m->_stream_blocks = stream_blocks;
-  m->_mmap_weights =
-      !stream_blocks && std::getenv("VPIPE_BOOGU_NO_MMAP_WEIGHTS") == nullptr;
+  // BEFORE the first weight is read, because it decides how they are read:
+  // a mapped view can be neither mlock'd nor parked. See
+  // shared/wired-pool.h.
+  m->_wire.open(mc);
+  // The reusable read destinations. Configured whether or not this run
+  // streams: they cost nothing until the first streamed block asks for
+  // one, and a model that preloads never gets there.
+  m->configure_slots_();
+  m->_mmap_weights = weights_may_be_mapped(stream_blocks, m->_wire.on()) &&
+                     std::getenv("VPIPE_BOOGU_NO_MMAP_WEIGHTS") == nullptr;
   WeightSet& ws = *m->_ws;
   // Everything loaded from here to the end of load() is RETAINED for the
   // model's life. The streamed blocks are read in forward(), and only
@@ -1043,6 +1517,22 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
                                    const std::vector<RefImage>& refs)
 {
   const Config& c = _cfg;
+  // JOIN ANY OUTSTANDING READ ON EVERY EXIT. A prefetch may be filling a
+  // slot, and this function returns from a dozen places -- a stop
+  // request, a GPU error, an allocation that failed. Freeing or reading
+  // a slot while a reader thread writes into it is a use-after-free, and
+  // a scope guard is the only version of this that cannot be forgotten
+  // at the thirteenth return.
+  struct SlotJoin {
+    MetalBooguTransformer* t;
+    ~SlotJoin()
+    {
+      t->_single_slots.join();
+      t->_double_slots.join();
+    }
+  } slot_join{this};
+  _single_slots.begin_forward();
+  _double_slots.begin_forward();
   const int H = c.hidden, HED = c.n_heads, KVH = c.n_kv_heads;
   const int HD = c.head_dim, KD = KVH * HD;
   const int XIN = c.x_in(), OC = c.out_channels, FFI = c.ff_inner;
@@ -1671,6 +2161,73 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   }
   if (prof) { t_refine += ms_since(mk); }
 
+  // ---- the resident set, once per forward --------------------------------
+  //
+  // THIS WAS MISSING. Everything below it -- resident_pages_,
+  // evict_tail_block_, release_resident_blocks -- was written when the
+  // residency machinery landed, but nothing ever called begin_forward(),
+  // note_weight_residency() or note_healthy_forward(). The effect was
+  // silent and complete: `_admitted_this_forward` never reset, so growth
+  // stopped for good after the per-forward cap was reached ONCE; the
+  // first hysteresis refusal cleared `_growing` for the rest of the
+  // process; the paging backstop never ran; and resident_pages_ had no
+  // callers at all, so a block that was compressed was never noticed and
+  // never given back. Boogu kept a handful of blocks on its first pass
+  // and streamed everything for the rest of the run.
+  //
+  // Re-arm growth for this forward (the ratchet from any earlier eviction
+  // deliberately survives), then take the measurement that actually finds
+  // the limit: are the blocks we kept still in RAM? Gated on our OWN
+  // compressed footprint moving, because the page walk costs ~57 ms per
+  // 4.3 GB and a healthy run would pay it every step to be told nothing.
+  {
+    if (_wire.on()) {
+      // Retry a pool that refused earlier -- the refusal may have been
+      // another process spiking, and a run that never asks again holds a
+      // small resident set for the whole schedule on the strength of one
+      // syscall. Growth stopped when the budget ran out and cannot see
+      // that the budget moved, so a successful retry has to say so.
+      if (_wire.retry(_mc, wire_retry_slack_())) {
+        _resid.note_landscape_changed();
+      }
+      // The trunk takes its place in the pool BEFORE this forward's block
+      // admissions start asking for room: the blocks are the shed-able
+      // half, so a pool that runs out should run out on them.
+      wire_fixed_(true);
+    }
+    const auto mbudget = _mc->memory_budget();
+    _resid.begin_forward(mbudget, [this]() -> std::size_t {
+      return evict_tail_block_();
+    });
+    bool shortfall = false;
+    if (_resid.count() > 0 &&
+        _resid.self_compression_grew(mbudget.self_compressed)) {
+      std::size_t examined = 0, incore = 0, paged_out = 0;
+      resident_pages_(&examined, &incore, &paged_out);
+      if (examined > 0 && incore < examined) {
+        shortfall = true;
+        std::size_t freed = _resid.note_weight_residency(
+            examined, incore, [this]() -> std::size_t {
+              return evict_tail_block_();
+            });
+        if (_mc->session() != nullptr) {
+          _mc->session()->log_normal(fmt(
+              "MetalBooguTransformer: resident weights are only {}% in RAM "
+              "({} of {} sampled pages paged out, {} MB wired) -- released "
+              "{} MB, now {} blocks resident",
+              (int)(100.0 * (double)incore / (double)examined),
+              paged_out, examined, _wire.wired_bytes() >> 20, freed >> 20,
+              _resid.count()));
+        }
+      }
+    }
+    // Nothing of ours had left RAM this step -- either the walk said so or
+    // there was no compression to make it worth walking. Enough in a row
+    // lifts the ratchet by a block, so a shed taken during a momentary
+    // squeeze is not the last word on the run.
+    if (!shortfall) { _resid.note_healthy_forward(); }
+  }
+
   // ===== double-stream blocks ==============================================
   for (int L = 0; L < c.n_double; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
@@ -1678,15 +2235,12 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     const bool held = L < (int)_double.size() &&
                       !_double[(std::size_t)L].jq_i.empty();
     const bool streaming = _stream_blocks && !held;
-    DoubleBlock streamed;
+    const DoubleBlock* streamed = nullptr;
     if (streaming) {
-      if (!load_double_(*_ws,
-                        "double_stream_layers." + std::to_string(L) + ".",
-                        streamed, Retain::Streamed)) {
-        return {};
-      }
+      streamed = _double_slots.acquire(L);
+      if (streamed == nullptr) { return {}; }
     }
-    const DoubleBlock& b = streaming ? streamed : _double[(std::size_t)L];
+    const DoubleBlock& b = streaming ? *streamed : _double[(std::size_t)L];
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
@@ -1819,20 +2373,45 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     op.gated_tanh(txt, 0, mods, MT1 + (std::size_t)3 * H, ob, 0, H, TS * H);
     enc.end();
     std::string gpu_err;
-    if (!stream.commit().wait_ok(&gpu_err)) {
-      if (_mc->session() != nullptr) {
-        _mc->session()->warn(fmt("MetalBooguTransformer::forward_dit: {}",
-                                 gpu_err.empty() ? "GPU failed" : gpu_err));
+    {
+      metal_compute::CommandStream::Fence bf = stream.commit();
+      if (streaming) {
+        // BETWEEN THE COMMIT AND THE WAIT the GPU is busy with this
+        // block and this thread has nothing to do. That window is
+        // where the next block's read goes.
+        {
+          int nxt = -1;
+          for (int n = L + 1; n < c.n_double; ++n) {
+            const bool h = n < (int)_double.size() &&
+                           !_double[(std::size_t)n].jq_i.empty();
+            if (!h) { nxt = n; break; }
+          }
+          _double_slots.prefetch(nxt);
+        }
       }
-      return {};
+      if (!bf.wait_ok(&gpu_err)) {
+        if (_mc->session() != nullptr) {
+          _mc->session()->warn(fmt("MetalBooguTransformer::forward_dit: {}",
+                                   gpu_err.empty() ? "GPU failed" : gpu_err));
+        }
+        return {};
+      }
     }
     // The commit above has been WAITED for, so nothing encoded still
     // points at this block's buffers -- which is why the promotion is
     // here and not at the top of the iteration.
     if (streaming && L < (int)_double.size()) {
-      const std::size_t nb = double_bytes_(streamed);
-      if (_resid.admit(_mc, nb)) {
-        _double[(std::size_t)L] = std::move(streamed);
+      const std::size_t nb = _double_slots.last_bytes();
+      // Past the wire budget there is nothing to gain: the block would be
+      // kept unprotected, the compressor would take it (it is the coldest
+      // memory in the process), and the next residency walk would shed a
+      // block and ratchet the ceiling over the whole resident set. Better
+      // not to hold it at all.
+      if (_wire.wirable(nb) && _resid.admit(_mc, nb) &&
+          _double_slots.promote_into(_double[(std::size_t)L])) {
+        // Wired LAST, after every write this block will ever get: mlock
+        // pins the pages that exist NOW.
+        _wire.note_wired(_mc, wire_block_(_double[(std::size_t)L], true), nb);
         _resid.note_admitted(nb);
       }
     }
@@ -1857,15 +2436,16 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     const bool held = L < (int)_single.size() &&
                       !_single[(std::size_t)L].q.empty();
     const bool streaming = _stream_blocks && !held;
-    Block streamed;
+    const Block* streamed = nullptr;
     if (streaming) {
-      if (!load_block_(*_ws,
-                       "single_stream_layers." + std::to_string(L) + ".",
-                       streamed, /*modulated=*/true, Retain::Streamed)) {
-        return {};
-      }
+      // Two reusable destinations, refilled in place with pread and with
+      // the next block's read already issued under the previous block's
+      // GPU work. See shared/block-slots.h; the fallback to a per-block
+      // allocation lives inside it and is sticky.
+      streamed = _single_slots.acquire(L);
+      if (streamed == nullptr) { return {}; }
     }
-    const Block& b = streaming ? streamed : _single[(std::size_t)L];
+    const Block& b = streaming ? *streamed : _single[(std::size_t)L];
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
@@ -1886,18 +2466,36 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
               "sgl_ffact", L, split);
     enc.end();
     std::string gpu_err;
-    if (!stream.commit().wait_ok(&gpu_err)) {
-      if (_mc->session() != nullptr) {
-        _mc->session()->warn(fmt("MetalBooguTransformer::forward_dit: {}",
-                                 gpu_err.empty() ? "GPU failed" : gpu_err));
+    {
+      metal_compute::CommandStream::Fence bf = stream.commit();
+      if (streaming) {
+        // BETWEEN THE COMMIT AND THE WAIT the GPU is busy with this
+        // block and this thread has nothing to do. That window is
+        // where the next block's read goes.
+        {
+          int nxt = -1;
+          for (int n = L + 1; n < c.n_single; ++n) {
+            const bool h = n < (int)_single.size() &&
+                           !_single[(std::size_t)n].q.empty();
+            if (!h) { nxt = n; break; }
+          }
+          _single_slots.prefetch(nxt);
+        }
       }
-      return {};
+      if (!bf.wait_ok(&gpu_err)) {
+        if (_mc->session() != nullptr) {
+          _mc->session()->warn(fmt("MetalBooguTransformer::forward_dit: {}",
+                                   gpu_err.empty() ? "GPU failed" : gpu_err));
+        }
+        return {};
+      }
     }
     // Waited above, so nothing encoded still points at this block.
     if (streaming && L < (int)_single.size()) {
-      const std::size_t nb = single_bytes_(streamed);
-      if (_resid.admit(_mc, nb)) {
-        _single[(std::size_t)L] = std::move(streamed);
+      const std::size_t nb = _single_slots.last_bytes();
+      if (_wire.wirable(nb) && _resid.admit(_mc, nb) &&
+          _single_slots.promote_into(_single[(std::size_t)L])) {
+        _wire.note_wired(_mc, wire_block_(_single[(std::size_t)L], true), nb);
         _resid.note_admitted(nb);
       }
     }

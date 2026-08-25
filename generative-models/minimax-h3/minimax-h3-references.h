@@ -31,14 +31,42 @@ namespace minimax_h3 {
 //     ratio, so two references of different shapes land on different
 //     canvases.
 
+// The canvas a reference is encoded at when the encoder may only
+// REDUCE -- what a `short_edge` of 0 selects on both the image and the
+// video path.
+//
+// Starts at the source's OWN extent, brings it under `max_pixels` if it
+// is over (aspect preserved), and then FLOORS both axes to `multiple`.
+// Floors rather than rounds to nearest, because the nearest grid line
+// sits above as often as below: a 1080-tall source rounds UP to 1088,
+// which is an upsample of exactly the kind this rule exists to refuse.
+//
+// The one upward move it cannot avoid is a source under one `multiple`.
+// The grid is not a preference -- the VAE's stride times the DiT's patch
+// is 32, and a latent the patch does not divide is refused 50 layers
+// later -- so a 20-pixel edge becomes 32 and there is nowhere else to
+// put it.
+//
+// `max_pixels` of 0 is uncapped. False on a non-positive extent, or
+// outside the trained 1:4 .. 4:1 aspect.
+bool resolve_canvas_within(int height, int width, int multiple,
+                           std::int64_t max_pixels, int* out_h, int* out_w);
+
 // The canvas a reference IMAGE is encoded at: the short edge scaled to
-// `short_edge`, both axes then rounded to `multiple`. No area cap, and
-// an image smaller than `short_edge` is scaled UP.
+// `short_edge`, both axes then rounded to `multiple`, held under
+// `max_pixels` (0 = uncapped, which is the released checkpoint's rule --
+// an image reference is read at high detail and never binds the
+// generated canvas). An image smaller than `short_edge` is scaled UP.
+//
+// `short_edge` of 0 is resolve_canvas_within above: take the picture at
+// the size it arrived, which is what a caller that has already sized it
+// -- a resample stage, a crop, a generated still -- is asking for.
 //
 // False when the geometry is not positive or the aspect is outside the
 // trained 1:4 .. 4:1 range -- the same bound the target canvas holds to.
 bool resolve_reference_image_size(int height, int width, int short_edge,
-                                  int multiple, int* out_h, int* out_w);
+                                  int multiple, std::int64_t max_pixels,
+                                  int* out_h, int* out_w);
 
 // How many times each source frame is held to put `num_frames` frames at
 // `src_fps` onto `dst_fps`.
@@ -66,11 +94,59 @@ bool resize_lanczos_planar_rgb(const std::uint8_t* rgb, int height, int width,
                                int out_h, int out_w,
                                std::vector<std::uint8_t>* out);
 
+// The same resize with its per-GEOMETRY work lifted out of the per-FRAME
+// work, for a caller that runs many frames through one (src -> dst)
+// pair.
+//
+// A video reference is dozens of frames of ONE geometry, and the
+// one-shot spelling above rebuilds the coefficient tables, reallocates
+// the intermediate and re-derives the tap bounds for every one of them.
+// MEASURED on a 39-frame 960x544 -> 1344x768 clip: 507 ms one-shot,
+// 350 ms prepared, and the 120 MB results hash the same -- nothing here
+// is a different filter, only the same one that stops re-deriving
+// itself.
+//
+// The scratch lives in the plan rather than in the caller because the
+// intermediate's size is a property of the geometry (`src_h` rows of
+// `dst_w`), so a caller that held it would be re-deriving the one thing
+// this type exists to remember.
+struct PlanarResize {
+  int src_h = 0, src_w = 0, dst_h = 0, dst_w = 0;
+  // Pillow's coefficients: `bx[x]` is the first source column output
+  // column x reads and `wx[x * kx ...]` its weights, and likewise down.
+  int                kx = 0, ky = 0;
+  std::vector<int>   bx, by;
+  std::vector<float> wx, wy;
+  // How many of those taps land INSIDE the source. The builder zeroes
+  // the weights of the ones that do not, so stopping early and adding
+  // 0 x whatever-is-there agree exactly -- this is the bounds test out
+  // of the innermost loop, not a change of filter.
+  std::vector<int>   nx, ny;
+  // The horizontal pass's u8 intermediate ([src_h, dst_w]) and one
+  // output row of the vertical pass's accumulator.
+  std::vector<std::uint8_t> mid;
+  std::vector<double>       acc;
+
+  bool empty() const { return kx <= 0 || ky <= 0; }
+};
+
+// Build the plan for one (src -> dst) geometry. False on a non-positive
+// extent.
+bool prepare_planar_resize(int src_h, int src_w, int dst_h, int dst_w,
+                           PlanarResize* out);
+
+// Run one planar [3, src_h, src_w] u8 frame through it, into a caller-
+// owned [3, dst_h, dst_w]. Not re-entrant on one plan -- the scratch is
+// shared -- and false when the plan is empty.
+bool run_planar_resize(PlanarResize& plan, const std::uint8_t* rgb,
+                       std::uint8_t* out);
+
 // An image reference onto its own canvas. `out_h` / `out_w` come back as
 // the resolved size; the pixels are untouched when they already match,
 // which is the parity-exact route.
 bool normalize_image_reference(const std::uint8_t* rgb, int height, int width,
                                int short_edge, int multiple,
+                               std::int64_t max_pixels,
                                std::vector<std::uint8_t>* out, int* out_h,
                                int* out_w, std::string* err = nullptr);
 
@@ -87,6 +163,22 @@ bool normalize_image_reference(const std::uint8_t* rgb, int height, int width,
 // truncated to; a clip shorter than that is left short (the layout is
 // built from what this produces, so a short reference is a smaller
 // conditioning block, not an error).
+//
+// `short_edge` of 0 means THE SOURCE'S OWN short edge, which is how a
+// caller asks for a clip that is never scaled UP. It is not a different
+// rule -- the aspect resolve, the `max_pixels` cap and the rounding all
+// still run, and the cap is still what binds a large source. What it
+// changes is the small one: the released checkpoint's 768 puts a
+// 960x544 clip on a 1344x768 canvas, which is 1.98x the pixels and
+// carries no more information than the 960x544 it was interpolated
+// from.
+//
+// Cheaper is not the same as equivalent, and this canvas reaches
+// further than this function does. Downstream it sets the VAE encode,
+// the reference rows the DiT attends to on every step, AND -- the one
+// that is easy to miss from here -- how many vision tokens the
+// conditioner gets, because the tower is handed these same pixels.
+// See ReferencePlan::canvas_short_edge; costed in docs/MINIMAX-H3.md.
 bool normalize_video_reference(const std::uint8_t* frames, int num_frames,
                                int height, int width, double src_fps,
                                int target_frames, int multiple, int short_edge,

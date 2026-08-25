@@ -306,11 +306,17 @@ public:
 
   // ---- residency policy hooks --------------------------------------
 
-  // Marked by the manager when it hands these pages to the kernel. A
-  // parked set is still fully usable: the next access reactivates it
+  // Recorded by the REGISTRY, through WeightOwner::note_parked, when it
+  // hands these pages to the kernel or takes them back. NOT settable by
+  // a caller, and that is the point: this flag is the only thing that
+  // will ever take the pages back, so a park that set the kernel's half
+  // and forgot this one left every later read serving buffers the
+  // kernel was free to empty.
+  //
+  // A parked set is still fully usable: the next access reactivates it
   // first (see ensure_active_), reloading from disk only if the kernel
   // actually took the pages.
-  void set_parked(bool p) noexcept;
+  void note_parked(bool on) override;
   bool parked() const noexcept;
 
   // ---- may this outlive the launch that opened it? ---------------------

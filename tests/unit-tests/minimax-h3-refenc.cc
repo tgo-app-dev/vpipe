@@ -231,6 +231,74 @@ TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
   EXPECT_TRUE(seen[2] == std::make_pair(3, 3));
 }
 
+// The fit record: three temporal reductions counted APART, and the
+// per-reference short edge overriding the plan's.
+//
+// Kept separate because they have different remedies. A 30 fps clip
+// loses a fifth of its frames to the RATE resample whether or not it is
+// also too long; `frames` is what fixes the truncation and nothing fixes
+// the resample. One "kept 43%" would tell a user something was lost
+// without telling them which knob gets it back.
+TEST(minimax_h3_refenc, fit_reports_each_reduction_separately)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;            // never upsample
+
+  std::vector<h3::MediaReference> refs;
+  {
+    // 1920x1080 at 30 fps, 90 frames: over the area cap AND over length,
+    // and at a rate that does not divide 24.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 90;
+    m.height     = 1080;
+    m.width      = 1920;
+    m.fps        = 30.0;
+    m.rgb.assign((std::size_t)90 * 3 * 1080 * 1920, 7);
+    refs.push_back(std::move(m));
+  }
+  {
+    // A still that states its own short edge, overriding the plan's.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1;
+    m.height     = 64;
+    m.width      = 64;
+    m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 9);
+    refs.push_back(std::move(m));
+  }
+
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &err));
+  ASSERT_TRUE(enc.fits.size() == 2);
+
+  const auto& v = enc.fits[0];
+  std::printf("[minimax_h3_refenc] clip %dx%d -> %dx%d, %d -> %d -> %d "
+              "frames\n", v.src_w, v.src_h, v.canvas_w, v.canvas_h,
+              v.src_frames, v.rate_frames, v.used_frames);
+  // The cap binds, and never upward: both axes are below the source.
+  EXPECT_TRUE(v.rescaled());
+  EXPECT_FALSE(v.upscaled());
+  EXPECT_TRUE(v.canvas_h <= 1080 && v.canvas_w <= 1920);
+  EXPECT_TRUE((std::int64_t)v.canvas_h * v.canvas_w <= 768LL * 1344);
+  // 90 frames at 30 fps is 72 at 24 -- the rate resample alone, before
+  // any truncation. Then `target_frames` cuts 72 to 39.
+  EXPECT_TRUE(v.rate_frames == 72);
+  EXPECT_TRUE(v.used_frames == 39);
+  EXPECT_TRUE(v.src_frames == 90);
+
+  const auto& i = enc.fits[1];
+  // The reference's own 128 won, not the plan's 2048 default.
+  EXPECT_TRUE(i.canvas_h == 128 && i.canvas_w == 128);
+  EXPECT_TRUE(i.upscaled());
+  std::printf("[minimax_h3_refenc] still 64x64 -> %dx%d on its own short "
+              "edge\n", i.canvas_w, i.canvas_h);
+}
+
 TEST(minimax_h3_refenc, request_limits)
 {
   h3::ReferenceLimits lim;

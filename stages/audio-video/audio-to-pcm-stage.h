@@ -173,8 +173,18 @@ private:
   int             _last_in_channels     = 0;
   enum AVSampleFormat _last_in_sample_fmt = AV_SAMPLE_FMT_NONE;
 
-  // Rolling chunk buffer (mono f32 at _output_sample_rate).
+  int      _channels = 1;
+
+  // Rolling chunk buffer: PACKED f32 at _output_sample_rate, so
+  // `_channels` floats per sample frame. The de-interleave to the planar
+  // [2, N] the oport promises happens once, at emit.
   std::vector<float> _chunk_buf;
+  // Sample frames currently buffered -- floats / channels. The chunk
+  // boundaries are seconds, so they count frames and never floats.
+  std::size_t chunk_frames_() const
+  {
+    return _channels > 0 ? _chunk_buf.size() / (std::size_t)_channels : 0;
+  }
   // UTC microseconds of the FIRST sample in `_chunk_buf`. Set on the
   // first appended packet of a chunk; reset to 0 after emit.
   std::uint64_t      _chunk_first_ts_us = 0;

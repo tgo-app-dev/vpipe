@@ -34,6 +34,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -181,6 +182,41 @@ const StageSpec kSpec = {
   .oports    = kOports,
   .attrs     = kAttrs,
 };
+
+
+// The block stems of every DiT this stage drives, and the FLOOR they
+// imply.
+//
+// ONE list, used by declare_memory() and declare_resources() both. They
+// answer different questions -- what the plan reports, and what the
+// resource phase may refuse a graph on -- but they must answer them
+// about the same bytes, and a stem list maintained twice is a silent
+// per-family divergence: a family missing from one copy is reported as
+// streamable and judged as though it were not.
+//
+// A stem matching nothing contributes nothing, so naming all four costs
+// one lookup each and cannot mis-measure a checkpoint that uses only
+// one of them.
+std::size_t
+dit_floor_bytes_(const std::string& dit)
+{
+  // EVERY stack, not just the first. These models stream BOTH of their
+  // stacks and keep a slot pair for each, so a stem list that names one
+  // leaves the other in the trunk -- MEASURED on FLUX.2-klein-9B, whose
+  // 24 single blocks are 10.5 GB of a 17.3 GB checkpoint: naming only
+  // `transformer_blocks.` reported a floor of 12324 MB against a true
+  // 2848, which is a declaration that says almost nothing.
+  static const std::vector<std::string_view> kStems = {
+      "transformer_blocks.",         // FLUX.2 doubles, Krea-2, Qwen-Image
+      "single_transformer_blocks.",  // FLUX.2 singles
+      "double_stream_layers.",       // Boogu doubles
+      "single_stream_layers.",       // Boogu singles
+      "double_blocks.",              // Comfy-Org repacks
+      "single_blocks.",
+      "blocks.",                     // single-stack spellings
+  };
+  return model_memory::streaming_floor_bytes(dit, kStems);
+}
 
 }  // namespace
 
@@ -377,6 +413,73 @@ flux2_vae_base_(const std::string& root)
   return 128;
 }
 
+// Force or suppress the free-the-DiT-for-the-decode reclaim.
+//
+//   VPIPE_IMAGE_DIT_RECLAIM=1  always free   =0  never free
+//   unset                      decide from the memory budget (the default)
+//
+// Exists because the path is otherwise reachable only on a box tight
+// enough to need it, which is exactly the box a test is least likely to
+// be running on -- so the reclaim, the hand-off to the weight pool and
+// the reload it implies went unexercised anywhere but in production on a
+// 16 GB machine. `0` is the operator's side of the same switch: on a box
+// with room to spare, never giving the DiT up saves the reload on every
+// prompt.
+//
+// Returns 1 / 0 / -1 for force / suppress / decide.
+int
+forced_dit_reclaim_()
+{
+  const char* e = std::getenv("VPIPE_IMAGE_DIT_RECLAIM");
+  if (e == nullptr || *e == '\0') { return -1; }
+  return std::atoi(e) != 0 ? 1 : 0;
+}
+
+// ---- VAE decode peaks ---------------------------------------------------
+//
+// The number a streamed DiT reserves for, the number its free-for-decode
+// tests against, and the number published to the plan as the decode
+// arena are all THE SAME number. They were three copies of one
+// expression per family, which is how the Qwen-Image-Edit reserve came to
+// be computing the FLUX.2 shape against a `_vae_base` its arm had never
+// set. One definition per VAE topology, so a drift is a compile error
+// rather than a silently generous or stingy reserve.
+//
+// Both are f16 (2 bytes/element) and both model ONE up-level's working
+// set: the per-up-block command-buffer split (default on) commits and
+// frees each level before the next, so the resident peak is a level, not
+// the summed up-path.
+
+// AutoencoderKLFlux2, and the plain diffusers AutoencoderKL that
+// Boogu-Image uses. The big convs run the NAX hardware conv and never
+// materialize a 9*base im2col, so the peak is the per-level activation
+// pool -- MEASURED at ~7x one full-res base-channel buffer at 1024^2
+// (~2.8 GB), NOT the 9x-im2col figure, which was a ~2.3x phantom that
+// over-estimated the decode ~2x. `base` = max(block_out[0..1]); see
+// flux2_vae_base_ and MetalFlux2Vae::decode_peak_bytes.
+std::size_t
+flux2_decode_peak_(int w, int h, int base)
+{
+  if (w <= 0 || h <= 0 || base <= 0) { return 0; }
+  return (std::size_t)h * (std::size_t)w * (std::size_t)base * 2 * 7;
+}
+
+// AutoencoderKLQwenImage -- Krea-2 AND Qwen-Image-Edit, which run the
+// same MetalKrea2Vae. Here the largest buffer in a level IS the top-res
+// im2col scratch [Hout*Wout, 9*base]: conv_out (3 ch) and the top-level
+// resblock convs (base ch) cannot use the hardware conv (cout % 64 != 0)
+// and fall back to im2col even in hwconv mode. Plus ~50% for that
+// level's input/output/carry. Mirrors MetalKrea2Vae::decode_peak_bytes;
+// `base` = the checkpoint's base_dim, see krea2_vae_base_.
+std::size_t
+qwen_decode_peak_(int w, int h, int base)
+{
+  if (w <= 0 || h <= 0 || base <= 0) { return 0; }
+  const std::size_t im2col =
+      (std::size_t)h * (std::size_t)w * 9 * (std::size_t)base * 2;
+  return im2col + im2col / 2;
+}
+
 // Mage-Flow's static flow-matching shift from <root>/scheduler/
 // scheduler_config.json (FlowMatchEulerDiscreteScheduler, shift 6.0,
 // use_dynamic_shifting false). 6.0 when unreadable -- the published value and
@@ -495,10 +598,7 @@ GenerateImageStage::declare_memory() const
   // lifetimes, and collapsing them to one number loses the distinction
   // the plan exists to make. Naming them is also what keeps a second
   // generate-image over the same model from being billed twice.
-  const std::size_t dit_floor = model_memory::streaming_floor_bytes(
-      dit, {"transformer_blocks.", "double_stream_layers.",
-            "double_blocks.", "blocks."});
-  m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor);
+  m.hold(dit, model_memory::dir_weights_bytes(dit), dit_floor_bytes_(dit));
   m.hold(enc, model_memory::dir_weights_bytes(enc));
   // No unload policy on this stage: it holds both for the run. Freeing
   // the DiT for a decode that would not otherwise fit
@@ -519,8 +619,23 @@ GenerateImageStage::declare_resources() const
   const std::string enc = fs::exists(mllm, ec)
                               ? mllm
                               : (fs::path(root) / "text_encoder").string();
-  std::vector<ResourceClaim> out = model_memory::weight_claims(
-      {(fs::path(root) / "transformer").string(), enc});
+  // THE DiT CARRIES ITS FLOOR, and that is the difference between a
+  // graph being reported and a graph being refused.
+  //
+  // declare_memory() above states the same floor, but into a different
+  // ledger: that one is what a run REPORTS. The floor on a
+  // ResourceClaim is what phase_footprint_floor() and phase_peak() read,
+  // and those are the only place a graph is turned away. Claimed without
+  // one, a streaming DiT is judged at its full on-disk size -- so
+  // "everything streamable at its floor" reads the same as "everything
+  // preloaded", and a 17 GB checkpoint that runs on a couple of blocks
+  // is weighed as 17 GB against the box.
+  const std::string dit = (fs::path(root) / "transformer").string();
+  std::vector<ResourceClaim> out{
+      model_memory::weight_claim_streamable(dit, dit_floor_bytes_(dit))};
+  for (auto& c : model_memory::weight_claims({enc})) {
+    out.push_back(std::move(c));
+  }
 
   // The DECODE ARENA this stage's output implies.
   //
@@ -757,13 +872,31 @@ GenerateImageStage::ensure_loaded_()
       return;
     }
     if (stream_blocks) {
+      // No prefix any more: the pinned-prefix policy was a fraction of
+      // TOTAL RAM decided before the run and blind to the machine, and
+      // the measured resident set (shared/block-residency.h) replaced
+      // it. Growth fills the stack from here as the box allows.
       session()->info(fmt(
-          "GenerateImageStage('{}'): Qwen-Image-Edit DiT streaming, pinned {} of "
-          "{} blocks resident", this->id(), _qie_dit->pinned_blocks(),
+          "GenerateImageStage('{}'): Qwen-Image-Edit DiT streaming {} blocks; "
+          "the resident set grows as the box allows", this->id(),
           qcfg.n_layers));
     }
     _release_scratch = stream_blocks;
     if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    // Cache the load params + VAE base so a memory-driven free after a
+    // generation (free_qie_dit_for_decode_) can reload identically. The
+    // Config is default-constructed above and everything else comes from
+    // the checkpoint's own config.json, so the dir and the streaming
+    // decision are the whole of it.
+    _qie_dit_dir = dit_dir;
+    _qie_stream  = stream_blocks;
+    // AutoencoderKLQwenImage, which is the SAME VAE Krea-2 runs (see
+    // vae_family_ in vae-decode-stage.cc: anything that is not Flux2 /
+    // Mage / Wan / MiniMax-H3 opens as one). So it sizes from `base_dim`,
+    // not from diffusers' block_out_channels -- reading it the FLUX.2 way
+    // would have silently pinned the estimate to the 128 default on a
+    // checkpoint whose base_dim is 96.
+    _vae_base = krea2_vae_base_(root);
   } else if (_family == "boogu-image") {
     // Boogu's 10B NextDiT. At ~20 GB bf16 it streams on any box that cannot
     // hold it beside the resident Qwen3-VL mllm (~16 GB), which is every box
@@ -835,9 +968,13 @@ GenerateImageStage::ensure_loaded_()
       return;
     }
     if (stream_blocks) {
+      // No prefix any more: the pinned-prefix policy was a fraction of
+      // TOTAL RAM decided before the run and blind to the machine, and
+      // the measured resident set (shared/block-residency.h) replaced
+      // it. Growth fills the stack from here as the box allows.
       session()->info(fmt(
-          "GenerateImageStage('{}'): Mage-Flow DiT streaming, pinned {} of {} "
-          "blocks resident", this->id(), _mage_dit->pinned_blocks(),
+          "GenerateImageStage('{}'): Mage-Flow DiT streaming {} blocks; the "
+          "resident set grows as the box allows", this->id(),
           mcfg.n_layers));
     }
     _release_scratch = stream_blocks;
@@ -926,38 +1063,41 @@ void
 GenerateImageStage::free_flux2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_flux2_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  publish_decode_arena_((std::size_t)gen_h * gen_w *
-                        (std::size_t)_vae_base * 2 * 7);
+  const std::size_t peak = flux2_decode_peak_(gen_w, gen_h, _vae_base);
+  publish_decode_arena_(peak);
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
-  if (mb.recommended == 0) { return; }   // budget query unavailable
-  // FLUX.2 VAE decode peak, mirroring MetalFlux2Vae::decode_peak_bytes on the
-  // DEFAULT hw-conv + split path: the big convs run the NAX hardware conv and
-  // never materialize the 9*base im2col scratch, so the resident peak is the
-  // per-level activation pool -- MEASURED ~7x one full-res base-ch buffer at
-  // 1024^2 (~2.8 GB decode delta), NOT the 9x-im2col figure (a ~2.3x phantom
-  // that over-estimated the decode ~2x). _vae_base = max(block_out[0..1]).
-  const std::size_t peak =
-      (std::size_t)gen_h * gen_w * (std::size_t)_vae_base * 2 * 7;
-  // Free if EITHER budget is short: fits() (our Metal working set) misses
-  // pressure from OTHER apps' resident memory; fits_physical() (host-wide
-  // reclaimable RAM) catches it, so external pressure triggers the reclaim
-  // instead of the decode later failing its own physical backstop.
-  if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  const int forced = forced_dit_reclaim_();
+  if (forced == 0) { return; }           // operator says never
+  if (forced < 0) {
+    if (mb.recommended == 0) { return; }   // budget query unavailable
+    // Free if EITHER budget is short: fits() (our Metal working set)
+    // misses pressure from OTHER apps' resident memory; fits_physical()
+    // (host-wide reclaimable RAM) catches it, so external pressure
+    // triggers the reclaim instead of the decode later failing its own
+    // physical backstop.
+    if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  }
   // The DiT is idle now (its latent is read back). Free the ~9 GB of mmap'd
   // weights so the downstream vae-decode stage's working set has room; the DiT
   // reloads lazily when the next prompt arrives. Done BEFORE the latent is
   // published, so the decode sees the freed working set.
+  // The numbers are reported either way, but a FORCED free must not
+  // read as a measured one -- "13072 MB headroom < 162 MB needed" is a
+  // comparison that never happened, and chasing it wastes the next
+  // reader's afternoon.
   session()->info(fmt(
-      "GenerateImageStage('{}'): freeing the FLUX.2 DiT ({} MB working-set "
-      "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
-      "reloads on the next prompt", this->id(), mb.headroom >> 20,
-      mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
-  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
-  // pool_weights() finds the set through a WEAK reference and there is
-  // nothing left to pool once this model has released its last strong
-  // one.
+      "GenerateImageStage('{}'): freeing the FLUX.2 DiT for the {}x{} "
+      "vae-decode (~{} MB): {} MB working-set headroom, ~{} MB "
+      "reclaimable{}; reloads on the next prompt", this->id(),
+      gen_w, gen_h, peak >> 20, mb.headroom >> 20,
+      mb.available_physical >> 20,
+      forced > 0 ? " -- FORCED by VPIPE_IMAGE_DIT_RECLAIM" : ""));
+  // SETTLED WITH THE MANAGER, which owns the checkpoint: the reset below
+  // only ends this stage's borrow. The order against it used to be the
+  // whole point -- the manager's reference was weak, so there was
+  // nothing left to pool afterwards -- and is now free either way.
   //
   // This free is the pool's best case. The DiT is being given up to make
   // room for a decode that may or may not actually need it: pooled, the
@@ -997,9 +1137,13 @@ GenerateImageStage::load_boogu_dit_()
   _boogu_dit = genai::MetalBooguTransformer::load(weight_set_(_boogu_dit_dir),
                                                  mc, bcfg, _boogu_stream);
   if (_boogu_dit && _boogu_stream) {
+    // No prefix any more: the pinned-prefix policy was a fraction of
+    // TOTAL RAM decided before the run and blind to the machine, and
+    // the measured resident set (shared/block-residency.h) replaced
+    // it. Growth fills the stack from here as the box allows.
     session()->info(fmt(
-        "GenerateImageStage('{}'): Boogu DiT streaming, pinned {} of {} blocks "
-        "resident", this->id(), _boogu_dit->pinned_blocks(),
+        "GenerateImageStage('{}'): Boogu DiT streaming {} blocks; the resident "
+        "set grows as the box allows", this->id(),
         _boogu_dit->config().n_double + _boogu_dit->config().n_single));
   }
   return (bool)_boogu_dit;
@@ -1009,17 +1153,20 @@ void
 GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_boogu_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  publish_decode_arena_((std::size_t)gen_h * gen_w *
-                        (std::size_t)_vae_base * 2 * 7);
+  // Boogu's VAE is the plain AutoencoderKL through MetalFlux2Vae.
+  const std::size_t peak = flux2_decode_peak_(gen_w, gen_h, _vae_base);
+  publish_decode_arena_(peak);
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
-  if (mb.recommended == 0) { return; }   // budget query unavailable
-  // Boogu's VAE is the plain AutoencoderKL through MetalFlux2Vae, so the decode
-  // peak is the FLUX.2 estimate: ~7x one full-res base-channel buffer.
-  const std::size_t peak =
-      (std::size_t)gen_h * gen_w * (std::size_t)_vae_base * 2 * 7;
-  const bool decode_runs_beside_us = mb.fits(peak) && mb.fits_physical(peak);
+  const int forced = forced_dit_reclaim_();
+  if (forced == 0) { return; }           // operator says never
+  if (forced < 0) {
+    if (mb.recommended == 0) { return; }   // budget query unavailable
+  }
+  // Forced (1) means free regardless; suppressed (0) returned above.
+  const bool decode_runs_beside_us =
+      forced < 0 && mb.fits(peak) && mb.fits_physical(peak);
   // Tell the DiT how much to leave clear when it decides whether to keep
   // a streamed block. Growth must not eat the arena the decode needs --
   // that trades a disk read for an allocation failure. ZERO when the DiT
@@ -1029,15 +1176,21 @@ GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
   // never having been told.
   _boogu_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
   if (decode_runs_beside_us) { return; }
+  // The numbers are reported either way, but a FORCED free must not
+  // read as a measured one -- "13072 MB headroom < 162 MB needed" is a
+  // comparison that never happened, and chasing it wastes the next
+  // reader's afternoon.
   session()->info(fmt(
-      "GenerateImageStage('{}'): freeing the Boogu-Image DiT ({} MB working-set "
-      "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
-      "reloads on the next prompt", this->id(), mb.headroom >> 20,
-      mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
-  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
-  // pool_weights() finds the set through a WEAK reference and there is
-  // nothing left to pool once this model has released its last strong
-  // one.
+      "GenerateImageStage('{}'): freeing the Boogu-Image DiT for the {}x{} "
+      "vae-decode (~{} MB): {} MB working-set headroom, ~{} MB "
+      "reclaimable{}; reloads on the next prompt", this->id(),
+      gen_w, gen_h, peak >> 20, mb.headroom >> 20,
+      mb.available_physical >> 20,
+      forced > 0 ? " -- FORCED by VPIPE_IMAGE_DIT_RECLAIM" : ""));
+  // SETTLED WITH THE MANAGER, which owns the checkpoint: the reset below
+  // only ends this stage's borrow. The order against it used to be the
+  // whole point -- the manager's reference was weak, so there was
+  // nothing left to pool afterwards -- and is now free either way.
   //
   // This free is the pool's best case. The DiT is being given up to make
   // room for a decode that may or may not actually need it: pooled, the
@@ -1050,6 +1203,76 @@ GenerateImageStage::free_boogu_dit_for_decode_(int gen_w, int gen_h)
     mgr->pool_weights(_boogu_dit_dir);
   }
   _boogu_dit.reset();
+  _dit_unloaded = true;
+}
+
+bool
+GenerateImageStage::load_qie_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _qie_dit_dir.empty()) { return false; }
+  // Default-constructed, exactly as the first load was: everything that
+  // varies (quantization, zero_cond_t, the block count) is read from the
+  // checkpoint's config.json inside load().
+  genai::MetalQwenImageTransformer::Config qcfg;
+  _qie_dit = genai::MetalQwenImageTransformer::load(
+      weight_set_(_qie_dit_dir), mc, qcfg, _qie_stream);
+  return (bool)_qie_dit;
+}
+
+void
+GenerateImageStage::free_qie_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_qie_dit || gen_w <= 0 || gen_h <= 0 || _vae_base <= 0) { return; }
+  const std::size_t peak = qwen_decode_peak_(gen_w, gen_h, _vae_base);
+  publish_decode_arena_(peak);
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  const auto mb = mc->memory_budget();
+  const int forced = forced_dit_reclaim_();
+  if (forced == 0) { return; }           // operator says never
+  if (forced < 0) {
+    if (mb.recommended == 0) { return; }   // budget query unavailable
+    // Free if EITHER budget is short: fits() (our Metal working set)
+    // misses pressure from OTHER apps' resident memory; fits_physical()
+    // (host-wide reclaimable RAM) catches it, so external pressure
+    // triggers the reclaim instead of the decode later failing its own
+    // physical backstop.
+    if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  }
+  // The numbers are reported either way, but a FORCED free must not
+  // read as a measured one -- "13072 MB headroom < 162 MB needed" is a
+  // comparison that never happened, and chasing it wastes the next
+  // reader's afternoon.
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the Qwen-Image-Edit DiT for the {}x{} "
+      "vae-decode (~{} MB): {} MB working-set headroom, ~{} MB "
+      "reclaimable{}; reloads on the next prompt", this->id(),
+      gen_w, gen_h, peak >> 20, mb.headroom >> 20,
+      mb.available_physical >> 20,
+      forced > 0 ? " -- FORCED by VPIPE_IMAGE_DIT_RECLAIM" : ""));
+  // SETTLED WITH THE MANAGER, which owns the checkpoint: the reset below
+  // only ends this stage's borrow. The order against it used to be the
+  // whole point -- the manager's reference was weak, so there was
+  // nothing left to pool afterwards -- and is now free either way.
+  //
+  // This free is the pool's best case. The DiT is being given up to make
+  // room for a decode that may or may not actually need it: pooled, the
+  // pages stay purgeable, so if the decode does need them
+  // reclaim_at_least() spends the pool first and they go -- and if it
+  // does not, the next prompt recycles the checkpoint instead of
+  // re-reading 20B of weights. Dropping outright took the reload every
+  // time and could not tell the two cases apart.
+  //
+  // The destructor below is also what gives this model's share of the
+  // WIRED POOL back (see MetalQwenImageTransformer::~...): freeing a
+  // wired buffer unwires it in the kernel but does not decrement the
+  // pool's counter, so a per-prompt free that skipped it would leak the
+  // whole share every prompt until nothing could wire at all.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_qie_dit_dir);
+  }
+  _qie_dit.reset();
   _dit_unloaded = true;
 }
 
@@ -1069,37 +1292,39 @@ void
 GenerateImageStage::free_krea2_dit_for_decode_(int gen_w, int gen_h)
 {
   if (!_dit || gen_w <= 0 || gen_h <= 0) { return; }
-  {
-    const std::size_t im2col =
-        (std::size_t)gen_h * gen_w * 9 * (std::size_t)_vae_base * 2;
-    publish_decode_arena_(im2col + im2col / 2);
-  }
+  // Checked AFTER release_forward_scratch(), so the weights are only
+  // freed when dropping the scratch was not enough.
+  const std::size_t peak = qwen_decode_peak_(gen_w, gen_h, _vae_base);
+  publish_decode_arena_(peak);
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
   if (mc == nullptr) { return; }
   const auto mb = mc->memory_budget();
-  if (mb.recommended == 0) { return; }   // budget query unavailable
-  // Krea-2 VAE (shared MetalKrea2Vae) decode peak, mirroring its
-  // decode_peak_bytes on the default split-on path: one up-level's top-res
-  // im2col scratch Hout*Wout*9*base*2 (= gen_h*gen_w*9*base*2) + ~50% for the
-  // level's I/O activations. Checked AFTER release_forward_scratch() so we only
-  // free the (reloadable) weights when dropping the scratch wasn't enough.
-  const std::size_t im2col =
-      (std::size_t)gen_h * gen_w * 9 * (std::size_t)_vae_base * 2;
-  const std::size_t peak = im2col + im2col / 2;
-  // Free if EITHER budget is short. fits() (our Metal working set) misses
-  // pressure from OTHER apps' resident memory; fits_physical() (host-wide
-  // reclaimable RAM) catches it -- otherwise external pressure leaves the DiT
-  // resident and the decode just fails its own physical backstop instead.
-  if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  const int forced = forced_dit_reclaim_();
+  if (forced == 0) { return; }           // operator says never
+  if (forced < 0) {
+    if (mb.recommended == 0) { return; }   // budget query unavailable
+    // Free if EITHER budget is short. fits() (our Metal working set)
+    // misses pressure from OTHER apps' resident memory; fits_physical()
+    // (host-wide reclaimable RAM) catches it -- otherwise external
+    // pressure leaves the DiT resident and the decode just fails its own
+    // physical backstop instead.
+    if (mb.fits(peak) && mb.fits_physical(peak)) { return; }
+  }
+  // The numbers are reported either way, but a FORCED free must not
+  // read as a measured one -- "13072 MB headroom < 162 MB needed" is a
+  // comparison that never happened, and chasing it wastes the next
+  // reader's afternoon.
   session()->info(fmt(
-      "GenerateImageStage('{}'): freeing the Krea-2 DiT ({} MB working-set "
-      "headroom / ~{} MB reclaimable < ~{} MB for the {}x{} vae-decode); "
-      "reloads on the next prompt", this->id(), mb.headroom >> 20,
-      mb.available_physical >> 20, peak >> 20, gen_w, gen_h));
-  // TO THE POOL, not simply dropped -- and BEFORE the reset, because
-  // pool_weights() finds the set through a WEAK reference and there is
-  // nothing left to pool once this model has released its last strong
-  // one.
+      "GenerateImageStage('{}'): freeing the Krea-2 DiT for the {}x{} "
+      "vae-decode (~{} MB): {} MB working-set headroom, ~{} MB "
+      "reclaimable{}; reloads on the next prompt", this->id(),
+      gen_w, gen_h, peak >> 20, mb.headroom >> 20,
+      mb.available_physical >> 20,
+      forced > 0 ? " -- FORCED by VPIPE_IMAGE_DIT_RECLAIM" : ""));
+  // SETTLED WITH THE MANAGER, which owns the checkpoint: the reset below
+  // only ends this stage's borrow. The order against it used to be the
+  // whole point -- the manager's reference was weak, so there was
+  // nothing left to pool afterwards -- and is now free either way.
   //
   // This free is the pool's best case. The DiT is being given up to make
   // room for a decode that may or may not actually need it: pooled, the
@@ -1165,14 +1390,19 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
   // clear -- so reserving it there protects a coexistence that never
   // happens and costs every block of every step.
   if (_vae_base > 0 && _dit) {
-    const std::size_t im2col =
-        (std::size_t)H * W * 9 * (std::size_t)_vae_base * 2;
-    const std::size_t peak = im2col + im2col / 2;
+    const std::size_t peak = qwen_decode_peak_(W, H, _vae_base);
     const auto mb = mc->memory_budget();
     // No budget to read -> the free bails out too, so the DiT survives.
     const bool decode_runs_beside_us =
         mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
     _dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    // And the RATES for this schedule. Both of BlockResidency's defaults
+    // are tuned for a ~30-step run: on a short one the probe would reach
+    // full residency only near the end, where nothing is left to use it.
+    // After the reserve, because the probe is sized against what is left
+    // once the reserve is taken.
+    _dit->set_residency_schedule(
+        _scheduler_spec.steps > 0 ? _scheduler_spec.steps : 1);
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Krea-2 residency reserve {} MB -- the "
         "{}x{} vae-decode wants {} MB and {}",
@@ -1442,13 +1672,19 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   // failure). Same predicate as the free, measured rather than assumed;
   // the post-denoise check stays the authority on a borderline box.
   if (_vae_base > 0) {
-    const std::size_t peak =
-        (std::size_t)H * W * (std::size_t)_vae_base * 2 * 7;
+    const std::size_t peak = flux2_decode_peak_(W, H, _vae_base);
     const auto mb = mc->memory_budget();
     // No budget to read -> the free bails out too, so the DiT survives.
     const bool decode_runs_beside_us =
         mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
     _flux2_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    // And the RATES for this schedule. Both of BlockResidency's defaults
+    // are tuned for a ~30-step run: on a short one the probe would reach
+    // full residency only near the end, where nothing is left to use it.
+    // After the reserve, because the probe is sized against what is left
+    // once the reserve is taken.
+    _flux2_dit->set_residency_schedule(
+        _scheduler_spec.steps > 0 ? _scheduler_spec.steps : 1);
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): FLUX.2 residency reserve {} MB -- the "
         "{}x{} vae-decode wants {} MB and {}",
@@ -1685,6 +1921,40 @@ GenerateImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
   sched.img_seq_len = img_seq;
   const bool dmd = (samp.method == "dmd");
   const int S = sched.steps < 1 ? 1 : sched.steps;
+
+  // How much room the streamed DiT must leave clear to keep a block
+  // resident -- and the reason this is HERE rather than only in
+  // free_boogu_dit_for_decode_, which is where it used to be set.
+  //
+  // That free runs AFTER the denoise, so on the first prompt no reserve
+  // had ever been declared while the blocks were being decided, and
+  // BlockResidency keeps growth OFF until one is (deliberately: a model
+  // that has not been told what its peers cost should not grow against a
+  // guess). Boogu therefore streamed its whole stack for every step of
+  // the generation the reserve was meant to inform.
+  //
+  // Same rule as FLUX.2 and Krea-2, against Boogu's own decode peak:
+  // reserve the VAE decode only where it would actually run beside us.
+  // Where it would not, that free drops the whole DiT first, which is
+  // strictly more than a reserve could hold clear -- so reserving it
+  // there protects a coexistence that never happens and costs every
+  // block of every step.
+  if (_vae_base > 0 && _boogu_dit) {
+    const std::size_t peak = flux2_decode_peak_(W, H, _vae_base);
+    const auto mb = mc->memory_budget();
+    // No budget to read -> the free bails out too, so the DiT survives.
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _boogu_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    _boogu_dit->set_residency_schedule(S);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Boogu residency reserve {} MB -- the "
+        "{}x{} vae-decode wants {} MB and {}",
+        this->id(), (decode_runs_beside_us ? peak : 0) >> 20, W, H,
+        peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+  }
   // DMD builds its own linspace(conditioning_sigma, 1, S+1)[:-1]; the Euler
   // path takes the shifted schedule (ascending, terminal 1.0).
   std::vector<double> sig;
@@ -1912,16 +2182,42 @@ GenerateImageStage::generate_qie_(const metal_compute::SharedBuffer& txt_pos,
   // allocation failure.
   //
   // Set HERE rather than at load, because the figure is a function of
-  // the geometry and the geometry arrives with the beat. It is also the
-  // only place that can: unlike the other image families, this one has
-  // no free-the-DiT-for-the-decode path, so nothing else would ever
-  // declare a reserve -- and BlockResidency keeps growth OFF until one
-  // is declared, which is deliberate: a model that has not been told
-  // what its peers cost should not grow against a guess.
-  if (mc != nullptr) {
-    const std::size_t peak =
-        (std::size_t)H * W * (std::size_t)_vae_base * 2 * 7;
-    _qie_dit->set_residency_reserve(peak);
+  // the geometry and the geometry arrives with the beat.
+  //
+  // Same rule as the other three families, against this one's own decode
+  // peak (free_qie_dit_for_decode_): reserve the VAE decode only where it
+  // would actually run beside us. Where it would not, that free drops the
+  // whole 20B DiT first, which is strictly more than a reserve could hold
+  // clear -- so reserving it there protects a coexistence that never
+  // happens, and pays for it by streaming every block of every step.
+  //
+  // The peak is the Krea-2 shape, not the FLUX.2 one it used to be: this
+  // family's VAE is AutoencoderKLQwenImage, whose top-res im2col scratch
+  // is [Hout*Wout, 9*base] plus ~50%. The old `base * 7` expression was
+  // the FLUX.2 hw-conv activation-pool model, and it read `_vae_base`
+  // that nothing in this arm had ever set -- so it ran on the 128
+  // default against a checkpoint whose base_dim is 96.
+  if (mc != nullptr && _vae_base > 0) {
+    const std::size_t peak = qwen_decode_peak_(W, H, _vae_base);
+    const auto mb = mc->memory_budget();
+    // No budget to read -> the free bails out too, so the DiT survives.
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _qie_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-Edit residency reserve {} MB "
+        "-- the {}x{} vae-decode wants {} MB and {}",
+        this->id(), (decode_runs_beside_us ? peak : 0) >> 20, W, H,
+        peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+    // And the RATES for this schedule. Both of BlockResidency's defaults
+    // are tuned for a ~30-step run: on a short one the probe would reach
+    // full residency only near the end, where nothing is left to use it.
+    // After the reserve, because the probe is sized against what is left
+    // once the reserve is taken.
+    _qie_dit->set_residency_schedule(
+        _scheduler_spec.steps > 0 ? _scheduler_spec.steps : 1);
   }
 
   // `txt_pos` is the diffusion-conditioner's qwen-image-edit conditioning: the
@@ -2441,6 +2737,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         this->id()));
     if (load_krea2_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "qwen-image-edit" && _dit_unloaded && !_qie_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the Qwen-Image-Edit DiT for the "
+        "next prompt", this->id()));
+    if (load_qie_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
@@ -2769,6 +3071,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "GenerateImageStage('{}'): Qwen-Image-Edit latent [16, {}, {}] "
         "({} steps @ {}x{})", this->id(), lh, lw, _scheduler_spec.steps,
         gen_h, gen_w));
+    // Before publishing: on a bounded box 20B of resident DiT would leave
+    // the downstream vae-decode no working set. Freed here, reloaded on
+    // the next prompt (the latent is already read back, so the DiT is
+    // idle) -- and BEFORE the write, so the separate vae-decode stage
+    // sees the freed room rather than racing it.
+    free_qie_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
   }
