@@ -97,6 +97,15 @@ SaveVideoStage::SaveVideoStage
   _enable_audio = attr_bool("enable_audio");
 
   const FlexData& cfg = this->config();
+  // Whether a key was WRITTEN, as opposed to resolving to its default.
+  // The flat keys have to override the superseded nesting only where
+  // they were actually set, or a graph using the old spelling would
+  // have every setting overwritten by a default it never asked for.
+  const auto written = [this](const char* k) {
+    const FlexData& c = this->config();
+    if (!c.is_object()) { return false; }
+    return c.as_object().contains(k);
+  };
   if (cfg.is_object()) {
     auto root = cfg.as_object();
     if (root.contains("video")) {
@@ -144,7 +153,40 @@ SaveVideoStage::SaveVideoStage
     if (root.contains("muxer_options")) {
       _muxer_options = root.at("muxer_options");
     }
+    if (root.contains("video") || root.contains("audio")) {
+      session()->warn(fmt(
+          "SaveVideoStage('{}'): the nested `video` / `audio` config "
+          "objects are superseded by flat keys (video_codec, "
+          "video_bitrate, video_preset, video_crf, video_gop_size, "
+          "video_options; audio_codec, audio_bitrate, audio_options). "
+          "Still honoured, so this graph runs unchanged -- but only the "
+          "flat keys carry a default and a description an editor can "
+          "show", this->id()));
+    }
   }
+
+  // The flat keys LAST, so an explicitly-set one wins over the same
+  // setting arriving through the superseded nesting. Read through
+  // `written` rather than unconditionally: attr_* cannot distinguish a
+  // configured value from the spec default, and applying the default
+  // here would silently undo a nested setting.
+  if (written("video_codec"))   { _video_codec   = attr_str("video_codec"); }
+  if (written("video_bitrate")) { _video_bitrate = attr_int("video_bitrate"); }
+  if (written("video_preset"))  { _video_preset  = attr_str("video_preset"); }
+  if (written("video_gop_size")) {
+    _video_gop_size = static_cast<int>(attr_int("video_gop_size"));
+  }
+  if (written("video_crf")) {
+    // NEGATIVE means unset, and that distinction is load-bearing: crf 0
+    // is lossless, a legal request, so absence cannot be spelled as 0.
+    const std::int64_t v = attr_int("video_crf");
+    _video_has_crf = v >= 0;
+    if (_video_has_crf) { _video_crf = static_cast<int>(v); }
+  }
+  if (written("video_options")) { _video_options = attr("video_options"); }
+  if (written("audio_codec"))   { _audio_codec   = attr_str("audio_codec"); }
+  if (written("audio_bitrate")) { _audio_bitrate = attr_int("audio_bitrate"); }
+  if (written("audio_options")) { _audio_options = attr("audio_options"); }
 
   // Validation is deferred to launch (see Stage::fail_config).
   if (_output_url.empty()) {
@@ -197,12 +239,65 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "encode a video stream", .def_bool = true},
   {.key = "enable_audio", .type = ConfigType::Bool,
    .doc = "encode an audio stream", .def_bool = true},
-  {.key = "video", .type = ConfigType::Object,
-   .doc = "video opts: codec/bitrate/preset/crf/gop_size/options"},
-  {.key = "audio", .type = ConfigType::Object,
-   .doc = "audio opts: codec/bitrate/options"},
+  // FLAT, one key per setting, because an editor can only show a default
+  // and a doc for something the spec names. These lived in a `video` /
+  // `audio` Object whose doc was a slash-separated list of sub-keys --
+  // readable in source, and nothing the web-ui could turn into a form:
+  // an Object is one opaque field, so every default and every
+  // explanation below was invisible to whoever was filling it in.
+  {.key = "video_codec", .type = ConfigType::String,
+   .doc = "video encoder. The default is part of macOS, hardware "
+          "accelerated, and carries no licence obligation -- libx264 is "
+          "GPL and cannot ship in an FFmpeg build this project "
+          "redistributes. A non-Apple build falls back to libx264 at "
+          "init. Anything the linked libavcodec provides is accepted",
+   .def_str = "h264_videotoolbox"},
+  {.key = "video_bitrate", .type = ConfigType::Int,
+   .doc = "target video bitrate in bits per second. Ignored by an "
+          "encoder run in constant-quality mode -- see video_crf",
+   .def_int = 2000000},
+  {.key = "video_preset", .type = ConfigType::String,
+   .doc = "encoder speed/size preset (ultrafast .. veryslow), for the "
+          "encoders that take one; ignored by those that do not",
+   .def_str = "medium"},
+  {.key = "video_crf", .type = ConfigType::Int,
+   .doc = "constant-quality target instead of a bitrate: lower is "
+          "better, 0 is lossless, ~18-28 is the usual range. -1 (the "
+          "default) leaves it UNSET, and video_bitrate decides. Set by "
+          "the encoders that support crf; ignored by the others",
+   .def_int = -1},
+  {.key = "video_gop_size", .type = ConfigType::Int,
+   .doc = "keyframe interval in frames. Smaller seeks and recovers "
+          "faster and costs size",
+   .def_int = 60},
+  {.key = "video_options", .type = ConfigType::Object,
+   .doc = "extra av_dict options passed to the video encoder, for "
+          "anything the keys above do not name"},
+  {.key = "audio_codec", .type = ConfigType::String,
+   .doc = "audio encoder", .def_str = "aac"},
+  {.key = "audio_bitrate", .type = ConfigType::Int,
+   .doc = "target audio bitrate in bits per second", .def_int = 128000},
+  {.key = "audio_options", .type = ConfigType::Object,
+   .doc = "extra av_dict options passed to the audio encoder"},
   {.key = "muxer_options", .type = ConfigType::Object,
-   .doc = "av_dict string opts for the muxer"},
+   .doc = "av_dict string opts for the muxer. NOT flattened: unlike the "
+          "encoder settings above these have no fixed set of names -- "
+          "they are whatever the chosen container takes"},
+
+  // The superseded nesting. Still READ, so a pipeline written against it
+  // keeps working, and warned about so it does not keep working
+  // silently: an unknown key is not an error anywhere in this runtime,
+  // which is what makes a quiet removal the wrong way to do this. Kept
+  // in the spec rather than dropped so an editor showing an old
+  // pipeline can say what the field is instead of leaving it unnamed.
+  {.key = "video", .type = ConfigType::Object,
+   .doc = "SUPERSEDED by video_codec / video_bitrate / video_preset / "
+          "video_crf / video_gop_size / video_options. Still read, and "
+          "warned about; a flat key set alongside it wins"},
+  {.key = "audio", .type = ConfigType::Object,
+   .doc = "SUPERSEDED by audio_codec / audio_bitrate / audio_options. "
+          "Still read, and warned about; a flat key set alongside it "
+          "wins"},
 };
 // Canonical iports (video first, audio second); either may be disabled
 // via config, so the live count comes from the wiring. Each port

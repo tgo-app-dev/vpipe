@@ -1,5 +1,7 @@
 #include "generative-models/video-model-registry.h"
 
+#include "pipeline/stage-config.h"
+
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -31,6 +33,12 @@ VideoModelRegistry::add(std::unique_ptr<VideoModelFamily> f)
     if (e->tag() == tag) { return false; }   // first-wins
   }
   _families.push_back(std::move(f));
+  // A family registered here is one generate-video / vae-decode can now
+  // run, which is a fact their static suggest_db_type cannot carry: it
+  // was written when this tree was compiled and a plugin's family did
+  // not exist. Telling the channel here means a plugin gets a working
+  // model picker by registering a family, with nothing else to remember.
+  register_channel_types("diffusion-model", tag);
   return true;
 }
 

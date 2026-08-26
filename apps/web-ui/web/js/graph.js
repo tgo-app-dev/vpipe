@@ -45,6 +45,10 @@ const SWEEPS    = 16;    // barycentre crossing-min iterations
 const MIN_K     = 0.08;
 const MAX_K     = 4;
 const FIT_MAX_K = 1;     // Fit never enlarges past 1:1 (only shrinks).
+// One press of − / + (button or keyboard). The wheel uses a smaller
+// step: it arrives in a continuous stream, where a discrete press does
+// not and wants to be felt.
+const ZOOM_STEP = 1.2;
 
 // Box height from the rendered port counts. `inCount` is the number of
 // input slots actually drawn (spec-declared, not just the wired ones);
@@ -841,8 +845,8 @@ export function renderGraph(graph, opts = {}) {
     el('button', { class: 'graph-ctl', title,
       onclick: (e) => { e.stopPropagation(); fn(); } }, label);
   const controls = el('div', { class: 'graph-controls' },
-    ctl('−', 'Zoom out', () => zoomBy(1 / 1.2)),
-    ctl('+', 'Zoom in', () => zoomBy(1.2)),
+    ctl('−', 'Zoom out', () => zoomBy(1 / ZOOM_STEP)),
+    ctl('+', 'Zoom in', () => zoomBy(ZOOM_STEP)),
     ctl('1:1', 'Actual size', () => setZoom(1)),
     ctl('Fit', 'Fit whole pipeline', fit),
     ctl('⊙', 'Center', center));
@@ -857,6 +861,12 @@ export function renderGraph(graph, opts = {}) {
   // Expose the screen->world mapper so the composer can turn a stage
   // drop point into a grid pin. Takes anything with {clientX, clientY}.
   container.clientToWorld = (evt) => clientToWorld(evt);
+  // ...and the zoom step the − / + buttons take, so a host can drive the
+  // same one from a keyboard shortcut. Exposed rather than reimplemented
+  // there: MIN_K/MAX_K and the 1.2 factor live here, and a second copy
+  // would drift from what the buttons do.
+  container.zoomBy = (f) => zoomBy(f);
+  container.zoomStep = ZOOM_STEP;
 
   // Drag to pan. The pointer is captured only once a real drag begins
   // (movement past a threshold). Capturing on pointerdown would

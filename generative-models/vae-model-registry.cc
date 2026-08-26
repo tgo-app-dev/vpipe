@@ -1,5 +1,7 @@
 #include "generative-models/vae-model-registry.h"
 
+#include "pipeline/stage-config.h"
+
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -40,6 +42,12 @@ VaeModelRegistry::add(std::unique_ptr<VaeModelFamily> f)
     if (e->tag() == tag) { return false; }   // first-wins
   }
   _families.push_back(std::move(f));
+  // Same reason as the video registry: a VAE family registered here is
+  // one vae-decode can now decode, and the channel is what carries that
+  // to the picker. Redundant when the plugin also registered a video
+  // family under the same tag -- the channel dedups -- and load-bearing
+  // for an image-only family that registers just this one.
+  register_channel_types("diffusion-model", tag);
   return true;
 }
 

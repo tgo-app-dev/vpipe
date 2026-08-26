@@ -1,0 +1,225 @@
+#include "stages/audio-video/temporal-slice-stage.h"
+
+#include "common/flex-data.h"
+#include "common/vpipe-format.h"
+#include "interfaces/session-context-intf.h"
+
+#include <algorithm>
+#include <utility>
+
+namespace vpipe {
+
+namespace {
+
+constexpr ConfigKey kAttrs[] = {
+  // All three optional, like every part of a Python slice. With none of
+  // them set this is `[:]` -- a pass-through, which is the harmless
+  // thing for an unconfigured stage to be.
+  {.key = "start", .type = ConfigType::Int, .required = false,
+   .doc = "first beat of the slice, Python-style. NEGATIVE counts back "
+          "from the end -- -1 is the last beat, -2 the one before it -- "
+          "which the stage can only resolve once the source hits EOS, so "
+          "it holds that many beats until then. Absent: start at the "
+          "first beat",
+   .def_int = 0},
+  {.key = "step", .type = ConfigType::Int, .required = false,
+   .doc = "keep every step-th beat from `start`. Must be POSITIVE: a "
+          "stream is read once and in order, so a negative step would "
+          "mean emitting beats this stage has already let go. Absent: 1",
+   .def_int = 1},
+  {.key = "end", .type = ConfigType::Int, .required = false,
+   .doc = "one PAST the last beat of the slice, Python-style, so the "
+          "slice is [start, end). Negative counts back from the end, on "
+          "the same terms as `start`. Absent: run until the source hits "
+          "EOS",
+   .def_int = 0},
+};
+
+// Untyped ports: this stage never looks inside a beat, it only counts
+// them, so constraining the payload would refuse producers it handles
+// perfectly well. What it forwards is the beat it was handed, which is
+// also how the sideband survives -- there is nothing to copy.
+const PortSpec kIports[] = {
+  {.name = "beats",
+   .doc = "any beat stream; one beat is one position in the sequence",
+   .clock_group = 0},
+};
+const PortSpec kOports[] = {
+  {.name = "beats",
+   .doc = "the selected beats, FORWARDED UNCHANGED -- same payload, same "
+          "shape, same sideband. Not stacked: a slice of N beats is N "
+          "beats, not one tensor with a new axis (that is temporal-stack)",
+   .clock_group = 1},
+};
+
+const StageSpec kSpec = {
+  .type_name = "temporal-slice",
+  .doc       = "Python's seq[start:end:step] over the beat stream: keeps "
+               "the beats the slice names and drops the rest, forwarding "
+               "each one untouched. `start: -1` into save-image writes "
+               "the LAST frame of a clip. Negative indices are resolved "
+               "at EOS, so they cost a held window of that many beats.",
+  .display_name = "Temporal Slice",
+  .category  = StageCategory::Visual,
+  .iports    = kIports,
+  .oports    = kOports,
+  .attrs     = kAttrs,
+};
+
+}  // namespace
+
+TemporalSliceStage::TemporalSliceStage(const SessionContextIntf* s,
+                                       std::string               id,
+                                       std::vector<InEdge>       iports,
+                                       FlexData                  config)
+  : TypedStage<TemporalSliceStage>(s, std::move(id), std::move(iports),
+                                   std::move(config))
+{
+  allocate_oports(std::size(kOports));
+
+  // PRESENCE, not value: 0 is a legal start and a legal end, so a
+  // default cannot stand in for "not written". attr_int would hand back
+  // the same 0 either way.
+  const auto& c = this->config();
+  if (c.is_object()) {
+    auto o = c.as_object();
+    _has_start = o.contains("start");
+    _has_end   = o.contains("end");
+  }
+  _start = attr_int("start");
+  _step  = attr_int("step");
+  _end   = attr_int("end");
+
+  // Deferred validation: the constructor never throws, and the runtime
+  // skips a stage whose config failed.
+  if (_step <= 0) {
+    fail_config(fmt("step must be positive (got {}); a stream is read "
+                    "once and in order, so there is no beat to step back "
+                    "to", _step));
+  }
+}
+
+TemporalSliceStage::~TemporalSliceStage() = default;
+
+const StageSpec&
+TemporalSliceStage::spec() const noexcept
+{
+  return kSpec;
+}
+
+std::int64_t
+TemporalSliceStage::hold_() const noexcept
+{
+  std::int64_t w = 0;
+  if (_has_start && _start < 0) { w = std::max<std::int64_t>(w, -_start); }
+  if (_has_end   && _end   < 0) { w = std::max<std::int64_t>(w, -_end); }
+  return w;
+}
+
+bool
+TemporalSliceStage::selected_(std::int64_t j, std::int64_t n) const noexcept
+{
+  // Python's slice resolution, both ends clamped into [0, n].
+  std::int64_t s = 0;
+  if (_has_start) {
+    s = (_start < 0) ? std::max<std::int64_t>(n + _start, 0)
+                     : std::min<std::int64_t>(_start, n);
+  }
+  std::int64_t e = n;
+  if (_has_end) {
+    e = (_end < 0) ? std::max<std::int64_t>(n + _end, 0)
+                   : std::min<std::int64_t>(_end, n);
+  }
+  if (j < s || j >= e) { return false; }
+  return ((j - s) % _step) == 0;
+}
+
+bool
+TemporalSliceStage::selected_streaming_(std::int64_t j) const noexcept
+{
+  // Only ever asked about a beat that has fallen out of the hold
+  // window, i.e. one with at least W beats behind it, so j < n - W.
+  // That single fact settles both ends without knowing n:
+  //
+  //   start < 0 => s = n + start >= n - W > j, so j is NEVER selected.
+  //   end   < 0 => e = n + end   >= n - W > j, so `end` cannot exclude
+  //                it, and only `start` and `step` decide.
+  //
+  // Which leaves the non-negative ends, and those never needed n.
+  if (_has_start && _start < 0) { return false; }
+  const std::int64_t s = _has_start ? _start : 0;
+  if (j < s) { return false; }
+  if (_has_end && _end >= 0 && j >= _end) { return false; }
+  return ((j - s) % _step) == 0;
+}
+
+Job
+TemporalSliceStage::initialize(RuntimeContext& ctx)
+{
+  (void)ctx;
+  _index     = 0;
+  _emitted   = 0;
+  _peak_hold = 0;
+  _hold.clear();
+
+  const std::int64_t w = hold_();
+  if (w > 0) {
+    // Said out loud because it is the stage's whole memory cost and it
+    // is set by a number the author wrote, not by the stream.
+    session()->info(fmt(
+        "TemporalSliceStage('{}'): a negative index holds the last {} "
+        "beat(s) until EOS, where the slice is resolved", this->id(), w));
+  }
+  co_return;
+}
+
+Job
+TemporalSliceStage::process(RuntimeContext& ctx)
+{
+  auto p = co_await ctx.read(0);
+  if (!p) {
+    // EOS: the count is finally known, so everything still held can be
+    // decided exactly. Emitted in ARRIVAL order -- a slice is a
+    // subsequence, not a reordering.
+    const std::int64_t n = _index;
+    for (auto& [j, beat] : _hold) {
+      if (!selected_(j, n)) { continue; }
+      ++_emitted;
+      co_await ctx.write(0, std::move(beat));
+    }
+    _hold.clear();
+    ctx.signal_done();
+    co_return;
+  }
+
+  const std::int64_t idx = _index++;
+  const std::int64_t w   = hold_();
+
+  // NO WINDOW: decide the beat on arrival and keep nothing. The whole
+  // non-negative case, and the one that has to work on a source that
+  // never reaches EOS.
+  if (w == 0) {
+    if (!selected_streaming_(idx)) { co_return; }
+    ++_emitted;
+    co_await ctx.write(0, std::move(p));
+    co_return;
+  }
+
+  // Room is made BEFORE the new beat is taken, so the window holds W and
+  // never W+1. A beat leaving it has W beats behind it, which is exactly
+  // what makes it decidable without the total (see selected_streaming_).
+  while ((std::int64_t)_hold.size() >= w) {
+    auto [j, beat] = std::move(_hold.front());
+    _hold.pop_front();
+    if (!selected_streaming_(j)) { continue; }
+    ++_emitted;
+    co_await ctx.write(0, std::move(beat));
+  }
+  _hold.emplace_back(idx, std::move(p));
+  _peak_hold = std::max(_peak_hold, (std::int64_t)_hold.size());
+}
+
+VPIPE_REGISTER_STAGE(TemporalSliceStage)
+VPIPE_REGISTER_SPEC(TemporalSliceStage, kSpec)
+
+}  // namespace vpipe

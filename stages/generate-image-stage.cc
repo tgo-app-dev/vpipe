@@ -68,7 +68,8 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit"},
+       "boogu-image,boogu-image-edit",
+   .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
    .suggest_db = kModelRegistryDb,

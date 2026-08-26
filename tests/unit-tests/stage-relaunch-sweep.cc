@@ -119,6 +119,46 @@ txt_path_()
   return p;
 }
 
+// A 0.1 s 8 kHz mono 16-bit PCM WAV, written the same way the PNG above
+// is: load-audio DEMUXES rather than decodes, so what it needs is a
+// container ffmpeg can walk, and PCM in a RIFF wrapper is the smallest
+// one that exists. Synthesized rather than shipped so the sweep stays a
+// file nobody has to keep a fixture next to.
+string
+wav_path_()
+{
+  const int      rate     = 8000;
+  const int      n_frames = rate / 10;
+  const unsigned n_bytes  = (unsigned)n_frames * 2;
+  const string   p        = tmpdir_() + "/vpipe-sweep.wav";
+  std::ofstream  o(p, std::ios::binary);
+  auto u32 = [&o](unsigned v) {
+    const unsigned char b[4] = {(unsigned char)(v & 0xff),
+                                (unsigned char)((v >> 8) & 0xff),
+                                (unsigned char)((v >> 16) & 0xff),
+                                (unsigned char)((v >> 24) & 0xff)};
+    o.write(reinterpret_cast<const char*>(b), 4);
+  };
+  auto u16 = [&o](unsigned v) {
+    const unsigned char b[2] = {(unsigned char)(v & 0xff),
+                                (unsigned char)((v >> 8) & 0xff)};
+    o.write(reinterpret_cast<const char*>(b), 2);
+  };
+  o.write("RIFF", 4);  u32(36 + n_bytes);  o.write("WAVE", 4);
+  o.write("fmt ", 4);  u32(16);
+  u16(1);              // PCM
+  u16(1);              // mono
+  u32((unsigned)rate);
+  u32((unsigned)rate * 2);   // byte rate
+  u16(2);              // block align
+  u16(16);             // bits
+  o.write("data", 4);  u32(n_bytes);
+  for (int i = 0; i < n_frames; ++i) {
+    u16((unsigned)(short)((i % 64) * 256));   // anything non-silent
+  }
+  return p;
+}
+
 }  // namespace
 
 // Launch `type` twice over ONE stage object and report the beats each
@@ -232,6 +272,9 @@ sweep_table_(size_t* n)
       "{\"url\":[\"" + png + "\"]}";
   static const string load_text_cfg =
       "{\"path\":[\"" + txt + "\"]}";
+  static const string wav = wav_path_();
+  static const string load_audio_cfg =
+      "{\"input_url\":\"" + wav + "\"}";
 
   static const SweepEntry kSweep[] = {
     {"chrono", "{\"frequency_hz\":200,\"count\":3}", false, nullptr},
@@ -242,6 +285,21 @@ sweep_table_(size_t* n)
     {"text-prompt", "{\"text\":\"hello\"}", false, nullptr},
     {"load-image", load_image_cfg.c_str(), false, nullptr},
     {"load-text", load_text_cfg.c_str(), false, nullptr},
+    {"load-audio", load_audio_cfg.c_str(), false, nullptr},
+
+    // The per-family model-config sources. One-shot emitters gated by a
+    // `_done` flag, which is the exact shape this test exists for --
+    // they share ModelConfigSourceStage, whose reset_run_state() clears
+    // it, and each is listed so that stays true rather than being
+    // assumed. They were added after this table last was and nothing
+    // forced the decision until the completeness test below caught them.
+    {"wan2-model-config", "{}", false, nullptr},
+    {"minimax-h3-model-config", "{}", false, nullptr},
+    {"flux2-model-config", "{}", false, nullptr},
+    {"mage-flow-model-config", "{}", false, nullptr},
+    {"krea2-model-config", "{}", false, nullptr},
+    {"boogu-image-model-config", "{}", false, nullptr},
+    {"qwen-image-edit-model-config", "{}", false, nullptr},
 
     // Decisions on record rather than silent gaps. Every one of these
     // was read for the latch pattern this test exists to catch (a member

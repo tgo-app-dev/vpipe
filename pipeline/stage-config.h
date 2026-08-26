@@ -72,6 +72,28 @@ struct ConfigKey {
   // type it can actually load. Ignored when suggest_db is unset.
   std::string_view suggest_db_type = {};
 
+  // Optional: the name of a SHARED-MODEL CHANNEL this key belongs to.
+  //
+  // A channel is one model reference travelling from a source stage
+  // (model-select) to every stage that latches it on a `model` iport.
+  // Both ends name the channel here, and the difference between them is
+  // whether they have a suggest_db_type of their own:
+  //
+  //   CONSUMER -- names the channel AND lists the model_types it can
+  //     actually run. Its own picker keeps that narrower list, because
+  //     generate-image cannot run a video family and vice versa.
+  //   SOURCE -- names the channel and leaves suggest_db_type EMPTY.
+  //     resolve_config_params() fills it with the UNION over every
+  //     registered consumer of the channel.
+  //
+  // Derived rather than written down because the source cannot know the
+  // consumers: a PLUGIN registers stages after this table is compiled,
+  // and a hard-coded list at the source is a list that is wrong the
+  // moment a plugin ships a family. It was: minimax-h3-fl2va ran a whole
+  // text-to-video graph while being unpickable, and every out-of-tree
+  // family was unpickable by construction.
+  std::string_view model_channel = {};
+
   // Optional companions to suggest_db: required input / output modalities
   // (comma-separated subset of "text","image","audio","video"). The web-ui
   // model browser keeps only models whose catalogue I/O covers these -- a
@@ -106,6 +128,22 @@ struct ConfigKey {
   // reads that from the file itself.
   std::string_view path_filter = {};
 };
+
+// Contribute model_types to a shared-model channel at RUN TIME.
+//
+// The ConfigKey side of a channel covers a plugin that brings its own
+// stage: it declares what it runs and the union picks it up. It does
+// NOT cover the other plugin shape -- a family that plugs into an
+// EXISTING stage's own registry. LTX-2.5 registers a video family with
+// generate-video and a VAE family with vae-decode, so those stages run
+// it while their suggest_db_type, written when this tree was compiled,
+// cannot name it.
+//
+// So the family registries call this, and a plugin that registers a
+// family gets a working picker without knowing this exists. Idempotent
+// per (channel, type); order of first appearance is preserved.
+void register_channel_types(std::string_view channel,
+                            std::string_view csv_model_types);
 
 // Per-instance resolved descriptor: one ConfigKey paired with the
 // value the stage instance was actually given. `default_value` is the

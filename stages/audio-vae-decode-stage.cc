@@ -32,7 +32,8 @@ const ConfigKey kAttrs[] = {
    .doc = "model dir carrying an audio VAE (read from <hf_dir>/audio_vae). "
           "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-fl2va"},
+   .suggest_db_type = "minimax-h3-fl2va",
+   .model_channel = "diffusion-model"},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "\"auto\" (default) decides from physical RAM vs the pipeline's "

@@ -394,6 +394,26 @@ function mountEditor(container, opts = {}) {
       }
       return;
     }
+    // Zoom the canvas. `-` and `=` are the UNSHIFTED pair, so neither
+    // needs a second finger; they drive the same step as the − / +
+    // buttons in the view-control cluster.
+    //
+    // ABOVE the showSelector return on purpose: the standalone editor
+    // (the composer's canvas) is the view with the most graph on screen
+    // and the least reason to reach for the mouse. The text-field guard
+    // is the one at the top of this function, which already covers
+    // INPUT / TEXTAREA / SELECT / contentEditable -- so typing a minus
+    // into a config field still types a minus.
+    if (e.key === '-' || e.key === '=') {
+      const gc = state.graphContainer;
+      if (gc && gc.zoomBy) {
+        e.preventDefault();
+        const step = gc.zoomStep || 1.2;
+        gc.zoomBy(e.key === '=' ? step : 1 / step);
+      }
+      return;
+    }
+
     // Pipeline-level shortcuts (create / load / save / unload) belong to
     // the selector; skip them in the standalone editor (no such buttons).
     if (!showSelector) { return; }

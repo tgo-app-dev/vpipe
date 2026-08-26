@@ -40,7 +40,7 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   _hf_dir    = attr_str("hf_dir");
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _fps = attr_real("fps");
-  if (!(_fps > 0.0)) { _fps = 16.0; }
+  if (!(_fps > 0.0)) { _fps = 24.0; }
   {
     bool bad = false;
     _unload_cfg = model_memory::parse_unload_policy(
@@ -73,19 +73,20 @@ namespace {
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
-   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
-          "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
-          "model iport overrides it",
+   .doc = "the model root whose VAE this decodes; the resident family "
+          "locates the VAE within it (conventionally <hf_dir>/vae). "
+          "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va"},
+       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va",
+   .model_channel = "diffusion-model"},
   {.key = "fps", .type = ConfigType::Real, .required = false,
-   .doc = "frame rate stamped on each decoded VIDEO frame's sideband when the "
-          "latent does not carry one. Wan latents from generate-video do, so "
-          "this is the fallback for a latent read from elsewhere. Ignored by "
-          "the image VAEs",
-   .def_real = 16.0},
+   .doc = "frame rate stamped on each decoded VIDEO frame's sideband when "
+          "the latent does not carry one. A latent from generate-video does "
+          "carry it, so this is the fallback for one read from elsewhere. "
+          "Ignored when the latent is an image",
+   .def_real = 24.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "This stage is idle for the whole denoise, so on a memory-bounded box "
@@ -96,7 +97,10 @@ const ConfigKey kAttrs[] = {
    .def_str = "auto"},
 };
 const PortSpec kIports[] = {
-  {.name = "latent", .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
+  {.name = "latent",
+   .doc = "f32 latent, unpacked and whitened: [z, H/r, W/r] for an image, "
+          "[z, T, H/r, W/r] for a clip. z and the spatial stride r are the "
+          "resident family's VAE geometry",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
@@ -104,15 +108,24 @@ const PortSpec kIports[] = {
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
-  {.name = "image", .doc = "decoded image as planar U8 RGB TensorBeat [3,H,W]",
+  {.name = "image",
+   .doc = "decoded planar U8 RGB TensorBeat [3, H, W]. A VIDEO latent emits "
+          "one beat PER FRAME rather than a clip-shaped tensor, each "
+          "carrying {frame, frames, fps} in its sideband, so a consumer "
+          "knows where in the clip it sits and how many follow",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "vae-decode",
-  .doc       = "Decodes a text-to-image (Krea-2 Qwen-Image / FLUX.2) VAE latent "
-               "into a planar U8 RGB image on the metal-compute backend. The "
-               "second half of the text-to-image split.",
+  .doc       = "Decodes a VAE latent into planar U8 RGB on the metal-compute "
+               "backend -- the second half of the generate/decode split, for "
+               "images and for video both. An IMAGE latent produces one "
+               "beat; a VIDEO latent produces ONE BEAT PER FRAME, so the "
+               "downstream is the per-frame machinery that already exists "
+               "(save-image, rgb-to-video -> save-video, a preview). Which "
+               "decoder runs is the resident family's, and a family "
+               "registered by a plugin decodes its own.",
   .display_name = "VAE Decode",
   .category  = StageCategory::Generative,
   .iports    = kIports,

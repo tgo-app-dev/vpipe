@@ -40,17 +40,19 @@ namespace {
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
-   .doc = "video model root -- Wan (transformer/, transformer_2/, vae/, "
-          "text_encoder/) or a MiniMax-H3 repack (diffusion_models/, vae/, "
-          "audio_vae/, text_encoders/). OPTIONAL: a model-select source on "
-          "the model iport overrides it",
+   .doc = "video model root. The layout is the resident family's own -- an "
+          "upstream tree of per-component directories, or a repack that "
+          "names them differently -- and each registered family claims the "
+          "roots it recognises, so this takes the checkpoint root and the "
+          "family that claims it decides. OPTIONAL: a model-select source "
+          "on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va"},
+   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va",
+   .model_channel = "diffusion-model"},
   {.key = "height", .type = ConfigType::Int, .required = false,
-   .doc = "video height in pixels. ROUNDED UP to the family's VAE stride "
-          "times its DiT patch -- 16 for wan (8x VAE, 2x patch), 32 for "
-          "minimax-h3 (16x VAE, 2x patch) -- so any positive value is "
-          "accepted and the stage logs what it used",
+   .doc = "video height in pixels. ROUNDED UP to the resident family's VAE "
+          "stride times its DiT patch, which differs per family, so any "
+          "positive value is accepted and the stage logs what it used",
    .def_int = 480},
   {.key = "width", .type = ConfigType::Int, .required = false,
    .doc = "video width in pixels; same multiple as height", .def_int = 832},
@@ -60,7 +62,10 @@ const ConfigKey kAttrs[] = {
           "number is accepted here", .def_int = 81},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on the emitted latent, for the decoder and the "
-          "encoder downstream of it", .def_real = 16.0},
+          "encoder downstream of it. This stage does not resample: the value "
+          "describes the clip the family generated, so a family conditioned "
+          "at another rate wants it set",
+   .def_real = 24.0},
   {.key = "steps", .type = ConfigType::Int, .required = false,
    .doc = "denoising steps", .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
@@ -69,8 +74,8 @@ const ConfigKey kAttrs[] = {
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Taken only by a "
           "family whose forward materializes a dense weight for the matrix "
-          "cores -- minimax-h3 today; wan is steel-only and IGNORES it, as "
-          "does any box without NAX matmul2d. It also self-gates on ROWS "
+          "cores; a steel-only family IGNORES it, as does any box without "
+          "NAX matmul2d. It also self-gates on ROWS "
           "(>= 1024), so a short clip keeps the bf16 tiles either way, and "
           "on how much a projection would have to be zero-padded to reach a "
           "whole int8 chunk (refused past 10% extra MACs). "
@@ -87,51 +92,54 @@ const ConfigKey kAttrs[] = {
 const PortSpec kIports[] = {
   {.name = "conditioning",
    .doc = "text hidden states from a diffusion-conditioner: bf16 [text_seq, "
-          "dim] at the resident family's own encoder width -- 4096 for wan "
-          "(umT5-XXL), 5120 for minimax-h3 (the Qwen3-VL tap)",
+          "dim] at the resident family's own encoder width. The conditioner "
+          "resolves the same checkpoint this stage does, so the width "
+          "matches by construction rather than by configuration",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "neg_conditioning",
    .doc = "OPTIONAL negative conditioning (the conditioner's oport1) for "
-          "classifier-free guidance, for the families that take it: wan is "
-          "not distilled, so without this its guidance is forced to 1. "
-          "Ignored by a guidance-distilled family (minimax-h3), which runs "
-          "one forward per step",
+          "classifier-free guidance. A family that is NOT guidance-distilled "
+          "needs it: without one its guidance is forced to 1. A "
+          "guidance-distilled family runs a single forward per step and "
+          "ignores it",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "sampler",
-   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read by "
-          "the families that sample from a spec (wan, defaulting to the UniPC "
-          "multistep it ships); inert for a family that carries its own "
-          "sampler (minimax-h3 runs rectified-flow Euler over two shifted "
-          "schedules -- see video_shift / audio_shift)",
+   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read "
+          "by a family that samples from a spec, in place of the sampler it "
+          "ships; inert for a family that carries its own sampler and its "
+          "own schedule, which is shaped through that family's model-config "
+          "source instead",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler",
    .doc = "OPTIONAL scheduler spec FlexData (scheduler-select). Inert for the "
           "same families the sampler port is inert for",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0",
-   .doc = "OPTIONAL image-to-video conditioning latent from vae-encode: f32 "
-          "[16, T, H/8, W/8] for wan (the conditioning image followed by "
-          "blank frames), f32 [24, 1, H/16, W/16] for minimax-h3 (the "
-          "FIRST-frame keyframe anchor). Present => image-to-video",
+   .doc = "OPTIONAL image-to-video conditioning latent from vae-encode, in "
+          "the resident family's own latent geometry. Which SHAPE depends on "
+          "how the family conditions: a clip-shaped tensor (the conditioning "
+          "image followed by blank frames) or a single FIRST-frame keyframe "
+          "anchor. Present => image-to-video",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_latent1",
-   .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode "
-          "(minimax-h3 only; wan's i2v latent is one clip-shaped tensor). "
-          "With ref_latent0 this is the FL2VA first-and-last mode",
+   .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode, "
+          "for a family that anchors on keyframes rather than on one "
+          "clip-shaped latent. With ref_latent0 this is the first-and-last "
+          "mode",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_video_rows",
    .doc = "OPTIONAL reference VIDEO rows from a video-ref-encoder: f32 "
-          "[rows, 96], MiniMax-H3's Ref2VA partition. Already packed into "
-          "DiT rows and concatenated in reference order, because every "
-          "reference is encoded at a resolution of its own and rows are the "
-          "only shape they share. Wiring it is what makes this stage a "
-          "Ref2VA denoiser; the geometry it belongs to rides on the "
-          "conditioning beat's sideband",
+          "[rows, 96], for a family with a reference-conditioned partition. "
+          "Already packed into DiT rows and concatenated in reference "
+          "order, because every reference is encoded at a resolution of its "
+          "own and rows are the only shape they share. Wiring it is what "
+          "puts this stage in its reference-conditioned mode; the geometry "
+          "the rows belong to rides on the conditioning beat's sideband",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_audio_rows",
    .doc = "OPTIONAL reference AUDIO rows from the same video-ref-encoder: "
@@ -139,25 +147,25 @@ const PortSpec kIports[] = {
           "a clean timestep and is never denoised",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "model_config",
-   .doc = "OPTIONAL model-specific parameters from the resident family's own "
-          "config source -- wan2-model-config (guidance, expert boundary) or "
-          "minimax-h3-model-config (sigma shifts, condition timesteps, audio "
-          "duration). Passed to that family's GenerationParams UNREAD, so "
-          "this stage carries none of the knobs. Unwired, the family runs "
-          "its documented defaults",
+   .doc = "OPTIONAL model-specific parameters from the resident family's "
+          "own config source -- each family ships one, carrying whatever it "
+          "alone has to say (guidance and expert boundaries, sigma shifts, "
+          "condition timesteps, audio duration). Passed to that family's "
+          "GenerationParams UNREAD, so this stage carries none of the knobs. "
+          "Unwired, the family runs its documented defaults",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
   {.name = "audio_conditioning",
    .doc = "OPTIONAL second-modality conditioning for a family that "
-          "generates a soundtrack from its own projection of the caption "
-          "-- LTX-2.5's 2048-wide audio context, beside the 4096-wide "
-          "video one on iport0. A separate port because it is a different "
-          "WIDTH from a different projection, so packing both into one "
-          "beat would make the split a convention rather than a type. "
-          "Unwired, such a family generates VIDEO ONLY and says so; it "
-          "must not invent a zero context, which would be conditioning "
-          "that says silence rather than nothing. Ignored by wan and "
-          "minimax-h3, which take no second context",
+          "generates a soundtrack from its own projection of the caption: "
+          "an AUDIO context beside the video one on iport0, at a width of "
+          "its own. A separate port because it is a different WIDTH from a "
+          "different projection, so packing both into one beat would make "
+          "the split a convention rather than a type. Unwired, such a "
+          "family generates VIDEO ONLY and says so; it must not invent a "
+          "zero context, which would be conditioning that says silence "
+          "rather than nothing. Ignored by a family that takes no second "
+          "context",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
 };
@@ -190,13 +198,13 @@ constexpr MovedKey kMovedKeys[] = {
 const PortSpec kOports[] = {
   {.name = "latent",
    .doc = "f32 latent VIDEO [z, T, H/r, W/r] (whitened), sideband "
-          "{fps, frames}. z/r are the family's VAE geometry: 16/8 for wan, "
-          "24/16 for minimax-h3",
+          "{fps, frames}. z/r are the resident family's VAE geometry",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
   {.name = "audio_latent",
-   .doc = "f32 latent AUDIO [audio_channels, audio_latents], minimax-h3 "
-          "only -- the families that generate no audio never write it",
+   .doc = "f32 latent AUDIO [audio_channels, audio_latents] from a family "
+          "that generates a soundtrack -- the families that do not never "
+          "write it",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
 };
@@ -251,32 +259,34 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   if (_width  <= 0) { _width  = 832; }
   if (_frames <= 0) { _frames = 81; }
   if (_steps  <= 0) { _steps  = 40; }
-  if (!(_fps > 0.0)) { _fps = 16.0; }
+  if (!(_fps > 0.0)) { _fps = 24.0; }
   if (_height <= 0) { _height = 480; }
   if (_width  <= 0) { _width  = 832; }
   // The frame SIZE is not validated here either, and for exactly the
   // reason the frame COUNT is not (see below): the legal grid is the
-  // family's VAE stride times its DiT patch -- 16 for wan, 32 for
-  // MiniMax-H3 -- and the family is not known until the checkpoint is
-  // read. resolve_config_ rounds UP to the resident family's grid.
+  // family's VAE stride times its DiT patch, which differs per family,
+  // and the family is not known until the checkpoint is read.
+  // resolve_config_ rounds UP to the resident family's grid.
   //
   // This used to refuse anything that was not a multiple of 16, which was
-  // both too strict (a caller should not have to know) and too loose (it
-  // passed H3 sizes that are illegal, e.g. 1360, whose latent width 85 is
-  // odd and cannot be patched).
+  // both too strict (a caller should not have to know) and too loose: on
+  // a coarser grid it passed sizes that cannot be patched at all, e.g.
+  // 1360, whose latent width at stride 16 is 85 -- odd, and so not
+  // divisible by the patch.
   // The frame count is NOT validated here, deliberately. A count the VAE
   // cannot chunk has no latent representation -- but the rule is PER
-  // FAMILY (wan compresses in 4-frame chunks after a 1-frame first chunk,
-  // 4k+1; MiniMax-H3 takes 17-frame clips keeping 5 latents, 17n+5) and
-  // the family is only known once the checkpoint is read, which happens
-  // after this constructor. So resolve_config_ rounds UP to the resident
-  // family's rule instead, and any positive count is accepted.
+  // FAMILY, and the shapes are unrelated to each other: one family
+  // compresses in 4-frame chunks after a 1-frame first chunk (4k+1),
+  // another takes 17-frame clips keeping 5 latents (17n+5). The family
+  // is only known once the checkpoint is read, which happens after this
+  // constructor, so resolve_config_ rounds UP to the resident family's
+  // rule instead and any positive count is accepted.
   //
-  // Rounding rather than rejecting because the two rules share almost no
-  // legal counts -- 81 is fine for wan and impossible for H3, 56 the
-  // reverse -- so a graph that names one family's number could not change
-  // checkpoints without also being re-authored, which is exactly what
-  // being family-generic is supposed to buy.
+  // Rounding rather than rejecting because such rules share almost no
+  // legal counts -- 81 is legal under 4k+1 and impossible under 17n+5;
+  // 56 is the reverse -- so a graph carrying one family's number could
+  // not change checkpoints without being re-authored, which is exactly
+  // what being family-generic is supposed to buy.
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -289,8 +299,10 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
           attr_str("unload_when_idle")));
     }
   }
-  // UniPC multistep on the checkpoint's flow schedule -- the sampler every
-  // Wan checkpoint ships with. A sampler-select source overrides it.
+  // UniPC multistep on the checkpoint's flow schedule: the spec this
+  // stage starts from for a family that samples from one. A family
+  // carrying its own sampler ignores it, and a sampler-select source on
+  // the sampler iport overrides it.
   _sampler_spec.method = "unipc";
   _sampler_spec.order = 2;
   _sampler_spec.solver_bh2 = true;
@@ -379,7 +391,7 @@ GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
 //
 // The same rules resolve_config_ applies, from the same sources. Each
 // arm is a cheap query by construction: a registered family answers
-// without loading, and both built-ins read one JSON (or, for a
+// without loading, and the built-in arms read one JSON (or, for a
 // Comfy-Org repack, the safetensors __metadata__ that stands in for it).
 //
 // RETURNING FALSE MATTERS AS MUCH AS THE ROUNDING. A source none of

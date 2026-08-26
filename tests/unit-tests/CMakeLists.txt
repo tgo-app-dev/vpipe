@@ -8,6 +8,7 @@ set(LOCAL_TEST_SOURCES
   console-writer.cc
   credential-store.cc
   denoise-progress.cc
+  gpu-thermal.cc
   detection-overlay-stage.cc
   feedback-pair.cc
   stage-relaunch-sweep.cc
@@ -203,6 +204,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc
         image-resample-stage.cc
+        temporal-slice-stage.cc
         temporal-stack-stage.cc
         text-chat-stage.cc
         text-to-speech-stage.cc

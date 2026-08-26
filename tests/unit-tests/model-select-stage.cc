@@ -18,7 +18,9 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "pipeline/stage-config.h"
 #include "pipeline/stage-registry.h"
+#include "pipeline/stage-spec.h"
 #include "stages/model-registry.h"
 #include "stages/model-select-stage.h"
 
@@ -232,11 +234,15 @@ TEST(model_select, apply_beat_parses_forms)
 // consumer that had it, or a typo in one list).
 TEST(model_select, diffusion_pickers_offer_the_same_families)
 {
-  auto types_of = [](const StageSpec& sp) -> std::string {
-    for (const auto& a : sp.attrs) {
-      if (std::string_view(a.key) == "hf_dir") {
-        return std::string(a.suggest_db_type);
-      }
+  // model-select declares NO families of its own now: it names the
+  // `diffusion-model` channel and resolve_config_params() fills its
+  // offered list with the union over the channel's consumers. So the
+  // invariant is read off the RESOLVED param, not the static spec.
+  auto resolved_types = [](const StageSpec& sp) -> std::string {
+    const auto params =
+        resolve_config_params(sp.attrs, FlexData::make_object());
+    for (const auto& p : params) {
+      if (p.key == "hf_dir") { return p.suggest_db_type; }
     }
     return "<no hf_dir key>";
   };
@@ -252,55 +258,80 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
     }
     return out;
   };
-  // Every stage that latches model-select's beat on a `model` iport.
-  const char* consumers[] = {"diffusion-conditioner", "generate-image",
-                             "generate-video", "vae-encode", "vae-decode",
-                             "audio-vae-decode"};
   const StageRegistry& reg = StageRegistry::get();
   const StageSpec* src = reg.spec("model-select");
   ASSERT_TRUE(src != nullptr);
-  const std::string want = types_of(*src);
+  const std::string want = resolved_types(*src);
   ASSERT_TRUE(!want.empty() && want != "<no hf_dir key>");
-  std::printf("[model_select] %-22s hf_dir suggest_db_type = %s\n",
-              "model-select", want.c_str());
-
+  std::printf("[model_select] model-select hf_dir resolves to = %s\n",
+              want.c_str());
   const std::vector<std::string> offered = split(want);
-  std::vector<std::string> seen;          // the union over the consumers
+
+  // The six in-tree stages that latch this beat must each be ON the
+  // channel. This is the failure mode the derivation introduces: a
+  // diffusion stage that forgets .model_channel keeps working, and its
+  // families silently vanish from the picker -- which is precisely the
+  // bug the written-down list used to cause, moved one step earlier.
+  const char* consumers[] = {"diffusion-conditioner", "generate-image",
+                             "generate-video", "vae-encode", "vae-decode",
+                             "audio-vae-decode"};
   for (const char* nm : consumers) {
     const StageSpec* sp = reg.spec(nm);
     ASSERT_TRUE(sp != nullptr);
-    const std::string got = types_of(*sp);
-    std::printf("[model_select] %-22s hf_dir suggest_db_type = %s\n", nm,
-                got.c_str());
+    bool on_channel = false;
+    std::string got;
+    for (const auto& a : sp->attrs) {
+      if (std::string_view(a.key) != "hf_dir") { continue; }
+      got = std::string(a.suggest_db_type);
+      on_channel = (a.model_channel == "diffusion-model");
+    }
+    if (!on_channel) {
+      std::printf("[model_select] '%s' hf_dir is NOT on the "
+                  "diffusion-model channel\n", nm);
+    }
+    EXPECT_TRUE(on_channel);
+    // ...and everything it declares must reach the source.
     for (const std::string& fam : split(got)) {
-      // A consumer offering what the shared source cannot emit is the
-      // same dead end seen from the other side.
       const bool at_source =
           std::find(offered.begin(), offered.end(), fam) != offered.end();
       if (!at_source) {
-        std::printf("[model_select] '%s' offers family '%s', model-select does "
-                    "NOT\n", nm, fam.c_str());
+        std::printf("[model_select] '%s' offers family '%s', model-select "
+                    "does NOT\n", nm, fam.c_str());
       }
       EXPECT_TRUE(at_source);
-      if (std::find(seen.begin(), seen.end(), fam) == seen.end()) {
-        seen.push_back(fam);
+    }
+  }
+
+  // And the other direction: nothing the source offers is orphaned.
+  // Derived from the REGISTRY rather than the list above, so a stage
+  // registered at run time (a plugin, or the fake in the next test)
+  // counts as the consumer it is instead of reading as an orphan.
+  std::vector<std::string> runnable;
+  for (const auto& [id, name] : reg.all()) {
+    (void)id;
+    const StageSpec* sp = reg.spec(name);
+    if (sp == nullptr) { continue; }
+    for (const auto& a : sp->attrs) {
+      if (a.model_channel != "diffusion-model") { continue; }
+      if (a.suggest_db_type.empty()) { continue; }   // the source itself
+      for (const std::string& f : split(std::string(a.suggest_db_type))) {
+        runnable.push_back(f);
       }
     }
   }
-  // ...and the other direction: nothing the source offers is orphaned.
   for (const std::string& fam : offered) {
-    const bool runnable =
-        std::find(seen.begin(), seen.end(), fam) != seen.end();
-    if (!runnable) {
+    const bool ok =
+        std::find(runnable.begin(), runnable.end(), fam) != runnable.end();
+    if (!ok) {
       std::printf("[model_select] model-select offers '%s' but NO consumer "
                   "runs it\n", fam.c_str());
     }
-    EXPECT_TRUE(runnable);
+    EXPECT_TRUE(ok);
   }
-  // And the set must actually contain every diffusion family the flow
-  // supports, so a future family shows up here rather than silently nowhere.
-  // The video families are named for the same reason the image ones are:
-  // they were added to the DiT and the VAEs before the picker.
+
+  // The set must still contain every diffusion family the flow supports,
+  // so a family dropped from the last consumer that had it shows up here
+  // rather than silently nowhere.
   for (const char* fam : {"krea2", "flux2", "qwen-image-edit", "mage-flow",
                           "mage-flow-edit", "boogu-image", "boogu-image-edit",
                           "wan-t2v", "wan-i2v", "minimax-h3-fl2va"}) {
@@ -311,4 +342,69 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
     }
     EXPECT_TRUE(present);
   }
+}
+
+// The point of the channel: a stage registered AFTER this table was
+// compiled -- which is what a plugin is -- extends the picker by saying
+// what it can run, without model-select having heard of it.
+//
+// Registers a spec directly rather than loading a real plugin: the
+// mechanism under test is the registry walk, and a plugin's only extra
+// step is being dlopen'd before this point.
+TEST(model_select, a_late_registered_stage_extends_the_picker)
+{
+  static const PortSpec kFakeIn[] = {
+    {.name = "model", .doc = "shared model reference",
+     .type = &typeid(FlexDataPayload)},
+  };
+  static const ConfigKey kFakeAttrs[] = {
+    {.key = "hf_dir", .type = ConfigType::String, .required = false,
+     .doc = "a checkpoint only this fake stage can run",
+     .suggest_db = kModelRegistryDb,
+     .suggest_db_type = "ut-fake-family",
+     .model_channel = "diffusion-model"},
+  };
+  static const StageSpec kFakeSpec = {
+    .type_name = "ut-fake-diffusion",
+    .doc       = "test-only stand-in for a plugin's diffusion stage",
+    .iports    = kFakeIn,
+    .attrs     = kFakeAttrs,
+  };
+
+  // A plugin registers a TYPE and a SPEC; the union walks the registered
+  // types, so registering only the spec would not reach it. The factory
+  // is never called -- nothing here constructs the stage -- and the
+  // `ut-` prefix is the tree's marker for a test-only stage type.
+  StageRegistry& reg = StageRegistry::get();
+  reg.register_type("ut-fake-diffusion",
+                    [](const SessionContextIntf*, std::string,
+                       std::vector<InEdge>, FlexData) -> StagePtr {
+                      return nullptr;
+                    });
+  const StageSpec* src = reg.spec("model-select");
+  ASSERT_TRUE(src != nullptr);
+  auto offered = [&]() {
+    const auto params =
+        resolve_config_params(src->attrs, FlexData::make_object());
+    for (const auto& p : params) {
+      if (p.key == "hf_dir") { return p.suggest_db_type; }
+    }
+    return std::string();
+  };
+
+  const std::string before = offered();
+  EXPECT_TRUE(before.find("ut-fake-family") == std::string::npos);
+
+  reg.set_spec("ut-fake-diffusion", &kFakeSpec);
+
+  const std::string after = offered();
+  if (after.find("ut-fake-family") == std::string::npos) {
+    std::printf("[model_select] after registering: %s\n", after.c_str());
+  }
+  EXPECT_TRUE(after.find("ut-fake-family") != std::string::npos);
+  // The built-ins are still there -- the plugin ADDS, it does not
+  // replace, and it lands after them.
+  EXPECT_TRUE(after.find("krea2") != std::string::npos);
+  EXPECT_TRUE(after.rfind("ut-fake-family")
+              > after.find("krea2"));
 }

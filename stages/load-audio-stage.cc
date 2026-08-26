@@ -191,6 +191,23 @@ LoadAudioStage::open_input_()
       _codec_id, _sample_rate, _channels, _extradata.size()));
 }
 
+void
+LoadAudioStage::reset_run_state()
+{
+  if (_pkt != nullptr && _libs != nullptr) {
+    _libs->avcodec().api.packet_free(&_pkt);
+  }
+  if (_fctx != nullptr && _libs != nullptr) {
+    _libs->avformat().api.close_input(&_fctx);
+  }
+  _pkt     = nullptr;
+  _fctx    = nullptr;
+  _idx     = -1;
+  _eof     = false;
+  _packets = 0;
+  _last_us = 0;
+}
+
 Job
 LoadAudioStage::initialize(RuntimeContext& ctx)
 {

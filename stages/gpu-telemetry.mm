@@ -602,7 +602,7 @@ struct GpuTelemetrySampler::Impl {
   std::thread        worker;
   std::atomic<bool>  running{false};
 
-  Acc         a_freq, a_temp, a_util, a_pwr, a_mem;
+  Acc         a_freq, a_temp, a_util, a_pwr, a_mem, a_active;
   std::string thermal;
 
   Impl()
@@ -697,8 +697,17 @@ struct GpuTelemetrySampler::Impl {
     return energy_J / elapsed_s;
   }
 
-  // Residency-weighted GPU active frequency (MHz) over the interval.
-  std::optional<double> sample_freq_()
+  // Residency-weighted GPU active frequency (MHz) over the interval,
+  // and the share of the interval the GPU spent OUT of the idle state.
+  //
+  // Both come from one histogram because both are the same read, and
+  // the second is the reason the first is interpretable. IOAccelerator
+  // publishes a "Device Utilization %" that reads a flat 0 on this OS
+  // -- MEASURED, over a sustained metal_compute run where this
+  // residency moved from 3% to 70% -- so the pstate histogram is the
+  // busy signal, not a second opinion about it.
+  struct FreqSample { double mhz; double active_pct; };
+  std::optional<FreqSample> sample_freq_()
   {
     if (!frq_ready) { return std::nullopt; }
     const auto& api = ioreport::resolve();
@@ -717,7 +726,7 @@ struct GpuTelemetrySampler::Impl {
     }
     CFArrayRef arr = static_cast<CFArrayRef>(arr_raw);
     const CFIndex n = CFArrayGetCount(arr);
-    std::optional<double> result;
+    std::optional<FreqSample> result;
     for (CFIndex i = 0; i < n && !result; ++i) {
       CFDictionaryRef ch = static_cast<CFDictionaryRef>(
           CFArrayGetValueAtIndex(arr, i));
@@ -732,18 +741,23 @@ struct GpuTelemetrySampler::Impl {
       if (count <= 1) { continue; }
       double wsum = 0.0;
       double rsum = 0.0;
+      double all  = 0.0;   // including the idle state, for the share
       const int lim = std::min(
           count, static_cast<int>(mhz_table.size()));
       for (int s = 0; s < lim; ++s) {
-        const double f = mhz_table[static_cast<std::size_t>(s)];
-        if (f <= 0.0) { continue; }   // idle state
         const double r =
             static_cast<double>(api.state_get_residency(ch, s));
+        if (r > 0.0) { all += r; }
+        const double f = mhz_table[static_cast<std::size_t>(s)];
+        if (f <= 0.0) { continue; }   // idle state: counted in `all` only
         if (r <= 0.0) { continue; }
         wsum += r * f;
         rsum += r;
       }
-      if (rsum > 0.0) { result = wsum / rsum; }
+      if (rsum > 0.0) {
+        result = FreqSample{wsum / rsum,
+                            all > 0.0 ? 100.0 * rsum / all : 0.0};
+      }
     }
     CFRelease(delta);
     return result;
@@ -755,7 +769,10 @@ struct GpuTelemetrySampler::Impl {
   {
     while (running.load(std::memory_order_relaxed)) {
       if (auto w = sample_power_()) { a_pwr.add(*w); }
-      if (auto f = sample_freq_())  { a_freq.add(*f); }
+      if (auto f = sample_freq_()) {
+        a_freq.add(f->mhz);
+        a_active.add(f->active_pct);
+      }
       const GpuInfo g = query_gpu_iokit_();
       if (g.util_ok) { a_util.add(g.util_pct); }
       if (auto t = sample_temp_()) { a_temp.add(*t); }
@@ -783,6 +800,7 @@ GpuTelemetrySampler::start()
   Impl& im = *_impl;
   if (im.running.load()) { im.join_(); }
   im.a_freq = im.a_temp = im.a_util = im.a_pwr = im.a_mem = Acc{};
+  im.a_active = Acc{};
   im.thermal.clear();
   // Seed the running deltas with a baseline sample.
   const auto& api = ioreport::resolve();
@@ -810,9 +828,15 @@ GpuTelemetrySampler::stop()
   t.freq_mhz      = im.a_freq.done();
   t.temp_c        = im.a_temp.done();
   t.util_pct      = im.a_util.done();
+  t.active_pct    = im.a_active.done();
   t.power_w       = im.a_pwr.done();
   t.footprint_mb  = im.a_mem.done();
   t.thermal_state = thermal_state_label_();
+  // Max of the DVFS table, not table.back(): the ladder is published in
+  // ascending order today, and a max costs nothing to be sure.
+  for (double f : im.mhz_table) {
+    if (f > t.ceiling_mhz) { t.ceiling_mhz = f; }
+  }
   return t;
 }
 
@@ -826,6 +850,20 @@ std::uint64_t
 GpuTelemetrySampler::gpu_core_count()
 {
   return query_gpu_iokit_().core_count;
+}
+
+GpuTelemetry
+GpuTelemetrySampler::sample_once(int window_ms)
+{
+  // Clamped rather than trusted. Below ~100 ms the residency delta is
+  // small enough that a single scheduling hiccup dominates it; above a
+  // couple of seconds a caller polling on a timer would overlap itself.
+  if (window_ms < 100)  { window_ms = 100; }
+  if (window_ms > 5000) { window_ms = 5000; }
+  GpuTelemetrySampler s;
+  s.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+  return s.stop();
 }
 
 }  // namespace vpipe

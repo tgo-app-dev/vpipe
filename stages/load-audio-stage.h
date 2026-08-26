@@ -74,6 +74,14 @@ public:
   ~LoadAudioStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // Per-LAUNCH reset. Stopping a pipeline destroys the runtime, not this
+  // stage, so a second launch used to find `_eof` still set from the
+  // first and end the stream before reading a packet -- and initialize()
+  // would open a SECOND AVFormatContext over the member holding the
+  // first, leaking it. Closing here means the next initialize() opens
+  // the input the way the first one did.
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;

@@ -55,6 +55,15 @@ public:
   ~LoadVideoStage() override;
 
   Job initialize(RuntimeContext& ctx) override;
+
+  // Per-LAUNCH reset, for the same reason load-audio has one: a stop
+  // destroys the runtime and not this stage, so a second launch found
+  // `_eof` still set from the first and ended the stream before reading
+  // a packet -- while initialize() opened a SECOND AVFormatContext over
+  // the member holding the first. Not caught by the relaunch sweep,
+  // which skips this stage for want of a video fixture; found by fixing
+  // the identical bug in its sibling.
+  void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;

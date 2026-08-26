@@ -43,6 +43,8 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "plugin/plugin-manager.h"
+#include "stages/gpu-telemetry.h"
+#include "stages/gpu-thermal.h"
 #include "stages/model-catalog.h"
 #include "ui/ui-view-registry.h"
 #include "common/stdio-ui-delegate.h"
@@ -148,6 +150,12 @@ const char* const kUsage =
   "                              and exit.\n"
   "  --gpu-info                  print the GPU/OS facts that decide whether\n"
   "                              the matrix-core (M5 NAX) kernels are used.\n"
+  "  --gpu-thermal [MS]          sample the GPU for MS ms (default 600) and\n"
+  "                              print clock, ceiling, utilisation, die temp\n"
+  "                              and a throttle verdict as JSON. Reports\n"
+  "                              whether a busy GPU is being held below the\n"
+  "                              clock it is rated for, which the OS thermal\n"
+  "                              state does not.\n"
   "  --list-views                print the stage types that have a web-UI\n"
   "                              panel, as JSON. A pipeline containing one\n"
   "                              needs someone at the browser to finish.\n"
@@ -425,6 +433,71 @@ run(int argc, char** argv)
                             FlexData::make_bool(g.env_forced));
         oo.insert_or_assign("matrix_cores_gate", std::move(why));
       }
+      std::printf("%s\n", o.to_json().c_str());
+      return 0;
+#endif
+    } else if (a == "--gpu-thermal") {
+      // Whether this machine is being held back RIGHT NOW, which
+      // NSProcessInfo.thermalState does not answer: on a fanless Mac
+      // under a long generation it reads `nominal` while the GPU clock
+      // sits at roughly two thirds of the chip's ceiling.
+      //
+      // A WINDOW, not an instant. The clock comes from a pstate
+      // RESIDENCY histogram, so it only exists as a delta between two
+      // samples -- there is no such thing as the frequency right now.
+      //
+      // Session-free: IOReport, IOKit and SMC reads only, no GPU work
+      // and no model loading, so this can run alongside a real
+      // generation rather than perturbing the thing it measures.
+#if !defined(VPIPE_BUILD_APPLE_SILICON)
+      std::printf("{\"verdict\":\"unknown\","
+                  "\"note\":\"not an Apple Silicon build\"}\n");
+      return 0;
+#else
+      int window_ms = 600;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        window_ms = std::atoi(argv[++i]);
+      }
+      const GpuTelemetry g = GpuTelemetrySampler::sample_once(window_ms);
+
+      ThermalSample s;
+      // active_pct, not util_pct: see gpu-telemetry.h. The IOAccelerator
+      // utilisation key still reports, it just reports zero.
+      s.have_util = g.active_pct.ok;
+      s.util_pct  = g.active_pct.avg;
+      // The BEST clock seen in the window, not the average. The question
+      // is what ceiling the OS allowed, and a run that dipped between
+      // kernels still proves the top was reachable; averaging that dip
+      // in would report a throttle that is really just a gap in work.
+      s.have_clock   = g.freq_mhz.ok && g.ceiling_mhz > 0.0;
+      s.clock_mhz    = g.freq_mhz.max;
+      s.ceiling_mhz  = g.ceiling_mhz;
+      s.have_temp    = g.temp_c.ok;
+      s.temp_c       = g.temp_c.avg;
+      const ThermalReading r = classify_thermal(s);
+
+      FlexData o  = FlexData::make_object();
+      auto     oo = o.as_object();
+      oo.insert_or_assign(
+        "verdict", FlexData::make_string(thermal_verdict_name(r.verdict)));
+      oo.insert_or_assign("window_ms",
+                          FlexData::make_int(window_ms));
+      if (r.have_clock) {
+        oo.insert_or_assign("clock_mhz", FlexData::make_real(r.clock_mhz));
+        oo.insert_or_assign("ceiling_mhz",
+                            FlexData::make_real(r.ceiling_mhz));
+      }
+      if (g.active_pct.ok) {
+        oo.insert_or_assign("gpu_active_pct",
+                            FlexData::make_real(r.util_pct));
+      }
+      if (r.have_temp) {
+        oo.insert_or_assign("temp_c", FlexData::make_real(r.temp_c));
+      }
+      // The OS's own answer, alongside ours. Keeping both makes the
+      // disagreement visible in a bug report rather than arguable.
+      oo.insert_or_assign("os_thermal_state",
+                          FlexData::make_string(g.thermal_state));
       std::printf("%s\n", o.to_json().c_str());
       return 0;
 #endif

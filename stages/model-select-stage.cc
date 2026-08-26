@@ -21,14 +21,19 @@ const ConfigKey kAttrs[] = {
           "and audio-vae-decode stages; emitted as a beat that overrides "
           "each of their hf_dir config keys",
    .suggest_db = kModelRegistryDb,
-   // Every family whose stages latch this beat -- the IMAGE DiTs and the
-   // VIDEO ones both. The list is what the model browser filters on, so a
-   // family missing here is a model the picker will not offer even though
-   // the graph runs it: minimax-h3-fl2va was exactly that until now.
-   .suggest_db_type =
-       "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
-       "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va"},
+   // NO family list of its own. This is the SOURCE of the
+   // `diffusion-model` channel, and what it offers is the union of what
+   // the channel's consumers declare -- resolved from the stage
+   // registry when an editor asks for this form (see ConfigKey::
+   // model_channel).
+   //
+   // Written down, this list was wrong twice for the same reason and
+   // could only ever be wrong again: it has to name every family every
+   // consumer can run, including families from stages that do not exist
+   // when this file is compiled. A PLUGIN registering a diffusion stage
+   // now extends the picker by declaring what IT can run, which is the
+   // only place that knowledge actually lives.
+   .model_channel = "diffusion-model"},
 };
 const PortSpec kOports[] = {
   {.name = "model",

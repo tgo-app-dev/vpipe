@@ -328,6 +328,26 @@ LoadVideoStage::open_input_()
   }
 }
 
+void
+LoadVideoStage::reset_run_state()
+{
+  if (_pkt != nullptr && _libs != nullptr) {
+    _libs->avcodec().api.packet_free(&_pkt);
+  }
+  if (_fctx != nullptr && _libs != nullptr) {
+    _libs->avformat().api.close_input(&_fctx);
+  }
+  _pkt          = nullptr;
+  _fctx         = nullptr;
+  _v_stream_idx = -1;
+  _a_stream_idx = -1;
+  _vmeta        = StreamMeta{};
+  _ameta        = StreamMeta{};
+  _eof          = false;
+  _v_packets    = 0;
+  _a_packets    = 0;
+}
+
 Job
 LoadVideoStage::initialize(RuntimeContext& ctx)
 {

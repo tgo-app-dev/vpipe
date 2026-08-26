@@ -152,7 +152,8 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
+       "wan-t2v,wan-i2v,minimax-h3-fl2va",
+   .model_channel = "diffusion-model"},
   {.key = "target_width", .type = ConfigType::Int, .required = false,
    .doc = "letterbox-resize the input to this width before encoding (multiple "
           "of 8; requires target_height). 0/unset = encode at native size"},

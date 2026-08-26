@@ -49,7 +49,8 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image-edit,mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
-       "wan-t2v,wan-i2v,minimax-h3-fl2va"},
+       "wan-t2v,wan-i2v,minimax-h3-fl2va",
+   .model_channel = "diffusion-model"},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
           "oport1 -- a GROUNDED encode of the (possibly empty) negative prompt "

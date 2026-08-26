@@ -20,10 +20,27 @@ struct MetricAgg {
 struct GpuTelemetry {
   MetricAgg   freq_mhz;        // GPU clock (residency-weighted active)
   MetricAgg   temp_c;          // GPU die temperature
-  MetricAgg   util_pct;        // GPU utilization
+  MetricAgg   util_pct;        // GPU utilization (IOAccelerator)
+
+  // Share of the window the GPU spent out of its idle pstate, from the
+  // same residency histogram the frequency is weighted over.
+  //
+  // This is the busy signal, not util_pct. IOAccelerator's
+  // "Device Utilization %" reads a flat 0 on current macOS -- measured
+  // against a sustained GPU run where this figure moved from 3% to 70%
+  // -- so a caller gating on utilisation must gate on this one.
+  MetricAgg   active_pct;
   MetricAgg   power_w;         // GPU power
   MetricAgg   footprint_mb;    // process phys-footprint (RAM), in MB
   std::string thermal_state;   // coarse OS thermal-pressure label
+
+  // Top of the GPU's DVFS ladder: the clock the silicon is rated for,
+  // ~1578 MHz on M4/M5. 0 when the table could not be read.
+  //
+  // Reported because freq_mhz is only interpretable against it. A GPU
+  // observed at 1000 MHz is either at its ceiling or two thirds of the
+  // way down from it, and nothing in the sample itself says which.
+  double      ceiling_mhz = 0.0;
 };
 
 // Samples GPU metrics on a background thread while a region runs, then
@@ -54,6 +71,12 @@ public:
   // Static descriptors (from the IOAccelerator registry entry).
   static std::string   gpu_model();        // e.g. "Apple M4 Pro"
   static std::uint64_t gpu_core_count();   // e.g. 20
+
+  // Sample for `window_ms` and return the aggregate. A convenience for
+  // callers that want one reading rather than to bracket a region --
+  // the frequency and power channels are DELTAS, so a window is not
+  // optional: a single instant carries no residency to weight.
+  static GpuTelemetry sample_once(int window_ms);
 
 private:
   struct Impl;
