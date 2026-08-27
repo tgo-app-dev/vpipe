@@ -1,6 +1,7 @@
 #ifndef JOB_H
 #define JOB_H
 
+#include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <exception>
@@ -35,6 +36,10 @@ inline constexpr std::uint32_t kNoPerfTag = 0xFFFFFFFFu;
 // on a worker) before the Job is destroyed. The PipelineRuntime
 // enforces this via wait_idle() before driver teardown.
 //
+// WHEN THE DESTROYER IS A DIFFERENT THREAD, that check is
+// `quiescent()`, never `done()` -- see the comment on quiescent(). The
+// distinction is a real use-after-free, not a formality.
+//
 // Thread safety: a Job object is not internally synchronized; it is
 // owned by one thread at a time. The coroutine state itself may move
 // between worker threads as the chain of symmetric transfers and
@@ -49,6 +54,10 @@ public:
     std::coroutine_handle<> _continuation{};
     std::exception_ptr      _eptr{};
     std::uint32_t           _perf_tag = kNoPerfTag;
+    // Set by FinalAwaiter::await_suspend as the LAST thing this
+    // coroutine ever does to its own frame. See Job::quiescent() for
+    // why `done()` cannot answer this question.
+    std::atomic<bool>       _quiescent{false};
 
     Job
     get_return_object() noexcept
@@ -68,10 +77,17 @@ public:
       await_suspend(handle_t h) noexcept
       {
         auto& p = h.promise();
-        if (p._continuation) {
-          return p._continuation;
-        }
-        return std::noop_coroutine();
+        std::coroutine_handle<> next = p._continuation
+            ? p._continuation
+            : std::noop_coroutine();
+        // THE LAST WRITE THIS COROUTINE MAKES TO ITS OWN FRAME, and it
+        // has to stay last: everything above reads the promise, and a
+        // waiter that observes this store is entitled to free the frame
+        // immediately. `next` is a local by now, so the transfer below
+        // touches nothing here. Release pairs with the acquire in
+        // quiescent().
+        p._quiescent.store(true, std::memory_order_release);
+        return next;
       }
 
       void await_resume() const noexcept {}
@@ -132,6 +148,33 @@ public:
 
   bool done()  const noexcept { return !_h || _h.done(); }
   bool valid() const noexcept { return static_cast<bool>(_h); }
+
+  // Whether the coroutine has stopped touching its frame, so another
+  // thread may destroy it.
+  //
+  // `done()` IS NOT THIS TEST, and using it as one is a use-after-free.
+  // A coroutine reaching final_suspend flips the frame into the "done"
+  // state BEFORE FinalAwaiter::await_suspend runs -- and await_suspend
+  // then reads the promise. So a peer thread spinning on `done()` is
+  // released one frame-access too early, and destroying the Job there
+  // frees the frame out from under a worker that is still inside it.
+  //
+  // MEASURED (ThreadSanitizer, model-fetch stopped mid-download): a
+  // `.destroy` on the main thread racing a `.resume` on a pool worker,
+  // over the 144-byte driver frame -- with a second race on the plain
+  // read of the frame's done-state, which has no happens-before edge
+  // against the worker writing it. Both are gone with this flag.
+  //
+  // An unstarted Job (still at initial_suspend) never reaches
+  // final_suspend and so is never quiescent -- the same as `done()`
+  // never becoming true for one. Callers wait only on coroutines they
+  // know have run: PipelineRuntime gates on its completion counter
+  // first, StdoutLogDelegate on `_consumer_done`.
+  bool
+  quiescent() const noexcept
+  {
+    return !_h || _h.promise()._quiescent.load(std::memory_order_acquire);
+  }
 
   // Awaiter for `co_await job`. Takes ownership of the handle out of
   // the (rvalue) Job; its destructor destroys the inner coroutine

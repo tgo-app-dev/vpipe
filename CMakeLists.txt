@@ -71,6 +71,60 @@ option(VPIPE_BUILD_PYTHON
     "Build the vpipe Python extension (requires Python dev headers)"
     ON)
 
+# ---------------------------------------------------------------------
+# Sanitizers.
+#
+# `-DVPIPE_SANITIZE=thread` (or `address`, `undefined`, or a
+# comma-separated set) builds the whole tree -- library, apps and tests
+# -- under the named sanitizer.
+#
+# WHY THIS IS A BUILD OPTION rather than something to hand-roll per
+# investigation: the bugs it catches are the ones that do not reproduce
+# on demand. The teardown races between a driver coroutine and its
+# destructor were 100% reproducible on ONE Release binary and vanished
+# when that binary was merely relinked from identical source -- they
+# survive as latent UB that any unrelated layout change can re-expose.
+# ThreadSanitizer finds them every run, whether or not the crash
+# manifests, which makes it the only reliable gate.
+#
+# Notes:
+#   - Sanitizers are MUTUALLY EXCLUSIVE except undefined, which combines
+#     with either of the other two. address+thread is rejected by the
+#     compiler, so it is rejected here with a clearer message.
+#   - The build type is left alone. RelWithDebInfo is the useful pairing
+#     (optimized enough to be representative, with symbols); a plain
+#     Release build under a sanitizer reports frames without line
+#     numbers, so -g is added here regardless of build type.
+#   - Frame pointers are kept so the reports have usable stacks.
+#   - A sanitized tree must be a SEPARATE build dir: the flags land in
+#     the cache and every object needs them consistently.
+set(VPIPE_SANITIZE "" CACHE STRING
+    "Build with sanitizers: thread | address | undefined (comma-separated)")
+set_property(CACHE VPIPE_SANITIZE PROPERTY STRINGS
+    "" thread address undefined address,undefined thread,undefined)
+
+if(VPIPE_SANITIZE)
+    string(REPLACE "," ";" _vpipe_san_list "${VPIPE_SANITIZE}")
+    foreach(_san IN LISTS _vpipe_san_list)
+        if(NOT _san MATCHES "^(thread|address|undefined)$")
+            message(FATAL_ERROR
+                "VPIPE_SANITIZE: unknown sanitizer '${_san}'. "
+                "Valid: thread, address, undefined (comma-separated).")
+        endif()
+    endforeach()
+    if("thread" IN_LIST _vpipe_san_list AND "address" IN_LIST _vpipe_san_list)
+        message(FATAL_ERROR
+            "VPIPE_SANITIZE: 'thread' and 'address' cannot be combined -- "
+            "they instrument memory incompatibly. Configure two build "
+            "trees instead.")
+    endif()
+    set(_vpipe_san_flags "-fsanitize=${VPIPE_SANITIZE}"
+                         "-fno-omit-frame-pointer" "-g")
+    add_compile_options(${_vpipe_san_flags})
+    add_link_options("-fsanitize=${VPIPE_SANITIZE}")
+    message(STATUS "vpipe: sanitizer build -- ${VPIPE_SANITIZE}")
+endif()
+
 # Apple-only feature options (metal-compute / CoreML), declared up here.
 if(APPLE)
     # Auto-detect an Apple Silicon (arm64) target so the native

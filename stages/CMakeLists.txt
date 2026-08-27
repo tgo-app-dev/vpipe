@@ -44,6 +44,7 @@ set(LOCAL_SOURCES
   model-register-stage.cc
   model-remove-stage.cc
   model-registry.cc
+  model-source.cc
   passthrough-stage.cc
   qwen-asr-tokenizer.cc
   rest-client-stage.cc

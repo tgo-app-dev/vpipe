@@ -162,3 +162,94 @@ TEST(thread_pool, worker_id_does_not_leak_across_pools) {
   EXPECT_TRUE(from_a < pool_a.num_workers());
   EXPECT_TRUE(from_b == vpipe::ThreadPool::not_a_worker);
 }
+
+// ---- Job::quiescent() -------------------------------------------------
+//
+// The signal a peer thread uses to decide it may destroy a coroutine
+// frame. `done()` cannot serve: the frame flips into the done state
+// BEFORE FinalAwaiter::await_suspend runs, and await_suspend reads the
+// promise -- so a destroyer released by done() frees the frame one
+// access too early. That race is what ThreadSanitizer caught between
+// PipelineRuntime's driver teardown and a pool worker.
+//
+// The ordering itself is a race and cannot be observed reliably from a
+// test, so what is pinned here is the CONTRACT the fix rests on:
+// quiescent() is false until the coroutine has actually reached
+// final_suspend, and true afterwards.
+
+namespace {
+
+// Suspends once, so the test can observe a started-but-unfinished
+// coroutine before letting it run to completion.
+vpipe::Job
+suspend_then_finish(atomic<bool>* ran)
+{
+  ran->store(true, memory_order_release);
+  co_await std::suspend_always{};
+  co_return;
+}
+
+}
+
+// An UNSTARTED Job has not reached final_suspend, so it is not
+// quiescent -- and neither is it done. Destroying one is safe only
+// because its owner is the only thread that has ever touched it.
+TEST(thread_pool, job_unstarted_is_not_quiescent) {
+  atomic<bool> ran{false};
+  vpipe::Job j = suspend_then_finish(&ran);
+  EXPECT_TRUE(j.valid());
+  EXPECT_FALSE(ran.load(memory_order_acquire));   // initial_suspend
+  EXPECT_FALSE(j.done());
+  EXPECT_FALSE(j.quiescent());
+}
+
+// Mid-flight (started, suspended, not finished) is likewise not
+// quiescent: the coroutine still owns its frame.
+TEST(thread_pool, job_midflight_is_not_quiescent) {
+  atomic<bool> ran{false};
+  vpipe::Job j = suspend_then_finish(&ran);
+  j.handle().resume();                            // runs to the co_await
+  EXPECT_TRUE(ran.load(memory_order_acquire));
+  EXPECT_FALSE(j.done());
+  EXPECT_FALSE(j.quiescent());
+  j.handle().resume();                            // now runs to completion
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// A completed coroutine is quiescent, and quiescence implies done --
+// the whole point being that the converse does NOT hold.
+TEST(thread_pool, job_completed_is_quiescent) {
+  atomic<unsigned> n{0};
+  vpipe::Job j = inc_counter(&n);
+  EXPECT_FALSE(j.quiescent());
+  j.handle().resume();
+  EXPECT_TRUE(n.load(memory_order_relaxed) == 1);
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// An empty Job owns no frame, so there is nothing to wait for: both
+// predicates say "go ahead". A waiter that skipped this would spin
+// forever on a default-constructed Job.
+TEST(thread_pool, job_empty_is_quiescent) {
+  vpipe::Job j;
+  EXPECT_FALSE(j.valid());
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// Quiescence survives a move: the flag lives in the coroutine FRAME,
+// not in the Job handle, so moving the handle cannot lose it. A
+// PipelineRuntime that moved its drivers into place after they ran
+// would otherwise wait on a flag that reset itself.
+TEST(thread_pool, job_quiescence_follows_the_frame) {
+  atomic<unsigned> n{0};
+  vpipe::Job j = inc_counter(&n);
+  j.handle().resume();
+  EXPECT_TRUE(j.quiescent());
+  vpipe::Job moved = std::move(j);
+  EXPECT_TRUE(moved.quiescent());
+  EXPECT_TRUE(j.quiescent());        // empty now -- nothing to wait for
+  EXPECT_FALSE(j.valid());
+}

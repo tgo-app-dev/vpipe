@@ -207,6 +207,13 @@ FlexData catalog_entry_to_flex(const ModelCatalogEntry& e);
 //   "owner/repo/"                           -> "owner/repo"
 // Query/fragment and any path beyond the first two segments are dropped.
 // Returns "" when the input has no owner/repo pair.
+//
+// HuggingFace SPELLINGS ONLY. For anything a user might have pasted, use
+// `normalize_model_ref` (model-source.h) instead: it handles the mirror
+// hosts too, and a modelscope.cn URL run through THIS function yields
+// "models/<owner>" -- a repo that does not exist -- because ModelScope's
+// web URL carries a "models/" segment that HuggingFace's does not. This
+// one is kept for callers that are already working in HuggingFace terms.
 std::string normalize_hf_path(const std::string& input);
 
 // One file listed by the HuggingFace tree API.

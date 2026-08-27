@@ -1079,7 +1079,7 @@ PipelineRuntime::stop()
   }
 }
 
-// Spin until every driver coroutine is officially at final_suspend.
+// Spin until every driver coroutine has stopped touching its frame.
 // `_completed.fetch_add(...)` in stage_driver_ runs INSIDE the
 // coroutine body before the implicit co_return, so by the time
 // _completed reaches _expected the coroutine has signalled "done"
@@ -1089,14 +1089,23 @@ PipelineRuntime::stop()
 // still executing its return epilogue -- libmalloc reports this
 // later as a "memory corruption of free block" abort.
 //
+// THIS WAITS ON `quiescent()`, NOT `done()`, and the difference is the
+// whole point. `done()` turns true one frame-access too early -- the
+// coroutine flips into the done state and only then runs
+// FinalAwaiter::await_suspend, which reads the promise -- so spinning
+// on it closed most of the window and left a real one. MEASURED with
+// ThreadSanitizer on a model-fetch stopped mid-download: a `.destroy`
+// here racing a `.resume` on a pool worker over the driver frame, plus
+// an unsynchronized read of the frame's done-state. `quiescent()` is
+// published with release as the coroutine's last frame write and read
+// here with acquire, so observing it means the frame is genuinely ours.
+//
 // The window is microseconds; yield is enough.
 void
 PipelineRuntime::wait_drivers_suspended_()
 {
   for (const Job& d : _drivers) {
-    auto h = d.handle();
-    if (!h) { continue; }
-    while (!h.done()) {
+    while (!d.quiescent()) {
       std::this_thread::yield();
     }
   }

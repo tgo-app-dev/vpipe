@@ -3,6 +3,7 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/shared/streamed-refill.h"
@@ -36,6 +37,68 @@ using metal_compute::SharedBuffer;
 namespace h3 = vpipe::genai::minimax_h3;
 
 namespace {
+
+using H3Route = MetalMiniMaxH3Transformer::GemmRoute;
+
+// Which routes DEQUANTIZE the whole [N, K] weight into a dense bf16
+// buffer and then run a matmul2d tile on it, as against the steel qmm
+// routes that walk the quantized weight inline. Three places care --
+// which arms the tuner keeps, whether a route's cost has an
+// M-independent half, and whether a split-K is even possible -- and they
+// have to agree, so they ask here.
+bool
+route_is_mma_(H3Route r)
+{
+  return r == H3Route::kMma128 || r == H3Route::kMma128x256 ||
+         r == H3Route::kMma128x256Tn2;
+}
+
+// The tuner's row floors, and the ceiling they imply.
+//
+// kFlatTuneRows is about filling the machine and is generous for that:
+// the grid is two-dimensional and N alone already supplies 42 tiles at
+// the narrowest projection here. kMmaTuneRows is where the dequant has
+// fallen to a few percent of the call -- see route_tune_rows_ for the
+// ladder that was measured to land on it.
+constexpr int kFlatTuneRows = 1024;
+constexpr int kMmaTuneRows  = 4096;
+
+// How far behind the leader a candidate may measure on the warm pass and
+// still be timed properly. See the note in tune_qmm_ for why it is this
+// loose -- the warm pass separates hopeless from plausible and nothing
+// finer.
+constexpr double kPruneKeep = 0.6;
+
+// VPIPE_H3_TUNE_ROWS overrides both floors. Read at LOAD and kept on the
+// model rather than in a process-wide static: a static would be fixed by
+// whichever model in the process ran first, which is exactly the ordering
+// a test cannot control.
+int
+tune_rows_override_()
+{
+  const char* e = std::getenv("VPIPE_H3_TUNE_ROWS");
+  return e != nullptr ? std::atoi(e) : 0;
+}
+
+// The most rows any route asks to be timed over, in whole 128-row tiles.
+//
+// This is a CEILING on the measurement, and that makes it the natural
+// cache key. tune_qmm_ times at min(M, ceiling), so two geometries at or
+// above it run a LITERALLY IDENTICAL measurement -- same rows, same
+// shapes, same candidates -- and keying the cache on the caller's own M
+// made the second one pay for the first one's answer again. At the
+// production geometry that was 16.5 s per distinct sequence length, for
+// a result that could not differ.
+//
+// Below the ceiling the row count really is the caller's, so min() gives
+// an exact key there and a shared one above.
+int
+tune_ceiling_()
+{
+  const int o = tune_rows_override_();
+  const int m = o > 0 ? o : kMmaTuneRows;
+  return ((m + 127) / 128) * 128;
+}
 
 // Namespace for this class's derived-tensor cache keys. A WeightSet is
 // shared by everything reading one checkpoint, so the key has to name
@@ -818,10 +881,25 @@ MetalMiniMaxH3Transformer::fc1_gu_(WeightSet& ws, const std::string& nm)
 // ever split -- which is the whole reason the fusion can be a load-time
 // transform instead of a kernel that understands two layouts.
 //
-// Into FRESH buffers rather than in place: the source may be a cached
-// WeightSet tensor, which is shared with every other holder of that
-// checkpoint and must never be written through (see the WeightSet
-// immutability contract; VPIPE_WEIGHT_INTEGRITY=1 catches a violation).
+// IN PLACE, through the shared cycle walk (shared/riffle-rows.h).
+//
+// It used to build three fresh buffers and swap them in, which cost a
+// whole second copy of fc1 -- the largest weight in a block -- at the
+// one moment a promotion is already asking the box for room. That made
+// the interleave fail on memory, per block, which is precisely what
+// made `gu_inter` vary between blocks and forced _ff_needs_wide to be
+// decided globally.
+//
+// Writing through the buffers is safe HERE and would not be everywhere:
+// this is only ever called on a block that promotion has just cloned
+// into the resident set, out of stream_tensor sources that are cached
+// nowhere. A weight held through tensor()/derived() is shared with
+// every other holder of that checkpoint and must never be written
+// (VPIPE_WEIGHT_INTEGRITY=1 catches it); nothing on this path is.
+//
+// The permutation is the same one FLUX.2's ff.linear_in wants -- gate
+// rows and up rows woven into pairs -- which is why the walk is shared
+// rather than written twice.
 bool
 MetalMiniMaxH3Transformer::interleave_gu_(Linear& l) const
 {
@@ -834,30 +912,17 @@ MetalMiniMaxH3Transformer::interleave_gu_(Linear& l) const
       l.qbias.byte_size() < (std::size_t)N * row_grp * 2) {
     return false;
   }
-  SharedBuffer codes = _mc->make_shared_buffer((std::size_t)N * row_codes);
-  SharedBuffer scales = _mc->make_shared_buffer((std::size_t)N * row_grp * 2);
-  SharedBuffer qbias = _mc->make_shared_buffer((std::size_t)N * row_grp * 2);
-  if (codes.empty() || scales.empty() || qbias.empty()) { return false; }
-  const auto* sc = static_cast<const std::uint8_t*>(l.codes.contents());
-  const auto* ss = static_cast<const std::uint16_t*>(l.scales.contents());
-  const auto* sb = static_cast<const std::uint16_t*>(l.qbias.contents());
-  auto* dc = static_cast<std::uint8_t*>(codes.contents());
-  auto* ds = static_cast<std::uint16_t*>(scales.contents());
-  auto* db = static_cast<std::uint16_t*>(qbias.contents());
-  const int half = N / 2;
-  for (int j = 0; j < half; ++j) {
-    const int from[2] = {j, half + j};          // gate row, then up row
-    for (int h = 0; h < 2; ++h) {
-      const std::size_t d = (std::size_t)(2 * j + h);
-      const std::size_t s = (std::size_t)from[h];
-      std::memcpy(dc + d * row_codes, sc + s * row_codes, row_codes);
-      std::memcpy(ds + d * row_grp, ss + s * row_grp, row_grp * 2);
-      std::memcpy(db + d * row_grp, sb + s * row_grp, row_grp * 2);
-    }
+  // All three checked before any is touched: they only mean something
+  // together, and the walk cannot back out once it has started.
+  const std::size_t n = (std::size_t)N;
+  if (!genai::riffle_rows_ok(l.codes, n)
+      || !genai::riffle_rows_ok(l.scales, n)
+      || !genai::riffle_rows_ok(l.qbias, n)) {
+    return false;
   }
-  l.codes = std::move(codes);
-  l.scales = std::move(scales);
-  l.qbias = std::move(qbias);
+  genai::riffle_rows(l.codes, n);
+  genai::riffle_rows(l.scales, n);
+  genai::riffle_rows(l.qbias, n);
   l.gu_inter = true;
   return true;
 }
@@ -1401,6 +1466,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_rms       = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_rms_heads = m->_lib_rope.function("rms_norm_heads_strided_f16");
   m->_fn_trope = m->_lib_rope.function("transpose_rope_half_part_ftab_f16");
+  // The transpose-free twin. Optional: a build without it simply keeps
+  // the transposing path, which is correct and only slower.
+  m->_fn_rope_ip = m->_lib_rope.function("rope_half_part_ftab_inplace_f16");
   m->_fn_modulate  = m->_lib_elt.function("adaln_modulate_idx_f16");
   m->_fn_gated     = m->_lib_elt.function("gated_residual_idx_f16");
   // The fused fc1 is [GATE | up] and the block computes silu(gate)*up.
@@ -1465,6 +1533,31 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       std::getenv("VPIPE_H3_NO_ATTN_NAX") == nullptr) {
     m->_lib_attn_nax = mc->load_library("attn_steel_nax");
     m->_attn_nax = m->_lib_attn_nax.valid();
+  }
+  // FUSED ATTENTION: let steel address the activations where they
+  // already are instead of transposing four [seq, inner] buffers per
+  // block into and out of a head-major layout it never required. See
+  // the strides in fill() below, and the header for what each bit costs.
+  //
+  // The default is the OUT bit alone: the q/k/v half was measured and
+  // loses. VPIPE_H3_FUSED_ATTN overrides with an explicit mask (0 for
+  // the old path, 3 for both).
+  {
+    int want = kFusedAttnOut;
+    if (const char* e = std::getenv("VPIPE_H3_FUSED_ATTN")) {
+      if (*e != '\0') { want = std::atoi(e); }
+    }
+    m->_fused_attn = 0;
+    if (m->_steel_ok) {
+      m->_fused_attn = want & kFusedAttnOut;
+      // Steel only -- the scalar sdpa_full_f16 fallback reads contiguous
+      // [H, seq, D] and has no stride to give it. The head-major windows
+      // therefore stay allocated: the fallback is what runs if the steel
+      // functions fail to build, and it has to have somewhere to work.
+      if ((want & kFusedAttnQkv) != 0 && m->_fn_rope_ip.valid()) {
+        m->_fused_attn |= kFusedAttnQkv;
+      }
+    }
   }
 
   // Quantization block from the checkpoint's own config.json.
@@ -1618,7 +1711,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (i8->enabled()) { m->_i8 = std::move(i8); }
     // Deep-K split for the FF down projection. bf16 libraries: the fold
     // writes this DiT's element type.
+    m->_tune_ceiling = tune_ceiling_();
     m->_splitk.load(mc, m->_lib_dense_mma, m->_lib_elt);
+    // The split is tuned at the same ceiling the route is, so two
+    // geometries above it share one answer instead of re-measuring it.
+    m->_splitk.m_bucket = m->_tune_ceiling;
   }
   // The matrix-core path takes precedence and keeps the FF it has. See
   // the _fuse_ff comment in the header for why this is a refusal rather
@@ -1766,6 +1863,54 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                 : std::string()));
   }
   return m;
+}
+
+std::vector<int>
+MetalMiniMaxH3Transformer::tune_prune_survivors(
+    const std::vector<double>& warm, double keep)
+{
+  std::vector<int> live;
+  const std::size_t n = warm.size();
+  // A warm pass that failed to time is not evidence. Neither is a field
+  // of two, where there is nothing to prune down to.
+  bool timed = n > 2;
+  for (double t : warm) { timed = timed && t > 0.0; }
+  if (!timed) {
+    for (std::size_t i = 0; i < n; ++i) { live.push_back((int)i); }
+    return live;
+  }
+  // Fastest and second-fastest. BOTH start at infinity, so that a list
+  // already in ascending order still finds a real second -- seeded from
+  // warm[0] it would not, and {1, 2, 3} would keep one arm instead of
+  // the two this rule promises.
+  double lo = std::numeric_limits<double>::infinity(), lo2 = lo;
+  for (double t : warm) {
+    if (t < lo)       { lo2 = lo; lo = t; }
+    else if (t < lo2) { lo2 = t; }
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    // The two fastest unconditionally, then anything the warm pass puts
+    // within `keep` of the leader.
+    if (warm[i] <= lo2 || lo >= keep * warm[i]) { live.push_back((int)i); }
+  }
+  return live;
+}
+
+void
+MetalMiniMaxH3Transformer::set_fused_attention(int mask)
+{
+  // Bits the build cannot honour are dropped rather than faked, so an
+  // A/B that reads fused_attention() back sees which arm it ran.
+  int want = 0;
+  if (_steel_ok) {
+    want = mask & kFusedAttnOut;
+    if ((mask & kFusedAttnQkv) != 0 && _fn_rope_ip.valid()) {
+      want |= kFusedAttnQkv;
+    }
+  }
+  _fused_attn = want;
+  // The cached AttnParams may describe another layout now. The pipeline
+  // states do not depend on the layout and are left alone.
 }
 
 void
@@ -1918,8 +2063,9 @@ MetalMiniMaxH3Transformer::gemm_route_(int M, int N, int K) const
     // correct (if slower) answer on an M4.
     if (route_ok_(_forced_route, M, N, K)) { return _forced_route; }
   } else {
+    const int key = tune_row_key(M);
     for (const QmmTuneSet& set : _qmm_tuned) {
-      if (set.m != M) { continue; }
+      if (set.m != key) { continue; }
       for (const QmmTune& t : set.shapes) {
         if (t.N == N && t.K == K && route_ok_(t.route, M, N, K)) {
           return t.route;
@@ -2287,8 +2433,6 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
 
 namespace {
 
-using H3Route = MetalMiniMaxH3Transformer::GemmRoute;
-
 // Does this route's RANKING move with the row count, or only its
 // absolute time? Marked here, statically, per kernel -- it is a property
 // of what the kernel does and not of the checkpoint or the machine.
@@ -2309,19 +2453,7 @@ using H3Route = MetalMiniMaxH3Transformer::GemmRoute;
 bool
 route_m_sensitive_(H3Route r)
 {
-  switch (r) {
-    case H3Route::kSteelBm32:
-    case H3Route::kSteelBm64:
-    case H3Route::kSteelBm128:
-      return false;
-    case H3Route::kMma128:
-    case H3Route::kMma128x256:
-    case H3Route::kMma128x256Tn2:
-      return true;
-    case H3Route::kAuto:
-      break;
-  }
-  return true;      // unknown: assume the expensive answer
+  return route_is_mma_(r);
 }
 
 // The rows a route has to be timed over. Both numbers are floors on the
@@ -2353,15 +2485,15 @@ route_m_sensitive_(H3Route r)
 // VPIPE_H3_TUNE_ROWS overrides both, which is how the ladder above was
 // taken and how to re-take it on a machine this was not tuned on.
 int
-route_tune_rows_(H3Route r)
+route_tune_rows_(H3Route r, int ceiling)
 {
-  static const int kForced = [] {
-    const char* e = std::getenv("VPIPE_H3_TUNE_ROWS");
-    return e != nullptr ? std::atoi(e) : 0;
-  }();
-  if (kForced > 0) { return kForced; }
-  return route_m_sensitive_(r) ? 4096 : 1024;
+  // The ceiling IS the override when there is one -- it is the rounded
+  // form of the same number -- so a forced value reaches both floors
+  // through here and the two can never disagree.
+  if (tune_rows_override_() > 0) { return ceiling; }
+  return route_m_sensitive_(r) ? kMmaTuneRows : kFlatTuneRows;
 }
+
 
 }  // namespace
 
@@ -2369,8 +2501,12 @@ void
 MetalMiniMaxH3Transformer::tune_qmm_(int M)
 {
   if (_qmm_manual) { return; }   // the caller is driving; see set_qmm_tile
+  // Keyed on what will be MEASURED, not on what the caller asked for --
+  // see tune_ceiling_. Two video geometries above the ceiling share one
+  // entry because they would produce one answer.
+  const int key = tune_row_key(M);
   for (const QmmTuneSet& set : _qmm_tuned) {
-    if (set.m == M) { return; }
+    if (set.m == key) { return; }
   }
   // Nothing to choose: no wide steel twins built AND no matrix cores.
   if (_qmm_tile < 1 && !_use_mma2) { return; }
@@ -2419,6 +2555,7 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   std::vector<QmmTune> tuned;
   std::string detail;
   int tune_rows = 0;
+  std::size_t n_pruned = 0;
   const auto t0 = std::chrono::steady_clock::now();
   for (const Shape& sh : shapes) {
     if (skip_fc1 && sh.N == 2 * F) { continue; }
@@ -2450,7 +2587,7 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     int tune_m = 0;
     bool any_mma = false;
     for (GemmRoute r : cands) {
-      tune_m = std::max(tune_m, route_tune_rows_(r));
+      tune_m = std::max(tune_m, route_tune_rows_(r, _tune_ceiling));
       any_mma = any_mma || route_m_sensitive_(r);
     }
     // An mma route below _mma_min_m does not merely score badly -- it is
@@ -2460,26 +2597,85 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     tune_m = ((tune_m + 127) / 128) * 128;    // whole tiles, no tail
     if (tune_m > M) { tune_m = M; }
     tune_rows = tune_m;
+
+    // One arm, warm pass and timed round alike.
+    //
+    // No adapter: the tuner measures the BASE projection. The fold adds
+    // ~1% of a tile's work and only to the two plain tiles, which is far
+    // short of flipping a route, and giving the tuner an adapter would
+    // make its choice depend on which LoRA happened to be loaded.
+    //
+    // Banded exactly as the forward encodes it. Unbanded, an mma route
+    // past 2^31 bytes would silently skip its last tiles and be timed for
+    // work it did not do, while steel -- which addresses in 64 bits --
+    // did all of it. (At `tune_m` the band never fires; it is here
+    // because what is timed has to be what runs.)
+    auto time_route = [&](GemmRoute r) {
+      return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
+        dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N,
+                            sh.K, r);
+      });
+    };
+
+    // PRUNE ON A WARM PASS, which is how this gets cheaper without being
+    // told anything about the machine it is on.
+    //
+    // The point of this tuner is that an M4 Pro, an M5, an M5 Max and
+    // whatever comes next each end up on their own best kernel, so the
+    // one thing it must not do is carry a constant fitted to the box it
+    // was written on. But most of what it spends goes on arms that are
+    // not close, and WHICH arms those are is itself something a
+    // measurement can answer. So: run every candidate once, drop the ones
+    // far behind the leader, and spend the timed rounds on what is left.
+    // On this M5 that drops the three steel tiles because they measured
+    // 3x behind; on a machine with no matrix cores nothing is dropped,
+    // because the three steel tiles are within 1.2x of each other; on a
+    // part where steel wins it is the matmul2d arms that go.
+    //
+    // THE THRESHOLD IS SET BY WHAT THE WARM PASS CAN ACTUALLY RESOLVE,
+    // and that is much less than it looks. MEASURED on the M5, warm
+    // against the timed mean, as a ratio to the leader:
+    //
+    //   fc1 route  warm .292 .316 .309 | .865 .932 1.000
+    //              mean .289 .312 .306 | .866 .930 1.000
+    //   fc2 route  warm .312 .339 .332 | .938 .976 1.000
+    //              mean .314 .341 .335 | .992 .989 1.000
+    //
+    // Far-behind arms are identified exactly. Close ones are NOT: in the
+    // split sweep on the same box, warm rated two arms .905 and .851
+    // whose means were .990 and .996, and the first of them went on to
+    // win the vote. A threshold at .85 would have pruned the winner.
+    //
+    // Hence 0.6: it removes only the hopeless, never reaches into the
+    // cluster where the decision actually lives, and the two fastest
+    // survive whatever the ratios say.
+    //
+    // VPIPE_H3_TUNE_NO_PRUNE=1 measures every candidate, which is how to
+    // check that the pruned arms were not deciding anything. MEASURED
+    // here: 16.7 s against 11.9, same routes.
+    static const bool kNoPrune =
+        std::getenv("VPIPE_H3_TUNE_NO_PRUNE") != nullptr;
+    if (!kNoPrune && cands.size() > 2) {
+      std::vector<double> warm(cands.size(), 0.0);
+      bool timed = true;
+      for (std::size_t i = 0; i < cands.size() && timed; ++i) {
+        warm[i] = time_route(cands[i]);
+        timed = warm[i] > 0.0;
+      }
+      if (timed) {
+        std::vector<GemmRoute> keep;
+        // Original order, so the vote's tie-break is stable.
+        for (int i : tune_prune_survivors(warm, kPruneKeep)) {
+          keep.push_back(cands[(std::size_t)i]);
+        }
+        n_pruned += cands.size() - keep.size();
+        cands.swap(keep);
+      }
+    }
+
     const int w = autotune_vote((int)cands.size(), /*rounds=*/2,
         /*reps_for_us=*/1,
-        [&](int i) {
-          return autotune_time(_mc, 1, [&](ComputeEncoder& enc) {
-            // No adapter: the tuner measures the BASE projection. The
-            // fold adds ~1% of a tile's work and only to the two plain
-            // tiles, which is far short of flipping a route, and giving
-            // the tuner an adapter would make its choice depend on which
-            // LoRA happened to be loaded.
-            //
-            // Banded exactly as the forward encodes it. Unbanded, an mma
-            // route past 2^31 bytes would silently skip its last tiles
-            // and be timed for work it did not do, while steel -- which
-            // addresses in 64 bits -- did all of it. (At `tune_m` the
-            // band never fires; it is here because what is timed has to
-            // be what runs.)
-            dispatch_row_bands_(enc, xin, 0, *sh.l, yout, 0, tune_m, sh.N,
-                                sh.K, cands[(std::size_t)i]);
-          });
-        });
+        [&](int i) { return time_route(cands[(std::size_t)i]); });
     const GemmRoute win = cands[(std::size_t)w];
     tuned.push_back(QmmTune{sh.N, sh.K, win});
     if (!detail.empty()) { detail += " "; }
@@ -2489,8 +2685,7 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
     // dispatcher, so the tuner compares the winning route against itself
     // with and without the split rather than against a stand-in. The route
     // has to be pinned first -- measuring both at once would confound them.
-    if (win == GemmRoute::kMma128 || win == GemmRoute::kMma128x256 ||
-        win == GemmRoute::kMma128x256Tn2) {
+    if (route_is_mma_(win)) {
       // Keyed on the REAL M -- plan() matches the row count the forward
       // asks with -- but MEASURED at tune_m like everything else. The
       // split path already walks M in row blocks of its own choosing
@@ -2507,16 +2702,22 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   }
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
+  ++_qmm_tune_count;
   // Bounded: a pathological caller sweeping sequence lengths must not
   // grow this without limit, and the oldest entry is the one least
   // likely to come back.
   if (_qmm_tuned.size() >= 8) { _qmm_tuned.erase(_qmm_tuned.begin()); }
-  _qmm_tuned.push_back(QmmTuneSet{M, std::move(tuned)});
-  _qmm_tuning_desc = std::to_string(M) + ": " + detail;
+  _qmm_tuned.push_back(QmmTuneSet{key, std::move(tuned)});
+  // The row count MEASURED, which is also the cache key. The caller's own
+  // row count is in the debug line below and in the first-forward log; it
+  // is deliberately not what this string names, because after the
+  // bucketing it is not what the answer belongs to.
+  _qmm_tuning_desc = std::to_string(key) + " rows: " + detail;
   if (_mc->session() != nullptr) {
     _mc->session()->log_debug(fmt(
-        "[h3-dit] qmm autotune for {} rows, timed over {}: {} ({:.0f} ms)",
-        M, tune_rows, detail, ms));
+        "[h3-dit] qmm autotune for {} rows, timed over {}: {} "
+        "({:.0f} ms, {} arm(s) pruned on the warm pass)",
+        M, tune_rows, detail, ms, n_pruned));
   }
 }
 
@@ -2980,6 +3181,28 @@ namespace {
 // ensure_scratch_ allocates.
 struct ScratchItem { std::size_t mul_seq, mul_text, mul_t, esz; };
 
+// Elements per row of the ATTENTION ARENA: qh|kh|vh|oh|ob end to end,
+// with `ff` aliased over the whole of it. The five are dead before the
+// FF writes, so what has to be held is the WIDER of the two uses.
+//
+// max(), not 5*I: nothing guarantees 2*ffn fits inside five inner()s on
+// a config this file has not seen. Where it does not, the arena is the
+// ff width and the attention buffers sit inside it instead.
+std::size_t
+attn_arena_elems_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
+{
+  const std::size_t I  = (std::size_t)c.inner();
+  const std::size_t ff = narrow_ff ? 3 * I : 2 * (std::size_t)c.ffn;
+  // ...+ hidden, because `proj` also lives here, parked past ff. It is
+  // written only by the FINAL layer -- final norm, modulate, then the
+  // video/audio output projections read it -- so it is dead for the
+  // whole block loop, and everything else in this arena is dead by the
+  // time it is written. Placing it PAST ff rather than at 0 costs
+  // nothing on the released config (34048 still under 5*inner) and
+  // means the two can never collide even if ff's live range grows.
+  return std::max<std::size_t>(5 * I, ff + (std::size_t)c.hidden);
+}
+
 std::vector<ScratchItem>
 scratch_plan_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
 {
@@ -2989,11 +3212,10 @@ scratch_plan_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
   return {
       {rot_half, 0, 0, sizeof(float)},           // rcos
       {rot_half, 0, 0, sizeof(float)},           // rsin
-      {H, 0, 0, 2}, {H, 0, 0, 2}, {H, 0, 0, 2},  // x, nm, proj
+      {H, 0, 0, 2}, {H, 0, 0, 2},                // x, nm (proj is in the arena)
       {3 * I, 0, 0, 2},                          // qkv
-      {I, 0, 0, 2}, {I, 0, 0, 2}, {I, 0, 0, 2},  // qh, kh, vh
-      {I, 0, 0, 2}, {I, 0, 0, 2},                // oh, ob
-      {narrow_ff ? 3 * I : 2 * (std::size_t)c.ffn, 0, 0, 2},   // ff
+      // qh|kh|vh|oh|ob and ff, one arena (see attn_arena_elems_).
+      {attn_arena_elems_(c, narrow_ff), 0, 0, 2},
       {0, H, 0, 2},                              // txt
       {0, 0, (std::size_t)c.time_dim, 2},        // temb
       {0, 0, (std::size_t)c.adaln_out(), 2},     // mod
@@ -3054,8 +3276,8 @@ std::size_t
 MetalMiniMaxH3Transformer::scratch_resident_bytes() const
 {
   const metal_compute::SharedBuffer* all[] = {
-      &_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.qh, &_s.kh, &_s.vh,
-      &_s.oh, &_s.ob, &_s.ff, &_s.proj, &_s.txt, &_s.temb, &_s.mod,
+      &_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.attn,
+      &_s.txt, &_s.temb, &_s.mod,
       &_s.fmod, &_s.adaln_idx, &_s.tstep_idx};
   std::size_t total = 0;
   for (const metal_compute::SharedBuffer* b : all) { total += b->byte_size(); }
@@ -3208,8 +3430,10 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
 std::vector<metal_compute::SharedBuffer*>
 MetalMiniMaxH3Transformer::scratch_buffers_()
 {
-  return {&_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.qh, &_s.kh,
-          &_s.vh, &_s.oh, &_s.ob, &_s.ff, &_s.proj, &_s.txt, &_s.temb,
+  // The ARENA, not its windows: subview() handles are explicitly not
+  // wirable, and wiring the one allocation covers all six of them.
+  return {&_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.attn,
+          &_s.txt, &_s.temb,
           &_s.mod, &_s.fmod, &_s.adaln_idx, &_s.tstep_idx, &_s.lora};
 }
 
@@ -3308,20 +3532,32 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
   s.rsin = _mc->make_shared_buffer(S * rot_half * sizeof(float));
   s.x    = mk(S * H);
   s.nm   = mk(S * H);
-  s.proj = mk(S * H);
   s.qkv  = mk(S * 3 * I);
-  s.qh   = mk(S * I);
-  s.kh   = mk(S * I);
-  s.vh   = mk(S * I);
-  s.oh   = mk(S * I);
-  s.ob   = mk(S * I);
+  // The arena, then five windows into it. subview() keeps the same
+  // MTL::Buffer and carries the offset, so binding a window addresses
+  // its slice with no copy -- and each window is CONTIGUOUS, which the
+  // [rows, I] shapes require.
+  s.attn = mk(S * attn_arena_elems_(c, !_ff_needs_wide));
+  if (s.attn.empty()) { return false; }
+  const std::size_t win = S * I * 2;            // bytes per window
+  s.qh   = s.attn.subview(0 * win, win);
+  s.kh   = s.attn.subview(1 * win, win);
+  s.vh   = s.attn.subview(2 * win, win);
+  s.oh   = s.attn.subview(3 * win, win);
+  s.ob   = s.attn.subview(4 * win, win);
   // The [seq, 2*ffn] fc1 intermediate -- the single largest scratch this
   // model holds. A fused FF never writes it, so when every block is
   // interleaved it shrinks to what its OTHER user needs: tune_qmm_'s
   // destination, whose widest remaining shape is qkv's 3*inner. The
   // public scratch_bytes() still quotes the wide figure, so the stage's
   // preflight over-estimates rather than under-estimates.
-  s.ff   = mk(S * (_ff_needs_wide ? 2 * (std::size_t)c.ffn : 3 * I));
+  // ALIASED over the arena, from offset 0: every window above is dead by
+  // the time fc1 writes this.
+  const std::size_t ff_elems =
+      S * (_ff_needs_wide ? 2 * (std::size_t)c.ffn : 3 * I);
+  s.ff   = s.attn.subview(0, ff_elems * 2);
+  // ...and `proj` past it, for the final layer alone.
+  s.proj = s.attn.subview(ff_elems * 2, S * H * 2);
   // A runtime LoRA's [M, rank] intermediate. Rank 64 at 19k rows is
   // 2.4 MB -- the whole reason applying an adapter at runtime is
   // affordable is that this is the only extra buffer it needs.
@@ -3646,7 +3882,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const int A_BQ = _attn_nax ? 64 : 32;
   const int A_BK = _attn_nax ? 32 : 16;
   bool use_steel = _steel_ok;
-  if (use_steel && (_attn_seq != seq || _attn_text != n_text)) {
+  // Read ONCE per forward: the A/B setter can change it between two, and
+  // the cached AttnParams below are tagged with the value they were
+  // filled for.
+  const int fused_attn = _fused_attn;
+  // The FUNCTIONS depend on the sequence lengths alone; the PARAMS also
+  // depend on which layout attention is reading, and the A/B setter
+  // flips that between forwards. Kept apart so toggling the layout does
+  // not rebuild two pipeline states -- an A/B that pays a rebuild in one
+  // arm and not the other is measuring the rebuild.
+  const bool attn_dirty = _attn_seq != seq || _attn_text != n_text;
+  if (use_steel && (attn_dirty || _attn_fused != fused_attn)) {
     // C++ mirror of mlx::steel::AttnParams, as in the sibling DiTs. Two
     // shapes only, and both are SQUARE: this model has no
     // cross-attention, so the refiner attends over the text rows and
@@ -3667,17 +3913,42 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       p->qL_rem = qL - p->NQ_aligned * A_BQ;
       p->kL_rem = qL - p->NK_aligned * A_BK;
       p->qL_off = 0;
-      p->Q_strides[0] = (std::int64_t)NH * qL * HD;
-      p->Q_strides[1] = (std::int64_t)qL * HD;
-      p->Q_strides[2] = HD;
+      // Head-major [H, qL, D], the layout the transposes produce.
+      const std::int64_t hm[3] = {(std::int64_t)NH * qL * HD,
+                                  (std::int64_t)qL * HD, HD};
+      if ((fused_attn & kFusedAttnQkv) != 0) {
+        // Q, K and V ARE the fused projection, addressed in place: a row
+        // is 3*I apart, a head QKV_HSTRIDE apart within the row, and the
+        // head_dim channels are contiguous, which is the one thing the
+        // BlockLoader actually requires. Which of the two groupings the
+        // checkpoint uses is already in QKV_HSTRIDE, so both are covered
+        // by the same three numbers. The q/k/v base offsets are applied
+        // at the BIND, not here -- steel has no field for them.
+        p->Q_strides[0] = (std::int64_t)qL * 3 * I;
+        p->Q_strides[1] = QKV_HSTRIDE;
+        p->Q_strides[2] = 3 * I;
+      } else {
+        for (int i = 0; i < 3; ++i) { p->Q_strides[i] = hm[i]; }
+      }
       for (int i = 0; i < 3; ++i) {
         p->K_strides[i] = p->Q_strides[i];
         p->V_strides[i] = p->Q_strides[i];
-        p->O_strides[i] = p->Q_strides[i];
+      }
+      if ((fused_attn & kFusedAttnOut) != 0) {
+        // O goes straight back into [rows, I], head h at column h*HD --
+        // the layout the out projection reads. Unlike the q/k/v side
+        // this asks nothing of the loaders: it is the kernel's final
+        // store, of exactly the bytes it was storing anyway.
+        p->O_strides[0] = (std::int64_t)qL * I;
+        p->O_strides[1] = HD;
+        p->O_strides[2] = I;
+      } else {
+        for (int i = 0; i < 3; ++i) { p->O_strides[i] = hm[i]; }
       }
     };
     fill(_attn_p_main, seq);
     fill(_attn_p_text, n_text);
+    _attn_fused = fused_attn;
     auto build = [&](int qL) {
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (qL % A_BK) == 0)
@@ -3686,14 +3957,22 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                  ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
     };
-    _fn_attn_main = build(seq);
-    _fn_attn_text = build(n_text);
-    _attn_seq = seq;
-    _attn_text = n_text;
+    if (attn_dirty) {
+      _fn_attn_main = build(seq);
+      _fn_attn_text = build(n_text);
+      _attn_seq = seq;
+      _attn_text = n_text;
+    }
   }
   if (use_steel) {
     use_steel = _fn_attn_main.valid() && _fn_attn_text.valid();
   }
+  // The scalar fallback has no strides, so a build that fails to make
+  // the steel functions falls all the way back -- head-major buffers,
+  // transposes and all. That is why the arena still carries them.
+  const int  fused     = use_steel ? fused_attn : 0;
+  const bool fused_qkv = (fused & kFusedAttnQkv) != 0;
+  const bool fused_out = (fused & kFusedAttnOut) != 0;
 
   // ---- env-gated per-section GPU timing (VPIPE_H3_DIT_PROFILE) --------
   // The whole forward is ONE deferred stream, so there is nothing to
@@ -3883,6 +4162,24 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
                    {(unsigned)HD, 1, 1});
     };
+    // The fused path's rope: the same rotation, written back over the
+    // values it read. No transpose, and V -- which does not rotate --
+    // needs no pass at all.
+    auto rope_ip = [&](int rows, int off, int rot) {
+      if (rot == 0) { return; }
+      enc.set_function(_fn_rope_ip);
+      enc.set_buffer(0, s.qkv);
+      enc.set_buffer(1, s.rcos); enc.set_buffer(2, s.rsin);
+      enc.set_constant(3, NH);
+      enc.set_constant(4, rows);
+      enc.set_constant(5, HD);
+      enc.set_constant(6, rot);
+      enc.set_constant(7, 3 * I);
+      enc.set_constant(8, off);
+      enc.set_constant(9, QKV_HSTRIDE);
+      enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
+                   {(unsigned)HD, 1, 1});
+    };
     auto qk_norm = [&](const SharedBuffer& g, int rows, int off) {
       enc.set_function(_fn_rms_heads);
       enc.set_buffer(0, s.qkv); enc.set_buffer(1, g);
@@ -3898,8 +4195,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     auto attn = [&](int rows, bool main) {
       if (use_steel) {
         enc.set_function(main ? _fn_attn_main : _fn_attn_text);
-        enc.set_buffer(0, s.qh); enc.set_buffer(1, s.kh);
-        enc.set_buffer(2, s.vh); enc.set_buffer(3, s.oh);
+        if (fused_qkv) {
+          enc.set_buffer(0, s.qkv, (std::size_t)Q_OFF * 2);
+          enc.set_buffer(1, s.qkv, (std::size_t)K_OFF * 2);
+          enc.set_buffer(2, s.qkv, (std::size_t)V_OFF * 2);
+        } else {
+          enc.set_buffer(0, s.qh); enc.set_buffer(1, s.kh);
+          enc.set_buffer(2, s.vh);
+        }
+        enc.set_buffer(3, fused_out ? s.ob : s.oh);
         enc.set_buffer(4, main ? _attn_p_main : _attn_p_text);
         enc.dispatch({32 * (unsigned)((rows + A_BQ - 1) / A_BQ),
                       4 * (unsigned)NH, 1}, {32, 4, 1});
@@ -3936,18 +4240,28 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // the two groupings the fused projection ships in.
       qk_norm(b.qn, rows, Q_OFF);
       qk_norm(b.kn, rows, K_OFF);
-      trope(s.qh, rows, Q_OFF, modulated ? c.rope_rot() : 0);
-      trope(s.kh, rows, K_OFF, modulated ? c.rope_rot() : 0);
-      trope(s.vh, rows, V_OFF, 0);
+      if (fused_qkv) {
+        rope_ip(rows, Q_OFF, modulated ? c.rope_rot() : 0);
+        rope_ip(rows, K_OFF, modulated ? c.rope_rot() : 0);
+      } else {
+        trope(s.qh, rows, Q_OFF, modulated ? c.rope_rot() : 0);
+        trope(s.kh, rows, K_OFF, modulated ? c.rope_rot() : 0);
+        trope(s.vh, rows, V_OFF, 0);
+      }
       psplit(t_prep);
       attn(rows, modulated);
       psplit(t_attn);
-      enc.set_function(_fn_transpose);
-      enc.set_buffer(0, s.oh); enc.set_buffer(1, s.ob);
-      enc.set_constant(2, NH); enc.set_constant(3, rows);
-      enc.set_constant(4, HD);
-      enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
-                   {(unsigned)HD, 1, 1});
+      if (!fused_out) {
+        // Head-major [H, rows, D] back to the row-major [rows, I] the
+        // out projection reads. The fused path had steel store it that
+        // way to begin with.
+        enc.set_function(_fn_transpose);
+        enc.set_buffer(0, s.oh); enc.set_buffer(1, s.ob);
+        enc.set_constant(2, NH); enc.set_constant(3, rows);
+        enc.set_constant(4, HD);
+        enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
+                     {(unsigned)HD, 1, 1});
+      }
       bdump("attn_out", s.ob, I);
       gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I,
             lo != nullptr ? &lo->out : nullptr);

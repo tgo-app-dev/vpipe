@@ -124,7 +124,7 @@ that downloads a model and records it in the local model registry.
 
    | Prompt | What to enter |
    | --- | --- |
-   | `HuggingFace path (owner/repo or URL), or Enter to browse the catalogue:` | press **Enter** to browse |
+   | `Model path (owner/repo, or a huggingface.co / modelscope.cn URL), or Enter to browse the catalogue:` | press **Enter** to browse |
    | `Model family` | the index next to **Qwen** |
    | `Version` | **3.5** |
    | `Parameter class` | **4B** |
@@ -144,8 +144,31 @@ auto-stops. Models land under `<base_path>/<owner>/<repo>` (default
 **Non-interactive shortcut.** Set the stage's `model_path` config to
 `mlx-community/Qwen3.5-4B-MLX-4bit` and it fetches without prompting. Useful
 keys: `base_path` (download root, default `./models`), `hf_token` (for
-gated/private repos; falls back to `$HF_TOKEN`), `overwrite_existing`
-(re-download if already registered, default `true`).
+gated/private repos; falls back to the chosen source's token env var),
+`overwrite_existing` (re-download if already registered, default `true`).
+
+**Downloading from ModelScope instead.** huggingface.co is not reachable from
+mainland China; much of the catalogue is mirrored on **modelscope.cn**. Set
+`source` to `modelscope` on the stage, or — more usefully — export
+`VPIPE_MODEL_SOURCE=modelscope` once and every fetch on that machine uses it:
+
+```sh
+export VPIPE_MODEL_SOURCE=modelscope
+./build/apps/vpipe/vpipe --launch-stage model-fetch \
+  --stage-cfg model_path=krea/Krea-2-Turbo
+```
+
+This changes **only where the bytes come from**. The model still registers
+under its HuggingFace path and still lands in `<base>/<owner>/<repo>`, so
+recipes, `model_path` references and an existing local copy all keep working,
+and switching sources never produces a second copy of a model you already have.
+A gated ModelScope repo takes `$MODELSCOPE_API_TOKEN` (or `hf_token` on the
+stage) the way HuggingFace takes `$HF_TOKEN`.
+
+Most repos are mirrored under the identical `owner/repo`; the handful that are
+not (MiniMax publishes as `MiniMaxAI` upstream and `MiniMax` on ModelScope) are
+mapped internally, so you still name the HuggingFace path either way. A repo
+with no ModelScope counterpart is refused by name rather than by HTTP code.
 
 **As a spec.** The same fetch in spec form — here with the non-interactive
 `model_path` set so it runs without prompts (an interactively-built fetch with

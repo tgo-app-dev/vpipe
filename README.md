@@ -646,6 +646,28 @@ Some tests exercise real models and are gated on environment variables that
 point at local model directories; when a variable is unset, the corresponding
 test skips.
 
+### Sanitizers
+
+`VPIPE_SANITIZE` builds the whole tree — library, apps and tests — under a
+sanitizer. Use a **separate build directory**: the flags go in the cache and
+every object needs them consistently.
+
+```sh
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVPIPE_SANITIZE=thread
+cmake --build build-tsan -j
+./build-tsan/vpipe_test
+```
+
+`thread`, `address` and `undefined` are accepted, comma-separated;
+`address,thread` is refused (they instrument memory incompatibly). Debug info
+is added regardless of build type, since a sanitizer report without line
+numbers is most of the way to useless.
+
+Reach for `thread` on anything touching the coroutine/teardown paths. The races
+it finds there are latent — they can be 100% reproducible on one binary and
+invisible after an unrelated relink of the same source — so a crash that "went
+away" is not evidence, and TSan finding nothing is.
+
 ---
 
 ## Structure

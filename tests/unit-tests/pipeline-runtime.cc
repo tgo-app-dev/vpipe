@@ -40,16 +40,23 @@ public:
   using TypedStage::TypedStage;
 
   unsigned target = 0;
-  unsigned next   = 0;
+  // ATOMIC because the tests below sample it MID-RUN from the main
+  // thread while this coroutine is still producing on a worker. A
+  // plain unsigned there is a data race that ThreadSanitizer flags in
+  // the library's own suite -- noise that hides real findings. Only
+  // this coroutine writes it, so relaxed is enough: the tests want a
+  // sample, not a synchronised count.
+  std::atomic<unsigned> next{0};
 
   vpipe::Job
   process(vpipe::RuntimeContext& ctx) override
   {
-    if (next >= target) {
+    const unsigned v = next.load(std::memory_order_relaxed);
+    if (v >= target) {
       ctx.signal_done();
       co_return;
     }
-    unsigned v = next++;
+    next.store(v + 1, std::memory_order_relaxed);
     co_await ctx.write(0,
         vpipe::make_payload<vpipe::test::UintPayload>(v));
   }
@@ -175,7 +182,7 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
   // while the sink is a handful of items in; held to depth 1 it can
   // only be a couple of Beats ahead of what the sink has taken.
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  unsigned produced = w.src->next;
+  unsigned produced = w.src->next.load(std::memory_order_relaxed);
   size_t   consumed = 0;
   {
     std::lock_guard<std::mutex> lk(w.sink->mu);
@@ -299,7 +306,8 @@ TEST(pipeline_runtime, stop_mid_stream) {
   rt.stop();
   EXPECT_TRUE(!rt.running());
   // Source should be far from finished.
-  EXPECT_TRUE(w.src->next < 1000000u);
+  EXPECT_TRUE(w.src->next.load(std::memory_order_relaxed)
+              < 1000000u);
 }
 
 TEST(pipeline_runtime, self_completed_when_all_stages_done) {

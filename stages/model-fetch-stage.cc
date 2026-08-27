@@ -2,6 +2,7 @@
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
+#include "stages/model-source.h"
 #include "stages/resumable-fetch.h"
 #include "stages/qwen-asr-tokenizer.h"
 
@@ -44,6 +45,18 @@ trim_(string& s)
   auto ns = [](unsigned char c) { return !std::isspace(c); };
   s.erase(s.begin(), std::find_if(s.begin(), s.end(), ns));
   s.erase(std::find_if(s.rbegin(), s.rend(), ns).base(), s.end());
+}
+
+// "a, b, c" -- for naming the valid options back at a user who missed.
+string
+join_(const vector<string>& v)
+{
+  string out;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i > 0) { out += ", "; }
+    out += "'" + v[i] + "'";
+  }
+  return out;
 }
 
 // Expand a leading "~/" to $HOME (getline doesn't go through a shell).
@@ -241,6 +254,8 @@ ModelFetchStage::ModelFetchStage(const SessionContextIntf* s,
   _model_variant       = attr_str("model_variant");
   _model_key           = attr_str("model_key");
   _hf_token            = attr_str("hf_token");
+  _source              = attr_str("source");
+  _source_revision     = attr_str("source_revision");
   _overwrite_existing  = attr_bool("overwrite_existing");
   _prepare_tokenizer   = attr_bool("prepare_tokenizer");
   _skip_existing_files = attr_bool("skip_existing_files");
@@ -289,8 +304,32 @@ constexpr ConfigKey kAttrs[] = {
           "taking the first",
    .def_str = ""},
   {.key = "hf_token", .type = ConfigType::String,
-   .doc = "HuggingFace token for gated/private repos; empty -> $HF_TOKEN "
-          "(prompted via getpasswd if a download is gated)"},
+   .doc = "bearer token for gated/private repos; empty -> the token env "
+          "var for the chosen source ($HF_TOKEN / "
+          "$HUGGING_FACE_HUB_TOKEN for HuggingFace, "
+          "$MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN for ModelScope), "
+          "and prompted via getpasswd if a download turns out to be "
+          "gated"},
+  {.key = "source", .type = ConfigType::String,
+   .doc = "where to DOWNLOAD from: 'huggingface' (default) or "
+          "'modelscope' (modelscope.cn, the mirror reachable from "
+          "mainland China). Empty -> $VPIPE_MODEL_SOURCE, else "
+          "huggingface -- so a machine behind the Great Firewall sets "
+          "the env var once instead of every stage. This picks the "
+          "SOURCE only: the registry key and the on-disk directory come "
+          "from the HuggingFace path either way, so the same model "
+          "fetched from either side is one model in one place, and "
+          "switching does not produce a second copy. Most of the "
+          "catalogue is mirrored under the identical owner/repo; where "
+          "it is not, the mapping is in model-source.cc",
+   .def_str = ""},
+  {.key = "source_revision", .type = ConfigType::String,
+   .doc = "branch/tag/commit to read; empty -> the source's own default, "
+          "which differs ('main' on HuggingFace, 'master' on "
+          "ModelScope). Naming one explicitly is rarely right for that "
+          "reason -- and on ModelScope a revision that does not exist "
+          "comes back as an EMPTY file list rather than an error",
+   .def_str = ""},
   {.key = "overwrite_existing", .type = ConfigType::Bool,
    .doc = "re-download + re-register a model already in the registry",
    .def_bool = true},
@@ -370,10 +409,11 @@ const StageSpec kSpec = {
   .type_name = "model-fetch",
   .doc       = "Interactive one-shot: identify a model (browse the "
                "internal HuggingFace catalogue or type a path), download "
-               "it under a base path, synthesize the Qwen3-ASR "
-               "tokenizer.json natively, and register it in the model "
-               "registry keyed by the huggingface.co path. Optional "
-               "trigger in / summary out.",
+               "it from HuggingFace or a mirror (modelscope.cn) under a "
+               "base path, synthesize the Qwen3-ASR tokenizer.json "
+               "natively, and register it in the model registry keyed by "
+               "the huggingface.co path whichever source served it. "
+               "Optional trigger in / summary out.",
   .display_name = "Model Fetch",
   .category  = StageCategory::Preparation,
   .iports    = kIports,
@@ -409,13 +449,44 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
   }
 
+  // -------- 0. Resolve the SOURCE --------------------------------------
+  // Which server the bytes come from. Settled before anything is
+  // identified because it changes the wording of the prompts below (a
+  // user pasting a modelscope.cn URL should not be asked for a
+  // HuggingFace path) and because an unusable setting is worth saying
+  // NOW rather than after a catalogue drill-down.
+  const ModelSource* src = nullptr;
+  if (!_source.empty()) {
+    src = model_source(_source);
+    if (src == nullptr) {
+      s->error(fmt("ModelFetchStage('{}'): unknown source '{}'; known "
+                   "sources are {}", this->id(), _source,
+                   join_(model_source_names())));
+    }
+  } else {
+    src = &default_model_source();
+    // An unknown $VPIPE_MODEL_SOURCE silently falling back to
+    // HuggingFace is the wrong failure for the user this setting exists
+    // for: they set it precisely because HuggingFace does not work.
+    const char* env = std::getenv("VPIPE_MODEL_SOURCE");
+    if (env != nullptr && *env != '\0' && model_source(env) == nullptr) {
+      s->warn(fmt("ModelFetchStage('{}'): $VPIPE_MODEL_SOURCE is '{}', "
+                  "which is not a known source -- falling back to {}. "
+                  "Known sources are {}",
+                  this->id(), env, src->label(),
+                  join_(model_source_names())));
+    }
+  }
+  const string revision = _source_revision.empty()
+      ? string(src->default_revision()) : _source_revision;
+
   // -------- 1. Identify the model --------------------------------------
   // Precedence: configured model_path > direct entry > catalogue browse.
   string hf_path;
   const ModelCatalogEntry* entry = nullptr;
 
   if (!_model_path.empty()) {
-    hf_path = normalize_hf_path(_model_path);
+    hf_path = normalize_model_ref(_model_path);
     if (hf_path.empty()) {
       s->error(fmt("ModelFetchStage('{}'): invalid model_path '{}'",
                    this->id(), _model_path));
@@ -423,14 +494,14 @@ ModelFetchStage::process(RuntimeContext& ctx)
   } else {
     string direct;
     if (s->getline(
-            fmt("HuggingFace path (owner/repo or URL), or Enter to "
-                "browse the catalogue: "),
+            fmt("Model path (owner/repo, or a huggingface.co / "
+                "modelscope.cn URL), or Enter to browse the catalogue: "),
             direct, cancel) != UiInputStatus::Ok) {
       s->error(fmt("ModelFetchStage('{}'): input closed", this->id()));
     }
     trim_(direct);
     if (!direct.empty()) {
-      hf_path = normalize_hf_path(direct);
+      hf_path = normalize_model_ref(direct);
       if (hf_path.empty()) {
         s->error(fmt("ModelFetchStage('{}'): could not parse '{}' as "
                      "owner/repo", this->id(), direct));
@@ -630,8 +701,8 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
   }
 
-  s->info(fmt("ModelFetchStage('{}'): fetching '{}' -> '{}'",
-              this->id(), hf_path, local_dir.string()));
+  s->info(fmt("ModelFetchStage('{}'): fetching '{}' from {} -> '{}'",
+              this->id(), hf_path, src->label(), local_dir.string()));
 
   // How every file below is fetched: no total deadline, a stall window,
   // retries that resume, the content store for the big ones, and a
@@ -649,6 +720,18 @@ ModelFetchStage::process(RuntimeContext& ctx)
   // registered -- no model-repo tree walk. Keeps dataset text out of the binary
   // (the model-eval stage reads these rows-*.json pages on demand).
   if (entry != nullptr && !entry->dataset_files.empty()) {
+    // These are VERBATIM URLs into HuggingFace's datasets-server, which
+    // has no mirror counterpart -- there is no ModelScope endpoint that
+    // serves the same /rows pages. Say so rather than let a fetch that
+    // cannot reach the host look like a network fault.
+    if (src->name() != string("huggingface")) {
+      s->warn(fmt(
+          "ModelFetchStage('{}'): '{}' is a DATASET, and its rows come "
+          "from HuggingFace's datasets-server by absolute URL -- source "
+          "'{}' does not apply and this fetch still needs "
+          "huggingface.co to be reachable",
+          this->id(), reg_key, src->name()));
+    }
     std::error_code ec;
     fs::create_directories(local_dir, ec);
     uint64_t total = 0;
@@ -712,20 +795,34 @@ ModelFetchStage::process(RuntimeContext& ctx)
   }
 
   // -------- 4. Resolve auth token -------------------------------------
+  // Each source has its own token env vars, so a machine set up for both
+  // does not offer HuggingFace's credential to modelscope.cn.
   string token = _hf_token;
-  if (token.empty()) {
-    if (const char* e = std::getenv("HF_TOKEN")) { token = e; }
-  }
-  if (token.empty()) {
-    if (const char* e = std::getenv("HUGGING_FACE_HUB_TOKEN")) {
-      token = e;
-    }
+  for (const string& var : src->token_env()) {
+    if (!token.empty()) { break; }
+    if (const char* e = std::getenv(var.c_str())) { token = e; }
   }
 
-  // -------- 5. List repo files (HF tree API) --------------------------
-  const string tree_url =
-      "https://huggingface.co/api/models/" + hf_path
-      + "/tree/main?recursive=true";
+  // -------- 4b. Where the repo lives ON THIS SOURCE --------------------
+  // Everything above this line -- the catalogue entry, the registry key,
+  // `local_dir` -- is in HuggingFace terms and STAYS that way. Only the
+  // download coordinate moves.
+  string repo_path;
+  const MirrorStatus mirror = mirror_repo(src->name(), hf_path, repo_path);
+  if (mirror == MirrorStatus::Absent) {
+    s->error(fmt(
+        "ModelFetchStage('{}'): '{}' has no counterpart on {} -- it is "
+        "published only on HuggingFace. Fetch it with source=huggingface "
+        "(or clear $VPIPE_MODEL_SOURCE) if you can reach that host",
+        this->id(), hf_path, src->label()));
+  }
+  if (mirror == MirrorStatus::Renamed) {
+    s->info(fmt("ModelFetchStage('{}'): '{}' is '{}' on {}",
+                this->id(), hf_path, repo_path, src->label()));
+  }
+
+  // -------- 5. List repo files (the source's tree API) ----------------
+  const string tree_url = src->tree_url(repo_path, revision);
   string body, err;
   long   status = 0;
   bool   ok = http_get_text(tree_url, token, _verify_tls,
@@ -735,8 +832,8 @@ ModelFetchStage::process(RuntimeContext& ctx)
   if (!ok && (status == 401 || status == 403)) {
     string t;
     if (s->getpasswd(
-            fmt("'{}' is gated. HuggingFace token (blank to cancel): ",
-                hf_path),
+            fmt("'{}' is gated. {} token (blank to cancel): ",
+                repo_path, src->label()),
             t, cancel) == UiInputStatus::Ok) {
       trim_(t);
       if (!t.empty()) {
@@ -747,21 +844,24 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
   }
   if (!ok) {
-    s->error(fmt("ModelFetchStage('{}'): listing '{}' failed: {}",
-                 this->id(), hf_path, err));
+    s->error(fmt("ModelFetchStage('{}'): listing '{}' on {} failed: {}",
+                 this->id(), repo_path, src->label(), err));
   }
 
   FlexData tree;
   try {
     tree = FlexData::from_json(body);
   } catch (const std::exception& e) {
-    s->error(fmt("ModelFetchStage('{}'): bad tree JSON for '{}': {}",
-                 this->id(), hf_path, e.what()));
+    s->error(fmt("ModelFetchStage('{}'): bad tree JSON for '{}' on {}: {}",
+                 this->id(), repo_path, src->label(), e.what()));
   }
-  vector<HfFile> files = hf_tree_files(tree);
+  vector<HfFile> files = src->parse_tree(tree);
   if (files.empty()) {
-    s->error(fmt("ModelFetchStage('{}'): '{}' lists no files (private or "
-                 "non-existent?)", this->id(), hf_path));
+    // The hint is per-source because the likely CAUSE is: HuggingFace
+    // 404s a repo that is not there, ModelScope answers a bad revision
+    // with an empty list and HTTP 200.
+    s->error(fmt("ModelFetchStage('{}'): {}", this->id(),
+                 src->empty_tree_hint(repo_path, revision)));
   }
 
   // A catalogue entry may pin a SUBSET of repo files (e.g. one GGUF quant
@@ -818,8 +918,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
     s->info(fmt("  [{}/{}] {} ({}) ...",
                 i + 1, files.size(), f.path,
                 f.size ? human_bytes(f.size) : string("size unknown")));
-    const string file_url = "https://huggingface.co/" + hf_path
-                          + "/resolve/main/" + f.path;
+    const string file_url = src->file_url(repo_path, revision, f.path);
     // A live progress report for big shards -- a bar in the console
     // footer, an entry in the web UI's progress panel. The handle
     // closes itself when it leaves scope, including on the error path.
@@ -837,10 +936,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
     freq.want.git_oid = f.git_oid;
     // A repo that publishes a xet hash can be rebuilt from the content
     // store instead of streamed, which is many ranges at once rather
-    // than one. Only worth the extra round trips on a big file.
-    if (!f.xet_hash.empty() && f.size >= kBigFileBytes) {
-      freq.xet.repo     = hf_path;
-      freq.xet.revision = "main";
+    // than one. Only worth the extra round trips on a big file -- and
+    // only HuggingFace has such a store, so a mirror leaves this empty
+    // and every file streams.
+    if (src->supports_xet() && !f.xet_hash.empty()
+        && f.size >= kBigFileBytes) {
+      freq.xet.repo     = repo_path;
+      freq.xet.revision = revision;
       freq.xet.hash     = f.xet_hash;
     }
     FileCheck fc = FileCheck::NotPublished;
@@ -886,8 +988,24 @@ ModelFetchStage::process(RuntimeContext& ctx)
         ++got;
         continue;
       }
-      const string curl_url = "https://huggingface.co/" + c.repo
-                            + "/resolve/main/" + c.file;
+      // A companion names ANOTHER repo, in HuggingFace terms like
+      // everything else in the catalogue, so it needs the same mirror
+      // resolution the main repo got -- MiniMax-H3's tokenizer companion
+      // is exactly such a case, and reaching for the HuggingFace spelling
+      // here would be an unreachable host in the one deployment this
+      // whole path exists for. A companion the mirror lacks is skipped
+      // with a warning rather than failing the fetch, for the reason the
+      // failure path below gives.
+      string crepo;
+      if (mirror_repo(src->name(), c.repo, crepo) == MirrorStatus::Absent) {
+        s->warn(fmt(
+            "ModelFetchStage('{}'): companion '{}' comes from '{}', which "
+            "{} does not carry; fetch it from HuggingFace and copy it to "
+            "'{}'", this->id(), c.file, c.repo, src->label(),
+            dest.string()));
+        continue;
+      }
+      const string curl_url = src->file_url(crepo, revision, c.file);
       long   cstatus = 0;
       string cerr;
       UiProgress cbar;
@@ -1004,9 +1122,13 @@ ModelFetchStage::process(RuntimeContext& ctx)
   FlexData rec = FlexData::make_object();
   auto ro = rec.as_object();
   ro.insert_or_assign("hf_path", FlexData::make_string(hf_path));
+  // PROVENANCE, not identity: `hf_path` above is what this record is
+  // keyed and looked up by whichever server served the bytes, and these
+  // two say where they actually came from. A record written before this
+  // field existed has no `source`, which reads correctly as HuggingFace.
+  ro.insert_or_assign("source", FlexData::make_string(src->name()));
   ro.insert_or_assign("source_url",
-                      FlexData::make_string("https://huggingface.co/"
-                                            + hf_path));
+                      FlexData::make_string(src->web_url(repo_path)));
   ro.insert_or_assign("local_path",
                       FlexData::make_string(local_path_str));
   ro.insert_or_assign("file_count",

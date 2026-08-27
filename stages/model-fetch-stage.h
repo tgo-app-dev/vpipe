@@ -5,7 +5,8 @@
 
 namespace vpipe {
 
-// Interactive one-shot stage that obtains a model from HuggingFace:
+// Interactive one-shot stage that obtains a model from HuggingFace or a
+// mirror of it:
 //
 //   1) identify a model -- either browse the internal catalogue
 //      (model-catalog.{h,cc}) by drilling down family -> version ->
@@ -21,6 +22,14 @@ namespace vpipe {
 //      keyed by the path after huggingface.co, with a FlexData record of
 //      the key facts;
 //   5) signal_done and terminate.
+//
+// WHERE the bytes come from is a separate axis from WHICH model is meant
+// (model-source.h). The catalogue speaks HuggingFace throughout, and the
+// registry key and on-disk directory are derived from the HuggingFace
+// path whichever source served the download -- so a model fetched from
+// modelscope.cn (the mirror reachable from mainland China) is the same
+// model, in the same place, under the same key. Pick the source with the
+// `source` attribute, or once per machine with $VPIPE_MODEL_SOURCE.
 //
 // 1 optional trigger iport (any beat) + 1 FlexData "summary" oport, so
 // these preparation stages can be cascaded into a recipe and/or dumped to
@@ -52,6 +61,11 @@ private:
   // on disk and still be distinct records in the models DB.
   std::string   _model_key;
   std::string   _hf_token;           // optional auth ("" -> $HF_TOKEN)
+  // Where to fetch FROM: a model-source.h name ("" -> $VPIPE_MODEL_SOURCE,
+  // else huggingface), and the branch to read ("" -> that source's own
+  // default, which is NOT the same string on both).
+  std::string   _source;
+  std::string   _source_revision;
   bool          _overwrite_existing{};
   bool          _prepare_tokenizer{};
   bool          _skip_existing_files{};

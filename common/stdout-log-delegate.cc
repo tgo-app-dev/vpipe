@@ -356,16 +356,22 @@ StdoutLogDelegate::detach()
   // block" abort observed in the test binary.
   //
   // Two-phase wait: (1) cv on _consumer_done so we sleep cheaply
-  // until the coroutine is essentially done, then (2) spin on
-  // _h.done() until the coroutine is officially at
-  // final_suspend. The spin window is typically a handful of
-  // instructions; yield keeps it polite even if the scheduler
-  // is unkind.
+  // until the coroutine is essentially done, then (2) spin until the
+  // coroutine has stopped touching its frame. The spin window is
+  // typically a handful of instructions; yield keeps it polite even
+  // if the scheduler is unkind.
+  //
+  // Phase 2 tests `quiescent()`, NOT `handle().done()`. done() turns
+  // true while FinalAwaiter::await_suspend still has the promise to
+  // read, so the original spin here left exactly the window it was
+  // written to close -- ThreadSanitizer catches it as this thread
+  // racing the consumer's `.resume` on a pool worker. See Job::
+  // quiescent().
   {
     unique_lock<mutex> lk(_done_mu);
     _done_cv.wait(lk, [this] { return _consumer_done; });
   }
-  while (_consumer.handle() && !_consumer.handle().done()) {
+  while (!_consumer.quiescent()) {
     std::this_thread::yield();
   }
 

@@ -1,5 +1,6 @@
 #include "generative-models/flux2/metal-flux2-transformer.h"
 
+#include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/i8-gemm.h"
 
 #include "common/flex-data.h"
@@ -410,48 +411,32 @@ MetalFlux2Transformer::each_single_tensor_(
 }
 
 // [g0..g_{m-1} | u0..u_{m-1}] -> [g0,u0,g1,u1,...], where it lies.
+// The walk itself is shared/riffle-rows.h -- MiniMax-H3's fc1 wants the
+// identical permutation over the identical layout.
 //
-// Row i moves to 2i mod (n-1), with the last row fixed -- the standard
-// riffle. Following the permutation's cycles needs one row of scratch
-// and a visited byte per row, against a whole second copy of the tensor
-// for the out-of-place version at load. On the largest weight in a
-// double block that is the difference between a slot costing one block
-// and a slot costing one and a quarter.
+// EVERY buffer is checked before ANY is permuted. A quantized weight is
+// three buffers that only mean something together, and the walk cannot
+// report a failure once started, so a refusal discovered between two
+// walks would leave the weight half-permuted.
 bool
 MetalFlux2Transformer::riffle_rows_(QWeight& qw) const
 {
   const std::size_t n = (std::size_t)qw.n;
   if (qw.n <= 1) { return true; }
-  if ((n & 1) != 0) { return false; }
-  bool ok = true;
-  const auto one = [&](SharedBuffer& b) {
-    if (!ok || b.empty()) { return; }
-    const std::size_t rb = b.byte_size() / n;
-    if (rb == 0 || rb * n != b.byte_size()) { ok = false; return; }
-    auto* base = static_cast<std::uint8_t*>(b.contents());
-    std::vector<std::uint8_t> seen(n, 0);
-    std::vector<std::uint8_t> hold(rb), next(rb);
-    for (std::size_t s = 0; s + 1 < n; ++s) {
-      if (seen[s] != 0) { continue; }
-      std::memcpy(hold.data(), base + s * rb, rb);
-      std::size_t i = s;
-      for (;;) {
-        const std::size_t j = (2 * i) % (n - 1);
-        std::memcpy(next.data(), base + j * rb, rb);
-        std::memcpy(base + j * rb, hold.data(), rb);
-        hold.swap(next);
-        seen[j] = 1;
-        i = j;
-        if (j == s) { break; }
-      }
-    }
-  };
   if (qw.quantized) {
-    one(qw.codes); one(qw.scales); one(qw.qbias);
-  } else {
-    one(qw.w);
+    if (!genai::riffle_rows_ok(qw.codes, n)
+        || !genai::riffle_rows_ok(qw.scales, n)
+        || !genai::riffle_rows_ok(qw.qbias, n)) {
+      return false;
+    }
+    genai::riffle_rows(qw.codes, n);
+    genai::riffle_rows(qw.scales, n);
+    genai::riffle_rows(qw.qbias, n);
+    return true;
   }
-  return ok;
+  if (!genai::riffle_rows_ok(qw.w, n)) { return false; }
+  genai::riffle_rows(qw.w, n);
+  return true;
 }
 
 // Rebuild a single block's fused halves out of the raw projection it

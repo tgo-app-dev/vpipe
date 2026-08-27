@@ -140,6 +140,21 @@ struct MmaSplitK {
   struct Tuned { int N, K, M, splits; };
   std::vector<Tuned> tuned;
 
+  // Row count above which two callers share one tuned entry. 0 keys on
+  // the exact M, which is what the LM callers want -- their M is the
+  // prompt length and the answer really can move with it.
+  //
+  // A caller that always MEASURES at a ceiling should set this to that
+  // ceiling: above one row block the split decision stops moving with M
+  // (encode walks M in blocks of its own choosing), so keying two
+  // geometries apart there buys nothing and costs a full re-tune. The
+  // video DiT sets it; nothing else does.
+  int m_bucket = 0;
+  int m_key_(int M) const
+  {
+    return m_bucket > 0 ? std::min(M, m_bucket) : M;
+  }
+
   void load(metal_compute::MetalCompute* mc,
             metal_compute::ComputeLibrary& lib_dense,
             metal_compute::ComputeLibrary& lib_elt)
@@ -213,7 +228,7 @@ struct MmaSplitK {
     // floors are guesses about where a split pays and the measurement is
     // not.
     for (const Tuned& t : tuned) {
-      if (t.N == N && t.K == K && t.M == M) {
+      if (t.N == N && t.K == K && t.M == m_key_(M)) {
         if (t.splits <= 0) { return best; }
         const metal_compute::ComputeFunction* fn = fn_for_kc(K / t.splits);
         if (fn != nullptr) { best = Plan{fn, t.splits}; }
@@ -284,8 +299,9 @@ struct MmaSplitK {
   int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run)
   {
     if (!enabled || mc == nullptr) { return 0; }
+    const int key = m_key_(M);
     for (const Tuned& t : tuned) {
-      if (t.N == N && t.K == K && t.M == M) { return t.splits; }
+      if (t.N == N && t.K == K && t.M == key) { return t.splits; }
     }
     // Candidate 0 is "no split". The rest are every exact chunk with a
     // kernel and a row block that fits -- the same filter plan() applies,
@@ -298,7 +314,7 @@ struct MmaSplitK {
       cands.push_back(S);
     }
     if (cands.size() < 2) {
-      tuned.push_back(Tuned{N, K, M, 0});
+      tuned.push_back(Tuned{N, K, key, 0});
       return 0;
     }
     const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
@@ -312,7 +328,7 @@ struct MmaSplitK {
           return t;
         });
     const int splits = cands[(std::size_t)w];
-    tuned.push_back(Tuned{N, K, M, splits});
+    tuned.push_back(Tuned{N, K, key, splits});
     return splits;
   }
 

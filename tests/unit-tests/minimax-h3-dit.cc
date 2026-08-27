@@ -36,6 +36,7 @@
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/streamed-refill.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -49,6 +50,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1125,7 +1127,10 @@ TEST(minimax_h3_dit, step_bench)
   const int naud   = envi("VPIPE_MINIMAX_H3_BENCH_AUD", 93);
   const int ntext  = envi("VPIPE_MINIMAX_H3_BENCH_TEXT", 16);
   const int layers = envi("VPIPE_MINIMAX_H3_BENCH_LAYERS", 2);
-  const int iters  = envi("VPIPE_MINIMAX_H3_BENCH_ITERS", 3);
+  // At least two: iteration 0 of each arm pays for scratch allocation and
+  // function binding and is discarded, so ITERS=1 would time nothing and
+  // fail the `best` assertion rather than report a number.
+  const int iters  = std::max(2, envi("VPIPE_MINIMAX_H3_BENCH_ITERS", 3));
 
   MetalMiniMaxH3Transformer::Config cfg;
   std::string cerr;
@@ -1196,7 +1201,49 @@ TEST(minimax_h3_dit, step_bench)
   // under the same drift.
   const bool ab_tile =
       std::getenv("VPIPE_MINIMAX_H3_BENCH_TILE_AB") != nullptr;
-  const int arms = ab_tile ? (m->qmm_tile() + 1) : 1;
+  // VPIPE_MINIMAX_H3_BENCH_FUSED_AB: the same interleave over the
+  // attention layout masks -- arm 0 transposes all four activations,
+  // arm 1 only stores the output row-major, arm 2 also reads q/k/v out
+  // of the fused projection in place. Every arm is the SAME arithmetic
+  // on the same bytes, so the rms check below is a correctness
+  // assertion here and not just a sanity one.
+  const bool ab_fused =
+      std::getenv("VPIPE_MINIMAX_H3_BENCH_FUSED_AB") != nullptr;
+  const int kFusedArm[] = {0, MetalMiniMaxH3Transformer::kFusedAttnOut,
+                           MetalMiniMaxH3Transformer::kFusedAttnOut |
+                               MetalMiniMaxH3Transformer::kFusedAttnQkv};
+  const int n_fuse = (int)std::size(kFusedArm);
+  const int arms = ab_tile ? (m->qmm_tile() + 1) : (ab_fused ? n_fuse : 1);
+
+  // THE WEAVE, on buffers the size of one block's fc1 -- timed on
+  // scratch of its own, because riffling a block that is already
+  // interleaved would corrupt it. Pure CPU and independent of the row
+  // count, which is the whole asymmetry: it is paid per block-load
+  // while the fused saving is paid per row.
+  {
+    const std::size_t N  = (std::size_t)(2 * cfg.ffn);
+    const int bits = m->quant_bits() > 0 ? m->quant_bits() : 8;
+    const std::size_t rc = (std::size_t)cfg.hidden * (std::size_t)bits / 8;
+    const std::size_t rg =
+        (std::size_t)cfg.hidden / (std::size_t)m->quant_group() * 2;
+    SharedBuffer wc = mc->make_shared_buffer(N * rc);
+    SharedBuffer wsc = mc->make_shared_buffer(N * rg);
+    SharedBuffer wqb = mc->make_shared_buffer(N * rg);
+    if (!wc.empty() && !wsc.empty() && !wqb.empty()) {
+      double bestw = 1e30;
+      for (int r = 0; r < 5; ++r) {
+        const auto w0 = std::chrono::steady_clock::now();
+        vpipe::genai::riffle_rows(wc, N);
+        vpipe::genai::riffle_rows(wsc, N);
+        vpipe::genai::riffle_rows(wqb, N);
+        bestw = std::min(bestw, std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - w0).count());
+      }
+      std::printf("[minimax_h3_dit] weave: %.2f ms per block "
+                  "(w%d, %zu MB fc1), row-count independent\n",
+                  bestw, bits, (N * rc + 2 * N * rg) >> 20);
+    }
+  }
   std::vector<double> arm_best((std::size_t)arms, 1e30);
 
   double best = 1e30;
@@ -1204,6 +1251,16 @@ TEST(minimax_h3_dit, step_bench)
   bool l2_stable = true;
   for (int i = 0; i < iters * arms; ++i) {
     if (ab_tile) { m->set_qmm_tile(i % arms); }
+    if (ab_fused) {
+      m->set_fused_attention(kFusedArm[(std::size_t)(i % arms)]);
+      // What the model ACCEPTED, not what the arm asked for: a build
+      // without the in-place rope silently runs arm 1 twice, and this
+      // is where that shows.
+      if (m->fused_attention() != kFusedArm[(std::size_t)(i % arms)]) {
+        std::printf("[minimax_h3_dit]   (arm %d refused: mask %d)\n",
+                    i % arms, m->fused_attention());
+      }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     std::string ferr;
     MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
@@ -1235,14 +1292,18 @@ TEST(minimax_h3_dit, step_bench)
       arm_best[(std::size_t)(i % arms)] =
           std::min(arm_best[(std::size_t)(i % arms)], ms);
     }
-    std::printf("[minimax_h3_dit]   iter %2d tile %d: %8.1f ms  rms %.6f\n",
-                i, ab_tile ? (i % arms) : m->qmm_tile(), ms, l2);
+    std::printf("[minimax_h3_dit]   iter %2d %s %d: %8.1f ms  rms %.6f\n",
+                i, ab_fused ? "fusemask" : "tile",
+                ab_fused ? kFusedArm[(std::size_t)(i % arms)]
+                         : (ab_tile ? (i % arms) : m->qmm_tile()), ms, l2);
   }
-  if (ab_tile) {
+  if (ab_tile || ab_fused) {
+    const char* what = ab_fused ? "fusemask" : "tile";
     for (int a = 0; a < arms; ++a) {
-      std::printf("[minimax_h3_dit] tile %d best %8.1f ms  (%.3fx vs tile 0)\n",
-                  a, arm_best[(std::size_t)a],
-                  arm_best[0] / arm_best[(std::size_t)a]);
+      std::printf("[minimax_h3_dit] %s %d best %8.1f ms  (%.3fx vs %s 0)\n",
+                  what, ab_fused ? kFusedArm[(std::size_t)a] : a,
+                  arm_best[(std::size_t)a],
+                  arm_best[0] / arm_best[(std::size_t)a], what);
     }
   }
   std::printf("[minimax_h3_dit] best %.1f ms/step at %d rows, %d blocks "
@@ -1250,6 +1311,330 @@ TEST(minimax_h3_dit, step_bench)
               best / (double)(cfg.n_layers ? cfg.n_layers : 1));
   EXPECT_TRUE(l2_stable);
   EXPECT_TRUE(best < 1e29);
+}
+
+// The GEMM tuner prunes its candidate list on a warm pass, so that it
+// gets cheaper on every machine without being told anything about any of
+// them. This is the RULE half, and the rule is what can go wrong
+// silently: a pruned winner is not an error, it is just a slower model.
+//
+// Three invariants, and the first one is not academic -- the rule was
+// written with both minima seeded from warm[0], which keeps ONE arm out
+// of an already-ascending list instead of the two it promises.
+//
+// No GPU and no checkpoint: this is arithmetic.
+TEST(minimax_h3_dit, warm_pass_prune_keeps_the_contenders)
+{
+  using M = MetalMiniMaxH3Transformer;
+  auto has = [](const std::vector<int>& v, int i) {
+    return std::find(v.begin(), v.end(), i) != v.end();
+  };
+
+  // Ascending, evenly spread -- the case the seeded-from-warm[0] version
+  // got wrong.
+  {
+    const std::vector<int> live = M::tune_prune_survivors({1.0, 2.0, 3.0}, 0.6);
+    EXPECT_TRUE(live.size() == 2);
+    EXPECT_TRUE(has(live, 0) && has(live, 1));
+  }
+  // One leader, the rest far behind: the runner-up survives anyway, so
+  // the vote always has something to compare against.
+  {
+    const std::vector<int> live =
+        M::tune_prune_survivors({1.0, 9.0, 9.1, 9.2}, 0.6);
+    EXPECT_TRUE(live.size() == 2);
+    EXPECT_TRUE(has(live, 0) && has(live, 1));
+  }
+  // A close cluster is never reached into -- this is the M5 split sweep,
+  // where the warm pass under-rated the eventual winner by 15%.
+  {
+    const std::vector<int> live =
+        M::tune_prune_survivors({1.9, 1.25, 1.10, 1.00, 1.18, 1.11}, 0.6);
+    EXPECT_TRUE(live.size() == 5);
+    EXPECT_TRUE(!has(live, 0));           // 0.53 of the leader: hopeless
+  }
+  // The M5 route sweep: three steel arms at ~3x, three matmul2d arms
+  // close together. Exactly the steel arms go.
+  {
+    const std::vector<int> live =
+        M::tune_prune_survivors({3.42, 3.16, 3.21, 1.15, 1.07, 1.00}, 0.6);
+    EXPECT_TRUE(live.size() == 3);
+    EXPECT_TRUE(has(live, 3) && has(live, 4) && has(live, 5));
+  }
+  // All within the threshold: nothing is dropped. A machine with no
+  // matrix cores sees this, and pays exactly what it paid before.
+  {
+    const std::vector<int> live =
+        M::tune_prune_survivors({1.00, 1.19, 1.12}, 0.6);
+    EXPECT_TRUE(live.size() == 3);
+  }
+  // The leader is in the survivors no matter what the field looks like.
+  {
+    const std::vector<double> warm{4.0, 1.0, 4.1, 40.0, 4.2};
+    const std::vector<int> live = M::tune_prune_survivors(warm, 0.6);
+    EXPECT_TRUE(has(live, 1));
+    EXPECT_TRUE(!has(live, 3));
+  }
+  // A warm pass that failed to time is not evidence, and neither is a
+  // field of two. Both prune nothing.
+  {
+    EXPECT_TRUE(M::tune_prune_survivors({1.0, 0.0, 5.0}, 0.6).size() == 3);
+    EXPECT_TRUE(M::tune_prune_survivors({1.0, -1.0, 5.0}, 0.6).size() == 3);
+    EXPECT_TRUE(M::tune_prune_survivors({1.0, 9.0}, 0.6).size() == 2);
+    EXPECT_TRUE(M::tune_prune_survivors({}, 0.6).empty());
+  }
+}
+
+// A tuned GEMM answer is filed under the row count it was MEASURED at,
+// not the row count the caller asked for -- so two geometries above the
+// tuner's ceiling share one measurement instead of running the identical
+// sweep twice.
+//
+// Two claims, and the second is the one that can rot silently. The key
+// ALGEBRA is arithmetic. But the store and the lookup compute that key in
+// different functions, and if they ever disagreed nothing would fail --
+// every projection would just fall back to the untuned rule and only a
+// timing would show it. So this drives real forwards and counts the
+// measurements.
+//
+// VPIPE_H3_TUNE_ROWS drops the ceiling so the sequences can be small: the
+// property under test is about the ceiling, not about its default value,
+// and at the default this test would cost two 4096-row sweeps. It is read
+// at LOAD and kept per model, which is what makes setting it here work
+// whatever else has run in this process first.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, tuned_routes_are_shared_above_the_tune_ceiling)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 1;
+
+  ::setenv("VPIPE_H3_TUNE_ROWS", "128", 1);
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ::unsetenv("VPIPE_H3_TUNE_ROWS");
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  const int ceil = m->tune_row_ceiling();
+  ASSERT_TRUE(ceil == 128);
+  if (ceil != 128) { return; }
+  // The algebra: shared at and above the ceiling, exact below it.
+  EXPECT_TRUE(m->tune_row_key(ceil) == ceil);
+  EXPECT_TRUE(m->tune_row_key(ceil + 1) == ceil);
+  EXPECT_TRUE(m->tune_row_key(9382) == m->tune_row_key(16990));
+  EXPECT_TRUE(m->tune_row_key(ceil - 1) == ceil - 1);
+  EXPECT_TRUE(m->tune_row_key(ceil - 1) != m->tune_row_key(ceil));
+
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  // One forward at a layout of `latf` video frames. The two calls must
+  // land at DIFFERENT sequence lengths, both above the ceiling, or this
+  // proves nothing -- checked below rather than assumed.
+  auto run_at = [&](int latf, int* seq) {
+    h3::PackedLayout L;
+    const std::vector<int> tags(8, h3::kTextTag);
+    if (!h3::build_packed_sequence(tags, latf, 12, 20, 8, cfg.patch_h,
+                                   cfg.patch_w, h3::kAudioChannels, {}, &L)) {
+      return false;
+    }
+    *seq = L.seq_len;
+    std::vector<float> uniq;
+    std::vector<int>   row_idx;
+    h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+    const int n_video = (int)L.video_indices.size();
+    const SharedBuffer vb = to_bf16_buf_(
+        mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+    const SharedBuffer ab = to_bf16_buf_(
+        mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+    const SharedBuffer tb = to_bf16_buf_(
+        mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+    if (vb.empty() || ab.empty() || tb.empty()) { return false; }
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto out = m->forward(step, &ferr);
+    if (out.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    return true;
+  };
+
+  int seq_a = 0, seq_b = 0;
+  ASSERT_TRUE(run_at(2, &seq_a));
+  // Nothing was tuned at all: no matrix cores and only one steel tile
+  // built, so there was never a choice to make. Say so -- the counts
+  // below would all be 0 and would pass while proving nothing.
+  if (m->qmm_tune_count() == 0) {
+    std::printf("[minimax_h3_dit] no GEMM route to tune on this build; "
+                "sharing not exercised\n");
+    return;
+  }
+  EXPECT_TRUE(m->qmm_tune_count() == 1);
+  // Same geometry again: a cache hit whichever way the key is computed,
+  // so this is the weak half and it comes first.
+  ASSERT_TRUE(run_at(2, &seq_b));
+  EXPECT_TRUE(seq_b == seq_a);
+  EXPECT_TRUE(m->qmm_tune_count() == 1);
+  // A DIFFERENT sequence length, still above the ceiling. This is the
+  // claim: one measurement covers both.
+  ASSERT_TRUE(run_at(3, &seq_b));
+  if (seq_b == seq_a || seq_a <= ceil || seq_b <= ceil) {
+    std::printf("[minimax_h3_dit] layouts %d/%d do not straddle the "
+                "ceiling %d; sharing not exercised\n", seq_a, seq_b, ceil);
+    return;
+  }
+  EXPECT_TRUE(m->qmm_tune_count() == 1);
+}
+
+// Attention must compute the same thing whichever of its four
+// activations it addresses in place.
+//
+// The bar here is BIT-EXACT, not close: the three masks are the same
+// arithmetic in the same order on the same values, and all that differs
+// is which addresses those values live at. Nothing rounds differently,
+// so anything but equality is a layout error -- a wrong stride, a head
+// grouping read as the other one, rope applied to the wrong channel
+// pair, the in-place hazard not actually settled by the barrier.
+//
+// And a layout error here is SILENT. Every wrong version still produces
+// a full velocity of plausible magnitude; the rms barely moves, because
+// scrambling which head attends to what does not change how big the
+// numbers are. Only equality separates them.
+//
+// One load, three masks, because the mask is settable at runtime --
+// which also means this is the test that the setter takes effect at
+// all, and it says so rather than passing vacuously if a mask is
+// refused.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_dit, fused_attention_matches_the_transposes)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  // Four blocks, and a layout with text, condition, audio and video rows
+  // -- the refiner blocks run unmodulated over the text rows alone and
+  // take a different rope path (rot 0), so a mask that is only right for
+  // the main blocks has to be able to show it.
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Step step;
+  step.video = &vb;  step.audio = &ab;  step.text = &tb;
+  step.layout = &L;  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+
+  // Raw bf16, not floats: the claim is that the bytes are identical, and
+  // comparing them as bytes is the way to say so.
+  auto run = [&](int mask, std::vector<std::uint16_t>* v,
+                 std::vector<std::uint16_t>* a) {
+    m->set_fused_attention(mask);
+    if (m->fused_attention() != mask) { return false; }
+    std::string ferr;
+    const auto out = m->forward(step, &ferr);
+    if (out.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    auto copy = [](const SharedBuffer& b) {
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      return std::vector<std::uint16_t>(p, p + b.byte_size() / 2);
+    };
+    *v = copy(out.video);
+    *a = copy(out.audio);
+    return !v->empty();
+  };
+
+  const int kOut = MetalMiniMaxH3Transformer::kFusedAttnOut;
+  const int kQkv = MetalMiniMaxH3Transformer::kFusedAttnQkv;
+  std::vector<std::uint16_t> bv, ba;
+  const bool base = run(0, &bv, &ba);
+  ASSERT_TRUE(base);
+  if (!base) { return; }
+
+  for (int mask : {kOut, kOut | kQkv}) {
+    std::vector<std::uint16_t> v, a;
+    if (!run(mask, &v, &a)) {
+      // Refused, not wrong: a build without the steel attention or the
+      // in-place rope cannot offer this mask, and comparing the default
+      // path with itself would pass while proving nothing.
+      std::printf("[minimax_h3_dit] fuse mask %d unavailable; not "
+                  "compared\n", mask);
+      continue;
+    }
+    ASSERT_TRUE(v.size() == bv.size() && a.size() == ba.size());
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < v.size() && i < bv.size(); ++i) {
+      if (v[i] != bv[i]) { ++bad; }
+    }
+    for (std::size_t i = 0; i < a.size() && i < ba.size(); ++i) {
+      if (a[i] != ba[i]) { ++bad; }
+    }
+    if (bad != 0) {
+      std::printf("[minimax_h3_dit] fuse mask %d: %zu of %zu elements "
+                  "differ from the transposing path\n", mask, bad,
+                  v.size() + a.size());
+    }
+    EXPECT_TRUE(bad == 0);
+  }
+  // The default the model ships with, restored for anything that reuses
+  // this process.
+  m->set_fused_attention(kOut);
 }
 
 // The fused-SwiGLU FF must be the same function as the GEMM-then-split

@@ -767,6 +767,75 @@ kernel void transpose_rope_half_part_ftab_f16(
       VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
 }
 
+// The same partial rotate-half RoPE as above, IN PLACE on the fused qkv
+// projection and with NO transpose.
+//
+// The transposing version exists because the steel flash-attention
+// kernel wants [H, seq, D]. It does not have to: steel takes per-axis
+// STRIDES for Q, K, V and O, so it can read the heads straight out of
+// the [seq, 3*H*D] projection where the qkv GEMM left them. Once it
+// does, the only thing the transpose pass was still carrying is the
+// rotation -- and that is a rewrite of the same bytes, which is what
+// this kernel is.
+//
+// The saving is four full passes over a [seq, H*D] activation per block
+// (q, k, v out, o back), each of them a read plus a write of the whole
+// thing. At video sequence lengths that is gigabytes of traffic per
+// block against an arithmetic-free permutation.
+//
+// V never rotates and so needs NOTHING here: the strided read replaces
+// its transpose outright.
+//
+// IN-PLACE MEANS A HAZARD. Channel d is built from d and its partner
+// d +/- rot/2, so a thread that writes before its partner has read hands
+// the partner a rotated value. Both halves live in the SAME threadgroup
+// (the dispatch is one threadgroup per (row, head), D threads wide), so
+// one barrier between the reads and the writes settles it -- and every
+// thread must reach that barrier, including the `d >= rot` tail that has
+// nothing to do, which is why the tail is skipped with a flag rather
+// than an early return.
+//
+//   0:x 1:cos[seq,rot/2] 2:sin[seq,rot/2] 3:H 4:seq 5:D 6:rot 7:stride
+//   8:off 9:head_stride.
+//   grid {D, seq, H}, tg {D, 1, 1}.
+kernel void rope_half_part_ftab_inplace_f16(
+    device VPIPE_ELT*       x    [[buffer(0)]],
+    const device float*     cosb [[buffer(1)]],
+    const device float*     sinb [[buffer(2)]],
+    constant int&      H         [[buffer(3)]],
+    constant int&      S        [[buffer(4)]],
+    constant int&      D         [[buffer(5)]],
+    constant int&      rot       [[buffer(6)]],
+    constant int&      stride    [[buffer(7)]],
+    constant int&      off       [[buffer(8)]],
+    constant int&      head_stride [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  // Both halves of the pair are read before the barrier and the result
+  // written after it, so `live` gates the work and never the barrier.
+  const bool live = d < D && t < S && h < H && d < rot;
+  const int half_r = rot / 2;
+  const uint src = (uint)t * (uint)stride + (uint)off +
+                   (uint)h * (uint)head_stride;
+  float x1 = 0.0f, x2 = 0.0f, c = 0.0f, s = 0.0f;
+  if (live) {
+    const int i = (d < half_r) ? d : (d - half_r);
+    const uint cb = (uint)t * (uint)half_r + (uint)i;
+    c = cosb[cb];
+    s = sinb[cb];
+    x1 = float(x[src + (uint)(d < half_r ? d : d - half_r)]);
+    x2 = float(x[src + (uint)(d < half_r ? d + half_r : d)]);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  if (live) {
+    x[src + (uint)d] =
+        VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+  }
+}
+
 // Per-HEAD RMS norm in place over a strided fused projection: the row
 // (t, h) lives at `x[t*stride + off + h*D]` and is normalized over its
 // own D channels against a shared [D] gamma.

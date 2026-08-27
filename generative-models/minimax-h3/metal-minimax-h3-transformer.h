@@ -10,6 +10,7 @@
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -541,6 +542,9 @@ class MetalMiniMaxH3Transformer {
   // 2 = +BM128. Same knob, and the same reason for it, as the Wan DiT:
   // the only way to compare two tiles without the thermal spread between
   // processes is to alternate them inside one.
+  int  quant_bits() const { return _quant_bits; }
+  int  quant_group() const { return _quant_group; }
+
   void set_qmm_tile(int cap);
   int qmm_tile() const { return _qmm_tile; }
 
@@ -569,6 +573,48 @@ class MetalMiniMaxH3Transformer {
   bool ff_scratch_narrow() const { return !_ff_needs_wide; }
   // Whether the DiT's flash attention is the matrix-core (NAX) kernel.
   bool uses_nax_attention() const { return _attn_nax; }
+  // The row count a tuned GEMM answer is filed under.
+  //
+  // The tuner measures at min(M, ceiling) rows, so every geometry at or
+  // above the ceiling produces an IDENTICAL measurement -- same rows,
+  // same shapes, same candidates. Keying the cache on the caller's own
+  // row count therefore made a second video geometry pay again for an
+  // answer that could not differ, which at the production shapes was
+  // ~5 s of GPU per distinct sequence length. Below the ceiling the row
+  // count really is the caller's and the key is exact.
+  //
+  // Public because it is the property worth pinning: if the store and
+  // the lookup ever disagreed about this, every projection would fall
+  // silently back to the untuned rule and only a timing would show it.
+  int tune_row_ceiling() const { return _tune_ceiling; }
+  int tune_row_key(int M) const { return std::min(M, _tune_ceiling); }
+  // How many times the tuner has actually MEASURED, as against found its
+  // answer already cached. Test seam for the line above.
+  int qmm_tune_count() const { return _qmm_tune_count; }
+  // Which candidate indices survive the GEMM tuner's warm pass, given
+  // each one's warm time and how far behind the leader an arm may be and
+  // still be timed properly.
+  //
+  // Pure, and public, because it is a RULE rather than a measurement and
+  // the rule is what can silently go wrong: the two fastest must always
+  // survive, the leader must never be dropped, and a warm pass that
+  // failed to time must prune nothing. None of those is visible in a
+  // timing. See the note in tune_qmm_ for why the threshold is loose.
+  static std::vector<int> tune_prune_survivors(
+      const std::vector<double>& warm, double keep);
+  // Which of attention's four transposes are gone. The two halves are
+  // INDEPENDENT and, measured, they are not the same trade -- see the
+  // note on _fused_attn -- so they are separate bits rather than one
+  // switch.
+  //
+  // A path-SELECTION accessor: every combination is numerically
+  // identical, so only a timing can tell them apart. The setter is for
+  // the in-process A/B; bits the build cannot honour are refused, and
+  // fused_attention() then reports what actually runs.
+  static constexpr int kFusedAttnOut = 1;   // store O row-major
+  static constexpr int kFusedAttnQkv = 2;   // read q/k/v in place
+  int fused_attention() const { return _fused_attn; }
+  void set_fused_attention(int mask);
 
   // What the route autotune MEASURED for the sequence length last run,
   // e.g. "9382: qkv=mma128x256 o=bm64 fc1=mma128x256tn2 fc2=bm32". Empty
@@ -767,7 +813,22 @@ class MetalMiniMaxH3Transformer {
   struct Scratch {
     int seq = -1, n_text = -1, n_t = -1;
     metal_compute::SharedBuffer rcos, rsin;
-    metal_compute::SharedBuffer x, nm, qkv, qh, kh, vh, oh, ob, ff, proj;
+    metal_compute::SharedBuffer x, nm, qkv;
+    // ONE allocation backing qh|kh|vh|oh|ob, with `ff` aliased over the
+    // whole of it. The five attention buffers are dead by the time the
+    // FF runs -- attention has finished and `ob` has been folded into
+    // `nm` -- so the widest of the two uses is what has to be held, not
+    // their sum. At video sequence lengths that is the difference
+    // between 7.9 GB of scratch and 5.7 GB.
+    //
+    // `ff` cannot alias `qkv` instead, which is the obvious-looking
+    // choice: the UNFUSED SwiGLU reads s.ff and writes s.qkv, so those
+    // two are live at the same instant. (The fused path writes straight
+    // into s.qkv and never touches s.ff at all -- that reuse is already
+    // here, and it is why streaming, which forces the unfused path, is
+    // what makes this scratch its widest.)
+    metal_compute::SharedBuffer attn;
+    metal_compute::SharedBuffer qh, kh, vh, oh, ob, ff, proj;  // in `attn`
     metal_compute::SharedBuffer txt, temb, mod, fmod;
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
@@ -796,6 +857,7 @@ class MetalMiniMaxH3Transformer {
   std::vector<QmmTuneSet> _qmm_tuned;
   std::string _qmm_tuning_desc;   // human-readable, for qmm_tuning()
   bool _qmm_manual = false;       // set_qmm_tile/route called: tuning off
+  int  _qmm_tune_count = 0;       // measurements taken, not cache hits
   GemmRoute _forced_route = GemmRoute::kAuto;
   void tune_qmm_(int M);
   // The route for one projection: the forced one, else the tuned one,
@@ -1042,14 +1104,64 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_rms_heads, _fn_trope,
       _fn_modulate, _fn_gated, _fn_swiglu, _fn_transpose, _fn_residual,
       _fn_bias_add, _fn_sdpa;
+  // Rope written back over the fused projection, for the path that never
+  // transposes. See _fused_attn.
+  metal_compute::ComputeFunction _fn_rope_ip;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
+  // Rows the GEMM tuner measures at, and therefore the row count a tuned
+  // answer is filed under -- see tune_row_key(). Fixed at load from
+  // VPIPE_H3_TUNE_ROWS.
+  int _tune_ceiling = 4096;
   int _attn_seq = -1, _attn_text = -1;
+  // Which layout the cached AttnParams describe. Tracked apart from the
+  // sequence lengths so set_fused_attention() re-fills the params
+  // without rebuilding the pipeline states.
+  int _attn_fused = -1;
   bool _steel_ok = false;
   // The matrix-core (NAX) flash attention. Same param block and function
   // constants as the ALU steel kernel; only the tile sizes differ, so the
   // two are interchangeable at the call site.
   bool _attn_nax = false;
+  // Which of the four per-block [seq, inner] transposes attention no
+  // longer needs. Steel takes per-axis STRIDES for Q, K, V and O, so the
+  // head-major layout was never a requirement of the kernel -- only of
+  // the buffers we happened to hand it.
+  //
+  // The two bits are NOT the same trade, which is the whole reason they
+  // are separate. MEASURED on the M5 at 9382 rows, 2 blocks, the three
+  // masks interleaved inside one process:
+  //
+  //   kFusedAttnOut  the transpose after attention becomes a strided
+  //                  STORE. Free -- attention 482 ms either way -- and
+  //                  it is one fewer dispatch. Shipped.
+  //   kFusedAttnQkv  q/k/v become strided READS, and rope moves in
+  //                  place. Prep 26.7 -> 21.2 ms, and attention
+  //                  482 -> 505.8 ms: +23.8 to save 5.5, in every one of
+  //                  three measurements with no overlap between the arms.
+  //                  A net ~1% loss. NOT shipped.
+  //
+  // The asymmetry is K and V REUSE. Q is read once and O written once,
+  // so a stride costs them nothing; K and V are re-read by every query
+  // block. Head-major, one head's K is a contiguous 2.4 MB that stays
+  // cached across the whole Q loop. In the fused projection the same
+  // 2.4 MB is scattered one head_dim slice per 43 KB row, so each pass
+  // walks 400 MB of address space to touch it. That is a property of
+  // the layout, not of this GPU, and it is why the Qkv bit is kept as
+  // an A/B arm rather than as a tuning knob anyone should expect to
+  // flip.
+  //
+  // Worth knowing before attacking any of this again: at these shapes
+  // the four transposes are ~1.1 GB of traffic against ~9.7 TFLOP of
+  // arithmetic per block, and the DiT runs at ~10.6 TFLOP/s. The whole
+  // prize was under half a percent of the step. It was measured, not
+  // assumed, and the answer is that the transposes were never where the
+  // time is.
+  //
+  // Steel only: the scalar sdpa fallback has no strides. The head-major
+  // windows therefore stay allocated for it, so this saves traffic, not
+  // bytes. VPIPE_H3_FUSED_ATTN=<mask> overrides the default.
+  int _fused_attn = 0;
 };
 
 }  // namespace genai

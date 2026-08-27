@@ -474,6 +474,31 @@ same invocation just registered.
 **Pin `files`.** Most modern video repos publish several precisions in one
 repo; fetching the whole thing pulls packings this build cannot read.
 
+**Mirrors.** `hf_path` is a HuggingFace coordinate, and it stays the entry's
+identity — the registry key and the on-disk directory come from it whichever
+server actually served the download. `model-fetch` can pull from a mirror
+instead (`source=modelscope`, or `$VPIPE_MODEL_SOURCE`), and by default it
+looks for the repo there under the **same** `owner/repo`, which is how most of
+them are published. Nothing is needed from a plugin for that to work.
+
+Say something only when the mirror DIFFERS — a different owner, or no copy at
+all:
+
+```cpp
+#include "stages/model-source.h"
+
+vpipe::register_mirror_repos({
+    {.source = "modelscope", .hf_path = "acme/video-7b",
+     .path = "AcmeCN/video-7b"},        // mirrored under another name
+    {.source = "modelscope", .hf_path = "acme/lora-pack",
+     .path = ""},                       // not mirrored: refuse by name
+});
+```
+
+First-wins, built-ins included, so a plugin cannot redirect a repo the tree
+already places. A row whose `path` is empty makes the fetch say the repo has no
+counterpart on that source, instead of relaying a bare 404.
+
 ## Extension point 6 — CoreML
 
 There is no separate CoreML plugin type: a CoreML consumer is just a
