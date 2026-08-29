@@ -123,6 +123,23 @@ public:
   const std::string& calib_dir() const noexcept { return _calib_dir; }
   int n_layers() const noexcept { return _n_layers; }
 
+  // Test seam: which DiT directory a `src_model` path resolves to, and
+  // which family it belongs to ("" for neither).
+  //
+  // Exposed because this is the THIRD resolver of that question -- the
+  // DiT loader and the text encoder each have their own -- and it is the
+  // one no test could reach. Both times it has drifted behind the other
+  // two, the symptom was the same: the stage decided the source was not
+  // a diffusion pipeline and fell through to the LANGUAGE-model
+  // quantizer, which then reported an unknown architecture. That reads
+  // as "unsupported family" and is really "resolver missed a rung".
+  //
+  // `partition` is MiniMax-H3's fl2va / ref2va, which the caller takes
+  // from the models-DB record rather than from the directory.
+  static std::string resolve_source_dit_dir(const std::string& src_dir,
+                                            std::string* family,
+                                            const std::string& partition = {});
+
   // Test seam: run the quantization once. Returns true on success (or when
   // skipped because the output already exists). Logs + returns false on
   // error.

@@ -6,6 +6,7 @@
 #include <Metal/Metal.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <utility>
 
 namespace vpipe::metal_compute {
@@ -108,13 +109,65 @@ CommandStream::begin_compute(DispatchType dispatch_type)
   return e;
 }
 
+namespace {
+// See CommandStream::fire_and_forget_stats.
+std::atomic<unsigned long long> g_ff_completed{0};
+std::atomic<unsigned long long> g_ff_errored{0};
+}  // namespace
+
+void
+CommandStream::fire_and_forget_stats(unsigned long long* completed,
+                                     unsigned long long* errored)
+{
+  if (completed != nullptr) {
+    *completed = g_ff_completed.load(std::memory_order_relaxed);
+  }
+  if (errored != nullptr) {
+    *errored = g_ff_errored.load(std::memory_order_relaxed);
+  }
+}
+
 void
 CommandStream::split_encoder_(ComputeEncoder& enc)
 {
   const DispatchType dt = enc._dt;
   enc.end();                       // endEncoding + release enc._enc
   if (_cb != nullptr) {
-    _cb->commit();                 // fire-and-forget; final commit() waits
+    // NOBODY WAITS ON THIS BUFFER, so nothing else is in a position to
+    // notice it fail. Latch the failure from a completion handler and
+    // let the Fence the caller does wait on report it -- otherwise an
+    // intermediate out-of-memory skips its dispatches and the stream
+    // still reports success, which is a silently wrong result rather
+    // than a failed one.
+    if (!_fail) { _fail = std::make_shared<Failure>(); }
+    auto f = _fail;
+    MTL::HandlerFunction note = [f](MTL::CommandBuffer* cb) {
+      // Counted FIRST and unconditionally: this is what proves the
+      // handler runs at all, which is what makes a zero error count mean
+      // "nothing failed" rather than "nothing was watching".
+      g_ff_completed.fetch_add(1, std::memory_order_relaxed);
+      if (cb == nullptr ||
+          cb->status() != MTL::CommandBufferStatusError) {
+        return;
+      }
+      g_ff_errored.fetch_add(1, std::memory_order_relaxed);
+      // FIRST failure wins: it is the one that explains the rest, and a
+      // later buffer failing because an earlier one did would otherwise
+      // overwrite the cause with a symptom.
+      bool expected = false;
+      if (!f->failed.compare_exchange_strong(expected, true)) { return; }
+      std::string why = "GPU command buffer error";
+      if (NS::Error* e = cb->error()) {
+        if (NS::String* d = e->localizedDescription()) {
+          const char* c = d->utf8String();
+          if (c != nullptr) { why = c; }
+        }
+      }
+      std::lock_guard<std::mutex> lk(f->mu);
+      f->reason = "an earlier command buffer in this stream failed: " + why;
+    };
+    _cb->addCompletedHandler(note);
+    _cb->commit();                 // fire-and-forget; the latch reports
     _cb->release();
     _cb = nullptr;
   }
@@ -177,10 +230,12 @@ CommandStream::commit()
   }
   _cb->commit();
   // Transfer the refcount to the Fence and clear our slot so the
-  // next ensure_cb_() opens a fresh buffer.
+  // next ensure_cb_() opens a fresh buffer. The latch goes with it: this
+  // Fence is what the caller waits on, so it is where a failure in any
+  // buffer this stream already let go has to surface.
   MTL::CommandBuffer* cb = _cb;
   _cb = nullptr;
-  return Fence{cb};
+  return Fence{cb, _fail};
 }
 
 // ---- CommandStream::Fence ---------------------------------------
@@ -190,8 +245,14 @@ CommandStream::Fence::Fence(MTL::CommandBuffer* cb) noexcept
 {
 }
 
+CommandStream::Fence::Fence(MTL::CommandBuffer* cb,
+                            std::shared_ptr<Failure> f) noexcept
+  : _earlier(std::move(f)), _cb(cb)
+{
+}
+
 CommandStream::Fence::Fence(Fence&& o) noexcept
-  : _cb(std::exchange(o._cb, nullptr))
+  : _earlier(std::move(o._earlier)), _cb(std::exchange(o._cb, nullptr))
 {
 }
 
@@ -204,6 +265,7 @@ CommandStream::Fence::operator=(Fence&& o) noexcept
   if (_cb != nullptr) {
     _cb->release();
   }
+  _earlier = std::move(o._earlier);
   _cb = std::exchange(o._cb, nullptr);
   return *this;
 }
@@ -297,13 +359,23 @@ CommandStream::Fence::wait_ok(std::string* reason)
     return true;                 // nothing ran, nothing failed
   }
   _cb->waitUntilCompleted();
-  if (_cb->status() != MTL::CommandBufferStatusError) {
-    return true;
+  // This buffer's own status FIRST: when both failed, the one the caller
+  // was waiting on is the more specific answer.
+  if (_cb->status() == MTL::CommandBufferStatusError) {
+    if (reason != nullptr) { *reason = error_message(); }
+    return false;
   }
-  if (reason != nullptr) {
-    *reason = error_message();
+  // Then any buffer this stream committed and let go before it. Ordering
+  // is safe: a stream's buffers complete in submission order, so by the
+  // time this one has completed every earlier one has run its handler.
+  if (_earlier && _earlier->failed.load()) {
+    if (reason != nullptr) {
+      std::lock_guard<std::mutex> lk(_earlier->mu);
+      *reason = _earlier->reason;
+    }
+    return false;
   }
-  return false;
+  return true;
 }
 
 CommandStream::Fence::GpuTimes

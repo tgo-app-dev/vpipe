@@ -77,6 +77,32 @@ class WeightSet;   // generative-models/weight-set.h
 // That is not done yet (see the note on _mod in the .cc).
 class MetalMiniMaxH3Transformer {
  public:
+  // Rows one matmul2d dispatch may touch, over an N-wide destination
+  // contracting a K-wide source.
+  //
+  // The mma tiles address through `dextents<int32_t, 2>`, so the tile
+  // whose base crosses 2^31 BYTES stops storing -- silently, leaving
+  // whatever was in the buffer. MEASURED at H3's fc1 shape
+  // ([38222, 28672] bf16 = 2.19 GB, the 1344x768 x 124-frame sequence):
+  // rows 37504..38221 came back exactly as they went in. Banding M
+  // rebases each dispatch, which keeps every offset the kernel computes
+  // small; below the line the band is the whole thing and nothing about
+  // the encoding changes. VPIPE_H3_MMA_ROW_BAND forces a band, which is
+  // how a small shape can be tested against its own unbanded self.
+  //
+  // BOTH extents, because the limit is a property of every operand and
+  // not of the destination. Banding on N alone protects the widest
+  // tensor a projection WRITES and leaves the one it READS unguarded --
+  // which is invisible on three of H3's four projections and reachable
+  // on the fourth: fc2 has the block's smallest N (5376, so its band is
+  // 199680 and never bites) and its largest K (14336, so at 75136 rows
+  // its source is 2.15 GB). MEASURED, minimax_h3_blocks.
+  // tail_rows_match_a_small_reference at [76800, 14336] bf16: mma128
+  // and mma128x256tn2 return 9633792 wrong elements, every row from
+  // 75008 = ceil128(2^31 / 28672) to the end, against a small-buffer
+  // reference. steel, the int8 arm and split-K are clean.
+  static int mma_row_band(int N, int K);
+
   struct Config {
     int hidden        = 5376;
     int n_heads       = 56;
@@ -573,6 +599,20 @@ class MetalMiniMaxH3Transformer {
   bool ff_scratch_narrow() const { return !_ff_needs_wide; }
   // Whether the DiT's flash attention is the matrix-core (NAX) kernel.
   bool uses_nax_attention() const { return _attn_nax; }
+  // What the streamed-weight prefetch did on the last forward: reads
+  // ISSUED and reads a block actually CONSUMED. A gap between them is
+  // work paid for and discarded -- and on the fallback destination it
+  // also leaves a block's worth of buffers live for the rest of the
+  // pass, which is the opposite of what a memory-tight run wants. Zero
+  // when nothing streamed.
+  int prefetch_started() const { return _pf_started; }
+  int prefetch_hits() const { return _pf_hit; }
+  // Whether the last streamed forward ran with TWO reusable block slots.
+  // False means single-slot (the budget refused the second, or
+  // VPIPE_H3_SINGLE_SLOT asked for it) and is a distinct third path from
+  // slots-off.
+  bool slot_pair() const { return _slot_pair; }
+
   // The row count a tuned GEMM answer is filed under.
   //
   // The tuner measures at min(M, ceiling) rows, so every geometry at or
@@ -877,7 +917,7 @@ class MetalMiniMaxH3Transformer {
                             std::size_t y_off, int M, int N, int K,
                             GemmRoute route, const LoraFactors* lora,
                             bool* lora_folded, std::size_t lora_off = 0);
-  // `route`, over rows banded by mma_row_band_ -- the base projection
+  // `route`, over rows banded by mma_row_band -- the base projection
   // only, which is what the autotune measures.
   void dispatch_row_bands_(metal_compute::ComputeEncoder& enc,
                            const metal_compute::SharedBuffer& x,
@@ -885,18 +925,6 @@ class MetalMiniMaxH3Transformer {
                            const metal_compute::SharedBuffer& y,
                            std::size_t y_off, int M, int N, int K,
                            GemmRoute route);
-  // Rows one matmul2d dispatch may write into an N-wide destination.
-  //
-  // The mma tiles address through `dextents<int32_t, 2>`, so the tile
-  // whose base crosses 2^31 BYTES stops storing -- silently, leaving
-  // whatever was in the buffer. MEASURED at H3's fc1 shape
-  // ([38222, 28672] bf16 = 2.19 GB, the 1344x768 x 124-frame sequence):
-  // rows 37504..38221 came back exactly as they went in. Banding M
-  // rebases each dispatch, which keeps every offset the kernel computes
-  // small; below the line the band is the whole thing and nothing about
-  // the encoding changes. VPIPE_H3_MMA_ROW_BAND forces a band, which is
-  // how a small shape can be tested against its own unbanded self.
-  int mma_row_band_(int N) const;
   void qmm_dispatch_(metal_compute::ComputeEncoder& enc,
                      const metal_compute::SharedBuffer& x, std::size_t x_off,
                      const Linear& l, const metal_compute::SharedBuffer& y,
@@ -1107,12 +1135,18 @@ class MetalMiniMaxH3Transformer {
   // Rope written back over the fused projection, for the path that never
   // transposes. See _fused_attn.
   metal_compute::ComputeFunction _fn_rope_ip;
+  // The non-finite tripwire and its 8-word report. Runs in the stream, so
+  // finding the op that mints a NaN costs a pass over the tensor rather
+  // than a GPU drain -- and draining is what made this bug vanish.
+  metal_compute::ComputeFunction _fn_nan_trip;
+  metal_compute::SharedBuffer    _nan_report;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
   // Rows the GEMM tuner measures at, and therefore the row count a tuned
   // answer is filed under -- see tune_row_key(). Fixed at load from
   // VPIPE_H3_TUNE_ROWS.
   int _tune_ceiling = 4096;
+  int _pf_started = 0, _pf_hit = 0;
   int _attn_seq = -1, _attn_text = -1;
   // Which layout the cached AttnParams describe. Tracked apart from the
   // sequence lengths so set_fused_attention() re-fills the params

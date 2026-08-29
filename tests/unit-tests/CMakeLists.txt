@@ -207,6 +207,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         temporal-decimation-stage.cc
         image-resample-stage.cc
         temporal-slice-stage.cc
+        vae-encode-range.cc
         temporal-stack-stage.cc
         text-chat-stage.cc
         text-to-speech-stage.cc

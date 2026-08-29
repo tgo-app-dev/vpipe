@@ -76,6 +76,16 @@ workload and settings for both runtimes:
 | --- | ---: | ---: |
 | M4 Pro Mac mini, 64 GB RAM | **21 min 44 sec** | 27 min 40 sec |
 | Base M5 MacBook Air 15", 16 GB RAM | **11 min 25 sec** | 16 min 22 sec |
+| M5 Pro MacBook Pro 16", 24 GB RAM | **5 min 0 sec** | 7 min 19 sec |
+
+**Cooling is part of what these rows measure.** The fanless MacBook Air was
+run on an ice pack: it holds its full 1578 MHz for about two minutes, then
+throttles to around 1300 MHz for the rest — and because the pack is placed
+by hand, that row is one sample rather than a repeatable figure. The
+MacBook Pro 16" holds 1620 MHz, its maximum, at 100% for the whole run, and
+does repeat. See
+[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md#how-long-it-takes) for what that is
+worth in wall clock.
 
 These numbers are workload-specific measurements, not a universal runtime
 speed claim. [^3]

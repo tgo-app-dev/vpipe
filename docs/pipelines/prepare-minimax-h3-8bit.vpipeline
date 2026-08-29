@@ -7,6 +7,7 @@
       "config": {
         "model_path": "Comfy-Org/MiniMax-H3",
         "model_variant": "fl2va",
+        "model_key": "Comfy-Org/MiniMax-H3-FL2VA",
         "hf_token": "",
         "base_path": "./models",
         "skip_existing_files": true,
@@ -23,7 +24,7 @@
         }
       ],
       "config": {
-        "src_model": "Comfy-Org/MiniMax-H3",
+        "src_model": "Comfy-Org/MiniMax-H3-FL2VA",
         "output_name": "local/MiniMax-H3-FL2VA-8bit-dit",
         "target": "dit",
         "bits": 8,

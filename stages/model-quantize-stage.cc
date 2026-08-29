@@ -253,6 +253,36 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family,
       }
     }
   }
+  // Last: ask the MiniMax-H3 loader, which knows a shape this ladder does
+  // not. MiniMaxAI publishes BOTH partitions from one repo, so the fetch
+  // lands them one level down -- <root>/FL2VA/transformer and
+  // <root>/Ref2VA/transformer -- and the root itself carries none of the
+  // files probed above. Pointed at such a root, every rung misses, and
+  // what the caller gets is not "unsupported" but a fall-through to the
+  // LANGUAGE-model quantizer: `arch='unknown' n_layers=0` followed by "no
+  // submodule matching target 'dit'".
+  //
+  // DELEGATED rather than spelled out a fifth time. This is the third
+  // resolver of this question in the tree and the second time one of them
+  // has drifted behind the others (see the note on
+  // minimax_h3_comfy.a_quantized_repack_resolves_like_a_repack, which
+  // called this one out as unreachable and therefore untested). Asking the
+  // loader means the next shape it learns arrives here for free.
+  //
+  // LAST, and confirmed with family_of, because resolve_dit_dir answers
+  // with the path it was handed when nothing matches -- it is a resolver,
+  // not a detector. Only a result that DIFFERS from src_dir and names an
+  // H3 DiT is taken, so no other family's routing moves and the rungs
+  // above keep their order.
+  {
+    const std::string d =
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(src_dir, partition);
+    if (!d.empty() && d != src_dir &&
+        family_of(fs::path(d) / "config.json") == "minimax-h3") {
+      if (family != nullptr) { *family = "minimax-h3"; }
+      return d;
+    }
+  }
   return {};
 }
 
@@ -919,8 +949,30 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // when the actual cause is almost always that the component is not on disk
   // yet, an interrupted or still-running download. Say which it is, here.
   {
-    const bool has_index = fs::exists(fs::path(src_dir) / "model_index.json");
-    const fs::path tdir = fs::path(src_dir) / "transformer";
+    // WHERE to look. Normally src_dir -- but MiniMaxAI publishes both
+    // MiniMax-H3 partitions one level down, so a root holding FL2VA/ or
+    // Ref2VA/ has to be diagnosed THERE. Probing only the root misses by
+    // one directory, this guard does not fire, and the stage reports a
+    // video pipeline as a language model of unknown architecture: the
+    // most misleading thing it can say, and the reason this block exists.
+    //
+    // Reached only when the resolver above declined, so for H3 that means
+    // a component is genuinely absent -- an interrupted or still-running
+    // download -- which is exactly what it is here to name.
+    fs::path root(src_dir);
+    if (!fs::exists(root / "model_index.json") &&
+        !fs::is_directory(root / "transformer", ec)) {
+      for (const char* part : {"FL2VA", "Ref2VA"}) {
+        const fs::path sub = root / part;
+        if (fs::exists(sub / "model_index.json") ||
+            fs::is_directory(sub / "transformer", ec)) {
+          root = sub;
+          break;
+        }
+      }
+    }
+    const bool has_index = fs::exists(root / "model_index.json");
+    const fs::path tdir = root / "transformer";
     if (has_index || fs::is_directory(tdir, ec)) {
       std::string why;
       if (!fs::is_directory(tdir, ec)) {
@@ -949,7 +1001,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
           "but {}. If the model is still downloading, wait for it to finish; "
           "otherwise this build does not support that DiT. (Not falling back "
           "to the language-model quantizer -- there is no LM at this path.)",
-          this->id(), src_dir, why));
+          this->id(), root.string(), why));
       return false;
     }
   }
@@ -1762,6 +1814,17 @@ ModelQuantizeStage::comfy_target_subdir_(const std::string& target)
   if (sub == "text_encoder" || sub == "mllm") { return "text_encoders"; }
   if (sub == "vae") { return "vae"; }
   return {};
+}
+
+std::string
+ModelQuantizeStage::resolve_source_dit_dir(const std::string& src_dir,
+                                           std::string* family,
+                                           const std::string& partition)
+{
+  std::string fam;
+  const std::string d = resolve_t2i_dit_dir_(src_dir, &fam, partition);
+  if (family != nullptr) { *family = d.empty() ? std::string() : fam; }
+  return d;
 }
 
 bool

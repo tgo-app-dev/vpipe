@@ -22,6 +22,9 @@
 
 #include "minitest.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
+#include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
@@ -335,4 +338,177 @@ TEST(wan_vae, single_frame_matches_image_vae)
   // Both run f16 over the same weights but reduce in a different order
   // (27-tap GEMM vs 9-tap), so this is an agreement bound, not equality.
   EXPECT_TRUE(r < 0.02);
+}
+
+// THE 2 GB OPERAND LINE, at the shapes this decoder actually dispatches.
+//
+// matmul2d addresses through `dextents<int32_t, 2>`, so a tile whose base
+// passes 2^31 BYTES stops storing. gemm_bias_ splits tall GEMMs by
+// _mma_max_m, which is a ROW cap: it bounds the DESTINATION (cout <= 384,
+// so 262144 rows is 200 MB) and says nothing about the source the GEMM
+// contracts.
+//
+// The source is the im2col band, and this VAE is the one in the tree that
+// can make it large, because its causal conv3d has 27 taps rather than 9:
+// K = 27 * cin reaches 10368 where a 2D VAE's 9 * cin reaches 4608 at a
+// level whose spatial extent is 4x smaller. col_cap bounds M * K, and
+// col_cap is capped at (_mma_max_m / 2) * widest with widest = 27 * base *
+// dim_mult[1] = 5184 -- so the band alone permits 2.7 GB.
+//
+// PREDICTED reachable at the decoder's own level geometry (base 96,
+// dim_mult {1,2,4,4}, 8x spatial):
+//
+//   output      level   rows/frame        K    M used    source span
+//   1280x720    192 ch     230,400    5,184   230,400   2,388,787,200  OVER
+//   1920x1080   384 ch     129,600   10,368   129,600   2,687,385,600  OVER
+//   1920x1080   192 ch     518,400    5,184   262,144   2,717,908,992  OVER
+//   832x480      96 ch     399,360    2,592   262,144   1,358,954,496  ok
+//
+// Row r's output cannot depend on how many rows precede it, so run each
+// shape at its full height and again over its LAST kRef rows in their own
+// small buffers, where no offset is large, and compare bit-exact. The tail
+// is the only window that can see this: an overflowing offset leaves the
+// head untouched.
+TEST(wan_vae, mma_tail_at_the_decoder_shapes)
+{
+  if (std::getenv("VPIPE_WAN_MMA_PROBE") == nullptr) { return; }
+  Session s;
+  MetalCompute* mc = s.metal_compute();
+  if (mc == nullptr || !mc->valid() || !mc->supports_matrix_cores()) {
+    std::printf("[wan_vae] no matrix cores; mma tail probe skipped\n");
+    return;
+  }
+  metal_compute::ComputeLibrary lib = mc->load_library("dense_gemm_mma");
+  metal_compute::ComputeFunction n128 =
+      lib.function("dense_gemm_mma_t_n128_f16");
+  metal_compute::ComputeFunction n256 =
+      lib.function("dense_gemm_mma_t_n128x256_f16");
+  if (!n128.valid() || !n256.valid()) {
+    std::printf("[wan_vae] mma tiles not built; skipped\n");
+    return;
+  }
+
+  constexpr int kRef = 1024;
+  struct Shape { const char* tag; int M, N, K; };
+  const Shape shapes[] = {
+      {"720p  192ch", 230400, 192,  5184},
+      {"1080p 384ch", 129600, 384, 10368},
+      {"1080p 192ch", 262144, 192,  5184},
+      {"480p   96ch", 262144,  96,  2592},
+  };
+  // Sparse rows so every product is a small integer and f16 holds it
+  // exactly; 1296 divides all three K here.
+  auto xv = [](int m, int k) { return ((k % 1296) == (m % 1296)) ? 1.0f
+                                                                 : 0.0f; };
+  auto wv = [](int n, int k) { return (float)(((n * 7 + k) % 3) - 1); };
+
+  int checked = 0;
+  bool clean = true;
+  for (const Shape& sh : shapes) {
+    SharedBuffer x  = mc->make_shared_buffer((std::size_t)sh.M * sh.K * 2);
+    SharedBuffer y  = mc->make_shared_buffer((std::size_t)sh.M * sh.N * 2);
+    SharedBuffer w  = mc->make_shared_buffer((std::size_t)sh.N * sh.K * 2);
+    SharedBuffer xs = mc->make_shared_buffer((std::size_t)kRef * sh.K * 2);
+    SharedBuffer ys = mc->make_shared_buffer((std::size_t)kRef * sh.N * 2);
+    if (x.empty() || y.empty() || w.empty() || xs.empty() || ys.empty()) {
+      std::printf("[wan_vae] %s: needs %.2f GB, allocation failed\n", sh.tag,
+                  (double)((std::size_t)sh.M * sh.K * 2) / 1073741824.0);
+      continue;
+    }
+    {
+      auto* p = static_cast<__fp16*>(x.contents());
+      for (std::size_t m = 0; m < (std::size_t)sh.M; ++m) {
+        __fp16* row = p + m * (std::size_t)sh.K;
+        for (int k = 0; k < sh.K; ++k) { row[k] = (__fp16)xv((int)m, k); }
+      }
+      auto* ps = static_cast<__fp16*>(xs.contents());
+      for (int j = 0; j < kRef; ++j) {
+        __fp16* row = ps + (std::size_t)j * sh.K;
+        const int m = sh.M - kRef + j;
+        for (int k = 0; k < sh.K; ++k) { row[k] = (__fp16)xv(m, k); }
+      }
+      auto* pw = static_cast<__fp16*>(w.contents());
+      for (int n = 0; n < sh.N; ++n) {
+        for (int k = 0; k < sh.K; ++k) {
+          pw[(std::size_t)n * sh.K + k] = (__fp16)wv(n, k);
+        }
+      }
+    }
+    // gemm_bias_'s mma arm, verbatim, over `chunk` rows at a time.
+    auto run = [&](const SharedBuffer& xb, const SharedBuffer& yb, int rows,
+                   int chunk) {
+      const bool deep = (sh.K >= 6144);
+      const int BN = deep ? 256 : 128;
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder e = st.begin_compute();
+        for (int r0 = 0; r0 < rows; r0 += chunk) {
+          const int m = (rows - r0 < chunk) ? (rows - r0) : chunk;
+          e.set_function(deep ? n256 : n128);
+          e.set_buffer(0, xb, (std::size_t)r0 * sh.K * 2);
+          e.set_buffer(1, w);
+          e.set_buffer(2, w);
+          e.set_buffer(3, yb, (std::size_t)r0 * sh.N * 2);
+          e.set_constant(4, sh.K);
+          e.set_constant(5, sh.N);
+          e.set_constant(6, m);
+          e.set_constant(7, 0);
+          e.dispatch({(unsigned)(((sh.N + BN - 1) / BN) * 256),
+                      (unsigned)((m + 127) / 128), 1}, {256, 1, 1});
+        }
+      }
+      // wait_ok, not wait: a command buffer that failed leaves the
+      // destination untouched, which reads as a storage fault in a kernel
+      // that never ran.
+      std::string err;
+      if (!st.commit().wait_ok(&err)) {
+        std::printf("[wan_vae] %s: DISPATCH FAILED (%s)\n", sh.tag,
+                    err.empty() ? "GPU error" : err.c_str());
+        return false;
+      }
+      return true;
+    };
+    std::memset(ys.contents(), 0, (std::size_t)kRef * sh.N * 2);
+    if (!run(xs, ys, kRef, kRef)) { continue; }
+    const auto* sml = static_cast<const __fp16*>(ys.contents());
+    auto tail_bad = [&](int chunk, long long* first) {
+      std::memset(y.contents(), 0, (std::size_t)sh.M * sh.N * 2);
+      if (!run(x, y, sh.M, chunk)) { return (std::size_t)0; }
+      const auto* big = static_cast<const __fp16*>(y.contents()) +
+                        (std::size_t)(sh.M - kRef) * sh.N;
+      std::size_t bad = 0;
+      *first = -1;
+      for (std::size_t i = 0; i < (std::size_t)kRef * sh.N; ++i) {
+        if ((float)big[i] != (float)sml[i]) {
+          ++bad;
+          if (*first < 0) {
+            *first = (long long)(sh.M - kRef + (int)(i / sh.N));
+          }
+        }
+      }
+      return bad;
+    };
+    // DIAGNOSTIC, never asserted: the row cap alone, which is what the
+    // decoder encoded before the span entered the split. Printed so the
+    // cliff stays visible; a machine where Apple moved or fixed it is not
+    // a regression, but the assertion below still is.
+    long long raw_row = -1, got_row = -1;
+    const int row_only = (sh.M > (1 << 19)) ? (1 << 19) : sh.M;
+    const std::size_t raw = tail_bad(row_only, &raw_row);
+    // THE PROPERTY THE DECODER RESTS ON, at the shipped chunk.
+    const int chunk = MetalWanVae::mma_row_chunk(sh.M, sh.N, sh.K);
+    const std::size_t got = tail_bad(chunk, &got_row);
+    std::printf("[wan_vae] %-12s M=%7d N=%4d K=%6d  src %5.2f GB  chunk "
+                "%7d  rows-only %8zu (row %lld)  shipped %8zu (row %lld)\n",
+                sh.tag, sh.M, sh.N, sh.K,
+                (double)((std::size_t)sh.M * sh.K * 2) / 1073741824.0, chunk,
+                raw, raw_row, got, got_row);
+    if (got != 0) { clean = false; }
+    EXPECT_TRUE(got == 0);
+    ++checked;
+  }
+  std::printf("[wan_vae] mma tail: %d checks, %s\n", checked,
+              clean ? "every shape matches its small reference"
+                    : "SOME SHAPE DOES NOT");
+  EXPECT_TRUE(checked > 0);
 }

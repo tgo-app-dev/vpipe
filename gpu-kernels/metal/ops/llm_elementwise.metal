@@ -478,6 +478,60 @@ kernel void scale_inplace_f16(
 }
 
 // out[i] = a[i] + b[i].   0:a 1:b 2:out 3:n
+// NON-FINITE TRIPWIRE: scan a tensor on the GPU and record the FIRST
+// offender, without draining anything.
+//
+// Reading a buffer back on the CPU to look for a NaN costs a full GPU
+// drain per check, which changes the timing of the very thing being
+// measured -- on MiniMax-H3 at video geometry, draining between ops made
+// a reproducible corruption disappear. This runs in the stream like any
+// other dispatch and writes a fixed 8-word report, so the check is one
+// extra pass over the tensor and the report is read ONCE per forward.
+//
+// `tag` identifies the call site (block * 16 + op). The first thread to
+// find a non-finite element claims the report with a compare-exchange
+// and writes what it saw; every other one only bumps the count. So the
+// report names the earliest DETECTED offender rather than a race between
+// reporters, and the count says whether it was one element or a region.
+//
+// report[0] claimed flag   report[1] tag        report[2] flat index
+// report[3] raw bits       report[4] total non-finite found
+//   0:x 1:report(atomic_uint[8]) 2:n 3:tag.  grid (n).
+kernel void nan_tripwire_f16(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device atomic_uint*     report [[buffer(1)]],
+    constant uint&          n      [[buffer(2)]],
+    constant uint&          tag    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= n) { return; }
+  const float v = (float)x[gid];
+  if (isfinite(v)) { return; }
+  atomic_fetch_add_explicit(&report[4], 1u, memory_order_relaxed);
+  // PER-CALL-SITE count as well as the running total. Whether a tensor
+  // holds five bad elements or four hundred million is the difference
+  // between a localised fault and a wholesale one, and a single shared
+  // counter cannot tell them apart -- it reported 2.8e9 for a tensor of
+  // 4.0e8, which is only a total over every check in the pass.
+  //
+  // Slot 16 + tag, so a 50-block stack at 16 ops fits in the 1024-word
+  // report. Tags past that are dropped rather than aliased onto another
+  // site's count: a wrong attribution is worse than a missing one.
+  if (tag < 1008u) {
+    atomic_fetch_add_explicit(&report[16u + tag], 1u, memory_order_relaxed);
+  }
+  uint expected = 0u;
+  if (!atomic_compare_exchange_weak_explicit(&report[0], &expected, 1u,
+                                             memory_order_relaxed,
+                                             memory_order_relaxed)) {
+    return;                                  // someone else claimed it
+  }
+  atomic_store_explicit(&report[1], tag, memory_order_relaxed);
+  atomic_store_explicit(&report[2], gid, memory_order_relaxed);
+  atomic_store_explicit(&report[3],
+                        (uint)as_type<ushort>(x[gid]), memory_order_relaxed);
+}
+
 kernel void residual_add_f16(
     const device VPIPE_ELT* a   [[buffer(0)]],
     const device VPIPE_ELT* b   [[buffer(1)]],

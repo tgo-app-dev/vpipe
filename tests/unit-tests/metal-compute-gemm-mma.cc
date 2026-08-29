@@ -21,6 +21,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
+#include "generative-models/shared/mma-tile.h"
 
 #include <Metal/Metal.hpp>
 #include <chrono>
@@ -2684,4 +2685,99 @@ TEST(gemm_mma, alu_rate_f16_vs_f32)
   run("dg_imad_rate_i32", fma2_iters, fma2_flops);
   run("dg_imad_rate_mix_i8f16", fma2_iters, fma2_flops);
   EXPECT_TRUE(true);
+}
+
+// THE 2^31-BYTE OPERAND BAND IS DEFENSIVE, AND MUST STAY THAT WAY.
+//
+// mma_row_band caps how many rows one matmul2d dispatch may cover so that
+// no operand's byte span passes 2^31, where the tiles silently stop
+// storing. Two families were already wrong here -- MiniMax-H3's fc2 (band
+// taken from N, source unguarded) and the Wan VAE (split by a row cap, its
+// 27-tap im2col source unguarded) -- so the rule now guards every caller.
+//
+// Guarding every caller creates a NEW failure mode, and a quiet one. There
+// are two kinds of caller and the band means different things to each:
+//
+//   BANDING callers (MiniMax-H3, both VAEs) loop over row bands. A band
+//   that fires costs an extra dispatch and nothing else -- H3's qkv has
+//   banded at 49920 since long before any of this, correctly.
+//
+//   DECLINING callers (the four image DiTs) return false and let the
+//   caller keep its int64-safe steel path. A band that fires there drops
+//   the model off matmul2d entirely, at 2-3x. Every existing test still
+//   passes, because steel computes the right answer.
+//
+// So the property is asymmetric, and this pins the half that can go quiet:
+// at the shapes the image DiTs actually run, the guard must NOT fire.
+TEST(gemm_mma, row_band_does_not_fire_at_shipped_shapes)
+{
+  using vpipe::genai::mma_row_band;
+
+  // The DECLINING callers, at the largest geometry they are run at today.
+  // One token is 16x16 px, so 1024px is 4096 tokens plus text.
+  struct Shape { const char* tag; int M, N, K; };
+  const Shape decliners[] = {
+      {"krea2 qkv",         4106,  9216,  3072},
+      {"krea2 ff-up",       4106, 24576,  3072},
+      {"krea2 ff-down",     4106,  3072, 16384},
+      {"flux2 ff-down",     4106,  3072, 16384},
+      {"qie ff-down",       4106,  3072, 16384},
+      {"boogu ff-down",     4106,  3072,  6784},
+      {"krea2 ff-down 2k", 16384,  3072, 16384},
+      {"krea2 ff-up 2k",   16384, 24576,  3072},
+  };
+  bool clean = true;
+  for (const Shape& s : decliners) {
+    const int b = mma_row_band(s.N, s.K);
+    if (s.M > b) {
+      std::printf("[gemm_mma] %-18s M=%7d N=%6d K=%6d  band %9d  FIRES -- "
+                  "this shape just lost matmul2d\n",
+                  s.tag, s.M, s.N, s.K, b);
+      clean = false;
+    }
+    EXPECT_TRUE(s.M <= b);
+  }
+
+  // The BANDING callers: firing is legal, but the 2D VAE convs should not
+  // start splitting where the 2^19 row cap alone already served them --
+  // that would be a silent extra dispatch per conv at every resolution.
+  const Shape vae[] = {
+      {"vae top 3x3",  262144,   128,  1152},
+      {"vae mid 3x3",  262144,   256,  2304},
+      {"vae deep 3x3",  16384,   512,  4608},
+      {"wan 480p 96ch",262144,    96,  2592},
+  };
+  for (const Shape& s : vae) {
+    const int cap = (1 << 19);
+    const int was = s.M < cap ? s.M : cap;
+    const int now = was < mma_row_band(s.N, s.K)
+                        ? was : mma_row_band(s.N, s.K);
+    if (was != now) {
+      std::printf("[gemm_mma] %-18s chunk %d -> %d\n", s.tag, was, now);
+      clean = false;
+    }
+    EXPECT_TRUE(was == now);
+  }
+
+  // POSITIVE CONTROLS. The two shapes that did come back wrong must still
+  // be caught, or the rule has been weakened into a no-op.
+  //   H3 fc2 at 1376x768x243: source 75136 x 14336 bf16 = 2.15 GB.
+  //   Wan VAE 720p, 192-channel level: 230400 x 5184 = 2.22 GiB.
+  EXPECT_TRUE(75136 > mma_row_band(5376, 14336));
+  EXPECT_TRUE(230400 > mma_row_band(192, 5184));
+
+  // And whatever a band is, it must keep the widest operand under the line
+  // -- the property the whole rule exists to provide.
+  const Shape all[] = {
+      {"h3 fc2",  75136,  5376, 14336}, {"h3 qkv", 75136, 21504, 5376},
+      {"wan 720p",230400,  192,  5184}, {"krea2 ff-down", 4106, 3072, 16384},
+  };
+  for (const Shape& s : all) {
+    const long long b = mma_row_band(s.N, s.K);
+    const long long w = s.N > s.K ? s.N : s.K;
+    EXPECT_TRUE(b * w * 2 < (1LL << 31));
+  }
+  std::printf("[gemm_mma] row band: %s\n",
+              clean ? "inactive at every shipped shape, controls still caught"
+                    : "FIRES WHERE IT SHOULD NOT");
 }

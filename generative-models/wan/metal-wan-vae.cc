@@ -1,5 +1,7 @@
 #include "generative-models/wan/metal-wan-vae.h"
 
+#include "generative-models/shared/mma-tile.h"
+
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -754,6 +756,16 @@ MetalWanVae::autotune_mid_attn_(MetalCompute* mc, int C)
 
 // ---- forward primitives ------------------------------------------------
 
+int
+MetalWanVae::mma_row_chunk(int M, int N, int K, int max_m)
+{
+  int chunk = M > 0 ? M : 1;
+  if (max_m > 0 && chunk > max_m) { chunk = max_m; }
+  const int band = mma_row_band(N, K);
+  if (chunk > band) { chunk = band; }
+  return chunk;
+}
+
 void
 MetalWanVae::gemm_bias_(Ctx& cx, const SharedBuffer& x, const SharedBuffer& w,
                         const SharedBuffer& b, const SharedBuffer& y, int M,
@@ -765,8 +777,11 @@ MetalWanVae::gemm_bias_(Ctx& cx, const SharedBuffer& x, const SharedBuffer& w,
   if (_use_mma2 && M >= _mma_min_m && N >= _mma_min_n) {
     const bool deep = (K >= 6144);
     const int BN = deep ? 256 : 128;
-    // matmul2d corrupts output rows past ~2^19, so split a tall GEMM.
-    const int chunk = (_mma_max_m > 0 && M > _mma_max_m) ? _mma_max_m : M;
+    // Split a tall GEMM: past ~2^19 rows matmul2d corrupts its output,
+    // and past 2^31 bytes on ANY operand it stops storing. See
+    // mma_row_chunk -- the second limit is the one the row cap alone
+    // misses, because it binds on the 27-tap im2col SOURCE.
+    const int chunk = mma_row_chunk(M, N, K, _mma_max_m);
     for (int r0 = 0; r0 < M; r0 += chunk) {
       const int mc = (M - r0 < chunk) ? (M - r0) : chunk;
       enc.set_function(deep ? _fn_dense_mma_deep : _fn_dense_mma);

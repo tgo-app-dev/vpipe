@@ -135,6 +135,17 @@ Four stages, in order:
    different transformer files and different tokenizers. A fetch that does
    not say which is refused, with both listed, rather than quietly taking
    the first.
+
+   **`model_key` is what the next stage names.** The two partitions share
+   a directory on disk, so what keeps them apart is the key each is
+   registered under in the models DB — not the repo path, which is the
+   same string for both. `model_key: Comfy-Org/MiniMax-H3-FL2VA` pins it,
+   and step 2's `src_model` has to be that key. Passing the repo path
+   (`Comfy-Org/MiniMax-H3`) there instead is the mistake to avoid: the
+   fetch succeeds, and the quantize then fails to find a model of that
+   name. Left unset, the key falls back to the catalogue entry's name,
+   which happens to be the same string here — so pinning it costs
+   nothing and makes the pipeline say what it depends on.
 2. **`model-quantize`** (`target: dit`) — the 33B transformer to 8-bit,
    group size 64. **Leave `quant_modulation: true` alone.** H3's per-block
    AdaLN modulation is not a small side projection the way other DiTs' is —
@@ -242,25 +253,59 @@ family carries its own.
 
 ### How long it takes
 
-Measured on the smallest machine that runs this at all — a **fanless
-MacBook Air 15-inch (M5)**, 10-core CPU / 10-core GPU, 16 GB — on the 8-bit
-model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with the
-[Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time:
+Measured on the 8-bit model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with
+the [Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time, on the
+smallest machine that runs this at all — a **fanless MacBook Air 15-inch
+(M5)**, 10-core CPU / 10-core GPU, 16 GB — and on a **MacBook Pro 16-inch
+(M5 Pro)**, 24 GB:
 
-| frames | clip | |
-|---|---|---|
-| 90 | 3.75 s | **9 min 26 s** |
-| 124 | 5.2 s | **11 min 25 s** |
+| frames | clip | M5 Air, 16 GB | M5 Pro, 24 GB |
+|---|---|---|---|
+| 90 | 3.75 s | **9 min 26 s** | **3 min 20 s** |
+| 124 | 5.2 s | **11 min 25 s** | **5 min 0 s** |
 
 `steps` is the setting that moves this most, and the Turbo adapter is what
 buys the low count: without it, plan on 8 steps for a draft and 16 for a
 final clip, at roughly proportional cost.
 
-> **Both figures were measured with the chassis sitting on an ice pack.**
-> That is not a tuning tip so much as a warning about what the numbers are:
-> this model holds the GPU flat out for the whole run, and a fanless Mac
-> clocks down long before it ends. On a warm desk expect slower — how much
-> slower has not been measured here, so no figure for it is quoted.
+**The two columns are not equally solid, and it is worth saying which is
+which.** The M5 Pro column is repeatable: fans, one pinned clock, the same
+figure run to run. The M5 Air column is not. An ice pack is placed by hand,
+and where it sits changes both how long the boost window lasts and how far
+the clock falls afterwards, so those figures carry a run-to-run spread that
+has not been quantified here.
+
+So the gap reads **2.8× at 90 frames and 2.3× at 124**, but the difference
+between those two is not structure — it is mostly the Air moving. The same
+goes for scaling: 90 → 124 frames is 1.38× the length and costs the Air
+1.21× its time against the Pro's 1.50×, and only the Pro's number is a
+measurement rather than one sample of a noisy quantity. Take the Air column
+as the order of magnitude a well-cooled fanless M5 reaches, and the Pro
+column as a figure you can reproduce.
+
+> **The M5 Air column was measured with the chassis sitting on an ice pack**,
+> and even then it is a throttled machine for most of the run. It starts at
+> the full **1578 MHz** and holds it for roughly the **first two minutes**,
+> then throttles and settles into a fluctuation around **1300 MHz** — 82% of
+> the part — because an ice pack is a heatsink that warms up, not stable
+> cooling.
+>
+> So the penalty is a function of how LONG the job is, not a flat tax: a
+> two-minute job never leaves the boost window, while these runs spend
+> **79–82% of their wall clock** past it. Read the Air column as a machine
+> that was fast at the start and is not by the end.
+>
+> It is also **noisy**, in a way the other column is not: the ice pack is
+> placed by hand and where it sits moves both the length of the boost window
+> and the clock it settles to, so repeating an Air run does not repeat its
+> number. On a warm desk it drops further still — the 124-frame run takes
+> about 15 minutes there.
+>
+> **The M5 Pro column is that machine as it ships**, on its own fans with
+> nothing under it, and its fans are enough that the workload pins the GPU at
+> **1620 MHz — the maximum — at 100% for the whole run.** That is **1.25×**
+> the Air's sustained clock before any difference in core count, so clock
+> alone accounts for part of the 2.3–2.8× gap and not for most of it.
 
 ### More than text in
 
@@ -796,16 +841,40 @@ the log.
 |---|---|
 | **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 44 s** |
 | **M5** MacBook Air 15", 16 GB, fanless, on an ice pack | **11 min 25 s** |
+| **M5 Pro** MacBook Pro 16", 24 GB, its own fans, no cooling aid | **5 min 0 s** |
 
-Both rows are the same pipeline file, so they are directly comparable: the
-fanless M5 finishes **1.9× faster** than the fan-cooled M4 Pro, and does it
-on a quarter of the RAM. On 16 GB the DiT streams its weights, which is what
-keeps that machine from going faster still.
+All three rows are the same pipeline file, so they are directly comparable:
+the fanless M5 finishes **1.9× faster** than the fan-cooled M4 Pro, and does
+it on a quarter of the RAM. On 16 GB the DiT streams its weights, which is
+what keeps that machine from going faster still. The M5 Pro is **2.3× faster
+again** — 4.3× the M4 Pro — with more RAM and, measurably, a chassis that
+holds its clocks.
 
-Each row is that chassis at its best — a fan for one, an ice pack for the
-other. The **same M5 run on a desk takes about 15 minutes**, so on a fanless
-Mac, cooling is worth roughly a tenth of the wall clock and is the first thing
-to check before reading anything else into a timing.
+Each row is that chassis at its best, and for the Air that still is not
+very good for long. It starts at the full **1578 MHz** and holds it about
+**two minutes**, then throttles to a fluctuation around **1300 MHz** — 82%
+of the part — because an ice pack is a heatsink that warms up, not stable
+cooling. An 11-minute run therefore spends **~82% of itself throttled**,
+which is why the number to distrust on a fanless Mac is a short benchmark:
+it can finish before the machine slows down. The **same run on a desk takes
+about 15 minutes**, so cooling is worth roughly a **quarter** of the wall
+clock here, and is the first thing to check before reading anything else
+into a timing.
+
+It is a **noisy** row for the same reason. The ice pack is placed by hand,
+and where it sits moves both the length of the boost window and the clock
+after it, so the Air figure is one sample rather than a repeatable number.
+Treat it as the order of magnitude, and compare against it accordingly.
+
+The M5 Pro row is the machine as it ships, with nothing under it: its fans
+are enough that this workload **pins the GPU at 1620 MHz, its maximum, at
+100% for the whole run** — so unlike the Air it is repeatable, and it is the
+row to quote when a number has to hold up. The two M5 rows are therefore not
+the same silicon running at the same rate: one is held at its ceiling, the
+other spends most of its run **18% under its own**. That is about **1.25×**
+of the 2.3× between them, leaving roughly **1.8×** to core count and memory
+— worth separating, because only the 1.25× is something better cooling could
+recover.
 
 Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
 mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on

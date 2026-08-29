@@ -1500,6 +1500,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_bias_add  = m->_lib_elt.function("bias_add_rows_f16");
   // The blit a baked AdaLN needs when an adapter has to be added on top.
   m->_fn_copy      = m->_lib_elt.function("copy_f16");
+  m->_fn_nan_trip  = m->_lib_elt.function("nan_tripwire_f16");
   {
     metal_compute::ComputeLibrary sdpa = mc->load_library("sdpa_bf16");
     m->_fn_sdpa = sdpa.function("sdpa_full_f16");
@@ -2320,7 +2321,7 @@ MetalMiniMaxH3Transformer::dispatch_row_bands_(ComputeEncoder& enc,
                                                std::size_t y_off, int M,
                                                int N, int K, GemmRoute route)
 {
-  const int band = mma_row_band_(N);
+  const int band = mma_row_band(N, K);
   for (int m0 = 0; m0 < M; m0 += band) {
     gemm_route_dispatch_(enc, x, x_off + (std::size_t)m0 * K, l, y,
                          y_off + (std::size_t)m0 * N,
@@ -2330,22 +2331,18 @@ MetalMiniMaxH3Transformer::dispatch_row_bands_(ComputeEncoder& enc,
 }
 
 int
-MetalMiniMaxH3Transformer::mma_row_band_(int N) const
+MetalMiniMaxH3Transformer::mma_row_band(int N, int K)
 {
   static const int kForced = [] {
     const char* e = std::getenv("VPIPE_H3_MMA_ROW_BAND");
     return e != nullptr ? std::atoi(e) : 0;
   }();
   if (kForced > 0) { return kForced; }
-  if (N <= 0) { return 1 << 30; }
-  // The last row a 32-bit BYTE offset can reach, floored to the 128-row
-  // tile the mma kernels step in -- a band that ended mid-tile would
-  // still hand one tile an offset past the line.
-  const long long lim = (((long long)1 << 31) - 1) / ((long long)N * 2);
-  long long band = (lim / 128) * 128;
-  if (band < 128) { band = 128; }
-  if (band > (1 << 30)) { band = 1 << 30; }
-  return (int)band;
+  // The rule itself is shared: the Wan VAE reaches the same line from the
+  // other side (a fixed row cap that bounds its destination and not its
+  // 27-tap im2col source), and two families disagreeing about where 2^31
+  // is would be one of them silently wrong.
+  return ::vpipe::genai::mma_row_band(N, K);
 }
 
 void
@@ -2370,7 +2367,7 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   // 2^31-byte line -- everything this model ran before 1344x768 -- the
   // band IS M and this is the single pass it always was.
   const GemmRoute route = gemm_route_(M, N, K);
-  const int band = mma_row_band_(N);
+  const int band = mma_row_band(N, K);
   for (int m0 = 0; m0 < M; m0 += band) {
     const int rows = std::min(band, M - m0);
     const std::size_t xo = x_off + (std::size_t)m0 * K;
@@ -2967,7 +2964,20 @@ MetalMiniMaxH3Transformer::bake_adaln(
         ComputeEncoder enc = st.begin_compute();
         gemm_(enc, temb, 0, *ada, tab, 0, T, D, c.time_dim);
       }
-      st.commit().wait();
+      // CHECKED, because a discarded status here is the worst kind of
+      // silence this model can produce. The table is a FRESH allocation:
+      // if the GEMM's command buffer fails -- out of memory is the way,
+      // and the video geometries put ~10 GB of scratch beside the
+      // weights -- nothing has written it, and every block then
+      // modulates every row of every step with whatever those pages
+      // held. That is a whole-latent corruption in BOTH modalities from
+      // a run that reported success.
+      std::string bake_err;
+      if (!st.commit().wait_ok(&bake_err)) {
+        return fail(fmt("AdaLN bake of block {} failed: {}", i,
+                        bake_err.empty() ? std::string("GPU error")
+                                         : bake_err)());
+      }
     }
     _adaln_tab[(std::size_t)i] = std::move(tab);
     // Release the weights. For a resident model this IS the win; for a
@@ -3005,7 +3015,14 @@ MetalMiniMaxH3Transformer::bake_adaln(
       ComputeEncoder enc = st.begin_compute();
       gemm_(enc, temb, 0, *fada, _final_adaln_tab, 0, T, FD, c.time_dim);
     }
-    st.commit().wait();
+    // Same reasoning as the per-block tables above: unwritten here is
+    // silent, and it reaches the output layer of every step.
+    std::string bake_err;
+    if (!st.commit().wait_ok(&bake_err)) {
+      return fail(fmt("AdaLN bake of the final layer failed: {}",
+                      bake_err.empty() ? std::string("GPU error")
+                                       : bake_err)());
+    }
   }
   freed += lin_bytes(*fada);
   _final_adaln = Linear{};
@@ -3568,6 +3585,9 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
   s.mod  = mk((std::size_t)n_t * (std::size_t)c.adaln_out());
   s.fmod = mk((std::size_t)n_t * 2 * H);
   s.adaln_idx = _mc->make_shared_buffer(S * sizeof(int));
+  if (_nan_report.empty()) {
+    _nan_report = _mc->make_shared_buffer(1024 * sizeof(unsigned));
+  }
   s.tstep_idx = _mc->make_shared_buffer(S * sizeof(int));
   if (s.rcos.empty() || s.rsin.empty() || s.x.empty() || s.nm.empty() ||
       s.proj.empty() || s.qkv.empty() || s.qh.empty() || s.kh.empty() ||
@@ -4068,6 +4088,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // internals can be walked GEMM by GEMM. `bprobe` is set only for the
     // block being dissected -- every call drains the GPU.
     bool bprobe = false;
+    // Which block the tripwire tags its findings with. Set in the loop
+    // for the same reason bprobe is: the block lambda is defined before
+    // the loop variable exists.
+    int trip_blk = -1;
     auto bdump = [&](const char* where, const SharedBuffer& buf, int width) {
       if (!bprobe || _mc->session() == nullptr) { return; }
       enc.end();
@@ -4095,6 +4119,29 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
+    // THE TRIPWIRE. One dispatch per checked tensor, no drain, so it can
+    // run on EVERY op of EVERY block without changing the timing that
+    // this bug turned out to depend on. `tag` is block * 16 + op, and the
+    // report is read once after the forward commits.
+    static const bool ktrip =
+        std::getenv("VPIPE_H3_NAN_TRIP") != nullptr;
+    if (ktrip && !_nan_report.empty()) {
+      std::memset(_nan_report.contents(), 0, 1024 * sizeof(unsigned));
+    }
+    auto trip = [&](int blk, int op, const SharedBuffer& b,
+                    std::size_t n) {
+      if (!ktrip || !_fn_nan_trip.valid() || _nan_report.empty() ||
+          b.empty() || n == 0) {
+        return;
+      }
+      enc.set_function(_fn_nan_trip);
+      enc.set_buffer(0, b);
+      enc.set_buffer(1, _nan_report);
+      enc.set_constant(2, (unsigned)n);
+      enc.set_constant(3, (unsigned)(blk * 16 + op));
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    };
+
     auto rms = [&](const SharedBuffer& x, std::size_t x_off,
                    const SharedBuffer& g, const SharedBuffer& y,
                    std::size_t y_off, int rows, int width, float eps) {
@@ -4225,6 +4272,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                      bool modulated, const BlockLora* lo) {
       rms(x, 0, b.n1, s.nm, 0, rows, H, c.norm_eps);
       bdump("n1", s.nm, H);
+      trip(trip_blk, 0, s.nm, (std::size_t)rows * H);
       if (modulated) {
         modulate(s.nm, *mod_buf, mod_off * 2, s.adaln_idx, s.nm, rows,
                  6 * H, H, 0);
@@ -4234,6 +4282,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H,
             lo != nullptr ? &lo->qkv : nullptr);
       bdump("qkv", s.qkv, 3 * I);
+      trip(trip_blk, 2, s.qkv, (std::size_t)rows * 3 * I);
       psplit(t_qkv);
       // Per-HEAD RMS over head_dim, in place on the fused buffer, BEFORE
       // rope -- the reference's order. See QKV_HSTRIDE / Q_OFF above for
@@ -4263,13 +4312,16 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                      {(unsigned)HD, 1, 1});
       }
       bdump("attn_out", s.ob, I);
+      trip(trip_blk, 3, s.ob, (std::size_t)rows * I);
       gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I,
             lo != nullptr ? &lo->out : nullptr);
       bdump("o_proj", s.nm, H);
+      trip(trip_blk, 4, s.nm, (std::size_t)rows * H);
       psplit(t_oproj);
       if (modulated) { gated(x, s.nm, rows, 2 * H); }
       else           { residual(x, s.nm, rows); }
       bdump("x_after_attn", x, H);
+      trip(trip_blk, 5, x, (std::size_t)rows * H);
 
       rms(x, 0, b.n2, s.nm, 0, rows, H, c.norm_eps);
       if (modulated) {
@@ -4306,6 +4358,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         gemm_(enc, s.nm, 0, b.fc1, s.ff, 0, rows, 2 * FF, H,
               lo != nullptr ? &lo->fc1 : nullptr);
         bdump("fc1", s.ff, 2 * FF);
+      trip(trip_blk, 6, s.ff, (std::size_t)rows * 2 * FF);
         // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
         // convention, not the llama one the rest of this tree follows.
         enc.set_function(_fn_swiglu);
@@ -4315,13 +4368,16 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
       }
       bdump("swiglu", s.qkv, FF);
+      trip(trip_blk, 7, s.qkv, (std::size_t)rows * FF);
       gemm_(enc, s.qkv, 0, b.fc2, s.nm, 0, rows, H, FF,
             lo != nullptr ? &lo->fc2 : nullptr);
       bdump("fc2", s.nm, H);
+      trip(trip_blk, 8, s.nm, (std::size_t)rows * H);
       psplit(t_ff);
       if (modulated) { gated(x, s.nm, rows, 5 * H); }
       else           { residual(x, s.nm, rows); }
       bdump("x_after_ff", x, H);
+      trip(trip_blk, 9, x, (std::size_t)rows * H);
       psplit(t_elt);
     };
 
@@ -4488,8 +4544,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           // on the same terms as any other growth. Refused, this runs
           // single-slot: no prefetch, but still no per-block allocation
           // and no memcpy out of the mapping, which is the larger half.
+          // VPIPE_H3_SINGLE_SLOT forces the refusal. Which mode a run
+          // takes otherwise depends on LIVE memory, so on a tight box it
+          // is not reproducible from outside -- and single-slot is a
+          // distinct third path (the pair, this, and no slots at all)
+          // that no A/B could reach without a way to ask for it. Read per
+          // allocation rather than latched in a static, so a test can put
+          // two arms in one process.
+          const bool force_single =
+              std::getenv("VPIPE_H3_SINGLE_SLOT") != nullptr;
           const auto mbs = _mc->memory_budget();
-          _slot_pair = mbs.recommended != 0 &&
+          _slot_pair = !force_single && mbs.recommended != 0 &&
                        mbs.fits_growth(block_bytes_(_slot[0])) &&
                        clone_block_(_slot[0], _slot[1], false);
           if (!_slot_pair) { _slot[1] = Block{}; }
@@ -4690,6 +4755,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         mark = std::chrono::steady_clock::now();
       }
       bprobe = xprobe && Lx == 0;
+      trip_blk = Lx;
       block(b, s.x, seq, true,
             (std::size_t)Lx < _lora_blocks.size() ? &_lora_blocks[(std::size_t)Lx]
                                                   : nullptr);
@@ -4753,9 +4819,35 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           // the ones it refused.
           bool room = slots;
           if (!slots) {
-            const auto mbp = _mc->memory_budget();
-            room = mbp.recommended != 0 &&
-                   mbp.fits_growth(block_bytes_(*bp));
+            // SINGLE-SLOT ISSUES NOTHING. The fallback destination is
+            // only ever CONSUMED by the pre-slot path below, which runs
+            // when the slots are not ready; the slot consumption branch
+            // requires pf.slot >= 0. So a fallback read issued while one
+            // live slot is serving the stack is picked up by nobody:
+            // pf.layer stays set, which refuses every later prefetch, and
+            // pf.blk holds a whole block for the rest of the forward.
+            //
+            // MEASURED before this, on a 4-block stack: the pair reports
+            // 3 of 3 reads hit and slots-off 3 of 3, while single-slot
+            // reported 0 of 1 -- one read paid for and discarded, then no
+            // prefetch at all. Both wrongs land on the run that refused
+            // the second slot because memory was tight, which is the last
+            // run that can afford a block of dead buffers.
+            //
+            // Not issuing is what the mode's own log line already claims
+            // ("single -- prefetch off") and is strictly better than the
+            // behaviour it replaces: the same absent overlap, minus the
+            // wasted read and minus the block. Teaching the consumption
+            // path to take a fallback read while the slots are live would
+            // be better still, and is a separate change -- it puts a
+            // second block in the air, which is the growth the budget
+            // just refused.
+            room = false;
+            if (!_slots_ready || _slots_off) {
+              const auto mbp = _mc->memory_budget();
+              room = mbp.recommended != 0 &&
+                     mbp.fits_growth(block_bytes_(*bp));
+            }
           }
           if (nxt >= 0 && room) {
             pf.layer = nxt;
@@ -4901,6 +4993,29 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             : 0.0));
     }
 
+    // What the prefetch actually managed this pass, kept so a test can
+    // see it: `started` counts reads issued, `hit` counts reads a block
+    // consumed. Any gap is work paid for and thrown away, and -- on the
+    // fallback destination -- a block's worth of buffers left live for
+    // the rest of the forward.
+    _pf_started = pf_started;
+    _pf_hit     = pf_hit;
+    // THE FIRE-AND-FORGET TALLY. The encoder splits every 50 dispatches
+    // and commits those buffers without waiting, so nothing else is in a
+    // position to see one fail; a completion handler latches it and
+    // Fence::wait_ok reports it. This says whether that machinery is
+    // LIVE. A zero error count next to a zero completed count means
+    // nobody was watching; next to a large completed count it means
+    // nothing failed, and those are opposite conclusions from the same
+    // silence.
+    if (_mc->session() != nullptr) {
+      unsigned long long ff_done = 0, ff_bad = 0;
+      CommandStream::fire_and_forget_stats(&ff_done, &ff_bad);
+      _mc->session()->log_debug(fmt(
+          "[h3-dit] fire-and-forget command buffers: {} completed, {} in "
+          "error (process total)", ff_done, ff_bad));
+    }
+
     // ---- 4. the shared output norm and the two heads ------------------
     const SharedBuffer* fmod_buf = &s.fmod;
     std::size_t fmod_off = 0;
@@ -4958,9 +5073,51 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     psplit(t_final);
   }
   std::string gpu_err;
+  const bool trip_on = !_nan_report.empty() &&
+                       std::getenv("VPIPE_H3_NAN_TRIP") != nullptr;
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("MiniMax-H3 DiT forward failed")
                                 : gpu_err);
+  }
+  // THE TRIPWIRE'S VERDICT, read once now that everything has completed.
+  // Names the block and the op that first held a non-finite value, the
+  // element, and how many there were -- one element or a region, which
+  // are different bugs.
+  if (trip_on && _mc->session() != nullptr) {
+    const auto* r = static_cast<const unsigned*>(_nan_report.contents());
+    if (r != nullptr && r[0] != 0) {
+      static const char* kOp[] = {"n1", "?1", "qkv", "attn_out", "o_proj",
+                                  "x_after_attn", "fc1", "swiglu", "fc2",
+                                  "x_after_ff", "?", "?", "?", "?", "?", "?"};
+      const unsigned blk = r[1] / 16, op = r[1] % 16;
+      const std::uint32_t bits = (std::uint32_t)r[3] << 16;
+      float v;
+      std::memcpy(&v, &bits, 4);
+      _mc->session()->warn(fmt(
+          // "first" is whichever thread won the claim, not the lowest
+          // index -- and the count is the RUNNING TOTAL over every
+          // tripwire in this forward, not this tensor's. Both were
+          // mislabelled in the first cut and both invite wrong readings:
+          // an arbitrary index reads as a position, and a total reads as
+          // a density.
+          "h3-nan-trip: earliest CLAIMED non-finite at block {} op '{}' -- "
+          "element {} (raw 0x{:04x} = {}); {} non-finite seen so far this "
+          "forward, across all checks",
+          blk, kOp[op], r[2], r[3], (double)v, r[4]));
+      // EVERY call site that saw one, in block/op order. Where the count
+      // is small the fault is localised and its inputs are worth
+      // capturing; where it is the whole tensor it is already
+      // propagation and the site upstream of it is the interesting one.
+      for (unsigned t = 0; t < 1008u; ++t) {
+        const unsigned c = r[16 + t];
+        if (c == 0) { continue; }
+        _mc->session()->warn(fmt(
+            "h3-nan-trip:   block {:2} op '{}' -- {} non-finite", t / 16,
+            kOp[t % 16], c));
+      }
+    } else {
+      _mc->session()->log_debug(fmt("h3-nan-trip: no non-finite anywhere"));
+    }
   }
 
   if (prof && _mc->session() != nullptr) {

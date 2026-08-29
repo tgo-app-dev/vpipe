@@ -343,7 +343,12 @@ target_link_libraries(vpipe_test_echo_plugin PRIVATE vpipe)
 add_dependencies(vpipe_test vpipe_test_echo_plugin)
 if(TARGET vpipe_unit_tests)
     target_compile_definitions(vpipe_unit_tests PRIVATE
-        VPIPE_TEST_ECHO_PLUGIN="$<TARGET_FILE:vpipe_test_echo_plugin>")
+        VPIPE_TEST_ECHO_PLUGIN="$<TARGET_FILE:vpipe_test_echo_plugin>"
+        # The SHIPPED example pipelines, so a test can check them against
+        # the catalogue they name. Nothing else reads them at run time --
+        # they are documentation -- which is exactly why a wrong key in
+        # one is invisible until a user runs it.
+        VPIPE_DOCS_PIPELINES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/docs/pipelines")
 endif()
 
 # A standalone .metallib compiled offline (NOT embedded into libvpipe),

@@ -54,6 +54,53 @@ inline bool mma_use_wide_tile(int N, int K)
   return K >= kMmaDeepK || (wide_n > 0 && N >= wide_n);
 }
 
+// ---------------------------------------------------------------------
+// How many ROWS one matmul2d dispatch may cover, over an N-wide
+// destination contracting a K-wide source, at 2 bytes per element.
+//
+// The mma kernels build their tensors as `dextents<int32_t, 2>`, so MPP
+// computes addresses in 32 bits and a tile whose base passes 2^31 BYTES
+// silently stops storing -- no error, no partial write, the rows come back
+// holding whatever was already in the buffer. Splitting M and rebasing each
+// dispatch through the buffer offset keeps every offset the kernel computes
+// small. Below the line the band is the whole thing and nothing about the
+// encoding changes, so this costs nothing at the shapes that already work.
+//
+// BOTH extents, because the limit is a property of EVERY operand and not of
+// the destination. This lives here, and takes both, because banding on one
+// of them is the mistake that has now been made twice:
+//
+//   MiniMax-H3's DiT banded on N. Three of its four projections cannot show
+//   the difference; fc2 can, having the block's smallest N (5376, so its
+//   band was 199680 and never fired) and its largest K (14336, so at 75136
+//   packed rows the SwiGLU output it contracts is 2.15 GB). It came back as
+//   whole-latent video noise.
+//
+//   The Wan VAE splits by a fixed ROW cap, which bounds its destination
+//   (cout <= 384) and not its source. Its causal conv3d has 27 taps where a
+//   2D VAE has 9, so K = 27 * cin reaches 10368 and the im2col band alone
+//   permits 2.7 GB.
+//
+// Floored to 128, the mma tiles' row step; a band ending mid-tile would
+// still hand one tile an offset past the line. 128 is a multiple of the
+// 64-row step the scaled/LoRA tiles use, so one floor serves both.
+//
+// MEASURED, minimax_h3_blocks.tail_rows_match_a_small_reference at
+// [76800, 14336] bf16: the 128-row tiles return 9633792 wrong elements,
+// every row from 75008 = ceil128(2^31 / 28672) to the end, and 0 at the
+// band. steel, the int8 arm and split-K are clean either way -- all three
+// are int64 internally, which is why this is a matrix-core path only.
+inline int mma_row_band(int N, int K)
+{
+  const int W = N > K ? N : K;
+  if (W <= 0) { return 1 << 30; }
+  const long long lim = (((long long)1 << 31) - 1) / ((long long)W * 2);
+  long long band = (lim / 128) * 128;
+  if (band < 128) { band = 128; }
+  if (band > (1 << 30)) { band = 1 << 30; }
+  return (int)band;
+}
+
 }  // namespace vpipe::genai
 
 #endif

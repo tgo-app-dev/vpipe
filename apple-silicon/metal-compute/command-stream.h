@@ -3,8 +3,11 @@
 
 #include "apple-silicon/metal-compute/compute-encoder.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace MTL {
@@ -72,6 +75,42 @@ public:
   // it captures.
   void on_completion(std::function<void()> handler);
 
+  // The failure latch shared by a stream and the Fence it hands out.
+  //
+  // split_encoder_ commits INTERMEDIATE command buffers fire-and-forget
+  // -- that is the whole point, it is what lets the CPU encode the next
+  // chunk while the GPU runs this one -- and nothing waits on them, so
+  // nothing was in a position to notice one FAIL. A long stream commits
+  // a dozen of these before the one the caller actually waits on, and an
+  // intermediate out-of-memory therefore skipped its work silently and
+  // reported success: exactly the shape of a corrupted result from a
+  // run that was merely too big.
+  //
+  // So each fire-and-forget buffer carries a completion handler that
+  // records the first failure here, and Fence::wait_ok() reports it
+  // alongside its own buffer's. The handler runs on a Metal thread,
+  // hence the atomic and the mutex.
+  struct Failure {
+    std::atomic<bool> failed{false};
+    std::mutex        mu;
+    std::string       reason;
+  };
+
+  // How many fire-and-forget buffers have COMPLETED process-wide, and how
+  // many of those ended in error.
+  //
+  // The latch above reports a failure, and a latch that never fires is
+  // indistinguishable from nothing ever failing -- which is exactly the
+  // reading a silent run invites. The completed count settles that: it is
+  // incremented by the same handler, so a nonzero value proves the
+  // handler runs and therefore that a zero error count means something.
+  //
+  // Process-wide and monotonic on purpose. A stream is opened and
+  // discarded many times per forward, so per-stream counters would be
+  // reset before anyone could read them.
+  static void fire_and_forget_stats(unsigned long long* completed,
+                                    unsigned long long* errored);
+
   // RAII handle on a committed MTL::CommandBuffer. Lets the caller
   // poll status, wait, or attach a completion callback.
   class Fence {
@@ -133,6 +172,10 @@ public:
   private:
     friend class CommandStream;
     explicit Fence(MTL::CommandBuffer* cb) noexcept;
+    Fence(MTL::CommandBuffer* cb, std::shared_ptr<Failure> f) noexcept;
+    // The stream's latch, so wait_ok() also answers for the buffers
+    // committed and released before this one.
+    std::shared_ptr<Failure> _earlier;
 
     MTL::CommandBuffer* _cb = nullptr;
   };
@@ -155,6 +198,9 @@ private:
 
   MTL::CommandQueue*  _queue = nullptr;
   MTL::CommandBuffer* _cb    = nullptr;
+  // Created lazily on the first fire-and-forget commit; shared with every
+  // Fence this stream returns. See Failure.
+  std::shared_ptr<Failure> _fail;
 };
 
 }  // namespace vpipe::metal_compute

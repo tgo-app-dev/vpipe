@@ -25,15 +25,33 @@
 
 namespace vpipe {
 
+// Map an `input_range` name to the (scale, offset) that take a raw F32
+// sample to the VAE's [-1, 1]: `value * scale + offset`.
+//
+// EXPOSED FOR TESTING, and it is worth a test of its own. The dtype does
+// not say what an f32 RGB beat's numbers mean, and this stage assumed
+// [-1, 1] while the tree's only f32 RGB producer (`video-to-rgb`, whose
+// `normalize` defaults ON) emits [0, 1]. The result encoded `p` where
+// `2p - 1` was meant: every latent came back at half contrast with its
+// blacks at mid grey, which still decodes to a recognisable picture --
+// so nothing failed, and a round trip that should have scored 43 dB
+// scored 8.
+//
+// False on an unknown name, which the stage turns into a config failure.
+bool vae_input_range_scale(const std::string& name, float* scale,
+                           float* offset);
+
 // VAE encode stage: the mirror of vae-decode -- it turns an RGB image into a
 // latent. Runs the Qwen-Image VAE encoder (AutoencoderKLQwenImage) on the
 // metal-compute backend, emitting the WHITENED latent that the generate-image
 // stage's `latent` port consumes for img2img (and that vae-decode round-trips
 // back to an image).
 //
-//   iport0  TensorBeatPayload, a U8 or f32 RGB image [3, H, W] (channel-first,
-//           U8 0..255 or f32 [-1,1]) -- the format load-image / vae-decode
-//           emit. Converted to [-1,1] and encoded to the posterior mode.
+//   iport0  TensorBeatPayload, U8 or f32 RGB, channel-first. [3, H, W] is one
+//           picture; [frames, 3, H, W] is a CLIP (what temporal-stack emits),
+//           encoded in ONE call because a video VAE is causal. U8 is 0..255;
+//           an f32 beat is read per the `input_range` config, [0,1] by
+//           default. Converted to [-1,1] and encoded to the posterior mode.
 //
 //   iport1  OPTIONAL FlexDataPayload model reference (from a `model-select`
 //           source). Latched on the first beat; OVERRIDES the hf_dir config so
@@ -125,6 +143,11 @@ private:
   // frames, and the DiT concatenates it channel-wise onto a noise
   // latent of that shape.
   int _frames = 81;
+  // How to read an F32 RGB beat's values -- see kInputRangeDoc. Held as
+  // the scale/offset that map a raw sample to the VAE's [-1, 1], so the
+  // string is parsed once at config time and never at a pixel.
+  float _f32_scale = 2.0f;
+  float _f32_offset = -1.0f;
   std::uint64_t _latents_emitted = 0;
 
   // Parse the `pad_color` config attr into _pad_r/_pad_g/_pad_b (0..255).

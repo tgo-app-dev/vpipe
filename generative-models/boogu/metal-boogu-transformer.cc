@@ -1,3 +1,4 @@
+#include "generative-models/shared/mma-tile.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
 
 #include "generative-models/shared/i8-gemm.h"
@@ -1442,6 +1443,17 @@ MetalBooguTransformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
                                  int M, int N, int K)
 {
   if (!_use_mma2 || M < _mma_min_m || N < 16) { return false; }
+  // And decline a shape whose operands would not survive the tiles'
+  // 32-bit addressing: past 2^31 BYTES on ANY operand the mma tiles stop
+  // storing, silently. DECLINING rather than banding is deliberate here.
+  // The steel path the caller falls back to is int64 and therefore
+  // correct, and this shape is not reachable: K peaks at the ff-down's
+  // 16384, so the line sits at 65536 tokens = a 4096px square, where one
+  // token is 16x16 px. MiniMax-H3's fc2 got a band instead because it was
+  // live at 1376x768x243 and a band is free; paying a restructure of this
+  // GEMM for a resolution nothing can allocate is not the same trade.
+  // See shared/mma-tile.h.
+  if (M > mma_row_band(N, K)) { return false; }
   const SharedBuffer* wdense;
   if (w.quantized) {
     const ComputeFunction& dq = (w.bits == 8) ? _fn_dequant8 : _fn_dequant4;

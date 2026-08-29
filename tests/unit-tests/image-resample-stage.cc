@@ -67,6 +67,11 @@ public:
   int H = 0, W = 0;
   TensorBeat::DType dt = TensorBeat::DType::U8;
   float fill = 200.0f, sentinel = 17.0f;
+  // A vertical STEP EDGE instead of a solid fill: `fill` on the left
+  // half, 0 on the right. A solid image is a fixed point of every
+  // sensible resampling filter, so nothing uniform can say WHICH filter
+  // ran -- which is why every other test here passes under either.
+  bool edge = false;
 
   Job process(RuntimeContext& ctx) override
   {
@@ -85,7 +90,8 @@ public:
         for (int64_t x = 0; x < P; ++x) {
           const size_t i =
               static_cast<size_t>(c) * H * P + static_cast<size_t>(y) * P + x;
-          const float v = (x < W) ? fill : sentinel;
+          float v = (x < W) ? fill : sentinel;
+          if (edge && x < W && x >= W / 2) { v = 0.0f; }
           if (dt == TensorBeat::DType::U8) {
             tb.as_u8()[i] = static_cast<uint8_t>(v);
           } else {
@@ -147,12 +153,14 @@ vector<TensorBeat> run_resample(Session& sess, int H, int W, TensorBeat::DType d
 // Like run_resample but the source emits a padded (strided) frame.
 vector<TensorBeat> run_resample_strided(Session& sess, int H, int W,
                        TensorBeat::DType dt, float fill, float sentinel,
+                       bool edge,
                        FlexData cfg)
 {
   auto pl = std::make_unique<Pipeline>("p", &sess);
   auto s = std::make_unique<StridedFrameSource>(
       &sess, "src", vector<InEdge>{}, FlexData::make_object());
   s->H = H; s->W = W; s->dt = dt; s->fill = fill; s->sentinel = sentinel;
+  s->edge = edge;
   s->allocate_oports(1);
   auto* src = static_cast<StridedFrameSource*>(pl->insert_stage(std::move(s)));
   auto rs = std::make_unique<ImageResampleStage>(
@@ -312,7 +320,7 @@ TEST(image_resample_stage, metal_strided_input_no_shear) {
   Session sess;
   if (!sess.metal_compute() || !sess.metal_compute()->valid()) { return; }
   auto got = run_resample_strided(sess, 8, 40, TensorBeat::DType::U8,
-                 200.0f, 17.0f, mkcfg(40, 8, "stretch"));
+                 200.0f, 17.0f, /*edge=*/false, mkcfg(40, 8, "stretch"));
   ASSERT_TRUE(got.size() == 1);
   const TensorBeat& o = got[0];
   EXPECT_TRUE(o.shape[1] == 8 && o.shape[2] == 40);
@@ -331,7 +339,7 @@ TEST(image_resample_stage, cpu_strided_input_no_shear) {
   Session sess;
   // f32 exercises the CPU fallback, which must also honour strides.
   auto got = run_resample_strided(sess, 8, 40, TensorBeat::DType::F32,
-                 0.5f, -1.0f, mkcfg(40, 8, "stretch"));
+                 0.5f, -1.0f, /*edge=*/false, mkcfg(40, 8, "stretch"));
   ASSERT_TRUE(got.size() == 1);
   const TensorBeat& o = got[0];
   EXPECT_TRUE(o.shape[1] == 8 && o.shape[2] == 40);
@@ -382,4 +390,73 @@ TEST(image_resample_stage, cpu_f32_resample) {
   EXPECT_TRUE(o.shape[1] == 8 && o.shape[2] == 8);
   const float* f = o.as_f32();
   EXPECT_TRUE(f[0] > 0.49f && f[0] < 0.51f);   // solid 0.5 preserved
+}
+
+
+// WHICH FILTER the default selects -- the one thing the tests above
+// cannot say.
+//
+// Every other case here resamples a SOLID fill, and a constant image is
+// a fixed point of any sensible resampling filter, so all of them pass
+// under either. This one downscales a STEP EDGE, where the two filters
+// genuinely disagree, and pins the default by identity: the unset key
+// must produce exactly what "lanczos" produces, and must NOT produce
+// what "bilinear" produces.
+//
+// Stated that way rather than by asserting pixel values, so it keeps
+// meaning the same thing if either kernel is ever retuned.
+namespace {
+
+FlexData mkcfg_alg(int w, int h, const char* alg)
+{
+  FlexData c = FlexData::make_object();
+  auto o = c.as_object();
+  o.insert("width",  FlexData::make_int(w));
+  o.insert("height", FlexData::make_int(h));
+  o.insert("fit",    FlexData::make_string("stretch"));
+  if (alg != nullptr) { o.insert("algorithm", FlexData::make_string(alg)); }
+  return c;
+}
+
+// f32 so the comparison is not flattened by u8 quantisation, and it
+// runs on the CPU path with or without a GPU.
+vector<float> edge_resample(Session& sess, const char* alg)
+{
+  auto got = run_resample_strided(sess, 8, 64, TensorBeat::DType::F32,
+                 1.0f, -1.0f, /*edge=*/true, mkcfg_alg(16, 8, alg));
+  if (got.size() != 1) { return {}; }
+  const TensorBeat& o = got[0];
+  const float* f = o.as_f32();
+  return vector<float>(f, f + static_cast<size_t>(3) * 8 * 16);
+}
+
+}  // namespace
+
+TEST(image_resample_stage, default_algorithm_is_lanczos) {
+  Session sess;
+  const vector<float> dflt = edge_resample(sess, nullptr);
+  const vector<float> lanc = edge_resample(sess, "lanczos");
+  const vector<float> bili = edge_resample(sess, "bilinear");
+  ASSERT_TRUE(!dflt.empty() && dflt.size() == lanc.size());
+  ASSERT_TRUE(dflt.size() == bili.size());
+
+  // The two filters must actually differ on this input, or the identity
+  // below would hold for either default and prove nothing.
+  bool filters_differ = false;
+  for (size_t i = 0; i < lanc.size(); ++i) {
+    if (lanc[i] != bili[i]) { filters_differ = true; break; }
+  }
+  EXPECT_TRUE(filters_differ);
+
+  bool same_as_lanczos = true;
+  for (size_t i = 0; i < dflt.size(); ++i) {
+    if (dflt[i] != lanc[i]) { same_as_lanczos = false; break; }
+  }
+  EXPECT_TRUE(same_as_lanczos);
+
+  bool same_as_bilinear = true;
+  for (size_t i = 0; i < dflt.size(); ++i) {
+    if (dflt[i] != bili[i]) { same_as_bilinear = false; break; }
+  }
+  EXPECT_FALSE(same_as_bilinear);
 }

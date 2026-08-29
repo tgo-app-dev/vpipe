@@ -176,6 +176,29 @@ class MetalWanVae {
 
   const Config& config() const { return _cfg; }
 
+  // ROWS one matmul2d dispatch may cover here, for an [M, K] source and an
+  // [M, N] destination. Two independent limits, and the chunk is the
+  // smaller:
+  //
+  //   kMmaMaxM   matmul2d corrupts output rows past ~2^19 regardless of
+  //              width (the Krea-2 VAE's grey-bottom at 1024px).
+  //   mma_row_band  no operand's byte span may pass 2^31.
+  //
+  // The row cap alone was the whole rule, and it bounds the DESTINATION --
+  // cout is at most 384 here, so 2^19 rows is 200 MB and never close. The
+  // source is the im2col band, and this VAE is the one in the tree that can
+  // make it large: its causal conv3d has 27 taps where a 2D VAE has 9, so
+  // K = 27 * cin reaches 10368. MEASURED at the decoder's own geometry, the
+  // source span the row cap permits is 2.39 GB at 1280x720 (192-channel
+  // level, K = 5184, 230400 rows per frame) and 2.72 GB at 1920x1080 --
+  // both past the line, while 832x480 stays under it at 1.36 GB.
+  //
+  // VPIPE_WAN_VAE_MMA_MAX_M overrides the row cap only; the span band is
+  // not negotiable, being a property of the kernels rather than a tuning
+  // choice.
+  static constexpr int kMmaMaxM = 1 << 19;
+  static int mma_row_chunk(int M, int N, int K, int max_m = kMmaMaxM);
+
  private:
   MetalWanVae() = default;
 
@@ -371,7 +394,7 @@ class MetalWanVae {
   bool _use_mma2  = false;
   int  _mma_min_m = 64;
   int  _mma_min_n = 16;
-  int  _mma_max_m = 1 << 19;
+  int  _mma_max_m = kMmaMaxM;
 
   // Mid-block attention, picked by MEASUREMENT at load (vae-mid-attn-tune.h)
   // exactly as in the Qwen-Image VAE -- the attention here is the same

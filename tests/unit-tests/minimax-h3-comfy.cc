@@ -28,6 +28,7 @@
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "common/flex-data.h"
 #include "stages/model-detect.h"
+#include "stages/model-quantize-stage.h"
 
 #include <cstdint>
 #include <cstring>
@@ -772,5 +773,116 @@ TEST(minimax_h3_comfy, a_told_partition_beats_the_filename)
 
   std::printf("[minimax_h3_comfy] a tree with both DiTs resolves fl2va "
               "untold, ref2va when told\n");
+  fs::remove_all(root, ec);
+}
+
+// THE RELEASED MiniMaxAI LAYOUT, through all THREE resolvers.
+//
+// MiniMaxAI publishes both partitions from ONE repo, so a fetch lands
+// them a level down -- <root>/FL2VA/transformer and <root>/Ref2VA/... --
+// and the models-DB record points at the repo root, because both records
+// share it. The root itself carries no model_index.json, no config.json,
+// no transformer/ and no diffusion_models/: every probe a resolver
+// naturally reaches for is one directory too high.
+//
+// The DiT loader has always walked down to the partition. model-quantize
+// has its OWN resolver, and it did not -- so pointing src_model at the
+// registry key resolved to the root, missed every rung, and fell through
+// to the LANGUAGE-model quantizer, which reported `arch='unknown'
+// layer_prefix='' n_layers=0` and then "no submodule matching target
+// 'dit'". Two messages that both read as "this family is unsupported"
+// for a family this build fully supports.
+//
+// That resolver was unreachable from a test, which is the reason it
+// could drift twice. It is reachable now, and this asserts the two agree
+// on the shape that separated them.
+TEST(minimax_h3_comfy, the_released_partition_layout_resolves_for_quantize)
+{
+  const fs::path root = scratch_() / "minimaxai-repo";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+
+  auto write_partition_ = [&](const char* part) {
+    const fs::path p = root / part;
+    fs::create_directories(p / "transformer");
+    std::ofstream mi(p / "model_index.json");
+    mi << "{\"transformer\": [\"diffusers\", \"MiniMaxH3DiTModel\"]}";
+    std::ofstream cf(p / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+  };
+  write_partition_("FL2VA");
+  write_partition_("Ref2VA");
+
+  // The root really is bare -- if any of these ever appears, the rungs
+  // above would catch it and this test would stop testing the rung it
+  // was written for.
+  ASSERT_TRUE(!fs::exists(root / "model_index.json"));
+  ASSERT_TRUE(!fs::exists(root / "config.json"));
+  ASSERT_TRUE(!fs::is_directory(root / "transformer", ec));
+  ASSERT_TRUE(!fs::is_directory(root / "diffusion_models", ec));
+
+  // The loader, which always knew.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string(),
+                                                         "fl2va") ==
+              (root / "FL2VA" / "transformer").string());
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string(),
+                                                         "ref2va") ==
+              (root / "Ref2VA" / "transformer").string());
+
+  // model-quantize, which did not. The family matters as much as the
+  // path: it is what routes the source to the DiT quantizer instead of
+  // the LM one.
+  {
+    std::string fam;
+    const std::string d = ModelQuantizeStage::resolve_source_dit_dir(
+        root.string(), &fam, "fl2va");
+    EXPECT_TRUE(d == (root / "FL2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+  {
+    std::string fam;
+    const std::string d = ModelQuantizeStage::resolve_source_dit_dir(
+        root.string(), &fam, "ref2va");
+    EXPECT_TRUE(d == (root / "Ref2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+  // Untold, both resolvers prefer FL2VA -- the historical answer, so a
+  // graph written before Ref2VA existed keeps resolving as it did.
+  {
+    std::string fam;
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    root.string(), &fam) ==
+                (root / "FL2VA" / "transformer").string());
+  }
+  // Pointing at the partition directly still works -- it is the rung
+  // above, and it is what unblocked this by hand.
+  {
+    std::string fam;
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    (root / "FL2VA").string(), &fam) ==
+                (root / "FL2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+
+  // A directory that is NOT a DiT of any family must still resolve to
+  // nothing. The new rung delegates to a resolver that answers with the
+  // path it was handed when it matches nothing, so without the family
+  // confirmation this would claim every directory in the world.
+  {
+    const fs::path plain = scratch_() / "not-a-dit";
+    fs::remove_all(plain, ec);
+    fs::create_directories(plain);
+    std::ofstream f(plain / "config.json");
+    f << "{\"model_type\": \"qwen3\"}";
+    f.close();
+    std::string fam = "sentinel";
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    plain.string(), &fam).empty());
+    EXPECT_TRUE(fam.empty());
+    fs::remove_all(plain, ec);
+  }
+
+  std::printf("[minimax_h3_comfy] the released partition layout resolves "
+              "for the loader and for model-quantize\n");
   fs::remove_all(root, ec);
 }

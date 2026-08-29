@@ -60,8 +60,12 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   else                       { _mode = 0; }   // pad (default)
 
   const string alg = attr_str("algorithm");
-  if      (alg == "lanczos")  { _alg = 1; }
-  else                        { _alg = 0; }   // bilinear (default)
+  // LANCZOS unless bilinear is asked for by name. The fallback is the
+  // DEFAULT, so it has to be the declared one -- attr_str() hands back
+  // `def_str` for an absent key, but a key set to "" reaches here empty
+  // and would otherwise land on whichever branch the else happened to be.
+  if      (alg == "bilinear") { _alg = 0; }
+  else                        { _alg = 1; }   // lanczos (default)
   // Deferred validation: the ctor never throws (Stage::fail_config).
   // At least one of width / height must be positive; a missing (<= 0)
   // axis is inferred per-frame from the source aspect ratio.
@@ -105,10 +109,13 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "manual: resample ratio (output px per source px, > 0)",
    .def_real = 1.0},
   {.key = "algorithm", .type = ConfigType::String,
-   .doc = "interpolation algorithm: 'bilinear' (fast) | 'lanczos' "
-          "(Lanczos-3, anti-aliased, matches PIL LANCZOS -- prefer for "
-          "downscaling)",
-   .def_str = "bilinear"},
+   .doc = "interpolation algorithm: 'lanczos' (the DEFAULT -- Lanczos-3, "
+          "anti-aliased, matches PIL LANCZOS) | 'bilinear' (cheaper, and "
+          "aliases when downscaling). Most traffic through this stage is a "
+          "downscale onto a model's input canvas, where bilinear keeps the "
+          "high frequencies it should be removing -- so the good filter is "
+          "the default and the fast one is opted into",
+   .def_str = "lanczos"},
 };
 const PortSpec kIports[] = {
   {.name = "frames", .doc = "planar RGB TensorBeat [3,H,W] (u8 or f32)",
@@ -125,9 +132,11 @@ const StageSpec kSpec = {
   .type_name = "image-resample",
   .doc       = "Resample rgb-frames to a fixed width x height, with a "
                "configurable aspect-ratio fit (pad / crop / stretch / "
-               "manual) and pad colour. u8 frames use the letterbox GPU "
-               "kernel; f32 uses a CPU bilinear fallback. iport and oport "
-               "share one clock domain (1:1).",
+               "manual) and pad colour. Resamples with Lanczos-3 by "
+               "default; 'bilinear' is available and cheaper. u8 frames go "
+               "through the GPU letterbox kernel, f32 through a CPU path "
+               "that implements BOTH filters. iport and oport share one "
+               "clock domain (1:1).",
   .display_name = "Resample",
   .category  = StageCategory::Visual,
   .iports    = kIports,

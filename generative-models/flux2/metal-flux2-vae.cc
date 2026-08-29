@@ -1,3 +1,4 @@
+#include "generative-models/shared/mma-tile.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 
 #include "common/flex-data.h"
@@ -1084,7 +1085,17 @@ MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
     // dense_gemm_mma tensors are column-major (the row dim's stride is K for x /
     // N for y), so a contiguous r0*K / r0*N ELEMENT offset (x2 for f16 bytes)
     // selects rows [r0, r0+mc). _mma_max_m == 0 disables the split (A/B).
-    const int chunk = (_mma_max_m > 0 && M > _mma_max_m) ? _mma_max_m : M;
+    // The chunk also has to keep every OPERAND's byte span under 2^31 --
+    // the row cap above bounds the destination (cout) and not the im2col
+    // SOURCE, whose K is 9*cin here. Safe by geometry at every resolution
+    // this decodes today (M and K trade off inversely in a 2D VAE, so
+    // cin=512's K=4608 only meets M=2^18 at ~4096px output), which is
+    // exactly why it needs a guard rather than a comment. See
+    // shared/mma-tile.h; MiniMax-H3 and the Wan VAE each reached this
+    // line from a different side.
+    const int chunk = std::min(
+        (_mma_max_m > 0 && M > _mma_max_m) ? _mma_max_m : M,
+        mma_row_band(N, K));
     for (int r0 = 0; r0 < M; r0 += chunk) {
       const int mc = (M - r0 < chunk) ? (M - r0) : chunk;
       enc.set_function(deep ? _fn_dense_mma_deep : _fn_dense_mma);

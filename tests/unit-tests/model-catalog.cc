@@ -4,6 +4,8 @@
 #include "common/flex-data.h"
 
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -1024,4 +1026,121 @@ TEST(model_catalog, several_models_can_share_one_repo) {
 
   std::printf("[model_catalog] Comfy-Org/MiniMax-H3 publishes %zu models, "
               "vpipe-supplement %zu\n", h3.size(), sup.size());
+}
+
+// THE SHIPPED PREPARE PIPELINES NAME A MODEL THAT WILL EXIST.
+//
+// docs/pipelines/prepare-*.vpipeline fetch a model and then quantize it,
+// and the second stage names the first stage's result by its DB KEY. The
+// key is not the repo path: model-fetch registers under `model_key` when
+// set, else the catalogue entry's `name`, else the hf path -- so for any
+// repo publishing more than one model, where the catalogue gives each a
+// distinct name, the repo path is exactly the string that will NOT
+// resolve.
+//
+// prepare-minimax-h3-8bit shipped that way. Its fetch pulled
+// Comfy-Org/MiniMax-H3 with model_variant=fl2va, which registers as
+// "Comfy-Org/MiniMax-H3-FL2VA", and its quantize asked for
+// "Comfy-Org/MiniMax-H3" -- so the fetch succeeded and the quantize
+// could not find its input. Both Ref2VA siblings had it right, which is
+// what made it a one-file slip rather than a misunderstanding.
+//
+// Nothing else reads these files: they are documentation, so a wrong key
+// is invisible until a user runs one. This walks them instead.
+TEST(model_catalog, shipped_prepare_pipelines_name_a_resolvable_model)
+{
+#ifndef VPIPE_DOCS_PIPELINES_DIR
+  std::printf("[catalog] no docs dir defined; skipped\n");
+#else
+  namespace fs = std::filesystem;
+  const fs::path dir(VPIPE_DOCS_PIPELINES_DIR);
+  if (!fs::is_directory(dir)) {
+    std::printf("[catalog] %s is not a directory; skipped\n",
+                dir.string().c_str());
+    return;
+  }
+  // The key a model-fetch stage will register under, by the same rule
+  // model-fetch-stage.cc applies.
+  auto fetch_key = [](const std::string& path, const std::string& key,
+                      const std::string& variant) {
+    if (!key.empty()) { return key; }
+    const ModelCatalogEntry* hit = nullptr;
+    for (const ModelCatalogEntry& e : model_catalog()) {
+      if (e.hf_path != path) { continue; }
+      if (variant.empty()) { hit = &e; break; }
+      // model_variant is matched against several descriptive fields; for
+      // this check a case-insensitive substring over them is enough to
+      // pick the entry the fetch would.
+      auto has = [&](const std::string& f) {
+        if (f.empty()) { return false; }
+        std::string a = f, b = variant;
+        std::transform(a.begin(), a.end(), a.begin(), ::tolower);
+        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        return a.find(b) != std::string::npos;
+      };
+      if (has(e.version) || has(e.variant) || has(e.name) ||
+          has(e.model_type)) {
+        hit = &e;
+        break;
+      }
+    }
+    if (hit != nullptr && !hit->name.empty()) { return hit->name; }
+    return path;
+  };
+
+  int checked = 0;
+  for (const fs::directory_entry& de : fs::directory_iterator(dir)) {
+    const std::string fn = de.path().filename().string();
+    if (fn.rfind("prepare-", 0) != 0) { continue; }
+    if (de.path().extension() != ".vpipeline") { continue; }
+    std::string txt, line;
+    {
+      std::ifstream in(de.path());
+      while (std::getline(in, line)) { txt += line + "\n"; }
+    }
+    FlexData fd = FlexData::from_json(txt);
+    auto root = fd.as_object();
+    // A malformed example pipeline is its own failure, and a silent
+    // `continue` here would let one hide the rest of the file's checks.
+    EXPECT_TRUE(root.contains("stages"));
+    if (!root.contains("stages")) { continue; }
+    const FlexData stages = root.at("stages");
+    // Keys a stage in THIS pipeline produces, so a later src_model may
+    // name an intermediate that does not exist on disk yet.
+    std::vector<std::string> produced;
+    for (const FlexData& st : stages.as_array()) {
+      auto o = st.as_object();
+      if (!o.contains("config")) { continue; }
+      const FlexData cfg = o.at("config");
+      auto c = cfg.as_object();
+      auto str = [&](const char* k) {
+        return c.contains(k) ? std::string(c.at(k).as_string("")) : "";
+      };
+      const std::string type = std::string(o.at("type").as_string(""));
+      if (type == "model-fetch") {
+        produced.push_back(fetch_key(str("model_path"), str("model_key"),
+                                     str("model_variant")));
+        continue;
+      }
+      if (type != "model-quantize") { continue; }
+      const std::string src = str("src_model");
+      if (src.empty()) { continue; }
+      const bool from_pipeline =
+          std::find(produced.begin(), produced.end(), src) != produced.end();
+      if (!from_pipeline) {
+        std::printf("[catalog] %s: quantize src_model '%s' is neither a key "
+                    "an earlier stage registers nor its output\n",
+                    fn.c_str(), src.c_str());
+      }
+      EXPECT_TRUE(from_pipeline);
+      ++checked;
+      if (!str("output_name").empty()) {
+        produced.push_back(str("output_name"));
+      }
+    }
+  }
+  std::printf("[catalog] %d quantize stages across the shipped prepare "
+              "pipelines name a model an earlier stage produces\n", checked);
+  EXPECT_TRUE(checked > 0);
+#endif
 }

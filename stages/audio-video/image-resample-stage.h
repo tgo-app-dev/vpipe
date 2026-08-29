@@ -60,7 +60,7 @@ public:
 private:
   int          _out_w{}, _out_h{};  // 0 on either axis = infer from AR
   int          _mode{};            // 0 pad, 1 crop, 2 stretch, 3 manual
-  int          _alg{};             // 0 bilinear, 1 lanczos
+  int          _alg{1};            // 0 bilinear, 1 lanczos (the default)
   int          _src_x{}, _src_y{}; // manual source origin
   double       _scale{};           // manual resample ratio
   std::uint8_t _pad_r{}, _pad_g{}, _pad_b{};

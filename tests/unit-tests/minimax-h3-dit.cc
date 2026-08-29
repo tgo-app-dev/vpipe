@@ -1505,6 +1505,261 @@ TEST(minimax_h3_dit, tuned_routes_are_shared_above_the_tune_ceiling)
   EXPECT_TRUE(m->qmm_tune_count() == 1);
 }
 
+// IS THE FORWARD DETERMINISTIC AT A VIDEO GEOMETRY?
+//
+// A 1376x768x243 generation returns whole-latent noise in both video and
+// audio, while 175 and 209 frames are clean, and the author's own reading
+// is that it may not fail EVERY time. Every kernel on the block path has
+// been probed in isolation at and past that height and none of them
+// moves -- elementwise, norms, rope, all five GEMM arms, the band loop,
+// the matmul2d destination cliff, attention against float64, arena
+// subviews past 4 GB, and the LoRA pair. So what is left is not a kernel:
+// it is composition, and pressure.
+//
+// Neither reproduces in a kernel probe. Composition needs the real
+// aliasing (ff over qh|kh|vh|oh, proj over ob) driven by the real block
+// loop; pressure needs the real streamed checkpoint competing with ~10 GB
+// of activation scratch on a box that has 24. This runs the actual
+// forward TWICE on the same input and diffs it bit-exact, which catches
+// both without needing to know which:
+//
+//   * a race, or a shared scratch read after the next writer touched it,
+//     is a different answer on the second run
+//   * a purged or parked page returning zeros is a different answer
+//   * an uninitialised read is a different answer
+//   * a deterministic index bug is NOT caught here -- it would produce
+//     the same wrong bytes twice -- which is exactly why the kernel
+//     probes came first
+//
+// It needs no golden and no reference implementation, and one forward is
+// a fraction of a generation, so it is affordable on the box that
+// actually reproduces the corruption where a full run is not.
+//
+// GEOMETRY FROM THE ENV, because the box that reproduces this is not the
+// box this was written on. The defaults are the failing clip: 1376x768 is
+// a 86x48 latent, 243 frames is 72 latent frames, and 243/24 s at 40
+// latents/second is 405 audio latents.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, VPIPE_H3_DETERMINISM=1,
+// and optionally VPIPE_H3_DET_{LATF,LATH,LATW,AUD,LAYERS,RUNS}.
+TEST(minimax_h3_dit, forward_is_deterministic_at_video_heights)
+{
+  if (std::getenv("VPIPE_H3_DETERMINISM") == nullptr) { return; }
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int latf   = envi("VPIPE_H3_DET_LATF", 72);    // 243 frames
+  const int lath   = envi("VPIPE_H3_DET_LATH", 48);    // 768 / 16
+  const int latw   = envi("VPIPE_H3_DET_LATW", 86);    // 1376 / 16
+  const int naud   = envi("VPIPE_H3_DET_AUD", 405);    // 243/24 s x 40
+  const int ntext  = envi("VPIPE_H3_DET_TEXT", 16);
+  const int runs   = envi("VPIPE_H3_DET_RUNS", 2);
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_dit] config: %s\n", cerr.c_str());
+    return;
+  }
+  // FOUR BLOCKS by default, not the whole stack.
+  //
+  // The full stack was the original default, on the reasoning that only
+  // it reproduces a real generation's memory pressure. That reasoning
+  // was right and the default was still wrong: reproducing the pressure
+  // means loading the entire checkpoint beside ~10 GB of scratch, and on
+  // the 24 GB box that actually shows the bug it took the machine down.
+  // A test that can only demonstrate the failure by causing it is not a
+  // test, it is the failure.
+  //
+  // Four blocks still exercise composition, the arena aliasing and the
+  // slot alternation, which is what a kernel probe cannot reach. The
+  // pressure half belongs to instrumenting a real run, not to
+  // manufacturing it here.
+  const int meta_layers = cfg.n_layers;
+  cfg.n_layers = envi("VPIPE_H3_DET_LAYERS", 4);
+
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(
+      text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
+      h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  std::printf("[minimax_h3_dit] determinism: seq %d (%d text + %d cond + "
+              "%d audio + %d video), %d blocks, %d runs\n", L.seq_len,
+              L.num_text_rows, L.num_condition_rows, L.num_audio_rows,
+              L.num_video_rows, cfg.n_layers, runs);
+  {
+    const std::size_t sc = MetalMiniMaxH3Transformer::scratch_bytes(
+        cfg, L.seq_len, L.num_text_rows, (int)uniq.size(), true);
+    const auto b = mc->memory_budget();
+    std::printf("[minimax_h3_dit] scratch estimate %.2f GB; headroom %.2f "
+                "GB, available physical %.2f GB\n",
+                (double)sc / 1073741824.0,
+                (double)b.headroom / 1073741824.0,
+                (double)b.available_physical / 1073741824.0);
+    // REFUSE A GEOMETRY THIS BOX CANNOT HOLD, rather than finding out by
+    // running it. The scratch is mlock-WIRED, so the kernel cannot
+    // reclaim it under pressure: an over-commit here does not fail the
+    // process, it takes the machine down. Asked before the model loads,
+    // because by then the weights are resident too.
+    //
+    // Two gigabytes of margin covers the trunk, the block slots and the
+    // dequant scratch, none of which are in `sc`. VPIPE_H3_DET_FORCE
+    // overrides for a box with room to spare -- and is deliberately not
+    // something the geometry knobs imply.
+    // The WEIGHTS TOO, which the first version of this check left out --
+    // and they are the larger term whenever n_layers is more than a
+    // handful. A block of this model is ~0.6 GB at 8 bits, the trunk and
+    // the embedders are another couple, and scratch_bytes() knows about
+    // none of it. Leaving them out is what let a full-stack run at the
+    // video geometry look affordable when it was three times the box.
+    std::size_t weights = 0;
+    {
+      namespace fs = std::filesystem;
+      std::error_code wec;
+      for (const auto& de : fs::recursive_directory_iterator(
+               fs::path(root), fs::directory_options::skip_permission_denied,
+               wec)) {
+        if (wec) { break; }
+        if (de.is_regular_file(wec) &&
+            de.path().extension() == ".safetensors") {
+          weights += (std::size_t)de.file_size(wec);
+        }
+      }
+      // Blocks scale with the stack this run asks for; the trunk, the
+      // embedders and the two heads do not, so they get a flat two
+      // gigabytes on top. Both terms err HIGH on purpose -- the
+      // checkpoint directory may hold more than the one partition being
+      // read, and an under-estimate here is what takes a box down.
+      const double frac = meta_layers > 0
+                              ? (double)cfg.n_layers / (double)meta_layers
+                              : 1.0;
+      weights = (std::size_t)((double)weights * std::min(1.0, frac)) +
+                ((std::size_t)2 << 30);
+    }
+    // Idle physical, not `available_physical`: the latter counts
+    // file-backed and purgeable pages the OS *could* reclaim, which on a
+    // box already deep in swap reads as room that does not exist.
+    // free_physical is free + purgeable + speculative and deliberately
+    // EXCLUDES the file cache -- which is what makes it the right number
+    // here. available_physical counts clean file pages as room, and on a
+    // box already deep in swap that reads as space which does not exist.
+    const std::size_t idle = b.free_physical != 0 ? b.free_physical
+                                                  : b.available_physical;
+    const std::size_t margin = (std::size_t)3 << 30;
+    const std::size_t need = sc + weights;
+    std::printf("[minimax_h3_dit] need ~%.2f GB (scratch %.2f + weights "
+                "~%.2f); idle physical %.2f GB\n",
+                (double)need / 1073741824.0, (double)sc / 1073741824.0,
+                (double)weights / 1073741824.0,
+                (double)idle / 1073741824.0);
+    if (std::getenv("VPIPE_H3_DET_FORCE") == nullptr &&
+        idle != 0 && need + margin > idle) {
+      std::printf("[minimax_h3_dit] SKIPPED: ~%.2f GB needed plus %.0f GB "
+                  "of margin does not fit in %.2f GB idle. Lower "
+                  "VPIPE_H3_DET_LAYERS or VPIPE_H3_DET_LATF; do NOT reach "
+                  "for VPIPE_H3_DET_FORCE on a box that is already "
+                  "swapping.\n", (double)need / 1073741824.0,
+                  (double)margin / 1073741824.0,
+                  (double)idle / 1073741824.0);
+      return;
+    }
+  }
+
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.audio_indices.size() * cfg.audio_channels,
+               0.031f));
+  const SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)ntext * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  if (m == nullptr) { std::printf("[minimax_h3_dit] load failed\n"); }
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Step step;
+  step.video  = &vb;
+  step.audio  = &ab;
+  step.text   = &tb;
+  step.layout = &L;
+  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+
+  // Raw bf16 both times: the claim is that the bytes are identical, so
+  // they are compared as bytes. A float compare would let a NaN pass as
+  // equal to itself, and NaN is one of the things being looked for.
+  std::vector<std::uint16_t> ref_v, ref_a;
+  bool diverged = false;
+  for (int r = 0; r < runs; ++r) {
+    std::string ferr;
+    const auto t0 = std::chrono::steady_clock::now();
+    MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (out.empty()) { std::printf("[minimax_h3_dit] %s\n", ferr.c_str()); }
+    ASSERT_TRUE(!out.empty());
+    if (out.empty()) { return; }
+    auto copy = [](const SharedBuffer& b) {
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      return std::vector<std::uint16_t>(p, p + b.byte_size() / 2);
+    };
+    std::vector<std::uint16_t> v = copy(out.video), a = copy(out.audio);
+    // A finite, non-degenerate velocity is its own check: an all-zero or
+    // all-NaN output would otherwise be perfectly reproducible.
+    std::size_t bad_v = 0;
+    double l2 = 0.0;
+    for (std::uint16_t h : v) {
+      const float f = bf16_to_f32_(h);
+      if (!std::isfinite(f)) { ++bad_v; }
+      else { l2 += (double)f * (double)f; }
+    }
+    l2 = std::sqrt(l2 / (double)(v.empty() ? 1 : v.size()));
+    const auto b = mc->memory_budget();
+    std::printf("[minimax_h3_dit]   run %d: %8.0f ms  rms %.6f  non-finite "
+                "%zu  scratch %.2f GB  avail %.2f GB\n", r, ms, l2, bad_v,
+                (double)m->scratch_resident_bytes() / 1073741824.0,
+                (double)b.available_physical / 1073741824.0);
+    EXPECT_TRUE(bad_v == 0);
+    if (r == 0) { ref_v = std::move(v); ref_a = std::move(a); continue; }
+    std::size_t dv = 0, da = 0;
+    for (std::size_t i = 0; i < v.size() && i < ref_v.size(); ++i) {
+      if (v[i] != ref_v[i]) { ++dv; }
+    }
+    for (std::size_t i = 0; i < a.size() && i < ref_a.size(); ++i) {
+      if (a[i] != ref_a[i]) { ++da; }
+    }
+    if (dv != 0 || da != 0) {
+      diverged = true;
+      std::printf("[minimax_h3_dit]   run %d DIFFERS from run 0: video %zu "
+                  "of %zu, audio %zu of %zu\n", r, dv, v.size(), da,
+                  a.size());
+    }
+    EXPECT_TRUE(dv == 0 && da == 0);
+  }
+  std::printf("[minimax_h3_dit] determinism: %s over %d runs\n",
+              diverged ? "NOT REPRODUCIBLE" : "identical", runs);
+}
+
 // Attention must compute the same thing whichever of its four
 // activations it addresses in place.
 //
@@ -1832,11 +2087,18 @@ TEST(minimax_h3_dit, streamed_slots_match_per_block_loads)
   // Raw bf16 words, not floats: this is an exactness check, so nothing
   // should pass through a conversion that could round two different
   // values to one.
-  auto arm = [&](bool slots, std::vector<std::uint16_t>* out_v,
+  // mode 0 = the slot PAIR, 1 = slots OFF (per-block allocations),
+  // 2 = SINGLE slot -- which is what a box takes when the budget refuses
+  // the second slot, and a path neither of the original two arms reaches.
+  int pf_started = 0, pf_hit = 0;
+  bool saw_pair = false;
+  auto arm = [&](int mode, std::vector<std::uint16_t>* out_v,
                  std::vector<std::uint16_t>* out_a) {
     ::setenv("VPIPE_H3_STREAM", "1", 1);
-    if (slots) { ::unsetenv("VPIPE_H3_NO_SLOTS"); }
-    else       { ::setenv("VPIPE_H3_NO_SLOTS", "1", 1); }
+    if (mode == 1) { ::setenv("VPIPE_H3_NO_SLOTS", "1", 1); }
+    else           { ::unsetenv("VPIPE_H3_NO_SLOTS"); }
+    if (mode == 2) { ::setenv("VPIPE_H3_SINGLE_SLOT", "1", 1); }
+    else           { ::unsetenv("VPIPE_H3_SINGLE_SLOT"); }
     auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
     if (m == nullptr) { return false; }
     // The GEMM route is chosen by MEASUREMENT, so two loads of the same
@@ -1864,15 +2126,58 @@ TEST(minimax_h3_dit, streamed_slots_match_per_block_loads)
     *out_v = raw(v.video, (std::size_t)n_video * cfg.video_patch_elems());
     *out_a = raw(v.audio,
                  (std::size_t)L.audio_indices.size() * cfg.audio_channels);
+    pf_started = m->prefetch_started();
+    pf_hit     = m->prefetch_hits();
+    saw_pair   = m->slot_pair();
+    std::printf("[minimax_h3_dit] slots mode %d: pair=%d prefetch %d/%d "
+                "hit\n", mode, saw_pair ? 1 : 0, pf_hit, pf_started);
     return true;
   };
 
-  std::vector<std::uint16_t> sv, sa, pv, pa;
-  const bool ok_s = arm(true, &sv, &sa);
-  const bool ok_p = arm(false, &pv, &pa);
+  std::vector<std::uint16_t> sv, sa, pv, pa, gv, ga;
+  const bool ok_s = arm(0, &sv, &sa);
+  const int pair_started = pf_started, pair_hit = pf_hit;
+  const bool was_pair = saw_pair;
+  const bool ok_p = arm(1, &pv, &pa);
+  const bool ok_g = arm(2, &gv, &ga);
+  const int single_started = pf_started, single_hit = pf_hit;
+  const bool single_pair = saw_pair;
   ::unsetenv("VPIPE_H3_NO_SLOTS");
+  ::unsetenv("VPIPE_H3_SINGLE_SLOT");
   ::unsetenv("VPIPE_H3_STREAM");
-  ASSERT_TRUE(ok_s && ok_p);
+  ASSERT_TRUE(ok_s && ok_p && ok_g);
+
+  // THE SINGLE-SLOT ARM IS A THIRD PATH, and it has to be the same
+  // function as the other two. A box tight enough to refuse the second
+  // slot takes it without saying so, which is why it needs forcing to be
+  // testable at all.
+  {
+    std::size_t dv = 0, da = 0;
+    for (std::size_t i = 0; i < gv.size() && i < sv.size(); ++i) {
+      if (gv[i] != sv[i]) { ++dv; }
+    }
+    for (std::size_t i = 0; i < ga.size() && i < sa.size(); ++i) {
+      if (ga[i] != sa[i]) { ++da; }
+    }
+    if (dv != 0 || da != 0) {
+      std::printf("[minimax_h3_dit] SINGLE-SLOT DIFFERS from the pair: "
+                  "video %zu of %zu, audio %zu of %zu\n", dv, gv.size(), da,
+                  ga.size());
+    }
+    EXPECT_TRUE(dv == 0 && da == 0);
+  }
+  // And the prefetch has to be ACCOUNTED FOR. A read issued and never
+  // consumed is not merely wasted: on the fallback destination the block
+  // it filled stays live for the rest of the forward, which is a block's
+  // worth of memory added on exactly the runs that were already too tight
+  // to afford a second slot. `started == hit` is the property; a run that
+  // issued nothing trivially has it.
+  std::printf("[minimax_h3_dit] pair(pair=%d) %d/%d, single(pair=%d) %d/%d\n",
+              was_pair ? 1 : 0, pair_hit, pair_started,
+              single_pair ? 1 : 0, single_hit, single_started);
+  EXPECT_TRUE(single_pair == false);          // the force took effect
+  EXPECT_TRUE(pair_hit == pair_started);
+  EXPECT_TRUE(single_hit == single_started);
   ASSERT_TRUE(!sv.empty() && !sa.empty());
   EXPECT_TRUE(sv.size() == pv.size());
   EXPECT_TRUE(sa.size() == pa.size());
