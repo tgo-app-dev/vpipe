@@ -55,11 +55,37 @@ namespace vpipe {
 // PCM beat, and `audio-segment` / `audio-transcribe` only ever compare
 // those to each other -- so a consistent media clock is what they need.
 //
+// ---- START AND DURATION ----
+//
+// `start_s` seeks before the first packet and `duration_s` bounds how
+// much is read, so a graph can work on a WINDOW of a long file without
+// decoding the whole thing:
+//
+//   start_s: 45.0, duration_s: 30.0   -- 45 s in, half a minute out
+//
+// Both are PACKET-accurate here, which is as exact as a demuxer can be.
+// The seek lands on the packet at or before `start_s`, and this stage
+// then drops packets that end at or before it -- safe for audio, whose
+// packets are independently decodable, and the reason load-video cannot
+// do the same for its video stream (see that header). So the first
+// sample is within one packet -- ~23 ms for AAC at 44.1 kHz -- of what
+// was asked for, and the last packet may straddle the end rather than
+// stop on it.
+//
+// TIMESTAMPS STAY MEDIA TIME FROM THE START OF THE FILE. A window
+// starting at 45 s emits `start_utc` = 45 s, not 0. Rebasing would make
+// the same samples carry different times depending on the window they
+// were read in, and `audio-segment` / `audio-transcribe` only ever
+// compare these to each other.
+//
 // Configuration (FlexData object on the 4th constructor parameter):
 //   input_url        (string, required)  -- file path or URL
 //   stream_index     (int, default -1)   -- ABSOLUTE stream index, video
 //                                           streams included; -1 = the first
 //                                           audio stream
+//   start_s          (real, default 0)   -- seek to this media time first
+//   duration_s       (real, default 0)   -- stop this many seconds past
+//                                           start_s; 0 = read to EOF
 //   read_timeout_ms  (int, default 0)    -- network open/read timeout
 //   options          (object<string,string>) -- av_dict for the open
 class LoadAudioStage final : public TypedStage<LoadAudioStage> {
@@ -95,13 +121,25 @@ public:
 private:
   void open_input_();
   std::string av_err_(int rc) const;
+  // The configured window, for the open log; empty when there is none.
+  std::string window_doc_() const;
 
   const FFmpegLibraries* _libs = nullptr;
 
   std::string _input_url;
   int         _stream_index   = -1;
   int         _read_timeout_ms = 0;
+  double      _start_s        = 0.0;
+  double      _duration_s     = 0.0;
   FlexData    _open_options;
+
+  // The window in MEDIA microseconds, resolved once from the config.
+  // `_stop_us` is 0 when `duration_s` is 0, meaning "to EOF" -- a
+  // sentinel and not a time, so it is compared against only when
+  // `_has_stop` says it is one.
+  std::int64_t _start_us = 0;
+  std::int64_t _stop_us  = 0;
+  bool         _has_stop = false;
 
   AVFormatContext* _fctx = nullptr;
   AVPacket*        _pkt  = nullptr;

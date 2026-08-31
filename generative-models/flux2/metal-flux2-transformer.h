@@ -2,6 +2,7 @@
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/runtime-lora.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
@@ -174,9 +175,28 @@ class MetalFlux2Transformer {
   // What replaces it measures: admission against the live budget, a
   // probe read off the room actually free, doubling while the box stays
   // healthy, and a shed the moment the pages kept are found outside RAM.
+  // A runtime adapter. RUNTIME rather than fused because fusing writes
+  // A*B into the base weights, and this base is QUANTIZED -- so the sum
+  // is rounded back to 4/8-bit affine, which is exactly the precision a
+  // small correction cannot spare. Runtime also makes the strength a
+  // knob rather than a rebuild.
+  //
+  // Named at LOAD because it changes how the weights are BUILT. FLUX.2
+  // has TWO fused projections a pre-activation delta cannot reach --
+  // `ff.linear_in` (gate|up, interleaved for the fused-SwiGLU epilogue)
+  // and the single blocks' `to_qkv_mlp_proj` (sliced into an attention
+  // qkv and an interleaved gate|up) -- so an adapter that names either
+  // has to be known before the blocks are built. See the `_fuse_ff`
+  // gate in the loader.
+  struct LoraSpec {
+    std::string path;          // one .safetensors of lora_A/B pairs
+    float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
+  };
+
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const LoraSpec* lora = nullptr);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -184,7 +204,39 @@ class MetalFlux2Transformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalFlux2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const LoraSpec* lora = nullptr);
+
+  // How many projections carry a runtime adapter (0 = none attached).
+  int lora_modules() const { return _lora_modules; }
+
+  // The adapter's strength, per FORWARD. Live because it can be: the
+  // factors are the adapter's and the strength is the request's, so it
+  // rides the GEMM as a constant rather than being folded into A.
+  // Turning it costs nothing and needs no reload. 0 skips both GEMMs, so
+  // "off" is exactly off.
+  void set_lora_scale(float s) { _lora_scale = s; }
+  float lora_scale() const { return _lora_scale; }
+
+  // Every projection a runtime adapter can name, and the base dims its
+  // factors have to fit, for a model of this shape.
+  //
+  // Public and static so the names can be checked against a real
+  // checkpoint without loading one -- a module name that matches
+  // nothing binds nothing, which is indistinguishable at runtime from
+  // an adapter that had no effect. Derived from the same tables
+  // bind_lora_ walks, so the two cannot drift apart.
+  struct LoraModule {
+    std::string name;          // `<name>.weight` is the base tensor
+    int         n = 0, k = 0;  // out, in
+  };
+  static std::vector<LoraModule> lora_module_list(const Config& cfg);
+
+  // Does `path` name a projection the fused paths would swallow? Public
+  // and static for the same reason: it is the FLUX.2-specific half of
+  // the adapter contract, it reads only a file header, and getting it
+  // wrong costs an adapter that silently does not apply.
+  static bool lora_forbids_fusion(const std::string& path);
 
   ~MetalFlux2Transformer();
 
@@ -527,6 +579,54 @@ class MetalFlux2Transformer {
       _fn_qmm_swiglu4_bm64_rs_a16, _fn_qmm_swiglu8_bm64_rs_a16, _fn_swiglu_rs;
   bool _fuse_ff = false;
   bool _ff_acc16 = true;
+
+  // ---- runtime LoRA ------------------------------------------------
+  //
+  // The module names ARE the diffusers spelling, which is what the
+  // checkpoint itself carries -- the double blocks keep to_q / to_k /
+  // to_v / to_out.0 and their add_* twins split, and the single blocks
+  // really do have ONE Linear named `to_qkv_mlp_proj` in the model, not
+  // three that this loader happened to fuse. So an adapter trained
+  // against diffusers names the same modules this binds, and nothing
+  // has to be de-fused to find them.
+  //
+  // Scope is the transformer BLOCKS. The embedders, the shared
+  // modulation and proj_out are deliberately not bound: no style
+  // adapter touches them, and the ones that do (control adapters that
+  // widen x_embedder's input) change a SHAPE, which is a different
+  // conversation than a rank-r side GEMM.
+  struct DoubleLora {
+    genai::lora::Factors q, k, v, o;          // image attention
+    genai::lora::Factors aq, ak, av, ao;      // text attention
+    genai::lora::Factors ff_in, ff_out;       // image FF
+    genai::lora::Factors cff_in, cff_out;     // text FF
+  };
+  struct SingleLora {
+    genai::lora::Factors qkv_mlp, o;
+  };
+  // The tables. Each row names a module, the base dims its factors must
+  // fit, the block it belongs to, and WHERE the factors land -- so
+  // nothing has to be kept in step by hand between a name and its
+  // destination.
+  struct DoubleLoraModule {
+    std::string name;
+    int n = 0, k = 0, block = 0;
+    genai::lora::Factors DoubleLora::*dst = nullptr;
+  };
+  struct SingleLoraModule {
+    std::string name;
+    int n = 0, k = 0, block = 0;
+    genai::lora::Factors SingleLora::*dst = nullptr;
+  };
+  static std::vector<DoubleLoraModule> lora_double_modules_(const Config& c);
+  static std::vector<SingleLoraModule> lora_single_modules_(const Config& c);
+  bool bind_lora_(const LoraSpec& spec, std::string* err);
+  std::vector<DoubleLora> _lora_double;
+  std::vector<SingleLora> _lora_single;
+  genai::lora::Applier    _lora;
+  int   _lora_modules  = 0;
+  int   _lora_max_rank = 0;
+  float _lora_scale    = 1.0f;
 
   // Steel flash-attention (head_dim 128, GQA-aware). Best-effort; scalar SDPA
   // fallback when absent or VPIPE_FLUX2_NO_STEEL_ATTN is set.

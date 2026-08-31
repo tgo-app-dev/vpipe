@@ -322,6 +322,23 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
           "VideoRefEncoderStage('{}'): references must be a path or an array "
           "of paths", this->id()));
     }
+    // CONFINE every reference to the session file sandbox, the way
+    // load-image and load-text do with their own path arrays. This key
+    // declares itself a path (.is_path, so the composer's file browser
+    // fills it in) and was the only such key that never resolved one.
+    //
+    // A RELATIVE path was therefore left relative and opened against the
+    // process CWD, which under the web-ui sandbox is not the sandbox
+    // root -- so a path the file browser had just produced did not
+    // exist, while an absolute one worked. That asymmetry was the bug.
+    //
+    // An absolute path inside a granted prefix still passes through
+    // unchanged, so what worked keeps working; one outside it is
+    // re-rooted, which is the confinement this key already claimed and
+    // did not apply.
+    for (auto& p : _references) {
+      p = confine_local_(p, /*for_write=*/false);
+    }
     // An empty list is no longer a config error, because it is no
     // longer the only source: a graph may feed every reference through
     // the tensor iports instead, and whether those are wired is not

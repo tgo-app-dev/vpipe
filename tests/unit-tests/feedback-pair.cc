@@ -14,6 +14,7 @@
 #include "interfaces/ui-delegate-intf.h"
 #include "pipeline/feedback-rx-stage.h"
 #include "pipeline/feedback-tx-stage.h"
+#include "stages/audio-video/temporal-slice-stage.h"
 #include "stages/passthrough-stage.h"
 #include "stages/text-input-stage.h"
 #include "pipeline/pipeline-runtime.h"
@@ -21,6 +22,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "tests/unit-tests/payload-types.h"
+#include "apple-silicon/tensor-beat.h"
 
 #include <atomic>
 #include <chrono>
@@ -467,4 +469,360 @@ TEST(feedback_pair, spans_clock_domains_refused) {
 
   vpipe::PipelineRuntime rt(pl.get(), &sess);
   EXPECT_TRUE(!rt.launch());
+}
+
+namespace {
+
+// The shape of a real feedback LOOP, minus the models: the beat this
+// stage sends to the rx is caused by the beat it read from the tx, so
+// on round one there is nothing behind the edge and nobody can go
+// first. That is the deadlock `prime` exists to break, and it is the
+// only reason a graph like
+//
+//   video-ref-encoder -> generate-video -> vae-decode -> feedback-rx
+//   feedback-tx -------> video-ref-encoder (a reference port)
+//
+// cannot start.
+class FbLoopRelay : public vpipe::TypedStage<FbLoopRelay> {
+public:
+  static constexpr const char* kTypeName = "ut-fb-loop-relay";
+  using TypedStage::TypedStage;
+
+  std::mutex mu;
+  int  rounds  = 0;
+  int  limit   = 3;
+  std::vector<bool> saw_empty;   // was round k's inbound beat empty?
+
+  vpipe::Job
+  process(vpipe::RuntimeContext& ctx) override
+  {
+    auto in = co_await ctx.read(0);
+    if (!in) { ctx.signal_done(); co_return; }
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      bool empty = true;
+      if (const auto* tb =
+              dynamic_cast<const vpipe::TensorBeatPayload*>(in.get())) {
+        empty = tb->shape.empty() || tb->byte_size() == 0;
+      }
+      saw_empty.push_back(empty);
+      ++rounds;
+      done = rounds >= limit;
+    }
+    if (done) {
+      // Stop WITHOUT writing: closing the outputs and then writing to
+      // them is not a thing a stage may do.
+      ctx.signal_done();
+      co_return;
+    }
+    // The round's "output": a NON-empty tensor, so the next round can
+    // tell a relayed beat from a primed one.
+    // Clip-shaped, so a frames-mode temporal-slice in the loop has a
+    // leading axis to index: [2, 3, 1, 1].
+    vpipe::TensorBeat out;
+    out.dtype = vpipe::TensorBeat::DType::U8;
+    out.shape = {2, 3, 1, 1};
+    out.data.assign(6, (std::uint8_t)7);
+    // Bound to its own local BEFORE the suspend. Building the payload
+    // inside the co_await argument leaves the temporary's lifetime
+    // tangled with the frame layout across the resume -- the crash
+    // audio-to-pcm's emit_chunk_ carries a comment about.
+    auto payload = vpipe::make_payload<vpipe::TensorBeatPayload>(
+        std::move(out));
+    co_await ctx.write(0, std::move(payload));
+  }
+
+  const vpipe::StageSpec&
+  spec() const noexcept override
+  {
+    static const vpipe::PortSpec ip[] = {
+      {.name = "in", .doc = "", .type = nullptr, .clock_group = 0}};
+    static const vpipe::PortSpec op[] = {
+      {.name = "out", .doc = "", .type = nullptr, .clock_group = 0}};
+    static const vpipe::StageSpec sp = {
+        .type_name = "ut-fb-loop-relay", .doc = "", .display_name = "",
+        .iports = ip, .oports = op};
+    return sp;
+  }
+};
+VPIPE_REGISTER_STAGE(FbLoopRelay)
+
+// Build tx -> relay -> rx (the pair itself is wired BY NAME, so the
+// graph stays a DAG) and run it. Returns the relay so the caller can
+// see how far the loop actually got.
+struct LoopRun {
+  vpipe::Session sess;
+  std::unique_ptr<vpipe::Pipeline> pl;
+  FbLoopRelay* relay = nullptr;
+  bool launched = false;
+  bool went_idle = false;
+};
+
+void
+drive_loop_(LoopRun& r, const char* prime, int limit, int timeout_ms)
+{
+  using namespace vpipe;
+  r.pl = std::make_unique<Pipeline>("loop", &r.sess);
+
+  auto tcfg = FlexData::make_object();
+  tcfg.as_object().insert_or_assign("from", FlexData::make_string("rx"));
+  if (prime != nullptr) {
+    tcfg.as_object().insert_or_assign("prime", FlexData::make_string(prime));
+  }
+  auto tx_u = std::make_unique<FeedbackTxStage>(
+      &r.sess, "tx", std::vector<InEdge>{}, tcfg);
+  auto* tx = static_cast<FeedbackTxStage*>(r.pl->insert_stage(std::move(tx_u)));
+
+  auto relay_u = std::make_unique<FbLoopRelay>(
+      &r.sess, "relay", std::vector<InEdge>{{tx, 0}}, FlexData::make_object());
+  relay_u->limit = limit;
+  r.relay = static_cast<FbLoopRelay*>(r.pl->insert_stage(std::move(relay_u)));
+  // A writing stage has to be given its oports explicitly; TypedStage
+  // does not infer them for a test stage, and the rx wired below reads
+  // this one's oport 0.
+  r.relay->allocate_oports(1);
+
+  auto rx_u = std::make_unique<FeedbackRxStage>(
+      &r.sess, "rx", std::vector<InEdge>{{r.relay, 0}},
+      FlexData::make_object());
+  r.pl->insert_stage(std::move(rx_u));
+
+  PipelineRuntime rt(r.pl.get(), &r.sess);
+  r.launched = rt.launch();
+  if (!r.launched) { return; }
+  r.went_idle = rt.wait_idle(timeout_ms);
+  rt.stop();
+}
+
+}  // namespace
+
+// WITHOUT priming the loop cannot start. This is the deadlock stated as
+// a test rather than as a comment: the relay's beat is what the rx
+// receives, and the tx waits for the rx, so round one never happens.
+TEST(feedback_pair, an_unprimed_loop_never_starts)
+{
+  LoopRun r;
+  drive_loop_(r, nullptr, /*limit=*/3, /*timeout_ms=*/400);
+  ASSERT_TRUE(r.launched);
+  if (r.relay == nullptr) { return; }
+  std::lock_guard<std::mutex> lk(r.relay->mu);
+  std::printf("[feedback_pair] unprimed loop: %d round(s), idle=%d\n",
+              r.relay->rounds, (int)r.went_idle);
+  EXPECT_TRUE(r.relay->rounds == 0);
+  // And it does not merely run slowly -- it never finishes.
+  EXPECT_FALSE(r.went_idle);
+}
+
+// WITH priming it starts, and the primed beat is EMPTY -- the declared
+// "nothing this time" that video-ref-encoder already skips, so the
+// consumer needs no first-round special case.
+TEST(feedback_pair, a_primed_loop_starts_and_the_first_beat_is_empty)
+{
+  LoopRun r;
+  drive_loop_(r, "empty-tensor", /*limit=*/3, /*timeout_ms=*/4000);
+  ASSERT_TRUE(r.launched);
+  if (r.relay == nullptr) { return; }
+  std::lock_guard<std::mutex> lk(r.relay->mu);
+  std::printf("[feedback_pair] primed loop: %d round(s), idle=%d\n",
+              r.relay->rounds, (int)r.went_idle);
+  EXPECT_TRUE(r.went_idle);
+  EXPECT_TRUE(r.relay->rounds == 3);
+  ASSERT_TRUE(r.relay->saw_empty.size() >= 2);
+  if (r.relay->saw_empty.size() >= 2) {
+    // Round 1 is the primed beat...
+    EXPECT_TRUE(r.relay->saw_empty[0]);
+    // ... and every round after it is REAL feedback, not more priming.
+    // A stage that primed every round would pass the first assertion
+    // and fail this one.
+    for (std::size_t i = 1; i < r.relay->saw_empty.size(); ++i) {
+      EXPECT_FALSE(r.relay->saw_empty[i]);
+    }
+  }
+}
+
+// A misspelt kind is refused at CONFIG. Defaulting it to "none" would
+// deadlock the loop the setting exists to start, with the config
+// LOOKING right -- the worst of the available failures.
+TEST(feedback_pair, an_unknown_prime_kind_is_refused)
+{
+  vpipe::Session sess;
+  auto cfg = vpipe::FlexData::make_object();
+  cfg.as_object().insert_or_assign("from", vpipe::FlexData::make_string("rx"));
+  cfg.as_object().insert_or_assign("prime",
+                                   vpipe::FlexData::make_string("empty"));
+  auto tx = std::make_unique<vpipe::FeedbackTxStage>(
+      &sess, "tx", std::vector<vpipe::InEdge>{}, cfg);
+  EXPECT_FALSE(tx->config_error().empty());
+
+  // The two spellings that ARE accepted.
+  for (const char* ok : {"none", "empty-tensor"}) {
+    auto c = vpipe::FlexData::make_object();
+    c.as_object().insert_or_assign("from", vpipe::FlexData::make_string("rx"));
+    c.as_object().insert_or_assign("prime", vpipe::FlexData::make_string(ok));
+    auto t = std::make_unique<vpipe::FeedbackTxStage>(
+        &sess, "tx", std::vector<vpipe::InEdge>{}, c);
+    EXPECT_TRUE(t->config_error().empty());
+  }
+}
+
+namespace {
+
+// A stage that changes the beat RATE, declared the way temporal-slice
+// declares it: iport in clock group 0, oport in group 1. The analyzer
+// unifies connected port-groups, so it does NOT unify across this one
+// -- which is the whole point of the declaration.
+class FbRateChanger : public vpipe::TypedStage<FbRateChanger> {
+public:
+  static constexpr const char* kTypeName = "ut-fb-rate-changer";
+  using TypedStage::TypedStage;
+
+  vpipe::Job
+  process(vpipe::RuntimeContext& ctx) override
+  {
+    auto in = co_await ctx.read(0);
+    if (!in) { ctx.signal_done(); co_return; }
+    auto out = in->clone();
+    co_await ctx.write(0, std::move(out));
+  }
+
+  const vpipe::StageSpec&
+  spec() const noexcept override
+  {
+    static const vpipe::PortSpec ip[] = {
+      {.name = "in", .doc = "", .type = nullptr, .clock_group = 0}};
+    static const vpipe::PortSpec op[] = {
+      {.name = "out", .doc = "", .type = nullptr, .clock_group = 1}};
+    static const vpipe::StageSpec sp = {
+        .type_name = "ut-fb-rate-changer", .doc = "", .display_name = "",
+        .iports = ip, .oports = op};
+    return sp;
+  }
+};
+VPIPE_REGISTER_STAGE(FbRateChanger)
+
+}  // namespace
+
+// WHAT PRIMING DOES NOT FIX, stated as a test so the limitation is not
+// something a graph author discovers at launch.
+//
+// `prime` removes the "nobody can go first" deadlock. It does NOT relax
+// the rule that a feedback pair lives inside ONE clock domain, and a
+// loop that picks ONE beat out of many -- `temporal-slice` selecting
+// each clip's last frame, which is the obvious way to feed the next
+// generation -- changes the rate and so splits the domain.
+//
+// So the frame-accurate version of cross-segment continuity needs more
+// than priming: either the selection has to happen without a rate
+// change, or the feedback has to be taken from a port that is already
+// in the consumer's domain.
+TEST(feedback_pair, priming_does_not_lift_the_one_clock_domain_rule)
+{
+  using namespace vpipe;
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("loop", &sess);
+
+  auto tcfg = FlexData::make_object();
+  tcfg.as_object().insert_or_assign("from", FlexData::make_string("rx"));
+  tcfg.as_object().insert_or_assign("prime",
+                                    FlexData::make_string("empty-tensor"));
+  auto tx_u = std::make_unique<FeedbackTxStage>(
+      &sess, "tx", std::vector<InEdge>{}, tcfg);
+  auto* tx = static_cast<FeedbackTxStage*>(pl->insert_stage(std::move(tx_u)));
+
+  auto relay_u = std::make_unique<FbLoopRelay>(
+      &sess, "relay", std::vector<InEdge>{{tx, 0}}, FlexData::make_object());
+  auto* relay =
+      static_cast<FbLoopRelay*>(pl->insert_stage(std::move(relay_u)));
+  relay->allocate_oports(1);
+
+  // The rate change sits between the loop body and the rx, exactly
+  // where a `temporal-slice` picking the last frame of each clip would.
+  auto rc_u = std::make_unique<FbRateChanger>(
+      &sess, "slice", std::vector<InEdge>{{relay, 0}}, FlexData::make_object());
+  auto* rc = static_cast<FbRateChanger*>(pl->insert_stage(std::move(rc_u)));
+  rc->allocate_oports(1);
+
+  auto rx_u = std::make_unique<FeedbackRxStage>(
+      &sess, "rx", std::vector<InEdge>{{rc, 0}}, FlexData::make_object());
+  pl->insert_stage(std::move(rx_u));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  const bool launched = rt.launch();
+  std::printf("[feedback_pair] primed loop across a rate change: "
+              "launched=%d (expected 0)\n", (int)launched);
+  EXPECT_FALSE(launched);
+  if (launched) { rt.wait_idle(200); rt.stop(); }
+}
+
+// THE PAYOFF, and the counterpart of the refusal above.
+//
+// `temporal-slice` in `sequence: frames` is one beat in and one beat
+// out, so it reports the iport's clock group and the analyzer unifies
+// them. Put in the same place the rate changer was refused -- between
+// the loop body and the rx, picking the last frame of each clip -- it
+// LAUNCHES, and the primed loop runs through it.
+//
+// That is the whole cross-segment-continuity wiring in miniature:
+// generate -> decode a clip -> slice its last frame -> feed it back as
+// the next round's reference, with `prime` supplying round one.
+TEST(feedback_pair, a_frames_mode_slice_keeps_the_loop_in_one_domain)
+{
+  using namespace vpipe;
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("loop", &sess);
+
+  auto tcfg = FlexData::make_object();
+  tcfg.as_object().insert_or_assign("from", FlexData::make_string("rx"));
+  tcfg.as_object().insert_or_assign("prime",
+                                    FlexData::make_string("empty-tensor"));
+  auto tx_u = std::make_unique<FeedbackTxStage>(
+      &sess, "tx", std::vector<InEdge>{}, tcfg);
+  auto* tx = static_cast<FeedbackTxStage*>(pl->insert_stage(std::move(tx_u)));
+
+  auto relay_u = std::make_unique<FbLoopRelay>(
+      &sess, "relay", std::vector<InEdge>{{tx, 0}}, FlexData::make_object());
+  relay_u->limit = 3;
+  auto* relay =
+      static_cast<FbLoopRelay*>(pl->insert_stage(std::move(relay_u)));
+  relay->allocate_oports(1);
+
+  // The last frame of each clip, as a STILL -- exactly what a reference
+  // port wants, and the shape a one-frame clip would get wrong.
+  auto scfg = FlexData::make_object();
+  scfg.as_object().insert_or_assign("sequence",
+                                    FlexData::make_string("frames"));
+  scfg.as_object().insert_or_assign("start", FlexData::make_int(-1));
+  scfg.as_object().insert_or_assign("squeeze", FlexData::make_bool(true));
+  auto sl_u = std::make_unique<TemporalSliceStage>(
+      &sess, "slice", std::vector<InEdge>{{relay, 0}}, scfg);
+  auto* sl =
+      static_cast<TemporalSliceStage*>(pl->insert_stage(std::move(sl_u)));
+
+  auto rx_u = std::make_unique<FeedbackRxStage>(
+      &sess, "rx", std::vector<InEdge>{{sl, 0}}, FlexData::make_object());
+  pl->insert_stage(std::move(rx_u));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  const bool launched = rt.launch();
+  std::printf("[feedback_pair] primed loop through a frames-mode slice: "
+              "launched=%d (expected 1)\n", (int)launched);
+  EXPECT_TRUE(launched);
+  if (!launched) { return; }
+  const bool idle = rt.wait_idle(4000);
+  rt.stop();
+
+  std::lock_guard<std::mutex> lk(relay->mu);
+  std::printf("[feedback_pair] ... ran %d round(s), idle=%d\n",
+              relay->rounds, (int)idle);
+  EXPECT_TRUE(idle);
+  EXPECT_TRUE(relay->rounds == 3);
+  // Round one is the primed empty beat; the rounds after it carry the
+  // sliced still, so the loop really did turn over.
+  ASSERT_TRUE(relay->saw_empty.size() >= 2);
+  if (relay->saw_empty.size() >= 2) {
+    EXPECT_TRUE(relay->saw_empty[0]);
+    EXPECT_FALSE(relay->saw_empty[1]);
+  }
+  EXPECT_TRUE(sl->emitted() >= 1);
 }

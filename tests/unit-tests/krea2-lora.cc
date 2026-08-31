@@ -14,8 +14,11 @@
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/lora-fusion.h"
+#include "generative-models/shared/lora-names.h"
+#include "generative-models/shared/runtime-lora.h"
 
 #include <cmath>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -236,4 +239,175 @@ TEST(krea2_lora, fused_dit_loads_and_runs)
   const double r = den > 0 ? std::sqrt(num / den) : 0.0;
   std::printf("[krea2_lora] fused DiT velocity vs base rel-L2 = %.4f\n", r);
   EXPECT_TRUE(r > 1e-3 && r < 1.5);   // differs from base, but sane
+}
+
+// ---- runtime LoRA: the module names, under BOTH conventions ---------
+//
+// These need no checkpoint, and they are the tests the runtime adapter
+// needs most. A LoRA binds by NAME, and an absent module is not an
+// error anywhere -- an adapter is free to touch some projections and
+// not others -- so a name this model gets wrong produces an adapter
+// that loads, reports, and changes nothing.
+//
+// Three of the four Krea-2 adapters in the catalogue ship the
+// ai-toolkit / ComfyUI spelling, so "the names" means two sets, and the
+// second is reached through shared/lora-names.h rather than a second
+// list. What follows checks that the one map covers the whole of the
+// one list.
+
+namespace {
+
+// The test's OWN inverse of remap_ai_toolkit_module, written from the
+// convention rather than from that function, so agreement between them
+// is evidence and not a tautology.
+std::string
+ai_toolkit_spelling(std::string m)
+{
+  auto sub = [&](const std::string& from, const std::string& to) {
+    const std::size_t p = m.find(from);
+    if (p != std::string::npos) { m.replace(p, from.size(), to); }
+  };
+  sub("transformer_blocks.", "blocks.");
+  sub("text_fusion.", "txtfusion.");
+  sub(".attn.to_out.0", ".attn.wo");
+  sub(".attn.to_gate", ".attn.gate");
+  sub(".attn.to_q", ".attn.wq");
+  sub(".attn.to_k", ".attn.wk");
+  sub(".attn.to_v", ".attn.wv");
+  sub(".ff.", ".mlp.");
+  return "diffusion_model." + m;
+}
+
+// A tiny model shape, so a fixture naming every module is a few KB.
+// The DIMS do not matter to a name test; the COUNTS do, because the
+// three containers are what a main-blocks-only binder would miss.
+MetalKrea2Transformer::Config
+tiny_cfg()
+{
+  MetalKrea2Transformer::Config c;
+  c.hidden = 16; c.n_heads = 2; c.n_kv_heads = 1; c.head_dim = 8;
+  c.ffn = 24; c.n_layers = 2;
+  c.text_hidden = 12; c.text_heads = 2; c.text_kv_heads = 2;
+  c.text_ffn = 20; c.n_layerwise = 1; c.n_refiner = 1;
+  return c;
+}
+
+// A minimal F32 safetensors of zero-filled lora_A/B pairs for `modules`.
+bool
+write_pairs(const std::filesystem::path& p,
+            const std::vector<MetalKrea2Transformer::LoraModule>& mods,
+            int rank, const std::function<std::string(std::string)>& spell)
+{
+  const int kSufs = 2;
+  std::string hdr = "{";
+  std::size_t off = 0;
+  bool first = true;
+  auto add = [&](const std::string& nm, int r, int c) {
+    if (!first) { hdr += ","; }
+    first = false;
+    const std::size_t n = (std::size_t)r * (std::size_t)c * 4;
+    hdr += "\"" + nm + "\":{\"dtype\":\"F32\",\"shape\":[" +
+           std::to_string(r) + "," + std::to_string(c) + "],"
+           "\"data_offsets\":[" + std::to_string(off) + "," +
+           std::to_string(off + n) + "]}";
+    off += n;
+  };
+  for (const auto& m : mods) {
+    const std::string nm = spell(m.name);
+    add(nm + ".lora_A.weight", rank, m.k);
+    add(nm + ".lora_B.weight", m.n, rank);
+  }
+  hdr += "}";
+  while (hdr.size() % 8 != 0) { hdr += " "; }
+  std::ofstream f(p, std::ios::binary);
+  if (!f) { return false; }
+  const std::uint64_t hl = hdr.size();
+  f.write(reinterpret_cast<const char*>(&hl), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const std::vector<char> zeros(off, 0);
+  f.write(zeros.data(), (std::streamsize)zeros.size());
+  (void)kSufs;
+  return (bool)f;
+}
+
+}  // namespace
+
+// Every module this model can adapt has an ai-toolkit spelling that the
+// shared map brings back to it. This is what makes ONE list serve two
+// conventions -- and what would fail if a container were added to the
+// list (a new block stack) that the map does not know about.
+TEST(krea2_lora, every_module_round_trips_through_the_name_map)
+{
+  const auto mods = MetalKrea2Transformer::lora_module_list(tiny_cfg());
+  // 8 projections x (2 main + 1 layerwise + 1 refiner) blocks.
+  EXPECT_TRUE(mods.size() == 32);
+  int bad = 0, tower = 0;
+  for (const auto& m : mods) {
+    if (m.name.find("text_fusion.") != std::string::npos) { ++tower; }
+    // Through the map the MODEL installs, not one the test names, so
+    // this fails if the family ever stops installing it.
+    const std::string back =
+        MetalKrea2Transformer::lora_rename()(ai_toolkit_spelling(m.name));
+    if (back != m.name) {
+      if (bad < 4) {
+        std::printf("[krea2_lora] '%s' -> '%s' -> '%s'\n", m.name.c_str(),
+                    ai_toolkit_spelling(m.name).c_str(), back.c_str());
+      }
+      ++bad;
+    }
+  }
+  EXPECT_TRUE(bad == 0);
+  // The TEXT-FUSION tower is in the list. Binding only the main blocks
+  // applies an adapter that touches all three containers in PART, which
+  // is not a cheaper adapter but a wrong one that looks like it worked.
+  EXPECT_TRUE(tower == 16);
+}
+
+// End to end through the real binder: a fixture naming every module in
+// the ai-toolkit spelling binds all of them, and reports that it got
+// there the other way.
+TEST(krea2_lora, an_ai_toolkit_fixture_binds_every_module)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-ut-krea2-lora";
+  fs::create_directories(dir, ec);
+
+  const auto cfg = tiny_cfg();
+  const auto mods = MetalKrea2Transformer::lora_module_list(cfg);
+  const int R = 2;
+
+  struct Arm {
+    const char* tag;
+    std::function<std::string(std::string)> spell;
+    int expect_renamed;
+  };
+  const Arm arms[] = {
+    {"diffusers", [](std::string s) { return s; }, 0},
+    {"ai-toolkit", ai_toolkit_spelling, (int)mods.size()},
+  };
+  for (const Arm& a : arms) {
+    const fs::path p = dir / "adapter.safetensors";
+    ASSERT_TRUE(write_pairs(p, mods, R, a.spell));
+    std::string err;
+    auto ad = lora::Adapter::open(p.string(), mc, &err,
+                                  MetalKrea2Transformer::lora_rename());
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      lora::Factors f;
+      for (const auto& m : mods) { ad->bind(m.name, m.n, m.k, &f); }
+      if (ad->modules() != (int)mods.size()) {
+        std::printf("[krea2_lora] %s: bound %d of %zu (%d skipped)\n", a.tag,
+                    ad->modules(), mods.size(), ad->skipped());
+      }
+      EXPECT_TRUE(ad->modules() == (int)mods.size());
+      EXPECT_TRUE(ad->skipped() == 0);
+      EXPECT_TRUE(ad->renamed() == a.expect_renamed);
+      EXPECT_TRUE(ad->max_rank() == R);
+    }
+    fs::remove(p, ec);
+  }
 }

@@ -2,6 +2,7 @@
 #include "generative-models/krea2/metal-krea2-transformer.h"
 
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/lora-names.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -445,16 +446,138 @@ MetalKrea2Transformer::~MetalKrea2Transformer()
   }
 }
 
+// ---- the module table ----------------------------------------------
+//
+// Krea-2's own projection names are the DIFFUSERS spelling -- attn.to_q
+// / to_k / to_v / to_gate / to_out.0, ff.gate / ff.up / ff.down -- and
+// that is what these rows carry. The ai-toolkit / ComfyUI spelling
+// (`diffusion_model.blocks.N.attn.wq`, `mlp.gate`) is NOT a second
+// table: the adapter is opened with shared/lora-names.h's map
+// installed, which indexes such a file under these names, so one list
+// serves both conventions and cannot describe them differently.
+//
+// THREE containers, not one. The main stack plus the text-fusion
+// tower's layerwise and refiner blocks -- every one of them the same
+// `Block`, so one row type serves. The tower is not optional: an
+// adapter that touches it and is bound only on the main blocks applies
+// in part, silently.
+std::vector<MetalKrea2Transformer::LoraModuleRef>
+MetalKrea2Transformer::lora_modules_(const Config& c)
+{
+  const int H = c.hidden, F = c.ffn;
+  const int qd = c.n_heads * c.head_dim;
+  const int kd = c.n_kv_heads * c.head_dim;
+  const int TH = c.text_hidden, TF = c.text_ffn;
+  std::vector<LoraModuleRef> out;
+  out.reserve((std::size_t)(c.n_layers + c.n_layerwise + c.n_refiner) * 8);
+  // One block's eight projections. The fusion tower has no GQA
+  // (text_kv_heads == text_heads), so its k/v are as wide as its q.
+  auto stack = [&](LoraStack st, const char* pre, int n, int nq, int nkv,
+                   int hid, int ffn) {
+    for (int i = 0; i < n; ++i) {
+      const std::string p = pre + std::to_string(i) + ".";
+      auto add = [&](const char* nm, int on, int k,
+                     lora::Factors BlockLora::*dst) {
+        out.push_back({p + nm, on, k, st, i, dst});
+      };
+      add("attn.to_q",     nq,  hid, &BlockLora::q);
+      add("attn.to_k",     nkv, hid, &BlockLora::k);
+      add("attn.to_v",     nkv, hid, &BlockLora::v);
+      add("attn.to_gate",  hid, hid, &BlockLora::gate);
+      add("attn.to_out.0", hid, hid, &BlockLora::o);
+      add("ff.gate",       ffn, hid, &BlockLora::ff_gate);
+      add("ff.up",         ffn, hid, &BlockLora::ff_up);
+      add("ff.down",       hid, ffn, &BlockLora::ff_down);
+    }
+  };
+  stack(LoraStack::kMain, "transformer_blocks.", c.n_layers, qd, kd, H, F);
+  stack(LoraStack::kLayerwise, "text_fusion.layerwise_blocks.",
+        c.n_layerwise, TH, TH, TH, TF);
+  stack(LoraStack::kRefiner, "text_fusion.refiner_blocks.",
+        c.n_refiner, TH, TH, TH, TF);
+  return out;
+}
+
+genai::lora::Adapter::Rename
+MetalKrea2Transformer::lora_rename()
+{
+  return &lora::remap_ai_toolkit_module;
+}
+
+std::vector<MetalKrea2Transformer::LoraModule>
+MetalKrea2Transformer::lora_module_list(const Config& cfg)
+{
+  std::vector<LoraModule> out;
+  for (const auto& m : lora_modules_(cfg)) {
+    out.push_back({m.name, m.n, m.k});
+  }
+  return out;
+}
+
+// Read the adapter and bind its factors to the modules they name.
+//
+// Everything about reading the file (the publisher prefixes, the
+// ai-toolkit name map, alpha/rank, bf16, the shape check) is shared;
+// what is here is the module list, which is the model.
+bool
+MetalKrea2Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
+{
+  std::string oerr;
+  auto ad = lora::Adapter::open(spec.path, _mc, &oerr, lora_rename());
+  if (!ad) {
+    if (err != nullptr) { *err = "krea2 lora: " + oerr; }
+    return false;
+  }
+  _lora_scale = spec.scale;
+
+  _lora_blocks.clear();
+  _lora_blocks.resize((std::size_t)_cfg.n_layers);
+  _lora_layerwise.clear();
+  _lora_layerwise.resize((std::size_t)_cfg.n_layerwise);
+  _lora_refiner.clear();
+  _lora_refiner.resize((std::size_t)_cfg.n_refiner);
+  for (const auto& m : lora_modules_(_cfg)) {
+    std::vector<BlockLora>& v = m.stack == LoraStack::kMain    ? _lora_blocks
+                              : m.stack == LoraStack::kLayerwise
+                                    ? _lora_layerwise
+                                    : _lora_refiner;
+    ad->bind(m.name, m.n, m.k, &(v[(std::size_t)m.block].*m.dst));
+  }
+  _lora_modules  = ad->modules();
+  _lora_max_rank = ad->max_rank();
+  if (_lora_modules == 0) {
+    _lora_blocks.clear();
+    _lora_layerwise.clear();
+    _lora_refiner.clear();
+    if (err != nullptr) {
+      *err = "krea2 lora: '" + spec.path +
+             "' adapts none of this model's modules, under either the "
+             "diffusers or the ai-toolkit/ComfyUI names. A LoKr adapter "
+             "(lokr_w1/lokr_w2) is not a runtime LoRA -- fuse it with the "
+             "lora-fuse stage instead";
+    }
+    return false;
+  }
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt("MetalKrea2Transformer: {}",
+                                   ad->summary(spec.path, _lora_scale)));
+  }
+  return true;
+}
+
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(const std::string& model_dir, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks)
+                            const Config& cfg, bool stream_blocks,
+                            const LoraSpec* lora)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
+              lora);
 }
 
 std::unique_ptr<MetalKrea2Transformer>
 MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
-                            const Config& cfg, bool stream_blocks)
+                            const Config& cfg, bool stream_blocks,
+                            const LoraSpec* lora)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -701,6 +824,31 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     m->_fn_qmm_swiglu4 = m->_lib_qmm.function("affine_qmm_swiglu_w4g64");
     m->_fn_qmm_swiglu8 = m->_lib_qmm.function("affine_qmm_swiglu_w8g64");
     m->_fuse_ff = m->_fn_qmm_swiglu4.valid() && m->_fn_qmm_swiglu8.valid();
+    // AN ADAPTED FF CANNOT BE FUSED. The fused kernel's epilogue writes
+    // silu(gate)*up straight out of the accumulator, so there is nowhere
+    // for a pre-activation delta to land -- the adapter would simply not
+    // apply, silently, to the two biggest projections in the block.
+    // Asked from the FILE HEADER because the answer decides how the
+    // blocks are BUILT, which happens before there is a model to bind an
+    // adapter to.
+    // The needles are the MODEL's names; the rename is passed so an
+    // ai-toolkit file -- which spells them `mlp.gate` / `mlp.up` -- is
+    // caught too. Without it such an adapter would bind through the
+    // rename and then meet a fused kernel that silently drops its
+    // delta on the two biggest projections in the block.
+    if (m->_fuse_ff && lora != nullptr &&
+        (lora::Adapter::file_touches(lora->path, ".ff.gate.lora_",
+                                     lora_rename()) ||
+         lora::Adapter::file_touches(lora->path, ".ff.up.lora_",
+                                     lora_rename()))) {
+      m->_fuse_ff = false;
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt(
+            "MetalKrea2Transformer: the adapter touches ff.gate/ff.up, so "
+            "the fused-SwiGLU weave is off for this load -- the split "
+            "path is the only one a pre-activation delta can reach"));
+      }
+    }
     if (m->_fuse_ff && m->_use_mma2) {
       m->_fn_swiglu_inter = m->_lib_elt.function("swiglu_interleaved_f16");
       if (!m->_fn_swiglu_inter.valid()) { m->_fuse_ff = false; }
@@ -826,6 +974,23 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     if (m->_mmap_weights && mc->session() != nullptr) {
       mc->session()->log_debug(fmt(
           "MetalKrea2Transformer: zero-copy (mmap) quantized weights enabled"));
+    }
+  }
+  // The adapter LAST: every projection it names has to exist, and the
+  // fused-FF decision above has already been taken with it in view.
+  if (lora != nullptr && !lora->path.empty()) {
+    std::string lerr;
+    if (!m->_lora.init(mc, m->_use_mma2)) {
+      if (mc->session() != nullptr) {
+        mc->session()->warn(fmt(
+            "MetalKrea2Transformer: the LoRA GEMM kernels did not load; "
+            "the adapter is NOT applied"));
+      }
+    } else if (!m->bind_lora_(*lora, &lerr)) {
+      if (mc->session() != nullptr) {
+        mc->session()->warn(fmt("{}", lerr));
+      }
+      m->_lora_modules = 0;
     }
   }
   return m;
@@ -1471,9 +1636,16 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
       enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
                     (unsigned)(((M + 31) / 32) * 2), 2}, {32, 2, 2});
     };
+    // `lf`, when given, is the runtime adapter for THIS projection.
+    // Threaded through the lambda for the same reason the DiT's is: so
+    // it cannot be forgotten on one projection and applied on the rest.
     auto gemm = [&](const SharedBuffer& xin, const QWeight& w,
-                    const SharedBuffer& y, int M, int N, int K) {
+                    const SharedBuffer& y, int M, int N, int K,
+                    const lora::Factors* lf = nullptr) {
       gemm_off(xin, w, y, 0, M, N, K);
+      if (lf != nullptr) {
+        _lora.apply(enc, xin, 0, *lf, y, 0, M, N, K, _lora_scale, _mma_min_m);
+      }
     };
     auto bias_add = [&](const SharedBuffer& bs, const SharedBuffer& y, int M,
                         int N) {
@@ -1547,14 +1719,15 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
 
     // Krea2 attention+SwiGLU block over `batch` independent length-T sequences
     // (dim TH, heads HED, ff TFF, no rope). x [batch*T, TH], updated in place.
-    auto block = [&](const Block& b, const SharedBuffer& x, int batch, int T) {
+    auto block = [&](const Block& b, const SharedBuffer& x, int batch, int T,
+                     const BlockLora* bl) {
       const int BT = batch * T, BH = batch * HED;
       const float scale = 1.0f / std::sqrt((float)THD);
       rms(x, 0, b.n1, sn, 0, BT, TH);
-      gemm(sn, b.q, sq, BT, TH, TH);
-      gemm(sn, b.k, sk, BT, TH, TH);
-      gemm(sn, b.v, sv, BT, TH, TH);
-      gemm(sn, b.gate, sgate, BT, TH, TH);
+      gemm(sn, b.q, sq, BT, TH, TH, bl ? &bl->q : nullptr);
+      gemm(sn, b.k, sk, BT, TH, TH, bl ? &bl->k : nullptr);
+      gemm(sn, b.v, sv, BT, TH, TH, bl ? &bl->v : nullptr);
+      gemm(sn, b.gate, sgate, BT, TH, TH, bl ? &bl->gate : nullptr);
       rms(sq, 0, b.qn, sq, 0, BT * HED, THD);   // per-head q-norm
       rms(sk, 0, b.kn, sk, 0, BT * HED, THD);   // per-head k-norm
       for (int bi = 0; bi < batch; ++bi) {      // -> head-major [BH, T, THD]
@@ -1570,25 +1743,41 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
                   (std::size_t)bi * T * TH, HED, T, THD);
       }
       elt3(_fn_mul_sigmoid, att, sgate, att, BT * TH);   // att *= sigmoid(gate)
-      gemm(att, b.o, o, BT, TH, TH);
+      gemm(att, b.o, o, BT, TH, TH, bl ? &bl->o : nullptr);
       elt3(_fn_residual, x, o, x, BT * TH);
       rms(x, 0, b.n2, sn, 0, BT, TH);
-      gemm(sn, b.ff_gate, h1, BT, TFF, TH);
-      gemm(sn, b.ff_up, h2, BT, TFF, TH);
+      gemm(sn, b.ff_gate, h1, BT, TFF, TH, bl ? &bl->ff_gate : nullptr);
+      gemm(sn, b.ff_up, h2, BT, TFF, TH, bl ? &bl->ff_up : nullptr);
       elt3(_fn_swiglu, h1, h2, h1, BT * TFF);            // silu(gate)*up
-      gemm(h1, b.ff_down, o, BT, TH, TFF);
+      gemm(h1, b.ff_down, o, BT, TH, TFF, bl ? &bl->ff_down : nullptr);
       elt3(_fn_residual, x, o, x, BT * TH);
     };
 
     // Text-fusion: layerwise (over the 12-layer axis, per token) -> projector
     // (Linear 12->1) -> refiner (over the token axis).
-    for (const Block& b : _layerwise) { block(b, xlw, TS, NL); }
+    // The tower's widest projection is [TS*NL, rank] in the layerwise
+    // stack. Sized before the first block for the same reason the DiT's
+    // is: apply() returns early on an empty scratch, and an adapter
+    // that does nothing looks exactly like one that had no effect.
+    if (_lora_modules > 0 && _lora_scale != 0.0f) {
+      _lora.ensure_scratch((std::size_t)TS * (std::size_t)NL *
+                           (std::size_t)_lora_max_rank);
+    }
+    for (int i = 0; i < (int)_layerwise.size(); ++i) {
+      block(_layerwise[(std::size_t)i], xlw, TS, NL,
+            i < (int)_lora_layerwise.size()
+                ? &_lora_layerwise[(std::size_t)i] : nullptr);
+    }
     for (int t = 0; t < TS; ++t) {              // (NL,TH) -> (TH,NL) per token
       transpose(xlw, (std::size_t)t * NL * TH, xt, (std::size_t)t * TH * NL,
                 NL, TH, 1);
     }
     gemm(xt, _projector, fused, TS * TH, 1, NL);
-    for (const Block& b : _refiner) { block(b, fused, 1, TS); }
+    for (int i = 0; i < (int)_refiner.size(); ++i) {
+      block(_refiner[(std::size_t)i], fused, 1, TS,
+            i < (int)_lora_refiner.size()
+                ? &_lora_refiner[(std::size_t)i] : nullptr);
+    }
 
     // txt_in: RMSNorm(+1) -> Linear+bias -> gelu-tanh -> Linear+bias.
     rms(fused, 0, _txt_norm, sn, 0, TS, TH);
@@ -1779,9 +1968,21 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
+    // `lf`, when given, is the runtime adapter for THIS projection: the
+    // base GEMM runs unchanged and the pair t = x A^T, y += s t B^T is
+    // encoded after it. Threaded through the lambda rather than called
+    // at each site so the adapter cannot be forgotten on one projection
+    // and applied on the other seven.
     auto gemm = [&](const SharedBuffer& xin, const QWeight& w,
-                    const SharedBuffer& y, std::size_t ye, int M, int N, int K) {
-      if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { return; }
+                    const SharedBuffer& y, std::size_t ye, int M, int N,
+                    int K, const lora::Factors* lf = nullptr) {
+      auto lora_after = [&]() {
+        if (lf != nullptr) {
+          _lora.apply(enc, xin, 0, *lf, y, ye, M, N, K, _lora_scale,
+                      _mma_min_m);
+        }
+      };
+      if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { lora_after(); return; }
       int bm = 32, bn = 32;               // steel tile
       if (w.quantized) {
         // BM=64 tile once M amortizes it (the DiT block GEMMs, M ~= seq);
@@ -1823,6 +2024,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       enc.dispatch({(unsigned)(((N + bn - 1) / bn) * 32),
                     (unsigned)(((M + bm - 1) / bm) * 2), tgz},
                    {32, 2, tgz});
+      lora_after();
     };
     auto gemm_bias = [&](const SharedBuffer& xin, const QWeight& w,
                          const SharedBuffer& bs, const SharedBuffer& y,
@@ -2082,6 +2284,14 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       ~SlotJoin() { s->join(); }
     } slot_join{&_slots};
     _slots.begin_forward();
+    // The adapter's [seq, rank] intermediate, sized ONCE for the widest
+    // projection this pass will take. Without it apply() returns early
+    // and the adapter silently does nothing -- which looks exactly like
+    // an adapter that had no effect, so it is allocated here rather than
+    // lazily inside the block loop.
+    if (_lora_modules > 0 && _lora_scale != 0.0f) {
+      _lora.ensure_scratch((std::size_t)seq * (std::size_t)_lora_max_rank);
+    }
     if (_stream_blocks) { flush(); }   // commit conditioning before streaming
     for (int L = 0; L < c.n_layers; ++L) {
       // Cooperative stop: bail EVERY block (not just the streamed tail) so a
@@ -2116,10 +2326,13 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       adaln(n1, mod, 0, HID, nm, HID, seq * HID);             // (1+pre_s)*n1+pre_sh
       psplit(t_norm);
       if (_calib_on) { colmax(nm, _cb_qkv[(std::size_t)L], seq, HID); }
-      gemm(nm, b.q, q, 0, seq, qd, HID);
-      gemm(nm, b.k, k, 0, seq, kd, HID);
-      gemm(nm, b.v, v, 0, seq, kd, HID);
-      gemm(nm, b.gate, gate, 0, seq, HID, HID);
+      const BlockLora* lb = (std::size_t)L < _lora_blocks.size()
+                                ? &_lora_blocks[(std::size_t)L]
+                                : nullptr;
+      gemm(nm, b.q, q, 0, seq, qd, HID, lb ? &lb->q : nullptr);
+      gemm(nm, b.k, k, 0, seq, kd, HID, lb ? &lb->k : nullptr);
+      gemm(nm, b.v, v, 0, seq, kd, HID, lb ? &lb->v : nullptr);
+      gemm(nm, b.gate, gate, 0, seq, HID, HID, lb ? &lb->gate : nullptr);
       psplit(t_qkv);
       rms(q, 0, b.qn, q, 0, seq * HED, HD);
       rms(k, 0, b.kn, k, 0, seq * KVH, HD);
@@ -2142,7 +2355,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       elt3(_fn_mul_sigmoid, att, gate, att, seq * HID);
       psplit(t_attn);
       if (_calib_on) { colmax(att, _cb_o[(std::size_t)L], seq, HID); }
-      gemm(att, b.o, o, 0, seq, HID, HID);
+      gemm(att, b.o, o, 0, seq, HID, HID, lb ? &lb->o : nullptr);
       gated(joint, mod, 2 * HID, o, HID, seq * HID);          // += pregate*attn
       psplit(t_oproj);
       rms(joint, 0, b.n2, n2, 0, seq, HID);
@@ -2189,14 +2402,16 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           psplit(t_ffact);   // activation fused into the GEMM epilogue
         }
       } else {
-        gemm(nm, b.ff_gate, g, 0, seq, FF, HID);
-        gemm(nm, b.ff_up, u, 0, seq, FF, HID);
+        gemm(nm, b.ff_gate, g, 0, seq, FF, HID,
+             lb ? &lb->ff_gate : nullptr);
+        gemm(nm, b.ff_up, u, 0, seq, FF, HID, lb ? &lb->ff_up : nullptr);
         psplit(t_ffup);
         elt3(_fn_swiglu, g, u, g, seq * FF);
         psplit(t_ffact);
       }
       if (_calib_on) { colmax(g, _cb_dn[(std::size_t)L], seq, FF); }
-      gemm(g, b.ff_down, o, 0, seq, HID, FF);
+      gemm(g, b.ff_down, o, 0, seq, HID, FF,
+           lb ? &lb->ff_down : nullptr);
       gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
       psplit(t_ff);
       if (streaming) {

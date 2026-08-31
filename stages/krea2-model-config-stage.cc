@@ -1,4 +1,5 @@
 #include "stages/krea2-model-config-stage.h"
+#include "stages/model-registry.h"
 
 #include "common/flex-data.h"
 
@@ -20,6 +21,28 @@ const ConfigKey kAttrs[] = {
    .doc = "grounded encode: the image processor's lower bound, which is what "
           "makes a small or very wide reference get UPSCALED before patching. "
           "Unset => the tower default"},
+  {.key = "lora", .type = ConfigType::String, .required = false,
+   .doc = "a LoRA applied AT RUNTIME -- every adapted projection computes "
+          "W x + scale * B (A x) rather than having the delta folded into "
+          "the weights, which for a 4-bit base is the difference between "
+          "keeping a small correction and rounding it away. A registered "
+          "model, a directory holding one .safetensors, or a path to one. "
+          "Both key conventions bind: this model's own diffusers names and "
+          "the ai-toolkit / ComfyUI spelling. LOAD-TIME: it changes how the "
+          "weights are BUILT (an adapted ff.gate/ff.up forbids the "
+          "fused-SwiGLU weave), so a beat that changes it once the DiT is "
+          "up is reported and ignored. Unset => no adapter",
+   // A MODEL picker, not a file browser: an adapter is a catalogued
+   // model here, and `krea2-lora` is what keeps a FLUX.2 or H3 adapter
+   // out of the list. Free text still works, so a bare path is
+   // unaffected -- see ConfigKey::suggest_db.
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "krea2-lora"},
+  {.key = "lora_scale", .type = ConfigType::Real, .required = false,
+   .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
+          "GEMM as a constant, so it can be swept without a reload. 1.0 = as "
+          "trained; 0 skips both adapter GEMMs, so off is exactly off",
+   .def_real = 1.0},
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the tower default"},
@@ -33,9 +56,11 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "model_config",
-   .doc = "krea2 parameters as one FlexData object {model_family: "
-          "krea2, +vl_*}, for a diffusion-conditioner model_config iport "
-          "(the grounded encode)",
+   .doc = "krea2 parameters as one FlexData object {model_family: krea2, "
+          "+vl_*, +lora, +lora_scale}. The vl_* keys are for a "
+          "diffusion-conditioner's model_config iport (the grounded "
+          "encode); the lora keys are for generate-image's. Wire it to "
+          "both -- each reads only what it owns",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -78,6 +103,17 @@ Krea2ModelConfigStage::resolved_config() const
 {
   FlexData fd = model_config::make_config("krea2");
   model_config::copy_grounded_keys(config(), fd);
+  // The adapter. Written only when SET, on the same argument as the
+  // grounded keys: a default emitted as though it were a choice would
+  // read downstream as "the graph asked for scale 1.0" when the graph
+  // said nothing at all.
+  {
+    auto in = config().as_object();
+    auto o  = fd.as_object();
+    for (const char* k : {"lora", "lora_scale"}) {
+      if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
+    }
+  }
   return fd;
 }
 

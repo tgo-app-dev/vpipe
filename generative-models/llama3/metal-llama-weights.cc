@@ -103,6 +103,18 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
   for (auto entry : j.as_object()) {
     const std::string_view key = entry.first;
     if (key == "__metadata__") {
+      // A file-level annotation, kept for the FIRST shard that carries
+      // one: safetensors permits only string values, and a sharded
+      // model repeats the same object per shard.
+      if (_metadata.empty() && entry.second.is_object()) {
+        FlexData md = entry.second;              // own it before viewing
+        for (auto kv : md.as_object()) {
+          if (kv.second.is_string()) {
+            _metadata.emplace(std::string(kv.first),
+                              std::string(kv.second.as_string("")));
+          }
+        }
+      }
       continue;
     }
     const FlexData& e = entry.second;
@@ -356,9 +368,15 @@ MetalLlamaWeights::operator=(MetalLlamaWeights&& o) noexcept
       if (sh.fd >= 0) { ::close(sh.fd); }
       if (sh.fd_stream >= 0) { ::close(sh.fd_stream); }
     }
+    // EVERY member, by hand. This is not the compiler's move -- the
+    // mmap release above is why it cannot be -- so a member added to
+    // the class and not to this list is silently dropped by the move
+    // that open() makes on the way out. `_metadata` was exactly that
+    // for as long as it took one test to notice.
     _shards = std::move(o._shards);
     _shard_maps = std::move(o._shard_maps);
     _tensors = std::move(o._tensors);
+    _metadata = std::move(o._metadata);
     _gguf = std::move(o._gguf);
     o._shards.clear();      // moved-from vectors are empty; make it explicit
     o._shard_maps.clear();
@@ -388,6 +406,12 @@ MetalLlamaWeights::info(const std::string& name) const
 {
   auto it = _tensors.find(name);
   return it == _tensors.end() ? nullptr : &it->second;
+}
+
+const std::map<std::string, std::string>&
+MetalLlamaWeights::metadata() const
+{
+  return _metadata;
 }
 
 std::vector<std::string>

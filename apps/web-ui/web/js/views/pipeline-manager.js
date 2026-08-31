@@ -182,10 +182,72 @@ function mountEditor(container, opts = {}) {
   // Live stage count, right-aligned in the Stages title bar. Updated by
   // renderGraphPane whenever the graph changes.
   const stagesCount = el('span', { class: 'stages-count' });
+  // The NARROW view's way in to the palette.
+  //
+  // Below the canvas crossover the pane shows the linearized lane list,
+  // and a docked toolbox there is the wrong shape twice over: it spends
+  // a third of an already-cramped pane on a permanent panel, and what it
+  // offers -- drag a chip onto the canvas -- cannot be done, because
+  // there is no canvas to drop onto. So the panel is hidden and this
+  // takes its place: one button, and a picker that opens on demand,
+  // filters, and adds on a single click.
+  //
+  // It is the SAME palette (see stageSections), so the two views cannot
+  // come to disagree about what can be added.
+  //
+  // Declared BEFORE the header that mounts it: `const` is in its
+  // temporal dead zone until this line runs, so appending it above
+  // would throw on mount rather than merely read oddly.
+  const addStageBtn = el('button', {
+    class: 'graph-add-stage', type: 'button',
+    title: tOr('pl.add_stage', 'Add stage'),
+    onclick: (e) => { e.stopPropagation(); openStagePicker(); },
+  }, '+');
+
   graphHead.append(
     el('span', { class: 'title' }, t('pl.stages')),
     el('span', { class: 'grow' }),
-    stagesCount);
+    stagesCount,
+    addStageBtn);
+
+  function openStagePicker() {
+    if (!canEdit()) { return; }
+    const body = el('div', { class: 'sp-body' });
+    const filter = el('input', {
+      type: 'search', class: 'sp-filter', placeholder: t('pl.filter_ph'),
+      oninput: () => { clear(body); fill(); },
+    });
+    const pop = el('div', { class: 'stage-picker' }, filter, body);
+    const close = () => {
+      pop.remove();
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onAway, true);
+      window.removeEventListener('resize', close);
+    };
+    const fill = () => renderSections(body, filter.value || '', {
+      onPick: (type) => { close(); promptCreateStage(type); },
+    });
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(); }
+    };
+    const onAway = (e) => {
+      if (!pop.contains(e.target) && e.target !== addStageBtn) { close(); }
+    };
+    fill();
+    // Anchored under the button and clamped to the viewport, so it does
+    // not hang off the right edge of a narrow pane -- which is the only
+    // width this thing is ever opened at.
+    const r = addStageBtn.getBoundingClientRect();
+    (document.getElementById('modal-root') || document.body).append(pop);
+    const w = pop.offsetWidth || 260;
+    pop.style.left = Math.max(6, Math.min(r.right - w,
+      window.innerWidth - w - 6)) + 'px';
+    pop.style.top = (r.bottom + 4) + 'px';
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onAway, true);
+    window.addEventListener('resize', close);
+    setTimeout(() => filter.focus(), 0);
+  }
 
   // Toolbox: a filterable palette of every registered stage type.
   // Drag a chip onto the canvas (or double-click it) to add a stage.
@@ -812,6 +874,12 @@ function mountEditor(container, opts = {}) {
     // the top-left regardless of graph/empty content (absolute-positioned).
     if (canvasControls) { renderControls(); graphBody.append(canvasControls); }
     const editable = canEdit();
+    // NARROW: the docked toolbox goes away and the header's + takes over
+    // (see openStagePicker). Both are driven off the SAME `narrow` the
+    // lane list is, so the panel cannot be left sitting beside a list
+    // there is no way to drag onto.
+    graphSplit.classList.toggle('tb-hidden', narrow);
+    addStageBtn.classList.toggle('show', narrow && editable);
     // Edit affordances only make sense while stopped; drop any stale
     // arming/selection when the pipeline isn't editable.
     if (!editable) { state.pending = null; state.selectedEdge = null; }
@@ -1012,7 +1080,7 @@ function mountEditor(container, opts = {}) {
                           'model-specific-config', 'audio', 'text',
                           'network', 'control', 'database', 'generic'];
 
-  function stageChip(s) {
+  function stageChip(s, opts = {}) {
     const ins = (s.iports || []).length;
     const outs = (s.oports || []).length;
     // Prefer the spec's human display name; the type name still drives
@@ -1029,6 +1097,16 @@ function mountEditor(container, opts = {}) {
       el('span', { class: 'tb-grip' }),
       el('span', { class: 'tb-name' }, label),
       el('span', { class: 'tb-io' }, ins + '→' + outs));
+    // PICK mode, for the narrow view's picker: there is no canvas to drop
+    // onto, so the chip is a button and one click adds the stage. Drag is
+    // turned off rather than left dangling -- a drag that can only end
+    // nowhere reads as a broken affordance.
+    if (opts.onPick) {
+      chip.removeAttribute('draggable');
+      chip.classList.add('pickable');
+      chip.addEventListener('click', () => opts.onPick(s.type));
+      return chip;
+    }
     chip.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('text/vpipe-stage-type', s.type);
       e.dataTransfer.setData('text/plain', s.type);
@@ -1040,9 +1118,11 @@ function mountEditor(container, opts = {}) {
     return chip;
   }
 
-  function renderToolbox() {
-    clear(toolboxBody);
-    const q = (toolboxFilter.value || '').toLowerCase();
+  // The palette's contents for a query, grouped and ordered. Shared by
+  // the side panel and the narrow view's picker so the two cannot come
+  // to offer different stages, or the same stages in a different order.
+  function stageSections(query) {
+    const q = (query || '').toLowerCase();
     // `plugin_enabled === false` means a loaded plugin the session has
     // switched off: its stages stay in state.stageTypes so an
     // already-placed instance still renders with its spec, and drop out
@@ -1080,24 +1160,42 @@ function mountEditor(container, opts = {}) {
       const ib = CATEGORY_ORDER.indexOf(b);
       return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
     });
+    const out = [];
     for (const c of cats) {
       const items = byCat.get(c).sort((a, b) => a.type.localeCompare(b.type));
-      toolboxBody.append(el('div', { class: 'tb-cat' },
-        tOr('cat.' + c, c) + ' (' + items.length + ')'));
-      for (const s of items) { toolboxBody.append(stageChip(s)); }
+      out.push({ label: tOr('cat.' + c, c) + ' (' + items.length + ')',
+                 plugin: false, items });
     }
     for (const p of [...byPlugin.keys()].sort((a, b) => a.localeCompare(b))) {
       const items = byPlugin.get(p).sort(
         (a, b) => a.type.localeCompare(b.type));
       // The plugin NAME is not translated -- it is a proper noun the
       // plugin chose. Only the "plugin" label around it is.
-      toolboxBody.append(el('div', { class: 'tb-cat tb-plugin' },
-        t('pl.plugin_group') + ' ' + p + ' (' + items.length + ')'));
-      for (const s of items) { toolboxBody.append(stageChip(s)); }
+      out.push({ label: t('pl.plugin_group') + ' ' + p
+                        + ' (' + items.length + ')',
+                 plugin: true, items });
     }
-    if (match.length === 0) {
-      toolboxBody.append(el('div', { class: 'tb-empty' }, t('pl.no_matches')));
+    return { sections: out, total: match.length };
+  }
+
+  // Render grouped sections into `body`. `opts` is passed through to
+  // stageChip, which is what makes the picker's chips click-to-add.
+  function renderSections(body, query, opts) {
+    const { sections, total } = stageSections(query);
+    for (const sec of sections) {
+      body.append(el('div',
+        { class: 'tb-cat' + (sec.plugin ? ' tb-plugin' : '') }, sec.label));
+      for (const st of sec.items) { body.append(stageChip(st, opts)); }
     }
+    if (total === 0) {
+      body.append(el('div', { class: 'tb-empty' }, t('pl.no_matches')));
+    }
+    return total;
+  }
+
+  function renderToolbox() {
+    clear(toolboxBody);
+    renderSections(toolboxBody, toolboxFilter.value || '', {});
   }
 
   // --- type helpers (for client-side connection validation) --------

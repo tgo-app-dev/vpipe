@@ -175,6 +175,36 @@ const ModelCatalogEntry* catalog_by_path(const std::string& hf_path);
 std::vector<const ModelCatalogEntry*>
 catalog_all_by_path(const std::string& hf_path);
 
+// WHICH of those a `model_variant` string selects, or nullptr when it does
+// not come down to exactly one.
+//
+// The rule, and it is a rule rather than a search because guessing here
+// downloads the wrong model and registers it under the right name:
+//
+//   * `variant` is matched case-insensitively against each candidate's
+//     version, variant, name and model_type;
+//   * an EXACT hit on any of those beats a substring hit on any of them,
+//     so "fl2va" takes the FL2VA entry even where another entry's
+//     description happens to contain the word;
+//   * the answer must be exactly ONE entry. Zero and two are both
+//     nullptr -- ambiguity is refused, never resolved by order;
+//   * an empty `variant` selects only when there is a single candidate.
+//
+// `matched` (optional) receives the entries the string actually hit, so a
+// caller refusing the request can say how many and which. It is the hit
+// set, not the candidate set: on a miss it is empty, and on an ambiguous
+// hit it holds the tied entries.
+//
+// SHARED because it was duplicated. model-fetch-stage owns the only
+// production caller, and a test that re-implemented "match a variant" as
+// a plain substring scan agreed with it on every shipped pipeline while
+// disagreeing on the two things above -- which is a test that stops
+// tracking the thing it checks the moment either moves.
+const ModelCatalogEntry*
+catalog_pick_variant(const std::vector<const ModelCatalogEntry*>& cands,
+                     const std::string& variant,
+                     std::vector<const ModelCatalogEntry*>* matched = nullptr);
+
 // Look up a catalogue entry by its `name` (the registration key used when
 // several entries share ONE hf_path -- the vpipe-supplement CoreML models).
 // catalog_by_path can't disambiguate those (they share hf_path), so the

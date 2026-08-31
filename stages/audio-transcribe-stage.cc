@@ -800,7 +800,7 @@ AudioTranscribeStage::slice_and_transcribe_(std::uint64_t start_us,
     session()->warn(fmt(
         "AudioTranscribeStage('{}'): segment marker arrived before any "
         "timestamped PCM beat; cannot slice -- check that audio-to-pcm "
-        "is emitting sideband.timestamp_us"));
+        "is emitting sideband.timestamp_us", this->id()));
     return false;
   }
   const std::uint64_t buf_end_us =

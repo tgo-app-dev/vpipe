@@ -136,6 +136,21 @@ public:
   //
   // `partition` is MiniMax-H3's fl2va / ref2va, which the caller takes
   // from the models-DB record rather than from the directory.
+  // The PIPELINE root to quantize, given the source that was named and
+  // the DiT the resolver found under it. Normally the source itself --
+  // but MiniMaxAI publishes both MiniMax-H3 partitions from ONE repo, so
+  // the runnable root is <repo>/FL2VA and the components to copy sit
+  // beside the DiT rather than beside the repo.
+  //
+  // Exposed for the same reason as the resolver below: the two answers
+  // have to agree, and the one that decides WHERE TO COPY FROM had no
+  // test at all -- a source that resolved its DiT correctly still failed
+  // with "root ... has no 'transformer' component to quantize", which
+  // reads as a broken download rather than a resolver that stopped one
+  // directory short.
+  static std::string pipeline_root_for(const std::string& src_dir,
+                                       const std::string& dit_dir);
+
   static std::string resolve_source_dit_dir(const std::string& src_dir,
                                             std::string* family,
                                             const std::string& partition = {});

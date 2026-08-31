@@ -4,8 +4,12 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include "apple-silicon/tensor-beat.h"
+
 #include <algorithm>
+#include <cstring>
 #include <utility>
+#include <vector>
 
 namespace vpipe {
 
@@ -27,6 +31,24 @@ constexpr ConfigKey kAttrs[] = {
           "stream is read once and in order, so a negative step would "
           "mean emitting beats this stage has already let go. Absent: 1",
    .def_int = 1},
+  {.key = "sequence", .type = ConfigType::String, .required = false,
+   .doc = "what the slice indexes. \"beats\" (default) is the beat "
+          "STREAM -- keep some beats, drop the rest. \"frames\" is the "
+          "LEADING AXIS OF ONE BEAT: a stacked clip [T, 3, H, W] in, the "
+          "selected frames out, one beat in and one beat out. The frames "
+          "mode holds nothing (T is known from the beat, so a negative "
+          "index resolves at once) and does NOT change the beat rate, so "
+          "unlike the stream mode it can sit inside a feedback loop",
+   .def_str = "beats"},
+  {.key = "squeeze", .type = ConfigType::Bool, .required = false,
+   .doc = "frames mode only: when the slice selects exactly ONE frame, "
+          "drop the time axis and emit [3, H, W] -- a STILL -- instead of "
+          "[1, 3, H, W], a one-frame CLIP. The two are different requests "
+          "to a reference-conditioned model and are sized by different "
+          "rules, so there is no safe default and this is a switch rather "
+          "than an inference. Asking to squeeze several frames is warned "
+          "about once and the axis is kept",
+   .def_bool = false},
   {.key = "end", .type = ConfigType::Int, .required = false,
    .doc = "one PAST the last beat of the slice, Python-style, so the "
           "slice is [start, end). Negative counts back from the end, on "
@@ -89,6 +111,25 @@ TemporalSliceStage::TemporalSliceStage(const SessionContextIntf* s,
   _start = attr_int("start");
   _step  = attr_int("step");
   _end   = attr_int("end");
+  _squeeze = attr_bool("squeeze");
+  {
+    const std::string seq = attr_str("sequence");
+    if (seq.empty() || seq == "beats") {
+      _within_beat = false;
+    } else if (seq == "frames") {
+      _within_beat = true;
+    } else {
+      fail_config(fmt("sequence '{}' is not beats|frames", seq));
+    }
+  }
+  if (_squeeze && !_within_beat) {
+    // Not fatal, but it means nothing: the stream mode forwards beats
+    // untouched, so there is no axis to drop.
+    session()->warn(fmt(
+        "TemporalSliceStage('{}'): squeeze has no effect with "
+        "sequence 'beats' -- that mode forwards each beat untouched, "
+        "shape included", this->id()));
+  }
 
   // Deferred validation: the constructor never throws, and the runtime
   // skips a stage whose config failed.
@@ -174,8 +215,119 @@ TemporalSliceStage::initialize(RuntimeContext& ctx)
 }
 
 Job
+TemporalSliceStage::process_within_(RuntimeContext& ctx)
+{
+  auto p = co_await ctx.read(0);
+  if (!p) { ctx.signal_done(); co_return; }
+
+  const auto* tb = dynamic_cast<const TensorBeatPayload*>(p.get());
+  if (tb == nullptr) {
+    session()->warn(fmt(
+        "TemporalSliceStage('{}'): sequence 'frames' slices the leading "
+        "axis of a TENSOR, got {}; dropping beat", this->id(),
+        p->describe()));
+    co_return;
+  }
+  // Rank 2 is the floor: there has to be a leading axis to index AND
+  // something left after it. A rank-1 tensor sliced this way would be
+  // audio samples, which is temporal-stack's other modality and not a
+  // clip at all.
+  if (tb->shape.size() < 2 || tb->shape[0] <= 0 || tb->byte_size() == 0) {
+    session()->warn(fmt(
+        "TemporalSliceStage('{}'): sequence 'frames' needs a rank >= 2 "
+        "tensor with a non-empty leading axis, got {}; dropping beat",
+        this->id(), tb->describe()));
+    co_return;
+  }
+
+  // T is KNOWN here, which is the whole difference from the stream
+  // mode: a negative index resolves now instead of at EOS, so nothing
+  // is held and `start: -1` costs nothing.
+  const std::int64_t n = tb->shape[0];
+  std::vector<std::int64_t> pick;
+  for (std::int64_t j = 0; j < n; ++j) {
+    if (selected_(j, n)) { pick.push_back(j); }
+  }
+  if (pick.empty()) {
+    session()->log_debug(fmt(
+        "TemporalSliceStage('{}'): the slice selected no frame of {}; "
+        "dropping beat", this->id(), n));
+    co_return;
+  }
+
+  // One element's geometry and byte size: everything after the leading
+  // axis, which the rank check above guarantees is non-empty.
+  std::vector<std::int64_t> elem(tb->shape.begin() + 1, tb->shape.end());
+  std::size_t per_elems = 1;
+  for (std::int64_t d : elem) { per_elems *= (std::size_t)(d > 0 ? d : 0); }
+  const std::size_t esz = TensorBeat::byte_size_of(tb->dtype);
+  const std::size_t per = per_elems * esz;
+  if (per == 0 || tb->byte_size() < (std::size_t)n * per) {
+    session()->warn(fmt(
+        "TemporalSliceStage('{}'): {} does not hold {} whole elements; "
+        "dropping beat", this->id(), tb->describe(), n));
+    co_return;
+  }
+
+  // SQUEEZE: only when the slice named exactly one frame. Asking for it
+  // over several is the caller describing a shape they cannot have
+  // meant, so it is said out loud rather than fabricated -- once,
+  // because a clip stream would otherwise say it every beat.
+  bool squeeze = _squeeze && pick.size() == 1;
+  if (_squeeze && pick.size() != 1 && !_squeeze_warned) {
+    _squeeze_warned = true;
+    session()->warn(fmt(
+        "TemporalSliceStage('{}'): squeeze asked for but the slice "
+        "selected {} frames, not 1; keeping the time axis. A multi-frame "
+        "selection is a CLIP and has no still to squeeze to",
+        this->id(), pick.size()));
+  }
+
+  TensorBeat out;
+  out.dtype = tb->dtype;
+  if (squeeze) {
+    out.shape = elem;
+  } else {
+    out.shape.push_back((std::int64_t)pick.size());
+    for (std::int64_t d : elem) { out.shape.push_back(d); }
+  }
+  out.data.resize(pick.size() * per);
+  for (std::size_t k = 0; k < pick.size(); ++k) {
+    std::memcpy(out.data.data() + k * per,
+                tb->bytes_() + (std::size_t)pick[k] * per, per);
+  }
+
+  // The sideband is the input's, with the rate fields made true of what
+  // came out. A SQUEEZED beat is a still: it carries neither `frames`
+  // nor `fps`, because a picture that claims a frame count is a clip to
+  // anything that reads one.
+  FlexData sb = tb->sideband.is_object() ? tb->sideband
+                                         : FlexData::make_object();
+  auto o = sb.as_object();
+  if (squeeze) {
+    o.erase("frames");
+    o.erase("fps");
+  } else {
+    o.insert_or_assign("frames",
+                       FlexData::make_int((std::int64_t)pick.size()));
+  }
+  out.sideband = std::move(sb);
+
+  ++_emitted;
+  // Bound before the suspend; see audio-to-pcm's emit_chunk_ for what
+  // building the payload inside the co_await argument costs.
+  auto payload = make_payload<TensorBeatPayload>(std::move(out));
+  co_await ctx.write(0, std::move(payload));
+  co_return;
+}
+
+Job
 TemporalSliceStage::process(RuntimeContext& ctx)
 {
+  if (_within_beat) {
+    co_await process_within_(ctx);
+    co_return;
+  }
   auto p = co_await ctx.read(0);
   if (!p) {
     // EOS: the count is finally known, so everything still held can be

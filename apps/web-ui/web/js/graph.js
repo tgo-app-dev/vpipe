@@ -49,6 +49,25 @@ const FIT_MAX_K = 1;     // Fit never enlarges past 1:1 (only shrinks).
 // step: it arrives in a continuous stream, where a discrete press does
 // not and wants to be felt.
 const ZOOM_STEP = 1.2;
+// Wheel deltas arrive in one of three units. Only pixels are directly
+// usable as a pan distance; the other two are nominal and have to be
+// given a size, or a Firefox line-mode wheel would pan by 3 world units
+// where Chrome pans by 100.
+const WHEEL_LINE_PX = 16;
+const WHEEL_PAGE_PX = 400;
+
+// A wheel event's pan distance in screen pixels, both axes.
+function wheelPixels(e) {
+  const s = e.deltaMode === 1 ? WHEEL_LINE_PX
+          : (e.deltaMode === 2 ? WHEEL_PAGE_PX : 1);
+  let dx = e.deltaX * s, dy = e.deltaY * s;
+  // A plain mouse wheel has no horizontal axis, and shift is the
+  // conventional way to ask one for horizontal movement. Applied only
+  // when the device really sent nothing sideways, so a trackpad's
+  // diagonal swipe is not flattened into one direction.
+  if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+  return { dx, dy };
+}
 
 // Box height from the rendered port counts. `inCount` is the number of
 // input slots actually drawn (spec-declared, not just the wired ones);
@@ -906,22 +925,69 @@ export function renderGraph(graph, opts = {}) {
   svg.addEventListener('pointerup', endPan);
   svg.addEventListener('pointercancel', endPan);
 
-  // Wheel to zoom, anchored at the cursor.
+  // Wheel PANS; ctrl/cmd-wheel ZOOMS, anchored at the cursor.
+  //
+  // A trackpad's two-finger swipe is the gesture people expect to move a
+  // canvas around -- it is what every map and every design tool does with
+  // it -- and it arrives as a plain wheel event carrying BOTH axes. Zoom
+  // keeps the modifier, which costs nothing: macOS reports a trackpad
+  // PINCH as a wheel event with ctrlKey already set, so pinch-to-zoom
+  // works through the same branch without a gesture handler of its own.
+  //
+  // The − / + buttons and the keys below are the discrete way to zoom,
+  // for a plain mouse that has no pinch and no horizontal wheel.
   svg.addEventListener('wheel', (e) => {
     e.preventDefault();
     const W = svg.clientWidth, H = svg.clientHeight;
     if (!W || !H) { return; }
-    const rect = svg.getBoundingClientRect();
-    const px = e.clientX - rect.left, py = e.clientY - rect.top;
     const k0 = view.k || 1;
-    const wx = (view.cx - (W / k0) / 2) + px / k0;
-    const wy = (view.cy - (H / k0) / 2) + py / k0;
-    const k = clamp(k0 * (e.deltaY < 0 ? 1.1 : 1 / 1.1), MIN_K, MAX_K);
-    view.k = k;
-    view.cx = wx - px / k + (W / k) / 2;
-    view.cy = wy - py / k + (H / k) / 2;
+
+    if (e.ctrlKey || e.metaKey) {
+      const rect = svg.getBoundingClientRect();
+      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      const wx = (view.cx - (W / k0) / 2) + px / k0;
+      const wy = (view.cy - (H / k0) / 2) + py / k0;
+      const k = clamp(k0 * (e.deltaY < 0 ? 1.1 : 1 / 1.1), MIN_K, MAX_K);
+      view.k = k;
+      view.cx = wx - px / k + (W / k) / 2;
+      view.cy = wy - py / k + (H / k) / 2;
+      applyView();
+      return;
+    }
+
+    // Deltas are screen pixels, so dividing by k moves the content under
+    // the cursor by the same screen distance at any zoom -- a swipe feels
+    // the same close up as it does zoomed out.
+    const { dx, dy } = wheelPixels(e);
+    view.cx += dx / k0;
+    view.cy += dy / k0;
     applyView();
   }, { passive: false });
+
+  // Keyboard zoom, the discrete counterpart to ctrl-wheel. Bound on the
+  // container rather than the document so the editor's own text inputs
+  // keep their keys; the canvas takes focus on pointerdown below, so the
+  // keys work after any interaction with it.
+  container.tabIndex = 0;
+  container.addEventListener('keydown', (e) => {
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA'
+        || (e.target && e.target.isContentEditable)) {
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) { return; }
+    if (e.key === '-' || e.key === '_') {
+      e.preventDefault(); zoomBy(1 / ZOOM_STEP);
+    } else if (e.key === '=' || e.key === '+') {
+      e.preventDefault(); zoomBy(ZOOM_STEP);
+    } else if (e.key === '0') {
+      e.preventDefault(); setZoom(1);
+    }
+  });
+  svg.addEventListener('pointerdown', () => {
+    // preventScroll: focusing must not yank an enclosing scroller.
+    try { container.focus({ preventScroll: true }); } catch (x) {}
+  }, true);
 
   // Map a pointer event to "world" (content) coordinates -- same
   // inverse-viewBox math the wheel handler uses. Needed for the

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -91,6 +92,19 @@ public:
   };
   Alignment alignment() const;
   const TensorInfo* info(const std::string& name) const;
+
+  // The safetensors `__metadata__` object, string -> string (the format
+  // permits no other value type).
+  //
+  // Worth exposing because for a LoRA it is not decoration: a
+  // peft/diffusers export states its `alpha` ONCE here rather than as a
+  // per-module tensor, and an adapter read without it applies at
+  // alpha == rank -- 16x its trained strength on the lightx2v files,
+  // with nothing to see but a bad video. Empty when the file carries
+  // none; for a sharded model it is the FIRST shard that carried one,
+  // the field being a file-level annotation rather than a model-level
+  // one.
+  const std::map<std::string, std::string>& metadata() const;
 
   // All tensor names in the checkpoint (unordered). Used by the model
   // quantizer to enumerate + classify every tensor.
@@ -228,6 +242,7 @@ private:
   // const and this is bookkeeping, not state a caller can observe.
   mutable std::vector<bool>                       _shard_unmappable_said;
   std::unordered_map<std::string, TensorInfo> _tensors;
+  std::map<std::string, std::string> _metadata;
   // Non-null when this checkpoint was loaded from a `.gguf`; owns the
   // GgufFile + converter and backs the shard==-2 tensors in load().
   std::unique_ptr<GgufBacking>                _gguf;

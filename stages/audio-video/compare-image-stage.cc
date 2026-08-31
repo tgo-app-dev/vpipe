@@ -388,6 +388,7 @@ CompareImageStage::publish_()
 Job
 CompareImageStage::process(RuntimeContext& ctx)
 {
+  ++_process_calls;
   resolve_roles_(ctx);
 
   if (!_want_a && !_want_b) {
@@ -405,7 +406,32 @@ CompareImageStage::process(RuntimeContext& ctx)
   vector<unsigned> ports;
   if (_want_a) { ports.push_back(0); }
   if (_want_b) { ports.push_back(1); }
-  co_await ctx.read_any(ports);
+
+  // WAIT ON THE LIVE INPUTS ONLY. read_any treats a drained-and-closed
+  // port as perpetually ready, so keeping one in the wait set makes the
+  // wait return AT ONCE -- and while the other input has not produced
+  // yet, this stage then wakes, drains nothing, finds all_eos false
+  // because that other input is still live, and re-arms immediately.
+  //
+  // That spin is not merely wasteful. It occupies a worker for as long
+  // as the live producer takes to speak, and under enough CPU
+  // oversubscription it can starve the very producer it is waiting for
+  // -- so the pair never publishes AT ALL. It is the one input wired
+  // and silent case, i.e. exactly what
+  // `one_side_only_leaves_other_black` covers; that test reached a
+  // 10-SECOND deadline about one run in 100-150 under a 12-way load,
+  // which is what a starved producer looks like from the outside. A
+  // flat sleep could not distinguish it from "slow" and reported it as
+  // rare test noise for a long time.
+  //
+  // An empty live set means every wired input is finished, and the
+  // retirement check below is what acts on that -- so the wait is
+  // simply skipped rather than being asked to block on nothing.
+  vector<unsigned> live;
+  for (unsigned p : ports) {
+    if (!ctx.eos(p)) { live.push_back(p); }
+  }
+  if (!live.empty()) { co_await ctx.read_any(live); }
 
   // Drain both backlogs, keeping only the newest frame per side -- an
   // unread backlog is still consumed so the producer isn't

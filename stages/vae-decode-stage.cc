@@ -1,5 +1,7 @@
 #include "stages/vae-decode-stage.h"
 
+#include <cstring>
+
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -114,7 +116,21 @@ const PortSpec kOports[] = {
           "carrying {frame, frames, fps} in its sideband, so a consumer "
           "knows where in the clip it sits and how many follow",
    .type = &typeid(TensorBeatPayload),
+   // The DECLARED group is the image answer; the real one is resolved
+   // per checkpoint in oport_clock_group(), because a video family
+   // emits F of these per latent and an image family one. See that
+   // override -- the analyzer reads it, not this.
    .tags = "rgb-frames", .clock_group = 0},
+  {.name = "clip",
+   .doc = "OPTIONAL: the same pixels as ONE beat, planar U8 RGB "
+          "[frames, 3, H, W] with {frames, fps} on the sideband -- the "
+          "shape temporal-stack builds, so it is what a "
+          "reference-conditioned model takes. Written only for a VIDEO "
+          "latent and only when a consumer is wired, because building it "
+          "costs a copy of the whole clip. oport0 is unchanged, so a "
+          "graph that wants frames needs no unpacking",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-clip", .clock_group = 0},
 };
 const StageSpec kSpec = {
   .type_name = "vae-decode",
@@ -123,7 +139,8 @@ const StageSpec kSpec = {
                "images and for video both. An IMAGE latent produces one "
                "beat; a VIDEO latent produces ONE BEAT PER FRAME, so the "
                "downstream is the per-frame machinery that already exists "
-               "(save-image, rgb-to-video -> save-video, a preview). Which "
+               "(save-image, rgb-to-video -> save-video, a preview), and "
+               "optionally the whole clip in one beat on oport1. Which "
                "decoder runs is the resident family's, and a family "
                "registered by a plugin decodes its own.",
   .display_name = "VAE Decode",
@@ -260,6 +277,42 @@ VaeDecodeStage::reset_run_state()
   _arena_decided = 0;
   _arena_stated  = 0;
   _idle_peers.clear();
+}
+
+unsigned
+VaeDecodeStage::oport_clock_group(unsigned p) const noexcept
+{
+  // The clip is one beat per latent whatever the family, so it always
+  // shares the latent's clock. That is the port a feedback loop closes
+  // through, and it is true by construction rather than by probe.
+  if (p != 0) { return 0; }
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_oport0_group < 0) {
+    // The IMAGE answer is the fallback, not a guess dressed as one: it
+    // is what this stage reported for every checkpoint before it could
+    // tell them apart, so a probe that comes up empty changes nothing
+    // rather than splitting a domain nobody asked to have split.
+    _oport0_group = 0;
+    try {
+      if (!_hf_dir.empty()) {
+        const std::string root = resolve_model_dir(session(), _hf_dir);
+        const std::string fam  = vae_family_(resolve_vae_dir(root));
+        // The two families whose oport0 emits F beats for one latent.
+        // A registered out-of-tree family is not classified here: it
+        // decides per LATENT (rank 4 is a clip), so there is nothing to
+        // read off the checkpoint, and it keeps the old answer.
+        if (fam == "wan" || fam == "minimax-h3") { _oport0_group = 1; }
+      }
+    } catch (...) {
+      // noexcept, and a checkpoint that cannot be probed must not take
+      // the launch down over a clock label.
+    }
+  }
+  return (unsigned)_oport0_group;
+#else
+  return 0;
+#endif
 }
 
 std::vector<ResourceClaim>
@@ -834,6 +887,57 @@ forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
 
 }  // namespace
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+
+std::unique_ptr<TensorBeatPayload>
+VaeDecodeStage::begin_clip_(RuntimeContext& ctx, int F, int H, int W) const
+{
+  // Nothing wired, nothing built. Returning null rather than a flag
+  // means no caller can hold a flag that disagrees with a pointer.
+  if (!(ctx.num_oports() > 1 && ctx.has_consumers(1))) { return nullptr; }
+  if (F <= 0 || H <= 0 || W <= 0) { return nullptr; }
+  auto clip = std::make_unique<TensorBeatPayload>();
+  clip->dtype = TensorBeat::DType::U8;
+  clip->shape = {(std::int64_t)F, 3, (std::int64_t)H, (std::int64_t)W};
+  clip->resize_contiguous((std::size_t)F * 3 * (std::size_t)H * W);
+  return clip;
+}
+
+void
+VaeDecodeStage::add_to_clip_(TensorBeatPayload* clip, int f,
+                             const TensorBeatPayload& frame)
+{
+  if (clip == nullptr) { return; }
+  const std::size_t per = frame.byte_size();
+  if (per == 0) { return; }
+  const std::size_t off = (std::size_t)f * per;
+  // Bounds-checked rather than trusted: F comes from the decoder and
+  // the frame geometry from the family, and a clip built from a
+  // disagreement between them would be a heap overwrite, not a bad
+  // picture.
+  if (off + per > clip->byte_size()) { return; }
+  std::memcpy(clip->as_u8() + off, frame.bytes_(), per);
+}
+
+void
+VaeDecodeStage::finish_clip_(TensorBeatPayload* clip, double fps,
+                             const TensorBeatPayload& src) const
+{
+  if (clip == nullptr) { return; }
+  // The same keys temporal-stack puts on a stacked video group, so a
+  // consumer cannot tell where its clip was built. `frames` is read off
+  // the leading extent rather than being a second opinion about it.
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert_or_assign(
+      "frames",
+      FlexData::make_int(clip->shape.empty() ? 0 : clip->shape[0]));
+  sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+  clip->sideband = std::move(sb);
+  forward_model_name_(src, *clip);
+}
+
+#endif
+
 Job
 VaeDecodeStage::process(RuntimeContext& ctx)
 {
@@ -1190,6 +1294,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
                           "to {}", this->id(), F, H, W, rd));
     }
     if (_unload_idle) { unload_vae_(); }
+    // The clip, when a consumer asked for one. Filled frame by frame
+    // from the beats below rather than from a second pass over `rgb`,
+    // so the conversion lives in exactly one place and the two ports
+    // cannot drift apart in what they show.
+    auto clip = begin_clip_(ctx, F, H, W);
     for (int f = 0; f < F; ++f) {
       auto out = std::make_unique<TensorBeatPayload>();
       out->dtype = TensorBeat::DType::U8;
@@ -1229,8 +1338,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
       out->sideband = std::move(sb);
       forward_model_name_(*tbp, *out);
+      add_to_clip_(clip.get(), f, *out);
       ++_images_emitted;
       co_await ctx.write(0, std::move(out));
+    }
+    if (clip) {
+      finish_clip_(clip.get(), fps, *tbp);
+      auto payload = std::move(clip);
+      co_await ctx.write(1, std::move(payload));
     }
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): decoded [{}, {}, {}, {}] -> {} frames "
@@ -1398,9 +1513,25 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         "VaeDecodeStage('{}'): family '{}' decoded {} -> {} frames",
         this->id(), _family, tbp->describe(), seen));
     if (_unload_idle) { unload_vae_(); }
+    // Only a VIDEO latent gets a clip: emitting [1, 3, H, W] for a still
+    // would invent a one-frame CLIP, which is a different request from a
+    // picture to every consumer that reads references.
+    auto clip = (is_video && !frames.empty() && frames[0] != nullptr
+                 && frames[0]->shape.size() == 3)
+                    ? begin_clip_(ctx, (int)frames.size(),
+                                  (int)frames[0]->shape[1],
+                                  (int)frames[0]->shape[2])
+                    : nullptr;
+    int clip_at = 0;
     for (auto& f : frames) {
+      add_to_clip_(clip.get(), clip_at++, *f);
       ++_images_emitted;
       co_await ctx.write(0, std::move(f));
+    }
+    if (clip) {
+      finish_clip_(clip.get(), fps, *tbp);
+      auto payload = std::move(clip);
+      co_await ctx.write(1, std::move(payload));
     }
     co_return;
   }
@@ -1526,9 +1657,22 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         "[3, {}, {}] @ {:.3f} fps", this->id(), Cz, T, h8, w8,
         frames.size(), H, W, fps));
     if (_unload_idle) { unload_vae_(); }
+    auto clip = (!frames.empty() && frames[0] != nullptr
+                 && frames[0]->shape.size() == 3)
+                    ? begin_clip_(ctx, (int)frames.size(),
+                                  (int)frames[0]->shape[1],
+                                  (int)frames[0]->shape[2])
+                    : nullptr;
+    int clip_at = 0;
     for (auto& f : frames) {
+      add_to_clip_(clip.get(), clip_at++, *f);
       ++_images_emitted;
       co_await ctx.write(0, std::move(f));
+    }
+    if (clip) {
+      finish_clip_(clip.get(), fps, *tbp);
+      auto payload = std::move(clip);
+      co_await ctx.write(1, std::move(payload));
     }
     co_return;
   }

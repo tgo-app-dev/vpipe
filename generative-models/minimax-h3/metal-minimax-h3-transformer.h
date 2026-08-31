@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "generative-models/shared/runtime-lora.h"
 
 namespace vpipe {
 namespace genai {
@@ -328,6 +329,26 @@ class MetalMiniMaxH3Transformer {
   // GEMMs entirely, so "off" is exactly off.
   void set_lora_scale(float s) { _lora_scale = s; }
   float lora_scale() const { return _lora_scale; }
+
+  // Where row `r` of part `pt` (0 = q, 1 = k, 2 = v) of a SPLIT adapter
+  // lands in the fused [3 * inner] qkv output.
+  //
+  // Public and static because it is the one piece of the diffusers
+  // conversion that has to agree with something else: the forward's own
+  // Q_OFF / K_OFF / V_OFF and QKV_HSTRIDE, which describe the same
+  // layout for the buffers it hands the attention. If those two ever
+  // disagree the adapter lands on the wrong channels and nothing fails
+  // -- see the test that pins them together.
+  //
+  //   flat     [ all q | all k | all v ]        -- Comfy-Org's repack
+  //   per head [ q0 k0 v0 | q1 k1 v1 | ... ]    -- MiniMaxAI's releases
+  static int qkv_fused_row(int pt, int r, int inner, int head_dim,
+                           bool per_head)
+  {
+    if (!per_head) { return pt * inner + r; }
+    const int h = r / head_dim, d = r % head_dim;
+    return h * 3 * head_dim + pt * head_dim + d;
+  }
 
   // Leading blocks pinned resident in streaming mode (0 = pure streaming,
   // or preloaded). For logging the RAM-for-speed decision.
@@ -671,7 +692,13 @@ class MetalMiniMaxH3Transformer {
  private:
   // Defined with the runtime-LoRA members below; declared here because
   // gemm_ and its dispatchers take one by pointer.
-  struct LoraFactors;
+  // The shared factor pair (generative-models/shared/runtime-lora.h):
+  // A [rank, K] and B [N, rank], both bf16 and both in the checkpoint's
+  // own orientation. An ALIAS rather than a second definition -- the
+  // reader of the adapter file and the forward that applies it have to
+  // agree about the layout, and two structs that merely look alike agree
+  // only until one of them moves.
+  using LoraFactors = lora::Factors;
 
   MetalMiniMaxH3Transformer() = default;
 
@@ -1014,11 +1041,6 @@ class MetalMiniMaxH3Transformer {
   // One projection's factors. A [rank, K] and B [N, rank], both bf16 and
   // both in the checkpoint's own orientation, so the same transposed-W
   // GEMM serves them: t = x A^T, then y += t B^T.
-  struct LoraFactors {
-    metal_compute::SharedBuffer a, b;
-    int rank = 0;
-    bool empty() const { return rank <= 0 || a.empty() || b.empty(); }
-  };
   struct BlockLora {
     LoraFactors qkv, out, fc1, fc2, adaln;
     bool any() const

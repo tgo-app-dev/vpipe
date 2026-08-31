@@ -186,9 +186,29 @@ private:
     return _channels > 0 ? _chunk_buf.size() / (std::size_t)_channels : 0;
   }
   // UTC microseconds of the FIRST sample in `_chunk_buf`. Set on the
-  // first appended packet of a chunk; reset to 0 after emit.
+  // first appended packet of a chunk; after an emit it advances to the
+  // first RETAINED sample (see `_chunk_overlap_s`), or resets to 0 when
+  // nothing is retained.
   std::uint64_t      _chunk_first_ts_us = 0;
   bool               _chunk_has_ts      = false;
+
+  // Seconds of the emitted chunk kept in the buffer so the NEXT chunk
+  // begins with them. 0 (the default) is the old behaviour exactly: the
+  // buffer is cleared and consecutive chunks share no samples.
+  double             _chunk_overlap_s   = 0.0;
+  // The overlap in sample frames, clamped to what was emitted. Zero
+  // when there is no overlap, which is the path that clears.
+  std::size_t overlap_frames_(std::size_t emitted) const
+  {
+    if (_chunk_overlap_s <= 0.0 || _output_sample_rate <= 0) { return 0; }
+    const std::size_t want = (std::size_t)(_chunk_overlap_s
+                                           * _output_sample_rate);
+    // Never the whole chunk: retaining everything would leave the
+    // buffer at or past the emit threshold with no new samples, and the
+    // stage would emit the same window forever. The ctor refuses an
+    // overlap >= chunk_duration_s, so this is the belt to that braces.
+    return want >= emitted ? (emitted > 0 ? emitted - 1 : 0) : want;
+  }
 
   // Bookkeeping for test / log.
   std::uint64_t      _chunks_emitted    = 0;

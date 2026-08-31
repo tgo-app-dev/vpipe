@@ -59,6 +59,13 @@ public:
   std::vector<std::int64_t> shape;
   std::vector<std::uint8_t> bytes;
   FlexData sideband;
+  // Every group, not just the last: an overlap is a claim about what
+  // CONSECUTIVE groups share, so one group's contents cannot show it.
+  // `fills` is the leading byte of each frame in a video group, which
+  // frame_() sets to a per-frame marker.
+  std::vector<std::vector<std::int64_t>> all_shapes;
+  std::vector<std::vector<std::uint8_t>> fills;
+  std::vector<std::uint64_t> group_ts;
 
   Job
   process(RuntimeContext& ctx) override
@@ -70,6 +77,26 @@ public:
       shape = tb->shape;
       bytes.assign(tb->data.begin(), tb->data.end());
       sideband = tb->sideband;
+      all_shapes.push_back(tb->shape);
+      std::vector<std::uint8_t> f;
+      if (tb->shape.size() == 4 && !tb->data.empty()) {
+        const std::size_t per = (std::size_t)tb->shape[1] * tb->shape[2]
+                                * tb->shape[3];
+        for (std::int64_t k = 0; k < tb->shape[0]; ++k) {
+          const std::size_t off = (std::size_t)k * per;
+          if (off < tb->data.size()) { f.push_back(tb->data[off]); }
+        }
+      }
+      fills.push_back(std::move(f));
+      std::uint64_t ts = 0;
+      if (tb->sideband.is_object()) {
+        FlexData sb = tb->sideband;
+        auto o = sb.as_object();
+        if (o.contains("timestamp_us")) {
+          ts = (std::uint64_t)o.at("timestamp_us").as_uint(0);
+        }
+      }
+      group_ts.push_back(ts);
     }
     co_return;
   }
@@ -370,4 +397,110 @@ TEST(temporal_stack, the_ceiling_emits_and_ends)
               (long long)kept);
   EXPECT_TRUE(kept > 0 && kept < 40);
   EXPECT_TRUE(r.sink->bytes.size() <= (std::size_t)1 << 20);
+}
+
+// ---- overlap: what CONSECUTIVE groups share -------------------------
+//
+// The point of the feature is that group k+1 opens with the tail of
+// group k, so the assertion has to be about two groups at once. Every
+// frame carries a distinct fill byte, so a group's contents name
+// themselves.
+TEST(temporal_stack, overlap_carries_beats_into_the_next_group)
+{
+  std::vector<TensorBeat> beats;
+  for (int i = 1; i <= 6; ++i) {
+    beats.push_back(frame_(2, 2, (std::uint8_t)i, (std::uint64_t)i * 1000));
+  }
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("mode", FlexData::make_string("video"));
+  cfg.as_object().insert_or_assign("group_size", FlexData::make_int(3));
+  cfg.as_object().insert_or_assign("overlap", FlexData::make_int(1));
+  cfg.as_object().insert_or_assign("fps", FlexData::make_real(24.0));
+
+  Run r;
+  ASSERT_TRUE(drive_(r, std::move(beats), std::move(cfg)));
+  if (r.sink == nullptr) { return; }
+
+  // Groups advance by (group_size - overlap) = 2, and each opens with
+  // the last frame of the one before: {1,2,3} {3,4,5} {5,6}.
+  EXPECT_TRUE(r.sink->groups == 3);
+  if (r.sink->fills.size() != 3) {
+    std::printf("[temporal_stack] overlap: %zu group(s)\n",
+                r.sink->fills.size());
+    return;
+  }
+  const std::vector<std::vector<std::uint8_t>> want = {
+      {1, 2, 3}, {3, 4, 5}, {5, 6}};
+  for (std::size_t g = 0; g < want.size(); ++g) {
+    EXPECT_TRUE(r.sink->fills[g] == want[g]);
+    if (r.sink->fills[g] != want[g]) {
+      std::printf("[temporal_stack] group %zu:", g);
+      for (std::uint8_t v : r.sink->fills[g]) { std::printf(" %u", v); }
+      std::printf("\n");
+    }
+  }
+  // The retained frame's TIMESTAMP comes with it. Carrying the emitted
+  // group's would date each clip to a frame it no longer starts on --
+  // group 1 starts on frame 3, at 3000 us.
+  EXPECT_TRUE(r.sink->group_ts.size() == 3);
+  if (r.sink->group_ts.size() == 3) {
+    EXPECT_TRUE(r.sink->group_ts[0] == 1000);
+    EXPECT_TRUE(r.sink->group_ts[1] == 3000);
+    EXPECT_TRUE(r.sink->group_ts[2] == 5000);
+  }
+}
+
+// An overlap that leaves no room to advance would reopen the group
+// already full and emit for ever. Refused at CONFIG, where a graph can
+// still be fixed, rather than clamped to something the author did not
+// ask for.
+TEST(temporal_stack, an_overlap_that_cannot_advance_is_refused)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("group_size", FlexData::make_int(3));
+  cfg.as_object().insert_or_assign("overlap", FlexData::make_int(3));
+  auto s = std::make_unique<TemporalStackStage>(
+      &sess, "ts", std::vector<InEdge>{}, cfg);
+  EXPECT_FALSE(s->config_error().empty());
+
+  // One less, and it is a legal hop of 1.
+  auto ok = FlexData::make_object();
+  ok.as_object().insert_or_assign("group_size", FlexData::make_int(3));
+  ok.as_object().insert_or_assign("overlap", FlexData::make_int(2));
+  auto s2 = std::make_unique<TemporalStackStage>(
+      &sess, "ts2", std::vector<InEdge>{}, ok);
+  EXPECT_TRUE(s2->config_error().empty());
+}
+
+// Audio beats are variable-length on the time axis, so "the last N
+// beats" is not a duration. The stage says so and stacks without an
+// overlap rather than retaining a length nobody asked for.
+TEST(temporal_stack, overlap_does_not_apply_to_audio)
+{
+  std::vector<TensorBeat> beats;
+  beats.push_back(pcm_(1, 4, 0.0f, 16000));
+  beats.push_back(pcm_(1, 4, 100.0f, 16000));
+  beats.push_back(pcm_(1, 4, 200.0f, 16000));
+  beats.push_back(pcm_(1, 4, 300.0f, 16000));
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("mode", FlexData::make_string("audio"));
+  cfg.as_object().insert_or_assign("group_size", FlexData::make_int(2));
+  cfg.as_object().insert_or_assign("overlap", FlexData::make_int(1));
+
+  Run r;
+  ASSERT_TRUE(drive_(r, std::move(beats), std::move(cfg)));
+  if (r.sink == nullptr) { return; }
+
+  // Two groups of two chunks each, 8 samples apiece -- NOT the 12 that
+  // a retained chunk would add.
+  EXPECT_TRUE(r.sink->groups == 2);
+  EXPECT_TRUE(r.sink->all_shapes.size() == 2);
+  for (const auto& sh : r.sink->all_shapes) {
+    EXPECT_TRUE(sh.size() == 1 && sh[0] == 8);
+    if (!(sh.size() == 1 && sh[0] == 8)) {
+      std::printf("[temporal_stack] audio group shape %s\n",
+                  sh.empty() ? "(empty)" : std::to_string(sh[0]).c_str());
+    }
+  }
 }

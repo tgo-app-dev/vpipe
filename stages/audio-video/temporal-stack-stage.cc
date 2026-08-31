@@ -32,6 +32,16 @@ constexpr ConfigKey kAttrs[] = {
           "requests must set this, or every request after the first sees "
           "a producer that has already ended",
    .def_int = 0},
+  {.key = "overlap", .type = ConfigType::Int, .required = false,
+   .doc = "beats of each emitted group kept so the NEXT group opens with "
+          "them -- context that lets a consumer see what came just before. "
+          "BEATS, not seconds, the same unit group_size counts: at 24 fps "
+          "an overlap of 24 is one second. Must be < group_size, and the "
+          "group then advances by (group_size - overlap) beats per emit. "
+          "VIDEO and generic groups only -- for audio use audio-to-pcm's "
+          "chunk_overlap_s, which works in samples. 0 (default) = groups "
+          "share nothing",
+   .def_int = 0},
   {.key = "max_mb", .type = ConfigType::Int, .required = false,
    .doc = "ceiling on the accumulator, in MB (default 256). Reaching it "
           "emits what is held, WARNS, and ends the stream -- the group is "
@@ -140,11 +150,35 @@ TemporalStackStage::TemporalStackStage(const SessionContextIntf* s,
         "TemporalStackStage('{}'): mode '{}' is not auto|video|audio|generic",
         this->id(), m));
   }
+  _overlap = (int)attr_int("overlap");
+  if (_overlap < 0) {
+    session()->warn(fmt(
+        "TemporalStackStage('{}'): overlap {} is negative; using 0",
+        this->id(), _overlap));
+    _overlap = 0;
+  }
   _group_size = (int)attr_int("group_size");
   if (_group_size < 0) {
     fail_config(fmt(
         "TemporalStackStage('{}'): group_size {} is negative; 0 means "
         "accumulate to end-of-stream", this->id(), _group_size));
+  }
+  if (_overlap > 0 && _group_size > 0 && _overlap >= _group_size) {
+    // The group would reopen already full, emit again with no new beat,
+    // and never advance. Refused rather than clamped: the graph asked
+    // for a hop of zero or less, and quietly running a different one is
+    // how a wrong number becomes a runtime mystery.
+    fail_config(fmt(
+        "TemporalStackStage('{}'): overlap {} must be < group_size {} -- "
+        "the group advances by (group_size - overlap) beats, so this asks "
+        "it to advance by {}", this->id(), _overlap, _group_size,
+        _group_size - _overlap));
+  }
+  if (_overlap > 0 && _group_size == 0) {
+    session()->warn(fmt(
+        "TemporalStackStage('{}'): overlap {} has no effect with "
+        "group_size 0 -- that accumulates to end-of-stream, so there is "
+        "no next group to carry beats into", this->id(), _overlap));
   }
   const int mb = (int)attr_int("max_mb");
   if (mb <= 0) {
@@ -217,6 +251,7 @@ TemporalStackStage::sense(const TensorBeat& tb)
 void
 TemporalStackStage::reset_group_()
 {
+  _tail_meta.clear();
   _buf.clear();
   _elem_shape.clear();
   _count        = 0;
@@ -228,6 +263,51 @@ TemporalStackStage::reset_group_()
   _sample_rate  = 0;
   _fps_num      = 0.0;
   _fps_den      = 0.0;
+}
+
+int
+TemporalStackStage::retain_beats_() const noexcept
+{
+  if (_overlap <= 0 || _count <= 0) { return 0; }
+  // Audio beats are variable-length on the time axis, so N beats is not
+  // a duration; audio-to-pcm's chunk_overlap_s is the control that is.
+  if (_mode == Mode::kAudio) { return 0; }
+  // Never the whole group: reopening it full would emit again with no
+  // new beat. The ctor already refuses overlap >= group_size, so this
+  // only binds a SHORT group -- one cut off by EOS or the byte ceiling.
+  return _overlap < _count ? _overlap : _count - 1;
+}
+
+void
+TemporalStackStage::retain_tail_(int keep)
+{
+  const std::size_t per = (std::size_t)_count > 0
+                              ? _buf.size() / (std::size_t)_count
+                              : 0;
+  if (keep <= 0 || per == 0) { reset_group_(); return; }
+  const std::size_t drop = (std::size_t)(_count - keep) * per;
+  _buf.erase(_buf.begin(), _buf.begin() + (std::ptrdiff_t)drop);
+  _count = keep;
+  _tail  = 0;   // audio never gets here; see retain_beats_
+
+  // The rate metadata has to describe the beats that REMAIN. Anything
+  // else dates the next clip to a frame it no longer starts on, and the
+  // timestamp-derived fps is a span over beats that already went out.
+  while ((int)_tail_meta.size() > keep) { _tail_meta.pop_front(); }
+  _has_first_ts = false;
+  _first_ts_us  = 0;
+  _last_ts_us   = 0;
+  if (!_tail_meta.empty()) {
+    _first_sideband = _tail_meta.front().sb;
+    for (const auto& t : _tail_meta) {
+      if (!t.has_ts) { continue; }
+      if (!_has_first_ts) { _first_ts_us = t.ts; }
+      _has_first_ts = true;
+      _last_ts_us   = t.ts;
+    }
+  }
+  // _elem_shape, _dtype, _mode and the declared fps_num/fps_den are
+  // properties of the SOURCE, not of a group, and stay latched.
 }
 
 bool
@@ -289,6 +369,21 @@ TemporalStackStage::append_(const TensorBeat& tb, std::string* err)
   }
   if (sb_num_(tb.sideband, "fps_num", &v) && v > 0.0) { _fps_num = v; }
   if (sb_num_(tb.sideband, "fps_den", &v) && v > 0.0) { _fps_den = v; }
+
+  // The last `_overlap` beats' rate metadata, for the retention after
+  // the next emit. Kept only when an overlap is configured, and bounded
+  // by it, so the default path allocates nothing.
+  if (_overlap > 0) {
+    TailMeta tm;
+    tm.sb = tb.sideband;
+    double ts = 0.0;
+    if (sb_num_(tb.sideband, "timestamp_us", &ts) && ts >= 0.0) {
+      tm.has_ts = true;
+      tm.ts     = (std::uint64_t)ts;
+    }
+    _tail_meta.push_back(std::move(tm));
+    while ((int)_tail_meta.size() > _overlap) { _tail_meta.pop_front(); }
+  }
   return true;
 }
 
@@ -404,11 +499,22 @@ TemporalStackStage::emit_(RuntimeContext& ctx)
           "wrong speed with nothing to complain about", this->id()));
     }
   }
-  reset_group_();
+  if (_overlap > 0 && _mode == Mode::kAudio && !_overlap_audio_warned) {
+    _overlap_audio_warned = true;
+    session()->warn(fmt(
+        "TemporalStackStage('{}'): overlap {} is ignored for an AUDIO "
+        "group -- its beats are variable-length on the time axis, so N "
+        "beats is not a duration. Set audio-to-pcm's chunk_overlap_s "
+        "instead; it works in samples and owns the chunking",
+        this->id(), _overlap));
+  }
+  const int keep = retain_beats_();
+  if (keep > 0) { retain_tail_(keep); } else { reset_group_(); }
   ++_emitted;
   session()->log_debug(fmt(
-      "TemporalStackStage('{}'): group #{} of {} beat(s) -> {}", this->id(),
-      _emitted, n, shape_str_(tb.shape)));
+      "TemporalStackStage('{}'): group #{} of {} beat(s) -> {}{}", this->id(),
+      _emitted, n, shape_str_(tb.shape),
+      keep > 0 ? fmt(" (keeping {} for the next)", keep)() : std::string()));
   auto payload = make_payload<TensorBeatPayload>(std::move(tb));
   co_await ctx.write(0, std::move(payload));
   co_return;

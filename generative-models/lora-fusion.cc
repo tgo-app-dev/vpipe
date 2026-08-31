@@ -7,6 +7,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/safetensors-writer.h"
 #include "generative-models/shared/comfy-output-config.h"
+#include "generative-models/shared/lora-names.h"
 #include "interfaces/session-context-intf.h"
 
 #include <cstdint>
@@ -88,45 +89,6 @@ from_f32(const std::vector<float>& w, const std::string& dtype)
 const std::string kSufA = ".lora_A.weight";
 const std::string kSufB = ".lora_B.weight";
 
-void
-replace_all(std::string& s, const std::string& from, const std::string& to)
-{
-  if (from.empty()) { return; }
-  std::size_t p = 0;
-  while ((p = s.find(from, p)) != std::string::npos) {
-    s.replace(p, from.size(), to);
-    p += to.size();
-  }
-}
-
-// Map an ai-toolkit / ComfyUI adapter module name ("diffusion_model.*") to the
-// diffusers base-weight name used by the Krea-2 DiT. Handles the three block
-// containers (blocks -> transformer_blocks; txtfusion.{layerwise,refiner}_blocks
-// -> text_fusion.{...}) and the per-block submodule renames (mlp -> ff; attn
-// wq/wk/wv/wo/gate -> to_q/to_k/to_v/to_out.0/to_gate). Returns "" when the
-// module isn't in that convention.
-std::string
-remap_ai_toolkit(std::string m)
-{
-  const std::string kPre = "diffusion_model.";
-  if (m.size() < kPre.size() || m.compare(0, kPre.size(), kPre) != 0) {
-    return {};
-  }
-  m = m.substr(kPre.size());
-  if (m.compare(0, 7, "blocks.") == 0) {
-    m = "transformer_" + m;              // blocks.N -> transformer_blocks.N
-  } else {
-    replace_all(m, "txtfusion.", "text_fusion.");   // layerwise/refiner_blocks
-  }
-  replace_all(m, ".mlp.", ".ff.");        // mlp.{gate,up,down} -> ff.{...}
-  replace_all(m, ".attn.wq", ".attn.to_q");
-  replace_all(m, ".attn.wk", ".attn.to_k");
-  replace_all(m, ".attn.wv", ".attn.to_v");
-  replace_all(m, ".attn.wo", ".attn.to_out.0");
-  replace_all(m, ".attn.gate", ".attn.to_gate");
-  return m;
-}
-
 // A resolved LoRA/LoKr adapter targeting one base weight.
 struct Adapter {
   bool        lokr = false;
@@ -191,7 +153,7 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
       const std::string s = module.substr(dot + 1) + ".weight";
       if (base.info(s) != nullptr) { return s; }
     }
-    const std::string rm = remap_ai_toolkit(module);
+    const std::string rm = lora::remap_ai_toolkit_module(module);
     if (!rm.empty() && base.info(rm + ".weight") != nullptr) {
       return rm + ".weight";
     }
@@ -253,7 +215,15 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
     }
   }
   if (fuse.empty()) {
-    return fail("lora-fuse: no LoRA tensors matched the base model");
+    return fail(
+        "lora-fuse: no LoRA tensors matched the base model. This path "
+        "reads `<module>.lora_{A,B}.weight` against the base's own "
+        "module names; a peft/diffusers export spells its factors "
+        "`.lora_A.<adapter>.weight` and may DECOMPOSE a projection the "
+        "base fuses (separate to_q/to_k/to_v against one qkv_proj), "
+        "which is a conversion and not a name match. Those load through "
+        "the RUNTIME adapter instead -- the `lora` key on the model's "
+        "config stage");
   }
 
   std::error_code ec;

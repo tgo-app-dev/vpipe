@@ -100,6 +100,40 @@ const ConfigKey kAttrs[] = {
           "block matmuls, ~2x their f16 rate at int8 quality; IGNORED "
           "without NAX matmul2d (matrix-core GPU + kernels). Default "
           "false; env VPIPE_I8_GEMM overrides"},
+  // The adapter lives HERE, on the stage that loads the DiT, and not
+  // only on the family's config source.
+  //
+  // It is not a family-specific knob the way klein_kv is -- every DiT
+  // here can carry one -- so it belongs beside `i8_gemm`, which is the
+  // other cross-family argument to the same load. Putting it ONLY on
+  // the config source made it possible to configure an adapter, see the
+  // source report it, and have nothing happen: that beat fans out to
+  // whichever stages a graph wires it to, and a graph that wired it to
+  // the diffusion-conditioner alone -- for the `vl_*` keys it also
+  // carries -- dropped the adapter without a word.
+  //
+  // A model_config beat that NAMES these still wins, so one source can
+  // still drive a whole graph.
+  {.key = "lora", .type = ConfigType::String, .required = false,
+   .doc = "a LoRA applied AT RUNTIME -- every adapted projection computes "
+          "W x + scale * B (A x) rather than having the delta folded into "
+          "the weights, which for a quantized base is the difference "
+          "between keeping a small correction and rounding it away. A "
+          "registered model, a directory holding one .safetensors, or a "
+          "path to one. Krea-2 and FLUX.2 only. LOAD-time: it decides how "
+          "the blocks are BUILT, so a beat that changes it once the DiT "
+          "is up is reported and ignored. A `lora` on the family's "
+          "model-config beat OVERRIDES this",
+   .suggest_db = kModelRegistryDb,
+   // Both families this stage can adapt. A comma list so the picker
+   // offers either and refuses the rest -- a Krea-2 adapter on a FLUX.2
+   // DiT binds nothing and says so, but not until it has been fetched.
+   .suggest_db_type = "krea2-lora,flux2-lora"},
+  {.key = "lora_scale", .type = ConfigType::Real, .required = false,
+   .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
+          "GEMM as a constant, so it can be swept without a reload. 1.0 = "
+          "as trained; 0 skips both adapter GEMMs, so off is exactly off",
+   .def_real = 1.0},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -143,12 +177,16 @@ const PortSpec kIports[] = {
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "model_config",
    .doc = "OPTIONAL model-specific parameters from the resident family's own "
-          "config source -- flux2-model-config (the klein-kv recipe) or "
-          "mage-flow-model-config (the provenance watermark). Passed to that "
-          "family's own params struct UNREAD, so this stage carries none of "
-          "the knobs. Wiring it DEFERS the DiT load to the first beat, "
-          "because a recipe like klein_kv has to be known before the weights "
-          "are read",
+          "config source -- flux2-model-config (the klein-kv recipe and its "
+          "`lora`), krea2-model-config (its `lora`), or mage-flow-model-config "
+          "(the provenance watermark). Passed to that family's own params "
+          "struct UNREAD, so this stage carries none of the knobs. Wiring it "
+          "DEFERS the DiT load to the first beat, because a recipe like "
+          "klein_kv -- or an adapter, which decides how the blocks are built "
+          "-- has to be known before the weights are read. THE ADAPTER KEYS "
+          "ARE READ HERE AND NOWHERE ELSE: a krea2-model-config wired only to "
+          "the diffusion-conditioner delivers its `vl_*` keys and its `lora` "
+          "goes nowhere, silently",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -247,6 +285,8 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // faster. klein_kv chooses a RECIPE, so on the wrong checkpoint it
   // does not run slower, it runs wrong.
   _i8_gemm = attr_bool("i8_gemm");
+  _lora       = attr_str("lora");
+  _lora_scale = attr_real("lora_scale");
   _seed   = (std::uint64_t)attr_int("seed");
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
@@ -690,12 +730,57 @@ GenerateImageStage::apply_model_config_()
     return false;
   }
   std::string perr;
+  // The adapter keys, read the same way by every family that has one.
+  // The PATH is a LOAD-TIME argument -- it decides whether a
+  // fused-activation weave could be built at all -- so a beat that
+  // changes it once the DiT is up is reported rather than dropped in
+  // silence. The STRENGTH is live: it rides the adapter's GEMM as a
+  // constant, so it can be swept without rebuilding anything.
+  auto adapter_keys = [&](const char* what, bool loaded, std::string& ref,
+                          double& scale, auto&& push_scale) {
+    if (!_model_cfg.is_object()) { return; }
+    FlexData cfg = _model_cfg;
+    auto o = cfg.as_object();
+    // An ABSENT key keeps what a previous beat set. A beat carrying
+    // other keys and not these is saying nothing about the adapter, and
+    // reading that as "drop it" would make an unrelated re-emission
+    // silently un-adapt the run.
+    const std::string lp =
+        o.contains("lora") ? std::string(o.at("lora").as_string("")) : ref;
+    const double ls = o.contains("lora_scale")
+                          ? o.at("lora_scale").as_real(1.0) : scale;
+    if (loaded && lp != ref) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the {} DiT is already loaded, so the "
+          "model_config beat's `lora` is IGNORED -- it is a load-time "
+          "argument. `lora_scale` still applies", this->id(), what));
+    } else {
+      ref = lp;
+    }
+    if (ls != scale) {
+      scale = ls;
+      push_scale((float)ls);
+    }
+  };
   if (_family == "flux2") {
     _flux2_params =
         genai::MetalFlux2Transformer::GenerationParams::from_flex(_model_cfg,
                                                                   &perr);
+    adapter_keys("FLUX.2", _flux2_dit != nullptr, _lora,
+                 _lora_scale, [&](float s) {
+                   if (_flux2_dit && _flux2_dit->lora_modules() > 0) {
+                     _flux2_dit->set_lora_scale(s);
+                   }
+                 });
   } else if (_family == "mage-flow") {
     _wm_params = genai::mage_wm::Params::from_flex(_model_cfg, &perr);
+  } else if (_family == "krea2") {
+    adapter_keys("Krea-2", _dit != nullptr, _lora, _lora_scale,
+                 [&](float s) {
+                   if (_dit && _dit->lora_modules() > 0) {
+                     _dit->set_lora_scale(s);
+                   }
+                 });
   }
   if (!perr.empty() && !_model_cfg.is_null()) {
     session()->warn(fmt("GenerateImageStage('{}'): model_config: {}",
@@ -794,9 +879,10 @@ GenerateImageStage::ensure_loaded_()
         stream_blocks = (std::atoi(e) != 0);
       }
       session()->log_debug(fmt(
-          "GenerateImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) + 6 "
-          "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
-          plan.others >> 30, phys_ram() >> 30,
+          "GenerateImageStage('{}'): FLUX.2 footprint {} GB (others {} GB) "
+          "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
+          plan.footprint >> 30, plan.others >> 30,
+          model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
           stream_blocks ? "STREAM blocks" : "PRELOAD"));
     }
     genai::MetalFlux2Transformer::Config fcfg;
@@ -821,8 +907,12 @@ GenerateImageStage::ensure_loaded_()
             _flux2_params.klein_kv ? "true" : "false"));
       }
     }
+    genai::MetalFlux2Transformer::LoraSpec lspec;
+    lspec.path  = adapter_file_(_lora);
+    lspec.scale = (float)_lora_scale;
     _flux2_dit = genai::MetalFlux2Transformer::load(
-        weight_set_(dit_dir), mc, fcfg, stream_blocks);
+        weight_set_(dit_dir), mc, fcfg, stream_blocks,
+        lspec.path.empty() ? nullptr : &lspec);
     if (!_flux2_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
@@ -860,8 +950,8 @@ GenerateImageStage::ensure_loaded_()
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Qwen-Image-Edit footprint {} GB (others {} "
         "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
-        plan.footprint >> 30, model_memory::kStreamHeadroom >> 30,
-        plan.others >> 30, phys_ram() >> 30,
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     genai::MetalQwenImageTransformer::Config qcfg;
     _qie_dit = genai::MetalQwenImageTransformer::load(
@@ -912,7 +1002,8 @@ GenerateImageStage::ensure_loaded_()
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Boogu footprint {} GB (others {} GB) + {} "
         "GB headroom vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
-        plan.others >> 30, phys_ram() >> 30,
+        plan.others >> 30, model_memory::kStreamHeadroom >> 30,
+        phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     // Cache the load params so the stage can free the DiT for a big decode and
     // reload it on the next prompt (free_boogu_dit_for_decode_).
@@ -955,9 +1046,10 @@ GenerateImageStage::ensure_loaded_()
       stream_blocks = (std::atoi(e) != 0);
     }
     session()->log_debug(fmt(
-        "GenerateImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) + 6 "
-        "GB vs {} GB RAM -> {}", this->id(), plan.footprint >> 30,
-        plan.others >> 30, phys_ram() >> 30,
+        "GenerateImageStage('{}'): Mage-Flow footprint {} GB (others {} GB) "
+        "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
         stream_blocks ? "STREAM blocks" : "PRELOAD"));
     auto mcfg = genai::mage_flow_dit_config();
     _mage_dit = genai::MetalMageFlowTransformer::load(
@@ -982,9 +1074,43 @@ GenerateImageStage::ensure_loaded_()
     if (stream_blocks) { revise_dit_declaration_(dit_dir); }
     _mage_shift = mage_static_shift_(root);
   } else {
+    // Stream the 28 transformer blocks when the box cannot hold the DiT
+    // beside the conditioner's encoder -- the same rule the other four
+    // image families take, from the same plan_streaming(), rather than a
+    // fifth answer to one question.
+    //
+    // KREA-2 WAS THE FAMILY THAT NEVER ASKED. It loaded unconditionally
+    // and decided only whether to drop per-forward scratch, on the
+    // reasoning below: its weights are mmapped and therefore evictable
+    // under pressure. That holds for a QUANTIZED checkpoint. It does not
+    // hold for raw bf16, which is read `Copied` like every other LM and
+    // tower in this tree (see the WeightSet residency rule) -- so the 28
+    // blocks land in dirty, non-reclaimable buffers and the box swaps
+    // instead of evicting. MEASURED: ~7 GB of swap on a 24 GB M5 Pro
+    // with the bf16 weights, where the plan says stream.
+    bool stream_blocks;
+    {
+      const auto plan = model_memory::plan_streaming(
+          session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+      stream_blocks = plan.stream;
+      if (const char* e = std::getenv("VPIPE_KREA2_STREAM")) {
+        stream_blocks = (std::atoi(e) != 0);
+      }
+      session()->log_debug(fmt(
+          "GenerateImageStage('{}'): Krea-2 footprint {} GB (others {} GB) "
+          "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
+          plan.footprint >> 30, plan.others >> 30,
+          model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+          stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    }
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
-    _dit = genai::MetalKrea2Transformer::load(weight_set_(dit_dir), mc, kcfg);
+    genai::MetalKrea2Transformer::LoraSpec lspec;
+    lspec.path  = adapter_file_(_lora);
+    lspec.scale = (float)_lora_scale;
+    _dit = genai::MetalKrea2Transformer::load(
+        weight_set_(dit_dir), mc, kcfg, stream_blocks,
+        lspec.path.empty() ? nullptr : &lspec);
     if (!_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the DiT from '{}'; inert",
@@ -994,27 +1120,69 @@ GenerateImageStage::ensure_loaded_()
     // Cache the resolved dir (reload after a decode-driven free) + the VAE base
     // channels for the decode-peak estimate (shared MetalKrea2Vae -> base_dim).
     _krea2_dit_dir = dit_dir;
+    _krea2_stream  = stream_blocks;
     _vae_base = krea2_vae_base_(root);
-    // The Krea-2 DiT mmaps its quantized weights (evictable under GPU memory
-    // pressure), but the conditioner's dense text encoder is copied into dirty,
-    // non-reclaimable buffers resident in this process. When the box can't hold
-    // encoder + DiT + a large VAE decode at once, drop the DiT's per-forward
-    // scratch after each generation so its working set doesn't crowd out the
-    // downstream vae-decode stage.
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    // Drop the DiT's per-forward scratch after each generation when the
+    // box cannot hold encoder + DiT + a large VAE decode at once, so its
+    // working set does not crowd out the downstream vae-decode.
+    //
+    // Kept as its OWN question rather than folded into the streaming
+    // one: releasing scratch is the milder measure and answers to the
+    // smaller kHeadroom, so a box that is tight without being tight
+    // enough to stream still gets it -- which is what this stage did
+    // before streaming was wired in, and there is no reason to take it
+    // away.
     const std::vector<std::string> peers = {dit_dir, enc_dir};
     _release_scratch =
+        stream_blocks ||
         model_memory::bounded(session(), peers, model_memory::kHeadroom);
     session()->log_debug(fmt(
-        "GenerateImageStage('{}'): Krea2 footprint {} GB + {} GB headroom vs {} "
-        "GB RAM -> {} DiT scratch", this->id(),
+        "GenerateImageStage('{}'): Krea-2 scratch: footprint {} GB + {} GB "
+        "headroom vs {} GB RAM -> {}", this->id(),
         model_memory::weight_footprint(session(), peers) >> 30,
-        phys_ram() >> 30, _release_scratch ? "RELEASE" : "keep"));
+        model_memory::kHeadroom >> 30, phys_ram() >> 30,
+        _release_scratch ? "RELEASE" : "keep"));
   }
   session()->log_debug(fmt(
       "GenerateImageStage('{}'): {} DiT ready{}",
       this->id(), _family,
       _strength > 0.0 ? "; img2img init latent expected on a ref_latent iport"
                       : ""));
+}
+
+// The config names a MODEL (a registry key), a directory or a file;
+// this is the one place that turns any of those into the single
+// .safetensors a loader opens. A key beats a directory scan because
+// several adapters of one repo land side by side, and only the record
+// says which one the key meant.
+//
+// A failure WARNS and returns empty rather than failing the graph: an
+// unreadable adapter should cost the adapter, not the run -- and the
+// image that comes back un-adapted is obvious, where a stage that
+// refused to start is a mystery.
+std::string
+GenerateImageStage::adapter_file_(const std::string& ref) const
+{
+  if (ref.empty()) { return {}; }
+  std::string lerr;
+  std::string f = resolve_adapter_file(session(), ref, &lerr);
+  if (f.empty()) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): {} -- generating WITHOUT the adapter",
+        this->id(), lerr));
+    return f;
+  }
+  // SAID OUT LOUD, on the UI delegate, beside the "loading <family> DiT
+  // from ..." line. An adapter that never arrives is otherwise
+  // indistinguishable from one that was never configured: the config
+  // source reports what it EMITTED, and if that beat is wired somewhere
+  // that does not read the key -- a krea2-model-config on the
+  // conditioner alone, say -- nothing downstream says a word. This line
+  // is the one place a user can see that the key got here.
+  session()->info(fmt(
+      "GenerateImageStage('{}'): runtime LoRA '{}'", this->id(), f));
+  return f;
 }
 
 bool
@@ -1025,8 +1193,15 @@ GenerateImageStage::load_flux2_dit_()
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
   _flux2_params.apply_to(fcfg);
+  // The streaming flag the first load used, and the adapter with it. A
+  // reload that dropped either would come back preloaded, or
+  // un-adapted, on the graph that asked for both.
+  genai::MetalFlux2Transformer::LoraSpec lspec;
+  lspec.path  = adapter_file_(_lora);
+  lspec.scale = (float)_lora_scale;
   _flux2_dit = genai::MetalFlux2Transformer::load(
-      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream);
+      weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream,
+      lspec.path.empty() ? nullptr : &lspec);
   return (bool)_flux2_dit;
 }
 
@@ -1284,8 +1459,15 @@ GenerateImageStage::load_krea2_dit_()
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
-  _dit = genai::MetalKrea2Transformer::load(weight_set_(_krea2_dit_dir), mc,
-                                            kcfg);
+  // The streaming flag the first load used, and the adapter with it. A
+  // reload that dropped either would come back preloaded, or un-adapted,
+  // on the graph that asked for both.
+  genai::MetalKrea2Transformer::LoraSpec lspec;
+  lspec.path  = adapter_file_(_lora);
+  lspec.scale = (float)_lora_scale;
+  _dit = genai::MetalKrea2Transformer::load(
+      weight_set_(_krea2_dit_dir), mc, kcfg, _krea2_stream,
+      lspec.path.empty() ? nullptr : &lspec);
   return (bool)_dit;
 }
 

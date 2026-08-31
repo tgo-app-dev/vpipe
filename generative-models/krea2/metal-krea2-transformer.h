@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "generative-models/shared/runtime-lora.h"
 
 namespace vpipe {
 namespace genai {
@@ -78,9 +79,26 @@ class MetalKrea2Transformer {
   // What replaces it measures: admission against the live budget, a
   // probe read off the room actually free, doubling while the box stays
   // healthy, and a shed the moment the pages kept are found outside RAM.
+  // A runtime adapter. RUNTIME rather than fused because fusing writes
+  // A*B into the base weights, and this base is QUANTIZED -- so the sum
+  // is rounded back to 4/8-bit affine, which is exactly the precision a
+  // small correction cannot spare. Runtime also makes the strength a
+  // knob rather than a rebuild.
+  //
+  // Named at LOAD because it changes how the weights are BUILT: an
+  // adapted `ff.gate` or `ff.up` cannot take the fused-SwiGLU kernel,
+  // whose epilogue writes silu(gate)*up straight out of the accumulator
+  // and leaves nowhere for a pre-activation delta to land. See the
+  // `_fuse_ff` gate in the loader.
+  struct LoraSpec {
+    std::string path;          // one .safetensors of lora_A/B pairs
+    float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
+  };
+
   static std::unique_ptr<MetalKrea2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const LoraSpec* lora = nullptr);
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -88,7 +106,41 @@ class MetalKrea2Transformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalKrea2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const LoraSpec* lora = nullptr);
+
+  // How many projections carry a runtime adapter (0 = none attached).
+  int lora_modules() const { return _lora_modules; }
+
+  // The adapter's strength, per FORWARD. Live because it can be: the
+  // factors are the adapter's and the strength is the request's, so it
+  // rides the GEMM as a constant rather than being folded into A.
+  // Turning it costs nothing and needs no reload. 0 skips both GEMMs, so
+  // "off" is exactly off.
+  void set_lora_scale(float s) { _lora_scale = s; }
+  float lora_scale() const { return _lora_scale; }
+
+  // Every projection a runtime adapter can name, and the base dims its
+  // factors have to fit, for a model of this shape. Public and static
+  // so the names can be checked without loading a checkpoint: a module
+  // name that matches nothing binds nothing, which at runtime is
+  // indistinguishable from an adapter that had no effect. Derived from
+  // the same table bind_lora_ walks, so the two cannot drift.
+  struct LoraModule {
+    std::string name;          // `<name>.weight` is the base tensor
+    int         n = 0, k = 0;  // out, in
+  };
+  static std::vector<LoraModule> lora_module_list(const Config& cfg);
+
+  // The file-name convention map this family binds through, and the
+  // reason it is a function rather than a constant at each use: the
+  // BINDER and the FUSED-FF GATE must ask about the same spellings. If
+  // the gate did not know the ai-toolkit names, an adapter published
+  // that way would bind its `ff.gate` / `ff.up` -- which the file calls
+  // `mlp.gate` / `mlp.up` -- and then meet a fused-SwiGLU kernel with
+  // nowhere to put the delta, dropping it on the two biggest
+  // projections in every block and reporting nothing.
+  static genai::lora::Adapter::Rename lora_rename();
 
   ~MetalKrea2Transformer();   // out-of-line: _ws is a fwd-declared type
 
@@ -493,6 +545,47 @@ class MetalKrea2Transformer {
   // seq >= 1024.
   metal_compute::ComputeFunction _fn_qmm_swiglu4_bm128, _fn_qmm_swiglu8_bm128;
   bool _fuse_ff = false;
+
+  // ---- runtime LoRA ------------------------------------------------
+  // Krea-2's projections are SPLIT (to_q / to_k / to_v / to_out.0,
+  // ff.gate / ff.up / ff.down), which is the spelling diffusers-convention
+  // adapters ship in -- so modules map one-to-one and nothing has to be
+  // de-fused to find them.
+  struct BlockLora {
+    genai::lora::Factors q, k, v, gate, o, ff_gate, ff_up, ff_down;
+    bool any() const
+    {
+      return !q.empty() || !k.empty() || !v.empty() || !gate.empty() ||
+             !o.empty() || !ff_gate.empty() || !ff_up.empty() ||
+             !ff_down.empty();
+    }
+  };
+  // Which of the three block containers a row belongs to. All three are
+  // the same `Block`, so one BlockLora and one member-pointer type
+  // serve them; only the prefix, the dims and the destination vector
+  // differ.
+  enum class LoraStack { kMain, kLayerwise, kRefiner };
+  struct LoraModuleRef {
+    std::string name;
+    int n = 0, k = 0;
+    LoraStack stack = LoraStack::kMain;
+    int block = 0;
+    genai::lora::Factors BlockLora::*dst = nullptr;
+  };
+  static std::vector<LoraModuleRef> lora_modules_(const Config& c);
+  bool bind_lora_(const LoraSpec& spec, std::string* err);
+  std::vector<BlockLora> _lora_blocks;      // per main block
+  // The TEXT-FUSION tower. Not an afterthought: the ai-toolkit
+  // convention names these (`txtfusion.{layerwise,refiner}_blocks`) and
+  // the identity-edit adapter adapts all three containers, so binding
+  // only the main blocks would apply HALF of it -- which is not a
+  // cheaper adapter, it is a wrong one that looks like it worked.
+  std::vector<BlockLora> _lora_layerwise;
+  std::vector<BlockLora> _lora_refiner;
+  genai::lora::Applier   _lora;
+  int   _lora_modules = 0;
+  int   _lora_max_rank = 0;
+  float _lora_scale = 1.0f;
 
   // M5-only matrix-core dense GEMM (matmul2d/NAX) for the DiT projections. Same
   // NAX path the LM prefill + gemma-vision use, gated on supports_matrix_cores()

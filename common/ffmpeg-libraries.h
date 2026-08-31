@@ -126,6 +126,7 @@ public:
     decltype(&::avformat_find_stream_info)      find_stream_info;
     decltype(&::av_find_input_format)           find_input_format;
     decltype(&::av_read_frame)                  read_frame;
+    decltype(&::av_seek_frame)                  seek_frame;
     decltype(&::avformat_alloc_output_context2) alloc_output_context2;
     decltype(&::avformat_new_stream)            new_stream;
     decltype(&::avformat_write_header)          write_header;

@@ -1059,31 +1059,18 @@ TEST(model_catalog, shipped_prepare_pipelines_name_a_resolvable_model)
                 dir.string().c_str());
     return;
   }
-  // The key a model-fetch stage will register under, by the same rule
-  // model-fetch-stage.cc applies.
+  // The key a model-fetch stage will register under, through the SAME
+  // resolver the stage calls. The first cut of this re-implemented the
+  // variant match as a plain substring scan taking the first hit, which
+  // agreed with the stage on every shipped pipeline while disagreeing
+  // about exact-beats-substring and about ambiguity being an error --
+  // so it would have kept passing while drifting away from the thing it
+  // is here to check.
   auto fetch_key = [](const std::string& path, const std::string& key,
                       const std::string& variant) {
     if (!key.empty()) { return key; }
-    const ModelCatalogEntry* hit = nullptr;
-    for (const ModelCatalogEntry& e : model_catalog()) {
-      if (e.hf_path != path) { continue; }
-      if (variant.empty()) { hit = &e; break; }
-      // model_variant is matched against several descriptive fields; for
-      // this check a case-insensitive substring over them is enough to
-      // pick the entry the fetch would.
-      auto has = [&](const std::string& f) {
-        if (f.empty()) { return false; }
-        std::string a = f, b = variant;
-        std::transform(a.begin(), a.end(), a.begin(), ::tolower);
-        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
-        return a.find(b) != std::string::npos;
-      };
-      if (has(e.version) || has(e.variant) || has(e.name) ||
-          has(e.model_type)) {
-        hit = &e;
-        break;
-      }
-    }
+    const ModelCatalogEntry* hit =
+        catalog_pick_variant(catalog_all_by_path(path), variant);
     if (hit != nullptr && !hit->name.empty()) { return hit->name; }
     return path;
   };
@@ -1143,4 +1130,84 @@ TEST(model_catalog, shipped_prepare_pipelines_name_a_resolvable_model)
               "pipelines name a model an earlier stage produces\n", checked);
   EXPECT_TRUE(checked > 0);
 #endif
+}
+
+// THE VARIANT RULE, stated as tests rather than as a comment.
+//
+// catalog_pick_variant decides WHICH model one repo's several entries a
+// `model_variant` string means. Two of its properties are easy to
+// re-implement wrongly, and both were, in the first version of the
+// pipeline check above: an exact hit outranks a substring hit, and an
+// ambiguous match is refused rather than resolved by catalogue order.
+// Getting either wrong downloads a different model and registers it
+// under the right name, which is the failure the rule exists to prevent.
+TEST(model_catalog, variant_resolution_is_exact_before_substring)
+{
+  // Synthetic, so the properties are pinned independently of what the
+  // shipped catalogue happens to contain today.
+  ModelCatalogEntry a, b;
+  a.version = "turbo";
+  a.name    = "x/turbo";
+  b.version = "turbo-8step";
+  b.name    = "x/turbo-8step";
+  const std::vector<const ModelCatalogEntry*> both = {&a, &b};
+  const std::vector<const ModelCatalogEntry*> rev  = {&b, &a};
+  const std::vector<const ModelCatalogEntry*> one  = {&a};
+
+  // "turbo" is EXACT on a's version and a substring of b's. The exact hit
+  // wins, and it wins from either order -- a first-match scan would have
+  // returned b from `rev`.
+  EXPECT_TRUE(catalog_pick_variant(both, "turbo") == &a);
+  EXPECT_TRUE(catalog_pick_variant(rev, "turbo") == &a);
+
+  // A substring hitting both is AMBIGUOUS, and ambiguity is nullptr --
+  // never the first one.
+  EXPECT_TRUE(catalog_pick_variant(both, "turb") == nullptr);
+  EXPECT_TRUE(catalog_pick_variant(rev, "turb") == nullptr);
+
+  // An empty variant selects only when there is nothing to choose.
+  EXPECT_TRUE(catalog_pick_variant(both, "") == nullptr);
+  EXPECT_TRUE(catalog_pick_variant(one, "") == &a);
+  EXPECT_TRUE(catalog_pick_variant({}, "turbo") == nullptr);
+
+  // A miss is a miss, however close.
+  EXPECT_TRUE(catalog_pick_variant(both, "turbot") == nullptr);
+
+  // `matched` carries the hit set so a refusing caller can name it: the
+  // tie on an ambiguous match, and nothing on a miss.
+  std::vector<const ModelCatalogEntry*> hits;
+  EXPECT_TRUE(catalog_pick_variant(both, "turb", &hits) == nullptr);
+  EXPECT_TRUE(hits.size() == 2);
+  EXPECT_TRUE(catalog_pick_variant(both, "nope", &hits) == nullptr);
+  EXPECT_TRUE(hits.empty());
+  EXPECT_TRUE(catalog_pick_variant(both, "turbo", &hits) == &a);
+  EXPECT_TRUE(hits.size() == 1);
+}
+
+// And the shipped case the prepare pipelines depend on: one repo, two
+// partitions, and the variant string each pipeline passes.
+TEST(model_catalog, minimax_h3_partitions_resolve_from_their_variant)
+{
+  const std::vector<const ModelCatalogEntry*> cands =
+      catalog_all_by_path("Comfy-Org/MiniMax-H3");
+  if (cands.size() < 2) {
+    std::printf("[catalog] Comfy-Org/MiniMax-H3 publishes %zu entries; "
+                "the two-partition check needs both\n", cands.size());
+    return;
+  }
+  const ModelCatalogEntry* fl = catalog_pick_variant(cands, "fl2va");
+  const ModelCatalogEntry* rf = catalog_pick_variant(cands, "ref2va");
+  ASSERT_TRUE(fl != nullptr);
+  ASSERT_TRUE(rf != nullptr);
+  if (fl == nullptr || rf == nullptr) { return; }
+  EXPECT_TRUE(fl != rf);
+  // The NAME is what model-fetch registers under with no model_key, and
+  // therefore what a downstream `src_model` has to say.
+  EXPECT_TRUE(fl->name == "Comfy-Org/MiniMax-H3-FL2VA");
+  EXPECT_TRUE(rf->name == "Comfy-Org/MiniMax-H3-Ref2VA");
+  // Bare "h3" cannot choose between them, and must not pretend to.
+  EXPECT_TRUE(catalog_pick_variant(cands, "h3") == nullptr);
+  // Neither may an empty variant, which is the case that sends the fetch
+  // stage to its "publishes N models" refusal.
+  EXPECT_TRUE(catalog_pick_variant(cands, "") == nullptr);
 }

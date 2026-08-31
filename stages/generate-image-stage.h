@@ -150,6 +150,12 @@ public:
   // Test-only accessors.
   const std::string& hf_dir()        const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
+  // The adapter this stage would load with, after its own config and
+  // any model_config beat. Exposed because the interesting failure is
+  // that it is EMPTY when the graph thought it had set one, and every
+  // other way of seeing that needs a checkpoint.
+  const std::string& lora_ref()   const noexcept { return _lora; }
+  double             lora_scale() const noexcept { return _lora_scale; }
 
 private:
   // Stamp the generating model onto a latent beat's sideband. The chain
@@ -239,8 +245,35 @@ private:
   bool        _qie_stream = false;
   bool        _flux2_stream   = false;   // streaming mode used at load
   std::string _krea2_dit_dir;            // resolved Krea-2 DiT dir (reload)
+  // Streaming mode used at load. Cached for the SAME reason
+  // _flux2_stream is: a memory-driven free after a generation
+  // reloads through load_krea2_dit_(), and a reload that forgot the
+  // flag would come back PRELOADED -- quietly undoing the decision
+  // on the box that needed it most.
+  bool        _krea2_stream   = false;
+  // The runtime adapter. The PATH is LOAD-TIME -- it decides whether a
+  // fused-activation weave can be built at all -- so a later beat that
+  // changes it is warned about rather than silently ignored; the scale
+  // is live and is pushed straight at the model.
+  //
+  // Held as the REFERENCE the config gave (a registry key, a directory
+  // or a file), not as a resolved path: it is compared against the next
+  // beat's, and resolving first would make two spellings of one adapter
+  // read as a change.
+  // ONE pair, not one per family: a stage holds exactly one DiT, so it
+  // has exactly one adapter. Seeded from this stage's OWN `lora` /
+  // `lora_scale` config and overridden by a model_config beat that
+  // names them.
+  std::string _lora;
+  double      _lora_scale = 1.0;
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
+
+  // Turn what the config named -- a registry key, a directory holding
+  // one .safetensors, or a file -- into the single file a loader opens.
+  // Empty (with a warning naming the reason) when it cannot, so the
+  // caller generates WITHOUT the adapter rather than failing the graph.
+  std::string adapter_file_(const std::string& ref) const;
 
   // (Re)load the FLUX.2 DiT from the cached params. Returns false on failure.
   bool load_flux2_dit_();

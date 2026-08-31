@@ -76,6 +76,14 @@ public:
   int  common_height() const noexcept { return _pub_h; }
   bool have_a()        const noexcept { return _a.valid; }
   bool have_b()        const noexcept { return _b.valid; }
+  // How many times process() has run SINCE CONSTRUCTION. The wait set
+  // covers only LIVE inputs precisely so this stays small while one
+  // side is closed and the other has not spoken yet; a stage that waits
+  // on a closed port instead re-arms in a tight loop, and this climbs
+  // into the hundreds of thousands. That is the difference between
+  // blocking and spinning, and it is not otherwise observable from
+  // outside the stage.
+  std::uint64_t process_calls() const noexcept { return _process_calls; }
 
 private:
   // One input's latest frame, unpacked to packed RGB24 at its OWN size.
@@ -137,6 +145,9 @@ private:
   bool _want_a = false;
   bool _want_b = false;
   bool _torn   = false;
+
+  // Test-only bookkeeping; see process_calls().
+  std::uint64_t _process_calls = 0;
 
   std::shared_ptr<CompareImageChannel> _channel;
 };

@@ -116,6 +116,26 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
     _max_chunk_duration_s = v;
   }
   {
+    const double v = attr_real("chunk_overlap_s");
+    if (v < 0.0) {
+      session()->warn(fmt(
+          "AudioToPcmStage('{}'): chunk_overlap_s {} is negative; using 0",
+          this->id(), v));
+    } else if (v >= _chunk_duration_s) {
+      // The buffer would still be at the emit threshold with no new
+      // samples appended, so the stage would emit the same window for
+      // ever. Refused rather than clamped: a graph that asked for this
+      // has the wrong number, and silently running a different one is
+      // how a config lie becomes a runtime mystery.
+      session()->warn(fmt(
+          "AudioToPcmStage('{}'): chunk_overlap_s {} must be < "
+          "chunk_duration_s {}; using 0 (no overlap)",
+          this->id(), v, _chunk_duration_s));
+    } else {
+      _chunk_overlap_s = v;
+    }
+  }
+  {
     int v = static_cast<int>(attr_int("oport_capacity"));
     if (v < 1) {
       fail_config(fmt(
@@ -160,10 +180,10 @@ AudioToPcmStage::AudioToPcmStage(const SessionContextIntf* s,
       * static_cast<std::size_t>(_channels));
   session()->info(fmt(
       "AudioToPcmStage('{}'): output_sample_rate={} Hz, "
-      "chunk_duration_s={}, max_chunk_duration_s={}, "
+      "chunk_duration_s={}, chunk_overlap_s={}, max_chunk_duration_s={}, "
       "emit_log_every={}",
       this->id(), _output_sample_rate, _chunk_duration_s,
-      _max_chunk_duration_s, _emit_log_every));
+      _chunk_overlap_s, _max_chunk_duration_s, _emit_log_every));
 }
 
 namespace {
@@ -182,6 +202,14 @@ constexpr ConfigKey kAttrs[] = {
    .def_int = 1},
   {.key = "chunk_duration_s", .type = ConfigType::Real,
    .doc = "min emitted chunk seconds, (0,600]", .def_real = 10.0},
+  {.key = "chunk_overlap_s", .type = ConfigType::Real,
+   .doc = "seconds of each emitted chunk kept so the NEXT chunk begins "
+          "with them -- context that lets a consumer see what came just "
+          "before. Must be < chunk_duration_s. The stream then advances "
+          "by (chunk_duration_s - chunk_overlap_s) per beat, so N chunks "
+          "cover less audio than N x chunk_duration_s. 0 (default) = "
+          "consecutive chunks share nothing",
+   .def_real = 0.0},
   {.key = "max_chunk_duration_s", .type = ConfigType::Real,
    .doc = "hard-cap chunk seconds; >= chunk_duration_s",
    .def_real = 30.0},
@@ -537,14 +565,32 @@ AudioToPcmStage::emit_chunk_(RuntimeContext& ctx)
       || (_chunks_emitted % _emit_log_every) == 0) {
     session()->log_verbose(fmt(
         "AudioToPcmStage('{}'): emit chunk #{} samples={} dur={:.2f}s "
-        "ts_us={}",
+        "ts_us={}{}",
         this->id(), _chunks_emitted, n,
         n / static_cast<double>(_output_sample_rate),
-        _chunk_first_ts_us));
+        _chunk_first_ts_us,
+        _chunk_overlap_s > 0.0
+            ? fmt(" (keeping {:.2f}s for the next)", _chunk_overlap_s)()
+            : std::string()));
   }
-  _chunk_buf.clear();
-  _chunk_has_ts = false;
-  _chunk_first_ts_us = 0;
+  // Overlap: keep the tail of what was just emitted so the NEXT chunk
+  // opens with it. The retained samples have already gone out once --
+  // that is the point, the consumer sees them twice and can use the
+  // first copy as context for the second -- so `_chunk_first_ts_us`
+  // advances to the first RETAINED sample rather than resetting, and
+  // consecutive beats then carry overlapping, still-monotonic times.
+  const std::size_t keep = overlap_frames_(n);
+  if (keep > 0) {
+    _chunk_buf.erase(_chunk_buf.begin(),
+                     _chunk_buf.begin()
+                         + static_cast<std::ptrdiff_t>((n - keep) * ch));
+    _chunk_first_ts_us += static_cast<std::uint64_t>(n - keep)
+                          * 1'000'000ULL / _output_sample_rate;
+  } else {
+    _chunk_buf.clear();
+    _chunk_has_ts = false;
+    _chunk_first_ts_us = 0;
+  }
   ++_chunks_emitted;
   // Build the payload as a separate local BEFORE the suspend.
   // Inlining the make_payload<...>(std::move(tb)) expression inside

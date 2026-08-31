@@ -1116,3 +1116,70 @@ TEST(minimax_h3_lora, baked_adaln_keeps_the_adapter_live)
   // approximately, because scale 0 encodes no adapter kernels at all.
   EXPECT_TRUE(live == 0.0);
 }
+
+// ---- the split (diffusers) decomposition ----------------------------
+
+// Where a split adapter's q/k/v rows land in the fused qkv output.
+//
+// This is the piece of the conversion that can be wrong without
+// anything failing: every shape stays right and the delta simply lands
+// on the wrong channels. The flat case is checked against the exact
+// permutation upstream's own ComfyUI conversion produces; the per-head
+// case is checked against the offsets the FORWARD uses for the same
+// buffer, which is the coupling that would otherwise be nothing but a
+// comment.
+TEST(minimax_h3_lora, split_qkv_rows_land_where_the_forward_reads_them)
+{
+  using T = MetalMiniMaxH3Transformer;
+  const int HD = 128, HEADS = 56;
+  const int I = HEADS * HD;                 // 7168
+  const int N = 3 * I;
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool per_head = arm == 1;
+    // A bijection onto [0, 3*inner). Anything else either drops a
+    // channel or writes two deltas onto one.
+    std::vector<int> hit((std::size_t)N, 0);
+    for (int pt = 0; pt < 3; ++pt) {
+      for (int r = 0; r < I; ++r) {
+        const int d = T::qkv_fused_row(pt, r, I, HD, per_head);
+        ASSERT_TRUE(d >= 0 && d < N);
+        if (d >= 0 && d < N) { ++hit[(std::size_t)d]; }
+      }
+    }
+    int once = 0;
+    for (int x : hit) { if (x == 1) { ++once; } }
+    EXPECT_TRUE(once == N);
+  }
+
+  // FLAT is exactly [all q | all k | all v] -- the layout Comfy-Org's
+  // repack uses and the one every published fusion is built for.
+  EXPECT_TRUE(T::qkv_fused_row(0, 0, I, HD, false) == 0);
+  EXPECT_TRUE(T::qkv_fused_row(1, 0, I, HD, false) == I);
+  EXPECT_TRUE(T::qkv_fused_row(2, 0, I, HD, false) == 2 * I);
+  EXPECT_TRUE(T::qkv_fused_row(0, I - 1, I, HD, false) == I - 1);
+
+  // PER-HEAD must match the forward's own view of the same buffer:
+  // head stride 3*head_dim, k at +head_dim, v at +2*head_dim. These are
+  // the QKV_HSTRIDE / K_OFF / V_OFF of forward_dit, restated here so a
+  // change to either side without the other fails.
+  const int HSTRIDE = 3 * HD, K_OFF = HD, V_OFF = 2 * HD;
+  bool ok = true;
+  for (int h = 0; h < HEADS; ++h) {
+    for (int d = 0; d < HD; ++d) {
+      const int r = h * HD + d;
+      ok = ok && T::qkv_fused_row(0, r, I, HD, true) == h * HSTRIDE + d;
+      ok = ok && T::qkv_fused_row(1, r, I, HD, true)
+                     == h * HSTRIDE + K_OFF + d;
+      ok = ok && T::qkv_fused_row(2, r, I, HD, true)
+                     == h * HSTRIDE + V_OFF + d;
+    }
+  }
+  EXPECT_TRUE(ok);
+
+  // The two groupings are NOT the same map -- which is the whole reason
+  // a published (flat) fusion is wrong on per-head weights, and the
+  // reason this tree fuses from the split file instead.
+  EXPECT_TRUE(T::qkv_fused_row(1, 0, I, HD, false) !=
+              T::qkv_fused_row(1, 0, I, HD, true));
+}

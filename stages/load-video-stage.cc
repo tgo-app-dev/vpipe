@@ -3,6 +3,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -62,7 +63,23 @@ LoadVideoStage::LoadVideoStage
   _video_stream_index = static_cast<int>(attr_int("video_stream_index"));
   _audio_stream_index = static_cast<int>(attr_int("audio_stream_index"));
   _read_timeout_ms    = static_cast<int>(attr_int("read_timeout_ms"));
+  _start_s            = attr_real("start_s");
+  _duration_s         = attr_real("duration_s");
   _open_options       = attr("options");
+
+  if (_start_s < 0.0) {
+    fail_config(fmt("LoadVideoStage('{}'): start_s must be >= 0, got {}",
+                    this->id(), _start_s));
+  }
+  if (_duration_s < 0.0) {
+    fail_config(fmt("LoadVideoStage('{}'): duration_s must be >= 0 (0 = to "
+                    "the end of the file), got {}", this->id(), _duration_s));
+  }
+  _start_us = static_cast<std::int64_t>(_start_s * 1e6);
+  _has_stop = _duration_s > 0.0;
+  _stop_us  = _has_stop
+                  ? _start_us + static_cast<std::int64_t>(_duration_s * 1e6)
+                  : 0;
 
   // Validation is deferred to launch (see Stage::fail_config).
   if (_input_url.empty()) {
@@ -103,6 +120,18 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "stream to use; -1 = first video", .def_int = -1},
   {.key = "audio_stream_index", .type = ConfigType::Int,
    .doc = "stream to use; -1 = first audio", .def_int = -1},
+  {.key = "start_s", .type = ConfigType::Real,
+   .doc = "seek to this media time (seconds from the start of the file) "
+          "before reading the first packet; 0 (default) starts at the "
+          "beginning. KEYFRAME-accurate: the packets between the keyframe "
+          "and start_s are emitted, because the frames after it are "
+          "decoded from them",
+   .def_real = 0.0},
+  {.key = "duration_s", .type = ConfigType::Real,
+   .doc = "stop this many seconds past start_s; 0 (default) reads to the "
+          "end of the file. Each enabled stream stops when it passes the "
+          "end, and the run ends when both have",
+   .def_real = 0.0},
   {.key = "read_timeout_ms", .type = ConfigType::Int,
    .doc = "network read timeout ms; 0 = none", .def_int = 0},
   {.key = "options", .type = ConfigType::Object,
@@ -320,12 +349,64 @@ LoadVideoStage::open_input_()
     }
   }
 
+  // Seek AFTER the streams are chosen: the target is in a stream's own
+  // time base, and it is the VIDEO stream's when there is one -- seeking
+  // on the audio stream would land between video keyframes and hand the
+  // decoder a stream that starts mid-GOP.
+  if (_start_us > 0 && (_v_stream_idx >= 0 || _a_stream_idx >= 0)) {
+    const bool on_video = _v_stream_idx >= 0;
+    const int  sidx     = on_video ? _v_stream_idx : _a_stream_idx;
+    const AVRational stb = on_video ? _vmeta.time_base : _ameta.time_base;
+    const AVRational us  = {1, 1000000};
+    const std::int64_t ts =
+        _libs->avutil().api.rescale_q(_start_us, us, stb);
+    const int srr = _libs->avformat().api.seek_frame(_fctx, sidx, ts,
+                                                     AVSEEK_FLAG_BACKWARD);
+    if (srr < 0) {
+      // Not fatal: a stream with no index refuses the seek, and reading
+      // from the start still produces the right WINDOW -- `duration_s`
+      // still ends it, and only the work to reach it is wasted.
+      session()->warn(fmt(
+          "LoadVideoStage('{}'): seek to {:.3f}s failed ({}); reading from "
+          "the start instead", this->id(), _start_s, av_err_(srr)));
+    }
+  }
+  _vmeta.last_us = _start_us;
+  _ameta.last_us = _start_us;
+  if (_start_us > 0 || _has_stop) {
+    session()->info(fmt("LoadVideoStage('{}'): '{}'{}", this->id(),
+                        _input_url, window_doc_()));
+  }
+
   _pkt = _libs->avcodec().api.packet_alloc();
   if (!_pkt) {
     session()->error(fmt(
         "LoadVideoStage('{}'): av_packet_alloc failed",
         this->id()));
   }
+}
+
+std::string
+LoadVideoStage::window_doc_() const
+{
+  if (_start_us <= 0 && !_has_stop) { return std::string(); }
+  if (!_has_stop) {
+    return fmt(", from {:.3f}s to the end", _start_s)();
+  }
+  return fmt(", window [{:.3f}s, {:.3f}s)", _start_s,
+             _start_s + _duration_s)();
+}
+
+bool
+LoadVideoStage::all_past_end_() const noexcept
+{
+  if (_video_port >= 0 && _v_stream_idx >= 0 && !_vmeta.past_end) {
+    return false;
+  }
+  if (_audio_port >= 0 && _a_stream_idx >= 0 && !_ameta.past_end) {
+    return false;
+  }
+  return true;
 }
 
 void
@@ -344,6 +425,7 @@ LoadVideoStage::reset_run_state()
   _vmeta        = StreamMeta{};
   _ameta        = StreamMeta{};
   _eof          = false;
+  _lead_in_logged = false;
   _v_packets    = 0;
   _a_packets    = 0;
 }
@@ -410,7 +492,50 @@ LoadVideoStage::process(RuntimeContext& ctx)
     _libs->avcodec().api.packet_unref(_pkt);
     co_return;
   }
+
+  // Past the end of the window? Tested per STREAM, on the packet's
+  // start: the two do not interleave evenly, so ending the run on the
+  // first stream to get there would truncate its partner. The packet
+  // straddling the end is kept whole -- this stage does not decode and
+  // so cannot cut inside one.
+  //
+  // Nothing is dropped at the START. The seek landed on the keyframe at
+  // or before `start_s` and the frames after it are decoded from the
+  // packets in between, so they are emitted; see the header.
+  StreamMeta& m = video ? _vmeta : _ameta;
+  if (_has_stop) {
+    const AVRational us = {1, 1000000};
+    std::int64_t t = m.last_us;
+    if (_pkt->pts != AV_NOPTS_VALUE) {
+      t = _libs->avutil().api.rescale_q(_pkt->pts, m.time_base, us);
+    }
+    if (t >= _stop_us) {
+      m.past_end = true;
+      _libs->avcodec().api.packet_unref(_pkt);
+      if (all_past_end_()) {
+        _eof = true;
+        session()->info(fmt(
+            "LoadVideoStage('{}'): reached {:.3f}s of '{}' after {} video + "
+            "{} audio packet(s)", this->id(), _start_s + _duration_s,
+            _input_url, _v_packets, _a_packets));
+        ctx.signal_done();
+      }
+      co_return;
+    }
+  }
+
   auto seg = segment_(video);
+  if (!_lead_in_logged && _start_us > 0) {
+    _lead_in_logged = true;
+    const std::int64_t first_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            seg->start_utc.time_since_epoch()).count();
+    session()->info(fmt(
+        "LoadVideoStage('{}'): seek for start_s={:.3f}s landed at {:.3f}s "
+        "-- {:.3f}s of lead-in emitted so the decoder has its keyframe",
+        this->id(), _start_s, first_us / 1e6,
+        (_start_us - first_us) / 1e6));
+  }
   if (video) { ++_v_packets; } else { ++_a_packets; }
   _libs->avcodec().api.packet_unref(_pkt);
   // The payload is bound to its own local before the suspend: a

@@ -396,6 +396,7 @@ LibAvFormat::LibAvFormat(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(find_stream_info,         "avformat_find_stream_info");
   VPIPE_RESOLVE(find_input_format,        "av_find_input_format");
   VPIPE_RESOLVE(read_frame,               "av_read_frame");
+  VPIPE_RESOLVE(seek_frame,               "av_seek_frame");
   VPIPE_RESOLVE(alloc_output_context2,    "avformat_alloc_output_context2");
   VPIPE_RESOLVE(new_stream,               "avformat_new_stream");
   VPIPE_RESOLVE(write_header,             "avformat_write_header");

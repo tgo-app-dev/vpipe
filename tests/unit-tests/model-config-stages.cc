@@ -19,7 +19,9 @@
 #include "stages/krea2-model-config-stage.h"
 #include "stages/mage-flow-model-config-stage.h"
 #include "stages/minimax-h3-model-config-stage.h"
+#include "stages/model-catalog.h"
 #include "stages/model-config-source.h"
+#include "stages/model-registry.h"
 #include "stages/qwen-image-edit-model-config-stage.h"
 #include "stages/wan2-model-config-stage.h"
 
@@ -302,3 +304,235 @@ TEST(model_config, a_moved_image_key_is_reported_not_rejected)
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
+
+// The adapter keys reach the beat.
+//
+// Worth its own test because declaring a key in kAttrs is NOT what puts
+// it in the beat -- this family builds its config explicitly, so a key
+// can be fully documented, offered by the composer's file browser, and
+// still never arrive. That is a config that reads as supported and does
+// FLUX.2 builds its beat by hand too (klein_kv is written explicitly),
+// so it has the same trap and needs the same check. `klein_kv` must
+// survive beside the adapter keys: it is the one key on this beat that
+// changes the ATTENTION recipe, and losing it is a wrong image rather
+// than a missing feature.
+TEST(model_config, flux2_emits_the_adapter_keys_only_when_set)
+{
+  Session sess;
+  {
+    Flux2ModelConfigStage s(&sess, "f", {}, FlexData::make_object());
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("lora"));
+    EXPECT_FALSE(o.contains("lora_scale"));
+    ASSERT_TRUE(o.contains("klein_kv"));
+  }
+  {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign(
+        "lora", FlexData::make_string("/models/style.safetensors"));
+    cfg.as_object().insert_or_assign("lora_scale", FlexData::make_real(0.5));
+    cfg.as_object().insert_or_assign("klein_kv", FlexData::make_bool(true));
+    Flux2ModelConfigStage s(&sess, "f2", {}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    // ASSERT_TRUE does NOT abort in minitest, so every read is guarded
+    // by its own contains(): an unguarded at() on a regression throws
+    // out of the test instead of naming the key that went missing.
+    EXPECT_TRUE(o.contains("lora"));
+    EXPECT_TRUE(o.contains("lora") &&
+                std::string(o.at("lora").as_string("")) ==
+                    "/models/style.safetensors");
+    EXPECT_TRUE(o.contains("lora_scale"));
+    EXPECT_TRUE(o.contains("lora_scale") &&
+                o.at("lora_scale").as_real(0.0) == 0.5);
+    EXPECT_TRUE(o.contains("klein_kv"));
+    EXPECT_TRUE(o.contains("klein_kv") && o.at("klein_kv").as_bool(false));
+    EXPECT_TRUE(std::string(o.at("model_family").as_string("")) == "flux2");
+  }
+  {
+    // A scale alone, as above: naming one key must not conjure the other.
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("lora_scale", FlexData::make_real(0.0));
+    Flux2ModelConfigStage s(&sess, "f3", {}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("lora"));
+    EXPECT_TRUE(o.contains("lora_scale"));
+    EXPECT_TRUE(o.contains("lora_scale") &&
+                o.at("lora_scale").as_real(1.0) == 0.0);
+  }
+}
+
+// nothing, which is the worst of the available failures and is exactly
+// what happened on the first attempt here.
+TEST(model_config, krea2_emits_the_adapter_keys_only_when_set)
+{
+  Session sess;
+  {
+    // Unset stays unset, on the same argument as the grounded keys: a
+    // default emitted as though it were a choice reads downstream as
+    // "the graph asked for scale 1.0" when the graph said nothing.
+    Krea2ModelConfigStage s(&sess, "k", {}, FlexData::make_object());
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("lora"));
+    EXPECT_FALSE(o.contains("lora_scale"));
+  }
+  {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign(
+        "lora", FlexData::make_string("/models/turbo.safetensors"));
+    cfg.as_object().insert_or_assign("lora_scale", FlexData::make_real(0.75));
+    Krea2ModelConfigStage s(&sess, "k2", {}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    // Guarded rather than ASSERTed: ASSERT_TRUE does not abort, so an
+    // unguarded at() on a regression throws out of the test instead of
+    // naming the key that went missing.
+    EXPECT_TRUE(o.contains("lora"));
+    EXPECT_TRUE(o.contains("lora") &&
+                std::string(o.at("lora").as_string("")) ==
+                    "/models/turbo.safetensors");
+    EXPECT_TRUE(o.contains("lora_scale"));
+    EXPECT_TRUE(o.contains("lora_scale") &&
+                o.at("lora_scale").as_real(0.0) == 0.75);
+    // And the family stamp survives beside them, so a consumer can still
+    // tell whose config this is.
+    EXPECT_TRUE(std::string(o.at("model_family").as_string("")) == "krea2");
+  }
+  {
+    // A scale ALONE is a legitimate request -- sweeping the strength of
+    // an adapter named in the stage's own config -- so naming one key
+    // must not conjure the other.
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("lora_scale", FlexData::make_real(0.0));
+    Krea2ModelConfigStage s(&sess, "k3", {}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_FALSE(o.contains("lora"));
+    EXPECT_TRUE(o.contains("lora_scale"));
+    EXPECT_TRUE(o.contains("lora_scale") &&
+                o.at("lora_scale").as_real(1.0) == 0.0);
+  }
+}
+
+// Every `lora` key offers a MODEL picker, filtered to its own family.
+//
+// The failure this pins is a UI one, which is exactly why it needs a
+// test: a `lora` field declared `is_path` renders a FILE BROWSER, and a
+// browser cannot show a catalogued adapter at all -- so the models the
+// catalogue exists to offer are invisible and the field looks broken
+// while being, technically, configurable. Krea-2's shipped that way.
+//
+// The type also has to be the family's OWN, or the picker offers every
+// adapter in the catalogue and a Krea-2 LoRA can be chosen for a FLUX.2
+// DiT, which loads and binds nothing.
+TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
+{
+  struct Row { const char* stage; const char* want_type; };
+  const Row rows[] = {
+    {"krea2-model-config",      "krea2-lora"},
+    {"flux2-model-config",      "flux2-lora"},
+    {"minimax-h3-model-config", "minimax-h3-lora"},
+  };
+  for (const Row& row : rows) {
+    const StageSpec* sp = StageRegistry::get().spec(row.stage);
+    EXPECT_TRUE(sp != nullptr);
+    if (sp == nullptr) { continue; }
+    const Row& r = row;
+    const ConfigKey* lora = nullptr;
+    for (const ConfigKey& k : sp->attrs) {
+      if (k.key == "lora") { lora = &k; break; }
+    }
+    EXPECT_TRUE(lora != nullptr);
+    if (lora == nullptr) { continue; }
+    // A model picker, not the filesystem browser.
+    EXPECT_TRUE(!lora->is_path);
+    EXPECT_TRUE(lora->suggest_db == kModelRegistryDb);
+    EXPECT_TRUE(lora->suggest_db_type == r.want_type);
+    if (lora->suggest_db_type != r.want_type) {
+      std::printf("[model_config] %s lora suggest_db_type '%s' != '%s'\n",
+                  r.stage, std::string(lora->suggest_db_type).c_str(),
+                  r.want_type);
+    }
+  }
+
+  // And the type has to NAME something, or the picker is empty and the
+  // field is free text with extra steps. flux2-lora is the exception,
+  // and is stated as one: nothing verified has been published for that
+  // family yet, so the FILTER is right and the list is empty until one
+  // is. If that changes, so should this.
+  int krea = 0, h3 = 0, flux = 0;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type == "krea2-lora")      { ++krea; }
+    if (e.model_type == "minimax-h3-lora") { ++h3; }
+    if (e.model_type == "flux2-lora")      { ++flux; }
+  }
+  EXPECT_TRUE(krea > 0);
+  EXPECT_TRUE(h3 > 0);
+  std::printf("[model_config] catalogued adapters: krea2 %d, h3 %d, "
+              "flux2 %d (none published yet)\n", krea, h3, flux);
+}
+
+// generate-image reads the adapter from its OWN config, and a beat
+// overrides it.
+//
+// This is the shape of a real report: a krea2-model-config carrying
+// `lora` was wired to the diffusion-conditioner -- which reads the
+// `vl_*` keys off the same beat -- and not to generate-image, so the
+// adapter was configured, reported by its source, and dropped. The key
+// now lives on the stage that loads the DiT as well, so a graph needs
+// no wiring at all to set one.
+TEST(model_config, generate_image_takes_the_adapter_from_its_own_config)
+{
+  Session sess;
+  auto mk = [&](const char* id, const char* lora, bool with_scale,
+                double scale) {
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("hf_dir",
+                                     FlexData::make_string("some/model"));
+    if (lora != nullptr) {
+      cfg.as_object().insert_or_assign("lora", FlexData::make_string(lora));
+    }
+    if (with_scale) {
+      cfg.as_object().insert_or_assign("lora_scale",
+                                       FlexData::make_real(scale));
+    }
+    return std::make_unique<GenerateImageStage>(&sess, id,
+                                                std::vector<InEdge>{},
+                                                std::move(cfg));
+  };
+
+  {   // Nothing set: no adapter, and the scale is the neutral default.
+    auto s = mk("g0", nullptr, false, 0.0);
+    EXPECT_TRUE(s->lora_ref().empty());
+    EXPECT_TRUE(s->lora_scale() == 1.0);
+  }
+  {   // Set on the stage: taken, with no beat and no wiring at all.
+    auto s = mk("g1", "mgwr/M87", true, 0.75);
+    EXPECT_TRUE(s->lora_ref() == "mgwr/M87");
+    EXPECT_TRUE(s->lora_scale() == 0.75);
+  }
+
+  // And the picker for it offers BOTH families this stage can adapt --
+  // a file browser here would hide every catalogued adapter, which is
+  // the bug this key was added to stop repeating.
+  const StageSpec* sp = StageRegistry::get().spec("generate-image");
+  EXPECT_TRUE(sp != nullptr);
+  if (sp != nullptr) {
+    const ConfigKey* lora = nullptr;
+    for (const ConfigKey& k : sp->attrs) {
+      if (k.key == "lora") { lora = &k; break; }
+    }
+    EXPECT_TRUE(lora != nullptr);
+    if (lora != nullptr) {
+      EXPECT_TRUE(!lora->is_path);
+      EXPECT_TRUE(lora->suggest_db == kModelRegistryDb);
+      EXPECT_TRUE(lora->suggest_db_type.find("krea2-lora") !=
+                  std::string_view::npos);
+      EXPECT_TRUE(lora->suggest_db_type.find("flux2-lora") !=
+                  std::string_view::npos);
+    }
+  }
+}

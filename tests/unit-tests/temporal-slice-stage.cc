@@ -26,6 +26,7 @@
 #include "stages/audio-video/temporal-slice-stage.h"
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -73,6 +74,11 @@ public:
   std::vector<std::int64_t> sb_idx;  // sideband `index`, same order
   std::vector<std::string> markers;
   std::vector<std::size_t> ranks;
+  // Full shapes, and -- for the frames mode -- the leading byte of each
+  // element along axis 0, which ClipSource sets to that frame's index.
+  std::vector<std::vector<std::int64_t>> shapes;
+  std::vector<std::vector<int>> elem_fills;
+  std::vector<bool> had_frames_key;
 
   Job
   process(RuntimeContext& ctx) override
@@ -82,16 +88,31 @@ public:
     if (const auto* tb = dynamic_cast<const TensorBeatPayload*>(in.get())) {
       got.push_back(tb->data.empty() ? -1 : (int)tb->data[0]);
       ranks.push_back(tb->shape.size());
+      shapes.push_back(tb->shape);
+      std::vector<int> fills;
+      if (tb->shape.size() >= 2 && tb->shape[0] > 0 && !tb->data.empty()) {
+        std::size_t per = 1;
+        for (std::size_t d = 1; d < tb->shape.size(); ++d) {
+          per *= (std::size_t)tb->shape[d];
+        }
+        for (std::int64_t k = 0; k < tb->shape[0]; ++k) {
+          const std::size_t off = (std::size_t)k * per;
+          if (off < tb->data.size()) { fills.push_back((int)tb->data[off]); }
+        }
+      }
+      elem_fills.push_back(std::move(fills));
       FlexData sb = tb->sideband;
       if (sb.is_object()) {
         auto o = sb.as_object();
         sb_idx.push_back(o.contains("index") ? o.at("index").as_int(-1) : -1);
+        had_frames_key.push_back(o.contains("frames"));
         markers.push_back(o.contains("marker")
                               ? std::string(o.at("marker").as_string(""))
                               : std::string());
       } else {
         sb_idx.push_back(-1);
         markers.push_back(std::string());
+        had_frames_key.push_back(false);
       }
     }
     co_return;
@@ -415,4 +436,197 @@ TEST(temporal_slice, an_unconfigured_slice_is_a_passthrough)
   ASSERT_TRUE(r.sink != nullptr);
   EXPECT_TRUE(same_(r.sink->got, {0, 1, 2, 3, 4, 5}));
   EXPECT_TRUE(r.slice->peak_hold() == 0);
+}
+
+namespace {
+
+// Emits `clips` stacked clip beats, each [T, 3, 2, 2] u8 with every byte
+// of frame f set to f -- so a sliced result names the frames it kept.
+class ClipSource : public TypedStage<ClipSource> {
+public:
+  static constexpr const char* kTypeName = "ut-tsl-clip-source";
+  using TypedStage::TypedStage;
+
+  int clips = 1;
+  int T     = 5;
+  int next  = 0;
+
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    if (next >= clips) { ctx.signal_done(); co_return; }
+    ++next;
+    const std::size_t per = (std::size_t)3 * 2 * 2;
+    TensorBeat tb;
+    tb.dtype = TensorBeat::DType::U8;
+    tb.shape = {(std::int64_t)T, 3, 2, 2};
+    tb.data.resize((std::size_t)T * per);
+    for (int f = 0; f < T; ++f) {
+      std::memset(tb.data.data() + (std::size_t)f * per, f, per);
+    }
+    FlexData o = FlexData::make_object();
+    o.as_object().insert_or_assign("frames", FlexData::make_int(T));
+    o.as_object().insert_or_assign("fps", FlexData::make_real(24.0));
+    o.as_object().insert_or_assign("marker",
+                                   FlexData::make_string("from-source"));
+    tb.sideband = std::move(o);
+    auto payload = make_payload<TensorBeatPayload>(std::move(tb));
+    co_await ctx.write(0, std::move(payload));
+    co_return;
+  }
+};
+
+// clip-source -> temporal-slice(cfg) -> sink
+bool
+drive_clips_(Run& r, int clips, int T, FlexData cfg)
+{
+  r.pl = std::make_unique<Pipeline>("p", &r.sess);
+  auto src_u = std::make_unique<ClipSource>(&r.sess, "src",
+                                            std::vector<InEdge>{},
+                                            FlexData::make_object());
+  src_u->clips = clips;
+  src_u->T = T;
+  auto* src = static_cast<ClipSource*>(r.pl->insert_stage(std::move(src_u)));
+  src->allocate_oports(1);
+  auto sl_u = std::make_unique<TemporalSliceStage>(
+      &r.sess, "sl", std::vector<InEdge>{{src, 0}}, std::move(cfg));
+  r.slice =
+      static_cast<TemporalSliceStage*>(r.pl->insert_stage(std::move(sl_u)));
+  auto sink_u = std::make_unique<IndexSink>(&r.sess, "sink",
+                                            std::vector<InEdge>{{r.slice, 0}},
+                                            FlexData::make_object());
+  r.sink = static_cast<IndexSink*>(r.pl->insert_stage(std::move(sink_u)));
+  PipelineRuntime rt(r.pl.get(), &r.sess);
+  if (!rt.launch()) { return false; }
+  rt.wait_idle();
+  rt.stop();
+  return true;
+}
+
+FlexData
+frames_cfg_(std::int64_t start, bool squeeze)
+{
+  auto c = FlexData::make_object();
+  c.as_object().insert_or_assign("sequence", FlexData::make_string("frames"));
+  c.as_object().insert_or_assign("start", FlexData::make_int(start));
+  if (squeeze) {
+    c.as_object().insert_or_assign("squeeze", FlexData::make_bool(true));
+  }
+  return c;
+}
+
+}  // namespace
+
+// The leading axis is the sequence, and ONE beat comes back per beat in
+// -- not the N beats the stream mode would emit.
+TEST(temporal_slice, frames_mode_slices_inside_one_beat)
+{
+  Run r;
+  ASSERT_TRUE(drive_clips_(r, /*clips=*/2, /*T=*/5, frames_cfg_(-1, false)));
+  if (r.sink == nullptr) { return; }
+
+  // Two clips in, two beats out: one per clip, NOT one per frame.
+  EXPECT_TRUE(r.sink->got.size() == 2);
+  ASSERT_TRUE(r.sink->shapes.size() == 2);
+  if (r.sink->shapes.size() == 2) {
+    // The time axis is KEPT at length 1 -- a one-frame clip, because
+    // squeeze was not asked for.
+    const std::vector<std::int64_t> want = {1, 3, 2, 2};
+    EXPECT_TRUE(r.sink->shapes[0] == want);
+    EXPECT_TRUE(r.sink->shapes[1] == want);
+  }
+  // ... and it is the LAST frame, resolved against this beat's own T.
+  ASSERT_TRUE(r.sink->elem_fills.size() == 2);
+  if (r.sink->elem_fills.size() == 2) {
+    const std::vector<int> last = {4};
+    EXPECT_TRUE(r.sink->elem_fills[0] == last);
+    EXPECT_TRUE(r.sink->elem_fills[1] == last);
+  }
+  // T is known from the beat, so a negative index holds NOTHING. The
+  // stream mode would have held one beat to answer the same question.
+  EXPECT_TRUE(r.slice != nullptr && r.slice->peak_hold() == 0);
+}
+
+// [3, H, W] is a still and [1, 3, H, W] is a one-frame clip. A model
+// that conditions on references reads the two by RANK and sizes them by
+// different rules, so the switch has to be explicit -- and it has to
+// actually change the rank.
+TEST(temporal_slice, frames_mode_squeeze_drops_the_time_axis)
+{
+  Run r;
+  ASSERT_TRUE(drive_clips_(r, /*clips=*/1, /*T=*/5, frames_cfg_(-1, true)));
+  if (r.sink == nullptr || r.sink->shapes.empty()) { return; }
+
+  const std::vector<std::int64_t> still = {3, 2, 2};
+  EXPECT_TRUE(r.sink->shapes[0] == still);
+  // Still the last frame, just without the axis.
+  EXPECT_TRUE(r.sink->got[0] == 4);
+  // A still carries no `frames`: a picture that claims a frame count is
+  // a clip to anything that reads one.
+  ASSERT_TRUE(!r.sink->had_frames_key.empty());
+  if (!r.sink->had_frames_key.empty()) {
+    EXPECT_FALSE(r.sink->had_frames_key[0]);
+  }
+  // What the stage does not understand still survives.
+  EXPECT_TRUE(!r.sink->markers.empty()
+              && r.sink->markers[0] == "from-source");
+}
+
+// Squeezing several frames is not a shape the caller can have meant, so
+// the axis is kept and the run says so rather than fabricating one.
+TEST(temporal_slice, frames_mode_squeeze_of_several_keeps_the_axis)
+{
+  Run r;
+  // start: -2 selects the last TWO frames.
+  ASSERT_TRUE(drive_clips_(r, /*clips=*/1, /*T=*/5, frames_cfg_(-2, true)));
+  if (r.sink == nullptr || r.sink->shapes.empty()) { return; }
+
+  const std::vector<std::int64_t> clip = {2, 3, 2, 2};
+  EXPECT_TRUE(r.sink->shapes[0] == clip);
+  ASSERT_TRUE(!r.sink->elem_fills.empty());
+  if (!r.sink->elem_fills.empty()) {
+    const std::vector<int> want = {3, 4};
+    EXPECT_TRUE(r.sink->elem_fills[0] == want);
+  }
+  // A multi-frame selection IS a clip, so it keeps `frames` -- and the
+  // count is what came out, not what went in.
+  ASSERT_TRUE(!r.sink->had_frames_key.empty());
+  if (!r.sink->had_frames_key.empty()) {
+    EXPECT_TRUE(r.sink->had_frames_key[0]);
+  }
+}
+
+// A middle slice, to pin that the indexing is Python's and not just the
+// two endpoints.
+TEST(temporal_slice, frames_mode_matches_python_slice_semantics)
+{
+  Run r;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("sequence",
+                                   FlexData::make_string("frames"));
+  cfg.as_object().insert_or_assign("start", FlexData::make_int(1));
+  cfg.as_object().insert_or_assign("end", FlexData::make_int(6));
+  cfg.as_object().insert_or_assign("step", FlexData::make_int(2));
+  ASSERT_TRUE(drive_clips_(r, /*clips=*/1, /*T=*/7, std::move(cfg)));
+  if (r.sink == nullptr || r.sink->elem_fills.empty()) { return; }
+
+  // list(range(7))[1:6:2] == [1, 3, 5]
+  const std::vector<int> want = {1, 3, 5};
+  EXPECT_TRUE(r.sink->elem_fills[0] == want);
+  if (r.sink->elem_fills[0] != want) {
+    std::printf("[temporal_slice] frames [1:6:2] gave:");
+    for (int v : r.sink->elem_fills[0]) { std::printf(" %d", v); }
+    std::printf("\n");
+  }
+}
+
+TEST(temporal_slice, an_unknown_sequence_is_a_config_error)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("sequence",
+                                   FlexData::make_string("samples"));
+  auto s = std::make_unique<TemporalSliceStage>(
+      &sess, "sl", std::vector<InEdge>{}, cfg);
+  EXPECT_FALSE(s->config_error().empty());
 }

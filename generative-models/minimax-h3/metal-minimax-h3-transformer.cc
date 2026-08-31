@@ -187,47 +187,6 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
 
 // One scalar tensor as f32 (a kohya `alpha`). Empty when it is not a
 // scalar this can read; the caller then treats the module as
-// alpha == rank, which is the no-rescale case.
-std::vector<float>
-scalar_f32_(const MetalLlamaWeights& w, const std::string& name,
-            const MetalLlamaWeights::TensorInfo* ti, MetalCompute* mc)
-{
-  std::size_t n = 1;
-  for (auto d : ti->shape) { n *= (std::size_t)d; }
-  if (n != 1) { return {}; }
-  SharedBuffer b = w.load(name, mc);
-  if (b.empty()) { return {}; }
-  if (ti->dtype == "F32") {
-    return {*static_cast<const float*>(b.contents())};
-  }
-  if (ti->dtype == "F16") {
-    return {(float)*static_cast<const _Float16*>(b.contents())};
-  }
-  if (ti->dtype == "BF16") {
-    return {bf16_to_f32_(*static_cast<const std::uint16_t*>(b.contents()))};
-  }
-  return {};
-}
-
-// Does this adapter touch any `mlp.fc1`?
-//
-// Asked by opening the header only -- no tensor is read -- because the
-// answer decides how the BLOCKS are built, and that happens before there
-// is a model to bind an adapter to. A file that cannot be opened answers
-// "no": bind_lora_ runs later and reports the real error, and refusing
-// the fusion on a file that turns out to be unreadable would be a
-// slowdown chosen for a reason that never materialized.
-bool
-lora_touches_fc1_(const std::string& path)
-{
-  auto w = MetalLlamaWeights::open(path);
-  if (!w.has_value()) { return false; }
-  for (const std::string& n : w->tensor_names()) {
-    if (n.find(".mlp.fc1.lora_") != std::string::npos) { return true; }
-  }
-  return false;
-}
-
 std::string
 blk_(const char* prefix, int i, const char* rest)
 {
@@ -1272,103 +1231,131 @@ MetalMiniMaxH3Transformer::lora_route_b_(int rank, int N) const
 bool
 MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
 {
-  auto fail = [&](const std::string& m) {
-    if (err != nullptr) { *err = "minimax-h3 lora: " + m; }
+  // Reading the FILE is shared with every other family that takes an
+  // adapter (shared/runtime-lora.h): the two publisher spellings, the
+  // alpha/rank rescale, the bf16 conversion, the shape check and the
+  // skip counting. What stays here is the MODULE LIST, which is the
+  // model -- a family that shared that would bind an adapter to the
+  // wrong projections and produce plausible wrong output.
+  std::string oerr;
+  auto ad = lora::Adapter::open(spec.path, _mc, &oerr);
+  if (!ad) {
+    if (err != nullptr) { *err = "minimax-h3 lora: " + oerr; }
     return false;
-  };
-  auto w = MetalLlamaWeights::open(spec.path);
-  if (!w.has_value()) { return fail("cannot open " + spec.path); }
+  }
   _lora_scale = spec.scale;
 
-  // One factor, converted to bf16 and (for A) pre-scaled -- folding the
-  // strength into A here keeps the kernels scale-free and costs one pass
-  // over the smaller of the two matrices.
-  auto take = [&](const std::string& name, float mul) -> SharedBuffer {
-    const auto* ti = w->info(name);
-    if (ti == nullptr || ti->shape.size() != 2) { return {}; }
-    std::size_t n = (std::size_t)ti->shape[0] * (std::size_t)ti->shape[1];
-    SharedBuffer src = w->load(name, _mc);
-    if (src.empty()) { return {}; }
-    SharedBuffer dst = _mc->make_shared_buffer(n * 2);
-    if (dst.empty()) { return {}; }
-    auto* d = static_cast<std::uint16_t*>(dst.contents());
-    if (ti->dtype == "BF16") {
-      const auto* p = static_cast<const std::uint16_t*>(src.contents());
-      for (std::size_t i = 0; i < n; ++i) {
-        d[i] = mul == 1.0f ? p[i] : f32_to_bf16_(bf16_to_f32_(p[i]) * mul);
-      }
-    } else if (ti->dtype == "F16") {
-      const auto* p = static_cast<const _Float16*>(src.contents());
-      for (std::size_t i = 0; i < n; ++i) {
-        d[i] = f32_to_bf16_((float)p[i] * mul);
-      }
-    } else if (ti->dtype == "F32") {
-      const auto* p = static_cast<const float*>(src.contents());
-      for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_(p[i] * mul); }
-    } else {
-      return {};
-    }
-    return dst;
-  };
-
-  // Publishers disagree about one thing only: whether the module names
-  // carry a container prefix. ComfyUI-convention adapters key on
-  // `diffusion_model.<module>` where the model's own names have no
-  // prefix at all, and the shapes and the ORDER are otherwise identical
-  // -- so this is a lookup with two spellings rather than a conversion.
-  // An adapter that needs more than a prefix (diffusers' split
-  // to_q/to_k/to_v, its value-first ff.net.0.proj) is NOT one of these
-  // and must not be coerced into looking like one.
-  static const char* const kPrefixes[] = {"", "diffusion_model."};
-
-  int skipped = 0;
+  // How many fused `attn.qkv_proj` modules the FILE supplied. Those
+  // carry a block-diagonal B in the [all q | all k | all v] sense, and
+  // that is a claim about the BASE's row order -- see the warning at
+  // the end of this function.
+  int fused_qkv = 0;
   auto bind = [&](const std::string& mod, int N, int K, LoraFactors& out) {
-    std::string key;
-    const MetalLlamaWeights::TensorInfo* ai = nullptr;
-    const MetalLlamaWeights::TensorInfo* bi = nullptr;
-    for (const char* pre : kPrefixes) {
-      const std::string k = std::string(pre) + mod;
-      const auto* a = w->info(k + ".lora_A.weight");
-      const auto* b = w->info(k + ".lora_B.weight");
-      if (a != nullptr && b != nullptr) { key = k; ai = a; bi = b; break; }
-    }
-    if (ai == nullptr || bi == nullptr) { return; }
-    if (ai->shape.size() != 2 || bi->shape.size() != 2 ||
-        ai->shape[1] != K || bi->shape[0] != N ||
-        ai->shape[0] != bi->shape[1]) {
-      // A shape that does not fit is the one thing worth counting
-      // separately from absence: it means the adapter was trained
-      // against a DIFFERENT model, and applying the parts that happen to
-      // fit would be worse than applying none.
-      ++skipped;
-      return;
-    }
-    out.rank = (int)ai->shape[0];
-    // kohya / ai-toolkit ship a per-module `alpha` and the update is
-    // scaled by alpha/rank. Absent (diffusers, and larryvrh's adapter)
-    // means the factors are already at strength, which is the same thing
-    // as alpha == rank. This is a property of the FILE, so it folds into
-    // A once, here. The caller's strength does NOT: it is a per-forward
-    // constant, so it can be turned without rebuilding 33B of weights.
-    float mul = 1.0f;
-    if (const auto* al = w->info(key + ".alpha")) {
-      std::vector<float> v = scalar_f32_(*w, key + ".alpha", al, _mc);
-      if (!v.empty() && out.rank > 0) { mul *= v[0] / (float)out.rank; }
-    }
-    out.a = take(key + ".lora_A.weight", mul);
-    out.b = take(key + ".lora_B.weight", 1.0f);
-    if (out.empty()) { out = LoraFactors{}; ++skipped; return; }
-    _lora_max_rank = std::max(_lora_max_rank, out.rank);
-    ++_lora_modules;
+    ad->bind(mod, N, K, &out);
   };
 
   const Config& c = _cfg;
   const int H = c.hidden, I = c.inner(), F = c.ffn;
+
+  // ---- the DIFFUSERS decomposition ---------------------------------
+  //
+  // lightx2v publishes each Turbo adapter twice. The ComfyUI copy names
+  // this model's own modules and binds below; the diffusers copy is the
+  // ORIGINAL peft export and is a different DECOMPOSITION, not a
+  // renaming:
+  //
+  //   transformer_blocks.N.            -> blocks.N.
+  //   token_refiner.refiner_blocks.N.  -> token_refiner.blocks.N.
+  //   attn.to_q + to_k + to_v          -> attn.qkv_proj  (FUSED)
+  //   attn.to_out.0                    -> attn.out_proj
+  //   ff.net.0.proj                    -> mlp.fc1  (B halves SWAPPED)
+  //   ff.net.2                         -> mlp.fc2
+  //
+  // and its factors are spelled `.lora_A.default.weight` with ONE alpha
+  // in `__metadata__` instead of a tensor per module.
+  //
+  // Every line of that was VERIFIED tensor-for-tensor against
+  // upstream's own ComfyUI conversion of the same adapter, on a main
+  // block and on a refiner block: A concatenates on the rank axis
+  // exactly, B is exactly block-diagonal, fc1's halves are exactly
+  // swapped, out_proj and fc2 are byte-identical, and alpha 8 over rank
+  // 128 is the same strength as their fused 24 over 384. It is not
+  // inferred from the metadata's description of itself.
+  //
+  // IT IS THE BETTER FILE TO HOLD, which is what makes this worth
+  // doing rather than pointing users at the ComfyUI copy. A PUBLISHED
+  // fusion is built for one qkv column grouping -- flat, in every case
+  // that exists -- so it is silently wrong on the other publisher's
+  // weights. Fusing it HERE builds the grouping this model actually
+  // has, so the diffusers copy runs on both releases where the ComfyUI
+  // copy runs on one. It is also the smaller download -- 1.38 GB
+  // against 1.96, the difference being the two thirds of a
+  // block-diagonal B that is zero. NOT the smaller model: the fusion is
+  // rebuilt here, so what it costs in RAM is what the ComfyUI copy
+  // costs on disk.
+  if (ad->has("transformer_blocks.0.attn.to_q")) {
+    const int HD = c.head_dim;
+    const bool per_head = c.qkv_per_head;
+    // Where part `pt` (0 = q, 1 = k, 2 = v) row `r` lands in the fused
+    // [3 * inner] output. FLAT is [all q | all k | all v]; PER-HEAD
+    // interleaves the three within each head, which is what every
+    // MiniMaxAI release does and what no published fusion targets.
+    const lora::Adapter::RowMap qkv_rows =
+        [per_head, HD, I](int pt, int r) {
+          return qkv_fused_row(pt, r, I, HD, per_head);
+        };
+    // Diffusers' SwiGLU is [value; gate] where fc1 here is read
+    // [gate; value] -- see the fc1 half-order note in the forward.
+    const lora::Adapter::RowMap swap_halves =
+        [F](int, int r) { return r < F ? r + F : r - F; };
+    // out_proj and fc2 are byte-identical between the two copies, so
+    // they take the plain bind and not a scatter that would copy every
+    // row to its own index.
+    auto bind_block = [&](const std::string& dp, BlockLora& bl) {
+      ad->bind_fused({dp + "attn.to_q", dp + "attn.to_k", dp + "attn.to_v"},
+                     3 * I, H, &bl.qkv, qkv_rows);
+      ad->bind(dp + "attn.to_out.0", H, I, &bl.out);
+      ad->bind_fused({dp + "ff.net.0.proj"}, 2 * F, H, &bl.fc1, swap_halves);
+      ad->bind(dp + "ff.net.2", H, F, &bl.fc2);
+    };
+    _lora_blocks.resize((std::size_t)c.n_layers);
+    for (int i = 0; i < c.n_layers; ++i) {
+      bind_block("transformer_blocks." + std::to_string(i) + ".",
+                 _lora_blocks[(std::size_t)i]);
+    }
+    _lora_refiner.resize((std::size_t)c.n_refiner);
+    for (int i = 0; i < c.n_refiner; ++i) {
+      bind_block("token_refiner.refiner_blocks." + std::to_string(i) + ".",
+                 _lora_refiner[(std::size_t)i]);
+    }
+    // No adaln and no final_layer: the diffusers export does not adapt
+    // them, and neither does the ComfyUI copy built from it.
+    _lora_modules  = ad->modules();
+    _lora_max_rank = ad->max_rank();
+    if (_lora_modules == 0) {
+      if (err != nullptr) {
+        *err = "minimax-h3 lora: '" + spec.path +
+               "' looks like the diffusers decomposition but none of its "
+               "modules fit this DiT";
+      }
+      return false;
+    }
+    if (_mc->session() != nullptr) {
+      _mc->session()->info(fmt(
+          "MetalMiniMaxH3Transformer: {} (diffusers decomposition, qkv "
+          "fused HERE for this DiT's {} grouping)",
+          ad->summary(spec.path, _lora_scale),
+          per_head ? "PER-HEAD" : "flat"));
+    }
+    return true;
+  }
+
   _lora_blocks.resize((std::size_t)c.n_layers);
   for (int i = 0; i < c.n_layers; ++i) {
     BlockLora& bl = _lora_blocks[(std::size_t)i];
     const std::string p = blk_("blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
+    if (!bl.qkv.empty()) { ++fused_qkv; }
     bind(p + "attn.out_proj", H, I, bl.out);
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
@@ -1379,22 +1366,52 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     BlockLora& bl = _lora_refiner[(std::size_t)i];
     const std::string p = blk_("token_refiner.blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
+    if (!bl.qkv.empty()) { ++fused_qkv; }
     bind(p + "attn.out_proj", H, I, bl.out);
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
   }
   bind("final_layer.adaln_proj.linear", 2 * H, c.time_dim, _lora_final);
 
+  _lora_modules  = ad->modules();
+  _lora_max_rank = ad->max_rank();
   if (_lora_modules == 0) {
-    return fail("'" + spec.path + "' adapts none of this model's modules");
+    if (err != nullptr) {
+      *err = "minimax-h3 lora: '" + spec.path +
+             "' adapts none of this model's modules";
+    }
+    return false;
   }
   if (_mc->session() != nullptr) {
-    _mc->session()->log_normal(fmt(
-        "MetalMiniMaxH3Transformer: runtime LoRA '{}' -- {} modules at "
-        "scale {}, rank <= {}{}",
-        spec.path, _lora_modules, _lora_scale, _lora_max_rank,
-        skipped > 0 ? fmt(", {} SKIPPED (shape mismatch)", skipped)()
-                    : std::string()));
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: {}",
+        ad->summary(spec.path, _lora_scale)));
+  }
+  // A FUSED qkv adapter is not layout-neutral, and the mismatch is
+  // silent.
+  //
+  // `attn.qkv_proj` writes one [rows, 3*inner] block whose columns the
+  // two publishers group differently: Comfy-Org's repack is FLAT
+  // ([all q | all k | all v]) and every MiniMaxAI release is PER-HEAD
+  // ([q0 k0 v0 | q1 k1 v1 | ...]). Every fused adapter published for
+  // this model -- larryvrh's and both of lightx2v's ComfyUI copies --
+  // has a block-diagonal B built for the FLAT order, so on a per-head
+  // DiT it adds one head's q delta onto another head's k in every
+  // block. The weights stay well-shaped and the video comes out wrong.
+  //
+  // Nothing in the file states the grouping, so this cannot be checked
+  // -- only reported. It is a warning rather than a refusal because the
+  // caller may know better than the guess: a repack could ship a
+  // per-head fusion, and refusing would make that unusable.
+  if (fused_qkv > 0 && c.qkv_per_head && _mc->session() != nullptr) {
+    _mc->session()->warn(fmt(
+        "MetalMiniMaxH3Transformer: '{}' carries a FUSED attn.qkv_proj "
+        "adapter ({} blocks) and this DiT groups qkv PER HEAD. Every "
+        "published fusion for this model is built for the flat "
+        "[q|k|v] order of Comfy-Org's repack; on per-head weights it "
+        "adds one head's q delta onto another head's k, silently. Use "
+        "the Comfy-Org DiT with this adapter, or an adapter that keeps "
+        "to_q/to_k/to_v separate", spec.path, fused_qkv));
   }
   return true;
 }
@@ -1629,7 +1646,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // delta to be added to. This has to be settled HERE, before any block
     // loads -- load_block_ interleaves fc1's rows when the fusion is on,
     // and an interleaved weight cannot then take the split path.
-    if (m->_fuse_ff && lora != nullptr && lora_touches_fc1_(lora->path)) {
+    if (m->_fuse_ff && lora != nullptr &&
+        lora::Adapter::file_touches(lora->path, ".mlp.fc1.lora_")) {
       m->_fuse_ff = false;
       if (mc->session() != nullptr) {
         mc->session()->log_debug(fmt(
@@ -3661,6 +3679,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   //     a head is 3*HD apart, q/k/v are HD apart WITHIN it
   //   flat (Comfy-Org's conversion):   [all q | all k | all v]
   //     a head is HD apart, q/k/v are I apart
+  // MUST agree with qkv_fused_row(), which places a split adapter's
+  // rows into this same layout; the two are pinned together by a test.
   const int QKV_HSTRIDE = c.qkv_per_head ? 3 * HD : HD;
   const int Q_OFF = 0;
   const int K_OFF = c.qkv_per_head ? HD : I;

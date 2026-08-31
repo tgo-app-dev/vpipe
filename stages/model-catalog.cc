@@ -1279,17 +1279,29 @@ builtin_catalog_()
      .files = {"minimax_h3_turbo_4step_ema_ckpt850.safetensors"},
      .needs_tokenizer_json = false,
      .name = "larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema"},
-    // lightx2v's Turbo line, the OTHER few-step distillation of FL2VA.
+    // lightx2v's Turbo line, the OTHER few-step distillation of this
+    // model -- and the only one that covers BOTH partitions.
     //
-    // Only the `_comfyui_` spellings are catalogued, and the omission is
-    // deliberate rather than an oversight: the repo publishes each
-    // adapter twice, and the diffusers copy is not a renaming but a
-    // different DECOMPOSITION -- separate to_q/to_k/to_v that would have
-    // to be stacked block-diagonally into this model's fused qkv_proj,
-    // and an ff.net.0.proj in diffusers' value-first order whose halves
-    // would need swapping. Both transforms produce a well-shaped WRONG
-    // model if guessed at, so the files that would need them are not
-    // offered.
+    // The repo publishes each adapter TWICE and both spellings are
+    // catalogued, because the difference is not cosmetic and the two
+    // are not equally good.
+    //
+    // The diffusers copy is the original peft export: separate
+    // to_q/to_k/to_v, an ff.net.0.proj in value-first order, factors
+    // named `.lora_A.default.weight` and one alpha in `__metadata__`.
+    // The ComfyUI copy is that file CONVERTED -- q/k/v stacked
+    // block-diagonally into this model's fused qkv_proj, fc1's halves
+    // swapped to gate-first, a per-module alpha written out. Both load
+    // (see MetalMiniMaxH3Transformer::bind_lora_, whose conversion is
+    // verified tensor-for-tensor against upstream's).
+    //
+    // PREFER THE DIFFUSERS COPY. A published fusion is built for ONE
+    // qkv column grouping and is silently wrong on the other; fusing
+    // from the split file happens against the DiT actually loaded, so
+    // it is right on both publishers' weights. It is also the smaller
+    // DOWNLOAD, 1.38 GB against 1.96 -- the difference being the two
+    // thirds of a block-diagonal B that is zero. Not the smaller
+    // model: the fusion is rebuilt at load either way.
     //
     // The ComfyUI copies key on `diffusion_model.<module>`, which both
     // the fuse and the runtime path resolve, and carry per-module alpha
@@ -1325,6 +1337,60 @@ builtin_catalog_()
      .files = {"minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-8step"},
+    // The 8-step at 768p: the same distillation as the entry above run
+    // at 1344x768 on the 4-step 768p's shifts (6 / 3), and upstream's
+    // own default -- LightX2V Studio serves this one. Recommended at 8
+    // steps, where the 544p 8-step is also usable at 4.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6 (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p"},
+    // The FIRST adapter here for the OTHER partition. Ref2VA's DiT is
+    // the same architecture as FL2VA down to the tensor names, so the
+    // adapter has the same 50+2 blocks and the same shapes -- and it is
+    // trained for the other task, so the parent link is what keeps it
+    // out of an FL2VA graph. Distilled at 544p on the checkpoint's own
+    // 12 / 3 shifts, 4 steps.
+    //
+    // Its metadata names the FL2VA repack as `base_model`, which is a
+    // stale string in upstream's conversion script rather than a claim
+    // about the weights: the file's own module list is the Ref2VA
+    // partition's, and the two partitions are byte-identical in shape.
+    // What the string DOES get right is the publisher -- see the qkv
+    // grouping note above, which applies to this file too.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v0.1 (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step"},
+    // The DIFFUSERS copies of the two entries above -- the same
+    // adapters, split rather than fused, and the ones to reach for.
+    // See the qkv-grouping paragraph at the head of this section.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p-split"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v0.1, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step-split"},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -1649,6 +1715,45 @@ catalog_all_by_path(const std::string& hf_path)
     if (e.hf_path == hf_path) { out.push_back(&e); }
   }
   return out;
+}
+
+const ModelCatalogEntry*
+catalog_pick_variant(const std::vector<const ModelCatalogEntry*>& cands,
+                     const std::string& variant,
+                     std::vector<const ModelCatalogEntry*>* matched)
+{
+  if (matched != nullptr) { matched->clear(); }
+  if (cands.empty()) { return nullptr; }
+  if (variant.empty()) {
+    // Nothing to match on: only a single candidate is unambiguous.
+    if (cands.size() != 1) { return nullptr; }
+    if (matched != nullptr) { matched->push_back(cands.front()); }
+    return cands.front();
+  }
+  auto lower = [](std::string v) {
+    for (char& c : v) { c = (char)tolower((unsigned char)c); }
+    return v;
+  };
+  const std::string w = lower(variant);
+  std::vector<const ModelCatalogEntry*> exact, part;
+  for (const ModelCatalogEntry* e : cands) {
+    const std::string fields[] = {lower(e->version), lower(e->variant),
+                                  lower(e->name), lower(e->model_type)};
+    bool is_exact = false, is_part = false;
+    for (const std::string& f : fields) {
+      if (f.empty()) { continue; }
+      if (f == w) { is_exact = true; }
+      else if (f.find(w) != std::string::npos) { is_part = true; }
+    }
+    if (is_exact)     { exact.push_back(e); }
+    else if (is_part) { part.push_back(e); }
+  }
+  // An exact hit anywhere outranks every substring hit; only within one
+  // tier does a tie mean ambiguity.
+  const std::vector<const ModelCatalogEntry*>& hits =
+      exact.empty() ? part : exact;
+  if (matched != nullptr) { *matched = hits; }
+  return hits.size() == 1 ? hits.front() : nullptr;
 }
 
 const ModelCatalogEntry*

@@ -7,7 +7,9 @@
 #include "pipeline/typed-stage.h"
 
 #include <cstdint>
+#include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -79,6 +81,13 @@ public:
 private:
   // Reset the accumulator to empty, keeping the configured mode.
   void reset_group_();
+  // How many beats to keep after an emit: `_overlap`, bounded by what
+  // the group actually held and never the whole of it. 0 for audio and
+  // whenever no overlap is configured.
+  int retain_beats_() const noexcept;
+  // Drop all but the last `keep` beats from the accumulator, rebuilding
+  // the group's rate metadata from the beats that remain.
+  void retain_tail_(int keep);
   // Append one beat. False (with a warned reason) when it does not match
   // the group already open.
   bool append_(const TensorBeat& tb, std::string* err);
@@ -86,6 +95,33 @@ private:
   // group is empty.
   TensorBeat build_() const;
   Job emit_(RuntimeContext& ctx);
+
+  // How many beats of the group just emitted stay in the accumulator, so
+  // the NEXT group opens with them. Frames, not seconds: this stage's
+  // unit is the beat and `group_size` already counts them, so at 24 fps
+  // an overlap of 24 is one second and the arithmetic is the caller's
+  // rather than a rate this stage would have to re-derive at retention
+  // time. 0 (the default) is the old behaviour -- groups share nothing.
+  //
+  // VIDEO and generic groups only. Audio beats are variable-length on
+  // the time axis, so "the last N beats" is not a duration and the
+  // retention would depend on how the source happened to chunk; the
+  // seconds-accurate control for audio is `audio-to-pcm`'s
+  // `chunk_overlap_s`, which works in samples and owns the chunking.
+  int    _overlap  = 0;
+  bool   _overlap_audio_warned = false;
+
+  // The last `_overlap` beats' rate metadata, kept only when an overlap
+  // is configured. The group's `timestamp_us` and its derived fps come
+  // from the FIRST beat in the accumulator, so after a retention they
+  // have to come from the first RETAINED beat -- carrying the emitted
+  // group's would date the next clip to a frame it no longer starts on.
+  struct TailMeta {
+    bool          has_ts = false;
+    std::uint64_t ts     = 0;
+    FlexData      sb;
+  };
+  std::deque<TailMeta> _tail_meta;
 
   Mode   _mode_cfg = Mode::kAuto;   // as configured
   Mode   _mode     = Mode::kAuto;   // latched for the open group

@@ -572,108 +572,6 @@ PipelineRuntime::launch_()
     }
   }
 
-  // Phase 1.5: clock-domain analysis. Observational + validation:
-  // log the partitioning at info level so users can see how their
-  // graph was carved into clock domains, and reject the launch if
-  // any single domain contains a directed cycle (those need a
-  // {drain, feed} stage pair, which is future work). The explicit
-  // edge list is the post-inlining logical topology -- using it
-  // (instead of raw oport_edges()) keeps the analysis correct
-  // when call-stages have been erased.
-  ClockDomainAssignment cd = compute_clock_domains(stages, logical_edges);
-  {
-    ostringstream summary;
-    summary << "PipelineRuntime: pipeline '" << _pipeline->id()
-            << "' has " << cd.num_domains << " clock domain"
-            << (cd.num_domains == 1 ? "" : "s");
-    for (unsigned d = 0; d < cd.num_domains; ++d) {
-      summary << "; domain " << d << " = {";
-      bool first = true;
-      for (Stage* s : cd.stages_in_domain[d]) {
-        if (!first) summary << ", ";
-        summary << s->id();
-        first = false;
-      }
-      summary << "}";
-    }
-    if (!cd.crossers.empty()) {
-      summary << "; crossers = {";
-      bool first = true;
-      for (Stage* s : cd.crossers) {
-        if (!first) summary << ", ";
-        summary << s->id();
-        first = false;
-      }
-      summary << "}";
-    }
-    string s = summary.str();
-    session()->info(fmt("{}", s));
-  }
-  if (cd.intra_domain_cycle) {
-    session()->warn(fmt(
-      "PipelineRuntime: pipeline '{}' has a directed cycle within a "
-      "single clock domain (first stage on cycle: '{}'); intra-domain "
-      "feedback requires a {{drain, feed}} stage pair, which is not "
-      "yet supported. Refusing to launch.",
-      _pipeline->id(),
-      cd.cycle_stage ? cd.cycle_stage->id() : "?"));
-    return false;
-  }
-
-  // Phase 1.6: feedback-pair validation. Every feedback-tx stage names
-  // (via config.from) the feedback-rx stage it relays. The pair forms
-  // a logical one-beat-delay register that only makes sense when both
-  // endpoints already participate in the same clock domain via the
-  // rest of the graph (the "register" lives inside one clock, not
-  // across two). Verify rx exists and tx.oport=0 + rx.iport=0 fell
-  // into the same domain.
-  for (Stage* s : stages) {
-    auto* tx = dynamic_cast<FeedbackTxStage*>(s);
-    if (!tx) { continue; }
-    FeedbackRxStage* rx = tx->rx();
-    if (!rx) {
-      // initialize() will not have run yet; resolve here so we can
-      // perform the clock-domain check before launch. Re-uses
-      // tx's stored from_id.
-      const std::string& from_id = tx->from_id();
-      for (Stage* candidate : stages) {
-        if (candidate->id() != from_id) { continue; }
-        rx = dynamic_cast<FeedbackRxStage*>(candidate);
-        break;
-      }
-    }
-    if (!rx) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback-tx '{}' names "
-        "feedback-rx '{}' but no such stage exists in the pipeline. "
-        "Refusing to launch.",
-        _pipeline->id(), tx->id(), tx->from_id()));
-      return false;
-    }
-    auto it_tx = cd.port_domain.find(
-        PortKey{tx, PortKey::Kind::Out, 0});
-    auto it_rx = cd.port_domain.find(
-        PortKey{rx, PortKey::Kind::In, 0});
-    if (it_tx == cd.port_domain.end()
-        || it_rx == cd.port_domain.end()) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' / "
-        "rx='{}' missing from clock-domain map (tx oport or rx iport "
-        "unwired?). Refusing to launch.",
-        _pipeline->id(), tx->id(), rx->id()));
-      return false;
-    }
-    if (it_tx->second != it_rx->second) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' (domain "
-        "{}) and rx='{}' (domain {}) are in different clock domains; "
-        "feedback edges must stay within one clock domain. Refusing "
-        "to launch.",
-        _pipeline->id(), tx->id(), it_tx->second,
-        rx->id(), it_rx->second));
-      return false;
-    }
-  }
 
   // Phase 2a: allocate one OportBuffer per (producer, oport). Every
   // oport gets one, even if it has no consumers wired up -- a stage's
@@ -863,6 +761,121 @@ PipelineRuntime::launch_()
       session()->log_debug(fmt(
           "constant-fold: delivered {} constant beat(s) to consumers "
           "before planning", folded));
+    }
+  }
+
+  // Phase 3.7: clock-domain analysis, then feedback-pair validation.
+  // Observational + validation: log the partitioning at info level so
+  // users can see how their graph was carved into clock domains, and
+  // reject the launch if any single domain contains a directed cycle
+  // (those need a {drain, feed} stage pair, which is future work). The
+  // explicit edge list is the post-inlining logical topology -- using it
+  // (instead of raw oport_edges()) keeps the analysis correct when
+  // call-stages have been erased.
+  //
+  // AFTER CONSTANT FOLDING, and that ordering is load-bearing. A stage
+  // may report a clock group that depends on what it is configured to
+  // do -- vae-decode's frame oport is a rate change for a VIDEO
+  // checkpoint and one-to-one for an IMAGE one -- and for the graphs
+  // that matter the checkpoint arrives as a model-select constant, not
+  // in the stage's own config. Asked before Phase 3.6, every such stage
+  // has to answer from an empty configuration and the analysis is of a
+  // graph nobody is going to run.
+  //
+  // Still BEFORE Phase 4: both checks below refuse the launch, and
+  // refusing after begin_plan would leave a planner bracketed open.
+  ClockDomainAssignment cd = compute_clock_domains(stages, logical_edges);
+  {
+    ostringstream summary;
+    summary << "PipelineRuntime: pipeline '" << _pipeline->id()
+            << "' has " << cd.num_domains << " clock domain"
+            << (cd.num_domains == 1 ? "" : "s");
+    for (unsigned d = 0; d < cd.num_domains; ++d) {
+      summary << "; domain " << d << " = {";
+      bool first = true;
+      for (Stage* s : cd.stages_in_domain[d]) {
+        if (!first) summary << ", ";
+        summary << s->id();
+        first = false;
+      }
+      summary << "}";
+    }
+    if (!cd.crossers.empty()) {
+      summary << "; crossers = {";
+      bool first = true;
+      for (Stage* s : cd.crossers) {
+        if (!first) summary << ", ";
+        summary << s->id();
+        first = false;
+      }
+      summary << "}";
+    }
+    string s = summary.str();
+    session()->info(fmt("{}", s));
+  }
+  if (cd.intra_domain_cycle) {
+    session()->warn(fmt(
+      "PipelineRuntime: pipeline '{}' has a directed cycle within a "
+      "single clock domain (first stage on cycle: '{}'); intra-domain "
+      "feedback requires a {{drain, feed}} stage pair, which is not "
+      "yet supported. Refusing to launch.",
+      _pipeline->id(),
+      cd.cycle_stage ? cd.cycle_stage->id() : "?"));
+    return false;
+  }
+
+  // Feedback-pair validation. Every feedback-tx stage names
+  // (via config.from) the feedback-rx stage it relays. The pair forms
+  // a logical one-beat-delay register that only makes sense when both
+  // endpoints already participate in the same clock domain via the
+  // rest of the graph (the "register" lives inside one clock, not
+  // across two). Verify rx exists and tx.oport=0 + rx.iport=0 fell
+  // into the same domain.
+  for (Stage* s : stages) {
+    auto* tx = dynamic_cast<FeedbackTxStage*>(s);
+    if (!tx) { continue; }
+    FeedbackRxStage* rx = tx->rx();
+    if (!rx) {
+      // initialize() will not have run yet; resolve here so we can
+      // perform the clock-domain check before launch. Re-uses
+      // tx's stored from_id.
+      const std::string& from_id = tx->from_id();
+      for (Stage* candidate : stages) {
+        if (candidate->id() != from_id) { continue; }
+        rx = dynamic_cast<FeedbackRxStage*>(candidate);
+        break;
+      }
+    }
+    if (!rx) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback-tx '{}' names "
+        "feedback-rx '{}' but no such stage exists in the pipeline. "
+        "Refusing to launch.",
+        _pipeline->id(), tx->id(), tx->from_id()));
+      return false;
+    }
+    auto it_tx = cd.port_domain.find(
+        PortKey{tx, PortKey::Kind::Out, 0});
+    auto it_rx = cd.port_domain.find(
+        PortKey{rx, PortKey::Kind::In, 0});
+    if (it_tx == cd.port_domain.end()
+        || it_rx == cd.port_domain.end()) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' / "
+        "rx='{}' missing from clock-domain map (tx oport or rx iport "
+        "unwired?). Refusing to launch.",
+        _pipeline->id(), tx->id(), rx->id()));
+      return false;
+    }
+    if (it_tx->second != it_rx->second) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' (domain "
+        "{}) and rx='{}' (domain {}) are in different clock domains; "
+        "feedback edges must stay within one clock domain. Refusing "
+        "to launch.",
+        _pipeline->id(), tx->id(), it_tx->second,
+        rx->id(), it_rx->second));
+      return false;
     }
   }
 

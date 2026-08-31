@@ -169,6 +169,9 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-avae.cc
         audio-vae-encode.cc
         load-audio-stage.cc
+        load-video-stage.cc
+        vae-decode-clip.cc
+        runtime-lora.cc
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
         mage-vae.cc

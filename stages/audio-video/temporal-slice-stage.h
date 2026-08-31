@@ -47,6 +47,41 @@ namespace vpipe {
 // it is whatever the author wrote. `start: -600` on a live source really
 // does hold 600 beats, which is why the stage says at launch how many it
 // will keep.
+//
+// ---- SLICING INSIDE ONE BEAT (`sequence: frames`) ----
+//
+// The default sequence is the beat STREAM, above. `sequence: frames`
+// makes it the LEADING AXIS OF ONE BEAT instead: a stacked clip
+// [T, 3, H, W] in, the selected frames out, ONE BEAT IN AND ONE BEAT
+// OUT. It is the shape `vae-decode`'s clip oport and `temporal-stack`
+// both produce.
+//
+// Two things follow, and both are the point:
+//
+//   * NO CLOCK-DOMAIN CROSSING. One beat in, one beat out, so the
+//     oport reports the iport's clock group and the analyzer unifies
+//     them. That is what lets this stage sit inside a FEEDBACK loop --
+//     a feedback pair must stay within one clock domain, and the
+//     stream mode, which drops beats, cannot.
+//   * NO HOLDING. `T` is known from the beat, so `start: -1` resolves
+//     immediately instead of waiting for EOS. Negative indices cost
+//     nothing here.
+//
+// SQUEEZE IS EXPLICIT, AND THAT IS DELIBERATE. Selecting one frame can
+// mean either of two things, and they are different requests to a
+// model that conditions on references: [3, H, W] is a STILL, while
+// [1, 3, H, W] is a one-frame CLIP. MiniMax-H3's reference encoder
+// reads the two by RANK and sizes them by different rules -- a still
+// gets its own short edge with no area cap, a clip gets the target
+// canvas -- so reading one as the other encodes it at a fraction of
+// the detail, from a tensor that is correctly shaped either way.
+//
+// There is no safe default for that, so `squeeze` is a switch rather
+// than an inference: false (the default) keeps the time axis, true
+// drops it when -- and only when -- the slice selected exactly one
+// frame. Asking to squeeze several is warned about, once, and the axis
+// is kept: the alternative is fabricating a shape the caller cannot
+// have meant.
 class TemporalSliceStage final : public TypedStage<TemporalSliceStage> {
 public:
   static constexpr const char* kTypeName = "temporal-slice";
@@ -58,6 +93,18 @@ public:
   Job initialize(RuntimeContext& ctx) override;
   Job process(RuntimeContext& ctx) override;
   const StageSpec& spec() const noexcept override;
+
+  // `sequence: frames` is one beat in, one beat out, so it does NOT
+  // change the beat rate and the oport belongs in the iport's clock
+  // group. The stream mode drops beats and keeps its own group. The
+  // analyzer reads this rather than the static spec, which is what
+  // makes the answer config-dependent at all.
+  unsigned
+  oport_clock_group(unsigned p) const noexcept override
+  {
+    if (p == 0 && _within_beat) { return 0; }
+    return 1;
+  }
 
   // Test-only. `peak_hold` is the most beats the window ever held at
   // once -- the stage's whole memory cost, and the thing a negative
@@ -79,6 +126,18 @@ private:
   // beat that has already fallen out of the hold window, which is what
   // makes the missing ends unable to change the answer.
   bool selected_streaming_(std::int64_t j) const noexcept;
+
+  // Slice the leading axis of ONE beat instead of the beat stream.
+  bool _within_beat = false;
+  // Drop the time axis when the slice selected exactly one frame. Only
+  // meaningful with `_within_beat`; see SQUEEZE above.
+  bool _squeeze = false;
+  // Latched so a mismatched squeeze is said once, not once per clip.
+  bool _squeeze_warned = false;
+
+  // One beat in, one beat out: slice the leading axis. Warns and
+  // forwards nothing when the beat is not a tensor it can index.
+  Job process_within_(RuntimeContext& ctx);
 
   std::int64_t _start = 0;
   std::int64_t _step  = 1;

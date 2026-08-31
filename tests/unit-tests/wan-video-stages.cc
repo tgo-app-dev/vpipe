@@ -1165,3 +1165,90 @@ TEST(model_config, generate_video_survives_a_missing_beat)
   // And the positive: it got far enough to identify the checkpoint.
   EXPECT_TRUE(cap->saw("MiniMax-H3 partition"));
 }
+
+// `references` DECLARES itself a path (.is_path, so the composer's file
+// browser fills it in) and was the only such key that never resolved
+// one. Left raw, a RELATIVE path was opened against the process CWD --
+// which under the web-ui's file sandbox is not the sandbox root -- so a
+// path the browser had just produced did not exist, while an absolute
+// one worked. That asymmetry is the bug; these pin the fix.
+TEST(video_ref_encoder, references_are_confined_to_the_file_sandbox)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-ut-vre-sandbox";
+  std::error_code ec;
+  fs::create_directories(root / "clips", ec);
+  const std::string cfg_json =
+      "{\"file_sandbox\":{\"enabled\":true,\"root\":\""
+      + root.string() + "\"}}";
+  // What the sandbox will answer with: weakly_canonical resolves
+  // symlinks, and on macOS /var IS one (-> /private/var). Comparing
+  // against the raw temp path would fail on the platform this runs on
+  // while the resolution was perfectly correct.
+  const fs::path croot = fs::weakly_canonical(root, ec);
+
+  {
+    Session sess(cfg_json);
+    auto refs = FlexData::make_array();
+    refs.as_array().push_back(FlexData::make_string("subject.png"));
+    refs.as_array().push_back(FlexData::make_string("clips/motion.mp4"));
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references", std::move(refs));
+    VideoRefEncoderStage s(&sess, "rel", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(s.config_error().empty());
+    ASSERT_TRUE(s.references().size() == 2);
+    if (s.references().size() == 2) {
+      EXPECT_TRUE(s.references()[0] == (croot / "subject.png").string());
+      EXPECT_TRUE(s.references()[1] ==
+                  (croot / "clips" / "motion.mp4").string());
+      if (s.references()[0] != (croot / "subject.png").string()) {
+        std::printf("[video_ref_encoder] relative resolved to '%s', "
+                    "wanted '%s'\n", s.references()[0].c_str(),
+                    (croot / "subject.png").string().c_str());
+      }
+    }
+  }
+  {
+    // A bare string is the same request as a one-element list, so it
+    // must be confined the same way -- the spelling a hand-written
+    // pipeline uses must not be the one that fails.
+    Session sess(cfg_json);
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references",
+                                     FlexData::make_string("subject.png"));
+    VideoRefEncoderStage s(&sess, "bare", vector<InEdge>{}, cfg);
+    ASSERT_TRUE(s.references().size() == 1);
+    if (s.references().size() == 1) {
+      EXPECT_TRUE(s.references()[0] == (croot / "subject.png").string());
+    }
+  }
+  {
+    // An ABSOLUTE path outside a granted prefix is RE-ROOTED, not taken
+    // verbatim -- the confinement this key already claimed. What the
+    // stage used to do instead was read it, sandbox or not.
+    Session sess(cfg_json);
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references",
+                                     FlexData::make_string("/etc/passwd"));
+    VideoRefEncoderStage s(&sess, "abs", vector<InEdge>{}, cfg);
+    ASSERT_TRUE(s.references().size() == 1);
+    if (s.references().size() == 1) {
+      EXPECT_TRUE(s.references()[0] == (croot / "etc" / "passwd").string());
+      EXPECT_TRUE(s.references()[0] != "/etc/passwd");
+    }
+  }
+  {
+    // With NO sandbox the path is untouched, so every graph outside the
+    // web-ui keeps resolving exactly as it did.
+    Session plain;
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("references",
+                                     FlexData::make_string("subject.png"));
+    VideoRefEncoderStage s(&plain, "off", vector<InEdge>{}, cfg);
+    ASSERT_TRUE(s.references().size() == 1);
+    if (s.references().size() == 1) {
+      EXPECT_TRUE(s.references()[0] == "subject.png");
+    }
+  }
+  fs::remove_all(root, ec);
+}

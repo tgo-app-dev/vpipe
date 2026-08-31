@@ -886,3 +886,146 @@ TEST(minimax_h3_comfy, the_released_partition_layout_resolves_for_quantize)
               "for the loader and for model-quantize\n");
   fs::remove_all(root, ec);
 }
+
+// WHERE THE COMPONENTS ARE COPIED FROM, which is a different question
+// from where the DiT is -- and the one that was wrong.
+//
+// resolve_source_dit_dir already found <repo>/FL2VA/transformer (the
+// test above pins it), but the pass that does the work was handed the
+// SOURCE, looked for <repo>/transformer, and reported
+//
+//   minimax-h3 root '<repo>' has no 'transformer' component to quantize
+//
+// for a repo that was fully downloaded. The components sit beside the
+// DiT, not beside the repo, so the root to copy from is the DiT's
+// parent.
+TEST(minimax_h3_comfy, a_partitioned_repo_quantizes_from_the_partition)
+{
+  const fs::path root = scratch_() / "minimaxai-piperoot";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+
+  auto write_partition_ = [&](const char* part) {
+    const fs::path p = root / part;
+    fs::create_directories(p / "transformer");
+    fs::create_directories(p / "text_encoder");
+    std::ofstream mi(p / "model_index.json");
+    mi << "{\"transformer\": [\"diffusers\", \"MiniMaxH3DiTModel\"],"
+          " \"_minimax_h3\": {\"partition\": \""
+       << (std::string(part) == "FL2VA" ? "fl2va" : "ref2va") << "\"}}";
+    std::ofstream cf(p / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+  };
+  write_partition_("FL2VA");
+  write_partition_("Ref2VA");
+
+  // The partition asked for is the one copied from -- NOT the repo, and
+  // not the other half.
+  for (const char* part : {"FL2VA", "Ref2VA"}) {
+    const std::string want = std::string(part) == "FL2VA" ? "fl2va" : "ref2va";
+    std::string fam;
+    const std::string dit =
+        ModelQuantizeStage::resolve_source_dit_dir(root.string(), &fam, want);
+    ASSERT_TRUE(fam == "minimax-h3");
+    const std::string pr =
+        ModelQuantizeStage::pipeline_root_for(root.string(), dit);
+    EXPECT_TRUE(pr == (root / part).string());
+    if (pr != (root / part).string()) {
+      std::printf("[minimax_h3_comfy] %s: dit='%s' pr='%s' want='%s'\n",
+                  want.c_str(), dit.c_str(), pr.c_str(),
+                  (root / part).string().c_str());
+    }
+    // ... and the component the failing message named is really there
+    // once the root is right, which is the whole point.
+    EXPECT_TRUE(fs::is_directory(fs::path(pr) / "transformer", ec));
+    // The partition survives into what the output will record: it is
+    // read from the model_index.json beside the transformer, which only
+    // exists at the partition root.
+    EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(dit) == want);
+  }
+
+  // An ORDINARY diffusers root is untouched: the DiT's parent IS the
+  // source, so nothing moves for every other family.
+  {
+    const fs::path plain = scratch_() / "plain-diffusers";
+    fs::remove_all(plain, ec);
+    fs::create_directories(plain / "transformer");
+    std::ofstream cf(plain / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+    cf.close();
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                    plain.string(), (plain / "transformer").string())
+                == plain.string());
+  }
+
+  // A DiT resolved to something that is not a pipeline root leaves the
+  // source alone rather than copying from a tree nobody named.
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(root.string(), "")
+              == root.string());
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                  root.string(), (root / "nope" / "transformer").string())
+              == root.string());
+
+  // ---- A COMFY-ORG REPACK MUST NOT MOVE ----
+  //
+  // Routing sends a repack to the comfy pass BEFORE this derivation is
+  // reached, so in practice it never sees one. Asserted anyway, because
+  // "unreachable today" is the state this file has already watched a
+  // resolver rot in, and because the two shapes fail here for DIFFERENT
+  // reasons -- only one of which is the ordering.
+  {
+    const fs::path repack = scratch_() / "comfy-repack-root";
+    fs::remove_all(repack, ec);
+
+    // A SOURCE repack: the DiT is a FILE under diffusion_models/. Its
+    // parent is a real directory that is NOT the source, so the parent
+    // test alone would move the root onto diffusion_models/ and copy a
+    // role subdir as if it were a pipeline. What stops that is the
+    // "looks like a pipeline root" guard -- this is the case that makes
+    // the guard load-bearing rather than defensive.
+    const fs::path dfile =
+        repack / "diffusion_models" / "minimax_h3_fl2va_bf16.safetensors";
+    write_component_(dfile, "config", kH3Config);
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(repack.string(),
+                                                      dfile.string())
+                == repack.string());
+
+    // An ALREADY-QUANTIZED repack: the DiT is the diffusion_models/
+    // DIRECTORY, so the parent IS the source and the derivation
+    // short-circuits before the guard. Chaining a second pass over a
+    // repack goes through here.
+    fs::remove_all(repack / "diffusion_models", ec);
+    fs::create_directories(repack / "diffusion_models");
+    {
+      std::ofstream f(repack / "diffusion_models" / "config.json");
+      f << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+    }
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                    repack.string(), (repack / "diffusion_models").string())
+                == repack.string());
+  }
+}
+
+// The real Comfy-Org-shaped pack on disk, when one is present. Synthetic
+// trees pin the rules; this pins that the rules describe a checkpoint
+// somebody actually produced. Env-gated, so it skips where the model is
+// not installed.
+TEST(minimax_h3_comfy, a_real_repack_pack_does_not_move)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_REPACK_PATH");
+  if (root == nullptr || *root == '\0') {
+    std::printf("[minimax_h3_comfy] VPIPE_MINIMAX_H3_REPACK_PATH unset; "
+                "skipping the on-disk repack check\n");
+    return;
+  }
+  std::string fam;
+  const std::string dit =
+      ModelQuantizeStage::resolve_source_dit_dir(root, &fam);
+  std::printf("[minimax_h3_comfy] real pack: fam='%s' dit='%s'\n",
+              fam.c_str(), dit.c_str());
+  EXPECT_TRUE(fam == "minimax-h3");
+  // Whatever shape it resolved to, the pass must copy from the pack
+  // itself -- never from a role subdir inside it.
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(root, dit)
+              == std::string(root));
+}

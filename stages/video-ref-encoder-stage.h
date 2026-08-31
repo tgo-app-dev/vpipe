@@ -266,6 +266,15 @@ public:
 
   // Test-only accessors.
   const std::string& hf_dir() const noexcept { return _hf_dir; }
+  // The reference paths AS RESOLVED -- confined to the session file
+  // sandbox at construction. Exposed because that resolution is the
+  // difference between a path the composer's file browser produced
+  // opening and not opening, and it is not observable any other way
+  // without a model to load.
+  const std::vector<std::string>& references() const noexcept
+  {
+    return _references;
+  }
   std::uint64_t requests_encoded() const noexcept { return _emitted; }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON

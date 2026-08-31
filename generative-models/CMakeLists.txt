@@ -30,6 +30,8 @@ set(LOCAL_SOURCES
   shared/gguf-file.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
+  shared/lora-names.cc
+  shared/runtime-lora.cc
   shared/wired-pool.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc

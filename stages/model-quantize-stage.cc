@@ -898,7 +898,33 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
       // Self-contained pass: copy every component, quantize the `target` one
       // (default the DiT), register as a full pipeline usable as an hf_dir.
       // Chainable across passes (DiT, then text_encoder, ...).
-      return quantize_t2i_pipeline_(src_dir, t2i_family, out_dir, stop);
+      //
+      // THE PIPELINE ROOT IS THE DiT'S PARENT, which is not always
+      // src_dir. MiniMaxAI publishes both MiniMax-H3 partitions from ONE
+      // repo and the fetch lands them a level down, so the runnable root
+      // is <repo>/FL2VA -- the resolver above already found the DiT
+      // there, and the siblings it needs (text_encoder/, vae/,
+      // model_index.json) sit beside it, not beside the repo.
+      //
+      // Handing src_dir on instead looked for <repo>/transformer, which a
+      // partitioned repo does not have, and reported "root ... has no
+      // 'transformer' component to quantize" for a model that is fully
+      // downloaded. This file already knew the shape -- the diagnostic
+      // below descends into FL2VA/ to explain a missing component -- but
+      // the path that does the work did not, which is the whole bug.
+      //
+      // For an ordinary diffusers tree the parent IS src_dir, so nothing
+      // moves there. For the partitioned one it also means the copy takes
+      // the partition that was ASKED for rather than both halves of a
+      // 133 GB repo.
+      const std::string pipe_root = pipeline_root_for(src_dir, dit_dir);
+      if (pipe_root != src_dir) {
+        session()->info(fmt(
+            "ModelQuantizeStage('{}'): '{}' is a partitioned repo; "
+            "quantizing the pipeline at '{}'",
+            this->id(), src_dir, pipe_root));
+      }
+      return quantize_t2i_pipeline_(pipe_root, t2i_family, out_dir, stop);
     }
     // A single component named DIRECTLY (a path to one .safetensors, not
     // to the repo around it). Sibling selection is not possible from here
@@ -1814,6 +1840,31 @@ ModelQuantizeStage::comfy_target_subdir_(const std::string& target)
   if (sub == "text_encoder" || sub == "mllm") { return "text_encoders"; }
   if (sub == "vae") { return "vae"; }
   return {};
+}
+
+std::string
+ModelQuantizeStage::pipeline_root_for(const std::string& src_dir,
+                                      const std::string& dit_dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (dit_dir.empty()) { return src_dir; }
+  // The components live beside the DiT. For an ordinary diffusers tree
+  // that parent IS the source and nothing moves; for MiniMaxAI's
+  // partitioned repo it is <repo>/FL2VA, which is the runnable root.
+  const fs::path parent = fs::path(dit_dir).parent_path();
+  if (parent.empty() || !fs::is_directory(parent, ec)) { return src_dir; }
+  if (parent.lexically_normal() == fs::path(src_dir).lexically_normal()) {
+    return src_dir;
+  }
+  // Only ever DOWNWARD, and only to a directory that actually looks like
+  // a pipeline root. A resolver that answered with something outside the
+  // source would have this pass copy from a tree the caller never named.
+  if (!fs::exists(parent / "model_index.json", ec) &&
+      !fs::is_directory(parent / "transformer", ec)) {
+    return src_dir;
+  }
+  return parent.string();
 }
 
 std::string

@@ -2843,3 +2843,172 @@ TEST(flux2_smoke, kept_blocks_are_wired_and_bounded_by_the_pool)
   EXPECT_TRUE(mgr->wired_pool_used() == 0u);
   mgr->set_wired_pool_pct(0);
 }
+
+// ---- runtime LoRA ---------------------------------------------------
+
+// The module names a runtime adapter has to use, checked against a REAL
+// checkpoint's tensor names.
+//
+// This is the test the feature needs most, and it needs no GPU and no
+// model load. A LoRA binds by NAME: a name that matches nothing is not
+// an error anywhere -- Adapter::bind treats an absent module as the
+// ordinary case, because an adapter is free to touch some projections
+// and not others -- so a typo produces an adapter that loads, reports,
+// and changes nothing. Against the checkpoint the typo is immediate.
+//
+// N is checked too (a wrong output dim would be counted a SHAPE SKIP,
+// which is at least loud, but the message would blame the adapter for
+// the model's error). K is checked only where the base tensor is dense:
+// a quantized `.weight` holds packed codes, so its second dimension is
+// K/8, not K.
+TEST(flux2_smoke, lora_module_names_match_the_checkpoint)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  namespace fs = std::filesystem;
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+  auto wopt = MetalLlamaWeights::open_model(tdir);
+  ASSERT_TRUE(wopt.has_value());
+  if (!wopt.has_value()) { return; }
+  const MetalLlamaWeights& w = *wopt;
+
+  // Size the Config from the checkpoint itself rather than from
+  // config.json: these are the same derivations load() makes in
+  // streaming mode, and taking them from the tensors keeps the test
+  // from agreeing with a config that disagrees with the weights.
+  MetalFlux2Transformer::Config cfg;
+  auto rows = [&](const char* nm) -> int {
+    const auto* ti = w.info(nm);
+    return (ti != nullptr && !ti->shape.empty()) ? (int)ti->shape[0] : 0;
+  };
+  cfg.hidden = rows("transformer_blocks.0.attn.to_q.weight");
+  ASSERT_TRUE(cfg.hidden > 0);
+  if (cfg.hidden <= 0) { return; }
+  cfg.double_ff_hidden = rows("transformer_blocks.0.ff.linear_in.weight");
+  const int pw = rows("single_transformer_blocks.0.attn.to_qkv_mlp_proj"
+                      ".weight");
+  ASSERT_TRUE(cfg.double_ff_hidden > 0 && pw > 3 * cfg.hidden);
+  if (cfg.double_ff_hidden <= 0 || pw <= 3 * cfg.hidden) { return; }
+  cfg.single_mlp_in = (pw - 3 * cfg.hidden) / 2;
+  cfg.n_double = 0;
+  cfg.n_single = 0;
+  while (w.info("transformer_blocks." + std::to_string(cfg.n_double) +
+                ".attn.to_q.weight") != nullptr) {
+    ++cfg.n_double;
+  }
+  while (w.info("single_transformer_blocks." + std::to_string(cfg.n_single) +
+                ".attn.to_out.weight") != nullptr) {
+    ++cfg.n_single;
+  }
+  EXPECT_TRUE(cfg.n_double > 0 && cfg.n_single > 0);
+
+  const auto mods = MetalFlux2Transformer::lora_module_list(cfg);
+  EXPECT_TRUE(mods.size() ==
+              (std::size_t)(cfg.n_double * 12 + cfg.n_single * 2));
+  int missing = 0, bad_n = 0, bad_k = 0, k_checked = 0;
+  for (const auto& m : mods) {
+    const auto* ti = w.info(m.name + ".weight");
+    if (ti == nullptr || ti->shape.size() != 2) {
+      if (missing < 4) {
+        std::printf("[flux2_smoke] LoRA module '%s' names no base tensor\n",
+                    m.name.c_str());
+      }
+      ++missing;
+      continue;
+    }
+    if ((int)ti->shape[0] != m.n) { ++bad_n; }
+    if (w.info(m.name + ".scales") == nullptr) {
+      ++k_checked;
+      if ((int)ti->shape[1] != m.k) { ++bad_k; }
+    }
+  }
+  EXPECT_TRUE(missing == 0);
+  EXPECT_TRUE(bad_n == 0);
+  EXPECT_TRUE(bad_k == 0);
+  std::printf("[flux2_smoke] %zu LoRA modules (%d double + %d single blocks) "
+              "all name a base tensor; N checked on all, K on %d dense\n",
+              mods.size(), cfg.n_double, cfg.n_single, k_checked);
+}
+
+// Which projections the fused paths swallow. Getting this wrong does
+// NOT fail -- it produces a run where the adapter's two biggest
+// projections quietly do not apply -- so it is asserted rather than
+// left to a forward that has no reference to disagree with.
+TEST(flux2_smoke, lora_forbids_fusion_names_the_fused_projections)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-ut-flux2-lora";
+  fs::create_directories(dir, ec);
+
+  // A minimal F32 safetensors holding only the names -- file_touches
+  // reads the header, so the tensors need no useful content.
+  auto write = [&](const fs::path& p,
+                   const std::vector<std::string>& names) -> bool {
+    std::string hdr = "{";
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (i) { hdr += ","; }
+      hdr += "\"" + names[i] + "\":{\"dtype\":\"F32\",\"shape\":[1,1],"
+             "\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + 4) + "]}";
+      off += 4;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    const float z = 0.0f;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      f.write(reinterpret_cast<const char*>(&z), 4);
+    }
+    return (bool)f;
+  };
+
+  const std::string b = "transformer_blocks.0.";
+  const std::string s = "single_transformer_blocks.0.";
+  struct Case { const char* tag; std::vector<std::string> names; bool forbid; };
+  const Case cases[] = {
+    // The three fused projections, each on its own.
+    {"ff.linear_in", {b + "ff.linear_in.lora_A.weight",
+                      b + "ff.linear_in.lora_B.weight"}, true},
+    {"ff_context.linear_in", {b + "ff_context.linear_in.lora_A.weight",
+                              b + "ff_context.linear_in.lora_B.weight"}, true},
+    {"to_qkv_mlp_proj", {s + "attn.to_qkv_mlp_proj.lora_A.weight",
+                         s + "attn.to_qkv_mlp_proj.lora_B.weight"}, true},
+    // Everything the fused paths leave alone. `linear_out` is the trap:
+    // it shares a prefix with `linear_in` and is NOT fused, so a match
+    // on "ff.linear" would turn the weave off for no reason.
+    {"attn only", {b + "attn.to_q.lora_A.weight",
+                   b + "attn.to_q.lora_B.weight",
+                   b + "attn.to_out.0.lora_A.weight",
+                   b + "attn.to_out.0.lora_B.weight"}, false},
+    {"ff.linear_out", {b + "ff.linear_out.lora_A.weight",
+                       b + "ff.linear_out.lora_B.weight",
+                       b + "ff_context.linear_out.lora_A.weight",
+                       b + "ff_context.linear_out.lora_B.weight",
+                       s + "attn.to_out.lora_A.weight",
+                       s + "attn.to_out.lora_B.weight"}, false},
+  };
+  for (const Case& c : cases) {
+    const fs::path p = dir / "case.safetensors";
+    ASSERT_TRUE(write(p, c.names));
+    const bool got = MetalFlux2Transformer::lora_forbids_fusion(p.string());
+    if (got != c.forbid) {
+      std::printf("[flux2_smoke] '%s': forbids_fusion %d, expected %d\n",
+                  c.tag, (int)got, (int)c.forbid);
+    }
+    EXPECT_TRUE(got == c.forbid);
+    fs::remove(p, ec);
+  }
+  // A file that is not there answers NO: the real error belongs to the
+  // bind that follows, and refusing the weave over an unreadable file
+  // would be a slowdown chosen for a reason that never materialized.
+  EXPECT_FALSE(MetalFlux2Transformer::lora_forbids_fusion(
+      (dir / "nope.safetensors").string()));
+}

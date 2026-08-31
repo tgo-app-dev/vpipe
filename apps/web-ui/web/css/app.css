@@ -787,6 +787,10 @@ svg.sb-spark .line {
 .graph-rebind-item:hover { background: var(--bg-3);
                            border-color: #475061; }
 .graph-view { position: absolute; inset: 0; }
+/* Focusable so the − / + / 0 keys reach it (see graph.js); the canvas
+   takes focus on pointerdown, and a ring around the whole pane would be
+   noise rather than a cue. */
+.graph-view:focus, .graph-view:focus-visible { outline: none; }
 svg.graph { display: block; width: 100%; height: 100%;
             cursor: grab; touch-action: none;
             /* Dragging boxes/panning must never start a text selection of
@@ -849,6 +853,47 @@ svg.graph { display: block; width: 100%; height: 100%;
 /* Collapsed: shrink to zero width and hide the content, but keep the
    toggle tab (a child) visible at the canvas's left edge to re-extend. */
 .toolbox.collapsed { flex-basis: 0; width: 0; border-right: none; }
+
+/* NARROW pane: the docked toolbox is hidden entirely and the pane
+   header's + opens the picker instead. Distinct from .collapsed, which
+   is the user folding the panel away by hand and leaves the ◀/▶ tab on
+   screen to unfold it -- here there is nothing to unfold back TO, since
+   the canvas the chips drag onto is not being shown. */
+.graph-split.tb-hidden > .toolbox { display: none; }
+
+/* The + that replaces it. Hidden until a narrow render turns it on. */
+.graph-add-stage { display: none; }
+.graph-add-stage.show {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin-left: 6px; padding: 0;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: var(--bg-2); color: var(--fg-dim);
+  font: 600 14px/1 var(--mono); cursor: pointer;
+}
+.graph-add-stage.show:hover { background: var(--bg-3); color: var(--fg); }
+
+/* The picker. Fixed-position and z-index 60 to match .ctx-menu, which is
+   the same kind of thing: a transient overlay anchored to a control in a
+   pane that may itself scroll. The opener clamps it to the viewport. */
+.stage-picker {
+  position: fixed; z-index: 60; width: 260px; max-height: 60vh;
+  display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 7px; box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+}
+.stage-picker .sp-filter {
+  flex: 0 0 auto; margin: 6px; padding: 4px 6px;
+  background: var(--bg-2); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 5px; font: 11px var(--mono);
+}
+.stage-picker .sp-body {
+  flex: 1 1 auto; overflow: auto; padding: 0 6px 8px;
+}
+/* A picked chip is a button, not a drag handle: no grip, and the whole
+   row reacts to the pointer. */
+.stage-picker .tb-chip.pickable { cursor: pointer; }
+.stage-picker .tb-chip.pickable:hover { background: var(--bg-3); }
+.stage-picker .tb-chip.pickable .tb-grip { display: none; }
 .toolbox.collapsed > .toolbox-head,
 .toolbox.collapsed > .toolbox-filter,
 .toolbox.collapsed > .toolbox-body { display: none; }

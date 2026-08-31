@@ -163,6 +163,13 @@ TEST(model_source_live, pinned_files_resolve_on_modelscope) {
       "krea/Krea-2-Turbo",
       "krea/Krea-2-Raw",
       "krea/Krea-2-LoRA-softwatercolor",
+      // The two MiniMax-H3 Turbo adapter repos. Both are mirrored under
+      // the IDENTICAL owner/repo, so neither needs a row in the mirror
+      // table -- which is exactly why they are listed here: a mirror
+      // that works by DEFAULT has nothing declaring it, so the only
+      // thing that can catch it going away is asking.
+      "lightx2v/Minimax-h3-Turbo",
+      "larryvrh/MiniMax-H3-Turbo-Lora",
       "Lightricks/LTX-2.5",                // plugin, when loaded
       "sensenova/SenseNova-U1.5-8B-MoT",   // plugin, when loaded
   };

@@ -10,6 +10,7 @@
 // builds the stage is an inert stub (the constructor errors through session()
 // and every beat emits nothing).
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/tensor-beat.h"
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
@@ -45,6 +46,40 @@ namespace vpipe {
 //   oport0  TensorBeatPayload, planar U8 RGB [3, H, W] (channel order R,G,B,
 //           0..255) -- the same format load-image emits, so it flows into the
 //           image sinks. The decoded [-1,1] float is mapped (x+1)/2*255.
+//
+//   oport1  OPTIONAL TensorBeatPayload, the same pixels as ONE CLIP:
+//           planar U8 RGB [frames, 3, H, W], one beat per VIDEO latent,
+//           sideband {frames, fps}. The shape temporal-stack builds for
+//           a clip reference, so it is what a reference-conditioned
+//           model takes.
+//
+//           WHY A SECOND PORT AND NOT A MODE. oport0 is unchanged, so
+//           every graph that decodes to frames -- save-image,
+//           rgb-to-video -> save-video, a preview -- is untouched and
+//           needs no unpacking stage to get back what it already had.
+//           The two ports are the same pixels at two granularities, and
+//           a graph wires whichever it wants (or both).
+//
+//           It is written ONLY for a video latent, and only when a
+//           consumer is wired (ctx.has_consumers). An image latent has
+//           no time axis, and emitting [1, 3, H, W] for one would
+//           invent a one-frame CLIP where the model draws a real
+//           distinction between that and a still.
+//
+//           BUILDING IT COSTS A COPY OF THE CLIP -- ~380 MB at
+//           960x544x243 -- which is why it is conditional on the
+//           wiring. It is not a new memory regime: the families that
+//           decode video already hold the whole clip before they emit
+//           anything (the wan and plugin paths collect their frames,
+//           the MiniMax-H3 one decodes into a single bf16 buffer),
+//           because ctx.write is a coroutine and a VAE frame sink is a
+//           plain callback.
+//
+//           A CONSUMER THAT HOLDS THIS BEAT HOLDS THE WHOLE CLIP. Where
+//           the point is one frame -- seeding the next generation from
+//           the last frame of this one -- slice it down BEFORE anything
+//           caches it, or a feedback register pins 380 MB for the
+//           length of the next generation instead of 1.5 MB.
 //
 // Config (FlexData object on the 4th constructor parameter):
 //   hf_dir     (string, OPTIONAL) -- the Krea-2-Turbo model directory; the VAE
@@ -96,8 +131,59 @@ private:
   // claim and its release cannot name different things.
   std::string vae_dir_for_release_() const;
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // ---- the clip oport (oport1) ----
+  //
+  // Allocate the [F, 3, H, W] clip, or return null when nothing is
+  // wired to oport1 -- the null IS the "do not build it" answer, so
+  // every caller is one `if (clip)` rather than a flag plus a pointer
+  // that can disagree with it.
+  std::unique_ptr<TensorBeatPayload>
+  begin_clip_(RuntimeContext& ctx, int F, int H, int W) const;
+  // Copy frame `f`'s [3, H, W] planar bytes into the clip. Silently
+  // does nothing when `clip` is null, so a caller need not re-test.
+  static void
+  add_to_clip_(TensorBeatPayload* clip, int f,
+               const TensorBeatPayload& frame);
+  // Stamp {frames, fps} and the producer's model name, matching what
+  // temporal-stack puts on a stacked video group.
+  void
+  finish_clip_(TensorBeatPayload* clip, double fps,
+               const TensorBeatPayload& src) const;
+#endif
+
   // See Stage::declare_memory.
   StageMemory declare_memory() const override;
+
+public:
+  // THE TWO OPORTS DO NOT ADVANCE AT THE SAME RATE, and which rate
+  // oport0 runs at depends on the checkpoint.
+  //
+  //   * oport1, the clip, is ONE beat per latent by construction, so it
+  //     always shares the latent iport's clock.
+  //   * oport0 is one beat per latent for an IMAGE checkpoint and one
+  //     PER FRAME for a video one. Those are different clocks, and only
+  //     the family says which.
+  //
+  // It matters because a feedback pair must stay inside one clock
+  // domain. Reporting the image answer for a video checkpoint -- which
+  // is what this stage did before it could tell them apart -- admits a
+  // loop that closes through the FRAME stream, where `feedback-rx`
+  // caches whichever frame won the scheduling. The clip oport is the
+  // one that can carry a loop, and now it is the one that says so.
+  //
+  // The family is probed from the checkpoint, so this answer needs
+  // `_hf_dir` -- which for the graphs that matter arrives as a
+  // model-select constant. That is why the runtime's clock-domain
+  // analysis runs after constant folding; see Phase 3.7 in
+  // pipeline-runtime.cc. With no checkpoint to probe it falls back to
+  // the image answer, i.e. exactly what it reported before.
+  unsigned oport_clock_group(unsigned p) const noexcept override;
+
+private:
+  // Resolved once, lazily, from the checkpoint: 0 = one beat per
+  // latent, 1 = one per frame. -1 = not yet asked.
+  mutable int _oport0_group = -1;
 
   std::string _hf_dir;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |

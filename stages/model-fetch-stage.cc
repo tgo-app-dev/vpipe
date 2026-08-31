@@ -90,10 +90,6 @@ pick_catalog_entry_(const SessionContextIntf* s,
                     const vector<const ModelCatalogEntry*>& cands,
                     const string& hf_path, const string& want)
 {
-  auto lower = [](string v) {
-    for (char& c : v) { c = (char)tolower((unsigned char)c); }
-    return v;
-  };
   auto describe = [&]() {
     string out;
     for (const ModelCatalogEntry* e : cands) {
@@ -113,23 +109,16 @@ pick_catalog_entry_(const SessionContextIntf* s,
                  "of:{}", hf_path, cands.size(), describe()));
     return nullptr;
   }
-  const string w = lower(want);
-  vector<const ModelCatalogEntry*> exact, part;
-  for (const ModelCatalogEntry* e : cands) {
-    const string fields[] = {lower(e->version), lower(e->variant),
-                             lower(e->name), lower(e->model_type)};
-    bool is_exact = false, is_part = false;
-    for (const string& f : fields) {
-      if (f.empty()) { continue; }
-      if (f == w) { is_exact = true; }
-      else if (f.find(w) != string::npos) { is_part = true; }
-    }
-    if (is_exact)     { exact.push_back(e); }
-    else if (is_part) { part.push_back(e); }
+  // THE RULE ITSELF LIVES IN THE CATALOGUE, not here: exact-beats-
+  // substring and must-be-exactly-one are properties of what the
+  // catalogue publishes, and a second implementation of them drifts.
+  // This function keeps only what is local to the stage -- the wording
+  // of the refusal and who it is reported to.
+  vector<const ModelCatalogEntry*> hits;
+  if (const ModelCatalogEntry* e =
+          catalog_pick_variant(cands, want, &hits)) {
+    return e;
   }
-  const vector<const ModelCatalogEntry*>& hits =
-      exact.empty() ? part : exact;
-  if (hits.size() == 1) { return hits.front(); }
   s->error(fmt("ModelFetchStage: model_variant '{}' matches {} of the {} "
                "models published from '{}'; it has to select exactly one "
                "of:{}", want, hits.size(), cands.size(), hf_path,

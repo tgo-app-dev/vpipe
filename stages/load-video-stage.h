@@ -32,6 +32,29 @@ namespace vpipe {
 // the decode downstream is what gives a file the whole existing chain --
 // resample, decimate, stack, encode -- instead of a private one.
 //
+// ---- START AND DURATION ----
+//
+// `start_s` seeks before the first packet and `duration_s` bounds how
+// much is read, so a graph can take a WINDOW out of a long file:
+//
+//   start_s: 45.0, duration_s: 30.0   -- 45 s in, half a minute out
+//
+// THE START IS KEYFRAME-ACCURATE, NOT FRAME-ACCURATE, and that is a
+// property of demuxing rather than a shortcut. The seek lands on the
+// keyframe at or before `start_s`; the packets between it and
+// `start_s` are what the frames after `start_s` are DECODED FROM, so
+// dropping them here -- which is exactly what load-audio does, its
+// packets being independently decodable -- would hand video-to-rgb a
+// stream it cannot decode. They are emitted, and the run logs how much
+// lead-in the seek cost.
+//
+// A consumer that needs the window trimmed to the frame has the means
+// to do it: `start_utc` is media time from the start of the FILE, so
+// the lead-in frames are the ones stamped before `start_s`.
+//
+// Both streams are cut the same way, so audio and video stay aligned:
+// each stops when it passes the end, and the run ends when both have.
+//
 // Configuration (FlexData object on the 4th constructor parameter):
 //   input_url            (string, required)
 //   format               (string, default "")  -- forced demuxer; "" auto
@@ -39,6 +62,9 @@ namespace vpipe {
 //   enable_audio         (bool,   default true)
 //   video_stream_index   (int,    default -1)  -- -1 = first video
 //   audio_stream_index   (int,    default -1)
+//   start_s              (real,   default 0)   -- seek here first
+//   duration_s           (real,   default 0)   -- stop this far past
+//                                                 start_s; 0 = to EOF
 //   options              (object<string,string>) -- av_dict for open
 //   read_timeout_ms      (int,    default 0)   -- network timeout
 class LoadVideoStage final
@@ -97,6 +123,10 @@ private:
   // after this stage is gone.
   void cache_stream_(int stream_idx, bool video);
   std::string av_err_(int rc) const;
+  // The configured window, for the open log; empty when there is none.
+  std::string window_doc_() const;
+  // Have all the ENABLED streams passed the end of the window?
+  bool all_past_end_() const noexcept;
 
   // Build one segment from the packet currently in `_pkt`.
   std::unique_ptr<EncodedSegmentPayload> segment_(bool video);
@@ -111,6 +141,13 @@ private:
   int         _audio_stream_index{};
   FlexData    _open_options;
   int         _read_timeout_ms{};
+  double      _start_s{};
+  double      _duration_s{};
+
+  // The window in MEDIA microseconds, resolved once from the config.
+  std::int64_t _start_us = 0;
+  std::int64_t _stop_us  = 0;
+  bool         _has_stop = false;
 
   // Derived port indices: -1 = disabled.
   int _video_port = -1;
@@ -140,9 +177,17 @@ private:
     // which keeps the stream monotonic where a zero would jump it back
     // to the start mid-clip.
     std::int64_t last_us = 0;
+    // Set once this stream has passed `_stop_us`. The two streams do
+    // not interleave evenly, so one reaches the end well before the
+    // other; ending the RUN on the first to get there would truncate
+    // its partner.
+    bool past_end = false;
   };
   StreamMeta _vmeta, _ameta;
 
+  // Logged once, on the first packet out: what the keyframe seek
+  // actually cost in lead-in. See the header's START AND DURATION.
+  bool _lead_in_logged = false;
   bool _eof = false;
   std::uint64_t _v_packets = 0, _a_packets = 0;
 };
