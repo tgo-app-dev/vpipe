@@ -184,9 +184,15 @@ export function mountIoWorkspace(container) {
       { label: t('io.split_h'),
         onClick: () => splitLeaf(leaf, 'h') },
     ];
-    // The anchor text I/O pane is the session-wide singleton and is
-    // never closeable; every other pane is.
+    // The anchor text I/O pane is the session-wide singleton: it can be
+    // neither replaced nor closed. Every other pane can be both -- and
+    // the composer's panel menu offers the same pair, so the two read
+    // the same way.
     if (leaf.view !== 'text') {
+      if (leaf.view !== 'empty') {
+        items.push({ label: t('io.replace_view'),
+          onClick: () => mountView(leaf, 'empty') });
+      }
       items.push({ label: t('io.close_pane'), danger: true,
         onClick: () => closeLeaf(leaf) });
     }

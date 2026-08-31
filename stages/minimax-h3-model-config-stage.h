@@ -69,6 +69,10 @@ private:
   double _audio_seconds = 0.0;
   std::string _lora;
   double _lora_scale = 1.0;
+  // "auto" | "flat" | "per_head"; empty keeps the beat silent. See the
+  // key's doc -- it decides whether a FUSED qkv adapter's rows are
+  // permuted into a per-head DiT's order.
+  std::string _lora_qkv;
 };
 
 }  // namespace vpipe

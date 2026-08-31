@@ -252,6 +252,10 @@ private:
   // Load-time, not per-step: see the LoraSpec note in the transformer.
   std::string _h3_lora;
   double      _h3_lora_scale = 1.0;
+  // "auto" | "flat" | "per_head" from the model_config beat; empty is
+  // auto. LOAD-time, like the adapter path: the rows are permuted once
+  // at bind, not per forward.
+  std::string _h3_lora_qkv;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;

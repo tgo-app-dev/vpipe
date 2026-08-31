@@ -764,6 +764,7 @@ const STRINGS = {
       '垂直拆分（本视图在右）', '垂直分割（本檢視在右）'],
   'io.split_h_alt':    ['Split horizontally (this view bottom)',
       '水平拆分（本视图在下）', '水平分割（本檢視在下）'],
+  'io.replace_view':   ['Replace view…', '替换视图…', '替換檢視…'],
   'io.close_pane':     ['Close pane', '关闭窗格', '關閉窗格'],
 
   // ---- Composer view ----
@@ -791,6 +792,7 @@ const STRINGS = {
   'composer.maximize':  ['Maximize as background', '最大化为背景',
                          '最大化為背景'],
   'composer.restore':   ['Restore to window', '还原为窗口', '還原為視窗'],
+  'composer.replace_view': ['Replace view…', '替换视图…', '替換檢視…'],
   'composer.close':     ['Close', '关闭', '關閉'],
   'composer.no_pipeline': ['No pipeline available', '没有可用的流水线',
                            '沒有可用的管線'],

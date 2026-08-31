@@ -797,6 +797,10 @@ svg.graph { display: block; width: 100%; height: 100%;
                the node labels. */
             user-select: none; -webkit-user-select: none; }
 .graph-view.panning svg.graph { cursor: grabbing; }
+/* The canvas's own hit target (see graph.js). `transparent` is PAINTED,
+   so it is hit-tested; `none` is not, and the empty canvas would go
+   back to being a hole that swallows wheel and drag events. */
+.graph-bg { fill: transparent; }
 
 .graph-controls { position: absolute; left: 10px; bottom: 10px;
                   display: flex; gap: 4px; z-index: 2; }

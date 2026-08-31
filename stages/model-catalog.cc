@@ -1247,10 +1247,26 @@ builtin_catalog_()
     // already means here.
     //
     // It is trained against Comfy-Org's repack, so it assumes the FLAT
-    // qkv grouping. Fusing it into MiniMaxAI's released weights would
-    // add the delta of one head's q to another head's k in every block,
-    // silently. That is why the entry pins the Comfy-Org parent rather
-    // than the family.
+    // qkv grouping. On MiniMaxAI's released weights the fused
+    // `attn.qkv_proj` delta lands on the wrong channels -- one head's q
+    // onto another head's k -- in every block, silently. The other four
+    // adapted projections (out_proj, mlp.fc1/fc2, adaln_proj.linear)
+    // carry no grouping, so ~207 of its 259 modules apply correctly
+    // either way, which is why the mismatch reads as "Turbo, but not
+    // quite" rather than as a broken model.
+    //
+    // The EVIDENCE is the repo, not the file: its README frontmatter is
+    // `base_model: Comfy-Org/MiniMax-H3` with a `comfyui` tag, where
+    // the safetensors' own `__metadata__.base_model` says only
+    // "MiniMax-H3" -- the family, not the publisher. Reading the second
+    // as the first is a mistake this note has already made once.
+    //
+    // lightx2v's ComfyUI copies are flat too, and there it was settled
+    // WITHOUT trusting metadata: their B is exactly block-diagonal in
+    // the [all q | all k | all v] sense. That is a property of a
+    // CONVERTED fusion only; this adapter is trained directly on the
+    // fused projection (rank 64, dense B), so nothing in its bytes
+    // states a layout and only the repo does.
     {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
      .variant = "Turbo few-step v4-600 EMA (larryvrh)",
      .hf_path = "larryvrh/MiniMax-H3-Turbo-Lora",

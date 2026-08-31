@@ -1183,3 +1183,69 @@ TEST(minimax_h3_lora, split_qkv_rows_land_where_the_forward_reads_them)
   EXPECT_TRUE(T::qkv_fused_row(1, 0, I, HD, false) !=
               T::qkv_fused_row(1, 0, I, HD, true));
 }
+
+// The flat -> per-head map, against the two published checkpoints.
+//
+// Comfy-Org's repack and MiniMaxAI's release hold the SAME qkv weights
+// in different row orders, so the map between them is provable on the
+// bytes rather than argued from a tag -- which is what this needs, the
+// two arguments-from-tags in this area having both been wrong once.
+//
+// Env: VPIPE_H3_COMFY_DIT = the repack's diffusion_models/*.safetensors,
+// VPIPE_H3_DIFFUSERS_DIT = MiniMaxAI's transformer/ directory. Skips
+// without both -- they are 66 GB apiece.
+TEST(minimax_h3_lora, the_flat_to_per_head_map_is_the_two_checkpoints)
+{
+  const char* cf = std::getenv("VPIPE_H3_COMFY_DIT");
+  const char* dd = std::getenv("VPIPE_H3_DIFFUSERS_DIT");
+  if (cf == nullptr || dd == nullptr || !*cf || !*dd) { return; }
+  namespace fs = std::filesystem;
+  auto comfy = MetalLlamaWeights::open(cf);
+  auto diff  = MetalLlamaWeights::open_model(dd);
+  ASSERT_TRUE(comfy.has_value() && diff.has_value());
+  if (!comfy.has_value() || !diff.has_value()) { return; }
+
+  const std::string key = "blocks.0.attn.qkv_proj.weight";
+  const auto* ci = comfy->info(key);
+  const auto* di = diff->info(key);
+  ASSERT_TRUE(ci != nullptr && di != nullptr);
+  if (ci == nullptr || di == nullptr) { return; }
+  ASSERT_TRUE(ci->shape == di->shape && ci->shape.size() == 2);
+  if (ci->shape != di->shape) { return; }
+
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  metal_compute::SharedBuffer cb = comfy->load(key, mc);
+  metal_compute::SharedBuffer db = diff->load(key, mc);
+  ASSERT_TRUE(!cb.empty() && !db.empty());
+  if (cb.empty() || db.empty()) { return; }
+
+  const int rows = (int)ci->shape[0], cols = (int)ci->shape[1];
+  const int HD = 128, I = rows / 3;
+  const auto* c = static_cast<const std::uint16_t*>(cb.contents());
+  const auto* d = static_cast<const std::uint16_t*>(db.contents());
+  auto row_eq = [&](int cr, int dr) {
+    return std::memcmp(c + (std::size_t)cr * cols,
+                       d + (std::size_t)dr * cols,
+                       (std::size_t)cols * 2) == 0;
+  };
+  int mapped = 0, identity = 0;
+  const int kStride = rows / 200 + 1;
+  int checked = 0;
+  for (int r = 0; r < rows; r += kStride) {
+    ++checked;
+    const int p = MetalMiniMaxH3Transformer::qkv_fused_row(
+        r / I, r % I, I, HD, /*per_head=*/true);
+    if (row_eq(r, p)) { ++mapped; }
+    if (row_eq(r, r)) { ++identity; }
+  }
+  std::printf("[minimax_h3_lora] %d rows: mapped %d, identity %d\n",
+              checked, mapped, identity);
+  // EVERY row matches under the map. The identity count is not asserted
+  // to be zero -- the permutation has fixed points, and row 0 is one --
+  // only that it is nowhere near the whole, or the two layouts would be
+  // the same layout and there would be nothing to adapt.
+  EXPECT_TRUE(mapped == checked);
+  EXPECT_TRUE(identity * 4 < checked);
+}

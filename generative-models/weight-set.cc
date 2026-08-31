@@ -71,52 +71,48 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
     }
     return nullptr;
   }
-  // SAY SO IF THE PACK IS MISALIGNED, once per checkpoint and here
-  // rather than where it bites.
+  // A MISALIGNED PACK IS A NOTE NOW, NOT A WARNING.
   //
-  // THE COST THIS NAMES IS THE READ, not the mapping.
+  // It used to be one, and the finding behind it was real: F_NOCACHE
+  // only bypasses the buffer cache on a page-aligned offset, so a
+  // checkpoint whose data section sits off-boundary had every streamed
+  // read silently fall back to buffered I/O and grow file-backed pages
+  // one-for-one with what it read -- tens of gigabytes competing with
+  // the wired pool. MEASURED at the time: 4 GB read with F_NOCACHE set
+  // grew file pages by 0 MB at a page-aligned offset and 1813 MB at
+  // offset+8.
   //
-  // A misaligned tensor also cannot be used where it lies -- a Metal
-  // buffer offset must be 16-byte aligned -- and that used to be the
-  // headline here. It is deliberately not any more: zero-copy mapping is
-  // not the direction. Asking the OS to manage 4 KB pages over a 10+ GB
-  // checkpoint costs more than owning the bytes does, and a mapped
-  // weight can be neither wired, parked nor pooled (see
-  // docs/MODEL-MEMORY.md), so a loader that maps is outside every
-  // mechanism that protects memory. Leading with a penalty on the path
-  // this tree is leaving would point an operator at the wrong repair.
+  // THAT IS FIXED IN THE READER. pread_into() now reads on page
+  // boundaries into a staging buffer and copies the wanted bytes out,
+  // so the cache stays clean whatever the offset. What is left of the
+  // cost is one extra memcpy per streamed read, at memory bandwidth,
+  // against a drive -- and it is paid ONLY on the streaming path.
   //
-  // What is left is the one that is paid on EVERY path: F_NOCACHE only
-  // bypasses the buffer cache on a page-aligned offset, so a misaligned
-  // checkpoint's reads silently fall back to buffered I/O and grow the
-  // file cache one-for-one with what they read. That memory comes out of
-  // the weights themselves.
+  // So the warning had outlived its cause twice over. It fired at
+  // OPEN, before anything knew whether this checkpoint would ever be
+  // streamed, and it fired on every stock VAE -- which is read Copied
+  // through mmap+memcpy and never touches F_NOCACHE at all. Worse, its
+  // remedy (re-run vpipe's quantizer, which lays the same weights down
+  // aligned) is no remedy for a published checkpoint nobody quantized:
+  // an operator reading it could do nothing but wonder.
   //
-  // The remedy is the one the operator can act on, so it is part of the
-  // message: vpipe's own quantizer used to write tensors in an order
-  // that shifted everything after the first odd-sized one, and re-running
-  // it lays the same weights down aligned.
+  // The fact is still recorded, because it still explains a throughput
+  // question when one is being asked. It is recorded where a fact goes.
   if (session != nullptr) {
     const auto a = wts->alignment();
     if (a.misaligned > 0 || a.bad_shards > 0) {
-      const bool whole = a.bad_shards > 0;
-      session->warn(fmt(
-          "weights: '{}' is not aligned ({}). Every UNCACHED read of it "
-          "silently falls back to buffered I/O, because F_NOCACHE only "
-          "bypasses the cache on a page-aligned offset -- MEASURED, "
-          "6.2 GB read from a misaligned checkpoint grew the file cache "
-          "by 6.2 GB, which is memory taken from the weights themselves. "
-          "vpipe reads it on page boundaries and copies, so the cache "
-          "stays clean at the price of a memcpy. If this model was "
-          "quantized by an earlier version of vpipe, re-running the "
-          "quantization is recommended: it writes the same weights "
-          "aligned and costs neither",
+      session->log_debug(fmt(
+          "weights: '{}' is not aligned ({}). Costs one extra copy per "
+          "STREAMED read (pread_into stages on page boundaries so the "
+          "buffer cache stays clean); nothing on the mmap+memcpy path "
+          "every preloaded model takes",
           dir,
-          whole ? fmt("{} of {} shard data sections start off-boundary, "
-                      "which shifts every tensor in them",
-                      a.bad_shards, a.shards)()
-                : fmt("{} of {} tensors start off-boundary",
-                      a.misaligned, a.tensors)()));
+          a.bad_shards > 0
+              ? fmt("{} of {} shard data sections start off-boundary, "
+                    "which shifts every tensor in them",
+                    a.bad_shards, a.shards)()
+              : fmt("{} of {} tensors start off-boundary",
+                    a.misaligned, a.tensors)()));
     }
   }
   // make_shared is not usable: the constructor is private.

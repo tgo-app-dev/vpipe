@@ -132,6 +132,29 @@ public:
   bool bind_fused(const std::vector<std::string>& modules, int n, int k,
                   Factors* out, const RowMap& rows);
 
+  // Is `f`'s B block-diagonal over `parts` equal row bands -- band j
+  // nonzero only in rank band j?
+  //
+  // WHAT THIS ANSWERS is where a FUSED adapter came from, which is the
+  // only thing that says whether it assumes a row order. A fusion
+  // CONVERTED from separate projections (bind_fused above, and
+  // upstream's own ComfyUI conversions) is block-diagonal by
+  // construction, with exact zeros off the diagonal, and its bands are
+  // a claim about which rows of the base are q, k and v. One trained
+  // DIRECTLY on the fused projection is dense, and claims nothing
+  // beyond the base it was trained on.
+  //
+  // The two are not a judgement call: the converted one's off-diagonal
+  // is exactly zero and the trained one's is not, so this returns on
+  // the first nonzero it finds and costs nothing on a dense B.
+  static bool block_diagonal_b(const Factors& f, int parts, int n);
+
+  // Permute B's rows: row `r` of `f` moves to `rows(0, r)`. For turning
+  // a fused adapter built for one output-channel order into the same
+  // adapter for another. `n` is B's row count; a no-op when `f` is
+  // empty or the map is not a permutation of [0, n).
+  static bool permute_b_rows(Factors* f, int n, const RowMap& rows);
+
   // How many of the file's modules were reached through the rename
   // rather than by their own name. Reported so a log says WHICH
   // convention the adapter turned out to be in -- the two are otherwise

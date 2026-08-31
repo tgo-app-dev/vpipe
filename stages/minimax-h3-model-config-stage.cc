@@ -55,6 +55,18 @@ const ConfigKey kAttrs[] = {
    // Naming the type is also what keeps a Krea-2 or Wan adapter out of
    // an H3 field.
    .suggest_db_type = "minimax-h3-lora"},
+  {.key = "lora_qkv_layout", .type = ConfigType::String, .required = false,
+   .doc = "which row order a FUSED attn.qkv_proj adapter is in. The two "
+          "publishers group that projection's rows differently -- "
+          "Comfy-Org's repack flat [all q | all k | all v], every "
+          "MiniMaxAI release per head -- and this tree re-orders neither, "
+          "so an adapter built for the other one lands on the wrong "
+          "channels in every block. `auto` (the default) reads FLAT, "
+          "which every published H3 adapter is, and permutes the rows on "
+          "a per-head DiT so one adapter serves both checkpoints. "
+          "`per_head` is the escape hatch for an adapter actually trained "
+          "on MiniMaxAI's weights. Only the fused projection is affected",
+   .def_str = "auto"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
    .doc = "adapter strength, folded into A at load. 1.0 is as trained and "
           "is what the Turbo adapter is tuned for; nudge up for blurry "
@@ -110,6 +122,7 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _audio_seconds = attr_real("audio_seconds");
   _lora          = attr_str("lora");
   _lora_scale    = attr_real("lora_scale");
+  _lora_qkv      = attr_str("lora_qkv_layout");
   // Deferred validation: the ctor never throws, so a nonsense number is
   // reported and the runtime skips the stage at launch. A non-positive
   // shift collapses the schedule to a single sigma, which generates
@@ -160,6 +173,10 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   if (!_lora.empty()) {
     o.insert_or_assign("lora", FlexData::make_string(_lora));
     o.insert_or_assign("lora_scale", FlexData::make_real(_lora_scale));
+    if (!_lora_qkv.empty()) {
+      o.insert_or_assign("lora_qkv_layout",
+                         FlexData::make_string(_lora_qkv));
+    }
   }
   return fd;
 }

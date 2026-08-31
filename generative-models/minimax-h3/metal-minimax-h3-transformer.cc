@@ -1245,11 +1245,9 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
   }
   _lora_scale = spec.scale;
 
-  // How many fused `attn.qkv_proj` modules the FILE supplied. Those
-  // carry a block-diagonal B in the [all q | all k | all v] sense, and
-  // that is a claim about the BASE's row order -- see the warning at
-  // the end of this function.
-  int fused_qkv = 0;
+  // Every fused `attn.qkv_proj` the FILE supplied, so the check at the
+  // end of this function can ask what kind of fusion they are.
+  std::vector<LoraFactors*> fused_qkv;
   auto bind = [&](const std::string& mod, int N, int K, LoraFactors& out) {
     ad->bind(mod, N, K, &out);
   };
@@ -1355,7 +1353,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     BlockLora& bl = _lora_blocks[(std::size_t)i];
     const std::string p = blk_("blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
-    if (!bl.qkv.empty()) { ++fused_qkv; }
+    if (!bl.qkv.empty()) { fused_qkv.push_back(&bl.qkv); }
     bind(p + "attn.out_proj", H, I, bl.out);
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
@@ -1366,7 +1364,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     BlockLora& bl = _lora_refiner[(std::size_t)i];
     const std::string p = blk_("token_refiner.blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
-    if (!bl.qkv.empty()) { ++fused_qkv; }
+    if (!bl.qkv.empty()) { fused_qkv.push_back(&bl.qkv); }
     bind(p + "attn.out_proj", H, I, bl.out);
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
@@ -1387,31 +1385,54 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
         "MetalMiniMaxH3Transformer: {}",
         ad->summary(spec.path, _lora_scale)));
   }
-  // A FUSED qkv adapter is not layout-neutral, and the mismatch is
-  // silent.
+  // A FUSED qkv adapter carries a ROW ORDER, and it is adapted to this
+  // DiT's rather than reported as a mismatch.
   //
-  // `attn.qkv_proj` writes one [rows, 3*inner] block whose columns the
-  // two publishers group differently: Comfy-Org's repack is FLAT
-  // ([all q | all k | all v]) and every MiniMaxAI release is PER-HEAD
-  // ([q0 k0 v0 | q1 k1 v1 | ...]). Every fused adapter published for
-  // this model -- larryvrh's and both of lightx2v's ComfyUI copies --
-  // has a block-diagonal B built for the FLAT order, so on a per-head
-  // DiT it adds one head's q delta onto another head's k in every
-  // block. The weights stay well-shaped and the video comes out wrong.
+  // `attn.qkv_proj` writes one [rows, 3*inner] block whose columns
+  // Comfy-Org's repack groups FLAT ([all q | all k | all v]) and every
+  // MiniMaxAI release groups PER HEAD ([q0 k0 v0 | q1 k1 v1 | ...]).
+  // This tree re-orders neither publisher's weights -- it points the
+  // attention at the right offsets -- so the delta has to be in the
+  // base's order, and one built for the other publisher lands on the
+  // wrong channels in all 50 blocks.
   //
-  // Nothing in the file states the grouping, so this cannot be checked
-  // -- only reported. It is a warning rather than a refusal because the
-  // caller may know better than the guess: a repack could ship a
-  // per-head fusion, and refusing would make that unusable.
-  if (fused_qkv > 0 && c.qkv_per_head && _mc->session() != nullptr) {
-    _mc->session()->warn(fmt(
-        "MetalMiniMaxH3Transformer: '{}' carries a FUSED attn.qkv_proj "
-        "adapter ({} blocks) and this DiT groups qkv PER HEAD. Every "
-        "published fusion for this model is built for the flat "
-        "[q|k|v] order of Comfy-Org's repack; on per-head weights it "
-        "adds one head's q delta onto another head's k, silently. Use "
-        "the Comfy-Org DiT with this adapter, or an adapter that keeps "
-        "to_q/to_k/to_v separate", spec.path, fused_qkv));
+  // THE MAP IS PROVEN, not derived: Comfy-Org's flat row r and
+  // MiniMaxAI's per-head row qkv_fused_row(r/I, r%I, ..., true) are the
+  // SAME WEIGHTS. MEASURED on the two published FL2VA checkpoints,
+  // blocks.0.attn.qkv_proj: 156 sampled rows byte-identical under that
+  // map, 3 of 156 under the identity (its fixed points).
+  //
+  // Only the fused projection is affected. out_proj, mlp.fc1/fc2 and
+  // adaln_proj carry no grouping and were always applied correctly,
+  // which is why a mismatch reads as "Turbo, but not quite" instead of
+  // as a broken model -- and why it survived so long unnoticed.
+  if (!fused_qkv.empty() && c.qkv_per_head &&
+      spec.qkv_layout != LoraSpec::QkvLayout::kPerHead) {
+    const int HD = c.head_dim;
+    const lora::Adapter::RowMap to_per_head = [HD, I](int, int r) {
+      return qkv_fused_row(r / I, r % I, I, HD, true);
+    };
+    int fixed = 0;
+    for (LoraFactors* f : fused_qkv) {
+      if (lora::Adapter::permute_b_rows(f, 3 * I, to_per_head)) { ++fixed; }
+    }
+    // MEASURED says the layout was read off the factors; ASSUMED says
+    // it was taken on the evidence that every published adapter is
+    // flat. Both permute; the log says which, because only one of them
+    // is something the bytes could confirm.
+    const bool measured =
+        lora::Adapter::block_diagonal_b(*fused_qkv[0], 3, 3 * I);
+    if (_mc->session() != nullptr) {
+      _mc->session()->info(fmt(
+          "MetalMiniMaxH3Transformer: '{}' adapts the FUSED attn.qkv_proj "
+          "in the flat [q|k|v] order ({}) and this DiT groups qkv PER "
+          "HEAD -- {} of {} blocks re-ordered to match. Set "
+          "`lora_qkv_layout: per_head` if this adapter was trained on "
+          "MiniMaxAI's weights", spec.path,
+          measured ? "block-diagonal B, so read off the factors"
+                   : "assumed: every published H3 adapter is",
+          fixed, (int)fused_qkv.size()));
+    }
   }
   return true;
 }

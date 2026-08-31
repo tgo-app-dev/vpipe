@@ -1524,6 +1524,42 @@ function mountEditor(container, opts = {}) {
     // An inline block can be folded away while its request is in flight;
     // it is then detached and there is nothing to fill.
     const live = () => !target || body.isConnected;
+    // WHAT THE USER IS DOING, remembered across the teardown.
+    //
+    // A rebuild replaces every control, so the focused one is removed
+    // from the document: focus falls back to <body> and the scroller
+    // jumps to the top. Tabbing through a form the user has EDITED then
+    // behaves nothing like tabbing through one they have not, which is
+    // the report this exists to answer.
+    //
+    // The key is captured rather than the element, because the element
+    // is exactly the thing that will not survive.
+    const scroller = body.closest('.pane-body') || body;
+    const prevTop = scroller.scrollTop;
+    const act = document.activeElement;
+    const prevKey = act && body.contains(act) ? act.dataset.cfgKey : null;
+    const prevSel = prevKey && typeof act.selectionStart === 'number'
+        ? [act.selectionStart, act.selectionEnd] : null;
+    const restore = () => {
+      // ONLY when the rebuild happened under the user's hands. Every
+      // other caller -- selecting another stage, coming back from the
+      // one-column layout -- is showing a DIFFERENT form, and putting
+      // the old scroll position on it would be its own bug.
+      if (!prevKey) { return; }
+      // Scroll first: focusing scrolls too, and doing it after would
+      // fight the browser's own scroll-into-view.
+      scroller.scrollTop = prevTop;
+      const next = body.querySelector(
+          `[data-cfg-key="${CSS.escape(prevKey)}"]`);
+      if (!next) { return; }
+      // preventScroll: the field is already where it was; letting the
+      // browser scroll to it would undo the line above.
+      try { next.focus({ preventScroll: true }); } catch (e) { next.focus(); }
+      if (prevSel && typeof next.setSelectionRange === 'function') {
+        try { next.setSelectionRange(prevSel[0], prevSel[1]); } catch (e) {}
+      }
+      scroller.scrollTop = prevTop;
+    };
     clear(body);
     clear(cfgHead);   // header Apply/Remove; refilled below when editable
     if (!state.detail || !state.selectedStage) {
@@ -1571,6 +1607,23 @@ function mountEditor(container, opts = {}) {
     const commit = () => {
       if (canEdit()) { applyConfig(inputs, { rerender: false }); }
     };
+    // The graph refresh an auto-apply deferred (see applyConfig). Run
+    // when focus leaves the FORM, not merely the field: tabbing between
+    // two fields passes through here with relatedTarget still inside,
+    // and rebuilding then would be the very teardown that was deferred.
+    //
+    // Bound ONCE per host element -- clear() empties the body but leaves
+    // its own listeners, so binding per render would stack a copy per
+    // rebuild.
+    if (!body.dataset.cfgFocusHook) {
+      body.dataset.cfgFocusHook = '1';
+      body.addEventListener('focusout', (e) => {
+        if (!state.graphStale) { return; }
+        if (e.relatedTarget && body.contains(e.relatedTarget)) { return; }
+        state.graphStale = false;
+        renderGraphPane();
+      });
+    }
 
     wrap.append(el('div', { class: 'stage-id' }, info.id));
 
@@ -1591,9 +1644,17 @@ function mountEditor(container, opts = {}) {
     for (const f of info.schema) {
       const { field, read } = configField(f, !editable, info.type, commit);
       inputs.push({ key: f.key, type: f.type, read });
+      // Tag the field's own controls with the key. A rebuild replaces
+      // every element, so the only way to put the caret back where it
+      // was is to find the NEW control that means the same thing.
+      for (const c of field.querySelectorAll(
+             'input, select, textarea')) {
+        c.dataset.cfgKey = f.key;
+      }
       wrap.append(field);
     }
     body.append(wrap);
+    restore();
   }
 
   // Build one config field. `read()` returns:
@@ -2177,8 +2238,18 @@ function mountEditor(container, opts = {}) {
       state.detail = await api.setStageConfig(
         state.selectedId, state.selectedStage, cfg);
       toast(t('pl.config_applied'), 'ok');
-      renderGraphPane();
-      if (rerender) { await renderConfig(); }
+      // `rerender:false` is a promise not to tear down the form the
+      // user is still in, and rebuilding the GRAPH broke that promise
+      // in the one-column layout -- where the form lives inside
+      // graphBody, so clearing it takes the form with it. The graph is
+      // marked stale instead and redrawn when focus leaves the form.
+      if (rerender) {
+        state.graphStale = false;
+        renderGraphPane();
+        await renderConfig();
+      } else {
+        state.graphStale = true;
+      }
     } catch (e) { toast(t('pl.apply_failed', { msg: e.message }), 'error'); }
   }
 

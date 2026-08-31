@@ -615,6 +615,14 @@ function build() {
         onClick: () => splitPanel(p, 'h'),
         onAlt: () => splitPanel(p, 'h', true) });
     }
+    // WHAT THE PANEL SHOWS, as against where it sits. Sends it back to
+    // the chooser in the same slot -- the affordance an empty pane
+    // already has, reached from a panel that is not empty. Without it a
+    // panel's view is fixed for its life: the only way to change one was
+    // to close it and split again, which loses its size and position.
+    items.push(null);
+    items.push({ label: t('composer.replace_view'),
+      onClick: () => chooseInto(p, 'empty') });
     items.push(null);
     if (p.mode === 'bg') {
       items.push({ label: t('composer.restore'), onClick: () => toFloat(p) });

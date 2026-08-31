@@ -531,6 +531,18 @@ export function renderGraph(graph, opts = {}) {
   const svg = svgEl('svg', { class: 'graph' + (editable ? ' editable' : '')
                               + (pending ? ' arming' : '') });
 
+  // A transparent rect covering the whole viewBox, FIRST so it paints
+  // behind everything and hit-tests everywhere.
+  //
+  // The canvas has to be a target over its EMPTY area, or panning only
+  // works where a node or an edge happens to be. Chrome hit-tests the
+  // root <svg> box itself and needs none of this; other engines follow
+  // the SVG rule that only painted geometry is hit, and there the empty
+  // canvas is a hole. A `fill` of `transparent` is painted geometry --
+  // `none` is not, and would leave the hole exactly where it was.
+  const bgHit = svgEl('rect', { class: 'graph-bg' });
+  svg.append(bgHit);
+
   // Edges underneath nodes. Each long edge has its own routing
   // dummies inserted by computeLayout(); buildEdgePath() splines the
   // curve through every dummy's centre so it can never hide behind a
@@ -850,8 +862,16 @@ export function renderGraph(graph, opts = {}) {
       view.cy = contentH / 2;
     }
     const vw = W / view.k, vh = H / view.k;
-    svg.setAttribute('viewBox',
-      `${view.cx - vw / 2} ${view.cy - vh / 2} ${vw} ${vh}`);
+    const x = view.cx - vw / 2, y = view.cy - vh / 2;
+    svg.setAttribute('viewBox', `${x} ${y} ${vw} ${vh}`);
+    // The hit rect tracks the viewBox rather than being given a huge
+    // fixed extent: a rect far larger than the view would enlarge the
+    // element's bbox, and anything that measures the content (fit,
+    // auto-arrange) would then be fitting the rect.
+    bgHit.setAttribute('x', x);
+    bgHit.setAttribute('y', y);
+    bgHit.setAttribute('width', vw);
+    bgHit.setAttribute('height', vh);
   }
 
   const setZoom = (k) => { view.k = clamp(k, MIN_K, MAX_K); applyView(); };
@@ -936,7 +956,11 @@ export function renderGraph(graph, opts = {}) {
   //
   // The − / + buttons and the keys below are the discrete way to zoom,
   // for a plain mouse that has no pinch and no horizontal wheel.
-  svg.addEventListener('wheel', (e) => {
+  // Bound on the CONTAINER, not the svg: the request is "anywhere on
+  // the canvas", and the container is what the canvas area IS. Events
+  // over the svg bubble to it, so content behaves exactly as before,
+  // and any strip of the pane the svg does not cover now works too.
+  container.addEventListener('wheel', (e) => {
     e.preventDefault();
     const W = svg.clientWidth, H = svg.clientHeight;
     if (!W || !H) { return; }
@@ -1031,7 +1055,10 @@ export function renderGraph(graph, opts = {}) {
   // connect. A trailing click after a pan (moved) is ignored.
   if (editable) {
     svg.addEventListener('click', (e) => {
-      if (e.target !== svg || moved) { return; }
+      // The background rect counts as the background -- it IS the
+      // background, and without it here a click on empty canvas would
+      // stop deselecting the moment the rect was added.
+      if ((e.target !== svg && e.target !== bgHit) || moved) { return; }
       if (opts.onEdgeSelect) { opts.onEdgeSelect(null); }
       if (opts.onBackgroundClick) { opts.onBackgroundClick(); }
     });

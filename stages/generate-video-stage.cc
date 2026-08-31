@@ -953,6 +953,9 @@ GenerateVideoStage::apply_model_config_()
       const auto o = _model_cfg.as_object();
       lp = o.contains("lora") ? std::string(o.at("lora").as_string("")) : "";
       ls = o.contains("lora_scale") ? o.at("lora_scale").as_real(1.0) : 1.0;
+      if (o.contains("lora_qkv_layout")) {
+        _h3_lora_qkv = std::string(o.at("lora_qkv_layout").as_string(""));
+      }
     } else {
       lp = _h3_lora;   // nothing said; keep what a previous beat set
     }
@@ -1301,6 +1304,15 @@ GenerateVideoStage::ensure_expert_(int which)
       }
     }
     lora.scale = (float)_h3_lora_scale;
+    // LOAD-time like the path: the rows are permuted once, at bind.
+    using QL = genai::MetalMiniMaxH3Transformer::LoraSpec::QkvLayout;
+    if (_h3_lora_qkv == "per_head") { lora.qkv_layout = QL::kPerHead; }
+    else if (_h3_lora_qkv == "flat") { lora.qkv_layout = QL::kFlat; }
+    else if (!_h3_lora_qkv.empty() && _h3_lora_qkv != "auto") {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): lora_qkv_layout '{}' is not one of "
+          "auto / flat / per_head; using auto", this->id(), _h3_lora_qkv));
+    }
     // NOTE for the pinned prefix: stream_pin_count now measures the
     // trunk but still assumes 1 GB of activation scratch, and this model
     // holds ~4 GB at its own sizes. It is not passed here because the

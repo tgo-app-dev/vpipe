@@ -17,6 +17,9 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "common/vpipe-format.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "generative-models/shared/streamed-refill.h"
 #include "generative-models/weight-set.h"
 
@@ -1387,4 +1390,94 @@ TEST(weight_set, an_unreachable_cap_parks_what_it_can_and_stops) {
   ASSERT_TRUE(back != nullptr);
   if (back != nullptr) { EXPECT_TRUE(back->parked()); }
   mgr->set_memory_cap(0);
+}
+
+// A misaligned pack does not WARN.
+//
+// It used to, and the finding was real -- F_NOCACHE silently falls back
+// to buffered I/O on an unaligned offset, and a streamed checkpoint then
+// grew file pages one-for-one with what it read. pread_into() fixed that
+// by staging on page boundaries, which left the warning describing a
+// solved problem, at OPEN (before anything knows whether this checkpoint
+// will ever be streamed), with a remedy -- re-run vpipe's quantizer --
+// that means nothing for a published VAE nobody quantized.
+//
+// So the bar is: opening one says nothing the user has to read. The fact
+// is still recorded, but on the LOG delegate, which is where a fact that
+// explains a throughput question goes.
+namespace {
+
+// Same shape as TempCheckpoint, with the header padded so the data
+// section starts OFF a 16-byte boundary -- which is how a real one gets
+// this way: the section sits at 8 + header_len, so its alignment is
+// whatever the header length happened to be.
+class MisalignedCheckpoint {
+public:
+  MisalignedCheckpoint()
+  {
+    namespace fs = std::filesystem;
+    _dir = (fs::temp_directory_path() /
+            ("vpipe-ws-mis-" + to_string(::getpid()))).string();
+    fs::create_directories(_dir);
+    float v[4] = {1.f, 2.f, 3.f, 4.f};
+    string hdr = "{\"trunk.w\":{\"dtype\":\"F32\",\"shape\":[4],"
+                 "\"data_offsets\":[0,16]}}";
+    while (((8 + hdr.size()) % 16) != 8) { hdr.push_back(' '); }
+    ofstream out(_dir + "/model.safetensors", ios::binary);
+    const uint64_t n = hdr.size();
+    out.write(reinterpret_cast<const char*>(&n), 8);
+    out.write(hdr.data(), (streamsize)hdr.size());
+    out.write(reinterpret_cast<const char*>(v), 16);
+  }
+  ~MisalignedCheckpoint()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+  const string& dir() const { return _dir; }
+private:
+  string _dir;
+};
+
+struct WarnCounter : public UiDelegateIntf {
+  std::vector<std::string> lines;
+  void error(const VpipeFormat& f) override { lines.push_back(f()); }
+  void warn (const VpipeFormat& f) override { lines.push_back(f()); }
+  void info (const VpipeFormat&) override {}
+  UiInputStatus getline(const VpipeFormat&, std::string&,
+                        const std::function<bool()>&) override
+  {
+    return UiInputStatus::Eof;
+  }
+  std::unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return std::make_unique<NullUiTextStream>();
+  }
+};
+
+}  // namespace
+
+TEST(weight_set, a_misaligned_pack_does_not_warn)
+{
+  MisalignedCheckpoint ck;
+  Session sess;
+  auto  ui_owned = std::make_unique<WarnCounter>();
+  auto* ui = ui_owned.get();
+  sess.set_ui_delegate(std::move(ui_owned));
+
+  // The fixture is actually misaligned, or this test passes by having
+  // nothing to report.
+  auto raw = genai::MetalLlamaWeights::open_model(ck.dir());
+  ASSERT_TRUE(raw.has_value());
+  if (!raw.has_value()) { return; }
+  const auto a = raw->alignment();
+  EXPECT_TRUE(a.misaligned > 0 || a.bad_shards > 0);
+
+  ui->lines.clear();
+  auto ws = genai::WeightSet::open(ck.dir(), &sess);
+  EXPECT_TRUE(ws != nullptr);
+  for (const std::string& l : ui->lines) {
+    std::printf("[weight_set] unexpected: %s\n", l.c_str());
+  }
+  EXPECT_TRUE(ui->lines.empty());
 }

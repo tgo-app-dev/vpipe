@@ -305,6 +305,27 @@ class MetalMiniMaxH3Transformer {
   struct LoraSpec {
     std::string path;          // a single .safetensors of lora_A/B pairs
     float       scale = 1.0f;  // folded into A at load; 1.0 = as trained
+
+    // Which row order the adapter's FUSED `attn.qkv_proj` is in.
+    //
+    // The two publishers order that projection's 3*inner output rows
+    // differently -- Comfy-Org's repack FLAT ([all q | all k | all v]),
+    // every MiniMaxAI release PER HEAD -- and this tree re-orders
+    // neither, pointing the attention at the right offsets instead. So
+    // an adapter's delta has to be in the same order as the base it is
+    // added to, and one built for the other publisher lands on the
+    // wrong channels in every block.
+    //
+    // kAuto reads FLAT, because every H3 adapter published so far is:
+    // lightx2v's ComfyUI copies measurably (their B is exactly
+    // block-diagonal), larryvrh's Turbo by its repo's own
+    // `base_model: Comfy-Org/MiniMax-H3`. On a per-head DiT the rows
+    // are then permuted at bind. kPerHead is the escape hatch for an
+    // adapter actually trained on MiniMaxAI's weights -- none is known,
+    // and assuming one exists would silently break every adapter that
+    // does.
+    enum class QkvLayout { kAuto, kFlat, kPerHead };
+    QkvLayout qkv_layout = QkvLayout::kAuto;
   };
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>

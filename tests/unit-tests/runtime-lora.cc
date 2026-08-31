@@ -706,3 +706,98 @@ TEST(runtime_lora, applier_computes_x_a_b_on_the_gpu)
   }
   EXPECT_TRUE(untouched);
 }
+
+// ---- telling a CONVERTED fusion from a TRAINED one ------------------
+
+// The structural question behind the qkv-grouping check.
+//
+// A fusion CONVERTED from separate q/k/v is block-diagonal by
+// construction, and its bands are a claim about which rows of the base
+// are q, k and v -- a claim that is wrong on a base grouped the other
+// way. One trained DIRECTLY on the fused projection is dense and makes
+// no claim at all. Asking the FACTORS is what tells them apart; asking
+// "is it fused" cannot, and a check that did warned about correct
+// pairings.
+TEST(runtime_lora, block_diagonal_tells_a_converted_fusion_from_a_trained_one)
+{
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::error_code ec;
+  fs::create_directories(scratch(), ec);
+  const int R = 2, K = 3, NP = 4, N = 3 * NP;   // 3 parts
+
+  // CONVERTED: built by bind_fused, so block-diagonal by construction.
+  const fs::path pc = scratch() / "converted.safetensors";
+  ASSERT_TRUE(write_st(pc, {
+      {"q.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 1.0f)},
+      {"q.lora_B.weight", {NP, R}, ramp(NP * R, 1.0f, 1.0f)},
+      {"k.lora_A.weight", {R, K}, ramp(R * K, 2.0f, 1.0f)},
+      {"k.lora_B.weight", {NP, R}, ramp(NP * R, 2.0f, 1.0f)},
+      {"v.lora_A.weight", {R, K}, ramp(R * K, 3.0f, 1.0f)},
+      {"v.lora_B.weight", {NP, R}, ramp(NP * R, 3.0f, 1.0f)},
+  }));
+  std::string err;
+  auto ac = genai::lora::Adapter::open(pc.string(), mc, &err);
+  ASSERT_TRUE(ac != nullptr);
+  if (!ac) { return; }
+  genai::lora::Factors conv;
+  ASSERT_TRUE(ac->bind_fused({"q", "k", "v"}, N, K, &conv,
+                             [](int pt, int r) { return pt * NP + r; }));
+  EXPECT_TRUE(genai::lora::Adapter::block_diagonal_b(conv, 3, N));
+
+  // TRAINED: one dense B over the whole fused width, which is what
+  // larryvrh's Turbo adapter is. Same shape, different provenance.
+  const fs::path pt = scratch() / "trained.safetensors";
+  ASSERT_TRUE(write_st(pt, {
+      {"qkv.lora_A.weight", {3 * R, K}, ramp(3 * R * K, 1.0f, 1.0f)},
+      {"qkv.lora_B.weight", {N, 3 * R}, ramp(N * 3 * R, 1.0f, 1.0f)},
+  }));
+  auto at = genai::lora::Adapter::open(pt.string(), mc, &err);
+  ASSERT_TRUE(at != nullptr);
+  if (!at) { return; }
+  genai::lora::Factors trained;
+  // rank is 3R (A's rows); K is A's columns, as for any other module.
+  ASSERT_TRUE(at->bind("qkv", N, K, &trained));
+  EXPECT_FALSE(genai::lora::Adapter::block_diagonal_b(trained, 3, N));
+
+  // A rank that does not divide by the part count is not one of these
+  // either -- and must not be read as one.
+  EXPECT_FALSE(genai::lora::Adapter::block_diagonal_b(conv, 4, N));
+
+  // ---- and the repair -------------------------------------------
+  // Reversing the flat band order is a permutation, so every row keeps
+  // its values and only its position changes.
+  std::vector<float> before;
+  for (int i = 0; i < N * 3 * R; ++i) {
+    before.push_back(bf16_at(conv.b, (std::size_t)i));
+  }
+  ASSERT_TRUE(genai::lora::Adapter::permute_b_rows(
+      &conv, N, [](int, int r) { return N - 1 - r; }));
+  bool moved = true;
+  for (int row = 0; row < N; ++row) {
+    for (int c = 0; c < 3 * R; ++c) {
+      const float got = bf16_at(conv.b, (std::size_t)row * 3 * R + c);
+      const float want = before[(std::size_t)(N - 1 - row) * 3 * R + c];
+      if (got != want) { moved = false; }
+    }
+  }
+  EXPECT_TRUE(moved);
+
+  // A map that is NOT a permutation leaves the factors ALONE. A
+  // half-scrambled B would be worse than the order already there.
+  std::vector<float> now;
+  for (int i = 0; i < N * 3 * R; ++i) {
+    now.push_back(bf16_at(conv.b, (std::size_t)i));
+  }
+  EXPECT_FALSE(genai::lora::Adapter::permute_b_rows(
+      &conv, N, [](int, int) { return 0; }));       // every row -> 0
+  bool untouched = true;
+  for (int i = 0; i < N * 3 * R; ++i) {
+    if (bf16_at(conv.b, (std::size_t)i) != now[(std::size_t)i]) {
+      untouched = false;
+    }
+  }
+  EXPECT_TRUE(untouched);
+  fs::remove(pc, ec); fs::remove(pt, ec);
+}

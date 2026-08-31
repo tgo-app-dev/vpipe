@@ -5,6 +5,7 @@
 #include "interfaces/session-context-intf.h"
 
 #include <cstring>
+#include <vector>
 #include <algorithm>
 
 namespace vpipe {
@@ -392,6 +393,50 @@ Adapter::bind_fused(const std::vector<std::string>& modules, int n, int k,
   _max_rank = std::max(_max_rank, total_rank);
   ++_modules;
   if (via_rename) { ++_renamed; }
+  return true;
+}
+
+bool
+Adapter::block_diagonal_b(const Factors& f, int parts, int n)
+{
+  if (f.empty() || parts <= 1 || n <= 0) { return false; }
+  if (f.rank % parts != 0 || n % parts != 0) { return false; }
+  const int rb = f.rank / parts, nb = n / parts;
+  if ((std::size_t)n * (std::size_t)f.rank * 2 > f.b.byte_size()) {
+    return false;
+  }
+  const auto* b = static_cast<const std::uint16_t*>(f.b.contents());
+  for (int row = 0; row < n; ++row) {
+    const int band = row / nb;
+    for (int c = 0; c < f.rank; ++c) {
+      if (c / rb == band) { continue; }        // on the diagonal block
+      if (b[(std::size_t)row * f.rank + c] != 0) { return false; }
+    }
+  }
+  return true;
+}
+
+bool
+Adapter::permute_b_rows(Factors* f, int n, const RowMap& rows)
+{
+  if (f == nullptr || f->empty() || n <= 0 || !rows) { return false; }
+  const std::size_t cnt = (std::size_t)n * (std::size_t)f->rank;
+  if (cnt * 2 > f->b.byte_size()) { return false; }
+  std::vector<std::uint16_t> tmp(cnt, 0);
+  const auto* src = static_cast<const std::uint16_t*>(f->b.contents());
+  std::vector<bool> hit((std::size_t)n, false);
+  for (int r = 0; r < n; ++r) {
+    const int d = rows(0, r);
+    // NOT a permutation -- leave the factors untouched rather than
+    // write a partly-scrambled B, which would be worse than the order
+    // that was already there.
+    if (d < 0 || d >= n || hit[(std::size_t)d]) { return false; }
+    hit[(std::size_t)d] = true;
+    std::memcpy(tmp.data() + (std::size_t)d * f->rank,
+                src + (std::size_t)r * f->rank,
+                (std::size_t)f->rank * 2);
+  }
+  std::memcpy(f->b.contents(), tmp.data(), cnt * 2);
   return true;
 }
 
