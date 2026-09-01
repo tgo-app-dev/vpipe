@@ -9,10 +9,12 @@
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
+#include "common/ffmpeg-libraries.h"
 #include "common/flex-data.h"
 #include "common/job.h"
 #include "common/session.h"
 #include "interfaces/ui-delegate-intf.h"
+#include <cmath>
 #include <mutex>
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
@@ -789,6 +791,92 @@ TEST(video_ref_encoder, attach_audio_names_reference_ports)
   }
   std::printf("[video_ref_encoder] attach_audio: 1..6 accepted, 0 and 7 "
               "refused at launch\n");
+}
+
+// A soundtrack that arrives on a PORT arrives at its producer's rate,
+// and the audio VAE reads one rate only (32000 for the released
+// checkpoint). Nothing downstream looks at `sample_rate` again --
+// normalize_audio_reference truncates with it and then hands the
+// waveform to a VAE that assumes its own -- so an unconformed 44.1 kHz
+// beat was encoded as if it were 32 kHz: a fourth too high and 1.38x too
+// long against the clip it shares a rotary clock with. Every shape stays
+// valid, which is why it read as "the reference did nothing".
+//
+// The FILE path never had this: decode_references_ hands the decoder the
+// VAE's rate and gets it back resampled in the same pass.
+TEST(video_ref_encoder, a_port_soundtrack_is_conformed_to_the_vae_rate)
+{
+  namespace h3 = vpipe::genai::minimax_h3;
+  Session sess;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = sess.ffmpeg_libraries();
+  } catch (...) {
+    return;   // no FFmpeg on this box -- skip vacuously
+  }
+  if (libs == nullptr || !libs->valid()) { return; }
+
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("references",
+                                   FlexData::make_string("subject.png"));
+  VideoRefEncoderStage st(&sess, "refenc", vector<InEdge>{}, cfg);
+
+  // Two seconds of 440 Hz at 44100, stereo planar -- what an
+  // `audio-to-pcm` set to 44100 emits.
+  constexpr int kIn = 44100, kN = 2 * 44100;
+  auto tone = [&](int rate, int n) {
+    h3::MediaReference m;
+    m.kind        = h3::MediaReference::Kind::kAudio;
+    m.channels    = 2;
+    m.sample_rate = rate;
+    m.pcm.resize((std::size_t)2 * n);
+    for (int i = 0; i < n; ++i) {
+      const float v =
+          0.5f * (float)std::sin(2.0 * M_PI * 440.0 * i / (double)rate);
+      m.pcm[(std::size_t)i]     = v;
+      m.pcm[(std::size_t)n + i] = v;
+    }
+    return m;
+  };
+  auto hz = [](const float* p, int n, int rate) {
+    int cross = 0;
+    for (int i = 1; i < n; ++i) {
+      if ((p[i - 1] < 0.0f) != (p[i] < 0.0f)) { ++cross; }
+    }
+    return 0.5 * (double)cross * (double)rate / (double)n;
+  };
+
+  h3::MediaReference m = tone(kIn, kN);
+  ASSERT_TRUE(st.conform_audio_rate(&m, 1));
+  // With no audio VAE loaded the target is the released checkpoint's
+  // 32000, which is the rate a graph has to hit either way.
+  EXPECT_TRUE(m.sample_rate == 32000);
+  const int got = (int)(m.pcm.size() / 2);
+  EXPECT_TRUE(got > 63700 && got < 64300);        // 2 s at 32 kHz
+  // The tone survived. Reinterpreting instead of resampling would leave
+  // 88200 samples reading as 606 Hz.
+  EXPECT_TRUE(std::fabs(hz(m.pcm.data(), got, 32000) - 440.0) < 4.0);
+  EXPECT_TRUE(std::fabs(hz(m.pcm.data() + got, got, 32000) - 440.0) < 4.0);
+
+  // A beat ALREADY at the VAE's rate is left exactly as it came: the
+  // graph that was wired right pays nothing, and does not get a second
+  // pass of the filter.
+  h3::MediaReference ok = tone(32000, 64000);
+  const std::vector<float> before = ok.pcm;
+  ASSERT_TRUE(st.conform_audio_rate(&ok, 1));
+  EXPECT_TRUE(ok.sample_rate == 32000);
+  EXPECT_TRUE(ok.pcm == before);
+
+  // Pixels are not audio, whatever their rate field says.
+  h3::MediaReference img;
+  img.kind        = h3::MediaReference::Kind::kImage;
+  img.sample_rate = 44100;
+  ASSERT_TRUE(st.conform_audio_rate(&img, 1));
+  EXPECT_TRUE(img.sample_rate == 44100);
+
+  std::printf("[video_ref_encoder] port soundtrack 44100 -> 32000: "
+              "%d samples/ch, %.1f Hz\n", got,
+              hz(m.pcm.data(), got, 32000));
 }
 
 TEST(video_ref_encoder, reference_beats_are_typed_by_rank)

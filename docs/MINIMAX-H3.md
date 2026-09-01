@@ -639,7 +639,24 @@ are different requests. The rates are **required and never defaulted** — a
 soundtrack read at the wrong rate conditions on the wrong sound, and a clip at
 the wrong speed generates video with nothing to complain about.
 
+**Send audio at the audio VAE's rate: 32000 Hz.** A file reference is
+decoded straight onto it, but a *beat* arrives at whatever its producer
+chose, so set the producing `audio-to-pcm`'s `output_sample_rate` to
+`32000`. Another rate is not silently wrong — the encoder resamples it
+onto 32000 and warns — but that is a second pass of the filter over a
+waveform its producer already resampled once, and the fix is one config
+key. It matters because nothing downstream looks at the rate again: an
+*unconformed* 44.1 kHz soundtrack would be encoded as if it were 32 kHz,
+i.e. 1.38× too fast, pitched up a fourth, and 1.38× too long against the
+clip it shares a rotary clock with — with every shape still valid.
+
 One optional sideband key: `short_edge` sets *this one reference's* canvas.
+
+When the rate is not yours to set — the PCM arrives from a stage you did not
+configure, or one feed has to serve both this port and a 44.1 kHz mux — put an
+**`audio-temporal-resample`** in front of it with `output_sample_rate: 32000`.
+That stage also owns the *speed* and *pitch* of a soundtrack, if the reference
+wants stretching before the model hears it.
 
 ##### Audio that belongs to a clip
 
@@ -1045,6 +1062,15 @@ instead.
 **It generated video but the audio is silent or wrong.** Check that
 `save-video` has `enable_audio: true` and that `audio-vae-decode` is wired to
 `generate-video` **port 1** (port 0 is video).
+
+**The generated soundtrack doesn't carry the reference music.** The prompt
+has to ask for it — the sound comes from the same text as the picture, so
+name what is being played (see [step 2](#step-2--text-to-video-and-audio)).
+Then check the encoder's line: `N reference(s) -> ... M reference audio
+rows`, where `M` should be `2 × 40 × seconds` — 400 for a 5 s reference.
+Far more than that means the soundtrack reached it at the wrong rate; the
+encoder warns about it and resamples, and the fix is to set the producing
+`audio-to-pcm`'s `output_sample_rate` to **32000**.
 
 **`frames` isn't what you asked for.** Expected — see the table above.
 

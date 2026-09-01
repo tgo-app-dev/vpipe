@@ -50,10 +50,14 @@ constexpr const char* kRefPortDoc =
     "cannot state, since a one-frame clip is [1, 3, H, W] and a still is "
     "[3, H, W]. The SIDEBAND carries the rates, and their absence is an "
     "error rather than a default: `fps` for a clip, `sr` (or "
-    "`sample_rate`) for audio. Optional sideband keys: `short_edge` for "
-    "this one reference's canvas (0, the default here, encodes it at the "
-    "size it arrived), and `attach` on an audio beat to override the "
-    "stage's `attach_audio` for that beat -- true to make it the SOUNDTRACK "
+    "`sample_rate`) for audio -- a soundtrack arriving at a rate other "
+    "than the audio VAE's is RESAMPLED onto it, which is what stating the "
+    "rate is for, so set the producer's rate to the VAE's (32000 for the "
+    "released checkpoint) to be resampled once instead of twice. Optional "
+    "sideband keys: `short_edge` for this one reference's canvas (0, the "
+    "default here, encodes it at the size it arrived), and `attach` on an "
+    "audio beat to override the stage's `attach_audio` for that beat -- "
+    "true to make it the SOUNDTRACK "
     "of the preceding reference, false to decline where the config asked. "
     "A WIRED port must beat every request -- an empty tensor is how "
     "you say \"nothing this time\", because a silent port would renumber "
@@ -915,6 +919,58 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
   return true;
 }
 
+// The audio VAE's rate is the only rate a reference soundtrack may be
+// encoded at, and a beat is the one path that can arrive at another one.
+// See the declaration for what the mismatch did.
+//
+// Resampling here is a SECOND pass over a waveform its producer already
+// resampled once, so it is warned rather than done quietly: the fix is
+// one config key on the producer, and a graph that takes it pays for one
+// conversion instead of two.
+bool
+VideoRefEncoderStage::conform_audio_rate(h3::MediaReference* m, int n)
+{
+  if (m == nullptr || m->kind != h3::MediaReference::Kind::kAudio) {
+    return true;
+  }
+  const int want = _audio_vae ? _audio_vae->config().sample_rate : 32000;
+  if (m->sample_rate == want || m->pcm.empty() || m->channels <= 0) {
+    return true;
+  }
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
+  if (libs == nullptr || !libs->valid()) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+        "but the VAE reads {} Hz, and FFmpeg is unavailable to resample it; "
+        "skipping", this->id(), n, m->sample_rate, want));
+    return false;
+  }
+  const int samples = (int)(m->pcm.size() / (std::size_t)m->channels);
+  std::vector<float> pcm;
+  int got = 0;
+  std::string rerr;
+  if (!resample_pcm(libs, m->pcm.data(), m->channels, samples,
+                    m->sample_rate, want, m->channels, &pcm, &got, &rerr)) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+        "but the VAE reads {} Hz, and the resample failed: {}; skipping",
+        this->id(), n, m->sample_rate, want, rerr));
+    return false;
+  }
+  session()->warn(fmt(
+      "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+      "and the audio VAE reads {} Hz -- resampled ({} -> {} samples). Set "
+      "the producing stage's rate to {} so the waveform is resampled ONCE; "
+      "an unconformed soundtrack would be encoded {:.2f}x too fast and "
+      "{:.2f}x too long against the clip it is conditioning",
+      this->id(), n, m->sample_rate, want, samples, got, want,
+      (double)m->sample_rate / (double)want,
+      (double)m->sample_rate / (double)want));
+  m->pcm         = std::move(pcm);
+  m->sample_rate = want;
+  return true;
+}
+
 void
 VideoRefEncoderStage::report_fits_(const h3::EncodedReferences& enc)
 {
@@ -1111,6 +1167,13 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     if (!media_from_beat(*tb, (int)(p - kFirstRefPort + 1), &m, &merr)) {
       session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
                           this->id(), merr));
+      co_return;
+    }
+    // A beat's rate is its producer's, and the audio VAE reads one
+    // rate only. Conformed BEFORE the attach fold below, so a
+    // soundtrack folded onto a clip gets the same treatment as a
+    // standalone one.
+    if (!conform_audio_rate(&m, (int)(p - kFirstRefPort + 1))) {
       co_return;
     }
     // `attach` folds a soundtrack onto the reference before it instead

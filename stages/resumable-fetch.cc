@@ -45,6 +45,28 @@ write_to_string_(char* p, size_t s, size_t n, void* u)
   return s * n;
 }
 
+// The same, but counting as it goes. A range on the Xet path arrives as
+// one buffered GET, so nothing downstream can see it move until it is
+// whole -- and the writer that would report it is meanwhile blocked on
+// SOME OTHER range. This is the hook that lets the caller report a
+// transfer in flight; libcurl calls it about every 16 KB.
+struct CountingSink {
+  string*                                   out      = nullptr;
+  const std::function<void(std::uint64_t)>* on_bytes = nullptr;
+  std::uint64_t                             got      = 0;
+};
+
+size_t
+write_counting_(char* p, size_t s, size_t n, void* u)
+{
+  auto* c = static_cast<CountingSink*>(u);
+  const size_t got = s * n;
+  c->out->append(p, got);
+  c->got += got;
+  if (c->on_bytes) { (*c->on_bytes)(c->got); }
+  return got;
+}
+
 // ---- download progress -------------------------------------------------
 
 // Per-download progress state handed to the libcurl xferinfo callback.
@@ -298,11 +320,15 @@ bool
 http_get_range(const string& url, const string& token, bool verify_tls,
                long stall_s, std::uint64_t off, std::uint64_t last,
                string& out, long& status, string& err,
-               const std::function<bool()>* cancel)
+               const std::function<bool()>* cancel,
+               const std::function<void(std::uint64_t)>* on_bytes)
 {
   out.clear();
   ProgressCtx pctx;
   pctx.cancel = cancel;
+  CountingSink sink;
+  sink.out      = &out;
+  sink.on_bytes = on_bytes;
   PerformOpts o;
   o.verify_tls = verify_tls;
   o.stall_s    = stall_s;
@@ -310,7 +336,7 @@ http_get_range(const string& url, const string& token, bool verify_tls,
   // so this has to be the exact range the manifest named -- an open
   // "bytes=N-" would be refused.
   o.range = fmt("{}-{}", off, last)();
-  CURLcode rc = curl_perform_(url, token, o, &write_to_string_, &out,
+  CURLcode rc = curl_perform_(url, token, o, &write_counting_, &sink,
                               &status, cancel ? &pctx : nullptr);
   if (rc != CURLE_OK) {
     err = curl_easy_strerror(rc);

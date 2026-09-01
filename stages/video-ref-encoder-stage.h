@@ -288,6 +288,28 @@ public:
   static bool
   media_from_beat(const TensorBeatPayload& tb, int n,
                   genai::minimax_h3::MediaReference* out, std::string* err);
+
+  // Bring a PORT-SOURCED soundtrack onto the audio VAE's sample rate.
+  //
+  // The FILE path never needs this -- decode_references_ hands the
+  // decoder the VAE's rate and gets it back resampled in the same pass.
+  // A beat arrives at whatever rate its producer chose, and NOTHING
+  // downstream reads `sample_rate` again: `normalize_audio_reference`
+  // truncates with it and then hands the waveform to a VAE that assumes
+  // its own. So a 44.1 kHz beat was encoded as if it were 32 kHz --
+  // 1.38x too fast, pitched up a fourth, and 1.38x too long against the
+  // target block it shares a rotary clock with. That is a reference the
+  // model cannot use, and it looks exactly like a prompt that did not
+  // take.
+  //
+  // Public for the same reason `media_from_beat` is: it is the half of
+  // the port contract that fails SILENTLY, and it deserves a test that
+  // needs neither a model nor a runtime. With no audio VAE loaded the
+  // target is the released checkpoint's 32000.
+  //
+  // `n` is the 1-based port number, for the message. False with the
+  // reason already warned.
+  bool conform_audio_rate(genai::minimax_h3::MediaReference* m, int n);
 #endif
 
 private:
@@ -349,6 +371,7 @@ private:
   // Warn about every reference the encoder had to reshape, and log the
   // ones it took as given. See the definition for why this is WARN.
   void report_fits_(const genai::minimax_h3::EncodedReferences& enc);
+
 
   // ---- idle unload -------------------------------------------------
   // The conditioner is the largest resident block in a `ref2va` graph

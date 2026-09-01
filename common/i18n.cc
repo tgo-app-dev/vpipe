@@ -21,10 +21,13 @@ struct Entry {
 // the browser catalogue in apps/web-ui/web/js/i18n.js.
 constexpr Entry kCatalog[] = {
   {"app.name",          {"VPIPE", "VPIPE", "VPIPE"}},
-  {"nav.pipelines",     {"Pipelines", "管道", "管線"}},
+  {"nav.pipelines",     {"Pipelines", "流水线", "處理管線"}},
   {"nav.profiler",      {"Profiler", "性能分析", "效能分析"}},
-  {"nav.io",            {"User I/O", "用户输入输出", "使用者輸入輸出"}},
+  {"nav.io",            {"User I/O", "输入输出", "輸入輸出"}},
   {"nav.database",      {"Database", "数据库", "資料庫"}},
+  {"nav.files",         {"Files", "文件", "檔案"}},
+  {"nav.composer",      {"Composer", "自定义", "自訂"}},
+  {"nav.plugins",       {"Plugins", "插件", "外掛"}},
   {"nav.settings",      {"Settings", "设置", "設定"}},
   {"settings.title",    {"Settings", "设置", "設定"}},
   {"settings.language", {"Language", "语言", "語言"}},

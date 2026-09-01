@@ -45,11 +45,19 @@ bool http_get_text(const std::string& url, const std::string& token,
 // transfer gets. This is the unit of work on the Xet path, where a file
 // arrives as many ranges of content-addressed objects rather than as
 // one stream. `off`/`last` are inclusive, as HTTP counts them.
+//
+// `on_bytes` (optional) is called as the range arrives with the count
+// SO FAR in this attempt -- back to a small number if the transfer is
+// retried, since the range starts over. Without it a range is invisible
+// until it is whole, which is what leaves a parallel fetch's progress
+// report standing still while eight of them are in flight.
 bool http_get_range(const std::string& url, const std::string& token,
                     bool verify_tls, long stall_s, std::uint64_t off,
                     std::uint64_t last, std::string& out, long& status,
                     std::string& err,
-                    const std::function<bool()>* cancel = nullptr);
+                    const std::function<bool()>* cancel = nullptr,
+                    const std::function<void(std::uint64_t)>* on_bytes
+                        = nullptr);
 
 // ---- integrity ---------------------------------------------------------
 

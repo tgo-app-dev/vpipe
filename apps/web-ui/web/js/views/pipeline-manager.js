@@ -1127,11 +1127,19 @@ function mountEditor(container, opts = {}) {
     // switched off: its stages stay in state.stageTypes so an
     // already-placed instance still renders with its spec, and drop out
     // of the toolbox so nothing new can be built from them.
+    const hit = (v) => (v || '').toLowerCase().includes(q);
+    // The type name and the server's English are always searchable; so is
+    // what the toolbox actually SHOWS -- the localized label, doc and
+    // category heading. Without those last three a reader on a non-English
+    // locale can only search by text the UI is not displaying to them, and
+    // the display name is not in the English text either ("Frame Dropper"
+    // is neither the type nor a word in its doc).
     const match = state.stageTypes.filter((s) => !s.hidden
       && s.plugin_enabled !== false && (
-      s.type.toLowerCase().includes(q)
-      || (s.doc || '').toLowerCase().includes(q)
-      || (s.category || '').toLowerCase().includes(q)));
+      hit(s.type) || hit(s.doc) || hit(s.category)
+      || hit(tOr('stage.' + s.type + '.name', s.display_name))
+      || hit(tOr('stage.' + s.type + '.doc', ''))
+      || hit(tOr('cat.' + s.category, ''))));
     // Built-ins bucket by category; anything a PLUGIN contributed gets a
     // section of its own, named after the plugin, after the built-ins.
     //

@@ -4,6 +4,8 @@
 #include "common/vpipe-format.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -343,6 +345,26 @@ xet_plan_(const XetSource& src, const string& cas_url,
   return true;
 }
 
+// How often the report is pushed while ranges are in flight.
+//
+// The producer-side contract is "do not throttle" (UiProgressRegistry):
+// one libcurl callback fires hundreds of times a second, the renderers
+// coalesce, and update() is cheap. Eight of them are a different
+// proposition -- they fired ~186 times a second on the measured run --
+// and every push is a mutex plus two formatted byte counts for a number
+// no renderer reads more than ten times a second. Half a second is what
+// this report is worth: a bar that never stands still longer than that
+// reads as live, and it is the web UI's own poll rate.
+constexpr std::int64_t kReportEveryNs = std::int64_t{500} * 1000 * 1000;
+
+std::int64_t
+steady_ns_()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 // ---- the parallel walk -------------------------------------------------
 
 // Shared state for one pass over a plan: workers pull units in order,
@@ -429,6 +451,38 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
       if (u.uses > 0) { u.uses -= 1; }
     }
 
+    // ---- what the report is driven from ------------------------------
+    //
+    // NOT the bytes the writer has appended. The writer advances only
+    // when the ONE range it is waiting for lands, while the other N-1
+    // are still coming down, so the file-bytes count stands still for as
+    // long as that takes and then jumps. MEASURED on a 1.0 GB shard at 8
+    // streams: a 1 Hz renderer saw six consecutive seconds of nothing
+    // and then a 307 MB step, and the longest gap between appends was
+    // 7.5 s. The bytes were arriving the whole time; nothing was
+    // counting them.
+    //
+    // So each range is credited as it ARRIVES, for what it is worth in
+    // FILE bytes -- the slices cut from it, which the manifest states up
+    // front. The sum over ranges is the rest of the file exactly, so the
+    // report still lands on the same number, and it can only run AHEAD
+    // of the writer (a slice is appended from a range that is already
+    // whole, hence already fully credited), never behind it.
+    const std::uint64_t have0 = have;
+    vector<std::uint64_t> worth(plan.units.size(), 0);
+    for (std::size_t i = start; i < plan.terms.size(); ++i) {
+      std::uint64_t b = plan.terms[i].bytes;
+      // The manifest can start the first slice partway in; the writer
+      // drops that prefix, so it is not worth anything here either.
+      if (i == 0 && plan.skip > 0 && b > plan.skip) { b -= plan.skip; }
+      worth[plan.terms[i].unit] += b;
+    }
+    std::atomic<std::uint64_t> credit{0};
+    // When the next push is due. Shared, so the rate is the REPORT's,
+    // not one worker's -- eight independent half-second timers would be
+    // eight times the pushes for no more information.
+    std::atomic<std::int64_t> due{0};
+
     std::ofstream ofs(part, std::ios::binary | std::ios::app);
     if (!ofs) {
       err = fmt("cannot open '{}' for writing", part.string())();
@@ -471,12 +525,50 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
         long   st = 0;
         string e2;
         bool   ok = false;
+        // This range's share of the report, scaled by how much of it has
+        // arrived. `given` is what this worker has already added, so a
+        // retry -- which starts the range over at zero -- hands its own
+        // credit back instead of counting the bytes twice.
+        //
+        // worth[u] is at most the whole file and a range is at most
+        // ~64 MB, so the product cannot overflow short of an exabyte.
+        const std::uint64_t wire =
+            un.last >= un.off ? un.last - un.off + 1 : 0;
+        std::uint64_t given = 0;
+        std::function<void(std::uint64_t)> arrived =
+            [&](std::uint64_t got) {
+          const std::uint64_t c = (wire == 0 || got >= wire)
+              ? worth[u]
+              : (worth[u] * got) / wire;
+          if (c > given)      { credit.fetch_add(c - given); }
+          else if (c < given) { credit.fetch_sub(given - c); }
+          given = c;
+          if (!progress) { return; }
+          // Whoever gets there first pushes for everyone, and the value
+          // is the total across all eight, so it does not matter which
+          // worker that is.
+          const std::int64_t now = steady_ns_();
+          std::int64_t       at  = due.load(std::memory_order_relaxed);
+          if (now < at
+              || !due.compare_exchange_strong(at, now + kReportEveryNs,
+                                              std::memory_order_relaxed)) {
+            return;
+          }
+          const std::uint64_t d = have0 + credit.load();
+          progress->update(d, total,
+                           human_bytes(d) + " / " + human_bytes(total));
+        };
         for (unsigned a = 0; a <= o.retries && !ok; ++a) {
           if (cancel && (*cancel)()) { break; }
           ok = http_get_range(un.url, string(), o.verify_tls, o.stall_s,
-                              un.off, un.last, *body, st, e2, cancel);
+                              un.off, un.last, *body, st, e2, cancel,
+                              &arrived);
           if (!ok && (st == 401 || st == 403)) { break; }   // expired
         }
+        // Settle exactly on success: a server that sent the range in
+        // fewer bytes than asked for would otherwise leave the report a
+        // little short of where the file actually is.
+        if (ok && given < worth[u]) { credit.fetch_add(worth[u] - given); }
         std::lock_guard<std::mutex> lk(w.m);
         if (!ok) {
           w.failed = true;
@@ -579,11 +671,10 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
         local_err = fmt("cannot write '{}'", part.string())();
         break;
       }
+      // `have` is the file's own accounting -- the resume point, and
+      // what the next pass trims back to. It is deliberately NOT the
+      // report: see the credit table above.
       have += out_n;
-      if (progress) {
-        progress->update(have, total,
-                         human_bytes(have) + " / " + human_bytes(total));
-      }
       std::lock_guard<std::mutex> lk(w.m);
       Unit& mu = plan.units[t.unit];
       if (mu.uses > 0) { mu.uses -= 1; }
@@ -603,7 +694,16 @@ xet_fetch(const SessionContextIntf* s, const XetSource& src,
     }
     for (std::thread& t : pool) { t.join(); }
     ofs.close();
-    if (good) { return true; }
+    if (good) {
+      // Land exactly on the finished size. The in-flight report is
+      // pushed on a clock, so the last one can be half a second short of
+      // the end -- and nothing reports this file again.
+      if (progress) {
+        progress->update(have, total,
+                         human_bytes(have) + " / " + human_bytes(total));
+      }
+      return true;
+    }
     if (cancel && (*cancel)()) {
       err = "canceled";
       return false;

@@ -15,6 +15,7 @@ set(LOCAL_SOURCES
   lmdb-db.cc
   lmdb-env.cc
   lmdb-txn.cc
+  av-filter-graph.cc
   media-decode.cc
   image-metadata.cc
   media-line.cc
@@ -64,6 +65,7 @@ set(LOCAL_HEADERS
   lmdb-db.h
   lmdb-env.h
   lmdb-txn.h
+  av-filter-graph.h
   media-decode.h
   image-metadata.h
   media-line.h

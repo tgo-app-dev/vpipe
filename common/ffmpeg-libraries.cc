@@ -157,6 +157,23 @@ constexpr const char* kAvDeviceCandidates[] = {
   "libavdevice.so.58",
 };
 
+constexpr const char* kAvFilterCandidates[] = {
+  "libavfilter.dylib",
+  "libavfilter.11.dylib",
+  "libavfilter.10.dylib",
+  "libavfilter.9.dylib",
+  "libavfilter.8.dylib",
+  "libavfilter.7.dylib",
+  "/opt/homebrew/lib/libavfilter.dylib",
+  "/usr/local/lib/libavfilter.dylib",
+  "libavfilter.so",
+  "libavfilter.so.11",
+  "libavfilter.so.10",
+  "libavfilter.so.9",
+  "libavfilter.so.8",
+  "libavfilter.so.7",
+};
+
 constexpr const char* kSwResampleCandidates[] = {
   "libswresample.dylib",
   "libswresample.6.dylib",
@@ -288,6 +305,7 @@ LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(buffer_unref,        "av_buffer_unref");
   VPIPE_RESOLVE(hwdevice_ctx_create, "av_hwdevice_ctx_create");
   VPIPE_RESOLVE(hwframe_transfer_data, "av_hwframe_transfer_data");
+  VPIPE_RESOLVE(strdup,              "av_strdup");
 
 #undef VPIPE_RESOLVE
 }
@@ -520,6 +538,56 @@ LibSwScale::version_micro() const noexcept
 }
 
 // ---------------------------------------------------------------------
+// LibAvFilter
+// ---------------------------------------------------------------------
+
+LibAvFilter::LibAvFilter(const LogSinkIntf* s, LoadMode mode)
+  : LibraryHandle(s, find_first_loadable_(s, kAvFilterCandidates,
+                                          "libavfilter"),
+                  mode)
+{
+  if (!valid()) {
+    return;
+  }
+
+#define VPIPE_RESOLVE(F, N)                                            \
+  api.F = reinterpret_cast<decltype(api.F)>(this->require_symbol(N))
+
+  VPIPE_RESOLVE(version,                   "avfilter_version");
+  VPIPE_RESOLVE(get_by_name,               "avfilter_get_by_name");
+  VPIPE_RESOLVE(graph_alloc,               "avfilter_graph_alloc");
+  VPIPE_RESOLVE(graph_free,                "avfilter_graph_free");
+  VPIPE_RESOLVE(graph_alloc_filter,        "avfilter_graph_alloc_filter");
+  VPIPE_RESOLVE(init_str,                  "avfilter_init_str");
+  VPIPE_RESOLVE(graph_parse_ptr,           "avfilter_graph_parse_ptr");
+  VPIPE_RESOLVE(graph_config,              "avfilter_graph_config");
+  VPIPE_RESOLVE(inout_alloc,               "avfilter_inout_alloc");
+  VPIPE_RESOLVE(inout_free,                "avfilter_inout_free");
+  VPIPE_RESOLVE(buffersrc_add_frame_flags, "av_buffersrc_add_frame_flags");
+  VPIPE_RESOLVE(buffersink_get_frame,      "av_buffersink_get_frame");
+
+#undef VPIPE_RESOLVE
+}
+
+unsigned
+LibAvFilter::version_major() const noexcept
+{
+  return api.version ? (api.version() >> 16) & 0xff : 0;
+}
+
+unsigned
+LibAvFilter::version_minor() const noexcept
+{
+  return api.version ? (api.version() >> 8) & 0xff : 0;
+}
+
+unsigned
+LibAvFilter::version_micro() const noexcept
+{
+  return api.version ? api.version() & 0xff : 0;
+}
+
+// ---------------------------------------------------------------------
 // LibAvDevice
 // ---------------------------------------------------------------------
 
@@ -575,6 +643,10 @@ FFmpegLibraries::FFmpegLibraries(const LogSinkIntf*      s,
   // it isn't required for the existing rtsp/file pipelines, and many
   // bundled FFmpeg installs ship without it.
   , _avdevice(s, LibraryHandle::LoadMode::Optional)
+  // ...and avfilter for the same reason: the filter graphs are used by
+  // the resampling stages only, and a build without them should lose
+  // those stages rather than the pipeline.
+  , _avfilter(s, LibraryHandle::LoadMode::Optional)
 {
   // Funnel FFmpeg's own log emissions into session->log_verbose().
   // Process-wide effects: bumps the global log threshold to VERBOSE

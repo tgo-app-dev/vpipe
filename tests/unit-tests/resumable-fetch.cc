@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <netinet/in.h>
 #include <string>
@@ -527,6 +528,47 @@ TEST(resumable_fetch, an_unchecked_file_still_downloads) {
   string detail;
   EXPECT_TRUE(check_file_digest(dest, FileDigest{}, detail)
               == FileCheck::NotPublished);
+  srv.stop();
+}
+
+// A range arrives as one buffered GET, so without this hook nothing can
+// see it move until it is whole -- which is what left the parallel Xet
+// fetch's report standing still for seconds at a time while eight
+// transfers were in flight. What matters is that the counts arrive
+// DURING the transfer, not that they arrive at all.
+TEST(resumable_fetch, a_ranged_get_reports_bytes_as_they_arrive) {
+  ensure_curl_global_init();
+  const string body = blob_(1u << 20);
+  BlobServer   srv(body);
+  ASSERT_TRUE(srv.start());
+
+  vector<uint64_t>                 seen;
+  std::function<void(uint64_t)>    on_bytes =
+      [&](uint64_t got) { seen.push_back(got); };
+  string out;
+  long   status = 0;
+  string err;
+  ASSERT_TRUE(http_get_range(srv.url(), "", false, 0, 0, body.size() - 1,
+                             out, status, err, nullptr, &on_bytes));
+  EXPECT_TRUE(out.size() == body.size());
+  // libcurl hands the body over in ~16 KB pieces, so a megabyte is tens
+  // of calls. One call would mean the hook fires only at the end, which
+  // is the behaviour it exists to replace.
+  EXPECT_TRUE(seen.size() >= 8);
+  EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
+  EXPECT_TRUE(!seen.empty() && seen.back() == out.size());
+
+  // Each attempt counts ITSELF: a retried range starts over at zero
+  // rather than continuing the previous attempt's total. The Xet worker
+  // relies on that to hand back the credit it gave a transfer that
+  // died, instead of counting those bytes twice.
+  vector<uint64_t>              again;
+  std::function<void(uint64_t)> on_again =
+      [&](uint64_t got) { again.push_back(got); };
+  out.clear();
+  ASSERT_TRUE(http_get_range(srv.url(), "", false, 0, 0, body.size() - 1,
+                             out, status, err, nullptr, &on_again));
+  EXPECT_TRUE(!again.empty() && again.front() < seen.back());
   srv.stop();
 }
 

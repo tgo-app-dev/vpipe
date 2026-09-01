@@ -888,6 +888,110 @@ decode_audio_bytes(const FFmpegLibraries*  libs,
                             channels, error);
 }
 
+bool
+resample_pcm(const FFmpegLibraries* libs, const float* pcm, int channels,
+             int samples, int in_sample_rate, int out_sample_rate,
+             int out_channels, vector<float>* out, int* out_samples,
+             string* error)
+{
+  if (libs == nullptr || !libs->valid() || pcm == nullptr || out == nullptr) {
+    set_err_(error, "resample_pcm: null argument");
+    return false;
+  }
+  if (channels < 1 || channels > 2 || out_channels < 1 || out_channels > 2) {
+    set_err_(error, "resample_pcm: mono or stereo only");
+    return false;
+  }
+  if (samples <= 0 || in_sample_rate <= 0 || out_sample_rate <= 0) {
+    set_err_(error, "resample_pcm: needs positive geometry");
+    return false;
+  }
+  if (static_cast<size_t>(samples) / max(1, in_sample_rate) >
+      kMaxAudioSeconds) {
+    set_err_(error, "resample_pcm: longer than the "
+             + to_string(kMaxAudioSeconds) + " s cap");
+    return false;
+  }
+
+  AVChannelLayout in_layout = AV_CHANNEL_LAYOUT_MONO;
+  if (channels == 2) {
+    const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    in_layout = stereo;
+  }
+  AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+  if (out_channels == 2) {
+    const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    out_layout = stereo;
+  }
+  // PLANAR both ways, which is what makes this a pointer hand-off: the
+  // caller's planes go in as they are and the result needs no
+  // de-interleave afterwards.
+  SwrContext* sw = nullptr;
+  int rc = libs->swresample().api.alloc_set_opts2(
+      &sw,
+      &out_layout, AV_SAMPLE_FMT_FLTP, out_sample_rate,
+      &in_layout,  AV_SAMPLE_FMT_FLTP, in_sample_rate,
+      0, nullptr);
+  if (rc < 0 || sw == nullptr) {
+    set_err_(error, "swr_alloc_set_opts2 failed");
+    return false;
+  }
+  SwrPtr swr(sw, SwrDeleter{libs});
+  rc = libs->swresample().api.init(sw);
+  if (rc < 0) {
+    set_err_(error, "swr_init failed: " + av_err_(libs, rc));
+    return false;
+  }
+
+  // Ceiling plus the resampler's own delay, which it gives back on the
+  // flush pass below. Slack rather than an exact count: a short read is
+  // a truncated soundtrack and nothing reports it.
+  const int64_t cap =
+      (static_cast<int64_t>(samples) * out_sample_rate) / in_sample_rate
+      + 1024;
+  vector<float> buf(static_cast<size_t>(out_channels)
+                    * static_cast<size_t>(cap), 0.0f);
+  const uint8_t* src[2] = {
+      reinterpret_cast<const uint8_t*>(pcm),
+      reinterpret_cast<const uint8_t*>(pcm + static_cast<size_t>(samples))};
+  uint8_t* dst[2] = {
+      reinterpret_cast<uint8_t*>(buf.data()),
+      reinterpret_cast<uint8_t*>(buf.data() + static_cast<size_t>(cap))};
+  int n = libs->swresample().api.convert(swr.get(), dst,
+                                         static_cast<int>(cap), src, samples);
+  if (n < 0) {
+    set_err_(error, "swr_convert failed: " + av_err_(libs, n));
+    return false;
+  }
+  // Drain the filter's tail. Without it a short clip loses its last
+  // few milliseconds, which is inaudible and still shortens the latent
+  // count a model was told to expect.
+  if (n < cap) {
+    uint8_t* tail[2] = {dst[0] + static_cast<size_t>(n) * sizeof(float),
+                        dst[1] + static_cast<size_t>(n) * sizeof(float)};
+    const int m = libs->swresample().api.convert(
+        swr.get(), tail, static_cast<int>(cap - n), nullptr, 0);
+    if (m > 0) { n += m; }
+  }
+  if (n <= 0) {
+    set_err_(error, "resample_pcm: the conversion produced nothing");
+    return false;
+  }
+
+  // Compact: plane 1 was written at `cap`, and the planes have to end up
+  // adjacent at the LENGTH that came back.
+  out->assign(static_cast<size_t>(out_channels) * static_cast<size_t>(n),
+              0.0f);
+  for (int c = 0; c < out_channels; ++c) {
+    const float* p = buf.data() + static_cast<size_t>(c)
+                                    * static_cast<size_t>(cap);
+    copy(p, p + n, out->data() + static_cast<size_t>(c)
+                                     * static_cast<size_t>(n));
+  }
+  if (out_samples != nullptr) { *out_samples = n; }
+  return true;
+}
+
 optional<DecodedVideo>
 decode_video_file(const FFmpegLibraries* libs,
                   const string&          path,

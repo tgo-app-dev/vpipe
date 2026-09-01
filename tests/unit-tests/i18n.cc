@@ -43,6 +43,19 @@ TEST(i18n, localize_lookup_and_fallback) {
   EXPECT_TRUE(localize("en-us", "no.such.key") == "no.such.key");
 }
 
+// The header asks that this catalogue stay in step with the browser's
+// (apps/web-ui/web/js/i18n.js). Only one half of that is checkable from
+// here: that a key the web-ui's nav renders has a server string too, in
+// both Chinese locales. localize() returns the KEY when it has none.
+TEST(i18n, nav_keys_are_translated_in_both_chinese_locales) {
+  for (const char* k : {"nav.pipelines", "nav.profiler", "nav.io",
+                        "nav.database", "nav.files", "nav.composer",
+                        "nav.plugins", "nav.settings"}) {
+    EXPECT_TRUE(localize("zh-cn", k) != k);
+    EXPECT_TRUE(localize("zh-tw", k) != k);
+  }
+}
+
 TEST(i18n, session_language_get_set) {
   Session sess;
   EXPECT_TRUE(sess.language() == "en-us");           // default locale

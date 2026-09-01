@@ -154,6 +154,32 @@ decode_audio_bytes(const FFmpegLibraries*         libs,
                    std::string*                   error    = nullptr,
                    int                            channels = 1);
 
+// Resample PLANAR f32 PCM that is ALREADY DECODED onto another rate and
+// channel count, through the same swresample every decoder above uses.
+//
+// The decoders take a target rate because they are the one pass that
+// can: a file is demuxed, decoded and resampled together, and a second
+// resampler after them filters the waveform twice. This is for the
+// waveform that did NOT come through them -- one that arrived on a port
+// already at some producer's rate, where the choice is not "one pass or
+// two" but "the model's rate or the wrong one".
+//
+// `pcm` is planar [channels, samples]; `out` receives planar
+// [out_channels, *out_samples]. Both counts are 1 or 2. A no-op
+// conversion (same rate, same channels) still runs, so a caller need
+// not special-case it -- but it is cheap to skip and worth skipping.
+bool
+resample_pcm(const FFmpegLibraries* libs,
+             const float*           pcm,
+             int                    channels,
+             int                    samples,
+             int                    in_sample_rate,
+             int                    out_sample_rate,
+             int                    out_channels,
+             std::vector<float>*    out,
+             int*                   out_samples,
+             std::string*           error = nullptr);
+
 }
 
 #endif

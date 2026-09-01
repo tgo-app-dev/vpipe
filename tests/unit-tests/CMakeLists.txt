@@ -31,6 +31,7 @@ set(LOCAL_TEST_SOURCES
   lmdb-wrapper.cc
   lmdb.cc
   log-delegate.cc
+  av-filter-graph.cc
   media-decode.cc
   media-line.cc
   text-stream-chunk.cc
@@ -212,6 +213,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         temporal-slice-stage.cc
         vae-encode-range.cc
         temporal-stack-stage.cc
+        temporal-resample-stage.cc
+        audio-temporal-resample-stage.cc
         text-chat-stage.cc
         text-to-speech-stage.cc
         visual-qa-stage.cc

@@ -170,6 +170,15 @@ const VIEWS = [
 const SETTINGS = { id: 'settings', labelKey: 'nav.settings', icon: 'settings',
   mount: mountSettings };
 
+// The shell's own subtitle is static markup (it is painted before any
+// module runs, so the page never flashes an untranslated one); this
+// rewrites it once the catalogue is available, and again on a locale
+// change.
+function brandSub() {
+  const e = document.querySelector('#topbar .brand-sub');
+  if (e) { e.textContent = t('app.dashboard'); }
+}
+
 // A phone that was sent to the desktop layout (auto-detection overridden
 // from the drawer, or a stale `?ui=desktop`) has no other way back --
 // this shell has no drawer. Offer the return trip in the top bar, and
@@ -199,6 +208,7 @@ function main() {
     e.preventDefault();
   });
 
+  brandSub();
   phoneReturnButton();
   const nav = document.getElementById('nav');
   const view = document.getElementById('view');
@@ -233,7 +243,10 @@ function main() {
 
   // Re-render the nav and re-mount the current view when the UI language
   // changes (each view reads t() at mount time).
-  onLocaleChange(() => { if (current) { select(current); } });
+  onLocaleChange(() => {
+    brandSub();
+    if (current) { select(current); }
+  });
 
   // Bottom system status bar -- polls /api/system/status every 1 s
   // and survives the view-switching lifecycle (no mount/unmount, it

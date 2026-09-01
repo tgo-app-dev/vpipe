@@ -19,6 +19,9 @@ extern "C" {
 #include <libavutil/mem.h>
 #include <libavutil/rational.h>
 #include <libavutil/samplefmt.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -68,6 +71,7 @@ public:
     decltype(&::av_buffer_unref)        buffer_unref;
     decltype(&::av_hwdevice_ctx_create) hwdevice_ctx_create;
     decltype(&::av_hwframe_transfer_data) hwframe_transfer_data;
+    decltype(&::av_strdup)              strdup;
   } api{};
 };
 
@@ -180,6 +184,43 @@ public:
   } api{};
 };
 
+// libavfilter -- the filter graphs (`fps`, `tmix`, `minterpolate`,
+// `atempo`, `asetrate`, `aresample`, ...). Loaded Optional in the
+// composite for the same reason avdevice is: nothing in the older
+// capture/decode/encode paths needs it, and a trimmed FFmpeg build may
+// not ship it. A stage that wants a filter graph checks `valid()` on
+// this handle and says so when it is missing, rather than open-coding a
+// resampler of its own.
+//
+// The graph is driven through `avfilter_graph_alloc_filter` +
+// `avfilter_init_str` rather than `avfilter_graph_create_filter`, which
+// is deprecated from FFmpeg 7 on; the pair has been present since 4.x,
+// so it is the spelling that works across every build this dlopens.
+class LibAvFilter final : public LibraryHandle {
+public:
+  explicit LibAvFilter(const LogSinkIntf* log,
+                       LoadMode           mode = LoadMode::Optional);
+
+  unsigned version_major() const noexcept;
+  unsigned version_minor() const noexcept;
+  unsigned version_micro() const noexcept;
+
+  struct Api {
+    decltype(&::avfilter_version)             version;
+    decltype(&::avfilter_get_by_name)         get_by_name;
+    decltype(&::avfilter_graph_alloc)         graph_alloc;
+    decltype(&::avfilter_graph_free)          graph_free;
+    decltype(&::avfilter_graph_alloc_filter)  graph_alloc_filter;
+    decltype(&::avfilter_init_str)            init_str;
+    decltype(&::avfilter_graph_parse_ptr)     graph_parse_ptr;
+    decltype(&::avfilter_graph_config)        graph_config;
+    decltype(&::avfilter_inout_alloc)         inout_alloc;
+    decltype(&::avfilter_inout_free)          inout_free;
+    decltype(&::av_buffersrc_add_frame_flags) buffersrc_add_frame_flags;
+    decltype(&::av_buffersink_get_frame)      buffersink_get_frame;
+  } api{};
+};
+
 // libavdevice -- supplies platform input device demuxers (e.g.
 // "avfoundation" on macOS, "v4l2" / "alsa" on Linux). Loaded as
 // Optional in the FFmpegLibraries composite so installations without
@@ -229,6 +270,7 @@ public:
   const LibSwScale&    swscale()    const noexcept { return _swscale; }
   // Optional; check `valid()` on the returned handle.
   const LibAvDevice&   avdevice()   const noexcept { return _avdevice; }
+  const LibAvFilter&   avfilter()   const noexcept { return _avfilter; }
 
 private:
   // Only ever used to report; see LibraryHandle.
@@ -241,6 +283,7 @@ private:
   LibSwScale    _swscale;
   LibAvFormat   _avformat;
   LibAvDevice   _avdevice;
+  LibAvFilter   _avfilter;
 };
 
 }

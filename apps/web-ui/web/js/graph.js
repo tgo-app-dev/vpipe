@@ -23,7 +23,10 @@
 // reset it (pass a fresh {}) only on pipeline switch, which refits.
 
 import { el, svgEl } from './dom.js';
-import { tOr } from './i18n.js';
+// t() is aliased: this file has three locals called `t` (an SVG <title>,
+// an easing parameter, shortType's argument) and a shadowed import
+// would fail silently at whichever one is in scope.
+import { t as t_, tOr } from './i18n.js';
 
 const NODE_W    = 176;
 const COL_GAP   = 74;
@@ -90,6 +93,18 @@ export function shortType(t) {
 function truncate(s, n) {
   s = String(s);
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+// A port's translated doc. The overlay keys these `port.<type>.<name>`,
+// except where a stage names an input and an output alike -- there the
+// two docs are different text and get `port.<type>.in.<name>` /
+// `port.<type>.out.<name>`. Try the qualified key first; falling through
+// keeps the short key working for the ports that are unambiguous, and the
+// server's own English is the last resort.
+function portDoc(type, dir, pt) {
+  if (!pt.name) { return pt.doc || ''; }
+  const q = tOr('port.' + type + '.' + dir + '.' + pt.name, '');
+  return q || tOr('port.' + type + '.' + pt.name, pt.doc || '');
 }
 
 // `metrics` resolves per-node rendered-port counts:
@@ -617,7 +632,7 @@ export function renderGraph(graph, opts = {}) {
     animNodes.push({ g, id: n.id, toX: p.x, toY: p.y });
     if (n.config_error) {
       const t = svgEl('title');
-      t.textContent = 'Needs configuration: ' + n.config_error;
+      t.textContent = t_('pl.needs_config', { msg: n.config_error });
       g.append(t);
     }
     // Drag-to-move sets this so the release's trailing click doesn't also
@@ -754,8 +769,7 @@ export function renderGraph(graph, opts = {}) {
       pg.append(lbl);
       // Tooltip carries the full name + beat type + doc.
       const tip = svgEl('title');
-      const ptDoc = pt.name ? tOr('port.' + n.type + '.' + pt.name, pt.doc)
-                            : pt.doc;
+      const ptDoc = portDoc(n.type, 'in', pt);
       tip.textContent = (pt.name ? pt.name + '  ' : '')
           + '(' + shortType(pt.type) + ')'
           + (pt.tags ? '\ntags: ' + pt.tags : '')
@@ -802,9 +816,11 @@ export function renderGraph(graph, opts = {}) {
       lbl.textContent = truncate(shortType(pt.type), 12);
       pg.append(lbl);
       const otip = svgEl('title');
+      const otDoc = portDoc(n.type, 'out', pt);
       otip.textContent = (pt.name ? pt.name + '  ' : '')
           + '(' + shortType(pt.type) + ')'
-          + (pt.tags ? '\ntags: ' + pt.tags : '');
+          + (pt.tags ? '\ntags: ' + pt.tags : '')
+          + (otDoc ? '\n' + otDoc : '');
       pg.append(otip);
       if (editable) {
         const hit = svgEl('circle', { class: 'porthit', cx: NODE_W, cy: y,
@@ -832,7 +848,7 @@ export function renderGraph(graph, opts = {}) {
       plus.textContent = '+';
       pg.append(plus);
       const lbl = svgEl('text', { class: 'portlabel add', x: 8, y: y + 3 });
-      lbl.textContent = 'add input';
+      lbl.textContent = t_('pl.add_input');
       pg.append(lbl);
       const hit = svgEl('circle', { class: 'porthit', cx: 0, cy: y, r: 9 });
       hit.addEventListener('pointerdown', (ev) => ev.stopPropagation());
@@ -884,11 +900,11 @@ export function renderGraph(graph, opts = {}) {
     el('button', { class: 'graph-ctl', title,
       onclick: (e) => { e.stopPropagation(); fn(); } }, label);
   const controls = el('div', { class: 'graph-controls' },
-    ctl('−', 'Zoom out', () => zoomBy(1 / ZOOM_STEP)),
-    ctl('+', 'Zoom in', () => zoomBy(ZOOM_STEP)),
-    ctl('1:1', 'Actual size', () => setZoom(1)),
-    ctl('Fit', 'Fit whole pipeline', fit),
-    ctl('⊙', 'Center', center));
+    ctl('−', t_('pl.zoom_out'), () => zoomBy(1 / ZOOM_STEP)),
+    ctl('+', t_('pl.zoom_in'), () => zoomBy(ZOOM_STEP)),
+    ctl('1:1', t_('pl.actual_size'), () => setZoom(1)),
+    ctl('Fit', t_('pl.fit_all'), fit),
+    ctl('⊙', t_('pl.center'), center));
   // Auto-arrange: re-layout the graph tidily (drops manual placements).
   // Sits with the view controls; only shown when the caller wires it.
   if (opts.onAutoArrange) {

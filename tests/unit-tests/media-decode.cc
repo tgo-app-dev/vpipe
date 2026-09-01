@@ -265,6 +265,82 @@ TEST(media_decode, audio_bytes_to_planar_stereo) {
               er / static_cast<double>(n));
 }
 
+// resample_pcm is for the waveform that did NOT come through a decoder
+// -- one that arrived on a port at its producer's rate -- and the thing
+// it has to get right is the thing a length check cannot see: the PITCH.
+// Reinterpreting 44.1 kHz samples as 32 kHz produces a buffer of exactly
+// the right shape carrying a tone a fourth too high, which is what a
+// reference soundtrack fed to MiniMax-H3's 32 kHz audio VAE without this
+// was doing. So the assertion is the frequency, counted from zero
+// crossings, and not merely the sample count.
+TEST(media_decode, resample_pcm_keeps_the_pitch_and_the_planes) {
+  Session s;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = s.ffmpeg_libraries();
+  } catch (...) {
+    return;   // no FFmpeg on this box -- skip vacuously
+  }
+  if (!libs || !libs->valid()) { return; }
+
+  // One second at 44100: LEFT a 440 Hz sine, RIGHT a 220 Hz one. Two
+  // different tones so a swapped or duplicated plane is a failure and
+  // not a coincidence.
+  constexpr int kIn = 44100, kOut = 32000, kN = 44100;
+  vector<float> pcm(2 * kN);
+  for (int i = 0; i < kN; ++i) {
+    pcm[i]      = 0.5f * (float)std::sin(2.0 * M_PI * 440.0 * i / kIn);
+    pcm[kN + i] = 0.5f * (float)std::sin(2.0 * M_PI * 220.0 * i / kIn);
+  }
+  // Zero crossings per second == 2x the frequency of a pure tone.
+  auto hz = [](const float* p, int n, int rate) {
+    int cross = 0;
+    for (int i = 1; i < n; ++i) {
+      if ((p[i - 1] < 0.0f) != (p[i] < 0.0f)) { ++cross; }
+    }
+    return 0.5 * (double)cross * (double)rate / (double)n;
+  };
+  EXPECT_TRUE(std::fabs(hz(pcm.data(), kN, kIn) - 440.0) < 2.0);
+
+  vector<float> out;
+  int got = 0;
+  string err;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 2, kN, kIn, kOut, 2, &out,
+                           &got, &err));
+  // The length follows the RATIO, within the filter's edge slack.
+  EXPECT_TRUE(got > 31900 && got < 32100);
+  EXPECT_TRUE(out.size() == (size_t)2 * (size_t)got);
+  // ...and so does the pitch, which is the part that was wrong. Reading
+  // these samples at 32 kHz has to give 440 and 220 again; had they been
+  // reinterpreted rather than resampled it would read 606 and 303.
+  const double l = hz(out.data(), got, kOut);
+  const double r = hz(out.data() + got, got, kOut);
+  EXPECT_TRUE(std::fabs(l - 440.0) < 4.0);
+  EXPECT_TRUE(std::fabs(r - 220.0) < 4.0);
+  // Planar out, planar in: the two tones stayed in their own halves.
+  EXPECT_TRUE(std::fabs(l - r) > 100.0);
+
+  // Upsampling is the same call in the other direction.
+  vector<float> up;
+  int upn = 0;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 2, kN, kIn, 48000, 2, &up,
+                           &upn, &err));
+  EXPECT_TRUE(upn > 47800 && upn < 48200);
+  EXPECT_TRUE(std::fabs(hz(up.data(), upn, 48000) - 440.0) < 4.0);
+
+  // Mono in, mono out -- the plane arithmetic must not read past the
+  // single plane it was given.
+  vector<float> mono;
+  int mn = 0;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 1, kN, kIn, kOut, 1, &mono,
+                           &mn, &err));
+  EXPECT_TRUE(mono.size() == (size_t)mn);
+  EXPECT_TRUE(std::fabs(hz(mono.data(), mn, kOut) - 440.0) < 4.0);
+
+  std::printf("[media_decode] resample 44100->32000: %d samples, "
+              "L %.1f Hz, R %.1f Hz\n", got, l, r);
+}
+
 TEST(media_decode, video_file_frames_rate_and_bound) {
   Session s;
   const FFmpegLibraries* libs = nullptr;
