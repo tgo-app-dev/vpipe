@@ -193,10 +193,18 @@ class MetalFlux2Transformer {
     float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
   };
 
+  // How many adapters may ride the DiT at once. Two, because that is
+  // what a real request wants: a distillation or identity adapter beside
+  // a style one. They stay SEPARATE slots rather than one merged set of
+  // factors -- concatenating them on the rank axis is exact arithmetic
+  // and free in the forward, but it folds both strengths into A and so
+  // turns the live knob back into a rebuild. See lora::Stack.
+  static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
+
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -205,18 +213,25 @@ class MetalFlux2Transformer {
   static std::unique_ptr<MetalFlux2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
-  // How many projections carry a runtime adapter (0 = none attached).
-  int lora_modules() const { return _lora_modules; }
+  // How many projections carry a runtime adapter, summed over the slots
+  // that bound (0 = none attached).
+  int lora_modules() const;
+  // The same for ONE slot, so a caller can report which adapter took.
+  int lora_modules(int slot) const;
+  // Slots that bound. Indices below this are live; the rest are not.
+  int lora_slots() const { return static_cast<int>(_lora_slots.size()); }
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
   // rides the GEMM as a constant rather than being folded into A.
   // Turning it costs nothing and needs no reload. 0 skips both GEMMs, so
   // "off" is exactly off.
-  void set_lora_scale(float s) { _lora_scale = s; }
-  float lora_scale() const { return _lora_scale; }
+  // Per SLOT, because two adapters are two requests. An index past what
+  // bound is ignored.
+  void set_lora_scale(int slot, float s);
+  float lora_scale(int slot) const;
 
   // Every projection a runtime adapter can name, and the base dims its
   // factors have to fit, for a model of this shape.
@@ -620,13 +635,34 @@ class MetalFlux2Transformer {
   };
   static std::vector<DoubleLoraModule> lora_double_modules_(const Config& c);
   static std::vector<SingleLoraModule> lora_single_modules_(const Config& c);
-  bool bind_lora_(const LoraSpec& spec, std::string* err);
-  std::vector<DoubleLora> _lora_double;
-  std::vector<SingleLora> _lora_single;
+  // ONE attached adapter: its factors for both block stacks, its live
+  // strength, and its share of the [rows, rank] scratch.
+  struct LoraSlot {
+    std::vector<DoubleLora> dbl;
+    std::vector<SingleLora> sgl;
+    int   modules  = 0;
+    int   max_rank = 0;
+    float scale    = 1.0f;
+    // Ranks of the slots BEFORE this one. The scratch is [rows, sum of
+    // ranks], so this slot's region starts at `rows * rank_prefix` --
+    // which needs the row count, a forward-time number.
+    int   rank_prefix = 0;
+  };
+  bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // The live adapters for one projection of one block, named by the
+  // member that holds it. Two overloads because the two block stacks
+  // hold different structs.
+  genai::lora::Stack lora_at_(int block,
+                              genai::lora::Factors DoubleLora::*dst) const;
+  genai::lora::Stack lora_at_(int block,
+                              genai::lora::Factors SingleLora::*dst) const;
+  std::vector<LoraSlot>   _lora_slots;
   genai::lora::Applier    _lora;
-  int   _lora_modules  = 0;
-  int   _lora_max_rank = 0;
-  float _lora_scale    = 1.0f;
+  // Summed max ranks: what the scratch holds for all slots at once, and
+  // the stride that turns a rank prefix into an offset.
+  int         _lora_rank_total   = 0;
+  // Rows the scratch was last sized for. Set with it, read by lora_at_.
+  std::size_t _lora_scratch_rows = 0;
 
   // Steel flash-attention (head_dim 128, GQA-aware). Best-effort; scalar SDPA
   // fallback when absent or VPIPE_FLUX2_NO_STEEL_ATTN is set.

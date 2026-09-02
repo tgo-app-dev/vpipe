@@ -328,18 +328,37 @@ class MetalMiniMaxH3Transformer {
     QkvLayout qkv_layout = QkvLayout::kAuto;
   };
 
+  // How many adapters may ride the DiT at once.
+  //
+  // Two, because that is what a real request wants: a few-step Turbo
+  // distillation, which is a correction to the WHOLE model and belongs
+  // at the strength it was trained at, and a style or identity adapter,
+  // which is the thing actually being dialled. They stay SEPARATE slots
+  // rather than one merged set of factors because their strengths move
+  // independently -- concatenating them on the rank axis is exact
+  // arithmetic (A = [s1 A1; s2 A2], B = [B1 | B2]) and would be free in
+  // the forward, but it folds both strengths into A and so turns the
+  // live knob back into a rebuild, for the adapter most likely to be
+  // swept.
+  static constexpr int kMaxLoraSlots = 2;
+
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
-  // How many projections carry a runtime adapter (0 = none attached).
-  int lora_modules() const { return _lora_modules; }
+  // How many projections carry a runtime adapter, summed over the slots
+  // that bound (0 = none attached).
+  int lora_modules() const;
+  // The same for ONE slot, so a caller can report which adapter took.
+  int lora_modules(int slot) const;
+  // Slots that bound. Indices below this are live; the rest are not.
+  int lora_slots() const { return static_cast<int>(_lora.size()); }
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
@@ -348,8 +367,11 @@ class MetalMiniMaxH3Transformer {
   // difference between a knob and a rebuild, and the reason to prefer
   // the runtime path when a strength has to be swept. 0 skips the two
   // GEMMs entirely, so "off" is exactly off.
-  void set_lora_scale(float s) { _lora_scale = s; }
-  float lora_scale() const { return _lora_scale; }
+  // Per SLOT, because two adapters are two requests: the distillation is
+  // pinned where it was trained and the style one is the knob. An index
+  // past what bound is ignored.
+  void set_lora_scale(int slot, float s);
+  float lora_scale(int slot) const;
 
   // Where row `r` of part `pt` (0 = q, 1 = k, 2 = v) of a SPLIT adapter
   // lands in the fused [3 * inner] qkv output.
@@ -721,6 +743,19 @@ class MetalMiniMaxH3Transformer {
   // only until one of them moves.
   using LoraFactors = lora::Factors;
 
+  // The adapters attached to ONE projection, in slot order. Shared with
+  // every other family that takes one (generative-models/shared/
+  // runtime-lora.h) -- an ALIAS rather than a second definition, for the
+  // same reason LoraFactors is one.
+  //
+  // Built per call rather than cached per block: it is three words a
+  // slot on the stack, and the alternative is five of these per block
+  // holding a strength that a config beat can change between forwards.
+  using LoraStack = lora::Stack;
+  static_assert(kMaxLoraSlots <= lora::Stack::kMax,
+                "a slot the shared Stack cannot hold would be dropped "
+                "silently at the projection rather than at load");
+
   MetalMiniMaxH3Transformer() = default;
 
   // A Linear: either a dense bf16 [N, K] matrix or an MLX-affine
@@ -872,15 +907,18 @@ class MetalMiniMaxH3Transformer {
   // modality writes into its own contiguous slice of the one packed
   // sequence -- the reference's index_copy scatters are destination
   // offsets here.
-  // `lora`, when given, is applied to this projection: the adapter's
-  // first GEMM is encoded BEFORE the base one (the fused tile consumes
-  // its output), and its second is folded into the base tile where the
-  // route allows and encoded separately where it does not.
+  // `lora`, when given, is every adapter attached to this projection.
+  // Each one's first GEMM is encoded BEFORE the base one (the fused tile
+  // consumes its output); ONE of their second GEMMs is folded into the
+  // base tile where the route allows, and the rest are encoded
+  // separately. The base weight is read once either way -- what a second
+  // adapter costs is its own pair of skinny GEMMs, ~1.5% of the
+  // projection at rank 64.
   void gemm_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
              std::size_t y_off, int M, int N, int K,
-             const LoraFactors* lora = nullptr);
+             const LoraStack* lora = nullptr);
 
   // The [seq, rot/2] f32 cos/sin tables for a packed layout's (t, h, w)
   // grid. Rebuilt whenever the layout changes, which in a denoise loop
@@ -1070,12 +1108,38 @@ class MetalMiniMaxH3Transformer {
              !adaln.empty();
     }
   };
-  std::vector<BlockLora> _lora_blocks;    // per main block
-  std::vector<BlockLora> _lora_refiner;   // per refiner block (no adaln)
-  LoraFactors            _lora_final;     // final_layer.adaln_proj.linear
-  int                    _lora_modules = 0;
-  float                  _lora_scale = 1.0f;
-  int                    _lora_max_rank = 0;
+  // One attached adapter. Slots are independent all the way down: their
+  // own factors, their own live strength, and DISJOINT regions of the
+  // shared [rows, rank] scratch, so the second adapter's first GEMM does
+  // not have to wait on the first adapter's second.
+  struct LoraSlot {
+    std::vector<BlockLora> blocks;    // per main block
+    std::vector<BlockLora> refiner;   // per refiner block (no adaln)
+    LoraFactors            final_adaln;  // final_layer.adaln_proj.linear
+    int   modules  = 0;
+    int   max_rank = 0;
+    float scale    = 1.0f;
+    // Ranks of the slots BEFORE this one. The scratch is [seq, sum of
+    // ranks], so this slot's region starts at `rows * rank_prefix` --
+    // which needs the row count, and that is a forward-time number.
+    int   rank_prefix = 0;
+  };
+  std::vector<LoraSlot> _lora;
+  // Summed max ranks: what the [seq, rank] scratch has to hold for all
+  // of them at once, and the stride that turns a rank prefix into an
+  // offset.
+  int _lora_rank_total = 0;
+  // Rows the scratch was last allocated for. Set with it, read by
+  // lora_stack_ -- a stack built before any forward would have nowhere
+  // to point, and there is no forward without the scratch.
+  std::size_t _lora_scratch_rows = 0;
+
+  // The live adapters for one projection of one block, named by the
+  // member that holds it. `refiner` picks which stack of blocks.
+  LoraStack lora_stack_(bool refiner, int layer,
+                        LoraFactors BlockLora::* which) const;
+  // The same for final_layer.adaln_proj.linear, which is not in a block.
+  LoraStack lora_stack_final_() const;
   metal_compute::ComputeFunction _fn_gemm_acc;
   // The matrix-core twins of that pair. `_a64`/`_a128` scale on store and
   // serve the rank-wide first GEMM; `_b128`/`_b256` seed their register
@@ -1106,7 +1170,7 @@ class MetalMiniMaxH3Transformer {
 
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
-  bool bind_lora_(const LoraSpec& spec, std::string* err);
+  bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
   // Which matrix-core tile serves each half of the adapter, or nullptr
   // for "stay on steel". Split in two because the two GEMMs are skinny in
   // different dimensions and do not flip together -- see the measured
@@ -1119,19 +1183,21 @@ class MetalMiniMaxH3Transformer {
   // returns whether it APPLIED the strength -- only the matrix-core tile
   // can, and the answer decides both where the scale goes and whether the
   // fused base tile is legal at all (that tile has no scale of its own).
+  // `scale` is the SLOT's, passed rather than read off the object: with
+  // two adapters live there is no single current strength.
   bool lora_gemm_a_(metal_compute::ComputeEncoder& enc,
                     const metal_compute::SharedBuffer& x, std::size_t x_off,
-                    const LoraFactors& lf, int M, int K,
+                    const LoraFactors& lf, int M, int K, float scale,
                     std::size_t lora_off = 0);
   void lora_gemm_b_(metal_compute::ComputeEncoder& enc, const LoraFactors& lf,
                     const metal_compute::SharedBuffer& y, std::size_t y_off,
-                    int M, int N, bool scale_applied,
+                    int M, int N, bool scale_applied, float scale,
                     std::size_t lora_off = 0);
-  // Both halves back to back. The standalone form, for the modulation
-  // projections that do not go through gemm_.
+  // Every attached adapter, back to back. The standalone form, for the
+  // modulation projections that do not go through gemm_.
   void lora_apply_(metal_compute::ComputeEncoder& enc,
                    const metal_compute::SharedBuffer& x, std::size_t x_off,
-                   const LoraFactors& lf,
+                   const LoraStack& st,
                    const metal_compute::SharedBuffer& y, std::size_t y_off,
                    int M, int N, int K);
   // Whether the ff scratch still has to hold a [seq, 2*ffn] fc1 output.

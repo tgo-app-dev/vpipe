@@ -68,9 +68,36 @@ const ConfigKey kAttrs[] = {
           "on MiniMaxAI's weights. Only the fused projection is affected",
    .def_str = "auto"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
-   .doc = "adapter strength, folded into A at load. 1.0 is as trained and "
-          "is what the Turbo adapter is tuned for; nudge up for blurry "
-          "ghosting, down for over-sharp grain", .def_real = 1.0},
+   .doc = "adapter strength, per FORWARD. Live: a trigger-driven config "
+          "can sweep it across beats without a reload, and 0 skips the "
+          "adapter's two GEMMs so off is exactly off. 1.0 is as trained "
+          "and is what the Turbo adapter is tuned for; nudge up for "
+          "blurry ghosting, down for over-sharp grain", .def_real = 1.0},
+  {.key = "lora2", .type = ConfigType::String, .required = false,
+   .doc = "a SECOND runtime LoRA, applied alongside the first: every "
+          "adapted projection computes W x + s1 B1 (A1 x) + s2 B2 (A2 x). "
+          "The pairing this exists for is a few-step Turbo distillation "
+          "in `lora` -- a correction to the whole model, belonging at the "
+          "strength it was trained at -- and a style or identity adapter "
+          "here, which is the one actually being dialled. Nothing "
+          "distinguishes the slots though: either may hold either, and "
+          "the strengths move independently. Same accepted forms as "
+          "`lora`. Costs one more pair of skinny GEMMs, ~1.5% of a "
+          "projection at rank 64; the base weight is still read once. "
+          "LOAD-time like `lora`",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "minimax-h3-lora"},
+  {.key = "lora2_qkv_layout", .type = ConfigType::String, .required = false,
+   .doc = "the row order of `lora2`'s FUSED attn.qkv_proj, exactly as "
+          "`lora_qkv_layout` is for `lora`. Per slot because the order is "
+          "a property of the FILE: two adapters from different "
+          "publishers need different answers",
+   .def_str = "auto"},
+  {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
+   .doc = "`lora2`'s strength, per FORWARD and independent of "
+          "`lora_scale` -- which is the point of a second slot: the "
+          "distillation stays where it was trained while this one is "
+          "swept. 0 skips its two GEMMs", .def_real = 1.0},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -83,8 +110,9 @@ const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
-          "condition_timestep, condition_audio_timestep, audio_seconds}, for "
-          "a generate-video model_config iport",
+          "condition_timestep, condition_audio_timestep, audio_seconds, "
+          "+lora, +lora2 and their scales}, for a generate-video "
+          "model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -123,6 +151,9 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _lora          = attr_str("lora");
   _lora_scale    = attr_real("lora_scale");
   _lora_qkv      = attr_str("lora_qkv_layout");
+  _lora2         = attr_str("lora2");
+  _lora2_scale   = attr_real("lora2_scale");
+  _lora2_qkv     = attr_str("lora2_qkv_layout");
   // Deferred validation: the ctor never throws, so a nonsense number is
   // reported and the runtime skips the stage at launch. A non-positive
   // shift collapses the schedule to a single sigma, which generates
@@ -178,6 +209,17 @@ MiniMaxH3ModelConfigStage::resolved_config() const
                          FlexData::make_string(_lora_qkv));
     }
   }
+  // The second slot is independent of the first: `lora2` with no `lora`
+  // is a graph with one style adapter and no distillation, which is a
+  // perfectly ordinary request and not a hole to be filled.
+  if (!_lora2.empty()) {
+    o.insert_or_assign("lora2", FlexData::make_string(_lora2));
+    o.insert_or_assign("lora2_scale", FlexData::make_real(_lora2_scale));
+    if (!_lora2_qkv.empty()) {
+      o.insert_or_assign("lora2_qkv_layout",
+                         FlexData::make_string(_lora2_qkv));
+    }
+  }
   return fd;
 }
 
@@ -187,12 +229,15 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
   (void)fd;
   session()->info(fmt(
       "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
-      "t {:.3f}/{:.3f}, audio {}{}", this->id(), _video_shift, _audio_shift,
+      "t {:.3f}/{:.3f}, audio {}{}{}", this->id(), _video_shift,
+      _audio_shift,
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
                            : std::string("as long as the video"),
       _lora.empty() ? std::string()
-                    : fmt(", runtime LoRA at {:.2f}", _lora_scale)()));
+                    : fmt(", runtime LoRA at {:.2f}", _lora_scale)(),
+      _lora2.empty() ? std::string()
+                     : fmt(", second at {:.2f}", _lora2_scale)()));
 }
 
 VPIPE_REGISTER_STAGE(MiniMaxH3ModelConfigStage)

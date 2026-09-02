@@ -245,6 +245,50 @@ private:
 // smaller intermediate instead. Same product either way -- what must
 // never happen is BOTH, which is why the first call reports back whether
 // it took the scale.
+// The adapters attached to ONE projection, in slot order.
+//
+// A model may carry more than one runtime adapter at a time -- the
+// pairing that motivates it is a few-step distillation, which is a
+// correction to the whole model and belongs at the strength it was
+// trained at, beside a style or identity adapter, which is the one
+// actually being dialled. They stay SEPARATE slots rather than one
+// merged set of factors because their strengths move independently:
+// concatenating them on the rank axis is exact arithmetic (A = [s1 A1;
+// s2 A2], B = [B1 | B2]) and would be free in the forward, but it folds
+// both strengths into A and so turns the live knob back into a rebuild.
+//
+// `base` is the slot's own region of the [rows, rank] scratch. Whether
+// that is a CORRECTNESS requirement depends on the caller. Applier's own
+// loop runs each slot's pair back to back, so sharing one region would
+// only serialise them; a caller that issues every `t` first -- to let a
+// base tile fold one of them, as MiniMax-H3's gemm_ does -- must give
+// them disjoint regions or the last writer's intermediate is what every
+// B factor multiplies.
+struct Stack {
+  static constexpr int kMax = 2;
+  struct Use {
+    const Factors* f     = nullptr;
+    float          scale = 0.0f;
+    std::size_t    base  = 0;
+  };
+  Use s[kMax];
+  int n = 0;
+
+  bool empty() const { return n == 0; }
+  // An adapter that cannot or should not run is dropped HERE, so nothing
+  // downstream has to re-check it: a module the file did not touch, or a
+  // strength of zero -- a legitimate request (an A/B against the
+  // un-adapted model), and the cheapest way to serve it is to encode
+  // nothing, which also makes "off" exactly off rather than a pair of
+  // roundings that cancel.
+  void add(const Factors& f, float scale, std::size_t base)
+  {
+    if (n < kMax && !f.empty() && scale != 0.0f) {
+      s[n++] = {&f, scale, base};
+    }
+  }
+};
+
 class Applier {
 public:
   // Loads the tiles once. Safe to call on a box without matrix cores:
@@ -263,11 +307,25 @@ public:
   // (an A/B against the un-adapted model) and the cheapest way to serve
   // it is not to encode the GEMMs at all, so "off" is exactly off rather
   // than a pair of roundings that happen to cancel.
+  // `scratch_off` is where in the [rows, rank] intermediate this
+  // adapter's `t` goes, in ELEMENTS. Non-zero only when several slots
+  // are live, and then it is what keeps them from serialising on the
+  // same rows -- the caller sizes the scratch for the sum.
   void apply(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Factors& f,
              const metal_compute::SharedBuffer& y, std::size_t y_off,
-             int m, int n, int k, float scale, int mma_min_m);
+             int m, int n, int k, float scale, int mma_min_m,
+             std::size_t scratch_off = 0);
+
+  // Every adapter attached to one projection, back to back. They all
+  // accumulate onto the same y, and the order they land in does not
+  // matter because addition is what they do.
+  void apply(metal_compute::ComputeEncoder& enc,
+             const metal_compute::SharedBuffer& x, std::size_t x_off,
+             const Stack& st,
+             const metal_compute::SharedBuffer& y, std::size_t y_off,
+             int m, int n, int k, int mma_min_m);
 
 private:
   const metal_compute::ComputeFunction* route_a_(int rank) const;

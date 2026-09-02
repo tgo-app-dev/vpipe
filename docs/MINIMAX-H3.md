@@ -33,10 +33,21 @@ once, up front. Both copies exist while that runs:
 | Source repack (`Comfy-Org/MiniMax-H3`, bf16) | **~115 GB** |
 | Peak while preparing (source + output) | **~180 GB** |
 | 8-bit model, source deleted | **~65 GB** |
-| Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+33 GB** 8-bit or **+24 GB** 4-bit |
+| Adding the Ref2VA partition | **+66 GB** source, **+60 GB** 8-bit (~**+44 GB** at 4-bit) |
 
 Once preparation finishes you can delete the source repack and keep the
 ~65 GB. The 115 GB is a one-time cost, not a standing one.
+
+The Ref2VA row is the whole partition, not just its transformer, and that is
+worth reading twice. The *download* really does add only the 66 GB
+transformer — the prompt encoder and both VAEs are already on disk and are
+skipped. But the pipeline that prepares it **quantizes the encoder too**, into
+an output of its own, so what you end up holding is a second complete model:
+~33 GB of transformer plus ~27 GB of encoder at 8-bit. Only the components
+quantization leaves alone are hard-linked, and a re-quantized encoder is new
+bytes. The 4-bit figure is that same sum scaled by the transformer's own
+8-bit-to-4-bit ratio rather than a measurement; treat it as a budget, not a
+promise.
 
 **Why 8-bit and not 4.** Quality, at the price of disk and very little else.
 Both widths stream, so neither has to fit in RAM, and the transformer spends
@@ -45,6 +56,22 @@ are — so moving to 8-bit costs about 20 GB and does not meaningfully change
 how long a clip takes. The 4-bit path still works and is the one to take if
 the disk matters more: set `bits` to 4 in both `model-quantize` stages and
 name the output to match.
+
+**You do not have to quantize at all.** The downloaded bf16 repack is a
+complete, runnable model: point `model-select` straight at
+`Comfy-Org/MiniMax-H3-FL2VA` and skip [step 1](#step-1--prepare-the-model)'s
+quantize stages entirely. Nothing has to be told what width it is — the
+loader reads the per-tensor bit width out of the checkpoint, and a checkpoint
+that carries none is simply the dense bf16 path.
+
+What it costs is memory, and the cost is paid per step rather than once. The
+transformer is ~66 GB at bf16 against ~33 GB at 8-bit, so streaming it
+re-reads about twice the bytes on every forward pass, and the resident set —
+which grows into whatever RAM is spare, see [Memory](#memory) — holds
+proportionally fewer blocks between steps. On a memory-bounded box that is
+the whole difference: the same clip, more time in the storage path. Quantize
+when you are going to generate more than once; run the repack as it comes when
+you want to see the model work before spending the hours and the 115 GB.
 
 > **Keep the download and the output on one filesystem.** Components that
 > quantization does not touch (the VAEs) are **hard-linked** into the output
@@ -180,23 +207,25 @@ registry holding your model lives. Then open the URL it prints, load
 `minimax-h3-text-to-video.vpipeline`, edit the `text-prompt` stage, and press
 Start. The shipped prompt asks for both halves at once:
 
-> *An Asian musician playing classical music on a grand piano.*
+> *Cinematic video of a young Asian female pianist passionately playing a
+> grand piano.*
 
-The soundtrack is in that sentence: naming what is being *played* is what
-gives the model the music. There is no separate audio prompt — the sound
-comes from the same text — so describe the **sound** as well as the picture.
-Either name it outright (*"sound of the rain, with the occasional individual
-drop"*) or, as here, name the thing making it. A prompt that says only what a
-scene looks like gets you whatever the model thinks that scene sounds like.
+The soundtrack is in that sentence: naming the instrument is what gives the
+model the music. There is no separate audio prompt — the sound comes from the
+same text — so describe the **sound** as well as the picture. Either name it
+outright (*"sound of the rain, with the occasional individual drop"*) or, as
+here, name the thing making it. A prompt that says only what a scene looks
+like gets you whatever the model thinks that scene sounds like.
 
-The graph is eight stages:
+The graph is nine stages:
 
 ```
 text-prompt ──> diffusion-conditioner ──> generate-video ─┬─0─> vae-decode ──> rgb-to-video ─┐
                                                           │                                  ├─> save-video
                                                           └─1─> audio-vae-decode ────────────┘
 
-model-select ──> diffusion-conditioner, generate-video, vae-decode, audio-vae-decode
+model-select            ──> diffusion-conditioner, generate-video, vae-decode, audio-vae-decode
+minimax-h3-model-config ──> generate-video (port 9)
 ```
 
 `model-select` names the model once and every model-holding stage latches it,
@@ -227,6 +256,7 @@ From the `generate-video` stage:
 | `fps` | 24 | 124 frames ≈ 5.2 s; 56 ≈ 2.3 s. |
 | `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
+| `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
 And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
@@ -448,13 +478,17 @@ lines; the stage takes either.
 Four details in that shape are load-bearing. **One `load-video` feeds both
 streams**, so the clip and its soundtrack still leave one container together —
 the sync argument the `references` list was built on, kept rather than traded.
-**`attach_audio: [3]`** on the encoder makes port 3's audio the soundtrack of
-the reference before it, so it stays one `<Video 2>` + `<Audio 2>` pair instead
-of becoming a third, independent reference. **`channels: 2`** carries true stereo, which the
+**`attach_audio: [3]`** on the encoder makes **ref3**'s audio — the PCM on
+iport 4, the third reference — the soundtrack of the reference before it, so
+it stays one `<Video 2>` + `<Audio 2>` pair instead of becoming a third,
+independent reference. The number is a **reference** number in `1..6`, not an
+iport index: ref1 is iport 2. **`channels: 2`** carries true stereo, which the
 `references` path also does and a mono chain would silently give up.
-And **`max_mb: 384`** on the clip stacker is sized on purpose: 90 frames at
-1344 × 768 is 279 MB, over the 256 MB default, which would otherwise cap the
-group at 86 frames and warn.
+And **`max_mb: 384`** on the clip stacker is sized on purpose: the 124-frame
+clip step 2 writes is 366 MiB at 1344 × 768, over the 256 MiB default, which
+would otherwise cap the group at 86 frames and warn. Note how little headroom
+384 leaves — a longer reference clip needs a larger ceiling, or a `duration_s`
+on the `load-video`.
 
 MEASURED: this produces a request identical to the `references` list at every
 count that exists — 2 references, 3,115 conditioning rows, 13,120 reference
@@ -466,9 +500,9 @@ instead of the size control, leave the resamples at the source size and put
 `short_edge: 768` in the clip stacker's `sideband`.
 
 One inefficiency worth knowing: the encoder truncates a clip to `frames`, so
-this chain resizes all 90 frames and uses 39. The `references` list truncates
-first and resizes only what it keeps. Bound the source rather than raise
-`max_mb` if that matters.
+this chain resizes all 124 frames of the reference and uses 39. The
+`references` list truncates first and resizes only what it keeps. Bound the
+source rather than raise `max_mb` if that matters.
 
 ```sh
 cd ~/vpipe-work                                    # the work directory again
@@ -510,9 +544,9 @@ the clip. Making only `width`/`height` smaller would cut the 28% and leave the
 
 The **other** lever is the reference canvas itself. That 1344 × 768 is an
 *upscale* of a 960 × 544 file — 1.98× the pixels, interpolated from the same
-information — and `reference_video_short_edge: 0` declines it, encoding the
-clip at its own size instead. MEASURED on the shipped example, back to back on
-an idle 16 GB M5 at the same seed:
+information — and declining it is worth measuring. MEASURED back to back on an
+idle 16 GB M5 at the same seed, on the two-reference request the example
+builds:
 
 | | `768` (default) | `0` (the clip's own) |
 |---|---|---|
@@ -544,6 +578,16 @@ reference the model was trained to see upscaled is what it gives. `0` is worth
 *trying* where references are already smaller than 768 and the budget is
 tight — and worth **comparing side by side** before you keep it. The area cap
 still binds a clip larger than the canvas either way.
+
+**Which key you turn depends on the route.** `reference_video_short_edge` is
+the per-kind default, and it is only consulted for a reference whose size the
+encoder has to resolve — i.e. one from the `references` LIST. A reference on a
+port arrives with `short_edge: 0` already set (that is the port default, and
+it is the point of the ports), so the per-kind default is never reached. On
+**this** example, which is the ports route throughout, the `0` column above is
+what you get by resampling the clip to 960 × 544 in `size-clip`; setting
+`reference_video_short_edge` on the encoder would change nothing. The same
+goes for `reference_image_short_edge` and the still.
 
 As shipped — 960 × 544, 39 frames, 8 steps, one still and one clip — that is
 **23 min 54 s** on the fanless 16 GB M5 (the `references` list, same geometry,
@@ -602,8 +646,15 @@ land on different canvases, which is expected.
 
 Those defaults are the released checkpoint's, and all of them are worth knowing
 about because none is visible in the output. `reference_image_short_edge` in
-particular: at 2048 a single still is 121 VAE tiles, and nine are allowed. The
-example lowers it to 1024, which is 25.
+particular: at 2048 a single still is 121 VAE tiles, and nine are allowed; at
+1024 it is 25. Lower it on any graph that feeds stills through the
+`references` list.
+
+Both keys are per-kind defaults, so they apply to the `references` list only —
+a reference arriving on a port already carries its own `short_edge` and never
+reaches them. The example holds its still to 1024 with an `image-resample`
+stage instead, which is the ports route's equivalent and the reason it also
+carries a redundant `reference_image_short_edge: 1024`.
 
 You do not have to accept any of it silently. **Every reference the encoder
 had to reshape is warned about**, naming what was kept:
@@ -778,24 +829,36 @@ distils that down: usable video **and** synchronized audio at **4 steps**, and
 better still at 6–8. Past 8 it stops helping and starts to over-sharpen, so
 4–8 is the range. Keep `scale` at **1.0** — the adapter is tuned for it.
 
-It adapts the **FL2VA** partition (text-to-video and image-to-video), not
-Ref2VA. Two checkpoints are catalogued because the choice between them is
-real rather than a version bump:
+Most of these adapt the **FL2VA** partition (text-to-video and
+image-to-video), and lightx2v's line also covers **Ref2VA**. Six adapters are
+catalogued rather than one — eight entries, because lightx2v publishes two of
+them twice — since the choices between them are real rather than version
+bumps: a different training resolution, a different sigma grid, a different
+partition, a different decomposition of the same file.
 
-| entry | steps | shifts (v/a) | trained at | when |
-|---|---|---|---|---|
-| `Turbo few-step v4-600 EMA` (larryvrh) | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
-| `Turbo few-step v1-850 EMA` (larryvrh) | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
-| `Turbo 4-step v1.0 768p` (lightx2v) | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
-| `Turbo 8-step v1.0 544p` (lightx2v) | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
+| entry | partition | steps | shifts (v/a) | trained at | when |
+|---|---|---|---|---|---|
+| `Turbo few-step v4-600 EMA` (larryvrh) | FL2VA | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
+| `Turbo few-step v1-850 EMA` (larryvrh) | FL2VA | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
+| `Turbo 4-step v1.0 768p` (lightx2v) | FL2VA | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
+| `Turbo 8-step v1.0 544p` (lightx2v) | FL2VA | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
+| `Turbo 8-step v1.0 768p` (lightx2v) | FL2VA | 8 | **6** / 3 | 1344×768 | upstream's own default — LightX2V Studio serves this one. Also published **split**, which is the copy to prefer; see below. |
+| `Turbo 4-step v0.1` (lightx2v) | **Ref2VA** | 4 | 12 / 3 | 544p | the only adapter for the reference partition. Also published **split**. |
 
-**The shifts are part of the adapter, not a preference.** lightx2v's 4-step
-was distilled on a video shift of **6** where this model's default — and every
-other adapter here — is 12. A distillation is fit to the sigma grid it was
-trained on, so running it on the wrong one is not a style difference; it is a
-different schedule, and nothing will report it. `video_shift` lives on the same
-`minimax-h3-model-config` stage as `lora`, which is exactly why the two travel
-in one beat.
+**The shifts are part of the adapter, not a preference.** lightx2v's 768p
+checkpoints were distilled on a video shift of **6** where this model's
+default — and every adapter here not trained at 768p — is 12. A distillation is fit to the
+sigma grid it was trained on, so running it on the wrong one is not a style
+difference; it is a different schedule, and nothing will report it.
+`video_shift` lives on the same `minimax-h3-model-config` stage as `lora`,
+which is exactly why the two travel in one beat.
+
+**`-split` is the diffusers copy, and it is the better file.** lightx2v
+publishes each adapter twice — once fused for ComfyUI, once as the original
+split `to_q`/`to_k`/`to_v` export — and vpipe loads both. Prefer the split
+one: see [Which Turbo adapters work](#which-turbo-adapters-work) for why a
+published fusion is silently wrong on one of the two weight releases and a
+split file is right on both.
 
 #### Get it
 
@@ -811,18 +874,26 @@ it ships, so there is nothing to quantize afterwards.
 
 lightx2v's line is
 [`prepare-minimax-h3-turbo-lora-lightx2v.vpipeline`](pipelines/prepare-minimax-h3-turbo-lora-lightx2v.vpipeline),
-same shape, pinning `lightx2v/Minimax-h3-Turbo-4step-768p` (swap in
-`lightx2v/Minimax-h3-Turbo-8step` for the other). Only the **ComfyUI**
-spellings of that repo are catalogued: it publishes each adapter twice and the
-diffusers copy needs a conversion this build does not do — see *Which Turbo
-adapters work* below.
+same shape, pinning `lightx2v/Minimax-h3-Turbo-4step-768p`. Both of that
+repo's spellings are catalogued — it publishes each adapter twice, fused for
+ComfyUI and split for diffusers, and vpipe loads either. The full set of
+`model_variant` values:
+
+| variant | what |
+|---|---|
+| `lightx2v/Minimax-h3-Turbo-4step-768p` | FL2VA 4-step, shift 6 |
+| `lightx2v/Minimax-h3-Turbo-8step` | FL2VA 8-step, 544p, shift 12 |
+| `lightx2v/Minimax-h3-Turbo-8step-768p` | FL2VA 8-step, shift 6 |
+| `lightx2v/Minimax-h3-Turbo-8step-768p-split` | the same, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-ref2va-4step` | Ref2VA 4-step, 544p, shift 12 |
+| `lightx2v/Minimax-h3-Turbo-ref2va-4step-split` | the same, **split** — prefer this |
 
 `model_variant` is not optional here and its value is the catalogue **name**,
-not a word from the title. Both Turbo checkpoints are published from the one
-repo, so a bare `"turbo"` matches both and the fetch is refused with the
-candidates listed rather than quietly taking the first. Swap in
-`larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema` for the other one; they share a
-directory on disk and register under separate keys.
+not a word from the title. Every Turbo checkpoint of a repo is published from
+that one repo, so a bare `"turbo"` matches several and the fetch is refused
+with the candidates listed rather than quietly taking the first. For larryvrh
+that means swapping in `larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema` for the
+other one; they share a directory on disk and register under separate keys.
 
 The fetch **registers** the adapter under its catalogue name — an `owner/name`
 key like `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` — and that key is what the
@@ -893,11 +964,11 @@ of the 2.3× between them, leaving roughly **1.8×** to core count and memory
 — worth separating, because only the 1.25× is something better cooling could
 recover.
 
-Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
-mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on
-the M4 Pro, and an M5 run without it will be slower than 11 min 25 s. It works
-with the adapter, but it changes the picture by about as much as the adapter
-does, so turn one at a time when you are judging output rather than speed.
+Like every other pipeline here this one sets `i8_gemm` (see [the settings
+worth knowing](#the-settings-worth-knowing)). It does nothing on the M4 Pro,
+and an M5 run without it will be slower than 11 min 25 s. It works with the
+adapter, but it changes the picture by about as much as the adapter does, so
+turn one at a time when you are judging output rather than speed.
 
 There are two ways to apply it, and for this adapter they are not
 equivalent.
@@ -941,6 +1012,50 @@ which kernels the blocks are built with, so it cannot be swapped under a
 running DiT. A beat that changes the adapter after the DiT is built is
 reported and ignored rather than silently applied to the next clip; one that
 changes only the strength is applied.
+
+#### Two at once
+
+There are **two slots**. `lora2`, `lora2_scale` and `lora2_qkv_layout` are the
+second one, and they work exactly as the first three do:
+
+```json
+{
+  "id": "h3-config", "type": "minimax-h3-model-config", "iports": [],
+  "config": {
+    "lora":  "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+    "lora_scale": 1.0,
+    "lora2": "my-style-adapter",
+    "lora2_scale": 0.7
+  }
+}
+```
+
+Every adapted projection then computes `W x + s1 B1 (A1 x) + s2 B2 (A2 x)`.
+The pairing this exists for is a **few-step distillation** in the first slot —
+a correction to the whole model, belonging at the strength it was trained at —
+and a **style or identity adapter** in the second, which is the one you
+actually dial. Nothing in the model distinguishes the slots though: either may
+hold either, and `lora2` alone (no `lora`) is a perfectly ordinary request.
+
+**The strengths are independent, and both stay live.** That is the reason the
+two are separate slots rather than one merged set of factors. Merging is exact
+arithmetic — stack the factors on the rank axis, `A = [s1 A1; s2 A2]` and
+`B = [B1 | B2]`, and one adapter of rank `r1 + r2` computes the same sum for
+free — but it folds both strengths into `A`, which turns the live knob back
+into a rebuild for the adapter most likely to be swept.
+
+What a second adapter costs is **its own pair of skinny GEMMs**, about 1.5% of
+a projection at rank 64. The base weight is still read once, which is where the
+time actually goes. One caveat if you compare runs: the second adapter's
+delta accumulates onto the output in a separate bf16 pass, so *the same*
+adapter split across both slots at half strength is not bit-identical to one
+slot at full — **measured at 5.7e-3 of the output, flat across strengths**,
+which is one and a half bf16 ULPs and not a scale-dependent error. Two
+*different* adapters pay the same and have nothing to be compared against.
+
+`lora2` is load-time exactly as `lora` is, and `lora2_qkv_layout` is per slot
+because the fused-`qkv` row order is a property of the *file*: two adapters
+from different publishers need different answers.
 
 #### Merging, and why it loses most of this adapter
 
@@ -1000,14 +1115,26 @@ Measured against the FL2VA base:
 |---|---|---|
 | `larryvrh/MiniMax-H3-Turbo-Lora` | 259 (adds `adaln_proj`, `final_layer`) | yes, both paths |
 | `lightx2v/Minimax-h3-Turbo`, the `_comfyui_` files | 208 | yes, both paths |
-| `lightx2v/Minimax-h3-Turbo`, the diffusers files | 312 | **no** |
+| `lightx2v/Minimax-h3-Turbo`, the diffusers files | 312 | yes, both paths — **and these are the ones to hold** |
 
 The diffusers spelling is not a naming difference but a different
-decomposition: separate `to_q`/`to_k`/`to_v` adapters that would have to be
-stacked block-diagonally into the fused `qkv_proj`, and an `ff.net.0.proj`
-in diffusers' **value-first** order whose halves would need swapping. Both
-transforms produce a well-shaped, wrong model if guessed at, so they are
-refused rather than approximated.
+decomposition: separate `to_q`/`to_k`/`to_v` adapters stacked
+block-diagonally into the fused `qkv_proj`, and an `ff.net.0.proj` in
+diffusers' **value-first** order whose halves are swapped into this model's
+gate-first `mlp.fc1`. vpipe does both transforms at load, verified
+tensor-for-tensor against upstream's own ComfyUI conversion of the same
+adapter: `A` concatenates on the rank axis exactly, `B` is exactly
+block-diagonal, `fc1`'s halves are exactly swapped, `out_proj` and `fc2` are
+byte-identical, and alpha 8 over rank 128 is the same strength as the fused
+24 over 384.
+
+**Prefer the diffusers copy**, which is why both are catalogued. A *published*
+fusion is built for one qkv column grouping — flat, in every case that
+exists — so it is silently wrong on the other publisher's weights. Fusing from
+the split file happens against the DiT actually loaded, so it is right on
+both. It is also the smaller download, 1.38 GB against 1.96, the difference
+being the two thirds of a block-diagonal `B` that is zero. Not the smaller
+model: the fusion is rebuilt at load either way.
 
 lightx2v's `_comfyui_` `qkv_proj` is rank 384 — three rank-128 adapters
 stacked — and that stacking is how you can tell which base it assumes: its
@@ -1015,10 +1142,12 @@ stacked — and that stacking is how you can tell which base it assumes: its
 the Comfy-Org flat grouping, not the per-head release its `base_model` tag
 names.
 
-**On the released MiniMaxAI weights either path would be wrong.** The adapter
-is trained against Comfy-Org's repack, so its `attn.qkv_proj` delta assumes the
+**On the released MiniMaxAI weights a fused adapter would be wrong.** It is
+trained against Comfy-Org's repack, so its `attn.qkv_proj` delta assumes the
 flat grouping. Applied to the per-head release it would add one head's `q`
-delta onto another head's `k`, in all 50 blocks, with nothing to report.
+delta onto another head's `k`, in all 50 blocks, with nothing to report. This
+is exactly the case the split files do not have: their q, k and v arrive
+separately and are fused here, into whichever grouping the loaded DiT has.
 
 ## Memory
 

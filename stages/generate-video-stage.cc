@@ -38,6 +38,15 @@ namespace vpipe {
 
 namespace {
 
+// How many MiniMax-H3 runtime-LoRA slots this stage carries beats for.
+// Must not exceed MetalMiniMaxH3Transformer::kMaxLoraSlots, which is the
+// authority; it is repeated rather than referenced because this file's
+// slot bookkeeping lives outside the Apple-Silicon guard and the
+// transformer header does not exist on the other side of it. A stage
+// that named more than the DiT has slots would have its extras warned
+// about and dropped there, which is a message rather than a bug.
+constexpr int kH3LoraSlots = 2;
+
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "video model root. The layout is the resident family's own -- an "
@@ -947,40 +956,61 @@ GenerateVideoStage::apply_model_config_()
     // what took the whole stage down rather than leaving it inert.
     // family_of() and from_flex() above already tolerate it; this has to
     // as well.
-    std::string lp;
-    double      ls = _h3_lora_scale;
-    if (_model_cfg.is_object()) {
-      const auto o = _model_cfg.as_object();
-      lp = o.contains("lora") ? std::string(o.at("lora").as_string("")) : "";
-      ls = o.contains("lora_scale") ? o.at("lora_scale").as_real(1.0) : 1.0;
-      if (o.contains("lora_qkv_layout")) {
-        _h3_lora_qkv = std::string(o.at("lora_qkv_layout").as_string(""));
+    // Both adapter slots, read the same way. Slot 0 is the plain `lora`
+    // keys and slot 1 the `lora2` ones, so a graph that names one
+    // adapter reads exactly as it always did and a second is additive.
+    // Which is which is the CALLER's order, not a role the model knows:
+    // the usual pairing is a few-step Turbo distillation and a style or
+    // identity adapter, but nothing here depends on that.
+    static const char* const kKeys[kH3LoraSlots][3] = {
+      {"lora",  "lora_scale",  "lora_qkv_layout"},
+      {"lora2", "lora2_scale", "lora2_qkv_layout"},
+    };
+    _h3_lora.resize(kH3LoraSlots);
+    for (int i = 0; i < kH3LoraSlots; ++i) {
+      H3LoraSlot want = _h3_lora[(std::size_t)i];   // nothing said: keep
+      if (_model_cfg.is_object()) {
+        const auto o = _model_cfg.as_object();
+        // An object beat WITHOUT the key turns that slot OFF: the config
+        // source emits the keys only when set, so their absence is the
+        // graph saying it wants no adapter there.
+        want.path = o.contains(kKeys[i][0])
+            ? std::string(o.at(kKeys[i][0]).as_string("")) : "";
+        want.scale = o.contains(kKeys[i][1])
+            ? o.at(kKeys[i][1]).as_real(1.0) : 1.0;
+        if (o.contains(kKeys[i][2])) {
+          want.qkv = std::string(o.at(kKeys[i][2]).as_string(""));
+        }
       }
-    } else {
-      lp = _h3_lora;   // nothing said; keep what a previous beat set
-    }
-    // The two halves of "which adapter, how strong" have different
-    // lifetimes and this is where that shows. The PATH is load-time --
-    // an adapted mlp.fc1 rules out the fused-SwiGLU kernel, which is
-    // chosen before the blocks load -- so changing it under a built DiT
-    // is refused rather than half-applied. The STRENGTH is not: it rides
-    // the accumulating GEMM as a per-forward constant, so a trigger-
-    // driven config can sweep it across beats for the cost of a setter.
-    if (_h3_dit != nullptr && lp != _h3_lora) {
-      session()->warn(fmt(
-          "GenerateVideoStage('{}'): the DiT is already built, so the "
-          "model_config beat's `lora` is IGNORED -- it is a load-time "
-          "argument. `lora_scale` still applies", this->id()));
-    } else {
-      _h3_lora = lp;
-    }
-    if (ls != _h3_lora_scale) {
-      _h3_lora_scale = ls;
-      if (_h3_dit != nullptr && _h3_dit->lora_modules() > 0) {
-        _h3_dit->set_lora_scale((float)ls);
-        session()->log_debug(fmt(
-            "GenerateVideoStage('{}'): runtime LoRA strength -> {:.3f}",
-            this->id(), ls));
+      H3LoraSlot& have = _h3_lora[(std::size_t)i];
+      // The two halves of "which adapter, how strong" have different
+      // lifetimes and this is where that shows. The PATH is load-time --
+      // an adapted mlp.fc1 rules out the fused-SwiGLU kernel, which is
+      // chosen before the blocks load -- so changing it under a built
+      // DiT is refused rather than half-applied. The STRENGTH is not: it
+      // rides the accumulating GEMM as a per-forward constant, so a
+      // trigger-driven config can sweep it across beats for the cost of
+      // a setter -- PER SLOT, which is the point of having two: the
+      // distillation stays where it was trained while the style adapter
+      // is dialled.
+      if (_h3_dit != nullptr && want.path != have.path) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the DiT is already built, so the "
+            "model_config beat's `{}` is IGNORED -- it is a load-time "
+            "argument. `{}` still applies",
+            this->id(), kKeys[i][0], kKeys[i][1]));
+      } else {
+        have.path = want.path;
+        have.qkv  = want.qkv;
+      }
+      if (want.scale != have.scale) {
+        have.scale = want.scale;
+        if (_h3_dit != nullptr && _h3_dit->lora_modules(i) > 0) {
+          _h3_dit->set_lora_scale(i, (float)want.scale);
+          session()->log_debug(fmt(
+              "GenerateVideoStage('{}'): runtime LoRA slot {} strength "
+              "-> {:.3f}", this->id(), i, want.scale));
+        }
       }
     }
   } else {
@@ -1293,25 +1323,36 @@ GenerateVideoStage::ensure_expert_(int which)
     // .safetensors the loader opens. A key beats a directory scan
     // because both Turbo checkpoints of a repo land side by side, and
     // only the record says which one the key meant.
-    genai::MetalMiniMaxH3Transformer::LoraSpec lora;
-    if (!_h3_lora.empty()) {
-      std::string lerr;
-      lora.path = resolve_adapter_file(session(), _h3_lora, &lerr);
-      if (lora.path.empty()) {
-        session()->warn(fmt(
-            "GenerateVideoStage('{}'): {} -- generating WITHOUT the "
-            "adapter", this->id(), lerr));
-      }
-    }
-    lora.scale = (float)_h3_lora_scale;
-    // LOAD-time like the path: the rows are permuted once, at bind.
+    // One LoraSpec per named slot, in the order the graph named them --
+    // which is the order the DiT binds and the order `lora_scale(i)`
+    // addresses afterwards. A slot whose file cannot be resolved is
+    // DROPPED rather than left as a hole, so the surviving adapters keep
+    // consecutive indices and a strength beat still reaches them.
+    std::vector<genai::MetalMiniMaxH3Transformer::LoraSpec> loras;
     using QL = genai::MetalMiniMaxH3Transformer::LoraSpec::QkvLayout;
-    if (_h3_lora_qkv == "per_head") { lora.qkv_layout = QL::kPerHead; }
-    else if (_h3_lora_qkv == "flat") { lora.qkv_layout = QL::kFlat; }
-    else if (!_h3_lora_qkv.empty() && _h3_lora_qkv != "auto") {
-      session()->warn(fmt(
-          "GenerateVideoStage('{}'): lora_qkv_layout '{}' is not one of "
-          "auto / flat / per_head; using auto", this->id(), _h3_lora_qkv));
+    _h3_lora.resize(kH3LoraSlots);
+    for (int i = 0; i < kH3LoraSlots; ++i) {
+      const H3LoraSlot& sl = _h3_lora[(std::size_t)i];
+      if (sl.path.empty()) { continue; }
+      std::string lerr;
+      genai::MetalMiniMaxH3Transformer::LoraSpec spec;
+      spec.path = resolve_adapter_file(session(), sl.path, &lerr);
+      if (spec.path.empty()) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): {} -- generating WITHOUT that "
+            "adapter", this->id(), lerr));
+        continue;
+      }
+      spec.scale = (float)sl.scale;
+      // LOAD-time like the path: the rows are permuted once, at bind.
+      if (sl.qkv == "per_head") { spec.qkv_layout = QL::kPerHead; }
+      else if (sl.qkv == "flat") { spec.qkv_layout = QL::kFlat; }
+      else if (!sl.qkv.empty() && sl.qkv != "auto") {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): lora_qkv_layout '{}' is not one of "
+            "auto / flat / per_head; using auto", this->id(), sl.qkv));
+      }
+      loras.push_back(std::move(spec));
     }
     // NOTE for the pinned prefix: stream_pin_count now measures the
     // trunk but still assumes 1 GB of activation scratch, and this model
@@ -1322,7 +1363,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // beat and parks, or refuses, if the prefix turned out too generous.
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
-        stream_blocks, lora.path.empty() ? nullptr : &lora);
+        stream_blocks, loras);
     resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
       // A streamed DiT holds ~one block, not the checkpoint, so the

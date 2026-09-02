@@ -31,6 +31,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/runtime-lora.h"
 
 #include <algorithm>
 #include <cmath>
@@ -387,18 +388,19 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   // kSteelBm32 because route_ok_ accepts it unconditionally, so the pin
   // holds on a box with no matrix cores too.
   const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
-  auto arm_turned = [&](const MetalMiniMaxH3Transformer::LoraSpec* spec,
+  using Specs = std::vector<MetalMiniMaxH3Transformer::LoraSpec>;
+  auto arm_turned = [&](const Specs& specs,
                         float to, std::vector<float>* out, int* mods) {
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     *mods = m->lora_modules();
-    m->set_lora_scale(to);
+    m->set_lora_scale(0, to);
     return run(m.get(), out);
   };
-  auto arm = [&](const MetalMiniMaxH3Transformer::LoraSpec* spec,
+  auto arm = [&](const Specs& specs,
                  std::vector<float>* out, int* mods) {
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     *mods = m->lora_modules();
@@ -431,14 +433,14 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   MetalMiniMaxH3Transformer::LoraSpec one{lp, 1.0f};
   std::vector<float> v_off, v_zero, v_one, v_turned;
   int m_off = 0, m_zero = 0, m_one = 0, m_turned = 0;
-  ASSERT_TRUE(arm(nullptr, &v_off, &m_off));
-  ASSERT_TRUE(arm(&zero, &v_zero, &m_zero));
-  ASSERT_TRUE(arm(&one, &v_one, &m_one));
+  ASSERT_TRUE(arm({}, &v_off, &m_off));
+  ASSERT_TRUE(arm({zero}, &v_zero, &m_zero));
+  ASSERT_TRUE(arm({one}, &v_one, &m_one));
   // The strength is a per-forward constant, so an adapter loaded at 0
   // and TURNED UP has to land on the same velocity as one loaded at 1.
   // That is the claim that makes it a knob rather than a load argument,
   // and it is exactly what a scale folded into A at bind would fail.
-  ASSERT_TRUE(arm_turned(&zero, 1.0f, &v_turned, &m_turned));
+  ASSERT_TRUE(arm_turned({zero}, 1.0f, &v_turned, &m_turned));
   EXPECT_TRUE(m_off == 0);
   EXPECT_TRUE(m_zero > 0 && m_one == m_zero);
 
@@ -461,6 +463,283 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   EXPECT_TRUE(at_zero == 0.0);
   EXPECT_TRUE(at_one > 1e-3);
   EXPECT_TRUE(turned == 0.0);
+}
+
+// The fused-SwiGLU gate has to ask in BOTH of fc1's spellings.
+//
+// An adapter on `mlp.fc1` and the fused SwiGLU are mutually exclusive --
+// the fused epilogue writes silu(gate)*up straight out of the
+// accumulator, leaving nowhere for a pre-activation delta -- and load()
+// settles that before any block is built, by looking for the factor
+// tensors in the FILE. It used to look only for `.mlp.fc1.lora_`, which
+// is the ComfyUI spelling. bind_lora_ also reaches fc1 from the
+// DIFFUSERS decomposition, where the same projection is `ff.net.0.proj`,
+// so such a file left the fusion on and had its fc1 delta silently
+// dropped.
+//
+// WHAT THIS PINS is the needle, not the consequence: reaching the
+// consequence needs a box where the fusion is on at all, and a
+// matrix-core GPU turns it off unconditionally (see _use_mma2 in
+// load()), which is why the gap went unseen. The two EXPECTs below are
+// the whole reason the second needle exists.
+TEST(minimax_h3_lora, both_fc1_spellings_reach_the_fused_swiglu_gate)
+{
+  const fs::path dir = fs::temp_directory_path() / "vpipe-h3-fc1-needle";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const fs::path comfy = dir / "comfy.safetensors";
+  const fs::path diff  = dir / "diffusers.safetensors";
+  const int R = 2, K = 4, N = 8;
+  ASSERT_TRUE(write_st_(comfy, {
+      {"blocks.0.mlp.fc1.lora_A.weight", {R, K}, ramp_(R * K, 1.1f, 0.25f)},
+      {"blocks.0.mlp.fc1.lora_B.weight", {N, R}, ramp_(N * R, 0.9f, 0.25f)},
+  }, ""));
+  ASSERT_TRUE(write_st_(diff, {
+      {"transformer_blocks.0.ff.net.0.proj.lora_A.default.weight", {R, K},
+       ramp_(R * K, 1.1f, 0.25f)},
+      {"transformer_blocks.0.ff.net.0.proj.lora_B.default.weight", {N, R},
+       ramp_(N * R, 0.9f, 0.25f)},
+  }, ""));
+  using A = genai::lora::Adapter;
+  EXPECT_TRUE(A::file_touches(comfy.string(), ".mlp.fc1.lora_"));
+  // The gap: the diffusers copy adapts the same projection under
+  // another name, and the old single needle could not see it.
+  EXPECT_FALSE(A::file_touches(diff.string(), ".mlp.fc1.lora_"));
+  EXPECT_TRUE(A::file_touches(diff.string(), ".ff.net.0.proj.lora_"));
+  fs::remove_all(dir, ec);
+}
+
+// TWO adapters ride together, and their strengths are independent.
+//
+// The claim a second slot has to earn is LINEARITY: every adapted
+// projection computes W x + s1 B1 (A1 x) + s2 B2 (A2 x), so with the
+// same file in both slots the deltas must ADD. That is checkable with
+// one adapter file, which is what a test box has -- half strength twice
+// has to land where full strength once does, and two at full strength
+// where one at double does.
+//
+// Independence is the other half, and it is the reason the slots are not
+// merged into one set of factors at bind: concatenating them on the rank
+// axis is exact arithmetic and free in the forward, but it folds both
+// strengths into A and takes the live knob away. So the load-at-1-and-
+// turn-one-down arm is not a refinement of the linearity check -- it is
+// the property the design is built around.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_MINIMAX_H3_TURBO_LORA.
+TEST(minimax_h3_lora, two_adapters_add_and_are_dialled_apart)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_MINIMAX_H3_TURBO_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  // Same pin and same split-FF reasoning as
+  // runtime_adapter_is_off_at_zero_and_on_at_one: with the route and the
+  // FF path fixed, the adapters are the only variable left.
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  using Specs = std::vector<MetalMiniMaxH3Transformer::LoraSpec>;
+  int mods0 = 0, mods1 = 0, mods_all = 0, slots = 0;
+  auto arm = [&](const Specs& specs, const std::vector<float>& turn,
+                 std::vector<float>* out) {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(kPin);
+    for (std::size_t i = 0; i < turn.size(); ++i) {
+      m->set_lora_scale((int)i, turn[i]);
+    }
+    slots    = m->lora_slots();
+    mods0    = m->lora_modules(0);
+    mods1    = m->lora_modules(1);
+    mods_all = m->lora_modules();
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    out->resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  // A SECOND, DIFFERENT adapter, synthesised against this DiT's own
+  // dimensions. The linearity arms below use one file in both slots,
+  // which cannot see whether the slots share a scratch region: with the
+  // same A on both sides, one overwriting the other's [rows, rank]
+  // intermediate is invisible. Two different files make the swap arm
+  // below discriminating.
+  const fs::path syn_dir = fs::temp_directory_path() / "vpipe-h3-lora2";
+  std::error_code sec;
+  fs::remove_all(syn_dir, sec);
+  fs::create_directories(syn_dir, sec);
+  const fs::path syn = syn_dir / "other.safetensors";
+  {
+    const int R = 8, HH = cfg.hidden, II = cfg.inner();
+    std::vector<Tensor> ts;
+    for (int i = 0; i < cfg.n_layers; ++i) {
+      const std::string p = "blocks." + std::to_string(i) + ".attn.out_proj";
+      ts.push_back({p + ".lora_A.weight", {R, II},
+                    ramp_((std::size_t)R * II, 0.013f, 0.30f)});
+      ts.push_back({p + ".lora_B.weight", {HH, R},
+                    ramp_((std::size_t)HH * R, 0.021f, 0.30f)});
+    }
+    ASSERT_TRUE(write_st_(syn, ts, ""));
+  }
+  const MetalMiniMaxH3Transformer::LoraSpec other{syn.string(), 1.0f};
+
+  const MetalMiniMaxH3Transformer::LoraSpec half{lp, 0.5f};
+  const MetalMiniMaxH3Transformer::LoraSpec one{lp, 1.0f};
+  const MetalMiniMaxH3Transformer::LoraSpec two{lp, 2.0f};
+  const MetalMiniMaxH3Transformer::LoraSpec four{lp, 4.0f};
+  const MetalMiniMaxH3Transformer::LoraSpec eight{lp, 8.0f};
+  std::vector<float> v_four, v_eight, v_44;
+  std::vector<float> v_off, v_one, v_two, v_half_half, v_one_one, v_dialled;
+  ASSERT_TRUE(arm({}, {}, &v_off));
+  EXPECT_TRUE(slots == 0 && mods_all == 0);
+  ASSERT_TRUE(arm({one}, {}, &v_one));
+  const int one_mods = mods_all;
+  EXPECT_TRUE(slots == 1 && one_mods > 0);
+  ASSERT_TRUE(arm({two}, {}, &v_two));
+
+  // Both slots bind, and the totals are the sum rather than the last one
+  // to write a member -- which is what the single-slot members did.
+  ASSERT_TRUE(arm({half, half}, {}, &v_half_half));
+  EXPECT_TRUE(slots == 2);
+  EXPECT_TRUE(mods0 == one_mods && mods1 == one_mods);
+  EXPECT_TRUE(mods_all == 2 * one_mods);
+  ASSERT_TRUE(arm({one, one}, {}, &v_one_one));
+  // Loaded at full in BOTH and the second turned to zero afterwards:
+  // the first slot must still be at full. This is the arm that fails if
+  // the two slots share a strength, or if slot 1's scratch region
+  // overlaps slot 0's and its zeroed GEMM scribbles on the other's
+  // intermediate.
+  ASSERT_TRUE(arm({one, one}, {1.0f, 0.0f}, &v_dialled));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+
+  // ORDER DOES NOT MATTER, and that is the arm that says the slots have
+  // their own scratch. Addition commutes, so naming the two adapters
+  // either way round is the same function -- but if both slots wrote
+  // their [rows, rank] intermediate to the same place, the LAST one's
+  // would be what both B factors multiply, and the two orders would
+  // compute two different (wrong) things.
+  std::vector<float> v_ab, v_ba;
+  ASSERT_TRUE(arm({one, other}, {}, &v_ab));
+  EXPECT_TRUE(slots == 2 && mods1 > 0);
+  ASSERT_TRUE(arm({other, one}, {}, &v_ba));
+  ASSERT_TRUE(arm({four}, {}, &v_four));
+  ASSERT_TRUE(arm({eight}, {}, &v_eight));
+  ASSERT_TRUE(arm({four, four}, {}, &v_44));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+
+  const double d_one  = rel(v_one, v_off);
+  const double d_two  = rel(v_two, v_off);
+  const double add_hh = rel(v_half_half, v_one);
+  const double add_11 = rel(v_one_one, v_two);
+  const double add_44 = rel(v_44, v_eight);
+  const double apart  = rel(v_four, v_eight);
+  const double solo   = rel(v_dialled, v_one);
+  const double swap   = rel(v_ab, v_ba);
+  const double other_moves = rel(v_ab, v_one);
+  std::printf("[minimax_h3_lora] two slots: %d+%d=%d modules | 1.0 moves "
+              "%.3e, 2.0 moves %.3e | halves vs whole: 0.5+0.5 %.3e, 1+1 "
+              "%.3e, 4+4 %.3e (4 vs 8 is %.3e away) | second dialled to 0 "
+              "vs one alone %.3e\n",
+              mods0, mods1, mods_all, d_one, d_two, add_hh, add_11, add_44,
+              apart, solo);
+  std::printf("[minimax_h3_lora] two DIFFERENT adapters: swapping the "
+              "slots moves %.3e; the second one moves %.3e\n", swap,
+              other_moves);
+  // The adapter has to be DOING something, or the sums below are three
+  // ways of comparing zero to zero.
+  EXPECT_TRUE(d_one > 1e-3 && d_two > d_one);
+
+  // TWO SLOTS ADD. `s` in one slot and `s` in the other is the same
+  // arithmetic as `2s` in one -- W x + s BAx + s BAx against
+  // W x + 2s BAx -- so the two runs differ only in rounding, and the
+  // discriminating question is whether the pair lands on the SUM or on
+  // one of its halves.
+  //
+  // At 4+4 the pair is 7.6e-3 from the sum where the single adapter is
+  // 8.5e-2 away: eleven times closer, which no dropped or overwritten
+  // slot could be.
+  EXPECT_TRUE(add_44 < 0.1 * apart);
+  // The residual is NOT an error that grows with strength. MEASURED at
+  // three scales it is FLAT -- 5.7e-3 at 0.5+0.5, 6.6e-3 at 1+1, 7.6e-3
+  // at 4+4, while the delta itself goes 1.9e-2 -> 3.8e-2 -> 1.6e-1 --
+  // which is the signature of a fixed number of bf16 roundings of y and
+  // not of a scale-dependent mistake. Splitting ONE adapter across two
+  // slots costs about one and a half bf16 ULPs of the output (eps is
+  // 2^-8 = 3.9e-3); two DIFFERENT adapters, which is the case this
+  // exists for, pay the same and have nothing to be compared against.
+  EXPECT_TRUE(add_hh < 0.02 && add_11 < 0.02 && add_44 < 0.02);
+  // And turning the second slot off leaves the first exactly where it
+  // was: no kernels are encoded for a slot at zero, so this is the same
+  // run and not a near miss. The arm that fails if the slots share a
+  // strength, or if slot 1's scratch region overlaps slot 0's.
+  EXPECT_TRUE(solo == 0.0);
+  // The second adapter has to be reaching the output, or the swap below
+  // compares a run with itself.
+  EXPECT_TRUE(other_moves > 1e-3);
+  // Two accumulates onto y in the other order: bf16, so a ULP or two.
+  // MEASURED 4.7e-3, which is one bf16 eps (2^-8 = 3.9e-3) of the
+  // output and does NOT shrink as the adapters get stronger -- a
+  // rounding floor, not a scale-dependent error. A shared scratch would
+  // make the two orders compute different FUNCTIONS (the last slot's
+  // intermediate is what both B factors would multiply), which lands an
+  // order of magnitude above this.
+  EXPECT_TRUE(swap < 0.01);
+  EXPECT_TRUE(other_moves > 10.0 * swap);
+  fs::remove_all(syn_dir, sec);
 }
 
 // The adapter's matrix-core route must agree with the steel pair.
@@ -520,7 +799,9 @@ TEST(minimax_h3_lora, runtime_adapter_routes_agree)
   const int n_video = (int)L.video_indices.size();
   auto ramp = [](std::size_t n, float k) {
     std::vector<float> v(n);
-    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
     return v;
   };
   const metal_compute::SharedBuffer vb = to_bf16_buf_(
@@ -551,7 +832,7 @@ TEST(minimax_h3_lora, runtime_adapter_routes_agree)
     if (steel_lora) { ::setenv("VPIPE_H3_NO_LORA_MMA", "1", 1); }
     else            { ::unsetenv("VPIPE_H3_NO_LORA_MMA"); }
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, kScale};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, &spec);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, {spec});
     if (m == nullptr) { return false; }
     if (base != Route::kAuto) { m->set_gemm_route(base); }
     *mods = m->lora_modules();
@@ -576,8 +857,7 @@ TEST(minimax_h3_lora, runtime_adapter_routes_agree)
   // would agree perfectly.
   auto base_arm = [&](std::vector<float>* out) {
     ::unsetenv("VPIPE_H3_NO_LORA_MMA");
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false,
-                                             nullptr);
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, {});
     if (m == nullptr) { return false; }
     m->set_gemm_route(Route::kMma128);
     MetalMiniMaxH3Transformer::Step step;
@@ -922,8 +1202,10 @@ TEST(minimax_h3_lora, runtime_adapter_survives_i8_gemm)
     MetalMiniMaxH3Transformer::Config c = cfg;
     c.i8_gemm = i8;
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, 1.0f};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, c, false,
-                                             lora ? &spec : nullptr);
+    auto m = MetalMiniMaxH3Transformer::load(
+        root, mc, c, false,
+        lora ? std::vector<MetalMiniMaxH3Transformer::LoraSpec>{spec}
+             : std::vector<MetalMiniMaxH3Transformer::LoraSpec>{});
     if (m == nullptr) { return false; }
     // Pin the base tile: the route tuner's own vote moves the velocity by
     // about what i8 does, so an unpinned arm measures the wrong thing.
@@ -1047,15 +1329,17 @@ TEST(minimax_h3_lora, baked_adaln_keeps_the_adapter_live)
                  std::vector<float>* out) {
     MetalMiniMaxH3Transformer::LoraSpec spec{lp, turn_to >= 0.0f ? 0.0f
                                                                 : scale};
-    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false,
-                                             lora ? &spec : nullptr);
+    auto m = MetalMiniMaxH3Transformer::load(
+        root, mc, cfg, false,
+        lora ? std::vector<MetalMiniMaxH3Transformer::LoraSpec>{spec}
+             : std::vector<MetalMiniMaxH3Transformer::LoraSpec>{});
     if (m == nullptr) { return false; }
     m->set_gemm_route(kPin);
     if (bake) {
       std::string berr;
       if (!m->bake_adaln(sched, &berr)) { return false; }
     }
-    if (turn_to >= 0.0f) { m->set_lora_scale(turn_to); }
+    if (turn_to >= 0.0f) { m->set_lora_scale(0, turn_to); }
     out->clear();
     for (int i = 0; i < kSteps; ++i) {
       MetalMiniMaxH3Transformer::Step st;

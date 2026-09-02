@@ -248,14 +248,20 @@ private:
   // reads it is not known until the checkpoint resolves, and a config
   // beat can arrive before the model does.
   FlexData _model_cfg;
-  // A runtime LoRA for the MiniMax-H3 DiT, off the model_config beat.
-  // Load-time, not per-step: see the LoraSpec note in the transformer.
-  std::string _h3_lora;
-  double      _h3_lora_scale = 1.0;
-  // "auto" | "flat" | "per_head" from the model_config beat; empty is
-  // auto. LOAD-time, like the adapter path: the rows are permuted once
-  // at bind, not per forward.
-  std::string _h3_lora_qkv;
+  // The runtime LoRA SLOTS for the MiniMax-H3 DiT, off the model_config
+  // beat, in the order the DiT binds them. Two, so a few-step Turbo
+  // distillation and a style or identity adapter can ride together --
+  // see kMaxLoraSlots in the transformer. The PATH is load-time; the
+  // STRENGTH is not, and each slot's moves on its own.
+  struct H3LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+    // "auto" | "flat" | "per_head"; empty is auto. LOAD-time like the
+    // path -- the rows are permuted once at bind, not per forward -- and
+    // per SLOT because the row order is a property of the FILE.
+    std::string qkv;
+  };
+  std::vector<H3LoraSlot> _h3_lora;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;

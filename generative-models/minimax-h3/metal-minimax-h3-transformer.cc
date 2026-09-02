@@ -1056,7 +1056,7 @@ MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
                                         const SharedBuffer& x,
                                         std::size_t x_off,
                                         const LoraFactors& lf, int M, int K,
-                                        std::size_t lora_off)
+                                        float scale, std::size_t lora_off)
 {
   const int r = lf.rank;
   const bool mma = _use_mma2 && M >= _mma_min_m;
@@ -1078,7 +1078,7 @@ MetalMiniMaxH3Transformer::lora_gemm_a_(ComputeEncoder& enc,
   enc.set_constant(6, M);
   enc.set_constant(7, 0);
   if (fa != nullptr) {
-    enc.set_constant(8, _lora_scale);
+    enc.set_constant(8, scale);
     const int BN = (fa == &_fn_lora_a128) ? 128 : 64;
     const unsigned tw = (BN == 128) ? 256u : 128u;
     enc.dispatch({(unsigned)(((r + BN - 1) / BN) * tw),
@@ -1095,7 +1095,7 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
                                         const LoraFactors& lf,
                                         const SharedBuffer& y,
                                         std::size_t y_off, int M, int N,
-                                        bool scale_applied,
+                                        bool scale_applied, float scale,
                                         std::size_t lora_off)
 {
   const int r = lf.rank;
@@ -1113,7 +1113,7 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
   enc.set_constant(5, N);
   enc.set_constant(6, M);
   enc.set_constant(7, 0);
-  enc.set_constant(8, scale_applied ? 1.0f : _lora_scale);
+  enc.set_constant(8, scale_applied ? 1.0f : scale);
   if (fb != nullptr) {
     const int BN = (fb == &_fn_lora_b256) ? 256 : 128;
     enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
@@ -1128,18 +1128,86 @@ void
 MetalMiniMaxH3Transformer::lora_apply_(ComputeEncoder& enc,
                                        const SharedBuffer& x,
                                        std::size_t x_off,
-                                       const LoraFactors& lf,
+                                       const LoraStack& st,
                                        const SharedBuffer& y,
                                        std::size_t y_off, int M, int N, int K)
 {
-  if (lf.empty() || _s.lora.empty() || !_fn_gemm_acc.valid()) { return; }
-  // Strength 0 is a legitimate request (an A/B against the un-adapted
-  // model) and the cheapest way to serve it is not to encode the two
-  // GEMMs at all -- which also makes "off" exactly off rather than a
-  // pair of roundings that happen to cancel.
-  if (_lora_scale == 0.0f) { return; }
-  const bool scaled = lora_gemm_a_(enc, x, x_off, lf, M, K);
-  lora_gemm_b_(enc, lf, y, y_off, M, N, scaled);
+  if (st.empty() || _s.lora.empty() || !_fn_gemm_acc.valid()) { return; }
+  // Strength 0 is dropped in lora_stack_, so a slot that reaches here
+  // has something to add. Each one runs its own pair into its own
+  // scratch region and accumulates onto the same y; the order they land
+  // in does not matter because addition is what they do.
+  for (int i = 0; i < st.n; ++i) {
+    const LoraStack::Use& u = st.s[i];
+    const bool scaled =
+        lora_gemm_a_(enc, x, x_off, *u.f, M, K, u.scale, u.base);
+    lora_gemm_b_(enc, *u.f, y, y_off, M, N, scaled, u.scale, u.base);
+  }
+}
+
+// The live adapters for one projection, in slot order.
+//
+// An adapter that cannot or should not run is dropped HERE, so nothing
+// downstream has to re-check it: a slot the file did not touch, a
+// strength of zero (a legitimate request -- an A/B against the
+// un-adapted model -- and the cheapest way to serve it is to encode
+// nothing, which also makes "off" exactly off rather than a pair of
+// roundings that cancel), or a build with no accumulating GEMM.
+MetalMiniMaxH3Transformer::LoraStack
+MetalMiniMaxH3Transformer::lora_stack_(bool refiner, int layer,
+                                       LoraFactors BlockLora::* which) const
+{
+  LoraStack st;
+  if (_s.lora.empty() || !_fn_gemm_acc.valid()) { return st; }
+  for (const LoraSlot& sl : _lora) {
+    const std::vector<BlockLora>& v = refiner ? sl.refiner : sl.blocks;
+    if (layer < 0 || (std::size_t)layer >= v.size()) { continue; }
+    st.add(v[(std::size_t)layer].*which, sl.scale,
+           _lora_scratch_rows * (std::size_t)sl.rank_prefix);
+  }
+  return st;
+}
+
+MetalMiniMaxH3Transformer::LoraStack
+MetalMiniMaxH3Transformer::lora_stack_final_() const
+{
+  LoraStack st;
+  if (_s.lora.empty() || !_fn_gemm_acc.valid()) { return st; }
+  for (const LoraSlot& sl : _lora) {
+    st.add(sl.final_adaln, sl.scale,
+           _lora_scratch_rows * (std::size_t)sl.rank_prefix);
+  }
+  return st;
+}
+
+int
+MetalMiniMaxH3Transformer::lora_modules() const
+{
+  int n = 0;
+  for (const LoraSlot& sl : _lora) { n += sl.modules; }
+  return n;
+}
+
+int
+MetalMiniMaxH3Transformer::lora_modules(int slot) const
+{
+  return (slot >= 0 && (std::size_t)slot < _lora.size())
+      ? _lora[(std::size_t)slot].modules : 0;
+}
+
+void
+MetalMiniMaxH3Transformer::set_lora_scale(int slot, float s)
+{
+  if (slot >= 0 && (std::size_t)slot < _lora.size()) {
+    _lora[(std::size_t)slot].scale = s;
+  }
+}
+
+float
+MetalMiniMaxH3Transformer::lora_scale(int slot) const
+{
+  return (slot >= 0 && (std::size_t)slot < _lora.size())
+      ? _lora[(std::size_t)slot].scale : 0.0f;
 }
 
 // Which tile runs t = x A^T. Its N is the RANK, so this is purely a rank
@@ -1229,7 +1297,8 @@ MetalMiniMaxH3Transformer::lora_route_b_(int rank, int N) const
 // the projections is normal, and refusing one would be refusing the
 // common case.
 bool
-MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
+MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
+                                      std::string* err)
 {
   // Reading the FILE is shared with every other family that takes an
   // adapter (shared/runtime-lora.h): the two publisher spellings, the
@@ -1243,7 +1312,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     if (err != nullptr) { *err = "minimax-h3 lora: " + oerr; }
     return false;
   }
-  _lora_scale = spec.scale;
+  slot.scale = spec.scale;
 
   // Every fused `attn.qkv_proj` the FILE supplied, so the check at the
   // end of this function can ask what kind of fusion they are.
@@ -1316,21 +1385,21 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
       ad->bind_fused({dp + "ff.net.0.proj"}, 2 * F, H, &bl.fc1, swap_halves);
       ad->bind(dp + "ff.net.2", H, F, &bl.fc2);
     };
-    _lora_blocks.resize((std::size_t)c.n_layers);
+    slot.blocks.resize((std::size_t)c.n_layers);
     for (int i = 0; i < c.n_layers; ++i) {
       bind_block("transformer_blocks." + std::to_string(i) + ".",
-                 _lora_blocks[(std::size_t)i]);
+                 slot.blocks[(std::size_t)i]);
     }
-    _lora_refiner.resize((std::size_t)c.n_refiner);
+    slot.refiner.resize((std::size_t)c.n_refiner);
     for (int i = 0; i < c.n_refiner; ++i) {
       bind_block("token_refiner.refiner_blocks." + std::to_string(i) + ".",
-                 _lora_refiner[(std::size_t)i]);
+                 slot.refiner[(std::size_t)i]);
     }
     // No adaln and no final_layer: the diffusers export does not adapt
     // them, and neither does the ComfyUI copy built from it.
-    _lora_modules  = ad->modules();
-    _lora_max_rank = ad->max_rank();
-    if (_lora_modules == 0) {
+    slot.modules  = ad->modules();
+    slot.max_rank = ad->max_rank();
+    if (slot.modules == 0) {
       if (err != nullptr) {
         *err = "minimax-h3 lora: '" + spec.path +
                "' looks like the diffusers decomposition but none of its "
@@ -1342,15 +1411,15 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
       _mc->session()->info(fmt(
           "MetalMiniMaxH3Transformer: {} (diffusers decomposition, qkv "
           "fused HERE for this DiT's {} grouping)",
-          ad->summary(spec.path, _lora_scale),
+          ad->summary(spec.path, slot.scale),
           per_head ? "PER-HEAD" : "flat"));
     }
     return true;
   }
 
-  _lora_blocks.resize((std::size_t)c.n_layers);
+  slot.blocks.resize((std::size_t)c.n_layers);
   for (int i = 0; i < c.n_layers; ++i) {
-    BlockLora& bl = _lora_blocks[(std::size_t)i];
+    BlockLora& bl = slot.blocks[(std::size_t)i];
     const std::string p = blk_("blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
     if (!bl.qkv.empty()) { fused_qkv.push_back(&bl.qkv); }
@@ -1359,9 +1428,9 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     bind(p + "mlp.fc2", H, F, bl.fc2);
     bind(p + "adaln_proj.linear", c.adaln_out(), c.time_dim, bl.adaln);
   }
-  _lora_refiner.resize((std::size_t)c.n_refiner);
+  slot.refiner.resize((std::size_t)c.n_refiner);
   for (int i = 0; i < c.n_refiner; ++i) {
-    BlockLora& bl = _lora_refiner[(std::size_t)i];
+    BlockLora& bl = slot.refiner[(std::size_t)i];
     const std::string p = blk_("token_refiner.blocks.", i, "");
     bind(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
     if (!bl.qkv.empty()) { fused_qkv.push_back(&bl.qkv); }
@@ -1369,11 +1438,12 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
   }
-  bind("final_layer.adaln_proj.linear", 2 * H, c.time_dim, _lora_final);
+  bind("final_layer.adaln_proj.linear", 2 * H, c.time_dim,
+       slot.final_adaln);
 
-  _lora_modules  = ad->modules();
-  _lora_max_rank = ad->max_rank();
-  if (_lora_modules == 0) {
+  slot.modules  = ad->modules();
+  slot.max_rank = ad->max_rank();
+  if (slot.modules == 0) {
     if (err != nullptr) {
       *err = "minimax-h3 lora: '" + spec.path +
              "' adapts none of this model's modules";
@@ -1383,7 +1453,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
   if (_mc->session() != nullptr) {
     _mc->session()->info(fmt(
         "MetalMiniMaxH3Transformer: {}",
-        ad->summary(spec.path, _lora_scale)));
+        ad->summary(spec.path, slot.scale)));
   }
   // A FUSED qkv adapter carries a ROW ORDER, and it is adapted to this
   // DiT's rather than reported as a mismatch.
@@ -1455,18 +1525,18 @@ MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer()
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(const std::string& dit_dir, MetalCompute* mc,
                                 const Config& cfg, bool stream_blocks,
-                                const LoraSpec* lora)
+                                const std::vector<LoraSpec>& loras)
 {
   return load(WeightSet::open(resolve_dit_dir(dit_dir, cfg.partition),
                              nullptr),
-              mc, cfg, stream_blocks, lora);
+              mc, cfg, stream_blocks, loras);
 }
 
 std::unique_ptr<MetalMiniMaxH3Transformer>
 MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                                 MetalCompute* mc, const Config& cfg,
                                 bool stream_blocks,
-                                const LoraSpec* lora)
+                                const std::vector<LoraSpec>& loras)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   WeightSet& ws = *ws_in;
@@ -1667,13 +1737,24 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // delta to be added to. This has to be settled HERE, before any block
     // loads -- load_block_ interleaves fc1's rows when the fusion is on,
     // and an interleaved weight cannot then take the split path.
-    if (m->_fuse_ff && lora != nullptr &&
-        lora::Adapter::file_touches(lora->path, ".mlp.fc1.lora_")) {
-      m->_fuse_ff = false;
-      if (mc->session() != nullptr) {
-        mc->session()->log_debug(fmt(
-            "MetalMiniMaxH3Transformer: fused SwiGLU off -- the LoRA adapts "
-            "mlp.fc1, whose delta has to land before the activation"));
+    //
+    // BOTH spellings, and EVERY slot. bind_lora_ reaches fc1 from the
+    // diffusers decomposition too (`ff.net.0.proj`, halves swapped), and
+    // a file asked only about `.mlp.fc1.` would leave the fusion on and
+    // that adapter's fc1 delta silently dropped -- visible only on a
+    // machine without matrix cores, since `_use_mma2` turns the fusion
+    // off anyway. One adapter needing the split path settles it for all
+    // of them: the weight layout is the block's, not the adapter's.
+    for (const LoraSpec& sp : loras) {
+      if (!m->_fuse_ff || sp.path.empty()) { continue; }
+      if (lora::Adapter::file_touches(sp.path, ".mlp.fc1.lora_") ||
+          lora::Adapter::file_touches(sp.path, ".ff.net.0.proj.lora_")) {
+        m->_fuse_ff = false;
+        if (mc->session() != nullptr) {
+          mc->session()->log_debug(fmt(
+              "MetalMiniMaxH3Transformer: fused SwiGLU off -- a LoRA adapts "
+              "mlp.fc1, whose delta has to land before the activation"));
+        }
       }
     }
   }
@@ -1869,12 +1950,30 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // see the machine, and BlockResidency measures instead.
     m->_blocks.resize((std::size_t)cfg.n_layers);
   }
-  if (lora != nullptr && !lora->path.empty()) {
+  // Slots bind in the order given and keep it: `lora_scale(0)` is the
+  // first adapter the caller named, whatever it turned out to be.
+  for (const LoraSpec& sp : loras) {
+    if (sp.path.empty()) { continue; }
+    if ((int)m->_lora.size() >= kMaxLoraSlots) {
+      if (mc->session() != nullptr) {
+        mc->session()->warn(fmt(
+            "MetalMiniMaxH3Transformer: {} adapters given, {} slots -- "
+            "'{}' is IGNORED", loras.size(), kMaxLoraSlots, sp.path));
+      }
+      break;
+    }
+    LoraSlot slot;
     std::string lerr;
-    if (!m->bind_lora_(*lora, &lerr)) {
+    if (!m->bind_lora_(sp, slot, &lerr)) {
       if (mc->session() != nullptr) { mc->session()->error(fmt("{}", lerr)); }
       return nullptr;
     }
+    // Each slot owns its own rows of the [seq, rank] scratch, so two
+    // adapters' first GEMMs do not have to be ordered against each
+    // other's second.
+    slot.rank_prefix = m->_lora_rank_total;
+    m->_lora_rank_total += slot.max_rank;
+    m->_lora.push_back(std::move(slot));
   }
   // The ff scratch can only shrink when NOTHING can present an unfused
   // fc1: streaming can, at any step, and so can a block whose interleave
@@ -2388,18 +2487,12 @@ void
 MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                                  std::size_t x_off, const Linear& l,
                                  const SharedBuffer& y, std::size_t y_off,
-                                 int M, int N, int K, const LoraFactors* lora)
+                                 int M, int N, int K, const LoraStack* lora)
 {
   const bool bias = !l.b.empty();
-  // An adapter that cannot or should not run is dropped HERE, so nothing
-  // downstream has to re-check it. Strength 0 is a legitimate request and
-  // the cheapest way to serve it is to encode nothing, which also makes
-  // "off" exactly off rather than a pair of roundings that cancel.
-  if (lora != nullptr &&
-      (lora->empty() || _s.lora.empty() || !_fn_gemm_acc.valid() ||
-       _lora_scale == 0.0f)) {
-    lora = nullptr;
-  }
+  // Whether an adapter can run at all was settled in lora_stack_, so an
+  // empty stack here simply means none is attached.
+  const int nl = lora != nullptr ? lora->n : 0;
   // One route for the WHOLE projection, chosen at the full M so a band
   // never lands on a kernel the tuner did not measure, then the rows in
   // bands narrow enough for the mma tiles' 32-bit addressing. Below the
@@ -2411,23 +2504,35 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
     const int rows = std::min(band, M - m0);
     const std::size_t xo = x_off + (std::size_t)m0 * K;
     const std::size_t yo = y_off + (std::size_t)m0 * N;
-    const std::size_t lo =
-        lora != nullptr ? (std::size_t)m0 * lora->rank : 0;
-    // t = [scale *] x A^T, BEFORE the projection: the fused tile reads
-    // it, and the unfused path does not care which order the two are in.
-    bool scaled = false;
-    if (lora != nullptr) {
-      scaled = lora_gemm_a_(enc, x, xo, *lora, rows, K, lo);
+    // t = [scale *] x A^T for EVERY adapter, BEFORE the projection: the
+    // fused tile reads one of them, and the unfused path does not care
+    // which order the two halves are in. Each writes into its own slot
+    // region, so these do not serialise on the scratch.
+    std::size_t lo[kMaxLoraSlots]   = {};
+    bool        scaled[kMaxLoraSlots] = {};
+    for (int i = 0; i < nl; ++i) {
+      const LoraStack::Use& u = lora->s[i];
+      lo[i] = u.base + (std::size_t)m0 * u.f->rank;
+      scaled[i] =
+          lora_gemm_a_(enc, x, xo, *u.f, rows, K, u.scale, lo[i]);
+    }
+    // The base tile can absorb ONE adapter's second GEMM. It carries no
+    // scale of its own, so only a slot whose strength already reached t
+    // is eligible -- offering it another would run that adapter at 1.0.
+    // The rest get their own dispatch, which is what a second adapter
+    // costs and the only place it costs anything.
+    int fold = -1;
+    for (int i = 0; i < nl && fold < 0; ++i) {
+      if (scaled[i]) { fold = i; }
     }
     bool folded = false;
     gemm_route_dispatch_(enc, x, xo, l, y, yo, rows, N, K, route,
-                         // The fused tile has no scale, so offering it an
-                         // adapter whose strength never reached t would
-                         // run that adapter at 1.0.
-                         (lora != nullptr && scaled) ? lora : nullptr,
-                         &folded, lo);
-    if (lora != nullptr && !folded) {
-      lora_gemm_b_(enc, *lora, y, yo, rows, N, scaled, lo);
+                         fold >= 0 ? lora->s[fold].f : nullptr,
+                         &folded, fold >= 0 ? lo[fold] : 0);
+    for (int i = 0; i < nl; ++i) {
+      if (folded && i == fold) { continue; }
+      const LoraStack::Use& u = lora->s[i];
+      lora_gemm_b_(enc, *u.f, y, yo, rows, N, scaled[i], u.scale, lo[i]);
     }
     if (bias) {
       enc.set_function(_fn_bias_add);
@@ -3614,11 +3719,14 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
   s.ff   = s.attn.subview(0, ff_elems * 2);
   // ...and `proj` past it, for the final layer alone.
   s.proj = s.attn.subview(ff_elems * 2, S * H * 2);
-  // A runtime LoRA's [M, rank] intermediate. Rank 64 at 19k rows is
-  // 2.4 MB -- the whole reason applying an adapter at runtime is
-  // affordable is that this is the only extra buffer it needs.
-  s.lora = _lora_max_rank > 0 ? mk(S * (std::size_t)_lora_max_rank)
-                              : SharedBuffer{};
+  // The runtime LoRAs' [M, rank] intermediates, one region per SLOT so
+  // two adapters do not serialise on the same rows. Rank 64 at 19k rows
+  // is 2.4 MB -- the whole reason applying an adapter at runtime is
+  // affordable is that this is the only extra buffer it needs, and a
+  // second one is another 2.4.
+  s.lora = _lora_rank_total > 0 ? mk(S * (std::size_t)_lora_rank_total)
+                                : SharedBuffer{};
+  _lora_scratch_rows = S;
   s.txt  = mk((std::size_t)n_text * H);
   s.temb = mk((std::size_t)n_t * (std::size_t)c.time_dim);
   s.mod  = mk((std::size_t)n_t * (std::size_t)c.adaln_out());
@@ -4309,8 +4417,20 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 
     // One block. `modulated` selects the 50 main blocks (per-row AdaLN
     // and rope) from the 2 refiner blocks (neither).
+    // `lora_layer` indexes the adapters' per-block factors -- the same
+    // stack `modulated` selects, since the refiner blocks are exactly the
+    // unmodulated ones.
     auto block = [&](const Block& b, const SharedBuffer& x, int rows,
-                     bool modulated, const BlockLora* lo) {
+                     bool modulated, int lora_layer) {
+      const bool lref = !modulated;
+      const LoraStack lo_qkv = lora_stack_(lref, lora_layer,
+                                           &BlockLora::qkv);
+      const LoraStack lo_out = lora_stack_(lref, lora_layer,
+                                           &BlockLora::out);
+      const LoraStack lo_fc1 = lora_stack_(lref, lora_layer,
+                                           &BlockLora::fc1);
+      const LoraStack lo_fc2 = lora_stack_(lref, lora_layer,
+                                           &BlockLora::fc2);
       rms(x, 0, b.n1, s.nm, 0, rows, H, c.norm_eps);
       bdump("n1", s.nm, H);
       trip(trip_blk, 0, s.nm, (std::size_t)rows * H);
@@ -4321,7 +4441,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       bdump("n1+mod", s.nm, H);
       psplit(t_elt);
       gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H,
-            lo != nullptr ? &lo->qkv : nullptr);
+            &lo_qkv);
       bdump("qkv", s.qkv, 3 * I);
       trip(trip_blk, 2, s.qkv, (std::size_t)rows * 3 * I);
       psplit(t_qkv);
@@ -4355,7 +4475,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       bdump("attn_out", s.ob, I);
       trip(trip_blk, 3, s.ob, (std::size_t)rows * I);
       gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I,
-            lo != nullptr ? &lo->out : nullptr);
+            &lo_out);
       bdump("o_proj", s.nm, H);
       trip(trip_blk, 4, s.nm, (std::size_t)rows * H);
       psplit(t_oproj);
@@ -4397,7 +4517,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                       (unsigned)(((rows + bm - 1) / bm) * 2), 2}, {32, 2, 2});
       } else {
         gemm_(enc, s.nm, 0, b.fc1, s.ff, 0, rows, 2 * FF, H,
-              lo != nullptr ? &lo->fc1 : nullptr);
+              &lo_fc1);
         bdump("fc1", s.ff, 2 * FF);
       trip(trip_blk, 6, s.ff, (std::size_t)rows * 2 * FF);
         // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
@@ -4411,7 +4531,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       bdump("swiglu", s.qkv, FF);
       trip(trip_blk, 7, s.qkv, (std::size_t)rows * FF);
       gemm_(enc, s.qkv, 0, b.fc2, s.nm, 0, rows, H, FF,
-            lo != nullptr ? &lo->fc2 : nullptr);
+            &lo_fc2);
       bdump("fc2", s.nm, H);
       trip(trip_blk, 8, s.nm, (std::size_t)rows * H);
       psplit(t_ff);
@@ -4460,8 +4580,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 
     // ---- 2. the text refiner -----------------------------------------
     for (std::size_t ri = 0; ri < _refiner.size(); ++ri) {
-      block(_refiner[ri], s.txt, n_text, false,
-            ri < _lora_refiner.size() ? &_lora_refiner[ri] : nullptr);
+      block(_refiner[ri], s.txt, n_text, false, (int)ri);
     }
     // Its final norm writes straight into the packed sequence's text
     // rows, which are rows [0, n_text) -- no separate copy.
@@ -4716,16 +4835,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // checkpoint. bake_adaln replaces the GEMM with a slice of a table
       // computed once for the whole schedule -- see its comment for why
       // that is a memory decision rather than a speed one.
-      const LoraFactors* ada_lo =
-          ((std::size_t)Lx < _lora_blocks.size() &&
-           !_lora_blocks[(std::size_t)Lx].adaln.empty())
-              ? &_lora_blocks[(std::size_t)Lx].adaln
-              : nullptr;
+      const LoraStack ada_lo =
+          lora_stack_(/*refiner=*/false, Lx, &BlockLora::adaln);
       if (baked) {
         const std::size_t row0 =
             (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
             (std::size_t)c.adaln_out();
-        if (ada_lo == nullptr) {
+        if (ada_lo.empty()) {
           // Nothing to add: point the modulation kernels straight at
           // this step's rows. No GEMM, no copy, no scratch.
           mod_buf = &_adaln_tab[(std::size_t)Lx];
@@ -4745,7 +4861,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           enc.set_constant(2, 0);
           enc.set_constant(3, n_el);
           enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
-          lora_apply_(enc, s.temb, 0, *ada_lo, s.mod, 0, n_t, c.adaln_out(),
+          lora_apply_(enc, s.temb, 0, ada_lo, s.mod, 0, n_t, c.adaln_out(),
                       c.time_dim);
         }
       } else {
@@ -4753,10 +4869,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         mod_off = 0;
         gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(),
               c.time_dim);
-        if (ada_lo != nullptr) {
-          lora_apply_(enc, s.temb, 0, *ada_lo, s.mod, 0, n_t, c.adaln_out(),
-                      c.time_dim);
-        }
+        lora_apply_(enc, s.temb, 0, ada_lo, s.mod, 0, n_t, c.adaln_out(),
+                    c.time_dim);
       }
       psplit(t_adaln);
       // The modulation VALUES, per modality tag. s.mod is [n_t*3, 6*H]
@@ -4797,9 +4911,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       bprobe = xprobe && Lx == 0;
       trip_blk = Lx;
-      block(b, s.x, seq, true,
-            (std::size_t)Lx < _lora_blocks.size() ? &_lora_blocks[(std::size_t)Lx]
-                                                  : nullptr);
+      block(b, s.x, seq, true, Lx);
       bprobe = false;
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
@@ -5060,11 +5172,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // ---- 4. the shared output norm and the two heads ------------------
     const SharedBuffer* fmod_buf = &s.fmod;
     std::size_t fmod_off = 0;
+    const LoraStack fin_lo = lora_stack_final_();
     if (baked) {
       const std::size_t row0 =
           (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
           (std::size_t)(2 * H);
-      if (_lora_final.empty()) {
+      if (fin_lo.empty()) {
         fmod_buf = &_final_adaln_tab;
         fmod_off = row0;
       } else {
@@ -5075,12 +5188,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.set_constant(2, 0);
         enc.set_constant(3, n_el);
         enc.dispatch({(unsigned)n_el, 1, 1}, {256, 1, 1});
-        lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
+        lora_apply_(enc, s.temb, 0, fin_lo, s.fmod, 0, n_t, 2 * H,
                     c.time_dim);
       }
     } else {
       gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H, c.time_dim);
-      lora_apply_(enc, s.temb, 0, _lora_final, s.fmod, 0, n_t, 2 * H,
+      lora_apply_(enc, s.temb, 0, fin_lo, s.fmod, 0, n_t, 2 * H,
                   c.time_dim);
     }
     rms(s.x, 0, _final_norm, s.proj, 0, seq, H, c.final_norm_eps);

@@ -535,7 +535,7 @@ void
 Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
                std::size_t x_off, const Factors& f, const SharedBuffer& y,
                std::size_t y_off, int m, int n, int k, float scale,
-               int mma_min_m)
+               int mma_min_m, std::size_t scratch_off)
 {
   if (f.empty() || !valid() || _scratch.empty()) { return; }
   if (scale == 0.0f) { return; }
@@ -548,7 +548,7 @@ Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
   enc.set_buffer(0, x, x_off * 2);
   enc.set_buffer(1, f.a);
   enc.set_buffer(2, f.a);            // bias slot unused (has_bias = 0)
-  enc.set_buffer(3, _scratch);
+  enc.set_buffer(3, _scratch, scratch_off * 2);
   enc.set_constant(4, k);
   enc.set_constant(5, r);
   enc.set_constant(6, m);
@@ -571,7 +571,7 @@ Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
   const metal_compute::ComputeFunction* fb =
       (mma && scaled) ? route_b_(r) : nullptr;
   enc.set_function(fb != nullptr ? *fb : _steel_acc);
-  enc.set_buffer(0, _scratch);
+  enc.set_buffer(0, _scratch, scratch_off * 2);
   enc.set_buffer(1, f.b);
   enc.set_buffer(2, f.b);
   enc.set_buffer(3, y, y_off * 2);
@@ -588,6 +588,18 @@ Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
   }
   enc.dispatch({(unsigned)(((n + 31) / 32) * 32),
                 (unsigned)(((m + 63) / 64) * 2), 2}, {32, 2, 2});
+}
+
+void
+Applier::apply(metal_compute::ComputeEncoder& enc, const SharedBuffer& x,
+               std::size_t x_off, const Stack& st, const SharedBuffer& y,
+               std::size_t y_off, int m, int n, int k, int mma_min_m)
+{
+  for (int i = 0; i < st.n; ++i) {
+    const Stack::Use& u = st.s[i];
+    apply(enc, x, x_off, *u.f, y, y_off, m, n, k, u.scale, mma_min_m,
+          u.base);
+  }
 }
 
 }  // namespace lora

@@ -134,6 +134,23 @@ const ConfigKey kAttrs[] = {
           "GEMM as a constant, so it can be swept without a reload. 1.0 = "
           "as trained; 0 skips both adapter GEMMs, so off is exactly off",
    .def_real = 1.0},
+  {.key = "lora2", .type = ConfigType::String, .required = false,
+   .doc = "a SECOND runtime LoRA, applied alongside the first: every "
+          "adapted projection computes W x + s1 B1 (A1 x) + s2 B2 (A2 x). "
+          "The pairing this exists for is a distillation or identity "
+          "adapter in `lora` and a style one here, which is the one "
+          "actually being dialled -- but nothing distinguishes the slots: "
+          "either may hold either, and `lora2` alone is an ordinary "
+          "request. Same accepted forms as `lora`, and LOAD-time in the "
+          "same way. A `lora2` on the family's model-config beat "
+          "OVERRIDES this",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "krea2-lora,flux2-lora"},
+  {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
+   .doc = "`lora2`'s strength, per FORWARD and independent of "
+          "`lora_scale` -- which is the point of a second slot: one "
+          "adapter stays where it was trained while the other is swept. "
+          "0 skips its two GEMMs", .def_real = 1.0},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -285,8 +302,10 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // faster. klein_kv chooses a RECIPE, so on the wrong checkpoint it
   // does not run slower, it runs wrong.
   _i8_gemm = attr_bool("i8_gemm");
-  _lora       = attr_str("lora");
-  _lora_scale = attr_real("lora_scale");
+  _lora[0].path  = attr_str("lora");
+  _lora[0].scale = attr_real("lora_scale");
+  _lora[1].path  = attr_str("lora2");
+  _lora[1].scale = attr_real("lora2_scale");
   _seed   = (std::uint64_t)attr_int("seed");
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
@@ -736,51 +755,61 @@ GenerateImageStage::apply_model_config_()
   // changes it once the DiT is up is reported rather than dropped in
   // silence. The STRENGTH is live: it rides the adapter's GEMM as a
   // constant, so it can be swept without rebuilding anything.
-  auto adapter_keys = [&](const char* what, bool loaded, std::string& ref,
-                          double& scale, auto&& push_scale) {
+  //
+  // Both SLOTS, read the same way. Slot 0 is the plain `lora` keys and
+  // slot 1 the `lora2` ones, so a graph that names one adapter reads
+  // exactly as it always did and a second is additive. Which slot holds
+  // what is the caller's order, not a role the model knows.
+  static const char* const kKeys[kLoraSlots][2] = {
+    {"lora",  "lora_scale"},
+    {"lora2", "lora2_scale"},
+  };
+  auto adapter_keys = [&](const char* what, bool loaded, auto&& push_scale) {
     if (!_model_cfg.is_object()) { return; }
     FlexData cfg = _model_cfg;
     auto o = cfg.as_object();
-    // An ABSENT key keeps what a previous beat set. A beat carrying
-    // other keys and not these is saying nothing about the adapter, and
-    // reading that as "drop it" would make an unrelated re-emission
-    // silently un-adapt the run.
-    const std::string lp =
-        o.contains("lora") ? std::string(o.at("lora").as_string("")) : ref;
-    const double ls = o.contains("lora_scale")
-                          ? o.at("lora_scale").as_real(1.0) : scale;
-    if (loaded && lp != ref) {
-      session()->warn(fmt(
-          "GenerateImageStage('{}'): the {} DiT is already loaded, so the "
-          "model_config beat's `lora` is IGNORED -- it is a load-time "
-          "argument. `lora_scale` still applies", this->id(), what));
-    } else {
-      ref = lp;
-    }
-    if (ls != scale) {
-      scale = ls;
-      push_scale((float)ls);
+    for (int i = 0; i < kLoraSlots; ++i) {
+      LoraSlot& sl = _lora[(std::size_t)i];
+      // An ABSENT key keeps what a previous beat set. A beat carrying
+      // other keys and not these is saying nothing about the adapter,
+      // and reading that as "drop it" would make an unrelated
+      // re-emission silently un-adapt the run.
+      const std::string lp = o.contains(kKeys[i][0])
+          ? std::string(o.at(kKeys[i][0]).as_string("")) : sl.path;
+      const double ls = o.contains(kKeys[i][1])
+          ? o.at(kKeys[i][1]).as_real(1.0) : sl.scale;
+      if (loaded && lp != sl.path) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): the {} DiT is already loaded, so the "
+            "model_config beat's `{}` is IGNORED -- it is a load-time "
+            "argument. `{}` still applies",
+            this->id(), what, kKeys[i][0], kKeys[i][1]));
+      } else {
+        sl.path = lp;
+      }
+      if (ls != sl.scale) {
+        sl.scale = ls;
+        push_scale(i, (float)ls);
+      }
     }
   };
   if (_family == "flux2") {
     _flux2_params =
         genai::MetalFlux2Transformer::GenerationParams::from_flex(_model_cfg,
                                                                   &perr);
-    adapter_keys("FLUX.2", _flux2_dit != nullptr, _lora,
-                 _lora_scale, [&](float s) {
-                   if (_flux2_dit && _flux2_dit->lora_modules() > 0) {
-                     _flux2_dit->set_lora_scale(s);
-                   }
-                 });
+    adapter_keys("FLUX.2", _flux2_dit != nullptr, [&](int i, float s) {
+      if (_flux2_dit && _flux2_dit->lora_modules(i) > 0) {
+        _flux2_dit->set_lora_scale(i, s);
+      }
+    });
   } else if (_family == "mage-flow") {
     _wm_params = genai::mage_wm::Params::from_flex(_model_cfg, &perr);
   } else if (_family == "krea2") {
-    adapter_keys("Krea-2", _dit != nullptr, _lora, _lora_scale,
-                 [&](float s) {
-                   if (_dit && _dit->lora_modules() > 0) {
-                     _dit->set_lora_scale(s);
-                   }
-                 });
+    adapter_keys("Krea-2", _dit != nullptr, [&](int i, float s) {
+      if (_dit && _dit->lora_modules(i) > 0) {
+        _dit->set_lora_scale(i, s);
+      }
+    });
   }
   if (!perr.empty() && !_model_cfg.is_null()) {
     session()->warn(fmt("GenerateImageStage('{}'): model_config: {}",
@@ -907,12 +936,9 @@ GenerateImageStage::ensure_loaded_()
             _flux2_params.klein_kv ? "true" : "false"));
       }
     }
-    genai::MetalFlux2Transformer::LoraSpec lspec;
-    lspec.path  = adapter_file_(_lora);
-    lspec.scale = (float)_lora_scale;
     _flux2_dit = genai::MetalFlux2Transformer::load(
         weight_set_(dit_dir), mc, fcfg, stream_blocks,
-        lspec.path.empty() ? nullptr : &lspec);
+        lora_specs_<genai::MetalFlux2Transformer::LoraSpec>());
     if (!_flux2_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the FLUX.2 DiT from '{}'; "
@@ -1105,12 +1131,9 @@ GenerateImageStage::ensure_loaded_()
     }
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
-    genai::MetalKrea2Transformer::LoraSpec lspec;
-    lspec.path  = adapter_file_(_lora);
-    lspec.scale = (float)_lora_scale;
     _dit = genai::MetalKrea2Transformer::load(
         weight_set_(dit_dir), mc, kcfg, stream_blocks,
-        lspec.path.empty() ? nullptr : &lspec);
+        lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
     if (!_dit) {
       session()->error(fmt(
           "GenerateImageStage('{}'): failed to load the DiT from '{}'; inert",
@@ -1196,12 +1219,9 @@ GenerateImageStage::load_flux2_dit_()
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or
   // un-adapted, on the graph that asked for both.
-  genai::MetalFlux2Transformer::LoraSpec lspec;
-  lspec.path  = adapter_file_(_lora);
-  lspec.scale = (float)_lora_scale;
   _flux2_dit = genai::MetalFlux2Transformer::load(
       weight_set_(_flux2_dit_dir), mc, fcfg, _flux2_stream,
-      lspec.path.empty() ? nullptr : &lspec);
+      lora_specs_<genai::MetalFlux2Transformer::LoraSpec>());
   return (bool)_flux2_dit;
 }
 
@@ -1462,12 +1482,9 @@ GenerateImageStage::load_krea2_dit_()
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or un-adapted,
   // on the graph that asked for both.
-  genai::MetalKrea2Transformer::LoraSpec lspec;
-  lspec.path  = adapter_file_(_lora);
-  lspec.scale = (float)_lora_scale;
   _dit = genai::MetalKrea2Transformer::load(
       weight_set_(_krea2_dit_dir), mc, kcfg, _krea2_stream,
-      lspec.path.empty() ? nullptr : &lspec);
+      lora_specs_<genai::MetalKrea2Transformer::LoraSpec>());
   return (bool)_dit;
 }
 

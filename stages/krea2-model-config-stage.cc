@@ -43,6 +43,23 @@ const ConfigKey kAttrs[] = {
           "GEMM as a constant, so it can be swept without a reload. 1.0 = as "
           "trained; 0 skips both adapter GEMMs, so off is exactly off",
    .def_real = 1.0},
+  {.key = "lora2", .type = ConfigType::String, .required = false,
+   .doc = "a SECOND runtime LoRA, applied alongside the first: every "
+          "adapted projection computes W x + s1 B1 (A1 x) + s2 B2 (A2 x). "
+          "The pairing this exists for is an identity or few-step adapter "
+          "in `lora` and a style one here, which is the one actually being "
+          "dialled -- but nothing distinguishes the slots: either may hold "
+          "either, and `lora2` alone is an ordinary request. Same accepted "
+          "forms and same conventions as `lora`. Costs one more pair of "
+          "skinny GEMMs; the base weight is still read once. LOAD-time "
+          "like `lora`",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "krea2-lora"},
+  {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
+   .doc = "`lora2`'s strength, per FORWARD and independent of "
+          "`lora_scale` -- which is the point of a second slot: one "
+          "adapter stays where it was trained while the other is swept. "
+          "0 skips its two GEMMs", .def_real = 1.0},
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the tower default"},
@@ -57,7 +74,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "krea2 parameters as one FlexData object {model_family: krea2, "
-          "+vl_*, +lora, +lora_scale}. The vl_* keys are for a "
+          "+vl_*, +lora, +lora2 and their scales}. The vl_* keys are "
+          "for a "
           "diffusion-conditioner's model_config iport (the grounded "
           "encode); the lora keys are for generate-image's. Wire it to "
           "both -- each reads only what it owns",
@@ -110,7 +128,8 @@ Krea2ModelConfigStage::resolved_config() const
   {
     auto in = config().as_object();
     auto o  = fd.as_object();
-    for (const char* k : {"lora", "lora_scale"}) {
+    for (const char* k : {"lora", "lora_scale",
+                          "lora2", "lora2_scale"}) {
       if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
   }

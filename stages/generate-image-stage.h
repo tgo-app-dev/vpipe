@@ -20,6 +20,7 @@
 #include "generative-models/mage/mage-watermark.h"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -154,8 +155,14 @@ public:
   // any model_config beat. Exposed because the interesting failure is
   // that it is EMPTY when the graph thought it had set one, and every
   // other way of seeing that needs a checkpoint.
-  const std::string& lora_ref()   const noexcept { return _lora; }
-  double             lora_scale() const noexcept { return _lora_scale; }
+  const std::string& lora_ref(int slot = 0) const noexcept
+  {
+    return _lora[(std::size_t)(slot > 0 ? 1 : 0)].path;
+  }
+  double lora_scale(int slot = 0) const noexcept
+  {
+    return _lora[(std::size_t)(slot > 0 ? 1 : 0)].scale;
+  }
 
 private:
   // Stamp the generating model onto a latent beat's sideband. The chain
@@ -264,8 +271,17 @@ private:
   // has exactly one adapter. Seeded from this stage's OWN `lora` /
   // `lora_scale` config and overridden by a model_config beat that
   // names them.
-  std::string _lora;
-  double      _lora_scale = 1.0;
+  // The runtime LoRA SLOTS, off this stage's own config and any
+  // model_config beat, in the order the DiT binds them. Two, so a
+  // distillation or identity adapter and a style one can ride together
+  // -- see kMaxLoraSlots on the transformers. The PATH is load-time; the
+  // STRENGTH is not, and each slot's moves on its own.
+  struct LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+  };
+  static constexpr int kLoraSlots = 2;
+  std::array<LoraSlot, kLoraSlots> _lora;
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
 
@@ -274,6 +290,29 @@ private:
   // Empty (with a warning naming the reason) when it cannot, so the
   // caller generates WITHOUT the adapter rather than failing the graph.
   std::string adapter_file_(const std::string& ref) const;
+
+  // The slots as the family's own LoraSpec list, in the order the graph
+  // named them -- which is the order the DiT binds and the order
+  // `lora_scale(i)` addresses afterwards. A slot whose file cannot be
+  // resolved is DROPPED rather than left as a hole, so the surviving
+  // adapters keep consecutive indices and a strength beat still reaches
+  // them. Templated because the two families spell LoraSpec separately
+  // (they are the same two fields, but a shared type would put one
+  // family's adapter contract in the other's header).
+  template <class Spec>
+  std::vector<Spec> lora_specs_() const
+  {
+    std::vector<Spec> out;
+    for (const LoraSlot& sl : _lora) {
+      if (sl.path.empty()) { continue; }
+      Spec sp;
+      sp.path = adapter_file_(sl.path);
+      if (sp.path.empty()) { continue; }   // adapter_file_ warned
+      sp.scale = (float)sl.scale;
+      out.push_back(std::move(sp));
+    }
+    return out;
+  }
 
   // (Re)load the FLUX.2 DiT from the cached params. Returns false on failure.
   bool load_flux2_dit_();

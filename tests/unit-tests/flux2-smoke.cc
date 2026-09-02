@@ -2936,6 +2936,315 @@ TEST(flux2_smoke, lora_module_names_match_the_checkpoint)
 // NOT fail -- it produces a run where the adapter's two biggest
 // projections quietly do not apply -- so it is asserted rather than
 // left to a forward that has no reference to disagree with.
+// TWO adapters ride together, and their strengths are independent.
+//
+// The shared machinery (lora::Stack, Applier::apply over one) is
+// exercised end to end by minimax_h3_lora.two_adapters_add_and_are_
+// dialled_apart; what is FLUX.2's own is the per-slot binding into
+// DoubleLora/SingleLora and the lora_at_ wiring at fourteen projections.
+// A member-pointer that names the wrong factor still COMPILES, so this
+// runs the real DiT.
+//
+// The adapters are synthesised from lora_module_list(), which is the
+// same table bind_lora_ walks -- so every module the model can adapt is
+// adapted, the fused ones included (which turns the SwiGLU weave off,
+// deliberately: that is the path a real adapter takes too).
+//
+// Env: VPIPE_FLUX2_TEST_MODEL_PATH (+ optional VPIPE_FLUX2_DIT_DIR).
+TEST(flux2_smoke, two_adapters_add_and_are_dialled_apart)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  // One block of each stack: the adapter question is per projection, and
+  // twenty-five blocks would only be twenty-five times the load.
+  MetalFlux2Transformer::Config cfg;
+  cfg.n_double = 1;
+  cfg.n_single = 1;
+  // The DIMS have to come from the model, not from Config's defaults:
+  // load() derives double_ff_hidden and single_mlp_in from the
+  // checkpoint, and factors built against the defaults are the wrong
+  // SHAPE -- which the binder counts as a skip, so the adapter loads,
+  // reports nothing and does nothing.
+  {
+    auto probe = MetalFlux2Transformer::load(tdir, mc, cfg, false, {});
+    ASSERT_TRUE(probe != nullptr);
+    if (probe == nullptr) { return; }
+    cfg = probe->config();
+    cfg.n_double = 1;
+    cfg.n_single = 1;
+  }
+
+  // A synthetic adapter over EVERY module this shape can carry.
+  auto write_adapter = [&](const fs::path& p, int rank, float amp,
+                           float phase) -> bool {
+    struct T { std::string name; int n, k; };
+    std::vector<T> ts;
+    for (const auto& m : MetalFlux2Transformer::lora_module_list(cfg)) {
+      if (m.n <= 0 || m.k <= 0) { continue; }
+      ts.push_back({m.name + ".lora_A.weight", rank, m.k});
+      ts.push_back({m.name + ".lora_B.weight", m.n, rank});
+    }
+    if (ts.empty()) { return false; }
+    std::string hdr = "{";
+    std::uint64_t off = 0;
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+      const std::uint64_t bytes = (std::uint64_t)ts[i].n * ts[i].k * 2;
+      hdr += (i ? "," : "");
+      hdr += "\"" + ts[i].name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+             std::to_string(ts[i].n) + "," + std::to_string(ts[i].k) +
+             "],\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + bytes) + "]}";
+      off += bytes;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    std::vector<std::uint16_t> buf;
+    for (const T& t : ts) {
+      const std::size_t n = (std::size_t)t.n * t.k;
+      buf.resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        const float v = amp * std::sin((float)i * 0.017f + phase);
+        std::uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        buf[i] = (std::uint16_t)(bits >> 16);   // bf16: truncate
+      }
+      f.write(reinterpret_cast<const char*>(buf.data()),
+              (std::streamsize)n * 2);
+    }
+    return (bool)f;
+  };
+
+  // The SAME sum in ONE slot: A = [A1; A2] stacked on the rank axis and
+  // B = [B1 | B2] beside it, which is exactly
+  // W x + B1 (A1 x) + B2 (A2 x) as a single rank-2r adapter. It is the
+  // ground truth the two-slot arms are measured against -- the only
+  // thing that differs is how many times y is accumulated onto.
+  auto write_merged = [&](const fs::path& p, int rank, float amp,
+                          float ph1, float ph2) -> bool {
+    struct T { std::string name; int n, k; bool is_b; };
+    std::vector<T> ts;
+    for (const auto& m : MetalFlux2Transformer::lora_module_list(cfg)) {
+      if (m.n <= 0 || m.k <= 0) { continue; }
+      ts.push_back({m.name + ".lora_A.weight", 2 * rank, m.k, false});
+      ts.push_back({m.name + ".lora_B.weight", m.n, 2 * rank, true});
+    }
+    if (ts.empty()) { return false; }
+    std::string hdr = "{";
+    std::uint64_t off = 0;
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+      const std::uint64_t bytes = (std::uint64_t)ts[i].n * ts[i].k * 2;
+      hdr += (i ? "," : "");
+      hdr += "\"" + ts[i].name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+             std::to_string(ts[i].n) + "," + std::to_string(ts[i].k) +
+             "],\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + bytes) + "]}";
+      off += bytes;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    auto bf16 = [&](float v) {
+      std::uint32_t bits;
+      std::memcpy(&bits, &v, 4);
+      return (std::uint16_t)(bits >> 16);
+    };
+    std::vector<std::uint16_t> buf;
+    for (const T& t : ts) {
+      buf.assign((std::size_t)t.n * t.k, 0);
+      if (!t.is_b) {
+        // [2r, k]: the two A blocks stacked, so a flat copy of each.
+        const std::size_t half = (std::size_t)rank * t.k;
+        for (std::size_t i = 0; i < half; ++i) {
+          buf[i]        = bf16(amp * std::sin((float)i * 0.017f + ph1));
+          buf[half + i] = bf16(amp * std::sin((float)i * 0.017f + ph2));
+        }
+      } else {
+        // [n, 2r]: the two B blocks SIDE BY SIDE, so the rows interleave.
+        for (int row = 0; row < t.n; ++row) {
+          for (int j = 0; j < rank; ++j) {
+            const std::size_t src = (std::size_t)row * rank + j;
+            buf[(std::size_t)row * 2 * rank + j] =
+                bf16(amp * std::sin((float)src * 0.017f + ph1));
+            buf[(std::size_t)row * 2 * rank + rank + j] =
+                bf16(amp * std::sin((float)src * 0.017f + ph2));
+          }
+        }
+      }
+      f.write(reinterpret_cast<const char*>(buf.data()),
+              (std::streamsize)buf.size() * 2);
+    }
+    return (bool)f;
+  };
+
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-ut-flux2-2lora";
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const fs::path pa = dir / "a.safetensors";
+  const fs::path pb = dir / "b.safetensors";
+  ASSERT_TRUE(write_adapter(pa, 8, 0.04f, 0.0f));
+  ASSERT_TRUE(write_adapter(pb, 8, 0.04f, 1.7f));
+  const fs::path pm = dir / "merged.safetensors";
+  ASSERT_TRUE(write_merged(pm, 8, 0.04f, 0.0f, 1.7f));
+
+  using Spec  = MetalFlux2Transformer::LoraSpec;
+  using Specs = std::vector<Spec>;
+  const Spec A{pa.string(), 1.0f};
+  const Spec B{pb.string(), 1.0f};
+
+  const int TS = 8, gh = 4, gw = 4, img_seq = gh * gw;
+  int slots = 0, mods0 = 0, mods1 = 0;
+  auto arm = [&](const Specs& specs, const std::vector<float>& turn,
+                 std::vector<float>* out) {
+    auto dit = MetalFlux2Transformer::load(tdir, mc, cfg, false, specs);
+    if (dit == nullptr) { return false; }
+    for (std::size_t i = 0; i < turn.size(); ++i) {
+      dit->set_lora_scale((int)i, turn[i]);
+    }
+    slots = dit->lora_slots();
+    mods0 = dit->lora_modules(0);
+    mods1 = dit->lora_modules(1);
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq *
+                                              c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    if (vel.empty()) { return false; }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    out->resize(n);
+    const auto* vp = static_cast<const _Float16*>(vel.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)vp[i]; }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  std::vector<float> v_off, v_a, v_ab, v_ba, v_dial;
+  ASSERT_TRUE(arm({}, {}, &v_off));
+  EXPECT_TRUE(slots == 0);
+  ASSERT_TRUE(arm({A}, {}, &v_a));
+  const int a_mods = mods0;
+  EXPECT_TRUE(slots == 1 && a_mods > 0 && mods1 == 0);
+  ASSERT_TRUE(arm({A, B}, {}, &v_ab));
+  EXPECT_TRUE(slots == 2 && mods0 == a_mods && mods1 == a_mods);
+  // Held, because the arms below reuse `mods0`/`mods1` and the last one
+  // is a single slot.
+  const int two_mods0 = mods0, two_mods1 = mods1;
+  // ORDER DOES NOT MATTER, and that is the arm that says the slots have
+  // their own scratch. Addition commutes -- but if both slots wrote
+  // their [rows, rank] intermediate to the same place, the LAST one's
+  // would be what both B factors multiply, and the two orders would
+  // compute two different (wrong) things.
+  ASSERT_TRUE(arm({B, A}, {}, &v_ba));
+  // Loaded at full in BOTH and the second turned to zero afterwards: the
+  // first must still be exactly where one adapter alone puts it. No
+  // kernels are encoded for a slot at zero, so this is the same run.
+  ASSERT_TRUE(arm({A, B}, {1.0f, 0.0f}, &v_dial));
+
+  // The same three arms at a tenth of the strength, to tell a ROUNDING
+  // apart from an error that scales with the adapters.
+  const Spec A1{pa.string(), 0.1f}, B1{pb.string(), 0.1f};
+  std::vector<float> w_a, w_ab, w_ba;
+  ASSERT_TRUE(arm({A1}, {}, &w_a));
+  ASSERT_TRUE(arm({A1, B1}, {}, &w_ab));
+  ASSERT_TRUE(arm({B1, A1}, {}, &w_ba));
+  // The SAME adapter, once in slot 0 and once in slot 1 with the other
+  // slot inert. Both must equal {A} alone BIT FOR BIT: a slot at zero
+  // encodes nothing, so the only thing that changed is which scratch
+  // REGION the live adapter writes its intermediate into.
+  std::vector<float> v_a_b0, v_b0_a, v_m;
+  const Spec Bz{pb.string(), 0.0f};
+  ASSERT_TRUE(arm({A, Bz}, {}, &v_a_b0));
+  ASSERT_TRUE(arm({Bz, A}, {}, &v_b0_a));
+  // The ground truth: both adapters as ONE rank-16 slot.
+  ASSERT_TRUE(arm({Spec{pm.string(), 1.0f}}, {}, &v_m));
+
+  const double d_a    = rel(v_a, v_off);
+  const double d_b    = rel(v_ab, v_a);
+  const double swap   = rel(v_ab, v_ba);
+  const double solo   = rel(v_dial, v_a);
+  const double reg0   = rel(v_a_b0, v_a);
+  const double reg1   = rel(v_b0_a, v_a);
+  const double m_ab   = rel(v_ab, v_m);
+  const double m_ba   = rel(v_ba, v_m);
+  const double m_one  = rel(v_a, v_m);
+  std::printf("[flux2_smoke] two slots: %d+%d modules | first moves %.3e, "
+              "second adds %.3e | vs the merged rank-16 adapter: {A,B} "
+              "%.3e, {B,A} %.3e, ONE adapter %.3e | swap %.3e | dialled to "
+              "0 %.3e | either scratch region %.3e / %.3e\n",
+              two_mods0, two_mods1, d_a, d_b, m_ab, m_ba, m_one, swap,
+              solo, reg0, reg1);
+  fs::remove_all(dir, ec);
+  // Both adapters reach the output, or every bar below compares a run
+  // with itself.
+  EXPECT_TRUE(d_a > 1e-3 && d_b > 1e-3);
+  // THE SUM, NOT ONE OF THE PARTS. Stacking the two on the rank axis is
+  // the same arithmetic through one GEMM pair, so it is the answer both
+  // orders have to land on -- and they land 5x nearer it than a single
+  // adapter does. The residual is the price of accumulating onto y
+  // TWICE in bf16 instead of once, and MEASURED it does not scale with
+  // the adapters (3.9e-2 at full strength, 5.4e-2 at a tenth of it,
+  // while the adapters' own effect moves 3.0e-1 -> 5.0e-2): a fixed
+  // rounding, spread over 14 modules in each of two blocks and
+  // amplified by what follows them. Two DIFFERENT adapters, which is
+  // the case this exists for, have nothing to be compared against.
+  EXPECT_TRUE(m_ab < 0.25 * m_one);
+  EXPECT_TRUE(m_ba < 0.25 * m_one);
+  // Order-independence follows, and is worth its own bar: naming the two
+  // adapters either way round is the same request.
+  EXPECT_TRUE(swap < 0.25 * m_one);
+  // The exact ones. A slot at zero encodes no kernels, and a live
+  // adapter does not care which region it was given.
+  //
+  // NOTE what the region bar does NOT pin. Applier::apply runs each
+  // slot's pair back to back -- t, then y += t B^T -- so slot 1's first
+  // GEMM writes the scratch only after slot 0's second has read it, and
+  // sharing one region would be CORRECT here, merely serialised. (H3 is
+  // the opposite: its gemm_ issues every t first, so that its base tile
+  // can fold one of them, and overlapping regions there corrupt. The
+  // mutation is caught by minimax_h3_lora, not here.) Disjoint regions
+  // are a scheduling choice on this path; this bar says the offsets are
+  // arithmetically sound, not that they are load-bearing.
+  EXPECT_TRUE(reg0 == 0.0 && reg1 == 0.0);
+  EXPECT_TRUE(solo == 0.0);
+}
+
 TEST(flux2_smoke, lora_forbids_fusion_names_the_fused_projections)
 {
   namespace fs = std::filesystem;

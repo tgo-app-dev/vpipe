@@ -4,6 +4,7 @@ set(LOCAL_TEST_SOURCES
   call-stage.cc
   chrono-shell-stages.cc
   save-text-stage.cc
+  shipped-pipelines.cc
   clock-domain.cc
   console-writer.cc
   credential-store.cc

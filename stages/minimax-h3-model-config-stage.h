@@ -42,6 +42,11 @@ namespace vpipe {
 //   audio_seconds (real) -- soundtrack duration; 0 derives it from the
 //                              video's frames / fps, which is what keeps
 //                              the two modalities the same length
+//   lora / lora2 (+ _scale, _qkv_layout) -- TWO runtime LoRA slots,
+//                              applied together: the usual pairing is a
+//                              few-step Turbo distillation and a style
+//                              or identity adapter, with independent,
+//                              live strengths
 class MiniMaxH3ModelConfigStage final
   : public ModelConfigSourceStage<MiniMaxH3ModelConfigStage> {
 public:
@@ -69,6 +74,9 @@ private:
   double _audio_seconds = 0.0;
   std::string _lora;
   double _lora_scale = 1.0;
+  std::string _lora2;
+  double _lora2_scale = 1.0;
+  std::string _lora2_qkv;
   // "auto" | "flat" | "per_head"; empty keeps the beat silent. See the
   // key's doc -- it decides whether a FUSED qkv adapter's rows are
   // permuted into a per-head DiT's order.

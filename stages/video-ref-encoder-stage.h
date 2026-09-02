@@ -126,7 +126,7 @@ namespace vpipe {
 //                        none.
 //
 // Config (FlexData object):
-//   references       (string or array of strings, REQUIRED) -- the
+//   references       (string or array of strings, OPTIONAL) -- the
 //                              reference files IN THE ORDER THE MODEL
 //                              SHOULD READ THEM. The order labels them
 //                              in the presentation ("<Picture 1>",

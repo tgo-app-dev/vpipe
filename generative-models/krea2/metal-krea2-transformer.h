@@ -95,10 +95,18 @@ class MetalKrea2Transformer {
     float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
   };
 
+  // How many adapters may ride the DiT at once. Two, because that is
+  // what a real request wants: an identity or few-step adapter beside a
+  // style one. They stay SEPARATE slots rather than one merged set of
+  // factors -- concatenating them on the rank axis is exact arithmetic
+  // and free in the forward, but it folds both strengths into A and so
+  // turns the live knob back into a rebuild. See lora::Stack.
+  static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
+
   static std::unique_ptr<MetalKrea2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -107,18 +115,25 @@ class MetalKrea2Transformer {
   static std::unique_ptr<MetalKrea2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
-  // How many projections carry a runtime adapter (0 = none attached).
-  int lora_modules() const { return _lora_modules; }
+  // How many projections carry a runtime adapter, summed over the slots
+  // that bound (0 = none attached).
+  int lora_modules() const;
+  // The same for ONE slot, so a caller can report which adapter took.
+  int lora_modules(int slot) const;
+  // Slots that bound. Indices below this are live; the rest are not.
+  int lora_slots() const { return static_cast<int>(_lora_slots.size()); }
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
   // rides the GEMM as a constant rather than being folded into A.
   // Turning it costs nothing and needs no reload. 0 skips both GEMMs, so
   // "off" is exactly off.
-  void set_lora_scale(float s) { _lora_scale = s; }
-  float lora_scale() const { return _lora_scale; }
+  // Per SLOT, because two adapters are two requests. An index past what
+  // bound is ignored.
+  void set_lora_scale(int slot, float s);
+  float lora_scale(int slot) const;
 
   // Every projection a runtime adapter can name, and the base dims its
   // factors have to fit, for a model of this shape. Public and static
@@ -573,19 +588,38 @@ class MetalKrea2Transformer {
     genai::lora::Factors BlockLora::*dst = nullptr;
   };
   static std::vector<LoraModuleRef> lora_modules_(const Config& c);
-  bool bind_lora_(const LoraSpec& spec, std::string* err);
-  std::vector<BlockLora> _lora_blocks;      // per main block
-  // The TEXT-FUSION tower. Not an afterthought: the ai-toolkit
-  // convention names these (`txtfusion.{layerwise,refiner}_blocks`) and
-  // the identity-edit adapter adapts all three containers, so binding
-  // only the main blocks would apply HALF of it -- which is not a
-  // cheaper adapter, it is a wrong one that looks like it worked.
-  std::vector<BlockLora> _lora_layerwise;
-  std::vector<BlockLora> _lora_refiner;
+  // ONE attached adapter: its factors for every container it touches,
+  // its live strength, and its share of the [rows, rank] scratch.
+  //
+  // The TEXT-FUSION tower is not an afterthought here: the ai-toolkit
+  // convention names those blocks (`txtfusion.{layerwise,refiner}_
+  // blocks`) and the identity-edit adapter adapts all three containers,
+  // so binding only the main blocks would apply HALF of it -- which is
+  // not a cheaper adapter, it is a wrong one that looks like it worked.
+  struct LoraSlot {
+    std::vector<BlockLora> blocks;      // per main block
+    std::vector<BlockLora> layerwise;
+    std::vector<BlockLora> refiner;
+    int   modules  = 0;
+    int   max_rank = 0;
+    float scale    = 1.0f;
+    // Ranks of the slots BEFORE this one. The scratch is [rows, sum of
+    // ranks], so this slot's region starts at `rows * rank_prefix` --
+    // which needs the row count, a forward-time number.
+    int   rank_prefix = 0;
+  };
+  bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // The live adapters for one projection of one block, named by the
+  // member of BlockLora that holds it.
+  genai::lora::Stack lora_at_(LoraStack which, int block,
+                              genai::lora::Factors BlockLora::* dst) const;
+  std::vector<LoraSlot>  _lora_slots;
   genai::lora::Applier   _lora;
-  int   _lora_modules = 0;
-  int   _lora_max_rank = 0;
-  float _lora_scale = 1.0f;
+  // Summed max ranks: what the scratch holds for all slots at once, and
+  // the stride that turns a rank prefix into an offset.
+  int         _lora_rank_total   = 0;
+  // Rows the scratch was last sized for. Set with it, read by lora_at_.
+  std::size_t _lora_scratch_rows = 0;
 
   // M5-only matrix-core dense GEMM (matmul2d/NAX) for the DiT projections. Same
   // NAX path the LM prefill + gemma-vision use, gated on supports_matrix_cores()

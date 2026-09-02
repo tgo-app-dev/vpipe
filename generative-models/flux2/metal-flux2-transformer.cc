@@ -734,7 +734,8 @@ MetalFlux2Transformer::lora_module_list(const Config& cfg)
 // input) change a SHAPE, which is a different conversation than a
 // rank-r side GEMM.
 bool
-MetalFlux2Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
+MetalFlux2Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
+                                  std::string* err)
 {
   std::string oerr;
   auto ad = lora::Adapter::open(spec.path, _mc, &oerr);
@@ -742,25 +743,23 @@ MetalFlux2Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
     if (err != nullptr) { *err = "flux2 lora: " + oerr; }
     return false;
   }
-  _lora_scale = spec.scale;
+  slot.scale = spec.scale;
 
-  _lora_double.clear();
-  _lora_double.resize((std::size_t)_cfg.n_double);
+  slot.dbl.clear();
+  slot.dbl.resize((std::size_t)_cfg.n_double);
   for (const auto& m : lora_double_modules_(_cfg)) {
-    ad->bind(m.name, m.n, m.k,
-             &(_lora_double[(std::size_t)m.block].*m.dst));
+    ad->bind(m.name, m.n, m.k, &(slot.dbl[(std::size_t)m.block].*m.dst));
   }
-  _lora_single.clear();
-  _lora_single.resize((std::size_t)_cfg.n_single);
+  slot.sgl.clear();
+  slot.sgl.resize((std::size_t)_cfg.n_single);
   for (const auto& m : lora_single_modules_(_cfg)) {
-    ad->bind(m.name, m.n, m.k,
-             &(_lora_single[(std::size_t)m.block].*m.dst));
+    ad->bind(m.name, m.n, m.k, &(slot.sgl[(std::size_t)m.block].*m.dst));
   }
-  _lora_modules  = ad->modules();
-  _lora_max_rank = ad->max_rank();
-  if (_lora_modules == 0) {
-    _lora_double.clear();
-    _lora_single.clear();
+  slot.modules  = ad->modules();
+  slot.max_rank = ad->max_rank();
+  if (slot.modules == 0) {
+    slot.dbl.clear();
+    slot.sgl.clear();
     if (err != nullptr) {
       *err = "flux2 lora: '" + spec.path +
              "' adapts none of this model's modules. The names must be the "
@@ -771,24 +770,81 @@ MetalFlux2Transformer::bind_lora_(const LoraSpec& spec, std::string* err)
   }
   if (_mc->session() != nullptr) {
     _mc->session()->info(fmt("MetalFlux2Transformer: {}",
-                                   ad->summary(spec.path, _lora_scale)));
+                                   ad->summary(spec.path, slot.scale)));
   }
   return true;
+}
+
+// The live adapters for one projection of one block, in slot order.
+genai::lora::Stack
+MetalFlux2Transformer::lora_at_(int block,
+                                lora::Factors DoubleLora::* dst) const
+{
+  lora::Stack st;
+  for (const LoraSlot& sl : _lora_slots) {
+    if (block < 0 || (std::size_t)block >= sl.dbl.size()) { continue; }
+    st.add(sl.dbl[(std::size_t)block].*dst, sl.scale,
+           _lora_scratch_rows * (std::size_t)sl.rank_prefix);
+  }
+  return st;
+}
+
+genai::lora::Stack
+MetalFlux2Transformer::lora_at_(int block,
+                                lora::Factors SingleLora::* dst) const
+{
+  lora::Stack st;
+  for (const LoraSlot& sl : _lora_slots) {
+    if (block < 0 || (std::size_t)block >= sl.sgl.size()) { continue; }
+    st.add(sl.sgl[(std::size_t)block].*dst, sl.scale,
+           _lora_scratch_rows * (std::size_t)sl.rank_prefix);
+  }
+  return st;
+}
+
+int
+MetalFlux2Transformer::lora_modules() const
+{
+  int n = 0;
+  for (const LoraSlot& sl : _lora_slots) { n += sl.modules; }
+  return n;
+}
+
+int
+MetalFlux2Transformer::lora_modules(int slot) const
+{
+  return (slot >= 0 && (std::size_t)slot < _lora_slots.size())
+      ? _lora_slots[(std::size_t)slot].modules : 0;
+}
+
+void
+MetalFlux2Transformer::set_lora_scale(int slot, float s)
+{
+  if (slot >= 0 && (std::size_t)slot < _lora_slots.size()) {
+    _lora_slots[(std::size_t)slot].scale = s;
+  }
+}
+
+float
+MetalFlux2Transformer::lora_scale(int slot) const
+{
+  return (slot >= 0 && (std::size_t)slot < _lora_slots.size())
+      ? _lora_slots[(std::size_t)slot].scale : 0.0f;
 }
 
 std::unique_ptr<MetalFlux2Transformer>
 MetalFlux2Transformer::load(const std::string& model_dir, MetalCompute* mc,
                             const Config& cfg, bool stream_blocks,
-                            const LoraSpec* lora)
+                            const std::vector<LoraSpec>& loras)
 {
   return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
-              lora);
+              loras);
 }
 
 std::unique_ptr<MetalFlux2Transformer>
 MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
                             const Config& cfg, bool stream_blocks,
-                            const LoraSpec* lora)
+                            const std::vector<LoraSpec>& loras)
 {
   if (mc == nullptr || !ws_in) { return nullptr; }
   const std::string model_dir = ws_in->dir();
@@ -1040,15 +1096,20 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // blocks are BUILT (interleave_gu_ / slice_rows_ below both read
   // _fuse_ff), which happens long before there is a model to bind an
   // adapter to.
-  if (m->_fuse_ff && lora != nullptr && !lora->path.empty() &&
-      lora_forbids_fusion(lora->path)) {
-    m->_fuse_ff = false;
-    if (mc->session() != nullptr) {
-      mc->session()->log_normal(fmt(
-          "MetalFlux2Transformer: the adapter touches a FUSED projection "
-          "(ff.linear_in / to_qkv_mlp_proj), so the fused-SwiGLU weave is "
-          "off for this load -- the split path is the only one a "
-          "pre-activation delta can reach"));
+  // Every slot is asked: ONE adapter needing the split path settles it
+  // for all of them, because the weight layout is the block's and not
+  // the adapter's.
+  for (const LoraSpec& sp : loras) {
+    if (!m->_fuse_ff || sp.path.empty()) { continue; }
+    if (lora_forbids_fusion(sp.path)) {
+      m->_fuse_ff = false;
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt(
+            "MetalFlux2Transformer: an adapter touches a FUSED projection "
+            "(ff.linear_in / to_qkv_mlp_proj), so the fused-SwiGLU weave is "
+            "off for this load -- the split path is the only one a "
+            "pre-activation delta can reach"));
+      }
     }
   }
   m->_lib_attn = mc->load_library("attn_steel");
@@ -1199,18 +1260,37 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   }
   // The adapter LAST: the dims it binds against (double_ff_hidden,
   // single_mlp_in) are derived by the branches above, on both routes.
-  if (lora != nullptr && !lora->path.empty()) {
-    std::string lerr;
+  // Slots bind in the order given and keep it: `lora_scale(0)` is the
+  // first adapter the caller named, whatever it turned out to be.
+  for (const LoraSpec& sp : loras) {
+    if (sp.path.empty()) { continue; }
+    if ((int)m->_lora_slots.size() >= kMaxLoraSlots) {
+      if (mc->session() != nullptr) {
+        mc->session()->warn(fmt(
+            "MetalFlux2Transformer: {} adapters given, {} slots -- '{}' is "
+            "IGNORED", loras.size(), kMaxLoraSlots, sp.path));
+      }
+      break;
+    }
     if (!m->_lora.init(mc, m->_use_mma2)) {
       if (mc->session() != nullptr) {
         mc->session()->warn(fmt(
             "MetalFlux2Transformer: the LoRA GEMM kernels did not load; "
             "the adapter is NOT applied"));
       }
-    } else if (!m->bind_lora_(*lora, &lerr)) {
-      if (mc->session() != nullptr) { mc->session()->warn(fmt("{}", lerr)); }
-      m->_lora_modules = 0;
+      break;
     }
+    LoraSlot slot;
+    std::string lerr;
+    if (!m->bind_lora_(sp, slot, &lerr)) {
+      if (mc->session() != nullptr) { mc->session()->warn(fmt("{}", lerr)); }
+      continue;
+    }
+    // Each slot owns its own rows of the [rows, rank] scratch, so two
+    // adapters' first GEMMs are not ordered against each other's second.
+    slot.rank_prefix = m->_lora_rank_total;
+    m->_lora_rank_total += slot.max_rank;
+    m->_lora_slots.push_back(std::move(slot));
   }
   return m;
 }
@@ -1976,12 +2056,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       // forgotten on one projection and applied on the other eleven.
       void gemm(const SharedBuffer& x, const QWeight& w, const SharedBuffer& y,
                 std::size_t ye, int M, int N, int K, std::size_t xe = 0,
-                const lora::Factors* lf = nullptr) {
+                const lora::Stack& lf = lora::Stack{}) {
         auto lora_after = [&]() {
-          if (lf != nullptr) {
-            self->_lora.apply(*e, x, xe, *lf, y, ye, M, N, K,
-                              self->_lora_scale, self->_mma_min_m);
-          }
+          self->_lora.apply(*e, x, xe, lf, y, ye, M, N, K,
+                            self->_mma_min_m);
         };
         // Matrix-core matmul2d first (M5); false -> steel below.
         if (self->gemm_mma_(*e, x, xe, w, y, ye, M, N, K)) {
@@ -2434,8 +2512,11 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   // sequence. Without it apply() returns early and the adapter silently
   // does nothing, which looks exactly like an adapter that had no
   // effect, so it is allocated here rather than lazily in a block loop.
-  if (_lora_modules > 0 && _lora_scale != 0.0f) {
-    _lora.ensure_scratch((std::size_t)seq * (std::size_t)_lora_max_rank);
+  if (_lora_rank_total > 0) {
+    // One region per SLOT, so two adapters do not serialise on the same
+    // rows.
+    _lora_scratch_rows = (std::size_t)seq;
+    _lora.ensure_scratch(_lora_scratch_rows * (std::size_t)_lora_rank_total);
   }
 
   // ===== stream 1: conditioning + embed + double blocks =====
@@ -2594,22 +2675,23 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
           streaming ? *streamed : _double[(std::size_t)L];
       // Null unless an adapter is attached; every site below then passes
       // nullptr and takes its base path unchanged.
-      const DoubleLora* dl = L < (int)_lora_double.size()
-                                 ? &_lora_double[(std::size_t)L] : nullptr;
+      auto dl = [&](lora::Factors DoubleLora::* d) {
+        return lora_at_(L, d);
+      };
       // MSA: img (mod set 0) + txt.  mod layout [shift,scale,gate]*2 (each H).
       ln_mod_img(op, img, H, 0, nrm);
       op.tap("dbl_norm1_img", L, nrm, 0, IS, H);
       op.gemm(nrm, b.q, jq, (std::size_t)TS * H, IS, H, H, 0,
-              dl ? &dl->q : nullptr);
+              dl(&DoubleLora::q));
       op.gemm(nrm, b.k, jk, (std::size_t)TS * H, IS, H, H, 0,
-              dl ? &dl->k : nullptr);
+              dl(&DoubleLora::k));
       op.gemm(nrm, b.v, jv, (std::size_t)TS * H, IS, H, H, 0,
-              dl ? &dl->v : nullptr);
+              dl(&DoubleLora::v));
       op.ln_mod(txt, 0, mtxt, H, 0, nrm, 0, H, TS);
       op.tap("dbl_norm1_txt", L, nrm, 0, TS, H);
-      op.gemm(nrm, b.aq, jq, 0, TS, H, H, 0, dl ? &dl->aq : nullptr);
-      op.gemm(nrm, b.ak, jk, 0, TS, H, H, 0, dl ? &dl->ak : nullptr);
-      op.gemm(nrm, b.av, jv, 0, TS, H, H, 0, dl ? &dl->av : nullptr);
+      op.gemm(nrm, b.aq, jq, 0, TS, H, H, 0, dl(&DoubleLora::aq));
+      op.gemm(nrm, b.ak, jk, 0, TS, H, H, 0, dl(&DoubleLora::ak));
+      op.gemm(nrm, b.av, jv, 0, TS, H, H, 0, dl(&DoubleLora::av));
       op.rms(jq, 0, b.aqn, jq, 0, TS * HED, HD);
       op.rms(jk, 0, b.akn, jk, 0, TS * HED, HD);
       const std::size_t io = (std::size_t)TS * H;   // image region offset
@@ -2632,12 +2714,12 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       attention(op, att, 0);                               // -> att (contiguous)
       op.tap("dbl_attn_txt", L, att, 0, TS, H);            // to_add_out input
       op.gemm(att, b.ao, ob, 0, TS, H, H, 0,               // text att[0:TS]
-              dl ? &dl->ao : nullptr);
+              dl(&DoubleLora::ao));
       op.gated(txt, 0, mtxt, 2 * H, ob, 0, H, TS * H);
       // img att is att[TS:seq] -> read at input offset TS*H (xe).
       op.tap("dbl_attn_img", L, att, (std::size_t)TS * H, IS, H);
       op.gemm(att, b.o, ob, 0, IS, H, H, (std::size_t)TS * H,
-              dl ? &dl->o : nullptr);
+              dl(&DoubleLora::o));
       gated_img(op, img, 2 * H, ob);
       // FF (mod set 1: shift_mlp=3H, scale_mlp=4H, gate_mlp=5H). Flux2FeedForward
       // is SwiGLU: linear_in -> [gate|up] (2*INNER) -> silu(gate)*up -> linear_out.
@@ -2647,14 +2729,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.swiglu_ff(nrm, b.ff_in, smlp, IS, H, DFF);    // silu(gate)*up [IS,INNER]
       } else {
         op.gemm(nrm, b.ff_in, ff1, 0, IS, DFF, H, 0,     // [IS, 2*INNER]
-                dl ? &dl->ff_in : nullptr);
+                dl(&DoubleLora::ff_in));
         op.slice(ff1, sg, IS, DFF, INNER, 0);            // gate = first half
         op.slice(ff1, su, IS, DFF, INNER, INNER);        // up = second half
         op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, IS * INNER);
       }
       op.tap("dbl_ffact_img", L, smlp, 0, IS, INNER);
       op.gemm(smlp, b.ff_out, ob, 0, IS, H, INNER, 0,
-              dl ? &dl->ff_out : nullptr);
+              dl(&DoubleLora::ff_out));
       gated_img(op, img, 5 * H, ob);
       op.ln_mod(txt, 0, mtxt, 4 * H, 3 * H, nrm, 0, H, TS);
       op.tap("dbl_norm2_txt", L, nrm, 0, TS, H);
@@ -2662,14 +2744,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         op.swiglu_ff(nrm, b.cff_in, smlp, TS, H, DFF);
       } else {
         op.gemm(nrm, b.cff_in, ff1, 0, TS, DFF, H, 0,
-                dl ? &dl->cff_in : nullptr);
+                dl(&DoubleLora::cff_in));
         op.slice(ff1, sg, TS, DFF, INNER, 0);
         op.slice(ff1, su, TS, DFF, INNER, INNER);
         op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, TS * INNER);
       }
       op.tap("dbl_ffact_txt", L, smlp, 0, TS, INNER);
       op.gemm(smlp, b.cff_out, ob, 0, TS, H, INNER, 0,
-              dl ? &dl->cff_out : nullptr);
+              dl(&DoubleLora::cff_out));
       op.gated(txt, 0, mtxt, 5 * H, ob, 0, H, TS * H);
       if (streaming) {
         const auto gp0 = sp_now();
@@ -2768,8 +2850,9 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     // fused branch below carries none by construction -- an adapter that
     // names to_qkv_mlp_proj turned the fusion off at load, so whenever
     // that factor exists this block is on the unfused path.
-    const SingleLora* sl = L < (int)_lora_single.size()
-                               ? &_lora_single[(std::size_t)L] : nullptr;
+    auto sl = [&](lora::Factors SingleLora::* d) {
+      return lora_at_(L, d);
+    };
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
@@ -2790,7 +2873,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       }
     } else {
       op.gemm(nrm, b.qkv_mlp, sproj, 0, seq, PW, H, 0,
-              sl ? &sl->qkv_mlp : nullptr);
+              sl(&SingleLora::qkv_mlp));
       op.slice(sproj, jq, seq, PW, H, 0);                  // q
       op.slice(sproj, jk, seq, PW, H, H);                  // k
       op.slice(sproj, jv, seq, PW, H, 2 * H);              // v
@@ -2834,7 +2917,7 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (!ff_direct) { op.concat_cols(scat, att, smlp, seq, H, SMLP); }
     op.tap("sgl_cat", L, scat, 0, seq, H + SMLP);
     op.gemm(scat, b.o, ob, 0, seq, H, H + SMLP, 0,
-            sl ? &sl->o : nullptr);
+            sl(&SingleLora::o));
     gated_joint(op, joint, 2 * H, ob);                     // += gate * to_out
     enc.end();
     std::string gpu_err;
