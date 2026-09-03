@@ -216,27 +216,35 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
 // this wrong are both silent -- stop() is reachable from the destructor
 // after an explicit stop (two lines for one run) and on a runtime that
 // never launched (a line for a run that never happened).
+// Captures only the "ran for" lines, so a test can count them.
+namespace {
+struct RanLines final : public vpipe::UiDelegateIntf {
+  std::mutex               mu;
+  std::vector<std::string> ran;
+  void error(const vpipe::VpipeFormat&) override {}
+  void warn(const vpipe::VpipeFormat&) override {}
+  void info(const vpipe::VpipeFormat& f) override {
+    const std::string s = f();
+    if (s.find("ran for") == std::string::npos) { return; }
+    std::lock_guard<std::mutex> lk(mu);
+    ran.push_back(s);
+  }
+  vpipe::UiInputStatus getline(const vpipe::VpipeFormat&, std::string&,
+                               const std::function<bool()>&) override {
+    return vpipe::UiInputStatus::Eof;
+  }
+  std::unique_ptr<vpipe::UiTextStream> open_text_stream() override {
+    return std::make_unique<vpipe::NullUiTextStream>();
+  }
+  std::size_t count() {
+    std::lock_guard<std::mutex> lk(mu);
+    return ran.size();
+  }
+};
+}  // namespace
+
 TEST(pipeline_runtime, stop_reports_how_long_it_ran) {
   vpipe::Session sess;
-  struct RanLines final : public vpipe::UiDelegateIntf {
-    std::mutex               mu;
-    std::vector<std::string> ran;
-    void error(const vpipe::VpipeFormat&) override {}
-    void warn(const vpipe::VpipeFormat&) override {}
-    void info(const vpipe::VpipeFormat& f) override {
-      const std::string s = f();
-      if (s.find("ran for") == std::string::npos) { return; }
-      std::lock_guard<std::mutex> lk(mu);
-      ran.push_back(s);
-    }
-    vpipe::UiInputStatus getline(const vpipe::VpipeFormat&, std::string&,
-                                 const std::function<bool()>&) override {
-      return vpipe::UiInputStatus::Eof;
-    }
-    std::unique_ptr<vpipe::UiTextStream> open_text_stream() override {
-      return std::make_unique<vpipe::NullUiTextStream>();
-    }
-  };
   auto owned = std::make_unique<RanLines>();
   RanLines* ui = owned.get();
   sess.set_ui_delegate(std::move(owned));
@@ -831,4 +839,48 @@ TEST(pipeline_runtime, satisfied_service_requirement_launches) {
   vpipe::PipelineRuntime rt(pl.get(), &sess);
   EXPECT_TRUE(rt.launch());
   rt.stop();
+}
+
+
+// A SELF-COMPLETED RUN HAS NOT REPORTED YET, and that is the whole
+// reason a host has to reap.
+//
+// When every stage signals done the drivers drain on their own, but
+// nothing calls stop() -- so `running()` is still set, the runtime still
+// holds its stages, and the "ran for" line is OWED and unprinted. The
+// web UI reached reap_completed_() only from three GET handlers, which
+// the browser polls only while the Pipeline Manager or Composer view is
+// mounted. Watch the User I/O page for the summary and no poll ever
+// came: the run ended, the console said nothing, and the pipeline read
+// as Running until you navigated back. It looked random because the
+// variable was which view happened to be open.
+//
+// The duration is the second casualty: it is measured launch -> stop(),
+// so a late reap does not merely delay the line, it INFLATES it.
+// MEASURED against the fix, same two-stage graph: 510 ms reaped by a
+// server-side tick against 14.0 s reaped by the first poll after a
+// 14-second wait.
+TEST(pipeline_runtime, a_self_completed_run_owes_its_summary_until_stop) {
+  vpipe::Session sess;
+  auto owned = std::make_unique<RanLines>();
+  RanLines* ui = owned.get();
+  sess.set_ui_delegate(std::move(owned));
+
+  auto w = build_pipeline(sess, 100);
+  vpipe::PipelineRuntime rt(w.pipeline.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+
+  // Drained on its own, with nobody having asked it to stop.
+  EXPECT_TRUE(rt.self_completed());
+  EXPECT_TRUE(rt.running());
+  // ... and NOTHING has been reported. A host that never calls stop()
+  // leaves this line unprinted for the life of the process, which is
+  // the defect a polling-driven reap produced.
+  EXPECT_TRUE(ui->count() == 0);
+
+  rt.stop();
+  EXPECT_TRUE(ui->count() == 1);
+  std::printf("[pipeline_runtime] self-completed: owed 0 lines before "
+              "stop, 1 after\n");
 }

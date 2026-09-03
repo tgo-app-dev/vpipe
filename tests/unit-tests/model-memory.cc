@@ -20,6 +20,7 @@
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "pipeline/pipeline-runtime.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -1841,4 +1842,234 @@ TEST(model_memory, mapping_is_off_whenever_streaming_or_wiring)
   EXPECT_FALSE(genai::weights_may_be_mapped(true, false));    // streaming
   EXPECT_FALSE(genai::weights_may_be_mapped(false, true));    // pool on
   EXPECT_FALSE(genai::weights_may_be_mapped(true, true));
+}
+
+// A PHASE ON A DECLARATION IS HONOURED, and the planner must not say
+// otherwise.
+//
+// `ResourceClaim::phase` is a declaration-time field -- "Optional
+// LIFETIME", empty meaning the whole run -- and every VAE stage sets it
+// to `decode`, because a VAE is loaded when a latent arrives and dropped
+// after: charging its whole weight to the conditioning and denoise
+// columns is what turns a graph that runs into a graph that reads as too
+// big.
+//
+// The weights planner warned that a declared phase was "ignored" and
+// told callers to move it to decide_resources. That was true of the
+// commit that added the warning and stopped being true three days later,
+// when claim() started forwarding `phase` to declare_weights -- so the
+// warning outlived its subject and fired on every graph with a
+// vae-decode in it, advising a move that was never needed. The two-pass
+// split exists to stop a stage READING accumulating manager state in
+// declare_resources; it was never about describing a lifetime.
+//
+// This goes through the PLANNER rather than declare_weights directly,
+// because the planner is the part that was dropping it, and a test that
+// called the manager would have passed throughout.
+TEST(model_memory, a_declared_phase_survives_the_planner)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-declphase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("diffusion_models/dit.safetensors", 8000);
+  put("vae/vae.safetensors", 2000);
+  const std::string dit = (root / "diffusion_models").string();
+  const std::string vae = (root / "vae").string();
+
+  // Exactly what the runtime does: begin, every stage's claims, end.
+  // The DiT is unphased (held throughout); the VAE names `decode` the
+  // way VaeDecodeStage::declare_resources does.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, std::string(model_memory::kPhaseDecode), "", 0);
+  pl->end_plan(&s);
+
+  // The denoise does not carry the VAE; the decode carries both.
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDenoise)) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecode)) == 10000u);
+  // And the peak is the widest phase, not the sum of every claim ever
+  // made -- which is the number an ignored phase would have produced.
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 10000u);
+
+  fs::remove_all(root, ec);
+}
+
+namespace {
+
+// RAII for VPIPE_RAM_LIMIT_MB, which every memory decision reads to
+// decide what it BELIEVES the box has.
+class RamLimit {
+public:
+  explicit RamLimit(const char* mb) { ::setenv("VPIPE_RAM_LIMIT_MB", mb, 1); }
+  ~RamLimit()                       { ::unsetenv("VPIPE_RAM_LIMIT_MB"); }
+};
+
+}   // namespace
+
+// A PEAK OVER BELIEVED RAM REPORTS; IT DOES NOT REFUSE -- and the advice
+// it gives names the free fix first.
+//
+// The message used to end "It does not fit at any setting", which is a
+// verdict, and the graph it was aimed at ran to completion. These models
+// hold their weights in mlock-WIRED buffers and the pool has a ceiling:
+// past it WiredPool::wirable() gates ADMISSION rather than merely
+// wiring, so a block nothing can protect is not kept at all and the
+// resident set falls back toward its streaming floor. That costs a
+// re-read per forward -- speed -- not correctness, and nothing fails to
+// allocate: a refused buffer is still allocated, just unwired.
+//
+// So the contract this pins is (a) end_plan does NOT refuse, and (b) the
+// remedy an operator reads first is `unload_when_idle`, ahead of the two
+// that trade output for room. Asserting the ORDER rather than the
+// wording, so the prose can be edited without breaking the test but the
+// priority cannot be silently inverted.
+TEST(model_memory, over_believed_ram_reports_and_advises_unload_first)
+{
+  // The UI delegate, not the log delegate: Session::warn routes there.
+  auto  ui_owner = std::make_unique<CapturingUi>();
+  auto* ui       = ui_owner.get();
+  Session s;
+  s.set_ui_delegate(std::move(ui_owner));
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-overram";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  // Comfortably over the 1 MB box below, so `need` clears it after the
+  // >> 20 the message prints in.
+  put("diffusion_models/dit.safetensors", 6u << 20);
+  put("vae/vae.safetensors", 3u << 20);
+
+  RamLimit tiny("1");
+  pl->begin_plan(&s);
+  pl->claim(&s, (root / "diffusion_models").string(), "", "", 0);
+  pl->claim(&s, (root / "vae").string(),
+            std::string(model_memory::kPhaseDecode), "", 0);
+  // REPORTED, NOT REFUSED. wired_pool_enforce is off by default, and a
+  // graph over believed RAM is exactly the case that still runs.
+  EXPECT_TRUE(pl->end_plan(&s));
+
+  std::string msg;
+  for (const std::string& l : ui->lines) {
+    if (l.find("estimated peak") != std::string::npos) { msg = l; break; }
+  }
+  EXPECT_TRUE(!msg.empty());
+  if (msg.empty()) { fs::remove_all(root, ec); return; }
+  // The old verdict is gone.
+  EXPECT_TRUE(msg.find("does not fit at any setting") == std::string::npos);
+  // Streaming is already inside the number, so recommending it would be
+  // advice that cannot be taken.
+  const std::size_t unload = msg.find("unload_when_idle");
+  const std::size_t geom   = msg.find("geometry");
+  const std::size_t quant  = msg.find("quantized");
+  EXPECT_TRUE(unload != std::string::npos);
+  EXPECT_TRUE(geom != std::string::npos);
+  EXPECT_TRUE(quant != std::string::npos);
+  // The free fix is offered BEFORE the two that cost output quality.
+  EXPECT_TRUE(unload < geom && unload < quant);
+  // And it names the policy that actually shortens a lifetime.
+  EXPECT_TRUE(msg.find("destroy") != std::string::npos);
+  EXPECT_TRUE(msg.find("park") != std::string::npos);
+
+  fs::remove_all(root, ec);
+}
+
+// EVERY PHASE IN THE RUNNING ORDER IS DECIDABLE.
+//
+// The planner's decide() hand-listed condition/denoise/decode and so
+// rejected `decode-audio`, which has been a first-class phase since the
+// two decodes were split apart ("an audio VAE and a video VAE are loaded
+// and dropped independently, and summing them sizes a moment that does
+// not happen"). A stage deciding it correctly was told its phase was
+// unknown and had its claim counted resident for the WHOLE RUN -- an
+// over-count that lands in every other phase's column, which is how a
+// graph starts reading as too big for its box.
+//
+// Driven from kPhasesInOrder rather than from a list written here, so
+// the test cannot desync the way the code did: adding a phase adds a
+// case automatically.
+TEST(model_memory, every_phase_in_the_order_can_be_decided)
+{
+  auto  ui_owner = std::make_unique<CapturingUi>();
+  auto* ui       = ui_owner.get();
+  Session s;
+  s.set_ui_delegate(std::move(ui_owner));
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-allphases";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const int n = model_memory::phase_count();
+  EXPECT_TRUE(n > 0);
+  std::vector<std::string> dirs;
+  for (int i = 0; i < n; ++i) {
+    const fs::path d = root / ("c" + std::to_string(i));
+    fs::create_directories(d, ec);
+    std::ofstream f(d / "w.safetensors", std::ios::binary);
+    std::string blob(1000, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+    dirs.push_back(d.string());
+  }
+
+  pl->begin_plan(&s);
+  for (const std::string& d : dirs) { pl->claim(&s, d, "", "", 0); }
+  // One component per phase, each deciding the phase it really runs in.
+  for (int i = 0; i < n; ++i) {
+    pl->decide(&s, dirs[(std::size_t)i],
+               std::string(model_memory::phase_name(i)));
+  }
+  pl->end_plan(&s);
+
+  // Not one of them may be called unknown.
+  const bool any_unknown = ui->contains("decides unknown phase");
+  if (any_unknown) {
+    for (const std::string& l : ui->lines) {
+      std::printf("[all-phases] %s\n", l.c_str());
+    }
+  }
+  EXPECT_FALSE(any_unknown);
+  // And each really landed in its own phase: every phase carries its own
+  // 1000 bytes and nothing else, so the peak is one component, not four.
+  for (int i = 0; i < n; ++i) {
+    EXPECT_TRUE(mgr->phase_footprint(
+                    std::string(model_memory::phase_name(i))) == 1000u);
+  }
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 1000u);
+
+  fs::remove_all(root, ec);
 }

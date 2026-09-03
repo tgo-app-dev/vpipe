@@ -3,6 +3,7 @@
 
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/lora-names.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -2369,7 +2370,10 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // pipeline stop is honored within ~one block even on the preloaded path
       // (a slow high-res step otherwise runs all blocks before responding).
       if (_stream_stop && _stream_stop()) { return {}; }
-      if (_block_progress) { _block_progress(L, c.n_layers); }
+      // On the GPU's clock: this stack commits ONCE at the end of the
+      // forward, so reporting inline would time the encode. See
+      // shared/dit-gpu-progress.h.
+      report_block(stream, _block_progress, L, c.n_layers);
       // Resident in _blocks once residency has promoted it, and
       // streamed until then. An unfilled slot reads as empty.
       const bool held = L < (int)_blocks.size() &&

@@ -3,6 +3,7 @@
 
 #include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -2647,9 +2648,10 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
       // tail) so a slow high-res step responds within ~one block on the
       // preloaded path too.
       if (_stream_stop && _stream_stop()) { return {}; }
-      if (_block_progress) {
-        _block_progress(L, c.n_double + c.n_single);
-      }
+      // On the GPU's clock: the double stack commits ONCE, after the
+      // loop, so reporting inline would time the encode. See
+      // shared/dit-gpu-progress.h.
+      report_block(stream, _block_progress, L, c.n_double + c.n_single);
       // Resident once residency has promoted it, and read into a slot
       // until then. The vector is sized to n_double in streaming mode
       // and an unfilled entry reads as empty -- an INDEX test would be
@@ -2825,11 +2827,6 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
   const bool ff_direct = _fn_transpose_rs.valid() && have_mlp_rs;
   for (int L = 0; L < c.n_single; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }   // pipeline stop, any mode
-    // Continues the double stack's numbering: one progress sequence over
-    // the whole forward, not two that each restart at zero.
-    if (_block_progress) {
-      _block_progress(c.n_double + L, c.n_double + c.n_single);
-    }
     // As above: resident once promoted, read into a slot until then.
     const bool held = L < (int)_single.size() &&
                       !_single[(std::size_t)L].o.empty();
@@ -2856,6 +2853,14 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
+    // Continues the double stack's numbering: one progress sequence over
+    // the whole forward, not two that each restart at zero. Reported
+    // here, after the stream exists, rather than at the top of the
+    // iteration -- this stack fences per block, so the two are the same
+    // instant today, and routing it through the same helper is what
+    // stops that being load-bearing.
+    report_block(stream, _block_progress, c.n_double + L,
+                 c.n_double + c.n_single);
     auto op = make_ops(enc);
     ln_mod_joint(op, joint, H, 0, nrm);                    // (1+scale)*LN+shift
     op.tap("sgl_norm", L, nrm, 0, seq, H);

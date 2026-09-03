@@ -17,8 +17,11 @@
 #include "interfaces/ui-delegate-intf.h"
 #include "stages/denoise-progress.h"
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -35,6 +38,15 @@ frac_(const UiProgressRegistry& reg, std::uint64_t id)
     }
   }
   return -1.0;
+}
+
+// Stage and publish in one go -- what report_block() does when there is
+// no command buffer to defer the publish onto, and what a plugin's own
+// loop does. The two-phase cases below drive the halves separately.
+void
+fire_(DenoiseProgress& prog, int done, int total)
+{
+  if (auto publish = prog.block_fn()(done, total)) { publish(); }
 }
 
 // Drive `prog` through a whole loop -- `fwds` forwards per step, `blocks`
@@ -64,7 +76,7 @@ run_loop_(DenoiseProgress& prog, const UiProgressRegistry& reg,
   for (int s = 0; s < steps; ++s) {
     for (int f = 0; f < fwds; ++f) {
       for (int b = 0; b < blocks; ++b) {
-        prog.block_fn()(b, blocks);
+        fire_(prog, b, blocks);
         r.sample(reg, id);
       }
       prog.end_forward();
@@ -118,7 +130,7 @@ TEST(denoise_progress, adopts_the_samplers_real_step_count)
   UiProgress bar2(reg2, id2);
   DenoiseProgress prog2(&bar2, /*steps=*/40, /*forwards_per_step=*/1);
   Run r2;
-  prog2.block_fn()(0, 50);            // one block tick at the wrong total
+  fire_(prog2, 0, 50);                // one block tick at the wrong total
   prog2.set_steps(3);
   run_loop_(prog2, *reg2, id2, r2, 3, 1, 50);
   EXPECT_TRUE(r2.bounded);
@@ -166,7 +178,7 @@ TEST(denoise_progress, a_step_boundary_is_exact)
   DenoiseProgress prog(&bar, steps, 1);
   bool exact = true;
   for (int s = 0; s < steps; ++s) {
-    for (int b = 0; b < 16; ++b) { prog.block_fn()(b, 16); }
+    for (int b = 0; b < 16; ++b) { fire_(prog, b, 16); }
     prog.end_forward();
     prog.end_step(s);
     const double want = (double)(s + 1) / (double)steps;
@@ -236,4 +248,109 @@ TEST(denoise_progress, rearm_moves_the_hook_and_clears_the_old_model)
     EXPECT_TRUE((bool)low.fn);
   }
   EXPECT_TRUE(!low.fn);             // and the scope still clears
+}
+
+// ---- reporting on the GPU's clock ------------------------------------
+//
+// The publish half is delivered from a Metal command-buffer completion
+// handler (generative-models/shared/dit-gpu-progress.h), which changes
+// two things this mapping never had to survive: it arrives on a foreign
+// thread, and it can arrive LATE -- after the step it belongs to has been
+// re-synced past, or after the stack local that owns the bar has gone.
+//
+// Neither is reachable from a stage, which is why they are asserted here:
+// the shapes below are what a completion handler does, written out by
+// hand -- stage inside the forward, publish whenever.
+
+TEST(denoise_progress, a_late_publish_lands_where_it_was_staged)
+{
+  // The point of staging on the forward's thread. Hold the publishes for
+  // a whole forward, cross the step boundary, and only then let them go:
+  // they must report the positions they were STAGED at, which the bar has
+  // already passed, and so change nothing. Resolving at publish time
+  // instead would read the new step's base and jump the bar most of a
+  // step ahead of the truth.
+  auto reg = std::make_shared<UiProgressRegistry>();
+  const std::uint64_t id = reg->open("denoise");
+  UiProgress bar(reg, id);
+  DenoiseProgress prog(&bar, /*steps=*/4, /*forwards_per_step=*/1);
+  auto fn = prog.block_fn();
+
+  std::vector<std::function<void()>> held;
+  for (int b = 0; b < 10; ++b) { held.push_back(fn(b, 10)); }
+  prog.end_forward();
+  prog.end_step(0);
+  const double after_step = frac_(*reg, id);
+  EXPECT_TRUE(after_step == 0.25);
+
+  for (auto& pub : held) { if (pub) { pub(); } }
+  EXPECT_TRUE(frac_(*reg, id) == after_step);
+
+  // A block staged in the NEW forward still moves it: 10 + 5 of 40.
+  if (auto pub = fn(5, 10)) { pub(); }
+  EXPECT_TRUE(frac_(*reg, id) == 0.375);
+}
+
+TEST(denoise_progress, a_publish_after_the_reporter_dies_is_inert)
+{
+  // The forward's last commit is waited for, but the completion handler
+  // runs on a Metal thread and is not ordered against that wait -- so the
+  // final block can publish after the DenoiseProgress (a stack local) has
+  // gone. The closure holds the state by shared_ptr and the destructor
+  // cuts the bar loose, so this is a no-op rather than a write through a
+  // dangling pointer.
+  auto reg = std::make_shared<UiProgressRegistry>();
+  const std::uint64_t id = reg->open("denoise");
+  std::function<void()> orphan;
+  {
+    UiProgress bar(reg, id);
+    DenoiseProgress prog(&bar, /*steps=*/2, /*forwards_per_step=*/1);
+    auto fn = prog.block_fn();
+    if (auto pub = fn(4, 8)) { pub(); }
+    EXPECT_TRUE(frac_(*reg, id) == 0.25);
+    orphan = fn(7, 8);              // staged, never published
+  }
+  // Both the bar and the progress are gone; the closure is not.
+  if (orphan) { orphan(); }
+  EXPECT_TRUE(true);                // reaching here without a fault is it
+}
+
+TEST(denoise_progress, concurrent_publishes_stay_monotonic)
+{
+  // Publishes for different command buffers are delivered by Metal, not
+  // by us, so nothing in this process serialises them against each other
+  // or against the denoise loop's own end_step(). The bar must come out
+  // monotonic and in range regardless of how they interleave.
+  auto reg = std::make_shared<UiProgressRegistry>();
+  const std::uint64_t id = reg->open("denoise");
+  UiProgress bar(reg, id);
+  const int kSteps = 8, kBlocks = 28;
+  DenoiseProgress prog(&bar, kSteps, /*forwards_per_step=*/1);
+  auto fn = prog.block_fn();
+
+  std::atomic<bool> bad{false};
+  double last = 0.0;
+  for (int s = 0; s < kSteps; ++s) {
+    // Staged in order on this thread, as a forward does...
+    std::vector<std::function<void()>> pubs;
+    for (int b = 0; b < kBlocks; ++b) { pubs.push_back(fn(b, kBlocks)); }
+    // ...and published from two threads at once, as two buffers would.
+    auto drain = [&pubs](int lo, int hi) {
+      for (int i = lo; i < hi; ++i) {
+        auto& pub = pubs[(std::size_t)i];
+        if (pub) { pub(); }
+      }
+    };
+    std::thread a([&]() { drain(0, kBlocks / 2); });
+    std::thread b([&]() { drain(kBlocks / 2, kBlocks); });
+    a.join();
+    b.join();
+    prog.end_forward();
+    prog.end_step(s);
+    const double f = frac_(*reg, id);
+    if (f < last - 1e-12 || f > 1.0 + 1e-12) { bad = true; }
+    last = f;
+  }
+  EXPECT_TRUE(!bad);
+  EXPECT_TRUE(last == 1.0);
 }

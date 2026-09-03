@@ -218,6 +218,18 @@ public:
 
   const StageSpec& spec() const noexcept override;
 
+  // How many keyframe anchors a MiniMax-H3 request takes: 0 for
+  // text-to-video, 1 for a first frame, 2 for first AND last. Sets
+  // `*ignored` when a keyframe was wired and had to be dropped.
+  //
+  // Public and static for the reason VideoRefEncoderStage::
+  // media_from_beat is: this is the part of the port contract that
+  // fails SILENTLY when it is wrong -- a Ref2VA graph takes no anchors
+  // at all, so a wired keyframe is read and goes nowhere -- and that
+  // deserves a test which needs neither a 33B model nor a runtime.
+  static int h3_anchor_count(bool is_ref2va, bool have_keyframe,
+                             int ref_frames, bool* ignored);
+
   // Test-only accessors.
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }
@@ -326,6 +338,10 @@ private:
   ResolvedModel _resolved;
   bool _have_cfg    = false;
   bool _two_experts = false;
+  // Said ONCE: a keyframe anchor wired on a Ref2VA graph. A continuous
+  // graph makes one clip per beat, and the wiring cannot change between
+  // them, so repeating it per request would bury every other line.
+  bool _kf_on_ref2va_said = false;
   std::string _root;
 
   // Load expert `which`, dropping whichever is resident first. The drop

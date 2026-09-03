@@ -12,6 +12,9 @@
 #include "interfaces/ui-delegate-intf.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
 
 namespace vpipe {
 
@@ -22,7 +25,14 @@ namespace vpipe {
 // step is ~2 s and a 20B Qwen-Image step ~12 s, so the report sits still
 // for the entire time anything is actually happening. The DiT already
 // walks its blocks one at a time, so counting those gives 25-60x the
-// resolution for a callback that costs a compare.
+// resolution for a callback that costs a lock and a small closure.
+//
+// ON THE GPU'S CLOCK, not the encode thread's, which is what the two
+// phases below are for -- see DitBlockProgressFn and
+// shared/dit-gpu-progress.h. A resident DiT encodes its whole stack in
+// under a millisecond and then runs it for tens of seconds, so a bar
+// driven from the block loop leaps a full step and freezes, which is
+// exactly the "sometimes fast, sometimes stuck" a user reports.
 //
 // Guidance runs the DiT TWICE per step, and the sampler may call the
 // denoise function more than once, so the block count alone cannot say
@@ -32,22 +42,58 @@ namespace vpipe {
 class DenoiseProgress {
 public:
   DenoiseProgress(UiProgress* bar, int steps, int forwards_per_step)
-      : _bar(bar), _steps(steps), _fwds(forwards_per_step < 1
-                                            ? 1 : forwards_per_step)
+      : _s(std::make_shared<State>())
   {
+    _s->bar   = bar;
+    _s->steps = steps;
+    _s->fwds  = forwards_per_step < 1 ? 1 : forwards_per_step;
   }
 
+  // CUT THE BAR LOOSE, do not assume nobody is still holding the
+  // callback.
+  //
+  // The report is delivered from a Metal command-buffer completion
+  // handler (see shared/dit-gpu-progress.h), which runs on a Metal
+  // thread and is NOT ordered against the wait_ok() that saw the same
+  // buffer finish -- so the last block of the last forward can be
+  // reported after this stack local has gone. The state outlives us by
+  // shared_ptr and a null bar makes every late report a no-op.
+  ~DenoiseProgress()
+  {
+    std::lock_guard<std::mutex> lk(_s->mu);
+    _s->bar = nullptr;
+  }
+
+  DenoiseProgress(const DenoiseProgress&)            = delete;
+  DenoiseProgress& operator=(const DenoiseProgress&) = delete;
+
   // Hand this to MetalXTransformer::set_block_progress.
+  //
+  // TWO PHASES (see DitBlockProgressFn). The outer call runs on the
+  // forward's thread and resolves the block to an ABSOLUTE position in
+  // the denoise loop; the closure it returns publishes that position and
+  // may run much later, on a Metal thread. Resolving early is what makes
+  // a late publish harmless -- the number was already fixed against the
+  // right forward.
+  //
+  // Captures the STATE, never `this`: the DiT is a stage member that
+  // outlives this object, and a closure already handed to a command
+  // buffer cannot be recalled.
   genai::DitBlockProgressFn block_fn()
   {
-    return [this](int done, int total) { on_block_(done, total); };
+    return [s = _s](int done, int total) -> std::function<void()> {
+      const long long at = stage_(s, done, total);
+      if (at < 0) { return {}; }
+      return [s, at]() { publish_(s, at); };
+    };
   }
 
   // Call where a forward RETURNS: the callback fires on block ENTRY, so
   // the last block's work is only accounted for here.
   void end_forward()
   {
-    if (_blocks > 0) { _base += _blocks; }
+    std::lock_guard<std::mutex> lk(_s->mu);
+    if (_s->blocks > 0) { _s->base += _s->blocks; }
   }
 
   // Adopt the step count the SAMPLER is actually running.
@@ -60,48 +106,86 @@ public:
   // carries it, and a bar told 4 while 3 run stops at 75% and reads as a
   // hang at the end of every generation.
   //
-  // Safe mid-run: the totals are recomputed from _steps on each update.
+  // Safe mid-run: the totals are recomputed from steps on each update.
   void set_steps(int n)
   {
-    if (n > 0) { _steps = n; }
+    if (n <= 0) { return; }
+    std::lock_guard<std::mutex> lk(_s->mu);
+    _s->steps = n;
   }
 
   // Call at the end of denoise step `i` (0-based).
   void end_step(int i)
   {
-    if (_bar == nullptr || _blocks <= 0) {
-      if (_bar != nullptr) { _bar->update((std::uint64_t)(i + 1),
-                                          (std::uint64_t)_steps); }
+    std::lock_guard<std::mutex> lk(_s->mu);
+    if (_s->bar == nullptr) { return; }
+    if (_s->blocks <= 0) {
+      _s->bar->update((std::uint64_t)(i + 1), (std::uint64_t)_s->steps);
       return;
     }
-    _base = (long long)(i + 1) * _fwds * _blocks;
-    _bar->update((std::uint64_t)_base, (std::uint64_t)total_());
+    _s->base = (long long)(i + 1) * _s->fwds * _s->blocks;
+    _s->publish(_s->base);
   }
 
 private:
-  void on_block_(int done, int total)
+  // Shared with every in-flight completion handler, so it must outlive
+  // the object that made it and be safe on any thread.
+  struct State {
+    std::mutex  mu;
+    UiProgress* bar    = nullptr;
+    int         steps  = 0;
+    int         fwds   = 1;
+    int         blocks = 0;      // learned from the first callback
+    long long   base   = 0;      // blocks completed before this forward
+    long long   high   = 0;      // the furthest the bar has been told
+
+    long long total() const { return (long long)steps * fwds * blocks; }
+
+    // MONOTONIC, and that is the point rather than a nicety. Handlers
+    // for several blocks ride one command buffer and fire together, and
+    // one for an early block can land after end_step() has re-synced
+    // past it; publishing that would walk the bar backwards. Keeping the
+    // furthest makes a buffer's worth of reports collapse to the last
+    // block it actually contained.
+    //
+    // Called under `mu`.
+    void publish(long long d)
+    {
+      if (bar == nullptr) { return; }
+      const long long t = total();
+      if (t <= 0) { return; }
+      if (d > t) { d = t; }       // an extra forward: clamp, do not wrap
+      if (d < high) { return; }
+      high = d;
+      bar->update((std::uint64_t)d, (std::uint64_t)t);
+    }
+  };
+
+  // PHASE 1, on the forward's thread: what absolute position is this
+  // block? Negative means there is nothing to report.
+  static long long stage_(const std::shared_ptr<State>& s, int done,
+                          int total)
   {
-    if (_bar == nullptr || total <= 0) { return; }
-    _blocks = total;
-    // Clamp: an extra forward (a sampler that evaluates more than _fwds
-    // times) would otherwise push the bar past 100%, which reads as a bug
-    // even though the step boundary re-syncs it a moment later.
-    const long long t = total_();
-    long long d = _base + done;
-    if (d > t) { d = t; }
-    _bar->update((std::uint64_t)d, (std::uint64_t)t);
+    std::lock_guard<std::mutex> lk(s->mu);
+    if (s->bar == nullptr || total <= 0) { return -1; }
+    // Re-baseline if the stack size is not what it was: `high` counts
+    // blocks, so a different stack makes every earlier reading
+    // incomparable.
+    if (s->blocks != total) {
+      s->blocks = total;
+      s->high   = 0;
+    }
+    return s->base + done;
   }
 
-  long long total_() const
+  // PHASE 2, on whatever thread the GPU's completion handler runs.
+  static void publish_(const std::shared_ptr<State>& s, long long at)
   {
-    return (long long)_steps * _fwds * _blocks;
+    std::lock_guard<std::mutex> lk(s->mu);
+    s->publish(at);
   }
 
-  UiProgress* _bar    = nullptr;
-  int         _steps  = 0;
-  int         _fwds   = 1;
-  int         _blocks = 0;      // learned from the first callback
-  long long   _base   = 0;      // blocks completed before the current forward
+  std::shared_ptr<State> _s;
 };
 
 // Installs the block hook for a scope and CLEARS it on the way out.

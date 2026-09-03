@@ -252,6 +252,11 @@ public:
   // with -- the same dirs its own sizing uses, so the declaration and
   // the estimate cannot disagree.
   std::vector<ResourceClaim> declare_resources() const override;
+  // The encoder's PHASE, once every stage has declared. Split out for
+  // the reason the two-pass planner exists: whether this stage will
+  // certainly let go of its 32B encoder is a DECISION, and a decision
+  // taken in declare_resources() reads a half-built picture.
+  std::vector<ResourceClaim> decide_resources() const override;
   // See Stage::declare_memory.
   StageMemory declare_memory() const override;
 

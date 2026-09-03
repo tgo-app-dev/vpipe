@@ -9,6 +9,7 @@
 #include "generative-models/shared/streamed-refill.h"
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -4654,7 +4655,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         if (err != nullptr) { *err = "stopped"; }
         return {};
       }
-      if (_block_progress) { _block_progress(Lx, c.n_layers); }
+      // On the GPU's clock. A resident stack encodes all 50 blocks in
+      // milliseconds and then runs for a minute, so an inline report
+      // would race to 100% and sit there. See
+      // shared/dit-gpu-progress.h.
+      report_block(stream, _block_progress, Lx, c.n_layers);
       // Pinned prefix (Lx < _pinned) is resident in _blocks; the tail is
       // read from the retained weight set into a loop-local Block and
       // freed when the iteration ends. The whole forward is otherwise ONE
@@ -4916,30 +4921,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
       }
-      // A RESIDENT stack encodes all 50 blocks in milliseconds and then
-      // runs for a minute, so `_block_progress` -- which fires at the top
-      // of each iteration, on the ENCODE thread -- would race to 100% and
-      // sit there. The streamed path does not have that problem only
-      // because it must already commit-and-wait per block to free the
-      // weights, which paces its callbacks against real work by accident.
+      // NO BARRIER HERE ANY MORE. A resident stack used to commit and
+      // re-encode per block whenever a bar was attached, purely so the
+      // per-block report was paced by something real. report_block()
+      // above does that from a completion handler instead, which costs
+      // no commit, no re-encode and no pipeline bubble -- so a watched
+      // run and an unwatched one now encode identically.
       //
-      // So take the same barrier deliberately when someone is watching.
-      // It costs a commit and a re-encode per block -- sub-millisecond
-      // against ~1.5 s of GPU per block at production geometry, and there
-      // is no CPU work to overlap with anyway, since encoding is the only
-      // thing this thread does. Gated on the callback so a run with no UI
-      // attached keeps one uninterrupted stream.
-      if (!streaming && _block_progress) {
-        enc.end();
-        std::string blk_err;
-        if (!stream.commit().wait_ok(&blk_err)) {
-          return fail("block " + std::to_string(Lx) + ": " +
-                      (blk_err.empty() ? std::string("GPU error") : blk_err));
-        }
-        stream = _mc->make_command_stream();
-        enc = stream.begin_compute();
-        mark = std::chrono::steady_clock::now();
-      }
+      // What goes with it is a GPU error being attributed to the block
+      // that caused it. The terminal commit still REPORTS the failure,
+      // it just cannot name the block any more -- and it never could on
+      // an unwatched run, so this drops a diagnostic that was only
+      // present when a bar happened to be attached rather than one
+      // anything relied on.
       if (streaming) {
         enc.end();
         std::string blk_err;

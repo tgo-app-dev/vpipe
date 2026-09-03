@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
@@ -917,7 +918,8 @@ MetalWanTransformer::forward(const SharedBuffer& latents, int T, int h, int w,
 
     // ---- blocks -------------------------------------------------------
     for (int L = 0; L < c.n_layers; ++L) {
-      if (_block_progress) { _block_progress(L, c.n_layers); }
+      // On the GPU's clock -- the whole stack commits once, below.
+      report_block(stream, _block_progress, L, c.n_layers);
       const Block& b = _blocks[(std::size_t)L];
       // shift, scale, gate, c_shift, c_scale, c_gate -- the reference's
       // chunk order over the 6-way table.

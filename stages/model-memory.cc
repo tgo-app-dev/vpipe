@@ -52,6 +52,13 @@ phase_count()
   return (int)(sizeof(kPhasesInOrder) / sizeof(*kPhasesInOrder));
 }
 
+std::string_view
+phase_name(int index)
+{
+  if (index < 0 || index >= phase_count()) { return {}; }
+  return kPhasesInOrder[index];
+}
+
 std::size_t
 phys_ram()
 {
@@ -595,16 +602,22 @@ public:
     // A floor bigger than the checkpoint is a caller mistake, and taking
     // it would report a streamed total ABOVE the preloaded one. Clamp
     // rather than trust: this figure decides whether a graph is refused.
-    // A phase on a DECLARATION is ignored, and said out loud. This pass
-    // runs while the picture is still being assembled, so honouring one
-    // here would make it visible to whichever stages are visited next
-    // and invisible to the rest -- order-dependence in the phase built
-    // to remove it. Phases belong in Stage::decide_resources.
-    if (!phase.empty() && session != nullptr) {
-      session->warn(fmt(
-          "resource-plan: '{}' names phase '{}' in declare_resources, where "
-          "it is ignored; move it to decide_resources", dir, phase));
-    }
+    // A phase on a DECLARATION is HONOURED, and passing it here is the
+    // normal way to state one -- ResourceClaim::phase is a declaration
+    // field, and every VAE stage sets it to `decode`.
+    //
+    // This used to WARN that a declared phase was ignored and tell the
+    // caller to move it to decide_resources. That was true of the commit
+    // that added the warning and stopped being true three days later,
+    // when this call started forwarding `phase`; the warning outlived
+    // its subject and fired on every graph holding a vae-decode.
+    // Pinned by model_memory.a_declared_phase_survives_the_planner.
+    //
+    // The two-pass split it appealed to is about READS, not lifetimes: a
+    // stage must not size itself against manager state that accumulates
+    // during the sweep. Describing how long its own claim lives reads
+    // nothing, so it is order-independent and belongs here. Only a
+    // decide-pass REFINEMENT has to be buffered -- see decide().
     mgr->declare_weights(dir, b, phase, last_phase,
                          floor > 0 && floor < b ? floor : 0);
     _declared.fetch_add(b, std::memory_order_relaxed);
@@ -619,8 +632,16 @@ public:
     // it would put the claim in a phase of its own, counted apart from
     // the claims it really coexists with -- an UNDER-count, which is the
     // direction that thrashes. See kPhaseCondition.
-    if (phase != kPhaseCondition && phase != kPhaseDenoise &&
-        phase != kPhaseDecode) {
+    //
+    // Asked of phase_order(), which reads kPhasesInOrder -- the ONE list
+    // the comment above it says exists so nothing can disagree about
+    // what a phase is. This used to hand-list three of the four and so
+    // rejected `decode-audio`, a first-class phase since the two decodes
+    // were split: an audio VAE that correctly decided its own phase was
+    // told it was unknown and counted resident for the WHOLE RUN, which
+    // is the over-count that then reads as a graph too big for the box.
+    // A fourth phase could be added and this could not desync again.
+    if (phase_order(phase) < 0) {
       if (session != nullptr) {
         session->warn(fmt(
             "resource-plan: '{}' decides unknown phase '{}'; counting it as "
@@ -776,15 +797,74 @@ public:
           pool_advice_(mgr, need, ram)));
       return false;
     }
-    const VpipeFormat msg = fmt(
-        "resource-plan: this graph needs at least {} MB resident at its "
-        "peak -- phase '{}', with everything streamable at its floor -- "
-        "and this machine has {} MB. It does not fit at any setting -- "
-        "use a smaller model, a smaller geometry, or a quantized "
-        "checkpoint.",
-        need >> 20, tight, ram >> 20);
-    if (enforce) { session->error(msg); } else { session->warn(msg); }
-    return !enforce;
+    // OVER BELIEVED RAM IS NOT "CANNOT RUN", and the message used to say
+    // it was: "it does not fit at any setting" reads as a verdict on the
+    // graph when it is a reading of an ESTIMATE. The estimate is built
+    // from what stages DECLARE and is conservative on purpose -- a
+    // declaration is an upper bound a component may never reach, an
+    // activation-scratch claim is a bound revised DOWN per beat, and two
+    // components charged to one phase need not peak together inside it.
+    // Graphs reported here do complete, routinely.
+    //
+    // THE IDLE-UNLOAD POLICY IS THE FIRST FIX, and the advice has to say
+    // so rather than listing three knobs of equal weight. `need` is the
+    // WIDEST PHASE, so the usual way a graph lands here is a model still
+    // charged to phases it does not run in -- which is a declaration
+    // problem, not a size problem, and the cheapest thing in this list
+    // to change. `destroy` is what shortens a lifetime; `park` does not
+    // (park_weights() walks CACHED entries, so an uncached-reading model
+    // parks 0 and stays entirely resident -- see the phase-claim rules).
+    // Geometry and a coarser quant are real but they trade output for
+    // room, so they come after the free fix.
+    //
+    // WHAT GOING OVER ACTUALLY COSTS, which is not thrash. These models
+    // hold their weights in mlock-WIRED buffers, and the pool has a
+    // ceiling: past it wire_into_pool() refuses, and WiredPool::wirable()
+    // then gates ADMISSION rather than merely wiring -- a block nothing
+    // can protect is not kept at all. So the resident set collapses
+    // toward the streaming floor and every forward RE-READS its weights
+    // from storage. The run stays correct -- streamed is bit-identical to
+    // preloaded -- and runs at streamed speed.
+    //
+    // Nothing fails to ALLOCATE: a refused buffer is still allocated,
+    // just unwired, and the log calls that "stays reclaimable". That is
+    // the exposure worth naming -- an unwired resident block is the
+    // coldest memory in the process, so the compressor takes it first,
+    // and the run loses exactly the protection it was configured for.
+    // Streaming is already inside `need` (it is the floor reading), so
+    // "turn on streaming" is never the advice here.
+    // One remedy sentence, in the order they should be tried.
+    const std::string fix = fmt(
+        "START WITH unload_when_idle: this is the widest PHASE, so a model "
+        "still charged to phases it does not run in is the usual cause, and "
+        "'destroy' is what shortens it ('park' does not -- a parked model is "
+        "still resident). Only once the phases are as tight as they go is it "
+        "worth a smaller geometry or a more heavily quantized checkpoint.")();
+    if (enforce) {
+      session->error(fmt(
+          "resource-plan: estimated peak {} MB -- phase '{}', with every "
+          "streamable component already at its floor -- against {} MB of "
+          "RAM, and wired_pool_enforce is on, so the graph is refused "
+          "rather than run. {}",
+          need >> 20, tight, ram >> 20, fix));
+      return false;
+    }
+    // The FIX comes before the explanation: an operator reads the first
+    // sentence and acts, so burying the actionable half behind the
+    // mechanism is how advice goes unread.
+    session->warn(fmt(
+        "resource-plan: estimated peak {} MB -- phase '{}', with every "
+        "streamable component already at its floor -- is above this "
+        "machine's {} MB. {} The estimate is what stages DECLARE and is "
+        "deliberately conservative, so this often still completes, and what "
+        "going over costs is SPEED rather than correctness: past the wired "
+        "pool's ceiling a block nothing can protect is not kept at all, so "
+        "the resident set falls back toward its streaming floor and every "
+        "forward re-reads its weights from storage -- with whatever is "
+        "still allocated left unwired and reclaimable rather than "
+        "protected.",
+        need >> 20, tight, ram >> 20, fix));
+    return true;
   }
 
 private:

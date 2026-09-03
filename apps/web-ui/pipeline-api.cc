@@ -16,6 +16,7 @@
 #include "vpipe/session-intf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cxxabi.h>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
@@ -1582,9 +1584,50 @@ PipelineApi::for_each_live_locked(
   }
 }
 
+PipelineApi::~PipelineApi()
+{
+  {
+    std::lock_guard<std::mutex> lk(_reap_mu);
+    _reap_stop = true;
+  }
+  _reap_cv.notify_all();
+  if (_reaper.joinable()) { _reaper.join(); }
+}
+
+// Tear down pipelines that finished on their own, without waiting for a
+// client to ask. See the declaration for why this cannot be left to the
+// GET handlers.
+//
+// The interval is a compromise and not a deadline: a run's summary is
+// worth at most this long a delay, and the walk is a few atomic reads
+// per pipeline. It waits on a condition variable rather than sleeping
+// so shutdown is immediate rather than up to one tick.
+void
+PipelineApi::reaper_loop_()
+{
+  using namespace std::chrono_literals;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(_reap_mu);
+      _reap_cv.wait_for(lk, 500ms, [this] { return _reap_stop; });
+      if (_reap_stop) { return; }
+    }
+    // The SAME lock every handler takes, so a reap cannot interleave
+    // with an edit or a launch. Taken after the wait, never across it.
+    std::lock_guard<std::mutex> lk(_ctx.mu);
+    reap_completed_();
+  }
+}
+
 void
 PipelineApi::register_routes(HttpServer& s)
 {
+  // Started here rather than in the constructor: this is the point the
+  // app is actually serving, and a PipelineApi built in a test that
+  // never registers routes has no reason to run a thread.
+  if (!_reaper.joinable()) {
+    _reaper = std::thread([this] { reaper_loop_(); });
+  }
   s.route("GET", "/api/stage-types",
           [this](const HttpRequest& r) { return h_stage_types_(r); });
   s.route("GET", "/api/pipelines",

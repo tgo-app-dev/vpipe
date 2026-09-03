@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 
 #include "common/flex-data.h"
@@ -1588,7 +1589,10 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       // streamed tail) so a slow preloaded step at high resolution responds to a
       // stop request within one block (~ms) instead of running all 60.
       if (_stream_stop && _stream_stop()) { return {}; }
-      if (_block_progress) { _block_progress(L, n_layers); }
+      // On the GPU's clock: only a STREAMED block commits per
+      // iteration, so a resident stack would otherwise report the
+      // encode. See shared/dit-gpu-progress.h.
+      report_block(stream, _block_progress, L, n_layers);
       // Resident in _blocks once residency has promoted it, and read
       // into a slot until then. `_blocks` is sized to n_layers in
       // streaming mode and an unfilled entry reads as empty.

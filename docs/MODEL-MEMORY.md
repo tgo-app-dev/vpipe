@@ -428,6 +428,16 @@ inside it. Pass 1 writes and does not read; pass 2 reads and does not
 write. Refinements are buffered and applied together at the end, so one
 stage's decision can never move the box another stage is deciding against.
 
+**Which pass a phase belongs in follows from whether it is CONDITIONAL,
+not from the phase field itself.** `ResourceClaim::phase` is a
+declaration field and is honoured wherever it is set, so a lifetime that
+is a fixed property of the stage — a VAE is loaded when a latent arrives
+and dropped after, in every graph — is stated in `declare_resources()`,
+where it reads nothing and cannot depend on visiting order. It is the
+phase whose validity depends on a *decision* (will this stage really
+release its encoder?) that has to wait for pass 2, because deciding is
+what needs the completed picture.
+
 **Two conditions on a phase claim, and neither is checkable by the
 planner.**
 
@@ -1400,15 +1410,57 @@ change something — and a percentage target is only offered when there is
 one at or below 95. Above that there is no such setting, and saying
 "raise it to 723%" reads like one.
 
-A peak above **believed RAM** is the reading that warns, because that is
-the graph no setting holds:
+A peak above **believed RAM** is the other reading that warns:
 
 ```
-resource-plan: this graph needs at least 10833 MB resident at its peak --
-  phase 'decode', with everything streamable at its floor -- and this
-  machine has 8192 MB. It does not fit at any setting -- use a smaller
-  model, a smaller geometry, or a quantized checkpoint.
+resource-plan: estimated peak 10833 MB -- phase 'decode', with every
+  streamable component already at its floor -- is above this machine's
+  8192 MB. START WITH unload_when_idle: this is the widest PHASE, so a
+  model still charged to phases it does not run in is the usual cause,
+  and 'destroy' is what shortens it ('park' does not -- a parked model
+  is still resident). Only once the phases are as tight as they go is it
+  worth a smaller geometry or a more heavily quantized checkpoint. The
+  estimate is what stages DECLARE and is deliberately conservative, so
+  this often still completes, and what going over costs is SPEED rather
+  than correctness: past the wired pool's ceiling a block nothing can
+  protect is not kept at all, so the resident set falls back toward its
+  streaming floor and every forward re-reads its weights from storage --
+  with whatever is still allocated left unwired and reclaimable rather
+  than protected.
 ```
+
+**Read it as a forecast, not a verdict.** The number is built from what
+stages *declare*, and a declaration is an upper bound a component may
+never reach: an activation-scratch claim is a bound revised down per
+beat, and two components charged to one phase need not peak together
+inside it. Graphs reported here complete routinely.
+
+**Going over does not thrash first — it gets slow first.** These models
+hold their weights in mlock-wired buffers, and the pool has a ceiling.
+Past it `wire_into_pool()` refuses, and `WiredPool::wirable()` gates
+**admission** rather than merely wiring: a block nothing can protect is
+not kept at all, because holding it unprotected only feeds the
+admit-compress-shed-readmit cycle wiring exists to break. So the
+resident set collapses toward the streaming floor and each forward
+re-reads its weights from storage — bit-identical output, at streamed
+speed.
+
+Nothing fails to *allocate*. A refused buffer is still allocated, just
+unwired, which the log calls "stays reclaimable"; an unwired resident
+block is the coldest memory in the process, so the compressor takes it
+first and the run loses the protection it was configured for. That is
+the second-order cost, and it is why the remedies are ordered:
+
+1. **`unload_when_idle`.** The number is the *widest phase*, so the usual
+   cause is a model still charged to phases it does not run in — a
+   declaration problem, not a size problem, and free to fix. Use
+   `destroy`; `park` does not shorten a lifetime, because a parked model
+   is still resident.
+2. **Geometry, then a coarser quantization.** Real, but they trade output
+   for room, so they come after the free fix.
+
+Turning on streaming is never the advice here — it is already in the
+number, which is the floor reading.
 
 **`wired_pool_enforce` is FALSE by default**, so a graph the pool cannot
 hold is reported and not refused. A refusal is only as good as the

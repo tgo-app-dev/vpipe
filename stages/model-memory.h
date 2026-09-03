@@ -130,6 +130,14 @@ int phase_order(std::string_view phase);
 // How many phases there are, for a caller walking all of them.
 int phase_count();
 
+// The phase at `index` in the running order, or "" when out of range.
+// The inverse of phase_order(), and the half that was missing: a caller
+// told how MANY phases there are had no way to name them, so anything
+// walking them had to re-list the constants and could then disagree
+// with kPhasesInOrder -- which is exactly how the planner's decide()
+// came to reject `decode-audio`.
+std::string_view phase_name(int index);
+
 // Claims for weights this stage holds only during `phase`.
 //
 // TWO CONDITIONS, both required, and neither is checkable by the

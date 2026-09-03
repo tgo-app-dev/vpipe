@@ -448,6 +448,8 @@ Job VideoRefEncoderStage::process(RuntimeContext&) { co_return; }
 void VideoRefEncoderStage::reset_run_state() {}
 std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const { return {}; }
+std::vector<ResourceClaim>
+VideoRefEncoderStage::decide_resources() const { return {}; }
 
 #else
 
@@ -516,7 +518,83 @@ VideoRefEncoderStage::declare_resources() const
   std::string dit =
       genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
   if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
-  return model_memory::weight_claims({enc, vvae, dit});
+
+  // THE ENCODER IS CLAIMED WITH ITS FLOOR, and that is not the same
+  // thing as declare_memory() already knowing the floor.
+  //
+  // Two ledgers: a floor in declare_memory() is what a run REPORTS, and
+  // a floor on a ResourceClaim is what phase_footprint_floor() and
+  // phase_peak() read -- the only figures a graph is ever judged
+  // against. This stage stated the first and not the second, so its 32B
+  // encoder was judged at full on-disk size while the plan described its
+  // floor correctly, which is the quietest version of this bug because
+  // the number is merely large. Same defect the image path had, and the
+  // same fix; `diffusion-conditioner` has always claimed it this way.
+  std::vector<ResourceClaim> out;
+  out.push_back(model_memory::weight_claim_streamable(
+      enc, genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc)));
+  // The video VAE stays UNPHASED on purpose. This stage holds it during
+  // the CONDITION phase (references are encoded through it) and
+  // vae-decode holds it during DECODE, so its true interval spans both
+  // and an unphased claim already says that. Phasing it here would make
+  // the answer depend on which of the two stages the flattener emitted
+  // first -- condition..decode one way, decode..decode the other, and
+  // the second is an UNDER-count that misses the use this stage makes
+  // of it.
+  //
+  // The DiT is declared here as well, exactly as the conditioner
+  // declares the DiT it is paired with: this claim is what every peer
+  // sizes itself against, and a 66 GB component nobody declared is the
+  // silent under-count the resource-planning phase exists to prevent.
+  for (auto& c : model_memory::weight_claims({vvae, dit})) {
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+// The encoder is charged to the CONDITION phase when this stage will
+// certainly let go of it, and left persistent when it might not.
+//
+// Without this every graph on this stage carried its 32B encoder through
+// the DENOISE, where it is not resident -- and a peak reported at
+// 'denoise' is exactly the reading an operator cannot fix by setting
+// unload_when_idle, because the policy was already right and the PLAN
+// was what did not know.
+//
+// The rules are `diffusion-conditioner`'s, and they are its rules
+// because neither is checkable by the planner. `destroy` qualifies;
+// `auto` only when it will resolve to destroy; `park` releases NOTHING
+// here, because park_weights() walks a weight set's CACHED entries and
+// this encoder reads uncached into the model's own members, so it parks
+// 0 bytes and stays entirely resident. A peer that subtracted it would
+// be short by the encoder's whole size.
+//
+// bounded() is unphased on purpose and is COMPLETE by this point: every
+// stage has declared and no refinement has been applied, so every stage
+// deciding gets the same answer.
+std::vector<ResourceClaim>
+VideoRefEncoderStage::decide_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  namespace fs = std::filesystem;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
+  if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
+
+  const bool releases =
+      _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
+      (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
+       model_memory::bounded(session(), {enc, dit},
+                             model_memory::kHeadroom));
+  if (!releases) { return {}; }
+  return model_memory::weight_claims_in_phase(
+      {enc}, model_memory::kPhaseCondition);
 }
 
 Job

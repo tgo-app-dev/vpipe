@@ -2,6 +2,7 @@
 #include "generative-models/boogu/metal-boogu-transformer.h"
 
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -2243,7 +2244,6 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   // ===== double-stream blocks ==============================================
   for (int L = 0; L < c.n_double; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
-    if (_block_progress) { _block_progress(L, c.n_double + c.n_single); }
     const bool held = L < (int)_double.size() &&
                       !_double[(std::size_t)L].jq_i.empty();
     const bool streaming = _stream_blocks && !held;
@@ -2256,6 +2256,12 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
+    // On the GPU's clock. Both stacks fence per block, so this is
+    // the same instant as reporting at the top of the iteration --
+    // routing it through the same helper is what keeps that from
+    // being load-bearing. See shared/dit-gpu-progress.h.
+    report_block(stream, _block_progress, L,
+                 c.n_double + c.n_single);
     auto op = make_ops(enc);
     double* const acc[3] = {&t_dbl_proj, &t_dbl_attn, &t_dbl_ff};
     auto psplit = [&](int which) {
@@ -2441,10 +2447,6 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
   // ===== single-stream blocks ==============================================
   for (int L = 0; L < c.n_single; ++L) {
     if (_stream_stop && _stream_stop()) { return {}; }
-    // Continues the double stack's numbering: one sequence per forward.
-    if (_block_progress) {
-      _block_progress(c.n_double + L, c.n_double + c.n_single);
-    }
     const bool held = L < (int)_single.size() &&
                       !_single[(std::size_t)L].q.empty();
     const bool streaming = _stream_blocks && !held;
@@ -2461,6 +2463,14 @@ MetalBooguTransformer::forward_dit(const SharedBuffer& instruct, int instr_seq,
     if (prof) { mk = tnow(); }
     CommandStream stream = _mc->make_command_stream();
     ComputeEncoder enc = stream.begin_compute();
+    // On the GPU's clock. Both stacks fence per block, so this is
+    // the same instant as reporting at the top of the iteration --
+    // routing it through the same helper is what keeps that from
+    // being load-bearing. See shared/dit-gpu-progress.h.
+    // Continues the double stack's numbering: one sequence per
+    // forward.
+    report_block(stream, _block_progress, c.n_double + L,
+                 c.n_double + c.n_single);
     auto op = make_ops(enc);
     double* const acc[3] = {&t_sgl_proj, &t_sgl_attn, &t_sgl_ff};
     auto split = [&](int which) {

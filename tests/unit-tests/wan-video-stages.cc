@@ -23,6 +23,7 @@
 #include "stages/audio-video/video-tokens.h"
 #include "stages/minimax-h3-model-config-stage.h"
 #include "stages/model-config-source.h"
+#include "stages/model-memory.h"
 #include "stages/rgb-to-video-stage.h"
 #include "stages/model-provenance.h"
 #include "stages/trigger-beat.h"
@@ -1339,4 +1340,169 @@ TEST(video_ref_encoder, references_are_confined_to_the_file_sandbox)
     }
   }
   fs::remove_all(root, ec);
+}
+
+
+// THE 32B ENCODER IS CHARGED TO THE CONDITION PHASE, AND CLAIMED AT ITS
+// FLOOR.
+//
+// This stage declared its encoder, the video VAE and the DiT as three
+// plain claims: no floor and no phase. Both halves were wrong in the
+// same direction, and both inflated the DENOISE column -- the phase the
+// encoder is provably not resident in, because `destroy` dropped it
+// before the first step.
+//
+//   * NO PHASE meant an operator who had already set unload_when_idle:
+//     destroy on every stage still saw the peak reported at 'denoise',
+//     with nothing left to turn. The policy was right; the plan did not
+//     know. `diffusion-conditioner` has always decided this phase.
+//   * NO FLOOR is the two-ledger trap: declare_memory() knew the
+//     streaming floor and declare_resources() did not, and only the
+//     second is read by phase_footprint_floor()/phase_peak(), which are
+//     the figures a graph is judged against.
+//
+// The video VAE deliberately stays unphased: this stage holds it while
+// encoding references (condition) and vae-decode holds it to decode, so
+// its real interval spans both, and phasing it here would make the
+// answer depend on which stage the flattener emitted first.
+TEST(video_ref_encoder, the_encoder_is_phased_and_claimed_at_its_floor)
+{
+  Session sess;
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("frames", FlexData::make_int(39));
+  cfg.as_object().insert_or_assign("hf_dir",
+                                   FlexData::make_string("/no/such/model"));
+  cfg.as_object().insert_or_assign("unload_when_idle",
+                                   FlexData::make_string("destroy"));
+  VideoRefEncoderStage st(&sess, "refenc", vector<InEdge>{}, cfg);
+  EXPECT_TRUE(st.config_error().empty());
+
+  // An absent model resolves to nothing to claim -- the point here is
+  // the SHAPE of what each pass returns, which is what the planner
+  // consumes, so the assertions below hold for a real dir too.
+  const auto declared = st.declare_resources();
+  const auto decided  = st.decide_resources();
+
+  // Whatever pass 1 claims, none of it may name a phase: a lifetime that
+  // depends on the unload policy is a DECISION and belongs in pass 2.
+  for (const ResourceClaim& c : declared) {
+    EXPECT_TRUE(c.phase.empty());
+  }
+  // Pass 2 is where the encoder's phase lives, and it is `condition`.
+  // The COUNT is asserted, not just the contents: "every decided claim
+  // is phased" is vacuously true of a stage that decides nothing, which
+  // is exactly the bug this test exists to catch.
+  EXPECT_TRUE(decided.size() == 1);
+  if (decided.size() == 1) {
+    EXPECT_TRUE(decided[0].phase == model_memory::kPhaseCondition);
+    // It is ONE of the three declared components that gets the phase,
+    // and the same key pass 1 named -- not a fourth path invented here.
+    bool named_in_declare = false;
+    for (const ResourceClaim& c : declared) {
+      if (c.key == decided[0].key) { named_in_declare = true; }
+    }
+    EXPECT_TRUE(named_in_declare);
+  }
+  // The encoder's streaming FLOOR is on the CLAIM and not only in
+  // declare_memory(), which is the ledger a graph is judged against.
+  // Its VALUE needs a real checkpoint to read layer names out of --
+  // streaming_floor_bytes() answers 0 for a directory that is not
+  // there, which is what this fixture has -- so the value is exercised
+  // by model_memory's floor tests and only the plumbing is asserted
+  // here. Printed so a run against a real dir shows it.
+  std::size_t with_floor = 0;
+  for (const ResourceClaim& c : declared) {
+    if (c.floor_bytes > 0) { ++with_floor; }
+  }
+  std::printf("[video_ref_encoder] %zu of %zu declared claims carry a "
+              "floor (0 expected on a fixture with no checkpoint)\n",
+              with_floor, declared.size());
+
+  // `never` decides NOTHING: a stage that will not let go must not have
+  // its encoder subtracted from any peer's box.
+  auto keep = FlexData::make_object();
+  keep.as_object().insert_or_assign("frames", FlexData::make_int(39));
+  keep.as_object().insert_or_assign("hf_dir",
+                                    FlexData::make_string("/no/such/model"));
+  keep.as_object().insert_or_assign("unload_when_idle",
+                                    FlexData::make_string("never"));
+  VideoRefEncoderStage kept(&sess, "keep", vector<InEdge>{}, keep);
+  EXPECT_TRUE(kept.decide_resources().empty());
+
+  // `park` releases NOTHING here -- park_weights() walks a weight set's
+  // CACHED entries and this encoder reads uncached into its own members,
+  // so it parks 0 bytes and stays entirely resident. Subtracting it
+  // would leave a peer short by the encoder's whole size.
+  auto parked = FlexData::make_object();
+  parked.as_object().insert_or_assign("frames", FlexData::make_int(39));
+  parked.as_object().insert_or_assign("hf_dir",
+                                      FlexData::make_string("/no/such/model"));
+  parked.as_object().insert_or_assign("unload_when_idle",
+                                      FlexData::make_string("park"));
+  VideoRefEncoderStage pk(&sess, "park", vector<InEdge>{}, parked);
+  EXPECT_TRUE(pk.decide_resources().empty());
+
+  std::printf("[video_ref_encoder] declare %zu claims (none phased), "
+              "decide %zu (condition); never/park decide nothing\n",
+              declared.size(), decided.size());
+}
+
+
+// A REF2VA REQUEST TAKES NO KEYFRAME ANCHOR, AND SAYS SO.
+//
+// The two MiniMax-H3 partitions pack different sequences -- FL2VA's is
+// [text | keyframe conditions | target audio | target video] and
+// Ref2VA's is [text | reference blocks | ...] -- so
+// build_ref2va_packed_sequence() has no keyframe parameter and there is
+// nowhere for an anchor to go. A graph wiring vae-encode to iport5 on a
+// Ref2VA checkpoint therefore had its beat read and discarded in
+// silence, and the symptom was a clip whose subject and wardrobe
+// transferred while its opening frame did not -- which reads as the
+// model disobeying rather than as a mode that does not exist. Asking for
+// it in the prompt ("use <Picture 2> as the opening frame") does nothing
+// for the same reason.
+//
+// Tested through the static rather than through run_h3_, which needs a
+// 33B checkpoint: the rule is a property of the partitions, not of the
+// backend, and it is the half that fails silently.
+TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
+{
+  bool ignored = false;
+
+  // FL2VA: one keyframe is first-frame i2v, two are first AND last.
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(false, true, 1,
+                                                  &ignored) == 1);
+  EXPECT_FALSE(ignored);
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(false, true, 2,
+                                                  &ignored) == 2);
+  EXPECT_FALSE(ignored);
+  // More latent frames than anchors is still first+last, not three.
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(false, true, 7,
+                                                  &ignored) == 2);
+
+  // No keyframe wired at all is text-to-video-and-audio, and is NOT
+  // something to report -- it is the ordinary case.
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(false, false, 0,
+                                                  &ignored) == 0);
+  EXPECT_FALSE(ignored);
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, false, 0,
+                                                  &ignored) == 0);
+  EXPECT_FALSE(ignored);
+
+  // REF2VA with a keyframe wired: no anchors, and flagged.
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, true, 1,
+                                                  &ignored) == 0);
+  EXPECT_TRUE(ignored);
+  ignored = false;
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, true, 2,
+                                                  &ignored) == 0);
+  EXPECT_TRUE(ignored);
+
+  // A null out-pointer is allowed -- the count is the contract, the
+  // flag is a courtesy.
+  EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, true, 1,
+                                                  nullptr) == 0);
+
+  std::printf("[generate_video] fl2va 1/2 anchors, ref2va 0 and reported, "
+              "no keyframe 0 and silent\n");
 }

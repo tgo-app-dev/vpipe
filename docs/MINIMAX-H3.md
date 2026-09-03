@@ -417,6 +417,24 @@ reads it off the packaging. A Ref2VA checkpoint wired as if it were FL2VA is
 refused rather than run: it would load, denoise at full 33B cost, and generate
 video conditioned on nothing.
 
+> **A reference is not a keyframe, and Ref2VA cannot pin one.** The two
+> partitions pack different sequences — FL2VA's is
+> `[text | keyframe conditions | target audio | target video]` and Ref2VA's is
+> `[text | reference blocks | target audio | target video]` — so there is no
+> slot that binds a reference to output frame 0. A reference image conditions
+> the **whole clip**: it carries subject, outfit and style everywhere, and
+> nowhere in particular.
+>
+> Asking for one in the prompt (*"use `<Picture 2>` as the opening frame"*)
+> therefore does nothing. It is not disobedience; there is no machinery for
+> that instruction to act on, and the give-away is a run where the wardrobe
+> and the face transfer while the first frame does not. Anchoring an opening
+> frame — continuing from the last frame of a previous clip, say — is
+> [FL2VA's job](#more-than-text-in), on `generate-video` port 5, and the two
+> are mutually exclusive: taking the anchor costs you the reference list.
+> `generate-video` **warns** if you wire a keyframe on a Ref2VA graph rather
+> than dropping it quietly.
+
 Wire a **`video-ref-encoder`** stage:
 
 | | |
@@ -458,7 +476,7 @@ runs on assets you already have:
 | reference | carries | where it comes from |
 |---|---|---|
 | `minimax-h3-reference-subject.jpg` | the subject | [ships in this repo](images/minimax-h3-reference-subject.jpg) — made with vpipe's own FLUX.2 text-to-image graph, so it comes with no licence question attached |
-| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip with audio stays ONE reference carrying both, labelled `<Video 2>` and `<Audio 2>`, however you feed it |
+| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip with audio stays ONE reference carrying both, labelled `<Video 1>` and `<Audio 1>`, however you feed it |
 
 It takes the **ports** route, preparing each reference through ordinary stages:
 
@@ -480,7 +498,7 @@ streams**, so the clip and its soundtrack still leave one container together —
 the sync argument the `references` list was built on, kept rather than traded.
 **`attach_audio: [3]`** on the encoder makes **ref3**'s audio — the PCM on
 iport 4, the third reference — the soundtrack of the reference before it, so
-it stays one `<Video 2>` + `<Audio 2>` pair instead of becoming a third,
+it stays one `<Video 1>` + `<Audio 1>` pair instead of becoming a third,
 independent reference. The number is a **reference** number in `1..6`, not an
 iport index: ref1 is iport 2. **`channels: 2`** carries true stereo, which the
 `references` path also does and a mono chain would silently give up.
@@ -601,10 +619,29 @@ reference rows with it, so the next size up is a bigger jump than it looks.
 #### How a reference is read
 
 A single path may be written bare, without the brackets. **The order is the
-request**: it numbers the references in the prompt the model reads
-(`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places them on a shared clock,
-so reordering the list is a different generation — and port references
-continue that numbering after the last file.
+request**: it numbers the references in the prompt the model reads and places
+them on a shared clock, so reordering the list is a different generation — and
+port references continue that numbering after the last file.
+
+**The number in a tag counts within its KIND, not across the list.** Each of
+`<Picture i>`, `<Video k>` and `<Audio j>` has a counter of its own, so the
+third reference overall can perfectly well be `<Audio 1>` — it is the first
+*soundtrack*, whatever sits ahead of it. Two stills and a soundtrack, in that
+order, present as:
+
+```
+<Picture 1>: … <Picture 2>: … <Audio 1>: … <your prompt text>
+```
+
+and a still followed by a clip that carries sound is `<Picture 1>`,
+`<Audio 1>`, `<Video 1>` — the clip is reference two and still the first video
+and the first audio. Getting this backwards writes a prompt that points at a
+reference which is not there, and nothing reports it: an unmatched tag is
+ordinary text to the model.
+
+A reference's own block is emitted in list order and the prompt text comes
+after all of them, so where you mention a tag inside the prompt is free — the
+tags refer back to blocks the model has already read.
 
 That ordering is why the list exists at all rather than a port per reference.
 A request's shape is only known when it arrives, and twelve `load-image`

@@ -553,7 +553,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     # into, how long a PREFIX to pin. No DiT uses the second half. dit-block-progress.h is the reason
     # a high-resolution denoise does not read as a stall -- per-STEP is
     # tens of seconds of silence at 1024px, and every DiT already walks its
-    # blocks one at a time. streamed-refill.h is the read itself: block
+    # blocks one at a time -- and dit-gpu-progress.h is what makes that
+    # report say anything: a forward is ONE deferred command stream, so a
+    # report fired from the block loop times the ENCODE, which is
+    # microseconds, and the bar leaps a step and freezes for the seconds
+    # the GPU then takes. Shipping the first without the second hands an
+    # out-of-tree model the hook and lets it wire it up the one way that
+    # does not work. streamed-refill.h is the read itself: block
     # streaming as documented costs a block-sized allocation and a
     # demand-faulted copy per block per step, and this is how a loader
     # stops paying both. wired-pool.h is the half of block residency that
@@ -570,6 +576,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-slots.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-sizing.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-gpu-progress.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/streamed-refill.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/wired-pool.h
         DESTINATION include/generative-models/shared)

@@ -24,11 +24,14 @@
 #include "interfaces/ui-view-intf.h"
 #include "vpipe/pipeline-handle.h"
 
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -46,6 +49,7 @@ Pipeline* live_pipeline(const PipelineHandle& h);
 class PipelineApi {
 public:
   explicit PipelineApi(ApiContext& ctx) : _ctx(ctx) {}
+  ~PipelineApi();
 
   void register_routes(HttpServer& s);
 
@@ -195,6 +199,29 @@ private:
     PipelineApi& _api;
   };
   ViewHost _view_host{*this};
+
+  // ---- the reaper --------------------------------------------------
+  //
+  // A pipeline whose stages have all signalled done is finished, but
+  // NOTHING in the process notices on its own: reap_completed_() is what
+  // tears the runtime down, flips the state to Stopped and lets
+  // PipelineRuntime::stop() print the run's summary -- and it used to be
+  // reached only from three GET handlers. So the visible end of a run
+  // depended on the browser happening to poll one of them, which it does
+  // only while the Pipeline Manager or Composer view is mounted. Watch
+  // the User I/O page for the summary and no poll ever comes: the run
+  // ends, the console says nothing, and the pipeline reads as Running
+  // until you navigate back.
+  //
+  // A server-side tick makes the end of a run a property of the RUN
+  // rather than of what the client is looking at. Cheap: it walks the
+  // pipe list and asks each live runtime whether it self-completed.
+  void reaper_loop_();
+
+  std::thread             _reaper;
+  std::mutex              _reap_mu;
+  std::condition_variable _reap_cv;
+  bool                    _reap_stop = false;
 
   ApiContext&                        _ctx;
   std::vector<std::unique_ptr<Pipe>> _pipes;

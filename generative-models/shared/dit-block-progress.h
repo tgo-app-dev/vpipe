@@ -13,6 +13,28 @@ namespace vpipe::genai {
 // transformer blocks it already walks one at a time (the same loop that
 // polls the streaming stop), so the block is a free, much finer tick.
 //
+// TWO PHASES, and the split is the whole design.
+//
+// Calling this STAGES a block: it runs on the forward's own thread as the
+// block is entered, and its job is to resolve `done` against the forward
+// it belongs to while that is still unambiguous. What it returns is the
+// PUBLISH -- run that when the GPU has actually reached the point being
+// reported, and the report lands then.
+//
+// Splitting them is what makes a report on the GPU's clock possible at
+// all. A DiT forward is one deferred command stream: the loop encodes N
+// blocks in milliseconds and the GPU then runs them for seconds, so a
+// one-phase callback measures the ENCODE and the bar leaps a whole step
+// and freezes. The publish is handed to a command-buffer completion
+// handler instead (shared/dit-gpu-progress.h) -- but a handler fires on a
+// Metal thread and may fire after the step boundary has been crossed, at
+// which point "block 3" no longer says which forward's block 3. Staging
+// on the encode thread settles that before it can go stale; publishing
+// late is then just a delay, not an ambiguity.
+//
+// An EMPTY publish means there is nothing to report and is the correct
+// answer for a stage with no bar attached. Callers must handle it.
+//
 // Fired as each block is ENTERED, with `done` = blocks completed before it
 // (so 0 on the first, total-1 on the last) and `total` = blocks in the
 // stack. Entry rather than exit because the DiTs' block loops are long and
@@ -25,11 +47,15 @@ namespace vpipe::genai {
 // loop -- which knows the step count and whether guidance runs a second
 // forward per step -- belongs to the caller.
 //
-// A stack that streams its blocks from disk ticks at wildly uneven
-// intervals; that is honest, not a defect. Runs on the forward's own
-// thread, between blocks, so it must be cheap and must not re-enter the
-// model.
-using DitBlockProgressFn = std::function<void(int done, int total)>;
+// A caller that has no command buffer to hang the publish on -- a plugin
+// driving its own loop, a test -- simply calls it immediately, which is
+// the old one-phase behaviour and still correct.
+//
+// The STAGE runs on the forward's own thread, between blocks, so it must
+// be cheap and must not re-enter the model. The PUBLISH may run on any
+// thread, and may run after the forward has returned.
+using DitBlockProgressFn =
+    std::function<std::function<void()>(int done, int total)>;
 
 // The same shape, out of a video VAE's decode.
 //

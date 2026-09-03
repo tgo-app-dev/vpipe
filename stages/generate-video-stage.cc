@@ -331,6 +331,33 @@ GenerateVideoStage::spec() const noexcept
   return kSpec;
 }
 
+// See the declaration. Deliberately outside the Apple-Silicon guard: the
+// rule is a property of the two PARTITIONS, not of the backend that runs
+// them, and a test for it should not need a GPU.
+int
+GenerateVideoStage::h3_anchor_count(bool is_ref2va, bool have_keyframe,
+                                    int ref_frames, bool* ignored)
+{
+  if (ignored != nullptr) { *ignored = false; }
+  if (!have_keyframe || ref_frames <= 0) { return 0; }
+  // A Ref2VA request takes NO anchors, and the reason is structural:
+  // build_ref2va_packed_sequence() has no keyframe parameter, because
+  // its layout is [text | reference blocks | target audio | target
+  // video] where FL2VA's is [text | keyframe conditions | ...]. There is
+  // nowhere to put one. Reported rather than dropped quietly -- the
+  // symptom otherwise is a clip whose subject and wardrobe transferred
+  // while its opening frame did not, which reads as disobedience rather
+  // than as a mode that does not exist.
+  if (is_ref2va) {
+    if (ignored != nullptr) { *ignored = true; }
+    return 0;
+  }
+  // One anchor is first-frame image-to-video; two is the first AND last
+  // the FL2VA partition is named for. A LAST frame with no first is
+  // caught upstream, where the beat is read.
+  return ref_frames >= 2 ? 2 : 1;
+}
+
 int
 GenerateVideoStage::latent_frames() const noexcept
 {
@@ -1115,7 +1142,12 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   // `total`). end_step re-syncs the bar to the exact boundary anyway, so
   // the cost is the bar trailing by one block within a step.
   req.block_progress = [&block_fn, &ctx](int done, int total) {
-    block_fn(done, total);
+    // A plugin drives its own loop and has no command buffer to hang the
+    // publish on, so the two phases collapse to one call here -- which is
+    // exactly the one-phase behaviour DitBlockProgressFn had before, and
+    // still correct: staging and publishing at the same instant cannot go
+    // stale between them.
+    if (auto publish = block_fn(done, total)) { publish(); }
     return !ctx.stop_requested();
   };
   // A 22B DiT spends minutes per generation, so a Stop that only lands
@@ -1767,10 +1799,37 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // One latent frame per anchor. No ref => text-to-video-and-audio; one
   // => a first-frame anchor; two => first AND last, which is what the
   // FL2VA partition is named for.
+  //
+  // A Ref2VA request takes NONE of them, and that is structural rather
+  // than a policy: build_ref2va_packed_sequence() has no keyframe
+  // parameter at all, because its layout is
+  // [text | reference blocks | target audio | target video] where
+  // FL2VA's is [text | keyframe conditions | ...]. There is no slot to
+  // put an anchor in.
+  //
+  // SAID, not dropped quietly. The graph is wired, the beat is read, and
+  // the latent then goes nowhere -- and the symptom is a clip whose
+  // subject and wardrobe transferred while its opening frame did not,
+  // which reads as the model disobeying rather than as a mode that does
+  // not exist. The neighbouring case (a last frame with no first) has
+  // always warned; this one had the same claim on one.
+  bool kf_ignored = false;
+  const int n_anchor = h3_anchor_count(r2v != nullptr, ref != nullptr,
+                                       ref_frames, &kf_ignored);
   std::vector<h3::Anchor> anchors;
-  if (r2v == nullptr && ref != nullptr && ref_frames > 0) {
-    anchors.push_back(h3::Anchor::kFirst);
-    if (ref_frames >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  if (n_anchor >= 1) { anchors.push_back(h3::Anchor::kFirst); }
+  if (n_anchor >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  if (kf_ignored && !_kf_on_ref2va_said) {
+    _kf_on_ref2va_said = true;
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): a keyframe anchor is wired on iport {} "
+        "but this is MiniMax-H3's Ref2VA partition, which conditions on "
+        "REFERENCES and has no keyframe slot -- the anchor is ignored. A "
+        "reference image conditions the whole clip (subject, wardrobe, "
+        "style) and cannot pin one frame; asking for it in the prompt "
+        "does nothing either. Anchoring an opening frame is the FL2VA "
+        "partition's job, and the two are mutually exclusive.",
+        this->id(), kRefPort));
   }
   // h3::kAudioChannels is the STEREO count (2) -- how many soundtrack
   // channels the audio rows are packed channel-major over. It is NOT
