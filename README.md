@@ -20,6 +20,7 @@
 · **[Run the first example](#first-example)**
 · **[Try image editing](docs/KLEIN-KV.md)**
 · **[Try MiniMax H3 video](docs/MINIMAX-H3.md)**
+· **[Try Krea-2 images](docs/KREA-2.md)**
 
 For the easiest install, choose the largest `.dmg` in the latest release.
 
@@ -46,6 +47,15 @@ preview panels, profiler, and reproducible model configuration.*
   and its soundtrack together, again on as little as 16 GB, through the
   [vpipe-ltx-2.5 plugin](https://github.com/tgo-app-dev/vpipe-ltx-2.5).
 
+- Runs **Krea-2 Turbo** — a 12B CFG-distilled text-to-image model — on the
+  **published bf16 weights**, no quantization pass.
+  See **[docs/KREA-2.md](docs/KREA-2.md)**
+
+  * 1024 x 1024, 8 steps takes **35 seconds** on an M5 Pro MacBook Pro
+    (20 GPU cores, 24 GB), with a run-time LoRA applied [^4]
+  * the same run takes **81 seconds** on a fanless 15-inch M5 MacBook Air
+    (10 GPU cores, 16 GB), no cooling aid — it scales with GPU cores [^4]
+
 - **Image and video generation on base-model Macs** with weight streaming —
   walk through a reference image edit in
   **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
@@ -61,6 +71,10 @@ preview panels, profiler, and reproducible model configuration.*
 
 [^1]: Fanless, and this run was helped by an ice pack under the
       chassis — a stock Air will throttle sooner and take longer.
+
+[^4]: Measured on the published bf16 weights with no quantization pass,
+      `i8_gemm` on (matrix-core GPUs only), end to end from launch to the
+      written file.
 
 [^2]: Build from source artifact size, not counting dynamically linked
       dependencies like FFmpeg, libcurl.
@@ -95,12 +109,13 @@ speed claim. [^3]
 | Workload family | Verified status |
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
-| Image generation / editing | **FLUX.2-klein-9b-kv:** 4-bit reference image editing with 4-step default pipeline and compare-image UI on Apple Silicon. |
+| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9b-kv:** 4-bit reference image editing with 4-step default pipeline and compare-image UI on Apple Silicon. |
 | Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
-settings, caveats, and Turbo LoRA notes; see
-**[docs/KLEIN-KV.md](docs/KLEIN-KV.md)** and
+settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
+for text-to-image, the tuned 8-step schedule and the live denoising preview;
+and **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
 workflows.
 
@@ -357,9 +372,10 @@ worth knowing.
 
 **Then:** **[EXAMPLES.md](EXAMPLES.md)** builds the same chat by hand in the
 web UI, and adds speech transcription. For image editing from a reference
-photo, **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**; for text-to-video *with
-sound*, **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the
-pipelines it describes.
+photo, **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**; for text-to-image,
+**[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
+**[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the pipelines it
+describes.
 
 ---
 

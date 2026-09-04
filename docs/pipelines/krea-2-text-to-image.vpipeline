@@ -1,0 +1,145 @@
+{
+  "id": "krea-2-text-to-image",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "krea/Krea-2-Turbo"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "masterpiece, best quality, ultra-detailed, photorealistic magical realism, warm analog film photograph, square composition, close-up waist-up portrait of a woman sitting beside an open wooden window in a quiet seaside bookstore cafe, bright ocean horizon and blue sky outside, golden morning sunlight flooding the room, she holds an open blank book toward the camera, dozens of blank pages rise from the book and turn into luminous translucent sky fragments and delicate glass butterflies, jasmine tea steam curling beside her, sparkling dust motes in sunlight, soft cream sage pale blue and warm gold palette, cinematic backlight, shallow depth of field, crisp expressive eyes, elegant clean composition, no readable text, no watermark, no logo --preview"
+      }
+    },
+    {
+      "id": "krea2-model-config",
+      "type": "krea2-model-config",
+      "iports": [],
+      "config": {
+        "lora": "mgwr/M87",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "scheduler-select",
+      "type": "scheduler-select",
+      "iports": [],
+      "config": {
+        "steps": 8,
+        "shift": 0.3
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "krea2-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "scheduler-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "krea2-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 1024,
+        "width": 1024,
+        "steps": 8,
+        "seed": 0,
+        "i8_gemm": true
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-image",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "krea-2-text-to-image.jpeg",
+        "quality": 95
+      }
+    }
+  ],
+  "subpipelines": []
+}

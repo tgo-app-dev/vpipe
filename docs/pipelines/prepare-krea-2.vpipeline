@@ -1,0 +1,37 @@
+{
+  "id": "prepare-krea-2",
+  "stages": [
+    {
+      "id": "fetch-krea-2",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "krea/Krea-2-Turbo",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-m87-lora",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-krea-2",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "mgwr/M87",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

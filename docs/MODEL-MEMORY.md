@@ -1002,13 +1002,19 @@ nothing.** MEASURED cold over four image and video DiT checkpoints, four
 arms interleaved with byte-balanced groups and the arm-to-group
 assignment rotated:
 
-| | internal SSD | external Thunderbolt |
+| | internal SSD | ONE external SSD |
 |---|---:|---:|
 | allocate per block, fill from the mapping | 3.1–4.0 GB/s | 0.77–0.78 GB/s |
 | `pread` into a buffer that already exists | 4.5–6.3 GB/s | 0.78–0.82 GB/s |
 | map and fault, no copy at all | 0.7–1.0 GB/s | 0.24–0.29 GB/s |
 
-At 0.84 GB/s the device is so far the slowest term that every arm ties.
+**The right-hand column is one device, not the interface.** Thunderbolt 4
+carries 40 Gbps — a 5 GB/s ceiling — so an external enclosure is not
+obliged to land anywhere near these figures, and a fast one will not.
+What the column shows is what a slow drive does to the comparison, which
+is the case worth designing for; measure the drive you actually have.
+
+At 0.84 GB/s that device is so far the slowest term that every arm ties.
 So this is a win on the drive a checkpoint should be on and no loss
 anywhere — and the third row is the reminder that a zero-copy mapping is
 not a saving: it copies nothing and is still four times slower than
