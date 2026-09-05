@@ -36,6 +36,30 @@ const ConfigKey kAttrs[] = {
    .doc = "soundtrack duration; 0 derives it from the video's frames / fps, "
           "which is what keeps the two modalities the same length by "
           "construction", .def_real = 0.0},
+  {.key = "linear_branch", .type = ConfigType::String, .required = false,
+   .doc = "OPTIONAL VDN-H3 release root -- the directory holding its "
+          "config.json and linear_branch/. Given one, every main block's "
+          "attention becomes the hybrid: a chunk-windowed softmax over "
+          "the frames near the query plus a bidirectional delta rule "
+          "carrying everything the window cannot see. The two PARTITION "
+          "the keys, so this is not an approximation layered on full "
+          "attention -- it is a different attention, and the weights "
+          "here were trained for it. A SECOND checkpoint, not a "
+          "replacement: the DiT stays whatever the model source names, "
+          "because the branch shares that DiT's own q/k/v projections. "
+          "LOAD-TIME, like `lora` below and for the same reason -- it "
+          "changes what the blocks are, not how strongly something is "
+          "applied -- so naming a different one under a built DiT is "
+          "refused rather than half-taken",
+   .suggest_db = kModelRegistryDb,
+   // A MODEL PICKER and not the filesystem browser, for the reason the
+   // LoRA field below is one, and typed for the same reason again: VDN
+   // is catalogued as a supplement of minimax-h3-fl2va, so an untyped
+   // field would offer plain models only and show nothing at all. The
+   // type is what keeps a LoRA out of this field and the branch out of
+   // the LoRA field -- they are not interchangeable, and the failure
+   // when they are swapped is a model that loads and renders.
+   .suggest_db_type = "minimax-h3-vdn"},
   {.key = "lora", .type = ConfigType::String, .required = false,
    .doc = "a LoRA applied AT RUNTIME -- every adapted projection computes "
           "W x + scale * B (A x) rather than having the delta folded into "
@@ -148,6 +172,7 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _cond_timestep = attr_real("condition_timestep");
   _cond_audio_timestep = attr_real("condition_audio_timestep");
   _audio_seconds = attr_real("audio_seconds");
+  _linear_branch = attr_str("linear_branch");
   _lora          = attr_str("lora");
   _lora_scale    = attr_real("lora_scale");
   _lora_qkv      = attr_str("lora_qkv_layout");
@@ -197,6 +222,14 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   o.insert_or_assign("condition_audio_timestep",
                      FlexData::make_real(_cond_audio_timestep));
   o.insert_or_assign("audio_seconds", FlexData::make_real(_audio_seconds));
+  // Emitted only when SET, for the reason the LoRA keys are: an empty
+  // string would read as "the graph asked for no branch", which is
+  // indistinguishable at the consumer from "the graph said nothing",
+  // and the consumer's default is already no branch.
+  if (!_linear_branch.empty()) {
+    o.insert_or_assign("linear_branch",
+                       FlexData::make_string(_linear_branch));
+  }
   // Emitted only when SET. An empty `lora` key would read as "the graph
   // asked for no adapter", which is indistinguishable from "the graph
   // said nothing" at the consumer -- and the consumer's default is

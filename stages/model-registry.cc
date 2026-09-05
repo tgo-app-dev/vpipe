@@ -86,6 +86,39 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
 }
 
 std::string
+resolved_subtree_dir(const ResolvedModel& rm)
+{
+  namespace fs = std::filesystem;
+  if (rm.files.empty()) { return rm.dir; }
+  // The common DIRECTORY prefix, component by component. A file's own
+  // name never contributes -- two records pinning `a/x` and `a/y` share
+  // `a`, and one pinning `a/x` alone shares `a` with itself.
+  std::vector<std::string> pre;
+  bool first = true;
+  for (const std::string& f : rm.files) {
+    std::vector<std::string> parts;
+    const fs::path p(f);
+    for (auto it = p.begin(); it != p.end(); ++it) {
+      parts.push_back(it->string());
+    }
+    if (parts.empty()) { return rm.dir; }
+    parts.pop_back();                       // drop the file name
+    if (first) {
+      pre = std::move(parts);
+      first = false;
+      continue;
+    }
+    std::size_t n = 0;
+    while (n < pre.size() && n < parts.size() && pre[n] == parts[n]) { ++n; }
+    pre.resize(n);
+    if (pre.empty()) { return rm.dir; }
+  }
+  fs::path out(rm.dir);
+  for (const std::string& c : pre) { out /= c; }
+  return out.string();
+}
+
+std::string
 resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        ref)
 {

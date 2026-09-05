@@ -63,6 +63,27 @@ std::string
 resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        ref);
 
+// The directory the record's pinned files actually live in.
+//
+// `dir` is where the repo was downloaded, and a record may pin a SUBTREE
+// of it rather than the whole thing. VDN-H3's two stages are published
+// from one repo as `stage-b-step-2000/...` and `stage-dmd-step-250/...`,
+// so both keys resolve to the same root and only the pinned paths say
+// which subtree was meant -- a consumer handed the root finds neither
+// stage's config and reports the repo as malformed.
+//
+// Returns `dir` joined with the common DIRECTORY prefix of the pinned
+// paths, and `dir` unchanged when they share none: a whole-repo fetch, a
+// plain filesystem path, and every record whose files sit at the top all
+// answer the same as before.
+//
+// OPT-IN, not folded into resolve_model_dir(), because "the directory
+// the files are in" is not always "the directory the consumer wants" --
+// a record pinning only `transformer/*.safetensors` of a multi-component
+// repo pins a subtree whose consumer still wants the root next to it.
+std::string
+resolved_subtree_dir(const ResolvedModel& rm);
+
 // True when `ref` resolves (via resolve_model_dir) to a path that exists
 // on disk -- i.e. the model is actually present, not just a registry key
 // or a not-yet-downloaded path. Cheap: one LMDB read + a stat. The

@@ -84,6 +84,13 @@ set(LOCAL_SOURCES
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
   minimax-h3/minimax-h3-layout.cc
+  minimax-h3/vdn-geometry.cc
+  minimax-h3/vdn-delta-solve.cc
+  minimax-h3/vdn-linear-features.cc
+  minimax-h3/vdn-linear-branch.cc
+  minimax-h3/vdn-window-softmax.cc
+  minimax-h3/vdn-config.cc
+  minimax-h3/metal-vdn-branch.cc
   minimax-h3/minimax-h3-references.cc
   minimax-h3/minimax-h3-reference-encoder.cc
   minimax-h3/metal-minimax-h3-transformer.cc
@@ -158,6 +165,13 @@ set(LOCAL_HEADERS
   wan/metal-umt5-encoder.h
   wan/metal-wan-transformer.h
   minimax-h3/minimax-h3-layout.h
+  minimax-h3/vdn-geometry.h
+  minimax-h3/vdn-delta-solve.h
+  minimax-h3/vdn-linear-features.h
+  minimax-h3/vdn-linear-branch.h
+  minimax-h3/vdn-window-softmax.h
+  minimax-h3/vdn-config.h
+  minimax-h3/metal-vdn-branch.h
   minimax-h3/minimax-h3-references.h
   minimax-h3/minimax-h3-reference-encoder.h
   minimax-h3/metal-minimax-h3-transformer.h

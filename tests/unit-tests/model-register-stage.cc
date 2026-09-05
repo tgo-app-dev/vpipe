@@ -12,6 +12,7 @@
 #include "common/lmdb-txn.h"
 #include "common/session.h"
 #include "pipeline/stage-registry.h"
+#include "stages/model-catalog.h"
 #include "stages/model-detect.h"
 #include "stages/model-register-stage.h"
 #include "stages/model-registry.h"
@@ -21,8 +22,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <streambuf>
+#include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
@@ -563,4 +566,122 @@ TEST(model_register_stage, coreml_container_registers_the_bundle)
               == "vpipe-supplement/qwen3_5_vision_vid_768x480");
   // Detection ran on the bundle, so the shape is recognised.
   EXPECT_TRUE(r.detected.category == "supplement");
+}
+
+TEST(model_registry, a_pinned_subtree_resolves_to_the_subtree)
+{
+  // WHERE A RECORD'S FILES ACTUALLY ARE, when the repo holds more than
+  // one model.
+  //
+  // `local_path` is where the repo was downloaded. A catalogue entry may
+  // pin a SUBTREE of it: VDN-H3 publishes two stages from one repo as
+  // stage-b-step-2000/... and stage-dmd-step-250/..., so both keys
+  // resolve to the same root and the root itself holds no config at all.
+  // A consumer handed the root reports the repo as malformed -- which is
+  // the loud half. The quiet half is a stage that scans the root for
+  // .safetensors, finds none and declares NOTHING for a 4.28 GB
+  // checkpoint.
+  auto rm = [](std::vector<std::string> files) {
+    ResolvedModel r;
+    r.dir = "/models/OpenVDN/vdn-minimax-h3";
+    r.files = std::move(files);
+    r.from_registry = true;
+    return r;
+  };
+  namespace fs = std::filesystem;
+  const std::string root = "/models/OpenVDN/vdn-minimax-h3";
+
+  // The reported case, with the record model-fetch actually wrote.
+  const std::string dmd = resolved_subtree_dir(rm({
+      "stage-dmd-step-250/linear_branch/config.json",
+      "stage-dmd-step-250/linear_branch/model.safetensors",
+      "stage-dmd-step-250/adapters/default/adapter_config.json",
+      "stage-dmd-step-250/adapters/default/adapter_model.safetensors",
+      "stage-dmd-step-250/adapters/turbo/adapter_config.json",
+      "stage-dmd-step-250/adapters/turbo/adapter_model.safetensors",
+      "stage-dmd-step-250/model_spec.json",
+      "stage-dmd-step-250/metadata.json"}));
+  EXPECT_TRUE(dmd == (fs::path(root) / "stage-dmd-step-250").string());
+
+  // The OTHER stage of the same repo must land somewhere else, or the
+  // two keys are still indistinguishable and this bought nothing.
+  const std::string b = resolved_subtree_dir(rm({
+      "stage-b-step-2000/linear_branch/config.json",
+      "stage-b-step-2000/model_spec.json"}));
+  EXPECT_TRUE(b == (fs::path(root) / "stage-b-step-2000").string());
+  EXPECT_TRUE(b != dmd);
+
+  // FILES AT THE ROOT ANSWER THE ROOT -- the H3 DiT partitions, which
+  // share a directory and are told apart by which file they pin, not by
+  // where it sits. Anything else here would move every existing
+  // consumer.
+  EXPECT_TRUE(resolved_subtree_dir(rm({"a.safetensors",
+                                       "b.safetensors"})) == root);
+  // Mixed depths share no prefix, so: the root.
+  EXPECT_TRUE(resolved_subtree_dir(rm({"transformer/a.safetensors",
+                                       "config.json"})) == root);
+  // A whole-repo fetch and a plain filesystem path pin nothing.
+  EXPECT_TRUE(resolved_subtree_dir(rm({})) == root);
+  // One file in a subtree is still that subtree.
+  EXPECT_TRUE(resolved_subtree_dir(rm({"vae/diffusion_pytorch_model.bin"}))
+              == (fs::path(root) / "vae").string());
+  // And a deeper common prefix is followed all the way down.
+  EXPECT_TRUE(resolved_subtree_dir(rm({"a/b/c/x.json", "a/b/c/y.json"}))
+              == (fs::path(root) / "a" / "b" / "c").string());
+}
+
+TEST(model_registry, the_vdn_catalogue_entries_pin_distinct_subtrees)
+{
+  // The catalogue is where the shape above comes from, so it is what has
+  // to keep it. Both VDN entries share one hf_path on purpose; if a
+  // later edit gave them files at the repo root -- or the same subtree --
+  // the two keys would resolve to one directory again and the attach
+  // would pick whichever stage the tree happened to hold.
+  const std::vector<ModelCatalogEntry>& all = model_catalog();
+  const ModelCatalogEntry* b = nullptr;
+  const ModelCatalogEntry* d = nullptr;
+  for (const ModelCatalogEntry& e : all) {
+    if (e.name == "OpenVDN/vdn-minimax-h3-stage-b") { b = &e; }
+    if (e.name == "OpenVDN/vdn-minimax-h3-stage-dmd") { d = &e; }
+  }
+  ASSERT_TRUE(b != nullptr && d != nullptr);
+  if (b == nullptr || d == nullptr) { return; }
+  EXPECT_TRUE(b->hf_path == d->hf_path);      // one repo, two records
+  auto sub = [](const ModelCatalogEntry& e) {
+    ResolvedModel r;
+    r.dir = "/root";
+    r.files = e.files;
+    r.from_registry = true;
+    return resolved_subtree_dir(r);
+  };
+  const std::string sb = sub(*b), sd = sub(*d);
+  std::printf("[registry] stage-b -> '%s', stage-dmd -> '%s'\n", sb.c_str(),
+              sd.c_str());
+  EXPECT_TRUE(sb != "/root");
+  EXPECT_TRUE(sd != "/root");
+  EXPECT_TRUE(sb != sd);
+  // And each must be the directory that actually holds a config, which
+  // is what vdn::load_config looks for.
+  EXPECT_TRUE(sb.find("stage-b") != std::string::npos);
+  EXPECT_TRUE(sd.find("stage-dmd") != std::string::npos);
+
+  // EVERY OTHER ENTRY THAT PINS A SUBTREE, named rather than asserted.
+  // The same shape is latent wherever one exists: a consumer that takes
+  // local_path and looks for a config beside it finds the repo root. Not
+  // a failure -- most consumers want the root, which is exactly why the
+  // descent is opt-in -- but this is the list to check when adding one.
+  int n = 0;
+  for (const ModelCatalogEntry& e : all) {
+    ResolvedModel r;
+    r.dir = "/root";
+    r.files = e.files;
+    r.from_registry = true;
+    const std::string sub = resolved_subtree_dir(r);
+    if (sub != "/root") {
+      std::printf("[registry]   pins a subtree: %-46s -> %s\n",
+                  e.name.c_str(), sub.c_str() + 6);
+      ++n;
+    }
+  }
+  std::printf("[registry] %d catalogue entries pin a subtree\n", n);
 }

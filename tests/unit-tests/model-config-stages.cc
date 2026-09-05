@@ -9,6 +9,8 @@
 
 #include "minitest.h"
 
+#include <optional>
+
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/session.h"
@@ -534,5 +536,97 @@ TEST(model_config, generate_image_takes_the_adapter_from_its_own_config)
       EXPECT_TRUE(lora->suggest_db_type.find("flux2-lora") !=
                   std::string_view::npos);
     }
+  }
+}
+
+TEST(model_config, the_vdn_branch_is_a_family_knob_and_not_a_stage_key)
+{
+  // WHICH STAGE OWNS A KNOB IS A CLAIM, not a filing preference.
+  // `generate-video` is family-agnostic -- it passes each family's beat
+  // to that family's GenerationParams UNREAD -- so a key on it is a key
+  // every family has to mean something by. VDN's linear branch means
+  // nothing to Wan, and a knob that is inert for half the graphs that
+  // can set it is how a config grows a field nobody can explain.
+  //
+  // So: the key lives on `minimax-h3-model-config` and NOT on
+  // `generate-video`, which takes the beat and nothing else.
+  const StageSpec* src = StageRegistry::get().spec("minimax-h3-model-config");
+  const StageSpec* dst = StageRegistry::get().spec("generate-video");
+  ASSERT_TRUE(src != nullptr && dst != nullptr);
+  if (src == nullptr || dst == nullptr) { return; }
+
+  const ConfigKey* lb = nullptr;
+  for (const ConfigKey& k : src->attrs) {
+    if (k.key == "linear_branch") { lb = &k; }
+  }
+  EXPECT_TRUE(lb != nullptr);
+  for (const ConfigKey& k : dst->attrs) {
+    EXPECT_FALSE(std::string(k.key) == "linear_branch");
+  }
+  if (lb == nullptr) { return; }
+
+  // A typed MODEL PICKER, not the filesystem browser and not free text.
+  // Untyped it would offer plain models only and show nothing, because
+  // VDN is catalogued as a supplement; wrongly typed it would offer a
+  // LoRA, and the two are not interchangeable -- swapped, the model
+  // loads and renders.
+  EXPECT_TRUE(!lb->is_path);
+  EXPECT_TRUE(lb->suggest_db == kModelRegistryDb);
+  EXPECT_TRUE(lb->suggest_db_type == "minimax-h3-vdn");
+
+  // And the type has to NAME something, or the picker is empty and the
+  // field is free text with extra steps.
+  int n = 0;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type == "minimax-h3-vdn") {
+      ++n;
+      // A supplement, and specifically one that attaches to the H3 DiT:
+      // the branch shares that DiT's own q/k/v projections, so it is a
+      // second checkpoint BESIDE a parent rather than a model.
+      EXPECT_TRUE(e.parent_model_type == "minimax-h3-fl2va");
+    }
+  }
+  std::printf("[model_config] catalogued VDN branches: %d\n", n);
+  EXPECT_TRUE(n > 0);
+}
+
+TEST(model_config, the_h3_source_emits_the_branch_only_when_set)
+{
+  // Emitted only when SET, for the reason the LoRA keys are: an empty
+  // string would read at the consumer as "the graph asked for no
+  // branch", which is indistinguishable from "the graph said nothing"
+  // -- and the consumer's default is already no branch. The difference
+  // matters because the consumer treats the key as a LOAD-TIME
+  // argument and warns when it changes under a built DiT.
+  Session sess;
+  auto bare = make_unique<MiniMaxH3ModelConfigStage>(
+      &sess, "h3c", vector<InEdge>{}, FlexData::make_object());
+  const FlexData off = bare->resolved_config();
+  ASSERT_TRUE(off.is_object());
+  EXPECT_FALSE(off.as_object().contains("linear_branch"));
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign(
+      "linear_branch", FlexData::make_string("OpenVDN/vdn-minimax-h3"));
+  auto on = make_unique<MiniMaxH3ModelConfigStage>(
+      &sess, "h3c2", vector<InEdge>{}, std::move(cfg));
+  const FlexData beat = on->resolved_config();
+  ASSERT_TRUE(beat.is_object());
+  auto o = beat.as_object();
+  EXPECT_TRUE(o.contains("linear_branch"));
+  if (o.contains("linear_branch")) {
+    EXPECT_TRUE(std::string(o.at("linear_branch").as_string(""))
+                == "OpenVDN/vdn-minimax-h3");
+  }
+
+  // And it must reach a consumer BEFORE any driver runs, or the branch
+  // -- a second 4.28 GB checkpoint -- is one every peer sized the box
+  // without. That is what constant_output is for; a trigger changes
+  // when the beat is emitted, never what it says.
+  const std::optional<FlexData> k = on->constant_output(0);
+  EXPECT_TRUE((bool)k);
+  if (k) {
+    EXPECT_TRUE(k->is_object()
+                && k->as_object().contains("linear_branch"));
   }
 }

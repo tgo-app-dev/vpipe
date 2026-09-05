@@ -21,6 +21,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
 
 #include <Metal/Metal.hpp>
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -942,6 +944,357 @@ TEST(conv2d_mma, hw_op_s2_probe) {
 // sequence the VAEs ship (im2col_hwc_3x3_f16 -> dense_gemm_mma_t_n128, K =
 // 9*Cin < 6144) at real decoder shapes. GFLOP/s + ratio printed; the hw op
 // skips the [H*W, 9*Cin] im2col DRAM round-trip entirely.
+TEST(conv2d_mma, hw_op_depthwise_probe) {
+  // CAN THE HARDWARE CONV OP TAKE A DEPTHWISE CONV, AND DOES IT PAY?
+  //
+  // MPP's convolution2d static_asserts groups == 1, so a depthwise conv --
+  // one KxK kernel per channel, no cross-channel term -- has exactly one
+  // mapping onto it: dense over a block of B channels with a weight that is
+  // ZERO off the diagonal. That multiplies the arithmetic by B and lands it
+  // on the matrix units, so it is a trade, and the point of this probe is to
+  // price it rather than argue it.
+  //
+  // Driven by VDN-H3's short conv, which is 5x5 depthwise over 7168 channels
+  // per latent frame and the largest remaining fp32 stage of its linear
+  // branch (36.8% of it on an M5). Its activation is a strided window inside
+  // a fused per-head projection, so the probe also settles the semantics
+  // that would let it run WITHOUT a repack: whether the descriptor's Cin may
+  // be smaller than the activation tensor's innermost extent, the way Cout
+  // already may (hw_op_extents_channel_tiling_probe).
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma_bf16");
+  if (!lib.valid()) { return; }
+
+  auto bf = [](float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto un_bf = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+
+  // The real grid: 960x544 / 120 frames is 17x30 patches. Deliberately NOT a
+  // multiple of the 8x8 dest tile -- the ragged tiles are where a halo or an
+  // offset convention goes wrong, and the shipped VAE shapes never show it.
+  const int gw = 30, gh = 17, KS = 5, pad = KS / 2;
+  const int frames = 3;
+
+  // `ok` is whether the block size is EXPECTED to be right, and B = 8 is
+  // in this list precisely because it is not.
+  //
+  // THE MATRIX UNIT HAS A FLOOR AT 16 CHANNELS AND DOES NOT SAY SO. An
+  // 8-wide block does not fail to build, does not fault and does not
+  // return zeros -- it returns a plausible field that is 64% wrong. It
+  // was found here only because the perf sweep wanted a smaller block
+  // (the waste is exactly B, so 8 would halve it) and the correctness
+  // list was widened to match the perf list. Anyone reaching for a
+  // narrower block to cut the waste will reach for exactly this, so it
+  // stays in the list, asserted to be wrong.
+  struct Case { const char* name; int B; int TW; int TH; bool ok; };
+  const Case cases[] = {
+      {"conv2d_hw_dw5_b32h8_f16", 32, 32, 8, true},
+      {"conv2d_hw_dw5_b16h4_f16", 16, 32, 4, true},
+      {"conv2d_hw_dw5_b16h6_f16", 16, 32, 6, true},
+      {"conv2d_hw_dw5_b16h8_f16", 16, 32, 8, true},
+      {"conv2d_hw_dw5_b16h9_f16", 16, 32, 9, true},
+      {"conv2d_hw_dw5_b8h8_f16",   8, 32, 8, false},
+  };
+
+  bool any = false;
+  for (const Case& cs : cases) {
+    ComputeFunction fn = lib.function(cs.name);
+    if (!fn.valid()) {
+      std::printf("[conv2d_dw] %s did not validate -- skip\n", cs.name);
+      continue;
+    }
+    const int C = cs.B * 4;                 // four blocks, so nblk > 1
+    const int nblk = C / cs.B;
+    const std::size_t npix = (std::size_t)frames * gh * gw;
+    std::mt19937 rng(4242u + (unsigned)cs.B);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+
+    std::vector<std::uint16_t> in(npix * (std::size_t)C);
+    std::vector<float> w((std::size_t)C * KS * KS);
+    for (auto& v : in) { v = bf(d(rng) * 0.5f); }
+    for (auto& v : w) { v = (float)bf(d(rng) * 0.4f) * 0.0f; }
+    for (auto& v : w) { v = un_bf(bf(d(rng) * 0.4f)); }
+
+    // The block-diagonal weight, hwio: [nblk][ky][kx][i][o], o innermost.
+    std::vector<std::uint16_t> wb(
+        (std::size_t)nblk * KS * KS * cs.B * cs.B, 0);
+    for (int cb = 0; cb < nblk; ++cb) {
+      for (int ky = 0; ky < KS; ++ky) {
+        for (int kx = 0; kx < KS; ++kx) {
+          for (int i = 0; i < cs.B; ++i) {
+            const std::size_t o =
+                ((((std::size_t)cb * KS + ky) * KS + kx) * cs.B + i) * cs.B
+                + i;
+            wb[o] = bf(w[((std::size_t)(cb * cs.B + i) * KS + ky) * KS + kx]);
+          }
+        }
+      }
+    }
+
+    // The depthwise reference, in the layout the kernel writes.
+    std::vector<float> ref(npix * (std::size_t)C, 0.0f);
+    for (int f = 0; f < frames; ++f) {
+      for (int y = 0; y < gh; ++y) {
+        for (int x = 0; x < gw; ++x) {
+          for (int c = 0; c < C; ++c) {
+            float acc = 0.0f;
+            for (int ky = 0; ky < KS; ++ky) {
+              const int sy = y + ky - pad;
+              if (sy < 0 || sy >= gh) { continue; }
+              for (int kx = 0; kx < KS; ++kx) {
+                const int sx = x + kx - pad;
+                if (sx < 0 || sx >= gw) { continue; }
+                acc += un_bf(in[((((std::size_t)f * gh + sy) * gw) + sx)
+                                * (std::size_t)C + c])
+                       * w[((std::size_t)c * KS + ky) * KS + kx];
+              }
+            }
+            ref[((((std::size_t)f * gh + y) * gw) + x) * (std::size_t)C + c] =
+                acc;
+          }
+        }
+      }
+    }
+
+    SharedBuffer ib = mc->make_shared_buffer(in.size() * 2);
+    SharedBuffer wbb = mc->make_shared_buffer(wb.size() * 2);
+    SharedBuffer ob = mc->make_shared_buffer(ref.size() * 2);
+    if (ib.empty() || wbb.empty() || ob.empty()) { continue; }
+    std::memcpy(ib.contents(), in.data(), in.size() * 2);
+    std::memcpy(wbb.contents(), wb.data(), wb.size() * 2);
+    std::memset(ob.contents(), 0, ob.byte_size());
+
+    const int SG = 4;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        enc.set_function(fn);
+        enc.set_buffer(0, ib); enc.set_buffer(1, wbb); enc.set_buffer(2, ob);
+        enc.set_constant(3, gw);
+        enc.set_constant(4, gh);
+        enc.set_constant(5, C);            // a_pitch
+        enc.set_constant(6, C);            // d_pitch
+        enc.set_constant(7, nblk);
+        enc.set_constant(8, frames);
+        enc.set_constant(9, C);            // hd  (tight: one group)
+        enc.set_constant(10, C);           // hst
+        enc.dispatch({(unsigned)(((gw + cs.TW - 1) / cs.TW) * SG * 32),
+                      (unsigned)((gh + cs.TH - 1) / cs.TH),
+                      (unsigned)(frames * nblk)},
+                     {(unsigned)(SG * 32), 1, 1});
+      }
+      std::string e;
+      if (!st.commit().wait_ok(&e)) {
+        std::printf("[conv2d_dw] %s: %s\n", cs.name, e.c_str());
+        continue;
+      }
+    }
+    const auto* o = static_cast<const std::uint16_t*>(ob.contents());
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      const double e = (double)un_bf(o[i]) - (double)ref[i];
+      num += e * e;
+      den += (double)ref[i] * (double)ref[i];
+    }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    const bool good = rel >= 0.0 && rel < 3e-2;
+    std::printf("[conv2d_dw] %-24s B=%2d tile %dx%d: rel-L2 %.4e %s%s\n",
+                cs.name, cs.B, cs.TW, cs.TH, rel,
+                good ? "VERIFIED" : "WRONG",
+                cs.ok ? "" : "  (expected -- below the 16-channel floor)");
+    EXPECT_TRUE(good == cs.ok);
+    any = true;
+  }
+  EXPECT_TRUE(any);
+}
+
+TEST(conv2d_mma, hw_op_depthwise_perf) {
+  // THE PRICE, at the shape that asked the question: VDN-H3's short conv,
+  // 5x5 depthwise over 7168 channels on a 17x30 patch grid, 37 latent
+  // frames. Two arms on the same buffers, INTERLEAVED:
+  //
+  //   vdn_conv_spatial_f32   the shipping kernel -- one thread per channel
+  //                          per run of 8 x, 25 taps, no matrix units
+  //   conv2d_hw_dw5_*        the same conv as a block-diagonal DENSE conv
+  //                          on the MPP hardware op, B channels at a time
+  //
+  // The hardware arm does B times the arithmetic for the same answer, so
+  // this is the whole of the trade: useful FLOPs are the depthwise count in
+  // both columns, and the hardware column's ISSUED FLOPs are B times that.
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("conv2d_mma_bf16");
+  ComputeLibrary vdn = mc->load_library("vdn_branch");
+  ComputeFunction base = vdn.function("vdn_conv_spatial_f32");
+  if (!lib.valid() || !base.valid()) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int gw = envi("VPIPE_DW_GW", 30), gh = envi("VPIPE_DW_GH", 17);
+  const int KS = 5, C = 7168, SG = 4;
+  // How many frames ONE dispatch carries. The branch tiles, so its
+  // dispatches are a handful of frames rather than the whole clip --
+  // and whether that costs anything per frame is the question this
+  // knob asks.
+  const int frames = envi("VPIPE_DW_FRAMES", 37);
+  const int iters = envi("VPIPE_DW_ITERS", 1);
+  // The REAL source: VDN's short conv reads the transformer's fused
+  // [rows, 3*inner] projection where it lies, grouped per head. So the row
+  // stride is 3*C and a head is 128 channels 384 apart -- which is the
+  // read pattern that matters, and the one a tight-buffer probe flatters.
+  // VPIPE_DW_TIGHT measures the flattering case for comparison.
+  const bool tight = std::getenv("VPIPE_DW_TIGHT") != nullptr;
+  const int rst = tight ? C : 3 * C;
+  const int hd = 128, hst = tight ? hd : 3 * hd;
+  const std::size_t npix = (std::size_t)frames * gh * gw;
+  SharedBuffer ib = mc->make_shared_buffer(npix * (std::size_t)rst * 2);
+  SharedBuffer ob = mc->make_shared_buffer(npix * (std::size_t)C * 2);
+  SharedBuffer wf = mc->make_shared_buffer((std::size_t)C * KS * KS * 4);
+  if (ib.empty() || ob.empty() || wf.empty()) {
+    std::printf("[conv2d_dw] cannot allocate %.2f GB\n",
+                (double)(2 * npix * C * 2) / 1073741824.0);
+    return;
+  }
+  std::memset(ib.contents(), 0x3c, ib.byte_size());
+  std::memset(ob.contents(), 0, ob.byte_size());
+  {
+    auto* w = static_cast<float*>(wf.contents());
+    for (std::size_t i = 0; i < (std::size_t)C * KS * KS; ++i) {
+      w[i] = 0.01f;
+    }
+  }
+  const double useful_gflop =
+      2.0 * (double)npix * (double)C * (double)(KS * KS) / 1e9;
+
+  // Arm A: the shipping kernel.
+  const int run = 8, nxg = (gw + run - 1) / run;
+  auto run_base = [&]() {
+    CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute();
+      enc.set_function(base);
+      enc.set_buffer(0, ib); enc.set_buffer(1, wf); enc.set_buffer(2, ob);
+      enc.set_constant(3, frames);
+      enc.set_constant(4, gh);
+      enc.set_constant(5, gw);
+      enc.set_constant(6, C);
+      enc.set_constant(7, KS);
+      enc.set_buffer(8, ib);
+      enc.set_constant(9, 1);            // bf16 in
+      enc.set_constant(10, rst);         // row stride
+      enc.set_constant(11, hst);         // head stride
+      enc.set_constant(12, hd);          // head_dim
+      enc.set_constant(13, run);
+      enc.set_buffer(14, ob);
+      enc.set_constant(15, 1);           // bf16 out
+      enc.dispatch({(unsigned)((std::size_t)frames * gh * nxg * C), 1, 1},
+                   {256, 1, 1});
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string e;
+    if (!st.commit().wait_ok(&e)) { return -1.0; }
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+  };
+
+  struct Case { const char* name; int B; int TW; int TH; };
+  const Case cases[] = {
+      {"conv2d_hw_dw5_b32h8_f16", 32, 32, 8},
+      {"conv2d_hw_dw5_b16h4_f16", 16, 32, 4},
+      {"conv2d_hw_dw5_b16h6_f16", 16, 32, 6},
+      {"conv2d_hw_dw5_b16h8_f16", 16, 32, 8},
+      {"conv2d_hw_dw5_b16h9_f16", 16, 32, 9},
+  };
+  // The block-diagonal weight, built once per B -- in production it is
+  // rebuilt per layer into scratch, which is 5.7 MB of writes and free.
+  auto make_wb = [&](int B) {
+    const int nblk = C / B;
+    SharedBuffer b = mc->make_shared_buffer(
+        (std::size_t)nblk * KS * KS * B * B * 2);
+    if (!b.empty()) { std::memset(b.contents(), 0, b.byte_size()); }
+    return b;
+  };
+
+  double best_base = -1.0;
+  std::vector<double> best(sizeof(cases) / sizeof(cases[0]), -1.0);
+  std::vector<SharedBuffer> wbs;
+  for (const Case& cs : cases) { wbs.push_back(make_wb(cs.B)); }
+
+  for (int r = 0; r < 4; ++r) {
+    const double a = run_base();
+    if (r > 0 && a >= 0.0 && (best_base < 0.0 || a < best_base)) {
+      best_base = a;
+    }
+    for (std::size_t i = 0; i < wbs.size(); ++i) {
+      const Case& cs = cases[i];
+      ComputeFunction fn = lib.function(cs.name);
+      if (!fn.valid() || wbs[i].empty()) { continue; }
+      const int nblk = C / cs.B;
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        // ITERS dispatches in ONE command buffer, so a small one is not
+        // measured against the submit round trip -- which is the whole
+        // question when the caller tiles and its dispatches are a
+        // handful of frames each. The reported ms is per iteration.
+        for (int it = 0; it < iters; ++it) {
+        enc.set_function(fn);
+        enc.set_buffer(0, ib); enc.set_buffer(1, wbs[i]);
+        enc.set_buffer(2, ob);
+        enc.set_constant(3, gw);
+        enc.set_constant(4, gh);
+        enc.set_constant(5, rst);
+        enc.set_constant(6, C);
+        enc.set_constant(7, nblk);
+        enc.set_constant(8, frames);
+        enc.set_constant(9, hd);
+        enc.set_constant(10, hst);
+        enc.dispatch({(unsigned)(((gw + cs.TW - 1) / cs.TW) * SG * 32),
+                      (unsigned)((gh + cs.TH - 1) / cs.TH),
+                      (unsigned)(frames * nblk)},
+                     {(unsigned)(SG * 32), 1, 1});
+        }
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      std::string e;
+      if (!st.commit().wait_ok(&e)) { continue; }
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count() / (double)iters;
+      if (r > 0 && (best[i] < 0.0 || ms < best[i])) { best[i] = ms; }
+    }
+  }
+
+  std::printf("[conv2d_dw] %d frames of %dx%d, %d channels, 5x5 depthwise "
+              "(%.2f useful GFLOP), source %s\n", frames, gh, gw, C,
+              useful_gflop, tight ? "TIGHT" : "fused (row 3C, head 3*128)");
+  std::printf("[conv2d_dw]   %-24s %8.2f ms  %6.3f TFLOP/s useful\n",
+              "vdn_conv_spatial_f32", best_base,
+              best_base > 0.0 ? useful_gflop / (best_base / 1000.0) / 1000.0
+                              : 0.0);
+  for (std::size_t i = 0; i < wbs.size(); ++i) {
+    if (best[i] < 0.0) { continue; }
+    std::printf("[conv2d_dw]   %-24s %8.2f ms  %6.3f useful / %6.2f issued "
+                "TFLOP/s   %.2fx\n", cases[i].name, best[i],
+                useful_gflop / (best[i] / 1000.0) / 1000.0,
+                (double)cases[i].B * useful_gflop / (best[i] / 1000.0)
+                    / 1000.0,
+                best_base > 0.0 ? best_base / best[i] : 0.0);
+  }
+  EXPECT_TRUE(best_base > 0.0);
+}
+
 TEST(conv2d_mma, hw_op_vs_im2col_perf) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -1628,6 +1981,129 @@ TEST(gemm_i8, ffn_prototype) {
 //           (512-deep quant groups along K on BOTH operands).
 // Quality + oracle at a small shape, then perf vs the single-op i8 kernel
 // at the flux2 FFN shapes.
+TEST(gemm_i8, the_vdn_readout_projection_survives_its_zero_rows) {
+  // THE VDN BRANCH'S OUTPUT PROJECTION under accelerated mode.
+  //
+  // The branch hands its readout to the TRANSFORMER's GEMM -- that is
+  // where the quantisation lives -- so with `i8_gemm` on, MiniMax-H3's
+  // to_out_linear takes the int8 path. Its shape qualifies exactly:
+  // K = inner = 7168 is 14 whole 512-groups, so there is not even a pad,
+  // and M is the video row count, far past the 1024-row gate.
+  //
+  // WHAT IS UNUSUAL ABOUT IT is the input. Under `anchors: both` the
+  // branch never writes frames 0 and F-1 -- the softmax half covers them
+  // in both directions, so their readout is exactly zero by the
+  // partition -- and the buffer is zeroed once and reused across all 50
+  // blocks. So ~1020 of 18870 rows are ALL ZERO on every block, which is
+  // a shape a dynamic per-row-group absmax quantiser has to have an
+  // answer for: the scale is the absmax, and the absmax of nothing is 0.
+  //
+  // The answer is a guard in quant_f16_i8_row_g512 (`am > 0 ? 127/am :
+  // 0`), and this is what says it holds end to end rather than by
+  // reading it -- an unguarded divide would put inf in the scale and NaN
+  // in the residual stream of two frames, which renders as two bad
+  // frames in an otherwise fine clip.
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) { return; }
+  // bf16, as H3 constructs it: its residual stream is bf16 throughout.
+  vpipe::genai::I8GemmContext i8(mc, /*want=*/true, /*bf16=*/true);
+  if (!i8.enabled()) {
+    std::printf("[gemm_i8vdn] accelerated mode unavailable -- skip\n");
+    return;
+  }
+  const int M = 2040, N = 5376, K = 7168;   // 4 frames of 510, hidden, inner
+  EXPECT_TRUE(i8.accepts(M, N, K));
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma_bf16");
+  ComputeFunction ref = lib.function("dense_gemm_mma_t_n128_f16");
+  if (!ref.valid()) { return; }
+
+  auto bf = [](float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto unbf = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  SharedBuffer xb = mc->make_shared_buffer((std::size_t)M * K * 2);
+  SharedBuffer wb = mc->make_shared_buffer((std::size_t)N * K * 2);
+  SharedBuffer y8 = mc->make_shared_buffer((std::size_t)M * N * 2);
+  SharedBuffer yr = mc->make_shared_buffer((std::size_t)M * N * 2);
+  if (xb.empty() || wb.empty() || y8.empty() || yr.empty()) { return; }
+  // The FIRST and LAST frame's rows are the anchors: exactly zero.
+  const int tpf = 510;
+  std::mt19937 rng(99u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  {
+    auto* x = static_cast<std::uint16_t*>(xb.contents());
+    for (int r = 0; r < M; ++r) {
+      const bool anchor = (r < tpf) || (r >= M - tpf);
+      for (int k = 0; k < K; ++k) {
+        x[(std::size_t)r * K + k] = anchor ? 0 : bf(nd(rng) * 0.5f);
+      }
+    }
+    auto* w = static_cast<std::uint16_t*>(wb.contents());
+    for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+      w[i] = bf(nd(rng) * 0.05f);
+    }
+    std::memset(y8.contents(), 0xff, y8.byte_size());   // not pre-zeroed
+    std::memset(yr.contents(), 0xff, yr.byte_size());
+  }
+
+  { CommandStream st = mc->make_command_stream();
+    { ComputeEncoder enc = st.begin_compute();
+      const bool took = i8.gemm(enc, xb, 0, wb, y8, 0, M, N, K);
+      EXPECT_TRUE(took);
+      if (!took) { return; }
+      // The bf16 arm the mode replaces, for the same operands.
+      enc.set_function(ref);
+      enc.set_buffer(0, xb); enc.set_buffer(1, wb); enc.set_buffer(2, wb);
+      enc.set_buffer(3, yr);
+      enc.set_constant(4, K);
+      enc.set_constant(5, N);
+      enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + 127) / 128) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+      enc.end();
+    }
+    std::string e;
+    ASSERT_TRUE(st.commit().wait_ok(&e));
+  }
+
+  const auto* a = static_cast<const std::uint16_t*>(y8.contents());
+  const auto* b = static_cast<const std::uint16_t*>(yr.contents());
+  double num = 0.0, den = 0.0;
+  std::size_t nonfinite = 0, anchor_nonzero = 0;
+  for (int r = 0; r < M; ++r) {
+    const bool anchor = (r < tpf) || (r >= M - tpf);
+    for (int n = 0; n < N; ++n) {
+      const float g = unbf(a[(std::size_t)r * N + n]);
+      const float w = unbf(b[(std::size_t)r * N + n]);
+      if (!std::isfinite(g)) { ++nonfinite; }
+      if (anchor && g != 0.0f) { ++anchor_nonzero; }
+      const double d = (double)g - (double)w;
+      num += d * d;
+      den += (double)w * (double)w;
+    }
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : -1.0;
+  std::printf("[gemm_i8vdn] %dx%dx%d, %d anchor rows: rel-L2 %.3e, "
+              "%zu non-finite, %zu anchor outputs non-zero\n", M, N, K,
+              2 * tpf, rel, nonfinite, anchor_nonzero);
+  // The zero rows are the point: exactly zero out, not NaN and not noise.
+  EXPECT_TRUE(nonfinite == 0);
+  EXPECT_TRUE(anchor_nonzero == 0);
+  // And the rest is int8's usual ~1e-2, which is what the mode costs
+  // everywhere and is why it is opt-in.
+  EXPECT_TRUE(rel >= 0.0 && rel < 0.05);
+}
+
 TEST(gemm_i8, k512_chunked) {
   Session sess;
   auto* mc = get_mc_(sess);

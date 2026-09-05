@@ -35,6 +35,7 @@ import { el, clear, openModal } from '../dom.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { t, tOr } from '../i18n.js';
 import { openFsSheet, dirOf, baseOf } from './phone-fs.js';
+import { compatibleModels } from '../model-filter.js';
 
 const NUMERIC = new Set(['int', 'uint', 'real']);
 const JSONISH = new Set(['array', 'object', 'any']);
@@ -313,39 +314,13 @@ async function openModelPicker(f, onPick, peerValues) {
     return;
   }
   const all = (data && data.models) || [];
-  const csv = (s) => String(s || '').split(',')
-    .map((x) => x.trim()).filter(Boolean);
 
-  // (a) + (b): what this STAGE FIELD will accept.
-  const allowed = csv(f.suggest_db_type);
-  const needIn  = csv(f.need_inputs);
-  const needOut = csv(f.need_outputs);
-  const ioOk = (m) =>
-    needIn.every((x) => (m.inputs || []).includes(x))
-    && needOut.every((x) => (m.outputs || []).includes(x));
-  const stageOk = (m) => (allowed.length
-    ? allowed.includes(m.model_type)
-    : (m.category || 'model') === 'model') && ioOk(m);
-
-  // (c): the installed models named by the OTHER fields of this form are
-  // the candidate parents. A supplement with no parent, or a form where
-  // nothing has been chosen yet, is not filtered out -- the rule hides
-  // what is known to be incompatible, never what is merely unconfirmed.
-  const chosen = new Set(peerValues ? peerValues() : []);
-  const parents = all.filter(
-    (m) => chosen.has(m.key) || chosen.has(m.hf_path));
-  const parentOk = (m) => {
-    if (!m.parent_model_type) { return true; }   // not a supplement
-    if (!parents.length) { return true; }        // no parent chosen yet
-    return parents.some((p) => p.model_type === m.parent_model_type
-      && (!m.parent_param_class
-          // Case-insensitive: a registry record written before the
-          // catalog switched "e4b" -> "E4B" still matches the tower's.
-          || m.parent_param_class.toLowerCase()
-               === (p.param_class || '').toLowerCase()));
-  };
-
-  const models = all.filter((m) => stageOk(m) && parentOk(m));
+  // WHAT THIS STAGE FIELD WILL ACCEPT: its suggest_db_type allow-list,
+  // its required I/O modalities, and parent compatibility against the
+  // installed models the form's OTHER fields already name. Shared with
+  // the desktop browser -- see model-filter.js, where a copy of this
+  // rule drifted into hiding a supplement's own siblings.
+  const models = compatibleModels(all, f, peerValues ? peerValues() : []);
   clear(list);
   if (!models.length) {
     list.append(el('div', { class: 'ph-sheet-hint' },

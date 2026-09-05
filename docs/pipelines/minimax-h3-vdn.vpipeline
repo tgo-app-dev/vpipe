@@ -1,0 +1,175 @@
+{
+  "id": "minimax-h3-vdn",
+  "stages": [
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12,
+        "audio_shift": 3,
+        "condition_timestep": 1,
+        "audio_seconds": 0,
+        "linear_branch": "OpenVDN/vdn-minimax-h3-stage-dmd",
+        "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+        "lora_scale": 1
+      }
+    },
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/MiniMax-H3-FL2VA-8bit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "surreal avant-garde fashion portrait of a woman with pale porcelain skin, wearing an oversized asymmetrical ribbed burnt orange hat and a textured black mask covering her right eye. Only her left amber eye is visible. She has plump lips painted vibrant orange and an abstract orange floral/berry motif on her collar. Four small birds with black heads and orange breasts (resembling orioles) are perched intricately on her hat, shoulder, and neck. Dark, thin, chaotic branch-like tendrils swirl around her head like a wild halo. The background is a moody, dark grey wall with heavy vertical textured streaks. Cinematic lighting, hyper-realistic digital art, striking color contrast between orange and dark grey, highly detailed, ethereal, mysterious atmosphere, 8k resolution."
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 544,
+        "width": 960,
+        "frames": 124,
+        "fps": 24,
+        "steps": 6,
+        "seed": 6,
+        "i8_gemm": true,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "minimax-h3-vdn.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

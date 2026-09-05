@@ -42,6 +42,10 @@ namespace vpipe {
 //   audio_seconds (real) -- soundtrack duration; 0 derives it from the
 //                              video's frames / fps, which is what keeps
 //                              the two modalities the same length
+//   linear_branch (string) -- VDN-H3 release root; turns every main
+//                              block's attention into the hybrid. A
+//                              SECOND checkpoint beside the DiT, not a
+//                              replacement for it
 //   lora / lora2 (+ _scale, _qkv_layout) -- TWO runtime LoRA slots,
 //                              applied together: the usual pairing is a
 //                              few-step Turbo distillation and a style
@@ -72,6 +76,8 @@ private:
   double _cond_timestep = 1.0;
   double _cond_audio_timestep = 1.0;
   double _audio_seconds = 0.0;
+  // The VDN-H3 release root, or empty for the stock attention.
+  std::string _linear_branch;
   std::string _lora;
   double _lora_scale = 1.0;
   std::string _lora2;

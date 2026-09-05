@@ -14,6 +14,22 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+// vpipe: BLOCK-SPARSE attention. The host supplies, per query block, the
+// key blocks it may attend to; everything else is never loaded. Gated on
+// a function constant so every existing instantiation compiles to
+// exactly the code it did before -- the specialisation is resolved
+// before codegen, so the branches below cost the dense kernels nothing.
+// OPTIONAL BY CONSTRUCTION. Every other caller of this entry point in
+// the tree -- eleven of them, across six DiTs, two encoders and an LM --
+// sets 300..302 and stops there, so a new slot they do not know about
+// must not be able to change what they get. Reading it through
+// is_function_constant_defined makes "unset" mean false explicitly
+// rather than relying on what an unset constant does, and leaves those
+// call sites correct without being touched, which is a stronger
+// statement than having audited them.
+constant bool has_spans_set [[function_constant(303)]];
+constant bool has_spans =
+    is_function_constant_defined(has_spans_set) ? has_spans_set : false;
 
 struct MaxOp {
   template <typename T>
@@ -76,6 +92,16 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    // vpipe block-sparse: qb_off[NQ + 1] indexes qb_blocks, which lists
+    // the key BLOCK indices each query block visits, ascending.
+    const device int* qb_off [[buffer(8), function_constant(has_spans)]],
+    const device int* qb_blocks [[buffer(9), function_constant(has_spans)]],
+    const constant AttnSpanParams* span_params
+        [[buffer(10), function_constant(has_spans)]],
+    // [num_frames] window bounds, inclusive, UNCLAMPED -- lo < 0 and
+    // hi >= num_frames are how "nothing outside on that side" is said.
+    const device int2* span_bounds
+        [[buffer(11), function_constant(has_spans)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -246,8 +272,30 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
+  // vpipe block-sparse: walk the query block's OWN list of key blocks
+  // instead of all of them. `nvis` is how many it visits and `kb` is
+  // which, so every position computed from `kb` below stays the real
+  // column and the length/causal masking is untouched.
+  int nvis = kb_lim;
+  int vis_base = 0;
+  int kb_prev = 0;
+  if (has_spans) {
+    vis_base = qb_off[tid.x];
+    nvis = qb_off[tid.x + 1] - vis_base;
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int vi = 0; vi < nvis; vi++) {
+    const int kb = has_spans ? qb_blocks[vis_base + vi] : vi;
+    if (has_spans) {
+      // The loaders start at block 0 and only ever move forward, so the
+      // step is the gap since the last visited block -- kb itself on the
+      // first iteration, which is how a query block whose window starts
+      // late skips straight to it.
+      loader_k.jump(kb - kb_prev);
+      loader_v.jump(kb - kb_prev);
+      kb_prev = kb;
+    }
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!align_K && kb == (params->NK_aligned)) {
@@ -320,6 +368,55 @@ template <
             if (row_pos < (col_pos + jj)) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
+          }
+        }
+      }
+    }
+
+    // vpipe block-sparse: the block list is rounded OUTWARD to whole
+    // key blocks, so a block at a span's edge carries keys the mask
+    // forbids. This is WindowMask::allows, element by element and in
+    // closed form -- nothing is read but the frame's own [lo, hi].
+    if (has_spans) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      const int vs = span_params->video_start;
+      const int tpf = span_params->tokens_per_frame;
+      const int nf = span_params->num_frames;
+      const int anc = span_params->anchors;
+      const int ve = vs + nf * tpf;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos =
+            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
+        const bool q_video = row_pos >= vs && row_pos < ve && tpf > 0;
+        // A query row outside the video block is dense both ways, and so
+        // is every row past the sequence -- those are already -inf from
+        // the length mask and must not be revived here.
+        if (!q_video) { continue; }
+        int qf = (row_pos - vs) / tpf;
+        qf = qf < 0 ? 0 : (qf > nf - 1 ? nf - 1 : qf);
+        const int2 b = span_bounds[qf];
+        const bool q_anchor = (qf == 0) || (qf == nf - 1);
+        // Anchor ROWS see everything, so the whole row is already right.
+        if (((anc & 2) != 0) && q_anchor) { continue; }
+
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            const int c = col_pos + jj;
+            if (c < vs || c >= ve) { continue; }   // a global key: dense
+            const int kf = (c - vs) / tpf;
+            bool ok = (kf >= b.x && kf <= b.y);
+            if (!ok && ((anc & 1) != 0)) {
+              ok = (kf == 0) || (kf == nf - 1);
+            }
+            if (!ok) { Stile.frag_at(i, j)[jj] = neg_inf; }
           }
         }
       }
@@ -451,9 +548,13 @@ template <
       }
     }
 
-    // Prepare for next iteration
-    loader_k.next();
-    loader_v.next();
+    // Prepare for next iteration. The sparse path jumps at the TOP
+    // instead, because the gap is a property of the block it is about to
+    // read and not of the one it has just finished.
+    if (!has_spans) {
+      loader_k.next();
+      loader_v.next();
+    }
   }
 
   // Normalize output

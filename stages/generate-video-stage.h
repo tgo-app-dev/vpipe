@@ -241,6 +241,20 @@ private:
   // config that predates the split still means what it did.
   std::string   _family = "wan";
   std::string   _hf_dir;
+  // The VDN-H3 release root the DiT was BUILT with, or empty for the
+  // stock attention. Latched from the model_config beat like a LoRA
+  // path -- see the `linear_branch` key on `minimax-h3-model-config`,
+  // which is where it is configured. Not a key on this stage: it is a
+  // fact about one family and nothing else here reads it.
+  std::string   _vdn_dir;
+
+  // The branch the CONFIG asks for, straight out of the beat.
+  //
+  // Apart from `_vdn_dir` because they answer different questions at
+  // different times: this one serves declare_resources(), which is
+  // const and runs before any driver, so it reads the folded constant
+  // rather than a value the runtime latch has not set yet.
+  std::string vdn_dir_() const;
   int           _height = 480;
   int           _width  = 832;
   int           _frames = 81;

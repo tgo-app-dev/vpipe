@@ -17,6 +17,18 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+// vpipe: BLOCK-SPARSE attention, the matrix-core twin of the same
+// constant in steel_attention.h. Same slot, same buffers, same closed-
+// form edge mask -- the two kernels are one predicate on two tile sizes,
+// which is what lets a windowed forward keep the matrix cores instead of
+// falling back to the ALU kernel for the whole block.
+//
+// Read through is_function_constant_defined for the reason the ALU one
+// is: every other caller of this entry point sets 200..302 and stops, so
+// a slot they do not know about must mean false to them.
+constant bool has_spans_set [[function_constant(303)]];
+constant bool has_spans =
+    is_function_constant_defined(has_spans_set) ? has_spans_set : false;
 
 template <typename T>
 struct TransformScale {
@@ -89,6 +101,19 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    // vpipe block-sparse: qb_off[NQ + 1] indexes qb_blocks, which lists
+    // the key BLOCK indices each query block visits, ascending. Built
+    // for THIS kernel's BQ/BK -- a list built for the ALU kernel's 32x16
+    // read against 64x32 blocks is not a slower answer, it is a
+    // different window.
+    const device int* qb_off [[buffer(8), function_constant(has_spans)]],
+    const device int* qb_blocks [[buffer(9), function_constant(has_spans)]],
+    const constant AttnSpanParams* span_params
+        [[buffer(10), function_constant(has_spans)]],
+    // [num_frames] window bounds, inclusive, UNCLAMPED -- lo < 0 and
+    // hi >= num_frames are how "nothing outside on that side" is said.
+    const device int2* span_bounds
+        [[buffer(11), function_constant(has_spans)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -193,8 +218,37 @@ template <
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+  // vpipe block-sparse: walk the query block's OWN list of key blocks
+  // instead of all of them. `nvis` is how many it visits and `kb` is
+  // which, so every position computed from `kb` below -- the length
+  // mask, the causal bound, the edge mask -- stays the real column.
+  int nvis = kb_lim;
+  int vis_base = 0;
+  int kb_prev = 0;
+  if (has_spans) {
+    vis_base = qb_off[tid.x];
+    nvis = qb_off[tid.x + 1] - vis_base;
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int vi = 0; vi < nvis; vi++) {
+    const int kb = has_spans ? qb_blocks[vis_base + vi] : vi;
+    if (has_spans) {
+      // K and V only ever move FORWARD, so the step is the gap since the
+      // last visited block -- kb itself on the first iteration, which is
+      // how a query block whose window starts late skips straight to it.
+      // int64 ON PURPOSE. The dense loop steps one block at a time and
+      // accumulates through the POINTER, so its increment is small
+      // whatever the sequence; a sparse jump is the GAP, which for the
+      // first visited block is the block index itself. At video geometry
+      // K_strides[2] is 3*inner = 21504, so a 32-bit product wraps at
+      // 3120 key blocks -- 99840 rows, which is a 27-second clip and not
+      // a hypothetical. It wraps silently: the loads come back from
+      // somewhere else in the same buffer.
+      K += (int64_t)(kb - kb_prev) * BK * params->K_strides[2];
+      V += (int64_t)(kb - kb_prev) * BK * params->V_strides[2];
+      kb_prev = kb;
+    }
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -297,6 +351,59 @@ template <
               const auto c = base_col + ik * kU + jj + sn;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
+    }
+
+    // vpipe block-sparse: the block list is rounded OUTWARD to whole key
+    // blocks, so a block at a span's edge carries keys the mask forbids.
+    // This is WindowMask::allows, element by element and in closed form
+    // -- nothing is read but the frame's own [lo, hi]. Byte for byte the
+    // predicate the ALU kernel applies; only the fragment indexing
+    // differs, which is why the two agree to the accumulation floor.
+    if (has_spans) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int vs = span_params->video_start;
+      const int tpf = span_params->tokens_per_frame;
+      const int nf = span_params->num_frames;
+      const int anc = span_params->anchors;
+      const int ve = vs + nf * tpf;
+      const int base_row = tid.x * BQ + params->qL_off + tm;
+      const int base_col = kb * BK;
+
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+          const int row_pos =
+              base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
+          // A query row outside the video block is dense both ways, and
+          // so is every row past the sequence -- those are already -inf
+          // from the length mask and must not be revived here.
+          if (!(row_pos >= vs && row_pos < ve && tpf > 0)) { continue; }
+          int qf = (row_pos - vs) / tpf;
+          qf = qf < 0 ? 0 : (qf > nf - 1 ? nf - 1 : qf);
+          const int2 b = span_bounds[qf];
+          const bool q_anchor = (qf == 0) || (qf == nf - 1);
+          // Anchor ROWS see everything, so the row is already right.
+          if (((anc & 2) != 0) && q_anchor) { continue; }
+
+          STEEL_PRAGMA_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            thread auto& fg = Stile.frag_at(iq, ik);
+            STEEL_PRAGMA_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const int c = base_col + ik * kU + jj + sn;
+              if (c < vs || c >= ve) { continue; }   // a global key: dense
+              const int kf = (c - vs) / tpf;
+              bool ok = (kf >= b.x && kf <= b.y);
+              if (!ok && ((anc & 1) != 0)) {
+                ok = (kf == 0) || (kf == nf - 1);
+              }
+              if (!ok) { fg[ii * stile_t::kFragThrCols + jj] = neg_inf; }
             }
           }
         }
@@ -451,9 +558,13 @@ template <
       }
     }
 
-    // Prepare for next iteration
-    K += BK * int(params->K_strides[2]);
-    V += BK * int(params->V_strides[2]);
+    // Prepare for next iteration. The sparse path steps at the TOP
+    // instead, because the gap is a property of the block it is about to
+    // read and not of the one it has just finished.
+    if (!has_spans) {
+      K += BK * int(params->K_strides[2]);
+      V += BK * int(params->V_strides[2]);
+    }
   }
 
   // Normalize output

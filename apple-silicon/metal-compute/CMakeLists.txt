@@ -92,6 +92,14 @@ add_vpipe_metal_kernel(qwen3_5_gated_delta_bf16
                        DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(qwen3_5_gdn_wy
                        SRC gated-delta/qwen3_5_gdn_wy.metal)
+# VDN-H3's per-frame SPD solve. f32 only: the matrix it factorises is
+# only symmetric to the working precision, and bf16's 8 mantissa bits
+# push the smallest eigenvalue of I + A below the 1 the maths guarantees.
+add_vpipe_metal_kernel(vdn_solve SRC gated-delta/vdn_solve.metal)
+# The linear branch's per-frame statistics. Also f32: A is what the
+# solve above inverts, and its symmetry only holds to the working
+# precision.
+add_vpipe_metal_kernel(vdn_branch SRC gated-delta/vdn_branch.metal)
 add_vpipe_metal_kernel(dense_gemm SRC gemm/dense_gemm.metal)
 add_vpipe_metal_kernel(dense_gemm_bf16 SRC gemm/dense_gemm.metal
                        DEFINES VPIPE_ELT=bfloat)
@@ -187,6 +195,13 @@ add_vpipe_metal_kernel(sdpa_mma_bf16 SRC attention/sdpa_mma.metal
 add_vpipe_metal_kernel(gdn_mma SRC gated-delta/gdn_mma.metal STD metal4.0
                        FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(gdn_mma_bf16 SRC gated-delta/gdn_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
+# VDN-H3's per-frame statistics on the matrix cores. bf16 ONLY, and not
+# for want of a twin: the operands are the branch's FEATURES, which are
+# bf16 exactly when the matrix-core route is on -- an fp32 branch is the
+# goldens' path and keeps the ALU kernel. Capability-gated.
+add_vpipe_metal_kernel(vdn_mma SRC gated-delta/vdn_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(attn_steel

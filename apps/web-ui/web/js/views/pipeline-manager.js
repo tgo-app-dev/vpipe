@@ -5,7 +5,8 @@ import { el, clear, append, toast, openModal, openMenu, kbd }
   from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
-import { modelMatches, modalitiesPresent } from '../model-filter.js';
+import { modelMatches, modalitiesPresent, compatibleModels }
+  from '../model-filter.js';
 import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
 import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
@@ -1693,10 +1694,9 @@ function mountEditor(container, opts = {}) {
   // editor doesn't strand the user with empty inputs against an
   // un-upgraded server.
   // Compatibility-aware model browser for a model-registry field.
-  // Lists installed models filtered by (a) the field's model_type allow-
-  // list (suggest_db_type) and (b) parent-model compatibility: a supplement
-  // (vision tower / LoRA) is shown only when the parent model chosen in a
-  // sibling field of this form matches its parent_model_type (+ size).
+  // Lists installed models filtered by the field's model_type allow-list
+  // (suggest_db_type), its required I/O modalities, and parent
+  // compatibility against what the form's other fields already name.
   // Picking a model sets the field via onPick(key).
   async function openModelBrowser(field, input, onPick) {
     let data;
@@ -1708,47 +1708,18 @@ function mountEditor(container, opts = {}) {
     }
     const all = (data && data.models) ? data.models : [];
 
-    // (a) Stage compatibility: the field's model_type allow-list (untyped
-    // fields show plain models only -- hide datasets + bare supplements)
-    // AND its required I/O modalities (need_inputs / need_outputs): a
-    // model's inputs must cover every required input, its outputs every
-    // required output. E.g. text-chat's LM field requires text->text.
-    const allowed = (field.suggest_db_type || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const needIn = (field.need_inputs || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const needOut = (field.need_outputs || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const ioOk = (m) =>
-      needIn.every((x) => (m.inputs || []).includes(x))
-      && needOut.every((x) => (m.outputs || []).includes(x));
-    const stageOk = (m) => (allowed.length
-      ? allowed.includes(m.model_type)
-      : (m.category || 'model') === 'model') && ioOk(m);
-
-    // (b) Parent compatibility: the installed models currently selected in
-    // OTHER fields of this config form (value matches an installed model
-    // key / hf_path) are candidate parents.
+    // WHAT THIS FIELD MAY OFFER: the field's own rules (its
+    // suggest_db_type allow-list and its required I/O modalities) plus
+    // parent compatibility, against the installed models the form's
+    // OTHER fields already name. Shared with the phone sheet -- see
+    // model-filter.js, where a copy of this rule drifted.
     const chosen = new Set();
     document.querySelectorAll('[id^="f_"]').forEach((elm) => {
       if (elm === input) { return; }
       const v = (elm.value || '').trim();
       if (v) { chosen.add(v); }
     });
-    const parents = all.filter(
-      (m) => chosen.has(m.key) || chosen.has(m.hf_path));
-    const parentOk = (m) => {
-      if (!m.parent_model_type) { return true; }   // not a supplement
-      if (!parents.length) { return true; }         // no parent chosen yet
-      return parents.some((p) => p.model_type === m.parent_model_type
-        && (!m.parent_param_class
-            // Case-insensitive: a registry record written before the catalog
-            // switched "e4b" -> "E4B" still matches the tower's "E4B".
-            || m.parent_param_class.toLowerCase()
-                 === (p.param_class || '').toLowerCase()));
-    };
-
-    const compatible = all.filter((m) => stageOk(m) && parentOk(m));
+    const compatible = compatibleModels(all, field, chosen);
 
     let closeModal = () => {};
     const groups = [

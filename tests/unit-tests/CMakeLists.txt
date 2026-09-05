@@ -166,7 +166,16 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-lora.cc
         minimax-h3-comfy.cc
         minimax-h3-layout.cc
+        vdn-geometry.cc
+        vdn-delta-solve.cc
+        vdn-linear-features.cc
+        vdn-linear-branch.cc
+        vdn-window-softmax.cc
+        vdn-span-attention.cc
+        vdn-config.cc
+        metal-vdn-branch.cc
         minimax-h3-dit.cc
+        minimax-h3-vdn-hybrid.cc
         minimax-h3-vvae.cc
         minimax-h3-avae.cc
         audio-vae-encode.cc

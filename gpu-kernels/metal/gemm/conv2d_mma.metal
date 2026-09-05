@@ -726,6 +726,142 @@ kernel void conv2d_hw_1x1_s1_i8f16(
   cT.store(mD);
 }
 
+
+// ---------------------------------------------------------------------------
+// DEPTHWISE on the hardware op, via a BLOCK-DIAGONAL weight.
+//
+// MPP's convolution2d static_asserts `groups == 1`, so a depthwise conv --
+// one KxK kernel per channel, no cross-channel term -- cannot be handed to it
+// as itself. The only mapping is to make it DENSE over a block of B channels
+// with a weight that is zero off the diagonal: the arithmetic goes up B-fold
+// and lands on the matrix units, which is a trade and not a free win. Whether
+// it pays is a measurement, and it is what conv2d_mma.hw_op_depthwise_probe
+// makes.
+//
+// NOTHING IS REPACKED, and that is the point of doing it here rather than
+// around a copy. Both channel slicing (the activation's innermost extent is
+// the caller's ROW PITCH, not B) and batch slicing (one image per frame) ride
+// on the same semantics the output-channel tiling already uses: the op takes
+// its strides from the tensor's extents and its tile shape from the
+// descriptor. So the activation may be a strided window inside a fused
+// projection -- which is exactly what VDN's short conv reads.
+//
+//   0:in  1:wblk [nblk][KS][KS][B][B] hwio, block-diagonal
+//   2:out 3:gw 4:gh 5:a_pitch (the activation's innermost extent -- the
+//   caller's ROW STRIDE, which for a fused projection is 3*inner)
+//   6:d_pitch (the destination's) 7:nblk 8:frames 9:hd (channels per
+//   group in the source) 10:hst (elements between groups)
+//
+// The source's channel map is the branch's own: channel c lives at
+// (c / hd) * hst + c % hd. Tight is hd = hst = the channel count, which
+// is the default any caller without a fused projection passes. B MUST
+// DIVIDE hd -- a block straddling a group boundary would read the next
+// group's channels under this one's weights, silently and only at the
+// seams -- and the host checks it rather than the kernel, because a
+// kernel that returns early here writes nothing and reads as zeros.
+// Dispatch: {ceil(gw/TW)*SG*32, ceil(gh/TH), frames*nblk}, tg {SG*32,1,1}.
+template <int B, int TW, int TH, int KS, int SG>
+static inline void conv2d_hw_dw_impl(
+    const device VPIPE_ELT* inp, const device VPIPE_ELT* wblk,
+    device VPIPE_ELT* out, int gw, int gh, int a_pitch, int d_pitch,
+    int nblk, int frames, int hd, int hst, uint3 tgid)
+{
+  using T4 = tensor<device VPIPE_ELT, dextents<int32_t, 4>, tensor_inline>;
+  const int f  = (int)tgid.z / nblk;
+  const int cb = (int)tgid.z - ((int)tgid.z / nblk) * nblk;
+  const int ox0 = (int)tgid.x * TW;
+  const int oy0 = (int)tgid.y * TH;
+  if (f >= frames || ox0 >= gw || oy0 >= gh) { return; }
+
+  // The activation's channel origin, through the source's own group map.
+  const int c0 = cb * B;
+  const int ci0 = (c0 / hd) * hst + (c0 - (c0 / hd) * hd);
+
+  T4 tA(const_cast<device VPIPE_ELT*>(inp),
+        dextents<int32_t, 4>(a_pitch, gw, gh, frames));
+  T4 tW(const_cast<device VPIPE_ELT*>(wblk) + (int64_t)cb * KS * KS * B * B,
+        dextents<int32_t, 4>(B, B, KS, KS));
+  T4 tD(out, dextents<int32_t, 4>(d_pitch, gw, gh, frames));
+
+  constexpr auto desc = convolution2d_descriptor(
+      /*destination_dimensions=*/int4(B, TW, TH, 1),
+      /*source_dimensions=*/int4(B, TW, TH, 1),   // patched below
+      /*kernel_dimensions=*/int2(KS, KS),
+      convolution2d_activation_layout::nhwc,
+      convolution2d_weights_layout::hwio,
+      /*strides=*/int2(1, 1), /*dilations=*/int2(1, 1), /*groups=*/1,
+      /*relaxed_precision=*/false,
+      convolution2d_descriptor::mode::multiply);
+  convolution2d<desc, execution_simdgroups<SG>> op;
+
+  auto sA = tA.slice(ci0, 0, 0, f);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(sA), decltype(tW), VPIPE_ELT>();
+  convolution2d_descriptor rd = desc;
+  rd.source_dimensions = int4(B, gw, gh, 1);
+  int2 off = int2(ox0, oy0);
+  __convolution2d_detail::__run<execution_simdgroups<SG>,
+                                decltype(sA), decltype(tW), decltype(cT)>(
+      sA, tW, cT, rd, off);
+  auto mD = tD.slice(c0, ox0, oy0, f);
+  cT.store(mD);
+}
+
+#define CV_DW(NAME, B, TW, TH, KS, SG)                                     \
+  kernel void NAME(                                                        \
+      const device VPIPE_ELT* inp [[buffer(0)]],                           \
+      const device VPIPE_ELT* wblk [[buffer(1)]],                          \
+      device VPIPE_ELT* out [[buffer(2)]],                                 \
+      const constant int& gw [[buffer(3)]],                                \
+      const constant int& gh [[buffer(4)]],                                \
+      const constant int& a_pitch [[buffer(5)]],                           \
+      const constant int& d_pitch [[buffer(6)]],                           \
+      const constant int& nblk [[buffer(7)]],                              \
+      const constant int& frames [[buffer(8)]],                            \
+      const constant int& c_base [[buffer(9)]],                            \
+      const constant int& c_stride [[buffer(10)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                       \
+    conv2d_hw_dw_impl<B, TW, TH, KS, SG>(inp, wblk, out, gw, gh, a_pitch,  \
+                                         d_pitch, nblk, frames, c_base,    \
+                                         c_stride, tgid);                  \
+  }
+
+// WHICH BLOCK AND WHICH TILE, both swept rather than reasoned
+// (conv2d_mma.hw_op_depthwise_perf, M5, 37 frames of 17x30 x 7168 ch,
+// against the ALU depthwise kernel at 16.9 ms):
+//
+//   B:   64 0.37x   32 0.75x   16 1.24x   8 0.68x   4 0.35x
+//
+// Neither direction is monotone, and 16 IS A HARD FLOOR RATHER THAN A
+// PREFERENCE: at B = 8 the op does not fail to build, does not fault and
+// does not return zeros -- it returns a plausible field that is 64%
+// wrong (conv2d_mma.hw_op_depthwise_probe asserts exactly that, because
+// the waste is exactly B and a narrower block is the first thing anyone
+// will reach for). Above 16 the waste grows faster than the rate
+// improves. So 16 is the smallest correct block and the fastest one at
+// the same time.
+//
+// The dest tile HEIGHT is then the grid's business, not the op's:
+//
+//   gh = 17:  h4 1.35x   h6 1.54x   h8 1.24x   h9 0.97x
+//   gh = 16:  h4 1.55x   h6 1.45x   h8 1.62x   h9 0.92x
+//
+// h8 wins where 8 divides the grid and loses where it does not (24 rows
+// computed for 17), so the rule is to MINIMISE THE PADDED ROW COUNT and
+// break ties toward the larger tile -- which is what the host does. h9
+// is kept as the recorded exception: it has the same padded count as h6
+// at gh = 17 and is 60% slower, so the rule is not "waste alone" and a
+// future tile must be measured rather than derived.
+CV_DW(conv2d_hw_dw5_b16h4_f16, 16, 32, 4, 5, 4)
+CV_DW(conv2d_hw_dw5_b16h6_f16, 16, 32, 6, 5, 4)
+CV_DW(conv2d_hw_dw5_b16h8_f16, 16, 32, 8, 5, 4)
+// The recorded neighbours, kept reachable so a future GPU can be
+// re-probed without rebuilding the sweep: one block size either side,
+// and the taller tile.
+CV_DW(conv2d_hw_dw5_b32h8_f16, 32, 32, 8, 5, 4)
+CV_DW(conv2d_hw_dw5_b8h8_f16,   8, 32, 8, 5, 4)
+CV_DW(conv2d_hw_dw5_b16h9_f16, 16, 32, 9, 5, 4)
+
 #else
 // Tensor ops unavailable for this target: emit stubs so the metallib still
 // builds. The loader never binds these on a non-tensor GPU.
@@ -765,6 +901,24 @@ kernel void conv2d_hw_1x1_s1_f16(device VPIPE_ELT* out [[buffer(2)]],
 kernel void conv2d_hw_1x1_s1_i8f16(device half* out [[buffer(2)]],
                                    uint tid [[thread_position_in_grid]])
 { if (tid == 0) { out[0] = (half)0; } }
+kernel void conv2d_hw_dw5_b16h4_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
+kernel void conv2d_hw_dw5_b16h6_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
+kernel void conv2d_hw_dw5_b16h8_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
+kernel void conv2d_hw_dw5_b32h8_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
+kernel void conv2d_hw_dw5_b8h8_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
+kernel void conv2d_hw_dw5_b16h9_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                  uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = out[0]; } }
 kernel void conv2d_hw_3x3_s2_f16(device VPIPE_ELT* out [[buffer(2)]],
                                  uint tid [[thread_position_in_grid]])
 { if (tid == 0) { out[0] = (VPIPE_ELT)0; } }

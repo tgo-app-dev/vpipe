@@ -1267,6 +1267,60 @@ builtin_catalog_()
     // CONVERTED fusion only; this adapter is trained directly on the
     // fused projection (rank 64, dense B), so nothing in its bytes
     // states a layout and only the repo does.
+    // VDN-H3 (OpenVDN): NOT a LoRA, and the difference is the whole
+    // point of listing it apart from the three above. A LoRA adds a
+    // low-rank correction to weights the DiT already has; this adds a
+    // SECOND PATHWAY -- a bidirectional delta-rule recurrence over
+    // frames -- and narrows the softmax to a window of whole frames so
+    // that the two PARTITION the keys. Attention is a different
+    // function afterwards, which is why the branch ships its own 4.28 GB
+    // checkpoint and why running the DiT without it, or it without the
+    // window, is wrong rather than merely unadapted.
+    //
+    // It brings no projections of its own: the branch reads the
+    // backbone's raw pre-QK-norm q/k/v, which is why one adapter on
+    // attn.orig.to_{q,k,v} feeds both halves and why this attaches to
+    // any MiniMax-H3 DiT rather than replacing one.
+    //
+    // TWO STAGES, and the choice between them is real. `stage-b` is the
+    // 50-step model; `stage-dmd` is an 8-step distillation and ships an
+    // extra `turbo` adapter -- the only adapter in this tree that
+    // touches the ADALN projections, at rank 16 where the rest is 64.
+    // Each pins its own subtree of one repo, so they need distinct
+    // registration keys for the reason the two Turbo entries above do.
+    //
+    // Wired through the `linear_branch` key on the
+    // `minimax-h3-model-config` source, not through a LoRA slot: it is
+    // a checkpoint beside the DiT, not a correction to it.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "VDN",
+     .variant = "VDN hybrid attention, stage-B 50-step (OpenVDN)",
+     .hf_path = "OpenVDN/vdn-minimax-h3",
+     .model_type = "minimax-h3-vdn",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"stage-b-step-2000/linear_branch/config.json",
+               "stage-b-step-2000/linear_branch/model.safetensors",
+               "stage-b-step-2000/adapters/default/adapter_config.json",
+               "stage-b-step-2000/adapters/default/adapter_model.safetensors",
+               "stage-b-step-2000/model_spec.json",
+               "stage-b-step-2000/metadata.json"},
+     .needs_tokenizer_json = false,
+     .name = "OpenVDN/vdn-minimax-h3-stage-b"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "VDN",
+     .variant = "VDN hybrid attention, stage-DMD 8-step (OpenVDN)",
+     .hf_path = "OpenVDN/vdn-minimax-h3",
+     .model_type = "minimax-h3-vdn",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"stage-dmd-step-250/linear_branch/config.json",
+               "stage-dmd-step-250/linear_branch/model.safetensors",
+               "stage-dmd-step-250/adapters/default/adapter_config.json",
+               "stage-dmd-step-250/adapters/default/"
+               "adapter_model.safetensors",
+               "stage-dmd-step-250/adapters/turbo/adapter_config.json",
+               "stage-dmd-step-250/adapters/turbo/adapter_model.safetensors",
+               "stage-dmd-step-250/model_spec.json",
+               "stage-dmd-step-250/metadata.json"},
+     .needs_tokenizer_json = false,
+     .name = "OpenVDN/vdn-minimax-h3-stage-dmd"},
     {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
      .variant = "Turbo few-step v4-600 EMA (larryvrh)",
      .hf_path = "larryvrh/MiniMax-H3-Turbo-Lora",

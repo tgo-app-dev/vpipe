@@ -90,7 +90,16 @@ const ConfigKey kAttrs[] = {
           "whole int8 chunk (refused past 10% extra MACs). "
           "MEASURED on minimax-h3, 2 blocks at production geometry: 2.02-2.11 "
           "s/step -> 1.52-1.55 s (1.35x), with the step's velocity rms moving "
-          "0.11%. Default false; env VPIPE_I8_GEMM overrides",
+          "0.11%. "
+          "WITH A VDN `linear_branch` ATTACHED this reaches it twice, which "
+          "a separately-fetched checkpoint does not obviously imply. Its "
+          "output projection is run by the DiT's own GEMM at the o_proj's "
+          "exact shape, so it takes the same route; and the branch reads the "
+          "DiT's q/k/v, which are themselves int8 by then. What the branch "
+          "computes INSIDE itself is not affected -- its statistics, solve "
+          "and readout have no int8 arm. Its per-frame A stays invertible "
+          "regardless, being a Gram matrix whatever noise its input carries. "
+          "Default false; env VPIPE_I8_GEMM overrides",
    .def_bool = false},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
@@ -410,6 +419,17 @@ GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
   // beat and the same parse, early enough that declare_resources()
   // sees the model. Bookkeeping only -- nothing loads here; the
   // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport == kModelCfgPort) {
+    // The family's own knobs, latched early for the one of them that a
+    // LATER DECISION depends on: VDN's linear branch is a second 4.28 GB
+    // checkpoint, and declare_resources() runs before any driver, so a
+    // branch first seen at run time is one every peer sized the box
+    // without. Stored RAW and re-parsed by the runtime latch, which
+    // stays in place -- apply_model_config_() needs a resolved family
+    // and there is none yet.
+    _model_cfg = beat;
+    return;
+  }
   if (iport != kModelPort) { return; }
   apply_model_select_beat(beat, _hf_dir);
 }
@@ -495,6 +515,15 @@ GenerateVideoStage::planned_geometry_(const std::string& root, int* out_w,
   if (out_h != nullptr)      { *out_h = h; }
   if (out_frames != nullptr) { *out_frames = frames; }
   return known;
+}
+
+std::string
+GenerateVideoStage::vdn_dir_() const
+{
+  if (!_model_cfg.is_object()) { return {}; }
+  auto o = _model_cfg.as_object();
+  if (!o.contains("linear_branch")) { return {}; }
+  return std::string(o.at("linear_branch").as_string(""));
 }
 
 std::vector<ResourceClaim>
@@ -638,6 +667,45 @@ GenerateVideoStage::declare_resources() const
   // does fit the second is not one to refuse -- it is one to stream.
   std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
       dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit))};
+  // VDN's branch is a SECOND checkpoint -- 4.28 GB over 50 blocks -- and
+  // it is declared here or it is invisible: every driver runs
+  // initialize() concurrently, so a peer that sizes itself against this
+  // stage before the branch loads sizes against a model that is 4 GB
+  // smaller than the one it will be sharing the box with.
+  //
+  // STREAMABLE, and to almost nothing, because the branch follows the
+  // DiT: if the DiT streams, the branch streams with it and holds one
+  // block. Claiming the full size as a floor would refuse graphs that
+  // stream perfectly well; claiming only the floor would let one in that
+  // then cannot hold both preloaded.
+  const std::string vdn_dir = vdn_dir_();
+  if (!vdn_dir.empty()) {
+    // The record's SUBTREE, not the repo root: the two VDN stages are
+    // published from one repo and both keys resolve to it, so the root
+    // holds no linear_branch/ at all. Handed the root, the scan below
+    // finds nothing and this stage claims NOTHING for a 4.28 GB
+    // checkpoint -- which is the silent half of the same mistake the
+    // attach reports loudly.
+    const std::string vroot =
+        resolved_subtree_dir(resolve_model(session(), vdn_dir));
+    const std::string vdir = (fs::path(vroot) / "linear_branch").string();
+    std::error_code vec;
+    std::size_t whole = 0;
+    for (const auto& de : fs::directory_iterator(vdir, vec)) {
+      if (vec) { break; }
+      if (de.is_regular_file(vec)
+          && de.path().extension() == ".safetensors") {
+        whole += (std::size_t)de.file_size(vec);
+      }
+    }
+    if (whole > 0) {
+      // One block plus the fp32 widening the kernels need, which is what
+      // a streamed branch actually holds at any instant.
+      const int nl = 50;
+      const std::size_t floor = (whole / (std::size_t)nl) * 2u;
+      out.push_back(model_memory::weight_claim_streamable(vdir, floor));
+    }
+  }
   for (auto& c : arena) { out.push_back(std::move(c)); }
   return out;
 #else
@@ -1040,6 +1108,28 @@ GenerateVideoStage::apply_model_config_()
         }
       }
     }
+    // VDN's linear branch, on the same terms as the LoRA PATH above and
+    // for the same reason: it changes what the blocks ARE -- every main
+    // block's attention becomes the hybrid -- so it is a load-time
+    // argument, and naming a different one under a built DiT is refused
+    // rather than half-taken. It lives on the H3 config source, not on
+    // this stage, because it is a fact about this family and nothing
+    // else here reads it.
+    // Through the same reader declare_resources() uses, so the key's
+    // name and its absent-versus-empty rule live in ONE place: the two
+    // disagreeing is how a graph gets its branch declared and not
+    // loaded, or the reverse.
+    const std::string want_vdn = vdn_dir_();
+    if (want_vdn != _vdn_dir) {
+      if (_h3_dit != nullptr) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the DiT is already built, so the "
+            "model_config beat's `linear_branch` is IGNORED -- it is a "
+            "load-time argument", this->id()));
+      } else {
+        _vdn_dir = want_vdn;
+      }
+    }
   } else {
     _wan_params =
         genai::MetalWanTransformer::GenerationParams::from_flex(_model_cfg,
@@ -1396,6 +1486,48 @@ GenerateVideoStage::ensure_expert_(int which)
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
         stream_blocks, loras);
+    // VDN's hybrid attention, if the graph asked for one. AFTER the DiT
+    // loads because the branch sizes itself from the stack it joins, and
+    // a FAILED CONFIG rather than a warning because a graph that names a
+    // branch and silently runs without it produces a plausible video
+    // from weights trained for a different attention -- there is no
+    // output anyone could look at and tell.
+    if (_h3_dit && !_vdn_dir.empty()) {
+      const std::string vroot =
+          resolved_subtree_dir(resolve_model(session(), _vdn_dir));
+      std::string verr;
+      if (!_h3_dit->attach_linear_branch(vroot, &verr)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): linear_branch '{}' could not be "
+            "attached: {}", this->id(), _vdn_dir, verr));
+        _h3_dit.reset();
+        return false;
+      }
+      // The CHECKPOINT's size, not what the branch holds: nothing is
+      // loaded yet -- the blocks come in on first use -- so
+      // linear_branch_bytes() is zero here and a line reporting it says
+      // "0 MB of branch weights" on every successful attach, which reads
+      // as the branch being free rather than as nothing having happened
+      // yet.
+      std::size_t vbytes = 0;
+      {
+        namespace fs = std::filesystem;
+        std::error_code vec;
+        const fs::path vdir = fs::path(vroot) / "linear_branch";
+        for (const auto& de : fs::directory_iterator(vdir, vec)) {
+          if (vec) { break; }
+          if (de.is_regular_file(vec)
+              && de.path().extension() == ".safetensors") {
+            vbytes += (std::size_t)de.file_size(vec);
+          }
+        }
+      }
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): VDN hybrid attention on -- {} MB of "
+          "branch weights beside the DiT, {}", this->id(), vbytes >> 20,
+          stream_blocks ? "streamed with it, one block at a time"
+                        : "held resident"));
+    }
     resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
@@ -2022,6 +2154,12 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   req.video  = vid.data();
   req.audio  = aud.data();
   req.num_steps   = _steps;
+  // VDN's hybrid attention needs the target's grid; without a branch
+  // attached the transformer ignores it. Patches, not pixels -- the same
+  // division build_packed_sequence made to lay the rows out, so the two
+  // cannot disagree about how many tokens a frame has.
+  req.video_grid_h = lh / c.patch_h;
+  req.video_grid_w = lw / c.patch_w;
   // The shifts and both condition levels in one move, so a knob added to
   // GenerationParams reaches the loop without this call site changing.
   req.set_params(_h3_params);

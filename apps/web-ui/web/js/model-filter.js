@@ -58,3 +58,77 @@ export function modelMatches(m, { query = '', wantIn, wantOut } = {}) {
   }
   return true;
 }
+
+// ---------------------------------------------------------------------
+// COMPATIBILITY -- the FIELD's rules, not the operator's.
+//
+// Everything above narrows a list that is already correct. This decides
+// what may be offered at all, and it lives here for the reason the rest
+// does: the desktop browser and the phone sheet ask the same question,
+// and it WAS copied into both, where it drifted into the bug below.
+
+// Does the field accept `m` at all? Its suggest_db_type allow-list (an
+// untyped field shows plain models only -- no datasets, no bare
+// supplements) and its required I/O modalities.
+export function fieldAccepts(m, field) {
+  const csv = (v) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const allowed = csv(field.suggest_db_type);
+  const needIn = csv(field.need_inputs);
+  const needOut = csv(field.need_outputs);
+  const ioOk = needIn.every((x) => (m.inputs || []).includes(x))
+    && needOut.every((x) => (m.outputs || []).includes(x));
+  return (allowed.length
+    ? allowed.includes(m.model_type)
+    : (m.category || 'model') === 'model') && ioOk;
+}
+
+// Is `m` compatible with what the form's OTHER fields already name?
+//
+// `picked` are the installed models those fields resolved to. The rule
+// hides what is known to be incompatible, never what is merely
+// unconfirmed -- so an empty form offers everything.
+//
+// A SUPPLEMENT IS NOT A PARENT, and this is where the rule went wrong.
+// Nothing in the catalogue attaches to a LoRA or a VDN branch, so a
+// chosen supplement treated as a candidate parent matches nothing and
+// vetoes its own siblings: picking the VDN branch on
+// minimax-h3-model-config hid every H3 Turbo LoRA, because the branch's
+// model_type is minimax-h3-vdn while the LoRAs attach to
+// minimax-h3-fl2va.
+//
+// What a chosen supplement IS is evidence about the parent -- it names
+// what it attaches to. On a form whose parent is chosen on ANOTHER stage
+// that is the only evidence there is, which is every H3 config form: the
+// DiT comes from model-select. Two supplements naming the same parent
+// are siblings, and a Krea-2 LoRA beside an H3 branch is still hidden.
+export function parentAccepts(m, picked) {
+  if (!m.parent_model_type) { return true; }        // not a supplement
+  const list = picked || [];
+  const parents = list.filter((p) => !p.parent_model_type);
+  const siblings = list.filter((p) => p.parent_model_type);
+  const classOk = (a, b) => !a || !b || a.toLowerCase() === b.toLowerCase();
+  // A real parent, when the form has one.
+  if (parents.some((p) => p.model_type === m.parent_model_type
+      // Case-insensitive: a registry record written before the catalog
+      // switched "e4b" -> "E4B" still matches the tower's "E4B".
+      && classOk(m.parent_param_class, p.param_class))) {
+    return true;
+  }
+  // Else a sibling's word for it.
+  if (siblings.length) {
+    return siblings.some((s) => s.parent_model_type === m.parent_model_type
+      && classOk(m.parent_param_class, s.parent_param_class));
+  }
+  return !parents.length;                           // nothing chosen yet
+}
+
+// The installed models a field may offer, given what the form's other
+// fields name. `chosen` is those fields' raw values; a value matches a
+// model by registry key or by hf_path.
+export function compatibleModels(all, field, chosen) {
+  const want = (chosen instanceof Set) ? chosen : new Set(chosen || []);
+  const picked = (all || []).filter(
+    (m) => want.has(m.key) || want.has(m.hf_path));
+  return (all || []).filter(
+    (m) => fieldAccepts(m, field) && parentAccepts(m, picked));
+}

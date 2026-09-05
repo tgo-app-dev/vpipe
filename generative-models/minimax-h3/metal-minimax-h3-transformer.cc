@@ -1361,7 +1361,16 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // block-diagonal B that is zero. NOT the smaller model: the fusion is
   // rebuilt here, so what it costs in RAM is what the ComfyUI copy
   // costs on disk.
-  if (ad->has("transformer_blocks.0.attn.to_q")) {
+  // VDN-H3 wraps each DiT block's attention in a HybridAttention that
+  // keeps the original module as `.orig`, so its adapters name
+  // `attn.orig.to_q` where a plain diffusers export names `attn.to_q`.
+  // The TOKEN REFINER is not wrapped -- only the DiT blocks are -- so
+  // its targets keep the plain spelling and the prefix is per call
+  // rather than per adapter. Same tensors either way: the branch shares
+  // the backbone's projections, which is exactly why one adapter feeds
+  // both halves of the hybrid.
+  const bool vdn_hybrid = ad->has("transformer_blocks.0.attn.orig.to_q");
+  if (vdn_hybrid || ad->has("transformer_blocks.0.attn.to_q")) {
     const int HD = c.head_dim;
     const bool per_head = c.qkv_per_head;
     // Where part `pt` (0 = q, 1 = k, 2 = v) row `r` lands in the fused
@@ -1379,25 +1388,50 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     // out_proj and fc2 are byte-identical between the two copies, so
     // they take the plain bind and not a scatter that would copy every
     // row to its own index.
-    auto bind_block = [&](const std::string& dp, BlockLora& bl) {
-      ad->bind_fused({dp + "attn.to_q", dp + "attn.to_k", dp + "attn.to_v"},
+    auto bind_block = [&](const std::string& dp, const std::string& ap,
+                          BlockLora& bl) {
+      ad->bind_fused({dp + ap + "to_q", dp + ap + "to_k", dp + ap + "to_v"},
                      3 * I, H, &bl.qkv, qkv_rows);
-      ad->bind(dp + "attn.to_out.0", H, I, &bl.out);
+      ad->bind(dp + ap + "to_out.0", H, I, &bl.out);
       ad->bind_fused({dp + "ff.net.0.proj"}, 2 * F, H, &bl.fc1, swap_halves);
       ad->bind(dp + "ff.net.2", H, F, &bl.fc2);
     };
+    const std::string block_ap = vdn_hybrid ? "attn.orig." : "attn.";
     slot.blocks.resize((std::size_t)c.n_layers);
     for (int i = 0; i < c.n_layers; ++i) {
-      bind_block("transformer_blocks." + std::to_string(i) + ".",
+      bind_block("transformer_blocks." + std::to_string(i) + ".", block_ap,
                  slot.blocks[(std::size_t)i]);
     }
     slot.refiner.resize((std::size_t)c.n_refiner);
     for (int i = 0; i < c.n_refiner; ++i) {
       bind_block("token_refiner.refiner_blocks." + std::to_string(i) + ".",
-                 slot.refiner[(std::size_t)i]);
+                 "attn.", slot.refiner[(std::size_t)i]);
     }
-    // No adaln and no final_layer: the diffusers export does not adapt
-    // them, and neither does the ComfyUI copy built from it.
+    // The AdaLN projections, which the plain diffusers and ComfyUI
+    // exports do NOT adapt -- bind() simply finds nothing there, which
+    // is why this costs those adapters nothing. VDN's turbo adapter is
+    // the one that does: `transformer_blocks.N.adaln_proj.linear`
+    // [96768, 2688] and `norm_out.linear` [10752, 2688], both at rank
+    // 16 where everything else is 64. Left unbound they are the LARGEST
+    // half of an 8-step distillation silently absent, and the model
+    // still renders.
+    //
+    // SCALE: none of the three VDN adapters carries a `__metadata__`
+    // alpha or a per-module `.alpha` tensor -- their alphas live only in
+    // adapter_config.json, which nothing here reads -- so every module
+    // takes the mul = 1.0 fallback. That is EXACTLY right for these
+    // files and by arithmetic rather than by design: alpha equals rank
+    // throughout (64/64 for the two `default` adapters, and 64/64 plus
+    // 16/16 for turbo's adaln group). An adapter of this shape whose
+    // alpha differed from its rank would be applied at the wrong
+    // strength with nothing to say so.
+    for (int i = 0; i < c.n_layers; ++i) {
+      ad->bind("transformer_blocks." + std::to_string(i)
+                   + ".adaln_proj.linear",
+               c.adaln_out(), c.time_dim,
+               &slot.blocks[(std::size_t)i].adaln);
+    }
+    ad->bind("norm_out.linear", 2 * H, c.time_dim, &slot.final_adaln);
     slot.modules  = ad->modules();
     slot.max_rank = ad->max_rank();
     if (slot.modules == 0) {
@@ -1611,8 +1645,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_copy      = m->_lib_elt.function("copy_f16");
   m->_fn_nan_trip  = m->_lib_elt.function("nan_tripwire_f16");
   {
-    metal_compute::ComputeLibrary sdpa = mc->load_library("sdpa_bf16");
-    m->_fn_sdpa = sdpa.function("sdpa_full_f16");
+    m->_lib_sdpa = mc->load_library("sdpa_bf16");
+    m->_fn_sdpa = m->_lib_sdpa.function("sdpa_full_f16");
   }
   if (!m->_fn_gemm.valid() || !m->_fn_rms.valid() ||
       !m->_fn_rms_heads.valid() || !m->_fn_trope.valid() ||
@@ -3773,6 +3807,230 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t)
 
 // ---- forward ---------------------------------------------------------
 
+// ---- VDN-H3's hybrid attention ---------------------------------------
+
+bool
+MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
+                                                std::string* err)
+{
+  auto fail = [&](const std::string& what) {
+    if (err != nullptr) { *err = what; }
+    return false;
+  };
+  if (!minimax_h3::vdn::load_config(dir, &_vdn_cfg, err)) { return false; }
+  if (!_vdn_cfg.supported(err)) { return false; }
+
+  // THROUGH THE MANAGER, like every other checkpoint: the linear branch
+  // is a separate 4.28 GB safetensors next to this model's, and a set
+  // opened privately here would be invisible to the only thing with a
+  // session-wide view of memory.
+  std::shared_ptr<WeightSet> ws =
+      open_weight_set(dir + "/linear_branch",
+                      _mc != nullptr ? _mc->session() : nullptr);
+  if (!ws) { return fail("cannot open " + dir + "/linear_branch"); }
+
+  minimax_h3::MetalVdnBranch::Dims dims;
+  dims.heads    = _cfg.n_heads;
+  dims.head_dim = _cfg.head_dim;
+  dims.hidden   = _cfg.hidden;
+  dims.n_layers = _cfg.n_layers;
+  std::unique_ptr<minimax_h3::MetalVdnBranch> br =
+      minimax_h3::MetalVdnBranch::load(ws, _mc, _vdn_cfg, dims, err);
+  if (!br) { return false; }
+
+  // The windowed softmax. Refused, the hybrid is not merely slower --
+  // the linear half carries the window's complement and would double
+  // count everything -- so this is a load failure and not a fallback.
+  _fn_sdpa_spans = _lib_sdpa.function("sdpa_spans_f16");
+  if (!_fn_sdpa_spans.valid()) {
+    return fail("sdpa_spans_f16 did not validate");
+  }
+  // THE BRANCH FOLLOWS THE DiT. If this stack streams its own blocks it
+  // is because the box could not hold them, and adding 4.28 GB of branch
+  // beside it would undo the decision that was just made -- so the
+  // branch streams too, and its blocks are released after the same
+  // per-block commit the DiT's are. A resident stack keeps both.
+  br->set_stream_blocks(_stream_blocks);
+  _vdn = std::move(br);
+  if (_mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalMiniMaxH3Transformer: VDN hybrid attention attached ({} "
+        "blocks, window radius {} chunk {})",
+        _cfg.n_layers, _vdn_cfg.radius, _vdn_cfg.chunk));
+  }
+  return true;
+}
+
+// The per-forward VDN state: the window as CSR spans, and the two
+// buffers the readout passes through.
+//
+// Rebuilt only when the geometry moves. The spans are a few hundred
+// kilobytes but building them walks every (query frame, key frame)
+// pair, and a denoise loop asks the same question 50 times a step.
+bool
+MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
+                                       const minimax_h3::PackedLayout& L,
+                                       int bq, int bk, std::string* err)
+{
+  auto fail = [&](const std::string& what) {
+    if (err != nullptr) { *err = what; }
+    return false;
+  };
+  const int tpf = in.video_grid_h * in.video_grid_w;
+  if (tpf <= 0 || L.num_video_rows % tpf != 0) {
+    return fail("the video grid does not divide the video rows");
+  }
+  const int frames = L.num_video_rows / tpf;
+
+  // THE WINDOW FIRST, because whether the linear half runs at all
+  // decides whether its buffers are worth allocating -- and at
+  // production geometry they are gigabytes.
+  if (_vdn_frames != frames || _vdn_tpf != tpf
+      || _vdn_vstart != L.video_start || _vdn_seq != L.seq_len) {
+    minimax_h3::vdn::WindowMask mask;
+    mask.seq_len          = L.seq_len;
+    mask.video_start      = L.video_start;
+    mask.num_frames       = frames;
+    mask.tokens_per_frame = tpf;
+    mask.anchors          = _vdn_cfg.anchors;
+    mask.bounds = minimax_h3::vdn::window_bounds(frames, _vdn_cfg.radius,
+                                                 _vdn_cfg.chunk);
+    const minimax_h3::vdn::WindowSpans sp =
+        minimax_h3::vdn::build_window_spans(mask);
+    auto ib = [&](const std::vector<int>& v) {
+      metal_compute::SharedBuffer b =
+          _mc->make_shared_buffer(v.size() * sizeof(int));
+      if (!b.empty()) {
+        std::memcpy(b.contents(), v.data(), v.size() * sizeof(int));
+      }
+      return b;
+    };
+    _vdn_span_off = ib(sp.off);
+    _vdn_span_lo  = ib(sp.start);
+    _vdn_span_hi  = ib(sp.end);
+    if (_vdn_span_off.empty() || _vdn_span_lo.empty()
+        || _vdn_span_hi.empty()) {
+      return fail("cannot allocate the VDN window spans");
+    }
+    _vdn_bounds = mask.bounds;
+    // The reference's own predicate, and it must stay that predicate:
+    // the two halves partition the keys, so anything that makes them
+    // disagree about the window's edge double counts or drops frames.
+    _vdn_full_cover = true;
+    for (const minimax_h3::vdn::Bound& b : mask.bounds) {
+      if (b.lo > 0 || b.hi < frames - 1) { _vdn_full_cover = false; break; }
+    }
+    _vdn_frames = frames;
+    _vdn_tpf    = tpf;
+    _vdn_vstart = L.video_start;
+    _vdn_seq    = L.seq_len;
+  }
+  if (_vdn_full_cover) { return true; }
+
+  // The block-sparse form of the same window, for whichever steel kernel
+  // the caller resolved: 32x16 for the ALU one, 64x32 for the matrix-core
+  // one. Both carry the has_spans specialisation, so the tiles are the
+  // caller's to choose -- but a list built for one grid read against the
+  // other is a different window and not a slower answer, which is why
+  // the tag below carries them.
+  if (bq <= 0 || bk <= 0) { return fail("no block tiling for the window"); }
+  if (_vdn_bspan_seq != L.seq_len || _vdn_bspan_bq != bq
+      || _vdn_bspan_bk != bk) {
+    minimax_h3::vdn::WindowMask bm;
+    bm.seq_len          = L.seq_len;
+    bm.video_start      = L.video_start;
+    bm.num_frames       = frames;
+    bm.tokens_per_frame = tpf;
+    bm.anchors          = _vdn_cfg.anchors;
+    bm.bounds           = _vdn_bounds;
+    const minimax_h3::vdn::BlockSpans bs =
+        minimax_h3::vdn::build_block_spans(bm, bq, bk);
+    auto ib = [&](const std::vector<int>& v) {
+      metal_compute::SharedBuffer b =
+          _mc->make_shared_buffer(v.size() * sizeof(int));
+      if (!b.empty()) {
+        std::memcpy(b.contents(), v.data(), v.size() * sizeof(int));
+      }
+      return b;
+    };
+    _vdn_qb_off    = ib(bs.off);
+    _vdn_qb_blocks = ib(bs.blocks);
+    _vdn_sp_params = _mc->make_shared_buffer(4 * sizeof(int));
+    _vdn_sp_bounds =
+        _mc->make_shared_buffer((std::size_t)frames * 2 * sizeof(int));
+    if (_vdn_qb_off.empty() || _vdn_qb_blocks.empty()
+        || _vdn_sp_params.empty() || _vdn_sp_bounds.empty()) {
+      return fail("cannot allocate the VDN block spans");
+    }
+    int* sp = static_cast<int*>(_vdn_sp_params.contents());
+    sp[0] = L.video_start;
+    sp[1] = tpf;
+    sp[2] = frames;
+    // Bit 0 is anchor COLUMNS, bit 1 anchor ROWS -- the kernel's
+    // spelling of AnchorFrames, which it cannot see.
+    sp[3] = (_vdn_cfg.anchors == minimax_h3::vdn::AnchorFrames::kColumns
+             || _vdn_cfg.anchors == minimax_h3::vdn::AnchorFrames::kBoth)
+                ? 1
+                : 0;
+    sp[3] |= (_vdn_cfg.anchors == minimax_h3::vdn::AnchorFrames::kRows
+              || _vdn_cfg.anchors == minimax_h3::vdn::AnchorFrames::kBoth)
+                 ? 2
+                 : 0;
+    int* bnd = static_cast<int*>(_vdn_sp_bounds.contents());
+    for (int f = 0; f < frames; ++f) {
+      bnd[2 * f]     = _vdn_bounds[(std::size_t)f].lo;
+      bnd[2 * f + 1] = _vdn_bounds[(std::size_t)f].hi;
+    }
+    _vdn_bspan_seq = L.seq_len;
+    _vdn_bspan_bq  = bq;
+    _vdn_bspan_bk  = bk;
+    _vdn_kb_sparse = bs.blocks.size();
+    _vdn_kb_dense = bs.off.size() > 1
+                        ? (bs.off.size() - 1)
+                              * (std::size_t)((L.seq_len + bk - 1) / bk)
+                        : 0;
+    // INFO and not debug: this is the line that says whether the hybrid
+    // is doing anything at all at this geometry. Full cover turns the
+    // linear half off and makes the run the stock model plus a gate --
+    // correct, and indistinguishable from the outside -- so without a
+    // report a short clip looks like a VDN generation and is not one.
+    // Once per geometry, not per forward.
+    if (_mc->session() != nullptr && _vdn_kb_dense > 0) {
+      _mc->session()->info(fmt(
+          "MetalMiniMaxH3Transformer: VDN window over {} frames of {} "
+          "tokens -- {}, {} of {} key blocks ({:.1f}% of dense)",
+          frames, tpf,
+          _vdn_full_cover ? "COVERS THE CLIP, so the linear half is off"
+                          : "windowed",
+          _vdn_kb_sparse, _vdn_kb_dense,
+          100.0 * (double)_vdn_kb_sparse / (double)_vdn_kb_dense));
+    }
+  }
+
+  const int I = _cfg.n_heads * _cfg.head_dim;
+  const std::size_t vrows = (std::size_t)L.num_video_rows;
+  if (_vdn_ro.byte_size() < vrows * (std::size_t)I * 2) {
+    _vdn_ro = _mc->make_shared_buffer(vrows * (std::size_t)I * 2);
+    if (_vdn_ro.empty()) { return fail("cannot allocate the VDN readout"); }
+    // ZEROED, and it stays that way where it matters. Under anchors
+    // `both` the branch never WRITES frames 0 and F-1 -- the softmax
+    // side covers them in both directions, so the partition makes their
+    // readout exactly zero -- and this buffer is reused across all 50
+    // blocks. Left unzeroed those two frames would project whatever the
+    // allocator handed over into the residual stream, once per block:
+    // not a crash and not a NaN, just two frames of noise.
+    std::memset(_vdn_ro.contents(), 0, _vdn_ro.byte_size());
+  }
+  if (_vdn_proj.byte_size() < vrows * (std::size_t)_cfg.hidden * 2) {
+    _vdn_proj = _mc->make_shared_buffer(vrows * (std::size_t)_cfg.hidden * 2);
+    if (_vdn_proj.empty()) {
+      return fail("cannot allocate the VDN projection");
+    }
+  }
+  return true;
+}
+
+
 MetalMiniMaxH3Transformer::Velocity
 MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
 {
@@ -4049,9 +4307,63 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       _attn_nax = false;
     }
   }
+  // VDN's hybrid attention, for this forward. Off unless a branch is
+  // attached AND the caller named the target video's grid: the window
+  // is over whole frames and the short conv is a (t, h, w) stencil, and
+  // neither can be recovered from a row count.
+  const bool vdn_on = (bool)_vdn && in.video_grid_h > 0
+                      && in.video_grid_w > 0 && L.num_video_rows > 0;
+  // TWO SWITCHES, not one. The per-head softmax gate is part of the
+  // hybrid's attention whatever the window does; the WINDOW and the
+  // linear branch are a matched pair that turn off together when the
+  // window reaches every frame. See _vdn_full_cover.
+  const bool spans_off = std::getenv("VPIPE_VDN_NO_STEEL_SPANS") != nullptr;
+  // THE WINDOW DECIDES THE TILES, so it is resolved before them -- the
+  // block list, the param block and the dispatch grid are all built for
+  // one BQ/BK and there is no arrangement in which they may disagree.
+  //
+  // Both steel kernels carry the has_spans specialisation now, so a
+  // windowed forward no longer costs the matrix cores: the ALU kernel
+  // masks 32x16 blocks and the NAX one 64x32, from the same closed-form
+  // predicate. What is NOT arranged for is mixing them -- if the NAX
+  // specialisation does not build, the whole forward drops to the ALU
+  // tiles rather than running the window at one block size and the text
+  // rows at another out of one param block.
+  //
+  // On a clip the window covers this builds a pipeline the forward will
+  // not use, because full cover is only known after ensure_vdn_ below
+  // and that needs the tiles this decides. It is one pipeline object per
+  // geometry, and the alternative is a forward whose tile size depends
+  // on a value computed from the tile size.
+  if (vdn_on && !spans_off && _attn_nax
+      && (_attn_spans_seq != seq || _attn_spans_nax != 1)) {
+    metal_compute::FunctionConstants fc;
+    fc.set_bool(200, (seq % 64) == 0).set_bool(201, (seq % 32) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, true);
+    _fn_attn_spans =
+        _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc);
+    if (_fn_attn_spans.valid()) {
+      _attn_spans_seq = seq;
+      _attn_spans_nax = 1;
+    } else {
+      _attn_nax = false;
+    }
+  }
   const int A_BQ = _attn_nax ? 64 : 32;
   const int A_BK = _attn_nax ? 32 : 16;
+  if (vdn_on && !ensure_vdn_(in, L, A_BQ, A_BK, err)) { return {}; }
+  const bool vdn_linear = vdn_on && !_vdn_full_cover;
+  const bool steel_spans = vdn_linear && _steel_ok && !spans_off;
+  _vdn_blocks_run = 0;
   bool use_steel = _steel_ok;
+  // Without the block-sparse kernel the window falls to sdpa_spans_f16,
+  // which reads HEAD-MAJOR q/k/v -- the unfused layout -- so that arm
+  // has to give up steel's fused spellings too. It is kept reachable
+  // (VPIPE_VDN_NO_STEEL_SPANS) because it is the verified reference the
+  // steel path is checked against, and the two must be A/B-able in one
+  // process.
+  if (vdn_linear && !steel_spans) { use_steel = false; }
   // Read ONCE per forward: the A/B setter can change it between two, and
   // the cached AttnParams below are tagged with the value they were
   // filled for.
@@ -4061,7 +4373,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // flips that between forwards. Kept apart so toggling the layout does
   // not rebuild two pipeline states -- an A/B that pays a rebuild in one
   // arm and not the other is measuring the rebuild.
-  const bool attn_dirty = _attn_seq != seq || _attn_text != n_text;
+  const bool attn_dirty = _attn_seq != seq || _attn_text != n_text
+                          || _attn_nax_built != (_attn_nax ? 1 : 0);
   if (use_steel && (attn_dirty || _attn_fused != fused_attn)) {
     // C++ mirror of mlx::steel::AttnParams, as in the sibling DiTs. Two
     // shapes only, and both are SQUARE: this model has no
@@ -4119,24 +4432,51 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     fill(_attn_p_main, seq);
     fill(_attn_p_text, n_text);
     _attn_fused = fused_attn;
-    auto build = [&](int qL) {
+    auto build = [&](int qL, bool spans) {
       metal_compute::FunctionConstants fc;
       fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (qL % A_BK) == 0)
-          .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+          .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+          .set_bool(303, spans);
       return _attn_nax
                  ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
                  : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
     };
     if (attn_dirty) {
-      _fn_attn_main = build(seq);
-      _fn_attn_text = build(n_text);
+      _fn_attn_main = build(seq, false);
+      _fn_attn_text = build(n_text, false);
       _attn_seq = seq;
       _attn_text = n_text;
+      _attn_nax_built = _attn_nax ? 1 : 0;
     }
+  }
+  // The SAME entry point as the dense pair, specialised on has_spans --
+  // so it is built here rather than in the block above, which only runs
+  // when that pair is dirty. Its tag is the sequence length AND the
+  // kernel, because the tiles differ between the two.
+  //
+  // The matrix-core spelling was resolved before the tiles were chosen
+  // (it is what chooses them); this is the ALU one, which is what an M4
+  // runs and what VPIPE_H3_NO_ATTN_NAX asks for.
+  if (steel_spans && !_attn_nax
+      && (_attn_spans_seq != seq || _attn_spans_nax != 0)) {
+    metal_compute::FunctionConstants fc;
+    fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (seq % A_BK) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(303, true);
+    _fn_attn_spans = _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+    _attn_spans_seq = seq;
+    _attn_spans_nax = 0;
   }
   if (use_steel) {
     use_steel = _fn_attn_main.valid() && _fn_attn_text.valid();
   }
+  // A block-sparse kernel that did not validate must not fall back to
+  // the DENSE one: dense attention over a windowed model is not a
+  // slower answer, it is a different one, and the linear branch beside
+  // it would then double count. Fall to sdpa_spans_f16 instead, which
+  // is the same mask by another route.
+  const bool spans_ok = steel_spans && _fn_attn_spans.valid();
+  if (vdn_linear && !spans_ok) { use_steel = false; }
   // The scalar fallback has no strides, so a build that fails to make
   // the steel functions falls all the way back -- head-major buffers,
   // transposes and all. That is why the arena still carries them.
@@ -4151,7 +4491,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // the GPU and inflates the total, so read the SHARE, not the sum.
   const bool prof = std::getenv("VPIPE_H3_DIT_PROFILE") != nullptr;
   double t_in = 0, t_adaln = 0, t_qkv = 0, t_prep = 0, t_attn = 0,
-         t_oproj = 0, t_ff = 0, t_elt = 0, t_final = 0;
+         t_oproj = 0, t_ff = 0, t_elt = 0, t_final = 0, t_vdn = 0, t_vdn_read = 0, t_sgate = 0;
+  // A failure INSIDE the block lambda, which returns void. Checked after
+  // every call: a branch that could not encode has left a partial run of
+  // dispatches, and running the stack on top of it would produce a
+  // plausible video with one block's attention missing.
+  std::string vdn_err;
 
   // ---- env-gated streaming split (VPIPE_H3_STREAM_PROFILE) ------------
   // How much of a streamed block's wall time is the DISK read and how
@@ -4390,6 +4735,53 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.dispatch({32, (unsigned)(rows * NH), 1}, {32, 1, 1});
     };
     auto attn = [&](int rows, bool main) {
+      // The hybrid's softmax half: exact attention, but (video, video)
+      // pairs restricted to the query frame's chunk window. Everything
+      // touching a global row -- the prompt, the soundtrack -- stays
+      // dense in both directions, which is what the spans' group 0 is.
+      // The refiner blocks are not video and keep full attention.
+      // The block-sparse steel kernel: the same MMA flash attention the
+      // dense path runs, walking only the key blocks this query block's
+      // window admits. `has_spans` is a function constant, so the dense
+      // instantiations are unchanged -- the specialisation is resolved
+      // before codegen.
+      if (spans_ok && main) {
+        enc.set_function(_fn_attn_spans);
+        if (fused_qkv) {
+          enc.set_buffer(0, s.qkv, (std::size_t)Q_OFF * 2);
+          enc.set_buffer(1, s.qkv, (std::size_t)K_OFF * 2);
+          enc.set_buffer(2, s.qkv, (std::size_t)V_OFF * 2);
+        } else {
+          enc.set_buffer(0, s.qh); enc.set_buffer(1, s.kh);
+          enc.set_buffer(2, s.vh);
+        }
+        enc.set_buffer(3, fused_out ? s.ob : s.oh);
+        enc.set_buffer(4, _attn_p_main);
+        enc.set_buffer(8, _vdn_qb_off);
+        enc.set_buffer(9, _vdn_qb_blocks);
+        enc.set_buffer(10, _vdn_sp_params);
+        enc.set_buffer(11, _vdn_sp_bounds);
+        enc.dispatch({32 * (unsigned)((rows + A_BQ - 1) / A_BQ),
+                      4 * (unsigned)NH, 1}, {32, 4, 1});
+        return;
+      }
+      if (vdn_linear && main) {
+        enc.set_function(_fn_sdpa_spans);
+        enc.set_buffer(0, s.qh); enc.set_buffer(1, s.kh);
+        enc.set_buffer(2, s.vh); enc.set_buffer(3, s.oh);
+        enc.set_constant(4, scale); enc.set_constant(5, rows);
+        enc.set_constant(6, HD); enc.set_constant(7, NH);
+        enc.set_constant(8, NH); enc.set_constant(9, rows);
+        enc.set_constant(10, rows);
+        enc.set_buffer(11, _vdn_span_off);
+        enc.set_buffer(12, _vdn_span_lo);
+        enc.set_buffer(13, _vdn_span_hi);
+        enc.set_constant(14, L.video_start);
+        enc.set_constant(15, _vdn_tpf);
+        enc.set_constant(16, _vdn_frames);
+        enc.dispatch({32, (unsigned)NH, (unsigned)rows}, {32, 1, 1});
+        return;
+      }
       if (use_steel) {
         enc.set_function(main ? _fn_attn_main : _fn_attn_text);
         if (fused_qkv) {
@@ -4446,6 +4838,74 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       bdump("qkv", s.qkv, 3 * I);
       trip(trip_blk, 2, s.qkv, (std::size_t)rows * 3 * I);
       psplit(t_qkv);
+      // THE GATE'S WEIGHTS LIVE IN THE BRANCH'S BLOCK, so the block is
+      // brought in whenever the hybrid is on at all -- not only when the
+      // linear half runs. Under full cover this loads a block to use two
+      // small tensors from it, which is the cheap side of a decision
+      // whose expensive side would be a second accessor for the gate
+      // alone; full cover only happens on clips of at most
+      // (radius + 1) * chunk frames, which is not the geometry anyone
+      // pays this for.
+      if (modulated && vdn_on) {
+        std::string verr;
+        if (!_vdn->ensure_block(lora_layer, &verr)) {
+          vdn_err = "VDN block " + std::to_string(lora_layer) + ": " + verr;
+          return;
+        }
+        // Its own bucket: on the streamed path this is 89 MB of DISK per
+        // block, which is not the branch's arithmetic and must not be
+        // reported as it. Nothing is encoded here, so under the profile
+        // the split measures the read alone.
+        psplit(t_vdn_read);
+      }
+      // ---- VDN: the linear branch, on the RAW projection -------------
+      //
+      // HERE AND NOT LATER, because qk_norm and rope below rewrite
+      // s.qkv IN PLACE and the branch shares this model's q/k/v. The
+      // alternative -- snapshotting the three -- is 8.67 GB a block at
+      // production geometry; running the whole branch first costs
+      // nothing, since its readout is not wanted until after the out
+      // projection anyway.
+      //
+      // Nothing is copied out: the strides below hand the branch H3's
+      // own fused, per-head-grouped bf16 buffer where it lies, and the
+      // video rows are addressed as the run they are inside the packed
+      // sequence. See MetalVdnBranch::Inputs.
+      if (modulated && vdn_linear) {
+        minimax_h3::MetalVdnBranch::Inputs vi;
+        vi.x = &s.nm;
+        vi.q_raw = vi.k_raw = vi.v_raw = &s.qkv;
+        vi.text_x = &s.nm;
+        vi.text_k = vi.text_v = &s.qkv;
+        vi.qkv_row_stride  = 3 * I;
+        vi.qkv_head_stride = QKV_HSTRIDE;
+        vi.qkv_bf16 = true;
+        vi.x_bf16   = true;
+        vi.out_bf16 = true;
+        const std::size_t v0 = (std::size_t)L.video_start * 3 * I;
+        vi.q_off = (v0 + (std::size_t)Q_OFF) * 2;
+        vi.k_off = (v0 + (std::size_t)K_OFF) * 2;
+        vi.v_off = (v0 + (std::size_t)V_OFF) * 2;
+        // The prompt is rows [0, n_text), so its own offsets are the
+        // field offsets alone.
+        vi.text_x_off = 0;
+        vi.text_k_off = (std::size_t)K_OFF * 2;
+        vi.text_v_off = (std::size_t)V_OFF * 2;
+        vi.x_off = (std::size_t)L.video_start * H * 2;
+        minimax_h3::MetalVdnBranch::Geometry vg;
+        vg.frames   = _vdn_frames;
+        vg.grid_h   = in.video_grid_h;
+        vg.grid_w   = in.video_grid_w;
+        vg.text_len = n_text;
+        std::string verr;
+        if (!_vdn->encode(enc, lora_layer, vg, _vdn_bounds, vi, _vdn_ro,
+                          &verr)) {
+          vdn_err = "VDN block " + std::to_string(lora_layer) + ": " + verr;
+          return;
+        }
+        ++_vdn_blocks_run;
+        psplit(t_vdn);
+      }
       // Per-HEAD RMS over head_dim, in place on the fused buffer, BEFORE
       // rope -- the reference's order. See QKV_HSTRIDE / Q_OFF above for
       // the two groupings the fused projection ships in.
@@ -4473,13 +4933,69 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.dispatch({(unsigned)HD, (unsigned)rows, (unsigned)NH},
                      {(unsigned)HD, 1, 1});
       }
+      // The softmax half's per-head gate. It scales a distribution that
+      // renormalised to 1 over however little of the sequence it saw,
+      // back toward the share it actually captured -- so it belongs
+      // BEFORE the out projection, and it reads the same x the branch
+      // did, which s.nm still holds until the GEMM below overwrites it.
+      if (modulated && vdn_on) {
+        std::string verr;
+        if (!_vdn->encode_softmax_gate(enc, lora_layer, rows, s.nm, 0, true,
+                                       H, s.ob, 0, &verr)) {
+          vdn_err = "VDN gate " + std::to_string(lora_layer) + ": " + verr;
+          return;
+        }
+        // Its OWN bucket. Without this the gate is charged to the out
+        // projection below -- the next psplit -- which is why VDN's
+        // o-proj read higher than the baseline's and looked like the
+        // second adapter alone.
+        psplit(t_sgate);
+      }
       bdump("attn_out", s.ob, I);
       trip(trip_blk, 3, s.ob, (std::size_t)rows * I);
       gemm_(enc, s.ob, 0, b.out, s.nm, 0, rows, H, I,
             &lo_out);
+      // DRAIN THE OUT PROJECTION HERE, before the branch's own
+      // projection is encoded. Under VPIPE_H3_DIT_PROFILE a psplit
+      // charges everything since the last one, so the VDN block below
+      // was absorbing this GEMM and reporting it as branch cost --
+      // which showed as an o-proj at 9.7 PFLOP/s, a number no kernel
+      // can reach and the only reason the mistake was visible.
+      // Inert without the profile.
+      psplit(t_oproj);
+      // ---- VDN: the linear readout into the residual stream ----------
+      //
+      // out = orig.to_out(gate * window_softmax) + to_out_linear(readout)
+      // on VIDEO rows, which is the line the whole component exists to
+      // add. The projection is the BRANCH's weight run by THIS model's
+      // GEMM -- that is where the quantisation, the LoRA stack and the
+      // steel routing live -- and the add is masked to the video run
+      // because the window covers the global rows exactly, so anything
+      // the branch put there would be counted twice.
+      if (modulated && vdn_linear) {
+        const metal_compute::SharedBuffer* wl =
+            _vdn->out_linear(lora_layer);
+        if (wl == nullptr || wl->empty()) {
+          vdn_err = "VDN block " + std::to_string(lora_layer)
+                    + ": no output projection";
+          return;
+        }
+        Linear vl;
+        vl.w = wl->subview(0, wl->byte_size());
+        gemm_(enc, _vdn_ro, 0, vl, _vdn_proj, 0, L.num_video_rows, H, I,
+              nullptr);
+        const std::size_t vo = (std::size_t)L.video_start * H * 2;
+        enc.set_function(_fn_residual);
+        enc.set_buffer(0, s.nm, vo);
+        enc.set_buffer(1, _vdn_proj);
+        enc.set_buffer(2, s.nm, vo);
+        enc.set_constant(3, L.num_video_rows * H);
+        enc.dispatch({(unsigned)(L.num_video_rows * H), 1, 1}, {256, 1, 1});
+        psplit(t_vdn);
+      }
       bdump("o_proj", s.nm, H);
       trip(trip_blk, 4, s.nm, (std::size_t)rows * H);
-      psplit(t_oproj);
+      psplit(t_oproj);   // the dumps and tripwires only, by now
       if (modulated) { gated(x, s.nm, rows, 2 * H); }
       else           { residual(x, s.nm, rows); }
       bdump("x_after_attn", x, H);
@@ -4917,6 +5433,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       bprobe = xprobe && Lx == 0;
       trip_blk = Lx;
       block(b, s.x, seq, true, Lx);
+      if (!vdn_err.empty()) { return fail(vdn_err); }
       bprobe = false;
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
@@ -5022,6 +5539,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+        // The VDN branch follows the DiT, and HERE is the only place it
+        // can: the commit above has been waited for, so nothing encoded
+        // still points at this block's branch buffers. On the resident
+        // path there is no such point -- the whole forward is one
+        // deferred stream -- which is why this sits inside `streaming`
+        // and not at the end of the block lambda.
+        if (vdn_on && _vdn->stream_blocks()) {
+          _vdn->release_block(Lx);
+        }
         // The commit above has been WAITED for, so nothing encoded still
         // points at this block's buffers -- which is exactly why the
         // promotion happens here and not at the top of the iteration.
@@ -5294,13 +5820,31 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         "({:6.0f} GF/s)\n"
         "  ff    {:8.1f} ms ({:6.0f} GF/s)   attn   {:8.1f} ms "
         "({:6.0f} GF/s, {})\n"
-        "  prep  {:8.1f} ms   elt {:8.1f} ms   final {:8.1f} ms",
+        "  prep  {:8.1f} ms   elt {:8.1f} ms   final {:8.1f} ms\n"
+        "  vdn   {:8.1f} ms ({}), weights {:8.1f} ms, "
+        "softmax gate {:8.1f} ms",
         seq, n_text, n_cond, n_audio, L.num_video_rows, c.n_layers, n_t, tot,
         t_in, t_adaln, rate(f_ada, t_adaln),
         t_qkv, rate(f_qkv, t_qkv), t_oproj, rate(f_op, t_oproj),
         t_ff, rate(f_ff, t_ff), t_attn, rate(f_attn, t_attn),
-        use_steel ? "steel flash" : "SCALAR sdpa",
-        t_prep, t_elt, t_final));
+        // WHICH attention actually ran, because the three are different
+        // functions and not three speeds of one. A profile that says
+        // "steel flash" for a windowed run reads as the dense kernel.
+        !vdn_linear
+            ? (use_steel ? "steel flash" : "SCALAR sdpa")
+            : (spans_ok ? "steel flash, WINDOWED (block-sparse)"
+                        : "SCALAR sdpa_spans, windowed"),
+        t_prep, t_elt, t_final,
+        // The linear branch: its features, statistics, solve, scan,
+        // gather and readout, plus the to_out_linear projection. Zero
+        // when no branch is attached, and zero under full cover, where
+        // the window reaches every frame and the linear half is
+        // correctly off.
+        t_vdn,
+        !_vdn ? "no branch attached"
+              : (_vdn_full_cover ? "full cover -- linear half OFF"
+                                 : "linear branch on video rows"),
+        t_vdn_read, t_sgate));
   }
   return out;
 }

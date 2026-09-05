@@ -131,6 +131,21 @@ struct BlockLoader {
   METAL_FUNC void next() {
     src += tile_stride;
   }
+
+  /* Skip forward by `n` tiles.
+   *
+   * vpipe: a BLOCK-SPARSE attention visits a subsequence of the key
+   * blocks, so it needs to advance by more than one. n == 1 is next().
+   *
+   * int64 ON PURPOSE: next() steps once and accumulates through the
+   * pointer, but a jump is the GAP between visited blocks -- the block
+   * index itself on the first one. tile_stride is BROWS * src_ld, which
+   * at video geometry is 16 * 21504, so a 32-bit product wraps at 6241
+   * blocks (99856 rows) and does it silently.
+   */
+  METAL_FUNC void jump(int n) {
+    src += (int64_t)n * tile_stride;
+  }
 };
 
 template <int R, int C>
@@ -257,6 +272,21 @@ struct BlockLoaderT {
   /* Iteration helper */
   METAL_FUNC void next() {
     src += tile_stride;
+  }
+
+  /* Skip forward by `n` tiles.
+   *
+   * vpipe: a BLOCK-SPARSE attention visits a subsequence of the key
+   * blocks, so it needs to advance by more than one. n == 1 is next().
+   *
+   * int64 ON PURPOSE: next() steps once and accumulates through the
+   * pointer, but a jump is the GAP between visited blocks -- the block
+   * index itself on the first one. tile_stride is BROWS * src_ld, which
+   * at video geometry is 16 * 21504, so a 32-bit product wraps at 6241
+   * blocks (99856 rows) and does it silently.
+   */
+  METAL_FUNC void jump(int n) {
+    src += (int64_t)n * tile_stride;
   }
 };
 

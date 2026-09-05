@@ -196,6 +196,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     st.timesteps          = &uniq;
     st.row_timestep_index = &row_idx;
     st.schedule_index     = baked ? i : -1;
+    st.video_grid_h       = req.video_grid_h;
+    st.video_grid_w       = req.video_grid_w;
     std::string ferr;
     const auto t_fwd0 = std::chrono::steady_clock::now();
     MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);

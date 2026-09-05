@@ -40,5 +40,22 @@ struct AttnMaskParams {
   int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
 };
 
+/* vpipe: the geometry a BLOCK-SPARSE run masks its span edges against.
+ *
+ * The block list the host supplies is rounded OUTWARD to whole key
+ * blocks, so a block at a span's edge carries keys the mask forbids and
+ * the kernel has to test them. The test is closed-form -- a row and a
+ * column each map to a video frame, and the frame's window says yes or
+ * no -- so nothing is materialised: this is four ints and one [lo, hi]
+ * per frame against a [qL, kL] mask that would be 11 billion elements
+ * at video geometry.
+ */
+struct AttnSpanParams {
+  int video_start; ///< First video row of the packed sequence
+  int tokens_per_frame;
+  int num_frames;
+  int anchors; ///< bit 0: anchor COLUMNS, bit 1: anchor ROWS
+};
+
 } // namespace steel
 } // namespace mlx

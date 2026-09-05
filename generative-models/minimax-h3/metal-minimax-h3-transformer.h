@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/i8-gemm.h"
@@ -423,6 +424,13 @@ class MetalMiniMaxH3Transformer {
     // "not baked" (then `timesteps` drives the AdaLN projection as
     // before). See bake_adaln.
     int schedule_index = -1;
+    // The GENERATED video's latent grid. Only the hybrid VDN path reads
+    // it -- its window is over whole frames and its short conv is a
+    // (t, h, w) stencil, neither of which can be recovered from a row
+    // count. Left at zero the hybrid is off for this forward, which is
+    // what every non-VDN caller wants and gets by saying nothing.
+    int video_grid_h = 0;
+    int video_grid_w = 0;
   };
 
   struct Velocity {
@@ -434,6 +442,62 @@ class MetalMiniMaxH3Transformer {
 
   // One denoiser evaluation. Empty on failure, with a reason in `err`.
   Velocity forward(const Step& in, std::string* err = nullptr);
+
+  // Attach VDN-H3's linear branch, turning every main block's attention
+  // into the hybrid: a chunk-windowed softmax over the frames near the
+  // query, plus a bidirectional delta rule carrying everything the
+  // window cannot see. The two PARTITION the keys, so this is not an
+  // approximation bolted onto full attention -- running one half alone
+  // is wrong in a way that looks like a plausible video.
+  //
+  // `dir` is the VDN release root (the one holding `config.json` and
+  // `linear_branch/`). The branch SHARES this model's q/k/v projections
+  // -- that is why one LoRA on attn.orig.to_{q,k,v} feeds both halves --
+  // so it brings no projections of its own, and attaching it does not
+  // change what this checkpoint means.
+  //
+  // Off until this is called, and a forward that leaves Step's grid at
+  // zero still runs the stock stack.
+  bool attach_linear_branch(const std::string& dir, std::string* err);
+  bool has_linear_branch() const { return (bool)_vdn; }
+
+  // Non-zero if any of the branch's per-frame I + A was not positive
+  // definite on the last forward. READ IT: the solve returns a NaN
+  // there, and a NaN in the residual stream makes the frame it came
+  // from unrecoverable from the output rather than merely wrong.
+  unsigned linear_solve_failures() const
+  {
+    return _vdn ? _vdn->solve_failures() : 0u;
+  }
+
+  // How many blocks ran the LINEAR half on the last forward, and whether
+  // the window reached every frame.
+  //
+  // Reported because the two are the same fact seen twice and getting
+  // them out of step is silent: a window that covers the clip makes the
+  // hybrid the stock model plus the gate, and a linear branch left
+  // running under it contributes the text state to every video row --
+  // no crash, no NaN, just a term the reference does not have.
+  unsigned linear_blocks_run() const { return _vdn_blocks_run; }
+
+  // How much of the dense key-block grid the window actually visits:
+  // the block-sparse kernel's whole reason for existing, and the number
+  // that says whether it is worth taking at a given geometry. Both zero
+  // until a windowed forward has built the list.
+  std::size_t window_key_blocks() const { return _vdn_kb_sparse; }
+  std::size_t dense_key_blocks() const { return _vdn_kb_dense; }
+  bool linear_window_covers_all() const { return _vdn_full_cover; }
+
+  // What the attached branch's blocks hold, plus the two per-forward
+  // buffers the hybrid adds. Reported apart from resident_block_bytes()
+  // because it is a SECOND checkpoint -- 4.28 GB over 50 blocks -- and a
+  // stage sizing this model has to count it.
+  std::size_t linear_branch_bytes() const
+  {
+    if (!_vdn) { return 0; }
+    return _vdn->resident_bytes() + _vdn_ro.byte_size()
+           + _vdn_proj.byte_size();
+  }
 
   // Precompute every step's modulation and drop the projections that
   // produce it. `schedule` is one entry per step: that step's distinct
@@ -961,6 +1025,74 @@ class MetalMiniMaxH3Transformer {
   };
   bool ensure_scratch_(int seq, int n_text, int n_t);
   Scratch _s;
+
+  // ---- VDN-H3's hybrid attention -------------------------------------
+  //
+  // Null unless attach_linear_branch() succeeded. The branch owns its
+  // own weight set: the linear half is a separate checkpoint from the
+  // DiT and the manager has to see it as one.
+  std::unique_ptr<minimax_h3::MetalVdnBranch> _vdn;
+  minimax_h3::vdn::Config                     _vdn_cfg;
+  // The readout, bf16 [video_rows, inner], and its projection into the
+  // residual stream, bf16 [video_rows, hidden]. Both are per forward
+  // and reused across the 50 blocks.
+  metal_compute::SharedBuffer _vdn_ro, _vdn_proj;
+  // The window as CSR spans for sdpa_spans: group 0 is the global rows
+  // (prompt and soundtrack, dense in both directions) and group 1+f is
+  // video frame f. Rebuilt only when the geometry changes.
+  metal_compute::SharedBuffer _vdn_span_off, _vdn_span_lo, _vdn_span_hi;
+  // The same window for the BLOCK-SPARSE steel kernel: per query block,
+  // the key blocks it visits, plus the four numbers and the per-frame
+  // bounds the kernel masks a block's edges against. A second shape of
+  // one fact -- see vdn::build_block_spans for why it is not merely a
+  // coarser WindowSpans.
+  metal_compute::SharedBuffer _vdn_qb_off, _vdn_qb_blocks;
+  metal_compute::SharedBuffer _vdn_sp_params, _vdn_sp_bounds;
+  int _vdn_bspan_seq = -1, _vdn_bspan_bq = 0, _vdn_bspan_bk = 0;
+  std::size_t _vdn_kb_sparse = 0, _vdn_kb_dense = 0;
+  // Held because sdpa_spans_f16 is resolved out of it LATER, when a
+  // branch is attached, and a ComputeFunction does not keep its library
+  // alive.
+  metal_compute::ComputeLibrary   _lib_sdpa;
+  metal_compute::ComputeFunction  _fn_sdpa_spans;
+  // The block-sparse steel kernel, which is the SAME entry point as the
+  // dense one specialised on has_spans -- so it is cached beside it and
+  // rebuilt on the same terms.
+  metal_compute::ComputeFunction  _fn_attn_spans;
+  int _attn_spans_seq = -1;
+  // And which KERNEL it is, because both have the specialisation now:
+  // the block list, the param block and the dispatch grid are all built
+  // for one tile size, and a cached 64x32 pipeline addressed as 32x16 is
+  // a different window rather than a slower one.
+  int _attn_spans_nax = -1;
+  // Which tiling the cached dense pair was built for. The cached
+  // functions are tagged with the sequence length alone -- so without
+  // this a later forward would reuse a 64x32 pipeline while addressing
+  // it as 32x16.
+  int _attn_nax_built = -1;
+  int _vdn_frames = 0, _vdn_tpf = 0, _vdn_vstart = 0, _vdn_seq = 0;
+  // A window wide enough to reach every frame IS the original attention,
+  // and then the linear half must NOT run: it carries the window's
+  // COMPLEMENT, and the complement of everything is nothing. Left on it
+  // adds the text state to every video row -- no crash, no NaN, a
+  // contribution the reference does not make. The reference calls this
+  // `full_cover` and takes the stock attention kernel for it too, so the
+  // full-cover path is exactly the unhybridised model plus the gate.
+  bool _vdn_full_cover = false;
+  unsigned _vdn_blocks_run = 0;
+  // The window per query frame, UNREBASED -- the anchor skip belongs to
+  // the branch, which applies it, because whether frames 0 and F-1 leave
+  // the linear input is a property of the configuration and not of the
+  // caller. The same bounds build the softmax side's spans, which is
+  // what makes the two halves a partition rather than two guesses.
+  std::vector<minimax_h3::vdn::Bound> _vdn_bounds;
+  // Sized for the geometry the span buffers describe.
+  // `bq`/`bk` are the tiles of the kernel that will READ the block list,
+  // which is why they are a parameter and not a constant: the ALU steel
+  // kernel is 32x16 and the matrix-core one 64x32, and a list built for
+  // one is a different window under the other.
+  bool ensure_vdn_(const Step& in, const minimax_h3::PackedLayout& L,
+                   int bq, int bk, std::string* err);
 
   // Every buffer of the scratch, so the wired pool can take them all
   // without a second list that drifts from the struct above.

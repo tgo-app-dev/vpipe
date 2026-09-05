@@ -1,0 +1,18 @@
+{
+  "id": "prepare-minimax-h3-vdn",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "OpenVDN/vdn-minimax-h3",
+        "model_variant": "OpenVDN/vdn-minimax-h3-stage-dmd",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

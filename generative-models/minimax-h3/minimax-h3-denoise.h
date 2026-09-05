@@ -49,6 +49,16 @@ struct DenoiseRequest {
   // [num_audio_rows, audio_channels].
   float* audio = nullptr;
 
+  // The GENERATED video's latent grid, patches not pixels. Only VDN's
+  // hybrid attention reads it -- its window is over whole frames and its
+  // short conv is a (t, h, w) stencil, neither of which can be recovered
+  // from a row count -- and left at zero the hybrid stays off. So a
+  // driver that forgets it does not get a wrong answer, it gets the
+  // unhybridised model; which is the failure worth having, and the
+  // reason the transformer's own switch is the same field.
+  int    video_grid_h = 0;
+  int    video_grid_w = 0;
+
   int    num_steps   = 32;
   double video_shift = 12.0;
   double audio_shift = 3.0;

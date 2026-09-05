@@ -97,6 +97,11 @@ you want to see the model work before spending the hours and the 115 GB.
   — the **Ref2VA** partition instead: reference images, clips and soundtracks
   in, `.mp4` out, each one prepared to a size you choose (see
   [Conditioning on references](#conditioning-on-references-ref2va)).
+- **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
+  / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
+  — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
+  **FL2VA only**, and worth more the longer the clip **and the larger the
+  frame** (see [Faster attention](#faster-attention--the-vdn-linear-branch)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
 from `docs/pipelines/` in your clone. Either can be run from the terminal with
@@ -296,7 +301,10 @@ smallest machine that runs this at all — a **fanless MacBook Air 15-inch
 
 `steps` is the setting that moves this most, and the Turbo adapter is what
 buys the low count: without it, plan on 8 steps for a draft and 16 for a
-final clip, at roughly proportional cost.
+final clip, at roughly proportional cost. What moves the cost of each *step*
+is [the VDN linear branch](#faster-attention--the-vdn-linear-branch), which
+takes the 124-frame Pro run to **4 min 38 s** and saves more the longer the
+clip.
 
 **The two columns are not equally solid, and it is worth saying which is
 which.** The M5 Pro column is repeatable: fans, one pinned clock, the same
@@ -1186,6 +1194,132 @@ delta onto another head's `k`, in all 50 blocks, with nothing to report. This
 is exactly the case the split files do not have: their q, k and v arrive
 separately and are fused here, into whichever grouping the loaded DiT has.
 
+### Faster attention — the VDN linear branch
+
+The Turbo LoRA above cuts how many steps a clip costs. This cuts what a step
+costs, and it does it by changing what attention *is* — from **dense**
+attention, whose cost grows with the *square* of the sequence, to a **linear**
+one whose cost grows in step with it. The sequence is every video row in the
+clip, and that count rises with **both** the duration and the resolution — so
+**a longer clip and a bigger frame each make this worth more**, and on a short
+small one it is barely worth turning on.
+
+[**VideoDeltaNet on MiniMax H3**](https://openvdn.github.io/#vdn-h3) (VDN-H3)
+is not a new model. It is a second checkpoint that sits beside the one you
+already have and replaces every main block's dense attention with a **hybrid**
+of two halves:
+
+- a **windowed softmax** over the frames near the query — a fixed span of
+  whole chunks, not the whole clip;
+- a **bidirectional delta rule** carrying everything that window cannot see,
+  as a linear-attention recurrence over frames.
+
+The two **partition** the keys. Every frame is read by exactly one half, which
+is why this is a different attention rather than an approximation layered on
+the old one — and why the branch's weights are trained for it. A frame counted
+by both would be counted twice; by neither, silently dropped.
+
+**Why the saving grows with the clip.** Dense attention compares every row
+with every other row, so **doubling the clip quadruples its cost** — and the
+rows here are the whole clip's video, not one frame's. Neither half of the
+hybrid does that. The window is a fixed span of frames however long the clip
+runs, so doubling the clip only doubles how many windows there are; the delta
+rule beside it is a recurrence over frames, which is linear for the same
+reason. Quadratic against linear is a gap that only opens with length, so the
+saving is a few percent on a short clip and the bulk of it is still ahead of
+you at 10 or 20 seconds.
+
+Measured on one block, both halves on the matrix cores, at two sequence
+lengths. Read the **growth** column: that is the quadratic and the linear
+doing what they do.
+
+| | 18,887 rows | 81,617 rows | growth |
+|---|---|---|---|
+| dense attention | 431 ms | 9662 ms | **22.4×** |
+| the hybrid's windowed half | 222 ms | 1105 ms | **5.0×** |
+| what the hybrid saves | 1.9× | **8.7×** | |
+
+**4.3× the rows costs dense attention 22× and the window 5×.** So the gap is
+not a constant to look up — it widens with every row you add.
+
+**Resolution buys this as surely as duration does.** A frame is
+`(width / 32) × (height / 32)` rows — 510 at 960 × 544, **1008** at
+1344 × 768 — so doubling the canvas doubles the sequence exactly as doubling
+the length does, and a quadratic does not care which one did it. Going from
+544p to 768p at the same duration is therefore about **4× the dense attention
+and 2× the hybrid's**, the same trade the table shows for a longer clip. And
+the two compound, because they multiply the same number: a long clip at a
+large size is where dense attention is worst and this is worth most. Read the
+right-hand column above as about 22 s at 544p **or roughly half that at
+768p** — the same rows either way.
+
+**FL2VA only.** Both released stages are trained against the FL2VA partition
+and there is no Ref2VA branch to attach, so this and
+[Conditioning on references](#conditioning-on-references-ref2va) are a choice
+between, not a pair. Nothing checks this for you — the partition is chosen on
+`model-select` and the branch on `minimax-h3-model-config`, two different
+stages — so pointing a Ref2VA graph at a branch gets you weights trained for
+the other partition's blocks.
+
+#### Get it and run it
+
+Two catalogue entries, one repo. **`stage-dmd`** is the 8-step distillation
+and the one to take; `stage-b` is the 50-step model it was distilled from.
+Each is about **5 GB** on top of the DiT.
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-vdn.vpipeline
+```
+
+Then [**`minimax-h3-vdn.vpipeline`**](pipelines/minimax-h3-vdn.vpipeline),
+which is the text-to-video graph with two lines added to
+`minimax-h3-model-config`:
+
+```json
+"linear_branch": "OpenVDN/vdn-minimax-h3-stage-dmd",
+"lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema"
+```
+
+It composes with the Turbo LoRA — the branch shares the DiT's own q/k/v
+projections, so one adapter on those feeds both halves of the hybrid — and
+with [`i8_gemm`](#the-settings-worth-knowing), which reaches it twice over:
+the branch's output projection is run by the DiT's own GEMM, and the q/k/v it
+reads are quantised by then. Nothing inside the branch is affected.
+
+**Load-time, like `lora` and for the same reason:** it changes what the blocks
+*are*, not how strongly something is applied. Naming a different branch under
+a DiT that is already built is refused rather than half-taken. And a branch
+that is named but cannot be attached **fails the stage** instead of warning,
+because a graph that silently ran without it would produce a perfectly
+plausible video from weights trained for a different attention — there is no
+output anyone could look at and tell.
+
+#### What it saves
+
+The same 124-frame clip as [How long it takes](#how-long-it-takes), on the
+**M5 Pro, 24 GB**, 6 steps with the Turbo LoRA:
+
+| | 124 frames, 5.2 s |
+|---|---|
+| dense attention | **5 min 0 s** |
+| VDN hybrid | **4 min 38 s** |
+
+**8% of the wall clock at this length, and that is the small end of it.** A
+5-second clip is under 40 latent frames, where the window still covers a large
+fraction of the sequence; the hybrid's advantage is in the part of the clip
+the window *doesn't* reach, which is why the figure above is a floor. Nor is
+attention the whole step — the feed-forward and the projections cost what they
+cost either way — so even the 1.9× on that one stage arrives at the wall clock
+diluted twice over. At four times the clip the same measurement is 8.7×, and
+that is where this setting is worth reaching for.
+
+> **This is a quality trade as well as a speed one, and it has not been
+> measured here.** The hybrid is a different attention, and while the branch's
+> weights are trained for it, nothing in this repository compares a VDN clip
+> against a dense one for fidelity. Upstream reports quality comparable to the
+> dense baseline; treat that as their claim, not a reproduction. Generate both
+> at a seed you like before committing a long job to it.
+
 ## Memory
 
 **16 GB is the floor, and it works** — but only because the two big models are
@@ -1250,3 +1384,44 @@ encoder warns about it and resamples, and the fix is to set the producing
   separate VAE to **32 kHz stereo**.
 - On **M5**, the GEMMs and attention run on the GPU's matrix cores
   (`matmul2d` / NAX flash attention).
+
+## References and licences
+
+**MiniMax-H3** is published by MiniMax AI under the **MiniMax H3 Community
+Licence Agreement**, which is the licence the checkpoint carries and the one
+you accept on its Hugging Face page before downloading:
+
+- Weights (FL2VA + Ref2VA): <https://huggingface.co/MiniMaxAI/MiniMax-H3>
+- Repack used as a second opinion on the qkv grouping:
+  <https://huggingface.co/Comfy-Org/MiniMax-H3>
+
+**VideoDeltaNet on MiniMax H3 (VDN-H3)** — the hybrid attention of
+[Faster attention](#faster-attention--the-vdn-linear-branch) — is by Haocheng
+Xi, Yiming Xie, Hexu Zhao, Yiwen Zhang, Michael Liu, Thomas Creavin, Kurt
+Keutzer, Xiuyu Li, Zhaoyang Lv, Chenfeng Xu and Haiwen Feng, of UC Berkeley,
+Impossible Inc. and UT Austin. Its Hugging Face repository declares the same
+**MiniMax H3 Community Licence Agreement** as the base model it attaches to,
+with the licence text in the repo's own `LICENSE`.
+
+- Project page: <https://openvdn.github.io/#vdn-h3>
+- Code: <https://github.com/OpenVDN/vdn-minimax-h3>
+- Weights: <https://huggingface.co/OpenVDN/vdn-minimax-h3>
+
+```bibtex
+@misc{xi2026videodeltanet,
+  title  = {VideoDeltaNet on MiniMax H3},
+  author = {Haocheng Xi and Yiming Xie and Hexu Zhao and Yiwen Zhang and
+            Michael Liu and Thomas Creavin and Kurt Keutzer and Xiuyu Li and
+            Zhaoyang Lv and Chenfeng Xu and Haiwen Feng},
+  year   = {2026},
+  url    = {https://openvdn.github.io/}
+}
+```
+
+**Turbo LoRAs** are community distillations, each under its own repository's
+terms: [larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+and [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo).
+
+None of these are redistributed here — every pipeline in this document
+downloads from the publisher, and the licence you accept is theirs. Check each
+before using its output commercially.

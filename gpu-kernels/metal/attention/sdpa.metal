@@ -4870,3 +4870,109 @@ kernel void sdpa_paged_mma_f16(
   }
 }
 #endif  // !VPIPE_BF16
+
+// Span-masked (non-causal) attention: the generalisation of
+// sdpa_varwindow_f16 from ONE window per query to a UNION of spans, for
+// a mask whose allowed set is a handful of contiguous runs rather than a
+// single interval.
+//
+// VDN-H3's hybrid attention is that shape. A video query sees its
+// chunk-aligned window of whole frames, PLUS every global row (the
+// prompt and the soundtrack, which stay dense in both directions), PLUS
+// the two anchor frames when the configuration makes them dense columns
+// -- at most five runs, and identical for every query in the same frame
+// because the window is a property of the CHUNK. So the spans are stored
+// per GROUP (0 = the global rows, 1 + f = video frame f) rather than per
+// row: 103 groups at production geometry instead of 105k rows, and no
+// [seq, seq] mask anywhere.
+//
+// THE SPANS MUST BE DISJOINT. The online softmax below makes ONE pass
+// over the union, so a key reachable through two spans is accumulated
+// twice and gets double its share of the mass -- and the result is still
+// a normalised distribution, so nothing downstream can tell. See
+// vdn::build_window_spans, which coalesces.
+//
+//   ... same buffers as sdpa_full_f16 ...
+//   11:span_off[groups+1] 12:span_start[] 13:span_end[]
+//   14:video_start 15:tokens_per_frame 16:num_frames
+kernel void sdpa_spans_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* k          [[buffer(1)]],
+    const device VPIPE_ELT* v          [[buffer(2)]],
+    device VPIPE_ELT*       out        [[buffer(3)]],
+    constant float&    scale           [[buffer(4)]],
+    constant int&      T_kv            [[buffer(5)]],
+    constant int&      D               [[buffer(6)]],
+    constant int&      Hq              [[buffer(7)]],
+    constant int&      Hkv             [[buffer(8)]],
+    constant int&      n_q             [[buffer(9)]],
+    constant int&      kv_stride       [[buffer(10)]],
+    const device int*  span_off        [[buffer(11)]],
+    const device int*  span_start      [[buffer(12)]],
+    const device int*  span_end        [[buffer(13)]],
+    constant int&      video_start     [[buffer(14)]],
+    constant int&      tokens_per_frame [[buffer(15)]],
+    constant int&      num_frames      [[buffer(16)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  (void)T_kv;
+  const int h = (int)tid.y;
+  const int qi = (int)tid.z;
+  const int kv = h / (Hq / Hkv);
+  const int per = (D + 31) / 32;
+
+  // Which group this row belongs to. A row outside the video block is a
+  // global one and takes group 0; the division is only reached when the
+  // row is inside, so it cannot run out of range.
+  const int video_end = video_start + num_frames * tokens_per_frame;
+  const int group = (qi < video_start || qi >= video_end)
+                        ? 0
+                        : 1 + (qi - video_start) / tokens_per_frame;
+
+  const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
+  const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
+  const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
+
+  float qreg[SDPA_MAX_PER];
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    qreg[p] = idx < D ? float(qh[idx]) * scale : 0.0f;
+    acc[p] = 0.0f;
+  }
+  float m = -INFINITY, l = 0.0f;
+  for (int s = span_off[group]; s < span_off[group + 1]; ++s) {
+    const int ws = span_start[s], we = span_end[s];
+    for (int j = ws; j < we; ++j) {
+      float dot = 0.0f;
+      for (int p = 0; p < per; ++p) {
+        const int idx = lane * per + p;
+        if (idx < D) { dot += qreg[p] * float(kkv[(uint)j * D + idx]); }
+      }
+      dot = simd_sum(dot);
+      const float m_new = max(m, dot);
+      const float corr = exp(m - m_new);
+      const float pj = exp(dot - m_new);
+      l = l * corr + pj;
+      for (int p = 0; p < per; ++p) {
+        const int idx = lane * per + p;
+        if (idx < D) {
+          acc[p] = acc[p] * corr + pj * float(vkv[(uint)j * D + idx]);
+        }
+      }
+      m = m_new;
+    }
+  }
+  // A row that no span admits would divide by zero. It cannot happen for
+  // a well-formed layout -- every row sees at least its own frame -- but
+  // zero is the right answer if it ever does: a NaN here reaches the
+  // residual stream and the frame it came from is unrecoverable.
+  const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    if (idx < D) {
+      out[((uint)h * n_q + qi) * D + idx] = VPIPE_ELT(acc[p] * inv_l);
+    }
+  }
+}
