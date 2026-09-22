@@ -8,6 +8,7 @@
 #include "interfaces/session-services-intf.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -286,6 +287,50 @@ AudioToPcmStage::teardown_resampler_()
   _last_in_sample_fmt  = AV_SAMPLE_FMT_NONE;
 }
 
+void
+AudioToPcmStage::trim_decoded_(std::size_t at, std::size_t n,
+                               std::size_t ch, const EncodedSegment& seg)
+{
+  if (n == 0) { return; }
+  // A NEW JOINED PART restarts the count: skip_head and total_samples
+  // describe one part, not the run.
+  if (seg.part_index != _trim_part) {
+    _trim_part = seg.part_index;
+    _out_samples_emitted = 0;
+  }
+  const double rate_ratio =
+      seg.sample_rate > 0
+          ? (double)_output_sample_rate / (double)seg.sample_rate
+          : 1.0;
+  const std::int64_t head =
+      (std::int64_t)std::llround((double)seg.skip_head * rate_ratio);
+  const std::int64_t total =
+      seg.total_samples > 0
+          ? (std::int64_t)std::llround((double)seg.total_samples * rate_ratio)
+          : 0;
+
+  std::int64_t first = _out_samples_emitted;          // before this block
+  std::int64_t last  = first + (std::int64_t)n;       // exclusive
+  _out_samples_emitted = last;
+
+  // How much of what was just appended survives.
+  std::int64_t keep_from = std::max<std::int64_t>(first, head);
+  std::int64_t keep_to   = last;
+  if (total > 0) { keep_to = std::min<std::int64_t>(keep_to, head + total); }
+  if (keep_to <= keep_from) {
+    _chunk_buf.resize(at);                            // all padding
+    return;
+  }
+  const std::size_t drop_front = (std::size_t)(keep_from - first);
+  const std::size_t keep_n     = (std::size_t)(keep_to - keep_from);
+  if (drop_front == 0 && keep_n == n) { return; }     // nothing to do
+  float* base = _chunk_buf.data() + at;
+  if (drop_front > 0) {
+    std::memmove(base, base + drop_front * ch, keep_n * ch * sizeof(float));
+  }
+  _chunk_buf.resize(at + keep_n * ch);
+}
+
 bool
 AudioToPcmStage::ensure_decoder_(const EncodedSegment& seg)
 {
@@ -512,6 +557,14 @@ AudioToPcmStage::decode_one_(const EncodedSegment& seg)
       break;
     }
     _chunk_buf.resize(prev + static_cast<std::size_t>(n_out) * ch);
+    // GAPLESS TRIM. A block codec pads both ends -- the encoder primes
+    // the decoder with a frame of silence and rounds the tail up to a
+    // whole frame -- so a decoded AAC stream is longer than the audio
+    // that went in. Inaudible played alone; CONCATENATED it is a gap at
+    // every join. `skip_head` and `total_samples` arrive on the segment
+    // (see EncodedSegment); both are counted at the SOURCE rate and are
+    // rescaled here because the resampler has already run.
+    trim_decoded_(prev, static_cast<std::size_t>(n_out), ch, seg);
     _libs->avutil().api.frame_unref(_frame);
   }
   if (any_decoded) {

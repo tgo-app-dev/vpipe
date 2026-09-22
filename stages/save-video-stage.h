@@ -6,7 +6,9 @@
 #include "pipeline/typed-stage.h"
 #include "common/ffmpeg-libraries.h"
 #include "stages/audio-video/video-tokens.h"
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace vpipe {
 
@@ -114,6 +116,14 @@ private:
   bool audio_params_from_pcm_(const class TensorBeatPayload& t,
                               AudioStreamParams* out);
   void encode_pcm_(const class TensorBeatPayload& t);
+  // Encode `count` samples/channel of planar-f32 `src` (whose channel
+  // stride is `samples`) starting at `off`, in whole frame_size frames.
+  void emit_pcm_frames_(const float* src, std::int64_t samples, int channels,
+                        std::int64_t off, std::int64_t count, int frame_size);
+  // The samples left over once the last whole frame is out. A block
+  // codec accepts a SHORT frame only as the stream's last, so this is
+  // the only thing that may send one.
+  void flush_pcm_tail_();
   void drain_encoder_(AVCodecContext* enc, AVStream* st);
   void finalize_();
   // Free the muxer/encoder objects (finalizing first if needed).
@@ -186,6 +196,16 @@ private:
   // generate, and then nothing is written.
   std::string _model_name;
   AVFrame* _apcm_frame    = nullptr;   // reused frame_size scratch
+  // Samples carried over a beat boundary because they did not fill a
+  // frame: planar f32, `_apcm_carry_n` per channel, channel stride
+  // `_apcm_carry_n`. A beat boundary is NOT the end of the stream --
+  // audio-to-pcm emits one beat per chunk and a joined load-video one
+  // per file -- so the tail of each has to wait for its successor.
+  std::vector<float> _apcm_carry;
+  std::int64_t       _apcm_carry_n = 0;
+  // Scratch holding carry ++ beat, so the usual carry-free case can
+  // encode straight out of the beat with no copy at all.
+  std::vector<float> _apcm_join;
 
   int _next_port = 0;
 };

@@ -39,6 +39,12 @@ namespace vpipe {
 // / `end_utc` / `duration_us` describe the GOP's wall-clock window;
 // `path` is the parent segment's mp4 path (consumers can also look
 // it up via `db_key`).
+// Metadata key under which a container vpipe wrote records the TRUE
+// (unpadded) audio sample count. Reverse-DNS, because mp4 carries an
+// arbitrary key only in the QuickTime `mdta` form.
+inline constexpr const char* kAudioSamplesMetaKey =
+    "com.tgo.vpipe.audio_samples";
+
 struct EncodedSegment {
   enum class Kind { Video, Audio };
 
@@ -67,6 +73,27 @@ struct EncodedSegment {
   unsigned    fps_den     = 0;            // video only
   unsigned    sample_rate = 0;            // audio only
   unsigned    channels    = 0;            // audio only
+
+  // AUDIO GAPLESS BOOKKEEPING, in samples at `sample_rate`.
+  //
+  // A block codec cannot encode an arbitrary length. AAC emits whole
+  // 1024-sample frames and primes its decoder with a frame of silence,
+  // so a decoded stream carries padding at BOTH ends: `skip_head`
+  // samples of encoder priming before the first real sample, and
+  // whatever it took to round the tail up to a whole frame after the
+  // last one. Played alone that is inaudible; CONCATENATED it is a gap
+  // at every join, which is what a multi-part video hears.
+  //
+  // The container knows the priming (`initial_padding`) but NOT the
+  // true length -- an mp4's audio duration is the PADDED count. So the
+  // writer records the true count and the reader trims to it. 0 means
+  // "not known", and nothing is trimmed at that end.
+  // Which JOINED part this packet came from, 0 when there is only one.
+  // `skip_head` / `total_samples` describe THAT part, so a consumer
+  // counting samples has to restart its count when this changes.
+  unsigned     part_index   = 0;
+  std::int64_t skip_head    = 0;          // audio only, encoder priming
+  std::int64_t total_samples = 0;         // audio only, true length
 
   std::vector<uint8_t> extradata;
   std::vector<uint8_t> data;

@@ -115,7 +115,7 @@ public:
   int audio_port() const noexcept { return _audio_port; }
 
 private:
-  void open_input_();
+  bool open_input_();
   int  pick_stream_(int media_type, int requested) const noexcept;
   // Cache the per-stream metadata every emitted segment repeats:
   // codec_id, extradata and the geometry or rate. Read once at open,
@@ -158,6 +158,18 @@ private:
   std::vector<std::string> _inputs;
   std::string              _concat_list;
   std::size_t              _concat_pos = 0;
+
+  // JOINING SEVERAL INPUTS, one file at a time. The concat demuxer
+  // flattens the parts into one stream, which is exactly what makes a
+  // block codec's per-file padding unreachable: only the FIRST file's
+  // gapless metadata is visible, and every interior part then welds its
+  // encoder priming into the seam. Opening the parts in turn keeps each
+  // one's own metadata, at the cost of continuing the timeline here.
+  std::size_t              _seq_index   = 0;   // which input is open
+  std::int64_t             _seq_base_us = 0;   // joined-timeline offset
+
+  // Open the input at `_seq_index`. False when it cannot be opened.
+  bool advance_to_next_input_();
   AVIOContext*             _avio       = nullptr;
   bool        _enable_video{};
   bool        _enable_audio{};
@@ -194,6 +206,8 @@ private:
     unsigned width = 0, height = 0;
     unsigned fps_num = 0, fps_den = 0;
     unsigned sample_rate = 0, channels = 0;
+    // Gapless bookkeeping for an AUDIO stream; see EncodedSegment.
+    std::int64_t skip_head = 0, total_samples = 0;
     std::vector<std::uint8_t> extradata;
     AVRational time_base { 0, 1 };
     // MEDIA time of the next packet, in microseconds from the start of

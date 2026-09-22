@@ -40,11 +40,22 @@ resolve_canvas_within(int height, int width, int multiple,
     h *= s;
     w *= s;
   }
-  // FLOOR, not nearest: nearest is above as often as below, and one grid
-  // line up is still an upsample.
+  // NEAREST, the same rule `resolve_canvas_size` and the reference use.
+  // This floored once, to refuse an upsample -- but the asymmetry runs
+  // the other way. A grid line up costs interpolated pixels and a little
+  // compute; a grid line down DISCARDS real ones, and it distorts the
+  // aspect further doing it. MEASURED over 44670 sources with
+  // 1.40 <= ratio <= 1.75: worst aspect error 8.52% flooring against
+  // 6.59% rounding, and flooring pushed 4.88% of them ABOVE ratio 1.75
+  // where rounding pushed 2.31%. That threshold is where the model's own
+  // canvas rule stops holding the short edge at 768, and crossing it
+  // costs about 1% of vertical scale -- so the rule that "never
+  // upsamples" was the one more likely to land a request in the worse
+  // regime. 1390x799 is the shape of it: floor gives 1376x768 (1.7917,
+  // over the line), nearest 1376x800 (1.7200, under it).
   const double m = (double)multiple;
-  *out_h = (int)std::max(m, std::floor(h / m) * m);
-  *out_w = (int)std::max(m, std::floor(w / m) * m);
+  *out_h = (int)std::max(m, std::nearbyint(h / m) * m);
+  *out_w = (int)std::max(m, std::nearbyint(w / m) * m);
   return true;
 }
 

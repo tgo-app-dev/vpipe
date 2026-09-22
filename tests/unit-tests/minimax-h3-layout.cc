@@ -1090,23 +1090,29 @@ TEST(minimax_h3_layout, reference_video_canvas_short_edge)
 
   // And 0 does not disable the area cap -- a source LARGER than the
   // canvas is still brought under it. 800x1600 would resolve to itself;
-  // the cap takes it to 704x1408.
+  // the cap takes it to 718.4x1436.8, which rounds to 704x1440.
   const int BH = 800, BW = 1600;
   std::vector<std::uint8_t> big((std::size_t)3 * BH * BW, 17);
   ASSERT_TRUE(h3::normalize_video_reference(big.data(), 1, BH, BW, 24.0, 1, 32,
                                             0, 768 * 1344, &out, &of, &oh,
                                             &ow));
-  EXPECT_TRUE(oh == 704 && ow == 1408);
+  EXPECT_TRUE(oh == 704 && ow == 1440);
   EXPECT_TRUE((std::int64_t)oh * ow <= 768LL * 1344);
   EXPECT_TRUE(oh <= BH && ow <= BW);
 
-  // The floor is the whole point, and rounding to NEAREST would miss it:
-  // 1080 is 33.75 grid lines, whose nearest is 34 -- an upsample to 1088
-  // by the rule that exists to refuse one. Uncapped, so only the grid is
-  // acting here.
+  // NEAREST, not floor. 1080 is 33.75 grid lines and rounds UP to 34,
+  // which costs 8 rows of interpolation; flooring to 33 would have
+  // DISCARDED 24 real ones and landed 2.27% off the source aspect
+  // against 0.74% here. Uncapped, so only the grid is acting.
   int fh = 0, fw = 0;
   ASSERT_TRUE(h3::resolve_canvas_within(1080, 1920, 32, 0, &fh, &fw));
-  EXPECT_TRUE(fh == 1056 && fw == 1920);
+  EXPECT_TRUE(fh == 1088 && fw == 1920);
+  // The case the change exists for: a source safely under ratio 1.75
+  // that flooring would push OVER it, into the regime where the model's
+  // own canvas rule stops holding the short edge at 768. Floor gives
+  // 1376x768 (1.7917); nearest keeps it at 1376x800 (1.7200).
+  ASSERT_TRUE(h3::resolve_canvas_within(799, 1390, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 800 && fw == 1376);
   // The one upward move it cannot refuse: under a single grid line there
   // is nowhere else to go, because a latent the DiT patch does not
   // divide is refused 50 layers later.
@@ -1132,7 +1138,7 @@ TEST(minimax_h3_layout, reference_video_canvas_short_edge)
   EXPECT_TRUE((std::int64_t)ih * iw <= 768LL * 1344);
   EXPECT_TRUE(ih <= 2160 && iw <= 3840);
   std::printf("[minimax_h3_layout] video canvas: 768 -> 1440x704, 0 -> the "
-              "clip's own (floored), cap holds either way\n");
+              "clip's own (rounded to the grid), cap holds either way\n");
 }
 
 // The prepared resize against the one-shot, frame for frame.

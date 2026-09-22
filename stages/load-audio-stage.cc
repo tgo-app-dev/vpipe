@@ -211,6 +211,16 @@ LoadAudioStage::open_input_()
           st->codecpar->extradata,
           st->codecpar->extradata + st->codecpar->extradata_size);
     }
+    // The encoder's priming: samples the decoder emits before the first
+    // real one. The container knows this much on its own.
+    _skip_head = st->codecpar->initial_padding > 0
+                     ? (std::int64_t)st->codecpar->initial_padding
+                     : 0;
+    // The TRUE length, which the container does not know -- an mp4's
+    // audio duration counts the padding too. A file vpipe wrote carries
+    // the real count in a metadata tag; anything else leaves it 0 and
+    // only the head is trimmed.
+    _total_samples = read_true_sample_count_(st);
     break;
   }
   if (_idx < 0) {
@@ -275,6 +285,31 @@ LoadAudioStage::reset_run_state()
   // after the seek, and a launch that fails before then should still
   // stamp a packet with no pts inside the window it was asked for.
   _last_us = _start_us;
+}
+
+
+std::int64_t
+LoadAudioStage::read_true_sample_count_(AVStream* st) const
+{
+  // Written by save-video; see kAudioSamplesMetaKey. Look on the STREAM
+  // first and then the container, because a muxer is free to put a tag
+  // in either place and mp4 puts ours in the file-level `mdta` box.
+  const auto& avu = _libs->avutil().api;
+  for (AVDictionary* d : {st != nullptr ? st->metadata : nullptr,
+                          _fctx != nullptr ? _fctx->metadata : nullptr}) {
+    if (d == nullptr) { continue; }
+    AVDictionaryEntry* e =
+        avu.dict_get(d, kAudioSamplesMetaKey, nullptr, 0);
+    if (e != nullptr && e->value != nullptr) {
+      errno = 0;
+      char* end = nullptr;
+      const long long v = std::strtoll(e->value, &end, 10);
+      if (errno == 0 && end != e->value && v > 0) {
+        return (std::int64_t)v;
+      }
+    }
+  }
+  return 0;
 }
 
 Job
@@ -342,6 +377,7 @@ LoadAudioStage::process(RuntimeContext& ctx)
   }
   _last_us = t + d;
 
+
   // Past the window: done. Tested on the packet's START, so the packet
   // straddling the end is emitted whole rather than truncated -- this
   // stage does not decode and so cannot cut inside one.
@@ -370,6 +406,8 @@ LoadAudioStage::process(RuntimeContext& ctx)
   seg->sample_rate = _sample_rate;
   seg->channels    = _channels;
   seg->extradata   = _extradata;
+  seg->skip_head     = _skip_head;
+  seg->total_samples = _total_samples;
   seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
 
   seg->duration_us = d;

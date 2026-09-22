@@ -611,16 +611,20 @@ public:
   int channels    = 2;
   int sample_rate = 32000;
   int samples     = 32000;      // 1 s
+  // Beats, not total length. A multi-part join sends one PER FILE and a
+  // chunking producer one per chunk, and neither lands on the codec's
+  // frame boundary -- which is the case a single beat cannot reach.
+  int beats       = 1;
   bool send_rate  = true;
   // What audio-vae-decode carries forward from the latent it decoded.
   string model_name;
 
-  void reset_run_state() override { _sent = false; }
+  void reset_run_state() override { _sent = 0; }
 
   Job process(RuntimeContext& ctx) override
   {
-    if (_sent) { ctx.signal_done(); co_return; }
-    _sent = true;
+    if (_sent >= beats) { ctx.signal_done(); co_return; }
+    ++_sent;
     auto b = make_unique<TensorBeatPayload>();
     b->dtype = TensorBeat::DType::F32;
     b->shape = {channels, samples};
@@ -658,7 +662,7 @@ public:
     return s;
   }
 private:
-  bool _sent = false;
+  int _sent = 0;
 };
 
 }  // namespace
@@ -743,6 +747,90 @@ TEST(video_stages, encoder_muxes_raw_stereo_pcm) {
   EXPECT_TRUE(n_audio == 1);
   EXPECT_TRUE(ach == 2);
   EXPECT_TRUE(arate == 32000);
+  remove(out_path.c_str());
+}
+
+// SEVERAL PCM beats, none of them a whole number of codec frames.
+//
+// A block codec takes a SHORT frame only as the stream's last: FFmpeg
+// pads it, latches `last_audio_frame`, and answers the NEXT
+// send_frame with EINVAL. The sink used to end every beat with one, so
+// a graph sending one beat per clip was fine and a graph sending one
+// per chunk -- audio-to-pcm -- or one per file -- a joined load-video --
+// lost everything after the first. MEASURED on a 5-part 896x512 story:
+// 1585 frames offered, 627 taken, 958 refused, and the run still exited
+// 0 with 20 s of audio under 50 s of video.
+//
+// 32400 is deliberately not a multiple of 1024 (31.64 frames), so every
+// beat boundary lands mid-frame.
+TEST(video_stages, encoder_joins_pcm_beats_across_frame_boundaries) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string out_path = tmp_path_("enc-pcm-beats", ".m4a");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto asrc_u = make_unique<SynthPcmSource>(
+    &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  asrc_u->samples = 32400;
+  asrc_u->beats   = 3;
+  asrc_u->allocate_oports(1);
+  auto* asrc = static_cast<SynthPcmSource*>(
+    pl->insert_stage(std::move(asrc_u)));
+  const int64_t want = 32400LL * 3;
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_video", FlexData::make_bool(false));
+  }
+  auto enc_u = make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{asrc, 0}}, std::move(enc_cfg));
+  auto* enc = static_cast<SaveVideoStage*>(
+    pl->insert_stage(std::move(enc_u)));
+  EXPECT_TRUE(enc->config_error().empty());
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  int64_t got = 0, meta = 0;
+  {
+    const FFmpegLibraries& libs = *sess.services()->ffmpeg_libraries();
+    AVFormatContext* ic = nullptr;
+    if (libs.avformat().api.open_input(&ic, out_path.c_str(), nullptr,
+                                       nullptr) == 0) {
+      if (libs.avformat().api.find_stream_info(ic, nullptr) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; ++i) {
+          AVStream* st = ic->streams[i];
+          if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) { continue; }
+          // mp4 audio is timed in samples, so the duration IS the count
+          // once it is rescaled off the stream's own base.
+          const int64_t rate = st->codecpar->sample_rate;
+          if (st->duration > 0 && st->time_base.den > 0) {
+            got = st->duration * st->time_base.num * rate / st->time_base.den;
+          }
+        }
+        AVDictionaryEntry* e = libs.avutil().api.dict_get(
+          ic->metadata, kAudioSamplesMetaKey, nullptr, 0);
+        if (e != nullptr && e->value != nullptr) { meta = atoll(e->value); }
+      }
+      libs.avformat().api.close_input(&ic);
+    }
+  }
+  printf("[video_stages] 3 beats x 32400: container %lld samples, "
+         "true-length tag %lld, wanted %lld\n",
+         (long long)got, (long long)meta, (long long)want);
+  // Before the fix this stopped at ~32768 -- the first beat and nothing
+  // after it. The upper bound is the codec rounding its LAST frame up.
+  EXPECT_TRUE(got >= want);
+  EXPECT_TRUE(got < want + 2048);
+  // And the true-length tag must be the real count, not the padded one,
+  // since that is what a joining reader trims to.
+  EXPECT_TRUE(meta == want);
   remove(out_path.c_str());
 }
 

@@ -153,6 +153,12 @@ private:
   unsigned             _sample_rate = 0;
   unsigned             _channels    = 0;
   std::vector<uint8_t> _extradata;
+  // Gapless bookkeeping read off the source; see EncodedSegment.
+  // The true sample count a vpipe-written container records, or 0.
+  std::int64_t read_true_sample_count_(struct AVStream* st) const;
+
+  std::int64_t         _skip_head    = 0;
+  std::int64_t         _total_samples = 0;
 
   bool          _eof     = false;
   std::uint64_t _packets = 0;

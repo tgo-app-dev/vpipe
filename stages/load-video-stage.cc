@@ -1,3 +1,4 @@
+#include "common/encoded-segment.h"
 #include "stages/load-video-stage.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
@@ -366,7 +367,58 @@ LoadVideoStage::cache_stream_(int stream_idx, bool video)
   } else {
     m.sample_rate = (unsigned)st->codecpar->sample_rate;
     m.channels    = (unsigned)st->codecpar->ch_layout.nb_channels;
+    // The encoder's priming, which the container knows, and the TRUE
+    // length, which it does not -- an mp4's audio duration counts the
+    // block codec's padding at both ends. A file vpipe wrote records
+    // the real count under kAudioSamplesMetaKey; see EncodedSegment.
+    m.skip_head = st->codecpar->initial_padding > 0
+                      ? (std::int64_t)st->codecpar->initial_padding
+                      : 0;
+    m.total_samples = 0;
+    {
+      const auto& avu = _libs->avutil().api;
+      for (AVDictionary* d : {st->metadata,
+                              _fctx != nullptr ? _fctx->metadata : nullptr}) {
+        if (d == nullptr) { continue; }
+        AVDictionaryEntry* e =
+            avu.dict_get(d, kAudioSamplesMetaKey, nullptr, 0);
+        if (e != nullptr && e->value != nullptr) {
+          const long long v = std::strtoll(e->value, nullptr, 10);
+          if (v > 0) { m.total_samples = (std::int64_t)v; break; }
+        }
+      }
+    }
   }
+}
+
+bool
+LoadVideoStage::advance_to_next_input_()
+{
+  // The joined timeline continues where this part ended. Both streams
+  // are considered: they do not end together, and rewinding the clock
+  // to the shorter one would overlap the next part on that port.
+  const std::int64_t end_us = std::max(_vmeta.last_us, _ameta.last_us);
+  ++_seq_index;
+  _libs->avformat().api.close_input(&_fctx);
+  _fctx = nullptr;
+  if (!open_input_()) {
+    session()->warn(fmt(
+        "LoadVideoStage('{}'): joining stopped at part {} of {}: '{}' "
+        "could not be opened", this->id(), _seq_index + 1, _inputs.size(),
+        _inputs[_seq_index]));
+    return false;
+  }
+  _seq_base_us = end_us;
+  // A fresh file restarts its own clock at zero; the per-stream cursors
+  // have to restart with it or a packet without a pts would be dated
+  // from the previous part.
+  _vmeta.last_us = 0;
+  _ameta.last_us = 0;
+  session()->info(fmt(
+      "LoadVideoStage('{}'): joined part {} of {} -- '{}' continues at "
+      "{:.3f} s", this->id(), _seq_index + 1, _inputs.size(),
+      _inputs[_seq_index], (double)_seq_base_us / 1e6));
+  return true;
 }
 
 std::unique_ptr<EncodedSegmentPayload>
@@ -387,6 +439,9 @@ LoadVideoStage::segment_(bool video)
   } else {
     seg->sample_rate = m.sample_rate;
     seg->channels    = m.channels;
+    seg->skip_head     = m.skip_head;
+    seg->total_samples = m.total_samples;
+    seg->part_index    = (unsigned)_seq_index;
   }
   seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
 
@@ -400,12 +455,14 @@ LoadVideoStage::segment_(bool video)
     d = _libs->avutil().api.rescale_q(_pkt->duration, m.time_base, us);
   }
   m.last_us = t + d;
+  // `t` is this PART's own clock; the beat carries the joined one.
+  const std::int64_t jt = t + _seq_base_us;
   seg->duration_us = d;
   seg->start_utc =
-      std::chrono::system_clock::time_point(std::chrono::microseconds(t));
+      std::chrono::system_clock::time_point(std::chrono::microseconds(jt));
   seg->end_utc =
       std::chrono::system_clock::time_point(
-          std::chrono::microseconds(t + d));
+          std::chrono::microseconds(jt + d));
   return seg;
 }
 
@@ -472,7 +529,7 @@ LoadVideoStage::check_inputs_agree_()
   }
 }
 
-void
+bool
 LoadVideoStage::open_input_()
 {
   AVDictionary* opts = nullptr;
@@ -505,66 +562,22 @@ LoadVideoStage::open_input_()
 
   int rc = 0;
   if (_inputs.size() > 1) {
-    // SEVERAL inputs: join them by driving the concat demuxer off a list
-    // we write ourselves. The list never touches the filesystem -- it is
-    // handed over through a custom AVIO -- so there is no temp file to
-    // place, clean up or confine, and the caller never learns that a
-    // list format exists.
-    //
-    // `safe` has to be 0 because the entries are ABSOLUTE: confine_local_
-    // rooted them in the sandbox. They came from the sandbox, so this
-    // loosens nothing the stage had not already checked.
+    // SEVERAL inputs are opened ONE AT A TIME rather than handed to the
+    // concat demuxer. The demuxer would present them as a single
+    // flattened stream, and a block codec's padding is then only
+    // visible for the first file -- every interior seam keeps its
+    // encoder priming, which is audible as a gap at every join. Opening
+    // each part in turn keeps its own gapless metadata; `_seq_base_us`
+    // carries the joined timeline across the boundary.
     if (forced != nullptr) {
       session()->error(fmt(
           "LoadVideoStage('{}'): `format: \"{}\"` cannot be combined with "
-          "an array of inputs -- an array IS the join, and it drives the "
-          "concat demuxer itself. Give one path to force a demuxer, or "
-          "drop `format`", this->id(), _format));
+          "an array of inputs -- an array IS the join. Give one path to "
+          "force a demuxer, or drop `format`", this->id(), _format));
     }
-    forced = _libs->avformat().api.find_input_format("concat");
-    if (forced == nullptr) {
-      session()->error(fmt(
-          "LoadVideoStage('{}'): this FFmpeg build has no `concat` "
-          "demuxer, so several inputs cannot be joined", this->id()));
-    }
-    _libs->avutil().api.dict_set(&opts, "safe", "0", 0);
-    _concat_list.clear();
-    for (const auto& u : _inputs) {
-      // The list quotes with ', so a ' inside a path has to be escaped
-      // the way the demuxer's own parser expects ('\'').
-      string q;
-      for (char c : u) {
-        if (c == '\'') { q += "'\\''"; } else { q += c; }
-      }
-      _concat_list += "file '" + q + "'\n";
-    }
-    _concat_pos = 0;
-
-    constexpr int kIoBuf = 1 << 16;
-    auto* iobuf = static_cast<uint8_t*>(_libs->avutil().api.malloc(kIoBuf));
-    if (!iobuf) {
-      session()->error(fmt(
-          "LoadVideoStage('{}'): avio buffer alloc failed", this->id()));
-    }
-    _avio = _libs->avformat().api.avio_alloc_context(
-        iobuf, kIoBuf, /*write_flag=*/0, this,
-        &LoadVideoStage::concat_read_, nullptr,
-        &LoadVideoStage::concat_seek_);
-    if (!_avio) {
-      _libs->avutil().api.freep(&iobuf);
-      session()->error(fmt(
-          "LoadVideoStage('{}'): avio_alloc_context failed", this->id()));
-    }
-    fctx = _libs->avformat().api.alloc_context();
-    if (!fctx) {
-      session()->error(fmt(
-          "LoadVideoStage('{}'): avformat_alloc_context failed",
-          this->id()));
-    }
-    fctx->pb = _avio;
-    rc = _libs->avformat().api.open_input(&fctx, nullptr, forced, &opts);
-    if (rc >= 0) { check_inputs_agree_(); }
-  } else {
+    _input_url = _inputs[_seq_index];
+  }
+  {
     rc = _libs->avformat().api.open_input(&fctx, _input_url.c_str(),
                                           forced, &opts);
   }
@@ -573,6 +586,7 @@ LoadVideoStage::open_input_()
     session()->error(fmt(
         "LoadVideoStage('{}'): avformat_open_input({}) "
         "failed: {}", this->id(), input_doc_(), av_err_(rc)));
+    return false;
   }
   _fctx = fctx;
 
@@ -581,6 +595,7 @@ LoadVideoStage::open_input_()
     session()->error(fmt(
         "LoadVideoStage('{}'): find_stream_info failed: {}",
         this->id(), av_err_(rc)));
+    return false;
   }
 
   if (_video_port >= 0) {
@@ -637,12 +652,18 @@ LoadVideoStage::open_input_()
                         input_doc_(), window_doc_()));
   }
 
-  _pkt = _libs->avcodec().api.packet_alloc();
-  if (!_pkt) {
-    session()->error(fmt(
-        "LoadVideoStage('{}'): av_packet_alloc failed",
-        this->id()));
+  if (_pkt == nullptr) {
+    // One packet for the whole run: re-opening for the next joined part
+    // must not leak the previous one.
+    _pkt = _libs->avcodec().api.packet_alloc();
+    if (!_pkt) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): av_packet_alloc failed",
+          this->id()));
+      return false;
+    }
   }
+  return true;
 }
 
 std::string
@@ -732,6 +753,11 @@ LoadVideoStage::process(RuntimeContext& ctx)
 
   const int rc = _libs->avformat().api.read_frame(_fctx, _pkt);
   if (rc == AVERROR_EOF) {
+    // The end of ONE part is not the end of the run when several inputs
+    // are being joined: carry the timeline forward and open the next.
+    if (_seq_index + 1 < _inputs.size()) {
+      if (advance_to_next_input_()) { co_return; }
+    }
     _eof = true;
     session()->info(fmt(
         "LoadVideoStage('{}'): end of {} after {} video + {} audio "

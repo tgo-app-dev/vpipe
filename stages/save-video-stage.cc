@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "common/encoded-segment.h"
 #include "stages/model-provenance.h"
 #include <algorithm>
 #include <cstring>
@@ -383,6 +384,8 @@ SaveVideoStage::reset_run_state()
   _finalized         = false;
   _audio_pcm         = false;
   _audio_pts         = 0;
+  _apcm_carry.clear();
+  _apcm_carry_n      = 0;
   _next_port         = 0;
   _model_name.clear();
 }
@@ -726,23 +729,94 @@ SaveVideoStage::encode_pcm_(const TensorBeatPayload& t)
   }
 
   const float* src = t.as_f32();
-  for (int64_t off = 0; off < samples; off += frame_size) {
-    const int n =
-      static_cast<int>(std::min<int64_t>(frame_size, samples - off));
-    // TELL THE ENCODER how many samples are real. This used to hand it a
-    // full frame every time, zero-filling the tail of the last one, and
-    // those zeros are audible: a clip of 324000 samples became 317 AAC
-    // blocks of 1024 = 324608, i.e. 19 ms of silence welded onto the end
-    // of the track. Harmless at the end of a lone clip, but a multi-part
-    // graph JOINS these files and every seam then carries that silence
-    // -- a pause just under half a video frame. A lossless codec would
-    // store the zeros outright.
-    _apcm_frame->nb_samples = n;
-    write_pcm_frame_(src, samples, channels, off, n);
+
+  // WHOLE FRAMES ONLY, and the remainder is CARRIED to the next beat.
+  //
+  // A block codec takes a short frame only as the stream's LAST: FFmpeg
+  // pads it, latches `last_audio_frame`, and answers the next
+  // send_frame with EINVAL ("frame_size was not respected for a
+  // non-last frame"). This used to end every BEAT with a short frame,
+  // which a one-beat-per-clip graph never notices because its only
+  // short frame really is the last. A beat boundary is not the end of
+  // the stream, though: `audio-to-pcm` emits one per chunk and a joined
+  // `load-video` one per file. MEASURED on the 5-part 896x512 story --
+  // 5 x 324000 samples is 317 frames each, 1585 in all, and the encoder
+  // took 627 then refused 958, writing 20 s of audio under 50 s of
+  // video and still exiting 0.
+  //
+  // Carrying also keeps the old fix that motivated the short frame:
+  // nothing is zero-padded mid-stream, so no silence is welded into a
+  // seam. Only `flush_pcm_tail_` may send a partial frame.
+  // Carry ++ beat, as one planar block. The carry is almost always
+  // empty -- a graph that sends one beat per clip never fills it -- and
+  // then the beat is encoded in place with no copy; `_apcm_join` is
+  // touched only on the joined path that needs it. Note the channel
+  // stride CHANGES when the two are spliced, so this cannot be done by
+  // growing `_apcm_carry` in place: channel c moves.
+  const int64_t have   = _apcm_carry_n + samples;
+  const float*  base   = src;
+  int64_t       stride = samples;
+  if (_apcm_carry_n > 0) {
+    _apcm_join.resize((size_t)channels * (size_t)have);
+    for (int c = 0; c < channels; ++c) {
+      float* d = _apcm_join.data() + (size_t)c * have;
+      std::memcpy(d, _apcm_carry.data() + (size_t)c * _apcm_carry_n,
+                  (size_t)_apcm_carry_n * sizeof(float));
+      std::memcpy(d + _apcm_carry_n, src + (size_t)c * samples,
+                  (size_t)samples * sizeof(float));
+    }
+    base   = _apcm_join.data();
+    stride = have;
+  }
+
+  // `whole` is 0 when the two together still do not fill a frame, which
+  // is the short-beat case and needs no branch of its own.
+  const int64_t whole = (have / frame_size) * frame_size;
+  emit_pcm_frames_(base, stride, channels, 0, whole, frame_size);
+
+  const int64_t left = have - whole;
+  std::vector<float> keep((size_t)channels * (size_t)left);
+  for (int c = 0; c < channels; ++c) {
+    std::memcpy(keep.data() + (size_t)c * left,
+                base + (size_t)c * stride + whole,
+                (size_t)left * sizeof(float));
+  }
+  _apcm_carry.swap(keep);
+  _apcm_carry_n = left;
+}
+
+void
+SaveVideoStage::emit_pcm_frames_(const float* src, int64_t samples,
+                                 int channels, int64_t off, int64_t count,
+                                 int frame_size)
+{
+  for (int64_t i = 0; i < count; i += frame_size) {
+    _apcm_frame->nb_samples = frame_size;
+    write_pcm_frame_(src, samples, channels, off + i, frame_size);
     _apcm_frame->pts = _audio_pts;
-    _audio_pts += n;
+    _audio_pts += frame_size;
     encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
   }
+}
+
+// The stream's one legitimate short frame. `_audio_pts` still counts
+// only REAL samples, so the true-length metadata the seam fix relies on
+// stays exact even though this frame is padded on the way out.
+void
+SaveVideoStage::flush_pcm_tail_()
+{
+  if (_aenc == nullptr || _apcm_frame == nullptr || _apcm_carry_n <= 0) {
+    return;
+  }
+  const int channels = _aenc->ch_layout.nb_channels;
+  const int n        = (int)_apcm_carry_n;
+  _apcm_frame->nb_samples = n;
+  write_pcm_frame_(_apcm_carry.data(), _apcm_carry_n, channels, 0, n);
+  _apcm_frame->pts = _audio_pts;
+  _audio_pts += n;
+  encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+  _apcm_carry.clear();
+  _apcm_carry_n = 0;
 }
 
 // Planar f32 -- the layout every generative graph in this tree carries
@@ -836,7 +910,21 @@ SaveVideoStage::write_provenance_(AVDictionary** mux_opts)
   // transcode must not come out claiming vpipe authored the footage --
   // and saying nothing also leaves the container's metadata layout
   // exactly as it would have been.
-  if (_model_name.empty() || _ofctx == nullptr) {
+  if (_ofctx == nullptr) {
+    return;
+  }
+  // The audio sample count is an arbitrary key too, and it is written
+  // at TRAILER time -- so the mdta form has to be asked for here, up
+  // front, even when there is no provenance string to write.
+  const bool want_mdta = _audio_port >= 0;
+  if (_model_name.empty() && !want_mdta) {
+    return;
+  }
+  if (_model_name.empty()) {
+    if (is_mov_family_(_ofctx->oformat)) {
+      _libs->avutil().api.dict_set(mux_opts, "movflags",
+                                   "+use_metadata_tags", AV_DICT_APPEND);
+    }
     return;
   }
   const string sw = provenance::software_string(_model_name);
@@ -984,8 +1072,25 @@ SaveVideoStage::finalize_()
       drain_encoder_(_venc, _vstream);
     }
     if (_aenc) {
+      // The samples that never filled a frame. HERE is the one place a
+      // short frame is legal, and it has to go in before the drain or
+      // the tail of the last beat is simply lost.
+      flush_pcm_tail_();
       _libs->avcodec().api.send_frame(_aenc, nullptr);
       drain_encoder_(_aenc, _astream);
+    }
+    // RECORD THE TRUE AUDIO LENGTH. `_audio_pts` counted the real
+    // samples handed to the encoder, which is the one number the
+    // container will not otherwise carry: a block codec rounds the tail
+    // up to a whole frame and primes its decoder with another, so an
+    // mp4's audio duration is the PADDED count. A reader that trims to
+    // this can join two parts without the gap those two paddings would
+    // otherwise weld into the seam. Set before the trailer because that
+    // is when the mov muxer writes moov.
+    if (_aenc != nullptr && _audio_pts > 0) {
+      const std::string n = std::to_string((long long)_audio_pts);
+      _libs->avutil().api.dict_set(&_ofctx->metadata,
+                                   kAudioSamplesMetaKey, n.c_str(), 0);
     }
     int rc = _libs->avformat().api.write_trailer(_ofctx);
     if (rc < 0) {

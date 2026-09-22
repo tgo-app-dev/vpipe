@@ -36,10 +36,19 @@ namespace minimax_h3 {
 // video path.
 //
 // Starts at the source's OWN extent, brings it under `max_pixels` if it
-// is over (aspect preserved), and then FLOORS both axes to `multiple`.
-// Floors rather than rounds to nearest, because the nearest grid line
-// sits above as often as below: a 1080-tall source rounds UP to 1088,
-// which is an upsample of exactly the kind this rule exists to refuse.
+// is over (aspect preserved), and then rounds both axes to the NEAREST
+// `multiple` -- the same grid rule resolve_canvas_size and the reference
+// follow, so only the short-edge step differs between the two routes.
+//
+// It is the last grid line that may go UP, and deliberately. Rounding up
+// costs interpolated pixels; rounding down DISCARDS real ones and misses
+// the source's aspect by more while doing it. Over 44670 sources with
+// 1.40 <= ratio <= 1.75 the worst aspect error was 8.52% flooring and
+// 6.59% rounding, and flooring put 4.88% of them above ratio 1.75 where
+// rounding put 2.31% -- the threshold past which the canvas rule stops
+// holding a short edge of 768, which is worth about 1% of vertical
+// scale. So "never upsample" was the rule more likely to land a request
+// in the worse regime, for a saving that was never real.
 //
 // The one upward move it cannot avoid is a source under one `multiple`.
 // The grid is not a preference -- the VAE's stride times the DiT's patch

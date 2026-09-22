@@ -1,6 +1,7 @@
 #ifndef VIDEO_AUDIO_TO_PCM_STAGE_H
 #define VIDEO_AUDIO_TO_PCM_STAGE_H
 
+#include "common/encoded-segment.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
 #include "common/job.h"
@@ -132,6 +133,14 @@ public:
   double max_chunk_duration_s() const noexcept { return _max_chunk_duration_s; }
 
 private:
+
+  // Drop the encoder's priming samples at the head of a stream and stop
+  // at its true length, for a source that told us both. `at` / `n` are
+  // the samples just appended to _chunk_buf, `ch` the channel count.
+  void trim_decoded_(std::size_t at, std::size_t n, std::size_t ch,
+                     const EncodedSegment& seg);
+  std::int64_t _out_samples_emitted = 0;   // per source stream
+  unsigned     _trim_part = 0;             // which joined part that counts
   // Decode a single AAC frame's worth of bytes through the FFmpeg
   // decoder + swresample pipeline; appends mono-f32-at-output_sr
   // samples to `_chunk_buf`. Returns false on hard decoder error;

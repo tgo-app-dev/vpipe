@@ -71,8 +71,8 @@ struct MediaReference {
   bool has_audio() const { return channels > 0 && !pcm.empty(); }
 
   // This reference's own canvas short edge, overriding the plan's for
-  // this one reference. Negative uses the plan's; 0 is the never-
-  // upsample rule (resolve_canvas_within).
+  // this one reference. Negative uses the plan's; 0 takes the clip at
+  // the size it arrived, under the area cap (resolve_canvas_within).
   //
   // Per REFERENCE and not per kind, because the reason to set it is a
   // property of the picture rather than of the checkpoint: a caller that
