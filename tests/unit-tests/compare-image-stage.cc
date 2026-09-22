@@ -186,6 +186,22 @@ make_rgb_(int H, int W, float v)
   return tb;
 }
 
+// RGBA, with a per-pixel alpha ramp so the checkerboard shows through
+// at some pixels and not others.
+TensorBeat
+make_rgba_(int H, int W, float v, float a)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::F32;
+  tb.shape = {4, H, W};
+  tb.resize_contiguous(static_cast<size_t>(4) * H * W);
+  float* p = tb.as_f32();
+  const size_t plane = static_cast<size_t>(H) * W;
+  for (size_t i = 0; i < 3 * plane; ++i) { p[i] = v; }
+  for (size_t i = 0; i < plane; ++i) { p[3 * plane + i] = a; }
+  return tb;
+}
+
 bool
 is_png_(const CompareImageChannel::Png& p)
 {
@@ -433,4 +449,59 @@ TEST(compare_image_stage, a_closed_input_does_not_spin_the_wait)
   std::printf("[compare_image_stage] process() ran %llu time(s) across a "
               "%d ms wait\n", (unsigned long long)calls, 250);
   EXPECT_TRUE(calls < 50);
+}
+
+// ---- RGBA ------------------------------------------------------------
+//
+// A four-channel beat is accepted, and it is shown OVER A CHECKERBOARD
+// rather than flattened onto a colour. That is not decoration: this is
+// a comparison view, and on flat white two images that differ ONLY in
+// their alpha would be published as identical -- the one thing a
+// comparison must never do.
+//
+// Asserted through the published PNGs rather than by reaching into the
+// stage: two images with the same RGB and DIFFERENT alpha must encode
+// differently.
+TEST(compare_image_stage, rgba_is_accepted_and_alpha_is_visible)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+
+  // Same colour on both sides; only the alpha differs.
+  auto a_u = make_unique<RepeatSource>(&sess, "a", vector<InEdge>{},
+                                       FlexData::make_object());
+  a_u->tb = make_rgba_(48, 64, 0.25f, 1.0f);    // opaque
+  a_u->allocate_oports(1);
+  auto* a = static_cast<RepeatSource*>(pl->insert_stage(std::move(a_u)));
+
+  auto b_u = make_unique<RepeatSource>(&sess, "b", vector<InEdge>{},
+                                       FlexData::make_object());
+  b_u->tb = make_rgba_(48, 64, 0.25f, 0.0f);    // fully transparent
+  b_u->allocate_oports(1);
+  auto* b = static_cast<RepeatSource*>(pl->insert_stage(std::move(b_u)));
+
+  auto c_u = make_unique<CompareImageStage>(
+      &sess, "cmp", vector<InEdge>{{a, 0}, {b, 0}}, FlexData::make_object());
+  auto* cmp =
+      static_cast<CompareImageStage*>(pl->insert_stage(std::move(c_u)));
+
+  auto ch = cmp->compare_channel();
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  EXPECT_TRUE(wait_for_(*ch, both_slots_));
+  rt.stop();
+
+  auto s = ch->snapshot();
+  EXPECT_TRUE(s.version >= 1);
+  EXPECT_TRUE(s.width == 64 && s.height == 48);
+  // Accepted at all -- a four-channel beat used to be dropped by
+  // unpack_ and the slot would simply never fill.
+  EXPECT_TRUE(is_png_(s.a));
+  EXPECT_TRUE(is_png_(s.b));
+  if (!is_png_(s.a) || !is_png_(s.b)) { return; }
+  // AND DISTINGUISHABLE. Same RGB, different alpha: over a flat colour
+  // these would be one flat field each and could easily encode to the
+  // same bytes; over the checkerboard the transparent one carries the
+  // pattern and the opaque one does not.
+  EXPECT_TRUE(*s.a != *s.b);
 }

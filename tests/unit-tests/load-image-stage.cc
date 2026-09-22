@@ -312,3 +312,80 @@ TEST(load_image_stage, chrono_paced) {
 
   EXPECT_TRUE(sink->captured.size() == 3);
 }
+
+// ---- alpha -----------------------------------------------------------
+//
+// `alpha: keep` is a statement about the BEAT's shape, not about the
+// file's: swscale fills an opaque alpha plane for a source that has
+// none, so a graph that asks for four channels gets four whatever it
+// is handed. That is the only version whose output shape a downstream
+// stage can rely on -- and it is what lets an RGBA VAE be fed from an
+// ordinary photo.
+//
+// The default stays DROP, because every other consumer in this tree
+// reads [3,H,W] and a transparent PNG must not silently change the
+// shape of a graph that was working yesterday.
+TEST(load_image_stage, alpha_keep_emits_four_channels) {
+  Session sess;
+  CerrSilencer hush;
+
+  const int W = 4, H = 2;
+  const uint8_t R = 0xFF, G = 0x80, B = 0x40;
+  // A PPM has NO alpha, which is the case worth pinning: `keep` must
+  // still produce four channels, with the fourth fully opaque.
+  const string path = write_test_ppm_(W, H, R, G, B);
+
+  auto run = [&](const char* alpha) -> vector<int64_t> {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("url", FlexData::make_string(path));
+    if (alpha != nullptr) {
+      cfg.as_object().insert("alpha", FlexData::make_string(alpha));
+    }
+    auto li_u = make_unique<LoadImageStage>(
+        &sess, "li", vector<InEdge>{}, std::move(cfg));
+    auto* li = static_cast<LoadImageStage*>(
+        pl->insert_stage(std::move(li_u)));
+    auto sink_u = make_unique<SinkCapture>(
+        &sess, "sink", vector<InEdge>{{li, 0}}, FlexData::make_object());
+    auto* sink = static_cast<SinkCapture*>(
+        pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    if (sink->captured.empty()) { return {}; }
+    const auto* tb = dynamic_cast<const TensorBeatPayload*>(
+        sink->captured[0].get());
+    if (tb == nullptr) { return {}; }
+    // Carry the first alpha byte out in the shape vector's tail so the
+    // caller can check it without a second capture type.
+    vector<int64_t> r = tb->shape;
+    if (tb->shape.size() == 3 && tb->shape[0] == 4) {
+      const auto bytes = tb->materialize_contiguous();
+      const size_t plane = static_cast<size_t>(H) * W;
+      r.push_back(bytes.size() >= 4 * plane
+                      ? (int64_t)bytes[3 * plane] : -1);
+    }
+    return r;
+  };
+
+  const vector<int64_t> dflt = run(nullptr);
+  EXPECT_TRUE(dflt.size() == 3);
+  if (dflt.size() == 3) { EXPECT_TRUE(dflt[0] == 3); }
+
+  const vector<int64_t> drop = run("drop");
+  EXPECT_TRUE(drop.size() == 3);
+  if (drop.size() == 3) { EXPECT_TRUE(drop[0] == 3); }
+
+  const vector<int64_t> keep = run("keep");
+  EXPECT_TRUE(keep.size() == 4);
+  if (keep.size() == 4) {
+    EXPECT_TRUE(keep[0] == 4);
+    EXPECT_TRUE(keep[1] == H && keep[2] == W);
+    // A source with no alpha comes back FULLY OPAQUE, not zero -- a
+    // zero would make the picture invisible everywhere it was used.
+    EXPECT_TRUE(keep[3] == 255);
+  }
+  remove(path.c_str());
+}

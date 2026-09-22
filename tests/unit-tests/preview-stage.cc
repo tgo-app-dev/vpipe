@@ -93,6 +93,22 @@ make_tensor_(int H, int W, float v = 0.5f)
   return tb;
 }
 
+// RGBA, with a uniform alpha. Neither the still PNG nor H.264 carries
+// alpha, so the stage composites it over a checkerboard.
+TensorBeat
+make_tensor_rgba_(int H, int W, float v, float a)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::F32;
+  tb.shape = {4, H, W};
+  tb.resize_contiguous(static_cast<size_t>(4) * H * W);
+  float* p = tb.as_f32();
+  const size_t plane = static_cast<size_t>(H) * W;
+  for (size_t i = 0; i < 3 * plane; ++i) { p[i] = v; }
+  for (size_t i = 0; i < plane; ++i) { p[3 * plane + i] = a; }
+  return tb;
+}
+
 // A video-type frame: carries an fps sideband (as video-to-rgb tags its
 // output). The preview stage treats such a source as video, never image.
 TensorBeat
@@ -467,3 +483,45 @@ TEST(preview_stage, video_plus_audio)
 }
 
 #endif  // __APPLE__ && __arm64__
+
+// ---- RGBA ------------------------------------------------------------
+//
+// An RGBA still reaches the preview. Neither of the two things the
+// stage can send carries alpha -- a PNG still could, but the H.264
+// fragments cannot, and one flattening keeps the two consistent -- so
+// the beat is composited over a checkerboard before either sees it.
+//
+// A four-channel beat used to be dropped by the shape test in
+// process(), which showed up as a preview that stayed black forever
+// while the generation it was watching completed normally.
+TEST(preview_stage, rgba_still_is_accepted_and_flattened)
+{
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  // Half transparent, so the composite has something to do.
+  src_u->tb    = make_tensor_rgba_(240, 320, 0.5f, 0.5f);
+  src_u->count = 1;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 2500);
+  EXPECT_TRUE(c.cfg_video);
+  EXPECT_TRUE(c.init >= 1);
+  // THE FRAME WAS TAKEN. Dropped, the stage would never adopt a
+  // resolution and would still be sending its pre-input black.
+  EXPECT_TRUE(pv->output_width() == 320);
+  EXPECT_TRUE(pv->output_height() == 240);
+  EXPECT_TRUE(c.image >= 1);
+  EXPECT_TRUE(c.last_image.size() > 8);
+  if (c.last_image.size() > 8) {
+    EXPECT_TRUE(c.last_image[0] == 0x89 && c.last_image[1] == 'P'
+                && c.last_image[2] == 'N' && c.last_image[3] == 'G');
+  }
+}

@@ -93,8 +93,11 @@ constexpr ConfigKey kAttrs[] = {
    .def_bool = true},
 };
 const PortSpec kIports[] = {
-  {.name = "frames", .doc = "video RGB TensorBeat [3,H,W] (F32 or U8); the "
-                            "first frame sets the native resolution",
+  {.name = "frames", .doc = "video RGB [3,H,W] or RGBA [4,H,W] TensorBeat "
+                            "(F32 or U8); RGBA is composited over a "
+                            "checkerboard, since neither the still PNG nor "
+                            "H.264 carries alpha. The first frame sets the "
+                            "native resolution",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "audio", .doc = "OPTIONAL audio PCM TensorBeat: F32 rank-1 [n] "
@@ -502,6 +505,65 @@ PreviewStage::adopt_fps_(const TensorBeat& tb)
   }
 }
 
+// RGBA -> RGB24 planar, over the checkerboard every image viewer uses.
+//
+// COMPOSITED RATHER THAN TRUNCATED for the reason save-image gives:
+// under a transparent pixel the stored colour is arbitrary, and on a
+// generated RGBA image it is usually black. And over a CHECKERBOARD
+// rather than a flat colour because this is a preview -- a viewer
+// needs to see that a region is empty, and flat white cannot be told
+// from a white picture.
+//
+// Done once, here, so both consumers below (the still PNG and the
+// H.264 encoder, neither of which carries alpha) see an ordinary
+// 3-plane beat.
+static TensorBeat
+composite_rgba_(const TensorBeat& tb)
+{
+  const int H = static_cast<int>(tb.shape[1]);
+  const int W = static_cast<int>(tb.shape[2]);
+  const size_t plane = static_cast<size_t>(H) * W;
+  TensorBeat out;
+  out.dtype = tb.dtype;
+  out.shape = {3, tb.shape[1], tb.shape[2]};
+  out.sideband = tb.sideband;
+  auto checker = [&](size_t i) {
+    const int x = static_cast<int>(i % static_cast<size_t>(W));
+    const int y = static_cast<int>(i / static_cast<size_t>(W));
+    return ((x / 8) + (y / 8)) % 2 == 0 ? 255.0f : 204.0f;
+  };
+  if (tb.dtype == TensorBeat::DType::U8) {
+    out.resize_contiguous(3 * plane);
+    const auto src = tb.materialize_contiguous();
+    if (src.size() < 4 * plane) { return out; }
+    uint8_t* d = out.bytes_();
+    for (size_t i = 0; i < plane; ++i) {
+      const float a01 = static_cast<float>(src[3 * plane + i]) / 255.0f;
+      const float bg = checker(i);
+      for (int c = 0; c < 3; ++c) {
+        const float v =
+            static_cast<float>(src[c * plane + i]) * a01 + bg * (1.0f - a01);
+        d[c * plane + i] =
+            static_cast<uint8_t>(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
+      }
+    }
+    return out;
+  }
+  // F32 frames are 0..1 here, so the backdrop is scaled to match.
+  out.resize_contiguous(3 * plane * sizeof(float));
+  const auto src = tb.materialize_contiguous_as<float>();
+  if (src.size() < 4 * plane) { return out; }
+  float* d = reinterpret_cast<float*>(out.bytes_());
+  for (size_t i = 0; i < plane; ++i) {
+    const float a01 = src[3 * plane + i];
+    const float bg = checker(i) / 255.0f;
+    for (int c = 0; c < 3; ++c) {
+      d[c * plane + i] = src[c * plane + i] * a01 + bg * (1.0f - a01);
+    }
+  }
+  return out;
+}
+
 void
 PreviewStage::handle_video_frame_(const TensorBeat& tb)
 {
@@ -843,9 +905,16 @@ PreviewStage::process(RuntimeContext& ctx)
       auto beat = co_await ctx.read(0);
       if (!beat) { break; }
       const auto* tb = dynamic_cast<const TensorBeatPayload*>(beat.get());
-      if (tb && tb->shape.size() == 3 && tb->shape[0] == 3) {
+      if (tb && tb->shape.size() == 3
+          && (tb->shape[0] == 3 || tb->shape[0] == 4)) {
         ++_frames_in;
-        handle_video_frame_(*tb);
+        // Neither the still PNG nor H.264 carries alpha, so an RGBA
+        // beat is flattened ONCE here rather than in both.
+        if (tb->shape[0] == 4) {
+          handle_video_frame_(composite_rgba_(*tb));
+        } else {
+          handle_video_frame_(*tb);
+        }
         got_frame = true;
       }
     }

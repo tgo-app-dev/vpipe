@@ -848,10 +848,12 @@ build_resample_(int srcN, int dstN)
 // `scale`/`offset` map a RAW sample to the VAE's [-1, 1]: the caller
 // works them out from the beat's dtype AND its declared range, because
 // the dtype alone does not say. See kInputRangeDoc.
+// `C` is the source AND destination channel count: 3 for RGB, 4 for an
+// RGBA beat feeding an RGBA VAE. `pad` carries C entries.
 std::vector<float> normalize_and_fit_(const std::uint8_t* src, bool is_u8,
-                                      float vscale, float voffset, int sH,
-                                      int sW, int outH, int outW,
-                                      const float pad[3]);
+                                      float vscale, float voffset, int C,
+                                      int sH, int sW, int outH, int outW,
+                                      const float* pad);
 
 // The same over a STACKED CLIP: a `[frames, 3, sH, sW]` beat -- what
 // `temporal-stack` emits -- becomes f32 `[3][frames][outH][outW]`, the
@@ -874,7 +876,7 @@ normalize_clip_(const std::uint8_t* src, bool is_u8, float vscale,
   for (int f = 0; f < frames; ++f) {
     const std::vector<float> one =
         normalize_and_fit_(src + (std::size_t)f * in_bytes, is_u8, vscale,
-                           voffset, sH, sW, outH, outW, pad);
+                           voffset, 3, sH, sW, outH, outW, pad);
     for (int c = 0; c < 3; ++c) {
       std::memcpy(out.data() + ((std::size_t)c * frames + f) * px,
                   one.data() + (std::size_t)c * px, px * sizeof(float));
@@ -885,8 +887,8 @@ normalize_clip_(const std::uint8_t* src, bool is_u8, float vscale,
 
 std::vector<float>
 normalize_and_fit_(const std::uint8_t* src, bool is_u8, float vscale,
-                   float voffset, int sH, int sW, int outH, int outW,
-                   const float pad[3])
+                   float voffset, int C, int sH, int sW, int outH, int outW,
+                   const float* pad)
 {
   auto src_val = [&](int c, int y, int x) -> float {
     const std::size_t idx = ((std::size_t)c * sH + y) * sW + x;
@@ -894,9 +896,9 @@ normalize_and_fit_(const std::uint8_t* src, bool is_u8, float vscale,
                             : reinterpret_cast<const float*>(src)[idx];
     return raw * vscale + voffset;
   };
-  std::vector<float> out((std::size_t)3 * outH * outW);
+  std::vector<float> out((std::size_t)C * outH * outW);
   if (sH == outH && sW == outW) {
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < C; ++c) {
       for (int y = 0; y < outH; ++y) {
         for (int x = 0; x < outW; ++x) {
           out[((std::size_t)c * outH + y) * outW + x] = src_val(c, y, x);
@@ -912,33 +914,59 @@ normalize_and_fit_(const std::uint8_t* src, bool is_u8, float vscale,
   const int newH = std::max(1, (int)std::lround(sH * scale));
   const int offX = (outW - newW) / 2;
   const int offY = (outH - newH) / 2;
-  for (int c = 0; c < 3; ++c) {
+  for (int c = 0; c < C; ++c) {
     const std::size_t base = (std::size_t)c * outH * outW;
     for (std::size_t i = 0; i < (std::size_t)outH * outW; ++i) {
       out[base + i] = pad[c];
     }
   }
+  // RGBA IS RESAMPLED PREMULTIPLIED. Averaging colour and alpha
+  // independently pulls the colour of fully transparent pixels into
+  // the edge -- a dark halo around everything on an image whose
+  // transparent region is black, which is what a generated RGBA
+  // picture usually has. Premultiply, resample, and divide back out.
+  std::vector<float> pm;
+  if (C == 4) {
+    pm.resize((std::size_t)4 * sH * sW);
+    const std::size_t hw = (std::size_t)sH * sW;
+    for (int y = 0; y < sH; ++y) {
+      for (int x = 0; x < sW; ++x) {
+        const std::size_t i = (std::size_t)y * sW + x;
+        const float a01 = (src_val(3, y, x) + 1.0f) * 0.5f;
+        for (int c = 0; c < 3; ++c) {
+          pm[(std::size_t)c * hw + i] = src_val(c, y, x) * a01;
+        }
+        pm[(std::size_t)3 * hw + i] = src_val(3, y, x);
+      }
+    }
+  }
+  auto tap = [&](int c, int y, int x) -> float {
+    if (C == 4) {
+      return pm[((std::size_t)c * sH + y) * sW + x];
+    }
+    return src_val(c, y, x);
+  };
   // Separable anti-aliased resample: horizontal (sW -> newW) into a scratch,
   // then vertical (sH -> newH) into the centered output window. The triangle
   // filter's footprint = the downscale ratio, so shrinking a high-res photo no
   // longer aliases fine detail (pleats, hair); an upscale stays 2-tap bilinear.
   const std::vector<AxisContrib> cx = build_resample_(sW, newW);
   const std::vector<AxisContrib> cy = build_resample_(sH, newH);
-  std::vector<float> tmp((std::size_t)3 * sH * newW);
-  for (int c = 0; c < 3; ++c) {
+  std::vector<float> tmp((std::size_t)C * sH * newW);
+  for (int c = 0; c < C; ++c) {
     for (int y = 0; y < sH; ++y) {
       for (int ox = 0; ox < newW; ++ox) {
         const AxisContrib& e = cx[(std::size_t)ox];
         float acc = 0.0f;
         for (std::size_t k = 0; k < e.w.size(); ++k) {
           const int sx = std::min(std::max(e.i0 + (int)k, 0), sW - 1);
-          acc += e.w[k] * src_val(c, y, sx);
+          acc += e.w[k] * tap(c, y, sx);
         }
         tmp[((std::size_t)c * sH + y) * newW + ox] = acc;
       }
     }
   }
-  for (int c = 0; c < 3; ++c) {
+  for (int c = 0; c < C; ++c) {
     for (int oy = 0; oy < newH; ++oy) {
       const AxisContrib& e = cy[(std::size_t)oy];
       for (int ox = 0; ox < newW; ++ox) {
@@ -951,7 +979,54 @@ normalize_and_fit_(const std::uint8_t* src, bool is_u8, float vscale,
       }
     }
   }
+  // ...and back out of premultiplied, over the window that was written.
+  if (C == 4) {
+    const std::size_t hw = (std::size_t)outH * outW;
+    for (int oy = 0; oy < newH; ++oy) {
+      for (int ox = 0; ox < newW; ++ox) {
+        const std::size_t i =
+            (std::size_t)(offY + oy) * outW + (offX + ox);
+        const float a01 = (out[3 * hw + i] + 1.0f) * 0.5f;
+        if (a01 <= 1e-6f) { continue; }   // nothing to recover
+        for (int c = 0; c < 3; ++c) { out[(std::size_t)c * hw + i] /= a01; }
+      }
+    }
+  }
   return out;
+}
+
+// Adapt a normalized [-1,1] planar picture between RGB and RGBA.
+//
+// Both directions are a real request. A 3-channel beat feeding an RGBA
+// VAE gets a FULLY OPAQUE alpha (+1 in this range), which is what an
+// ordinary photo means. A 4-channel beat feeding an RGB VAE is
+// COMPOSITED OVER WHITE rather than truncated, for the same reason
+// save-image composites: truncating keeps whatever colour sits under a
+// transparent pixel, and on a generated RGBA image that is usually
+// black, so the encoder would see a dark halo the picture does not
+// have.
+std::vector<float>
+fit_channels_(std::vector<float> in, int srcC, int dstC, int H, int W)
+{
+  if (srcC == dstC) { return in; }
+  const std::size_t hw = (std::size_t)H * W;
+  if (srcC == 3 && dstC == 4) {
+    in.resize(4 * hw, 1.0f);          // alpha +1 == fully opaque
+    return in;
+  }
+  if (srcC == 4 && dstC == 3) {
+    for (std::size_t i = 0; i < hw; ++i) {
+      const float a01 = (in[3 * hw + i] + 1.0f) * 0.5f;
+      for (int c = 0; c < 3; ++c) {
+        // white is +1 in [-1,1]
+        in[(std::size_t)c * hw + i] =
+            in[(std::size_t)c * hw + i] * a01 + (1.0f - a01);
+      }
+    }
+    in.resize(3 * hw);
+    return in;
+  }
+  return in;
 }
 
 }  // namespace
@@ -989,14 +1064,17 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   const bool stacked =
       tbp != nullptr && tbp->shape.size() == 4 && tbp->shape[1] == 3;
   const int in_frames = stacked ? (int)tbp->shape[0] : 1;
+  // RGBA IS A PICTURE TOO. Qwen-Image-2.1's VAE takes four channels,
+  // and load-image emits them under `alpha: keep`.
   const bool single = tbp != nullptr && tbp->shape.size() == 3
-                      && tbp->shape[0] == 3;
+                      && (tbp->shape[0] == 3 || tbp->shape[0] == 4);
   if (tbp == nullptr || (!stacked && !single) || in_frames <= 0 ||
       (tbp->dtype != TensorBeat::DType::U8 &&
        tbp->dtype != TensorBeat::DType::F32)) {
     session()->warn(fmt(
-        "VaeEncodeStage('{}'): expected a U8/f32 RGB [3,H,W] picture or a "
-        "[frames,3,H,W] clip (what temporal-stack emits), got {}; skipping",
+        "VaeEncodeStage('{}'): expected a U8/f32 RGB [3,H,W] or RGBA "
+        "[4,H,W] picture, or a [frames,3,H,W] clip (what temporal-stack "
+        "emits), got {}; skipping",
         this->id(), in->describe()));
     co_return;
   }
@@ -1042,7 +1120,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         stacked ? normalize_clip_(img.data(), is_u8, in_scale, in_off,
                                   in_frames, sH, sW, H, W, pad)
                 : normalize_and_fit_(img.data(), is_u8, in_scale, in_off,
-                                     sH, sW, H, W, pad);
+                                     3, sH, sW, H, W, pad);
 
     genai::VaeEncodeRequest req;
     req.accel = &_accel;
@@ -1146,8 +1224,8 @@ VaeEncodeStage::process(RuntimeContext& ctx)
       (float)_pad_b / 255.0f * 2.0f - 1.0f,
     };
     const std::vector<float> norm =
-        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, sH, sW, H,
-                           W, pad);
+        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, 3, sH, sW,
+                           H, W, pad);
     const std::size_t n = (std::size_t)3 * H * W;
     metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
     if (imgbuf.empty()) { co_return; }
@@ -1229,8 +1307,8 @@ VaeEncodeStage::process(RuntimeContext& ctx)
       (float)_pad_b / 255.0f * 2.0f - 1.0f,
     };
     const std::vector<float> norm =
-        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, sH, sW, H,
-                           W, pad);
+        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, 3, sH, sW,
+                           H, W, pad);
     const std::size_t n = (std::size_t)3 * H * W;
     metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
     if (imgbuf.empty()) { co_return; }
@@ -1316,7 +1394,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     const std::vector<float> norm =
         stacked ? normalize_clip_(img.data(), u8, in_scale, in_off, in_frames,
                                   sH, sW, H, W, pad)
-                : normalize_and_fit_(img.data(), u8, in_scale, in_off, sH,
+                : normalize_and_fit_(img.data(), u8, in_scale, in_off, 3, sH,
                                      sW, H, W, pad);
     const std::size_t plane = (std::size_t)H * W;
     metal_compute::SharedBuffer frame =
@@ -1460,7 +1538,7 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     const std::vector<float> norm =
         stacked ? normalize_clip_(img.data(), u8, in_scale, in_off, in_frames,
                                   sH, sW, H, W, pad)
-                : normalize_and_fit_(img.data(), u8, in_scale, in_off, sH,
+                : normalize_and_fit_(img.data(), u8, in_scale, in_off, 3, sH,
                                      sW, H, W, pad);
     // [3, F, H, W] channel-first: the frames that ARRIVED, then the ZERO
     // of the [-1, 1] range (mid grey) for the rest -- which is what the
@@ -1579,16 +1657,33 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   // 0..255 -> [-1,1]; f32 is assumed already in [-1,1].
   const auto img = tbp->materialize_contiguous();
   const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
-  const float pad[3] = {
+  // WHAT ARRIVED and WHAT THE VAE TAKES are separate questions, and on
+  // this family they differ: Qwen-Image-2.1's VAE is RGBA in and out.
+  // Resample at the BEAT's channel count -- so an alpha that is there
+  // is resampled premultiplied -- then adapt to the VAE's.
+  const int beat_c = (int)tbp->shape[0];
+  const int vae_c = _vae->config().in_channels;
+  // The letterbox fill. Alpha pads TRANSPARENT: a border invented to
+  // make an aspect fit is not part of the picture, and saying it is
+  // opaque white would put a frame around every reference image.
+  const float pad[4] = {
     (float)_pad_r / 255.0f * 2.0f - 1.0f,
     (float)_pad_g / 255.0f * 2.0f - 1.0f,
     (float)_pad_b / 255.0f * 2.0f - 1.0f,
+    -1.0f,
   };
-  const std::vector<float> norm =
-      normalize_and_fit_(img.data(), is_u8, in_scale, in_off, sH, sW, H, W,
-                         pad);
+  const std::vector<float> norm = fit_channels_(
+      normalize_and_fit_(img.data(), is_u8, in_scale, in_off, beat_c, sH,
+                         sW, H, W, pad),
+      beat_c, vae_c, H, W);
+  if ((int)norm.size() != vae_c * H * W) {
+    session()->warn(fmt(
+        "VaeEncodeStage('{}'): a {}-channel picture cannot feed a "
+        "{}-channel VAE; skipping", this->id(), beat_c, vae_c));
+    co_return;
+  }
 
-  const std::size_t n = (std::size_t)3 * H * W;
+  const std::size_t n = (std::size_t)vae_c * H * W;
   metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
   if (imgbuf.empty()) {
     session()->warn(fmt(

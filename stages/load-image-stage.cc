@@ -108,6 +108,7 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
   // Validation is deferred to launch (see Stage::fail_config): the
   // stage must construct for any config so a graph can be built/edited
   // before a url is supplied.
+  _keep_alpha = attr_str("alpha") == "keep";
   const FlexData& cfg = this->config();
   if (cfg.is_object()) {
     auto root = cfg.as_object();
@@ -158,10 +159,23 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
 }
 
 namespace {
+constexpr SpecExtra kAlphaChoices[] = {
+  {"choices", "drop,keep"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "url", .type = ConfigType::Any, .required = true,
    .doc = "image path/URL string or array of strings",
    .is_path = true, .path_filter = "image"},
+  {.key = "alpha", .type = ConfigType::String, .required = false,
+   .doc = "drop | keep. `keep` emits FOUR channels [4,H,W] RGBA -- what "
+          "an RGBA VAE (Qwen-Image-2.1) encodes and what save-image "
+          "writes to PNG. A source with no alpha then gets a fully "
+          "opaque one, so the shape is the graph's choice and not the "
+          "file's. Unset => drop, which is [3,H,W] and what every other "
+          "consumer here reads; a transparent PNG loaded that way keeps "
+          "whatever colour sits under its transparent pixels rather "
+          "than being composited",
+   .def_str = "drop", .extra = kAlphaChoices},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional pacing beat (e.g. chrono); each "
@@ -169,8 +183,9 @@ const PortSpec kIports[] = {
    .type = nullptr, .clock_group = 0},
 };
 const PortSpec kOports[] = {
-  {.name = "image", .doc = "decoded image as planar U8 RGB TensorBeat "
-                           "[3,H,W]",
+  {.name = "image", .doc = "decoded image as a planar U8 TensorBeat -- "
+                           "RGB [3,H,W], or RGBA [4,H,W] when the "
+                           "`alpha` config says keep",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "metadata", .doc = "FlexData {url, width, height, exif{...}, "
@@ -360,12 +375,21 @@ LoadImageStage::decode_url_(const string& url) const
     return nullptr;
   }
 
-  // Single sws_scale: arbitrary source pix_fmt → planar gbrp. The
-  // bilinear kernel is plenty for stills; chroma fidelity matters
-  // less than for video.
+  // Single sws_scale: arbitrary source pix_fmt → planar gbrp, or
+  // gbrap when the graph asked to keep alpha. The bilinear kernel is
+  // plenty for stills; chroma fidelity matters less than for video.
+  //
+  // NO ALPHA DETECTION, deliberately: swscale fills an opaque alpha
+  // plane when the source has none, so `keep` is a statement about the
+  // BEAT's shape rather than about the file's. A graph that asks for
+  // four channels gets four whatever it is handed, which is the only
+  // version of this whose output shape a downstream stage can rely on.
+  const int CH = _keep_alpha ? 4 : 3;
+  const AVPixelFormat planar =
+      _keep_alpha ? AV_PIX_FMT_GBRAP : AV_PIX_FMT_GBRP;
   SwsPtr sws(_libs->swscale().api.get_context(
                 W, H, static_cast<AVPixelFormat>(frame->format),
-                W, H, AV_PIX_FMT_GBRP,
+                W, H, planar,
                 SWS_BILINEAR, nullptr, nullptr, nullptr),
              SwsDeleter{_libs});
   if (!sws) {
@@ -383,7 +407,7 @@ LoadImageStage::decode_url_(const string& url) const
         this->id()));
     return nullptr;
   }
-  gbrp->format = AV_PIX_FMT_GBRP;
+  gbrp->format = planar;
   gbrp->width  = W;
   gbrp->height = H;
   rc = _libs->avutil().api.frame_get_buffer(gbrp.get(), 32);
@@ -403,30 +427,28 @@ LoadImageStage::decode_url_(const string& url) const
   // distinct values; round up to the wider so all three planes copy
   // through the same row stride.
   int P = gbrp->linesize[0];
-  if (gbrp->linesize[1] > P) {
-    P = gbrp->linesize[1];
-  }
-  if (gbrp->linesize[2] > P) {
-    P = gbrp->linesize[2];
+  for (int i = 1; i < CH; ++i) {
+    if (gbrp->linesize[i] > P) { P = gbrp->linesize[i]; }
   }
 
   auto out = make_unique<TensorBeatPayload>();
   out->dtype = TensorBeat::DType::U8;
-  out->shape = {3, H, W};
+  out->shape = {CH, H, W};
   const size_t row_stride =
       (P == W) ? static_cast<size_t>(W) : static_cast<size_t>(P);
   if (P == W) {
-    out->data.assign(static_cast<size_t>(3) * H * W, 0);
+    out->data.assign(static_cast<size_t>(CH) * H * W, 0);
   } else {
     out->strides = {static_cast<int64_t>(H) * P, P, 1};
-    out->data.assign(static_cast<size_t>(3) * H * P, 0);
+    out->data.assign(static_cast<size_t>(CH) * H * P, 0);
   }
 
-  // GBRP plane indices: 0=G, 1=B, 2=R. TensorBeat wants channels
-  // ordered R, G, B (matches the rest of the apple-silicon pipeline).
-  const int src_plane_for_channel[3] = {2, 0, 1};
+  // GBRP plane indices: 0=G, 1=B, 2=R -- and GBRAP appends A as plane
+  // 3. TensorBeat wants channels ordered R, G, B(, A), which matches
+  // the rest of the apple-silicon pipeline.
+  const int src_plane_for_channel[4] = {2, 0, 1, 3};
   uint8_t* dst_base = out->as_u8();
-  for (int c = 0; c < 3; ++c) {
+  for (int c = 0; c < CH; ++c) {
     const int      sp        = src_plane_for_channel[c];
     const uint8_t* src       = gbrp->data[sp];
     const int      src_pitch = gbrp->linesize[sp];

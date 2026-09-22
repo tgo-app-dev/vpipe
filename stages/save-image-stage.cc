@@ -85,20 +85,26 @@ using SwsPtr = unique_ptr<SwsContext, SwsDeleter>;
 // One supported output format: its config key, the FFmpeg encoder name,
 // whether it is lossy (quality-controlled), and the preferred encode
 // pixel format (validated against the encoder's list at open time).
+// `alpha_pix_fmt` is what this format encodes an RGBA beat as, or
+// AV_PIX_FMT_NONE when it carries no alpha at all -- in which case the
+// beat is composited over white rather than silently losing its
+// transparency to a truncation.
 struct FormatDef {
   const char*   key;
   const char*   encoder;
   bool          lossy;
   AVPixelFormat pref_pix_fmt;
+  AVPixelFormat alpha_pix_fmt;
 };
 const FormatDef kFormats[] = {
-  {"png",  "png",   false, AV_PIX_FMT_RGB24},
-  {"jpeg", "mjpeg", true,  AV_PIX_FMT_YUVJ444P},
-  {"jpg",  "mjpeg", true,  AV_PIX_FMT_YUVJ444P},
-  {"webp", "webp",  true,  AV_PIX_FMT_YUV420P},
-  {"bmp",  "bmp",   false, AV_PIX_FMT_BGR24},
-  {"tiff", "tiff",  false, AV_PIX_FMT_RGB24},
-  {"tif",  "tiff",  false, AV_PIX_FMT_RGB24},
+  {"png",  "png",   false, AV_PIX_FMT_RGB24,    AV_PIX_FMT_RGBA},
+  // JPEG has no alpha channel in any profile.
+  {"jpeg", "mjpeg", true,  AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_NONE},
+  {"jpg",  "mjpeg", true,  AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_NONE},
+  {"webp", "webp",  true,  AV_PIX_FMT_YUV420P,  AV_PIX_FMT_BGRA},
+  {"bmp",  "bmp",   false, AV_PIX_FMT_BGR24,    AV_PIX_FMT_BGRA},
+  {"tiff", "tiff",  false, AV_PIX_FMT_RGB24,    AV_PIX_FMT_RGBA},
+  {"tif",  "tiff",  false, AV_PIX_FMT_RGB24,    AV_PIX_FMT_RGBA},
 };
 
 const FormatDef*
@@ -218,7 +224,8 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "webp lossless mode (default false)"},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "planar U8 RGB TensorBeat [3,H,W] (load-image / "
+  {.name = "image", .doc = "planar U8 RGB [3,H,W] or RGBA [4,H,W] "
+          "TensorBeat (load-image / "
                            "vae-decode format)",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
@@ -287,12 +294,15 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
 {
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(&beat);
   if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
-      tbp->shape.size() != 3 || tbp->shape[0] != 3) {
+      tbp->shape.size() != 3 ||
+      (tbp->shape[0] != 3 && tbp->shape[0] != 4)) {
     session()->warn(fmt(
-        "SaveImageStage('{}'): expected a U8 [3,H,W] RGB TensorBeat, got "
-        "{}; dropping beat", this->id(), beat.describe()));
+        "SaveImageStage('{}'): expected a U8 [3,H,W] RGB or [4,H,W] RGBA "
+        "TensorBeat, got {}; dropping beat", this->id(),
+        beat.describe()));
     return false;
   }
+  const int CH = (int)tbp->shape[0];
   const int H = (int)tbp->shape[1];
   const int W = (int)tbp->shape[2];
   if (H <= 0 || W <= 0) {
@@ -319,6 +329,18 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
   // format -- chroma-subsampled YUV would not round-trip -- so promote it.
   AVPixelFormat pix = fd->pref_pix_fmt;
   if (_format == "webp" && _lossless) { pix = AV_PIX_FMT_BGRA; }
+  // AN RGBA BEAT KEEPS ITS ALPHA where the format has one, and is
+  // COMPOSITED OVER WHITE where it does not. Truncating instead would
+  // write the model's raw colour under a transparent pixel, which for
+  // a generated RGBA image is usually black fringing around everything
+  // -- the failure looks like a bad model rather than a lost channel.
+  const bool want_alpha = CH == 4 && fd->alpha_pix_fmt != AV_PIX_FMT_NONE;
+  if (want_alpha) { pix = fd->alpha_pix_fmt; }
+  if (CH == 4 && !want_alpha) {
+    session()->log_normal(fmt(
+        "SaveImageStage('{}'): '{}' carries no alpha channel, so the "
+        "image is composited over white", this->id(), _format));
+  }
 
   AVCodecContext* raw_cctx = _libs->avcodec().api.alloc_context3(codec);
   if (raw_cctx == nullptr) {
@@ -383,11 +405,41 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
   const uint8_t* plane_r = base + 0 * plane_stride;
   const uint8_t* plane_g = base + 1 * plane_stride;
   const uint8_t* plane_b = base + 2 * plane_stride;
-  const uint8_t* src_data[4]   = {plane_g, plane_b, plane_r, nullptr};
-  int            src_pitch[4]  = {row_pitch, row_pitch, row_pitch, 0};
+  const uint8_t* plane_a =
+      CH == 4 ? base + 3 * plane_stride : nullptr;
+  // COMPOSITE OVER WHITE into a scratch when the format has no alpha:
+  // out = a*rgb + (1-a)*255, which is what every viewer does to show a
+  // transparent PNG and what the reference pipeline does to flatten
+  // one. Planar, so the three planes are independent.
+  std::vector<uint8_t> flat;
+  if (CH == 4 && !want_alpha) {
+    flat.resize((std::size_t)3 * H * row_pitch);
+    const uint8_t* srcp[3] = {plane_r, plane_g, plane_b};
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        const uint8_t* sp = srcp[c] + (std::size_t)y * row_pitch;
+        const uint8_t* ap = plane_a + (std::size_t)y * row_pitch;
+        uint8_t* dp =
+            flat.data() + ((std::size_t)c * H + y) * row_pitch;
+        for (int x = 0; x < W; ++x) {
+          const int a = ap[x];
+          dp[x] = (uint8_t)((sp[x] * a + 255 * (255 - a) + 127) / 255);
+        }
+      }
+    }
+    plane_r = flat.data() + (std::size_t)0 * H * row_pitch;
+    plane_g = flat.data() + (std::size_t)1 * H * row_pitch;
+    plane_b = flat.data() + (std::size_t)2 * H * row_pitch;
+  }
+  // GBRP plane order is G, B, R -- and GBRAP appends A as plane 3.
+  const uint8_t* src_data[4]   = {plane_g, plane_b, plane_r,
+                                  want_alpha ? plane_a : nullptr};
+  int            src_pitch[4]  = {row_pitch, row_pitch, row_pitch,
+                                  want_alpha ? row_pitch : 0};
 
   SwsPtr sws(_libs->swscale().api.get_context(
-                 W, H, AV_PIX_FMT_GBRP, W, H, pix,
+                 W, H, want_alpha ? AV_PIX_FMT_GBRAP : AV_PIX_FMT_GBRP,
+                 W, H, pix,
                  SWS_BILINEAR, nullptr, nullptr, nullptr),
              SwsDeleter{_libs});
   if (!sws) {

@@ -118,10 +118,13 @@ const PortSpec kIports[] = {
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
-  {.name = "ref_image", .doc = "OPTIONAL raw reference image (planar U8 RGB "
-                               "TensorBeat [3,H,W], load-image format). Image-"
-                               "aware families (Qwen-Image-Edit) run it through "
-                               "the Qwen2.5-VL vision tower; others ignore it.",
+  {.name = "ref_image", .doc = "OPTIONAL raw reference image, load-image "
+                               "format: planar U8 RGB [3,H,W], or RGBA "
+                               "[4,H,W] which is composited over white for "
+                               "the vision tower (the VAE encoder alongside "
+                               "keeps the alpha). Image-aware families "
+                               "(Qwen-Image-Edit) run it through the "
+                               "Qwen2.5-VL vision tower; others ignore it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_image2", .doc = "OPTIONAL SECOND reference image (same format). "
                                 "Qwen-Image-Edit-2511 is multi-reference and "
@@ -3389,11 +3392,41 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
                         : nullptr;
     if (tb != nullptr && tb->dtype == TensorBeat::DType::U8 &&
-        tb->shape.size() == 3 && tb->shape[0] == 3) {
+        tb->shape.size() == 3 &&
+        (tb->shape[0] == 3 || tb->shape[0] == 4)) {
       const auto bytes = tb->materialize_contiguous();
-      _ref_rgb[i].assign(bytes.begin(), bytes.end());
-      _ref_rgb_h[i] = (int)tb->shape[1];
-      _ref_rgb_w[i] = (int)tb->shape[2];
+      const int rh = (int)tb->shape[1], rw = (int)tb->shape[2];
+      if (tb->shape[0] == 4) {
+        // THE VISION TOWER TAKES RGB, so an RGBA reference is
+        // COMPOSITED OVER WHITE here -- and only here. The VAE
+        // encoder alongside reads the same file at four channels,
+        // which is the split Qwen-Image-2.1 needs: the tower sees a
+        // picture, the latent keeps the transparency.
+        //
+        // Over white rather than truncated for the reason save-image
+        // composites: under a transparent pixel the stored colour is
+        // arbitrary, and on a generated RGBA image it is usually
+        // black, so a truncation would show the tower a dark halo
+        // that is not in the picture.
+        const std::size_t hw = (std::size_t)rh * rw;
+        std::vector<std::uint8_t> flat(3 * hw);
+        for (std::size_t px = 0; px < hw; ++px) {
+          const int a = bytes[3 * hw + px];
+          for (int c = 0; c < 3; ++c) {
+            flat[(std::size_t)c * hw + px] = (std::uint8_t)(
+                (bytes[(std::size_t)c * hw + px] * a + 255 * (255 - a) +
+                 127) / 255);
+          }
+        }
+        _ref_rgb[i] = std::move(flat);
+        session()->log_debug(fmt(
+            "DiffusionConditionerStage('{}'): reference {} arrived RGBA; "
+            "composited over white for the vision tower", this->id(), i));
+      } else {
+        _ref_rgb[i].assign(bytes.begin(), bytes.end());
+      }
+      _ref_rgb_h[i] = rh;
+      _ref_rgb_w[i] = rw;
     }
   }
   {

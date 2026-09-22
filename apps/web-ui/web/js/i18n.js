@@ -5741,6 +5741,58 @@ const STRINGS = {
   'port.image-levels.out.image': ['',
       '形状与 dtype 均不变，仅影调经过调整',
       '形狀與 dtype 均不變，僅影調經過調整'],
+
+  'stage.alpha-mix.name': ['', '透明度混合', '透明度混合'],
+  'stage.alpha-mix.doc': ['',
+      '把 front 叠加在 back 之上（Porter-Duff over），并可选地用一张遮罩'
+      + '作用于前景的 alpha。两路输入各自可以是 RGB 或 RGBA；结果可以保留'
+      + ' alpha 输出为 RGBA，也可以压平到某个背景色输出为 RGB。alpha 端口'
+      + '直接接收 create-mask 的输出。',
+      '把 front 疊加在 back 之上（Porter-Duff over），並可選地用一張遮罩'
+      + '作用於前景的 alpha。兩路輸入各自可以是 RGB 或 RGBA；結果可以保留'
+      + ' alpha 輸出為 RGBA，也可以壓平到某個背景色輸出為 RGB。alpha 連接'
+      + '埠可直接接收 create-mask 的輸出。'],
+  'cfg.alpha-mix.output': ['',
+      'rgb | rgba。rgba 保留合成结果自身的 alpha；rgb 则在之后把它压平到 '
+      + 'background 上。不设置时为 rgb——合成通常是**收尾**一张图的那一步，'
+      + '而 [3,H,W] 正是下游各级读取的形状',
+      'rgb | rgba。rgba 保留合成結果自身的 alpha；rgb 則在之後把它壓平到 '
+      + 'background 上。不設定時為 rgb——合成通常是**收尾**一張圖的那一步，'
+      + '而 [3,H,W] 正是下游各級讀取的形狀'],
+  'cfg.alpha-mix.background': ['',
+      '#RRGGBB，在合成结果仍然透明之处显示。仅当 output 为 rgb 时才读取——'
+      + 'rgba 是保留透明而不是填充它。不设置时为 #FFFFFF，与 save-image 及'
+      + '扩散条件器所压平到的颜色一致，同一张图便不会因为由哪一级压平而'
+      + '变色',
+      '#RRGGBB，在合成結果仍然透明之處顯示。僅當 output 為 rgb 時才讀取——'
+      + 'rgba 是保留透明而不是填充它。不設定時為 #FFFFFF，與 save-image 及'
+      + '擴散條件器所壓平到的顏色一致，同一張圖便不會因為由哪一級壓平而'
+      + '變色'],
+  'cfg.alpha-mix.input_normalized': ['',
+      'f32 输入是 [0,1] 还是 [0,255]。u8 没有歧义，会忽略此项。**它不作用'
+      + '于遮罩**：f32 遮罩始终是 [0,1] 的覆盖度',
+      'f32 輸入是 [0,1] 還是 [0,255]。u8 沒有歧義，會忽略此項。**它不作用'
+      + '於遮罩**：f32 遮罩始終是 [0,1] 的覆蓋度'],
+  'port.alpha-mix.in.front': ['',
+      '叠加在**上层**的图像：平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat'
+      + '（f32 或 u8）。三通道即表示不透明',
+      '疊加在**上層**的影像：平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat'
+      + '（f32 或 u8）。三通道即表示不透明'],
+  'port.alpha-mix.in.back': ['',
+      '叠加在**下层**的图像：格式相同，尺寸须与 front 一致',
+      '疊加在**下層**的影像：格式相同，尺寸須與 front 一致'],
+  'port.alpha-mix.in.alpha': ['',
+      '可选遮罩，即 create-mask 自身的输出格式——[1,H,W] 或 [H,W]，u8 '
+      + '0..255 或 f32 [0,1] 覆盖度，尺寸与两图一致。它与 front 的 alpha '
+      + '**相乘**：对 RGB 前景它就等于 alpha，对 RGBA 前景则是在不丢弃其'
+      + '原有透明度的前提下限制其显示范围',
+      '可選遮罩，即 create-mask 自身的輸出格式——[1,H,W] 或 [H,W]，u8 '
+      + '0..255 或 f32 [0,1] 覆蓋度，尺寸與兩圖一致。它與 front 的 alpha '
+      + '**相乘**：對 RGB 前景它就等於 alpha，對 RGBA 前景則是在不丟棄其'
+      + '原有透明度的前提下限制其顯示範圍'],
+  'port.alpha-mix.out.image': ['',
+      '合成结果：依 output 为平面 [3,H,W] 或 [4,H,W]，dtype 跟随 front',
+      '合成結果：依 output 為平面 [3,H,W] 或 [4,H,W]，dtype 跟隨 front'],
   'stage.image-resample.doc': ['',
       '把 rgb-frames 重采样到固定的宽 x 高，宽高比的处理方式（填充 / 裁剪 /'
       + ' 拉伸 / 手动）与填充色均可配置。默认使用 Lanczos-3 重采样；也可选'
@@ -5901,12 +5953,15 @@ const STRINGS = {
   // ---- RGB to Video (visual) ----
   'stage.rgb-to-video.name': ['', 'RGB → 视频', 'RGB → 視訊'],
   'stage.rgb-to-video.doc': ['',
-      '把平面 U8 RGB 图像节拍适配成 save-video 编码器所读取的 '
+      '把平面 U8 RGB 或 RGBA 图像节拍适配成 save-video 编码器所读取的 '
       + 'VideoStreamParams + FrameRef 流。生成式图像格式与 ffmpeg 之间的接'
-      + '缝。',
-      '把平面 U8 RGB 影像節拍轉接成 save-video 編碼器所讀取的 '
+      + '缝。由于 yuv420p 与 rgb24 都不承载 alpha，RGBA 帧会被压平到白色；'
+      + '若要合成到别的底色或另一段素材上，请在本级之前接一个 alpha-mix。',
+      '把平面 U8 RGB 或 RGBA 影像節拍轉接成 save-video 編碼器所讀取的 '
       + 'VideoStreamParams + FrameRef 串流。生成式影像格式與 ffmpeg 之間的'
-      + '接縫。'],
+      + '接縫。由於 yuv420p 與 rgb24 都不承載 alpha，RGBA 影格會被壓平到白'
+      + '色；若要合成到別的底色或另一段素材上，請在本級之前接一個 '
+      + 'alpha-mix。'],
   'cfg.rgb-to-video.fps': ['',
       '当生产者的边带未携带帧率时，声明使用的帧率。16 是 Wan 视频的默认值',
       '當生產者的邊帶未攜帶影格率時，宣告使用的影格率。16 是 Wan 影片的預設'
@@ -5917,8 +5972,12 @@ const STRINGS = {
       '發出影格的像素格式："yuv420p"（H.264 所需）或 "rgb24"（不做轉換，供'
       + '無失真編碼器使用）'],
   'port.rgb-to-video.image': ['',
-      '平面 U8 RGB TensorBeat [3, H, W]，按呈现顺序每帧一个',
-      '平面 U8 RGB TensorBeat [3, H, W]，按呈現順序每格一個'],
+      '平面 U8 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈现顺序每帧'
+      + '一个。这里没有哪种视频像素格式承载 alpha，所以第四个平面会被压平'
+      + '到白色',
+      '平面 U8 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈現順序每格'
+      + '一個。這裡沒有哪種視訊像素格式承載 alpha，所以第四個平面會被壓平'
+      + '到白色'],
   'port.rgb-to-video.video': ['',
       '先一个 VideoStreamParams 头，然后每帧一个 FrameRef——即 save-video 读'
       + '取的约定',

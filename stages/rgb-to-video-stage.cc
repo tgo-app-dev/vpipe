@@ -49,8 +49,11 @@ const ConfigKey kAttrs[] = {
    .def_str = "limited"},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "planar U8 RGB TensorBeat [3, H, W], one per frame "
-                           "in presentation order",
+  {.name = "image", .doc = "planar U8 RGB [3, H, W] or RGBA [4, H, W] "
+                           "TensorBeat, one per frame in presentation "
+                           "order. No video pixel format here carries "
+                           "alpha, so a fourth plane is composited over "
+                           "white",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
@@ -62,9 +65,12 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "rgb-to-video",
-  .doc       = "Adapts planar U8 RGB image beats into the VideoStreamParams + "
-               "FrameRef stream a save-video encoder reads. The seam between "
-               "the generative image format and ffmpeg.",
+  .doc       = "Adapts planar U8 RGB or RGBA image beats into the "
+               "VideoStreamParams + FrameRef stream a save-video encoder "
+               "reads. The seam between the generative image format and "
+               "ffmpeg. An RGBA frame is flattened onto white, since "
+               "neither yuv420p nor rgb24 carries alpha; put an alpha-mix "
+               "ahead of this stage to composite over anything else.",
   .display_name = "RGB to Video",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -168,12 +174,15 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
   if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
-      tbp->shape.size() != 3 || tbp->shape[0] != 3) {
+      tbp->shape.size() != 3 ||
+      (tbp->shape[0] != 3 && tbp->shape[0] != 4)) {
     session()->warn(fmt(
-        "RgbToVideoStage('{}'): expected a planar U8 RGB [3,H,W] TensorBeat, "
-        "got {}; skipping", this->id(), in->describe()));
+        "RgbToVideoStage('{}'): expected a planar U8 RGB [3,H,W] or RGBA "
+        "[4,H,W] TensorBeat, got {}; skipping",
+        this->id(), in->describe()));
     co_return;
   }
+  const int CH = (int)tbp->shape[0];
   const int H = (int)tbp->shape[1], W = (int)tbp->shape[2];
   if (H <= 0 || W <= 0) { co_return; }
 
@@ -260,9 +269,44 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   // timestamp and has nothing to infer the final one from.
   f->duration = 1;
 
-  const std::uint8_t* rp = tbp->as_u8();
-  const std::uint8_t* gp = rp + (std::size_t)H * W;
-  const std::uint8_t* bp = gp + (std::size_t)H * W;
+  // A PADDED ROW PITCH shears every row here, because the reads below
+  // index the planes as tight -- and load-image forwards FFmpeg's
+  // 32-byte-aligned GBRP linesize, so a width that is not a multiple of
+  // 32 arrives strided. Materialise when it is not contiguous.
+  AlignedVector<std::uint8_t> contig;
+  const std::uint8_t* src = tbp->as_u8();
+  if (!tbp->is_contiguous()) {
+    contig = tbp->materialize_contiguous();
+    src = contig.data();
+  }
+  const std::size_t plane = (std::size_t)H * W;
+
+  // COMPOSITE OVER WHITE, since neither yuv420p nor rgb24 carries alpha.
+  // Truncating the fourth plane is NOT the neutral choice: under a
+  // transparent pixel the stored colour is arbitrary, and on a generated
+  // RGBA frame it is usually black -- so dropping the plane fringes every
+  // edge in black, which reads as a bad model rather than a lost channel.
+  // out = a*rgb + (1-a)*255, the same arithmetic save-image flattens a
+  // transparent PNG with. Put an `alpha-mix` ahead of this stage to
+  // composite over any other colour, or over another clip.
+  std::vector<std::uint8_t> flat;
+  if (CH == 4) {
+    flat.resize(3 * plane);
+    const std::uint8_t* ap = src + 3 * plane;
+    for (int c = 0; c < 3; ++c) {
+      const std::uint8_t* sp = src + (std::size_t)c * plane;
+      std::uint8_t* dp = flat.data() + (std::size_t)c * plane;
+      for (std::size_t i = 0; i < plane; ++i) {
+        const int a = ap[i];
+        dp[i] = (std::uint8_t)((sp[i] * a + 255 * (255 - a) + 127) / 255);
+      }
+    }
+    src = flat.data();
+  }
+
+  const std::uint8_t* rp = src;
+  const std::uint8_t* gp = rp + plane;
+  const std::uint8_t* bp = gp + plane;
   if (_pix_fmt == AV_PIX_FMT_RGB24) {
     for (int y = 0; y < H; ++y) {
       std::uint8_t* row = f->data[0] + (std::size_t)y * f->linesize[0];

@@ -181,12 +181,19 @@ ImageResampleStage::initialize(RuntimeContext&)
   // backend's availability, which is not the same question: bicubic has
   // no GPU kernel and always takes the CPU path, so a graph that asked
   // for it was told metal was fine and quietly did not use it.
+  //
+  // THIS RUNS BEFORE ANY BEAT, so it cannot know the channel count --
+  // and RGBA is the second thing that takes the CPU whatever the
+  // filter, since the kernel has three planes and no notion of the
+  // premultiplication an alpha resample needs. Said here rather than
+  // left to contradict a later log line.
   const char* alg = _alg == 0 ? "bilinear" : _alg == 2 ? "bicubic"
                                                        : "lanczos";
   const bool gpu = _mc && _mc->valid() && _alg != 2;
   session()->info(fmt(
-      "ImageResampleStage('{}'): -> {}x{}, fit={}, {} on the {}",
-      this->id(), ws, hs, _mode, alg, gpu ? "GPU" : "CPU"));
+      "ImageResampleStage('{}'): -> {}x{}, fit={}, {} on the {}{}",
+      this->id(), ws, hs, _mode, alg, gpu ? "GPU" : "CPU",
+      gpu ? " (RGB; an RGBA beat takes the CPU path)" : ""));
   co_return;
 }
 
@@ -211,7 +218,7 @@ ImageResampleStage::resolve_out_dims_(int in_w, int in_h,
 void
 ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
                                   int out_w, int out_h,
-                                  uint8_t* dst, bool is_f32) const
+                                  uint8_t* dst, bool is_f32, int C) const
 {
   const metal_compute::ResampleGeom g =
       metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
@@ -219,7 +226,11 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
   const int planeS = in_w * in_h;
   const int planeD = out_w * out_h;
   const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
-  const float pad[3] = { _pad_r / div, _pad_g / div, _pad_b / div };
+  // A 4th pad entry for RGBA, and it is TRANSPARENT: a border invented
+  // to make an aspect fit is not part of the picture, so saying it is
+  // opaque would put a frame of `pad_rgb` around every letterboxed
+  // image instead of leaving it empty.
+  const float pad[4] = { _pad_r / div, _pad_g / div, _pad_b / div, 0.0f };
   const float* sf = reinterpret_cast<const float*>(src);
   float* df = reinterpret_cast<float*>(dst);
   auto rd = [&](int c, int x, int y) -> float {
@@ -236,7 +247,7 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
       const bool out = x < g.pad_x || x >= g.pad_x + g.new_w
                     || y < g.pad_y || y >= g.pad_y + g.new_h;
       if (out) {
-        for (int c = 0; c < 3; ++c) { wr(c, x, y, pad[c]); }
+        for (int c = 0; c < C; ++c) { wr(c, x, y, pad[c]); }
         continue;
       }
       const float sxf =
@@ -249,7 +260,7 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
       int ix1 = ix0 + 1, iy1 = iy0 + 1;
       ix0 = clamp(ix0, 0, in_w - 1); ix1 = clamp(ix1, 0, in_w - 1);
       iy0 = clamp(iy0, 0, in_h - 1); iy1 = clamp(iy1, 0, in_h - 1);
-      for (int c = 0; c < 3; ++c) {
+      for (int c = 0; c < C; ++c) {
         const float v00 = rd(c, ix0, iy0), v01 = rd(c, ix1, iy0);
         const float v10 = rd(c, ix0, iy1), v11 = rd(c, ix1, iy1);
         const float v0 = v00 + (v01 - v00) * fx;
@@ -263,7 +274,8 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
 void
 ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
                                  int out_w, int out_h,
-                                 uint8_t* dst, bool is_f32, bool cubic) const
+                                 uint8_t* dst, bool is_f32, bool cubic,
+                                 int C) const
 {
   const metal_compute::ResampleGeom g =
       metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
@@ -271,7 +283,11 @@ ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
   const int planeS = in_w * in_h;
   const int planeD = out_w * out_h;
   const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
-  const float pad[3] = { _pad_r / div, _pad_g / div, _pad_b / div };
+  // A 4th pad entry for RGBA, and it is TRANSPARENT: a border invented
+  // to make an aspect fit is not part of the picture, so saying it is
+  // opaque would put a frame of `pad_rgb` around every letterboxed
+  // image instead of leaving it empty.
+  const float pad[4] = { _pad_r / div, _pad_g / div, _pad_b / div, 0.0f };
   const float* sf = reinterpret_cast<const float*>(src);
   float* df = reinterpret_cast<float*>(dst);
   auto rd = [&](int c, int x, int y) -> float {
@@ -286,7 +302,7 @@ ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
   if (g.new_w <= 0 || g.new_h <= 0) {           // degenerate -> all pad
     for (int y = 0; y < out_h; ++y) {
       for (int x = 0; x < out_w; ++x) {
-        for (int c = 0; c < 3; ++c) { wr(c, x, y, pad[c]); }
+        for (int c = 0; c < C; ++c) { wr(c, x, y, pad[c]); }
       }
     }
     return;
@@ -308,13 +324,13 @@ ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
       const bool out = x < g.pad_x || x >= g.pad_x + g.new_w
                     || y < g.pad_y || y >= g.pad_y + g.new_h;
       if (out) {
-        for (int c = 0; c < 3; ++c) { wr(c, x, y, pad[c]); }
+        for (int c = 0; c < C; ++c) { wr(c, x, y, pad[c]); }
         continue;
       }
       const int cx = x - g.pad_x, cy = y - g.pad_y;
       const int xmin = bx[static_cast<size_t>(cx)];
       const int ymin = by[static_cast<size_t>(cy)];
-      for (int c = 0; c < 3; ++c) {
+      for (int c = 0; c < C; ++c) {
         float acc = 0.0f;
         for (int ty = 0; ty < ksy; ++ty) {
           const float wyt = wy[static_cast<size_t>(cy) * ksy + ty];
@@ -340,14 +356,16 @@ ImageResampleStage::process(RuntimeContext& ctx)
   if (!in0) { ctx.signal_done(); co_return; }
 
   const auto* tin = dynamic_cast<const TensorBeatPayload*>(in0.get());
-  if (tin == nullptr || tin->shape.size() != 3 || tin->shape[0] != 3
+  if (tin == nullptr || tin->shape.size() != 3
+      || (tin->shape[0] != 3 && tin->shape[0] != 4)
       || (tin->dtype != TensorBeat::DType::U8
           && tin->dtype != TensorBeat::DType::F32)) {
     session()->warn(fmt(
-        "ImageResampleStage('{}'): expected planar RGB [3,H,W] u8/f32 "
-        "TensorBeat; dropping beat", this->id()));
+        "ImageResampleStage('{}'): expected planar RGB [3,H,W] or RGBA "
+        "[4,H,W] u8/f32 TensorBeat; dropping beat", this->id()));
     co_return;
   }
+  const int CH = static_cast<int>(tin->shape[0]);
   const int in_h = static_cast<int>(tin->shape[1]);
   const int in_w = static_cast<int>(tin->shape[2]);
   if (in_w <= 0 || in_h <= 0) { co_return; }
@@ -372,7 +390,12 @@ ImageResampleStage::process(RuntimeContext& ctx)
   }
 
   // GPU fast path: u8 frames via the (generalised) letterbox kernel.
-  if (tin->dtype == TensorBeat::DType::U8 && _mc && _mc->valid()) {
+  // RGB ONLY -- the kernel takes three pad bytes and three planes, and
+  // an RGBA resample additionally has to run PREMULTIPLIED, which it
+  // has no notion of. Four channels take the CPU path below; a still
+  // is not a video loop, so what that costs is milliseconds.
+  if (CH == 3 && tin->dtype == TensorBeat::DType::U8 && _mc
+      && _mc->valid()) {
     const ExternalStorageHandle* src_h = nullptr;
     if (tin->external && contiguous) {
       src_h = tin->external.get();               // already GPU-resident
@@ -416,18 +439,71 @@ ImageResampleStage::process(RuntimeContext& ctx)
     // fall through to the CPU path on any GPU failure
   }
 
-  // CPU fallback: f32 frames, no-metal builds, or a GPU miss.
+  // CPU fallback: f32 frames, no-metal builds, RGBA, or a GPU miss.
   TensorBeat tb;
   tb.dtype = tin->dtype;
-  tb.shape = { 3, out_h, out_w };
+  tb.shape = { CH, out_h, out_w };
   tb.sideband = tin->sideband;
-  tb.resize_contiguous(static_cast<size_t>(3) * out_w * out_h);
+  tb.resize_contiguous(static_cast<size_t>(CH) * out_w * out_h);
   const bool is_f32 = tin->dtype == TensorBeat::DType::F32;
+
+  // RGBA RESAMPLES PREMULTIPLIED. Averaging colour and alpha
+  // independently pulls the colour of fully transparent pixels into
+  // the edge -- a dark halo around everything on an image whose
+  // transparent region is black, which is what a generated RGBA
+  // picture usually has. Premultiply, resample all four planes, then
+  // divide back out.
+  AlignedVector<uint8_t> pm;
+  if (CH == 4) {
+    const size_t plane = static_cast<size_t>(in_w) * in_h;
+    pm.resize(4 * plane * (is_f32 ? sizeof(float) : 1));
+    const float amax = is_f32 ? 1.0f : 255.0f;
+    const float* sf = reinterpret_cast<const float*>(src_tight);
+    float* pf = reinterpret_cast<float*>(pm.data());
+    for (size_t i = 0; i < plane; ++i) {
+      const float a = is_f32 ? sf[3 * plane + i]
+                             : static_cast<float>(src_tight[3 * plane + i]);
+      const float a01 = amax > 0.0f ? a / amax : 0.0f;
+      for (int c = 0; c < 3; ++c) {
+        const float v = is_f32 ? sf[c * plane + i]
+                               : static_cast<float>(src_tight[c * plane + i]);
+        if (is_f32) { pf[c * plane + i] = v * a01; }
+        else {
+          pm[c * plane + i] =
+              static_cast<uint8_t>(clamp(v * a01 + 0.5f, 0.0f, 255.0f));
+        }
+      }
+      if (is_f32) { pf[3 * plane + i] = a; }
+      else { pm[3 * plane + i] = src_tight[3 * plane + i]; }
+    }
+    src_tight = pm.data();
+  }
+
   if (_alg == 1 || _alg == 2) {
     cpu_lanczos_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32,
-                 _alg == 2);
+                 _alg == 2, CH);
   } else {
-    cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32);
+    cpu_resample_(src_tight, in_w, in_h, out_w, out_h, tb.bytes_(), is_f32,
+                  CH);
+  }
+  if (CH == 4) {
+    const size_t plane = static_cast<size_t>(out_w) * out_h;
+    const float amax = is_f32 ? 1.0f : 255.0f;
+    uint8_t* d8 = tb.bytes_();
+    float* df = reinterpret_cast<float*>(d8);
+    for (size_t i = 0; i < plane; ++i) {
+      const float a = is_f32 ? df[3 * plane + i]
+                             : static_cast<float>(d8[3 * plane + i]);
+      const float a01 = amax > 0.0f ? a / amax : 0.0f;
+      if (a01 <= 1e-4f) { continue; }        // nothing to recover
+      for (int c = 0; c < 3; ++c) {
+        if (is_f32) { df[c * plane + i] /= a01; }
+        else {
+          d8[c * plane + i] = static_cast<uint8_t>(
+              clamp(d8[c * plane + i] / a01 + 0.5f, 0.0f, 255.0f));
+        }
+      }
+    }
   }
   co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
 }

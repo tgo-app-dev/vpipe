@@ -1,0 +1,90 @@
+{
+  "id": "qwen-image-2.1-rgba",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Qwen/Qwen-Image-2.1"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "This is an RGBA image with transparency. A single red maple leaf, crisp edges, centred, high detail. The background is transparent."
+      }
+    },
+    {
+      "id": "qwen-image-21-model-config",
+      "type": "qwen-image-21-model-config",
+      "iports": [],
+      "config": {}
+    },
+    {
+      "id": "scheduler-select",
+      "type": "scheduler-select",
+      "iports": [],
+      "config": {
+        "steps": 20
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "scheduler-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {
+        "height": 1024,
+        "width": 1024,
+        "steps": 20,
+        "seed": 7
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "qwen-image-2.1-rgba.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

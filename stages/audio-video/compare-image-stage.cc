@@ -65,11 +65,13 @@ constexpr ConfigKey kAttrs[] = {
           "smaller than the common size", .def_str = "#000000"},
 };
 const PortSpec kIports[] = {
-  {.name = "a", .doc = "image A: planar RGB TensorBeat [3,H,W] (F32 or "
+  {.name = "a", .doc = "image A: planar RGB [3,H,W] or RGBA [4,H,W] "
+          "(shown over a checkerboard) TensorBeat (F32 or "
                        "U8). Optional -- unwired or silent shows black.",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
-  {.name = "b", .doc = "image B: planar RGB TensorBeat [3,H,W] (F32 or "
+  {.name = "b", .doc = "image B: planar RGB [3,H,W] or RGBA [4,H,W] "
+          "(shown over a checkerboard) TensorBeat (F32 or "
                        "U8). Optional -- unwired or silent shows black.",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 1},
@@ -152,17 +154,43 @@ CompareImageStage::resolve_roles_(RuntimeContext& ctx)
       "compare-image('{}'): roles a={} b={}", this->id(), _want_a, _want_b));
 }
 
+// The transparency backdrop, in the convention every image viewer
+// uses. OVER A CHECKERBOARD RATHER THAN A FLAT COLOUR, because this is
+// a comparison view: flattening onto white would make a transparent
+// region indistinguishable from a white one, so two images that differ
+// ONLY in their alpha would be shown as identical -- which is the one
+// thing a comparison must never do.
+static std::uint8_t
+checker_(int x, int y)
+{
+  return ((x / 8) + (y / 8)) % 2 == 0 ? 0xFF : 0xCC;
+}
+
 bool
 CompareImageStage::unpack_(const TensorBeat& tb, Side& side) const
 {
-  if (tb.shape.size() != 3 || tb.shape[0] != 3) { return false; }
+  if (tb.shape.size() != 3
+      || (tb.shape[0] != 3 && tb.shape[0] != 4)) {
+    return false;
+  }
+  const int CH = static_cast<int>(tb.shape[0]);
   const int H = static_cast<int>(tb.shape[1]);
   const int W = static_cast<int>(tb.shape[2]);
   if (H <= 0 || W <= 0) { return false; }
 
   const size_t plane   = static_cast<size_t>(H) * W;
-  const size_t expect  = 3 * plane;
-  vector<uint8_t>       out(expect);
+  const size_t expect  = static_cast<size_t>(CH) * plane;
+  vector<uint8_t>       out(3 * plane);
+
+  // alpha in [0,1] for pixel i, or 1 when the beat carries none.
+  auto blend = [&](size_t i, int c, float v, float a01) {
+    if (CH == 3) { return clamp_byte_(v); }
+    const int x = static_cast<int>(i % static_cast<size_t>(W));
+    const int y = static_cast<int>(i / static_cast<size_t>(W));
+    (void)c;
+    return clamp_byte_(v * a01 +
+                       static_cast<float>(checker_(x, y)) * (1.0f - a01));
+  };
 
   if (tb.dtype == TensorBeat::DType::U8) {
     const uint8_t*         src = nullptr;
@@ -174,9 +202,12 @@ CompareImageStage::unpack_(const TensorBeat& tb, Side& side) const
       src = tmp.data();
     }
     for (size_t i = 0; i < plane; ++i) {
-      out[i * 3 + 0] = src[i];
-      out[i * 3 + 1] = src[plane + i];
-      out[i * 3 + 2] = src[2 * plane + i];
+      const float a01 =
+          CH == 4 ? static_cast<float>(src[3 * plane + i]) / 255.0f : 1.0f;
+      for (int c = 0; c < 3; ++c) {
+        out[i * 3 + c] =
+            blend(i, c, static_cast<float>(src[c * plane + i]), a01);
+      }
     }
   } else if (tb.dtype == TensorBeat::DType::F32) {
     const float*         src = nullptr;
@@ -189,9 +220,11 @@ CompareImageStage::unpack_(const TensorBeat& tb, Side& side) const
     }
     const float scale = _input_normalized ? 255.0f : 1.0f;
     for (size_t i = 0; i < plane; ++i) {
-      out[i * 3 + 0] = clamp_byte_(src[i] * scale);
-      out[i * 3 + 1] = clamp_byte_(src[plane + i] * scale);
-      out[i * 3 + 2] = clamp_byte_(src[2 * plane + i] * scale);
+      const float a01 =
+          CH == 4 ? clamp_byte_(src[3 * plane + i] * scale) / 255.0f : 1.0f;
+      for (int c = 0; c < 3; ++c) {
+        out[i * 3 + c] = blend(i, c, src[c * plane + i] * scale, a01);
+      }
     }
   } else {
     return false;   // unsupported dtype: keep whatever we had

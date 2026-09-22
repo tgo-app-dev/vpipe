@@ -460,3 +460,136 @@ TEST(image_resample_stage, default_algorithm_is_lanczos) {
   }
   EXPECT_FALSE(same_as_bilinear);
 }
+
+// ---- RGBA ------------------------------------------------------------
+//
+// A four-channel beat resizes to a four-channel beat, and -- the part
+// worth a test -- it resamples PREMULTIPLIED.
+//
+// THE TWO ANSWERS DIFFER BY A FACTOR OF TWO at a hard alpha edge, so
+// this cannot pass by accident. The source is opaque WHITE on the left
+// half and fully transparent BLACK on the right. Downscaling 2:1 makes
+// each output pixel the average of one source pixel from each side at
+// the boundary, and:
+//
+//   not premultiplied   rgb = (255 + 0)/2 = 127, a = 127
+//                       -> a mid-grey edge that is not in the picture
+//   premultiplied       rgb = (255*1 + 0*0)/2 = 127 over a = 127,
+//                       divided back out -> 255, still white
+//
+// The transparent half's black is exactly the case a generated RGBA
+// image has, which is why the halo is the normal failure and not an
+// exotic one.
+namespace {
+
+class RgbaEdgeSource : public TypedStage<RgbaEdgeSource> {
+public:
+  static constexpr const char* kTypeName = "ut-resample-rgba-src";
+  using TypedStage::TypedStage;
+  int H = 4, W = 8;
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    TensorBeat tb;
+    tb.dtype = TensorBeat::DType::U8;
+    tb.shape = { 4, H, W };
+    tb.resize_contiguous(static_cast<size_t>(4) * H * W);
+    uint8_t* d = tb.bytes_();
+    const size_t plane = static_cast<size_t>(H) * W;
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        const size_t i = static_cast<size_t>(y) * W + x;
+        const bool left = x < W / 2;
+        for (int c = 0; c < 3; ++c) {
+          d[c * plane + i] = left ? 255 : 0;
+        }
+        d[3 * plane + i] = left ? 255 : 0;
+      }
+    }
+    co_await ctx.write(0, make_payload<TensorBeatPayload>(tb));
+  }
+private:
+  bool _sent = false;
+};
+
+vector<TensorBeat> run_rgba(Session& sess, int H, int W, FlexData cfg)
+{
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto s = std::make_unique<RgbaEdgeSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  s->H = H; s->W = W;
+  s->allocate_oports(1);
+  auto* src = static_cast<RgbaEdgeSource*>(pl->insert_stage(std::move(s)));
+  auto rs = std::make_unique<ImageResampleStage>(
+      &sess, "rs", vector<InEdge>{ { src, 0 } }, std::move(cfg));
+  auto* rst = static_cast<ImageResampleStage*>(
+      pl->insert_stage(std::move(rs)));
+  auto sk = std::make_unique<Sink>(
+      &sess, "sink", vector<InEdge>{ { rst, 0 } }, FlexData::make_object());
+  auto* sink = static_cast<Sink*>(pl->insert_stage(std::move(sk)));
+  PipelineRuntime rt(pl.get(), &sess);
+  if (!rt.launch()) { return {}; }
+  rt.wait_idle();
+  rt.stop();
+  return sink->out();
+}
+
+}  // namespace
+
+TEST(image_resample_stage, rgba_keeps_four_channels_and_premultiplies) {
+  Session sess;
+  const int H = 8, W = 16;
+  // THE DEFAULT KERNEL (lanczos, support 3) ON PURPOSE. A bilinear
+  // 2:1 downscale samples sources {2x, 2x+1}, so with the edge on an
+  // even column NO output pixel ever straddles it, every output alpha
+  // is 0 or 255, and the assertion below has nothing to bite on -- the
+  // first version of this test was exactly that, and passed with the
+  // premultiply deliberately disabled. A wide kernel guarantees the
+  // partial-alpha band the test is about, and `partial` below refuses
+  // to let it silently go away again.
+  //
+  // With premultiplication the expected value is EXACT and kernel-
+  // independent: premultiplied rgb equals alpha everywhere here (both
+  // are 255 on the opaque side and 0 on the other), so any kernel
+  // gives resampled_rgb == resampled_alpha, and dividing back out is
+  // 255 wherever alpha survives.
+  const auto got = run_rgba(sess, H, W, mkcfg(W / 2, H / 2, "stretch"));
+
+  ASSERT_TRUE(got.size() == 1);
+  if (got.empty()) { return; }
+  const TensorBeat& tb = got[0];
+  EXPECT_TRUE(tb.shape.size() == 3);
+  EXPECT_TRUE(tb.shape[0] == 4);
+  if (tb.shape[0] != 4) { return; }
+  EXPECT_TRUE(tb.shape[1] == H / 2 && tb.shape[2] == W / 2);
+
+  const auto bytes = tb.materialize_contiguous();
+  const size_t plane = static_cast<size_t>(H / 2) * (W / 2);
+  EXPECT_TRUE(bytes.size() == 4 * plane);
+  if (bytes.size() != 4 * plane) { return; }
+
+  // Deep in the opaque half: white and opaque.
+  const size_t li = static_cast<size_t>(1) * (W / 2) + 0;
+  EXPECT_TRUE(bytes[li] > 250);
+  EXPECT_TRUE(bytes[3 * plane + li] > 250);
+  // Deep in the transparent half: alpha gone.
+  const size_t ri = static_cast<size_t>(1) * (W / 2) + (W / 2 - 1);
+  EXPECT_TRUE(bytes[3 * plane + ri] < 5);
+  // EVERY pixel that retains ANY alpha must still be white -- and the
+  // ones that matter are the PARTIALLY transparent ones, because a
+  // fully opaque pixel is white either way. A non-premultiplied
+  // resample leaves mid-grey exactly there, which is the halo.
+  int partial = 0;
+  for (size_t i = 0; i < plane; ++i) {
+    const int a = bytes[3 * plane + i];
+    if (a < 8) { continue; }                      // nothing to say
+    if (a <= 247) { ++partial; }
+    EXPECT_TRUE(bytes[i] > 250);
+    EXPECT_TRUE(bytes[plane + i] > 250);
+    EXPECT_TRUE(bytes[2 * plane + i] > 250);
+  }
+  // THE GUARD THAT KEEPS THIS HONEST: without a partial-alpha band
+  // there is no halo to find and the loop above asserts nothing.
+  EXPECT_TRUE(partial > 0);
+}

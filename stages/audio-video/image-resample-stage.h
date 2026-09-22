@@ -74,9 +74,12 @@ private:
   // CPU bilinear fallback (f32, or no metal). Handles u8 and f32; matches
   // the GPU kernel's geometry exactly for u8. `out_w`/`out_h` are the
   // resolved (aspect-inferred) output dimensions.
+  // `C` is the plane count: 3 for RGB, 4 for RGBA. An RGBA source is
+  // handed here PREMULTIPLIED and unpremultiplied by the caller -- see
+  // process().
   void cpu_resample_(const std::uint8_t* src, int in_w, int in_h,
                      int out_w, int out_h,
-                     std::uint8_t* dst, bool is_f32) const;
+                     std::uint8_t* dst, bool is_f32, int C = 3) const;
 
   // CPU separable-kernel fallback (f32 frames, no metal, or bicubic --
   // which has no GPU twin). `cubic` picks Pillow's BICUBIC over
@@ -84,7 +87,8 @@ private:
   // kernel's geometry.
   void cpu_lanczos_(const std::uint8_t* src, int in_w, int in_h,
                     int out_w, int out_h,
-                    std::uint8_t* dst, bool is_f32, bool cubic) const;
+                    std::uint8_t* dst, bool is_f32, bool cubic,
+                    int C = 3) const;
 };
 
 }

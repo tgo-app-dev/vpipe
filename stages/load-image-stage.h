@@ -63,6 +63,11 @@ private:
   std::string av_err_(int rc) const;
 
   std::vector<std::string> _urls;
+  // `alpha: keep` emits four channels. DEFAULT DROP, because the beat
+  // every other consumer here reads is [3,H,W] and turning a
+  // transparent PNG into a 4-channel beat by surprise would break the
+  // graph that was working yesterday. See the config doc.
+  bool _keep_alpha = false;
   std::size_t              _next = 0;
 
   const FFmpegLibraries*   _libs = nullptr;

@@ -52,6 +52,10 @@ public:
 
   int     w = 4, h = 3, n = 1;
   uint8_t r = 0xFF, g = 0x80, b = 0x40;
+  // -1 emits three channels. Anything else emits FOUR, with this as
+  // the alpha -- what an RGBA VAE decodes and what load-image hands
+  // back under `alpha: keep`.
+  int     a = -1;
   bool    noisy = false;   // high-frequency fill (JPEG quality has teeth)
   // When set, stamped onto each beat's sideband exactly as vae-decode does,
   // so save-image sees a GENERATED image.
@@ -73,12 +77,18 @@ public:
   process(RuntimeContext& ctx) override
   {
     if (_emitted >= n) { ctx.signal_done(); co_return; }
+    const int ch = a < 0 ? 3 : 4;
     auto out = make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::U8;
-    out->shape = {3, h, w};
-    out->resize_contiguous(static_cast<size_t>(3) * h * w);
+    out->shape = {ch, h, w};
+    out->resize_contiguous(static_cast<size_t>(ch) * h * w);
     uint8_t* d = out->as_u8();
     const size_t plane = static_cast<size_t>(h) * w;
+    if (ch == 4) {
+      for (size_t i = 0; i < plane; ++i) {
+        d[3 * plane + i] = (uint8_t)a;
+      }
+    }
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
         const size_t i = static_cast<size_t>(y) * w + x;
@@ -426,4 +436,157 @@ TEST(save_image_stage, unmarked_image_gets_no_software_tag) {
   ASSERT_TRUE(src != nullptr);
   EXPECT_TRUE(imgmeta::read_exif_blob(path).empty());
   remove(path.c_str());
+}
+
+// ---- RGBA ------------------------------------------------------------
+//
+// Qwen-Image-2.1 decodes FOUR channels and transparency is its headline
+// feature, so the beat that carries it has to reach a file with its
+// alpha intact. Both halves are pinned here: a format that HAS an alpha
+// channel keeps it exactly, and one that does not COMPOSITES OVER WHITE
+// rather than truncating.
+//
+// The composite is the half worth a test. Truncating would keep
+// whatever colour sits under a transparent pixel, and on a generated
+// RGBA image that is usually black -- so the failure is not a missing
+// alpha, it is black fringing around everything, which reads as a bad
+// model rather than a lost channel.
+TEST(save_image_stage, png_keeps_alpha_and_roundtrips) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+  const uint8_t R = 0x12, G = 0xAB, B = 0xF0, A = 0x40;
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  // run_store_ does not carry alpha, so build the graph directly.
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SolidSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->n = 1; src_u->r = R; src_u->g = G; src_u->b = B; src_u->a = A;
+  auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+  pl->insert_stage(make_unique<SaveImageStage>(
+      &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+
+  // PNG colour type 6 is RGBA; 2 is RGB. Read it from the IHDR rather
+  // than trusting the decoder to tell us, because a decoder that
+  // invents an opaque alpha would hide exactly the bug this catches.
+  const string ihdr = head_bytes_(path, 26);
+  EXPECT_TRUE(ihdr.size() == 26);
+  if (ihdr.size() == 26) {
+    EXPECT_TRUE((uint8_t)ihdr[25] == 6);
+  }
+
+  // ...and back through load-image, which needs telling to keep it.
+  auto p2 = make_unique<Pipeline>("p2", &sess);
+  FlexData licfg = FlexData::make_object();
+  licfg.as_object().insert("url", FlexData::make_string(path));
+  licfg.as_object().insert("alpha", FlexData::make_string("keep"));
+  auto li_u = make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(licfg));
+  auto* li = static_cast<LoadImageStage*>(p2->insert_stage(std::move(li_u)));
+  auto cap_u = make_unique<CaptureSink>(
+      &sess, "cap", vector<InEdge>{{li, 0}}, FlexData::make_object());
+  auto* cap = static_cast<CaptureSink*>(p2->insert_stage(std::move(cap_u)));
+  {
+    PipelineRuntime rt(p2.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  remove(path.c_str());
+
+  EXPECT_TRUE(cap->got.size() == 1);
+  if (cap->got.empty()) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(cap->got[0].get());
+  EXPECT_TRUE(tb != nullptr);
+  if (!tb) { return; }
+  EXPECT_TRUE(tb->shape.size() == 3 && tb->shape[0] == 4);
+  if (tb->shape[0] != 4) { return; }
+  const auto bytes = tb->materialize_contiguous();
+  const size_t plane = static_cast<size_t>(tb->shape[1]) * tb->shape[2];
+  EXPECT_TRUE(bytes.size() == 4 * plane);
+  if (bytes.size() != 4 * plane) { return; }
+  // EXACT -- png is lossless and neither end resamples.
+  EXPECT_TRUE(bytes[0] == R);
+  EXPECT_TRUE(bytes[plane] == G);
+  EXPECT_TRUE(bytes[2 * plane] == B);
+  EXPECT_TRUE(bytes[3 * plane] == A);
+}
+
+TEST(save_image_stage, a_format_without_alpha_composites_over_white) {
+  Session sess;
+  CerrSilencer hush;
+
+  // JPEG, which has no alpha channel in any profile -- BMP and TIFF
+  // both do, so picking one of those would have made this assert
+  // nothing at all.
+  const string path = tmp_path_(".jpg");
+  remove(path.c_str());
+  // Fully TRANSPARENT black: truncating gives 0, compositing gives
+  // 255. The two answers could not be further apart, which is the
+  // point -- on a generated RGBA image the colour under a transparent
+  // pixel really is usually black, so a truncation shows up as black
+  // where the picture is meant to be empty.
+  const uint8_t R = 0x00, G = 0x00, B = 0x00, A = 0x00;
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  cfg.as_object().insert("format", FlexData::make_string("jpeg"));
+  cfg.as_object().insert("quality", FlexData::make_int(100));
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SolidSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->n = 1; src_u->r = R; src_u->g = G; src_u->b = B; src_u->a = A;
+  auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+  pl->insert_stage(make_unique<SaveImageStage>(
+      &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+
+  auto p2 = make_unique<Pipeline>("p2", &sess);
+  FlexData licfg = FlexData::make_object();
+  licfg.as_object().insert("url", FlexData::make_string(path));
+  auto li_u = make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(licfg));
+  auto* li = static_cast<LoadImageStage*>(p2->insert_stage(std::move(li_u)));
+  auto cap_u = make_unique<CaptureSink>(
+      &sess, "cap", vector<InEdge>{{li, 0}}, FlexData::make_object());
+  auto* cap = static_cast<CaptureSink*>(p2->insert_stage(std::move(cap_u)));
+  {
+    PipelineRuntime rt(p2.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  remove(path.c_str());
+
+  EXPECT_TRUE(cap->got.size() == 1);
+  if (cap->got.empty()) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(cap->got[0].get());
+  EXPECT_TRUE(tb != nullptr);
+  if (!tb) { return; }
+  EXPECT_TRUE(tb->shape.size() == 3 && tb->shape[0] == 3);
+  const auto bytes = tb->materialize_contiguous();
+  if (bytes.size() < 3) { return; }
+  const size_t plane = static_cast<size_t>(tb->shape[1]) * tb->shape[2];
+  // WHITE, not black. Lossy, so a band rather than equality -- but the
+  // two candidate answers are 0 and 255, so the band decides it.
+  EXPECT_TRUE(bytes[0] > 240);
+  EXPECT_TRUE(bytes[plane] > 240);
+  EXPECT_TRUE(bytes[2 * plane] > 240);
 }

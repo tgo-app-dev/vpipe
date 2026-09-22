@@ -63,6 +63,10 @@ public:
   double fps = 24.0;
   // What vae-decode carries onto a decoded frame when a model made it.
   string model_name;
+  // 3 = RGB (the ramp below), 4 = RGBA at `rgba` -- a constant frame, so
+  // one pixel out of the encoder says what the composite did.
+  int ch = 3;
+  uint8_t rgba[4] = {0, 0, 0, 255};
 
   Job
   process(RuntimeContext& ctx) override
@@ -70,11 +74,18 @@ public:
     for (int i = 0; i < count; ++i) {
       auto b = make_unique<TensorBeatPayload>();
       b->dtype = TensorBeat::DType::U8;
-      b->shape = {3, h, w};
-      const size_t n = (size_t)3 * h * w;
+      b->shape = {ch, h, w};
+      const size_t n = (size_t)ch * h * w;
       b->resize_contiguous(n);
       uint8_t* p = b->as_u8();
+      if (ch == 4) {
+        const size_t plane = (size_t)h * w;
+        for (int c = 0; c < 4; ++c) {
+          for (size_t k = 0; k < plane; ++k) { p[c * plane + k] = rgba[c]; }
+        }
+      } else {
       for (size_t k = 0; k < n; ++k) { p[k] = (uint8_t)((i * 40 + k) & 0xff); }
+      }
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign("frame", FlexData::make_int(i));
       sb.as_object().insert_or_assign("frames", FlexData::make_int(count));
@@ -108,6 +119,10 @@ public:
   int last_w = 0, last_h = 0, last_fmt = 0;
   int rate_num = 0, rate_den = 0;
   string last_model;
+  // Top-left pixel of the FIRST frame, read back out of the AVFrame.
+  // Only filled for rgb24, where the bytes are the picture -- a yuv420p
+  // readback would be testing the colour conversion as well.
+  int first_px[3] = {-1, -1, -1};
 
   Job
   process(RuntimeContext& ctx) override
@@ -123,7 +138,13 @@ public:
       rate_num = hp->frame_rate.num;
       rate_den = hp->frame_rate.den;
       last_model = hp->model_name;
-    } else if (dynamic_cast<const FrameRefPayload*>(b.get()) != nullptr) {
+    } else if (const auto* fp =
+                   dynamic_cast<const FrameRefPayload*>(b.get())) {
+      if (frames == 0 && fp->ref && fp->ref->format == AV_PIX_FMT_RGB24) {
+        for (int c = 0; c < 3; ++c) {
+          first_px[c] = fp->ref->data[0][c];
+        }
+      }
       ++frames;
     }
   }
@@ -312,6 +333,99 @@ TEST(rgb_to_video, header_then_one_frame_each)
   const double got = (double)sink->rate_num / (double)sink->rate_den;
   EXPECT_TRUE(got > 23.99 && got < 24.01);
   EXPECT_TRUE(cvt->frames_emitted() == 5u);
+}
+
+// An RGBA frame is COMPOSITED OVER WHITE, not truncated. No video pixel
+// format here carries alpha, and the fourth plane cannot simply be
+// dropped: under a transparent pixel the stored colour is arbitrary, and
+// on a generated RGBA frame it is usually black -- so a truncation
+// fringes every edge in black, which reads as a bad model rather than a
+// lost channel. Pure black at alpha 0.5 must therefore leave as mid
+// grey; a truncation leaves it black and a nearest-neighbour "flatten"
+// leaves it white.
+TEST(rgb_to_video, an_rgba_frame_is_composited_over_white)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                      FlexData::make_object());
+  src_u->count = 2;
+  src_u->w = 16;
+  src_u->h = 16;
+  src_u->ch = 4;
+  src_u->rgba[0] = 0; src_u->rgba[1] = 0; src_u->rgba[2] = 0;
+  src_u->rgba[3] = 128;               // half transparent black
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("pix_fmt",
+                                   FlexData::make_string("rgb24"));
+  auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                            vector<InEdge>{{src, 0}}, cfg);
+  auto* cvt = static_cast<RgbToVideoStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+  auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                       vector<InEdge>{{cvt, 0}},
+                                       FlexData::make_object());
+  auto* sink = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  // It was ACCEPTED at all -- before this, a [4,H,W] beat was warned
+  // about and skipped, so the stream had no frames and no header.
+  EXPECT_TRUE(sink->headers == 1);
+  EXPECT_TRUE(sink->frames == 2);
+  EXPECT_TRUE(sink->last_w == 16 && sink->last_h == 16);
+  printf("[rgb_to_video] rgba(0,0,0,128) -> %d,%d,%d\n",
+         sink->first_px[0], sink->first_px[1], sink->first_px[2]);
+  for (int c = 0; c < 3; ++c) {
+    EXPECT_TRUE(sink->first_px[c] >= 126 && sink->first_px[c] <= 129);
+  }
+}
+
+// The two ends of the range, so the blend is not merely "some number in
+// between": opaque keeps the colour exactly, and fully transparent is
+// the background exactly, whatever was stored underneath it.
+TEST(rgb_to_video, rgba_endpoints_are_exact)
+{
+  auto run = [](uint8_t r, uint8_t g, uint8_t b, uint8_t a, int* out) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                        FlexData::make_object());
+    src_u->count = 1; src_u->w = 8; src_u->h = 8; src_u->ch = 4;
+    src_u->rgba[0] = r; src_u->rgba[1] = g;
+    src_u->rgba[2] = b; src_u->rgba[3] = a;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("pix_fmt",
+                                     FlexData::make_string("rgb24"));
+    auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                              vector<InEdge>{{src, 0}}, cfg);
+    auto* cvt = static_cast<RgbToVideoStage*>(
+        pl->insert_stage(std::move(cvt_u)));
+    auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                         vector<InEdge>{{cvt, 0}},
+                                         FlexData::make_object());
+    auto* sk = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    if (!rt.launch()) { return; }
+    rt.wait_idle();
+    rt.stop();
+    for (int c = 0; c < 3; ++c) { out[c] = sk->first_px[c]; }
+  };
+  int px[3] = {-1, -1, -1};
+  run(200, 30, 90, 255, px);            // opaque: untouched
+  EXPECT_TRUE(px[0] == 200 && px[1] == 30 && px[2] == 90);
+  run(0, 0, 0, 0, px);                  // transparent BLACK: white
+  EXPECT_TRUE(px[0] == 255 && px[1] == 255 && px[2] == 255);
+  run(200, 30, 90, 0, px);              // transparent anything: white
+  EXPECT_TRUE(px[0] == 255 && px[1] == 255 && px[2] == 255);
 }
 
 // The generating model rides from the frames' sideband onto the STREAM

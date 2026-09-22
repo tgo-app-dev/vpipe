@@ -179,7 +179,9 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "image",
-   .doc = "decoded planar U8 RGB TensorBeat [3, H, W]. A VIDEO latent emits "
+   .doc = "decoded planar U8 TensorBeat [C, H, W] -- RGB, or RGBA when "
+          "the VAE decodes four channels (Qwen-Image-2.1). "
+          "A VIDEO latent emits "
           "one beat PER FRAME rather than a clip-shaped tensor, each "
           "carrying {frame, frames, fps} in its sideband, so a consumer "
           "knows where in the clip it sits and how many follow",
@@ -2027,23 +2029,25 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // f16 [3,H,W] in [-1,1] -> planar U8 RGB (x+1)/2*255, rounded + clamped.
+  // f16 [C,H,W] in [-1,1] -> planar U8 (x+1)/2*255, rounded + clamped.
   const int H = h8 * px, W = w8 * px;
-  // An RGBA VAE (Qwen-Image-2.1) decodes FOUR channels and this beat
-  // carries three. Dropping alpha is a real loss on a model whose
-  // headline feature is transparency, so it is SAID rather than done
-  // quietly -- the plumbing for a 4-channel image beat is its own
-  // change, and until it lands a graph should know what it is getting.
-  if (_vae->config().out_channels > 3) {
+  // THE CHANNEL COUNT IS THE VAE'S, not three. Qwen-Image-2.1 decodes
+  // FOUR -- RGBA is its headline feature -- and this used to truncate
+  // to three and say so, which was honest but threw the alpha away.
+  // A consumer that cannot take four (a video muxer, a vision tower)
+  // composites or refuses on its own; that decision belongs where the
+  // pixels are used, not here where they are produced.
+  const int OC = _vae->config().out_channels;
+  if (OC != 3 && OC != 4) {
     session()->warn(fmt(
-        "VaeDecodeStage('{}'): this VAE decodes {} channels and the image "
-        "beat carries 3; the alpha channel is being dropped",
-        this->id(), _vae->config().out_channels));
+        "VaeDecodeStage('{}'): this VAE decodes {} channels, and an image "
+        "beat is RGB or RGBA; dropping beat", this->id(), OC));
+    co_return;
   }
-  const std::size_t n = (std::size_t)3 * H * W;
+  const std::size_t n = (std::size_t)OC * H * W;
   auto out = std::make_unique<TensorBeatPayload>();
   out->dtype = TensorBeat::DType::U8;
-  out->shape = {3, H, W};
+  out->shape = {OC, H, W};
   out->resize_contiguous(n);
   const auto* rp = static_cast<const _Float16*>(rgb.contents());
   std::uint8_t* op = out->as_u8();
@@ -2056,8 +2060,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   }
   ++_images_emitted;
   session()->log_debug(fmt(
-      "VaeDecodeStage('{}'): decoded + emitted image #{} planar U8 RGB "
-      "[3, {}, {}]", this->id(), _images_emitted, H, W));
+      "VaeDecodeStage('{}'): decoded + emitted image #{} planar U8 {} "
+      "[{}, {}, {}]", this->id(), _images_emitted,
+      OC == 4 ? "RGBA" : "RGB", OC, H, W));
   forward_model_name_(*tbp, *out);
   if (_unload_idle) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));
