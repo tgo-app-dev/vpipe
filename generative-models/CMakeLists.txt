@@ -81,6 +81,8 @@ set(LOCAL_SOURCES
   krea2/metal-krea2-calibration.cc
   krea2/flow-sampler.cc
   qwen-image/metal-qwen-image-transformer.cc
+  qwen-image/qwen-image21-layout.cc
+  qwen-image/metal-qwen-image21-transformer.cc
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
   mage/metal-mage-vae.cc
@@ -164,6 +166,8 @@ set(LOCAL_HEADERS
   qwen3/metal-qwen-model.h
   qwen3/metal-qwen-model-exec.h
   qwen3/metal-qwen-vision.h
+  qwen-image/qwen-image21-layout.h
+  qwen-image/metal-qwen-image21-transformer.h
   llama3/metal-llama-model.h
   llama3/metal-llama-model-exec.h
   llama3/metal-llama-weights.h

@@ -257,6 +257,41 @@ TEST(model_register_stage, detects_qwen35_from_config)
 // defaults describe the family at its fullest, so they are trimmed to
 // what this checkpoint actually carries. Claiming image input here would
 // offer a text-only dump to a visual-qa field that cannot use it.
+// Qwen-Image-2.1, by PATH against the catalogue: the whole repo, which
+// is what a user registers after copying it from another machine.
+TEST(model_register_stage, detects_qwen_image_21_repo)
+{
+  TempDir tdir;
+  const auto dir = make_model_dir_(tdir.path, "Qwen", "Qwen-Image-2.1", "{}");
+  const DetectedModel d = detect_model_dir(dir.string());
+  EXPECT_TRUE(d.detected_by == "catalog");
+  EXPECT_TRUE(d.model_type == "qwen-image-21");
+  EXPECT_TRUE(d.family == "Qwen-Image");
+  EXPECT_TRUE(d.version == "2.1");
+  // ONE checkpoint does text-to-image AND reference editing, so it takes
+  // both and is not split into two entries the way the 20B sibling is.
+  EXPECT_TRUE(has_modality_(d.inputs, "text"));
+  EXPECT_TRUE(has_modality_(d.inputs, "image"));
+  EXPECT_TRUE(has_modality_(d.outputs, "image"));
+}
+
+// The DiT ALONE, by its class name -- which is what model-quantize
+// writes, and therefore what a quantize -> register recipe hands over.
+// It detects as the COMPONENT type, not the repo's: a bare transformer
+// directory is not a model a generate-image stage can be pointed at.
+TEST(model_register_stage, detects_qwen_image_21_dit_component)
+{
+  TempDir tdir;
+  const auto dir = make_model_dir_(
+      tdir.path, "local", "Qwen-Image-2.1-w4",
+      R"({"_class_name":"QwenImage21Transformer2DModel","num_layers":32,)"
+      R"("num_attention_heads":32,"attention_head_dim":128,)"
+      R"("quantization":{"bits":4,"group_size":64}})");
+  const DetectedModel d = detect_model_dir(dir.string());
+  EXPECT_TRUE(d.model_type == "qwen-image-21-dit");
+  EXPECT_TRUE(d.variant == "4-bit");
+}
+
 TEST(model_register_stage, trims_io_to_what_the_checkpoint_carries)
 {
   TempDir tdir;
@@ -325,6 +360,31 @@ TEST(model_register_stage, detects_diffusers_pipeline)
               R"({"_class_name":"BooguImageTransformer2DModel"})");
   EXPECT_TRUE(detect_model_dir(edit.string()).model_type ==
               "boogu-image-edit");
+
+  // Qwen-Image-2.1 is a DIFFERENT class from Qwen-Image / Qwen-Image-Edit
+  // despite the shared family name, and it is not split on the directory
+  // name the way Boogu is: one checkpoint answers both tasks, so a dir
+  // called "...-Edit" must still come back as the single type. Pinned
+  // because the two class strings differ by two characters and a
+  // prefix-style match would silently type this as the 20B MMDiT.
+  const auto q21 = filesystem::path(tdir.path) / "local" / "Qwen-Image-2.1";
+  filesystem::create_directories(q21, ec);
+  write_file_(q21, "transformer/config.json",
+              R"({"_class_name":"QwenImage21Transformer2DModel"})");
+  const DetectedModel q = detect_model_dir(q21.string());
+  EXPECT_TRUE(q.model_type == "qwen-image-21");
+  EXPECT_TRUE(q.family == "Qwen-Image");
+  EXPECT_TRUE(q.version == "2.1");
+  // Optional image input -- the one-checkpoint-two-tasks case.
+  EXPECT_TRUE(has_modality_(q.inputs, "text"));
+  EXPECT_TRUE(has_modality_(q.inputs, "image"));
+  EXPECT_TRUE(has_modality_(q.outputs, "image"));
+  const auto q21e =
+      filesystem::path(tdir.path) / "local" / "Qwen-Image-2.1-Edit";
+  filesystem::create_directories(q21e, ec);
+  write_file_(q21e, "transformer/config.json",
+              R"({"_class_name":"QwenImage21Transformer2DModel"})");
+  EXPECT_TRUE(detect_model_dir(q21e.string()).model_type == "qwen-image-21");
 }
 
 // A BARE DiT (diffusers weights + config, no pipeline around them --

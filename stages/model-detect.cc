@@ -188,6 +188,8 @@ family_version_(const std::string& mt, std::string& family,
       {"flux2-lora",             "FLUX",        "2"},
       {"qwen-image",             "Qwen-Image",  "2512"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
+      {"qwen-image-21",          "Qwen-Image",  "2.1"},
+      {"qwen-image-21-dit",      "Qwen-Image",  "2.1"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
       {"wan-i2v",                "Wan",         "2.2-I2V"},
@@ -293,6 +295,11 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   if (cls == "Flux2Transformer2DModel")      { return "flux2"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }
+  // Qwen-Image-2.1. NOT split on `edit` the way Boogu is: one checkpoint
+  // answers both tasks, because a reference image occupies vision slots
+  // in the text encoder's own sequence instead of a separate
+  // conditioning path. There is no sibling to pick wrongly.
+  if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21"; }
   if (cls == "BooguImageTransformer2DModel") {
     // The t2i and edit repos ship the SAME transformer config (only the
     // weights differ), so the name is the only signal.
@@ -420,6 +427,7 @@ dit_component_tag_(const std::string& cls)
   if (cls == "Flux2Transformer2DModel")      { return "flux2-dit"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2-dit"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
+  if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }
   if (cls == "MageFlow")                     { return "mage-flow-dit"; }
   if (cls == "BooguImageTransformer2DModel") { return "boogu-image-dit"; }
   // Either Wan expert on its own (a quantized transformer/ or

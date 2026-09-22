@@ -4358,7 +4358,8 @@ MetalGemmaModel::tap_(ComputeEncoder& enc, int hf_index,
 metal_compute::SharedBuffer
 MetalGemmaModel::forward_embeddings_taps(
     ContextId cid, const std::vector<std::int32_t>& ids,
-    const std::vector<int>& hf_indices, int key_valid_len, std::string* err)
+    const std::vector<int>& hf_indices, int key_valid_len, std::string* err,
+    bool skip_final_norm)
 {
   const Config& c = _cfg;
   auto fail = [&](std::string m) {
@@ -4442,6 +4443,7 @@ MetalGemmaModel::forward_embeddings_taps(
   }
 
   TapState st;
+  st.skip_final_norm = skip_final_norm;
   st.out = &out;
   st.slot_of = std::move(slot_of);
   st.n = n;
@@ -5914,8 +5916,16 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     // below norms the LAST ROW only, so this is a second, all-rows norm
     // rather than a reuse of it, and it runs only when a tap wants it.
     if (_taps != nullptr && _taps->slot_of[(std::size_t)nl] >= 0) {
-      rms(*xcur, 0, _final_ln, hn, 0, rows, H);
-      tap_(enc, nl, hn, 0, rows);
+      if (_taps->skip_final_norm) {
+        // The RAW residual: HF's hidden_states[-1] with self.norm
+        // neutralized. See HiddenTapRequest::skip_final_norm -- the two
+        // differ by a scale a consumer cannot detect downstream, so the
+        // caller has to say which it wants.
+        tap_(enc, nl, *xcur, 0, rows);
+      } else {
+        rms(*xcur, 0, _final_ln, hn, 0, rows, H);
+        tap_(enc, nl, hn, 0, rows);
+      }
     }
 
     // ---- final norm (last token) + lm_head + softcap ---------------

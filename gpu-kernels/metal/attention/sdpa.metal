@@ -26,6 +26,10 @@ using namespace metal;
 #endif
 
 #define SDPA_MAX_PER 16  // max D/32 (supports D up to 512: Gemma-4 full-attn)
+// The wide twin's budget: ceil(1280/32), which covers the Qwen-Image-2.1
+// VAE's 1152-channel mid block with room above it. Only
+// sdpa_full_wide_f16 pays these registers.
+#define SDPA_WIDE_MAX_PER 40
 #define SDPA_MAX_G   4   // max GQA group (e4b global Hq/Hkv = 8/2 = 4); used by
                          // the kv_read_probe M=G mode (qreg/dd = per*G regs).
 
@@ -35,20 +39,27 @@ using namespace metal;
 // qi attends ALL keys 0..T_kv-1. No q_offset.
 //   0:q[Hq,n_q,D] 1:k/2:v[Hkv,T_kv,D] 3:out 4:scale 5:T_kv 6:D 7:Hq
 //   8:Hkv 9:n_q 10:kv_stride.  grid (32, Hq, n_q); threadgroup (32,1,1).
-kernel void sdpa_full_f16(
-    const device VPIPE_ELT* q        [[buffer(0)]],
-    const device VPIPE_ELT* k        [[buffer(1)]],
-    const device VPIPE_ELT* v        [[buffer(2)]],
-    device VPIPE_ELT*       out      [[buffer(3)]],
-    constant float&    scale    [[buffer(4)]],
-    constant int&      T_kv     [[buffer(5)]],
-    constant int&      D        [[buffer(6)]],
-    constant int&      Hq       [[buffer(7)]],
-    constant int&      Hkv      [[buffer(8)]],
-    constant int&      n_q      [[buffer(9)]],
-    constant int&      kv_stride [[buffer(10)]],
-    uint3 tid  [[threadgroup_position_in_grid]],
-    uint  lane [[thread_index_in_simdgroup]])
+//
+// THE BODY IS TEMPLATED ON THE REGISTER BUDGET, and that is not a
+// refactor for its own sake. `per` is ceil(D/32) and indexes two
+// per-thread float arrays, so a D past MAXP*32 walks off the end of
+// both -- in Metal, silently, producing a plausible wrong answer rather
+// than a fault. That is exactly what a D=1152 VAE mid-block attention
+// did against a MAXP of 16 (rel-L2 0.17 against the reference, uniform
+// across every channel, which reads like precision and is not).
+//
+// So there are two entry points over one body: the ordinary one keeps
+// the 16 it always had, because these arrays are REGISTERS and this
+// tree's throughput is occupancy-bound -- widening them for everybody
+// would tax every LM and vision-tower fallback for one VAE. The _wide
+// twin pays for itself only where it is dispatched. The host picks, and
+// refuses loudly past the wider bound rather than overflowing again.
+template <int MAXP>
+inline void
+sdpa_full_body(const device VPIPE_ELT* q, const device VPIPE_ELT* k,
+               const device VPIPE_ELT* v, device VPIPE_ELT* out,
+               float scale, int T_kv, int D, int Hq, int Hkv, int n_q,
+               int kv_stride, uint3 tid, uint lane)
 {
   const int h = (int)tid.y;
   const int qi = (int)tid.z;
@@ -59,13 +70,17 @@ kernel void sdpa_full_f16(
   // every access with idx < D. For D divisible by 32 (head_dim 64/256
   // etc.) per is unchanged and every guard is trivially true, so this is
   // behaviour-identical to the old D/32 form.
-  const int per = (D + 31) / 32;
+  //
+  // CLAMPED to MAXP: a caller that ignores the host-side bound gets a
+  // truncated head rather than a stack overwrite. Wrong either way, but
+  // wrong INSIDE its own memory.
+  const int per = min((D + 31) / 32, MAXP);
   const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
   const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
   const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
 
-  float qreg[SDPA_MAX_PER];
-  float acc[SDPA_MAX_PER];
+  float qreg[MAXP];
+  float acc[MAXP];
   for (int p = 0; p < per; ++p) {
     const int idx = lane * per + p;
     qreg[p] = idx < D ? float(qh[idx]) * scale : 0.0f;
@@ -98,6 +113,48 @@ kernel void sdpa_full_f16(
       out[((uint)h * n_q + qi) * D + idx] = VPIPE_ELT(acc[p] * inv_l);
     }
   }
+}
+
+kernel void sdpa_full_f16(
+    const device VPIPE_ELT* q        [[buffer(0)]],
+    const device VPIPE_ELT* k        [[buffer(1)]],
+    const device VPIPE_ELT* v        [[buffer(2)]],
+    device VPIPE_ELT*       out      [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      T_kv     [[buffer(5)]],
+    constant int&      D        [[buffer(6)]],
+    constant int&      Hq       [[buffer(7)]],
+    constant int&      Hkv      [[buffer(8)]],
+    constant int&      n_q      [[buffer(9)]],
+    constant int&      kv_stride [[buffer(10)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  sdpa_full_body<SDPA_MAX_PER>(q, k, v, out, scale, T_kv, D, Hq, Hkv, n_q,
+                               kv_stride, tid, lane);
+}
+
+// The wide-head twin. Same contract, same results; it exists only to
+// carry a head dim the 16-register form cannot index. Used by the
+// Qwen-Image-2.1 VAE, whose mid-block attention is one head of 1152
+// (decoder) and 768 (encoder) channels.
+kernel void sdpa_full_wide_f16(
+    const device VPIPE_ELT* q        [[buffer(0)]],
+    const device VPIPE_ELT* k        [[buffer(1)]],
+    const device VPIPE_ELT* v        [[buffer(2)]],
+    device VPIPE_ELT*       out      [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      T_kv     [[buffer(5)]],
+    constant int&      D        [[buffer(6)]],
+    constant int&      Hq       [[buffer(7)]],
+    constant int&      Hkv      [[buffer(8)]],
+    constant int&      n_q      [[buffer(9)]],
+    constant int&      kv_stride [[buffer(10)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  sdpa_full_body<SDPA_WIDE_MAX_PER>(q, k, v, out, scale, T_kv, D, Hq, Hkv,
+                                    n_q, kv_stride, tid, lane);
 }
 
 // Block-windowed (non-causal) attention: identical to sdpa_full_f16 but

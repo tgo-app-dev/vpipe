@@ -76,6 +76,12 @@ kernel void sol_summaries_mma(
     constant int&           N  [[buffer(8)]],
     constant int&           BLK [[buffer(9)]],
     constant int&           which [[buffer(10)]],
+    // ROW STRIDE PER HEAD, which is NOT the token count when the
+    // operand is a BAND of a longer sequence -- a block-causal layout
+    // summarises one segment out of a buffer that holds them all. Equal
+    // to T for a whole-sequence operand, which is what every square
+    // caller passes.
+    constant int&           HS [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  d   [[thread_index_in_threadgroup]])
 {
@@ -89,19 +95,19 @@ kernel void sol_summaries_mma(
   // One loop per destination rather than one loop over three, so the
   // mask is tested once and an unwanted tensor is never read.
   if ((which & 1) != 0) {
-    const device VPIPE_ELT* qh = q + ((uint)h * T + t0) * D;
+    const device VPIPE_ELT* qh = q + ((uint)h * HS + t0) * D;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(qh[(uint)t * D + d]); }
     qc[o] = VPIPE_ELT(s * inv);
   }
   if ((which & 2) != 0) {
-    const device VPIPE_ELT* kh = k + ((uint)h * T + t0) * D;
+    const device VPIPE_ELT* kh = k + ((uint)h * HS + t0) * D;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(kh[(uint)t * D + d]); }
     kc[o] = VPIPE_ELT(s * inv);
   }
   if ((which & 4) != 0) {
-    const device VPIPE_ELT* vh = v + ((uint)h * T + t0) * D;
+    const device VPIPE_ELT* vh = v + ((uint)h * HS + t0) * D;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(vh[(uint)t * D + d]); }
     vc[o] = VPIPE_ELT(s * inv);
@@ -181,6 +187,11 @@ kernel void sol_route_mma(
     constant int&           BLK     [[buffer(12)]],
     constant int&           BQ      [[buffer(13)]],
     constant int&           radius  [[buffer(14)]],
+    // The GLOBAL row of this segment's first query. The local band is
+    // around the key block the query sits in, and a segment that starts
+    // part-way down the sequence sits somewhere else -- zero for a
+    // whole-sequence call.
+    constant int&           QOFF    [[buffer(20)]],
     constant int&           sink_lo [[buffer(15)]],
     constant int&           sink_hi [[buffer(16)]],
     constant int&           per     [[buffer(17)]],
@@ -217,7 +228,7 @@ kernel void sol_route_mma(
 
   // The local band is in KEY blocks around the key block this QUERY
   // block sits in, which is where the two granularities meet.
-  const int qk = (qb * BQ) / BLK;
+  const int qk = (QOFF + qb * BQ) / BLK;
   device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
   // THE QUERY CENTROID IS LOOP-INVARIANT and was being re-read from
   // device memory once per key block -- the same four elements, NK
@@ -305,6 +316,11 @@ kernel void sol_route_p_mma(
     constant int&           BLK     [[buffer(12)]],
     constant int&           BQ      [[buffer(13)]],
     constant int&           radius  [[buffer(14)]],
+    // The GLOBAL row of this segment's first query. The local band is
+    // around the key block the query sits in, and a segment that starts
+    // part-way down the sequence sits somewhere else -- zero for a
+    // whole-sequence call.
+    constant int&           QOFF    [[buffer(20)]],
     constant int&           sink_lo [[buffer(15)]],
     constant int&           sink_hi [[buffer(16)]],
     constant int&           per     [[buffer(17)]],
@@ -339,7 +355,7 @@ kernel void sol_route_p_mma(
   rv = max(simd_sum(rv), 0.0f) * ls * ls;
   const float thr = rm + tau * sqrt(rv + 1.0e-6f);
 
-  const int qk = (qb * BQ) / BLK;
+  const int qk = (QOFF + qb * BQ) / BLK;
   const device float* pr = proxy + ((uint)h * NQ + qb) * NK;
   device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
   // ONE LANE PER KEY BLOCK now that the dot is a load: the row is
@@ -707,6 +723,8 @@ kernel void sol_merge_mma(
     constant int&           T   [[buffer(7)]],
     constant int&           D   [[buffer(8)]],
     constant int&           TPAD [[buffer(9)]],
+    // See sol_merge_ml_mma: the destination may be a band.
+    constant int&           OS   [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  d   [[thread_index_in_threadgroup]])
 {
@@ -714,6 +732,7 @@ kernel void sol_merge_mma(
   const int t = (int)tid.z;
   if ((int)d >= D || t >= T) { return; }
   const uint r = (uint)h * T + t;
+  const uint ro = (uint)h * OS + t;
   const float me = m_e[r], le = l_e[r];
   const float ma = m_a[r], la = l_a[r];
   // Either half can be empty: a query block whose routing kept nothing
@@ -730,7 +749,7 @@ kernel void sol_merge_mma(
                        ? o_a[((uint)h * TPAD + t) * D + d] *
                              (la > 0.0f ? wa / la : 0.0f)
                        : 0.0f;
-  out[r * D + d] = VPIPE_ELT(den > 0.0f ? (ne + na) / den : 0.0f);
+  out[ro * D + d] = VPIPE_ELT(den > 0.0f ? (ne + na) / den : 0.0f);
 }
 
 // The same merge, for an approximate half produced by the FLASH kernel
@@ -775,6 +794,10 @@ kernel void sol_merge_ml_mma(
     constant int&           T     [[buffer(7)]],
     constant int&           D     [[buffer(8)]],
     constant float&         bonus [[buffer(9)]],
+    // The DESTINATION's row stride per head. The partial softmaxes are
+    // Sol's own and always [H,T,D]; `out` is the caller's and may be a
+    // band of a longer sequence. Equal to T for a whole-sequence call.
+    constant int&           OS    [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  d   [[thread_index_in_threadgroup]])
 {
@@ -782,6 +805,7 @@ kernel void sol_merge_ml_mma(
   const int t = (int)tid.z;
   if ((int)d >= D || t >= T) { return; }
   const uint r = (uint)h * T + t;
+  const uint ro = (uint)h * OS + t;
   const float me = m_e[r], le = l_e[r];
   const float ma_raw = m_a[r], la = l_a[r];
   const bool  a_live = (ma_raw > -1.0e30f) && (la > 0.0f);
@@ -793,5 +817,5 @@ kernel void sol_merge_ml_mma(
   const float den = we + wa;
   const float ne = (we > 0.0f) ? float(o_e[r * D + d]) * we : 0.0f;
   const float na = (wa > 0.0f) ? float(o_a[r * D + d]) * wa : 0.0f;
-  out[r * D + d] = VPIPE_ELT(den > 0.0f ? (ne + na) / den : 0.0f);
+  out[ro * D + d] = VPIPE_ELT(den > 0.0f ? (ne + na) / den : 0.0f);
 }

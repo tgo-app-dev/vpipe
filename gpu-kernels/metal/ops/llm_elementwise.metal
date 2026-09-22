@@ -815,6 +815,29 @@ kernel void gated_residual_tanh_v4_f16(
   hv[o] = VPIPE_ELT4(float4(hv[o]) + g * s);
 }
 
+// SwiGLU over FOUR elements per thread, contiguous, n % 4 == 0.
+//
+// The scalar form (swiglu_f16, above) is one element per thread, which on a DiT's
+// feed-forward is the largest elementwise dispatch in the model --
+// rows*ffn, 51M threads at 1024^2 -- and it runs nowhere near memory
+// bandwidth at that width. Same arithmetic, a quarter of the threads.
+//   0:gate 1:up 2:out 3:n4.  grid (n/4).
+kernel void swiglu_v4_f16(
+    const device VPIPE_ELT* gate [[buffer(0)]],
+    const device VPIPE_ELT* up   [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    constant int&      n4   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n4) { return; }
+  const float4 g = float4(reinterpret_cast<const device VPIPE_ELT4*>(gate)[gid]);
+  const float4 u = float4(reinterpret_cast<const device VPIPE_ELT4*>(up)[gid]);
+  // Plain exp(), matching swiglu_generic_ above: the point is a
+  // wider thread, not a different function.
+  const float4 sg = g / (1.0f + exp(-g));
+  reinterpret_cast<device VPIPE_ELT4*>(out)[gid] = VPIPE_ELT4(sg * u);
+}
+
 // out = a + b over 4 elements per thread, 1-D grid of n/4 threads (n % 4 == 0).
 kernel void residual_add_v4_f16(
     const device VPIPE_ELT* a   [[buffer(0)]],
@@ -1121,6 +1144,99 @@ kernel void upsample_nearest2x_hwc_f16(
   const int ox = (int)(p % (uint)OW);
   const int oy = (int)(p / (uint)OW);
   out[gid] = in[((ulong)(oy / 2) * W + (ox / 2)) * (uint)C + c];
+}
+
+// ---- AutoencoderKLQwenImage21's parameter-free residual shortcuts ----
+//
+// `is_residual` wraps each encoder/decoder level in a shortcut that is
+// pure index arithmetic -- no weights -- bridging the level's in/out
+// widths by REGROUPING channels against a space-to-depth. Both kernels
+// ACCUMULATE into `out`, because the reference adds the shortcut to the
+// main path's result and one thread owns each output element.
+//
+// THE TEMPORAL FACTOR SURVIVES ON A STILL, which is the part that looks
+// wrong and is not. These are video ops; a single latent frame is
+// zero-padded at the FRONT to `ft` frames, so the real frame is always
+// time index ft-1 and the padded ones contribute zeros. At a level with
+// ft=2 that makes half the shortcut's output channels exactly zero --
+// correct, and not something to "fix" by dropping the factor.
+//
+// Down: out[(oy,ox), o] += mean over g<G of src(n = o*G + g), where n
+// decomposes as (c, t, sy, sx) = (n/factor, rem/(fs*fs), (rem/fs)%fs,
+// rem%fs) with factor = ft*fs*fs, G = Cin*factor/Cout, and src is
+// in[(oy*fs+sy, ox*fs+sx), c] when t == ft-1 and zero otherwise.
+//   0:in[H*W,Cin] 1:out[(H/fs)*(W/fs),Cout] 2:H 3:W 4:Cin 5:Cout 6:ft
+//   7:fs.  grid (OH*OW*Cout) or (Cout, OH*OW).
+// Indices are ulong throughout: a full-resolution encoder level at 2048px
+// has H*W*C past 2^31, which is the silent all-zero failure this tree has
+// already paid for once.
+kernel void vae_res_avg_down_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H    [[buffer(2)]],
+    constant int&      W    [[buffer(3)]],
+    constant int&      Cin  [[buffer(4)]],
+    constant int&      Cout [[buffer(5)]],
+    constant int&      ft   [[buffer(6)]],
+    constant int&      fs   [[buffer(7)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int OH = H / fs, OW = W / fs;
+  const ulong gid = (ulong)tpig.y * (uint)Cout + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * (uint)Cout;
+  if (gid >= total) { return; }
+  const uint o = (uint)(gid % (uint)Cout);
+  const uint p = (uint)(gid / (uint)Cout);
+  const int ox = (int)(p % (uint)OW);
+  const int oy = (int)(p / (uint)OW);
+  const int factor = ft * fs * fs;
+  const int G = (Cin * factor) / Cout;
+  float acc = 0.0f;
+  for (int g = 0; g < G; ++g) {
+    const int n = (int)o * G + g;
+    const int c = n / factor;
+    const int rem = n % factor;
+    const int t = rem / (fs * fs);
+    if (t != ft - 1) { continue; }          // a zero-padded frame
+    const int sy = (rem / fs) % fs;
+    const int sx = rem % fs;
+    const int iy = oy * fs + sy, ix = ox * fs + sx;
+    if (iy >= H || ix >= W) { continue; }
+    acc += (float)in[((ulong)iy * (uint)W + (uint)ix) * (uint)Cin + (uint)c];
+  }
+  out[gid] = (VPIPE_ELT)((float)out[gid] + acc / (float)G);
+}
+
+// Up: out[(y*2+sy, x*2+sx), o] += in[(y,x), j/repeats] with
+// j = ((o*ft + (ft-1))*2 + sy)*2 + sx and repeats = Cout*ft*4/Cin. The
+// ft-1 is the surviving frame after the reference drops the leading
+// ft-1 of them (`first_chunk`), which on a still leaves exactly one.
+//   0:in[H*W,Cin] 1:out[(2H)*(2W),Cout] 2:H 3:W 4:Cin 5:Cout 6:ft.
+//   grid ((2H)*(2W)*Cout) or (Cout, (2H)*(2W)).
+kernel void vae_res_dup_up_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H    [[buffer(2)]],
+    constant int&      W    [[buffer(3)]],
+    constant int&      Cin  [[buffer(4)]],
+    constant int&      Cout [[buffer(5)]],
+    constant int&      ft   [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int OH = 2 * H, OW = 2 * W;
+  const ulong gid = (ulong)tpig.y * (uint)Cout + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * (uint)Cout;
+  if (gid >= total) { return; }
+  const uint o = (uint)(gid % (uint)Cout);
+  const uint p = (uint)(gid / (uint)Cout);
+  const int ox = (int)(p % (uint)OW);
+  const int oy = (int)(p / (uint)OW);
+  const int repeats = (Cout * ft * 4) / Cin;
+  const int j = (((int)o * ft + (ft - 1)) * 2 + (oy & 1)) * 2 + (ox & 1);
+  const int c = j / repeats;
+  const ulong si = ((ulong)(oy / 2) * (uint)W + (uint)(ox / 2)) * (uint)Cin +
+                   (uint)c;
+  out[gid] = (VPIPE_ELT)((float)out[gid] + (float)in[si]);
 }
 
 // GLU over a [rows, 2*D] matrix split into halves: each row is [a(D) |

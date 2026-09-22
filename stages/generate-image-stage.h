@@ -17,6 +17,7 @@
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
+#include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #endif
@@ -146,6 +147,17 @@ private:
   // suggest. Without this every peer sizes the box against ~20 GB that
   // was never there. No-op when the DiT is not streaming.
   void revise_dit_declaration_(const std::string& dit_dir) const;
+  std::size_t dit_resident_bytes_() const;
+  void correct_dit_holding_(const char* when) const;
+
+  // The checkpoint whose holding correct_dit_holding_ moves, plus the
+  // two figures that make the correction idempotent: the floor the
+  // load-time read fixed, and the last preload published. Mutable
+  // because the correction is bookkeeping about a plan, asked from the
+  // const side of generation.
+  std::string         _dit_holding_dir;
+  mutable std::size_t _dit_load_floor = 0;
+  mutable std::size_t _dit_revised    = 0;
 public:
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
@@ -440,6 +452,27 @@ private:
   // Cached reference latents from iport4 / iport5 (read once when a beat is
   // available, reused for every later prompt like the negative prompt).
   RefLatent _ref[2];
+
+  // ---- Qwen-Image-2.1 ------------------------------------------------
+  std::unique_ptr<genai::MetalQwenImage21Transformer> _qi21_dit;
+  std::string _qi21_dit_dir;
+  bool _qi21_stream = false;
+  // qwen-image-21-model-config's `use_kv_cache`. Defaults ON, matching
+  // the reference; an unset key is "no opinion", not `false`.
+  bool _qi21_use_kv_cache = true;
+  // The joint-sequence bookkeeping the CONDITIONER publishes on its
+  // beat's sideband. Nothing here can reconstruct it: which conditioning
+  // rows are image slots depends on where the tower's rows were spliced
+  // in, and an image row carries no token id.
+  std::vector<std::uint8_t> _qi21_slots;
+  std::vector<int> _qi21_ref_gh, _qi21_ref_gw;
+  bool load_qwen_image21_dit_();
+  void free_qwen_image21_dit_for_decode_(int gen_w, int gen_h);
+  std::vector<float> generate_qwen_image21_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w, const std::vector<RefLatent>& refs,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // The conditioning -> unpacked-latent forward: fuse the tapped text
   // conditioning through the DiT's text tower, sample the FlowMatchEuler turbo

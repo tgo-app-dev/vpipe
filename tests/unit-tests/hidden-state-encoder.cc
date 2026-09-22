@@ -18,6 +18,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/session.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -188,17 +189,26 @@ TEST(hidden_state_encoder, gemma_taps_the_whole_stack) {
   EXPECT_TRUE(zero_slots == 0);
 
   // THE INDEX CONVENTION. Index n_layers has been through the final
-  // RMSNorm and index n_layers-1 has not. Gemma's residual stream grows
-  // through the stack, so the normed state is much smaller -- a tap that
-  // returned the raw residual there would land near its neighbour
-  // instead. Only checkable when the whole stack is available; a model
-  // with a KV-shared tail never reaches the final norm per token.
+  // RMSNorm and index n_layers-1 has not, so the two must DIFFER
+  // materially -- a tap that returned the raw residual at index L would
+  // land on its neighbour's value instead.
+  //
+  // Deliberately not a DIRECTION. This used to assert normed < raw,
+  // which holds for e4b and fails for the 12B: the normed state's scale
+  // is the final norm's GAIN, and the 12B's is ~3.6 where e4b's is
+  // small. MEASURED on the 12B: raw 0.182 against normed 3.555. The
+  // relationship the convention actually guarantees is inequality.
+  //
+  // Only checkable when the whole stack is available; a model with a
+  // KV-shared tail never reaches the final norm per token.
   double last_normed = 0.0;
   if (L == enc->n_layers()) {
     const double last_raw = row_rms_(res, L - 1, n - 1);
     last_normed           = row_rms_(res, L,     n - 1);
     std::printf("  rms[L-1]=%.4f rms[L]=%.4f\n", last_raw, last_normed);
-    EXPECT_TRUE(last_normed < last_raw);
+    const double lo = std::min(last_raw, last_normed);
+    const double hi = std::max(last_raw, last_normed);
+    EXPECT_TRUE(hi > lo * 1.05);
   } else {
     last_normed = row_rms_(res, L, n - 1);
     std::printf("  KV-shared tail: final norm not reachable per token\n");
@@ -348,4 +358,76 @@ TEST(hidden_state_encoder, gemma_quantized_backbone_with_a_dense_embed) {
               res.dtype.c_str(), n0, nl);
   EXPECT_TRUE(n0 > 1e-2);
   EXPECT_TRUE(nl > 1e-2);
+}
+
+// skip_final_norm: index n_layers hands back the RAW residual.
+//
+// The convention's index L is post-final-norm and L-1 is the layer
+// BEFORE the last, so "the last layer, un-normed" had no index at all.
+// Qwen-Image-2.1 conditions on exactly that -- diffusers hooks its text
+// encoder's norm to return its own input -- and the two states are the
+// same shape, so nothing downstream can tell a wrong one.
+//
+// Two things are checked, and the second is the one that matters: the
+// flag CHANGES index L, and it changes NOTHING ELSE.
+TEST(hidden_state_encoder, skip_final_norm_affects_only_the_last_index) {
+  const std::string dir = gemma_dir_();
+  if (dir.empty()) { return; }
+  vpipe::Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  HiddenStateEncoderArgs args;
+  args.dir = dir;
+  args.metal = mc;
+  args.session = &sess;
+  std::string err;
+  auto enc = HiddenStateEncoderRegistry::get().open(args, &err);
+  if (enc == nullptr) {
+    std::printf("  [SKIP] %s\n", err.c_str());
+    return;
+  }
+  const int L = enc->max_tap_index();
+  // A KV-shared tail never reaches the final norm per token, so there is
+  // no normed state to skip and nothing to compare.
+  if (L != enc->n_layers() || L < 2) {
+    std::printf("  [SKIP] this checkpoint's tail stops short of the "
+                "final norm\n");
+    return;
+  }
+
+  const std::vector<std::int32_t> ids = {2, 1596, 861, 1024, 573};
+  HiddenTapRequest req;
+  req.indices = {0, L - 1, L};
+
+  HiddenTapResult normed, raw;
+  ASSERT_TRUE(enc->encode(ids, req, &normed, &err));
+  req.skip_final_norm = true;
+  ASSERT_TRUE(enc->encode(ids, req, &raw, &err));
+  if (!normed.valid() || !raw.valid()) { return; }
+
+  const int last = (int)ids.size() - 1;
+  const double n_L = row_rms_(normed, 2, last);
+  const double r_L = row_rms_(raw, 2, last);
+  std::printf("  index L: normed rms %.4f, raw rms %.4f\n", n_L, r_L);
+  // They must DIFFER materially -- equality would mean the flag did
+  // nothing. Deliberately not a direction: which is larger depends on
+  // the checkpoint's final-norm gain, not on the convention. MEASURED,
+  // same flag: e4b's tail never reaches the norm at all, and the 12B
+  // goes 0.182 raw -> 3.555 normed because its gain is ~3.6.
+  const double lo = std::min(n_L, r_L), hi = std::max(n_L, r_L);
+  EXPECT_TRUE(hi > lo * 1.05);
+
+  // ...and every OTHER index is untouched. Bit-identical, not close:
+  // the flag changes which tensor index L reads, and nothing else about
+  // the forward.
+  for (int slot = 0; slot < 2; ++slot) {
+    const double a = row_rms_(normed, slot, last);
+    const double b = row_rms_(raw, slot, last);
+    EXPECT_TRUE(std::abs(a - b) < 1e-9);
+  }
+  // Deterministic, like every other tap.
+  HiddenTapResult raw2;
+  ASSERT_TRUE(enc->encode(ids, req, &raw2, &err));
+  EXPECT_TRUE(std::abs(row_rms_(raw2, 2, last) - r_L) < 1e-6);
 }

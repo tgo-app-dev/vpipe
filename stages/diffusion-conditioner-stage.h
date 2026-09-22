@@ -272,6 +272,15 @@ private:
   mutable int _img_tok[kMaxRefs] = {0, 0};
   mutable int _img_n = 0;          // references the tower actually encoded
 
+  // Qwen-Image-2.1's joint-sequence bookkeeping, published on the
+  // conditioning beat's sideband. Nothing downstream can recover it:
+  // an image row's embedding is a tower output, not a token id, so
+  // which rows are image slots is knowable only here.
+  mutable std::vector<std::uint8_t> _qi21_slots;
+  mutable int _qi21_grid_h[kMaxRefs] = {0, 0};
+  mutable int _qi21_grid_w[kMaxRefs] = {0, 0};
+  mutable int _qi21_nref = 0;
+
   bool load_encoder_(metal_compute::MetalCompute* mc);
   // The VOSR path: one picture in, one conditioning beat out, driven by
   // the ref_image iport rather than by a prompt.

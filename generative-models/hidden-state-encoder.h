@@ -54,6 +54,22 @@ struct HiddenTapRequest {
   // position < key_valid_len, matching HF's attention_mask over the
   // real prefix. 0 disables (the whole sequence is real).
   int key_valid_len = 0;
+  // Index L returns the RAW residual out of the last layer, without the
+  // model's final norm -- HF's `hidden_states[-1]` with `self.norm`
+  // neutralized.
+  //
+  // It exists because the convention above cannot otherwise express a
+  // tap a shipping model wants. Index L is post-norm and index L-1 is
+  // the layer BEFORE the last, so "the last layer, un-normed" has no
+  // index at all. Qwen-Image-2.1 conditions on exactly that: diffusers
+  // hangs a forward hook on the text encoder's norm to return its own
+  // input, and the comment there notes that taking the normed value
+  // instead is a third of the signal, visible first in rendered text.
+  //
+  // Affects INDEX L ONLY; every other index is un-normed already. An
+  // encoder that cannot honour it must FAIL rather than return the
+  // normed state, which is indistinguishable downstream.
+  bool skip_final_norm = false;
 };
 
 // [slot][pos][hidden] in the model's compute dtype, slot j being

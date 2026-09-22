@@ -474,6 +474,59 @@ kernel void conv2d_hw_3x3_s1_c32_f16(
   cT.store(mD);
 }
 
+// And a 16-CHANNEL destination tile, for Cout % 32 != 0 but Cout % 16 ==
+// 0 -- Qwen-Image-2.1's 144-wide decoder top level, which is the
+// FULL-RESOLUTION one and which neither tile above can serve, so all of
+// its 3x3s ran through im2col. MEASURED at 1024^2: that level cost 1098
+// ms of a 4442 ms decode (25.3%) while carrying a QUARTER the conv FLOPs
+// of the 288-wide level below it, which the 32 tile does serve in 919
+// ms. Identical contract otherwise; dispatch z over Cout/16.
+kernel void conv2d_hw_3x3_s1_c16_f16(
+    const device VPIPE_ELT* inp  [[buffer(0)]],
+    const device VPIPE_ELT* wt   [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    const constant int& img_w [[buffer(3)]],
+    const constant int& img_h [[buffer(4)]],
+    const constant int& cin   [[buffer(5)]],
+    const constant int& cout  [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+  constexpr int kTileC = 16;
+  using T4 = tensor<device VPIPE_ELT, dextents<int32_t, 4>, tensor_inline>;
+  T4 tA(const_cast<device VPIPE_ELT*>(inp),
+        dextents<int32_t, 4>(cin, img_w, img_h, 1));
+  T4 tW(const_cast<device VPIPE_ELT*>(wt),
+        dextents<int32_t, 4>(cout, cin, 3, 3));
+  T4 tD(out, dextents<int32_t, 4>(cout, img_w, img_h, 1));
+
+  constexpr auto desc = convolution2d_descriptor(
+      /*destination_dimensions=*/int4(kTileC, CV_TW, CV_TH, 1),
+      /*source_dimensions=*/int4(CV_CIN, CV_HW, CV_HW, 1),   // patched below
+      /*kernel_dimensions=*/int2(3, 3),
+      convolution2d_activation_layout::nhwc,
+      convolution2d_weights_layout::hwio,
+      /*strides=*/int2(1, 1), /*dilations=*/int2(1, 1), /*groups=*/1,
+      /*relaxed_precision=*/false,
+      convolution2d_descriptor::mode::multiply);
+  convolution2d<desc, execution_simdgroups<CV_SG>> op;
+
+  const int ox0 = (int)tgid.x * CV_TW;
+  const int oy0 = (int)tgid.y * CV_TH;
+  const int oc0 = (int)tgid.z * kTileC;
+
+  auto sW = tW.slice(oc0, 0, 0, 0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(tA), decltype(sW), VPIPE_ELT>();
+  convolution2d_descriptor rd = desc;
+  rd.source_dimensions = int4(cin, img_w, img_h, 1);
+  int2 off = int2(ox0, oy0);
+  __convolution2d_detail::__run<execution_simdgroups<CV_SG>,
+                                decltype(tA), decltype(sW), decltype(cT)>(
+      tA, sW, cT, rd, off);
+  auto mD = tD.slice(oc0, ox0, oy0, 0);
+  cT.store(mD);
+}
+
 // ACCUMULATING twins of the two general hw convs: out += conv(inp, wt),
 // the destination tile loaded into the cooperative tensor and run in
 // mode::multiply_accumulate. They let a causal 3x3x3 conv run as THREE 2D
@@ -610,6 +663,66 @@ kernel void conv2d_hw_3x3_s2_c32_f16(
     uint3 tgid [[threadgroup_position_in_grid]])
 {
   constexpr int kTileC = 32;
+  const int ow = img_w / 2, oh = img_h / 2;
+  using T4 = tensor<device VPIPE_ELT, dextents<int32_t, 4>, tensor_inline>;
+  T4 tA(const_cast<device VPIPE_ELT*>(inp),
+        dextents<int32_t, 4>(cin, img_w, img_h, 1));
+  T4 tW(const_cast<device VPIPE_ELT*>(wt),
+        dextents<int32_t, 4>(cout, cin, 3, 3));
+  T4 tD(out, dextents<int32_t, 4>(cout, ow, oh, 1));
+
+  constexpr auto desc = convolution2d_descriptor(
+      /*destination_dimensions=*/int4(kTileC, CV_TW, CV_TH, 1),
+      /*source_dimensions=*/int4(CV_CIN, CV_HW, CV_HW, 1),   // patched below
+      /*kernel_dimensions=*/int2(3, 3),
+      convolution2d_activation_layout::nhwc,
+      convolution2d_weights_layout::hwio,
+      /*strides=*/int2(2, 2), /*dilations=*/int2(1, 1), /*groups=*/1,
+      /*relaxed_precision=*/false,
+      convolution2d_descriptor::mode::multiply);
+  convolution2d<desc, execution_simdgroups<CV_SG>> op;
+
+  const int ox0 = (int)tgid.x * CV_TW;      // dest-tile origin
+  const int oy0 = (int)tgid.y * CV_TH;
+  const int oc0 = (int)tgid.z * kTileC;
+
+  // The op reads src = off + k - 1 (pad-1 relative to the offset), so the
+  // offset encodes the padding convention:
+  //   mode 2: (2*ox0, 2*oy0)      -> iy = 2*oy + ky - 1 (SYMMETRIC pad 1)
+  //   mode 3: (2*ox0+1, 2*oy0+1)  -> iy = 2*oy + ky     (ASYMMETRIC pad
+  //           (0,1,0,1), the diffusers Downsample2D / im2col_hwc_3x3_s2
+  //           convention the VAE encoders use)
+  int2 off = int2(ox0, oy0);
+  if (off_mode == 1) { off = int2(ox0 * 2 - 1, oy0 * 2 - 1); }
+  if (off_mode == 2) { off = int2(ox0 * 2, oy0 * 2); }
+  if (off_mode == 3) { off = int2(ox0 * 2 + 1, oy0 * 2 + 1); }
+
+  auto sW = tW.slice(oc0, 0, 0, 0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(tA), decltype(sW), VPIPE_ELT>();
+  convolution2d_descriptor rd = desc;
+  rd.source_dimensions = int4(cin, img_w, img_h, 1);
+  __convolution2d_detail::__run<execution_simdgroups<CV_SG>,
+                                decltype(tA), decltype(sW), decltype(cT)>(
+      tA, sW, cT, rd, off);
+  auto mD = tD.slice(oc0, ox0, oy0, 0);
+  cT.store(mD);
+}
+
+// The stride-2 twin of conv2d_hw_3x3_s1_c16_f16; dispatch z over
+// Cout/16.
+kernel void conv2d_hw_3x3_s2_c16_f16(
+    const device VPIPE_ELT* inp  [[buffer(0)]],
+    const device VPIPE_ELT* wt   [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    const constant int& img_w [[buffer(3)]],
+    const constant int& img_h [[buffer(4)]],
+    const constant int& cin   [[buffer(5)]],
+    const constant int& cout  [[buffer(6)]],
+    const constant int& off_mode [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+  constexpr int kTileC = 16;
   const int ow = img_w / 2, oh = img_h / 2;
   using T4 = tensor<device VPIPE_ELT, dextents<int32_t, 4>, tensor_inline>;
   T4 tA(const_cast<device VPIPE_ELT*>(inp),
@@ -1099,6 +1212,12 @@ kernel void conv2d_hw_3x3_s2_f16(device VPIPE_ELT* out [[buffer(2)]],
                                  uint tid [[thread_position_in_grid]])
 { if (tid == 0) { out[0] = (VPIPE_ELT)0; } }
 kernel void conv2d_hw_3x3_s2_c32_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                     uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void conv2d_hw_3x3_s1_c16_f16(device VPIPE_ELT* out [[buffer(2)]],
+                                     uint tid [[thread_position_in_grid]])
+{ if (tid == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void conv2d_hw_3x3_s2_c16_f16(device VPIPE_ELT* out [[buffer(2)]],
                                      uint tid [[thread_position_in_grid]])
 { if (tid == 0) { out[0] = (VPIPE_ELT)0; } }
 #endif

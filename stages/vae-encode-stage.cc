@@ -224,7 +224,9 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it. May also name a STANDALONE VAE "
           "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,qwen-image-edit,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
+                      "qwen-image-edit,qwen-image-21,"
+                      ""
        "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
@@ -331,6 +333,9 @@ vae_family_(const std::string& vae_dir)
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
+        // See the note in vae-decode-stage.cc: the same implementation,
+        // generalized, so the same family string.
+        if (cls == "AutoencoderKLQwenImage21") { return "krea2"; }
         if (cls == "AutoencoderKLWan") { return "wan"; }
         if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
       }
@@ -767,25 +772,12 @@ VaeEncodeStage::ensure_loaded_()
     if (in) {
       FlexData fd = FlexData::from_json(in);
       if (fd.is_object()) {
-        auto obj = fd.as_object();
-        if (obj.contains("z_dim")) {
-          cfg.z_dim = (int)obj.at("z_dim").as_int(cfg.z_dim);
-        }
-        if (obj.contains("base_dim")) {
-          cfg.base_dim = (int)obj.at("base_dim").as_int(cfg.base_dim);
-        }
-        if (obj.contains("num_res_blocks")) {
-          cfg.num_res_blocks =
-              (int)obj.at("num_res_blocks").as_int(cfg.num_res_blocks);
-        }
-        if (obj.contains("latents_mean")) {
-          FlexData lm = obj.at("latents_mean");
-          for (auto v : lm.as_real_span()) { cfg.latents_mean.push_back((float)v); }
-        }
-        if (obj.contains("latents_std")) {
-          FlexData ls = obj.at("latents_std");
-          for (auto v : ls.as_real_span()) { cfg.latents_std.push_back((float)v); }
-        }
+        // One reader for both VAE stages. It also picks up the keys
+        // AutoencoderKLQwenImage21 needs -- dim_mult (whose LENGTH is
+        // the level count), decoder_base_dim, is_residual and the
+        // in/out channel counts -- which a per-stage copy of the
+        // four-key version would have been missing on one side.
+        genai::MetalKrea2Vae::config_from_json(fd, &cfg);
       }
     }
   }
@@ -1621,8 +1613,11 @@ VaeEncodeStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // f16 whitened latent [z_dim, H/8, W/8] -> f32 TensorBeat.
-  const int Cz = _vae->config().z_dim, lh = H / 8, lw = W / 8;
+  // f16 whitened latent [z_dim, H/px, W/px] -> f32 TensorBeat. px is 8
+  // for every checkpoint this path served until Qwen-Image-2.1, whose
+  // five levels make it 16 -- asked, not assumed.
+  const int px = _vae->config().spatial_factor();
+  const int Cz = _vae->config().z_dim, lh = H / px, lw = W / px;
   const std::size_t nz = (std::size_t)Cz * lh * lw;
   auto out = std::make_unique<TensorBeatPayload>();
   out->dtype = TensorBeat::DType::F32;

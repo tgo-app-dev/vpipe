@@ -58,7 +58,8 @@ public:
 
     std::string e;
     auto buf = _m->forward_embeddings_taps(_cid, ids, req.indices,
-                                           req.key_valid_len, &e);
+                                           req.key_valid_len, &e,
+                                           req.skip_final_norm);
     if (buf.empty()) {
       if (err != nullptr) { *err = std::move(e); }
       return false;

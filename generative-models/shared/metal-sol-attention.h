@@ -185,6 +185,40 @@ class MetalSolAttention {
               int tokens, int d, float scale, const sol::Config& cfg,
               std::string* err);
 
+  // A RECTANGULAR BAND of a longer sequence.
+  //
+  // `q`/`out` hold `q_rows` rows per head and this call attends
+  // `q_tokens` of them starting at `q_off`; `k`/`v` hold `k_rows` and
+  // it reads `k_tokens` from the start. The square forms above are this
+  // one with every field equal to the sequence length and `q_off` 0.
+  //
+  // `q_off` is the query's position IN THE SEQUENCE, which is what the
+  // local band is measured against -- not a buffer offset. For a
+  // segment of a joint stream the two coincide, and they are named
+  // apart because nothing guarantees it.
+  struct Band {
+    int q_tokens = 0;   // queries this call attends
+    int k_tokens = 0;   // keys it attends them against, from row 0
+    int q_rows   = 0;   // rows per head in `q` / `out`
+    int k_rows   = 0;   // rows per head in `k` / `v`
+    int q_off    = 0;   // sequence position of the first query
+    // The ROW of `q`/`out` the band starts at. Distinct from `q_off`:
+    // that is where the queries sit in the SEQUENCE and is what the
+    // local band is measured against, this is where they sit in the
+    // BUFFER. They coincide when the buffer holds the whole joint
+    // stream -- which is the common case and exactly why conflating
+    // them survives every test that does not separate them.
+    int q_row0   = 0;
+  };
+
+  bool encode(metal_compute::ComputeEncoder& enc,
+              const metal_compute::SharedBuffer& q,
+              const metal_compute::SharedBuffer& k,
+              const metal_compute::SharedBuffer& v,
+              metal_compute::SharedBuffer& out, int heads, int kv_heads,
+              const Band& band, int d, float scale, const sol::Config& cfg,
+              std::string* err);
+
   // Blocks kept exact by the LAST completed encode, and the total the
   // routing chose from. Valid only after the command buffer has run.
   // Realized sparsity is a property of the data, so it is read back
@@ -319,8 +353,9 @@ class MetalSolAttention {
   // `unload_when_idle: destroy` and left the VAE decode with nothing.
   // See metal_compute_residency.a_subview_adds_the_whole_parent.
   void drop_residency_();
-  bool ensure_scratch_(int heads, int kv_heads, int tokens, int d,
-                       std::string* err);
+  bool ensure_scratch_(int heads, int kv_heads, int q_tokens, int k_tokens,
+                       int d, std::string* err);
+  void set_band_params_(int heads, int kv_heads, const Band& band, int d);
   bool ensure_steel_(int tokens, std::string* err);
   // The steel entry point for this object's kernel arm AND head width.
   metal_compute::ComputeFunction _lib_for_width_(
@@ -404,6 +439,9 @@ class MetalSolAttention {
   bool                        _res_added = false;
   metal_compute::SharedBuffer _counts, _params, _sp_params, _sp_bounds;
   int _heads = 0, _tokens = 0, _d = 0, _nq = 0, _nk = 0, _tpad = 0;
+  // The KEY extent the scratch was built for. `_tokens` is the QUERY
+  // one; they were the same number until the band form.
+  int _k_tokens = 0;
   // Heads K and V carry. Equal to _heads under MHA, which is what every
   // caller was until GQA; part of the geometry tag because the key
   // summaries are sized by it.

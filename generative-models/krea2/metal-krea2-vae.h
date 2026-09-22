@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
@@ -34,14 +35,68 @@ class MetalKrea2Vae {
  public:
   struct Config {
     int base_dim       = 96;
+    // Decoder width when it differs from the encoder's: Qwen-Image-2.1 is
+    // base_dim 96 against decoder_base_dim 144. 0 means "same as
+    // base_dim", which is every checkpoint that came before it -- a
+    // sentinel rather than a real default because Config is
+    // aggregate-initialized all over the tree and an in-class
+    // initializer cannot name another member.
+    int decoder_base_dim = 0;
     int z_dim          = 16;
-    int dim_mult[4]    = {1, 2, 4, 4};
+    // One entry per LEVEL, so the vector's size is the level count and
+    // the spatial factor follows from it. A fixed int[4] until
+    // Qwen-Image-2.1 arrived with five levels ({1,2,4,8,8}, /16).
+    std::vector<int> dim_mult = {1, 2, 4, 4};
     int num_res_blocks = 2;
+    // Image channels. 3 on both sides everywhere until Qwen-Image-2.1,
+    // which is natively RGBA and reads/writes 4.
+    int in_channels    = 3;
+    int out_channels   = 3;
+    // The parameter-free residual shortcut AutoencoderKLQwenImage21 puts
+    // around each down/up block: group-average the channels after a
+    // space-to-depth on the way down, repeat them before a depth-to-space
+    // on the way up. It carries NO weights, so a checkpoint cannot be
+    // told from its tensors -- it comes from the config only.
+    bool is_residual   = false;
+    // Which levels compress TIME. The image path skips every temporal
+    // conv (one frame, so only the kt=2 slice contributes), which is why
+    // this was never needed before -- but the is_residual shortcut is a
+    // channel REGROUPING whose arithmetic includes the temporal factor,
+    // so on a single frame it decides which of its output channels are
+    // real and which are the zero-padded frame. Empty means "no level
+    // does", which is the right reading for a checkpoint without the key.
+    // int rather than bool: std::vector<bool>'s proxy reference is a
+    // trap for no benefit at this size.
+    std::vector<int> temperal_downsample;
     // Per-channel latent statistics (config latents_mean / latents_std) used
     // by unwhiten(); the pipeline applies latents = latents * std + mean.
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
+
+    // Levels, and what follows from the level count. Every downsample but
+    // the last level's contributes a factor of 2.
+    int levels() const { return static_cast<int>(dim_mult.size()); }
+    int spatial_factor() const { return 1 << (levels() - 1); }
+    // The decoder's base width, resolving the sentinel above.
+    int dec_base() const
+    {
+      return decoder_base_dim > 0 ? decoder_base_dim : base_dim;
+    }
   };
+
+  // Fill a Config from a parsed diffusers vae/config.json object.
+  //
+  // It exists because the two VAE stages each grew their own copy of the
+  // same four-key reader, so a key added for one was silently missing
+  // from the other -- and the keys that arrived with
+  // AutoencoderKLQwenImage21 (dim_mult, decoder_base_dim, is_residual,
+  // in/out_channels) are exactly the ones a half-read config gets wrong
+  // QUIETLY: a five-level checkpoint read as four levels asks for
+  // tensors that exist, at widths that do not.
+  //
+  // Absent keys leave `out` alone, so it layers over defaults. Mirrors
+  // MetalWanVae::config_from_json.
+  static void config_from_json(const FlexData& cfg_obj, Config* out);
 
   // `with_encoder` also loads the encoder weights (for the img2img encode
   // path); the decode-only path (text-to-image) leaves it false to save RAM.
@@ -124,13 +179,28 @@ class MetalKrea2Vae {
   struct UpBlock {
     std::vector<ResBlock> resnets;
     bool has_up = false;
-    Conv up;                        // resample.1: 3x3 conv (dim -> dim/2)
+    // resample.1: 3x3 conv. dim -> dim/2 normally; dim -> dim under
+    // is_residual, where the narrowing moves into the next level's first
+    // resnet instead. Either way the cout comes from the weight's shape.
+    Conv up;
     int up_dim = 0;                 // channels feeding the upsample conv
+    // The parameter-free DupUp3D shortcut (is_residual only): the
+    // block's INPUT, channel-regrouped and spatially doubled, added to
+    // its output. No weights -- the widths and the temporal factor are
+    // all it needs. res_ft is 2 on a level that upsamples TIME, which
+    // still decides the channel mapping on a single frame.
+    bool has_res = false;
+    int res_in = 0, res_out = 0, res_ft = 1;
   };
   struct DownStage {                // encoder down_blocks stage
     std::vector<ResBlock> resnets;  // num_res_blocks per stage
     bool has_down = false;
     Conv down;                      // resample.1: 3x3 STRIDE-2 conv (dim->dim)
+    // The AvgDown3D twin of UpBlock::has_res. res_fs is 1 on the last
+    // level, which has no downsample -- there the shortcut collapses to
+    // a plain residual add rather than vanishing.
+    bool has_res = false;
+    int res_in = 0, res_out = 0, res_ft = 1, res_fs = 1;
   };
 
   Conv load_conv3x3_(WeightSet& ws, const std::string& nm,
@@ -202,14 +272,15 @@ class MetalKrea2Vae {
   Conv _conv_in;                    // 3x3 conv z_dim -> dims[0]
   ResBlock _mid_res0, _mid_res1;
   Attn _mid_attn;
-  std::vector<UpBlock> _up_blocks;  // 4
+  std::vector<UpBlock> _up_blocks;  // cfg.levels()
   metal_compute::SharedBuffer _norm_out_g;
-  Conv _conv_out;                   // 3x3 conv base_dim -> 3
+  Conv _conv_out;                   // 3x3 conv dec_base -> out_channels
 
   // ---- encoder (loaded only when with_encoder) ----
   bool _has_encoder = false;
-  Conv _enc_conv_in;                // 3x3 conv 3 -> base
-  std::vector<DownStage> _enc_down; // 4 stages (3 with a stride-2 downsample)
+  Conv _enc_conv_in;                // 3x3 conv in_channels -> base
+  // cfg.levels() stages, all but the last with a stride-2 downsample.
+  std::vector<DownStage> _enc_down;
   ResBlock _enc_mid_res0, _enc_mid_res1;
   Attn _enc_mid_attn;
   metal_compute::SharedBuffer _enc_norm_out_g;
@@ -317,6 +388,7 @@ class MetalKrea2Vae {
   // could reach the hardware conv only through this tile. The stride-2 twin
   // serves the encoder's first downsample (96 -> 96).
   metal_compute::ComputeFunction _fn_conv_hw_s1_c32, _fn_conv_hw_s2_c32;
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c16, _fn_conv_hw_s2_c16;
   // Direct 3x3 for a small output-channel count. The hardware conv needs
   // cout % 64 == 0, so this VAE's final convs -- decoder.conv_out (-> 3) and
   // encoder.conv_out (-> 2*z_dim) -- drop to im2col AT FULL RESOLUTION and pay
@@ -341,7 +413,19 @@ class MetalKrea2Vae {
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_rms, _fn_mul_sigmoid,
       _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2, _fn_upsample,
+      // The wide-head scalar attention (sdpa_full_wide_f16). The ordinary
+      // one indexes its per-thread registers with ceil(D/32) against a
+      // fixed 16, so it cannot carry a head dim past 512 -- and it
+      // OVERFLOWS rather than failing there. Selected by width in
+      // encode_mid_attn_.
+      _fn_sdpa_wide,
       _fn_im2col_tiled, _fn_im2col_s2_tiled;
+  // AutoencoderKLQwenImage21's parameter-free residual shortcuts. Loaded
+  // best-effort and only USED when cfg.is_residual, so a checkpoint
+  // without them is unaffected; validated at load for the ones that need
+  // them, since an unvalidated ComputeFunction is a silent no-op and a
+  // missing shortcut is a plausible picture rather than a failure.
+  metal_compute::ComputeFunction _fn_res_dup_up, _fn_res_avg_down;
   // Matrix-core FULL flash-attention for the mid-block self-attention (D = the
   // mid channel dim). Replaces the scalar O(N^2) sdpa_full_f16 that dominates
   // decode at high res. Loaded best-effort (matrix cores only, D in {384,512});
@@ -370,7 +454,9 @@ class MetalKrea2Vae {
   // never lists kMat.
   using MidAttn = vae_mid_attn::Kind;
   MidAttn _attn_pick = MidAttn::kScalar;
-  bool mid_attn_available_(MidAttn k) const;
+  // `C` is the head width the candidate would run at: the scalar
+  // path's two forms differ only in how wide a head they can index.
+  bool mid_attn_available_(MidAttn k, int C) const;
   void encode_mid_attn_(metal_compute::ComputeEncoder& enc, MidAttn kind,
                         const metal_compute::SharedBuffer& q,
                         const metal_compute::SharedBuffer& k,

@@ -259,11 +259,15 @@ public:
   // key_valid_len > 0 applies a PREFIX KEY-MASK, matching HF's
   // attention_mask over a right-padded prompt.
   metal_compute::SharedBuffer
+  // `skip_final_norm` changes what INDEX n_layers means: the raw
+  // residual rather than the post-norm one. No effect on any other
+  // index, and no effect at all when n_layers is not requested.
   forward_embeddings_taps(ContextId cid,
                           const std::vector<std::int32_t>& ids,
                           const std::vector<int>& hf_indices,
                           int key_valid_len = 0,
-                          std::string* err = nullptr);
+                          std::string* err = nullptr,
+                          bool skip_final_norm = false);
 
   // Own-KV lifecycle (the exec calls these on branch / release).
   bool branch_kv(ContextId parent, ContextId child);
@@ -367,6 +371,9 @@ private:
     // the whole call fails, rather than handing back a buffer with a
     // silently stale slot.
     bool partial = false;
+    // Index n_layers hands back the RAW residual instead of the normed
+    // one. See HiddenTapRequest::skip_final_norm.
+    bool skip_final_norm = false;
   };
   TapState* _taps = nullptr;
   // Copy [n*hidden] from `src` into slot `slot` of the tap buffer.

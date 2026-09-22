@@ -14,7 +14,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <vector>
 
@@ -97,6 +100,105 @@ MetalKrea2Vae::wname_(const std::string& diffusers_name) const
 // values, one axis fewer. Reading a 4-D tensor as 5-D indexes past the
 // end of every row, so trusting the caller here is not a mis-load that
 // fails, it is one that produces a plausible picture of nothing.
+
+// Per-level activation TRACE, for locating a numeric gap against a
+// reference. VPIPE_VAE_TRACE names a directory; each call writes the
+// channel-last [rows, C] tensor as raw f32 under `<dir>/<tag>.f32`.
+// Off by default and costs nothing when unset. The caller must have
+// COMMITTED the stream first -- the buffer is read on the host.
+namespace {
+void
+trace_dump_(const char* tag, const metal_compute::SharedBuffer& b,
+            std::size_t rows, int C)
+{
+  const char* d = std::getenv("VPIPE_VAE_TRACE");
+  if (d == nullptr || *d == '\0' || b.empty()) { return; }
+  std::error_code ec;
+  std::filesystem::create_directories(d, ec);
+  const std::size_t n = rows * (std::size_t)C;
+  if (b.byte_size() < n * 2) { return; }
+  const auto* sp = static_cast<const _Float16*>(b.contents());
+  std::vector<float> v(n);
+  for (std::size_t i = 0; i < n; ++i) { v[i] = (float)sp[i]; }
+  std::ofstream o(std::filesystem::path(d) / (std::string(tag) + ".f32"),
+                  std::ios::binary);
+  if (o) {
+    o.write(reinterpret_cast<const char*>(v.data()),
+            (std::streamsize)(v.size() * sizeof(float)));
+  }
+}
+}  // namespace
+
+// The widest head the scalar mid-block attention can index, which is
+// SDPA_WIDE_MAX_PER * 32 from sdpa.metal. Kept here as a plain number
+// because the metal side is compiled separately -- so if that macro
+// moves, this is the other half to move with it, and the check below is
+// what makes the mismatch loud.
+constexpr int kMaxScalarAttnDim = 40 * 32;
+
+// Diffusers vae/config.json -> Config. See the header for why this is
+// here rather than in each stage.
+void
+MetalKrea2Vae::config_from_json(const FlexData& cfg_obj, Config* out)
+{
+  if (out == nullptr || !cfg_obj.is_object()) { return; }
+  auto o = cfg_obj.as_object();
+  auto get_int = [&](const char* k, int d) {
+    return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+  };
+  out->base_dim         = get_int("base_dim", out->base_dim);
+  out->decoder_base_dim = get_int("decoder_base_dim", out->decoder_base_dim);
+  out->z_dim            = get_int("z_dim", out->z_dim);
+  out->num_res_blocks   = get_int("num_res_blocks", out->num_res_blocks);
+  out->in_channels      = get_int("in_channels", out->in_channels);
+  out->out_channels     = get_int("out_channels", out->out_channels);
+  if (o.contains("is_residual")) {
+    out->is_residual = o.at("is_residual").as_bool(out->is_residual);
+  }
+  // as_array() returns a VIEW into the owning FlexData, so each one is
+  // bound to a named local first -- a temporary would dangle.
+  if (o.contains("dim_mult")) {
+    const FlexData dm = o.at("dim_mult");
+    if (dm.is_array()) {
+      auto a = dm.as_array();
+      // REPLACED wholesale, not overwritten in place: the size IS the
+      // level count, so merging a five-entry config into a four-entry
+      // default would keep the shorter one and quietly decode a
+      // five-level checkpoint at /8.
+      std::vector<int> v;
+      v.reserve(a.size());
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        v.push_back((int)a.at(i).as_int(1));
+      }
+      if (v.size() >= 2) { out->dim_mult = std::move(v); }
+    }
+  }
+  if (o.contains("temperal_downsample")) {      // sic -- the upstream spelling
+    const FlexData td = o.at("temperal_downsample");
+    if (td.is_array()) {
+      auto a = td.as_array();
+      std::vector<int> v;
+      v.reserve(a.size());
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        v.push_back(a.at(i).as_bool(false) ? 1 : 0);
+      }
+      out->temperal_downsample = std::move(v);
+    }
+  }
+  auto read_vec = [&](const char* k, std::vector<float>& dst) {
+    if (!o.contains(k)) { return; }
+    const FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    auto a = v.as_array();
+    dst.clear();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      dst.push_back((float)a.at(i).as_real(0.0));
+    }
+  };
+  read_vec("latents_mean", out->latents_mean);
+  read_vec("latents_std", out->latents_std);
+}
+
 MetalKrea2Vae::Conv
 MetalKrea2Vae::load_conv3x3_(WeightSet& ws, const std::string& nm,
                              bool from3d)
@@ -199,10 +301,12 @@ void MetalKrea2Vae::load_wide_attn_(int mid_d)
 }
 
 bool
-MetalKrea2Vae::mid_attn_available_(MidAttn k) const
+MetalKrea2Vae::mid_attn_available_(MidAttn k, int C) const
 {
   switch (k) {
-    case MidAttn::kScalar: return _fn_sdpa.valid();
+    case MidAttn::kScalar:
+      // The wide twin is the only scalar path past 512 channels.
+      return C > 32 * 16 ? _fn_sdpa_wide.valid() : _fn_sdpa.valid();
     case MidAttn::kSmm:    return _fn_sdpa_full_smm.valid();
     case MidAttn::kMma8:   return _fn_sdpa_full_mma.valid();
     case MidAttn::kWide16: return _fn_sdpa_full_wide16.valid();
@@ -248,10 +352,16 @@ MetalKrea2Vae::encode_mid_attn_(ComputeEncoder& enc, MidAttn kind,
       enc.dispatch({nt, 1, (unsigned)((hw + 31) / 32)}, {nt, 1, 1});
       break;
     }
-    default:
-      enc.set_function(_fn_sdpa);                    // scalar O(N^2)
+    default: {
+      // scalar O(N^2). Past 32*16 channels the ordinary kernel cannot
+      // index its own registers, so the wide twin carries it; see
+      // sdpa.metal. A width past the wide bound is REFUSED by the
+      // caller, not silently truncated here.
+      const bool wide = C > 32 * 16;
+      enc.set_function(wide ? _fn_sdpa_wide : _fn_sdpa);
       enc.dispatch({32, 1, (unsigned)hw}, {32, 1, 1});
       break;
+    }
   }
 }
 
@@ -261,29 +371,41 @@ MetalKrea2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
   // Capability guess, kept when the tune is skipped or an override names a
   // member outright.
   _attn_pick = MidAttn::kScalar;
-  const bool smm_ok = mid_attn_available_(MidAttn::kSmm) &&
+  const bool smm_ok = mid_attn_available_(MidAttn::kSmm, C) &&
                       (C % 64 == 0) && (C <= 512);
   if (smm_ok) { _attn_pick = MidAttn::kSmm; }
   if (mc->supports_matrix_cores()) {
-    if (mid_attn_available_(MidAttn::kMma8))   { _attn_pick = MidAttn::kMma8; }
-    if (mid_attn_available_(MidAttn::kWide32)) { _attn_pick = MidAttn::kWide32; }
+    if (mid_attn_available_(MidAttn::kMma8, C)) {
+      _attn_pick = MidAttn::kMma8;
+    }
+    if (mid_attn_available_(MidAttn::kWide32, C)) {
+      _attn_pick = MidAttn::kWide32;
+    }
   }
   if (std::getenv("VPIPE_KREA2_VAE_ATTN_SMM") != nullptr && smm_ok) {
     _attn_pick = MidAttn::kSmm; return;
   }
   if (const char* e = std::getenv("VPIPE_KREA2_VAE_ATTN_BQ")) {
     const int b = std::atoi(e);
-    if (b == 8  && mid_attn_available_(MidAttn::kMma8))   { _attn_pick = MidAttn::kMma8; }
-    if (b == 16 && mid_attn_available_(MidAttn::kWide16)) { _attn_pick = MidAttn::kWide16; }
-    if (b == 32 && mid_attn_available_(MidAttn::kWide32)) { _attn_pick = MidAttn::kWide32; }
-    if (b == 64 && mid_attn_available_(MidAttn::kWide64)) { _attn_pick = MidAttn::kWide64; }
+    if (b == 8 && mid_attn_available_(MidAttn::kMma8, C)) {
+      _attn_pick = MidAttn::kMma8;
+    }
+    if (b == 16 && mid_attn_available_(MidAttn::kWide16, C)) {
+      _attn_pick = MidAttn::kWide16;
+    }
+    if (b == 32 && mid_attn_available_(MidAttn::kWide32, C)) {
+      _attn_pick = MidAttn::kWide32;
+    }
+    if (b == 64 && mid_attn_available_(MidAttn::kWide64, C)) {
+      _attn_pick = MidAttn::kWide64;
+    }
     return;
   }
   std::vector<MidAttn> cands;
   for (MidAttn k : {MidAttn::kSmm, MidAttn::kMma8, MidAttn::kWide16,
                     MidAttn::kWide32, MidAttn::kWide64}) {
     if (k == MidAttn::kSmm && !smm_ok) { continue; }
-    if (mid_attn_available_(k)) { cands.push_back(k); }
+    if (mid_attn_available_(k, C)) { cands.push_back(k); }
   }
   std::string detail;
   const auto t0 = std::chrono::steady_clock::now();
@@ -413,6 +535,7 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_residual    = m->_lib_elt.function("residual_add_f16");
   m->_fn_clamp       = m->_lib_elt.function("clamp_f16");
   m->_fn_sdpa        = m->_lib_sdpa.function("sdpa_full_f16");
+  m->_fn_sdpa_wide   = m->_lib_sdpa.function("sdpa_full_wide_f16");
   m->_fn_sdpa_full_smm = m->_lib_sdpa.function("sdpa_full_mma_f16");
   // Direct small-cout 3x3 (see conv3x3_small_cout_). Loaded HERE, ahead of the
   // first load_conv3x3_, because that decides whether to build the HWIO twin
@@ -427,6 +550,16 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_fn_im2col_s2_tiled =
       m->_lib_elt.function("im2col_hwc_3x3_s2_tiled_f16");
   m->_fn_upsample    = m->_lib_elt.function("upsample_nearest2x_hwc_f16");
+  if (cfg.is_residual) {
+    m->_fn_res_dup_up   = m->_lib_elt.function("vae_res_dup_up_f16");
+    m->_fn_res_avg_down = m->_lib_elt.function("vae_res_avg_down_f16");
+    if (!m->_fn_res_dup_up.valid() || !m->_fn_res_avg_down.valid()) {
+      // Refuse rather than run: without the shortcut every level is
+      // missing a term, which decodes to a picture that merely looks
+      // wrong.
+      return nullptr;
+    }
+  }
   if (!m->_fn_gemm_bias.valid() || !m->_fn_rms.valid() ||
       !m->_fn_mul_sigmoid.valid() || !m->_fn_residual.valid() ||
       !m->_fn_clamp.valid() || !m->_fn_sdpa.valid() ||
@@ -483,7 +616,15 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // can't run the metal4.0 tensor kernel keeps the scalar fallback.
   // VPIPE_KREA2_NO_MMA_ATTN forces scalar.
   if (std::getenv("VPIPE_KREA2_NO_MMA_ATTN") == nullptr) {
-    const int mid_d = cfg.base_dim * cfg.dim_mult[3];
+    // The DECODER's mid width. It is the encoder's too wherever
+    // decoder_base_dim is unset, which is every checkpoint but
+    // Qwen-Image-2.1 -- there the encoder's mid is base_dim*mult.back()
+    // = 768 against this 1152, and the single-valued pick below serves
+    // the decoder. That is safe rather than wrong only because NEITHER
+    // width has an instantiated kernel (see the 384/512 table), so both
+    // halves fall to the scalar path. Instantiating one without giving
+    // the encoder its own pick would hand it the decoder's head_dim.
+    const int mid_d = cfg.dec_base() * cfg.dim_mult.back();
     const char* fn = (mid_d == 384) ? "sdpa_full_mma2_d384_f16"
                    : (mid_d == 512) ? "sdpa_full_mma2_d512_f16"
                                     : nullptr;
@@ -491,6 +632,21 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       m->_lib_sdpa_mma = mc->load_library("sdpa_mma");
       m->_fn_sdpa_full_mma = m->_lib_sdpa_mma.function(fn);
       m->load_wide_attn_(mid_d);
+    }
+    // The scalar path indexes per-thread registers with ceil(D/32)
+    // against a fixed bound, so a head wider than the WIDE form can
+    // carry has no correct fallback at all. Say so instead of running:
+    // the failure this replaces was a 1152-wide VAE quietly overflowing
+    // a 16-register array and returning a plausible picture.
+    if (mid_d > kMaxScalarAttnDim && !m->_fn_sdpa_full_mma.valid()) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt(
+            "MetalKrea2Vae: mid-block attention is {} channels wide, past "
+            "the {} the scalar kernel can index, and no matmul2d flash is "
+            "built for it -- refusing rather than computing nonsense",
+            mid_d, kMaxScalarAttnDim));
+      }
+      return nullptr;
     }
     m->autotune_mid_attn_(mc, mid_d);
     // Prefer matmul2d flash only where the matrix units make it worthwhile
@@ -510,6 +666,13 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
         m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_f16");
     m->_fn_conv_hw_s2_c32 =
         m->_lib_convhw.function("conv2d_hw_3x3_s2_c32_f16");
+    // And the 16-channel tile, for a width that is not a multiple of 32.
+    // Qwen-Image-2.1's decoder is 144 wide at FULL resolution, so without
+    // this its most expensive level is the one on im2col.
+    m->_fn_conv_hw_s1_c16 =
+        m->_lib_convhw.function("conv2d_hw_3x3_s1_c16_f16");
+    m->_fn_conv_hw_s2_c16 =
+        m->_lib_convhw.function("conv2d_hw_3x3_s2_c16_f16");
     if (!m->_fn_bias_add.valid()) {
       m->_fn_bias_add = m->_lib_elt.function("bias_add_rows_f16");
     }
@@ -517,9 +680,12 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
                      m->_fn_conv_hw_s2.valid() && m->_fn_bias_add.valid();
   }
 
-  const int base = cfg.base_dim;                         // 96
+  // The DECODER's base width, which is base_dim for every checkpoint
+  // but Qwen-Image-2.1 (96 encoder / 144 decoder).
+  const int base = cfg.dec_base();                       // 96
+  const int nlev = cfg.levels();                         // 4
   // Decoder channel dims: [dim*dim_mult[-1]] + dim*dim_mult[::-1].
-  const int dims0 = base * cfg.dim_mult[3];              // 384
+  const int dims0 = base * cfg.dim_mult[(std::size_t)nlev - 1];   // 384
 
   m->_post_quant = m->load_conv1x1_(wts, "post_quant_conv");
   m->_conv_in    = m->load_conv3x3_(wts, "decoder.conv_in", true);
@@ -574,17 +740,34 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
        !m->_mid_attn.k.w.empty() && !m->_mid_attn.v.w.empty() &&
        !m->_mid_attn.proj.w.empty();
 
-  // Upsample blocks. dims = [384, 384, 384, 192, 96]; up i maps dims[i]->dims[i+1]
-  // (for i>0 the resnet in_dim is halved by the previous upsample conv), with an
-  // upsample conv (out -> out/2, spatial 2x) for i != 3.
-  const int dims[5] = {dims0, base * cfg.dim_mult[3], base * cfg.dim_mult[2],
-                       base * cfg.dim_mult[1], base * cfg.dim_mult[0]};
-  m->_up_blocks.resize(4);
-  for (int i = 0; i < 4; ++i) {
+  // Upsample blocks. dims = [dim*mult[-1]] + dim*mult[::-1], so at the
+  // shipped {1,2,4,4} it is [384, 384, 384, 192, 96] and up i maps
+  // dims[i] -> dims[i+1], with an upsample conv for every level but the
+  // last.
+  //
+  // WHERE THE WIDTH NARROWS DEPENDS ON is_residual, and the two
+  // conventions are indistinguishable from the tensor NAMES:
+  //   plain       the upsample conv halves (out -> out/2), so the next
+  //               level's first resnet already sees the halved width --
+  //               hence the `in_dim / 2` below.
+  //   residual    the upsample conv KEEPS the width (out -> out) and the
+  //               narrowing moves into the next level's first resnet,
+  //               which grows a conv_shortcut to match.
+  // Reading a residual checkpoint with the plain rule asks for a resnet
+  // of half the width the file holds, which fails loudly on the shape --
+  // but only because these happen to differ; do not rely on that.
+  std::vector<int> dims;
+  dims.reserve((std::size_t)nlev + 1);
+  dims.push_back(dims0);
+  for (int i = nlev - 1; i >= 0; --i) {
+    dims.push_back(base * cfg.dim_mult[(std::size_t)i]);
+  }
+  m->_up_blocks.resize((std::size_t)nlev);
+  for (int i = 0; i < nlev; ++i) {
     UpBlock& ub = m->_up_blocks[(std::size_t)i];
-    int in_dim = dims[i];
-    if (i > 0) { in_dim = in_dim / 2; }
-    const int out_dim = dims[i + 1];
+    int in_dim = dims[(std::size_t)i];
+    if (i > 0 && !cfg.is_residual) { in_dim = in_dim / 2; }
+    const int out_dim = dims[(std::size_t)i + 1];
     ub.resnets.resize((std::size_t)cfg.num_res_blocks + 1);
     int cin = in_dim;
     for (int r = 0; r <= cfg.num_res_blocks; ++r) {
@@ -594,11 +777,31 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
           ub.resnets[(std::size_t)r], cin, out_dim);
       cin = out_dim;
     }
-    ub.has_up = (i != 3);
+    ub.has_up = (i != nlev - 1);
+    // The parameter-free shortcut runs on exactly the levels that
+    // upsample, and carries the block's own in/out widths because it has
+    // to bridge them itself.
+    ub.res_in = in_dim;
+    ub.res_out = out_dim;
+    ub.has_res = cfg.is_residual && ub.has_up;
+    // temperal_upsample is temperal_downsample REVERSED, so level i of
+    // the decoder reads the encoder's level (nlev-2-i). Out of range --
+    // a config without the key -- means no level compresses time.
+    {
+      const std::size_t td = cfg.temperal_downsample.size();
+      const std::size_t j = (std::size_t)(nlev - 2 - i);
+      ub.res_ft = (i <= nlev - 2 && j < td &&
+                   cfg.temperal_downsample[j] != 0) ? 2 : 1;
+    }
     if (ub.has_up) {
       ub.up_dim = out_dim;
+      // Singular `upsampler` with no list index under is_residual, where
+      // the level is one module rather than a ModuleList. Same shape of
+      // naming difference as the encoder's down_blocks above.
       ub.up = m->load_conv3x3_(
-          wts, "decoder.up_blocks." + std::to_string(i) + ".upsamplers.0.resample.1",
+          wts, "decoder.up_blocks." + std::to_string(i) +
+                   (cfg.is_residual ? ".upsampler.resample.1"
+                                    : ".upsamplers.0.resample.1"),
           false);
       ok = ok && !ub.up.w.empty();
     }
@@ -803,8 +1006,20 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
   // the encoder's first downsample at stride 2.
   const bool c32_ok = stride == 2 ? _fn_conv_hw_s2_c32.valid()
                                   : _fn_conv_hw_s1_c32.valid();
+  // VPIPE_VAE_NO_C16 declines the 16 tile, which is the A/B arm for it:
+  // without a knob the only comparison is across a code change, and the
+  // box moves between builds.
+  static const bool c16_off = std::getenv("VPIPE_VAE_NO_C16") != nullptr;
+  const bool c16_ok = !c16_off &&
+                      (stride == 2 ? _fn_conv_hw_s2_c16.valid()
+                                   : _fn_conv_hw_s1_c16.valid());
+  // Widest tile the width divides by. 16 is the last stop: a decoder
+  // 144 wide at full resolution reaches only this one, and reaching it
+  // is the difference between the hardware op and im2col on the most
+  // expensive level in the decode.
   const int tile = (c.cout % 64 == 0) ? 64
-                 : ((c.cout % 32) == 0 && c32_ok) ? 32 : 0;
+                 : ((c.cout % 32) == 0 && c32_ok) ? 32
+                 : ((c.cout % 16) == 0 && c16_ok) ? 16 : 0;
   if ((OW % 8) != 0 || (OH % 8) != 0 || tile == 0) { return false; }
   // The MPP conv op indexes its source/dest through int32 tensor extents; fall
   // back to the (uint-safe) im2col path before cin*W*H or cout*OW*OH would
@@ -815,9 +1030,12 @@ MetalKrea2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
       (std::size_t)c.cout * OW * OH > kIdxMax) {
     return false;
   }
-  enc.set_function(stride == 2
-                       ? (tile == 32 ? _fn_conv_hw_s2_c32 : _fn_conv_hw_s2)
-                       : (tile == 32 ? _fn_conv_hw_s1_c32 : _fn_conv_hw_s1));
+  enc.set_function(
+      stride == 2
+          ? (tile == 16 ? _fn_conv_hw_s2_c16
+                        : tile == 32 ? _fn_conv_hw_s2_c32 : _fn_conv_hw_s2)
+          : (tile == 16 ? _fn_conv_hw_s1_c16
+                        : tile == 32 ? _fn_conv_hw_s1_c32 : _fn_conv_hw_s1));
   enc.set_buffer(0, in);
   enc.set_buffer(1, c.whwio);
   enc.set_buffer(2, out);
@@ -929,9 +1147,10 @@ MetalKrea2Vae::maybe_tune_conv_(int H, int W, SharedBuffer& col,
   if (!all) {
     constexpr std::size_t kIdxMax = 0x7fffffffull;
     int h = H, w = W;                      // walk the decoder's pyramid
-    const int base = _cfg.base_dim;
-    for (int lvl = 0; lvl < 4 && !all; ++lvl) {
-      const int cin = base * _cfg.dim_mult[lvl];
+    const int base = _cfg.dec_base();
+    const int nlev = _cfg.levels();
+    for (int lvl = 0; lvl < nlev && !all; ++lvl) {
+      const int cin = base * _cfg.dim_mult[(std::size_t)lvl];
       if ((h % 8) != 0 || (w % 8) != 0) { all = true; break; }
       if ((std::size_t)cin * w * h > kIdxMax) { all = true; break; }
       h /= 2; w /= 2;
@@ -999,7 +1218,7 @@ MetalKrea2Vae::autotune_conv3x3_(MetalCompute* mc,
   if (const char* e = std::getenv("VPIPE_VAE_CONV_TUNE_HW")) {
     probe_base = std::max(32, std::atoi(e));
   }
-  const int top = _cfg.base_dim * _cfg.dim_mult[3];
+  const int top = _cfg.dec_base() * _cfg.dim_mult.back();
   const std::vector<vae_conv3x3::Kind> cands = {vae_conv3x3::Kind::kIm2col,
                                                 vae_conv3x3::Kind::kOnChip};
   std::string detail;
@@ -1069,13 +1288,16 @@ MetalKrea2Vae::autotune_conv3x3_(MetalCompute* mc,
 // at all. Off it, or at a grid it declines, every 3x3 falls back and the
 // band is the largest single buffer in the decode.
 bool
-MetalKrea2Vae::decode_gathers_(int h8, int w8) const noexcept
+MetalKrea2Vae::decode_gathers_(int hL, int wL) const noexcept
 {
-  const std::size_t Hout = (std::size_t)h8 * 8;
-  const std::size_t Wout = (std::size_t)w8 * 8;
-  const std::size_t base = (std::size_t)_cfg.base_dim;
-  return !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (h8 % 8) != 0 ||
-         (w8 % 8) != 0 ||
+  const std::size_t px = (std::size_t)_cfg.spatial_factor();
+  const std::size_t Hout = (std::size_t)hL * px;
+  const std::size_t Wout = (std::size_t)wL * px;
+  // The DECODER's width, which is what runs here -- not base_dim, which
+  // is the encoder's wherever the two differ.
+  const std::size_t base = (std::size_t)_cfg.dec_base();
+  return !_use_hwconv || !_fn_conv_hw_s1_c32.valid() || (hL % 8) != 0 ||
+         (wL % 8) != 0 ||
          base * (std::size_t)_cfg.dim_mult[1] * Hout * Wout > 0x7fffffffull;
 }
 
@@ -1097,12 +1319,13 @@ MetalKrea2Vae::decode_gathers_(int h8, int w8) const noexcept
 // 3603.9 ms with the full image in one band (906 MB / 3.6 GB). So cap it,
 // book the cap, and let the headroom only ever shrink it from there.
 std::size_t
-MetalKrea2Vae::decode_band_bytes_(int h8, int w8) const noexcept
+MetalKrea2Vae::decode_band_bytes_(int hL, int wL) const noexcept
 {
-  const std::size_t Hout = (std::size_t)h8 * 8;
-  const std::size_t Wout = (std::size_t)w8 * 8;
+  const std::size_t px = (std::size_t)_cfg.spatial_factor();
+  const std::size_t Hout = (std::size_t)hL * px;
+  const std::size_t Wout = (std::size_t)wL * px;
   const std::size_t wide =
-      (std::size_t)_cfg.base_dim * (std::size_t)_cfg.dim_mult[1];
+      (std::size_t)_cfg.dec_base() * (std::size_t)_cfg.dim_mult[1];
   const std::size_t full = Hout * Wout * 9 * wide * 2;      // whole image
   const std::size_t floor_ = Wout * 9 * wide * 8 * 2;       // 8 output rows
   if (full <= kDecodeBandMax) { return full; }
@@ -1133,9 +1356,14 @@ MetalKrea2Vae::decode_peak_bytes(int h8, int w8) const noexcept
   // over-estimate just rejects feasible decodes on a memory-bounded box,
   // which is what regressed 1024px.
   if (h8 <= 0 || w8 <= 0) { return 0; }
-  const std::size_t Hout = (std::size_t)h8 * 8;
-  const std::size_t Wout = (std::size_t)w8 * 8;
-  const std::size_t base = (std::size_t)_cfg.base_dim;
+  const std::size_t px = (std::size_t)_cfg.spatial_factor();
+  const std::size_t Hout = (std::size_t)h8 * px;
+  const std::size_t Wout = (std::size_t)w8 * px;
+  // The DECODER's base width. Booking base_dim where the two differ
+  // under-books by the whole ratio (96 against 144 is 2/3 of the truth),
+  // and the band term below -- the dominant one once the top level
+  // gathers -- is derived from the same figure.
+  const std::size_t base = (std::size_t)_cfg.dec_base();
   if (std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") != nullptr) {
     // Split off: the whole up-path is one command buffer -- keep the summed,
     // conservative figure (~16 GB at 1024px; the split is why it fits at
@@ -1182,7 +1410,7 @@ MetalKrea2Vae::decode_tiled_(const SharedBuffer& z, int h8, int w8,
     return {};
   };
   const int Cz = _cfg.z_dim;
-  const int px = 8;                              // output pixels per cell
+  const int px = _cfg.spatial_factor();          // output pixels per cell
   const int H = h8 * px, W = w8 * px;
   if (tile8 < kTileMin8) { return fail("tiled decode: window too small"); }
   const int ov = std::max(2, tile8 * kTileOvNum / kTileOvDen);
@@ -1190,7 +1418,9 @@ MetalKrea2Vae::decode_tiled_(const SharedBuffer& z, int h8, int w8,
   if (step < 1) { return fail("tiled decode: overlap exceeds the window"); }
 
   const std::size_t hw = (std::size_t)H * W;
-  std::vector<float> acc((std::size_t)3 * hw, 0.0f);   // weighted RGB sum
+  // Output channels, 3 (RGB) everywhere but Qwen-Image-2.1's RGBA.
+  const int OC = _cfg.out_channels;
+  std::vector<float> acc((std::size_t)OC * hw, 0.0f);  // weighted pixel sum
   std::vector<float> wsum(hw, 0.0f);                   // weight sum
   const auto* zsrc = static_cast<const _Float16*>(z.contents());
   if (zsrc == nullptr) { return fail("tiled decode: latent not host-visible"); }
@@ -1251,7 +1481,7 @@ MetalKrea2Vae::decode_tiled_(const SharedBuffer& z, int h8, int w8,
           const float wgt = wy * ramp(x, tW, x_lo, x_hi);
           const std::size_t op = orow + x;
           const std::size_t tp = (std::size_t)y * tW + x;
-          for (int c = 0; c < 3; ++c) {
+          for (int c = 0; c < OC; ++c) {
             acc[(std::size_t)c * hw + op] +=
                 wgt * (float)rs[(std::size_t)c * thw + tp];
           }
@@ -1264,12 +1494,12 @@ MetalKrea2Vae::decode_tiled_(const SharedBuffer& z, int h8, int w8,
     if (y_hi) { break; }
   }
 
-  SharedBuffer out = _mc->make_shared_buffer((std::size_t)3 * hw * 2);
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)OC * hw * 2);
   if (out.empty()) { return fail("tiled decode: output alloc failed"); }
   auto* od = static_cast<_Float16*>(out.contents());
   for (std::size_t p = 0; p < hw; ++p) {
     const float inv = (wsum[p] > 0.0f) ? 1.0f / wsum[p] : 0.0f;
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < OC; ++c) {
       od[(std::size_t)c * hw + p] =
           (_Float16)(acc[(std::size_t)c * hw + p] * inv);
     }
@@ -1296,8 +1526,10 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     return fail("input latent smaller than [z_dim, h8, w8]");
   }
   MetalCompute* mc = _mc;
-  const int Hout = h8 * 8, Wout = w8 * 8;
-  const int base = _cfg.base_dim;                    // 96
+  const int px = _cfg.spatial_factor();
+  const int Hout = h8 * px, Wout = w8 * px;
+  // The DECODER's width; base_dim is the encoder's wherever they differ.
+  const int base = _cfg.dec_base();                  // 96
 
   // Preflight: refuse to start a decode that clearly won't fit in the GPU's
   // current working-set headroom, rather than allocating our way into an
@@ -1441,6 +1673,10 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   SharedBuffer carry;
   const bool vae_split = std::getenv("VPIPE_KREA2_NO_VAE_SPLIT") == nullptr;
   bool split_ok = true;
+  // Per-level GPU time -- declared here because the report happens after
+  // the block that fills it. See the note at `dmark`.
+  const bool dprof = std::getenv("VPIPE_VAE_DECODE_PROFILE") != nullptr;
+  std::vector<std::pair<std::string, double>> dlevels;
   {
     ComputeEncoder enc = stream.begin_compute();
 
@@ -1515,6 +1751,19 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
       enc.dispatch({(unsigned)C, (unsigned)rows, 1}, {256, 1, 1});
       return out;
     };
+    // is_residual: ADD the block's input, channel-regrouped and spatially
+    // doubled, into `out` (already the block's result). H/W are the
+    // INPUT's, so the destination is 2H x 2W.
+    auto dup_up_add = [&](const SharedBuffer& in, int H, int W, int Cin,
+                          int Cout, int ft, SharedBuffer& out) {
+      const std::size_t rows = (std::size_t)4 * H * W;
+      enc.set_function(_fn_res_dup_up);
+      enc.set_buffer(0, in); enc.set_buffer(1, out);
+      enc.set_constant(2, H); enc.set_constant(3, W);
+      enc.set_constant(4, Cin); enc.set_constant(5, Cout);
+      enc.set_constant(6, ft);
+      enc.dispatch({(unsigned)Cout, (unsigned)rows, 1}, {256, 1, 1});
+    };
     auto resblock = [&](const ResBlock& rb, const SharedBuffer& x, int H,
                         int W) -> SharedBuffer& {
       const std::size_t hw = (std::size_t)H * W;
@@ -1570,6 +1819,25 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
         }
       }
     }
+    // Per-level GPU time (VPIPE_VAE_DECODE_PROFILE). The split already
+    // commits and waits at each level boundary, so this is a clock read
+    // rather than an added barrier -- but it needs the split ON, and it
+    // says so instead of silently reporting one bucket. With the split
+    // off there is no boundary to time and nothing is printed.
+    //
+    // WHY IT EXISTS: a decode's cost is not where the FLOP count says.
+    // MEASURED on Qwen-Image-2.1 at 1024^2, 4451 ms against ~2e12 FLOP
+    // of 3x3 convolution -- 0.45 TFLOP/s, where this box's GEMMs reach
+    // 11. A decode at that rate is not compute-bound, and picking a
+    // better conv tile for it is optimizing the wrong term.
+    auto dclock = std::chrono::steady_clock::now();
+    auto dmark = [&](const char* tag) {
+      if (!dprof) { return; }
+      dlevels.emplace_back(tag,
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - dclock).count());
+      dclock = std::chrono::steady_clock::now();
+    };
     auto flush = [&](const SharedBuffer*& xp) {
       if (!vae_split) { return; }
       enc.end();
@@ -1591,21 +1859,43 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
     step(resblock(_mid_res0, *x, H, W));
     step(attention(_mid_attn, *x, H, W));
     step(resblock(_mid_res1, *x, H, W));
+    int lvl_i = 0;
     for (const UpBlock& ub : _up_blocks) {
-      for (const ResBlock& rb : ub.resnets) { step(resblock(rb, *x, H, W)); }
+      // is_residual: the shortcut reads the block's INPUT, so that buffer
+      // has to outlive the resnets. Hold its pool slot by skipping the
+      // release on the first step, and give it back after the add -- one
+      // extra live level-sized tensor, which decode_peak_bytes books.
+      const SharedBuffer* skip = ub.has_res ? x : nullptr;
+      const int skip_h = H, skip_w = W;
+      bool first = true;
+      for (const ResBlock& rb : ub.resnets) {
+        SharedBuffer& nx = resblock(rb, *x, H, W);
+        if (skip != nullptr && first) { x = &nx; } else { step(nx); }
+        first = false;
+      }
       if (ub.has_up) {
         step(upsample(*x, H, W, ub.up_dim));     // nearest 2x
         H *= 2; W *= 2;
         step(conv3x3(*x, H, W, ub.up));          // resample.1 (out -> out/2)
       }
+      if (skip != nullptr) {
+        dup_up_add(*skip, skip_h, skip_w, ub.res_in, ub.res_out, ub.res_ft,
+                   const_cast<SharedBuffer&>(*x));
+        release(*skip);
+      }
       flush(x);            // pool off: bound the working set to ~one up-block
+      dmark((std::to_string(H) + "px/c" + std::to_string(ub.res_out))
+                .c_str());
+      trace_dump_(("dec_up" + std::to_string(lvl_i)).c_str(), *x,
+                  (std::size_t)H * W, ub.res_out);
+      ++lvl_i;
     }
     SharedBuffer& xn = normc(*x, (std::size_t)H * W, base, _norm_out_g);
     release(*x);
     silu(xn, (std::size_t)H * W * base);
-    SharedBuffer& rgb = conv3x3(xn, H, W, _conv_out);        // -> [hw, 3]
+    SharedBuffer& rgb = conv3x3(xn, H, W, _conv_out);        // -> [hw, OC]
     release(xn);
-    const int n = H * W * 3;                                  // clamp to [-1,1]
+    const int n = H * W * _cfg.out_channels;                  // clamp to [-1,1]
     enc.set_function(_fn_clamp);
     enc.set_buffer(0, rgb); enc.set_buffer(1, rgb);
     enc.set_constant(2, n); enc.set_constant(3, -1.0f); enc.set_constant(4, 1.0f);
@@ -1628,15 +1918,35 @@ MetalKrea2Vae::decode(const SharedBuffer& z, int h8, int w8, std::string* err)
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("GPU decode failed") : gpu_err);
   }
+  if (dprof && _mc != nullptr && _mc->session() != nullptr) {
+    if (dlevels.empty()) {
+      _mc->session()->info(fmt(
+          "vae decode profile: nothing to report -- the per-level split is "
+          "off, so there is no boundary to time"));
+    } else {
+      double tot = 0.0;
+      for (const auto& l : dlevels) { tot += l.second; }
+      std::string line = fmt("vae decode profile: {:.0f} ms over {} levels",
+                             tot, (int)dlevels.size())();
+      for (const auto& l : dlevels) {
+        line += fmt("; {} {:.0f} ms ({:.1f}%)", l.first, l.second,
+                    tot > 0.0 ? 100.0 * l.second / tot : 0.0)();
+      }
+      _mc->session()->info(fmt("{}", line));
+    }
+  }
 
-  // Transpose channel-last [hw, 3] -> channel-first [3, H, W].
-  SharedBuffer out = mc->make_shared_buffer((std::size_t)3 * H * W * 2);
+  // Transpose channel-last [hw, OC] -> channel-first [OC, H, W].
+  const int OC = _cfg.out_channels;
+  SharedBuffer out = mc->make_shared_buffer((std::size_t)OC * H * W * 2);
   {
     const auto* s = static_cast<const _Float16*>(rgb_ptr->contents());
     auto* d = static_cast<_Float16*>(out.contents());
     const std::size_t hw = (std::size_t)H * W;
     for (std::size_t p = 0; p < hw; ++p) {
-      for (int c = 0; c < 3; ++c) { d[(std::size_t)c * hw + p] = s[p * 3 + c]; }
+      for (int c = 0; c < OC; ++c) {
+        d[(std::size_t)c * hw + p] = s[p * (std::size_t)OC + c];
+      }
     }
   }
   return out;
@@ -1648,35 +1958,73 @@ MetalKrea2Vae::load_encoder_(WeightSet& ws)
   WeightSet& wts = ws;
   MetalCompute* mc = _mc;
   const int base = _cfg.base_dim;                    // 96
+  const int nlev = _cfg.levels();                    // 4
   // Encoder dims = [base*u for u in [1] + dim_mult] = [96, 96, 192, 384, 384].
-  const int dims[5] = {base, base * _cfg.dim_mult[0], base * _cfg.dim_mult[1],
-                       base * _cfg.dim_mult[2], base * _cfg.dim_mult[3]};
-  const int dtop = base * _cfg.dim_mult[3];          // 384
+  // Unlike the decoder this convention does NOT change with is_residual:
+  // the encoder narrows in the first resnet of a level either way.
+  std::vector<int> dims;
+  dims.reserve((std::size_t)nlev + 1);
+  dims.push_back(base);
+  for (int i = 0; i < nlev; ++i) {
+    dims.push_back(base * _cfg.dim_mult[(std::size_t)i]);
+  }
+  const int dtop = base * _cfg.dim_mult[(std::size_t)nlev - 1];   // 384
 
-  _enc_conv_in = load_conv3x3_(wts, "encoder.conv_in", true);   // 3 -> base
+  // in_channels -> base
+  _enc_conv_in = load_conv3x3_(wts, "encoder.conv_in", true);
   bool ok = !_enc_conv_in.w.empty();
 
-  // 4 down stages; the flat down_blocks index runs res,res,[resample],...
-  _enc_down.resize(4);
+  // THE NAMES DIFFER WITH is_residual, and this is the one place the two
+  // conventions are not interchangeable:
+  //   plain       one FLAT down_blocks index runs res,res,[resample],...
+  //               so a level's resnets and its downsample share the
+  //               numbering -- "down_blocks.2.resample.1".
+  //   residual    one module PER LEVEL holding its own list, so the
+  //               level index is the block index --
+  //               "down_blocks.1.resnets.0." / "down_blocks.1.downsampler.
+  //               resample.1".
+  // Picking the wrong one finds no tensors at all, which is at least
+  // loud; it is the same shape of difference as the decoder's
+  // upsampler/upsamplers below.
+  _enc_down.resize((std::size_t)nlev);
   int idx = 0;
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < nlev; ++i) {
     DownStage& st = _enc_down[(std::size_t)i];
-    const int out_dim = dims[i + 1];
+    const int out_dim = dims[(std::size_t)i + 1];
+    const std::string lvl = std::to_string(i);
     st.resnets.resize((std::size_t)_cfg.num_res_blocks);
-    int cin = dims[i];
+    int cin = dims[(std::size_t)i];
     for (int r = 0; r < _cfg.num_res_blocks; ++r) {
-      ok = ok && load_resblock_(
-          wts, "encoder.down_blocks." + std::to_string(idx) + ".",
-          st.resnets[(std::size_t)r], cin, out_dim);
+      const std::string pre =
+          _cfg.is_residual
+              ? "encoder.down_blocks." + lvl + ".resnets." +
+                    std::to_string(r) + "."
+              : "encoder.down_blocks." + std::to_string(idx) + ".";
+      ok = ok && load_resblock_(wts, pre, st.resnets[(std::size_t)r], cin,
+                                out_dim);
       cin = out_dim; ++idx;
     }
-    st.has_down = (i != 3);
+    st.has_down = (i != nlev - 1);
     if (st.has_down) {
-      st.down = load_conv3x3_(
-          wts, "encoder.down_blocks." + std::to_string(idx) + ".resample.1",
-          false);                                    // 2D stride-2 conv
+      const std::string nm =
+          _cfg.is_residual
+              ? "encoder.down_blocks." + lvl + ".downsampler.resample.1"
+              : "encoder.down_blocks." + std::to_string(idx) + ".resample.1";
+      st.down = load_conv3x3_(wts, nm, false);       // 2D stride-2 conv
       ok = ok && !st.down.w.empty();
       ++idx;
+    }
+    // The AvgDown3D shortcut runs on EVERY level, including the last --
+    // where factor_s is 1 and the group size collapses to 1, making it a
+    // plain residual add rather than a no-op to be skipped.
+    st.res_in = dims[(std::size_t)i];
+    st.res_out = out_dim;
+    st.has_res = _cfg.is_residual;
+    st.res_fs = st.has_down ? 2 : 1;
+    {
+      const std::size_t td = _cfg.temperal_downsample.size();
+      st.res_ft = (st.has_down && (std::size_t)i < td &&
+                   _cfg.temperal_downsample[(std::size_t)i] != 0) ? 2 : 1;
     }
   }
 
@@ -1739,7 +2087,7 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
 {
   if (!_has_encoder) { return {}; }
   const std::size_t hw = (std::size_t)H * W;
-  if (img.byte_size() < (std::size_t)3 * hw * 2) { return {}; }
+  if (img.byte_size() < (std::size_t)_cfg.in_channels * hw * 2) { return {}; }
   const int Cz = _cfg.z_dim;
   if ((int)_cfg.latents_mean.size() != Cz ||
       (int)_cfg.latents_std.size() != Cz) {
@@ -1914,14 +2262,16 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
       return out;
     };
 
-    // Input RGB [3, H, W] -> channel-last [hw, 3] (host).
-    SharedBuffer& x0 = alloc(hw * 3);
+    // Input image [IC, H, W] -> channel-last [hw, IC] (host). IC is 3
+    // everywhere but Qwen-Image-2.1, which encodes RGBA.
+    const int IC = _cfg.in_channels;
+    SharedBuffer& x0 = alloc(hw * (std::size_t)IC);
     {
       const auto* s = static_cast<const _Float16*>(img.contents());
       auto* d = static_cast<_Float16*>(x0.contents());
-      for (int c = 0; c < 3; ++c) {
+      for (int c = 0; c < IC; ++c) {
         for (std::size_t p = 0; p < hw; ++p) {
-          d[p * 3 + c] = s[(std::size_t)c * hw + p];
+          d[p * (std::size_t)IC + c] = s[(std::size_t)c * hw + p];
         }
       }
     }
@@ -1942,15 +2292,45 @@ MetalKrea2Vae::encode(const SharedBuffer& img, int H, int W)
     const SharedBuffer* x = &conv3x3g(x0, Hc, Wc, _enc_conv_in, false);
     release(x0);
     auto step = [&](const SharedBuffer& nx) { release(*x); x = &nx; };
+    // is_residual: ADD the stage's input, spatially pooled by fs and
+    // channel-regrouped, into `out` (already the stage's result). H/W are
+    // the INPUT's, so the destination is H/fs x W/fs.
+    auto avg_down_add = [&](const SharedBuffer& in, int H, int W, int Cin,
+                            int Cout, int ft, int fs, SharedBuffer& out) {
+      const std::size_t rows = (std::size_t)(H / fs) * (W / fs);
+      enc.set_function(_fn_res_avg_down);
+      enc.set_buffer(0, in); enc.set_buffer(1, out);
+      enc.set_constant(2, H); enc.set_constant(3, W);
+      enc.set_constant(4, Cin); enc.set_constant(5, Cout);
+      enc.set_constant(6, ft); enc.set_constant(7, fs);
+      enc.dispatch({(unsigned)Cout, (unsigned)rows, 1}, {256, 1, 1});
+    };
+    int lvl_i = 0;
     for (const DownStage& st : _enc_down) {
-      for (const ResBlock& rb : st.resnets) { step(resblock(rb, *x, Hc, Wc)); }
+      // Same slot-holding trick as the decoder's up-blocks; see there.
+      const SharedBuffer* skip = st.has_res ? x : nullptr;
+      const int skip_h = Hc, skip_w = Wc;
+      bool first = true;
+      for (const ResBlock& rb : st.resnets) {
+        SharedBuffer& nx = resblock(rb, *x, Hc, Wc);
+        if (skip != nullptr && first) { x = &nx; } else { step(nx); }
+        first = false;
+      }
       if (st.has_down) {
         step(conv3x3g(*x, Hc, Wc, st.down, true));  // stride-2 downsample
         Hc /= 2; Wc /= 2;
       }
+      if (skip != nullptr) {
+        avg_down_add(*skip, skip_h, skip_w, st.res_in, st.res_out, st.res_ft,
+                     st.res_fs, const_cast<SharedBuffer&>(*x));
+        release(*skip);
+      }
       flush(x);            // pool off: bound the working set to ~one down-stage
+      trace_dump_(("enc_dn" + std::to_string(lvl_i)).c_str(), *x,
+                  (std::size_t)Hc * Wc, st.res_out);
+      ++lvl_i;
     }
-    const int dtop = base * _cfg.dim_mult[3];        // 384
+    const int dtop = base * _cfg.dim_mult.back();    // 384
     step(resblock(_enc_mid_res0, *x, Hc, Wc));
     step(attention(_enc_mid_attn, *x, Hc, Wc));
     step(resblock(_enc_mid_res1, *x, Hc, Wc));

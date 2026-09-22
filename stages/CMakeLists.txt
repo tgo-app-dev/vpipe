@@ -28,6 +28,7 @@ set(LOCAL_SOURCES
   flux2-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
+  qwen-image-21-model-config-stage.cc
   qwen-image-edit-model-config-stage.cc
   vosr-model-config-stage.cc
   flashvsr-model-config-stage.cc
@@ -98,6 +99,7 @@ set(LOCAL_HEADERS
   flux2-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h
+  qwen-image-21-model-config-stage.h
   qwen-image-edit-model-config-stage.h
   model-config-source.h
   shell-stage.h

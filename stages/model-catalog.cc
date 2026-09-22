@@ -852,6 +852,82 @@ builtin_catalog_()
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = true},
+    // Qwen-Image-2.1 (Qwen): one checkpoint that does BOTH text-to-image
+    // and reference editing, and the first model here whose VAE is
+    // natively RGBA. Despite the family name it shares almost nothing
+    // with Edit-2511 / 2512 above -- read the three sub-models before
+    // assuming any of that code applies.
+    //   transformer/  = QwenImage21Transformer2DModel, a 7B SINGLE-stream
+    //     DiT: 32 blocks, 32 heads x head_dim 128 = 4096 hidden, in/out
+    //     channels 64, patch_size 1 (latents are consumed UNPATCHED),
+    //     mlp_ratio 3 -> SwiGLU inner 12288, 3D-RoPE axes [16,56,56],
+    //     causal_condition true. 297 tensors, every one a `.weight`:
+    //     there is no bias anywhere in the model. Modulation is NOT per
+    //     block -- a single shared 4096->16384 projection produces four
+    //     4096-wide vectors (scale/gate for attention, scale/gate for
+    //     the feed-forward) that all 32 blocks slice, and the gates go
+    //     through tanh. Two mechanisms have no precedent in this tree:
+    //     attention is BLOCK-CAUSAL (the joint text/image sequence is
+    //     causal while each image block stays internally bidirectional),
+    //     and the text + condition-image prefix is KV-CACHED across
+    //     denoise steps -- which is only sound because causal_condition
+    //     modulates that prefix from t=0, making it step-independent.
+    //   text_encoder/ = Qwen3-VL 8B (Qwen3VLForConditionalGeneration, 36
+    //     layers, hidden 4096, 32 q-heads GQA kv=8, head_dim 128, ffn
+    //     12288, rope theta 5e6, UNTIED embeddings) wrapped as
+    //     `model.language_model.` / `model.visual.`, with a 27-layer
+    //     tower and deepstack taps [8,16,24]. That is the same encoder
+    //     Boogu-Image drives, in the same layout. Reference images are
+    //     fed to the tower and the DiT substitutes their VAE latents
+    //     into the vision slots the encoder reserved, so editing rides
+    //     the PROMPT sequence rather than appending tokens to the DiT
+    //     stream the way Edit-2511 does. Up to 10 references.
+    //   vae/          = AutoencoderKLQwenImage21: z_dim 64, 16x spatial
+    //     (dim_mult [1,2,4,8,8], five levels), in_channels AND
+    //     out_channels 4 -- RGBA -- and asymmetric, base_dim 96 for the
+    //     encoder against decoder_base_dim 144. is_residual adds a
+    //     parameter-free shortcut (group-average down, channel-repeat
+    //     up) around each block; it carries no weights of its own.
+    //     Stored F32.
+    // Transparency is prompt-driven, not a mode: the card's recommended
+    // wording ("This is an RGBA image with transparency ... the
+    // background is transparent") is what produces a populated alpha
+    // channel, and the VAE emits four channels either way.
+    // Native resolution is 2048x2048 and the size grid is 32, not 16 --
+    // the pipeline rounds the LATENT grid even, so a 16-multiple that is
+    // not a 32-multiple is silently re-rounded.
+    // `files` PINS the diffusers subfolders and processor/ (which holds
+    // the consolidated tokenizer.json, hence needs_tokenizer_json false
+    // and no tokenizer/ subdir at all), skipping only README/LICENSE.
+    // ~33 GB (7B DiT + 8B VL encoder, bf16; 1.35 GB VAE).
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "7B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2.1",
+     .model_type = "qwen-image-21",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "processor/vocab.json",
+               "processor/merges.txt",
+               "processor/added_tokens.json",
+               "processor/special_tokens_map.json",
+               "processor/chat_template.jinja",
+               "processor/preprocessor_config.json",
+               "processor/video_preprocessor_config.json",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
     // separate VAE stages), but the FLUX topology rather than Qwen-Image
@@ -1894,6 +1970,16 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // image input and hand that stage a checkpoint with nowhere to put
     // one.
     set({"text"}, {"image"});
+  } else if (mt == "qwen-image-21") {
+    // 2.1 is the case the split above does not have: ONE checkpoint
+    // that answers both tasks, because a reference image occupies
+    // vision slots the text encoder reserved rather than a separate
+    // conditioning path. So it belongs in {"text", "image"} even though
+    // it generates from a bare prompt too -- the image input is
+    // optional, not absent, and splitting it into two model_types the
+    // way qwen-image / qwen-image-edit are split would describe two
+    // checkpoints where there is one.
+    set({"text", "image"}, {"image"});
   } else if (mt == "wan-i2v") {
     // The one family here that OUTPUTS video: a prompt plus a first-frame
     // image in, a clip out.

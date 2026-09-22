@@ -375,18 +375,90 @@ MetalSolAttention::set_arena(const SharedBuffer& a, const SharedBuffer& b)
   _arena_used[1] = 0;
 }
 
+// Fill the two attention param blocks for THIS call's band. Separated
+// from ensure_scratch_ because the scratch is cached on the extents and
+// the band is not: same shape, different offset, different answer.
+void
+MetalSolAttention::set_band_params_(int heads, int kv_heads,
+                                    const Band& band, int d)
+{
+  const int q_tokens = band.q_tokens, k_tokens = band.k_tokens;
+  const int q_rows = band.q_rows, k_rows = band.k_rows;
+  const int q_off = band.q_off;
+  const int nq = _nq, nk = _nk;
+  if (_params.empty()) { return; }
+  auto* p = static_cast<AttnP*>(_params.contents());
+  p->B = 1; p->H = heads; p->D = d; p->qL = q_tokens; p->kL = k_tokens;
+  // The exact half is steel, which walks K/V with this factor. It was
+  // pinned at 1 because every caller was MHA.
+  p->gqa = heads / kv_heads;
+  p->NQ = nq; p->NK = (k_tokens + _bk - 1) / _bk;
+  p->NQa = q_tokens / _bq; p->NKa = k_tokens / _bk;
+  p->qL_rem = q_tokens - p->NQa * _bq;
+  p->kL_rem = k_tokens - p->NKa * _bk;
+  // THE QUERY'S POSITION IN THE SEQUENCE, which the causal predicate
+  // measures a row against. Zero for a whole-sequence call.
+  p->qL_off = q_off;
+  // Head-major, but with the BAND's stride: q and the output step by
+  // the rows their buffer holds, k and v by theirs, and the two are
+  // only the same number when the band is the whole sequence.
+  const std::int64_t qm[3] = {(std::int64_t)heads * q_rows * d,
+                              (std::int64_t)q_rows * d, d};
+  const std::int64_t km[3] = {(std::int64_t)kv_heads * k_rows * d,
+                              (std::int64_t)k_rows * d, d};
+  // BOTH FLASH HALVES WRITE SOL'S OWN partials, which are dense
+  // [H, q_tokens, D] whatever the band is. Only the merge touches the
+  // caller's buffer, and it takes that stride separately. Giving the
+  // output the band's stride here would scatter the partials.
+  const std::int64_t om[3] = {(std::int64_t)heads * q_tokens * d,
+                              (std::int64_t)q_tokens * d, d};
+  for (int i = 0; i < 3; ++i) {
+    p->Qs[i] = qm[i]; p->Ks[i] = km[i]; p->Vs[i] = km[i]; p->Os[i] = om[i];
+  }
+  if (_masked) {
+    // The APPROXIMATE half's geometry: the same queries against the
+    // SUMMARY sequence, so qL is the rows and kL is the block count.
+    // `NQ` is what the block mask divides by -- it is the routing's
+    // query-block count and not a key-block one, which is exactly what
+    // the exact half already carries in the same field.
+    auto* pa = static_cast<AttnP*>(_params_a.contents());
+    *pa = *p;
+    // The summary sequence has no position of its own, so the routing's
+    // flags are the only mask and the causal offset does not apply.
+    pa->qL_off = 0;
+    pa->kL = nk;
+    pa->NK = (nk + _bk - 1) / _bk;
+    pa->NKa = nk / _bk;
+    pa->kL_rem = nk - pa->NKa * _bk;
+    // The summary sequence is the approximate half's K/V, so its strides
+    // are the KV head count's -- and `pa->gqa` (copied from `p`) is what
+    // makes that kernel read the right group.
+    const std::int64_t sm[3] = {(std::int64_t)kv_heads * nk * d,
+                                (std::int64_t)nk * d, d};
+    for (int i = 0; i < 3; ++i) { pa->Ks[i] = sm[i]; pa->Vs[i] = sm[i]; }
+
+  }
+}
+
 bool
-MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int tokens, int d,
-                                   std::string* err)
+MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
+                                   int k_tokens, int d, std::string* err)
 {
   const int blk = _blk;
-  const int nq = (tokens + _bq - 1) / _bq;
-  const int nk = (tokens + blk - 1) / blk;
+  // QUERY blocks from the query extent and KEY blocks from the key one.
+  // They were one number because every caller was square.
+  const int nq = (q_tokens + _bq - 1) / _bq;
+  const int nk = (k_tokens + blk - 1) / blk;
+  // Everything below that follows the QUERIES -- the partial softmaxes,
+  // the two partial outputs, the CSR's row count -- is sized by this,
+  // and everything that follows the KEYS by `k_tokens`.
+  const int tokens = q_tokens;
   // `_kv_heads` joins the geometry tag: the key summaries are sized by
   // it, so a caller that changed only the group factor would otherwise
   // keep buffers shaped for the previous one.
   if (_heads == heads && _kv_heads == kv_heads && _tokens == tokens &&
-      _d == d && _nk == nk && _nq == nq && !_qc.empty()) {
+      _k_tokens == k_tokens && _d == d && _nk == nk && _nq == nq &&
+      !_qc.empty()) {
     return true;
   }
   // A REBUILD, so the previous geometry's buffers are about to be
@@ -457,7 +529,7 @@ MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int tokens, int d,
   _kept  = mk(H * (std::size_t)nq * 4);
   _qb_off = mk(H * (std::size_t)(nq + 1) * 4);
   _qb_blk = mk(H * (std::size_t)nq *
-               (std::size_t)(tokens / _bk + 1) * 4);
+               (std::size_t)(k_tokens / _bk + 1) * 4);
   // THE fp32 [H, TPAD, D] APPROXIMATE OUTPUT IS sol_approx_mma'S ALONE.
   // The flash approximate half -- which is both arms now -- stores
   // normalised and in the tensor dtype into `_o_an`, half the bytes and
@@ -518,42 +590,10 @@ MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int tokens, int d,
     return false;
   }
 
-  auto* p = static_cast<AttnP*>(_params.contents());
-  p->B = 1; p->H = heads; p->D = d; p->qL = tokens; p->kL = tokens;
-  // The exact half is steel, which walks K/V with this factor. It was
-  // pinned at 1 because every caller was MHA.
-  p->gqa = heads / kv_heads;
-  p->NQ = nq; p->NK = (tokens + _bk - 1) / _bk;
-  p->NQa = tokens / _bq; p->NKa = tokens / _bk;
-  p->qL_rem = tokens - p->NQa * _bq;
-  p->kL_rem = tokens - p->NKa * _bk;
-  p->qL_off = 0;
-  // Head-major [H, T, D]: the layout the transposes produce, and the one
-  // every unfused attention path here speaks.
-  const std::int64_t hm[3] = {(std::int64_t)heads * tokens * d,
-                              (std::int64_t)tokens * d, d};
-  for (int i = 0; i < 3; ++i) {
-    p->Qs[i] = hm[i]; p->Ks[i] = hm[i]; p->Vs[i] = hm[i]; p->Os[i] = hm[i];
-  }
-  if (_masked) {
-    // The APPROXIMATE half's geometry: the same queries against the
-    // SUMMARY sequence, so qL is the rows and kL is the block count.
-    // `NQ` is what the block mask divides by -- it is the routing's
-    // query-block count and not a key-block one, which is exactly what
-    // the exact half already carries in the same field.
-    auto* pa = static_cast<AttnP*>(_params_a.contents());
-    *pa = *p;
-    pa->kL = nk;
-    pa->NK = (nk + _bk - 1) / _bk;
-    pa->NKa = nk / _bk;
-    pa->kL_rem = nk - pa->NKa * _bk;
-    // The summary sequence is the approximate half's K/V, so its strides
-    // are the KV head count's -- and `pa->gqa` (copied from `p`) is what
-    // makes that kernel read the right group.
-    const std::int64_t sm[3] = {(std::int64_t)kv_heads * nk * d,
-                                (std::int64_t)nk * d, d};
-    for (int i = 0; i < 3; ++i) { pa->Ks[i] = sm[i]; pa->Vs[i] = sm[i]; }
-  }
+  // THE PARAMS ARE PER CALL, not per scratch. The allocation above is
+  // keyed on the extents, but a band with the same extents can sit at a
+  // different offset -- so a cache hit must still refresh them. See
+  // set_band_params_, which encode() calls after this returns.
   int* sp = static_cast<int*>(_sp_params.contents());
   // tokens_per_frame 0 switches steel's span-EDGE predicate off. The Sol
   // list is exact at BK granularity -- one routing block is a whole
@@ -602,7 +642,8 @@ MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int tokens, int d,
         _nax ? "attn_steel_nax" : "attn_steel", _bq, _bk,
         _masked ? "block-masked" : "sol_approx_mma"));
   }
-  _heads = heads; _kv_heads = kv_heads; _tokens = tokens; _d = d;
+  _heads = heads; _kv_heads = kv_heads; _tokens = tokens;
+  _k_tokens = k_tokens; _d = d;
   _nq = nq; _nk = nk;
   // In STEEL key blocks: that is what the route kernel counts, so a
   // fraction against routing blocks would read above 100%.
@@ -707,11 +748,49 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
                           int tokens, int d, float scale,
                           const sol::Config& cfg, std::string* err)
 {
+  // The square case IS the banded one with the band spanning the whole
+  // sequence, so it is expressed that way rather than duplicated.
+  const Band b{tokens, tokens, tokens, tokens, 0, 0};
+  return encode(enc, q, k, v, out, heads, kv_heads, b, d, scale, cfg, err);
+}
+
+// The banded form. `q`/`out` cover `b.q_rows` rows per head and this
+// call attends `b.q_tokens` of them starting at `b.q_off`; `k`/`v` cover
+// `b.k_rows` and this call reads `b.k_tokens` from the start.
+//
+// WHY IT EXISTS. A block-causal layout does not have one attention --
+// it has one dispatch per segment, each a row band of a buffer holding
+// the whole joint sequence, and each RECTANGULAR (a target image block
+// attends itself plus everything before it, so qL < kL). Sol's method
+// does not care: the routing is a proxy score of query-block centroids
+// against key-block centroids and neither has to be the same sequence.
+// What cared was the plumbing -- three kernels reused the token count
+// as a head stride, and the local band assumed the query's row index
+// equalled the key's.
+bool
+MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
+                          const SharedBuffer& k, const SharedBuffer& v,
+                          SharedBuffer& out, int heads, int kv_heads,
+                          const Band& band, int d, float scale,
+                          const sol::Config& cfg, std::string* err)
+{
   auto fail = [&](const char* m) {
     if (err != nullptr) { *err = m; }
     return false;
   };
-  if (heads <= 0 || tokens <= 0 || d <= 0) { return fail("empty geometry"); }
+  const int q_tokens = band.q_tokens, k_tokens = band.k_tokens;
+  const int q_rows = band.q_rows, k_rows = band.k_rows;
+  const int q_off = band.q_off;
+  // `tokens` still names the KEY extent, which is what the sink window,
+  // the steel key-block count and the scratch that follows the keys are
+  // all measured in.
+  const int tokens = k_tokens;
+  if (heads <= 0 || q_tokens <= 0 || k_tokens <= 0 || d <= 0) {
+    return fail("empty geometry");
+  }
+  if (q_rows < q_tokens || k_rows < k_tokens || q_off < 0) {
+    return fail("sol_attn: a band must fit inside its buffer");
+  }
   // GQA, REFUSED RATHER THAN MIS-INDEXED. Every query head has to belong
   // to exactly one KV head: a ragged last group would read key centroids
   // that were never summarised, which is a wrong answer and not a crash.
@@ -754,7 +833,10 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return fail("the Sol key block must be a whole number of the exact "
                 "kernel's key blocks");
   }
-  if (!ensure_scratch_(heads, kv_heads, tokens, d, err)) { return false; }
+  if (!ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, err)) {
+    return false;
+  }
+  set_band_params_(heads, kv_heads, band, d);
   if (!ensure_steel_(tokens, err)) { return false; }
   // WHAT ACTUALLY HAPPENED, not what was asked: set_sage already
   // dropped the driver on a box with no matrix cores, so this is the
@@ -803,24 +885,32 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   //    EACH CALL ASKS FOR ONLY WHAT IT WANTS -- 2|4 then 1 -- because
   //    the block size is per call and the destination count with it.
   const int kSumQ = 1, kSumKV = 6;
+  // BYTE offset of the band's first query row. Q's head stride is the
+  // buffer's row count, so basing it here places head h row r at
+  // q_off + h*q_rows + r -- the band, read in place.
+  const std::size_t q_boff =
+      (std::size_t)band.q_row0 * (std::size_t)d * 2;
   if ((skip & 1) == 0) {
   enc.set_function(_fn_sum);
   enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
   enc.set_buffer(3, _qc); enc.set_buffer(4, _kc); enc.set_buffer(5, _vc);
-  enc.set_constant(6, tokens); enc.set_constant(7, d);
+  enc.set_constant(6, k_tokens); enc.set_constant(7, d);
   enc.set_constant(8, nk); enc.set_constant(9, _blk);
   enc.set_constant(10, kSumKV);
+  enc.set_constant(11, k_rows);   // head stride: k/v may be a band
   // OVER KV HEADS. The kernel takes its head from the grid's y, so the
   // k/v pass simply runs `kv_heads` of them and writes [KVH, nk, D] --
   // no kernel change, and the q pass below is untouched at `heads`.
   enc.dispatch({(unsigned)d, (unsigned)kv_heads, (unsigned)nk},
                {(unsigned)d, 1, 1});
   enc.set_function(_fn_sum);
-  enc.set_buffer(0, q); enc.set_buffer(1, q); enc.set_buffer(2, q);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, q, q_boff);
+  enc.set_buffer(2, q, q_boff);
   enc.set_buffer(3, _qc); enc.set_buffer(4, _qc); enc.set_buffer(5, _qc);
-  enc.set_constant(6, tokens); enc.set_constant(7, d);
+  enc.set_constant(6, q_tokens); enc.set_constant(7, d);
   enc.set_constant(8, nq); enc.set_constant(9, _bq);
   enc.set_constant(10, kSumQ);
+  enc.set_constant(11, q_rows);   // head stride: q may be a band
   enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)nq},
                {(unsigned)d, 1, 1});
   }
@@ -864,6 +954,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(17, per);
   enc.set_constant(18, nks);
   enc.set_constant(19, gqa);
+  enc.set_constant(20, q_off);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   } else if ((skip & 4) == 0) {
   enc.set_function(_fn_route);
@@ -878,6 +969,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(17, per);
   enc.set_constant(18, nks);
   enc.set_constant(19, gqa);
+  enc.set_constant(20, q_off);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   }
 
@@ -908,14 +1000,14 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // on the simdgroup kernel, at 1/64 of the dense work.
   if ((skip & 32) == 0 && _masked) {
   enc.set_function(_fn_approx_masked);
-  enc.set_buffer(0, q); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
   enc.set_buffer(3, _o_an); enc.set_buffer(4, _params_a);
   enc.set_buffer(12, _m_a); enc.set_buffer(13, _l_a);
   enc.set_buffer(14, _flags);
   enc.dispatch({32u * (unsigned)nq, 4u * (unsigned)heads, 1}, {32, 4, 1});
   } else if ((skip & 32) == 0) {
   enc.set_function(_fn_approx);
-  enc.set_buffer(0, q); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
   enc.set_buffer(3, _flags); enc.set_buffer(4, _o_a); enc.set_buffer(5, _m_a);
   enc.set_buffer(6, _l_a);
   enc.set_constant(7, scale); enc.set_constant(8, tokens);
@@ -932,7 +1024,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // 7. the exact half, on steel, walking only the listed blocks.
   if ((skip & 64) == 0) {
   enc.set_function(_fn_steel);
-  enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, k); enc.set_buffer(2, v);
   enc.set_buffer(3, _o_e); enc.set_buffer(4, _params);
   enc.set_buffer(8, _qb_off); enc.set_buffer(9, _qb_blk);
   enc.set_buffer(10, _sp_params); enc.set_buffer(11, _sp_bounds);
@@ -952,19 +1044,21 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_function(_fn_merge_ml);
   enc.set_buffer(0, _o_e); enc.set_buffer(1, _m_e); enc.set_buffer(2, _l_e);
   enc.set_buffer(3, _o_an); enc.set_buffer(4, _m_a); enc.set_buffer(5, _l_a);
-  enc.set_buffer(6, out);
-  enc.set_constant(7, tokens); enc.set_constant(8, d);
+  enc.set_buffer(6, out, q_boff);
+  enc.set_constant(7, q_tokens); enc.set_constant(8, d);
   enc.set_constant(9, bonus);
-  enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)tokens},
+  enc.set_constant(10, q_rows);   // destination stride: out may be a band
+  enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)q_tokens},
                {(unsigned)d, 1, 1});
   } else if ((skip & 128) == 0) {
   enc.set_function(_fn_merge);
   enc.set_buffer(0, _o_e); enc.set_buffer(1, _m_e); enc.set_buffer(2, _l_e);
   enc.set_buffer(3, _o_a); enc.set_buffer(4, _m_a); enc.set_buffer(5, _l_a);
-  enc.set_buffer(6, out);
-  enc.set_constant(7, tokens); enc.set_constant(8, d);
+  enc.set_buffer(6, out, q_boff);
+  enc.set_constant(7, q_tokens); enc.set_constant(8, d);
   enc.set_constant(9, _tpad);
-  enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)tokens},
+  enc.set_constant(10, q_rows);   // destination stride: out may be a band
+  enc.dispatch({(unsigned)d, (unsigned)heads, (unsigned)q_tokens},
                {(unsigned)d, 1, 1});
   }
   return true;

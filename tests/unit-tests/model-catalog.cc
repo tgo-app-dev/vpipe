@@ -546,6 +546,51 @@ TEST(model_catalog, qwen_image_pair_present) {
   EXPECT_TRUE(catalog_category(*t2i) == "model");
 }
 
+TEST(model_catalog, qwen_image_21_present) {
+  // 2.1 carries its own model_type despite the shared family name: it is
+  // a single-stream 7B DiT with an RGBA /16 VAE, sharing neither the
+  // transformer nor the autoencoder with the 20B pair above. Typing it
+  // as either of those would load a config that does not describe it.
+  const ModelCatalogEntry* e = catalog_by_path("Qwen/Qwen-Image-2.1");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Qwen-Image");
+  EXPECT_TRUE(e->version == "2.1");
+  EXPECT_TRUE(e->param_class == "7B");
+  EXPECT_TRUE(e->model_type == "qwen-image-21");
+  // The consolidated tokenizer.json ships in processor/, so no synthesis
+  // step -- unlike 2512, which has only vocab.json + merges.txt.
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // Two DiT shards here against 2512's nine and Edit-2511's five: a
+  // copied file list fetches an index pointing at shards it lacks.
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model-00002-of-00002."
+                   "safetensors"));
+  EXPECT_FALSE(has_(e->files,
+                    "transformer/diffusion_pytorch_model-00003-of-00009."
+                    "safetensors"));
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model.safetensors.index."
+                   "json"));
+  EXPECT_TRUE(has_(e->files, "text_encoder/model-00004-of-00004.safetensors"));
+  EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor/tokenizer.json"));
+  EXPECT_TRUE(has_(e->files, "processor/preprocessor_config.json"));
+  EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+  // There is no tokenizer/ subdir in this repo at all.
+  EXPECT_FALSE(has_(e->files, "tokenizer/vocab.json"));
+  // ONE checkpoint answers both tasks, so unlike the qwen-image /
+  // qwen-image-edit split this takes an OPTIONAL image input and must
+  // still be offered to a stage that wants one.
+  FlexData f = catalog_entry_to_flex(*e);
+  auto in = flex_arr_(f, "inputs");
+  EXPECT_TRUE(in.size() == 2);
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_TRUE(has_(flex_arr_(f, "outputs"), "image"));
+  EXPECT_TRUE(catalog_category(*e) == "model");
+}
+
 TEST(model_catalog, mage_flow_family_present) {
   // The six Mage-Flow rows are NOT in kCatalog any more: they moved into
   // the vpipe-mage-flow plugin, which registers them at load (see the

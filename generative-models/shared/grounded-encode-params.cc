@@ -29,6 +29,24 @@ GroundedEncodeParams::for_family(const std::string& family)
     p.max_pixels   = 16777216;
     return p;
   }
+  if (family == "qwen-image-21") {
+    // ONE resize feeds both the text encoder and the VAE -- the
+    // reference says so in as many words -- so this geometry is not a
+    // conditioning preference, it is a CONTRACT with the DiT. Each
+    // encoder image slot stands for a 2x2 group of latent tokens, so
+    // the tower's merged grid must be exactly half the VAE's: at patch
+    // 16 / merge 2 the tower sees H/32 and the VAE H/16, which holds
+    // only while both read the same pixels.
+    //
+    // The pipeline's `output_resolution` defaults to 1024 and it resizes
+    // to that AREA, aspect preserved, rounded to 32 -- not to a long
+    // edge, so there is no long_edge here.
+    p.long_edge    = 0;
+    p.pixel_budget = (std::size_t)1024 * 1024;
+    p.min_pixels   = 65536;
+    p.max_pixels   = 16777216;
+    return p;
+  }
   if (family == "qwen-image-edit") {
     // Qwen2.5-VL takes a pixel budget directly and does its own
     // smart-resize from it, so there is no separate long-edge cap.

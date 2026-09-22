@@ -136,6 +136,9 @@ dit_class_family_(const std::string& class_name)
 {
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
+  if (class_name == "QwenImage21Transformer2DModel") {
+    return "qwen-image-21";
+  }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   // Wan video. Its two A14B experts are separate checkpoints, so each is
@@ -501,6 +504,24 @@ dit_quant_linears_(const std::string& family)
     return {"to_q", "to_k", "to_v", "0",
             "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
             "proj", "2"};
+  }
+  if (family == "qwen-image-21") {
+    // SINGLE-stream QwenImage21Transformer2DModel, and biasless. Nine
+    // tensors a block, of which seven are Linears: attention's q/k/v and
+    // to_out.0 (leaf "0"), and the feed-forward's gate_layer / proj /
+    // out. The two left out are attn.norm_q / norm_k, which are
+    // per-head RMSNorm vectors and not matrices at all.
+    //
+    // NO EXCLUDE LIST IS NEEDED, which is worth stating because most
+    // families here need one: the model-level leaves are img_in, "1"
+    // (modulation), linear_1, linear_2, in_layer, out_layer, text_norm,
+    // linear and proj_out, and none of them collides with the seven.
+    // Everything model-level therefore stays bf16 by construction --
+    // which is what is wanted, since all of it is small and
+    // precision-sensitive: every latent enters through img_in, every
+    // velocity leaves through proj_out, and the shared modulation feeds
+    // all 32 blocks.
+    return {"to_q", "to_k", "to_v", "0", "gate_layer", "proj", "out"};
   }
   if (family == "wan") {
     // Wan's single-stream block: self-attention, cross-attention into the
@@ -1341,7 +1362,8 @@ ModelQuantizeStage::quantize_dit_component_(
           _bits));
     }
   }
-  if (_quant_modulation && (is_qie || is_boogu || is_wan)) {
+  const bool is_qi21 = (family == "qwen-image-21");
+  if (_quant_modulation && (is_qie || is_boogu || is_wan || is_qi21)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
     // rides on. This is the opt-in that quantizes them anyway, for a box that
@@ -1357,6 +1379,12 @@ ModelQuantizeStage::quantize_dit_component_(
     //     condition_embedder.time_proj      -> leaf "time_proj"
     //   (scale_shift_table is 3-D and never quantized at all, and the
     //   per-block modulation is that table plus this projection's output).
+    //   Qwen-Image-2.1: ONE shared `modulation.1` for all 32 blocks
+    //     -> leaf "1", the same leaf as the dual-stream sibling's
+    //     per-block `*_mod.1`. It is also the one family here where
+    //     this opt-in buys almost nothing: 0.12 GB of a 13.25 GB
+    //     checkpoint, against 40% of the model on MiniMax-H3. Offered
+    //     for completeness, not because it is a lever.
     const char* leaf = is_boogu ? "linear" : is_wan ? "time_proj" : "1";
     opt.quant_linears.push_back(leaf);
     // The modulation carries large-magnitude scale/gate values (on QIE they
@@ -1421,6 +1449,19 @@ ModelQuantizeStage::quantize_dit_component_(
     // no calib_dir is supplied. Krea-2 and FLUX.2 use family-specific collectors
     // (different encoder / template / tap groups); the quantizer reads the
     // right calib layout via opt.dit_family.
+    // THE FALL-THROUGH BELOW IS KREA-2'S COLLECTOR, so a built-in
+    // family without one of its own would be calibrated by building a
+    // Krea-2 DiT config over its weights. Refuse instead. Plain and
+    // mixed quantization are unaffected, and an explicit calib_dir
+    // still works.
+    if (is_qi21 && _calib_dir.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): qwen-image-21 has no on-device AWQ "
+          "collector, and the fall-through would calibrate a Krea-2 model "
+          "over these weights -- refusing. Use plain or mixed "
+          "quantization, or supply calib_dir", this->id()));
+      return false;
+    }
     if (qprof != nullptr && _calib_dir.empty()) {
       // The on-device collectors drive a family's OWN encoder and
       // template, and they are in-tree code -- so a family the host

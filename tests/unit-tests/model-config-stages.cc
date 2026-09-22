@@ -17,6 +17,7 @@
 #include "pipeline/stage-registry.h"
 #include "pipeline/stage-spec.h"
 #include "stages/boogu-image-model-config-stage.h"
+#include "stages/qwen-image-21-model-config-stage.h"
 #include "stages/flux2-model-config-stage.h"
 #include "stages/krea2-model-config-stage.h"
 #include "stages/minimax-h3-model-config-stage.h"
@@ -49,7 +50,7 @@ namespace {
 const char* const kSources[] = {
   "wan2-model-config", "minimax-h3-model-config", "flux2-model-config",
   "krea2-model-config", "boogu-image-model-config",
-  "qwen-image-edit-model-config",
+  "qwen-image-edit-model-config", "qwen-image-21-model-config",
 };
 
 }  // namespace
@@ -107,6 +108,10 @@ TEST(model_config, every_source_stamps_its_family)
          QwenImageEditModelConfigStage(&sess, "g", {},
                                        empty()).resolved_config()),
      "qwen-image-edit"},
+    {model_config::family_of(
+         QwenImage21ModelConfigStage(&sess, "h", {},
+                                     empty()).resolved_config()),
+     "qwen-image-21"},
   };
   for (const auto& c : cases) { EXPECT_TRUE(c.got == c.want); }
 }

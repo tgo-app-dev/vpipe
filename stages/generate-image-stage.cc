@@ -74,14 +74,14 @@ const ConfigKey kAttrs[] = {
           "pipeline. OPTIONAL: a model-select source on the model iport "
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
-       "krea2,flux2,qwen-image,qwen-image-edit,"
+       "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
        "boogu-image,boogu-image-edit,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
-       "krea2-dit,flux2-dit,qwen-image-edit-dit,"
+       "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
        "boogu-image-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
@@ -464,7 +464,8 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
   // `transformer_blocks.` reported a floor of 12324 MB against a true
   // 2848, which is a declaration that says almost nothing.
   static const std::vector<std::string_view> kStems = {
-      "transformer_blocks.",         // FLUX.2 doubles, Krea-2, Qwen-Image
+      "transformer_blocks.",         // FLUX.2 doubles, Krea-2,
+                                     // Qwen-Image, Qwen-Image-2.1
       "single_transformer_blocks.",  // FLUX.2 singles
       "double_stream_layers.",       // Boogu doubles
       "single_stream_layers.",       // Boogu singles
@@ -780,7 +781,12 @@ unclaimed_family_(const std::string& transformer_dir)
 int
 latent_scale_(const std::string& family)
 {
-  return family == "flux2" ? 16 : 8;
+  // Pixels per reference-latent cell: the VAE's spatial stride. 16 for
+  // FLUX.2 (8x VAE + 2x patch), and 16 for Qwen-Image-2.1 -- whose VAE
+  // is five levels, so the stride is the VAE's alone with no patch to
+  // multiply by.
+  if (family == "flux2" || family == "qwen-image-21") { return 16; }
+  return 8;
 }
 
 // FLUX.2 empirical flow-shift mu (diffusers Flux2Pipeline.compute_empirical_mu):
@@ -825,6 +831,13 @@ t2i_family_(const std::string& transformer_dir)
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
+        // Qwen-Image-2.1. A DIFFERENT network from the line above --
+        // single-stream, /16 VAE, RGBA -- and named here because the
+        // fall-through is "krea2", which would load a Krea-2 config over
+        // these weights and run.
+        if (cls == "QwenImage21Transformer2DModel") {
+          return "qwen-image-21";
+        }
         if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
       }
     }
@@ -994,6 +1007,32 @@ krea2_vae_base_(const std::string& root)
   return 96;
 }
 
+// The DECODER's base, which is the one the decode peak is about. Most
+// checkpoints on this VAE are symmetric and `decoder_base_dim` is
+// absent, so this is `krea2_vae_base_` for all of them -- but
+// Qwen-Image-2.1 is 96 encoder / 144 decoder, and reading the encoder's
+// number there under-books the peak by a third. That is the quietest
+// possible version of this bug: the estimate decides whether the DiT is
+// freed before the decode, so a short answer does not fail, it just
+// runs the decode in less room than it needs.
+int
+krea2_vae_dec_base_(const std::string& root)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(root) / "vae" / "config.json");
+  if (in) {
+    FlexData fd = FlexData::from_json(in);
+    if (fd.is_object()) {
+      auto o = fd.as_object();
+      if (o.contains("decoder_base_dim")) {
+        const int b = (int)o.at("decoder_base_dim").as_real(0.0);
+        if (b > 0) { return b; }
+      }
+    }
+  }
+  return krea2_vae_base_(root);
+}
+
 }  // namespace
 
 void
@@ -1006,9 +1045,16 @@ GenerateImageStage::reset_run_state()
   // weights are still held we deliberately leave the guard set --
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
-  if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit) {
+  if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
+    // The holding correction describes a DiT that is no longer here. A
+    // reloaded one starts at its trunk and grows again, so keeping the
+    // old figures would suppress the first revision that matters --
+    // `_dit_revised` is compared against to avoid replanning for an
+    // unchanged number, and a stale one reads as unchanged.
+    _dit_load_floor = 0;
+    _dit_revised    = 0;
   }
 
   // Per-launch reset: the stage survives a stop/relaunch, and the
@@ -1037,18 +1083,83 @@ GenerateImageStage::revise_dit_declaration_(const std::string& dit_dir) const
 {
   auto* mgr = session() ? session()->services()->generative_model_manager() : nullptr;
   if (mgr == nullptr || dit_dir.empty()) { return; }
-  // What the set holds IS the right number for a DiT: unlike the LMs,
-  // its retained tensors go through tensor()/derived() and are cached
-  // here, while the streamed blocks deliberately are not.
-  auto ws = mgr->weight_set(dit_dir);
-  if (!ws) { return; }
-  const std::size_t held = ws->stats().bytes;
+  // WHAT THE SET HOLDS IS ONLY THE TRUNK on a streaming DiT, and the
+  // trunk is the small half. Retained tensors go through
+  // tensor()/derived() and are cached in the set, but the blocks
+  // residency PROMOTES are the model's OWN buffers -- not cache
+  // entries, and so invisible here. A family that can answer for its
+  // whole holding is asked instead; the set is the fallback for the
+  // ones that cannot.
+  std::size_t held = dit_resident_bytes_();
+  if (held == 0) {
+    auto ws = mgr->weight_set(dit_dir);
+    if (!ws) { return; }
+    held = ws->stats().bytes;
+  }
   mgr->revise_declaration(dit_dir, held);
   session()->log_debug(fmt(
       "GenerateImageStage('{}'): streaming DiT keeps {} MB resident; revised "
-      "down from its {} MB on disk so peers do not size against weights "
+      "from its {} MB on disk so peers do not size against weights "
       "that are never there", this->id(), held >> 20,
       model_memory::dir_weights_bytes(dit_dir) >> 20));
+}
+
+// What the LIVE DiT says it holds, or 0 when this family cannot answer
+// cheaply. Only the streaming-aware ones are asked -- a preloaded DiT's
+// declaration is already right and re-stating it per generation would
+// replan the graph for nothing.
+std::size_t
+GenerateImageStage::dit_resident_bytes_() const
+{
+  if (_qi21_dit) { return (std::size_t)_qi21_dit->resident_bytes(); }
+  return 0;
+}
+
+// THE WORKING SET MOVES DURING THE RUN, and a declaration taken once at
+// load says otherwise.
+//
+// A streaming DiT loads holding its trunk and grows through the denoise
+// as block residency admits what the box turns out to have room for --
+// MEASURED on this family, 1088 MB declared at load against 7360 MB
+// held three forwards later. Revised only at load, the manager reports
+// the first number for the rest of the run, and a peer sizing against
+// it keeps weights the box no longer has room for. That is the
+// oversubscription that ends in swap, and it is silent: every
+// individual figure is one somebody really said.
+//
+// So the correction is asked again after every generation, which is the
+// same rule generate-video applies per clip. Both ledgers move: the
+// manager's, which is what peers read through weight_footprint(), and
+// the plan's holding, which is what the phase figures are computed
+// from. A revision replans the graph, so it is only published when the
+// number actually moved.
+void
+GenerateImageStage::correct_dit_holding_(const char* when) const
+{
+  const std::size_t held = dit_resident_bytes_();
+  if (held == 0 || _dit_holding_dir.empty()) { return; }
+  auto* mgr = session() ? session()->services()->generative_model_manager()
+                        : nullptr;
+  if (mgr == nullptr) { return; }
+  mgr->revise_declaration(_dit_holding_dir, held);
+
+  StageMemory m = declare_memory();
+  StageHolding* h = nullptr;
+  for (auto& x : m.holdings) {
+    if (x.source == _dit_holding_dir) { h = &x; break; }
+  }
+  // Named separately from the encoder on purpose (see declare_memory),
+  // which is what makes it findable here -- resident_bytes() is this
+  // DiT's total and cannot be apportioned across several holdings.
+  if (h == nullptr) { return; }
+  _dit_load_floor = correct_loaded_holding(*h, held, _dit_load_floor);
+  if (h->preload == _dit_revised) { return; }
+  _dit_revised = h->preload;
+  revise_memory(m);
+  session()->log_debug(fmt(
+      "GenerateImageStage('{}'): the DiT holds {} MB {}; the plan holds it "
+      "at {} MB, floor {} MB", this->id(), held >> 20, when,
+      h->preload >> 20, h->floor >> 20));
 }
 
 StageMemory
@@ -1211,6 +1322,24 @@ GenerateImageStage::declare_resources() const
   // projection -- are fixed modules too, summed into ONE unit: granted
   // together or not at all. Sized from the checkpoint's own dims, since the
   // klein-4B and -9B modules differ by ~1.8x.
+  // Qwen-Image-2.1's feed-forward tier: ONE runtime-weight module, so a
+  // single fixed unit, granted or not. Claimed only for the family that
+  // calls it -- booking bytes nothing allocates is the same lie the
+  // other way round.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "qwen-image-21") {
+    genai::MetalQwenImage21Transformer::Config qc;
+    (void)genai::MetalQwenImage21Transformer::Config::read_dims(dit, &qc);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalQwenImage21Transformer::ane_runtime_bytes(
+                 qc,
+                 genai::MetalQwenImage21Transformer::ane_plan_seq(_width,
+                                                                  _height)),
+             1, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
       t2i_family_(dit) == "flux2") {
     genai::MetalFlux2Transformer::Config fc;
@@ -1291,6 +1420,16 @@ GenerateImageStage::apply_model_config_()
       }
     }
   };
+  if (_family == "qwen-image-21") {
+    // `use_kv_cache` -- absent means "no opinion", so the family's own
+    // default (on) stands rather than being replaced by a false.
+    if (_model_cfg.is_object()) {
+      auto o = _model_cfg.as_object();
+      if (o.contains("use_kv_cache")) {
+        _qi21_use_kv_cache = o.at("use_kv_cache").as_bool(true);
+      }
+    }
+  }
   if (_family == "flux2") {
     _flux2_params =
         genai::MetalFlux2Transformer::GenerationParams::from_flex(_model_cfg,
@@ -1716,6 +1855,51 @@ GenerateImageStage::ensure_loaded_()
     // would have silently pinned the estimate to the 128 default on a
     // checkpoint whose base_dim is 96.
     _vae_base = krea2_vae_base_(root);
+  } else if (_family == "qwen-image-21") {
+    // A 7B DiT at ~14.2 GB bf16, beside a ~17.5 GB Qwen3-VL encoder.
+    // The same plan_streaming() rule the other five families take --
+    // not a sixth answer to one question.
+    // VPIPE_QWEN_IMAGE21_STREAM overrides.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool stream_blocks = plan.stream;
+    if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-2.1 footprint {} GB (others {} "
+        "GB) + {} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    _qi21_dit_dir = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
+    _qi21_stream = stream_blocks;
+    // Its VAE is the Qwen-Image one generalized, so the same reader
+    // serves it -- but the DECODER's base, which is 144 here against
+    // the encoder's 96, because every peak this feeds is a decode.
+    _vae_base = krea2_vae_dec_base_(root);
+    _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    if (stream_blocks) {
+      // Deferred for the same reason Boogu defers: both stages load in
+      // initialize(), so a preloaded DiT beside a resident encoder is
+      // the peak, and it is the peak that decides whether the box
+      // copes. The DiT loads on the first conditioning beat, by which
+      // time the conditioner has let its encoder go.
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "GenerateImageStage('{}'): memory-bounded -- the Qwen-Image-2.1 "
+          "DiT loads on the first conditioning beat (block streaming on) "
+          "and is freed for the vae-decode, so it never shares the box "
+          "with the text encoder", this->id()));
+    } else if (!load_qwen_image21_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the Qwen-Image-2.1 DiT "
+          "from '{}'; inert", this->id(), dit_dir));
+      return;
+    }
   } else if (_family == "boogu-image") {
     // Boogu's 10B NextDiT. At ~20 GB bf16 it streams on any box that cannot
     // hold it beside the resident Qwen3-VL mllm (~16 GB), which is every box
@@ -2045,6 +2229,63 @@ GenerateImageStage::load_vosr_dit_()
                          this->id(), err));
   }
   return (bool)_vosr;
+}
+
+bool
+GenerateImageStage::load_qwen_image21_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _qi21_dit_dir.empty()) { return false; }
+  genai::MetalQwenImage21Transformer::Config cfg;
+  if (!genai::MetalQwenImage21Transformer::Config::read_dims(_qi21_dit_dir,
+                                                             &cfg)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): '{}' does not hold a "
+        "QwenImage21Transformer2DModel config", this->id(), _qi21_dit_dir));
+    return false;
+  }
+  cfg.i8_gemm = _i8_gemm;
+  cfg.sage = _sage;
+  cfg.sol = _sol;
+  cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
+                                            0);
+  cfg.ane_layers = (int)genai::accel::integer(&_accel,
+                                              genai::accel::kAneLayers, 0);
+  _qi21_dit = genai::MetalQwenImage21Transformer::load(
+      weight_set_(_qi21_dit_dir), mc, cfg, _qi21_stream);
+  if (_qi21_dit && _qi21_stream) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-2.1 DiT streaming {} blocks; "
+        "the resident set grows as the box allows", this->id(),
+        _qi21_dit->config().n_layers));
+  }
+  return (bool)_qi21_dit;
+}
+
+void
+GenerateImageStage::free_qwen_image21_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_qi21_dit) { return; }
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  // The VAE decode that follows is a /16 one, so its peak is a quarter
+  // of what the same picture costs an /8 family -- the latent grid is
+  // half in each axis. Sized from the checkpoint either way.
+  const std::size_t peak =
+      qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 96);
+  const std::size_t budget = mc->memory_budget().available_physical;
+  if (peak <= budget) { return; }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the Qwen-Image-2.1 DiT before a "
+      "{}x{} decode ({} MB wanted, {} MB free)", this->id(), gen_w, gen_h,
+      peak >> 20, budget >> 20));
+  publish_decode_arena_(peak);
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_qi21_dit_dir);
+  }
+  _qi21_dit.reset();
+  _dit_unloaded = true;
 }
 
 bool
@@ -2902,6 +3143,271 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
 // clean, so the schedule ASCENDS. That is why neither uses genai::FlowSampler
 // (whose integrators all assume a descending sigma with a terminal 0).
 std::vector<float>
+GenerateImageStage::generate_qwen_image21_(
+    const metal_compute::SharedBuffer& txt_pos, int n_real,
+    const metal_compute::SharedBuffer& txt_neg, int n_real_neg, int gen_h,
+    int gen_w, const std::vector<RefLatent>& refs,
+    const std::function<void(const std::vector<float>&)>& emit_step) const
+{
+  using metal_compute::SharedBuffer;
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !_qi21_dit) { return {}; }
+  const auto& dcfg = _qi21_dit->config();
+  const int IC = dcfg.in_channels;                 // 64, latents UNPATCHED
+  const int lh = gen_h / 16, lw = gen_w / 16;      // the /16 VAE's grid
+  const int img_seq = lh * lw;
+  // The size grid is 32, not 16: the pipeline rounds the LATENT grid
+  // even, so an odd latent axis cannot be expressed. It also has to be
+  // a whole number of 2x2 encoder slots, which is the same condition.
+  if (img_seq <= 0 || (lh % 2) != 0 || (lw % 2) != 0) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): {}x{} gives a {}x{} latent, and this model "
+        "needs an EVEN latent grid (one encoder slot is 2x2 tokens) -- use "
+        "multiples of 32", this->id(), gen_w, gen_h, lw, lh));
+    return {};
+  }
+
+  // ---- the joint sequence -------------------------------------------
+  //
+  // The conditioner published which of ITS rows are image slots; the
+  // target's slots are appended here, because the target geometry is
+  // this stage's to know and the conditioner's to not.
+  std::vector<std::uint8_t> slot = _qi21_slots;
+  if ((int)slot.size() != n_real) {
+    // Not a warning that can be worked around: without the mask there
+    // is no way to tell a text row from an image row, and guessing
+    // would lay the sequence out wrongly and still produce a picture.
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the conditioning beat carries a slot mask "
+        "of {} for {} rows -- wire a qwen-image-21 conditioner",
+        this->id(), (int)_qi21_slots.size(), n_real));
+    return {};
+  }
+  std::vector<genai::qi21::ImgBlock> blocks;
+  std::vector<const RefLatent*> used;
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (refs[i].empty()) { continue; }
+    const int gh = i < _qi21_ref_gh.size() ? _qi21_ref_gh[i] : 0;
+    const int gw = i < _qi21_ref_gw.size() ? _qi21_ref_gw[i] : 0;
+    // THE CONTRACT, checked. One resize feeds both the tower and the
+    // VAE, so a reference's latent grid must be exactly twice the
+    // tower's merged grid. When it is not, the two stages resized
+    // differently and the layout below would silently mean something
+    // else.
+    if (gh != refs[i].h || gw != refs[i].w) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): reference {} is a {}x{} latent but the "
+          "conditioner saw a {}x{} grid -- the vae-encode and the "
+          "conditioner must be given the SAME resized picture",
+          this->id(), (int)i, refs[i].w, refs[i].h, gw, gh));
+      return {};
+    }
+    blocks.push_back(genai::qi21::ImgBlock{1, gh, gw});
+    used.push_back(&refs[i]);
+  }
+  blocks.push_back(genai::qi21::ImgBlock{1, lh, lw});
+  slot.insert(slot.end(), (std::size_t)(img_seq / 4), 1);
+  genai::qi21::Layout lay;
+  std::string lerr;
+  if (!genai::qi21::build_layout(slot, {}, blocks, &lay, &lerr)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the joint sequence does not add up: {}",
+        this->id(), lerr));
+    return {};
+  }
+
+  // ---- schedule ------------------------------------------------------
+  genai::FlowSchedulerSpec sched = _scheduler_spec;
+  if (!_scheduler_latched) {
+    // FlowMatchEulerDiscreteScheduler with dynamic shifting, straight
+    // off the checkpoint's scheduler_config: the base grid is
+    // linspace(1, 1/S, S) and shift_terminal stretches the tail to 0.02.
+    sched.dynamic_shift = true;
+    sched.shift_type = "exponential";
+    sched.base_shift = 0.5; sched.max_shift = 0.9;
+    sched.base_seq = 256; sched.max_seq = 8192;
+    sched.shift_terminal = 0.02;
+    sched.steps = _steps > 0 ? _steps : 40;
+  }
+  sched.img_seq_len = img_seq;
+  genai::FlowSampler sampler(_sampler_spec, sched);
+  const int S = sampler.steps();
+
+  std::vector<float> packed((std::size_t)img_seq * IC);
+  {
+    std::mt19937_64 rng(_seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : packed) { v = nd(rng); }
+  }
+
+  // Every image block's latents, condition images FIRST and the target
+  // LAST -- the order build_layout labelled them in.
+  const std::size_t total_img = (std::size_t)lay.image_len * IC;
+  SharedBuffer latbuf = mc->make_shared_buffer(total_img * 2);
+  if (latbuf.empty()) { return {}; }
+  {
+    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+    std::size_t at = 0;
+    for (const RefLatent* r : used) {
+      // Channel-first [c,h,w] -> packed [h*w, c], which is the layout
+      // the DiT reads and the one _pack_latents produces.
+      for (int y = 0; y < r->h; ++y) {
+        for (int x = 0; x < r->w; ++x) {
+          for (int c = 0; c < r->c && c < IC; ++c) {
+            lb[at + c] = f32_to_bf16_(
+                r->chw[((std::size_t)c * r->h + y) * r->w + x]);
+          }
+          at += (std::size_t)IC;
+        }
+      }
+    }
+  }
+  const std::size_t tgt_off = (std::size_t)(lay.image_len - img_seq) * IC;
+
+  const bool cfg = !txt_neg.empty() && n_real_neg > 0 &&
+                   _guidance_scale != 1.0;
+  const float gscale = (float)_guidance_scale;
+  bool dit_ok = true;
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_qi21_dit)>>
+      prog_guard(_qi21_dit.get(), prog);
+
+  // ---- how much of the stack this run may KEEP ----------------------
+  //
+  // Without this the DiT streams and NEVER grows: BlockResidency refuses
+  // every admission until a reserve has been DECLARED, because a model
+  // that has not been told what else needs the box cannot decide what is
+  // safe to hold. Declaring 0 is a real answer ("nothing runs beside
+  // me"); declaring nothing is not, and reads as a checkpoint re-read
+  // from disk on all forty steps.
+  if (mc != nullptr && _qi21_dit->streaming()) {
+    const std::size_t peak =
+        qwen_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 144);
+    const auto mb = mc->memory_budget();
+    // No budget to read -> the free bails out too, so the DiT survives
+    // the decode and the reserve has to cover it.
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _qi21_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-2.1 residency reserve {} MB "
+        "-- the {}x{} vae-decode wants {} MB and {}",
+        this->id(), (decode_runs_beside_us ? peak : 0) >> 20, gen_w, gen_h,
+        peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+    // And the RATES, after the reserve because the probe is sized
+    // against what is left once the reserve is taken. Both of
+    // BlockResidency's defaults assume a ~30-step run; this model's own
+    // default is 40, but a graph is free to ask for 8.
+    _qi21_dit->set_residency_schedule(
+        _scheduler_spec.steps > 0 ? _scheduler_spec.steps : 1);
+  }
+
+  // The cross-step prefix caches. TWO of them under CFG, because the
+  // positive and negative prompts have different prefixes -- sharing one
+  // would condition every later step on whichever ran first.
+  genai::MetalQwenImage21Transformer::KvCache kv_pos, kv_neg;
+  // The cache is on unless the graph's model-config turned it off. It
+  // is exact rather than approximate, so there is no quality reason to
+  // want it off -- the key exists for A/B and for the equivalence test.
+  const bool use_kv = _qi21_use_kv_cache && lay.prefix_len > 0;
+  int step_i = 0;
+
+  auto run = [&](const SharedBuffer& txt, int rows,
+                 genai::MetalQwenImage21Transformer::KvCache* kv, float sigma)
+      -> SharedBuffer {
+    (void)rows;
+    genai::MetalQwenImage21Transformer::Request req;
+    req.latents = &latbuf;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = sigma;
+    if (use_kv) {
+      req.kv = kv;
+      req.kv_mode = step_i == 0
+          ? genai::MetalQwenImage21Transformer::KvMode::kFill
+          : genai::MetalQwenImage21Transformer::KvMode::kCached;
+    }
+    std::string e;
+    SharedBuffer out = _qi21_dit->forward(req, &e);
+    if (out.empty()) {
+      // A cooperative stop comes back empty with NO reason, and is not
+      // a failure -- the beat-level line below reports it as stopped.
+      // Only a real fault has something to say here.
+      if (!e.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): DiT forward failed: "
+                            "{}", this->id(), e));
+      }
+      dit_ok = false;
+    }
+    return out;
+  };
+
+  auto denoise = [&](const std::vector<float>& cand,
+                     double sigma) -> std::vector<float> {
+    // The target block's rows are the TAIL of the packed latent.
+    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+    for (std::size_t k = 0; k < cand.size(); ++k) {
+      lb[tgt_off + k] = f32_to_bf16_(cand[k]);
+    }
+    SharedBuffer v = run(txt_pos, n_real, &kv_pos, (float)sigma);
+    if (!dit_ok || v.empty()) { return {}; }
+    std::vector<float> out((std::size_t)img_seq * IC);
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    for (std::size_t k = 0; k < out.size(); ++k) {
+      out[k] = bf16_to_f32_(vp[k]);
+    }
+    prog.end_forward();
+    if (cfg) {
+      SharedBuffer nv = run(txt_neg, n_real_neg, &kv_neg, (float)sigma);
+      if (!dit_ok || nv.empty()) { return {}; }
+      const auto* np = static_cast<const std::uint16_t*>(nv.contents());
+      for (std::size_t k = 0; k < out.size(); ++k) {
+        const float n = bf16_to_f32_(np[k]);
+        out[k] = n + gscale * (out[k] - n);
+      }
+      prog.end_forward();
+    }
+    // THE VELOCITY IS DATA-WARD for this family's scheduler? No: the
+    // reference hands the DiT output straight to
+    // FlowMatchEulerDiscreteScheduler.step, which is the ordinary
+    // noise-ward convention this sampler already implements.
+    return out;
+  };
+
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)IC * lh * lw);
+    for (int t = 0; t < img_seq; ++t) {
+      const int y = t / lw, x = t % lw;
+      for (int c = 0; c < IC; ++c) {
+        latent[((std::size_t)c * lh + y) * lw + x] =
+            pk[(std::size_t)t * IC + c];
+      }
+    }
+    return latent;
+  };
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < S; ++i) {
+    step_i = i;
+    sampler.step(i, packed, denoise);
+    if (!dit_ok) { return {}; }
+    if (emit_step) { emit_step(unpack(packed)); }
+    prog.end_step(i);
+  }
+  const double secs = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  session()->info(fmt(
+      "GenerateImageStage('{}'): Qwen-Image-2.1 latent generated in {:.2f}s "
+      "({} steps, joint {}, prefix {}{})", this->id(), secs, S,
+      lay.joint_len, lay.prefix_len,
+      use_kv ? ", prefix KV cached" : ""));
+  return unpack(packed);
+}
+
+std::vector<float>
 GenerateImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                                   int n_real,
                                   const metal_compute::SharedBuffer& txt_neg,
@@ -3543,6 +4049,31 @@ GenerateImageStage::process(RuntimeContext& ctx)
       auto o = sb.as_object();
       cond_blocked = o.contains("content_blocked")
                      && o.at("content_blocked").as_bool(false);
+      // Qwen-Image-2.1's joint-sequence bookkeeping. Read here rather
+      // than in the family branch because the beat is consumed by then,
+      // and read EVERY beat -- a second prompt with a different
+      // reference count has a different mask, and a latched one would
+      // lay the new sequence out with the old prompt's slots.
+      if (_family == "qwen-image-21") {
+        _qi21_slots.clear();
+        _qi21_ref_gh.clear();
+        _qi21_ref_gw.clear();
+        auto ints = [&](const char* k, std::vector<int>& dst) {
+          if (!o.contains(k)) { return; }
+          const FlexData f = o.at(k);
+          if (!f.is_array()) { return; }
+          auto a = f.as_array();
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            dst.push_back((int)a.at(i).as_int(0));
+          }
+        };
+        std::vector<int> sl;
+        ints("img_slots", sl);
+        _qi21_slots.reserve(sl.size());
+        for (int v : sl) { _qi21_slots.push_back(v != 0 ? 1 : 0); }
+        ints("ref_grid_h", _qi21_ref_gh);
+        ints("ref_grid_w", _qi21_ref_gw);
+      }
     }
   }
   // A prior generation may have freed the FLUX.2 DiT to make room for the
@@ -3565,6 +4096,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "next prompt", this->id()));
     if (load_qie_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "qwen-image-21" && _dit_unloaded && !_qi21_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the Qwen-Image-2.1 DiT for the "
+        "next prompt", this->id()));
+    if (load_qwen_image21_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
@@ -3575,6 +4112,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "flux2" ? (bool)_flux2_dit
       : _family == "qwen-image-edit" ? (bool)_qie_dit
       : _family == "boogu-image" ? (bool)_boogu_dit
+      : _family == "qwen-image-21" ? (bool)_qi21_dit
       : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
   if (!have_dit) {
@@ -4238,6 +4776,48 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // sequence) + the NextDiT, with the DMD student's ascending-sigma loop.
   // The VAE is 8x and the DiT patches 2x2 itself, so the emitted latent is
   // [16, H/8, W/8] -- the same shape Qwen-Image-Edit emits. ----
+  // ---- Qwen-Image-2.1: one joint sequence, a /16 VAE, and the target
+  // block's rows as the latent. The emitted shape is [64, H/16, W/16] --
+  // 64 channels because the DiT consumes latents UNPATCHED. ----
+  if (_family == "qwen-image-21") {
+    const int qlh = gen_h / 16, qlw = gen_w / 16;
+    const int QZ = _qi21_dit->config().out_channels;
+    std::vector<RefLatent> qrefs;
+    if (!_ref[0].empty()) { qrefs.push_back(_ref[0]); }
+    if (!_ref[1].empty()) { qrefs.push_back(_ref[1]); }
+    _qi21_dit->set_stream_stop(stopping);
+    const std::vector<float> ql =
+        generate_qwen_image21_(cond, n_real, cond_neg, n_real_neg, gen_h,
+                               gen_w, qrefs, step_emitter({QZ, qlh, qlw}));
+    _qi21_dit->set_stream_stop({});
+    if (ql.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): Qwen-Image-2.1 generation {}; dropping "
+          "beat", this->id(),
+          ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {QZ, qlh, qlw};
+    out->resize_contiguous(ql.size());
+    std::memcpy(out->as_f32(), ql.data(), ql.size() * sizeof(float));
+    tag_model_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-2.1 latent [{}, {}, {}] ({} "
+        "steps @ {}x{})", this->id(), QZ, qlh, qlw, _scheduler_spec.steps,
+        gen_h, gen_w));
+    // BEFORE the free, not after: this says what the DiT held while it
+    // denoised, which is the number a peer has to size against. The
+    // free that may follow is a transient (see declare_memory), so it
+    // deliberately does not move the holding back down.
+    correct_dit_holding_("after a generation");
+    free_qwen_image21_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
   if (_family == "boogu-image") {
     std::vector<RefLatent> brefs;
     if (!_ref[0].empty()) { brefs.push_back(_ref[0]); }

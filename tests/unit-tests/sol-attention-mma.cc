@@ -268,12 +268,14 @@ struct Rig {
     e.set_buffer(3, qc); e.set_buffer(4, kc); e.set_buffer(5, vc);
     e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NK);
     e.set_constant(9, BLK); e.set_constant(10, 6);
+    e.set_constant(11, T);   // head stride == tokens: not a band
     e.dispatch({kD, (unsigned)H, (unsigned)NK}, {kD, 1, 1});
     e.set_function(f_sum);
     e.set_buffer(0, q); e.set_buffer(1, q); e.set_buffer(2, q);
     e.set_buffer(3, qc); e.set_buffer(4, qc); e.set_buffer(5, qc);
     e.set_constant(6, T); e.set_constant(7, kD); e.set_constant(8, NQ);
     e.set_constant(9, BQ); e.set_constant(10, 1);
+    e.set_constant(11, T);   // head stride == tokens: not a band
     e.dispatch({kD, (unsigned)H, (unsigned)NQ}, {kD, 1, 1});
     }
 
@@ -296,6 +298,7 @@ struct Rig {
     e.set_constant(15, sink_lo); e.set_constant(16, sink_hi);
     e.set_constant(17, per);
     e.set_constant(18, nks);
+    e.set_constant(20, 0);   // query offset: a whole-sequence call
     e.dispatch({32, (unsigned)H, (unsigned)NQ}, {32, 1, 1});
     }
 
@@ -347,6 +350,7 @@ struct Rig {
     e.set_buffer(3, o_a); e.set_buffer(4, m_a); e.set_buffer(5, l_a);
     e.set_buffer(6, o_out);
     e.set_constant(7, T); e.set_constant(8, kD); e.set_constant(9, TPAD);
+    e.set_constant(10, T);   // destination stride == tokens: not a band
     e.dispatch({kD, (unsigned)H, (unsigned)T}, {kD, 1, 1});
     }
   }
@@ -729,6 +733,7 @@ TEST(sol_attention_mma, a_summary_pass_writes_only_what_it_was_asked_for)
       e.set_constant(6, T); e.set_constant(7, (int)kD);
       e.set_constant(8, N); e.set_constant(9, blk);
       e.set_constant(10, which);
+      e.set_constant(11, T);   // head stride == tokens: not a band
       e.dispatch({kD, (unsigned)H, (unsigned)N}, {kD, 1, 1});
     }
     return st.commit().wait_ok(&err);
@@ -923,6 +928,225 @@ TEST(sol_attention_mma, the_class_reproduces_dense)
     std::printf("[sol-mma] %-3s class tau=1.0  vs dense: rel-L2 %.4f\n",
                 want_nax ? "nax" : "alu", e1);
     EXPECT_TRUE(e1 > 1e-4 && e1 < 0.1);
+  }
+  ::unsetenv("VPIPE_SOL_NO_NAX");
+}
+
+// A RECTANGULAR BAND of a longer sequence.
+//
+// A block-causal layout does not have one attention -- it has one
+// dispatch per segment, each a row band of a buffer holding the whole
+// joint sequence, and each rectangular: a target image block attends
+// itself plus everything before it, so qL < kL. Sol's method does not
+// care (the routing scores query-block centroids against key-block
+// centroids, and neither has to be the same sequence); what cared was
+// the plumbing. Three kernels reused the token count as a head stride,
+// and the local band assumed a query's row index equalled a key's.
+//
+// TWO CLAIMS, and the first is the one that catches a stride:
+//
+//  * the band read IN PLACE out of the long buffers must equal the same
+//    rows COPIED OUT and attended contiguously -- bit for bit, because
+//    it is the same arithmetic reached by different strides; and
+//  * at tau = -inf it must reproduce dense attention over that
+//    rectangle, which is what says the rectangle itself is right and
+//    not merely self-consistent.
+TEST(sol_attention_mma, rectangular_band_matches_contiguous_and_dense)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 4, T = 2048, BLK = 64;
+  // A band that is rectangular AND offset: queries are the last 1024
+  // rows, keys are everything up to and including them, which is the
+  // shape a target image block has in a joint sequence.
+  int qL = 1024, kL = 1536, off = 512;
+  if (const char* e = std::getenv("VPIPE_SOL_QL")) { qL = std::atoi(e); }
+  if (const char* e = std::getenv("VPIPE_SOL_KL")) { kL = std::atoi(e); }
+  if (const char* e = std::getenv("VPIPE_SOL_OFF")) { off = std::atoi(e); }
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 8, 0.35f, 0xb0dd1e55u);
+
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool want_nax = arm == 1;
+    if (want_nax && !mc->supports_matrix_cores()) { break; }
+    if (!want_nax) { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+    else           { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+    Rig r;
+    if (!r.load(mc, H, T, BLK, want_nax)) { continue; }
+    ASSERT_TRUE(r.alloc());
+    r.q = up_(mc, q, r.bf16); r.k = up_(mc, k, r.bf16);
+    r.v = up_(mc, v, r.bf16);
+    if (r.q.empty()) { return; }
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, r.bf16, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { return; }
+
+    sol::Config cfg;
+    cfg.enabled = true;
+    cfg.tau = -1.0e30f;      // every block exact: the answer is dense
+    cfg.local_radius = 1;
+    cfg.key_block = BLK;
+
+    // ARM 1: in place, out of the full-length buffers.
+    SharedBuffer out_band = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!out_band.empty());
+    MetalSolAttention::Band band{qL, kL, T, T, off, off};
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, r.q, r.k, r.v, out_band, H, H, band, kD,
+                                r.scale, cfg, &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+
+    // ARM 2: the same rows, copied out and attended contiguously. The
+    // band's q_off stays `off` -- it is the query's SEQUENCE position,
+    // which the local band is measured against, and copying the rows
+    // does not move them in the sequence.
+    std::vector<float> qc((std::size_t)H * qL * kD);
+    std::vector<float> kc((std::size_t)H * kL * kD);
+    std::vector<float> vc((std::size_t)H * kL * kD);
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < qL; ++t) {
+        std::memcpy(&qc[((std::size_t)h * qL + t) * kD],
+                    &q[((std::size_t)h * T + off + t) * kD],
+                    (std::size_t)kD * sizeof(float));
+      }
+      for (int t = 0; t < kL; ++t) {
+        std::memcpy(&kc[((std::size_t)h * kL + t) * kD],
+                    &k[((std::size_t)h * T + t) * kD],
+                    (std::size_t)kD * sizeof(float));
+        std::memcpy(&vc[((std::size_t)h * kL + t) * kD],
+                    &v[((std::size_t)h * T + t) * kD],
+                    (std::size_t)kD * sizeof(float));
+      }
+    }
+    SharedBuffer qcb = up_(mc, qc, r.bf16);
+    SharedBuffer kcb = up_(mc, kc, r.bf16);
+    SharedBuffer vcb = up_(mc, vc, r.bf16);
+    SharedBuffer out_c =
+        mc->make_shared_buffer((std::size_t)H * qL * kD * 2);
+    ASSERT_TRUE(!qcb.empty() && !kcb.empty() && !vcb.empty() &&
+                !out_c.empty());
+    // Same SEQUENCE position, row 0 of its own buffer: the pair the
+    // band form exists to tell apart.
+    MetalSolAttention::Band tight{qL, kL, qL, kL, off, 0};
+    {
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        ASSERT_TRUE(sol->encode(e, qcb, kcb, vcb, out_c, H, H, tight, kD,
+                                r.scale, cfg, &err));
+      }
+      ASSERT_TRUE(st.commit().wait_ok(&err));
+    }
+
+    // Compare the band's rows against the contiguous answer. Read by
+    // SIZE rather than through the rig, whose reader assumes the full
+    // sequence -- the contiguous arm's buffer is shorter than that.
+    auto read_n = [&](const SharedBuffer& buf, std::size_t n) {
+      std::vector<float> o(n);
+      if (!r.bf16) {
+        const auto* p2 = static_cast<const _Float16*>(buf.contents());
+        for (std::size_t i = 0; i < n; ++i) { o[i] = (float)p2[i]; }
+        return o;
+      }
+      const auto* p2 = static_cast<const std::uint16_t*>(buf.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t u = (std::uint32_t)p2[i] << 16;
+        std::memcpy(&o[i], &u, 4);
+      }
+      return o;
+    };
+    const std::vector<float> a = read_n(out_band, (std::size_t)H * T * kD);
+    const std::vector<float> b = read_n(out_c, (std::size_t)H * qL * kD);
+    ASSERT_TRUE(a.size() == (std::size_t)H * T * kD);
+    ASSERT_TRUE(b.size() == (std::size_t)H * qL * kD);
+    std::size_t differ = 0;
+    double num = 0.0, den = 0.0;
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < qL; ++t) {
+        for (int d = 0; d < kD; ++d) {
+          const float x = a[((std::size_t)h * T + off + t) * kD + d];
+          const float y = b[((std::size_t)h * qL + t) * kD + d];
+          if (x != y) { ++differ; }
+          num += (double)(x - y) * (x - y);
+          den += (double)y * y;
+        }
+      }
+    }
+    // Only on a failure, and it is worth the lines: the first version
+    // of this plumbing was wrong for exactly the first `off` rows, and
+    // "which rows" is what said so.
+    if (differ > 0) {
+      int h0 = -1, t0 = -1, d0 = -1, tmin = 1 << 30, tmax = -1;
+      std::vector<int> per_head(H, 0);
+      for (int h = 0; h < H; ++h) {
+        for (int t = 0; t < qL; ++t) {
+          bool row_bad = false;
+          for (int d = 0; d < kD; ++d) {
+            if (a[((std::size_t)h * T + off + t) * kD + d] !=
+                b[((std::size_t)h * qL + t) * kD + d]) {
+              row_bad = true;
+              if (h0 < 0) { h0 = h; t0 = t; d0 = d; }
+            }
+          }
+          if (row_bad) {
+            ++per_head[h];
+            tmin = std::min(tmin, t); tmax = std::max(tmax, t);
+          }
+        }
+      }
+      std::printf("[sol-mma] first diff h=%d t=%d d=%d; bad rows t in "
+                  "[%d, %d]; per head:", h0, t0, d0, tmin, tmax);
+      for (int h = 0; h < H; ++h) { std::printf(" %d", per_head[h]); }
+      std::printf(" (of %d)\n", qL);
+    }
+    std::printf("[sol-mma] %-3s band vs contiguous: %zu of %zu words "
+                "differ\n", want_nax ? "nax" : "alu", differ,
+                (std::size_t)H * qL * kD);
+    EXPECT_TRUE(differ == 0);
+    (void)num; (void)den;
+
+    // AND THE RECTANGLE IS RIGHT, not just self-consistent: at
+    // tau = -inf every key block is exact, so this is dense attention
+    // over [off, off+qL) x [0, kL).
+    std::vector<float> want((std::size_t)H * qL * kD, 0.0f);
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < qL; ++t) {
+        const float* qr = &q[((std::size_t)h * T + off + t) * kD];
+        std::vector<float> lse((std::size_t)kL);
+        float m = -INFINITY;
+        for (int j = 0; j < kL; ++j) {
+          const float* kr = &k[((std::size_t)h * T + j) * kD];
+          float dot = 0.0f;
+          for (int d = 0; d < kD; ++d) { dot += qr[d] * kr[d]; }
+          lse[(std::size_t)j] = dot * r.scale;
+          m = std::max(m, lse[(std::size_t)j]);
+        }
+        float den2 = 0.0f;
+        for (int j = 0; j < kL; ++j) {
+          lse[(std::size_t)j] = std::exp(lse[(std::size_t)j] - m);
+          den2 += lse[(std::size_t)j];
+        }
+        float* o = &want[((std::size_t)h * qL + t) * kD];
+        for (int j = 0; j < kL; ++j) {
+          const float w = lse[(std::size_t)j] / den2;
+          if (w == 0.0f) { continue; }
+          const float* vr = &v[((std::size_t)h * T + j) * kD];
+          for (int d = 0; d < kD; ++d) { o[d] += w * vr[d]; }
+        }
+      }
+    }
+    const double rel = rel_(b, want);
+    std::printf("[sol-mma] %-3s rectangle tau=-inf vs CPU dense: rel-L2 "
+                "%.3e\n", want_nax ? "nax" : "alu", rel);
+    EXPECT_TRUE(rel < 5e-3);
   }
   ::unsetenv("VPIPE_SOL_NO_NAX");
 }

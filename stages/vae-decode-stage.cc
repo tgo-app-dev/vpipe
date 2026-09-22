@@ -111,7 +111,9 @@ const ConfigKey kAttrs[] = {
           "model-select source, or set this key directly, so the DiT "
           "stages keep pointing at the model",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,qwen-image-edit,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
+                      "qwen-image-edit,qwen-image-21,"
+                      ""
        "mage-flow,"
        "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
@@ -248,6 +250,13 @@ vae_family_(const std::string& vae_dir)
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
         if (cls == "MageVAE") { return "mage"; }
+        // Qwen-Image-2.1's VAE. The SAME family string on purpose: it is
+        // the same implementation, generalized -- five levels instead of
+        // four, z 64, RGBA, and an asymmetric decoder, all of which come
+        // from config.json rather than from the class name. Named here
+        // anyway rather than left to the "krea2" fall-through below,
+        // which would also catch a VAE nobody has read yet.
+        if (cls == "AutoencoderKLQwenImage21") { return "krea2"; }
         // The VIDEO VAE. Same tensor names as the Qwen-Image one
         // (it IS the general form of it), so the class name is the
         // only thing that tells them apart -- and getting it wrong
@@ -983,25 +992,12 @@ VaeDecodeStage::ensure_loaded_()
     if (in) {
       FlexData fd = FlexData::from_json(in);
       if (fd.is_object()) {
-        auto obj = fd.as_object();
-        if (obj.contains("z_dim")) {
-          cfg.z_dim = (int)obj.at("z_dim").as_int(cfg.z_dim);
-        }
-        if (obj.contains("base_dim")) {
-          cfg.base_dim = (int)obj.at("base_dim").as_int(cfg.base_dim);
-        }
-        if (obj.contains("num_res_blocks")) {
-          cfg.num_res_blocks =
-              (int)obj.at("num_res_blocks").as_int(cfg.num_res_blocks);
-        }
-        if (obj.contains("latents_mean")) {
-          FlexData lm = obj.at("latents_mean");
-          for (auto v : lm.as_real_span()) { cfg.latents_mean.push_back((float)v); }
-        }
-        if (obj.contains("latents_std")) {
-          FlexData ls = obj.at("latents_std");
-          for (auto v : ls.as_real_span()) { cfg.latents_std.push_back((float)v); }
-        }
+        // One reader for both VAE stages. It also picks up the keys
+        // AutoencoderKLQwenImage21 needs -- dim_mult (whose LENGTH is
+        // the level count), decoder_base_dim, is_residual and the
+        // in/out channel counts -- which a per-stage copy of the
+        // four-key version would have been missing on one side.
+        genai::MetalKrea2Vae::config_from_json(fd, &cfg);
       }
     }
   }
@@ -1982,9 +1978,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   const int Cz = (int)tbp->shape[0];
   const int h8 = (int)tbp->shape[1];
   const int w8 = (int)tbp->shape[2];
+  // Pixels per latent cell. 8 for every checkpoint this path served
+  // until Qwen-Image-2.1, whose five levels make it 16 -- so it is asked
+  // rather than assumed. The name h8/w8 is kept because it is what the
+  // rest of this function and the model's own API still call them.
+  const int px = _vae->config().spatial_factor();
   session()->log_debug(fmt(
       "VaeDecodeStage('{}'): beat received, latent [{}, {}, {}] -> image "
-      "[{}, {}]", this->id(), Cz, h8, w8, h8 * 8, w8 * 8));
+      "[{}, {}]", this->id(), Cz, h8, w8, h8 * px, w8 * px));
   if (Cz != _vae->config().z_dim || h8 <= 0 || w8 <= 0) {
     session()->warn(fmt(
         "VaeDecodeStage('{}'): latent [{}, {}, {}] does not match z_dim {}; "
@@ -2005,7 +2006,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // config geometry to declare from -- and Qwen-Image-Edit has no
     // free_*_dit_for_decode_ at all, so nothing upstream states it
     // either. Same estimator the plan used, at the real pixel size.
-  publish_image_arena_(w8 * 8, h8 * 8);
+  publish_image_arena_(w8 * px, h8 * px);
   metal_compute::SharedBuffer zw = _vae->unwhiten(z, h8, w8);
   if (zw.empty()) {
     session()->warn(fmt(
@@ -2016,7 +2017,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   metal_compute::SharedBuffer rgb;
   {
     PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae, kPerfLlmVaeBegin,
-                       (std::uint64_t)(h8 * 8) * (w8 * 8));
+                       (std::uint64_t)(h8 * px) * (w8 * px));
     rgb = _vae->decode(zw, h8, w8, &derr);
   }
   if (rgb.empty()) {
@@ -2027,7 +2028,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   }
 
   // f16 [3,H,W] in [-1,1] -> planar U8 RGB (x+1)/2*255, rounded + clamped.
-  const int H = h8 * 8, W = w8 * 8;
+  const int H = h8 * px, W = w8 * px;
+  // An RGBA VAE (Qwen-Image-2.1) decodes FOUR channels and this beat
+  // carries three. Dropping alpha is a real loss on a model whose
+  // headline feature is transparency, so it is SAID rather than done
+  // quietly -- the plumbing for a 4-channel image beat is its own
+  // change, and until it lands a graph should know what it is getting.
+  if (_vae->config().out_channels > 3) {
+    session()->warn(fmt(
+        "VaeDecodeStage('{}'): this VAE decodes {} channels and the image "
+        "beat carries 3; the alpha channel is being dropped",
+        this->id(), _vae->config().out_channels));
+  }
   const std::size_t n = (std::size_t)3 * H * W;
   auto out = std::make_unique<TensorBeatPayload>();
   out->dtype = TensorBeat::DType::U8;

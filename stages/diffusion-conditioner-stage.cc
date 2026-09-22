@@ -4,6 +4,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "generative-models/qwen-image/qwen-image21-layout.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -62,7 +63,7 @@ const ConfigKey kAttrs[] = {
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,flux2,qwen-image,qwen-image-edit,"
+   .suggest_db_type = "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
        "mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
@@ -402,6 +403,21 @@ constexpr const char* kBooguTi2i =
     "original input where appropriate.<|im_end|>\n<|im_start|>user\n";
 constexpr const char* kBooguSuffix = "<|im_end|>\n";
 
+// ---- Qwen-Image-2.1 ----------------------------------------------------
+//
+// ONE system prompt for both tasks -- unlike every other family here,
+// where the t2i and edit prompts differ. It is also unlike anything else
+// in this tree, so it is spelled out rather than adapted: "Describe the
+// image by detailing..." (Krea-2, Mage-Flow, Qwen-Image-2512) and
+// "Describe the key features of the input image" (Qwen-Image-Edit,
+// Boogu) are BOTH wrong here, and a wrong system prompt loads, runs and
+// conditions the DiT on the wrong thing.
+//
+// It also keeps the trailing generation prompt (`<|im_start|>assistant`),
+// which Boogu drops, and DROPS the leading system turn from the hidden
+// states, which Boogu keeps. Neither is guessable from the other.
+
+
 // ---- multi-reference helpers -------------------------------------------
 // One vision block per reference, with the family's own label convention:
 // Qwen-Image-Edit says "Picture N: ", Mage-Flow "Image N: ", Boogu uses bare
@@ -647,6 +663,18 @@ genai::MetalQwenModel::Config encoder_config_boogu_(const std::string& enc_dir)
   }
   return c;
 }
+// Qwen-Image-2.1's text encoder is the SAME Qwen3-VL 8B Boogu-Image
+// drives, under the same `model.language_model.` / `model.visual.`
+// wrapper -- 36 layers, hidden 4096, 32q/8kv, head_dim 128, ffn 12288,
+// rope theta 5e6, untied. So this is Boogu's reader pointed at
+// text_encoder/ rather than mllm/; sized from the file either way, so
+// one path serves whatever size Qwen publishes next.
+genai::MetalQwenModel::Config
+encoder_config_qwen_image21_(const std::string& enc_dir)
+{
+  return encoder_config_boogu_(enc_dir);
+}
+
 genai::MetalQwenModel::Config encoder_config_qie_()
 {
   genai::MetalQwenModel::Config c;
@@ -674,6 +702,12 @@ std::string family_(const std::string& transformer_dir)
         const std::string cls(obj.at("_class_name").as_string(""));
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
+        // Qwen-Image-2.1 -- a different network from the two above, and
+        // a different conditioning recipe. Named explicitly for the same
+        // reason Mage-Flow is: it rides the SAME Qwen3-VL the other
+        // families use, so an unrecognized repo would load and silently
+        // condition it with somebody else's system prompt.
+        if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21"; }
         // Mage-Flow (microsoft/Mage-Flow*). Named EXPLICITLY, never left to
         // the "krea2" default: its text encoder is the same Qwen3-VL 4B krea2
         // drives, so an unrecognized repo would LOAD and silently produce
@@ -1005,6 +1039,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       _family == "flux2" ? encoder_config_flux2_(_enc_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
       : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
+      : _family == "qwen-image-21" ? encoder_config_qwen_image21_(_enc_dir)
       : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
   _enc_hidden = ecfg.hidden;
@@ -1105,15 +1140,46 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     }
     return true;
   }
-  const std::string emb_name =
-      (_family == "flux2" || _family == "qwen-image-edit")
-          ? "model.embed_tokens.weight"
-      : (_family == "boogu-image")
-          ? "model.language_model.embed_tokens.weight"
-          : "language_model.embed_tokens.weight";
-  _embed = _enc_ws->tensor(emb_name, mc,
-                           genai::WeightSet::Residency::Copied);
-  return !_embed.empty();
+  // The embedding table's name follows the checkpoint's WRAPPER, and
+  // the wrappers in this tree are three: a bare `language_model.`
+  // (Krea-2), a bare `model.` (FLUX.2, Qwen-Image-Edit), and both at
+  // once (Boogu-Image and Qwen-Image-2.1, whose Qwen3-VL is wrapped
+  // twice).
+  //
+  // PROBED IN ORDER rather than selected by family, because the
+  // selection used to be a ternary whose fall-through was
+  // `language_model.` -- so a family added without a row of its own got
+  // a name that is simply absent from its checkpoint, and the stage
+  // reported "encoder/embeds load failed; inert" on every run.
+  // QWEN-IMAGE-2.1 SHIPPED WITH EXACTLY THAT GAP: its encoder is
+  // wrapped `model.language_model.` and it had no row, so its
+  // conditioner never loaded and the family could not generate at all.
+  // That is loud, but it is loud at RUN time and says nothing about
+  // which name was wanted -- and no test caught it, because the
+  // family's tests exercise `encode_` rather than `load_encoder_`.
+  //
+  // A checkpoint carries one of these and never two, so the order is
+  // tidiness rather than precedence.
+  static const char* const kEmbedNames[] = {
+      "model.language_model.embed_tokens.weight",
+      "model.embed_tokens.weight",
+      "language_model.embed_tokens.weight",
+  };
+  for (const char* nm : kEmbedNames) {
+    if (_enc_ws->src().info(nm) == nullptr) { continue; }
+    _embed = _enc_ws->tensor(nm, mc, genai::WeightSet::Residency::Copied);
+    if (!_embed.empty()) {
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): token embeddings from '{}'",
+          this->id(), nm));
+      return true;
+    }
+  }
+  session()->error(fmt(
+      "DiffusionConditionerStage('{}'): no token-embedding table in '{}' "
+      "under any known wrapper (tried model.language_model., model., "
+      "language_model.)", this->id(), _enc_dir));
+  return false;
 }
 
 void
@@ -1875,7 +1941,7 @@ single_tap_(const std::string& family)
 {
   return family == "qwen-image-edit" || family == "mage-flow" ||
          family == "boogu-image" || family == "wan" ||
-         family == "minimax-h3";
+         family == "minimax-h3" || family == "qwen-image-21";
 }
 
 SharedBuffer
@@ -1952,7 +2018,7 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   // the checkpoint prefix ("model.visual." vs "visual."), the conditioning
   // long-edge cap (384 vs 768) and the processor's min_pixels differ.
   if (_family == "krea2" || _family == "boogu-image" ||
-      _profile != nullptr) {
+      _family == "qwen-image-21" || _profile != nullptr) {
     // Boogu's mllm shares Mage-Flow's checkpoint wrapper ("model.visual."),
     // its bf16 pipeline dtype and its preprocessor bounds (shortest_edge
     // 65536), and its pipeline caps the VLM conditioning image at 384x384
@@ -1962,7 +2028,7 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
     // bare ("visual."). Boogu's mllm is wrapped; a registered family
     // says so in its profile.
     const bool mage =
-        _family == "boogu-image" ||
+        _family == "boogu-image" || _family == "qwen-image-21" ||
         (_profile != nullptr &&
          genai::cond::text(_profile, genai::cond::kVisionPrefix,
                            "visual.") == "model.visual.");
@@ -2040,6 +2106,15 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
                         _ground.long_edge, capped, &rh, &rw,
                         _ground.pixel_budget, 16, /*lanczos=*/true);
+    } else if (_family == "qwen-image-21") {
+      // LANCZOS (diffusers' VaeImageProcessor.resize defaults to it) and
+      // aligned to 32, which is what calculate_dimensions rounds to.
+      // The alignment is load-bearing rather than tidy: the same pixels
+      // go to the VAE, and the DiT requires the tower's merged grid to
+      // be exactly half the VAE's latent grid.
+      cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
+                        _ground.long_edge, capped, &rh, &rw,
+                        _ground.pixel_budget, 32, /*lanczos=*/true);
     } else {
       cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
                         _ground.long_edge, capped, &rh, &rw,
@@ -2545,6 +2620,160 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                              "-> [{}, {}] bf16{}", this->id(), which, n, EH,
                              grounded ? ", image-grounded (edit)" : ""));
     return txt;
+  }
+
+  if (_family == "qwen-image-21") {
+    // Qwen-Image-2.1: the text encoder's LAST DECODER LAYER, taken
+    // BEFORE its final RMSNorm.
+    //
+    // That is the whole reason this branch does not simply borrow
+    // Boogu's. The tap `forward_embeddings_taps` returns is already the
+    // un-normed residual, and every other family here then applies the
+    // final norm on the host to reach HF's `last_hidden_state`. This one
+    // must NOT: diffusers hangs a forward hook on the encoder's norm to
+    // return its own input, and says in as many words that the normed
+    // value is a third of the signal the transformer reads, showing up
+    // first in rendered text. So the step to get right is the one that
+    // is missing below, not one that is present.
+    const int NL = _encoder->config().n_layers;
+    const bool img_aware = (n_img > 0) && !vtok.empty();
+    const std::int32_t pad_id =
+        img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
+    const bool grounded = img_aware && pad_id >= 0;
+    const int nref = grounded ? _img_n : 0;
+    // ONE system prompt for both tasks; only the vision blocks differ.
+    // Rendered by the layout module, which is where this model's
+    // checkpoint-free facts live and where it is tested against the
+    // reference's own rendered string.
+    const std::string tmpl = genai::qi21::prompt_template(nref, text);
+    std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
+    if (ids.empty()) { return {}; }
+    // How many leading tokens the reference drops. It derives the count
+    // by tokenizing the SYSTEM TURN ALONE rather than hardcoding it, so
+    // that it tracks the template; this does the same, against the same
+    // prefix string, rather than assuming a number.
+    const std::vector<std::int32_t> sys_ids =
+        encode_with_specials_(*_tokenizer, genai::qi21::system_prefix());
+    const int drop = (int)sys_ids.size();
+    if (drop <= 0 || drop >= (int)ids.size()) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): the system prefix tokenized to "
+          "{} of {} tokens, which cannot be right; dropping beat",
+          this->id(), drop, (int)ids.size()));
+      return {};
+    }
+    std::vector<std::pair<int, int>> runs;
+    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok, nref); }
+    const int n = (int)ids.size();
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (x.empty()) { return {}; }
+    {
+      const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
+      auto* xb = static_cast<std::uint8_t*>(x.contents());
+      const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
+      for (int i = 0; i < n; ++i) {
+        const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
+        if (id >= vocab) { return {}; }
+        std::memcpy(xb + (std::size_t)i * EH * 2,
+                    tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
+      }
+    }
+    // Splice the tower rows over the image_pad embeddings.
+    int first_pad = -1;
+    if (grounded) {
+      const bool vt_bf16 = _vision3 && _vision3->is_bf16();
+      const auto* vt = static_cast<const std::uint16_t*>(vtok.contents());
+      auto* xh = static_cast<std::uint16_t*>(x.contents());
+      int j = 0;
+      for (int i = 0; i < n && j < n_img; ++i) {
+        if (ids[(std::size_t)i] == pad_id) {
+          if (first_pad < 0) { first_pad = i; }
+          const std::uint16_t* src = vt + (std::size_t)j * EH;
+          if (vt_bf16) {
+            std::memcpy(xh + (std::size_t)i * EH, src, (std::size_t)EH * 2);
+          } else {
+            for (int h = 0; h < EH; ++h) {
+              _Float16 hf; std::memcpy(&hf, &src[h], 2);
+              xh[(std::size_t)i * EH + h] = f32_to_bf16_((float)hf);
+            }
+          }
+          ++j;
+        }
+      }
+    }
+    genai::MetalQwenModel::DeepstackInject ds;
+    const bool use_ds = grounded && first_pad >= 0 && !_ds_feats.empty();
+    if (use_ds) {
+      for (int i = 0; i < (int)_ds_feats.size(); ++i) {
+        ds.feats.push_back(&_ds_feats[(std::size_t)i]);
+        ds.layers.push_back(i);
+      }
+      ds.row0 = first_pad;
+      ds.rows = n_img;
+      if (runs.size() > 1) {
+        int feat = 0;
+        for (const auto& rn : runs) {
+          ds.segs.push_back({rn.first, rn.second, feat});
+          feat += rn.second;
+        }
+      }
+    }
+    const bool use_mrope = grounded && !runs.empty() && _img_mw[0] > 0;
+    std::vector<std::int32_t> pos;
+    if (use_mrope) { pos = mrope_positions_(n, runs, _img_mh, _img_mw); }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = use_mrope
+                 ? _encoder->forward_embeddings_taps_mrope(
+                       cid, x, n, pos, std::vector<int>{NL - 1},
+                       /*key_valid_len=*/0, use_ds ? &ds : nullptr)
+                 : _encoder->forward_embeddings_taps(
+                       cid, x, n, std::vector<int>{NL - 1},
+                       /*key_valid_len=*/0, use_ds ? &ds : nullptr);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    // NO FINAL NORM. See the top of this branch.
+    const int keep = n - drop;
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)keep * EH * 2);
+    if (out.empty()) { return {}; }
+    std::memcpy(out.contents(),
+                static_cast<const std::uint8_t*>(taps.contents()) +
+                    (std::size_t)drop * EH * 2,
+                (std::size_t)keep * EH * 2);
+    // The SLOT MASK, over the rows that survive the drop: 1 where the
+    // encoder reserved an image slot. The DiT expands each into four
+    // latent rows, and the consumer appends the target's own slots --
+    // it knows that geometry and this stage does not. Published because
+    // nothing downstream can recover it: an image row's embedding is a
+    // tower output, not a token id.
+    _qi21_slots.assign((std::size_t)keep, 0);
+    if (grounded) {
+      for (int i = drop; i < n; ++i) {
+        if (ids[(std::size_t)i] == pad_id) {
+          _qi21_slots[(std::size_t)(i - drop)] = 1;
+        }
+      }
+    }
+    // Each slot is a 2x2 group of latent tokens, so a reference's DiT
+    // grid is exactly TWICE the tower's merged grid -- which holds only
+    // because one resize feeds both the tower and the VAE. See
+    // GroundedEncodeParams::for_family.
+    _qi21_nref = nref;
+    for (int i = 0; i < nref && i < kMaxRefs; ++i) {
+      _qi21_grid_h[i] = _img_mh[i] * 2;
+      _qi21_grid_w[i] = _img_mw[i] * 2;
+    }
+    n_real_out = keep;
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): [{}] qwen-image-2.1 -> [{}, {}] "
+        "bf16 (dropped {} system tokens, {} reference(s), pre-final-norm "
+        "tap)", this->id(), which, keep, EH, drop, nref));
+    return out;
   }
 
   // ---- a REGISTERED family, driven by its conditioning profile ------
@@ -3210,6 +3439,41 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   release_encoder_when_idle_();
   {
     auto beat = to_beat_(cond, shape_for(n_real), cdt);
+    // Qwen-Image-2.1's joint-sequence bookkeeping. This is the ONLY
+    // sideband the normal conditioning path carries, and it is here
+    // because the DiT cannot reconstruct it: which emitted rows are
+    // image slots depends on where the tower's rows were spliced in,
+    // and an image row's embedding carries no token id to recover.
+    //
+    // The TARGET image's slots are not included -- the consumer knows
+    // that geometry and this stage does not.
+    if (_family == "qwen-image-21" &&
+        (int)_qi21_slots.size() == n_real) {
+      FlexData sb = FlexData::make_object();
+      auto o = sb.as_object();
+      FlexData slots = FlexData::make_array();
+      {
+        auto a = slots.as_array();
+        for (std::uint8_t v : _qi21_slots) {
+          a.push_back(FlexData::make_int(v != 0 ? 1 : 0));
+        }
+      }
+      o.insert_or_assign("img_slots", std::move(slots));
+      // Per reference, the DiT's LATENT grid -- twice the tower's
+      // merged grid, because one slot is a 2x2 group of latent tokens.
+      FlexData gh = FlexData::make_array(), gw = FlexData::make_array();
+      {
+        auto ah = gh.as_array();
+        auto aw = gw.as_array();
+        for (int i = 0; i < _qi21_nref && i < kMaxRefs; ++i) {
+          ah.push_back(FlexData::make_int(_qi21_grid_h[i]));
+          aw.push_back(FlexData::make_int(_qi21_grid_w[i]));
+        }
+      }
+      o.insert_or_assign("ref_grid_h", std::move(gh));
+      o.insert_or_assign("ref_grid_w", std::move(gw));
+      beat->sideband = std::move(sb);
+    }
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce
     // the same downstream generation are ambiguous between "the encoder
     // emitted near-identical embeddings" and "the DiT ignored different

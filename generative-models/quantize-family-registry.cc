@@ -29,7 +29,7 @@ QuantizeFamilyRegistry::add(std::unique_ptr<QuantizableFamily> f)
   // registry is consulted FIRST, so a collision would read as a built-in
   // while running the plugin's component list.
   for (const char* built_in : {"krea2", "flux2", "mage", "wan", "boogu",
-                               "qwen-image", "minimax-h3"}) {
+                               "qwen-image", "qwen-image-21", "minimax-h3"}) {
     if (tag == built_in) { return false; }
   }
   std::lock_guard<std::mutex> lk(_mu);

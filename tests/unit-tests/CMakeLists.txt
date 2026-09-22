@@ -218,6 +218,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         krea2-sampler.cc
         qwen-image-edit-sched.cc
         qwen-image-edit-vae.cc
+        qwen-image-21-vae.cc
+        qwen-image-21-layout.cc
+        qwen-image-21-cond.cc
+        qwen-image-21-dit.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
         qwen-image-edit-vision.cc
