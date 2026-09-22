@@ -742,12 +742,14 @@ ctx->register_image_family(std::make_unique<AcmeImage>());
 ```
 
 The seam is the **generation**, not the step, for the reason the video
-one gives: `generate-image` holds five built-in denoisers side by side
+one gives: `generate-image` holds seven built-in denoisers side by side
 because their per-step forwards do not agree — Krea-2 takes a packed
 `[img_seq, z*4]` latent with one timestep, Qwen-Image-Edit runs a dual
 stream, FLUX.2 appends multi-reference tokens with their own RoPE band,
-Boogu is a NextDiT. An interface wide enough for all five describes none
-of them. One level up they all answer the same question: given
+Qwen-Image-2.1 is block-causal over one joint sequence with a cross-step
+KV cache, and Boogu and Z-Image are NextDiTs whose timestep conventions
+run in opposite directions. An interface wide enough for all seven
+describes none of them. One level up they all answer the same question: given
 conditioning, geometry, a step count and a seed, produce a latent.
 
 **It returns a latent, not pixels**, and that is what makes an image
@@ -772,7 +774,8 @@ downstream preview; a family that cannot produce an intermediate simply
 never calls it.
 
 The registry is consulted **before** the built-in `flux2` / `krea2` /
-`qwen-image-edit` / `boogu-image` / `mage-flow` dispatch. The built-ins
+`qwen-image-edit` / `qwen-image-21` / `boogu-image` / `z-image` /
+`mage-flow` dispatch. The built-ins
 are unchanged and unregistered: this adds a path, it does not reroute the
 existing ones.
 

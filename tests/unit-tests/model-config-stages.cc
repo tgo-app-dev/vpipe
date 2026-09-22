@@ -18,6 +18,7 @@
 #include "pipeline/stage-spec.h"
 #include "stages/boogu-image-model-config-stage.h"
 #include "stages/qwen-image-21-model-config-stage.h"
+#include "stages/z-image-model-config-stage.h"
 #include "stages/flux2-model-config-stage.h"
 #include "stages/krea2-model-config-stage.h"
 #include "stages/minimax-h3-model-config-stage.h"
@@ -51,6 +52,7 @@ const char* const kSources[] = {
   "wan2-model-config", "minimax-h3-model-config", "flux2-model-config",
   "krea2-model-config", "boogu-image-model-config",
   "qwen-image-edit-model-config", "qwen-image-21-model-config",
+  "z-image-model-config",
 };
 
 }  // namespace

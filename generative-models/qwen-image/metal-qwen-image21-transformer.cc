@@ -1754,6 +1754,25 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       if (!enc.valid()) {
         return fail("qwen-image-2.1 forward: no compute encoder");
       }
+    } else if (_stream_stop && kStopDrainBlocks > 0 &&
+               ((L + 1) % kStopDrainBlocks) == 0 && L + 1 < _cfg.n_layers) {
+      // A HELD BLOCK COMMITS NOTHING, so without this the stop check
+      // at the top of the loop can only ever see a request that was
+      // ALREADY set -- the loop encodes the whole stack in
+      // microseconds and then waits out the entire forward inside one
+      // commit. Draining on a cadence is what lets a request arriving
+      // mid-forward be seen at all.
+      enc.end();
+      std::string ge;
+      if (!stream.commit().wait_ok(&ge)) {
+        if (kv_fill && req.kv != nullptr) { req.kv->clear(); }
+        return fail("qwen-image-2.1 forward: " + ge);
+      }
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+      if (!enc.valid()) {
+        return fail("qwen-image-2.1 forward: no compute encoder");
+      }
     }
     trace(("blk" + std::to_string(L)).c_str(), jh, (std::size_t)ROWS * H);
   }

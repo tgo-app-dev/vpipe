@@ -300,6 +300,7 @@ sweep_table_(size_t* n)
     {"krea2-model-config", "{}", false, nullptr},
     {"boogu-image-model-config", "{}", false, nullptr},
       {"qwen-image-21-model-config", "{}", false, nullptr},
+    {"z-image-model-config", "{}", false, nullptr},
     {"qwen-image-edit-model-config", "{}", false, nullptr},
 
     // Decisions on record rather than silent gaps. Every one of these

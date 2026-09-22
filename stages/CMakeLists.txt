@@ -29,6 +29,7 @@ set(LOCAL_SOURCES
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
   qwen-image-21-model-config-stage.cc
+  z-image-model-config-stage.cc
   qwen-image-edit-model-config-stage.cc
   vosr-model-config-stage.cc
   flashvsr-model-config-stage.cc

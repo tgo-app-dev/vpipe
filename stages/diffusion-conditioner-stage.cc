@@ -5,6 +5,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
+#include "generative-models/z-image/z-image-layout.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -675,6 +676,18 @@ encoder_config_qwen_image21_(const std::string& enc_dir)
   return encoder_config_boogu_(enc_dir);
 }
 
+// Z-Image's text encoder is a stock DENSE Qwen3-4B -- `Qwen3Model`, 36
+// layers, hidden 2560, 32 q-heads GQA kv=8, head_dim 128, ffn 9728,
+// rope theta 1e6, TIED embeddings -- under a bare `model.` wrapper and
+// with NO vision tower at all. That is the same reader FLUX.2-klein's
+// encoder needs, pointed at this checkpoint: a flat config.json rather
+// than a nested text_config, and sized from the file either way.
+genai::MetalQwenModel::Config
+encoder_config_z_image_(const std::string& enc_dir)
+{
+  return encoder_config_flux2_(enc_dir);
+}
+
 genai::MetalQwenModel::Config encoder_config_qie_()
 {
   genai::MetalQwenModel::Config c;
@@ -708,6 +721,12 @@ std::string family_(const std::string& transformer_dir)
         // families use, so an unrecognized repo would load and silently
         // condition it with somebody else's system prompt.
         if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21"; }
+        // Z-Image. Named for the same reason the others are: its text
+        // encoder is a stock Qwen3-4B, so an unrecognized repo would
+        // load and silently condition it with Krea-2's 12-tap stack
+        // and system prompt instead of one un-normed tap of a bare
+        // user turn.
+        if (cls == "ZImageTransformer2DModel") { return "z-image"; }
         // Mage-Flow (microsoft/Mage-Flow*). Named EXPLICITLY, never left to
         // the "krea2" default: its text encoder is the same Qwen3-VL 4B krea2
         // drives, so an unrecognized repo would LOAD and silently produce
@@ -1040,6 +1059,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
       : _family == "boogu-image" ? encoder_config_boogu_(_enc_dir)
       : _family == "qwen-image-21" ? encoder_config_qwen_image21_(_enc_dir)
+      : _family == "z-image" ? encoder_config_z_image_(_enc_dir)
       : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
   _enc_hidden = ecfg.hidden;
@@ -1142,23 +1162,18 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   }
   // The embedding table's name follows the checkpoint's WRAPPER, and
   // the wrappers in this tree are three: a bare `language_model.`
-  // (Krea-2), a bare `model.` (FLUX.2, Qwen-Image-Edit), and both at
-  // once (Boogu-Image and Qwen-Image-2.1, whose Qwen3-VL is wrapped
-  // twice).
+  // (Krea-2), a bare `model.` (FLUX.2, Qwen-Image-Edit, Z-Image), and
+  // both at once (Boogu-Image and Qwen-Image-2.1, whose Qwen3-VL is
+  // wrapped twice).
   //
   // PROBED IN ORDER rather than selected by family, because the
   // selection used to be a ternary whose fall-through was
   // `language_model.` -- so a family added without a row of its own got
   // a name that is simply absent from its checkpoint, and the stage
-  // reported "encoder/embeds load failed; inert" on every run.
-  // QWEN-IMAGE-2.1 SHIPPED WITH EXACTLY THAT GAP: its encoder is
-  // wrapped `model.language_model.` and it had no row, so its
-  // conditioner never loaded and the family could not generate at all.
-  // That is loud, but it is loud at RUN time and says nothing about
-  // which name was wanted -- and no test caught it, because the
-  // family's tests exercise `encode_` rather than `load_encoder_`.
-  //
-  // A checkpoint carries one of these and never two, so the order is
+  // reported "encoder/embeds load failed; inert" on every run. That is
+  // loud, but it is loud at RUN time and says nothing about which name
+  // was wanted; Qwen-Image-2.1 shipped with exactly that gap. A
+  // checkpoint carries one of these and never two, so the order is
   // tidiness rather than precedence.
   static const char* const kEmbedNames[] = {
       "model.language_model.embed_tokens.weight",
@@ -1933,15 +1948,18 @@ DiffusionConditionerStage::reload_encoder_()
   return true;
 }
 
-// True for the families whose conditioning is a SINGLE post-final-norm
-// last-hidden tap [n_real, hidden] (bf16), as opposed to krea2's 12-tap stack
-// or flux2's 3-tap concat.
+// True for the families whose conditioning is a SINGLE tap
+// [n_real, hidden] (bf16), as opposed to krea2's 12-tap stack or flux2's
+// 3-tap concat. WHICH tap is per family and not implied by being here:
+// most take the post-final-norm last hidden, Qwen-Image-2.1 takes the
+// last layer un-normed, and Z-Image takes the SECOND to last.
 static bool
 single_tap_(const std::string& family)
 {
   return family == "qwen-image-edit" || family == "mage-flow" ||
          family == "boogu-image" || family == "wan" ||
-         family == "minimax-h3" || family == "qwen-image-21";
+         family == "minimax-h3" || family == "qwen-image-21" ||
+         family == "z-image";
 }
 
 SharedBuffer
@@ -2620,6 +2638,68 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                              "-> [{}, {}] bf16{}", this->id(), which, n, EH,
                              grounded ? ", image-grounded (edit)" : ""));
     return txt;
+  }
+
+  if (_family == "z-image") {
+    // Z-Image: HF's `hidden_states[-2]` -- the UN-NORMED output of the
+    // second-to-last decoder layer.
+    //
+    // Two off-by-ones live in that one line and both are silent. The
+    // tap the model wants is not the last hidden state, so no final
+    // norm is applied here (and the last layer is never run at all --
+    // the tap machinery stops after the deepest requested layer). And
+    // `forward_embeddings_taps` captures the residual AFTER layer L,
+    // which the reference indexes as hidden_states[L+1] -- so
+    // hidden_states[-2] == hidden_states[NL-1] is layer NL-2, not
+    // NL-1. Either mistake returns a plausible tensor of exactly the
+    // right shape.
+    //
+    // There is no system prompt and nothing is dropped: the whole of
+    // the rendered turn conditions the model. See z-image-layout.h.
+    const int NL = _encoder->config().n_layers;
+    const std::string tmpl = genai::zimage::prompt_template(text);
+    std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
+    if (ids.empty()) { return {}; }
+    if ((int)ids.size() > genai::zimage::kMaxCaptionTokens) {
+      // The reference TRUNCATES here (tokenizer max_length=512), so a
+      // long prompt is shortened rather than refused.
+      ids.resize((std::size_t)genai::zimage::kMaxCaptionTokens);
+      session()->log_normal(fmt(
+          "DiffusionConditionerStage('{}'): prompt truncated to {} tokens, "
+          "which is this model's limit", this->id(),
+          genai::zimage::kMaxCaptionTokens));
+    }
+    const int n = (int)ids.size();
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    if (x.empty()) { return {}; }
+    {
+      const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
+      auto* xb = static_cast<std::uint8_t*>(x.contents());
+      const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
+      for (int i = 0; i < n; ++i) {
+        const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
+        if (id >= vocab) { return {}; }
+        std::memcpy(xb + (std::size_t)i * EH * 2,
+                    tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
+      }
+    }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = _encoder->forward_embeddings_taps(
+          cid, x, n, std::vector<int>{NL - 2}, /*key_valid_len=*/0, nullptr);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    n_real_out = n;
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): [{}] z-image -> [{}, {}] bf16 "
+        "(tap layer {} of {}, un-normed)", this->id(), which, n, EH,
+        NL - 2, NL));
+    return taps;
   }
 
   if (_family == "qwen-image-21") {

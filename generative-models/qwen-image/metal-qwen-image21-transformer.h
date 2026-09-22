@@ -343,6 +343,14 @@ class MetalQwenImage21Transformer {
   // blocks the local band, the sink and the always-exact tail already
   // cover most of the sequence, so there is nothing left to skip.
   static constexpr int kSolMinSegment = 1024;
+  // How many blocks a NON-streamed stack may encode before it drains.
+  // A streamed block commits and waits on its own, which bounds a stop
+  // by one block; a preloaded one encodes the whole stack into a
+  // single command buffer, so every bit of GPU work happens inside one
+  // wait that the per-block check -- which races through in
+  // microseconds -- can never observe. The bound there is one FORWARD.
+  // Only paid when a stop callback is actually installed.
+  static constexpr int kStopDrainBlocks = 4;
   // Dequant-once scratch: a quantized weight is expanded to dense bf16
   // ONCE per GEMM and the matrix-core tiles read that, rather than every
   // tile re-decoding the codes. Shared across a block's GEMMs -- serial

@@ -1,6 +1,8 @@
 #include "generative-models/krea2/flow-sampler.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <cmath>
 
 namespace vpipe {
@@ -259,6 +261,29 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
   }
   sig[(std::size_t)S] = 0.0;   // terminal
   return sig;
+}
+
+double
+flow_shift_from_config(const std::string& model_root, bool* dynamic)
+{
+  namespace fs = std::filesystem;
+  if (dynamic != nullptr) { *dynamic = false; }
+  if (model_root.empty()) { return 0.0; }
+  std::ifstream in(fs::path(model_root) / "scheduler" /
+                   "scheduler_config.json");
+  if (!in) { return 0.0; }
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (...) {
+    return 0.0;
+  }
+  if (!fd.is_object()) { return 0.0; }
+  auto o = fd.as_object();
+  if (dynamic != nullptr && o.contains("use_dynamic_shifting")) {
+    *dynamic = o.at("use_dynamic_shifting").as_bool(false);
+  }
+  return o.contains("shift") ? o.at("shift").as_real(0.0) : 0.0;
 }
 
 // ---- FlowSamplerSpec ---------------------------------------------------

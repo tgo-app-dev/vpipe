@@ -139,6 +139,7 @@ dit_class_family_(const std::string& class_name)
   if (class_name == "QwenImage21Transformer2DModel") {
     return "qwen-image-21";
   }
+  if (class_name == "ZImageTransformer2DModel") { return "z-image"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   // Wan video. Its two A14B experts are separate checkpoints, so each is
@@ -523,6 +524,24 @@ dit_quant_linears_(const std::string& family)
     // all 32 blocks.
     return {"to_q", "to_k", "to_v", "0", "gate_layer", "proj", "out"};
   }
+  if (family == "z-image") {
+    // NextDiT / Lumina, single-stream. Seven Linears a block: the
+    // attention's q/k/v and to_out.0 (leaf "0"), and the feed-forward's
+    // w1 (gate), w3 (up) and w2 (down). attention.norm_q / norm_k are
+    // per-head RMSNorm vectors and not matrices; the four sandwich
+    // norms are vectors too.
+    //
+    // THE LEAVES ARE UNAMBIGUOUS HERE, which is unusual and worth
+    // stating: "w1"/"w2"/"w3" appear nowhere else in the checkpoint,
+    // and the only other "0" is `t_embedder.mlp.0`, which the exclude
+    // list below names. What the list must keep out is everything
+    // model-level -- the patch embedder (K = 64, one group at g64, and
+    // every latent enters through it), the caption projection, the
+    // timestep MLP that feeds every modulation vector in the model,
+    // and the final layer, through whose 64 rows every velocity value
+    // leaves.
+    return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
+  }
   if (family == "wan") {
     // Wan's single-stream block: self-attention, cross-attention into the
     // text, and an UNGATED feed-forward. Leaves are matched on the last
@@ -596,8 +615,11 @@ dit_hidden_size_(const std::string& src_dir)
   FlexData cfg = FlexData::from_json(in);
   if (!cfg.is_object()) { return 0; }
   auto obj = cfg.as_object();
+  // `dim` is Z-Image's spelling (NextDiT), and it is last because it
+  // is the most generic word here -- a config that has both should be
+  // read by its more specific key.
   for (const char* k : {"hidden_size", "joint_attention_dim",
-                        "attention_dim", "inner_dim"}) {
+                        "attention_dim", "inner_dim", "dim"}) {
     if (obj.contains(k)) {
       const int v = (int)obj.at(k).as_int(0);
       if (v > 0) { return v; }
@@ -632,6 +654,13 @@ dit_num_layers_(const std::string& src_dir)
       // per-layer ranking would silently run over the default 28 blocks.
       if (obj.contains("depth")) {
         const int n = (int)obj.at("depth").as_int(0);
+        if (n > 0) { return n; }
+      }
+      // Z-Image (NextDiT) says `n_layers`, and it means the MAIN stack
+      // only -- the four refiner blocks are counted separately and are
+      // not what the per-layer ranking walks.
+      if (obj.contains("n_layers")) {
+        const int n = (int)obj.at("n_layers").as_int(0);
         if (n > 0) { return n; }
       }
     }
@@ -1363,6 +1392,19 @@ ModelQuantizeStage::quantize_dit_component_(
     }
   }
   const bool is_qi21 = (family == "qwen-image-21");
+  const bool is_zimage = (family == "z-image");
+  if (_quant_modulation && is_zimage) {
+    // Z-Image's per-block adaLN is `adaLN_modulation.0` -> leaf "0",
+    // which is ALSO attention.to_out.0 and is therefore already in the
+    // quant set. So there is nothing to add here: asking to quantize
+    // the modulation on this family is a no-op, and saying so is
+    // better than looking like it did something.
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): z-image's adaLN_modulation.0 shares the "
+        "leaf \"0\" with attention.to_out.0, so quant_modulation cannot "
+        "separate them -- the modulation is quantized either way and this "
+        "key changes nothing", this->id()));
+  }
   if (_quant_modulation && (is_qie || is_boogu || is_wan || is_qi21)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
@@ -1410,6 +1452,14 @@ ModelQuantizeStage::quantize_dit_component_(
       opt.quant_exclude.push_back(e);
     }
   }
+  if (family == "z-image") {
+    // The model-level weights, kept bf16 on the usual grounds: all of
+    // them are small and every value in the model passes through one of
+    // them. `t_embedder.` also shields the leaf "0" that
+    // `t_embedder.mlp.0` would otherwise match.
+    opt.quant_exclude = {"all_x_embedder", "cap_embedder", "t_embedder.",
+                         "all_final_layer"};
+  }
   if (is_boogu) {
     // Keep the precision-sensitive heads out despite their shared leaf names
     // (see dit_quant_linears_): the final LuminaLayerNormContinuous projection
@@ -1433,7 +1483,12 @@ ModelQuantizeStage::quantize_dit_component_(
     opt.high_bits  = _high_bits;
     opt.mixed_frac = _mixed_frac;
     opt.n_layers   = dit_layers;
-    if (is_boogu) {
+    if (is_zimage) {
+      // Rank the MAIN stack: 30 of the 34 blocks and the bulk of the
+      // weights. The four refiner blocks keep the base width -- two of
+      // them are the only place the caption is processed at all.
+      opt.layer_prefix = "layers.";
+    } else if (is_boogu) {
       // Rank Boogu's single-stream tail: 32 of its 46 blocks and the bulk of
       // the weights. (The 8 dual-stream blocks and the 6 refiners keep the
       // base width -- the dual-stream blocks carry the joint attention that
@@ -1454,6 +1509,14 @@ ModelQuantizeStage::quantize_dit_component_(
     // Krea-2 DiT config over its weights. Refuse instead. Plain and
     // mixed quantization are unaffected, and an explicit calib_dir
     // still works.
+    if (is_zimage && _calib_dir.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): z-image has no on-device AWQ "
+          "collector, and the fall-through would calibrate a Krea-2 model "
+          "over these weights -- refusing. Use plain or mixed "
+          "quantization, or supply calib_dir", this->id()));
+      return false;
+    }
     if (is_qi21 && _calib_dir.empty()) {
       session()->warn(fmt(
           "ModelQuantizeStage('{}'): qwen-image-21 has no on-device AWQ "

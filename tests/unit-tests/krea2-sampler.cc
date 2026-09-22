@@ -15,6 +15,8 @@
 
 #include "minitest.h"
 
+#include <filesystem>
+
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -587,3 +589,54 @@ TEST(krea2_sampler, dpmpp_2m_karras_end_to_end)
   }
 }
 #endif
+
+// ---- the shift a checkpoint states for itself ------------------------
+//
+// Most families here can hardcode their schedule because it is a
+// property of the architecture. Z-Image's cannot: its two published
+// checkpoints ship byte-identical transformer configs and differ in
+// this number alone, so a graph with no scheduler-select stage would
+// take FlowSchedulerSpec's 1.15 default -- which is neither 3.0 nor
+// 6.0, and produces a picture rather than an error. That is exactly
+// what it did until this reader existed.
+TEST(krea2_sampler, flow_shift_comes_off_the_checkpoint)
+{
+  namespace fs = std::filesystem;
+  const fs::path d = fs::temp_directory_path() / "vpipe_flow_shift_test";
+  std::error_code ec;
+  fs::remove_all(d, ec);
+  fs::create_directories(d / "scheduler", ec);
+  auto put = [&](const char* json) {
+    std::ofstream o(d / "scheduler" / "scheduler_config.json");
+    o << json;
+  };
+  bool dyn = true;
+
+  // Z-Image-Turbo's own file.
+  put(R"({"_class_name":"FlowMatchEulerDiscreteScheduler",)"
+      R"("num_train_timesteps":1000,"use_dynamic_shifting":false,)"
+      R"("shift":3.0})");
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 3.0);
+  EXPECT_FALSE(dyn);
+
+  // ...and the undistilled base's, which is the whole point.
+  put(R"({"_class_name":"FlowMatchEulerDiscreteScheduler",)"
+      R"("use_dynamic_shifting":false,"shift":6.0})");
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 6.0);
+
+  // A checkpoint asking for a per-image mu says so, and a caller
+  // applying a constant anyway should be able to know.
+  put(R"({"use_dynamic_shifting":true,"shift":1.0})");
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 1.0);
+  EXPECT_TRUE(dyn);
+
+  // Absent, unreadable and silent all answer 0 -- "use the family's
+  // default" -- rather than a number that looks deliberate.
+  put(R"({"num_train_timesteps":1000})");
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 0.0);
+  put("{not json");
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 0.0);
+  fs::remove_all(d, ec);
+  EXPECT_TRUE(genai::flow_shift_from_config(d.string(), &dyn) == 0.0);
+  EXPECT_TRUE(genai::flow_shift_from_config("", &dyn) == 0.0);
+}

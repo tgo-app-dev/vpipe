@@ -928,6 +928,92 @@ builtin_catalog_()
                "processor/video_preprocessor_config.json",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // Z-Image (Tongyi-MAI): a 6B single-stream DiT in the Lumina/NextDiT
+    // lineage, and the cheapest first-class image family in this tree --
+    // two of its three sub-models are already supported code.
+    //   transformer/  = ZImageTransformer2DModel. dim 3840, 30 heads x
+    //     head_dim 128 (MHA, n_kv_heads == n_heads), 30 main layers PLUS
+    //     two 2-layer REFINER stacks that run before the join, so 34
+    //     blocks of identical shape. SwiGLU inner 10240 (dim/3*8), 3D
+    //     RoPE axes [32,48,48] at theta 256 (not 10000), norm_eps 1e-5.
+    //     Every norm is an RMSNorm and the block is SANDWICH-normed --
+    //     attention_norm1 before the attention and attention_norm2 on
+    //     its OUTPUT, inside the residual. Modulation is four chunks
+    //     (scale_msa, gate_msa, scale_mlp, gate_mlp) off a per-block
+    //     Linear(256 -> 4*dim) with NO activation in front of it, while
+    //     the final layer's adaLN has a SiLU in front -- a difference
+    //     visible only as the tensor index (.0 against .1).
+    //   text_encoder/ = Qwen3-4B DENSE (Qwen3Model: 36 layers, hidden
+    //     2560, 32 q-heads GQA kv=8, head_dim 128, ffn 9728, rope theta
+    //     1e6, TIED embeddings) under a bare `model.` wrapper -- the
+    //     same encoder FLUX.2-klein drives, and text-ONLY: there is no
+    //     vision tower in this family. Conditioning taps HF's
+    //     hidden_states[-2], i.e. the un-normed output of layer 34.
+    //   vae/          = the plain diffusers AutoencoderKL that FLUX.1
+    //     and Boogu-Image use, unchanged: 16 latent channels, 8x
+    //     spatial, block_out [128,256,512,512], no quant/post-quant 1x1
+    //     convs, scalar whitening (shift 0.1159, scale 0.3611).
+    // The prompt is rendered through Qwen3's own chat template with a
+    // generation turn and NO system message, and truncated at 512
+    // tokens; there is no family system prompt to get wrong.
+    // TWO CHECKPOINTS, ONE model_type, because their transformer
+    // configs are byte-identical apart from a default: what differs is
+    // the SCHEDULER shift (3.0 Turbo / 6.0 base) and whether CFG is
+    // wanted, and both of those are read rather than inferred. Turbo is
+    // distilled to ~8 steps at guidance 0; the base model wants 28-50
+    // steps at guidance 3-5 and answers a negative prompt.
+    // NOTE the Turbo transformer ships F32 (24.6 GB on disk against the
+    // base's 12.3 GB bf16) -- same 6B of parameters, twice the bytes to
+    // stream.
+    {.family = "Z-Image", .version = "1", .param_class = "6B",
+     .variant = "Turbo, 8-step distilled (Tongyi-MAI)",
+     .hf_path = "Tongyi-MAI/Z-Image-Turbo",
+     .model_type = "z-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00003.safetensors",
+               "text_encoder/model-00002-of-00003.safetensors",
+               "text_encoder/model-00003-of-00003.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
+    // Z-Image (base) -- the undistilled foundation model behind Turbo.
+    // Same architecture, same text encoder, same VAE; scheduler shift
+    // 6.0 rather than 3.0, and it is the variant that USES classifier-
+    // free guidance and negative prompts. bf16 on disk.
+    {.family = "Z-Image", .version = "1", .param_class = "6B",
+     .variant = "base, CFG + negative prompt (Tongyi-MAI)",
+     .hf_path = "Tongyi-MAI/Z-Image",
+     .model_type = "z-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00003.safetensors",
+               "text_encoder/model-00002-of-00003.safetensors",
+               "text_encoder/model-00003-of-00003.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
     // separate VAE stages), but the FLUX topology rather than Qwen-Image
@@ -1980,6 +2066,13 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // way qwen-image / qwen-image-edit are split would describe two
     // checkpoints where there is one.
     set({"text", "image"}, {"image"});
+  } else if (mt == "z-image") {
+    // Text-to-image ONLY. The family's editing checkpoint
+    // (Z-Image-Edit) and its omni base are not released, and this
+    // model has no vision tower and no reference path at all -- so
+    // {"text", "image"} would offer it to a stage that needs an image
+    // input and hand it a checkpoint with nowhere to put one.
+    set({"text"}, {"image"});
   } else if (mt == "wan-i2v") {
     // The one family here that OUTPUTS video: a prompt plus a first-frame
     // image in, a clip out.

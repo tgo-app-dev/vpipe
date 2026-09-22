@@ -292,6 +292,43 @@ TEST(model_register_stage, detects_qwen_image_21_dit_component)
   EXPECT_TRUE(d.variant == "4-bit");
 }
 
+// Z-Image, by PATH against the catalogue. BOTH published repos map to
+// ONE model_type: their transformer configs are byte-identical, so a
+// per-variant tag would promise a distinction nothing here can make.
+TEST(model_register_stage, detects_both_z_image_repos_as_one_type)
+{
+  TempDir tdir;
+  for (const char* repo : {"Z-Image-Turbo", "Z-Image"}) {
+    const auto dir = make_model_dir_(tdir.path, "Tongyi-MAI", repo, "{}");
+    const DetectedModel d = detect_model_dir(dir.string());
+    EXPECT_TRUE(d.detected_by == "catalog");
+    EXPECT_TRUE(d.model_type == "z-image");
+    EXPECT_TRUE(d.family == "Z-Image");
+    // Text-to-image ONLY: this family has no vision tower and no
+    // reference path, so claiming image input would offer it to a
+    // stage that needs one and hand it a checkpoint with nowhere to
+    // put it.
+    EXPECT_TRUE(has_modality_(d.inputs, "text"));
+    EXPECT_FALSE(has_modality_(d.inputs, "image"));
+    EXPECT_TRUE(has_modality_(d.outputs, "image"));
+  }
+}
+
+// The DiT ALONE, by its class name -- what model-quantize writes, and
+// therefore what a quantize -> register recipe hands over.
+TEST(model_register_stage, detects_z_image_dit_component)
+{
+  TempDir tdir;
+  const auto dir = make_model_dir_(
+      tdir.path, "local", "Z-Image-Turbo-w8",
+      R"({"_class_name":"ZImageTransformer2DModel","dim":3840,)"
+      R"("n_layers":30,"n_heads":30,)"
+      R"("quantization":{"bits":8,"group_size":64}})");
+  const DetectedModel d = detect_model_dir(dir.string());
+  EXPECT_TRUE(d.model_type == "z-image-dit");
+  EXPECT_TRUE(d.variant == "8-bit");
+}
+
 TEST(model_register_stage, trims_io_to_what_the_checkpoint_carries)
 {
   TempDir tdir;

@@ -75,14 +75,14 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "boogu-image,boogu-image-edit,vosr",
+       "boogu-image,boogu-image-edit,z-image,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
-       "boogu-image-dit"},
+       "boogu-image-dit,z-image-dit"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
           "(the init latent arrives on the `latent` iport from vae-encode)"},
@@ -457,6 +457,20 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
   if (genai::MetalVosrTransformer::read_config(root, &vc, nullptr)) {
     return 0;
   }
+  // Z-IMAGE ANSWERS FOR ITSELF. Its streamed stack is ONE stack spelled
+  // under two prefixes (`noise_refiner.` then `layers.`) sharing one
+  // slot pair, while `context_refiner.` is held in both modes; and its
+  // Turbo checkpoint is F32, so the bytes held are half the bytes on
+  // disk. The stem list below can express neither, and without a stem
+  // that matches at all it returns 0 -- "cannot be reduced" -- which
+  // declared a 24.6 GB DiT at its full size and put the plan's peak
+  // 8 GB over this box for a model that actually floors near 1.5.
+  {
+    genai::MetalZImageTransformer::Config zc;
+    if (genai::MetalZImageTransformer::Config::read_dims(dit, &zc)) {
+      return genai::MetalZImageTransformer::streaming_floor_bytes(dit);
+    }
+  }
   // EVERY stack, not just the first. These models stream BOTH of their
   // stacks and keep a slot pair for each, so a stem list that names one
   // leaves the other in the trunk -- MEASURED on FLUX.2-klein-9B, whose
@@ -778,6 +792,18 @@ unclaimed_family_(const std::string& transformer_dir)
   return {};
 }
 
+// Which built-in denoisers actually DISPATCH Sol-Attn -- verified
+// against `_sol->encode` in each transformer, not against what their
+// configs accept. A family here that does not dispatch would run dense
+// in silence; a family missing from here that does would be warned
+// about a tier it is running.
+bool
+family_implements_sol_(const std::string& family)
+{
+  return family == "krea2" || family == "flux2" ||
+         family == "qwen-image-21" || family == "z-image";
+}
+
 int
 latent_scale_(const std::string& family)
 {
@@ -785,6 +811,11 @@ latent_scale_(const std::string& family)
   // FLUX.2 (8x VAE + 2x patch), and 16 for Qwen-Image-2.1 -- whose VAE
   // is five levels, so the stride is the VAE's alone with no patch to
   // multiply by.
+  // NOT Z-Image, which looks like FLUX.2 and is not: the 2x patch is
+  // the DIT's, not the VAE's. MetalFlux2Vae emits
+  // [channels, H/(8*patch), W/(8*patch)] and Z-Image's VAE is patch 1,
+  // so a reference latent cell is 8 pixels and inferring a size at 16
+  // would ask for twice the picture.
   if (family == "flux2" || family == "qwen-image-21") { return 16; }
   return 8;
 }
@@ -835,6 +866,7 @@ t2i_family_(const std::string& transformer_dir)
         // single-stream, /16 VAE, RGBA -- and named here because the
         // fall-through is "krea2", which would load a Krea-2 config over
         // these weights and run.
+        if (cls == "ZImageTransformer2DModel") { return "z-image"; }
         if (cls == "QwenImage21Transformer2DModel") {
           return "qwen-image-21";
         }
@@ -1045,7 +1077,8 @@ GenerateImageStage::reset_run_state()
   // weights are still held we deliberately leave the guard set --
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
-  if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit) {
+  if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit &&
+      !_zi_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
     // The holding correction describes a DiT that is no longer here. A
@@ -1075,7 +1108,22 @@ GenerateImageStage::reset_run_state()
   // and the run silently re-uses the PREVIOUS image's reference.
   _ref[0] = RefLatent{};
   _ref[1] = RefLatent{};
-
+  // ...AND THE VALUES PARSED OUT OF IT. `_model_cfg` going empty is not
+  // enough: the parsed derivatives live in their own members, and an
+  // ABSENT key means "no opinion" on purpose -- which is right WITHIN a
+  // run and wrong across one. A relaunch may be a different graph
+  // entirely, and a graph with no z-image-model-config would otherwise
+  // inherit the previous run's guidance. On Z-Image that is visible:
+  // the distilled Turbo checkpoint wants 0 and takes a stale 4 as an
+  // instruction, producing an over-guided picture rather than an error.
+  //
+  // Only this family's are reset here. The same shape exists for
+  // Qwen-Image-2.1's `use_kv_cache` and FLUX.2's GenerationParams, and
+  // changing those is a decision about their defaults rather than a
+  // fix to this one.
+  _zi_guidance  = 0.0;
+  _zi_cfg_norm  = 0.0;
+  _zi_cfg_trunc = 1.0;
 }
 
 void
@@ -1112,6 +1160,7 @@ std::size_t
 GenerateImageStage::dit_resident_bytes_() const
 {
   if (_qi21_dit) { return (std::size_t)_qi21_dit->resident_bytes(); }
+  if (_zi_dit) { return (std::size_t)_zi_dit->resident_bytes(); }
   return 0;
 }
 
@@ -1340,6 +1389,23 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
+  // Z-Image's ANE tier is the feed-forward over its MAIN stack only --
+  // the refiners run a shorter sequence than the module is sized for.
+  // Claimed in UNITS because CoreML holds those bytes and no other
+  // ledger in this process can see them.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "z-image") {
+    genai::MetalZImageTransformer::Config zc;
+    (void)genai::MetalZImageTransformer::Config::read_dims(dit, &zc);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalZImageTransformer::ane_runtime_bytes(
+                 zc, genai::MetalZImageTransformer::ane_plan_seq(_width,
+                                                                 _height)),
+             1, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
       t2i_family_(dit) == "flux2") {
     genai::MetalFlux2Transformer::Config fc;
@@ -1420,6 +1486,25 @@ GenerateImageStage::apply_model_config_()
       }
     }
   };
+  if (_family == "z-image") {
+    // The two published checkpoints ship BYTE-IDENTICAL transformer
+    // configs; what separates them is the scheduler shift and whether
+    // CFG is wanted. So the guidance is a graph decision, defaulted to
+    // the distilled Turbo's 0 -- an absent key is "no opinion", not a
+    // demand for the base model's 4.
+    if (_model_cfg.is_object()) {
+      auto o = _model_cfg.as_object();
+      if (o.contains("guidance_scale")) {
+        _zi_guidance = o.at("guidance_scale").as_real(_zi_guidance);
+      }
+      if (o.contains("cfg_normalization")) {
+        _zi_cfg_norm = o.at("cfg_normalization").as_real(_zi_cfg_norm);
+      }
+      if (o.contains("cfg_truncation")) {
+        _zi_cfg_trunc = o.at("cfg_truncation").as_real(_zi_cfg_trunc);
+      }
+    }
+  }
   if (_family == "qwen-image-21") {
     // `use_kv_cache` -- absent means "no opinion", so the family's own
     // default (on) stands rather than being replaced by a false.
@@ -1437,6 +1522,12 @@ GenerateImageStage::apply_model_config_()
     adapter_keys("FLUX.2", _flux2_dit != nullptr, [&](int i, float s) {
       if (_flux2_dit && _flux2_dit->lora_modules(i) > 0) {
         _flux2_dit->set_lora_scale(i, s);
+      }
+    });
+  } else if (_family == "z-image") {
+    adapter_keys("Z-Image", _zi_dit != nullptr, [&](int i, float s) {
+      if (_zi_dit && _zi_dit->lora_modules(i) > 0) {
+        _zi_dit->set_lora_scale(i, s);
       }
     });
   } else if (_family == "krea2") {
@@ -1680,9 +1771,15 @@ GenerateImageStage::ensure_loaded_()
 
   session()->info(fmt(
       "GenerateImageStage('{}'): loading {} DiT from '{}'", this->id(),
+      // NAMED PER FAMILY, including the ones whose label is only a log
+      // line: the fall-through is "Krea2 MMDiT", so a family without a
+      // row here announces itself as a different model while loading
+      // correctly. Two already did.
       _family == "flux2" ? "FLUX.2"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
+      : _family == "qwen-image-21" ? "Qwen-Image-2.1 single-stream"
       : _family == "boogu-image" ? "Boogu-Image NextDiT"
+      : _family == "z-image" ? "Z-Image NextDiT"
       : _family == "vosr" ? "VOSR LightningDiT"
       : "Krea2 MMDiT", _family == "vosr" ? _vosr_dir : dit_dir));
   if (_family == "vosr") {
@@ -1900,6 +1997,71 @@ GenerateImageStage::ensure_loaded_()
           "from '{}'; inert", this->id(), dit_dir));
       return;
     }
+  } else if (_family == "z-image") {
+    // A 6B DiT beside a ~8 GB Qwen3-4B encoder. The same plan_streaming()
+    // rule the other families take -- not a seventh answer to one
+    // question. VPIPE_Z_IMAGE_STREAM overrides.
+    //
+    // NOTE the Turbo checkpoint is F32 on disk (24.6 GB against the
+    // base's 12.3 GB bf16), so plan_streaming sees twice the footprint
+    // for the same 6B of parameters -- which is the right answer for
+    // the READ and pessimistic for what is held, since every block is
+    // narrowed on the way in.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    bool stream_blocks = plan.stream;
+    if (const char* e = std::getenv("VPIPE_Z_IMAGE_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Z-Image footprint {} GB (others {} GB) + "
+        "{} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+    _zi_dit_dir = dit_dir;
+    // The holding correct_dit_holding_ moves as residency grows.
+    _dit_holding_dir = dit_dir;
+    _zi_stream = stream_blocks;
+    {
+      bool dyn = false;
+      _zi_shift = genai::flow_shift_from_config(root, &dyn);
+      if (dyn) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): this Z-Image checkpoint asks for "
+            "use_dynamic_shifting, which wants a per-image mu rather "
+            "than the constant shift this family runs; using the "
+            "constant", this->id()));
+      }
+      session()->log_debug(fmt(
+          "GenerateImageStage('{}'): Z-Image flow shift {} from the "
+          "checkpoint's scheduler_config", this->id(),
+          _zi_shift > 0.0 ? std::to_string(_zi_shift)
+                          : std::string("(absent, using 3.0)")));
+    }
+    // The plain diffusers AutoencoderKL -- the FLUX.1 VAE -- so it
+    // sizes from block_out_channels like FLUX.2's does, not from a
+    // Qwen-Image `base_dim`.
+    _vae_base = flux2_vae_base_(root);
+    _release_scratch = stream_blocks;
+    if (stream_blocks) { revise_dit_declaration_(dit_dir); }
+    if (stream_blocks) {
+      // Deferred for the same reason Boogu and 2.1 defer: both stages
+      // load in initialize(), so a preloaded DiT beside a resident
+      // encoder is the peak, and it is the peak that decides whether
+      // the box copes.
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "GenerateImageStage('{}'): memory-bounded -- the Z-Image DiT "
+          "loads on the first conditioning beat (block streaming on) and "
+          "is freed for the vae-decode, so it never shares the box with "
+          "the text encoder", this->id()));
+    } else if (!load_z_image_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the Z-Image DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      return;
+    }
   } else if (_family == "boogu-image") {
     // Boogu's 10B NextDiT. At ~20 GB bf16 it streams on any box that cannot
     // hold it beside the resident Qwen3-VL mllm (~16 GB), which is every box
@@ -2030,13 +2192,19 @@ GenerateImageStage::ensure_loaded_()
   // Reached only on the BUILT-IN path -- the registered-family branch
   // returns above -- so a plugin that implements Sol is never told its
   // own tier is inert.
-  // NOT FOR EVERY FAMILY ANY MORE. Krea-2 implements the tier, and this
-  // line would be printed at the moment it is routing -- a log that
-  // contradicts the run is worse than no log, and the transformer emits
-  // its own line when it arms. The others still ignore the key, and a
-  // graph that set it deserves to know the attention it asked to
-  // approximate ran dense anyway.
-  if (_sol.enabled && _family != "krea2" && _family != "flux2") {
+  // NOT FOR EVERY FAMILY. A family that implements the tier would
+  // otherwise be told its attention ran dense at the moment it is
+  // routing -- a log that CONTRADICTS the run, which is worse than no
+  // log. The rest still ignore the key, and a graph that set it
+  // deserves to know the attention it asked to approximate ran dense.
+  //
+  // KEPT AS ONE NAMED PREDICATE because the list has now gone stale
+  // twice in this file: it read {krea2, flux2} while Qwen-Image-2.1
+  // and Z-Image both dispatched Sol, so both were warned that a tier
+  // they were actively running did not exist. The check that catches
+  // it is `grep -c "_sol->encode"` over the transformers -- the
+  // dispatch, not the declaration.
+  if (_sol.enabled && !family_implements_sol_(_family)) {
     session()->warn(fmt(
         "GenerateImageStage('{}'): sol_attn is set and the built-in '{}' "
         "denoiser does not implement it, so the attention runs dense. It "
@@ -2285,6 +2453,66 @@ GenerateImageStage::free_qwen_image21_dit_for_decode_(int gen_w, int gen_h)
     mgr->pool_weights(_qi21_dit_dir);
   }
   _qi21_dit.reset();
+  _dit_unloaded = true;
+}
+
+bool
+GenerateImageStage::load_z_image_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _zi_dit_dir.empty()) { return false; }
+  genai::MetalZImageTransformer::Config cfg;
+  if (!genai::MetalZImageTransformer::Config::read_dims(_zi_dit_dir, &cfg)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): '{}' does not hold a "
+        "ZImageTransformer2DModel config", this->id(), _zi_dit_dir));
+    return false;
+  }
+  cfg.i8_gemm = _i8_gemm;
+  cfg.sage = _sage;
+  cfg.sol = _sol;
+  cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
+                                            0);
+  cfg.ane_layers = (int)genai::accel::integer(&_accel,
+                                              genai::accel::kAneLayers, 0);
+  _zi_dit = genai::MetalZImageTransformer::load(
+      weight_set_(_zi_dit_dir), mc, cfg, _zi_stream,
+      lora_specs_<genai::MetalZImageTransformer::LoraSpec>());
+  if (_zi_dit && _zi_stream) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Z-Image DiT streaming {} of {} blocks; "
+        "the resident set grows as the box allows{}", this->id(),
+        _zi_dit->config().n_mod_blocks(), _zi_dit->config().n_blocks(),
+        _zi_dit->narrows_f32()
+            ? " (the checkpoint is F32, so every block is narrowed to "
+              "bf16 on the way in -- twice the bytes to read, half the "
+              "bytes to hold)"
+            : ""));
+  }
+  return (bool)_zi_dit;
+}
+
+void
+GenerateImageStage::free_z_image_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_zi_dit) { return; }
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  // The plain AutoencoderKL that FLUX.1 and Boogu use, so the same peak.
+  const std::size_t peak =
+      flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+  const std::size_t budget = mc->memory_budget().available_physical;
+  if (peak <= budget) { return; }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the Z-Image DiT before a {}x{} "
+      "decode ({} MB wanted, {} MB free)", this->id(), gen_w, gen_h,
+      peak >> 20, budget >> 20));
+  publish_decode_arena_(peak);
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_zi_dit_dir);
+  }
+  _zi_dit.reset();
   _dit_unloaded = true;
 }
 
@@ -3407,6 +3635,241 @@ GenerateImageStage::generate_qwen_image21_(
   return unpack(packed);
 }
 
+// Z-Image: the NextDiT over patch-packed latents, along a STATIC
+// flow-shift Euler schedule.
+//
+// Three things here are this family's alone and each is silent:
+//
+//  * THE VELOCITY IS NEGATED. The reference computes `noise_pred =
+//    -model_out` before handing it to the scheduler, so a run that skips
+//    the sign denoises AWAY from the data and returns noise that still
+//    decodes to an image.
+//  * THE TIMESTEP IS INVERTED. The DiT's own input is 1 - sigma; the
+//    transformer converts, so this hands it sigma like every other
+//    family here.
+//  * CFG IS `pos + g*(pos - neg)`, not the usual `neg + g*(pos - neg)`.
+//    The two differ by one in the scale, so a model card's "guidance 4"
+//    read the ordinary way is the wrong picture rather than a broken
+//    one.
+std::vector<float>
+GenerateImageStage::generate_z_image_(
+    const metal_compute::SharedBuffer& txt_pos, int n_real,
+    const metal_compute::SharedBuffer& txt_neg, int n_real_neg, int gen_h,
+    int gen_w,
+    const std::function<void(const std::vector<float>&)>& emit_step) const
+{
+  auto* mc = session()->services()->metal_compute();
+  using metal_compute::SharedBuffer;
+  if (mc == nullptr || !_zi_dit) { return {}; }
+  const auto& dcfg = _zi_dit->config();
+  const int Z = dcfg.in_channels;            // 16
+  const int P = dcfg.patch;                  // 2
+  const int lh = gen_h / 8, lw = gen_w / 8;  // the VAE's 8x latent grid
+  const int gh = lh / P, gw = lw / P;        // the DiT's patch grid
+  const int img_seq = gh * gw;
+  const int PD = dcfg.patch_dim();           // 64
+  if (img_seq <= 0 || (lh % P) != 0 || (lw % P) != 0) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): {}x{} gives a {}x{} latent, which is not "
+        "a whole number of {}x{} patches -- use multiples of {}",
+        this->id(), gen_w, gen_h, lw, lh, P, P,
+        genai::zimage::kPixelsPerToken));
+    return {};
+  }
+  if (n_real <= 0) { return {}; }
+  // THIS FAMILY HAS NO REFERENCE PATH. There is no vision tower, no
+  // released edit checkpoint, and nothing in the sequence for a
+  // reference to occupy -- so a wired reference latent is ignored, and
+  // saying so beats letting someone wonder why their edit did nothing.
+  if (!_ref[0].empty() || !_ref[1].empty()) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): a reference latent is wired but "
+        "Z-Image is text-to-image only -- it is ignored. The family's "
+        "editing checkpoint is not published", this->id()));
+  }
+
+  genai::zimage::Layout lay;
+  std::string lerr;
+  if (!genai::zimage::build_layout(gh, gw, n_real, &lay, &lerr)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the joint sequence does not add up: {}",
+        this->id(), lerr));
+    return {};
+  }
+
+  // ---- schedule ------------------------------------------------------
+  //
+  // FlowMatchEulerDiscreteScheduler with use_dynamic_shifting FALSE, so
+  // the shift is the STATIC curve s' = shift*s / (1 + (shift-1)*s) --
+  // which is exactly `time_shift(..., linear)` -- over the base grid
+  // linspace(1, 1/S, S), which is what `type == "simple"` builds. The
+  // shift comes off the checkpoint's own scheduler_config: 3.0 for
+  // Turbo and 6.0 for the undistilled base, and nothing else in either
+  // repo tells the two apart.
+  genai::FlowSchedulerSpec sched = _scheduler_spec;
+  if (!_scheduler_latched) {
+    sched.type = "simple";
+    sched.dynamic_shift = false;
+    sched.shift_type = "linear";
+    // FROM THE CHECKPOINT, not from FlowSchedulerSpec's default --
+    // which is 1.15 and would win this ternary for both variants.
+    sched.shift = _zi_shift > 0.0 ? _zi_shift : 3.0;
+    sched.steps = _steps > 0 ? _steps : 8;
+  }
+  sched.img_seq_len = img_seq;
+  genai::FlowSamplerSpec samp = _sampler_spec;
+  if (!_sampler_latched) { samp.method = "euler"; }
+  genai::FlowSampler sampler(samp, sched);
+  const int S = sampler.steps();
+
+  std::vector<float> packed((std::size_t)img_seq * PD);
+  {
+    std::mt19937_64 rng(_seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : packed) { v = nd(rng); }
+  }
+  SharedBuffer latbuf = mc->make_shared_buffer((std::size_t)img_seq * PD * 2);
+  if (latbuf.empty()) { return {}; }
+
+  // CFG. The Turbo checkpoint is distilled to guidance 0 and answers no
+  // negative prompt; the base model wants 3-5. `_zi_guidance` defaults
+  // to Turbo's because the two ship identical transformer configs and
+  // nothing here can tell them apart.
+  const bool cfg = !txt_neg.empty() && n_real_neg > 0 && _zi_guidance > 0.0;
+  const float gscale = (float)_zi_guidance;
+  genai::zimage::Layout lay_neg;
+  if (cfg && !genai::zimage::build_layout(gh, gw, n_real_neg, &lay_neg,
+                                          &lerr)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the negative joint sequence does not "
+        "add up: {}", this->id(), lerr));
+    return {};
+  }
+  bool dit_ok = true;
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_zi_dit)>>
+      prog_guard(_zi_dit.get(), prog);
+
+  // ---- how much of the stack this run may KEEP ----------------------
+  //
+  // Without this the DiT streams and NEVER grows: BlockResidency refuses
+  // every admission until a reserve has been DECLARED. Declaring 0 is a
+  // real answer ("nothing runs beside me"); declaring nothing is not,
+  // and reads as a checkpoint re-read from disk on every step.
+  if (_zi_dit->streaming()) {
+    const std::size_t peak =
+        flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+    const auto mb = mc->memory_budget();
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _zi_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    _zi_dit->set_residency_schedule(S);
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Z-Image residency reserve {} MB -- the "
+        "{}x{} vae-decode wants {} MB and {}", this->id(),
+        (decode_runs_beside_us ? peak : 0) >> 20, gen_w, gen_h, peak >> 20,
+        decode_runs_beside_us ? "fits beside the DiT"
+                              : "does not, so the DiT is freed before it"));
+  }
+
+  auto run = [&](const SharedBuffer& txt, const genai::zimage::Layout& L,
+                 float sigma) -> SharedBuffer {
+    genai::MetalZImageTransformer::Request req;
+    req.latents = &latbuf;
+    req.cap = &txt;
+    req.layout = &L;
+    req.timestep = sigma;
+    std::string e;
+    SharedBuffer out = _zi_dit->forward(req, &e);
+    if (out.empty()) {
+      // A cooperative stop comes back empty with NO reason, and is not a
+      // failure -- the beat-level line reports it as stopped. Only a
+      // real fault has something to say here.
+      if (!e.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): DiT forward failed: "
+                            "{}", this->id(), e));
+      }
+      dit_ok = false;
+    }
+    return out;
+  };
+
+  auto denoise = [&](const std::vector<float>& cand,
+                     double sigma) -> std::vector<float> {
+    auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+    for (std::size_t k = 0; k < cand.size(); ++k) {
+      lb[k] = f32_to_bf16_(cand[k]);
+    }
+    SharedBuffer v = run(txt_pos, lay, (float)sigma);
+    if (!dit_ok || v.empty()) { return {}; }
+    std::vector<float> out((std::size_t)img_seq * PD);
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    for (std::size_t k = 0; k < out.size(); ++k) {
+      out[k] = bf16_to_f32_(vp[k]);
+    }
+    prog.end_forward();
+    if (cfg) {
+      // CFG TRUNCATION: the reference drops guidance once (1 - sigma)
+      // passes the threshold. Default 1.0, which never fires.
+      const bool guide = (1.0 - sigma) <= _zi_cfg_trunc;
+      SharedBuffer nv = run(txt_neg, lay_neg, (float)sigma);
+      if (!dit_ok || nv.empty()) { return {}; }
+      if (guide) {
+        const auto* np = static_cast<const std::uint16_t*>(nv.contents());
+        double pn = 0.0, dn = 0.0;
+        for (std::size_t k = 0; k < out.size(); ++k) {
+          const float p = out[k];
+          const float n = bf16_to_f32_(np[k]);
+          // `pos + g*(pos - neg)`, which is NOT the usual form.
+          out[k] = p + gscale * (p - n);
+          pn += (double)p * (double)p;
+          dn += (double)out[k] * (double)out[k];
+        }
+        // CFG RENORMALIZATION: clamp the guided prediction's norm to a
+        // multiple of the conditional one's. Off by default.
+        if (_zi_cfg_norm > 0.0 && dn > 0.0) {
+          const double maxn = std::sqrt(pn) * _zi_cfg_norm;
+          const double newn = std::sqrt(dn);
+          if (newn > maxn) {
+            const float k = (float)(maxn / newn);
+            for (auto& o : out) { o *= k; }
+          }
+        }
+      }
+      prog.end_forward();
+    }
+    // THE SIGN. The reference negates the DiT's output before the
+    // scheduler step; this sampler's Euler update is the ordinary
+    // noise-ward one, so the negation belongs here.
+    for (auto& o : out) { o = -o; }
+    return out;
+  };
+
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)Z * lh * lw);
+    genai::zimage::unpack_latents(pk.data(), Z, lh, lw, P, latent.data());
+    return latent;
+  };
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < S; ++i) {
+    sampler.step(i, packed, denoise);
+    if (!dit_ok) { return {}; }
+    if (emit_step) { emit_step(unpack(packed)); }
+    prog.end_step(i);
+  }
+  const double secs = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  session()->info(fmt(
+      "GenerateImageStage('{}'): Z-Image latent generated in {:.2f}s ({} "
+      "steps, joint {} = {} image + {} caption, shift {:.1f}, {})",
+      this->id(), secs, S, lay.joint_len, lay.img_total, lay.cap_total,
+      sched.shift,
+      cfg ? "cfg " + std::to_string(_zi_guidance) : std::string("no cfg")));
+  return unpack(packed);
+}
+
 std::vector<float>
 GenerateImageStage::generate_boogu_(const metal_compute::SharedBuffer& txt_pos,
                                   int n_real,
@@ -4102,6 +4565,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "next prompt", this->id()));
     if (load_qwen_image21_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "z-image" && _dit_unloaded && !_zi_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the Z-Image DiT for the next "
+        "prompt", this->id()));
+    if (load_z_image_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "boogu-image" && _dit_unloaded && !_boogu_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the Boogu-Image DiT for the next "
@@ -4113,6 +4582,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "qwen-image-edit" ? (bool)_qie_dit
       : _family == "boogu-image" ? (bool)_boogu_dit
       : _family == "qwen-image-21" ? (bool)_qi21_dit
+      : _family == "z-image" ? (bool)_zi_dit
       : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
   if (!have_dit) {
@@ -4814,6 +5284,42 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // deliberately does not move the holding back down.
     correct_dit_holding_("after a generation");
     free_qwen_image21_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
+  // ---- Z-Image: [image | caption] joined, an 8x VAE and a 2x patch in
+  // the DiT, so the emitted latent is [16, H/8, W/8] -- the same shape
+  // Boogu-Image and Qwen-Image-Edit emit, and the plain AutoencoderKL
+  // decodes it. ----
+  if (_family == "z-image") {
+    const int ZZ = _zi_dit->config().in_channels;
+    _zi_dit->set_stream_stop(stopping);
+    const std::vector<float> zl =
+        generate_z_image_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
+                          step_emitter({ZZ, lh, lw}));
+    _zi_dit->set_stream_stop({});
+    if (zl.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): Z-Image generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {ZZ, lh, lw};
+    out->resize_contiguous(zl.size());
+    std::memcpy(out->as_f32(), zl.data(), zl.size() * sizeof(float));
+    tag_model_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Z-Image latent [{}, {}, {}] ({} steps @ "
+        "{}x{})", this->id(), ZZ, lh, lw, _scheduler_spec.steps, gen_h,
+        gen_w));
+    // BEFORE the free, not after: this says what the DiT held while it
+    // denoised, which is the number a peer has to size against.
+    correct_dit_holding_("after a generation");
+    free_z_image_dit_for_decode_(gen_w, gen_h);
     co_await ctx.write(0, std::move(out));
     co_return;
   }

@@ -3419,6 +3419,118 @@ const STRINGS = {
       + ' +vl_*}，供 diffusion-conditioner 的 model_config 輸入埠使用（接地'
       + '編碼）'],
 
+  // ---- Qwen-Image-2.1 Model Config (model-specific-config) ----
+  'stage.qwen-image-21-model-config.name': ['',
+      'Qwen-Image-2.1 模型配置',
+      'Qwen-Image-2.1 模型設定'],
+  'stage.qwen-image-21-model-config.doc': ['',
+      '源：Qwen-Image-2.1 专属参数——跨步前缀 KV 缓存，以及对参考图像的界限'
+      + '（这些界限是与 VAE 共用的，并非可以随意选择）。发一个节拍即结束；'
+      + '若接了 trigger 输入端口，则每收到一个节拍发一次。',
+      '來源：Qwen-Image-2.1 專屬參數——跨步前綴 KV 快取，以及對參考影像的界'
+      + '限（這些界限是與 VAE 共用的，並非可以隨意選擇）。發一個節拍即結束'
+      + '；若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+  'cfg.qwen-image-21-model-config.use_kv_cache': ['',
+      '在各去噪步之间复用文本与条件图像前缀的注意力 K/V。之所以成立，是因为'
+      + '本模型在 t=0 调制该前缀，使它与步数无关——因此这是精确优化而非近似'
+      + '，缓存与不缓存的结果逐位相同。文生图时收益很小（前缀只有几十行，而'
+      + '图像有数千行），多参考编辑时收益很大。未设置 => 开启',
+      '在各去噪步之間重複使用文字與條件影像前綴的注意力 K/V。之所以成立，是'
+      + '因為本模型在 t=0 調變該前綴，使它與步數無關——因此這是精確最佳化而'
+      + '非近似，快取與不快取的結果逐位元相同。文生圖時收益很小（前綴只有幾'
+      + '十列，而影像有數千列），多參考編輯時收益很大。未設定 => 開啟'],
+  'cfg.qwen-image-21-model-config.vl_long_edge': ['',
+      '接地编码：送入视觉塔之前，参考图像最长边的上限。未设置 => 0（不限）'
+      + '——本模型族按面积而非最长边设界',
+      '接地編碼：送入視覺塔之前，參考影像最長邊的上限。未設定 => 0（不限）'
+      + '——本模型族按面積而非最長邊設界'],
+  'cfg.qwen-image-21-model-config.vl_pixel_budget': ['',
+      '接地编码：参考图像的总像素上限。未设置 => 本模型族自己的 1024x1024'
+      + '（1048576）。改动它并非没有代价：同一批缩放后的像素也要喂给 VAE，'
+      + '而 DiT 要求视觉塔的合并网格恰好是 VAE 潜空间网格的一半，因此结果若'
+      + '无法对齐到 32，该参考图就无法排布',
+      '接地編碼：參考影像的總像素上限。未設定 => 本模型族自己的 1024x1024'
+      + '（1048576）。改動它並非沒有代價：同一批縮放後的像素也要餵給 VAE，'
+      + '而 DiT 要求視覺塔的合併網格恰好是 VAE 潛空間網格的一半，因此結果若'
+      + '無法對齊到 32，該參考影像就無法排布'],
+  'cfg.qwen-image-21-model-config.vl_min_pixels': ['',
+      '接地编码：图像处理器的下界，正是它让过小或过于狭长的参考图在切 patch'
+      + ' 前被放大。未设置 => 本模型族自己的 65536',
+      '接地編碼：影像處理器的下界，正是它讓過小或過於狹長的參考影像在切 '
+      + 'patch 前被放大。未設定 => 本模型族自己的 65536'],
+  'cfg.qwen-image-21-model-config.vl_max_pixels': ['',
+      '接地编码：图像处理器的上界。未设置 => 本模型族自己的 16777216',
+      '接地編碼：影像處理器的上界。未設定 => 本模型族自己的 16777216'],
+  'port.qwen-image-21-model-config.trigger': ['',
+      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
+      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
+      + '一次',
+      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
+      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
+      + '發一次'],
+  'port.qwen-image-21-model-config.model_config': ['',
+      'qwen-image-2.1 参数，作为一个 FlexData 对象 {model_family: '
+      + 'qwen-image-21, +use_kv_cache, +vl_*}，供 generate-image 或 '
+      + 'diffusion-conditioner 的 model_config 输入端口使用',
+      'qwen-image-2.1 參數，作為一個 FlexData 物件 {model_family: '
+      + 'qwen-image-21, +use_kv_cache, +vl_*}，供 generate-image 或 '
+      + 'diffusion-conditioner 的 model_config 輸入埠使用'],
+
+  // ---- Z-Image Model Config (model-specific-config) ----
+  'stage.z-image-model-config.name': ['',
+      'Z-Image 模型配置',
+      'Z-Image 模型設定'],
+  'stage.z-image-model-config.doc': ['',
+      '源：Z-Image 专属参数——用本模型自己的参数化方式表达的引导强度，以及参'
+      + '考实现在其之上的两项修正。引导强度同时也是区分蒸馏版 Turbo（0）与'
+      + '未蒸馏基础版（3–5）的唯一依据，别处无从分辨。发一个节拍即结束；若'
+      + '接了 trigger 输入端口，则每收到一个节拍发一次。',
+      '來源：Z-Image 專屬參數——用本模型自己的參數化方式表達的引導強度，以及'
+      + '參考實作在其之上的兩項修正。引導強度同時也是區分蒸餾版 Turbo（0）'
+      + '與未蒸餾基礎版（3–5）的唯一依據，別處無從分辨。發一個節拍即結束；'
+      + '若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+  'cfg.z-image-model-config.guidance_scale': ['',
+      '无分类器引导，采用本模型自己的参数化：pred = pos + g*(pos - neg)，'
+      + '比常见的 neg + g*(pos - neg) 小 1。未设置 => 0，即蒸馏版 '
+      + 'Z-Image-Turbo 的设置，此时完全关闭 CFG（每步一次前向，不使用负面提'
+      + '示词）。未蒸馏的 Z-Image 基础版在此处需要 3–5，并配合 28–50 步——两'
+      + '个检查点的 transformer 配置完全相同，因此本键是唯一能说明载入了哪'
+      + '一个的依据',
+      '無分類器引導，採用本模型自己的參數化：pred = pos + g*(pos - neg)，'
+      + '比常見的 neg + g*(pos - neg) 小 1。未設定 => 0，即蒸餾版 '
+      + 'Z-Image-Turbo 的設定，此時完全關閉 CFG（每步一次前向，不使用負面提'
+      + '示詞）。未蒸餾的 Z-Image 基礎版在此處需要 3–5，並配合 28–50 步——兩'
+      + '個檢查點的 transformer 設定完全相同，因此本鍵是唯一能說明載入了哪'
+      + '一個的依據'],
+  'cfg.z-image-model-config.cfg_normalization': ['',
+      '把引导后预测的范数钳制到条件预测范数的这个倍数，用以抑制高引导强度带'
+      + '来的过饱和。未设置 => 0（关闭），与参考实现一致。仅在 '
+      + 'guidance_scale > 0 时生效',
+      '把引導後預測的範數箝制到條件預測範數的這個倍數，用以抑制高引導強度帶'
+      + '來的過飽和。未設定 => 0（關閉），與參考實作一致。僅在 '
+      + 'guidance_scale > 0 時生效'],
+  'cfg.z-image-model-config.cfg_truncation': ['',
+      '当 (1 - sigma) 超过此值时（即调度表靠近干净的一端，CFG 在那里多半只'
+      + '会带来伪影）关闭引导。未设置 => 1.0，即永不触发。仅在 '
+      + 'guidance_scale > 0 时生效',
+      '當 (1 - sigma) 超過此值時（即排程表靠近乾淨的一端，CFG 在那裡多半只'
+      + '會帶來偽影）關閉引導。未設定 => 1.0，即永不觸發。僅在 '
+      + 'guidance_scale > 0 時生效'],
+  'port.z-image-model-config.trigger': ['',
+      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
+      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
+      + '一次',
+      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
+      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
+      + '發一次'],
+  'port.z-image-model-config.model_config': ['',
+      'z-image 参数，作为一个 FlexData 对象 {model_family: z-image, '
+      + '+guidance_scale, +cfg_normalization, +cfg_truncation}，供 '
+      + 'generate-image 的 model_config 输入端口使用',
+      'z-image 參數，作為一個 FlexData 物件 {model_family: z-image, '
+      + '+guidance_scale, +cfg_normalization, +cfg_truncation}，供 '
+      + 'generate-image 的 model_config 輸入埠使用'],
+
   // ---- FlashVSR Model Config (model-specific-config) ----
   'stage.flashvsr-model-config.name': ['',
       'FlashVSR 模型配置', 'FlashVSR 模型設定'],

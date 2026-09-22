@@ -222,6 +222,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-21-layout.cc
         qwen-image-21-cond.cc
         qwen-image-21-dit.cc
+        z-image-dit.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
         qwen-image-edit-vision.cc

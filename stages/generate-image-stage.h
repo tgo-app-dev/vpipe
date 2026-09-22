@@ -19,6 +19,7 @@
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
+#include "generative-models/z-image/metal-z-image-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #endif
 
@@ -472,6 +473,35 @@ private:
       const metal_compute::SharedBuffer& txt_pos, int n_real,
       const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
       int gen_h, int gen_w, const std::vector<RefLatent>& refs,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- Z-Image -------------------------------------------------------
+  std::unique_ptr<genai::MetalZImageTransformer> _zi_dit;
+  std::string _zi_dit_dir;
+  bool _zi_stream = false;
+  // z-image-model-config's knobs. The DISTILLED Turbo checkpoint wants
+  // guidance 0 (no CFG at all) and ~8 steps; the undistilled base wants
+  // 3-5 and 28-50. They ship byte-identical transformer configs, so
+  // nothing can be inferred -- the default is Turbo's and a graph that
+  // loads the base model sets the key.
+  double _zi_guidance = 0.0;
+  // The reference's two CFG refinements, both off by default there.
+  // `cfg_normalization` clamps |pred| to that multiple of |pos|;
+  // `cfg_truncation` drops guidance once (1 - sigma) passes it.
+  double _zi_cfg_norm = 0.0;
+  double _zi_cfg_trunc = 1.0;
+  // The flow shift from the CHECKPOINT's own scheduler_config.json --
+  // 3.0 for Turbo and 6.0 for the undistilled base, and the one number
+  // that has to come off disk rather than from a default, because the
+  // two repos are otherwise identical and a graph with no
+  // scheduler-select stage would take neither.
+  double _zi_shift = 0.0;
+  bool load_z_image_dit_();
+  void free_z_image_dit_for_decode_(int gen_w, int gen_h);
+  std::vector<float> generate_z_image_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w,
       const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // The conditioning -> unpacked-latent forward: fuse the tapped text

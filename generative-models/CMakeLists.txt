@@ -85,6 +85,8 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen-image21-transformer.cc
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
+  z-image/z-image-layout.cc
+  z-image/metal-z-image-transformer.cc
   mage/metal-mage-vae.cc
   mage/mage-screen.cc
   mage/mage-screen-policy.cc
@@ -168,6 +170,8 @@ set(LOCAL_HEADERS
   qwen3/metal-qwen-vision.h
   qwen-image/qwen-image21-layout.h
   qwen-image/metal-qwen-image21-transformer.h
+  z-image/z-image-layout.h
+  z-image/metal-z-image-transformer.h
   llama3/metal-llama-model.h
   llama3/metal-llama-model-exec.h
   llama3/metal-llama-weights.h

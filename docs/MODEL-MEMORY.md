@@ -620,6 +620,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 |---|---|---|---|
 | FLUX.2 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Boogu | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
+| Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Krea-2 | `AutoencoderKLQwenImage`, `base_dim` ×27 | generate-image, vae-decode | exact |
 | Qwen-Image-Edit | `AutoencoderKLQwenImage`, `base_dim` ×27 | vae-decode | exact |
 | LTX-2.5 | rounded config geometry | vae-decode (family path) | exact |

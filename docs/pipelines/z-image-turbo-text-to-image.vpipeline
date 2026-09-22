@@ -1,0 +1,94 @@
+{
+  "id": "z-image-turbo-text-to-image",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Tongyi-MAI/Z-Image-Turbo"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A young Chinese woman in a red Hanfu with intricate embroidery, impeccable makeup and a red floral forehead pattern, an elaborate high bun with a golden phoenix headdress. She holds a round folding fan. Soft-lit outdoor night background, a silhouetted tiered pagoda, blurred colourful distant lights. Photorealistic, shallow depth of field."
+      }
+    },
+    {
+      "id": "z-image-model-config",
+      "type": "z-image-model-config",
+      "iports": [],
+      "config": {
+        "guidance_scale": 0.0
+      }
+    },
+    {
+      "id": "scheduler-select",
+      "type": "scheduler-select",
+      "iports": [],
+      "config": {
+        "steps": 8,
+        "shift": 3.0,
+        "type": "simple",
+        "shift_type": "linear"
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "z-image-model-config", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "scheduler-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "z-image-model-config", "oport": 0 }
+      ],
+      "config": {
+        "height": 1024,
+        "width": 1024,
+        "steps": 8,
+        "seed": 42
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "z-image-turbo.jpeg",
+        "quality": 95
+      }
+    }
+  ],
+  "subpipelines": []
+}

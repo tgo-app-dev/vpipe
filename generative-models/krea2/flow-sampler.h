@@ -223,6 +223,26 @@ private:
   int                             _uni_order     = 0;   // warmed-up order
 };
 
+// The flow-matching shift a diffusers checkpoint states in its OWN
+// `scheduler/scheduler_config.json`, given the model root. 0 when the
+// file is absent or says nothing, which a caller reads as "use the
+// family's default".
+//
+// Most families here can hardcode their schedule because it is a
+// property of the architecture. IT IS NOT ALWAYS: Z-Image ships two
+// checkpoints with byte-identical transformer configs that differ in
+// this number alone (3.0 distilled, 6.0 undistilled), so a graph with
+// no scheduler-select stage would take FlowSchedulerSpec's own 1.15
+// default -- which is neither, and produces a picture rather than an
+// error.
+//
+// `dynamic` reports `use_dynamic_shifting`: a checkpoint that says
+// true wants a per-image mu computed from the token count instead of
+// this constant, and a caller applying the constant anyway should at
+// least know.
+double flow_shift_from_config(const std::string& model_root,
+                              bool* dynamic = nullptr);
+
 }  // namespace genai
 }  // namespace vpipe
 
