@@ -19,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace vpipe;
 using namespace vpipe::genai::minimax_h3;
@@ -246,4 +247,57 @@ TEST(vdn_config, a_repo_root_says_which_stage_is_one_level_down)
   (void)vdn::load_config((root / "stage-dmd-step-250").string(), &c2, &err2);
   EXPECT_TRUE(err2.find("one level down") == std::string::npos);
   fs::remove_all(root, ec);
+}
+
+TEST(vdn_config, adapters_read_under_either_published_name)
+{
+  // OpenVDN RENAMED THE ADAPTER DESCRIPTION on 2026-09-09 --
+  // adapter_config.json became adapter_spec.json, bytes unchanged -- so
+  // a fresh download holds only the new name and one from before holds
+  // only the old. Reading one name alone lists NO adapters for the
+  // other checkout, which the released-stages test above reports only
+  // when the 9.6 GB happens to be on the box. Both must read, the new
+  // name must win where a checkout somehow has both, and a directory
+  // with neither must say what it looked for.
+  namespace fs = std::filesystem;
+  auto base = fs::temp_directory_path() / "vpipe-vdn-adapter-XXXXXX";
+  std::string tmpl = base.string();
+  if (::mkdtemp(tmpl.data()) == nullptr) { return; }
+  const fs::path stage(tmpl);
+  std::error_code ec;
+  auto spec = [](int rank) {
+    return R"({"type":"lora","version":1,"config":{"rank":)"
+           + std::to_string(rank)
+           + R"(,"alpha":64,"targets":["attn.orig.to_q"]}})";
+  };
+  auto write = [&](const char* adapter, const char* file, int rank) {
+    const fs::path d = stage / "adapters" / adapter;
+    fs::create_directories(d, ec);
+    std::ofstream o((d / file).string());
+    o << spec(rank);
+  };
+  write("current", "adapter_spec.json", 64);
+  write("legacy", "adapter_config.json", 32);
+  write("both", "adapter_config.json", 8);
+  write("both", "adapter_spec.json", 16);
+  fs::create_directories(stage / "adapters" / "empty", ec);
+
+  const std::vector<std::string> names = vdn::list_adapters(stage.string());
+  EXPECT_TRUE((names == std::vector<std::string>{"both", "current",
+                                                 "legacy"}));
+  vdn::Adapter a;
+  std::string err;
+  EXPECT_TRUE(vdn::load_adapter((stage / "adapters" / "current").string(),
+                                &a, &err));
+  EXPECT_TRUE(a.rank == 64);
+  EXPECT_TRUE(vdn::load_adapter((stage / "adapters" / "legacy").string(),
+                                &a, &err));
+  EXPECT_TRUE(a.rank == 32);
+  EXPECT_TRUE(vdn::load_adapter((stage / "adapters" / "both").string(),
+                                &a, &err));
+  EXPECT_TRUE(a.rank == 16);
+  EXPECT_FALSE(vdn::load_adapter((stage / "adapters" / "empty").string(),
+                                 &a, &err));
+  EXPECT_TRUE(err.find("adapter_spec.json") != std::string::npos);
+  fs::remove_all(stage, ec);
 }

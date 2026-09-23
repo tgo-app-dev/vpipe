@@ -156,6 +156,17 @@ struct PackedLayout {
   // conditioning exists only in `ref2va`.
   int num_condition_video_rows = 0;
   int num_condition_audio_rows = 0;
+
+  // Which builder made this layout. Nothing else in the struct answers
+  // it: a `ref2va` request of one image and an `fl2va` request of one
+  // keyframe agree on every count and both leave two `video_runs`, so
+  // the shapes are genuinely indistinguishable. What differs is what
+  // the conditioning rows MEAN, and the readers that have to say so out
+  // loud -- the VDN branch reports its keyframe count, and a reference
+  // has no frame count to report -- would otherwise have to guess from
+  // the partition, which is exactly the thing the Ref2VA-like mode
+  // decouples (references on FL2VA weights).
+  bool ref2va = false;
 };
 
 // One reference of a `ref2va` request, as the LAYOUT sees it: what

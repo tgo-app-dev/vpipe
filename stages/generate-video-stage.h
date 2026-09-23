@@ -224,12 +224,18 @@ public:
   // text-to-video, 1 for a first frame, 2 for first AND last. Sets
   // `*ignored` when a keyframe was wired and had to be dropped.
   //
+  // `have_references` is a property of the REQUEST rather than of the
+  // checkpoint, and it has to be: Ref2VA-like runs the reference layout
+  // on FL2VA weights, so a partition that takes keyframes can also be
+  // handed references, and the two layouts stay mutually exclusive.
+  //
   // Public and static for the reason VideoRefEncoderStage::
   // media_from_beat is: this is the part of the port contract that
-  // fails SILENTLY when it is wrong -- a Ref2VA graph takes no anchors
-  // at all, so a wired keyframe is read and goes nowhere -- and that
-  // deserves a test which needs neither a 33B model nor a runtime.
-  static int h3_anchor_count(bool is_ref2va, bool have_keyframe,
+  // fails SILENTLY when it is wrong -- a request with references takes
+  // no anchors at all, so a wired keyframe is read and goes nowhere --
+  // and that deserves a test which needs neither a 33B model nor a
+  // runtime.
+  static int h3_anchor_count(bool have_references, bool have_keyframe,
                              int ref_frames, bool* ignored);
 
   // How many `ref2va` reference rows a row beat carries: its row count,
@@ -407,10 +413,16 @@ private:
   ResolvedModel _resolved;
   bool _have_cfg    = false;
   bool _two_experts = false;
-  // Said ONCE: a keyframe anchor wired on a Ref2VA graph. A continuous
-  // graph makes one clip per beat, and the wiring cannot change between
-  // them, so repeating it per request would bury every other line.
+  // Said ONCE: a keyframe anchor wired alongside references. A
+  // continuous graph makes one clip per beat, and the wiring cannot
+  // change between them, so repeating it per request would bury every
+  // other line.
   bool _kf_on_ref2va_said = false;
+  // Said ONCE, for the same reason: references running on the FL2VA
+  // partition (upstream's Ref2VA-like mode), and a non-image reference
+  // inside one.
+  bool _ref2va_like_said = false;
+  bool _ref2va_like_media_said = false;
   // Said-once guard for the memory-gate arithmetic (allowance, supply,
   // margin). A denoise consults the gate on every block, and the figures
   // are a property of the box rather than of the forward.

@@ -17,6 +17,7 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 
 #include <algorithm>
 #include <cmath>
@@ -194,27 +195,52 @@ TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
 //
 // Checkable with every model pointer null: the per-reference work is all
 // guarded, so what is left is exactly the traversal and its reports.
-TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
+//
+// The bar is weighed in WORK, planned before anything runs. With no VAE
+// attached a reference weighs one frame of its canvas, and that makes the
+// plan checkable against what the loop then did: each reference's share
+// has to equal the canvas the fit record says it was resized to. That is
+// the property that matters -- the plan reads the same geometry rule as
+// the resize, and a copy of the rule would drift.
+TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
 {
   h3::ReferencePlan plan;
-  plan.target_frames = 39;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;            // the clip's own size
 
-  // Two stills, sized to what the loop checks (num_frames * 3 * h * w).
   std::vector<h3::MediaReference> refs;
-  for (int k = 0; k < 2; ++k) {
+  {
+    // A still that asks for 128 on its short edge.
     h3::MediaReference m;
     m.kind       = h3::MediaReference::Kind::kImage;
     m.num_frames = 1;
     m.height     = 64;
     m.width      = 64;
-    m.rgb.assign((std::size_t)3 * 64 * 64, (std::uint8_t)(40 * k + 10));
+    m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 10);
+    refs.push_back(std::move(m));
+  }
+  {
+    // A 30 fps clip, longer than the target once on the 24 fps grid.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 60;
+    m.height     = 96;
+    m.width      = 160;
+    m.fps        = 30.0;
+    m.rgb.assign((std::size_t)60 * 3 * 96 * 160, 20);
     refs.push_back(std::move(m));
   }
 
-  std::vector<std::pair<int, int>> seen;
+  struct Seen {
+    std::uint64_t done, total;
+    std::string detail;
+  };
+  std::vector<Seen> seen;
   h3::ReferenceEncoders models;          // every pointer null on purpose
-  models.progress = [&seen](int done, int total) {
-    seen.emplace_back(done, total);
+  models.progress = [&seen](std::uint64_t done, std::uint64_t total,
+                            const std::string& detail) {
+    seen.push_back({done, total, detail});
   };
 
   h3::EncodedReferences enc;
@@ -222,15 +248,91 @@ TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
   const bool ok = h3::encode_references(refs, "a prompt", plan, models,
                                         &enc, &err);
   std::printf("[minimax_h3_refenc] progress:");
-  for (const auto& p : seen) { std::printf(" %d/%d", p.first, p.second); }
+  for (const auto& p : seen) {
+    std::printf(" %llu/%llu '%s'", (unsigned long long)p.done,
+                (unsigned long long)p.total, p.detail.c_str());
+  }
   std::printf("%s%s\n", err.empty() ? "" : "  err: ", err.c_str());
   ASSERT_TRUE(ok);
-  ASSERT_TRUE(seen.size() == 3);
-  // One per reference, then the presentation -- and every report carries
-  // the SAME total, or a bar rescales itself mid-phase.
-  EXPECT_TRUE(seen[0] == std::make_pair(1, 3));
-  EXPECT_TRUE(seen[1] == std::make_pair(2, 3));
-  EXPECT_TRUE(seen[2] == std::make_pair(3, 3));
+  ASSERT_TRUE(enc.fits.size() == 2);
+  ASSERT_TRUE(!seen.empty());
+  if (!ok || enc.fits.size() != 2 || seen.empty()) { return; }
+
+  const std::uint64_t w0 =
+      (std::uint64_t)enc.fits[0].canvas_h * enc.fits[0].canvas_w;
+  const std::uint64_t w1 =
+      (std::uint64_t)enc.fits[1].canvas_h * enc.fits[1].canvas_w;
+  EXPECT_TRUE(w0 == 128u * 128u);        // the still's own short edge won
+  const std::uint64_t total = w0 + w1;
+
+  // ONE total for the whole request, never rescaled, and the bar never
+  // runs backwards. (No conditioner is attached, so no report here is
+  // the indeterminate one.)
+  std::uint64_t last = 0;
+  bool steady = true, forward = true;
+  for (const auto& p : seen) {
+    steady = steady && p.total == total;
+    forward = forward && p.done >= last;
+    last = p.done;
+  }
+  EXPECT_TRUE(steady);
+  EXPECT_TRUE(forward);
+  EXPECT_TRUE(seen.front().done == 0);
+  EXPECT_TRUE(seen.back().done == total && seen.back().detail == "done");
+
+  // Each reference's share is its planned work: the bar stands at w0
+  // when the second one starts, which is where the fit record says the
+  // first one's canvas put it.
+  bool second_started_at_w0 = false, named_phase = false;
+  for (const auto& p : seen) {
+    if (p.detail == "reference 2/2 (video)") {
+      second_started_at_w0 = p.done == w0;
+    }
+    if (p.detail == "reference 1/2 (image): done") {
+      EXPECT_TRUE(p.done == w0);
+    }
+    if (p.detail == "reference 2/2 (video): resize") { named_phase = true; }
+  }
+  EXPECT_TRUE(second_started_at_w0);
+  EXPECT_TRUE(named_phase);
+}
+
+// The plan's geometry IS the resize's: video_reference_geometry is what
+// normalize_video_reference asks, so the two agree on every input --
+// rate conversions that hold and drop, truncation, the never-upscale
+// short edge, the area cap.
+TEST(minimax_h3_refenc, planned_geometry_is_the_resize_geometry)
+{
+  struct Case {
+    int frames, h, w;
+    double fps;
+    int target, edge;
+    std::int64_t cap;
+  };
+  const Case cases[] = {
+      {60, 96, 160, 30.0, 39, 0, 768LL * 1344},    // drop to 24, truncate
+      {20, 96, 160, 12.0, 39, 0, 768LL * 1344},    // hold up to 24
+      {30, 90, 160, 24.0, 21, 128, 768LL * 1344},  // upscale to 128
+      {10, 720, 1280, 25.0, 39, 768, 256LL * 448}, // the cap binds
+  };
+  for (const Case& c : cases) {
+    std::vector<std::uint8_t> rgb((std::size_t)c.frames * 3 * c.h * c.w, 5);
+    std::vector<std::uint8_t> out;
+    int nf = 0, th = 0, tw = 0, pf = 0, ph = 0, pw = 0;
+    std::string e1, e2;
+    const bool a = h3::normalize_video_reference(
+        rgb.data(), c.frames, c.h, c.w, c.fps, c.target, 32, c.edge, c.cap,
+        &out, &nf, &th, &tw, h3::kFps, &e1);
+    const bool b = h3::video_reference_geometry(
+        c.frames, c.h, c.w, c.fps, c.target, 32, c.edge, c.cap, &pf, &ph,
+        &pw, h3::kFps, &e2);
+    std::printf("[minimax_h3_refenc] %dx%d %df@%.0f -> %dx%d %df "
+                "(planned %dx%d %df)\n", c.w, c.h, c.frames, c.fps, tw, th,
+                nf, pw, ph, pf);
+    EXPECT_TRUE(a && b);
+    EXPECT_TRUE(nf == pf && th == ph && tw == pw);
+    EXPECT_TRUE(out.size() == (std::size_t)nf * 3 * th * tw);
+  }
 }
 
 // The fit record: three temporal reductions counted APART, and the

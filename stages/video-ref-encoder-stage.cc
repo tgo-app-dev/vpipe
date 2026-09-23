@@ -87,7 +87,13 @@ const ConfigKey kAttrs[] = {
    .doc = "the MiniMax-H3 model dir (text_encoder/, video_vae/, audio_vae/). "
           "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-ref2va"},
+   // BOTH partitions, and FL2VA is not an oversight in the list.
+   // References are Ref2VA's trained task, but upstream's Ref2VA-like
+   // mode runs them on the FL2VA weights, and that graph wires this
+   // stage exactly the same way. Offering Ref2VA alone would hide the
+   // mode from the composer entirely -- the picker would filter out the
+   // only checkpoint it runs on.
+   .suggest_db_type = "minimax-h3-ref2va,minimax-h3-fl2va"},
   {.key = "frames", .type = ConfigType::Int, .required = false,
    .doc = "the GENERATED frame count at 24 fps, snapped up to the next "
           "17n+5. MUST MATCH the generate-video stage's `frames`: it is the "
@@ -97,9 +103,14 @@ const ConfigKey kAttrs[] = {
   {.key = "reference_image_short_edge", .type = ConfigType::Int,
    .required = false,
    .doc = "what an image reference's short edge is scaled to (2048 for the "
-          "released checkpoint). Unlike the target canvas this has NO area "
-          "cap and upscales a small picture -- an image reference is read at "
-          "high detail and never binds the generated geometry",
+          "released Ref2VA checkpoint). Unlike the target canvas this has NO "
+          "area cap and upscales a small picture -- an image reference is "
+          "read at high detail and never binds the generated geometry. LEFT "
+          "UNSET ON THE FL2VA PARTITION IT IS 768, not 2048: references on "
+          "FL2VA weights are upstream's Ref2VA-like mode, whose published "
+          "recipe is 768, and 2048 would be four times the tokens per "
+          "reference in a sequence the DiT re-reads every step. Setting it "
+          "is always taken as said",
    .def_int = 2048},
   {.key = "reference_image_max_pixels", .type = ConfigType::Int,
    .required = false,
@@ -240,7 +251,10 @@ const StageSpec kSpec = {
                "them, and each is decoded here so its frame rate and sample "
                "rate reach the model that resamples onto 24 fps. Pair it "
                "with a generate-video stage on the same hf_dir and the same "
-               "`frames`.",
+               "`frames`. EITHER PARTITION: references are Ref2VA's trained "
+               "task, and the FL2VA weights take them too as upstream's "
+               "Ref2VA-like mode -- images only there, and at a 768 short "
+               "edge rather than 2048.",
   .display_name = "Video Reference Encoder",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -376,6 +390,12 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   }
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
+  // Whether the graph SAID it, as opposed to taking the schema default.
+  // An absent key is "no opinion", and here the two published recipes
+  // hold different ones -- see ref_image_short_edge_().
+  _ref_short_edge_set =
+      this->config().is_object() &&
+      this->config().as_object().contains("reference_image_short_edge");
   _video_sample_fps = attr_real("video_sample_fps");
   _cond_noise_aug   = attr_real("condition_noise_aug");
   _max_prompt_tokens = attr_int("max_prompt_tokens");
@@ -635,6 +655,43 @@ VideoRefEncoderStage::initialize(RuntimeContext& ctx)
       ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
   if (!model_from_iport) { ensure_loaded_(); }
   co_return;
+}
+
+// See the declaration. Deliberately outside the Apple-Silicon guard
+// that wraps most of this file's model work: the rule is a property of
+// the two partitions' published recipes.
+int
+VideoRefEncoderStage::ref_image_short_edge(int configured,
+                                           bool configured_set,
+                                           const std::string& partition)
+{
+  // Upstream's Ref2VA-like recipe. Not a rounded-down default: it is the
+  // size the published example renders at, and the one the mode's own
+  // encoder defaults to.
+  constexpr int kRef2VaLikeShortEdge = 768;
+  if (configured_set || partition != "fl2va") { return configured; }
+  return kRef2VaLikeShortEdge;
+}
+
+// See the declaration.
+int
+VideoRefEncoderStage::ref_image_short_edge_()
+{
+  const int e =
+      ref_image_short_edge(_ref_short_edge, _ref_short_edge_set, _partition);
+  if (e != _ref_short_edge && !_ref_short_edge_said) {
+    _ref_short_edge_said = true;
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): FL2VA partition, so an image "
+        "reference that does not state its own size goes on a {}-pixel "
+        "short edge -- upstream's Ref2VA-like recipe, not the Ref2VA "
+        "checkpoint's {}, which is four times the tokens per reference in "
+        "a sequence the DiT re-reads every step. Set "
+        "`reference_image_short_edge` to say otherwise; a reference on a "
+        "tensor iport states its own and is unaffected",
+        this->id(), e, _ref_short_edge));
+  }
+  return e;
 }
 
 void
@@ -1450,7 +1507,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
 
   h3::ReferencePlan plan;
   plan.target_frames = h3::align_num_frames(_frames, 17, 5);
-  plan.reference_image_short_edge = _ref_short_edge;
+  plan.reference_image_short_edge = ref_image_short_edge_();
   plan.canvas_short_edge = _vid_short_edge;
   plan.canvas_max_pixels = (std::int64_t)_vid_max_pixels;
   plan.reference_image_max_pixels = (std::int64_t)_img_max_pixels;
@@ -1478,34 +1535,27 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // The phase the user actually waits through. The conditioner is loaded
   // and streamed, and every reference is read TWICE -- once by the vision
   // tower at its own canvas, once by the video VAE at MiniMax-H3's -- so
-  // on a memory-bounded box this is minutes. It reported to the debug log
-  // and nowhere else, which left a default run silent between "encoders
-  // ready" and the conditioning beat, over the longest stretch in the
-  // graph that is not the denoise.
+  // on a memory-bounded box this is minutes, nearly all of it the VAE.
   //
   // Opened BEFORE the encode rather than on the first report, which is
-  // the opposite of the lazy bars in the two VAE stages and for a reason
-  // particular to this one: the first report does not arrive until the
-  // first reference is FINISHED, so a lazy bar would still be invisible
-  // through exactly the stretch it exists to cover. The counts are set
-  // here too -- an un-updated handle reads as indeterminate, and the
-  // number of references is already known.
+  // the opposite of the lazy bars in the two VAE stages: the encoder
+  // plans the request and reports straight away, but a bar opened only
+  // then would still miss whatever ran before it. The encoder weighs
+  // the references by the VAE work each will cost and moves the bar per
+  // VAE tile, so a long clip no longer sits at one number for minutes;
+  // the detail names the reference and the phase. See
+  // ReferenceEncoders::progress.
   UiProgress bar = session()->open_progress("encoding references");
-  bar.update(0, (std::uint64_t)refs.size() + 1);
+  bar.update(0, 0, std::to_string(refs.size()) + " reference(s)");
   {
     auto* ui = session();
-    const std::string label = "encoding " + std::to_string(refs.size()) +
-                              " reference(s)";
-    // The debug line stays: a bar leaves nothing behind, and this phase
-    // is one people come back to a log about.
-    models.progress = [&bar, ui, label](int done, int total) {
-      bar.update(done < 0 ? 0 : (std::uint64_t)done,
-                 total < 0 ? 0 : (std::uint64_t)total);
-      ui->log_debug(fmt("{}: {}/{}", label, done, total));
+    models.progress = [&bar](std::uint64_t done, std::uint64_t total,
+                             const std::string& detail) {
+      bar.update(done, total, detail);
     };
-    // PER-PHASE timing, at NORMAL rather than debug: a reference encode
-    // is four models deep and the bar only moves once per reference, so
-    // a slow one is otherwise unattributable after the fact.
+    // PER-PHASE timing, at NORMAL: a bar leaves nothing behind, and this
+    // is a phase people come back to a log about. A reference encode is
+    // four models deep, so the line names each one's share.
     models.log = [ui](const std::string& line) {
       ui->log_normal(fmt("{}", line));
     };

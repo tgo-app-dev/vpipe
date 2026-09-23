@@ -33,6 +33,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [参考素材是怎么被读取的](#how-a-reference-is-read)
     - [不是文件的参考素材](#references-that-are-not-files)
     - [准备 Ref2VA 模型文件](#preparing-the-ref2va-checkpoint)
+    - [类 Ref2VA——在 FL2VA 权重上使用参考图](#ref2va-like--references-on-the-fl2va-weights)
   - [更长的片段——一个故事分四段](#longer-clips--one-story-in-four-parts)
     - [按顺序运行整条链](#running-the-chain)
     - [每一段如何取得它的引导片段](#how-a-part-takes-its-guide)
@@ -142,6 +143,9 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
   ——改用 **Ref2VA** 模式：输入参考图片、片段和音轨，输出 `.mp4`，每一项都会按你
   选择的尺寸预处理（见[以参考素材作为条件](#conditioning-on-references-ref2va)）。
+- **[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)**
+  ——在 **FL2VA** 权重上使用参考图，并挂上 VDN 分支和 Turbo LoRA，因此不需要第二个
+  66 GB 的 transformer（见[类 Ref2VA](#ref2va-like--references-on-the-fl2va-weights)）。
 - **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
   … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
   ——用四次运行生成一段 **33 秒**的片段：先是 FL2VA 文生视频，然后是三段 Ref2VA
@@ -153,8 +157,8 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
   ffmpeg。
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
-  ——获取 **VDN** 混合注意力分支，并用它运行文生视频。**只支持 FL2VA 模式，且只支持
-  文生视频**——没有关键帧，也没有参考素材——片段**越长、画幅越大**，它的价值越高
+  ——获取 **VDN** 混合注意力分支，并用它运行文生视频。**只支持 FL2VA 模式**——
+  文本或首/末关键帧都可以，参考素材不行——片段**越长、画幅越大**，它的价值越高
   （见[更快的注意力](#faster-attention--the-vdn-linear-branch)）。
 
 点开链接后用 **Raw ▸ Save as** 下载，或者直接从你克隆的仓库的 `docs/pipelines/`
@@ -441,6 +445,11 @@ MiniMax-H3 还发布了**第二个模型文件** `ref2va`，它不以关键帧�
 任何东西能把它们区分开**——vpipe 是从打包方式上读出来的。把 Ref2VA 模型文件
 当作 FL2VA 接线会被拒绝，而不是照跑：那样它会加载成功、以完整 33B 的代价
 去噪，然后生成一段不以任何东西为条件的视频。
+
+反过来那个方向则是一种真实存在的用法，而不是接错线：FL2VA 权重同样能经由这条
+序列接收参考图片，这就是下面的[类 Ref2VA](#ref2va-like--references-on-the-fl2va-weights)。
+先读本节——接线、限额以及一个参考是怎么被读取的，两者完全相同——再去读那一节，
+看有什么不一样。
 
 > **参考不是关键帧，Ref2VA 也无法钉住某一帧。** 两个模式打包的序列不同——
 > FL2VA 的是 `[text | keyframe conditions | target audio | target video]`，
@@ -822,6 +831,47 @@ transformer；51 GB 的提示词编码器和两个 VAE 在第 1 步之后已经�
 目录里放着**两个** transformer，它说不出你指的是哪一个。放任它去猜，它会挑
 FL2VA，而一个 Ref2VA 请求就会加载成功、以完整 33B 的代价运行，然后生成一段
 不以任何东西为条件的视频。
+
+<a id="ref2va-like--references-on-the-fl2va-weights"></a>
+#### 类 Ref2VA——在 FL2VA 权重上使用参考图
+
+第二个模型文件并不是非有不可。**FL2VA** 权重同样能接收参考图片，走的是
+Ref2VA 自己的那条序列，而不是关键帧。OpenVDN 在 2026-09-17
+[公布了这种用法](https://github.com/OpenVDN/vdn-minimax-h3#supporting-ref2va-like-task)
+并给出了渲染好的示例。vpipe 会运行它：照上面那样接一个 `video-ref-encoder`，
+再把 `model-select` 指向一份 FL2VA 模型文件，而不是 Ref2VA 的。
+
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)
+就是这张图，上面还挂了 [VDN 线性分支](#faster-attention--the-vdn-linear-branch)
+和 [Turbo LoRA](#fewer-steps--the-turbo-lora)——这正是上游渲染时用的组合，而这
+个组合正是靠这种用法才成为可能：**VDN 分支只在 FL2VA 上发布过**，所以在此之前，
+线性注意力和参考图没法同时拥有。
+
+**它到底是什么。** 权重什么都没变。参考图按 Ref2VA 的打包方式打包——
+`[text | 每个参考一个 block | 目标音频 | 目标视频]`，每个参考占一个旋转位置槽，
+各自保持在接近干净的噪声增强水平上——然后由 FL2VA 的 transformer 读取，而不是
+MiniMax-H3 那个独立的 `transformer_ref`。两个模式随附的 transformer 配置逐字节
+相同，所以这条序列两边都构建得出来；不同的只是由哪一份权重来读它。
+
+> **这是零样本能力，报告结果时请照实说。** 这是 FL2VA 模型文件碰巧具备的能力，
+> 而不是它训练过的任务。Ref2VA **就是**那个任务，权重也是为它训练的，当主体
+> 还原度才是重点时，它仍然是更好的答案。每一次用到这种用法，`generate-video`
+> 都会在日志里点明模式，因为它出问题的方式是：生成的片段悄悄忽略了参考图，
+> 而看上去完全正常。
+
+**和一张 Ref2VA 图相比有三处不同**，其中只有第一处需要你做什么：
+
+- **只用图片。** 上游这种用法针对的是参考*图片*。参考视频或音轨也能打包、也能
+  跑通——布局是同一套——但没有任何已发布结果覆盖它，所以 vpipe 会发出警告。
+  视频和音轨是 Ref2VA 模式上训练过的输入。
+- **短边 768，而不是 2048。** 这是上游的配方，vpipe 会自动采用：不设置时，
+  `reference_image_short_edge` 在 **FL2VA 上是 768**，在 Ref2VA 上是 2048。
+  它是每个参考四分之一的 token 数，而这些行处在 DiT **每一步**都要重读一遍的
+  序列里——所以这个差别不是一个随便放在哪儿都安全的保真度旋钮。一旦设置了这个
+  键，两个模式下都以设置为准。
+- **仍然不能用关键帧。** 参考图和关键帧锚点依然互斥，而这一点从来就与模式无关：
+  无论由哪份权重来读，参考布局里都没有放锚点的槽位。`generate-video` 会明确
+  指出这一点，而不是悄悄把锚点丢掉。
 
 <a id="longer-clips--one-story-in-four-parts"></a>
 ### 更长的片段——一个故事分成四部分
@@ -1562,29 +1612,34 @@ temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
 的片段正是密集注意力最糟、而这个设置最值得的地方。上表右侧那一列可以读作 544p
 下约 22 秒，**或者 768p 下大约一半的时长**——两种情况下行数相同。
 
-**只支持文生视频加音频——没有关键帧，没有参考图。** 这里有两条限制，而一个词就
-把两者都盖住了，所以它们很容易被混在一起。
+**文本和关键帧可以，参考图不行。** 这一句背后其实是两个不同的问题，答案也
+不同。
 
 *模式。* 已发布的两个 stage 都构建在 **FL2VA** 模式的 block 上，也没有可挂接的
-Ref2VA 分支，所以本节和[以参考图为条件](#conditioning-on-references-ref2va)是
-二选一，而不是可以搭配的一对。
+Ref2VA 分支，所以本节和 **Ref2VA 模型文件**是二选一，而不是可以搭配的一对。
+补上这个缺口的，是上游的**类 Ref2VA** 用法：改为经由 FL2VA 权重输入参考图——
+于是这个分支和参考图*可以*同时拥有，在 FL2VA 上。vpipe 会运行它，它是什么、
+不是什么见[类 Ref2VA](#ref2va-like--references-on-the-fl2va-weights)，把分支和
+参考图放在一张图里的例子见
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)。
+在 Ref2VA *模式*上挂这个分支，仍然是没有任何已发布配置覆盖的组合，
+`generate-video` 会在图这样要求时发出警告。
 
-*任务。* 在那个模式之内，这个分支的训练任务是**输入文本、输出视频和音频**——
-别的都不是。不是首帧，不是末帧，也不是参考图。这是分支本身的属性，而不是它下面
-那个 DiT 的：已发布分支自己的序列布局把视频描述为**一段连续不断**的行，而一个
-纯文本请求打包出来的正是这种形状；关键帧或参考图则会在它前面再加*第二段*条件
-行。
+*任务。* 这个分支的训练任务是**输入文本、输出视频和音频**。此后 OpenVDN 在
+**同一份检查点**上发布了首帧、末帧以及首末帧条件生成，权重本身没有变化。关键帧
+作为条件行打包在生成视频之前，保持在接近干净的噪声水平上，而混合注意力对待它们
+的方式和对待提示词、声轨一样：每一个生成行都在窗口之外精确地关注每一个关键帧，
+而线性那一半根本看不到它们。
 
-硬塞给它一个，它也会跑起来。vpipe 把那些条件行当作**全局**的来读：每一个生成行
-都在窗口之外精确地关注每一个关键帧，而线性那一半根本看不到它们。作为对锚定帧的
-一种解读，这说得过去——甚至可以说很宽厚——但这不是分支训练时所依据的解读，所以
-请把返回的结果当成一次实验，而不是模型在正常工作。`generate-video` 每个片段会
-就此提示一次。
+vpipe 对这些行的处理与此相同，所以[不只是文本输入](#more-than-text-in)一节里的
+图可以原样挂上分支：一个锚定帧对应开场帧，两个对应首帧和末帧。只给末帧是上游
+有、而这个图没有接上的唯一一种模式——`generate-video` 会忽略没有首帧的末帧锚定，
+并说明这一点。日志会针对每种几何尺寸记录一次关键帧的数量。
 
-这些都不会被拒绝。模式在 `model-select` 上选择，分支在
-`minimax-h3-model-config` 上选择，是两个不同的 stage，而无论你犯了哪个错误，
-回来的片段看起来都完全正常——所以如果你要用这个分支，就只配一条文本提示词，
-别的都不要。
+不过，模式不会替你检查。模式在 `model-select` 上选择，分支在
+`minimax-h3-model-config` 上选择，是两个不同的 stage；把分支挂到 Ref2VA 模式的
+block 上，回来的片段看起来仍然完全正常。发生这种情况时日志会给出警告，但不会
+拒绝——所以请确认 `model-select` 选的是 FL2VA。
 
 <a id="get-it-and-run-it"></a>
 #### 获取并运行

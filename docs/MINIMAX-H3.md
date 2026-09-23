@@ -35,6 +35,7 @@ arrives in **8–16 steps** instead of 30+.
     - [How a reference is read](#how-a-reference-is-read)
     - [References that are not files](#references-that-are-not-files)
     - [Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint)
+    - [Ref2VA-like — references on the FL2VA weights](#ref2va-like--references-on-the-fl2va-weights)
   - [Longer clips — one story in four parts](#longer-clips--one-story-in-four-parts)
     - [Running the chain](#running-the-chain)
     - [How a part takes its guide](#how-a-part-takes-its-guide)
@@ -153,6 +154,10 @@ you want to see the model work before spending the hours and the 115 GB.
   — the **Ref2VA** partition instead: reference images, clips and soundtracks
   in, `.mp4` out, each one prepared to a size you choose (see
   [Conditioning on references](#conditioning-on-references-ref2va)).
+- **[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)**
+  — reference images on the **FL2VA** weights, with the VDN branch and the
+  Turbo LoRA, so no second 66 GB transformer is needed (see
+  [Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights)).
 - **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
   … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
   — a **33-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
@@ -165,7 +170,7 @@ you want to see the model work before spending the hours and the 115 GB.
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
-  **FL2VA partition, and text-to-video only** — no keyframes, no references —
+  **FL2VA partition only** — text or first/last keyframes, not references —
   and worth more the longer the clip **and the larger the frame** (see
   [Faster attention](#faster-attention--the-vdn-linear-branch)).
 
@@ -496,6 +501,12 @@ transformer configs, so **nothing in the weights tells them apart** — vpipe
 reads it off the packaging. A Ref2VA checkpoint wired as if it were FL2VA is
 refused rather than run: it would load, denoise at full 33B cost, and generate
 video conditioned on nothing.
+
+The *other* direction is a real mode rather than a mistake: FL2VA weights will
+take reference images through this same sequence, which is what
+[Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights) below is. Read
+this section first — the wiring, the limits and how a reference is read are
+the same — and that one for what changes.
 
 > **A reference is not a keyframe, and Ref2VA cannot pin one.** The two
 > partitions pack different sequences — FL2VA's is
@@ -920,6 +931,56 @@ inspecting the directory — which matters because the directory holds **both**
 transformers and cannot say which one you meant. Left to guess it picks
 FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
 video conditioned on nothing.
+
+#### Ref2VA-like — references on the FL2VA weights
+
+You do not always need the second checkpoint. The **FL2VA** weights will take
+reference images too, through Ref2VA's own sequence rather than through
+keyframes, and OpenVDN [published that
+mode](https://github.com/OpenVDN/vdn-minimax-h3#supporting-ref2va-like-task)
+with a rendered example on 2026-09-17. vpipe runs it: wire a
+`video-ref-encoder` exactly as above and point `model-select` at an FL2VA
+checkpoint instead of a Ref2VA one.
+
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)
+is that graph, with the [VDN linear branch](#faster-attention--the-vdn-linear-branch)
+and the [Turbo LoRA](#fewer-steps--the-turbo-lora) on it — which is the
+combination upstream renders, and one this mode is what makes possible at
+all: **the VDN branch is only published for FL2VA**, so before it the linear
+attention and references could not be had together.
+
+**What it actually is.** Nothing about the weights changes. The references are
+packed as Ref2VA packs them — `[text | one block per reference | target audio
+| target video]`, one rotary slot each, every one held just short of clean at
+its noise-augmentation level — and read by the FL2VA transformer, not by
+MiniMax-H3's separate `transformer_ref`. The two partitions ship
+byte-identical transformer configs, so the sequence builds either way; what
+differs is only which weights read it.
+
+> **Zero-shot, and say so when you report a result.** This is an ability the
+> FL2VA checkpoint turns out to have, not a task it was trained for. Ref2VA
+> **is** that task, on weights trained for it, and remains the better answer
+> when subject fidelity is the point. `generate-video` names the mode in its
+> log every run that uses it, because the way this fails is a clip that
+> quietly ignores its references and looks entirely ordinary.
+
+**Three differences from a Ref2VA graph**, and only the first needs anything
+from you:
+
+- **Images only.** Upstream's mode is reference *images*. A reference clip or
+  soundtrack packs and runs — the layout is the same one — but nothing
+  published covers it, so vpipe warns. Clips and soundtracks are a trained
+  input on the Ref2VA partition.
+- **A 768 short edge, not 2048.** That is upstream's recipe and vpipe takes it
+  automatically: left unset, `reference_image_short_edge` is **768 on FL2VA**
+  and 2048 on Ref2VA. It is a quarter of the tokens per reference, and those
+  rows sit in the sequence the DiT re-reads at **every step** — so the
+  difference is not a fidelity knob you can leave anywhere safe. Setting the
+  key is always taken as said, on either partition.
+- **Still no keyframe.** References and a keyframe anchor remain mutually
+  exclusive, and that was never about the partition: there is no slot for an
+  anchor in the reference layout whichever weights read it.
+  `generate-video` says so rather than dropping the anchor quietly.
 
 ### Longer clips — one story in four parts
 
@@ -1755,32 +1816,42 @@ large size is where dense attention is worst and this is worth most. Read the
 right-hand column above as about 22 s at 544p **or roughly half that at
 768p** — the same rows either way.
 
-**Text to video and audio only — no keyframes, no references.** There are two
-limits here and one word covers both, so they are easy to run together.
+**Text and keyframes, not references.** Two different questions sit behind
+that line, and they have different answers.
 
 *The partition.* Both released stages are built on the **FL2VA** partition's
-blocks and there is no Ref2VA branch to attach, so this and
-[Conditioning on references](#conditioning-on-references-ref2va) are a choice
-between, not a pair.
+blocks and there is no Ref2VA branch to attach, so this and the **Ref2VA
+checkpoint** are a choice between, not a pair. What closes that gap is
+upstream's **Ref2VA-like** mode, which feeds reference images through the
+FL2VA weights — so the branch and references *can* be had together, on FL2VA.
+vpipe runs it; see
+[Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights) for what it is
+and what it is not, and
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)
+for the branch and references in one graph. The Ref2VA *partition* with this
+branch attached is still the pairing nothing published covers, and
+`generate-video` warns when a graph asks for it.
 
-*The task.* Within that partition the branch is trained on **text in, video
-and audio out** — and nothing else. Not a first frame, not a last frame, not
-a reference. This is a property of the branch, not of the DiT under it: the
-released branch's own sequence layout describes video as **one unbroken run**
-of rows, which is what a text-only request packs, while a keyframe or a
-reference adds a *second* run of conditioning rows before it.
+*The task.* The branch was trained on **text in, video and audio out**. Since
+then OpenVDN has published first-frame, last-frame and first-and-last
+conditioning on the **same checkpoints**, with the weights unchanged. The
+keyframes are packed as conditioning rows ahead of the generated video, held
+just short of clean, and the hybrid treats them the way it treats the prompt
+and the soundtrack: every generated row attends to each keyframe exactly,
+outside the window, and the linear half never sees them.
 
-Hand it one anyway and it runs. vpipe reads those conditioning rows as
-**global**: every generated row attends to each keyframe exactly, outside the
-window, and the linear half never sees them at all. That is a defensible
-reading of an anchor — arguably a generous one — but it is not the reading the
-branch was trained under, so treat what comes back as an experiment rather
-than as the model working. `generate-video` says so once per clip.
+vpipe gives those rows the same treatment, so the graphs in
+[More than text in](#more-than-text-in) take the branch as they are: one anchor
+for an opening frame, two for first and last. A last frame on its own is the one mode upstream has
+that this graph does not wire — `generate-video` ignores a last-frame anchor
+with no first, and says so. The log notes the keyframe count once per
+geometry.
 
-Nothing refuses any of this. The partition is chosen on `model-select` and the
-branch on `minimax-h3-model-config`, two different stages, and a clip comes
-back looking perfectly ordinary whichever mistake you made — so if you are
-using the branch, use it with a text prompt and nothing else.
+Nothing checks the partition for you, though. It is chosen on `model-select`
+and the branch on `minimax-h3-model-config`, two different stages, and a
+branch attached to the Ref2VA partition's blocks still returns an
+ordinary-looking clip. The log warns when that happens but nothing refuses
+it, so check that `model-select` names FL2VA.
 
 #### Get it and run it
 

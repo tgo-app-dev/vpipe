@@ -207,6 +207,75 @@ pack_condition_rows_raw_(const std::uint16_t* mp, int z,
   }
 }
 
+// How many of a normalized reference's `nf` frames the video VAE
+// encodes. A clip is snapped DOWN to `17n + 5` so it encodes without
+// padding -- which only bites when the reference is SHORTER than the
+// target, whose own count already has that form. The clamp is what
+// Python's slice does for a clip shorter than one chunk. A still is its
+// one frame.
+int
+vae_frames_(bool video, int nf, const MetalMiniMaxH3VideoVae::Config& vc)
+{
+  if (!video) { return nf; }
+  int use = nf;
+  const int fpc = vc.clip_length;
+  const int lpc = vc.tokens_per_chunk();
+  if (fpc > 0 && lpc > 0) {
+    use = std::max(1, (nf - lpc) / fpc) * fpc + lpc;
+    use = std::min(use, nf);
+  }
+  return use;
+}
+
+// What one reference will cost, in the unit ReferenceEncoders::progress
+// counts: pixel-frames through the video VAE, padded to whole clips as
+// encode_video pads them (`vae`), plus one frame of the canvas for the
+// resize, the tower and a soundtrack. Planned from the same geometry the
+// resize then uses, so the weights cannot drift from the work. A
+// reference with no VAE work -- a soundtrack, a carried latent -- or
+// whose geometry does not resolve weighs 1: it still moves the bar, and
+// a geometry that fails does so in the loop, where the message belongs.
+std::uint64_t
+reference_work_(const MediaReference& m, const ReferencePlan& plan,
+                const MetalMiniMaxH3VideoVae* video_vae, std::uint64_t* vae)
+{
+  *vae = 0;
+  if (m.kind == MediaReference::Kind::kAudio) { return 1; }
+  if (m.has_video_latent() && m.rgb.empty()) { return 1; }
+  int nf = 0, th = 0, tw = 0;
+  if (m.kind == MediaReference::Kind::kImage) {
+    const int edge = m.short_edge >= 0 ? m.short_edge
+                                       : plan.reference_image_short_edge;
+    if (!resolve_reference_image_size(m.height, m.width, edge,
+                                      plan.canvas_multiple,
+                                      plan.reference_image_max_pixels, &th,
+                                      &tw)) {
+      return 1;
+    }
+    nf = 1;
+  } else {
+    const int edge =
+        m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
+    if (!video_reference_geometry(m.num_frames, m.height, m.width, m.fps,
+                                  plan.target_frames, plan.canvas_multiple,
+                                  edge, plan.canvas_max_pixels, &nf, &th,
+                                  &tw, kFps)) {
+      return 1;
+    }
+  }
+  const std::uint64_t frame =
+      std::max<std::uint64_t>(1, (std::uint64_t)th * (std::uint64_t)tw);
+  if (video_vae != nullptr && !m.has_video_latent()) {
+    const auto& vc = video_vae->config();
+    const int use =
+        vae_frames_(m.kind == MediaReference::Kind::kVideo, nf, vc);
+    const int cl = std::max(1, vc.clip_length);
+    const int padded = use <= 1 ? 1 : (use + cl - 1) / cl * cl;
+    *vae = (std::uint64_t)padded * frame;
+  }
+  return frame + *vae;
+}
+
 }  // namespace
 
 bool
@@ -374,9 +443,38 @@ encode_references(const std::vector<MediaReference>& refs,
 
   const double max_seconds = (double)plan.target_frames / kFps;
 
+  // ---- progress, planned before anything runs --------------------------
+  // See ReferenceEncoders::progress for the unit. The whole request is
+  // weighed up front so the total never moves: a bar that rescales
+  // itself mid-run reads as progress going backwards.
+  const bool reporting = (bool)models.progress;
+  std::vector<std::uint64_t> work(refs.size(), 1), vae_work(refs.size(), 0);
+  std::uint64_t total_work = 0;
+  if (reporting) {
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      work[i] = reference_work_(refs[i], plan, models.video_vae,
+                                &vae_work[i]);
+      total_work += work[i];
+    }
+  }
+  std::uint64_t done_work = 0;      // the references already finished
+  auto report = [&](std::uint64_t done, const std::string& detail) {
+    if (reporting) {
+      models.progress(std::min(done, total_work), total_work, detail);
+    }
+  };
+
   for (std::size_t i = 0; i < refs.size(); ++i) {
     const MediaReference& m = refs[i];
     const std::string where = "reference " + std::to_string(i + 1);
+    const char* kind =
+        m.kind == MediaReference::Kind::kImage   ? "image"
+        : m.kind == MediaReference::Kind::kVideo ? "video"
+                                                 : "audio";
+    const std::string label = "reference " + std::to_string(i + 1) + "/" +
+                              std::to_string(refs.size()) + " (" + kind +
+                              ")";
+    report(done_work, label);
     Reference L;
     ReferenceFit fit;
     long long ms_audio = 0, ms_norm = 0, ms_vision = 0, ms_vae = 0;
@@ -412,6 +510,7 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<float> lat;
       int frames = 0;
       std::string aerr;
+      report(done_work, label + ": soundtrack");
       if (timing) { (void)tick(); }
       if (!models.audio_vae->encode(pcm.data(), 2, kept, &lat, &frames,
                                     &aerr)) {
@@ -489,6 +588,7 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<std::uint8_t> px;
       int nf = 0, th = 0, tw = 0;
       std::string nerr;
+      report(done_work, label + ": resize");
       if (timing) { (void)tick(); }
       // A reference's own short edge wins over the plan's. Negative
       // means it did not state one.
@@ -541,6 +641,7 @@ encode_references(const std::vector<MediaReference>& refs,
       // conditioning rows, all of it the clip's vision blocks (the still
       // is encoded at its own short edge and did not move).
       if (models.vision != nullptr) {
+        report(done_work, label + ": vision tower");
         if (timing) { (void)tick(); }
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
@@ -605,19 +706,8 @@ encode_references(const std::vector<MediaReference>& refs,
       } else if (models.video_vae != nullptr) {
         if (mc == nullptr) { return fail("the video VAE has no compute"); }
         const auto& vc = models.video_vae->config();
-        int use = nf;
-        if (m.kind == MediaReference::Kind::kVideo) {
-          // Snap DOWN to `17n + 5` so the VAE encodes without padding.
-          // Only bites when the reference is SHORTER than the target,
-          // whose own count already has that form. The clamp is what
-          // Python's slice does for a clip shorter than one chunk.
-          const int fpc = vc.clip_length;
-          const int lpc = vc.tokens_per_chunk();
-          if (fpc > 0 && lpc > 0) {
-            use = std::max(1, (nf - lpc) / fpc) * fpc + lpc;
-            use = std::min(use, nf);
-          }
-        }
+        const int use =
+            vae_frames_(m.kind == MediaReference::Kind::kVideo, nf, vc);
         fit.vae_frames = use;
         if (timing) { (void)tick(); }
         metal_compute::SharedBuffer in =
@@ -625,6 +715,29 @@ encode_references(const std::vector<MediaReference>& refs,
         if (in.empty()) { return fail(where + ": VAE input alloc failed"); }
         int lf = 0;
         std::string eerr;
+        // THE LONG STRETCH, so the bar moves per tile inside it: the
+        // reference's VAE share, in proportion to the tiles the VAE has
+        // finished. Cleared on every way out -- the VAE is the stage's,
+        // and a callback left on it would point at this frame.
+        struct TileProgressReset {
+          MetalMiniMaxH3VideoVae* vae;
+          ~TileProgressReset() { vae->set_tile_progress(nullptr); }
+        } tile_reset{models.video_vae};
+        if (reporting) {
+          const std::uint64_t at = done_work + (work[i] - vae_work[i]);
+          const std::uint64_t span = vae_work[i];
+          report(at, label + ": video VAE");
+          models.video_vae->set_tile_progress(
+              [&report, &label, at, span](int d, int t) {
+                const std::uint64_t part =
+                    t > 0 ? span * (std::uint64_t)std::max(d, 0) /
+                                (std::uint64_t)t
+                          : 0;
+                report(at + part, label + ": video VAE tile " +
+                                      std::to_string(d) + "/" +
+                                      std::to_string(t));
+              });
+        }
         metal_compute::SharedBuffer mom =
             models.video_vae->encode_video(in, use, th, tw, &lf, &eerr);
         if (mom.empty() || lf <= 0) {
@@ -654,12 +767,8 @@ encode_references(const std::vector<MediaReference>& refs,
     }
 
     if (timing) {
-      const std::string k =
-          m.kind == MediaReference::Kind::kImage   ? "image"
-          : m.kind == MediaReference::Kind::kVideo ? "video"
-                                                   : "audio";
       models.log(
-          "[h3-refenc] " + where + " (" + k + " " +
+          "[h3-refenc] " + where + " (" + kind + " " +
           std::to_string(m.num_frames) + "f " + std::to_string(m.width) + "x" +
           std::to_string(m.height) + " -> " + std::to_string(fit.used_frames) +
           "f " + std::to_string(fit.canvas_w) + "x" +
@@ -680,11 +789,8 @@ encode_references(const std::vector<MediaReference>& refs,
                  : Reference::Kind::kAudio;
     r.layout.push_back(L);
     r.fits.push_back(fit);
-    if (models.progress) {
-      // +1: the presentation below is a step of its own. See the
-      // declaration of ReferenceEncoders::progress.
-      models.progress((int)i + 1, (int)refs.size() + 1);
-    }
+    done_work += work[i];
+    report(done_work, label + ": done");
   }
 
   // ---- the presentation ------------------------------------------------
@@ -709,6 +815,11 @@ encode_references(const std::vector<MediaReference>& refs,
       pres.push_back(std::move(p));
     }
     std::string cerr;
+    // Indeterminate: see ReferenceEncoders::progress.
+    if (reporting) {
+      models.progress(0, 0, "conditioner, " + std::to_string(refs.size()) +
+                                " reference(s)");
+    }
     if (timing) { (void)tick(); }
     r.conditioning = models.text->encode_references(pres, prompt,
                                                     &r.token_tags,
@@ -723,12 +834,10 @@ encode_references(const std::vector<MediaReference>& refs,
     }
   }
 
-  // The presentation is done -- reported here rather than inside the
+  // The request is done -- reported here rather than inside the
   // `models.text` branch above, because reaching this line is what makes
-  // the request finished whether or not a conditioner was attached.
-  if (models.progress) {
-    models.progress((int)refs.size() + 1, (int)refs.size() + 1);
-  }
+  // it finished whether or not a conditioner was attached.
+  report(total_work, "done");
 
   *out = std::move(r);
   return true;

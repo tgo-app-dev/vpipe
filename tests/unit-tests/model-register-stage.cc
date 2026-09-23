@@ -720,9 +720,9 @@ TEST(model_registry, a_pinned_subtree_resolves_to_the_subtree)
   const std::string dmd = resolved_subtree_dir(rm({
       "stage-dmd-step-250/linear_branch/config.json",
       "stage-dmd-step-250/linear_branch/model.safetensors",
-      "stage-dmd-step-250/adapters/default/adapter_config.json",
+      "stage-dmd-step-250/adapters/default/adapter_spec.json",
       "stage-dmd-step-250/adapters/default/adapter_model.safetensors",
-      "stage-dmd-step-250/adapters/turbo/adapter_config.json",
+      "stage-dmd-step-250/adapters/turbo/adapter_spec.json",
       "stage-dmd-step-250/adapters/turbo/adapter_model.safetensors",
       "stage-dmd-step-250/model_spec.json",
       "stage-dmd-step-250/metadata.json"}));

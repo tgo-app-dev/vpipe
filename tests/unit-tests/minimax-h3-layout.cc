@@ -820,6 +820,64 @@ TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
       h3::kAudioChannels, &L));
 }
 
+// A one-image reference request and a one-keyframe request can agree on
+// EVERY count in the struct, so nothing downstream could tell them apart
+// until the layout said which builder made it.
+//
+// That stopped being an academic distinction with the Ref2VA-like mode:
+// references now run on FL2VA weights, so the partition no longer
+// answers it either. The reader that cares is the VDN branch, which
+// reports its conditioning rows as a keyframe COUNT -- rows divided by
+// the target's rows-per-frame. A reference carries its own geometry and
+// has no frame count, so on a reference request that division prints a
+// number that means nothing, and it prints it as an INFO line nobody
+// would think to check.
+TEST(minimax_h3_layout, the_layout_says_which_builder_made_it)
+{
+  using Ref  = h3::Reference;
+  using Kind = h3::Reference::Kind;
+  const std::vector<int> tags(16, 1);
+
+  // One keyframe over a 32x56 target...
+  h3::PackedLayout kf;
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 7, 32, 56, 37, 2, 2,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kFirst}, &kf));
+  // ...and one image reference encoded at that same 32x56. Both are one
+  // conditioning frame's worth of rows at one geometry.
+  h3::PackedLayout rf;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kImage, 1, 32, 56, 0}}, 7, 32, 56, 37, 2, 2,
+      h3::kAudioChannels, &rf));
+
+  // The counts that a reader could try to discriminate on: identical.
+  EXPECT_TRUE(kf.seq_len == rf.seq_len);
+  EXPECT_TRUE(kf.num_condition_rows == rf.num_condition_rows);
+  EXPECT_TRUE(kf.num_condition_video_rows == rf.num_condition_video_rows);
+  EXPECT_TRUE(kf.num_condition_audio_rows == rf.num_condition_audio_rows);
+  EXPECT_TRUE(kf.condition_start == rf.condition_start);
+  EXPECT_TRUE(kf.video_start == rf.video_start);
+  EXPECT_TRUE(kf.num_video_rows == rf.num_video_rows);
+  EXPECT_TRUE(kf.video_runs.size() == rf.video_runs.size());
+  EXPECT_TRUE(kf.video_indices == rf.video_indices);
+  EXPECT_TRUE(kf.audio_indices == rf.audio_indices);
+  EXPECT_TRUE(kf.num_condition_rows > 0);   // or the whole case is empty
+
+  // The one field that separates them.
+  EXPECT_FALSE(kf.ref2va);
+  EXPECT_TRUE(rf.ref2va);
+
+  // And it is set by the BUILDER, not left over: a t2va layout built
+  // into a struct a ref2va request just used comes back false.
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 7, 32, 56, 37, 2, 2,
+                                        h3::kAudioChannels, {}, &rf));
+  EXPECT_FALSE(rf.ref2va);
+
+  std::printf("[minimax_h3_layout] one keyframe and one same-size image "
+              "reference agree on every count (%d rows); only .ref2va "
+              "separates them\n", kf.num_condition_rows);
+}
+
 TEST(minimax_h3_layout, ref2va_row_timesteps)
 {
   using Ref  = h3::Reference;

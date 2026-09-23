@@ -6,7 +6,8 @@
 // A stage directory holds `model_spec.json` (the whole recipe: the base
 // it derives from, the hybrid-attention transform, and the adapters),
 // `linear_branch/{config.json,model.safetensors}` and
-// `adapters/<name>/{adapter_config.json,adapter_model.safetensors}`.
+// `adapters/<name>/{adapter_spec.json,adapter_model.safetensors}`
+// (`adapter_config.json` in checkouts made before OpenVDN renamed it).
 // The transform block in model_spec.json and linear_branch/config.json
 // carry the SAME object, so either file answers the question.
 //

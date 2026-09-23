@@ -315,7 +315,30 @@ public:
   // `n` is the 1-based port number, for the message. False with the
   // reason already warned.
   bool conform_audio_rate(genai::minimax_h3::MediaReference* m, int n);
+
 #endif
+
+  // The short edge an IMAGE reference is put on: `configured` when the
+  // graph said so, else the resident partition's published recipe.
+  //
+  // 2048 is MiniMaxH3Ref2VASetupStep's rule and belongs to the Ref2VA
+  // checkpoint, which was TRAINED on references. Upstream's Ref2VA-like
+  // mode runs references through the FL2VA weights instead and replaced
+  // that 2048 with 768; it is the only size anything published renders
+  // the mode at, and 2048 would be four times the tokens per reference
+  // in a sequence the DiT re-reads at every step.
+  //
+  // Static and OUTSIDE the Apple-Silicon guard for h3_anchor_count's
+  // reason: the rule is a property of the two partitions' recipes, not
+  // of the backend that runs them. Getting it wrong costs a graph four
+  // times its reference rows and still produces an entirely ordinary
+  // clip, so it is the half that fails silently, and it deserves a test
+  // needing neither a model nor a runtime. An unrecognised or empty
+  // partition keeps `configured` -- this is not the place to guess
+  // which checkpoint is resident.
+  static int ref_image_short_edge(int configured, bool configured_set,
+                                  const std::string& partition);
+
 
 private:
   std::string   _hf_dir;
@@ -326,6 +349,13 @@ private:
   std::vector<std::string> _references;
   int           _frames = 121;
   int           _ref_short_edge = 2048;
+  // Whether the GRAPH set the short edge, as distinct from inheriting
+  // the schema default. The two published recipes disagree -- 2048 is
+  // the Ref2VA checkpoint's rule, 768 is what upstream renders the
+  // Ref2VA-like mode at -- so an unset key follows the resident
+  // partition rather than one of them. See ref_image_short_edge_().
+  bool          _ref_short_edge_set = false;
+  bool          _ref_short_edge_said = false;
   // The video-reference canvas. 0 short edge = the clip's own, which is
   // how a graph declines an upscale (see normalize_video_reference).
   int           _vid_short_edge = 768;
@@ -362,6 +392,10 @@ private:
   // Resolve _hf_dir + load the four models (idempotent: the
   // _load_attempted guard runs the body at most once). Called from
   // initialize() (config model) or the first process() (model iport).
+  // ref_image_short_edge() for this stage's own config, saying once
+  // when the partition moved it. Non-const for that reason alone.
+  int ref_image_short_edge_();
+
   void ensure_loaded_();
   bool load_models_(metal_compute::MetalCompute* mc);
 

@@ -264,16 +264,29 @@ struct ReferenceEncoders {
   MetalMiniMaxH3AudioVae* audio_vae = nullptr;
   MiniMaxH3TextEncoder*   text      = nullptr;
 
-  // Called as each reference is finished, and once more when the
-  // presentation is built. Optional.
+  // Progress through the request, for a bar: `done` of `total` WORK
+  // UNITS, and a line saying what is running. Optional.
   //
-  // `total` is therefore refs.size() + 1, not refs.size(): the
-  // presentation is ONE conditioner call over the whole request, made
-  // AFTER the last reference has reported, so a total that stopped at
-  // the references would reach 100% and then leave the caller waiting at
-  // it. Counting it keeps that last stretch legible as unfinished work
-  // rather than as a hang.
-  std::function<void(int done, int total)> progress;
+  // THE UNIT IS WHAT THE VIDEO VAE WILL COST, because that is where the
+  // time goes: MEASURED at 96% of a reference encode, ~1.8 s per frame
+  // at 896x512, with the resize, the tower and the audio VAE in
+  // milliseconds beside it. So a reference weighs the pixel-frames its
+  // VAE encode will run -- planned before anything runs, from the same
+  // geometry the resize uses -- plus one frame of its canvas for the
+  // rest, and inside it the bar moves per VAE TILE. Counting whole
+  // references gave nine stills 90% of the bar and left one clip to
+  // spend minutes in the last tenth of it with nothing moving.
+  //
+  // The CONDITIONER is the exception. It is one call over the whole
+  // request, made after the last reference, and its cost cannot be
+  // weighed against the VAE's from here -- it depends on the tokens the
+  // tower produced and on whether the backbone streams -- so it reports
+  // `total == 0`: INDETERMINATE, which a bar draws as motion. Neither a
+  // guessed share nor a bar parked at 100% while it runs. A final
+  // `done == total` report closes the request.
+  std::function<void(std::uint64_t done, std::uint64_t total,
+                     const std::string& detail)>
+      progress;
 
   // Per-PHASE timing, one line per reference plus one for the
   // presentation. Optional; nothing is measured when it is unset.

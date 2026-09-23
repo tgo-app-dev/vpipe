@@ -276,6 +276,7 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   }
   L.num_condition_video_rows = num_cond;
   L.num_condition_audio_rows = 0;
+  L.ref2va                   = false;
 
   *out = std::move(L);
   return true;
@@ -505,6 +506,7 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
 
   L.num_condition_video_rows = num_ref_video;
   L.num_condition_audio_rows = num_ref_audio;
+  L.ref2va                   = true;
 
   *out = std::move(L);
   return true;

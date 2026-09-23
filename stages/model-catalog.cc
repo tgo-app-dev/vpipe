@@ -1576,6 +1576,15 @@ builtin_catalog_()
     // Wired through the `linear_branch` key on the
     // `minimax-h3-model-config` source, not through a LoRA slot: it is
     // a checkpoint beside the DiT, not a correction to it.
+    //
+    // Pinned against the repo at 50744d80 (2026-09-19). Since the
+    // first release it has grown an `h3-base/` (the full 72 GB
+    // MiniMax-H3 diffusers release) and per-stage `diffusers/` remote
+    // code; neither is pinned, because the branch attaches to whichever
+    // H3 DiT the graph already loads. `adapter_spec.json` was
+    // `adapter_config.json` until 2026-09-09, with identical bytes --
+    // vdn::load_adapter() reads either -- and every safetensors is
+    // unchanged, so a download from before the rename stays valid.
     {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "VDN",
      .variant = "VDN hybrid attention, stage-B 50-step (OpenVDN)",
      .hf_path = "OpenVDN/vdn-minimax-h3",
@@ -1583,7 +1592,7 @@ builtin_catalog_()
      .parent_model_type = "minimax-h3-fl2va",
      .files = {"stage-b-step-2000/linear_branch/config.json",
                "stage-b-step-2000/linear_branch/model.safetensors",
-               "stage-b-step-2000/adapters/default/adapter_config.json",
+               "stage-b-step-2000/adapters/default/adapter_spec.json",
                "stage-b-step-2000/adapters/default/adapter_model.safetensors",
                "stage-b-step-2000/model_spec.json",
                "stage-b-step-2000/metadata.json"},
@@ -1596,10 +1605,10 @@ builtin_catalog_()
      .parent_model_type = "minimax-h3-fl2va",
      .files = {"stage-dmd-step-250/linear_branch/config.json",
                "stage-dmd-step-250/linear_branch/model.safetensors",
-               "stage-dmd-step-250/adapters/default/adapter_config.json",
+               "stage-dmd-step-250/adapters/default/adapter_spec.json",
                "stage-dmd-step-250/adapters/default/"
                "adapter_model.safetensors",
-               "stage-dmd-step-250/adapters/turbo/adapter_config.json",
+               "stage-dmd-step-250/adapters/turbo/adapter_spec.json",
                "stage-dmd-step-250/adapters/turbo/adapter_model.safetensors",
                "stage-dmd-step-250/model_spec.json",
                "stage-dmd-step-250/metadata.json"},

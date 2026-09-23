@@ -317,10 +317,14 @@ class MetalMiniMaxH3VideoVae {
 
   const Config& config() const { return _cfg; }
 
-  // Per-TILE progress out of decode_video / decode_tiled_. A 960x544
-  // clip is ~15 tiles per chunk of a 2.4B ViT -- around a minute during
-  // which nothing else this class does is observable -- so without it a
-  // caller can only report the decode as one indivisible step.
+  // Per-TILE progress out of decode_video / decode_tiled_, and out of
+  // encode_video / encode_tiled_ the same way. A 960x544 clip is ~15
+  // tiles per chunk of a 2.4B ViT -- around a minute during which
+  // nothing else this class does is observable -- so without it a
+  // caller can only report the decode as one indivisible step. The
+  // encode is the same shape and as long: MEASURED ~1.8 s per frame at
+  // 896x512, so a 90-frame reference is two and a half silent minutes.
+  // encode_video reports against clips x tiles for the whole clip.
   //
   // Fires on the encode thread between tiles; must be cheap and must not
   // re-enter the decoder. See VaeTileProgressFn for the counting rule.

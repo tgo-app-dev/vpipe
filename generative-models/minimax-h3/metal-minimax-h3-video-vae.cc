@@ -1952,7 +1952,18 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
   const auto xs = minimax_h3::split_tiles(W, c.tile_size, c.tile_overlap_min,
                                           c.patch);
   if (ys.start.size() <= 1 && xs.start.size() <= 1) {
-    return encode(x, T, H, W, err);
+    // One tile is still a unit of work, so it ticks -- for the same
+    // reason decode_tiled_'s untiled path does.
+    if (_prog_total <= 0) { _prog_total = 1; _prog_done = 0; }
+    if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    SharedBuffer one = encode(x, T, H, W, err);
+    if (!one.empty()) { ++_prog_done; }
+    if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    return one;
+  }
+  if (_prog_total <= 0) {
+    _prog_total = (int)(ys.start.size() * xs.start.size());
+    _prog_done  = 0;
   }
   const int IC = c.in_channels;
   const std::size_t plane = (std::size_t)H * W;
@@ -1981,8 +1992,11 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
           }
         }
       }
+      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
       SharedBuffer enc = encode(sub, T, th, tw, err);
       if (enc.empty()) { return {}; }
+      ++_prog_done;
+      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
       tiles.push_back(std::move(enc));
     }
   }
@@ -2151,6 +2165,29 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
   };
   const Config& c = _cfg;
   if (T <= 0) { return fail("empty video"); }
+  // The counters belong to THIS call. Left set, a later bare
+  // encode_tiled_ / decode_tiled_ would report against this clip's total
+  // rather than its own, which reads as a bar that starts part-full.
+  struct ProgReset {
+    int& done;
+    int& total;
+    ~ProgReset() { done = 0; total = 0; }
+  } prog_reset{_prog_done, _prog_total};
+  // One bar for the WHOLE clip (clips x tiles), as decode_video does: a
+  // clip boundary is invisible to whoever is watching. The tiling is the
+  // same for every clip -- they all have the same extent.
+  {
+    const auto ys0 = minimax_h3::split_tiles(H, c.tile_size,
+                                             c.tile_overlap_min, c.patch);
+    const auto xs0 = minimax_h3::split_tiles(W, c.tile_size,
+                                             c.tile_overlap_min, c.patch);
+    const int tiles =
+        std::max(1, (int)(ys0.start.size() * xs0.start.size()));
+    const int cl0 = std::max(1, c.clip_length);
+    const int calls = T == 1 ? 1 : (T + cl0 - 1) / cl0;
+    _prog_total = calls * tiles;
+    _prog_done  = 0;
+  }
   if (T == 1) {
     SharedBuffer out = encode_tiled_(x, 1, H, W, err);
     if (!out.empty() && latent_frames != nullptr) { *latent_frames = 1; }
@@ -2217,6 +2254,13 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
     return {};
   };
   const Config& c = _cfg;
+  // See encode_video: the tile counters are this call's, and must not
+  // outlive it into a later decode_image.
+  struct ProgReset {
+    int& done;
+    int& total;
+    ~ProgReset() { done = 0; total = 0; }
+  } prog_reset{_prog_done, _prog_total};
   const int tcs = c.tokens_per_chunk();
   if (LT <= 0 || lh <= 0 || lw <= 0 || tcs <= 0) {
     return fail("empty latent video");

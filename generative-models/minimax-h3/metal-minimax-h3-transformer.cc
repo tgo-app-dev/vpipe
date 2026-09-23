@@ -1497,7 +1497,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     //
     // SCALE: none of the three VDN adapters carries a `__metadata__`
     // alpha or a per-module `.alpha` tensor -- their alphas live only in
-    // adapter_config.json, which nothing here reads -- so every module
+    // adapter_spec.json, which nothing here reads -- so every module
     // takes the mul = 1.0 fallback. That is EXACTLY right for these
     // files and by arithmetic rather than by design: alpha equals rank
     // throughout (64/64 for the two `default` adapters, and 64/64 plus
@@ -4773,32 +4773,54 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     // correct, and indistinguishable from the outside -- so without a
     // report a short clip looks like a VDN generation and is not one.
     // Once per geometry, not per forward.
-    // A KEYFRAME ANCHOR IS OUTSIDE THE WINDOW, and the released weights
-    // never saw one. VDN is a t2va model: its layout builder refuses a
-    // video block that is not contiguous, and H3's fl2va packs video as
-    // two runs -- the conditioning block and the target. Both places the
-    // reference builds a sequence, training and rendering, pass
-    // keyframe_anchors=() explicitly.
+    // A KEYFRAME ANCHOR IS OUTSIDE THE WINDOW, and that is the layout
+    // upstream runs it in. The branch was trained text-to-video, and
+    // OpenVDN has since published first-frame, last-frame and
+    // first-and-last conditioning on the SAME checkpoints (2026-09-08):
+    // the keyframes are packed ahead of the generated video, held at
+    // t = 0.999, and treated like the prompt and the soundtrack --
+    // dense both ways in the window softmax and absent from the linear
+    // scan. That is what falls out here too: the conditioning rows sit
+    // below video_start, so the mask keeps them GLOBAL, and the branch,
+    // sized from num_video_rows, never sees them. So it is reported,
+    // not warned about.
     //
-    // What happens here follows from the packed order and is coherent:
-    // the conditioning rows sit below video_start, so the mask keeps
-    // them GLOBAL -- every generated row attends to every keyframe
-    // exactly -- and the linear branch, sized from num_video_rows, never
-    // sees them. Same for a ref2va reference, which is packed the same
-    // way. It is not refused, because it is a reasonable reading of an
-    // anchor and the graph may well want it; it is SAID, because it is
-    // the weights being used outside what they were trained on and the
-    // output is a perfectly plausible video either way.
+    // A REFERENCE is the same GEOMETRY and a different claim. Upstream's
+    // "Ref2VA-like" mode (2026-09-17) packs references through the FL2VA
+    // weights and renders with them, so on this partition the pairing is
+    // published and reported. On the Ref2VA partition the branch would
+    // be attached to blocks it was not trained with, which nothing
+    // published does -- that one still warns.
+    //
+    // Which of the two this is comes off the LAYOUT, not off the
+    // partition, and that distinction is the whole point of the mode:
+    // references now run on FL2VA weights, so the partition no longer
+    // says what the conditioning rows are. It also keeps the wording
+    // honest -- a reference has no frame count, since each one carries
+    // its own geometry, so dividing the rows by the target's rows-per-
+    // frame would print a number that means nothing.
     if (_mc->session() != nullptr && L.num_condition_rows > 0) {
-      _mc->session()->warn(fmt(
-          "MetalMiniMaxH3Transformer: VDN is a t2va model and this "
-          "request carries {} conditioning rows ({} keyframe {}). They "
-          "are attended DENSELY, outside the window, and the linear "
-          "branch does not see them -- coherent, but a layout the "
-          "released branch was not trained on",
-          L.num_condition_rows,
-          tpf > 0 ? L.num_condition_rows / tpf : 0,
-          (tpf > 0 && L.num_condition_rows / tpf == 1) ? "frame" : "frames"));
+      if (L.ref2va && _cfg.partition == "ref2va") {
+        _mc->session()->warn(fmt(
+            "MetalMiniMaxH3Transformer: VDN's branch is trained on the "
+            "FL2VA partition's blocks and this is Ref2VA; its {} reference "
+            "rows are attended densely, outside the window, and the linear "
+            "branch does not see them -- no published configuration pairs "
+            "the two", L.num_condition_rows));
+      } else if (L.ref2va) {
+        _mc->session()->info(fmt(
+            "MetalMiniMaxH3Transformer: VDN with {} reference rows "
+            "(Ref2VA-like on the FL2VA partition), attended densely "
+            "outside the window and skipped by the linear branch, as "
+            "upstream conditions on them", L.num_condition_rows));
+      } else {
+        const int kf = tpf > 0 ? L.num_condition_rows / tpf : 0;
+        _mc->session()->info(fmt(
+            "MetalMiniMaxH3Transformer: VDN with {} keyframe {} ({} "
+            "conditioning rows), attended densely outside the window and "
+            "skipped by the linear branch, as upstream conditions on them",
+            kf, kf == 1 ? "frame" : "frames", L.num_condition_rows));
+      }
     }
     if (_mc->session() != nullptr && _vdn_kb_dense > 0) {
       _mc->session()->info(fmt(

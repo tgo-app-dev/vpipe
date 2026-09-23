@@ -45,6 +45,8 @@
 #include "common/media-decode.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 
 #include <algorithm>
 #include <chrono>
@@ -467,6 +469,158 @@ TEST(minimax_h3_vvae, encode_decode_round_trip)
 // two agreeing rather than image quality at that tile size.
 //
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, VPIPE_MINIMAX_H3_VVAE_VIDEO_GOLDEN.
+// THE ENCODE TICKS PER TILE, as the decode always has. A reference encode
+// is ~1.8 s per frame at 896x512, and before this the bar above it moved
+// once per REFERENCE -- minutes of one number for a long clip.
+//
+// Three things are pinned. The VAE's own count spans the whole clip
+// (clips x tiles, one total, reaching it). Its counters are the CALL's:
+// a second encode starts again from 0 against its own total, where a
+// counter left set would report against the first clip's. And the
+// reference encoder turns those ticks into a bar that moves INSIDE the
+// reference, landing exactly on the share it planned for it.
+//
+// Geometry chosen to clear the tiling floor: 256x512 is two tiles or
+// more across at the 256 tile, and 18 frames is two clips of 17.
+TEST(minimax_h3_vvae, encode_reports_progress_per_tile)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  const int T = 18, H = 256, W = 512, IC = cfg.in_channels;
+  const int tiles =
+      (int)(minimax_h3::split_tiles(H, cfg.tile_size, cfg.tile_overlap_min,
+                                    cfg.patch).start.size() *
+            minimax_h3::split_tiles(W, cfg.tile_size, cfg.tile_overlap_min,
+                                    cfg.patch).start.size());
+  const int clips = (T + cfg.clip_length - 1) / cfg.clip_length;
+  std::printf("[minimax_h3_vvae] encode %dx%dx%d: %d clips x %d tiles\n",
+              T, W, H, clips, tiles);
+  EXPECT_TRUE(tiles >= 2 && clips == 2);
+
+  auto run = [&](int frames, std::vector<std::pair<int, int>>* seen) {
+    const std::size_t n = (std::size_t)IC * frames * H * W;
+    SharedBuffer xb = mc->make_shared_buffer(n * 2);
+    if (xb.empty()) { return false; }
+    auto* d = static_cast<std::uint16_t*>(xb.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      d[i] = f32_to_bf16_(std::sin((float)(i % 977) * 0.01f) * 0.5f);
+    }
+    m->set_tile_progress([seen](int done, int total) {
+      seen->emplace_back(done, total);
+    });
+    int lf = 0;
+    std::string err;
+    SharedBuffer out = m->encode_video(xb, frames, H, W, &lf, &err);
+    m->set_tile_progress(nullptr);
+    return !out.empty() && lf > 0;
+  };
+
+  std::vector<std::pair<int, int>> clip, still;
+  ASSERT_TRUE(run(T, &clip));
+  ASSERT_TRUE(run(1, &still));
+  auto check = [&](const std::vector<std::pair<int, int>>& v, int want,
+                  const char* what) {
+    bool steady = !v.empty(), forward = true;
+    int last = 0;
+    for (const auto& p : v) {
+      steady = steady && p.second == want;
+      forward = forward && p.first >= last;
+      last = p.first;
+    }
+    std::printf("[minimax_h3_vvae] %s: %zu reports, %d/%d .. %d/%d\n", what,
+                v.size(), v.empty() ? -1 : v.front().first,
+                v.empty() ? -1 : v.front().second,
+                v.empty() ? -1 : v.back().first,
+                v.empty() ? -1 : v.back().second);
+    EXPECT_TRUE(steady);
+    EXPECT_TRUE(forward);
+    // Both edges of every tile: entry and exit.
+    EXPECT_TRUE((int)v.size() == 2 * want);
+    EXPECT_TRUE(!v.empty() && v.front().first == 0 &&
+                v.back().first == want);
+  };
+  check(clip, clips * tiles, "clip");
+  // The second call's own total, from 0 -- not the first one's.
+  check(still, tiles, "still");
+
+  // ---- through the reference encoder ---------------------------------
+  namespace h3 = vpipe::genai::minimax_h3;
+  h3::ReferencePlan plan;
+  plan.target_frames     = 21;
+  plan.canvas_short_edge = 0;           // the clip's own 512x256
+  h3::MediaReference ref;
+  ref.kind       = h3::MediaReference::Kind::kVideo;
+  ref.num_frames = T;
+  ref.height     = H;
+  ref.width      = W;
+  ref.fps        = 24.0;
+  ref.rgb.resize((std::size_t)T * 3 * H * W);
+  for (std::size_t i = 0; i < ref.rgb.size(); ++i) {
+    ref.rgb[i] = (std::uint8_t)((i * 7) % 251);
+  }
+  std::vector<h3::MediaReference> refs;
+  refs.push_back(std::move(ref));
+
+  struct Seen {
+    std::uint64_t done, total;
+    std::string detail;
+  };
+  std::vector<Seen> seen;
+  h3::ReferenceEncoders models;
+  models.mc        = mc;
+  models.video_vae = m.get();
+  models.progress  = [&seen](std::uint64_t done, std::uint64_t total,
+                             const std::string& detail) {
+    seen.push_back({done, total, detail});
+  };
+  h3::EncodedReferences enc;
+  std::string rerr;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &rerr));
+  if (seen.empty()) { return; }
+
+  // The plan: one canvas frame for the rest, plus 2 clips x 17 frames of
+  // it through the VAE.
+  const std::uint64_t frame = (std::uint64_t)H * W;
+  const std::uint64_t want = frame + (std::uint64_t)clips *
+                                         cfg.clip_length * frame;
+  int tile_reports = 0, distinct = 0;
+  std::uint64_t prev = ~0ull;
+  bool steady = true;
+  for (const auto& p : seen) {
+    steady = steady && p.total == want;
+    if (p.detail.find("video VAE tile") != std::string::npos) {
+      ++tile_reports;
+      if (p.done != prev) { ++distinct; prev = p.done; }
+    }
+  }
+  std::printf("[minimax_h3_vvae] refenc bar: total %llu, %d tile reports, "
+              "%d distinct positions, last '%s'\n",
+              (unsigned long long)want, tile_reports, distinct,
+              seen.back().detail.c_str());
+  EXPECT_TRUE(steady);
+  EXPECT_TRUE(tile_reports == 2 * clips * tiles);
+  // It MOVES inside the reference: one position per finished tile, plus
+  // the start.
+  EXPECT_TRUE(distinct == clips * tiles + 1);
+  EXPECT_TRUE(seen.back().done == want);
+  // The VAE is left as it was found.
+  std::vector<std::pair<int, int>> after;
+  ASSERT_TRUE(run(1, &after));
+  EXPECT_TRUE((int)after.size() == 2 * tiles);
+}
+
 TEST(minimax_h3_vvae, video_chunking_matches_golden)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");

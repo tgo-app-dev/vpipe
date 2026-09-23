@@ -1,0 +1,201 @@
+{
+  "id": "minimax-h3-ref2va-like",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/MiniMax-H3-FL2VA-8bit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "<Subject 1> is the ginger cat in <Picture 1>, with a dense orange tabby coat, white chest and paws, and bright green eyes.\n\n[reference generation] The target video takes place in a warm concert hall at dusk. <Subject 1> is seated at a grand piano, paws resting on the keys, head tilted toward the music as it plays; the camera pushes in slowly from a wide shot to a medium close-up. Soft stage light falls from above and the hall's natural reverb carries the piano."
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12.0,
+        "audio_shift": 3.0,
+        "condition_timestep": 1.0,
+        "condition_audio_timestep": 1.0,
+        "audio_seconds": 0.0,
+        "linear_branch": "OpenVDN/vdn-minimax-h3-stage-dmd",
+        "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "load-subject",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": "minimax-h3-reference-subject.jpg"
+      }
+    },
+    {
+      "id": "size-subject",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-subject",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 768,
+        "height": 768,
+        "fit": "stretch",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "video-ref-encoder",
+      "type": "video-ref-encoder",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "size-subject",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "frames": 124,
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "video-ref-encoder",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 1
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 2
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 544,
+        "width": 960,
+        "frames": 124,
+        "fps": 24,
+        "steps": 6,
+        "seed": 6,
+        "i8_gemm": true,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "minimax-h3-ref2va-like.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

@@ -196,6 +196,18 @@ bool normalize_video_reference(const std::uint8_t* frames, int num_frames,
                                int* out_h, int* out_w, double dst_fps = kFps,
                                std::string* err = nullptr);
 
+// The frame count and canvas normalize_video_reference() WILL produce,
+// without producing them. It is the same rule -- that function asks this
+// one -- so a caller planning work ahead of the resize (a progress bar
+// weighted by what each reference will cost the VAE) cannot drift from
+// what the resize then does.
+bool video_reference_geometry(int num_frames, int height, int width,
+                              double src_fps, int target_frames, int multiple,
+                              int short_edge, std::int64_t max_pixels,
+                              int* out_frames, int* out_h, int* out_w,
+                              double dst_fps = kFps,
+                              std::string* err = nullptr);
+
 // A reference soundtrack: truncated to the generated duration and
 // upmixed to stereo.
 //

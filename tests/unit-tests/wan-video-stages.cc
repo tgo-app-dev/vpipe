@@ -1583,6 +1583,11 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
 {
   bool ignored = false;
 
+  // The first argument is the REQUEST's -- whether it carries references
+  // -- and never the partition's. That matters since Ref2VA-like runs
+  // the reference layout on FL2VA weights: the same checkpoint can be
+  // handed either, so a partition test would have let a keyframe and a
+  // reference list into one forward, and only one of them has a slot.
   // FL2VA: one keyframe is first-frame i2v, two are first AND last.
   EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(false, true, 1,
                                                   &ignored) == 1);
@@ -1603,7 +1608,9 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
                                                   &ignored) == 0);
   EXPECT_FALSE(ignored);
 
-  // REF2VA with a keyframe wired: no anchors, and flagged.
+  // References with a keyframe wired: no anchors, and flagged. True on
+  // either partition -- this is the Ref2VA-like case as much as the
+  // Ref2VA one.
   EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, true, 1,
                                                   &ignored) == 0);
   EXPECT_TRUE(ignored);
@@ -1617,8 +1624,46 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
   EXPECT_TRUE(GenerateVideoStage::h3_anchor_count(true, true, 1,
                                                   nullptr) == 0);
 
-  std::printf("[generate_video] fl2va 1/2 anchors, ref2va 0 and reported, "
-              "no keyframe 0 and silent\n");
+  std::printf("[generate_video] fl2va 1/2 anchors, references 0 and "
+              "reported, no keyframe 0 and silent\n");
+}
+
+// Ref2VA-like: references on the FL2VA weights, which upstream renders
+// at a 768 short edge and NOT at the 2048 of MiniMaxH3Ref2VASetupStep,
+// whose checkpoint was trained on references.
+//
+// The gap is four times the tokens per reference -- and those rows sit
+// in the packed sequence that the DiT re-reads at every step of the
+// denoise, so it is not a fidelity knob left somewhere safe. It is also
+// invisible: a graph at 2048 renders a perfectly ordinary clip, four
+// times slower over its reference rows, and says nothing.
+//
+// Tested through the static because the stage's own resolution needs a
+// loaded 32B conditioner to know its partition, and the rule needs
+// neither that nor a GPU.
+TEST(generate_video, ref2va_like_takes_upstreams_768_not_ref2vas_2048)
+{
+  using V = VideoRefEncoderStage;
+
+  // Unset on FL2VA: upstream's Ref2VA-like recipe.
+  EXPECT_TRUE(V::ref_image_short_edge(2048, false, "fl2va") == 768);
+  // Unset on Ref2VA: the trained checkpoint's own rule, untouched.
+  EXPECT_TRUE(V::ref_image_short_edge(2048, false, "ref2va") == 2048);
+  // Unknown or absent partition keeps what it was given -- this is not
+  // the place to guess which checkpoint is resident.
+  EXPECT_TRUE(V::ref_image_short_edge(2048, false, "") == 2048);
+  EXPECT_TRUE(V::ref_image_short_edge(2048, false, "t2va") == 2048);
+
+  // SAID IS SAID, on both partitions. A graph that asks for 2048 on
+  // FL2VA gets it; the partition only fills a silence.
+  EXPECT_TRUE(V::ref_image_short_edge(2048, true, "fl2va") == 2048);
+  EXPECT_TRUE(V::ref_image_short_edge(1024, true, "fl2va") == 1024);
+  EXPECT_TRUE(V::ref_image_short_edge(768, true, "ref2va") == 768);
+  // Including a value that happens to equal the recipe it replaces.
+  EXPECT_TRUE(V::ref_image_short_edge(768, true, "fl2va") == 768);
+
+  std::printf("[generate_video] ref2va-like 768 unset / 2048 on ref2va / "
+              "configured always wins\n");
 }
 
 // A `ref2va` request of stills packs no audio, and its empty audio beat

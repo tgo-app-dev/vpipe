@@ -262,20 +262,17 @@ normalize_image_reference(const std::uint8_t* rgb, int height, int width,
 }
 
 bool
-normalize_video_reference(const std::uint8_t* frames, int num_frames,
-                          int height, int width, double src_fps,
-                          int target_frames, int multiple, int short_edge,
-                          std::int64_t max_pixels,
-                          std::vector<std::uint8_t>* out, int* out_frames,
-                          int* out_h, int* out_w, double dst_fps,
-                          std::string* err)
+video_reference_geometry(int num_frames, int height, int width,
+                         double src_fps, int target_frames, int multiple,
+                         int short_edge, std::int64_t max_pixels,
+                         int* out_frames, int* out_h, int* out_w,
+                         double dst_fps, std::string* err)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
-  if (frames == nullptr || out == nullptr || out_frames == nullptr ||
-      out_h == nullptr || out_w == nullptr) {
+  if (out_frames == nullptr || out_h == nullptr || out_w == nullptr) {
     return fail("null argument");
   }
   if (num_frames <= 0 || height <= 0 || width <= 0 || target_frames <= 0) {
@@ -284,24 +281,15 @@ normalize_video_reference(const std::uint8_t* frames, int num_frames,
   if (!(src_fps > 0.0)) {
     return fail("a reference video must have a positive frame rate");
   }
-
-  // 1. Onto the 24 fps grid, by holding and dropping WHOLE frames.
+  // 1. Onto the 24 fps grid, by holding and dropping WHOLE frames, and
+  // 2. truncated to the generated length.
   const std::vector<int> counts =
       frame_resample_counts(num_frames, src_fps, dst_fps);
   if (counts.empty()) { return fail("the frame-rate resample failed"); }
-  // 2. Truncated to the generated length. Built as an index list first
-  // so the truncation costs nothing: a 15-second reference against a
-  // 5-second target would otherwise materialize three times what it
-  // needs and then throw two thirds away.
-  std::vector<int> pick;
-  pick.reserve((std::size_t)target_frames);
-  for (int i = 0; i < num_frames && (int)pick.size() < target_frames; ++i) {
-    for (int k = 0; k < counts[(std::size_t)i] &&
-                    (int)pick.size() < target_frames; ++k) {
-      pick.push_back(i);
-    }
-  }
-  if (pick.empty()) { return fail("the reference video resampled to nothing"); }
+  long long kept = 0;
+  for (int c : counts) { kept += c; }
+  kept = std::min<long long>(kept, target_frames);
+  if (kept <= 0) { return fail("the reference video resampled to nothing"); }
 
   // 3. Onto the canvas its OWN aspect ratio resolves to -- the same rule
   // the target follows, unlike an image reference. A `short_edge` of 0
@@ -319,7 +307,58 @@ normalize_video_reference(const std::uint8_t* frames, int num_frames,
   if (!sized) {
     return fail("a reference video must be within 1:4 and 4:1");
   }
-  *out_frames = (int)pick.size();
+  *out_frames = (int)kept;
+  *out_h = th;
+  *out_w = tw;
+  return true;
+}
+
+bool
+normalize_video_reference(const std::uint8_t* frames, int num_frames,
+                          int height, int width, double src_fps,
+                          int target_frames, int multiple, int short_edge,
+                          std::int64_t max_pixels,
+                          std::vector<std::uint8_t>* out, int* out_frames,
+                          int* out_h, int* out_w, double dst_fps,
+                          std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (frames == nullptr || out == nullptr || out_frames == nullptr ||
+      out_h == nullptr || out_w == nullptr) {
+    return fail("null argument");
+  }
+  // The frame count and the canvas, by the one rule both this and a
+  // caller planning ahead of it read.
+  int nf = 0, th = 0, tw = 0;
+  if (!video_reference_geometry(num_frames, height, width, src_fps,
+                                target_frames, multiple, short_edge,
+                                max_pixels, &nf, &th, &tw, dst_fps, err)) {
+    return false;
+  }
+
+  // Which source frame each output frame is. Built as an index list first
+  // so the truncation costs nothing: a 15-second reference against a
+  // 5-second target would otherwise materialize three times what it
+  // needs and then throw two thirds away.
+  const std::vector<int> counts =
+      frame_resample_counts(num_frames, src_fps, dst_fps);
+  std::vector<int> pick;
+  pick.reserve((std::size_t)nf);
+  for (int i = 0; i < num_frames && (int)pick.size() < nf; ++i) {
+    for (int k = 0; k < counts[(std::size_t)i] && (int)pick.size() < nf;
+         ++k) {
+      pick.push_back(i);
+    }
+  }
+  if ((int)pick.size() != nf) {
+    return fail("the reference video resampled to " +
+                std::to_string(pick.size()) + " frames, not the planned " +
+                std::to_string(nf));
+  }
+  *out_frames = nf;
   *out_h = th;
   *out_w = tw;
 

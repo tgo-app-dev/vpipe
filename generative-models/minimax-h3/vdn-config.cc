@@ -225,16 +225,42 @@ load_config(const std::string& dir, Config* out, std::string* err)
   return fail_(err, "model_spec.json has no hybrid_attention transform");
 }
 
+namespace {
+
+// The adapter's description, under either name it has shipped as.
+// OpenVDN renamed `adapter_config.json` to `adapter_spec.json` on
+// 2026-09-09 with the bytes unchanged, so a checkout made before that
+// still holds the old name and is still the same model. Empty when
+// neither is there.
+std::filesystem::path
+adapter_spec_(const std::filesystem::path& dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (const char* name : {"adapter_spec.json", "adapter_config.json"}) {
+    if (fs::exists(dir / name, ec)) { return dir / name; }
+  }
+  return {};
+}
+
+}  // namespace
+
 bool
 load_adapter(const std::string& dir, Adapter* out, std::string* err)
 {
   namespace fs = std::filesystem;
   if (out == nullptr) { return fail_(err, "null out"); }
-  const fs::path p = fs::path(dir) / "adapter_config.json";
+  const fs::path p = adapter_spec_(fs::path(dir));
+  if (p.empty()) {
+    return fail_(err, "no adapter_spec.json (or the older "
+                      "adapter_config.json) under " + dir);
+  }
   std::ifstream in(p);
   if (!in) { return fail_(err, "cannot open " + p.string()); }
   FlexData doc = FlexData::from_json(in);
-  if (!doc.is_object()) { return fail_(err, "adapter_config is not JSON"); }
+  if (!doc.is_object()) {
+    return fail_(err, p.filename().string() + " is not JSON");
+  }
   auto root = doc.as_object();
   if (!root.contains("type")
       || std::string(root.at("type").as_string("")) != "lora") {
@@ -290,7 +316,7 @@ list_adapters(const std::string& stage_dir)
   if (!fs::is_directory(root, ec)) { return out; }
   for (const auto& e : fs::directory_iterator(root, ec)) {
     if (!e.is_directory()) { continue; }
-    if (fs::exists(e.path() / "adapter_config.json")) {
+    if (!adapter_spec_(e.path()).empty()) {
       out.push_back(e.path().filename().string());
     }
   }

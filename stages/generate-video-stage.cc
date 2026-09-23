@@ -613,20 +613,24 @@ GenerateVideoStage::spec() const noexcept
 // rule is a property of the two PARTITIONS, not of the backend that runs
 // them, and a test for it should not need a GPU.
 int
-GenerateVideoStage::h3_anchor_count(bool is_ref2va, bool have_keyframe,
+GenerateVideoStage::h3_anchor_count(bool have_references, bool have_keyframe,
                                     int ref_frames, bool* ignored)
 {
   if (ignored != nullptr) { *ignored = false; }
   if (!have_keyframe || ref_frames <= 0) { return 0; }
-  // A Ref2VA request takes NO anchors, and the reason is structural:
-  // build_ref2va_packed_sequence() has no keyframe parameter, because
-  // its layout is [text | reference blocks | target audio | target
-  // video] where FL2VA's is [text | keyframe conditions | ...]. There is
-  // nowhere to put one. Reported rather than dropped quietly -- the
-  // symptom otherwise is a clip whose subject and wardrobe transferred
-  // while its opening frame did not, which reads as disobedience rather
-  // than as a mode that does not exist.
-  if (is_ref2va) {
+  // A request WITH REFERENCES takes no anchors, and the reason is
+  // structural: build_ref2va_packed_sequence() has no keyframe
+  // parameter, because its layout is [text | reference blocks | target
+  // audio | target video] where the keyframe one is [text | keyframe
+  // conditions | ...]. There is nowhere to put one. Reported rather than
+  // dropped quietly -- the symptom otherwise is a clip whose subject and
+  // wardrobe transferred while its opening frame did not, which reads as
+  // disobedience rather than as a mode that does not exist.
+  //
+  // The test is the REQUEST, not the partition, and that is load-bearing
+  // since Ref2VA-like put references on FL2VA weights: the two layouts
+  // remain mutually exclusive on a checkpoint that can build either.
+  if (have_references) {
     if (ignored != nullptr) { *ignored = true; }
     return 0;
   }
@@ -2711,12 +2715,13 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // => a first-frame anchor; two => first AND last, which is what the
   // FL2VA partition is named for.
   //
-  // A Ref2VA request takes NONE of them, and that is structural rather
-  // than a policy: build_ref2va_packed_sequence() has no keyframe
-  // parameter at all, because its layout is
-  // [text | reference blocks | target audio | target video] where
-  // FL2VA's is [text | keyframe conditions | ...]. There is no slot to
-  // put an anchor in.
+  // A request carrying REFERENCES takes none of them, and that is
+  // structural rather than a policy: build_ref2va_packed_sequence() has
+  // no keyframe parameter at all, because its layout is
+  // [text | reference blocks | target audio | target video] where the
+  // keyframe one is [text | keyframe conditions | ...]. There is no slot
+  // to put an anchor in -- on either partition, since Ref2VA-like builds
+  // the reference layout from FL2VA weights.
   //
   // SAID, not dropped quietly. The graph is wired, the beat is read, and
   // the latent then goes nowhere -- and the symptom is a clip whose
@@ -2734,12 +2739,12 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     _kf_on_ref2va_said = true;
     session()->warn(fmt(
         "GenerateVideoStage('{}'): a keyframe anchor is wired on iport {} "
-        "but this is MiniMax-H3's Ref2VA partition, which conditions on "
-        "REFERENCES and has no keyframe slot -- the anchor is ignored. A "
-        "reference image conditions the whole clip (subject, wardrobe, "
-        "style) and cannot pin one frame; asking for it in the prompt "
-        "does nothing either. Anchoring an opening frame is the FL2VA "
-        "partition's job, and the two are mutually exclusive.",
+        "but this request carries REFERENCES, whose layout has no keyframe "
+        "slot -- the anchor is ignored. A reference image conditions the "
+        "whole clip (subject, wardrobe, style) and cannot pin one frame; "
+        "asking for it in the prompt does nothing either. Anchoring an "
+        "opening frame is the keyframe layout's job, and the two are "
+        "mutually exclusive whichever partition is resident.",
         this->id(), kRefPort));
   }
   // h3::kAudioChannels is the STEREO count (2) -- how many soundtrack
@@ -3345,12 +3350,56 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           "generates video conditioned on nothing. Skipping", this->id()));
       co_return;
     }
+    // REFERENCES ON THE FL2VA PARTITION: upstream's Ref2VA-like mode.
+    //
+    // This was refused, on the reading that FL2VA "has no reference
+    // blocks". The blocks are not the weights' -- they are the packed
+    // SEQUENCE's, and `build_ref2va_packed_sequence` builds it for
+    // whichever checkpoint is resident, since the two partitions ship
+    // byte-identical transformer configs. OpenVDN published the mode on
+    // 2026-09-17 with a rendered example: the references go in through
+    // the FL2VA weights, one block and one rotary slot each ahead of the
+    // generated rows, and the weights that read them are the loaded
+    // t2va/fl2va ones rather than MiniMax-H3's own `transformer_ref`.
+    //
+    // ZERO-SHOT, and named as such every run it is used. It is an
+    // ability of the FL2VA checkpoint rather than a task it was trained
+    // for, and the failure mode if it does not hold on some request is a
+    // clip that ignores its references while looking perfectly ordinary
+    // -- so the log says which mode ran rather than leaving the reader
+    // to infer it from the graph.
     if (have_r2v && _h3_partition == "fl2va") {
-      session()->warn(fmt(
-          "GenerateVideoStage('{}'): the conditioning carries references but "
-          "'{}' is the FL2VA partition, which has no reference blocks; "
-          "skipping", this->id(), _root));
-      co_return;
+      if (!_ref2va_like_said) {
+        _ref2va_like_said = true;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): {} reference{} on the FL2VA "
+            "partition -- upstream's Ref2VA-like mode. The references are "
+            "packed as Ref2VA's own blocks and read by these FL2VA "
+            "weights, which is a zero-shot ability of this checkpoint and "
+            "not a task it was trained for; MiniMax-H3's Ref2VA partition "
+            "is the trained route. Upstream renders these at a 768 short "
+            "edge (`reference_image_short_edge` on video-ref-encoder), a "
+            "quarter of the Ref2VA recipe's tokens",
+            this->id(), r2v.refs.size(), r2v.refs.size() == 1 ? "" : "s"));
+      }
+      // Upstream's mode is IMAGE references. Clips and soundtracks pack
+      // and run -- the layout is the same one either way -- but nothing
+      // published says the FL2VA weights read them, and a reference that
+      // is merely ignored looks exactly like one honoured badly.
+      const bool non_image =
+          std::any_of(r2v.refs.begin(), r2v.refs.end(),
+                      [](const h3::Reference& r) {
+                        return r.kind != h3::Reference::Kind::kImage;
+                      });
+      if (non_image && !_ref2va_like_media_said) {
+        _ref2va_like_media_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): a reference clip or soundtrack on "
+            "the FL2VA partition. Upstream's Ref2VA-like mode is image "
+            "references only; this packs and runs, but no published result "
+            "covers it. The Ref2VA partition is where clips and "
+            "soundtracks are a trained input", this->id()));
+      }
     }
     // The keyframe anchor arrives on the SAME port Wan's i2v latent
     // does, from a vae-encode over the keyframe image -- so a graph

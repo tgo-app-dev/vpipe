@@ -528,26 +528,25 @@ TEST(minimax_h3_vdn, block_sparse_steel_matches_the_span_reference)
 TEST(minimax_h3_vdn, a_keyframe_anchor_is_a_global_row_not_a_video_frame)
 {
   // WHAT THE HYBRID DOES WITH A FIRST/LAST-FRAME REQUEST, pinned --
-  // because the answer is a choice this port made and the reference
-  // cannot check.
+  // and since 2026-09-08 it is the reference's answer too, not only a
+  // choice this port made.
   //
-  // VDN IS A t2va MODEL. Its layout_from_indices REFUSES a video block
-  // that is not contiguous ("video rows are not contiguous in the packed
-  // sequence"), and H3's fl2va packs video as TWO runs -- the keyframe
-  // conditioning block and the target -- which are not adjacent. Both
-  // places the reference builds a sequence, training and rendering, pass
-  // keyframe_anchors=() explicitly. So there is no reference behaviour
-  // to match here.
+  // The branch was trained text-to-video, and its layout_from_indices
+  // REFUSES a video block that is not contiguous, while H3's fl2va packs
+  // video as TWO runs -- the keyframe conditioning block and the target.
+  // Upstream's keyframe support (same checkpoints, render.py) resolves
+  // that by handing the layout only the TARGET run,
+  // `video_indices[num_condition_rows:]`, so the conditioning rows fall
+  // outside the video span and are "attended like text and audio".
   //
-  // What vpipe does instead follows from the packed order,
+  // Which is what the packed order gives here,
   // [text | keyframe conditions | target audio | target video]: the
   // conditioning rows sit BELOW video_start, so the window's group
   // formula puts them in group 0 with the prompt and the soundtrack --
   // DENSE in both directions -- and the linear branch, which is sized
   // from num_video_rows, never sees them at all. Every generated row
-  // therefore attends to every keyframe exactly, which is a coherent
-  // reading of an anchor and is NOT the same as making the keyframe
-  // frame 0 of the windowed block.
+  // therefore attends to every keyframe exactly, which is NOT the same
+  // as making the keyframe frame 0 of the windowed block.
   //
   // NOTE the two unrelated senses of "anchor" this test sits between:
   // a KEYFRAME anchor is a conditioning row of H3's layout, while
