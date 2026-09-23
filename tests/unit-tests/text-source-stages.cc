@@ -135,6 +135,48 @@ TEST(text_prompt_stage, chrono_paced_reemits) {
   }
 }
 
+// A DECLARED BUT UNWIRED trigger iport is NOT a trigger.
+//
+// `{"src": "", "oport": 0}` is how this tree spells an optional iport
+// left unconnected -- the composer writes it when an edge is deleted but
+// the port row stays, and pipeline_from_spec turns it into
+// `InEdge{nullptr, 0}`. It still COUNTS in num_iports(), so a source
+// that gates on that alone waits on a port nothing will ever write: the
+// read returns immediate EOS and the source emits NOTHING, silently and
+// with no warning, so every stage downstream sees EOS and the whole
+// graph "completes" having done no work.
+//
+// MEASURED as a real failure: a text-to-image graph whose text-prompt
+// carried a dangling port ran to completion in 1.7 s without loading a
+// model, and looked exactly like a graph that needed a chrono to drive
+// it. `iport_connected()` is the distinction, and this pins it.
+TEST(text_prompt_stage, a_declared_but_unwired_trigger_is_a_one_shot) {
+  Session sess;
+  CerrSilencer hush;
+  auto pl = make_unique<Pipeline>("p", &sess);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("text", FlexData::make_string("undriven"));
+  auto tp_u = make_unique<TextPromptStage>(
+      &sess, "tp", vector<InEdge>{InEdge{nullptr, 0}}, std::move(cfg));
+  auto* tp = static_cast<TextPromptStage*>(pl->insert_stage(std::move(tp_u)));
+
+  auto sink_u = make_unique<SinkCapture>(
+      &sess, "sink", vector<InEdge>{{tp, 0}}, FlexData::make_object());
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  // Exactly the one-shot behaviour, not zero beats.
+  EXPECT_TRUE(sink->captured.size() == 1);
+  if (!sink->captured.empty()) {
+    EXPECT_TRUE(captured_str_(sink->captured[0]) == "undriven");
+  }
+}
+
 // ===== load-text =====
 
 TEST(load_text_stage, config_path_string) {

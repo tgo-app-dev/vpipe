@@ -525,7 +525,16 @@ LoadImageStage::process(RuntimeContext& ctx)
   // upstream (typically a chrono tick). The payload type doesn't
   // matter -- only the fact of receipt does. EOS upstream means we
   // stop emitting too.
-  if (ctx.num_iports() >= 1) {
+  //
+  // WIRED, not merely DECLARED -- see the same note in
+  // text-prompt-stage.cc. An optional iport left unconnected
+  // (`{"src": "", "oport": 0}`, what the composer writes when an edge
+  // is deleted but the port row stays) still counts in num_iports(),
+  // so testing that alone waits on a port nothing will ever write and
+  // this source loads NOTHING, silently.
+  const bool has_trigger =
+      ctx.num_iports() >= 1 && ctx.iport_connected(0);
+  if (has_trigger) {
     auto t = co_await ctx.read(0);
     if (!t) {
       ctx.signal_done();
@@ -547,11 +556,13 @@ LoadImageStage::process(RuntimeContext& ctx)
     if (meta) { co_await ctx.write(1, std::move(meta)); }
   }
 
-  // No iport => batch mode: signal done as soon as we've emitted (or
-  // tried to emit) the last URL so the driver closes our oport. With
-  // an iport wired the driver tears us down when the upstream source
-  // EOSes; we never self-signal in that case.
-  if (_next >= _urls.size() && ctx.num_iports() == 0) {
+  // No TRIGGER => batch mode: signal done as soon as we've emitted (or
+  // tried to emit) the last URL so the driver closes our oport. With a
+  // trigger wired the driver tears us down when the upstream source
+  // EOSes; we never self-signal in that case. Reads `has_trigger` and
+  // not `num_iports() == 0` for the reason above -- a dangling port
+  // would otherwise leave a batch run never closing its oport.
+  if (_next >= _urls.size() && !has_trigger) {
     ctx.signal_done();
   }
 }

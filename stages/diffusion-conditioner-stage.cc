@@ -1016,9 +1016,17 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       // summing the tree would decide to stream on the DiT's bytes.
       const std::string ed =
           genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_enc_dir);
+      // kPhaseCondition, not the default: this encoder runs in the
+      // CONDITION phase and is gone by denoise, so asking in denoise
+      // sizes it against a phase it is not in -- and drops its own
+      // bytes from the verdict. See plan_streaming's `phase`.
       const auto plan = model_memory::plan_streaming(
-          session(), ed, std::string(), model_memory::kStreamHeadroom);
-      h3cfg.lm.stream_layers = plan.stream;
+          session(), ed, std::string(), model_memory::kStreamHeadroom,
+          0, model_memory::kPhaseCondition);
+      // ALWAYS STREAM -- see StreamPlan::stream. This encoder prefills
+      // once per prompt and is dropped; the plan is consulted only for
+      // how much of the prefix fits beside everything else.
+      h3cfg.lm.stream_layers = true;
       h3cfg.lm.pin_frac      = plan.pin_frac;
       if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
         h3cfg.lm.stream_layers = (std::atoi(e) != 0);
@@ -1029,10 +1037,10 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       }
       session()->log_debug(fmt(
           "DiffusionConditionerStage('{}'): MiniMax-H3 encoder footprint "
-          "{} GB (others {} GB) + {} GB headroom -> {}", this->id(),
-          plan.footprint >> 30, plan.others >> 30,
-          model_memory::kStreamHeadroom >> 30,
-          h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
+          "{} GB (others {} GB) -> {} ({:.0f}% of the prefix pinned)",
+          this->id(), plan.footprint >> 30, plan.others >> 30,
+          h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD",
+          h3cfg.lm.pin_frac * 100.0));
     }
     _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_dir, mc,
                                                 const_cast<SessionContextIntf*>(
@@ -1106,9 +1114,34 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // combination anyway; asking only when it can be served keeps a
   // warning off a path that is behaving correctly.
   if (ecfg.backbone_only) {
+    // kPhaseCondition, not the default. This encoder is resident during
+    // CONDITIONING and dropped before the denoise -- decide_resources()
+    // says so by claiming it in that phase -- so the default denoise
+    // view excludes its own 16.7 GB and the verdict came out PRELOAD on
+    // a 16 GB box. MEASURED on Qwen-Image-2.1: footprint read 1288 MB
+    // against an unphased 18010 MB, and the run put 9 GB into swap.
     const auto plan = model_memory::plan_streaming(
-        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom);
-    ecfg.stream_layers = plan.stream;
+        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom,
+        0, model_memory::kPhaseCondition);
+    // ALWAYS STREAM, rather than taking plan.stream.
+    //
+    // `backbone_only` IS the prefill-only guarantee -- MetalQwenModel::
+    // load refuses stream_layers without it, because "decode re-reading
+    // the stack per token" is the case that makes streaming wrong. So
+    // this encoder runs ONE pass per prompt and is then dropped, and
+    // what streaming costs it is that single pass.
+    //
+    // Against that: preload is an IRREVERSIBLE decision taken from an
+    // on-disk size, and that size is wrong exactly when a loader
+    // converts -- an F32 checkpoint narrowed to bf16, MiniMax-H3's
+    // AdaLN bake. Streaming also starts the GPU after the first LAYER
+    // instead of after the whole read: 16.7 GB at ~4.5 GB/s is seconds
+    // of dead time before any work.
+    //
+    // The plan is still consulted for `pin_frac`, which is what makes
+    // this graceful -- on a roomy box the pinned prefix absorbs most of
+    // the stack and only the tail is re-read.
+    ecfg.stream_layers = true;
     ecfg.pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_ENC_STREAM")) {
       ecfg.stream_layers = (std::atoi(e) != 0);
@@ -1116,10 +1149,10 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     }
     session()->log_debug(fmt(
         "DiffusionConditionerStage('{}'): text encoder footprint {} MB "
-        "(others {} MB) + {} MB headroom -> {}", this->id(),
+        "(others {} MB) -> {} ({:.0f}% of the prefix pinned)", this->id(),
         plan.footprint >> 20, plan.others >> 20,
-        model_memory::kStreamHeadroom >> 20,
-        ecfg.stream_layers ? "STREAM layers" : "PRELOAD"));
+        ecfg.stream_layers ? "STREAM layers" : "PRELOAD",
+        ecfg.pin_frac * 100.0));
   }
   // One set for this checkpoint, shared with the vision tower and the
   // embedding table below and with anything else naming the same dir.

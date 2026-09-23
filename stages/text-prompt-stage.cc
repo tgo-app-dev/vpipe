@@ -82,7 +82,18 @@ TextPromptStage::process(RuntimeContext& ctx)
 {
   // With a trigger iport wired, gate each emission on one inbound beat (the
   // payload type doesn't matter, only receipt); EOS upstream ends the stage.
-  const bool has_trigger = ctx.num_iports() >= 1;
+  //
+  // WIRED, not merely DECLARED. `{"src": "", "oport": 0}` is the spelling
+  // this tree uses for an optional iport left unconnected -- the composer
+  // writes it when an edge is deleted but the port row stays, and the
+  // loader turns it into an InEdge{nullptr}. It still COUNTS in
+  // num_iports(), so testing that alone takes the trigger branch on a
+  // port nothing will ever write to: the read returns immediate EOS and
+  // this source emits NOTHING, silently, with no warning. Every stage
+  // downstream then sees EOS and the whole graph "completes" in
+  // milliseconds having done no work.
+  const bool has_trigger =
+      ctx.num_iports() >= 1 && ctx.iport_connected(0);
   if (has_trigger) {
     auto t = co_await ctx.read(0);
     if (!t) {

@@ -241,6 +241,17 @@ struct ReferenceEncoders {
   // it. Counting it keeps that last stretch legible as unfinished work
   // rather than as a hang.
   std::function<void(int done, int total)> progress;
+
+  // Per-PHASE timing, one line per reference plus one for the
+  // presentation. Optional; nothing is measured when it is unset.
+  //
+  // A reference encode is four models deep -- the resize, the vision
+  // tower, the video VAE and the audio VAE -- and a slow one reported
+  // only as a slow STAGE says nothing about which. MEASURED at 896x512:
+  // the video VAE is 96% of it, 104 s for a 56-frame guide and 156 s for
+  // a 90-frame one, against 2-5 ms for the resize and under half a
+  // second for the vision tower.
+  std::function<void(const std::string&)> log;
 };
 
 // Which frames of a normalized 24 fps reference the CONDITIONER reads,

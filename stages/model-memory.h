@@ -463,6 +463,19 @@ bool bounded(const SessionContextIntf*       session,
 // resident BESIDES the DiT, which is what the prefix has to coexist
 // with. Both are 0/false when RAM is unknown.
 struct StreamPlan {
+  // THE DiT'S ANSWER. A prefill-only TEXT ENCODER ignores it and streams
+  // unconditionally -- see the three call sites in
+  // diffusion-conditioner-stage.cc and video-ref-encoder-stage.cc.
+  //
+  // The two are not the same question. A DiT re-reads its stack once per
+  // STEP, so preloading is worth a real decision; `backbone_only` means
+  // no lm_head, MetalQwenModel::load refuses the combination otherwise,
+  // and such an encoder prefills ONCE per prompt and is then dropped.
+  // Streaming it costs one pass over the checkpoint per prompt and
+  // removes an irreversible guess taken from an on-disk size that is
+  // wrong whenever the loader converts (an F32 checkpoint narrowed to
+  // bf16, MiniMax-H3's AdaLN bake). It also starts the GPU after the
+  // first LAYER rather than after the whole read.
   bool        stream    = false;
   // LM LAYER pinning ONLY. Every DiT that used this is retired: the five
   // block-streaming families grow a resident set by measuring instead
@@ -493,11 +506,32 @@ struct StreamPlan {
 // direction is the expensive one: a model that declines to stream and
 // then holds more than predicted thrashes, and nothing later can undo
 // the decision. Zero -- the default -- is always safe.
+//
+// `phase` is THE CALLER'S OWN phase, and it is the one argument here
+// that is easy to leave wrong. The footprint is narrowed to it -- the
+// question being asked is "what else is resident while I run", so a
+// peer that has let go by then is correctly absent.
+//
+// A DiT runs in `denoise`, which is why that is the default and why
+// MiniMax-H3's verdict is not distorted by an encoder that stops
+// existing before the first step. A TEXT ENCODER does not: it runs in
+// `condition` and is gone by `denoise`. Asked with the default it
+// therefore sizes itself against a phase it is not in -- and because
+// weight_footprint()'s dedup is phase-blind while its total is not, its
+// own bytes are then dropped from BOTH terms rather than counted once.
+// MEASURED on the M5 16 GB with Qwen-Image-2.1: a 16722 MB encoder
+// judged itself against 1288 MB, preloaded, and put 9 GB into swap.
+// Qwen-Image-2.1's sibling families escaped the same bug only because
+// their DiT floors happen to clear the threshold.
+//
+// So: pass the phase the CALLER is resident in, not the phase the
+// component it is reasoning about runs in.
 StreamPlan plan_streaming(const SessionContextIntf* session,
                           const std::string&        dit_dir,
                           const std::string&        enc_dir,
                           std::size_t               headroom,
-                          std::size_t               dit_retires = 0);
+                          std::size_t               dit_retires = 0,
+                          std::string_view          phase = kPhaseDenoise);
 
 // The `unload_when_idle` config value shared by the model-holding stages.
 // THREE things can happen to idle weights, not two:

@@ -694,9 +694,15 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     // whatever the config named -- a repack root holds the 66 GB DiT
     // next to the encoder, and summing the tree would decide to stream
     // on the DiT's bytes.
+    // kPhaseCondition: decide_resources() claims this encoder in that
+    // phase, and asking about `denoise` -- where it no longer exists --
+    // drops its own bytes from its own verdict. See plan_streaming.
     const auto plan = model_memory::plan_streaming(
-        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom);
-    ecfg.lm.stream_layers = plan.stream;
+        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom,
+        0, model_memory::kPhaseCondition);
+    // ALWAYS STREAM -- see StreamPlan::stream. One prefill per prompt,
+    // then dropped; the plan is consulted only for the pinned prefix.
+    ecfg.lm.stream_layers = true;
     ecfg.lm.pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
       ecfg.lm.stream_layers = (std::atoi(e) != 0);
@@ -704,8 +710,10 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     }
     session()->log_debug(fmt(
         "VideoRefEncoderStage('{}'): conditioner footprint {} GB (others {} "
-        "GB) -> {}", this->id(), plan.footprint >> 30, plan.others >> 30,
-        ecfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
+        "GB) -> {} ({:.0f}% of the prefix pinned)", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        ecfg.lm.stream_layers ? "STREAM layers" : "PRELOAD",
+        ecfg.lm.pin_frac * 100.0));
   }
   _enc = genai::MiniMaxH3TextEncoder::load(
       _enc_dir, mc, const_cast<SessionContextIntf*>(session()), ecfg);
@@ -1401,6 +1409,12 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       bar.update(done < 0 ? 0 : (std::uint64_t)done,
                  total < 0 ? 0 : (std::uint64_t)total);
       ui->log_debug(fmt("{}: {}/{}", label, done, total));
+    };
+    // PER-PHASE timing, at NORMAL rather than debug: a reference encode
+    // is four models deep and the bar only moves once per reference, so
+    // a slow one is otherwise unattributable after the fact.
+    models.log = [ui](const std::string& line) {
+      ui->log_normal(fmt("{}", line));
     };
   }
 

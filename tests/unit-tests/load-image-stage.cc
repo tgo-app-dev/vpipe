@@ -243,6 +243,46 @@ TEST(load_image_stage, multi_url_emits_each) {
   EXPECT_TRUE(sink->captured.size() == 2);
 }
 
+// A DECLARED BUT UNWIRED trigger iport is NOT a trigger.
+//
+// `{"src": "", "oport": 0}` is how this tree spells an optional iport
+// left unconnected, and pipeline_from_spec turns it into
+// `InEdge{nullptr, 0}`. It still COUNTS in num_iports(), so a source
+// gating on that alone waits on a port nothing will ever write: the read
+// returns immediate EOS and the source loads NOTHING, silently. The same
+// bug shipped in text-prompt and is pinned there too; the two are the
+// tree's only trigger-gated sources.
+TEST(load_image_stage, a_declared_but_unwired_trigger_is_batch_mode) {
+  Session sess;
+  CerrSilencer hush;
+
+  string p1 = write_test_ppm_(2, 2, 0xFF, 0x00, 0x00);
+  auto pl = make_unique<Pipeline>("p", &sess);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("url", FlexData::make_string(p1));
+  auto li_u = make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{InEdge{nullptr, 0}}, std::move(cfg));
+  auto* li = static_cast<LoadImageStage*>(
+      pl->insert_stage(std::move(li_u)));
+
+  auto sink_u = make_unique<SinkCapture>(
+      &sess, "sink", vector<InEdge>{{li, 0}}, FlexData::make_object());
+  auto* sink = static_cast<SinkCapture*>(
+      pl->insert_stage(std::move(sink_u)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  remove(p1.c_str());
+
+  // The batch behaviour, not zero beats -- and it must also have CLOSED
+  // its oport, which is the second half the dangling port broke (the
+  // batch-done test was `num_iports() == 0`).
+  EXPECT_TRUE(sink->captured.size() == 1);
+}
+
 // Paced mode: when an iport is wired to a chrono source, each tick
 // triggers one decode. With 3 URLs we expect exactly 3 emissions,
 // regardless of how many ticks the chrono stage fires (chrono.count

@@ -1217,6 +1217,38 @@ TEST(minimax_h3_layout, reference_lanczos_resize)
 
 // ---- rotary grids ---------------------------------------------------
 
+// Cross-implementation check against ComfyUI's PackedLayout. Writes the
+// position_ids so an external harness can diff them element-wise.
+TEST(minimax_h3_layout, dump_ref2va_positions_for_cross_check)
+{
+  const char* dir = std::getenv("VPIPE_H3_POS_DUMP_DIR");
+  if (dir == nullptr) {
+    std::printf("[minimax_h3_layout] VPIPE_H3_POS_DUMP_DIR unset; skipped\n");
+    return;
+  }
+  struct Case { const char* tag; int text; int ref_lt; int ref_alat; };
+  const Case cases[] = {{"g90", 3032, 27, 150}, {"g56", 2576, 17, 94}};
+  for (const Case& c : cases) {
+    std::vector<int> tags((std::size_t)c.text, 1);
+    h3::Reference ref;
+    ref.kind              = h3::Reference::Kind::kVideo;
+    ref.num_latent_frames = c.ref_lt;
+    ref.latent_height     = 512 / 16;
+    ref.latent_width      = 896 / 16;
+    ref.num_audio_latents = c.ref_alat;
+    h3::PackedLayout L;
+    ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+        tags, {ref}, 57, 512 / 16, 896 / 16, 320, 2, 2, 2, &L));
+    const std::string path = std::string(dir) + "/vpipe-pos-" + c.tag + ".f64";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_TRUE(f != nullptr);
+    std::fwrite(L.position_ids.data(), sizeof(double), L.position_ids.size(), f);
+    std::fclose(f);
+    std::printf("[minimax_h3_layout] %s: seq_len %d -> %s\n", c.tag, L.seq_len,
+                path.c_str());
+  }
+}
+
 TEST(minimax_h3_layout, rotary_grids)
 {
   const double* kSpatial[] = {kSpatial0, kSpatial1, kSpatial2};

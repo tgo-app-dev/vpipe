@@ -3068,21 +3068,68 @@ MetalMiniMaxH3Transformer::build_rope_(const h3::PackedLayout& L,
   // The reference then concatenates that with itself to reach the 96
   // rotated channels -- the second copy is identical, so only the first
   // half is stored and the kernel indexes both halves into it.
+  //
+  // PRECISION IS THE REFERENCE'S, NOT THE BEST AVAILABLE. Both ComfyUI
+  // and diffusers cast the position to fp32 before multiplying, and then
+  // round the rotation table to the block stack's dtype -- bf16 -- before
+  // it is applied (`table.to(dtype)` / `cos.to(hidden_states.dtype)`).
+  // This evaluated the angle in double and kept an fp32 table, which is
+  // MORE exact than anything the checkpoint has ever been fed.
+  //
+  // MEASURED on a real 36556-row request: the bf16 cast moves the table
+  // by 6.0e-4 mean / 2.0e-3 max per element, which is 320x the 1.9e-6
+  // the double-vs-fp32 angle was worth. Being more exact is not neutral
+  // when the quantization may be baked into what the model learned, so
+  // the default reproduces it; `VPIPE_H3_ROPE_FP32=1` restores the old
+  // table for an A/B.
   const int F = _cfg.rope_freq_dim;
   const int half = 3 * F;
   auto* cb = static_cast<float*>(cos_out.contents());
   auto* sb = static_cast<float*>(sin_out.contents());
+  const char* fp32_env = std::getenv("VPIPE_H3_ROPE_FP32");
+  const bool  keep_fp32 = fp32_env != nullptr && fp32_env[0] == '1';
+  // Once per process: a run has to say which table it used, because the
+  // two are indistinguishable in the output and the difference is the
+  // kind that only shows up in a careful measurement weeks later.
+  static bool said = false;
+  if (!said && _mc != nullptr && _mc->session() != nullptr) {
+    said = true;
+    _mc->session()->log_normal(fmt(
+        "MetalMiniMaxH3Transformer: rope table {}",
+        keep_fp32 ? "fp32 (angles in double) -- MORE exact than the reference"
+                  : "bf16, angles fp32 -- matching ComfyUI / diffusers"));
+  }
+  // Round-to-nearest-EVEN on the top 16 bits, which is what torch's
+  // `.to(torch.bfloat16)` does. The buffer stays fp32; only the VALUE is
+  // quantized, so the kernels are untouched.
+  auto bf16_rne = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    const std::uint32_t lsb  = (u >> 16) & 1u;
+    const std::uint32_t bias = 0x7fffu + lsb;
+    u += bias;
+    u &= 0xffff0000u;
+    float o;
+    std::memcpy(&o, &u, sizeof o);
+    return o;
+  };
   for (int s = 0; s < L.seq_len; ++s) {
     const double* p = &L.position_ids[(std::size_t)s * 3];
     for (int a = 0; a < 3; ++a) {
       for (int i = 0; i < F; ++i) {
-        // Evaluated in double: these are absolute positions scaled by 32
-        // over sequences tens of thousands of rows long, so the angles
-        // are large and a float accumulation would quantize the grid.
-        const double ang = p[a] * (double)_inv_freq[(std::size_t)i];
         const std::size_t o = (std::size_t)s * half + (std::size_t)(a * F + i);
-        cb[o] = (float)std::cos(ang);
-        sb[o] = (float)std::sin(ang);
+        if (keep_fp32) {
+          // The old path. Evaluated in double: the positions are absolute
+          // and scaled by 32 over tens of thousands of rows, so the
+          // angles are large.
+          const double ang = p[a] * (double)_inv_freq[(std::size_t)i];
+          cb[o] = (float)std::cos(ang);
+          sb[o] = (float)std::sin(ang);
+        } else {
+          const float ang = (float)p[a] * _inv_freq[(std::size_t)i];
+          cb[o] = bf16_rne(std::cos(ang));
+          sb[o] = bf16_rne(std::sin(ang));
+        }
       }
     }
   }

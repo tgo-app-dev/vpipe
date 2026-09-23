@@ -891,6 +891,103 @@ struct CapturingUi : public UiDelegateIntf {
 // a VAE that only matters after -- scaled down. On MiniMax-H3 the same
 // shape is 94 GB summed against 78 GB peaked, which is the difference
 // between streaming a 33B DiT and holding it.
+// plan_streaming()'s `phase` is the CALLER'S phase, and getting it wrong
+// drops the caller's own bytes out of its own verdict.
+//
+// weight_footprint() narrows its total to the phase but deduplicates
+// with a phase-BLIND test, so a dir claimed in another phase contributes
+// 0 to the total AND is skipped from the sum. A component that asks
+// about a phase it does not run in therefore sizes itself against a box
+// its own checkpoint is absent from.
+//
+// MEASURED on the M5 16 GB with Qwen-Image-2.1: the text encoder runs in
+// `condition` and is claimed there, but asked with the denoise default
+// and read 1288 MB for a 16722 MB checkpoint -- so it preloaded and put
+// 9 GB into swap. Sibling families escaped it only because their DiT
+// floors happen to clear the threshold, which is luck, not design.
+//
+// The geometry below is that bug scaled down: a BIG encoder in
+// `condition` and a SMALL DiT floor in `denoise`.
+// pin_frac is sized WHATEVER the stream verdict is, because the prefix
+// and the verdict are independent questions and only prefill-only text
+// encoders read the prefix.
+//
+// Those encoders stream unconditionally (see StreamPlan::stream), so
+// gating pin_frac on `stream` had exactly the wrong shape: on a ROOMY
+// box the verdict is "preload", the prefix stayed 0, and an encoder
+// that streams anyway then streamed with NOTHING pinned -- the worst of
+// both paths, on the machine with the most room to spare.
+TEST(model_memory, pin_frac_is_sized_even_when_the_verdict_is_preload)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-pin-frac";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = make_ckpt(root / "enc", 4u << 20);
+
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+
+  // A 128 GB box against a 4 MB checkpoint: as roomy as it gets, so the
+  // verdict is unambiguously PRELOAD and pin_frac must still be sized.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "131072", 1);
+  const auto roomy = model_memory::plan_streaming(
+      &sess, enc, std::string(), model_memory::kStreamHeadroom);
+  EXPECT_FALSE(roomy.stream);            // the DiT answer: preload
+  EXPECT_TRUE(roomy.pin_frac > 0.0);     // the encoder answer: pin it
+  std::printf("[model_memory] roomy: stream=%d pin_frac=%.2f\n",
+              (int)roomy.stream, roomy.pin_frac);
+
+  // And the ceiling stream-sizing.h budgets against still holds.
+  EXPECT_TRUE(roomy.pin_frac <= 0.60);
+
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+}
+
+TEST(model_memory, plan_streaming_counts_the_caller_in_its_own_phase)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-plan-phase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = make_ckpt(root / "enc", 16000);
+  const std::string dit = make_ckpt(root / "dit", 1200);
+
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+  mgr->declare_weights(enc, 16000, std::string(model_memory::kPhaseCondition));
+  mgr->declare_weights(dit, 1200, std::string(model_memory::kPhaseDenoise));
+
+  // THE ENCODER, asking about the phase it is actually resident in: its
+  // own 16000 bytes are in the verdict.
+  const auto cond = model_memory::plan_streaming(
+      &sess, enc, std::string(), 0, 0, model_memory::kPhaseCondition);
+  EXPECT_TRUE(cond.footprint == 16000u);
+
+  // The same call with the DENOISE default -- what it used to do -- sees
+  // a box holding only the DiT floor and none of itself. This is the
+  // defect, asserted so the two cannot silently converge again.
+  const auto den = model_memory::plan_streaming(
+      &sess, enc, std::string(), 0);
+  EXPECT_TRUE(den.footprint == 1200u);
+  EXPECT_TRUE(cond.footprint > den.footprint);
+
+  // And the DEFAULT still does the job it exists for: a DiT asking in
+  // `denoise` while naming a peer's encoder must NOT be charged for an
+  // encoder that stops existing before the first step. This is H3's
+  // case, where the verdict once turned on 1 GB.
+  const auto dit_plan = model_memory::plan_streaming(&sess, dit, enc, 0);
+  EXPECT_TRUE(dit_plan.footprint == 1200u);
+
+  fs::remove_all(root, ec);
+}
+
 TEST(model_memory, phases_peak_rather_than_sum)
 {
   namespace fs = std::filesystem;

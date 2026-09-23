@@ -178,7 +178,7 @@ bounded(const SessionContextIntf*       session,
 StreamPlan
 plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
                const std::string& enc_dir, std::size_t headroom,
-               std::size_t dit_retires)
+               std::size_t dit_retires, std::string_view phase)
 {
   StreamPlan p;
   const std::size_t ram = phys_ram();
@@ -193,7 +193,7 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   // MEASURED on a 64 GB box with the bf16 MiniMax-H3: 57 GB of
   // footprint, of which 20 GB was an encoder that no longer existed by
   // the first denoise step, and the verdict turned on 1 GB.
-  p.footprint = weight_footprint(session, {dit_dir, enc_dir}, kPhaseDenoise);
+  p.footprint = weight_footprint(session, {dit_dir, enc_dir}, phase);
   // OTHERS INCLUDES THIS DIT, AND THAT IS DELIBERATE.
   //
   // The field reads like it should not -- and it was "corrected" once to
@@ -216,7 +216,7 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   // should make growth converge better -- see
   // BlockResidency::note_landscape_changed, which is how MiniMax-H3
   // recovers the ratchet after its AdaLN bake frees 13.2 GB.
-  p.others    = weight_footprint(session, {enc_dir}, kPhaseDenoise);
+  p.others    = weight_footprint(session, {enc_dir}, phase);
   // What the phase actually removed, for the caller's log line. The
   // unphased view is the no-release worst case, so the difference is
   // exactly the bytes some peer promised to have dropped.
@@ -252,9 +252,9 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
         "already accounts {} MB; unphased {} MB",
         ram >> 20, dit_dir, dir_weights_bytes(dit_dir) >> 20,
         enc_dir, dir_weights_bytes(enc_dir) >> 20,
-        kPhaseDenoise, p.footprint >> 20,
+        phase, p.footprint >> 20,
         mgr != nullptr
-            ? mgr->phase_footprint(std::string(kPhaseDenoise)) >> 20 : 0,
+            ? mgr->phase_footprint(std::string(phase)) >> 20 : 0,
         weight_footprint(session, {dit_dir, enc_dir}) >> 20));
   }
   p.retires   = std::min(dit_retires, p.footprint);
@@ -303,7 +303,16 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   // resident. 5 GB covers activation scratch plus the in-flight block
   // and its double-buffer margin; 0.60 is the ceiling stream-sizing.h
   // budgets against.
-  if (p.stream && ram > p.others + (5ull << 30)) {
+  //
+  // Computed WHATEVER `stream` came out as, because the two answers are
+  // independent and only prefill-only text encoders read this field --
+  // no DiT does (see StreamPlan::pin_frac). Those encoders now stream
+  // unconditionally, so gating the prefix on the verdict gave exactly
+  // the wrong shape: on a ROOMY box the verdict is "preload", pin_frac
+  // stayed 0, and an encoder that streams anyway then streamed with
+  // nothing pinned -- the worst of both paths, on the machine with the
+  // most room to spare.
+  if (ram > p.others + (5ull << 30)) {
     p.pin_frac = std::min(0.60,
                           double(ram - p.others - (5ull << 30)) / double(ram));
   }

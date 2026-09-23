@@ -8,6 +8,7 @@
 #include "generative-models/qwen3/metal-qwen-vision.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -305,6 +306,19 @@ encode_references(const std::vector<MediaReference>& refs,
 
   metal_compute::MetalCompute* mc = models.mc;
 
+  // Phase timing. `tick` restarts the clock and returns the ms since the
+  // last call, so a phase is measured by bracketing it -- and nothing is
+  // measured at all when `models.log` is unset.
+  const bool timing = (bool)models.log;
+  auto mark = std::chrono::steady_clock::now();
+  auto tick = [&]() -> long long {
+    const auto t = std::chrono::steady_clock::now();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t - mark).count();
+    mark = t;
+    return (long long)ms;
+  };
+
   const double max_seconds = (double)plan.target_frames / kFps;
 
   for (std::size_t i = 0; i < refs.size(); ++i) {
@@ -312,6 +326,8 @@ encode_references(const std::vector<MediaReference>& refs,
     const std::string where = "reference " + std::to_string(i + 1);
     Reference L;
     ReferenceFit fit;
+    long long ms_audio = 0, ms_norm = 0, ms_vision = 0, ms_vae = 0;
+    int vision_frames = 0;
     fit.kind       = m.kind;
     fit.src_h      = m.height;
     fit.src_w      = m.width;
@@ -343,11 +359,13 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<float> lat;
       int frames = 0;
       std::string aerr;
+      if (timing) { (void)tick(); }
       if (!models.audio_vae->encode(pcm.data(), 2, kept, &lat, &frames,
                                     &aerr)) {
         return fail(where + ": the audio VAE encode failed (" +
                     (aerr.empty() ? "unknown error" : aerr) + ")");
       }
+      if (timing) { ms_audio = tick(); }
       const auto& ac = models.audio_vae->config();
       const int AC = ac.latent_channels;
       const bool whiten = (int)ac.latents_mean.size() == AC &&
@@ -381,6 +399,7 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<std::uint8_t> px;
       int nf = 0, th = 0, tw = 0;
       std::string nerr;
+      if (timing) { (void)tick(); }
       // A reference's own short edge wins over the plan's. Negative
       // means it did not state one.
       if (m.kind == MediaReference::Kind::kImage) {
@@ -413,6 +432,7 @@ encode_references(const std::vector<MediaReference>& refs,
         for (int c : counts) { total += c; }
         fit.rate_frames = total;
       }
+      if (timing) { ms_norm = tick(); }
       fit.canvas_h    = th;
       fit.canvas_w    = tw;
       fit.used_frames = nf;
@@ -431,6 +451,7 @@ encode_references(const std::vector<MediaReference>& refs,
       // conditioning rows, all of it the clip's vision blocks (the still
       // is encoded at its own short edge and did not move).
       if (models.vision != nullptr) {
+        if (timing) { (void)tick(); }
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
         if (m.kind == MediaReference::Kind::kImage) {
@@ -449,9 +470,11 @@ encode_references(const std::vector<MediaReference>& refs,
                         px.data() + (std::size_t)idx[k] * frame_bytes,
                         frame_bytes);
           }
+          vision_frames = (int)idx.size();
           res = models.vision->encode_video(sampled.data(), (int)idx.size(),
                                             th, tw);
         }
+        if (timing) { ms_vision = tick(); }
         if (res.embeddings.empty()) {
           return fail(where + ": the vision tower produced nothing");
         }
@@ -478,6 +501,7 @@ encode_references(const std::vector<MediaReference>& refs,
           }
         }
         fit.vae_frames = use;
+        if (timing) { (void)tick(); }
         metal_compute::SharedBuffer in =
             to_vae_input_(mc, px.data(), use, th, tw);
         if (in.empty()) { return fail(where + ": VAE input alloc failed"); }
@@ -507,7 +531,29 @@ encode_references(const std::vector<MediaReference>& refs,
         L.num_latent_frames = lf;
         L.latent_height     = lh;
         L.latent_width      = lw;
+        if (timing) { ms_vae = tick(); }
       }
+    }
+
+    if (timing) {
+      const std::string k =
+          m.kind == MediaReference::Kind::kImage   ? "image"
+          : m.kind == MediaReference::Kind::kVideo ? "video"
+                                                   : "audio";
+      models.log(
+          "[h3-refenc] " + where + " (" + k + " " +
+          std::to_string(m.num_frames) + "f " + std::to_string(m.width) + "x" +
+          std::to_string(m.height) + " -> " + std::to_string(fit.used_frames) +
+          "f " + std::to_string(fit.canvas_w) + "x" +
+          std::to_string(fit.canvas_h) + "): resize " +
+          std::to_string(ms_norm) + " ms, vision tower " +
+          std::to_string(vision_frames) + " frames " +
+          std::to_string(ms_vision) + " ms, video VAE " +
+          std::to_string(fit.vae_frames) + "f -> " +
+          std::to_string(L.num_latent_frames) + " latent " +
+          std::to_string(ms_vae) + " ms, audio VAE " +
+          std::to_string(L.num_audio_latents) + " latents " +
+          std::to_string(ms_audio) + " ms");
     }
 
     L.kind = m.kind == MediaReference::Kind::kImage ? Reference::Kind::kImage
@@ -545,12 +591,17 @@ encode_references(const std::vector<MediaReference>& refs,
       pres.push_back(std::move(p));
     }
     std::string cerr;
+    if (timing) { (void)tick(); }
     r.conditioning = models.text->encode_references(pres, prompt,
                                                     &r.token_tags,
                                                     &r.n_tokens, &cerr);
     if (r.conditioning.empty()) {
       return fail("the conditioner failed (" +
                   (cerr.empty() ? "unknown error" : cerr) + ")");
+    }
+    if (timing) {
+      models.log("[h3-refenc] presentation: " + std::to_string(r.n_tokens) +
+                 " tokens, conditioner " + std::to_string(tick()) + " ms");
     }
   }
 
