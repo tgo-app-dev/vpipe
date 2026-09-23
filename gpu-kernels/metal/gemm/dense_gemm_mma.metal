@@ -371,6 +371,148 @@ static inline void dense_gemm_mma_lora_fused_impl(
 DGVF(dense_gemm_mma_t_n128_lora_f16,     128, 128, 8)
 DGVF(dense_gemm_mma_t_n128x256_lora_f16, 128, 256, 8)
 
+// BANDED twins of the two kernels above, for a runtime LoRA that fuses
+// several separate adapters into ONE projection's output -- q, k and v
+// into MiniMax-H3's qkv_proj. Each output column belongs to exactly one
+// part and contracts only over that part's rank, so B is stored [N, R]
+// with no zeros (not the [N, parts*R] block-diagonal it would otherwise
+// be) and the tile reads the matching R-wide WINDOW of t, which is
+// [M, ldt] with the parts' ranks side by side:
+//
+//   part = (n0 / group) % parts,   t_part = t[:, part*R : part*R + R]
+//
+// `group` is how many consecutive output columns one part owns before
+// the next takes over -- a head's worth (128) where q/k/v interleave per
+// head, the whole inner width where they are three flat blocks. The tile
+// must not straddle a group (group % BN == 0), which the host checks; a
+// tile that did would contract half its columns against the wrong part.
+// The window is a strided view of t, so nothing is copied.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_lora_band_impl(
+    const device VPIPE_ELT* t, const device VPIPE_ELT* Bf,
+    device VPIPE_ELT* y, int R, int N, int M, int ldt, int group,
+    int parts, uint3 tgid)
+{
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  const int part = (n0 / group) % parts;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tT(const_cast<device VPIPE_ELT*>(t) + part * R,
+        dextents<int32_t, 2>(R, M), metal::array<int32_t, 2>{1, ldt});
+  TX tB(const_cast<device VPIPE_ELT*>(Bf), dextents<int32_t, 2>(R, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  auto mT = tT.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mT), decltype(mB), VPIPE_ELT>();
+  cT.load(mY);
+  op.run(mT, mB, cT);
+  cT.store(mY);
+}
+
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_lora_fused_band_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* t, const device VPIPE_ELT* Bf,
+    device VPIPE_ELT* y, int K, int N, int M, int R, int ldt, int group,
+    int parts, uint3 tgid)
+{
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  const int part = (n0 / group) % parts;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x),  dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W),  dextents<int32_t, 2>(K, N));
+  TX tT(const_cast<device VPIPE_ELT*>(t) + part * R,
+        dextents<int32_t, 2>(R, M), metal::array<int32_t, 2>{1, ldt});
+  TX tB(const_cast<device VPIPE_ELT*>(Bf), dextents<int32_t, 2>(R, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  // The same two descriptors, in the same order, as the unbanded fused
+  // tile -- see dense_gemm_mma_lora_fused_impl for why the BASE keeps the
+  // plain mode and only the delta accumulates.
+  constexpr auto desc_mul = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  constexpr auto desc_acc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc_mul, execution_simdgroups<SG>> op;
+  matmul2d<desc_acc, execution_simdgroups<SG>> op_acc;
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto mT = tT.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  op_acc.run(mT, mB, cT);
+  cT.store(mY);
+}
+
+// Buffers 0-10 as DGVF (R is the PER-PART rank); 11: ldt 12: group
+// 13: parts.
+#define DGVFB(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const device VPIPE_ELT* t [[buffer(8)]],                           \
+      const device VPIPE_ELT* Bf [[buffer(9)]],                          \
+      const constant int& R [[buffer(10)]],                             \
+      const constant int& ldt [[buffer(11)]],                           \
+      const constant int& group [[buffer(12)]],                         \
+      const constant int& parts [[buffer(13)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_lora_fused_band_impl<BM, BN, SG>(                     \
+        x, W, t, Bf, y, K, N, M, R, ldt, group, parts, tgid);            \
+  }
+DGVFB(dense_gemm_mma_t_n128_lora_band_f16,     128, 128, 8)
+DGVFB(dense_gemm_mma_t_n128x256_lora_band_f16, 128, 256, 8)
+
+// The separate second GEMM, banded: 0: t, 1: B [N, R], 3: y, 4: R (the
+// PER-PART rank), 5: N, 6: M, 9: ldt, 10: group, 11: parts. Slots 2, 7
+// and 8 are unread, kept so the host binds it like the acc tiles.
+#define DGVLB(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const constant float& scale [[buffer(8)]],                        \
+      const constant int& ldt [[buffer(9)]],                            \
+      const constant int& group [[buffer(10)]],                         \
+      const constant int& parts [[buffer(11)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias; (void)scale;                             \
+    dense_gemm_mma_lora_band_impl<BM, BN, SG>(                           \
+        x, W, y, K, N, M, ldt, group, parts, tgid);                      \
+  }
+DGVLB(dense_gemm_mma_t_n128_acc_band_f16,     128, 128, 8)
+DGVLB(dense_gemm_mma_t_n128x256_acc_band_f16, 128, 256, 8)
+
 #define DGVL(NAME, BM, BN, SG, ACC)                                      \
   kernel void NAME(                                                      \
       const device VPIPE_ELT* x [[buffer(0)]],                           \
@@ -2396,6 +2538,10 @@ DGV_STUB(dense_gemm_mma_t_n128_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128_lora_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_lora_f16)
+DGV_STUB(dense_gemm_mma_t_n128_lora_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_lora_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128_acc_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_acc_band_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k8192_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k6784_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k3392_f16)

@@ -41,6 +41,44 @@ struct Factors {
   metal_compute::SharedBuffer a, b;
   int rank = 0;
   bool empty() const { return rank <= 0 || a.empty() || b.empty(); }
+
+  // BANDED: several separate adapters fused into one projection's output
+  // WITHOUT a block-diagonal B. A is still the parts' A stacked on the
+  // rank axis ([rank, k], rank = parts * part_rank), so the first GEMM
+  // is unchanged -- but B is [n, part_rank], and output row `c` belongs
+  // to part (c / group) % parts and contracts only over that part's
+  // window of t = x A^T. `group` is how many consecutive output rows one
+  // part owns before the next takes over. 0 means an ordinary dense pair.
+  //
+  // What it saves is the zeros: a block-diagonal B is `parts` times the
+  // size and does `parts` times the second GEMM's work, (parts-1)/parts
+  // of it on zeros. EVERY consumer of a Factors has to know this form --
+  // a kernel that reads `b` as [n, rank] reads past a banded B -- which
+  // is why only a family whose kernels all carry the banded variant
+  // asks for one (bind_banded), and every other family never sees it.
+  int parts = 1;
+  int group = 0;
+  bool banded() const { return group > 0 && parts > 1; }
+  // What the SECOND GEMM contracts over: the per-part rank when banded.
+  int b_rank() const { return banded() ? rank / parts : rank; }
+};
+
+// The same pair on the HOST in f32, for a projection the model runs on
+// the CPU. Same orientation (A [rank, k], B [n, rank]) and the same
+// contract: the file's alpha/rank is already folded into A, the
+// caller's strength is not.
+//
+// A separate type rather than a readback of Factors because the one
+// adapter that needs it stores those factors in f32 ON PURPOSE: the
+// timestep MLP it adapts is an f32 module, and rounding its update to
+// bf16 would reintroduce the bias that keeping the MLP in f32 exists to
+// avoid.
+struct HostFactors {
+  std::vector<float> a, b;
+  int rank = 0, n = 0, k = 0;
+  bool empty() const { return rank <= 0 || a.empty() || b.empty(); }
+  // y[n] += s * B (A x[k]). No-op when empty or `s` is 0.
+  void apply(const float* x, float s, float* y) const;
 };
 
 // An opened adapter file, queried per module.
@@ -85,6 +123,17 @@ public:
   // ordinary case rather than an error.
   bool bind(const std::string& module, int n, int k, Factors* out);
 
+  // bind(), for a projection the model computes on the HOST: the factors
+  // come back as f32 vectors at the file's own precision instead of
+  // bf16 GPU buffers. Counted as a bound module like any other, but NOT
+  // toward max_rank(), which sizes the GPU scratch these never touch.
+  bool bind_host(const std::string& module, int n, int k, HostFactors* out);
+
+  // One `__metadata__` entry of the file, or "" when absent. For an
+  // adapter that states facts about ITSELF there -- a sampling grid,
+  // a blend factor -- which no tensor carries.
+  std::string metadata(const std::string& key) const;
+
   // Does the file carry `module` at all, under any spelling this
   // adapter knows? For choosing BETWEEN layouts before binding either:
   // a publisher may ship one adapter decomposed two ways, and which one
@@ -116,9 +165,10 @@ public:
   // The zeros are the price and they are not small: a fused B is
   // `parts` times the size of the separate ones and two thirds of it is
   // zero. It buys a destination the accumulating GEMM can write
-  // CONTIGUOUSLY, where three separate applications would each need a
-  // column band of one wider matrix, which is a strided store no kernel
-  // here has. The published fused adapters pay the same price on disk.
+  // CONTIGUOUSLY with no kernel knowing anything about parts. The
+  // published fused adapters pay the same price on disk. A family whose
+  // second-factor kernels read a per-tile window of t can avoid it
+  // entirely -- see bind_banded.
   //
   // Each part's own alpha/rank folds into ITS OWN slice of A before the
   // stack, so parts of different rank compose correctly and no global
@@ -131,6 +181,19 @@ public:
   // a fused adapter is not a weaker adapter but a wrong one.
   bool bind_fused(const std::vector<std::string>& modules, int n, int k,
                   Factors* out, const RowMap& rows);
+
+  // bind_fused, BANDED (see Factors::banded): the same A, and a compact
+  // B with each destination row holding only its own part's factors.
+  //
+  // It needs what the band form assumes, and says false -- binding
+  // NOTHING, so the caller can fall back to bind_fused -- when it does
+  // not hold: every part present with the SAME rank, and `rows` placing
+  // part p's rows exactly where (row / group) % parts == p. That second
+  // condition is checked row by row rather than trusted: a map that
+  // broke it would contract some outputs against another part's rank,
+  // which is a wrong answer and not a slow one.
+  bool bind_banded(const std::vector<std::string>& modules, int n, int k,
+                   int group, Factors* out, const RowMap& rows);
 
   // Is `f`'s B block-diagonal over `parts` equal row bands -- band j
   // nonzero only in rank band j?
@@ -213,6 +276,8 @@ private:
   bool factor_meta_(const std::string& key, int* rank, float* mul);
   // One factor as bf16, scaled by `m`.
   metal_compute::SharedBuffer take_(const std::string& name, float m);
+  // One factor as f32, scaled by `m`.
+  bool take_f32_(const std::string& name, float m, std::vector<float>* out);
 
   metal_compute::MetalCompute* _mc = nullptr;
   std::unique_ptr<MetalLlamaWeights> _w;

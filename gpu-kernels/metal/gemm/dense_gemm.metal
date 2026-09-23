@@ -163,7 +163,17 @@ template <
     // buffer. A runtime LoRA needs exactly this: its second factor has to
     // land ON TOP of the base projection, and materializing the delta in
     // its own [M, N] buffer would cost 817 MB at H3's qkv width.
-    const bool ACC = false>
+    const bool ACC = false,
+    // BAND reads x as a WINDOW of a wider matrix: x is [M, ldx] and the
+    // tile at output column y_col contracts over columns
+    // [p*K, p*K + K) of it, p = (y_col / band_group) % band_parts. It is
+    // how a runtime LoRA whose output rows belong to SEVERAL adapters
+    // (q, k, v fused into one projection) runs its second factor without
+    // a block-diagonal B: each output row has only its own part's rank
+    // to contract over, so B is stored [N, K] with no zeros and the tile
+    // picks the matching window of t = x A^T. The caller guarantees a
+    // BN-wide tile never straddles a group (band_group % BN == 0).
+    const bool BAND = false>
 METAL_FUNC void dense_gemm_t_impl(
     const device T* x,
     const device T* W,
@@ -180,7 +190,10 @@ METAL_FUNC void dense_gemm_t_impl(
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid,
-    const float acc_scale = 1.0f) {
+    const float acc_scale = 1.0f,
+    const int ldx = 0,
+    const int band_group = 1,
+    const int band_parts = 1) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   constexpr int WM = 2;
@@ -218,13 +231,21 @@ METAL_FUNC void dense_gemm_t_impl(
       k0 = (lo > 0) ? (lo / BK) * BK : 0;
     }
   }
-  x += y_row * static_cast<int64_t>(K);
+  // x's row stride: K, or the full width of the matrix a BAND tile
+  // reads its window of. Compile-time for every other instantiation, so
+  // they are unchanged.
+  int x_ld = K;
+  if (BAND) {
+    x_ld = ldx;
+    x += ((y_col / band_group) % band_parts) * K;
+  }
+  x += y_row * static_cast<int64_t>(x_ld);
   W += y_col * static_cast<int64_t>(K);
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
-  loader_x_t loader_x(x + k0, K, Xs, simd_gid, simd_lid);
+  loader_x_t loader_x(x + k0, x_ld, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(W + k0, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
@@ -365,6 +386,42 @@ kernel void dense_gemm_t_bm64_acc_f16(
                     float, /*ACC=*/true>(
       x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
       tid, simd_gid, simd_lid, scale);
+}
+
+// BANDED twin of dense_gemm_t_bm64_acc_f16: y += scale * (t_p @ B^T),
+// where t_p is the rank window of t = x A^T that output column n's part
+// owns (see BAND in dense_gemm_t_impl). For a runtime LoRA that fuses
+// several separate adapters into one projection -- q, k and v into H3's
+// qkv_proj -- without the block-diagonal B that would multiply zeros for
+// two thirds of its rank. BN = 32, so any group that is a multiple of 32
+// keeps every tile inside one part.
+//
+//   9: ldx (t's row stride, the stacked rank)  10: group  11: parts
+kernel void dense_gemm_t_bm64_acc_band_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    const constant float& scale  [[buffer(8)]],
+    const constant int& ldx      [[buffer(9)]],
+    const constant int& group    [[buffer(10)]],
+    const constant int& parts    [[buffer(11)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/true, /*BAND=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid, scale, ldx, group, parts);
 }
 
 // FP16-pipe (AccumT=half) twin of dense_gemm_t_bm64_f16 (see the AccumT

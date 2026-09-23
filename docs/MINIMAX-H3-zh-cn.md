@@ -48,6 +48,10 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [同时用两个](#two-at-once)
     - [合并，以及为什么它会丢掉这个适配器的大部分](#merging-and-why-it-loses-most-of-this-adapter)
     - [哪些 Turbo 适配器可用](#which-turbo-adapters-work)
+  - [八步——HyperFlow](#eight-steps--hyperflow)
+    - [获取，然后指定它](#fetch-it-then-name-it)
+    - [它的不同之处](#what-makes-it-different)
+    - [代价](#what-it-costs-1)
   - [更快的注意力——VDN 线性分支](#faster-attention--the-vdn-linear-branch)
     - [获取并运行](#get-it-and-run-it)
     - [能省多少](#what-it-saves)
@@ -1391,7 +1395,9 @@ alpha 8 与融合版 384 上的 24 是同样的强度。
 针对某一种 qkv 列分组构建的——在现存的每一个情形里都是扁平分组——所以它用在
 另一个发布方的权重上会无声地出错。而从拆分文件做融合是针对实际加载的那个 DiT
 进行的，所以它在两边都对。它的下载也更小，1.38 GB 对 1.96，差别就是块对角 `B`
-中为零的那三分之二。但模型并不更小：无论走哪条路，融合都是在加载时重建的。
+中为零的那三分之二——而且模型也更小，原因相同：拆分的 q/k/v 是以*分带*方式融合的，
+每个输出行只保留它自己那一部分的因子；而已发布的融合版把这些零带进来，在内存里
+也照样占着。
 
 lightx2v 的 `_comfyui_` 版 `qkv_proj` 是 rank 384——三个 rank-128 适配器堆叠
 起来——而这种堆叠方式正好能看出它假定了哪个基础模型：它的 `B` 是在
@@ -1403,6 +1409,110 @@ lightx2v 的 `_comfyui_` 版 `qkv_proj` 是 rank 384——三个 rank-128 适配
 发布版上，它会把一个头的 `q` 增量加到另一个头的 `k` 上，50 个 block 全都如此，
 而且没有任何东西会报出来。这正是拆分文件不存在的问题：它们的 q、k、v 是分开
 到达、在这里融合的，融进所加载的那个 DiT 实际采用的分组。
+
+<a id="eight-steps--hyperflow"></a>
+### 八步——HyperFlow
+
+[HyperFlow](https://huggingface.co/videorebirth/hyperflow)（Video Rebirth）
+是把步数降下来的第二种办法，而且和上面的 Turbo 适配器不是同一类东西。它是一个
+8 步的**流映射（flow map）**自蒸馏：每一步都以它所积分的区间 `(t, r)`——从哪里
+出发、落到哪里——为条件，而不是只以时刻 `t` 为条件。它用**一个文件**覆盖全部三种
+工作流（`t2va`、`fl2va`、`ref2va`）。
+
+<a id="fetch-it-then-name-it"></a>
+#### 获取，然后指定它
+
+[`prepare-minimax-h3-hyperflow.vpipeline`](pipelines/prepare-minimax-h3-hyperflow.vpipeline)
+负责下载（2.8 GB）并把它注册为 `videorebirth/hyperflow`：
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-hyperflow.vpipeline
+```
+
+[`minimax-h3-text-to-video-hyperflow.vpipeline`](pipelines/minimax-h3-text-to-video-hyperflow.vpipeline)
+就是第 2 步的那张图，只是在配置 stage 上指定了这个适配器：
+
+```json
+"lora": "videorebirth/hyperflow",
+"lora_scale": 1.0
+```
+
+**Ref2VA** 的图请改用 `videorebirth/hyperflow-ref2va`——同一个文件，在模型目录里
+登记了第二次，好让 Browse 列表在参考图模式下也能列出它。任何 FL2VA 的图（首帧、
+首尾帧）用普通的那个键即可。
+
+改动就这么多。**你不需要设置步数。**适配器文件里写明了它蒸馏时用的 sigma 网格——
+9 个点、8 次前向——只要适配器在生效，vpipe 就跑这个网格；日志会说明这一点，而图里
+的 `steps` 在此期间不会被使用：
+
+```
+GenerateVideoStage('generate-video'): HyperFlow 1.0 on lora slot 0 --
+8-step flow-map grid from the adapter (`steps: 8` is not used while it is
+live), two-time embedding at gate 0.25
+```
+
+`video_shift` / `audio_shift` 保持 **12 / 3**，这是这个模型的默认值，也是适配器
+训练时用的 shift。网格会按图里设置的 shift 来变换（上游也是这么做的），但不一致
+时会给出警告：质量只在训练时的数值上验证过。
+
+`lora_scale` 保持 **1.0**。设为 **0** 时模型就精确地回到原始模型——适配器的两半
+一起关掉，所以一张图可以用同一个已加载的模型对比两者——但介于两者之间的数值是
+适配器从未训练过的状态。HyperFlow 占一个适配器槽位，所以风格或人物适配器仍然可以
+放在 `lora2`。同时加载两个流映射适配器会被拒绝。和 **Turbo** 适配器搭配不会被
+拒绝，但也没有用：两者都是同一个模型的蒸馏，会叠加在一起。
+
+<a id="what-makes-it-different"></a>
+#### 它的不同之处
+
+Turbo 适配器只是一个 LoRA：同样的 block、固定的调度，只是步数更少。HyperFlow 是
+一个 LoRA 再加上恰好一处结构改动，位置在时间步 MLP。除了模型文件自带的时间嵌入器，
+它还带有一个**终点（endpoint）**嵌入器——前者的一份拷贝，配有自己的适配器——
+用来嵌入 `r`，两者在每个 AdaLN 读取之前按下式混合：
+
+```
+temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
+```
+
+所以每一步每一行需要两个数，而原来只需要一个。生成的视频行走
+`(t_video, r_video)`，生成的音频行走 `(t_audio, r_audio)`，各自在自己变换后的网格
+上。条件行——关键帧、参考帧、参考音轨——没有要去的地方，所以那里 `r == t`。每一步
+的 AdaLN 表是按 `(t, r)` 对烘焙的，所以烘焙依然适用。
+
+时间步 MLP 在主机上以 f32 运行，这个适配器属于它的那部分也一样：文件有意以 f32
+发布这些因子，它们从不经过 bf16。与上游自己的 `TwoTimeEmbedder` 对照，在一次 8 步
+运行用到的每一个 `(t, r)` 对上，嵌入的相对误差约为 **1e-6**。适配器本身让它变化了
+**9%**，所以这个检查有五个数量级的余量。调度与上游**逐位一致**。
+
+文件的其余部分是熟悉的 diffusers 分解——拆分的 `to_q`/`to_k`/`to_v`、value 在前的
+`ff.net.0.proj`、refiner block——在这里融合进所加载的 DiT 实际采用的 qkv 分组，
+和 lightx2v 的拆分文件完全一样。和这里的每个适配器一样，它在运行时应用。
+
+<a id="what-it-costs-1"></a>
+#### 代价
+
+在一台 M4 Pro（64 GB）上测得，8 位 FL2VA 模型预加载，640 × 352 × 56 帧
+（3943 行），在同一段时间里先后运行：
+
+| | 前向次数 | 每次前向 | 去噪 |
+|---|---:|---:|---:|
+| 原始模型，`steps: 8` | 7 | 27.7 s | 194 s |
+| 原始模型，`steps: 16`（良好质量） | 15 | 27.7 s | 约 415 s |
+| **HyperFlow** | **8** | **30.2 s** | **241 s** |
+
+适配器让每次前向**慢 9%**。它换来的是步数：原始模型要 15 步以上的片段，它 8 次
+前向就完成。加载到内存里适配器约 **2.8 GB**，与磁盘上相同。它的 q/k/v 是同一个融合
+投影上的三个秩 256 的适配器，每个输出行只与它自己那一部分做收缩；等价的单个秩 768
+更新会有三分之二是零——多占 1.1 GB，在 M4 Pro 与 M5 Pro 上交错实测每次前向慢
+1.4–2.2%。
+
+同一个种子跑两次，得到逐位相同的视频。
+
+**配合 Sol-Attn。**上游为这个 8 步网格发布了一份 Sol-Attn 配方：前 **2 步**和前
+**2 个 block** 保持 dense，`tau` 取 1.0。在 vpipe 里就是在 `generate-video` 上
+`sol_attn: true` 旁边设 `sol_dense_steps: 2`、`sol_dense_layers: 2` 与
+`sol_tau: 1.0`。dense 的那一步已验证与不路由的模型完全一致，但两者组合后的画面质量
+在这里没有测过——请在你熟悉的种子上判断。见
+[更快的注意力——Sol-Attn 路由](#faster-attention--sol-attn-routing)。
 
 <a id="faster-attention--the-vdn-linear-branch"></a>
 ### 更快的注意力——VDN 线性分支
@@ -1668,6 +1778,7 @@ FL2VA 的块训练出来的。只需在 `generate-video` 上加一个开关：
 | `sol_tau` | `1.0` | 以标准差为单位。数值越高保留的分块越少：速度上升、质量下降，两者都是单调的。 |
 | `sol_key_block` | `64` | **只能取 32 或 64。** 32 做更多精确计算，更慢也更忠实——32 个 key 上的质心对它们的替代效果更好，而分块减半会让路由和摘要序列都翻倍。更大的分块实测在两方面都更差，因此会被拒绝，并给出警告并回退到 64。 |
 | `sol_dense_layers` | `1` | 前若干个块保持稠密。第一个块是残差流冗余度最低的地方，而它只是 50 个中的 1 个。 |
+| `sol_dense_steps` | `0` | 前若干个去噪步保持稠密——`sol_dense_layers` 在时间轴上的对应项。最前面的几步决定片段的大致结构。HyperFlow 发布的配方在它的 8 步里取 2。 |
 | `sol_local_radius` | `1` | query 自身所在分块两侧的分块，无论路由怎么判定都保持精确。 |
 
 它可以和 [Turbo LoRA](#fewer-steps--the-turbo-lora) 以及 `i8_gemm` 组合使用，

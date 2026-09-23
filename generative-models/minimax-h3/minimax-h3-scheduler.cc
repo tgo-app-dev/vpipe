@@ -12,6 +12,7 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
 {
   _sigmas.clear();
   _timesteps.clear();
+  _endpoints.clear();
   if (num_steps < 2 || !(_shift > 0.0)) { return false; }
 
   // torch.linspace(1, 0, n) in float32, then the exponential shift.
@@ -48,12 +49,52 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
     if (_sigmas.empty() || _sigmas.back() != s) { _sigmas.push_back(s); }
   }
   if (_sigmas.size() < 2 || _sigmas.back() != 0.0f) { return false; }
+  derive_();
+  return true;
+}
 
+bool
+MiniMaxH3Scheduler::set_sigmas(const std::vector<float>& raw)
+{
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || raw.size() < 2) { return false; }
+  auto strictly_down = [](const std::vector<float>& g) {
+    for (std::size_t i = 1; i < g.size(); ++i) {
+      if (!(g[i] < g[i - 1])) { return false; }
+    }
+    return true;
+  };
+  if (raw.front() > 1.0f || raw.back() != 0.0f || !strictly_down(raw)) {
+    return false;
+  }
+  // Upstream's shift_sigmas: `shift * base / (1.0 + (shift - 1.0) * base)`
+  // over a float32 tensor with Python-float scalars -- every op rounds to
+  // float32, in this order. Same expression as set_timesteps' grid.
+  const float sh  = (float)_shift;
+  const float sh1 = (float)(_shift - 1.0);
+  std::vector<float> g;
+  g.reserve(raw.size());
+  for (float base : raw) { g.push_back(sh * base / (1.0f + sh1 * base)); }
+  if (g.back() != 0.0f || !strictly_down(g)) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+void
+MiniMaxH3Scheduler::derive_()
+{
+  _timesteps.clear();
+  _endpoints.clear();
   _timesteps.reserve(_sigmas.size() - 1);
+  _endpoints.reserve(_sigmas.size() - 1);
   for (std::size_t i = 0; i + 1 < _sigmas.size(); ++i) {
     _timesteps.push_back(1.0f - _sigmas[i]);
+    // upstream endpoints_from_sigmas: 1.0 - sigmas[1:], float32.
+    _endpoints.push_back(1.0f - _sigmas[i + 1]);
   }
-  return true;
 }
 
 bool

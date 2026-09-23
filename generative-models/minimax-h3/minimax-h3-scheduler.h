@@ -48,12 +48,28 @@ class MiniMaxH3Scheduler {
   // SHORTER than the requested step count.
   bool set_timesteps(int num_steps);
 
+  // Rebuild the schedule from an explicit RAW grid instead of linspace:
+  // `raw` is pushed through the same shift and then installed verbatim --
+  // no deduplication, since a grid someone chose is not expected to
+  // collide and silently dropping a point would change the step count a
+  // distillation was trained at. This is how a few-step distillation
+  // that names its own grid is run (HyperFlow's 9 points, 8 forwards).
+  //
+  // False unless `raw` is strictly decreasing, starts at or below 1 and
+  // ends at exactly 0 -- and unless the SHIFTED grid still is, which is
+  // diffusers' own check on a grid handed to set_timesteps(sigmas=).
+  bool set_sigmas(const std::vector<float>& raw);
+
   // Sigma grid, descending, terminating at exactly 0. Size is one more
   // than timesteps().
   const std::vector<float>& sigmas() const { return _sigmas; }
   // The timestep the transformer is conditioned on at each step,
   // `1 - sigma`, ASCENDING towards 1 (clean).
   const std::vector<float>& timesteps() const { return _timesteps; }
+  // Where each step LANDS on the same axis, `1 - sigma[i+1]` -- the
+  // interval (timesteps()[i], endpoints()[i]) is what a flow-map adapter
+  // conditions step i on. Same size as timesteps(); the last is 1.
+  const std::vector<float>& endpoints() const { return _endpoints; }
   int num_inference_steps() const { return (int)_timesteps.size(); }
   double shift() const { return _shift; }
 
@@ -102,6 +118,10 @@ class MiniMaxH3Scheduler {
   double             _shift;
   std::vector<float> _sigmas;
   std::vector<float> _timesteps;
+  std::vector<float> _endpoints;
+
+  // timesteps / endpoints from `_sigmas`, float32 as the reference does.
+  void derive_();
 };
 
 }  // namespace genai

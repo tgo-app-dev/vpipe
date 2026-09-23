@@ -2452,6 +2452,15 @@ const STRINGS = {
       '開頭有多少個 transformer block 保持 DENSE，不被 Sol-Attn 觸碰。最前面'
       + '的幾個 block 正是殘差流冗餘最少的地方；已發布的檔位在 48 個裡留 1 個'
       + '。0 表示每個 block 都路由'],
+  'cfg.generate-video.sol_dense_steps': ['',
+      '开头有多少个去噪步保持 DENSE，不被 Sol-Attn 触碰——sol_dense_layers 在'
+      + '时间轴上的对应项。最前面的几步决定片段的大致结构，路由近似在这里代价'
+      + '最大。0（默认）表示每一步都路由。HyperFlow 为它的 8 步网格发布的 Sol '
+      + '配方是这里取 2，配合 sol_dense_layers 2 与 sol_tau 1.0。仅 minimax-h3',
+      '開頭有多少個去噪步保持 DENSE，不被 Sol-Attn 觸碰——sol_dense_layers 在'
+      + '時間軸上的對應項。最前面的幾步決定片段的大致結構，路由近似在這裡代價'
+      + '最大。0（預設）表示每一步都路由。HyperFlow 為它的 8 步網格發布的 Sol '
+      + '配方是這裡取 2，配合 sol_dense_layers 2 與 sol_tau 1.0。僅 minimax-h3'],
   'cfg.generate-video.sol_key_block': ['',
       '由一个质心概括多少个 key，也就是路由所依据的单位。只能是 32 或 64；'
       + '0（默认）取 64，也就是已发布的取值。两者是相互权衡而不是一方压倒另一'

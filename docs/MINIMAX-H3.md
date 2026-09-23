@@ -50,6 +50,10 @@ arrives in **8–16 steps** instead of 30+.
     - [Two at once](#two-at-once)
     - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
     - [Which Turbo adapters work](#which-turbo-adapters-work)
+  - [Eight steps — HyperFlow](#eight-steps--hyperflow)
+    - [Fetch it, then name it](#fetch-it-then-name-it)
+    - [What makes it different](#what-makes-it-different)
+    - [What it costs](#what-it-costs-1)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
@@ -1559,8 +1563,10 @@ fusion is built for one qkv column grouping — flat, in every case that
 exists — so it is silently wrong on the other publisher's weights. Fusing from
 the split file happens against the DiT actually loaded, so it is right on
 both. It is also the smaller download, 1.38 GB against 1.96, the difference
-being the two thirds of a block-diagonal `B` that is zero. Not the smaller
-model: the fusion is rebuilt at load either way.
+being the two thirds of a block-diagonal `B` that is zero — and the smaller
+model, for the same reason: split q/k/v are fused *banded*, each output row
+keeping only its own part's factors, where a published fusion arrives with
+the zeros built in and holds them in RAM too.
 
 lightx2v's `_comfyui_` `qkv_proj` is rank 384 — three rank-128 adapters
 stacked — and that stacking is how you can tell which base it assumes: its
@@ -1574,6 +1580,121 @@ flat grouping. Applied to the per-head release it would add one head's `q`
 delta onto another head's `k`, in all 50 blocks, with nothing to report. This
 is exactly the case the split files do not have: their q, k and v arrive
 separately and are fused here, into whichever grouping the loaded DiT has.
+
+### Eight steps — HyperFlow
+
+[HyperFlow](https://huggingface.co/videorebirth/hyperflow) (Video Rebirth) is
+a second way to buy the step count down, and a different kind of adapter from
+the Turbo ones above. It is an 8-step **flow-map** self-distillation: every
+step is conditioned on the interval it integrates, `(t, r)` — where it starts
+and where it lands — rather than on the point `t`. It covers all three
+workflows (`t2va`, `fl2va`, `ref2va`) with **one file**.
+
+#### Fetch it, then name it
+
+[`prepare-minimax-h3-hyperflow.vpipeline`](pipelines/prepare-minimax-h3-hyperflow.vpipeline)
+fetches it (2.8 GB) and registers it as `videorebirth/hyperflow`:
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-hyperflow.vpipeline
+```
+
+[`minimax-h3-text-to-video-hyperflow.vpipeline`](pipelines/minimax-h3-text-to-video-hyperflow.vpipeline)
+is the step-2 graph with the adapter named on the config stage:
+
+```json
+"lora": "videorebirth/hyperflow",
+"lora_scale": 1.0
+```
+
+For a **Ref2VA** graph name `videorebirth/hyperflow-ref2va` instead — the same
+file, catalogued a second time so the Browse list offers it under the
+reference partition. Any FL2VA graph (first frame, first-and-last) takes the
+plain key.
+
+That is the whole change. **You do not set a step count.** The adapter's file
+states the sigma grid it was distilled on — nine points, eight forwards — and
+vpipe runs that grid whenever the adapter is live; the log says so, and the
+graph's `steps` is not used while it is:
+
+```
+GenerateVideoStage('generate-video'): HyperFlow 1.0 on lora slot 0 --
+8-step flow-map grid from the adapter (`steps: 8` is not used while it is
+live), two-time embedding at gate 0.25
+```
+
+Keep `video_shift` / `audio_shift` at **12 / 3**, this model's defaults and
+the shifts the adapter was trained at. The grid is shifted with whatever the
+graph says, as upstream does, but a mismatch is warned about: quality is only
+validated at the trained values.
+
+Keep `lora_scale` at **1.0**. At **0** the model is exactly the base model
+again — both halves of the adapter switch off together, so a graph can A/B the
+two from one loaded model — but values in between are a state the adapter was
+never trained in. HyperFlow takes one adapter slot, so a style or identity
+adapter can still ride in `lora2`. Two flow-map adapters at once are refused.
+Pairing it with a **Turbo** adapter is not refused, and is not useful: both are
+distillations of the same model and they would stack.
+
+#### What makes it different
+
+A Turbo adapter is a LoRA and nothing else: the same blocks, a fixed schedule,
+fewer of them. HyperFlow is a LoRA plus exactly one architectural change, at
+the timestep MLP. Beside the checkpoint's own time embedder it carries an
+**endpoint** embedder — a copy of it with its own adapter — that embeds `r`,
+and the two are blended before every AdaLN reads them:
+
+```
+temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
+```
+
+So each step needs two numbers per row where it used to need one. Generated
+video rows step `(t_video, r_video)` and generated audio rows
+`(t_audio, r_audio)`, each on its own shifted grid. Conditioning rows —
+keyframes, reference frames, a reference soundtrack — have nowhere to go, so
+`r == t` there. The per-step AdaLN tables are baked from `(t, r)` pairs, so
+the bake still applies.
+
+The timestep MLP runs on the host in f32, and so does this adapter's part of
+it: the file ships those factors in f32 on purpose, and they never pass
+through bf16. Checked against upstream's own `TwoTimeEmbedder`, the embedding
+agrees to about **1e-6** relative on every `(t, r)` pair an 8-step run uses.
+The adapter moves it by **9%**, so the check has five orders of magnitude of
+margin. The schedule is **bit-identical** to upstream's.
+
+The rest of the file is the familiar diffusers decomposition — split
+`to_q`/`to_k`/`to_v`, value-first `ff.net.0.proj`, the refiner blocks —
+fused here into whichever qkv grouping the loaded DiT has, exactly as for
+lightx2v's split files. It is applied at runtime, as every adapter here is.
+
+#### What it costs
+
+Measured on an M4 Pro (64 GB) with the 8-bit FL2VA checkpoint preloaded, at
+640 × 352 × 56 frames (3943 rows), one after the other in one sitting:
+
+| | forwards | per forward | denoise |
+|---|---:|---:|---:|
+| base, `steps: 8` | 7 | 27.7 s | 194 s |
+| base, `steps: 16` (good quality) | 15 | 27.7 s | ~415 s |
+| **HyperFlow** | **8** | **30.2 s** | **241 s** |
+
+The adapter makes each forward **9% slower**. What it buys is the step
+count: eight forwards for a clip the base model wants fifteen or more for.
+Held in RAM the adapter is about **2.8 GB**, what it is on disk. Its q/k/v
+parts are three rank-256 adapters on one fused projection, and each output row
+contracts only against its own part. The equivalent single rank-768 update
+would be two thirds zeros — 1.1 GB more, and 1.4–2.2% slower per forward in
+interleaved measurements on the M4 Pro and the M5 Pro.
+
+Two runs of the same seed produce bit-identical video.
+
+**With Sol-Attn.** Upstream publishes a Sol-Attn recipe for the 8-step grid:
+keep the first **2 steps** and the first **2 blocks** dense, at `tau` 1.0. In
+vpipe that is `sol_dense_steps: 2`, `sol_dense_layers: 2` and `sol_tau: 1.0` on
+`generate-video` beside `sol_attn: true`. A dense step is verified to be the
+unrouted model exactly, but the combination's picture quality has not been
+measured here — judge it on a seed you know. See
+[Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing).
 
 ### Faster attention — the VDN linear branch
 
@@ -1878,6 +1999,7 @@ was measured at.
 | `sol_tau` | `1.0` | In standard deviations. Higher keeps fewer blocks: speed rises and quality falls, monotonically in both. |
 | `sol_key_block` | `64` | **32 or 64 only.** 32 does more exact work, is slower and is more faithful — a centroid over 32 keys stands in for them better, while halving the block doubles both the routing and the summary sequence. Larger blocks were measured and lose on both counts, so they are declined with a warning and a fall back to 64. |
 | `sol_dense_layers` | `1` | Leading blocks left dense. The first block is where the residual stream is least redundant, and it is one of 50. |
+| `sol_dense_steps` | `0` | Leading denoising steps left dense — the time-axis twin of `sol_dense_layers`. The first steps decide a clip's coarse structure. HyperFlow's published recipe uses 2 of its 8. |
 | `sol_local_radius` | `1` | Blocks either side of the query's own kept exact whatever the routing says. |
 
 It composes with the [Turbo LoRA](#fewer-steps--the-turbo-lora) and with

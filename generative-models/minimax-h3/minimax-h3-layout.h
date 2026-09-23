@@ -249,6 +249,30 @@ void build_row_timesteps(const PackedLayout& layout, float video_timestep,
                          std::vector<int>* row_index_out,
                          float condition_audio_timestep = 1.0f);
 
+// build_row_timesteps for a FLOW-MAP adapter (HyperFlow): every row also
+// carries the ENDPOINT its step aims at, and the distinct entries are
+// (t, r) PAIRS.
+//
+// Generated video rows (and text, which follows video) step
+// (video_timestep, video_endpoint); generated audio rows
+// (audio_timestep, audio_endpoint). The conditioning rows have nowhere
+// to go, so r == t there -- the video anchors at their noise-
+// augmentation level, a reference soundtrack at its own.
+//
+// Pairs are sorted lexicographically, (t, then r), and deduplicated --
+// torch.unique(pairs, dim=0, sorted=True), which is what upstream's
+// build_row_time_pairs calls. So two rows at the same t heading to
+// different r are DIFFERENT entries, and a caller that deduplicated on
+// t alone would hand one of them the other's endpoint.
+void build_row_time_pairs(const PackedLayout& layout, float video_timestep,
+                          float video_endpoint, float audio_timestep,
+                          float audio_endpoint,
+                          float condition_video_timestep,
+                          std::vector<float>* timesteps_out,
+                          std::vector<float>* endpoints_out,
+                          std::vector<int>* row_index_out,
+                          float condition_audio_timestep = 1.0f);
+
 // `timestep_index * kModalityNum + tag` for every row -- the AdaLN table
 // row each sequence row reads its six modulation parameters from.
 std::vector<int> build_adaln_indices(const PackedLayout& layout,

@@ -1654,8 +1654,9 @@ builtin_catalog_()
     // from the split file happens against the DiT actually loaded, so
     // it is right on both publishers' weights. It is also the smaller
     // DOWNLOAD, 1.38 GB against 1.96 -- the difference being the two
-    // thirds of a block-diagonal B that is zero. Not the smaller
-    // model: the fusion is rebuilt at load either way.
+    // thirds of a block-diagonal B that is zero -- and the smaller
+    // model: split q/k/v bind BANDED (lora::Factors::banded), without
+    // those zeros, where a published fusion holds them in RAM too.
     //
     // The ComfyUI copies key on `diffusion_model.<module>`, which both
     // the fuse and the runtime path resolve, and carry per-module alpha
@@ -1813,6 +1814,43 @@ builtin_catalog_()
                ".safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
+    // Video Rebirth's HyperFlow: an 8-step FLOW-MAP self-distillation,
+    // and not a Turbo adapter in the sense of the entries above. Beside
+    // the ordinary per-block factors it carries an ENDPOINT timestep
+    // embedder, so every step is conditioned on the interval it
+    // integrates, (t, r), rather than on t -- see
+    // MetalMiniMaxH3Transformer::FlowMap. That is detected from the
+    // file's own header, and so is the rest of what it needs: the 9-point
+    // sigma grid it was distilled on (the graph's `steps` is not used
+    // while it is live) and the 12 / 3 shifts it was trained at, which
+    // are this model's defaults.
+    //
+    // ONE FILE FOR BOTH PARTITIONS. Its header lists `transformer` and
+    // `transformer_ref` as compatible and upstream loads the same file
+    // onto both, so it is catalogued twice -- once per parent -- over
+    // the same download.
+    //
+    // Split q/k/v (diffusers decomposition, fused here for the DiT
+    // actually loaded), rank 256 / alpha 256 everywhere, 2.8 GB. The
+    // timestep-MLP factors are f32 on purpose and stay f32 on the host.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0 (Video Rebirth)",
+     .hf_path = "videorebirth/hyperflow",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "hyperflow.json", "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "videorebirth/hyperflow"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0 (Video Rebirth)",
+     .hf_path = "videorebirth/hyperflow",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "hyperflow.json", "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "videorebirth/hyperflow-ref2va"},
     // The single-image VAE -- the one piece that lets an H3 latent
     // become a PICTURE.
     //

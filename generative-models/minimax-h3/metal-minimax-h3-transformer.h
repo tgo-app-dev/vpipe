@@ -419,6 +419,12 @@ class MetalMiniMaxH3Transformer {
   int lora_modules(int slot) const;
   // Slots that bound. Indices below this are live; the rest are not.
   int lora_slots() const { return static_cast<int>(_lora.size()); }
+  // Of a slot's projections, how many bound BANDED (split q/k/v with no
+  // block-diagonal zeros; see lora::Factors::banded).
+  int lora_banded(int slot) const;
+  // Bytes every slot's GPU factors hold -- what attaching the adapters
+  // costs in memory, which is not what they cost on disk.
+  std::size_t lora_bytes() const;
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
@@ -432,6 +438,63 @@ class MetalMiniMaxH3Transformer {
   // past what bound is ignored.
   void set_lora_scale(int slot, float s);
   float lora_scale(int slot) const;
+
+  // A FLOW-MAP adapter: one that conditions every step on the INTERVAL
+  // it integrates, (t, r), rather than on the point t. HyperFlow
+  // (videorebirth/hyperflow, after AnyFlow's two-time conditioning) is
+  // the one that exists: an 8-step self-distillation of this model.
+  //
+  // It is a LoRA plus exactly one architectural change, and that change
+  // is at the timestep MLP. Beside the checkpoint's own embedder it
+  // carries an ENDPOINT embedder -- a copy of the base one with its own
+  // adapter -- that embeds r, and the two are blended
+  //
+  //     temb = emb(t) + gate * (emb_r(r) - emb(t))
+  //
+  // before the silu every AdaLN applies. Each distinct timestep of a
+  // forward therefore needs its endpoint too (Step::endpoints); rows
+  // that do not move -- conditioning anchors, a reference soundtrack --
+  // carry r == t.
+  //
+  // WHAT THE FILE DECIDES. Its header names the raw sigma grid it was
+  // distilled on (9 points, 8 forwards) and the shifts it was distilled
+  // at; those are a property of the weights, the way a step count is
+  // for any distillation, and denoise() takes them from here unless the
+  // caller supplies a grid of its own.
+  struct FlowMap {
+    float gate = 0.0f;                 // `hyperflow_gate`
+    std::vector<float> sigmas;         // raw (UNshifted) grid, 1 -> 0
+    double video_shift = 0.0;          // trained shifts; 0 = unstated
+    double audio_shift = 0.0;
+    std::string version;               // `hyperflow_version`
+    int slot = -1;                     // which adapter slot carries it
+  };
+  // The model evaluations a flow-map adapter FILE's grid drives, read
+  // from its safetensors header alone -- 0 when the file is not one,
+  // has no grid, or cannot be read. For a caller sizing a run BEFORE
+  // the DiT exists, which is when the step count bounds the AdaLN
+  // bake's table and a graph's `steps` would understate it.
+  static int flow_map_steps(const std::string& adapter_file);
+  // Null when no slot carries a flow-map adapter.
+  const FlowMap* flow_map() const
+  {
+    return _flow.slot >= 0 ? &_flow : nullptr;
+  }
+  // Whether a forward NEEDS endpoints: a flow-map adapter is bound and
+  // its slot's strength is not 0. At 0 the adapter is off in both of
+  // its halves -- the LoRA and the blend move together, because one on
+  // without the other is a state it was never trained in -- and the
+  // model is exactly the base again.
+  bool two_time_active() const;
+
+  // The timestep MLP's output BEFORE the silu, in f32, for each
+  // `timesteps[i]` (and, when `endpoints` is given and a flow-map
+  // adapter is live, blended with the endpoint embedding of
+  // `endpoints[i]`). What the forward rounds to bf16 after its silu;
+  // public so a test can hold it against the reference's own module.
+  bool time_embedding(const std::vector<float>& timesteps,
+                      const std::vector<float>* endpoints,
+                      std::vector<float>* out) const;
 
   // Where row `r` of part `pt` (0 = q, 1 = k, 2 = v) of a SPLIT adapter
   // lands in the fused [3 * inner] qkv output.
@@ -504,6 +567,12 @@ class MetalMiniMaxH3Transformer {
     // minimax_h3::build_row_timesteps.
     const std::vector<float>* timesteps         = nullptr;
     const std::vector<int>*   row_timestep_index = nullptr;
+    // Each distinct timestep's ENDPOINT, parallel to `timesteps` --
+    // required while a flow-map adapter is live (see FlowMap) and
+    // ignored otherwise. From minimax_h3::build_row_time_pairs, which
+    // makes the distinct entries PAIRS: two rows at the same t heading
+    // to different r are different entries.
+    const std::vector<float>* endpoints         = nullptr;
     // Which entry of a baked schedule this evaluation is, or -1 for
     // "not baked" (then `timesteps` drives the AdaLN projection as
     // before). See bake_adaln.
@@ -515,6 +584,11 @@ class MetalMiniMaxH3Transformer {
     // what every non-VDN caller wants and gets by saying nothing.
     int video_grid_h = 0;
     int video_grid_w = 0;
+    // Run this forward's attention DENSE even when Sol-Attn is on. The
+    // routing is per forward and so is this: a sampler that wants its
+    // early, structure-deciding steps exact (HyperFlow's published Sol
+    // recipe keeps the first two of eight dense) says so step by step.
+    bool dense_attention = false;
   };
 
   struct Velocity {
@@ -611,8 +685,14 @@ class MetalMiniMaxH3Transformer {
   // Idempotent per schedule; calling it with a different schedule
   // rebuilds. Requires the adaln weights to still be reachable, so it
   // must run before anything releases them.
+  //
+  // `endpoints`, when given, is the same shape as `schedule` and holds
+  // each entry's endpoint -- required under a live flow-map adapter,
+  // since the table IS the modulation and the modulation is a function
+  // of (t, r).
   bool bake_adaln(const std::vector<std::vector<float>>& schedule,
-                  std::string* err = nullptr);
+                  std::string* err = nullptr,
+                  const std::vector<std::vector<float>>* endpoints = nullptr);
   bool adaln_baked() const { return !_adaln_tab.empty(); }
 
   // Bytes the AdaLN bake will RETIRE, read from the checkpoint index
@@ -1160,8 +1240,15 @@ class MetalMiniMaxH3Transformer {
   // then accumulates coherently along the trajectory instead of
   // averaging out. Returns silu(temb) already cast to bf16, which is the
   // dtype the AdaLN projections consume.
+  // `endpoints` as in Step: consulted only while two_time_active(), and
+  // then required.
   bool time_embed_(const std::vector<float>& timesteps,
+                   const std::vector<float>* endpoints,
                    metal_compute::SharedBuffer& out) const;
+  // One row of the MLP: sinusoid(t) -> proj_in -> silu -> proj_out, with
+  // every live slot's host adapter on each projection. `endpoint` picks
+  // the ENDPOINT embedder's adapters (the base weights are shared).
+  void time_mlp_row_(double t, bool endpoint, float* out) const;
 
   struct Scratch {
     int seq = -1, n_text = -1, n_t = -1;
@@ -1462,7 +1549,17 @@ class MetalMiniMaxH3Transformer {
     std::vector<BlockLora> blocks;    // per main block
     std::vector<BlockLora> refiner;   // per refiner block (no adaln)
     LoraFactors            final_adaln;  // final_layer.adaln_proj.linear
+    // The timestep MLP runs on the host in f32, so its adapter does too:
+    // proj_in / proj_out of the checkpoint's own embedder, and of a
+    // flow-map adapter's ENDPOINT embedder (empty for any other file).
+    lora::HostFactors      time_in, time_out;
+    lora::HostFactors      end_in, end_out;
+    // Set when the FILE is a flow-map adapter; load() then promotes it
+    // to `_flow` with this slot's index.
+    bool    two_time = false;
+    FlowMap flow;
     int   modules  = 0;
+    int   banded   = 0;
     int   max_rank = 0;
     float scale    = 1.0f;
     // Ranks of the slots BEFORE this one. The scratch is [seq, sum of
@@ -1471,6 +1568,8 @@ class MetalMiniMaxH3Transformer {
     int   rank_prefix = 0;
   };
   std::vector<LoraSlot> _lora;
+  // The flow-map adapter's header facts; `slot` < 0 when there is none.
+  FlowMap _flow;
   // Summed max ranks: what the [seq, rank] scratch has to hold for all
   // of them at once, and the stride that turns a rank prefix into an
   // offset.
@@ -1497,6 +1596,17 @@ class MetalMiniMaxH3Transformer {
   // The base-projection tiles that also carry the adapter's second
   // factor, so `y = W x + B (A x)` is one store instead of three.
   metal_compute::ComputeFunction _fn_lora_fused128, _fn_lora_fused256;
+  // BANDED twins of the second-factor kernels, for a split q/k/v adapter
+  // fused WITHOUT a block-diagonal B (see lora::Factors::banded): each
+  // output tile contracts over its own part's window of t. Steel always;
+  // the matrix-core ones where the dense mma library is.
+  metal_compute::ComputeFunction _fn_gemm_acc_band;
+  metal_compute::ComputeFunction _fn_lora_b128_band, _fn_lora_b256_band;
+  metal_compute::ComputeFunction _fn_lora_fused128_band,
+                                 _fn_lora_fused256_band;
+  // VPIPE_H3_LORA_NO_BAND: bind split q/k/v the old way, block-diagonal.
+  // The A/B that says the banded form changes nothing but the zeros.
+  bool _lora_band_off = false;
   // ---- baked AdaLN (see bake_adaln) ---------------------------------
   // Per block, [total_rows, adaln_out] bf16; plus the final layer's
   // [total_rows, 2*hidden]. Empty = not baked.
@@ -1517,6 +1627,14 @@ class MetalMiniMaxH3Transformer {
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
   bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // The timestep-MLP half of a bind, both branches: the base embedder's
+  // host factors for ANY adapter that carries them, then -- for a
+  // flow-map adapter -- the endpoint embedder's and the header facts
+  // (gate, grid, shifts). A file that is not one passes with only the
+  // first; a file that is HALF of one -- the header without the
+  // embedder, or the reverse -- is refused.
+  bool bind_flow_map_(lora::Adapter& ad, const std::string& path,
+                      LoraSlot& slot, std::string* err);
   // Which matrix-core tile serves each half of the adapter, or nullptr
   // for "stay on steel". Split in two because the two GEMMs are skinny in
   // different dimensions and do not flip together -- see the measured

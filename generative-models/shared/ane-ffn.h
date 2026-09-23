@@ -76,6 +76,12 @@ struct AneFfnSource {
     float scale = 0.0f;
     std::size_t b_stride = 1;
     std::size_t b_offset = 0;
+    // A BANDED pair (lora::Factors::banded): `rank` is then the PER-PART
+    // rank B holds, A has parts * rank rows, and B row `br` contracts
+    // against A's rows [p*rank, p*rank + rank), p = (br / group) % parts.
+    // 0 = an ordinary dense pair.
+    int group = 0;
+    int parts = 1;
   };
   static constexpr int kMaxDeltas = 2;
   Delta delta[kMaxDeltas];

@@ -2665,9 +2665,19 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
   ASSERT_TRUE(h3::build_packed_sequence(
       text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
       h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
-  std::vector<float> uniq;
+  std::vector<float> uniq, uniq_r;
   std::vector<int>   row_idx;
-  h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  // A FLOW-MAP adapter (HyperFlow) refuses a forward without endpoints,
+  // so it gets (t, r) pairs; every other adapter keeps the t-only plan.
+  const bool flow = !loras.empty() &&
+      MetalMiniMaxH3Transformer::flow_map_steps(loras[0].path) > 0;
+  if (flow) {
+    h3::build_row_time_pairs(L, kTVideo, kTVideo + 0.1f, kTAudio,
+                             kTAudio + 0.1f, kTCond, &uniq, &uniq_r,
+                             &row_idx);
+  } else {
+    h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+  }
 
   const int n_video = (int)L.video_indices.size();
   std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems());
@@ -2695,6 +2705,7 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
   step.text   = &tb;
   step.layout = &L;
   step.timesteps = &uniq;
+  step.endpoints = flow ? &uniq_r : nullptr;
   step.row_timestep_index = &row_idx;
 
   auto to_f32 = [](const SharedBuffer& b) {

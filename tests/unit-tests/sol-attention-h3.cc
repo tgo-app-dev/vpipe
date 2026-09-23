@@ -334,6 +334,94 @@ TEST(sol_attention_h3, dense_layers_covering_the_stack_is_the_plain_model)
   EXPECT_TRUE(same);
 }
 
+// A DENSE STEP is the plain model: Sol-Attn configured and armed, and
+// a Step that says `dense_attention` runs byte-identical to a model
+// with Sol off. That is what sol_dense_steps leans on -- HyperFlow's
+// published recipe keeps its first two steps dense -- so the flag has
+// to mean "unchanged model", not "Sol with nothing routed by a slower
+// path". The same model WITHOUT the flag must differ, or the arm proves
+// nothing about Sol having been live to switch off.
+TEST(sol_attention_h3, a_dense_step_is_the_plain_model)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  ::setenv("VPIPE_H3_NO_QMM_AUTOTUNE", "1", 1);
+  struct Unpin {
+    ~Unpin() { ::unsetenv("VPIPE_H3_NO_QMM_AUTOTUNE"); }
+  } unpin;
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    return;
+  }
+  cfg.n_layers = envi_("VPIPE_H3_SOL_LAYERS", 2);
+
+  h3::PackedLayout L;
+  const std::vector<int> text_tags(16, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(text_tags, 20, 16, 16, 40,
+                                        cfg.patch_h, cfg.patch_w,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kFirst}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.7f, 0.5f, 0.0f, &uniq, &row_idx);
+  const SharedBuffer vb = ramp_(
+      mc, (std::size_t)L.video_indices.size() * cfg.video_patch_elems(),
+      0.017f);
+  const SharedBuffer ab = ramp_(
+      mc, (std::size_t)L.audio_indices.size() * cfg.audio_channels, 0.031f);
+  const SharedBuffer tb = ramp_(mc, (std::size_t)16 * cfg.text_dim, 0.005f);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  auto fwd = [&](MetalMiniMaxH3Transformer* m, bool dense,
+                 std::vector<std::uint16_t>* out) {
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb; step.audio = &ab; step.text = &tb;
+    step.layout = &L; step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    step.dense_attention = dense;
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity v = m->forward(step, &ferr);
+    if (v.empty()) { return false; }
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    out->assign(p, p + v.video.byte_size() / 2);
+    return true;
+  };
+
+  std::vector<std::uint16_t> plain, dense_step, routed;
+  {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    ASSERT_TRUE(fwd(m.get(), false, &plain));
+  }
+  {
+    MetalMiniMaxH3Transformer::Config c = cfg;
+    c.sol.enabled = true;
+    c.sol.tau = 1.0f;
+    c.sol.dense_layers = 0;                 // every block routed
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, c);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    // Dense FIRST, then routed, on ONE model: the order a sampler with
+    // sol_dense_steps runs them in, so a flag that left Sol state
+    // behind would show in the second.
+    ASSERT_TRUE(fwd(m.get(), true, &dense_step));
+    ASSERT_TRUE(fwd(m.get(), false, &routed));
+  }
+  const bool same = dense_step == plain;
+  const bool moved = routed != plain;
+  std::printf("[h3_sol] dense step: %s the plain stack; routed step %s\n",
+              same ? "BYTE-IDENTICAL to" : "DIFFERS from",
+              moved ? "differs (Sol was live)" : "IS the plain stack");
+  EXPECT_TRUE(same);
+  EXPECT_TRUE(moved);
+}
+
 // SOL AND i8_gemm ARE INDEPENDENT KNOBS, and this pins that the
 // architecture lets both be set at once.
 //

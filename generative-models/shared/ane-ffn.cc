@@ -358,17 +358,20 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       for (int di = 0; di < q.deltas && ok; ++di) {
         const AneFfnSource::Delta& dl = q.delta[di];
         const std::size_t rk = (std::size_t)std::max(0, dl.rank);
+        // A banded pair's A carries every part's rank.
+        const std::size_t ark =
+            rk * (std::size_t)(dl.group > 0 ? std::max(1, dl.parts) : 1);
         const std::size_t brows =
             dl.b_offset + (rows - 1) * std::max<std::size_t>(1, dl.b_stride) +
             1;
         ok = rk > 0 && dl.a != nullptr && dl.b != nullptr &&
              dl.a->contents() != nullptr && dl.b->contents() != nullptr &&
-             dl.a->byte_size() >= rk * cols * 2 &&
+             dl.a->byte_size() >= ark * cols * 2 &&
              dl.b->byte_size() >= brows * rk * 2;
         if (!ok) { break; }
-        a32[(std::size_t)di].resize(rk * cols);
+        a32[(std::size_t)di].resize(ark * cols);
         const auto* ap = static_cast<const std::uint16_t*>(dl.a->contents());
-        for (std::size_t k = 0; k < rk * cols; ++k) {
+        for (std::size_t k = 0; k < ark * cols; ++k) {
           a32[(std::size_t)di][k] = f32_of_bf16_(ap[k]);
         }
       }
@@ -481,12 +484,37 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
                   bsel[j * rk + k] = f32_of_bf16_(bp[br * rk + k]);
                 }
               }
-              cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                          (__LAPACK_int)n, (__LAPACK_int)cols,
-                          (__LAPACK_int)rk, dl.scale, bsel.data(),
-                          (__LAPACK_int)rk, a32[(std::size_t)di].data(),
-                          (__LAPACK_int)cols, 1.0f, delta.data(),
-                          (__LAPACK_int)cols);
+              if (dl.group <= 0 || dl.parts <= 1) {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            (__LAPACK_int)n, (__LAPACK_int)cols,
+                            (__LAPACK_int)rk, dl.scale, bsel.data(),
+                            (__LAPACK_int)rk, a32[(std::size_t)di].data(),
+                            (__LAPACK_int)cols, 1.0f, delta.data(),
+                            (__LAPACK_int)cols);
+                continue;
+              }
+              // Banded: one product per run of rows that share a part,
+              // each against that part's rows of A. A run is at least a
+              // group long except where the band cuts it.
+              auto part_of = [&](std::size_t j) {
+                const std::size_t br =
+                    (b0 + j) * std::max<std::size_t>(1, dl.b_stride) +
+                    dl.b_offset;
+                return (br / (std::size_t)dl.group) % (std::size_t)dl.parts;
+              };
+              for (std::size_t j = 0; j < n;) {
+                const std::size_t p = part_of(j);
+                std::size_t j2 = j + 1;
+                while (j2 < n && part_of(j2) == p) { ++j2; }
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            (__LAPACK_int)(j2 - j), (__LAPACK_int)cols,
+                            (__LAPACK_int)rk, dl.scale,
+                            bsel.data() + j * rk, (__LAPACK_int)rk,
+                            a32[(std::size_t)di].data() + p * rk * cols,
+                            (__LAPACK_int)cols, 1.0f,
+                            delta.data() + j * cols, (__LAPACK_int)cols);
+                j = j2;
+              }
             }
           }
           // Row-granular slices over an ELEMENT count: each row goes to the

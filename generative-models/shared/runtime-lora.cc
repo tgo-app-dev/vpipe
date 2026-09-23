@@ -163,8 +163,13 @@ Adapter::index_suffix_()
     _suf_b = b_of_a(suf);
     break;
   }
+  // `alpha` is peft's own key. `lora_alpha` is the SAME number under the
+  // name a hand-written header gives it (HyperFlow's, which states its
+  // rank beside it as `lora_rank`), and is read only when peft's is
+  // absent so no file that already bound changes strength.
   const auto& md = _w->metadata();
-  const auto it = md.find("alpha");
+  auto it = md.find("alpha");
+  if (it == md.end()) { it = md.find("lora_alpha"); }
   if (it != md.end()) {
     try {
       _meta_alpha = std::stof(it->second);
@@ -295,6 +300,96 @@ Adapter::take_(const std::string& name, float m)
 }
 
 bool
+Adapter::take_f32_(const std::string& name, float m, std::vector<float>* out)
+{
+  const auto* ti = _w->info(name);
+  if (ti == nullptr || ti->shape.size() != 2) { return false; }
+  const std::size_t cnt =
+      (std::size_t)ti->shape[0] * (std::size_t)ti->shape[1];
+  SharedBuffer src = _w->load(name, _mc);
+  if (src.empty()) { return false; }
+  out->resize(cnt);
+  float* d = out->data();
+  if (ti->dtype == "F32") {
+    const auto* p = static_cast<const float*>(src.contents());
+    for (std::size_t i = 0; i < cnt; ++i) { d[i] = p[i] * m; }
+  } else if (ti->dtype == "BF16") {
+    const auto* p = static_cast<const std::uint16_t*>(src.contents());
+    for (std::size_t i = 0; i < cnt; ++i) { d[i] = bf16_to_f32(p[i]) * m; }
+  } else if (ti->dtype == "F16") {
+    const auto* p = static_cast<const _Float16*>(src.contents());
+    for (std::size_t i = 0; i < cnt; ++i) { d[i] = (float)p[i] * m; }
+  } else {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+bool
+Adapter::bind_host(const std::string& module, int n, int k, HostFactors* out)
+{
+  if (out == nullptr || _w == nullptr) { return false; }
+  bool via_rename = false;
+  const std::string key = resolve_(module, &via_rename);
+  if (key.empty()) { return false; }          // simply absent
+  const auto* ai = _w->info(factor_name_(key, 'A'));
+  const auto* bi = _w->info(factor_name_(key, 'B'));
+  int rank = 0;
+  float mul = 1.0f;
+  if (!factor_meta_(key, &rank, &mul) ||
+      ai->shape[1] != k || bi->shape[0] != n) {
+    ++_skipped;
+    return false;
+  }
+  HostFactors f;
+  f.rank = rank;
+  f.n = n;
+  f.k = k;
+  if (!take_f32_(factor_name_(key, 'A'), mul, &f.a) ||
+      !take_f32_(factor_name_(key, 'B'), 1.0f, &f.b)) {
+    ++_skipped;
+    return false;
+  }
+  *out = std::move(f);
+  ++_modules;
+  if (via_rename) { ++_renamed; }
+  return true;
+}
+
+std::string
+Adapter::metadata(const std::string& key) const
+{
+  if (_w == nullptr) { return {}; }
+  const auto& md = _w->metadata();
+  const auto it = md.find(key);
+  return it != md.end() ? it->second : std::string();
+}
+
+void
+HostFactors::apply(const float* x, float s, float* y) const
+{
+  if (empty() || s == 0.0f || x == nullptr || y == nullptr) { return; }
+  // t = A x in double: rank 256 over k up to 5376 is a long sum, and
+  // this runs a handful of rows per step, so the precision is free.
+  std::vector<double> t((std::size_t)rank);
+  for (int r = 0; r < rank; ++r) {
+    const float* ar = &a[(std::size_t)r * (std::size_t)k];
+    double acc = 0.0;
+    for (int i = 0; i < k; ++i) { acc += (double)ar[i] * (double)x[i]; }
+    t[(std::size_t)r] = acc;
+  }
+  for (int o = 0; o < n; ++o) {
+    const float* br = &b[(std::size_t)o * (std::size_t)rank];
+    double acc = 0.0;
+    for (int r = 0; r < rank; ++r) {
+      acc += (double)br[r] * t[(std::size_t)r];
+    }
+    y[o] += s * (float)acc;
+  }
+}
+
+bool
 Adapter::bind(const std::string& module, int n, int k, Factors* out)
 {
   if (out == nullptr || _w == nullptr) { return false; }
@@ -395,6 +490,88 @@ Adapter::bind_fused(const std::vector<std::string>& modules, int n, int k,
   out->a = std::move(a);
   out->b = std::move(b);
   _max_rank = std::max(_max_rank, total_rank);
+  ++_modules;
+  if (via_rename) { ++_renamed; }
+  return true;
+}
+
+bool
+Adapter::bind_banded(const std::vector<std::string>& modules, int n, int k,
+                     int group, Factors* out, const RowMap& rows)
+{
+  if (out == nullptr || _w == nullptr || modules.size() < 2 || !rows ||
+      group <= 0) {
+    return false;
+  }
+  const int P = (int)modules.size();
+  struct Part {
+    std::string key;
+    int rank = 0, n = 0;
+    float mul = 1.0f;
+  };
+  std::vector<Part> parts;
+  bool via_rename = false;
+  int total_n = 0;
+  for (const std::string& m : modules) {
+    bool vr = false;
+    Part p;
+    p.key = resolve_(m, &vr);
+    if (p.key.empty()) { return false; }       // absent: not a skip
+    via_rename = via_rename || vr;
+    const auto* ai = _w->info(factor_name_(p.key, 'A'));
+    const auto* bi = _w->info(factor_name_(p.key, 'B'));
+    if (!factor_meta_(p.key, &p.rank, &p.mul) || ai->shape[1] != k) {
+      return false;                            // bind_fused counts it
+    }
+    p.n = (int)bi->shape[0];
+    total_n += p.n;
+    parts.push_back(std::move(p));
+  }
+  // The band form's two assumptions, BEFORE anything is allocated -- a
+  // refusal here leaves the caller free to take the block-diagonal path
+  // with nothing half-built and nothing counted twice.
+  const int r = parts[0].rank;
+  for (const Part& p : parts) {
+    if (p.rank != r) { return false; }
+  }
+  if (total_n != n) { return false; }
+  for (int i = 0; i < P; ++i) {
+    for (int row = 0; row < parts[(std::size_t)i].n; ++row) {
+      const int dst = rows(i, row);
+      if (dst < 0 || dst >= n || (dst / group) % P != i) { return false; }
+    }
+  }
+
+  // A exactly as bind_fused stacks it; B compact, [n, r].
+  SharedBuffer a =
+      _mc->make_shared_buffer((std::size_t)P * r * (std::size_t)k * 2);
+  SharedBuffer b = _mc->make_shared_buffer((std::size_t)n * r * 2);
+  if (a.empty() || b.empty()) { return false; }
+  auto* ad = static_cast<std::uint16_t*>(a.contents());
+  auto* bd = static_cast<std::uint16_t*>(b.contents());
+  // Every destination row is written below (the parts' rows partition
+  // [0, n), checked above), so there is nothing to zero.
+  for (int i = 0; i < P; ++i) {
+    const Part& p = parts[(std::size_t)i];
+    SharedBuffer pa = take_(factor_name_(p.key, 'A'), p.mul);
+    SharedBuffer pb = take_(factor_name_(p.key, 'B'), 1.0f);
+    // Not counted: the caller falls back to bind_fused, which reads the
+    // same tensors and counts the failure once if it recurs.
+    if (pa.empty() || pb.empty()) { return false; }
+    std::memcpy(ad + (std::size_t)i * r * (std::size_t)k, pa.contents(),
+                (std::size_t)r * (std::size_t)k * 2);
+    const auto* src = static_cast<const std::uint16_t*>(pb.contents());
+    for (int row = 0; row < p.n; ++row) {
+      std::memcpy(bd + (std::size_t)rows(i, row) * r,
+                  src + (std::size_t)row * r, (std::size_t)r * 2);
+    }
+  }
+  out->a     = std::move(a);
+  out->b     = std::move(b);
+  out->rank  = P * r;
+  out->parts = P;
+  out->group = group;
+  _max_rank = std::max(_max_rank, P * r);
   ++_modules;
   if (via_rename) { ++_renamed; }
   return true;

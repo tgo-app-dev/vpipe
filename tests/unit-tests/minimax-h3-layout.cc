@@ -1401,6 +1401,103 @@ TEST(minimax_h3_sched, sigma_schedules)
   EXPECT_FALSE(v.set_timesteps(1));
 }
 
+// HyperFlow's flow-map grid: 9 raw points pushed through each modality's
+// own shift and installed verbatim, plus each step's ENDPOINT.
+//
+// Expected values are UPSTREAM's, not re-derived: hyperflow_h3.schedule
+// .shift_sigmas + endpoints_from_sigmas, installed through diffusers'
+// MiniMaxH3Scheduler.set_timesteps(sigmas=...) -- the exact calls its
+// HyperFlowSetTimestepsStep makes (dump_hyperflow_golden.py, printed at
+// %.9g so every float32 round-trips). Held BIT-EXACT: the shift is the
+// same four float32 operations in the same order, so there is no ulp of
+// slack to explain away.
+TEST(minimax_h3_sched, flow_map_grid)
+{
+  const std::vector<float> raw = {1.0f,     0.931506f, 0.839236f,
+                                  0.703462f, 0.5f,      0.296538f,
+                                  0.160764f, 0.068494f, 0.0f};
+  struct Want {
+    double shift;
+    std::vector<float> sig, t, r;
+  };
+  const Want want[] = {
+      {12.0,
+       {1.0f, 0.993909776f, 0.9842875f, 0.966063678f, 0.923076928f,
+        0.834942341f, 0.696852028f, 0.468753338f, 0.0f},
+       {0.0f, 0.00609022379f, 0.0157124996f, 0.0339363217f, 0.0769230723f,
+        0.165057659f, 0.303147972f, 0.531246662f},
+       {0.00609022379f, 0.0157124996f, 0.0339363217f, 0.0769230723f,
+        0.165057659f, 0.303147972f, 0.531246662f, 1.0f}},
+      {3.0,
+       {1.0f, 0.976076305f, 0.939979196f, 0.876797915f, 0.75f,
+        0.558425307f, 0.364950269f, 0.180724859f, 0.0f},
+       {0.0f, 0.0239236951f, 0.0600208044f, 0.123202085f, 0.25f,
+        0.441574693f, 0.635049701f, 0.819275141f},
+       {0.0239236951f, 0.0600208044f, 0.123202085f, 0.25f, 0.441574693f,
+        0.635049701f, 0.819275141f, 1.0f}},
+  };
+  for (const Want& w : want) {
+    MiniMaxH3Scheduler s(w.shift);
+    ASSERT_TRUE(s.set_sigmas(raw));
+    ASSERT_TRUE(s.sigmas() == w.sig);
+    ASSERT_TRUE(s.timesteps() == w.t);
+    ASSERT_TRUE(s.endpoints() == w.r);
+    // Eight model evaluations from nine points, and the last step lands
+    // on clean.
+    EXPECT_TRUE(s.num_inference_steps() == 8);
+    EXPECT_TRUE(s.endpoints().back() == 1.0f);
+  }
+  // The linspace path grows endpoints too, by the same rule.
+  MiniMaxH3Scheduler l(12.0);
+  ASSERT_TRUE(l.set_timesteps(20));
+  ASSERT_TRUE(l.endpoints().size() == l.timesteps().size());
+  for (std::size_t i = 0; i < l.endpoints().size(); ++i) {
+    EXPECT_TRUE(l.endpoints()[i] == 1.0f - l.sigmas()[i + 1]);
+  }
+  // What diffusers' set_timesteps(sigmas=) refuses, this refuses: not
+  // ending at exactly 0, not strictly decreasing, starting above 1.
+  MiniMaxH3Scheduler b(12.0);
+  EXPECT_FALSE(b.set_sigmas({1.0f, 0.5f, 0.01f}));
+  EXPECT_FALSE(b.set_sigmas({1.0f, 0.5f, 0.5f, 0.0f}));
+  EXPECT_FALSE(b.set_sigmas({1.5f, 0.5f, 0.0f}));
+  EXPECT_FALSE(b.set_sigmas({0.0f}));
+}
+
+// Per-row (t, r) pairs: the pin rule of build_row_timesteps, with each
+// row also carrying where its step lands, deduplicated as PAIRS.
+//
+// Expected values are upstream's build_row_time_pairs on the same
+// hand-built layout (dump_hyperflow_golden.py): 3 text rows, 2
+// conditioning + 4 generated video rows, 1 reference + 3 generated audio
+// rows. Video and audio are handed the SAME t on purpose, with different
+// endpoints -- the case a t-only dedup gets wrong, collapsing the two
+// into one entry and giving the audio rows the video's endpoint.
+TEST(minimax_h3_layout, row_time_pairs)
+{
+  h3::PackedLayout L;
+  L.seq_len = 13;
+  L.video_indices = {3, 4, 5, 6, 7, 8};
+  L.audio_indices = {9, 10, 11, 12};
+  L.num_condition_video_rows = 2;
+  L.num_condition_audio_rows = 1;
+  std::vector<float> t, r;
+  std::vector<int> idx;
+  h3::build_row_time_pairs(L, 0.25f, 0.5f, 0.25f, 0.75f, 0.999f, &t, &r,
+                           &idx, 1.0f);
+  EXPECT_TRUE((t == std::vector<float>{0.25f, 0.25f, 0.999f, 1.0f}));
+  EXPECT_TRUE((r == std::vector<float>{0.5f, 0.75f, 0.999f, 1.0f}));
+  EXPECT_TRUE((idx == std::vector<int>{0, 0, 0, 2, 2, 0, 0, 0, 0, 3, 1, 1,
+                                       1}));
+  // With r == t everywhere the pairs collapse to build_row_timesteps'
+  // answer exactly -- the flow-map plan is a strict extension of it.
+  std::vector<float> t1, r1, t2;
+  std::vector<int> i1, i2;
+  h3::build_row_time_pairs(L, 0.3f, 0.3f, 0.6f, 0.6f, 0.999f, &t1, &r1,
+                           &i1, 1.0f);
+  h3::build_row_timesteps(L, 0.3f, 0.6f, 0.999f, &t2, &i2, 1.0f);
+  EXPECT_TRUE(t1 == t2 && t1 == r1 && i1 == i2);
+}
+
 TEST(minimax_h3_sched, euler_trajectory)
 {
   const std::size_t n = sizeof(kTrajX0) / sizeof(float);

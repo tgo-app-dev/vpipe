@@ -1099,12 +1099,42 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
                                         bool scale_applied, float scale,
                                         std::size_t lora_off)
 {
-  const int r = lf.rank;
+  // The second GEMM contracts over the PER-PART rank of a banded pair,
+  // reading its window of the [M, lf.rank] t -- see Factors::banded.
+  const bool band = lf.banded();
+  const int r = lf.b_rank();
   const bool mma = _use_mma2 && M >= _mma_min_m;
   // The accumulating tiles have no scale of their own, so this route is
   // legal only once the FIRST GEMM applied the strength.
   const metal_compute::ComputeFunction* fb =
       (mma && scale_applied) ? lora_route_b_(r, N) : nullptr;
+  if (band && fb != nullptr) {
+    // The banded twin of the tile the rank chose, unless its width would
+    // straddle a part's group -- the 256-wide tile over q/k/v grouped per
+    // 128-wide head -- in which case the 128-wide one serves it.
+    const bool wide = fb == &_fn_lora_b256 && lf.group % 256 == 0;
+    fb = wide ? &_fn_lora_b256_band : &_fn_lora_b128_band;
+    if (!fb->valid() || lf.group % 128 != 0) { fb = nullptr; }
+  }
+  if (band && fb == nullptr) {
+    // Steel, banded: BN 32 divides every group this model has.
+    enc.set_function(_fn_gemm_acc_band);
+    enc.set_buffer(0, _s.lora, lora_off * 2);
+    enc.set_buffer(1, lf.b);
+    enc.set_buffer(2, lf.b);
+    enc.set_buffer(3, y, y_off * 2);
+    enc.set_constant(4, r);
+    enc.set_constant(5, N);
+    enc.set_constant(6, M);
+    enc.set_constant(7, 0);
+    enc.set_constant(8, scale_applied ? 1.0f : scale);
+    enc.set_constant(9, lf.rank);
+    enc.set_constant(10, lf.group);
+    enc.set_constant(11, lf.parts);
+    enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                  (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+    return;
+  }
   enc.set_function(fb != nullptr ? *fb : _fn_gemm_acc);
   enc.set_buffer(0, _s.lora, lora_off * 2);
   enc.set_buffer(1, lf.b);
@@ -1115,8 +1145,14 @@ MetalMiniMaxH3Transformer::lora_gemm_b_(ComputeEncoder& enc,
   enc.set_constant(6, M);
   enc.set_constant(7, 0);
   enc.set_constant(8, scale_applied ? 1.0f : scale);
+  if (band) {                         // a banded mma twin, see above
+    enc.set_constant(9, lf.rank);
+    enc.set_constant(10, lf.group);
+    enc.set_constant(11, lf.parts);
+  }
   if (fb != nullptr) {
-    const int BN = (fb == &_fn_lora_b256) ? 256 : 128;
+    const int BN =
+        (fb == &_fn_lora_b256 || fb == &_fn_lora_b256_band) ? 256 : 128;
     enc.dispatch({(unsigned)(((N + BN - 1) / BN) * 256),
                   (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
     return;
@@ -1186,6 +1222,32 @@ MetalMiniMaxH3Transformer::lora_modules() const
 {
   int n = 0;
   for (const LoraSlot& sl : _lora) { n += sl.modules; }
+  return n;
+}
+
+int
+MetalMiniMaxH3Transformer::lora_banded(int slot) const
+{
+  return (slot >= 0 && (std::size_t)slot < _lora.size())
+      ? _lora[(std::size_t)slot].banded : 0;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::lora_bytes() const
+{
+  auto fb = [](const LoraFactors& f) {
+    return f.a.byte_size() + f.b.byte_size();
+  };
+  std::size_t n = 0;
+  for (const LoraSlot& sl : _lora) {
+    for (const auto* v : {&sl.blocks, &sl.refiner}) {
+      for (const BlockLora& bl : *v) {
+        n += fb(bl.qkv) + fb(bl.out) + fb(bl.fc1) + fb(bl.fc2) +
+             fb(bl.adaln);
+      }
+    }
+    n += fb(sl.final_adaln);
+  }
   return n;
 }
 
@@ -1358,9 +1420,8 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // has, so the diffusers copy runs on both releases where the ComfyUI
   // copy runs on one. It is also the smaller download -- 1.38 GB
   // against 1.96, the difference being the two thirds of a
-  // block-diagonal B that is zero. NOT the smaller model: the fusion is
-  // rebuilt here, so what it costs in RAM is what the ComfyUI copy
-  // costs on disk.
+  // block-diagonal B that is zero -- and, bound BANDED below, the
+  // smaller model too: the zeros are never built.
   // VDN-H3 wraps each DiT block's attention in a HybridAttention that
   // keeps the original module as `.orig`, so its adapters name
   // `attn.orig.to_q` where a plain diffusers export names `attn.to_q`.
@@ -1385,13 +1446,31 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     // [gate; value] -- see the fc1 half-order note in the forward.
     const lora::Adapter::RowMap swap_halves =
         [F](int, int r) { return r < F ? r + F : r - F; };
+    // BANDED where it can be (see lora::Factors::banded): the three
+    // adapters' B rows stored side by side with no zeros between them,
+    // and each output tile contracting over its own part's rank. The
+    // group is how many consecutive fused rows one of q/k/v owns -- a
+    // head's worth per head, the whole inner width flat -- and every
+    // second-factor kernel tiles at a width that divides both. The
+    // block-diagonal bind stays as the fallback: the same arithmetic
+    // with (parts-1)/parts of the second GEMM spent on zeros.
+    const bool band = !_lora_band_off && _fn_gemm_acc_band.valid();
+    const int qkv_group = per_head ? HD : I;
+    int banded = 0;
     // out_proj and fc2 are byte-identical between the two copies, so
     // they take the plain bind and not a scatter that would copy every
     // row to its own index.
     auto bind_block = [&](const std::string& dp, const std::string& ap,
                           BlockLora& bl) {
-      ad->bind_fused({dp + ap + "to_q", dp + ap + "to_k", dp + ap + "to_v"},
-                     3 * I, H, &bl.qkv, qkv_rows);
+      const std::vector<std::string> qkv = {dp + ap + "to_q",
+                                            dp + ap + "to_k",
+                                            dp + ap + "to_v"};
+      if (band && ad->bind_banded(qkv, 3 * I, H, qkv_group, &bl.qkv,
+                                  qkv_rows)) {
+        ++banded;
+      } else {
+        ad->bind_fused(qkv, 3 * I, H, &bl.qkv, qkv_rows);
+      }
       ad->bind(dp + ap + "to_out.0", H, I, &bl.out);
       ad->bind_fused({dp + "ff.net.0.proj"}, 2 * F, H, &bl.fc1, swap_halves);
       ad->bind(dp + "ff.net.2", H, F, &bl.fc2);
@@ -1432,7 +1511,11 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
                &slot.blocks[(std::size_t)i].adaln);
     }
     ad->bind("norm_out.linear", 2 * H, c.time_dim, &slot.final_adaln);
+    // The timestep MLP (diffusers' `time_embedder.linear_1/2`) and, for
+    // a flow-map adapter, its endpoint twin -- on the host, in f32.
+    if (!bind_flow_map_(*ad, spec.path, slot, err)) { return false; }
     slot.modules  = ad->modules();
+    slot.banded   = banded;
     slot.max_rank = ad->max_rank();
     if (slot.modules == 0) {
       if (err != nullptr) {
@@ -1445,9 +1528,13 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     if (_mc->session() != nullptr) {
       _mc->session()->info(fmt(
           "MetalMiniMaxH3Transformer: {} (diffusers decomposition, qkv "
-          "fused HERE for this DiT's {} grouping)",
+          "fused HERE for this DiT's {} grouping, {} of {} banded; "
+          "matrix-core band tiles {})",
           ad->summary(spec.path, slot.scale),
-          per_head ? "PER-HEAD" : "flat"));
+          per_head ? "PER-HEAD" : "flat", banded,
+          c.n_layers + c.n_refiner,
+          (_fn_lora_b128_band.valid() && _fn_lora_fused128_band.valid())
+              ? "ready" : "absent"));
     }
     return true;
   }
@@ -1475,6 +1562,10 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   }
   bind("final_layer.adaln_proj.linear", 2 * H, c.time_dim,
        slot.final_adaln);
+  // Through the same door as the diffusers branch, so a flow-map adapter
+  // in THIS spelling is bound whole or refused -- never bound as a plain
+  // LoRA with its endpoint embedder silently left behind.
+  if (!bind_flow_map_(*ad, spec.path, slot, err)) { return false; }
 
   slot.modules  = ad->modules();
   slot.max_rank = ad->max_rank();
@@ -1542,6 +1633,158 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   return true;
 }
 
+// HyperFlow's file layout, which is the only flow-map adapter there is:
+//
+//   header   hyperflow = "true", hyperflow_gate, hyperflow_sigmas (JSON
+//            list, raw grid), hyperflow_video_shift / _audio_shift,
+//            hyperflow_version, lora_alpha / lora_rank
+//   tensors  transformer.endpoint_time_embedder.linear_{1,2}.lora_{A,B}
+//            beside the ordinary per-block factors, f32
+//
+// The endpoint embedder has NO base weights in the file: upstream builds
+// it as a deep copy of the checkpoint's own `time_embedder` taken BEFORE
+// any adapter is injected, then gives it its own adapter. So here it is
+// the base proj_in/proj_out plus end_in/end_out -- and NOT plus the base
+// embedder's own adapter (time_in/time_out), which upstream's copy never
+// saw.
+bool
+MetalMiniMaxH3Transformer::bind_flow_map_(lora::Adapter& ad,
+                                          const std::string& path,
+                                          LoraSlot& slot, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "minimax-h3 lora: '" + path + "': " + m; }
+    return false;
+  };
+  const Config& c = _cfg;
+  // The timestep MLP, whichever adapter this is: diffusers' names
+  // (`linear_1/2`) or this checkpoint's own (`proj_in/out`). It runs on
+  // the host in f32 (see time_embed_), so these factors stay f32 on the
+  // host too -- a flow-map adapter ships them in f32 deliberately, and
+  // they would lose exactly what that keeps through the bf16 GPU path.
+  auto mlp = [&](const std::string& pre, lora::HostFactors* in,
+                 lora::HostFactors* out) {
+    const bool diffusers = ad.has(pre + "linear_1") ||
+                           ad.has(pre + "linear_2");
+    ad.bind_host(pre + (diffusers ? "linear_1" : "proj_in"), c.time_hidden,
+                 c.freq_dim, in);
+    ad.bind_host(pre + (diffusers ? "linear_2" : "proj_out"), c.time_dim,
+                 c.time_hidden, out);
+  };
+  mlp("time_embedder.", &slot.time_in, &slot.time_out);
+  const bool header = ad.metadata("hyperflow") == "true";
+  const bool tensors = ad.has("endpoint_time_embedder.linear_1") ||
+                       ad.has("endpoint_time_embedder.proj_in");
+  if (!header && !tensors) { return true; }   // an ordinary adapter
+  if (!header || !tensors) {
+    return fail(header
+        ? "the header says HyperFlow but the file has no "
+          "endpoint_time_embedder -- half a flow-map adapter"
+        : "the file has an endpoint_time_embedder but no HyperFlow "
+          "header, so its gate and grid are unknown");
+  }
+  mlp("endpoint_time_embedder.", &slot.end_in, &slot.end_out);
+  // BOTH embedders fully adapted, or refuse. A flow-map file that bound
+  // only some of them is not a weaker adapter but a different function
+  // of (t, r) -- the gate blends two embeddings the model was trained
+  // to see TOGETHER.
+  if (slot.end_in.empty() || slot.end_out.empty() ||
+      slot.time_in.empty() || slot.time_out.empty()) {
+    return fail(fmt("the timestep embedders did not bind (base {}/{}, "
+                    "endpoint {}/{}) -- shapes do not fit this DiT's "
+                    "{} -> {} -> {} MLP",
+                    !slot.time_in.empty(), !slot.time_out.empty(),
+                    !slot.end_in.empty(), !slot.end_out.empty(),
+                    c.freq_dim, c.time_hidden, c.time_dim)());
+  }
+  FlowMap f;
+  try {
+    f.gate = std::stof(ad.metadata("hyperflow_gate"));
+  } catch (...) {
+    return fail("no readable `hyperflow_gate` in the header");
+  }
+  const std::string sv = ad.metadata("hyperflow_sigmas");
+  if (!sv.empty()) {
+    const FlexData arr = FlexData::from_json(sv);
+    if (arr.is_array()) {
+      const auto av = arr.as_array();   // a view: `arr` owns it
+      for (std::size_t i = 0; i < av.size(); ++i) {
+        f.sigmas.push_back((float)av[i].as_real(-1.0));
+      }
+    }
+    // The contract diffusers' scheduler enforces on a grid it is handed:
+    // strictly decreasing, at most 1, ending at EXACTLY 0.
+    bool ok = f.sigmas.size() >= 2 && f.sigmas.front() <= 1.0f &&
+              f.sigmas.back() == 0.0f;
+    for (std::size_t i = 1; ok && i < f.sigmas.size(); ++i) {
+      ok = f.sigmas[i] < f.sigmas[i - 1];
+    }
+    if (!ok) { return fail("`hyperflow_sigmas` is not a valid grid: " + sv); }
+  }
+  auto num = [&](const char* k) {
+    try {
+      const std::string v = ad.metadata(k);
+      return v.empty() ? 0.0 : std::stod(v);
+    } catch (...) {
+      return 0.0;
+    }
+  };
+  f.video_shift = num("hyperflow_video_shift");
+  f.audio_shift = num("hyperflow_audio_shift");
+  f.version     = ad.metadata("hyperflow_version");
+  slot.flow     = std::move(f);
+  slot.two_time = true;
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: '{}' is a FLOW-MAP adapter (HyperFlow "
+        "{}): two-time timestep embedding, gate {:.4g}, {}-step grid, "
+        "trained at shifts {:.4g}/{:.4g}", path, slot.flow.version,
+        slot.flow.gate,
+        slot.flow.sigmas.empty() ? 0 : (int)slot.flow.sigmas.size() - 1,
+        slot.flow.video_shift, slot.flow.audio_shift));
+  }
+  return true;
+}
+
+int
+MetalMiniMaxH3Transformer::flow_map_steps(const std::string& adapter_file)
+{
+  // The safetensors header is `u64 length` + that many bytes of JSON,
+  // with the file's own facts under `__metadata__` as strings.
+  std::ifstream f(adapter_file, std::ios::binary);
+  if (!f) { return 0; }
+  std::uint64_t n = 0;
+  f.read(reinterpret_cast<char*>(&n), 8);
+  if (!f || n == 0 || n > (std::uint64_t)64 << 20) { return 0; }
+  std::string js((std::size_t)n, '\0');
+  f.read(js.data(), (std::streamsize)n);
+  if (!f) { return 0; }
+  const FlexData hdr = FlexData::from_json(js);
+  if (!hdr.is_object()) { return 0; }
+  const auto o = hdr.as_object();
+  if (!o.contains("__metadata__")) { return 0; }
+  const FlexData md = o.at("__metadata__");
+  if (!md.is_object()) { return 0; }
+  const auto mo = md.as_object();
+  if (!mo.contains("hyperflow") ||
+      std::string(mo.at("hyperflow").as_string("")) != "true" ||
+      !mo.contains("hyperflow_sigmas")) {
+    return 0;
+  }
+  const FlexData g = FlexData::from_json(
+      std::string(mo.at("hyperflow_sigmas").as_string("")));
+  if (!g.is_array()) { return 0; }
+  const std::size_t pts = g.as_array().size();
+  return pts >= 2 ? (int)pts - 1 : 0;
+}
+
+bool
+MetalMiniMaxH3Transformer::two_time_active() const
+{
+  return _flow.slot >= 0 && (std::size_t)_flow.slot < _lora.size() &&
+         _lora[(std::size_t)_flow.slot].scale != 0.0f;
+}
+
 MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer()
 {
   // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
@@ -1606,6 +1849,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // a build without it simply cannot attach one, which bind_lora_ reports
   // rather than silently applying half an adapter.
   m->_fn_gemm_acc  = m->_lib_gemm.function("dense_gemm_t_bm64_acc_f16");
+  m->_fn_gemm_acc_band =
+      m->_lib_gemm.function("dense_gemm_t_bm64_acc_band_f16");
+  m->_lora_band_off = std::getenv("VPIPE_H3_LORA_NO_BAND") != nullptr;
   m->_fn_rms       = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_rms_heads = m->_lib_rope.function("rms_norm_heads_strided_f16");
   m->_fn_trope = m->_lib_rope.function("transpose_rope_half_part_ftab_f16");
@@ -1842,6 +2088,14 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128_lora_f16");
     m->_fn_lora_fused256 =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_lora_f16");
+    m->_fn_lora_b128_band =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128_acc_band_f16");
+    m->_fn_lora_b256_band =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_acc_band_f16");
+    m->_fn_lora_fused128_band =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128_lora_band_f16");
+    m->_fn_lora_fused256_band =
+        m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_lora_band_f16");
     // Forces the ADAPTER back onto the steel pair while leaving the base
     // projections on the matrix cores. That separation is the point:
     // VPIPE_H3_NO_MMA2 moves the base too, so the difference it produces
@@ -2055,6 +2309,24 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // other's second.
     slot.rank_prefix = m->_lora_rank_total;
     m->_lora_rank_total += slot.max_rank;
+    // A flow-map adapter REPLACES the timestep embedding rather than
+    // adding to it, so two of them have no meaning together -- the
+    // second would blend an endpoint embedder trained against a
+    // different one. Refused rather than resolved by order.
+    if (slot.two_time) {
+      if (m->_flow.slot >= 0) {
+        if (mc->session() != nullptr) {
+          mc->session()->error(fmt(
+              "MetalMiniMaxH3Transformer: '{}' is a second flow-map "
+              "(two-time) adapter; slot {} already carries one, and two "
+              "cannot share the timestep embedding", sp.path,
+              m->_flow.slot));
+        }
+        return nullptr;
+      }
+      m->_flow = slot.flow;
+      m->_flow.slot = (int)m->_lora.size();
+    }
     m->_lora.push_back(std::move(slot));
   }
   // The ff scratch can only shrink when NOTHING can present an unfused
@@ -2488,10 +2760,18 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   if (lora != nullptr && lora_folded != nullptr && !_lora_fuse_off &&
       K <= _lora_fuse_max_k &&
       (route == GemmRoute::kMma128 || route == GemmRoute::kMma128x256)) {
+    const bool wide = route == GemmRoute::kMma128x256;
     const metal_compute::ComputeFunction* ff =
-        (route == GemmRoute::kMma128x256) ? &_fn_lora_fused256
-                                          : &_fn_lora_fused128;
-    if (ff->valid()) {
+        wide ? &_fn_lora_fused256 : &_fn_lora_fused128;
+    // A banded pair needs the banded tile, and the BASE's tile width is
+    // fixed by the route -- so where it would straddle a part's group
+    // (256 wide over q/k/v grouped per 128-wide head) there is no fold
+    // and the second GEMM runs on its own, as for any other decline.
+    if (lora->banded()) {
+      ff = wide ? &_fn_lora_fused256_band : &_fn_lora_fused128_band;
+      if (lora->group % (wide ? 256 : 128) != 0) { ff = nullptr; }
+    }
+    if (ff != nullptr && ff->valid()) {
       const int FRN = (route == GemmRoute::kMma128x256) ? 256 : 128;
       enc.set_function(*ff);
       enc.set_buffer(0, x, x_off * 2);
@@ -2504,7 +2784,12 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
       enc.set_constant(7, 0);
       enc.set_buffer(8, _s.lora, lora_off * 2);
       enc.set_buffer(9, lora->b);
-      enc.set_constant(10, lora->rank);
+      enc.set_constant(10, lora->b_rank());
+      if (lora->banded()) {
+        enc.set_constant(11, lora->rank);
+        enc.set_constant(12, lora->group);
+        enc.set_constant(13, lora->parts);
+      }
       enc.dispatch({(unsigned)(((N + FRN - 1) / FRN) * 256),
                     (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
       *lora_folded = true;
@@ -3137,18 +3422,12 @@ MetalMiniMaxH3Transformer::build_rope_(const h3::PackedLayout& L,
 
 // ---- the timestep MLP, on the host in f32 ----------------------------
 
-bool
-MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
-                                       SharedBuffer& out) const
+void
+MetalMiniMaxH3Transformer::time_mlp_row_(double t, bool endpoint,
+                                         float* out) const
 {
-  const int n_t = (int)timesteps.size();
   const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = _cfg.time_dim;
-  if (n_t <= 0 || out.byte_size() < (std::size_t)n_t * D * 2) { return false; }
-  if ((int)_time_in_w.size() != H * F || (int)_time_out_w.size() != D * H) {
-    return false;
-  }
   std::vector<float> row((std::size_t)F), h1((std::size_t)H);
-  auto* dst = static_cast<std::uint16_t*>(out.contents());
   const int half = F / 2;
   // Diagnostic: the scale the sinusoidal grid sees. At t in [0, 1] every
   // angle is tiny and the embedding is nearly CONSTANT across the
@@ -3158,37 +3437,117 @@ MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
   if (const char* ts = std::getenv("VPIPE_H3_TSCALE")) {
     tscale = std::atof(ts);
   }
+  // diffusers Timesteps(freq_dim, flip_sin_to_cos=True,
+  // downscale_freq_shift=0): cos first, then sin. Timesteps arrive in
+  // [0, 1] UNSCALED -- there is no 1000x here, which is the scale every
+  // other flow model in this tree conditions on. An ENDPOINT goes
+  // through the same projection: upstream copies `time_proj` for it.
+  for (int i = 0; i < half; ++i) {
+    const double fr = std::exp(-std::log(1e4) * (double)i / (double)half);
+    const double ang = t * tscale * fr;
+    row[(std::size_t)i] = (float)std::cos(ang);
+    row[(std::size_t)(half + i)] = (float)std::sin(ang);
+  }
+  for (int o = 0; o < H; ++o) {
+    float acc = _time_in_b[(std::size_t)o];
+    const float* w = &_time_in_w[(std::size_t)o * F];
+    for (int i = 0; i < F; ++i) { acc += w[i] * row[(std::size_t)i]; }
+    h1[(std::size_t)o] = acc;
+  }
+  // Each live slot's adapter on proj_in, PRE-activation. The endpoint
+  // embedder is the flow-map slot's own copy and takes only its own
+  // factors (see bind_flow_map_).
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    const LoraSlot& sl = _lora[si];
+    if (endpoint) {
+      if ((int)si == _flow.slot) {
+        sl.end_in.apply(row.data(), sl.scale, h1.data());
+      }
+    } else {
+      sl.time_in.apply(row.data(), sl.scale, h1.data());
+    }
+  }
+  for (int o = 0; o < H; ++o) {
+    const float a = h1[(std::size_t)o];
+    h1[(std::size_t)o] = a / (1.0f + std::exp(-a));   // silu
+  }
+  for (int o = 0; o < D; ++o) {
+    float acc = _time_out_b[(std::size_t)o];
+    const float* w = &_time_out_w[(std::size_t)o * H];
+    for (int i = 0; i < H; ++i) { acc += w[i] * h1[(std::size_t)i]; }
+    out[o] = acc;
+  }
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    const LoraSlot& sl = _lora[si];
+    if (endpoint) {
+      if ((int)si == _flow.slot) {
+        sl.end_out.apply(h1.data(), sl.scale, out);
+      }
+    } else {
+      sl.time_out.apply(h1.data(), sl.scale, out);
+    }
+  }
+}
+
+bool
+MetalMiniMaxH3Transformer::time_embedding(const std::vector<float>& timesteps,
+                                          const std::vector<float>* endpoints,
+                                          std::vector<float>* out) const
+{
+  const int n_t = (int)timesteps.size();
+  const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = _cfg.time_dim;
+  if (out == nullptr || n_t <= 0) { return false; }
+  if ((int)_time_in_w.size() != H * F || (int)_time_out_w.size() != D * H) {
+    return false;
+  }
+  // The flow-map blend, or the plain embedder. Off at strength 0 in
+  // BOTH halves -- see two_time_active() -- so an endpoint handed to a
+  // model with no live flow-map adapter is ignored rather than refused:
+  // the caller may not know the strength was turned down.
+  const bool two = two_time_active();
+  if (two && (endpoints == nullptr || (int)endpoints->size() != n_t)) {
+    return false;
+  }
+  out->assign((std::size_t)n_t * (std::size_t)D, 0.0f);
+  std::vector<float> er(two ? (std::size_t)D : 0);
   for (int t = 0; t < n_t; ++t) {
-    // diffusers Timesteps(freq_dim, flip_sin_to_cos=True,
-    // downscale_freq_shift=0): cos first, then sin. Timesteps arrive in
-    // [0, 1] UNSCALED -- there is no 1000x here, which is the scale
-    // every other flow model in this tree conditions on.
-    for (int i = 0; i < half; ++i) {
-      const double fr = std::exp(-std::log(1e4) * (double)i / (double)half);
-      const double ang = (double)timesteps[(std::size_t)t] * tscale * fr;
-      row[(std::size_t)i] = (float)std::cos(ang);
-      row[(std::size_t)(half + i)] = (float)std::sin(ang);
-    }
-    for (int o = 0; o < H; ++o) {
-      float acc = _time_in_b[(std::size_t)o];
-      const float* w = &_time_in_w[(std::size_t)o * F];
-      for (int i = 0; i < F; ++i) { acc += w[i] * row[(std::size_t)i]; }
-      h1[(std::size_t)o] = acc / (1.0f + std::exp(-acc));   // silu
-    }
+    float* dst = out->data() + (std::size_t)t * D;
+    time_mlp_row_((double)timesteps[(std::size_t)t], false, dst);
+    if (!two) { continue; }
+    time_mlp_row_((double)(*endpoints)[(std::size_t)t], true, er.data());
+    // emb_t + gate * (emb_r - emb_t), term for term as upstream writes
+    // it: rearranged to (1-g) emb_t + g emb_r it rounds differently in
+    // f32, and this module is the one place that rounding is coherent
+    // across every block and every step.
+    const float g = _flow.gate;
     for (int o = 0; o < D; ++o) {
-      float acc = _time_out_b[(std::size_t)o];
-      const float* w = &_time_out_w[(std::size_t)o * H];
-      for (int i = 0; i < H; ++i) { acc += w[i] * h1[(std::size_t)i]; }
-      // Every AdaLN module applies its OWN silu to temb and casts the
-      // result to its projection's dtype, so the activation runs at f32
-      // here and only its output rounds to bf16. That order is the
-      // reference's and its comment says why: rounding BEFORE the
-      // activation biases every block's modulation identically at every
-      // step, which then accumulates coherently down the denoising
-      // trajectory instead of averaging out.
-      const float sv = acc / (1.0f + std::exp(-acc));
-      dst[(std::size_t)t * D + (std::size_t)o] = f32_to_bf16_(sv);
+      dst[o] = dst[o] + g * (er[(std::size_t)o] - dst[o]);
     }
+  }
+  return true;
+}
+
+bool
+MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
+                                       const std::vector<float>* endpoints,
+                                       SharedBuffer& out) const
+{
+  const int n_t = (int)timesteps.size();
+  const int D = _cfg.time_dim;
+  if (n_t <= 0 || out.byte_size() < (std::size_t)n_t * D * 2) { return false; }
+  std::vector<float> temb;
+  if (!time_embedding(timesteps, endpoints, &temb)) { return false; }
+  auto* dst = static_cast<std::uint16_t*>(out.contents());
+  for (std::size_t i = 0; i < temb.size(); ++i) {
+    // Every AdaLN module applies its OWN silu to temb and casts the
+    // result to its projection's dtype, so the activation runs at f32
+    // here and only its output rounds to bf16. That order is the
+    // reference's and its comment says why: rounding BEFORE the
+    // activation biases every block's modulation identically at every
+    // step, which then accumulates coherently down the denoising
+    // trajectory instead of averaging out.
+    const float acc = temb[i];
+    dst[i] = f32_to_bf16_(acc / (1.0f + std::exp(-acc)));
   }
   return true;
 }
@@ -3251,7 +3610,8 @@ MetalMiniMaxH3Transformer::adaln_into_(const std::string& nm, Linear& dst)
 
 bool
 MetalMiniMaxH3Transformer::bake_adaln(
-    const std::vector<std::vector<float>>& schedule, std::string* err)
+    const std::vector<std::vector<float>>& schedule, std::string* err,
+    const std::vector<std::vector<float>>* endpoints)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = "minimax-h3 bake_adaln: " + m; }
@@ -3267,14 +3627,32 @@ MetalMiniMaxH3Transformer::bake_adaln(
   // an offset rather than gathering rows. The condition timestep repeats
   // in every step's group; deduplicating it would save one row in three
   // and cost a gather, which is the wrong trade at these sizes.
-  std::vector<float> all;
+  // Under a live flow-map adapter the table is a function of (t, r), so
+  // the endpoints are concatenated in the same order and a schedule
+  // without them is refused -- a table built from t alone would be the
+  // base model's modulation under the adapter's blocks.
+  const bool two = two_time_active();
+  if (two && (endpoints == nullptr || endpoints->size() != schedule.size())) {
+    return fail("a flow-map adapter is live and the schedule carries no "
+                "endpoints");
+  }
+  std::vector<float> all, all_r;
   _adaln_row0.clear();
   _adaln_nt.clear();
-  for (const std::vector<float>& st : schedule) {
+  for (std::size_t si = 0; si < schedule.size(); ++si) {
+    const std::vector<float>& st = schedule[si];
     if (st.empty()) { return fail("a step with no timesteps"); }
     _adaln_row0.push_back((int)all.size());
     _adaln_nt.push_back((int)st.size());
     all.insert(all.end(), st.begin(), st.end());
+    if (two) {
+      const std::vector<float>& er = (*endpoints)[si];
+      if (er.size() != st.size()) {
+        return fail(fmt("step {} has {} timesteps and {} endpoints", si,
+                        st.size(), er.size())());
+      }
+      all_r.insert(all_r.end(), er.begin(), er.end());
+    }
   }
   const int T = (int)all.size();
 
@@ -3298,7 +3676,9 @@ MetalMiniMaxH3Transformer::bake_adaln(
   SharedBuffer temb =
       _mc->make_shared_buffer((std::size_t)T * (std::size_t)c.time_dim * 2);
   if (temb.empty()) { return fail("temb allocation failed"); }
-  if (!time_embed_(all, temb)) { return fail("time embedding failed"); }
+  if (!time_embed_(all, two ? &all_r : nullptr, temb)) {
+    return fail("time embedding failed");
+  }
 
   // CAVEAT ON THIS NUMBER, which is a byte count and not a measurement.
   //
@@ -4557,7 +4937,9 @@ MetalMiniMaxH3Transformer::ane_stage_(int L, const Block& b,
       AneFfnSource::Delta& d = s.delta[s.deltas++];
       d.a     = &st.s[i].f->a;
       d.b     = &st.s[i].f->b;
-      d.rank  = st.s[i].f->rank;
+      d.rank  = st.s[i].f->b_rank();
+      d.group = st.s[i].f->group;
+      d.parts = st.s[i].f->parts;
       d.scale = st.s[i].scale;
       d.b_stride = stride;        // the fc1 adapter is laid out like fc1
       d.b_offset = offset;
@@ -4628,7 +5010,10 @@ MetalMiniMaxH3Transformer::ane_qkv_stage_(int L, const Block& b,
     AneFfnSource::Delta& d = s.delta[s.deltas++];
     d.a     = &lora.s[i].f->a;
     d.b     = &lora.s[i].f->b;
-    d.rank  = lora.s[i].f->rank;
+    // A banded q/k/v pair merges part by part (see Delta::group).
+    d.rank  = lora.s[i].f->b_rank();
+    d.group = lora.s[i].f->group;
+    d.parts = lora.s[i].f->parts;
     d.scale = lora.s[i].scale;
   }
   _ane_qkv->stage(L, s, _quant_group);
@@ -4701,6 +5086,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (seq <= 0 || n_t <= 0 || n_text <= 0) { return fail("empty sequence"); }
   if ((int)in.row_timestep_index->size() != seq) {
     return fail("row_timestep_index does not match the layout");
+  }
+  if (two_time_active() &&
+      (in.endpoints == nullptr ||
+       in.endpoints->size() != in.timesteps->size())) {
+    // Refused, not defaulted. A flow-map adapter's blocks were trained
+    // under the blended embedding; run with emb(t) alone they produce a
+    // plausible, wrong velocity -- the one failure nobody would notice.
+    return fail("a flow-map (HyperFlow) adapter is live, so every forward "
+                "needs its timesteps' ENDPOINTS (Step::endpoints, from "
+                "build_row_time_pairs); set its lora scale to 0 to run the "
+                "base model");
   }
   if (n_audio > 0 && in.audio == nullptr) {
     return fail("the layout has audio rows but no audio latents");
@@ -4843,7 +5239,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // produced plausible numbers, not a crash, and showed up only as the
   // baked and unbaked paths disagreeing once an adapter was attached.
   // It costs a host pass over n_t rows, which is nothing.
-  if (!time_embed_(*in.timesteps, s.temb)) {
+  if (!time_embed_(*in.timesteps, in.endpoints, s.temb)) {
     return fail("timestep embedding failed");
   }
   {
@@ -4936,7 +5332,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // different rounding. `dense_layers >= n_layers` is a legitimate
   // setting (it is the ablation that says the filter works), so it has
   // to mean "unchanged model", not "same answer, different kernel".
-  const bool sol_on = (bool)_sol && !vdn_linear &&
+  const bool sol_on = (bool)_sol && !vdn_linear && !in.dense_attention &&
                       c.sol.dense_layers < c.n_layers;
   // SAGE IS A KERNEL VARIANT, not a second attention: it needs the
   // matrix-core steel entry, because the int8 fragment MMA only exists

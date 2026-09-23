@@ -253,6 +253,14 @@ const ConfigKey kAttrs[] = {
           "redundant; the published profile keeps 1 of 48. 0 routes every "
           "block",
    .def_int = 1},
+  {.key = "sol_dense_steps", .type = ConfigType::Int, .required = false,
+   .doc = "leading DENOISING STEPS left dense, untouched by Sol-Attn -- "
+          "the time-axis twin of sol_dense_layers. The first steps decide "
+          "a clip's coarse structure, and they are where a routing "
+          "approximation costs most. 0 (default) routes every step. "
+          "HyperFlow's published Sol recipe for its 8-step grid is 2 "
+          "here with sol_dense_layers 2 and sol_tau 1.0. minimax-h3 only",
+   .def_int = 0},
   {.key = "sol_key_block", .type = ConfigType::Int, .required = false,
    .doc = "keys summarised by one centroid, and the unit the routing "
           "decides on. 32 or 64 only; 0 (default) takes 64, which is the "
@@ -440,6 +448,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _sol.tau          = (float)attr_real("sol_tau");
   _sol.dense_layers = (int)attr_int("sol_dense_layers");
   _sol.local_radius = (int)attr_int("sol_local_radius");
+  _sol_dense_steps  = std::max(0, (int)attr_int("sol_dense_steps"));
   // 32 or 64, and 0 means the default. WARN AND FALL BACK rather than
   // refuse the stage, which is what `unload_when_idle` beside it does
   // for the same class of key: a perf knob spelled wrong should not take
@@ -1900,7 +1909,22 @@ GenerateVideoStage::ensure_expert_(int which)
     std::size_t dit_retires = 0;
     {
       constexpr int kRowsPerStep = 4;      // == kTimestepsUpperBound below
-      const int max_rows = _steps > 0 ? _steps * kRowsPerStep : 0;
+      // A flow-map adapter runs ITS grid, not `steps`, so the bound
+      // takes the larger -- read from the file's header, since nothing
+      // is loaded yet. (Its (t, r) pairs still number at most four a
+      // step: video, audio and the two pinned conditioning levels.)
+      int bound_steps = _steps;
+      for (const H3LoraSlot& sl : _h3_lora) {
+        if (sl.path.empty()) { continue; }
+        std::string ignored;
+        const std::string f = resolve_adapter_file(session(), sl.path,
+                                                   &ignored);
+        if (f.empty()) { continue; }
+        bound_steps = std::max(
+            bound_steps,
+            genai::MetalMiniMaxH3Transformer::flow_map_steps(f));
+      }
+      const int max_rows = bound_steps > 0 ? bound_steps * kRowsPerStep : 0;
       if (genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
                                                               max_rows)) {
         dit_retires =
@@ -2027,6 +2051,45 @@ GenerateVideoStage::ensure_expert_(int which)
           "branch weights beside the DiT, {}", this->id(), vbytes >> 20,
           stream_blocks ? "streamed with it, one block at a time"
                         : "held resident"));
+    }
+    // A FLOW-MAP adapter (HyperFlow) brings its own sampling grid, and
+    // denoise() runs it in place of `steps` -- so say so here, once,
+    // rather than let a graph that asks for 40 steps quietly get 8.
+    if (_h3_dit && _h3_dit->flow_map() != nullptr &&
+        !_h3_dit->two_time_active()) {
+      // Loaded at strength 0: both halves are off and this is the base
+      // model on the graph's own `steps` -- which is worth saying,
+      // because the adapter's name in the graph suggests otherwise.
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): HyperFlow {} is loaded on lora slot {} "
+          "at strength 0 -- the BASE model runs, on `steps: {}`",
+          this->id(), _h3_dit->flow_map()->version,
+          _h3_dit->flow_map()->slot, _steps));
+    } else if (_h3_dit && _h3_dit->flow_map() != nullptr) {
+      const auto& fm = *_h3_dit->flow_map();
+      const int fsteps =
+          fm.sigmas.empty() ? _steps : (int)fm.sigmas.size() - 1;
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- "
+          "{}-step flow-map grid from the adapter (`steps: {}` is not "
+          "used while it is live), two-time embedding at gate {:.4g}",
+          this->id(), fm.version, fm.slot, fsteps, _steps, fm.gate));
+      // The grid is shifted with the GRAPH's shifts, as upstream does,
+      // but it was distilled at the file's. Warn, do not override: the
+      // shifts are a knob someone may be turning on purpose.
+      auto off = [](double want, double have) {
+        return want > 0.0 && std::fabs(want - have) > 1e-6;
+      };
+      if (off(fm.video_shift, _h3_params.video_shift) ||
+          off(fm.audio_shift, _h3_params.audio_shift)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): HyperFlow was distilled at shifts "
+            "{:.4g}/{:.4g} and this graph runs {:.4g}/{:.4g}; the "
+            "adapter's grid is shifted with the graph's, and quality is "
+            "only validated at the trained ones", this->id(),
+            fm.video_shift, fm.audio_shift, _h3_params.video_shift,
+            _h3_params.audio_shift));
+      }
     }
     resolve_unload_policy_h3_(stream_blocks);
     if (_h3_dit && stream_blocks) {
@@ -2882,13 +2945,20 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // The shifts and both condition levels in one move, so a knob added to
   // GenerationParams reaches the loop without this call site changing.
   req.set_params(_h3_params);
+  req.sol_dense_steps = _sol_dense_steps;
   UiProgress bar = session()->open_progress("denoise");
   // Block-granular, like the image DiTs. A step here is one forward of a
   // 33B stack over a ~19k-row sequence -- tens of seconds at the model's
   // own geometry -- so a step-granular bar sits still for the entire time
   // anything is happening. H3 is guidance-distilled, so exactly ONE
-  // forward per step.
-  DenoiseProgress prog(&bar, _steps, /*forwards_per_step=*/1);
+  // forward per step. A live flow-map adapter runs its own grid, so the
+  // bar starts at THAT count rather than jumping to it after step one.
+  int bar_steps = _steps;
+  if (_h3_dit->two_time_active() && _h3_dit->flow_map() != nullptr &&
+      !_h3_dit->flow_map()->sigmas.empty()) {
+    bar_steps = (int)_h3_dit->flow_map()->sigmas.size() - 1;
+  }
+  DenoiseProgress prog(&bar, bar_steps, /*forwards_per_step=*/1);
   ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
                                                              prog);
   req.progress = [&](int step, int total) {

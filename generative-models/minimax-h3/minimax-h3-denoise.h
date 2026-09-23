@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace vpipe {
 namespace genai {
@@ -60,6 +61,18 @@ struct DenoiseRequest {
   int    video_grid_w = 0;
 
   int    num_steps   = 32;
+  // An explicit RAW sigma grid (1 -> 0, unshifted), overriding
+  // `num_steps`. Each modality pushes it through its own shift, as with
+  // the linspace grid.
+  //
+  // Left empty, a live FLOW-MAP adapter on the DiT supplies its own --
+  // the grid it was distilled on is a property of its weights, the way
+  // upstream's loader configures the pipeline from the file -- and
+  // `num_steps` is ignored. An explicit grid here still wins.
+  std::vector<float> sigma_grid;
+  // Leading steps whose attention runs DENSE with Sol-Attn on (see
+  // Step::dense_attention). 0 routes every step.
+  int sol_dense_steps = 0;
   double video_shift = 12.0;
   double audio_shift = 3.0;
   // The timestep the pinned keyframe rows are conditioned on. They are

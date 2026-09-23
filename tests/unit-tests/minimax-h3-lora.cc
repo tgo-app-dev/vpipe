@@ -30,10 +30,12 @@
 #include "generative-models/lora-fusion.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/runtime-lora.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1532,4 +1534,551 @@ TEST(minimax_h3_lora, the_flat_to_per_head_map_is_the_two_checkpoints)
   // the same layout and there would be nothing to adapt.
   EXPECT_TRUE(mapped == checked);
   EXPECT_TRUE(identity * 4 < checked);
+}
+
+// ---- HyperFlow: the flow-map (two-time) adapter ----------------------
+//
+// VPIPE_H3_HYPERFLOW_LORA names videorebirth/hyperflow's weights file;
+// VPIPE_H3_HYPERFLOW_GOLDEN a directory written by
+// dump_hyperflow_golden.py (kept beside the reference checkout), which
+// runs UPSTREAM's TwoTimeEmbedder over diffusers' Timesteps +
+// TimestepEmbedding with the adapter injected by PEFT.
+
+namespace {
+
+struct HyperFlowGolden {
+  int n = 0, d = 0;
+  std::vector<float> t, r, hf, base;
+};
+
+bool
+read_hyperflow_golden_(const std::string& dir, HyperFlowGolden* g)
+{
+  std::ifstream f(dir + "/golden.bin", std::ios::binary);
+  if (!f) { return false; }
+  std::uint32_t hd[2] = {0, 0};
+  f.read(reinterpret_cast<char*>(hd), 8);
+  g->n = (int)hd[0];
+  g->d = (int)hd[1];
+  if (!f || g->n <= 0 || g->d <= 0) { return false; }
+  std::vector<float> tr((std::size_t)g->n * 2);
+  g->hf.resize((std::size_t)g->n * g->d);
+  g->base.resize(g->hf.size());
+  f.read(reinterpret_cast<char*>(tr.data()), (std::streamsize)tr.size() * 4);
+  f.read(reinterpret_cast<char*>(g->hf.data()),
+         (std::streamsize)g->hf.size() * 4);
+  f.read(reinterpret_cast<char*>(g->base.data()),
+         (std::streamsize)g->base.size() * 4);
+  if (!f) { return false; }
+  for (int i = 0; i < g->n; ++i) {
+    g->t.push_back(tr[(std::size_t)i * 2]);
+    g->r.push_back(tr[(std::size_t)i * 2 + 1]);
+  }
+  return true;
+}
+
+double
+rel_l2_(const std::vector<float>& a, const std::vector<float>& b)
+{
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    num += d * d;
+    den += (double)b[i] * (double)b[i];
+  }
+  return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+}
+
+}  // namespace
+
+// The two-time timestep embedding, against upstream's own module.
+//
+// This is the ONE architectural change HyperFlow makes, and it is on
+// the host in f32 -- so the bar is f32, not bf16: the same MLP in the
+// same precision, differing only in summation order. Every (t, r) pair
+// an 8-step run hands the embedder is covered, plus off-grid ones.
+//
+// Also asserted: that the file is RECOGNISED (a flow-map adapter whose
+// header was missed would bind as a plain LoRA and run the base
+// embedding under trained blocks -- plausible video, wrong model), and
+// that strength 0 is the base embedding EXACTLY, endpoints or not.
+TEST(minimax_h3_lora, hyperflow_embedding_matches_upstream)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_H3_HYPERFLOW_LORA");
+  const char* gd   = std::getenv("VPIPE_H3_HYPERFLOW_GOLDEN");
+  if (root == nullptr || lp == nullptr || gd == nullptr || *root == '\0' ||
+      *lp == '\0' || *gd == '\0') {
+    return;
+  }
+  HyperFlowGolden g;
+  ASSERT_TRUE(read_hyperflow_golden_(gd, &g));
+  if (g.n <= 0) { return; }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = 1;
+  ASSERT_TRUE(g.d == cfg.time_dim);
+
+  // Read from the header alone, before any model exists.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::flow_map_steps(lp) == 8);
+
+  auto m = MetalMiniMaxH3Transformer::load(
+      root, mc, cfg, false, {MetalMiniMaxH3Transformer::LoraSpec{lp, 1.0f}});
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const auto* fm = m->flow_map();
+  ASSERT_TRUE(fm != nullptr);
+  if (fm == nullptr) { return; }
+  EXPECT_TRUE(fm->slot == 0);
+  EXPECT_TRUE(fm->gate == 0.25f);
+  EXPECT_TRUE(fm->sigmas.size() == 9 && fm->sigmas.front() == 1.0f &&
+              fm->sigmas.back() == 0.0f);
+  EXPECT_TRUE(fm->video_shift == 12.0 && fm->audio_shift == 3.0);
+  EXPECT_TRUE(m->two_time_active());
+  // One block + two refiner blocks at four modules each (q/k/v bind as
+  // ONE fused projection), plus the four timestep-MLP projections.
+  std::printf("[minimax_h3_lora] hyperflow: %d modules bound at 1 block\n",
+              m->lora_modules());
+  EXPECT_TRUE(m->lora_modules() == 3 * 4 + 4);
+
+  std::vector<float> hf, base, base_nr;
+  ASSERT_TRUE(m->time_embedding(g.t, &g.r, &hf));
+  // Live and no endpoints: refused, never defaulted to r = t.
+  std::vector<float> none;
+  EXPECT_FALSE(m->time_embedding(g.t, nullptr, &none));
+  m->set_lora_scale(0, 0.0f);
+  EXPECT_FALSE(m->two_time_active());
+  ASSERT_TRUE(m->time_embedding(g.t, &g.r, &base));
+  ASSERT_TRUE(m->time_embedding(g.t, nullptr, &base_nr));
+
+  double worst = 0.0;
+  for (int i = 0; i < g.n; ++i) {
+    const auto row = [&](const std::vector<float>& v) {
+      return std::vector<float>(v.begin() + (std::ptrdiff_t)i * g.d,
+                                v.begin() + (std::ptrdiff_t)(i + 1) * g.d);
+    };
+    worst = std::max(worst, rel_l2_(row(hf), row(g.hf)));
+  }
+  const double e_hf = rel_l2_(hf, g.hf), e_base = rel_l2_(base, g.base);
+  const double moved = rel_l2_(g.hf, g.base);
+  std::printf("[minimax_h3_lora] hyperflow temb vs upstream: %.3e (worst "
+              "row %.3e) over %d (t, r) pairs | base at scale 0: %.3e | "
+              "the adapter moves temb %.3e\n", e_hf, worst, g.n, e_base,
+              moved);
+  // f32 against f32. The adapter moves the embedding by ~9%, so a bar
+  // this tight is five orders of magnitude inside the effect.
+  EXPECT_TRUE(worst < 1e-5);
+  EXPECT_TRUE(e_base < 1e-5);
+  EXPECT_TRUE(moved > 1e-2);
+  EXPECT_TRUE(base == base_nr);
+}
+
+// The forward: strength 0 is the base model EXACTLY, strength 1 moves
+// it, and a live flow-map adapter REFUSES a Step with no endpoints.
+//
+// Also that the endpoint reaches the output at all -- the same t with a
+// different r must give a different velocity, or the blend is dead
+// code and the adapter is a plain LoRA running under the wrong
+// embedding. Each arm pins the split FF and the steel route, for the
+// reasons runtime_adapter_is_off_at_zero_and_on_at_one gives.
+TEST(minimax_h3_lora, hyperflow_forward_is_the_base_at_zero)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_H3_HYPERFLOW_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = 4;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  // Step 5 of the 8-step grid, both modalities.
+  std::vector<float> uniq, uniq_r, uniq_r2, tonly;
+  std::vector<int> row_idx, row_idx2, tidx;
+  h3::build_row_time_pairs(L, 0.165057659f, 0.303147972f, 0.441574693f,
+                           0.635049701f, 0.999f, &uniq, &uniq_r, &row_idx);
+  // Same t, different endpoints for the generated rows.
+  std::vector<float> uniq2;
+  h3::build_row_time_pairs(L, 0.165057659f, 0.2f, 0.441574693f, 0.5f,
+                           0.999f, &uniq2, &uniq_r2, &row_idx2);
+  h3::build_row_timesteps(L, 0.165057659f, 0.441574693f, 0.999f, &tonly,
+                          &tidx);
+  ASSERT_TRUE(uniq == uniq2 && row_idx == row_idx2);
+
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  auto fwd = [&](MetalMiniMaxH3Transformer* m, const std::vector<float>* t,
+                 const std::vector<float>* r, const std::vector<int>* ri,
+                 std::vector<float>* out, std::string* ferr) {
+    MetalMiniMaxH3Transformer::Step st;
+    st.video = &vb;  st.audio = &ab;  st.text = &tb;
+    st.layout = &L;  st.timesteps = t;  st.endpoints = r;
+    st.row_timestep_index = ri;
+    const auto v = m->forward(st, ferr);
+    if (v.empty()) { return false; }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    out->resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
+    return true;
+  };
+
+  std::vector<float> v_base, v_zero, v_one, v_one_r2;
+  std::string ferr;
+  {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, {});
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { ::unsetenv("VPIPE_H3_NO_FUSED_FF"); return; }
+    m->set_gemm_route(kPin);
+    ASSERT_TRUE(fwd(m.get(), &tonly, nullptr, &tidx, &v_base, &ferr));
+  }
+  {
+    auto m = MetalMiniMaxH3Transformer::load(
+        root, mc, cfg, false,
+        {MetalMiniMaxH3Transformer::LoraSpec{lp, 1.0f}});
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { ::unsetenv("VPIPE_H3_NO_FUSED_FF"); return; }
+    m->set_gemm_route(kPin);
+    ASSERT_TRUE(fwd(m.get(), &uniq, &uniq_r, &row_idx, &v_one, &ferr));
+    ASSERT_TRUE(fwd(m.get(), &uniq2, &uniq_r2, &row_idx2, &v_one_r2, &ferr));
+    std::vector<float> junk;
+    std::string rerr;
+    EXPECT_FALSE(fwd(m.get(), &tonly, nullptr, &tidx, &junk, &rerr));
+    std::printf("[minimax_h3_lora] hyperflow without endpoints: %s\n",
+                rerr.c_str());
+    EXPECT_TRUE(rerr.find("ENDPOINTS") != std::string::npos);
+    // Turned to 0: the base model, with the endpoints still handed in
+    // and ignored -- and on the t-only plan too.
+    m->set_lora_scale(0, 0.0f);
+    std::vector<float> v_zero_t;
+    ASSERT_TRUE(fwd(m.get(), &uniq, &uniq_r, &row_idx, &v_zero, &ferr));
+    ASSERT_TRUE(fwd(m.get(), &tonly, nullptr, &tidx, &v_zero_t, &ferr));
+    EXPECT_TRUE(v_zero_t == v_base);
+  }
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  const double at_zero = rel_l2_(v_zero, v_base);
+  const double at_one  = rel_l2_(v_one, v_base);
+  const double by_r    = rel_l2_(v_one_r2, v_one);
+  std::printf("[minimax_h3_lora] hyperflow forward @4 blocks | scale 0 vs "
+              "base %.3e | scale 1 moves %.3e | a different endpoint "
+              "moves %.3e\n", at_zero, at_one, by_r);
+  EXPECT_TRUE(at_zero == 0.0);
+  EXPECT_TRUE(at_one > 1e-3);
+  EXPECT_TRUE(by_r > 1e-4);
+}
+
+// denoise() takes the adapter's grid, and the AdaLN bake keys on (t, r).
+//
+// A graph asking for 3 steps still runs HyperFlow's 8 -- the grid is a
+// property of the weights -- and the progress callback says 8. Then
+// baked against per-step projections, which must agree EXACTLY: the
+// bake only moves where the modulation is computed, so any difference
+// is a table built from the wrong (t, r), which is exactly the failure
+// a t-keyed bake would produce here.
+TEST(minimax_h3_lora, hyperflow_denoise_runs_the_adapters_grid)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_H3_HYPERFLOW_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = 2;
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  const int PE = cfg.video_patch_elems();
+  const std::size_t nv = L.video_indices.size() * (std::size_t)PE;
+  const std::size_t na =
+      L.audio_indices.size() * (std::size_t)cfg.audio_channels;
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!tb.empty());
+
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  auto run = [&](bool bake, std::vector<float>* vid, int* total) {
+    auto m = MetalMiniMaxH3Transformer::load(
+        root, mc, cfg, false,
+        {MetalMiniMaxH3Transformer::LoraSpec{lp, 1.0f}});
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    *vid = ramp(nv, 0.017f);
+    std::vector<float> aud = ramp(na, 0.031f);
+    DenoiseRequest req;
+    req.dit = m.get();
+    req.layout = &L;
+    req.text = &tb;
+    req.video = vid->data();
+    req.audio = aud.data();
+    req.num_steps = 3;
+    req.condition_timestep = 0.999f;
+    req.progress = [&](int, int t) { *total = t; return true; };
+    if (!bake) { ::setenv("VPIPE_H3_NO_ADALN_BAKE", "1", 1); }
+    std::string derr;
+    const bool ok = denoise(req, &derr);
+    ::unsetenv("VPIPE_H3_NO_ADALN_BAKE");
+    if (!ok) { std::printf("[minimax_h3_lora] denoise: %s\n", derr.c_str()); }
+    return ok;
+  };
+  std::vector<float> baked, plain;
+  int t_baked = 0, t_plain = 0;
+  ASSERT_TRUE(run(true, &baked, &t_baked));
+  ASSERT_TRUE(run(false, &plain, &t_plain));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  const double agree = rel_l2_(baked, plain);
+  std::printf("[minimax_h3_lora] hyperflow denoise: %d / %d steps (asked "
+              "for 3) | baked vs per-step %.3e\n", t_baked, t_plain, agree);
+  EXPECT_TRUE(t_baked == 8 && t_plain == 8);
+  EXPECT_TRUE(agree == 0.0);
+}
+
+// A BANDED split q/k/v adapter is the block-diagonal one without the
+// zeros (lora::Factors::banded): the same A, a B with only each row's own
+// part, and a second GEMM whose tile reads its part's window of t.
+//
+// Same arithmetic, so the bar is the arithmetic's. On steel it is EXACT:
+// the block-diagonal tile accumulates the same nonzero products in the
+// same BK order and adds exact zeros for the other parts, which do not
+// move an f32 sum. On the matrix cores the contraction is 256 deep
+// instead of 768 and matmul2d's internal reduction order is its own, so
+// the bar there is a small multiple of rounding, printed beside what the
+// adapter moves so it is not vacuous.
+//
+// Every route the box has, banded against block-diagonal with the base
+// route PINNED identically: steel; matmul2d as its own dispatch; matmul2d
+// folded into the base tile -- at both tile widths, since the 256-wide
+// tile straddles a per-head group and must decline to the 128-wide one
+// there rather than contract half a tile against the wrong part.
+//
+// The geometry clears every floor the routes have: gemm_mma_ declines
+// under 64 rows, so this packs ~3.9k.
+TEST(minimax_h3_lora, banded_qkv_is_the_block_diagonal_adapter)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_H3_HYPERFLOW_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = 4;
+  const bool nax = mc->supports_matrix_cores();
+
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 16, 40, 24, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq, uniq_r;
+  std::vector<int> row_idx;
+  h3::build_row_time_pairs(L, 0.165057659f, 0.303147972f, 0.441574693f,
+                           0.635049701f, 0.999f, &uniq, &uniq_r, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = std::sin((float)i * k) * 0.5f; }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  using Route = MetalMiniMaxH3Transformer::GemmRoute;
+  struct Env {                        // the load-time switches, restored
+    ~Env()
+    {
+      ::unsetenv("VPIPE_H3_LORA_NO_BAND");
+      ::unsetenv("VPIPE_H3_NO_LORA_MMA");
+      ::unsetenv("VPIPE_H3_NO_LORA_FUSE");
+      ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+    }
+  } env;
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  auto set = [](const char* k, bool on) {
+    if (on) { ::setenv(k, "1", 1); } else { ::unsetenv(k); }
+  };
+  auto load = [&](bool band, bool steel_lora, bool no_fuse, Route base) {
+    set("VPIPE_H3_LORA_NO_BAND", !band);
+    set("VPIPE_H3_NO_LORA_MMA", steel_lora);
+    set("VPIPE_H3_NO_LORA_FUSE", no_fuse);
+    auto m = MetalMiniMaxH3Transformer::load(
+        root, mc, cfg, false,
+        {MetalMiniMaxH3Transformer::LoraSpec{lp, 1.0f}});
+    if (m != nullptr) { m->set_gemm_route(base); }
+    return m;
+  };
+  auto fwd = [&](MetalMiniMaxH3Transformer* m, std::vector<float>* out) {
+    MetalMiniMaxH3Transformer::Step st;
+    st.video = &vb;  st.audio = &ab;  st.text = &tb;
+    st.layout = &L;  st.timesteps = &uniq;  st.endpoints = &uniq_r;
+    st.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(st, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    out->resize(n);
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
+    return true;
+  };
+
+  // The adapter's own effect, from the steel block-diagonal arm at
+  // strength 0 -- the yardstick every agreement below is weighed against.
+  std::vector<float> v_base;
+  {
+    auto m = load(false, true, true, nax ? Route::kMma128 : Route::kSteelBm32);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    m->set_lora_scale(0, 0.0f);
+    ASSERT_TRUE(fwd(m.get(), &v_base));
+  }
+
+  struct Arm {
+    const char* name;
+    bool steel_lora, no_fuse;
+    Route base;
+    double bar;                       // banded vs block-diagonal
+  };
+  std::vector<Arm> arms = {
+      {"steel", true, true, nax ? Route::kMma128 : Route::kSteelBm32, 0.0},
+  };
+  if (nax) {
+    // The same matmul2d kernel family on both sides, contracting 256
+    // deep against 768. MEASURED exact on the M5 Pro in all three arms
+    // (the unit accumulates the zero chunks without reordering the
+    // rest), but nothing documents that reduction order, so the bar is
+    // rounding-sized -- still an order below the adapter's effect.
+    arms.push_back({"mma separate, 128 tile", false, true, Route::kMma128,
+                    2e-3});
+    arms.push_back({"mma fused, 128 tile", false, false, Route::kMma128,
+                    2e-3});
+    arms.push_back({"mma fused, 256 tile", false, false, Route::kMma128x256,
+                    2e-3});
+  }
+  const int blocks = cfg.n_layers + cfg.n_refiner;
+  for (const Arm& a : arms) {
+    std::vector<float> v_band, v_block;
+    std::size_t by_band = 0, by_block = 0;
+    int nb_band = -1, nb_block = -1;
+    {
+      auto m = load(true, a.steel_lora, a.no_fuse, a.base);
+      ASSERT_TRUE(m != nullptr);
+      if (m == nullptr) { return; }
+      nb_band = m->lora_banded(0);
+      by_band = m->lora_bytes();
+      ASSERT_TRUE(fwd(m.get(), &v_band));
+    }
+    {
+      auto m = load(false, a.steel_lora, a.no_fuse, a.base);
+      ASSERT_TRUE(m != nullptr);
+      if (m == nullptr) { return; }
+      nb_block = m->lora_banded(0);
+      by_block = m->lora_bytes();
+      ASSERT_TRUE(fwd(m.get(), &v_block));
+    }
+    const double agree = rel_l2_(v_band, v_block);
+    const double moved = rel_l2_(v_block, v_base);
+    std::printf("[minimax_h3_lora] banded qkv, %s (%s grouping): %d/%d "
+                "banded | adapter %.1f MB banded vs %.1f MB block-diagonal "
+                "| banded vs block-diagonal %.3e | the adapter moves %.3e\n",
+                a.name, cfg.qkv_per_head ? "per-head" : "flat", nb_band,
+                blocks, by_band / 1048576.0, by_block / 1048576.0, agree,
+                moved);
+    // ENGAGED before accurate: every block banded in one arm, none in
+    // the other, or the comparison is of a thing with itself.
+    EXPECT_TRUE(nb_band == blocks && nb_block == 0);
+    // The zeros are gone: 2 of 3 parts' B per block, rank 256 x 3 * inner.
+    const std::size_t want =
+        (std::size_t)blocks * 2 * 256 * 3 * (std::size_t)cfg.inner() * 2;
+    EXPECT_TRUE(by_block - by_band == want);
+    EXPECT_TRUE(moved > 1e-3);
+    if (a.bar == 0.0) {
+      EXPECT_TRUE(agree == 0.0);
+    } else {
+      EXPECT_TRUE(agree < a.bar);
+    }
+  }
+
+  // The speed, opt-in: VPIPE_H3_BAND_BENCH=<reps>. Both models held and
+  // their forwards INTERLEAVED, order alternating per rep, so a clock
+  // that drifts over the run charges both arms alike.
+  const char* bench = std::getenv("VPIPE_H3_BAND_BENCH");
+  const int reps = bench != nullptr ? std::atoi(bench) : 0;
+  if (reps > 0) {
+    auto mb = load(true, false, false, nax ? Route::kMma128 : Route::kSteelBm32);
+    auto mk = load(false, false, false,
+                   nax ? Route::kMma128 : Route::kSteelBm32);
+    ASSERT_TRUE(mb != nullptr && mk != nullptr);
+    if (mb == nullptr || mk == nullptr) { return; }
+    std::vector<float> scratch;
+    ASSERT_TRUE(fwd(mb.get(), &scratch) && fwd(mk.get(), &scratch));  // warm
+    double tb_ms = 0.0, tk_ms = 0.0;
+    for (int r = 0; r < reps; ++r) {
+      for (int k = 0; k < 2; ++k) {
+        const bool band_first = (r % 2) == 0;
+        MetalMiniMaxH3Transformer* m =
+            ((k == 0) == band_first) ? mb.get() : mk.get();
+        const auto t0 = std::chrono::steady_clock::now();
+        ASSERT_TRUE(fwd(m, &scratch));
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        (m == mb.get() ? tb_ms : tk_ms) += ms;
+      }
+    }
+    std::printf("[minimax_h3_lora] band bench @%d rows x %d blocks, %d reps "
+                "interleaved: banded %.1f ms/fwd, block-diagonal %.1f ms/fwd "
+                "(%.3fx)\n", L.seq_len, cfg.n_layers, reps, tb_ms / reps,
+                tk_ms / reps, tk_ms / tb_ms);
+  }
 }

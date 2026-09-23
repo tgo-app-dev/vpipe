@@ -294,6 +294,8 @@ private:
   bool        _i8_gemm{};
   // Sol-Attn, family-agnostic beside _i8_gemm; see the config docs.
   genai::sol::Config _sol{};
+  // Leading denoising steps Sol leaves dense (minimax-h3's loop only).
+  int _sol_dense_steps = 0;
   // SageAttention, family-agnostic beside _sol and _i8_gemm. Carried to
   // plugin families too (VideoModelCreateArgs::sage), because the
   // families out of tree run the same flash kernel.

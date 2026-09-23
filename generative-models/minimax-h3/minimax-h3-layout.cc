@@ -1,6 +1,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 
 namespace vpipe {
@@ -549,6 +550,57 @@ build_row_timesteps(const PackedLayout& layout, float video_timestep,
                    uniq.begin());
   }
   *timesteps_out = std::move(uniq);
+  *row_index_out = std::move(idx);
+}
+
+void
+build_row_time_pairs(const PackedLayout& layout, float video_timestep,
+                     float video_endpoint, float audio_timestep,
+                     float audio_endpoint, float condition_video_timestep,
+                     std::vector<float>* timesteps_out,
+                     std::vector<float>* endpoints_out,
+                     std::vector<int>* row_index_out,
+                     float condition_audio_timestep)
+{
+  if (timesteps_out == nullptr || endpoints_out == nullptr ||
+      row_index_out == nullptr) {
+    return;
+  }
+  const std::size_t seq = (std::size_t)layout.seq_len;
+  using Pair = std::pair<float, float>;
+  std::vector<Pair> row(seq, Pair{video_timestep, video_endpoint});
+  // The same three overrides, in the same order, as build_row_timesteps
+  // -- the rule for which rows are pinned is unchanged; only what a row
+  // carries grew.
+  const int ncv = layout.num_condition_video_rows;
+  const int nca = layout.num_condition_audio_rows;
+  for (int i = 0; i < ncv && i < (int)layout.video_indices.size(); ++i) {
+    row[(std::size_t)layout.video_indices[(std::size_t)i]] =
+        Pair{condition_video_timestep, condition_video_timestep};
+  }
+  for (int i = nca; i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] =
+        Pair{audio_timestep, audio_endpoint};
+  }
+  for (int i = 0; i < nca && i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] =
+        Pair{condition_audio_timestep, condition_audio_timestep};
+  }
+
+  std::vector<Pair> uniq = row;
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+  std::vector<int> idx(seq, 0);
+  for (std::size_t i = 0; i < seq; ++i) {
+    idx[i] = (int)(std::lower_bound(uniq.begin(), uniq.end(), row[i]) -
+                   uniq.begin());
+  }
+  timesteps_out->resize(uniq.size());
+  endpoints_out->resize(uniq.size());
+  for (std::size_t i = 0; i < uniq.size(); ++i) {
+    (*timesteps_out)[i] = uniq[i].first;
+    (*endpoints_out)[i] = uniq[i].second;
+  }
   *row_index_out = std::move(idx);
 }
 

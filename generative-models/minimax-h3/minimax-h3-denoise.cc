@@ -5,6 +5,7 @@
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -83,7 +84,25 @@ denoise(const DenoiseRequest& req, std::string* err)
   // output, and the video at 4 steps is already good.
   const bool res_ms = std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
   std::vector<float> vprev, aprev;
-  if (!sv.set_timesteps(req.num_steps) || !sa.set_timesteps(req.num_steps)) {
+  // A FLOW-MAP adapter conditions each step on where it lands, so the
+  // loop hands the DiT (t, r) pairs rather than t alone -- and runs the
+  // grid the adapter was distilled on unless the caller named another.
+  const bool two_time = req.dit->two_time_active();
+  const MetalMiniMaxH3Transformer::FlowMap* fm = req.dit->flow_map();
+  const std::vector<float>* grid =
+      !req.sigma_grid.empty() ? &req.sigma_grid
+      : (two_time && fm != nullptr && !fm->sigmas.empty()) ? &fm->sigmas
+                                                           : nullptr;
+  if (grid != nullptr) {
+    if (!sv.set_sigmas(*grid) || !sa.set_sigmas(*grid)) {
+      return fail(fmt("denoise: the {} sigma grid ({} points) is not a "
+                      "strictly decreasing 1 -> 0 grid under shifts "
+                      "{:.4g}/{:.4g}",
+                      grid == &req.sigma_grid ? "requested" : "adapter's",
+                      grid->size(), req.video_shift, req.audio_shift)());
+    }
+  } else if (!sv.set_timesteps(req.num_steps) ||
+             !sa.set_timesteps(req.num_steps)) {
     return fail("denoise: bad step count " + std::to_string(req.num_steps));
   }
   // The shift collapses duplicate sigmas, and it does so at whichever
@@ -112,8 +131,25 @@ denoise(const DenoiseRequest& req, std::string* err)
   const bool prof =
       sess != nullptr && std::getenv("VPIPE_H3_DENOISE_PROFILE") != nullptr;
 
-  std::vector<float> uniq;
+  std::vector<float> uniq, uniq_r;
   std::vector<int>   row_idx;
+  // The one place a step's row plan is built, so the bake below and the
+  // forward in the loop cannot disagree about it.
+  auto plan = [&](int i, std::vector<float>* u, std::vector<float>* ur,
+                  std::vector<int>* ri) {
+    const float tv = sv.timesteps()[(std::size_t)i];
+    const float ta = sa.timesteps()[(std::size_t)i];
+    if (two_time) {
+      minimax_h3::build_row_time_pairs(
+          L, tv, sv.endpoints()[(std::size_t)i], ta,
+          sa.endpoints()[(std::size_t)i], req.condition_timestep, u, ur, ri,
+          req.condition_audio_timestep);
+    } else {
+      minimax_h3::build_row_timesteps(L, tv, ta, req.condition_timestep, u,
+                                      ri, req.condition_audio_timestep);
+      ur->clear();
+    }
+  };
 
   // Precompute every step's modulation before the loop, which is the one
   // place that can: the two schedules are fully built by now and the
@@ -127,15 +163,14 @@ denoise(const DenoiseRequest& req, std::string* err)
   // because this is a memory optimization and not a correctness step.
   bool baked = false;
   {
-    std::vector<std::vector<float>> sched;
+    std::vector<std::vector<float>> sched, sched_r;
     sched.reserve((std::size_t)steps);
     for (int i = 0; i < steps; ++i) {
-      std::vector<float> u;
+      std::vector<float> u, ur;
       std::vector<int>   ri;
-      minimax_h3::build_row_timesteps(
-          L, sv.timesteps()[(std::size_t)i], sa.timesteps()[(std::size_t)i],
-          req.condition_timestep, &u, &ri, req.condition_audio_timestep);
+      plan(i, &u, &ur, &ri);
       sched.push_back(std::move(u));
+      sched_r.push_back(std::move(ur));
     }
     std::string berr;
     // The A/B. Baking trades a per-step read of 55% of the checkpoint for
@@ -148,7 +183,8 @@ denoise(const DenoiseRequest& req, std::string* err)
       berr = "disabled by VPIPE_H3_NO_ADALN_BAKE";
       baked = false;
     } else {
-      baked = req.dit->bake_adaln(sched, &berr);
+      baked = req.dit->bake_adaln(sched, &berr,
+                                  two_time ? &sched_r : nullptr);
     }
     if (!baked && sess != nullptr) {
       sess->log_normal(fmt("denoise: AdaLN not baked ({}); running the "
@@ -165,11 +201,39 @@ denoise(const DenoiseRequest& req, std::string* err)
     // t = 1 - sigma, t = 1 meaning CLEAN. The transformer consumes it
     // unscaled and recovers sigma itself; feeding a pure-noise latent
     // t = 0 would tell the model it is already done.
-    const float tv = sv.timesteps()[(std::size_t)i];
-    const float ta = sa.timesteps()[(std::size_t)i];
-    const float tc = req.condition_timestep;
-    minimax_h3::build_row_timesteps(L, tv, ta, tc, &uniq, &row_idx,
-                                    req.condition_audio_timestep);
+    plan(i, &uniq, &uniq_r, &row_idx);
+    // Which ROLE each distinct entry serves, first and last step: the
+    // one line that shows the two schedules and the pinned references
+    // actually landed on the rows they were meant for, in a layout that
+    // interleaves them. Roles, not tags -- a vision block's prompt rows
+    // are tagged VIDEO and would otherwise read as generated video.
+    if (prof && (i == 0 || i + 1 == steps)) {
+      enum { kText, kRefVid, kGenVid, kRefAud, kGenAud, kRoles };
+      std::vector<int> role((std::size_t)L.seq_len, kText);
+      for (int k = 0; k < vrows; ++k) {
+        role[(std::size_t)L.video_indices[(std::size_t)k]] =
+            k < ncond ? kRefVid : kGenVid;
+      }
+      for (int k = 0; k < arows; ++k) {
+        role[(std::size_t)L.audio_indices[(std::size_t)k]] =
+            k < ncaud ? kRefAud : kGenAud;
+      }
+      std::vector<std::array<int, kRoles>> cnt(uniq.size(),
+                                               std::array<int, kRoles>{});
+      for (std::size_t k = 0; k < row_idx.size(); ++k) {
+        ++cnt[(std::size_t)row_idx[k]][(std::size_t)role[k]];
+      }
+      std::string s;
+      for (std::size_t e = 0; e < uniq.size(); ++e) {
+        const auto& c = cnt[e];
+        s += fmt(" | t {:.6f}", uniq[e])();
+        if (two_time) { s += fmt(" r {:.6f}", uniq_r[e])(); }
+        s += fmt(": text {} refvid {} genvid {} refaud {} genaud {}",
+                 c[kText], c[kRefVid], c[kGenVid], c[kRefAud], c[kGenAud])();
+      }
+      sess->info(fmt("h3-denoise step {} row plan ({} entries){}", i + 1,
+                     uniq.size(), s));
+    }
 
     {
       auto* d = static_cast<std::uint16_t*>(vb.contents());
@@ -195,7 +259,9 @@ denoise(const DenoiseRequest& req, std::string* err)
     st.layout = &L;
     st.timesteps          = &uniq;
     st.row_timestep_index = &row_idx;
+    st.endpoints          = two_time ? &uniq_r : nullptr;
     st.schedule_index     = baked ? i : -1;
+    st.dense_attention    = i < req.sol_dense_steps;
     st.video_grid_h       = req.video_grid_h;
     st.video_grid_w       = req.video_grid_w;
     std::string ferr;
