@@ -45,10 +45,16 @@ using vpipe::metal_compute::SharedBuffer;
 
 // ASSERT_TRUE records and CONTINUES, so anything that would run against
 // a failed precondition needs its own guard.
+// `cond` is evaluated ONCE. An ASSERT_TRUE(cond) followed by
+// if (!(cond)) evaluates it twice, which is invisible for a
+// comparison and doubles the work for a call -- a model loaded, or a
+// forward run, twice per use.
 #define Q21C_REQUIRE(cond)                                                 \
   do {                                                                     \
-    ASSERT_TRUE(cond);                                                     \
-    if (!(cond)) { return; }                                               \
+    if (!(cond)) {                                                         \
+      report_expect_true_failure(#cond, __FILE__, __LINE__);               \
+      return;                                                              \
+    }                                                                      \
   } while (0)
 
 namespace {

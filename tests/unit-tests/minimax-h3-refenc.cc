@@ -18,9 +18,11 @@
 
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -343,3 +345,74 @@ TEST(minimax_h3_refenc, request_limits)
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
+
+// A CARRIED latent and a VAE-encoded one become DiT rows by two separate
+// loops over the same layout: pack_latent_rows_ over an f32 latent that
+// is already whitened, pack_condition_rows_ over the VAE's bf16 moments
+// (mean half first) that it whitens on the way. The carried-latent route
+// is only right if the two place every value identically, and two loops
+// over one layout are exactly the shape of thing that drifts apart.
+//
+// Pinned two ways. With identity whitening and bf16-exact values the two
+// must agree BIT FOR BIT, which is the layout claim with nothing else in
+// it. With a real mean and std they must agree to the bf16 rounding of
+// the moments -- which says the whitening runs in the direction a
+// carried latent assumes ((m - mean) / std), not its inverse.
+TEST(minimax_h3_refenc, carried_latent_rows_match_the_vae_rows)
+{
+  const int z = 3, T = 2, Hh = 4, Ww = 6, ph = 2, pw = 2;
+  const std::size_t vox = (std::size_t)T * Hh * Ww;
+  auto to_bf16 = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  // A latent whose every value is distinct and bf16-exact, so a swapped
+  // index cannot hide behind two equal values.
+  std::vector<float> lat((std::size_t)z * vox);
+  for (std::size_t i = 0; i < lat.size(); ++i) {
+    lat[i] = (float)((int)(i % 97) - 48) * 0.0625f;
+  }
+  // Moments are [2z, T, H, W], MEAN half first; the logvar half is noise
+  // the packer must not read.
+  std::vector<std::uint16_t> mom((std::size_t)2 * z * vox);
+  for (std::size_t i = 0; i < lat.size(); ++i) { mom[i] = to_bf16(lat[i]); }
+  for (std::size_t i = lat.size(); i < mom.size(); ++i) {
+    mom[i] = to_bf16(1000.0f + (float)i);
+  }
+
+  std::vector<float> a, b;
+  h3::pack_latent_rows_for_test(lat.data(), z, T, Hh, Ww, ph, pw, &a);
+  h3::pack_condition_rows_for_test(mom.data(), z, T, Hh, Ww, ph, pw,
+                                   {0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f},
+                                   &b);
+  // T * (H/ph) * (W/pw) rows of z*ph*pw.
+  EXPECT_TRUE(a.size() == (std::size_t)T * (Hh / ph) * (Ww / pw) * z * ph *
+                              pw);
+  EXPECT_TRUE(a == b);
+
+  // A real whitening: the moments hold latent * std + mean, so the
+  // moments packer has to undo exactly that to land on the latent.
+  const std::vector<float> mean = {0.5f, -1.25f, 2.0f};
+  const std::vector<float> sd = {0.75f, 1.5f, 3.0f};
+  for (int c = 0; c < z; ++c) {
+    for (std::size_t v = 0; v < vox; ++v) {
+      const std::size_t k = (std::size_t)c * vox + v;
+      mom[k] = to_bf16(lat[k] * sd[(std::size_t)c] + mean[(std::size_t)c]);
+    }
+  }
+  std::vector<float> w;
+  h3::pack_condition_rows_for_test(mom.data(), z, T, Hh, Ww, ph, pw, mean,
+                                   sd, &w);
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size() && i < w.size(); ++i) {
+    worst = std::max(worst, (double)std::fabs(a[i] - w[i]));
+  }
+  // bf16 keeps 8 bits: |m| here is at most ~11, so one ulp is 0.0625,
+  // and dividing by std >= 0.75 grows it to ~0.083 at the worst.
+  std::printf("[minimax_h3_refenc] carried vs VAE rows: identity whitening "
+              "%s; real whitening max |diff| %.4f\n",
+              a == b ? "bit-identical" : "DIFFERS", worst);
+  EXPECT_TRUE(w.size() == a.size());
+  EXPECT_TRUE(worst < 0.1);
+}

@@ -70,6 +70,39 @@ struct MediaReference {
 
   bool has_audio() const { return channels > 0 && !pcm.empty(); }
 
+  // ALREADY-ENCODED conditioning, in the DiT's whitened space -- what
+  // `generate-video` emits on its latent oports. When either is set the
+  // VAE is SKIPPED for that stream and these rows are packed as they
+  // are.
+  //
+  // WHY THIS EXISTS. Handing a clip to the next one through a FILE makes
+  // the encoder re-derive a latent from decoded pixels, and a VAE
+  // encoder is not the inverse of its decoder: MEASURED on MiniMax-H3,
+  // encode(decode(z)) recovers z at correlation 0.875 with a systematic
+  // 0.86 gain, 21 of 24 channels attenuated. The reference the model
+  // then conditions on is a flatter, noisier thing than the clip it is
+  // supposed to continue. Carrying the latent skips the VAE, the codec
+  // and every resample between them.
+  //
+  // `video_latent` is [z, frames, height, width] row-major; the extents
+  // are the LATENT's, not the picture's. `audio_latent` is
+  // [channels, latents].
+  std::vector<float> video_latent;
+  int latent_z      = 0;
+  int latent_frames = 0;
+  int latent_height = 0;
+  int latent_width  = 0;
+  std::vector<float> audio_latent;
+  int audio_latent_channels = 0;
+  int audio_latent_frames   = 0;
+
+  bool has_video_latent() const {
+    return !video_latent.empty() && latent_z > 0 && latent_frames > 0;
+  }
+  bool has_audio_latent() const {
+    return !audio_latent.empty() && audio_latent_channels > 0;
+  }
+
   // This reference's own canvas short edge, overriding the plan's for
   // this one reference. Negative uses the plan's; 0 takes the clip at
   // the size it arrived, under the area cap (resolve_canvas_within).
@@ -247,10 +280,10 @@ struct ReferenceEncoders {
   //
   // A reference encode is four models deep -- the resize, the vision
   // tower, the video VAE and the audio VAE -- and a slow one reported
-  // only as a slow STAGE says nothing about which. MEASURED at 896x512:
-  // the video VAE is 96% of it, 104 s for a 56-frame guide and 156 s for
-  // a 90-frame one, against 2-5 ms for the resize and under half a
-  // second for the vision tower.
+  // only as a slow STAGE says nothing about which. MEASURED: a 90-frame
+  // guide took 20 minutes where a 56-frame one takes under two, on a
+  // box with memory to spare, and the stage log could not tell the two
+  // apart because it reports whole references.
   std::function<void(const std::string&)> log;
 };
 
@@ -301,6 +334,27 @@ bool encode_references(const std::vector<MediaReference>& refs,
                        std::string_view prompt, const ReferencePlan& plan,
                        const ReferenceEncoders& models,
                        EncodedReferences* out, std::string* err = nullptr);
+
+// ---- internals, exposed so the two packers can be cross-checked ------
+//
+// A reference's DiT rows are produced two ways -- from the VAE's moments
+// (whitening the mean half) or from a latent that is already whitened
+// and carried in -- and the whole carried-latent route rests on those
+// two agreeing exactly. They are separate loops over the same layout,
+// which is precisely the shape of thing that drifts apart silently, so
+// the invariant is pinned by a test rather than by inspection.
+//
+// `moments` is bf16 [2*z, frames, h, w] (mean half first); `latent` is
+// f32 [z, frames, h, w], already whitened. Both append to `rows`.
+void pack_condition_rows_for_test(const std::uint16_t* moments, int z,
+                                  int frames, int h, int w, int patch_h,
+                                  int patch_w,
+                                  const std::vector<float>& latents_mean,
+                                  const std::vector<float>& latents_std,
+                                  std::vector<float>* rows);
+void pack_latent_rows_for_test(const float* latent, int z, int frames,
+                               int h, int w, int patch_h, int patch_w,
+                               std::vector<float>* rows);
 
 }  // namespace minimax_h3
 }  // namespace genai

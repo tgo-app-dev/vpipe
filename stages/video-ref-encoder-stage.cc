@@ -971,6 +971,42 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
     out->short_edge = 0;
   }
 
+  // ALREADY-ENCODED rows, said so by the beat itself. Rank cannot
+  // settle this on its own -- a video latent is rank 4 like pixels and
+  // an audio latent rank 3 like nothing else here -- so the producer
+  // states it and this port believes it. `load-tensor` sets it from its
+  // `sideband` key; `generate-video`'s latent oports are where such a
+  // tensor comes from.
+  bool is_latent = false;
+  sideband_bool_(tb.sideband, "latent", &is_latent);
+  if (is_latent) {
+    if (tb.dtype != TensorBeat::DType::F32) {
+      return fail("a carried latent must be f32, got " +
+                  std::string(TensorBeat::name_of(tb.dtype)));
+    }
+    if (rank != 4) {
+      return fail("a carried VIDEO latent is rank 4 [z, frames, h, w]; "
+                  "got rank " + std::to_string(rank) + ". Audio latents "
+                  "are not carried yet");
+    }
+    const int z = (int)sh[0], lt = (int)sh[1];
+    const int lh = (int)sh[2], lw = (int)sh[3];
+    if (z <= 0 || lt <= 0 || lh <= 0 || lw <= 0) {
+      return fail("a carried latent is empty");
+    }
+    out->kind          = h3::MediaReference::Kind::kVideo;
+    out->latent_z      = z;
+    out->latent_frames = lt;
+    out->latent_height = lh;
+    out->latent_width  = lw;
+    const std::size_t n = (std::size_t)z * lt * lh * lw;
+    out->video_latent.assign(tb.as_f32(), tb.as_f32() + n);
+    // The rates still come from the sideband: the rotary clock is laid
+    // out in SECONDS whatever the rows were made of.
+    if (sideband_num_(tb.sideband, "fps", &v) && v > 0.0) { out->fps = v; }
+    return true;
+  }
+
   if (rank <= 2) {                       // audio
     const int ch = rank == 2 ? (int)sh[0] : 1;
     const int ns = rank == 2 ? (int)sh[1] : (int)sh[0];
@@ -1301,6 +1337,63 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       bool said = false;
       if (sideband_bool_(tb->sideband, "attach", &said)) { attach = said; }
     }
+    // A CARRIED LATENT folds onto the reference before it, the way an
+    // attached soundtrack does. It has to: the conditioner builds the
+    // presentation (`<Video 1>`) out of the vision tower's tokens, so a
+    // visual reference with no pixels is a request it refuses. The
+    // pixels therefore still arrive on their own port and still feed
+    // the tower; the latent only replaces what the VAE would have
+    // produced for the DiT -- which is the round trip worth removing,
+    // since encode(decode(z)) recovers z at correlation 0.875 with a
+    // systematic 0.86 gain.
+    if (m.has_video_latent() && m.rgb.empty()) {
+      if (!attach) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} carries a "
+            "latent but no pixels and does not ask to attach. A visual "
+            "reference needs pixels for the conditioner; set `attach: "
+            "true` in its sideband so the latent folds onto the picture "
+            "reference before it; skipping", this->id(), refno));
+        co_return;
+      }
+      if (refs.empty()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent but nothing precedes it; skipping", this->id(),
+            refno));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.kind == h3::MediaReference::Kind::kAudio) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent to an AUDIO reference, which has no video rows to "
+            "replace; skipping", this->id(), refno));
+        co_return;
+      }
+      if (prev.has_video_latent()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent but reference {} already carries one; skipping",
+            this->id(), refno, refs.size()));
+        co_return;
+      }
+      prev.video_latent  = std::move(m.video_latent);
+      prev.latent_z      = m.latent_z;
+      prev.latent_frames = m.latent_frames;
+      prev.latent_height = m.latent_height;
+      prev.latent_width  = m.latent_width;
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference {} takes its video rows "
+          "from a carried latent [{}x{}x{}x{}] -- the VAE encode is "
+          "skipped", this->id(), refs.size(), prev.latent_z,
+          prev.latent_frames, prev.latent_height, prev.latent_width));
+      // `continue`, NOT `co_return`: this is one port of a loop over
+      // them, and returning here abandons the ports after it AND the
+      // encode itself -- which is exactly what it did the first time.
+      continue;
+    }
+
     if (m.kind == h3::MediaReference::Kind::kAudio && attach) {
       if (refs.empty()) {
         session()->warn(fmt(

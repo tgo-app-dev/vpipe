@@ -70,6 +70,25 @@ to_vae_input_(metal_compute::MetalCompute* mc, const std::uint8_t* rgb,
   return buf;
 }
 
+void
+pack_condition_rows_raw_(const std::uint16_t* mp, int z, int lt, int lh,
+                         int lw, int patch_h, int patch_w,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* rows);
+
+void
+pack_condition_rows_(const metal_compute::SharedBuffer& moments, int z,
+                     int lt, int lh, int lw, int patch_h, int patch_w,
+                     const std::vector<float>& mean,
+                     const std::vector<float>& std_,
+                     std::vector<float>* rows)
+{
+  pack_condition_rows_raw_(
+      static_cast<const std::uint16_t*>(moments.contents()), z, lt, lh, lw,
+      patch_h, patch_w, mean, std_, rows);
+}
+
 // The CONDITION NOISE AUGMENTATION the released checkpoint was trained
 // with: `0.999*z + 0.001*noise` on every visual conditioning row.
 //
@@ -111,6 +130,38 @@ augment_condition_rows_(std::vector<float>* rows, std::size_t from,
   }
 }
 
+// The same gather as pack_condition_rows_, over an f32 latent that is
+// ALREADY in the DiT's whitened space -- so there is no moments buffer
+// to take the mean half of, and no whitening left to apply.
+void
+pack_latent_rows_(const float* z_data, int z, int lt, int lh, int lw,
+                  int patch_h, int patch_w, std::vector<float>* rows)
+{
+  const std::size_t vox = (std::size_t)lt * lh * lw;
+  const int gh = lh / patch_h, gw = lw / patch_w;
+  const int PE = z * patch_h * patch_w;
+  const std::size_t base = rows->size();
+  rows->resize(base + (std::size_t)lt * gh * gw * PE);
+  float* out = rows->data() + base;
+  for (int t = 0; t < lt; ++t) {
+    for (int cell = 0; cell < gh * gw; ++cell) {
+      float* row = out + ((std::size_t)t * gh * gw + cell) * PE;
+      const int by = (cell / gw) * patch_h;
+      const int bx = (cell % gw) * patch_w;
+      for (int c = 0; c < z; ++c) {
+        for (int y = 0; y < patch_h; ++y) {
+          for (int x = 0; x < patch_w; ++x) {
+            const std::size_t k = (std::size_t)c * vox +
+                                  ((std::size_t)t * lh + (by + y)) * lw +
+                                  (bx + x);
+            row[((std::size_t)c * patch_h + y) * patch_w + x] = z_data[k];
+          }
+        }
+      }
+    }
+  }
+}
+
 // The MEAN half of the VAE's moments, whitened and packed into DiT rows.
 //
 // Two deliberate departures from the reference, both shared with the
@@ -119,13 +170,12 @@ augment_condition_rows_(std::vector<float>* rows, std::size_t from,
 // seed 42; an anchor whose whole job is to be exact does not want noise
 // in it), and the latent is not rounded through float16 first.
 void
-pack_condition_rows_(const metal_compute::SharedBuffer& moments, int z,
-                     int lt, int lh, int lw, int patch_h, int patch_w,
-                     const std::vector<float>& mean,
-                     const std::vector<float>& std_,
-                     std::vector<float>* rows)
+pack_condition_rows_raw_(const std::uint16_t* mp, int z,
+                         int lt, int lh, int lw, int patch_h, int patch_w,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* rows)
 {
-  const auto* mp = static_cast<const std::uint16_t*>(moments.contents());
   const std::size_t vox = (std::size_t)lt * lh * lw;
   const int gh = lh / patch_h, gw = lw / patch_w;
   const int PE = z * patch_h * patch_w;
@@ -306,15 +356,18 @@ encode_references(const std::vector<MediaReference>& refs,
 
   metal_compute::MetalCompute* mc = models.mc;
 
-  // Phase timing. `tick` restarts the clock and returns the ms since the
-  // last call, so a phase is measured by bracketing it -- and nothing is
-  // measured at all when `models.log` is unset.
+  // Phase timing. `tick` restarts the clock and returns the ms since
+  // the last call, so each phase is measured by bracketing it -- no
+  // cost at all when `models.log` is unset.
   const bool timing = (bool)models.log;
-  auto mark = std::chrono::steady_clock::now();
+  auto now_ = [] {
+    return std::chrono::steady_clock::now();
+  };
+  auto mark = now_();
   auto tick = [&]() -> long long {
-    const auto t = std::chrono::steady_clock::now();
-    const auto ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(t - mark).count();
+    const auto t = now_();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t - mark).count();
     mark = t;
     return (long long)ms;
   };
@@ -385,8 +438,45 @@ encode_references(const std::vector<MediaReference>& refs,
       L.num_audio_latents = frames;
     }
 
+    // ---- a reference that carries its own latent ----------------------
+    // Nothing to normalize, nothing for the VAE, and -- with no pixels
+    // -- nothing for the VISION TOWER either, so this reference
+    // contributes DiT rows but no conditioning rows. That is a real
+    // difference from the pixel route and not a detail: the tower's
+    // reading of the clip is part of the prompt. A caller that wants
+    // both wires the pixels AS WELL, and the branch further down uses
+    // the latent for the rows while the tower still reads the picture.
+    const bool latent_only = m.kind != MediaReference::Kind::kAudio
+                             && m.has_video_latent() && m.rgb.empty();
+    if (latent_only) {
+      const int lh = m.latent_height, lw = m.latent_width;
+      if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+        return fail(where + ": a carried latent is " + std::to_string(lh) +
+                    "x" + std::to_string(lw) + ", which the DiT's " +
+                    std::to_string(plan.patch_h) + "x" +
+                    std::to_string(plan.patch_w) + " patch does not divide");
+      }
+      const std::size_t need =
+          (std::size_t)m.latent_z * m.latent_frames * lh * lw;
+      if (m.video_latent.size() < need) {
+        return fail(where + ": a carried latent is shorter than its own "
+                            "shape");
+      }
+      const std::size_t before = r.video_rows.size();
+      pack_latent_rows_(m.video_latent.data(), m.latent_z, m.latent_frames,
+                        lh, lw, plan.patch_h, plan.patch_w, &r.video_rows);
+      augment_condition_rows_(&r.video_rows, before,
+                              plan.condition_noise_aug,
+                              plan.condition_noise_seed);
+      L.num_latent_frames = m.latent_frames;
+      L.latent_height     = lh;
+      L.latent_width      = lw;
+      fit.vae_frames      = 0;
+      fit.rate_frames     = m.latent_frames;
+    }
+
     // ---- the pixels ---------------------------------------------------
-    if (m.kind != MediaReference::Kind::kAudio) {
+    if (m.kind != MediaReference::Kind::kAudio && !latent_only) {
       if (m.num_frames <= 0 || m.height <= 0 || m.width <= 0) {
         return fail(where + " has no pixels");
       }
@@ -483,8 +573,36 @@ encode_references(const std::vector<MediaReference>& refs,
         block_seconds.push_back(std::move(secs));
       }
 
-      // The VAE's read: the full 24 fps clip at MiniMax-H3's canvas.
-      if (models.video_vae != nullptr) {
+      // A CARRIED latent needs no VAE at all -- it is already the
+      // thing the VAE would have produced, without the round trip that
+      // attenuates it.
+      if (m.has_video_latent()) {
+        const int lh = m.latent_height, lw = m.latent_width;
+        if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+          return fail(where + ": a carried latent is " +
+                      std::to_string(lh) + "x" + std::to_string(lw) +
+                      ", which the DiT's " + std::to_string(plan.patch_h) +
+                      "x" + std::to_string(plan.patch_w) + " patch does "
+                      "not divide");
+        }
+        const std::size_t need = (std::size_t)m.latent_z * m.latent_frames
+                                 * lh * lw;
+        if (m.video_latent.size() < need) {
+          return fail(where + ": a carried latent is shorter than its "
+                      "own shape");
+        }
+        const std::size_t before2 = r.video_rows.size();
+        pack_latent_rows_(m.video_latent.data(), m.latent_z,
+                          m.latent_frames, lh, lw, plan.patch_h,
+                          plan.patch_w, &r.video_rows);
+        augment_condition_rows_(&r.video_rows, before2,
+                                plan.condition_noise_aug,
+                                plan.condition_noise_seed);
+        L.num_latent_frames = m.latent_frames;
+        L.latent_height     = lh;
+        L.latent_width      = lw;
+        fit.vae_frames      = 0;
+      } else if (models.video_vae != nullptr) {
         if (mc == nullptr) { return fail("the video VAE has no compute"); }
         const auto& vc = models.video_vae->config();
         int use = nf;
@@ -614,6 +732,25 @@ encode_references(const std::vector<MediaReference>& refs,
 
   *out = std::move(r);
   return true;
+}
+
+void
+pack_condition_rows_for_test(const std::uint16_t* moments, int z, int frames,
+                             int h, int w, int patch_h, int patch_w,
+                             const std::vector<float>& latents_mean,
+                             const std::vector<float>& latents_std,
+                             std::vector<float>* rows)
+{
+  pack_condition_rows_raw_(moments, z, frames, h, w, patch_h, patch_w,
+                           latents_mean, latents_std, rows);
+}
+
+void
+pack_latent_rows_for_test(const float* latent, int z, int frames, int h,
+                          int w, int patch_h, int patch_w,
+                          std::vector<float>* rows)
+{
+  pack_latent_rows_(latent, z, frames, h, w, patch_h, patch_w, rows);
 }
 
 }  // namespace minimax_h3

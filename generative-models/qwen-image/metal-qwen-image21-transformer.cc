@@ -685,6 +685,9 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
   if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_ANE_ROWS")) {
     m->_cfg.ane_rows = std::atoi(e);
   }
+  if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_ANE_QKV")) {
+    m->_cfg.ane_qkv = std::atoi(e) != 0;
+  }
   if (m->_cfg.sol.enabled) {
     std::string serr;
     m->_sol = MetalSolAttention::load(mc, /*bf16=*/true, &serr);
@@ -1352,7 +1355,18 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     }
     const bool ane_split = ane_plan == AneFeedForward::Plan::kSplit;
     const bool ane_probe = ane_plan == AneFeedForward::Plan::kProbe;
-    if ((ane_split || ane_probe) && (L == 0 || _ane->needs_barrier())) {
+    // The q/k/v tier's plan, decided the same way and independently: a
+    // box and geometry where one pays and the other does not keeps the
+    // one that does.
+    AneFeedForward::Plan qkv_plan = AneFeedForward::Plan::kGpu;
+    if (_cfg.ane_qkv && ane_qkv_setup_(ROWS) && ane_qkv_eligible_(L, *b)) {
+      qkv_plan = _ane_qkv->plan_block();
+    }
+    const bool qkv_split = qkv_plan == AneFeedForward::Plan::kSplit;
+    const bool qkv_probe = qkv_plan == AneFeedForward::Plan::kProbe;
+    if (((ane_split || ane_probe) && (L == 0 || _ane->needs_barrier())) ||
+        ((qkv_split || qkv_probe) &&
+         (L == 0 || _ane_qkv->needs_barrier()))) {
       // An unsplit block commits nothing mid-block, so on a stack that
       // defers its commits the split point's drain would wait for every
       // such block queued before it. Drain what is queued FIRST.
@@ -1364,7 +1378,16 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
     }
-    if (ane_split) { ane_stage_(L, *b); }
+    // ONE ANE worker serves both tiers, and it takes one job at a time: a
+    // second stage() would block this thread until the first finished.
+    // So q/k/v stage first -- they are needed first -- and the feed-
+    // forward's weights follow their join, still ahead of the attention
+    // they hide under.
+    if (qkv_split) {
+      ane_qkv_stage_(L, *b);
+    } else if (ane_split) {
+      ane_stage_(L, *b);
+    }
 
     if (_block_progress) {
       // `done` of `total`, so L -- the blocks finished BEFORE this one.
@@ -1384,10 +1407,68 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
              tmp, (std::size_t)bd.start * H, bd.rows);
     }
     mark("elt");
-    lin(tmp, 0, b->qw, qb, 0, ROWS, H, H);
-    lin(tmp, 0, b->kw, kb, 0, ROWS, H, H);
-    lin(tmp, 0, b->vw, vb, 0, ROWS, H, H);
+    // ---- the q/k/v split point --------------------------------------
+    //
+    // The feed-forward's choreography, one sublayer earlier: `tmp` holds
+    // the modulated attention input for every row, so drain, START THE
+    // ANE on the tail rows -- its output columns land in qb / kb / vb at
+    // the rows they came from -- and only then encode the GPU's head
+    // rows. The attention reads all of q/k/v, so the join is before it.
+    int q_rows = 0;
+    double q_drain_ms = 0.0;
+    if (qkv_split || qkv_probe) {
+      enc.end();
+      const auto t_d0 = std::chrono::steady_clock::now();
+      std::string ge2;
+      if (!stream.commit().wait_ok(&ge2)) {
+        return fail("qwen-image-2.1 forward: " + ge2);
+      }
+      q_drain_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_d0).count();
+      if (qkv_split && _ane_qkv->join_stage(L)) {
+        q_rows = _ane_qkv->begin(
+            tmp,
+            std::vector<AneFeedForward::OutSeg>{
+                {&qb, H, 0}, {&kb, H, 0}, {&vb, H, 0}},
+            ROWS);
+      } else if (qkv_split && _mc->session() != nullptr) {
+        _mc->session()->warn(fmt(
+            "qwen-image-2.1: staging block {}'s q/k/v for the ANE failed; "
+            "it keeps the GPU projections", L));
+      }
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+    }
+    const int qg_rows = ROWS - q_rows;
+    const auto t_q0 = std::chrono::steady_clock::now();
+    if (qg_rows > 0) {
+      lin(tmp, 0, b->qw, qb, 0, qg_rows, H, H);
+      lin(tmp, 0, b->kw, kb, 0, qg_rows, H, H);
+      lin(tmp, 0, b->vw, vb, 0, qg_rows, H, H);
+    }
     mark("gemm.qkv");
+    if (qkv_split || qkv_probe) {
+      enc.end();
+      std::string ge2;
+      if (!stream.commit().wait_ok(&ge2)) {
+        if (q_rows > 0) {
+          (void)_ane_qkv->finish(L, ROWS, 0.0, q_drain_ms);
+        }
+        return fail("qwen-image-2.1 forward: " + ge2);
+      }
+      const double t_gpu = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_q0).count();
+      if (qkv_probe) { _ane_qkv->note_probe(q_drain_ms, t_gpu); }
+      if (!_ane_qkv->finish(L, ROWS, t_gpu, q_drain_ms) && q_rows > 0) {
+        return fail("qwen-image-2.1 forward: the ANE left its rows of a "
+                    "q/k/v projection uncomputed");
+      }
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+    }
+    // The worker is free again: the feed-forward's weights now, so they
+    // stage under the attention exactly as they would alone.
+    if (qkv_split && ane_split) { ane_stage_(L, *b); }
     // Per-head RMSNorm, then the fused transpose+rope. Token-major
     // [JT, NH, Hd] normalizes over the last Hd with JT*NH rows.
     rms(qb, 0, b->nq, qb, 0, ROWS * NH, Hd);
@@ -1947,8 +2028,15 @@ std::size_t
 MetalQwenImage21Transformer::ane_runtime_bytes(const Config& c,
                                                int seq) noexcept
 {
-  return AneFeedForward::runtime_bytes(c.hidden, c.hidden * c.mlp_ratio,
-                                       seq, ane_chunk_rows());
+  std::size_t n = AneFeedForward::runtime_bytes(
+      c.hidden, c.hidden * c.mlp_ratio, seq, ane_chunk_rows());
+  // The q/k/v module is a second fixed unit, and it has to be booked:
+  // one claimed at zero is memory CoreML holds that no plan can see.
+  if (c.ane_qkv) {
+    n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * c.hidden, seq,
+                                              ane_chunk_rows());
+  }
+  return n;
 }
 
 int
@@ -2023,6 +2111,80 @@ MetalQwenImage21Transformer::ane_stage_(int L, const Block& b)
     return s;
   };
   _ane->stage(L, src(b.gate_w), src(b.proj_w), src(b.out_w), _quant_group);
+}
+
+// THE q/k/v TIER: one matmul module, hidden -> 3*hidden, whose single
+// weight slot holds q, k and v stacked by rows, and whose output
+// COLUMNS scatter straight into qb / kb / vb -- so the three stay the
+// separate matrices this model keeps, and nothing is fused on the GPU
+// side to feed it. Same row split, balancer and probe as the
+// feed-forward's; the ANE's rows are the TAIL of the block's.
+bool
+MetalQwenImage21Transformer::ane_qkv_setup_(int seq)
+{
+  if (_ane_qkv_tried) { return _ane_qkv != nullptr; }
+  _ane_qkv_tried = true;
+  if (_mc == nullptr || _mc->session() == nullptr || seq <= 0) {
+    return false;
+  }
+  AneFeedForward::Options o;
+  o.session = _mc->session();
+  o.mc      = _mc;
+  o.tag     = "qwen-image-2.1-qkv";
+  o.hidden  = _cfg.hidden;
+  o.ffn     = 3 * _cfg.hidden;       // the matmul's output width
+  o.seq     = seq;
+  o.rows    = _cfg.ane_rows;
+  o.chunk   = ane_chunk_rows();
+  o.matmul  = true;
+  o.profile = std::getenv("VPIPE_QWEN_IMAGE21_ANE_PROFILE") != nullptr;
+  _ane_qkv = AneFeedForward::create(o);
+  return _ane_qkv != nullptr;
+}
+
+bool
+MetalQwenImage21Transformer::ane_qkv_eligible_(int L, const Block& b) const
+{
+  if (_ane_qkv == nullptr) { return false; }
+  const int cap = (_cfg.ane_layers > 0)
+                      ? std::min(_cfg.ane_layers, _cfg.n_layers)
+                      : _cfg.n_layers;
+  if (L >= cap) { return false; }
+  auto ok = [](const QWeight& q) {
+    if (q.empty()) { return false; }
+    if (!q.quantized) { return true; }
+    return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
+           !q.qbias.empty();
+  };
+  return ok(b.qw) && ok(b.kw) && ok(b.vw);
+}
+
+void
+MetalQwenImage21Transformer::ane_qkv_stage_(int L, const Block& b)
+{
+  if (_ane_qkv == nullptr) { return; }
+  const std::size_t H = (std::size_t)_cfg.hidden;
+  // Stacked along the slot's rows in the order the split scatters the
+  // output columns: q, then k, then v.
+  auto part = [&](const QWeight& q, std::size_t row0) {
+    AneFfnSource s;
+    s.w         = &q.w;
+    s.codes     = q.quantized ? &q.codes : nullptr;
+    s.scales    = q.quantized ? &q.scales : nullptr;
+    s.qbias     = q.quantized ? &q.qbias : nullptr;
+    s.quantized = q.quantized;
+    s.bits      = q.quantized ? q.bits : 0;
+    s.stride    = 1;
+    s.offset    = 0;
+    s.slot      = 0;
+    s.slot_row  = row0;
+    s.rows      = H;
+    return s;
+  };
+  _ane_qkv->stage(L,
+                  std::vector<AneFfnSource>{part(b.qw, 0), part(b.kw, H),
+                                            part(b.vw, 2 * H)},
+                  _quant_group);
 }
 
 std::size_t

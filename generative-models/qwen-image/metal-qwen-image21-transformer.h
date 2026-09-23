@@ -95,6 +95,12 @@ class MetalQwenImage21Transformer {
     bool ane_ffn   = false;
     int  ane_rows  = 0;    // 0 = balance from the two engines' rates
     int  ane_layers = 0;   // 0 = every block
+    // The q/k/v projections on the ANE too, as a SECOND module (one
+    // matmul hidden -> 3*hidden, the three weights stacked into its slot)
+    // split by rows the same way and sharing the one ANE worker. Once
+    // the feed-forward is on the ANE, q/k/v is the largest GPU bucket
+    // left: 24.6% of a 1024^2 forward on an M4 Pro.
+    bool ane_qkv   = false;
 
     // Read what can be read from <dir>/config.json. False when the file
     // is absent or names a different class.
@@ -184,6 +190,7 @@ class MetalQwenImage21Transformer {
   bool uses_sol_attn() const { return (bool)_sol; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
   bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
 
   // What the CoreML module holds, for the resource plan. Its bytes are
   // CoreML's and no other ledger in this process can see them, so the
@@ -252,6 +259,10 @@ class MetalQwenImage21Transformer {
   bool ane_setup_(int seq);
   bool ane_eligible_(int L, const Block& b) const;
   void ane_stage_(int L, const Block& b);
+  // The q/k/v tier's three, on the same terms.
+  bool ane_qkv_setup_(int seq);
+  bool ane_qkv_eligible_(int L, const Block& b) const;
+  void ane_qkv_stage_(int L, const Block& b);
 
   // The matrix-core GEMM. Returns false with NOTHING encoded when this
   // box or this shape is not for it, and the caller keeps its steel
@@ -361,6 +372,8 @@ class MetalQwenImage21Transformer {
   std::unique_ptr<MetalSolAttention> _sol;
   std::unique_ptr<AneFeedForward> _ane;
   bool _ane_tried = false;
+  std::unique_ptr<AneFeedForward> _ane_qkv;
+  bool _ane_qkv_tried = false;
   std::unique_ptr<I8GemmContext> _i8;
 };
 

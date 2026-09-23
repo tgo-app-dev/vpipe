@@ -733,6 +733,9 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_ANE_ROWS")) {
     m->_cfg.ane_rows = std::atoi(e);
   }
+  if (const char* e = std::getenv("VPIPE_Z_IMAGE_ANE_QKV")) {
+    m->_cfg.ane_qkv = std::atoi(e) != 0;
+  }
   if (m->_cfg.sol.enabled) {
     std::string serr;
     m->_sol = MetalSolAttention::load(mc, /*bf16=*/true, &serr);
@@ -1392,7 +1395,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   auto run_block = [&](const Block& b, std::size_t xe, int rows, int row0,
                        bool modulated, int L,
                        AneFeedForward::Plan ane_plan,
-                       bool ctx = false) -> bool {
+                       bool ctx = false,
+                       AneFeedForward::Plan qkv_plan =
+                           AneFeedForward::Plan::kGpu) -> bool {
     auto LA = [&](lora::Factors BlockLora::* w) {
       return lora_for_(ctx, L, w);
     };
@@ -1402,10 +1407,67 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     rms(joint, xe, fold ? nw1 : b.an1, nrm, 0, rows, H);
     if (modulated && !fold) { modulate(nrm, 0, mods, 0, nrm, 0, rows); }
     mark("elt");
-    lin(nrm, 0, b.qw, qb, 0, rows, H, H, LA(&BlockLora::q));
-    lin(nrm, 0, b.kw, kb, 0, rows, H, H, LA(&BlockLora::k));
-    lin(nrm, 0, b.vw, vb, 0, rows, H, H, LA(&BlockLora::v));
+    // ---- the q/k/v split point --------------------------------------
+    //
+    // The feed-forward's choreography, one sublayer earlier: `nrm` holds
+    // the attention input for every row, so drain, START THE ANE on the
+    // tail rows -- its output columns land in qb / kb / vb at the rows
+    // they came from -- and only then encode the GPU's head rows. The
+    // attention reads all of q/k/v, so the join comes before it.
+    const bool qkv_split = qkv_plan == AneFeedForward::Plan::kSplit;
+    const bool qkv_probe = qkv_plan == AneFeedForward::Plan::kProbe;
+    int q_rows = 0;
+    double q_drain_ms = 0.0;
+    if (qkv_split || qkv_probe) {
+      enc.end();
+      const auto t_d0 = std::chrono::steady_clock::now();
+      std::string ge2;
+      if (!stream.commit().wait_ok(&ge2)) { return false; }
+      q_drain_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_d0).count();
+      if (qkv_split && _ane_qkv->join_stage(L)) {
+        q_rows = _ane_qkv->begin(
+            nrm,
+            std::vector<AneFeedForward::OutSeg>{
+                {&qb, H, 0}, {&kb, H, 0}, {&vb, H, 0}},
+            rows);
+      } else if (qkv_split && _mc->session() != nullptr) {
+        _mc->session()->warn(fmt(
+            "z-image: staging block {}'s q/k/v for the ANE failed; it "
+            "keeps the GPU projections", L));
+      }
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+    }
+    const int qg_rows = rows - q_rows;
+    const auto t_q0 = std::chrono::steady_clock::now();
+    if (qg_rows > 0) {
+      lin(nrm, 0, b.qw, qb, 0, qg_rows, H, H, LA(&BlockLora::q));
+      lin(nrm, 0, b.kw, kb, 0, qg_rows, H, H, LA(&BlockLora::k));
+      lin(nrm, 0, b.vw, vb, 0, qg_rows, H, H, LA(&BlockLora::v));
+    }
     mark("gemm.qkv");
+    if (qkv_split || qkv_probe) {
+      enc.end();
+      std::string ge2;
+      if (!stream.commit().wait_ok(&ge2)) {
+        if (q_rows > 0) { (void)_ane_qkv->finish(L, rows, 0.0, q_drain_ms); }
+        return false;
+      }
+      const double t_gpu = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_q0).count();
+      if (qkv_probe) { _ane_qkv->note_probe(q_drain_ms, t_gpu); }
+      if (!_ane_qkv->finish(L, rows, t_gpu, q_drain_ms) && q_rows > 0) {
+        return false;
+      }
+      stream = mc->make_command_stream();
+      enc = stream.begin_compute();
+    }
+    // The worker is free again: the feed-forward's weights now, so they
+    // stage under the attention exactly as they would alone.
+    if (qkv_split && ane_plan == AneFeedForward::Plan::kSplit) {
+      ane_stage_(L, b);
+    }
     // Per-head RMSNorm over the last Hd of a token-major [rows, NH, Hd].
     rms(qb, 0, b.nq, qb, 0, rows * NH, Hd);
     rms(kb, 0, b.nk, kb, 0, rows * NH, Hd);
@@ -1699,8 +1761,17 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
         ane_eligible_(L, *b)) {
       ane_plan = _ane->plan_block();
     }
-    if ((ane_plan != AneFeedForward::Plan::kGpu) &&
-        (L == _cfg.n_refiner || _ane->needs_barrier())) {
+    // q/k/v's plan, the same way and independently: where one tier pays
+    // and the other does not, the one that does is kept.
+    AneFeedForward::Plan qkv_plan = AneFeedForward::Plan::kGpu;
+    if (_cfg.ane_qkv && !is_refiner && ane_qkv_setup_(JT) &&
+        ane_qkv_eligible_(L, *b)) {
+      qkv_plan = _ane_qkv->plan_block();
+    }
+    if (((ane_plan != AneFeedForward::Plan::kGpu) &&
+         (L == _cfg.n_refiner || _ane->needs_barrier())) ||
+        ((qkv_plan != AneFeedForward::Plan::kGpu) &&
+         (L == _cfg.n_refiner || _ane_qkv->needs_barrier()))) {
       // An unsplit block commits nothing mid-block, so on a stack that
       // defers its commits the split point's drain would wait for every
       // such block queued before it. Drain what is queued FIRST.
@@ -1712,7 +1783,15 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
     }
-    if (ane_plan == AneFeedForward::Plan::kSplit) { ane_stage_(L, *b); }
+    // ONE ANE worker serves both tiers and takes one job at a time -- a
+    // second stage() would block this thread until the first finished.
+    // q/k/v are needed first, so they stage first; the feed-forward's
+    // weights follow their join inside run_block.
+    if (qkv_plan == AneFeedForward::Plan::kSplit) {
+      ane_qkv_stage_(L, *b);
+    } else if (ane_plan == AneFeedForward::Plan::kSplit) {
+      ane_stage_(L, *b);
+    }
 
     if (_block_progress) {
       // `done` of `total`: the blocks finished BEFORE this one. The
@@ -1722,7 +1801,8 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     }
 
     fill_mod(*b);
-    if (!run_block(*b, 0, rows, 0, /*modulated=*/true, L, ane_plan)) {
+    if (!run_block(*b, 0, rows, 0, /*modulated=*/true, L, ane_plan,
+                   /*ctx=*/false, qkv_plan)) {
       return fail("z-image forward: block " + std::to_string(L) +
                   " failed");
     }
@@ -1970,8 +2050,15 @@ MetalZImageTransformer::ane_chunk_rows() noexcept
 std::size_t
 MetalZImageTransformer::ane_runtime_bytes(const Config& c, int seq) noexcept
 {
-  return AneFeedForward::runtime_bytes(c.hidden, c.ffn_inner, seq,
-                                       ane_chunk_rows());
+  std::size_t n = AneFeedForward::runtime_bytes(c.hidden, c.ffn_inner, seq,
+                                                ane_chunk_rows());
+  // The q/k/v module is a second fixed unit, and it has to be booked:
+  // one claimed at zero is memory CoreML holds that no plan can see.
+  if (c.ane_qkv) {
+    n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * c.hidden, seq,
+                                              ane_chunk_rows());
+  }
+  return n;
 }
 
 int
@@ -2030,6 +2117,43 @@ MetalZImageTransformer::ane_eligible_(int L, const Block& b) const
   return ok(b.w1) && ok(b.w3) && ok(b.w2);
 }
 
+namespace {
+
+// One projection as the ANE stages it: dense bf16 or affine 4/8-bit,
+// read whole, WITH the runtime adapters on it. The module is fed fp16
+// weights per block, so an adapter has to be merged into what it
+// stages -- left out, the ANE's rows run the base model while the
+// GPU's run the adapted one, and the split becomes a seam in the
+// picture that looks like an adapter applied at half strength.
+// A template for the reason FLUX.2's twin is one: the weight type is
+// private to the model, and deduction does not need to name it.
+template <typename Q>
+AneFfnSource
+ane_src_(const Q& q, const lora::Stack& st)
+{
+  AneFfnSource s;
+  s.w         = &q.w;
+  s.codes     = q.quantized ? &q.codes : nullptr;
+  s.scales    = q.quantized ? &q.scales : nullptr;
+  s.qbias     = q.quantized ? &q.qbias : nullptr;
+  s.quantized = q.quantized;
+  s.bits      = q.quantized ? q.bits : 0;
+  s.stride    = 1;
+  s.offset    = 0;
+  for (int i = 0; i < st.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
+    AneFfnSource::Delta& d = s.delta[s.deltas++];
+    d.a     = &st.s[i].f->a;
+    d.b     = &st.s[i].f->b;
+    d.rank  = st.s[i].f->b_rank();
+    d.group = st.s[i].f->group;
+    d.parts = st.s[i].f->parts;
+    d.scale = st.s[i].scale;
+  }
+  return s;
+}
+
+}  // namespace
+
 void
 MetalZImageTransformer::ane_stage_(int L, const Block& b)
 {
@@ -2037,19 +2161,80 @@ MetalZImageTransformer::ane_stage_(int L, const Block& b)
   // This model keeps the gate and the up projection as SEPARATE
   // matrices and never fuses them, so each is read whole -- stride 1,
   // offset 0. A family that fuses reads one matrix twice with stride 2.
-  auto src = [&](const QWeight& q) {
-    AneFfnSource s;
-    s.w         = &q.w;
-    s.codes     = q.quantized ? &q.codes : nullptr;
-    s.scales    = q.quantized ? &q.scales : nullptr;
-    s.qbias     = q.quantized ? &q.qbias : nullptr;
-    s.quantized = q.quantized;
-    s.bits      = q.quantized ? q.bits : 0;
-    s.stride    = 1;
-    s.offset    = 0;
+  _ane->stage(L, ane_src_(b.w1, lora_for_(false, L, &BlockLora::w1)),
+              ane_src_(b.w3, lora_for_(false, L, &BlockLora::w3)),
+              ane_src_(b.w2, lora_for_(false, L, &BlockLora::w2)),
+              _quant_group);
+}
+
+// THE q/k/v TIER: one matmul module, hidden -> 3*hidden, whose single
+// weight slot holds q, k and v stacked by rows, and whose output
+// COLUMNS scatter straight into qb / kb / vb -- so the three stay the
+// separate matrices this model keeps. Same row split, balancer and
+// probe as the feed-forward's; the ANE's rows are the TAIL.
+bool
+MetalZImageTransformer::ane_qkv_setup_(int seq)
+{
+  if (_ane_qkv_tried) { return _ane_qkv != nullptr; }
+  _ane_qkv_tried = true;
+  if (_mc == nullptr || _mc->session() == nullptr || seq <= 0) {
+    return false;
+  }
+  AneFeedForward::Options o;
+  o.session = _mc->session();
+  o.mc      = _mc;
+  o.tag     = "z-image-qkv";
+  o.hidden  = _cfg.hidden;
+  o.ffn     = 3 * _cfg.hidden;       // the matmul's output width
+  o.seq     = seq;
+  o.rows    = _cfg.ane_rows;
+  o.chunk   = ane_chunk_rows();
+  o.matmul  = true;
+  o.profile = std::getenv("VPIPE_Z_IMAGE_ANE_PROFILE") != nullptr;
+  _ane_qkv = AneFeedForward::create(o);
+  return _ane_qkv != nullptr;
+}
+
+bool
+MetalZImageTransformer::ane_qkv_eligible_(int L, const Block& b) const
+{
+  if (_ane_qkv == nullptr) { return false; }
+  const int main_idx = L - _cfg.n_refiner;
+  if (main_idx < 0) { return false; }
+  const int cap = (_cfg.ane_layers > 0)
+                      ? std::min(_cfg.ane_layers, _cfg.n_layers)
+                      : _cfg.n_layers;
+  if (main_idx >= cap) { return false; }
+  auto ok = [](const QWeight& q) {
+    if (q.empty()) { return false; }
+    if (!q.quantized) { return true; }
+    return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
+           !q.qbias.empty();
+  };
+  return ok(b.qw) && ok(b.kw) && ok(b.vw);
+}
+
+void
+MetalZImageTransformer::ane_qkv_stage_(int L, const Block& b)
+{
+  if (_ane_qkv == nullptr) { return; }
+  const std::size_t H = (std::size_t)_cfg.hidden;
+  // Stacked along the slot's rows in the order the split scatters the
+  // output columns: q, then k, then v -- each with its own adapters.
+  auto part = [&](const QWeight& q, std::size_t row0,
+                  lora::Factors BlockLora::* which) {
+    AneFfnSource s = ane_src_(q, lora_for_(false, L, which));
+    s.slot     = 0;
+    s.slot_row = row0;
+    s.rows     = H;
     return s;
   };
-  _ane->stage(L, src(b.w1), src(b.w3), src(b.w2), _quant_group);
+  _ane_qkv->stage(L,
+                  std::vector<AneFfnSource>{
+                      part(b.qw, 0, &BlockLora::q),
+                      part(b.kw, H, &BlockLora::k),
+                      part(b.vw, 2 * H, &BlockLora::v)},
+                  _quant_group);
 }
 
 // ---- runtime LoRA ---------------------------------------------------

@@ -31,6 +31,7 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,10 +52,16 @@ namespace {
 
 // minitest's ASSERT_TRUE does NOT abort, so every follow-on step has to
 // be guarded by hand.
+// `cond` is evaluated ONCE. An ASSERT_TRUE(cond) followed by
+// if (!(cond)) evaluates it twice, which is invisible for a
+// comparison and doubles the work for a call -- a model loaded, or a
+// forward run, twice per use.
 #define ZI_REQUIRE(cond)                                                   \
   do {                                                                     \
-    ASSERT_TRUE(cond);                                                     \
-    if (!(cond)) { return; }                                               \
+    if (!(cond)) {                                                         \
+      report_expect_true_failure(#cond, __FILE__, __LINE__);               \
+      return;                                                              \
+    }                                                                      \
   } while (0)
 
 std::string
@@ -1284,4 +1291,295 @@ TEST(z_image_dit, stop_on_the_real_checkpoint_lands_within_a_block)
     // the end of the forward.
     EXPECT_TRUE(lat3 < 4.0 * per_block);
   }
+}
+
+// THE ANE TIERS: that their rows are right, that a runtime adapter
+// reaches them, and -- opt-in -- what they save.
+//
+// A SwiGLU feed-forward is row-independent, and so is a projection, so
+// the ANE takes a contiguous band of a block's rows and the GPU the
+// rest, concurrently, with no seam to blend: the feed-forward tier
+// (ane_ffn) and the q/k/v tier (ane_qkv) beside it. The rows come back
+// fp16 where the GPU's are bf16 (more mantissa, not less), so the bar is
+// a rounding difference through the stack, not bit-identity.
+//
+// ENGAGEMENT FIRST. The modules' chunk is 2048 rows and a geometry that
+// gives the ANE less than one declines the tier outright, which passes
+// while testing nothing -- so 1024^2 (4096 image rows) is the floor, and
+// the test asserts each tier ARMED before anything about the numbers.
+//
+// THE ADAPTER. The ANE is fed each block's weights as fp16 inputs, so a
+// runtime LoRA has to be MERGED into what it stages; a tier that stages
+// the bare weights runs the base model on its rows and the adapted one
+// on the GPU's -- a seam that looks like the adapter at half strength.
+// A synthetic adapter on q/k/v and the feed-forward of every main block,
+// strong enough to move the output well past the tiers' own rounding,
+// has to agree ANE-vs-GPU as closely as the base model does.
+//
+// SPEED is a property of the machine, not of the tier, so it is not
+// asserted: VPIPE_Z_IMAGE_ANE_BENCH=<reps> holds every arm, warms them,
+// and times their forwards with the order ROTATING per rep, so a clock
+// that drifts charges every arm alike. It is meant for the M4 series (no
+// matrix cores, so the GPU's GEMMs run the tiled path and the ANE has
+// proportionally most to take); a fanless M5 shares one power budget
+// between the engines and reads slower. VPIPE_Z_IMAGE_ANE_PX sets the
+// square size (default 1024), VPIPE_Z_IMAGE_ANE_STREAM=0 holds the
+// blocks (default: stream, which a 16 GB box must).
+namespace {
+
+// A bf16 safetensors file, for a synthetic adapter.
+bool
+write_bf16_st_(const std::filesystem::path& p,
+               const std::vector<std::pair<std::string,
+                                           std::vector<std::int64_t>>>& ts,
+               const std::vector<std::vector<std::uint16_t>>& data)
+{
+  std::string hdr = "{";
+  std::uint64_t off = 0;
+  for (std::size_t i = 0; i < ts.size(); ++i) {
+    const std::uint64_t nb = data[i].size() * 2;
+    hdr += (i ? "," : "") + std::string("\"") + ts[i].first +
+           "\":{\"dtype\":\"BF16\",\"shape\":[";
+    for (std::size_t d = 0; d < ts[i].second.size(); ++d) {
+      hdr += (d ? "," : "") + std::to_string(ts[i].second[d]);
+    }
+    hdr += "],\"data_offsets\":[" + std::to_string(off) + "," +
+           std::to_string(off + nb) + "]}";
+    off += nb;
+  }
+  hdr += "}";
+  while ((hdr.size() + 8) % 16 != 0) { hdr += ' '; }
+  std::ofstream f(p, std::ios::binary);
+  if (!f) { return false; }
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  for (const auto& d : data) {
+    f.write(reinterpret_cast<const char*>(d.data()),
+            (std::streamsize)(d.size() * 2));
+  }
+  return (bool)f;
+}
+
+}  // namespace
+
+TEST(z_image_dit, ane_tiers_rows_are_right)
+{
+  const char* r = std::getenv("VPIPE_Z_IMAGE_TEST_MODEL_PATH");
+  if (r == nullptr || *r == '\0') { return; }
+  const std::string dir =
+      (std::filesystem::path(r) / "transformer").string();
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalZImageTransformer::Config cfg;
+  ZI_REQUIRE(MetalZImageTransformer::Config::read_dims(dir, &cfg));
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int px = envi("VPIPE_Z_IMAGE_ANE_PX", 1024);
+  const bool stream = envi("VPIPE_Z_IMAGE_ANE_STREAM", 1) != 0;
+  const int reps = envi("VPIPE_Z_IMAGE_ANE_BENCH", 0);
+  // 8x VAE, 2x patch: a px^2 image is a (px/16)^2 patch grid.
+  const int grid = px / 16;
+  zimage::Layout lay;
+  std::string lerr;
+  ZI_REQUIRE(zimage::build_layout(grid, grid, 64, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.img_tokens * cfg.patch_dim(), 21u);
+  metal_compute::SharedBuffer cap =
+      rnd((std::size_t)lay.cap_len * cfg.cap_dim, 22u);
+  ZI_REQUIRE(!lat.empty() && !cap.empty());
+  MetalZImageTransformer::Request req;
+  req.latents = &lat;
+  req.cap = &cap;
+  req.layout = &lay;
+  req.timestep = 0.75f;
+
+  enum Arm { kGpu, kFf, kQkv, kArms };
+  const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv"};
+  auto make = [&](int arm,
+                  const std::vector<MetalZImageTransformer::LoraSpec>& lo) {
+    MetalZImageTransformer::Config c = cfg;
+    c.ane_ffn = arm != kGpu;
+    c.ane_qkv = arm == kQkv;
+    auto m = MetalZImageTransformer::load(dir, mc, c, stream, lo);
+    // A streamed stack admits nothing until a reserve is DECLARED; 0 is
+    // the answer that keeps every block on the read path, in every arm.
+    if (m != nullptr && stream) {
+      m->set_residency_reserve(0);
+      m->set_residency_schedule(reps + 2);
+    }
+    return m;
+  };
+  const std::size_t n = (std::size_t)lay.img_tokens * cfg.patch_dim();
+  auto fwd = [&](MetalZImageTransformer* m, std::vector<float>* out) {
+    std::string ferr;
+    metal_compute::SharedBuffer o = m->forward(req, &ferr);
+    if (o.empty() || o.byte_size() < n * 2) {
+      std::printf("[z_image_dit] forward failed: %s\n", ferr.c_str());
+      return false;
+    }
+    if (out != nullptr) {
+      const auto* d = static_cast<const std::uint16_t*>(o.contents());
+      out->resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        std::uint32_t u = (std::uint32_t)d[i] << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        (*out)[i] = f;
+      }
+    }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      num += e * e;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  std::vector<float> out[kArms];
+  {
+    std::unique_ptr<MetalZImageTransformer> m[kArms];
+    for (int a = 0; a < kArms; ++a) {
+      m[a] = make(a, {});
+      ZI_REQUIRE(m[a] != nullptr);
+      ZI_REQUIRE(fwd(m[a].get(), &out[a]));
+    }
+    // Asked AFTER the forward: the modules are created on the first one,
+    // when the row count is finally known.
+    EXPECT_TRUE(!m[kGpu]->ane_armed() && !m[kGpu]->ane_qkv_armed());
+    EXPECT_TRUE(!m[kFf]->ane_qkv_armed());
+    if (!m[kFf]->ane_armed()) {
+      // No ANE on this box, or the module would not compile: the tier
+      // declining is a valid outcome, and not one to measure.
+      std::printf("[z_image_dit] ANE did not arm at %dx%d -- SKIPPED\n", px,
+                  px);
+      return;
+    }
+    EXPECT_TRUE(m[kQkv]->ane_armed() && m[kQkv]->ane_qkv_armed());
+    const double r_ff = rel(out[kFf], out[kGpu]);
+    const double r_qkv = rel(out[kQkv], out[kGpu]);
+    std::printf("[z_image_dit] ANE split vs GPU-only at %dx%d (%d image "
+                "rows, %d blocks%s): rel-L2 %.4e ff, %.4e ff+qkv\n", px, px,
+                lay.img_tokens, cfg.n_blocks(), stream ? ", streamed" : "",
+                r_ff, r_qkv);
+    EXPECT_TRUE(r_ff < 0.05);
+    EXPECT_TRUE(r_qkv < 0.05);
+
+    if (reps > 0) {
+      double t[kArms] = {};
+      std::vector<double> per[kArms];
+      for (int k = 0; k < reps; ++k) {
+        for (int j = 0; j < kArms; ++j) {
+          const int a = (j + k) % kArms;
+          const auto t0 = std::chrono::steady_clock::now();
+          ZI_REQUIRE(fwd(m[a].get(), nullptr));
+          const double ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t0).count();
+          t[a] += ms;
+          per[a].push_back(ms);
+        }
+      }
+      auto list = [](const std::vector<double>& v) {
+        std::string s;
+        for (double x : v) { s += std::to_string((int)(x + 0.5)) + " "; }
+        return s;
+      };
+      std::printf("[z_image_dit] ANE bench %dx%d%s, %d reps rotated: %s "
+                  "%.0f, %s %.0f (%.3fx), %s %.0f ms/fwd (%.3fx; %.3fx over "
+                  "ff) | %s| %s| %s\n", px, px, stream ? " streamed" : "",
+                  reps, kName[kGpu], t[kGpu] / reps, kName[kFf],
+                  t[kFf] / reps, t[kGpu] / t[kFf], kName[kQkv],
+                  t[kQkv] / reps, t[kGpu] / t[kQkv], t[kFf] / t[kQkv],
+                  list(per[kGpu]).c_str(), list(per[kFf]).c_str(),
+                  list(per[kQkv]).c_str());
+    }
+  }
+
+  // ---- the adapter reaches the ANE's rows ---------------------------
+  const int H = cfg.hidden, FFI = cfg.ffn_inner, R = 8;
+  std::vector<std::pair<std::string, std::vector<std::int64_t>>> ts;
+  std::vector<std::vector<std::uint16_t>> data;
+  unsigned st = 0x5eedu;
+  auto fill = [&](std::size_t cnt, float amp) {
+    std::vector<std::uint16_t> v(cnt);
+    for (auto& e : v) {
+      st = st * 1664525u + 1013904223u;
+      const float f = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * amp;
+      std::uint32_t u;
+      std::memcpy(&u, &f, 4);
+      e = (std::uint16_t)(u >> 16);
+    }
+    return v;
+  };
+  // The effect scales with amp^2: 0.03 moved the output only 1.1e-2,
+  // under the tiers' own ~4e-2 rounding, where a missing adapter and a
+  // present one read alike.
+  const float kAmp = 0.13f;
+  for (int i = 0; i < cfg.n_layers; ++i) {
+    const std::string p = "layers." + std::to_string(i) + ".";
+    struct M { const char* name; int n, k; };
+    const M mods[] = {{"attention.to_q", H, H}, {"attention.to_k", H, H},
+                      {"attention.to_v", H, H}, {"feed_forward.w1", FFI, H},
+                      {"feed_forward.w3", FFI, H}, {"feed_forward.w2", H, FFI}};
+    for (const M& mo : mods) {
+      ts.push_back({p + mo.name + ".lora_A.weight", {R, mo.k}});
+      data.push_back(fill((std::size_t)R * mo.k, kAmp));
+      ts.push_back({p + mo.name + ".lora_B.weight", {mo.n, R}});
+      data.push_back(fill((std::size_t)mo.n * R, kAmp));
+    }
+  }
+  const std::filesystem::path lp =
+      std::filesystem::temp_directory_path() / "z_image_ane_lora.safetensors";
+  ZI_REQUIRE(write_bf16_st_(lp, ts, data));
+  std::vector<MetalZImageTransformer::LoraSpec> lo = {{lp.string(), 1.0f}};
+  std::vector<float> gl, al;
+  int bound = 0;
+  {
+    auto m = make(kGpu, lo);
+    ZI_REQUIRE(m != nullptr);
+    bound = m->lora_modules(0);
+    ZI_REQUIRE(fwd(m.get(), &gl));
+  }
+  {
+    auto m = make(kQkv, lo);
+    ZI_REQUIRE(m != nullptr);
+    ZI_REQUIRE(fwd(m.get(), &al));
+    EXPECT_TRUE(m->ane_armed() && m->ane_qkv_armed());
+  }
+  std::error_code ec;
+  std::filesystem::remove(lp, ec);
+  const double moved = rel(gl, out[kGpu]);
+  const double r_lora = rel(al, gl);
+  std::printf("[z_image_dit] adapter on q/k/v + ff of %d blocks (%d modules "
+              "bound): moves the output %.4e; ANE ff+qkv vs GPU-only with "
+              "it %.4e (without it %.4e)\n", cfg.n_layers, bound, moved,
+              r_lora, rel(out[kQkv], out[kGpu]));
+  EXPECT_TRUE(bound == 6 * cfg.n_layers);
+  // Moved well past the tiers' own rounding, so an adapter missing from
+  // half the rows could not hide inside it...
+  EXPECT_TRUE(moved > 0.12);
+  // ...and yet the ANE agrees with the GPU as closely as it does on the
+  // base model.
+  EXPECT_TRUE(r_lora < 0.06);
 }

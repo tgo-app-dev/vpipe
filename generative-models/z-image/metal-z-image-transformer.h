@@ -125,6 +125,11 @@ class MetalZImageTransformer {
     bool ane_ffn   = false;
     int  ane_rows  = 0;    // 0 = balance from the two engines' rates
     int  ane_layers = 0;   // 0 = every block
+    // q/k/v on the ANE too: a SECOND module, one matmul hidden ->
+    // 3*hidden with the three weights stacked in its slot, split by
+    // rows like the feed-forward and sharing its worker. Main stack
+    // only, for the same reason the feed-forward is.
+    bool ane_qkv   = false;
 
     // Read what can be read from <dir>/config.json. False when the file
     // is absent or names a different class.
@@ -210,6 +215,7 @@ class MetalZImageTransformer {
   bool uses_sol_attn() const { return (bool)_sol; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
   bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
   // True when the checkpoint stores F32 and every block is therefore
   // narrowed on the way in. Turbo does; the undistilled base does not.
   bool narrows_f32() const { return _src_f32; }
@@ -311,6 +317,9 @@ class MetalZImageTransformer {
   bool ane_setup_(int seq);
   bool ane_eligible_(int L, const Block& b) const;
   void ane_stage_(int L, const Block& b);
+  bool ane_qkv_setup_(int seq);
+  bool ane_qkv_eligible_(int L, const Block& b) const;
+  void ane_qkv_stage_(int L, const Block& b);
 
   bool gemm_mma_(metal_compute::ComputeEncoder& enc,
                  const metal_compute::SharedBuffer& xin, std::size_t xe,
@@ -406,6 +415,8 @@ class MetalZImageTransformer {
   std::unique_ptr<MetalSolAttention> _sol;
   std::unique_ptr<AneFeedForward> _ane;
   bool _ane_tried = false;
+  std::unique_ptr<AneFeedForward> _ane_qkv;
+  bool _ane_qkv_tried = false;
   std::unique_ptr<I8GemmContext> _i8;
 
   // ---- runtime LoRA ---------------------------------------------------

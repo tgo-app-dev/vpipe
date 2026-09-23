@@ -30,10 +30,16 @@ using namespace vpipe::genai::qi21;
 
 namespace {
 
+// `cond` is evaluated ONCE. An ASSERT_TRUE(cond) followed by
+// if (!(cond)) evaluates it twice, which is invisible for a
+// comparison and doubles the work for a call -- a model loaded, or a
+// forward run, twice per use.
 #define Q21L_REQUIRE(cond)                                                 \
   do {                                                                     \
-    ASSERT_TRUE(cond);                                                     \
-    if (!(cond)) { return; }                                               \
+    if (!(cond)) {                                                         \
+      report_expect_true_failure(#cond, __FILE__, __LINE__);               \
+      return;                                                              \
+    }                                                                      \
   } while (0)
 
 // A slot mask with `text_runs` text tokens between successive images.

@@ -125,9 +125,13 @@ const ConfigKey kAttrs[] = {
           "as one unit and grants them together. It costs its own weight "
           "slots and staging on top of the feed-forward's, so the plan "
           "may decline the pair where it would have granted the "
-          "feed-forward alone. Implemented by Krea-2 (q|k|v|gate) and "
-          "FLUX.2 (the double blocks' image q|k|v); "
-          "VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 also turn it on"},
+          "feed-forward alone. Implemented by Krea-2 (q|k|v|gate), "
+          "FLUX.2 (the double blocks' image q|k|v), Qwen-Image-2.1 and "
+          "Z-Image (q|k|v of every main block). MEASURED on an M4 Pro "
+          "at 1024^2 with the feed-forward already there: Qwen-Image-2.1 "
+          "1.08x more per forward. VPIPE_KREA2_ANE_QKV=1 / "
+          "VPIPE_FLUX2_ANE_QKV=1 / VPIPE_QWEN_IMAGE21_ANE_QKV=1 / "
+          "VPIPE_Z_IMAGE_ANE_QKV=1 also turn it on"},
   {.key = "ane_rows", .type = ConfigType::Real, .required = false,
    .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
           "rest CONCURRENTLY (rows are independent in a feed-forward, so "
@@ -1379,6 +1383,7 @@ GenerateImageStage::declare_resources() const
       t2i_family_(dit) == "qwen-image-21") {
     genai::MetalQwenImage21Transformer::Config qc;
     (void)genai::MetalQwenImage21Transformer::Config::read_dims(dit, &qc);
+    qc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
     for (auto& c : model_memory::coreml_claims(
              ane_claim_label_(),
              genai::MetalQwenImage21Transformer::ane_runtime_bytes(
@@ -1397,6 +1402,7 @@ GenerateImageStage::declare_resources() const
       t2i_family_(dit) == "z-image") {
     genai::MetalZImageTransformer::Config zc;
     (void)genai::MetalZImageTransformer::Config::read_dims(dit, &zc);
+    zc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
     for (auto& c : model_memory::coreml_claims(
              ane_claim_label_(),
              genai::MetalZImageTransformer::ane_runtime_bytes(
@@ -2416,6 +2422,7 @@ GenerateImageStage::load_qwen_image21_dit_()
   cfg.sage = _sage;
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
@@ -2472,6 +2479,7 @@ GenerateImageStage::load_z_image_dit_()
   cfg.sage = _sage;
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,

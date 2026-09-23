@@ -47,10 +47,16 @@ using metal_compute::MetalCompute;
 
 namespace {
 
+// `cond` is evaluated ONCE. An ASSERT_TRUE(cond) followed by
+// if (!(cond)) evaluates it twice, which is invisible for a
+// comparison and doubles the work for a call -- a model loaded, or a
+// forward run, twice per use.
 #define Q21D_REQUIRE(cond)                                                 \
   do {                                                                     \
-    ASSERT_TRUE(cond);                                                     \
-    if (!(cond)) { return; }                                               \
+    if (!(cond)) {                                                         \
+      report_expect_true_failure(#cond, __FILE__, __LINE__);               \
+      return;                                                              \
+    }                                                                      \
   } while (0)
 
 std::string
@@ -2258,7 +2264,21 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
   // shorter sequence gives the ANE less than one chunk and the tier
   // declines outright -- which is a correct outcome that tests nothing,
   // and is what 512^2 did here.
-  const int lg = 64, n_text = 64;
+  //
+  // Opt-in, for the machines the tier is aimed at:
+  //   VPIPE_QWEN_IMAGE21_ANE_BENCH=<reps>  hold both arms, warm them, and
+  //       time their forwards INTERLEAVED, order alternating per rep
+  //   VPIPE_QWEN_IMAGE21_ANE_PX=<px>       square size (default 1024)
+  //   VPIPE_QWEN_IMAGE21_ANE_STREAM=0      hold the blocks (default: stream,
+  //       which is what a 16 GB box must do)
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int px = envi("VPIPE_QWEN_IMAGE21_ANE_PX", 1024);
+  const bool stream = envi("VPIPE_QWEN_IMAGE21_ANE_STREAM", 1) != 0;
+  const int reps = envi("VPIPE_QWEN_IMAGE21_ANE_BENCH", 0);
+  const int lg = px / 16, n_text = 64;
   std::vector<std::uint8_t> slot((std::size_t)n_text, 0);
   slot.insert(slot.end(), (std::size_t)(lg * lg / 4), 1);
   const std::vector<qi21::ImgBlock> blocks = {{1, lg, lg}};
@@ -2281,32 +2301,35 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
     return b;
   };
   const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
-
-  auto run = [&](bool ane, std::vector<float>* outv, bool* armed) {
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.image_len * cfg.in_channels, 61u);
+  metal_compute::SharedBuffer txt =
+      rnd((std::size_t)lay.text_len * cfg.txt_dim, 62u);
+  Q21D_REQUIRE(!lat.empty() && !txt.empty());
+  MetalQwenImage21Transformer::Request req;
+  req.latents = &lat;
+  req.txt = &txt;
+  req.layout = &lay;
+  req.timestep = 0.75f;
+  // Three arms: the GPU alone, the feed-forward on the ANE, and the
+  // feed-forward AND q/k/v on it -- so each tier is measured against
+  // the one before it, not only against nothing.
+  enum Arm { kGpu, kFf, kQkv, kArms };
+  const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv"};
+  auto make = [&](int arm) {
     MetalQwenImage21Transformer::Config c = cfg;
-    c.ane_ffn = ane;
-    auto m = MetalQwenImage21Transformer::load(dir, mc, c, true);
-    if (m == nullptr) { return false; }
-    metal_compute::SharedBuffer lat =
-        rnd((std::size_t)lay.image_len * cfg.in_channels, 61u);
-    metal_compute::SharedBuffer txt =
-        rnd((std::size_t)lay.text_len * cfg.txt_dim, 62u);
-    if (lat.empty() || txt.empty()) { return false; }
-    MetalQwenImage21Transformer::Request req;
-    req.latents = &lat;
-    req.txt = &txt;
-    req.layout = &lay;
-    req.timestep = 0.75f;
+    c.ane_ffn = arm != kGpu;
+    c.ane_qkv = arm == kQkv;
+    return MetalQwenImage21Transformer::load(dir, mc, c, stream);
+  };
+  auto fwd = [&](MetalQwenImage21Transformer* m, std::vector<float>* outv) {
     std::string ferr;
     metal_compute::SharedBuffer out = m->forward(req, &ferr);
-    // Asked AFTER the forward: the module is created on the first one,
-    // when the row count is finally known.
-    *armed = m->ane_armed();
     if (out.empty() || out.byte_size() < n * 2) {
-      std::printf("[qwen_image_21_dit] ane=%d forward failed: %s\n",
-                  (int)ane, ferr.c_str());
+      std::printf("[qwen_image_21_dit] forward failed: %s\n", ferr.c_str());
       return false;
     }
+    if (outv == nullptr) { return true; }
     const auto* d = static_cast<const std::uint16_t*>(out.contents());
     outv->resize(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -2317,31 +2340,76 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
     }
     return true;
   };
-
-  std::vector<float> gpu, split;
-  bool armed_off = true, armed_on = false;
-  Q21D_REQUIRE(run(false, &gpu, &armed_off));
-  Q21D_REQUIRE(run(true, &split, &armed_on));
-  EXPECT_TRUE(!armed_off);
-  if (!armed_on) {
+  // Every arm held at once, so a bench can interleave them.
+  std::unique_ptr<MetalQwenImage21Transformer> m[kArms];
+  std::vector<float> out[kArms];
+  for (int a = 0; a < kArms; ++a) {
+    m[a] = make(a);
+    Q21D_REQUIRE(m[a] != nullptr);
+    Q21D_REQUIRE(fwd(m[a].get(), &out[a]));
+  }
+  // Asked AFTER the forward: the modules are created on the first one,
+  // when the row count is finally known.
+  EXPECT_TRUE(!m[kGpu]->ane_armed() && !m[kGpu]->ane_qkv_armed());
+  EXPECT_TRUE(!m[kFf]->ane_qkv_armed());
+  if (!m[kFf]->ane_armed()) {
     // No ANE on this box, or the module would not compile: the tier
     // declining is a valid outcome and not a failure.
     std::printf("[qwen_image_21_dit] ANE did not arm -- SKIPPED\n");
     return;
   }
-  Q21D_REQUIRE(gpu.size() == split.size() && !gpu.empty());
-  double num = 0.0, den = 0.0;
-  for (std::size_t i = 0; i < gpu.size(); ++i) {
-    const double e = (double)split[i] - (double)gpu[i];
-    num += e * e;
-    den += (double)gpu[i] * (double)gpu[i];
-  }
-  const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
-  std::printf("[qwen_image_21_dit] ANE split vs GPU-only: rel-L2 %.4e "
-              "(joint %d, %d layers)\n", rel, lay.joint_len, cfg.n_layers);
+  // ENGAGED before accurate: the q/k/v arm has to have built its own
+  // module, or its numbers are the feed-forward arm's again.
+  EXPECT_TRUE(m[kQkv]->ane_armed() && m[kQkv]->ane_qkv_armed());
+  auto rel = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      num += e * e;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  const double r_ff = rel(out[kFf], out[kGpu]);
+  const double r_qkv = rel(out[kQkv], out[kGpu]);
+  std::printf("[qwen_image_21_dit] ANE split vs GPU-only: rel-L2 %.4e ff, "
+              "%.4e ff+qkv (joint %d, %d layers)\n", r_ff, r_qkv,
+              lay.joint_len, cfg.n_layers);
   // The same function over disjoint rows, one side fp16: a rounding
-  // difference through 32 blocks, not a different answer.
-  EXPECT_TRUE(rel < 0.05);
+  // difference through 32 blocks, not a different answer. The q/k/v
+  // rows are fp16 too, and are normalized per head right after, so
+  // they add rounding and nothing else.
+  EXPECT_TRUE(r_ff < 0.05);
+  EXPECT_TRUE(r_qkv < 0.05);
+
+  if (reps <= 0) { return; }
+  double t[kArms] = {};
+  std::vector<double> per[kArms];
+  for (int k = 0; k < reps; ++k) {
+    // The order ROTATES per rep, so a clock that drifts over the run
+    // charges every arm alike.
+    for (int j = 0; j < kArms; ++j) {
+      const int a = (j + k) % kArms;
+      const auto t0 = std::chrono::steady_clock::now();
+      Q21D_REQUIRE(fwd(m[a].get(), nullptr));
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      t[a] += ms;
+      per[a].push_back(ms);
+    }
+  }
+  auto list = [](const std::vector<double>& v) {
+    std::string s;
+    for (double x : v) { s += std::to_string((int)(x + 0.5)) + " "; }
+    return s;
+  };
+  std::printf("[qwen_image_21_dit] ANE bench %dx%d%s, %d reps rotated: "
+              "%s %.0f, %s %.0f (%.3fx), %s %.0f ms/fwd (%.3fx; %.3fx over "
+              "ff) | %s| %s| %s\n", px, px, stream ? " streamed" : "",
+              reps, kName[kGpu], t[kGpu] / reps, kName[kFf], t[kFf] / reps,
+              t[kGpu] / t[kFf], kName[kQkv], t[kQkv] / reps,
+              t[kGpu] / t[kQkv], t[kFf] / t[kQkv], list(per[kGpu]).c_str(),
+              list(per[kFf]).c_str(), list(per[kQkv]).c_str());
 }
 
 // QUANTIZING THIS FAMILY, end to end: the stage's leaf set, the

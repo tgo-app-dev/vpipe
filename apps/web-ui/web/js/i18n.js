@@ -1956,14 +1956,20 @@ const STRINGS = {
       + '式相同，并共用同一个 ANE worker。需要 ane_ffn：资源计划把两个模块作为'
       + '一个整体来预订，要给就一起给。它在前馈之外还要占用自己的权重槽位和暂'
       + '存，因此在只有前馈时会被批准的场合，成对申请仍可能被拒。已由 Krea-2'
-      + '（q|k|v|gate）与 FLUX.2（double block 的图像 q|k|v）实现；环境变量 '
-      + 'VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 同样可以打开',
+      + '（q|k|v|gate）、FLUX.2（double block 的图像 q|k|v）、Qwen-Image-2.1 '
+      + '与 Z-Image（每个主 block 的 q|k|v）实现。在 M4 Pro 上以 1024^2、前馈'
+      + '已在 ANE 的前提下实测：Qwen-Image-2.1 每次前向再快 1.08 倍。环境变量 '
+      + 'VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 / '
+      + 'VPIPE_QWEN_IMAGE21_ANE_QKV=1 / VPIPE_Z_IMAGE_ANE_QKV=1 同样可以打开',
       '把融合的 q|k|v 投影也放到 ANE 上，作為前饋模組之外的第二個模組，切分方'
       + '式相同，並共用同一個 ANE worker。需要 ane_ffn：資源計畫把兩個模組作為'
       + '一個整體來預訂，要給就一起給。它在前饋之外還要占用自己的權重槽位與暫'
       + '存，因此在只有前饋時會被核准的場合，成對申請仍可能被拒。已由 Krea-2'
-      + '（q|k|v|gate）與 FLUX.2（double block 的影像 q|k|v）實作；環境變數 '
-      + 'VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 同樣可以開啟'],
+      + '（q|k|v|gate）、FLUX.2（double block 的影像 q|k|v）、Qwen-Image-2.1 '
+      + '與 Z-Image（每個主 block 的 q|k|v）實作。在 M4 Pro 上以 1024^2、前饋'
+      + '已在 ANE 的前提下實測：Qwen-Image-2.1 每次前向再快 1.08 倍。環境變數 '
+      + 'VPIPE_KREA2_ANE_QKV=1 / VPIPE_FLUX2_ANE_QKV=1 / '
+      + 'VPIPE_QWEN_IMAGE21_ANE_QKV=1 / VPIPE_Z_IMAGE_ANE_QKV=1 同樣可以開啟'],
   'cfg.generate-image.ane_rows': ['',
       '前馈中分给 ANE 的行的比例，其余由 GPU 并发承担（前馈里各行相互独立，所'
       + '以这个切分是精确的——没有部分和，也没有接缝）。0（默认）让模型族按两'
