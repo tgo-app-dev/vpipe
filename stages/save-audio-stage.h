@@ -4,6 +4,7 @@
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/output-path.h"
 
 #include <cstdint>
 #include <string>
@@ -41,9 +42,17 @@ class TensorBeatPayload;
 // Config (FlexData object on the 4th constructor parameter; deferred-
 // validated -- the ctor never throws, problems are recorded via
 // fail_config()):
-//   output_path  (string, required)  -- output file path. When it has no
-//                                        extension, one is appended from
-//                                        `format`.
+//   output_path  (string, required)  -- output file path, a template:
+//                                        see stages/output-path.h. A
+//                                        printf integer conversion
+//                                        ("clip-%03d.wav") numbers the
+//                                        clips and "%t" stamps the local
+//                                        time. When it has no extension,
+//                                        one is appended from `format`.
+//   no_overwrite (bool, default false)-- never write over a file that is
+//                                        already there: the index starts
+//                                        past every name on disk instead
+//                                        of at 0.
 //   format       (string)            -- "wav" | "aac" | "mp3" | "m4a"
 //                                        (m4a => AAC in an mp4 container).
 //                                        Default: inferred from the
@@ -85,9 +94,11 @@ private:
                       std::size_t n_frames, int channels, int sample_rate,
                       const std::string& format);
 
-  // Append `_files_written` as a zero-padded index before the extension
-  // for the 2nd+ output file (out.aac -> out-001.aac).
-  std::string next_output_path_(const std::string& ext) const;
+  // The path for the next clip, in the container `ext` actually
+  // encoded. Non-const: it advances the sequence picker. Without a
+  // conversion of its own the template gets a zero-padded index before
+  // the extension for the 2nd+ file of a run (out.aac -> out-001.aac).
+  std::string take_output_path_(const std::string& ext);
 
   // ---- Config; defaults live in kSpec.attrs and are read in the ctor
   // via attr_*. ----
@@ -95,12 +106,19 @@ private:
   std::string _format;       // resolved lower-case: wav | aac | mp3 | m4a
   int         _bitrate{};
   int         _sample_rate{};
+  bool        _no_overwrite = false;
+  outpath::Tokens _tok;      // which tokens `output_path` carries
 
-  // Per-run: `_files_written` is the filename index (2nd+ file in a RUN
-  // gets out-001.aac). The stage survives a stop/relaunch, so without a
-  // reset the next launch starts at 1 and writes out-001.aac instead of
+  // Per-run. The picker holds the FILENAME INDEX (2nd+ file in a RUN
+  // gets out-001.aac); it survives a stop/relaunch, so without a reset
+  // the next launch starts at 1 and writes out-001.aac instead of
   // rewriting the file the user configured. Between launches, naming is
-  // the operator's business -- reconfigure the stage.
+  // the operator's business -- reconfigure the stage, or set
+  // no_overwrite. `_files_written` is now only the success count the
+  // test accessor reports: the index advances per ATTEMPT, as
+  // save-image's has always done, so a failed encode does not hand the
+  // next clip a name a broken file may already sit on.
+  outpath::SeqPicker _seq;
   std::uint64_t _files_written = 0;
 };
 

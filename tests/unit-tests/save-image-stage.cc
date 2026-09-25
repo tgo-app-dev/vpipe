@@ -15,8 +15,10 @@
 #include "stages/load-image-stage.h"
 #include "stages/save-image-stage.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -28,6 +30,11 @@
 
 using namespace std;
 using namespace vpipe;
+
+// minitest's ASSERT_TRUE does NOT abort, so a test that would go on to
+// index a string it just failed to produce guards itself.
+#define REQUIRE_(cond) do { if (!(cond)) { EXPECT_TRUE(cond); return; } } \
+                       while (0)
 
 namespace {
 
@@ -367,6 +374,142 @@ TEST(save_image_stage, indexed_stream_paths) {
   remove(p1.c_str());
   EXPECT_TRUE(has0);
   EXPECT_TRUE(has1);
+}
+
+// `no_overwrite` is what issue #38 asked for: run the graph again and
+// keep what the last run wrote, without retyping the name. The default
+// is the OPPOSITE (rewrite the same file), and both halves are checked
+// here because only the pair proves the flag is what moved.
+TEST(save_image_stage, no_overwrite_keeps_what_the_previous_run_wrote) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-nov-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+  const string tmpl = dir + "/f-%02d.png";
+
+  // Two launches with the flag OFF: the second rewrites f-00.png.
+  for (int run = 0; run < 2; ++run) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(tmpl));
+    SolidSource* s = nullptr;
+    run_store_(sess, s, std::move(cfg), 1, 1, 2, 3);
+  }
+  const bool off_reused = file_size_(dir + "/f-00.png") > 0
+                       && file_size_(dir + "/f-01.png") == 0;
+
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  // Two launches with it ON: the second lands beside the first.
+  for (int run = 0; run < 2; ++run) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(tmpl));
+    cfg.as_object().insert("no_overwrite", FlexData::make_bool(true));
+    SolidSource* s = nullptr;
+    run_store_(sess, s, std::move(cfg), 1, 1, 2, 3);
+  }
+  const bool on_kept = file_size_(dir + "/f-00.png") > 0
+                    && file_size_(dir + "/f-01.png") > 0;
+  filesystem::remove_all(dir, ec);
+
+  EXPECT_TRUE(off_reused);
+  EXPECT_TRUE(on_kept);
+}
+
+// Within ONE run, no_overwrite still numbers the stream -- and starts
+// past a file somebody left in the directory.
+TEST(save_image_stage, no_overwrite_starts_past_a_file_already_there) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-nov2-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+  { ofstream(dir + "/f-00.png", ios::binary) << "squatter"; }
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string(dir + "/f-%02d.png"));
+  cfg.as_object().insert("no_overwrite", FlexData::make_bool(true));
+  SolidSource* s = nullptr;
+  run_store_(sess, s, std::move(cfg), 2, 0x10, 0x20, 0x30);
+
+  // The squatter is untouched, and both images went after it.
+  const string kept = head_bytes_(dir + "/f-00.png", 8);
+  const bool one = file_size_(dir + "/f-01.png") > 0;
+  const bool two = file_size_(dir + "/f-02.png") > 0;
+  filesystem::remove_all(dir, ec);
+  EXPECT_TRUE(kept == "squatter");
+  EXPECT_TRUE(one);
+  EXPECT_TRUE(two);
+}
+
+// %t names the file after the local wall clock. The test cannot pin the
+// clock, so it asserts the SHAPE the stage produced and that the token
+// is gone -- a template copied through verbatim would fail both.
+TEST(save_image_stage, a_timestamp_token_names_the_file) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-t-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string(dir + "/shot-%t.png"));
+  SolidSource* s = nullptr;
+  run_store_(sess, s, std::move(cfg), 1, 4, 5, 6);
+
+  string name;
+  int n = 0;
+  for (const auto& e : filesystem::directory_iterator(dir, ec)) {
+    name = e.path().filename().string();
+    ++n;
+  }
+  filesystem::remove_all(dir, ec);
+  REQUIRE_(n == 1);
+  // "shot-YYYYmmdd-HHMMSS.png"
+  EXPECT_TRUE(name.rfind("shot-", 0) == 0);
+  EXPECT_TRUE(name.size() == string("shot-20260924-111530.png").size());
+  EXPECT_TRUE(name.find("%t") == string::npos);
+  EXPECT_TRUE(name[13] == '-');            // the date/time separator
+  EXPECT_TRUE(name.substr(name.size() - 4) == ".png");
+  for (size_t i = 5; i < 13; ++i) {
+    EXPECT_TRUE(isdigit((unsigned char)name[i]) != 0);
+  }
+}
+
+// A template the expander cannot parse is a CONFIG error, reported
+// where it can still be fixed rather than at the first write.
+TEST(save_image_stage, a_broken_timestamp_format_is_deferred_config) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string("/tmp/f-%t{%Y.png"));
+  SaveImageStage st(&sess, "st", vector<InEdge>{}, std::move(cfg));
+  // The message must be ABOUT the template: a stage has other reasons
+  // to fail its config, and "non-empty" would accept any of them.
+  EXPECT_FALSE(st.config_error().empty());
+  EXPECT_TRUE(st.config_error().find("%t{%Y.png") != string::npos);
+}
+
+TEST(save_image_stage, a_separator_in_a_timestamp_format_is_refused) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string("/tmp/%t{%Y/%m}.png"));
+  SaveImageStage st(&sess, "st", vector<InEdge>{}, std::move(cfg));
+  EXPECT_FALSE(st.config_error().empty());
+  EXPECT_TRUE(st.config_error().find("separator") != string::npos);
 }
 
 // The metadata iport is OPTIONAL: the stage still constructs (and stays a

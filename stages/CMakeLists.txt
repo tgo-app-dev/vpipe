@@ -44,6 +44,7 @@ set(LOCAL_SOURCES
   video-ref-encoder-stage.cc
   model-catalog.cc
   model-memory.cc
+  output-path.cc
   model-detect.cc
   model-fetch-stage.cc
   model-register-stage.cc
@@ -87,6 +88,7 @@ set(LOCAL_HEADERS
   model-remove-stage.h
   model-registry.h
   model-select-stage.h
+  output-path.h
   passthrough-stage.h
   qwen-asr-tokenizer.h
   rest-client-stage.h

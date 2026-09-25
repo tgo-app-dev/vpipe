@@ -7,7 +7,9 @@
 #include "generative-models/weight-set.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -25,11 +27,6 @@ namespace {
 
 // The largest f16 -- the ReLU's upper bound.
 constexpr float kF16Max = 65504.0f;
-
-// The head goes to the direct conv at or under this many output channels
-// (3 * patch^2: 3, 12, 48). The gather conv tiles output channels 32 or
-// more at a time, so a 12-channel head would compute mostly padding.
-constexpr int kSmallCoutMax = 48;
 
 // A tensor's host copy as f32, whatever the file stores. Read UNCACHED:
 // every weight here is transformed into the decoder's own layout and the
@@ -187,8 +184,13 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
     const auto* inf = src.info(nm);
     return inf != nullptr ? inf->shape : std::vector<std::int64_t>{};
   };
+  // `split` packs the HWIO twin as TWO [3, 3, cin/2, cout] halves back
+  // to back instead of one [3, 3, cin, cout]. That is what lets a
+  // MemBlock's [x, past] conv run as two hardware convs, each reading
+  // its own activation: the standard packing interleaves the halves
+  // per tap, so neither half is contiguous in it.
   auto conv3 = [&](const std::string& nm, int pad_cin, Conv* c,
-                   bool want_hwio) -> bool {
+                   bool split = false) -> bool {
     if (!read) {
       shp = shape_of(nm + ".weight");
       if (shp.size() != 4 || shp[2] != 3 || shp[3] != 3) { return false; }
@@ -196,9 +198,12 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       const int cp = std::max(ci, pad_cin);
       const bool bias = src.has(nm + ".bias");
       _info.params += (std::size_t)co * ci * 9 + (bias ? co : 0);
-      _weight_bytes += (std::size_t)2 * co * 9 * cp *
-                           (want_hwio ? 2 : 1) +
+      _weight_bytes += (std::size_t)2 * co * 9 * cp +
                        (bias ? (std::size_t)2 * co : 0);
+      // The HWIO twin, booked on the same rule the build uses (see
+      // Conv::whwio): cout % 64 is what the hardware op takes.
+      if ((co % 64) == 0) { _weight_bytes += (std::size_t)2 * co * 9 * cp; }
+      c->split_hwio = split;
       c->cin = cp;
       c->cout = co;
       c->k3 = true;
@@ -220,21 +225,32 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       }
     }
     c->w = f16_buf_(mc, w);
-    if (want_hwio) {
-      std::vector<float> hw((std::size_t)9 * cp * co, 0.0f);
+    _info.params += (std::size_t)co * ci * 9;
+    _weight_bytes += c->w.byte_size();
+    if ((co % 64) == 0) {
+      // [3, 3, cin, cout] from the [cout, 9 * cin] just built: the same
+      // numbers, transposed, because hwio is the only layout the MPP
+      // convolution2d op reads.
+      std::vector<float> hwio((std::size_t)9 * cp * co, 0.0f);
+      const int cs = split ? cp / 2 : cp;
       for (int o = 0; o < co; ++o) {
-        for (int i = 0; i < ci; ++i) {
-          for (int t = 0; t < 9; ++t) {
-            hw[((std::size_t)t * cp + i) * co + o] =
-                host[((std::size_t)o * ci + i) * 9 + t];
+        for (int t = 0; t < 9; ++t) {
+          for (int i = 0; i < cp; ++i) {
+            // Unsplit: [t][i][o]. Split: half h = i / cs at
+            // [h][t][i - h*cs][o], so each half is a whole
+            // [3, 3, cs, cout] the op can be pointed straight at.
+            const std::size_t d =
+                split ? ((std::size_t)(i / cs) * 9 * cs
+                         + (std::size_t)t * cs + (i % cs)) * co + o
+                      : ((std::size_t)t * cp + i) * co + o;
+            hwio[d] = w[(std::size_t)o * 9 * cp + (std::size_t)t * cp + i];
           }
         }
       }
-      c->hwio = f16_buf_(mc, hw);
-      if (c->hwio.empty()) { return false; }
+      c->whwio = f16_buf_(mc, hwio);
+      _weight_bytes += c->whwio.byte_size();
+      c->split_hwio = split;
     }
-    _info.params += (std::size_t)co * ci * 9;
-    _weight_bytes += c->w.byte_size() + c->hwio.byte_size();
     if (src.has(nm + ".bias")) {
       if (!read_host_(*_ws, mc, nm + ".bias", &host, &shp)) {
         return false;
@@ -297,9 +313,10 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
         return fail(fmt("{}: block reads {} channels where {} flow in",
                         nm, cin0, C)());
       }
-      if (!conv3(nm + ".conv.0", 0, &op.c0, false) ||
-          !conv3(nm + ".conv.2", 0, &op.c1, false) ||
-          !conv3(nm + ".conv.4", 0, &op.c2, false)) {
+      if (!conv3(nm + ".conv.0", 0, &op.c0,
+                 /*split=*/op.kind == Op::kMemBlock) ||
+          !conv3(nm + ".conv.2", 0, &op.c1) ||
+          !conv3(nm + ".conv.4", 0, &op.c2)) {
         return fail(fmt("{}: unreadable block convs", nm)());
       }
       op.out_ch = op.c2.cout;
@@ -391,10 +408,8 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
         return fail(fmt("{}: conv reads {} channels where {} flow in", nm,
                         inf->shape[1], C)());
       }
-      const bool head = (i == max_idx);
       const int pad = first ? ((C + 31) / 32) * 32 : 0;
-      if (!conv3(nm, pad, &op.c,
-                 head && (int)inf->shape[0] <= kSmallCoutMax)) {
+      if (!conv3(nm, pad, &op.c)) {
         return fail(fmt("{}: unreadable conv", nm)());
       }
       op.out_ch = op.c.cout;
@@ -459,6 +474,29 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
       ++i;
     }
   }
+  // FUSIONS, decided once from the layout. Each removes a whole pass over
+  // a full activation, and on these small-channel nets those passes were
+  // not small: MEASURED at 1024^2 on an M4 Pro, the ReLU / residual /
+  // upsample passes were 20-45% of a preview between them, one element
+  // per thread and bound by launch, not bandwidth.
+  //   Upsample -> 3x3 conv: the conv reads the SOURCE at (y/2, x/2) and
+  //     the 4x intermediate is never written. After the reorder above,
+  //     every upsample in the published layouts feeds a conv.
+  //   3x3 conv -> ReLU: the ReLU runs on the accumulator.
+  // Blocks fuse inside run_: c0/c1 carry their ReLU, and c2 adds the skip
+  // and applies the block's ReLU in its epilogue.
+  for (std::size_t i = 0; i + 1 < _ops.size(); ++i) {
+    Op& a = _ops[i];
+    Op& b = _ops[i + 1];
+    if (a.kind == Op::kUpsample && b.kind == Op::kConv) {
+      a.fused = true;
+      b.up = 2;
+    }
+    if (a.kind == Op::kConv && b.kind == Op::kRelu) {
+      a.relu = true;
+      b.fused = true;
+    }
+  }
   _last_state_op = 0;
   for (std::size_t i = 0; i < _ops.size(); ++i) {
     if (_ops[i].kind == Op::kMemBlock) { _last_state_op = i; }
@@ -471,15 +509,87 @@ MetalTaeDecoder::build_kernels_(std::string* err)
 {
   _lib_gemm = _mc->load_library("dense_gemm");
   _lib_elt  = _mc->load_library("llm_elementwise");
-  _fn_conv_bn32  = _lib_gemm.function("conv3x3_gemm_s1_bn32_f16");
-  _fn_conv_bn64  = _lib_gemm.function("conv3x3_gemm_s1_bn64_f16");
+  // The gather conv in every form the forward fuses into it, [BN 32, 64].
+  // Names as the MSL declares them -- the element type is the LIBRARY's.
+  static const char* const kConv[kConvForms][2] = {
+      {"conv3x3_gemm_s1_bn32_f16", "conv3x3_gemm_s1_bn64_f16"},
+      {"conv3x3_gemm_s1_bn32_relu_f16", "conv3x3_gemm_s1_bn64_relu_f16"},
+      {"conv3x3_gemm_s1_bn32_addrelu_f16",
+       "conv3x3_gemm_s1_bn64_addrelu_f16"},
+      {"conv3x3_gemm_up2_bn32_f16", "conv3x3_gemm_up2_bn64_f16"},
+      {"conv3x3_gemm_up2_bn32_relu_f16", "conv3x3_gemm_up2_bn64_relu_f16"},
+      {"conv3x3_gemm_s1_bn32_cat_relu_f16",
+       "conv3x3_gemm_s1_bn64_cat_relu_f16"},
+  };
+  for (int f = 0; f < kConvForms; ++f) {
+    for (int b = 0; b < 2; ++b) {
+      _fn_conv[f][b] = _lib_gemm.function(kConv[f][b]);
+      if (!_fn_conv[f][b].valid()) {
+        if (err != nullptr) {
+          *err = fmt("kernel {} did not load", kConv[f][b])();
+        }
+        return false;
+      }
+    }
+  }
+  // THE HARDWARE CONVOLUTION, where the machine has matrix cores. It
+  // runs the same contraction as the gather conv above with the same
+  // epilogue folded into its cooperative tensor, and MEASURED ~3x ahead
+  // of it at every TAE shape it accepts (tae_conv_route). Optional in
+  // every sense: no matrix cores, an unbuildable kernel or
+  // VPIPE_TAE_NO_HWCONV leaves _use_hwconv false and every conv takes
+  // the gather path exactly as before.
+  const bool want_hw = _mc->supports_matrix_cores() &&
+                       std::getenv("VPIPE_TAE_NO_HWCONV") == nullptr;
+  if (want_hw) {
+    _lib_convhw = _mc->load_library("conv2d_mma");
+    static const char* const kEpi[2][3] = {
+        {"conv2d_hw_3x3_s1_epi_f16",
+         "conv2d_hw_3x3_s1_epi_relu_f16",
+         "conv2d_hw_3x3_s1_epi_addrelu_f16"},
+        {"conv2d_hw_3x3_s1_epi_tail_f16",
+         "conv2d_hw_3x3_s1_epi_relu_tail_f16",
+         "conv2d_hw_3x3_s1_epi_addrelu_tail_f16"},
+    };
+    _use_hwconv = true;
+    for (int t = 0; t < 2; ++t) {
+      for (int i = 0; i < 3; ++i) {
+        _fn_hw_epi[t][i] = _lib_convhw.function(kEpi[t][i]);
+        if (!_fn_hw_epi[t][i].valid()) { _use_hwconv = false; }
+      }
+    }
+    // The concat pair: a plain conv for [x], then its accumulating
+    // twin for [past], which carries the bias and the ReLU.
+    _fn_hw_plain = _lib_convhw.function("conv2d_hw_3x3_s1_f16");
+    _fn_hw_acc_relu =
+        _lib_convhw.function("conv2d_hw_3x3_s1_acc_epi_relu_f16");
+    if (!_fn_hw_plain.valid() || !_fn_hw_acc_relu.valid()) {
+      _use_hwconv = false;
+    }
+    // These are runtime-compiled, so a source error shows up as an
+    // INVALID HANDLE rather than a build failure. Half a set is not a
+    // route: take none of it, rather than dispatch one form with no
+    // kernel bound and run whichever kernel was bound last. This class
+    // has no log delegate to complain through, so what catches a
+    // silently-lost route is the engagement half of the test
+    // (tae_decoder.the_hardware_conv_is_what_runs), not a warning.
+  }
+  if (_use_hwconv) {
+    // One zero vector wide enough for any conv the op will take.
+    int widest = 64;
+    for (const Op& o : _ops) {
+      for (const Conv* cc : {&o.c, &o.c0, &o.c1, &o.c2, &o.skip}) {
+        if (!cc->whwio.empty()) { widest = std::max(widest, cc->cout); }
+      }
+    }
+    std::vector<float> z((std::size_t)widest, 0.0f);
+    _zero_bias = f16_buf_(_mc, z);
+  }
   _fn_gemm_bm64     = _lib_gemm.function("dense_gemm_t_bm64_f16");
   _fn_gemm_bm64bn64 = _lib_gemm.function("dense_gemm_t_bm64bn64_f16");
-  _fn_small_cout = _lib_elt.function("conv3x3_hwc_small_cout_f16");
   _fn_relu     = _lib_elt.function("clamp_f16");
   _fn_add      = _lib_elt.function("residual_add_f16");
   _fn_upsample = _lib_elt.function("upsample_nearest2x_hwc_f16");
-  _fn_concat   = _lib_elt.function("concat_cols_f16");
   _fn_copy     = _lib_elt.function("copy_f16");
   _fn_gn_stats  = _lib_elt.function("group_norm_chan_stats_f16");
   _fn_gn_reduce = _lib_elt.function("group_norm_group_stats_f32");
@@ -489,14 +599,10 @@ MetalTaeDecoder::build_kernels_(std::string* err)
   // loader refuses rather than find out at decode.
   const std::pair<const char*, const metal_compute::ComputeFunction*>
       need[] = {
-          {"conv3x3_gemm_s1_bn32_f16", &_fn_conv_bn32},
-          {"conv3x3_gemm_s1_bn64_f16", &_fn_conv_bn64},
           {"dense_gemm_t_bm64_f16", &_fn_gemm_bm64},
-          {"conv3x3_hwc_small_cout_f16", &_fn_small_cout},
           {"clamp_f16", &_fn_relu},
           {"residual_add_f16", &_fn_add},
           {"upsample_nearest2x_hwc_f16", &_fn_upsample},
-          {"concat_cols_f16", &_fn_concat},
           {"copy_f16", &_fn_copy},
           {"group_norm_chan_stats_f16", &_fn_gn_stats},
           {"group_norm_group_stats_f32", &_fn_gn_reduce},
@@ -553,14 +659,14 @@ MetalTaeDecoder::scratch_for_(int h, int w) const
         if (i + 1 < _ops.size()) { z.op_out[i] = m_in * op.out_ch; }
         break;
       case Op::kUpsample:
-        z.op_out[i] = m_in * 4 * op.out_ch;
+        // Fused into the conv it feeds: nothing is written.
+        if (!op.fused) { z.op_out[i] = m_in * 4 * op.out_ch; }
         break;
       case Op::kTGrow:
         z.op_out[i] = m_in * op.out_ch;
         break;
       case Op::kMemBlock:
         z.mem[(std::size_t)op.mem] = m_in * op.in_ch;
-        z.cat = std::max(z.cat, m_in * 2 * op.in_ch);
         [[fallthrough]];
       case Op::kBlock:
         z.op_out[i] = m_in * op.out_ch;
@@ -585,7 +691,7 @@ MetalTaeDecoder::scratch_for_(int h, int w) const
 std::size_t
 MetalTaeDecoder::Scratch::fixed_bytes() const
 {
-  std::size_t n = in + cat + 3 * tmp + skip;
+  std::size_t n = in + 2 * tmp + skip;
   if (gn_part_bytes > 0) { n += 2 * pool + pooled; }
   for (std::size_t e : op_out) { n += e; }
   for (std::size_t e : mem) { n += e; }
@@ -650,10 +756,8 @@ MetalTaeDecoder::ensure_scratch_(int h, int w)
     if (z.op_out[i] > 0) { _op_out[i] = take(z.op_out[i]); }
   }
   for (std::size_t k = 0; k < z.mem.size(); ++k) { _mem[k] = take(z.mem[k]); }
-  _cat  = take(z.cat);
   _tmp0 = take(z.tmp);
   _tmp1 = take(z.tmp);
-  _tmp2 = take(z.tmp);
   _skip = take(z.skip);
   if (z.gn_part_bytes > 0) {
     _pool_a = take(z.pool);
@@ -669,7 +773,7 @@ MetalTaeDecoder::ensure_scratch_(int h, int w)
   _head_frame = z.head_frame;
   _head = {};
   _in_all = {};
-  bool ok = !_in.empty() && !_cat.empty();
+  bool ok = !_in.empty();
   for (std::size_t i = 0; i < _ops.size(); ++i) {
     if (z.op_out[i] > 0 && _op_out[i].empty()) { ok = false; }
   }
@@ -686,26 +790,127 @@ MetalTaeDecoder::ensure_scratch_(int h, int w)
   return true;
 }
 
+// The MPP convolution2d op takes whole 8x8 destination tiles and whole
+// 64-channel slices, and reads the activation itself -- so a gather the
+// decoder wanted to fold in (the 2x upsample, a MemBlock's concat) is
+// what rules it out, along with the head's 3-16 output channels and any
+// grid that is not a multiple of 8. `out_off` is not a problem: the
+// caller passes the destination already offset.
+bool
+MetalTaeDecoder::hw_ok_(const Conv& c, int H, int W, int up, bool cat,
+                        bool whole_tiles) const
+{
+  if (!_use_hwconv || c.whwio.empty() || up != 1 || cat) { return false; }
+  if ((c.cout % 64) != 0) { return false; }
+  if (whole_tiles && ((H % 8) != 0 || (W % 8) != 0)) { return false; }
+  // The op indexes source and destination through int32 tensor extents.
+  // Fall back before either would overflow, so a very large preview
+  // degrades to the gather conv instead of reading somewhere else.
+  constexpr std::size_t kIdxMax = 0x7fffffffull;
+  if ((std::size_t)c.cin * W * H > kIdxMax ||
+      (std::size_t)c.cout * W * H > kIdxMax) {
+    return false;
+  }
+  return true;
+}
+
 void
 MetalTaeDecoder::conv3_(ComputeEncoder& enc, const Conv& c,
                         const SharedBuffer& in, const SharedBuffer& out,
-                        int H, int W)
+                        std::size_t out_off, int H, int W, int up, Epi epi,
+                        const SharedBuffer* res, const char* cat,
+                        const SharedBuffer* in2)
 {
-  const int M = H * W;
+  const int OH = H * up, OW = W * up;
+  const int M = OH * OW;
   // BN 64 wherever the output is that wide: the FLUX.2 VAE measured it
   // ahead of BN 128 once the gather vectorized (the narrower tile's
-  // smaller threadgroup footprint wins on occupancy).
+  // smaller threadgroup footprint wins on occupancy). The head's 3-16
+  // channels take BN 32 -- mostly padding, and still MEASURED 2.5-12x
+  // ahead of the direct small-cout conv (taeh3's 717 ms of heads per 90
+  // frames at 960x576 -> 75 ms): one thread per pixel with scalar loads
+  // does not come close to a simdgroup-MMA tile even at 3/32 occupancy.
   const int bn = c.cout >= 64 ? 64 : 32;
-  enc.set_function(bn == 64 ? _fn_conv_bn64 : _fn_conv_bn32);
+  // `in2` (a concat's second half) is only ever a MemBlock's first conv,
+  // which carries a ReLU and no upsample.
+  // THE HARDWARE CONVOLUTION FIRST, where it fits. It takes the plain,
+  // +ReLU and +residual+ReLU forms -- which is most of a decode: a
+  // Block is conv->ReLU->conv->ReLU->conv and its last conv writes
+  // relu(y + skip). What it cannot do is read through the gather: the
+  // op fetches the activation window itself, so an on-the-fly 2x
+  // upsample (up == 2) or a MemBlock's [x, past] concat (in2) has no
+  // way in, and those keep the gather conv.
+  // A CONCAT CONV RUNS AS TWO. The op reads one activation, so [x,
+  // past] is served by conv(x) followed by conv(past) ACCUMULATED onto
+  // it, each against its own half of the split twin -- which is why the
+  // twin was packed in halves at load. The bias and the ReLU ride the
+  // second one, so the pair rounds where the single gather conv does.
+  if (in2 != nullptr && c.split_hwio &&
+      hw_ok_(c, H, W, up, false, /*whole_tiles=*/true)) {
+    const int cs = c.cin / 2;
+    const std::size_t half = (std::size_t)9 * cs * c.cout * 2;
+    const metal_compute::LaunchDims grid = {
+        (unsigned)((W / 8) * 128), (unsigned)(H / 8),
+        (unsigned)(c.cout / 64)};
+    enc.set_function(_fn_hw_plain);
+    enc.set_buffer(0, in);
+    enc.set_buffer(1, c.whwio);
+    enc.set_buffer(2, out, out_off);
+    enc.set_constant(3, W);   enc.set_constant(4, H);
+    enc.set_constant(5, cs);  enc.set_constant(6, c.cout);
+    dispatch_(enc, cat, grid, {128, 1, 1}, /*hw=*/true);
+    enc.set_function(_fn_hw_acc_relu);
+    enc.set_buffer(0, *in2);
+    enc.set_buffer(1, c.whwio, half);
+    enc.set_buffer(2, out, out_off);
+    enc.set_constant(3, W);   enc.set_constant(4, H);
+    enc.set_constant(5, cs);  enc.set_constant(6, c.cout);
+    enc.set_buffer(7, c.b.empty() ? _zero_bias : c.b);
+    dispatch_(enc, cat, grid, {128, 1, 1}, /*hw=*/true);
+    return;
+  }
+  if (hw_ok_(c, H, W, up, in2 != nullptr, /*whole_tiles=*/false)) {
+    const int e = epi == Epi::kAddRelu ? 2 : epi == Epi::kRelu ? 1 : 0;
+    // The guarded entry only where the grid actually has an overhang.
+    const int t = ((H % 8) != 0 || (W % 8) != 0) ? 1 : 0;
+    enc.set_function(_fn_hw_epi[t][e]);
+    enc.set_buffer(0, in);
+    enc.set_buffer(1, c.whwio);
+    enc.set_buffer(2, out, out_off);
+    enc.set_constant(3, W);      enc.set_constant(4, H);
+    enc.set_constant(5, c.cin);  enc.set_constant(6, c.cout);
+    enc.set_buffer(7, c.b.empty() ? _zero_bias : c.b);
+    // Bound even when the epilogue will not read it: an unbound slot
+    // is a fault, and `out` is a buffer this dispatch already holds.
+    enc.set_buffer(8, epi == Epi::kAddRelu && res != nullptr ? *res : out);
+    // CEIL, not floor: an edge tile computes rows the image does not
+    // have and the kernel drops them. That is what lets the latent-grid
+    // level in (a 36x60 preview grid is not a multiple of 8, and it was
+    // the whole of what stayed on the gather conv).
+    dispatch_(enc, cat, {(unsigned)(((W + 7) / 8) * 128),
+                  (unsigned)((H + 7) / 8),
+                  (unsigned)(c.cout / 64)}, {128, 1, 1}, /*hw=*/true);
+    return;
+  }
+  const int form = in2 != nullptr ? 5
+                 : up == 2 ? (epi == Epi::kRelu ? 4 : 3)
+                 : epi == Epi::kRelu    ? 1
+                 : epi == Epi::kAddRelu ? 2
+                                        : 0;
+  enc.set_function(_fn_conv[form][bn == 64 ? 1 : 0]);
   enc.set_buffer(0, in);
   enc.set_buffer(1, c.w);
   enc.set_buffer(2, c.b.empty() ? c.w : c.b);
-  enc.set_buffer(3, out);
+  enc.set_buffer(3, out, out_off);
   enc.set_constant(4, H);      enc.set_constant(5, W);
   enc.set_constant(6, c.cin);  enc.set_constant(7, c.cout);
-  enc.set_constant(8, H);      enc.set_constant(9, W);
+  enc.set_constant(8, OH);     enc.set_constant(9, OW);
   enc.set_constant(10, c.b.empty() ? 0 : 1);
-  enc.dispatch({(unsigned)(((c.cout + bn - 1) / bn) * 32),
+  if (form != 0) {
+    enc.set_buffer(11, res != nullptr ? *res : in);
+    enc.set_buffer(12, in2 != nullptr ? *in2 : in);
+  }
+  dispatch_(enc, cat, {(unsigned)(((c.cout + bn - 1) / bn) * 32),
                 (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
 }
 
@@ -728,8 +933,35 @@ MetalTaeDecoder::conv1_(ComputeEncoder& enc, const Conv& c,
   enc.set_constant(5, rows);
   enc.set_constant(6, M);
   enc.set_constant(7, 0);
-  enc.dispatch({(unsigned)(((rows + bn - 1) / bn) * 32),
+  dispatch_(enc, "conv1x1", {(unsigned)(((rows + bn - 1) / bn) * 32),
                 (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+}
+
+// Every dispatch goes through here so that VPIPE_TAE_PROFILE can time it.
+// Profiling commits and waits after EACH dispatch and adds the command
+// buffer's kernel time to `cat` -- which serializes the whole decode and
+// is therefore a diagnostic only: the split between categories is what
+// it measures, never the decode's wall time.
+void
+MetalTaeDecoder::dispatch_(ComputeEncoder& enc, const char* cat,
+                           metal_compute::LaunchDims grid,
+                           metal_compute::LaunchDims tg, bool hw)
+{
+  enc.dispatch(grid, tg);
+  if (_prof_cs == nullptr) { return; }
+  enc.end();
+  const auto t0 = std::chrono::steady_clock::now();
+  metal_compute::CommandStream::Fence f = _prof_cs->commit();
+  f.wait_ok();
+  ProfileRow& r = _profile[hw ? std::string(cat) + "-hw" : std::string(cat)];
+  // GPUStartTime..GPUEndTime. The Fence's `kernel_s` read ~30x under
+  // the wall time here (34 full-size 3x3 convs in 1.4 ms), so it is not
+  // what is summed; the commit..wait wall is kept beside it as a check.
+  r.ms += f.gpu_times().gpu_s * 1e3;
+  r.wall_ms += std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+  ++r.dispatches;
+  enc = _prof_cs->begin_compute();
 }
 
 void
@@ -742,7 +974,7 @@ MetalTaeDecoder::relu_(ComputeEncoder& enc, const SharedBuffer& x,
   enc.set_constant(2, (int)n);
   enc.set_constant(3, 0.0f);
   enc.set_constant(4, kF16Max);
-  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  dispatch_(enc, "relu", {(unsigned)n, 1, 1}, {256, 1, 1});
 }
 
 void
@@ -751,6 +983,9 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
                       const std::function<int(long)>& slot_of)
 {
   const SharedBuffer* cur = &x;
+  // A fused upsample leaves H/W at the SOURCE size and says so here; the
+  // conv it feeds reads through it and doubles them.
+  int up = 1;
   for (; i < _ops.size(); ++i) {
     const Op& op = _ops[i];
     const int M = H * W;
@@ -770,54 +1005,40 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
     }
     switch (op.kind) {
       case Op::kConv: {
+        const Epi epi = op.relu ? Epi::kRelu : Epi::kNone;
         if (i + 1 == _ops.size()) {
+          // The head writes its frame's slot, bound as a buffer offset.
           const int slot = slot_of(raw);
           if (slot < 0) { return; }
-          const std::size_t off = (std::size_t)slot * _head_frame * 2;
-          if (op.c.cout <= kSmallCoutMax && !op.c.hwio.empty()) {
-            enc.set_function(_fn_small_cout);
-            enc.set_buffer(0, *cur);
-            enc.set_buffer(1, op.c.hwio);
-            enc.set_buffer(2, op.c.b.empty() ? op.c.hwio : op.c.b);
-            enc.set_buffer(3, _head, off);
-            enc.set_constant(4, W);        enc.set_constant(5, H);
-            enc.set_constant(6, op.c.cin); enc.set_constant(7, op.c.cout);
-            enc.set_constant(8, op.c.b.empty() ? 0 : 1);
-            enc.dispatch({(unsigned)W, (unsigned)H, 1}, {256, 1, 1});
-          } else {
-            // A head too wide for the direct conv writes its slot through
-            // the gather conv; bind the slot as its own buffer offset.
-            const SharedBuffer& o = _head;
-            int bn = op.c.cout >= 64 ? 64 : 32;
-            enc.set_function(bn == 64 ? _fn_conv_bn64 : _fn_conv_bn32);
-            enc.set_buffer(0, *cur);
-            enc.set_buffer(1, op.c.w);
-            enc.set_buffer(2, op.c.b.empty() ? op.c.w : op.c.b);
-            enc.set_buffer(3, o, off);
-            enc.set_constant(4, H);         enc.set_constant(5, W);
-            enc.set_constant(6, op.c.cin);  enc.set_constant(7, op.c.cout);
-            enc.set_constant(8, H);         enc.set_constant(9, W);
-            enc.set_constant(10, op.c.b.empty() ? 0 : 1);
-            enc.dispatch({(unsigned)(((op.c.cout + bn - 1) / bn) * 32),
-                          (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
-          }
+          conv3_(enc, op.c, *cur, _head,
+                 (std::size_t)slot * _head_frame * 2, H, W, up, epi,
+                 nullptr, "head");
           return;
         }
-        conv3_(enc, op.c, *cur, _op_out[i], H, W);
+        conv3_(enc, op.c, *cur, _op_out[i], 0, H, W, up, epi, nullptr,
+               up == 2 ? "conv3x3+up" : "conv3x3");
+        H *= up;
+        W *= up;
+        up = 1;
         cur = &_op_out[i];
         break;
       }
       case Op::kRelu:
+        if (op.fused) { break; }   // ran in the conv's epilogue
         relu_(enc, *cur, (std::size_t)M * op.out_ch);
         break;
       case Op::kUpsample: {
+        if (op.fused) {
+          up = 2;                  // the next conv reads through it
+          break;
+        }
         enc.set_function(_fn_upsample);
         enc.set_buffer(0, *cur);
         enc.set_buffer(1, _op_out[i]);
         enc.set_constant(2, H);
         enc.set_constant(3, W);
         enc.set_constant(4, op.out_ch);
-        enc.dispatch({(unsigned)op.out_ch, (unsigned)(4 * M), 1},
+        dispatch_(enc, "upsample", {(unsigned)op.out_ch, (unsigned)(4 * M), 1},
                      {(unsigned)std::min(op.out_ch, 256), 1, 1});
         cur = &_op_out[i];
         H *= 2;
@@ -852,7 +1073,8 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
           enc.set_constant(2, M);
           enc.set_constant(3, n);
           enc.set_constant(4, NB);
-          enc.dispatch({(unsigned)(256 * NB), 1, 1}, {256, 1, 1});
+          dispatch_(enc, "groupnorm", {(unsigned)(256 * NB), 1, 1},
+                    {256, 1, 1});
           enc.set_function(_fn_gn_reduce);
           enc.set_buffer(0, _gn_part);
           enc.set_buffer(1, _gn_stats);
@@ -861,7 +1083,8 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
           enc.set_constant(4, kPoolGroups);
           enc.set_constant(5, NB);
           enc.set_constant(6, kGnEps);
-          enc.dispatch({(unsigned)(256 * kPoolGroups), 1, 1}, {256, 1, 1});
+          dispatch_(enc, "groupnorm", {(unsigned)(256 * kPoolGroups), 1, 1},
+                    {256, 1, 1});
           enc.set_function(_fn_gn_apply);
           enc.set_buffer(0, _pool_a);
           enc.set_buffer(1, op.gn_gamma);
@@ -870,7 +1093,8 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
           enc.set_buffer(4, _gn_stats);
           enc.set_constant(5, n);
           enc.set_constant(6, kPoolGroups);
-          enc.dispatch({(unsigned)n, (unsigned)M, 1}, {256, 1, 1});
+          dispatch_(enc, "groupnorm", {(unsigned)n, (unsigned)M, 1},
+                    {256, 1, 1});
           relu_(enc, _pool_b, (std::size_t)M * n);
           conv1_(enc, op.pool_out, 0, C, _pool_b, _pooled, M);
           enc.set_function(_fn_add);
@@ -878,51 +1102,39 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
           enc.set_buffer(1, _pooled);
           enc.set_buffer(2, _pooled);
           enc.set_constant(3, M * C);
-          enc.dispatch({(unsigned)((std::size_t)M * C), 1, 1}, {256, 1, 1});
+          dispatch_(enc, "add", {(unsigned)((std::size_t)M * C), 1, 1},
+                    {256, 1, 1});
           cur = &_pooled;
         }
-        const SharedBuffer* in0 = cur;
+        // A MemBlock's first conv reads [x, past] -- the current frame's
+        // channels first -- straight out of the two maps; the concat that
+        // used to be written here was ~10% of an H3 preview.
+        const SharedBuffer* past =
+            op.kind == Op::kMemBlock ? &_mem[(std::size_t)op.mem] : nullptr;
+        conv3_(enc, op.c0, *cur, _tmp0, 0, H, W, 1, Epi::kRelu, nullptr,
+               "conv3x3", past);
+        conv3_(enc, op.c1, _tmp0, _tmp1, 0, H, W, 1, Epi::kRelu, nullptr,
+               "conv3x3");
         if (op.kind == Op::kMemBlock) {
-          // [x, past]: the current frame's channels first.
-          const SharedBuffer& mem = _mem[(std::size_t)op.mem];
-          enc.set_function(_fn_concat);
-          enc.set_buffer(0, *cur);
-          enc.set_buffer(1, mem);
-          enc.set_buffer(2, _cat);
-          enc.set_constant(3, M);
-          enc.set_constant(4, C);
-          enc.set_constant(5, C);
-          enc.dispatch({(unsigned)((std::size_t)M * 2 * C), 1, 1},
-                       {256, 1, 1});
-          in0 = &_cat;
-        }
-        conv3_(enc, op.c0, *in0, _tmp0, H, W);
-        relu_(enc, _tmp0, (std::size_t)M * N);
-        conv3_(enc, op.c1, _tmp0, _tmp1, H, W);
-        relu_(enc, _tmp1, (std::size_t)M * N);
-        conv3_(enc, op.c2, _tmp1, _tmp2, H, W);
-        if (op.kind == Op::kMemBlock) {
-          // The NEXT frame's past is THIS frame's input. After the concat
-          // has read the old one; the encoder orders the two.
+          // The NEXT frame's past is THIS frame's input. After c0 has read
+          // the old one; the encoder orders the two.
           enc.set_function(_fn_copy);
           enc.set_buffer(0, *cur);
           enc.set_buffer(1, _mem[(std::size_t)op.mem]);
           enc.set_constant(2, 0);
           enc.set_constant(3, M * C);
-          enc.dispatch({(unsigned)((std::size_t)M * C), 1, 1}, {256, 1, 1});
+          dispatch_(enc, "copy", {(unsigned)((std::size_t)M * C), 1, 1},
+                    {256, 1, 1});
         }
         const SharedBuffer* skip = cur;
         if (op.has_skip) {
           conv1_(enc, op.skip, 0, N, *cur, _skip, M);
           skip = &_skip;
         }
-        enc.set_function(_fn_add);
-        enc.set_buffer(0, _tmp2);
-        enc.set_buffer(1, *skip);
-        enc.set_buffer(2, _op_out[i]);
-        enc.set_constant(3, M * N);
-        enc.dispatch({(unsigned)((std::size_t)M * N), 1, 1}, {256, 1, 1});
-        relu_(enc, _op_out[i], (std::size_t)M * N);
+        // out = relu(c2(t1) + skip), in c2's epilogue: the residual pass
+        // and the block's ReLU pass are both gone.
+        conv3_(enc, op.c2, _tmp1, _op_out[i], 0, H, W, 1, Epi::kAddRelu,
+               skip, "conv3x3");
         cur = &_op_out[i];
         break;
       }
@@ -983,6 +1195,13 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
   }
   metal_compute::CommandStream cs = _mc->make_command_stream();
   if (!cs.valid()) { return fail("no command stream"); }
+  _profile.clear();
+  _prof_cs = std::getenv("VPIPE_TAE_PROFILE") != nullptr ? &cs : nullptr;
+  // Cleared on EVERY way out: the stream is this call's local.
+  struct ProfGuard {
+    metal_compute::CommandStream** cs;
+    ~ProfGuard() { *cs = nullptr; }
+  } prof_guard{&_prof_cs};
 
   // The whole latent, channel-last, zero-padded to the first conv's width
   // and through the input Clamp, uploaded ONCE: each latent frame is
@@ -1052,7 +1271,7 @@ MetalTaeDecoder::decode(const float* latent, int C, int T, int h, int w,
         enc.set_buffer(1, _in);
         enc.set_constant(2, 0);
         enc.set_constant(3, (int)in_frame);
-        enc.dispatch({(unsigned)in_frame, 1, 1}, {256, 1, 1});
+        dispatch_(enc, "copy", {(unsigned)in_frame, 1, 1}, {256, 1, 1});
         const std::function<int(long)> slot_of = [&slots](long raw) {
           auto it = slots.find(raw);
           return it == slots.end() ? -1 : it->second;

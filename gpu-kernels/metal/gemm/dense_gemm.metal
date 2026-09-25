@@ -129,6 +129,14 @@ struct BiasAddEpilogue {
   }
 };
 
+// max(x, 0) on the fp32 accumulator, before the one store rounds it.
+struct ReluEpilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return max(x, static_cast<AccumT>(0));
+  }
+};
+
 // CAUSAL: 0 = dense (default). 1 = QK (scores[query,key]): skip a whole tile
 // when its smallest key column (y_col) is above the block's largest query
 // (q_offset+y_row+BM-1) -- those columns are masked away by the downstream
@@ -1320,8 +1328,26 @@ kernel void dense_moe_gate_f16(
 //   0:in[H*W,Cin] 1:W[Cout,9*Cin] 2:bias[Cout] 3:out[OH*OW,Cout]
 //   4:H 5:W 6:Cin 7:Cout 8:OH 9:OW 10:has_bias
 //   dispatch {ceil(Cout/BN)*32, ceil(OH*OW/BM)*2, 2}, tg {32,2,2}
+//
+// FUSED FORMS, for a decoder that would otherwise pay a whole memory pass
+// per op around every conv (the tiny autoencoders: measured 20-45% of a
+// preview in ReLU / residual / upsample passes that each read and wrote a
+// full activation at one element per thread):
+//   UP == 2   the input is NEAREST-UPSAMPLED 2x on the fly: H/Wi are the
+//             SOURCE dims, OH/OW = 2H/2Wi, and a tap at upsampled (iy, ix)
+//             reads source (iy/2, ix/2) -- the 4x-larger intermediate is
+//             never written. Stride 1 only.
+//   EPI == 1  y = relu(conv + bias)
+//   EPI == 2  y = relu(conv + bias + res), `res` an [OH*OW, Cout] map
+//   CAT == 1  the input is the channel CONCAT of two maps, `inp` then
+//             `inp2`, each Cin/2 wide -- read in place, so the [H*W, Cin]
+//             concat is never materialized (a TAEHV MemBlock's [x, past]).
+//             Cin/2 must be a multiple of 4, and of BK for the fast gather.
+// all on the fp32 accumulator, so the fused output is rounded once where
+// the unfused chain rounded after every op.
 template <typename T, const int BM, const int BK, const int BN,
-          const int STRIDE>
+          const int STRIDE, const int UP = 1, const int EPI = 0,
+          const int CAT = 0>
 METAL_FUNC void conv3x3_gemm_impl(
     const device T* inp,
     const device T* Wt,
@@ -1336,15 +1362,25 @@ METAL_FUNC void conv3x3_gemm_impl(
     const constant int& OH,
     const constant int& OW,
     const constant int& has_bias,
+    const device T* res,
+    const device T* inp2,
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid,
     uint  lid) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(UP == 1 || (UP == 2 && STRIDE == 1),
+                "the fused upsample is stride-1 only");
   constexpr int WM = 2;
   constexpr int WN = 2;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int THREADS = WM * WN * SIMD_SIZE;
+  // The bounds a tap is checked against: the UPSAMPLED map's when UP == 2,
+  // before the tap is folded back onto the source pixel it duplicates.
+  const int LH = H * UP, LW = Wi * UP;
+  // The row stride of the map a channel is read from: each concat half
+  // holds Cin/2 channels per pixel.
+  const int CS = CAT ? Cin / 2 : Cin;
 
   using mma_t = mlx::steel::BlockMMA<
       T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded, float>;
@@ -1411,10 +1447,14 @@ METAL_FUNC void conv3x3_gemm_impl(
         if (i < num_els) {
           const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky) : (oyv[n] + ky - 1);
           const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx) : (oxv[n] + kx - 1);
-          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
-            // Cin and ci are multiples of 4, so this is 8-byte aligned.
+          if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
+            // Cin and ci are multiples of 4, so this is 8-byte aligned; a
+            // concat half is too (CS % 4 == 0), and a quad never straddles
+            // the two.
+            const bool hi = CAT && ci >= CS;
             v = *reinterpret_cast<const device vec<T, 4>*>(
-                inp + ((int64_t)iy * Wi + ix) * Cin + ci);
+                (hi ? inp2 : inp) +
+                ((int64_t)(iy / UP) * Wi + ix / UP) * CS + (hi ? ci - CS : ci));
           }
         }
         *reinterpret_cast<threadgroup vec<T, 4>*>(Xs + i * BK_padded + cl) = v;
@@ -1434,8 +1474,10 @@ METAL_FUNC void conv3x3_gemm_impl(
           const int ky = tap / 3, kx = tap - ky * 3;
           const int iy = (STRIDE == 2) ? (oy * 2 + ky) : (oy + ky - 1);
           const int ix = (STRIDE == 2) ? (ox * 2 + kx) : (ox + kx - 1);
-          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
-            v = inp[((int64_t)iy * Wi + ix) * Cin + ci];
+          if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
+            const bool hi = CAT && ci >= CS;
+            v = (hi ? inp2 : inp)[((int64_t)(iy / UP) * Wi + ix / UP) * CS +
+                                  (hi ? ci - CS : ci)];
           }
         }
         Xs[i * BK_padded + j] = v;
@@ -1453,18 +1495,29 @@ METAL_FUNC void conv3x3_gemm_impl(
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   device T* yp = y + y_row * static_cast<int64_t>(Cout) + y_col;
+  const device T* rp = res + y_row * static_cast<int64_t>(Cout) + y_col;
   if (num_els < BM || num_outs < BN) {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue_safe(bias + y_col, 0, 1, short2(num_outs, num_els),
                                  op);
     }
+    if (EPI == 2) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue_safe(rp, Cout, 1, short2(num_outs, num_els), op);
+    }
+    if (EPI >= 1) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result_safe(yp, Cout, short2(num_outs, num_els));
   } else {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue(bias + y_col, 0, 1, op);
     }
+    if (EPI == 2) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue(rp, Cout, 1, op);
+    }
+    if (EPI >= 1) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result(yp, Cout);
   }
 }
@@ -1492,8 +1545,43 @@ METAL_FUNC void conv3x3_gemm_impl(
     threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
     threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
     conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, STRIDE_>(                      \
-        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, tid,    \
-        simd_gid, simd_lid, lid);                                             \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias,         \
+        (const device VPIPE_ELT*)nullptr, (const device VPIPE_ELT*)nullptr,   \
+        tid, simd_gid, simd_lid, lid);                                        \
+  }
+
+// The fused forms (see conv3x3_gemm_impl). Their own entry points, so the
+// plain ones keep their exact signature for every caller that exists:
+// buffer 11 is the residual, read only when EPI == 2, and buffer 12 the
+// concat's second half, read only when CAT == 1 (bind anything valid
+// otherwise). OH/OW are the OUTPUT dims -- 2H x 2Wi when UP == 2.
+#define VPIPE_CONV3X3_GEMM_FUSED_ENTRY(NAME, BM_, BN_, UP_, EPI_, CAT_)      \
+  kernel void NAME(                                                           \
+      const device VPIPE_ELT* inp  [[buffer(0)]],                             \
+      const device VPIPE_ELT* Wt   [[buffer(1)]],                             \
+      const device VPIPE_ELT* bias [[buffer(2)]],                             \
+      device VPIPE_ELT*       y    [[buffer(3)]],                             \
+      const constant int& H        [[buffer(4)]],                             \
+      const constant int& Wi       [[buffer(5)]],                             \
+      const constant int& Cin      [[buffer(6)]],                             \
+      const constant int& Cout     [[buffer(7)]],                             \
+      const constant int& OH       [[buffer(8)]],                             \
+      const constant int& OW       [[buffer(9)]],                             \
+      const constant int& has_bias [[buffer(10)]],                            \
+      const device VPIPE_ELT* res  [[buffer(11)]],                            \
+      const device VPIPE_ELT* inp2 [[buffer(12)]],                            \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]],                           \
+      uint  lid      [[thread_index_in_threadgroup]])                         \
+  {                                                                           \
+    constexpr int BK = 32;                                                    \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
+    threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
+    conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, 1, UP_, EPI_, CAT_>(           \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, res,    \
+        inp2, tid, simd_gid, simd_lid, lid);                                  \
   }
 
 // BN=128: the activation tile is re-read once per CHANNEL tile, so total
@@ -1507,3 +1595,18 @@ VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn64_f16, 64, 64, 1)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn32_f16, 64, 32, 1)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn64_f16, 64, 64, 2)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn32_f16, 64, 32, 2)
+
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_relu_f16, 64, 64, 1, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_relu_f16, 64, 32, 1, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_addrelu_f16,
+                               64, 64, 1, 2, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_addrelu_f16,
+                               64, 32, 1, 2, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn64_f16, 64, 64, 2, 0, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn32_f16, 64, 32, 2, 0, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn64_relu_f16, 64, 64, 2, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn32_relu_f16, 64, 32, 2, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_cat_relu_f16,
+                               64, 64, 1, 1, 1)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_cat_relu_f16,
+                               64, 32, 1, 1, 1)

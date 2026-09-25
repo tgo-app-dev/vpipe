@@ -29,7 +29,9 @@ set(LOCAL_TEST_SOURCES
   graph-move-iport.cc
   load-image-stage.cc
   text-source-stages.cc
+  output-path.cc
   save-image-stage.cc
+  tae-conv-route.cc
   host-identity.cc
   i18n.cc
   library-handle.cc

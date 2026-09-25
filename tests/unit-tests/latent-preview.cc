@@ -222,7 +222,12 @@ public:
   genai::MetalTaeDecoder::Trim trim = genai::MetalTaeDecoder::Trim::kH3Chunks;
   bool began = false;
   int began_count = 0;
+  // The stage-wide policy an IMAGE denoiser sets: drop the TAE when a
+  // generation's Scope is left. Exercised through a Scope, because that
+  // is where the flag is read and where a stage's previews live.
+  bool release_each = false;
   std::size_t resident = 0;
+  std::size_t resident_mid = 0;
   std::uint64_t rendered = 0, replaced = 0;
 
   Job
@@ -230,14 +235,20 @@ public:
   {
     LatentPreviewer pv(session(), "producer");
     pv.configure(spec_, trim);
+    pv.release_each_generation(release_each);
     for (int g = 0; g < generations; ++g) {
-      began = pv.begin(ctx, 0, fps, video_frames);
-      if (!began) { break; }
-      ++began_count;
-      for (int s = 1; s <= steps; ++s) {
-        if (pv.due(s, steps)) { pv.submit(latent, C, T, h, w, s, steps); }
+      {
+        LatentPreviewer::Scope sc(&pv, ctx, 0, fps, video_frames);
+        began = sc.active();
+        if (!began) { break; }
+        ++began_count;
+        for (int s = 1; s <= steps; ++s) {
+          if (pv.due(s, steps)) { pv.submit(latent, C, T, h, w, s, steps); }
+        }
+        // Inside the scope the decoder is necessarily still there; the
+        // question this pins is what is left once it closes.
+        resident_mid = pv.resident_bytes();
       }
-      pv.end(ctx);
       rendered += pv.rendered();
       replaced += pv.replaced();
     }
@@ -330,6 +341,65 @@ golden_(Golden* g)
 }
 
 }  // namespace
+
+// WHAT THE DENOISE-PHASE CLAIM PROMISES. latent_preview_claims books
+// the TAE's decode scratch under kPhaseDenoise -- hundreds of MB at a
+// real preview size -- so a stage that keeps the decoder past the
+// generation is holding memory the plan says is not there, in the
+// decode phase, where a tight box is tightest. An image denoiser
+// therefore sets release_each_generation(); a video one keeps the TAE
+// for the next clip and releases on its idle policy instead.
+//
+// BOTH ARMS, because only the pair says the flag is what moved: the
+// default must still keep it (that is the reuse the video path is built
+// on) and setting it must still leave nothing behind.
+TEST(latent_preview, releasing_each_generation_leaves_nothing_resident)
+{
+  Golden g;
+  if (!golden_(&g)) { return; }
+  for (int arm = 0; arm < 2; ++arm) {
+    const bool release_each = arm == 1;
+    Session sess;
+    auto pl = std::make_unique<Pipeline>("p", &sess);
+    auto prod_u = std::make_unique<PreviewProducer>(
+        &sess, "prod", std::vector<InEdge>{}, FlexData::make_object());
+    prod_u->spec_.vae = g.checkpoint;
+    prod_u->spec_.every = 1;
+    prod_u->spec_.max_edge = 0;
+    prod_u->latent = g.latent;
+    prod_u->C = g.C; prod_u->T = g.T; prod_u->h = g.h; prod_u->w = g.w;
+    prod_u->steps = 2;
+    prod_u->generations = 2;
+    prod_u->release_each = release_each;
+    prod_u->allocate_oports(1);
+    prod_u->set_oport_policy(0, {2, OverrunPolicy::DropOldest});
+    auto* prod =
+        static_cast<PreviewProducer*>(pl->insert_stage(std::move(prod_u)));
+    auto sink_u = std::make_unique<ClipSink>(
+        &sess, "sink", std::vector<InEdge>{{prod, 0}},
+        FlexData::make_object());
+    pl->insert_stage(std::move(sink_u));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    ASSERT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+
+    std::printf("[latent-preview] release_each=%d: %zu bytes mid-scope, "
+                "%zu after, %d generations\n", (int)release_each,
+                prod->resident_mid, prod->resident, prod->began_count);
+    // Both arms must have actually DECODED -- an arm that never loaded
+    // the TAE reports 0 resident and would pass the release half while
+    // proving nothing.
+    EXPECT_TRUE(prod->began_count == 2);
+    EXPECT_TRUE(prod->resident_mid > 0);
+    if (release_each) {
+      EXPECT_TRUE(prod->resident == 0);
+    } else {
+      EXPECT_TRUE(prod->resident > 0);
+    }
+  }
+}
 
 // End to end: a producer submits back to back, the worker renders on its
 // own thread and pushes through the DropOldest port, a sink reads. What

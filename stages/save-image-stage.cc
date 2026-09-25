@@ -25,8 +25,8 @@ extern "C" {
 #include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -126,28 +126,11 @@ lower_ext(const string& path)
   return ext;
 }
 
-// Detect a single printf integer conversion ("%d", "%04d", "%i", ...) so
-// a path template can index a stream of images. Returns true when exactly
-// one such conversion is present (a literal "%%" is not a conversion).
-bool
-has_int_conversion(const string& s)
-{
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] != '%') { continue; }
-    if (i + 1 < s.size() && s[i + 1] == '%') { ++i; continue; }   // %%
-    size_t j = i + 1;
-    while (j < s.size() &&
-           (s[j] == '-' || s[j] == '+' || s[j] == ' ' ||
-            s[j] == '#' || s[j] == '0')) { ++j; }                 // flags
-    while (j < s.size() && isdigit((unsigned char)s[j])) { ++j; } // width
-    if (j < s.size() &&
-        (s[j] == 'd' || s[j] == 'i' || s[j] == 'u' ||
-         s[j] == 'x' || s[j] == 'X')) {
-      return true;
-    }
-  }
-  return false;
-}
+// The width of the "-NNNNNN" suffix this stage has always given the
+// second and later images of a stream when `path` carries no sequence
+// conversion of its own. See stages/output-path.h on why it is per
+// stage.
+constexpr int kSeqPad = 6;
 
 }   // namespace
 
@@ -166,6 +149,20 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
   _quality     = (int)attr_int("quality");
   _compression = (int)attr_int("compression");
   _lossless    = attr_bool("lossless");
+  _no_overwrite = attr_bool("no_overwrite");
+  // The template is checked HERE, not at the first write: a misspelt
+  // %t{...} is a config mistake and belongs in the editor's error line,
+  // where it can still be fixed, rather than in a log the run produced
+  // after it had already written somewhere unexpected.
+  if (!_path.empty()) {
+    const std::string bad = outpath::check(_path, &_tok);
+    if (!bad.empty()) {
+      fail_config(fmt(
+          "SaveImageStage('{}'): config.path '{}': {}",
+          this->id(), _path, bad));
+    }
+  }
+  _seq.configure(_no_overwrite);
   if (_quality <= 0)     { _quality = 90; }
   if (_compression <= 0) { _compression = 6; }
   _quality     = std::clamp(_quality, 1, 100);
@@ -207,10 +204,16 @@ constexpr SpecExtra kFormatChoices[] = {
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
-   .doc = "output image file path; a printf integer conversion "
-          "(e.g. frame-%04d.png) indexes a stream of images, else later "
-          "images get a -NNNNNN suffix",
+   .doc = "output image file path. A printf integer conversion "
+          "(frame-%04d.png) numbers a stream of images and %t stamps the "
+          "local time (%t{...} takes a strftime format); without a "
+          "conversion later images get a -NNNNNN suffix",
    .is_path = true, .path_write = true, .path_filter = "image"},
+  {.key = "no_overwrite", .type = ConfigType::Bool, .required = false,
+   .doc = "never write over a file that already exists: the sequence "
+          "number starts past every name on disk instead of at 0. Off by "
+          "default, because the usual graph wants the same name rewritten "
+          "each run", .def_bool = false},
   {.key = "format", .type = ConfigType::String, .required = false,
    .doc = "png | jpeg (jpg) | webp | bmp | tiff; default from the path "
           "extension, else png",
@@ -261,31 +264,6 @@ SaveImageStage::av_err_(int rc) const
   char buf[256];
   _libs->avutil().api.strerror(rc, buf, sizeof buf);
   return string(buf);
-}
-
-string
-SaveImageStage::resolve_path_(uint64_t index) const
-{
-  // A printf integer conversion gives the caller full control over the
-  // per-image name.
-  if (has_int_conversion(_path)) {
-    char buf[2048];
-    std::snprintf(buf, sizeof buf, _path.c_str(),
-                  (int)(unsigned)index);
-    return string(buf);
-  }
-  // No token: the first image writes to `path` verbatim; each later image
-  // gets a zero-padded suffix before the extension so a stream does not
-  // clobber itself.
-  if (index == 0) { return _path; }
-  char suf[16];
-  std::snprintf(suf, sizeof suf, "-%06u", (unsigned)index);
-  const auto dot = _path.find_last_of('.');
-  const auto slash = _path.find_last_of("/\\");
-  if (dot != string::npos && (slash == string::npos || dot > slash)) {
-    return _path.substr(0, dot) + suf + _path.substr(dot);
-  }
-  return _path + suf;
 }
 
 bool
@@ -529,14 +507,17 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
 void
 SaveImageStage::reset_run_state()
 {
-  // Per-launch reset. `_seen` is the filename index: image 0 writes
-  // `path` verbatim and every later one gets a `-%06u` suffix so a
-  // stream can't clobber itself WITHIN a run. Across runs that is
+  // Per-launch reset. The picker holds the filename index: image 0
+  // writes `path` verbatim and every later one gets a `-%06u` suffix so
+  // a stream can't clobber itself WITHIN a run. Across runs that is
   // wrong -- the stage survives a stop/relaunch, so without this the
-  // second launch starts at index 1 and writes `name-000001.jpeg`,
-  // the third `name-000002.jpeg`, and the file the user is actually
+  // second launch starts at index 1 and writes `name-000001.jpeg`, the
+  // third `name-000002.jpeg`, and the file the user is actually
   // watching is never rewritten.
-  _seen    = 0;
+  //
+  // Under `no_overwrite` the reset costs nothing: the scan re-finds the
+  // first free name, which is now one past what the last run wrote.
+  _seq.reset();
   _written = 0;
 
 }
@@ -549,6 +530,16 @@ SaveImageStage::initialize(RuntimeContext& /*ctx*/)
       "SaveImageStage('{}'): writing {} to '{}' (quality {}, compression "
       "{}{})", this->id(), _format, _path, _quality, _compression,
       _lossless ? ", lossless" : ""));
+  // A template is worth ECHOING RESOLVED. Anything this file does not
+  // recognise is copied verbatim into the name (see output-path.h), so
+  // a mistyped token is otherwise invisible until someone goes looking
+  // for a file that is not there.
+  if (_tok.sequence || _tok.time) {
+    session()->info(fmt(
+        "SaveImageStage('{}'): names files like '{}'{}", this->id(),
+        outpath::expand(_path, _seq.peek(), kSeqPad, std::time(nullptr)),
+        _no_overwrite ? "; existing names are skipped" : ""));
+  }
   co_return;
 }
 
@@ -610,7 +601,13 @@ SaveImageStage::process(RuntimeContext& ctx)
     exif_tiff.clear();
   }
 
-  const string out_path = resolve_path_(_seen++);
+  const string out_path = _seq.take(_path, kSeqPad);
+  if (out_path.empty()) {
+    session()->error(fmt(
+        "SaveImageStage('{}'): no_overwrite is set and '{}' has no free "
+        "sequence number left; nothing written", this->id(), _path));
+    co_return;
+  }
   if (encode_(*in, out_path, exif_tiff)) {
     ++_written;
     session()->log_verbose(fmt(

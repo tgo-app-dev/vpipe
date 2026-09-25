@@ -93,6 +93,7 @@ SaveVideoStage::SaveVideoStage
   // Flat attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _output_url   = attr_path("output_url", true);
+  _no_overwrite = attr_bool("no_overwrite");
   _format       = attr_str("format");
   _enable_video = attr_bool("enable_video");
   _enable_audio = attr_bool("enable_audio");
@@ -194,7 +195,17 @@ SaveVideoStage::SaveVideoStage
     fail_config(fmt(
       "SaveVideoStage('{}'): config.output_url is required",
       this->id()));
+  } else {
+    // Checked at CONFIG time so a misspelt token reaches the editor
+    // rather than the log of a run that has already opened a file.
+    const string bad = outpath::check(_output_url, &_tok);
+    if (!bad.empty()) {
+      fail_config(fmt(
+        "SaveVideoStage('{}'): config.output_url '{}': {}",
+        this->id(), _output_url, bad));
+    }
   }
+  _seq.configure(_no_overwrite);
   if (!_enable_video && !_enable_audio) {
     fail_config(fmt(
       "SaveVideoStage('{}'): at least one of enable_video / "
@@ -230,10 +241,23 @@ SaveVideoStage::SaveVideoStage
 }
 
 namespace {
+// The width of the "-NNNNNN" suffix an output_url with no sequence
+// conversion of its own gets from the SECOND file onward. This stage
+// writes one file per launch, so under no_overwrite that is the second
+// RUN -- see stages/output-path.h.
+constexpr int kSeqPad = 6;
+
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_url", .type = ConfigType::String, .required = true,
-   .doc = "output file path / URL",
+   .doc = "output file path / URL. A printf integer conversion "
+          "(clip-%03d.mp4) numbers the launches and %t stamps the local "
+          "time (%t{...} takes a strftime format)",
    .is_path = true, .path_write = true, .path_filter = "video"},
+  {.key = "no_overwrite", .type = ConfigType::Bool,
+   .doc = "never write over a file that already exists: the number "
+          "starts past every name on disk instead of at 0, so a second "
+          "run does not erase the first one's clip. Off by default; "
+          "ignored for a network URL", .def_bool = false},
   {.key = "format", .type = ConfigType::String,
    .doc = "container format; \"\" = inferred", .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
@@ -388,6 +412,14 @@ SaveVideoStage::reset_run_state()
   _apcm_carry_n      = 0;
   _next_port         = 0;
   _model_name.clear();
+  // A fresh name for the next launch. Without `no_overwrite` the
+  // template resolves to the same thing again and the run rewrites its
+  // predecessor, which is what every graph has always done; with it the
+  // scan starts past whatever run 1 left behind, which is the whole
+  // point of the flag.
+  _resolved_url.clear();
+  _url_resolved = false;
+  _seq.reset();
 }
 
 string
@@ -399,15 +431,41 @@ SaveVideoStage::av_err_(int rc) const
 }
 
 void
+SaveVideoStage::resolve_output_url_()
+{
+  if (_url_resolved) { return; }
+  _url_resolved = true;
+  // ONE file per run, so ONE name per run: resolved here, at the first
+  // thing that needs it, and held for the whole launch. Resolving per
+  // use would let a %t tick between alloc_output_context2 (which reads
+  // the extension) and avio_open (which creates the file), and the two
+  // would disagree about which file this is.
+  _resolved_url = _seq.take(_output_url, kSeqPad);
+  if (_resolved_url.empty()) {
+    session()->error(fmt(
+      "SaveVideoStage('{}'): no_overwrite is set and '{}' has no free "
+      "sequence number left; nothing written",
+      this->id(), _output_url));
+    return;
+  }
+  if (_resolved_url != _output_url) {
+    session()->info(fmt(
+      "SaveVideoStage('{}'): writing '{}'", this->id(), _resolved_url));
+  }
+}
+
+void
 SaveVideoStage::ensure_output_format_()
 {
   if (_ofctx) {
     return;
   }
+  resolve_output_url_();
+  if (_resolved_url.empty()) { return; }   // already reported
   AVFormatContext* ofctx = nullptr;
   const char* fmt_name = _format.empty() ? nullptr : _format.c_str();
   int rc = _libs->avformat().api.alloc_output_context2(
-    &ofctx, nullptr, fmt_name, _output_url.c_str());
+    &ofctx, nullptr, fmt_name, _resolved_url.c_str());
   if (rc < 0 || !ofctx) {
     session()->error(fmt(
         "SaveVideoStage('{}'): alloc_output_context2 failed: "
@@ -988,13 +1046,15 @@ SaveVideoStage::open_output_and_write_header_()
   if (_ofctx->oformat
       && !(_ofctx->oformat->flags & AVFMT_NOFILE))
   {
+    resolve_output_url_();
+    if (_resolved_url.empty()) { return; }   // already reported
     int rc = _libs->avformat().api.avio_open(&_ofctx->pb,
-                                             _output_url.c_str(),
+                                             _resolved_url.c_str(),
                                              AVIO_FLAG_WRITE);
     if (rc < 0) {
       session()->error(fmt(
           "SaveVideoStage('{}'): avio_open('{}') failed: {}",
-          this->id(), _output_url, av_err_(rc)));
+          this->id(), _resolved_url, av_err_(rc)));
     }
   }
 

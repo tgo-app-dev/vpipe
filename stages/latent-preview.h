@@ -187,7 +187,7 @@ public:
     {
       if (_p == nullptr) { return; }
       _p->end(*_ctx);
-      if (release) { _p->release(); }
+      if (release || _p->releases_each_generation()) { _p->release(); }
     }
     Scope(const Scope&)            = delete;
     Scope& operator=(const Scope&) = delete;
@@ -206,6 +206,19 @@ public:
 
   // Drop the decoder and its weights (the stage's idle unload).
   void release();
+
+  // DROP IT AFTER EVERY GENERATION, rather than keeping it for the next
+  // one. A stage-wide policy, set once where the previewer is built,
+  // because it is a property of how that stage runs and not of any one
+  // generation -- and because it is what makes the DENOISE-PHASE claim
+  // latent_preview_claims files true. Held across generations, the TAE
+  // and its scratch (726 MB for a 1024^2 taef1) are still resident
+  // through the decode phase, which the claim says they are not, and
+  // the decode is where a tight box is tightest. The cost is a reload
+  // per generation: ~10-23 MB read and narrowed to f16, against a
+  // generation measured in seconds.
+  void release_each_generation(bool on) noexcept { _release_each = on; }
+  bool releases_each_generation() const noexcept { return _release_each; }
 
   // What the TAE holds, 0 before the first load.
   std::size_t resident_bytes() const noexcept;
@@ -235,6 +248,9 @@ private:
   // A load that failed is not retried every generation: the same file
   // would fail the same way, and the warning would repeat per clip.
   std::string _failed_vae;
+  // See release_each_generation(). Off by default: keeping the decoder
+  // is the cheaper answer wherever the claim already says so.
+  bool _release_each = false;
 
   // Set by begin(), read by the worker.
   RuntimeContext* _ctx = nullptr;

@@ -143,6 +143,27 @@ latent_preview_claims(const SessionContextIntf* session,
   int nf = Tae::frames_for(T, tp.info.time_upscale, trim);
   if (spec.max_frames > 0) { nf = std::min(nf, spec.max_frames); }
   const std::size_t ic = (std::size_t)tp.info.image_channels;
+  // THE CHECKPOINT IS NOT WHAT THE DECODER HOLDS, and the claim above
+  // books the checkpoint: the weights planner sizes a weight claim from
+  // the file on disk. MetalTaeDecoder narrows to f16 on the way in
+  // (which makes an f32 TAESD file an over-estimate, harmless) and, on
+  // matrix-core hardware, keeps an hwio twin of every 3x3 for the
+  // hardware convolution -- which makes taeh3 39.3 MB held against 22.7
+  // MB on disk. The file was a fair proxy until that twin existed; it
+  // now under-books by ~16 MB on three of the five published TAEs, and
+  // a claim that under-books is the direction that admits a graph which
+  // does not fit. Top it up from plan(), the same sizing the decoder
+  // allocates from, with NO phase -- the decoder is held from the first
+  // preview to the end of the run, exactly as the checkpoint claim
+  // above is.
+  const std::size_t on_disk = model_memory::dir_weights_bytes(file);
+  if (tp.weight_bytes > on_disk) {
+    for (auto& c : model_memory::scratch_claims(
+             fmt("{}-preview-weights", owner)(), tp.weight_bytes - on_disk,
+             /*phase=*/{})) {
+      out.push_back(std::move(c));
+    }
+  }
   const std::size_t bytes =
       tp.scratch_bytes + (k > 1 ? 4 * ic * NW * NH : 0) +
       2 * (std::size_t)nf * ic * (std::size_t)(NW / k) * (std::size_t)(NH / k);

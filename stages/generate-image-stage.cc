@@ -1469,18 +1469,20 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
-  // The live preview's TAE and its decode, for the families that render
-  // one -- exact, from the TAE's headers; see latent_preview_claims.
-  const std::string pfam = model_config::family_of(_model_cfg);
-  if (pfam == "krea2" || pfam == "flux2" || pfam == "z-image" ||
-      pfam == "qwen-image-21") {
-    for (auto& c : latent_preview_claims(
-             session(), this->id(),
-             LatentPreviewSpec::from_model_config(_model_cfg),
-             genai::MetalTaeDecoder::Trim::kLeading,
-             _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
-      out.push_back(std::move(c));
-    }
+  // The live preview's TAE and its decode -- exact, from the TAE's
+  // headers; see latent_preview_claims. NOT gated on a family list:
+  // the spec is what decides, and it is empty unless this family's
+  // model-config named a `preview_vae`, so a family that renders no
+  // preview claims nothing. A list here would have to be kept in step
+  // with the model-config stages that carry the key, and would fail
+  // silently in the direction that under-books. The registered-family
+  // branch above asks the same way.
+  for (auto& c : latent_preview_claims(
+           session(), this->id(),
+           LatentPreviewSpec::from_model_config(_model_cfg),
+           genai::MetalTaeDecoder::Trim::kLeading,
+           _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
+    out.push_back(std::move(c));
   }
   return out;
 }
@@ -1511,6 +1513,13 @@ GenerateImageStage::apply_model_config_()
   if (!_preview) {
     _preview = std::make_unique<LatentPreviewer>(session(),
                                                  std::string(this->id()));
+    // AN IMAGE STAGE DROPS ITS TAE AFTER EVERY GENERATION. Its preview
+    // scratch is claimed for the denoise phase alone (see
+    // latent_preview_claims) and at 1024^2 that is hundreds of
+    // megabytes -- held into the decode, it would be memory the plan
+    // says is not there, on the one box and phase where that matters.
+    // A reload costs a read of ~10-23 MB per generation.
+    _preview->release_each_generation(true);
   }
   _preview->configure(LatentPreviewSpec::from_model_config(_model_cfg),
                       genai::MetalTaeDecoder::Trim::kLeading);

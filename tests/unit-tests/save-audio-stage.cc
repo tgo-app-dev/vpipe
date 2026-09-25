@@ -197,6 +197,56 @@ TEST(save_audio_stage, relaunch_rewrites_the_same_file) {
   std::filesystem::remove_all(dir);
 }
 
+// The other half of the relaunch rule: with `no_overwrite` the operator
+// is asking for the opposite, and every launch keeps its own clip. The
+// pair is what proves the flag is what moved -- the test above shows
+// the default still rewrites.
+TEST(save_audio_stage, no_overwrite_keeps_every_run) {
+  Session sess;
+  CerrSilencer hush;
+  const string dir  = make_tempdir_();
+  const string path = dir + "/out.wav";
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<OneSineSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->allocate_oports(1);
+  auto* src = static_cast<OneSineSource*>(pl->insert_stage(std::move(src_u)));
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_path", FlexData::make_string(path));
+  cfg.as_object().insert("no_overwrite", FlexData::make_bool(true));
+  auto st_u = make_unique<SaveAudioStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(cfg));
+  pl->insert_stage(std::move(st_u));
+
+  for (int run = 0; run < 3; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  // out.wav, then the -NNN fallback, three launches deep. The suffix
+  // is three wide here and six in save-image; that is each stage's own
+  // history, not a rule (see stages/output-path.h).
+  EXPECT_TRUE(!slurp_(path).empty());
+  EXPECT_TRUE(!slurp_(dir + "/out-001.wav").empty());
+  EXPECT_TRUE(!slurp_(dir + "/out-002.wav").empty());
+  EXPECT_TRUE(slurp_(dir + "/out-003.wav").empty());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(save_audio_stage, a_broken_template_is_deferred_config) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_path",
+                         FlexData::make_string("/tmp/a-%t{%Y.wav"));
+  SaveAudioStage st(&sess, "enc", vector<InEdge>{}, std::move(cfg));
+  // About the TEMPLATE, not merely non-empty: the stage has other
+  // reasons to fail a config and any of them would carry the test.
+  EXPECT_FALSE(st.config_error().empty());
+  EXPECT_TRUE(st.config_error().find("%t{%Y.wav") != string::npos);
+}
+
 TEST(save_audio_stage, type_is_registered) {
   EXPECT_TRUE(string_view(SaveAudioStage::kTypeName) == "save-audio");
 }
@@ -451,6 +501,37 @@ private:
 };
 
 }  // namespace
+
+// A conversion in the template numbers the clips itself, and the index
+// goes where the operator put it rather than before the extension.
+TEST(save_audio_stage, a_conversion_in_the_template_numbers_the_clips) {
+  Session sess;
+  CerrSilencer hush;
+  const string dir = make_tempdir_();
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src = make_unique<TwoSineSource>(
+      &sess, "sine2", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  auto* s2 = static_cast<TwoSineSource*>(pl->insert_stage(std::move(src)));
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_path",
+                         FlexData::make_string(dir + "/take%02d-end.wav"));
+  auto st_u = make_unique<SaveAudioStage>(
+      &sess, "enc", vector<InEdge>{{s2, 0}}, std::move(cfg));
+  pl->insert_stage(std::move(st_u));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  EXPECT_TRUE(std::filesystem::exists(dir + "/take00-end.wav"));
+  EXPECT_TRUE(std::filesystem::exists(dir + "/take01-end.wav"));
+  // And no fallback suffix on top of it.
+  EXPECT_TRUE(!std::filesystem::exists(dir + "/take00-end-001.wav"));
+  std::filesystem::remove_all(dir);
+}
 
 TEST(save_audio_stage, multiple_beats_index_suffix) {
   const std::string dir = make_tempdir_();

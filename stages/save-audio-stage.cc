@@ -134,6 +134,13 @@ struct AudioPlanarFloatFifo {
   }
 };
 
+// The width of the "-NNN" index this stage has always given the 2nd+
+// clip of a run when output_path carries no sequence conversion of its
+// own. Three, not save-image's six, because that is what it already
+// wrote and renaming somebody's files is not this change's business
+// (see stages/output-path.h).
+constexpr int kSeqPad = 3;
+
 // The container set, matching is_known_format_() above -- which stays
 // the authority; this is only what the editor offers.
 constexpr SpecExtra kFormatChoices[] = {
@@ -142,8 +149,16 @@ constexpr SpecExtra kFormatChoices[] = {
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_path", .type = ConfigType::String, .required = true,
    .doc = "output file path; when it has no extension, one is appended "
-          "from `format`",
+          "from `format`. A printf integer conversion (clip-%03d.wav) "
+          "numbers the clips and %t stamps the local time (%t{...} takes "
+          "a strftime format); without a conversion the 2nd+ clip of a "
+          "run gets a -NNN index",
    .is_path = true, .path_write = true, .path_filter = "audio"},
+  {.key = "no_overwrite", .type = ConfigType::Bool,
+   .doc = "never write over a file that already exists: the index starts "
+          "past every name on disk instead of at 0. Off by default, "
+          "because the usual graph wants the same name rewritten each "
+          "run", .def_bool = false},
   {.key = "format", .type = ConfigType::String,
    .doc = "wav | aac | mp3 | m4a (m4a => AAC in mp4). Default: inferred "
           "from the output_path extension, else wav",
@@ -196,9 +211,10 @@ SaveAudioStage::SaveAudioStage(const SessionContextIntf* s,
   // a stage must construct so a graph can be built/edited before
   // required fields are supplied. Config problems are recorded via
   // fail_config (first message wins) and deferred to launch.
-  _output_path = attr_path("output_path", true);
-  _bitrate     = static_cast<int>(attr_int("bitrate"));
-  _sample_rate = static_cast<int>(attr_int("sample_rate"));
+  _output_path  = attr_path("output_path", true);
+  _bitrate      = static_cast<int>(attr_int("bitrate"));
+  _sample_rate  = static_cast<int>(attr_int("sample_rate"));
+  _no_overwrite = attr_bool("no_overwrite");
 
   // Resolve the format: explicit `format` wins; else infer from the
   // output_path extension; else "wav".
@@ -229,6 +245,17 @@ SaveAudioStage::SaveAudioStage(const SessionContextIntf* s,
         "SaveAudioStage('{}'): sample_rate must be >= 0 (got {})",
         this->id(), _sample_rate));
   }
+  // Checked at CONFIG time, not at the first write: a misspelt token is
+  // something the editor can still show somebody.
+  if (!_output_path.empty()) {
+    const std::string bad = outpath::check(_output_path, &_tok);
+    if (!bad.empty()) {
+      fail_config(fmt(
+          "SaveAudioStage('{}'): config.output_path '{}': {}",
+          this->id(), _output_path, bad));
+    }
+  }
+  _seq.configure(_no_overwrite);
 
   // Always allocate the info oport. When nothing is wired downstream the
   // runtime allocates an OportBuffer with no cursors and writes are
@@ -245,10 +272,11 @@ SaveAudioStage::spec() const noexcept
 }
 
 std::string
-SaveAudioStage::next_output_path_(const std::string& ext) const
+SaveAudioStage::take_output_path_(const std::string& ext)
 {
-  // Start from output_path; ensure it ends in `.ext`. For the 2nd+ file
-  // insert "-NNN" before the extension to avoid overwrite.
+  // Start from output_path; ensure it ends in `.ext`, THEN number it.
+  // That order matters: the index belongs before the extension, and the
+  // extension is only known once the encode has settled on a container.
   std::string base = _output_path;
   // Strip a trailing extension equal to one of the known formats so we
   // can re-attach `ext` consistently (the configured extension may be
@@ -257,16 +285,7 @@ SaveAudioStage::next_output_path_(const std::string& ext) const
   if (!have_ext.empty() && is_known_format_(have_ext)) {
     base.erase(base.size() - have_ext.size() - 1);  // drop ".ext"
   }
-  std::string out = base;
-  if (_files_written > 0) {
-    char idx[16];
-    std::snprintf(idx, sizeof(idx), "-%03llu",
-                  static_cast<unsigned long long>(_files_written));
-    out += idx;
-  }
-  out += ".";
-  out += ext;
-  return out;
+  return _seq.take(base + "." + ext, kSeqPad);
 }
 
 bool
@@ -596,6 +615,11 @@ SaveAudioStage::encode_ffmpeg_(const std::string& path, const float* pcm,
 void
 SaveAudioStage::reset_run_state()
 {
+  // The index is per RUN: without this the second launch would start at
+  // 1 and write out-001.wav rather than rewriting the file the operator
+  // configured. Under no_overwrite the reset costs nothing -- the scan
+  // re-finds the first free name, which is one past the last run's.
+  _seq.reset();
   _files_written = 0;
 }
 
@@ -698,7 +722,14 @@ SaveAudioStage::process(RuntimeContext& ctx)
   }
   // The container ext == format, except m4a stays "m4a".
   const std::string ext = format;
-  const std::string out_path = next_output_path_(ext);
+  const std::string out_path = take_output_path_(ext);
+  if (out_path.empty()) {
+    session()->error(fmt(
+        "SaveAudioStage('{}'): no_overwrite is set and '{}' has no free "
+        "sequence number left; nothing written",
+        this->id(), _output_path));
+    co_return;
+  }
 
   bool wrote = false;
   if (format == "wav") {

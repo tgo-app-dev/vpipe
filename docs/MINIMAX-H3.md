@@ -470,9 +470,12 @@ The knobs are on `minimax-h3-model-config`, next to H3's other settings:
 
 What it costs, measured on an M4 Pro:
 
+- A full 90-frame 960 × 576 clip takes **0.94 s** to decode on an idle GPU.
 - A 39-frame 512 × 288 preview took about **0.5 s** while the DiT ran
-  (the model resident, 8 s per step).
-- A full 90-frame 960 × 576 clip takes **2.1 s** to decode on an idle GPU.
+  (the model resident, 8 s per step). That, and the 3% below, were
+  measured when the full clip took 2.1 s, before the decoder's ReLUs,
+  residual adds, upsamples and concats were folded into its convs, so
+  read both as upper bounds.
 - The decode runs off the generation thread. If a render is still running
   when the next one is due, the waiting clip is replaced rather than
   queued, so previews never make the generation wait.

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -156,14 +157,40 @@ public:
   static bool plan(const std::string& file, int T, int h, int w, Trim trim,
                    Plan* out, std::string* err);
 
+  // The last decode's GPU kernel time per op category, when it ran with
+  // VPIPE_TAE_PROFILE set (empty otherwise). A profiled decode commits
+  // after every dispatch, so read the SPLIT from it, never the total.
+  struct ProfileRow {
+    double ms = 0.0;        // GPU time (GPUStartTime..GPUEndTime)
+    double wall_ms = 0.0;   // commit..wait, the cross-check
+    int    dispatches = 0;
+  };
+  const std::map<std::string, ProfileRow>& profile() const
+  {
+    return _profile;
+  }
+
 private:
   struct Conv {
     // 3x3: [cout, 9 * cin] with K ordered (ky, kx, ci) -- the layout the
     // gather conv reads. 1x1: [cout, cin]. f16.
     metal_compute::SharedBuffer w;
     metal_compute::SharedBuffer b;      // [cout] f16, or empty
-    // The head's twin for the direct small-cout conv: [9][cin][cout].
-    metal_compute::SharedBuffer hwio;
+    // The SAME weights as HWIO [3, 3, cin, cout], which is the only
+    // layout the MPP convolution2d op accepts -- so it is a twin, not a
+    // relayout, and it is built whenever cout % 64 == 0 (what the op
+    // takes) regardless of the machine. Unconditionally, because plan()
+    // is static and has no GPU to ask: booking it on one box and not
+    // the other is how the plan and the allocation come to disagree.
+    // The price is a second copy of the 3x3 weights -- ~19 MB on a 20 MB
+    // TAE -- which an M4 pays for nothing. Small beside the scratch a
+    // preview allocates (377 MB at 960x576), and the alternative is a
+    // plan that lies on one of the two machines.
+    metal_compute::SharedBuffer whwio;
+    // The twin holds TWO [3, 3, cin/2, cout] halves rather than one
+    // whole: a MemBlock's first conv reads [x, past] and runs as two
+    // hardware convs, one per half.
+    bool split_hwio = false;
     int  cin  = 0;
     int  cout = 0;
     bool k3   = true;
@@ -184,13 +211,20 @@ private:
     int  in_ch    = 0;
     int  out_ch   = 0;
     int  scale    = 1;       // spatial scale of its INPUT vs the latent
+    // Fusions (see the end of parse_): `fused` on a ReLU or Upsample that
+    // the conv beside it performs, `relu` / `up` on that conv.
+    bool fused    = false;
+    bool relu     = false;
+    int  up       = 1;
   };
+  // A gather conv's fused epilogue.
+  enum class Epi { kNone, kRelu, kAddRelu };
 
   MetalTaeDecoder() = default;
 
   // Element counts of the per-geometry scratch; see ensure_scratch_.
   struct Scratch {
-    std::size_t in = 0, cat = 1, tmp = 1, skip = 1, head_frame = 0;
+    std::size_t in = 0, tmp = 1, skip = 1, head_frame = 0;
     std::size_t pool = 1, pooled = 1;              // f16 elements
     std::size_t gn_part_bytes = 0, gn_stats_bytes = 0;   // f32
     std::vector<std::size_t> op_out, mem;
@@ -223,15 +257,29 @@ private:
             const metal_compute::SharedBuffer& x, int H, int W, long raw,
             const std::function<int(long)>& slot_of);
 
+  // A 3x3 conv of an `H` x `W` input into `out` at byte `out_off`, the
+  // input nearest-upsampled `up` (1 or 2) on the fly, with `epi` on the
+  // accumulator (`res` the residual for kAddRelu). `cat` names it for
+  // VPIPE_TAE_PROFILE.
   void conv3_(metal_compute::ComputeEncoder& enc, const Conv& c,
               const metal_compute::SharedBuffer& in,
-              const metal_compute::SharedBuffer& out, int H, int W);
+              const metal_compute::SharedBuffer& out, std::size_t out_off,
+              int H, int W, int up, Epi epi,
+              const metal_compute::SharedBuffer* res, const char* cat,
+              const metal_compute::SharedBuffer* in2 = nullptr);
   void conv1_(metal_compute::ComputeEncoder& enc, const Conv& c,
               std::size_t w_row0, int rows,
               const metal_compute::SharedBuffer& in,
               const metal_compute::SharedBuffer& out, int M);
   void relu_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t n);
+  // `hw` splits the profile row: a conv that took the hardware op is
+  // counted as "<cat>-hw". That is the ENGAGEMENT evidence -- the route
+  // is a silent fallback otherwise, and a decode that quietly stayed on
+  // the gather conv matches every golden and is merely slower.
+  void dispatch_(metal_compute::ComputeEncoder& enc, const char* cat,
+                 metal_compute::LaunchDims grid,
+                 metal_compute::LaunchDims tg, bool hw = false);
 
   std::shared_ptr<WeightSet>    _ws;
   metal_compute::MetalCompute*  _mc = nullptr;
@@ -245,11 +293,40 @@ private:
   std::size_t                   _last_state_op = 0;
   Info                          _info;
 
-  metal_compute::ComputeLibrary  _lib_gemm, _lib_elt;
-  metal_compute::ComputeFunction _fn_conv_bn32, _fn_conv_bn64,
-      _fn_gemm_bm64, _fn_gemm_bm64bn64, _fn_small_cout, _fn_relu, _fn_add,
-      _fn_upsample, _fn_concat, _fn_copy, _fn_gn_stats, _fn_gn_reduce,
-      _fn_gn_apply;
+  // Whether this conv's geometry and width let the hardware op take it:
+  // whole 8x8 destination tiles and 64-channel slices (see conv3_).
+  // `whole_tiles` is the stricter rule the concat pair needs: those two
+  // entries store through the device destination tensor, so an edge
+  // tile would write past the image. The fused-epilogue entries write
+  // the destination themselves and drop the overhang, so they take any
+  // grid.
+  bool hw_ok_(const Conv& c, int H, int W, int up, bool cat,
+              bool whole_tiles) const;
+
+  metal_compute::ComputeLibrary  _lib_gemm, _lib_elt, _lib_convhw;
+  // [form][BN 32, 64]; form 0 plain, 1 +relu, 2 +residual+relu, 3 up2,
+  // 4 up2+relu, 5 concat-input+relu -- see conv3_.
+  static constexpr int kConvForms = 6;
+  metal_compute::ComputeFunction _fn_conv[kConvForms][2];
+  metal_compute::ComputeFunction _fn_gemm_bm64, _fn_gemm_bm64bn64, _fn_relu,
+      _fn_add, _fn_upsample, _fn_copy, _fn_gn_stats,
+      _fn_gn_reduce, _fn_gn_apply;
+  // The MPP convolution2d op with the decoder's own epilogue fused into
+  // its cooperative tensor, indexed by Epi. ~3x the gather conv on an
+  // M5 at every shape it accepts, epilogue included. Off without matrix
+  // cores or under VPIPE_TAE_NO_HWCONV.
+  // [tail][epi]: tail 0 assumes whole 8x8 destination tiles, tail 1
+  // guards the store for a grid that is not a multiple of 8. Two
+  // entries and not one runtime branch -- the guard costs 1-10% when it
+  // can never fire.
+  metal_compute::ComputeFunction _fn_hw_epi[2][3];
+  // The concat pair (see conv3_): plain, then accumulate + bias + ReLU.
+  metal_compute::ComputeFunction _fn_hw_plain, _fn_hw_acc_relu;
+  bool _use_hwconv = false;
+  // A zero vector the hardware conv binds when a conv has no bias: its
+  // epilogue reads the bias unconditionally, and a branch per element
+  // to avoid one small buffer is the worse trade.
+  metal_compute::SharedBuffer _zero_bias;
 
   // Scratch for the geometry last decoded. `_op_out[i]` is op i's output
   // for one frame; `_mem[k]` MemBlock k's remembered input; `_tmp*` the
@@ -258,7 +335,7 @@ private:
   int _sh = 0, _sw = 0;
   std::vector<metal_compute::SharedBuffer> _op_out;
   std::vector<metal_compute::SharedBuffer> _mem;
-  metal_compute::SharedBuffer _in, _cat, _tmp0, _tmp1, _tmp2, _skip;
+  metal_compute::SharedBuffer _in, _tmp0, _tmp1, _skip;
   // The mid-block pool's scratch, when a block has one.
   metal_compute::SharedBuffer _pool_a, _pool_b, _pooled, _gn_part,
       _gn_stats;
@@ -269,6 +346,9 @@ private:
   std::size_t _head_frame = 0;   // elements per head slot
   std::size_t _scratch_bytes = 0;
   std::size_t _weight_bytes  = 0;
+  // VPIPE_TAE_PROFILE: the decode's stream while it runs, else null.
+  metal_compute::CommandStream* _prof_cs = nullptr;
+  std::map<std::string, ProfileRow> _profile;
 };
 
 }  // namespace genai

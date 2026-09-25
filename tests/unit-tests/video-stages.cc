@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -373,6 +374,135 @@ TEST(video_stages, encoder_relaunch_writes_again) {
   }
   EXPECT_TRUE(first > 0);
   remove(out_path.c_str());
+}
+
+// THE ISSUE-38 CASE, on the stage that had no numbering at all: before
+// this, every launch of a save-video graph wrote the same name and
+// erased the previous clip unless somebody retyped the path in the
+// web-ui between runs. With `no_overwrite` the second run lands beside
+// the first; the test above still shows the default rewriting, and the
+// pair is what says the flag is what moved.
+TEST(video_stages, encoder_no_overwrite_keeps_each_run) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-enc-nov-") + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 6;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url",
+               FlexData::make_string(dir + "/clip-%03d.mp4"));
+    obj.insert("no_overwrite", FlexData::make_bool(true));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto* enc = static_cast<SaveVideoStage*>(pl->insert_stage(
+    make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg))));
+
+  string url_run0;
+  for (int run = 0; run < 2; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    if (run == 0) { url_run0 = enc->resolved_url(); }
+  }
+  const size_t a = file_size_or_zero_(dir + "/clip-000.mp4");
+  const size_t b = file_size_or_zero_(dir + "/clip-001.mp4");
+  filesystem::remove_all(dir, ec);
+  EXPECT_TRUE(url_run0 == dir + "/clip-000.mp4");
+  EXPECT_TRUE(a > 0);
+  EXPECT_TRUE(b > 0);
+}
+
+// %t names the clip after the wall clock. The stage resolves the name
+// ONCE per run (the muxer reads the extension before the file is
+// opened, and the two must agree), so the check is that exactly one
+// file appeared and the token is gone from it.
+TEST(video_stages, encoder_timestamp_token_names_the_clip) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-enc-t-") + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 4;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url",
+               FlexData::make_string(dir + "/take-%t.mp4"));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto* enc = static_cast<SaveVideoStage*>(pl->insert_stage(
+    make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg))));
+
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  const string url = enc->resolved_url();
+  int n = 0;
+  string name;
+  for (const auto& e : filesystem::directory_iterator(dir, ec)) {
+    name = e.path().filename().string();
+    ++n;
+  }
+  const size_t sz = file_size_or_zero_(url);
+  filesystem::remove_all(dir, ec);
+
+  EXPECT_TRUE(n == 1);
+  // "take-YYYYmmdd-HHMMSS.mp4"
+  EXPECT_TRUE(name.size() == string("take-20260924-111530.mp4").size());
+  EXPECT_TRUE(name.find("%t") == string::npos);
+  EXPECT_TRUE(url == dir + "/" + name);
+  EXPECT_TRUE(sz > 0);
+}
+
+TEST(video_stages, encoder_broken_template_is_deferred_config) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_url",
+                         FlexData::make_string("/tmp/c-%t{%Y.mp4"));
+  SaveVideoStage e(&sess, "e", {}, std::move(cfg));
+  // NOT just "some error": this stage also refuses 0 input edges, and
+  // that message would carry the test on its own -- which is exactly
+  // what it did until an ablation run showed the assertion surviving
+  // with the template check deleted. The message has to be ABOUT the
+  // template, so look for the path in it.
+  EXPECT_FALSE(e.config_error().empty());
+  EXPECT_TRUE(e.config_error().find("/tmp/c-%t{%Y.mp4")
+              != string::npos);
 }
 
 // Every frame handed to the encoder must come back out of the file.

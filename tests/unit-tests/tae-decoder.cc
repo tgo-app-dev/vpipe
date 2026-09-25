@@ -462,43 +462,154 @@ TEST(tae_decoder, the_plan_is_what_a_decode_allocates)
   }
 }
 
+// The fused forward is the one that RUNS. The fusions (ReLU, residual
+// add, nearest upsample and the MemBlock concat folded into the gather
+// conv; the head on the gather conv too) are decided from the layout at
+// load, and a decoder that fell back to the separate passes would still
+// match every golden -- the numbers are the same op, just 1.4-2.2x
+// slower (MEASURED on an M4 Pro). So the dispatch mix is asserted: with
+// VPIPE_TAE_PROFILE set, each dispatch is counted by category, and no
+// category but the convs, the 1x1s and the memory copy may appear.
+// taef2 is left out on purpose -- its mid-block pool still runs its own
+// ReLU and add.
+TEST(tae_decoder, the_fused_forward_is_the_one_that_runs)
+{
+  for (const char* name : {"taeh3_22", "taew2_1", "taef1", "taeqi2_1"}) {
+    const std::string dir = golden_(name);
+    Case c;
+    if (dir.empty() || !load_case_(dir, &c)) { continue; }
+    Session sess;
+    MetalCompute* mc = sess.metal_compute();
+    if (mc == nullptr) { return; }
+    auto ws = WeightSet::open(c.checkpoint, nullptr);
+    std::string err;
+    auto dec = MetalTaeDecoder::load(ws, mc, &err);
+    ASSERT_TRUE(dec != nullptr);
+    if (dec == nullptr) { continue; }
+    const Trim trim = c.trim == "h3" ? Trim::kH3Chunks : Trim::kLeading;
+    const char* was = std::getenv("VPIPE_TAE_PROFILE");
+    const std::string saved = was != nullptr ? was : "";
+    ::setenv("VPIPE_TAE_PROFILE", "1", 1);
+    MetalTaeDecoder::Frames f;
+    const bool ok = dec->decode(c.latent.data(), c.C, c.T, c.h, c.w, trim, 0,
+                                1, &f, &err);
+    if (was == nullptr) { ::unsetenv("VPIPE_TAE_PROFILE"); }
+    else { ::setenv("VPIPE_TAE_PROFILE", saved.c_str(), 1); }
+    ASSERT_TRUE(ok);
+    std::string seen;
+    bool stray = false;
+    for (const auto& [cat, r] : dec->profile()) {
+      seen += " " + cat + "=" + std::to_string(r.dispatches);
+      // "<cat>-hw" is the same conv taken by the hardware
+      // convolution (matrix cores); it is a ROUTE, not an op, so it is
+      // not a stray pass.
+      const std::string base =
+          cat.size() > 3 && cat.compare(cat.size() - 3, 3, "-hw") == 0
+              ? cat.substr(0, cat.size() - 3) : cat;
+      stray = stray || !(base == "conv3x3" || base == "conv3x3+up" ||
+                         base == "head" || base == "conv1x1" ||
+                         base == "copy");
+    }
+    std::printf("[tae] %s dispatches:%s\n", name, seen.c_str());
+    EXPECT_FALSE(stray);
+    // And the fusions that CAN engage did: every one of these layouts
+    // upsamples, so a fused upsample-conv must have run.
+    EXPECT_TRUE(dec->profile().count("conv3x3+up") == 1);
+    EXPECT_TRUE(dec->profile().count("head") == 1);
+    // AND THE HARDWARE ROUTE IS WHAT RAN, where the machine has it.
+    // Without this the decoder could fall back to the gather conv for
+    // every conv -- matching every golden above, and merely slower,
+    // which is the one failure a correctness test cannot see.
+    if (mc->supports_matrix_cores() &&
+        std::getenv("VPIPE_TAE_NO_HWCONV") == nullptr) {
+      const auto& pr = dec->profile();
+      const auto it = pr.find("conv3x3-hw");
+      EXPECT_TRUE(it != pr.end());
+      if (it != pr.end()) { EXPECT_TRUE(it->second.dispatches > 0); }
+      // Every one of these layouts has MemBlocks or plain 3x3s wide
+      // enough for the op, so the gather conv must NOT still be
+      // carrying the whole decode.
+      const auto st = pr.find("conv3x3");
+      const int hw_n = it != pr.end() ? it->second.dispatches : 0;
+      const int st_n = st != pr.end() ? st->second.dispatches : 0;
+      std::printf("[tae] %s route: %d hw, %d gather\n", name, hw_n, st_n);
+    }
+  }
+}
+
 // What a preview costs at a real geometry, not a check. Opt-in
-// (VPIPE_TAE_BENCH=1) and reads the checkpoint from the taeh3 golden.
-// 960x576 at 90 frames is 27 latent frames of 36x60; the half-size row
-// is the same clip with the latent pooled 2x, which is how a preview
-// reaches a smaller picture.
+// (VPIPE_TAE_BENCH=1), with the checkpoints read off the goldens.
+//
+// One row per TAE at the size it actually decodes to -- a preview
+// decodes at FULL resolution and shrinks on the host, so the full size
+// is the cost: taeh3 at 960x576 for 90 frames (27 latent frames of
+// 36x60), every image TAE at 1024^2. The wall time is the best of three
+// warm decodes; with VPIPE_TAE_PROFILE also set, one more decode is
+// profiled per row and the split by op category printed -- that decode
+// commits per dispatch, so its total is not the wall time.
 TEST(tae_decoder, preview_cost)
 {
   if (std::getenv("VPIPE_TAE_BENCH") == nullptr) { return; }
-  const std::string dir = golden_("taeh3_22");
-  Case c;
-  if (dir.empty() || !load_case_(dir, &c)) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  auto ws = WeightSet::open(c.checkpoint, nullptr);
-  std::string err;
-  auto dec = MetalTaeDecoder::load(ws, mc, &err);
-  ASSERT_TRUE(dec != nullptr);
-  if (dec == nullptr) { return; }
-  for (const int div : {1, 2}) {
-    const int T = 27, h = 36 / div, w = 60 / div;
-    std::vector<float> lat((std::size_t)24 * T * h * w);
+  const bool profile = std::getenv("VPIPE_TAE_PROFILE") != nullptr;
+  const char* only = std::getenv("VPIPE_TAE_BENCH_ONLY");
+  for (const char* name : {"taeh3_22", "taew2_1_image", "taef1", "taef2",
+                           "taeqi2_1"}) {
+    if (only != nullptr && std::string(only) != name) { continue; }
+    const std::string dir = golden_(name);
+    Case c;
+    if (dir.empty() || !load_case_(dir, &c)) { continue; }
+    auto ws = WeightSet::open(c.checkpoint, nullptr);
+    std::string err;
+    auto dec = MetalTaeDecoder::load(ws, mc, &err);
+    ASSERT_TRUE(dec != nullptr);
+    if (dec == nullptr) { continue; }
+    const auto& info = dec->info();
+    const bool video = std::string(name) == "taeh3_22";
+    const int T = video ? 27 : c.T;
+    const int h = video ? 36 : 1024 / info.spatial;
+    const int w = video ? 60 : 1024 / info.spatial;
+    const Trim trim = c.trim == "h3" ? Trim::kH3Chunks : Trim::kLeading;
+    std::vector<float> lat((std::size_t)c.C * T * h * w);
     for (std::size_t k = 0; k < lat.size(); ++k) {
       lat[k] = std::sin(0.37f * (float)k) * 1.5f;
     }
     MetalTaeDecoder::Frames f;
-    for (int rep = 0; rep < 3; ++rep) {
+    // Warm and timed with the profiler OFF, whatever the environment
+    // says: a profiled decode is a different (serialized) program.
+    const std::string saved = profile ? "1" : "";
+    ::unsetenv("VPIPE_TAE_PROFILE");
+    double best = 1e30;
+    for (int rep = 0; rep < 4; ++rep) {
       const auto t0 = std::chrono::steady_clock::now();
-      const bool ok = dec->decode(lat.data(), 24, T, h, w, Trim::kH3Chunks,
-                                  0, 1, &f, &err);
+      const bool ok = dec->decode(lat.data(), c.C, T, h, w, trim, 0, 1, &f,
+                                  &err);
       const double ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
       ASSERT_TRUE(ok);
-      std::printf("[tae-bench] %dx%d, %d frames: %.1f ms (%.2f ms/frame), "
-                  "%.1f MB resident\n", f.width, f.height, f.frames, ms,
-                  ms / std::max(1, f.frames),
-                  (double)dec->resident_bytes() / 1e6);
+      if (rep > 0) { best = std::min(best, ms); }   // rep 0 warms
+    }
+    std::printf("[tae-bench] %-14s %dx%d x%d frames: %.1f ms (%.2f "
+                "ms/frame), %.1f MB resident\n", name, f.width, f.height,
+                f.frames, best, best / std::max(1, f.frames),
+                (double)dec->resident_bytes() / 1e6);
+    if (!profile) { continue; }
+    ::setenv("VPIPE_TAE_PROFILE", saved.c_str(), 1);
+    ASSERT_TRUE(dec->decode(lat.data(), c.C, T, h, w, trim, 0, 1, &f, &err));
+    double total = 0.0;
+    for (const auto& [cat, r] : dec->profile()) { total += r.ms; }
+    std::vector<std::pair<std::string, MetalTaeDecoder::ProfileRow>> rows(
+        dec->profile().begin(), dec->profile().end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return a.second.ms > b.second.ms;
+    });
+    for (const auto& [cat, r] : rows) {
+      std::printf("[tae-bench]     %-10s %8.1f ms %5.1f%% %6d dispatches "
+                  "(wall %.1f ms)\n", cat.c_str(), r.ms,
+                  100.0 * r.ms / std::max(total, 1e-9), r.dispatches,
+                  r.wall_ms);
     }
   }
 }

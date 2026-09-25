@@ -6,6 +6,7 @@
 #include "pipeline/typed-stage.h"
 #include "common/ffmpeg-libraries.h"
 #include "stages/audio-video/video-tokens.h"
+#include "stages/output-path.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -36,7 +37,17 @@ namespace vpipe {
 // swresample here, so a mismatch surfaces at avcodec_open2.
 //
 // Configuration (FlexData object):
-//   output_url       (string, required)
+//   output_url       (string, required)       -- a path template: see
+//                      stages/output-path.h. A printf integer conversion
+//                      ("clip-%03d.mp4") numbers the LAUNCHES and "%t"
+//                      stamps the local time. One file per run, so the
+//                      name is resolved once, when the muxer is opened.
+//   no_overwrite     (bool,   default false)  -- never write over a file
+//                      that is already there: the number starts past
+//                      every name on disk instead of at 0. This is the
+//                      knob that stops a second run from erasing the
+//                      first one's clip. Ignored for a network URL,
+//                      which has nothing to stat.
 //   format           (string, default "")     -- container; "" = inferred
 //   enable_video     (bool,   default true)
 //   enable_audio     (bool,   default true)
@@ -95,7 +106,16 @@ public:
   int video_port() const noexcept { return _video_port; }
   int audio_port() const noexcept { return _audio_port; }
 
+  // The path actually being written this run ("" before the muxer is
+  // opened). Test-only, and the only way to see what a template
+  // resolved to.
+  const std::string& resolved_url() const noexcept { return _resolved_url; }
+
 private:
+  // Fix this run's output path from the template. Called once, before
+  // the format is inferred from the extension and before the IO context
+  // is opened -- both of them need the real name, not the template.
+  void resolve_output_url_();
   void ensure_output_format_();
   void init_video_encoder_(const VideoStreamParams& p);
   void init_audio_encoder_(const AudioStreamParams& p);
@@ -139,7 +159,16 @@ private:
   // attr_*); the nested video.* / audio.* sub-object defaults have no
   // flat ConfigKey representation and are seeded once at the top of the
   // constructor. Declarations carry no non-zero default.
-  std::string _output_url;
+  std::string _output_url;      // the template, as configured
+  std::string _resolved_url;    // this run's name; "" until resolved
+  // Whether resolve_output_url_() has already run this launch. A
+  // separate flag, not `_resolved_url.empty()`: an exhausted
+  // no_overwrite scan legitimately yields "", and retrying it would
+  // re-walk a million names and re-log once per caller.
+  bool        _url_resolved = false;
+  bool        _no_overwrite = false;
+  outpath::Tokens    _tok;      // which tokens `output_url` carries
+  outpath::SeqPicker _seq;
   std::string _format;
   bool        _enable_video{};
   bool        _enable_audio{};
